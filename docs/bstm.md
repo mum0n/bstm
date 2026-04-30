@@ -15,7 +15,7 @@ params:
 
 <!-- Quarto formatted: To create/render document:
 
-make quarto FN=carstm_julia.md DOCTYPE=html PARAMS="-P todo:[nothing,add,more,here]" --directory=~/projects/model_covariance/docs
+make quarto FN=carstm_julia.md DOCTYPE=html PARAMS="-P todo:[nothing,add,more,here]" --directory=~/projects/bstm/docs
  
 -->
 
@@ -33,7 +33,27 @@ make quarto FN=carstm_julia.md DOCTYPE=html PARAMS="-P todo:[nothing,add,more,he
 
 ## Abstract
  
-Bayesian Space-Time Models in Julia (*bstm*) is a Julia project that combines elements of the Spatial partitioning methods together with some basic Bayesian spatiotemporal models. At its core is a discrete perspective upon space and time, not for philosophical reasons, but rather operational functionality. Spatiotemporal models are resource intensive. This discrete perspective permits useful solutions within the constraints of most currently available computing resources. It also goes well beyond the discrete approximations with continuous Gaussian Process methods, some of which we will touch upon below. Though the focus is upon Ecological issues, it is a general framework that can be readily adapted to any spatiotemporal process, no matter how large or small. 
+Bayesian Space-Time Models in Julia (*bstm*) is a Julia project that combines elements of Spatial partitioning methods (for discrete modelling) together with Bayesian spatiotemporal models. At its core is a discrete perspective upon space and time, not for philosophical reasons, but rather operational functionality. Spatiotemporal models are resource intensive. This discrete perspective permits useful solutions within the constraints of most currently available computing resources. After developing these discrete approximations, we explore continuous Gaussian Process methods. Though the focus is upon Ecological applications, the framework is sufficiently general that it can be readily adapted to any spatiotemporal process, no matter how large or small. 
+
+Using Julia leverages the power and flexibility of the language (especially the Bayesian Turing.jl framework), with a compact, flexible and extensible set of functions and tools. Ultimately, here, we are developing a general framework to explore various models of increasing complexity to handle measurement error, periodic dynamics, and spatial dependencies. Random Fourier Features (RFF), Fully Independent Training Conditional (FITC) and Deep Gaussian Processes are explored to make Discrete and Continuous Spatiotemporal models computationally tractable for large datasets.
+
+  
+## Introduction: The SpatioTemporal Challenge 
+
+Ecological monitoring is a pursuit of moving targets. To usefully model important variables  like bottom temperature, species composition, and the population dynamics of  species requires using utilizing incomplete or low density information from expensive surveys with limits to resources and time. The usual recourse is some variation of Random Stratified Sampling to "absorb" unaccounted errors or "externalities" as unstructured, **independent**, random effects. This can of course be fine in simple settings. In really dynamic environments, this can be a source of bias, no matter how good you think the stratification may be. In *bstm*, we do not ignore these "externalities", instead we embrace them as they are usually informative and therefore useful. Though *bstm* can be used for the former, it shines as a high-dimensional Bayesian hierarchical framework designed to decompose complex spatiotemporal data into interpretable latent components. This is because, ecological data is inherently **dependent** or structured. 
+
+To address the "SpatioTemporal Challenge," *bstm* utilizes three primary components:
+
+1. Spatial Clustering: Implemented via spatial autocorrelation specifications to account for geographical neighborhoods.
+2. Temporal Autocorrelation: Utilizing temporal autocorrelation to capture evolving trends.
+3. Non-linear Interactions: Modeling complex interactions where the relationship between space and time is non-stationary and dynamic.
+
+Failing to distinguish between a permanent habitat feature (captured by a spatial component) and a transient environmental anomaly (captured by the space-time interaction) results in biased forecasts. By isolating these effects, we ensure that our understanding and consequent management decisions are based on the "true" underlying drivers rather than statistical noise. This decomposition is made possible by the rigorous mathematical axioms that transform a computationally prohibitive problem into a tractable one.
+ 
+
+### Computation: 1. Getting started with the environment
+
+As this document is structured like a notebook with explanations inter-spread with examples, let us get the Julia environment set up before anything else. Here we use [Julia](https://julialang.org/), as in my experience, it is a clear didactic tool and better for long-term learning and simultaneously use in large projects due to maintainability of the code-base and high performance. It is an open-source platform created by mathematicians, engineers, natural scientists, statisticians, computer scientists and machine learning specialists, each bringing the best from their respective fields and lessons learned from domain-specific software platforms in a coherent and performative fashion. At the time of this writing, there still remain some lingering issues (start up speed, recompilation of code and incompatibility creep when there are updates to any library, most already being addressed rapidly), but the speed that is offered and code clarity in exchange is worth it in any serious data manipulation efforts. Your mileage will vary, but the lessons learned are also easily transportable to R, python, matlab, octave, etc., if forced to use those platforms. They each have their own quirks and challenges, but until their eventual convergence into something (that will likely look a lot like Julia), it is still a great platform to learn, teach and operate/develop cutting edge work. Many learning tools exist. [Have a look here for a curated list](https://julialang.org/learning/). See the Appendices for more details.
 
 The current library of functions replicates most of the functionality of the following R-packages and essentially subsumes them:
 
@@ -41,87 +61,38 @@ The current library of functions replicates most of the functionality of the fol
 - [aegis.polygons](https://github.com/jae0/aegis.polygons): creating and handling areal unit information, and
 - [CARSTM](https://github.com/jae0/carstm): an INLA wrapper for simple GRMF spatiotemporal models. 
 - [stmv](https://github.com/jae0/stmv): a mosaic approach to non-stationary spatiotemporal processes. 
-
-Using Julia leverages the power and flexibility of the language (especially the Bayesian Turing.jl framework), with a compact, flexible and extensible set of functions and tools. Ultimately, here, we are developing a general framework to explore various models of increasing complexity to handle measurement error, periodic dynamics, and spatial dependencies. Random Fourier Features (RFF), Fully Independent Training Conditional (FITC) and Deep Gaussian Processes are explored to make Discrete and Continuous Spatiotemporal models computationally tractable for large datasets.
-
-Note: a lot of this work has been accelerated by using [Google' Colab](https://colab.research.google.com/). If used carefully, it can be a powerful accelerator. I acknowledge the use of it, though it does require care as well. 
-
-
-
-## Introduction: The SpatioTemporal Challenge 
-
-Ecological monitoring is a pursuit of moving targets. To usefully model important variables  like bottom temperature, species composition, and the population dynamics of  species requires using utilizing incomplete or low density information from expensive surveys with limits to resources and time. The usual recourse is some variation of Random Stratified Sampling to absorb unaccounted errors or "externalities". In *bstm*, we embrace these externalities as they are quite informative and useful. 
-
-*bstm* is a high-dimensional Bayesian hierarchical framework designed to decompose complex spatiotemporal data into interpretable latent components. Standard models typically  assume independence ("Random Stratified"); however, ecological data is inherently dependent. To address the "SpatioTemporal Challenge," *bstm* utilizes three primary components:
-*bstm* is a high-dimensional Bayesian hierarchical framework designed to decompose complex spatio-temporal data into interpretable latent components. Standard models typically  assume independence ("Random Stratified"); however, ecological data is inherently dependent. To address the "Spatio-Temporal Challenge," *bstm* utilizes three primary components:
-
-1. Spatial Clustering: Implemented via the BYM2 (Besag-York-Mollié) specification to account for geographical neighborhoods.
-2. Temporal Autocorrelation: Utilizing AR1 or Random Fourier Features (RFF) to capture evolving trends.
-3. Non-linear Interactions: Modeling "Type IV" Interactions where the relationship between space and time is non-stationary and dynamic.
-
-Failing to distinguish between a permanent habitat feature (captured by the BYM2 spatial component) and a transient environmental anomaly (captured by the Type IV interaction) results in biased forecasts. By isolating these effects, we ensure that our understanding and consequent management decisions are based on the "true" underlying drivers rather than statistical noise. This decomposition is made possible by the rigorous mathematical axioms that transform a computationally prohibitive problem into a tractable one.
-
-
-### Computation: 1. Start environment
-
-As this document is structured like a notebook with explanations inter-spread with examples, let us get the Julia environment set up before anything else. 
  
-**WARNING**: if this is the first run, this can take up to 1 hour to install and precompile libraries and their dependencies
+Note: a lot of this work has been accelerated by using [Google' Colab](https://colab.research.google.com/). If used carefully, it can be a powerful accelerator. I acknowledge the use of it, though it does require care as well and a lot of error checking. 
+
+Installing [Julia](https://julialang.org/) is best done with [juliaup](https://github.com/JuliaLang/juliaup). It can make maintenance simpler. Most functions used here that are not part of a standard library are collected together in [Julia](https://julialang.org/) functions at [src](../src/). They can be loaded with supporting standard libraries, as follows:
+ 
+ 
+**WARNING**: if this is the first run, this can take up to 1 hour to install libraries and dependencies, so let it run and read on... You might need to re-start the Julia session if there is a old library. 
+
 
 ```{julia}
- 
-# For Areal Units
-using Pkg
-pkgs_au = ["Random", "Statistics", "LinearAlgebra", "DataFrames",
-       "StatsBase", "SparseArrays", "Plots", "StatsPlots", "StaticArrays",
-        "JLD2", "LibGEOS", "Graphs", "DelaunayTriangulation" ]
-Pkg.add(pkgs_au)
-for pk in pkgs_au; @eval using $(Symbol(pk)); end
-
-
-# For CARSTM 
-using Pkg
-pkgs_carstm = ["Random",   "Distributions", "Statistics", "MCMCChains", "DataFrames",
-        "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests",
-        "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays",
-         "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "PosteriorStats",  "Turing" ]
-Pkg.add(pkgs_carstm)
-for pk in pkgs_carstm;  @eval using $(Symbol(pk)) end
-
-
-
-# Pkg.precompile()
-# Pkg.instantiate()
-# Pkg.gc()
-
-
-# Pinning LibGEOS to the latest available package version to resolve API inconsistencies
-# Pkg.add(name="LibGEOS", version="0.9.7")
-# Pkg.precompile()
-
-
-
-# define 'project_directory' as the location of the repository -- required
 
 if Sys.iswindows()
-    project_directory = joinpath( "C:\\", "home", "jae", "projects", "model_covariance")  
+    project_directory = joinpath( "C:\\", "home", "jae", "projects", "bstm")  
 elseif Sys.islinux()
-    project_directory = joinpath( "/home", Sys.username(), "projects", "model_covariance")
+    project_directory = joinpath( "/home", Sys.username(), "projects", "bstm")
 else
-    project_directory = joinpath( "C:\\", "Users", "choij", "projects", "model_covariance")  # examples
+    project_directory = joinpath( "C:\\", "Users", "choij", "projects", "bstm")  # examples
 end
 
 
-include( joinpath( project_directory, "src", "spatial_partitioning_functions.jl" ) ) # support functions  
-include( joinpath( project_directory, "src", "spatiotemporal_functions.jl" ) )       # suppoert functions
-include( joinpath( project_directory, "src", "spatiotemporal_turing_models.jl" ) )     # Turing models
- 
+# include( joinpath( project_directory, "src", "spatial_partitioning_functions.jl" ) ) # support functions  
+# include( joinpath( project_directory, "src", "spatiotemporal_functions.jl" ) )       # support functions
+# include( joinpath( project_directory, "src", "spatiotemporal_turing_models.jl" ) )     # Turing models
+
+include( joinpath( project_directory, "scripts", "startup.jl" ) ) # support functions   
+
 
 ```
  
 ### The Core Assumptions
 
-For *bstm*s, there are four core assumptions. Some of these can be relaxed depending upon the final method but these assumptions allow us to move from $O(N^3)$ Gaussian Process complexity to $O(N)$ or $O(N \log N)$ operational tractability. 
+For *bstm*s, there are four main features help us to move from a "naive" $O(N^3)$ Gaussian Process complexity to $O(N)$ or $O(N \log N)$ operational tractability. 
 
 Markov Property: 
 - A spatial unit is independent of all non-neighbors given its immediate neighbors ($\mathcal{N}(i)$). 
@@ -134,24 +105,23 @@ Additivity:
 Stationarity:
 - Processes assume constant mean/variance over a standardized [0, 1] interval.	
 - Provides structural stability; ensures the "rules" of time-series (AR1) or kernels (RFF) are consistent.
+- Non-stationarity is important is real systems and so we will work towards this being relaxed in later methods.  
 
 Rank-Deficiency:
 - Intrinsic priors (ICAR and RW2) measure differences between units, not absolute levels.	
 - Provides the mathematical basis for smoothing, though it requires constraints to achieve identifiability.
+- Identifiability: The Sum-to-Zero Constraint
 
+    - When we use intrinsic priors like the ICAR (spatial) or RW2 (temporal) to provide structure to our models, we encounter a singular precision matrix. Because these priors define the distribution of differences between points, they possess a "null space." In other words, adding any constant $c$ to the vector $\mathbf{u}$ (i.e., $\mathbf{u} + c\mathbf{1}$) results in the same log-density, the metric used for solution finding. In the most extreme form, this Rank-Deficiency Problem means that a computations cannot distinguish between a global intercept ($\alpha$) and the mean level of the spatial field are interchangeable and one may drift toward +infinity while the other drifts toward -infinity.
 
-### Identifiability: The Sum-to-Zero Constraint
+    - Using a Sum-to-Zero Constraint ($\sum u_i = 0$) "pins" the latent field to a mean of zero, so the global intercept is preserved as the true overall mean of the response. This means the spatial effect effectively captures only the deviations from the mean, so highlighting which areas are geographically anomalous. This is very much the approach that was using in the early Universal Kriging with External Drift (UKED). This also has the benefit of stabilizing computations, by preventing MCMC chains from wandering along an infinite "ridge" of equally likely values, and so supporting convergence.
 
-When we use intrinsic priors like the ICAR (spatial) or RW2 (temporal) to provide structure to our models, we encounter a singular precision matrix. Because these priors define the distribution of differences between points, they possess a "null space." In other words, adding any constant $c$ to the vector $\mathbf{u}$ (i.e., $\mathbf{u} + c\mathbf{1}$) results in the same log-density, the metric used for solution finding. In the most extreme form, this Rank-Deficiency Problem means that a computations cannot distinguish between a global intercept ($\alpha$) and the mean level of the spatial field are interchangeable and one may drift toward +infinity while the other drifts toward -infinity.
-
-Using a Sum-to-Zero Constraint ($\sum u_i = 0$) "pins" the latent field to a mean of zero, so the global intercept is preserved as the true overall mean of the response. This means the spatial effect effectively captures only the deviations from the mean, so highlighting which areas are geographically anomalous. This is very much the approach that was using in the early Universal Kriging with External Drift (UKED). This also has the benefit of stabilizing computations, by preventing MCMC chains from wandering along an infinite "ridge" of equally likely values, and so supporting convergence.
-
-Implementation Note: While "Soft Constraints" (penalty methods) exist, Explicit Re-centering (subtracting the empirical mean during each iteration) is the preferred method for maintaining stability within the NUTS sampler.
+    - Implementation Note: While "Soft Constraints" (penalty methods) exist, Explicit Re-centering (subtracting the empirical mean during each iteration) is the preferred method for maintaining stability within the NUTS sampler.
  
  
 ###  Partitioning the Map: Areal Units and Information Balance
 
-To run the discrete *bstm*s, we must discretize the spatial domain into "Areal Units." A well-constructed partition balances geometric compactness with statistical information density to avoid "Data Starvation." Or sometimes, one inherits management areal units, often with no structural support. Though one can simply push on using such area definitions, if the balance of information available to information extractable is poor due to improper sizes and shapes, one should consider alternative areal units which then can be reconsolidated to estimate at the level of the unfortunate management units.   
+For discrete *bstm*s, we must discretize the spatial domain into "Areal Units." A well-constructed partition balances geometric compactness with statistical information density to avoid "Data Starvation." Or sometimes, one inherits management areal units, often with no structural support. Though one can simply push on using such area definitions, if the balance of information available to information extractable is poor due to improper sizes and shapes, one should consider alternative areal units which then can be reconsolidated to estimate at the level of the unfortunate management units.   
 
 Amongst the partitionning methods available in *bstm* are:
    
@@ -163,8 +133,7 @@ Amongst the partitionning methods available in *bstm* are:
 
 - Agglomerative Voronoi Tessellation (AVT): An iterative merging approach that balances multiple constraints upon the data that iteratively aggregates small areal units until stopping rules are met. It also begins with KDE to identify initial conditions. 
 
-
-  
+ 
 ###  Advanced Topics: RFF, Deep GPs, and Scaling
 
 To handle non-stationary surfaces and large-scale seasonality, *bstm* uses a few approximations and scaling techniques.
@@ -1495,10 +1464,10 @@ println("="^45)
 ## Example 1: Bottom temperatures
 
 See the INLA-based (Laplace-Approximation) implementation here:
-<https://github.com/jae0/carstm/blob/master/inst/scripts/example_temperature_carstm.md>
+<https://github.com/jae0/carstm/blob/main/inst/scripts/example_temperature_carstm.md>
 
 Here we re-implement this as a fully Bayesian process with Julia, Turing
-and the [supporting functions in this repository](https://github.com/jae0/model_covariance/)
+and the [supporting functions in this repository](https://github.com/jae0/bstm/)
 
 The main idea is to model spatial variability via a [Conditional
 Autoregressive Process or CAR](./spatial_processes.md) and [temporal variability via Fourier terms](./temporal_processes.md). 
@@ -1539,14 +1508,12 @@ The example data is bounded by longitudes (-65, -62) and latitudes (45,
 
 ```julia
 
-project_directory = joinpath( homedir(), "projects", "model_covariance"  )
-
-funcs = ( "startup.jl", "pca_functions.jl",  "regression_functions.jl", "car_functions.jl", "carstm_functions.jl" )
-
+project_directory = joinpath( homedir(), "projects", "bstm"  )
+ 
 download_directly = false
 if download_directly
   using Downloads
-  project_url = "https://raw.githubusercontent.com/jae0/model_covariance/master/"
+  project_url = "https://raw.githubusercontent.com/mum0n/bstm/main/"
 
   for f in funcs
     include( Downloads.download( string(project_url, f) ))
@@ -1571,7 +1538,7 @@ Random.seed!(1); # Set a seed for reproducibility.
 
 using RData  
 
-#fndat = "https://github.com/jae0/model_covariance/data/example_bottom_temp.rdz"
+#fndat = "https://github.com/mum0n/bstm/data/example_bottom_temp.rdz"
 
 #fn = Downloads.download(fndat)  # save rdz locally
 fn = joinpath( project_directory, "data", "example_bottom_temp.rdz" )
@@ -1691,10 +1658,10 @@ Y ~ MvNormal( mu_fp .+ mp_icar, Symmetric(vcv) )   # add mvn noise
 
 ## Example 2: Species Composition
 
-See the [INLA-based (Laplace-Approximation) implementation.](https://github.com/jae0/aegis.speciescomposition/blob/master/inst/scripts/01_speciescomposition_carstm_1999_to_present.R)
+See the [INLA-based (Laplace-Approximation) implementation.](https://github.com/jae0/aegis.speciescomposition/blob/main/inst/scripts/01_speciescomposition_carstm_1999_to_present.R)
 
 Here we re-implement this as a fully Bayesian process with Julia, Turing
-and the [supporting functions in this repository](https://github.com/jae0/model_covariance/)
+and the [supporting functions in this repository](https://github.com/mum0n/bstm/)
 
 
 Similar to Example 1, the main idea is to model spatial variability via a [Conditional
@@ -1819,7 +1786,7 @@ Make data in R:
     # devtools::install_github("wesm/feather/R")
     # require(feather)
     
-    #  rootdir = file.path("/home", "jae", "projects", "model_covariance", "data" )
+    #  rootdir = file.path("/home", "jae", "projects", "bstm", "data" )
     #  rootdir = p$project_data_directory
 
     #  py_save_object(set, file.path(rootdir, "set.pickle") )
@@ -1843,7 +1810,7 @@ Now bring data into julia for analysis
 
     # y ∼ N(ZW^T +βX+GP(z,bt)+ICAR(s)+F(t)+ICAR(s,t)⊗F(s,t), σ^2 I)
 
-    project_directory = joinpath( homedir(), "projects", "model_covariance"  )
+    project_directory = joinpath( homedir(), "projects", "bstm"  )
 
     funcs = ( "startup.jl", "pca_functions.jl",  "regression_functions.jl", "car_functions.jl", "carstm_functions.jl" )
 
@@ -1852,7 +1819,7 @@ Now bring data into julia for analysis
     end
 
     # using Downloads
-    # project_url = "https://raw.githubusercontent.com/jae0/model_covariance/master/"
+    # project_url = "https://raw.githubusercontent.com/mum0n/bstm/main/"
     for f in funcs
       # include( download( string(project_url, f) ))
     end
@@ -1871,7 +1838,7 @@ Now bring data into julia for analysis
     # load test data: 1999:2023 
     # NOTE: data created in /home/jae/bio/aegis.speciescomposition/inst/scripts/01_speciescomposition_carstm_1999_to_present.R
 
-    # fn = "https://github.com/jae0/model_covariance/raw/master/data/sps_comp.rdz"
+    # fn = "https://github.com/mum0n/bstm/raw/main/data/sps_comp.rdz"
     # fndat = joinpath( tempdir(), "sps.rdz" )
     # Downloads.download(fn, fndat )  # save rdz locally
 
@@ -2386,8 +2353,8 @@ First save a copy of rdata to a local directory ("outdir")
 yrs = 1999:2024
 
 homedir = Sys.getenv()[["HOME"]]
-scriptsdir = file.path( homedir, "projects", "model_covariance", "scripts" ) 
-outdir = file.path( homedir, "projects", "model_covariance", "data", "snowcrab" ) 
+scriptsdir = file.path( homedir, "projects", "bstm", "scripts" ) 
+outdir = file.path( homedir, "projects", "bstm", "data", "snowcrab" ) 
 
 source( file.path( scriptsdir, "snow_crab_survey_data.R" ) ) 
 
@@ -2402,7 +2369,7 @@ using DrWatson
 # rootdir = joinpath("\\", "home", "jae" ) # windows
 rootdir = joinpath("/", "home", "jae" )  # linux
 
-project_directory = joinpath( rootdir, "projects", "model_covariance"  )
+project_directory = joinpath( rootdir, "projects", "bstm"  )
 
 quickactivate(project_directory)
 
@@ -2594,7 +2561,7 @@ showall( summarize(msol) )
 ### Model 4: GP only (no space, no fixed effects)
 
 
-SEE: https://github.com/STOR-i/GaussianProcesses.jl/blob/master/notebooks/Regression.ipynb eqs 2-4
+SEE: https://github.com/STOR-i/GaussianProcesses.jl/blob/main/notebooks/Regression.ipynb eqs 2-4
 
 https://betanalpha.github.io/assets/case_studies/gaussian_processes.html
 
@@ -3146,10 +3113,10 @@ end
 ## Example 4: Snow crab habitat and abundance (Hurdle)
 
 See the INLA-based (Laplace-Approximation) implementation here:
-<https://github.com/jae0/bio.snowcrab/blob/master/inst/markdown/03.biomass_index_carstm.md>
+<https://github.com/jae0/bio.snowcrab/blob/main/inst/markdown/03.biomass_index_carstm.md>
 
 Here we re-implement this as a fully Bayesian process with Julia, Turing
-and the [supporting functions in this repository](https://github.com/jae0/model_covariance/)
+and the [supporting functions in this repository](https://github.com/mum0n/bstm/)
 
  
 
@@ -5366,11 +5333,11 @@ Test by varing the noise multiplier in step 3 to: 1.5 * randn(N).
 
 
 if Sys.iswindows()
-    project_directory = joinpath( "C:\\", "home", "jae", "projects", "model_covariance")  
+    project_directory = joinpath( "C:\\", "home", "jae", "projects", "bstm")  
 elseif Sys.islinux()
-    project_directory = joinpath( "/home", "jae", "projects", "model_covariance")
+    project_directory = joinpath( "/home", "jae", "projects", "bstm")
 else
-    project_directory = joinpath( "C:\\", "Users", "choij", "projects", "model_covariance")  # examples
+    project_directory = joinpath( "C:\\", "Users", "choij", "projects", "bstm")  # examples
 end
 
 include( joinpath( project_directory, "src", "gaussian_processes_functions.jl" ) )   
@@ -5878,11 +5845,11 @@ using Turing, FFTW, Distributions, LinearAlgebra, Plots, Random
 # define 'project_directory' as the location of the repository -- required
 
 if Sys.iswindows()
-    project_directory = joinpath( "C:\\", "home", "jae", "projects", "model_covariance")  
+    project_directory = joinpath( "C:\\", "home", "jae", "projects", "bstm")  
 elseif Sys.islinux()
-    project_directory = joinpath( "/home", "jae", "projects", "model_covariance")
+    project_directory = joinpath( "/home", "jae", "projects", "bstm")
 else
-    project_directory = joinpath( "C:\\", "Users", "choij", "projects", "model_covariance")  # examples
+    project_directory = joinpath( "C:\\", "Users", "choij", "projects", "bstm")  # examples
 end
 
 
