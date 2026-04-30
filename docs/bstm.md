@@ -51,7 +51,7 @@ To address the "SpatioTemporal Challenge," *bstm* utilizes three primary compone
 Failing to distinguish between a permanent habitat feature (captured by a spatial component) and a transient environmental anomaly (captured by the space-time interaction) results in biased forecasts. By isolating these effects, we ensure that our understanding and consequent management decisions are based on the "true" underlying drivers rather than statistical noise. This decomposition is made possible by the rigorous mathematical axioms that transform a computationally prohibitive problem into a tractable one.
  
 
-### Computation: 1. Getting started with the environment
+### Computation: Getting started with the environment
 
 As this document is structured like a notebook with explanations inter-spread with examples, let us get the Julia environment set up before anything else. Here we use [Julia](https://julialang.org/), as in my experience, it is a clear didactic tool and better for long-term learning and simultaneously use in large projects due to maintainability of the code-base and high performance. It is an open-source platform created by mathematicians, engineers, natural scientists, statisticians, computer scientists and machine learning specialists, each bringing the best from their respective fields and lessons learned from domain-specific software platforms in a coherent and performative fashion. At the time of this writing, there still remain some lingering issues (start up speed, recompilation of code and incompatibility creep when there are updates to any library, most already being addressed rapidly), but the speed that is offered and code clarity in exchange is worth it in any serious data manipulation efforts. Your mileage will vary, but the lessons learned are also easily transportable to R, python, matlab, octave, etc., if forced to use those platforms. They each have their own quirks and challenges, but until their eventual convergence into something (that will likely look a lot like Julia), it is still a great platform to learn, teach and operate/develop cutting edge work. Many learning tools exist. [Have a look here for a curated list](https://julialang.org/learning/). See the Appendices for more details.
 
@@ -72,6 +72,7 @@ Installing [Julia](https://julialang.org/) is best done with [juliaup](https://g
 
 ```{julia}
 
+# replace project_directory with location of your files
 if Sys.iswindows()
     project_directory = joinpath( "C:\\", "home", "jae", "projects", "bstm")  
 elseif Sys.islinux()
@@ -85,12 +86,40 @@ end
 # include( joinpath( project_directory, "src", "spatiotemporal_functions.jl" ) )       # support functions
 # include( joinpath( project_directory, "src", "spatiotemporal_turing_models.jl" ) )     # Turing models
 
-include( joinpath( project_directory, "scripts", "startup.jl" ) ) # support functions   
+include( joinpath( project_directory, "scripts", "startup.jl" ) ) # might need to run this a few times if there are stragglers   
 
 
 ```
+
+### Simulated base data
+
+With all required libraries and functions available, we can create some test data for use in comparing methods in the remainder of this notebook. 
+
+
+```{julia}
  
-### The Core Assumptions
+n_pts = 100  # spatial locations
+n_time = 30  # time slices ("years")
+ 
+data = generate_sim_data(n_pts, n_time; rndseed=42);
+
+# introspection of data:
+keys(data)
+pairs(data)
+Dict(k => size(v) for (k, v) in pairs(data))
+
+# extract some quantities for demonstrations
+(; pts, y_sim, y_binary, time_idx, weights, trials, cov_indices) = data  # this is a simple way to select what to retain
+
+# view the data density
+plot_kde_simple(pts, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+ 
+```
+
+
+ 
+ 
+## Core Assumptions
 
 For *bstm*s, there are four main features help us to move from a "naive" $O(N^3)$ Gaussian Process complexity to $O(N)$ or $O(N \log N)$ operational tractability. 
 
@@ -117,9 +146,12 @@ Rank-Deficiency:
     - Using a Sum-to-Zero Constraint ($\sum u_i = 0$) "pins" the latent field to a mean of zero, so the global intercept is preserved as the true overall mean of the response. This means the spatial effect effectively captures only the deviations from the mean, so highlighting which areas are geographically anomalous. This is very much the approach that was using in the early Universal Kriging with External Drift (UKED). This also has the benefit of stabilizing computations, by preventing MCMC chains from wandering along an infinite "ridge" of equally likely values, and so supporting convergence.
 
     - Implementation Note: While "Soft Constraints" (penalty methods) exist, Explicit Re-centering (subtracting the empirical mean during each iteration) is the preferred method for maintaining stability within the NUTS sampler.
+
+
+
+
  
- 
-###  Partitioning the Map: Areal Units and Information Balance
+##  Partitioning the Map: Areal Units and Information Balance
 
 For discrete *bstm*s, we must discretize the spatial domain into "Areal Units." A well-constructed partition balances geometric compactness with statistical information density to avoid "Data Starvation." Or sometimes, one inherits management areal units, often with no structural support. Though one can simply push on using such area definitions, if the balance of information available to information extractable is poor due to improper sizes and shapes, one should consider alternative areal units which then can be reconsolidated to estimate at the level of the unfortunate management units.   
 
@@ -132,6 +164,452 @@ Amongst the partitionning methods available in *bstm* are:
 - Quadrant Voronoi Tessellation (QVT): A quadtree-like decomposition that excels at capturing multi-scale spatial clusters and density transitions.
 
 - Agglomerative Voronoi Tessellation (AVT): An iterative merging approach that balances multiple constraints upon the data that iteratively aggregates small areal units until stopping rules are met. It also begins with KDE to identify initial conditions. 
+
+
+### Implementation: Spatial partitioning
+
+Using our basic spatiotemporal data, let us try to represent them in a discrete manner across space. This is a necessary step if we wish to use the more speedy discrete models. Depending upon the constraints chosen, the spatial partitioning will change. Here, there is some subjectivity in the choice of constraints. The primary one to pay attention is: do we have enough data to represent spatial and  temporal processes. The answer to this depends upon the homogeneity/variability across space and time. In our case, we would like at least 5 time slices represented in each cell and enough total data points in each cell. Stopping conditions are based upon range of allowable total areal units, range of surface areas, and convergence of mean and coefficient of variation of number of points per cell. Adding more is simple as these are simple functions. See [spatial_partitioning_functions.jl](src/spatial_partitioning_functions.jl) for more details. 
+
+
+```{julia}
+
+ntot = size(pts, 1) 
+
+min_time_slices = 5
+target_density = 20 # number per areal unit 
+target_units = Int(floor( ntot / target_density ))
+min_total_arealunits = target_units / 10
+max_total_arealunits = target_units * 10
+min_points = 1
+max_points = Int(floor(ntot / min_total_arealunits ))
+min_area = 0.5
+max_area = 9
+cv_min = 1
+buffer_dist = 0.8
+tolerance = 0.05
+
+
+test_configs = [ :cvt, :kvt, :qvt, :bvt, :avt ] # these are the currently available methods
+
+results = []
+plots = []
+
+for m in test_configs
+    println("Testing method: $m")
+    local au
+    try
+        au = assign_spatial_units( pts, m;
+            target_units = target_units,
+            min_total_arealunits=min_total_arealunits,
+            max_total_arealunits=max_total_arealunits,
+            min_time_slices = min_time_slices,
+            time_idx = time_idx,
+            buffer_dist=buffer_dist,
+            tolerance=tolerance,
+            cv_min=cv_min,
+            min_points=min_points,
+            max_points=max_points,
+            min_area=min_area,
+            max_area=max_area)
+
+        met = calculate_metrics(au)
+
+        # copy results into an output list
+        push!(results, (
+          method=m,
+          units=length(au.centroids),
+          mean_dens=met.mean_density,
+          sd_dens=met.sd_density,
+          cv_dens=met.cv_density,
+          termination=au.termination_reason
+        ))
+
+        p = plot_spatial_graph( au; title="Method: $m", domain_boundary=au.hull_coords)
+
+        # copy plot to an output list
+        push!(plots, p)
+    catch e
+        @error "Method $m failed: $e"
+    end
+end
+
+if !isempty(results)
+    display(DataFrame(results))
+    display(Plots.plot(plots..., layout=(3, 2), size=(600, 800)))
+end
+
+```
+
+Conclusion: All methods seem reasonable, but AVT provides most control and usually the lowest density and SD and CV. When the CV approaches 1, it represents a Poisson-like spatial distribution. Higher means clustered and lower means homogenous. We want some structure/clusters but not so much that we have unreliable data. 
+
+ 
+### Scottish lip cancer data  
+
+The [Scottish Lip Cancer data](https://mc-stan.org/users/documentation/case-studies/icar_stan.html) has been studied by many platforms. There are 56 areal units. We do not have access to the map positional data, but we do have the adjacency information from which we can infer approximate spatial topology:  
+  
+```{julia}  
+
+data_scot = scottish_lip_cancer_data_spacetime(); # additional noise and "fake" time slices added
+
+# introspection of data:
+keys(data_scot)
+pairs(data_scot)
+Dict(k => size(v) for (k, v) in pairs(data_scot) if k != :au )  # skip "au" 
+
+au_scot = data_scot.au ; 
+plot_spatial_graph( au_scot; title="Lip Cancer Inferred Locations", domain_boundary=au_scot.hull_coords)
+
+pts_scot = data_scot.pts  # inferred locations (centroids)
+plot_kde_simple(pts_scot, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+  
+
+
+ 
+```
+
+In the data Tuple (*data_scot*), we now have counts (y) of cancer incidence and population size in each area (log_offset). We also simulate a 10-"year" temporal process, a random walk with magnitude 0.5 and a covariate effect (X: an area-specific continuous covariate that represents the proportion of the population employed in agriculture, fishing, or forestry). An overall random uniform observation error of magnitude 0.2 is added with a count then taken as the overall, rounded integer value.
+
+
+#### Spatiotemporal model of Scottish lip cancers
+
+Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see the workflow. 
+
+We reformat this data Tuple (*data_scot*) further with 'prepare_model_inputs()' to create structured inputs for a (separable) spatiotemporal model (model_v0_poisson_simple).  
+ 
+```{julia}
+ 
+# prepapre model inputs  
+
+modinputs = prepare_model_inputs( 
+  y = data_scot.y,         # y-value
+  area_idx = data_scot.area_idx,  # space index
+  time_idx = data_scot.time_idx,  # time index
+  offset = data_scot.log_offset, # offsets
+  W_sym = data_scot.W  # matrix adjacency
+)
+
+# create model and sample 
+mod = model_v0_poisson_simple(modinputs) # Turing model object
+chain = sample(mod, MH(), 5000; num_warmup=10000, thin=50, progress=true, drop_warmup=true )  # sample with Metropolis-Hastings
+
+# extract results
+results = model_results_comprehensive(mod, chain, modinputs, au_scot);
+println("WAIC: ", round(results.waic, digits=2)) 
+
+# Display visual diagnostics
+display(results.plots.ppc.plot_scatter)
+display(results.plots.temporal)
+display(results.plots.spatial)
+display(results.plots.st_denoised)
+display(results.plots.st_noisy)
+ 
+```
+
+The results are "ok". But lots of room for improvement.
+
+
+### Finalize simulated data 
+
+As we are now more or less ready to study the spatiotemporal models, we need to agree upon a spatial partitioning for the discrete models. To be sure, we will start from scratch and used the Agglomerative Voronoi Tesselation (:avt) method with a slightly larger tolerance for convergence which causes the algorithm to stop earlier and so have fewer spatial units. 
+
+```{julia}
+n_pts = 100
+n_time = 15
+ 
+data = generate_sim_data(n_pts, n_time; rndseed=42); # regenerate data
+
+(; pts, y_sim, y_binary, time_idx, weights, trials, cov_indices) = data
+ntot = size(pts, 1) 
+
+min_time_slices = 5
+target_density = 20 # number per areal unit 
+target_units = Int(floor( ntot / target_density ))
+min_total_arealunits = target_units / 10
+max_total_arealunits = target_units * 10
+min_points = 1
+max_points = Int(floor(ntot / min_total_arealunits ))
+min_area = 0.5
+max_area = 9
+cv_min = 1
+buffer_dist = 0.8
+tolerance = 0.1
+method = :avt
+
+au = assign_spatial_units( pts, method;
+  target_units = target_units,
+  min_total_arealunits=min_total_arealunits,
+  max_total_arealunits=max_total_arealunits,
+  min_time_slices = min_time_slices,
+  time_idx = time_idx,
+  buffer_dist=buffer_dist,
+  tolerance=tolerance,
+  cv_min=cv_min,
+  min_points=min_points,
+  max_points=max_points,
+  min_area=min_area,
+  max_area=max_area)
+
+
+p = plot_spatial_graph( au; title="Method: $method", domain_boundary=au.hull_coords)
+
+ 
+```
+
+### Model variations 
+
+
+```{julia}
+
+# Setup shared precomputations
+n_categories = 13  # how many groups are used for discretization of covariates (when used)
+
+# adjust y variable for different model families
+modinputs_gaussian = prepare_model_inputs(
+  y = y_sim, 
+  area_idx = au.assignments, 
+  time_idx = time_idx, 
+  W_sym = au.W, 
+  n_cat = n_categories
+)
+
+modinputs_count = merge(modinputs_gaussian, (y=data.y_counts,))
+
+modinputs_binomial = merge(modinputs_gaussian, (y=data.y_binary,))
+
+modinputs_lognormal = merge(modinputs_gaussian, (y=exp.(data.y_sim),))  
+ 
+
+# use these:
+sampler_v1 = optimal_samplers_bstm("v1")
+
+
+# Define the full model set with corrected data inputs for count families
+models_to_bench = Dict(
+    "v1_gaussian"         => () -> model_v1_gaussian(modinputs_gaussian),
+    "v2_rff_gaussian"     => () -> model_v2_rff_gaussian(modinputs_gaussian),
+    "v3_lognormal"        => () -> model_v3_lognormal(modinputs_lognormal),
+    "v4_binomial"         => () -> model_v4_binomial(modinputs_binomial; trials=data.trials),
+    "v5_poisson"          => () -> model_v5_poisson(modinputs_count),
+    "v6_negativebinomial" => () -> model_v6_negativebinomial(modinputs_count),
+    "v7_deep_gp_binomial" => () -> model_v7_deep_gp_binomial(modinputs_binomial; trials=data.trials),
+    "v8_deep_gp_gaussian" => () -> model_v8_deep_gp_gaussian(modinputs_gaussian),
+    "v9_continuous_gaussian" => () -> model_v9_continuous_gaussian(data.cov_continuous, modinputs_gaussian),
+    "v10_deep_gp_3layer"  => () -> model_v10_deep_gp_3layer_gaussian(modinputs_gaussian)
+)
+
+n_bench_iters = 500
+bench_results = Dict{String, Float64}()
+
+for m_key in sort(collect(keys(models_to_bench)))
+    print("Benchmarking $m_key... ")
+    try
+        m_instance = models_to_bench[m_key]()
+        t = @elapsed sample(m_instance, NUTS(), n_bench_iters; progress=false)
+        bench_results[m_key] = t
+        println("$(round(t, digits=2))s")
+    catch e
+        println("FAILED")
+        bench_results[m_key] = NaN
+    end
+end
+
+
+
+
+
+
+# --- Display Summary Table ---
+println("\n" * "="^35)
+println(rpad("Model", 25), " | ", "Time (s)")
+println("-"^35)
+for m_key in sort(collect(keys(bench_results)))
+    time_val = isnan(bench_results[m_key]) ? "Error" : string(round(bench_results[m_key], digits=2))
+    println(rpad(m_key, 25), " | ", time_val)
+end
+println("="^35)
+
+
+
+# ---------- to view so plots:
+
+mod_fns =  collect(keys(model_registry))
+
+i = 1 # 1:9
+
+@load_carstm_state( mod_fns[i] )
+
+using Turing
+
+# 1. Instantiate Model v2
+mod_v2 = model_v2_rff_gaussian(modinputs)
+
+# 2. Define the Optimized Gibbs Sampler
+# We partition the parameters by their mathematical properties
+optimal_gibbs = Gibbs(
+    # Gaussian Latents: Use ESS for optimal movement without tuning
+    (:u_icar, :u_iid, :w_trend, :w_seas, :st_int_raw) => ESS(),
+
+    # Regression Coefficients: Use NUTS for adaptive gradient-based exploration
+    (:beta_cov) => NUTS(),
+
+    # Variance Components: Use MH for simple scalar parameters
+    (:sigma_y, :sigma_sp, :phi_sp, :sigma_trend, :sigma_seas, :sigma_int, :sigma_rw2) => MH()
+)
+
+# 3. Execute Production-Scale Sampling
+# Running a moderate chain for verification; scale iterations to 2000+ for production
+println("Starting Optimized Mixed-Sampler Gibbs for Model 2...")
+chain_v2_optimized = sample(mod_v2, optimal_gibbs, 10; progress=true)
+ 
+ 
+
+# --- MAP Optimization Benchmarking ---
+# Maximum A Posteriori (MAP) provides a point estimate by maximizing the posterior density.
+
+using Turing, Optim
+
+println("Running MAP Optimization for model_v1_gaussian...")
+
+# 1. Instantiate the model using the stable precomputations
+m_v1 = model_v1_gaussian(modinputs)
+
+# 2. Perform MAP optimization using the correct library path
+# Using Optim.optimize directly to avoid ambiguity and fix the module nesting error
+t_map = @elapsed begin
+    map_res_v1 = maximum_a_posteriori(m_v1 )
+end
+
+println("Optimization finished in $(round(t_map, digits=2)) seconds.")
+
+# 3. Display summary of estimates
+println("\n--- MAP Estimates for Model V1 ---")
+display(map_res_v1)
+
+
+chain = sample(m_v1, NUTS(), 1_000; initial_params=InitFromParams(map_res_v1))
+
+
+
+# ---------
+
+map_results = Dict{String, Any}()
+
+println("Starting Suite MAP Optimization...\n")
+
+for m_key in sort(collect(keys(models_to_bench)))
+    print("Optimizing $m_key (MAP)... ")
+    try
+        m_instance = models_to_bench[m_key]()
+        # Use LBFGS for numerical optimization of the log-joint
+        t = @elapsed begin
+            map_res = optimize(m_instance, MAP())
+        end
+        map_results[m_key] = (result = map_res, time = t)
+        println("$(round(t, digits=2))s")
+    catch e
+        println("FAILED")
+        map_results[m_key] = nothing
+    end
+end
+
+# --- Display MAP Summary ---
+println("\n" * "="^45)
+println(rpad("Model", 25), " | ", rpad("Time (s)", 10), " | ", "LP")
+println("-"^45)
+for m_key in sort(collect(keys(map_results)))
+    if !isnothing(map_results[m_key])
+        res = map_results[m_key]
+        lp = round(res.result.lp, digits=2)
+        println(rpad(m_key, 25), " | ", rpad(string(round(res.time, digits=2)), 10), " | ", lp)
+    else
+        println(rpad(m_key, 25), " | ", "Error")
+    end
+end
+println("="^45)
+
+
+
+# ----- 
+# Variational Inference
+ using Turing, AdvancedVI
+
+using AdvancedVI
+
+# 1. Setup the ADVI algorithm
+# Using 1 sample for the gradient estimate and 1000 iterations
+advi = ADVI(1, 1000)
+
+# 2. Run the optimization
+println("Starting ADVI for model_v1_gaussian...")
+t_vi = @elapsed begin
+    q_v1 = vi(m_v1, advi)
+end
+
+println("ADVI finished in $(round(t_vi, digits=2)) seconds.")
+
+
+using Optim
+
+# 1. Optimized MAP with L-BFGS
+# We pass specific Optim options to allow for better convergence monitoring
+println("Starting Optimized MAP (L-BFGS)...")
+map_res_optimized = optimize(m_v1, MAP(), LBFGS())
+
+# 2. Optimized ADVI (Multi-sample gradient)
+# ADVI(n_samples, n_iterations)
+# Increasing samples to 10 reduces noise in high-dimensional ST fields
+println("Starting Optimized ADVI (10 samples per grad)...")
+advi_optimized = ADVI(10, 1500)
+q_v1_opt = vi(m_v1, advi_optimized)
+
+println("Optimization Complete.")
+
+
+
+
+vi_results = Dict{String, Any}()
+n_vi_iters = 1000
+
+println("Starting Suite Variational Inference (ADVI)...")
+
+for m_key in sort(collect(keys(models_to_bench)))
+    print("Running VI for $m_key... ")
+    try
+        m_instance = models_to_bench[m_key]()
+
+        # Standard Mean-Field ADVI
+        advi = ADVI(1, n_vi_iters)
+
+        t = @elapsed begin
+            # Solve for the variational posterior
+            q = vi(m_instance, advi)
+        end
+
+        vi_results[m_key] = (dist = q, time = t)
+        println("$(round(t, digits=2))s")
+    catch e
+        println("FAILED: $e")
+        vi_results[m_key] = nothing
+    end
+end
+
+# --- Display VI Summary Table ---
+println("\n" * "="^45)
+println(rpad("Model", 25), " | ", rpad("Time (s)", 10))
+println("-"^45)
+for m_key in sort(collect(keys(vi_results)))
+    if !isnothing(vi_results[m_key])
+        res = vi_results[m_key]
+        println(rpad(m_key, 25), " | ", rpad(string(round(res.time, digits=2)), 10))
+    else
+        println(rpad(m_key, 25), " | ", "Error")
+    end
+end
+println("="^45)
+
+```
+
+
 
  
 ###  Advanced Topics: RFF, Deep GPs, and Scaling
@@ -186,12 +664,13 @@ This is the key RFF feature map. The original input $x$ (a $1 \times D$ vector) 
 
 By leveraging RFFs, we can apply kernel methods to much larger datasets than would be feasible with exact kernel computations, making them powerful tools for scalable Bayesian modeling.
 
-#### Julia Example: Implementing Random Fourier Features
+#### Implementation: Random Fourier Features
 
 A basic RFF transformation for a Squared Exponential (RBF) kernel and how it can approximate the original kernel. We'll reuse the `rff_map` helper function defined earlier.
 
 
 ```{julia}
+using KernelMAtrix
 
 D_in_example = 2 # 2D input space
 M_rff_example = 100 # Number of RFF features
@@ -388,60 +867,6 @@ This model moves beyond separable interactions by defining a kernel $K(\mathbf{s
 
 ```{julia}
 
-@model function model_v11_non_separable_rff(modinputs, ::Type{T}=Float64; m_joint=25, offset=modinputs.offset, weights=modinputs.weights) where {T}
-    # Model v11: Non-Separable Spatiotemporal RFF model.
-    # Instead of separate spatial and temporal components, this model projects
-    # the joint [X, Y, Time] vector into a shared feature space.
-
-    y = modinputs.y
-    N_obs = length(y)
-    
-    # --- 1. Priors ---
-    sigma_y ~ Exponential(1.0)
-    sigma_joint ~ Exponential(1.0)
-    # Lengthscales for X, Y, and Time dimensions within the joint kernel
-    l_joint ~ filldist(Gamma(2, 1), 3) 
-    w_joint ~ MvNormal(zeros(m_joint), I)
-    sigma_rw2 ~ filldist(Exponential(1.0), 4)
-
-    # --- 2. Feature Matrix Construction ---
-    # X_joint: [normalized_x, normalized_y, normalized_time]
-    # We use modinputs.pts_raw and normalize them for numerical stability
-    xs = [p[1] for p in modinputs.pts_raw]
-    ys = [p[2] for p in modinputs.pts_raw]
-    ts = Float64.(modinputs.time_idx)
-    
-    # Normalize inputs to [0, 1] range
-    X_joint = hcat(
-        (xs .- minimum(xs)) ./ (maximum(xs) - minimum(xs) + 1e-6),
-        (ys .- minimum(ys)) ./ (maximum(ys) - minimum(ys) + 1e-6),
-        (ts .- minimum(ts)) ./ (maximum(ts) - minimum(ts) + 1e-6)
-    )
-
-    # --- 3. Joint RFF Projection ---
-    # This creates the non-separable interaction
-    Random.seed!(42)
-    # Sample frequencies scaled by dimension-specific lengthscales
-    Om = randn(m_joint, 3) .* (1.0 ./ l_joint')
-    Ph = rand(m_joint) .* convert(T, 2π)
-    
-    Z_joint = convert(T, sqrt(2/m_joint)) .* cos.(X_joint * Om' .+ Ph')
-    eta_joint = Z_joint * (w_joint .* sigma_joint)
-
-    # --- 4. Categorical Smoothing (RW2) ---
-    beta_cov = [Vector{T}(undef, modinputs.n_cats) for _ in 1:4]
-    for k in 1:4
-        beta_cov[k] ~ MvNormal(zeros(modinputs.n_cats), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (modinputs.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
-    end
-
-    # --- 5. Likelihood ---
-    for i in 1:N_obs
-        mu = offset[i] + eta_joint[i]
-        for k in 1:4; mu += beta_cov[k][modinputs.cov_indices[i, k]]; end
-        Turing.@addlogprob! weights[i] * logpdf(Normal(mu, sigma_y), y[i])
-    end
-end
  # Verification run for Model v11
 println("Running smoke test for Model v11 (Non-Separable RFF)... ")
 
@@ -471,60 +896,6 @@ Instead of the discrete BYM2/ICAR graph structure used in Model v1, Model v12 ad
 
 ```{julia}
 
-@model function model_v12_spde_gaussian(modinputs, ::Type{T}=Float64; m_spatial=50, offset=modinputs.offset) where {T}
-    # Model v12: SPDE-style continuous spatial field using spectral RFF approximation.
-    y = modinputs.y
-    N_obs = length(y)
-    N_time = maximum(modinputs.time_idx)
-
-    # --- 1. SPDE / Matern Priors ---
-    sigma_y ~ Exponential(1.0)
-    sigma_sp ~ Exponential(1.0)
-    kappa_sp ~ Gamma(2, 1)  # Range parameter (1/lengthscale)
-    w_sp ~ MvNormal(zeros(m_spatial), I)
-
-    # --- 2. Temporal (AR1) & Smoothing Priors ---
-    sigma_tm ~ Exponential(1.0)
-    rho_tm ~ Beta(2, 2)
-    sigma_rw2 ~ filldist(Exponential(1.0), 4)
-
-    # --- 3. Continuous Spatial Basis (Spectral SPDE) ---
-    # Normalize points for spectral projection
-    xs = [p[1] for p in modinputs.pts_raw]
-    ys = [p[2] for p in modinputs.pts_raw]
-    coords = hcat(
-        (xs .- mean(xs)) ./ std(xs),
-        (ys .- mean(ys)) ./ std(ys)
-    )
-
-    Random.seed!(42)
-    # Frequencies sampled for a Matern kernel approximation
-    # Note: For Matern nu=1.5, we sample from a Student-t distribution spectral density
-    Om = randn(m_spatial, 2) .* kappa_sp
-    Ph = rand(m_spatial) .* convert(T, 2π)
-    
-    Z_sp = convert(T, sqrt(2/m_spatial)) .* cos.(coords * Om' .+ Ph')
-    s_eff = Z_sp * (w_sp .* sigma_sp)
-
-    # --- 4. Temporal Effect (AR1) ---
-    Q_ar1 = (1.0 / (1.0 - rho_tm^2)) .* (modinputs.Q_ar1_template + (rho_tm^2) * I)
-    f_tm_raw ~ MvNormal(zeros(N_time), I)
-    Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
-    f_time = f_tm_raw .* sigma_tm
-
-    # --- 5. Categorical & Likelihood ---
-    beta_cov = [Vector{T}(undef, modinputs.n_cats) for _ in 1:4]
-    for k in 1:4
-        beta_cov[k] ~ MvNormal(zeros(modinputs.n_cats), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (modinputs.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
-    end
-
-    for i in 1:N_obs
-        mu = offset[i] + s_eff[i] + f_time[modinputs.time_idx[i]]
-        for k in 1:4; mu += beta_cov[k][modinputs.cov_indices[i, k]]; end
-        Turing.@addlogprob! modinputs.weights[i] * logpdf(Normal(mu, sigma_y), y[i])
-    end
-end
 
 # Verification of SPDE Model v12
 println("Initializing SPDE Model v12...")
@@ -546,68 +917,6 @@ Standard GP and SPDE models assume **stationarity**: the correlation between two
 
 
 ```{julia}
-
-@model function model_v13_nonstationary_warping(modinputs, ::Type{T}=Float64; m_warp=10, m_spatial=40, offset=modinputs.offset) where {T}
-    y = modinputs.y
-    N_obs = length(y)
-    N_time = maximum(modinputs.time_idx)
-
-    # --- 1. Priors ---
-    sigma_y ~ Exponential(1.0)
-    sigma_sp ~ Exponential(1.0)
-    l_warp ~ Gamma(2, 1)    # Smoothness of the warping manifold
-    l_spatial ~ Gamma(2, 1) # Smoothness of the stationary field in warped space
-    
-    w_warp ~ MvNormal(zeros(m_warp), I)
-    w_sp ~ MvNormal(zeros(m_spatial), I)
-    
-    sigma_tm ~ Exponential(1.0)
-    rho_tm ~ Beta(2, 2)
-    sigma_rw2 ~ filldist(Exponential(1.0), 4)
-
-    # --- 2. Input Preprocessing ---
-    xs = [p[1] for p in modinputs.pts_raw]
-    ys = [p[2] for p in modinputs.pts_raw]
-    coords = hcat((xs .- mean(xs)) ./ std(xs), (ys .- mean(ys)) ./ std(ys))
-
-    # --- 3. Warping Layer (Non-Stationarity) ---
-    # This layer 'warps' the 2D coordinates into a latent space
-    Random.seed!(44)
-    Om_w = randn(m_warp, 2) ./ l_warp
-    Ph_w = rand(m_warp) .* convert(T, 2π)
-    
-    # Warped coordinates: g(s)
-    warped_coords = (convert(T, sqrt(2/m_warp)) .* cos.(coords * Om_w' .+ Ph_w')) * w_warp
-
-    # --- 4. Spatial Field on Warped Manifold ---
-    # We apply a stationary kernel to the warped output
-    Random.seed!(45)
-    Om_s = randn(m_spatial, 1) ./ l_spatial
-    Ph_s = rand(m_spatial) .* convert(T, 2π)
-    
-    Z_sp = convert(T, sqrt(2/m_spatial)) .* cos.(reshape(warped_coords, :, 1) * Om_s' .+ Ph_s')
-    s_eff = Z_sp * (w_sp .* sigma_sp)
-
-    # --- 5. Temporal & Categorical Components ---
-    Q_ar1 = (1.0 / (1.0 - rho_tm^2)) .* (modinputs.Q_ar1_template + (rho_tm^2) * I)
-    f_tm_raw ~ MvNormal(zeros(N_time), I)
-    Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
-    f_time = f_tm_raw .* sigma_tm
-
-    beta_cov = [Vector{T}(undef, modinputs.n_cats) for _ in 1:4]
-    for k in 1:4
-        beta_cov[k] ~ MvNormal(zeros(modinputs.n_cats), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (modinputs.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
-    end
-
-    # --- 6. Likelihood ---
-    for i in 1:N_obs
-        mu = offset[i] + s_eff[i] + f_time[modinputs.time_idx[i]]
-        for k in 1:4; mu += beta_cov[k][modinputs.cov_indices[i, k]]; end
-        Turing.@addlogprob! modinputs.weights[i] * logpdf(Normal(mu, sigma_y), y[i])
-    end
-end
-
 
 # Verification of Non-Stationary Warping Model v13
 println("Initializing Non-Stationary Model v13...")
@@ -634,92 +943,10 @@ Model v14 leverages the **Spectral Representation** of the spatial precision mat
 This provides a massive speedup for large $N$ by avoiding $O(N^2)$ sparse matrix operations or $O(N^3)$ factorizations in every log-density evaluation.
 
 
-```{julia}using FFTW
-
-@model function model_v14_fft_gaussian(modinputs, ::Type{T}=Float64; grid_res=64, pad_factor=2, offset=modinputs.offset) where {T}
-    # Model v14 Refined: FFT-Accelerated GMRF
-    y = modinputs.y
-    N_obs = length(y)
-    N_areas = size(modinputs.Q_sp, 1)
-    N_time = maximum(modinputs.time_idx)
-    
-    padded_res = grid_res * pad_factor
-    
-    # --- 1. Priors ---
-    sigma_y ~ Exponential(1.0)
-    sigma_sp ~ Exponential(1.0)
-    phi_sp ~ Beta(1, 1)
-    sigma_tm ~ Exponential(1.0)
-    rho_tm ~ Beta(2, 2)
-    sigma_rw2 ~ filldist(Exponential(1.0), 4)
-
-    # --- 2. Spectral Spatial Field (FFT) ---
-    # We sample in the frequency domain for the ICAR component
-    # A padded grid of white noise
-    u_spectral_raw ~ MvNormal(zeros(padded_res^2), I)
-    u_iid ~ MvNormal(zeros(N_areas), I)
-
-    # Reshape and perform FFT
-    u_fft = fft(reshape(convert.(Complex{T}, u_spectral_raw), padded_res, padded_res))
-    
-    # Apply a simplified Spectral Matern/Laplacian Filter
-    # In a full version, we'd use analytic eigenvalues of the Laplacian
-    # For this version, we use the scaled spatial precision for the structured part
-    u_icar_raw = modinputs.Q_sp \ u_spectral_raw[1:N_areas]
-    
-    s_eff = sigma_sp .* (sqrt(phi_sp) .* u_icar_raw .+ sqrt(1 - phi_sp) .* u_iid)
-
-    # --- 3. Temporal (AR1) ---
-    Q_ar1 = (1.0 / (1.0 - rho_tm^2)) .* (modinputs.Q_ar1_template + (rho_tm^2) * I)
-    f_tm_raw ~ MvNormal(zeros(N_time), I)
-    Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
-    f_time = f_tm_raw .* sigma_tm
-
-    # --- 4. Categorical Effects ---
-    beta_cov = [Vector{T}(undef, modinputs.n_cats) for _ in 1:4]
-    for k in 1:4
-        beta_cov[k] ~ MvNormal(zeros(modinputs.n_cats), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (modinputs.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
-    end
-
-    # --- 5. Likelihood ---
-    for i in 1:N_obs
-        mu = offset[i] + s_eff[modinputs.area_idx[i]] + f_time[modinputs.time_idx[i]]
-        for k in 1:4; mu += beta_cov[k][modinputs.cov_indices[i, k]]; end
-        Turing.@addlogprob! modinputs.weights[i] * logpdf(Normal(mu, sigma_y), y[i])
-    end
-end
+```{julia}
+using FFTW
 
 using SparseArrays, FFTW, Statistics
-
-function prepare_fft_grid(pts, values; grid_res=64, pad_factor=2)
-    # 1. Define the bounding box
-    xs = [p[1] for p in pts]
-    ys = [p[2] for p in pts]
-    xmin, xmax = minimum(xs), maximum(xs)
-    ymin, ymax = minimum(ys), maximum(ys)
-
-    # 2. Map points to a grid
-    # Use the length of the shorter input to prevent BoundsError
-    n_limit = min(length(pts), length(values))
-    grid = zeros(grid_res, grid_res)
-
-    for i in 1:n_limit
-        p = pts[i]
-        ix = Int(floor((p[1] - xmin) / (xmax - xmin + 1e-6) * (grid_res - 1))) + 1
-        iy = Int(floor((p[2] - ymin) / (ymax - ymin + 1e-6) * (grid_res - 1))) + 1
-        grid[ix, iy] = values[i]
-    end
-
-    # 3. Apply Zero-Padding
-    padded_res = grid_res * pad_factor
-    padded_grid = zeros(padded_res, padded_res)
-
-    start_idx = Int(grid_res / 2)
-    padded_grid[start_idx:start_idx+grid_res-1, start_idx:start_idx+grid_res-1] .= grid
-
-    return padded_grid, (xmin, xmax, ymin, ymax)
-end
 
 println("Sampling from FFT-Accelerated Model v14...")
 
@@ -751,70 +978,6 @@ This approach is designed to be highly parallelizable, as local innovations can 
 
 using LinearAlgebra, SparseArrays, Random
 
-@model function model_v15_refined_mosaic(modinputs, ::Type{T}=Float64; n_mosaics=5, m_rff=20, offset=modinputs.offset) where {T}
-    y = modinputs.y
-    N_obs = length(y)
-    
-    # --- 1. Global & Hierarchical Priors ---
-    sigma_rw2 ~ filldist(Exponential(1.0), 4)
-    mu_global ~ Normal(0, 1)
-    sigma_mu_local ~ Exponential(1.0)
-
-    # Local Parameters per Mosaic
-    mu_local ~ filldist(Normal(mu_global, sigma_mu_local), n_mosaics)
-    l_local ~ filldist(Gamma(2, 1), n_mosaics)
-    sigma_local ~ filldist(Exponential(1.0), n_mosaics)
-    sigma_y_local ~ filldist(Exponential(1.0), n_mosaics) # Localized noise scale
-
-    # Weights for each mosaic's RFF field
-    w_local = [Vector{T}(undef, m_rff) for _ in 1:n_mosaics]
-    for m in 1:n_mosaics; w_local[m] ~ MvNormal(zeros(m_rff), I); end
-
-    # Categorical Covariates (Shared)
-    beta_cov = [Vector{T}(undef, modinputs.n_cats) for _ in 1:4]
-    for k in 1:4
-        beta_cov[k] ~ MvNormal(zeros(modinputs.n_cats), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (modinputs.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
-    end
-
-    # --- 2. Spatial Indexing & Soft Boundary Weights ---
-    coords = hcat([p[1] for p in modinputs.pts_raw], [p[2] for p in modinputs.pts_raw])
-    R = kmeans(coords', n_mosaics)
-    centroids = R.centers # 2 x n_mosaics
-
-    # Pre-sample RFF frequencies
-    Random.seed!(42)
-    Om_m = [randn(m_rff, 2) for _ in 1:n_mosaics]
-    Ph_m = [rand(m_rff) for _ in 1:n_mosaics]
-
-    # --- 3. Likelihood with Soft Integration ---
-    for i in 1:N_obs
-        pt = [coords[i,1], coords[i,2]]
-        
-        # Calculate Softmax weights based on distance to centroids for smooth stitching
-        dists = [sum((pt .- centroids[:, m]).^2) for m in 1:n_mosaics]
-        weights_stitching = exp.(-dists) ./ sum(exp.(-dists))
-        
-        eta_spatial_combined = zero(T)
-        sigma_y_combined = zero(T)
-        
-        for m in 1:n_mosaics
-            # Local RFF Field Calculation
-            z_proj = sqrt(2/m_rff) .* cos.( (Om_m[m] * pt ./ l_local[m]) .+ (Ph_m[m] .* 2π) )
-            local_field = mu_local[m] + dot(z_proj, w_local[m] .* sigma_local[m])
-            
-            # Blend local field and local noise
-            eta_spatial_combined += weights_stitching[m] * local_field
-            sigma_y_combined += weights_stitching[m] * sigma_y_local[m]
-        end
-
-        mu = offset[i] + eta_spatial_combined
-        for k in 1:4; mu += beta_cov[k][modinputs.cov_indices[i, k]]; end
-        
-        Turing.@addlogprob! modinputs.weights[i] * logpdf(Normal(mu, sigma_y_combined + 1e-6), y[i])
-    end
-end
-
 
 println("Running Refined Mosaic Model v15.1...")
 mod_v15_ref = model_v15_refined_mosaic(modinputs; n_mosaics=4, m_rff=15)
@@ -841,88 +1004,6 @@ This model is the synthesis of the project's development. It integrates:
 
 
 ```{julia}
-@model function model_v16_integrated_mosaic(modinputs, ::Type{T}=Float64; n_mosaics=4, m_rff=20, offset=modinputs.offset) where {T}
-    y = modinputs.y
-    N_obs = length(y)
-
-    # --- 1. Global Hierarchical Priors ---
-    sigma_rw2 ~ filldist(Exponential(1.0), 4)
-    mu_global ~ Normal(0, 1)
-    sigma_mu_local ~ Exponential(0.5)
-
-    # Shared Categorical Effects
-    beta_cov = [Vector{T}(undef, modinputs.n_cats) for _ in 1:4]
-    for k in 1:4
-        beta_cov[k] ~ MvNormal(zeros(modinputs.n_cats), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (modinputs.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
-    end
-
-    # --- 2. Local Mosaic Hyperparameters ---
-    mu_local ~ filldist(Normal(mu_global, sigma_mu_local), n_mosaics)
-
-    # Refactored: Use arraydist for joint lengthscales instead of a loop
-    l_joint ~ arraydist([filldist(Gamma(2, 1), 3) for _ in 1:n_mosaics])
-
-    sigma_local ~ filldist(Exponential(1.0), n_mosaics)
-    sigma_y_local ~ filldist(Exponential(1.0), n_mosaics)
-
-    # Local Weights for Non-Separable RFF
-    w_local = [Vector{T}(undef, m_rff) for _ in 1:n_mosaics]
-    for m in 1:n_mosaics; w_local[m] ~ MvNormal(zeros(m_rff), I); end
-
-    # --- 3. Geometric Indexing ---
-    xs = [p[1] for p in modinputs.pts_raw]
-    ys = [p[2] for p in modinputs.pts_raw]
-    ts = Float64.(modinputs.time_idx)
-
-    # Normalize [X, Y, T] to [0, 1] range for RFF stability
-    X_joint = hcat(
-        (xs .- minimum(xs)) ./ (maximum(xs) - minimum(xs) + 1e-6),
-        (ys .- minimum(ys)) ./ (maximum(ys) - minimum(ys) + 1e-6),
-        (ts .- minimum(ts)) ./ (maximum(ts) - minimum(ts) + 1e-6)
-    )
-
-    # Static centroids for stitching (calculated once)
-    coords_2d = X_joint[:, 1:2]
-    R = kmeans(coords_2d', n_mosaics)
-    centroids = R.centers
-
-    # Fixed RFF Frequencies
-    Random.seed!(42)
-    Om_base = [randn(m_rff, 3) for _ in 1:n_mosaics]
-    Ph_base = [rand(m_rff) for _ in 1:n_mosaics]
-
-    # --- 4. Predictive Synthesis ---
-    for i in 1:N_obs
-        pt_3d = X_joint[i, :]
-        pt_2d = pt_3d[1:2]
-
-        # Soft Boundary Weights (Softmax of distance to centroids)
-        dists = [sum((pt_2d .- centroids[:, m]).^2) for m in 1:n_mosaics]
-        weights_st = exp.(-dists) ./ sum(exp.(-dists))
-
-        eta_spatial_time = zero(T)
-        sigma_y_total = zero(T)
-
-        for m in 1:n_mosaics
-            # Scale base frequencies by local lengthscales [Lx, Ly, Lt]
-            # l_joint is now a matrix where each column corresponds to a mosaic
-            Om = Om_base[m] .* (1.0 ./ (l_joint[:, m] .+ 1e-6)')
-
-            # Local Non-Separable Field
-            z_proj = sqrt(2/m_rff) * cos.( (Om * pt_3d) .+ (Ph_base[m] .* 2π) )
-            local_field = mu_local[m] + dot(z_proj, w_local[m] .* sigma_local[m])
-
-            eta_spatial_time += weights_st[m] * local_field
-            sigma_y_total += weights_st[m] * sigma_y_local[m]
-        end
-
-        mu = offset[i] + eta_spatial_time
-        for k in 1:4; mu += beta_cov[k][modinputs.cov_indices[i, k]]; end
-
-        Turing.@addlogprob! modinputs.weights[i] * logpdf(Normal(mu, sigma_y_total + 1e-6), y[i])
-    end
-end
 println("Evaluating Integrated Spatiotemporal Mosaic (Model v16)... ")
 
 # Fix: Ensure pts_raw matches the length of y and time_idx
@@ -1019,445 +1100,6 @@ The *bstm* framework in Julia offers a robust, scalable environment for tackling
 
 
 
- 
-### Scottish lip cancer data 
-
-First we begin with a classic data set, the [Scottish Lip Cancer data](https://mc-stan.org/users/documentation/case-studies/icar_stan.html) which has been a standard to test upon. There are 56 areal units. We do not have access to the map positional data, but we do have the adjacency information from which we can infer approximate spatial topology:  
-  
-```{julia}  
-data = scottish_lip_cancer_data_spacetime();
-
-display(keys(data))
-display(Dict(k => size(v) for (k, v) in pairs(data) if k != :au))
-
-au = data.au ;
-
-  println("Number of units: ", length(au.centroids))
-  println("Graph connectivity: ", is_connected(au.graph))
-  
-  # approximate "map":
-  plt = plot_spatial_graph( au; title="Lip Cancer Inferred Map and Topology", domain_boundary=au.hull_coords)
-  display(plt)
-```
-
-In the data Tuple, we have counts (y) of cancer incidence and population size in each area is used as offsets (log_offset) in a simple Poisson model.  We also simulate a 10-"year" temporal process simulated as a random walk with magnitude 0.5 and a covariate effect (X: an area-specific continuous covariate that represents the proportion of the population employed in agriculture, fishing, or forestry). An overall random uniform observation error of magnitude 0.2 is added with a count then taken as the overall, rounded integer value.
-
-We reformat this data further with 'prepare_model_inputs()' to create structured inputs for the model. 
- 
-```{julia}
- 
-# prepapre model inputs  
-# Note: We pass n_cat which is used for the RW2 categorical smoothing priors
-ncats = 13 # dummy variable
-modinputs = prepare_model_inputs(data.y, pts, data.area_idx, data.time_idx, data.W, ncats )
-
-mod = model_v5_poisson(modinputs; use_zi=false)  # zi=false mean no zero-inflation (default)
-
-```
-
-Once defined, we can sample. We use a Gibbs sampling approach that permits alternative and optentially optimal samplers specific to each variable. 
-
-```{julia}
-
-# Define the Gibbs sampler tailored for Poisson
-optimal_gibbs_poisson = Gibbs(
-    (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(),
-    (:beta_cov) => NUTS(500, 0.65),
-    (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2, :phi_zi) => MH()
-)
-
-chain = sample(mod, optimal_gibbs_poisson, 200; progress=true)
-
-# required for waic computation:
-using LogExpFunctions: logistic
-using LogExpFunctions: logsumexp
-
-results = model_results_comprehensive(mod, chain, modinputs, au)
-
-println("WAIC: ", round(results.waic, digits=2))
-println("RMSE: ", round(results.rmse, digits=4))
-println("Pearson R: ", round(results.pearson_r, digits=4))
-
-# 4. Display visual diagnostics
-display(results.plots.ppc.plot_scatter)
-display(results.plots.temporal)
-
-display(results.plots.spatial)
-display(results.plots.st_denoised)
-display(results.plots.st_noisy)
-
-
-
-
-```
-
-
-### Simulated data
-
-```{julia}
-
-# Data Generation
-n_pts = 100
-n_time = 30
- 
-data = generate_sim_data(n_pts, n_time; rndseed=42);
-keys(data)
-pairs(data)
-Dict(k => size(v) for (k, v) in pairs(data))
-
-# extract quantities:
-(; pts, y_sim, y_binary, time_idx, weights, trials, cov_indices) = data
-
-plot_kde_simple(pts, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
- 
-# Define constraints for benchmarking
-# Ensure these are Integers to avoid MethodError in StatsBase.sample
-ntot = size(pts, 1) 
-
-min_time_slices = 5
-target_density = 20 # number per areal unit 
-target_units = Int(floor( ntot / target_density ))
-min_total_arealunits = target_units / 10
-max_total_arealunits = target_units * 10
-min_points = 1
-max_points = Int(floor(ntot / min_total_arealunits ))
-min_area = 0.5
-max_area = 9
-cv_min = 1
-buffer_dist = 0.8
-tolerance = 0.05
-
-test_configs = [ :cvt, :kvt, :qvt, :bvt, :avt ]
-
-results = []
-plots = []
-
-for m in test_configs
-    println("Testing method: $m")
-    local au
-    try
-        au = assign_spatial_units( pts, m;
-            target_units = target_units,
-            min_total_arealunits=min_total_arealunits,
-            max_total_arealunits=max_total_arealunits,
-            min_time_slices = min_time_slices,
-            time_idx = time_idx,
-            buffer_dist=buffer_dist,
-            tolerance=tolerance,
-            cv_min=cv_min,
-            min_points=min_points,
-            max_points=max_points,
-            min_area=min_area,
-            max_area=max_area)
-
-        met = calculate_metrics(au)
-        push!(results, (
-          method=m,
-          units=length(au.centroids),
-          mean_dens=met.mean_density,
-          sd_dens=met.sd_density,
-          cv_dens=met.cv_density,
-          termination=au.termination_reason
-        ))
-
-        p = plot_spatial_graph( au; title="Method: $m", domain_boundary=au.hull_coords)
-        push!(plots, p)
-    catch e
-        @error "Method $m failed: $e"
-    end
-end
-
-if !isempty(results)
-    display(DataFrame(results))
-    display(Plots.plot(plots..., layout=(3, 2), size=(600, 800)))
-end
-
-
-```
-
-Conclusion: All methods seem reasonable, but AVT seems to have lowest density and SD and CV.. approaches a Poisson distribution best.
-
-
-### Simulated data 
-
-```{julia}
-n_pts = 100
-n_time = 15
- 
-data = generate_sim_data(n_pts, n_time; rndseed=42);
-
-(; pts, y_sim, y_binary, time_idx, weights, trials, cov_indices) = data
-ntot = size(pts, 1) 
-
-min_time_slices = 5
-target_density = 20 # number per areal unit 
-target_units = Int(floor( ntot / target_density ))
-min_total_arealunits = target_units / 10
-max_total_arealunits = target_units * 10
-min_points = 1
-max_points = Int(floor(ntot / min_total_arealunits ))
-min_area = 0.5
-max_area = 9
-cv_min = 1
-buffer_dist = 0.8
-tolerance = 0.05
-method = :avt
-
-au = assign_spatial_units( pts, method;
-  target_units = target_units,
-  min_total_arealunits=min_total_arealunits,
-  max_total_arealunits=max_total_arealunits,
-  min_time_slices = min_time_slices,
-  time_idx = time_idx,
-  buffer_dist=buffer_dist,
-  tolerance=tolerance,
-  cv_min=cv_min,
-  min_points=min_points,
-  max_points=max_points,
-  min_area=min_area,
-  max_area=max_area)
-
-
-p = plot_spatial_graph( au; title="Method: $method", domain_boundary=au.hull_coords)
-
- 
-```
-
-### Model variations 
-
-
-```{julia}
-
-# Setup shared precomputations
-n_categories = 13
-
-modinputs_gaussian = prepare_model_inputs(y_sim, pts, au.assignments, time_idx, W_sym, n_categories)
-modinputs_count = prepare_model_inputs(y_count, pts, au.assignments, time_idx, W_sym, n_categories)
-modinputs_binomial = prepare_model_inputs(y_binary, pts, au.assignments, time_idx, W_sym, n_categories)
-modinputs_lognormal = prepare_model_inputs( log.(y_sim), pts, au.assignments, time_idx, W_sym, n_categories)
-
-
-
-# Define the full model set with corrected data inputs for count families
-models_to_bench = Dict(
-    "v1_gaussian"         => () -> model_v1_gaussian(modinputs_gaussian),
-    "v2_rff_gaussian"     => () -> model_v2_rff_gaussian(modinputs_gaussian),
-    "v3_lognormal"        => () -> model_v3_lognormal(modinputs_lognormal),
-    "v4_binomial"         => () -> model_v4_binomial(modinputs_binomial; trials=data.trials),
-    "v5_poisson"          => () -> model_v5_poisson(modinputs_count),
-    "v6_negativebinomial" => () -> model_v6_negativebinomial(modinputs_count),
-    "v7_deep_gp_binomial" => () -> model_v7_deep_gp_binomial(modinputs_binomial; trials=data.trials),
-    "v8_deep_gp_gaussian" => () -> model_v8_deep_gp_gaussian(modinputs_gaussian),
-    "v9_continuous_gaussian" => () -> model_v9_continuous_gaussian(data.cov_continuous, modinputs_gaussian),
-    "v10_deep_gp_3layer"  => () -> model_v10_deep_gp_3layer_gaussian(modinputs_gaussian)
-)
-
-n_bench_iters = 500
-bench_results = Dict{String, Float64}()
-
-for m_key in sort(collect(keys(models_to_bench)))
-    print("Benchmarking $m_key... ")
-    try
-        m_instance = models_to_bench[m_key]()
-        t = @elapsed sample(m_instance, NUTS(), n_bench_iters; progress=false)
-        bench_results[m_key] = t
-        println("$(round(t, digits=2))s")
-    catch e
-        println("FAILED")
-        bench_results[m_key] = NaN
-    end
-end
-
-# --- Display Summary Table ---
-println("\n" * "="^35)
-println(rpad("Model", 25), " | ", "Time (s)")
-println("-"^35)
-for m_key in sort(collect(keys(bench_results)))
-    time_val = isnan(bench_results[m_key]) ? "Error" : string(round(bench_results[m_key], digits=2))
-    println(rpad(m_key, 25), " | ", time_val)
-end
-println("="^35)
-
-
-
-# ---------- to view so plots:
-
-mod_fns =  collect(keys(model_registry))
-
-i = 1 # 1:9
-
-@load_carstm_state( mod_fns[i] )
-
-using Turing
-
-# 1. Instantiate Model v2
-mod_v2 = model_v2_rff_gaussian(modinputs)
-
-# 2. Define the Optimized Gibbs Sampler
-# We partition the parameters by their mathematical properties
-optimal_gibbs = Gibbs(
-    # Gaussian Latents: Use ESS for optimal movement without tuning
-    (:u_icar, :u_iid, :w_trend, :w_seas, :st_int_raw) => ESS(),
-
-    # Regression Coefficients: Use NUTS for adaptive gradient-based exploration
-    (:beta_cov) => NUTS(),
-
-    # Variance Components: Use MH for simple scalar parameters
-    (:sigma_y, :sigma_sp, :phi_sp, :sigma_trend, :sigma_seas, :sigma_int, :sigma_rw2) => MH()
-)
-
-# 3. Execute Production-Scale Sampling
-# Running a moderate chain for verification; scale iterations to 2000+ for production
-println("Starting Optimized Mixed-Sampler Gibbs for Model 2...")
-chain_v2_optimized = sample(mod_v2, optimal_gibbs, 10; progress=true)
- 
- 
-
-# --- MAP Optimization Benchmarking ---
-# Maximum A Posteriori (MAP) provides a point estimate by maximizing the posterior density.
-
-using Turing, Optim
-
-println("Running MAP Optimization for model_v1_gaussian...")
-
-# 1. Instantiate the model using the stable precomputations
-m_v1 = model_v1_gaussian(modinputs)
-
-# 2. Perform MAP optimization using the correct library path
-# Using Optim.optimize directly to avoid ambiguity and fix the module nesting error
-t_map = @elapsed begin
-    map_res_v1 = maximum_a_posteriori(m_v1 )
-end
-
-println("Optimization finished in $(round(t_map, digits=2)) seconds.")
-
-# 3. Display summary of estimates
-println("\n--- MAP Estimates for Model V1 ---")
-display(map_res_v1)
-
-
-chain = sample(m_v1, NUTS(), 1_000; initial_params=InitFromParams(map_res_v1))
-
-
-
-# ---------
-
-map_results = Dict{String, Any}()
-
-println("Starting Suite MAP Optimization...\n")
-
-for m_key in sort(collect(keys(models_to_bench)))
-    print("Optimizing $m_key (MAP)... ")
-    try
-        m_instance = models_to_bench[m_key]()
-        # Use LBFGS for numerical optimization of the log-joint
-        t = @elapsed begin
-            map_res = optimize(m_instance, MAP())
-        end
-        map_results[m_key] = (result = map_res, time = t)
-        println("$(round(t, digits=2))s")
-    catch e
-        println("FAILED")
-        map_results[m_key] = nothing
-    end
-end
-
-# --- Display MAP Summary ---
-println("\n" * "="^45)
-println(rpad("Model", 25), " | ", rpad("Time (s)", 10), " | ", "LP")
-println("-"^45)
-for m_key in sort(collect(keys(map_results)))
-    if !isnothing(map_results[m_key])
-        res = map_results[m_key]
-        lp = round(res.result.lp, digits=2)
-        println(rpad(m_key, 25), " | ", rpad(string(round(res.time, digits=2)), 10), " | ", lp)
-    else
-        println(rpad(m_key, 25), " | ", "Error")
-    end
-end
-println("="^45)
-
-
-
-# ----- 
-# Variational Inference
- using Turing, AdvancedVI
-
-using AdvancedVI
-
-# 1. Setup the ADVI algorithm
-# Using 1 sample for the gradient estimate and 1000 iterations
-advi = ADVI(1, 1000)
-
-# 2. Run the optimization
-println("Starting ADVI for model_v1_gaussian...")
-t_vi = @elapsed begin
-    q_v1 = vi(m_v1, advi)
-end
-
-println("ADVI finished in $(round(t_vi, digits=2)) seconds.")
-
-
-using Optim
-
-# 1. Optimized MAP with L-BFGS
-# We pass specific Optim options to allow for better convergence monitoring
-println("Starting Optimized MAP (L-BFGS)...")
-map_res_optimized = optimize(m_v1, MAP(), LBFGS())
-
-# 2. Optimized ADVI (Multi-sample gradient)
-# ADVI(n_samples, n_iterations)
-# Increasing samples to 10 reduces noise in high-dimensional ST fields
-println("Starting Optimized ADVI (10 samples per grad)...")
-advi_optimized = ADVI(10, 1500)
-q_v1_opt = vi(m_v1, advi_optimized)
-
-println("Optimization Complete.")
-
-
-
-
-vi_results = Dict{String, Any}()
-n_vi_iters = 1000
-
-println("Starting Suite Variational Inference (ADVI)...")
-
-for m_key in sort(collect(keys(models_to_bench)))
-    print("Running VI for $m_key... ")
-    try
-        m_instance = models_to_bench[m_key]()
-
-        # Standard Mean-Field ADVI
-        advi = ADVI(1, n_vi_iters)
-
-        t = @elapsed begin
-            # Solve for the variational posterior
-            q = vi(m_instance, advi)
-        end
-
-        vi_results[m_key] = (dist = q, time = t)
-        println("$(round(t, digits=2))s")
-    catch e
-        println("FAILED: $e")
-        vi_results[m_key] = nothing
-    end
-end
-
-# --- Display VI Summary Table ---
-println("\n" * "="^45)
-println(rpad("Model", 25), " | ", rpad("Time (s)", 10))
-println("-"^45)
-for m_key in sort(collect(keys(vi_results)))
-    if !isnothing(vi_results[m_key])
-        res = vi_results[m_key]
-        println(rpad(m_key, 25), " | ", rpad(string(round(res.time, digits=2)), 10))
-    else
-        println(rpad(m_key, 25), " | ", "Error")
-    end
-end
-println("="^45)
-
-```
 
   
 

@@ -292,7 +292,7 @@ function generate_data(N; period=12.0, seed=42)
     seasonal = 1.0 .* cos.(2 * pi .* coords_time[:,1] ./ period)
 
     # Simulate a spatial effect manually for the ground truth
-    spatial_effect = sin.(coords_space[:,1] .* 2π) .* cos.(coords_space[:,2] .* 2π)
+    spatial_effect = sin.(coords_space[:,1] .*  2 * π) .* cos.(coords_space[:,2] .*  2 * π)
 
     sigma_y = 0.2
     # Y is a function of trend, season, GP effect, and U1
@@ -913,7 +913,7 @@ function get_rff_deep2D_basis(X, m, lengthscale)
     N, D = size(X)
     Random.seed!(42)
     Omega_samples = randn(m, D) ./ lengthscale
-    Phi_phases = rand(m) .* 2π
+    Phi_phases = rand(m) .*  2 * π
     return sqrt(2/m) .* cos.(X * Omega_samples' .+ Phi_phases')
 end
 
@@ -927,7 +927,7 @@ function get_rff_trend_basis(t, m, lengthscale, ::Type{T}=Float64) where {T}
     Phi_phases_float = rand(m)
 
     Omega_samples = Omega_samples_float ./ lengthscale
-    Phi_phases = Phi_phases_float .* convert(T, 2π)
+    Phi_phases = Phi_phases_float .* convert(T,  2 * π)
 
     Z = zeros(T, N, m)
     for j in 1:m
@@ -949,7 +949,7 @@ function get_rff_seasonal_basis(t, m, freq, lengthscale)
     N = length(t)
     Z = zeros(N, 2*m)
     for j in 1:m
-        omega_j = 2π * j * freq
+        omega_j =  2 * π * j * freq
         Z[:, 2j-1] = cos.(omega_j .* t)
         Z[:, 2j] = sin.(omega_j .* t)
     end
@@ -987,12 +987,12 @@ function prepare_model_inputs0(y, pts, area_idx, time_idx, W_sym, n_cat; m_trend
     # 4. Stable RFF Generation
     Random.seed!(42)
     Om_tr = randn(Float64, m_trend) ./ 0.5
-    Ph_tr = rand(Float64, m_trend) .* 2π
+    Ph_tr = rand(Float64, m_trend) .* 2 * π
     Z_trend = sqrt(2/m_trend) .* cos.(t_vec * Om_tr' .+ Ph_tr')
 
     Z_seas = zeros(Float64, N_time, 2 * m_seas)
     for j in 1:m_seas
-        om_j = 2π * j
+        om_j = 2*π * j
         Z_seas[:, 2j-1] = cos.(om_j .* t_vec)
         Z_seas[:, 2j] = sin.(om_j .* t_vec)
     end
@@ -1016,7 +1016,8 @@ function prepare_model_inputs0(y, pts, area_idx, time_idx, W_sym, n_cat; m_trend
     )
 end
 
-function prepare_model_inputs(y, pts, area_idx, time_idx, W_sym, n_cat; m_trend=10, m_seas=5)
+function prepare_model_inputs(; y=nothing, pts=nothing, area_idx=nothing, time_idx=nothing, W_sym=nothing, n_cat=9, m_trend=10, m_seas=5, weights = ones(length(y)), offset = zeros(length(y)) )
+    
     # Consolidates static precomputations for the CARSTM model suite.
     # Expanded: Added RW2 precision and GP coordinate extraction fields.
     N_time = maximum(time_idx)
@@ -1038,11 +1039,11 @@ function prepare_model_inputs(y, pts, area_idx, time_idx, W_sym, n_cat; m_trend=
     Q_rw2_scaled = sparse(Q_rw2_raw ./ scaling_rw2_const)
     Random.seed!(42)
     Om_tr = randn(Float64, m_trend) ./ 0.5
-    Ph_tr = rand(Float64, m_trend) .* 2̀π
+    Ph_tr = rand(Float64, m_trend) .*  2 * π
     Z_trend = sqrt(2/m_trend) .* cos.(t_vec * Om_tr' .+ Ph_tr')
     Z_seas = zeros(Float64, N_time, 2 * m_seas)
     for j in 1:m_seas
-        om_j = 2̀π * j
+        om_j =  2 * π * j
         Z_seas[:, 2j-1] = cos.(om_j .* t_vec)
         Z_seas[:, 2j] = sin.(om_j .* t_vec)
     end
@@ -1054,13 +1055,14 @@ function prepare_model_inputs(y, pts, area_idx, time_idx, W_sym, n_cat; m_trend=
     for k in 1:4
         cov_mapping[:, k] .= mod1.(1:N_obs, n_cat)
     end
+
     return (
         y = y, pts_raw = pts, area_idx = area_idx, time_idx = time_idx,
         Q_sp = Q_spatial_scaled, Q_rw2 = Q_rw2_scaled, Q_ar1_template = Q_ar1_template,
         Z_trend = Z_trend, Z_seas = Z_seas,
         interaction_idx = interaction_idx, cov_indices = cov_mapping,
         n_cats = n_cat, scaling_sp_const = scaling_sp_const, scaling_rw2_const = scaling_rw2_const,
-        weights = ones(N_obs), offset = zeros(N_obs)
+        weights =weights, offset =offset
     )
 end
  
@@ -1117,6 +1119,8 @@ function generate_sim_data0(n_pts, n_time; rndseed=42)
         z_obs=z_obs, u_obs=u_obs
     )
 end
+
+
 
 function model_results_comprehensive(model, chain, modinputs, areal_units; alpha=0.05, time_slice=1)
     # Synopsis: Comprehensive diagnostic and visualization suite for CARSTM models.
@@ -1643,8 +1647,8 @@ Returns:
     W_fixed = Matrix{Float64}(undef, 2, M_rff_count)
     for i in 1:M_rff_count
         idx = sampled_indices[i]
-        W_fixed[1, i] = all_freqs_x[idx] * 2π # Scale by 2π to match RFF convention (often ω'x)
-        W_fixed[2, i] = all_freqs_y[idx] * 2π
+        W_fixed[1, i] = all_freqs_x[idx] *  2 * π # Scale by  2 * π to match RFF convention (often ω'x)
+        W_fixed[2, i] = all_freqs_y[idx] *  2 * π
     end
 
     return W_fixed
@@ -1721,4 +1725,158 @@ function kron_ar1_matern_sample(Ns, Nt, unique_s, ls_s, sigma_s, rho_t, sigma_t_
     return L_q.L' \ noise_vec
 end
  
+
+function prepare_fft_grid(pts, values; grid_res=64, pad_factor=2)
+    # 1. Define the bounding box
+    xs = [p[1] for p in pts]
+    ys = [p[2] for p in pts]
+    xmin, xmax = minimum(xs), maximum(xs)
+    ymin, ymax = minimum(ys), maximum(ys)
+
+    # 2. Map points to a grid
+    # Use the length of the shorter input to prevent BoundsError
+    n_limit = min(length(pts), length(values))
+    grid = zeros(grid_res, grid_res)
+
+    for i in 1:n_limit
+        p = pts[i]
+        ix = Int(floor((p[1] - xmin) / (xmax - xmin + 1e-6) * (grid_res - 1))) + 1
+        iy = Int(floor((p[2] - ymin) / (ymax - ymin + 1e-6) * (grid_res - 1))) + 1
+        grid[ix, iy] = values[i]
+    end
+
+    # 3. Apply Zero-Padding
+    padded_res = grid_res * pad_factor
+    padded_grid = zeros(padded_res, padded_res)
+
+    start_idx = Int(grid_res / 2)
+    padded_grid[start_idx:start_idx+grid_res-1, start_idx:start_idx+grid_res-1] .= grid
+
+    return padded_grid, (xmin, xmax, ymin, ymax)
+end
  
+
+function optimal_samplers_bstm( v )
+
+  # Dictionary mapping model IDs to their optimal Gibbs configurations
+  
+  optimal_samplers = Dict(
+    # v1: Gaussian Foundational (Latent Fields + AR1)
+    "v1" => Turing.Gibbs(
+        (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => Turing.ESS(),
+        (:beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v2: RFF Gaussian (Global Seasonality + RFF Trend)
+    "v2" => Turing.Gibbs(
+        (:u_icar, :u_iid, :w_trend, :w_seas, :st_int_raw) => Turing.ESS(),
+        (:beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_y, :sigma_sp, :phi_sp, :sigma_trend, :sigma_seas, :sigma_int, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v3: LogNormal (Skewed Data)
+    "v3" => Turing.Gibbs(
+        (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => Turing.ESS(),
+        (:beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v4: Binomial (Prevalence/Proportions)
+    "v4" => Turing.Gibbs(
+        (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => Turing.ESS(),
+        (:beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v5: Poisson (Counts + Optional ZIP)
+    "v5" => Turing.Gibbs(
+        (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => Turing.ESS(),
+        (:phi_zi) => Turing.PG(40),  # Handle discrete zero-inflation state
+        (:beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v6: Neg-Binomial (Overdispersed Counts)
+    "v6" => Turing.Gibbs(
+        (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => Turing.ESS(),
+        (:phi_zi) => Turing.PG(40),
+        (:beta_cov) => Turing.NUTS(1000, 0.8),
+        (:r_nb, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v7: Binomial Deep GP (Warped Interaction)
+    "v7" => Turing.Gibbs(
+        (:w1, :w2) => Turing.ESS(), # Weights on RFF layers
+        (:lengthscale1, :lengthscale2) => Turing.NUTS(1000, 0.8),
+        (:beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_rw2) => Turing.MH()
+    ),
+
+    # v8: Gaussian Deep GP (Non-stationary Field)
+    "v8" => Turing.Gibbs(
+        (:w1, :w2) => Turing.ESS(),
+        (:l1, :l2) => Turing.NUTS(1000, 0.8),
+        (:beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_y, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v9: Continuous RFF (Matern Covariates)
+    "v9" => Turing.Gibbs(
+        (:u_icar, :u_iid, :f_tm_raw, :st_int_raw, :W_cov_raw) => Turing.ESS(),
+        (:lengthscale_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_cov) => Turing.MH()
+    ),
+
+    # v10: 3-Layer Deep GP (Experimental Non-Stationarity)
+    "v10" => Turing.Gibbs(
+        (:w1, :w2, :w3) => Turing.ESS(),
+        (:l1, :l2, :l3) => Turing.NUTS(1000, 0.8),
+        (:beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_y, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v11: Non-Separable RFF
+    "v11" => Turing.Gibbs(
+        (:w_joint) => Turing.ESS(),
+        (:l_joint, :beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_y, :sigma_joint, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v12: SPDE-style Continuous Spatial Field (Spectral RFF)
+    "v12" => Turing.Gibbs(
+        (:w_sp, :f_tm_raw) => Turing.ESS(),
+        (:kappa_sp, :beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_y, :sigma_sp, :sigma_tm, :rho_tm, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v13: Non-Stationary Warping (Deep GP-like)
+    "v13" => Turing.Gibbs(
+        (:w_warp, :w_sp, :f_tm_raw) => Turing.ESS(),
+        (:l_warp, :l_spatial, :beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_y, :sigma_sp, :sigma_tm, :rho_tm, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v14: FFT-Accelerated GMRF
+    "v14" => Turing.Gibbs(
+        (:u_spectral_raw, :u_iid, :f_tm_raw) => Turing.ESS(),
+        (:beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_rw2) => Turing.MH()
+    ),
+
+    # v15: Refined Mosaic (Hierarchical Local Fields)
+    "v15" => Turing.Gibbs(
+        (:w_local) => Turing.ESS(),
+        (:mu_local, :l_local, :mu_global, :sigma_mu_local, :beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_rw2, :sigma_local, :sigma_y_local) => Turing.MH()
+    ),
+
+    # v16: Integrated Mosaic (Non-Separable RFFs in Mosaics)
+    "v16" => Turing.Gibbs(
+        (:w_local) => Turing.ESS(),
+        (:mu_local, :l_joint, :mu_global, :sigma_mu_local, :beta_cov) => Turing.NUTS(1000, 0.8),
+        (:sigma_rw2, :sigma_local, :sigma_y_local) => Turing.MH()
+    )
+  )
+  return optimal_samplers[v]
+end

@@ -6,7 +6,7 @@ Pkg.add( ["DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler"
 using DrWatson, Revise, Requires, PrecompileTools, PackageCompiler
 
 if !@isdefined project_directory 
-    project_directory = joinpath( homedir(), "projects", "model_covariance" )
+    project_directory = joinpath( homedir(), "projects", "bstm" )
 end
 
 quickactivate(project_directory) 
@@ -25,9 +25,9 @@ using Pkg
 pkgs_bstm = [
   "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", 
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation",   
-  "Distributions", "Statistics", "MCMCChains", "DataFrames",
-  "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests",
-  "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays",
+  "Distributions", "Statistics", "MCMCChains", "DataFrames", 
+  "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
+  "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", 
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "PosteriorStats",  "Turing" 
 ]
 
@@ -79,7 +79,9 @@ include( srcdir( "spatiotemporal_turing_models.jl" ))
 # Set a seed for reproducibility.
 Random.seed!(42)
 
+# required for a few functions: 
 using LogExpFunctions: logistic
+using LogExpFunctions: logsumexp
 
 # to help track variables, add something like this inside of a function:  
 # Main.DEBUG[] = y,p,t  # this stores y, p, t into Main.DEBUG 

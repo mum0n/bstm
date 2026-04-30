@@ -288,7 +288,7 @@ end
 
  
 
-@memoize function icar_form(theta, phi, sigma, rho)
+function icar_form(theta, phi, sigma, rho)
     # https://sites.stat.columbia.edu/gelman/research/published/bym_article_SSTEproof.pdf
     # Reibler parameterization: https://pubmed.ncbi.nlm.nih.gov/27566770/
     # https://www.jstatsoft.org/index.php/jss/article/view/v063c01/841
@@ -296,7 +296,7 @@ end
 end
    
 
-@memoize function sample_gaussian_process( ; GPmethod="cholesky", returntype="default",
+function sample_gaussian_process( ; GPmethod="cholesky", returntype="default",
     fkernal=nothing, kerneltype="default", kvar=nothing, kscale=nothing, gpc=GPC(),
     Yobs, Xobs, Xinducing=nothing, lambda=0.0001 )
     
@@ -1264,7 +1264,7 @@ function plot_variational_marginals(z, sym2range)
 end
 
 
-@memoize function fkernal( kernfunctype="squared_exp", params=nothing )
+function fkernal( kernfunctype="squared_exp", params=nothing )
 
     if kernfunctype=="squared_exp"
         out = params[1] * SqExponentialKernel() ∘ ScaleTransform(params[2])  
@@ -1288,7 +1288,7 @@ end
 end
 
 
-@memoize sekernel2(v, s) = v * SqExponentialKernel() ∘ ScaleTransform(s) # ∘ ARDTransform(a);
+sekernel2(v, s) = v * SqExponentialKernel() ∘ ScaleTransform(s) # ∘ ARDTransform(a);
 
 sekernel(v, s) = v * SqExponentialKernel() ∘ ScaleTransform(s) # ∘ ARDTransform(a);
 
