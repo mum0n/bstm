@@ -109,7 +109,7 @@ pairs(data)
 Dict(k => size(v) for (k, v) in pairs(data))
 
 # extract some quantities for demonstrations
-(; pts, y_sim, y_binary, time_idx, weights, trials, cov_indices) = data  # this is a simple way to select what to retain
+(; pts, y_obs, y_binary, time_idx, weights, trials, cov_indices) = data  # this is a simple way to select what to retain
 
 # view the data density
 plot_kde_simple(pts, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
@@ -284,8 +284,10 @@ modinputs = prepare_model_inputs(
   y = data_scot.y,         # y-value
   area_idx = data_scot.area_idx,  # space index
   time_idx = data_scot.time_idx,  # time index
+  coords_space = data_scot.coords_space,  # actual values
+  coords_time = data_scot.coords_time,    # actual values
   offset = data_scot.log_offset, # offsets
-  W_sym = data_scot.W  # matrix adjacency
+  W = data_scot.W  # matrix adjacency
 )
 
 # create model and sample 
@@ -318,7 +320,7 @@ n_time = 15
  
 data = generate_sim_data(n_pts, n_time; rndseed=42); # regenerate data
 
-(; pts, y_sim, y_binary, time_idx, weights, trials, cov_indices) = data
+(; pts, y_obs, y_binary, time_idx, weights, trials, cov_indices) = data
 ntot = size(pts, 1) 
 
 min_time_slices = 5
@@ -350,6 +352,12 @@ au = assign_spatial_units( pts, method;
   max_area=max_area)
 
 
+met = calculate_metrics(au)
+
+display(met.mean_density)
+display(met.sd_density)
+display(met.cv_density)
+
 p = plot_spatial_graph( au; title="Method: $method", domain_boundary=au.hull_coords)
 
  
@@ -361,58 +369,158 @@ p = plot_spatial_graph( au; title="Method: $method", domain_boundary=au.hull_coo
 ```{julia}
 
 # Setup shared precomputations
-n_categories = 13  # how many groups are used for discretization of covariates (when used)
+n_categories = 13  # how many groups are used for discretization of covariates (when used) 
 
-# adjust y variable for different model families
-modinputs_gaussian = prepare_model_inputs(
-  y = y_sim, 
-  area_idx = au.assignments, 
-  time_idx = time_idx, 
-  W_sym = au.W, 
-  n_cat = n_categories
+# Populate standard input sets per response family
+modinputs = prepare_model_inputs(
+    y = data.y_obs, 
+    pts = data.pts, 
+    area_idx = au.assignments, 
+    time_idx = data.time_idx, 
+    coords_space = data.coords_space,  # actual values
+    coords_time = data.coords_time,    # actual values
+    W = au.W,
+    z_obs = data.z_obs,
+    u_obs = data.u_obs,
+    trials = data.trials
 )
+ 
+  
 
-modinputs_count = merge(modinputs_gaussian, (y=data.y_counts,))
+# Specialized input sets for family-specific response variables
+modinputs_gaussian = modinputs
+modinputs_count = merge(modinputs, (y=data.y_counts,))
+modinputs_binomial = merge(modinputs, (y=data.y_binary,))
+modinputs_lognormal = merge(modinputs, (y=exp.(data.y_obs),))
 
-modinputs_binomial = merge(modinputs_gaussian, (y=data.y_binary,))
-
-modinputs_lognormal = merge(modinputs_gaussian, (y=exp.(data.y_sim),))  
  
 
-# use these:
-sampler_v1 = optimal_samplers_bstm("v1")
+# Clean Model Registry using the consolidated modinputs
+model_list = Dict(
+    "v0_poisson_simple"     => () -> model_v0_poisson_simple(modinputs_count),
+    "v1_gaussian"           => () -> model_v1_gaussian(modinputs_gaussian),
+    "v2_rff_gaussian"       => () -> model_v2_rff_gaussian(modinputs_gaussian),
+    "v3_lognormal"          => () -> model_v3_lognormal(modinputs_lognormal),
+    "v4_binomial"           => () -> model_v4_binomial(modinputs_binomial),
+    "v5_poisson"            => () -> model_v5_poisson(modinputs_count),
+    "v6_negativebinomial"   => () -> model_v6_negativebinomial(modinputs_count),
+    "v7_deep_gp_binomial"   => () -> model_v7_deep_gp_binomial(modinputs_binomial),
+    "v8_deep_gp_gaussian"   => () -> model_v8_deep_gp_gaussian(modinputs_gaussian),
+    "v9_continuous_gaussian" => () -> model_v9_continuous_gaussian(modinputs_gaussian),
+    "v10_deep_gp_3layer"    => () -> model_v10_deep_gp_3layer_gaussian(modinputs_gaussian),
+    "v11_non_separable_rff" => () -> model_v11_non_separable_rff(modinputs_gaussian),
+    "v12_spde_gaussian"     => () -> model_v12_spde_gaussian(modinputs_gaussian),
+    "v13_nonstationary_warp" => () -> model_v13_nonstationary_warping(modinputs_gaussian),
+    "v14_fft_gaussian"      => () -> model_v14_fft_gaussian(modinputs_gaussian),
+    "v15_refined_mosaic"    => () -> model_v15_refined_mosaic(modinputs_gaussian),
+    "v16_integrated_mosaic" => () -> model_v16_integrated_mosaic(modinputs_gaussian),
 
-
-# Define the full model set with corrected data inputs for count families
-models_to_bench = Dict(
-    "v1_gaussian"         => () -> model_v1_gaussian(modinputs_gaussian),
-    "v2_rff_gaussian"     => () -> model_v2_rff_gaussian(modinputs_gaussian),
-    "v3_lognormal"        => () -> model_v3_lognormal(modinputs_lognormal),
-    "v4_binomial"         => () -> model_v4_binomial(modinputs_binomial; trials=data.trials),
-    "v5_poisson"          => () -> model_v5_poisson(modinputs_count),
-    "v6_negativebinomial" => () -> model_v6_negativebinomial(modinputs_count),
-    "v7_deep_gp_binomial" => () -> model_v7_deep_gp_binomial(modinputs_binomial; trials=data.trials),
-    "v8_deep_gp_gaussian" => () -> model_v8_deep_gp_gaussian(modinputs_gaussian),
-    "v9_continuous_gaussian" => () -> model_v9_continuous_gaussian(data.cov_continuous, modinputs_gaussian),
-    "v10_deep_gp_3layer"  => () -> model_v10_deep_gp_3layer_gaussian(modinputs_gaussian)
+    # A-series (Advanced/Multi-fidelity)
+    "A01_dense_gp"          => () -> model_A00_dense_gp(modinputs_gaussian),
+    "A02_adaptive_rff"      => () -> model_A02_adaptive_rff(modinputs_gaussian),
+    "A03_nested_covs"       => () -> model_A03_nested_covs(modinputs_gaussian),
+    "A04_tv_intercept"      => () -> model_A04_time_varying_intercept(modinputs_gaussian),
+    "A05_stochastic_vol"    => () -> model_A05_stochastic_volatility(modinputs_gaussian),
+    "A06_fitc_sv"           => () -> model_A06_fitc(modinputs_gaussian, modinputs_gaussian.Z_inducing),
+    "A07_fitc_standard"     => () -> model_A07_fitc_standardized(modinputs_gaussian, modinputs_gaussian.Z_inducing),
+    "A08_fitc_nonlinear"    => () -> model_A08_fitc_nonlinear_standardized(modinputs_gaussian),
+    "A09_gp_trend"          => () -> model_A09_gp_trend_standardized(modinputs_gaussian),
+    "A10_fixed_fitc"        => () -> model_A10_fixed_fitc_standardized(modinputs_gaussian, modinputs_gaussian.Z_inducing),
+    "A11_svgp_learned"      => () -> model_A11_svgp_standardized(modinputs_gaussian),
+    "A12_svgp_full"         => () -> model_A12_svgp_full_standardized(modinputs_gaussian),
+    "A13_multifidelity_gp"  => () -> model_A13_multifidelity_gp_standardized(modinputs_gaussian),
+    "A14_minibatch_mfgp"    => () -> model_A14_minibatch_mfgp_standardized(modinputs_gaussian),
+    "A15_deep_gp"           => () -> model_A15_deep_gp(modinputs_gaussian),
+    "A16_nystrom"           => () -> model_A16_nystrom(modinputs_gaussian),
+    "A17_spde"              => () -> model_A17_spde(modinputs_gaussian),
+    "A18_kronecker_spde"    => () -> model_A18_kronecker_spde(modinputs_gaussian),
+    "A19_svgp_matern"       => () -> model_A19_svgp_matern(modinputs_gaussian),
+    "A20_multifidelity_mat" => () -> model_A20_multifidelity_gp_matern(modinputs_gaussian),
+    "A21_mf_sv_seasonal"    => () -> model_A21_multifidelity_gp_matern_sv_seasonal(modinputs_gaussian),
+    "A22_rff_multifidelity" => () -> model_A22_rff_multifidelity_gp(modinputs_gaussian),
+    "A23_dfrff_multifidelity" => () -> model_A23_dfrff_multifidelity_gp(modinputs_gaussian),
+    "A24_semi_adaptive_dfrff" => () -> model_A24_semi_adaptive_dfrff_multifidelity_gp(modinputs_gaussian),
+    "A25_hybrid_fitc_rff"   => () -> model_A25_hybrid_fitc_rff(modinputs_gaussian)
 )
 
-n_bench_iters = 500
-bench_results = Dict{String, Float64}()
+using BenchmarkTools
 
-for m_key in sort(collect(keys(models_to_bench)))
-    print("Benchmarking $m_key... ")
+# Benchmark Configuration
+
+n_iters = 1000
+n_samples_bench = 200
+n_chains_bench = 2
+bench_results = []
+
+println("Starting Registry Benchmark Loop...")
+println("------------------------------------")
+
+# Iterate through the model registry
+for model_key in sort(collect(keys(model_list)))
+    println("Benchmarking: $model_key")
+    
     try
-        m_instance = models_to_bench[m_key]()
-        t = @elapsed sample(m_instance, NUTS(), n_bench_iters; progress=false)
-        bench_results[m_key] = t
-        println("$(round(t, digits=2))s")
+        # 1. Instantiate the model from the registry
+        target_model = model_list[model_key]()
+        
+        # 2. Retrieve the optimized Gibbs sampler
+        target_sampler = get_optimal_sampler(model_key)
+        
+        # 3. Execute Benchmarked Sampling
+        start_time = time()
+        # Short run for timing estimation
+        chain = sample(target_model, target_sampler, MCMCThreads(), n_samples_bench, n_chains_bench; progress=false)
+        elapsed = time() - start_time
+        
+        # 4. Extract Diagnostics
+        summ = summarize(chain)
+        avg_ess = mean(summ[:, :ess_bulk])
+        max_rhat = maximum(summ[:, :rhat])
+        ess_per_sec = avg_ess / elapsed
+        
+        # 5. Store Results
+        push!(bench_results, (
+            model = model_key, 
+            time_sec = round(elapsed, digits=2), 
+            ess_avg = round(avg_ess, digits=1), 
+            ess_sec = round(ess_per_sec, digits=2),
+            max_rhat = round(max_rhat, digits=3),
+            status = "Success"
+        ))
+        
+        println("   Done. Time: $(round(elapsed, digits=2))s | ESS/sec: $(round(ess_per_sec, digits=2))")
+        
     catch e
-        println("FAILED")
-        bench_results[m_key] = NaN
+        @warn "Model $model_key failed benchmarking: $e"
+        push!(bench_results, (
+            model = model_key, 
+            time_sec = NaN, 
+            ess_avg = NaN, 
+            ess_sec = NaN, 
+            max_rhat = NaN, 
+            status = "Error: $e"
+        ))
     end
 end
 
+# Convert results to DataFrame for analysis
+bench_df = DataFrame(bench_results)
+sort!(bench_df, :ess_sec, rev=true)
+
+display(bench_df)
+
+
+# Visualization of Benchmarking Performance
+if !isempty(bench_results)
+    p_bench = bar(bench_df.model, bench_df.ess_sec, 
+                  title="Sampler Efficiency by Model", 
+                  ylabel="Effective Samples per Second (ESS/sec)", 
+                  xrotation=90, 
+                  legend=false, 
+                  size=(900, 500),
+                  color=:viridis)
+    display(p_bench)
+end
 
 
 
@@ -2778,28 +2886,28 @@ Nt_y_unique = 5
 sim_data = generate_sim_data(Ns_y_unique, Nt_y_unique)
 
 # Extract variables following the new naming standard
-y_obs = sim_data.y_sim
-u_obs = sim_data.u_obs
-z_obs = sim_data.z_obs
-coords_y_raw = sim_data.pts
-time_y_idx = sim_data.time_idx
+y_obs = data.y_obs
+u_obs = data.u_obs
+z_obs = data.z_obs
+coords_y_raw = data.pts
+time_y_idx = data.time_idx
 
 # --- 2. FFT-Informed RFF Parameter Generation ---
 M_rff_base_val = 40
 M_rff_sigma_val = 20
 
 # Spatial-only coordinates for Z-fidelity extracted from current simulation
-coords_z_s = [p for p in sim_data.pts[1:120]] 
+coords_z_s = [p for p in data.pts[1:120]] 
 
 # Z-fidelity frequencies
 W_z_fixed, b_z_fixed = generate_informed_rff_params(hcat([p[1] for p in coords_z_s], [p[2] for p in coords_z_s]), M_rff_base_val)
 
 # U-fidelity dummy inputs for frequency setup: [lon, lat, time, z_latent]
-coords_u_dummy = hcat([p[1] for p in sim_data.pts], [p[2] for p in sim_data.pts], sim_data.time_idx, sim_data.z_obs)
+coords_u_dummy = hcat([p[1] for p in data.pts], [p[2] for p in data.pts], data.time_idx, data.z_obs)
 W_u_fixed, b_u_fixed = generate_informed_rff_params(coords_u_dummy, M_rff_base_val)
 
 # Volatility frequencies for Y fidelity
-coords_st_y = hcat([p[1] for p in sim_data.pts], [p[2] for p in sim_data.pts], sim_data.time_idx)
+coords_st_y = hcat([p[1] for p in data.pts], [p[2] for p in data.pts], data.time_idx)
 W_sigma_fixed, b_sigma_fixed = generate_informed_rff_params(coords_st_y, M_rff_sigma_val)
 
 # --- 3. Inducing Point Setup for FITC ---
@@ -4106,7 +4214,7 @@ This model builds upon the multi-fidelity concept by employing Random Fourier Fe
 
 ```{julia}
 
-model_A22 = model_A22_rff_multifidelity_gp(modinputs, coords_u_s, coords_u_t, coords_z_s )
+model_A22 = model_A22_rff_multifidelity_gp(modinputs )
 chain_A22 = sample(model_A22, NUTS(), 100) # Reduced samples for faster testing
 display(describe(chain_A22))
 waic_A22 = compute_y_waic(model_A22, chain_A22)
@@ -4157,56 +4265,13 @@ This model builds upon A22 by transitioning from *adaptive* Random Fourier Featu
 *   Hierarchical Bayesian Models: Gelman, A., et al. (2013). *Bayesian Data Analysis*. CRC Press.
 *   Stochastic Volatility: Kim, S., Shephard, N., & Chib, S. (1998). *Stochastic Volatility: Likelihood Inference and Comparison*.
 
-```{julia} 
-# --- 1. Prepare Synthetic Data and Inputs ---
-sim = generate_sim_data(20, 10) # 20 areas, 10 time steps
+```{julia}  
 
-# Create standardized modinputs
-mod_in = prepare_model_inputs(
-    sim.y_sim, 
-    sim.pts, 
-    repeat(1:20, 10), 
-    sim.time_idx, 
-    sparse(I(20)), 
-    4
-)
-
-# Extend modinputs with multi-fidelity fields required by A23
-mod_in = merge(mod_in, (
-    z_obs = sim.z_obs[1:20], 
-    u_obs = sim.u_obs
-))
-
-# --- 2. Initialize Fixed Projection Matrices (DFRFF) ---
-# These are static weights for the functional mapping layers
-M_base = 40
-M_sig = 20
-
-# Layer Z: Maps Space (Dim 2) to Latent Z
-W_z_fix = randn(2, M_base); b_z_fix = rand(M_base) .* 2π
-
-# Layer U: Maps [Space, Time, Z] (Dim 4) to Latent U
-W_u_fix = randn(4, M_base); b_u_fix = rand(M_base) .* 2π
-
-# Layer Y: Maps [Space, Time, Z, U] (Dim 5) to Output Y
-W_y_fix = randn(5, M_base); b_y_fix = rand(M_base) .* 2π
-
-# Layer Sigma: Maps [Space, Time] (Dim 3) to Volatility
-W_sig_fix = randn(3, M_sig); b_sig_fix = rand(M_sig) .* 2π
-
-# --- 3. Instantiate and Sample ---
-model_instance = model_A23_dfrff_multifidelity_gp(
-    mod_in,
-    W_z_fix, b_z_fix,
-    W_u_fix, b_u_fix,
-    W_y_fix, b_y_fix,
-    W_sig_fix, b_sig_fix
-)
+model_instance = model_A23_dfrff_multifidelity_gp( modinputs )
 
 println("Starting NUTS sampling for Model A23 (Deep Functional RFF)... ")
 chain_a23 = sample(model_instance, NUTS(0.65), 100)
-
-# Display summary
+ 
 display(summarize(chain_a23))
 
 ```
@@ -4249,55 +4314,12 @@ Crucially, this multi-fidelity RFF architecture inherently forms a Deep Gaussian
 
  
 
-```{julia}
-# --- 1. Prepare Synthetic Data and Inputs ---
-sim = generate_sim_data(20, 10) # 20 areas, 10 time steps
-
-# Create standardized modinputs
-mod_in = prepare_model_inputs(
-    sim.y_sim, 
-    sim.pts, 
-    repeat(1:20, 10), 
-    sim.time_idx, 
-    sparse(I(20)), 
-    4
-)
-
-# Extend modinputs with multi-fidelity fields for A24
-mod_in = merge(mod_in, (
-    z_obs = sim.z_obs[1:20], 
-    u_obs = sim.u_obs
-))
-
-# --- 2. Initialize Fixed Prior Means for Adaptive RFF Layers ---
-M_base = 40
-M_sig = 20
-
-# Layer Z: Input Dim 2 (Space)
-W_z_fix = randn(2, M_base); b_z_fix = rand(M_base) .* 2π
-
-# Layer U: Input Dim 4 (Space + Time + Z)
-W_u_fix = randn(4, M_base); b_u_fix = rand(M_base) .* 2π
-
-# Layer Y: Input Dim 5 (Space + Time + Z + U)
-W_y_fix = randn(5, M_base); b_y_fix = rand(M_base) .* 2π
-
-# Layer Sigma: Input Dim 3 (Space + Time)
-W_sig_fix = randn(3, M_sig); b_sig_fix = rand(M_sig) .* 2π
-
-# --- 3. Instantiate and Sample ---
-model_instance = model_A24_semi_adaptive_dfrff_multifidelity_gp(
-    mod_in, 
-    W_z_fix, b_z_fix, 
-    W_u_fix, b_u_fix, 
-    W_y_fix, b_y_fix, 
-    W_sig_fix, b_sig_fix
-)
+```{julia} 
+model_instance = model_A24_semi_adaptive_dfrff_multifidelity_gp(modinputs)
 
 println("Starting NUTS sampling for Model A24 (Semi-Adaptive DFRFF)... ")
 chain_a24 = sample(model_instance, NUTS(0.65), 100)
-
-# Display summary
+ 
 display(summarize(chain_a24))
 waic_A24 = compute_y_waic(model_A24, chain_A24)
 println("\nWAIC for A24: ", waic_A24)
@@ -4330,47 +4352,12 @@ This model represents the integration of non-linear spectral feature extraction 
 *   Spectral Bottleneck: The latent U fields serve as 'deep' features that are fed into the FITC GP's kernel, creating a Deep GP effect where the kernel itself is defined over a learned feature space.
 *   Data-Driven Initialization: RFF weights are initialized using the `generate_informed_rff_params` heuristic (FFT-informed).
  
-```{julia}
-sim = generate_sim_data(20, 10) # 20 areas, 10 time steps
-
-# Create standardized modinputs
-mod_in = prepare_model_inputs(
-    sim.y_sim, 
-    sim.pts, 
-    repeat(1:20, 10), 
-    sim.time_idx, 
-    sparse(I(20)), 
-    4
-)
-
-# Extend modinputs with multi-fidelity fields for A25
-mod_in = merge(mod_in, (
-    z_obs = sim.z_obs[1:20], 
-    u_obs = sim.u_obs
-))
-
-# --- 2. Initialize Fixed Parameters for Hybrid Architecture ---
-M_base = 40
-Z_inducing = randn(50, 9) # Inducing points in feature space
-W_z_fix = randn(2, M_base)
-b_z_fix = rand(M_base) .* 2π
-W_u_fix = randn(4, M_base)
-b_u_fix = rand(M_base) .* 2π
-
-# --- 3. Instantiate and Sample ---
-model_instance = model_A25_hybrid_fitc_rff(
-    mod_in, 
-    Z_inducing, 
-    W_z_fix, 
-    b_z_fix, 
-    W_u_fix, 
-    b_u_fix
-)
+```{julia} 
+model_instance = model_A25_hybrid_fitc_rff(modinputs)
 
 println("Starting NUTS sampling for Model A25...")
 chain_a25 = sample(model_instance, NUTS(0.65), 100)
-
-# Display summary
+ 
 display(summarize(chain_a25))
 
 waic_A25 = compute_y_waic(model_A25, chain_A25)
