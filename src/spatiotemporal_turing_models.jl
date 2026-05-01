@@ -1,23 +1,32 @@
  
 
 @model function model_D00_poisson_simple(modinputs, ::Type{T}=Float64; offset=modinputs.offset ) where {T}
-    # based on Model v5 but simplified for demonstration (no covars, no spacetime, no weights nor zeroinflation)
+    # Simplest possible model .. for demonstration (no covars, no spacetime, no weights nor zeroinflation)
     
     y = modinputs.y
     N_obs, N_areas, N_time = length(y), size(modinputs.Q_sp, 1), maximum(modinputs.time_idx)
 
     # --- 1. Priors ---
-    sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
-    sigma_tm ~ Exponential(1.0); rho_tm ~ Beta(2, 2)
-    sigma_int ~ Exponential(0.5); sigma_rw2 ~ filldist(Exponential(1.0), 4)
+    sigma_sp ~ Exponential(1.0);
+    sigma_tm ~ Exponential(1.0); 
+    sigma_int ~ Exponential(0.5); 
+    sigma_rw2 ~ filldist(Exponential(1.0), 4)
     
+    phi_sp ~ Beta(1, 1)
+    rho_tm ~ Beta(2, 2)
+     
     # --- 2. Spatial Effect (BYM2) ---
-    u_icar ~ MvNormal(zeros(N_areas), I); Turing.@addlogprob! -0.5 * dot(u_icar, modinputs.Q_sp * u_icar)
-    u_iid ~ MvNormal(zeros(N_areas), I); s_eff = sigma_sp .* (sqrt(phi_sp) .* u_icar .+ sqrt(1 - phi_sp) .* u_iid)
+    u_icar ~ MvNormal(zeros(N_areas), I); 
+    Turing.@addlogprob! -0.5 * dot(u_icar, modinputs.Q_sp * u_icar)
+    
+    u_iid ~ MvNormal(zeros(N_areas), I); 
+    s_eff = sigma_sp .* (sqrt(phi_sp) .* u_icar .+ sqrt(1 - phi_sp) .* u_iid)
 
     # --- 3. Temporal Effect (AR1) ---
     Q_ar1 = (1.0 / (1.0 - rho_tm^2)) .* (modinputs.Q_ar1_template + (rho_tm^2) * I)
-    f_tm_raw ~ MvNormal(zeros(N_time), I); Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
+    f_tm_raw ~ MvNormal(zeros(N_time), I); 
+    Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
+    
     f_time = f_tm_raw .* sigma_tm
   
     # --- Poisson Likelihood (Log Link) ---
@@ -32,9 +41,8 @@ end
 
 
 @model function model_D01_poisson(modinputs, ::Type{T}=Float64; use_zi=false, offset=modinputs.offset, weights=modinputs.weights) where {T}
-    # Model v5 Optimized: Poisson Spatiotemporal model with optional Zero-Inflation.
-    # Uses a log-link to ensure non-negative intensity (mu).
-
+    # Poisson Spatiotemporal model with optional Zero-Inflation.
+ 
     y = modinputs.y
     N_obs, N_areas, N_time = length(y), size(modinputs.Q_sp, 1), maximum(modinputs.time_idx)
 

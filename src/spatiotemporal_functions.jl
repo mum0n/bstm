@@ -1248,18 +1248,14 @@ function turing_glm_icar_summary( method="mcmc";
     scaling_factor=nothing, n_sample=nothing, nAU=nothing, auid=nothing, tuid=nothing, 
     kerneltype="squared_exponential"
 )
-
-    
-
+ 
     fixed_effects = nothing
     sp_re_structured = nothing
     sp_re_unstructured = nothing
     Gymu = nothing
 
     # Main.DEBUG = Ymu
-    
-    # @infiltrate
-
+  
     if !isnothing(good)
                      
         if !isnothing(Y)
@@ -2012,232 +2008,84 @@ end
 
  
 
-function get_optimal_sampler(model_key::String)
-    # Comprehensive mapping of model keys to optimized Gibbs configurations
-    # to ensure efficient mixing of latent fields and hyperparameters.
-    
-    samplers = Dict(
-        # --- V-Series (GMRF & RFF) ---
-        "v00_poisson_simple" => Gibbs(
-            (:u_icar, :u_iid, :f_tm_raw) => ESS(),
-            (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()
-        ),
-        "v01_gaussian" => Gibbs(
-            (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(),
-            (:beta_cov) => NUTS(500, 0.65),
-            (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()
-        ),
-        "v02_rff_gaussian" => Gibbs(
-            (:u_icar, :u_iid, :w_trend, :w_seas, :st_int_raw) => ESS(),
-            (:beta_cov) => NUTS(500, 0.65),
-            (:sigma_y, :sigma_sp, :phi_sp, :sigma_trend, :sigma_seas, :sigma_int, :sigma_rw2) => MH()
-        ),
-        "v03_lognormal" => Gibbs(
-            (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(),
-            (:beta_cov) => NUTS(500, 0.65),
-            (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()
-        ),
-        "v04_binomial" => Gibbs(
-            (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(),
-            (:beta_cov) => NUTS(500, 0.65),
-            (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()
-        ),
-        "v05_poisson" => Gibbs(
-            (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(),
-            (:phi_zi) => PG(20),
-            (:beta_cov) => NUTS(500, 0.65),
-            (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()
-        ),
-        "v06_negativebinomial" => Gibbs(
-            (:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(),
-            (:phi_zi) => PG(20),
-            (:beta_cov) => NUTS(500, 0.65),
-            (:r_nb, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()
-        ),
-        "v07_deep_gp_binomial" => Gibbs(
-            (:w1, :w2) => ESS(),
-            (:lengthscale1, :lengthscale2, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_rw2) => MH()
-        ),
-        "v08_deep_gp_gaussian" => Gibbs(
-            (:w1, :w2) => ESS(),
-            (:l1, :l2, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_y, :sigma_rw2) => MH()
-        ),
-        "v09_continuous_gaussian" => Gibbs(
-            (:u_icar, :u_iid, :f_tm_raw, :st_int_raw, :W_cov_raw) => ESS(),
-            (:lengthscale_cov) => NUTS(500, 0.65),
-            (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_cov) => MH()
-        ),
-        "v10_deep_gp_3layer" => Gibbs(
-            (:w1, :w2, :w3) => ESS(),
-            (:l1, :l2, :l3, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_y, :sigma_rw2) => MH()
-        ),
-        "v11_non_separable_rff" => Gibbs(
-            (:w_joint) => ESS(),
-            (:l_joint, :beta_cov) => NUTS(500, 0.65),
-            (:sigma_y, :sigma_joint, :sigma_rw2) => MH()
-        ),
-        "v12_spde_gaussian" => Gibbs(
-            (:w_sp, :f_tm_raw) => ESS(),
-            (:kappa_sp, :beta_cov) => NUTS(500, 0.65),
-            (:sigma_y, :sigma_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()
-        ),
-        "v13_nonstationary_warp" => Gibbs(
-            (:w_warp, :w_sp, :f_tm_raw) => ESS(),
-            (:l_warp, :l_spatial, :beta_cov) => NUTS(500, 0.65),
-            (:sigma_y, :sigma_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()
-        ),
-        "v14_fft_gaussian" => Gibbs(
-            (:u_spectral_raw, :u_iid, :f_tm_raw) => ESS(),
-            (:beta_cov) => NUTS(500, 0.65),
-            (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()
-        ),
-        "v15_refined_mosaic" => Gibbs(
-            (:w_local) => ESS(),
-            (:mu_local, :l_local, :mu_global, :sigma_mu_local, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_rw2, :sigma_local, :sigma_y_local) => MH()
-        ),
-        "v16_integrated_mosaic" => Gibbs(
-            (:w_local) => ESS(),
-            (:mu_local, :l_joint, :mu_global, :sigma_mu_local, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_rw2, :sigma_local, :sigma_y_local) => MH()
-        ),
+ 
+function get_optimal_sampler(model_key::String; nuts_adapt=1, target_acceptance=target_acceptance, pg_particles=10)
+    # Mathematically optimized Gibbs sampler mapping for the CARSTM suite.
+    # Partitions parameters into blocks to maximize Effective Sample Size (ESS).
 
-        # --- A-Series (Advanced/Multi-fidelity) ---
-        "A01_dense_gp" => Gibbs(
-            (:f_latent) => ESS(),
-            (:ls_s, :ls_t, :beta_cos, :beta_sin, :beta_cov) => NUTS(500, 0.65),
-            (:sigma_y, :sigma_f, :sigma_rw2) => MH()
-        ),
-        "A02_adaptive_rff" => Gibbs(
-            (:beta_rff, :u_icar, :u_iid) => ESS(),
-            (:W_matrix, :b_phases, :beta_z, :beta_u, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_y, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()
-        ),
-        "A03_nested_covs" => Gibbs(
-            (:beta_rff, :u_icar, :u_iid) => ESS(),
-            (:W_matrix, :beta_z, :beta_u_main, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_y, :sigma_u, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()
-        ),
-        "A04_tv_intercept" => Gibbs(
-            (:beta_rff, :u_icar, :u_iid) => ESS(),
-            (:alpha_rw, :beta_z, :beta_u_main, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_y, :sigma_alpha, :sigma_f, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A05_stochastic_vol" => Gibbs(
-            (:beta_rff_mean, :beta_rff_vol, :u_icar, :u_iid) => ESS(),
-            (:alpha_rw, :beta_z, :beta_u_main, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_log_var, :sigma_f, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A06_fitc_sv" => Gibbs(
-            (:u_inducing, :beta_rff_vol) => ESS(),
-            (:ls_st, :sigma_f, :beta_z, :beta_u_main, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_log_var, :sigma_sp, :phi_sp, :sigma_rw2) => MH()
-        ),
-        "A07_fitc_standard" => Gibbs(
-            (:u_inducing, :beta_rff_vol) => ESS(),
-            (:ls_st, :sigma_f, :beta_z, :beta_u_main, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_log_var, :sigma_sp, :phi_sp, :sigma_rw2) => MH()
-        ),
-        "A08_fitc_nonlinear" => Gibbs(
-            (:u_inducing, :beta_rff_u1, :beta_rff_u2, :beta_rff_u3, :f_gp) => ESS(),
-            (:Z_inducing, :ls_st, :beta_z, :beta_u_main, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_log_var, :sigma_sp, :phi_sp, :sigma_rw2) => MH()
-        ),
-        "A09_gp_trend" => Gibbs(
-            (:alpha_gp, :u_inducing, :f_gp) => ESS(),
-            (:Z_inducing, :ls_st, :ls_trend, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_trend, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A10_fixed_fitc" => Gibbs(
-            (:alpha_gp, :u_inducing, :f_gp) => ESS(),
-            (:ls_st, :ls_trend, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_trend, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A11_svgp_learned" => Gibbs(
-            (:u_inducing, :f_gp) => ESS(),
-            (:Z_inducing, :ls_st, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_f, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A12_svgp_full" => Gibbs(
-            (:u_latent) => ESS(),
-            (:Z_inducing, :m_u, :s_u_diag, :beta_cov) => NUTS(500, 0.7),
-            (:ls_st, :sigma_y, :sigma_rw2) => MH()
-        ),
-        "A13_multifidelity_gp" => Gibbs(
-            (:beta_z_rff, :beta_u1, :beta_u2, :beta_u3, :u_icar, :u_iid) => ESS(),
-            (:W_z, :W_u, :beta_y_main, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_z, :sigma_u, :sigma_sp, :sigma_y) => MH()
-        ),
-        "A14_minibatch_mfgp" => Gibbs(
-            (:beta_z_rff, :beta_u1, :beta_u2, :beta_u3, :u_icar, :u_iid) => ESS(),
-            (:W_z, :W_u, :beta_y_main, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_z, :sigma_u, :sigma_sp, :sigma_y) => MH()
-        ),
-        "A15_deep_gp" => Gibbs(
-            (:beta_z, :beta_u_mat, :beta_y_gp, :u_icar, :u_iid) => ESS(),
-            (:W_z, :W_u, :W_y, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_y, :sigma_sp, :sigma_z, :sigma_rw2) => MH()
-        ),
-        "A16_nystrom" => Gibbs(
-            (:v_latent, :beta_rff_sigma, :u_icar, :u_iid) => ESS(),
-            (:Z_ind, :ls_st, :W_sigma, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_f, :sigma_sp, :sigma_u, :sigma_rw2) => MH()
-        ),
-        "A17_spde" => Gibbs(
-            (:alpha, :u_icar, :u_iid, :beta_rff_sigma) => ESS(),
-            (:ls_trend, :W_sigma, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_trend, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A18_kronecker_spde" => Gibbs(
-            (:z_noise, :u1_noise, :y_noise, :u_icar, :u_iid) => ESS(),
-            (:ls_s_cov, :ls_t_cov, :ls_s_y, :ls_t_y, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_s_cov, :sigma_s_y, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A19_svgp_matern" => Gibbs(
-            (:y_noise, :u_icar, :u_iid) => ESS(),
-            (:ls_s_y, :ls_t_y, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_s_y, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A20_multifidelity_mat" => Gibbs(
-            (:z_latent, :u1_noise, :y_noise, :u_icar, :u_iid) => ESS(),
-            (:ls_z, :ls_s_u, :ls_s_y, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_y, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A21_mf_sv_seasonal" => Gibbs(
-            (:z_latent, :u1_noise, :y_noise, :u_icar, :u_iid, :beta_rff_sigma) => ESS(),
-            (:ls_z, :ls_s_u, :ls_s_y, :W_sigma, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_y, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A22_rff_multifidelity" => Gibbs(
-            (:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(),
-            (:W_z, :W_u, :W_y_gp, :W_sigma, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_z_f, :sigma_u_f, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A23_dfrff_multifidelity" => Gibbs(
-            (:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(),
-            (:beta_cov) => NUTS(500, 0.65),
-            (:sigma_z_f, :sigma_u_f, :sigma_y_gp_f, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A24_semi_adaptive_dfrff" => Gibbs(
-            (:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(),
-            (:W_z, :W_u, :W_y_gp, :W_sigma, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_W_z, :sigma_W_u, :sigma_sp, :sigma_rw2) => MH()
-        ),
-        "A25_hybrid_fitc_rff" => Gibbs(
-            (:beta_z, :beta_u, :u_latent_gp) => ESS(),
-            (:W_z, :b_z, :W_u, :b_u, :ls_y, :beta_cov) => NUTS(500, 0.7),
-            (:sigma_z_f, :sigma_u_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()
-        )
+    samplers = Dict(
+        # --- D-Series: Discrete Spatial Models (GMRF/BYM2) ---
+        "D00_poisson_simple"      => Gibbs((:u_icar, :u_iid, :f_tm_raw) => ESS(), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm) => MH()),
+        "D01_poisson"             => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "D02_gaussian"            => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "D03_gaussian_rff"        => Gibbs((:u_icar, :u_iid, :w_trend, :w_seas, :st_int_raw) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :phi_sp, :sigma_trend, :sigma_seas, :sigma_int, :sigma_rw2) => MH()),
+        "D04_lognormal"           => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "D05_binomial"            => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "D06_negbin"              => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:r_nb, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "D07_gaussian_rff_cov"    => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw, :W_cov_raw) => ESS(), (:lengthscale_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_cov) => MH()),
+        "D08_gaussian_fft"        => Gibbs((:u_spectral_raw, :u_iid, :f_tm_raw) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()),
+        "D09_adaptive_rff_bym2"   => Gibbs((:beta_rff, :u_icar, :u_iid) => ESS(), (:W_matrix, :b_phases, :beta_z, :beta_u, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "D10_nested_multifid_rff" => Gibbs((:beta_rff, :u_icar, :u_iid) => ESS(), (:W_matrix, :beta_z, :beta_u_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_u, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "D11_tv_intercept_bym2"   => Gibbs((:beta_rff, :u_icar, :u_iid) => ESS(), (:alpha_rw, :beta_z, :beta_u_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_alpha, :sigma_f, :sigma_sp, :sigma_rw2) => MH()),
+        "D12_stochastic_vol"      => Gibbs((:beta_rff_mean, :beta_rff_vol, :u_icar, :u_iid) => ESS(), (:alpha_rw, :beta_z, :beta_u_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_log_var, :sigma_f, :sigma_sp, :sigma_rw2) => MH()),
+        "D13_fitc_bym2"           => Gibbs((:u_inducing, :u_icar, :u_iid) => ESS(), (:ls_st, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "D14_fitc_nonlinear"      => Gibbs((:u_inducing, :beta_rff_u1, :beta_rff_u2, :beta_rff_u3, :f_gp) => ESS(), (:Z_inducing, :ls_st, :beta_z, :beta_u_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_log_var, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "D15_gptime_fitc"         => Gibbs((:alpha_gp, :u_inducing, :f_gp) => ESS(), (:Z_inducing, :ls_st, :ls_trend, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_trend, :sigma_sp, :sigma_rw2) => MH()),
+
+        # --- C-Series: Continuous Spatial Models (Deep GP/RFF/SPDE) ---
+        "C01_dense_gp"            => Gibbs((:f_latent) => ESS(), (:ls_s, :ls_t, :beta_cos, :beta_sin, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_f, :sigma_rw2) => MH()),
+        "C02_deep_gp"             => Gibbs((:w1, :w2) => ESS(), (:l1, :l2, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_rw2) => MH()),
+        "C03_binomial_deep_gp"    => Gibbs((:w1, :w2) => ESS(), (:lengthscale1, :lengthscale2, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_rw2) => MH()),
+        "C04_deep_gp_3layer"      => Gibbs((:w1, :w2, :w3) => ESS(), (:l1, :l2, :l3, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_rw2) => MH()),
+        "C05_non_separable_rff"   => Gibbs((:w_joint) => ESS(), (:l_joint, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_joint, :sigma_rw2) => MH()),
+        "C06_spde_rff"            => Gibbs((:w_sp, :f_tm_raw) => ESS(), (:kappa_sp, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()),
+        "C07_nonstationary_warp"  => Gibbs((:w_warp, :w_sp, :f_tm_raw) => ESS(), (:l_warp, :l_spatial, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()),
+        "C08_refined_mosaic"      => Gibbs((:w_local) => ESS(), (:mu_local, :l_local, :mu_global, :sigma_mu_local, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_rw2, :sigma_local, :sigma_y_local) => MH()),
+        "C09_integrated_mosaic"   => Gibbs((:w_local) => ESS(), (:mu_local, :l_joint, :mu_global, :sigma_mu_local, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_rw2, :sigma_local, :sigma_y_local) => MH()),
+        "C10_fitc_gmrf_hybrid"    => Gibbs((:alpha_gp, :u_inducing, :f_gp) => ESS(), (:ls_st, :ls_trend, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_trend, :sigma_sp, :sigma_rw2) => MH()),
+        "C11_svgp_learned"        => Gibbs((:u_inducing, :f_gp) => ESS(), (:Z_inducing, :ls_st, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_f, :sigma_sp, :sigma_rw2) => MH()),
+        "C12_svgp_full"           => Gibbs((:u_latent) => ESS(), (:Z_inducing, :m_u, :s_u_diag, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:ls_st, :sigma_y, :sigma_rw2) => MH()),
+        "C13_multifidelity_gp"    => Gibbs((:beta_z_rff, :beta_u1, :beta_u2, :beta_u3, :u_icar, :u_iid) => ESS(), (:W_z, :W_u, :beta_y_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_z, :sigma_u, :sigma_sp, :sigma_y) => MH()),
+        "C14_minibatch_mfgp"      => Gibbs((:beta_z_rff, :beta_u1, :beta_u2, :beta_u3, :u_icar, :u_iid) => ESS(), (:W_z, :W_u, :beta_y_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_z, :sigma_u, :sigma_sp, :sigma_y) => MH()),
+        "C15_deep_gp_rff"         => Gibbs((:beta_z, :beta_u_mat, :beta_y_gp, :u_icar, :u_iid) => ESS(), (:W_z, :W_u, :W_y, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :sigma_z, :sigma_rw2) => MH()),
+        "C16_nystrom_sv"          => Gibbs((:v_latent, :beta_rff_sigma, :u_icar, :u_iid) => ESS(), (:Z_ind, :ls_st, :W_sigma, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_f, :sigma_sp, :sigma_u, :sigma_rw2) => MH()),
+        "C17_spde_trend"          => Gibbs((:alpha, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:ls_trend, :W_sigma, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_trend, :sigma_sp, :sigma_rw2) => MH()),
+        "C18_kron_spde"           => Gibbs((:z_noise, :u1_noise, :y_noise, :u_icar, :u_iid) => ESS(), (:ls_s_cov, :ls_t_cov, :ls_s_y, :ls_t_y, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_s_cov, :sigma_s_y, :sigma_sp, :sigma_rw2) => MH()),
+        "C19_svgp_matern"         => Gibbs((:y_noise, :u_icar, :u_iid) => ESS(), (:ls_s_y, :ls_t_y, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_s_y, :sigma_sp, :sigma_rw2) => MH()),
+        "C20_mf_gp_matern"        => Gibbs((:z_latent, :u1_noise, :y_noise, :u_icar, :u_iid) => ESS(), (:ls_z, :ls_s_u, :ls_s_y, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :sigma_rw2) => MH()),
+        "C21_mf_sv_seasonal"      => Gibbs((:z_latent, :u1_noise, :y_noise, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:ls_z, :ls_s_u, :ls_s_y, :W_sigma, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :sigma_rw2) => MH()),
+        "C22_rff_mf_gp"           => Gibbs((:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:W_z, :W_u, :W_y_gp, :W_sigma, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_z_f, :sigma_u_f, :sigma_sp, :sigma_rw2) => MH()),
+        "C23_dfrff_mf_gp"         => Gibbs((:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_z_f, :sigma_u_f, :sigma_y_gp_f, :sigma_sp, :sigma_rw2) => MH()),
+        "C24_semi_adaptive_rff"   => Gibbs((:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:W_z, :W_u, :W_y_gp, :W_sigma, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_W_z, :sigma_W_u, :sigma_sp, :sigma_rw2) => MH()),
+        "C25_hybrid_fitc_rff"     => Gibbs((:beta_z, :beta_u, :u_latent_gp) => ESS(), (:W_z, :b_z, :W_u, :b_u, :ls_y, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_z_f, :sigma_u_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH())
     )
 
     # Fallback to standard NUTS for complex variants without custom recipes
-    return get(samplers, model_key, NUTS(1000, 0.65))
+    return get(samplers, model_key, NUTS(nuts_adapt, target_acceptance))
 end
 
- 
+
+
+function kron_matern_sample(Ns, Nt, unique_s, unique_t, ls_s, sigma_s, ls_t, sigma_t, noise_vec)
+    # Helper to sample a spatiotemporal field using Kronecker product of precision matrices
+    # Spatial Precision
+    k_s = Matern32Kernel() ∘ ScaleTransform(inv(ls_s))
+    K_s = sigma_s^2 * kernelmatrix(k_s, RowVecs(unique_s)) + 1e-6*I
+    Q_s = sparse(inv(K_s))
+
+    # Temporal Precision
+    k_t = Matern32Kernel() ∘ ScaleTransform(inv(ls_t))
+    K_t = sigma_t^2 * kernelmatrix(k_t, unique_t) + 1e-6*I
+    Q_t = sparse(inv(K_t))
+
+    # Full Kronecker Precision
+    Q_full = kron(Q_t, Q_s)
+    L_q = cholesky(Q_full + 1e-6*I)
+
+    # Sample: f = (L')^-1 * noise
+    return L_q.PtL' \ noise_vec
+end
+
 
 
 function get_posterior_means(ch, param_base, N)
@@ -3221,24 +3069,28 @@ function get_rff_seasonal_basis(t, m, freq, lengthscale)
 end
 
 
-function prepare_model_inputs(;
-    y=nothing, 
-    pts=nothing, 
-    area_idx=nothing, 
-    time_idx=nothing, 
-    W=nothing,  # adjacency matrix
-    n_cat=9, 
-    m_trend=10, 
-    m_seas=5, 
-    weights=nothing, 
-    offset=nothing,
-    z_obs=nothing, 
-    u_obs=nothing, 
-    trials=nothing,
-    M_inducing_count=15, 
-    M_rff_base=40, 
-    M_rff_sigma=20
-)
+
+function prepare_model_inputs(; kwargs...)
+
+    y = get(kwargs, :y, nothing)
+    pts = get(kwargs, :pts, nothing)
+    area_idx = get(kwargs, :area_idx, nothing)
+    time_idx = get(kwargs, :time_idx, nothing)
+    coords_space = get(kwargs, :coords_space, nothing)
+    coords_time = get(kwargs, :coords_time, nothing)
+    W = get(kwargs, :W, nothing) # Adjacency matrix
+    n_cat = get(kwargs, :n_cat, 9)
+    m_trend = get(kwargs, :m_trend, 10)
+    m_seas = get(kwargs, :m_seas, 5)
+    weights = get(kwargs, :weights, nothing)
+    offset = get(kwargs, :offset, nothing)
+    z_obs = get(kwargs, :z_obs, nothing)
+    u_obs = get(kwargs, :u_obs, nothing)
+    trials = get(kwargs, :trials, nothing)
+    M_inducing_count = get(kwargs, :M_inducing_count, 15)
+    M_rff_base = get(kwargs, :M_rff_base, 40)
+    M_rff_sigma = get(kwargs, :M_rff_sigma, 20)
+ 
     # 1. Dimension Extraction
     N_obs = length(y)
     N_time = maximum(time_idx)
@@ -3342,6 +3194,9 @@ function prepare_model_inputs(;
         pts = pts, 
         area_idx = area_idx, 
         time_idx = time_idx, 
+        coords_space = coords_space, 
+        coords_time = coords_time, 
+        W = W, 
         trials = trials, 
         z_obs = z_obs, 
         u_obs = u_obs, 

@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "3719be207c7181a2ba44842a94b0b8659bb9518b"
+project_hash = "34f6680eabed79ddfe36e411e3f4e2171044097a"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "bbc22a9a08a0ef6460041086d8a7b27940ed4ffd"
@@ -25,6 +25,12 @@ weakdeps = ["ChainRulesCore", "Test"]
     [deps.AbstractFFTs.extensions]
     AbstractFFTsChainRulesCoreExt = "ChainRulesCore"
     AbstractFFTsTestExt = "Test"
+
+[[deps.AbstractGPs]]
+deps = ["ChainRulesCore", "Distributions", "FillArrays", "IrrationalConstants", "KernelFunctions", "LinearAlgebra", "PDMats", "Random", "RecipesBase", "Reexport", "Statistics", "StatsBase", "Test"]
+git-tree-sha1 = "8a05cefb7c891378c89576bd4865f34d010c9ece"
+uuid = "99985d1d-32ba-4be9-9821-2ec096f28918"
+version = "0.5.24"
 
 [[deps.AbstractMCMC]]
 deps = ["BangBang", "ConsoleProgressMonitor", "Dates", "Distributed", "LogDensityProblems", "Logging", "LoggingExtras", "ProgressLogging", "Random", "StatsBase", "TerminalLoggers", "UUIDs"]
@@ -1208,22 +1214,10 @@ uuid = "5ab0869b-81aa-558d-bb23-cbf5423bbe9b"
 version = "0.6.11"
 
 [[deps.KernelFunctions]]
-deps = ["Compat", "CompositionsBase", "Distances", "FillArrays", "Functors", "IrrationalConstants", "LinearAlgebra", "LogExpFunctions", "Random", "SpecialFunctions", "Statistics", "StatsBase", "TensorCore", "Test"]
-git-tree-sha1 = "b992b4b1bc04fa3fef7f778c261b1ab7cbaf69c4"
+deps = ["ChainRulesCore", "Compat", "CompositionsBase", "Distances", "FillArrays", "Functors", "IrrationalConstants", "LinearAlgebra", "LogExpFunctions", "Random", "Requires", "SpecialFunctions", "Statistics", "StatsBase", "TensorCore", "Test", "ZygoteRules"]
+git-tree-sha1 = "9db545feadff48ec2da8216f589857e7a619df84"
 uuid = "ec8451be-7e33-11e9-00cf-bbf324bd1392"
-version = "0.11.0"
-
-    [deps.KernelFunctions.extensions]
-    KernelFunctionsChainRulesCoreExt = "ChainRulesCore"
-    KernelFunctionsKroneckerExt = "Kronecker"
-    KernelFunctionsPDMatsExt = "PDMats"
-    KernelFunctionsZygoteRulesExt = "ZygoteRules"
-
-    [deps.KernelFunctions.weakdeps]
-    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
-    Kronecker = "2c470bb0-bcc8-11e8-3dad-c9649493f05e"
-    PDMats = "90014a1f-27ba-587c-ab20-58faa44d9150"
-    ZygoteRules = "700de1a5-db45-46bc-99cf-38207098b444"
+version = "0.10.67"
 
 [[deps.LAME_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
@@ -2667,6 +2661,12 @@ deps = ["Artifacts", "JLLWrappers", "Libdl"]
 git-tree-sha1 = "446b23e73536f84e8037f5dce465e92275f6a308"
 uuid = "3161d3a3-bdf6-5164-811a-617609db77b4"
 version = "1.5.7+1"
+
+[[deps.ZygoteRules]]
+deps = ["ChainRulesCore", "MacroTools"]
+git-tree-sha1 = "434b3de333c75fc446aa0d19fc394edafd07ab08"
+uuid = "700de1a5-db45-46bc-99cf-38207098b444"
+version = "0.2.7"
 
 [[deps.eudev_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]

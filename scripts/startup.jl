@@ -27,7 +27,7 @@ pkgs_bstm = [
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation",   
   "Distributions", "Statistics", "MCMCChains", "DataFrames", 
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
-  "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", 
+  "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs",
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "PosteriorStats",  "Turing" 
 ]
 
@@ -65,13 +65,7 @@ print( "\nTo (re)-install required packages, run:  install_required_packages() o
   
 
 # support functions
-include( srcdir( "example_data.jl" ))     
 include( srcdir( "shared_functions.jl") )
-  
-include( srcdir( "car_functions.jl" ))   
-# include( srcdir( "carstm_functions.jl" ))   
-
-include( srcdir( "spatial_partitioning_functions.jl" ))   
 include( srcdir( "spatiotemporal_functions.jl" ))   
 include( srcdir( "spatiotemporal_turing_models.jl" ))   
 
