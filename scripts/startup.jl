@@ -28,7 +28,7 @@ pkgs_bstm = [
   "Distributions", "Statistics", "MCMCChains", "DataFrames", 
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs",
-  "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "PosteriorStats",  "Turing" 
+  "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing" 
 ]
 
 Pkg.add(pkgs_bstm)

@@ -341,7 +341,7 @@ end
     W_cov_raw ~ MvNormal(zeros(N_covs * m_feat), I); W_mat = reshape(W_cov_raw, m_feat, N_covs)
     f_cov_total = zeros(T, N_obs)
     for k in 1:N_covs
-        Random.seed!(42 + k); Om = randn(m_feat) ./ lengthscale_cov[k]; Ph = rand(m_feat) .* convert(T, 2 * π)
+        Random.seed!(42 + k); Om = randn(m_feat) ./ lengthscale_cov[k]; Ph = rand(m_feat) .* convert(T, 2 * pi)
         Z_k = convert(T, sqrt(2/m_feat)) .* cos.(continuous_covs[:, k] * Om' .+ Ph')
         f_cov_total .+= Z_k * (W_mat[:, k] .* sigma_cov[k])
     end
@@ -444,7 +444,7 @@ end
     coords_st = hcat([p[1] for p in modinputs.pts], [p[2] for p in modinputs.pts], modinputs.time_idx ./ N_time)
 
     W_matrix ~ filldist(Normal(0, 1), D_st, M_rff)
-    b_phases ~ filldist(Uniform(0, 2 * π), M_rff)
+    b_phases ~ filldist(Uniform(0, 2 * pi), M_rff)
     beta_rff ~ filldist(Normal(0, sigma_f), M_rff)
 
     projection = (coords_st * W_matrix) .+ b_phases'
@@ -460,7 +460,7 @@ end
 
     # --- 5. Likelihood ---
     t_vals = collect(1:N_time)
-    seasonal_trend = beta_cos .* cos.(2 * π .* t_vals ./ period) .+ beta_sin .* sin.(2 * π .* t_vals ./ period)
+    seasonal_trend = beta_cos .* cos.(2 * pi .* t_vals ./ period) .+ beta_sin .* sin.(2 * pi .* t_vals ./ period)
 
     for i in 1:N_obs
         a, t = modinputs.area_idx[i], modinputs.time_idx[i]
@@ -515,7 +515,7 @@ end
     # --- 4. Adaptive RFF Spatiotemporal Process ---
     coords_st = hcat([p[1] for p in modinputs.pts], [p[2] for p in modinputs.pts], t_norm)
     W_matrix ~ filldist(Normal(0, 1), D_st, M_rff)
-    b_phases ~ filldist(Uniform(0, 2 * π), M_rff)
+    b_phases ~ filldist(Uniform(0, 2 * pi), M_rff)
     beta_rff ~ filldist(Normal(0, sigma_f), M_rff)
     Phi = sqrt(2.0 / M_rff) .* cos.((coords_st * W_matrix) .+ b_phases')
     f_gp = Phi * beta_rff
@@ -529,7 +529,7 @@ end
 
     # --- 6. Likelihoods ---
     t_vals = collect(1:N_time)
-    seasonal_trend = beta_cos .* cos.(2 * π .* t_vals ./ period) .+ beta_sin .* sin.(2 * π .* t_vals ./ period)
+    seasonal_trend = beta_cos .* cos.(2 * pi .* t_vals ./ period) .+ beta_sin .* sin.(2 * pi .* t_vals ./ period)
 
     for i in 1:N_obs
         a, t = modinputs.area_idx[i], modinputs.time_idx[i]
@@ -599,7 +599,7 @@ end
     # --- 4. Adaptive RFF Spatiotemporal Process ---
     coords_st = hcat([p[1] for p in modinputs.pts], [p[2] for p in modinputs.pts], t_norm)
     W_matrix ~ filldist(Normal(0, 1), D_st, M_rff)
-    b_phases ~ filldist(Uniform(0, 2 * π), M_rff)
+    b_phases ~ filldist(Uniform(0, 2 * pi), M_rff)
     beta_rff ~ filldist(Normal(0, sigma_f), M_rff)
     Phi = sqrt(2.0 / M_rff) .* cos.((coords_st * W_matrix) .+ b_phases')
     f_gp = Phi * beta_rff
@@ -613,7 +613,7 @@ end
 
     # --- 6. Likelihoods ---
     t_vals = collect(1:N_time)
-    seasonal_trend = beta_cos .* cos.(2 * π .* t_vals ./ period) .+ beta_sin .* sin.(2 * π .* t_vals ./ period)
+    seasonal_trend = beta_cos .* cos.(2 * pi .* t_vals ./ period) .+ beta_sin .* sin.(2 * pi .* t_vals ./ period)
 
     for i in 1:N_obs
         a, t = modinputs.area_idx[i], modinputs.time_idx[i]
@@ -680,13 +680,13 @@ end
 
     # Mean GP (RFF)
     W_mean ~ filldist(Normal(0, 1), D_st, M_rff)
-    b_mean ~ filldist(Uniform(0, 2 * π), M_rff)
+    b_mean ~ filldist(Uniform(0, 2 * pi), M_rff)
     beta_rff_mean ~ filldist(Normal(0, sigma_f), M_rff)
     f_mean = (sqrt(2.0 / M_rff) .* cos.((coords_st * W_mean) .+ b_mean')) * beta_rff_mean
 
     # Volatility GP (RFF for Log-Variance)
     W_vol ~ filldist(Normal(0, 1), D_st, M_rff_sigma)
-    b_vol ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    b_vol ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     beta_rff_vol ~ filldist(Normal(0, sigma_log_var), M_rff_sigma)
     log_sigma_y = (sqrt(2.0 / M_rff_sigma) .* cos.((coords_st * W_vol) .+ b_vol')) * beta_rff_vol
     sigma_y_process = exp.(log_sigma_y ./ 2.0)
@@ -700,7 +700,7 @@ end
 
     # --- 6. Likelihoods ---
     t_vals = collect(1:N_time)
-    seasonal_trend = beta_cos .* cos.(2 * π .* t_vals ./ period) .+ beta_sin .* sin.(2 * π .* t_vals ./ period)
+    seasonal_trend = beta_cos .* cos.(2 * pi .* t_vals ./ period) .+ beta_sin .* sin.(2 * pi .* t_vals ./ period)
 
     for i in 1:N_obs
         a, t = modinputs.area_idx[i], modinputs.time_idx[i]
@@ -812,18 +812,18 @@ end
     coords_tz = hcat(t_norm, modinputs.z_obs)
     
     # U1 = f1(t, z)
-    W_u1 ~ filldist(Normal(0, 1), 2, M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u1 ~ filldist(Normal(0, 1), 2, M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u1 ~ Exponential(1.0); beta_rff_u1 ~ filldist(Normal(0, sigma_f_u1), M_rff_u)
     u1_true = (sqrt(2/M_rff_u) .* cos.(coords_tz * W_u1 .+ b_u1')) * beta_rff_u1
 
     # U2 = f2(t, z, u1)
     coords_tz_u1 = hcat(t_norm, modinputs.z_obs, u1_true)
-    W_u2 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u2 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u2 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u2 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u2 ~ Exponential(1.0); beta_rff_u2 ~ filldist(Normal(0, sigma_f_u2), M_rff_u)
     u2_true = (sqrt(2/M_rff_u) .* cos.(coords_tz_u1 * W_u2 .+ b_u2')) * beta_rff_u2
 
     # U3 = f3(t, z, u1)
-    W_u3 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u3 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u3 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u3 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u3 ~ Exponential(1.0); beta_rff_u3 ~ filldist(Normal(0, sigma_f_u3), M_rff_u)
     u3_true = (sqrt(2/M_rff_u) .* cos.(coords_tz_u1 * W_u3 .+ b_u3')) * beta_rff_u3
     u_true_mat = hcat(u1_true, u2_true, u3_true)
@@ -849,7 +849,7 @@ end
     f_gp ~ MvNormal(f_mean, Diagonal(max.(1e-6, cov_f_diag)))
 
     # --- 5. Volatility & Categorical Smoothing ---
-    W_vol ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_vol ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    W_vol ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_vol ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     beta_rff_vol ~ filldist(Normal(0, sigma_log_var), M_rff_sigma)
     log_sigma_y = (sqrt(2/M_rff_sigma) .* cos.(coords_st * W_vol .+ b_vol')) * beta_rff_vol
     sigma_y = exp.(log_sigma_y ./ 2.0)
@@ -863,7 +863,7 @@ end
     # --- 6. Likelihoods ---
     beta_z ~ Normal(0, 2); beta_u_main ~ MvNormal(zeros(3), 2.0 * I)
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2 * π .* t_norm * (N_time/period)) .+ beta_sin .* sin.(2 * π .* t_norm * (N_time/period))
+    seasonal = beta_cos .* cos.(2 * pi .* t_norm * (N_time/period)) .+ beta_sin .* sin.(2 * pi .* t_norm * (N_time/period))
 
     for i in 1:N_obs
         a, t = modinputs.area_idx[i], modinputs.time_idx[i]
@@ -901,16 +901,16 @@ end
     t_norm = modinputs.time_idx ./ N_time
     coords_tz = hcat(t_norm, modinputs.z_obs)
     
-    W_u1 ~ filldist(Normal(0, 1), 2, M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u1 ~ filldist(Normal(0, 1), 2, M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u1 ~ Exponential(1.0); beta_rff_u1 ~ filldist(Normal(0, sigma_f_u1), M_rff_u)
     u1_true = (sqrt(2/M_rff_u) .* cos.(coords_tz * W_u1 .+ b_u1')) * beta_rff_u1
 
     coords_tz_u1 = hcat(t_norm, modinputs.z_obs, u1_true)
-    W_u2 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u2 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u2 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u2 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u2 ~ Exponential(1.0); beta_rff_u2 ~ filldist(Normal(0, sigma_f_u2), M_rff_u)
     u2_true = (sqrt(2/M_rff_u) .* cos.(coords_tz_u1 * W_u2 .+ b_u2')) * beta_rff_u2
 
-    W_u3 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u3 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u3 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u3 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u3 ~ Exponential(1.0); beta_rff_u3 ~ filldist(Normal(0, sigma_f_u3), M_rff_u)
     u3_true = (sqrt(2/M_rff_u) .* cos.(coords_tz_u1 * W_u3 .+ b_u3')) * beta_rff_u3
     u_true_mat = hcat(u1_true, u2_true, u3_true)
@@ -936,7 +936,7 @@ end
     f_gp ~ MvNormal(f_mean, Diagonal(max.(1e-6, cov_f_diag)))
 
     # --- 6. Volatility & Categorical ---
-    W_vol ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_vol ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    W_vol ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_vol ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     beta_rff_vol ~ filldist(Normal(0, sigma_log_var), M_rff_sigma)
     log_sigma_y = (sqrt(2/M_rff_sigma) .* cos.(coords_st * W_vol .+ b_vol')) * beta_rff_vol
     sigma_y = exp.(log_sigma_y ./ 2.0)
@@ -950,7 +950,7 @@ end
     # --- 7. Likelihoods ---
     beta_z ~ Normal(0, 2); beta_u_main ~ MvNormal(zeros(3), 2.0 * I)
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2 * π .* t_norm * (N_time/period)) .+ beta_sin .* sin.(2 * π .* t_norm * (N_time/period))
+    seasonal = beta_cos .* cos.(2 * pi .* t_norm * (N_time/period)) .+ beta_sin .* sin.(2 * pi .* t_norm * (N_time/period))
 
     for i in 1:N_obs
         a, t = modinputs.area_idx[i], modinputs.time_idx[i]
@@ -963,6 +963,40 @@ end
 
 
 
+
+@model function model_C00_gaussian_dense_gp(modinputs, ::Type{T}=Float64 ) where {T}
+    # Dense Spatiotemporal Gaussian Process   
+    # Uses a separable space and time kernel  
+  
+    N_obs = length(modinputs.y)
+
+    # --- 1. Priors ---
+    sigma_y ~ Exponential(1.0)
+    sigma_f ~ Exponential(1.0)
+    ls_s ~ Gamma(2, 2)
+    ls_t ~ Gamma(2, 2)
+
+    # --- 2. Coordinate Extraction ---
+    xs = [p[1] for p in modinputs.pts]
+    ys = [p[2] for p in modinputs.pts]
+    ts = Float64.(modinputs.time_idx)
+
+    # --- 3. Kernel Matrix Construction ---
+    k_s = SqExponentialKernel() ∘ ScaleTransform(inv(ls_s))  # space
+    k_t = SqExponentialKernel() ∘ ScaleTransform(inv(ls_t))  # time
+    coords_s = RowVecs(hcat(xs, ys))
+    K = (sigma_f^2) .* kernelmatrix(k_s, coords_s) .* kernelmatrix(k_t, ts) # full covariance (separable)
+    
+    # --- 4. Latent Process ---
+    f_latent ~ MvNormal(zeros(N_obs), K + 1e-6*I)
+  
+    # --- 6. Likelihood ---
+    for i in 1:N_obs
+        mu = modinputs.offset[i] + f_latent[i]  
+        Turing.@addlogprob!  logpdf(Normal(mu, sigma_y), modinputs.y[i])
+    end
+end
+ 
 
 @model function model_C01_gaussian_dense_gp(modinputs, ::Type{T}=Float64; trials=ones(Int, length(modinputs.y)), offset=modinputs.offset, weights=modinputs.weights, period=12.0) where {T}
     # Model A00 Optimized: Dense Spatiotemporal Gaussian Process with Seasonality.
@@ -1006,7 +1040,7 @@ end
     # --- 6. Likelihood ---
     for i in 1:N_obs
         # Add Seasonality component
-        seasonal = beta_cos * cos(2 * π * ts[i] / period) + beta_sin * sin(2 * π * ts[i] / period)
+        seasonal = beta_cos * cos(2 * pi * ts[i] / period) + beta_sin * sin(2 * pi * ts[i] / period)
         
         mu = offset[i] + f_latent[i] + seasonal
         for k in 1:4
@@ -1031,11 +1065,11 @@ end
 
     # --- 2. Deep GP Layer 1 (Input Transformation) ---
     X = hcat([p[1] for p in modinputs.pts], [p[2] for p in modinputs.pts], Float64.(modinputs.time_idx))
-    Random.seed!(42); Om1 = randn(m1, 3) ./ l1; Ph1 = rand(m1) .* convert(T, 2 * π)
+    Random.seed!(42); Om1 = randn(m1, 3) ./ l1; Ph1 = rand(m1) .* convert(T, 2 * pi)
     h1 = (convert(T, sqrt(2/m1)) .* cos.(X * Om1' .+ Ph1')) * w1
 
     # --- 3. Deep GP Layer 2 (Latent Mean Field) ---
-    Random.seed!(43); Om2 = randn(m2, 1) ./ l2; Ph2 = rand(m2) .* convert(T, 2 * π)
+    Random.seed!(43); Om2 = randn(m2, 1) ./ l2; Ph2 = rand(m2) .* convert(T, 2 * pi)
     eta_gp = (convert(T, sqrt(2/m2)) .* cos.(reshape(h1, :, 1) * Om2' .+ Ph2')) * w2
 
     # --- 4. Categorical Smoothing (RW2) ---
@@ -1071,11 +1105,11 @@ end
     X = hcat([p[1] for p in modinputs.pts], [p[2] for p in modinputs.pts], Float64.(modinputs.time_idx))
 
     # --- 3. Layer 1 (Hidden Warp) ---
-    Random.seed!(42); Om1 = randn(m1, 3) ./ lengthscale1; Ph1 = rand(m1) .* convert(T, 2 * π)
+    Random.seed!(42); Om1 = randn(m1, 3) ./ lengthscale1; Ph1 = rand(m1) .* convert(T, 2 * pi)
     h1 = (convert(T, sqrt(2/m1)) .* cos.(X * Om1' .+ Ph1')) * w1
 
     # --- 4. Layer 2 (Latent Response) ---
-    Random.seed!(43); Om2 = randn(m2, 1) ./ lengthscale2; Ph2 = rand(m2) .* convert(T, 2 * π)
+    Random.seed!(43); Om2 = randn(m2, 1) ./ lengthscale2; Ph2 = rand(m2) .* convert(T, 2 * pi)
     eta_gp = (convert(T, sqrt(2/m2)) .* cos.(reshape(h1, :, 1) * Om2' .+ Ph2')) * w2
 
     # --- 5. Categorical Smoothing (RW2) ---
@@ -1109,15 +1143,15 @@ end
 
     # --- 2. Layer 1 (Input Transformation) ---
     X = hcat([p[1] for p in modinputs.pts], [p[2] for p in modinputs.pts], Float64.(modinputs.time_idx))
-    Random.seed!(42); Om1 = randn(m1, 3) ./ l1; Ph1 = rand(m1) .* convert(T, 2 * π)
+    Random.seed!(42); Om1 = randn(m1, 3) ./ l1; Ph1 = rand(m1) .* convert(T, 2 * pi)
     h1 = (convert(T, sqrt(2/m1)) .* cos.(X * Om1' .+ Ph1')) * w1
 
     # --- 3. Layer 2 (Non-linear Manifold Transformation) ---
-    Random.seed!(43); Om2 = randn(m2, 1) ./ l2; Ph2 = rand(m2) .* convert(T, 2 * π)
+    Random.seed!(43); Om2 = randn(m2, 1) ./ l2; Ph2 = rand(m2) .* convert(T, 2 * pi)
     h2 = (convert(T, sqrt(2/m2)) .* cos.(reshape(h1, :, 1) * Om2' .+ Ph2')) * w2
 
     # --- 4. Layer 3 (Response Surface) ---
-    Random.seed!(44); Om3 = randn(m3, 1) ./ l3; Ph3 = rand(m3) .* convert(T, 2 * π)
+    Random.seed!(44); Om3 = randn(m3, 1) ./ l3; Ph3 = rand(m3) .* convert(T, 2 * pi)
     eta_gp = (convert(T, sqrt(2/m3)) .* cos.(reshape(h2, :, 1) * Om3' .+ Ph3')) * w3
 
     # --- 5. Categorical Smoothing (RW2) ---
@@ -1172,7 +1206,7 @@ end
     Random.seed!(42)
     # Sample frequencies scaled by dimension-specific lengthscales
     Om = randn(m_joint, 3) .* (1.0 ./ l_joint')
-    Ph = rand(m_joint) .* convert(T, 2π)
+    Ph = rand(m_joint) .* convert(T, 2pi)
     
     Z_joint = convert(T, sqrt(2/m_joint)) .* cos.(X_joint * Om' .+ Ph')
     eta_joint = Z_joint * (w_joint .* sigma_joint)
@@ -1223,7 +1257,7 @@ end
     # Frequencies sampled for a Matern kernel approximation
     # Note: For Matern nu=1.5, we sample from a Student-t distribution spectral density
     Om = randn(m_spatial, 2) .* kappa_sp
-    Ph = rand(m_spatial) .* convert(T, 2π)
+    Ph = rand(m_spatial) .* convert(T, 2pi)
     
     Z_sp = convert(T, sqrt(2/m_spatial)) .* cos.(coords * Om' .+ Ph')
     s_eff = Z_sp * (w_sp .* sigma_sp)
@@ -1278,7 +1312,7 @@ end
     # This layer 'warps' the 2D coordinates into a latent space
     Random.seed!(44)
     Om_w = randn(m_warp, 2) ./ l_warp
-    Ph_w = rand(m_warp) .* convert(T, 2π)
+    Ph_w = rand(m_warp) .* convert(T, 2pi)
     
     # Warped coordinates: g(s)
     warped_coords = (convert(T, sqrt(2/m_warp)) .* cos.(coords * Om_w' .+ Ph_w')) * w_warp
@@ -1287,7 +1321,7 @@ end
     # We apply a stationary kernel to the warped output
     Random.seed!(45)
     Om_s = randn(m_spatial, 1) ./ l_spatial
-    Ph_s = rand(m_spatial) .* convert(T, 2π)
+    Ph_s = rand(m_spatial) .* convert(T, 2pi)
     
     Z_sp = convert(T, sqrt(2/m_spatial)) .* cos.(reshape(warped_coords, :, 1) * Om_s' .+ Ph_s')
     s_eff = Z_sp * (w_sp .* sigma_sp)
@@ -1364,7 +1398,7 @@ end
         
         for m in 1:n_mosaics
             # Local RFF Field Calculation
-            z_proj = sqrt(2/m_rff) .* cos.( (Om_m[m] * pt ./ l_local[m]) .+ (Ph_m[m] .* 2π) )
+            z_proj = sqrt(2/m_rff) .* cos.( (Om_m[m] * pt ./ l_local[m]) .+ (Ph_m[m] .* 2pi) )
             local_field = mu_local[m] + dot(z_proj, w_local[m] .* sigma_local[m])
             
             # Blend local field and local noise
@@ -1449,7 +1483,7 @@ end
             Om = Om_base[m] .* (1.0 ./ (l_joint[:, m] .+ 1e-6)')
 
             # Local Non-Separable Field
-            z_proj = sqrt(2/m_rff) * cos.( (Om * pt_3d) .+ (Ph_base[m] .* 2π) )
+            z_proj = sqrt(2/m_rff) * cos.( (Om * pt_3d) .+ (Ph_base[m] .* 2pi) )
             local_field = mu_local[m] + dot(z_proj, w_local[m] .* sigma_local[m])
 
             eta_spatial_time += weights_st[m] * local_field
@@ -1559,16 +1593,16 @@ end
     # --- 3. Non-linear Nested Structure (RFF) ---
     t_norm = modinputs.time_idx ./ N_time
     coords_tz = hcat(t_norm, modinputs.z_obs)
-    W_u1 ~ filldist(Normal(0, 1), 2, M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u1 ~ filldist(Normal(0, 1), 2, M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u1 ~ Exponential(1.0); beta_rff_u1 ~ filldist(Normal(0, sigma_f_u1), M_rff_u)
     u1_true = (sqrt(2/M_rff_u) .* cos.(coords_tz * W_u1 .+ b_u1')) * beta_rff_u1
 
     coords_tz_u1 = hcat(t_norm, modinputs.z_obs, u1_true)
-    W_u2 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u2 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u2 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u2 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u2 ~ Exponential(1.0); beta_rff_u2 ~ filldist(Normal(0, sigma_f_u2), M_rff_u)
     u2_true = (sqrt(2/M_rff_u) .* cos.(coords_tz_u1 * W_u2 .+ b_u2')) * beta_rff_u2
 
-    W_u3 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u3 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u3 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u3 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u3 ~ Exponential(1.0); beta_rff_u3 ~ filldist(Normal(0, sigma_f_u3), M_rff_u)
     u3_true = (sqrt(2/M_rff_u) .* cos.(coords_tz_u1 * W_u3 .+ b_u3')) * beta_rff_u3
     u_true_mat = hcat(u1_true, u2_true, u3_true)
@@ -1597,7 +1631,7 @@ end
     f_gp ~ MvNormal(f_mean, Diagonal(max.(1e-6, cov_f_diag)))
 
     # --- 6. Volatility & Categorical Smoothing ---
-    W_vol ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_vol ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    W_vol ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_vol ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     beta_rff_vol ~ filldist(Normal(0, sigma_log_var), M_rff_sigma)
     log_sigma_y = (sqrt(2/M_rff_sigma) .* cos.(coords_st * W_vol .+ b_vol')) * beta_rff_vol
     sigma_y = exp.(log_sigma_y ./ 2.0)
@@ -1611,7 +1645,7 @@ end
     # --- 7. Likelihoods ---
     beta_z ~ Normal(0, 2); beta_u_main ~ MvNormal(zeros(3), 2.0 * I)
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2 * π .* t_norm * (N_time/period)) .+ beta_sin .* sin.(2 * π .* t_norm * (N_time/period))
+    seasonal = beta_cos .* cos.(2 * pi .* t_norm * (N_time/period)) .+ beta_sin .* sin.(2 * pi .* t_norm * (N_time/period))
 
     for i in 1:N_obs
         a, t = modinputs.area_idx[i], modinputs.time_idx[i]
@@ -1646,16 +1680,16 @@ end
     # --- 3. Non-linear Nested Structure (RFF) ---
     t_norm = modinputs.time_idx ./ N_time
     coords_tz = hcat(t_norm, modinputs.z_obs)
-    W_u1 ~ filldist(Normal(0, 1), 2, M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u1 ~ filldist(Normal(0, 1), 2, M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u1 ~ Exponential(1.0); beta_rff_u1 ~ filldist(Normal(0, sigma_f_u1), M_rff_u)
     u1_true = (sqrt(2/M_rff_u) .* cos.(coords_tz * W_u1 .+ b_u1')) * beta_rff_u1
 
     coords_tz_u1 = hcat(t_norm, modinputs.z_obs, u1_true)
-    W_u2 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u2 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u2 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u2 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u2 ~ Exponential(1.0); beta_rff_u2 ~ filldist(Normal(0, sigma_f_u2), M_rff_u)
     u2_true = (sqrt(2/M_rff_u) .* cos.(coords_tz_u1 * W_u2 .+ b_u2')) * beta_rff_u2
 
-    W_u3 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u3 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u3 ~ filldist(Normal(0, 1), 3, M_rff_u); b_u3 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     sigma_f_u3 ~ Exponential(1.0); beta_rff_u3 ~ filldist(Normal(0, sigma_f_u3), M_rff_u)
     u3_true = (sqrt(2/M_rff_u) .* cos.(coords_tz_u1 * W_u3 .+ b_u3')) * beta_rff_u3
     u_true_mat = hcat(u1_true, u2_true, u3_true)
@@ -1687,7 +1721,7 @@ end
     f_gp ~ MvNormal(f_mean, Diagonal(max.(1e-6, cov_f_diag)))
 
     # --- 6. Volatility & Categorical Smoothing ---
-    W_vol ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_vol ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    W_vol ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_vol ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     beta_rff_vol ~ filldist(Normal(0, sigma_log_var), M_rff_sigma)
     log_sigma_y = (sqrt(2/M_rff_sigma) .* cos.(coords_st * W_vol .+ b_vol')) * beta_rff_vol
     sigma_y = exp.(log_sigma_y ./ 2.0)
@@ -1701,7 +1735,7 @@ end
     # --- 7. Likelihoods ---
     beta_z ~ Normal(0, 2); beta_u_main ~ MvNormal(zeros(3), 2.0 * I)
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2 * π .* t_norm * (N_time/period)) .+ beta_sin .* sin.(2 * π .* t_norm * (N_time/period))
+    seasonal = beta_cos .* cos.(2 * pi .* t_norm * (N_time/period)) .+ beta_sin .* sin.(2 * pi .* t_norm * (N_time/period))
 
     for i in 1:N_obs
         a, t = modinputs.area_idx[i], modinputs.time_idx[i]
@@ -1878,7 +1912,7 @@ end
     beta_y_gp ~ filldist(Normal(0, 1), M_rff)
 
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2 * π .* coords_time ./ period) .+ beta_sin .* sin.(2 * π .* coords_time ./ period)
+    seasonal = beta_cos .* cos.(2 * pi .* coords_time ./ period) .+ beta_sin .* sin.(2 * pi .* coords_time ./ period)
     f_y = (rff_map(coords_l3, W_y, b_y) * beta_y_gp) .+ vec(seasonal)
 
     # --- 5. Likelihood ---
@@ -1925,11 +1959,11 @@ end
 
     # --- 2. Nested Latent Covariates (RFF Mapping) ---
     coords_tz = hcat(coords_time, modinputs.z_obs)
-    W_u1 ~ filldist(Normal(0, 1), size(coords_tz, 2), M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u1 ~ filldist(Normal(0, 1), size(coords_tz, 2), M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     u1_true = rff_map(coords_tz, W_u1, b_u1) * filldist(Normal(0, 1), M_rff_u)
 
     coords_tz_u1 = hcat(coords_time, modinputs.z_obs, u1_true)
-    W_u2 ~ filldist(Normal(0, 1), size(coords_tz_u1, 2), M_rff_u); b_u2 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u2 ~ filldist(Normal(0, 1), size(coords_tz_u1, 2), M_rff_u); b_u2 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     u2_true = rff_map(coords_tz_u1, W_u2, b_u2) * filldist(Normal(0, 1), M_rff_u)
 
     # --- 3. Nyström GP (Low Rank Approximation) ---
@@ -1947,13 +1981,13 @@ end
     f_nystrom = sigma_f .* (K_xz * (cholesky(K_zz).U \ v_latent))
 
     # --- 4. Spatiotemporal Stochastic Volatility ---
-    W_sigma ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    W_sigma ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     beta_rff_sigma ~ filldist(Normal(0, 1), M_rff_sigma)
     sigma_y = exp.(rff_map(coords_st, W_sigma, b_sigma) * beta_rff_sigma ./ 2)
 
     # --- 5. Likelihood ---
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2 * π .* coords_time ./ period) .+ beta_sin .* sin.(2 * π .* coords_time ./ period)
+    seasonal = beta_cos .* cos.(2 * pi .* coords_time ./ period) .+ beta_sin .* sin.(2 * pi .* coords_time ./ period)
 
     for i in 1:N_obs
         a = modinputs.area_idx[i]
@@ -2004,16 +2038,16 @@ end
     trend = alpha[indexin(coords_time[:,1], unique_times)]
 
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2 * π .* coords_time ./ period) .+ beta_sin .* sin.(2 * π .* coords_time ./ period)
+    seasonal = beta_cos .* cos.(2 * pi .* coords_time ./ period) .+ beta_sin .* sin.(2 * pi .* coords_time ./ period)
 
     # --- 3. Nested Latent Covariates (RFF) ---
     coords_tz = hcat(coords_time, modinputs.z_obs)
-    W_u1 ~ filldist(Normal(0, 1), size(coords_tz, 2), M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u1 ~ filldist(Normal(0, 1), size(coords_tz, 2), M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     u1_true = rff_map(coords_tz, W_u1, b_u1) * filldist(Normal(0, 1), M_rff_u)
 
     # --- 4. Stochastic Volatility ---
     coords_st = hcat(coords_space, coords_time)
-    W_sigma ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    W_sigma ~ filldist(Normal(0, 1), D_st, M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     beta_rff_sigma ~ filldist(Normal(0, 1), M_rff_sigma)
     sigma_y = exp.(rff_map(coords_st, W_sigma, b_sigma) * beta_rff_sigma ./ 2)
 
@@ -2076,7 +2110,7 @@ end
 
     # --- 4. Stochastic Volatility (RFF) ---
     coords_st = hcat(coords_space, coords_time)
-    W_sigma ~ filldist(Normal(0, 1), size(coords_st, 2), M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    W_sigma ~ filldist(Normal(0, 1), size(coords_st, 2), M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     beta_rff_sigma ~ filldist(Normal(0, 1), M_rff_sigma)
     sigma_y = exp.(rff_map(coords_st, W_sigma, b_sigma) * beta_rff_sigma ./ 2)
 
@@ -2124,7 +2158,7 @@ end
 
     # --- 2. Nested Latent Covariates (RFF) ---
     coords_tz = hcat(coords_time, modinputs.z_obs)
-    W_u1 ~ filldist(Normal(0, 1), size(coords_tz, 2), M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * π), M_rff_u)
+    W_u1 ~ filldist(Normal(0, 1), size(coords_tz, 2), M_rff_u); b_u1 ~ filldist(Uniform(0, 2 * pi), M_rff_u)
     u1_true = rff_map(coords_tz, W_u1, b_u1) * filldist(Normal(0, 1), M_rff_u)
 
     # --- 3. Main Spatiotemporal Process (Kronecker) ---
@@ -2135,13 +2169,13 @@ end
 
     # --- 4. Stochastic Volatility (RFF) ---
     coords_st = hcat(coords_space, coords_time)
-    W_sigma ~ filldist(Normal(0, 1), size(coords_st, 2), M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    W_sigma ~ filldist(Normal(0, 1), size(coords_st, 2), M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     beta_rff_sigma ~ filldist(Normal(0, 1), M_rff_sigma)
     sigma_y = exp.(rff_map(coords_st, W_sigma, b_sigma) * beta_rff_sigma ./ 2)
 
     # --- 5. Likelihood ---
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2 * π .* coords_time ./ period) .+ beta_sin .* sin.(2 * π .* coords_time ./ period)
+    seasonal = beta_cos .* cos.(2 * pi .* coords_time ./ period) .+ beta_sin .* sin.(2 * pi .* coords_time ./ period)
 
     for i in 1:N_obs
         a = modinputs.area_idx[i]
@@ -2288,11 +2322,11 @@ end
     # --- 4. Stochastic Volatility & Seasonality ---
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
     t_vec = modinputs.time_idx ./ Nt_y
-    seasonal_y = beta_cos .* cos.(2 * π .* t_vec) .+ beta_sin .* sin.(2 * π .* t_vec)
+    seasonal_y = beta_cos .* cos.(2 * pi .* t_vec) .+ beta_sin .* sin.(2 * pi .* t_vec)
 
     coords_st_y = hcat(modinputs.pts, modinputs.time_idx)
     W_sigma ~ filldist(Normal(0, 1), size(coords_st_y, 2), M_rff_sigma)
-    b_sigma ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    b_sigma ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     sigma_log_var ~ Exponential(1.0); beta_rff_sigma ~ filldist(Normal(0, sigma_log_var^2), M_rff_sigma)
     sigma_y_vec = exp.(rff_map(coords_st_y, W_sigma, b_sigma) * beta_rff_sigma ./ 2)
 
@@ -2328,7 +2362,7 @@ end
     coords_z_s = modinputs.pts[1:Nz, :]
     D_z_in = size(coords_z_s, 2)
     W_z ~ filldist(Normal(0, 1), D_z_in, M_rff_base)
-    b_z ~ filldist(Uniform(0, 2 * π), M_rff_base)
+    b_z ~ filldist(Uniform(0, 2 * pi), M_rff_base)
     sigma_z_f ~ Exponential(1.0)
     beta_z ~ filldist(Normal(0, sigma_z_f^2), M_rff_base)
 
@@ -2345,7 +2379,7 @@ end
 
     coords_u_rff_in = hcat(coords_u_s, coords_u_t, z_at_u_s)
     W_u ~ filldist(Normal(0, 1), size(coords_u_rff_in, 2), M_rff_base)
-    b_u ~ filldist(Uniform(0, 2 * π), M_rff_base)
+    b_u ~ filldist(Uniform(0, 2 * pi), M_rff_base)
     sigma_u_f ~ Exponential(1.0)
     beta_u1 ~ filldist(Normal(0, sigma_u_f^2), M_rff_base)
 
@@ -2373,18 +2407,18 @@ end
 
     coords_y_rff_in = hcat(modinputs.pts, modinputs.time_idx, z_at_y, u1_at_y)
     W_y_gp ~ filldist(Normal(0, 1), size(coords_y_rff_in, 2), M_rff_base)
-    b_y_gp ~ filldist(Uniform(0, 2 * π), M_rff_base)
+    b_y_gp ~ filldist(Uniform(0, 2 * pi), M_rff_base)
     sigma_y_gp_f ~ Exponential(1.0)
     beta_y_gp ~ filldist(Normal(0, sigma_y_gp_f^2), M_rff_base)
     f_st_y = rff_map(coords_y_rff_in, W_y_gp, b_y_gp) * beta_y_gp
 
     # Stochastic Volatility & Seasonality
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal_y = beta_cos .* cos.(2 * π .* modinputs.time_idx ./ Nt_y) .+ beta_sin .* sin.(2 * π .* modinputs.time_idx ./ Nt_y)
+    seasonal_y = beta_cos .* cos.(2 * pi .* modinputs.time_idx ./ Nt_y) .+ beta_sin .* sin.(2 * pi .* modinputs.time_idx ./ Nt_y)
 
     coords_st_y = hcat(modinputs.pts, modinputs.time_idx)
     W_sigma ~ filldist(Normal(0, 1), size(coords_st_y, 2), M_rff_sigma)
-    b_sigma ~ filldist(Uniform(0, 2 * π), M_rff_sigma)
+    b_sigma ~ filldist(Uniform(0, 2 * pi), M_rff_sigma)
     sigma_log_var ~ Exponential(1.0); beta_rff_sigma ~ filldist(Normal(0, sigma_log_var^2), M_rff_sigma)
     sigma_y_vec = exp.(rff_map(coords_st_y, W_sigma, b_sigma) * beta_rff_sigma ./ 2)
 

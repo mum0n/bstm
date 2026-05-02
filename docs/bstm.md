@@ -348,8 +348,9 @@ Before getting into the nitty gritty of the spatiotemporal models, let us go thr
 We reformat this data Tuple (*data_scot*) further with 'prepare_model_inputs()' to create structured inputs for, in this case, a simple separable spatiotemporal model (model_D1_poisson_simple).  
  
 ```{julia}
- 
-# prepapre model inputs  
+#| D00: Base Model - Sparse GMRF Separable Spatiotemporal  
+
+# prepare model inputs  
 
 modinputs = prepare_model_inputs( 
   y = data_scot.y,         # y-value, counts of people with lip cancer
@@ -364,7 +365,7 @@ modinputs = prepare_model_inputs(
 # create model instance
 mod = model_D00_poisson_simple(modinputs) # Turing model object
 
-# sample with Metropolis-Hastings
+# sample with Metropolis-Hastings: 
 chain = sample(mod, MH(), 5000; num_warmup=10000, thin=50, progress=true, drop_warmup=true )  
 
 # extract results see a few figures
@@ -379,15 +380,81 @@ display(results.plots.st_denoised)
 display(results.plots.st_noisy)
  
 ```
+ 
+These results are "ok". But there is lots of room for improvement--starting with the sampler: MH() is a simple one that is used here for checking timings only. Extracting different components of the model internals takes a little more digging, but as these are Bayesian models, every aspect is completely available and adjustable. The model itself is a basic one (separable time and space) with no covariates. However, it does use optimizations that take advantage of the sparse nature of the neighbourhood adjacency matrix and the temporal autocorrelation. In other words, a sparse form can speed through 15000 samples in a reasonable amount of time (7.6 seconds). 
 
-As evident, the main workflow is simple. These results are "ok". But there is lots of room for improvement. Extracting different components of the model internals takes a little more digging, but as these are Bayesian models, every aspect is completely available.  
+In contrast, when an unoptimized model is used, the inversion of the full spatial and temporal covariance matrices is required ($O(n^3)$) due to the dense nature of the covariance matrices. This is approach is equivalent to Kriging solutions, where a squared exponential covariance function is used for both space and time. Notice that the following used 2 orders of magnitude fewer samples (150) than the sparse form and it still take more time (21 secconds, almost 3 X more for 100 X fewer samples !).   
 
+```{julia}
+#| label: C00: Base Model - Dense Kernel Matrix Separable Spatiotemporal GP
+
+mod = model_C00_gaussian_dense_gp(modinputs) # Turing model object
+chain = sample(mod, MH(), 50; num_warmup=100, thin=50, progress=true, drop_warmup=true )  
+
+```    
+
+*   Spatiotemporal GP (f):
+    *   Separable Covariance: Assumes the spatiotemporal kernel can be factored into a product of a spatial kernel and a temporal kernel, i.e., $K((x_s, t_s), (x_t, t_t)) = K_s(x_s, x_t) \times K_t(t_s, t_t)$.
+    *   Spatial Kernel: Isotropic Squared Exponential kernel (single lengthscale `ls_s`).
+    *   Temporal Kernel: Squared Exponential kernel (single lengthscale `ls_t`).
+    *   Dense Kernel Matrix: Computes the full $N \times N$ covariance matrix, leading to $O(N^3)$ computational complexity for inference, which is noted as "very slow".
+    *   Non-centered Parameterization: The latent GP `f` is sampled directly from `MvNormal(zeros(N), K + 1e-6*I)`.
+
+*   Observation Noise (sigma_y, sigma_u): Assumed to be homoscedastic (constant variance) and normally distributed.
+
+*   Priors: Standard weakly informative priors (Exponential for scales, Normal for coefficients, Uniform for phases).
+
+*   Problem: very slow, really slow
+
+
+The other purpose of the above example was to show that the workflow is simple, once the model form has been chosen. The model structure is important and where the time and resources should be spent: deliberating utility, rather than trying to debug,implement and run.
+
+#### Optimization-based approaches
+
+Though MCMC sampling is our gold-standard, we also have other optimization-based options that can be worth considering. All of these methods are boosted by Automatic Differentiation, some require smooth differentiable likelihood surfaces, while others are robust and can be range bound. See the [whole list here](https://docs.sciml.ai/Optimization/stable/optimization_packages/optim/). 
+
+- Maximum likelihood (ML) estimation can be much faster than MCMC as pure optimization of a point mass is considerably simpler as priors are ignored and there is no need to carry posterior samples. Many specialized optimization algorithms exist that have been tried and tested over many years. 
+- Maximum a-posteriori (MAP) estimation is the same as ML except that prior information is used as well and so a bit closer to MCMC in spirit, though the focus is still upon the point estimates. 
+- Variational Inference is also an optimization method. However, it approaches the problem using the ELBO estimator. In priciple it is closest to MCMC and able to describe the posterior distribution reasonably well. It is, therefore, similar to INLA, except that in the latter, a Laplace Approximation is used which comes with other constraints.
+
+All three methods are accessible with the same Turing/Julia model (but not Laplace Approximation, to my knowledge, though that may always change). The following code snippet shows how to run then and even use one as the starting point of another. Let us return to the sparse demonstration model: model_D00_poisson_simple(modinputs).
+ 
+
+```{julia}
+#| Optimization approaches
+
+using Optim, AdvancedVI, Turing
+
+# ML
+mod = model_D00_poisson_simple(modinputs) # Turing model object
+mod_opt = maximum_likelihood(mod, LBFGS() )
+mod_opt.optim_result.retcode  # it fails 
+mod_opt.params 
+
+# MAP
+mod_map = maximum_a_posteriori( mod, NelderMead() )
+mod_map.optim_result.retcode  # it fails
+mod_map.params
+
+# VI: Mean-Field Variational Inference (ADVI), Default optimiser is TruncatedADAGrad
+mod_vi = Turing.vi(mod, ADVI(10, 1000), Variational.meanfield(mod))  #, optimizer=Flux.ADAM(1e-1));
+pm = mod_vi.mmean
+msamples = DataFrame( rand(mod_vi, nsamps )', :auto )
+
+``` 
+
+Any of these point estimates can be used as starting points for MCMC runs--if you trust the point estimates to have converged to a correct solution, otherwise you would be pointing MCMC runs to start from a pathological positon. 
+   
 
 ### Finalize simulated data 
 
-As we are now more or less ready to study the spatiotemporal models, we move to our previous simulated data set ("data") as we can readily increase or decrease the amount of data to see how useful these methods are. We also need to agree upon a spatial partitioning scheme. We start from scratch and use the Agglomerative Voronoi Tesselation (:avt) method with a slightly larger, tolerance=0.1, which causes the algorithm to stop earlier, ultimately resulting in fewer spatial units. 
+As we are now more or less ready to study the full spectrum of spatiotemporal models, we move to our previous simulated data set ("data") as we can readily increase or decrease and adjust the amount of data to balance the time required and see how useful these methods are and why some might be worth the extra wait and others not. 
+
+Before proceeding, we also need to agree upon a spatial partitioning scheme. We start from scratch and use the Agglomerative Voronoi Tesselation (:avt) method with a slightly larger, tolerance=0.1, which causes the algorithm to stop earlier, ultimately resulting in fewer spatial units. The balance of information (being able to resolve small spatial patterns) and costs (computational time) is one that must be judged based upon the specifics of every application.
 
 ```{julia}
+#| label: Data and spatial partitioning
+
 n_pts = 100
 n_time = 15
  
@@ -444,12 +511,10 @@ Note the target point density is similar to the final density.
 
 
 ```{julia}
-
-# Setup shared precomputations
-n_categories = 9  # how many groups are used for discretization of covariates (when used) 
-
+#| label: create structured model inputs and model_list definitions 
+ 
 # Populate standard input sets per response family
-modinputs = prepare_model_inputs(
+modinputs_reference = prepare_model_inputs(
     y = data.y_obs, 
     pts = data.pts, 
     area_idx = au.assignments, 
@@ -461,14 +526,13 @@ modinputs = prepare_model_inputs(
     u_obs = data.u_obs,
     trials = data.trials
 )
- 
   
 
 # Specialized input sets for family-specific response variables
-modinputs_gaussian = modinputs
-modinputs_count = merge(modinputs, (y=data.y_counts,))
-modinputs_binomial = merge(modinputs, (y=data.y_binary,))
-modinputs_lognormal = merge(modinputs, (y=exp.(data.y_obs),))
+modinputs_gaussian = modinputs_reference
+modinputs_count = merge(modinputs_reference, (y=data.y_counts,))
+modinputs_binomial = merge(modinputs_reference, (y=data.y_binary,))
+modinputs_lognormal = merge(modinputs_reference, (y=exp.(data.y_obs),))
 
  ```julia
 # Consolidated Model Registry for D-Series (Discrete) and C-Series (Continuous)
@@ -521,7 +585,7 @@ model_list = Dict(
 
 println("Model registry updated with $(length(model_list)) D- and C-series variants.")
 
-
+# quick check to see if models are still functional 
 for model_key in sort(collect(keys(model_list))[9:41] )
   display(model_key)
   if model_key == "C08_refined_mosaic" break
@@ -530,133 +594,14 @@ for model_key in sort(collect(keys(model_list))[9:41] )
   chain = sample(target_model, target_sampler, 10; progress=true)
 end
 
+     
 
-
-using BenchmarkTools
-
-# Benchmark Configuration
-
-n_iters = 1000
-n_samples_bench = 200
-n_chains_bench = 2
-bench_results = []
-
-println("Starting Registry Benchmark Loop...")
-println("------------------------------------")
-
-# Iterate through the model registry
-for model_key in sort(collect(keys(model_list)))
-    println("Benchmarking: $model_key")
-    
-    try
-        # 1. Instantiate the model from the registry
-        target_model = model_list[model_key]()
-        
-        # 2. Retrieve the optimized Gibbs sampler
-        target_sampler = get_optimal_sampler(model_key)
-        
-        # 3. Execute Benchmarked Sampling
-        start_time = time()
-        # Short run for timing estimation
-        chain = sample(target_model, target_sampler, MCMCThreads(), n_samples_bench, n_chains_bench; progress=false)
-        elapsed = time() - start_time
-        
-        # 4. Extract Diagnostics
-        summ = summarize(chain)
-        avg_ess = mean(summ[:, :ess_bulk])
-        max_rhat = maximum(summ[:, :rhat])
-        ess_per_sec = avg_ess / elapsed
-        
-        # 5. Store Results
-        push!(bench_results, (
-            model = model_key, 
-            time_sec = round(elapsed, digits=2), 
-            ess_avg = round(avg_ess, digits=1), 
-            ess_sec = round(ess_per_sec, digits=2),
-            max_rhat = round(max_rhat, digits=3),
-            status = "Success"
-        ))
-        
-        println("   Done. Time: $(round(elapsed, digits=2))s | ESS/sec: $(round(ess_per_sec, digits=2))")
-        
-    catch e
-        @warn "Model $model_key failed benchmarking: $e"
-        push!(bench_results, (
-            model = model_key, 
-            time_sec = NaN, 
-            ess_avg = NaN, 
-            ess_sec = NaN, 
-            max_rhat = NaN, 
-            status = "Error: $e"
-        ))
-    end
-end
-
-# Convert results to DataFrame for analysis
-bench_df = DataFrame(bench_results)
-sort!(bench_df, :ess_sec, rev=true)
-
-display(bench_df)
-
-
-# Visualization of Benchmarking Performance
-if !isempty(bench_results)
-    p_bench = bar(bench_df.model, bench_df.ess_sec, 
-                  title="Sampler Efficiency by Model", 
-                  ylabel="Effective Samples per Second (ESS/sec)", 
-                  xrotation=90, 
-                  legend=false, 
-                  size=(900, 500),
-                  color=:viridis)
-    display(p_bench)
-end
-
-
-
-
-
-# --- Display Summary Table ---
-println("\n" * "="^35)
-println(rpad("Model", 25), " | ", "Time (s)")
-println("-"^35)
-for m_key in sort(collect(keys(bench_results)))
-    time_val = isnan(bench_results[m_key]) ? "Error" : string(round(bench_results[m_key], digits=2))
-    println(rpad(m_key, 25), " | ", time_val)
-end
-println("="^35)
-
-
-
-# ---------- to view so plots:
-
-mod_fns =  collect(keys(model_registry))
-
-i = 1 # 1:9
-
-@load_carstm_state( mod_fns[i] )
-
-using Turing
-
-# 1. Instantiate Model v2
-mod_v2 = model_v2_rff_gaussian(modinputs)
-
-# 2. Define the Optimized Gibbs Sampler
-# We partition the parameters by their mathematical properties
-optimal_gibbs = Gibbs(
-    # Gaussian Latents: Use ESS for optimal movement without tuning
-    (:u_icar, :u_iid, :w_trend, :w_seas, :st_int_raw) => ESS(),
-
-    # Regression Coefficients: Use NUTS for adaptive gradient-based exploration
-    (:beta_cov) => NUTS(),
-
-    # Variance Components: Use MH for simple scalar parameters
-    (:sigma_y, :sigma_sp, :phi_sp, :sigma_trend, :sigma_seas, :sigma_int, :sigma_rw2) => MH()
-)
-
-# 3. Execute Production-Scale Sampling
-# Running a moderate chain for verification; scale iterations to 2000+ for production
-println("Starting Optimized Mixed-Sampler Gibbs for Model 2...")
-chain_v2_optimized = sample(mod_v2, optimal_gibbs, 10; progress=true)
+# mod_fns =  collect(keys(model_registry))
+# i = 1 # 1:9
+# @load_carstm_state( mod_fns[i] )
+ 
+mod = model_v2_rff_gaussian(modinputs_gaussian)
+chain_v2_optimized = sample(mod, optimal_gibbs, 10; progress=true)
  
  
 
@@ -668,7 +613,7 @@ using Turing, Optim
 println("Running MAP Optimization for model_v1_gaussian...")
 
 # 1. Instantiate the model using the stable precomputations
-m_v1 = model_v1_gaussian(modinputs)
+m_v1 = model_v1_gaussian(modinputs_gaussian)
 
 # 2. Perform MAP optimization using the correct library path
 # Using Optim.optimize directly to avoid ambiguity and fix the module nesting error
@@ -1069,14 +1014,14 @@ println("Running smoke test for Model v11 (Non-Separable RFF)... ")
 
 # Fix: Ensure modinputs contains observation-level coordinates
 # Repeating the base centroids to match the total observation count (N_areas * N_years)
-N_total_obs = length(modinputs.y)
-n_areas_base = size(modinputs.Q_sp, 1)
+N_total_obs = length(modinputs_reference.y)
+n_areas_base = size(modinputs_reference.Q_sp, 1)
 n_years_base = Int(N_total_obs / n_areas_base)
 
-pts_full = repeat(modinputs.pts_raw[1:n_areas_base], n_years_base)
+pts_full = repeat(modinputs_reference.pts_raw[1:n_areas_base], n_years_base)
 
-# Update modinputs for this specific model run
-modinputs_v11 = merge(modinputs, (pts_raw = pts_full,))
+# Update modinputs_reference for this specific model run
+modinputs_v11 = merge(modinputs_reference, (pts_raw = pts_full,))
 
 mod_v11 = model_v11_non_separable_rff(modinputs_v11; m_joint=20)
 
@@ -1096,7 +1041,7 @@ Instead of the discrete BYM2/ICAR graph structure used in Model v1, Model v12 ad
 
 # Verification of SPDE Model v12
 println("Initializing SPDE Model v12...")
-mod_v12 = model_v12_spde_gaussian(modinputs; m_spatial=30)
+mod_v12 = model_v12_spde_gaussian(modinputs_gaussian; m_spatial=30)
 
 # MAP for rapid convergence
 # map_v12 = maximum_a_posteriori(mod_v12)
@@ -1117,7 +1062,7 @@ Standard GP and SPDE models assume **stationarity**: the correlation between two
 
 # Verification of Non-Stationary Warping Model v13
 println("Initializing Non-Stationary Model v13...")
-mod_v13 = model_v13_nonstationary_warping(modinputs; m_warp=8, m_spatial=25)
+mod_v13 = model_v13_nonstationary_warping(modinputs_gaussian; m_warp=8, m_spatial=25)
 
 # MAP Estimate
 # map_v13 = maximum_a_posteriori(mod_v13)
@@ -1148,7 +1093,7 @@ using SparseArrays, FFTW, Statistics
 println("Sampling from FFT-Accelerated Model v14...")
 
 # Instantiate model with fixed grid resolution parameters
-mod_v14_final = model_v14_fft_gaussian(modinputs; grid_res=64, pad_factor=2)
+mod_v14_final = model_v14_fft_gaussian(modinputs_gaussian; grid_res=64, pad_factor=2)
 
 # Run MH sampler for verification (100 samples)
 chain_v14 = sample(mod_v14_final, MH(), 100)
@@ -1157,8 +1102,8 @@ chain_v14 = sample(mod_v14_final, MH(), 100)
 display(MCMCChains.summarize(chain_v14[[:sigma_sp, :sigma_tm, :rho_tm]]))
 
 # Reconstruct and visualize
-stats_v14 = reconstruct_posteriors(mod_v14_final, chain_v14, modinputs)
-plt_v14 = plot_posterior_results(stats_v14, modinputs; effect=:spatial)
+stats_v14 = reconstruct_posteriors(mod_v14_final, chain_v14, modinputs_gaussian)
+plt_v14 = plot_posterior_results(stats_v14, modinputs_gaussian; effect=:spatial)
 title!(plt_v14, "Model v14: FFT-Accelerated Spatial Field")
 display(plt_v14)
 
@@ -1177,7 +1122,7 @@ using LinearAlgebra, SparseArrays, Random
 
 
 println("Running Refined Mosaic Model v15.1...")
-mod_v15_ref = model_v15_refined_mosaic(modinputs; n_mosaics=4, m_rff=15)
+mod_v15_ref = model_v15_refined_mosaic(modinputs_gaussian; n_mosaics=4, m_rff=15)
 
 # Calculate MAP to define the variable map_v15_ref
 # map_v15_ref = maximum_a_posteriori(mod_v15_ref)
@@ -3013,34 +2958,34 @@ println(" - Inducing points: $M_inducing_A25")
 
 Most of the models here are didactic, demonstrating form and approach. 
 
-| Model | Likelihood Family | Key Feature | Best Use Case |
-| :------| :------------------| :------------------| :--------------------------------------------------|
-| A00 | Gaussian | Naive, Dense, Kernel matrix | Intuitive form, didactic (Problem: very slow) |
-| A01 | Gaussian | Non-separable Anisotropic Kernel, Dense Kernel Matrix | Capturing complex spatiotemporal interactions without separability assumptions |
-| A02 | Gaussian | Fully Adaptive Random Fourier Features (RFF) | Scalable approximation of non-separable GPs with learned features |
-| A03 | Gaussian | Nested Covariates (linear), Adaptive RFF | Modeling explicit structural dependencies between covariates |
-| A04 | Gaussian | Time-varying Intercept (Random Walk), Nested Covariates, Adaptive RFF | Capturing non-linear temporal trends in the mean function |
-| A05 | Gaussian | Spatiotemporal Stochastic Volatility (RFF for log-variance), Random Walk Trend, Nested Covariates, Adaptive RFF | Modeling heteroscedastic observation noise that varies across space and time |
-| A06 | Gaussian | Fully Independent Training Conditional (FITC), Fixed Inducing Points, Spatiotemporal Stochastic Volatility, Random Walk Trend, Nested Covariates | Scalable GP approximation for larger datasets with pre-defined inducing points |
-| A07 | Gaussian | Sparse Functional Form (AbstractGPs FITC), Learned Inducing Point Locations, Spatiotemporal Stochastic Volatility, Random Walk Trend, Linear Nested Covariates | More robust FITC approximation with optimized inducing point locations, improving model fit |
-| A08 | Gaussian | Nonlinear Nested Covariates (RFF-based), Learned Inducing Point Locations (FITC), Spatiotemporal Stochastic Volatility, Random Walk Trend | Flexible modeling of complex, non-linear relationships between covariates |
-| A09 | Gaussian | Gaussian Process Trend, Nonlinear Nested Covariates (RFF-based), Learned Inducing Point Locations (FITC), Spatiotemporal Stochastic Volatility | More flexible and smooth temporal trend modeling for continuous non-linear behaviors |
-| A10 | Gaussian | Fixed K-Means Inducing Points (FITC), Gaussian Process Trend, Nonlinear Nested Covariates (RFF-based), Spatiotemporal Stochastic Volatility | Improved sampling efficiency for FITC by fixing inducing points via K-Means |
-| A11 | Gaussian | Sparse Variational Gaussian Process (SVGP-like, Learned Inducing Points), Gaussian Process Trend, Nonlinear Nested Covariates (RFF-based), Spatiotemporal Stochastic Volatility | Adaptive inducing point placement within the NUTS framework for better model fit and exploration |
-| A12 | Gaussian | Full SVGP Variation (Learned Inducing Point Distribution Mean & Variance), GP Trend, Nonlinear Nested Covariates (RFF-based), Spatiotemporal Stochastic Volatility | Highly flexible and adaptive inducing point distribution for improved GP approximation in complex models |
-| A13 | Gaussian | Multi-fidelity Gaussian Process (MFGP), Nested RFF for cross-fidelity mappings, RFFs for Z, U fields | Modeling data observed at different resolutions with hierarchical non-linear dependencies between fidelity levels |
-| A14 | Gaussian | Mini-batchable MFGP (SVI-compatible), RFF for all fidelity levels, Conditional Independence Assumption | Scalable inference for multi-fidelity data using Stochastic Variational Inference (SVI) with mini-batching |
-| A15 | Gaussian | Deep Gaussian Process (Stacked RFF), Hierarchical Composition of RFF Layers, Non-linear Feature Transformation | Modeling highly non-linear and multi-layered relationships in complex systems |
-| A16 | Gaussian | Nyström Approximation, Learned Inducing Points, Nonlinear Nested Covariates (RFF-based), GP Trend, Spatiotemporal Stochastic Volatility | Efficient low-rank GP approximation for large datasets, capturing global correlations better than diagonal FITC in some cases |
-| A17 | Gaussian | SPDE Approximation (Spatial Matern 3/2), GMRF representation, Nonlinear Nested Covariates (RFF-based), GP Trend, Spatiotemporal Stochastic Volatility | Scalable spatial GP modeling using sparse precision matrices for Matern fields |
-| A18 | Gaussian | Kronecker-Spatiotemporal SPDE Approximation, Matern 3/2 kernels, AR(1) Temporal Process (implicitly for covariates), Unified Spatiotemporal Field | Efficient and coherent spatiotemporal modeling of covariates and main process using Kronecker products of precision matrices |
-| A19 | Gaussian | SVGP with Kronecker Matern Kernel (for main process), Nested RFF Covariates, Explicit Seasonal Harmonics, Stochastic Volatility | Combining flexible RFF-based covariate modeling with a structured Kronecker Matern GP for the main spatiotemporal process and seasonal components |
-| A20 | Gaussian | Multi-fidelity Kronecker Matern GP, AR(1) Temporal Process, Kernel-based Interpolation between fidelity levels | Hierarchical multi-fidelity modeling with structured spatial (Matern) and temporal (AR1) correlations and explicit interpolation |
-| A21 | Gaussian | Multi-fidelity Kronecker Matern GP with AR(1), Spatiotemporal Stochastic Volatility (RFF), Seasonal Harmonics, Enhanced Kernel-based Interpolation | Comprehensive multi-fidelity model capturing structured spatiotemporal effects, heteroscedastic noise, and seasonality through explicit kernel interpolation |
-| A22 | Gaussian | Nonlinear Cross-Fidelity Mappings (Adaptive RFFs), Multi-fidelity GP, Deep GP structure (stacked RFF), Seasonal Harmonics, Spatiotemporal Stochastic Volatility | Highly flexible and adaptive multi-fidelity modeling with full non-linear RFF interactions between fidelity levels (conceptually, but with computational challenges) |
-| A23 | Gaussian | Fixed Deterministic Fourier Features (DFRFF), Multi-fidelity GP, Deep GP structure, Seasonal Harmonics, Spatiotemporal Stochastic Volatility | Efficient and scalable multi-fidelity Deep GP by fixing RFF basis functions, making inference tractable |
-| A24 | Gaussian | Semi-Adaptive DFRFF, Multi-fidelity Deep GP (DGP), Seasonal Harmonics, Spatiotemporal Stochastic Volatility, Learned variances for W,b priors | Balanced approach for multi-fidelity Deep GP, allowing for refinement of RFF basis functions around pre-generated values for improved flexibility and tractability |
-| A25 | Gaussian | Hybrid FITC-RFF, Spectral Bottleneck (RFF for Z, U), Sparse FITC GP (for Y), Data-Driven (FFT-informed) RFF initialization, Semi-Adaptive RFFs | High-performance multi-fidelity model combining efficient non-linear feature extraction (RFF) with global structural correlation capture (FITC) and adaptive feature learning.  |
+| Model | Likelihood Family | Key Feature                                                                                                                                                                     | Best Use Case                                                                                                                                                                  |
+| :------| :------------------| :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------| :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| A00   | Gaussian          | Naive, Dense, Kernel matrix                                                                                                                                                     | Intuitive form, didactic (Problem: very slow)                                                                                                                                  |
+| A01   | Gaussian          | Non-separable Anisotropic Kernel, Dense Kernel Matrix                                                                                                                           | Capturing complex spatiotemporal interactions without separability assumptions                                                                                                 |
+| A02   | Gaussian          | Fully Adaptive Random Fourier Features (RFF)                                                                                                                                    | Scalable approximation of non-separable GPs with learned features                                                                                                              |
+| A03   | Gaussian          | Nested Covariates (linear), Adaptive RFF                                                                                                                                        | Modeling explicit structural dependencies between covariates                                                                                                                   |
+| A04   | Gaussian          | Time-varying Intercept (Random Walk), Nested Covariates, Adaptive RFF                                                                                                           | Capturing non-linear temporal trends in the mean function                                                                                                                      |
+| A05   | Gaussian          | Spatiotemporal Stochastic Volatility (RFF for log-variance), Random Walk Trend, Nested Covariates, Adaptive RFF                                                                 | Modeling heteroscedastic observation noise that varies across space and time                                                                                                   |
+| A06   | Gaussian          | Fully Independent Training Conditional (FITC), Fixed Inducing Points, Spatiotemporal Stochastic Volatility, Random Walk Trend, Nested Covariates                                | Scalable GP approximation for larger datasets with pre-defined inducing points                                                                                                 |
+| A07   | Gaussian          | Sparse Functional Form (AbstractGPs FITC), Learned Inducing Point Locations, Spatiotemporal Stochastic Volatility, Random Walk Trend, Linear Nested Covariates                  | More robust FITC approximation with optimized inducing point locations, improving model fit                                                                                    |
+| A08   | Gaussian          | Nonlinear Nested Covariates (RFF-based), Learned Inducing Point Locations (FITC), Spatiotemporal Stochastic Volatility, Random Walk Trend                                       | Flexible modeling of complex, non-linear relationships between covariates                                                                                                      |
+| A09   | Gaussian          | Gaussian Process Trend, Nonlinear Nested Covariates (RFF-based), Learned Inducing Point Locations (FITC), Spatiotemporal Stochastic Volatility                                  | More flexible and smooth temporal trend modeling for continuous non-linear behaviors                                                                                           |
+| A10   | Gaussian          | Fixed K-Means Inducing Points (FITC), Gaussian Process Trend, Nonlinear Nested Covariates (RFF-based), Spatiotemporal Stochastic Volatility                                     | Improved sampling efficiency for FITC by fixing inducing points via K-Means                                                                                                    |
+| A11   | Gaussian          | Sparse Variational Gaussian Process (SVGP-like, Learned Inducing Points), Gaussian Process Trend, Nonlinear Nested Covariates (RFF-based), Spatiotemporal Stochastic Volatility | Adaptive inducing point placement within the NUTS framework for better model fit and exploration                                                                               |
+| A12   | Gaussian          | Full SVGP Variation (Learned Inducing Point Distribution Mean & Variance), GP Trend, Nonlinear Nested Covariates (RFF-based), Spatiotemporal Stochastic Volatility              | Highly flexible and adaptive inducing point distribution for improved GP approximation in complex models                                                                       |
+| A13   | Gaussian          | Multi-fidelity Gaussian Process (MFGP), Nested RFF for cross-fidelity mappings, RFFs for Z, U fields                                                                            | Modeling data observed at different resolutions with hierarchical non-linear dependencies between fidelity levels                                                              |
+| A14   | Gaussian          | Mini-batchable MFGP (SVI-compatible), RFF for all fidelity levels, Conditional Independence Assumption                                                                          | Scalable inference for multi-fidelity data using Stochastic Variational Inference (SVI) with mini-batching                                                                     |
+| A15   | Gaussian          | Deep Gaussian Process (Stacked RFF), Hierarchical Composition of RFF Layers, Non-linear Feature Transformation                                                                  | Modeling highly non-linear and multi-layered relationships in complex systems                                                                                                  |
+| A16   | Gaussian          | Nyström Approximation, Learned Inducing Points, Nonlinear Nested Covariates (RFF-based), GP Trend, Spatiotemporal Stochastic Volatility                                         | Efficient low-rank GP approximation for large datasets, capturing global correlations better than diagonal FITC in some cases                                                  |
+| A17   | Gaussian          | SPDE Approximation (Spatial Matern 3/2), GMRF representation, Nonlinear Nested Covariates (RFF-based), GP Trend, Spatiotemporal Stochastic Volatility                           | Scalable spatial GP modeling using sparse precision matrices for Matern fields                                                                                                 |
+| A18   | Gaussian          | Kronecker-Spatiotemporal SPDE Approximation, Matern 3/2 kernels, AR(1) Temporal Process (implicitly for covariates), Unified Spatiotemporal Field                               | Efficient and coherent spatiotemporal modeling of covariates and main process using Kronecker products of precision matrices                                                   |
+| A19   | Gaussian          | SVGP with Kronecker Matern Kernel (for main process), Nested RFF Covariates, Explicit Seasonal Harmonics, Stochastic Volatility                                                 | Combining flexible RFF-based covariate modeling with a structured Kronecker Matern GP for the main spatiotemporal process and seasonal components                              |
+| A20   | Gaussian          | Multi-fidelity Kronecker Matern GP, AR(1) Temporal Process, Kernel-based Interpolation between fidelity levels                                                                  | Hierarchical multi-fidelity modeling with structured spatial (Matern) and temporal (AR1) correlations and explicit interpolation                                               |
+| A21   | Gaussian          | Multi-fidelity Kronecker Matern GP with AR(1), Spatiotemporal Stochastic Volatility (RFF), Seasonal Harmonics, Enhanced Kernel-based Interpolation                              | Comprehensive multi-fidelity model capturing structured spatiotemporal effects, heteroscedastic noise, and seasonality through explicit kernel interpolation                   |
+| A22   | Gaussian          | Nonlinear Cross-Fidelity Mappings (Adaptive RFFs), Multi-fidelity GP, Deep GP structure (stacked RFF), Seasonal Harmonics, Spatiotemporal Stochastic Volatility                 | Highly flexible and adaptive multi-fidelity modeling with full non-linear RFF interactions between fidelity levels (conceptually, but with computational challenges)           |
+| A23   | Gaussian          | Fixed Deterministic Fourier Features (DFRFF), Multi-fidelity GP, Deep GP structure, Seasonal Harmonics, Spatiotemporal Stochastic Volatility                                    | Efficient and scalable multi-fidelity Deep GP by fixing RFF basis functions, making inference tractable                                                                        |
+| A24   | Gaussian          | Semi-Adaptive DFRFF, Multi-fidelity Deep GP (DGP), Seasonal Harmonics, Spatiotemporal Stochastic Volatility, Learned variances for W,b priors                                   | Balanced approach for multi-fidelity Deep GP, allowing for refinement of RFF basis functions around pre-generated values for improved flexibility and tractability             |
+| A25   | Gaussian          | Hybrid FITC-RFF, Spectral Bottleneck (RFF for Z, U), Sparse FITC GP (for Y), Data-Driven (FFT-informed) RFF initialization, Semi-Adaptive RFFs                                  | High-performance multi-fidelity model combining efficient non-linear feature extraction (RFF) with global structural correlation capture (FITC) and adaptive feature learning. |
 
 
  
@@ -3058,42 +3003,6 @@ Model summary: 100 NUTS()
 
 
 
-
-## A00: Base Model - Dense Kernel Matrix Spatiotemporal GP
-
-Data generation function and the base spatiotemporal model (A00) using `AbstractGPs` and `KernelFunctions` with a separable covariance structure.
-
-### Model Assumptions:
-*   Dependent Variable (Y): Modeled with a mean component (trend, seasonal, covariates) and a latent spatiotemporal Gaussian Process (GP) component, plus observation noise.
-*   Latent Covariates (U1, U2, U3): Assumed to be observed with measurement error. Their 'true' values are non-centered parameterized, where `u_true = mean(u_obs) + u_off * std(u_obs)`.
-*   Trend: A simple cumulative sum of `alpha_raw` terms, implementing a random walk prior on the intercept over unique time points.
-*   Seasonal Process: Modeled as a fixed-period harmonic (sine/cosine waves).
-*   Spatiotemporal GP (f):
-    *   Separable Covariance: Assumes the spatiotemporal kernel can be factored into a product of a spatial kernel and a temporal kernel, i.e., $K((x_s, t_s), (x_t, t_t)) = K_s(x_s, x_t) \times K_t(t_s, t_t)$.
-    *   Spatial Kernel: Isotropic Squared Exponential kernel (single lengthscale `ls_s`).
-    *   Temporal Kernel: Squared Exponential kernel (single lengthscale `ls_t`).
-    *   Dense Kernel Matrix: Computes the full $N \times N$ covariance matrix, leading to $O(N^3)$ computational complexity for inference, which is noted as "very slow".
-    *   Non-centered Parameterization: The latent GP `f` is sampled directly from `MvNormal(zeros(N), K + 1e-6*I)`.
-*   Observation Noise (sigma_y, sigma_u): Assumed to be homoscedastic (constant variance) and normally distributed.
-*   Priors: Standard weakly informative priors (Exponential for scales, Normal for coefficients, Uniform for phases).
-
-### Key References:
-*   Rasmussen, C. E., & Williams, C. K. I. (2006). *Gaussian Processes for Machine Learning*. MIT Press. (For GP fundamentals)
-*   Gelman, A., et al. (2013). *Bayesian Data Analysis*. CRC Press. (For non-centered parameterization)
-
-Problem: very slow, really slow
-
-
-```{julia} 
-modinputs = generate_data()
-
-model_A00 = model_A00_dense_gp(modinputs)
-chain_A00 = sample(model_A00, NUTS(), 100)
-display(describe(chain_A00))
-waic_A00 = compute_y_waic(model_A00, chain_A00)  # not reliable without convergence
-println("WAIC for A00: ", waic_A00)
-
-```
  
 
 ## A01: Non-separable Anisotropic Spatiotemporal GP
