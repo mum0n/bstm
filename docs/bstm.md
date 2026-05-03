@@ -94,6 +94,7 @@ include( joinpath( project_directory, "scripts", "startup.jl" ) ) # might need t
 
 # if there continue to be issues: some more lower level package management may be required ... 
 
+ 
 ```
 
 ### Simulated base data
@@ -249,9 +250,9 @@ Using our basic spatiotemporal data, let us try to represent them in a discrete 
 
 ```{julia}
 
-(; pts  ) = data  # this is a simple way to copy objects into the Main environment
+# (; pts  ) = data  # this is a simple way to copy objects into the Main environment
 
-ntot = size(pts, 1) 
+ntot = size(data.pts, 1) 
 
 min_time_slices = 5
 target_density = 50 # number per areal unit 
@@ -276,12 +277,12 @@ for m in test_configs
     println("Testing method: $m")
     local au
     try
-        au = assign_spatial_units( pts, m;
+        au = assign_spatial_units( data.pts, m;
+            time_idx = data.time_idx,
             target_units = target_units,
             min_total_arealunits=min_total_arealunits,
             max_total_arealunits=max_total_arealunits,
             min_time_slices = min_time_slices,
-            time_idx = time_idx,
             buffer_dist=buffer_dist,
             tolerance=tolerance,
             cv_min=cv_min,
@@ -469,9 +470,8 @@ n_pts = 100
 n_time = 15
  
 data = generate_sim_data(n_pts, n_time; rndseed=42); # regenerate data
-
-(; pts, y_obs, y_binary, time_idx, weights, trials, cov_indices_mat) = data
-ntot = size(pts, 1) 
+ 
+ntot = size(data.pts, 1) 
 
 min_time_slices = 10
 target_density = 20 # number per areal unit 
@@ -487,12 +487,12 @@ buffer_dist = 0.8
 tolerance = 0.1
 method = :avt
 
-au = assign_spatial_units( pts, method;
+au = assign_spatial_units( data.pts, method;
+  time_idx = data.time_idx,
   target_units = target_units,
   min_total_arealunits=min_total_arealunits,
   max_total_arealunits=max_total_arealunits,
   min_time_slices = min_time_slices,
-  time_idx = time_idx,
   buffer_dist=buffer_dist,
   tolerance=tolerance,
   cv_min=cv_min,
@@ -544,20 +544,20 @@ modinputs_count = merge(modinputs_reference, (y=data.y_counts,))
 modinputs_binomial = merge(modinputs_reference, (y=data.y_binary,))
 modinputs_lognormal = merge(modinputs_reference, (y=exp.(data.y_obs),))
 
- ```julia
+
 # Consolidated Model Registry for D-Series (Discrete) and C-Series (Continuous)
 model_list = Dict(
     # --- D-Series: Discrete Spatial Models (GMRF/BYM2) ---
     "D00_poisson_simple"      => () -> model_D00_poisson_simple(modinputs_count),
     "D01_poisson"             => () -> model_D01_poisson(modinputs_count),
     "D02_poisson_leroux"      => () -> model_D02_poisson_leroux(modinputs_count),
-    "D02_poisson_localised"   => () -> model_D03_poisson_localised(modinputs_count),
-    "D02_poisson_sar"         => () -> model_D04_poisson_sar(modinputs_count),
-    "D02_poisson_mcar"        => () -> model_D05_poisson_mcar(modinputs_count),
-    "D02_poisson_svc"         => () -> model_D06_poisson_svc(modinputs_count),
-    "D02_poisson_dag"         => () -> model_D07_poisson_dag(modinputs_count),
-    "D02_poisson_hurdle"      => () -> model_D08_hurdle(modinputs_count),
-    "D02_poisson_ei"          => () -> model_D09_poisson_ei(modinputs_count),
+    "D03_poisson_localised"   => () -> model_D03_poisson_localised(modinputs_count),
+    "D04_poisson_sar"         => () -> model_D04_poisson_sar(modinputs_count),
+    "D05_poisson_mcar"        => () -> model_D05_poisson_mcar(modinputs_count),
+    "D06_poisson_svc"         => () -> model_D06_poisson_svc(modinputs_count),
+    "D07_poisson_dag"         => () -> model_D07_poisson_dag(modinputs_count),
+    "D08_poisson_hurdle"      => () -> model_D08_hurdle(modinputs_count),
+    "D09_poisson_ei"          => () -> model_D09_poisson_ei(modinputs_count),
     "D10_gaussian"            => () -> model_D10_gaussian(modinputs_gaussian),
     "D11_gaussian_rff"        => () -> model_D11_gaussian_rff(modinputs_gaussian),
     "D12_lognormal"           => () -> model_D12_lognormal(modinputs_lognormal),
@@ -588,7 +588,7 @@ model_list = Dict(
     "C12_svgp_full"           => () -> model_C12_svgp_full(modinputs_gaussian),
     "C13_multifidelity_gp"    => () -> model_C13_multifidelity_gp(modinputs_gaussian),
     "C14_minibatch_mfgp"      => () -> model_C14_minibatch_mfgp(modinputs_gaussian),
-    "C15_deep_gp_rff"         => () -> model_C15_deep_gp(modinputs_gaussian),  #  no method matching _fastmul!(::Matrix{Union{}}, ::Matrix{Tuple{Float64, Float64}},
+    "C15_deep_gp_rff"         => () -> model_C15_deep_gp(modinputs_gaussian),   
     "C16_nystrom_sv"          => () -> model_C16_nystrom(modinputs_gaussian),  #  matrix not positive definite
     "C17_spde_trend"          => () -> model_C17_spde(modinputs_gaussian), # not positive definite
     "C18_kron_spde"           => () -> model_C18_kronecker_spde(modinputs_gaussian),  # error
@@ -601,27 +601,35 @@ model_list = Dict(
     "C25_hybrid_fitc_rff"     => () -> model_C25_hybrid_fitc_rff(modinputs_gaussian)  # Dim mismatch 3 vs 4
 )
 
-println("Model registry updated with $(length(model_list)) D- and C-series variants.")
-
+ 
 # quick check to see if all models are still functional 
-for model_key in sort(collect(keys(model_list))[9:41] )
+mk = sort( collect(keys(model_list)) )
+nk = size(mk,1)
+
+i=15; 
+for model_key in mk[i:nk] 
   display(model_key)
-  if model_key == "C08_refined_mosaic" break
+  # if model_key == "C08_refined_mosaic" break
   target_model = model_list[model_key]()
   target_sampler = MH()
-  chain = sample(target_model, target_sampler, 10; progress=true)
+  chain = sample(target_model, target_sampler, 100; progress=true)
 end
 
-     
-# saving or testing: 
 
-# mod_fns =  collect(keys(model_registry))
-# i = 1 # 1:9
-# @load_carstm_state( mod_fns[i] )
+if false 
+  include( joinpath( project_directory, "src", "spatiotemporal_functions.jl" ) )       # support functions
+
+  include( joinpath( project_directory, "src", "spatiotemporal_turing_models.jl" ) )     # Turing models
+     
+  # saving or testing: 
+
+  # mod_fns =  collect(keys(model_registry))
+  # i = 1 # 1:9
+  # @load_carstm_state( mod_fns[i] )
  
-mod = model_v2_rff_gaussian(modinputs_gaussian)
-chain = sample(mod, MH(), 10; progress=true)
-  
+  mod = model_v2_rff_gaussian(modinputs_gaussian)
+  chain = sample(mod, MH(), 10; progress=true)
+end  
     
 ```
  

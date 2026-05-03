@@ -98,10 +98,14 @@ end
     # M.Q_sp is the scaled graph Laplacian (D-W)/scaling_factor
     # The Leroux precision matrix combines IID (I) and structured (Q_sp) components:
     # Q_Leroux = tau * ((1-rho)*I + rho*Q_ICAR)
-    Q_leroux = tau_leroux * ( (1 - rho_leroux) * I + rho_leroux * M.Q_sp )
+    Q_leroux_sparse = tau_leroux .* ((1 - rho_leroux) .* I + rho_leroux .* M.Q_sp)
+    # Q_leroux = Symmetric(Matrix(Q_leroux_sparse) + 1e-6 * I)
+    Q_leroux = Symmetric(Matrix(Q_leroux_sparse) + M.jitter * I)
     
     # The spatial effect phi_leroux is sampled directly from the Leroux prior precision.
     phi_leroux ~ MvNormalCanon(Q_leroux) # Leroux spatial random effect
+
+
 
     # --- 3. Temporal Effect (AR1) ---
     Q_ar1 = (1.0 / (1.0 - rho_tm^2)) .* (M.Q_ar1_template + (rho_tm^2) * I)
@@ -119,7 +123,7 @@ end
     end
 
     # --- 6. Poisson Likelihood (Log Link) ---
-    for i in 1:N_obs
+    for i in 1:M.N_obs
         a, t = M.area_idx[i], M.time_idx[i]
         eta = M.log_offset[i] + phi_leroux[a] + f_time[t] + st_interaction[a, t]
         for k in 1:4; eta += beta_cov[k][M.cov_indices[i, k]]; end
@@ -157,8 +161,12 @@ end
     mu_clusters ~ filldist(Normal(mu_global, sigma_cluster), M.n_clusters)
 
     # --- 3. Spatial Effect (Leroux CAR with Localised Means) ---
-    Q_proper = tau_sp * ((1 - rho_sp) * I + rho_sp * M.Q_sp)
+    # Q_proper = tau_sp * ((1 - rho_sp) * I + rho_sp * M.Q_sp)
     # The random effect s_eff is centered around the cluster-specific intercepts
+    Q_proper_sparse = tau_sp .* ((1 - rho_sp) .* I + rho_sp .* M.Q_sp)
+    Q_proper = Symmetric(Matrix(Q_proper_sparse) + M.jitter * I)
+   
+
     s_eff ~ MvNormalCanon(mu_clusters[cluster_assignments], Q_proper)
 
     # --- 4. Temporal Effect (AR1) ---
@@ -177,7 +185,7 @@ end
     end
 
     # --- 7. Likelihood ---
-    for i in 1:N_obs
+    for i in 1:M.N_obs
         a, t = M.area_idx[i], M.time_idx[i]
         eta = M.log_offset[i] + s_eff[a] + f_time[t] + st_interaction[a, t]
         for k in 1:4; eta += beta_cov[k][M.cov_indices[i, k]]; end
@@ -230,7 +238,7 @@ end
     end
 
     # --- 6. Likelihood ---
-    for i in 1:N_obs
+    for i in 1:M.N_obs
         a, t = M.area_idx[i], M.time_idx[i]
         eta = M.log_offset[i] + s_eff[a] + f_time[t] + st_interaction[a, t]
         for k in 1:4; eta += beta_cov[k][M.cov_indices[i, k]]; end
@@ -248,24 +256,25 @@ end
  
     # --- 1. Multivariate Spatial Priors (Bivariate Example) ---
     # We model two latent fields that are correlated via an LKJ prior on the correlation matrix
-    sigma_outcome ~ filldist(Exponential(1.0), 2)  
-    corr_matrix ~ LKJ(2, 1.0) 
-    Sigma = Symmetric(diagm(sigma_outcome) * corr_matrix * diagm(sigma_outcome))
-    L_sigma = cholesky(Sigma).L
+   
+
+    # STABILITY FIX: Use LKJCholesky for numerical robustness and better AD compatibility
+    sigma_outcome ~ filldist(Exponential(1.0), 2)
+    L_corr ~ LKJCholesky(2, 1.0)
+      # Reconstruct the scale-correlation Cholesky factor
+    L_sigma = Diagonal(sigma_outcome) * L_corr.L
 
     # Precision for MCAR: Sigma ⊗ Q_sp
-    # For sampling, we use the property that if Z ~ N(0, I), then (L_sigma ⊗ L_q^-1)Z has the MCAR covariance
+    # We use the property that if Z ~ N(0, I), then (L_q^-1' ⊗ L_sigma)Z follows the MCAR distribution
     u_raw ~ filldist(Normal(0, 1), M.N_areas, 2)
-    
-    # Solve spatial part (Intrinsic CAR)
-    # We use a small jitter to make Q_sp invertible or use the pseudoinverse approach
-    Q_stable = M.Q_sp + 1e-6*I
-    L_q = cholesky(Q_stable).L
-    
-    # Transform raw noise into correlated spatial fields
-    # phi_mcar[area, outcome]
-    phi_spatial = (L_q' \ u_raw) * L_sigma'
 
+    # FIX: Ensure Q_sp is dense and symmetric for stable inversion
+    Q_stable_dense = Symmetric(Matrix(M.Q_sp) + 1e-6 * I)
+    L_q = cholesky(Q_stable_dense).L
+
+    # Transform raw noise into correlated spatial fields: phi_spatial[area, outcome]
+    phi_spatial = (L_q' \ u_raw) * L_sigma'
+ 
     # --- 2. Temporal & Interaction Priors ---
     sigma_tm ~ Exponential(1.0); rho_tm ~ Beta(2, 2)
     sigma_int ~ Exponential(0.5); 
@@ -289,7 +298,7 @@ end
 
     # --- 4. Likelihood ---
     # Here we assume y is the primary outcome influenced by the first latent field
-    for i in 1:N_obs
+    for i in 1:M.N_obs
         a, t = M.area_idx[i], M.time_idx[i]
         # Outcome uses the first column of the bivariate MCAR field
         eta1 = M.log_offset[i] + phi_spatial[a, 1] + f_time[t] + st_interaction[a, t]
@@ -303,7 +312,7 @@ end
 
 
 
-@model function model_D06_poisson_svc(M ::Type{T}=Float64) where {T}
+@model function model_D06_poisson_svc(M, ::Type{T}=Float64) where {T}
      
     # assume.. X.svc == u_obs
 
@@ -347,7 +356,7 @@ end
     end
 
     # --- 6. Likelihood ---
-    for i in 1:N_obs
+    for i in 1:M.N_obs
         a, t = M.area_idx[i], M.time_idx[i]
         # Fixed + Spatial + Temporal + Interaction
         eta = M.log_offset[i] + s_eff[a] + f_time[t] + st_interaction[a, t]
@@ -411,7 +420,7 @@ end
     end
 
     # --- 6. Likelihood ---
-    for i in 1:N_obs
+    for i in 1:M.N_obs
         a, t = M.area_idx[i], M.time_idx[i]
         eta = M.log_offset[i] + s_eff[a] + f_time[t] + st_interaction[a, t]
         for k in 1:4; eta += beta_cov[k][M.cov_indices[i, k]]; end
@@ -429,8 +438,6 @@ end
 
 @model function model_D08_hurdle(M, ::Type{T}=Float64) where {T}
     
-    
-
     # --- 1. Priors ---
     # Hurdle (Binary) Component Hyperparams
     sigma_sp_h ~ Exponential(1.0); phi_sp_h ~ Beta(1, 1)
@@ -468,7 +475,7 @@ end
     end
 
     # --- 5. Joint Hurdle Likelihood ---
-    for i in 1:N_obs
+    for i in 1:M.N_obs
         a, t = M.area_idx[i], M.time_idx[i]
         
         # Linear predictors
@@ -496,9 +503,7 @@ end
 
 
 @model function model_D09_poisson_ei(M, ::Type{T}=Float64) where {T}
-     
-    coords_space = M.pts
-
+  
     # --- 1. Priors ---
     sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
     sigma_tm ~ Exponential(1.0); rho_tm ~ Beta(2, 2)
@@ -524,7 +529,7 @@ end
     beta_rff ~ filldist(Normal(0, sigma_f_rff), M.M_rff)
 
     # Standardize space and map to RFF
-    coords_norm = (hcat([p[1] for p in coords_space], [p[2] for p in coords_space]) .- 50.0) ./ 100.0
+    coords_norm = (M.coords_space .- 50.0) ./ 100.0
     projection = (coords_norm * W_rff ./ ls_rff) .+ b_rff'
     f_rff = sqrt(2/M.M_rff) .* cos.(projection) * beta_rff
 
@@ -538,7 +543,7 @@ end
 
     # --- 6. Aggregated Likelihood ---
     # mu_it represents the total intensity integrated over area i
-    for i in 1:N_obs
+    for i in 1:M.N_obs
         a, t = M.area_idx[i], M.time_idx[i]
         # Link: offset + Global_Time + Area_Spatial + Interaction + Continuous_Local_Variation
         eta = M.log_offset[i] + s_eff[a] + f_time[t] + st_interaction[a, t] + f_rff[i]
@@ -769,7 +774,8 @@ end
 
     
     continuous_covs = M.u_obs
-    M.N_obs, M.N_areas, M.N_time, N_covs = length(y), size(M.Q_sp, 1), maximum(M.time_idx), size(continuous_covs, 2)
+
+    N_covs = size(continuous_covs, 2)
 
     # --- 1. Priors ---
     sigma_y ~ Exponential(1.0); sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
@@ -1450,7 +1456,7 @@ end
     K = (sigma_f^2) .* kernelmatrix(k_s, coords_s) .* kernelmatrix(k_t, ts)
     
     # --- 4. Latent Process ---
-    f_latent ~ MvNormal(zeros(M.N_obs), K + 1e-6*I)
+    f_latent ~ MvNormal(zeros(M.N_obs), K + M.jitter*I)
 
     # --- 5. Categorical Covariates (RW2 Smoothing) ---
     beta_cov = [Vector{T}(undef, M.N_cat) for _ in 1:4]
@@ -1477,6 +1483,10 @@ end
 @model function model_C02_gaussian_deep_gp(M, ::Type{T}=Float64; m1=10, m2=5 ) where {T}
     # Model v8 Optimized: Refined 2-Layer Deep GP Spatiotemporal model for Gaussian data.
     # Combines deep non-linear interaction with robust Muted covariate smoothing.
+ 
+    # --- 1. Priors ---
+    sigma_y ~ Exponential(1.0)
+    sigma_rw2 ~ filldist(Exponential(1.0), 4)
  
     # --- 1. Deep GP Priors ---
     l1 ~ Gamma(2, 1); w1 ~ MvNormal(zeros(m1), I)
@@ -1643,7 +1653,7 @@ end
 end
 
 
-@model function model_C06_gaussian_spde_rff(M, ::Type{T}=Float64; m_spatial=50 ) where {T}
+@model function model_C06_gaussian_spde_rff(M, ::Type{T}=Float64 ) where {T}
     # Model v12: SPDE-style continuous spatial field using spectral RFF approximation.
 
     
@@ -1651,7 +1661,7 @@ end
     sigma_y ~ Exponential(1.0)
     sigma_sp ~ Exponential(1.0)
     kappa_sp ~ Gamma(2, 1)  # Range parameter (1/lengthscale)
-    w_sp ~ MvNormal(zeros(m_spatial), I)
+    w_sp ~ MvNormal(zeros(M.m_spatial), I)
 
     # --- 2. Temporal (AR1) & Smoothing Priors ---
     sigma_tm ~ Exponential(1.0)
@@ -1670,10 +1680,10 @@ end
     Random.seed!(42)
     # Frequencies sampled for a Matern kernel approximation
     # Note: For Matern nu=1.5, we sample from a Student-t distribution spectral density
-    Om = randn(m_spatial, 2) .* kappa_sp
-    Ph = rand(m_spatial) .* convert(T, 2pi)
+    Om = randn(M.m_spatial, 2) .* kappa_sp
+    Ph = rand(M.m_spatial) .* convert(T, 2pi)
     
-    Z_sp = convert(T, sqrt(2/m_spatial)) .* cos.(coords * Om' .+ Ph')
+    Z_sp = convert(T, sqrt(2/M.m_spatial)) .* cos.(coords * Om' .+ Ph')
     s_eff = Z_sp * (w_sp .* sigma_sp)
 
     # --- 4. Temporal Effect (AR1) ---
@@ -1707,8 +1717,8 @@ end
     l_warp ~ Gamma(2, 1)    # Smoothness of the warping manifold
     l_spatial ~ Gamma(2, 1) # Smoothness of the stationary field in warped space
     
-    w_warp ~ MvNormal(zeros(m_warp), I)
-    w_sp ~ MvNormal(zeros(m_spatial), I)
+    w_warp ~ MvNormal(zeros(M.m_warp), I)
+    w_sp ~ MvNormal(zeros(M.m_spatial), I)
     
     sigma_tm ~ Exponential(1.0)
     rho_tm ~ Beta(2, 2)
@@ -1722,19 +1732,19 @@ end
     # --- 3. Warping Layer (Non-Stationarity) ---
     # This layer 'warps' the 2D coordinates into a latent space
     Random.seed!(44)
-    Om_w = randn(m_warp, 2) ./ l_warp
-    Ph_w = rand(m_warp) .* convert(T, 2pi)
+    Om_w = randn(M.m_warp, 2) ./ l_warp
+    Ph_w = rand(M.m_warp) .* convert(T, 2pi)
     
     # Warped coordinates: g(s)
-    warped_coords = (convert(T, sqrt(2/m_warp)) .* cos.(coords * Om_w' .+ Ph_w')) * M.w_warp
+    warped_coords = (convert(T, sqrt(2/M.m_warp)) .* cos.(coords * Om_w' .+ Ph_w')) * w_warp
 
     # --- 4. Spatial Field on Warped Manifold ---
     # We apply a stationary kernel to the warped output
     Random.seed!(45)
-    Om_s = randn(m_spatial, 1) ./ l_spatial
-    Ph_s = rand(m_spatial) .* convert(T, 2pi)
+    Om_s = randn(M.m_spatial, 1) ./ l_spatial
+    Ph_s = rand(M.m_spatial) .* convert(T, 2pi)
     
-    Z_sp = convert(T, sqrt(2/m_spatial)) .* cos.(reshape(warped_coords, :, 1) * Om_s' .+ Ph_s')
+    Z_sp = convert(T, sqrt(2/M.m_spatial)) .* cos.(reshape(warped_coords, :, 1) * Om_s' .+ Ph_s')
     s_eff = Z_sp * (w_sp .* sigma_sp)
 
     # --- 5. Temporal & Categorical Components ---
@@ -1761,9 +1771,7 @@ end
 
 
 @model function model_C08_gaussian_refined_mosaic(M, ::Type{T}=Float64 ) where {T}
-    
-    M.N_obs = length(y)
-    
+      
     # --- 1. Global & Hierarchical Priors ---
     sigma_rw2 ~ filldist(Exponential(1.0), 4)
     mu_global ~ Normal(0, 1)
@@ -1802,8 +1810,10 @@ end
         
         # Calculate Softmax M.weights based on distance to centroids for smooth stitching
         dists = [sum((pt .- centroids[:, m]).^2) for m in 1:M.n_mosaics]
-        M.weights_stitching = exp.(-dists) ./ sum(exp.(-dists))
         
+        max_d = maximum(-dists)
+        weights_stitching = exp.(-dists .- max_d) ./ (sum(exp.(-dists .- max_d)) + 1e-9)
+     
         eta_spatial_combined = zero(T)
         sigma_y_combined = zero(T)
         
@@ -1813,14 +1823,14 @@ end
             local_field = mu_local[m] + dot(z_proj, w_local[m] .* sigma_local[m])
             
             # Blend local field and local noise
-            eta_spatial_combined += M.weights_stitching[m] * local_field
-            sigma_y_combined += M.weights_stitching[m] * sigma_y_local[m]
+            eta_spatial_combined += weights_stitching[m] * local_field
+            sigma_y_combined += weights_stitching[m] * sigma_y_local[m]
         end
 
         mu = M.log_offset[i] + eta_spatial_combined
         for k in 1:4; mu += beta_cov[k][M.cov_indices[i, k]]; end
         
-        Turing.@addlogprob! M.weights[i] * logpdf(Normal(mu, sigma_y_combined + 1e-6), M.y[i])
+        Turing.@addlogprob! M.weights[i] * logpdf(Normal(mu, sigma_y_combined + 1e-4), M.y[i])
     end
 end
 
@@ -1881,7 +1891,7 @@ end
 
         # Soft Boundary M.Weights (Softmax of distance to centroids)
         dists = [sum((pt_2d .- centroids[:, m]).^2) for m in 1:M.n_mosaics]
-        M.weights_st = exp.(-dists) ./ sum(exp.(-dists))
+        weights_st = exp.(-dists) ./ sum(exp.(-dists))
 
         eta_spatial_time = zero(T)
         sigma_y_total = zero(T)
@@ -1895,8 +1905,8 @@ end
             z_proj = sqrt(2/M.m_rff) * cos.( (Om * pt_3d) .+ (Ph_base[m] .* 2pi) )
             local_field = mu_local[m] + dot(z_proj, w_local[m] .* sigma_local[m])
 
-            eta_spatial_time += M.weights_st[m] * local_field
-            sigma_y_total += M.weights_st[m] * sigma_y_local[m]
+            eta_spatial_time += weights_st[m] * local_field
+            sigma_y_total += weights_st[m] * sigma_y_local[m]
         end
 
         mu = M.log_offset[i] + eta_spatial_time
@@ -2256,11 +2266,9 @@ end
 @model function model_C15_deep_gp(M, ::Type{T}=Float64) where {T}
     # Deep Spatiotemporal GP.
     # Integrates BYM2 spatial effects and RW2 smoothing into a 3-layer RFF hierarchy.
- 
-    coords_space = M.pts
-    coords_time = reshape(M.time_idx ./ M.N_time, :, 1)
-    D_s = size(coords_space, 2)
-    D_t = size(coords_time, 2)
+   
+    D_s = size(M.coords_space, 2)
+    D_t = size(M.coords_time, 2)
 
     # --- 1. Priors & Structural Components ---
     sigma_y ~ Exponential(1.0); sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
@@ -2283,10 +2291,10 @@ end
     W_z ~ filldist(Normal(0, 1), D_s, M.M_rff)
     b_z ~ filldist(Uniform(0, 2pi), M.M_rff)
     beta_z ~ filldist(Normal(0, 1), M.M_rff)
-    z_latent = rff_map(coords_space, W_z, b_z) * beta_z
+    z_latent = rff_map(M.coords_space, W_z, b_z) * beta_z
 
     # --- 3. Layer 2: Latent Spatiotemporal GPs (U1, U2, U3) ---
-    coords_l2 = hcat(coords_space, coords_time, z_latent)
+    coords_l2 = hcat(M.coords_space, M.coords_time, z_latent)
     W_u ~ filldist(Normal(0, 1), size(coords_l2, 2), M.M_rff)
     b_u ~ filldist(Uniform(0, 2pi), M.M_rff)
     beta_u_mat ~ filldist(Normal(0, 1), M.M_rff, 3)
@@ -2294,13 +2302,13 @@ end
     u_latent = Phi_u * beta_u_mat # Matrix M.N_obs x 3
 
     # --- 4. Layer 3: Final Output GP (Y) ---
-    coords_l3 = hcat(coords_space, coords_time, u_latent)
+    coords_l3 = hcat(M.coords_space, M.coords_time, u_latent)
     W_y ~ filldist(Normal(0, 1), size(coords_l3, 2), M.M_rff)
     b_y ~ filldist(Uniform(0, 2pi), M.M_rff)
     beta_y_gp ~ filldist(Normal(0, 1), M.M_rff)
 
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2pi .* coords_time ./ M.period) .+ beta_sin .* sin.(2pi .* coords_time ./ M.period)
+    seasonal = beta_cos .* cos.(2pi .* M.coords_time ./ M.period) .+ beta_sin .* sin.(2pi .* M.coords_time ./ M.period)
     f_y = (rff_map(coords_l3, W_y, b_y) * beta_y_gp) .+ vec(seasonal)
 
     # --- 5. Likelihood ---
@@ -2321,10 +2329,9 @@ end
     # Model A16 Optimized: Standardized Nyström GP with Stochastic Volatility.
     # Combines low-rank spatiotemporal approximations with heteroskedastic noise modeling.
  
-    coords_space = M.pts
-    coords_time = reshape(M.time_idx ./ M.N_time, :, 1)
-    D_s, D_t = size(coords_space, 2), size(coords_time, 2)
-    M.D_st = D_s + D_t
+    
+    D_s, D_t = size(M.coords_space, 2), size(M.coords_time, 2)
+    D_st = D_s + D_t
 
     # --- 1. Priors & Structural Components ---
     sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
@@ -2344,36 +2351,37 @@ end
     end
 
     # --- 2. Nested Latent Covariates (RFF Mapping) ---
-    coords_tz = hcat(coords_time, M.z_obs)
+    coords_tz = hcat(M.coords_time, M.z_obs)
     W_u1 ~ filldist(Normal(0, 1), size(coords_tz, 2), M.M_rff_u); b_u1 ~ filldist(Uniform(0, 2pi), M.M_rff_u)
     u1_true = rff_map(coords_tz, W_u1, b_u1) * filldist(Normal(0, 1), M.M_rff_u)
 
-    coords_tz_u1 = hcat(coords_time, M.z_obs, u1_true)
+    coords_tz_u1 = hcat(M.coords_time, M.z_obs, u1_true)
     W_u2 ~ filldist(Normal(0, 1), size(coords_tz_u1, 2), M.M_rff_u); b_u2 ~ filldist(Uniform(0, 2pi), M.M_rff_u)
     u2_true = rff_map(coords_tz_u1, W_u2, b_u2) * filldist(Normal(0, 1), M.M_rff_u)
 
     # --- 3. Nyström GP (Low Rank Approximation) ---
-    coords_st = hcat(coords_space, coords_time)
-    ls_st ~ filldist(Gamma(2, 2), M.D_st); sigma_f ~ Exponential(1.0)
-    k_st = SqExponentialKernel() ∘ ARDTransform(inv.(ls_st))
+    coords_st = hcat(M.coords_space, M.coords_time)
+    ls_st ~ filldist(Gamma(2, 2), D_st); 
+    sigma_f ~ Exponential(1.0)
+    k_st = SqExponentialKernel() ∘ ARDTransform(inv.(ls_st + M.jitter))
 
-    Z_ind = Matrix{T}(undef, M.M_inducing_val, M.D_st)
+    Z_ind = Matrix{T}(undef, M.M_inducing_val, D_st)
     mu_st, std_st = mean(coords_st, dims=1), std(coords_st, dims=1)
-    for j in 1:M.D_st; Z_ind[:, j] ~ filldist(Normal(mu_st[j], 2.0 * std_st[j]), M.M_inducing_val); end
+    for j in 1:D_st; Z_ind[:, j] ~ filldist(Normal(mu_st[j], 2.0 * std_st[j]), M.M_inducing_val); end
 
-    K_zz = kernelmatrix(k_st, RowVecs(Z_ind)) + 1e-6*I
+    K_zz = Symmetric( kernelmatrix(k_st, RowVecs(Z_ind)) + M.jitter*I)
     K_xz = kernelmatrix(k_st, RowVecs(coords_st), RowVecs(Z_ind))
     v_latent ~ filldist(Normal(0, 1), M.M_inducing_val)
     f_nystrom = sigma_f .* (K_xz * (cholesky(K_zz).U \ v_latent))
 
     # --- 4. Spatiotemporal Stochastic Volatility ---
-    W_sigma ~ filldist(Normal(0, 1), M.D_st, M.M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2pi), M.M_rff_sigma)
+    W_sigma ~ filldist(Normal(0, 1), D_st, M.M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2pi), M.M_rff_sigma)
     beta_rff_sigma ~ filldist(Normal(0, 1), M.M_rff_sigma)
     sigma_y = exp.(rff_map(coords_st, W_sigma, b_sigma) * beta_rff_sigma ./ 2)
 
     # --- 5. Likelihood ---
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2pi .* coords_time ./ M.period) .+ beta_sin .* sin.(2pi .* coords_time ./ M.period)
+    seasonal = beta_cos .* cos.(2pi .* M.coords_time ./ M.period) .+ beta_sin .* sin.(2pi .* M.coords_time ./ M.period)
 
     for i in 1:M.N_obs
         a = M.area_idx[i]
@@ -2392,10 +2400,8 @@ end
     # SPDE-based Spatiotemporal GP.
     # Employs sparse precision approximations for spatial effects and RFF for volatility.
  
-    coords_space = M.pts
-    coords_time = reshape(M.time_idx ./ M.N_time, :, 1)
-    D_s, D_t = size(coords_space, 2), size(coords_time, 2)
-    M.D_st = D_s + D_t
+    D_s, D_t = size(M.coords_space, 2), size(M.coords_time, 2)
+    D_st = D_s + D_t
 
     # --- 1. Priors & Structural Components ---
     sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
@@ -2403,7 +2409,8 @@ end
     sigma_rw2 ~ filldist(Exponential(1.0), 4)
 
     # BYM2 Spatial Effect
-    u_icar ~ MvNormal(zeros(M.N_areas), I); Turing.@addlogprob! -0.5 * dot(u_icar, M.Q_sp * u_icar)
+    u_icar ~ MvNormal(zeros(M.N_areas), I); 
+    Turing.@addlogprob! -0.5 * dot(u_icar, M.Q_sp * u_icar)
     u_iid ~ MvNormal(zeros(M.N_areas), I)
     s_eff = sigma_sp .* (sqrt(phi_sp) .* u_icar .+ sqrt(1 - phi_sp) .* u_iid)
 
@@ -2416,22 +2423,27 @@ end
 
     # --- 2. Latent Trends (GP Trend & Seasonal) ---
     ls_trend ~ Gamma(2, 2); sigma_trend ~ Exponential(0.5)
+
     k_trend = SqExponentialKernel() ∘ ScaleTransform(inv(ls_trend))
-    unique_times = sort(unique(coords_time[:,1]))
-    alpha ~ GP(sigma_trend^2 * k_trend)(unique_times, 1e-6)
-    trend = alpha[indexin(coords_time[:,1], unique_times)]
+    unique_times = sort(unique(M.coords_time[:,1]))
+    
+    K_trend = Symmetric(sigma_trend^2 * kernelmatrix(k_trend, unique_times) + 1e-4 * I)
+    alpha ~ MvNormal(zeros(length(unique_times)), K_trend)
+
+    # alpha ~ GP(sigma_trend^2 * k_trend)(unique_times, 1e-6)
+    trend = alpha[indexin(M.coords_time[:,1], unique_times)]
 
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2pi .* coords_time ./ M.period) .+ beta_sin .* sin.(2pi .* coords_time ./ M.period)
+    seasonal = beta_cos .* cos.(2pi .* M.coords_time ./ M.period) .+ beta_sin .* sin.(2pi .* M.coords_time ./ M.period)
 
     # --- 3. Nested Latent Covariates (RFF) ---
-    coords_tz = hcat(coords_time, M.z_obs)
+    coords_tz = hcat(M.coords_time, M.z_obs)
     W_u1 ~ filldist(Normal(0, 1), size(coords_tz, 2), M.M_rff_u); b_u1 ~ filldist(Uniform(0, 2pi), M.M_rff_u)
     u1_true = rff_map(coords_tz, W_u1, b_u1) * filldist(Normal(0, 1), M.M_rff_u)
 
     # --- 4. Stochastic Volatility ---
-    coords_st = hcat(coords_space, coords_time)
-    W_sigma ~ filldist(Normal(0, 1), M.D_st, M.M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2pi), M.M_rff_sigma)
+    coords_st = hcat(M.coords_space, M.coords_time)
+    W_sigma ~ filldist(Normal(0, 1), D_st, M.M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2pi), M.M_rff_sigma)
     beta_rff_sigma ~ filldist(Normal(0, 1), M.M_rff_sigma)
     sigma_y = exp.(rff_map(coords_st, W_sigma, b_sigma) * beta_rff_sigma ./ 2)
 
@@ -2451,11 +2463,9 @@ end
 @model function model_C18_kronecker_spde(M, ::Type{T}=Float64) where {T}
     # Kronecker SPDE Spatiotemporal GP.
     # Utilizes Kronecker-structured precision matrices for efficient spatiotemporal inference.
- 
-    coords_space = M.pts
-    coords_time = reshape(M.time_idx ./ M.N_time, :, 1)
+  
     unique_t = collect(1:M.N_time) ./ M.N_time
-    unique_s = coords_space[1:M.N_areas, :]
+    unique_s = M.coords_space[1:M.N_areas, :]
 
     # --- 1. Priors & Structural Components ---
     sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
@@ -2491,7 +2501,7 @@ end
     f_st = kron_matern_sample(M.N_areas, M.N_time, unique_s, unique_t, ls_s_y, sigma_s_y, ls_t_y, sigma_t_y, y_noise)
 
     # --- 4. Stochastic Volatility (RFF) ---
-    coords_st = hcat(coords_space, coords_time)
+    coords_st = hcat(M.coords_space, M.coords_time)
     W_sigma ~ filldist(Normal(0, 1), size(coords_st, 2), M.M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2pi), M.M_rff_sigma)
     beta_rff_sigma ~ filldist(Normal(0, 1), M.M_rff_sigma)
     sigma_y = exp.(rff_map(coords_st, W_sigma, b_sigma) * beta_rff_sigma ./ 2)
@@ -2513,12 +2523,10 @@ end
 @model function model_C19_svgp_matern(M, ::Type{T}=Float64) where {T}
     # SVGP with Matern structure.
     # Integrates nested RFF latent covariates and Kronecker spatiotemporal kernels.
- 
-    coords_space = M.pts
-    coords_time = reshape(M.time_idx ./ M.N_time, :, 1)
+   
     unique_t = collect(1:M.N_time) ./ M.N_time
-    unique_s = coords_space[1:M.N_areas, :]
-    M.D_st = size(coords_space, 2) + 1
+    unique_s = M.coords_space[1:M.N_areas, :]  ## need a better implementation 
+    # D_st = size(M.coords_space, 2) + 1
 
     # --- 1. Priors & Structural Components ---
     sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
@@ -2537,7 +2545,7 @@ end
     end
 
     # --- 2. Nested Latent Covariates (RFF) ---
-    coords_tz = hcat(coords_time, M.z_obs)
+    coords_tz = hcat(M.coords_time, M.z_obs)
     W_u1 ~ filldist(Normal(0, 1), size(coords_tz, 2), M.M_rff_u); b_u1 ~ filldist(Uniform(0, 2pi), M.M_rff_u)
     u1_true = rff_map(coords_tz, W_u1, b_u1) * filldist(Normal(0, 1), M.M_rff_u)
 
@@ -2548,14 +2556,14 @@ end
     f_st = kron_matern_sample(M.N_areas, M.N_time, unique_s, unique_t, ls_s_y, sigma_s_y, ls_t_y, sigma_t_y, y_noise)
 
     # --- 4. Stochastic Volatility (RFF) ---
-    coords_st = hcat(coords_space, coords_time)
+    coords_st = hcat(M.coords_space, M.coords_time)
     W_sigma ~ filldist(Normal(0, 1), size(coords_st, 2), M.M_rff_sigma); b_sigma ~ filldist(Uniform(0, 2pi), M.M_rff_sigma)
     beta_rff_sigma ~ filldist(Normal(0, 1), M.M_rff_sigma)
     sigma_y = exp.(rff_map(coords_st, W_sigma, b_sigma) * beta_rff_sigma ./ 2)
 
     # --- 5. Likelihood ---
     beta_cos ~ Normal(0, 1); beta_sin ~ Normal(0, 1)
-    seasonal = beta_cos .* cos.(2pi .* coords_time ./ M.period) .+ beta_sin .* sin.(2pi .* coords_time ./ M.period)
+    seasonal = beta_cos .* cos.(2pi .* M.coords_time ./ M.period) .+ beta_sin .* sin.(2pi .* M.coords_time ./ M.period)
 
     for i in 1:M.N_obs
         a = M.area_idx[i]
@@ -2818,8 +2826,7 @@ end
     W_z = M.W_z_fixed; b_z = M.b_z_fixed
     W_u = M.W_u_fixed; b_u = M.b_u_fixed
     W_y = M.W_y_gp_fixed; b_y = M.b_y_gp_fixed
-    M.N_obs = length(y); M.N_areas = size(M.Q_sp, 1); M.N_time = maximum(M.time_idx)
-
+ 
     # Priors
     sigma_y ~ Exponential(1.0); sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
     sigma_tm ~ Exponential(1.0); rho_tm ~ Beta(2, 2); sigma_int ~ Exponential(0.5)
@@ -2859,7 +2866,6 @@ end
 @model function model_C24_semi_adaptive_dfrff(M, ::Type{T}=Float64) where {T}
     # Semi-Adaptive DFRFF with learned noise on fixed weight bases.
     
-    M.N_obs = length(y); M.N_areas = size(M.Q_sp, 1); M.N_time = maximum(M.time_idx)
     W_z_base = M.W_z_fixed; W_u_base = M.W_u_fixed
 
     # Adaptive Priors
@@ -2880,7 +2886,7 @@ end
     # Semi-Adaptive M.Weights
     W_z ~ MvNormal(vec(W_z_base), sigma_W_z^2 * I)
     W_u ~ MvNormal(vec(W_u_base), sigma_W_u^2 * I)
-    f_gp = rff_map(hcat(M.pts, M.time_idx), M.W_y_gp_fixed, M.b_y_gp_fixed) * filldist(Normal(0,1), size(M.W_y_gp_fixed, 2))
+    f_gp = rff_map(hcat(M.coords_space, M.coords_time), M.W_y_gp_fixed, M.b_y_gp_fixed) * filldist(Normal(0,1), size(M.W_y_gp_fixed, 2))
 
     # RW2 & Likelihood
     beta_cov = [Vector{T}(undef, M.N_cat) for _ in 1:4]
@@ -2901,8 +2907,7 @@ end
     # Refactored for M_gaussian variable seeking.
      
     W_z_fixed = M.W_z_fixed; b_z_fixed = M.b_z_fixed
-    M.N_obs = length(y); M.N_areas = size(M.Q_sp, 1); M.N_time = maximum(M.time_idx)
-
+ 
     # Priors
     sigma_y ~ Exponential(1.0); sigma_f ~ Exponential(1.0); sigma_sp ~ Exponential(1.0)
     phi_sp ~ Beta(1, 1); sigma_tm ~ Exponential(1.0); rho_tm ~ Beta(2, 2)

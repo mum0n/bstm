@@ -2079,7 +2079,7 @@ function kron_matern_sample(Ns, Nt, unique_s, unique_t, ls_s, sigma_s, ls_t, sig
     Q_t = sparse(inv(K_t))
 
     # Full Kronecker Precision
-    Q_full = kron(Q_t, Q_s)
+    Q_full = Symmetric(kron(Q_t, Q_s))
     L_q = cholesky(Q_full + 1e-6*I)
 
     # Sample: f = (L')^-1 * noise
@@ -3100,7 +3100,8 @@ function prepare_model_inputs(; kwargs...)
     coords_space = isnothing(pts) ? nothing : get(kwargs, :coords_space, vcat([collect(t)' for t in pts]...) ) # as a matrix 
     
     coords_time = isnothing(time_idx) ? nothing : get(kwargs, :coords_time, time_idx)
-    
+    period = get(kwargs, :period, 12 )
+
     weights = get(kwargs, :weights, ones(Float64, N_obs) )
 
     log_offset = get(kwargs, :log_offset, zeros(Float64, N_obs))
@@ -3252,15 +3253,18 @@ function prepare_model_inputs(; kwargs...)
         n_mosaics = get(kwargs, :n_mosaics, 5),
         m_rff = get(kwargs, :m_rff, 20),
         D_st =  get(kwargs, :D_st, 3 ),  # svgp
-        period = get(kwargs, :D_st, 12 ),  # svgp
+        period = period,  # svgp
         N_obs = N_obs, 
         N_areas = N_areas, 
         N_time = N_time, 
         N_cat = N_cat,
         m_feat = 5,
+        m_warp = 10, 
+        m_spatial=50,
         grid_res = get(kwargs, :grid_res,  64), 
         pad_factor = get(kwargs, :pad_factor, 2),
         n_clusters = get(kwargs, :n_clusters, 4), # model_D03_poisson_localised
+        jitter=1e-4,
         use_zi = get(kwargs, :use_zi, false) 
     )
 end
@@ -3871,21 +3875,21 @@ function ar1_cross_covariance_matrix(times_a::Vector{<:Real}, times_b::Vector{<:
 end
 
 # Helper for Kronecker AR1 x Matern Sampling
-function kron_ar1_matern_sample(Ns, Nt, unique_s, ls_s, sigma_s, rho_t, sigma_t_noise, noise_vec)
+function kron_ar1_matern_sample(Ns, Nt, unique_s, ls_s, sigma_s, rho_t, sigma_t_noise, noise_vec, jitter=1e-4)
     # Spatial Matern 3/2 Precision
     k_s = Matern32Kernel() ∘ ScaleTransform(inv(ls_s))
-    K_s = sigma_s^2 * kernelmatrix(k_s, RowVecs(unique_s)) + 1e-3*I # Increased jitter
+    K_s = Symmetric(sigma_s^2 * kernelmatrix(k_s, RowVecs(unique_s)) + jitter*I )
     Q_s = sparse(inv(K_s))
 
     # Temporal AR1 Precision
     Q_t = ar1_precision(Nt, rho_t, sigma_t_noise)
 
     # Kronecker Product Q = Qt ⊗ Qs
-    Q_full = kron(Q_t, Q_s)
+    Q_full = Symmetric( kron(Q_t, Q_s) + jitter*I)
 
     # Explicitly ensure symmetry for sparse matrix before Cholesky decomposition
     # Convert to dense Matrix to avoid SparseArrays.CHOLMOD incompatibility with ForwardDiff.Dual
-    L_q = cholesky(Symmetric(Matrix(Q_full) + 1e-3*I)) # Increased jitter
+    L_q = cholesky(Symmetric(Matrix(Q_full) + jitter*I)) # Increased jitter
 
     # Correctly extract the lower triangular factor for dense Cholesky
     return L_q.L' \ noise_vec
