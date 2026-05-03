@@ -19,26 +19,27 @@ quickactivate(project_directory)
 current_directory =  @__DIR__() 
 print( "Current directory is: ", current_directory, "\n\n" )
 
- 
-using Pkg
- 
+  
 pkgs_bstm = [
   "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", 
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation",   
-  "Distributions", "Statistics", "MCMCChains", "DataFrames", 
+  "Distributions", "Statistics", "MCMCChains", "DataFrames", "Clustering",
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs",
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing" 
 ]
 
+# force install all:
 Pkg.add(pkgs_bstm)
 
+# load them all:
 for pk in pkgs_bstm;  @eval using $(Symbol(pk)) end
-
  
+# tidy loose ends:
+Pkg.gc()
+
 # Pkg.precompile()
 # Pkg.instantiate()
-# Pkg.gc()
 # Pkg.update()
 
 
@@ -47,7 +48,7 @@ for pk in pkgs_bstm;  @eval using $(Symbol(pk)) end
   
   
 if false
-  # For RCall:
+  # For RCall:  (not needed in this project .. but in case you need it)
   if Sys.iswindows()
     # ENV["R_HOME"] = "C:\Program Files\R\R-4.5.2\bin\x64\Rgui.exe"
     ENV["R_HOME"] = "C:\\Program Files\\R\\R-4.5.2"
@@ -76,7 +77,12 @@ Random.seed!(42)
 # required for a few functions: 
 using LogExpFunctions: logistic
 using LogExpFunctions: logsumexp
+using Turing: Variational
 
 # to help track variables, add something like this inside of a function:  
 # Main.DEBUG[] = y,p,t  # this stores y, p, t into Main.DEBUG 
 DEBUG = Ref{Any}()  # initiate
+
+print( "\nTo Debug a variable, place some like the following into your function: \n
+  Main.DEBUG[] = y,p,t  # this stores y, p, t into Main.DEBUG \n
+which means, you can see what these values are by typing: DEBUG.y, etc... \n")

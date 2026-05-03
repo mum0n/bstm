@@ -1638,18 +1638,18 @@ function plot_variational_marginals(z, sym2range)
     for (i, sym) in enumerate(keys(sym2range))
         indices = union(sym2range[sym]...)  # <= array of ranges
         if sum(length.(indices)) > 1
-            offset = 1
+            k = 1
             for r in indices
                 p = density(
                     z[r, :];
-                    title="$(sym)[$offset]",
+                    title="$(sym)[$k]",
                     titlefontsize=10,
                     label="",
                     ylabel="Density",
                     margin=1.5mm,
                 )
                 push!(ps, p)
-                offset += 1
+                k += 1
             end
         else
             p = density(
@@ -1724,10 +1724,10 @@ function generate_sim_data(n_pts=10, n_time=5; rndseed=42)
     # Components: Linear Trend + Seasonal Harmonic + Latent Process + Noise
     period=12.0
     trend = 0.05 .* coords_time[:,1] # linear trend
-    seasonal = 1.0 .* cos.(2 * pi .* coords_time[:,1] ./ period)
+    seasonal = 1.0 .* cos.(2pi .* coords_time[:,1] ./ period)
     temporal_effect =  1.0 .* ( trend .+ seasonal )
     
-    spatial_effect = 1.5 .* sin.(coords_space[:,1] .*  2 * pi) .* cos.(coords_space[:,2] .*  2 * pi)
+    spatial_effect = 1.5 .* sin.(coords_space[:,1] .*  2pi) .* cos.(coords_space[:,2] .*  2pi)
     
     sigma_y = 0.2
     observation_error = sigma_y .* randn(n_total) 
@@ -1752,14 +1752,14 @@ function generate_sim_data(n_pts=10, n_time=5; rndseed=42)
 
     cov_continuous = hcat(U1_obs, U2_obs, U3_obs)
 
-    n_cats = 7
-    probs = collect(range(0.0, stop=1.0, length=n_cats + 1))
+    N_cat = 7
+    probs = collect(range(0.0, stop=1.0, length=N_cat + 1))
     breaks1 = quantile(U1_obs, probs)
     breaks2 = quantile(U2_obs, probs)
     breaks3 = quantile(U3_obs, probs)
-    time_idx_quantiles1 = map(x -> clamp(searchsortedfirst(breaks1, x) - 1, 1, n_cats), U1_obs)
-    time_idx_quantiles2 = map(x -> clamp(searchsortedfirst(breaks2, x) - 1, 1, n_cats), U2_obs)
-    time_idx_quantiles3 = map(x -> clamp(searchsortedfirst(breaks3, x) - 1, 1, n_cats), U3_obs)
+    time_idx_quantiles1 = map(x -> clamp(searchsortedfirst(breaks1, x) - 1, 1, N_cat), U1_obs)
+    time_idx_quantiles2 = map(x -> clamp(searchsortedfirst(breaks2, x) - 1, 1, N_cat), U2_obs)
+    time_idx_quantiles3 = map(x -> clamp(searchsortedfirst(breaks3, x) - 1, 1, N_cat), U3_obs)
     cov_indices_mat = hcat(time_idx_quantiles1, time_idx_quantiles2, time_idx_quantiles3)
     
     # 4. Generate Dependent Variable Y
@@ -1968,7 +1968,7 @@ function scottish_lip_cancer_data_spacetime(n_years::Int=10; rndseed::Int=42)
     e = Edge.(node1, node2)
     g = Graph(e)
     W = adjacency_matrix(g)
-    D = diagm(vec(sum(W, dims=2)))
+    # D = diagm(vec(sum(W, dims=2)))
  
     au = assign_spatial_units( W ) # "infer" from the adjacency network (W)
     pts_base = au.centroids
@@ -2307,10 +2307,10 @@ function variational_inference_solution(m; max_iters=100, nsamps=max_iters,  nel
         j = union(indices[sym]...)  # <= array of ranges
         nj = sum(length.(j)) 
         if  nj > 1
-            offset = 1
+            k = 1
             for r in j
-                push!(vns, "$(sym)[$offset]")
-                offset += 1
+                push!(vns, "$(sym)[$k]")
+                k += 1
             end
         else
             push!(vns, "$(sym)") 
@@ -2762,7 +2762,7 @@ function logpdf_gmrf(x, Q)
     #   - Log-likelihood value.
     Q_stable = Matrix(Q) + I * 1e-5
     F = cholesky(Symmetric(Q_stable))
-    return 0.5 * (logdet(F) - dot(x, Q, x) - length(x) * log(2 * pi))
+    return 0.5 * (logdet(F) - dot(x, Q, x) - length(x) * log(2pi))
 end
 
 
@@ -3025,7 +3025,7 @@ function get_rff_deep2D_basis(X, m, lengthscale)
     N, D = size(X)
     Random.seed!(42)
     Omega_samples = randn(m, D) ./ lengthscale
-    Phi_phases = rand(m) .*  2 * pi
+    Phi_phases = rand(m) .*  2pi
     return sqrt(2/m) .* cos.(X * Omega_samples' .+ Phi_phases')
 end
 
@@ -3039,7 +3039,7 @@ function get_rff_trend_basis(t, m, lengthscale, ::Type{T}=Float64) where {T}
     Phi_phases_float = rand(m)
 
     Omega_samples = Omega_samples_float ./ lengthscale
-    Phi_phases = Phi_phases_float .* convert(T,  2 * pi)
+    Phi_phases = Phi_phases_float .* convert(T,  2pi)
 
     Z = zeros(T, N, m)
     for j in 1:m
@@ -3061,7 +3061,7 @@ function get_rff_seasonal_basis(t, m, freq, lengthscale)
     N = length(t)
     Z = zeros(N, 2*m)
     for j in 1:m
-        omega_j =  2 * pi * j * freq
+        omega_j =  2pi * j * freq
         Z[:, 2j-1] = cos.(omega_j .* t)
         Z[:, 2j] = sin.(omega_j .* t)
     end
@@ -3071,40 +3071,47 @@ end
 
 
 function prepare_model_inputs(; kwargs...)
+     
+    y = get(kwargs, :y, nothing) # better to throw an error as it is required
 
-    y = get(kwargs, :y, nothing)
-    pts = get(kwargs, :pts, nothing)
-    area_idx = get(kwargs, :area_idx, nothing)
-    time_idx = get(kwargs, :time_idx, nothing)
-    coords_space = get(kwargs, :coords_space, nothing)
-    coords_time = get(kwargs, :coords_time, nothing)
-    W = get(kwargs, :W, nothing) # Adjacency matrix
-    n_cat = get(kwargs, :n_cat, 9)
-    m_trend = get(kwargs, :m_trend, 10)
-    m_seas = get(kwargs, :m_seas, 5)
-    weights = get(kwargs, :weights, nothing)
-    offset = get(kwargs, :offset, nothing)
-    z_obs = get(kwargs, :z_obs, nothing)
-    u_obs = get(kwargs, :u_obs, nothing)
-    trials = get(kwargs, :trials, nothing)
-    M_inducing_count = get(kwargs, :M_inducing_count, 15)
-    M_rff_base = get(kwargs, :M_rff_base, 40)
-    M_rff_sigma = get(kwargs, :M_rff_sigma, 20)
+    N_obs = get(kwargs, :N_obs,  length(y))
  
-    # 1. Dimension Extraction
-    N_obs = length(y)
-    N_time = maximum(time_idx)
-    t_vec = collect(1:N_time) ./ N_time
-    n_areas = size(W, 1)
+    area_idx = get(kwargs, :area_idx, nothing)  # better to throw an error as it is required
+    if isnothing(area_idx)
+        error("area_idx not provided: It is required. ")
+    end
 
-    # 2. Variable Defaults
+    time_idx = get(kwargs, :time_idx, nothing)  # better to throw an error as it is required
+    if isnothing(time_idx)
+        error("time_idx not provided: It is required.")
+    end
+
+    N_time = get(kwargs, :N_time,  maximum(time_idx) )
+
+    W = get(kwargs, :W, I(1)) # Adjacency matrix
+
+    N_areas = size(W, 1)
+
+    pts = get(kwargs, :pts, nothing)
+    if isnothing(pts)
+        error("pts not provided: It is required. ")
+    end
+
+    coords_space = isnothing(pts) ? nothing : get(kwargs, :coords_space, vcat([collect(t)' for t in pts]...) ) # as a matrix 
+    
+    coords_time = isnothing(time_idx) ? nothing : get(kwargs, :coords_time, time_idx)
+    
+    weights = get(kwargs, :weights, ones(Float64, N_obs) )
+
+    log_offset = get(kwargs, :log_offset, zeros(Float64, N_obs))
+    
+    trials = get(kwargs, :trials, ones(Int, N_obs))
+    
+    rnd_seed = get(kwargs, :rnd_seed, 42)
+    Random.seed!(rnd_seed)
+    
     # Ensures that multi-fidelity and weighted variables exist even for simple models
-    weights = isnothing(weights) ? ones(Float64, N_obs) : weights
-    offset = isnothing(offset) ? zeros(Float64, N_obs) : offset
-    trials = isnothing(trials) ? ones(Int, N_obs) : trials
-    # z_obs = isnothing(z_obs) ? randn(N_obs) : z_obs
-    # u_obs = isnothing(u_obs) ? randn(N_obs, 3) : u_obs
-
+     
     # 3. Standardized Precision Scaling (BYM2 & RW2)
     # Pre-scaling ensures that priors on sigma_sp and sigma_rw2 are interpretable as marginal scales
     
@@ -3114,10 +3121,12 @@ function prepare_model_inputs(; kwargs...)
     eigs_sp = filter(x -> x > 1e-6, eigvals(Matrix(Q_sp_raw)))
     scaling_sp_const = exp(mean(log.(eigs_sp)))
     Q_spatial_scaled = sparse(Q_sp_raw ./ scaling_sp_const)
-
+    
     # B. Smoothing Scaling (RW2)
-    D_rw2_mat = spzeros(Float64, n_cat - 2, n_cat)
-    for i in 1:(n_cat - 2)
+    N_cat = get(kwargs, :N_cat, 9)
+
+    D_rw2_mat = spzeros(Float64, N_cat - 2, N_cat)
+    for i in 1:(N_cat - 2)
         D_rw2_mat[i, i] = 1.0; D_rw2_mat[i, i+1] = -2.0; D_rw2_mat[i, i+2] = 1.0
     end
     Q_rw2_raw = D_rw2_mat' * D_rw2_mat
@@ -3127,10 +3136,14 @@ function prepare_model_inputs(; kwargs...)
 
     # 4. Fixed Projections & RFF Bases
     # Generating fixed weights and phases ensures stability across iterations for deep functional RFFs
-    Random.seed!(42)
     
     # Trend & Seasonality Static Projection Vectors
-    Om_tr = randn(Float64, m_trend) ./ 0.5; Ph_tr = rand(Float64, m_trend) .* 2 * pi
+    m_trend = get(kwargs, :m_trend, 10)
+    m_seas = get(kwargs, :m_seas, 5)
+    t_vec = get(kwargs, :t_vec,  collect(1:N_time) ./ N_time )
+
+    Om_tr = randn(Float64, m_trend) ./ 0.5; 
+    Ph_tr = rand(Float64, m_trend) .* 2pi
     Z_trend = sqrt(2/m_trend) .* cos.(t_vec * Om_tr' .+ Ph_tr')
     
     Z_seas = zeros(Float64, N_time, 2 * m_seas)
@@ -3154,7 +3167,10 @@ function prepare_model_inputs(; kwargs...)
     # W_y_fix = randn(5, M_base); b_y_fix = rand(M_base) .* 2π
 
     # Layer Sigma: Maps [Space, Time] (Dim 3) to Volatility
-
+    
+    M_rff = M_rff_base = get(kwargs, :M_rff_base, 40)
+    M_rff_sigma = get(kwargs, :M_rff_sigma, 20)
+ 
     W_z_fixed = randn(2, M_rff_base); 
     b_z_fixed = rand(M_rff_base) .* 2pi
 
@@ -3171,19 +3187,27 @@ function prepare_model_inputs(; kwargs...)
     # Coordinates and Inducing points for FITC Sparse GPs
     coords_space_y = hcat([p[1] for p in pts], [p[2] for p in pts])
     coords_st_full = hcat(coords_space_y, time_idx ./ N_time)
+    
+    M_inducing_count = get(kwargs, :M_inducing_count, 15)
     Z_inducing = kmeans_inducing_points(coords_st_full, M_inducing_count)
-
+     
     # Subsets for varied fidelity resolutions
+    z_obs = get(kwargs, :z_obs, zeros(Float64, N_obs))
+    u_obs = get(kwargs, :u_obs, zeros(Float64, N_obs))
+    
     coords_z_spatial = coords_space_y[1:min(length(z_obs), size(coords_space_y,1)), :]
-    coords_u_st = hcat(coords_space_y[1:min(size(u_obs,1), size(coords_space_y,1)), :], (time_idx ./ N_time)[1:min(size(u_obs,1), length(time_idx))])
+    coords_u_st = hcat(
+      coords_space_y[1:min(size(u_obs,1), size(coords_space_y,1)), :], 
+      (time_idx ./ N_time)[1:min(size(u_obs,1), length(time_idx))]
+    )
 
     # 6. Interaction & Covariate Mapping Vectors
     # interaction_idx: Maps (area, time) to a unique linear index for Type IV interactions
-    interaction_idx = (time_idx .- 1) .* n_areas .+ area_idx
+    interaction_idx = (time_idx .- 1) .* N_areas .+ area_idx
     
     # cov_mapping: Discretizes covariates for RW2 smoothing models
     cov_mapping = zeros(Int, N_obs, 4)
-    for k in 1:4; cov_mapping[:, k] .= mod1.(1:N_obs, n_cat); end
+    for k in 1:4; cov_mapping[:, k] .= mod1.(1:N_obs, N_cat); end
     
     # 7. Templates for AR1 Temporal Effects
     Q_ar1_template = spdiagm(0 => ones(N_time), 1 => fill(-1.0, N_time-1), -1 => fill(-1.0, N_time-1))
@@ -3201,18 +3225,20 @@ function prepare_model_inputs(; kwargs...)
         z_obs = z_obs, 
         u_obs = u_obs, 
         weights = weights, 
-        offset = offset,
+        log_offset = log_offset,
         coords_z_spatial = coords_z_spatial,   
         coords_u_st = coords_u_st,
-        n_areas = n_areas, 
-        N_time = N_time, 
-        n_cats = n_cat,
         Q_sp = Q_spatial_scaled, 
         Q_rw2 = Q_rw2_scaled, 
         Q_ar1_template = Q_ar1_template,
         Z_trend = Z_trend, 
         Z_seas = Z_seas, 
         Z_inducing = Z_inducing,
+        M_inducing_val = get( kwargs, :M_inducing_val, 15),
+        M_rff = M_rff,
+        M_rff_u = get( kwargs, :M_rff_u, 30),
+        M_rff_sigma = M_rff_sigma,
+        M_rff_base = M_rff_base,
         W_z_fixed = W_z_fixed, 
         b_z_fixed = b_z_fixed, 
         W_u_fixed = W_u_fixed, 
@@ -3222,9 +3248,24 @@ function prepare_model_inputs(; kwargs...)
         W_sigma_fixed = W_sigma_fixed, 
         b_sigma_fixed = b_sigma_fixed,
         interaction_idx = interaction_idx, 
-        cov_indices = cov_mapping
+        cov_indices = cov_mapping,
+        n_mosaics = get(kwargs, :n_mosaics, 5),
+        m_rff = get(kwargs, :m_rff, 20),
+        D_st =  get(kwargs, :D_st, 3 ),  # svgp
+        period = get(kwargs, :D_st, 12 ),  # svgp
+        N_obs = N_obs, 
+        N_areas = N_areas, 
+        N_time = N_time, 
+        N_cat = N_cat,
+        m_feat = 5,
+        grid_res = get(kwargs, :grid_res,  64), 
+        pad_factor = get(kwargs, :pad_factor, 2),
+        n_clusters = get(kwargs, :n_clusters, 4), # model_D03_poisson_localised
+        use_zi = get(kwargs, :use_zi, false) 
     )
 end
+
+
 
 # Helper to create AR1 precision matrix
 function ar1_precision(n, rho, sigma_e)
@@ -3561,7 +3602,7 @@ function waic_compute(model::DynamicPPL.Model, chain::MCMCChains.Chains, modinpu
         # Likelihood calculation
         for i in 1:N_obs
             a, t = modinputs.area_idx[i], modinputs.time_idx[i]
-            eta = modinputs.offset[i] + s_eff[a] + f_time[t]
+            eta = modinputs.log_offset[i] + s_eff[a] + f_time[t]
             
             # Add categorical covariate effects if present
             for k in 1:4
@@ -3697,8 +3738,8 @@ function reconstruct_posteriors(model::DynamicPPL.Model, chain::MCMCChains.Chain
     # 6. Recover Categorical Covariate Effects (RW2/beta_cov and b_class)
     beta_cov_summaries = []
     for k in 1:size(modinputs.cov_indices, 2)
-        raw_samples = get_params_vector(chain, "beta_cov[" * string(k) * "]", modinputs.n_cats)
-        summary_k = summarize_array(reshape(raw_samples', modinputs.n_cats, 1, N_samples))
+        raw_samples = get_params_vector(chain, "beta_cov[" * string(k) * "]", modinputs.N_cat)
+        summary_k = summarize_array(reshape(raw_samples', modinputs.N_cat, 1, N_samples))
         push!(beta_cov_summaries, summary_k)
     end
 
@@ -3713,7 +3754,7 @@ function reconstruct_posteriors(model::DynamicPPL.Model, chain::MCMCChains.Chain
 
         for i in 1:N_obs
             a, t = modinputs.area_idx[i], modinputs.time_idx[i]
-            eta = modinputs.offset[i] + st_noisy[a, t, s] + gp_latent_samples[i, s]
+            eta = modinputs.log_offset[i] + st_noisy[a, t, s] + gp_latent_samples[i, s]
 
             for k in 1:length(beta_cov_summaries)
                 eta += beta_cov_summaries[k].mean[modinputs.cov_indices[i, k]]
@@ -3772,8 +3813,8 @@ Returns:
     W_fixed = Matrix{Float64}(undef, 2, M_rff_count)
     for i in 1:M_rff_count
         idx = sampled_indices[i]
-        W_fixed[1, i] = all_freqs_x[idx] *  2 * pi # Scale by  2 * pi to match RFF convention (often ω'x)
-        W_fixed[2, i] = all_freqs_y[idx] *  2 * pi
+        W_fixed[1, i] = all_freqs_x[idx] *  2pi # Scale by  2pi to match RFF convention (often ω'x)
+        W_fixed[2, i] = all_freqs_y[idx] *  2pi
     end
 
     return W_fixed

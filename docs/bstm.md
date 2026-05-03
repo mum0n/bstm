@@ -88,6 +88,11 @@ end
 
 include( joinpath( project_directory, "scripts", "startup.jl" ) ) # might need to run this a few times if there are stragglers   
 
+# Pkg.instantiate()  # to force a reset
+
+# Pkg.update()  # to update  (this can break dependencies .. only if you really need to )
+
+# if there continue to be issues: some more lower level package management may be required ... 
 
 ```
 
@@ -107,12 +112,10 @@ data = generate_sim_data(n_pts, n_time; rndseed=42);
 keys(data)
 pairs(data)
 Dict(k => size(v) for (k, v) in pairs(data))
-
-# extract some quantities for demonstrations
-(; pts, y_obs, y_binary, time_idx, weights, trials, cov_indices) = data  # this is a simple way to select what to retain
+# (; pts, W ) = data  # this is a simple way to copy objects into the Main environment
 
 # view the data density
-plot_kde_simple(pts, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+plot_kde_simple( data.pts, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
  
 ```
  
@@ -120,7 +123,7 @@ plot_kde_simple(pts, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
 
 ## Discrete Bayesian Spatiotemporal Models
 
-Many *bstm*s treat space as discrete entities. There are many reasons for this. Well-constructed spatial partitions balances geometric compactness with statistical information density to avoid "Data Starvation." However, more often, one inherits areal management units, often with no structural support/scientific rationale. Though one can simply push on using such area definitions, if the balance of information available to information extractable is poor, often due  due to improper sizes and shapes, one should consider alternative areal units which then can be reconsolidated post-analysis to estimate at the level of the original, unfortunate areal units (*AUs*).   
+Many *bstm*s treat space as discrete areal units. There are many reasons for this. Well-constructed spatial partitions balances geometric compactness with statistical information density to avoid "Data Starvation." However, more often, one inherits areal management units, often with no structural support/scientific rationale. Though one can simply push on using such area definitions, if the balance of information available to information extractable is poor, often due  due to improper sizes and shapes, one should consider alternative areal units which then can be reconsolidated post-analysis to estimate at the level of the original, unfortunate areal units (*AUs*).   
 
 Another pivotal advantage is speed. By being able to adjust the number of units, one can balance computational resources against information gain, depending upon the system being studied.
 
@@ -246,20 +249,22 @@ Using our basic spatiotemporal data, let us try to represent them in a discrete 
 
 ```{julia}
 
+(; pts  ) = data  # this is a simple way to copy objects into the Main environment
+
 ntot = size(pts, 1) 
 
 min_time_slices = 5
-target_density = 20 # number per areal unit 
+target_density = 50 # number per areal unit 
 target_units = Int(floor( ntot / target_density ))
 min_total_arealunits = target_units / 10
 max_total_arealunits = target_units * 10
-min_points = 1
+min_points = 3
 max_points = Int(floor(ntot / min_total_arealunits ))
-min_area = 0.5
-max_area = 9
+min_area = 0.1
+max_area = 10
 cv_min = 1
 buffer_dist = 0.8
-tolerance = 0.05
+tolerance = 0.1
 
 
 test_configs = [ :cvt, :kvt, :qvt, :bvt, :avt ] # these are the currently available methods
@@ -306,14 +311,13 @@ for m in test_configs
     end
 end
 
-if !isempty(results)
-    display(DataFrame(results))
-    display(Plots.plot(plots..., layout=(3, 2), size=(600, 800)))
-end
+display(DataFrame(results))
 
+display(Plots.plot(plots..., layout=(3, 2), size=(600, 800)))
+ 
 ```
 
-Conclusion: All methods seem reasonable, but AVT provides most control and usually the lowest density and SD and CV. When the CV approaches 1, it represents a Poisson-like spatial distribution. Higher means clustered and lower means homogenous. We want some structure/clusters but not so much that we have unreliable data. 
+Conclusion: All methods seem similar and reasonable, but AVT provides most control. Note that if the CV approaches 1, it represents a Poisson-like spatial distribution. Higher means clustered and lower means homogenous. We want some structure/clusters but not so much that we have unreliable data and not so little that everything is the same. 
 
  
 ### Scottish lip cancer data  
@@ -341,24 +345,20 @@ plot_kde_simple(pts_scot, sd_extension_factor=0.25, title="Spatial Intensity (KD
 In the data Tuple (*data_scot*), we have counts (y) of cancer incidence and population size in each area (log_offset). We also simulate a 10-"year" temporal process, a random walk with magnitude 0.5 and a covariate effect (X: an area-specific continuous covariate that represents the proportion of the population employed in agriculture, fishing, or forestry). An overall random uniform observation error of magnitude 0.2 is added with a count then taken as the overall, rounded integer value.
 
 
-#### Spatiotemporal model of Scottish lip cancers
+#### Spatiotemporal model: a preview 
 
-Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see the workflow. 
-
-We reformat this data Tuple (*data_scot*) further with 'prepare_model_inputs()' to create structured inputs for, in this case, a simple separable spatiotemporal model (model_D1_poisson_simple).  
+Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we reformat the data (*data_scot*) with 'prepare_model_inputs()' to create a structured data object and run a simple separable spatiotemporal model (model_D1_poisson_simple).  
  
 ```{julia}
 #| D00: Base Model - Sparse GMRF Separable Spatiotemporal  
 
 # prepare model inputs  
-
 modinputs = prepare_model_inputs( 
   y = data_scot.y,         # y-value, counts of people with lip cancer
+  pts = data_scot.pts,
   area_idx = data_scot.area_idx,  # space index
   time_idx = data_scot.time_idx,  # time index
-  coords_space = data_scot.coords_space,  # actual values
-  coords_time = data_scot.coords_time,    # actual values
-  offset = data_scot.log_offset, # offsets, population size on log-scale
+  log_offset = data_scot.log_offset, # offsets, population size on log-scale
   W = data_scot.W  # matrix adjacency
 )
 
@@ -409,7 +409,7 @@ chain = sample(mod, MH(), 50; num_warmup=100, thin=50, progress=true, drop_warmu
 
 The other purpose of the above example was to show that the workflow is simple, once the model form has been chosen. The model structure is important and where the time and resources should be spent: deliberating utility, rather than trying to debug,implement and run.
 
-#### Optimization-based approaches
+#### Options: Optimization-based approaches
 
 Though MCMC sampling is our gold-standard, we also have other optimization-based options that can be worth considering. All of these methods are boosted by Automatic Differentiation, some require smooth differentiable likelihood surfaces, while others are robust and can be range bound. See the [whole list here](https://docs.sciml.ai/Optimization/stable/optimization_packages/optim/). 
 
@@ -437,9 +437,19 @@ mod_map.optim_result.retcode  # it fails
 mod_map.params
 
 # VI: Mean-Field Variational Inference (ADVI), Default optimiser is TruncatedADAGrad
-mod_vi = Turing.vi(mod, ADVI(10, 1000), Variational.meanfield(mod))  #, optimizer=Flux.ADAM(1e-1));
+
+advi = ADVI(FullRankGaussian, 10, 1000)
+mod_vi = Turing.vi(mod, , Variational.meanfield(mod))  #, optimizer=Flux.ADAM(1e-1));
 pm = mod_vi.mmean
 msamples = DataFrame( rand(mod_vi, nsamps )', :auto )
+q = FullRankGaussian(mod, LowerTriangular(Matrix{Float64}(0.6*I, d, d)))
+q = MeanFieldGaussian(mod, Diagonal(ones(d)));
+
+q0 = Variational.q_meanfield_gaussian(mod)  # initialize variational distribution (optional)
+advi = ADVI(1, 2000)  # num_elbo_samples, max_iters
+@time q = vi(m, advi, q0, optimizer=Flux.ADAM(1e-1));
+
+
 
 ``` 
 
@@ -540,20 +550,28 @@ model_list = Dict(
     # --- D-Series: Discrete Spatial Models (GMRF/BYM2) ---
     "D00_poisson_simple"      => () -> model_D00_poisson_simple(modinputs_count),
     "D01_poisson"             => () -> model_D01_poisson(modinputs_count),
-    "D02_gaussian"            => () -> model_D02_gaussian(modinputs_gaussian),
-    "D03_gaussian_rff"        => () -> model_D03_gaussian_rff(modinputs_gaussian),
-    "D04_lognormal"           => () -> model_D04_lognormal(modinputs_lognormal),
-    "D05_binomial"            => () -> model_D05_binomial(modinputs_binomial),
-    "D06_negbin"              => () -> model_D06_negativebinomial(modinputs_count),
-    "D07_gaussian_rff_cov"    => () -> model_D07_gaussian_rff_cov(modinputs_gaussian),
-    "D08_gaussian_fft"        => () -> model_D08_gaussian_fft(modinputs_gaussian),
-    "D09_adaptive_rff_bym2"   => () -> model_D09_gaussian_adaptive_rff(modinputs_gaussian),
-    "D10_nested_multifid_rff" => () -> model_D10_nested_multifidelity_rff(modinputs_gaussian),
-    "D11_tv_intercept_bym2"   => () -> model_D11_nested_time_varying_intercept(modinputs_gaussian),
-    "D12_stochastic_vol"      => () -> model_D12_stochastic_volatility(modinputs_gaussian),
-    "D13_fitc_bym2"           => () -> model_D13_fitc(modinputs_gaussian),
-    "D14_fitc_nonlinear"      => () -> model_D14_fitc_nonlinear_nested_rff(modinputs_gaussian),
-    "D15_gptime_fitc"         => () -> model_D15_gptime_fitc(modinputs_gaussian),
+    "D02_poisson_leroux"      => () -> model_D02_poisson_leroux(modinputs_count),
+    "D02_poisson_localised"   => () -> model_D03_poisson_localised(modinputs_count),
+    "D02_poisson_sar"         => () -> model_D04_poisson_sar(modinputs_count),
+    "D02_poisson_mcar"        => () -> model_D05_poisson_mcar(modinputs_count),
+    "D02_poisson_svc"         => () -> model_D06_poisson_svc(modinputs_count),
+    "D02_poisson_dag"         => () -> model_D07_poisson_dag(modinputs_count),
+    "D02_poisson_hurdle"      => () -> model_D08_hurdle(modinputs_count),
+    "D02_poisson_ei"          => () -> model_D09_poisson_ei(modinputs_count),
+    "D10_gaussian"            => () -> model_D10_gaussian(modinputs_gaussian),
+    "D11_gaussian_rff"        => () -> model_D11_gaussian_rff(modinputs_gaussian),
+    "D12_lognormal"           => () -> model_D12_lognormal(modinputs_lognormal),
+    "D13_binomial"            => () -> model_D13_binomial(modinputs_binomial),
+    "D14_negbin"              => () -> model_D14_negativebinomial(modinputs_count),
+    "D15_gaussian_rff_cov"    => () -> model_D15_gaussian_rff_cov(modinputs_gaussian),
+    "D16_gaussian_fft"        => () -> model_D16_gaussian_fft(modinputs_gaussian),
+    "D17_adaptive_rff_bym2"   => () -> model_D17_gaussian_adaptive_rff(modinputs_gaussian),
+    "D18_nested_multifid_rff" => () -> model_D18_nested_multifidelity_rff(modinputs_gaussian),
+    "D19_tv_intercept_bym2"   => () -> model_D19_nested_time_varying_intercept(modinputs_gaussian),
+    "D20_stochastic_vol"      => () -> model_D20_stochastic_volatility(modinputs_gaussian),
+    "D21_fitc_bym2"           => () -> model_D21_fitc(modinputs_gaussian),
+    "D22_fitc_nonlinear"      => () -> model_D22_fitc_nonlinear_nested_rff(modinputs_gaussian),
+    "D23_gptime_fitc"         => () -> model_D23_gptime_fitc(modinputs_gaussian),
 
     # --- C-Series: Continuous Spatial Models (Deep GP/RFF/SPDE) ---
     "C01_dense_gp"            => () -> model_C01_gaussian_dense_gp(modinputs_gaussian),
@@ -585,7 +603,7 @@ model_list = Dict(
 
 println("Model registry updated with $(length(model_list)) D- and C-series variants.")
 
-# quick check to see if models are still functional 
+# quick check to see if all models are still functional 
 for model_key in sort(collect(keys(model_list))[9:41] )
   display(model_key)
   if model_key == "C08_refined_mosaic" break
@@ -595,165 +613,220 @@ for model_key in sort(collect(keys(model_list))[9:41] )
 end
 
      
+# saving or testing: 
 
 # mod_fns =  collect(keys(model_registry))
 # i = 1 # 1:9
 # @load_carstm_state( mod_fns[i] )
  
 mod = model_v2_rff_gaussian(modinputs_gaussian)
-chain_v2_optimized = sample(mod, optimal_gibbs, 10; progress=true)
+chain = sample(mod, MH(), 10; progress=true)
+  
+    
+```
  
+### Non-Intrinsic Poisson Spatiotemporal Model (Leroux CAR)
+
+This model is a variation of `model_D01_poisson`. It uses the **Leroux CAR** prior for spatial effects. By combining the identity matrix $I$ and the scaled spatial Laplacian $Q_{sp}$, it creates a non-singular precision matrix:
+
+$$Q_{Leroux} = \tau [ (1-\rho)I + \rho Q_{sp} ]$$
+
+This specification is robust because it automatically handles both structured spatial clustering and unstructured heterogeneity within a single latent field, ensuring a proper posterior without needing extra pinning constraints.
  
-
-# --- MAP Optimization Benchmarking ---
-# Maximum A Posteriori (MAP) provides a point estimate by maximizing the posterior density.
-
-using Turing, Optim
-
-println("Running MAP Optimization for model_v1_gaussian...")
-
-# 1. Instantiate the model using the stable precomputations
-m_v1 = model_v1_gaussian(modinputs_gaussian)
-
-# 2. Perform MAP optimization using the correct library path
-# Using Optim.optimize directly to avoid ambiguity and fix the module nesting error
-t_map = @elapsed begin
-    map_res_v1 = maximum_a_posteriori(m_v1 )
-end
-
-println("Optimization finished in $(round(t_map, digits=2)) seconds.")
-
-# 3. Display summary of estimates
-println("\n--- MAP Estimates for Model V1 ---")
-display(map_res_v1)
+```{julia}
+  
 
 
-chain = sample(m_v1, NUTS(), 1_000; initial_params=InitFromParams(map_res_v1))
+```
+
+### Mathematical Documentation: Localized Poisson Spatiotemporal Model (Leroux CAR)
+
+This model (`model_D01_poisson_localised`) implements a localized Bayesian hierarchical framework for count data. It extends the standard Leroux CAR model by incorporating a cluster-based intercept structure, allowing for the detection of abrupt spatial transitions (step-changes).
+
+#### 1. Likelihood and Link Function
+The observation $y_{it}$ for area $i$ and time $t$ follows a Poisson distribution:
+
+$$y_{it} \sim \text{Poisson}(\mu_{it})$$
+$$\log(\mu_{it}) = \text{offset}_{it} + \phi_i + \delta_t + \gamma_{it} + \sum_{k=1}^K \beta_{k, x_{itk}}$$
+
+Where:
+*   $\phi_i$: Spatial random effect.
+*   $\delta_t$: Temporal main effect (AR1).
+*   $\gamma_{it}$: Space-time interaction effect.
+*   $\beta_{k, x_{itk}}$: Second-order random walk (RW2) smoothing for categorical covariate $k$.
+
+#### 2. Localized Spatial Effect (Leroux CAR Prior)
+
+Following **Lee and Sarran (2015)**, the spatial field $\mathbf{\phi}$ is modeled as a non-intrinsic Gaussian Markov Random Field (GMRF) centered around cluster-specific means:
+
+$$\mathbf{\phi} \sim \text{MvNormal}(\mathbf{\mu}_{cluster}, Q_{Leroux}^{-1})$$
+
+**The Mean Structure:**
+Study areas are partitioned into $G$ clusters using K-means clustering on spatial coordinates. Each cluster $g$ is assigned an intercept $\mu_g \sim \text{Normal}(\mu_{global}, \sigma^2_{cluster})$. Thus, if area $i$ belongs to cluster $g$, then $[mu_{cluster}]_i = \mu_g$.
+
+**The Precision Matrix ($Q_{Leroux}$):**
+To ensure properness and handle both structured and unstructured variance, the precision matrix is defined as:
+
+$$Q_{Leroux} = \tau [ (1-\rho)I + \rho Q_{sp} ]$$
+
+*   $\tau$: Spatial precision (scale).
+*   $\rho$: Spatial dependence parameter ($\rho=0$ implies IID noise; $\rho=1$ implies ICAR).
+*   $Q_{sp}$: Scaled graph Laplacian $(D - W) / \text{scaling\_factor}$.
+
+#### 3. Temporal Component (AR1)
+The temporal main effect follows a first-order autoregressive process:
+
+$$\delta_t \sim \text{AR1}(\rho_{tm}, \sigma^2_{tm})$$
+
+#### 4. Interaction Component
+The space-time interaction $\gamma_{it}$ allows for area-specific deviations from the global spatial and temporal trends, modeled as i.i.d. Gaussian noise:
+
+$$\gamma_{it} \sim \text{Normal}(0, \sigma^2_{int})$$
 
 
+ 
+### Mathematical Documentation: Simultaneous Autoregressive (SAR) Model
 
-# ---------
+While the Conditional Autoregressive (CAR) models we've explored (ICAR, Leroux) define the distribution of area $i$ conditioned on its neighbors, the **Simultaneous Autoregressive (SAR)** model specifies the joint dependency directly.
 
-map_results = Dict{String, Any}()
+#### 1. The SAR Structural Equation
+A spatial random effect $\mathbf{\phi}$ in a SAR model is typically defined by the relationship:
+$$\mathbf{\phi} = \rho W \mathbf{\phi} + \mathbf{\epsilon}$$
+where $\mathbf{\epsilon} \sim N(0, \sigma^2 I)$ and $W$ is the row-standardized adjacency matrix. This implies that the spatial field is equal to a weighted average of its neighbors plus independent noise.
 
-println("Starting Suite MAP Optimization...\n")
+#### 2. The SAR Precision Matrix
+Rearranging the structural equation leads to the joint distribution:
+$$(I - \rho W)\mathbf{\phi} = \mathbf{\epsilon}$$
+$$\mathbf{\phi} \sim \text{MvNormal}(0, \sigma^2 [(I - \rho W)'(I - \rho W)]^{-1})$$
 
-for m_key in sort(collect(keys(models_to_bench)))
-    print("Optimizing $m_key (MAP)... ")
-    try
-        m_instance = models_to_bench[m_key]()
-        # Use LBFGS for numerical optimization of the log-joint
-        t = @elapsed begin
-            map_res = optimize(m_instance, MAP())
-        end
-        map_results[m_key] = (result = map_res, time = t)
-        println("$(round(t, digits=2))s")
-    catch e
-        println("FAILED")
-        map_results[m_key] = nothing
-    end
-end
+The precision matrix for a SAR model is therefore:
+$$Q_{SAR} = \frac{1}{\sigma^2} (I - \rho W)'(I - \rho W)$$
 
-# --- Display MAP Summary ---
-println("\n" * "="^45)
-println(rpad("Model", 25), " | ", rpad("Time (s)", 10), " | ", "LP")
-println("-"^45)
-for m_key in sort(collect(keys(map_results)))
-    if !isnothing(map_results[m_key])
-        res = map_results[m_key]
-        lp = round(res.result.lp, digits=2)
-        println(rpad(m_key, 25), " | ", rpad(string(round(res.time, digits=2)), 10), " | ", lp)
-    else
-        println(rpad(m_key, 25), " | ", "Error")
-    end
-end
-println("="^45)
+**Key Difference:**
+*   **CAR Precision:** $Q \propto (I - \rho W)$.
+*   **SAR Precision:** $Q \propto (I - \rho W)^2$.
 
+In practice, SAR models often result in a denser precision matrix than CAR models for the same graph, though they can be more intuitive for modeling 'spillover' processes.
 
-
-# ----- 
-# Variational Inference
- using Turing, AdvancedVI
-
-using AdvancedVI
-
-# 1. Setup the ADVI algorithm
-# Using 1 sample for the gradient estimate and 1000 iterations
-advi = ADVI(1, 1000)
-
-# 2. Run the optimization
-println("Starting ADVI for model_v1_gaussian...")
-t_vi = @elapsed begin
-    q_v1 = vi(m_v1, advi)
-end
-
-println("ADVI finished in $(round(t_vi, digits=2)) seconds.")
-
-
-using Optim
-
-# 1. Optimized MAP with L-BFGS
-# We pass specific Optim options to allow for better convergence monitoring
-println("Starting Optimized MAP (L-BFGS)...")
-map_res_optimized = optimize(m_v1, MAP(), LBFGS())
-
-# 2. Optimized ADVI (Multi-sample gradient)
-# ADVI(n_samples, n_iterations)
-# Increasing samples to 10 reduces noise in high-dimensional ST fields
-println("Starting Optimized ADVI (10 samples per grad)...")
-advi_optimized = ADVI(10, 1500)
-q_v1_opt = vi(m_v1, advi_optimized)
-
-println("Optimization Complete.")
-
-
-
-
-vi_results = Dict{String, Any}()
-n_vi_iters = 1000
-
-println("Starting Suite Variational Inference (ADVI)...")
-
-for m_key in sort(collect(keys(models_to_bench)))
-    print("Running VI for $m_key... ")
-    try
-        m_instance = models_to_bench[m_key]()
-
-        # Standard Mean-Field ADVI
-        advi = ADVI(1, n_vi_iters)
-
-        t = @elapsed begin
-            # Solve for the variational posterior
-            q = vi(m_instance, advi)
-        end
-
-        vi_results[m_key] = (dist = q, time = t)
-        println("$(round(t, digits=2))s")
-    catch e
-        println("FAILED: $e")
-        vi_results[m_key] = nothing
-    end
-end
-
-# --- Display VI Summary Table ---
-println("\n" * "="^45)
-println(rpad("Model", 25), " | ", rpad("Time (s)", 10))
-println("-"^45)
-for m_key in sort(collect(keys(vi_results)))
-    if !isnothing(vi_results[m_key])
-        res = vi_results[m_key]
-        println(rpad(m_key, 25), " | ", rpad(string(round(res.time, digits=2)), 10))
-    else
-        println(rpad(m_key, 25), " | ", "Error")
-    end
-end
-println("="^45)
+```{julia}
 
 ```
 
 
+### Mathematical Documentation: Multivariate Conditional Autoregressive (MCAR) Model
 
- 
+The **MCAR** model extends CAR models to the multivariate case, where we wish to model $J$ spatial processes (e.g., two different diseases) that are likely correlated.
+
+#### 1. The MCAR Prior
+For a bivariate case ($J=2$), the joint spatial random effect $\mathbf{\Phi} = [\mathbf{\phi}_1, \mathbf{\phi}_2]'$ follows a multivariate normal distribution:
+$$\mathbf{\Phi} \sim \text{MvNormal}(\mathbf{0}, [\Sigma \otimes Q_{ICAR}]^{-1})$$
+Where:
+*   $\Sigma$: A $J \times J$ covariance matrix capturing the correlation between the different outcomes.
+*   $Q_{ICAR}$: The standard ICAR precision matrix ($D-W$).
+*   $\otimes$: The Kronecker product.
+
+#### 2. Implementation in Turing
+In this bivariate example, we use a Cholesky decomposition of $\Sigma$ to sample the joint field efficiently. This allows the model to share spatial information across outcomes while identifying unique spatial clusters for each.
+
+model_D05_poisson_mcar()
+
+```{julia}
+
+```
+
+### Mathematical Documentation: Spatially Varying Coefficient (SVC) Model
+
+The **SVC** model (`model_D06_poisson_svc`) relaxes the assumption of global stationarity in regression effects. Instead of a single $\beta$ for the whole domain, each area $i$ has its own coefficient $\beta_{i,k}$.
+
+#### 1. Multivariate Spatial Prior for Coefficients
+To ensure spatial smoothness in the coefficients, we use a Multivariate ICAR (MCAR) prior. For $K$ spatially varying covariates, the vector $\mathbf{B} = [\beta_{1}, \dots, \beta_{K}]'$ follows:
+
+$$\mathbf{B} \sim \text{MvNormal}(\mathbf{\mu}_\beta, [\Sigma_\beta \otimes Q_{sp}]^{-1})$$
+
+Where:
+*   $\Sigma_\beta$: Covariance matrix capturing correlations between the slopes of different covariates.
+*   $Q_{sp}$: The scaled graph Laplacian.
+
+#### 2. Linear Predictor
+The log-intensity for area $i$ at time $t$ becomes:
+$$\log(\mu_{it}) = \text{offset}_{it} + \phi_i + \delta_t + \gamma_{it} + \sum_{k=1}^K x_{it,k} \beta_{i,k}$$
+
+This specification is particularly powerful for identifying 'local' drivers of risk that may be masked by global averages.
+
+modinputs.X_svc  -- additional covariates
+
+model_D06_poisson_svc()
+
+```{julia}
+
+```
+
+### Mathematical Documentation: Directed Acyclic Graph (DAG) Spatial Model
+
+The **DAG Spatial Model** (`model_D01_poisson_dag`) provides a scalable framework for spatial dependencies by replacing the symmetric GMRF precision matrix with a recursive directed structure. 
+
+#### 1. The DAGAR Specification
+Given a spatial domain and a defined ordering of $N$ areas, the spatial random effect $\phi_i$ for area $i$ is defined as:
+
+$$\phi_1 = \epsilon_1$$
+$$\phi_i = \sum_{j \in \text{pa}(i)} w_{ij} \phi_j + \epsilon_i, \quad i=2, \dots, N$$
+
+Where:
+*   $\text{pa}(i)$: The set of neighbors of $i$ that precede it in the chosen ordering.
+*   $w_{ij}$: Directed weights, often derived from the graph topology and a dependence parameter $\rho$.
+*   $\epsilon_i$: Independent Gaussian noise with variance scaled to maintain marginal stationarity.
+
+#### 2. Computational Advantage
+The joint distribution $\mathbf{\phi} \sim \text{MvNormal}(\mathbf{0}, (B'B)^{-1})$ utilizes a lower-triangular matrix $B$. This allows the spatial field to be sampled or evaluated using forward substitution, entirely avoiding the $O(N^3)$ cost of matrix inversion or the complexities of sum-to-zero constraints associated with intrinsic CAR models.
+
+
+model_D07_poisson_dag()
+
+
+```{julia}
+
+```
+
+### Mathematical Documentation: Hurdle Spatiotemporal Model
+
+The **Hurdle Model** (`model_D08_hurdle`) is designed for data with an excess of zeros by modeling the zero-generating process and the positive-count process separately.
+
+#### 1. Likelihood Structure
+$$y_{it} = 0 \text{ with probability } 1 - \pi_{it}$$
+$$y_{it} > 0 \text{ with probability } \pi_{it} \cdot \text{TruncatedPoisson}(y_{it} | \mu_{it}, y_{it} \ge 1)$$
+
+Where:
+*   $\text{logit}(\pi_{it}) = \alpha_H + \text{Space}_H + \text{Time}_H$ (Hurdle predictor)
+*   $\log(\mu_{it}) = \alpha_C + \text{Space}_C + \text{Time}_C$ (Count predictor)
+
+#### 2. Statistical Advantages
+Unlike Zero-Inflation (ZIP), which assumes zeros can come from both a 'structural' source and the Poisson process, the Hurdle model assumes **all zeros** are generated by the hurdle process. This is ideal when the 'zero' state represents a specific barrier (e.g., presence/absence of a disease) distinct from the intensity of the events.
+
+model_D08_hurdle()
+
+
+```{julia}
+
+```
+
+
+### Mathematical Documentation: Ecological Inference (EI) Spatiotemporal Model
+
+The **Ecological Inference Model** (`model_D09_poisson_ei`) is designed to mitigate the **Modifiable Areal Unit Problem (MAUP)**. Standard models assume that the risk within an area $i$ is constant (the 'ecological fallacy'). This model instead treats the observed count $y_{it}$ as an aggregation of an underlying continuous risk surface $\lambda(s, t)$.
+
+#### 1. The Latent Intensity Surface
+We define a latent intensity field $\lambda_{it}$ at the sub-grid or point level using a Gaussian Process approximated by Random Fourier Features (RFF):
+$$\log(\lambda(s, t)) = \alpha + \text{Field}_{RFF}(s, t) + \text{Space}_{BYM2}(i) + \text{Time}_{AR1}(t)$$
+
+#### 2. Aggregation Logic
+The expected count for area $i$ is the integral of the intensity over its geometry $A_i$:
+$$\mu_{it} = \int_{A_i} \lambda(s, t) ds \approx \sum_{p \in A_i} w_p \exp(\eta_p)$$
+where $w_p$ are weights representing the relative area or population density of sub-points $p$ within area $i$. By linking the discrete counts to this continuous approximation, the model becomes less sensitive to the specific boundaries of the partitioning scheme.
+
+```{julia}
+```
+
+
 ###  Advanced Topics: RFF, Deep GPs, and Scaling
 
 To handle non-stationary surfaces and large-scale seasonality, *bstm* uses a few approximations and scaling techniques.
