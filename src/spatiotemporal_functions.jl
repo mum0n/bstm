@@ -2785,23 +2785,36 @@ function plot_posterior_results(stats, modinputs=nothing, areal_units=nothing; p
                    ribbon=(t_stats.mean .- t_stats.lower, t_stats.upper .- t_stats.mean),
                    fillalpha=0.2, lw=2, title="Temporal Main Effect", xlabel="Time Index", ylabel="Effect (Latent Scale)", legend=false)
 
+    # 2a. Handle Seasonal Effects
+    elseif effect == :seasonal
+        t_stats = stats.seasonal
+        n_times = length(t_stats.mean)
+        return StatsPlots.plot(1:n_times, t_stats.mean,
+                   ribbon=(t_stats.mean .- t_stats.lower, t_stats.upper .- t_stats.mean),
+                   fillalpha=0.2, lw=2, title="Seasonal Effect", xlabel="Time Index", ylabel="Effect (Latent Scale)", legend=false)
+
+
     # 3. Handle Spatial, ST, and Deep GP Mean Fields
-    elseif effect in [:spatial, :st_mat_denoised, :st_mat_noisy, :residuals, :eta_gp, :hidden_layer]
+    elseif effect in [:spatial, :spatial_structured, :spatial_unstructured, :predictions_denoised, :predictions_noisy, :residuals, :eta_gp, :hidden_layer]
         plt = StatsPlots.plot(aspect_ratio=:equal, title="$effect (T=$(time_slice))", legend=true)
 
         # Determine the values to map to colors
         values = if effect == :spatial
             stats.spatial.mean
+        elseif effect == :spatial_structured
+            stats.spatial_structured.mean
+        elseif effect == :spatial_unstructured
+            stats.spatial_unstructured.mean
         elseif effect == :eta_gp
             haskey(stats, :eta_gp) ? stats.eta_gp.mean : error("eta_gp not found in stats")
         elseif effect == :hidden_layer
             haskey(stats, :h1) ? stats.h1.mean : error("hidden layer h1 not found in stats")
-        elseif effect == :st_mat_denoised && !isnothing(time_slice)
-            stats.st_mat_denoised.mean[:, time_slice]
-        elseif effect == :st_mat_noisy && !isnothing(time_slice)
-            stats.st_mat_noisy.mean[:, time_slice]
-        elseif effect == :residuals
-            stats.st_mat_noisy.mean[:, isnothing(time_slice) ? 1 : time_slice]
+        elseif effect == :predictions_denoised && !isnothing(time_slice)
+            stats.predictions_denoised.mean[:, time_slice]
+        elseif effect == :predictions_noisy && !isnothing(time_slice)
+            stats.predictions_noisy.mean[:, time_slice]
+        # elseif effect == :residuals
+        #    stats.predictions_noisy.mean[:, isnothing(time_slice) ? 1 : time_slice]
         else
             error("Effect $effect requires specific keys in stats or time_slice index")
         end
@@ -3488,22 +3501,24 @@ end
 
 
 function get_params_vector(chain, base_name, len)
-    # Helper to extract and format MCMC data for a vector parameter with correct index sorting
-    # Convert symbols to strings for regex matching
-    names_ch = string.(names(chain))
-    regex = Regex("^$base_name\\[(\\d+)\\]")
-    matched_names = filter(n -> occursin(regex, n), names_ch)
+    # Use the robust helper to get names from either standard MCMCChains or FlexiChains
+    names_ch = get_chain_names(chain)
     
+    # Use a case-insensitive or exact regex match for indexing
+    regex = Regex("^$base_name\\\\[(\\\\d+)\\\\]")
+    matched_names = filter(n -> occursin(regex, n), names_ch)
+
     if isempty(matched_names)
-        # Fallback for scalar/missing params
+        # Fallback for scalar/missing params: return zero matrix
         return zeros(size(chain, 1), len)
     end
-    
-    # Sort matched names by the integer index to ensure order
+
+    # Sort matched names by the integer index to ensure [1], [2], ... order
     sort!(matched_names, by = n -> parse(Int, match(regex, n).captures[1]))
+    
+    # Extract data using Symbol indexing (supported by both types)
     return hcat([vec(chain[Symbol(n)].data) for n in matched_names]...)
-end
- 
+end 
 
 
 
@@ -3654,51 +3669,102 @@ end
 
 
 # --- 1. ARCHITECTURE & FAMILY TRAITS ---
+
 abstract type ModelArchitecture end
-struct GMRFArchitecture   <: ModelArchitecture end
-struct RFFArchitecture    <: ModelArchitecture end
-struct DeepGPArchitecture <: ModelArchitecture end
-struct SPDEArchitecture <: ModelArchitecture end
+struct GMRFArchitecture     <: ModelArchitecture end
+struct RFFArchitecture      <: ModelArchitecture end
+struct DeepArchitecture     <: ModelArchitecture end
+struct LerouxArchitecture   <: ModelArchitecture end
+struct SARArchitecture      <: ModelArchitecture end
+struct SVCArchitecture      <: ModelArchitecture end
+struct MosaicArchitecture   <: ModelArchitecture end
+struct SPDEArchitecture     <: ModelArchitecture end
 struct SpectralArchitecture <: ModelArchitecture end
-struct DenseGPArchitecture <: ModelArchitecture end
-struct SVCArchitecture <: ModelArchitecture end
-struct UnknownArchitecture <: ModelArchitecture end
+struct DenseGPArchitecture  <: ModelArchitecture end
+struct UnknownArchitecture  <: ModelArchitecture end
 
 abstract type ModelFamily end
-struct PoissonFamily <: ModelFamily end
-struct GaussianFamily <: ModelFamily end
-struct BinomialFamily <: ModelFamily end
-struct LogNormalFamily <: ModelFamily end
+struct PoissonFamily          <: ModelFamily end
+struct GaussianFamily         <: ModelFamily end
+struct BinomialFamily         <: ModelFamily end
 struct NegativeBinomialFamily <: ModelFamily end
+struct LogNormalFamily        <: ModelFamily end
+struct HurdleFamily           <: ModelFamily end
+struct UnknownFamily          <: ModelFamily end
+
 
 # --- 2. TRAIT IDENTIFICATION ---
-function identify_traits(m::DynamicPPL.Model)
-    name = lowercase(string(m.f))
-    fam = if occursin("poisson", name) PoissonFamily()
-    elseif occursin("binomial", name) BinomialFamily()
-    elseif occursin("negbin", name) || occursin("negativebinomial", name) NegativeBinomialFamily()
-    elseif occursin("lognormal", name) LogNormalFamily()
-    else GaussianFamily() end
 
-    vi = DynamicPPL.VarInfo(m)
-    vns = string.(collect(keys(vi)))
-    arch = if any(occursin.(r"w1", vns)) DeepGPArchitecture()
-    elseif any(occursin.(r"w_trend", vns)) || any(occursin.(r"Z_trend", vns)) RFFArchitecture()
-    elseif any(occursin.(r"u_spectral", vns)) SpectralArchitecture()
-    elseif any(occursin.(r"kappa_sp", vns)) || any(occursin.(r"w_sp", vns)) SPDEArchitecture()
-    elseif any(occursin.(r"W_svc", vns)) SVCArchitecture()
-    elseif any(occursin.(r"f_latent", vns)) DenseGPArchitecture()
-    elseif any(occursin.(r"u_icar", vns)) || any(occursin.(r"phi_leroux", vns)) || any(occursin.(r"s_eff", vns)) GMRFArchitecture()
-    else UnknownArchitecture() end
+function identify_traits(model_name::String)
+    name = lowercase(model_name)
+    
+    # Identify Architecture
+    arch = if occursin("simple", name) || occursin("bym2", name) || occursin("d00", name) || occursin("d01", name)
+        GMRFArchitecture()
+    elseif occursin("leroux", name) || occursin("d02", name)
+        LerouxArchitecture()
+    elseif occursin("localised", name) || occursin("d03", name)
+        LerouxArchitecture() # centered Leroux variant
+    elseif occursin("sar", name) || occursin("d04", name)
+        SARArchitecture()
+    elseif occursin("svc", name) || occursin("d06", name)
+        SVCArchitecture()
+    elseif occursin("mosaic", name) || occursin("c08", name) || occursin("c09", name)
+        MosaicArchitecture()
+    elseif occursin("deep", name) || occursin("c02", name) || occursin("c03", name) || occursin("c04", name)
+        DeepArchitecture()
+    elseif occursin("rff", name) || occursin("adaptive", name) || occursin("d17", name)
+        RFFArchitecture()
+    elseif occursin("spde", name) || occursin("c06", name) || occursin("c17", name)
+        SPDEArchitecture()
+    elseif occursin("fft", name) || occursin("spectral", name) || occursin("d16", name)
+        SpectralArchitecture()
+    elseif occursin("dense", name) || occursin("c00", name) || occursin("c01", name)
+        DenseGPArchitecture()
+    else
+        UnknownArchitecture()
+    end
+
+    # Identify Family
+    fam = if occursin("poisson", name)
+        PoissonFamily()
+    elseif occursin("gaussian", name)
+        GaussianFamily()
+    elseif occursin("binomial", name)
+        BinomialFamily()
+    elseif occursin("negbin", name)
+        NegativeBinomialFamily()
+    elseif occursin("lognormal", name)
+        LogNormalFamily()
+    elseif occursin("hurdle", name)
+        HurdleFamily()
+    else
+        UnknownFamily()
+    end
 
     return arch, fam
 end
 
+
+function get_chain_names(chain)
+    try
+        # Primary method: using FlexiChains metadata if available
+        return string.(FlexiChains.parameters(chain))
+    catch
+        # Fallback: Standard MCMCChains names conversion
+        return string.(names(chain))
+    end
+end
+
 function get_model_parameters(m::DynamicPPL.Model)
-    # Directly extract names from a model instance sample
-    raw_keys = keys(rand(m))
-    return map(raw_keys) do k
-        replace(string(k), r"[\(\)\"\:]" => "") 
+    # Directly extract names from a model instance sample as a fallback discovery method
+    try
+        raw_keys = keys(rand(m))
+        return map(raw_keys) do k
+            replace(string(k), r"[\(\)\"\:]" => "")
+        end
+    catch
+        return String[]
     end
 end
 
@@ -3710,7 +3776,7 @@ end
 
 # --- 3. UNIFIED RECONSTRUCTION INTERFACE ---
 function reconstruct_posteriors(model::DynamicPPL.Model, chain, modinputs; alpha=0.05)
-    arch, fam = identify_traits(model)
+    arch, fam = identify_traits(string.(model.f))
     return _reconstruct(arch, fam, chain, modinputs, alpha)
 end
 
@@ -3749,53 +3815,71 @@ function _compute_waic(log_lik)
     return -2 * (lppd - p_waic)
 end
 
-# Helper for common covariate extraction
 function _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
-    beta_cov_eff = []
-    for k in 1:size(modinputs.cov_indices, 2)
-        if any(occursin.("beta_cov[$k]", all_names))
-            raw = get_params_vector(chain, "beta_cov[$k]", modinputs.N_cat)
-            push!(beta_cov_eff, summarize_array(reshape(raw', modinputs.N_cat, 1, N_samples); alpha=alpha))
+    # Identify all categorical covariate groups present in the chain
+    # Matches patterns like "beta_cov[1]", "beta_cov[2]", etc.
+    cov_matches = unique(map(m -> m.captures[1], filter(!isnothing, match.(r"beta_cov\[(\d+)\]", all_names))))
+    
+    if isempty(cov_matches)
+        return nothing
+    end
+
+    # Parse indices and sort to ensure sequential processing
+    cov_indices = sort(parse.(Int, cov_matches))
+    
+    results = []
+    for k in cov_indices
+        base_name = "beta_cov[$k]"
+        # Use the robust get_params_vector helper to extract the full vector for this covariate group
+        raw_vals = get_params_vector(chain, base_name, modinputs.N_cat)
+        
+        if !all(raw_vals .== 0) # Only process if data was actually found
+            # Reshape for summarize_array (N_categories x 1 x N_samples)
+            summ = summarize_array(reshape(raw_vals', modinputs.N_cat, 1, N_samples); alpha=alpha)
+            push!(results, summ)
         end
     end
-    return beta_cov_eff
+
+    return isempty(results) ? nothing : results
 end
 
-# --- ARCHITECTURE RECONSTRUCTIONS ---
 
+# --- ARCHITECTURE RECONSTRUCTIONS ---
 function _reconstruct(arch::GMRFArchitecture, fam::ModelFamily, chain, modinputs, alpha)
     N_obs, N_areas, N_time = length(modinputs.y), size(modinputs.Q_sp, 1), Int(maximum(modinputs.time_idx))
     N_samples = size(chain, 1)
-    all_names = get_chain_names(chain)
+    all_names = FlexiChains.parameters(chain)
+    name_strs = string.(all_names)
 
     sp_struct = zeros(N_areas, N_samples)
     sp_unstruct = zeros(N_areas, N_samples)
-    if any(occursin.(r"u_icar", all_names))
-        sig_sp = "sigma_sp" ∈ all_names ? vec(chain[:sigma_sp].data) : ones(N_samples)
-        phi_sp = "phi_sp" ∈ all_names ? vec(chain[:phi_sp].data) : fill(0.5, N_samples)
-        u_icar = get_params_vector(chain, "u_icar", N_areas)
-        u_iid = get_params_vector(chain, "u_iid", N_areas)
+    temporal = zeros(N_time, N_samples)
+    seasonal = zeros(N_time, N_samples)
+    eta = zeros(N_obs, N_samples)
+
+    if any(occursin.("u_icar", name_strs))
+        sig_sp = "sigma_sp" in name_strs ? vec(chain[:sigma_sp].data) : ones(N_samples)
+        phi_sp = "phi_sp" in name_strs ? vec(chain[:phi_sp].data) : fill(0.5, N_samples)
+        u_icar_data = chain[:u_icar].data
+        u_iid_data = chain[:u_iid].data
         for s in 1:N_samples
-            sp_struct[:, s] = sig_sp[s] .* sqrt(phi_sp[s]) .* u_icar[s, :]
-            sp_unstruct[:, s] = sig_sp[s] .* sqrt(1 - phi_sp[s]) .* u_iid[s, :]
+            sp_struct[:, s] = sig_sp[s] .* sqrt.(phi_sp[s]) .* vec(u_icar_data[s])
+            sp_unstruct[:, s] = sig_sp[s] .* sqrt.(1 - phi_sp[s]) .* vec(u_iid_data[s])
         end
     end
 
-    temporal = zeros(N_time, N_samples)
-    if any(occursin.(r"f_tm_raw", all_names))
-        sig_tm = "sigma_tm" ∈ all_names ? vec(chain[:sigma_tm].data) : ones(N_samples)
-        f_tm = get_params_vector(chain, "f_tm_raw", N_time)
-        for s in 1:N_samples; temporal[:, s] = f_tm[s, :] .* sig_tm[s]; end
+    if any(occursin.("f_tm_raw", name_strs))
+        sig_tm = "sigma_tm" in name_strs ? vec(chain[:sigma_tm].data) : ones(N_samples)
+        f_tm_data = chain[:f_tm_raw].data
+        for s in 1:N_samples; temporal[:, s] = vec(f_tm_data[s]) .* sig_tm[s]; end
     end
 
-    beta_cov_eff = _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
+    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
 
-    eta = zeros(N_obs, N_samples)
-    for s in 1:N_samples, i in 1:N_obs
-        a, t = modinputs.area_idx[i], modinputs.time_idx[i]
-        eta[i, s] = modinputs.log_offset[i] + sp_struct[a, s] + sp_unstruct[a, s] + temporal[t, s]
-        for (k, summ) in enumerate(beta_cov_eff)
-            eta[i, s] += summ.mean[modinputs.cov_indices[i, k]]
+    for s in 1:N_samples
+        for i in 1:N_obs
+            a, t = modinputs.area_idx[i], modinputs.time_idx[i]
+            eta[i, s] = modinputs.log_offset[i] + sp_struct[a, s] + sp_unstruct[a, s] + temporal[t, s]
         end
     end
 
@@ -3804,249 +3888,372 @@ function _reconstruct(arch::GMRFArchitecture, fam::ModelFamily, chain, modinputs
     return (
         spatial_structured = summarize_array(reshape(sp_struct, N_areas, 1, N_samples); alpha=alpha),
         spatial_unstructured = summarize_array(reshape(sp_unstruct, N_areas, 1, N_samples); alpha=alpha),
+        spatial = summarize_array(reshape(sp_struct .+ sp_unstruct, N_areas, 1, N_samples); alpha=alpha),
         temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
+        seasonal = summarize_array(reshape(seasonal, N_time, 1, N_samples); alpha=alpha),
         beta_cov = beta_cov_eff,
         predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
         predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
         waic = _compute_waic(log_lik),
-        summarystats=summarystats(chain), 
-        family = fam,
-        architecture = arch
+        family = fam, architecture = arch
     )
 end
+
 
 function _reconstruct(arch::RFFArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_time = length(modinputs.y), Int(maximum(modinputs.time_idx))
+    N_obs, N_areas = length(modinputs.y), size(modinputs.W, 1)
     N_samples = size(chain, 1)
-    all_names = get_chain_names(chain)
+    all_names = FlexiChains.parameters(chain)
+    name_strs = string.(all_names)
 
-    w_tr = get_params_vector(chain, "w_trend", size(modinputs.Z_trend, 2))
-    sig_tr = "sigma_trend" ∈ all_names ? vec(chain[:sigma_trend].data) : ones(N_samples)
-    temporal = zeros(N_time, N_samples)
-    for s in 1:N_samples; temporal[:, s] = modinputs.Z_trend * (w_tr[s, :] .* sig_tr[s]); end
-
-    seasonal = zeros(N_time, N_samples)
-    if "sigma_seas" ∈ all_names
-        w_se = get_params_vector(chain, "w_seas", size(modinputs.Z_seas, 2))
-        sig_se = vec(chain[:sigma_seas].data)
-        for s in 1:N_samples; seasonal[:, s] = modinputs.Z_seas * (w_se[s, :] .* sig_se[s]); end
-    end
-
-    beta_cov_eff = _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
-    eta = zeros(N_obs, N_samples)
-    for s in 1:N_samples, i in 1:N_obs
-        t = modinputs.time_idx[i]
-        eta[i, s] = modinputs.log_offset[i] + temporal[t, s] + seasonal[t, s]
-        for (k, summ) in enumerate(beta_cov_eff)
-            eta[i, s] += summ.mean[modinputs.cov_indices[i, k]]
-        end
-    end
-
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
-
-    return (
-        temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
-        seasonal = "sigma_seas" ∈ all_names ? summarize_array(reshape(seasonal, N_time, 1, N_samples); alpha=alpha) : nothing,
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        summarystats=summarystats(chain), 
-        family = fam,
-        architecture = arch
-    )
-end
-
-function _reconstruct(arch::DeepGPArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_samples = length(modinputs.y), size(chain, 1)
-    all_names = get_chain_names(chain)
-    
-    eta_gp = get_params_vector(chain, "eta_gp", N_obs)
-    beta_cov_eff = _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
-    
-    eta = zeros(N_obs, N_samples)
-    for s in 1:N_samples, i in 1:N_obs
-        eta[i, s] = modinputs.log_offset[i] + eta_gp[s, i]
-        for (k, summ) in enumerate(beta_cov_eff)
-            eta[i, s] += summ.mean[modinputs.cov_indices[i, k]]
-        end
-    end
-
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
-    
-    return (
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        summarystats=summarystats(chain), 
-        family = fam,
-        architecture = arch
-    )
-end
-
-function _reconstruct(arch::SPDEArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_samples = length(modinputs.y), size(chain, 1)
-    all_names = get_chain_names(chain)
-    N_areas = size(modinputs.Q_sp, 1)
-    
-    w_sp = get_params_vector(chain, "w_sp", N_areas)
-    sig_sp = "sigma_sp" ∈ all_names ? vec(chain[:sigma_sp].data) : ones(N_samples)
-    beta_cov_eff = _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
-    
-    eta = zeros(N_obs, N_samples)
-    for s in 1:N_samples, i in 1:N_obs
-        eta[i, s] = modinputs.log_offset[i] + w_sp[s, modinputs.area_idx[i]] * sig_sp[s]
-        for (k, summ) in enumerate(beta_cov_eff)
-            eta[i, s] += summ.mean[modinputs.cov_indices[i, k]]
-        end
-    end
-
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
-    
-    return (
-        spatial_structured = summarize_array(reshape((w_sp .* sig_sp)', N_areas, 1, N_samples); alpha=alpha),
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        summarystats=summarystats(chain), 
-        family = fam,
-        architecture = arch
-    )
-end
-
-
-function _reconstruct(arch::DenseGPArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_samples = length(modinputs.y), size(chain, 1)
-    all_names = get_chain_names(chain)
-    
-    f_latent = get_params_vector(chain, "f_latent", N_obs)
-    beta_cov_eff = _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
-    
-    eta = zeros(N_obs, N_samples)
-    for s in 1:N_samples, i in 1:N_obs
-        eta[i, s] = modinputs.log_offset[i] + f_latent[s, i]
-        for (k, summ) in enumerate(beta_cov_eff)
-            eta[i, s] += summ.mean[modinputs.cov_indices[i, k]]
-        end
-    end
-
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
-    
-    return (
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        summarystats=summarystats(chain), 
-        family = fam,
-        architecture = arch
-    )
-end
-
-
-
-
-function _reconstruct(arch::SpectralArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_samples = length(modinputs.y), size(chain, 1)
-    all_names = get_chain_names(chain)
-    # Recover spectral spatial component
-    u_spec = get_params_vector(chain, "u_spectral_raw", modinputs.grid_res^2)
-    # Simplified: Mapping first N_areas for visualization
+    # Containers
+    spatial = zeros(N_areas, N_samples)
     temporal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
+    seasonal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
     eta = zeros(N_obs, N_samples)
-    for s in 1:N_samples, i in 1:N_obs
-        eta[i, s] = modinputs.log_offset[i] + u_spec[s, modinputs.area_idx[i]]
+
+    # 1. RFF Spatial Component
+    if any(occursin.("beta_rff", name_strs))
+        # RFF logic would ideally project from frequencies
+        # For summary, we check if s_eff or similar is pre-calculated or needs mapping
     end
+
+    # 2. BYM2 if present in hybrid models
+    if any(occursin.("u_icar", name_strs))
+        sig_sp = "sigma_sp" in name_strs ? vec(chain[:sigma_sp].data) : ones(N_samples)
+        phi_sp = "phi_sp" in name_strs ? vec(chain[:phi_sp].data) : fill(0.5, N_samples)
+        u_icar_data = chain[:u_icar].data
+        u_iid_data = chain[:u_iid].data
+
+        for s in 1:N_samples
+            u_icar_vec = vec(u_icar_data[s])
+            u_iid_vec = vec(u_iid_data[s])
+            spatial[:, s] = sig_sp[s] .* (sqrt(phi_sp[s]) .* u_icar_vec .+ sqrt(1 - phi_sp[s]) .* u_iid_vec)
+        end
+    end
+
+    # 3. Categorical Covariates
+    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
+
+    # 4. Predictor Assembly
+    for s in 1:N_samples
+        for i in 1:N_obs
+            a = modinputs.area_idx[i]
+            eta[i, s] = modinputs.log_offset[i] + spatial[a, s]
+        end
+    end
+
     denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
-    
+
     return (
+        spatial_structured = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
+        spatial_unstructured = nothing,
+        spatial = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
+        temporal = summarize_array(reshape(temporal, size(temporal, 1), 1, N_samples); alpha=alpha),
+        seasonal = summarize_array(reshape(seasonal, size(seasonal, 1), 1, N_samples); alpha=alpha),
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik),
+        family = fam,
+        architecture = arch
+    )
+end
+
+function _reconstruct(arch::DeepArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs = length(modinputs.y)
+    N_samples = size(chain, 1)
+    all_names = FlexiChains.parameters(chain)
+    name_strs = string.(all_names)
+
+    eta = zeros(N_obs, N_samples)
+
+    for s in 1:N_samples
+        eta[:, s] .= modinputs.log_offset
+    end
+
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+
+    return (
+        spatial_structured = nothing,
+        spatial_unstructured = nothing,
+        spatial = nothing,
+        temporal = nothing,
+        seasonal = nothing,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik),
+        family = fam,
+        architecture = arch
+    )
+end
+
+
+
+function _reconstruct(arch::LerouxArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_areas, N_time = length(modinputs.y), size(modinputs.Q_sp, 1), Int(maximum(modinputs.time_idx))
+    N_samples = size(chain, 1)
+    name_strs = string.(FlexiChains.parameters(chain))
+
+    spatial = zeros(N_areas, N_samples)
+    temporal = zeros(N_time, N_samples)
+    eta = zeros(N_obs, N_samples)
+
+    if "phi_leroux" in name_strs
+        phi_data = chain[:phi_leroux].data
+        for s in 1:N_samples; spatial[:, s] = vec(phi_data[s]); end
+    end
+
+    if "f_tm_raw" in name_strs
+        sig_tm = "sigma_tm" in name_strs ? vec(chain[:sigma_tm].data) : ones(N_samples)
+        f_tm_data = chain[:f_tm_raw].data
+        for s in 1:N_samples; temporal[:, s] = vec(f_tm_data[s]) .* sig_tm[s]; end
+    end
+
+    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
+
+    for s in 1:N_samples
+        for i in 1:N_obs
+            a, t = modinputs.area_idx[i], modinputs.time_idx[i]
+            eta[i, s] = modinputs.log_offset[i] + spatial[a, s] + temporal[t, s]
+        end
+    end
+
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+
+    return (
+        spatial_structured = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
+        spatial_unstructured = nothing, 
+        spatial = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
+        temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
+        seasonal = nothing, 
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik), 
+        family = fam, architecture = arch
+    )
+end
+
+
+function _reconstruct(arch::SARArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_areas = length(modinputs.y), size(modinputs.Q_sp, 1)
+    N_samples = size(chain, 1)
+    all_names = FlexiChains.parameters(chain)
+    name_strs = string.(all_names)
+
+    spatial = zeros(N_areas, N_samples)
+    temporal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
+    seasonal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
+    eta = zeros(N_obs, N_samples)
+
+    if any(occursin.("s_eff", name_strs))
+        s_eff_data = chain[:s_eff].data
+        for s in 1:N_samples; spatial[:, s] = vec(s_eff_data[s]); end
+    end
+
+    if any(occursin.("f_tm_raw", name_strs))
+        sig_tm = "sigma_tm" in name_strs ? vec(chain[:sigma_tm].data) : ones(N_samples)
+        f_tm_data = chain[:f_tm_raw].data
+        for s in 1:N_samples; temporal[:, s] = vec(f_tm_data[s]) .* sig_tm[s]; end
+    end
+
+    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
+
+    for s in 1:N_samples
+        for i in 1:N_obs
+            a, t = modinputs.area_idx[i], modinputs.time_idx[i]
+            eta[i, s] = modinputs.log_offset[i] + spatial[a, s] + temporal[t, s]
+        end
+    end
+
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+
+    return (
+        spatial_structured = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
+        spatial_unstructured = nothing,
+        spatial = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
+        temporal = summarize_array(reshape(temporal, size(temporal, 1), 1, N_samples); alpha=alpha),
+        seasonal = summarize_array(reshape(seasonal, size(seasonal, 1), 1, N_samples); alpha=alpha),
         beta_cov = beta_cov_eff,
         predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
         predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
         waic = _compute_waic(log_lik),
-        summarystats=summarystats(chain), 
         family = fam,
         architecture = arch
     )
 end
 
 function _reconstruct(arch::SVCArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_samples = length(modinputs.y), size(chain, 1)
-    all_names = get_chain_names(chain)
-    N_areas = size(modinputs.Q_sp, 1)
-    N_svc = size(modinputs.u_obs, 2)
+    N_obs, N_areas = length(modinputs.y), size(modinputs.Q_sp, 1)
+    N_samples = size(chain, 1)
+    name_strs = string.(FlexiChains.parameters(chain))
     
-    # Recover svc matrix [area, covar]
-    svc_raw = get_params_vector(chain, "W_svc_raw", N_areas * N_svc)
+    spatial = zeros(N_areas, N_samples)
     eta = zeros(N_obs, N_samples)
-    for s in 1:N_samples, i in 1:N_obs
-        a = modinputs.area_idx[i]
-        eta[i, s] = modinputs.log_offset[i]
-        for k in 1:N_svc
-            # Map linearized svc_raw to area/covar index
-            eta[i, s] += modinputs.u_obs[i, k] * svc_raw[s, (k-1)*N_areas + a]
-        end
+
+    if "s_eff" in name_strs
+        s_data = chain[:s_eff].data
+        for s in 1:N_samples; spatial[:, s] = vec(s_data[s]); end
     end
+
+    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
+    for s in 1:N_samples
+        eta[:, s] .= modinputs.log_offset .+ spatial[modinputs.area_idx, s]
+    end
+
     denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+
+    return (
+        spatial_structured = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
+        spatial_unstructured = nothing,
+        spatial = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
+        temporal = nothing,
+        seasonal = nothing,
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik), 
+        family = fam, architecture = arch
+    )
+end
+
+
+function _reconstruct(arch::MosaicArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_areas = length(modinputs.y), size(modinputs.W, 1)
+    N_samples = size(chain, 1)
+    all_names = FlexiChains.parameters(chain)
+    name_strs = string.(all_names)
+    eta = zeros(N_obs, N_samples)
+
+    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
+
+    for s in 1:N_samples; eta[:, s] .= modinputs.log_offset; end
+
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+
     return (
         beta_cov = beta_cov_eff,
         predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
         predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
         waic = _compute_waic(log_lik),
-        summarystats=summarystats(chain), 
         family = fam,
         architecture = arch
     )
 end
 
 
-# --- 8. UNIFIED VISUALIZATION SUITE ---
-function model_results_comprehensive(model, chain, modinputs, au; alpha=0.05, time_slice=1)
-    res = reconstruct_posteriors(model, chain, modinputs; alpha=alpha)
+function _reconstruct(arch::Union{SPDEArchitecture, SpectralArchitecture, DenseGPArchitecture}, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_samples = length(modinputs.y), size(chain, 1)
+    name_strs = string.(FlexiChains.parameters(chain))
+    eta = zeros(N_obs, N_samples)
+    temporal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
+
+    target = "f_latent" in name_strs ? :f_latent : "f_gp" in name_strs ? :f_gp : "s_eff" in name_strs ? :s_eff : nothing
+    
+    if !isnothing(target)
+        data = chain[target].data
+        for s in 1:N_samples; eta[:, s] = modinputs.log_offset .+ vec(data[s]); end
+    else
+        for s in 1:N_samples; eta[:, s] .= modinputs.log_offset; end
+    end
+
+    if "f_tm_raw" in name_strs
+        sig_tm = "sigma_tm" in name_strs ? vec(chain[:sigma_tm].data) : ones(N_samples)
+        f_tm_data = chain[:f_tm_raw].data
+        for s in 1:N_samples; temporal[:, s] = vec(f_tm_data[s]) .* sig_tm[s]; end
+    end
+
+    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+
+    return (
+        spatial_structured = nothing,
+        spatial_unstructured = nothing,
+        spatial = nothing, 
+        temporal = summarize_array(reshape(temporal, size(temporal,1), 1, N_samples); alpha=alpha),
+        seasonal = nothing,
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik), 
+        family = fam, architecture = arch
+    )
+end
+
+
+
+function model_results_comprehensive(model, chain, modinputs, areal_units; alpha=0.05, time_slice=1)
+    pstats = reconstruct_posteriors(model, chain, modinputs; alpha=alpha)
     y_obs = Float64.(modinputs.y)
-    y_pred = vec(res.predictions_denoised.mean)
+    y_pred = vec(pstats.predictions_denoised.mean)
 
     # Metrics
     rmse = sqrt(mean((y_obs .- y_pred).^2))
     r2 = length(unique(y_pred)) > 1 ? cor(y_obs, y_pred)^2 : 0.0
-    waic_val = res.waic
-    mean_ess = mean( x for x in res.summarystats.ess_per_sec if !isnan(x)  )
-    mean_rhat = mean( x for x in res.summarystats.rhat if !isnan(x)   )
+    waic_val = pstats.waic
+
+    ss = summarystats(chain) 
+    mean_ess_bulk = mean( x for x in Array(ss[:,stat=At(:ess_bulk)] ) if !isnan(x)  )
+    mean_ess_tail = mean( x for x in Array(ss[:,stat=At(:ess_tail)] ) if !isnan(x)  )
+    mean_rhat = mean( x for x in Array(ss[:,stat=At(:rhat)] ) if !isnan(x)   )
+
+    metrics = (rmse=rmse, r2=r2, waic=waic_val, 
+        mean_ess_bulk=mean_ess_bulk, mean_ess_tail=mean_ess_tail, mean_rhat=mean_rhat)
+    display(metrics)
+
+    # Plots
+    plt_ppc = scatter(y_pred, y_obs, alpha=0.4, label="Obs vs Pred", title="PPC (RMSE: $(round(rmse, digits=3)), WAIC: $(round(waic_val, digits=1)))", xlabel="Pred", ylabel="Obs")
+    plot!(plt_ppc, [minimum(y_obs), maximum(y_obs)], [minimum(y_obs), maximum(y_obs)], ls=:dash, lc=:red, label="Identity")
+
+    plt_tm = nothing
+    if haskey(pstats, :temporal) && !isnothing(pstats.temporal)
+        plt_tm = plot(pstats.temporal.mean, 
+            ribbon=(pstats.temporal.mean .- pstats.temporal.lower, pstats.temporal.upper .- pstats.temporal.mean), 
+            title="Temporal Trend", xlabel="Time", ylabel="Effect", legend=false, fillalpha=0.3)
+    end
+
+    plt_seas = nothing
+    if haskey(pstats, :seasonal) && !isnothing(pstats.seasonal)
+        plt_seas = plot(pstats.seasonal.mean, 
+            ribbon=(pstats.seasonal.mean .- pstats.seasonal.lower, pstats.seasonal.upper .- pstats.seasonal.mean), 
+            title="Seasonal Trend", xlabel="Time", ylabel="Effect", legend=false, fillalpha=0.3)
+    end
  
-    # Dynamic Plot Generation
-    plots = []
-    p_ppc = scatter(y_pred, y_obs, alpha=0.4, label="Obs vs Pred", title="PPC (RMSE: $(round(rmse, digits=3)), WAIC: $(round(waic_val, digits=1)))", xlabel="Pred", ylabel="Obs")
-    plot!(p_ppc, [minimum(y_obs), maximum(y_obs)], [minimum(y_obs), maximum(y_obs)], ls=:dash, lc=:red, label="Identity")
-    push!(plots, p_ppc)
+    plt_sp = plot_posterior_results(pstats, modinputs, areal_units; effect=:spatial)
+    title!(plt_sp, "Main Spatial Effect")
 
-    if haskey(res, :temporal)
-        p_tm = plot(res.temporal.mean, ribbon=(res.temporal.mean .- res.temporal.lower, res.temporal.upper .- res.temporal.mean), title="Temporal Trend", xlabel="Time", ylabel="Effect", legend=false, fillalpha=0.3)
-        push!(plots, p_tm)
+    plt_sp_struct = nothing
+    if haskey(pstats, :spatial_structured) && !isnothing(pstats.spatial_structured)
+        plt_sp_struct = plot_posterior_results(pstats, modinputs, areal_units; effect=:spatial_structured )
+        title!(plt_sp_struct, "Structured Spatial Effect")
     end
 
-    p_denoised = StatsPlots.plot(aspect_ratio=:equal, title="Denoised Map (T=$time_slice)", legend=false)
-    indices = findall(x -> x == time_slice, modinputs.time_idx)
-    if !isempty(indices)
-        vals_t = res.predictions_denoised.mean[indices]
-        for i in 1:min(length(au.polygons), length(vals_t))
-            poly = au.polygons[i]
-            if length(poly) > 2
-                px = [pt[1] for pt in poly]; py = [pt[2] for pt in poly]
-                plot!(p_denoised, px, py, seriestype=:shape, fill_z=vals_t[i], c=:viridis, linecolor=:black, lw=0.5)
-            end
-        end
+    plt_sp_unstruct = nothing
+    if haskey(pstats, :spatial_unstructured) && !isnothing(pstats.spatial_unstructured)
+        plt_sp_unstruct = plot_posterior_results(pstats, modinputs, areal_units; effect=:spatial_unstructured )
+        title!(plt_sp_unstruct, "Unstructured Spatial Effect")
     end
-    push!(plots, p_denoised)
 
-    n_rows = ceil(Int, length(plots)/2)
-    display(plot(plots..., layout=(n_rows, 2), size=(1000, 350*n_rows)))
+
+    plt_st_denoised = plot_posterior_results(pstats, modinputs, areal_units; effect=:predictions_denoised, time_slice=time_slice)
+    title!(plt_st_denoised, "Denoised Predictions (T=$time_slice)")
+
+    plt_st_noisy = plot_posterior_results(pstats, modinputs, areal_units; effect=:predictions_noisy, time_slice=time_slice)
+    title!(plt_st_noisy, "Noisy Predictions (T=$time_slice)")
+
+    # Combine only non-nothing plots
+    plot_list = filter(!isnothing, [plt_ppc, plt_tm, plt_seas, plt_sp, plt_st_denoised])
+    
+    n_plots = length(plot_list)
+    n_rows = ceil(Int, n_plots / 2)
+    display(plot(plot_list..., layout=(n_rows, min(n_plots, 2)), size=(1000, 350*n_rows)))
+
     return (
-        metrics=(rmse=rmse, r2=r2, waic=waic_val, mean_ess=mean_ess, mean_rhat=mean_rhat), 
-        results=res, 
-        plots=plots
+        metrics=metrics, 
+        pstats=pstats,
+        summarystats=ss, 
+        plots=(ppc=plt_ppc, tm=plt_tm, seas=plt_seas, spatial=plt_sp, spatial_structured=plt_sp_struct, spatial_unstructured=plt_sp_unstruct,
+            denoised=plt_st_denoised, noisy=plt_st_noisy)
     )
 end
 
- 
+

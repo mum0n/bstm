@@ -88,14 +88,14 @@ end
 
 include( joinpath( project_directory, "scripts", "startup.jl" ) ) # might need to run this a few times if there are stragglers   
 
-# Pkg.instantiate()  # to force a reset
+# Pkg.instantiate()  # to force a reset if some package seems corrupted/partially installed
 
-# Pkg.update()  # to update  (this can break dependencies .. only if you really need to )
-
-# if there continue to be issues: some more lower level package management may be required ... 
-
+# Pkg.update()  # to update this can break dependencies .. do this only if you really need to 
  
 ```
+
+If there continue to be issues with packages breaking, some more lower level package management may be required or a restart of Julia ... ;)
+
 
 ### Simulated base data
 
@@ -105,7 +105,7 @@ With all required libraries and functions available, we can create some test dat
 ```{julia}
  
 n_pts = 100  # spatial locations
-n_time = 30  # time slices ("years")
+n_time = 15  # time slices ("years")
  
 data = generate_sim_data(n_pts, n_time; rndseed=42);
 
@@ -333,7 +333,7 @@ data_scot = scottish_lip_cancer_data_spacetime(); # additional noise and "fake" 
 # introspection of data:
 keys(data_scot)
 pairs(data_scot)
-Dict(k => size(v) for (k, v) in pairs(data_scot) if k != :au )  # skip "au" 
+Dict(k => size(v) for (k, v) in pairs(data_scot) if k != :au )  # skip "au" as it is a tuple
 
 au_scot = data_scot.au ; 
 plot_spatial_graph( au_scot; title="Lip Cancer Inferred Locations", domain_boundary=au_scot.hull_coords)
@@ -364,19 +364,19 @@ modinputs = prepare_model_inputs(
 )
 
 # create model instance
-m = model_D00_poisson_simple(modinputs) # Turing model object
+m = model_D00_poisson_simple(modinputs); # Turing model object
 
 # sample with Metropolis-Hastings: 
-chn = sample(m, MH(), 5000; num_warmup=10000, thin=50, progress=true, drop_warmup=true )  
+chn = sample(m, MH(), 5000; num_warmup=10000, thin=50, progress=true, drop_warmup=true ) ;
 
 # extract results see a few figures
 res = model_results_comprehensive(m, chn, modinputs, au_scot);
  
-display(res.plots.p_ppc)
-display(res.plots.p_tm)
-display(res.plots.p_seas)
-display(res.plots.p_denoised)
-display(res.plots.p_noisy) 
+display(res.plots.ppc)
+display(res.plots.tm)
+display(res.plots.seas)
+display(res.plots.denoised)
+display(res.plots.noisy) 
 
 
 ```
@@ -684,18 +684,17 @@ Computation:
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
  
-m = model_D00_poisson_simple(modinputs_count)
-os = get_optimal_sampler("model_D00_poisson_simple"; nuts_adapt=1000) 
-chn = sample(m, os, 2000, nchains=4)
+m = model_D00_poisson_simple(modinputs_count);
+os = get_optimal_sampler("model_D00_poisson_simple"; nuts_adapt=1000);
+chn = sample(m, os, 2000, nchains=4);
 res = model_results_comprehensive(m, chn, modinputs_count, au);
 
 showall(res.summarystats)
 
-display(res.plots.p_ppc)
-display(res.plots.p_tm)
-display(res.plots.p_seas)
-display(res.plots.p_denoised)
-display(res.plots.p_noisy) 
+display(res.plots.ppc)
+display(res.plots.tm)
+display(res.plots.denoised)
+display(res.plots.noisy) 
 
 ```
 
@@ -741,11 +740,11 @@ res = model_results_comprehensive(m, chn, modinputs_count, au);
 
 showall(res.summarystats)
 
-display(res.plots.p_ppc)
-display(res.plots.p_tm)
-display(res.plots.p_seas)
-display(res.plots.p_denoised)
-display(res.plots.p_noisy) 
+display(res.plots.ppc)
+display(res.plots.tm)
+display(res.plots.seas)
+display(res.plots.denoised)
+display(res.plots.noisy) 
 
 ```
 
@@ -797,11 +796,11 @@ res = model_results_comprehensive(m, chn, modinputs_count, au);
 
 showall(res.summarystats)
 
-display(res.plots.p_ppc)
-display(res.plots.p_tm)
-display(res.plots.p_seas)
-display(res.plots.p_denoised)
-display(res.plots.p_noisy) 
+display(res.plots.ppc)
+display(res.plots.tm)
+display(res.plots.seas)
+display(res.plots.denoised)
+display(res.plots.noisy) 
 
 ```
 
@@ -846,11 +845,11 @@ res = model_results_comprehensive(m, chn, modinputs_count, au);
 
 showall(res.summarystats)
 
-display(res.plots.p_ppc)
-display(res.plots.p_tm)
-display(res.plots.p_seas)
-display(res.plots.p_denoised)
-display(res.plots.p_noisy) 
+display(res.plots.ppc)
+display(res.plots.tm)
+display(res.plots.seas)
+display(res.plots.denoised)
+display(res.plots.noisy) 
 
 ```
 
@@ -893,11 +892,11 @@ res = model_results_comprehensive(m, chn, modinputs_count, au);
 
 showall(res.summarystats)
 
-display(res.plots.p_ppc)
-display(res.plots.p_tm)
-display(res.plots.p_seas)
-display(res.plots.p_denoised)
-display(res.plots.p_noisy) 
+display(res.plots.ppc)
+display(res.plots.tm)
+display(res.plots.seas)
+display(res.plots.denoised)
+display(res.plots.noisy) 
 
 ```
 
@@ -946,7 +945,7 @@ res = model_results_comprehensive(m, chn, modinputs_count, au);
 
 showall(res.summarystats)
 
-display(res.plots.p_ppc) 
+display(res.plots.ppc) 
 display(res.plots.temporal)
 display(res.plots.spatial)
 display(res.plots.st_denoised)
@@ -992,7 +991,7 @@ res = model_results_comprehensive(m, chn, modinputs_count, au);
 
 showall(res.summarystats)
 
-display(res.plots.p_ppc) 
+display(res.plots.ppc) 
 display(res.plots.temporal)
 display(res.plots.spatial)
 display(res.plots.st_denoised)
@@ -1038,11 +1037,11 @@ res = model_results_comprehensive(m, chn, modinputs_count, au);
 
 showall(res.summarystats)
 
-display(res.plots.p_ppc)
-display(res.plots.p_tm)
-display(res.plots.p_seas)
-display(res.plots.p_denoised)
-display(res.plots.p_noisy) 
+display(res.plots.ppc)
+display(res.plots.tm)
+display(res.plots.seas)
+display(res.plots.denoised)
+display(res.plots.noisy) 
 
 ```
 
@@ -1084,11 +1083,11 @@ res = model_results_comprehensive(m, chn, modinputs_count, au);
 
 showall(res.summarystats)
 
-display(res.plots.p_ppc)
-display(res.plots.p_tm)
-display(res.plots.p_seas)
-display(res.plots.p_denoised)
-display(res.plots.p_noisy) 
+display(res.plots.ppc)
+display(res.plots.tm)
+display(res.plots.seas)
+display(res.plots.denoised)
+display(res.plots.noisy) 
 
 ```
 
@@ -1130,11 +1129,11 @@ res = model_results_comprehensive(m, chn, modinputs_count, au);
 
 showall(res.summarystats)
 
-display(res.plots.p_ppc)
-display(res.plots.p_tm)
-display(res.plots.p_seas)
-display(res.plots.p_denoised)
-display(res.plots.p_noisy) 
+display(res.plots.ppc)
+display(res.plots.tm)
+display(res.plots.seas)
+display(res.plots.denoised)
+display(res.plots.noisy) 
 
 ```
 
