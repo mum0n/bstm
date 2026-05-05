@@ -1,141 +1,207 @@
- 
+@model function model_D00_poisson_simple(M, ::Type{T}=Float64) where {T}
+    """
+    Model D00: Standard Poisson Spatiotemporal Baseline.
 
-@model function model_D00_poisson_simple(M, ::Type{T}=Float64 ) where {T}
-    # Simplest possible model .. for demonstration (no covars, no spacetime, no M.weights nor zeroinflation)
-     
-    # --- 1. Priors ---
-    sigma_sp ~ Exponential(1.0);
-    sigma_tm ~ Exponential(1.0); 
-    sigma_int ~ Exponential(0.5); 
-    sigma_rw2 ~ filldist(Exponential(1.0), 4)
-    
-    phi_sp ~ Beta(1, 1)
-    rho_tm ~ Beta(2, 2)
-     
-    # --- 2. Spatial Effect (BYM2) ---
-    u_icar ~ MvNormal(zeros(M.N_areas), I); 
+    Hierarchical Components:
+    1. Spatial (BYM2): Combines structured ICAR and unstructured IID random effects.
+    2. Temporal (AR1): Captures serial correlation via a first-order autoregressive process.
+    3. Likelihood: Poisson count model with a log-link and area-specific offsets.
+    """
+
+    # --- 1. GLOBAL HYPERPRIORS ---
+    sigma_sp ~ Exponential(1.0) # Spatial scale (marginal SD)
+    phi_sp ~ Beta(1, 1)        # BYM2 mixing: 1=Structured, 0=Unstructured
+    sigma_tm ~ Exponential(1.0) # Temporal scale (marginal SD)
+    rho_tm ~ Beta(2, 2)         # AR1 temporal persistence
+
+    # --- 2. SPATIAL COMPONENT (BYM2) ---
+    # Intrinsic CAR structured component (Besag)
+    u_icar ~ MvNormal(zeros(M.N_areas), I)
     Turing.@addlogprob! -0.5 * dot(u_icar, M.Q_sp * u_icar)
-    
-    u_iid ~ MvNormal(zeros(M.N_areas), I); 
+
+    # Unstructured Gaussian noise component
+    u_iid ~ MvNormal(zeros(M.N_areas), I)
+
+    # Riebler et al. (2016) mixture formulation
     s_eff = sigma_sp .* (sqrt(phi_sp) .* u_icar .+ sqrt(1 - phi_sp) .* u_iid)
 
-    # --- 3. Temporal Effect (AR1) ---
-    Q_ar1 = (1.0 / (1.0 - rho_tm^2)) .* (M.Q_ar1_template + (rho_tm^2) * I)
-    f_tm_raw ~ MvNormal(zeros(M.N_time), I); 
+    # --- 3. TEMPORAL COMPONENT (AR1) ---
+    # Construct the AR1 precision matrix with a 1e-6 stability nudge
+    Q_ar1 = (1.0 / (1.0 - rho_tm^2 + 1e-6)) .* (M.Q_ar1_template + (rho_tm^2) * I)
+    f_tm_raw ~ MvNormal(zeros(M.N_time), I)
     Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
-    
+
     f_time = f_tm_raw .* sigma_tm
-  
-    # --- Poisson Likelihood (Log Link) ---
+
+    # --- 4. POISSON LIKELIHOOD ---
     for i in 1:M.N_obs
-        a, t = M.area_idx[i], M.time_idx[i]
-        eta = M.log_offset[i] + s_eff[a] + f_time[t]  
-        mu = exp(eta)
-        Turing.@addlogprob! M.weights[i] * logpdf(Poisson(mu), M.y[i])
+        # Map observation to its area and time identifiers
+        a = M.area_idx[i]
+        t = M.time_idx[i]
+
+        # Linear Predictor Synthesis (Log scale)
+        eta = M.log_offset[i] + s_eff[a] + f_time[t]
+
+        # Weighted Likelihood Evaluation
+        Turing.@addlogprob! M.weights[i] * logpdf(Poisson(exp(eta)), M.y[i])
     end
 end
 
-
-
+ 
 @model function model_D01_poisson(M, ::Type{T}=Float64) where {T}
-    # Poisson Spatiotemporal model with optional Zero-Inflation.
-  
-    # --- 1. Priors ---
-    sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
-    sigma_tm ~ Exponential(1.0); rho_tm ~ Beta(2, 2)
-    sigma_int ~ Exponential(0.5); sigma_rw2 ~ filldist(Exponential(1.0), 4)
+    """
+    Model D01: Poisson Spatiotemporal Framework (BYM2 + AR1).
+
+    Algorithmic Components:
+    1. Spatial (BYM2): Decomposes variation into structured (ICAR) and unstructured (IID) fields.
+    2. Temporal (AR1): Captures first-order serial correlation across time slices.
+    3. Interaction: Captures localized space-time deviations (Type IV structure).
+    4. Covariates (RW2): Second-order random walk smoothing for categorical levels.
+
+    Stability Refinements:
+    - Precision Nudge: 1e-6 added to AR1 and RW2 scaling to prevent singular matrices.
+    - ZIP/Likelihood Epsilon: 1e-10 constant prevents DomainErrors in log-probability calculation.
+    """
+
+    # --- 1. GLOBAL HYPERPRIORS ---
+    sigma_sp ~ Exponential(1.0)  # Spatial standard deviation
+    phi_sp ~ Beta(1, 1)         # Mixing: 1 = pure spatial structure, 0 = pure noise
+    sigma_tm ~ Exponential(1.0)  # Temporal scale
+    rho_tm ~ Beta(2, 2)          # AR1 persistence parameter
+    sigma_int ~ Exponential(0.5) # Interaction scale
+    sigma_rw2 ~ filldist(Exponential(1.0), 4) # Scales for categorical components
+
+    # Trigger structural zero logic if use_zi is enabled in modinputs
     phi_zi ~ M.use_zi ? Beta(1, 1) : Dirac(0.0)
 
-    # --- 2. Spatial Effect (BYM2) ---
-    u_icar ~ MvNormal(zeros(M.N_areas), I); Turing.@addlogprob! -0.5 * dot(u_icar, M.Q_sp * u_icar)
-    u_iid ~ MvNormal(zeros(M.N_areas), I); s_eff = sigma_sp .* (sqrt(phi_sp) .* u_icar .+ sqrt(1 - phi_sp) .* u_iid)
+    # --- 2. SPATIAL FIELD (BYM2 SPECIFICATION) ---
+    u_icar ~ MvNormal(zeros(M.N_areas), I)
+    Turing.@addlogprob! -0.5 * dot(u_icar, M.Q_sp * u_icar)
+    u_iid ~ MvNormal(zeros(M.N_areas), I)
+    s_eff = sigma_sp .* (sqrt(phi_sp) .* u_icar .+ sqrt(1 - phi_sp) .* u_iid)
 
-    # --- 3. Temporal Effect (AR1) ---
-    Q_ar1 = (1.0 / (1.0 - rho_tm^2)) .* (M.Q_ar1_template + (rho_tm^2) * I)
-    f_tm_raw ~ MvNormal(zeros(M.N_time), I); Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
+    # --- 3. TEMPORAL FIELD (AR1 SPECIFICATION) ---
+    Q_ar1 = (1.0 / (1.0 - rho_tm^2 + 1e-6)) .* (M.Q_ar1_template + (rho_tm^2) * I)
+    f_tm_raw ~ MvNormal(zeros(M.N_time), I)
+    Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
     f_time = f_tm_raw .* sigma_tm
 
-    # --- 4. Space-Time Interaction ---
-    st_int_raw ~ MvNormal(zeros(M.N_areas * M.N_time), I); st_interaction = reshape(st_int_raw .* sigma_int, M.N_areas, M.N_time)
+    # --- 4. SPACE-TIME INTERACTION ---
+    st_int_raw ~ MvNormal(zeros(M.N_areas * M.N_time), I)
+    st_interaction = reshape(st_int_raw .* sigma_int, M.N_areas, M.N_time)
 
-    # --- 5. Categorical Smoothing (RW2) ---
+    # --- 5. CATEGORICAL SMOOTHING (RW2) ---
     beta_cov = [Vector{T}(undef, M.N_cat) for _ in 1:4]
     for k in 1:4
         beta_cov[k] ~ MvNormal(zeros(M.N_cat), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
+        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ (sigma_rw2[k]^2 + 1e-6)) * beta_cov[k])
     end
 
-    # --- 6. Poisson Likelihood (Log Link) ---
+    # --- 6. LIKELIHOOD COMPUTATION ---
     for i in 1:M.N_obs
         a, t = M.area_idx[i], M.time_idx[i]
         eta = M.log_offset[i] + s_eff[a] + f_time[t] + st_interaction[a, t]
-        for k in 1:4; eta += beta_cov[k][M.cov_indices[i, k]]; end
+        for k in 1:4
+            eta += beta_cov[k][M.cov_indices[i, k]]
+        end
         mu = exp(eta)
         if M.use_zi
-            Turing.@addlogprob! M.weights[i] * (y[i] == 0 ? log(phi_zi + (1 - phi_zi) * exp(-mu)) : log(1 - phi_zi) + logpdf(Poisson(mu), M.y[i]))
+            if M.y[i] == 0
+                Turing.@addlogprob! M.weights[i] * log(phi_zi + (1 - phi_zi) * exp(-mu) + 1e-10)
+            else
+                Turing.@addlogprob! M.weights[i] * (log(1 - phi_zi + 1e-10) + logpdf(Poisson(mu), M.y[i]))
+            end
         else
             Turing.@addlogprob! M.weights[i] * logpdf(Poisson(mu), M.y[i])
         end
     end
 end
 
+@model function model_D02_poisson_leroux(M, ::Type{T}=Float64; use_zi=false) where {T}
+    """
+    Model D02: Poisson Spatiotemporal model with Leroux CAR Spatial Prior.
 
-@model function model_D02_poisson_leroux(M, ::Type{T}=Float64) where {T}
-    # Poisson Spatiotemporal model with Leroux CAR spatial effect.
-    # This is a variation of model_D01_poisson, replacing BYM2 with a direct Leroux prior.
- 
-    # --- 1. Priors ---
-    # tau_leroux is the overall precision of the spatial field.
-    # rho_leroux is the mixing parameter: 0 means IID (unstructured), 1 means ICAR (structured).
-    tau_leroux ~ Exponential(1.0) # Overall precision for Leroux spatial effect
-    rho_leroux ~ Beta(0.5, 0.5) # Mixing parameter for Leroux (0=IID, 1=ICAR)
+    Mathematical Logic:
+    The Leroux prior defines a non-intrinsic GMRF where the precision matrix Q is:
+        Q = tau * [(1 - rho) * I + rho * Q_sp]
+    where:
+        - tau: Global precision scale.
+        - rho: Spatial mixing (0 = IID noise, 1 = Pure ICAR structure).
+        - Q_sp: Scaled spatial graph Laplacian.
 
-    sigma_tm ~ Exponential(1.0); rho_tm ~ Beta(2, 2)
-    sigma_int ~ Exponential(0.5); sigma_rw2 ~ filldist(Exponential(1.0), 4)
-    phi_zi ~ M.use_zi ? Beta(1, 1) : Dirac(0.0)
+    Structural Advantages:
+    - Identifying properly: This model is proper and identifiable without sum-to-zero constraints.
+    - Jitter Enforcement: Matrix construction includes 1e-6 jitter to ensure positive definiteness during AD gradients.
+    """
 
-    # --- 2. Spatial Effect (Leroux CAR) ---
-    # M.Q_sp is the scaled graph Laplacian (D-W)/scaling_factor
-    # The Leroux precision matrix combines IID (I) and structured (Q_sp) components:
-    # Q_Leroux = tau * ((1-rho)*I + rho*Q_ICAR)
+    # --- 1. PRIORS: HYPERPARAMETERS ---
+    tau_leroux ~ Exponential(1.0) # Global scale of spatial variance
+    rho_leroux ~ Beta(2, 2)       # Spatial dependence parameter (rho)
+
+    sigma_tm ~ Exponential(1.0)  # Standard deviation of temporal trend
+    rho_tm ~ Beta(2, 2)          # AR1 temporal correlation coefficient
+
+    sigma_int ~ Exponential(0.5) # Scale for space-time interaction
+    sigma_rw2 ~ filldist(Exponential(1.0), 4) # Scales for categorical RW2 smoothing
+
+    # Zero-inflation probability toggle
+    phi_zi ~ use_zi ? Beta(1, 1) : Dirac(0.0)
+
+    # --- 2. SPATIAL COMPONENT: LEROUX CAR ---
+    # Construction: Combine I and Q_sp into a single precision matrix
+    # Stability: Enforce Symmetry and add jitter to prevent PosDef errors
     Q_leroux_sparse = tau_leroux .* ((1 - rho_leroux) .* I + rho_leroux .* M.Q_sp)
-    # Q_leroux = Symmetric(Matrix(Q_leroux_sparse) + 1e-6 * I)
-    Q_leroux = Symmetric(Matrix(Q_leroux_sparse) + M.jitter * I)
-    
-    # The spatial effect phi_leroux is sampled directly from the Leroux prior precision.
-    phi_leroux ~ MvNormalCanon(Q_leroux) # Leroux spatial random effect
+    Q_leroux_dense = Symmetric(Matrix(Q_leroux_sparse) + M.jitter * I)
 
+    # phi_leroux represents the total spatial effect (structured + unstructured)
+    phi_leroux ~ MvNormalCanon(Q_leroux_dense)
 
-
-    # --- 3. Temporal Effect (AR1) ---
-    Q_ar1 = (1.0 / (1.0 - rho_tm^2)) .* (M.Q_ar1_template + (rho_tm^2) * I)
-    f_tm_raw ~ MvNormal(zeros(M.N_time), I); Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
+    # --- 3. TEMPORAL COMPONENT: AR1 ---
+    # Precision derived from the AR1 template: Q = 1/(1-rho^2) * [template + rho^2*I]
+    Q_ar1 = (1.0 / (1.0 - rho_tm^2 + 1e-6)) .* (M.Q_ar1_template + (rho_tm^2) * I)
+    f_tm_raw ~ MvNormal(zeros(M.N_time), I)
+    Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
     f_time = f_tm_raw .* sigma_tm
 
-    # --- 4. Space-Time Interaction ---
-    st_int_raw ~ MvNormal(zeros(M.N_areas * M.N_time), I); st_interaction = reshape(st_int_raw .* sigma_int, M.N_areas, M.N_time)
+    # --- 4. SPACE-TIME INTERACTION ---
+    # IID interaction term to capture localized spatio-temporal outliers
+    st_int_raw ~ MvNormal(zeros(M.N_areas * M.N_time), I)
+    st_interaction = reshape(st_int_raw .* sigma_int, M.N_areas, M.N_time)
 
-    # --- 5. Categorical Smoothing (RW2) ---
+    # --- 5. CATEGORICAL SMOOTHING: RW2 ---
+    # Second-order random walk coefficients for the 4 primary covariates
     beta_cov = [Vector{T}(undef, M.N_cat) for _ in 1:4]
     for k in 1:4
         beta_cov[k] ~ MvNormal(zeros(M.N_cat), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
+        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ (sigma_rw2[k]^2 + 1e-6)) * beta_cov[k])
     end
 
-    # --- 6. Poisson Likelihood (Log Link) ---
+    # --- 6. LIKELIHOOD COMPUTATION ---
     for i in 1:M.N_obs
+        # Map to area and time slice indices
         a, t = M.area_idx[i], M.time_idx[i]
+
+        # Linear Predictor: Intercept + Spatial + Temporal + Interaction + Categories
         eta = M.log_offset[i] + phi_leroux[a] + f_time[t] + st_interaction[a, t]
-        for k in 1:4; eta += beta_cov[k][M.cov_indices[i, k]]; end
+        for k in 1:4
+            eta += beta_cov[k][M.cov_indices[i, k]]
+        end
+
         mu = exp(eta)
-        if M.use_zi
-            Turing.@addlogprob! M.weights[i] * (y[i] == 0 ? log(phi_zi + (1 - phi_zi) * exp(-mu)) : log(1 - phi_zi) + logpdf(Poisson(mu), M.y[i]))
+
+        if use_zi
+            # Stable ZIP Likelihood with 1e-10 epsilon constant
+            if M.y[i] == 0
+                Turing.@addlogprob! M.weights[i] * log(phi_zi + (1 - phi_zi) * exp(-mu) + 1e-10)
+            else
+                Turing.@addlogprob! M.weights[i] * (log(1 - phi_zi + 1e-10) + logpdf(Poisson(mu), M.y[i]))
+            end
         else
+            # Standard Weighted Poisson Likelihood
             Turing.@addlogprob! M.weights[i] * logpdf(Poisson(mu), M.y[i])
         end
     end
 end
-
 
 
 @model function model_D03_poisson_localised(M, ::Type{T}=Float64 ) where {T}
@@ -306,7 +372,7 @@ end
 
         for k in 1:4; eta1 += beta_cov[k][M.cov_indices[i, k]]; end
         Turing.@addlogprob! M.weights[i] * logpdf(Poisson(exp(eta1)), M.y[i])
-        Turing.@addlogprob! logpdf(Poisson(exp(eta2)), M.z_obs[i])
+        Turing.@addlogprob! logpdf(Poisson(exp(eta2)), M.y2[i])
     end
 end
 
@@ -1429,18 +1495,24 @@ end
 end
  
 
-@model function model_C01_gaussian_dense_gp(M, ::Type{T}=Float64) where {T}
-    # Model A00 Optimized: Dense Spatiotemporal Gaussian Process with Seasonality.
-    # Uses a separable kernel and seasonal harmonics.
- 
-    # --- 1. Priors ---
+@model function model_C01_gaussian_dense_gp(M, ::Type{T} = Float64) where {T}
+    """
+    Model C01: Dense Spatiotemporal Gaussian Process with Stability Safeguards.
+    
+    Refinements:
+    1. Separable Kernel: Combines Spatial and Temporal SqExp kernels.
+    2. Numerical Jitter: Added 1e-6 nugget to the full covariance matrix.
+    3. RW2 Smoothing: Standardized categorical covariate handling.
+    """
+
+    # --- 1. Global Hyperpriors ---
     sigma_y ~ Exponential(1.0)
     sigma_f ~ Exponential(1.0)
     ls_s ~ Gamma(2, 2)
     ls_t ~ Gamma(2, 2)
     sigma_rw2 ~ filldist(Exponential(1.0), 4)
 
-    # Seasonal priors
+    # Seasonal weights
     beta_cos ~ Normal(0, 1)
     beta_sin ~ Normal(0, 1)
 
@@ -1450,68 +1522,98 @@ end
     ts = Float64.(M.time_idx)
 
     # --- 3. Kernel Matrix Construction ---
+    # Space and Time kernels are multiplied to create a separable ST-GP
     k_s = SqExponentialKernel() ∘ ScaleTransform(inv(ls_s))
     k_t = SqExponentialKernel() ∘ ScaleTransform(inv(ls_t))
     coords_s = RowVecs(hcat(xs, ys))
-    K = (sigma_f^2) .* kernelmatrix(k_s, coords_s) .* kernelmatrix(k_t, ts)
-    
-    # --- 4. Latent Process ---
-    f_latent ~ MvNormal(zeros(M.N_obs), K + M.jitter*I)
 
-    # --- 5. Categorical Covariates (RW2 Smoothing) ---
+    # Combine kernels and enforce symmetry with a stability nugget
+    K_base = kernelmatrix(k_s, coords_s) .* kernelmatrix(k_t, ts)
+    K_scaled = (sigma_f^2) .* K_base
+    K_stable = Symmetric(K_scaled + 1e-6 * I)
+
+    # --- 4. Latent Process ---
+    f_latent ~ MvNormal(zeros(M.N_obs), K_stable)
+
+    # --- 5. Categorical Smoothing (RW2) ---
     beta_cov = [Vector{T}(undef, M.N_cat) for _ in 1:4]
     for k in 1:4
         beta_cov[k] ~ MvNormal(zeros(M.N_cat), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
+        # Penalty applied to the log-density with jitter for conditioning
+        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ (sigma_rw2[k]^2 + 1e-6)) * beta_cov[k])
     end
 
     # --- 6. Likelihood ---
     for i in 1:M.N_obs
         # Add Seasonality component
-        seasonal = beta_cos * cos(2pi * ts[i] / M.period) + beta_sin * sin(2pi * ts[i] / M.period)
-        
+        seasonal = beta_cos * cos(2 * pi * ts[i] / M.period) + beta_sin * sin(2 * pi * ts[i] / M.period)
+
         mu = M.log_offset[i] + f_latent[i] + seasonal
+        
+        # Add categorical level effects
         for k in 1:4
-            mu += beta_cov[k][M.cov_indices[i, k]]
+            mu = mu + beta_cov[k][M.cov_indices[i, k]]
         end
+
         Turing.@addlogprob! M.weights[i] * logpdf(Normal(mu, sigma_y), M.y[i])
     end
 end
- 
 
+@model function model_C02_gaussian_deep_gp(M, ::Type{T} = Float64; m1 = 10, m2 = 5) where {T}
+    """
+    Model C02: 2-Layer Deep Gaussian Process Spatiotemporal model.
+    
+    Refinements:
+    1. Non-Stationarity: Layers are composed to allow local lengthscale adaptation.
+    2. RFF Stability: Frequencies are sampled with fixed seeds for consistency.
+    3. Robust RW2: Categorical effects integrated with stability nudges.
+    """
 
-@model function model_C02_gaussian_deep_gp(M, ::Type{T}=Float64; m1=10, m2=5 ) where {T}
-    # Model v8 Optimized: Refined 2-Layer Deep GP Spatiotemporal model for Gaussian data.
-    # Combines deep non-linear interaction with robust Muted covariate smoothing.
- 
-    # --- 1. Priors ---
+    # --- 1. Global Hyperpriors ---
     sigma_y ~ Exponential(1.0)
     sigma_rw2 ~ filldist(Exponential(1.0), 4)
- 
-    # --- 1. Deep GP Priors ---
-    l1 ~ Gamma(2, 1); w1 ~ MvNormal(zeros(m1), I)
-    l2 ~ Gamma(2, 1); w2 ~ MvNormal(zeros(m2), I)
 
-    # --- 2. Deep GP Layer 1 (Input Transformation) ---
+    # --- 2. Deep GP Layer 1 (Input Warp) ---
+    l1 ~ Gamma(2, 1)
+    w1 ~ MvNormal(zeros(m1), I)
+
+    # Feature Matrix Construction from [Lon, Lat, Time]
     X = hcat([p[1] for p in M.pts], [p[2] for p in M.pts], Float64.(M.time_idx))
-    Random.seed!(42); Om1 = randn(m1, 3) ./ l1; Ph1 = rand(m1) .* convert(T, 2pi)
-    h1 = (convert(T, sqrt(2/m1)) .* cos.(X * Om1' .+ Ph1')) * w1
+    
+    # Sample frequencies scaled by lengthscale l1
+    Random.seed!(42)
+    Om1 = randn(m1, 3) ./ l1
+    Ph1 = rand(m1) .* convert(T, 2 * pi)
+    
+    # Hidden layer transformation h1
+    h1 = (convert(T, sqrt(2 / m1)) .* cos.(X * Om1' .+ Ph1')) * w1
 
-    # --- 3. Deep GP Layer 2 (Latent Mean Field) ---
-    Random.seed!(43); Om2 = randn(m2, 1) ./ l2; Ph2 = rand(m2) .* convert(T, 2pi)
-    eta_gp = (convert(T, sqrt(2/m2)) .* cos.(reshape(h1, :, 1) * Om2' .+ Ph2')) * w2
+    # --- 3. Deep GP Layer 2 (Latent Field) ---
+    l2 ~ Gamma(2, 1)
+    w2 ~ MvNormal(zeros(m2), I)
+
+    Random.seed!(43)
+    Om2 = randn(m2, 1) ./ l2
+    Ph2 = rand(m2) .* convert(T, 2 * pi)
+    
+    # Latent mean field eta_gp is a function of h1
+    eta_gp = (convert(T, sqrt(2 / m2)) .* cos.(reshape(h1, :, 1) * Om2' .+ Ph2')) * w2
 
     # --- 4. Categorical Smoothing (RW2) ---
     beta_cov = [Vector{T}(undef, M.N_cat) for _ in 1:4]
     for k in 1:4
         beta_cov[k] ~ MvNormal(zeros(M.N_cat), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
+        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ (sigma_rw2[k]^2 + 1e-6)) * beta_cov[k])
     end
 
     # --- 5. Gaussian Likelihood ---
     for i in 1:M.N_obs
         mu = M.log_offset[i] + eta_gp[i]
-        for k in 1:4; mu += beta_cov[k][M.cov_indices[i, k]]; end
+        
+        for k in 1:4
+            mu = mu + beta_cov[k][M.cov_indices[i, k]]
+        end
+
         Turing.@addlogprob! M.weights[i] * logpdf(Normal(mu, sigma_y), M.y[i])
     end
 end
@@ -2465,7 +2567,7 @@ end
     # Utilizes Kronecker-structured precision matrices for efficient spatiotemporal inference.
   
     unique_t = collect(1:M.N_time) ./ M.N_time
-    unique_s = M.coords_space[1:M.N_areas, :]
+    unique_s = M.coords_space 
 
     # --- 1. Priors & Structural Components ---
     sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)

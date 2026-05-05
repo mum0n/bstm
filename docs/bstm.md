@@ -348,7 +348,7 @@ In the data Tuple (*data_scot*), we have counts (y) of cancer incidence and popu
 
 #### Spatiotemporal model: a preview 
 
-Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we reformat the data (*data_scot*) with 'prepare_model_inputs()' to create a structured data object and run a simple separable spatiotemporal model (model_D1_poisson_simple).  
+Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we reformat the data (*data_scot*) with 'prepare_model_inputs()' to create a structured data object and run a simple separable spatiotemporal model (model_D00_poisson_simple).  
  
 ```{julia}
 #| D00: Base Model - Sparse GMRF Separable Spatiotemporal  
@@ -364,22 +364,21 @@ modinputs = prepare_model_inputs(
 )
 
 # create model instance
-mod = model_D00_poisson_simple(modinputs) # Turing model object
+m = model_D00_poisson_simple(modinputs) # Turing model object
 
 # sample with Metropolis-Hastings: 
-chain = sample(mod, MH(), 5000; num_warmup=10000, thin=50, progress=true, drop_warmup=true )  
+chn = sample(m, MH(), 5000; num_warmup=10000, thin=50, progress=true, drop_warmup=true )  
 
 # extract results see a few figures
-results = model_results_comprehensive(mod, chain, modinputs, au_scot);
-
-println("WAIC: ", round(results.waic, digits=2)) 
-
-display(results.plots.ppc.plot_scatter)
-display(results.plots.temporal)
-display(results.plots.spatial)
-display(results.plots.st_denoised)
-display(results.plots.st_noisy)
+res = model_results_comprehensive(m, chn, modinputs, au_scot);
  
+display(res.plots.p_ppc)
+display(res.plots.p_tm)
+display(res.plots.p_seas)
+display(res.plots.p_denoised)
+display(res.plots.p_noisy) 
+
+
 ```
  
 These results are "ok". But there is lots of room for improvement--starting with the sampler: MH() is a simple one that is used here for checking timings only. Extracting different components of the model internals takes a little more digging, but as these are Bayesian models, every aspect is completely available and adjustable. The model itself is a basic one (separable time and space) with no covariates. However, it does use optimizations that take advantage of the sparse nature of the neighbourhood adjacency matrix and the temporal autocorrelation. In other words, a sparse form can speed through 15000 samples in a reasonable amount of time (7.6 seconds). 
@@ -389,8 +388,8 @@ In contrast, when an unoptimized model is used, the inversion of the full spatia
 ```{julia}
 #| label: C00: Base Model - Dense Kernel Matrix Separable Spatiotemporal GP
 
-mod = model_C00_gaussian_dense_gp(modinputs) # Turing model object
-chain = sample(mod, MH(), 50; num_warmup=100, thin=50, progress=true, drop_warmup=true )  
+m = model_C00_gaussian_dense_gp(modinputs) # Turing model object
+chn = sample(m, MH(), 50; num_warmup=100, thin=50, progress=true, drop_warmup=true )  
 
 ```    
 
@@ -416,7 +415,7 @@ Though MCMC sampling is our gold-standard, we also have other optimization-based
 
 - Maximum likelihood (ML) estimation can be much faster than MCMC as pure optimization of a point mass is considerably simpler as priors are ignored and there is no need to carry posterior samples. Many specialized optimization algorithms exist that have been tried and tested over many years. 
 - Maximum a-posteriori (MAP) estimation is the same as ML except that prior information is used as well and so a bit closer to MCMC in spirit, though the focus is still upon the point estimates. 
-- Variational Inference is also an optimization method. However, it approaches the problem using the ELBO estimator. In priciple it is closest to MCMC and able to describe the posterior distribution reasonably well. It is, therefore, similar to INLA, except that in the latter, a Laplace Approximation is used which comes with other constraints.
+- Variational Inference is also an optimization method. However, it approaches the problem using the ELBO estimator. In principle it is closest to MCMC and able to describe the posterior distribution reasonably well. It is, therefore, similar to INLA, except that in the latter, a Laplace Approximation is used which comes with other constraints.
 
 All three methods are accessible with the same Turing/Julia model (but not Laplace Approximation, to my knowledge, though that may always change). The following code snippet shows how to run then and even use one as the starting point of another. Let us return to the sparse demonstration model: model_D00_poisson_simple(modinputs).
  
@@ -427,31 +426,38 @@ All three methods are accessible with the same Turing/Julia model (but not Lapla
 using Optim, AdvancedVI, Turing
 
 # ML
-mod = model_D00_poisson_simple(modinputs) # Turing model object
-mod_opt = maximum_likelihood(mod, LBFGS() )
-mod_opt.optim_result.retcode  # it fails 
-mod_opt.params 
+m = model_D00_poisson_simple(modinputs) # Turing model object
+res_opt = maximum_likelihood(m, LBFGS() )
+res_opt.optim_result.retcode  # it fails 
+res_opt.params 
 
 # MAP
-mod_map = maximum_a_posteriori( mod, NelderMead() )
-mod_map.optim_result.retcode  # it fails
-mod_map.params
-
-# VI: Mean-Field Variational Inference (ADVI), Default optimiser is TruncatedADAGrad
-
-advi = ADVI(FullRankGaussian, 10, 1000)
-mod_vi = Turing.vi(mod, , Variational.meanfield(mod))  #, optimizer=Flux.ADAM(1e-1));
-pm = mod_vi.mmean
-msamples = DataFrame( rand(mod_vi, nsamps )', :auto )
-q = FullRankGaussian(mod, LowerTriangular(Matrix{Float64}(0.6*I, d, d)))
-q = MeanFieldGaussian(mod, Diagonal(ones(d)));
-
-q0 = Variational.q_meanfield_gaussian(mod)  # initialize variational distribution (optional)
-advi = ADVI(1, 2000)  # num_elbo_samples, max_iters
-@time q = vi(m, advi, q0, optimizer=Flux.ADAM(1e-1));
+res_map = maximum_a_posteriori( m, NelderMead() )
+res_map.optim_result.retcode  # it fails
+res_map.params
 
 
+# Variational Inference
+#;, optimizer=Flux.ADAM(1e-1));
+# q_init = q_locationscale
+# q_init = q_meanfield_gaussian 
+# q_init = q_fullrank_gaussian
+samples_per_step = 10
+max_iters = 1000
+no_samples = 1000
 
+q_init = q_fullrank_gaussian     
+chn_vi = vi(m, q_init, 1000, adtype=AutoForwardDiff(), show_progress=true) 
+  
+# Extend base names check for ADVI pseudo-chain
+MCMCChains.names(chain::NamedTuple) = collect(keys(chain.data))
+ 
+# Convert to reconstruct-compatible format
+chn = convert_advi_to_reconstruct_format(m, chn_vi, 1000)
+
+# Reconstruct and Visualize
+res = model_results_comprehensive(m, chn, modinputs_count, au)
+ 
 ``` 
 
 Any of these point estimates can be used as starting points for MCMC runs--if you trust the point estimates to have converged to a correct solution, otherwise you would be pointing MCMC runs to start from a pathological positon. 
@@ -517,8 +523,9 @@ plot_spatial_graph( au; title="Method: $method", domain_boundary=au.hull_coords)
 Note the target point density is similar to the final density. 
 
 
-### Model variations 
+## Model Compendium
 
+The following prepares data for the models to be examine together with a short list.
 
 ```{julia}
 #| label: create structured model inputs and model_list definitions 
@@ -604,34 +611,613 @@ model_list = Dict(
  
 # quick check to see if all models are still functional 
 mk = sort( collect(keys(model_list)) )
-nk = size(mk,1)
-
-i=15; 
-for model_key in mk[i:nk] 
+nk = size(mk,1) # end
+sk = 1  # start
+for model_key in mk[sk:nk] 
   display(model_key)
   # if model_key == "C08_refined_mosaic" break
-  target_model = model_list[model_key]()
-  target_sampler = MH()
-  chain = sample(target_model, target_sampler, 100; progress=true)
+  m = model_list[model_key]()
+  chn = sample(m, MH(), 10; progress=true)
 end
 
 
 if false 
-  include( joinpath( project_directory, "src", "spatiotemporal_functions.jl" ) )       # support functions
-
-  include( joinpath( project_directory, "src", "spatiotemporal_turing_models.jl" ) )     # Turing models
-     
   # saving or testing: 
-
-  # mod_fns =  collect(keys(model_registry))
-  # i = 1 # 1:9
-  # @load_carstm_state( mod_fns[i] )
- 
-  mod = model_v2_rff_gaussian(modinputs_gaussian)
-  chain = sample(mod, MH(), 10; progress=true)
+  # m = model_D00_poisson_simple(modinputs_count)
+  # chn = sample(m, MH(), 10; progress=true)
+  # res_fns =  collect(keys(model_registry))
+  # @load_carstm_state( res_fns[i] )
 end  
     
 ```
+
+## Discrete models
+
+### model_D00_poisson_simple
+ 
+It is perhaps the most basic spatiotemporal model. We have already seen this model in the introductory example with Scottish lip cancers. No covariates are in it. There is no weighting nor use of offsets. It is as basic as it can get. 
+
+This model decomposes spatiotemporal count data into three main additive latent components, without any interactions: 
+    
+    - fixed offset (e.g., expected population count or risk)
+
+    - spatial field: Besag-York-Mollié (BYM2) prior, identify how much of the spatial variance is due to real geographic clustering (structured) versus random local noise (unstructured) using a single mixing parameter (phi_sp).
+
+    - temporal trend: AR1, a first-order autoregressive process, the model assumes that what happened yesterday is the best predictor of what happens today, allowing for smooth trend estimation over time.
+ 
+
+Utility: 
+
+    - Smooth raw count data 
+    
+    - Identify 'hotspots' that are statistically significant rather than just random fluctuations in small populations.
+
+    - Denoising filter, partitioning observation noise to reveal the underlying latent 'signal' of how a phenomenon moves through space and time.
+
+Computation:
+
+    - Efficient: GMRFs (Gaussian Markov Random Fields) and sparse precision matrices (instead of dense covariance matrices) make it much faster for large datasets.
+
+    - Penalized Complexity (PC) priors (Exponentials for scales), pulls the model toward a NULL hypothesis unless the data strongly supports complex spatial or temporal structures. The use of sigma_sp (spatial sd) and sigma_tm (temporal sd) as exponential priors allows for principled shrinkage, ensuring that the latent fields only become complex (larger) if supported by the data (i.e., the NULL hypothesis is low SD).
+ 
+    - Poisson Log-Link: observations $y_i$$y_i$ follow a Poisson distribution. The log-linear predictor $\eta$$\eta$ combines a known offset with latent spatial and temporal effects: $$\log(\mu_{it}) = \text{offset}_{it} + \text{Spatial Effect}_a + \text{Temporal Effect}_t$$$$\log(\mu_{it}) = \text{offset}_{it} + \text{Spatial Effect}_a + \text{Temporal Effect}_t$$
+
+    - Spatial Effect: BYM2 Specification (Besag-York-Mollié) parameterization, which decomposes spatial variance into two parts:
+
+        - u_icar (Structured): An Intrinsic Conditional Autoregressive (ICAR) component that accounts for spatial clustering based on the adjacency graph $Q_{sp}$$Q_{sp}$.
+
+        - u_iid (Unstructured): Independent noise that accounts for area-specific heterogeneity.
+
+        - phi_sp: A mixing parameter that determines the proportion of variance explained by the spatial structure vs. random noise.
+
+    - Temporal Effect: AR1 Process (f_time) follows a First-Order Autoregressive (AR1) process:
+
+        - rho_tm: The correlation coefficient between successive time steps.
+
+        - Q_ar1: A precision matrix constructed using the Q_ar1_template to enforce temporal dependency.
+
+
+    - GMRF (Gaussian Markov Random Field) densities for the ICAR and AR1 components are used to directly increment the Log-Probability (Turing.@addlogprob!). This is significantly more computationally efficient than inverting large covariance matrices.
+
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+ 
+m = model_D00_poisson_simple(modinputs_count)
+os = get_optimal_sampler("model_D00_poisson_simple"; nuts_adapt=1000) 
+chn = sample(m, os, 2000, nchains=4)
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+showall(res.summarystats)
+
+display(res.plots.p_ppc)
+display(res.plots.p_tm)
+display(res.plots.p_seas)
+display(res.plots.p_denoised)
+display(res.plots.p_noisy) 
+
+```
+
+Sampling takes 6 seconds and gives the following results:
+
+``` 
+RMSE: 2160.3172
+Pearson R: -0.0149 (p=0.5647)
+Spearman rho: -0.0451 (p=NaN)
+WAIC: 5.031550009328398e11
+RHAT (mean): 1.2954
+ESS (mean): 2.3984
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+
+    sigma_sp    0.2720    0.2762    0.0686    15.1341    14.8657    1.0529        2.4076
+      phi_sp    0.6396    0.0990    0.0223    56.7353    76.2545    1.0529        9.0257
+    sigma_tm    4.5220    0.4695    0.1072    15.1732        NaN    1.0526        2.4138
+      rho_tm    0.9449    0.1081    0.0265    15.2319        NaN    1.0529        2.4231
+           ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+      
+
+```
+
+- Convergence metric rhat=1.3 indicates it has not yet converged (though the sigmas, phi and rho have). 
+- Effective number of samples per second (ess_per_sec) are mostly about 7.5. 
+- Predictions are poor and WAIC is very elevated/poor 
+ 
+### model_D01_poisson
+
+This model serves to enter four covariates via a RW2 smoothing process and offsets into the model. A full Space-Time Interaction field is also incorporated ($\\sigma_{int}$$\\sigma_{int}$), allowing for localized hotspots that aren't captured by the main spatial or temporal trends.
+ 
+Sampling takes much longer than the simple model and so I have reduced the number of samples taken by 1 order of magnitude:
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+
+m = model_D01_poisson(modinputs_count)
+os = get_optimal_sampler("model_D01_poisson"; nuts_adapt=100) 
+chn = sample(m, os, 200, nchains=4)
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+showall(res.summarystats)
+
+display(res.plots.p_ppc)
+display(res.plots.p_tm)
+display(res.plots.p_seas)
+display(res.plots.p_denoised)
+display(res.plots.p_noisy) 
+
+```
+
+It takes 297 seconds to complete 200 samples. 
+
+Which gives:
+
+``` 
+ 
+RMSE: 10181.0727
+Pearson R: -0.1354 (p=0.0)
+Spearman rho: -0.0791 (p=NaN)
+WAIC: 2.132247536459414e11
+RHAT (mean): 1.4106
+ESS (mean): 0.0219
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+      sigma_sp    0.2120    0.0415    0.0092    20.2005    20.2005    1.0263        0.0659
+        phi_sp    0.9098    0.0175    0.0039    20.2005        NaN    1.0263        0.0659
+      sigma_tm    0.1401    0.1000    0.0223    20.2005    20.2005    1.0263        0.0659
+        rho_tm    0.4916    0.0256    0.0057    20.2005        NaN    1.0263        0.0659
+     sigma_int    0.0775    0.0150    0.0033    20.2005    20.2005    1.0263        0.0659
+             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+
+  
+
+```
+
+- Convergence metric rhat indicate it has not converged. 
+- Effective number of samples per second (ess_per_sec) are mostly about  0.02 (~ 6000 X slower our base model). 
+- Predictions are poor, WAIC is elevated but a little better than the base model
+- sigma space slighly higher and sigma time is lower 
+- phi (space autocorrelation) is much higher but rho (temporal autocorrelation) is lower 
+- Note: phi_zi is zero as it is a flag for zero-inflated operations. In production mode, this effect would/should be trimmed out if not used. 
+
+
+
+### model_D02_poisson_leroux
+
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+
+m = model_D02_poisson_leroux(modinputs_count)
+os = get_optimal_sampler("model_D02_poisson_leroux"; nuts_adapt=100) 
+chn = sample(m, os, 200, nchains=4)
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+showall(res.summarystats)
+
+display(res.plots.p_ppc)
+display(res.plots.p_tm)
+display(res.plots.p_seas)
+display(res.plots.p_denoised)
+display(res.plots.p_noisy) 
+
+```
+
+It takes 310 seconds to complete 200 samples. 
+
+Which gives:
+
+``` 
+RMSE: 10181.0727 
+Pearson R: -0.1354 (p=0.0)
+Spearman rho: -0.0791 (p=NaN)
+WAIC: 2.132247536459414e11
+RHAT (mean): 1.4106
+ESS (mean): 0.0251
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+      sigma_sp    0.2120    0.0415    0.0092    20.2005    20.2005    1.0263        0.0754
+        phi_sp    0.9098    0.0175    0.0039    20.2005        NaN    1.0263        0.0754
+      sigma_tm    0.1401    0.1000    0.0223    20.2005    20.2005    1.0263        0.0754
+        rho_tm    0.4916    0.0256    0.0057    20.2005        NaN    1.0263        0.0754
+     sigma_int    0.0775    0.0150    0.0033    20.2005    20.2005    1.0263        0.0754
+             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+
+  
+
+```
+
+ESS (mean) was 0.0251 !
+
+### model_D03_poisson_localised
+
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+
+m = model_D03_poisson_localised(modinputs_count)
+os = get_optimal_sampler("model_D03_poisson_localised"; nuts_adapt=100) 
+chn = sample(m, os, 200, nchains=4)
+
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+showall(res.summarystats)
+
+display(res.plots.p_ppc)
+display(res.plots.p_tm)
+display(res.plots.p_seas)
+display(res.plots.p_denoised)
+display(res.plots.p_noisy) 
+
+```
+
+It takes 310 seconds to complete 200 samples. 
+
+Which gives:
+
+``` 
+RMSE: 10181.1341
+Pearson R: 0.1089 (p=0.0)
+Spearman ρ: 0.121
+WAIC: 1.489552542314989e11
+RHAT (mean): 1.5224
+ESS (mean): 0.0318
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+      sigma_sp    0.0355    0.1203    0.0236     7.7670     7.5826    1.0765        0.0251
+        phi_sp    0.6897    0.0751    0.0234    14.2291     8.2144    1.0767        0.0460
+      sigma_tm    0.3708    0.0788    0.0066    67.8181    33.0718    1.0765        0.2194
+        rho_tm    0.2396    0.0758    0.0267     7.7625     7.5826    1.0768        0.0251
+     sigma_int    0.0867    0.1387    0.0447     7.7027     7.5826    1.0776        0.0249
+             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+
+```
+
+ESS (mean) was 0.0318!
+
+### model_D04_poisson_sar
+
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+
+m = model_D04_poisson_sar(modinputs_count)
+os = get_optimal_sampler("model_D04_poisson_sar"; nuts_adapt=100) 
+chn = sample(m, os, 200, nchains=4)
+
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+showall(res.summarystats)
+
+display(res.plots.p_ppc)
+display(res.plots.p_tm)
+display(res.plots.p_seas)
+display(res.plots.p_denoised)
+display(res.plots.p_noisy) 
+
+```
+
+It takes 287 seconds to complete 200 samples. 
+
+Which gives:
+
+``` 
+RMSE: 10180.981
+Pearson R: 0.0035 (p=0.8919)
+Spearman ρ: -0.0309
+WAIC: 3.143918264442984e11
+RHAT (mean): 1.3325
+ESS (mean): 0.0066
+
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+
+      sigma_sp    3.2792    2.4112    1.0174     8.3294        NaN    1.1413        0.0094
+       rho_sar    0.3929    0.2239    0.1342     4.8731     5.5037    1.2303        0.0055
+      sigma_tm    0.0834    0.1309    0.0423    23.6232     3.6777    1.0305        0.0267
+        rho_tm    0.3754    0.1056    0.0395     5.8626     5.5037    1.1885        0.0066
+     sigma_int    0.0711    0.1363    0.0611     1.5658     1.5666    1.7549        0.0018
+            ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+
+```
+
+ESS was 0.0066
+
+
+### model_D05_poisson_mcar
+
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+
+# need a count: 
+modinputs_count = merge( modinputs_count, (y2=Int.(floor.( 100 .* (modinputs_count.z_obs .- minimum(modinputs_count.z_obs) ) ) ), ))
+
+m = model_D05_poisson_mcar(modinputs_count)
+os = get_optimal_sampler("model_D05_poisson_mcar"; nuts_adapt=100) 
+chn = sample(m, os, 200, nchains=4)
+
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+showall(res.summarystats)
+
+display(res.plots.p_ppc) 
+display(res.plots.temporal)
+display(res.plots.spatial)
+display(res.plots.st_denoised)
+display(res.plots.st_noisy)
+
+```
+
+It takes 310 seconds to complete 200 samples. 
+
+Which gives:
+
+``` 
+RMSE: 10181.1341
+Pearson R: 0.1089 (p=0.0)
+Spearman ρ: 0.121
+WAIC: 1.489552542314989e11
+RHAT (mean): 1.5224
+ESS (mean): 0.0318
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+      sigma_sp    0.0355    0.1203    0.0236     7.7670     7.5826    1.0765        0.0251
+        phi_sp    0.6897    0.0751    0.0234    14.2291     8.2144    1.0767        0.0460
+      sigma_tm    0.3708    0.0788    0.0066    67.8181    33.0718    1.0765        0.2194
+        rho_tm    0.2396    0.0758    0.0267     7.7625     7.5826    1.0768        0.0251
+     sigma_int    0.0867    0.1387    0.0447     7.7027     7.5826    1.0776        0.0249
+             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+
+```
+
+
+### model_D06_poisson_svc
+
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+
+m = model_D06_poisson_svc(modinputs_count)
+os = get_optimal_sampler("model_D06_poisson_svc"; nuts_adapt=100) 
+chn = sample(m, os, 200, nchains=4)
+
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+showall(res.summarystats)
+
+display(res.plots.p_ppc) 
+display(res.plots.temporal)
+display(res.plots.spatial)
+display(res.plots.st_denoised)
+display(res.plots.st_noisy)
+
+```
+
+It takes 310 seconds to complete 200 samples. 
+
+Which gives:
+
+``` 
+RMSE: 10181.1341
+Pearson R: 0.1089 (p=0.0)
+Spearman ρ: 0.121
+WAIC: 1.489552542314989e11
+RHAT (mean): 1.5224
+ESS (mean): 0.0318
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+      sigma_sp    0.0355    0.1203    0.0236     7.7670     7.5826    1.0765        0.0251
+        phi_sp    0.6897    0.0751    0.0234    14.2291     8.2144    1.0767        0.0460
+      sigma_tm    0.3708    0.0788    0.0066    67.8181    33.0718    1.0765        0.2194
+        rho_tm    0.2396    0.0758    0.0267     7.7625     7.5826    1.0768        0.0251
+     sigma_int    0.0867    0.1387    0.0447     7.7027     7.5826    1.0776        0.0249
+             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+
+```
+
+
+### model_D07_poisson_dag
+
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+
+m = model_D03_poisson_localised(modinputs_count)
+os = get_optimal_sampler("model_D03_poisson_localised"; nuts_adapt=100) 
+chn = sample(m, os, 200, nchains=4)
+
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+showall(res.summarystats)
+
+display(res.plots.p_ppc)
+display(res.plots.p_tm)
+display(res.plots.p_seas)
+display(res.plots.p_denoised)
+display(res.plots.p_noisy) 
+
+```
+
+It takes 310 seconds to complete 200 samples. 
+
+Which gives:
+
+``` 
+RMSE: 10181.1341
+Pearson R: 0.1089 (p=0.0)
+Spearman ρ: 0.121
+WAIC: 1.489552542314989e11
+RHAT (mean): 1.5224
+ESS (mean): 0.0318
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+      sigma_sp    0.0355    0.1203    0.0236     7.7670     7.5826    1.0765        0.0251
+        phi_sp    0.6897    0.0751    0.0234    14.2291     8.2144    1.0767        0.0460
+      sigma_tm    0.3708    0.0788    0.0066    67.8181    33.0718    1.0765        0.2194
+        rho_tm    0.2396    0.0758    0.0267     7.7625     7.5826    1.0768        0.0251
+     sigma_int    0.0867    0.1387    0.0447     7.7027     7.5826    1.0776        0.0249
+             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+
+```
+
+
+### model_D08_hurdle
+
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+
+m = model_D03_poisson_localised(modinputs_count)
+os = get_optimal_sampler("model_D03_poisson_localised"; nuts_adapt=100) 
+chn = sample(m, os, 200, nchains=4)
+
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+showall(res.summarystats)
+
+display(res.plots.p_ppc)
+display(res.plots.p_tm)
+display(res.plots.p_seas)
+display(res.plots.p_denoised)
+display(res.plots.p_noisy) 
+
+```
+
+It takes 310 seconds to complete 200 samples. 
+
+Which gives:
+
+``` 
+RMSE: 10181.1341
+Pearson R: 0.1089 (p=0.0)
+Spearman ρ: 0.121
+WAIC: 1.489552542314989e11
+RHAT (mean): 1.5224
+ESS (mean): 0.0318
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+      sigma_sp    0.0355    0.1203    0.0236     7.7670     7.5826    1.0765        0.0251
+        phi_sp    0.6897    0.0751    0.0234    14.2291     8.2144    1.0767        0.0460
+      sigma_tm    0.3708    0.0788    0.0066    67.8181    33.0718    1.0765        0.2194
+        rho_tm    0.2396    0.0758    0.0267     7.7625     7.5826    1.0768        0.0251
+     sigma_int    0.0867    0.1387    0.0447     7.7027     7.5826    1.0776        0.0249
+             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+
+```
+
+
+### model_D09_poisson_ei
+
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+
+m = model_D03_poisson_localised(modinputs_count)
+os = get_optimal_sampler("model_D03_poisson_localised"; nuts_adapt=100) 
+chn = sample(m, os, 200, nchains=4)
+
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+showall(res.summarystats)
+
+display(res.plots.p_ppc)
+display(res.plots.p_tm)
+display(res.plots.p_seas)
+display(res.plots.p_denoised)
+display(res.plots.p_noisy) 
+
+```
+
+It takes 310 seconds to complete 200 samples. 
+
+Which gives:
+
+``` 
+RMSE: 10181.1341
+Pearson R: 0.1089 (p=0.0)
+Spearman ρ: 0.121
+WAIC: 1.489552542314989e11
+RHAT (mean): 1.5224
+ESS (mean): 0.0318
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+      sigma_sp    0.0355    0.1203    0.0236     7.7670     7.5826    1.0765        0.0251
+        phi_sp    0.6897    0.0751    0.0234    14.2291     8.2144    1.0767        0.0460
+      sigma_tm    0.3708    0.0788    0.0066    67.8181    33.0718    1.0765        0.2194
+        rho_tm    0.2396    0.0758    0.0267     7.7625     7.5826    1.0768        0.0251
+     sigma_int    0.0867    0.1387    0.0447     7.7027     7.5826    1.0776        0.0249
+             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+
+```
+
+
+### model_D10_gaussian
+### model_D11_gaussian_rff
+### model_D12_lognormal 
+### model_D13_binomial 
+### model_D14_negativebinomial
+### model_D15_gaussian_rff_cov
+### model_D16_gaussian_fft
+### model_D17_gaussian_adaptive_rff
+### model_D18_nested_multifidelity_rff
+### model_D19_nested_time_varying_intercept
+### model_D20_stochastic_volatility
+### model_D21_fitc
+### model_D22_fitc_nonlinear_nested_rff
+### model_D23_gptime_fitc
+
+
+Continuous Spatial Models (Deep GP/RFF/SPDE) 
+
+### model_C01_gaussian_dense_gp
+### model_C02_gaussian_deep_gp
+### model_C03_binomial_deep_gp 
+### model_C04_gaussian_deep_gp_3layer
+### model_C05_gaussian_non_separable_rff
+### model_C06_gaussian_spde_rff
+### model_C07_gaussian_nonstationary_warping
+### model_C08_gaussian_refined_mosaic  
+    -- issue: σ >= zero(σ) is not satisfied.
+
+### model_C09_gaussian_integrated_mosaic
+### model_C10_gaussian_fitcxed_fitc_grmf
+### model_C11_svgp
+### model_C12_svgp_full
+### model_C13_multifidelity_gp
+### model_C14_minibatch_mfgp
+### model_C15_deep_gp   
+### model_C16_nystrom 
+    --  matrix not positive definite
+### model_C17_spde
+    -- not positive definite
+### model_C18_kronecker_spde 
+    -- error
+### model_C19_svgp_matern 
+    --  matrix not positive definite
+### model_C20_multifidelity_gp_matern 
+    -- something missing
+### model_C21_multifidelity_gp_matern_sv_seasonal
+    -- something missing
+### model_C22_rff_multifidelity_gp 
+    -- multiplication error
+### model_C23_dfrff_multifidelity_gp 
+    -- Dim mismatch 3 vs 4  
+### model_C24_semi_adaptive_dfrff 
+    -- Dim mismatch 3 vs 4
+### model_C25_hybrid_fitc_rff  
+    -- Dim mismatch 3 vs 4
+
+
  
 ### Non-Intrinsic Poisson Spatiotemporal Model (Leroux CAR)
 
@@ -1104,12 +1690,12 @@ pts_full = repeat(modinputs_reference.pts_raw[1:n_areas_base], n_years_base)
 # Update modinputs_reference for this specific model run
 modinputs_v11 = merge(modinputs_reference, (pts_raw = pts_full,))
 
-mod_v11 = model_v11_non_separable_rff(modinputs_v11; m_joint=20)
+m = model_v11_non_separable_rff(modinputs_v11; m_joint=20)
 
 # Sample using MH for a quick smoke test
-chain_v11 = sample(mod_v11, MH(), 100)
+chn = sample(m, MH(), 100)
 
-display(MCMCChains.summarize(chain_v11[[:sigma_joint, Symbol("l_joint[1]"), Symbol("l_joint[2]"), Symbol("l_joint[3]")]]))
+display(MCMCChains.summarize(chn[[:sigma_joint, Symbol("l_joint[1]"), Symbol("l_joint[2]"), Symbol("l_joint[3]")]]))
 
 ```
 
@@ -1122,15 +1708,15 @@ Instead of the discrete BYM2/ICAR graph structure used in Model v1, Model v12 ad
 
 # Verification of SPDE Model v12
 println("Initializing SPDE Model v12...")
-mod_v12 = model_v12_spde_gaussian(modinputs_gaussian; m_spatial=30)
+m = model_v12_spde_gaussian(modinputs_gaussian; m_spatial=30)
 
 # MAP for rapid convergence
-# map_v12 = maximum_a_posteriori(mod_v12)
+# map_v12 = maximum_a_posteriori(m)
 
 # Short NUTS chain to verify posterior variance
-chain_v12 = sample(mod_v12, MH(), 100) #; initial_params=InitFromParams(map_v12))
+chn = sample(m, MH(), 100) #; initial_params=InitFromParams(map_v12))
 
-summarystats(chain_v12[[:sigma_sp, :kappa_sp, :rho_tm]])
+summarystats(chn[[:sigma_sp, :kappa_sp, :rho_tm]])
 
 ```
 
@@ -1143,15 +1729,15 @@ Standard GP and SPDE models assume **stationarity**: the correlation between two
 
 # Verification of Non-Stationary Warping Model v13
 println("Initializing Non-Stationary Model v13...")
-mod_v13 = model_v13_nonstationary_warping(modinputs_gaussian; m_warp=8, m_spatial=25)
+m = model_v13_nonstationary_warping(modinputs_gaussian; m_warp=8, m_spatial=25)
 
 # MAP Estimate
-# map_v13 = maximum_a_posteriori(mod_v13)
+# map_v13 = maximum_a_posteriori(m)
 
 # Chain verification
-chain_v13 = sample(mod_v13, MH(), 100) #; initial_params=InitFromParams(map_v13))
+chn = sample(m, MH(), 100) #; initial_params=InitFromParams(map_v13))
 
-summarystats(chain_v13[[:l_warp, :l_spatial, :sigma_sp]])
+summarystats(chn[[:l_warp, :l_spatial, :sigma_sp]])
 
 ```
 
@@ -1174,16 +1760,16 @@ using SparseArrays, FFTW, Statistics
 println("Sampling from FFT-Accelerated Model v14...")
 
 # Instantiate model with fixed grid resolution parameters
-mod_v14_final = model_v14_fft_gaussian(modinputs_gaussian; grid_res=64, pad_factor=2)
+m = model_v14_fft_gaussian(modinputs_gaussian; grid_res=64, pad_factor=2)
 
 # Run MH sampler for verification (100 samples)
-chain_v14 = sample(mod_v14_final, MH(), 100)
+chn = sample(m, MH(), 100)
 
 # Display summary of spatial and temporal variance components
-display(MCMCChains.summarize(chain_v14[[:sigma_sp, :sigma_tm, :rho_tm]]))
+display(MCMCChains.summarize(chn[[:sigma_sp, :sigma_tm, :rho_tm]]))
 
 # Reconstruct and visualize
-stats_v14 = reconstruct_posteriors(mod_v14_final, chain_v14, modinputs_gaussian)
+stats_v14 = reconstruct_posteriors(m, chn, modinputs_gaussian)
 plt_v14 = plot_posterior_results(stats_v14, modinputs_gaussian; effect=:spatial)
 title!(plt_v14, "Model v14: FFT-Accelerated Spatial Field")
 display(plt_v14)
@@ -1203,16 +1789,16 @@ using LinearAlgebra, SparseArrays, Random
 
 
 println("Running Refined Mosaic Model v15.1...")
-mod_v15_ref = model_v15_refined_mosaic(modinputs_gaussian; n_mosaics=4, m_rff=15)
+m = model_v15_refined_mosaic(modinputs_gaussian; n_mosaics=4, m_rff=15)
 
 # Calculate MAP to define the variable map_v15_ref
-# map_v15_ref = maximum_a_posteriori(mod_v15_ref)
+# map_v15_ref = maximum_a_posteriori(m)
 
 # Check the distribution of local noise scales using the now-defined map_v15_ref
 # println("Local Noise Scales (MAP): ", [map_v15_ref[Symbol("sigma_y_local[$i]")] for i in 1:4])
 
-chain_v15_ref = sample(mod_v15_ref, MH(), 100) #, initial_params=InitFromParams(map_v15_ref))
-summarystats(chain_v15_ref[[:mu_global, :sigma_mu_local]])
+chn = sample(m, MH(), 100) #, initial_params=InitFromParams(map_v15_ref))
+summarystats(chn[[:mu_global, :sigma_mu_local]])
 
 ```
 
@@ -1238,16 +1824,16 @@ n_years_lip = 10
 pts_full_lip = repeat(modinputs.pts_raw[1:n_areas_lip], n_years_lip)
 lip_inputs_v16 = merge(modinputs, (pts_raw = pts_full_lip,))
 
-mod_v16 = model_v16_integrated_mosaic(lip_inputs_v16; n_mosaics=3, m_rff=15)
+m = model_v16_integrated_mosaic(lip_inputs_v16; n_mosaics=3, m_rff=15)
 
 # Short MH chain for verification
-chain_v16 = sample(mod_v16, MH(), 100)
+chn = sample(m, MH(), 100)
 
 summary_params = [:mu_global, Symbol("sigma_y_local[1]"), Symbol("sigma_y_local[2]")]
-display(summarystats(chain_v16[intersect(summary_params, names(chain_v16))]))
+display(summarystats(chn[intersect(summary_params, names(chn))]))
 
 # Reconstruct and Plot
-stats_v16 = reconstruct_posteriors(mod_v16, chain_v16, lip_inputs_v16)
+stats_v16 = reconstruct_posteriors(m, chn, lip_inputs_v16)
 plt_sp_v16 = plot_posterior_results(stats_v16, lip_inputs_v16; effect=:spatial)
 title!(plt_sp_v16, "Model v16: Integrated Mosaic Spatial Field")
 display(plt_sp_v16)
@@ -3111,11 +3697,10 @@ This model extends A00 by using a non-separable anisotropic kernel for the spati
  
 
 ```{julia}
-data = generate_data(50)
-model_A01 = model_A01_anisotropic_gp(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.coords_space, data.coords_time)
-chain_A01 = sample(model_A01, NUTS(), 100) # Using MH sampler for demonstration, consider NUTS for better sampling
-display(describe(chain_A01))
-waic_A01 = compute_y_waic(model_A01, chain_A01)
+m = model_A01_anisotropic_gp(modinputs_gaussian)
+chn = sample(m, NUTS(), 100) # Using MH sampler for demonstration, consider NUTS for better sampling
+display(describe(chn))
+
 println("WAIC for A01: ", waic_A01)
 ```
 
@@ -3159,12 +3744,11 @@ This model builds upon A01 by replacing the direct computation of the dense kern
 
 
 ```{julia}
-data = generate_data(50)
 M_rff_val = 50 # Number of RFF features
-model_A02 = model_A02_adaptive_rff(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.coords_space, data.coords_time; M_rff=M_rff_val)
-chain_A02 = sample(model_A02, NUTS(), 100) # Using MH sampler for demonstration
-display(describe(chain_A02))
-waic_A02 = compute_y_waic(model_A02, chain_A02)
+m = model_A02_adaptive_rff(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.coords_space, data.coords_time; M_rff=M_rff_val)
+chn = sample(m, NUTS(), 100) # Using MH sampler for demonstration
+
+
 println("WAIC for A02: ", waic_A02)
 ```
 
@@ -3199,13 +3783,10 @@ This model introduces explicit structural assumptions about how covariates influ
 
 
 ```{julia}
-data = generate_data(50)
 M_rff_val = 50 # Number of RFF features
 model_A03 = model_A03_nested_covs(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.coords_space, data.coords_time; M_rff=M_rff_val)
 chain_A03 = sample(model_A03, NUTS(), 100) # Using MH sampler for demonstration; consider NUTS for better sampling
-display(describe(chain_A03))
-waic_A03 = compute_y_waic(model_A03, chain_A03)
-println("WAIC for A03: ", waic_A03)
+
 ```
 
     Samples per chain = 100
@@ -3233,13 +3814,10 @@ This model builds upon A03 by adding a latent temporal process (Random Walk Inte
  
 
 ```{julia}
-data = generate_data(50)
 M_rff_val = 50 # Number of RFF features
 model_A04 = model_A04_time_varying_intercept(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.coords_space, data.coords_time; M_rff=M_rff_val)
 chain_A04 = sample(model_A04, NUTS(), 100) # Using MH sampler for demonstration; consider NUTS for better sampling
-display(describe(chain_A04))
-waic_A04 = compute_y_waic(model_A04, chain_A04)
-println("WAIC for A04: ", waic_A04)
+
 ```
     Samples per chain = 100
     Compute duration  = 1380.22 seconds
@@ -3270,14 +3848,11 @@ This model builds upon A04 by treating the observation noise not as a constant, 
 
 
 ```{julia}
-data = generate_data(50)
 M_rff_val = 50 # Number of RFF features for mean GP
 M_rff_sigma_val = 20 # Number of RFF features for log-variance GP
 model_A05 = model_A05_stochastic_volatility(modinputs; M_rff=M_rff_val, M_rff_sigma=M_rff_sigma_val)
 chain_A05 = sample(model_A05, NUTS(), 100) # Using MH sampler for demonstration; consider NUTS for better sampling
-display(describe(chain_A05))
-waic_A05 = compute_y_waic(model_A05, chain_A05)
-println("WAIC for A05: ", waic_A05)
+
 ```
 
     Samples per chain = 100
@@ -3344,13 +3919,11 @@ Z_inducing_A06 = generate_inducing_points(coords_st_A06, M_inducing_val_A06)
 
 # Sample Model A06 with NUTS
 M_rff_sigma_val_A06 = 20 # Number of RFF features for log-variance GP
-model_A06 = model_A06_fitc(modiputs, Z_inducing_A06; M_rff_sigma=M_rff_sigma_val_A06)
+m = model_A06_fitc(modiputs, Z_inducing_A06; M_rff_sigma=M_rff_sigma_val_A06)
 
 # Using NUTS sampler for better convergence; consider increasing iterations for production runs
-chain_A06 = sample(model_A06, NUTS(), 100) # Increased samples from 100 to 500
-display(describe(chain_A06))
-waic_A06 = compute_y_waic(model_A06, chain_A06)
-println("WAIC for A06: ", waic_A06)
+chn = sample(m, NUTS(), 100) # Increased samples from 100 to 500
+
 
 println("\nNote: For robust results, consider increasing the number of samples (e.g., 1000-2000 or more) and tuning the NUTS parameters (e.g., `adapts=num_adapts_steps`) if convergence issues persist.")
 ```
@@ -3419,14 +3992,11 @@ M_inducing_val_A07_linear = 10 # Number of inducing points
 M_rff_sigma_val_A07_linear = 20 # Number of RFF features for log-variance GP
 
 # Instantiate and sample Model A07_linear with NUTS
-model_A07_fitc_abstractgps_linear_inst = model_A07_fitc_abstractgps_linear(modinputs, Z_inducing; M_rff_sigma=M_rff_sigma_val_A07_linear, M_inducing_val=M_inducing_val_A07_linear)
+m = model_A07_fitc_abstractgps_linear(modinputs, Z_inducing; M_rff_sigma=M_rff_sigma_val_A07_linear, M_inducing_val=M_inducing_val_A07_linear)
 
 # Using NUTS sampler; consider increasing iterations for production runs
-chain_A07_linear = sample(model_A07_fitc_abstractgps_linear_inst, NUTS(), 100) # Reduced samples for faster testing
-display(describe(chain_A07_linear))
-waic_A07_linear = compute_y_waic(model_A07_fitc_abstractgps_linear_inst, chain_A07_linear)
-println("WAIC for A07_linear: ", waic_A07_linear)
-
+chn = sample(m, NUTS(), 100) # Reduced samples for faster testing
+ 
 println("\nNote: For robust results, consider increasing the number of samples (e.g., 1000-2000 or more) and tuning the NUTS parameters (e.g., `adapts=num_adapts_steps`) if convergence issues persist.")
 ```
      
@@ -3512,13 +4082,11 @@ M_rff_u_val = 30 # Number of RFF features for nested covariates
 
 # Sample Model A08 with NUTS
 M_rff_sigma_val_A08 = 20 # Number of RFF features for log-variance GP
-model_A08 = model_A08_fitc_abstractgps_nonlinear(modinputs; M_rff_sigma=M_rff_sigma_val_A08, M_inducing_val=M_inducing_val_A08, M_rff_u=M_rff_u_val)
+m = model_A08_fitc_abstractgps_nonlinear(modinputs; M_rff_sigma=M_rff_sigma_val_A08, M_inducing_val=M_inducing_val_A08, M_rff_u=M_rff_u_val)
 
 # Using NUTS sampler for better convergence; consider increasing iterations for production runs
-chain_A08 = sample(model_A08, NUTS(), 100)
-display(describe(chain_A08))
-waic_A08 = compute_y_waic(model_A08, chain_A08)
-println("WAIC for A08: ", waic_A08)
+chn = sample(m, NUTS(), 100)
+
 
 println("\nNote: For robust results, consider increasing the number of samples (e.g., 1000-2000 or more) and tuning the NUTS parameters (e.g., `adapts=num_adapts_steps`) if convergence issues persist.")
 ```
@@ -3591,9 +4159,7 @@ model_A09 = model_A09_gp_trend(modinputs; M_rff_sigma=M_rff_sigma_val_A09, M_ind
 
 # Using NUTS sampler for better convergence; consider increasing iterations for production runs
 chain_A09 = sample(model_A09, NUTS(), 100)
-display(describe(chain_A09))
-waic_A09 = compute_y_waic(model_A09, chain_A09)
-println("WAIC for A09: ", waic_A09)
+
 
 println("\nNote: For robust results, consider increasing the number of samples (e.g., 1000-2000 or more) and tuning the NUTS parameters (e.g., `adapts=num_adapts_steps`) if convergence issues persist.")
 ```
@@ -3647,9 +4213,6 @@ model_A10 = model_A10_fixed_kmeans_fitc(modinputs, Z_inducing_A10; M_rff_sigma=M
 
 # Using NUTS sampler; consider increasing iterations for production runs
 chain_A10 = sample(model_A10, NUTS(), 100)
-display(describe(chain_A10))
-waic_A10 = compute_y_waic(model_A10, chain_A10)
-println("WAIC for A10: ", waic_A10)
 
 println("\nNote: For robust results, consider increasing the number of samples (e.g., 1000-2000 or more) and tuning the NUTS parameters (e.g., `adapts=num_adapts_steps`) if convergence issues persist.")
 ```
@@ -3724,9 +4287,7 @@ model_A11 = model_A11_svgp(modinputs; M_rff_sigma=M_rff_sigma_val_A11, M_inducin
 
 # Using NUTS sampler; consider increasing iterations for production runs
 chain_A11 = sample(model_A11, NUTS(), 100) # Reduced samples from 500 to 100 for faster testing
-display(describe(chain_A11))
-waic_A11 = compute_y_waic(model_A11, chain_A11)
-println("WAIC for A11: ", waic_A11)
+
 
 println("\nNote: For robust results, consider increasing the number of samples (e.g., 1000-2000 or more) and tuning the NUTS parameters (e.g., `adapts=num_adapts_steps`) if convergence issues persist.")
 ```
@@ -3768,9 +4329,6 @@ model_A12 = model_A12_svgp_full(modinputs; M_rff_sigma=M_rff_sigma_val_A12, M_in
 
 # Using NUTS sampler; consider increasing iterations for production runs
 chain_A12 = sample(model_A12, NUTS(), 100) # Reduced samples for faster testing
-display(describe(chain_A12))
-waic_A12 = compute_y_waic(model_A12, chain_A12)
-println("WAIC for A12: ", waic_A12)
 
 println("\nNote: For robust results, consider increasing the number of samples (e.g., 1000-2000 or more) and tuning the NUTS parameters (e.g., `adapts=num_adapts_steps`) if convergence issues persist. This model has a significantly larger parameter space, which may lead to slower sampling and more complex convergence behavior.")
 ```
@@ -3938,8 +4496,7 @@ This model implements the Nyström Approximation to the Gaussian Process. The Ny
 model_A16 = model_A16_nystrom(modinputs)
 chain_A16 = sample(model_A16, NUTS(), 100) 
 display(describe(chain_A16))
-waic_A16 = compute_y_waic(model_A16_inst, chain_A16)
-println("\nWAIC for A16 (Nystr&#246;m): ", waic_A16)
+
 
 ```
 
@@ -3969,9 +4526,7 @@ This model implements an SPDE Approximation for the spatial component. While a f
 # Instantiate and test model_A17_spde
 model_A17 = model_A17_spde(modinputs)
 chain_A17 = sample(model_A17, NUTS(), 100)
-display(describe(chain_A17))
-waic_A17 = compute_y_waic(model_A17, chain_A17)
-println("WAIC for A17 (SPDE): ", waic_A17)
+
 
 ```
 
@@ -4000,9 +4555,7 @@ This model builds upon A17 by replacing the additive seasonal and trend componen
 # Sample model_A18_kronecker_spde
 model_A18 = model_A18_kronecker_spde( modinputs )
 chain_A18 = sample(model_A18, NUTS(), 100)
-display(describe(chain_A18))
-waic_A18 = compute_y_waic(model_A18, chain_A18)
-println("\nWAIC for A18 (Kronecker SPDE): ", waic_A18)
+
 ```
 
 ## A19: SVGP with Kronecker Matern Kernel
@@ -4028,9 +4581,7 @@ This model builds upon A18's Kronecker Spatiotemporal SPDE approximation for the
 ```{julia}
 model_A19 = model_A19_svgp_matern(modinputs; period=12.0, M_rff_sigma=20, M_rff_u=30)
 chain_A19 = sample(model_A19, NUTS(), 100)
-display(describe(chain_A19))
-waic_A19 = compute_y_waic(model_A19, chain_A19)
-println("\nWAIC for A19: ", waic_A19)
+
 ```
 
 ## A20: Multi-fidelity Kronecker Matern GP
@@ -4068,9 +4619,7 @@ model_A20 = model_A20_multifidelity_gp_matern(modinputs)
 
 println("Starting sampling for Model A20 (Multi-fidelity Kronecker Matern)... ")
 chain_A20 = sample(model_A20, NUTS(), 100)
-display(describe(chain_A20))
-waic_A20 = compute_y_waic(model_A20, chain_A20)
-println("\nWAIC for A20: ", waic_A20)
+
 
 ```
 
@@ -4226,9 +4775,7 @@ display(p)
 ```{julia}
 model_A21 = model_A21_multifidelity_gp_matern_sv_seasonal( modinputs, coords_u_s, coords_u_t, coords_z_s )
 chain_A21 = sample(model_A21, NUTS(), 100)
-display(describe(chain_A21))
-waic_A21 = compute_y_waic(model_A21, chain_A21)
-println("\nWAIC for A21: ", waic_A21)
+
 ```
 
     Samples per chain = 100
@@ -4269,9 +4816,7 @@ This model builds upon the multi-fidelity concept by employing Random Fourier Fe
 
 model_A22 = model_A22_rff_multifidelity_gp(modinputs )
 chain_A22 = sample(model_A22, NUTS(), 100) # Reduced samples for faster testing
-display(describe(chain_A22))
-waic_A22 = compute_y_waic(model_A22, chain_A22)
-println("\nWAIC for A22: ", waic_A22)
+
 ```
 
 
@@ -4373,9 +4918,7 @@ model_instance = model_A24_semi_adaptive_dfrff_multifidelity_gp(modinputs)
 println("Starting NUTS sampling for Model A24 (Semi-Adaptive DFRFF)... ")
 chain_a24 = sample(model_instance, NUTS(0.65), 100)
  
-display(summarize(chain_a24))
-waic_A24 = compute_y_waic(model_A24, chain_A24)
-println("\nWAIC for A24: ", waic_A24)
+
 
 ``` 
 
@@ -4410,10 +4953,7 @@ model_instance = model_A25_hybrid_fitc_rff(modinputs)
 
 println("Starting NUTS sampling for Model A25...")
 chain_a25 = sample(model_instance, NUTS(0.65), 100)
- 
-display(summarize(chain_a25))
-
-waic_A25 = compute_y_waic(model_A25, chain_A25)
+  
 ```
 
 

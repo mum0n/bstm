@@ -2006,86 +2006,88 @@ function scottish_lip_cancer_data_spacetime(n_years::Int=10; rndseed::Int=42)
     )
 end
 
- 
 
  
-function get_optimal_sampler(model_key::String; nuts_adapt=1, target_acceptance=target_acceptance, pg_particles=10)
-    # Mathematically optimized Gibbs sampler mapping for the CARSTM suite.
-    # Partitions parameters into blocks to maximize Effective Sample Size (ESS).
+function get_optimal_sampler(model_key::String; nuts_adapt=10, target_acc=0.8, pg_particles=40)
+    # Optimized Gibbs configurations aligned exactly with model_list registry keys
 
     samplers = Dict(
         # --- D-Series: Discrete Spatial Models (GMRF/BYM2) ---
-        "D00_poisson_simple"      => Gibbs((:u_icar, :u_iid, :f_tm_raw) => ESS(), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm) => MH()),
-        "D01_poisson"             => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
-        "D02_gaussian"            => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
-        "D03_gaussian_rff"        => Gibbs((:u_icar, :u_iid, :w_trend, :w_seas, :st_int_raw) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :phi_sp, :sigma_trend, :sigma_seas, :sigma_int, :sigma_rw2) => MH()),
-        "D04_lognormal"           => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
-        "D05_binomial"            => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
-        "D06_negbin"              => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:r_nb, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
-        "D07_gaussian_rff_cov"    => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw, :W_cov_raw) => ESS(), (:lengthscale_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_cov) => MH()),
-        "D08_gaussian_fft"        => Gibbs((:u_spectral_raw, :u_iid, :f_tm_raw) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()),
-        "D09_adaptive_rff_bym2"   => Gibbs((:beta_rff, :u_icar, :u_iid) => ESS(), (:W_matrix, :b_phases, :beta_z, :beta_u, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
-        "D10_nested_multifid_rff" => Gibbs((:beta_rff, :u_icar, :u_iid) => ESS(), (:W_matrix, :beta_z, :beta_u_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_u, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
-        "D11_tv_intercept_bym2"   => Gibbs((:beta_rff, :u_icar, :u_iid) => ESS(), (:alpha_rw, :beta_z, :beta_u_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_alpha, :sigma_f, :sigma_sp, :sigma_rw2) => MH()),
-        "D12_stochastic_vol"      => Gibbs((:beta_rff_mean, :beta_rff_vol, :u_icar, :u_iid) => ESS(), (:alpha_rw, :beta_z, :beta_u_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_log_var, :sigma_f, :sigma_sp, :sigma_rw2) => MH()),
-        "D13_fitc_bym2"           => Gibbs((:u_inducing, :u_icar, :u_iid) => ESS(), (:ls_st, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
-        "D14_fitc_nonlinear"      => Gibbs((:u_inducing, :beta_rff_u1, :beta_rff_u2, :beta_rff_u3, :f_gp) => ESS(), (:Z_inducing, :ls_st, :beta_z, :beta_u_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_log_var, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
-        "D15_gptime_fitc"         => Gibbs((:alpha_gp, :u_inducing, :f_gp) => ESS(), (:Z_inducing, :ls_st, :ls_trend, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_trend, :sigma_sp, :sigma_rw2) => MH()),
+        "model_D00_poisson_simple"      => Gibbs((:u_icar, :u_iid, :f_tm_raw) => ESS(), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm) => MH()),
+        "model_D01_poisson"             => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D02_poisson_leroux"      => Gibbs((:phi_leroux, :f_tm_raw, :st_int_raw) => ESS(),  (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:tau_leroux, :rho_leroux, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D03_poisson_localised"   => Gibbs((:s_eff, :f_tm_raw, :st_int_raw) => ESS(),  (:phi_zi) => PG(pg_particles), (:mu_global, :sigma_cluster, :mu_clusters, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:tau_sp, :rho_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D04_poisson_sar"         => Gibbs((:s_eff, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :rho_sar, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D05_poisson_mcar"        => Gibbs((:u_raw, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(40), (:L_corr, :beta_cov) => Turing.NUTS(10, 0.8), (:sigma_outcome, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D06_poisson_svc"         => Gibbs((:W_svc_raw, :u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_svc, :corr_svc, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D07_poisson_dag"         => Gibbs((:s_raw, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :rho_dag, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D08_poisson_hurdle"      => Gibbs((:u_icar_h, :u_iid_h, :f_tm_h, :u_icar_c, :u_iid_c, :f_tm_c) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp_h, :phi_sp_h, :sigma_tm_h, :rho_tm_h, :sigma_sp_c, :phi_sp_c, :sigma_tm_c, :rho_tm_c, :sigma_rw2) => MH()),
+        "model_D09_poisson_ei"          => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw, :beta_rff) => ESS(), (:phi_zi) => PG(pg_particles), (:W_rff, :b_rff, :ls_rff, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_f_rff, :sigma_int, :sigma_rw2) => MH()),
+        "model_D10_gaussian"            => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D11_gaussian_rff"        => Gibbs((:u_icar, :u_iid, :w_trend, :w_seas, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :phi_sp, :sigma_trend, :sigma_seas, :sigma_int, :sigma_rw2) => MH()),
+        "model_D12_lognormal"           => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D13_binomial"            => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D14_negbin"              => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:r_nb, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D15_gaussian_rff_cov"    => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw, :W_cov_raw) => ESS(), (:lengthscale_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_cov) => MH()),
+        "model_D16_gaussian_fft"        => Gibbs((:u_spectral_raw, :u_iid, :f_tm_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()),
+        "model_D17_adaptive_rff_bym2"   => Gibbs((:beta_rff, :u_icar, :u_iid) => ESS(), (:phi_zi) => PG(pg_particles), (:W_matrix, :b_phases, :beta_z, :beta_u, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "model_D18_nested_multifid_rff" => Gibbs((:beta_rff, :u_icar, :u_iid) => ESS(), (:phi_zi) => PG(pg_particles), (:W_matrix, :b_phases, :beta_z, :beta_u_main, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_u, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "model_D19_tv_intercept_bym2"   => Gibbs((:beta_rff, :u_icar, :u_iid) => ESS(), (:phi_zi) => PG(pg_particles), (:alpha_rw, :beta_z, :beta_u_main, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_alpha, :sigma_f, :sigma_sp, :sigma_rw2) => MH()),
+        "model_D20_stochastic_vol"      => Gibbs((:beta_rff_mean, :beta_rff_vol, :u_icar, :u_iid) => ESS(), (:phi_zi) => PG(pg_particles), (:alpha_rw, :beta_z, :beta_u_main, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_log_var, :sigma_f, :sigma_sp, :sigma_rw2) => MH()),
+        "model_D21_fitc_bym2"           => Gibbs((:u_inducing, :u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:ls_st, :beta_cos, :beta_sin, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_f, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D22_fitc_nonlinear"      => Gibbs((:u_inducing, :f_gp, :beta_rff_u1, :beta_rff_u2, :beta_rff_u3, :beta_rff_vol, :u_icar, :u_iid) => ESS(), (:phi_zi) => PG(pg_particles), (:Z_inducing, :ls_st, :W_vol, :b_vol, :beta_z, :beta_u_main, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "model_D23_gptime_fitc"         => Gibbs((:alpha_gp, :u_inducing, :f_gp, :beta_rff_u1, :beta_rff_u2, :beta_rff_u3, :beta_rff_vol, :u_icar, :u_iid) => ESS(), (:phi_zi) => PG(pg_particles), (:ls_trend, :ls_st, :W_vol, :b_vol, :beta_z, :beta_u_main, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_trend, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
 
         # --- C-Series: Continuous Spatial Models (Deep GP/RFF/SPDE) ---
-        "C01_dense_gp"            => Gibbs((:f_latent) => ESS(), (:ls_s, :ls_t, :beta_cos, :beta_sin, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_f, :sigma_rw2) => MH()),
-        "C02_deep_gp"             => Gibbs((:w1, :w2) => ESS(), (:l1, :l2, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_rw2) => MH()),
-        "C03_binomial_deep_gp"    => Gibbs((:w1, :w2) => ESS(), (:lengthscale1, :lengthscale2, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_rw2) => MH()),
-        "C04_deep_gp_3layer"      => Gibbs((:w1, :w2, :w3) => ESS(), (:l1, :l2, :l3, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_rw2) => MH()),
-        "C05_non_separable_rff"   => Gibbs((:w_joint) => ESS(), (:l_joint, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_joint, :sigma_rw2) => MH()),
-        "C06_spde_rff"            => Gibbs((:w_sp, :f_tm_raw) => ESS(), (:kappa_sp, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()),
-        "C07_nonstationary_warp"  => Gibbs((:w_warp, :w_sp, :f_tm_raw) => ESS(), (:l_warp, :l_spatial, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()),
-        "C08_refined_mosaic"      => Gibbs((:w_local) => ESS(), (:mu_local, :l_local, :mu_global, :sigma_mu_local, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_rw2, :sigma_local, :sigma_y_local) => MH()),
-        "C09_integrated_mosaic"   => Gibbs((:w_local) => ESS(), (:mu_local, :l_joint, :mu_global, :sigma_mu_local, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_rw2, :sigma_local, :sigma_y_local) => MH()),
-        "C10_fitc_gmrf_hybrid"    => Gibbs((:alpha_gp, :u_inducing, :f_gp) => ESS(), (:ls_st, :ls_trend, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_trend, :sigma_sp, :sigma_rw2) => MH()),
-        "C11_svgp_learned"        => Gibbs((:u_inducing, :f_gp) => ESS(), (:Z_inducing, :ls_st, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_f, :sigma_sp, :sigma_rw2) => MH()),
-        "C12_svgp_full"           => Gibbs((:u_latent) => ESS(), (:Z_inducing, :m_u, :s_u_diag, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:ls_st, :sigma_y, :sigma_rw2) => MH()),
-        "C13_multifidelity_gp"    => Gibbs((:beta_z_rff, :beta_u1, :beta_u2, :beta_u3, :u_icar, :u_iid) => ESS(), (:W_z, :W_u, :beta_y_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_z, :sigma_u, :sigma_sp, :sigma_y) => MH()),
-        "C14_minibatch_mfgp"      => Gibbs((:beta_z_rff, :beta_u1, :beta_u2, :beta_u3, :u_icar, :u_iid) => ESS(), (:W_z, :W_u, :beta_y_main, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_z, :sigma_u, :sigma_sp, :sigma_y) => MH()),
-        "C15_deep_gp_rff"         => Gibbs((:beta_z, :beta_u_mat, :beta_y_gp, :u_icar, :u_iid) => ESS(), (:W_z, :W_u, :W_y, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :sigma_z, :sigma_rw2) => MH()),
-        "C16_nystrom_sv"          => Gibbs((:v_latent, :beta_rff_sigma, :u_icar, :u_iid) => ESS(), (:Z_ind, :ls_st, :W_sigma, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_f, :sigma_sp, :sigma_u, :sigma_rw2) => MH()),
-        "C17_spde_trend"          => Gibbs((:alpha, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:ls_trend, :W_sigma, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_trend, :sigma_sp, :sigma_rw2) => MH()),
-        "C18_kron_spde"           => Gibbs((:z_noise, :u1_noise, :y_noise, :u_icar, :u_iid) => ESS(), (:ls_s_cov, :ls_t_cov, :ls_s_y, :ls_t_y, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_s_cov, :sigma_s_y, :sigma_sp, :sigma_rw2) => MH()),
-        "C19_svgp_matern"         => Gibbs((:y_noise, :u_icar, :u_iid) => ESS(), (:ls_s_y, :ls_t_y, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_s_y, :sigma_sp, :sigma_rw2) => MH()),
-        "C20_mf_gp_matern"        => Gibbs((:z_latent, :u1_noise, :y_noise, :u_icar, :u_iid) => ESS(), (:ls_z, :ls_s_u, :ls_s_y, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :sigma_rw2) => MH()),
-        "C21_mf_sv_seasonal"      => Gibbs((:z_latent, :u1_noise, :y_noise, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:ls_z, :ls_s_u, :ls_s_y, :W_sigma, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_y, :sigma_sp, :sigma_rw2) => MH()),
-        "C22_rff_mf_gp"           => Gibbs((:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:W_z, :W_u, :W_y_gp, :W_sigma, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_z_f, :sigma_u_f, :sigma_sp, :sigma_rw2) => MH()),
-        "C23_dfrff_mf_gp"         => Gibbs((:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_z_f, :sigma_u_f, :sigma_y_gp_f, :sigma_sp, :sigma_rw2) => MH()),
-        "C24_semi_adaptive_rff"   => Gibbs((:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:W_z, :W_u, :W_y_gp, :W_sigma, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_W_z, :sigma_W_u, :sigma_sp, :sigma_rw2) => MH()),
-        "C25_hybrid_fitc_rff"     => Gibbs((:beta_z, :beta_u, :u_latent_gp) => ESS(), (:W_z, :b_z, :W_u, :b_u, :ls_y, :beta_cov) => NUTS(nuts_adapt, target_acceptance), (:sigma_z_f, :sigma_u_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH())
+        "model_C01_dense_gp"            => Gibbs((:f_latent) => ESS(), (:ls_s, :ls_t, :beta_cos, :beta_sin, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_f, :sigma_rw2) => MH()),
+        "model_C02_deep_gp"             => Gibbs((:w1, :w2) => ESS(), (:l1, :l2, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_rw2) => MH()),
+        "model_C03_binomial_deep_gp"    => Gibbs((:w1, :w2) => ESS(), (:lengthscale1, :lengthscale2, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_rw2) => MH()),
+        "model_C04_deep_gp_3layer"      => Gibbs((:w1, :w2, :w3) => ESS(), (:l1, :l2, :l3, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_rw2) => MH()),
+        "model_C05_non_separable_rff"   => Gibbs((:w_joint) => ESS(), (:l_joint, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_joint, :sigma_rw2) => MH()),
+        "model_C06_spde_rff"            => Gibbs((:w_sp, :f_tm_raw) => ESS(), (:kappa_sp, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()),
+        "model_C07_nonstationary_warp"  => Gibbs((:w_warp, :w_sp, :f_tm_raw) => ESS(), (:l_warp, :l_spatial, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :sigma_tm, :rho_tm, :sigma_rw2) => MH()),
+        "model_C08_refined_mosaic"      => Gibbs((:w_local) => ESS(), (:mu_local, :l_local, :mu_global, :sigma_mu_local, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_rw2, :sigma_local, :sigma_y_local) => MH()),
+        "model_C09_integrated_mosaic"   => Gibbs((:w_local) => ESS(), (:mu_local, :l_joint, :mu_global, :sigma_mu_local, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_rw2, :sigma_local, :sigma_y_local) => MH()),
+        "model_C10_fitc_gmrf_hybrid"    => Gibbs((:alpha_gp, :u_inducing, :f_gp) => ESS(), (:ls_st, :ls_trend, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_trend, :sigma_sp, :sigma_rw2) => MH()),
+        "model_C11_svgp_learned"        => Gibbs((:u_inducing, :f_gp, :alpha_gp, :beta_rff_u1, :beta_rff_u2, :beta_rff_u3, :beta_rff_vol, :u_icar, :u_iid) => ESS(), (:Z_inducing, :ls_st, :ls_trend, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_f, :sigma_sp, :sigma_rw2) => MH()),
+        "model_C12_svgp_full"           => Gibbs((:u_latent, :alpha_gp, :beta_rff_u1, :beta_rff_u2, :beta_rff_u3, :beta_rff_vol, :u_icar, :u_iid) => ESS(), (:Z_inducing, :m_u, :s_u_diag, :ls_st, :ls_trend, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_f, :sigma_sp, :sigma_y, :sigma_rw2) => MH()),
+        "model_C13_multifidelity_gp"    => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw, :beta_z_rff, :beta_u_rff) => ESS(), (:W_z, :b_z, :W_u, :b_u, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2, :sigma_z, :sigma_u) => MH()),
+        "model_C14_minibatch_mfgp"      => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_C15_deep_gp_rff"         => Gibbs((:beta_z, :beta_u_mat, :beta_y_gp, :u_icar, :u_iid) => ESS(), (:W_z, :b_z, :W_u, :b_u, :W_y, :b_y, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :phi_sp, :sigma_z, :sigma_u, :sigma_rw2) => MH()),
+        "model_C16_nystrom_sv"          => Gibbs((:v_latent, :beta_rff_sigma, :u_icar, :u_iid, :u1_coeff) => ESS(), (:ls_st, :W_sigma, :b_sigma, :W_u1, :b_u1, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_f, :sigma_sp, :phi_sp, :sigma_u, :sigma_rw2) => MH()),
+        "model_C17_spde_trend"          => Gibbs((:alpha, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:ls_trend, :W_sigma, :b_sigma, :W_u1, :b_u1, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_trend, :sigma_sp, :phi_sp, :sigma_u, :sigma_rw2) => MH()),
+        "model_C18_kron_spde"           => Gibbs((:u_icar, :u_iid, :y_noise, :z_noise, :u1_noise) => ESS(), (:ls_s_y, :ls_t_y, :ls_s_cov, :ls_t_cov, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :phi_sp, :sigma_s_y, :sigma_t_y, :sigma_s_cov, :sigma_t_cov, :sigma_rw2) => MH()),
+        "model_C19_svgp_matern"         => Gibbs((:u_icar, :u_iid, :y_noise) => ESS(), (:ls_s_y, :ls_t_y, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :phi_sp, :sigma_s_y, :sigma_t_y, :sigma_rw2) => MH()),
+        "model_C20_mf_gp_matern"        => Gibbs((:z_latent, :u1_noise, :y_noise, :u_icar, :u_iid) => ESS(), (:ls_z, :ls_s_u, :ls_s_y, :beta_uz, :beta_y, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "model_C21_mf_sv_seasonal"      => Gibbs((:z_latent, :u1_noise, :y_noise, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:ls_z, :ls_s_u, :ls_s_y, :W_sigma, :b_sigma, :beta_y_covs, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "model_C22_rff_mf_gp"           => Gibbs((:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:W_z, :b_z, :W_u, :b_u, :W_y_gp, :b_y_gp, :W_sigma, :b_sigma, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_z_f, :sigma_u_f, :sigma_y_gp_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "model_C23_dfrff_mf_gp"         => Gibbs((:beta_z, :beta_u, :beta_y_gp, :u_icar, :u_iid) => ESS(), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_z_f, :sigma_u_f, :sigma_y, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "model_C24_semi_adaptive_rff"   => Gibbs((:u_icar, :u_iid) => ESS(), (:W_z, :W_u, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_W_z, :sigma_W_u, :sigma_y, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+        "model_C25_hybrid_fitc_rff"     => Gibbs((:beta_z, :u_inducing, :u_icar, :u_iid) => ESS(), (:ls_st, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_z_f, :sigma_f, :sigma_y, :sigma_sp, :phi_sp, :sigma_rw2) => MH())
     )
 
-    # Fallback to standard NUTS for complex variants without custom recipes
-    return get(samplers, model_key, NUTS(nuts_adapt, target_acceptance))
+    return get(samplers, model_key, Turing.NUTS(nuts_adapt, target_acc))
 end
 
-
-
+ 
 function kron_matern_sample(Ns, Nt, unique_s, unique_t, ls_s, sigma_s, ls_t, sigma_t, noise_vec)
-    # Helper to sample a spatiotemporal field using Kronecker product of precision matrices
     # Spatial Precision
     k_s = Matern32Kernel() ∘ ScaleTransform(inv(ls_s))
-    K_s = sigma_s^2 * kernelmatrix(k_s, RowVecs(unique_s)) + 1e-6*I
-    Q_s = sparse(inv(K_s))
+    K_s = Symmetric(sigma_s^2 * kernelmatrix(k_s, RowVecs(unique_s)) + 1e-4*I)
+    Q_s = inv(K_s)
 
     # Temporal Precision
     k_t = Matern32Kernel() ∘ ScaleTransform(inv(ls_t))
-    K_t = sigma_t^2 * kernelmatrix(k_t, unique_t) + 1e-6*I
-    Q_t = sparse(inv(K_t))
+    K_t = Symmetric(sigma_t^2 * kernelmatrix(k_t, unique_t) + 1e-4*I)
+    Q_t = inv(K_t)
 
-    # Full Kronecker Precision
-    Q_full = Symmetric(kron(Q_t, Q_s))
-    L_q = cholesky(Q_full + 1e-6*I)
+    # Full Kronecker Precision (Dense for AD compatibility)
+    Q_full = Symmetric(Matrix(kron(Q_t, Q_s)) + 1e-4*I)
+    L_q = cholesky(Q_full)
 
     # Sample: f = (L')^-1 * noise
-    return L_q.PtL' \ noise_vec
+    return L_q.U \ noise_vec
 end
-
 
 
 function get_posterior_means(ch, param_base, N)
@@ -2335,44 +2337,7 @@ function variational_inference_solution(m; max_iters=100, nsamps=max_iters,  nel
  
 end
 
- 
-function compute_y_waic(mod, ch)
-    # Description:
-    #   Calculates the Widely Applicable Information Criterion (WAIC)
-    #   for model selection using pointwise log-likelihoods.
-    # Inputs:
-    #   mod: The Turing model instance.
-    #   ch: The MCMCChains object containing posterior samples.
-    # Outputs:
-    #   WAIC value (Scalar).
-
-    try
-        pointwise_ll = pointwise_loglikelihoods(mod, ch)
-        # Identify keys associated with the response variable
-        y_keys = [k for k in keys(pointwise_ll) if occursin("y_obs", string(k))]
-        
-        if isempty(y_keys)
-            return NaN
-        end
-
-        # Concatenate log-likelihoods across samples
-        loglik_matrix = hcat([vec(pointwise_ll[k]) for k in y_keys]...)
-        
-        # Log-pointwise predictive density
-        lppd = sum(log.(mean(exp.(loglik_matrix), dims=1)))
-        
-        # Effective number of parameters
-        p_waic = sum(var(loglik_matrix, dims=1))
-        
-        return -2 * (lppd - p_waic)
-    catch e
-        return NaN
-    end
-end
-
-
- 
-
+  
 
 
 function rff_map(coords, W, b)
@@ -2637,6 +2602,7 @@ function summarize_array(samples::AbstractArray; alpha=0.05)
         upper = dropdims(high_bound, dims=n_dims)
     )
 end
+ 
 
 
 # --- 1. Custom PC Priors ---
@@ -2786,63 +2752,6 @@ function detect_model_family(model::DynamicPPL.Model)
 end
 
 
-function posterior_predictive_check(model::DynamicPPL.Model, stats, y_obs)
-    # Description: Performs Posterior Predictive Checks (PPC), computing metrics like RMSE, Pearson R, and Kendall Tau.
-    # Inputs:
-    #   - model: Turing model object.
-    #   - stats: summarized results from reconstruct_posteriors.
-    #   - y_obs: Vector of ground-truth observations.
-    # Outputs:
-    #   - NamedTuple of metrics and Plots.Plot objects for density and scatter checks.
-
-    # 1. Automatically detect family from model if not explicitly in stats
-    family = haskey(stats, :family) ? stats.family : detect_model_family(model)
-    # Ensure y_pred is a 1D vector for calculation compatibility
-    y_pred = vec(stats.predictions.mean)
-
-    # 2. Basic Metrics
-    rmse = sqrt(mean((y_obs .- y_pred).^2))
-
-    # Correlation metrics with p-values from HypothesisTests
-    pearson_val = 0.0; pearson_p = 1.0
-    kendall_val = 0.0; kendall_p = 1.0
-
-    if length(unique(y_pred)) > 1 && length(unique(y_obs)) > 1
-        try
-            # Use explicit module referencing for reliability
-            p_test = HypothesisTests.CorrelationTest(y_obs, y_pred)
-            pearson_val = p_test.r
-            pearson_p = HypothesisTests.pvalue(p_test)
-
-            # Replaced Spearman with Kendall's Tau
-            k_test = HypothesisTests.KendallTauTest(y_obs, y_pred)
-            kendall_val = k_test.tau
-            kendall_p = HypothesisTests.pvalue(k_test)
-        catch e
-            @warn "Hypothesis tests failed. Ensure HypothesisTests is correctly loaded."
-        end
-    end
-
-    println("--- PPC for Family: $family ---")
-    println("RMSE: ", round(rmse, digits=4))
-    println("Pearson R: ", round(pearson_val, digits=4), " (p=", round(pearson_p, digits=4), ")")
-    println("Kendall τ: ", round(kendall_val, digits=4), " (p=", round(kendall_p, digits=4), ")")
-
-    # 3. Density Visualization
-    plt_density = StatsPlots.density(y_obs, label="Observed", lw=2, color=:black)
-    StatsPlots.density!(plt_density, y_pred, label="Predicted (Denoised)", lw=2, color=:blue, ls=:dash)
-    title!(plt_density, "PPC: Posterior Predictive Density ($family)")
-    xlabel!(plt_density, "Value")
-    ylabel!(plt_density, "Density")
-
-    # 4. Scatterplot of Observed vs. Predicted
-    plt_scatter = Plots.scatter(y_obs, y_pred, alpha=0.3, label="Observed vs Predicted",
-                          xlabel="Observed", ylabel="Predicted", title="PPC: Model Fit Scatter ($family)")
-    Plots.plot!(plt_scatter, [minimum(y_obs), maximum(y_obs)], [minimum(y_obs), maximum(y_obs)],
-          lc=:red, ls=:dash, label="Identity")
-
-    return (rmse=rmse, pearson=(val=pearson_val, p=pearson_p), kendall=(val=kendall_val, p=kendall_p), plot_density=plt_density, plot_scatter=plt_scatter)
-end
 
 
 function plot_posterior_results(stats, modinputs=nothing, areal_units=nothing; pts=nothing, time_slice=nothing, effect=:spatial, cov_idx=1, show_pts=false)
@@ -2970,33 +2879,6 @@ function plot_posterior_vs_prior(model::DynamicPPL.Model, chain::MCMCChains.Chai
 end
 
 
-
-function calculate_st_intervals(stats; alpha=0.05)
-    # Description: Calculates credible intervals for Spatio-Temporal matrices (Placeholder implementation).
-    # Inputs:
-    #   - stats: summarized results from reconstruct_posteriors.
-    # Outputs:
-    #   - NamedTuple: (mean, lower, upper).
-
-    # This function assumes stats contains the required matrices
-    # In a full Bayesian implementation, this would iterate over multiple samples,
-    # but here we provide the structure based on the current stats object.
-    
-    N_areas, N_time = size(stats.st_mat_denoised)
-    
-    # If stats only contains point estimates, we return those.
-    # For true credible intervals, we would need the full sample 3D-array.
-    
-    lower_q = alpha / 2
-    upper_q = 1 - alpha / 2
-    
-    println("Note: Credible intervals for ST effects currently return point estimates.")
-    println("To calculate full Bayesian CIs, pass the full sample array from the chain.")
-    
-    return (mean = stats.st_mat_denoised, 
-            lower = stats.st_mat_denoised, 
-            upper = stats.st_mat_denoised)
-end
 
 
 # --- 1. MODEL UTILITIES ---
@@ -3291,69 +3173,6 @@ end
  
 
 
-
-function model_results_comprehensive(model, chain, modinputs, areal_units; alpha=0.05, time_slice=1)
-    # Synopsis: Comprehensive diagnostic and visualization suite for CARSTM models.
-    # Inputs: model (Turing), chain (MCMCChains), modinputs (NamedTuple)
-
-    # 1. Basic Diagnostics
-    sum_stats = summarystats(chain)
-    min_ess = minimum(sum_stats[:, :ess_bulk])
-    max_rhat = maximum(sum_stats[:, :rhat])
-
-    # 2. Reconstruct Posteriors using the refactored logic, passing alpha for CIs
-    stats = reconstruct_posteriors(model, chain, modinputs; alpha=alpha)
-
-    # 3. Accuracy Metrics
-    y_pred = vec(stats.predictions.mean)
-    y_obs = modinputs.y
-    rmse = sqrt(mean((y_obs .- y_pred).^2))
-    mae = mean(abs.(y_obs .- y_pred))
-    corr_p = cor(y_obs, y_pred)
-
-    # 4. Coverage Probability (using CIs determined by alpha)
-    low_bound = vec(stats.predictions.lower)
-    high_bound = vec(stats.predictions.upper)
-    coverage = mean((y_obs .>= low_bound) .& (y_obs .<= high_bound))
-
-    # 5. Visualizations and Diagnostics
-    # Standard PPC (Density and Scatter)
-    ppc = posterior_predictive_check(model, stats, y_obs)
-
-    # Spatial Main Effect
-    plt_sp = plot_posterior_results(stats, modinputs, areal_units; effect=:spatial)
-    title!(plt_sp, "Main Spatial Effect ($(100(1-alpha))% CI)")
-
-    # Temporal Time-Series Plot
-    plt_tm = plot_posterior_results(stats, modinputs, areal_units; effect=:temporal)
-    title!(plt_tm, "Temporal Main Effect Trend")
-
-    # Denoised Predictions for specific time slice
-    plt_st_denoised = plot_posterior_results(stats, modinputs, areal_units; effect=:st_mat_denoised, time_slice=time_slice)
-    title!(plt_st_denoised, "Denoised Predictions (Time: $time_slice)")
-
-    plt_st_noisy = plot_posterior_results(stats, modinputs, areal_units; effect=:st_mat_noisy, time_slice=time_slice)
-    title!(plt_st_noisy, "Noisy Predictions (Time: $time_slice)")
-
-    # Calculate WAIC
-    waic_val = waic_compute(model, chain, modinputs)
-
-    return (
-        summarystats = sum_stats,
-        min_ess = min_ess,
-        max_rhat = max_rhat,
-        rmse = rmse,
-        mae = mae,
-        pearson_r = corr_p,
-        waic = waic_val,
-        coverage_prob = coverage,
-        st_intervals = (mean=stats.st_mat_denoised.mean, lower=stats.st_mat_denoised.lower, upper=stats.st_mat_denoised.upper),
-        plots = (ppc=ppc, spatial=plt_sp, temporal=plt_tm, st_denoised=plt_st_denoised, st_noisy=plt_st_noisy),
-        stats_raw = stats
-    )
-end
- 
-
 # -----------------------
 
 
@@ -3544,33 +3363,35 @@ function assign_spatial_units_inferred(adjacency_matrix; iterations=50, learning
     """
 end
 
-
 function waic_compute(model::DynamicPPL.Model, chain::MCMCChains.Chains, modinputs; use_weights=true)
     """
     Consolidated WAIC calculation function.
     1. Attempts native Turing pointwise log-likelihood extraction.
     2. Falls back to manual reconstruction if native fails.
-    3. Automatically detects model type (AR1, RFF, Deep GP) and likelihood family.
+    3. Dynamically handles BYM2 (u_icar), Leroux (phi_leroux), and SAR/DAG (s_eff) spatial effects.
     """
     N_obs = length(modinputs.y)
     N_samples = size(chain, 1)
     family = detect_model_family(model)
     weights = use_weights ? modinputs.weights : ones(N_obs)
-    chain_names = names(chain)
+    chain_names = string.(names(chain))
     model_type = identify_model_type(chain)
 
     # Strategy 1: Native Turing extraction
     try
         pointwise_ll = Turing.pointwise_loglikelihoods(model, chain)
-        ks = collect(keys(pointwise_ll))
-        if !isempty(ks)
-            log_lik_mat = Float64.(copy(pointwise_ll[ks[1]]))
-            for i in 2:length(ks)
-                log_lik_mat .+= pointwise_ll[ks[i]]
+        y_keys = [k for k in keys(pointwise_ll) if occursin("y", string(k))]
+
+        if !isempty(y_keys)
+            log_lik_mat = Float64.(copy(pointwise_ll[y_keys[1]]))
+            for i in 2:length(y_keys)
+                log_lik_mat .+= pointwise_ll[y_keys[i]]
             end
+
             if use_weights
                 for i in 1:N_obs; log_lik_mat[:, i] .*= weights[i]; end
             end
+
             lppd = sum(logsumexp(log_lik_mat[:, i]) - log(N_samples) for i in 1:N_obs)
             p_waic = sum(var(log_lik_mat, dims=1))
             return -2 * (lppd - p_waic)
@@ -3585,32 +3406,43 @@ function waic_compute(model::DynamicPPL.Model, chain::MCMCChains.Chains, modinpu
     N_time = maximum(modinputs.time_idx)
 
     for s in 1:N_samples
-        # Reconstruct Spatial Effect
-        sig_sp = :sigma_sp in chain_names ? chain[:sigma_sp].data[s] : 0.0
-        phi_sp = :phi_sp in chain_names ? chain[:phi_sp].data[s] : 0.5
-        u_icar = [chain[Symbol("u_icar[$i]")].data[s] for i in 1:N_areas]
-        u_iid = [chain[Symbol("u_iid[$i]")].data[s] for i in 1:N_areas]
-        s_eff = sig_sp .* (sqrt(phi_sp) .* u_icar .+ sqrt(1 - phi_sp) .* u_iid)
+        # --- Robust Spatial Effect Reconstruction ---
+        s_eff = zeros(N_areas)
+        
+        if any(occursin.("phi_leroux", chain_names))
+            # Case: Leroux Models (D02, D03)
+            s_eff = [chain[Symbol("phi_leroux[$i]")].data[s] for i in 1:N_areas]
+        elseif any(occursin.("u_icar", chain_names))
+            # Case: BYM2 Models (D01, D10+)
+            sig_sp = :sigma_sp in names(chain) ? chain[:sigma_sp].data[s] : 1.0
+            phi_sp = :phi_sp in names(chain) ? chain[:phi_sp].data[s] : 0.5
+            u_icar = [chain[Symbol("u_icar[$i]")].data[s] for i in 1:N_areas]
+            u_iid = [chain[Symbol("u_iid[$i]")].data[s] for i in 1:N_areas]
+            s_eff = sig_sp .* (sqrt(phi_sp) .* u_icar .+ sqrt(1 - phi_sp) .* u_iid)
+        elseif any(occursin.("s_eff", chain_names))
+            # Case: SAR/DAG Models (D04, D07)
+            s_eff = [chain[Symbol("s_eff[$i]")].data[s] for i in 1:N_areas]
+        end
 
-        # Reconstruct Temporal Effect based on detected Model Type
+        # --- Temporal Effect Reconstruction ---
         f_time = zeros(N_time)
         if model_type == :ar1
-            sig_tm = chain[:sigma_tm].data[s]
+            sig_tm = :sigma_tm in names(chain) ? chain[:sigma_tm].data[s] : 1.0
             f_time = [chain[Symbol("f_tm_raw[$i]")].data[s] for i in 1:N_time] .* sig_tm
         elseif model_type == :rff
-            w_tr = [chain[Symbol("w_trend[$i]")].data[s] for i in 1:size(modinputs.Z_trend, 2)]
-            w_se = [chain[Symbol("w_seas[$i]")].data[s] for i in 1:size(modinputs.Z_seas, 2)]
+            w_tr = get_params_vector(chain, "w_trend", size(modinputs.Z_trend, 2))[s, :]
+            w_se = get_params_vector(chain, "w_seas", size(modinputs.Z_seas, 2))[s, :]
             f_time = modinputs.Z_trend * (w_tr .* chain[:sigma_trend].data[s]) + modinputs.Z_seas * (w_se .* chain[:sigma_seas].data[s])
         end
 
-        # Likelihood calculation
+        # --- Likelihood Calculation ---
         for i in 1:N_obs
             a, t = modinputs.area_idx[i], modinputs.time_idx[i]
             eta = modinputs.log_offset[i] + s_eff[a] + f_time[t]
-            
-            # Add categorical covariate effects if present
+
+            # Add categorical covariate effects
             for k in 1:4
-                if Symbol("beta_cov[$k][1]") in chain_names
+                if Symbol("beta_cov[$k][1]") in names(chain)
                     eta += chain[Symbol("beta_cov[$k][$(modinputs.cov_indices[i,k])]")].data[s]
                 end
             end
@@ -3623,9 +3455,7 @@ function waic_compute(model::DynamicPPL.Model, chain::MCMCChains.Chains, modinpu
                 logpdf(BinomialLogit(1, eta), modinputs.y[i])
             elseif family == :lognormal
                 logpdf(LogNormal(eta, chain[:sigma_y].data[s]), modinputs.y[i])
-            else
-                0.0
-            end
+            else 0.0 end
             log_lik_mat[s, i] = weights[i] * ll
         end
     end
@@ -3634,6 +3464,7 @@ function waic_compute(model::DynamicPPL.Model, chain::MCMCChains.Chains, modinpu
     p_waic = sum(var(log_lik_mat, dims=1))
     return -2 * (lppd - p_waic)
 end
+
 
 function identify_model_type(chain::MCMCChains.Chains)
     """
@@ -3673,116 +3504,6 @@ function get_params_vector(chain, base_name, len)
     return hcat([vec(chain[Symbol(n)].data) for n in matched_names]...)
 end
  
-
-function reconstruct_posteriors(model::DynamicPPL.Model, chain::MCMCChains.Chains, modinputs; alpha=0.05)
-    # Exhaustive Posterior Reconstruction for CARSTM Suite (GMRF, RFF & Deep GP)
-
-    N_obs = length(modinputs.y)
-    N_areas = size(modinputs.Q_sp, 1)
-    N_time = maximum(modinputs.time_idx)
-    N_samples = size(chain, 1)
-    family = detect_model_family(model)
-    names_ch = names(chain)  # Returns Symbols
-
-    # 1. Summarize Scalar Parameters (Variances, mixing, lengthscales)
-    param_patterns = [r"sigma_", r"phi_", r"rho_", r"r_nb", r"l1", r"l2", r"l3"]
-    # FIX: Convert symbol to string for occursin
-    target_params = filter(n -> any(occursin.(param_patterns, string(n))), names_ch)
-    parameters = Dict(Symbol(p) => summarize_array(reshape(vec(chain[Symbol(p)].data), 1, 1, N_samples)) for p in target_params)
-
-    # 2. Recover Spatial Component (BYM2)
-    spatial_samples = zeros(N_areas, N_samples)
-    if :sigma_sp in names_ch && :phi_sp in names_ch
-        sig_sp = vec(chain[:sigma_sp].data)
-        phi_sp = vec(chain[:phi_sp].data)
-        u_icar = get_params_vector(chain, "u_icar", N_areas)
-        u_iid = get_params_vector(chain, "u_iid", N_areas)
-        for s in 1:N_samples
-            spatial_samples[:, s] = sig_sp[s] .* (sqrt(phi_sp[s]) .* u_icar[s, :] .+ sqrt(1 - phi_sp[s]) .* u_iid[s, :])
-        end
-    end
-
-    # 3. Recover Temporal Component (AR1 or RFF Trend/Seasonal)
-    temporal_samples = zeros(N_time, N_samples)
-    if any(occursin.("f_tm_raw", string.(names_ch)))
-        sig_tm = :sigma_tm in names_ch ? vec(chain[:sigma_tm].data) : ones(N_samples)
-        f_tm_raw = get_params_vector(chain, "f_tm_raw", N_time)
-        for s in 1:N_samples
-            temporal_samples[:, s] = f_tm_raw[s, :] .* sig_tm[s]
-        end
-    elseif any(occursin.("w_trend", string.(names_ch)))
-        # RFF Reconstruction
-        m_trend = size(modinputs.Z_trend, 2)
-        m_seas = size(modinputs.Z_seas, 2)
-        w_tr = get_params_vector(chain, "w_trend", m_trend)
-        w_se = get_params_vector(chain, "w_seas", m_seas)
-        sig_tr = :sigma_trend in names_ch ? vec(chain[:sigma_trend].data) : ones(N_samples)
-        sig_se = :sigma_seas in names_ch ? vec(chain[:sigma_seas].data) : ones(N_samples)
-        for s in 1:N_samples
-            temporal_samples[:, s] = modinputs.Z_trend * (w_tr[s, :] .* sig_tr[s]) + modinputs.Z_seas * (w_se[s, :] .* sig_se[s])
-        end
-    end
-
-    # 4. Recover Deep GP Latent Field (if present)
-    gp_latent_samples = zeros(N_obs, N_samples)
-    if any(occursin.("eta_gp", string.(names_ch)))
-        gp_latent_samples = get_params_vector(chain, "eta_gp", N_obs)'
-    end
-
-    # 5. Recover Interaction (Noise Field)
-    st_noise_samples = zeros(N_areas, N_time, N_samples)
-    if any(occursin.("st_int_raw", string.(names_ch)))
-        sig_int = :sigma_int in names_ch ? vec(chain[:sigma_int].data) : ones(N_samples)
-        st_raw = get_params_vector(chain, "st_int_raw", N_areas * N_time)
-        for s in 1:N_samples
-            st_noise_samples[:, :, s] = reshape(st_raw[s, :] .* sig_int[s], N_areas, N_time)
-        end
-    end
-
-    # 6. Recover Categorical Covariate Effects (RW2/beta_cov and b_class)
-    beta_cov_summaries = []
-    for k in 1:size(modinputs.cov_indices, 2)
-        raw_samples = get_params_vector(chain, "beta_cov[" * string(k) * "]", modinputs.N_cat)
-        summary_k = summarize_array(reshape(raw_samples', modinputs.N_cat, 1, N_samples))
-        push!(beta_cov_summaries, summary_k)
-    end
-
-    # 7. Prediction Synthesis
-    st_denoised = zeros(N_areas, N_time, N_samples)
-    st_noisy = zeros(N_areas, N_time, N_samples)
-    pred_samples = zeros(N_obs, N_samples)
-
-    for s in 1:N_samples
-        st_denoised[:, :, s] = spatial_samples[:, s] .+ temporal_samples[:, s]'
-        st_noisy[:, :, s] = st_denoised[:, :, s] .+ st_noise_samples[:, :, s]
-
-        for i in 1:N_obs
-            a, t = modinputs.area_idx[i], modinputs.time_idx[i]
-            eta = modinputs.log_offset[i] + st_noisy[a, t, s] + gp_latent_samples[i, s]
-
-            for k in 1:length(beta_cov_summaries)
-                eta += beta_cov_summaries[k].mean[modinputs.cov_indices[i, k]]
-            end
-
-            if family == :poisson || family == :negbinomial; pred_samples[i, s] = exp(eta)
-            elseif family == :binomial; pred_samples[i, s] = 1.0 / (1.0 + exp(-eta))
-            else; pred_samples[i, s] = eta; end
-        end
-    end
-
-    return (
-        spatial = summarize_array(reshape(spatial_samples, N_areas, 1, N_samples)),
-        temporal = summarize_array(reshape(temporal_samples, N_time, 1, N_samples)),
-        st_mat_denoised = summarize_array(st_denoised),
-        st_mat_noisy = summarize_array(st_noisy),
-        beta_cov = beta_cov_summaries,
-        parameters = parameters,
-        predictions = summarize_array(reshape(pred_samples, N_obs, 1, N_samples)),
-        family = family
-    )
-end
-
-
 
 
 
@@ -3926,3 +3647,406 @@ function prepare_fft_grid(pts, values; grid_res=64, pad_factor=2)
 end
  
 
+
+
+#####
+
+
+
+# --- 1. ARCHITECTURE & FAMILY TRAITS ---
+abstract type ModelArchitecture end
+struct GMRFArchitecture   <: ModelArchitecture end
+struct RFFArchitecture    <: ModelArchitecture end
+struct DeepGPArchitecture <: ModelArchitecture end
+struct SPDEArchitecture <: ModelArchitecture end
+struct SpectralArchitecture <: ModelArchitecture end
+struct DenseGPArchitecture <: ModelArchitecture end
+struct SVCArchitecture <: ModelArchitecture end
+struct UnknownArchitecture <: ModelArchitecture end
+
+abstract type ModelFamily end
+struct PoissonFamily <: ModelFamily end
+struct GaussianFamily <: ModelFamily end
+struct BinomialFamily <: ModelFamily end
+struct LogNormalFamily <: ModelFamily end
+struct NegativeBinomialFamily <: ModelFamily end
+
+# --- 2. TRAIT IDENTIFICATION ---
+function identify_traits(m::DynamicPPL.Model)
+    name = lowercase(string(m.f))
+    fam = if occursin("poisson", name) PoissonFamily()
+    elseif occursin("binomial", name) BinomialFamily()
+    elseif occursin("negbin", name) || occursin("negativebinomial", name) NegativeBinomialFamily()
+    elseif occursin("lognormal", name) LogNormalFamily()
+    else GaussianFamily() end
+
+    vi = DynamicPPL.VarInfo(m)
+    vns = string.(collect(keys(vi)))
+    arch = if any(occursin.(r"w1", vns)) DeepGPArchitecture()
+    elseif any(occursin.(r"w_trend", vns)) || any(occursin.(r"Z_trend", vns)) RFFArchitecture()
+    elseif any(occursin.(r"u_spectral", vns)) SpectralArchitecture()
+    elseif any(occursin.(r"kappa_sp", vns)) || any(occursin.(r"w_sp", vns)) SPDEArchitecture()
+    elseif any(occursin.(r"W_svc", vns)) SVCArchitecture()
+    elseif any(occursin.(r"f_latent", vns)) DenseGPArchitecture()
+    elseif any(occursin.(r"u_icar", vns)) || any(occursin.(r"phi_leroux", vns)) || any(occursin.(r"s_eff", vns)) GMRFArchitecture()
+    else UnknownArchitecture() end
+
+    return arch, fam
+end
+
+function get_model_parameters(m::DynamicPPL.Model)
+    # Directly extract names from a model instance sample
+    raw_keys = keys(rand(m))
+    return map(raw_keys) do k
+        replace(string(k), r"[\(\)\"\:]" => "") 
+    end
+end
+
+function check_has_parameter(m::DynamicPPL.Model, param_name::String)
+    all_p = get_model_parameters(m)
+    return any(n -> n == param_name || startswith(n, "$param_name["), all_p)
+end
+
+
+# --- 3. UNIFIED RECONSTRUCTION INTERFACE ---
+function reconstruct_posteriors(model::DynamicPPL.Model, chain, modinputs; alpha=0.05)
+    arch, fam = identify_traits(model)
+    return _reconstruct(arch, fam, chain, modinputs, alpha)
+end
+
+# Helper for linear predictor and LL calculation
+function _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+    denoised = zeros(N_obs, N_samples)
+    noisy = zeros(N_obs, N_samples)
+    log_lik = zeros(N_samples, N_obs)
+    
+    # Use the model trait check logic or check the chain properties directly
+    # Note: chain indexing remains standard for data extraction
+    has_sig_y = :sigma_y in propertynames(chain) || any(n -> startswith(string(n), "sigma_y"), propertynames(chain))
+
+    for j in 1:N_samples
+        sig_y = has_sig_y ? Float64(chain[:sigma_y].data[j]) : 1.0
+        for i in 1:N_obs
+            mu_eta = eta[i, j]
+            mu = if fam isa PoissonFamily; exp(mu_eta)
+                 elseif fam isa BinomialFamily; 1.0 / (1.0 + exp(-mu_eta))
+                 else mu_eta end
+            denoised[i, j] = mu
+            log_lik[j, i] = if fam isa PoissonFamily; logpdf(Poisson(mu), modinputs.y[i])
+                           elseif fam isa BinomialFamily; logpdf(Bernoulli(mu), modinputs.y[i])
+                           elseif fam isa GaussianFamily; logpdf(Normal(mu, sig_y), modinputs.y[i])
+                           else 0.0 end
+            noisy[i, j] = if fam isa GaussianFamily; mu + randn() * sig_y else mu end
+        end
+    end
+    return denoised, noisy, log_lik
+end
+
+function _compute_waic(log_lik)
+    nsamples, nobs = size(log_lik)
+    lppd = sum(logsumexp(log_lik[:, i]) - log(nsamples) for i in 1:nobs)
+    p_waic = sum(var(log_lik[:, i]) for i in 1:nobs)
+    return -2 * (lppd - p_waic)
+end
+
+# Helper for common covariate extraction
+function _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
+    beta_cov_eff = []
+    for k in 1:size(modinputs.cov_indices, 2)
+        if any(occursin.("beta_cov[$k]", all_names))
+            raw = get_params_vector(chain, "beta_cov[$k]", modinputs.N_cat)
+            push!(beta_cov_eff, summarize_array(reshape(raw', modinputs.N_cat, 1, N_samples); alpha=alpha))
+        end
+    end
+    return beta_cov_eff
+end
+
+# --- ARCHITECTURE RECONSTRUCTIONS ---
+
+function _reconstruct(arch::GMRFArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_areas, N_time = length(modinputs.y), size(modinputs.Q_sp, 1), Int(maximum(modinputs.time_idx))
+    N_samples = size(chain, 1)
+    all_names = get_chain_names(chain)
+
+    sp_struct = zeros(N_areas, N_samples)
+    sp_unstruct = zeros(N_areas, N_samples)
+    if any(occursin.(r"u_icar", all_names))
+        sig_sp = "sigma_sp" ∈ all_names ? vec(chain[:sigma_sp].data) : ones(N_samples)
+        phi_sp = "phi_sp" ∈ all_names ? vec(chain[:phi_sp].data) : fill(0.5, N_samples)
+        u_icar = get_params_vector(chain, "u_icar", N_areas)
+        u_iid = get_params_vector(chain, "u_iid", N_areas)
+        for s in 1:N_samples
+            sp_struct[:, s] = sig_sp[s] .* sqrt(phi_sp[s]) .* u_icar[s, :]
+            sp_unstruct[:, s] = sig_sp[s] .* sqrt(1 - phi_sp[s]) .* u_iid[s, :]
+        end
+    end
+
+    temporal = zeros(N_time, N_samples)
+    if any(occursin.(r"f_tm_raw", all_names))
+        sig_tm = "sigma_tm" ∈ all_names ? vec(chain[:sigma_tm].data) : ones(N_samples)
+        f_tm = get_params_vector(chain, "f_tm_raw", N_time)
+        for s in 1:N_samples; temporal[:, s] = f_tm[s, :] .* sig_tm[s]; end
+    end
+
+    beta_cov_eff = _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
+
+    eta = zeros(N_obs, N_samples)
+    for s in 1:N_samples, i in 1:N_obs
+        a, t = modinputs.area_idx[i], modinputs.time_idx[i]
+        eta[i, s] = modinputs.log_offset[i] + sp_struct[a, s] + sp_unstruct[a, s] + temporal[t, s]
+        for (k, summ) in enumerate(beta_cov_eff)
+            eta[i, s] += summ.mean[modinputs.cov_indices[i, k]]
+        end
+    end
+
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+
+    return (
+        spatial_structured = summarize_array(reshape(sp_struct, N_areas, 1, N_samples); alpha=alpha),
+        spatial_unstructured = summarize_array(reshape(sp_unstruct, N_areas, 1, N_samples); alpha=alpha),
+        temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik),
+        summarystats=summarystats(chain), 
+        family = fam,
+        architecture = arch
+    )
+end
+
+function _reconstruct(arch::RFFArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_time = length(modinputs.y), Int(maximum(modinputs.time_idx))
+    N_samples = size(chain, 1)
+    all_names = get_chain_names(chain)
+
+    w_tr = get_params_vector(chain, "w_trend", size(modinputs.Z_trend, 2))
+    sig_tr = "sigma_trend" ∈ all_names ? vec(chain[:sigma_trend].data) : ones(N_samples)
+    temporal = zeros(N_time, N_samples)
+    for s in 1:N_samples; temporal[:, s] = modinputs.Z_trend * (w_tr[s, :] .* sig_tr[s]); end
+
+    seasonal = zeros(N_time, N_samples)
+    if "sigma_seas" ∈ all_names
+        w_se = get_params_vector(chain, "w_seas", size(modinputs.Z_seas, 2))
+        sig_se = vec(chain[:sigma_seas].data)
+        for s in 1:N_samples; seasonal[:, s] = modinputs.Z_seas * (w_se[s, :] .* sig_se[s]); end
+    end
+
+    beta_cov_eff = _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
+    eta = zeros(N_obs, N_samples)
+    for s in 1:N_samples, i in 1:N_obs
+        t = modinputs.time_idx[i]
+        eta[i, s] = modinputs.log_offset[i] + temporal[t, s] + seasonal[t, s]
+        for (k, summ) in enumerate(beta_cov_eff)
+            eta[i, s] += summ.mean[modinputs.cov_indices[i, k]]
+        end
+    end
+
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+
+    return (
+        temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
+        seasonal = "sigma_seas" ∈ all_names ? summarize_array(reshape(seasonal, N_time, 1, N_samples); alpha=alpha) : nothing,
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik),
+        summarystats=summarystats(chain), 
+        family = fam,
+        architecture = arch
+    )
+end
+
+function _reconstruct(arch::DeepGPArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_samples = length(modinputs.y), size(chain, 1)
+    all_names = get_chain_names(chain)
+    
+    eta_gp = get_params_vector(chain, "eta_gp", N_obs)
+    beta_cov_eff = _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
+    
+    eta = zeros(N_obs, N_samples)
+    for s in 1:N_samples, i in 1:N_obs
+        eta[i, s] = modinputs.log_offset[i] + eta_gp[s, i]
+        for (k, summ) in enumerate(beta_cov_eff)
+            eta[i, s] += summ.mean[modinputs.cov_indices[i, k]]
+        end
+    end
+
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+    
+    return (
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik),
+        summarystats=summarystats(chain), 
+        family = fam,
+        architecture = arch
+    )
+end
+
+function _reconstruct(arch::SPDEArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_samples = length(modinputs.y), size(chain, 1)
+    all_names = get_chain_names(chain)
+    N_areas = size(modinputs.Q_sp, 1)
+    
+    w_sp = get_params_vector(chain, "w_sp", N_areas)
+    sig_sp = "sigma_sp" ∈ all_names ? vec(chain[:sigma_sp].data) : ones(N_samples)
+    beta_cov_eff = _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
+    
+    eta = zeros(N_obs, N_samples)
+    for s in 1:N_samples, i in 1:N_obs
+        eta[i, s] = modinputs.log_offset[i] + w_sp[s, modinputs.area_idx[i]] * sig_sp[s]
+        for (k, summ) in enumerate(beta_cov_eff)
+            eta[i, s] += summ.mean[modinputs.cov_indices[i, k]]
+        end
+    end
+
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+    
+    return (
+        spatial_structured = summarize_array(reshape((w_sp .* sig_sp)', N_areas, 1, N_samples); alpha=alpha),
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik),
+        summarystats=summarystats(chain), 
+        family = fam,
+        architecture = arch
+    )
+end
+
+
+function _reconstruct(arch::DenseGPArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_samples = length(modinputs.y), size(chain, 1)
+    all_names = get_chain_names(chain)
+    
+    f_latent = get_params_vector(chain, "f_latent", N_obs)
+    beta_cov_eff = _extract_beta_cov(all_names, chain, modinputs, N_samples, alpha)
+    
+    eta = zeros(N_obs, N_samples)
+    for s in 1:N_samples, i in 1:N_obs
+        eta[i, s] = modinputs.log_offset[i] + f_latent[s, i]
+        for (k, summ) in enumerate(beta_cov_eff)
+            eta[i, s] += summ.mean[modinputs.cov_indices[i, k]]
+        end
+    end
+
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+    
+    return (
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik),
+        summarystats=summarystats(chain), 
+        family = fam,
+        architecture = arch
+    )
+end
+
+
+
+
+function _reconstruct(arch::SpectralArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_samples = length(modinputs.y), size(chain, 1)
+    all_names = get_chain_names(chain)
+    # Recover spectral spatial component
+    u_spec = get_params_vector(chain, "u_spectral_raw", modinputs.grid_res^2)
+    # Simplified: Mapping first N_areas for visualization
+    temporal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
+    eta = zeros(N_obs, N_samples)
+    for s in 1:N_samples, i in 1:N_obs
+        eta[i, s] = modinputs.log_offset[i] + u_spec[s, modinputs.area_idx[i]]
+    end
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+    
+    return (
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik),
+        summarystats=summarystats(chain), 
+        family = fam,
+        architecture = arch
+    )
+end
+
+function _reconstruct(arch::SVCArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    N_obs, N_samples = length(modinputs.y), size(chain, 1)
+    all_names = get_chain_names(chain)
+    N_areas = size(modinputs.Q_sp, 1)
+    N_svc = size(modinputs.u_obs, 2)
+    
+    # Recover svc matrix [area, covar]
+    svc_raw = get_params_vector(chain, "W_svc_raw", N_areas * N_svc)
+    eta = zeros(N_obs, N_samples)
+    for s in 1:N_samples, i in 1:N_obs
+        a = modinputs.area_idx[i]
+        eta[i, s] = modinputs.log_offset[i]
+        for k in 1:N_svc
+            # Map linearized svc_raw to area/covar index
+            eta[i, s] += modinputs.u_obs[i, k] * svc_raw[s, (k-1)*N_areas + a]
+        end
+    end
+    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+    return (
+        beta_cov = beta_cov_eff,
+        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+        waic = _compute_waic(log_lik),
+        summarystats=summarystats(chain), 
+        family = fam,
+        architecture = arch
+    )
+end
+
+
+# --- 8. UNIFIED VISUALIZATION SUITE ---
+function model_results_comprehensive(model, chain, modinputs, au; alpha=0.05, time_slice=1)
+    res = reconstruct_posteriors(model, chain, modinputs; alpha=alpha)
+    y_obs = Float64.(modinputs.y)
+    y_pred = vec(res.predictions_denoised.mean)
+
+    # Metrics
+    rmse = sqrt(mean((y_obs .- y_pred).^2))
+    r2 = length(unique(y_pred)) > 1 ? cor(y_obs, y_pred)^2 : 0.0
+    waic_val = res.waic
+    mean_ess = mean( x for x in res.summarystats.ess_per_sec if !isnan(x)  )
+    mean_rhat = mean( x for x in res.summarystats.rhat if !isnan(x)   )
+ 
+    # Dynamic Plot Generation
+    plots = []
+    p_ppc = scatter(y_pred, y_obs, alpha=0.4, label="Obs vs Pred", title="PPC (RMSE: $(round(rmse, digits=3)), WAIC: $(round(waic_val, digits=1)))", xlabel="Pred", ylabel="Obs")
+    plot!(p_ppc, [minimum(y_obs), maximum(y_obs)], [minimum(y_obs), maximum(y_obs)], ls=:dash, lc=:red, label="Identity")
+    push!(plots, p_ppc)
+
+    if haskey(res, :temporal)
+        p_tm = plot(res.temporal.mean, ribbon=(res.temporal.mean .- res.temporal.lower, res.temporal.upper .- res.temporal.mean), title="Temporal Trend", xlabel="Time", ylabel="Effect", legend=false, fillalpha=0.3)
+        push!(plots, p_tm)
+    end
+
+    p_denoised = StatsPlots.plot(aspect_ratio=:equal, title="Denoised Map (T=$time_slice)", legend=false)
+    indices = findall(x -> x == time_slice, modinputs.time_idx)
+    if !isempty(indices)
+        vals_t = res.predictions_denoised.mean[indices]
+        for i in 1:min(length(au.polygons), length(vals_t))
+            poly = au.polygons[i]
+            if length(poly) > 2
+                px = [pt[1] for pt in poly]; py = [pt[2] for pt in poly]
+                plot!(p_denoised, px, py, seriestype=:shape, fill_z=vals_t[i], c=:viridis, linecolor=:black, lw=0.5)
+            end
+        end
+    end
+    push!(plots, p_denoised)
+
+    n_rows = ceil(Int, length(plots)/2)
+    display(plot(plots..., layout=(n_rows, 2), size=(1000, 350*n_rows)))
+    return (
+        metrics=(rmse=rmse, r2=r2, waic=waic_val, mean_ess=mean_ess, mean_rhat=mean_rhat), 
+        results=res, 
+        plots=plots
+    )
+end
+
+ 

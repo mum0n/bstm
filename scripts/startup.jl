@@ -23,7 +23,7 @@ print( "Current directory is: ", current_directory, "\n\n" )
 pkgs_bstm = [
   "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", 
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation",   
-  "Distributions", "Statistics", "MCMCChains", "DataFrames",  
+  "Distributions", "Statistics", "MCMCChains", "DataFrames",  "GLM",
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs",
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing" 
@@ -71,12 +71,13 @@ include( srcdir( "spatiotemporal_functions.jl" ))
 include( srcdir( "spatiotemporal_turing_models.jl" ))   
 
 
-# Set a seed for reproducibility.
-Random.seed!(42)
+Random.seed!(42) # Set a seed for reproducibility.
+
 
 # required for a few functions: 
 using LogExpFunctions: logistic
-using LogExpFunctions: logsumexp
+# using LogExpFunctions: logsumexp
+import LogExpFunctions: logsumexp
 using Turing: Variational
 
 # to help track variables, add something like this inside of a function:  
