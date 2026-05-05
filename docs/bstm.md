@@ -48,7 +48,7 @@ To address the "SpatioTemporal Challenge," *bstm* utilizes three primary compone
 2. Temporal Autocorrelation: Utilizing temporal autocorrelation to capture evolving trends.
 3. Non-linear Interactions: Modeling complex interactions where the relationship between space and time is non-stationary and dynamic.
 
-Failing to distinguish between a permanent habitat feature (captured by a spatial component) and a transient environmental anomaly (captured by the space-time interaction) results in biased forecasts. By isolating these effects, we ensure that our understanding and consequent management decisions are based on the "true" underlying drivers rather than statistical noise. This decomposition is made possible by the rigorous mathematical axioms that transform a computationally prohibitive problem into a tractable one.
+Failing to distinguish between a permanent habitat feature (captured by a spatial component) and a transient environmental anomaly (captured by the space-time interaction) results in biased forecasts. By isolating these effects, we ensure that our understanding and consequent management decisions are based on the "true" underlying drivers rather than statistical noise. This decomposition is made possible by transforming a computationally prohibitive problem into a tractable one. And by using Julia and Turing, you get the state of the art in computation with Automatic Differentiation built into most heavy lifting operations. 
  
 
 ### Computation: Getting started with the environment
@@ -390,6 +390,7 @@ In contrast, when an unoptimized model is used, the inversion of the full spatia
 
 m = model_C00_gaussian_dense_gp(modinputs) # Turing model object
 chn = sample(m, MH(), 50; num_warmup=100, thin=50, progress=true, drop_warmup=true )  
+# res = model_results_comprehensive(m, chn, modinputs, au_scot);
 
 ```    
 
@@ -409,51 +410,56 @@ chn = sample(m, MH(), 50; num_warmup=100, thin=50, progress=true, drop_warmup=tr
 
 The other purpose of the above example was to show that the workflow is simple, once the model form has been chosen. The model structure is important and where the time and resources should be spent: deliberating utility, rather than trying to debug,implement and run.
 
-#### Options: Optimization-based approaches
+#### Optimization-based approaches
 
 Though MCMC sampling is our gold-standard, we also have other optimization-based options that can be worth considering. All of these methods are boosted by Automatic Differentiation, some require smooth differentiable likelihood surfaces, while others are robust and can be range bound. See the [whole list here](https://docs.sciml.ai/Optimization/stable/optimization_packages/optim/). 
 
 - Maximum likelihood (ML) estimation can be much faster than MCMC as pure optimization of a point mass is considerably simpler as priors are ignored and there is no need to carry posterior samples. Many specialized optimization algorithms exist that have been tried and tested over many years. 
-- Maximum a-posteriori (MAP) estimation is the same as ML except that prior information is used as well and so a bit closer to MCMC in spirit, though the focus is still upon the point estimates. 
-- Variational Inference is also an optimization method. However, it approaches the problem using the ELBO estimator. In principle it is closest to MCMC and able to describe the posterior distribution reasonably well. It is, therefore, similar to INLA, except that in the latter, a Laplace Approximation is used which comes with other constraints.
 
-All three methods are accessible with the same Turing/Julia model (but not Laplace Approximation, to my knowledge, though that may always change). The following code snippet shows how to run then and even use one as the starting point of another. Let us return to the sparse demonstration model: model_D00_poisson_simple(modinputs).
+- Maximum a-posteriori (MAP) estimation is the same as ML except that prior information is used as well and so a bit closer to MCMC in spirit, though the focus is still upon the point estimates. 
+
+- Variational Inference is also an optimization method. However, it approaches the problem using the ELBO estimator (log-likelihood aka "evidence" of the observed data, \(\log p(x)\)). In complex models, calculating the true posterior distribution \(p(z|x)\) is impossible (intractable). Instead, we choose a simpler, flexible distribution \(q(z)\) to approximate it. Maximizing the ELBO is equivalent to minimizing the difference (Kullback-Leibler divergence) between \(q(z)\) and the true posterior. The ELBO allows us to use gradient-based optimization methods (like Stochastic Gradient Descent) to solve Bayesian inference problems. In principle it is closest to MCMC and able to describe the posterior distribution reasonably well. 
+
+It is, similar to INLA except that in the latter, optimization is also used but with a Laplace Approximation which comes with the assumption/constraint that the posterior marginals can be accurately approximated by a Taylor expansion. VI has no limits to distributional constraints (INLA assumes Gaussian), and requires that the likelihood is smooth enough for optimization (however, non-differentiable optimizers exist too...).  
+ 
+All three methods are accessible with the same Turing/Julia model (but not Laplace Approximation, to my knowledge, though some Julia projects seem to have used LA). As a bonus you also get Automatic Differentiation for free and can use the same Turing model. 
+
+The following code snippet shows how to run them. One can even use the solution from one method as the starting point of another (though that runs the risk of starting from a pathologiucal suboptimimum). 
+
+Let us return to the sparse demonstration model: model_D00_poisson_simple(modinputs).
  
 
 ```{julia}
 #| Optimization approaches
 
-using Optim, AdvancedVI, Turing
-
-# ML
+# using Optim, AdvancedVI, Turing
+ 
+# ML -- fast but does not converge
 m = model_D00_poisson_simple(modinputs) # Turing model object
-res_opt = maximum_likelihood(m, LBFGS() )
-res_opt.optim_result.retcode  # it fails 
+res_opt = maximum_likelihood(m, LBFGS() )  # many optimizaers available
+res_opt.optim_result.retcode    
 res_opt.params 
 
-# MAP
+# MAP - does not converge .. try other optimizers
 res_map = maximum_a_posteriori( m, NelderMead() )
-res_map.optim_result.retcode  # it fails
+res_map.optim_result.retcode   
 res_map.params
 
 
-# Variational Inference
-#;, optimizer=Flux.ADAM(1e-1));
-# q_init = q_locationscale
-# q_init = q_meanfield_gaussian 
-# q_init = q_fullrank_gaussian
+# Variational Inference: slower .. (about 30 minutes; uses ~ 30 GB RAM)
 samples_per_step = 10
 max_iters = 1000
 no_samples = 1000
 
+# q_init = q_locationscale
+# q_init = q_meanfield_gaussian 
+# q_init = q_fullrank_gaussian
 q_init = q_fullrank_gaussian     
-chn_vi = vi(m, q_init, 1000, adtype=AutoForwardDiff(), show_progress=true) 
-  
-# Extend base names check for ADVI pseudo-chain
-MCMCChains.names(chain::NamedTuple) = collect(keys(chain.data))
- 
+
+chn_vi = vi(m, q_init, max_iters, adtype=AutoForwardDiff(), show_progress=true) #;, optimizer=Flux.ADAM(1e-1));
+   
 # Convert to reconstruct-compatible format
-chn = convert_advi_to_reconstruct_format(m, chn_vi, 1000)
+chn = convert_advi_to_reconstruct_format(m, chn_vi, no_samples)
 
 # Reconstruct and Visualize
 res = model_results_comprehensive(m, chn, modinputs_count, au)

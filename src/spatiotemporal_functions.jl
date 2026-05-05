@@ -4255,5 +4255,141 @@ function model_results_comprehensive(model, chain, modinputs, areal_units; alpha
             denoised=plt_st_denoised, noisy=plt_st_noisy)
     )
 end
+function model_results_comprehensive(model, vi_result::Turing.Variational.VIResult, modinputs, areal_units; alpha=0.05, time_slice=1, n_samples=500)
+    # Specialized method for ADVI results produced by convert_advi_to_reconstruct_format
 
+    # 1. Unpack the bundle to get the actual chain
+    bundle = convert_advi_to_reconstruct_format(vi_result, model, n_samples)
+    chain = bundle.chain
+
+    # 2. Use the specialized traits/reconstruction logic
+    pstats = reconstruct_posteriors(model, chain, modinputs; alpha=alpha)
+
+    y_obs = Float64.(modinputs.y)
+    y_pred = vec(pstats.predictions_denoised.mean)
+
+    # 3. Metrics Calculation
+    rmse = sqrt(mean((y_obs .- y_pred).^2))
+    r2 = length(unique(y_pred)) > 1 ? cor(y_obs, y_pred)^2 : 0.0
+    waic_val = pstats.waic
+
+    # FIXED: Access FlexiChains summary stats using correct keyword syntax
+    ss = summarystats(chain)
+    params = FlexiChains.parameters(chain)
+    
+    mean_ess_bulk = mean(ss[p, stat=:ess_bulk] for p in params)
+    mean_ess_tail = mean(ss[p, stat=:ess_tail] for p in params)
+    mean_rhat = mean(ss[p, stat=:rhat] for p in params)
+
+    metrics = (rmse=rmse, r2=r2, waic=waic_val,
+               mean_ess_bulk=mean_ess_bulk, mean_ess_tail=mean_ess_tail, mean_rhat=mean_rhat)
+    display(metrics)
+
+    # 4. Base Plots (PPC, Spatial)
+    plt_ppc = scatter(y_pred, y_obs, alpha=0.4, label="Obs vs Pred",
+                      title="ADVI PPC (RMSE: $(round(rmse, digits=3)), WAIC: $(round(waic_val, digits=1)))",
+                      xlabel="Pred", ylabel="Obs")
+    plot!(plt_ppc, [minimum(y_obs), maximum(y_obs)], [minimum(y_obs), maximum(y_obs)], ls=:dash, lc=:red, label="Identity")
+
+    plt_sp = plot_posterior_results(pstats, modinputs, areal_units; effect=:spatial)
+    title!(plt_sp, "Main Spatial Effect")
+
+    # 5. Component Plots (Temporal, Seasonal)
+    plt_tm = nothing
+    if haskey(pstats, :temporal) && !isnothing(pstats.temporal)
+        plt_tm = plot(pstats.temporal.mean,
+                      ribbon=(pstats.temporal.mean .- pstats.temporal.lower, pstats.temporal.upper .- pstats.temporal.mean),
+                      title="Temporal Trend", xlabel="Time", ylabel="Effect", legend=false, fillalpha=0.3)
+    end
+
+    plt_seas = nothing
+    if haskey(pstats, :seasonal) && !isnothing(pstats.seasonal)
+        plt_seas = plot(pstats.seasonal.mean,
+                        ribbon=(pstats.seasonal.mean .- pstats.seasonal.lower, pstats.seasonal.upper .- pstats.seasonal.mean),
+                        title="Seasonal Trend", xlabel="Time", ylabel="Effect", legend=false, fillalpha=0.3)
+    end
+
+    # 6. Spatiotemporal Prediction Plots
+    plt_st_denoised = plot_posterior_results(pstats, modinputs, areal_units; effect=:predictions_denoised, time_slice=time_slice)
+    title!(plt_st_denoised, "Denoised Predictions (T=$time_slice)")
+
+    plt_st_noisy = plot_posterior_results(pstats, modinputs, areal_units; effect=:predictions_noisy, time_slice=time_slice)
+    title!(plt_st_noisy, "Noisy Predictions (T=$time_slice)")
+
+    # Display Composite Grid
+    plot_list = filter(!isnothing, [plt_ppc, plt_tm, plt_seas, plt_sp, plt_st_denoised])
+    n_plots = length(plot_list)
+    n_rows = ceil(Int, n_plots / 2)
+    display(plot(plot_list..., layout=(n_rows, min(n_plots, 2)), size=(1000, 350*n_rows)))
+
+    return (
+        metrics=metrics,
+        pstats=pstats,
+        summarystats=ss,
+        plots=(ppc=plt_ppc, tm=plt_tm, seas=plt_seas, spatial=plt_sp, denoised=plt_st_denoised, noisy=plt_st_noisy)
+    )
+end
+
+
+function convert_advi_to_reconstruct_format(msol, model::DynamicPPL.Model, n_samples::Int=500)
+    """
+    Synopsis: Converts ADVI variational solutions into a format compatible with _reconstruct logic.
+    Inputs:
+    - msol: The solution object from Turing.vi()
+    - model: The Turing model instance used for VI.
+    - n_samples: Number of posterior samples to draw from the variational distribution.
+    Outputs:
+    - A FlexiChains-like object or standard Chain that _reconstruct can process.
+    """
+  
+    # 1. Sample from the variational solution
+    # Turing's rand(msol, n_samples) returns a Vector of VarNamedTuples
+    samples_vec = rand(msol, n_samples)
+
+    # 2. Extract unique base parameter names for reconstruction logic
+    # We peek at the first sample to find the keys
+    all_keys = keys(samples_vec[1])
+    unique_bases = Set{Symbol}()
+    for k in all_keys
+        # Regex handles both scalar 'x' and vector 'x[1]' patterns
+        m = match(r"^([^\\\\[]+)", string(k))
+        if m !== nothing
+            push!(unique_bases, Symbol(m.captures[1]))
+        end
+    end
+
+    # 3. Create the reconstruct_samples (Vector of NamedTuples)
+    # Required for DynamicPPL.reconstruct(model, sample)
+    reconstruct_samples = map(samples_vec) do samp
+        sample_params = Dict{Symbol, Any}()
+        for base_sym in unique_bases
+            base_str = string(base_sym)
+            # Filter keys belonging to this base parameter group
+            col_keys = filter(k -> string(k) == base_str || startswith(string(k), "$base_str["), all_keys)
+
+            if length(col_keys) == 1 && string(first(col_keys)) == base_str
+                sample_params[base_sym] = samp[first(col_keys)]
+            else
+                # Sort indexed keys like x[1], x[10], x[2] into numerical order
+                sorted_keys = sort(collect(col_keys), by = k -> begin
+                    m_idx = match(r"\\\\[(\\d+)\\\\]", string(k))
+                    m_idx !== nothing ? parse(Int, m_idx.captures[1]) : 0
+                end)
+                sample_params[base_sym] = [samp[k] for k in sorted_keys]
+            end
+        end
+        return (; sample_params...)
+    end
+
+    # 4. Construct FlexiChain for diagnostics
+    # FIXED: Explicitly convert VarName keys to Symbol for FlexiChains compatibility
+    formatted_dicts = map(samples_vec) do samp
+        # Use Symbol(k) to ensure keys are Parameter{Symbol} not Parameter{VarName}
+        Dict(FlexiChains.Parameter(Symbol(k)) => v for (k, v) in pairs(samp))
+    end
+
+    chn = FlexiChains.FlexiChain{Symbol}(n_samples, 1, formatted_dicts)
+
+    return (chain=chn, reconstruct_samples=reconstruct_samples)
+end
 

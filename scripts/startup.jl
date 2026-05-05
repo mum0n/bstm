@@ -23,7 +23,7 @@ print( "Current directory is: ", current_directory, "\n\n" )
 pkgs_bstm = [
   "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", 
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation",   
-  "Distributions", "Statistics", "MCMCChains", "DataFrames",  "GLM", "FlexiChains",
+  "Distributions", "Statistics", "MCMCChains", "DataFrames",  "GLM", "FlexiChains", "AbstractPPL",
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs",
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing" 
@@ -73,11 +73,20 @@ include( srcdir( "spatiotemporal_turing_models.jl" ))
 
 Random.seed!(42) # Set a seed for reproducibility.
 
+# Extend base names check for ADVI pseudo-chain
+MCMCChains.names(chain::NamedTuple) = collect(keys(chain.data))
+
+# Support FlexiChains.parameters() fallback for standardization logic
+import FlexiChains
+try
+    FlexiChains.parameters(c::ADVIChainWrapper) = c.names
+catch
+end
 
 # required for a few functions: 
-using LogExpFunctions: logistic
-# using LogExpFunctions: logsumexp
+import LogExpFunctions: logistic
 import LogExpFunctions: logsumexp
+
 using Turing: Variational
 
 # to help track variables, add something like this inside of a function:  
