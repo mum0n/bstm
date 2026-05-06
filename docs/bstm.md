@@ -112,7 +112,7 @@ With all required libraries and functions available, we can create some test dat
 
 
 ```{julia}
- 
+
 n_pts = 100  # spatial locations
 n_time = 15  # time slices ("years")
  
@@ -261,6 +261,8 @@ Using our basic spatiotemporal data, let us try to represent them in a discrete 
 
 # (; pts  ) = data  # this is a simple way to copy objects into the Main environment
 
+Random.seed!(42) # Set a seed for reproducibility.
+
 ntot = size(data.pts, 1) 
 
 min_time_slices = 5
@@ -372,11 +374,13 @@ modinputs = prepare_model_inputs(
   W = data_scot.W  # matrix adjacency
 )
 
+Random.seed!(42) # Set a seed for reproducibility.
+
 # create model instance
 m = model_D00_poisson_simple(modinputs); # Turing model object
 
 # sample with Metropolis-Hastings: 
-chn = sample(m, MH(), 5000; num_warmup=10000, thin=50, progress=true, drop_warmup=true ) ;
+chn = sample(m, MH(), 5000; num_warmup=2000, thin=25, progress=true, drop_warmup=true )  
 
 # extract some results  
 res = model_results_comprehensive(m, chn, modinputs, au_scot);
@@ -392,21 +396,20 @@ display(res.plots.ppc)  # there are a few more generic plots (see inside the obj
 
 ```
 modelname: model_D00_poisson_simple
-compute_time_seconds: 2.2
-rmse: 7.342
-r2: 0.39
-waic: 6165.64
-mean_rhat: 1.438
-mean_ess_bulk: 10.786
+compute_time_seconds: 0.5
+rmse: 7.26
+r2: 0.368
+waic: 8868.971
+mean_rhat: 2.019
+mean_ess_bulk: 11.168
 mean_ess_tail: NaN
-ess_per_second: 4.903
+ess_per_second: 22.336
 
       param    mean     std    mcse  ess_bulk  ess_tail    rhat      q5     q50     q95                               │
-│   sigma_sp  0.3388  0.0279  0.0085   10.7856       NaN  1.4377  0.3224  0.3224  0.3861                               │
-│     phi_sp  0.7136  0.3260  0.0993   10.7856       NaN  1.4377  0.1611  0.9059  0.9059                               │
-│   sigma_tm  0.0883  0.0194  0.0059   10.7856       NaN  1.4377  0.0553  0.0997  0.0997                               │
-│     rho_tm  0.5066  0.2403  0.0732   10.7856       NaN  1.4377  0.0993  0.6484  0.6484                               │
-╰
+│   sigma_sp  0.3364  0.0188  0.0057   11.3099       NaN  2.4904  0.3172  0.3254  0.3595                               │
+│     phi_sp  0.5020  0.1838  0.0523   11.6767       NaN  1.3901  0.2185  0.5651  0.6719                               │
+│   sigma_tm  0.1248  0.0751  0.0234   10.3378       NaN  2.4904  0.0377  0.1041  0.2132                               │
+│     rho_tm  0.5431  0.1937  0.0572   11.6767       NaN  2.4904  0.3005  0.5093  0.7925                               │
 
 ```
 
@@ -415,41 +418,76 @@ These results have not converged (rhat is far from 1).
 But even still, there is some reasonably description of the spatial patterns. However, there is also lots of room for improvement:
 
   - the sampler: MH() is a simple one that is used here for checking timings only. 
-  - The model itself is a basic one (separable time and space) with no covariates.
+  - The model itself is a basic one (separable time and space) with no covariates and no interactions.
 
 Extracting different components of the model internals takes a little more digging, but as these are Bayesian models, every aspect is completely available and adjustable. 
 
-However, it does use optimizations that take advantage of the sparse nature of the neighbourhood adjacency matrix and the temporal autocorrelation. In other words, a sparse form can speed through 15000 samples in a reasonable amount of time (7.6 seconds). 
+However, it does use optimizations that take advantage of the sparse nature of the neighbourhood adjacency matrix and the temporal autocorrelation.  
 
-In contrast, when a naive model is used (below), inversion of the full spatial and temporal covariance matrices is required, $O(n^3)$, due to the dense nature of the covariance matrices. This dense approach is equivalent to "Kriging" solutions, where a squared exponential covariance function is used for both space and time. However, in Kriging, Least-squares assumptions are used to speed up computations. Notice that the following, there were two orders of magnitude fewer samples (150) than the sparse form and it still takes more time (21 seconds, almost 3 X more for 100 X fewer samples !).  This is not a completely fair evaluation as there is a space-time interaction effect, whereas in the sparse version, there are only the main effects of space and time with no "interaction-effect." A better speed comparison is  to examine the effective number of samples per second ("ess_per_second") which ultimately will constrain total computational time. The effective sampling speed is about three times slower. The target total ESS will vary with application and data density, but we want a value that is as high as possible, in order have reasonably reliable descriptions of the the full posteriors.  
+In contrast, when a naive model is used (below), inversion of the full/dense spatial and temporal covariance matrices is required at a cost of $O(n^3)$ operations. Total compute time, using the same settings and number of samples, increases from 0.5 seconds to 96.2 seconds. This naive approach is almost the same as "Kriging" solutions (here a squared exponential covariance function is used for both space and time). However, in Kriging, Least-squares assumptions are used to speed up computations. This simple model uses a Poisson form with temporal autocorrelation. And, as can be seen the model code is relatively short and straight-forward, closely mimicking the mathematical relationships. 
+
+Notice that the following is not a completely fair evaluation as there is a space-time interaction effect in the dense model, whereas in the sparse version, there are only the main effects of space and time with no "interaction-effect." A better speed comparison is to examine the effective number of samples per second ("ess_per_second") which ultimately will constrain total computational time. The effective sampling speed drops from 22 to about 0.156. The target total ESS will vary with application and data density and information content, but we want a value that is as high as possible in order have reasonably reliable descriptions of the the full posteriors.   
 
 
 ```{julia}
 #| label: C00: Base Model - Dense Kernel Matrix Separable Spatiotemporal GP
 
-m = model_C00_gaussian_dense_gp(modinputs) # Turing model object
-chn = sample(m, MH(), 50; num_warmup=100, thin=50, progress=true, drop_warmup=true )  
-# res = model_results_comprehensive(m, chn, modinputs, au_scot);
+Random.seed!(42) # Set a seed for reproducibility.
 
+
+@model function model_C00_poisson_dense_gp(M, ::Type{T}=Float64 ) where {T}
+ 
+    # Priors
+    sigma_y ~ Exponential(1.0)
+    sigma_f ~ Exponential(1.0)
+    ls_s ~ Gamma(2, 2)
+    ls_t ~ Gamma(2, 2)
+
+    # Coordinates
+    coords_s = RowVecs(M.coords_space)
+    ts = Float64.(M.time_idx)
+
+    # Kernel Matrix / covariance
+    k_s = SqExponentialKernel() ∘ ScaleTransform(inv(ls_s))  # space
+    k_t = SqExponentialKernel() ∘ ScaleTransform(inv(ls_t))  # time
+    K = (sigma_f^2) .* kernelmatrix(k_s, coords_s) .* kernelmatrix(k_t, ts) # full covariance (separable)
+    
+    # Latent Process
+    f_latent ~ MvNormal(zeros(M.N_obs), K + 1e-6*I)
+  
+    # Likelihood
+    for i in 1:M.N_obs
+        mu = M.log_offset[i] + f_latent[i]  
+        Turing.@addlogprob!  logpdf(Poisson(exp(mu)), M.y[i])
+    end
+end
+
+m = model_C00_poisson_dense_gp(modinputs) # Turing model object
+chn = sample(m, MH(), 5000; num_warmup=2000, thin=25, progress=true, drop_warmup=true )  
+res = model_results_comprehensive(m, chn, modinputs, au_scot);
+
+showparams( res.summarystats )
+  
 ```    
 
 ```
-modelname: model_C00_gaussian_dense_gp
-compute_time_seconds: 3.0
-rmse: 9.698
-r2: 0.192
-waic: 135201.129
-mean_rhat: 1.874
-mean_ess_bulk: 3.83
-mean_ess_tail: NaN
-ess_per_second: 1.277
+modelname: model_C00_poisson_dense_gp
+compute_time_seconds: 96.2
+rmse: 6.394
+r2: 0.565
+waic: 3714.362
+mean_rhat: 1.548
+mean_ess_bulk: 12.364
+mean_ess_tail: 10.722
+ess_per_second: 0.129
 
      param    mean     std    mcse  ess_bulk  ess_tail    rhat      q5     q50     q95                                │
-│   sigma_y  3.5173  0.1456  0.0580    7.5456       NaN  1.6971  3.3279  3.6066  3.6810                                │
-│   sigma_f  0.6982  0.3090  0.2002    1.8983       NaN  1.6974  0.3053  0.7844  0.9935                                │
-│      ls_s  3.8879  1.1169  0.3353    9.1612       NaN  1.9799  1.2971  3.9121  4.6927                                │
-│      ls_t  3.4763  1.0789  0.7393    1.5769       NaN  2.1675  2.7006  3.1822  5.7160                                │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+│   sigma_y  0.3308  0.0727  0.0224   10.5378       NaN  1.5830  0.2155  0.3781  0.3781                                │
+│   sigma_f  0.5614  0.0603  0.0181   13.1811       NaN  1.5830  0.5255  0.5255  0.6577                                │
+│      ls_s  2.7490  0.2658  0.0687   11.6511       NaN  1.5345  2.5046  2.8916  2.8916                                │
+│      ls_t  6.7584  1.2076  0.3695   10.5378       NaN  1.5830  4.8197  7.5158  7.5158                                │
+                         │
+
 
 ```
 
@@ -461,7 +499,7 @@ ess_per_second: 1.277
     *   Dense Kernel Matrix: Computes the full $N \times N$ covariance matrix, leading to $O(N^3)$ computational complexity for inference, which is noted as "very slow".
     *   Non-centered Parameterization: The latent GP `f` is sampled directly from `MvNormal(zeros(N), K + 1e-6*I)`.
 
-*   Observation Noise (sigma_y, sigma_u): Assumed to be homoscedastic (constant variance) and normally distributed.
+*   Observation Noise (sigma_y, aka "nugget"): Assumed to be homoscedastic (constant variance) and normally distributed.
 
 *   Priors: Standard weakly informative priors (Exponential for scales, Normal for coefficients, Uniform for phases).
 
@@ -470,7 +508,7 @@ ess_per_second: 1.277
 
 The other purpose of the above example was to show that the workflow is simple, once the model form has been chosen. The model structure is important and where the time and resources should be spent: deliberating utility, rather than trying to debug,implement and run.
 
-Note: Though both models did not converge, the WAIC seems really poor with this dense model and will require much more time to sample the "evidence" surface. 
+Note: Though both models did not converge, the WAIC seems improves quite a bit with dense model. However, as neither has converged, that assessment is premature. 
 
 
 #### Optimization-based approaches
@@ -488,8 +526,7 @@ It is, similar to INLA except that in the latter, optimization is also used but 
 All three methods are accessible with the same Turing/Julia model (but not Laplace Approximation, to my knowledge, though some Julia projects seem to have used LA). As a bonus you also get Automatic Differentiation for free and can use the same Turing model. 
 
 The following code snippet shows how to run them. One can even use the solution from one method as the starting point of another (though that runs the risk of starting from a pathologiucal suboptimimum). 
-
-Let us return to the sparse demonstration model: model_D00_poisson_simple(modinputs).
+ 
  
 
 ```{julia}
@@ -497,11 +534,19 @@ Let us return to the sparse demonstration model: model_D00_poisson_simple(modinp
 
 # using Optim, AdvancedVI, Turing
  
-# ML -- fast but does not converge
+# ML -- Sparse version: fast (seconds) but does not converge
 m = model_D00_poisson_simple(modinputs) # Turing model object
 res_opt = maximum_likelihood(m, LBFGS() )  # many optimizaers available
 res_opt.optim_result.retcode    
 res_opt.params 
+
+# ML -- Dense version: slow, really slow, so slow that you do not want to run this:
+m = model_C00_poisson_dense_gp(modinputs) # Turing model object
+# res_opt = maximum_likelihood(m, LBFGS() )  # run only if you have a lot of time
+res_opt.optim_result.retcode    
+res_opt.params 
+
+
 
 # MAP - does not converge .. try other optimizers
 res_map = maximum_a_posteriori( m, NelderMead() )

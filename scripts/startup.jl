@@ -66,21 +66,22 @@ print( "\nTo (re)-install required packages, run:  install_required_packages() o
   
 
 # support functions
-include( srcdir( "shared_functions.jl") )
+include( srcdir( "data_prep.jl") )
 include( srcdir( "spatiotemporal_functions.jl" ))   
 include( srcdir( "spatiotemporal_turing_models.jl" ))   
 
 
 Random.seed!(42) # Set a seed for reproducibility.
 
-# Extend base names check for ADVI pseudo-chain
-MCMCChains.names(chain::NamedTuple) = collect(keys(chain.data))
- 
-# required for a few functions: 
+
+# required for a waic: 
 import LogExpFunctions: logistic
 import LogExpFunctions: logsumexp
 
+# Extend base names check for ADVI pseudo-chain
 using Turing: Variational
+
+# MCMCChains.names(chain::NamedTuple) = collect(keys(chain.data))  # USED? 
 
 # to help track variables, add something like this inside of a function:  
 # Main.DEBUG[] = y,p,t  # this stores y, p, t into Main.DEBUG 
