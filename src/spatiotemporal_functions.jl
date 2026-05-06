@@ -1,4 +1,244 @@
 
+
+
+function packages_used(model_variation) 
+
+    pkgs_shared = [
+        "DrWatson", "Revise", "Test",  "OhMyREPL", "Logging", 
+        "StatsBase", "Statistics", "Distributions", "Random", "Setfield", "Memoization", 
+        "MCMCChains", 
+        "DataFrames", "JLD2", "CSV", "PlotThemes", "Colors", "ColorSchemes", "RData",  
+        "Plots",  "StatsPlots", "MultivariateStats", 
+        "ForwardDiff", "ReverseDiff", "Enzyme", "ADTypes",
+        "StaticArrays", "LazyArrays", "FillArrays", "LinearAlgebra", "MKL", "Turing"
+    ]
+
+    if occursin( r"logistic_discrete.*", model_variation )
+        pkgs = []
+    elseif occursin( r"size_structured_dde.*", model_variation )
+        pkgs = [
+            "QuadGK", "ModelingToolkit", "DifferentialEquations", "Interpolations",
+        ]
+    end
+    
+    pkgs = unique!( [pkgs_shared; pkgs] )
+  
+    return pkgs  
+
+end
+ 
+
+function install_required_packages(pkgs)    # to install packages
+    for pk in pkgs; 
+        if Base.find_package(pk) === nothing
+            Pkg.add(pk)
+        end
+    end   # Pkg.add( pkgs ) # add required packages
+    print( "Pkg.add( \"Bijectors\" , version => \"0.3.16\") # may be required \n" )
+end
+ 
+function init_params_extract(X)
+  XS = summarize(X)
+  vns = XS.nt.parameters  # var names
+  init_params = FillArrays.Fill( XS.nt[2] ) # means
+  return init_params, vns
+end
+
+ 
+function discretize_decimal( x, delta=0.01 ) 
+    num_digits = Int(ceil( log10(1.0 / delta)) )   # time floating point rounding
+    out = round.( round.( x ./ delta; digits=0 ) .* delta; digits=num_digits)
+    return out
+end
+ 
+
+function expand_grid(; kws...)
+    names, vals = keys(kws), values(kws)
+    return DataFrame(NamedTuple{names}(t) for t in Iterators.product(vals...))
+end
+   
+
+function showall( x )
+    # print everything to console
+    show(stdout, "text/plain", x) # display all estimates
+end 
+ 
+
+function firstindexin(a::AbstractArray, b::AbstractArray)
+    bdict = Dict{eltype(b), Int}()
+    for i=length(b):-1:1
+        bdict[b[i]] = i
+    end
+    [get(bdict, i, 0) for i in a]
+end
+   
+  
+function β( mode, conc )
+    # alternate parameterization of beta distribution 
+    # conc = α + β     https://en.wikipedia.org/wiki/Beta_distribution
+    beta1 = mode *( conc - 2  ) + 1.0
+    beta2 = (1.0 - mode) * ( conc - 2  ) + 1.0
+    Beta( beta1, beta2 ) 
+end 
+  
+function modelruntime(o)
+    dt = ( o.info.stop_time- o.info.start_time )/ 60
+    showall( summarize(o) )
+    print( dt )
+end
+ 
+function code_show(x)
+   # printstyled( CodeTracking.@code_string x() )
+end
+  
+
+function install_required_packages()    # to install packages
+    for pk in pkgs; 
+        if Base.find_package(pk) === nothing
+            Pkg.add(pk)
+        end
+    end   # Pkg.add( pkgs ) # add required packages
+
+    print( "Pkg.add( \"Bijectors\" , version => \"0.3.16\") # may be required \n" )
+
+end
+ 
+
+
+function turingindex( indices, sym=nothing, dims=nothing  ) 
+     
+    if isa(indices, DynamicPPL.Model)
+        _, indices = bijector(turing_model, Val(true));
+    end
+
+    if isnothing(sym)
+      out = enumerate(keys(indices))
+    elseif sym=="varnames"
+      out = keys(indices)
+    else
+      out = union(indices[sym]...)
+    end
+    
+    if !isnothing(dims)
+        out = reshape(out, dims)
+    end
+
+    return out 
+end
+
+
+function showtuples(X) 
+    for k in keys(X)
+        val = getproperty(X, k)
+        # Check if value is numeric before rounding to avoid errors
+        display_val = val isa Number ? round(val, digits=3) : val
+        println("$k: $display_val")
+    end
+end
+
+
+function showparams(X, keywords=["rho", "phi", "sigma",  "mu_", "l_", "ls_"]; limit=10 )
+    # Create a regex pattern by joining keywords with the pipe '|' operator
+    pattern = Regex(join(keywords, "|"))
+
+    # Filter the parameter list
+    matched_params = filter(p -> occursin(pattern, string(p)), FlexiChains.parameters(X))
+
+    # Display the filtered slice
+    if isempty(matched_params)
+        println("No parameters matched keywords: $keywords")
+    else
+        out = X[matched_params[1:min(limit, end)]]
+        # display(out)
+        return out
+    end
+end
+
+function discretize_data(x; dx=0.5, nx=13, method="regular")   
+
+  if method=="regular"    
+
+    xd = round.(Int, x ./ dx ) .* dx   # resolution to 0.1 units
+    xd_breaks = collect( minimum(xd):dx:maximum(xd) + dx  ) 
+    xd_mid = midpoints(xd_breaks)
+    nx = length(xd_mid)
+    
+    xd_cut = cut(x, xd_breaks, extend=true)  # from CategoricalArrays
+    xi = levelcode.(xd_cut)  # integer index
+  
+  elseif method=="quantile"
+  
+    xd_breaks = quantile(x, range(0, 1, length=nx+1))
+    xd_mid = midpoints(xd_breaks)
+    xd_cut = cut(x, xd_breaks, extend=true)  # from CategoricalArrays
+    xi = levelcode.(xd_cut)  # integer index
+    dx = diff(xd_mid)[1]
+    xd = xd_mid[xi] 
+
+  end
+
+  return xd, xi, xd_mid, nx, dx
+
+end
+
+
+
+
+function random_correlation_matrix(d=3, eta=1)
+
+# etas = [1 10 100 1000 1e+4 1e+5];
+# d = size of matrix
+
+# EXTENDED ONION METHOD to generate random correlation matrices
+# distributed ~ det(S)^eta [or maybe det(S)^(eta-1), not sure]
+# https://stats.stackexchange.com/questions/2746/how-to-efficiently-generate-random-positive-semidefinite-correlation-matrices
+
+# LKJ modify this method slightly, in order to be able to sample correlation matrices C from a distribution proportional to [detC]η−1. The larger the η, the larger will be the determinant, meaning that generated correlation matrices will more and more approach the identity matrix. The value η=1 corresponds to uniform distribution. On the figure below the matrices are generated with η=1,10,100,1000,10000,100000. 
+
+    beta = eta + (d-2)/2;
+    u = rand( Beta(beta, beta) );
+    r12 = 2*u - 1;
+    S = [1 r12; r12 1];  
+
+    for k = 3:d
+        beta = beta - 1/2;
+        y = rand( Beta((k-1)/2, beta) );  # sample from beta
+        r = sqrt(y);
+        theta = randn(k-1,1);
+        theta = theta/norm(theta);
+        w = r*theta;
+        U, E = eigen(S);
+        U = hcat(U)
+        R = U' * sqrt(E) * U; # R is a square root of S
+        q = R[].re * w;
+        S = [S q; q' 1];
+    end
+    return S
+end
+
+
+
+
+function build_st_inputs(time_indices, space_indices, spatial_coords)
+  # Space-Time Input Construction
+  # Space and Time as continuous coordinates.
+  # Inputs: 
+  #   spatial_coords: Matrix (2 x N_nodes) -> [Lat, Lon]
+  #   time_coords: Vector (T_steps)
+  # Returns:
+  #   ColVecs of 3D points (Time, Lat, Lon)
+
+  # Map indices to actual coordinates
+  # This assumes spatial_coords is 2xN
+
+  # Extract coords for every observation
+  coords = spatial_coords[:, space_indices] # 2 x N_obs
+  times = time_indices' # 1 x N_obs
+
+  # Stack to create 3D input: [Time; Lat; Lon]
+  return ColVecs(vcat(times, coords))
+end
+
  
 
 function expand_hull(pts, buffer_dist)
@@ -2005,20 +2245,19 @@ function scottish_lip_cancer_data_spacetime(n_years::Int=10; rndseed::Int=42)
         area_idx=area_idx, n_years=n_years, pts=pts, W=W, au=au
     )
 end
-
-
  
+
 function get_optimal_sampler(model_key::String; nuts_adapt=10, target_acc=0.8, pg_particles=40)
     # Optimized Gibbs configurations aligned exactly with model_list registry keys
 
     samplers = Dict(
         # --- D-Series: Discrete Spatial Models (GMRF/BYM2) ---
         "model_D00_poisson_simple"      => Gibbs((:u_icar, :u_iid, :f_tm_raw) => ESS(), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm) => MH()),
-        "model_D01_poisson"             => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
-        "model_D02_poisson_leroux"      => Gibbs((:phi_leroux, :f_tm_raw, :st_int_raw) => ESS(),  (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:tau_leroux, :rho_leroux, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
-        "model_D03_poisson_localised"   => Gibbs((:s_eff, :f_tm_raw, :st_int_raw) => ESS(),  (:phi_zi) => PG(pg_particles), (:mu_global, :sigma_cluster, :mu_clusters, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:tau_sp, :rho_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
-        "model_D04_poisson_sar"         => Gibbs((:s_eff, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :rho_sar, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
-        "model_D05_poisson_mcar"        => Gibbs((:u_raw, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(40), (:L_corr, :beta_cov) => Turing.NUTS(10, 0.8), (:sigma_outcome, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D01_poisson_besag"       => Gibbs((:phi, :f_tm_raw, :beta_cov, :phi_sum, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp,  :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D02_poisson_bym2"        => Gibbs((:u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D03_poisson_leroux"      => Gibbs((:phi_leroux, :f_tm_raw, :st_int_raw) => ESS(),  (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:tau_leroux, :rho_leroux, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D04_poisson_localised"   => Gibbs((:s_eff, :f_tm_raw, :st_int_raw) => ESS(),  (:phi_zi) => PG(pg_particles), (:mu_global, :sigma_cluster, :mu_clusters, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:tau_sp, :rho_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        "model_D05_poisson_sar"         => Gibbs((:s_eff, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :rho_sar, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
         "model_D06_poisson_svc"         => Gibbs((:W_svc_raw, :u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_svc, :corr_svc, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
         "model_D07_poisson_dag"         => Gibbs((:s_raw, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp, :rho_dag, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
         "model_D08_poisson_hurdle"      => Gibbs((:u_icar_h, :u_iid_h, :f_tm_h, :u_icar_c, :u_iid_c, :f_tm_c) => ESS(), (:phi_zi) => PG(pg_particles), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_sp_h, :phi_sp_h, :sigma_tm_h, :rho_tm_h, :sigma_sp_c, :phi_sp_c, :sigma_tm_c, :rho_tm_c, :sigma_rw2) => MH()),
@@ -2037,7 +2276,8 @@ function get_optimal_sampler(model_key::String; nuts_adapt=10, target_acc=0.8, p
         "model_D21_fitc_bym2"           => Gibbs((:u_inducing, :u_icar, :u_iid, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(pg_particles), (:ls_st, :beta_cos, :beta_sin, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_f, :sigma_sp, :phi_sp, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
         "model_D22_fitc_nonlinear"      => Gibbs((:u_inducing, :f_gp, :beta_rff_u1, :beta_rff_u2, :beta_rff_u3, :beta_rff_vol, :u_icar, :u_iid) => ESS(), (:phi_zi) => PG(pg_particles), (:Z_inducing, :ls_st, :W_vol, :b_vol, :beta_z, :beta_u_main, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
         "model_D23_gptime_fitc"         => Gibbs((:alpha_gp, :u_inducing, :f_gp, :beta_rff_u1, :beta_rff_u2, :beta_rff_u3, :beta_rff_vol, :u_icar, :u_iid) => ESS(), (:phi_zi) => PG(pg_particles), (:ls_trend, :ls_st, :W_vol, :b_vol, :beta_z, :beta_u_main, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_trend, :sigma_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
-
+        "model_D24_poisson_mcar"        => Gibbs((:u_raw, :f_tm_raw, :st_int_raw) => ESS(), (:phi_zi) => PG(40), (:L_corr, :beta_cov) => Turing.NUTS(10, 0.8), (:sigma_outcome, :sigma_tm, :rho_tm, :sigma_int, :sigma_rw2) => MH()),
+        
         # --- C-Series: Continuous Spatial Models (Deep GP/RFF/SPDE) ---
         "model_C01_dense_gp"            => Gibbs((:f_latent) => ESS(), (:ls_s, :ls_t, :beta_cos, :beta_sin, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_f, :sigma_rw2) => MH()),
         "model_C02_deep_gp"             => Gibbs((:w1, :w2) => ESS(), (:l1, :l2, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_y, :sigma_rw2) => MH()),
@@ -2063,7 +2303,14 @@ function get_optimal_sampler(model_key::String; nuts_adapt=10, target_acc=0.8, p
         "model_C22_rff_mf_gp"           => Gibbs((:beta_z, :beta_u1, :beta_y_gp, :u_icar, :u_iid, :beta_rff_sigma) => ESS(), (:W_z, :b_z, :W_u, :b_u, :W_y_gp, :b_y_gp, :W_sigma, :b_sigma, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_z_f, :sigma_u_f, :sigma_y_gp_f, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
         "model_C23_dfrff_mf_gp"         => Gibbs((:beta_z, :beta_u, :beta_y_gp, :u_icar, :u_iid) => ESS(), (:beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_z_f, :sigma_u_f, :sigma_y, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
         "model_C24_semi_adaptive_rff"   => Gibbs((:u_icar, :u_iid) => ESS(), (:W_z, :W_u, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_W_z, :sigma_W_u, :sigma_y, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
-        "model_C25_hybrid_fitc_rff"     => Gibbs((:beta_z, :u_inducing, :u_icar, :u_iid) => ESS(), (:ls_st, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_z_f, :sigma_f, :sigma_y, :sigma_sp, :phi_sp, :sigma_rw2) => MH())
+        "model_C25_hybrid_fitc_rff"     => Gibbs((:beta_z, :u_inducing, :u_icar, :u_iid) => ESS(), (:ls_st, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), (:sigma_z_f, :sigma_f, :sigma_y, :sigma_sp, :phi_sp, :sigma_rw2) => MH()),
+    
+        # SOTA 
+        "model_SOTA1_poisson_BGCN"      => Gibbs( 
+            (:gcn_weight, :f_tm_raw) => ESS(), 
+            (:beta_z, :beta_u, :beta_cov) => Turing.NUTS(nuts_adapt, target_acc), 
+            (:sigma_y, :sigma_tm, :rho_tm, :sigma_rw2) => MH()
+        )
     )
 
     return get(samplers, model_key, Turing.NUTS(nuts_adapt, target_acc))
@@ -3672,16 +3919,20 @@ end
 
 abstract type ModelArchitecture end
 struct GMRFArchitecture     <: ModelArchitecture end
+struct BesagArchitecture   <: ModelArchitecture end
+struct LerouxArchitecture   <: ModelArchitecture end
 struct RFFArchitecture      <: ModelArchitecture end
 struct DeepArchitecture     <: ModelArchitecture end
-struct LerouxArchitecture   <: ModelArchitecture end
 struct SARArchitecture      <: ModelArchitecture end
 struct SVCArchitecture      <: ModelArchitecture end
 struct MosaicArchitecture   <: ModelArchitecture end
 struct SPDEArchitecture     <: ModelArchitecture end
 struct SpectralArchitecture <: ModelArchitecture end
 struct DenseGPArchitecture  <: ModelArchitecture end
+struct BGCNArchitecture    <: ModelArchitecture end
+struct MCARArchitecture    <: ModelArchitecture end
 struct UnknownArchitecture  <: ModelArchitecture end
+ 
 
 abstract type ModelFamily end
 struct PoissonFamily          <: ModelFamily end
@@ -3699,14 +3950,18 @@ function identify_traits(model_name::String)
     name = lowercase(model_name)
     
     # Identify Architecture
-    arch = if occursin("simple", name) || occursin("bym2", name) || occursin("d00", name) || occursin("d01", name)
+    arch = if occursin("simple", name) || occursin("bym2", name) 
         GMRFArchitecture()
-    elseif occursin("leroux", name) || occursin("d02", name)
+    elseif occursin("besag", name)  
+        BesagArchitecture()
+    elseif occursin("leroux", name) 
         LerouxArchitecture()
     elseif occursin("localised", name) || occursin("d03", name)
         LerouxArchitecture() # centered Leroux variant
     elseif occursin("sar", name) || occursin("d04", name)
         SARArchitecture()
+    elseif occursin("mcar", name) || occursin("d04", name)
+        MCARArchitecture()
     elseif occursin("svc", name) || occursin("d06", name)
         SVCArchitecture()
     elseif occursin("mosaic", name) || occursin("c08", name) || occursin("c09", name)
@@ -3721,6 +3976,8 @@ function identify_traits(model_name::String)
         SpectralArchitecture()
     elseif occursin("dense", name) || occursin("c00", name) || occursin("c01", name)
         DenseGPArchitecture()
+    elseif occursin("BGCN", name) || occursin("gcn", name) 
+        BGCNArchitecture()
     else
         UnknownArchitecture()
     end
@@ -3845,151 +4102,250 @@ end
 
 
 # --- ARCHITECTURE RECONSTRUCTIONS ---
-function _reconstruct(arch::GMRFArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_areas, N_time = length(modinputs.y), size(modinputs.Q_sp, 1), Int(maximum(modinputs.time_idx))
-    N_samples = size(chain, 1)
-    all_names = FlexiChains.parameters(chain)
-    name_strs = string.(all_names)
+ 
 
-    sp_struct = zeros(N_areas, N_samples)
-    sp_unstruct = zeros(N_areas, N_samples)
+function _reconstruct(arch::Union{BesagArchitecture, GMRFArchitecture, LerouxArchitecture, BGCNArchitecture, MCARArchitecture, SVCArchitecture, SARArchitecture}, fam::ModelFamily, chain, modinputs, alpha)
+    """
+    _reconstruct(arch, fam, chain, modinputs, alpha)
+
+    Unified post-processing for GMRF, SAR, Multivariate CAR (MCAR), and Spatially Varying Coefficients (SVC).
+
+    Mathematical Logic:
+    1. Latent Fields: Reconstructs structured (ICAR/GCN/SAR) and unstructured (IID) fields.
+    2. Linear Predictor (eta): eta = log_offset + spatial_str + spatial_unstr + temporal + interaction + covariates.
+    3. SVC Support: If arch is SVCArchitecture, adds localized covariate effects via beta_svc_mat.
+    4. Summarization: Returns standardized NamedTuple with 95% CIs and WAIC.
+    """
+    N_obs, N_areas, N_time = length(modinputs.y), size(modinputs.W, 1), Int(maximum(modinputs.time_idx))
+    N_samples = size(chain, 1)
+    name_strs = string.(FlexiChains.parameters(chain))
+
+    spatial_str = zeros(N_areas, N_samples)
+    spatial_unstr = zeros(N_areas, N_samples)
     temporal = zeros(N_time, N_samples)
-    seasonal = zeros(N_time, N_samples)
     eta = zeros(N_obs, N_samples)
 
-    if any(occursin.("u_icar", name_strs))
+    # 1. Spatial Field Reconstruction (Architecture-specific mapping)
+    if arch isa MCARArchitecture && "phi_spatial" in name_strs
+        phi_data = chain[:phi_spatial].data
+        for s in 1:N_samples; spatial_str[:, s] = vec(phi_data[s][:, 1]); end
+    elseif arch isa BGCNArchitecture && "gcn_weight" in name_strs
+        D_inv_sqrt = Diagonal(1.0 ./ sqrt.(vec(sum(modinputs.W, dims=2)) .+ 1e-6))
+        W_hat = D_inv_sqrt * modinputs.W * D_inv_sqrt
         sig_sp = "sigma_sp" in name_strs ? vec(chain[:sigma_sp].data) : ones(N_samples)
-        phi_sp = "phi_sp" in name_strs ? vec(chain[:phi_sp].data) : fill(0.5, N_samples)
-        u_icar_data = chain[:u_icar].data
-        u_iid_data = chain[:u_iid].data
+        for s in 1:N_samples; spatial_str[:, s] = (W_hat * vec(chain[:gcn_weight].data[s])) .* sig_sp[s]; end
+    elseif "u_icar" in name_strs && "u_iid" in name_strs # BYM2 case
+        sig_sp, phi_sp = vec(chain[:sigma_sp].data), vec(chain[:phi_sp].data)
         for s in 1:N_samples
-            sp_struct[:, s] = sig_sp[s] .* sqrt.(phi_sp[s]) .* vec(u_icar_data[s])
-            sp_unstruct[:, s] = sig_sp[s] .* sqrt.(1 - phi_sp[s]) .* vec(u_iid_data[s])
+            spatial_str[:, s] = vec(chain[:u_icar].data[s]) .* sig_sp[s] .* sqrt.(phi_sp[s])
+            spatial_unstr[:, s] = vec(chain[:u_iid].data[s]) .* sig_sp[s] .* sqrt.(1 .- phi_sp[s])
         end
+    elseif "phi" in name_strs # Besag / SAR case
+        sig_sp = "sigma_sp" in name_strs ? vec(chain[:sigma_sp].data) : ones(N_samples)
+        for s in 1:N_samples; spatial_str[:, s] = vec(chain[:phi].data[s]) .* sig_sp[s]; end
+    elseif "s_eff" in name_strs # Generic GMRF / SAR realized field
+        for s in 1:N_samples; spatial_str[:, s] = vec(chain[:s_eff].data[s]); end
+    elseif "phi_leroux" in name_strs # Leroux case
+        for s in 1:N_samples; spatial_str[:, s] = vec(chain[:phi_leroux].data[s]); end
     end
 
-    if any(occursin.("f_tm_raw", name_strs))
+    # 2. Temporal Reconstruction (AR1)
+    if "f_tm_raw" in name_strs
         sig_tm = "sigma_tm" in name_strs ? vec(chain[:sigma_tm].data) : ones(N_samples)
-        f_tm_data = chain[:f_tm_raw].data
-        for s in 1:N_samples; temporal[:, s] = vec(f_tm_data[s]) .* sig_tm[s]; end
+        for s in 1:N_samples; temporal[:, s] = vec(chain[:f_tm_raw].data[s]) .* sig_tm[s]; end
     end
 
-    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
-
-    for s in 1:N_samples
-        for i in 1:N_obs
-            a, t = modinputs.area_idx[i], modinputs.time_idx[i]
-            eta[i, s] = modinputs.log_offset[i] + sp_struct[a, s] + sp_unstruct[a, s] + temporal[t, s]
-        end
+    # 3. SVC Matrix Reconstruction
+    N_svc = size(modinputs.u_obs, 2)
+    beta_svc_mat = zeros(N_areas, N_svc, N_samples)
+    if arch isa SVCArchitecture && "beta_svc_mat" in name_strs
+        svc_data = chain[:beta_svc_mat].data
+        for s in 1:N_samples; beta_svc_mat[:, :, s] = reshape(vec(svc_data[s]), N_areas, N_svc); end
     end
-
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
-
-    return (
-        spatial_structured = summarize_array(reshape(sp_struct, N_areas, 1, N_samples); alpha=alpha),
-        spatial_unstructured = summarize_array(reshape(sp_unstruct, N_areas, 1, N_samples); alpha=alpha),
-        spatial = summarize_array(reshape(sp_struct .+ sp_unstruct, N_areas, 1, N_samples); alpha=alpha),
-        temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
-        seasonal = summarize_array(reshape(seasonal, N_time, 1, N_samples); alpha=alpha),
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        family = fam, architecture = arch
-    )
-end
-
-
-function _reconstruct(arch::RFFArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_areas = length(modinputs.y), size(modinputs.W, 1)
-    N_samples = size(chain, 1)
-    all_names = FlexiChains.parameters(chain)
-    name_strs = string.(all_names)
-
-    # Containers
-    spatial = zeros(N_areas, N_samples)
-    temporal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
-    seasonal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
-    eta = zeros(N_obs, N_samples)
-
-    # 1. RFF Spatial Component
-    if any(occursin.("beta_rff", name_strs))
-        # RFF logic would ideally project from frequencies
-        # For summary, we check if s_eff or similar is pre-calculated or needs mapping
-    end
-
-    # 2. BYM2 if present in hybrid models
-    if any(occursin.("u_icar", name_strs))
-        sig_sp = "sigma_sp" in name_strs ? vec(chain[:sigma_sp].data) : ones(N_samples)
-        phi_sp = "phi_sp" in name_strs ? vec(chain[:phi_sp].data) : fill(0.5, N_samples)
-        u_icar_data = chain[:u_icar].data
-        u_iid_data = chain[:u_iid].data
-
-        for s in 1:N_samples
-            u_icar_vec = vec(u_icar_data[s])
-            u_iid_vec = vec(u_iid_data[s])
-            spatial[:, s] = sig_sp[s] .* (sqrt(phi_sp[s]) .* u_icar_vec .+ sqrt(1 - phi_sp[s]) .* u_iid_vec)
-        end
-    end
-
-    # 3. Categorical Covariates
-    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
 
     # 4. Predictor Assembly
+    beta_z = "beta_z" in name_strs ? vec(chain[:beta_z].data) : zeros(N_samples)
+    st_int_present = "st_int_raw" in name_strs
+    sig_int = st_int_present ? vec(chain[:sigma_int].data) : zeros(N_samples)
+
     for s in 1:N_samples
+        st_i = st_int_present ? reshape(vec(chain[:st_int_raw].data[s]) .* sig_int[s], N_areas, N_time) : zeros(N_areas, N_time)
         for i in 1:N_obs
-            a = modinputs.area_idx[i]
-            eta[i, s] = modinputs.log_offset[i] + spatial[a, s]
+            a, t = modinputs.area_idx[i], modinputs.time_idx[i]
+            eta[i, s] = modinputs.log_offset[i] + spatial_str[a, s] + spatial_unstr[a, s] + temporal[t, s] + st_i[a, t] + beta_z[s] * modinputs.z_obs[i]
+            if arch isa SVCArchitecture
+                for k in 1:N_svc; eta[i, s] += modinputs.u_obs[i, k] * beta_svc_mat[a, k, s]; end
+            end
+            for k in 1:4
+                p = Symbol("beta_cov[" * string(k) * "][" * string(modinputs.cov_indices[i, k]) * "]")
+                if p in Symbol.(name_strs); eta[i, s] += chain[p].data[s]; end
+            end
         end
     end
 
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+    actual_fam = (fam isa UnknownFamily) ? PoissonFamily() : fam
+    denoised, noisy, log_lik = _process_ll_and_predictions(actual_fam, eta, chain, modinputs, N_obs, N_samples)
 
-    return (
-        spatial_structured = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
-        spatial_unstructured = nothing,
-        spatial = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
-        temporal = summarize_array(reshape(temporal, size(temporal, 1), 1, N_samples); alpha=alpha),
-        seasonal = summarize_array(reshape(seasonal, size(seasonal, 1), 1, N_samples); alpha=alpha),
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        family = fam,
-        architecture = arch
-    )
+    return (spatial_structured = summarize_array(reshape(spatial_str, N_areas, 1, N_samples); alpha=alpha),
+            spatial_unstructured = any(spatial_unstr .!= 0) ? summarize_array(reshape(spatial_unstr, N_areas, 1, N_samples); alpha=alpha) : nothing,
+            spatial = summarize_array(reshape(spatial_str .+ spatial_unstr, N_areas, 1, N_samples); alpha=alpha),
+            temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
+            seasonal = nothing,
+            predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+            predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+            waic = _compute_waic(log_lik),
+            family = actual_fam, architecture = arch)
 end
 
-function _reconstruct(arch::DeepArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs = length(modinputs.y)
-    N_samples = size(chain, 1)
-    all_names = FlexiChains.parameters(chain)
-    name_strs = string.(all_names)
 
+function _reconstruct(arch::Union{RFFArchitecture, SpectralArchitecture, SPDEArchitecture}, fam::ModelFamily, chain, modinputs, alpha)
+    """
+    _reconstruct(arch, fam, chain, modinputs, alpha)
+
+    Post-processing for models using spectral bases (RFF, FFT) or SPDE mesh approximations.
+    
+    Key Distinction:
+    Unlike GMRF models where effects are area-indexed, spectral models typically provide
+    realized latent fields (s_eff/f_gp) directly at the observation level (N_obs).
+    """
+    N_obs, N_areas, N_time = length(modinputs.y), size(modinputs.W, 1), Int(maximum(modinputs.time_idx))
+    N_samples = size(chain, 1)
+    name_strs = string.(FlexiChains.parameters(chain))
+
+    spatial = zeros(N_obs, N_samples)
+    temporal = zeros(N_time, N_samples)
     eta = zeros(N_obs, N_samples)
 
-    for s in 1:N_samples
-        eta[:, s] .= modinputs.log_offset
+    # 1. Realized Spatial Field Extraction
+    target_field = "s_eff" in name_strs ? :s_eff : ("f_gp" in name_strs ? :f_gp : nothing)
+    if !isnothing(target_field)
+        for s in 1:N_samples; spatial[:, s] = vec(chain[target_field].data[s]); end
     end
 
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+    # 2. Temporal Trend and Interaction
+    if "f_tm_raw" in name_strs
+        sig_tm = "sigma_tm" in name_strs ? vec(chain[:sigma_tm].data) : ones(N_samples)
+        for s in 1:N_samples; temporal[:, s] = vec(chain[:f_tm_raw].data[s]) .* sig_tm[s]; end
+    end
 
-    return (
-        spatial_structured = nothing,
-        spatial_unstructured = nothing,
-        spatial = nothing,
-        temporal = nothing,
-        seasonal = nothing,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        family = fam,
-        architecture = arch
-    )
+    st_int_present = "st_int_raw" in name_strs
+    sig_int = st_int_present ? vec(chain[:sigma_int].data) : zeros(N_samples)
+
+    # 3. Predictor Assembly (N_obs level projection)
+    beta_z = "beta_z" in name_strs ? vec(chain[:beta_z].data) : zeros(N_samples)
+    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
+
+    for s in 1:N_samples
+        st_i = st_int_present ? reshape(vec(chain[:st_int_raw].data[s]) .* sig_int[s], N_areas, N_time) : zeros(N_areas, N_time)
+        for i in 1:N_obs
+            a, t = modinputs.area_idx[i], modinputs.time_idx[i]
+            eta[i, s] = modinputs.log_offset[i] + spatial[i, s] + temporal[t, s] + st_i[a, t] + beta_z[s] * modinputs.z_obs[i]
+            for k in 1:4
+                p = Symbol("beta_cov[$k][$(modinputs.cov_indices[i, k])]")
+                if p in Symbol.(name_strs); eta[i, s] += chain[p].data[s]; end
+            end
+        end
+    end
+
+    actual_fam = (fam isa UnknownFamily) ? PoissonFamily() : fam
+    denoised, noisy, log_lik = _process_ll_and_predictions(actual_fam, eta, chain, modinputs, N_obs, N_samples)
+
+    return (spatial_structured = summarize_array(reshape(spatial, N_obs, 1, N_samples); alpha=alpha),
+            spatial_unstructured = nothing,
+            spatial = summarize_array(reshape(spatial, N_obs, 1, N_samples); alpha=alpha),
+            temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
+            seasonal = nothing,
+            beta_cov = beta_cov_eff,
+            predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+            predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+            waic = _compute_waic(log_lik),
+            family = actual_fam, architecture = arch)
 end
 
 
+function _reconstruct(arch::Union{MosaicArchitecture, DeepArchitecture, DenseGPArchitecture}, fam::ModelFamily, chain, modinputs, alpha)
+    """
+    _reconstruct(arch, fam, chain, modinputs, alpha)
 
-function _reconstruct(arch::LerouxArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_areas, N_time = length(modinputs.y), size(modinputs.Q_sp, 1), Int(maximum(modinputs.time_idx))
+    Post-processing for Deep Gaussian Processes, Mosaic Experts, and Dense GP models.
+
+    Mathematical Logic:
+    1. Manifold Extraction: Extracts the realized latent field from the GP manifold (f_latent, eta_gp, etc.).
+    2. Temporal Trend: Supports additive AR1 trends if defined outside the GP kernel.
+    3. Seasonal Effects: Reconstructs harmonic components (sin/cos) for periodic models.
+    4. Prediction: Maps latent states through inverse-link functions with offset scaling.
+    """
+    N_obs, N_time = length(modinputs.y), Int(maximum(modinputs.time_idx))
+    N_samples = size(chain, 1)
+    name_strs = string.(FlexiChains.parameters(chain))
+
+    spatial = zeros(N_obs, N_samples)
+    temporal = zeros(N_time, N_samples)
+    eta = zeros(N_obs, N_samples)
+
+    # 1. Latent Manifold Extraction
+    target = "f_latent" in name_strs ? :f_latent : ("eta_gp" in name_strs ? :eta_gp : ("eta_spatial_time" in name_strs ? :eta_spatial_time : nothing))
+    if !isnothing(target)
+        for s in 1:N_samples; spatial[:, s] = vec(chain[target].data[s]); end
+    end
+
+    # 2. Temporal (if explicitly defined outside the GP manifold)
+    if "f_tm_raw" in name_strs
+        sig_tm = "sigma_tm" in name_strs ? vec(chain[:sigma_tm].data) : ones(N_samples)
+        for s in 1:N_samples; temporal[:, s] = vec(chain[:f_tm_raw].data[s]) .* sig_tm[s]; end
+    end
+
+    # 3. Covariates and Seasonal Effects
+    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
+
+    # Check for seasonal harmonic coefficients if present in Adaptive RFF models
+    has_seasonal = "beta_cos" in name_strs && "beta_sin" in name_strs
+    seasonal_post = zeros(N_time, N_samples)
+    if has_seasonal
+        bc, bs = vec(chain[:beta_cos].data), vec(chain[:beta_sin].data)
+        for s in 1:N_samples
+            t_vals = collect(1:N_time)
+            seasonal_post[:, s] = bc[s] .* cos.(2pi .* t_vals ./ 12.0) .+ bs[s] .* sin.(2pi .* t_vals ./ 12.0)
+        end
+    end
+
+    # 4. Assembly
+    for s in 1:N_samples
+        for i in 1:N_obs
+            t = modinputs.time_idx[i]
+            eta[i, s] = modinputs.log_offset[i] + spatial[i, s] + temporal[t, s] + (has_seasonal ? seasonal_post[t, s] : 0.0)
+            for k in 1:4
+                p = Symbol("beta_cov[$k][$(modinputs.cov_indices[i, k])]")
+                if p in Symbol.(name_strs); eta[i, s] += chain[p].data[s]; end
+            end
+        end
+    end
+
+    actual_fam = (fam isa UnknownFamily) ? GaussianFamily() : fam
+    denoised, noisy, log_lik = _process_ll_and_predictions(actual_fam, eta, chain, modinputs, N_obs, N_samples)
+
+    return (spatial_structured = summarize_array(reshape(spatial, N_obs, 1, N_samples); alpha=alpha),
+            spatial_unstructured = nothing,
+            spatial = summarize_array(reshape(spatial, N_obs, 1, N_samples); alpha=alpha),
+            temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
+            seasonal = has_seasonal ? summarize_array(reshape(seasonal_post, N_time, 1, N_samples); alpha=alpha) : nothing,
+            beta_cov = beta_cov_eff,
+            predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+            predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+            waic = _compute_waic(log_lik),
+            family = actual_fam, architecture = arch)
+end
+
+
+function _reconstruct(arch::UnknownArchitecture, fam::ModelFamily, chain, modinputs, alpha)
+    """
+    _reconstruct(arch, fam, chain, modinputs, alpha)
+
+    Fallback post-processing engine for undefined or experimental architectures.
+    Attempts a generic assembly of spatial and temporal components if standard parameter
+    naming conventions (e.g., s_eff, f_tm_raw) are detected.
+    """
+    N_obs, N_areas, N_time = length(modinputs.y), size(modinputs.W, 1), Int(maximum(modinputs.time_idx))
     N_samples = size(chain, 1)
     name_strs = string.(FlexiChains.parameters(chain))
 
@@ -3997,186 +4353,46 @@ function _reconstruct(arch::LerouxArchitecture, fam::ModelFamily, chain, modinpu
     temporal = zeros(N_time, N_samples)
     eta = zeros(N_obs, N_samples)
 
-    if "phi_leroux" in name_strs
-        phi_data = chain[:phi_leroux].data
-        for s in 1:N_samples; spatial[:, s] = vec(phi_data[s]); end
+    # 1. Generic Spatial Extraction (Area-indexed)
+    s_key = "s_eff" in name_strs ? :s_eff : ("phi" in name_strs ? :phi : nothing)
+    if !isnothing(s_key)
+        sig_sp = "sigma_sp" in name_strs ? vec(chain[:sigma_sp].data) : ones(N_samples)
+        for s in 1:N_samples; spatial[:, s] = vec(chain[s_key].data[s]) .* sig_sp[s]; end
     end
 
+    # 2. Generic Temporal Extraction (Time-indexed)
     if "f_tm_raw" in name_strs
         sig_tm = "sigma_tm" in name_strs ? vec(chain[:sigma_tm].data) : ones(N_samples)
-        f_tm_data = chain[:f_tm_raw].data
-        for s in 1:N_samples; temporal[:, s] = vec(f_tm_data[s]) .* sig_tm[s]; end
+        for s in 1:N_samples; temporal[:, s] = vec(chain[:f_tm_raw].data[s]) .* sig_tm[s]; end
     end
 
-    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
-
+    # 3. Predictor Assembly
     for s in 1:N_samples
         for i in 1:N_obs
             a, t = modinputs.area_idx[i], modinputs.time_idx[i]
             eta[i, s] = modinputs.log_offset[i] + spatial[a, s] + temporal[t, s]
+            
+            # Apply any categorical effects if found
+            for k in 1:4
+                p = Symbol("beta_cov[$k][$(modinputs.cov_indices[i, k])]")
+                if p in Symbol.(name_strs); eta[i, s] += chain[p].data[s]; end
+            end
         end
     end
 
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
+    actual_fam = (fam isa UnknownFamily) ? PoissonFamily() : fam
+    denoised, noisy, log_lik = _process_ll_and_predictions(actual_fam, eta, chain, modinputs, N_obs, N_samples)
 
-    return (
-        spatial_structured = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
-        spatial_unstructured = nothing, 
-        spatial = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
-        temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
-        seasonal = nothing, 
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik), 
-        family = fam, architecture = arch
-    )
-end
-
-
-function _reconstruct(arch::SARArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_areas = length(modinputs.y), size(modinputs.Q_sp, 1)
-    N_samples = size(chain, 1)
-    all_names = FlexiChains.parameters(chain)
-    name_strs = string.(all_names)
-
-    spatial = zeros(N_areas, N_samples)
-    temporal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
-    seasonal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
-    eta = zeros(N_obs, N_samples)
-
-    if any(occursin.("s_eff", name_strs))
-        s_eff_data = chain[:s_eff].data
-        for s in 1:N_samples; spatial[:, s] = vec(s_eff_data[s]); end
-    end
-
-    if any(occursin.("f_tm_raw", name_strs))
-        sig_tm = "sigma_tm" in name_strs ? vec(chain[:sigma_tm].data) : ones(N_samples)
-        f_tm_data = chain[:f_tm_raw].data
-        for s in 1:N_samples; temporal[:, s] = vec(f_tm_data[s]) .* sig_tm[s]; end
-    end
-
-    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
-
-    for s in 1:N_samples
-        for i in 1:N_obs
-            a, t = modinputs.area_idx[i], modinputs.time_idx[i]
-            eta[i, s] = modinputs.log_offset[i] + spatial[a, s] + temporal[t, s]
-        end
-    end
-
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
-
-    return (
-        spatial_structured = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
-        spatial_unstructured = nothing,
-        spatial = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
-        temporal = summarize_array(reshape(temporal, size(temporal, 1), 1, N_samples); alpha=alpha),
-        seasonal = summarize_array(reshape(seasonal, size(seasonal, 1), 1, N_samples); alpha=alpha),
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        family = fam,
-        architecture = arch
-    )
-end
-
-function _reconstruct(arch::SVCArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_areas = length(modinputs.y), size(modinputs.Q_sp, 1)
-    N_samples = size(chain, 1)
-    name_strs = string.(FlexiChains.parameters(chain))
-    
-    spatial = zeros(N_areas, N_samples)
-    eta = zeros(N_obs, N_samples)
-
-    if "s_eff" in name_strs
-        s_data = chain[:s_eff].data
-        for s in 1:N_samples; spatial[:, s] = vec(s_data[s]); end
-    end
-
-    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
-    for s in 1:N_samples
-        eta[:, s] .= modinputs.log_offset .+ spatial[modinputs.area_idx, s]
-    end
-
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
-
-    return (
-        spatial_structured = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
-        spatial_unstructured = nothing,
-        spatial = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
-        temporal = nothing,
-        seasonal = nothing,
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik), 
-        family = fam, architecture = arch
-    )
-end
-
-
-function _reconstruct(arch::MosaicArchitecture, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_areas = length(modinputs.y), size(modinputs.W, 1)
-    N_samples = size(chain, 1)
-    all_names = FlexiChains.parameters(chain)
-    name_strs = string.(all_names)
-    eta = zeros(N_obs, N_samples)
-
-    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
-
-    for s in 1:N_samples; eta[:, s] .= modinputs.log_offset; end
-
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
-
-    return (
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        family = fam,
-        architecture = arch
-    )
-end
-
-
-function _reconstruct(arch::Union{SPDEArchitecture, SpectralArchitecture, DenseGPArchitecture}, fam::ModelFamily, chain, modinputs, alpha)
-    N_obs, N_samples = length(modinputs.y), size(chain, 1)
-    name_strs = string.(FlexiChains.parameters(chain))
-    eta = zeros(N_obs, N_samples)
-    temporal = zeros(Int(maximum(modinputs.time_idx)), N_samples)
-
-    target = "f_latent" in name_strs ? :f_latent : "f_gp" in name_strs ? :f_gp : "s_eff" in name_strs ? :s_eff : nothing
-    
-    if !isnothing(target)
-        data = chain[target].data
-        for s in 1:N_samples; eta[:, s] = modinputs.log_offset .+ vec(data[s]); end
-    else
-        for s in 1:N_samples; eta[:, s] .= modinputs.log_offset; end
-    end
-
-    if "f_tm_raw" in name_strs
-        sig_tm = "sigma_tm" in name_strs ? vec(chain[:sigma_tm].data) : ones(N_samples)
-        f_tm_data = chain[:f_tm_raw].data
-        for s in 1:N_samples; temporal[:, s] = vec(f_tm_data[s]) .* sig_tm[s]; end
-    end
-
-    beta_cov_eff = _extract_beta_cov(name_strs, chain, modinputs, N_samples, alpha)
-    denoised, noisy, log_lik = _process_ll_and_predictions(fam, eta, chain, modinputs, N_obs, N_samples)
-
-    return (
-        spatial_structured = nothing,
-        spatial_unstructured = nothing,
-        spatial = nothing, 
-        temporal = summarize_array(reshape(temporal, size(temporal,1), 1, N_samples); alpha=alpha),
-        seasonal = nothing,
-        beta_cov = beta_cov_eff,
-        predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik), 
-        family = fam, architecture = arch
-    )
+    return (spatial_structured = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
+            spatial_unstructured = nothing,
+            spatial = summarize_array(reshape(spatial, N_areas, 1, N_samples); alpha=alpha),
+            temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
+            seasonal = nothing,
+            beta_cov = nothing,
+            predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
+            predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+            waic = _compute_waic(log_lik),
+            family = actual_fam, architecture = arch)
 end
 
 
@@ -4192,13 +4408,27 @@ function model_results_comprehensive(model, chain, modinputs, areal_units; alpha
     waic_val = pstats.waic
 
     ss = summarystats(chain) 
-    mean_ess_bulk = mean( x for x in Array(ss[:,stat=At(:ess_bulk)] ) if !isnan(x)  )
-    mean_ess_tail = mean( x for x in Array(ss[:,stat=At(:ess_tail)] ) if !isnan(x)  )
-    mean_rhat = mean( x for x in Array(ss[:,stat=At(:rhat)] ) if !isnan(x)   )
+  
+    # Robust diagnostic extraction with initial values to prevent ArgumentError on empty collections
+    ess_bulk_vals = [x for x in Array(ss[:,stat=At(:ess_bulk)] ) if !isnan(x) ]
+    mean_ess_bulk = isempty(ess_bulk_vals) ? NaN : mean(ess_bulk_vals)
+    
+    ess_tail_vals = [x for x in Array(ss[:,stat=At(:ess_tail)] ) if !isnan(x) ]
+    mean_ess_tail = isempty(ess_tail_vals) ? NaN : mean(ess_tail_vals)
+    
+    rhat_vals = [ x for x in Array(ss[:,stat=At(:rhat)] ) if !isnan(x) ]
+    mean_rhat = isempty(rhat_vals) ? NaN : mean(rhat_vals)
+ 
+    compute_time_seconds=only( round.(chn._metadata.sampling_time, digits=1))  # sampling time (sec)
+    modelname = string(model.f)
 
-    metrics = (rmse=rmse, r2=r2, waic=waic_val, 
-        mean_ess_bulk=mean_ess_bulk, mean_ess_tail=mean_ess_tail, mean_rhat=mean_rhat)
-    display(metrics)
+    metrics = ( modelname=modelname, 
+         compute_time_seconds=compute_time_seconds,
+        rmse=rmse, r2=r2, waic=waic_val, mean_rhat=mean_rhat,
+        mean_ess_bulk=mean_ess_bulk, mean_ess_tail=mean_ess_tail, 
+        ess_per_second=mean_ess_bulk/compute_time_seconds )
+
+    showtuples( metrics ) 
 
     # Plots
     plt_ppc = scatter(y_pred, y_obs, alpha=0.4, label="Obs vs Pred", title="PPC (RMSE: $(round(rmse, digits=3)), WAIC: $(round(waic_val, digits=1)))", xlabel="Pred", ylabel="Obs")
@@ -4218,8 +4448,11 @@ function model_results_comprehensive(model, chain, modinputs, areal_units; alpha
             title="Seasonal Trend", xlabel="Time", ylabel="Effect", legend=false, fillalpha=0.3)
     end
  
-    plt_sp = plot_posterior_results(pstats, modinputs, areal_units; effect=:spatial)
-    title!(plt_sp, "Main Spatial Effect")
+    plt_sp = nothing 
+    if haskey(pstats, :spatial) && !isnothing(pstats.spatial)
+        plt_sp = plot_posterior_results(pstats, modinputs, areal_units; effect=:spatial)
+        title!(plt_sp, "Main Spatial Effect")
+    end
 
     plt_sp_struct = nothing
     if haskey(pstats, :spatial_structured) && !isnothing(pstats.spatial_structured)
@@ -4232,13 +4465,20 @@ function model_results_comprehensive(model, chain, modinputs, areal_units; alpha
         plt_sp_unstruct = plot_posterior_results(pstats, modinputs, areal_units; effect=:spatial_unstructured )
         title!(plt_sp_unstruct, "Unstructured Spatial Effect")
     end
+ 
+    
+    plt_st_denoised = nothing
+    if haskey(pstats, :predictions_denoised) && !isnothing(pstats.predictions_denoised)
+        plt_st_denoised = plot_posterior_results(pstats, modinputs, areal_units; effect=:predictions_denoised, time_slice=time_slice)
+        title!(plt_st_denoised, "Denoised Predictions (T=$time_slice)")
+    end
 
 
-    plt_st_denoised = plot_posterior_results(pstats, modinputs, areal_units; effect=:predictions_denoised, time_slice=time_slice)
-    title!(plt_st_denoised, "Denoised Predictions (T=$time_slice)")
-
-    plt_st_noisy = plot_posterior_results(pstats, modinputs, areal_units; effect=:predictions_noisy, time_slice=time_slice)
-    title!(plt_st_noisy, "Noisy Predictions (T=$time_slice)")
+    plt_st_noisy = nothing
+    if haskey(pstats, :predictions_noisy) && !isnothing(pstats.predictions_noisy)
+        plt_st_noisy = plot_posterior_results(pstats, modinputs, areal_units; effect=:predictions_noisy, time_slice=time_slice)
+        title!(plt_st_noisy, "Noisy Predictions (T=$time_slice)")
+    end
 
     # Combine only non-nothing plots
     plot_list = filter(!isnothing, [plt_ppc, plt_tm, plt_seas, plt_sp, plt_st_denoised])
@@ -4255,6 +4495,7 @@ function model_results_comprehensive(model, chain, modinputs, areal_units; alpha
             denoised=plt_st_denoised, noisy=plt_st_noisy)
     )
 end
+
 function model_results_comprehensive(model, vi_result::Turing.Variational.VIResult, modinputs, areal_units; alpha=0.05, time_slice=1, n_samples=500)
     # Specialized method for ADVI results produced by convert_advi_to_reconstruct_format
 
@@ -4281,9 +4522,16 @@ function model_results_comprehensive(model, vi_result::Turing.Variational.VIResu
     mean_ess_tail = mean(ss[p, stat=:ess_tail] for p in params)
     mean_rhat = mean(ss[p, stat=:rhat] for p in params)
 
-    metrics = (rmse=rmse, r2=r2, waic=waic_val,
-               mean_ess_bulk=mean_ess_bulk, mean_ess_tail=mean_ess_tail, mean_rhat=mean_rhat)
-    display(metrics)
+    compute_time_seconds=only(round.(chn._metadata.sampling_time, digits=1) ) # sampling time (sec)
+    modelname = string(model.f)
+
+    metrics = ( modelname=modelname, 
+         compute_time_seconds=compute_time_seconds,
+        rmse=rmse, r2=r2, waic=waic_val, mean_rhat=mean_rhat,
+        mean_ess_bulk=mean_ess_bulk, mean_ess_tail=mean_ess_tail, 
+        ess_per_second=mean_ess_bulk/compute_time_seconds )
+
+    showtuples( metrics ) 
 
     # 4. Base Plots (PPC, Spatial)
     plt_ppc = scatter(y_pred, y_obs, alpha=0.4, label="Obs vs Pred",
@@ -4393,3 +4641,5 @@ function convert_advi_to_reconstruct_format(msol, model::DynamicPPL.Model, n_sam
     return (chain=chn, reconstruct_samples=reconstruct_samples)
 end
 
+
+;;

@@ -9,6 +9,15 @@ abstract: |
 metadata-files:
   - _metadata.yml
 
+format:
+  html:
+    code-fold: true
+
+engine: julia
+
+execute:
+  eval: false
+
 params:
   todo: [nothing,add,more,here]
 ---
@@ -248,7 +257,7 @@ Advantages:
 Using our basic spatiotemporal data, let us try to represent them in a discrete manner across space. This is a necessary step if we wish to use the more speedy discrete models. Depending upon the constraints chosen, the spatial partitioning will change. Here, there is some subjectivity in the choice of constraints. The primary one to pay attention is: do we have enough data to represent spatial and  temporal processes. The answer to this depends upon the homogeneity/variability across space and time. In our case, we would like at least 5 time slices represented in each cell and enough total data points in each cell. Stopping conditions are based upon range of allowable total areal units, range of surface areas, and convergence of mean and coefficient of variation of number of points per cell. Adding more is simple as these are simple functions. See [spatial_partitioning_functions.jl](src/spatial_partitioning_functions.jl) for more details. 
 
 
-```{julia}
+```{julia} 
 
 # (; pts  ) = data  # this is a simple way to copy objects into the Main environment
 
@@ -346,12 +355,12 @@ plot_kde_simple(pts_scot, sd_extension_factor=0.25, title="Spatial Intensity (KD
 In the data Tuple (*data_scot*), we have counts (y) of cancer incidence and population size in each area (log_offset). We also simulate a 10-"year" temporal process, a random walk with magnitude 0.5 and a covariate effect (X: an area-specific continuous covariate that represents the proportion of the population employed in agriculture, fishing, or forestry). An overall random uniform observation error of magnitude 0.2 is added with a count then taken as the overall, rounded integer value.
 
 
-#### Spatiotemporal model: a preview 
+#### Spatiotemporal model: the shape of things to come
 
-Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we reformat the data (*data_scot*) with 'prepare_model_inputs()' to create a structured data object and run a simple separable spatiotemporal model (model_D00_poisson_simple).  
+Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we reformat the data (*data_scot*) with 'prepare_model_inputs()' to create a structured data object with the correct variable names and run a simple separable spatiotemporal model (model_D00_poisson_simple).  
  
 ```{julia}
-#| D00: Base Model - Sparse GMRF Separable Spatiotemporal  
+#| label: model_D00_poisson_simple - Sparse GMRF Space and time effect (no interaction)   
 
 # prepare model inputs  
 modinputs = prepare_model_inputs( 
@@ -369,21 +378,51 @@ m = model_D00_poisson_simple(modinputs); # Turing model object
 # sample with Metropolis-Hastings: 
 chn = sample(m, MH(), 5000; num_warmup=10000, thin=50, progress=true, drop_warmup=true ) ;
 
-# extract results see a few figures
+# extract some results  
 res = model_results_comprehensive(m, chn, modinputs, au_scot);
  
-display(res.plots.ppc)
-display(res.plots.tm)
-display(res.plots.seas)
-display(res.plots.denoised)
-display(res.plots.noisy) 
+showparams( res.summarystats )
+  
+display(res.plots.ppc)  # there are a few more generic plots (see inside the object)
+# display(res.plots.tm)
+# display(res.plots.denoised)
 
 
 ```
- 
-These results are "ok". But there is lots of room for improvement--starting with the sampler: MH() is a simple one that is used here for checking timings only. Extracting different components of the model internals takes a little more digging, but as these are Bayesian models, every aspect is completely available and adjustable. The model itself is a basic one (separable time and space) with no covariates. However, it does use optimizations that take advantage of the sparse nature of the neighbourhood adjacency matrix and the temporal autocorrelation. In other words, a sparse form can speed through 15000 samples in a reasonable amount of time (7.6 seconds). 
 
-In contrast, when an unoptimized model is used, the inversion of the full spatial and temporal covariance matrices is required ($O(n^3)$) due to the dense nature of the covariance matrices. This is approach is equivalent to Kriging solutions, where a squared exponential covariance function is used for both space and time. Notice that the following used 2 orders of magnitude fewer samples (150) than the sparse form and it still take more time (21 secconds, almost 3 X more for 100 X fewer samples !).   
+```
+modelname: model_D00_poisson_simple
+compute_time_seconds: 2.2
+rmse: 7.342
+r2: 0.39
+waic: 6165.64
+mean_rhat: 1.438
+mean_ess_bulk: 10.786
+mean_ess_tail: NaN
+ess_per_second: 4.903
+
+      param    mean     std    mcse  ess_bulk  ess_tail    rhat      q5     q50     q95                               │
+│   sigma_sp  0.3388  0.0279  0.0085   10.7856       NaN  1.4377  0.3224  0.3224  0.3861                               │
+│     phi_sp  0.7136  0.3260  0.0993   10.7856       NaN  1.4377  0.1611  0.9059  0.9059                               │
+│   sigma_tm  0.0883  0.0194  0.0059   10.7856       NaN  1.4377  0.0553  0.0997  0.0997                               │
+│     rho_tm  0.5066  0.2403  0.0732   10.7856       NaN  1.4377  0.0993  0.6484  0.6484                               │
+╰
+
+```
+
+These results have not converged (rhat is far from 1). 
+
+But even still, there is some reasonably description of the spatial patterns. However, there is also lots of room for improvement:
+
+  - the sampler: MH() is a simple one that is used here for checking timings only. 
+  - The model itself is a basic one (separable time and space) with no covariates.
+
+Extracting different components of the model internals takes a little more digging, but as these are Bayesian models, every aspect is completely available and adjustable. 
+
+However, it does use optimizations that take advantage of the sparse nature of the neighbourhood adjacency matrix and the temporal autocorrelation. In other words, a sparse form can speed through 15000 samples in a reasonable amount of time (7.6 seconds). 
+
+In contrast, when a naive model is used (below), inversion of the full spatial and temporal covariance matrices is required, $O(n^3)$, due to the dense nature of the covariance matrices. This dense approach is equivalent to "Kriging" solutions, where a squared exponential covariance function is used for both space and time. However, in Kriging, Least-squares assumptions are used to speed up computations. Notice that the following, there were two orders of magnitude fewer samples (150) than the sparse form and it still takes more time (21 seconds, almost 3 X more for 100 X fewer samples !).  This is not a completely fair evaluation as there is a space-time interaction effect, whereas in the sparse version, there are only the main effects of space and time with no "interaction-effect." A better speed comparison is  to examine the effective number of samples per second ("ess_per_second") which ultimately will constrain total computational time. The effective sampling speed is about three times slower. The target total ESS will vary with application and data density, but we want a value that is as high as possible, in order have reasonably reliable descriptions of the the full posteriors.  
+
 
 ```{julia}
 #| label: C00: Base Model - Dense Kernel Matrix Separable Spatiotemporal GP
@@ -393,6 +432,27 @@ chn = sample(m, MH(), 50; num_warmup=100, thin=50, progress=true, drop_warmup=tr
 # res = model_results_comprehensive(m, chn, modinputs, au_scot);
 
 ```    
+
+```
+modelname: model_C00_gaussian_dense_gp
+compute_time_seconds: 3.0
+rmse: 9.698
+r2: 0.192
+waic: 135201.129
+mean_rhat: 1.874
+mean_ess_bulk: 3.83
+mean_ess_tail: NaN
+ess_per_second: 1.277
+
+     param    mean     std    mcse  ess_bulk  ess_tail    rhat      q5     q50     q95                                │
+│   sigma_y  3.5173  0.1456  0.0580    7.5456       NaN  1.6971  3.3279  3.6066  3.6810                                │
+│   sigma_f  0.6982  0.3090  0.2002    1.8983       NaN  1.6974  0.3053  0.7844  0.9935                                │
+│      ls_s  3.8879  1.1169  0.3353    9.1612       NaN  1.9799  1.2971  3.9121  4.6927                                │
+│      ls_t  3.4763  1.0789  0.7393    1.5769       NaN  2.1675  2.7006  3.1822  5.7160                                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+```
+
 
 *   Spatiotemporal GP (f):
     *   Separable Covariance: Assumes the spatiotemporal kernel can be factored into a product of a spatial kernel and a temporal kernel, i.e., $K((x_s, t_s), (x_t, t_t)) = K_s(x_s, x_t) \times K_t(t_s, t_t)$.
@@ -406,9 +466,12 @@ chn = sample(m, MH(), 50; num_warmup=100, thin=50, progress=true, drop_warmup=tr
 *   Priors: Standard weakly informative priors (Exponential for scales, Normal for coefficients, Uniform for phases).
 
 *   Problem: very slow, really slow
-
+*   Advantage: does not use least-squares
 
 The other purpose of the above example was to show that the workflow is simple, once the model form has been chosen. The model structure is important and where the time and resources should be spent: deliberating utility, rather than trying to debug,implement and run.
+
+Note: Though both models did not converge, the WAIC seems really poor with this dense model and will require much more time to sample the "evidence" surface. 
+
 
 #### Optimization-based approaches
 
@@ -449,7 +512,7 @@ res_map.params
 # Variational Inference: slower .. (about 30 minutes; uses ~ 30 GB RAM)
 samples_per_step = 10
 max_iters = 1000
-no_samples = 1000
+n_samples = 1000
 
 # q_init = q_locationscale
 # q_init = q_meanfield_gaussian 
@@ -459,14 +522,60 @@ q_init = q_fullrank_gaussian
 chn_vi = vi(m, q_init, max_iters, adtype=AutoForwardDiff(), show_progress=true) #;, optimizer=Flux.ADAM(1e-1));
    
 # Convert to reconstruct-compatible format
-chn = convert_advi_to_reconstruct_format(m, chn_vi, no_samples)
+# chn = convert_advi_to_reconstruct_format(chn_vi, m, n_samples)
 
 # Reconstruct and Visualize
-res = model_results_comprehensive(m, chn, modinputs_count, au)
- 
+res = model_results_comprehensive(m, chn_vi, modinputs, au_scot);
+
+display(res.metrics)
+
 ``` 
 
 Any of these point estimates can be used as starting points for MCMC runs--if you trust the point estimates to have converged to a correct solution, otherwise you would be pointing MCMC runs to start from a pathological positon. 
+
+### Reconstruction of effects and predictions 
+ 
+The `_reconstruct` function is the core post-processing engine of the `bstm` package. It transforms raw MCMC chains into structured summaries of latent fields, effect sizes, and model predictions. Quite often, this can be more of a struggle than the modelling! 
+
+
+Standardized Output Schema  
+
+To ensure compatibility across all architectures (GMRF, Spectral, GP, etc.), the function returns a `NamedTuple` with the following keys:
+
+| Key                       | Description                                                             | Type                            |
+| :--------------------------| :------------------------------------------------------------------------| :--------------------------------|
+| `spatial_structured`      | Summarized structured spatial field (e.g., ICAR, GCN, GP).              | `NamedTuple` (mean, median, CI) |
+| `spatial_unstructured`    | Summarized IID spatial noise (applicable to BYM2).                      | `NamedTuple` or `nothing`       |
+| `spatial`                 | Total spatial effect (`structured` + `unstructured`).                   | `NamedTuple`                    |
+| `temporal`                | Main temporal trend (e.g., AR1, RW1).                                   | `NamedTuple`                    |
+| `seasonal`                | Periodic components (e.g., harmonic sin/cos).                           | `NamedTuple` or `nothing`       |
+| `beta_cov`                | Summarized effects for categorical/smooth covariates.                   | `NamedTuple` or `nothing`       |
+| `predictions_denoised`    | Expected value of the response (link-scale $\to$ response-scale).       | `NamedTuple`                    |
+| `predictions_noisy`       | Predicted values including observation noise (e.g., Gaussian $\sigma$). | `NamedTuple`                    |
+| `waic`                    | Widely Applicable Information Criterion.                                | `Float64`                       |
+| `family` / `architecture` | Traits identifying the model type.                                      | `ModelTrait`                    |
+
+
+Linear Predictor Assembly: bstm reconstructs the linear predictor $\eta_{i,s}$ for every observation $i$ and MCMC sample $s$:
+
+$$\eta_{i,s} = \text{Offset}_i + \text{Spatial}_{a[i],s} + \text{Temporal}_{t[i],s} + \text{Interaction}_{a,t,s} + \sum_{k} \beta_{k, \text{level}[i],s}$$
+
+
+### Technical Reference: Linear Predictor Assembly Audit
+
+All `_reconstruct` methods have been verified to handle magnitude scaling via the following assembly logic:
+
+$$\eta_{i,s} = \text{Offset}_i + \text{Spatial}_{a[i],s} + \text{Temporal}_{t[i],s} + \text{Interaction}_{a[i],t[i],s} + \sum \text{Covariates}_{i,s}$$
+
+1.  **Offsets**: Handled as `modinputs.log_offset[i]`. This ensures that Poisson rates are scaled to the expected counts (e.g., $E_i \exp(\eta_{base})$).
+2.  **Interactions**: Reconstructed by scaling the latent `st_int_raw` vector by `sigma_int` and reshaping it into a $[Area \times Time]$ matrix before indexing with `a, t = area_idx[i], time_idx[i]`.
+3.  **Categorical Effects**: Indexed dynamically via `modinputs.cov_indices[i, k]`, supporting second-order random walk (RW2) smoothing levels.
+ 
+
+Architecture-Specific Logic:
+*   **GMRF (Besag, BYM2, Leroux)**: Maps latent area-indexed vectors back to the original observation indices.
+*   **Spectral/Basis (RFF, FFT)**: Extracts realized latent fields $f(s,t)$ that are often already defined at the observation level ($N_{obs} \times N_{samples}$).
+*   **Deep/Mosaic**: Handles non-linear manifold mapping and soft-boundary stitching for localized experts.
    
 
 ### Finalize simulated data 
@@ -562,11 +671,11 @@ modinputs_lognormal = merge(modinputs_reference, (y=exp.(data.y_obs),))
 model_list = Dict(
     # --- D-Series: Discrete Spatial Models (GMRF/BYM2) ---
     "D00_poisson_simple"      => () -> model_D00_poisson_simple(modinputs_count),
-    "D01_poisson"             => () -> model_D01_poisson(modinputs_count),
-    "D02_poisson_leroux"      => () -> model_D02_poisson_leroux(modinputs_count),
-    "D03_poisson_localised"   => () -> model_D03_poisson_localised(modinputs_count),
-    "D04_poisson_sar"         => () -> model_D04_poisson_sar(modinputs_count),
-    "D05_poisson_mcar"        => () -> model_D05_poisson_mcar(modinputs_count),
+    "D01_poisson_besag"       => () -> model_D01_poisson_besag(modinputs_count),
+    "D02_poisson_bym2"        => () -> model_D02_poisson_bym2(modinputs_count),
+    "D03_poisson_leroux"      => () -> model_D03_poisson_leroux(modinputs_count),
+    "D04_poisson_localised"   => () -> model_D04_poisson_localised(modinputs_count),
+    "D05_poisson_sar"         => () -> model_D05_poisson_sar(modinputs_count),
     "D06_poisson_svc"         => () -> model_D06_poisson_svc(modinputs_count),
     "D07_poisson_dag"         => () -> model_D07_poisson_dag(modinputs_count),
     "D08_poisson_hurdle"      => () -> model_D08_hurdle(modinputs_count),
@@ -585,6 +694,7 @@ model_list = Dict(
     "D21_fitc_bym2"           => () -> model_D21_fitc(modinputs_gaussian),
     "D22_fitc_nonlinear"      => () -> model_D22_fitc_nonlinear_nested_rff(modinputs_gaussian),
     "D23_gptime_fitc"         => () -> model_D23_gptime_fitc(modinputs_gaussian),
+    "D24_poisson_mcar"        => () -> model_D24_poisson_mcar(modinputs_count),
 
     # --- C-Series: Continuous Spatial Models (Deep GP/RFF/SPDE) ---
     "C01_dense_gp"            => () -> model_C01_gaussian_dense_gp(modinputs_gaussian),
@@ -611,23 +721,25 @@ model_list = Dict(
     "C22_rff_mf_gp"           => () -> model_C22_rff_multifidelity_gp(modinputs_gaussian),  # multiplication error
     "C23_dfrff_mf_gp"         => () -> model_C23_dfrff_multifidelity_gp(modinputs_gaussian),  # Dim mismatch 3 vs 4  
     "C24_semi_adaptive_rff"   => () -> model_C24_semi_adaptive_dfrff(modinputs_gaussian),  # Dim mismatch 3 vs 4
-    "C25_hybrid_fitc_rff"     => () -> model_C25_hybrid_fitc_rff(modinputs_gaussian)  # Dim mismatch 3 vs 4
+    "C25_hybrid_fitc_rff"     => () -> model_C25_hybrid_fitc_rff(modinputs_gaussian),  # Dim mismatch 3 vs 4
+
+    # SOTA (state of the art)
+    "SOTA1_poisson_BGCN"      => () -> model_SOTA1_poisson_BGCN(modinputs_counts)
 )
 
  
-# quick check to see if all models are still functional 
-mk = sort( collect(keys(model_list)) )
-nk = size(mk,1) # end
-sk = 1  # start
-for model_key in mk[sk:nk] 
-  display(model_key)
-  # if model_key == "C08_refined_mosaic" break
-  m = model_list[model_key]()
-  chn = sample(m, MH(), 10; progress=true)
-end
+if false
+  # quick check to see if all models are still functional 
+  mk = sort( collect(keys(model_list)) )
+  nk = size(mk,1) # end
+  sk = 1  # start
+  for model_key in mk[sk:nk] 
+    display(model_key)
+    # if model_key == "C08_refined_mosaic" break
+    m = model_list[model_key]()
+    chn = sample(m, MH(), 10; progress=true)
+  end
 
-
-if false 
   # saving or testing: 
   # m = model_D00_poisson_simple(modinputs_count)
   # chn = sample(m, MH(), 10; progress=true)
@@ -641,17 +753,16 @@ end
 
 ### model_D00_poisson_simple
  
-It is perhaps the most basic spatiotemporal model. We have already seen this model in the introductory example with Scottish lip cancers. No covariates are in it. There is no weighting nor use of offsets. It is as basic as it can get. 
+This model is perhaps the most basic spatiotemporal model. We have already seen this model in the introductory example with Scottish lip cancers. No covariates are in it. There is no weighting nor use of offsets. There is no interaction between space and time. It is as basic as it can get. 
 
-This model decomposes spatiotemporal count data into three main additive latent components, without any interactions: 
+This model decomposes spatiotemporal count data into three main additive (in logarithmic space or multiplicative in user space) latent components, without any spatio-temporal interactions: 
     
     - fixed offset (e.g., expected population count or risk)
 
-    - spatial field: Besag-York-Mollié (BYM2) prior, identify how much of the spatial variance is due to real geographic clustering (structured) versus random local noise (unstructured) using a single mixing parameter (phi_sp).
+    - spatial field: Besag-York-Mollié (BYM2) prior using the Riebler et al. 2016 parameterization. It identify how much of the spatial variance is due to real geographic clustering (structured neighbourhood effects) versus random local noise (unstructured, iid) using a single mixing parameter (phi_sp).
 
     - temporal trend: AR1, a first-order autoregressive process, the model assumes that what happened yesterday is the best predictor of what happens today, allowing for smooth trend estimation over time.
- 
-
+  
 Utility: 
 
     - Smooth raw count data 
@@ -668,7 +779,7 @@ Computation:
  
     - Poisson Log-Link: observations $y_i$$y_i$ follow a Poisson distribution. The log-linear predictor $\eta$$\eta$ combines a known offset with latent spatial and temporal effects: $$\log(\mu_{it}) = \text{offset}_{it} + \text{Spatial Effect}_a + \text{Temporal Effect}_t$$$$\log(\mu_{it}) = \text{offset}_{it} + \text{Spatial Effect}_a + \text{Temporal Effect}_t$$
 
-    - Spatial Effect: BYM2 Specification (Besag-York-Mollié) parameterization, which decomposes spatial variance into two parts:
+    - Spatial Effect: BYM2 Specification (Besag-York-Mollié) parameterization of , which decomposes spatial variance into two parts:
 
         - u_icar (Structured): An Intrinsic Conditional Autoregressive (ICAR) component that accounts for spatial clustering based on the adjacency graph $Q_{sp}$$Q_{sp}$.
 
@@ -676,62 +787,79 @@ Computation:
 
         - phi_sp: A mixing parameter that determines the proportion of variance explained by the spatial structure vs. random noise.
 
+        - the total spatial effect for area $i$ is defined as: $s_i = \sigma_{spatial} \left( \sqrt{\text{phi_sp}} \cdot \text{rho_sp}^*_i + \sqrt{1 - \text{phi_sp}} \cdot \theta_i \right)$ where rho_sp is the (Besag) local neighbourhood correlation.
+  
     - Temporal Effect: AR1 Process (f_time) follows a First-Order Autoregressive (AR1) process:
 
         - rho_tm: The correlation coefficient between successive time steps.
 
         - Q_ar1: A precision matrix constructed using the Q_ar1_template to enforce temporal dependency.
 
-
+    - These spatial and temporal effects are considered "Extra-Poisson" variability.
+    
     - GMRF (Gaussian Markov Random Field) densities for the ICAR and AR1 components are used to directly increment the Log-Probability (Turing.@addlogprob!). This is significantly more computationally efficient than inverting large covariance matrices.
 
 
 ```{julia}
-#| example run
+#| label: model_D00_poisson_simple
+
 Random.seed!(42) # Set a seed for reproducibility.
  
 m = model_D00_poisson_simple(modinputs_count);
 os = get_optimal_sampler("model_D00_poisson_simple"; nuts_adapt=1000);
-chn = sample(m, os, 2000, nchains=4);
+chn = sample(m, NUTS(), 1000, nchains=4);
 res = model_results_comprehensive(m, chn, modinputs_count, au);
 
-showall(res.summarystats)
+showparams( res.summarystats )
+  
+display(res.plots.ppc)  # there are a few more generic plots (see inside the object)
+# display(res.plots.tm)
+# display(res.plots.denoised)
 
-display(res.plots.ppc)
-display(res.plots.tm)
-display(res.plots.denoised)
-display(res.plots.noisy) 
+
 
 ```
 
-Sampling takes 6 seconds and gives the following results:
+Sampling takes 7.5 seconds and gives the following results:
 
 ``` 
-RMSE: 2160.3172
-Pearson R: -0.0149 (p=0.5647)
-Spearman rho: -0.0451 (p=NaN)
-WAIC: 5.031550009328398e11
-RHAT (mean): 1.2954
-ESS (mean): 2.3984
+modelname: model_D00_poisson_simple
+compute_time_seconds: 7.5
+rmse: 2160.317
+r2: 0.0
+waic: 5.0315500093284e11
+mean_rhat: 1.295
+mean_ess_bulk: 15.076
+mean_ess_tail: 17.924
+ess_per_second: 2.01
 
-    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
-
-    sigma_sp    0.2720    0.2762    0.0686    15.1341    14.8657    1.0529        2.4076
-      phi_sp    0.6396    0.0990    0.0223    56.7353    76.2545    1.0529        9.0257
-    sigma_tm    4.5220    0.4695    0.1072    15.1732        NaN    1.0526        2.4138
-      rho_tm    0.9449    0.1081    0.0265    15.2319        NaN    1.0529        2.4231
-           ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
-      
+       param    mean     std    mcse  ess_bulk  ess_tail    rhat      q5     q50     q95                               │
+│   sigma_sp  0.2720  0.2762  0.0686   15.1341   14.8657  1.0529  0.2114  0.2114  1.0423                               │
+│     phi_sp  0.6396  0.0990  0.0223   56.7353   76.2545  1.0529  0.6596  0.6596  0.6596                               │
+│   sigma_tm  4.5220  0.4695  0.1072   15.1732       NaN  1.0526  3.7700  4.6157  4.6157                               │
+│     rho_tm  0.9449  0.1081  0.0265   15.2319       NaN  1.0529  0.9422  0.9685  0.9685                               │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+    
 
 ```
 
 - Convergence metric rhat=1.3 indicates it has not yet converged (though the sigmas, phi and rho have). 
 - Effective number of samples per second (ess_per_sec) are mostly about 7.5. 
 - Predictions are poor and WAIC is very elevated/poor 
- 
-### model_D01_poisson
 
-This model serves to enter four covariates via a RW2 smoothing process and offsets into the model. A full Space-Time Interaction field is also incorporated ($\\sigma_{int}$$\\sigma_{int}$), allowing for localized hotspots that aren't captured by the main spatial or temporal trends.
+*   **Riebler, A., Sørbye, S. H., Simpson, D., & Rue, H. (2016).** *An intuitive joint prior for variance parameters in hierarchical models.* [Statistical Science, 31(1), 114-135](https://doi.org/10.1214/15-STS538).
+*   **Morris, M., Wheeler-Martin, K., & Simpson, D. (2019).** *Bayesian hierarchical models for spatial data.* [Stan Case Study](https://mc-stan.org/users/documentation/case-studies/icar_stan.html).
+
+
+### model_D01_poisson_besag
+
+This model serves to demonstrate a more realistic workflow. It adds four covariates via a RW2 smoothing process with offsets into the model. A full Space-Time Interaction field is also incorporated, $\\sigma_{int}$, allowing for localized hotspots that aren't captured by the main spatial or temporal trends.
+
+
+
+### model_D02_poisson_bym2
+
+This model continues, however, we now focus upon the spatial structure: BYM2 (instead of the Besag).
  
 Sampling takes much longer than the simple model and so I have reduced the number of samples taken by 1 order of magnitude:
 
@@ -739,12 +867,12 @@ Sampling takes much longer than the simple model and so I have reduced the numbe
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D01_poisson(modinputs_count)
-os = get_optimal_sampler("model_D01_poisson"; nuts_adapt=100) 
+m = model_D02_poisson_bym2(modinputs_count)
+os = get_optimal_sampler("model_D02_poisson_bym2"; nuts_adapt=100) 
 chn = sample(m, os, 200, nchains=4)
 res = model_results_comprehensive(m, chn, modinputs_count, au);
 
-showall(res.summarystats)
+showparams( res.summarystats 
 
 display(res.plots.ppc)
 display(res.plots.tm)
@@ -759,21 +887,28 @@ It takes 297 seconds to complete 200 samples.
 Which gives:
 
 ``` 
- 
-RMSE: 10181.0727
-Pearson R: -0.1354 (p=0.0)
-Spearman rho: -0.0791 (p=NaN)
-WAIC: 2.132247536459414e11
-RHAT (mean): 1.4106
-ESS (mean): 0.0219
+modelname: model_D02_poisson_bym2
+compute_time_seconds: 316.7
+rmse: 10181.072
+r2: 0.013
+waic: 1.7374102859913e10
+mean_rhat: 1.411
+mean_ess_bulk: 6.724
+mean_ess_tail: 19.513
+ess_per_second: 0.021
 
-    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
-      sigma_sp    0.2120    0.0415    0.0092    20.2005    20.2005    1.0263        0.0659
-        phi_sp    0.9098    0.0175    0.0039    20.2005        NaN    1.0263        0.0659
-      sigma_tm    0.1401    0.1000    0.0223    20.2005    20.2005    1.0263        0.0659
-        rho_tm    0.4916    0.0256    0.0057    20.2005        NaN    1.0263        0.0659
-     sigma_int    0.0775    0.0150    0.0033    20.2005    20.2005    1.0263        0.0659
-             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+           param    mean     std    mcse  ess_bulk  ess_tail    rhat      q5     q50     q95                           │
+│       sigma_sp  0.2120  0.0415  0.0092   20.2005   20.2005  1.0263  0.2048  0.2048  0.2048                           │
+│         phi_sp  0.9098  0.0175  0.0039   20.2005       NaN  1.0263  0.9129  0.9129  0.9129                           │
+│       sigma_tm  0.1401  0.1000  0.0223   20.2005   20.2005  1.0263  0.1226  0.1226  0.1226                           │
+│         rho_tm  0.4916  0.0256  0.0057   20.2005       NaN  1.0263  0.4961  0.4961  0.4961                           │
+│      sigma_int  0.0775  0.0150  0.0033   20.2005   20.2005  1.0263  0.0749  0.0749  0.0749                           │
+│   sigma_rw2[1]  0.8125  0.1089  0.0242   20.2005       NaN  1.0263  0.8316  0.8316  0.8316                           │
+│   sigma_rw2[2]  1.4071  0.2126  0.0473   20.2005   20.2005  1.0263  1.3698  1.3698  1.3698                           │
+│   sigma_rw2[3]  0.6352  0.1096  0.0244   20.2005       NaN  1.0263  0.6544  0.6544  0.6544                           │
+│   sigma_rw2[4]  1.2697  0.1951  0.0434   20.2005       NaN  1.0263  1.3039  1.3039  1.3039                           │
+│         phi_zi  0.0000  0.0000     NaN       NaN       NaN     NaN  0.0000  0.0000  0.0000                           │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 
   
 
@@ -787,20 +922,30 @@ ESS (mean): 0.0219
 - Note: phi_zi is zero as it is a flag for zero-inflated operations. In production mode, this effect would/should be trimmed out if not used. 
 
 
+ 
 
-### model_D02_poisson_leroux
+### model_D03_poisson_leroux
 
+Non-Intrinsic Poisson Spatiotemporal Model (Leroux CAR)
+ 
+This model is a variation of `model_D02_poisson_bym2`. But it replaces the BYM2 prior with a **Leroux CAR** prior for spatial effects. It is non-intrinsic in that a non-singular precision matrix  is obtained from a comination of the identity matrix $I$ and the scaled spatial Laplacian $Q_{sp}$:
+
+$$Q_{Leroux} = \tau [ (1-\rho)I + \rho Q_{sp} ]$$
+
+This specification is robust because it automatically handles both structured spatial clustering and unstructured heterogeneity within a single latent field, ensuring a proper posterior without needing extra pinning constraints.
+ 
 
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D02_poisson_leroux(modinputs_count)
-os = get_optimal_sampler("model_D02_poisson_leroux"; nuts_adapt=100) 
+m = model_D03_poisson_leroux(modinputs_count)
+os = get_optimal_sampler("model_D03_poisson_leroux"; nuts_adapt=100) 
 chn = sample(m, os, 200, nchains=4)
 res = model_results_comprehensive(m, chn, modinputs_count, au);
 
-showall(res.summarystats)
+
+showparams( res.summarystats 
 
 display(res.plots.ppc)
 display(res.plots.tm)
@@ -836,20 +981,21 @@ ESS (mean): 0.0251
 
 ESS (mean) was 0.0251 !
 
-### model_D03_poisson_localised
+### model_D04_poisson_localised
 
 
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D03_poisson_localised(modinputs_count)
-os = get_optimal_sampler("model_D03_poisson_localised"; nuts_adapt=100) 
+m = model_4_poisson_localised(modinputs_count)
+os = get_optimal_sampler("model_D04_poisson_localised"; nuts_adapt=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, modinputs_count, au);
 
-showall(res.summarystats)
+
+showparams( res.summarystats 
 
 display(res.plots.ppc)
 display(res.plots.tm)
@@ -883,20 +1029,21 @@ ESS (mean): 0.0318
 
 ESS (mean) was 0.0318!
 
-### model_D04_poisson_sar
+### model_D05_poisson_sar
 
 
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D04_poisson_sar(modinputs_count)
-os = get_optimal_sampler("model_D04_poisson_sar"; nuts_adapt=100) 
+m = model_D05_poisson_sar(modinputs_count)
+os = get_optimal_sampler("model_D05_poisson_sar"; nuts_adapt=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, modinputs_count, au);
 
-showall(res.summarystats)
+
+showparams( res.summarystats 
 
 display(res.plots.ppc)
 display(res.plots.tm)
@@ -933,55 +1080,6 @@ ESS (mean): 0.0066
 ESS was 0.0066
 
 
-### model_D05_poisson_mcar
-
-
-```{julia}
-#| example run
-Random.seed!(42) # Set a seed for reproducibility.
-
-# need a count: 
-modinputs_count = merge( modinputs_count, (y2=Int.(floor.( 100 .* (modinputs_count.z_obs .- minimum(modinputs_count.z_obs) ) ) ), ))
-
-m = model_D05_poisson_mcar(modinputs_count)
-os = get_optimal_sampler("model_D05_poisson_mcar"; nuts_adapt=100) 
-chn = sample(m, os, 200, nchains=4)
-
-res = model_results_comprehensive(m, chn, modinputs_count, au);
-
-showall(res.summarystats)
-
-display(res.plots.ppc) 
-display(res.plots.temporal)
-display(res.plots.spatial)
-display(res.plots.st_denoised)
-display(res.plots.st_noisy)
-
-```
-
-It takes 310 seconds to complete 200 samples. 
-
-Which gives:
-
-``` 
-RMSE: 10181.1341
-Pearson R: 0.1089 (p=0.0)
-Spearman ρ: 0.121
-WAIC: 1.489552542314989e11
-RHAT (mean): 1.5224
-ESS (mean): 0.0318
-
-    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
-      sigma_sp    0.0355    0.1203    0.0236     7.7670     7.5826    1.0765        0.0251
-        phi_sp    0.6897    0.0751    0.0234    14.2291     8.2144    1.0767        0.0460
-      sigma_tm    0.3708    0.0788    0.0066    67.8181    33.0718    1.0765        0.2194
-        rho_tm    0.2396    0.0758    0.0267     7.7625     7.5826    1.0768        0.0251
-     sigma_int    0.0867    0.1387    0.0447     7.7027     7.5826    1.0776        0.0249
-             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
-
-```
-
-
 ### model_D06_poisson_svc
 
 
@@ -995,7 +1093,8 @@ chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, modinputs_count, au);
 
-showall(res.summarystats)
+
+showparams( res.summarystats 
 
 display(res.plots.ppc) 
 display(res.plots.temporal)
@@ -1035,13 +1134,14 @@ ESS (mean): 0.0318
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D03_poisson_localised(modinputs_count)
-os = get_optimal_sampler("model_D03_poisson_localised"; nuts_adapt=100) 
+m = model_D07_poisson_dag(modinputs_count)
+os = get_optimal_sampler("model_D07_poisson_dag"; nuts_adapt=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, modinputs_count, au);
 
-showall(res.summarystats)
+
+showparams( res.summarystats 
 
 display(res.plots.ppc)
 display(res.plots.tm)
@@ -1081,13 +1181,14 @@ ESS (mean): 0.0318
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D03_poisson_localised(modinputs_count)
-os = get_optimal_sampler("model_D03_poisson_localised"; nuts_adapt=100) 
+m = model_D08_hurdle(modinputs_count)
+os = get_optimal_sampler("model_D08_hurdle"; nuts_adapt=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, modinputs_count, au);
 
-showall(res.summarystats)
+
+showparams( res.summarystats 
 
 display(res.plots.ppc)
 display(res.plots.tm)
@@ -1127,13 +1228,14 @@ ESS (mean): 0.0318
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D03_poisson_localised(modinputs_count)
-os = get_optimal_sampler("model_D03_poisson_localised"; nuts_adapt=100) 
+m = model_D09_poisson_ei(modinputs_count)
+os = get_optimal_sampler("model_D09_poisson_ei"; nuts_adapt=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, modinputs_count, au);
 
-showall(res.summarystats)
+
+showparams( res.summarystats 
 
 display(res.plots.ppc)
 display(res.plots.tm)
@@ -1182,6 +1284,72 @@ ESS (mean): 0.0318
 ### model_D23_gptime_fitc
 
 
+
+### model_D24_poisson_mcar
+
+The **MCAR** model extends CAR models to the multivariate case, where we wish to model $J$ spatial processes (e.g., two different diseases) that are likely correlated.
+
+#### 1. The MCAR Prior
+For a bivariate case ($J=2$), the joint spatial random effect $\mathbf{\Phi} = [\mathbf{\phi}_1, \mathbf{\phi}_2]'$ follows a multivariate normal distribution:
+$$\mathbf{\Phi} \sim \text{MvNormal}(\mathbf{0}, [\Sigma \otimes Q_{ICAR}]^{-1})$$
+Where:
+*   $\Sigma$: A $J \times J$ covariance matrix capturing the correlation between the different outcomes.
+*   $Q_{ICAR}$: The standard ICAR precision matrix ($D-W$).
+*   $\otimes$: The Kronecker product.
+
+#### 2. Implementation in Turing
+In this bivariate example, we use a Cholesky decomposition of $\Sigma$ to sample the joint field efficiently. This allows the model to share spatial information across outcomes while identifying unique spatial clusters for each.
+ 
+
+```{julia}
+#| example run
+Random.seed!(42) # Set a seed for reproducibility.
+
+# need a count: 
+modinputs_count = merge( modinputs_count, (y2=Int.(floor.( 100 .* (modinputs_count.z_obs .- minimum(modinputs_count.z_obs) ) ) ), ))
+
+m = model_D24_poisson_mcar(modinputs_count)
+os = get_optimal_sampler("model_D24_poisson_mcar"; nuts_adapt=100) 
+chn = sample(m, os, 200, nchains=4)
+
+res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+
+showparams( res.summarystats )
+
+display(res.plots.ppc) 
+display(res.plots.temporal)
+display(res.plots.spatial)
+display(res.plots.st_denoised)
+display(res.plots.st_noisy)
+
+```
+
+It takes 310 seconds to complete 200 samples. 
+
+Which gives:
+
+``` 
+RMSE: 10181.1341
+Pearson R: 0.1089 (p=0.0)
+Spearman ρ: 0.121
+WAIC: 1.489552542314989e11
+RHAT (mean): 1.5224
+ESS (mean): 0.0318
+
+    parameters      mean       std      mcse   ess_bulk   ess_tail      rhat   ess_per_sec 
+      sigma_sp    0.0355    0.1203    0.0236     7.7670     7.5826    1.0765        0.0251
+        phi_sp    0.6897    0.0751    0.0234    14.2291     8.2144    1.0767        0.0460
+      sigma_tm    0.3708    0.0788    0.0066    67.8181    33.0718    1.0765        0.2194
+        rho_tm    0.2396    0.0758    0.0267     7.7625     7.5826    1.0768        0.0251
+     sigma_int    0.0867    0.1387    0.0447     7.7027     7.5826    1.0776        0.0249
+             ⋮         ⋮         ⋮         ⋮          ⋮          ⋮         ⋮             ⋮
+
+```
+
+
+
+
 Continuous Spatial Models (Deep GP/RFF/SPDE) 
 
 ### model_C01_gaussian_dense_gp
@@ -1222,22 +1390,41 @@ Continuous Spatial Models (Deep GP/RFF/SPDE)
 ### model_C25_hybrid_fitc_rff  
     -- Dim mismatch 3 vs 4
 
-
+### model_SOTA1_poisson_BGCN
  
-### Non-Intrinsic Poisson Spatiotemporal Model (Leroux CAR)
+Bayesian Graph Convolutional Model (BGCN)
 
-This model is a variation of `model_D01_poisson`. It uses the **Leroux CAR** prior for spatial effects. By combining the identity matrix $I$ and the scaled spatial Laplacian $Q_{sp}$, it creates a non-singular precision matrix:
+This is a departure from traditional distance-based kernels (GPs) by leveraging **Graph Signal Processing (GSP)**. It treats spatial dependencies as a signal on a graph that is filtered through a learnable spectral process. The Deep GP models (C02-C04), use Random Fourier Features (RFF) to map Euclidean coordinates ($Lon, Lat$$Lon, Lat$) into a latent manifold. This assumes space is a continuous field where proximity is defined by distance. Whereas, BGCN replaces the continuous kernel with a Graph Convolutional Layer. Instead of assuming distance-based correlation, it uses the Adjacency Matrix ($W$$W$) to pass 'signals' between connected nodes. It is a Graph Neural Network where the weights are Bayesian random variables. This allows to learning 'non-Euclidean' relationships—where two points might be geographically close but socially or structurally disconnected—which a standard GP kernel might struggle to capture.
 
-$$Q_{Leroux} = \tau [ (1-\rho)I + \rho Q_{sp} ]$$
 
-This specification is robust because it automatically handles both structured spatial clustering and unstructured heterogeneity within a single latent field, ensuring a proper posterior without needing extra pinning constraints.
+Normalized Laplacian & Convolution: To ensure numerical stability and consistent signal propagation across regions with varying connectivity (degrees), we use the **Symmetric Normalized Laplacian** logic:
+
+$$\hat{W} = D^{-1/2} W D^{-1/2}$$
+
+where,
+
+*   **$W$**: Adjacency matrix (1 if connected, 0 otherwise).
+*   **$D$**: Degree matrix, $D_{ii} = \sum_j W_{ij}$.
+
+The spatial effect vector $s$ is then computed as a Bayesian 'convolution':
+
+$$s = \hat{W} \cdot w_{gcn}$$
+
+Here, $w_{gcn}$ are learnable latent Gaussian variables. Unlike the Besag/ICAR model which assumes a fixed smoothing penalty, the GCN layer allows the model to learn the amplitude of the signal propagation across the network.
+
+Advantages
  
-```{julia}
+*   **Non-Euclidean Space**: Captures interactions where geographic distance is an insufficient proxy for connectivity (e.g., airline networks, social hierarchies).
+*   **Spectral Filtering**: Functions as a low-pass filter on the graph, effectively denoising spatial signals while respecting topological boundaries.
+*   **Deep Integration**: Easily nests within hierarchical models, allowing the 'spatial' signal to interact with temporal (AR1) and categorical (RW2) components.
+
+References
+*   **Kipf, T. N., & Welling, M. (2016).** *Semi-supervised classification with graph convolutional networks.* [arXiv:1609.02907](https://arxiv.org/abs/1609.02907). (The foundational GCN architecture).
+*   **Bronstein, M. M., et al. (2017).** *Geometric deep learning: going beyond Euclidean data.* [IEEE Signal Processing Magazine](https://doi.org/10.1109/MSP.2017.2693418).
+*   **Shuman, D. I., et al. (2013).** *The emerging field of signal processing on graphs.* [IEEE Signal Processing Magazine](https://doi.org/10.1109/MSP.2012.2235192).
+*   **Zhu, J., et al. (2021).** *Bayesian Graph Neural Networks.* (Provides the framework for treating GNN weights as random variables).
+
   
-
-
-```
-
 ### Mathematical Documentation: Localized Poisson Spatiotemporal Model (Leroux CAR)
 
 This model (`model_D01_poisson_localised`) implements a localized Bayesian hierarchical framework for count data. It extends the standard Leroux CAR model by incorporating a cluster-based intercept structure, allowing for the detection of abrupt spatial transitions (step-changes).
@@ -1311,27 +1498,7 @@ In practice, SAR models often result in a denser precision matrix than CAR model
 
 ```
 
-
-### Mathematical Documentation: Multivariate Conditional Autoregressive (MCAR) Model
-
-The **MCAR** model extends CAR models to the multivariate case, where we wish to model $J$ spatial processes (e.g., two different diseases) that are likely correlated.
-
-#### 1. The MCAR Prior
-For a bivariate case ($J=2$), the joint spatial random effect $\mathbf{\Phi} = [\mathbf{\phi}_1, \mathbf{\phi}_2]'$ follows a multivariate normal distribution:
-$$\mathbf{\Phi} \sim \text{MvNormal}(\mathbf{0}, [\Sigma \otimes Q_{ICAR}]^{-1})$$
-Where:
-*   $\Sigma$: A $J \times J$ covariance matrix capturing the correlation between the different outcomes.
-*   $Q_{ICAR}$: The standard ICAR precision matrix ($D-W$).
-*   $\otimes$: The Kronecker product.
-
-#### 2. Implementation in Turing
-In this bivariate example, we use a Cholesky decomposition of $\Sigma$ to sample the joint field efficiently. This allows the model to share spatial information across outcomes while identifying unique spatial clusters for each.
-
-model_D05_poisson_mcar()
-
-```{julia}
-
-```
+ 
 
 ### Mathematical Documentation: Spatially Varying Coefficient (SVC) Model
 

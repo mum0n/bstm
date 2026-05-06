@@ -47,8 +47,77 @@
     end
 end
 
+
+
+@model function model_D01_poisson_besag(M, ::Type{T}=Float64) where {T}
+    """
+    Model D01 (Besag Variant): Poisson Spatiotemporal with pure ICAR Spatial Prior.
+
+    Modifications from standard D01:
+    1. Spatial: Besag (ICAR) 
+    2. Identifiability: soft sum-to-zero constraint on the phi spatial field.
+    3. Main Components: Temporal (AR1), Interaction (Type IV), and Covariates (RW2) remain consistent.
+    """
+
+    # --- 1. GLOBAL HYPERPRIORS ---
+    sigma_sp ~ Exponential(1.0)  # Spatial scale
+    sigma_tm ~ Exponential(1.0)  # Temporal scale
+    rho_tm ~ Beta(2, 2)          # AR1 persistence
+    sigma_int ~ Exponential(0.5) # Interaction scale
+    sigma_rw2 ~ filldist(Exponential(1.0), 4) 
+
+    phi_zi ~ M.use_zi ? Beta(1, 1) : Dirac(0.0)
+
+    # --- 2. BESAG (ICAR) SPATIAL FIELD ---
+    phi ~ MvNormal(zeros(M.N_areas), I)
+    Turing.@addlogprob! -0.5 * dot(phi, M.Q_sp * phi)
+    
+    # Soft sum-to-zero constraint: mean(phi) ~ N(0, 0.001 * N_areas)
+    phi_sum = sum(phi)
+    phi_sum ~ Normal(0, 0.001 * M.N_areas)
+
+    # Total spatial effect (Besag only)
+    s_eff = phi .* sigma_sp
+
+    # --- 3. TEMPORAL FIELD (AR1) ---
+    Q_ar1 = (1.0 / (1.0 - rho_tm^2 + 1e-6)) .* (M.Q_ar1_template + (rho_tm^2) * I)
+    f_tm_raw ~ MvNormal(zeros(M.N_time), I)
+    Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
+    f_time = f_tm_raw .* sigma_tm
+
+    # --- 4. SPACE-TIME INTERACTION ---
+    st_int_raw ~ MvNormal(zeros(M.N_areas * M.N_time), I)
+    st_interaction = reshape(st_int_raw .* sigma_int, M.N_areas, M.N_time)
+
+    # --- 5. CATEGORICAL SMOOTHING (RW2) ---
+    beta_cov = [Vector{T}(undef, M.N_cat) for _ in 1:4]
+    for k in 1:4
+        beta_cov[k] ~ MvNormal(zeros(M.N_cat), I)
+        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ (sigma_rw2[k]^2 + 1e-6)) * beta_cov[k])
+    end
+
+    # --- 6. LIKELIHOOD ---
+    for i in 1:M.N_obs
+        a, t = M.area_idx[i], M.time_idx[i]
+        eta = M.log_offset[i] + s_eff[a] + f_time[t] + st_interaction[a, t]
+        for k in 1:4; eta += beta_cov[k][M.cov_indices[i, k]]; end
+        
+        mu = exp(eta)
+        if M.use_zi
+            if M.y[i] == 0
+                Turing.@addlogprob! M.weights[i] * log(phi_zi + (1 - phi_zi) * exp(-mu) + 1e-10)
+            else
+                Turing.@addlogprob! M.weights[i] * (log(1 - phi_zi + 1e-10) + logpdf(Poisson(mu), M.y[i]))
+            end
+        else
+            Turing.@addlogprob! M.weights[i] * logpdf(Poisson(mu), M.y[i])
+        end
+    end
+end
+
+
  
-@model function model_D01_poisson(M, ::Type{T}=Float64) where {T}
+@model function model_D02_poisson_bym2(M, ::Type{T}=Float64) where {T}
     """
     Model D01: Poisson Spatiotemporal Framework (BYM2 + AR1).
 
@@ -117,7 +186,7 @@ end
     end
 end
 
-@model function model_D02_poisson_leroux(M, ::Type{T}=Float64; use_zi=false) where {T}
+@model function model_D03_poisson_leroux(M, ::Type{T}=Float64; use_zi=false) where {T}
     """
     Model D02: Poisson Spatiotemporal model with Leroux CAR Spatial Prior.
 
@@ -204,7 +273,7 @@ end
 end
 
 
-@model function model_D03_poisson_localised(M, ::Type{T}=Float64 ) where {T}
+@model function model_D04_poisson_localised(M, ::Type{T}=Float64 ) where {T}
      
     # --- 1. Priors ---
     tau_sp ~ Exponential(1.0)        # Spatial precision scale
@@ -265,7 +334,7 @@ end
 end
 
 
-@model function model_D04_poisson_sar(M, ::Type{T}=Float64) where {T}
+@model function model_D05_poisson_sar(M, ::Type{T}=Float64) where {T}
      
     # --- 1. Priors ---
     sigma_sp ~ Exponential(1.0)      # Spatial scale
@@ -318,63 +387,6 @@ end
 end
 
 
-@model function model_D05_poisson_mcar(M, ::Type{T}=Float64) where {T}
- 
-    # --- 1. Multivariate Spatial Priors (Bivariate Example) ---
-    # We model two latent fields that are correlated via an LKJ prior on the correlation matrix
-   
-
-    # STABILITY FIX: Use LKJCholesky for numerical robustness and better AD compatibility
-    sigma_outcome ~ filldist(Exponential(1.0), 2)
-    L_corr ~ LKJCholesky(2, 1.0)
-      # Reconstruct the scale-correlation Cholesky factor
-    L_sigma = Diagonal(sigma_outcome) * L_corr.L
-
-    # Precision for MCAR: Sigma ⊗ Q_sp
-    # We use the property that if Z ~ N(0, I), then (L_q^-1' ⊗ L_sigma)Z follows the MCAR distribution
-    u_raw ~ filldist(Normal(0, 1), M.N_areas, 2)
-
-    # FIX: Ensure Q_sp is dense and symmetric for stable inversion
-    Q_stable_dense = Symmetric(Matrix(M.Q_sp) + 1e-6 * I)
-    L_q = cholesky(Q_stable_dense).L
-
-    # Transform raw noise into correlated spatial fields: phi_spatial[area, outcome]
-    phi_spatial = (L_q' \ u_raw) * L_sigma'
- 
-    # --- 2. Temporal & Interaction Priors ---
-    sigma_tm ~ Exponential(1.0); rho_tm ~ Beta(2, 2)
-    sigma_int ~ Exponential(0.5); 
-    sigma_rw2 ~ filldist(Exponential(1.0), 4)
-
-    # AR1 Temporal
-    Q_ar1 = (1.0 / (1.0 - rho_tm^2)) .* (M.Q_ar1_template + (rho_tm^2) * I)
-    f_tm_raw ~ MvNormal(zeros(M.N_time), I); Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
-    f_time = f_tm_raw .* sigma_tm
-
-    # Space-Time Interaction
-    st_int_raw ~ MvNormal(zeros(M.N_areas * M.N_time), I); 
-    st_interaction = reshape(st_int_raw .* sigma_int, M.N_areas, M.N_time)
-
-    # --- 3. Categorical Smoothing (RW2) ---
-    beta_cov = [Vector{T}(undef, M.N_cat) for _ in 1:4]
-    for k in 1:4
-        beta_cov[k] ~ MvNormal(zeros(M.N_cat), I)
-        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
-    end
-
-    # --- 4. Likelihood ---
-    # Here we assume y is the primary outcome influenced by the first latent field
-    for i in 1:M.N_obs
-        a, t = M.area_idx[i], M.time_idx[i]
-        # Outcome uses the first column of the bivariate MCAR field
-        eta1 = M.log_offset[i] + phi_spatial[a, 1] + f_time[t] + st_interaction[a, t]
-        eta2 = phi_spatial[a, 2]  # spatail effect only 
-
-        for k in 1:4; eta1 += beta_cov[k][M.cov_indices[i, k]]; end
-        Turing.@addlogprob! M.weights[i] * logpdf(Poisson(exp(eta1)), M.y[i])
-        Turing.@addlogprob! logpdf(Poisson(exp(eta2)), M.y2[i])
-    end
-end
 
 
 
@@ -846,7 +858,8 @@ end
     # --- 1. Priors ---
     sigma_y ~ Exponential(1.0); sigma_sp ~ Exponential(1.0); phi_sp ~ Beta(1, 1)
     sigma_tm ~ Exponential(1.0); rho_tm ~ Beta(2, 2)
-    sigma_int ~ Exponential(0.5); sigma_cov ~ filldist(Exponential(1.0), N_covs); lengthscale_cov ~ filldist(Gamma(2, 1), N_covs)
+    sigma_int ~ Exponential(0.5); sigma_cov ~ filldist(Exponential(1.0), N_covs); 
+    lengthscale_cov ~ filldist(Gamma(2, 1), N_covs)
 
     # --- 2. Spatial Effect (BYM2) ---
     u_icar ~ MvNormal(zeros(M.N_areas), I); Turing.@addlogprob! -0.5 * dot(u_icar, M.Q_sp * u_icar)
@@ -1461,12 +1474,76 @@ end
 
 
 
+@model function model_D24_poisson_mcar(M, ::Type{T}=Float64) where {T}
+ 
+    # --- 1. Multivariate Spatial Priors (Bivariate Example) ---
+    # We model two latent fields that are correlated via an LKJ prior on the correlation matrix
+   
+
+    # STABILITY FIX: Use LKJCholesky for numerical robustness and better AD compatibility
+    sigma_outcome ~ filldist(Exponential(1.0), 2)
+    L_corr ~ LKJCholesky(2, 1.0)
+      # Reconstruct the scale-correlation Cholesky factor
+    L_sigma = Diagonal(sigma_outcome) * L_corr.L
+
+    # Precision for MCAR: Sigma ⊗ Q_sp
+    # We use the property that if Z ~ N(0, I), then (L_q^-1' ⊗ L_sigma)Z follows the MCAR distribution
+    u_raw ~ filldist(Normal(0, 1), M.N_areas, 2)
+
+    # FIX: Ensure Q_sp is dense and symmetric for stable inversion
+    Q_stable_dense = Symmetric(Matrix(M.Q_sp) + 1e-6 * I)
+    L_q = cholesky(Q_stable_dense).L
+
+    # Transform raw noise into correlated spatial fields: phi_spatial[area, outcome]
+    phi_spatial = (L_q' \ u_raw) * L_sigma'
+ 
+    # --- 2. Temporal & Interaction Priors ---
+    sigma_tm ~ Exponential(1.0); rho_tm ~ Beta(2, 2)
+    sigma_int ~ Exponential(0.5); 
+    sigma_rw2 ~ filldist(Exponential(1.0), 4)
+
+    # AR1 Temporal
+    Q_ar1 = (1.0 / (1.0 - rho_tm^2)) .* (M.Q_ar1_template + (rho_tm^2) * I)
+    f_tm_raw ~ MvNormal(zeros(M.N_time), I); Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
+    f_time = f_tm_raw .* sigma_tm
+
+    # Space-Time Interaction
+    st_int_raw ~ MvNormal(zeros(M.N_areas * M.N_time), I); 
+    st_interaction = reshape(st_int_raw .* sigma_int, M.N_areas, M.N_time)
+
+    # --- 3. Categorical Smoothing (RW2) ---
+    beta_cov = [Vector{T}(undef, M.N_cat) for _ in 1:4]
+    for k in 1:4
+        beta_cov[k] ~ MvNormal(zeros(M.N_cat), I)
+        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ sigma_rw2[k]^2) * beta_cov[k])
+    end
+
+    # --- 4. Likelihood ---
+    # Here we assume y is the primary outcome influenced by the first latent field
+    for i in 1:M.N_obs
+        a, t = M.area_idx[i], M.time_idx[i]
+        # Outcome uses the first column of the bivariate MCAR field
+        eta1 = M.log_offset[i] + phi_spatial[a, 1] + f_time[t] + st_interaction[a, t]
+        eta2 = phi_spatial[a, 2]  # spatail effect only 
+
+        for k in 1:4; eta1 += beta_cov[k][M.cov_indices[i, k]]; end
+        Turing.@addlogprob! M.weights[i] * logpdf(Poisson(exp(eta1)), M.y[i])
+        Turing.@addlogprob! logpdf(Poisson(exp(eta2)), M.y2[i])
+    end
+end
+
+
+
+
+####
+
+
+
 
 @model function model_C00_gaussian_dense_gp(M, ::Type{T}=Float64 ) where {T}
     # Dense Spatiotemporal Gaussian Process   
     # Uses a separable space and time kernel  
-   
-
+    
     # --- 1. Priors ---
     sigma_y ~ Exponential(1.0)
     sigma_f ~ Exponential(1.0)
@@ -4158,3 +4235,85 @@ Turing.@model function test_gp2( Y, YG, G, Gp, nInducing, good, i )
  
 end
  
+
+@model function model_SOTA1_poisson_BGCN(M, ::Type{T}=Float64) where {T}
+    """
+    Model SOTA: Bayesian Graph Convolutional Spatiotemporal Model.
+
+    Theoretical Background:
+    This model implements a Bayesian Graph Neural Network (BGNN) approach to spatial dependencies. 
+    Instead of assuming a fixed spatial structure (like Besag/ICAR), it utilizes Graph Signal 
+    Processing (GSP) to apply a learnable spectral filter to the graph signal.
+
+    Mathematical Components:
+    1. Spatial Field (Graph Convolution): 
+       s_eff = (D^-0.5 * W * D^-0.5) * gcn_weight
+       Where W is the adjacency matrix, D is the degree matrix, and gcn_weight are learnable 
+       random variables representing the signal amplitude across nodes.
+    2. Temporal Trend (AR1):
+       Captures serial correlation using a first-order autoregressive precision matrix.
+    3. Multi-fidelity Covariates:
+       Incorporates fixed effects for purely spatial (z_obs) and spatiotemporal (u_obs) covariates.
+    4. Categorical Smoothing (RW2):
+       Applies second-order random walk penalties to categorical feature coefficients to ensure 
+       smooth transitions between levels.
+
+    Likelihood:
+    - Family: Poisson with a log-link.
+    - Observation weighting and area-specific offsets are supported.
+    """
+
+    # --- 1. Global Hyperpriors ---
+    sigma_y ~ Exponential(1.0)
+    sigma_rw2 ~ filldist(Exponential(1.0), 4)
+    
+    # Covariate Coefficients
+    beta_z ~ Normal(0, 2)
+    beta_u ~ MvNormal(zeros(size(M.u_obs, 2)), 2.0 * I)
+    
+    # --- 2. Graph Convolution Weights (Learnable spectral filter) ---
+    # Treats the signal on the graph as a random variable to be inferred
+    gcn_weight ~ MvNormal(zeros(M.N_areas), I)
+    
+    # --- 3. Spatial Field via Graph Signal Processing ---
+    # Normalized Laplacian construction for stable message passing
+    D_inv_sqrt = Diagonal(1.0 ./ sqrt.(vec(sum(M.W, dims=2)) .+ 1e-6))
+    W_hat = D_inv_sqrt * M.W * D_inv_sqrt
+    s_eff = W_hat * gcn_weight
+
+    # --- 4. Standard AR1 Temporal Trend ---
+    rho_tm ~ Beta(2, 2)
+    sigma_tm ~ Exponential(1.0)
+    Q_ar1 = (1.0 / (1.0 - rho_tm^2 + 1e-6)) .* (M.Q_ar1_template + (rho_tm^2) * I)
+    f_tm_raw ~ MvNormal(zeros(M.N_time), I)
+    Turing.@addlogprob! -0.5 * dot(f_tm_raw, Q_ar1 * f_tm_raw)
+    f_time = f_tm_raw .* sigma_tm
+
+    # --- 5. Categorical Smoothing (RW2) ---
+    # Group-wise coefficients for discretized features
+    beta_cov = [Vector{T}(undef, M.N_cat) for _ in 1:4]
+    for k in 1:4
+        beta_cov[k] ~ MvNormal(zeros(M.N_cat), I)
+        Turing.@addlogprob! -0.5 * dot(beta_cov[k], (M.Q_rw2 ./ (sigma_rw2[k]^2 + 1e-6)) * beta_cov[k])
+    end
+
+    # --- 6. Likelihood Integration ---
+    for i in 1:M.N_obs
+        a, t = M.area_idx[i], M.time_idx[i]
+        
+        # Linear Predictor Composition
+        # eta = offset + spatial_gcn + temporal_ar1 + covariates + categorical_smooths
+        eta = M.log_offset[i] + s_eff[a] + f_time[t] + beta_z * M.z_obs[i] + dot(beta_u, M.u_obs[i, :])
+        
+        # Add categorical level effects
+        for k in 1:4
+            eta += beta_cov[k][M.cov_indices[i, k]]
+        end
+        
+        # Poisson Likelihood with area-specific weights
+        Turing.@addlogprob! M.weights[i] * logpdf(Poisson(exp(eta)), M.y[i])
+    end
+end
+
+
+;;

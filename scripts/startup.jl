@@ -75,14 +75,7 @@ Random.seed!(42) # Set a seed for reproducibility.
 
 # Extend base names check for ADVI pseudo-chain
 MCMCChains.names(chain::NamedTuple) = collect(keys(chain.data))
-
-# Support FlexiChains.parameters() fallback for standardization logic
-import FlexiChains
-try
-    FlexiChains.parameters(c::ADVIChainWrapper) = c.names
-catch
-end
-
+ 
 # required for a few functions: 
 import LogExpFunctions: logistic
 import LogExpFunctions: logsumexp
