@@ -163,6 +163,37 @@ Rank-Deficiency:
 
     - Implementation Note: While "Soft Constraints" (penalty methods) exist, Explicit Re-centering (subtracting the empirical mean during each iteration) is the preferred method for maintaining stability within the NUTS sampler.
 
+Spatiotemporal Interactions in the discrete GMRF models (Classes I-IV):
+
+- Four classes of space-time interactions (**Knorr-Held (2000)**) are implemented allow the spatial effect to evolve dynamically over time or the temporal trend to vary across regions. 
+    - Given a spatial precision matrix $\mathbf{Q}_{sp}$ and a temporal precision matrix $\mathbf{Q}_{tm}$, the interaction effect $\delta_{at}$ is modeled as a Gaussian Markov Random Field (GMRF) with a precision matrix $\mathbf{Q}_{\delta}$ defined by the Kronecker product of the marginal precisions:
+
+$$\mathbf{Q}_{\delta} = \mathbf{Q}_{time} \otimes \mathbf{Q}_{space}$$
+
+- Interaction Class Definitions
+
+*   **Class I (Unstructured):** $\mathbf{I} \otimes \mathbf{I}$
+    *   *Reasoning:* Assumes interaction effects are independent across both space and time (IID noise).
+*   **Class II (Time-Structured):** $\mathbf{Q}_{tm} \otimes \mathbf{I}$
+    *   *Reasoning:* Interaction effects are temporally autocorrelated within each region, but independent across regions.
+*   **Class III (Space-Structured):** $\mathbf{I} \otimes \mathbf{Q}_{sp}$
+    *   *Reasoning:* Interaction effects are spatially correlated within each time slice, but independent over time.
+*   **Class IV (Fully-Structured):** $\mathbf{Q}_{tm} \otimes \mathbf{Q}_{sp}$
+    *   *Reasoning:* Interactions are correlated in both dimensions. This is the most complex form, where a spatial pattern persists but evolves according to a temporal process (e.g., a Random Walk).
+
+- Computational Implementation (The Cholesky Trick)
+
+Directly sampling from a precision matrix of size $(N \times T) \times (N \times T)$ is computationally prohibitive ($O((NT)^3)$). To maintain efficiency in `Turing.jl`, we use a transformation method:
+
+1.  **Factorization:** compute the Cholesky factors $\mathbf{L}_{sp}$ and $\mathbf{L}_{tm}$ such that $\mathbf{Q} = \mathbf{L}\mathbf{L}^T$.
+2.  **Transformation:** sample raw standard normal noise $\mathbf{z} \sim N(0, 1)$ of length $NT$.
+3.  **Back-substitution:** structured interaction vector $\delta$ is recovered via:
+    $$\delta = \sigma_{int} \cdot (\mathbf{L}_{sp}^{-T} \otimes \mathbf{L}_{tm}^{-T}) \mathbf{z}$$
+
+In the code, this is implemented as `reshape(L_sp' \ (L_tm' \ mat_int')', :)`, which leverages the properties of Kronecker products to solve the system using smaller marginal matrices, reducing the cost significantly.
+
+
+
  
 ###  Partitioning the Map: Areal Units and Information Balance
 
@@ -289,7 +320,7 @@ for m in test_configs
     local au
     try
         au = assign_spatial_units( data.pts, m;
-            time_idx = data.time_idx,
+            t_idx = data.t_idx,
             target_units = target_units,
             min_total_arealunits=min_total_arealunits,
             max_total_arealunits=max_total_arealunits,
@@ -359,17 +390,17 @@ In the data Tuple (*data_scot*), we have counts (y) of cancer incidence and popu
 
 #### Spatiotemporal model: the shape of things to come
 
-Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we reformat the data (*data_scot*) with 'prepare_model_inputs()' to create a structured data object with the correct variable names and run a simple separable spatiotemporal model (model_D00_poisson_simple).  
+Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we reformat the data (*data_scot*) with 'bstm_options()' to create a structured data object with the correct variable names and run a simple separable spatiotemporal model (model_D00_poisson_simple).  
  
 ```{julia}
 #| label: model_D00_poisson_simple - Sparse GMRF Space and time effect (no interaction)   
 
 # prepare model inputs  
-modinputs = prepare_model_inputs( 
+modinputs = bstm_options( 
   y = data_scot.y,         # y-value, counts of people with lip cancer
   pts = data_scot.pts,
   area_idx = data_scot.area_idx,  # space index
-  time_idx = data_scot.time_idx,  # time index
+  t_idx = data_scot.t_idx,  # time index
   log_offset = data_scot.log_offset, # offsets, population size on log-scale
   W = data_scot.W  # matrix adjacency
 )
@@ -430,7 +461,9 @@ Notice that the following is not a completely fair evaluation as there is a spac
 
 
 ```{julia}
-#| label: C00: Base Model - Dense Kernel Matrix Separable Spatiotemporal GP
+#| label: model_C00_poisson_dense_gp 
+
+# Dense Kernel Matrix Separable Spatiotemporal GP
 
 Random.seed!(42) # Set a seed for reproducibility.
 
@@ -444,8 +477,8 @@ Random.seed!(42) # Set a seed for reproducibility.
     ls_t ~ Gamma(2, 2)
 
     # Coordinates
-    coords_s = RowVecs(M.coords_space)
-    ts = Float64.(M.time_idx)
+    coords_s = RowVecs(M.s_obs)
+    ts = Float64.(M.t_idx)
 
     # Kernel Matrix / covariance
     k_s = SqExponentialKernel() ∘ ScaleTransform(inv(ls_s))  # space
@@ -540,9 +573,12 @@ res_opt = maximum_likelihood(m, LBFGS() )  # many optimizaers available
 res_opt.optim_result.retcode    
 res_opt.params 
 
+res = model_results_comprehensive(m, res_opt, modinputs, au_scot);
+
+
 # ML -- Dense version: slow, really slow, so slow that you do not want to run this:
 m = model_C00_poisson_dense_gp(modinputs) # Turing model object
-# res_opt = maximum_likelihood(m, LBFGS() )  # run only if you have a lot of time
+# res_opt = maximum_likelihood(m, LBFGS() )  # run only if you have a **lot** of time
 res_opt.optim_result.retcode    
 res_opt.params 
 
@@ -552,6 +588,7 @@ res_opt.params
 res_map = maximum_a_posteriori( m, NelderMead() )
 res_map.optim_result.retcode   
 res_map.params
+res = model_results_comprehensive(m, res_map, modinputs, au_scot);
 
 
 # Variational Inference: slower .. (about 30 minutes; uses ~ 30 GB RAM)
@@ -613,7 +650,7 @@ All `_reconstruct` methods have been verified to handle magnitude scaling via th
 $$\eta_{i,s} = \text{Offset}_i + \text{Spatial}_{a[i],s} + \text{Temporal}_{t[i],s} + \text{Interaction}_{a[i],t[i],s} + \sum \text{Covariates}_{i,s}$$
 
 1.  **Offsets**: Handled as `modinputs.log_offset[i]`. This ensures that Poisson rates are scaled to the expected counts (e.g., $E_i \exp(\eta_{base})$).
-2.  **Interactions**: Reconstructed by scaling the latent `st_int_raw` vector by `sigma_int` and reshaping it into a $[Area \times Time]$ matrix before indexing with `a, t = area_idx[i], time_idx[i]`.
+2.  **Interactions**: Reconstructed by scaling the latent `st_int_raw` vector by `sigma_int` and reshaping it into a $[Area \times Time]$ matrix before indexing with `a, t = area_idx[i], t_idx[i]`.
 3.  **Categorical Effects**: Indexed dynamically via `modinputs.cov_indices[i, k]`, supporting second-order random walk (RW2) smoothing levels.
  
 
@@ -636,36 +673,26 @@ n_pts = 100
 n_time = 15
  
 data = generate_sim_data(n_pts, n_time; rndseed=42); # regenerate data
- 
-ntot = size(data.pts, 1) 
 
-min_time_slices = 10
-target_density = 20 # number per areal unit 
-target_units = Int(floor( ntot / target_density ))
-min_total_arealunits = target_units / 10
-max_total_arealunits = target_units * 10
-min_points = 1
-max_points = Int(floor(ntot / min_total_arealunits ))
-min_area = 0.5
-max_area = 9
-cv_min = 1
-buffer_dist = 0.8
-tolerance = 0.1
-method = :avt
+# time discretization
+tu = assign_time_units(data.t_obs)  # t_idx, t0, t1, tn
 
+# space discretization
 au = assign_spatial_units( data.pts, method;
-  time_idx = data.time_idx,
-  target_units = target_units,
-  min_total_arealunits=min_total_arealunits,
-  max_total_arealunits=max_total_arealunits,
-  min_time_slices = min_time_slices,
-  buffer_dist=buffer_dist,
-  tolerance=tolerance,
-  cv_min=cv_min,
-  min_points=min_points,
-  max_points=max_points,
-  min_area=min_area,
-  max_area=max_area)
+  t_idx = tu.t_idx,
+  target_density = 20,  # number per areal unit 
+  target_units = Int(floor( size(data.pts, 1) / 20 )),  # ntot/target_density
+  min_total_arealunits = 10,
+  max_total_arealunits = 100,
+  min_time_slices = 10,
+  buffer_dist=0.8,  # as fraction of average distance between points
+  tolerance=0.1,
+  cv_min=1,
+  min_points=1,
+  max_points=100,
+  min_area=0.5,  # in units of pts
+  max_area=9   # in units of pts
+)
 
 met = calculate_metrics(au)
 
@@ -689,46 +716,106 @@ The following prepares data for the models to be examine together with a short l
 
 ```{julia}
 #| label: create structured model inputs and model_list definitions 
+  
+U = assign_covariate_levels( data.u_obs, N_cat=9 )  
+Z = assign_covariate_levels( data.z_obs, N_cat=9 ) 
+covs=[ Z.mids, U.mids ]
+
+# prediction surface
+observations = DataFrame(
+    s_idx = au.assignments,
+    t_idx = tu.t_idx,
+    u_idx = tu.seas_idx,
+    z = data.z_obs,
+    u1 = data.u_obs[:,1],
+    u2 = data.u_obs[:,2],
+    u3 = data.u_obs[:,3]
+)
+
+
+s_idx = au.s_vals
+t_idx = tu.t_vals
+u_idx = tu.seas_vals
+
+combinations = Iterators.product( s_idx, t_idx, u_idx )
+basis = DataFrame([ (s, t, u) for (s, t, u) in combinations ], [:s_idx, :t_idx, :u_idx])
+
+# Call the function - ensure create_prediction_surface uses DataFrames.combine internally
+PS = create_prediction_surface(basis, observations)
+
+
+ 
  
 # Populate standard input sets per response family
-modinputs_reference = prepare_model_inputs(
-    y = data.y_obs, 
-    pts = data.pts, 
+modinputs_reference = bstm_options(
+    y_obs = data.y_obs, 
+    s_obs = data.s_obs,  
+    t_obs = data.t_obs,  
+    centroids = au.centroids,
     area_idx = au.assignments, 
-    time_idx = data.time_idx, 
-    coords_space = data.coords_space,  # actual values
-    coords_time = data.coords_time,    # actual values
     W = au.W,
+    t_idx = tu.t_idx, 
+    cov = U.idx,
     z_obs = data.z_obs,
     u_obs = data.u_obs,
-    trials = data.trials
-)
+    trials = data.trials,
+    model_family = "poisson",   
+    model_space = "besag",
+    model_time = "ar1",
+    model_cov = "rw2", 
+    model_st = 1  # 0 (no interaction), 1 (iid), 2(time dominant), 3 (space domiant), 4 (spacetime inseparable) .. Knorr & Held classifications
+);
   
 
 # Specialized input sets for family-specific response variables
-modinputs_gaussian = modinputs_reference
-modinputs_count = merge(modinputs_reference, (y=data.y_counts,))
-modinputs_binomial = merge(modinputs_reference, (y=data.y_binary,))
-modinputs_lognormal = merge(modinputs_reference, (y=exp.(data.y_obs),))
+modinputs_gaussian = bstm_options( modinputs_reference, 
+    y=data.y_obs, 
+    model_family="gaussian", 
+    model_time="ar1" ) ;
+  
+modinputs_gaussian_rff = bstm_options( modinputs_reference,
+    y=data.y_counts, 
+    model_family="poisson", 
+    model_time="rff" ) ; 
+
+modinputs_count = bstm_options( modinputs_reference,
+    y=data.y_counts, 
+    model_family="poisson", 
+    model_time="ar1" ) ;
+
+modinputs_binomial = bstm_options( modinputs_reference,
+    y=data.y_binary, 
+    model_family="binomial", 
+    model_time="ar1" ) ;
+
+modinputs_negbin = bstm_options( modinputs_reference,
+    y=data.y_binary, 
+    model_family="negbin", 
+    model_time="ar1" ) ;
+
+modinputs_lognormal = bstm_options( modinputs_reference,
+    y=exp.(data.y_obs), 
+    model_family="lognormal",
+    model_time="ar1" ) ;
 
 
 # Consolidated Model Registry for D-Series (Discrete) and C-Series (Continuous)
 model_list = Dict(
     # --- D-Series: Discrete Spatial Models (GMRF/BYM2) ---
     "D00_poisson_simple"      => () -> model_D00_poisson_simple(modinputs_count),
-    "D01_poisson_besag"       => () -> model_D01_poisson_besag(modinputs_count),
-    "D02_poisson_bym2"        => () -> model_D02_poisson_bym2(modinputs_count),
-    "D03_poisson_leroux"      => () -> model_D03_poisson_leroux(modinputs_count),
-    "D04_poisson_localised"   => () -> model_D04_poisson_localised(modinputs_count),
-    "D05_poisson_sar"         => () -> model_D05_poisson_sar(modinputs_count),
+    "D01_poisson_besag"       => () -> model_grmf(modinputs_count),
+    "D02_poisson_bym2"        => () -> model_grmf(modinputs_count),
+    "D03_poisson_leroux"      => () -> model_grmf(modinputs_count),
+    "D04_poisson_localised"   => () -> model_grmf(modinputs_count),
+    "D05_poisson_sar"         => () -> model_grmf(modinputs_count),
     "D06_poisson_svc"         => () -> model_D06_poisson_svc(modinputs_count),
     "D07_poisson_dag"         => () -> model_D07_poisson_dag(modinputs_count),
     "D08_poisson_hurdle"      => () -> model_D08_hurdle(modinputs_count),
     "D09_poisson_ei"          => () -> model_D09_poisson_ei(modinputs_count),
-    "D10_gaussian"            => () -> model_D10_gaussian(modinputs_gaussian),
-    "D11_gaussian_rff"        => () -> model_D11_gaussian_rff(modinputs_gaussian),
-    "D12_lognormal"           => () -> model_D12_lognormal(modinputs_lognormal),
-    "D13_binomial"            => () -> model_D13_binomial(modinputs_binomial),
+    "D10_gaussian"            => () -> model_grmf(modinputs_gaussian),
+    "D11_gaussian_rff"        => () -> model_grmf(modinputs_gaussian_rff),
+    "D12_lognormal"           => () -> model_grmf(modinputs_lognormal),
+    "D13_binomial"            => () -> model_grmf(modinputs_negbin),
     "D14_negbin"              => () -> model_D14_negativebinomial(modinputs_count),
     "D15_gaussian_rff_cov"    => () -> model_D15_gaussian_rff_cov(modinputs_gaussian),
     "D16_gaussian_fft"        => () -> model_D16_gaussian_fft(modinputs_gaussian),
@@ -770,7 +857,7 @@ model_list = Dict(
 
     # SOTA (state of the art)
     "SOTA1_poisson_BGCN"      => () -> model_SOTA1_poisson_BGCN(modinputs_counts)
-)
+) ;
 
  
 if false
@@ -846,22 +933,21 @@ Computation:
 
 
 ```{julia}
-#| label: model_D00_poisson_simple
+#| label: model_grmf poisson bym2 no covariates
 
 Random.seed!(42) # Set a seed for reproducibility.
- 
-m = model_D00_poisson_simple(modinputs_count);
-os = get_optimal_sampler("model_D00_poisson_simple"; nuts_adapt=1000);
-chn = sample(m, NUTS(), 1000, nchains=4);
-res = model_results_comprehensive(m, chn, modinputs_count, au);
+
+mdata = bstm_options(modinputs_count, model_space="bym2", cov=nothing);
+m = model_grmf(mdata);
+chn = sample(m, MH(), 1000, nchains=4);
+res = model_results_comprehensive(m, chn, mdata, au, PS);
 
 showparams( res.summarystats )
   
 display(res.plots.ppc)  # there are a few more generic plots (see inside the object)
 # display(res.plots.tm)
 # display(res.plots.denoised)
-
-
+ 
 
 ```
 
@@ -1395,7 +1481,59 @@ ESS (mean): 0.0318
 
 
 
-Continuous Spatial Models (Deep GP/RFF/SPDE) 
+## Continuous Spatial Models (Deep GP/RFF/SPDE) 
+
+### Mathematical Formulation: Continuous Spatiotemporal Interactions
+
+In models using **Random Fourier Features (RFF)**, **FITC Sparse GPs**, and **Deep GPs**, space-time dependencies are defined via the covariance kernel $k(\mathbf{x}_i, \mathbf{x}_j)$ where $\mathbf{x} = [s_{lon}, s_{lat}, t]$. Unlike the discrete GMRF framework, these treat space and time as continuous dimensions.
+
+#### 1. Separable vs. Non-Separable Kernels
+*   **Separable (e.g., C01):** The interaction is implied by the product of marginal kernels:
+    $$k(\mathbf{s}_i, t_i, \mathbf{s}_j, t_j) = k_{space}(\mathbf{s}_i, \mathbf{s}_j) \cdot k_{time}(t_i, t_j)$$
+    This assumes that the spatial correlation structure is invariant over time, though the amplitude scales.
+*   **Non-Separable (e.g., C05):** The interaction is modeled by a joint kernel in $\mathbb{R}^3$:
+    $$k(\mathbf{x}_i, \mathbf{x}_j) = \sigma^2 \exp\left( -\frac{1}{2} (\mathbf{x}_i - \mathbf{x}_j)^T \mathbf{L}^{-2} (\mathbf{x}_i - \mathbf{x}_j) \right)$$
+    where $\mathbf{L} = \text{diag}(\ell_{lon}, \ell_{lat}, \ell_t)$. This allows for complex dependencies where the spatial range can vary depending on the temporal distance.
+
+#### 2. Spectral Approximation (RFF Mapping)
+To avoid $O(N^3)$ kernel inversions, we approximate the interaction using $M$ features mapped through a spectral density $p(\boldsymbol{\omega})$:
+$$\phi(\mathbf{x}) = \sqrt{\frac{2}{M}} \cos(\mathbf{W}\mathbf{x} + \mathbf{b})$$
+Where $\mathbf{W} \sim p(\boldsymbol{\omega})$. For a spatiotemporal Gaussian kernel, $\mathbf{W}$ is a $3 \times M$ matrix where rows correspond to the spectral frequencies of Longitude, Latitude, and Time. The interaction is then the linear product $\eta_{it} = \phi(\mathbf{x}_i)^T \boldsymbol{\beta}_{rff}$.
+
+#### 3. Deep GP Functional Composition
+In Deep GPs (e.g., C02, C15), the interaction is hierarchical. A latent manifold $\mathbf{h}$ is learned, warping the input space:
+$$\eta_{it} = f_{layer2}(g_{layer1}(s_{lon}, s_{lat}, t))$$
+This allows for **non-stationary interactions**, where the space-time dependency structure changes depending on the local value of the covariates or the coordinates themselves.
+
+
+### Mathematical Formulation: Bayesian Graph Convolutional Interaction
+
+Unlike traditional GMRFs where the spatial dependency is hard-coded into $\mathbf{Q}_{sp}$, the **BGCN** architecture treats the spatial field as a graph signal processing task.
+
+#### 1. The Message Passing Layer
+We construct a normalized Laplacian $\mathbf{\hat{W}} = \mathbf{D}^{-0.5} \mathbf{W} \mathbf{D}^{-0.5}$, which ensures that the spectral radius of the graph operator is bounded, preventing exploding/vanishing gradients during MCMC sampling.
+
+#### 2. The Spatial Filter
+The spatial effect is defined as:
+$$\mathbf{s}_{eff} = \mathbf{\hat{W}} \cdot \mathbf{\theta}_{gcn}$$
+where $\mathbf{\theta}_{gcn}$ are learnable weights. This allows the model to 'smooth' information across neighbors adaptively.
+
+#### 3. Space-Time Interaction
+In this context, interactions can be modeled by:
+*   **Dynamic Weights**: Allowing the weights $\mathbf{\theta}_{gcn}$ to evolve according to a temporal process (e.g., an AR1 process per weight).
+*   **Diffusion Interactions**: Adding a Kronecker-structured interaction term $\mathbf{\delta}_{at}$ similar to the GMRF framework, but mapped through the graph convolutional operator to capture sub-regional diffusion patterns.
+
+summary:
+	Series	Interaction_Type	Mathematical_Form
+0   no interaction
+1	D-Series (GMRF)	Class I	I ⊗ I (IID Noise)
+2	D-Series (GMRF)	Class II	Q_tm ⊗ I (Temporal Auto-corr)
+3	D-Series (GMRF)	Class III	I ⊗ Q_sp (Spatial Auto-corr)
+4	D-Series (GMRF)	Class IV	Q_tm ⊗ Q_sp (Fully Structured)
+5	C-Series (GP)	Separable	k_space * k_time
+6	C-Series (GP)	Non-Separable	k(space, time) in R^3
+7	SOTA (BGCN)	Learnable Filter	Learnable spectral signal on W_hat
+
 
 ### model_C01_gaussian_dense_gp
 ### model_C02_gaussian_deep_gp
@@ -2032,7 +2170,7 @@ This model is the synthesis of the project's development. It integrates:
 ```{julia}
 println("Evaluating Integrated Spatiotemporal Mosaic (Model v16)... ")
 
-# Fix: Ensure pts_raw matches the length of y and time_idx
+# Fix: Ensure pts_raw matches the length of y and t_idx
 # The Lip Cancer data has 56 areas and 10 years.
 n_areas_lip = 56
 n_years_lip = 10
@@ -3808,7 +3946,7 @@ y_obs = data.y_obs
 u_obs = data.u_obs
 z_obs = data.z_obs
 coords_y_raw = data.pts
-time_y_idx = data.time_idx
+time_y_idx = data.t_idx
 
 # --- 2. FFT-Informed RFF Parameter Generation ---
 M_rff_base_val = 40
@@ -3821,11 +3959,11 @@ coords_z_s = [p for p in data.pts[1:120]]
 W_z_fixed, b_z_fixed = generate_informed_rff_params(hcat([p[1] for p in coords_z_s], [p[2] for p in coords_z_s]), M_rff_base_val)
 
 # U-fidelity dummy inputs for frequency setup: [lon, lat, time, z_latent]
-coords_u_dummy = hcat([p[1] for p in data.pts], [p[2] for p in data.pts], data.time_idx, data.z_obs)
+coords_u_dummy = hcat([p[1] for p in data.pts], [p[2] for p in data.pts], data.t_idx, data.z_obs)
 W_u_fixed, b_u_fixed = generate_informed_rff_params(coords_u_dummy, M_rff_base_val)
 
 # Volatility frequencies for Y fidelity
-coords_st_y = hcat([p[1] for p in data.pts], [p[2] for p in data.pts], data.time_idx)
+coords_st_y = hcat([p[1] for p in data.pts], [p[2] for p in data.pts], data.t_idx)
 W_sigma_fixed, b_sigma_fixed = generate_informed_rff_params(coords_st_y, M_rff_sigma_val)
 
 # --- 3. Inducing Point Setup for FITC ---
@@ -3962,7 +4100,7 @@ This model builds upon A01 by replacing the direct computation of the dense kern
 
 ```{julia}
 M_rff_val = 50 # Number of RFF features
-m = model_A02_adaptive_rff(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.coords_space, data.coords_time; M_rff=M_rff_val)
+m = model_A02_adaptive_rff(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.s_obs, data.t_obs; M_rff=M_rff_val)
 chn = sample(m, NUTS(), 100) # Using MH sampler for demonstration
 
 
@@ -3976,15 +4114,15 @@ println("WAIC for A02: ", waic_A02)
 
 ## A03: Nested Covariates
 
-This model builds upon A02 by assuming that the covariates `U1`, `U2`, and `U3` are nested functions. Specifically, it explicitly models the relationships between these covariates and the base inputs (`coords_time`, `z`).
+This model builds upon A02 by assuming that the covariates `U1`, `U2`, and `U3` are nested functions. Specifically, it explicitly models the relationships between these covariates and the base inputs (`t_obs`, `z`).
 
 ### Model Assumptions:
 *   Dependent Variable (Y): Similar to A02, modeled with a mean component (trend, seasonal, covariates) and a latent spatiotemporal Gaussian Process (GP) component, plus observation noise.
-*   Latent Covariates (U1, U2, U3): These covariates are modeled as *nested linear functions* of `coords_time`, `z`, and previous `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) are assumed to have measurement error.
-    *   `U1 = f1(coords_time, Z)`: Modeled as a linear function of time and spatial covariate `Z`.
-    *   `U2 = f2(coords_time, Z, U1)`: Modeled as a linear function of time, `Z`, and the latent `U1`.
-    *   `U3 = f3(coords_time, Z, U1)`: Modeled as a linear function of time, `Z`, and the latent `U1`.
-    (Note: In this implementation, `Z_time` is `coords_time[:,1]` and `Z_space` is `z`).
+*   Latent Covariates (U1, U2, U3): These covariates are modeled as *nested linear functions* of `t_obs`, `z`, and previous `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) are assumed to have measurement error.
+    *   `U1 = f1(t_obs, Z)`: Modeled as a linear function of time and spatial covariate `Z`.
+    *   `U2 = f2(t_obs, Z, U1)`: Modeled as a linear function of time, `Z`, and the latent `U1`.
+    *   `U3 = f3(t_obs, Z, U1)`: Modeled as a linear function of time, `Z`, and the latent `U1`.
+    (Note: In this implementation, `Z_time` is `t_obs[:,1]` and `Z_space` is `z`).
 *   Trend: Same as A02, a random walk prior on the intercept over unique time points.
 *   Seasonal Process: Same as A02, a fixed-period harmonic.
 *   Spatiotemporal GP (f): Same as A02, uses an Adaptive Random Fourier Features (RFF) approximation with learned projection weights and offsets.
@@ -4001,7 +4139,7 @@ This model introduces explicit structural assumptions about how covariates influ
 
 ```{julia}
 M_rff_val = 50 # Number of RFF features
-model_A03 = model_A03_nested_covs(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.coords_space, data.coords_time; M_rff=M_rff_val)
+model_A03 = model_A03_nested_covs(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.s_obs, data.t_obs; M_rff=M_rff_val)
 chain_A03 = sample(model_A03, NUTS(), 100) # Using MH sampler for demonstration; consider NUTS for better sampling
 
 ```
@@ -4032,7 +4170,7 @@ This model builds upon A03 by adding a latent temporal process (Random Walk Inte
 
 ```{julia}
 M_rff_val = 50 # Number of RFF features
-model_A04 = model_A04_time_varying_intercept(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.coords_space, data.coords_time; M_rff=M_rff_val)
+model_A04 = model_A04_time_varying_intercept(data.y_obs, data.U1_obs, data.U2_obs, data.U3_obs, data.Z, data.s_obs, data.t_obs; M_rff=M_rff_val)
 chain_A04 = sample(model_A04, NUTS(), 100) # Using MH sampler for demonstration; consider NUTS for better sampling
 
 ```
@@ -4109,7 +4247,7 @@ This model builds upon A08 by replacing the Random Walk Intercept with a Gaussia
 
 ### Model Assumptions:
 *   Dependent Variable (Y): Similar to A08, modeled with a mean component (GP trend, seasonal, covariates) and a latent spatiotemporal Gaussian Process (GP) component, plus spatiotemporal stochastic observation noise.
-*   Latent Covariates (U1, U2, U3): Same as A08, modeled as nonlinear functions using separate RFF mappings of `coords_time`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
+*   Latent Covariates (U1, U2, U3): Same as A08, modeled as nonlinear functions using separate RFF mappings of `t_obs`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
 *   Trend: New in A09, the trend component is now explicitly modeled as a 1D Gaussian Process (`GP Trend`) using a `SqExponentialKernel` over unique time points. This replaces the Random Walk Intercept from previous versions.
 *   Seasonal Process: Same as A08, a fixed-period harmonic.
 *   Spatiotemporal GP (f): Same as A08, uses the Fully Independent Training Conditional (FITC) approximation with learned inducing point locations (`Z_inducing`) and latent values (`u_latent`).
@@ -4128,9 +4266,9 @@ This model builds upon A08 by replacing the Random Walk Intercept with a Gaussia
 ```{julia}
 
 # Generate inducing points for A06
-D_s_A06 = size(data.coords_space, 2)
-D_st_A06 = D_s_A06 + size(data.coords_time, 2)
-coords_st_A06 = hcat(data.coords_space, data.coords_time)
+D_s_A06 = size(data.s_obs, 2)
+D_st_A06 = D_s_A06 + size(data.t_obs, 2)
+coords_st_A06 = hcat(data.s_obs, data.t_obs)
 M_inducing_val_A06 = 10 # Number of inducing points (e.g., 10-20% of N)
 Z_inducing_A06 = generate_inducing_points(coords_st_A06, M_inducing_val_A06)
 
@@ -4201,9 +4339,9 @@ This model builds upon A06 by using a sparse Gaussian Process. While the underly
 
 ```{julia}
 # The Z_inducing variable is learned within the model.
-D_s_A07_linear = size(data.coords_space, 2)
-D_st_A07_linear = D_s_A07_linear + size(data.coords_time, 2)
-coords_st_A07_linear = hcat(data.coords_space, data.coords_time)
+D_s_A07_linear = size(data.s_obs, 2)
+D_st_A07_linear = D_s_A07_linear + size(data.t_obs, 2)
+coords_st_A07_linear = hcat(data.s_obs, data.t_obs)
 M_inducing_val_A07_linear = 10 # Number of inducing points
 # M_rff_u_val is no longer needed for this linear version
 M_rff_sigma_val_A07_linear = 20 # Number of RFF features for log-variance GP
@@ -4230,14 +4368,14 @@ println("\nNote: For robust results, consider increasing the number of samples (
 
 ## A08: Nonlinear Nested Covariates (RFF-based)
 
-This model builds upon A07 by introducing nonlinear functional forms for the nested covariates `U1`, `U2`, and `U3`. Instead of simple linear relationships, it uses Random Fourier Features (RFFs) to model these dependencies, allowing for more complex and adaptive representations of how `U` covariates are generated from `coords_time`, `Z`, and other `U` covariates.
+This model builds upon A07 by introducing nonlinear functional forms for the nested covariates `U1`, `U2`, and `U3`. Instead of simple linear relationships, it uses Random Fourier Features (RFFs) to model these dependencies, allowing for more complex and adaptive representations of how `U` covariates are generated from `t_obs`, `Z`, and other `U` covariates.
 
 ### Model Assumptions:
 *   Dependent Variable (Y): Similar to A07, modeled with a mean component (GP trend, seasonal, covariates) and a latent spatiotemporal Gaussian Process (GP) component, plus spatiotemporal stochastic observation noise.
 *   Latent Covariates (U1, U2, U3): New in A08, these are now modeled as nonlinear functions using separate RFF mappings:
-    *   `U1 = f1_rff(coords_time, Z)`: Modeled as a nonlinear function of time and spatial covariate `Z` via an RFF layer.
-    *   `U2 = f2_rff(coords_time, Z, U1)`: Modeled as a nonlinear function of time, `Z`, and the latent `U1` via an RFF layer.
-    *   `U3 = f3_rff(coords_time, Z, U1)`: Modeled as a nonlinear function of time, `Z`, and the latent `U1` via an RFF layer.
+    *   `U1 = f1_rff(t_obs, Z)`: Modeled as a nonlinear function of time and spatial covariate `Z` via an RFF layer.
+    *   `U2 = f2_rff(t_obs, Z, U1)`: Modeled as a nonlinear function of time, `Z`, and the latent `U1` via an RFF layer.
+    *   `U3 = f3_rff(t_obs, Z, U1)`: Modeled as a nonlinear function of time, `Z`, and the latent `U1` via an RFF layer.
     Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
 *   Trend: Same as A07, a Gaussian Process-based trend (`GP Trend`).
 *   Seasonal Process: Same as A07, a fixed-period harmonic.
@@ -4291,9 +4429,9 @@ Retained Components from A05:
  
 ```{julia}
 # The Z_inducing_A08 variable is no longer passed as an argument as it is now learned within the model.
-D_s_A08 = size(data.coords_space, 2)
-D_st_A08 = D_s_A08 + size(data.coords_time, 2)
-coords_st_A08 = hcat(data.coords_space, data.coords_time)
+D_s_A08 = size(data.s_obs, 2)
+D_st_A08 = D_s_A08 + size(data.t_obs, 2)
+coords_st_A08 = hcat(data.s_obs, data.t_obs)
 M_inducing_val_A08 = 10 # Number of inducing points (e.g., 10-20% of N)
 M_rff_u_val = 30 # Number of RFF features for nested covariates
 
@@ -4348,7 +4486,7 @@ This model builds upon A08 by replacing the Random Walk Intercept with a Gaussia
 
 ### Model Assumptions:
 *   Dependent Variable (Y): Similar to A08, modeled with a mean component (GP trend, seasonal, covariates) and a latent spatiotemporal Gaussian Process (GP) component, plus spatiotemporal stochastic observation noise.
-*   Latent Covariates (U1, U2, U3): Same as A08, modeled as nonlinear functions using separate RFF mappings of `coords_time`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
+*   Latent Covariates (U1, U2, U3): Same as A08, modeled as nonlinear functions using separate RFF mappings of `t_obs`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
 *   Trend: New in A09, the trend component is now explicitly modeled as a 1D Gaussian Process (`GP Trend`) using a `SqExponentialKernel` over unique time points. This replaces the Random Walk Intercept from previous versions.
 *   Seasonal Process: Same as A08, a fixed-period harmonic.
 *   Spatiotemporal GP (f): Same as A08, uses the Fully Independent Training Conditional (FITC) approximation with learned inducing point locations (`Z_inducing`) and latent values (`u_latent`).
@@ -4364,9 +4502,9 @@ This model builds upon A08 by replacing the Random Walk Intercept with a Gaussia
 
 ```{julia}
 # The Z_inducing variable is learned within the model.
-D_s_A09 = size(data.coords_space, 2)
-D_st_A09 = D_s_A09 + size(data.coords_time, 2)
-coords_st_A09 = hcat(data.coords_space, data.coords_time)
+D_s_A09 = size(data.s_obs, 2)
+D_st_A09 = D_s_A09 + size(data.t_obs, 2)
+coords_st_A09 = hcat(data.s_obs, data.t_obs)
 M_inducing_val_A09 = 10 # Number of inducing points
 M_rff_u_val_A09 = 30 # Number of RFF features for nested covariates
 M_rff_sigma_val_A09 = 20 # Number of RFF features for log-variance GP
@@ -4393,7 +4531,7 @@ The rest of the model structure (Nested RFF covariates, GP Trend, Seasonal compo
 
 ### Model Assumptions:
 *   Dependent Variable (Y): Similar to A09, modeled with a mean component (GP trend, seasonal, covariates) and a latent spatiotemporal Gaussian Process (GP) component, plus spatiotemporal stochastic observation noise.
-*   Latent Covariates (U1, U2, U3): Same as A09, modeled as nonlinear functions using separate RFF mappings of `coords_time`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
+*   Latent Covariates (U1, U2, U3): Same as A09, modeled as nonlinear functions using separate RFF mappings of `t_obs`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
 *   Trend: Same as A09, a Gaussian Process-based trend (`GP Trend`).
 *   Seasonal Process: Same as A09, a fixed-period harmonic.
 *   Spatiotemporal GP (f): Same as A09, uses the Fully Independent Training Conditional (FITC) approximation. However, new in A10, the inducing point locations (`Z_inducing`) are *fixed* and pre-computed using K-Means clustering, rather than being learned as parameters by the NUTS sampler.
@@ -4415,9 +4553,9 @@ The rest of the model structure (Nested RFF covariates, GP Trend, Seasonal compo
 # data = generate_data(50) # Uncomment and run if `data` is not defined from previous cells
 
 # Parameters for A10
-D_s_A10 = size(data.coords_space, 2)
-D_st_A10 = D_s_A10 + size(data.coords_time, 2)
-coords_st_A10 = hcat(data.coords_space, data.coords_time)
+D_s_A10 = size(data.s_obs, 2)
+D_st_A10 = D_s_A10 + size(data.t_obs, 2)
+coords_st_A10 = hcat(data.s_obs, data.t_obs)
 M_inducing_val_A10 = 10 # Number of inducing points
 M_rff_u_val_A10 = 30 # Number of RFF features for nested covariates
 M_rff_sigma_val_A10 = 20 # Number of RFF features for log-variance GP
@@ -4473,7 +4611,7 @@ This approach differs from A10 (which fixed inducing points using K-Means) by al
 
 ### Model Assumptions:
 *   Dependent Variable (Y): Similar to A10, modeled with a mean component (GP trend, seasonal, covariates) and a latent spatiotemporal Gaussian Process (GP) component, plus spatiotemporal stochastic observation noise.
-*   Latent Covariates (U1, U2, U3): Same as A10, modeled as nonlinear functions using separate RFF mappings of `coords_time`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
+*   Latent Covariates (U1, U2, U3): Same as A10, modeled as nonlinear functions using separate RFF mappings of `t_obs`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
 *   Trend: Same as A10, a Gaussian Process-based trend (`GP Trend`).
 *   Seasonal Process: Same as A10, a fixed-period harmonic.
 *   Spatiotemporal GP (f): Same as A10, uses the Fully Independent Training Conditional (FITC) approximation. However, new in A11, the inducing point locations (`Z_inducing`) are *learned* as parameters within the NUTS sampler, initialized with priors based on the input data, similar to A07 and A09.
@@ -4492,9 +4630,9 @@ This approach differs from A10 (which fixed inducing points using K-Means) by al
 
 ```{julia}
 # The Z_inducing variable is learned within the model.
-D_s_A11 = size(data.coords_space, 2)
-D_st_A11 = D_s_A11 + size(data.coords_time, 2)
-coords_st_A11 = hcat(data.coords_space, data.coords_time)
+D_s_A11 = size(data.s_obs, 2)
+D_st_A11 = D_s_A11 + size(data.t_obs, 2)
+coords_st_A11 = hcat(data.s_obs, data.t_obs)
 M_inducing_val_A11 = 10 # Number of inducing points
 M_rff_u_val_A11 = 30 # Number of RFF features for nested covariates
 M_rff_sigma_val_A11 = 20 # Number of RFF features for log-variance GP
@@ -4515,7 +4653,7 @@ This model builds upon A11 by making the mean and diagonal variance of the induc
 
 ### Model Assumptions:
 *   Dependent Variable (Y): Similar to A11, modeled with a mean component (GP trend, seasonal, covariates) and a latent spatiotemporal Gaussian Process (GP) component, plus spatiotemporal stochastic observation noise.
-*   Latent Covariates (U1, U2, U3): Same as A11, modeled as nonlinear functions using separate RFF mappings of `coords_time`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
+*   Latent Covariates (U1, U2, U3): Same as A11, modeled as nonlinear functions using separate RFF mappings of `t_obs`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
 *   Trend: Same as A11, a Gaussian Process-based trend (`GP Trend`).
 *   Seasonal Process: Same as A11, a fixed-period harmonic.
 *   Spatiotemporal GP (f): Same as A11, uses the Fully Independent Training Conditional (FITC) approximation. However, new in A12, the distribution of latent values at inducing points (`u_latent`) is further parameterized. Instead of sampling `u_latent` directly from `MvNormal(zeros(M_inducing_val), K_ZZ)`, its mean (`m_latent_u`) and diagonal standard deviation (`sigma_latent_u_diag`) are now treated as parameters to be learned by the NUTS sampler. This allows for a more flexible, SVGP-like representation of the inducing point distribution within the MCMC framework.
@@ -4534,9 +4672,9 @@ This model builds upon A11 by making the mean and diagonal variance of the induc
 
 ```{julia}
 # The Z_inducing variable is learned within the model.
-D_s_A12 = size(data.coords_space, 2)
-D_st_A12 = D_s_A12 + size(data.coords_time, 2)
-coords_st_A12 = hcat(data.coords_space, data.coords_time)
+D_s_A12 = size(data.s_obs, 2)
+D_st_A12 = D_s_A12 + size(data.t_obs, 2)
+coords_st_A12 = hcat(data.s_obs, data.t_obs)
 M_inducing_val_A12 = 10 # Number of inducing points
 M_rff_u_val_A12 = 30 # Number of RFF features for nested covariates
 M_rff_sigma_val_A12 = 20 # Number of RFF features for log-variance GP
@@ -4690,7 +4828,7 @@ This model implements the Nyström Approximation to the Gaussian Process. The Ny
 
 ### Model Assumptions:
 *   Dependent Variable (Y): Similar to A12-A15, modeled with a mean component (GP trend, seasonal, covariates) and a latent spatiotemporal Gaussian Process (GP) component, plus spatiotemporal stochastic observation noise.
-*   Latent Covariates (U1, U2, U3): Same as A12-A15, modeled as nonlinear functions using separate RFF mappings of `coords_time`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
+*   Latent Covariates (U1, U2, U3): Same as A12-A15, modeled as nonlinear functions using separate RFF mappings of `t_obs`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
 *   Trend: Same as A12-A15, a Gaussian Process-based trend (`GP Trend`).
 *   Seasonal Process: Same as A12-A15, a fixed-period harmonic.
 *   Spatiotemporal GP (f): New in A16, the main spatiotemporal GP is approximated using the Nyström method. This involves:
@@ -4723,7 +4861,7 @@ This model implements an SPDE Approximation for the spatial component. While a f
 
 ### Model Assumptions:
 *   Dependent Variable (Y): Similar to A12-A16, modeled with a mean component (GP trend, seasonal, covariates) and a latent spatiotemporal Gaussian Process (GP) component, plus spatiotemporal stochastic observation noise.
-*   Latent Covariates (U1, U2, U3): Same as A12-A16, modeled as nonlinear functions using separate RFF mappings of `coords_time`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
+*   Latent Covariates (U1, U2, U3): Same as A12-A16, modeled as nonlinear functions using separate RFF mappings of `t_obs`, `Z`, and other `U` covariates. Their observed values (`u1_obs`, `u2_obs`, `u3_obs`) still have measurement error.
 *   Trend: Same as A12-A16, a Gaussian Process-based trend (`GP Trend`).
 *   Seasonal Process: Same as A12-A16, a fixed-period harmonic.
 *   Spatiotemporal GP (f): New in A17, the main spatiotemporal GP explicitly incorporates an SPDE (Stochastic Partial Differential Equation) approximation for its spatial component. Instead of a full GP or Nyström approximation, the spatial process `f_spatial` is directly sampled from a `MvNormal` with a covariance matrix derived from a Matern 3/2 kernel, which is a common approach to approximate SPDE solutions. This helps to manage computational complexity for large spatial datasets by implicitly leveraging the connection between Matern kernels and SPDEs.
@@ -4955,18 +5093,18 @@ end
 
 ### Demonstration of `compute_spatial_spectral_features`
 
-We'll use the `coords_space` data from our mock dataset to demonstrate how to compute and display its 2D spatial spectral features.
+We'll use the `s_obs` data from our mock dataset to demonstrate how to compute and display its 2D spatial spectral features.
 
 
 ```{julia}
-# Assuming `data.coords_space` is available from previous cells
+# Assuming `data.s_obs` is available from previous cells
 # If not, run `data = generate_data(50)` first.
 
 # Set the grid resolution for the FFT
 grid_resolution = 32 # A power of 2 is often good for FFT performance
 
 # Compute the spectral features
-freqs_x, freqs_y, magnitude_spectrum = compute_spatial_spectral_features(data.coords_space, grid_resolution)
+freqs_x, freqs_y, magnitude_spectrum = compute_spatial_spectral_features(data.s_obs, grid_resolution)
 
 println("Computed spatial spectral features:")
 println("  - X-frequencies range: ", minimum(freqs_x), " to ", maximum(freqs_x))
@@ -5490,7 +5628,7 @@ using Random
 Random.seed!(123)
 
 # Total data
-x_all = Float32.(hcat(data.coords_space, data.coords_time))
+x_all = Float32.(hcat(data.s_obs, data.t_obs))
 y_all = Float32.(reshape(data.y_obs, 1, :))
 N_total = size(x_all, 1)
 
