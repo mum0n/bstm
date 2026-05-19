@@ -25,7 +25,7 @@ pkgs_bstm = [
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation", "OrderedCollections",  
   "Distributions", "Statistics", "MCMCChains", "DataFrames",  "GLM", "FlexiChains", "AbstractPPL",
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
-  "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs",
+  "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs", 
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing" 
 ]
 

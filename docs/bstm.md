@@ -71,12 +71,11 @@ The current library of functions replicates most of the functionality of the fol
 - [CARSTM](https://github.com/jae0/carstm): an INLA wrapper for simple GRMF spatiotemporal models. 
 - [stmv](https://github.com/jae0/stmv): a mosaic approach to continuous, non-stationary spatiotemporal processes. 
  
-Note: a lot of this work has been accelerated by using [Google' Colab](https://colab.research.google.com/). If used carefully, it can be a powerful accelerator. I acknowledge the use of it, though it does require an almost overwhelming amount of attention to verification. 
 
 Installing [Julia](https://julialang.org/) is best done with [juliaup](https://github.com/JuliaLang/juliaup). It can make maintenance simpler. Most functions used here that are not part of a standard library are collected together in [Julia](https://julialang.org/) functions at [src](../src/). They can be loaded with supporting standard libraries, as follows:
  
  
-**WARNING**: if this is the first run, this can take up to 1 hour to install libraries and dependencies, so let it run and read on... You might need to re-start the Julia session if there is a old library. 
+**WARNING**: if this is your first run, this can take up to 1 hour to install libraries and dependencies, so let it run in the background. You might need to re-start the Julia session if there is are library dependency issues. 
 
 
 ```{julia}
@@ -91,7 +90,7 @@ else
 end
 
 
-# include( joinpath( project_directory, "src", "shared_functions.jl" ) ) # support functions  
+# include( joinpath( project_directory, "src", "data_prep.jl" ) ) # support functions  
 # include( joinpath( project_directory, "src", "spatiotemporal_functions.jl" ) )       # support functions
 # include( joinpath( project_directory, "src", "spatiotemporal_turing_models.jl" ) )     # Turing models
 
@@ -106,9 +105,131 @@ include( joinpath( project_directory, "scripts", "startup.jl" ) ) # might need t
 If there continue to be issues with packages breaking, some more lower level package management may be required or a restart of Julia ... ;)
 
 
+### First steps: Scottish lip cancer data  
+
+As a first step towards spatial modelling, we look at a minimal data series: the [Scottish Lip Cancer data](https://mc-stan.org/users/documentation/case-studies/icar_stan.html). It has been thoroughly studied on many platforms over the years. There are 56 areal units and no temporal component. We do not have access to the map positional data, but we do have the adjacency information from which we can infer approximate spatial topology. In these discrete models, we really only need to know which areal units are neighbours (connected graph), encapsulated through the adjacency matrix $W$.  
+
+  
+```{julia}  
+
+data_scot = scottish_lip_cancer_data_spacetime(); # additional noise and "fake" time slices added
+au_scot = data_scot.au ; # areal unit information
+
+```
+
+To interact with the data which in the above are known as `tuples`, here are a few methods:
+
+```{julia}
+# introspection of data:
+keys(data_scot)
+pairs(data_scot)
+
+data_scot[:W] # the neighbourhood adjacency matrix
+ 
+plot_spatial_graph( au_scot; title="Lip Cancer Inferred from Adjacency 'Locations'", domain_boundary=au_scot.hull_coords)
+
+pts_scot = data_scot.pts  # inferred locations (centroids)
+plot_kde_simple(pts_scot, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+   
+```
+
+In the data Tuple (*data_scot*), we have counts (y) of cancer incidence and population size in each area (log_offset). We also simulate a 10-"year" temporal process, a random walk with magnitude 0.5 and a covariate effect (X: an area-specific continuous covariate that represents the proportion of the population employed in agriculture, fishing, or forestry). An overall random uniform observation error of magnitude 0.2 is added with a count then taken as the overall, rounded integer value.
+
+
+#### Spatiotemporal model: the shape of things to come
+
+Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we reformat the data (*data_scot*) with 'bstm_options()' to create a structured data object with the correct variable names and run a simple separable spatiotemporal model (example_bym2_ar1_poisson).  
+ 
+```{julia}
+#| label: example_bym2_ar1_poisson - Sparse GMRF Space and time effect (no interaction)   
+
+# prepare model inputs  
+modinputs = bstm_options( 
+  y_obs = data_scot.y,         # y-value, counts of people with lip cancer
+  pts = data_scot.pts,
+  s_idx = data_scot.s_idx ,  # space index
+  t_idx = data_scot.t_idx,  # time index
+  log_offset = data_scot.log_offset, # offsets, population size on log-scale
+  W = data_scot.W,  # matrix adjacency,
+  model_family = "poisson",
+  model_space = "bym2",  # example_bym2_ar1_poisson is one of the simplest possible (no space-time interaction)
+  model_time = "ar1",
+  model_st = 0,  # no space-time interactions (main effects only)
+  use_zi = false
+) ;
+
+Random.seed!(42) # Set a seed for reproducibility.
+
+# create model instance
+m = example_bym2_ar1_poisson(modinputs); # m contains the Turing model object with the data .. ready to run
+
+# sample with Metropolis-Hastings: 
+chn = sample(m, MH(), 10000; num_warmup=1000, thin=20, progress=true, drop_warmup=true )  
+res = model_results_comprehensive(m, chn, modinputs, au_scot );
+
+# showparams( res.summarystats )
+# display(res.plots.ppc)  # there are a few more generic plots (see inside the object)
+# display(res.plots.tm)
+# display(res.plots.denoised)
+
+
+# alternatively, one could use `bstm` which does something very similar : 
+Random.seed!(42)
+m = bstm(modinputs);
+chn = sample(m, MH(), 10000; num_warmup=1000, thin=20, progress=true, drop_warmup=true )  
+res = model_results_comprehensive(m, chn, modinputs, au_scot );
+
+ 
+```
+The results look like this. Not great but that is because, it is a simple model: we are ignoring covariates and spatiotemporal interactions. The bstm version does some additional work which slows it down a bit and has a slightly harder time sampling. But overall, reasonable. 
+
+
+```
+modelname: example_bym2_ar1_poisson
+compute_time_seconds: 1.1
+rmse: 7.17
+r2: 0.354
+waic: 6107.993
+mean_rhat: 1.35
+mean_ess_bulk: 20.872
+ess_per_second: 18.975
+ 
+  vs
+
+modelname: bstm
+modelarch: univariate
+modelspace: bym2
+modeltime: ar1
+modelseason: ar1
+modelspacetime: 0
+modelcov: nothing
+compute_time_seconds: 1.0
+rmse: 7.698
+r2: 0.265
+waic: 5683.979
+mean_rhat: NaN
+mean_ess_bulk: NaN
+mean_ess_tail: NaN
+ess_per_second: NaN
+
+
+```
+
+These results have not converged (rhat is far from 1 or NaN). This is because MH() by itself is not ideal for this type of model. 
+
+But even still, there is some reasonably description of the spatial patterns. However, there is also lots of room for improvement:
+
+  - the sampler: MH() is a simple one that is used here for checking timings only. 
+  - The model is still basic (separable time and space) with no covariates and no interactions.
+
+Extracting different components of the model internals takes a little more digging, but as these are Bayesian models, every aspect is completely available and adjustable. 
+
+However, we also are using optimizations that take advantage of the sparse nature of the neighbourhood adjacency matrix and the temporal autocorrelation.  
+ 
+
 ### Simulated base data
 
-With all required libraries and functions available, we can create some test data for use in comparing methods in the remainder of this notebook. 
+In real life, we do not often have such polygons (`au_scot`, above). Or if we do, they are relatively useless. So we need to get side tracked a bit and think a bit about getting such polygons and extracting what we need with is their graphical network. To help, we create some test data for use in comparing these and other methods. 
 
 
 ```{julia}
@@ -118,7 +239,7 @@ n_time = 15  # time slices ("years")
  
 data = generate_sim_data(n_pts, n_time; rndseed=42);
 
-# introspection of data:
+# introspection of data (tuples):
 keys(data)
 pairs(data)
 Dict(k => size(v) for (k, v) in pairs(data))
@@ -292,6 +413,10 @@ Using our basic spatiotemporal data, let us try to represent them in a discrete 
 
 # (; pts  ) = data  # this is a simple way to copy objects into the Main environment
 
+# time discretization
+tu = assign_time_units(data.t_obs;  method="regular", N_time=data.N_time, N_season=data.N_season)  # t_idx, t0, t1, tn
+
+# space discretizatio
 Random.seed!(42) # Set a seed for reproducibility.
 
 ntot = size(data.pts, 1) 
@@ -320,7 +445,7 @@ for m in test_configs
     local au
     try
         au = assign_spatial_units( data.pts, m;
-            t_idx = data.t_idx,
+            t_idx = tu.t_idx,
             target_units = target_units,
             min_total_arealunits=min_total_arealunits,
             max_total_arealunits=max_total_arealunits,
@@ -363,97 +488,7 @@ display(Plots.plot(plots..., layout=(3, 2), size=(600, 800)))
 Conclusion: All methods seem similar and reasonable, but AVT provides most control. Note that if the CV approaches 1, it represents a Poisson-like spatial distribution. Higher means clustered and lower means homogenous. We want some structure/clusters but not so much that we have unreliable data and not so little that everything is the same. 
 
  
-### Scottish lip cancer data  
-
-As a first step towards spatial modelling, we look at a minimal data series: the [Scottish Lip Cancer data](https://mc-stan.org/users/documentation/case-studies/icar_stan.html). It has been thoroughly studied by many platforms over the years. There are 56 areal units and no temporal component. We do not have access to the map positional data, but we do have the adjacency information from which we can infer approximate spatial topology. In these discrete models, we really only need to know which areal units are neighbours (connected), encapsulated through the adjacency matrix $W$.  
-
-  
-```{julia}  
-
-data_scot = scottish_lip_cancer_data_spacetime(); # additional noise and "fake" time slices added
-
-# introspection of data:
-keys(data_scot)
-pairs(data_scot)
-Dict(k => size(v) for (k, v) in pairs(data_scot) if k != :au )  # skip "au" as it is a tuple
-
-au_scot = data_scot.au ; 
-plot_spatial_graph( au_scot; title="Lip Cancer Inferred Locations", domain_boundary=au_scot.hull_coords)
-
-pts_scot = data_scot.pts  # inferred locations (centroids)
-plot_kde_simple(pts_scot, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
-   
-```
-
-In the data Tuple (*data_scot*), we have counts (y) of cancer incidence and population size in each area (log_offset). We also simulate a 10-"year" temporal process, a random walk with magnitude 0.5 and a covariate effect (X: an area-specific continuous covariate that represents the proportion of the population employed in agriculture, fishing, or forestry). An overall random uniform observation error of magnitude 0.2 is added with a count then taken as the overall, rounded integer value.
-
-
-#### Spatiotemporal model: the shape of things to come
-
-Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we reformat the data (*data_scot*) with 'bstm_options()' to create a structured data object with the correct variable names and run a simple separable spatiotemporal model (model_D00_poisson_simple).  
- 
-```{julia}
-#| label: model_D00_poisson_simple - Sparse GMRF Space and time effect (no interaction)   
-
-# prepare model inputs  
-modinputs = bstm_options( 
-  y = data_scot.y,         # y-value, counts of people with lip cancer
-  pts = data_scot.pts,
-  area_idx = data_scot.area_idx,  # space index
-  t_idx = data_scot.t_idx,  # time index
-  log_offset = data_scot.log_offset, # offsets, population size on log-scale
-  W = data_scot.W  # matrix adjacency
-)
-
-Random.seed!(42) # Set a seed for reproducibility.
-
-# create model instance
-m = model_D00_poisson_simple(modinputs); # Turing model object
-
-# sample with Metropolis-Hastings: 
-chn = sample(m, MH(), 5000; num_warmup=2000, thin=25, progress=true, drop_warmup=true )  
-
-# extract some results  
-res = model_results_comprehensive(m, chn, modinputs, au_scot);
- 
-showparams( res.summarystats )
-  
-display(res.plots.ppc)  # there are a few more generic plots (see inside the object)
-# display(res.plots.tm)
-# display(res.plots.denoised)
-
-
-```
-
-```
-modelname: model_D00_poisson_simple
-compute_time_seconds: 0.5
-rmse: 7.26
-r2: 0.368
-waic: 8868.971
-mean_rhat: 2.019
-mean_ess_bulk: 11.168
-mean_ess_tail: NaN
-ess_per_second: 22.336
-
-      param    mean     std    mcse  ess_bulk  ess_tail    rhat      q5     q50     q95                               │
-│   sigma_sp  0.3364  0.0188  0.0057   11.3099       NaN  2.4904  0.3172  0.3254  0.3595                               │
-│     phi_sp  0.5020  0.1838  0.0523   11.6767       NaN  1.3901  0.2185  0.5651  0.6719                               │
-│   sigma_tm  0.1248  0.0751  0.0234   10.3378       NaN  2.4904  0.0377  0.1041  0.2132                               │
-│     rho_tm  0.5431  0.1937  0.0572   11.6767       NaN  2.4904  0.3005  0.5093  0.7925                               │
-
-```
-
-These results have not converged (rhat is far from 1). 
-
-But even still, there is some reasonably description of the spatial patterns. However, there is also lots of room for improvement:
-
-  - the sampler: MH() is a simple one that is used here for checking timings only. 
-  - The model itself is a basic one (separable time and space) with no covariates and no interactions.
-
-Extracting different components of the model internals takes a little more digging, but as these are Bayesian models, every aspect is completely available and adjustable. 
-
-However, it does use optimizations that take advantage of the sparse nature of the neighbourhood adjacency matrix and the temporal autocorrelation.  
+## Back to modelling
 
 In contrast, when a naive model is used (below), inversion of the full/dense spatial and temporal covariance matrices is required at a cost of $O(n^3)$ operations. Total compute time, using the same settings and number of samples, increases from 0.5 seconds to 96.2 seconds. This naive approach is almost the same as "Kriging" solutions (here a squared exponential covariance function is used for both space and time). However, in Kriging, Least-squares assumptions are used to speed up computations. This simple model uses a Poisson form with temporal autocorrelation. And, as can be seen the model code is relatively short and straight-forward, closely mimicking the mathematical relationships. 
 
@@ -461,41 +496,13 @@ Notice that the following is not a completely fair evaluation as there is a spac
 
 
 ```{julia}
-#| label: model_C00_poisson_dense_gp 
+#| label: example_gp_gaussian 
 
 # Dense Kernel Matrix Separable Spatiotemporal GP
 
-Random.seed!(42) # Set a seed for reproducibility.
+Random.seed!(42) # Set a seed for reproducibility
 
-
-@model function model_C00_poisson_dense_gp(M, ::Type{T}=Float64 ) where {T}
- 
-    # Priors
-    sigma_y ~ Exponential(1.0)
-    sigma_f ~ Exponential(1.0)
-    ls_s ~ Gamma(2, 2)
-    ls_t ~ Gamma(2, 2)
-
-    # Coordinates
-    coords_s = RowVecs(M.s_obs)
-    ts = Float64.(M.t_idx)
-
-    # Kernel Matrix / covariance
-    k_s = SqExponentialKernel() ∘ ScaleTransform(inv(ls_s))  # space
-    k_t = SqExponentialKernel() ∘ ScaleTransform(inv(ls_t))  # time
-    K = (sigma_f^2) .* kernelmatrix(k_s, coords_s) .* kernelmatrix(k_t, ts) # full covariance (separable)
-    
-    # Latent Process
-    f_latent ~ MvNormal(zeros(M.N_obs), K + 1e-6*I)
-  
-    # Likelihood
-    for i in 1:M.N_obs
-        mu = M.log_offset[i] + f_latent[i]  
-        Turing.@addlogprob!  logpdf(Poisson(exp(mu)), M.y[i])
-    end
-end
-
-m = model_C00_poisson_dense_gp(modinputs) # Turing model object
+m = example_gp_gaussian(modinputs) # Turing model object
 chn = sample(m, MH(), 5000; num_warmup=2000, thin=25, progress=true, drop_warmup=true )  
 res = model_results_comprehensive(m, chn, modinputs, au_scot);
 
@@ -504,7 +511,7 @@ showparams( res.summarystats )
 ```    
 
 ```
-modelname: model_C00_poisson_dense_gp
+modelname: example_gp_gaussian
 compute_time_seconds: 96.2
 rmse: 6.394
 r2: 0.565
@@ -568,7 +575,7 @@ The following code snippet shows how to run them. One can even use the solution 
 # using Optim, AdvancedVI, Turing
  
 # ML -- Sparse version: fast (seconds) but does not converge
-m = model_D00_poisson_simple(modinputs) # Turing model object
+m = example_bym2_ar1_poisson(modinputs) # Turing model object
 res_opt = maximum_likelihood(m, LBFGS() )  # many optimizaers available
 res_opt.optim_result.retcode    
 res_opt.params 
@@ -577,7 +584,7 @@ res = model_results_comprehensive(m, res_opt, modinputs, au_scot);
 
 
 # ML -- Dense version: slow, really slow, so slow that you do not want to run this:
-m = model_C00_poisson_dense_gp(modinputs) # Turing model object
+m = example_gp_gaussian(modinputs) # Turing model object
 # res_opt = maximum_likelihood(m, LBFGS() )  # run only if you have a **lot** of time
 res_opt.optim_result.retcode    
 res_opt.params 
@@ -627,16 +634,17 @@ To ensure compatibility across all architectures (GMRF, Spectral, GP, etc.), the
 | Key                       | Description                                                             | Type                            |
 | :--------------------------| :------------------------------------------------------------------------| :--------------------------------|
 | `spatial_structured`      | Summarized structured spatial field (e.g., ICAR, GCN, GP).              | `NamedTuple` (mean, median, CI) |
-| `spatial_unstructured`    | Summarized IID spatial noise (applicable to BYM2).                      | `NamedTuple` or `nothing`       |
-| `spatial`                 | Total spatial effect (`structured` + `unstructured`).                   | `NamedTuple`                    |
+| `spatial_noisy`           | Total spatial effect (`structured` + `unstructured`).                   | `NamedTuple`                    |
 | `temporal`                | Main temporal trend (e.g., AR1, RW1).                                   | `NamedTuple`                    |
 | `seasonal`                | Periodic components (e.g., harmonic sin/cos).                           | `NamedTuple` or `nothing`       |
-| `beta_cov`                | Summarized effects for categorical/smooth covariates.                   | `NamedTuple` or `nothing`       |
+| `covariate_effects`       | Summarized effects for categorical/smooth covariates.                   | `NamedTuple` or `nothing`       |
+| `fixed_effects`           | Fixed effects                                                           | `NamedTuple`                    |
 | `predictions_denoised`    | Expected value of the response (link-scale $\to$ response-scale).       | `NamedTuple`                    |
 | `predictions_noisy`       | Predicted values including observation noise (e.g., Gaussian $\sigma$). | `NamedTuple`                    |
 | `waic`                    | Widely Applicable Information Criterion.                                | `Float64`                       |
 | `family` / `architecture` | Traits identifying the model type.                                      | `ModelTrait`                    |
 
+Additional features where applicable are also presents (e.g. volatility models).
 
 Linear Predictor Assembly: bstm reconstructs the linear predictor $\eta_{i,s}$ for every observation $i$ and MCMC sample $s$:
 
@@ -650,7 +658,7 @@ All `_reconstruct` methods have been verified to handle magnitude scaling via th
 $$\eta_{i,s} = \text{Offset}_i + \text{Spatial}_{a[i],s} + \text{Temporal}_{t[i],s} + \text{Interaction}_{a[i],t[i],s} + \sum \text{Covariates}_{i,s}$$
 
 1.  **Offsets**: Handled as `modinputs.log_offset[i]`. This ensures that Poisson rates are scaled to the expected counts (e.g., $E_i \exp(\eta_{base})$).
-2.  **Interactions**: Reconstructed by scaling the latent `st_int_raw` vector by `sigma_int` and reshaping it into a $[Area \times Time]$ matrix before indexing with `a, t = area_idx[i], t_idx[i]`.
+2.  **Interactions**: Reconstructed by scaling the latent `st_int_raw` vector by `sigma_int` and reshaping it into a $[Area \times Time]$ matrix before indexing with `a, t = s_idx[i], t_idx[i]`.
 3.  **Categorical Effects**: Indexed dynamically via `modinputs.cov_indices[i, k]`, supporting second-order random walk (RW2) smoothing levels.
  
 
@@ -675,9 +683,11 @@ n_time = 15
 data = generate_sim_data(n_pts, n_time; rndseed=42); # regenerate data
 
 # time discretization
-tu = assign_time_units(data.t_obs)  # t_idx, t0, t1, tn
+tu = assign_time_units(data.t_obs;  method="regular", N_time=data.N_time, N_season=data.N_season)  # t_idx, t0, t1, tn
 
 # space discretization
+method = :avt
+
 au = assign_spatial_units( data.pts, method;
   t_idx = tu.t_idx,
   target_density = 20,  # number per areal unit 
@@ -717,7 +727,7 @@ The following prepares data for the models to be examine together with a short l
 ```{julia}
 #| label: create structured model inputs and model_list definitions 
   
-U = assign_covariate_levels( data.u_obs, N_cat=9 )  
+W = assign_covariate_levels( data.w_obs, N_cat=9 )  
 Z = assign_covariate_levels( data.z_obs, N_cat=9 ) 
 covs=[ Z.mids, U.mids ]
 
@@ -725,17 +735,17 @@ covs=[ Z.mids, U.mids ]
 observations = DataFrame(
     s_idx = au.assignments,
     t_idx = tu.t_idx,
-    u_idx = tu.seas_idx,
+    u_idx = tu.u_idx,
     z = data.z_obs,
-    u1 = data.u_obs[:,1],
-    u2 = data.u_obs[:,2],
-    u3 = data.u_obs[:,3]
+    w1 = data.w_obs[:,1],
+    w2 = data.w_obs[:,2],
+    w3 = data.w_obs[:,3]
 )
 
 
 s_idx = au.s_vals
 t_idx = tu.t_vals
-u_idx = tu.seas_vals
+u_idx = tu.u_vals
 
 combinations = Iterators.product( s_idx, t_idx, u_idx )
 basis = DataFrame([ (s, t, u) for (s, t, u) in combinations ], [:s_idx, :t_idx, :u_idx])
@@ -749,141 +759,521 @@ PS = create_prediction_surface(basis, observations)
 # Populate standard input sets per response family
 modinputs_reference = bstm_options(
     y_obs = data.y_obs, 
+    y_coords_st = hcat( data.pts, data.t_obs ),  # only for some methods: deepGP, etc
     s_obs = data.s_obs,  
     t_obs = data.t_obs,  
     centroids = au.centroids,
-    area_idx = au.assignments, 
+    s_idx = au.assignments, 
     W = au.W,
     t_idx = tu.t_idx, 
     cov = U.idx,
     z_obs = data.z_obs,
-    u_obs = data.u_obs,
+    w_obs = data.w_obs,
     trials = data.trials,
     model_family = "poisson",   
     model_space = "besag",
     model_time = "ar1",
     model_cov = "rw2", 
-    model_st = 1  # 0 (no interaction), 1 (iid), 2(time dominant), 3 (space domiant), 4 (spacetime inseparable) .. Knorr & Held classifications
+    model_st = 1  # 0 (no interaction), 1 (iid), 2(time dominant), 3 (space dominant), 4 (spacetime inseparable) .. Knorr & Held classifications
 );
   
 
 # Specialized input sets for family-specific response variables
 modinputs_gaussian = bstm_options( modinputs_reference, 
-    y=data.y_obs, 
+    y_obs = data.y_obs, 
     model_family="gaussian", 
     model_time="ar1" ) ;
   
 modinputs_gaussian_rff = bstm_options( modinputs_reference,
-    y=data.y_counts, 
+    y_obs = data.y_counts, 
     model_family="poisson", 
     model_time="rff" ) ; 
 
 modinputs_count = bstm_options( modinputs_reference,
-    y=data.y_counts, 
+    y_obs = data.y_counts, 
     model_family="poisson", 
     model_time="ar1" ) ;
 
 modinputs_binomial = bstm_options( modinputs_reference,
-    y=data.y_binary, 
+    y_obs=data.y_binary, 
     model_family="binomial", 
     model_time="ar1" ) ;
 
 modinputs_negbin = bstm_options( modinputs_reference,
-    y=data.y_binary, 
+    y_obs=data.y_binary, 
     model_family="negbin", 
     model_time="ar1" ) ;
 
 modinputs_lognormal = bstm_options( modinputs_reference,
-    y=exp.(data.y_obs), 
+    y_obs =exp.(data.y_obs), 
     model_family="lognormal",
     model_time="ar1" ) ;
 
-
-# Consolidated Model Registry for D-Series (Discrete) and C-Series (Continuous)
-model_list = Dict(
-    # --- D-Series: Discrete Spatial Models (GMRF/BYM2) ---
-    "D00_poisson_simple"      => () -> model_D00_poisson_simple(modinputs_count),
-    "D01_poisson_besag"       => () -> model_grmf(modinputs_count),
-    "D02_poisson_bym2"        => () -> model_grmf(modinputs_count),
-    "D03_poisson_leroux"      => () -> model_grmf(modinputs_count),
-    "D04_poisson_localised"   => () -> model_grmf(modinputs_count),
-    "D05_poisson_sar"         => () -> model_grmf(modinputs_count),
-    "D06_poisson_svc"         => () -> model_D06_poisson_svc(modinputs_count),
-    "D07_poisson_dag"         => () -> model_D07_poisson_dag(modinputs_count),
-    "D08_poisson_hurdle"      => () -> model_D08_hurdle(modinputs_count),
-    "D09_poisson_ei"          => () -> model_D09_poisson_ei(modinputs_count),
-    "D10_gaussian"            => () -> model_grmf(modinputs_gaussian),
-    "D11_gaussian_rff"        => () -> model_grmf(modinputs_gaussian_rff),
-    "D12_lognormal"           => () -> model_grmf(modinputs_lognormal),
-    "D13_binomial"            => () -> model_grmf(modinputs_negbin),
-    "D14_negbin"              => () -> model_D14_negativebinomial(modinputs_count),
-    "D15_gaussian_rff_cov"    => () -> model_D15_gaussian_rff_cov(modinputs_gaussian),
-    "D16_gaussian_fft"        => () -> model_D16_gaussian_fft(modinputs_gaussian),
-    "D17_adaptive_rff_bym2"   => () -> model_D17_gaussian_adaptive_rff(modinputs_gaussian),
-    "D18_nested_multifid_rff" => () -> model_D18_nested_multifidelity_rff(modinputs_gaussian),
-    "D19_tv_intercept_bym2"   => () -> model_D19_nested_time_varying_intercept(modinputs_gaussian),
-    "D20_stochastic_vol"      => () -> model_D20_stochastic_volatility(modinputs_gaussian),
-    "D21_fitc_bym2"           => () -> model_D21_fitc(modinputs_gaussian),
-    "D22_fitc_nonlinear"      => () -> model_D22_fitc_nonlinear_nested_rff(modinputs_gaussian),
-    "D23_gptime_fitc"         => () -> model_D23_gptime_fitc(modinputs_gaussian),
-    "D24_poisson_mcar"        => () -> model_D24_poisson_mcar(modinputs_count),
-
-    # --- C-Series: Continuous Spatial Models (Deep GP/RFF/SPDE) ---
-    "C01_dense_gp"            => () -> model_C01_gaussian_dense_gp(modinputs_gaussian),
-    "C02_deep_gp"             => () -> model_C02_gaussian_deep_gp(modinputs_gaussian),
-    "C03_binomial_deep_gp"    => () -> model_C03_binomial_deep_gp(modinputs_binomial),
-    "C04_deep_gp_3layer"      => () -> model_C04_gaussian_deep_gp_3layer(modinputs_gaussian),
-    "C05_non_separable_rff"   => () -> model_C05_gaussian_non_separable_rff(modinputs_gaussian),
-    "C06_spde_rff"            => () -> model_C06_gaussian_spde_rff(modinputs_gaussian),
-    "C07_nonstationary_warp"  => () -> model_C07_gaussian_nonstationary_warping(modinputs_gaussian),
-    "C08_refined_mosaic"      => () -> model_C08_gaussian_refined_mosaic(modinputs_gaussian),  # issue: σ >= zero(σ) is not satisfied.
-    "C09_integrated_mosaic"   => () -> model_C09_gaussian_integrated_mosaic(modinputs_gaussian),
-    "C10_fitc_gmrf_hybrid"    => () -> model_C10_gaussian_fitcxed_fitc_grmf(modinputs_gaussian),
-    "C11_svgp_learned"        => () -> model_C11_svgp(modinputs_gaussian),
-    "C12_svgp_full"           => () -> model_C12_svgp_full(modinputs_gaussian),
-    "C13_multifidelity_gp"    => () -> model_C13_multifidelity_gp(modinputs_gaussian),
-    "C14_minibatch_mfgp"      => () -> model_C14_minibatch_mfgp(modinputs_gaussian),
-    "C15_deep_gp_rff"         => () -> model_C15_deep_gp(modinputs_gaussian),   
-    "C16_nystrom_sv"          => () -> model_C16_nystrom(modinputs_gaussian),  #  matrix not positive definite
-    "C17_spde_trend"          => () -> model_C17_spde(modinputs_gaussian), # not positive definite
-    "C18_kron_spde"           => () -> model_C18_kronecker_spde(modinputs_gaussian),  # error
-    "C19_svgp_matern"         => () -> model_C19_svgp_matern(modinputs_gaussian),  #  matrix not positive definite
-    "C20_mf_gp_matern"        => () -> model_C20_multifidelity_gp_matern(modinputs_gaussian),  # something missing
-    "C21_mf_sv_seasonal"      => () -> model_C21_multifidelity_gp_matern_sv_seasonal(modinputs_gaussian), # something missing
-    "C22_rff_mf_gp"           => () -> model_C22_rff_multifidelity_gp(modinputs_gaussian),  # multiplication error
-    "C23_dfrff_mf_gp"         => () -> model_C23_dfrff_multifidelity_gp(modinputs_gaussian),  # Dim mismatch 3 vs 4  
-    "C24_semi_adaptive_rff"   => () -> model_C24_semi_adaptive_dfrff(modinputs_gaussian),  # Dim mismatch 3 vs 4
-    "C25_hybrid_fitc_rff"     => () -> model_C25_hybrid_fitc_rff(modinputs_gaussian),  # Dim mismatch 3 vs 4
-
-    # SOTA (state of the art)
-    "SOTA1_poisson_BGCN"      => () -> model_SOTA1_poisson_BGCN(modinputs_counts)
-) ;
-
- 
-if false
-  # quick check to see if all models are still functional 
-  mk = sort( collect(keys(model_list)) )
-  nk = size(mk,1) # end
-  sk = 1  # start
-  for model_key in mk[sk:nk] 
-    display(model_key)
-    # if model_key == "C08_refined_mosaic" break
-    m = model_list[model_key]()
-    chn = sample(m, MH(), 10; progress=true)
-  end
-
-  # saving or testing: 
-  # m = model_D00_poisson_simple(modinputs_count)
-  # chn = sample(m, MH(), 10; progress=true)
-  # res_fns =  collect(keys(model_registry))
-  # @load_carstm_state( res_fns[i] )
-end  
+  
     
 ```
 
+# Overview
+
+## Detailed Methods Discussion for `bstm` Model
+
+### Conceptual Overview: bstm - Generalized Random Markov Field Spatiotemporal Model
+
+The `bstm` (Bayesian Space-Time Model) is a highly modular and flexible framework for inference on spatiotemporal data. It decomposes observed phenomena into various underlying components, such as spatial effects, temporal trends, space-time interactions, covariate effects, and seasonal patterns. Its design emphasizes adaptability, supporting a range of model specifications and likelihood families to accommodate diverse data types and research questions.
+
+The core idea is to build complex spatiotemporal models by combining different 'manifolds' (components), each with its own set of prior distributions and mathematical structures. This modularity allows researchers to tailor models precisely to the nuances of their data, from simple IID effects to Gaussian Processes or graph-based convolutions.
+
+**Architecture Hierarchy & Key Components:**
+
+1.  **Stochastic Volatility Manifold (Optional):** Allows the observation-level variance (for Gaussian/Log-Normal models) to vary over space and time, captured by a Random Fourier Feature (RFF) representation.
+
+2.  **Spatial Manifolds (`s_eta`):** Models spatial dependencies. Options include:
+    -   **IID:** Independent and identically distributed effects (no spatial structure).
+    -   **Besag/ICAR:** Intrinsic Conditional Autoregressive model for structured spatial smoothing.
+    -   **BYM2:** Riebler et al.'s (2016) BYM2 model, combining structured ICAR and unstructured IID spatial effects for improved identifiability.
+    -   **FITC (Fully Independent Training Conditional) Sparse GP:** A low-rank approximation of a Gaussian Process, efficient for large datasets.
+    -   **FITC-GP / Nystrom:** Variations of sparse GP approximations.
+    -   **Mosaic:** Localized experts where spatial effects are clustered.
+    -   **Warping:** Nonstationary spatial fields using RFF for flexible deformation.
+    -   **RFF / EI:** Random Fourier Features for continuous risk surfaces.
+    -   **BGCN (Bayesian Graph Convolutional Network):** Models spatial dependencies via spectral graph convolutions, suitable for irregular graph structures.
+    -   **SAR (Spatial Autoregressive):** Models spatial dependence directly through a spatial lag operator.
+    -   **DAG (Directed Acyclic Graph):** For causal inference or flow data, where dependencies are directional.
+    -   **Local:** Cluster-specific effects with Leroux-like precision structure.
+    -   **SVGP (Sparse Variational Gaussian Process):** A scalable GP using variational inference.
+    -   **SVC (Spatially Varying Coefficients):** Allows regression coefficients of fixed effects to vary spatially.
+
+3.  **Temporal Manifolds (`t_eta`):** Models temporal trends. Options include:
+    -   **AR1:** First-order Autoregressive process for capturing serial correlation.
+    -   **RW2:** Second-order Random Walk for smooth temporal trends.
+    -   **GP:** Gaussian Process for flexible non-parametric temporal modeling.
+    -   **Harmonic:** Seasonal patterns using sine and cosine functions.
+    -   **IID:** Independent and identically distributed temporal effects.
+
+4.  **Space-Time Interaction (`st_eta`):** Captures how spatial patterns change over time or how temporal trends vary across space. Implements Knorr-Held (2000) interaction types:
+    -   **Type I:** IID interaction (unstructured).
+    -   **Type II:** Structured temporal trend varying independently across space.
+    -   **Type III:** Structured spatial pattern varying independently across time.
+    -   **Type IV:** Fully inseparable spatiotemporal structure (structured both spatially and temporally).
+
+5.  **Covariate Smoothing (`c_beta`):** Handles effects of covariates, including:
+    -   **RW2/AR1/GP/Harmonic/IID:** Smoothing for categorical or discretized continuous covariates.
+    -   **RFF:** For continuous Gaussian Processes with Random Fourier Features.
+
+6.  **Season Manifold (`u_eta`):** (If separate from temporal trend) Models distinct seasonal effects, similar options to temporal manifolds.
+
+7.  **Likelihood Engine:** A unified interface (`bstm_Likelihood`) for various distributions:
+    -   **Gaussian, Log-Normal, Poisson, Binomial, Negative Binomial.**
+    -   Optional **Zero-Inflation** for count data (Poisson, Negative Binomial).
+
+### Mathematical Justification:
+
+The model constructs a linear predictor $\eta$ for each observation $i$ at space $s$ and time $t$. The specific form of $\eta$ depends on the chosen manifolds:
+
+$$\eta_i = \text{log\_offset}_i + s_{\text{eta}}(M.s_{\text{idx}}[i]) + t_{\text{eta}}(M.t_{\text{idx}}[i]) + \text{st\_inter}(M.s_{\text{idx}}[i], M.t_{\text{idx}}[i]) + \sum_{k} c_{\text{eta}}(M.cov_{\text{indices}}[i, k]) + u_{\text{eta}}(M.u_{\text{idx}}[i]) + \sum_{j} \text{fixed\_effect}_j \cdot \text{SVC}(M.s_{\text{idx}}[i])$$ 
+
+Each component $s_{\text{eta}}$, $t_{\text{eta}}$, $st_{\text{inter}}$, $c_{\text{eta}}$, $u_{\text{eta}}$ is derived from latent fields that are assigned prior distributions. These priors typically encode smoothness, correlation, or other structural assumptions.
+
+**1. Global Hyperpriors & Toggle Logic:**
+
+-   `r_nb` $\sim (\text{model\_family} == \text{"negbin"}) ? \text{Exponential}(1.0) : \text{Dirac}(1.0)$:
+    -   Negative Binomial dispersion parameter. Controls overdispersion in Negative Binomial likelihood.
+-   `phi_zi` $\sim M.use_{\text{zi}} ? \text{Beta}(1, 1) : \text{Dirac}(0.0)$:
+    -   Zero-inflation probability for zero-inflated models. If `use_zi` is true, a Beta prior is used; otherwise, it's fixed at 0.
+
+**2. Stochastic Volatility Manifold (`y_sigma`):**
+
+-   `y_sigma_const` $\sim (\text{model\_family} \in [\text{"gaussian"}, \text{"lognormal"}]) ? \text{Exponential}(1.0) : \text{Dirac}(1.0)$:
+    -   Constant observation-level standard deviation. Used if stochastic volatility is not enabled.
+-   If `M.use_sv` is true:
+    -   `sigma_log_var` $\sim \text{Exponential}(1.0)$:
+        -   Variance for the log of the standard deviation in the stochastic volatility model.
+    -   `beta_vol` $\sim \text{filldist}(\text{Normal}(0, \text{sigma\_log\_var}), M.M_{\text{rff\_sigma}})$:
+        -   Coefficients for the Random Fourier Features (RFF) used to model the spatially and temporally varying observation standard deviation.
+    -   `coords_st = hcat(M.s_obs, M.t_obs ./ M.N_time)`: Spatiotemporal coordinates.
+    -   `vol_proj = (coords_st * M.W_sigma_fixed) .+ M.b_sigma_fixed'`:
+        -   Projection of coordinates through fixed RFF weights and biases.
+    -   `y_sigma = exp.( (\sqrt{2.0 / M.M_{\text{rff\_sigma}}} .* \cos.(vol_proj) * beta_vol) ./ 2.0 )$:
+        -   The observation standard deviation, obtained by transforming the RFF output to ensure positivity and scaling.
+-   Else: `y_sigma = fill(y_sigma_const, M.N_obs)`: Constant standard deviation across all observations.
+
+**3. Spatial Manifold (`s_eta`):**
+
+-   `s_sigma` $\sim \text{Exponential}(1.0)$:
+    -   Marginal standard deviation (scale) for the spatial effects.
+-   `s_rho` $\sim (M.model_{\text{space}} \in [\text{"bym2"}, \text{"leroux"}, \text{"sar"}, \text{"fft"}, \text{"dag"}, \text{"local"}]) ? \text{Beta}(1, 1) : \text{Dirac}(1.0)$:
+    -   Spatial correlation parameter (e.g., mixing for BYM2, autoregressive parameter for SAR).
+
+-   **Specific `model_space` implementations:**
+    -   **`iid`:** $s_{\text{iid}} \sim \text{MvNormal}(\mathbf{0}, I)$, $s_{\text{eta}} = (s_{\text{iid}} \cdot s_{\text{sigma}})[M.s_{\text{idx}}]$. $s_Q = I(M.N_{\text{areas}})$.
+    -   **`besag`/`icar`:** $s_{\text{icar}} \sim \text{MvNormalCanon}(\mathbf{0}, M.s_Q + M.noise \cdot I)$, $s_{\text{eta}} = (s_{\text{icar}} \cdot s_{\text{sigma}})[M.s_{\text{idx}}]$. $M.s_Q$ is the ICAR precision matrix.
+    -   **`bym2`:** $s_{\text{icar}} \sim \text{MvNormalCanon}(\mathbf{0}, M.s_Q + M.noise \cdot I)$, $s_{\text{iid}} \sim \text{MvNormal}(\mathbf{0}, I)$. $s_{\text{eta}} = (s_{\text{sigma}} \cdot (\sqrt{s_{\text{rho}}} \cdot s_{\text{icar}} + \sqrt{1 - s_{\text{rho}}} \cdot s_{\text{iid}}))[M.s_{\text{idx}}]$.
+    -   **`fitc`:** Utilizes $ls_{\text{st}} \sim \text{filldist}(\text{Gamma}(2, 2), 3)$ (lengthscales), $k_{\text{st}} = (s_{\text{sigma}}^2) * (\text{SqExponentialKernel}() \circ \text{ARDTransform}(\text{inv}.(ls_{\text{st}} + M.noise)))$ (kernel), $s_{\text{inducing}} \sim \text{MvNormal}(\mathbf{0}, K_{\text{ZZ}})$, and $s_{\text{eta}} = K_{\text{XZ}} * (K_{\text{ZZ}} \setminus s_{\text{inducing}})$ for sparse GP projection.
+    -   **`fitcGP`:** $u_{\text{inducing}} \sim \text{filldist}(\text{Normal}(0, 1), M.M_{\text{inducing\_count}})$, $s_{\text{eta}} = (M.Z_{\text{inducing\_proj}} * u_{\text{inducing}}) \cdot s_{\text{sigma}}$.
+    -   **`mosaic`:** $\mu_{\text{local}} \sim \text{filldist}(\text{Normal}(0, 1), M.n_{\text{mosaics}})$, $s_{\text{eta}} = \mu_{\text{local}}[M.cluster_{\text{assignments}}[M.s_{\text{idx}}]] \cdot s_{\text{sigma}}$.
+    -   **`warping`:** $w_{\text{warp}} \sim \text{filldist}(\text{Normal}(0, 1), M.M_{\text{rff}})$, $s_{\text{eta}} = s_{\text{warp}} \cdot s_{\text{sigma}}$ where $s_{\text{warp}}$ is an RFF projection.
+    -   **`rff`/`ei`:** $ls_{\text{rff}} \sim \text{Gamma}(2, 2)$, $\beta_{\text{rff}} \sim \text{filldist}(\text{Normal}(0, 1), M.M_{\text{rff}})$, $s_{\text{eta}}$ is an RFF projection scaled by $s_{\text{sigma}}$.
+    -   **`bgcn`:** $gcn_{\text{weight\_raw}} \sim \text{MvNormal}(\mathbf{0}, I)$. $D_{\text{inv\_sqrt}} = \text{Diagonal}(1.0 ./ \sqrt{\text{vec(sum(M.W, dims=2)) + M.noise}})$, $W_{\text{norm}} = D_{\text{inv\_sqrt}} * M.W * D_{\text{inv\_sqrt}}$. $s_{\text{eta}} = (W_{\text{norm}} * gcn_{\text{weight\_raw}})[M.s_{\text{idx}}] \cdot s_{\text{sigma}}$.
+    -   **`deepGP`:** A multi-layered Gaussian Process where `y_coords_st` are transformed through `n_layers` using RFF-like projections.
+    -   **`sar`:** $W_{\text{row\_norm}} = M.W ./ (\text{vec(sum(M.W, dims=2)) + M.noise})$, $L_{\text{sar}} = I(M.N_{\text{areas}}) - s_{\text{rho}} \cdot W_{\text{row\_norm}}$. $s_Q = \text{Symmetric}(L_{\text{sar}}' * L_{\text{sar}}) + M.noise \cdot I$. $s_{\text{sar\_raw}} \sim \text{MvNormalCanon}(\mathbf{0}, s_Q)$, $s_{\text{eta}} = (s_{\text{sar\_raw}}[M.s_{\text{idx}}] \cdot s_{\text{sigma}})$.
+    -   **`fft`:** $s_{\text{spectral\_raw}} \sim \text{MvNormal}(\mathbf{0}, I)$, $s_{\text{icar\_fft}} = M.s_Q \setminus s_{\text{spectral\_raw}}$, $s_{\text{eta}} = (s_{\text{icar\_fft}} \cdot s_{\text{sigma}})[M.s_{\text{idx}}]$.
+    -   **`nystrom`:** $v_{\text{latent}} \sim \text{filldist}(\text{Normal}(0, 1), M.M_{\text{inducing\_count}})$, $s_{\text{eta}} = (M.K_{\text{nystrom\_proj}} * v_{\text{latent}}) \cdot s_{\text{sigma}}$.
+    -   **`svc`:** $svc_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, s_Q)$, $s_{\text{eta}}$ is a sum of $(svc_{\text{raw}}[M.s_{\text{idx}}] \cdot s_{\text{sigma}}) \cdot M.fixed[:, k]$ for fixed effects $k$.
+    -   **`dag`:** $L = I(M.N_{\text{areas}}) - W_{\text{scaled}}$ (where $W_{\text{scaled}}$ is adapted from $M.W$ for DAG structure), $s_Q_{\text{structural}} = L' * L$, $s_Q = (1.0 / s_{\text{sigma}}^2) \cdot s_Q_{\text{structural}} + M.noise \cdot I$.
+    -   **`local`:** $\mu_{\text{clusters}} \sim \text{filldist}(\text{Normal}(0, 1), M.n_{\text{clusters}})$, $s_Q_{\text{base}} = s_{\text{rho}} \cdot M.s_Q + (1 - s_{\text{rho}}) \cdot I(M.N_{\text{areas}})$, $s_Q = (1.0 / (s_{\text{sigma}}^2 + M.noise)) \cdot s_Q_{\text{base}} + M.noise \cdot I$. $s_{\text{eta\_raw}} \sim \text{MvNormalCanon}(\mu_{\text{clusters}}[M.cluster_{\text{assignments}}], s_Q)$, $s_{\text{eta}} = s_{\text{eta\_raw}}[M.s_{\text{idx}}]$.
+    -   **`svgp`:** $kernel_{\text{svgp}} = \text{sigma\_f} * \text{SqExponentialKernel}() \circ \text{ScaleTransform}(ls_{\text{st}})$, $K_{\text{uu}} = \text{kernelmatrix}(kernel_{\text{svgp}}, \text{RowVecs}(M.Z_{\text{inducing\_coords}}))$. $m_u \sim \text{filldist}(\text{Normal}(0, 1), M.M_{\text{inducing\_count}})$, $s_{u\_diag} \sim \text{filldist}(\text{Exponential}(1.0), M.M_{\text{inducing\_count}})$. $u_{\text{latent}} \sim \text{MvNormal}(m_u, \text{Symmetric}(K_{\text{uu}} + \text{Diagonal}(s_{u\_diag}.^2)))$. $s_{\text{eta}} = (M.Z_{\text{inducing\_proj}} * u_{\text{latent}}) \cdot s_{\text{sigma}}$.
+
+**4. Temporal Manifold (`t_eta`):**
+
+-   `t_sigma` $\sim \text{Exponential}(1.0)$:
+    -   Marginal standard deviation (scale) for the temporal effects.
+-   `t_rho` $\sim (M.model_{\text{time}} == \text{"ar1"}) ? \text{Beta}(2, 2) : \text{Dirac}(0.0)$:
+    -   AR1 persistence parameter.
+-   `t_ls` $\sim (M.model_{\text{time}} == \text{"gp"}) ? \text{InverseGamma}(3, 3) : \text{Dirac}(1.0)$:
+    -   Lengthscale for Gaussian Process temporal model.
+-   `t_\alpha, t_\beta` $\sim (M.model_{\text{time}} == \text{"harmonic"}) ? \text{Normal}(0, 1) : \text{Dirac}(0.0)$:
+    -   Coefficients for harmonic (seasonal) components.
+
+-   **Specific `model_time` implementations:**
+    -   **`ar1`:** $t_Q_{\text{base}} = \text{Symmetric}((1.0 + t_{\text{rho}}^2) \cdot I(M.N_{\text{time}}) + t_{\text{rho}} \cdot M.t_Q)$, $t_Q = (1.0 / (1.0 - t_{\text{rho}}^2 + M.noise)) \cdot t_Q_{\text{base}}$. $t_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, t_Q + M.noise \cdot I)$, $t_{\text{eta}} = t_{\text{raw}} \cdot t_{\text{sigma}}$.
+    -   **`rw2`:** $t_Q = (1.0 / (t_{\text{sigma}}^2 + M.noise)) \cdot M.t_Q$. $t_{\text{eta}} \sim \text{MvNormalCanon}(\mathbf{0}, t_Q + M.noise \cdot I)$ (where $t_{\text{eta}}$ already includes $t_{\text{sigma}}$).
+    -   **`gp`:** $t_K = (t_{\text{sigma}}^2) \cdot \text{kernelmatrix}(\text{SqExponentialKernel}() \circ \text{ScaleTransform}(\text{inv}(t_{\text{ls}})), 1.0:\text{Float64}(M.N_{\text{time}})) + M.noise \cdot I$. $t_{\text{eta}} \sim \text{MvNormal}(\mathbf{0}, \text{Symmetric}(t_K))$. $t_Q = \text{inv}(\text{Symmetric}(t_K))$.
+    -   **`harmonic`:** $t_{\text{eta}} = (t_{\text{alpha}} \cdot \text{sin}.(M.t_{\text{angle}}) + t_{\text{beta}} \cdot \text{cos}.(M.t_{\text{angle}})) \cdot t_{\text{sigma}}$. $t_Q = (1.0 / (t_{\text{sigma}}^2 + M.noise)) \cdot M.t_Q$.
+    -   **`iid`:** $t_{\text{eta}} \sim \text{MvNormal}(\mathbf{0}, t_{\text{sigma}} \cdot I)$. $t_Q = I(M.N_{\text{time}})$.
+
+**5. Space-Time Interaction (`st_eta`):**
+
+-   `st_sigma` $\sim M.model_{\text{st}} > 0 ? \text{Exponential}(0.5) : \text{Dirac}(0.0)$:
+    -   Scale parameter for space-time interactions.
+
+-   **Specific `model_st` implementations (Knorr-Held types):**
+    -   **`0` (None):** $st_{\text{inter}} = \text{zeros}(M.N_{\text{areas}}, M.N_{\text{time}})$.
+    -   **`1` (Type I - IID):** $st_{\text{raw}} \sim \text{MvNormal}(\mathbf{0}, I)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
+    -   **`2` (Type II - Temporal Structure):** $st_Q2 = \text{kron}(I(M.N_{\text{areas}}), t_Q)$, $st_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, st_Q2)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
+    -   **`3` (Type III - Spatial Structure):** $st_Q3 = \text{kron}(s_Q, I(M.N_{\text{time}}))$, $st_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, st_Q3)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
+    -   **`4` (Type IV - Inseparable):** $st_Q4 = \text{kron}(s_Q, t_Q)$, $st_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, st_Q4)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
+
+**6. Covariate Smoothing (`c_beta`):**
+
+-   `c_sigma` $\sim M.N_{\text{cov}} > 0 ? \text{Exponential}(1.0) : \text{Dirac}(0.0)$:
+    -   Scale parameter for covariate effects.
+-   `c_rho` $\sim (M.model_{\text{cov}} == \text{"ar1"}) ? \text{Beta}(2, 2) : \text{Dirac}(0.0)$:
+    -   AR1 persistence for covariates.
+-   `c_ls` $\sim (M.model_{\text{cov}} == \text{"gp"}) ? \text{InverseGamma}(3, 3) : \text{Dirac}(1.0)$:
+    -   Lengthscale for GP covariates.
+
+-   **Specific `model_cov` implementations (e.g., RW2, GP, RFF, Harmonic, IID, AR1):** These follow similar structures to the temporal and spatial manifolds, generating `c_eta` based on the chosen prior for the covariates. For instance, `rw2` uses $c_Q = (1.0 / (c_{\text{sigma}}^2 + M.noise)) \cdot M.c_Q$ and $c_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, c_Q)$.
+
+**7. Season Manifold (`u_eta`):**
+
+-   Similar hyperparameters ($u_{\text{sigma}}$, $u_{\text{rho}}$, $u_{\text{ls}}$, $u_{\text{alpha}}$, $u_{\text{beta}}$) and implementations (`ar1`, `rw2`, `gp`, `harmonic`, `iid`) as the Temporal Manifold, but applied to a separate seasonal index (`M.u_idx`).
+
+**8. Linear Predictor (`eta`):**
+
+The final linear predictor is assembled by summing all relevant components:
+
+$$\text{eta}_i = M.log\_offset_i + s_{\text{eta}}[M.s_{\text{idx}}[i]] + t_{\text{eta}}[M.t_{\text{idx}}[i]]$$
+
+-   If `M.N_cov > 0`: `eta .+= c_eta[M.cov_indices[:, 1]]`
+-   If `M.model_season != "none"`: `eta .+= u_eta[M.u_idx]`
+-   If `M.model_space == "svc" && M.N_fixed > 0`: `eta .+= (svc_raw[M.s_idx] .* svc_sigma) .* M.fixed[:, k]` for each fixed effect `k`.
+-   If `M.model_st > 0`: `eta[i] += st_eta[M.s_idx[i], M.t_idx[i]]` for each observation `i`.
+
+**9. Likelihood:**
+
+The model's likelihood is defined by `bstm_Likelihood` function, which dispatches based on `M.model_family` (e.g., "gaussian", "poisson", "negbin"). It takes the constructed `eta`, `M.y_obs`, and other parameters (`M.use_zi`, `M.weights`, `phi_zi`, `r_nb`, `y_sigma`, `M.trials`) to compute the log-probability of the observed data given the latent parameters.
+For example, for Poisson data, it would be $Y_i \sim \text{Poisson}(\exp(\eta_i))$, potentially with zero-inflation.
+
+### References:
+
+*   Besag, J., York, J., & Mollié, A. (1991). Bayesian image restoration, with applications in spatial statistics. *Annals of the Institute of Statistical Mathematics*, 43(1), 1-20.
+*   Riebler, A., Sørbye, S. H., & Rue, H. (2016). An intuitive Bayesian spatial model with two hyperparameters. *Statistical Methods in Medical Research*, 25(2), 1145-1160.
+*   Knorr-Held, L. (2000). Bayesian modelling of inseparable space-time variation in disease risk. *Statistical Methods in Medical Research*, 9(3), 205-220.
+*   Rasmussen, C. E., & Williams, C. K. I. (2006). *Gaussian Processes for Machine Learning*. MIT Press.
+*   Rahimi, A., & Recht, B. (2008). Random features for large-scale kernel machines. *Advances in Neural Information Processing Systems*, 20.
+
+
+
+## `bstm_multivariate` Model Documentation
+
+### Conceptual Overview: bstm_multivariate - Multivariate Bayesian Space-Time Models
+
+The `bstm_multivariate` model extends the univariate `bstm` framework to simultaneously model multiple related outcomes (e.g., different disease types, crime categories, or economic indicators) that share underlying spatiotemporal dynamics. It allows for flexible modeling of spatial, temporal, seasonal, and interaction effects for each outcome, while explicitly accounting for inter-outcome correlation using a multivariate normal prior on the effects.
+
+This model is particularly useful when analyzing phenomena that are not independent but rather influenced by common or related latent processes across space and time. By modeling outcomes jointly, it can borrow strength across them, potentially leading to more robust estimates and a better understanding of shared and unique drivers of each outcome.
+
+**Key Features:**
+
+1.  **Multivariate Latent Fields:** Unlike univariate models that produce a single set of spatial/temporal effects, `bstm_multivariate` generates a set of effects for *each* observed outcome (e.g., `s_eta` will be a matrix where columns correspond to outcomes).
+2.  **LKJ Correlation Prior:** Inter-outcome correlation is introduced through a Cholesky decomposition of an LKJ (Lewandowski, Kurowicka, Joe) prior. This prior is specifically designed for correlation matrices, ensuring positive definiteness and offering flexibility in modeling correlation structures.
+3.  **Modular Component Structure:** Retains the modularity of `bstm`, allowing various choices for spatial, temporal, seasonal, and interaction manifolds for each outcome. This means each outcome can have its own `s_sigma`, `t_sigma`, `st_sigma`, `s_rho`, `t_rho`, etc., providing immense flexibility.
+4.  **Flexible Likelihoods:** Supports multiple likelihood families (Gaussian, Log-Normal, Poisson, Binomial, Negative Binomial) for each outcome, with options for zero-inflation and stochastic volatility, enabling analysis of diverse data types within a single framework.
+
+### Mathematical Justification:
+
+Let $Y_{i,k}$ be the observed data for the $i$-th spatiotemporal observation of the $k$-th outcome, where $k \in \{1, \ldots, N_{\text{obs}}\}$. The model assumes a multivariate structure where the linear predictor for each outcome $k$, denoted $\eta_k$, contributes to the likelihood of $Y_{i,k}$.
+
+The total linear predictor for each outcome $k$ is given by:
+
+$$\eta_{i,k} = \text{log\_offset}_{i,k} + s_{\text{eta}}[M.s_{\text{idx}}[i], k] + t_{\text{eta}}[M.t_{\text{idx}}[i], k] + \text{st_eta}[k][M.s_{\text{idx}}[i], M.t_{\text{idx}}[i]] + \sum_{j} c_{\text{eta}}[M.cov_{\text{indices}}[i, j], k] + u_{\text{eta}}[M.u_{\text{idx}}[i], k] + \sum_{p} \text{fixed_effect}_{i,p} \cdot \text{SVC}_{p}[M.s_{\text{idx}}[i], k] + \text{fixed_effect}_{i,p} \cdot d_{\text{beta}}[p, k]$$
+
+Where components `s_eta`, `t_eta`, `st_eta`, `c_eta`, `u_eta` (and `svc_raw`, `d_beta` for fixed effects) are now matrices or arrays of matrices, with the last dimension corresponding to the outcome `k`. The key difference from the univariate model is the introduction of outcome-specific parameters and the LKJ correlation.
+
+**1. Setup & Hyperpriors:**
+
+-   `s_sigma` $\sim \text{filldist}(\text{Exponential}(1.0), N_{\text{obs}})$:
+    -   Outcome-specific marginal standard deviations for spatial effects.
+-   `t_sigma` $\sim \text{filldist}(\text{Exponential}(1.0), N_{\text{obs}})$:
+    -   Outcome-specific marginal standard deviations for temporal effects.
+-   `st_sigma` $\sim \text{filldist}(\text{Exponential}(0.5), N_{\text{obs}})$:
+    -   Outcome-specific marginal standard deviations for space-time interaction effects.
+-   `L_corr` $\sim \text{LKJCholesky}(N_{\text{obs}}, 1.0, :L)$:
+    -   Cholesky factor of the correlation matrix for the latent fields across outcomes. This prior on the Cholesky factor ensures a valid correlation matrix. The parameter 1.0 indicates a uniform prior on the correlation matrix.
+-   `r_nb` $\sim (M.model_{\text{family}} == \text{"negbin"}) ? \text{filldist}(\text{Exponential}(1.0), N_{\text{obs}}) : \text{filldist}(\text{Dirac}(1.0), N_{\text{obs}})$:
+    -   Outcome-specific Negative Binomial dispersion parameter.
+-   `phi_zi` $\sim M.use_{\text{zi}} ? \text{Beta}(1, 1) : \text{Dirac}(0.0)$:
+    -   Zero-inflation probability (shared across outcomes if `use_zi` is true).
+
+**2. Stochastic Volatility Manifold (Optional):**
+
+-   `y_sigma_const` $\sim (M.model_{\text{family}} \in [\text{"gaussian"}, \text{"lognormal"}]) ? \text{Exponential}(1.0) : \text{Dirac}(1.0)$:
+    -   Constant observation-level standard deviation (if not using stochastic volatility).
+-   If `M.use_sv` is true:
+    -   `sigma_log_var` $\sim \text{Exponential}(1.0)$:
+        -   Variance for the log of the standard deviation in the stochastic volatility model.
+    -   `beta_vol` $\sim \text{filldist}(\text{Normal}(0, \text{sigma_log_var}), M.M_{\text{rff_sigma}})$:
+        -   Coefficients for the RFF-based stochastic volatility (shared across outcomes).
+    -   `y_sigma` is derived as a spatiotemporally varying standard deviation for each observation.
+-   Else: `y_sigma = fill(y_sigma_const, M.N_obs)`: Each outcome uses `y_sigma_const`.
+
+**3. Spatial Manifolds (`s_eta`):**
+
+-   `s_rho` $\sim (M.model_{\text{space}} \in [\text{"bym2"}, \text{"leroux"}, \text{"sar"}]) ? \text{filldist}(\text{Beta}(1, 1), N_{\text{obs}}) : \text{filldist}(\text{Dirac}(1.0), N_{\text{obs}})$:
+    -   Outcome-specific spatial correlation/mixing parameters.
+-   `gcn_weight` $\sim (M.model_{\text{space}} == \text{"bgcn"}) ? \text{filldist}(\text{Beta}(1, 1), N_{\text{obs}}) : \text{filldist}(\text{Dirac}(0.0), N_{\text{obs}})$:
+    -   Outcome-specific weights for GCN models.
+-   `s_eta_scaled` (matrix `N_areas` x `N_obs`):
+    -   For each outcome $k$, a latent ICAR field `s_icar` $\sim \text{MvNormalCanon}(\mathbf{0}, \text{Symmetric}(M.s_Q + M.noise \cdot I))$ is sampled.
+    -   A soft sum-to-zero constraint is applied: `s_total_k = sum(s_icar)` $\sim \text{Normal}(0, 0.001 \cdot N_{\text{areas}})$.
+    -   Depending on `M.model_space` (e.g., `besag`, `bym2`, `leroux`, `sar`, `iid`), `s_icar` (and potentially `u_iid_k` for BYM2) is transformed to `s_eta_scaled[:, k]`.
+-   The final spatial effect is obtained by applying the LKJ correlation and scaling:
+    -   `s_eta = (s_eta_scaled * L_corr) .* s_sigma'`
+    -   This allows for correlation between the spatial effects of different outcomes.
+
+**4. Temporal Manifolds (`t_eta`):**
+
+-   `t_eta` (matrix `N_time` x `N_obs`):
+    -   For each outcome $k$, outcome-specific temporal hyperparameters are drawn (`t_rho_k`, `t_ls_k`, `t_α_k`, `t_β_k`).
+    -   A temporal latent field (`t_raw_k`, `t_gp_k`, `t_iid_k`, or direct harmonic calculation) is sampled based on `M.model_time` (e.g., `ar1`, `rw2`, `gp`, `harmonic`, `iid`).
+    -   `t_eta[:, k]` is constructed by scaling this latent field with `t_sigma[k]`.
+    -   `t_Q[k]` stores the outcome-specific temporal precision matrix, which is used for space-time interactions.
+
+**5. Season Manifolds (`u_eta`):**
+
+-   `u_sigma` $\sim M.model_{\text{season}} \neq \text{"none"} ? \text{filldist}(\text{Exponential}(0.5), N_{\text{obs}}) : \text{filldist}(\text{Dirac}(0.0), N_{\text{obs}})$:
+    -   Outcome-specific scale for seasonal effects.
+-   `u_eta` (matrix `N_season` x `N_obs`):
+    -   Similar to `t_eta`, for each outcome $k$, outcome-specific seasonal hyperparameters are drawn and a seasonal latent field is constructed based on `M.model_season` (`ar1`, `rw2`, `gp`, `harmonic`, `iid`), scaled by `u_sigma[k]`.
+
+**6. Interactions (`st_eta` - Knorr-Held Types):**
+
+-   `st_eta` (array of `N_obs` matrices, each `N_areas` x `N_time`):
+    -   For each outcome $k$, `st_raw_k` $\sim \text{MvNormal}(\mathbf{0}, I)$ (for Type I) or $\sim \text{MvNormalCanon}(\mathbf{0}, st_Q_{type_k})$ (for Types II-IV) is sampled.
+    -   `st_Q_{type_k}` is constructed using `M.s_Q` and `t_Q[k]`, depending on `M.model_st`.
+    -   `st_eta[k]` is the reshaped and scaled interaction field for outcome $k$, scaled by `st_sigma[k]`.
+
+**7. Covariate Smoothing (`c_eta`):**
+
+-   `c_sigma` $\sim M.N_{\text{cov}} > 0 ? \text{filldist}(\text{Exponential}(1.0), N_{\text{obs}}) : \text{filldist}(\text{Dirac}(0.0), N_{\text{obs}})$:
+    -   Outcome-specific scale for covariate effects.
+-   `c_eta` (matrix `M.N_cat` x `N_obs`):
+    -   For each outcome $k$, outcome-specific covariate hyperparameters are drawn and a covariate latent field is constructed based on `M.model_cov` (`ar1`, `rw2`, `gp`, `harmonic`, `rff`, `iid`), scaled by `c_sigma[k]`.
+
+**8. Fixed Effects:**
+
+-   `svc_sigma` $\sim (M.model_{\text{space}} == \text{"svc"}) ? \text{filldist}(\text{Exponential}(0.5), N_{\text{obs}}) : \text{filldist}(\text{Dirac}(0.0), N_{\text{obs}})$:
+    -   Outcome-specific scale for spatially varying coefficients.
+-   If `M.model_space == "svc" && M.N_fixed > 0`:
+    -   `eta_k .+= (s_eta_scaled[M.s_idx, k] .* svc_sigma[k]) .* M.fixed[:, d]` for each fixed effect `d`.
+    -   Here, `s_eta_scaled[:, k]` serves as the spatial effect for the coefficients.
+-   Else if `M.N_fixed > 0` (non-SVC fixed effects):
+    -   `d_beta_k` $\sim \text{filldist}(\text{Normal}(0, 5), M.N_{\text{fixed}})$:
+        -   Outcome-specific coefficients for fixed effects.
+    -   `eta_k .+= M.fixed * d_beta_k`.
+
+**9. Likelihood Assembly:**
+
+-   For each outcome $k \in \{1, \ldots, N_{\text{obs}}\}$:
+    -   An outcome-specific linear predictor `eta_k` is assembled by summing all relevant components (offset, spatial, temporal, seasonal, interaction, covariates, fixed effects).
+    -   `Turing.@addlogprob! logpdf(bstm_Likelihood(M.model_family, M.use_zi, M.weights, phi_zi, r_nb[k], y_sigma[k], M.trials, M.y_obs[:, k]), eta_k)`:
+        -   The `bstm_Likelihood` function computes the log-likelihood for the $k$-th outcome, using its specific parameters (`r_nb[k]`, `y_sigma[k]`, `M.y_obs[:, k]`), and shared parameters (`M.model_family`, `M.use_zi`, `M.weights`, `phi_zi`, `M.trials`).
+
+### References:
+
+*   Besag, J., York, J., & Mollié, A. (1991). Bayesian image restoration, with applications in spatial statistics. *Annals of the Institute of Statistical Mathematics*, 43(1), 1-20.
+*   Riebler, A., Sørbye, S. H., & Rue, H. (2016). An intuitive Bayesian spatial model with two hyperparameters. *Statistical Methods in Medical Research*, 25(2), 1145-1160.
+*   Knorr-Held, L. (2000). Bayesian modelling of inseparable space-time variation in disease risk. *Statistical Methods in Medical Research*, 9(3), 205-220.
+*   Rasmussen, C. E., & Williams, C. K. I. (2006). *Gaussian Processes for Machine Learning*. MIT Press.
+*   Rahimi, A., & Recht, B. (2008). Random features for large-scale kernel machines. *Advances in Neural Information Processing Systems*, 20.
+
+
+
+## `bstm_multifidelity` Model Documentation
+
+### Conceptual Overview
+
+The `bstm_multifidelity` model is a Bayesian spatio-temporal framework designed to integrate data from multiple fidelity levels (e.g., high-resolution observations and lower-resolution simulations or auxiliary data). It aims to leverage the strengths of each data source to produce a more robust and accurate inference of the underlying latent processes. The model achieves this by: 
+
+1.  **Global Hyperpriors:** Setting up overarching priors for key model parameters like observation noise, dispersion, and zero-inflation.
+2.  **Nested Latent Covariate Structure (RFF-based Multi-Fidelity):** This is the core multi-fidelity component. It models latent spatial (`z_latent`) and spatiotemporal (`w_latent`) processes using Random Fourier Features (RFF). Crucially, the medium-fidelity `w_latent` process *depends* on the high-fidelity `z_latent` process, creating a nested structure that allows information flow between fidelity levels. This captures complex, non-linear relationships between covariates and observations.
+3.  **Spatio-Temporal Manifolds:** Incorporating traditional Bayesian spatio-temporal components to capture residual variation:
+    *   **Spatial (`s_eta`):** Models spatial autocorrelation using a combination of ICAR (Intrinsic Conditional Autoregressive) and IID (Independent and Identically Distributed) effects, allowing for flexible spatial smoothing.
+    *   **Temporal (`t_eta_full`):** Models temporal dependence using various structures like AR(1), RW2 (Random Walk of order 2), Gaussian Processes (GP), or IID effects.
+    *   **Seasonality (`u_eta_full`):** Captures periodic patterns in data, also offering AR(1), RW2, GP, or IID structures.
+4.  **Space-Time Interaction (`st_eta`):** Allows for different types of interactions between spatial and temporal effects, ranging from IID to fully inseparable structures (Knorr-Held Types 0-4), enabling the model to capture non-additive spatio-temporal dynamics.
+5.  **Linear Predictor Construction:** Combines all latent components (spatial, temporal, seasonality, multi-fidelity RFFs, and interaction terms) into a single linear predictor (`eta`), which represents the expected value of the response.
+6.  **Joint Multi-fidelity Likelihood:** The model specifies likelihoods for both the multi-fidelity latent observations (`z_obs`, `w_obs`) and the primary observations (`y_obs`), linking the latent processes to the observed data. This allows the model to learn from all available data simultaneously.
+
+In essence, `bstm_multifidelity` is designed to be highly flexible, combining established spatio-temporal modeling techniques with modern multi-fidelity approaches to handle complex data structures and improve predictive performance by integrating information from diverse sources.
+
+
+The `bstm_multifidelity` model is defined by a series of hierarchical priors and likelihoods, detailed below:
+
+#### 1. Global Hyperpriors
+
+These priors govern the fundamental properties of the observation noise and data distribution:
+
+*   **`y_sigma` (Observation Noise Scale):**
+    *   If `M.model_family` is `"gaussian"` or `"lognormal"`, `y_sigma ~ Exponential(1.0)`. This assigns a prior favoring smaller observation noise, with a mean of 1.0.
+    *   Otherwise, `y_sigma ~ Dirac(1.0)`, fixing the scale to 1.0 (e.g., for Poisson or Negative Binomial where dispersion is handled differently or not applicable).
+
+*   **`r_nb` (Negative Binomial Dispersion):**
+    *   If `M.model_family == "negbin"`, `r_nb ~ Exponential(1.0)`. This provides a prior for the dispersion parameter of the Negative Binomial distribution, influencing its overdispersion.
+    *   Otherwise, `r_nb ~ Dirac(1.0)`, making it inactive for other likelihood families.
+
+*   **`phi_zi` (Zero-Inflation Probability):**
+    *   If `M.use_zi` is true, `phi_zi ~ Beta(1, 1)`. A uniform prior between 0 and 1 for the probability of excess zeros.
+    *   Otherwise, `phi_zi ~ Dirac(0.0)`, setting the zero-inflation probability to zero.
+
+*   **`z_sigma` (High-Fidelity Noise Scale):** `z_sigma ~ Exponential(0.5)`. Prior for the observation noise of the high-fidelity latent process `z_latent`.
+
+*   **`w_sigma` (Medium-Fidelity Noise Scales):** `w_sigma ~ filldist(Exponential(0.5), 3)`. Independent priors for the observation noise of the three medium-fidelity latent processes `w_latent[:, k]`.
+
+#### 2. Nested Latent Covariate Structure (RFF based)
+
+This section models multi-fidelity latent processes using Random Fourier Features (RFF) for flexible, non-linear function approximation. RFFs transform input coordinates into a high-dimensional space where linear models can approximate functions that are non-linear in the original space.
+
+*   **High-Fidelity `Z` (Spatial):**
+    *   **`z_ls` (Length Scale):** `z_ls ~ Gamma(2, 2)`. Prior for the length scale governing the smoothness of the `z_latent` spatial process. `Gamma(2,2)` is a common weakly informative prior for scales.
+    *   **`z_beta` (RFF Weights):** `z_beta ~ filldist(Normal(0, 1), M.M_rff)`. Weights for the RFF expansion, drawn from a standard normal distribution.
+    *   **`z_proj` (Projected Coordinates):** `z_proj = (M.z_coords_s * (M.W_fixed[1:size(M.z_coords_s, 2), :] ./ z_ls)) .+ M.b_fixed'`. This projects the spatial coordinates `M.z_coords_s` into the RFF space. `M.W_fixed` and `M.b_fixed` are precomputed RFF projection matrices and biases.
+    *   **`z_latent` (High-Fidelity Latent Process):** `z_latent = M.rff_scale .* (cos.(z_proj) * z_beta)`. The final high-fidelity latent process, obtained by applying cosine activation to the projected coordinates and scaling by `M.rff_scale` and the RFF weights `z_beta`.
+
+*   **Medium-Fidelity `W` (Spatiotemporal, depends on `Z`):**
+    *   **`w_ls` (Length Scale):** `w_ls ~ Gamma(2, 2)`. Prior for the length scale of the `w_latent` spatiotemporal process.
+    *   **`w_beta` (RFF Weights):** `w_beta ~ filldist(Normal(0, 1), M.M_rff, 3)`. Weights for the RFF expansion of the `w_latent` processes (three of them, hence `3`).
+    *   **`w_coords_augmented` (Augmented Coordinates):** `w_coords_augmented = hcat(M.w_coords_st, z_latent[1:size(M.w_coords_st, 1)])`. This is the crucial step for multi-fidelity nesting: the medium-fidelity spatiotemporal coordinates `M.w_coords_st` are augmented with the *high-fidelity latent process* `z_latent`. This allows the `w_latent` to learn non-linear relationships with `z_latent`.
+    *   **`w_proj` (Projected Coordinates):** `w_proj = (w_coords_augmented * (M.W_fixed[1:size(w_coords_augmented, 2), :] ./ w_ls)) .+ M.b_fixed'`. Projects the augmented coordinates into the RFF space.
+    *   **`w_latent` (Medium-Fidelity Latent Process):** `w_latent = M.rff_scale .* (cos.(w_proj) * beta_w)`. The medium-fidelity latent process, derived from its RFF expansion and dependence on `z_latent`.
+
+#### 3. Spatial, Temporal, and Seasonality Manifolds
+
+These components capture standard spatio-temporal variation independent of the multi-fidelity RFFs.
+
+*   **Spatial Manifold (`s_eta`):**
+    *   **`s_sigma` (Spatial Scale):** `s_sigma ~ Exponential(1.0)`. Overall scale for the spatial effect.
+    *   **`s_rho` (Spatial Mixing Parameter):** `s_rho ~ Beta(1, 1)`. A parameter for mixing between structured ICAR and unstructured IID spatial effects. A `Beta(1,1)` prior is uniform over `(0,1)`.
+    *   **`s_icar` (ICAR Component):** `s_icar ~ MvNormalCanon(zeros(M.N_areas), M.s_Q + M.noise*I)`. This represents the Intrinsic Conditional Autoregressive (ICAR) component. `MvNormalCanon` parameterizes by mean and precision matrix. `M.s_Q` is a precomputed structural precision matrix, and `M.noise*I` adds a small amount of jitter for numerical stability.
+    *   **`s_iid` (IID Component):** `s_iid ~ MvNormal(zeros(M.N_areas), I)`. An Independent and Identically Distributed spatial component.
+    *   **Sum-to-zero constraint:** `sum_icar = sum(s_icar); sum_icar ~ Normal(0, 0.001 * M.N_areas)`. This soft constraint helps ensure identifiability by preventing the spatial field from absorbing the global intercept. It gently pulls the sum of the ICAR component towards zero.
+    *   **`s_eta` (Mapped Spatial Effect):** `s_eta = (s_sigma .* (sqrt(s_rho) .* s_icar .+ sqrt(1 - s_rho) .* s_iid))[M.s_idx]`. The final spatial effect, constructed as a weighted average of the `s_icar` and `s_iid` components, scaled by `s_sigma`, and then mapped to the observations via `M.s_idx`.
+
+*   **Temporal Manifold (`t_eta_full`):**
+    *   **`t_sigma` (Temporal Scale):** `t_sigma ~ Exponential(1.0)`. Overall scale for the temporal effect.
+    *   **`t_rho` (AR(1) Parameter):** If `M.model_time == "ar1"`, `t_rho ~ Beta(2, 2)`. Prior for the autocorrelation parameter in an AR(1) process, favoring values near 0.5. Otherwise, `t_rho ~ Dirac(0.0)`.
+    *   **`t_ls` (GP Length Scale):** If `M.model_time == "gp"`, `t_ls ~ InverseGamma(3, 3)`. Prior for the length scale of a Gaussian Process. Otherwise, `t_ls ~ Dirac(1.0)`.
+    *   **Conditional Logic for `t_eta_full` and `t_Q`:**
+        *   **`"ar1"` (Autoregressive of order 1):**
+            *   `t_Q_base = Symmetric((1.0 + t_rho^2) .* I(M.N_time) .+ (t_rho) .* M.t_Q)`. The base precision matrix for the AR(1) process, constructed from `t_rho` and a structural template `M.t_Q`.
+            *   `t_Q = Symmetric((1.0 / (1.0 - t_rho^2 + M.noise)) .* t_Q_base )`. The final precision matrix, scaled by the AR(1) variance `(1 - t_rho^2)`.
+            *   `t_raw ~ MvNormalCanon(zeros(M.N_time), t_Q)`. Samples the raw temporal effect from a canonical multivariate normal.
+            *   `t_eta_full = (t_raw .* t_sigma)[M.t_idx]`. Scales the raw effect and maps it to observations.
+        *   **`"rw2"` (Random Walk of order 2):**
+            *   `t_Q = Symmetric((1.0 / (t_sigma^2 + M.noise)) .* M.t_Q )`. The precision matrix, scaled by `t_sigma^2` and the precomputed RW2 structural template `M.t_Q`.
+            *   `t_raw ~ MvNormalCanon(zeros(M.N_time), t_Q)`. Samples the raw temporal effect.
+            *   `t_eta_full = t_raw[M.t_idx]`. Maps the raw effect. Note `t_sigma` is already in `t_Q`.
+        *   **`"gp"` (Gaussian Process):**
+            *   `K_t = (t_sigma^2) .* kernelmatrix(SqExponentialKernel() ∘ ScaleTransform(inv(t_ls)), 1.0:Float64(M.N_time)) + M.noise * I`. Constructs the covariance matrix `K_t` using a Squared Exponential kernel with length scale `t_ls` and variance `t_sigma^2`.
+            *   `t_gp ~ MvNormal(zeros(M.N_time), Symmetric(K_t))`. Samples the temporal effect directly from a multivariate normal with `K_t` as covariance.
+            *   `t_eta_full = t_gp[M.t_idx]`. Maps the GP samples.
+            *   `t_Q = inv(Symmetric(K_t))`. Derives the precision matrix for interaction logic.
+        *   **`"iid"` (Independent and Identically Distributed):**
+            *   `t_Q = Symmetric((1.0 / (t_sigma^2 + M.noise)) .* I(M.N_time))`. Precision matrix for IID effects.
+            *   `t_iid ~ MvNormal(zeros(M.N_time), I)`. Samples IID effects.
+            *   `t_eta_full = (t_iid .* t_sigma)[M.t_idx]`. Scales and maps IID effects.
+        *   **Else:** `t_eta_full = zeros(T, M.N_obs)`.
+
+*   **Seasonality Manifold (`u_eta_full`):**
+    *   **`u_sigma` (Seasonality Scale):** If `M.model_season != "none"`, `u_sigma ~ Exponential(0.5)`. Otherwise, `u_sigma ~ Dirac(0.0)`.
+    *   **`u_rho` (AR(1) Parameter):** If `M.model_season == "ar1"`, `u_rho ~ Beta(2, 2)`. Otherwise, `u_rho ~ Dirac(0.0)`.
+    *   **`u_ls` (GP Length Scale):** If `M.model_season == "gp"`, `u_ls ~ InverseGamma(3, 3)`. Otherwise, `u_ls ~ Dirac(1.0)`.
+    *   **Conditional Logic for `u_eta_full`:** Similar logic to the temporal manifold, but applied to seasonal cycles using `M.N_season`, `M.u_Q`, and `M.u_idx`.
+
+#### 4. Space-Time Interaction (`st_eta`)
+
+This component captures non-additive interactions between space and time, following Knorr-Held types.
+
+*   **`st_sigma` (Interaction Scale):** If `M.model_st > 0`, `st_sigma ~ Exponential(0.5)`. Otherwise, `st_sigma ~ Dirac(0.0)`.
+*   **Conditional Logic for `st_eta`:**
+    *   **`M.model_st == 0` (No Interaction):** `st_eta = zeros(T, M.N_areas, M.N_time)`.
+    *   **`M.model_st == 1` (Type I: IID Interaction):** `st_raw ~ MvNormal(zeros(M.N_areas * M.N_time), I)`. Samples IID interaction effects, then reshapes and scales them.
+    *   **`M.model_st == 2` (Type II: Temporal Structure):** `st_Q2 = Symmetric(kron(I(M.N_areas), t_Q) )`. Precision for each area having an independent structured temporal trend, using the previously derived `t_Q`.
+    *   **`M.model_st == 3` (Type III: Spatial Structure):** `st_Q3 = Symmetric(kron(M.s_Q, I(M.N_time)) )`. Precision for each time point having an independent structured spatial field, using `M.s_Q`.
+    *   **`M.model_st == 4` (Type IV: Inseparable):** `st_Q4 = Symmetric(kron(M.s_Q, t_Q) )`. Fully inseparable spatiotemporal structure, using the Kronecker product of `M.s_Q` and `t_Q`.
+    *   In types 1-4, `st_raw` is sampled from a canonical multivariate normal with the derived precision, then `st_eta` is reshaped and scaled by `st_sigma`.
+
+#### 5. Linear Predictor Construction
+
+This combines all latent effects into the final linear predictor `eta`.
+
+*   **`z_beta_eta` (High-Fidelity Linkage):** `z_beta_eta ~ Normal(0, 1)`. A coefficient linking the high-fidelity latent process `z_latent` to the overall linear predictor.
+*   **`w_beta_eta` (Medium-Fidelity Linkage):** `w_beta_eta ~ MvNormal(zeros(3), I)`. Coefficients linking the three medium-fidelity latent processes `w_latent` to the overall linear predictor.
+*   **`eta` (Linear Predictor):** `eta = M.log_offset .+ s_eta .+ t_eta_full .+ u_eta_full .+ (z_latent .* z_beta_eta) .+ (w_latent * w_beta_eta)`. This sums the log offset, spatial, temporal, seasonal, and multi-fidelity RFF effects.
+*   **Interaction Term Addition:** `if M.model_st > 0; for i in 1:M.N_obs; eta[i] += st_eta[M.s_idx[i], M.t_idx[i]]; end; end`. If a space-time interaction is enabled, its components are added to the corresponding observation points in `eta`.
+
+#### 6. Joint Multi-fidelity Likelihood
+
+This defines how the observed data are generated from the latent processes.
+
+*   **High-Fidelity Latent Likelihood:** `Turing.@addlogprob! logpdf(MvNormal(z_latent, z_sigma^2 * I), M.z_obs)`. The high-fidelity observations `M.z_obs` are assumed to be normally distributed around the `z_latent` process with variance `z_sigma^2`.
+
+*   **Medium-Fidelity Latent Likelihoods:** `for k in 1:3; Turing.@addlogprob! logpdf(MvNormal(w_latent[:, k], w_sigma[k]^2 * I), M.w_obs[:, k]); end`. Each of the three medium-fidelity observations `M.w_obs[:, k]` is normally distributed around its respective `w_latent[:, k]` process with variance `w_sigma[k]^2`.
+
+*   **Primary Observation Likelihood:** `Turing.@addlogprob! logpdf(bstm_Likelihood(M.model_family, M.use_zi, M.weights, phi_zi, r_nb, y_sigma, M.trials, M.y_obs), eta)`. The primary observations `M.y_obs` are modeled according to `M.model_family` (e.g., Poisson, Negative Binomial, Gaussian) with potential zero-inflation (`phi_zi`), negative binomial dispersion (`r_nb`), and observation scale (`y_sigma`), all linked via the linear predictor `eta` and observation-specific weights (`M.weights`) and trials (`M.trials`) for count models.
+
+
+#### References for Multi-Fidelity Models
+
+*   **General Multi-Fidelity Modeling:**
+    *   Forrester, A. I. J., Sóbester, A., & Keane, A. J. (2008). *Engineering Design via Surrogate Modelling: A Practical Guide* (pp. 129-152). Chichester: John Wiley & Sons. (General overview of multi-fidelity optimization and modeling)
+    *   Kennedy, M. C., & O'Hagan, A. (2001). Bayesian calibration of computer models. *Journal of the Royal Statistical Society: Series B (Statistical Methodology)*, 63(3), 425-450. (Foundational work on calibrating computer models, often related to multi-fidelity)
+
+*   **Random Fourier Features (RFF) and Kernel Methods:**
+    *   Rahimi, A., & Recht, B. (2008). Random features for large-scale kernel machines. *Advances in Neural Information Processing Systems*, 20. (Key paper introducing RFFs)
+    *   Sutherland, D. J., & Schneider, J. (2015). On the error of random Fourier features. *Proceedings of the Eighteenth International Conference on Artificial Intelligence and Statistics*. (Analysis of RFF performance)
+
+*   **Bayesian Approaches in Multi-Fidelity:**
+    *   P. Perdikaris and K. Willcox. (2017). Learning solutions of parametrized partial differential equations from small datasets. *SIAM Journal on Scientific Computing*, 39(4), A2054–A2079. (Bayesian multi-fidelity methods for PDEs)
+    *   Cutler, J., & Wild, S. M. (2020). Multi-fidelity Bayesian Optimization with Deep Neural Networks. *Advances in Neural Information Processing Systems*, 33.
+
+
+
+
+
+
 ## Discrete models
 
-### model_D00_poisson_simple
+### example_bym2_ar1_poisson
  
 This model is perhaps the most basic spatiotemporal model. We have already seen this model in the introductory example with Scottish lip cancers. No covariates are in it. There is no weighting nor use of offsets. There is no interaction between space and time. It is as basic as it can get. 
 
@@ -954,7 +1344,7 @@ display(res.plots.ppc)  # there are a few more generic plots (see inside the obj
 Sampling takes 7.5 seconds and gives the following results:
 
 ``` 
-modelname: model_D00_poisson_simple
+modelname: example_bym2_ar1_poisson
 compute_time_seconds: 7.5
 rmse: 2160.317
 r2: 0.0
@@ -982,13 +1372,13 @@ ess_per_second: 2.01
 *   **Morris, M., Wheeler-Martin, K., & Simpson, D. (2019).** *Bayesian hierarchical models for spatial data.* [Stan Case Study](https://mc-stan.org/users/documentation/case-studies/icar_stan.html).
 
 
-### model_D01_poisson_besag
+### example_besag_ar1_poisson
 
 This model serves to demonstrate a more realistic workflow. It adds four covariates via a RW2 smoothing process with offsets into the model. A full Space-Time Interaction field is also incorporated, $\\sigma_{int}$, allowing for localized hotspots that aren't captured by the main spatial or temporal trends.
 
 
 
-### model_D02_poisson_bym2
+### example_bym2_ar1_poisson
 
 This model continues, however, we now focus upon the spatial structure: BYM2 (instead of the Besag).
  
@@ -1535,7 +1925,6 @@ summary:
 7	SOTA (BGCN)	Learnable Filter	Learnable spectral signal on W_hat
 
 
-### model_C01_gaussian_dense_gp
 ### model_C02_gaussian_deep_gp
 ### model_C03_binomial_deep_gp 
 ### model_C04_gaussian_deep_gp_3layer
@@ -1549,7 +1938,11 @@ summary:
 ### model_C10_gaussian_fitcxed_fitc_grmf
 ### model_C11_svgp
 ### model_C12_svgp_full
-### model_C13_multifidelity_gp
+### Detailed Mathematical Justification
+
+
+
+
 ### model_C14_minibatch_mfgp
 ### model_C15_deep_gp   
 ### model_C16_nystrom 
@@ -2481,6 +2874,87 @@ but note that $y^{n \times k}$ are mean centered observations of n data points a
 $$\mathbf{y} \sim \text{N} (\mathbf{Z} \mathbf{W}^T  + \mathbf{\beta} \mathbf{X} + \textbf{GP}(z, bt) + \textbf{ICAR}(s) + \textit{F}(t) + \textbf{ICAR}(s,t) \otimes \textit{F}(s,t),  \sigma^2 \mathbf{I})$$
 
 The computation of each component is relatively simple, however, to improve parameter estimation and sampling efficiency, we use a [Householder transformation to ensure rotationally invariant solutions](./pca.md). 
+
+
+### The Householder PCA Manifold
+
+In multivariate spatiotemporal models, we often map $N_{outcomes}$ down to $N_{factors}$ latent variables. To ensure this mapping is identifiable and numerically stable, we require the loadings matrix $U$ to be **orthonormal** ($U'U = I$). 
+
+Instead of sampling a dense matrix and orthogonalizing it (which is non-differentiable and unstable), we use a series of **Householder reflections**. A Householder reflection maps a vector to a hyperplane, and the composition of several such reflections constructs an arbitrary orthonormal basis.
+
+#### Mathematical Logic
+1.  **Reflector Vectors ($v$):** We sample a vector of free parameters $v$ from the unit ball.
+2.  **Householder Matrix ($H$):** For each factor, we construct $H = I - 2vv'$, which is a symmetric orthogonal matrix.
+3.  **Recursive Reconstruction:** By multiplying these reflection matrices, we build the matrix $U$ such that its columns are the principal axes of our latent space.
+4.  **Uniqueness Matrix ($K$):** The total covariance is reconstructed as $\Sigma = U \Lambda U' + \Psi$, where $\Lambda$ contains the factor variances and $\Psi$ is a diagonal matrix of uniqueness/residual variances.
+
+### Mathematical Summary: Householder Reflections in Bayesian PCA
+
+The goal is to construct an $N \times K$ orthonormal loadings matrix $U$ (where $U'U = I$) such that the first $K$ columns of a full orthogonal matrix $Q$ serve as our principal axes.
+
+#### 1. The Elementary Reflection
+A Householder reflection is defined by a unit vector $v \in \mathbb{R}^N$. The corresponding Householder matrix $H$ is:
+$$H = I - 2vv^T$$
+Key properties:
+*   **Symmetry:** $H = H^T$
+*   **Orthogonality:** $H^T H = I$
+*   **Reflection:** It reflects any vector across the hyperplane orthogonal to $v$.
+
+#### 2. Sequential Construction
+To construct a loadings matrix for $K$ factors, we compose a sequence of $K$ such reflections:
+$$Q = H_1 H_2 \dots H_K$$
+In the model implementation, we start with the Identity matrix $I_N$ and iteratively apply reflections:
+1.  Initialize $U^{(0)} = I_N$.
+2.  For each factor $k \in \{1, \dots, K\}$:
+    *   Sample a free vector $v_k$.
+    *   Normalize to unit length: $\hat{v}_k = \frac{v_k}{\|v_k\|}$.
+    *   Update the matrix: $U^{(k)} = (I - 2\hat{v}_k \hat{v}_k^T) U^{(k-1)}$.
+
+#### 3. Dimensionality Reduction
+The final loadings matrix $U$ is formed by taking the first $K$ columns of the transformed matrix:
+$$U = [U^{(K)}]_{:, 1:K}$$
+This process is differentiable and maintains $U'U = I$ exactly, avoiding the need for the unstable Gram-Schmidt process during MCMC sampling.
+
+#### 4. Covariate Reconstruction
+The observed multivariate covariance $\Sigma$ is then modeled as:
+$$\Sigma = U \Lambda U^T + \Psi$$
+where $\Lambda = \text{diag}(\sigma_{pca}^2)$ contains the factor variances and $\Psi = \sigma_{residual}^2 I$ represents the uniqueness or measurement noise.
+
+
+### Efficiencies and Alternatives for Orthonormal Loadings
+
+#### 1. Implementation Efficiencies (The $O(K \cdot N^2)$ trick)
+In the current Householder implementation, we apply $U^{(k)} = (I - 2vv^T) U^{(k-1)}$. Performing a full matrix-matrix multiplication is $O(N^3)$. However, because $(I - 2vv^T)$ is a rank-1 update, we can compute it much faster:
+
+$$U^{(k)} = U^{(k-1)} - 2v(v^T U^{(k-1)})$$
+
+By computing the vector-matrix product $v^T U$ first ($O(N^2)$) and then the outer product ($O(N^2)$), the total cost for $K$ factors becomes **$O(K \cdot N^2)$**. This is significantly faster than the naive $O(K \cdot N^3)$ approach when $N$ is large.
+
+#### 2. Alternative: The Cayley Transform
+The Cayley Transform maps a skew-symmetric matrix $A$ (where $A^T = -A$) to an orthogonal matrix $Q$:
+
+$$Q = (I - A)(I + A)^{-1}$$
+
+*   **Pros:** It directly maps $\frac{N(N-1)}{2}$ free parameters to $SO(N)$ without sequential loops.
+*   **Cons:** Requires a matrix inversion, which is $O(N^3)$. For dimensionality reduction ($N \gg K$), Householder is usually more efficient because it only requires $K$ reflections rather than a full $N \times N$ transform.
+
+#### 3. Alternative: Exponential Map
+One can use the matrix exponential of a skew-symmetric matrix: $Q = \exp(A)$. 
+*   This is theoretically elegant but computationally expensive due to the need for power series or Padé approximations, which are difficult for Automatic Differentiation (AD) engines like `ForwardDiff` to handle efficiently compared to simple arithmetic Householder updates.
+
+#### 4. Summary Table
+
+| Method           | Complexity       | AD Compatibility | Notes                                       |
+| :-----------------| :-----------------| :-----------------| :--------------------------------------------|
+| **Householder**  | $O(K \cdot N^2)$ | High             | Best for $N \gg K$; very stable.            |
+| **Cayley**       | $O(N^3)$         | Medium           | Requires inversion; good for full rotation. |
+| **Gram-Schmidt** | $O(K^2 \cdot N)$ | Low              | Numerically unstable during NUTS sampling.  |
+| **Stiefel Opt.** | Variable         | Medium           | Requires specialized manifold samplers.     |
+
+
+
+
+
 
 But first prepare the data. This uses the [aegis.speciescomposition R library](https://github.com/jae0/aegis.speciescomposition/) to prepare the data and format it. As the purpose of this is to run a complex model in Julia, we do data manipulations outside of Julia unless there is a specific advantage to do so. 
 
