@@ -10,7 +10,9 @@ function packages_used(model_variation)
         "DataFrames", "JLD2", "CSV", "PlotThemes", "Colors", "ColorSchemes", "RData",  
         "Plots",  "StatsPlots", "MultivariateStats", 
         "ForwardDiff", "ReverseDiff", "Enzyme", "ADTypes",
-        "StaticArrays", "LazyArrays", "FillArrays", "LinearAlgebra", "MKL", "Turing"
+        "StaticArrays", "LazyArrays", "FillArrays", "LinearAlgebra", "MKL", "Turing", "Graphs",
+        "Clustering", "LibGEOS", "FlexiChains",
+        "DelaunayTriangulation"
     ]
 
     if occursin( r"logistic_discrete.*", model_variation )
@@ -239,13 +241,14 @@ end
 
 function get_kde_seeds(pts, target_u)
     # Basic KDE-based seeding using StatsBase weights based on local density
-    if isempty(pts) return [] end
-    n = length(pts)
-    dists = [sum((p1 .- p2).^2) for p1 in pts, p2 in pts]
+    u_pts = unique(pts)
+    if isempty(u_pts) return [] end
+    n = length(u_pts)
+    dists = [sum((p1 .- p2).^2) for p1 in u_pts, p2 in u_pts]
     # Inverse of mean distance as a density proxy
     weights = 1.0 ./ (mean(dists, dims=2)[:] .+ 1e-6)
     idx = sample(1:n, Weights(weights), min(target_u, n), replace=false)
-    return pts[idx]
+    return u_pts[idx]
 end
 
  
@@ -257,6 +260,10 @@ function get_cvt_centroids(pts, cfg, hull_geom)
     """
     Synopsis: Centroidal Voronoi Tessellation (CVT) with diagnostic termination tracking.
     """
+    if isempty(pts)
+        return [], "no_points_provided"
+    end
+
     u_pts = unique(pts)
     idx = StatsBase.sample(1:length(u_pts), min(cfg.target, length(u_pts)), replace=false)
     curr_centroids = [u_pts[i] for i in idx]
@@ -273,7 +280,7 @@ function get_cvt_centroids(pts, cfg, hull_geom)
             poly_coords = polys[i]
             area = get_polygon_area(poly_coords)
 
-            if length(poly_coords) > 2 && area >= cfg.min_a && area <= cfg.max_a
+            if length(poly_coords) > 2 && area >= cfg.min_area && area <= cfg.max_area
                 lg_poly = LibGEOS.Polygon([[ [p[1], p[2]] for p in poly_coords ]])
                 cent_geom = LibGEOS.centroid(lg_poly)
                 seq = LibGEOS.getCoordSeq(cent_geom)
@@ -287,7 +294,7 @@ function get_cvt_centroids(pts, cfg, hull_geom)
             end
         end
 
-        if isempty(shifts) || mean(shifts) < cfg.tol
+        if isempty(shifts) || mean(shifts) < cfg.tolerance
             termination_reason = "convergence"
             break
         end
@@ -295,14 +302,19 @@ function get_cvt_centroids(pts, cfg, hull_geom)
         assigns = [argmin([sum((p .- c).^2) for c in new_centroids]) for p in pts]
         counts = [count(==(i), assigns) for i in 1:length(new_centroids)]
 
-        if mean(counts) < cfg.min_p
+        if isempty(counts)
+            termination_reason = "no_units_formed"
+            break
+        end
+
+        if mean(counts) < cfg.min_points
             termination_reason = "min_points_violation"
             break
         end
 
         # New Density Convergence Check
         curr_mean_density = mean(counts)
-        if abs(curr_mean_density - last_mean_density) < cfg.tol && iter > 1
+        if abs(curr_mean_density - last_mean_density) < cfg.tolerance && iter > 1
             termination_reason = "density_convergence"
             break
         end
@@ -310,7 +322,7 @@ function get_cvt_centroids(pts, cfg, hull_geom)
 
         cv_val = std(counts) / (mean(counts) + 1e-9)
         # CV Convergence Check
-        if abs(cv_val - last_cv) < cfg.tol && iter > 1
+        if abs(cv_val - last_cv) < cfg.tolerance && iter > 1
             termination_reason = "cv_convergence"
             break
         end
@@ -325,10 +337,15 @@ function get_cvt_centroids(pts, cfg, hull_geom)
     return curr_centroids, termination_reason
 end
 
+
 function get_kvt_centroids(pts, cfg, hull_geom)
     """
     Synopsis: K-means Voronoi Tessellation (KVT) with diagnostic termination tracking.
     """
+    if isempty(pts)
+        return [], "no_points_provided"
+    end
+
     u_pts = unique(pts)
     idx_init = sample(1:length(u_pts), min(cfg.target, length(u_pts)), replace=false)
     c_iter = [u_pts[i] for i in idx_init]
@@ -353,9 +370,9 @@ function get_kvt_centroids(pts, cfg, hull_geom)
                 area = get_polygon_area(polys_coords[k])
             end
 
-            area_ok = (area > 0) ? (area >= cfg.min_a && area <= cfg.max_a) : true
+            area_ok = (area > 0) ? (area >= cfg.min_area && area <= cfg.max_area) : true
 
-            if !isempty(idx_cluster) && length(idx_cluster) >= cfg.min_p && ts_count >= cfg.min_ts && area_ok
+            if !isempty(idx_cluster) && length(idx_cluster) >= cfg.min_points && ts_count >= cfg.min_time_slices && area_ok
                 mean_x = mean(data[j][1][1] for j in idx_cluster)
                 mean_y = mean(data[j][1][2] for j in idx_cluster)
 
@@ -365,18 +382,23 @@ function get_kvt_centroids(pts, cfg, hull_geom)
         end
 
         counts = [count(==(k), assigns) for k in 1:length(c_iter)]
+        if isempty(counts)
+            termination_reason = "no_units_formed"
+            break
+        end
+
         cv_val = std(counts) / (mean(counts) + 1e-9)
 
         # New Density Convergence Check
         curr_mean_density = mean(counts)
-        if abs(curr_mean_density - last_mean_density) < cfg.tol && iter > 1
+        if abs(curr_mean_density - last_mean_density) < cfg.tolerance && iter > 1
             termination_reason = "density_convergence"
             break
         end
         last_mean_density = curr_mean_density
 
         # CV Convergence Check
-        if abs(cv_val - last_cv) < cfg.tol && iter > 1
+        if abs(cv_val - last_cv) < cfg.tolerance && iter > 1
             termination_reason = "cv_convergence"
             break
         end
@@ -385,7 +407,7 @@ function get_kvt_centroids(pts, cfg, hull_geom)
         
 
 
-        if mean(counts) < cfg.min_p
+        if mean(counts) < cfg.min_points
             termination_reason = "min_points_violation"
             break
         end
@@ -405,201 +427,230 @@ end
 
 function get_qvt_centroids(pts, cfg, hull_geom)
     """
-    Synopsis: Quadtree Voronoi Tessellation (QVT) with expanded formatting for readability.
+    Synopsis: Quadtree Voronoi Tessellation (QVT) with corrected recursive splitting logic.
     """
+    if isempty(pts); return [], "no_points_provided"; end
+
     data = collect(zip(pts, cfg.t_idx))
     regions = [data]
-    termination_reason = "max_units_reached"
+    # Track specific region objects that failed to split to avoid redundant attempts
+    unsplittable = Set{UInt64}() 
+    
+    effective_min_p = max(1, cfg.min_points)
 
-    while length(regions) < cfg.max_u
-        yi = argmax([length(r) for r in regions])
-        target = regions[yi]
-
-        if length(target) < 2 * cfg.min_p
-            termination_reason = "min_points_limit"
-            break
-        end
-
-        xs = [p[1][1] for p in target]
-        ys = [p[1][2] for p in target]
-        mx, my = median(xs), median(ys)
-
-        r_splits = [
-            filter(p -> p[1][1] <= mx && p[1][2] <= my, target),
-            filter(p -> p[1][1] > mx && p[1][2] <= my, target),
-            filter(p -> p[1][1] <= mx && p[1][2] > my, target),
-            filter(p -> p[1][1] > mx && p[1][2] > my, target)
-        ]
-
-        valid_splits = filter(
-            r -> length(r) >= cfg.min_p && length(unique([p[2] for p in r])) >= cfg.min_ts, 
-            r_splits
-        )
-
-        if length(valid_splits) < 2
-            termination_reason = "cannot_split_further"
-            break
-        end
-
-        # Process splitting
-        splice!(regions, yi, valid_splits)
-        
-        candidate_centroids = [
-            (mean(p[1][1] for p in r), mean(p[1][2] for p in r)) 
-            for r in regions
-        ]
-        
-        polys_coords, _ = get_voronoi_polygons_and_edges(candidate_centroids, hull_geom)
-
-        # Enforcement: Check area violations
-        area_violation = any(
-            p_coords -> !is_valid_polygon_coords(p_coords) || get_polygon_area(p_coords) < cfg.min_a, 
-            polys_coords
-        )
-
-        if area_violation
-            if length(regions) >= cfg.min_u
-                termination_reason = "min_area_violation"
-                break
-            end
-        end
+    if length(data) < 2 * effective_min_p # Initial check: if the whole dataset is too small to split
+        return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_split"
     end
 
-    final_centroids = [
-        (mean(p[1][1] for p in r), mean(p[1][2] for p in r)) 
-        for r in regions
-    ]
+    termination_reason = "max_units_reached"
+    last_mean_density = 0.0
+    last_cv = 0.0
+    cnt = 0
 
-    final_status = length(final_centroids) < cfg.min_u ? "insufficient_units_error" : termination_reason
+    while length(regions) < cfg.max_total_arealunits
+        cnt += 1
+
+        counts = length.(regions)
+        curr_mean_density = mean(counts)
+        cv_val = std(counts) / (curr_mean_density + 1e-9)
+
+        if cnt > 5 
+            # Early breaking based on statistical stabilization and target resolution
+            if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
+                if length(regions) >= cfg.target && all(c -> c <= cfg.max_points, counts)
+                    termination_reason = "converged_constraints_satisfied"
+                    break
+                elseif abs(cv_val - cfg.target_cv) < cfg.tolerance
+                    termination_reason = "converged_low_cv"
+                    break
+                elseif (count(>(cfg.max_points), counts) / length(regions)) < cfg.tolerance
+                    termination_reason = "converged_minor_violations"
+                    break
+                end
+            end
+        end
+
+        last_mean_density = curr_mean_density
+        last_cv = cv_val
+
+        # Candidacy: regions that can be split
+        viable_indices = findall(r -> length(r) >= 2 * effective_min_p && objectid(r) ∉ unsplittable, regions)
+        if isempty(viable_indices); termination_reason = "cannot_split_further"; break; end
+
+        # Split if (below min_total_arealunits) OR (below target OR has max_points violators)
+        violators = filter(i -> length(regions[i]) > cfg.max_points, viable_indices)
+        must_split = length(regions) < cfg.min_total_arealunits
+        want_split = length(regions) < cfg.target || !isempty(violators)
+        candidates = (must_split || want_split) ? (isempty(violators) ? viable_indices : violators) : []
+
+        if isempty(candidates); termination_reason = "constraints_satisfied"; break; end
+
+        # Attempt splitting the largest available candidate
+        target_idx = candidates[argmax([length(regions[i]) for i in candidates])]
+        target_region = regions[target_idx]
+
+        xs = [p[1][1] for p in target_region]; ys = [p[1][2] for p in target_region]
+        
+        # Robust splitting: handle datasets with zero variance in one or more dimensions
+        mx = length(unique(xs)) > 1 ? median(xs) : xs[1]
+        my = length(unique(ys)) > 1 ? median(ys) : ys[1]
+
+        r_splits = [
+            filter(p -> p[1][1] <= mx && p[1][2] <= my, target_region),
+            filter(p -> p[1][1] > mx && p[1][2] <= my, target_region),
+            filter(p -> p[1][1] <= mx && p[1][2] > my, target_region),
+            filter(p -> p[1][1] > mx && p[1][2] > my, target_region)
+        ]
+
+        valid_splits = filter(r -> length(r) >= effective_min_p, r_splits)
+
+        if length(valid_splits) < 2
+            # This specific region is locally unsplittable; mark it and continue with others
+            push!(unsplittable, objectid(target_region))
+            continue
+        end
+
+        deleteat!(regions, target_idx)
+        append!(regions, valid_splits)
+    end
+
+    # Post-audit: filter by final constraints (minimum time slices and point counts)
+    final_filtered_regions = filter(regions) do r
+        length(r) >= effective_min_p && length(unique([p[2] for p in r])) >= cfg.min_time_slices
+    end
+
+    if isempty(final_filtered_regions)
+        return [], "no_valid_units_after_filter"
+    end
+
+    final_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in final_filtered_regions]
+
+    polys_coords, _ = get_voronoi_polygons_and_edges(final_centroids, hull_geom)
+    area_violation = any(
+        p_coords -> !is_valid_polygon_coords(p_coords) || get_polygon_area(p_coords) < cfg.min_area,
+        polys_coords
+    )
+
+    final_status = termination_reason
+    if length(final_centroids) < cfg.min_total_arealunits
+        final_status = "insufficient_units_error"
+    elseif area_violation
+        final_status = "min_area_violation"
+    end
 
     return final_centroids, final_status
 end
 
 
 
-function get_qvt_centroids(pts, cfg, hull_geom)
-    """
-    Synopsis: Quadtree Voronoi Tessellation (QVT) with corrected recursive splitting logic.
-    """
-    data = collect(zip(pts, cfg.t_idx))
-    regions = [data]
-    termination_reason = "max_units_reached"
-
-    while length(regions) < cfg.max_u
-        # Find the region with the most points to split
-        yi = argmax([length(r) for r in regions])
-        target = regions[yi]
-
-        if length(target) < 2 * cfg.min_p
-            termination_reason = "min_points_limit"
-            break
-        end
-
-        xs = [p[1][1] for p in target]
-        ys = [p[1][2] for p in target]
-        mx, my = median(xs), median(ys)
-
-        r_splits = [
-            filter(p -> p[1][1] <= mx && p[1][2] <= my, target),
-            filter(p -> p[1][1] > mx && p[1][2] <= my, target),
-            filter(p -> p[1][1] <= mx && p[1][2] > my, target),
-            filter(p -> p[1][1] > mx && p[1][2] > my, target)
-        ]
-
-        valid_splits = filter(
-            r -> length(r) >= cfg.min_p && length(unique([p[2] for p in r])) >= cfg.min_ts,
-            r_splits
-        )
-
-        if length(valid_splits) < 2
-            # If this specific region can't be split into at least 2 valid parts, 
-            # we try to split the next largest, or stop if no others are viable.
-            # For simplicity in this logic, we mark as finished for this branch.
-            termination_reason = "cannot_split_further"
-            break
-        end
-
-        # Correct splice: Replace the parent with its valid children
-        deleteat!(regions, yi)
-        for child in valid_splits
-            push!(regions, child)
-        end
-
-        # Area check: Only halt if we have already satisfied the minimum unit count
-        candidate_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
-        polys_coords, _ = get_voronoi_polygons_and_edges(candidate_centroids, hull_geom)
-
-        area_violation = any(
-            p_coords -> !is_valid_polygon_coords(p_coords) || get_polygon_area(p_coords) < cfg.min_a,
-            polys_coords
-        )
-
-        if area_violation && length(regions) >= cfg.min_u
-            termination_reason = "min_area_violation"
-            break
-        end
-    end
-
-    final_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
-    return final_centroids, length(final_centroids) < cfg.min_u ? "insufficient_units_error" : termination_reason
-end
-
 function get_bvt_centroids(pts, cfg, hull_geom)
     """
     Synopsis: Binary Voronoi Tessellation (BVT) with corrected recursive splitting logic.
     """
+    if isempty(pts)
+        return [], "no_points_provided"
+    end
     data = collect(zip(pts, cfg.t_idx))
     regions = [data]
+    # Track specific region objects that failed to split to avoid redundant attempts
+
+    effective_min_p = max(1, cfg.min_points)
+    if length(data) < 2 * effective_min_p # Initial check: if the whole dataset is too small to split
+        return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_split"
+    end
+
+    unsplittable = Set{UInt64}() 
     termination_reason = "max_units_reached"
+    last_mean_density = 0.0
+    last_cv = 0.0
+    cnt =0
 
-    while length(regions) < cfg.max_u
-        yi = argmax([length(r) for r in regions])
-        target = regions[yi]
+    while length(regions) < cfg.max_total_arealunits
+        cnt += 1
 
-        if length(target) < 2 * cfg.min_p
-            termination_reason = "min_points_limit"
-            break
+        counts = length.(regions)
+        curr_mean_density = mean(counts)
+        cv_val = std(counts) / (curr_mean_density + 1e-9)
+
+        # Early breaking based on statistical stabilization and target resolution
+        if cnt > 5 
+            if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
+                if length(regions) >= cfg.target && all(c -> c <= cfg.max_points, counts)
+                    termination_reason = "converged_constraints_satisfied"
+                    break
+                elseif (abs(cv_val - cfg.target_cv) < cfg.tolerance)
+                    termination_reason = "converged_low_cv"
+                    break
+                elseif (count(>(cfg.max_points), counts) / length(regions)) < cfg.tolerance
+                    termination_reason = "converged_minor_violations"
+                    break
+                end
+            end
         end
+        
+        last_mean_density = curr_mean_density
+        last_cv = cv_val
 
-        xs = [p[1][1] for p in target]
-        ys = [p[1][2] for p in target]
-        dim = std(xs) > std(ys) ? 1 : 2
+        # Candidacy: regions that can be split
+        viable_indices = findall(r -> length(r) >= 2 * effective_min_p && objectid(r) ∉ unsplittable, regions)
+        if isempty(viable_indices); termination_reason = "cannot_split_further"; break; end
+
+        # Split if (below min_total_arealunits) OR (below target OR has max_points violators)
+        violators = filter(i -> length(regions[i]) > cfg.max_points, viable_indices)
+        must_split = length(regions) < cfg.min_total_arealunits
+        want_split = length(regions) < cfg.target || !isempty(violators)
+        candidates = (must_split || want_split) ? (isempty(violators) ? viable_indices : violators) : []
+
+        if isempty(candidates); termination_reason = "constraints_satisfied"; break; end
+
+        # Attempt splitting the largest available candidate
+        target_idx = candidates[argmax([length(regions[i]) for i in candidates])]
+        target = regions[target_idx]
+
+        xs = [p[1][1] for p in target]; ys = [p[1][2] for p in target]
+        var_x = length(xs) > 1 ? var(xs) : 0.0
+        var_y = length(ys) > 1 ? var(ys) : 0.0
+        dim = var_x > var_y ? 1 : 2
+
         vals = [p[1][dim] for p in target]
-        med = median(vals)
+        # Robust splitting: handle datasets with zero variance in the split dimension
+        med = length(unique(vals)) > 1 ? median(vals) : vals[1]
 
         r1 = filter(p -> p[1][dim] <= med, target)
         r2 = filter(p -> p[1][dim] > med, target)
 
-        # Validate children
-        v1 = length(r1) >= cfg.min_p && length(unique([p[2] for p in r1])) >= cfg.min_ts
-        v2 = length(r2) >= cfg.min_p && length(unique([p[2] for p in r2])) >= cfg.min_ts
+        # Validate children for point count and temporal diversity
+        v1 = length(r1) >= effective_min_p && length(unique([p[2] for p in r1])) >= cfg.min_time_slices
+        v2 = length(r2) >= effective_min_p && length(unique([p[2] for p in r2])) >= cfg.min_time_slices
 
         if !v1 || !v2
-             termination_reason = "statistical_constraints"
-             break
+             push!(unsplittable, objectid(target))
+             continue
         end
 
-        # Correct update
-        deleteat!(regions, yi)
-        push!(regions, r1)
-        push!(regions, r2)
+        # Tentative update to check global area constraints
+        tentative_regions = copy(regions)
+        deleteat!(tentative_regions, target_idx)
+        push!(tentative_regions, r1, r2)
 
-        candidate_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
+        candidate_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in tentative_regions]
         polys_coords, _ = get_voronoi_polygons_and_edges(candidate_centroids, hull_geom)
 
         area_violation = any(
-            p_coords -> !is_valid_polygon_coords(p_coords) || get_polygon_area(p_coords) < cfg.min_a,
+            p_coords -> !is_valid_polygon_coords(p_coords) || get_polygon_area(p_coords) < cfg.min_area,
             polys_coords
         )
 
-        if area_violation && length(regions) >= cfg.min_u
-            termination_reason = "min_area_violation"
-            break
+        if area_violation && length(tentative_regions) > cfg.min_total_arealunits
+             push!(unsplittable, objectid(target))
+             continue
         end
+
+        regions = tentative_regions
     end
 
     final_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
-    return final_centroids, length(final_centroids) < cfg.min_u ? "insufficient_units_error" : termination_reason
+    return final_centroids, length(final_centroids) < cfg.min_total_arealunits ? "insufficient_units_error" : termination_reason
 end
 
 
@@ -608,70 +659,100 @@ function get_avt_centroids(pts, cfg, hull_geom)
     """
     Synopsis: Agglomerative Voronoi Tessellation (AVT) with diagnostic termination tracking.
     """
+    if isempty(pts)
+        return [], "no_points_provided"
+    end
+
     u_pts = unique(pts)
-    c_init = get_kde_seeds(u_pts, cfg.target)
+    # Start with maximum allowed units to give agglomeration room to satisfy constraints
+    c_init = get_kde_seeds(u_pts, min(length(u_pts), cfg.max_total_arealunits))
     data = collect(zip(pts, cfg.t_idx))
     curr_c = [SVector{2, Float64}(c) for c in c_init]
     termination_reason = "min_units_reached"
     last_mean_density = 0.0
     last_cv = 0.0
 
-    while length(curr_c) > cfg.min_u
+    while length(curr_c) > cfg.min_total_arealunits
+        # 1. Assignment Phase: Re-map points to current centroids
         assigns = [Int[] for _ in 1:length(curr_c)]
         for i in 1:length(data)
-            d = data[i]
-            dist_idx = argmin([sum((d[1] .- c).^2) for c in curr_c])
+            # Find nearest centroid index
+            d_pt = data[i][1]
+            dist_idx = argmin([sum((d_pt .- c).^2) for c in curr_c])
             push!(assigns[dist_idx], i)
         end
 
         counts = length.(assigns)
+        if isempty(counts); termination_reason = "no_units_formed"; break; end
 
+        # 2. Geometry Audit
         polys_coords, _ = get_voronoi_polygons_and_edges([Tuple(c) for c in curr_c], hull_geom)
-
         areas = fill(0.0, length(curr_c))
         for i in 1:min(length(curr_c), length(polys_coords))
             areas[i] = get_polygon_area(polys_coords[i])
         end
 
+        # 3. Violation Detection: Focus on "Too Small" or "Too Sparse" (Data Starvation)
         violators = []
         for k in 1:length(curr_c)
             ts_count = length(unique([data[idx][2] for idx in assigns[k]]))
-            if (counts[k] < cfg.min_p || counts[k] > cfg.max_p ||
-                ts_count < cfg.min_ts ||
-                (areas[k] > 0 && (areas[k] < cfg.min_a || areas[k] > cfg.max_a)))
+            # Note: max_points and max_area are ignored for violators because merging cannot fix them.
+            if counts[k] < cfg.min_points || ts_count < cfg.min_time_slices || (areas[k] > 0 && areas[k] < cfg.min_area)
                 push!(violators, k)
             end
         end
 
+        # 4. Exit Conditions
+        curr_mean_density = mean(counts)
         cv_val = std(counts) / (mean(counts) + 1e-9)
 
-        # New Density Convergence Check
-        curr_mean_density = mean(counts)
-        if abs(curr_mean_density - last_mean_density) < cfg.tol
-            termination_reason = "density_convergence"
-            break
+        # Increase likelihood of stopping early if system statistics stabilize.
+        # Check for convergence in either density or uniformity (CV).
+        if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
+            if isempty(violators) && length(curr_c) <= cfg.target
+                 termination_reason = "converged_target_reached"
+                 break
+            elseif ( cv_val - cfg.target_cv) < cfg.tolerance
+                 termination_reason = "converged_low_cv"
+                 break
+            elseif (length(violators) / length(curr_c)) < cfg.tolerance # Looser exit: stop if violations are minor  
+                 termination_reason = "converged_minor_violations"
+                 break
+            end
         end
         last_mean_density = curr_mean_density
-
-        # CV Convergence Check
-        if abs(cv_val - last_cv) < cfg.tol && length(curr_c) < cfg.target
-            termination_reason = "cv_convergence"
-            break
-        end
         last_cv = cv_val
 
-        
+        # Logic for determining if we should continue merging
+        must_merge = length(curr_c) > cfg.max_total_arealunits
+        want_merge = length(curr_c) > cfg.target || !isempty(violators)
 
-
-        if isempty(violators)
-             termination_reason = "no_violators"
+        if !must_merge && !want_merge
+             termination_reason = "constraints_satisfied"
              break
         end
 
-        target_idx = violators[argmin(counts[violators])]
+        # Agglomeration Phase: Select candidates for merging, prioritizing violators
+        candidates_indices = isempty(violators) ? collect(1:length(curr_c)) : violators
+        
+        # Merge the unit with fewest points among candidates
+        v_counts = [counts[k] for k in candidates_indices]
+        target_idx = candidates_indices[argmin(v_counts)]
+        
+        if length(curr_c) <= cfg.min_total_arealunits ; break; end # Cannot merge further
+
         dists = [sum((curr_c[target_idx] .- curr_c[j]).^2) for j in 1:length(curr_c)]
         dists[target_idx] = Inf
-        neighbor_idx = argmin(dists)
+        
+        # Utility: find neighbor that doesn't violate max_points
+        neighbor_indices = sortperm(dists)
+        neighbor_idx = neighbor_indices[1] # Default to nearest
+        for idx in neighbor_indices
+            if counts[target_idx] + counts[idx] <= cfg.max_points
+                neighbor_idx = idx
+                break
+            end
+        end
 
         total_n = counts[target_idx] + counts[neighbor_idx]
         curr_c[neighbor_idx] = (curr_c[target_idx] .* counts[target_idx] .+ curr_c[neighbor_idx] .* counts[neighbor_idx]) ./ (total_n + 1e-9)
@@ -708,15 +789,21 @@ function assign_spatial_units(input_data, area_method=nothing; target_units=10, 
 
     else
 
-        cfg = (target=target_units, min_u=get(kwargs, :min_total_arealunits, 3), 
-            max_u=get(kwargs, :max_total_arealunits, target_units*2), 
-            min_ts=get(kwargs, :min_time_slices, 1), min_p=get(kwargs, :min_points, 1), 
-            max_p=get(kwargs, :max_points, length(input_data)), min_a=get(kwargs, :min_area, 0.0), 
-            max_a=get(kwargs, :max_area, Inf), cv_min=get(kwargs, :cv_min, 1.0), 
-            tol=get(kwargs, :tolerance, 0.1), buff=get(kwargs, :buffer_dist, 0.5), 
+        cfg = (
+            target=target_units, 
+            min_total_arealunits=get(kwargs, :min_total_arealunits, 3), 
+            max_total_arealunits=get(kwargs, :max_total_arealunits, target_units*2), 
+            min_time_slices=get(kwargs, :min_time_slices, 1),
+            min_points=get(kwargs, :min_points, 1), 
+            max_points=get(kwargs, :max_points, length(input_data)), 
+            min_area=get(kwargs, :min_area, 0.0), 
+            max_area=get(kwargs, :max_area, Inf), 
+            target_cv=get(kwargs, :target_cv, 1.0), 
+            tolerance=get(kwargs, :tolerance, 0.1), 
+            buffer_dist=get(kwargs, :buffer_dist, 0.5), 
             t_idx=get(kwargs, :t_idx, ones(Int, length(input_data))))
 
-        hull_geom = expand_hull(input_data, cfg.buff)
+        hull_geom = expand_hull(input_data, cfg.buffer_dist)
 
         c_mid, reason = if area_method == :cvt get_cvt_centroids(input_data, cfg, hull_geom)
         elseif area_method == :kvt get_kvt_centroids(input_data, cfg, hull_geom)
@@ -773,7 +860,7 @@ function assign_spatial_units_inferred(adjacency_matrix; input_polygons=nothing,
     cfg = (
         iters = iterations,
         lr    = learning_rate,
-        buff  = buffer_dist
+        buffer_dist  = buffer_dist
     )
 
     local final_centroids
@@ -813,7 +900,7 @@ function assign_spatial_units_inferred(adjacency_matrix; input_polygons=nothing,
         end
         
         inferred_pts = [(p[1], p[2]) for p in centroids_vec]
-        hull_geom = expand_hull(inferred_pts, cfg.buff)
+        hull_geom = expand_hull(inferred_pts, cfg.buffer_dist)
         hull_coords_output = get_coords_from_geom(hull_geom)
 
         # Generate tessellation based on inferred positions
@@ -956,6 +1043,14 @@ function get_voronoi_polygons_and_edges(centroids, hull_geom, tol=1e-7)
         res1 = LibGEOS.intersection(hull_geom, poly1_box)
         res2 = LibGEOS.intersection(hull_geom, poly2_box)
         return [get_coords_from_geom(res1), get_coords_from_geom(res2)], [(p1, p2)]
+    end
+
+    # Deduplicate centroids before triangulation to suppress package warnings 
+    # and ensure the output polygon array matches the input centroid array in length.
+    u_centroids = unique(centroids)
+    if length(u_centroids) < n_c
+        u_polys, u_edges = get_voronoi_polygons_and_edges(u_centroids, hull_geom, tol)
+        return [u_polys[findfirst(==(c), u_centroids)] for c in centroids], u_edges
     end
 
     # 3+ points logic
@@ -2339,19 +2434,21 @@ function parameter_inits(model::DynamicPPL.Model; n_samples=10,
     
     # 2. Use MAP to find the local mode (peak density)
     try
-        println("Trying MAP for an even better starting point...")
+        println("Trying MAP to improve starting point...")
         # Set link=false to prevent Dirac bijector crashes and fix initial_params keyword
-        map_res = maximum_a_posteriori(model, optimizer; link=false, 
-            initial_params=DynamicPPL.InitFromParams(init_guess), 
+        map_res = maximum_a_posteriori(model, optimizer; link=true, 
+            initial_params=DynamicPPL.InitFromParams(NamedTuple(init_guess)), 
             show_trace=show_trace, iterations=maxiters, maxtime=maxtime, kwargs...) 
 
-        return map_res.values
+        return DynamicPPL.InitFromParams(NamedTuple(map_res.values)) 
     catch e
         @warn "MAP refinement failed: $e. Falling back to heuristic guess."
-        return init_guess
+        return DynamicPPL.InitFromParams(NamedTuple(init_guess))
     end
 
 end
+
+
 
 
  
@@ -3269,7 +3366,7 @@ function bstm_options(; kwargs...)
     model_family = get(  M_base, :model_family, "gaussian")  # "poisson", "gaussian", "binomial", "negbin", "lognormal"
     model_space =  get(  M_base, :model_space, "bym2") # 
     model_time = get(  M_base, :model_time, "ar1")  
-    model_season = get(  M_base, :model_time, "none")
+    model_season = get(  M_base, :model_season, "none")
 
     model_st = get(  M_base, :model_st, 1)  # type 1 separable
         # Type of Space-time Interaction Effect:
@@ -3385,6 +3482,8 @@ function bstm_options(; kwargs...)
 
     # linear design matrix (beta)
     fixed = get( M_base, :fixed, ones(N_obs) )  # intercept only by default
+    fixed = fixed isa AbstractMatrix ? fixed : (fixed isa AbstractVector ? hcat(fixed) : reduce(hcat, fixed))
+ 
     N_fixed = !isnothing(fixed) ? size(fixed, 2) : 0  
 
     # random effects covariates that will be smoothed outside of the design matrix (fixed) 
@@ -3547,6 +3646,14 @@ function bstm_options(; kwargs...)
         K_nystrom_proj = precompute_nystrom_projection( s_obs, inducing_points, kernel_nystrom; jitter=1e-6)
     end
   
+
+    # Ensure s_Q is handled as a concrete Symmetric matrix for AD
+    s_Q = if s_Q isa AbstractMatrix
+        Symmetric(Matrix(s_Q) + (noise * I))
+    else
+        Symmetric(Matrix(Diagonal(fill(1.0 + noise, N_areas))))
+    end
+
 
     updates = (
         y_obs = y_obs,
@@ -5105,7 +5212,8 @@ end
 
  
 
-function model_results_comprehensive(model, result, M, areal_units; PS=nothing, alpha=0.05, time_slice=1)
+function model_results_comprehensive(model, result, M, areal_units; PS=nothing, alpha=0.05, time_slice=1, n_samples=500)
+    
 
     # Unpack 
     if result isa Turing.Variational.VIResult 
@@ -5115,7 +5223,8 @@ function model_results_comprehensive(model, result, M, areal_units; PS=nothing, 
     elseif result isa VNChain
         chain = result
     elseif result isa Turing.Optimisation.ModeResult 
-        chain = convert_optim_to_reconstruct_format(result, model, n_samples; use_hessian=true)
+        out = convert_optim_to_reconstruct_format(result, model, n_samples; use_hessian=true)
+        chain = out.chain
     end
  
     pstats = reconstruct_posteriors( chain, M, PS; alpha=alpha)
@@ -5298,72 +5407,111 @@ function convert_advi_to_reconstruct_format(msol, model::DynamicPPL.Model, n_sam
 end
 
 
-function convert_optim_to_reconstruct_format(optim_result, model, n_samples::Int=500; use_hessian=true)
+function convert_optim_to_reconstruct_format(optim_result, model, n_samples::Int=500; use_hessian=true, external_hessian=nothing)
     """
     Synopsis: Converts a point estimate (MAP/ML) from Optim/Optimisers into a distribution of samples.
     If a Hessian is available, it samples from the Multivariate Normal Laplace approximation.
     Otherwise, it creates a narrow Gaussian around the point estimate.
     """
-    
-    # 1. Extract the point estimate (the 'values' from Turing's Optim solution)
-    # Turing's optimize() returns a result where .values is a VarNamedTuple
-    point_est = optim_result.values
-    all_keys = keys(point_est)
-    
-    # 2. Extract unique base parameter names
-    unique_bases = Set{Symbol}()
-    for k in all_keys
-        m = match(r"^([^\\[]+)", string(k))
-        if m !== nothing
-            push!(unique_bases, Symbol(m.captures[1]))
+
+    point_est_constrained = optim_result.params # This is the named tuple of constrained parameters
+
+    reconstruct_samples_namedtuple = [] # Store NamedTuple for easier handling
+
+    # Determine which Hessian to use
+    H_to_use = nothing
+    if external_hessian !== nothing
+        H_to_use = external_hessian
+    elseif hasproperty(optim_result, :hessian)
+        H_to_use = optim_result.hessian
+    end
+
+    # Attempt Hessian-based sampling if enabled and a Hessian is available from either source
+    if use_hessian && H_to_use !== nothing
+        try
+            # Get the unconstrained minimizer (mu_unconstrained)
+            mu_unconstrained = optim_result.minimizer
+            H = H_to_use
+
+            # Ensure H is symmetric and compute its inverse for the covariance matrix
+            Sigma = inv(Symmetric(Matrix(H) + Diagonal(fill(1e-6, size(H, 1)))))
+            
+            dist = MvNormal(mu_unconstrained, Sigma)
+
+            # Generate n_samples of unconstrained parameters
+            unconstrained_samples_matrix = rand(dist, n_samples)
+
+            # Prepare template for conversion
+            vi_template = DynamicPPL.VarInfo(model)
+
+            for i in 1:n_samples
+                sample_unconstrained_vec = unconstrained_samples_matrix[:, i]
+                vi_current_sample = deepcopy(vi_template)
+                DynamicPPL.setlink!(vi_current_sample, sample_unconstrained_vec)
+                
+                # Convert back to constrained named tuple
+                constrained_sample_params = DynamicPPL.vi_to_params(vi_current_sample, model)
+                push!(reconstruct_samples_namedtuple, constrained_sample_params)
+            end
+
+        catch e
+            @warn "Failed to compute covariance from Hessian or convert samples, falling back to adding noise: $e"
+            use_hessian = false 
         end
     end
 
-    # 3. Create synthetic samples
-    # In a real MAP context, we'd use inv(-Hessian). For this helper, we'll 
-    # default to a very tight distribution if no Hessian logic is passed.
-    reconstruct_samples = map(1:n_samples) do _
-        sample_params = Dict{Symbol, Any}()
-        for base_sym in unique_bases
-            base_str = string(base_sym)
-            col_keys = filter(k -> string(k) == base_str || startswith(string(k), "$base_str["), all_keys)
-
-            # Map specific values and add a tiny bit of noise (1e-4) to simulate 'width'
-            # if we are not doing a formal Laplace approximation
-            if length(col_keys) == 1 && string(first(col_keys)) == base_str
-                sample_params[base_sym] = point_est[first(col_keys)] + randn() * 1e-4
-            else
-                sorted_keys = sort(collect(col_keys), by = k -> begin
-                    m_idx = match(r"\\\[(\\d+)\\\]", string(k))
-                    m_idx !== nothing ? parse(Int, m_idx.captures[1]) : 0
-                end)
-                sample_params[base_sym] = [point_est[k] + randn() * 1e-4 for k in sorted_keys]
+    # Fallback to noise-based sampling
+    if !use_hessian || isempty(reconstruct_samples_namedtuple)
+        all_keys = keys(point_est_constrained)
+        unique_bases = Set{Symbol}()
+        for k in all_keys
+            m = match(r"^([^\\[]+)", string(k))
+            if m !== nothing
+                push!(unique_bases, Symbol(m.captures[1]))
             end
         end
-        return (; sample_params...)
+
+        reconstruct_samples_namedtuple = map(1:n_samples) do _
+            sample_params_dict = Dict{Symbol, Any}() 
+            for base_sym in unique_bases
+                base_str = string(base_sym)
+                col_keys = filter(k -> string(k) == base_str || startswith(string(k), "$base_str["), all_keys)
+
+                if length(col_keys) == 1 && string(first(col_keys)) == base_str
+                    val = point_est_constrained[first(col_keys)]
+                    if val isa AbstractVector
+                        sample_params_dict[base_sym] = val .+ randn() * 1e-4
+                    else
+                        sample_params_dict[base_sym] = val + randn() * 1e-4
+                    end
+                else
+                    sorted_keys = sort(collect(col_keys), by = k -> begin
+                        m_idx = match(r"\\[(\\d+)\\]", string(k))
+                        m_idx !== nothing ? parse(Int, m_idx.captures[1]) : 0
+                    end)
+                    sample_params_dict[base_sym] = [point_est_constrained[k] + randn() * 1e-4 for k in sorted_keys]
+                end
+            end
+            return (; sample_params_dict...)
+        end
     end
 
-    # 4. Format into a FlexiChain for standard diagnostics
+    # 4. Format into a FlexiChain
+    # IMPORTANT: Store ONLY the base symbols (e.g., :s_icar as a vector).
+    # FlexiChains will automatically expand these into indexed names for summary statistics,
+    # avoiding duplicate key errors while allowing _reconstruct to find the full vector.
     formatted_dicts = map(1:n_samples) do i
-        samp = reconstruct_samples[i]
-        # We need to flatten the dictionary back to VarName format for FlexiChains
+        samp = reconstruct_samples_namedtuple[i]
         d = Dict{FlexiChains.Parameter, Any}()
         for k in keys(samp)
-            val = samp[k]
-            if val isa AbstractVector
-                for (idx, v) in enumerate(val)
-                    d[FlexiChains.Parameter(Symbol("$k[$idx]"))] = v
-                end
-            else
-                d[FlexiChains.Parameter(k)] = val
-            end
+            d[FlexiChains.Parameter(k)] = samp[k]
         end
         return d
     end
 
     chn = FlexiChains.FlexiChain{Symbol}(n_samples, 1, formatted_dicts)
 
-    return (chain=chn, reconstruct_samples=reconstruct_samples)
+    return (chain=chn, reconstruct_samples=reconstruct_samples_namedtuple)
 end
 
 struct bstm_Likelihood{F, Z, W, P, R, S, T, TR} <: ContinuousMultivariateDistribution
@@ -5753,6 +5901,16 @@ function eigenvector_to_householder(U_in::AbstractMatrix{T}, n_factors) where {T
     return v_mat
 end
 
+
+function extract_v_parameters(v_mat, ltri_indices)
+    # extract_v_parameters(v_mat, ltri_indices)
+    #
+    # Utility to extract only the free parameters (lower triangular) from the v_mat
+    # for use as initial values in Turing (matching the 'v' parameter vector).
+    return v_mat[ltri_indices]
+end
+
+;;
 
 function extract_v_parameters(v_mat, ltri_indices)
     # extract_v_parameters(v_mat, ltri_indices)

@@ -173,12 +173,15 @@ res = model_results_comprehensive(m, chn, modinputs, au_scot );
 # display(res.plots.denoised)
 
 
-# alternatively, one could use `bstm` which does something very similar : 
+# alternatively, one could use `bstm` which does almost the same thing (it has more overhead and uses better samplers): 
 Random.seed!(42)
 m = bstm(modinputs);
-chn = sample(m, MH(), 10000; num_warmup=1000, thin=20, progress=true, drop_warmup=true )  
-res = model_results_comprehensive(m, chn, modinputs, au_scot );
+os = get_optimal_sampler(m; nuts_adapt=1000) 
+inits = parameter_inits(m)
 
+chn = sample(m, os, 5000; initial_params=inits )  
+
+res = model_results_comprehensive(m, chn, modinputs, au_scot );
  
 ```
 The results look like this. Not great but that is because, it is a simple model: we are ignoring covariates and spatiotemporal interactions. The bstm version does some additional work which slows it down a bit and has a slightly harder time sampling. But overall, reasonable. 
@@ -186,38 +189,42 @@ The results look like this. Not great but that is because, it is a simple model:
 
 ```
 modelname: example_bym2_ar1_poisson
-compute_time_seconds: 1.1
+modelarch: univariate
+modelspace: bym2
+modeltime: ar1
+modelseason: none
+modelspacetime: 0
+modelcov: nothing
+compute_time_seconds: 1.0
 rmse: 7.17
 r2: 0.354
 waic: 6107.993
 mean_rhat: 1.35
 mean_ess_bulk: 20.872
-ess_per_second: 18.975
+mean_ess_tail: NaN
+ess_per_second: 20.872
  
   vs
 
-modelname: bstm
+modelname: bstm_univariate
 modelarch: univariate
 modelspace: bym2
 modeltime: ar1
-modelseason: ar1
+modelseason: none
 modelspacetime: 0
 modelcov: nothing
 compute_time_seconds: 1.0
-rmse: 7.698
-r2: 0.265
-waic: 5683.979
-mean_rhat: NaN
-mean_ess_bulk: NaN
-mean_ess_tail: NaN
-ess_per_second: NaN
-
+rmse: 2.854
+r2: 0.868
+waic: 4357.091
+mean_rhat: 1.473
+mean_ess_bulk: 169.934
+mean_ess_tail: 65.012
+ess_per_second: 169.934  <<< 8 X faster! >>>
 
 ```
 
-These results have not converged (rhat is far from 1 or NaN). This is because MH() by itself is not ideal for this type of model. 
-
-But even still, there is some reasonably description of the spatial patterns. However, there is also lots of room for improvement:
+These results have not converged (rhat is far from 1). But even still, there is some reasonably description of the spatial patterns, especially the second version. However, there is also lots of room for improvement:
 
   - the sampler: MH() is a simple one that is used here for checking timings only. 
   - The model is still basic (separable time and space) with no covariates and no interactions.
@@ -413,6 +420,11 @@ Using our basic spatiotemporal data, let us try to represent them in a discrete 
 
 # (; pts  ) = data  # this is a simple way to copy objects into the Main environment
 
+n_pts = 100  # spatial locations
+n_time = 15  # time slices ("years")
+ 
+data = generate_sim_data(n_pts, n_time; rndseed=42);
+
 # time discretization
 tu = assign_time_units(data.t_obs;  method="regular", N_time=data.N_time, N_season=data.N_season)  # t_idx, t0, t1, tn
 
@@ -422,15 +434,15 @@ Random.seed!(42) # Set a seed for reproducibility.
 ntot = size(data.pts, 1) 
 
 min_time_slices = 5
-target_density = 50 # number per areal unit 
+target_density = 5 # number per areal unit 
 target_units = Int(floor( ntot / target_density ))
 min_total_arealunits = target_units / 10
 max_total_arealunits = target_units * 10
-min_points = 3
-max_points = Int(floor(ntot / min_total_arealunits ))
+min_points = 1
+max_points = Int(floor(ntot /min_total_arealunits ))
 min_area = 0.1
 max_area = 10
-cv_min = 1
+target_cv = 0.9
 buffer_dist = 0.8
 tolerance = 0.1
 
@@ -447,12 +459,12 @@ for m in test_configs
         au = assign_spatial_units( data.pts, m;
             t_idx = tu.t_idx,
             target_units = target_units,
+            target_cv=target_cv,
             min_total_arealunits=min_total_arealunits,
             max_total_arealunits=max_total_arealunits,
             min_time_slices = min_time_slices,
             buffer_dist=buffer_dist,
             tolerance=tolerance,
-            cv_min=cv_min,
             min_points=min_points,
             max_points=max_points,
             min_area=min_area,
@@ -576,15 +588,16 @@ The following code snippet shows how to run them. One can even use the solution 
  
 # ML -- Sparse version: fast (seconds) but does not converge
 m = example_bym2_ar1_poisson(modinputs) # Turing model object
-res_opt = maximum_likelihood(m, LBFGS() )  # many optimizaers available
+res_opt = maximum_likelihood(m, LBFGS() )  # many optimizers available
 res_opt.optim_result.retcode    
 res_opt.params 
 
-res = model_results_comprehensive(m, res_opt, modinputs, au_scot);
+res = model_results_comprehensive(m, res_opt, modinputs, au_scot, n_samples=100);
 
 
 # ML -- Dense version: slow, really slow, so slow that you do not want to run this:
 m = example_gp_gaussian(modinputs) # Turing model object
+
 # res_opt = maximum_likelihood(m, LBFGS() )  # run only if you have a **lot** of time
 res_opt.optim_result.retcode    
 res_opt.params 
@@ -697,7 +710,7 @@ au = assign_spatial_units( data.pts, method;
   min_time_slices = 10,
   buffer_dist=0.8,  # as fraction of average distance between points
   tolerance=0.1,
-  cv_min=1,
+  target_cv=1,
   min_points=1,
   max_points=100,
   min_area=0.5,  # in units of pts

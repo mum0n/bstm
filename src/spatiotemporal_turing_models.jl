@@ -398,7 +398,24 @@ end
 end
 
 
-@model function bstm(M, ::Type{T}=Float64) where {T}
+
+function bstm(modinput::NamedTuple; kwargs...)  
+    modinput = bstm_options(modinput; kwargs...)
+    if modinput.model_arch == "univariate"
+        return bstm_univariate(modinput )
+    elseif modinput.model_arch == "multivariate"
+        return bstm_multivariate(modinput )
+    elseif modinput.model_arch == "multioutcome"
+        return bstm_multioutcome(modinput )
+    elseif modinput.model_arch == "multifidelity"
+        return bstm_multifidelity(modinput )
+    else
+        error("Unknown model architecture: $(modinput.model_arch)")
+    end
+end
+
+
+@model function bstm_univariate(M, ::Type{T}=Float64) where {T}
     # """
     # **Conceptual Overview: bstm - Generalized Random Markov Field Spatiotemporal Model**
 
@@ -990,13 +1007,16 @@ end
         else 
             # fixed effects
             d_beta ~ MvNormal(zeros(M.N_fixed), I)
-            eta += M.fixed * d_beta'
+            eta .+= M.fixed * d_beta
         end
     end
   
     # --- 7. Likelihood (handling missing observations) ---
     # Filter out missing observations and corresponding linear predictors/weights/trials
     # This ensures logpdf only operates on valid data points.
+
+    eta = clamp.(eta, -20.0, 20.0)
+
     good_indices = findall(!ismissing, M.y_obs)
     y_obs_filtered = M.y_obs[good_indices]
     eta_filtered = eta[good_indices]
