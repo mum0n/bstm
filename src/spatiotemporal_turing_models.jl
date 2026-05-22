@@ -21,14 +21,14 @@
     s_iid ~ MvNormal(zeros(M.N_areas), I)
 
     # Mixture formulation using standard s_eta mapping
-    s_eta_field = s_sigma .* (sqrt(s_rho) .* s_icar .+ sqrt(1 - s_rho) .* s_iid)
+    s_eta = s_sigma .* (sqrt(s_rho) .* s_icar .+ sqrt(1 - s_rho) .* s_iid)
 
     # --- 3. TEMPORAL COMPONENT (AR1) ---
     t_Q = (1.0 / (1.0 - t_rho^2 + M.noise)) .* (M.t_Q + (t_rho^2) * I)
     t_raw ~ MvNormal(zeros(M.N_time), I)
     Turing.@addlogprob! -0.5 * dot(t_raw, t_Q * t_raw)
 
-    t_eta_field = t_raw .* t_sigma
+    t_eta = t_raw .* t_sigma
 
     # --- 4. POISSON LIKELIHOOD ---
     for i in 1:M.N_obs
@@ -36,7 +36,7 @@
         t = M.t_idx[i]
 
         # Linear Predictor Synthesis
-        eta = M.log_offset[i] + s_eta_field[a] + t_eta_field[t]
+        eta = M.log_offset[i] + s_eta[a] + t_eta[t]
 
         # Weighted Likelihood Evaluation
         Turing.@addlogprob! M.weights[i] * logpdf(Poisson(exp(eta)), M.y_obs[i])
@@ -66,7 +66,7 @@ end
     Turing.@addlogprob! -0.5 * (sum(s_icar)^2 / (0.001 * M.N_areas))
 
     # Map to standard s_eta for reconstruction
-    s_eta_field = s_icar .* s_sigma
+    s_eta = s_icar .* s_sigma
 
     # --- 3. TEMPORAL FIELD (AR1) ---
     t_Q = (1.0 / (1.0 - t_rho^2 + M.noise)) .* (M.t_Q + (t_rho^2) * I)
@@ -74,7 +74,7 @@ end
     Turing.@addlogprob! -0.5 * dot(t_raw, t_Q * t_raw)
     
     # Map to standard t_eta for reconstruction
-    t_eta_field = t_raw .* t_sigma
+    t_eta = t_raw .* t_sigma
 
     # --- 4. SPACE-TIME INTERACTION ---
     st_raw ~ MvNormal(zeros(M.N_areas * M.N_time), I)
@@ -90,7 +90,7 @@ end
     # --- 6. LIKELIHOOD ---
     for i in 1:M.N_obs
         a, t = M.s_idx[i], M.t_idx[i]
-        eta = M.log_offset[i] + s_eta_field[a] + t_eta_field[t] + st_eta[a, t]
+        eta = M.log_offset[i] + s_eta[a] + t_eta[t] + st_eta[a, t]
         for k in 1:M.N_cov; eta += c_beta[k][M.cov_indices[i, k]]; end
         
         mu = exp(eta)
@@ -191,28 +191,31 @@ end
 
     # --- 1. Priors ---
     y_sigma ~ Exponential(1.0)
-    sigma_f ~ Exponential(1.0)
+    s_sigma ~ Exponential(1.0)
     ls_s ~ Gamma(2, 2)
     ls_t ~ Gamma(2, 2)
 
     # --- 2. Coordinate Extraction ---
-    xs = [p[1] for p in M.pts]
-    ys = [p[2] for p in M.pts]
     ts = Float64.(M.t_idx)
 
     # --- 3. Kernel Matrix Construction ---
     k_s = SqExponentialKernel() ∘ ScaleTransform(inv(ls_s))  # space
     k_t = SqExponentialKernel() ∘ ScaleTransform(inv(ls_t))  # time
-    coords_s = RowVecs(hcat(xs, ys))
-    K = (sigma_f^2) .* kernelmatrix(k_s, coords_s) .* kernelmatrix(k_t, ts) # full covariance (separable)
 
+    K_s = kernelmatrix(k_s, M.s_obs_unique) 
+    K_t = kernelmatrix(k_t, ts) 
+    
+    # Combined Separable Covariance (Kronecker Product for space-time interaction)
+    # K_total = sigma^2 * (K_t ⊗ K_s)
+    K = (s_sigma^2) .* kron(K_t, K_s) + M.noise * I
+ 
     # --- 4. Latent Process ---
-    # Renamed to s_eta_field for compatibility with _reconstruct
-    s_eta_field ~ MvNormal(zeros(M.N_obs), K + M.noise*I)
+    # Renamed to s_eta for compatibility with _reconstruct
+    s_eta ~ MvNormal(zeros(M.N_obs), K )
 
     # --- 5. Likelihood ---
     for i in 1:M.N_obs
-        mu = M.log_offset[i] + s_eta_field[i]
+        mu = M.log_offset[i] + s_eta[i]
         Turing.@addlogprob! logpdf(Normal(mu, y_sigma), M.y_obs[i])
     end
 end
@@ -347,24 +350,24 @@ end
     # --- 2. Latent Fields for Hurdle Part ---
     s_icar_h ~ MvNormal(zeros(M.N_areas), I); Turing.@addlogprob! -0.5 * dot(s_icar_h, M.s_Q * s_icar_h)
     s_iid_h ~ MvNormal(zeros(M.N_areas), I)
-    # Renamed to s_eta_field_h for reconstruction compatibility
-    s_eta_field_h = s_sigma_h .* (sqrt(s_rho_h) .* s_icar_h .+ sqrt(1 - s_rho_h) .* s_iid_h)
+    # Renamed to s_eta_h for reconstruction compatibility
+    s_eta_h = s_sigma_h .* (sqrt(s_rho_h) .* s_icar_h .+ sqrt(1 - s_rho_h) .* s_iid_h)
 
     t_Q_h = (1.0 / (1.0 - t_rho_h^2)) .* (M.t_Q + (t_rho_h^2) * I)
     t_f_h ~ MvNormal(zeros(M.N_time), I); Turing.@addlogprob! -0.5 * dot(t_f_h, t_Q_h * t_f_h)
-    # Renamed to t_eta_field_h for reconstruction compatibility
-    t_eta_field_h = t_f_h .* t_sigma_h
+    # Renamed to t_eta_h for reconstruction compatibility
+    t_eta_h = t_f_h .* t_sigma_h
 
     # --- 3. Latent Fields for Count Part ---
     s_icar_c ~ MvNormal(zeros(M.N_areas), I); Turing.@addlogprob! -0.5 * dot(s_icar_c, M.s_Q * s_icar_c)
     s_iid_c ~ MvNormal(zeros(M.N_areas), I)
-    # Renamed to s_eta_field_c for reconstruction compatibility
-    s_eta_field_c = s_sigma_c .* (sqrt(s_rho_c) .* s_icar_c .+ sqrt(1 - s_rho_c) .* s_iid_c)
+    # Renamed to s_eta_c for reconstruction compatibility
+    s_eta_c = s_sigma_c .* (sqrt(s_rho_c) .* s_icar_c .+ sqrt(1 - s_rho_c) .* s_iid_c)
 
     t_Q_c = (1.0 / (1.0 - t_rho_c^2)) .* (M.t_Q + (t_rho_c^2) * I)
     t_f_c ~ MvNormal(zeros(M.N_time), I); Turing.@addlogprob! -0.5 * dot(t_f_c, t_Q_c * t_f_c)
-    # Renamed to t_eta_field_c for reconstruction compatibility
-    t_eta_field_c = t_f_c .* t_sigma_c
+    # Renamed to t_eta_c for reconstruction compatibility
+    t_eta_c = t_f_c .* t_sigma_c
 
     # --- 4. Shared Categorical Smoothing ---
     c_beta = [Vector{T}(undef, M.N_cat) for _ in 1:4]
@@ -378,8 +381,8 @@ end
         a, t = M.s_idx[i], M.t_idx[i]
 
         # Linear predictors
-        eta_h = s_eta_field_h[a] + t_eta_field_h[t]
-        eta_c = M.log_offset[i] + s_eta_field_c[a] + t_eta_field_c[t]
+        eta_h = s_eta_h[a] + t_eta_h[t]
+        eta_c = M.log_offset[i] + s_eta_c[a] + t_eta_c[t]
         for k in 1:M.N_cov;
             eff_k = c_beta[k][M.cov_indices[i, k]]
             eta_h += eff_k
@@ -557,6 +560,16 @@ end
 
         # Precision representation for the low-rank component (Optional for audit)
         s_Q = inv(K_ZZ) + M.noise * I
+            
+    elseif M.model_space =="denseGP"
+       # --- Dense Gaussian Process Spatial Manifold ---
+        s_sigma ~ Exponential(1.0)
+        s_ls ~ Gamma(2, 2) 
+        k_s_gp = SqExponentialKernel() ∘ ScaleTransform(inv(s_ls))
+        K_s_gp = (s_sigma^2) .* kernelmatrix(k_s_gp, M.s_obs_unique) + M.noise * I
+        s_eta_raw ~ MvNormal(zeros(M.N_areas), Symmetric(K_s_gp))
+        s_eta = s_eta_raw
+        s_Q = inv(Symmetric(K_s_gp))
 
     elseif M.model_space == "fitcGP"
         # Sparse GP inducing points
@@ -1008,6 +1021,7 @@ end
             # fixed effects
             d_beta ~ MvNormal(zeros(M.N_fixed), I)
             eta .+= M.fixed * d_beta
+            
         end
     end
   
@@ -1164,12 +1178,12 @@ end
     end
 
     # Unified spatial field with cross-outcome linkage
-    s_eta_field = (s_eta_scaled * L_corr) .* s_sigma'
+    s_eta = (s_eta_scaled * L_corr) .* s_sigma'
 
     # --- 3. TEMPORAL, SEASONAL & COVARIATE MANIFOLDS ---
-    t_eta_field = Matrix{T}(undef, N_time, N_outcomes)
-    u_eta_field = Matrix{T}(undef, N_season, N_outcomes)
-    c_eta_field = Matrix{T}(undef, M.N_cat, N_outcomes)
+    t_eta = Matrix{T}(undef, N_time, N_outcomes)
+    u_eta = Matrix{T}(undef, N_season, N_outcomes)
+    c_eta = Matrix{T}(undef, M.N_cat, N_outcomes)
     t_Q_list = Vector{Any}(undef, N_outcomes)
 
     for k in 1:N_outcomes
@@ -1178,26 +1192,26 @@ end
             t_rho_k ~ Beta(2, 2)
             t_Q_k = (1.0 / (1.0 - t_rho_k^2 + M.noise)) .* Symmetric((1.0 + t_rho_k^2) .* I(N_time) .+ (t_rho_k) .* M.t_Q)
             t_raw_k ~ MvNormalCanon(zeros(N_time), t_Q_k + M.noise * I)
-            t_eta_field[:, k] = t_raw_k .* t_sigma[k]
+            t_eta[:, k] = t_raw_k .* t_sigma[k]
             t_Q_list[k] = t_Q_k
         elseif M.model_time == "rw2"
             t_Q_k = (1.0 / (t_sigma[k]^2 + M.noise)) .* M.t_Q
             t_raw_k ~ MvNormalCanon(zeros(N_time), t_Q_k + M.noise * I)
-            t_eta_field[:, k] = t_raw_k .* t_sigma[k]
+            t_eta[:, k] = t_raw_k .* t_sigma[k]
             t_Q_list[k] = t_Q_k
         elseif M.model_time == "gp"
             t_ls_k ~ InverseGamma(3, 3)
             t_K_k = (t_sigma[k]^2) .* kernelmatrix(SqExponentialKernel() ∘ ScaleTransform(inv(t_ls_k)), 1.0:Float64(N_time)) + M.noise * I
             t_gp_k ~ MvNormal(zeros(N_time), Symmetric(t_K_k))
-            t_eta_field[:, k] = t_gp_k
+            t_eta[:, k] = t_gp_k
             t_Q_list[k] = inv(Symmetric(t_K_k))
         elseif M.model_time == "harmonic"
             t_alpha_k ~ Normal(0, 1); 
             t_beta_k ~ Normal(0, 1)
-            t_eta_field[:, k] = (t_alpha_k .* sin.(M.t_angle) .+ t_beta_k .* cos.(M.t_angle)) .* t_sigma[k]
+            t_eta[:, k] = (t_alpha_k .* sin.(M.t_angle) .+ t_beta_k .* cos.(M.t_angle)) .* t_sigma[k]
             t_Q_list[k] = (1.0 / (t_sigma[k]^2 + M.noise)) .* M.t_Q
         elseif M.model_time == "iid"
-            t_eta_field[:, k] ~ MvNormal(zeros(N_time), t_sigma[k] * I)
+            t_eta[:, k] ~ MvNormal(zeros(N_time), t_sigma[k] * I)
             t_Q_list[k] = I(N_time)
         else
             t_Q_list[k] = I(N_time)
@@ -1208,23 +1222,23 @@ end
             u_rho_k ~ Beta(2, 2)
             u_Q_k = (1.0 / (1.0 + M.noise)) .* (M.u_Q + M.noise*I)
             u_raw_k ~ MvNormalCanon(zeros(N_season), u_Q_k)
-            u_eta_field[:, k] = u_raw_k .* u_sigma[k]
+            u_eta[:, k] = u_raw_k .* u_sigma[k]
         elseif M.model_season == "rw2"
             u_raw_k ~ MvNormalCanon(zeros(N_season), M.u_Q + M.noise*I)
-            u_eta_field[:, k] = u_raw_k .* u_sigma[k]
+            u_eta[:, k] = u_raw_k .* u_sigma[k]
         elseif M.model_season == "gp"
             u_ls_k ~ InverseGamma(3, 3)
             u_K_k = (u_sigma[k]^2) .* kernelmatrix(SqExponentialKernel() ∘ ScaleTransform(inv(u_ls_k)), 1.0:Float64(N_season)) + M.noise * I
             u_gp_k ~ MvNormal(zeros(N_season), Symmetric(u_K_k))
-            u_eta_field[:, k] = u_gp_k
+            u_eta[:, k] = u_gp_k
         elseif M.model_season == "harmonic"
             u_alpha_k ~ Normal(0, 1); 
             u_beta_k ~ Normal(0, 1)
             u_steps = 1:N_season
-            u_eta_field[:, k] = (u_alpha_k .* sin.(2π .* u_steps ./ 12.0) .+ u_beta_k .* cos.(2π .* u_steps ./ 12.0)) .* u_sigma[k]
+            u_eta[:, k] = (u_alpha_k .* sin.(2π .* u_steps ./ 12.0) .+ u_beta_k .* cos.(2π .* u_steps ./ 12.0)) .* u_sigma[k]
         elseif M.model_season == "iid"
             u_iid_k ~ MvNormal(zeros(N_season), I)
-            u_eta_field[:, k] = u_iid_k .* u_sigma[k]
+            u_eta[:, k] = u_iid_k .* u_sigma[k]
         end
 
         if M.N_cov > 0
@@ -1232,39 +1246,39 @@ end
                 c_rho_k ~ Beta(2, 2)
                 c_Q_k = (1.0 / (1.0 - c_rho_k^2 + M.noise)) .* ((1.0 + c_rho_k^2) .* I(M.N_cat) .+ (c_rho_k) .* M.c_Q)
                 c_raw_k ~ MvNormalCanon(zeros(M.N_cat), Matrix(c_Q_k))
-                c_eta_field[:, k] = c_raw_k .* c_sigma[k]
+                c_eta[:, k] = c_raw_k .* c_sigma[k]
             elseif M.model_cov == "rw2"
                 c_raw_k ~ MvNormalCanon(zeros(M.N_cat), M.c_Q + M.noise * I)
-                c_eta_field[:, k] = c_raw_k .* c_sigma[k]
+                c_eta[:, k] = c_raw_k .* c_sigma[k]
             elseif M.model_cov == "gp"
                 c_ls_k ~ InverseGamma(3, 3)
                 c_K_k = (c_sigma[k]^2) .* kernelmatrix(SqExponentialKernel() ∘ ScaleTransform(1.0 / c_ls_k), 1.0:Float64(M.N_cat)) + M.noise * I
                 c_gp_k ~ MvNormal(zeros(M.N_cat), Matrix(c_K_k))
-                c_eta_field[:, k] = c_gp_k
+                c_eta[:, k] = c_gp_k
             elseif M.model_cov == "harmonic"
                 h_c_alpha_k ~ Normal(0, 1)
                 h_c_beta_k ~ Normal(0, 1)
                 c_steps = 1:M.N_cat
-                c_eta_field[:, k] = (h_c_alpha_k .* sin.(2π .* c_steps ./ 12.0) .+ h_c_beta_k .* cos.(2π .* c_steps ./ 12.0)) .* c_sigma[k]
+                c_eta[:, k] = (h_c_alpha_k .* sin.(2π .* c_steps ./ 12.0) .+ h_c_beta_k .* cos.(2π .* c_steps ./ 12.0)) .* c_sigma[k]
             elseif M.model_cov == "rff"
                 W_rff_k ~ MvNormal(zeros(M.N_rff), I)
                 B_rff_k ~ filldist(Uniform(0, 2π), M.N_rff)
-                c_eta_field[:, k] = (cos.((1:M.N_cat) * W_rff_k' .+ B_rff_k') * ones(M.N_rff)) .* c_sigma[k]
+                c_eta[:, k] = (cos.((1:M.N_cat) * W_rff_k' .+ B_rff_k') * ones(M.N_rff)) .* c_sigma[k]
             elseif M.model_cov == "iid"
                 c_iid_k ~ MvNormal(zeros(M.N_cat), I)
-                c_eta_field[:, k] = c_iid_k .* c_sigma[k]
+                c_eta[:, k] = c_iid_k .* c_sigma[k]
             else
                 # Default to zeros if no specific model is matched
-                c_eta_field[:, k] = zeros(M.N_cat)
+                c_eta[:, k] = zeros(M.N_cat)
             end
         end
     end
 
     # --- 4. LIKELIHOOD ASSEMBLY ---
     for k in 1:N_outcomes
-        eta_k = M.log_offset[:, k] .+ s_eta_field[M.s_idx, k] .+ t_eta_field[M.t_idx, k]
-        if M.model_season != "none"; eta_k .+= u_eta_field[M.u_idx, k]; end
-        if M.N_cov > 0; eta_k .+= c_eta_field[M.cov_indices[:, 1], k]; end
+        eta_k = M.log_offset[:, k] .+ s_eta[M.s_idx, k] .+ t_eta[M.t_idx, k]
+        if M.model_season != "none"; eta_k .+= u_eta[M.u_idx, k]; end
+        if M.N_cov > 0; eta_k .+= c_eta[M.cov_indices[:, 1], k]; end
 
         if M.model_space == "svc" && M.N_fixed > 0
             # Multivariate SVC logic using shared s_eta_scaled components

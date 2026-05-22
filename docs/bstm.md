@@ -423,23 +423,23 @@ Using our basic spatiotemporal data, let us try to represent them in a discrete 
 n_pts = 100  # spatial locations
 n_time = 15  # time slices ("years")
  
-data = generate_sim_data(n_pts, n_time; rndseed=42);
+modinputs = generate_sim_data(n_pts, n_time; rndseed=42);
 
 # time discretization
-tu = assign_time_units(data.t_obs;  method="regular", N_time=data.N_time, N_season=data.N_season)  # t_idx, t0, t1, tn
+tu = assign_time_units(modinputs.t_obs;  method="regular", N_time=modinputs.N_time, N_season=modinputs.N_season)  # t_idx, t0, t1, tn
 
 # space discretizatio
 Random.seed!(42) # Set a seed for reproducibility.
 
-ntot = size(data.pts, 1) 
+ntot = size(modinputs.pts, 1) 
 
 min_time_slices = 5
 target_density = 5 # number per areal unit 
-target_units = Int(floor( ntot / target_density ))
+target_units = floor( ntot / target_density )
 min_total_arealunits = target_units / 10
 max_total_arealunits = target_units * 10
-min_points = 1
-max_points = Int(floor(ntot /min_total_arealunits ))
+min_points = 5
+max_points = floor(ntot /min_total_arealunits )
 min_area = 0.1
 max_area = 10
 target_cv = 0.9
@@ -447,7 +447,7 @@ buffer_dist = 0.8
 tolerance = 0.1
 
 
-test_configs = [ :cvt, :kvt, :qvt, :bvt, :avt ] # these are the currently available methods
+test_configs = [ :cvt, :kvt, :qvt, :bvt, :avt, :hvt ] # these are the currently available methods
 
 results = []
 plots = []
@@ -456,7 +456,7 @@ for m in test_configs
     println("Testing method: $m")
     local au
     try
-        au = assign_spatial_units( data.pts, m;
+        au = assign_spatial_units( modinputs.pts, m;
             t_idx = tu.t_idx,
             target_units = target_units,
             target_cv=target_cv,
@@ -482,7 +482,7 @@ for m in test_configs
           termination=au.termination_reason
         ))
 
-        p = plot_spatial_graph( au; title="Method: $m", domain_boundary=au.hull_coords)
+        p = plot_spatial_graph( au; plot_title="Method: $m", domain_boundary=au.hull_coords)
 
         # copy plot to an output list
         push!(plots, p)
@@ -512,10 +512,55 @@ Notice that the following is not a completely fair evaluation as there is a spac
 
 # Dense Kernel Matrix Separable Spatiotemporal GP
 
+n_pts = 100  # spatial locations
+n_time = 15  # time slices ("years")
+ 
+data = generate_sim_data(n_pts, n_time; rndseed=42);
+
+
+# time discretization
+tu = assign_time_units(data.t_obs;  method="regular", N_time=data.N_time, N_season=data.N_season)  
+
+# space discretization
+au = assign_spatial_units( data.pts, :hvt;
+    t_idx = tu.t_idx,
+    target_units = 50,
+    target_cv=1.0,
+    min_total_arealunits=5,
+    max_total_arealunits=100,
+    min_time_slices = 5,
+    buffer_dist=0.8,  # fraction of mean distance between points
+    tolerance=0.1,
+    min_points=5,
+    max_points=50,
+    min_area=0.1,
+    max_area=25);
+
+met = calculate_metrics(au)
+
+plot_spatial_graph( au; plot_title="Method: $m", domain_boundary=au.hull_coords)
+
+
+# prepare model inputs  
+modinputs = bstm_options( 
+  y_obs = data.y_obs,         # y-value, counts of people with lip cancer
+  pts = data.pts,
+  s_idx = au.assignments ,  # space index
+  t_idx = tu.t_idx,  # time index
+  log_offset = 0, # offsets, population size on log-scale
+  W = au.W,  # matrix adjacency,
+  model_family = "gaussian",
+  model_architecture ="univariate",
+  model_space = "denseGP",  # <dense gp>
+  model_time = "gp",
+  model_st = 0,  # no space-time interactions (main effects only)
+  use_zi = false
+);
+
 Random.seed!(42) # Set a seed for reproducibility
 
-m = example_gp_gaussian(modinputs) # Turing model object
-chn = sample(m, MH(), 5000; num_warmup=2000, thin=25, progress=true, drop_warmup=true )  
+m = example_gp_gaussian(modinputs); # Turing model object
+chn = sample(m, MH(), 5000; num_warmup=2000, thin=25, progress=true, drop_warmup=true )  ;
 res = model_results_comprehensive(m, chn, modinputs, au_scot);
 
 showparams( res.summarystats )
@@ -611,7 +656,7 @@ res_map.params
 res = model_results_comprehensive(m, res_map, modinputs, au_scot);
 
 
-# Variational Inference: slower .. (about 30 minutes; uses ~ 30 GB RAM)
+# Variational Inference: slower .. (about 60 minutes; uses ~ 30 GB RAM)
 samples_per_step = 10
 max_iters = 1000
 n_samples = 1000
@@ -629,7 +674,15 @@ chn_vi = vi(m, q_init, max_iters, adtype=AutoForwardDiff(), show_progress=true) 
 # Reconstruct and Visualize
 res = model_results_comprehensive(m, chn_vi, modinputs, au_scot);
 
-display(res.metrics)
+pairs(res.metrics)
+
+
+# init_optim = optim_result.minimizer
+# q = vi(m, advi; init = init_optim)
+
+# or
+
+# q = vi(m, advi; init = randn(DynamicPPL.num_params(m))) 
 
 ``` 
 
@@ -657,7 +710,7 @@ To ensure compatibility across all architectures (GMRF, Spectral, GP, etc.), the
 | `waic`                    | Widely Applicable Information Criterion.                                | `Float64`                       |
 | `family` / `architecture` | Traits identifying the model type.                                      | `ModelTrait`                    |
 
-Additional features where applicable are also presents (e.g. volatility models).
+Additional features where applicable are also presents (e.g. volatility models, multivariate or multioutcome).
 
 Linear Predictor Assembly: bstm reconstructs the linear predictor $\eta_{i,s}$ for every observation $i$ and MCMC sample $s$:
 

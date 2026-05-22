@@ -253,21 +253,32 @@ end
 
  
 
-
-
-
+ 
+function is_valid_polygon_coords(poly_coords)
+    # Filters out NaN/Inf values and checks for a minimum of 3 valid points for a polygon.
+    valid_pts = [p for p in poly_coords if !isnan(p[1]) && !isinf(p[1]) && !isnan(p[2]) && !isinf(p[2])]
+    return length(valid_pts) >= 3
+end
+ 
 function get_cvt_centroids(pts, cfg, hull_geom)
     """
     Synopsis: Centroidal Voronoi Tessellation (CVT) with diagnostic termination tracking.
     """
+
     if isempty(pts)
         return [], "no_points_provided"
+    end
+
+    if length(pts) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in pts), mean(p[2] for p in pts)) ], "not_enough_points_to_tessellate"
     end
 
     u_pts = unique(pts)
     idx = StatsBase.sample(1:length(u_pts), min(cfg.target, length(u_pts)), replace=false)
     curr_centroids = [u_pts[i] for i in idx]
     termination_reason = "max_iterations"
+
+    # Initialize convergence tracking variables
     last_mean_density = 0.0
     last_cv = 0.0
 
@@ -307,11 +318,6 @@ function get_cvt_centroids(pts, cfg, hull_geom)
             break
         end
 
-        if mean(counts) < cfg.min_points
-            termination_reason = "min_points_violation"
-            break
-        end
-
         # New Density Convergence Check
         curr_mean_density = mean(counts)
         if abs(curr_mean_density - last_mean_density) < cfg.tolerance && iter > 1
@@ -328,8 +334,10 @@ function get_cvt_centroids(pts, cfg, hull_geom)
         end
         last_cv = cv_val
 
-        
-
+        if mean(counts) < cfg.min_points
+            termination_reason = "min_points_violation"
+            break
+        end
 
         curr_centroids = new_centroids
     end
@@ -337,13 +345,17 @@ function get_cvt_centroids(pts, cfg, hull_geom)
     return curr_centroids, termination_reason
 end
 
-
 function get_kvt_centroids(pts, cfg, hull_geom)
     """
     Synopsis: K-means Voronoi Tessellation (KVT) with diagnostic termination tracking.
     """
+
     if isempty(pts)
         return [], "no_points_provided"
+    end
+
+    if length(pts) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in pts), mean(p[2] for p in pts)) ], "not_enough_points_to_tessellate"
     end
 
     u_pts = unique(pts)
@@ -352,6 +364,8 @@ function get_kvt_centroids(pts, cfg, hull_geom)
     data = collect(zip(pts, cfg.t_idx))
     damping = 0.7
     termination_reason = "max_iterations"
+
+    # Initialize convergence tracking variables
     last_mean_density = 0.0
     last_cv = 0.0
 
@@ -370,7 +384,8 @@ function get_kvt_centroids(pts, cfg, hull_geom)
                 area = get_polygon_area(polys_coords[k])
             end
 
-            area_ok = (area > 0) ? (area >= cfg.min_area && area <= cfg.max_area) : true
+            # Modified area_ok condition: require positive area
+            area_ok = (area > 0) && area >= cfg.min_area && area <= cfg.max_area
 
             if !isempty(idx_cluster) && length(idx_cluster) >= cfg.min_points && ts_count >= cfg.min_time_slices && area_ok
                 mean_x = mean(data[j][1][1] for j in idx_cluster)
@@ -387,8 +402,6 @@ function get_kvt_centroids(pts, cfg, hull_geom)
             break
         end
 
-        cv_val = std(counts) / (mean(counts) + 1e-9)
-
         # New Density Convergence Check
         curr_mean_density = mean(counts)
         if abs(curr_mean_density - last_mean_density) < cfg.tolerance && iter > 1
@@ -397,15 +410,13 @@ function get_kvt_centroids(pts, cfg, hull_geom)
         end
         last_mean_density = curr_mean_density
 
+        cv_val = std(counts) / (mean(counts) + 1e-9)
         # CV Convergence Check
         if abs(cv_val - last_cv) < cfg.tolerance && iter > 1
             termination_reason = "cv_convergence"
             break
         end
         last_cv = cv_val
-
-        
-
 
         if mean(counts) < cfg.min_points
             termination_reason = "min_points_violation"
@@ -418,33 +429,33 @@ function get_kvt_centroids(pts, cfg, hull_geom)
     return c_iter, termination_reason
 end
 
-function is_valid_polygon_coords(poly_coords)
-    # Filters out NaN/Inf values and checks for a minimum of 3 valid points for a polygon.
-    valid_pts = [p for p in poly_coords if !isnan(p[1]) && !isinf(p[1]) && !isnan(p[2]) && !isinf(p[2])]
-    return length(valid_pts) >= 3
-end
-
-
 function get_qvt_centroids(pts, cfg, hull_geom)
     """
     Synopsis: Quadtree Voronoi Tessellation (QVT) with corrected recursive splitting logic.
     """
     if isempty(pts); return [], "no_points_provided"; end
 
+    if length(pts) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in pts), mean(p[2] for p in pts)) ], "not_enough_points_to_tessellate"
+    end
+
     data = collect(zip(pts, cfg.t_idx))
     regions = [data]
     # Track specific region objects that failed to split to avoid redundant attempts
-    unsplittable = Set{UInt64}() 
-    
+    unsplittable = Set{UInt64}()
+
     effective_min_p = max(1, cfg.min_points)
 
     if length(data) < 2 * effective_min_p # Initial check: if the whole dataset is too small to split
-        return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_split"
+        return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_tessellate"
     end
 
     termination_reason = "max_units_reached"
+
+    # Initialize convergence tracking variables
     last_mean_density = 0.0
     last_cv = 0.0
+
     cnt = 0
 
     while length(regions) < cfg.max_total_arealunits
@@ -454,16 +465,16 @@ function get_qvt_centroids(pts, cfg, hull_geom)
         curr_mean_density = mean(counts)
         cv_val = std(counts) / (curr_mean_density + 1e-9)
 
-        if cnt > 5 
-            # Early breaking based on statistical stabilization and target resolution
+        # Early breaking based on statistical stabilization and target resolution
+        if cnt > 3
             if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
                 if length(regions) >= cfg.target && all(c -> c <= cfg.max_points, counts)
                     termination_reason = "converged_constraints_satisfied"
                     break
                 elseif abs(cv_val - cfg.target_cv) < cfg.tolerance
-                    termination_reason = "converged_low_cv"
+                    termination_reason = "converged_target_cv"
                     break
-                elseif (count(>(cfg.max_points), counts) / length(regions)) < cfg.tolerance
+                elseif (count(>(cfg.max_points), counts) / length(regions)) < cfg.tolerance/10
                     termination_reason = "converged_minor_violations"
                     break
                 end
@@ -474,8 +485,10 @@ function get_qvt_centroids(pts, cfg, hull_geom)
         last_cv = cv_val
 
         # Candidacy: regions that can be split
-        viable_indices = findall(r -> length(r) >= 2 * effective_min_p && objectid(r) ∉ unsplittable, regions)
-        if isempty(viable_indices); termination_reason = "cannot_split_further"; break; end
+        viable_indices = findall(r -> length(r) >= max(2, effective_min_p) && objectid(r) ∉ unsplittable, regions)
+        if cnt > 3
+            if isempty(viable_indices); termination_reason = "cannot_split_further"; break; end
+        end
 
         # Split if (below min_total_arealunits) OR (below target OR has max_points violators)
         violators = filter(i -> length(regions[i]) > cfg.max_points, viable_indices)
@@ -490,17 +503,22 @@ function get_qvt_centroids(pts, cfg, hull_geom)
         target_region = regions[target_idx]
 
         xs = [p[1][1] for p in target_region]; ys = [p[1][2] for p in target_region]
-        
-        # Robust splitting: handle datasets with zero variance in one or more dimensions
-        mx = length(unique(xs)) > 1 ? median(xs) : xs[1]
-        my = length(unique(ys)) > 1 ? median(ys) : ys[1]
 
-        r_splits = [
-            filter(p -> p[1][1] <= mx && p[1][2] <= my, target_region),
-            filter(p -> p[1][1] > mx && p[1][2] <= my, target_region),
-            filter(p -> p[1][1] <= mx && p[1][2] > my, target_region),
-            filter(p -> p[1][1] > mx && p[1][2] > my, target_region)
-        ]
+        # Robust splitting: handle datasets with zero variance in one or more dimensions
+        if length(unique(xs)) > 1 || length(unique(ys)) > 1
+            mx = length(unique(xs)) > 1 ? median(xs) : xs[1]
+            my = length(unique(ys)) > 1 ? median(ys) : ys[1]
+            r_splits = [
+                filter(p -> p[1][1] <= mx && p[1][2] <= my, target_region),
+                filter(p -> p[1][1] > mx && p[1][2] <= my, target_region),
+                filter(p -> p[1][1] <= mx && p[1][2] > my, target_region),
+                filter(p -> p[1][1] > mx && p[1][2] > my, target_region)
+            ]
+        else
+            # All points collocated spatially: split by index to progress toward target unit count
+            mid = length(target_region) ÷ 2
+            r_splits = [target_region[1:mid], target_region[mid+1:end], [], []]
+        end
 
         valid_splits = filter(r -> length(r) >= effective_min_p, r_splits)
 
@@ -541,8 +559,6 @@ function get_qvt_centroids(pts, cfg, hull_geom)
     return final_centroids, final_status
 end
 
-
-
 function get_bvt_centroids(pts, cfg, hull_geom)
     """
     Synopsis: Binary Voronoi Tessellation (BVT) with corrected recursive splitting logic.
@@ -550,16 +566,21 @@ function get_bvt_centroids(pts, cfg, hull_geom)
     if isempty(pts)
         return [], "no_points_provided"
     end
+
+    if length(pts) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in pts), mean(p[2] for p in pts)) ], "not_enough_points_to_tessellate"
+    end
+
     data = collect(zip(pts, cfg.t_idx))
     regions = [data]
     # Track specific region objects that failed to split to avoid redundant attempts
 
     effective_min_p = max(1, cfg.min_points)
     if length(data) < 2 * effective_min_p # Initial check: if the whole dataset is too small to split
-        return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_split"
+        return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_tessellate"
     end
 
-    unsplittable = Set{UInt64}() 
+    unsplittable = Set{UInt64}()
     termination_reason = "max_units_reached"
     last_mean_density = 0.0
     last_cv = 0.0
@@ -573,27 +594,29 @@ function get_bvt_centroids(pts, cfg, hull_geom)
         cv_val = std(counts) / (curr_mean_density + 1e-9)
 
         # Early breaking based on statistical stabilization and target resolution
-        if cnt > 5 
+        if cnt > 3
             if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
                 if length(regions) >= cfg.target && all(c -> c <= cfg.max_points, counts)
                     termination_reason = "converged_constraints_satisfied"
                     break
                 elseif (abs(cv_val - cfg.target_cv) < cfg.tolerance)
-                    termination_reason = "converged_low_cv"
+                    termination_reason = "converged_target_cv"
                     break
-                elseif (count(>(cfg.max_points), counts) / length(regions)) < cfg.tolerance
+                elseif (count(>(cfg.max_points), counts) / length(regions)) < cfg.tolerance/10
                     termination_reason = "converged_minor_violations"
                     break
                 end
             end
         end
-        
+
         last_mean_density = curr_mean_density
         last_cv = cv_val
 
         # Candidacy: regions that can be split
-        viable_indices = findall(r -> length(r) >= 2 * effective_min_p && objectid(r) ∉ unsplittable, regions)
-        if isempty(viable_indices); termination_reason = "cannot_split_further"; break; end
+        viable_indices = findall(r -> length(r) >= max(2, effective_min_p) && objectid(r) ∉ unsplittable, regions)
+        if cnt > 3
+            if isempty(viable_indices); termination_reason = "cannot_split_further"; break; end
+        end
 
         # Split if (below min_total_arealunits) OR (below target OR has max_points violators)
         violators = filter(i -> length(regions[i]) > cfg.max_points, viable_indices)
@@ -612,12 +635,16 @@ function get_bvt_centroids(pts, cfg, hull_geom)
         var_y = length(ys) > 1 ? var(ys) : 0.0
         dim = var_x > var_y ? 1 : 2
 
-        vals = [p[1][dim] for p in target]
-        # Robust splitting: handle datasets with zero variance in the split dimension
-        med = length(unique(vals)) > 1 ? median(vals) : vals[1]
-
-        r1 = filter(p -> p[1][dim] <= med, target)
-        r2 = filter(p -> p[1][dim] > med, target)
+        if var_x > 1e-9 || var_y > 1e-9
+            vals = [p[1][dim] for p in target]
+            med = length(unique(vals)) > 1 ? median(vals) : vals[1]
+            r1 = filter(p -> p[1][dim] <= med, target)
+            r2 = filter(p -> p[1][dim] > med, target)
+        else
+            # Handle collocated points
+            mid = length(target) ÷ 2
+            r1, r2 = target[1:mid], target[mid+1:end]
+        end
 
         # Validate children for point count and temporal diversity
         v1 = length(r1) >= effective_min_p && length(unique([p[2] for p in r1])) >= cfg.min_time_slices
@@ -649,8 +676,113 @@ function get_bvt_centroids(pts, cfg, hull_geom)
         regions = tentative_regions
     end
 
-    final_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
-    return final_centroids, length(final_centroids) < cfg.min_total_arealunits ? "insufficient_units_error" : termination_reason
+    final_centroids_candidate = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
+
+    # if length(final_centroids_candidate) < cfg.min_total_arealunits
+    #     # Aggregate all original points (from 'data') into a single centroid
+    #     all_pts_x = [p[1][1] for p in data]
+    #     all_pts_y = [p[1][2] for p in data]
+    #     return [ (mean(all_pts_x), mean(all_pts_y)) ], "insufficient_units_error"
+    # else
+        return final_centroids_candidate, termination_reason
+    # end
+end
+
+ 
+ 
+function get_hvt_centroids(pts, cfg, hull_geom; max_iter=500)
+    if isempty(pts); return [], "no_points_provided"; end
+
+    # Internal utility for point-to-centroid distance
+    dist(p1, p2) = sqrt(sum((p1 .- p2).^2))
+
+    # Standardized refinement loop (Lloyd's update)
+    function refine(pts_in, centroids, iters)
+        curr = deepcopy(centroids)
+        for _ in 1:iters
+            groups = [Int[] for _ in 1:length(curr)]
+            for (i, p) in enumerate(pts_in)
+                dists = [dist(p, c) for c in curr]
+                push!(groups[argmin(dists)], i)
+            end
+            new_c = [!isempty(idx) ? 
+                     (mean(pts_in[j][1] for j in idx), mean(pts_in[j][2] for j in idx)) : 
+                     curr[k] for (k, idx) in enumerate(groups)]
+            if all(dist(new_c[j], curr[j]) < cfg.tolerance for j in 1:length(curr))
+                return new_c
+            end
+            curr = new_c
+        end
+        return curr
+    end
+
+    # Initial Seed generation using k-means
+    # Convert pts to matrix for Clustering.jl
+    pts_matrix = hcat([p[1] for p in pts], [p[2] for p in pts])'
+    k_target = max(1, cfg.min_total_arealunits)
+    
+    # Run k-means to find initial centers
+    R = kmeans(pts_matrix, k_target)
+    curr_centroids = [(R.centers[1, i], R.centers[2, i]) for i in 1:size(R.centers, 2)]
+    
+    # Iterative HVT process with advanced stopping conditions
+    last_mean_density = 0.0
+    last_cv = 0.0
+    status = "max_iterations_reached"
+
+    for i in 1:max_iter
+        # 1. Assignment step to calculate metrics
+        assignments = [argmin([dist(p, c) for c in curr_centroids]) for p in pts]
+        counts = [count(==(k), assignments) for k in 1:length(curr_centroids)]
+        
+        curr_mean_density = mean(counts)
+        cv_val = std(counts) / (curr_mean_density + 1e-9)
+
+        # Convergence logic aligned with QVT/BVT
+        if i > 5
+            if abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance
+                if length(curr_centroids) >= cfg.target && all(c -> c <= cfg.max_points, counts)
+                    status = "converged_constraints_satisfied"
+                    break
+                elseif abs(cv_val - cfg.target_cv) < cfg.tolerance
+                    status = "converged_target_cv"
+                    break
+                elseif (count(>(cfg.max_points), counts) / length(curr_centroids)) < cfg.tolerance/10
+                    status = "converged_minor_violations"
+                    break
+                end
+            end
+        end
+
+        last_mean_density = curr_mean_density
+        last_cv = cv_val
+
+        # 2. Refinement step (Lloyd's update)
+        new_centroids = refine(pts, curr_centroids, 3)
+        
+        # Check for centroid position stabilization
+        if all(dist(new_centroids[j], curr_centroids[j]) < cfg.tolerance for j in 1:length(curr_centroids))
+             # If positions stabilized but constraints aren't met, check if we should add a unit
+             if length(curr_centroids) < cfg.max_total_arealunits && (length(curr_centroids) < cfg.target || any(counts .> cfg.max_points))
+                 # Split the largest group to improve density balance
+                 idx_to_split = argmax(counts)
+                 group_pts = pts[assignments .== idx_to_split]
+                 if length(group_pts) >= 2 * cfg.min_points
+                     new_seeds = [(mean(p[1] for p in group_pts) * 0.99, mean(p[2] for p in group_pts) * 0.99), 
+                                  (mean(p[1] for p in group_pts) * 1.01, mean(p[2] for p in group_pts) * 1.01)]
+                     deleteat!(curr_centroids, idx_to_split)
+                     append!(curr_centroids, new_seeds)
+                     continue 
+                 end
+             end
+             status = "converged_stable_positions"
+             break
+        end
+        
+        curr_centroids = new_centroids
+    end
+
+    return curr_centroids, status
 end
 
 
@@ -661,6 +793,10 @@ function get_avt_centroids(pts, cfg, hull_geom)
     """
     if isempty(pts)
         return [], "no_points_provided"
+    end
+
+    if length(pts) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in pts), mean(p[2] for p in pts)) ], "not_enough_points_to_tessellate"
     end
 
     u_pts = unique(pts)
@@ -689,6 +825,7 @@ function get_avt_centroids(pts, cfg, hull_geom)
         polys_coords, _ = get_voronoi_polygons_and_edges([Tuple(c) for c in curr_c], hull_geom)
         areas = fill(0.0, length(curr_c))
         for i in 1:min(length(curr_c), length(polys_coords))
+            if !is_valid_polygon_coords(polys_coords[i]); areas[i] = 0.0; continue; end
             areas[i] = get_polygon_area(polys_coords[i])
         end
 
@@ -696,8 +833,15 @@ function get_avt_centroids(pts, cfg, hull_geom)
         violators = []
         for k in 1:length(curr_c)
             ts_count = length(unique([data[idx][2] for idx in assigns[k]]))
-            # Note: max_points and max_area are ignored for violators because merging cannot fix them.
-            if counts[k] < cfg.min_points || ts_count < cfg.min_time_slices || (areas[k] > 0 && areas[k] < cfg.min_area)
+            
+            # min_points: If a unit has fewer points than required.
+            # min_time_slices: If a unit spans too few distinct time slices.
+            # min_area: If a unit's polygon area is below the threshold (only for areas > 0).
+            # max_area: If a unit's polygon area exceeds the threshold.
+            if counts[k] < cfg.min_points || 
+               ts_count < cfg.min_time_slices || 
+               (areas[k] > 0 && areas[k] < cfg.min_area) || 
+               (areas[k] > cfg.max_area)
                 push!(violators, k)
             end
         end
@@ -713,9 +857,9 @@ function get_avt_centroids(pts, cfg, hull_geom)
                  termination_reason = "converged_target_reached"
                  break
             elseif ( cv_val - cfg.target_cv) < cfg.tolerance
-                 termination_reason = "converged_low_cv"
+                 termination_reason = "converged_target_cv"
                  break
-            elseif (length(violators) / length(curr_c)) < cfg.tolerance # Looser exit: stop if violations are minor  
+            elseif (length(violators) / length(curr_c)) < cfg.tolerance/10 # Looser exit: stop if violations are minor
                  termination_reason = "converged_minor_violations"
                  break
             end
@@ -734,16 +878,16 @@ function get_avt_centroids(pts, cfg, hull_geom)
 
         # Agglomeration Phase: Select candidates for merging, prioritizing violators
         candidates_indices = isempty(violators) ? collect(1:length(curr_c)) : violators
-        
+
         # Merge the unit with fewest points among candidates
         v_counts = [counts[k] for k in candidates_indices]
         target_idx = candidates_indices[argmin(v_counts)]
-        
+
         if length(curr_c) <= cfg.min_total_arealunits ; break; end # Cannot merge further
 
         dists = [sum((curr_c[target_idx] .- curr_c[j]).^2) for j in 1:length(curr_c)]
         dists[target_idx] = Inf
-        
+
         # Utility: find neighbor that doesn't violate max_points
         neighbor_indices = sortperm(dists)
         neighbor_idx = neighbor_indices[1] # Default to nearest
@@ -762,7 +906,6 @@ function get_avt_centroids(pts, cfg, hull_geom)
 
     return [Tuple(c) for c in curr_c], termination_reason
 end
- 
 
 
 function assign_spatial_units(input_data, area_method=nothing; target_units=10, kwargs...)
@@ -790,12 +933,12 @@ function assign_spatial_units(input_data, area_method=nothing; target_units=10, 
     else
 
         cfg = (
-            target=target_units, 
-            min_total_arealunits=get(kwargs, :min_total_arealunits, 3), 
-            max_total_arealunits=get(kwargs, :max_total_arealunits, target_units*2), 
-            min_time_slices=get(kwargs, :min_time_slices, 1),
-            min_points=get(kwargs, :min_points, 1), 
-            max_points=get(kwargs, :max_points, length(input_data)), 
+            target=Int(target_units), 
+            min_total_arealunits=Int(get(kwargs, :min_total_arealunits, 3)), 
+            max_total_arealunits=Int(get(kwargs, :max_total_arealunits, target_units*2)), 
+            min_time_slices=Int(get(kwargs, :min_time_slices, 1)),
+            min_points=Int(get(kwargs, :min_points, 1)), 
+            max_points=Int(get(kwargs, :max_points, length(input_data))), 
             min_area=get(kwargs, :min_area, 0.0), 
             max_area=get(kwargs, :max_area, Inf), 
             target_cv=get(kwargs, :target_cv, 1.0), 
@@ -809,6 +952,7 @@ function assign_spatial_units(input_data, area_method=nothing; target_units=10, 
         elseif area_method == :kvt get_kvt_centroids(input_data, cfg, hull_geom)
         elseif area_method == :qvt get_qvt_centroids(input_data, cfg, hull_geom)
         elseif area_method == :bvt get_bvt_centroids(input_data, cfg, hull_geom)
+        elseif area_method == :hvt get_hvt_centroids(input_data, cfg, hull_geom)
         elseif area_method == :avt get_avt_centroids(input_data, cfg, hull_geom)
         else error("Unknown partitioning method: $area_method") end
 
@@ -1148,11 +1292,11 @@ function ensure_connected!(g, centroids)
 end
 
 
- 
-function plot_spatial_graph(au; title="Spatial Partitioning", domain_boundary=nothing)
-    # 1. Base Plot with Polygons
-    plt = Plots.plot(aspect_ratio=:equal, title=title, legend=false)
-    
+ function plot_spatial_graph(au; plot_title="Spatial Partitioning", domain_boundary=nothing)
+    # 1. Base Plot - Use qualified Plots.plot and Plots.title!
+    plt = Plots.plot(aspect_ratio=:equal, legend=false)
+    Plots.title!(plt, plot_title)
+
     # Plot Polygons
     for poly_coords in au.polygons
         if length(poly_coords) > 2
@@ -1165,9 +1309,9 @@ function plot_spatial_graph(au; title="Spatial Partitioning", domain_boundary=no
         end
     end
 
-    # 2. Plot Adjacency Graph Edges (Using au.centroids directly for nodes)
+    # 2. Plot Adjacency Graph Edges
     for edge in Graphs.edges(au.graph)
-        u, v = src(edge), dst(edge)
+        u, v = Graphs.src(edge), Graphs.dst(edge)
         p1, p2 = au.centroids[u], au.centroids[v]
         Plots.plot!(plt, [p1[1], p2[1]], [p1[2], p2[2]], color=:red, lw=1.5, alpha=0.6)
     end
@@ -1186,8 +1330,6 @@ function plot_spatial_graph(au; title="Spatial Partitioning", domain_boundary=no
 
     return plt
 end
-
-
 
 
 function adjacency_matrix_to_nb( W )
@@ -2015,27 +2157,39 @@ function assign_time_units(t_obs; method="regular", N_time=nothing, N_season=12)
 
         tint = Int.(floor.(t_obs))
         t0, t1 = minimum(tint), maximum(tint)
+        t_n = t1-t0
+        if !isnothing(N_time) 
+            if t_n != N_time
+                print("warning: time range and unique years do not match")
+            end
+        end
+
         t_idx = tint .- t0 .+ 1
         t_vals = collect(t0:t1) .- t0 .+ 1
         t_yr = collect(t0:t1)
         t_brks = (t_yr, t1+1)
         t_mids = t_yr .+ 0.5
-
-        if !isnothing(N_time)
-            t_disc = discretize_data( t_yr, N_cat=N_time, method="regular" )
-            t_idx = t_disc.idx
-            t_brks = t_disc.brks
-            t_mids = t_disc.mids
-        end
-
+        
         u_obs = t_obs - tint
+
         u_disc = discretize_data( u_obs, N_cat=N_season, method="regular" )  # seasonality discretized
 
         return (
-            t_obs=t_obs, t_idx = t_idx, t0=t0, t1=t1, t_vals, t_yr=t_yr, tn=length(t_vals), 
-            t_mids=t_mids, t_brks=t_brks,
-            u_obs=u_obs, u_idx=u_disc.idx, 
-            u_brks=u_disc.brks, u_mids=u_disc.mids, u_vals=collect(1:N_season) )
+            t_obs = t_obs, 
+            t_idx = t_idx, 
+            t0=t0, 
+            t1=t1, 
+            t_vals, 
+            t_yr=t_yr, 
+            t_mids=t_mids, 
+            t_brks=t_brks,
+            tn=length(t_vals), 
+            u_obs=u_obs, 
+            u_idx=u_disc.idx, 
+            u_brks=u_disc.brks,
+            u_mids=u_disc.mids, 
+            u_vals=collect(1:N_season) 
+        )
     end
 
 end
@@ -3394,7 +3548,8 @@ function bstm_options(; kwargs...)
     N_areas = size(W, 1)
 
     # actual values (directly from observations)
-    s_obs = get(M_base, :s_obs, nothing)
+    pts = get(M_base, :pts, nothing)
+    s_obs = get(M_base, :s_obs, pts)
     t_obs = get(M_base, :t_obs, nothing)
     u_obs = get(M_base, :u_obs, nothing)
 
@@ -3624,13 +3779,19 @@ function bstm_options(; kwargs...)
         # FIX: Explicitly cast to dense Matrix to prevent PDMats MethodError
         sf = isempty(eigs) ? 1.0 : exp(mean(log.(eigs)))
         s_Q = Symmetric(Matrix(Q_raw ./ sf))
-    
-    elseif model_space == "deepgp"
+
+    elseif model_space == "denseGP"
+        
+        s_obs = !isnothing(s_obs) ? s_obs : pts   
+        s_obs = RowVecs(reduce(hcat, [collect(p) for p in s_obs])')
+        s_obs_unique = unique(s_obs)
+
+    elseif model_space == "deepGP"
     
         # --- 2. Hierarchical Deep GP Construction ---
         # Initial input: [Lon, Lat, Time]
         
-        current_input = hcat([p[1] for p in M.pts], [p[2] for p in M.pts], Float64.(M.t_idx))
+        current_input = hcat([p[1] for p in  pts], [p[2] for p in  pts], Float64.( t_idx))
         m_layers = get( M_base, :m_layers, m_layers=[10, 5]) 
         n_layers = length(m_layers)
 
@@ -3640,7 +3801,7 @@ function bstm_options(; kwargs...)
         cl_res = kmeans( M.s_coords[1:N_areas, :]' , n_clusters)  # fix to regular grid
         cluster_assignments = cl_res.assignments
 
-    elseif model_spatial == "nystrom" 
+    elseif model_space == "nystrom" 
         # Nystrom low-rank approximation
         inducing_points = !isnothing(inducing_points) ? inducing_points : sobs[1:10,]
         K_nystrom_proj = precompute_nystrom_projection( s_obs, inducing_points, kernel_nystrom; jitter=1e-6)
@@ -3660,7 +3821,8 @@ function bstm_options(; kwargs...)
         
         s_idx = s_idx, 
         s_obs = s_obs, 
-        
+        s_obs_unique = s_obs_unique,
+
         t_idx = t_idx, 
         t_obs = t_obs, 
         
@@ -4973,6 +5135,11 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         elseif M.model_space == "fitcGP"
             field_noisy_sample = (M.Z_inducing_proj * vec(chain[:u_inducing].data[s])) .* s_sigma_sample
             field_structured_sample = field_noisy_sample
+                
+        elseif model_space =="denseGP"   
+            field_noisy_sample = vec(chain[:s_eta_raw].data[s]) .* s_sigma
+            field_structured_sample = field_noisy_sample
+
         elseif M.model_space == "nystrom"
             field_noisy_sample = (M.K_nystrom_proj * vec(chain[:v_latent].data[s])) .* s_sigma_sample
             field_structured_sample = field_noisy_sample
