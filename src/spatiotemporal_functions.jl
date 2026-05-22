@@ -210,8 +210,8 @@ function build_st_inputs(time_indices, space_indices, spatial_coords)
   # This assumes spatial_coords is 2xN
 
   # Extract coords for every observation
-  coords = spatial_coords[:, space_indices] # 2 x N_obs
-  times = time_indices' # 1 x N_obs
+  coords = spatial_coords[:, space_indices] # 2 x y_N
+  times = time_indices' # 1 x y_N
 
   # Stack to create 3D input: [Time; Lat; Lon]
   return ColVecs(vcat(times, coords))
@@ -219,18 +219,18 @@ end
 
  
 
-function expand_hull(pts, buffer_dist)
+function expand_hull(s_coord_tuple, buffer_dist)
     """
     Synopsis: Computes the convex hull of points and expands it by a buffer distance.
     Inputs:
-    - pts: Vector of (x, y) tuples.
+    - s_coord_tuple: Vector of (x, y) tuples.
     - buffer_dist: Distance to buffer the convex hull.
     Outputs:
     - A LibGEOS Polygon geometry representing the buffered convex hull.
     """
 
-    if isempty(pts) return LibGEOS.Polygon([[ (0.0,0.0), (0.0,0.0), (0.0,0.0), (0.0,0.0) ]]) end
-    coords_vec = [[Float64(p[1]), Float64(p[2])] for p in pts]
+    if isempty(s_coord_tuple) return LibGEOS.Polygon([[ (0.0,0.0), (0.0,0.0), (0.0,0.0), (0.0,0.0) ]]) end
+    coords_vec = [[Float64(p[1]), Float64(p[2])] for p in s_coord_tuple]
     points_geom = LibGEOS.MultiPoint(coords_vec)
     hull = LibGEOS.convexhull(points_geom)
     buffered_hull = LibGEOS.buffer(hull, buffer_dist)
@@ -239,9 +239,9 @@ end
 
 
 
-function get_kde_seeds(pts, target_u)
+function get_kde_seeds(s_coord_tuple, target_u)
     # Basic KDE-based seeding using StatsBase weights based on local density
-    u_pts = unique(pts)
+    u_pts = unique(s_coord_tuple)
     if isempty(u_pts) return [] end
     n = length(u_pts)
     dists = [sum((p1 .- p2).^2) for p1 in u_pts, p2 in u_pts]
@@ -260,20 +260,20 @@ function is_valid_polygon_coords(poly_coords)
     return length(valid_pts) >= 3
 end
  
-function get_cvt_centroids(pts, cfg, hull_geom)
+function get_cvt_centroids(s_coord_tuple, cfg, hull_geom)
     """
     Synopsis: Centroidal Voronoi Tessellation (CVT) with diagnostic termination tracking.
     """
 
-    if isempty(pts)
+    if isempty(s_coord_tuple)
         return [], "no_points_provided"
     end
 
-    if length(pts) <= cfg.min_total_arealunits
-        return [ (mean(p[1] for p in pts), mean(p[2] for p in pts)) ], "not_enough_points_to_tessellate"
+    if length(s_coord_tuple) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in s_coord_tuple), mean(p[2] for p in s_coord_tuple)) ], "not_enough_points_to_tessellate"
     end
 
-    u_pts = unique(pts)
+    u_pts = unique(s_coord_tuple)
     idx = StatsBase.sample(1:length(u_pts), min(cfg.target, length(u_pts)), replace=false)
     curr_centroids = [u_pts[i] for i in idx]
     termination_reason = "max_iterations"
@@ -310,7 +310,7 @@ function get_cvt_centroids(pts, cfg, hull_geom)
             break
         end
 
-        assigns = [argmin([sum((p .- c).^2) for c in new_centroids]) for p in pts]
+        assigns = [argmin([sum((p .- c).^2) for c in new_centroids]) for p in s_coord_tuple]
         counts = [count(==(i), assigns) for i in 1:length(new_centroids)]
 
         if isempty(counts)
@@ -345,23 +345,23 @@ function get_cvt_centroids(pts, cfg, hull_geom)
     return curr_centroids, termination_reason
 end
 
-function get_kvt_centroids(pts, cfg, hull_geom)
+function get_kvt_centroids(s_coord_tuple, cfg, hull_geom)
     """
     Synopsis: K-means Voronoi Tessellation (KVT) with diagnostic termination tracking.
     """
 
-    if isempty(pts)
+    if isempty(s_coord_tuple)
         return [], "no_points_provided"
     end
 
-    if length(pts) <= cfg.min_total_arealunits
-        return [ (mean(p[1] for p in pts), mean(p[2] for p in pts)) ], "not_enough_points_to_tessellate"
+    if length(s_coord_tuple) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in s_coord_tuple), mean(p[2] for p in s_coord_tuple)) ], "not_enough_points_to_tessellate"
     end
 
-    u_pts = unique(pts)
+    u_pts = unique(s_coord_tuple)
     idx_init = sample(1:length(u_pts), min(cfg.target, length(u_pts)), replace=false)
     c_iter = [u_pts[i] for i in idx_init]
-    data = collect(zip(pts, cfg.t_idx))
+    data = collect(zip(s_coord_tuple, cfg.t_idx))
     damping = 0.7
     termination_reason = "max_iterations"
 
@@ -429,17 +429,17 @@ function get_kvt_centroids(pts, cfg, hull_geom)
     return c_iter, termination_reason
 end
 
-function get_qvt_centroids(pts, cfg, hull_geom)
+function get_qvt_centroids(s_coord_tuple, cfg, hull_geom)
     """
     Synopsis: Quadtree Voronoi Tessellation (QVT) with corrected recursive splitting logic.
     """
-    if isempty(pts); return [], "no_points_provided"; end
+    if isempty(s_coord_tuple); return [], "no_points_provided"; end
 
-    if length(pts) <= cfg.min_total_arealunits
-        return [ (mean(p[1] for p in pts), mean(p[2] for p in pts)) ], "not_enough_points_to_tessellate"
+    if length(s_coord_tuple) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in s_coord_tuple), mean(p[2] for p in s_coord_tuple)) ], "not_enough_points_to_tessellate"
     end
 
-    data = collect(zip(pts, cfg.t_idx))
+    data = collect(zip(s_coord_tuple, cfg.t_idx))
     regions = [data]
     # Track specific region objects that failed to split to avoid redundant attempts
     unsplittable = Set{UInt64}()
@@ -559,19 +559,19 @@ function get_qvt_centroids(pts, cfg, hull_geom)
     return final_centroids, final_status
 end
 
-function get_bvt_centroids(pts, cfg, hull_geom)
+function get_bvt_centroids(s_coord_tuple, cfg, hull_geom)
     """
     Synopsis: Binary Voronoi Tessellation (BVT) with corrected recursive splitting logic.
     """
-    if isempty(pts)
+    if isempty(s_coord_tuple)
         return [], "no_points_provided"
     end
 
-    if length(pts) <= cfg.min_total_arealunits
-        return [ (mean(p[1] for p in pts), mean(p[2] for p in pts)) ], "not_enough_points_to_tessellate"
+    if length(s_coord_tuple) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in s_coord_tuple), mean(p[2] for p in s_coord_tuple)) ], "not_enough_points_to_tessellate"
     end
 
-    data = collect(zip(pts, cfg.t_idx))
+    data = collect(zip(s_coord_tuple, cfg.t_idx))
     regions = [data]
     # Track specific region objects that failed to split to avoid redundant attempts
 
@@ -690,8 +690,8 @@ end
 
  
  
-function get_hvt_centroids(pts, cfg, hull_geom; max_iter=500)
-    if isempty(pts); return [], "no_points_provided"; end
+function get_hvt_centroids(s_coord_tuple, cfg, hull_geom; max_iter=500)
+    if isempty(s_coord_tuple); return [], "no_points_provided"; end
 
     # Internal utility for point-to-centroid distance
     dist(p1, p2) = sqrt(sum((p1 .- p2).^2))
@@ -717,8 +717,8 @@ function get_hvt_centroids(pts, cfg, hull_geom; max_iter=500)
     end
 
     # Initial Seed generation using k-means
-    # Convert pts to matrix for Clustering.jl
-    pts_matrix = hcat([p[1] for p in pts], [p[2] for p in pts])'
+    # Convert s_coord_tuple to matrix for Clustering.jl
+    pts_matrix = hcat([p[1] for p in s_coord_tuple], [p[2] for p in s_coord_tuple])'
     k_target = max(1, cfg.min_total_arealunits)
     
     # Run k-means to find initial centers
@@ -732,7 +732,7 @@ function get_hvt_centroids(pts, cfg, hull_geom; max_iter=500)
 
     for i in 1:max_iter
         # 1. Assignment step to calculate metrics
-        assignments = [argmin([dist(p, c) for c in curr_centroids]) for p in pts]
+        assignments = [argmin([dist(p, c) for c in curr_centroids]) for p in s_coord_tuple]
         counts = [count(==(k), assignments) for k in 1:length(curr_centroids)]
         
         curr_mean_density = mean(counts)
@@ -758,7 +758,7 @@ function get_hvt_centroids(pts, cfg, hull_geom; max_iter=500)
         last_cv = cv_val
 
         # 2. Refinement step (Lloyd's update)
-        new_centroids = refine(pts, curr_centroids, 3)
+        new_centroids = refine(s_coord_tuple, curr_centroids, 3)
         
         # Check for centroid position stabilization
         if all(dist(new_centroids[j], curr_centroids[j]) < cfg.tolerance for j in 1:length(curr_centroids))
@@ -766,7 +766,7 @@ function get_hvt_centroids(pts, cfg, hull_geom; max_iter=500)
              if length(curr_centroids) < cfg.max_total_arealunits && (length(curr_centroids) < cfg.target || any(counts .> cfg.max_points))
                  # Split the largest group to improve density balance
                  idx_to_split = argmax(counts)
-                 group_pts = pts[assignments .== idx_to_split]
+                 group_pts = s_coord_tuple[assignments .== idx_to_split]
                  if length(group_pts) >= 2 * cfg.min_points
                      new_seeds = [(mean(p[1] for p in group_pts) * 0.99, mean(p[2] for p in group_pts) * 0.99), 
                                   (mean(p[1] for p in group_pts) * 1.01, mean(p[2] for p in group_pts) * 1.01)]
@@ -787,22 +787,22 @@ end
 
 
 
-function get_avt_centroids(pts, cfg, hull_geom)
+function get_avt_centroids(s_coord_tuple, cfg, hull_geom)
     """
     Synopsis: Agglomerative Voronoi Tessellation (AVT) with diagnostic termination tracking.
     """
-    if isempty(pts)
+    if isempty(s_coord_tuple)
         return [], "no_points_provided"
     end
 
-    if length(pts) <= cfg.min_total_arealunits
-        return [ (mean(p[1] for p in pts), mean(p[2] for p in pts)) ], "not_enough_points_to_tessellate"
+    if length(s_coord_tuple) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in s_coord_tuple), mean(p[2] for p in s_coord_tuple)) ], "not_enough_points_to_tessellate"
     end
 
-    u_pts = unique(pts)
+    u_pts = unique(s_coord_tuple)
     # Start with maximum allowed units to give agglomeration room to satisfy constraints
     c_init = get_kde_seeds(u_pts, min(length(u_pts), cfg.max_total_arealunits))
-    data = collect(zip(pts, cfg.t_idx))
+    data = collect(zip(s_coord_tuple, cfg.t_idx))
     curr_c = [SVector{2, Float64}(c) for c in c_init]
     termination_reason = "min_units_reached"
     last_mean_density = 0.0
@@ -921,9 +921,9 @@ function assign_spatial_units(input_data, area_method=nothing; target_units=10, 
             buffer_dist=get(kwargs, :buffer_dist, 0.5),
             input_polygons=get(kwargs, :input_polygons, nothing))
  
-        pts = au_inferred.centroids
+        s_coord_tuple = au_inferred.centroids
         final_centroids = au_inferred.centroids
-        new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in pts]
+        new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in s_coord_tuple]
         polys_coords = au_inferred.polygons        
         v_edges = au_inferred.adjacency_edges
         g = au_inferred.graph
@@ -982,7 +982,7 @@ function assign_spatial_units(input_data, area_method=nothing; target_units=10, 
         g = ensure_connected!(g, final_centroids)
 
         hull_coords = get_coords_from_geom(hull_geom)
-        pts = input_data
+        s_coord_tuple = input_data
 
         W = Float64.( Graphs.adjacency_matrix(g) )
  
@@ -990,7 +990,7 @@ function assign_spatial_units(input_data, area_method=nothing; target_units=10, 
 
     return (centroids=final_centroids, assignments=new_assigns, polygons=polys_coords, 
             adjacency_edges=v_edges, graph=g, hull_coords=hull_coords, 
-            termination_reason=reason, pts=pts, W=W, s_vals=collect(1:size(W,1)))
+            termination_reason=reason, s_coord_tuple=s_coord_tuple, W=W, s_vals=collect(1:size(W,1)))
 end
  
 
@@ -1317,7 +1317,7 @@ end
     end
 
     # 3. Plot Centroids and Raw Points
-    Plots.scatter!(plt, [p[1] for p in au.pts], [p[2] for p in au.pts], 
+    Plots.scatter!(plt, [p[1] for p in au.s_coord_tuple], [p[2] for p in au.s_coord_tuple], 
         markersize=1, color=:gray, alpha=0.3, label="Points")
     Plots.scatter!(plt, [c[1] for c in au.centroids], [c[2] for c in au.centroids], 
         markersize=4, color=:blue, markerstrokecolor=:white, label="Centroids")
@@ -1543,7 +1543,7 @@ function sample_gaussian_process( ; GPmethod="cholesky", returntype="default",
                 return MVN
             end
 
-            Yobs_mean_process = Kio' * ( Li' \ (Li \ Yinducing_mean_process ))  # mean process from inducing pts
+            Yobs_mean_process = Kio' * ( Li' \ (Li \ Yinducing_mean_process ))  # mean process from inducing s_coord_tuple
             Yinducing_sample  = Yinducing_mean_process + Li * rand(Normal(0, 1), size(Li,1))   # faster sampling without covariance
             Yobs_sample = Yobs_mean_process + Lo * rand(Normal(0, 1), size(Lo,2)) # error process 
 
@@ -1564,7 +1564,7 @@ function sample_gaussian_process( ; GPmethod="cholesky", returntype="default",
 
             Ko = kernelmatrix( fkernal, vec(Xobs) ) 
             Lo = cholesky(Symmetric( Ko + lambda*I)).L 
-            Yobs_mean_process = Ko' * ( Lo' \ (Lo \ Yobs ))  # mean process from inducing pts
+            Yobs_mean_process = Ko' * ( Lo' \ (Lo \ Yobs ))  # mean process from inducing s_coord_tuple
             
             Covo = Symmetric( cov(Ko) + lambda*I)  
             MVN = MvNormal( Yobs_mean_process, Covo ) # of observations
@@ -2151,15 +2151,15 @@ sekernel(v, s) = v * SqExponentialKernel() ∘ ScaleTransform(s) # ∘ ARDTransf
 
     
     
-function assign_time_units(t_obs; method="regular", N_time=nothing, N_season=12)
+function assign_time_units(t_coord; method="regular", t_N=nothing, u_N=12)
 
     if method=="regular"
 
-        tint = Int.(floor.(t_obs))
+        tint = Int.(floor.(t_coord))
         t0, t1 = minimum(tint), maximum(tint)
         t_n = t1-t0
-        if !isnothing(N_time) 
-            if t_n != N_time
+        if !isnothing(t_N) 
+            if t_n != t_N
                 print("warning: time range and unique years do not match")
             end
         end
@@ -2170,12 +2170,12 @@ function assign_time_units(t_obs; method="regular", N_time=nothing, N_season=12)
         t_brks = (t_yr, t1+1)
         t_mids = t_yr .+ 0.5
         
-        u_obs = t_obs - tint
+        u_coord = t_coord - tint
 
-        u_disc = discretize_data( u_obs, N_cat=N_season, method="regular" )  # seasonality discretized
+        u_disc = discretize_data( u_coord, N_cat=u_N, method="regular" )  # seasonality discretized
 
         return (
-            t_obs = t_obs, 
+            t_coord = t_coord, 
             t_idx = t_idx, 
             t0=t0, 
             t1=t1, 
@@ -2184,11 +2184,11 @@ function assign_time_units(t_obs; method="regular", N_time=nothing, N_season=12)
             t_mids=t_mids, 
             t_brks=t_brks,
             tn=length(t_vals), 
-            u_obs=u_obs, 
+            u_coord=u_coord, 
             u_idx=u_disc.idx, 
             u_brks=u_disc.brks,
             u_mids=u_disc.mids, 
-            u_vals=collect(1:N_season) 
+            u_vals=collect(1:u_N) 
         )
     end
 
@@ -2255,12 +2255,12 @@ end
 
 
 
-function estimate_local_kde_with_extrapolation(pts, t_idx, target_ts; grid_res=600, sd_extension_factor=0.25)
+function estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx, target_ts; grid_res=600, sd_extension_factor=0.25)
     """
     Synopsis: Estimates 2D KDE for a specific time slice with extrapolation.
     Inputs:
-    - pts: Vector of (x, y) coordinates for all time points.
-    - t_idx: Vector of time indices corresponding to pts.
+    - s_coord_tuple: Vector of (x, y) coordinates for all time points.
+    - t_idx: Vector of time indices corresponding to s_coord_tuple.
     - target_ts: The specific time slice to estimate KDE for.
     - grid_res: Resolution of the output grid (e.g., 100 for 100x100 grid).
     - sd_extension_factor: Multiplier for standard deviation to define the bandwidth.
@@ -2268,7 +2268,7 @@ function estimate_local_kde_with_extrapolation(pts, t_idx, target_ts; grid_res=6
     - Tuple (x_grid, y_grid, intensity) where intensity is a matrix.
     """
     # Filter points for the target time slice
-    filtered_pts = [p for (i, p) in enumerate(pts) if t_idx[i] == target_ts]
+    filtered_pts = [p for (i, p) in enumerate(s_coord_tuple) if t_idx[i] == target_ts]
     if isempty(filtered_pts)
         error("No points found for the target time slice $target_ts")
     end
@@ -2300,7 +2300,7 @@ end
 
 function calculate_metrics(au)
     # Restoration: Calculate assignments and counts based on the actual centroids in the au object
-    assigns = [argmin([sum((p .- c).^2) for c in au.centroids]) for p in au.pts]
+    assigns = [argmin([sum((p .- c).^2) for c in au.centroids]) for p in au.s_coord_tuple]
     counts = [count(==(i), assigns) for i in 1:length(au.centroids)]
 
     # Safety: Filter valid counts to prevent downstream NaN propagation
@@ -2335,26 +2335,26 @@ end
 
 
 
-function plot_kde_simple(pts; grid_res=600, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+function plot_kde_simple(s_coord_tuple; grid_res=600, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
     # Internal wrapper for estimate_local_kde_with_extrapolation
     # Description: Generates a simple 2D Heatmap of spatial intensity using Kernel Density Estimation.
     # Inputs:
-    #   - pts: Vector of (x, y) coordinate tuples.
+    #   - s_coord_tuple: Vector of (x, y) coordinate tuples.
     #   - grid_res: Resolution of the output grid.
     #   - sd_extension_factor: Factor to extend the bandwidth standard deviation.
     #   - title: Title for the generated plot.
     # Outputs:
     #   - A Plots.Plot object (Heatmap with scatter overlay).
     # Using a dummy t_idx of 1s since we are plotting a static slice
-    t_idx_dummy = ones(Int, length(pts))
-    x_g, y_g, intensity = estimate_local_kde_with_extrapolation(pts, t_idx_dummy, 1; grid_res=grid_res, sd_extension_factor=sd_extension_factor)
+    t_idx_dummy = ones(Int, length(s_coord_tuple))
+    x_g, y_g, intensity = estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx_dummy, 1; grid_res=grid_res, sd_extension_factor=sd_extension_factor)
 
     plt = Plots.heatmap(x_g, y_g, intensity',
                   title=title,
                   c=:viridis,
                   aspect_ratio=:equal,
                   xlabel="X", ylabel="Y")
-    Plots.scatter!(plt, [p[1] for p in pts], [p[2] for p in pts],
+    Plots.scatter!(plt, [p[1] for p in s_coord_tuple], [p[2] for p in s_coord_tuple],
                    markersize=2, markercolor=:white, markeralpha=0.5, label="Points")
     return plt
 end
@@ -2442,7 +2442,7 @@ function scottish_lip_cancer_data_spacetime(n_years::Int=10; rndseed::Int=42)
     E_expanded = repeat(E_base, n_years)
     x_expanded = repeat(x_base, n_years)
     t_idx = repeat(1:n_years, inner=nAU)
-    pts = repeat(pts_base, n_years)
+    s_coord_tuple = repeat(pts_base, n_years)
     # The s_idx is the spatial unit identifier (1 to 56)
     s_idx = repeat(1:nAU, n_years)
  
@@ -2461,7 +2461,7 @@ function scottish_lip_cancer_data_spacetime(n_years::Int=10; rndseed::Int=42)
    
     return (
         y=y_final, X=X, log_offset=log_offset, t_idx=t_idx,
-        s_idx=s_idx, n_years=n_years, pts=pts, W=W, au=au
+        s_idx=s_idx, n_years=n_years, s_coord_tuple=s_coord_tuple, W=W, au=au
     )
 end
  
@@ -2652,49 +2652,73 @@ end
 
 
 
-function generate_inducing_points(coords_st, M_inducing, seed=42)
+function generate_inducing_points(coords, M_inducing, seed=42; method="kmeans")
+
     # Helper function to generate inducing points (simple random sampling for now)
-    Random.seed!(seed)
-    N_data = size(coords_st, 1)
-    if M_inducing >= N_data
-        return coords_st # If M >= N, just use all data points (becomes exact GP)
-    end
-    indices = sample(1:N_data, M_inducing, replace=false)
-    return coords_st[indices, :]
-end
-
-
-function kmeans_inducing_points(coords_st, M_inducing; seed=42)
-    # Description:
-    #   Identifies optimal inducing point locations using K-Means clustering.
-    #   Essential for Sparse/FITC Gaussian Process models.
-    # Inputs:
-    #   coords_st: N x D matrix of spatiotemporal coordinates.
-    #   M_inducing: Target number of inducing points.
-    # Outputs:
-    #   M x D matrix of cluster centroids.
 
     Random.seed!(seed)
-    
-    # Handle cases where data is smaller than requested inducing points
-    n_data = size(coords_st, 1)
+    n_data = size(coords, 1)
+    @assert M_inducing <= n_data "M_inducing cannot be greater than total number of points."
     if M_inducing >= n_data
-        return coords_st
+        return coords # If M >= N, just use all data points (becomes exact GP)
     end
 
-    # Transpose for Clustering.jl compatibility
-    data_matrix = Matrix(coords_st')
     
-    # Execute K-Means
-    clustering_result = kmeans(data_matrix, M_inducing, maxiter=200)
-    
-    # Extract centroids and transpose back
-    inducing_points = clustering_result.centers'
-    
-    return inducing_points
+    if method=="random"
+        indices = sample(1:n_data, M_inducing, replace=false)
+        return coords[indices, :]
+    end
+
+    if method=="kmeans"
+        #   Identifies optimal inducing point locations using K-Means clustering.
+        #   Essential for Sparse/FITC Gaussian Process models.
+        # Inputs:
+        #   coords: N x D matrix of spatiotemporal coordinates.
+        #   M_inducing: Target number of inducing points.
+        # Outputs:
+        #   M x D matrix of cluster centroids.
+
+        # Transpose for Clustering.jl compatibility
+        data_matrix = Matrix(coords')
+        
+        # Execute K-Means
+        clustering_result = kmeans(data_matrix, M_inducing, maxiter=200)
+        
+        # Extract centroids and transpose back
+        inducing_points = clustering_result.centers'
+        
+        return inducing_points
+    end
+
+    if method=="furthest_point"
+
+        # Initialize with a random point
+        inducing_points_idx = [rand(1:n_data)]
+        distances = fill(Inf, n_data)
+
+        # Convert coords to the expected format for pairwise
+        coords_matrix = permutedims(coords)
+
+        for _ in 2:M_inducing
+            # Calculate distances from all points to the newest inducing point
+            last_added_idx = inducing_points_idx[end]
+            new_distances = colwise(Euclidean(), coords_matrix, coords_matrix[:, last_added_idx])
+
+            # Update minimum distances to any inducing point found so far
+            distances = min.(distances, new_distances)
+
+            # Find the point farthest from any existing inducing point
+            farthest_idx = argmax(distances)
+            push!(inducing_points_idx, farthest_idx)
+        end
+
+        return coords[inducing_points_idx, :], inducing_points_idx
+
+    end
+
 end
 
-
+ 
 
 # Squared-exponential covariance function
 sqexp_cov_fn(D, phi, noise=1e-6) = exp.(-D^2 / phi) + LinearAlgebra.I * noise
@@ -2913,19 +2937,7 @@ function generate_rff_params_for_se_kernel(D_in, M_rff, lengthscale)
     b_vector = rand(Uniform(0, 2pi), M_rff)
     return W_matrix, b_vector
 end 
-
-
-function generate_inducing_points(coords_st, M_inducing, seed=42)
-    # Helper function to generate inducing points (simple random sampling for now)
-    Random.seed!(seed)
-    N_data = size(coords_st, 1)
-    if M_inducing >= N_data
-        return coords_st # If M >= N, just use all data points (becomes exact GP)
-    end
-    indices = sample(1:N_data, M_inducing, replace=false)
-    return coords_st[indices, :]
-end
-
+ 
 
 macro save_carstm_state(file_to_save_name_sym)
   quote
@@ -2935,7 +2947,7 @@ macro save_carstm_state(file_to_save_name_sym)
       @info "Saving CARSTM state to $(filename_val)..."
       # JLD2.@save expects variable names as symbols, not their values.
       # The variables themselves should be directly passed.
-      JLD2.@save "$(filename_val)" areal_units mod chain pts y_sim y_binary t_idx weights trials cov_indices cov_indices trials_sim  weights_sim adj_matrix_numeric n_pts n_time area_method
+      JLD2.@save "$(filename_val)" areal_units mod chain s_coord_tuple y_sim y_binary t_idx weights trials cov_indices cov_indices trials_sim  weights_sim adj_matrix_numeric s_N t_N area_method
       @info "CARSTM state saved successfully."
     catch e
       @error "Error saving CARSTM state: $e"
@@ -2955,7 +2967,7 @@ macro load_carstm_state(filename_sym)
       @info "Loading CARSTM state from $(filename_val)..."
       # JLD2.@load expects variable names as symbols, not their values.
       # The variables themselves should be directly passed.
-      JLD2.@load "$(filename_val)" areal_units mod chain pts y_sim y_binary t_idx weights trials cov_indices cov_indices trials_sim  weights_sim adj_matrix_numeric n_pts n_time area_method
+      JLD2.@load "$(filename_val)" areal_units mod chain s_coord_tuple y_sim y_binary t_idx weights trials cov_indices cov_indices trials_sim  weights_sim adj_matrix_numeric s_N t_N area_method
       @info "CARSTM state loaded successfully."
       # Variables are loaded directly into the calling scope by JLD2.@load
       # No explicit return value from the macro itself, as it injects variables
@@ -3274,7 +3286,7 @@ end
  
  
 
-function plot_posterior_results(stats, M=nothing, areal_units=nothing; pts=nothing, time_slice=nothing, effect=:spatial, cov_idx=1, show_pts=false)
+function plot_posterior_results(stats, M=nothing, areal_units=nothing; s_coord_tuple=nothing, time_slice=nothing, effect=:spatial, cov_idx=1, show_pts=false)
     # Description: Comprehensive posterior visualization for CARSTM and Deep GP models.
 
     # Extract target stats and guard against nothing or scalar values
@@ -3285,7 +3297,7 @@ function plot_posterior_results(stats, M=nothing, areal_units=nothing; pts=nothi
     end
 
     if !isnothing(M)
-        pts = M.pts
+        s_coord_tuple = M.s_coord_tuple
     end
  
     # 1. Handle Categorical/Class Bar Plots
@@ -3380,7 +3392,7 @@ function plot_posterior_results(stats, M=nothing, areal_units=nothing; pts=nothi
         end
 
         if show_pts
-            StatsPlots.scatter!(plt, [p[1] for p in pts], [p[2] for p in pts],
+            StatsPlots.scatter!(plt, [p[1] for p in s_coord_tuple], [p[2] for p in s_coord_tuple],
                 markersize=1, markercolor=:gray, alpha=0.2, label="Observations")
         end
 
@@ -3532,38 +3544,46 @@ function bstm_options(; kwargs...)
      
 
     y_obs = get(M_base, :y_obs, nothing)
-    N_obs = get(M_base, :N_obs, size(y_obs, 1) )  # y_obs can be a matrix
+    y_N = get(M_base, :y_N, size(y_obs, 1) )  # y_obs can be a matrix
     
     y_has_data = findall(!ismissing, y_obs)
-
 
     s_idx = get(M_base, :s_idx, 1)  # force to carry to make dimensional expectations simpler ..
     t_idx = get(M_base, :t_idx, 1)  # force to carry to make dimensional expectations simpler ..
     u_idx = get(M_base, :u_idx, 1)  # force to carry to make dimensional expectations simpler ..
+    st_idx = (t_idx .- 1) .* t_N .+ s_idx
 
     W = get(M_base, :W, I(1))
     
-    N_time = get(M_base, :N_time, (t_idx === nothing ? 1 : maximum(t_idx)))
-    N_season = get(M_base, :N_season, 12)
-    N_areas = size(W, 1)
+    s_N = size(W, 1)
+    t_N = get(M_base, :t_N, (t_idx === nothing ? 1 : maximum(t_idx)))
+    u_N = get(M_base, :u_N, 12)
 
     # actual values (directly from observations)
-    pts = get(M_base, :pts, nothing)
-    s_obs = get(M_base, :s_obs, pts)
-    t_obs = get(M_base, :t_obs, nothing)
-    u_obs = get(M_base, :u_obs, nothing)
+    s_coord_tuple = get(M_base, :s_coord_tuple, nothing)
+    s_coord = get(M_base, :s_coord, s_coord_tuple)
+    if isnothing(s_coord)
+        if !isnothing(s_coord_tuple)
+            s_coord = RowVecs(reduce(hcat, [collect(p) for p in s_coord])')
+        end
+    end 
+    
+    t_coord = get(M_base, :t_coord, nothing)
+    u_coord = get(M_base, :u_coord, nothing)
+
+    s_obs_unique = unique(s_coord)
+    t_obs_unique = unique(t_coord)
+    u_obs_unique = unique(u_coord)
 
     period = get(M_base, :period, 12)
-    weights = get(M_base, :weights, ones(Float64, N_obs))
-    log_offset = get(M_base, :log_offset, zeros(Float64, N_obs))
-    trials = get(M_base, :trials, ones(Int, N_obs))
-
+    weights = get(M_base, :weights, ones(Float64, y_N))
+    log_offset = get(M_base, :log_offset, zeros(Float64, y_N))
+    trials = get(M_base, :trials, ones(Int, y_N))
     
     rnd_seed = get(M_base, :rnd_seed, 42)
     Random.seed!(rnd_seed)
     
     noise = get(M_base, :noise, 1e-6)   # jitter for Pos Def
-    
 
     # Fixed weights for multi-fidelity/A-series models (A13-A25)
     # --- 2. Initialize Fixed Projection Matrices (DFRFF) ---
@@ -3591,12 +3611,20 @@ function bstm_options(; kwargs...)
     W_fixed = randn(D_in, M_rff)
     b_fixed = rand(M_rff) .* 2 * pi
  
-    y_coords_st =  get(M_base, :y_coords_st, nothing )
+    st_coord =  get(M_base, :st_coord, nothing )  # space and time
+    if isnothing(st_coord)
+        st_coord = !isnothing(s_coord) && !isnothing(t_coord) ? hcat( (s_coord, t_coord)... ) : hcat( (s_idx, t_idx)... )
+        st_coord_normalized = copy(st_coord)
+        st_coord_normalized[:, 3] = st_coord_normalized[:,3] ./ t_N  # normalize
+    end 
+
     use_sv = get(  M_base, :use_sv, false)  # stochastic volatitity
-    
+    stochastic_volatility_factor = nothing
     if use_sv
-        y_coords_st = !isnothing(y_coords_st) ? y_coords_st :  hcat(s_obs, t_obs ./ N_time) 
+        vol_proj = (st_coord_normalized * W_f_sigmaixed) .+ b_f_sigmaixed'
+        stochastic_volatility_factor = sqrt( 2.0 / M.M_rff_sigma) .* cos.(vol_proj)
     end
+
     M_rff_sigma = get(M_base, :M_rff_sigma, 20)
     W_sigma_fixed = randn(3, M_rff_sigma); 
  
@@ -3616,9 +3644,8 @@ function bstm_options(; kwargs...)
 
     # 5. Spatial Geometric Indices
     # Coordinates and Inducing points for FITC Sparse GPs
-    st_obs = !isnothing(s_obs) && !isnothing(t_obs) ? hcat( (s_obs, t_obs)... ) : nothing
     
-    Z_inducing = !isnothing(st_obs) ? kmeans_inducing_points(st_obs, M_inducing_count) : nothing
+    Z_inducing = !isnothing(st_coord) ? generate_inducing_points(st_coord, M_inducing_count) : nothing
      
     # Subsets for varied fidelity resolutions
     
@@ -3631,22 +3658,19 @@ function bstm_options(; kwargs...)
     z_coords_s = get(M_base, :z_coords_s, nothing)  
     w_coords_st = get(M_base, :w_coords_st, nothing)  # consider scaling time to range from 0 to 1
  
-    # Interaction & Covariate Mapping Vectors
-    # interaction_idx: Maps (area, time) to a unique linear index for Type IV interactions
-    # interaction_idx = (t_idx .- 1) .* N_areas .+ s_idx
 
     # linear design matrix (beta)
-    fixed = get( M_base, :fixed, ones(N_obs) )  # intercept only by default
+    fixed = get( M_base, :fixed, ones(y_N) )  # intercept only by default
     fixed = fixed isa AbstractMatrix ? fixed : (fixed isa AbstractVector ? hcat(fixed) : reduce(hcat, fixed))
  
-    N_fixed = !isnothing(fixed) ? size(fixed, 2) : 0  
+    fixed_N = !isnothing(fixed) ? size(fixed, 2) : 0  
 
     # random effects covariates that will be smoothed outside of the design matrix (fixed) 
     # e.g. discretizes covariates for RW2 smoothing models, etc
     N_cat = get(M_base, :N_cat, 9)
     
     cov = get(M_base, :cov, nothing )
-    N_cov = !isnothing(cov) ? size(cov,2) : 0
+    cov_N = !isnothing(cov) ? size(cov,2) : 0
 
     model_cov = get(M_base, :model_cov, nothing )
     cov_indices = get(M_base, :cov_indices, nothing )
@@ -3660,10 +3684,10 @@ function bstm_options(; kwargs...)
     if !isnothing(model_cov) 
 
         if isnothing(cov_indices)    
-            cov_indices = zeros(Int, N_obs, N_cov)
-            if N_cov > 0
+            cov_indices = zeros(Int, y_N, cov_N)
+            if cov_N > 0
                 probs = collect(range(0.0, stop=1.0, length=N_cat + 1))
-                for i in 1:N_cov
+                for i in 1:cov_N
                     cov_indices[:,i] = map(x -> clamp(searchsortedfirst(quantile(cov[:,i], probs), x) - 1, 1, N_cat), cov[:,i])
                 end
             end
@@ -3694,24 +3718,24 @@ function bstm_options(; kwargs...)
  
     # 3. Seasonal Precision (u_Q)
     u_Q = nothing
-    if !isnothing(N_season) 
+    if !isnothing(u_N) 
         if model_season == "ar1"
-            u_Q = build_bstm_ar1_template(N_season).matrix
+            u_Q = build_bstm_ar1_template(u_N).matrix
         elseif model_season == "rw2"
-            u_Q = build_bstm_rw2_template(N_season).matrix
+            u_Q = build_bstm_rw2_template(u_N).matrix
             
         elseif model_season =="harmonic"
             # Simple seasonal cycle: alpha*sin(2pi*t/P) + beta*cos(2pi*t/P)
             # t_eff = (h_α .* sin.(2π .* t_steps ./ period) .+ h_β .* cos.(2π .* t_steps ./ period)) .* t_sigma
             u_period = 12.0 # Default period (annual)
-            u_steps = 1:N_season
+            u_steps = 1:u_N
             u_angle = 2π * t_steps / t_period
-            u_Q = build_bstm_harmonic_template(N_season).matrix
+            u_Q = build_bstm_harmonic_template(u_N).matrix
 
         elseif model_season =="rw2"
-            u_Q = build_bstm_rw2_template(N_season).matrix
+            u_Q = build_bstm_rw2_template(u_N).matrix
         else 
-            u_Q = I(N_season)
+            u_Q = I(u_N)
         end
     end
 
@@ -3721,20 +3745,20 @@ function bstm_options(; kwargs...)
 
     # 2. Temporal Precision (t_Q)
     t_Q = nothing
-    if !isnothing(N_time)
+    if !isnothing(t_N)
         if model_time == "ar1"
-            t_Q = build_bstm_ar1_template(N_time).matrix
+            t_Q = build_bstm_ar1_template(t_N).matrix
         elseif model_time == "rw2"
-            t_Q = build_bstm_rw2_template(N_time).matrix
+            t_Q = build_bstm_rw2_template(t_N).matrix
         
         elseif model_time == "harmonic"
             # Simple annual cycle: alpha*sin(2pi*t/P) + beta*cos(2pi*t/P)
             # t_eff = (h_α .* sin.(2π .* t_steps ./ period) .+ h_β .* cos.(2π .* t_steps ./ period)) .* t_sigma
             t_period = 1.0 # Default period (annual)
-            t_steps = 1:N_time
+            t_steps = 1:t_N
             t_angle = 2π * t_steps / t_period
             
-            t_Q = build_bstm_harmonic_template(N_time).matrix
+            t_Q = build_bstm_harmonic_template(t_N).matrix
 
         elseif model_time == "rff"
             # Fixed Projections & RFF Bases
@@ -3742,16 +3766,16 @@ function bstm_options(; kwargs...)
             # Trend & Seasonality Static Projection Vectors
             m_trend = get(M_base, :m_trend, 10) 
             m_seas = get(M_base, :m_seas, 5)
-            t_vec = get(M_base, :t_vec,  collect(1:N_time) ./ N_time )
+            t_vec = get(M_base, :t_vec,  collect(1:t_N) ./ t_N )
             Om_tr = randn(Float64, m_trend) ./ 0.5; 
             Ph_tr = rand(Float64, m_trend) .* 2pi
             t_Z_trend = sqrt(2/m_trend) .* cos.(t_vec * Om_tr' .+ Ph_tr')
-            t_Z_seas = zeros(Float64, N_time, 2 * m_seas)
+            t_Z_seas = zeros(Float64, t_N, 2 * m_seas)
     #        for j in 1:m_seas
     #            om_j = 2*pi * j; t_Z_seas[:, 2j-1] = cos.(om_j .* t_vec); t_Z_seas[:, 2j] = sin.(om_j .* t_vec)
     #        end
         else 
-            t_Q = I(N_time)
+            t_Q = I(t_N)
         end
     end
 
@@ -3761,13 +3785,13 @@ function bstm_options(; kwargs...)
     n_layers = nothing
     m_layers = nothing
 
-    M_inducing_count = !isnothing(st_obs) ? get(M_base, :M_inducing_count, 15) : nothing
+    M_inducing_count = !isnothing(st_coord) ? get(M_base, :M_inducing_count, 15) : nothing
     K_nystrom_proj = nothing
     kernel_nystrom =  get( M_base, :kernel_nystrom,  Matern32Kernel() ∘ ScaleTransform(1.0) )
     inducing_points = get( M_base, :inducing_points, nothing)
 
 
-    s_Q = I(N_areas)
+    s_Q = I(s_N)
  
     if model_space in [ "bym2", "besag", "leroux", "svc", "local" ] 
         # Standardized Precision Scaling (BYM2 & RW2)
@@ -3782,29 +3806,27 @@ function bstm_options(; kwargs...)
 
     elseif model_space == "denseGP"
         
-        s_obs = !isnothing(s_obs) ? s_obs : pts   
-        s_obs = RowVecs(reduce(hcat, [collect(p) for p in s_obs])')
-        s_obs_unique = unique(s_obs)
+        #
 
     elseif model_space == "deepGP"
     
         # --- 2. Hierarchical Deep GP Construction ---
         # Initial input: [Lon, Lat, Time]
         
-        current_input = hcat([p[1] for p in  pts], [p[2] for p in  pts], Float64.( t_idx))
+        current_input = hcat([p[1] for p in  s_coord_tuple], [p[2] for p in  s_coord_tuple], Float64.( t_idx))
         m_layers = get( M_base, :m_layers, m_layers=[10, 5]) 
         n_layers = length(m_layers)
 
     elseif model_space == "local"
         
         n_clusters = get(M_base, :n_clusters, 4)
-        cl_res = kmeans( M.s_coords[1:N_areas, :]' , n_clusters)  # fix to regular grid
+        cl_res = kmeans( M.s_obs_unique' , n_clusters)  # fix to regular grid
         cluster_assignments = cl_res.assignments
 
     elseif model_space == "nystrom" 
         # Nystrom low-rank approximation
         inducing_points = !isnothing(inducing_points) ? inducing_points : sobs[1:10,]
-        K_nystrom_proj = precompute_nystrom_projection( s_obs, inducing_points, kernel_nystrom; jitter=1e-6)
+        K_nystrom_proj = precompute_nystrom_projection( s_coord, inducing_points, kernel_nystrom; jitter=1e-6)
     end
   
 
@@ -3812,7 +3834,7 @@ function bstm_options(; kwargs...)
     s_Q = if s_Q isa AbstractMatrix
         Symmetric(Matrix(s_Q) + (noise * I))
     else
-        Symmetric(Matrix(Diagonal(fill(1.0 + noise, N_areas))))
+        Symmetric(Matrix(Diagonal(fill(1.0 + noise, s_N))))
     end
 
 
@@ -3820,22 +3842,26 @@ function bstm_options(; kwargs...)
         y_obs = y_obs,
         
         s_idx = s_idx, 
-        s_obs = s_obs, 
+        s_coord = s_coord, 
         s_obs_unique = s_obs_unique,
 
         t_idx = t_idx, 
-        t_obs = t_obs, 
-        
+        t_coord = t_coord, 
+        t_obs_unique = t_obs_unique,
+
         u_idx =u_idx,
-        u_obs = u_obs, 
-        
+        u_coord = u_coord, 
+        u_obs_unique = u_obs_unique,
+
         W = W, 
         trials = trials, 
         weights = weights, 
         log_offset = log_offset,
         
         y_has_data = y_has_data,
-        y_coords_st = y_coords_st,
+        st_coord = st_coord,
+        st_coord_normalized = st_coord_normalized,
+        st_idx = st_idx,
 
         z_obs = z_obs, 
         z_coords_s = z_coords_s,   
@@ -3866,7 +3892,9 @@ function bstm_options(; kwargs...)
         K_nystrom_proj = K_nystrom_proj,
         kernel_nystrom = kernel_nystrom,
         M_inducing_count = M_inducing_count, 
+
         use_sv = use_sv,
+        stochastic_volatility_factor = stochastic_volatility_factor,
 
         M_rff = M_rff,
         M_rff_w = M_rff_w,
@@ -3882,7 +3910,7 @@ function bstm_options(; kwargs...)
         b_sigma_fixed = b_sigma_fixed,
 
         cluster_assignments = cluster_assignments,
-        # interaction_idx = interaction_idx,   
+         
         W_fixed = W_fixed,
         b_fixed = b_fixed,
         rff_scale = sqrt(2.0 / M_rff),  
@@ -3901,16 +3929,20 @@ function bstm_options(; kwargs...)
 
         n_mosaics = get(M_base, :n_mosaics, 5),
         m_rff = get(M_base, :m_rff, 20),
-        D_st =  get(M_base, :D_st, 3 ),  # svgp
-        period = period,  # svgp
+         
+        s_D = size(s_coord, 2),
+        t_D = size(t_coord, 2),
+        st_D = size(s_coord, 2) + size(t_coord, 2),
+
+        period = period,  
         
-        N_obs = N_obs, 
-        N_areas = N_areas, 
-        N_time = N_time, 
-        N_season = N_season,
-        N_fixed = N_fixed,
+        y_N = y_N, 
+        s_N = s_N, 
+        t_N = t_N, 
+        u_N = u_N,
+        fixed_N = fixed_N,
         N_cat = N_cat,
-        N_cov = N_cov,
+        cov_N = cov_N,
         
         
         m_feat = 5,
@@ -4118,7 +4150,7 @@ function assign_spatial_units_inferred(adjacency_matrix; iterations=50, learning
         println("Graph connectivity: ", is_connected(areal_units.graph))
         
         # Quick test run: model 2 using explicit unpacking of required fields
-        plt = plot_spatial_graph(lip_inputs.pts, areal_units; title="Lip Cancer Spatial Graph", domain_boundary=lip_inputs.pts)
+        plt = plot_spatial_graph(lip_inputs.s_coord_tuple, areal_units; title="Lip Cancer Spatial Graph", domain_boundary=lip_inputs.s_coord_tuple)
         display(plt)
         
         println("First few centroids from areal_units: ", areal_units.centroids[1:min(5, length(areal_units.centroids))])
@@ -4260,20 +4292,20 @@ function kron_ar1_matern_sample(Ns, Nt, unique_s, ls_s, sigma_s, rho_t, sigma_t_
 end
  
 
-function prepare_fft_grid(pts, values; grid_res=64, pad_factor=2)
+function prepare_fft_grid(s_coord_tuple, values; grid_res=64, pad_factor=2)
     # 1. Define the bounding box
-    xs = [p[1] for p in pts]
-    ys = [p[2] for p in pts]
+    xs = [p[1] for p in s_coord_tuple]
+    ys = [p[2] for p in s_coord_tuple]
     xmin, xmax = minimum(xs), maximum(xs)
     ymin, ymax = minimum(ys), maximum(ys)
 
     # 2. Map points to a grid
     # Use the length of the shorter input to prevent BoundsError
-    n_limit = min(length(pts), length(values))
+    n_limit = min(length(s_coord_tuple), length(values))
     grid = zeros(grid_res, grid_res)
 
     for i in 1:n_limit
-        p = pts[i]
+        p = s_coord_tuple[i]
         ix = Int(floor((p[1] - xmin) / (xmax - xmin + 1e-6) * (grid_res - 1))) + 1
         iy = Int(floor((p[2] - ymin) / (ymax - ymin + 1e-6) * (grid_res - 1))) + 1
         grid[ix, iy] = values[i]
@@ -4382,7 +4414,7 @@ end
 function _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples=nothing, y_obs_custom=nothing)
     denoised = zeros(N_tot, N_samples)
     noisy = zeros(N_tot, N_samples)
-    log_lik = zeros(N_samples, M.N_obs)
+    log_lik = zeros(N_samples, M.y_N)
 
     name_strs = string.(FlexiChains.parameters(chain))
 
@@ -4417,7 +4449,7 @@ function _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sig
             denoised[i, j] = mu
 
             # --- Likelihood Calculation (Audit Training Only) ---
-            if i <= M.N_obs
+            if i <= M.y_N
                 y_vals_src = isnothing(y_obs_custom) ? M.y_obs : y_obs_custom
                 y_val = y_vals_src[i]
                 log_lik[j, i] = if fam isa PoissonFamily; logpdf(Poisson(mu), y_val)
@@ -4630,32 +4662,29 @@ end
 
 
 function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M, PS, alpha)
-    N_obs_points = M.N_obs
-    N_outcomes = M.N_outcomes
-    N_areas, N_time = M.N_areas, M.N_time
-    N_season = M.N_season
+    
     N_PS = isnothing(PS) ? 0 : size(PS, 1)
-    N_tot_points = N_obs_points + N_PS
+    N_tot_points = M.y_N + N_PS
     
     N_samples = size(chain, 1)
     name_strs = string.(FlexiChains.parameters(chain))
 
     # Storage for outcome-wise summaries aligned with _reconstruct_template output
-    outcome_results = Vector{Any}(undef, N_outcomes)
+    outcome_results = Vector{Any}(undef, M.outcomes_N)
 
     # Global components
     phi_zi_samples = "phi_zi" in name_strs ? vec(chain[:phi_zi].data) : zeros(N_samples)
     
-    for k in 1:N_outcomes
+    for k in 1:M.outcomes_N
         # --- 1. MANIFOLD RECOVERY FOR OUTCOME K ---
         y_sigma_samples_k = _extract_volatility(chain, name_strs, N_tot_points, N_samples, k)
 
         s_eta_tot = zeros(N_tot_points, N_samples)
-        s_eta_obs_denoised = zeros(N_obs_points, N_samples)
-        t_eta_tot = zeros(N_time, N_samples)
-        u_eta_tot = zeros(N_season, N_samples)
-        st_eta_tot = zeros(N_areas, N_time, N_samples)
-        fixed_effects_samples_k = zeros(M.N_fixed, N_samples)
+        s_eta_obs_denoised = zeros(M.y_N, N_samples)
+        t_eta_tot = zeros(M.t_N, N_samples)
+        u_eta_tot = zeros(M.u_N, N_samples)
+        st_eta_tot = zeros(M.s_N, M.t_N, N_samples)
+        fixed_effects_samples_k = zeros(M.fixed_N, N_samples)
         
         # Extract outcome-specific scales
         s_sigma_k = vec(chain[Symbol("s_sigma[$k]")].data)
@@ -4665,8 +4694,8 @@ function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M
         
         for s in 1:N_samples
             # --- A. SPATIAL MANIFOLD AUDIT (All 14 Structures) ---
-            local field_structured_k = zeros(N_areas)
-            local field_noisy_k = zeros(N_areas)
+            local field_structured_k = zeros(M.s_N)
+            local field_noisy_k = zeros(M.s_N)
 
             if M.model_space == "bym2"
                 rho_k = "s_rho" in name_strs ? clamp(chain[Symbol("s_rho[$k]")].data[s], 0.0, 1.0) : 1.0
@@ -4698,7 +4727,7 @@ function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M
                 field_noisy_k = field_structured_k
             elseif M.model_space == "warping"
                 w_warp = vec(chain[Symbol("w_warp_k[$k]")].data[s])
-                warp_proj = (M.s_obs * M.W_fixed) .+ M.b_fixed'
+                warp_proj = (M.s_coord * M.W_fixed) .+ M.b_fixed'
                 field_structured_k = (sqrt(2.0 / M.M_rff) .* cos.(warp_proj) * w_warp) .* s_sigma_k[s]
                 field_noisy_k = field_structured_k
             elseif M.model_space == "fft"
@@ -4706,19 +4735,19 @@ function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M
                 field_structured_k = field_noisy_k
             elseif M.model_space == "iid"
                 field_noisy_k = vec(chain[Symbol("s_iid_k[$k]")].data[s]) .* s_sigma_k[s]
-                field_structured_k = zeros(N_areas)
+                field_structured_k = zeros(M.s_N)
             else # Catch-all for RFF/GP/SVC which map directly to s_eta_scaled if indexed
-                field_noisy_k = zeros(N_areas)
-                field_structured_k = zeros(N_areas)
+                field_noisy_k = zeros(M.s_N)
+                field_structured_k = zeros(M.s_N)
             end
 
             # Map to Obs + PS
-            s_idx_obs = M.s_idx isa AbstractVector ? M.s_idx : fill(M.s_idx[1], N_obs_points)
-            s_eta_tot[1:N_obs_points, s] = field_noisy_k[s_idx_obs]
+            s_idx_obs = M.s_idx isa AbstractVector ? M.s_idx : fill(M.s_idx[1], M.y_N)
+            s_eta_tot[1:M.y_N, s] = field_noisy_k[s_idx_obs]
             s_eta_obs_denoised[:, s] = field_structured_k[s_idx_obs]
             if N_PS > 0
                 s_idx_ps = PS.s_idx isa AbstractVector ? PS.s_idx : fill(PS.s_idx[1], N_PS)
-                s_eta_tot[(N_obs_points+1):end, s] = field_noisy_k[s_idx_ps]
+                s_eta_tot[(M.y_N+1):end, s] = field_noisy_k[s_idx_ps]
             end
 
             # --- B. TEMPORAL FIELD ---
@@ -4737,7 +4766,7 @@ function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M
             if M.model_season != "none"
                 if M.model_season == "harmonic"
                     u_a, u_b = chain[Symbol("u_alpha_k[$k]")].data[s], chain[Symbol("u_beta_k[$k]")].data[s]
-                    u_steps = 1:N_season
+                    u_steps = 1:M.u_N
                     u_eta_tot[:, s] = (u_a .* sin.(2π .* u_steps ./ 12.0) .+ u_b .* cos.(2π .* u_steps ./ 12.0)) .* u_sigma_k[s]
                 else
                     u_eta_tot[:, s] = vec(chain[Symbol("u_raw_k[$k]")].data[s]) .* u_sigma_k[s]
@@ -4747,7 +4776,7 @@ function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M
             # --- D. SPACE-TIME INTERACTION ---
             if M.model_st > 0
                 st_raw_k = vec(chain[Symbol("st_raw_k[$k]")].data[s])
-                st_eta_tot[:, :, s] = reshape(st_raw_k .* st_sigma_k[s], N_areas, N_time)
+                st_eta_tot[:, :, s] = reshape(st_raw_k .* st_sigma_k[s], M.s_N, M.t_N)
             end
         end
 
@@ -4756,9 +4785,9 @@ function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M
         for s in 1:N_samples
             st_mat_k = st_eta_tot[:, :, s]
             for i in 1:N_tot_points
-                is_obs = i <= N_obs_points
+                is_obs = i <= M.y_N
                 src = is_obs ? M : PS
-                idx_adj = is_obs ? i : i - N_obs_points
+                idx_adj = is_obs ? i : i - M.y_N
                 
                 a = src.s_idx isa AbstractVector ? src.s_idx[idx_adj] : src.s_idx
                 t = src.t_idx isa AbstractVector ? src.t_idx[idx_adj] : src.t_idx
@@ -4768,8 +4797,8 @@ function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M
                 if M.model_season != "none"; val += u_eta_tot[u, s]; end
                 
                 # Fixed Effects Logic for Multivariate
-                if M.N_fixed > 0
-                    p_beta_k = [chain[Symbol("d_beta_k[$k][$d]")].data[s] for d in 1:M.N_fixed]
+                if M.fixed_N > 0
+                    p_beta_k = [chain[Symbol("d_beta_k[$k][$d]")].data[s] for d in 1:M.fixed_N]
                     fixed_effects_samples_k[:, s] = p_beta_k
                     val += dot(p_beta_k, is_obs ? M.fixed[i, :] : PS.fixed[idx_adj, :])
                 end
@@ -4782,16 +4811,16 @@ function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M
         denoised_mu, noisy_y, log_lik = _process_ll_and_predictions(fam, eta_k, chain, M, N_tot_points, N_samples, y_sigma_samples_k, M.y_obs[:, k])
         
         outcome_results[k] = (
-            spatial_structured = summarize_array(reshape(s_eta_obs_denoised, N_obs_points, 1, N_samples); alpha=alpha),
-            spatial_noisy = summarize_array(reshape(s_eta_tot[1:N_obs_points, :], N_obs_points, 1, N_samples); alpha=alpha),
-            temporal = summarize_array(reshape(t_eta_tot, N_time, 1, N_samples); alpha=alpha),
-            seasonal = summarize_array(reshape(u_eta_tot, N_season, 1, N_samples); alpha=alpha),
+            spatial_structured = summarize_array(reshape(s_eta_obs_denoised, M.y_N, 1, N_samples); alpha=alpha),
+            spatial_noisy = summarize_array(reshape(s_eta_tot[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+            temporal = summarize_array(reshape(t_eta_tot, M.t_N, 1, N_samples); alpha=alpha),
+            seasonal = summarize_array(reshape(u_eta_tot, M.u_N, 1, N_samples); alpha=alpha),
             volatility = summarize_array(reshape(y_sigma_samples_k, N_tot_points, 1, N_samples); alpha=alpha),
-            fixed_effects = M.N_fixed > 0 ? summarize_array(reshape(fixed_effects_samples_k, M.N_fixed, 1, N_samples); alpha=alpha) : nothing,
-            predictions_observed = summarize_array(reshape(denoised_mu[1:N_obs_points, :], N_obs_points, 1, N_samples); alpha=alpha),
-            predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[(N_obs_points+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
-            predictions_noisy = N_PS > 0 ? summarize_array(reshape(noisy_y[(N_obs_points+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
-            waic = _compute_waic(log_lik[:, 1:N_obs_points]),
+            fixed_effects = M.fixed_N > 0 ? summarize_array(reshape(fixed_effects_samples_k, M.fixed_N, 1, N_samples); alpha=alpha) : nothing,
+            predictions_observed = summarize_array(reshape(denoised_mu[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+            predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+            predictions_noisy = N_PS > 0 ? summarize_array(reshape(noisy_y[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+            waic = _compute_waic(log_lik[:, 1:M.y_N]),
             family = fam
         )
     end
@@ -4808,24 +4837,22 @@ function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M
     # Description: Reconstructs factor-based multivariate spatiotemporal fields.
     # Maps latent factor scores back to outcome space via the learned PCA loadings (Householder).
 
-    N_obs, N_outcomes = size(M.y_obs)
     N_factors = get(M, :N_factors, 2)
-    N_areas, N_time = M.N_areas, M.N_time
     N_PS = isnothing(PS) ? 0 : size(PS, 1)
-    N_tot = N_obs + N_PS
+    N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
     name_strs = string.(FlexiChains.parameters(chain))
 
     # 1. PCA & Loadings Recovery
-    U_samples = zeros(N_outcomes, N_factors, N_samples)
-    Kmat_samples = zeros(N_outcomes, N_outcomes, N_samples)
-    nvh = Int(N_outcomes * N_factors - N_factors * (N_factors - 1) / 2)
+    U_samples = zeros(M.outcomes_N, N_factors, N_samples)
+    Kmat_samples = zeros(M.outcomes_N, M.outcomes_N, N_samples)
+    nvh = Int(M.outcomes_N * N_factors - N_factors * (N_factors - 1) / 2)
     v_all = get_params_vector(chain, "v", nvh)
 
     for s in 1:N_samples
         pca_sd = [chain[Symbol("pca_sd[$k]")].data[s] for k in 1:N_factors]
         pca_pdef_sd = chain[:pca_pdef_sd].data[s]
-        Kmat, _, U = householder_transform(v_all[s, :], N_outcomes, N_factors, M.ltri, pca_sd, pca_pdef_sd, M.noise)
+        Kmat, _, U = householder_transform(v_all[s, :], M.outcomes_N, N_factors, M.ltri, pca_sd, pca_pdef_sd, M.noise)
         U_samples[:, :, s] = U
         Kmat_samples[:, :, s] = Kmat
     end
@@ -4836,7 +4863,7 @@ function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M
         for s in 1:N_samples
             # Spatial Component
             s_sigma_k = chain[Symbol("s_sigma_k[$k]")].data[s]
-            local field_k = zeros(N_areas)
+            local field_k = zeros(M.s_N)
             if M.model_space == "bym2"
                 rho_k = clamp(chain[Symbol("s_rho_k[$k]")].data[s], 0.0, 1.0)
                 field_k = s_sigma_k .* (sqrt(rho_k) .* vec(chain[Symbol("s_icar_k[$k]")].data[s]) .+ 
@@ -4849,7 +4876,7 @@ function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M
 
             # Temporal Component
             t_sigma_k = chain[Symbol("t_sigma_k[$k]")].data[s]
-            local trend_k = zeros(N_time)
+            local trend_k = zeros(M.t_N)
             if M.model_time == "ar1"
                 trend_k = vec(chain[Symbol("t_raw_k[$k]")].data[s]) .* t_sigma_k
             elseif M.model_time == "rw2"
@@ -4858,9 +4885,9 @@ function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M
 
             # Assembly
             for i in 1:N_tot
-                is_obs = i <= N_obs
+                is_obs = i <= M.y_N
                 src = is_obs ? M : PS
-                idx_adj = is_obs ? i : i - N_obs
+                idx_adj = is_obs ? i : i - M.y_N
                 a = src.s_idx isa AbstractVector ? src.s_idx[idx_adj] : src.s_idx
                 t = src.t_idx isa AbstractVector ? src.t_idx[idx_adj] : src.t_idx
                 factor_fields[i, k, s] = field_k[a] + trend_k[t]
@@ -4869,12 +4896,12 @@ function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M
     end
 
     # 3. Outcome Predictor Synthesis
-    eta = zeros(N_tot, N_outcomes, N_samples)
+    eta = zeros(N_tot, M.outcomes_N, N_samples)
     c_eta_all = "c_eta" in name_strs ? get_params_vector(chain, "c_eta", M.N_cat)' : zeros(M.N_cat, N_samples)
     
-    fixed_effects_samples = zeros(M.N_fixed, N_outcomes, N_samples)
-    if M.N_fixed > 0
-        for k in 1:N_outcomes, d in 1:M.N_fixed
+    fixed_effects_samples = zeros(M.fixed_N, M.outcomes_N, N_samples)
+    if M.fixed_N > 0
+        for k in 1:M.outcomes_N, d in 1:M.fixed_N
             p_name = Symbol("d_beta[$d,$k]")
             if p_name in Symbol.(name_strs)
                 for s in 1:N_samples; fixed_effects_samples[d, k, s] = chain[p_name].data[s]; end
@@ -4885,17 +4912,17 @@ function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M
     for s in 1:N_samples
         mu_proj = factor_fields[:, :, s] * U_samples[:, :, s]'
         for i in 1:N_tot
-            is_obs = i <= N_obs
-            idx_adj = is_obs ? i : i - N_obs
-            off = is_obs ? M.log_offset[idx_adj, :] : zeros(N_outcomes)
-            for k in 1:N_outcomes
+            is_obs = i <= M.y_N
+            idx_adj = is_obs ? i : i - M.y_N
+            off = is_obs ? M.log_offset[idx_adj, :] : zeros(M.outcomes_N)
+            for k in 1:M.outcomes_N
                 val = off[k] + mu_proj[i, k]
                 if "c_eta" in name_strs
                     val += c_eta_all[is_obs ? M.cov_indices[idx_adj, 1] : PS.cov_indices[idx_adj, 1], s]
                 end
-                if M.N_fixed > 0
+                if M.fixed_N > 0
                     fixed_mat = is_obs ? M.fixed : PS.fixed
-                    for d in 1:M.N_fixed
+                    for d in 1:M.fixed_N
                         dm_val = fixed_mat isa AbstractMatrix ? fixed_mat[idx_adj, d] : (fixed_mat isa AbstractVector ? fixed_mat[idx_adj] : fixed_mat)
                         val += fixed_effects_samples[d, k, s] * dm_val
                     end
@@ -4906,17 +4933,17 @@ function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M
     end
 
     # 4. Summaries
-    outcome_results = Vector{Any}(undef, N_outcomes)
-    for k in 1:N_outcomes
+    outcome_results = Vector{Any}(undef, M.outcomes_N)
+    for k in 1:M.outcomes_N
         y_sig_k = sqrt.(Kmat_samples[k, k, :])
         y_sigma_samples_k = repeat(y_sig_k', N_tot, 1)
         denoised_k, noisy_k, log_lik_k = _process_ll_and_predictions(fam, eta[:, k, :], chain, M, N_tot, N_samples, y_sigma_samples_k, M.y_obs[:, k])
         outcome_results[k] = (
-            spatial_noisy = summarize_array(reshape(eta[1:N_obs, k, :], N_obs, 1, N_samples); alpha=alpha),
+            spatial_noisy = summarize_array(reshape(eta[1:M.y_N, k, :], M.y_N, 1, N_samples); alpha=alpha),
             volatility = summarize_array(reshape(y_sigma_samples_k, N_tot, 1, N_samples); alpha=alpha),
-            fixed_effects = M.N_fixed > 0 ? summarize_array(reshape(fixed_effects_samples[:, k, :], M.N_fixed, 1, N_samples); alpha=alpha) : nothing,
-            predictions_observed = summarize_array(reshape(denoised_k[1:N_obs, :], N_obs, 1, N_samples); alpha=alpha),
-            predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_k[(N_obs+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+            fixed_effects = M.fixed_N > 0 ? summarize_array(reshape(fixed_effects_samples[:, k, :], M.fixed_N, 1, N_samples); alpha=alpha) : nothing,
+            predictions_observed = summarize_array(reshape(denoised_k[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+            predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_k[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
             waic = _compute_waic(log_lik_k), family = fam
         )
     end
@@ -4927,19 +4954,18 @@ end
 
 
 function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily, chain, M, PS, alpha)
-    N_obs = M.N_obs
+
     N_PS = isnothing(PS) ? 0 : size(PS, 1)
-    N_areas, N_time = M.N_areas, M.N_time
-    N_tot = N_obs + N_PS
+    N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
     name_strs = string.(FlexiChains.parameters(chain))
 
     # 1. MANIFOLD RECOVERY (Latent Field Synthesis)
     s_eta_tot = zeros(N_tot, N_samples)
-    s_eta_obs_denoised = zeros(N_obs, N_samples)
-    s_eta_obs_noisy = zeros(N_obs, N_samples)
-    t_eta_tot = zeros(N_time, N_samples)
-    u_eta_tot = zeros(M.N_season, N_samples)
+    s_eta_obs_denoised = zeros(M.y_N, N_samples)
+    s_eta_obs_noisy = zeros(M.y_N, N_samples)
+    t_eta_tot = zeros(M.t_N, N_samples)
+    u_eta_tot = zeros(M.u_N, N_samples)
 
     # Multi-fidelity specific latent fields
     z_latent_samples = zeros(size(M.z_obs, 1), N_samples)
@@ -4957,9 +4983,9 @@ function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily, chain, 
     end
 
     # Extract fixed effects
-    fixed_effects_samples = zeros(M.N_fixed, N_samples)
-    if M.N_fixed > 0
-        for d in 1:M.N_fixed
+    fixed_effects_samples = zeros(M.fixed_N, N_samples)
+    if M.fixed_N > 0
+        for d in 1:M.fixed_N
             p_name = Symbol("d_beta[$d]")
             if p_name in Symbol.(name_strs)
                 for s in 1:N_samples
@@ -4989,9 +5015,9 @@ function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily, chain, 
         end
 
         # Map to total grid
-        s_eta_tot[1:N_obs, s] = field_noisy[M.s_idx]
+        s_eta_tot[1:M.y_N, s] = field_noisy[M.s_idx]
         if N_PS > 0 && !isnothing(PS)
-            s_eta_tot[(N_obs+1):end, s] = field_noisy[PS.s_idx]
+            s_eta_tot[(M.y_N+1):end, s] = field_noisy[PS.s_idx]
         end
         s_eta_obs_denoised[:, s] = field_structured[M.s_idx]
         s_eta_obs_noisy[:, s] = field_noisy[M.s_idx]
@@ -5010,11 +5036,11 @@ function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily, chain, 
 
     for s in 1:N_samples
         for i in 1:N_tot
-            is_obs = i <= N_obs
-            idx_adj = is_obs ? i : i - N_obs
+            is_obs = i <= M.y_N
+            idx_adj = is_obs ? i : i - M.y_N
             src = is_obs ? M : PS
 
-            # src can be nothing if i > N_obs and PS is nothing, though N_tot implies PS exists if i > N_obs
+            # src can be nothing if i > M.y_N and PS is nothing, though N_tot implies PS exists if i > M.y_N
             a, t, u = src.s_idx[idx_adj], src.t_idx[idx_adj], src.u_idx[idx_adj]
             off = is_obs ? M.log_offset[i] : 0.0
 
@@ -5030,19 +5056,19 @@ function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily, chain, 
     denoised_mu, noisy_y, log_lik_mat = _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples, M.y_obs)
 
     return (
-        spatial_structured = summarize_array(reshape(s_eta_obs_denoised, N_obs, 1, N_samples); alpha=alpha),
-        spatial_noisy = summarize_array(reshape(s_eta_obs_noisy, N_obs, 1, N_samples); alpha=alpha),
-        temporal = summarize_array(reshape(t_eta_tot, N_time, 1, N_samples); alpha=alpha),
-        seasonal = summarize_array(reshape(u_eta_tot, M.N_season, 1, N_samples); alpha=alpha),
+        spatial_structured = summarize_array(reshape(s_eta_obs_denoised, M.y_N, 1, N_samples); alpha=alpha),
+        spatial_noisy = summarize_array(reshape(s_eta_obs_noisy, M.y_N, 1, N_samples); alpha=alpha),
+        temporal = summarize_array(reshape(t_eta_tot, M.t_N, 1, N_samples); alpha=alpha),
+        seasonal = summarize_array(reshape(u_eta_tot, M.u_N, 1, N_samples); alpha=alpha),
         volatility = summarize_array(reshape(y_sigma_samples, N_tot, 1, N_samples); alpha=alpha),
-        fixed_effects = summarize_array(reshape(fixed_effects_samples, M.N_fixed, 1, N_samples); alpha=alpha),
+        fixed_effects = summarize_array(reshape(fixed_effects_samples, M.fixed_N, 1, N_samples); alpha=alpha),
         covariate_effects = summarize_array(reshape(c_eta_all, M.N_cat, 1, N_samples); alpha=alpha),
-        predictions_observed = summarize_array(reshape(denoised_mu[1:N_obs, :], N_obs, 1, N_samples); alpha=alpha),
+        predictions_observed = summarize_array(reshape(denoised_mu[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
         z_latent = summarize_array(reshape(z_latent_samples, size(M.z_obs, 1), 1, N_samples); alpha=alpha),
         w_latent = [summarize_array(reshape(w_latent_samples[:, k, :], size(M.w_obs, 1), 1, N_samples); alpha=alpha) for k in 1:3],
-        predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[(N_obs+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
-        predictions_noisy = N_PS > 0 ? summarize_array(reshape(noisy_y[(N_obs+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
-        waic = _compute_waic(log_lik_mat[:, 1:N_obs]),
+        predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        predictions_noisy = N_PS > 0 ? summarize_array(reshape(noisy_y[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        waic = _compute_waic(log_lik_mat[:, 1:M.y_N]),
         family = fam, architecture = arch
     )
 end
@@ -5050,20 +5076,19 @@ end
 
 function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, PS, alpha)
 
-    N_obs = M.N_obs
     N_PS = isnothing(PS) ? 0 : size(PS, 1)
-    N_areas, N_time = M.N_areas, M.N_time
-    N_tot = N_obs + N_PS
+    
+    N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
     name_strs = string.(FlexiChains.parameters(chain))
 
     # 1. MANIFOLD RECOVERY
     s_eta_tot = zeros(N_tot, N_samples)
-    s_eta_obs_denoised = zeros(N_obs, N_samples)
-    s_eta_obs_noisy = zeros(N_obs, N_samples)
-    t_eta_tot = zeros(N_time, N_samples)
-    u_eta_tot = zeros(M.N_season, N_samples)
-    st_eta_tot = zeros(N_areas, N_time, N_samples)
+    s_eta_obs_denoised = zeros(M.y_N, N_samples)
+    s_eta_obs_noisy = zeros(M.y_N, N_samples)
+    t_eta_tot = zeros(M.t_N, N_samples)
+    u_eta_tot = zeros(M.u_N, N_samples)
+    st_eta_tot = zeros(M.s_N, M.t_N, N_samples)
 
     y_sigma_samples = _extract_volatility(chain, name_strs, N_tot, N_samples)
     c_eta_all = zeros(M.N_cat, N_samples)
@@ -5073,9 +5098,9 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         end
     end
 
-    fixed_effects_samples = zeros(M.N_fixed, N_samples)
-    if M.N_fixed > 0
-        for d in 1:M.N_fixed
+    fixed_effects_samples = zeros(M.fixed_N, N_samples)
+    if M.fixed_N > 0
+        for d in 1:M.fixed_N
             p_name = Symbol("d_beta[$d]")
             if p_name in Symbol.(name_strs)
                 for s in 1:N_samples
@@ -5087,8 +5112,8 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
 
     for s in 1:N_samples
         s_sigma_sample = "s_sigma" in name_strs ? chain[:s_sigma].data[s] : 1.0
-        local field_structured_sample = zeros(N_areas)
-        local field_noisy_sample = zeros(N_areas)
+        local field_structured_sample = zeros(M.s_N)
+        local field_noisy_sample = zeros(M.s_N)
 
         if M.model_space == "bym2"
             rho_sample = "s_rho" in name_strs ? clamp(chain[:s_rho].data[s], 0.0, 1.0) : 1.0
@@ -5125,7 +5150,7 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
             field_structured_sample = field_noisy_sample
         elseif M.model_space == "warping"
             w_warp = vec(chain[:w_warp].data[s])
-            warp_proj = (M.s_obs * M.W_fixed) .+ M.b_fixed'
+            warp_proj = (M.s_coord * M.W_fixed) .+ M.b_fixed'
             field_noisy_sample = (sqrt(2.0 / M.M_rff) .* cos.(warp_proj) * w_warp) .* s_sigma_sample
             field_structured_sample = field_noisy_sample
         elseif M.model_space == "fitc"
@@ -5158,17 +5183,17 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
             field_noisy_sample = field_structured_sample
         elseif M.model_space == "iid"
             field_noisy_sample = vec(chain[:s_iid].data[s]) .* s_sigma_sample
-            field_structured_sample = zeros(N_areas)
+            field_structured_sample = zeros(M.s_N)
         else
-            field_noisy_sample = "s_eta" in name_strs ? vec(chain[:s_eta].data[s]) : zeros(N_areas)
+            field_noisy_sample = "s_eta" in name_strs ? vec(chain[:s_eta].data[s]) : zeros(M.s_N)
             field_structured_sample = field_noisy_sample
         end
 
-        s_idx_obs = M.s_idx isa AbstractVector ? M.s_idx : fill(M.s_idx[1], N_obs)
-        s_eta_tot[1:N_obs, s] = field_noisy_sample[s_idx_obs]
+        s_idx_obs = M.s_idx isa AbstractVector ? M.s_idx : fill(M.s_idx[1], M.y_N)
+        s_eta_tot[1:M.y_N, s] = field_noisy_sample[s_idx_obs]
         if N_PS > 0  && !isnothing(PS)
             s_idx_ps = PS.s_idx isa AbstractVector ? PS.s_idx : fill(PS.s_idx[1], N_PS)
-            s_eta_tot[(N_obs+1):end, s] = field_noisy_sample[s_idx_ps]
+            s_eta_tot[(M.y_N+1):end, s] = field_noisy_sample[s_idx_ps]
         end
         s_eta_obs_denoised[:, s] = field_structured_sample[s_idx_obs]
         s_eta_obs_noisy[:, s] = field_noisy_sample[s_idx_obs]
@@ -5183,30 +5208,30 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         if "u_eta" in name_strs; u_eta_tot[:, s] = vec(chain[:u_eta].data[s])
         elseif "u_raw" in name_strs; u_eta_tot[:, s] = vec(chain[:u_raw].data[s]) .* u_sigma_sample
         elseif "u_alpha" in name_strs
-            u_steps = 1:M.N_season
+            u_steps = 1:M.u_N
             u_eta_tot[:, s] = (chain[:u_alpha].data[s] .* sin.( 2pi .* u_steps ./ 12.0) .+ chain[:u_beta].data[s] .* cos.(2pi .* u_steps ./ 12.0)) .* u_sigma_sample
         end
 
         if M.model_st > 0 && "st_raw" in name_strs
             st_sigma = "st_sigma" in name_strs ? chain[:st_sigma].data[s] : 1.0
-            st_eta_tot[:, :, s] = reshape(vec(chain[:st_raw].data[s]) .* st_sigma, N_areas, N_time)
+            st_eta_tot[:, :, s] = reshape(vec(chain[:st_raw].data[s]) .* st_sigma, M.s_N, M.t_N)
         end
     end
 
     eta = zeros(N_tot, N_samples)
     for s in 1:N_samples
-        st_mat = M.model_st > 0 ? st_eta_tot[:, :, s] : zeros(N_areas, N_time)
+        st_mat = M.model_st > 0 ? st_eta_tot[:, :, s] : zeros(M.s_N, M.t_N)
         for i in 1:N_tot
-            is_obs = i <= N_obs
+            is_obs = i <= M.y_N
             src = is_obs ? M : PS
-            idx_adj = is_obs ? i : i - N_obs
+            idx_adj = is_obs ? i : i - M.y_N
             a = src.s_idx isa AbstractVector ? src.s_idx[idx_adj] : src.s_idx
             t = src.t_idx isa AbstractVector ? src.t_idx[idx_adj] : src.t_idx
             u = src.u_idx isa AbstractVector ? src.u_idx[idx_adj] : src.u_idx
             val = (is_obs ? M.log_offset[i] : 0.0) + s_eta_tot[i, s] + t_eta_tot[t, s] + u_eta_tot[u, s] + st_mat[a, t]
-            if M.N_fixed > 0
+            if M.fixed_N > 0
                 fixed_mat = is_obs ? M.fixed : PS.fixed
-                for d in 1:M.N_fixed
+                for d in 1:M.fixed_N
                     dm_val = fixed_mat isa AbstractMatrix ? fixed_mat[idx_adj, d] : (fixed_mat isa AbstractVector ? fixed_mat[idx_adj] : fixed_mat)
                     val += fixed_effects_samples[d, s] * dm_val
                 end
@@ -5222,17 +5247,17 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
 
     denoised_mu, noisy_y, log_lik_mat = _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples, M.y_obs)
     return (
-        spatial_structured = summarize_array(reshape(s_eta_obs_denoised, N_obs, 1, N_samples); alpha=alpha),
-        spatial_noisy = summarize_array(reshape(s_eta_obs_noisy, N_obs, 1, N_samples); alpha=alpha),
-        temporal = summarize_array(reshape(t_eta_tot, N_time, 1, N_samples); alpha=alpha),
-        seasonal = summarize_array(reshape(u_eta_tot, M.N_season, 1, N_samples); alpha=alpha),
+        spatial_structured = summarize_array(reshape(s_eta_obs_denoised, M.y_N, 1, N_samples); alpha=alpha),
+        spatial_noisy = summarize_array(reshape(s_eta_obs_noisy, M.y_N, 1, N_samples); alpha=alpha),
+        temporal = summarize_array(reshape(t_eta_tot, M.t_N, 1, N_samples); alpha=alpha),
+        seasonal = summarize_array(reshape(u_eta_tot, M.u_N, 1, N_samples); alpha=alpha),
         volatility = summarize_array(reshape(y_sigma_samples, N_tot, 1, N_samples); alpha=alpha),
-        fixed_effects = M.N_fixed > 0 ? summarize_array(reshape(fixed_effects_samples, M.N_fixed, 1, N_samples); alpha=alpha) : nothing,
+        fixed_effects = M.fixed_N > 0 ? summarize_array(reshape(fixed_effects_samples, M.fixed_N, 1, N_samples); alpha=alpha) : nothing,
         covariate_effects = summarize_array(reshape(c_eta_all, M.N_cat, 1, N_samples); alpha=alpha),
-        predictions_observed = summarize_array(reshape(denoised_mu[1:N_obs, :], N_obs, 1, N_samples); alpha=alpha),
-        predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[(N_obs+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
-        predictions_noisy = N_PS > 0 ? summarize_array(reshape(noisy_y[(N_obs+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
-        waic = _compute_waic(log_lik_mat[:, 1:N_obs]), family = fam, architecture = arch
+        predictions_observed = summarize_array(reshape(denoised_mu[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+        predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        predictions_noisy = N_PS > 0 ? summarize_array(reshape(noisy_y[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        waic = _compute_waic(log_lik_mat[:, 1:M.y_N]), family = fam, architecture = arch
     )
 end
 
@@ -5246,15 +5271,15 @@ function _reconstruct(arch::ComplexArchitecture, fam::ModelFamily, chain, M, PS,
     
     Key Distinction:
     Unlike GMRF models where effects are area-indexed, spectral models typically provide
-    realized latent fields (s_eff/f_gp) directly at the observation level (N_obs).
+    realized latent fields (s_eff/f_gp) directly at the observation level (y_N).
     """
-    N_obs, N_areas, N_time = length(M.y_obs), size(M.W, 1), Int(maximum(M.t_idx))
+      
     N_samples = size(chain, 1)
     name_strs = string.(FlexiChains.parameters(chain))
 
-    spatial = zeros(N_obs, N_samples)
-    temporal = zeros(N_time, N_samples)
-    eta = zeros(N_obs, N_samples)
+    spatial = zeros(M.y_N, N_samples)
+    temporal = zeros(M.t_N, N_samples)
+    eta = zeros(M.y_N, N_samples)
 
     # 1. Realized Spatial Field Extraction
     target_field = "s_eff" in name_strs ? :s_eff : ("f_gp" in name_strs ? :f_gp : nothing)
@@ -5271,13 +5296,13 @@ function _reconstruct(arch::ComplexArchitecture, fam::ModelFamily, chain, M, PS,
     st_int_present = "st_int_raw" in name_strs
     sig_int = st_int_present ? vec(chain[:sigma_int].data) : zeros(N_samples)
 
-    # 3. Predictor Assembly (N_obs level projection)
+    # 3. Predictor Assembly (M.y_N level projection)
     beta_z = "beta_z" in name_strs ? vec(chain[:beta_z].data) : zeros(N_samples)
     beta_cov_eff = _extract_beta_cov(name_strs, chain, M, N_samples, alpha)
 
     for s in 1:N_samples
-        st_i = st_int_present ? reshape(vec(chain[:st_int_raw].data[s]) .* sig_int[s], N_areas, N_time) : zeros(N_areas, N_time)
-        for i in 1:N_obs
+        st_i = st_int_present ? reshape(vec(chain[:st_int_raw].data[s]) .* sig_int[s], M.s_N, M.t_N) : zeros(M.s_N, M.t_N)
+        for i in 1:M.y_N
             a, t = M.s_idx[i], M.t_idx[i]
             eta[i, s] = M.log_offset[i] + spatial[i, s] + temporal[t, s] + st_i[a, t] + beta_z[s] * M.z_obs[i]
             for k in 1:4
@@ -5288,16 +5313,16 @@ function _reconstruct(arch::ComplexArchitecture, fam::ModelFamily, chain, M, PS,
     end
 
     actual_fam = (fam isa UnknownFamily) ? PoissonFamily() : fam
-    denoised, noisy, log_lik = _process_ll_and_predictions(actual_fam, eta, chain, M, N_obs, N_samples)
+    denoised, noisy, log_lik = _process_ll_and_predictions(actual_fam, eta, chain, M, M.y_N, N_samples)
 
-    return (spatial_structured = summarize_array(reshape(spatial, N_obs, 1, N_samples); alpha=alpha),
+    return (spatial_structured = summarize_array(reshape(spatial, M.y_N, 1, N_samples); alpha=alpha),
             spatial_unstructured = nothing,
-            spatial = summarize_array(reshape(spatial, N_obs, 1, N_samples); alpha=alpha),
-            temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
+            spatial = summarize_array(reshape(spatial, M.y_N, 1, N_samples); alpha=alpha),
+            temporal = summarize_array(reshape(temporal, M.t_N, 1, N_samples); alpha=alpha),
             seasonal = nothing,
             beta_cov = beta_cov_eff,
-            predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-            predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+            predictions_denoised = summarize_array(reshape(denoised, M.y_N, 1, N_samples); alpha=alpha),
+            predictions_noisy = summarize_array(reshape(noisy, M.y_N, 1, N_samples); alpha=alpha),
             waic = _compute_waic(log_lik),
             family = actual_fam, architecture = arch)
 end
@@ -5316,13 +5341,13 @@ function _reconstruct(arch::UnknownArchitecture, fam::ModelFamily, chain, M, PS,
     3. Seasonal Effects: Reconstructs harmonic components (sin/cos) for periodic models.
     4. Prediction: Maps latent states through inverse-link functions with offset scaling.
     """
-    N_obs, N_time = length(M.y_obs), Int(maximum(M.t_idx))
+     
     N_samples = size(chain, 1)
     name_strs = string.(FlexiChains.parameters(chain))
 
-    spatial = zeros(N_obs, N_samples)
-    temporal = zeros(N_time, N_samples)
-    eta = zeros(N_obs, N_samples)
+    spatial = zeros(M.y_N, N_samples)
+    temporal = zeros(M.t_N, N_samples)
+    eta = zeros(M.y_N, N_samples)
 
     # 1. Latent Manifold Extraction
     target = "f_latent" in name_strs ? :f_latent : ("eta_gp" in name_strs ? :eta_gp : ("eta_spatial_time" in name_strs ? :eta_spatial_time : nothing))
@@ -5341,18 +5366,18 @@ function _reconstruct(arch::UnknownArchitecture, fam::ModelFamily, chain, M, PS,
 
     # Check for seasonal harmonic coefficients if present in Adaptive RFF models
     has_seasonal = "beta_cos" in name_strs && "beta_sin" in name_strs
-    seasonal_post = zeros(N_time, N_samples)
+    seasonal_post = zeros(M.t_N, N_samples)
     if has_seasonal
         bc, bs = vec(chain[:beta_cos].data), vec(chain[:beta_sin].data)
         for s in 1:N_samples
-            t_vals = collect(1:N_time)
+            t_vals = collect(1:M.t_N)
             seasonal_post[:, s] = bc[s] .* cos.(2pi .* t_vals ./ 12.0) .+ bs[s] .* sin.(2pi .* t_vals ./ 12.0)
         end
     end
 
     # 4. Assembly
     for s in 1:N_samples
-        for i in 1:N_obs
+        for i in 1:M.y_N
             t = M.t_idx[i]
             eta[i, s] = M.log_offset[i] + spatial[i, s] + temporal[t, s] + (has_seasonal ? seasonal_post[t, s] : 0.0)
             for k in 1:4
@@ -5363,16 +5388,16 @@ function _reconstruct(arch::UnknownArchitecture, fam::ModelFamily, chain, M, PS,
     end
 
     actual_fam = (fam isa UnknownFamily) ? GaussianFamily() : fam
-    denoised, noisy, log_lik = _process_ll_and_predictions(actual_fam, eta, chain, M, N_obs, N_samples)
+    denoised, noisy, log_lik = _process_ll_and_predictions(actual_fam, eta, chain, M, M.y_N, N_samples)
 
-    return (spatial_structured = summarize_array(reshape(spatial, N_obs, 1, N_samples); alpha=alpha),
+    return (spatial_structured = summarize_array(reshape(spatial, M.y_N, 1, N_samples); alpha=alpha),
             spatial_unstructured = nothing,
-            spatial = summarize_array(reshape(spatial, N_obs, 1, N_samples); alpha=alpha),
-            temporal = summarize_array(reshape(temporal, N_time, 1, N_samples); alpha=alpha),
-            seasonal = has_seasonal ? summarize_array(reshape(seasonal_post, N_time, 1, N_samples); alpha=alpha) : nothing,
+            spatial = summarize_array(reshape(spatial, M.y_N, 1, N_samples); alpha=alpha),
+            temporal = summarize_array(reshape(temporal, M.t_N, 1, N_samples); alpha=alpha),
+            seasonal = has_seasonal ? summarize_array(reshape(seasonal_post, M.t_N, 1, N_samples); alpha=alpha) : nothing,
             beta_cov = beta_cov_eff,
-            predictions_denoised = summarize_array(reshape(denoised, N_obs, 1, N_samples); alpha=alpha),
-            predictions_noisy = summarize_array(reshape(noisy, N_obs, 1, N_samples); alpha=alpha),
+            predictions_denoised = summarize_array(reshape(denoised, M.y_N, 1, N_samples); alpha=alpha),
+            predictions_noisy = summarize_array(reshape(noisy, M.y_N, 1, N_samples); alpha=alpha),
             waic = _compute_waic(log_lik),
             family = actual_fam, architecture = arch)
 end
@@ -5755,28 +5780,27 @@ end
 
 
 
-function generate_sim_data(n_pts=10, n_time=5; rndseed=42)
+function generate_sim_data(s_N=10, t_N=5; rndseed=42)
     Random.seed!(rndseed)
-    n_total = n_pts * n_time
-    unique_pts = [(rand() * 100, rand() * 100) for _ in 1:n_pts]
-    pts_full_dataset = repeat(unique_pts, n_time)
-    s_obs = vcat([collect(t)' for t in pts_full_dataset]...)
-    t_obs = rand(n_total) .* (n_time+1) .+ 2000
+    n_total = s_N * t_N
+    unique_pts = [(rand() * 100, rand() * 100) for _ in 1:s_N]
+    s_coord_tuple = repeat(unique_pts, t_N)
+    s_coord = vcat([collect(t)' for t in s_coord_tuple]...)
+    t_coord = rand(n_total) .* (t_N+1) .+ 2000
     weights = ones(n_total)
     trials  = ones(Int, n_total)
-    N_time = n_time
-    N_season = 12
-    period=12.0
-    trend = 0.05 .* t_obs[:,1]
-    seasonal = 1.0 .* cos.(2pi .* t_obs[:,1] ./ period)
+    u_N = 12
+    period=u_N
+    trend = 0.05 .* t_coord[:,1]
+    seasonal = 1.0 .* cos.(2pi .* t_coord[:,1] ./ period)
     temporal_effect =  1.0 .* ( trend .+ seasonal )
-    spatial_effect = 1.5 .* sin.(s_obs[:,1] .*  2pi) .* cos.(s_obs[:,2] .*  2pi)
+    spatial_effect = 1.5 .* sin.(s_coord[:,1] .*  2pi) .* cos.(s_coord[:,2] .*  2pi)
     sigma_y = 0.2
     observation_error = sigma_y .* randn(n_total)
     Z = randn(n_total)
-    W1_true = 0.5 .* sin.(t_obs[:,1] ./ 5.0) .+ 0.5 .* Z
-    W2_true = 0.5 .* cos.(t_obs[:,1] ./ 5.0) .- 0.3 .* Z
-    W3_true = 0.2 .* (t_obs[:,1] ./ n_total) .+ 0.1 .* Z
+    W1_true = 0.5 .* sin.(t_coord[:,1] ./ 5.0) .+ 0.5 .* Z
+    W2_true = 0.5 .* cos.(t_coord[:,1] ./ 5.0) .- 0.3 .* Z
+    W3_true = 0.2 .* (t_coord[:,1] ./ n_total) .+ 0.1 .* Z
     sigma_w1, sigma_w2, sigma_w3 = 0.1, 0.2, 0.3
     W1_obs = W1_true .+ randn(n_total) .* sigma_w1
     W2_obs = W2_true .+ randn(n_total) .* sigma_w2
@@ -5791,7 +5815,8 @@ function generate_sim_data(n_pts=10, n_time=5; rndseed=42)
     fixed = [ones(n_total) ]   # column of ones is the intercept
      
     return (
-        pts=pts_full_dataset, s_obs=s_obs, t_obs=t_obs, weights=weights, trials=trials, N_time=N_time, N_season=N_season,
+        s_coord_tuple=s_coord_tuple, s_coord=s_coord, t_coord=t_coord, weights=weights, trials=trials, 
+        s_N=s_N, t_N=t_N, u_N=u_N,
         y_obs=y_obs, y_binary=y_binary, y_counts=y_counts, fixed=fixed,
         z_obs=Z, w_obs=cov_continuous
     )
@@ -5971,9 +5996,9 @@ end
 
 # --- Optimized Householder PCA Helper Functions ---
 
-function householder_to_eigenvector(v_mat::AbstractMatrix{T}, n_outcomes, n_factors) where {T}
+function householder_to_eigenvector(v_mat::AbstractMatrix{T}, nU, n_factors) where {T}
     # Initializes the Identity matrix to be transformed
-    U = Matrix{T}(I, n_outcomes, n_outcomes)
+    U = Matrix{T}(I, nU, nU)
 
     for k in 1:n_factors
         # Extract the k-th Householder vector
@@ -5997,13 +6022,13 @@ function householder_to_eigenvector(v_mat::AbstractMatrix{T}, n_outcomes, n_fact
     return U[:, 1:n_factors]
 end
 
-function householder_transform(v, n_outcomes, n_factors, ltri_indices, pca_sd, pdef_sd, noise)
+function householder_transform(v, nU, n_factors, ltri_indices, pca_sd, pdef_sd, noise)
     T = eltype(v)
-    v_mat = zeros(T, n_outcomes, n_factors)
+    v_mat = zeros(T, nU, n_factors)
     v_mat[ltri_indices] .= v
 
     # Generate Orthonormal Loadings using optimized transformation
-    U = householder_to_eigenvector(v_mat, n_outcomes, n_factors)
+    U = householder_to_eigenvector(v_mat, nU, n_factors)
 
     # Reconstruct Covariance Components
     # W = Loadings * Scaled Eigenvalues
@@ -6011,7 +6036,7 @@ function householder_transform(v, n_outcomes, n_factors, ltri_indices, pca_sd, p
 
     # Kmat is the full covariance matrix: WW' + Residual_Variance
     # We add a small noise term for numerical stability
-    Kmat = W * W' + (pdef_sd^2 + noise) * I(n_outcomes)
+    Kmat = W * W' + (pdef_sd^2 + noise) * I(nU)
 
     return Kmat, pca_sd, U
 end
@@ -6029,13 +6054,13 @@ function eigenvector_to_householder(U_in::AbstractMatrix{T}, n_factors) where {T
 #
 # Complexity: O(K * N^2)
 
-    n_outcomes = size(U_in, 1)
+    nU = size(U_in, 1)
     # We work on a copy to avoid modifying the input
     U = copy(U_in)
     
     # Storage for the lower-triangular part of the v_mat
     # Each column k corresponds to the k-th Householder vector
-    v_mat = zeros(T, n_outcomes, n_factors)
+    v_mat = zeros(T, nU, n_factors)
 
     for k in 1:n_factors
         # 1. Target vector is the k-th column of the current transformation
