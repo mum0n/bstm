@@ -126,10 +126,9 @@ pairs(data_scot)
 
 data_scot[:W] # the neighbourhood adjacency matrix
  
-plot_spatial_graph( au_scot; title="Lip Cancer Inferred from Adjacency 'Locations'", domain_boundary=au_scot.hull_coords)
+plot_spatial_graph( au_scot; plot_title="Lip Cancer Inferred from Adjacency 'Locations'", domain_boundary=au_scot.hull_coords)
 
-s_coord_tuple_scot = data_scot.s_coord_tuple  # inferred locations (centroids)
-plot_kde_simple(s_coord_tuple_scot, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+plot_kde_simple(data_scot.s_coord_tuple, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
    
 ```
 
@@ -176,12 +175,14 @@ res = model_results_comprehensive(m, chn, modinputs, au_scot );
 # alternatively, one could use `bstm` which does almost the same thing (it has more overhead and uses better samplers): 
 Random.seed!(42)
 m = bstm(modinputs);
-os = get_optimal_sampler(m; nuts_adapt=1000) 
-inits = parameter_inits(m)
+os = get_optimal_sampler(m; nuts_adapt=2000) 
+inits = parameter_inits(m);
 
-chn = sample(m, os, 5000; initial_params=inits )  
+chn = sample(m, os, 6000; initial_params=inits )  
 
-res = model_results_comprehensive(m, chn, modinputs, au_scot );
+res = model_results_comprehensive(m, chn, modinputs, au_scot );  
+
+# a little longer to sample but worth the wait ..
  
 ```
 The results look like this. Not great but that is because, it is a simple model: we are ignoring covariates and spatiotemporal interactions. The bstm version does some additional work which slows it down a bit and has a slightly harder time sampling. But overall, reasonable. 
@@ -520,7 +521,7 @@ data = generate_sim_data(s_N, t_N; rndseed=42);
 
 
 # time discretization
-tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N)  
+tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N)  ;
 
 # space discretization
 au_method = :hvt   # reasonably simple
@@ -546,24 +547,27 @@ plot_spatial_graph( au; plot_title="Method: $au_method", domain_boundary=au.hull
 # prepare model inputs  
 modinputs = bstm_options( 
   y_obs = data.y_obs,         # y-value, counts of people with lip cancer
-  s_coord_tuple = data.s_coord_tuple,
+  s_coord_tuple = data.s_coord_tuple, # Explicitly pass coordinate tuples to fix the MethodError
   s_idx = au.assignments ,  # space index
   t_idx = tu.t_idx,  # time index
-  log_offset = 0, # offsets, population size on log-scale
+  log_offset = zeros(length(data.y_obs)), # offsets, population size on log-scale
   W = au.W,  # matrix adjacency,
+  model_arch ="univariate",
   model_family = "gaussian",
-  model_architecture ="univariate",
   model_space = "denseGP",  # <dense gp>
-  model_time = "gp",
+  model_time = "none",
   model_st = 0,  # no space-time interactions (main effects only)
+  s_coord_unique = RowVecs(reduce(hcat, [collect(p) for p in au.centroids])'),
+  t_coord_unique = RowVecs(hcat(unique(tu.t_idx)...)'),
   use_zi = false  
 );
+ 
 
 Random.seed!(42) # Set a seed for reproducibility
 
 m = example_gp_gaussian(modinputs); # Turing model object
 chn = sample(m, MH(), 100; num_warmup=50 )  ;
-res = model_results_comprehensive(m, chn, modinputs, au_scot);
+res = model_results_comprehensive(m, chn, modinputs, au);  # reconstruct method required ... 
 
 showparams( res.summarystats )
   
@@ -781,7 +785,7 @@ display( "Mean point density: $(round( met.mean_density, sigdigits=5 ))")
 display( "SD point density: $(round( met.sd_density, sigdigits=5 ))")
 display( "CV point density: $(round( met.cv_density, sigdigits=5 ))")
  
-plot_spatial_graph( au; title="Method: $method", domain_boundary=au.hull_coords)
+plot_spatial_graph( au; plot_title="Method: $method", domain_boundary=au.hull_coords)
  
 ```
 
