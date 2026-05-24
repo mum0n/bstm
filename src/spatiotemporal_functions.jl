@@ -2067,6 +2067,34 @@ function build_cyclic_ar1_precision(n, rho, tau)
     return (tau / (one(T) - rho^2)) * Q
 end
 
+
+function build_ar1_precision_matrix(n::Int, rho::T, sigma::T) where {T<:Real}
+    
+    # Revised AR1 implementation for bstm_complex
+    # separates stochastic innovations from the latent states
+
+    # Q represents the precision of the stochastic process deviations
+    Q = spzeros(T, n, n)
+    if n == 1
+        return ones(T, 1, 1) ./ (sigma^2 + 1e-6)
+    end
+
+    Q[1, 1] = one(T)
+    for i in 2:(n - 1)
+        Q[i, i] = one(T) + rho^2
+    end
+    Q[n, n] = one(T)
+
+    for i in 1:(n - 1)
+        Q[i, i + 1] = -rho
+        Q[i + 1, i] = -rho
+    end
+
+    # Marginal variance scaling: Var(x_t) = sigma^2 / (1 - rho^2)
+    return ( (one(T) - rho^2) / (sigma^2 + 1e-8) ) .* Q
+end
+
+
 function logpdf_gmrf(x, Q)
     # Description: Calculates the log-probability of a Gaussian Markov Random Field.
     # Inputs:
@@ -3903,25 +3931,48 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         s_eta_obs_denoised[:, s] = field_structured_sample[s_idx_obs]
         s_eta_obs_noisy[:, s] = field_noisy_sample[s_idx_obs]
 
+
+        # 2. Temporal Manifolds
         t_sigma_sample = "t_sigma" in name_strs ? chain[:t_sigma].data[s] : 1.0
-        if "t_eta" in name_strs; t_eta_tot[:, s] = vec(chain[:t_eta].data[s])
-        elseif "t_raw" in name_strs; t_eta_tot[:, s] = vec(chain[:t_raw].data[s]) .* t_sigma_sample
-        elseif "t_alpha" in name_strs; t_eta_tot[:, s] = (chain[:t_alpha].data[s] .* sin.(M.t_angle) .+ chain[:t_beta].data[s] .* cos.(M.t_angle)) .* t_sigma_sample
+        if "t_eta" in name_strs;
+             t_eta_tot[:, s] = vec(chain[:t_eta].data[s])
+        elseif "t_raw" in name_strs; 
+            t_eta_tot[:, s] = vec(chain[:t_raw].data[s]) .* t_sigma_sample
+        elseif "t_alpha" in name_strs; 
+            t_eta_tot[:, s] = (chain[:t_alpha].data[s] .* sin.(M.t_angle) .+ chain[:t_beta].data[s] .* cos.(M.t_angle)) .* t_sigma_sample
+        end
+       
+        # 2. Temporal Manifolds
+        if M.model_time == "logistic"
+            if "m" in name_strs; m_latent_tot[:, s] = vec(chain[:m].data[s]); end
+            t_eta_tot[:, s] = "t_eta" in name_strs ? vec(chain[:t_eta].data[s]) : vec(chain[:t_innovations].data[s])
+        elseif M.model_time == "ar1"
+            t_eta_tot[:, s] = vec(chain[:t_raw].data[s]) .* chain[:t_sigma].data[s]
+        elseif M.model_time == "rw2"
+            t_eta_tot[:, s] = vec(chain[:t_raw].data[s])
+        elseif M.model_time == "harmonic"
+            ta, tb = chain[:t_alpha].data[s], chain[:t_beta].data[s]
+            t_eta_tot[:, s] = (ta .* sin.(M.t_angle) .+ tb .* cos.(M.t_angle)) .* chain[:t_sigma].data[s]
         end
 
-        u_sigma_sample = "u_sigma" in name_strs ? chain[:u_sigma].data[s] : 1.0
-        if "u_eta" in name_strs; u_eta_tot[:, s] = vec(chain[:u_eta].data[s])
-        elseif "u_raw" in name_strs; u_eta_tot[:, s] = vec(chain[:u_raw].data[s]) .* u_sigma_sample
-        elseif "u_alpha" in name_strs
-            u_steps = 1:M.u_N
-            u_eta_tot[:, s] = (chain[:u_alpha].data[s] .* sin.( 2pi .* u_steps ./ 12.0) .+ chain[:u_beta].data[s] .* cos.(2pi .* u_steps ./ 12.0)) .* u_sigma_sample
+        # 3. Seasonal Manifolds
+        if M.model_season == "ar1"
+            u_eta_tot[:, s] = vec(chain[:u_raw].data[s]) .* chain[:u_sigma].data[s]
+        elseif M.model_season == "rw2"
+            u_eta_tot[:, s] = vec(chain[:u_raw].data[s])
+        elseif M.model_season == "harmonic"
+            ua, ub = chain[:u_alpha].data[s], chain[:u_beta].data[s]
+            u_eta_tot[:, s] = (ua .* sin.(M.u_angle) .+ ub .* cos.(M.u_angle)) .* chain[:u_sigma].data[s]
         end
 
+ 
+        # 4. Space-Time Interaction Manifolds
         if M.model_st > 0 && "st_raw" in name_strs
-            st_sigma = "st_sigma" in name_strs ? chain[:st_sigma].data[s] : 1.0
-            st_eta_tot[:, :, s] = reshape(vec(chain[:st_raw].data[s]) .* st_sigma, M.s_N, M.t_N)
+            st_eta_tot[:, :, s] = reshape(vec(chain[:st_raw].data[s]) .* chain[:st_sigma].data[s], M.s_N, M.t_N)
         end
     end
+
+
 
     eta = zeros(N_tot, N_samples)
     for s in 1:N_samples
