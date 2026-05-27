@@ -4,13 +4,13 @@
 function bstm(modinput::NamedTuple; kwargs...)  
     modinput = bstm_options(modinput; kwargs...)
     if modinput.model_arch == "univariate"
-        return bstm_univariate(modinput )
+        return bstm_univariate( modinput )
     elseif modinput.model_arch == "multivariate"
-        return bstm_multivariate(modinput )
+        return bstm_multivariate( modinput )
     elseif modinput.model_arch == "multioutcome"
-        return bstm_multioutcome(modinput )
+        return bstm_multioutcome( modinput )
     elseif modinput.model_arch == "multifidelity"
-        return bstm_multifidelity(modinput )
+        return bstm_multifidelity( modinput )
     else
         error("Unknown model architecture: $(modinput.model_arch)")
     end
@@ -430,6 +430,58 @@ end
             # Note: t_sigma here acts as the marginal amplitude scale.
             t_Q = (1.0 / (t_sigma^2 + M.noise)) .* M.t_Q
 
+        elseif M.model_time == "logistic_ar1"
+            # biomass process model: dn/dt = r n (1-n/K) - removed ; b, removed are not normalized by K  
+            # Hyper-priors for the logistic process
+            t_rho ~ Beta(2, 2)
+            t_sigma ~ Exponential(1.0)
+            
+            # Decoupled AR1 precision for stochastic innovations
+            t_Q = build_ar1_precision_matrix(M.t_N, t_rho, t_sigma)
+            t_innovations ~ MvNormalCanon(zeros(M.t_N), t_Q_innov + 1e-6*I)
+
+            K  ~ truncated(Normal(M.K[1], M.K[2]), lower=M.K[1]*0.01)
+            r  ~ truncated(Normal(M.r[1], M.r[2]), lower=0.01)
+            q1 ~ truncated(Normal(M.q1[1], M.q1[2]), lower=0.01)
+            bpsd ~ truncated(Normal(M.bpsd[1], M.bpsd[2]), lower=0.01)
+
+            # Latent state vector with AD compatibility
+            m = Vector{T}(undef, M.nM)
+            m[1] ~ truncated(Normal(M.m0[1], M.m0[2]), lower=M.mlim[1], upper=M.mlim[2])
+
+            for i in 2:M.nT
+                growth = r * m[i-1] * (1.0 - m[i-1])
+                removal = M.removed[i-1] / K
+                m[i] ~ truncated(Normal(m[i-1] + growth - removal, bpsd), lower=M.mlim[1], upper=M.mlim[2])
+            end
+
+            for i in (M.nT+1):M.nM
+                m[i] ~ truncated(Normal(m[i-1] + r * m[i-1] * (1.0 - m[i-1]), bpsd), lower=M.mlim[1], upper=M.mlim[2])
+            end
+            
+            # Survival check for latent vector
+            if any(x -> x < M.mlim[1], m)
+                Turing.@addlogprob! -Inf
+                return nothing
+            end
+
+            # Base latent state transitions
+            if M.yeartransition == 0
+                for i in M.iok
+                    t_eta[i] ~ Normal((m[i] - M.removed[i]/K) / q1, 1e-6) # Precision handles noise
+                end
+            else
+                for i in M.iok
+                    mu_base = i < M.yeartransition ? (m[i] / q1) :
+                              i == M.yeartransition ? ((m[i] - (M.removed[i-1] + M.removed[i])/(2.0*K)) / q1) :
+                              ((m[i] - M.removed[i]/K) / q1)
+                    t_eta[i] ~ Normal(mu_base, 1e-6)
+                end
+            end
+
+            # Final latent effect: deterministic logistic transition + correlated noise
+            t_eta .+= t_innovations
+ 
         elseif M.model_time == "iid"
             t_sigma ~ Exponential(1.0)
             t_eta ~ MvNormal(zeros(M.t_N), t_sigma*I)
@@ -479,21 +531,20 @@ end
 
     end
 
-    
     # --- 5. Space-Time Interaction (st_eta) ---
     # Captures localized deviations across both space and time
  
-    local st_eta = zeros(M.s_N, M.t_N)
-
-    if M.model_st == 0 # None
+    local st_eta = zeros(T, M.s_N, M.t_N)
+   
+    if M.model_st == "none"  
         st_eta = zeros(M.s_N, M.t_N)
 
-    elseif M.model_st == 1 # Type I: IID Interaction
+    elseif M.model_st == "I" # Type I: IID Interaction
         st_sigma ~ Exponential(0.5)
         st_raw ~ MvNormal(zeros(M.s_N * M.t_N), I)
         st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
 
-    elseif M.model_st == 2 # Type II: Temporal Structure (I ⊗ Q_t)
+    elseif M.model_st == "II" # Type II: Temporal Structure (I ⊗ Q_t)
         # Each area has its own structured temporal trend
         st_sigma ~ Exponential(0.5)
         st_Q2 = kron(I(M.s_N), t_Q)
@@ -502,7 +553,7 @@ end
         st_raw ~ MvNormalCanon(zeros(M.s_N * M.t_N), Matrix(st_Q2))
         st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
 
-    elseif M.model_st == 3 # Type III: Spatial Structure (Q_s ⊗ I)
+    elseif M.model_st == "III" # Type III: Spatial Structure (Q_s ⊗ I)
         # Each time point has its own structured spatial field
         st_sigma ~ Exponential(0.5)
         st_Q3 = kron(s_Q, I(M.t_N))
@@ -511,7 +562,7 @@ end
         st_raw ~ MvNormalCanon(zeros(M.s_N * M.t_N), Matrix(st_Q3))
         st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
 
-    elseif M.model_st == 4 # Type IV: Inseparable (Q_s ⊗ Q_t)
+    elseif M.model_st == "IV" # Type IV: Inseparable (Q_s ⊗ Q_t)
         # Fully inseparable spatiotemporal structure
         st_sigma ~ Exponential(0.5)
         st_Q4 = kron(s_Q, t_Q)
@@ -519,6 +570,62 @@ end
         st_Q4 = Matrix(kron(s_Q, t_Q))
         st_raw ~ MvNormalCanon(zeros(M.s_N * M.t_N), Matrix(st_Q4))
         st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
+
+    elseif M.model_st == "advection_diffusion"
+
+        st_sigma ~ Exponential(1.0)
+        st_diffusion ~ Exponential(0.5) 
+        st_advection ~ Exponential(0.5) 
+        
+        st_eta_z ~ MvNormal(zeros(M.s_N * M.t_N), I)
+        st_innovation = reshape(st_eta_z, M.s_N, M.t_N) .* st_sigma
+        st_persistence ~ MvNormal(zeros(M.s_N), I) # spatially varying persistence (temporal autocorrelation)
+
+        L_phys = Matrix(Diagonal(vec(sum(M.W, dims=2))) - M.W)
+        st_eta[:, 1] = st_innovation[:, 1]
+        
+        for t in 2:M.t_N
+            # Dynamics: mu = Prev - Diffusion(Prev) - Advection(SpatialField)
+            mu_phys = st_eta[:, t-1] .- st_diffusion .* (L_phys * st_eta[:, t-1]) .- st_advection .* (L_phys * s_eta)
+            st_eta[:, t] = logistic.(st_persistence) .* mu_phys .+ st_innovation[:, t]
+        end
+    
+    elseif M.model_st == "advection"
+
+        st_sigma ~ Exponential(1.0) 
+        st_advection ~ Exponential(0.5) 
+        
+        st_eta_z ~ MvNormal(zeros(M.s_N * M.t_N), I)
+        st_innovation = reshape(st_eta_z, M.s_N, M.t_N) .* st_sigma
+        st_persistence ~ MvNormal(zeros(M.s_N), I) # spatially varying persistence (temporal autocorrelation)
+
+        L_phys = Matrix(Diagonal(vec(sum(M.W, dims=2))) - M.W)
+        st_eta[:, 1] = st_innovation[:, 1]
+        
+        for t in 2:M.t_N
+            # Dynamics: mu = Prev  - Advection(SpatialField)
+            mu_phys = st_eta[:, t-1]  .- st_advection .* (L_phys * s_eta)
+            st_eta[:, t] = logistic.(st_persistence) .* mu_phys .+ st_innovation[:, t]
+        end
+
+    elseif M.model_st == "diffusion"
+
+        st_sigma ~ Exponential(1.0)
+        st_diffusion ~ Exponential(0.5) 
+        
+        st_eta_z ~ MvNormal(zeros(M.s_N * M.t_N), I)
+        st_innovation = reshape(st_eta_z, M.s_N, M.t_N) .* st_sigma
+        st_persistence ~ MvNormal(zeros(M.s_N), I) # spatially varying persistence (temporal autocorrelation)
+
+        L_phys = Matrix(Diagonal(vec(sum(M.W, dims=2))) - M.W)
+        st_eta[:, 1] = st_innovation[:, 1]
+        
+        for t in 2:M.t_N
+            # Dynamics: mu = Prev - Diffusion(Prev)  
+            mu_phys = st_eta[:, t-1] .- st_diffusion .* (L_phys * st_eta[:, t-1])  
+            st_eta[:, t] = logistic.(st_persistence) .* mu_phys .+ st_innovation[:, t]
+        end
+
     else
         # nothing to do 
     end
@@ -568,7 +675,10 @@ end
         end
     end
 
-    # --- 6. Linear Predictor (eta) ---
+
+ 
+
+    # --- Linear Predictor (eta) ---
     eta = zeros(T, M.y_N) 
     
     if haskey(M, :log_offset) 
@@ -600,6 +710,13 @@ end
     if !isnothing(c_eta) 
         for i in 1:M.cov_N
             eta .+= c_eta[M.cov_indices[:, i]] 
+        end
+    end
+
+
+    if get(M, :model_transport, "none") != "none"
+        for i in 1:M.y_N
+            eta[i] += tp_eta[M.s_idx[i], M.t_idx[i]]; 
         end
     end
 
@@ -638,6 +755,56 @@ end
 
 end
 
+ 
+
+@model function bstm_transport(M, ::Type{T}=Float64) where {T}
+    local r_nb = 1.0; local phi_zi = 0.0
+    if M.model_family == "negbin"; r_nb ~ Exponential(1.0); end
+    if M.use_zi; phi_zi ~ Beta(1, 1); end
+
+    s_sigma ~ Exponential(1.0)
+    L = Matrix(Diagonal(vec(sum(M.W, dims=2))) - M.W)
+    Q_static = L + 1e-6 * I
+    
+    s_rho ~ MvNormalCanon(zeros(M.s_N), (1.0 / s_sigma^2) .* Q_static)
+
+    m_total ~ MvNormal(fill(M.m0_total, M.t_N), 10.0 * I)
+    temporal_trend = m_total ./ M.s_N
+
+    st_diffusion ~ Exponential(0.5)
+    st_advection ~ Exponential(0.5)
+    st_sigma ~ Exponential(1.0)
+
+    st_eta_z ~ MvNormal(zeros(M.s_N * M.t_N), I)
+    st_eta_raw = reshape(st_eta_z, M.s_N, M.t_N) .* st_sigma
+    
+    # Spatially varying temporal persistence
+    st_rho ~ MvNormal(zeros(M.s_N), I)
+
+    st_eta = zeros(T, M.s_N, M.t_N)
+    st_eta[:, 1] = st_eta_raw[:, 1]
+    
+    for t in 2:M.t_N
+        mu_phys = st_eta[:, t-1] .- st_diffusion .* (L * st_eta[:, t-1]) .- st_advection .* (L * st_rho)
+        st_eta[:, t] = logistic.(st_rho) .* mu_phys .+ st_eta_raw[:, t]
+    end
+
+    eta = zeros(T, M.y_N)
+    for i in 1:M.y_N
+        s_id, t_id = M.s_idx[i], M.t_idx[i]
+        eta[i] = M.log_offset[i] + s_rho[s_id] + temporal_trend[t_id] + st_eta[s_id, t_id]
+    end
+
+    if M.fixed_N > 0
+        d_beta ~ MvNormal(zeros(M.fixed_N), I)
+        eta .+= M.fixed * d_beta
+    end
+
+    y_sigma ~ Exponential(1.0)
+    good_idx = findall(!ismissing, M.y_obs)
+    Turing.@addlogprob! logpdf(bstm_Likelihood(M.model_family, M.use_zi, M.weights[good_idx], phi_zi, r_nb, y_sigma, M.trials[good_idx], M.y_obs[good_idx]), eta[good_idx])
+end
+
 
 
 
@@ -651,7 +818,7 @@ end
     s_sigma ~ filldist(Exponential(1.0), outcomes_N)
     t_sigma ~ filldist(Exponential(1.0), outcomes_N)
     local st_sigma
-    if M.model_st > 0
+    if M.model_st != "none" 
         st_sigma ~ filldist(Exponential(0.5), outcomes_N)
     else
         st_sigma = zeros(outcomes_N)
@@ -884,12 +1051,12 @@ end
             eta_k .+= M.fixed * d_beta_k
         end
 
-        if M.model_st > 0
+        if M.model_st != "none" 
             local st_Q
-            if M.model_st == 1; st_Q = I(M.s_N * M.t_N)
-            elseif M.model_st == 2; st_Q = kron(I(M.s_N), Symmetric(t_Q_list[k]))
-            elseif M.model_st == 3; st_Q = kron(M.s_Q, I(M.t_N))
-            elseif M.model_st == 4; st_Q = kron(M.s_Q, Symmetric(t_Q_list[k])); end
+            if M.model_st == "I" ; st_Q = I(M.s_N * M.t_N)
+            elseif M.model_st == "II" ; st_Q = kron(I(M.s_N), Symmetric(t_Q_list[k]))
+            elseif M.model_st == "III"; st_Q = kron(M.s_Q, I(M.t_N))
+            elseif M.model_st == "IV"; st_Q = kron(M.s_Q, Symmetric(t_Q_list[k])); end
 
             st_raw_k ~ MvNormalCanon(zeros(M.s_N * M.t_N), Symmetric(Matrix(st_Q + M.noise * I)))
             st_field_k = reshape(st_raw_k .* st_sigma[k], M.s_N, M.t_N)
@@ -963,7 +1130,7 @@ end
         end
 
         # C. Space-Time Interaction (Factor-Specific)
-        if M.model_st > 0
+        if M.model_st != "none"
             st_sigma_k ~ Exponential(0.5)
             # Use factor-specific precision derived from s_Q and t_Q_k
             # Simplified Type I (IID) for example:
@@ -1191,7 +1358,7 @@ end
     
     # --- 4. Space-Time Interaction (Knorr-Held Types 0-4) ---
     local st_sigma
-    if M.model_st > 0
+    if M.model_st != "none" 
         st_sigma ~ Exponential(0.5)
     else
         st_sigma = 0.0
@@ -1199,26 +1366,26 @@ end
     # --- 4. Space-Time Interaction (Knorr-Held Types 0-4) ---
     local st_eta = zeros(T, M.s_N, M.t_N)
 
-    if M.model_st == 0
+    if M.model_st == "none"
         st_eta = zeros(T, M.s_N, M.t_N)
 
-    elseif M.model_st == 1 # Type I: IID Interaction
+    elseif M.model_st == "I" # Type I: IID Interaction
         st_raw ~ MvNormal(zeros(M.s_N * M.t_N), I)
         st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
 
-    elseif M.model_st == 2 # Type II: Temporal Structure (I ⊗ Q_t)
+    elseif M.model_st == "II" # Type II: Temporal Structure (I ⊗ Q_t)
         # Each area has an independent structured temporal trend
         st_Q2 = Symmetric(kron(I(M.s_N), t_Q) )
         st_raw ~ MvNormalCanon(zeros(M.s_N * M.t_N), st_Q2)
         st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
 
-    elseif M.model_st == 3 # Type III: Spatial Structure (Q_s ⊗ I)
+    elseif M.model_st == "III" # Type III: Spatial Structure (Q_s ⊗ I)
         # Each time point has an independent structured spatial field
         st_Q3 = Symmetric(kron(M.s_Q, I(M.t_N)) )
         st_raw ~ MvNormalCanon(zeros(M.s_N * M.t_N), st_Q3)
         st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
 
-    elseif M.model_st == 4 # Type IV: Inseparable (Q_s ⊗ Q_t)
+    elseif M.model_st == "IV" # Type IV: Inseparable (Q_s ⊗ Q_t)
         # Fully inseparable spatiotemporal structure
         st_Q4 = Symmetric(kron(M.s_Q, t_Q) )
         st_raw ~ MvNormalCanon(zeros(M.s_N * M.t_N), st_Q4)
@@ -1241,7 +1408,7 @@ end
     
     if M.fixed_N > 0; eta .+= M.fixed * d_beta; end
 
-    if M.model_st > 0
+    if M.model_st != "none" 
         for i in 1:M.y_N; eta[i] += st_eta[M.s_idx[i], M.t_idx[i]]; end
     end
 
@@ -1644,60 +1811,6 @@ end
             # t_eta = zeros(M.t_N)  #this is already default
             # t_Q = I(M.t_N)  # already default
 
-        elseif M.model_time == "logistic"
-            # biomass process model: dn/dt = r n (1-n/K) - removed ; b, removed are not normalized by K  
-           # Hyper-priors for the logistic process
-            t_rho ~ Beta(2, 2)
-            t_sigma ~ Exponential(1.0)
-            
-            # Decoupled AR1 precision for stochastic innovations
-            t_Q = build_ar1_precision_matrix(M.t_N, t_rho, t_sigma)
-            t_innovations ~ MvNormalCanon(zeros(M.t_N), t_Q_innov + 1e-6*I)
-
-            K  ~ truncated(Normal(M.K[1], M.K[2]), lower=M.K[1]*0.01)
-            r  ~ truncated(Normal(M.r[1], M.r[2]), lower=0.01)
-            q1 ~ truncated(Normal(M.q1[1], M.q1[2]), lower=0.01)
-            bpsd ~ truncated(Normal(M.bpsd[1], M.bpsd[2]), lower=0.01)
-
-            # Latent state vector with AD compatibility
-            m = Vector{T}(undef, M.nM)
-            m[1] ~ truncated(Normal(M.m0[1], M.m0[2]), lower=M.mlim[1], upper=M.mlim[2])
-
-            for i in 2:M.nT
-                prev_m = clamp(m[i-1], M.mlim[1], M.mlim[2])
-                growth = r * prev_m * (1.0 - prev_m)
-                removal = M.removed[i-1] / K
-                m[i] ~ truncated(Normal(prev_m + growth - removal, bpsd), lower=M.mlim[1], upper=M.mlim[2])
-            end
-
-            for i in (M.nT+1):M.nM
-                prev_m = clamp(m[i-1], M.mlim[1], M.mlim[2])
-                m[i] ~ truncated(Normal(prev_m + r * prev_m * (1.0 - prev_m), bpsd), lower=M.mlim[1], upper=M.mlim[2])
-            end
-            
-            # Survival check for latent vector
-            if any(x -> x < M.mlim[1], m)
-                Turing.@addlogprob! -Inf
-                return nothing
-            end
-
-            # Base latent state transitions
-            if M.yeartransition == 0
-                for i in M.iok
-                    t_eta[i] ~ Normal((m[i] - M.removed[i]/K) / q1, 1e-6) # Precision handles noise
-                end
-            else
-                for i in M.iok
-                    mu_base = i < M.yeartransition ? (m[i] / q1) :
-                              i == M.yeartransition ? ((m[i] - (M.removed[i-1] + M.removed[i])/(2.0*K)) / q1) :
-                              ((m[i] - M.removed[i]/K) / q1)
-                    t_eta[i] ~ Normal(mu_base, 1e-6)
-                end
-            end
-
-            # Final latent effect: deterministic logistic transition + correlated noise
-            t_eta .+= t_innovations
-
         else # Default to no effects
             # nothing to do
         end
@@ -1743,15 +1856,15 @@ end
  
     local st_eta = zeros(M.s_N, M.t_N)
 
-    if M.model_st == 0 # None
+    if M.model_st == "none"  
         st_eta = zeros(M.s_N, M.t_N)
 
-    elseif M.model_st == 1 # Type I: IID Interaction
+    elseif M.model_st == "I" # Type I: IID Interaction
         st_sigma ~ Exponential(0.5)
         st_raw ~ MvNormal(zeros(M.s_N * M.t_N), I)
         st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
 
-    elseif M.model_st == 2 # Type II: Temporal Structure (I ⊗ Q_t)
+    elseif M.model_st == "II" # Type II: Temporal Structure (I ⊗ Q_t)
         # Each area has its own structured temporal trend
         st_sigma ~ Exponential(0.5)
         st_Q2 = kron(I(M.s_N), t_Q)
@@ -1760,7 +1873,7 @@ end
         st_raw ~ MvNormalCanon(zeros(M.s_N * M.t_N), Matrix(st_Q2))
         st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
 
-    elseif M.model_st == 3 # Type III: Spatial Structure (Q_s ⊗ I)
+    elseif M.model_st == "III" # Type III: Spatial Structure (Q_s ⊗ I)
         # Each time point has its own structured spatial field
         st_sigma ~ Exponential(0.5)
         st_Q3 = kron(s_Q, I(M.t_N))
@@ -1769,7 +1882,7 @@ end
         st_raw ~ MvNormalCanon(zeros(M.s_N * M.t_N), Matrix(st_Q3))
         st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
 
-    elseif M.model_st == 4 # Type IV: Inseparable (Q_s ⊗ Q_t)
+    elseif M.model_st == IV # Type IV: Inseparable (Q_s ⊗ Q_t)
         # Fully inseparable spatiotemporal structure
         st_sigma ~ Exponential(0.5)
         st_Q4 = kron(s_Q, t_Q)

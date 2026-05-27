@@ -1,22 +1,42 @@
 
 
-
-
 @model function example_bym2_ar1_poisson(M, ::Type{T}=Float64) where {T}
- 
-#     This model serves as a foundational spatiotemporal baseline for count data, typically used in epidemiology, crime analysis, or other fields where events occur over space and time. It decomposes the observed counts into a structured spatial component, a serially correlated temporal component, and an overall baseline, all within a Poisson likelihood framework.
 
-#     The model explicitly addresses two key challenges in spatiotemporal data analysis:
-#     1.  **Spatial Dependence:** Accounts for the fact that neighboring areas often exhibit similar patterns (e.g., disease rates in adjacent regions are correlated) using a BYM2 structure, which balances spatially structured effects with unstructured area-specific variability.
-#     2.  **Temporal Dependence:** Captures trends or serial correlation over time (e.g., a high incidence in one period is likely followed by a high incidence in the next) through a first-order autoregressive (AR1) process.
- 
-    # --- 1. GLOBAL HYPERPRIORS ---
+    # Synopsis/Purpose:
+    # This model serves as a foundational spatiotemporal baseline for count data, typically used in epidemiology, crime analysis, or other fields where events occur over space and time. It decomposes the observed counts into a structured spatial component, a serially correlated temporal component, and an overall baseline, all within a Poisson likelihood framework.
+
+    # Conceptual Overview:
+    # The model explicitly addresses two key challenges in spatiotemporal data analysis:
+    # 1. **Spatial Dependence:** Accounts for the fact that neighboring areas often exhibit similar patterns (e.g., disease rates in adjacent regions are correlated) using a BYM2 structure, which balances spatially structured effects with unstructured area-specific variability.
+    # 2. **Temporal Dependence:** Captures trends or serial correlation over time (e.g., a high incidence in one period is likely followed by a high incidence in the next) through a first-order autoregressive (AR1) process.
+
+    # Mathematical Justification:
+    # - **BYM2 Spatial Effect (s_eta):** The BYM2 model, proposed by Riebler et al. (2016), reparameterizes the intrinsic conditional autoregressive (ICAR) model to improve interpretability. It separates spatial effects into a spatially structured component (s_icar) and an unstructured (IID) component (s_iid), controlled by a mixing parameter (s_rho) and scaled by s_sigma.
+    #   `s_eta = s_sigma * (sqrt(s_rho) * s_icar + sqrt(1 - s_rho) * s_iid)`
+    #   The `s_icar` component is constrained by `M.s_Q`, the scaled adjacency matrix.
+    # - **AR1 Temporal Effect (t_eta):** A first-order autoregressive process captures temporal correlation. The `t_raw` component follows a multivariate normal distribution with a precision matrix `t_Q`, which models the dependence between consecutive time points, scaled by t_sigma. The `t_Q` matrix is constructed based on the `t_rho` parameter.
+
+    # Priors:
+    # - `s_sigma ~ Exponential(1.0)`: Scale parameter for the combined spatial effect. An exponential prior enforces positivity.
+    # - `s_rho ~ Beta(1, 1)`: Mixing parameter for the BYM2 spatial effect. A Beta(1,1) (uniform) prior allows `s_rho` to range from 0 (purely IID) to 1 (purely structured).
+    # - `t_sigma ~ Exponential(1.0)`: Scale parameter for the temporal effect.
+    # - `t_rho ~ Beta(2, 2)`: Persistence parameter for the AR1 temporal effect. A Beta(2,2) prior centers the correlation around 0.5, allowing for both positive and negative correlation within the stable range (-1, 1).
+
+    # Latent Fields/Components:
+    # - `s_icar`: Latent variables for the spatially structured component, informed by the adjacency matrix.
+    # - `s_iid`: Latent variables for the spatially unstructured component (independent and identically distributed).
+    # - `t_raw`: Latent variables for the AR1 temporal component, modeling deviations over time.
+
+    # Likelihood:
+    # - `Poisson(exp(eta))`: The observed `M.y_obs` counts are modeled as following a Poisson distribution, where the rate parameter is `exp(eta)`. `eta` is the linear predictor comprising the log-offset, spatial effect, and temporal effect. `M.weights[i]` allows for differential weighting of observations in the log-likelihood calculation.
+
+    # --- 1. GLOBAL HYPERPRIORS --- (Defined in `bstm_options` or explicitly here)
     s_sigma ~ Exponential(1.0) # Standard BSTM name for spatial scale
     s_rho ~ Beta(1, 1)        # Standard BSTM name for BYM2 mixing
     t_sigma ~ Exponential(1.0) # Standard BSTM name for temporal scale
     t_rho ~ Beta(2, 2)         # Standard BSTM name for AR1 persistence
 
-    # --- 2. SPATIAL COMPONENT (BYM2) ---
+    # --- 2. SPATIAL COMPONENT (BYM2) --- (Defined by `M.s_Q` from `bstm_options`)
     s_icar ~ MvNormal(zeros(M.s_N), I)
     Turing.@addlogprob! -0.5 * dot(s_icar, M.s_Q * s_icar)
 
@@ -25,7 +45,7 @@
     # Mixture formulation using standard s_eta mapping
     s_eta = s_sigma .* (sqrt(s_rho) .* s_icar .+ sqrt(1 - s_rho) .* s_iid)
 
-    # --- 3. TEMPORAL COMPONENT (AR1) ---
+    # --- 3. TEMPORAL COMPONENT (AR1) --- (Defined by `M.t_Q` from `bstm_options`)
     t_Q = (1.0 / (1.0 - t_rho^2 + M.noise)) .* (M.t_Q + (t_rho^2) * I)
     t_raw ~ MvNormal(zeros(M.t_N), I)
     Turing.@addlogprob! -0.5 * dot(t_raw, t_Q * t_raw)
@@ -43,96 +63,97 @@
         # Weighted Likelihood Evaluation
         Turing.@addlogprob! M.weights[i] * logpdf(Poisson(exp(eta)), M.y_obs[i])
     end
-end
+end 
 
 
+@model function example_kriging_simple(M, ::Type{T}=Float64) where {T}
+    # Priors for the global mean
+    mu_global ~ Normal(0.0, 10.0)
 
-@model function example_besag_ar1_poisson(M, ::Type{T}=Float64) where {T}
-    # --- 1. GLOBAL HYPERPRIORS ---
-    s_sigma ~ Exponential(1.0)  # Standard spatial scale
-    t_sigma ~ Exponential(1.0)  # Standard temporal scale
-    t_rho ~ Beta(2, 2)          # AR1 persistence
-    st_sigma ~ Exponential(0.5) # Interaction scale
-    c_sigma ~ filldist(Exponential(1.0), 4)
+    # Time-varying hyperparameters
+    signal_std_dev = Vector{T}(undef, M.t_N)
+    spatial_lengthscale = Vector{T}(undef, M.t_N)
+    obs_std_dev = Vector{T}(undef, M.t_N)
 
-    if M.use_zi
-        phi_zi ~ Beta(1, 1)
-    end
- 
-    # --- 2. BESAG (ICAR) SPATIAL FIELD ---
-    s_icar ~ MvNormal(zeros(M.s_N), I)
-    Turing.@addlogprob! -0.5 * dot(s_icar, M.s_Q * s_icar)
-    
-    # Soft sum-to-zero constraint for identifiability
-    s_icar_sum ~ Normal(0, 0.001 * M.s_N)
-    Turing.@addlogprob! -0.5 * (sum(s_icar)^2 / (0.001 * M.s_N))
-
-    # Map to standard s_eta for reconstruction
-    s_eta = s_icar .* s_sigma
-
-    # --- 3. TEMPORAL FIELD (AR1) ---
-    t_Q = (1.0 / (1.0 - t_rho^2 + M.noise)) .* (M.t_Q + (t_rho^2) * I)
-    t_raw ~ MvNormal(zeros(M.t_N), I)
-    Turing.@addlogprob! -0.5 * dot(t_raw, t_Q * t_raw)
-    
-    # Map to standard t_eta for reconstruction
-    t_eta = t_raw .* t_sigma
-
-    # --- 4. SPACE-TIME INTERACTION ---
-    st_raw ~ MvNormal(zeros(M.s_N * M.t_N), I)
-    st_eta = reshape(st_raw .* st_sigma, M.s_N, M.t_N)
-
-    # --- 5. CATEGORICAL SMOOTHING (RW2) ---
-    c_beta = [Vector{T}(undef, M.N_cat) for _ in 1:4]
-    for k in 1:M.N_cov
-        c_beta[k] ~ MvNormal(zeros(M.N_cat), I)
-        Turing.@addlogprob! -0.5 * dot(c_beta[k], (M.Q_rw2 ./ (c_sigma[k]^2 + M.noise)) * c_beta[k])
+    for i in 1:M.t_N
+        signal_std_dev[i] ~ Exponential(1.0)
+        spatial_lengthscale[i] ~ Gamma(2.0, 0.5)
+        obs_std_dev[i] ~ Exponential(1.0)
     end
 
-    # --- 6. LIKELIHOOD ---
-    for i in 1:M.y_N
-        a, t = M.s_idx[i], M.t_idx[i]
-        eta = M.log_offset[i] + s_eta[a] + t_eta[t] + st_eta[a, t]
-        for k in 1:M.N_cov; eta += c_beta[k][M.cov_indices[i, k]]; end
-        
-        mu = exp(eta)
-        if M.use_zi
-            if M.y_obs[i] == 0
-                Turing.@addlogprob! M.weights[i] * log(phi_zi + (1 - phi_zi) * exp(-mu) + 1e-10)
-            else
-                Turing.@addlogprob! M.weights[i] * (log(1 - phi_zi + 1e-10) + logpdf(Poisson(mu), M.y_obs[i]))
-            end
-        else
-            Turing.@addlogprob! M.weights[i] * logpdf(Poisson(mu), M.y_obs[i])
+    f_latent_spatial_all = Vector{T}(undef, length(M.y_obs))
+
+    for i in 1:M.t_N
+        time_mask_i = findall(==(i), M.t_idx)
+
+        if !isempty(time_mask_i)
+            # FIX: Ensure we extract a standard matrix of floats
+            # M.s_coord[indices] returns a vector of vectors; reduce(hcat, ...) makes it a matrix
+            coords_raw = M.s_coord[M.s_idx[time_mask_i]]
+            X_obs_time_i = reduce(hcat, coords_raw)
+
+            k_spatial_i = (signal_std_dev[i]^2) * SqExponentialKernel() ∘ ScaleTransform(1/spatial_lengthscale[i])
+            f_spatial_i = GP(ZeroMean(), k_spatial_i )
+
+            # Sample latent GP values with jitter for numerical stability
+            f_latent_spatial_all[time_mask_i] ~ f_spatial_i(ColVecs(X_obs_time_i), 1e-6)
         end
     end
+
+    combined_mean = mu_global .+ f_latent_spatial_all
+
+    # Observation Likelihood
+    M.y_obs ~ MvNormal(combined_mean, Diagonal((obs_std_dev[M.t_idx].^2 .+ 1e-6 )))
 end
 
 
-@model function example_gp_gaussian(M, ::Type{T}=Float64 ) where {T}
-   y_sigma ~ Exponential(1.0)
+
+# Defining the model with corrected grid-based space-time inputs
+@model function example_gp_gaussian(M, ::Type{T}=Float64) where {T}
+    # 1. Hyperparameters
+    y_sigma ~ Exponential(1.0)
     st_sigma ~ Exponential(1.0)
     ls_s ~ Gamma(2, 2)
     ls_t ~ Gamma(2, 2)
 
-    k_s = SqExponentialKernel() ∘ ScaleTransform(inv(ls_s))
-    k_t = SqExponentialKernel() ∘ ScaleTransform(inv(ls_t))
+    # 2. Kernel Definitions
+    # Space-time Kronecker product
+    k = (st_sigma^2) * (SqExponentialKernel() ∘ ScaleTransform(inv(ls_s))) ⊗ (SqExponentialKernel() ∘ ScaleTransform(inv(ls_t)))
 
-    K_s = kernelmatrix(k_s, M.s_coord_unique)
-    K_t = kernelmatrix(k_t, M.t_coord_unique)
+    # 3. Define the GP
+    f = GP(k)
 
-    K_full = (st_sigma^2) .* kron(K_t, K_s) + M.noise * I
+    # 4. Correctly construct the Inducing Points Grid
+    # s_inducing is 2xNs, t_inducing is 1xNt
+    Ns = size(M.s_inducing, 2)
+    Nt = size(M.t_inducing, 2)
 
-    n_total_latent = length(M.s_coord_unique) * length(M.t_coord_unique)
-    s_eta_raw ~ MvNormal(zeros(n_total_latent), Symmetric(K_full))
+    # Create grid: repeat spatial points Nt times, and tile temporal points Ns times
+    # This creates the Cartesian product for the inducing points
+    s_grid = repeat(M.s_inducing, outer=(1, Nt))
+    t_grid = repeat(M.t_inducing, inner=(1, Ns))
+    X_ind = ColVecs(vcat(s_grid, t_grid))
 
-    s_eta = s_eta_raw[M.interaction_idx]
+    # 5. Sparse GP Approximation
+    f_u = f(X_ind, 1e-6)
+    u_latent ~ f_u
 
-    mu = M.log_offset .+ s_eta
+    # 6. Conditional GP and Likelihood
+    f_cond = condition(f_u, u_latent)
+
+    # Map to observed space coordinates
+    # s_coord.X' gives the 2xN spatial coordinate matrix
+    s_obs_full = M.s_coord.X'
+    # Ensure t_coord is a 1xN row matrix for concatenation
+    t_obs_full = reshape(M.t_coord, 1, :)
+    X_obs_all = ColVecs(vcat(s_obs_full, t_obs_full))
+
+    # Select specific observations using st_idx
+    mu = M.log_offset .+ mean(f_cond(X_obs_all[M.st_idx]))
+
+    # 7. Observation Likelihood
     M.y_obs ~ MvNormal(mu, y_sigma^2 * I)
 end
-
-
 
 @model function example_hurdle_bernoulli_poisson(M, ::Type{T}=Float64) where {T}
     # """

@@ -67,8 +67,13 @@ print( "\nTo (re)-install required packages, run:  install_required_packages() o
 
 # support functions
 include( srcdir( "data_prep.jl") )
+
+include( srcdir( "spatial_partitioning.jl" ))   
+
 include( srcdir( "spatiotemporal_functions.jl" ))   
+
 include( srcdir( "spatiotemporal_turing_models.jl" ))   
+
 include( srcdir( "example_turing_models.jl" ))   
 
 

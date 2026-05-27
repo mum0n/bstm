@@ -132,7 +132,7 @@ plot_kde_simple(data_scot.s_coord_tuple, sd_extension_factor=0.25, title="Spatia
    
 ```
 
-In the data Tuple (*data_scot*), we have counts (y) of cancer incidence and population size in each area (log_offset). We also simulate a 10-"year" temporal process, a random walk with magnitude 0.5 and a covariate effect (X: an area-specific continuous covariate that represents the proportion of the population employed in agriculture, fishing, or forestry). An overall random uniform observation error of magnitude 0.2 is added with a count then taken as the overall, rounded integer value.
+In the tuple (*data_scot*), we have counts (y) of cancer incidence and population size in each area (log_offset). We also simulate a 10-"year" temporal process, a random walk with magnitude 0.5 and a covariate effect (X: an area-specific continuous covariate that represents the proportion of the population employed in agriculture, fishing, or forestry). An overall random uniform observation error of magnitude 0.2 is added with a count then taken as the overall, rounded integer value.
 
 
 #### Spatiotemporal model: the shape of things to come
@@ -143,7 +143,7 @@ Before getting into the nitty gritty of the spatiotemporal models, let us go thr
 #| label: example_bym2_ar1_poisson - Sparse GMRF Space and time effect (no interaction)   
 
 # prepare model inputs  
-modinputs = bstm_options( 
+inp_scot = bstm_options( 
   y_obs = data_scot.y,         # y-value, counts of people with lip cancer
   s_coord_tuple = data_scot.s_coord_tuple,
   s_idx = data_scot.s_idx ,  # space index
@@ -153,18 +153,18 @@ modinputs = bstm_options(
   model_family = "poisson",
   model_space = "bym2",  # example_bym2_ar1_poisson is one of the simplest possible (no space-time interaction)
   model_time = "ar1",
-  model_st = 0,  # no space-time interactions (main effects only)
+  model_st = "none",  # no space-time interactions (main effects only)
   use_zi = false
 ) ;
 
 Random.seed!(42) # Set a seed for reproducibility.
 
 # create model instance
-m = example_bym2_ar1_poisson(modinputs); # m contains the Turing model object with the data .. ready to run
+m = example_bym2_ar1_poisson(inp_scot); # m contains the Turing model object with the data .. ready to run
 
 # sample with Metropolis-Hastings: 
 chn = sample(m, MH(), 10000; num_warmup=1000, thin=20, progress=true, drop_warmup=true )  
-res = model_results_comprehensive(m, chn, modinputs, au_scot );
+res = model_results_comprehensive(m, chn, inp_scot, au_scot );  # results are "OK" but looks like it has not converged
 
 # showparams( res.summarystats )
 # display(res.plots.ppc)  # there are a few more generic plots (see inside the object)
@@ -172,20 +172,20 @@ res = model_results_comprehensive(m, chn, modinputs, au_scot );
 # display(res.plots.denoised)
 
 
-# alternatively, one could use `bstm` which does almost the same thing (it has more overhead and uses better samplers): 
+# alternatively, one could use `bstm` which does almost the same thing (it has a bit more overhead to have flexibility, and uses better samplers): 
 Random.seed!(42)
-m = bstm(modinputs);
-os = get_optimal_sampler(m; nuts_adapt=2000) 
-inits = parameter_inits(m);
+m = bstm(inp_scot);
 
-chn = sample(m, os, 6000; initial_params=inits )  
+os, inits = get_optimal_sampler(m; n_samples_adaptation=100) ; 
 
-res = model_results_comprehensive(m, chn, modinputs, au_scot );  
+chn = sample(m, os, 5000; initial_params=inits, progress=true, drop_warmup=true ) ; 
+
+res = model_results_comprehensive(m, chn, inp_scot, au_scot );  
 
 # a little longer to sample but worth the wait ..
  
 ```
-The results look like this. Not great but that is because, it is a simple model: we are ignoring covariates and spatiotemporal interactions. The bstm version does some additional work which slows it down a bit and has a slightly harder time sampling. But overall, reasonable. 
+The results look like this. Not great but that is because, they have not converged yet (rhat is far from 1) and the model is simple: we are ignoring covariates and spatiotemporal interactions. The bstm version does some additional work which slows it down a bit but overall, gives a better posterior predictive check (PPC). 
 
 
 ```
@@ -194,16 +194,16 @@ modelarch: univariate
 modelspace: bym2
 modeltime: ar1
 modelseason: none
-modelspacetime: 0
+modelspacetime: none
 modelcov: nothing
-compute_time_seconds: 1.0
+compute_time_seconds: 0.8
 rmse: 7.17
 r2: 0.354
 waic: 6107.993
 mean_rhat: 1.35
 mean_ess_bulk: 20.872
 mean_ess_tail: NaN
-ess_per_second: 20.872
+ess_per_second: 26.091
  
   vs
 
@@ -212,28 +212,26 @@ modelarch: univariate
 modelspace: bym2
 modeltime: ar1
 modelseason: none
-modelspacetime: 0
+modelspacetime: none
 modelcov: nothing
-compute_time_seconds: 1.0
-rmse: 2.854
-r2: 0.868
-waic: 4357.091
-mean_rhat: 1.473
-mean_ess_bulk: 169.934
-mean_ess_tail: 65.012
-ess_per_second: 169.934  <<< 8 X faster! >>>
+compute_time_seconds: 24.5
+rmse: 4.487
+r2: 0.934
+waic: 6468.946
+mean_rhat: 1.56
+mean_ess_bulk: 22.787
+mean_ess_tail: 33.589
+ess_per_second: 0.93
 
 ```
 
-These results have not converged (rhat is far from 1). But even still, there is some reasonably description of the spatial patterns, especially the second version. However, there is also lots of room for improvement:
+These results have not converged (rhat is far from 1). But even still, there is some reasonably description of the spatial patterns. However, there is also lots of room for improvement:
 
   - the sampler: MH() is a simple one that is used here for checking timings only. 
   - The model is still basic (separable time and space) with no covariates and no interactions.
 
-Extracting different components of the model internals takes a little more digging, but as these are Bayesian models, every aspect is completely available and adjustable. 
-
-However, we also are using optimizations that take advantage of the sparse nature of the neighbourhood adjacency matrix and the temporal autocorrelation.  
- 
+Extracting different components of the model internals takes a little more effort, but as these are Bayesian models, every aspect is completely available and adjustable. 
+  
 
 ### Simulated base data
 
@@ -299,7 +297,7 @@ Spatiotemporal Interactions in the discrete GMRF models (Classes I-IV):
 
 $$\mathbf{Q}_{\delta} = \mathbf{Q}_{time} \otimes \mathbf{Q}_{space}$$
 
-- Interaction Class Definitions
+- Interaction Class Definitions (`model_st`)
 
 *   **Class I (Unstructured):** $\mathbf{I} \otimes \mathbf{I}$
     *   *Reasoning:* Assumes interaction effects are independent across both space and time (IID noise).
@@ -309,6 +307,10 @@ $$\mathbf{Q}_{\delta} = \mathbf{Q}_{time} \otimes \mathbf{Q}_{space}$$
     *   *Reasoning:* Interaction effects are spatially correlated within each time slice, but independent over time.
 *   **Class IV (Fully-Structured):** $\mathbf{Q}_{tm} \otimes \mathbf{Q}_{sp}$
     *   *Reasoning:* Interactions are correlated in both dimensions. This is the most complex form, where a spatial pattern persists but evolves according to a temporal process (e.g., a Random Walk).
+
+There is also a class: "none" which ignores all interactions. This is useful for more complex space-time structures.
+
+In addition, for dynamic transport: advection, diffusion and advection_diffusion are also physical structure/contraints that can be used. 
 
 - Computational Implementation (The Cholesky Trick)
 
@@ -328,64 +330,118 @@ In the code, this is implemented as `reshape(L_sp' \ (L_tm' \ mat_int')', :)`, w
 
 For discrete *bstm*s, we must first discretize the spatial domain into "Areal Units" (AUs).   
 
-Any will do. But in *bstm*, the following are available. By default we will use the AVT method as it is most tuneable. 
+Any will do. But in *bstm*, the following are available (:avt is default). 
+
+The `assign_spatial_units` function is a tool for partitioning a study area into discrete spatial units based on point patterns, pre-defined boundaries, or regular lattices. This process is essential for creating structured spatial random effects in spatiotemporal models (e.g., CAR, BYM2).
+
+Available Partitioning Methods (`area_method`):
+
+| Method           | Description                         | Mathematical Assumption / Justification                                                                                                                                                                         |
+| :-----------------| :------------------------------------| :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `:cvt`           | **Centroidal Voronoi Tessellation** | Assumes the area should be divided into cells where each unit is the geometric centroid of its Voronoi region. Lloyd's algorithm iteratively minimizes the variance of the partition.                           |
+| `:kvt`           | **K-Means Voronoi Tessellation**    | Uses a weighted K-Means approach. It justifies boundaries based on point density rather than just geometry, ensuring units have a balanced number of observations.                                              |
+| `:qvt` / `:bvt`  | **Quadtree / Binary Split**         | Employs recursive spatial partitioning. Splits a parent region if it violates constraints (e.g., `max_points`). Best for handling extreme density gradients where some areas are sparse and others hyper-dense. |
+| `:hvt`           | **Hierarchical Voronoi**            | Combines K-Means seeding with Lloyd's refinement. It justifies unit placement by ensuring stable centroid positions that satisfy geometric and count constraints.                                               |
+| `:avt`           | **Agglomerative Voronoi**           | Starts with a high-resolution mesh and merges units. Justified for small datasets where preventing 'starved' units (zero observations) is a priority.                                                           |
+| `:lattice`       | **Regular Grid**                    | Discretizes space into uniform squares ($L \times L$). Assumes spatial stationarity across a regular grid, simplifying adjacency calculations to a Queen's contiguity check.                                    |
+| `:user_polygons` | **External Shapefiles**             | Uses provided `LibGEOS` polygons. Justified when political or administrative boundaries (e.g., census tracts) define the spatial process.                                                                       |
+
+
+
+**Geometric Clipping (`geom_hull`)**:
+
+When a `geom_hull` is provided, the function performs a spatial intersection: 
+$$ P_{clipped} = P_{tessellated} \cap H_{hull} $$
+This ensures that generated units do not extend into invalid areas (e.g., water bodies or outside the study region).
+
+**Adjacency and Graph Theory**:
+
+Connectivity is determined by a topological check. Two units $i$ and $j$ are adjacent if:
+1.  They share a boundary: `LibGEOS.touches(P_i, P_j) == true`.
+2.  They are within a numerical tolerance: `LibGEOS.intersects(buffer(P_i, 1e-7), P_j) == true`.
+
+**Justification for Adjacency Transformation:**
+
+The resulting `SimpleGraph` is used to construct the Graph Laplacian $\mathbf{Q}$ for Intrinsic Conditional Autoregressive (ICAR) models:
+$$ \mathbf{Q} = \mathbf{D} - \mathbf{W} $$
+where $\mathbf{D}$ is the degree matrix and $\mathbf{W}$ is the binary adjacency matrix.
+
+**Global Connectivity Constraint**:
+
+If the tessellation results in disjoint 'islands', the `ensure_connected!` utility adds edges between the nearest centroids of different components. This satisfies the mathematical assumption of a single connected component required for stable ICAR precision matrix inversion.
+
+
+#### Controlling paramters: assign_spatial_units()
+
+*   **`t_idx` and `u_idx`:** These indices link each observation to its respective time and seasonal unit, allowing for spatiotemporal modeling.
+*   **`target_units`:** The desired resolution of the spatial model. A higher number captures finer local variation but increases computational cost and risk of data sparsity.
+*   **`target_cv`:** A target coefficient of variation, often for the number of data points per areal unit, used to balance unit sizes.
+*   **`min_total_arealunits`, `max_total_arealunits`:** Constraints on the total number of areal units created.
+*   **`min_time_slices`:** Ensures each areal unit has a minimum number of time observations.
+*   **`buffer_dist`:** Used in methods like `:hvt` to define a buffer zone for identifying neighbors or influencing centroid placement.
+*   **`tolerance`:** Defines the convergence criteria for iterative methods (CVT/HVT). Stability is reached when the movement of centroids is negligible.
+*   **`min_points`, `max_points`:** Ensures that each spatial unit contains enough information for the likelihood to be 'identifiable'. Units failing this are merged or split depending on the method.
+*   **`min_area`, `max_area`:** Constraints on the geographic area of each areal unit.
 
 
 #### (Adaptive) Centroidal Voronoi Tessellation (CVT)
 
 CVT is a popular method designed for uniform statistical power. It uses Lloyd's algorithm to create a highly regular, "honeycomb" mesh. Data density is rarely uniform and so an Adaptive form of CVT uses Kernel Density Estimation (KDE) to migrate seeds toward density modes (peaks). This shrinks tiles in high-activity areas and stretches them in sparse areas, ensuring every unit is informative and minimizing Boundary Artifacts that occur when standard tiles split high-density clusters.
 
-Algorithm:
 
-1. **Intensity Mapping (KDE)**: A Kernel Density Estimation is performed across the spatial domain to create a continuous intensity surface $\lambda(x)$. This surface identifies regions of high and low data density.
-
-2. **Density-Weighted Seeding**: Instead of random or grid-based initialization, $k$ seed points are sampled from the domain with probabilities proportional to $\lambda(x)$. This ensures that more seeds are placed where data is abundant.
-
-3. **Lloyd Iteration**: The algorithm then enters the standard CVT refinement loop:
-   *   Construct Voronoi cells $V_i$ around seeds $s_i$.
-   *   Compute the new centroid $s_i'$ as the geometric center of $V_i$.
-   *   Optional: In *Weighted CVT*, $s_i'$ is the mass-center weighted by the underlying intensity $\rho(x)$.
-
-4. **Convergence**: Steps are repeated until the movement of seeds falls below a threshold $\epsilon$.
-
-
-Advantages:
+**Algorithm:** Lloyd's Algorithm
+1. **Initialization:** Generate $K$ initial seeds $\{c_1, ..., c_k\}$ (using K-means or random sampling).
+2. **Partitioning:** Construct the Voronoi cells $V_i$ such that $V_i = \{x \in \Omega \mid d(x, c_i) \le d(x, c_j) \forall j \}$.
+3. **Centroid Update:** For each cell, calculate the geometric centroid $c_i^* = \frac{1}{A} \iint_{V_i} (x, y) dA$.
+4. **Refinement:** Move $c_i \to c_i^*$.
+5. **Convergence:** Repeat until the L2-norm of the shift vector $\sum ||c_i - c_i^*||$ is less than `tolerance`.
+ 
+**Advantages:**
 
 *   **Information Balance**: Units in sparse areas are allowed to be larger, while units in dense areas are smaller, balancing the sample size per unit.
-
 *   **Rapid Convergence**: Starting with seeds already near the data mass significantly reduces the number of iterations required for the tessellation to stabilize.
-
 *   **Regularity**: Maintains the high geometric compactness of standard Voronoi cells, which minimizes the distance between observations and their assigned centroids.
+
+**Assumptions:**
+*   The desired areal units should be as compact and equitably sized as possible.
+*   The 'center' of each unit (its centroid) should coincide with the mean position of the points it contains.
+*   Often used when optimizing for uniform coverage or resource allocation.
+
 
 
 #### Binary Vector Tree (BVT)
 
 BVT is a recursive splitting method along the axis of maximum variance. It is the fastest approach, ideal for datasets with millions of points. The **KDE-Informed Binary Vector Tree (BVT)** is a high-speed hierarchical partitioning method. While standard BVT focuses strictly on variance-based splitting to balance point counts, the KDE-informed variant incorporates the underlying data intensity surface to ensure that partitions are not only balanced in count but also aligned with the statistical topology of the domain.
-
-Algorithm:
-1.  **Global Variance Analysis**: The algorithm starts with the entire point set and identifies the axis ($x$ or $y$) with the highest spatial variance.
-2.  **KDE-Weighted Splitting**: Instead of splitting exactly at the geometric median, the algorithm uses a Kernel Density Estimation (KDE) surface $\lambda(x)$ to find a 'statistical median'. The split point is chosen such that the integrated intensity (expected number of points) is equalized between the two resulting child nodes.
-3.  **Recursive Decomposition**: This process is applied recursively. At each step, the node splits along its major axis of variance until the `target_units` or the `min_pts` constraint is reached.
-4.  **Voronoi Rectification**: Once the tree structure is finalized, the centroids of the leaf nodes are used as seeds for a final Voronoi tessellation to ensure topological adjacency and a valid graph $W$ for GMRF models.
+ 
+**Algorithm:** Spatial Binary Tree
+1. **Evaluation:** Calculate the number of points $N_p$ in the current region $\Omega_{parent}$.
+2. **Decision:** If $N_p > \text{max\_points}$ and the split doesn't violate $\text{min\_area}$, divide the region.
+3. **Splitting Mechanics:** Split along the dimension with the highest variance (Principal Component split).
+4. **Pruning:** Discard child regions that contain fewer than `min_points` or have zero distinct `time_slices`.
+5. **Termination:** Continue until all regions satisfy constraints or `max_total_arealunits` is reached.
 
 Advantages:
 *   **Computational Efficiency**: BVT is significantly faster than iterative methods like CVT (Lloyd's algorithm), making it the preferred choice for massive datasets.
 *   **Perfect Count Balancing**: Because it is based on a tree structure, it is highly effective at creating units with nearly identical sample sizes, which stabilizes the estimation of local variance parameters.
 *   **Scalability**: The recursive nature allows for rapid partitioning of millions of points into thousands of units in logarithmic time $O(N \log N)$.
-* 
+
+**Assumptions:**
+*   The primary goal is to create Voronoi cells that are approximately equal in terms of a specific metric (e.g., number of points, area, population).
+*   Ensuring an equitable distribution of data or resources among units is critical.
+
+
 
 #### Quadrant Voronoi Tessellation (QVT)
 
 QVT is a quadtree-like decomposition that excels at capturing multi-scale spatial clusters and density transitions.
 The **KDE-Informed Quadrant Voronoi Tessellation (QVT)** is a multi-scale hierarchical partitioning method. It combines the structured efficiency of a quadtree decomposition with the statistical sensitivity of Kernel Density Estimation (KDE) to ensure that the recursive subdivision reflects the underlying data topology.
-
-Algorithm:
-1.  **Global Intensity Analysis**: The domain is treated as a single root node. A KDE surface $\lambda(x)$ is computed for the entire domain to identify clusters and voids.
-2.  **KDE-Weighted Quad-Splitting**: Instead of splitting the spatial bounding box at its geometric center, the algorithm calculates a 'statistical center of mass' based on the integrated intensity. The node is then divided into four quadrants relative to this point.
-3.  **Recursive Evaluation**: For each resulting quadrant, the algorithm evaluates two criteria:
-    *   **Information Density**: Does the quadrant contain the required `min_pts` and `min_ts` (time slices)?
-    *   **Heterogeneity**: Is the variance of the KDE surface within the quadrant high enough to justify further subdivision?
-4.  **Voronoi Rectification**: Once the recursive splitting stops (either due to reaching `max_units` or failing constraints), the centroids of the leaf quadrants are used as seeds for a final Voronoi tessellation to ensure valid GMRF adjacency properties.
+ 
+**Algorithm:** Spatial Quadtree
+1. **Evaluation:** Calculate the number of points $N_p$ in the current region $\Omega_{parent}$.
+2. **Decision:** If $N_p > \text{max\_points}$ and the split doesn't violate $\text{min\_area}$, divide the region.
+3. **Splitting Mechanics:** Split at the median $(x, y)$ coordinates into four quadrants.
+4. **Pruning:** Discard child regions that contain fewer than `min_points` or have zero distinct `time_slices`.
+5. **Termination:** Continue until all regions satisfy constraints or `max_total_arealunits` is reached.
 
 Advantages:
 *   **Multi-Scale Sensitivity**: QVT is exceptionally good at automatically adjusting its resolution, creating fine-grained units in high-density urban areas and coarse units in sparse rural areas.
@@ -393,22 +449,132 @@ Advantages:
 *   **Void Handling**: By guiding splits via the KDE surface, it naturally avoids creating 'empty' units that can lead to singular precision matrices in Bayesian samplers.
 
 
+**Assumptions:**
+*   Spatial data exhibits varying densities, and an adaptive resolution is desired.
+*   Computational efficiency for spatial queries and hierarchical indexing is important.
+*   Combines the advantages of quadtrees (hierarchical decomposition) with Voronoi diagrams (proximity-based partitioning).
+
+
+
 #### Agglomerative Voronoi Tessellation (AVT)
 
 AVT is an iterative merging approach that balances multiple constraints upon the data that iteratively aggregates small areal units until stopping rules are met. It also begins with KDE to identify initial conditions. The **Agglomerative Voronoi Tessellation (AVT)** is a data-driven spatial partitioning strategy designed specifically to solve the 'Data Starvation' problem in Bayesian inference. Unlike recursive splitting methods (BVT/QVT) which start from a global domain, AVT operates from the 'bottom-up'.
+  
+**Assumptions:**
 
-Algorithm:
-1. **Over-Partitioning**: The algorithm begins by generating a large number of seed points (usually via KDE Seeding) to create an initial Voronoi mesh that is significantly denser than the final target.
-2. **Constraint Evaluation**: For each unit in the mesh, the algorithm evaluates statistical constraints, primarily `min_pts` (minimum observations) and `min_ts` (minimum time slices covered).
-3. **Iterative Dissolution**: Units that fail to meet these constraints ('violators') are identified. The algorithm iteratively dissolves the boundary between a violator and its nearest neighbor. 
-4. **Centroid Re-weighting**: Upon merging, the new centroid is calculated as the intensity-weighted mean of the merged units, ensuring the partition center migrates toward the data mass.
-5. **Termination**: The process continues until every unit satisfies the constraints or the `min_total_units` threshold is reached.
+*   The density or importance of data points varies significantly across the study area.
+*   Finer resolution is needed in high-density areas, while coarser resolution is acceptable in low-density areas.
+*   Similar to `:hvt` but often with more sophisticated adaptation criteria.
 
-Advantages:
+**Algorithm:** Hierarchical Clustering with Voronoi Constraints
+
+1. **Initialization:** Start with a dense set of units (over-partitioned).
+2. **Audit:** Identify 'starved' units that violate `min_points` or `min_time_slices`.
+3. **Neighbor Selection:** For each violating unit $i$, find the adjacent unit $j \in \text{neighbors}(i)$ that minimizes the change in the coefficient of variation ($CV$) of point counts.
+4. **Merge:** Redefine the new centroid $c_{new} = \frac{N_i c_i + N_j c_j}{N_i + N_j}$ and dissolve the shared boundary.
+5. **Termination:** Stop when all units satisfy the minimum constraints. 
+
+**Advantages:**
+
 * **Guaranteed Identifiability**: By enforcing `min_pts`, AVT ensures there is enough local information to identify complex latent parameters like the temporal correlation $\rho$.
 * **Topological Integrity**: Because it is based on Voronoi geometry, it maintains a valid adjacency graph (W) required for GMRF precision matrices.
 * **Robustness**: Ideal for sparse or irregularly distributed point sets where standard grid-based methods would produce 'empty' units that crash the Bayesian sampler.
+  
 
+#### Hierarchical Voronoi Tessellation (HVT)
+
+**Philosophy:** Geometry-driven partitioning with data-aware splitting. It seeks to create 'well-behaved' (equilateral/hexagonal-like) polygons to ensure stable Queen's contiguity graphs.
+
+**The Algorithm:**
+1.  **Objective Function:** Minimize the variance of the geometric distribution (quantization error) over the continuous study area $\Omega$:
+    $$\mathcal{H} = \sum_{i=1}^{k} \int_{V_i} \rho(x) ||x - c_i||^2 dx$$
+    where $\rho(x)$ is typically uniform.
+2.  **Lloyd’s Update (The Distinguisher):** Unlike KVT, the centroid is moved to the **geometric center of the clipped polygon**:
+    $$c_i^{(t+1)} = \text{centroid}(\text{Polygon}_i \cap \text{Hull})$$
+3.  **Adaptive Splitting (The Hierarchy):** After geometric convergence, each unit is audited against a density threshold (`max_points`). If a unit violates the threshold:
+    - It is split into two or more sub-units.
+    - The system re-runs Lloyd's algorithm locally to re-stabilize the new centroids.
+4.  **Constraint Enforcement:** It explicitly checks for `min_area` to prevent 'sliver' polygons which can create unstable edges in the adjacency matrix $\mathbf{W}$.
+5.  **Result:** A more uniform spatial grid than KVT, but one that adaptively increases resolution only where geometrically and statistically necessary.
+
+**Assumptions:**
+*   Spatial data exhibits clustering or non-uniform density.
+*   The objective is to create roughly balanced areal units in terms of number of points or other metrics, while preserving spatial contiguity.
+*   Distance is a key factor in defining neighborhood and unit boundaries.
+ 
+
+
+#### Regular Grid (grid)
+
+**Assumptions:**
+*   Spatial effects are relatively uniform across the study area.
+*   A simple, regular partitioning is sufficient for the analysis.
+*   Computational efficiency is a priority, as grid-based operations are often faster.
+
+**Algorithm:**
+1.  **Bounding Box:** Determine the minimum and maximum coordinates (bounding box) of the entire spatial dataset.
+2.  **Grid Definition:** Divide the bounding box into a regular grid of cells (e.g., squares or hexagons) of a predefined size or number of rows/columns.
+3.  **Point Assignment:** Assign each data point to the grid cell it falls within.
+4.  **Areal Unit Creation:** Each grid cell (or a collection of adjacent cells, if further aggregation is desired) forms an areal unit.
+
+
+#### K-Means based Voronoi Tesselation (KVT)
+
+**Philosophy:** Data-driven partitioning. It treats the spatial units as clusters of observations, ensuring each unit has sufficient data for robust parameter estimation.
+
+**The Algorithm:**
+1.  **Objective Function:** Minimize the Within-Cluster Sum of Squares (WCSS):
+    $$J = \sum_{i=1}^{k} \sum_{x \in S_i} ||x - \mu_i||^2$$
+    where $x$ are the observed point coordinates and $\mu_i$ is the mean of points in cluster $S_i$.
+2.  **Assignment:** Each observation point is assigned to the nearest current centroid.
+3.  **Update Step (The Distinguisher):** The new centroid is calculated as the **arithmetic mean of the observations** assigned to that unit:
+    $$c_{i}^{(t+1)} = \frac{1}{|S_i^{(t)}|} \sum_{x_j \in S_i^{(t)}} x_j$$
+4.  **Damping:** A damping factor $\eta$ is often applied to prevent chaotic boundary shifts in sparse areas: $c_{new} = (1-\eta)c_{old} + \eta c_{mean}$.
+5.  **Result:** Areas with high point density receive more (and smaller) spatial units, while sparse areas are aggregated into larger units. This naturally prevents 'data starvation' in the resulting ICAR model.
+
+
+**Assumptions:**
+*   k-means clusters are interpreted as initial Voronoi cells.
+*   Areal units can be defined by clusters of points that are geometrically close to each other.
+*   The number of clusters (areal units) is known or can be estimated beforehand.
+*   The clusters are expected to be roughly spherical and of similar size.
+
+ 
+
+####  Predefined Areal Units 
+
+**Assumptions:**
+*   A set of existing, well-defined administrative or ecological boundaries (e.g., counties, census tracts, watersheds) are appropriate for the analysis.
+*   The data points can be accurately assigned to these predefined units.
+
+**Algorithm:**
+1.  **Input Units:** The method takes a set of pre-existing polygon geometries (e.g., shapefiles) representing the areal units.
+2.  **Spatial Join:** Each data point is spatially joined (e.g., using point-in-polygon test) to determine which predefined areal unit it belongs to.
+3.  **W Matrix Construction:** The adjacency matrix `W` is constructed based on the contiguity of these predefined units (e.g., queen contiguity or rook contiguity).
+
+If using proprietary shapefile formats, you can use something like the following to read in the shapefile:
+
+```{julia}
+import Shapefile  << --- install this if you need it
+import GeoInterface
+import LibGEOS
+
+fn = "filename of shapefile"
+
+plygn = load_shapefile_to_libgeos(fn)
+```
+
+
+####  Force-Directed Layout (Inferred Adjacency)
+
+This was used for the Scottish Lip cancer data. It is a means to quickly assess geographical position when we do not have coordinates but only adjacency information. Its current forms simplistic and so should be refined with constraints if used for anything serious. 
+
+**Algorithm:** Fruchterman-Reingold (Simplified)
+
+1. **Repulsion:** All nodes exert an inverse-square force to prevent overlap.
+2. **Attraction:** Nodes connected in the adjacency matrix $W$ exert a linear spring force $F = k(d - d_0)$.
+3. **Update:** Shift centroids $c_i \to c_i + \eta \sum F_{total}$.
+4. **Justification:** This creates a planar representation of a non-spatial graph, allowing Voronoi tessellation to be applied back to purely topological data.
 
 
 
@@ -417,6 +583,8 @@ Advantages:
 Using our basic spatiotemporal data, let us try to represent them in a discrete manner across space. This is a necessary step if we wish to use the more speedy discrete models. Depending upon the constraints chosen, the spatial partitioning will change. Here, there is some subjectivity in the choice of constraints. The primary one to pay attention is: do we have enough data to represent spatial and  temporal processes. The answer to this depends upon the homogeneity/variability across space and time. In our case, we would like at least 5 time slices represented in each cell and enough total data points in each cell. Stopping conditions are based upon range of allowable total areal units, range of surface areas, and convergence of mean and coefficient of variation of number of points per cell. Adding more is simple as these are simple functions. See [spatial_partitioning_functions.jl](src/spatial_partitioning_functions.jl) for more details. 
 
 
+Here is a simple comparison of the methods using random data:
+
 ```{julia} 
 
 # (; s_coord_tuple  ) = data  # this is a simple way to copy objects into the Main environment
@@ -424,15 +592,15 @@ Using our basic spatiotemporal data, let us try to represent them in a discrete 
 s_N = 100  # spatial locations
 t_N = 15  # time slices ("years")
  
-modinputs = generate_sim_data(s_N, t_N; rndseed=42);
+inp_sim = generate_sim_data(s_N, t_N; rndseed=42);
 
 # time discretization
-tu = assign_time_units(modinputs.t_coord;  method="regular", t_N=modinputs.t_N, u_N=modinputs.u_N)  # t_idx, t0, t1, tn
+tu = assign_time_units(inp_sim.t_coord;  method="regular", t_N=inp_sim.t_N, u_N=inp_sim.u_N)  # t_idx, t0, t1, tn
 
 # space discretizatio
 Random.seed!(42) # Set a seed for reproducibility.
 
-ntot = size(modinputs.s_coord_tuple, 1) 
+ntot = size(inp_sim.s_coord_tuple, 1) 
 
 min_time_slices = 5
 target_density = 5 # number per areal unit 
@@ -457,7 +625,7 @@ for m in test_configs
     println("Testing method: $m")
     local au
     try
-        au = assign_spatial_units( modinputs.s_coord_tuple, m;
+        au = assign_spatial_units( inp_sim.s_coord_tuple, m;
             t_idx = tu.t_idx,
             target_units = target_units,
             target_cv=target_cv,
@@ -496,43 +664,44 @@ display(DataFrame(results))
 
 display(Plots.plot(plots..., layout=(3, 2), size=(600, 800)))
  
+
 ```
 
-Conclusion: All methods seem similar and reasonable, but AVT provides most control. Note that if the CV approaches 1, it represents a Poisson-like spatial distribution. Higher means clustered and lower means homogenous. We want some structure/clusters but not so much that we have unreliable data and not so little that everything is the same. 
+Conclusion: All methods seem similar and reasonable. Having fewer areal units can make modeling faster. Buit that may also mean too much homogenization of the pattern, losing the ability to discriminate "hot" and "cold" spots. Note that if the CV approaches 1, it represents a Poisson-like spatial distribution. Higher than 1 is considered clustered and lower than 1 means homogenous. We want some structure/clusters but not so much that we have unreliable data and not so little that everything is the same. 
 
+The final choice of partitioning method depends heavily on the nature of the data, the underlying spatial processes, and the research questions being addressed.
+ 
  
 ## Back to modelling
 
-In contrast, when a naive model is used (below), inversion of the full/dense spatial and temporal covariance matrices is required at a cost of $O(n^3)$ operations. Total compute time, using the same settings and number of samples, increases from 0.5 seconds to 96.2 seconds. This naive approach is almost the same as "Kriging" solutions (here a squared exponential covariance function is used for both space and time). However, in Kriging, Least-squares assumptions are used to speed up computations. This simple model uses a Poisson form with temporal autocorrelation. And, as can be seen the model code is relatively short and straight-forward, closely mimicking the mathematical relationships. 
+When a naive model is used, inversion of the full/dense spatial and temporal covariance matrices is required at a cost of $O(n^3)$ operations. Total compute time, using the same settings and number of samples, increases from ~ 1 second to 143 seconds. This naive approach is essentially the same as "Kriging" solutions (here a squared exponential covariance function is used for space). However, in Kriging, Least-squares assumptions are used to speed up computations. This simple model uses a Gaussian form. And, as can be seen the model code is relatively short and straight-forward, closely mimicking the mathematical relationships. 
 
-Notice that the following is not a completely fair evaluation as there is a space-time interaction effect in the dense model, whereas in the sparse version, there are only the main effects of space and time with no "interaction-effect." A better speed comparison is to examine the effective number of samples per second ("ess_per_second") which ultimately will constrain total computational time. The effective sampling speed drops from 22 to about 0.156. The target total ESS will vary with application and data density and information content, but we want a value that is as high as possible in order have reasonably reliable descriptions of the the full posteriors.   
+The effective number of samples per second ("ess_per_second") which ultimately will constrain total computational time is useful as a benchmark. The effective sampling speed drops from 22 to about 0.2. The target total ESS will vary with application and data density and information content, but we want a value that is as high as possible in order have reasonably reliable descriptions of the the full posteriors.   
 
 
 ```{julia}
-#| label: example_gp_gaussian 
+#| label: example_kriging_simple 
 
-# Dense Kernel Matrix Separable Spatiotemporal GP
+# Dense Kernel Matrix Separable Spatiotemporal GP 
+    
+s_N = 100  # spatial locations
+t_N = 15  # time slices ("years")
 
-# takes a lot of RAM and so reduce problem size:
-s_N = 20  # spatial locations
-t_N = 5  # time slices ("years")
- 
 data = generate_sim_data(s_N, t_N; rndseed=42);
 
-
 # time discretization
-tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N)  ;
+tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N);
 
 # space discretization
-au_method = :hvt   # reasonably simple
-au = assign_spatial_units( data.s_coord_tuple, au_method;
+au_method = :hvt
+au = assign_spatial_units(data.s_coord_tuple, au_method;
     t_idx = tu.t_idx,
     target_units = 50,
     target_cv=1.0,
     min_total_arealunits=5,
     max_total_arealunits=100,
     min_time_slices = 5,
-    buffer_dist=0.8,  # fraction of mean distance between points
+    buffer_dist=0.8,
     tolerance=0.1,
     min_points=5,
     max_points=50,
@@ -543,54 +712,59 @@ met = calculate_metrics(au)
 
 plot_spatial_graph( au; plot_title="Method: $au_method", domain_boundary=au.hull_coords)
 
-
-# prepare model inputs  
-modinputs = bstm_options( 
-  y_obs = data.y_obs,         # y-value, counts of people with lip cancer
-  s_coord_tuple = data.s_coord_tuple, # Explicitly pass coordinate tuples to fix the MethodError
-  s_idx = au.assignments ,  # space index
-  t_idx = tu.t_idx,  # time index
-  log_offset = zeros(length(data.y_obs)), # offsets, population size on log-scale
-  W = au.W,  # matrix adjacency,
-  model_arch ="univariate",
+# prepare model inputs
+inp_krig = bstm_options(
+  y_obs = data.y_obs,
+  s_coord = data.s_coord,
+  t_coord = data.t_coord,
+  s_idx = au.assignments,
+  t_idx = tu.t_idx,
+  u_N = s_N, 
+  log_offset = zeros(length(data.y_obs)),
+  W = au.W,
+  model_arch = "example",  # Pass the struct instance, not a string
   model_family = "gaussian",
-  model_space = "denseGP",  # <dense gp>
+  model_space = "kriging_simple",
   model_time = "none",
-  model_st = 0,  # no space-time interactions (main effects only)
-  s_coord_unique = RowVecs(reduce(hcat, [collect(p) for p in au.centroids])'),
-  t_coord_unique = RowVecs(hcat(unique(tu.t_idx)...)'),
-  use_zi = false  
+  model_st = "none",  # ~ each year is treated separately
+  model_season = "none",
+  model_cov = "none",
+  N_cat = 0,
+  fixed_N = 0,
+  use_zi = false
 );
  
-
+m = example_kriging_simple(inp_krig);  # note this model has probleme with Positive Definateness ... 
+   
 Random.seed!(42) # Set a seed for reproducibility
 
-m = example_gp_gaussian(modinputs); # Turing model object
-chn = sample(m, MH(), 100; num_warmup=50 )  ;
-res = model_results_comprehensive(m, chn, modinputs, au);  # reconstruct method required ... 
 
-showparams( res.summarystats )
+os, inits = get_optimal_sampler(m; n_samples_adaptation=100) 
+
+# note this is really slow. Do not use too many samples .. just testing to show that it is slow..
+chn = sample(m, os, 10; initial_params=inits, progress=true, drop_warmup=true ) ; 
+
+res = model_results_comprehensive(m, chn, inp_krig, au);  
+ 
   
 ```    
 
 ```
-modelname: example_gp_gaussian
-compute_time_seconds: 96.2
-rmse: 6.394
-r2: 0.565
-waic: 3714.362
-mean_rhat: 1.548
-mean_ess_bulk: 12.364
-mean_ess_tail: 10.722
-ess_per_second: 0.129
-
-     param    mean     std    mcse  ess_bulk  ess_tail    rhat      q5     q50     q95                                │
-│   sigma_y  0.3308  0.0727  0.0224   10.5378       NaN  1.5830  0.2155  0.3781  0.3781                                │
-│   sigma_f  0.5614  0.0603  0.0181   13.1811       NaN  1.5830  0.5255  0.5255  0.6577                                │
-│      ls_s  2.7490  0.2658  0.0687   11.6511       NaN  1.5345  2.5046  2.8916  2.8916                                │
-│      ls_t  6.7584  1.2076  0.3695   10.5378       NaN  1.5830  4.8197  7.5158  7.5158                                │
-                         │
-
+modelname: example_kriging_simple
+modelarch: example
+modelspace: kriging_simple
+modeltime: none
+modelseason: none
+modelspacetime: III
+modelcov: none
+compute_time_seconds: 143.8
+rmse: 90.409
+r2: 0.0
+waic: 9.6342614716788e10
+mean_rhat: 1.088
+mean_ess_bulk: 26.817
+mean_ess_tail: 24.686
+ess_per_second: 0.186
 
 ```
 
@@ -609,9 +783,9 @@ ess_per_second: 0.129
 *   Problem: very slow, really slow
 *   Advantage: does not use least-squares
 
-The other purpose of the above example was to show that the workflow is simple, once the model form has been chosen. The model structure is important and where the time and resources should be spent: deliberating utility, rather than trying to debug,implement and run.
+The other purpose of the above example was to show that the workflow is simple, once the model form has been chosen. The model structure is important and where the time and resources should be spent: deliberating utility, rather than trying to debug, implement and run.
 
-Note: Though both models did not converge, the WAIC seems improves quite a bit with dense model. However, as neither has converged, that assessment is premature. 
+Note: The sampling has not converged so any deep assessment is premature. 
 
 
 #### Optimization-based approaches
@@ -624,7 +798,7 @@ Though MCMC sampling is our gold-standard, we also have other optimization-based
 
 - Variational Inference is also an optimization method. However, it approaches the problem using the ELBO estimator (log-likelihood aka "evidence" of the observed data, \(\log p(x)\)). In complex models, calculating the true posterior distribution \(p(z|x)\) is impossible (intractable). Instead, we choose a simpler, flexible distribution \(q(z)\) to approximate it. Maximizing the ELBO is equivalent to minimizing the difference (Kullback-Leibler divergence) between \(q(z)\) and the true posterior. The ELBO allows us to use gradient-based optimization methods (like Stochastic Gradient Descent) to solve Bayesian inference problems. In principle it is closest to MCMC and able to describe the posterior distribution reasonably well. 
 
-It is, similar to INLA except that in the latter, optimization is also used but with a Laplace Approximation which comes with the assumption/constraint that the posterior marginals can be accurately approximated by a Taylor expansion. VI has no limits to distributional constraints (INLA assumes Gaussian), and requires that the likelihood is smooth enough for optimization (however, non-differentiable optimizers exist too...).  
+It is, similar to INLA in that optimization is also used but INLA uses a Laplace Approximation which comes with the assumption/constraint that the posterior marginals can be accurately approximated by a Taylor-series expansion. VI has no limits to distributional constraints (INLA internally assumes Gaussian), and requires that the likelihood is smooth enough for optimization. Note that optimizers for non-differentiable surfaces exist too...  
  
 All three methods are accessible with the same Turing/Julia model (but not Laplace Approximation, to my knowledge, though some Julia projects seem to have used LA). As a bonus you also get Automatic Differentiation for free and can use the same Turing model. 
 
@@ -638,31 +812,24 @@ The following code snippet shows how to run them. One can even use the solution 
 # using Optim, AdvancedVI, Turing
  
 # ML -- Sparse version: fast (seconds) but does not converge
-m = example_bym2_ar1_poisson(modinputs) # Turing model object
+m = example_bym2_ar1_poisson(inp_scot) # Turing model object
 res_opt = maximum_likelihood(m, LBFGS() )  # many optimizers available
 res_opt.optim_result.retcode    
 res_opt.params 
 
-res = model_results_comprehensive(m, res_opt, modinputs, au_scot, n_samples=100);
-
-
-# ML -- Dense version: slow, really slow, so slow that you do not want to run this:
-m = example_gp_gaussian(modinputs) # Turing model object
-
-# res_opt = maximum_likelihood(m, LBFGS() )  # run only if you have a **lot** of time
-res_opt.optim_result.retcode    
-res_opt.params 
-
+res = model_results_comprehensive(m, res_opt, inp_scot, au_scot, n_samples=100);
+ 
+ 
 
 
 # MAP - does not converge .. try other optimizers
-res_map = maximum_a_posteriori( m, NelderMead() )
-res_map.optim_result.retcode   
+res_map = maximum_a_posteriori( m, LBFGS() )
+res_map.optim_result.retcode   # 
 res_map.params
-res = model_results_comprehensive(m, res_map, modinputs, au_scot);
+res = model_results_comprehensive(m, res_map, inp_scot, au_scot);
 
 
-# Variational Inference: slower .. (about 60 minutes; uses ~ 30 GB RAM)
+# Variational Inference: slower .. (also slow: about 60 minutes; uses ~ 30 GB RAM)
 samples_per_step = 10
 max_iters = 1000
 n_samples = 1000
@@ -672,13 +839,13 @@ n_samples = 1000
 # q_init = q_fullrank_gaussian
 q_init = q_fullrank_gaussian     
 
-chn_vi = vi(m, q_init, max_iters, adtype=AutoForwardDiff(), show_progress=true) #;, optimizer=Flux.ADAM(1e-1));
+chn_vi = vi(m, q_init, max_iters, adtype=AutoForwardDiff(), show_progress=true; optimizer=LBFGS() ) #;, optimizer=Flux.ADAM(1e-1));
    
 # Convert to reconstruct-compatible format
 # chn = convert_advi_to_reconstruct_format(chn_vi, m, n_samples)
 
 # Reconstruct and Visualize
-res = model_results_comprehensive(m, chn_vi, modinputs, au_scot);
+res = model_results_comprehensive(m, chn_vi, inp_scot, au_scot);
 
 pairs(res.metrics)
 
@@ -692,7 +859,7 @@ pairs(res.metrics)
 
 ``` 
 
-Any of these point estimates can be used as starting points for MCMC runs--if you trust the point estimates to have converged to a correct solution, otherwise you would be pointing MCMC runs to start from a pathological positon. 
+Any of these point estimates can be used as starting points for further MCMC runs--if you trust the point estimates to have converged to a correct solution, and not from a pathological position. 
 
 ### Reconstruction of effects and predictions 
  
@@ -829,7 +996,7 @@ PS = create_prediction_surface(basis, observations)
  
  
 # Populate standard input sets per response family
-modinputs_reference = bstm_options(
+inp_reference = bstm_options(
     y_obs = data.y_obs, 
     y_coords_st = hcat( data.s_coord_tuple, data.t_coord ),  # only for some methods: deepGP, etc
     s_coord = data.s_coord,  
@@ -846,42 +1013,43 @@ modinputs_reference = bstm_options(
     model_space = "besag",
     model_time = "ar1",
     model_cov = "rw2", 
-    model_st = 1  # 0 (no interaction), 1 (iid), 2(time dominant), 3 (space dominant), 4 (spacetime inseparable) .. Knorr & Held classifications
+    model_st = "I"  # 0 (no interaction), I (iid), II (time dominant), III (space dominant), IV (spacetime inseparable) .. Knorr & Held classifications
 );
-  
 
-# Specialized input sets for family-specific response variables
-modinputs_gaussian = bstm_options( modinputs_reference, 
+```
+
+Note when using different models, their inputs (Dict Tuple) can be adjusted or values reset using a call such as follows. Directly altering the contents is not permitted by Julia, althouhg one can use the "merge" function to do this (see the "bstm_options" code):   
+
+```{julia}
+inp_gaussian = bstm_options( inp_reference, 
     y_obs = data.y_obs, 
     model_family="gaussian", 
     model_time="ar1" ) ;
   
-modinputs_gaussian_rff = bstm_options( modinputs_reference,
+inp_gaussian_rff = bstm_options( inp_reference,
     y_obs = data.y_counts, 
     model_family="poisson", 
     model_time="rff" ) ; 
 
-modinputs_count = bstm_options( modinputs_reference,
+inp_count = bstm_options( inp_reference,
     y_obs = data.y_counts, 
     model_family="poisson", 
     model_time="ar1" ) ;
 
-modinputs_binomial = bstm_options( modinputs_reference,
+inp_binomial = bstm_options( inp_reference,
     y_obs=data.y_binary, 
     model_family="binomial", 
     model_time="ar1" ) ;
 
-modinputs_negbin = bstm_options( modinputs_reference,
+inp_negbin = bstm_options( inp_reference,
     y_obs=data.y_binary, 
     model_family="negbin", 
     model_time="ar1" ) ;
 
-modinputs_lognormal = bstm_options( modinputs_reference,
+inp_lognormal = bstm_options( inp_reference,
     y_obs =exp.(data.y_obs), 
     model_family="lognormal",
     model_time="ar1" ) ;
-
-  
     
 ```
 
@@ -923,10 +1091,14 @@ The core idea is to build complex spatiotemporal models by combining different '
     -   **IID:** Independent and identically distributed temporal effects.
 
 4.  **Space-Time Interaction (`st_eta`):** Captures how spatial patterns change over time or how temporal trends vary across space. Implements Knorr-Held (2000) interaction types:
-    -   **Type I:** IID interaction (unstructured).
-    -   **Type II:** Structured temporal trend varying independently across space.
-    -   **Type III:** Structured spatial pattern varying independently across time.
-    -   **Type IV:** Fully inseparable spatiotemporal structure (structured both spatially and temporally).
+    -   **I:** IID interaction (unstructured).
+    -   **II:** Structured temporal trend varying independently across space.
+    -   **III:** Structured spatial pattern varying independently across time.
+    -   **IV:** Fully inseparable spatiotemporal structure (structured both spatially and temporally).
+    -   **none:** Ignore
+    -   **advection** Space-time evolution with directed movement between adjacent areal units (using the Laplacian)
+    -   **diffusion**  Space-time evolution with diffusion between adjacent areal units (using the Laplacian)
+    -   **advection_diffusion**  Space-time evolution with directed movement and diffusion between adjacent areal units (using the Laplacian)
 
 5.  **Covariate Smoothing (`c_beta`):** Handles effects of covariates, including:
     -   **RW2/AR1/GP/Harmonic/IID:** Smoothing for categorical or discretized continuous covariates.
@@ -1019,11 +1191,11 @@ Each component $s_{\text{eta}}$, $t_{\text{eta}}$, $st_{\text{inter}}$, $c_{\tex
     -   Scale parameter for space-time interactions.
 
 -   **Specific `model_st` implementations (Knorr-Held types):**
-    -   **`0` (None):** $st_{\text{inter}} = \text{zeros}(M.N_{\text{areas}}, M.N_{\text{time}})$.
-    -   **`1` (Type I - IID):** $st_{\text{raw}} \sim \text{MvNormal}(\mathbf{0}, I)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
-    -   **`2` (Type II - Temporal Structure):** $st_Q2 = \text{kron}(I(M.N_{\text{areas}}), t_Q)$, $st_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, st_Q2)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
-    -   **`3` (Type III - Spatial Structure):** $st_Q3 = \text{kron}(s_Q, I(M.N_{\text{time}}))$, $st_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, st_Q3)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
-    -   **`4` (Type IV - Inseparable):** $st_Q4 = \text{kron}(s_Q, t_Q)$, $st_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, st_Q4)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
+    -   **`none` (None):** $st_{\text{inter}} = \text{zeros}(M.N_{\text{areas}}, M.N_{\text{time}})$.
+    -   **`I` (Type I - IID):** $st_{\text{raw}} \sim \text{MvNormal}(\mathbf{0}, I)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
+    -   **`II` (Type II - Temporal Structure):** $st_Q2 = \text{kron}(I(M.N_{\text{areas}}), t_Q)$, $st_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, st_Q2)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
+    -   **`III` (Type III - Spatial Structure):** $st_Q3 = \text{kron}(s_Q, I(M.N_{\text{time}}))$, $st_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, st_Q3)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
+    -   **`IV` (Type IV - Inseparable):** $st_Q4 = \text{kron}(s_Q, t_Q)$, $st_{\text{raw}} \sim \text{MvNormalCanon}(\mathbf{0}, st_Q4)$, $st_{\text{inter}} = \text{reshape}(st_{\text{raw}} \cdot st_{\text{sigma}}, M.N_{\text{areas}}, M.N_{\text{time}})$.
 
 **6. Covariate Smoothing (`c_beta`):**
 
@@ -1049,7 +1221,7 @@ $$\text{eta}_i = M.log\_offset_i + s_{\text{eta}}[M.s_{\text{idx}}[i]] + t_{\tex
 -   If `M.N_cov > 0`: `eta .+= c_eta[M.cov_indices[:, 1]]`
 -   If `M.model_season != "none"`: `eta .+= u_eta[M.u_idx]`
 -   If `M.model_space == "svc" && M.N_fixed > 0`: `eta .+= (svc_raw[M.s_idx] .* svc_sigma) .* M.fixed[:, k]` for each fixed effect `k`.
--   If `M.model_st > 0`: `eta[i] += st_eta[M.s_idx[i], M.t_idx[i]]` for each observation `i`.
+-   If `M.model_st !="none"`: `eta[i] += st_eta[M.s_idx[i], M.t_idx[i]]` for each observation `i`.
 
 **9. Likelihood:**
 
@@ -1295,13 +1467,13 @@ These components capture standard spatio-temporal variation independent of the m
 
 This component captures non-additive interactions between space and time, following Knorr-Held types.
 
-*   **`st_sigma` (Interaction Scale):** If `M.model_st > 0`, `st_sigma ~ Exponential(0.5)`. Otherwise, `st_sigma ~ Dirac(0.0)`.
+*   **`st_sigma` (Interaction Scale):** If `M.model_st != "none"`, `st_sigma ~ Exponential(0.5)`. Otherwise, `st_sigma ~ Dirac(0.0)`.
 *   **Conditional Logic for `st_eta`:**
-    *   **`M.model_st == 0` (No Interaction):** `st_eta = zeros(T, M.N_areas, M.t_N)`.
-    *   **`M.model_st == 1` (Type I: IID Interaction):** `st_raw ~ MvNormal(zeros(M.N_areas * M.t_N), I)`. Samples IID interaction effects, then reshapes and scales them.
-    *   **`M.model_st == 2` (Type II: Temporal Structure):** `st_Q2 = Symmetric(kron(I(M.N_areas), t_Q) )`. Precision for each area having an independent structured temporal trend, using the previously derived `t_Q`.
-    *   **`M.model_st == 3` (Type III: Spatial Structure):** `st_Q3 = Symmetric(kron(M.s_Q, I(M.t_N)) )`. Precision for each time point having an independent structured spatial field, using `M.s_Q`.
-    *   **`M.model_st == 4` (Type IV: Inseparable):** `st_Q4 = Symmetric(kron(M.s_Q, t_Q) )`. Fully inseparable spatiotemporal structure, using the Kronecker product of `M.s_Q` and `t_Q`.
+    *   **`M.model_st == "none"` (No Interaction):** `st_eta = zeros(T, M.N_areas, M.t_N)`.
+    *   **`M.model_st == "I"` (Type I: IID Interaction):** `st_raw ~ MvNormal(zeros(M.N_areas * M.t_N), I)`. Samples IID interaction effects, then reshapes and scales them.
+    *   **`M.model_st == "II"` (Type II: Temporal Structure):** `st_Q2 = Symmetric(kron(I(M.N_areas), t_Q) )`. Precision for each area having an independent structured temporal trend, using the previously derived `t_Q`.
+    *   **`M.model_st == "III"` (Type III: Spatial Structure):** `st_Q3 = Symmetric(kron(M.s_Q, I(M.t_N)) )`. Precision for each time point having an independent structured spatial field, using `M.s_Q`.
+    *   **`M.model_st == "IV"` (Type IV: Inseparable):** `st_Q4 = Symmetric(kron(M.s_Q, t_Q) )`. Fully inseparable spatiotemporal structure, using the Kronecker product of `M.s_Q` and `t_Q`.
     *   In types 1-4, `st_raw` is sampled from a canonical multivariate normal with the derived precision, then `st_eta` is reshaped and scaled by `st_sigma`.
 
 #### 5. Linear Predictor Construction
@@ -1311,7 +1483,7 @@ This combines all latent effects into the final linear predictor `eta`.
 *   **`z_beta_eta` (High-Fidelity Linkage):** `z_beta_eta ~ Normal(0, 1)`. A coefficient linking the high-fidelity latent process `z_latent` to the overall linear predictor.
 *   **`w_beta_eta` (Medium-Fidelity Linkage):** `w_beta_eta ~ MvNormal(zeros(3), I)`. Coefficients linking the three medium-fidelity latent processes `w_latent` to the overall linear predictor.
 *   **`eta` (Linear Predictor):** `eta = M.log_offset .+ s_eta .+ t_eta_full .+ u_eta_full .+ (z_latent .* z_beta_eta) .+ (w_latent * w_beta_eta)`. This sums the log offset, spatial, temporal, seasonal, and multi-fidelity RFF effects.
-*   **Interaction Term Addition:** `if M.model_st > 0; for i in 1:M.N_obs; eta[i] += st_eta[M.s_idx[i], M.t_idx[i]]; end; end`. If a space-time interaction is enabled, its components are added to the corresponding observation points in `eta`.
+*   **Interaction Term Addition:** `if M.model_st != "none"; for i in 1:M.N_obs; eta[i] += st_eta[M.s_idx[i], M.t_idx[i]]; end; end`. If a space-time interaction is enabled, its components are added to the corresponding observation points in `eta`.
 
 #### 6. Joint Multi-fidelity Likelihood
 
@@ -1337,6 +1509,106 @@ This defines how the observed data are generated from the latent processes.
 *   **Bayesian Approaches in Multi-Fidelity:**
     *   P. Perdikaris and K. Willcox. (2017). Learning solutions of parametrized partial differential equations from small datasets. *SIAM Journal on Scientific Computing*, 39(4), A2054–A2079. (Bayesian multi-fidelity methods for PDEs)
     *   Cutler, J., & Wild, S. M. (2020). Multi-fidelity Bayesian Optimization with Deep Neural Networks. *Advances in Neural Information Processing Systems*, 33.
+
+
+
+
+## Reaction-Advection-Diffusion  
+
+### Mathematical Justification: `bstm` (The Physical Manifold)
+
+The `bstm` model extends standard spatiotemporal Bayesian models by incorporating a **mechanistic transport layer**. Instead of assuming a purely statistical interaction (like a Knorr-Held Type IV), it simulates the evolution of a latent field through a discretized **Diffusion-Advection-Reaction PDE**.
+
+#### 1. The Latent State Dynamics
+Let $\eta_{s,t}$ represent the latent spatiotemporal field at location $s$ and time $t$. The model evolves as:
+
+$$\eta_t = \text{logistic}(\rho_s) \odot \mu_{phys} + \epsilon_{innov}$$
+
+Where $\mu_{phys}$ is the physical prediction derived from the previous state:
+
+$$\mu_{phys} = \eta_{t-1} - \underbrace{\delta (L \eta_{t-1})}_{\text{Diffusion}} - \underbrace{\alpha (L \rho_s)}_{\text{Advection}}$$
+
+#### 2. Component Breakdown
+*   **Diffusion ($\delta L \eta_{t-1}$):** 
+    The Graph Laplacian $L = D - W$ acts as a discrete approximation of the negative Laplace-Beltrami operator ($-\nabla^2$). Multiplying by the diffusion coefficient $\delta$ (code: `st_diffusion`) smooths the field, causing high-intensity regions to dissipate into neighboring units.
+*   **Advection ($\alpha L \rho_s$):** 
+    This represents transport driven by a potential gradient. Here, the static spatial field $\rho_s$ (code: `s_rho`) acts as a 'source' or 'pressure' map. The term $\alpha L \rho_s$ simulates the flow of the latent field toward regions of lower spatial risk/intensity.
+*   **Spatially-Varying Persistence ($\text{logistic}(\rho_s)$):**
+    The model allows the "memory" of the physical process to vary by location. If $\rho_s$ is high, the location retains more of its physical momentum; if low, it is more heavily dominated by new stochastic innovations ($\epsilon_{innov}$).
+
+#### 3. Implementation Details
+*   **Precision Handling:** The model uses `MvNormalCanon` for the static spatial field $\rho_s$ to leverage the sparsity of the Graph Laplacian $L$, ensuring computational efficiency even as spatial resolution increases.
+*   **Innovation:** `st_eta_z` represents independent white noise innovations that are reshaped and scaled by `st_sigma` to provide the stochastic driving force at each time step.
+*   **Clamping & Stability:** In the linear predictor assembly, we use `clamp` and `Int` casting to ensure indices mapping to the areal units remain within the bounds of the precomputed $W$ and $L$ matrices.
+
+
+```{julia}
+
+# takes a lot of RAM and so reduce problem size:
+s_N = 100  # spatial locations
+t_N = 5  # time slices ("years")
+ 
+data = generate_sim_data(s_N, t_N; rndseed=42);
+
+
+# time discretization
+tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N)  ;
+
+# space discretization
+au_method = :hvt   # reasonably simple
+au = assign_spatial_units( data.s_coord_tuple, au_method;
+    t_idx = tu.t_idx,
+    target_units = 50,
+    target_cv=1.0,
+    min_total_arealunits=5,
+    max_total_arealunits=100,
+    min_time_slices = 5,
+    buffer_dist=0.8,  # fraction of mean distance between points
+    tolerance=0.1,
+    min_points=5,
+    max_points=50,
+    min_area=0.1,
+    max_area=25);
+
+met = calculate_metrics(au)
+
+plot_spatial_graph( au; plot_title="Method: $au_method", domain_boundary=au.hull_coords)
+
+
+# prepare model inputs   
+
+Random.seed!(42) # Set a seed for reproducibility
+
+inp_test = bstm_options(
+    y_obs = data.y_obs .* 100 , 
+    s_coord_tuple = data.s_coord_tuple, 
+    s_idx = au.assignments, 
+    t_idx = tu.t_idx,
+    log_offset = zeros(length(data.y_obs)), 
+    W = au.W, 
+    model_arch = "univariate",
+    model_family = "gaussian", 
+    model_transport = "advection_diffusion",
+    K_total = [200.0, 100.0], 
+    r_total = [1.0, 1.0], 
+    m0_total = 100.0,
+    s_N = length(au.centroids), 
+    t_N = tu.tn, 
+    fixed_N = 0
+);
+
+
+m = bstm(inp_test);
+
+# Using NUTS instead of MH to correctly handle vector-valued latent fields
+chn = sample(m, MH(), 1000)
+res = model_results_comprehensive(m, chn, inp_test, au)
+
+
+```
+
+An alternative is to embed the reaction (fishery dynamics and growth/mortality) at the space-time level rather than the above global model.
+
 
 
 
@@ -1399,7 +1671,7 @@ Computation:
 
 Random.seed!(42) # Set a seed for reproducibility.
 
-mdata = bstm_options(modinputs_count, model_space="bym2", cov=nothing);
+mdata = bstm_options(inp_count, model_space="bym2", cov=nothing);
 m = model_grmf(mdata);
 chn = sample(m, MH(), 1000, nchains=4);
 res = model_results_comprehensive(m, chn, mdata, au, PS);
@@ -1460,10 +1732,10 @@ Sampling takes much longer than the simple model and so I have reduced the numbe
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D02_poisson_bym2(modinputs_count)
-os = get_optimal_sampler("model_D02_poisson_bym2"; nuts_adapt=100) 
+m = model_D02_poisson_bym2(inp_count)
+os, inits = get_optimal_sampler(m; n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
-res = model_results_comprehensive(m, chn, modinputs_count, au);
+res = model_results_comprehensive(m, chn, inp_count, au);
 
 showparams( res.summarystats 
 
@@ -1532,10 +1804,10 @@ This specification is robust because it automatically handles both structured sp
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D03_poisson_leroux(modinputs_count)
-os = get_optimal_sampler("model_D03_poisson_leroux"; nuts_adapt=100) 
+m = model_D03_poisson_leroux(inp_count)
+os, inits = get_optimal_sampler(m; n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
-res = model_results_comprehensive(m, chn, modinputs_count, au);
+res = model_results_comprehensive(m, chn, inp_count, au);
 
 
 showparams( res.summarystats 
@@ -1581,11 +1853,11 @@ ESS (mean) was 0.0251 !
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_4_poisson_localised(modinputs_count)
-os = get_optimal_sampler("model_D04_poisson_localised"; nuts_adapt=100) 
+m = model_4_poisson_localised(inp_count)
+os, inits = get_optimal_samplerm; n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, modinputs_count, au);
+res = model_results_comprehensive(m, chn, inp_count, au);
 
 
 showparams( res.summarystats 
@@ -1629,11 +1901,11 @@ ESS (mean) was 0.0318!
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D05_poisson_sar(modinputs_count)
-os = get_optimal_sampler("model_D05_poisson_sar"; nuts_adapt=100) 
+m = model_D05_poisson_sar(inp_count)
+os, inits = get_optimal_samplerm; n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, modinputs_count, au);
+res = model_results_comprehensive(m, chn, inp_count, au);
 
 
 showparams( res.summarystats 
@@ -1680,11 +1952,11 @@ ESS was 0.0066
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D06_poisson_svc(modinputs_count)
-os = get_optimal_sampler("model_D06_poisson_svc"; nuts_adapt=100) 
+m = model_D06_poisson_svc(inp_count)
+os, inits = get_optimal_samplerm; n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, modinputs_count, au);
+res = model_results_comprehensive(m, chn, inp_count, au);
 
 
 showparams( res.summarystats 
@@ -1727,11 +1999,11 @@ ESS (mean): 0.0318
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D07_poisson_dag(modinputs_count)
-os = get_optimal_sampler("model_D07_poisson_dag"; nuts_adapt=100) 
+m = model_D07_poisson_dag(inp_count)
+os, inits = get_optimal_sampler(m; n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, modinputs_count, au);
+res = model_results_comprehensive(m, chn, inp_count, au);
 
 
 showparams( res.summarystats 
@@ -1774,11 +2046,11 @@ ESS (mean): 0.0318
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D08_hurdle(modinputs_count)
-os = get_optimal_sampler("model_D08_hurdle"; nuts_adapt=100) 
+m = model_D08_hurdle(inp_count)
+os, inits = get_optimal_samplerm; n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, modinputs_count, au);
+res = model_results_comprehensive(m, chn, inp_count, au);
 
 
 showparams( res.summarystats 
@@ -1821,11 +2093,11 @@ ESS (mean): 0.0318
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 
-m = model_D09_poisson_ei(modinputs_count)
-os = get_optimal_sampler("model_D09_poisson_ei"; nuts_adapt=100) 
+m = model_D09_poisson_ei(inp_count)
+os, inits = get_optimal_samplerm; n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, modinputs_count, au);
+res = model_results_comprehensive(m, chn, inp_count, au);
 
 
 showparams( res.summarystats 
@@ -1899,13 +2171,13 @@ In this bivariate example, we use a Cholesky decomposition of $\Sigma$ to sample
 Random.seed!(42) # Set a seed for reproducibility.
 
 # need a count: 
-modinputs_count = merge( modinputs_count, (y2=Int.(floor.( 100 .* (modinputs_count.z_obs .- minimum(modinputs_count.z_obs) ) ) ), ))
+inp_count = merge( inp_count, (y2=Int.(floor.( 100 .* (inp_count.z_obs .- minimum(inp_count.z_obs) ) ) ), ))
 
-m = model_D24_poisson_mcar(modinputs_count)
-os = get_optimal_sampler("model_D24_poisson_mcar"; nuts_adapt=100) 
+m = model_D24_poisson_mcar(inp_count)
+os, inits = get_optimal_sampler(m; n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, modinputs_count, au);
+res = model_results_comprehensive(m, chn, inp_count, au);
 
 
 showparams( res.summarystats )
@@ -2503,14 +2775,14 @@ println("Running smoke test for Model v11 (Non-Separable RFF)... ")
 
 # Fix: Ensure modinputs contains observation-level coordinates
 # Repeating the base centroids to match the total observation count (N_areas * N_years)
-N_total_obs = length(modinputs_reference.y)
-n_areas_base = size(modinputs_reference.Q_sp, 1)
+N_total_obs = length(inp_reference.y)
+n_areas_base = size(inp_reference.Q_sp, 1)
 n_years_base = Int(N_total_obs / n_areas_base)
 
-s_coord_tuple_full = repeat(modinputs_reference.s_coord_tuple_raw[1:n_areas_base], n_years_base)
+s_coord_tuple_full = repeat(inp_reference.s_coord_tuple_raw[1:n_areas_base], n_years_base)
 
-# Update modinputs_reference for this specific model run
-modinputs_v11 = merge(modinputs_reference, (s_coord_tuple_raw = s_coord_tuple_full,))
+# Update inp_reference for this specific model run
+modinputs_v11 = merge(inp_reference, (s_coord_tuple_raw = s_coord_tuple_full,))
 
 m = model_v11_non_separable_rff(modinputs_v11; m_joint=20)
 
@@ -2530,7 +2802,7 @@ Instead of the discrete BYM2/ICAR graph structure used in Model v1, Model v12 ad
 
 # Verification of SPDE Model v12
 println("Initializing SPDE Model v12...")
-m = model_v12_spde_gaussian(modinputs_gaussian; m_spatial=30)
+m = model_v12_spde_gaussian(inp_gaussian; m_spatial=30)
 
 # MAP for rapid convergence
 # map_v12 = maximum_a_posteriori(m)
@@ -2551,7 +2823,7 @@ Standard GP and SPDE models assume **stationarity**: the correlation between two
 
 # Verification of Non-Stationary Warping Model v13
 println("Initializing Non-Stationary Model v13...")
-m = model_v13_nonstationary_warping(modinputs_gaussian; m_warp=8, m_spatial=25)
+m = model_v13_nonstationary_warping(inp_gaussian; m_warp=8, m_spatial=25)
 
 # MAP Estimate
 # map_v13 = maximum_a_posteriori(m)
@@ -2582,7 +2854,7 @@ using SparseArrays, FFTW, Statistics
 println("Sampling from FFT-Accelerated Model v14...")
 
 # Instantiate model with fixed grid resolution parameters
-m = model_v14_fft_gaussian(modinputs_gaussian; grid_res=64, pad_factor=2)
+m = model_v14_fft_gaussian(inp_gaussian; grid_res=64, pad_factor=2)
 
 # Run MH sampler for verification (100 samples)
 chn = sample(m, MH(), 100)
@@ -2591,8 +2863,8 @@ chn = sample(m, MH(), 100)
 display(MCMCChains.summarize(chn[[:sigma_sp, :sigma_tm, :rho_tm]]))
 
 # Reconstruct and visualize
-stats_v14 = reconstruct_posteriors(m, chn, modinputs_gaussian)
-plt_v14 = plot_posterior_results(stats_v14, modinputs_gaussian; effect=:spatial)
+stats_v14 = reconstruct_posteriors(m, chn, inp_gaussian)
+plt_v14 = plot_posterior_results(stats_v14, inp_gaussian; effect=:spatial)
 title!(plt_v14, "Model v14: FFT-Accelerated Spatial Field")
 display(plt_v14)
 
@@ -2611,7 +2883,7 @@ using LinearAlgebra, SparseArrays, Random
 
 
 println("Running Refined Mosaic Model v15.1...")
-m = model_v15_refined_mosaic(modinputs_gaussian; n_mosaics=4, m_rff=15)
+m = model_v15_refined_mosaic(inp_gaussian; n_mosaics=4, m_rff=15)
 
 # Calculate MAP to define the variable map_v15_ref
 # map_v15_ref = maximum_a_posteriori(m)
@@ -4604,7 +4876,7 @@ This model extends A00 by using a non-separable anisotropic kernel for the spati
  
 
 ```{julia}
-m = model_A01_anisotropic_gp(modinputs_gaussian)
+m = model_A01_anisotropic_gp(inp_gaussian)
 chn = sample(m, NUTS(), 100) # Using MH sampler for demonstration, consider NUTS for better sampling
 display(describe(chn))
 

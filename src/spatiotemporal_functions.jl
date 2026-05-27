@@ -1319,8 +1319,8 @@ end
 
 
 function get_optimal_sampler(model::DynamicPPL.Model;
-    nuts_adapt=50,
-    target_acc=0.65,
+    n_samples_adaptation=50,
+    target_acceptance_ratio=0.65,
     pg_particles=20,
     kwargs...)
 
@@ -1365,7 +1365,7 @@ function get_optimal_sampler(model::DynamicPPL.Model;
     end
 
     if !isempty(active_hypers)
-        push!(sampler_blocks, Tuple(active_hypers) => Turing.NUTS(nuts_adapt, target_acc))
+        push!(sampler_blocks, Tuple(active_hypers) => Turing.NUTS(n_samples_adaptation, target_acceptance_ratio))
     end
 
     if !isempty(safe_params)
@@ -1376,7 +1376,9 @@ function get_optimal_sampler(model::DynamicPPL.Model;
     # println("ESS (Fields): ", latent_fields)
     # println("NUTS (Hypers): ", active_hypers)
 
-    return Gibbs(sampler_blocks...)
+    inits = parameter_inits(m)
+
+    return Gibbs(sampler_blocks...), inits
 end
 
 
@@ -2359,7 +2361,7 @@ function bstm_options(; kwargs...)
     model_time = get(  M_base, :model_time, "ar1")  
     model_season = get(  M_base, :model_season, "none")
 
-    model_st = get(  M_base, :model_st, 1)  # type 1 separable
+    model_st = get(  M_base, :model_st, "none")  # type 1 separable
         # Type of Space-time Interaction Effect:
         #- Type I:  (IID) ε_{at} ~ N(0, σ²)
         #- Type II: (Time-Structured) Interaction structured by AR1 in time, independent in space.
@@ -2377,9 +2379,17 @@ function bstm_options(; kwargs...)
     s_N = size(W, 1)
     s_idx = get(M_base, :s_idx, 1)  # force to carry to make dimensional expectations simpler ..
     @assert length(unique(s_idx)) == s_N "Unique spatial indexes must have the same number as the size of W adjacency matrix."
+     
     s_coord_tuple = get(M_base, :s_coord_tuple, nothing)
     s_coord = get(M_base, :s_coord, s_coord_tuple)
-    s_coord = RowVecs(reduce(hcat, [collect(p) for p in s_coord])')
+    
+    if !isnothing(s_coord) && !(s_coord isa AbstractVector)
+        # If it's a matrix, wrap it in RowVecs for kernel compatibility
+        s_coord = RowVecs(s_coord)
+    elseif isnothing(s_coord) && !isnothing(s_coord_tuple)
+        s_coord = RowVecs(reduce(hcat, [collect(p) for p in s_coord_tuple])')
+    end
+ 
     s_coord_unique = !isnothing(s_coord) ? unique(s_coord) : nothing
  
   
@@ -2401,7 +2411,7 @@ function bstm_options(; kwargs...)
     u_coord_unique = !isnothing(u_coord) ? unique(u_coord) : nothing
     
     
-    st_idx = (t_idx .- 1) .* t_N .+ s_idx
+    st_idx = get(M_base, :st_idx, (t_idx .- 1) .* t_N .+ s_idx )
     
     st_coord =  get(M_base, :st_coord, nothing )  # space and time
     st_coord = !isnothing(s_coord) && !isnothing(t_coord) ? hcat([p[1] for p in s_coord], [p[2] for p in s_coord], t_coord) : hcat( (s_idx, t_idx)... )
@@ -2802,26 +2812,189 @@ end
 # -----------------------
 
 
+function get_chain_names(chain)
+    try
+        return string.(FlexiChains.parameters(chain))
+    catch
+        return string.(names(chain))
+    end
+end
+
+
+function _extract_volatility(chain, name_strs, N_tot, N_samples, outcome_idx=nothing)
+    y_sig_samples = zeros(N_tot, N_samples)
+    for j in 1:N_samples
+        local sig_y
+        if isnothing(outcome_idx)
+            if "y_sigma" in name_strs
+                val = chain[:y_sigma][j]
+                sig_y = val isa AbstractVector ? vec(collect(val)) : fill(Float64(val), N_tot)
+            elseif "y_sigma_const" in name_strs
+                sig_val = Float64(chain[:y_sigma_const][j])
+                sig_y = fill(sig_val, N_tot)
+            else
+                sig_y = fill(1.0, N_tot)
+            end
+        else
+            v_key = "y_sigma_k[$outcome_idx]"
+            c_key = "y_sigma_const_k[$outcome_idx]"
+            if v_key in name_strs
+                val = chain[Symbol(v_key)][j]
+                sig_y = val isa AbstractVector ? vec(collect(val)) : fill(Float64(val), N_tot)
+            elseif c_key in name_strs
+                sig_val = Float64(chain[Symbol(c_key)][j])
+                sig_y = fill(sig_val, N_tot)
+            else
+                sig_y = fill(1.0, N_tot)
+            end
+        end
+
+        # Final flattening and type enforcement to prevent MethodError
+        flat_sig = vec(Float64.(collect(sig_y)))
+        
+        if length(flat_sig) >= N_tot
+            y_sig_samples[:, j] = flat_sig[1:N_tot]
+        else
+            y_sig_samples[1:length(flat_sig), j] = flat_sig
+            y_sig_samples[length(flat_sig)+1:end, j] .= flat_sig[end]
+        end
+    end
+    return y_sig_samples
+end
+
+
 
 function get_params_vector(chain, base_name, len)
-    # Use the robust helper to get names from either standard MCMCChains or FlexiChains
-    names_ch = get_chain_names(chain)
-    
-    # Use a case-insensitive or exact regex match for indexing
-    regex = Regex("^$base_name\\\\[(\\\\d+)\\\\]")
+    # Robust parameter extraction for FlexiChains/MCMCChains
+    N_samples = size(chain, 1)
+
+    # Use FlexiChains.parameters to get names
+    names_ch = string.(FlexiChains.parameters(chain))
+
+    # Tier 1: Indexed names [k]
+    regex = Regex("^" * base_name * "\\[(\\d+)\\]")
     matched_names = filter(n -> occursin(regex, n), names_ch)
 
-    if isempty(matched_names)
-        # Fallback for scalar/missing params: return zero matrix
-        return zeros(size(chain, 1), len)
+    if !isempty(matched_names)
+        sort!(matched_names, by = n -> parse(Int, match(regex, n).captures[1]))
+        res_mat = zeros(Float64, N_samples, length(matched_names))
+
+        for (idx, n) in enumerate(matched_names)
+            val_obj = chain[Symbol(n)]
+            raw = hasproperty(val_obj, :data) ? val_obj.data : Array(val_obj)
+            # Flatten nested structures if they appear at the index level
+            data_fixed = raw isa AbstractVector && eltype(raw) <: AbstractVector ? reduce(vcat, raw) : raw
+            res_mat[:, idx] = vec(Float64.(collect(data_fixed)))
+        end
+
+        if size(res_mat, 2) == 1 && len > 1
+            return repeat(res_mat, 1, len)
+        end
+        return res_mat
     end
 
-    # Sort matched names by the integer index to ensure [1], [2], ... order
-    sort!(matched_names, by = n -> parse(Int, match(regex, n).captures[1]))
-    
-    # Extract data using Symbol indexing (supported by both types)
-    return hcat([vec(chain[Symbol(n)].data) for n in matched_names]...)
-end 
+    # Tier 2: Single entity fallback
+    if base_name in names_ch
+        val_obj = chain[Symbol(base_name)]
+        raw_data = hasproperty(val_obj, :data) ? val_obj.data : Array(val_obj)
+        if ndims(raw_data) == 3; raw_data = raw_data[:, :, 1]; end
+
+        # Standardize to Matrix [Samples x Params]
+        # Robustly handle Matrix{Vector{Float64}} or Vector{Vector{Float64}} by flattening
+        if raw_data isa AbstractMatrix && eltype(raw_data) <: AbstractVector
+            # Flatten each row of vectors into a single parameter row
+            mat_data = reduce(hcat, [reduce(vcat, row) for row in eachrow(raw_data)])'
+        elseif raw_data isa AbstractArray && eltype(raw_data) <: AbstractVector
+            mat_data = reduce(hcat, vec(raw_data))'
+        else
+            mat_data = Matrix{Float64}(raw_data)
+        end
+
+        if size(mat_data, 2) == len
+            return mat_data
+        elseif size(mat_data, 1) == len
+            return mat_data'
+        elseif size(mat_data, 2) == 1
+            return repeat(mat_data, 1, len)
+        end
+    end
+
+    @warn "Parameter '$base_name' not found in chain. Returning zeros for length $len."
+    return zeros(Float64, N_samples, len)
+end
+
+
+function get_params_matrix(chain, base_name, dims)
+    s_N, t_N = dims
+    names_ch = get_chain_names(chain)
+    N_samples = size(chain, 1)
+
+    println("DEBUG: Reconstructing matrix '$base_name'. Target: ($s_N x $t_N) over $N_samples samples.")
+
+    # 1. Tier 1: Multi-indexed [i,j]
+    regex_ij = Regex("^" * base_name * "\\[(\\d+),(\\d+)\\]")
+    matched_ij = filter(n -> occursin(regex_ij, n), names_ch)
+
+    if !isempty(matched_ij)
+        println("DEBUG: Found multi-indexed names for matrix '$base_name'.")
+        res = zeros(s_N, t_N, N_samples)
+        for n in matched_ij
+            m = match(regex_ij, n)
+            if m !== nothing
+                i, j = parse(Int, m.captures[1]), parse(Int, m.captures[2])
+                if i <= s_N && j <= t_N
+                    val_obj = chain[Symbol(n)]
+                    raw = hasfield(typeof(val_obj), :data) ? val_obj.data : Array(val_obj)
+                    res[i, j, :] = vec(raw)
+                end
+            end
+        end
+        return res
+    end
+
+    # 2. Tier 2: Flattened vector [k]
+    regex_k = Regex("^" * base_name * "\\[(\\d+)\\]")
+    matched_k = filter(n -> occursin(regex_k, n), names_ch)
+
+    if !isempty(matched_k)
+        println("DEBUG: Found flattened indexed names for '$base_name'.")
+        res = zeros(s_N, t_N, N_samples)
+        for n in matched_k
+            m = match(regex_k, n)
+            if m !== nothing
+                k = parse(Int, m.captures[1])
+                i = (k - 1) % s_N + 1
+                j = div(k - 1, s_N) + 1
+                if i <= s_N && j <= t_N
+                    val_obj = chain[Symbol(n)]
+                    raw = hasfield(typeof(val_obj), :data) ? val_obj.data : Array(val_obj)
+                    res[i, j, :] = vec(raw)
+                end
+            end
+        end
+        return res
+    end
+
+    # 3. Tier 3: Single entity fallback
+    if base_name in names_ch
+        println("DEBUG: Found single entity for '$base_name'.")
+        data_obj = chain[Symbol(base_name)]
+        raw_data = hasfield(typeof(data_obj), :data) ? data_obj.data : Array(data_obj)
+        if ndims(raw_data) == 3; raw_data = raw_data[:, :, 1]; end
+
+        if size(raw_data, 2) == s_N * t_N
+            res = zeros(s_N, t_N, N_samples)
+            for s in 1:N_samples
+                res[:, :, s] = reshape(raw_data[s, :], s_N, t_N)
+            end
+            return res
+        end
+    end
+
+    @warn "Parameter '$base_name' not found or dimension mismatch. Returning zeros."
+    return zeros(s_N, t_N, N_samples)
+end
+
 
 
 
@@ -2973,7 +3146,7 @@ end
 
 abstract type AbstractArchitecture end
 
-struct DidacticArchitecture <: AbstractArchitecture end
+struct DidacticArchitecture <: AbstractArchitecture end 
 struct UnivariateArchitecture <: AbstractArchitecture end
 struct MultivariateArchitecture <: AbstractArchitecture end
 struct MultioutcomeArchitecture <: AbstractArchitecture end
@@ -2981,10 +3154,8 @@ struct MultifidelityArchitecture <: AbstractArchitecture end
 struct ComplexArchitecture <: AbstractArchitecture end
 struct UnknownArchitecture <: AbstractArchitecture end
 
-
-# Modify get_architecture to classify 'example_*' models
 function get_architecture(model_arch::String)
-    if startswith(model_arch, "example_")
+    if model_arch=="example"
         return DidacticArchitecture()
     elseif model_arch in ["univariate"]
         return UnivariateArchitecture()
@@ -3000,7 +3171,6 @@ function get_architecture(model_arch::String)
         return UnknownArchitecture()
     end
 end
-
 
  
 abstract type ModelFamily end
@@ -3031,19 +3201,10 @@ end
 function reconstruct_posteriors( chain, M, PS; alpha=0.05)
     arch = get_architecture(M.model_arch)
     fam = get_model_family(M.model_family)
+    
     return _reconstruct(arch, fam, chain, M, PS, alpha)
 end
-
  
-function get_chain_names(chain)
-    try
-        # Primary method: using FlexiChains metadata if available
-        return string.(FlexiChains.parameters(chain))
-    catch
-        # Fallback: Standard MCMCChains names conversion
-        return string.(names(chain))
-    end
-end
 
 function get_model_parameters(m::DynamicPPL.Model)
     # Directly extract names from a model instance sample as a fallback discovery method
@@ -3128,67 +3289,7 @@ function _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sig
     end
     return denoised, noisy, log_lik
 end
-
-
-
-function _extract_volatility(chain, name_strs, N_tot, N_samples, outcome_idx=nothing)
-    y_sig_samples = zeros(N_tot, N_samples)
-    for j in 1:N_samples
-        local sig_y
-        if isnothing(outcome_idx)
-            if "y_sigma" in name_strs
-                val = chain[:y_sigma][j]
-                # Robust handling of scalar vs array output
-                if val isa AbstractArray
-                    sig_y = vec(val)
-                elseif val isa Real
-                    sig_y = fill(Float64(val), N_tot)
-                else
-                    sig_y = fill(Float64(first(val)), N_tot)
-                end
-            elseif "y_sigma_const" in name_strs
-                sig_val = Float64(chain[:y_sigma_const][j])
-                sig_y = fill(sig_val, N_tot)
-            else
-                sig_y = fill(1.0, N_tot)
-            end
-        else
-            v_key = "y_sigma_k[$outcome_idx]"
-            c_key = "y_sigma_const_k[$outcome_idx]"
-            if v_key in name_strs
-                val = chain[Symbol(v_key)][j]
-                if val isa AbstractArray
-                    sig_vec = vec(val)
-                elseif val isa Real
-                    sig_vec = [Float64(val)]
-                else
-                    sig_vec = [Float64(first(val))]
-                end
-
-                if length(sig_vec) == 1
-                    sig_y = fill(sig_vec[1], N_tot)
-                else
-                    # Handle dimension matching for varying vector lengths
-                    sig_y = vcat(sig_vec, fill(Statistics.mean(sig_vec), max(0, N_tot - length(sig_vec))))
-                end
-            elseif c_key in name_strs
-                sig_val = Float64(chain[Symbol(c_key)][j])
-                sig_y = fill(sig_val, N_tot)
-            else
-                sig_y = fill(1.0, N_tot)
-            end
-        end
-        
-        # Ensure fixed dimensions (N_tot, N_samples) by clamping or padding
-        if length(sig_y) >= N_tot
-            y_sig_samples[:, j] = sig_y[1:N_tot]
-        else
-            y_sig_samples[1:length(sig_y), j] = sig_y
-            y_sig_samples[length(sig_y)+1:end, j] .= sig_y[end]
-        end
-    end
-    return y_sig_samples
-end
+ 
 
 
 function _compute_waic(log_lik)
@@ -3336,34 +3437,94 @@ function _reconstruct(arch::DidacticArchitecture, fam::ModelFamily, chain, M, PS
     N_PS = isnothing(PS) ? 0 : size(PS, 1)
     N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
+ 
+
     name_strs = string.(FlexiChains.parameters(chain))
+
 
     s_eta_tot = zeros(N_tot, N_samples)
     s_eta_obs_denoised = zeros(M.y_N, N_samples)
     y_sigma_samples = _extract_volatility(chain, name_strs, N_tot, N_samples)
 
-    for s in 1:N_samples
-        if "s_eta_raw" in name_strs
-            full_latent = vec(chain[:s_eta_raw].data[s])
-            s_eta_tot[1:M.y_N, s] = full_latent[M.interaction_idx]
+    # Check for Sparse GP parameters
+     
+    if M.model_space == "sparseGP"
+        
+        # "u_latent" in name_strs && haskey(M, :t_inducing)
+        
+        # --- Sparse GP Reconstruction Branch ---
+        n_u = size(M.s_inducing, 2) * size(M.t_inducing, 2)
+        u_latent_samples = get_params_vector(chain, "u_latent", n_u)
+        st_sigma_samples = vec(get_params_vector(chain, "st_sigma", 1))
+        ls_s_samples = vec(get_params_vector(chain, "ls_s", 1))
+        ls_t_samples = vec(get_params_vector(chain, "ls_t", 1))
+
+        for s in 1:N_samples
+            # Reconstruct Kernel and GP
+            k = (st_sigma_samples[s]^2) * (SqExponentialKernel() ∘ ScaleTransform(inv(ls_s_samples[s]))) ⊗ (SqExponentialKernel() ∘ ScaleTransform(inv(ls_t_samples[s])))
+            f = GP(k)
+            
+            X_ind = ColVecs(vcat(M.s_inducing', M.t_inducing'))
+            f_u = f(X_ind, 1e-6)
+            f_cond = condition(f_u, vec(u_latent_samples[s, :]))
+
+            # Project to training locations
+            X_obs = ColVecs(vcat(M.s_coord', M.t_coord'))[M.st_idx]
+            s_eta_tot[1:M.y_N, s] = mean(f_cond(X_obs))
             s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
-        elseif "eta_joint" in name_strs
-            s_eta_tot[1:M.y_N, s] = vec(chain[:eta_joint].data[s])
-            s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
-        elseif "s_eta" in name_strs
-            s_eta_tot[1:M.y_N, s] = vec(chain[:s_eta].data[s])
-            s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
-        elseif "eta_spatial_combined" in name_strs
-            s_eta_tot[1:M.y_N, s] = vec(chain[:eta_spatial_combined].data[s])
-            s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
-        elseif "f_gp" in name_strs
-            s_eta_tot[1:M.y_N, s] = vec(chain[:f_gp].data[s])
-            s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
-        elseif "f_st" in name_strs
-            s_eta_tot[1:M.y_N, s] = vec(chain[:f_st].data[s])
-            s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
+
+            # Project to prediction locations
+            if N_PS > 0
+                X_ps = ColVecs(vcat(PS.s_coord', PS.t_coord'))[PS.st_idx]
+                s_eta_tot[M.y_N+1:end, s] = mean(f_cond(X_ps))
+            end
         end
-    end
+    
+    elseif M.model_space == "kriging_simple"
+    
+        # 1. Parameter Extraction for GP components
+        s_eta_tot = zeros(M.y_N, N_samples)
+        for s in 1:N_samples
+            s_eta_tot[:, s] = vec(chain[:f_latent_spatial_all].data[s])
+        end
+
+        y_sigma_samples = zeros(N_tot, N_samples)
+        for s in 1:N_samples
+            sigmas = vec(chain[:obs_std_dev].data[s])
+            y_sigma_samples[1:M.y_N, s] = sigmas[M.t_idx]
+        end
+
+        # 2. Linear Predictor (eta)
+        for s in 1:N_samples
+            s_eta_tot[:, s] .+= chain[:mu_global].data[s]  
+        end
+
+ 
+    else
+        # --- Standard Latent Extraction Branch ---
+        for s in 1:N_samples
+            if "s_eta_raw" in name_strs
+                full_latent = vec(chain[:s_eta_raw].data[s])
+                s_eta_tot[1:M.y_N, s] = full_latent[M.st_idx]
+                s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
+            elseif "eta_joint" in name_strs
+                s_eta_tot[1:M.y_N, s] = vec(chain[:eta_joint].data[s])
+                s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
+            elseif "s_eta" in name_strs
+                s_eta_tot[1:M.y_N, s] = vec(chain[:s_eta].data[s])
+                s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
+            elseif "eta_spatial_combined" in name_strs
+                s_eta_tot[1:M.y_N, s] = vec(chain[:eta_spatial_combined].data[s])
+                s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
+            elseif "f_gp" in name_strs
+                s_eta_tot[1:M.y_N, s] = vec(chain[:f_gp].data[s])
+                s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
+            elseif "f_st" in name_strs
+                s_eta_tot[1:M.y_N, s] = vec(chain[:f_st].data[s])
+                s_eta_obs_denoised[:, s] = s_eta_tot[1:M.y_N, s]
+            end
+        end
+    end 
 
     eta = zeros(N_tot, N_samples)
     for s in 1:N_samples
@@ -3377,22 +3538,26 @@ function _reconstruct(arch::DidacticArchitecture, fam::ModelFamily, chain, M, PS
     end
 
     denoised_mu, noisy_y, log_lik_mat = _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples, M.y_obs)
-
+ 
     return (
         spatial_structured = summarize_array(reshape(s_eta_obs_denoised, M.y_N, 1, N_samples); alpha=alpha),
         spatial_noisy = summarize_array(reshape(s_eta_tot[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+        temporal = summarize_array(reshape(zeros(M.t_N, N_samples), M.t_N, 1, N_samples); alpha=alpha),
+        seasonal = summarize_array(reshape(zeros(M.u_N, N_samples), M.u_N, 1, N_samples); alpha=alpha),
         volatility = summarize_array(reshape(y_sigma_samples, N_tot, 1, N_samples); alpha=alpha),
+        fixed_effects = nothing,
+        covariate_effects = nothing,
         predictions_observed = summarize_array(reshape(denoised_mu[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
         predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
         predictions_noisy = N_PS > 0 ? summarize_array(reshape(noisy_y[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
-        waic = _compute_waic(log_lik_mat),
+        waic = _compute_waic(log_lik_mat[:, 1:M.y_N]),
         family = fam,
         arch = arch
     )
 end
 
 
-
+ 
 
 function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M, PS, alpha)
     
@@ -3507,7 +3672,7 @@ function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M
             end
 
             # --- D. SPACE-TIME INTERACTION ---
-            if M.model_st > 0
+            if M.model_st != "none"
                 st_raw_k = vec(chain[Symbol("st_raw_k[$k]")].data[s])
                 st_eta_tot[:, :, s] = reshape(st_raw_k .* st_sigma_k[s], M.s_N, M.t_N)
             end
@@ -3823,6 +3988,17 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
     u_eta_tot = zeros(M.u_N, N_samples)
     st_eta_tot = zeros(M.s_N, M.t_N, N_samples)
 
+    
+    # Transport Logic Flag
+    is_transport = get(M, :model_transport, "none") != "none"
+
+    # Transport-specific parameters
+    st_rho_persist_samples = is_transport ? get_params_vector(chain, "st_rho", M.s_N) : zeros(N_samples, M.s_N)
+    st_eta_z_samples = is_transport ? get_params_vector(chain, "st_eta_z", M.s_N * M.t_N) : zeros(N_samples, M.s_N * M.t_N)
+    st_sigma_transport_samples = is_transport ? vec(get_params_vector(chain, "st_sigma", 1)) : zeros(N_samples) # Transport innovation volatility (re-uses st_sigma name)
+    st_diffusion_samples = is_transport ? vec(get_params_vector(chain, "st_diffusion", 1)) : zeros(N_samples)
+    st_advection_samples = is_transport ? vec(get_params_vector(chain, "st_advection", 1)) : zeros(N_samples)
+ 
     y_sigma_samples = _extract_volatility(chain, name_strs, N_tot, N_samples)
     c_eta_all = zeros(M.N_cat, N_samples)
     if "c_eta" in name_strs
@@ -3843,6 +4019,7 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         end
     end
 
+    
     for s in 1:N_samples
         s_sigma_sample = "s_sigma" in name_strs ? chain[:s_sigma].data[s] : 1.0
         local field_structured_sample = zeros(M.s_N)
@@ -3935,7 +4112,7 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         # 2. Temporal Manifolds
         t_sigma_sample = "t_sigma" in name_strs ? chain[:t_sigma].data[s] : 1.0
         if "t_eta" in name_strs;
-             t_eta_tot[:, s] = vec(chain[:t_eta].data[s])
+            t_eta_tot[:, s] = vec(chain[:t_eta].data[s])
         elseif "t_raw" in name_strs; 
             t_eta_tot[:, s] = vec(chain[:t_raw].data[s]) .* t_sigma_sample
         elseif "t_alpha" in name_strs; 
@@ -3943,7 +4120,7 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         end
        
         # 2. Temporal Manifolds
-        if M.model_time == "logistic"
+        if M.model_time == "logistic_ar1"
             if "m" in name_strs; m_latent_tot[:, s] = vec(chain[:m].data[s]); end
             t_eta_tot[:, s] = "t_eta" in name_strs ? vec(chain[:t_eta].data[s]) : vec(chain[:t_innovations].data[s])
         elseif M.model_time == "ar1"
@@ -3964,19 +4141,37 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
             ua, ub = chain[:u_alpha].data[s], chain[:u_beta].data[s]
             u_eta_tot[:, s] = (ua .* sin.(M.u_angle) .+ ub .* cos.(M.u_angle)) .* chain[:u_sigma].data[s]
         end
-
- 
+  
         # 4. Space-Time Interaction Manifolds
-        if M.model_st > 0 && "st_raw" in name_strs
+        # Process Space-Time Interaction / Transport Field
+        local current_st_field = zeros(M.s_N, M.t_N)
+        if is_transport
+            diff_val = Float64(st_diffusion_samples[s])
+            adv_val = Float64(st_advection_samples[s])
+            st_sigma_val = Float64(st_sigma_transport_samples[s])
+            st_rho_persist_s = vec(Float64.(st_rho_persist_samples[s, :]))
+            s_rho_for_advection = vec(Float64.(s_rho_samples[s, :])) # Use s_rho for advection base
+
+            st_innov_sample = reshape(vec(Float64.(st_eta_z_samples[s, :])), M.s_N, M.t_N) .* st_sigma_val
+            current_st_field[:, 1] = st_innov_sample[:, 1]
+
+            for t in 2:M.t_N
+                # PDE: Next = Persistence * (Prev - Diffusion - Advection) + Innovation
+                mu_phys = current_st_field[:, t-1] .- diff_val .* (L * current_st_field[:, t-1]) .- adv_val .* (L * s_rho_for_advection)
+                current_st_field[:, t] = logistic.(st_rho_persist_s) .* mu_phys .+ st_innov_sample[:, t]
+            end
+            st_eta_tot[:, :, s] = current_st_field
+        elseif M.model_st in ["I", "II", "III", "IV"] 
             st_eta_tot[:, :, s] = reshape(vec(chain[:st_raw].data[s]) .* chain[:st_sigma].data[s], M.s_N, M.t_N)
         end
+
     end
 
 
 
     eta = zeros(N_tot, N_samples)
     for s in 1:N_samples
-        st_mat = M.model_st > 0 ? st_eta_tot[:, :, s] : zeros(M.s_N, M.t_N)
+        st_eta = M.model_st == "none"  ? zeros(M.s_N, M.t_N) : st_eta_tot[:, :, s]
         for i in 1:N_tot
             is_obs = i <= M.y_N
             src = is_obs ? M : PS
@@ -3984,15 +4179,16 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
             a = src.s_idx isa AbstractVector ? src.s_idx[idx_adj] : src.s_idx
             t = src.t_idx isa AbstractVector ? src.t_idx[idx_adj] : src.t_idx
             u = src.u_idx isa AbstractVector ? src.u_idx[idx_adj] : src.u_idx
-            val = (is_obs ? M.log_offset[i] : 0.0) + s_eta_tot[i, s] + t_eta_tot[t, s] + u_eta_tot[u, s] + st_mat[a, t]
+            val = (is_obs ? M.log_offset[i] : 0.0) + s_eta_tot[i, s] + t_eta_tot[t, s] + u_eta_tot[u, s] + st_eta[a, t]
+
             if M.fixed_N > 0
                 fixed_mat = is_obs ? M.fixed : PS.fixed
                 for d in 1:M.fixed_N
                     dm_val = fixed_mat isa AbstractMatrix ? fixed_mat[idx_adj, d] : (fixed_mat isa AbstractVector ? fixed_mat[idx_adj] : fixed_mat)
                     val += fixed_effects_samples[d, s] * dm_val
                 end
-
             end
+
             if "c_eta" in name_strs
                 c_level = is_obs ? M.cov_indices[idx_adj, 1] : PS.cov_indices[idx_adj, 1]
                 val += c_eta_all[c_level, s]
@@ -4013,7 +4209,9 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         predictions_observed = summarize_array(reshape(denoised_mu[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
         predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
         predictions_noisy = N_PS > 0 ? summarize_array(reshape(noisy_y[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
-        waic = _compute_waic(log_lik_mat[:, 1:M.y_N]), family = fam, arch = arch
+        waic = _compute_waic(log_lik_mat[:, 1:M.y_N]), 
+        family = fam, 
+        arch = arch
     )
 end
 
@@ -4083,7 +4281,7 @@ function _reconstruct(arch::ComplexArchitecture, fam::ModelFamily, chain, M, PS,
             family = actual_fam, arch = arch)
 end
 
- 
+
 
 function _reconstruct(arch::UnknownArchitecture, fam::ModelFamily, chain, M, PS, alpha)
     """
@@ -4203,7 +4401,7 @@ function model_results_comprehensive(model, result, M, areal_units; PS=nothing, 
     
     pms = string.(FlexiChains.parameters(chain))
 
-    compute_time_seconds = hasproperty(chain, :_metadata) && "sampling_time" in pms ? only(round.(chain._metadata.sampling_time, digits=1)) : 1.0
+    compute_time_seconds = hasproperty(chain, :_metadata) && hasproperty(chain._metadata, :sampling_time) ? only(round.(chain._metadata.sampling_time, digits=1)) : 1.0
 
     modelname = string(model.f)
     modelarch = string(M.model_arch)

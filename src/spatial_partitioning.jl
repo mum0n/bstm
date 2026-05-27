@@ -568,6 +568,8 @@ end
 
 
 
+
+
 function get_avt_centroids(s_coord_tuple, cfg, hull_geom)
     """
     Synopsis: Agglomerative Voronoi Tessellation (AVT) with diagnostic termination tracking.
@@ -689,46 +691,182 @@ function get_avt_centroids(s_coord_tuple, cfg, hull_geom)
 end
 
 
-function assign_spatial_units(input_data, area_method=nothing; target_units=10, kwargs...)
-    # Overload to handle adjacency matrices directly
+function get_lattice_centroids(s_coord_tuple, lengthscale)
+    """
+    Synopsis: Generates centroids for a regular 2D lattice (grid) based on a lengthscale.
+    """
+    if isempty(s_coord_tuple); return [], 0, 0, (0.0, 0.0, 0.0, 0.0); end
+
+    xs = [p[1] for p in s_coord_tuple]
+    ys = [p[2] for p in s_coord_tuple]
+
+    xmin, xmax = minimum(xs), maximum(xs)
+    ymin, ymax = minimum(ys), maximum(ys)
+
+    # Generate grid ranges
+    x_range = collect(xmin:lengthscale:xmax)
+    y_range = collect(ymin:lengthscale:ymax)
+
+    # Ensure at least one cell if the range is smaller than lengthscale
+    if isempty(x_range); x_range = [xmin]; end
+    if isempty(y_range); y_range = [ymin]; end
+
+    rows = length(y_range)
+    cols = length(x_range)
+
+    # Create meshgrid of centroids
+    centroids = [(x, y) for y in y_range, x in x_range][:]
+
+    return centroids, rows, cols, (xmin, xmax, ymin, ymax)
+end
+
+
+
+function load_shapefile_to_libgeos(filepath::String)
+    # Read the shapefile
+    # import Shapefile  << --- install this if you need it
+    # import LibGEOS
+    # import GeoInterface
+
+    table = Shapefile.Table(filepath)
+    
+    # Extract geometries and convert to LibGEOS
+    # GeoInterface allows LibGEOS to understand Shapefile objects automatically
+    geoms = [LibGEOS.read_geom(row.geometry) for row in table]
+    
+    return geoms, table
+end
+
+function get_user_centroids(input_polygons)
+    # Convert input to a concrete vector of LibGEOS Polygons
+    geoms = LibGEOS.Polygon[p for p in input_polygons]
+    n = length(geoms)
+    centroids = Vector{Tuple{Float64, Float64}}(undef, n)
+    polys_coords = Vector{Vector{Tuple{Float64, Float64}}}(undef, n)
+
+    for i in 1:n
+        poly = geoms[i]
+        cent_geom = LibGEOS.centroid(poly)
+        seq = LibGEOS.getCoordSeq(cent_geom)
+        centroids[i] = (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1))
+        polys_coords[i] = get_coords_from_geom(poly)
+    end
+
+    # Wrap the vector in a GeometryCollection so GeoInterface traits are recognized
+    collection = LibGEOS.GeometryCollection(geoms)
+    # Perform unaryUnion on the collection instead of the vector
+    united = LibGEOS.unaryUnion(collection)
+    hull_coords = get_coords_from_geom(united)
+
+    return centroids, polys_coords, hull_coords
+end
+
+
+
+
+function assign_spatial_units(input_data, area_method=nothing; target_units=10, lengthscale=nothing, input_polygons=nothing, geom_hull=nothing, kwargs...)
+    # 1. Overload to handle adjacency matrices directly
     if input_data isa AbstractMatrix
-        
         reason = :inferred
         W = input_data
-
         au_inferred = assign_spatial_units_inferred(W;
             iterations=get(kwargs, :iterations, 50),
             learning_rate=get(kwargs, :learning_rate, 0.1),
             buffer_dist=get(kwargs, :buffer_dist, 0.5),
-            input_polygons=get(kwargs, :input_polygons, nothing))
- 
+            input_polygons=input_polygons)
+
         s_coord_tuple = au_inferred.centroids
         final_centroids = au_inferred.centroids
         new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in s_coord_tuple]
-        polys_coords = au_inferred.polygons        
+        polys_coords = au_inferred.polygons
         v_edges = au_inferred.adjacency_edges
         g = au_inferred.graph
         hull_coords = au_inferred.hull_coords
 
+    # 2. Handle User-Defined Polygons
+    elseif !isnothing(input_polygons)
+        # If geom_hull is provided, we intersect the input polygons with it
+        processed_polys = isnothing(geom_hull) ? input_polygons : [LibGEOS.intersection(p, geom_hull) for p in input_polygons]
+        
+        final_centroids, polys_coords, hull_coords = get_user_centroids(processed_polys)
+        reason = :user_polygons
+        n_units = length(final_centroids)
 
+        g = SimpleGraph(n_units)
+        for i in 1:n_units, j in (i+1):n_units
+            if LibGEOS.touches(processed_polys[i], processed_polys[j]) || LibGEOS.intersects(LibGEOS.buffer(processed_polys[i], 1e-7), processed_polys[j])
+                add_edge!(g, i, j)
+            end
+        end
+        g = ensure_connected!(g, final_centroids)
+        W = Float64.(Graphs.adjacency_matrix(g))
+
+        new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in input_data]
+        v_edges = []
+        s_coord_tuple = input_data
+
+    # 3. Handle Lattice Method
+    elseif area_method == :lattice
+        ls = isnothing(lengthscale) ? sqrt(get_polygon_area(get_coords_from_geom(expand_hull(input_data, 0.0))) / target_units) : lengthscale
+        final_centroids_raw, rows, cols, bbox = get_lattice_centroids(input_data, ls)
+        reason = :lattice_grid
+        
+        # Generate square polygons and clip them if geom_hull is provided
+        polys_coords = Vector{Vector{Tuple{Float64, Float64}}}()
+        lg_polys = LibGEOS.Polygon[]
+        final_centroids = Tuple{Float64, Float64}[]
+        half = ls / 2.0
+        
+        for c in final_centroids_raw
+            coords = [[(c[1]-half, c[2]-half), (c[1]+half, c[2]-half), (c[1]+half, c[2]+half), (c[1]-half, c[2]+half), (c[1]-half, c[2]-half)]]
+            p_geom = LibGEOS.Polygon(coords)
+            if !isnothing(geom_hull)
+                p_geom = LibGEOS.intersection(p_geom, geom_hull)
+            end
+            
+            if !LibGEOS.isEmpty(p_geom)
+                push!(lg_polys, p_geom)
+                p_c = LibGEOS.centroid(p_geom)
+                seq = LibGEOS.getCoordSeq(p_c)
+                push!(final_centroids, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
+                push!(polys_coords, get_coords_from_geom(p_geom))
+            end
+        end
+
+        n_units = length(final_centroids)
+        g = SimpleGraph(n_units)
+        for i in 1:n_units, j in (i+1):n_units
+            if LibGEOS.touches(lg_polys[i], lg_polys[j]) || LibGEOS.intersects(LibGEOS.buffer(lg_polys[i], 1e-7), lg_polys[j])
+                add_edge!(g, i, j)
+            end
+        end
+        g = ensure_connected!(g, final_centroids)
+        W = Float64.(Graphs.adjacency_matrix(g))
+        
+        new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in input_data]
+        v_edges = []
+        hull_coords = isnothing(geom_hull) ? [(bbox[1], bbox[3]), (bbox[2], bbox[3]), (bbox[2], bbox[4]), (bbox[1], bbox[4]), (bbox[1], bbox[3])] : get_coords_from_geom(geom_hull)
+        s_coord_tuple = input_data
+
+    # 4. Standard Tessellation Methods
     else
-
         cfg = (
-            target=Int(target_units), 
-            min_total_arealunits=Int(get(kwargs, :min_total_arealunits, 3)), 
-            max_total_arealunits=Int(get(kwargs, :max_total_arealunits, target_units*2)), 
+            target=Int(target_units),
+            min_total_arealunits=Int(get(kwargs, :min_total_arealunits, 3)),
+            max_total_arealunits=Int(get(kwargs, :max_total_arealunits, target_units*2)),
             min_time_slices=Int(get(kwargs, :min_time_slices, 1)),
-            min_points=Int(get(kwargs, :min_points, 1)), 
-            max_points=Int(get(kwargs, :max_points, length(input_data))), 
-            min_area=get(kwargs, :min_area, 0.0), 
-            max_area=get(kwargs, :max_area, Inf), 
-            target_cv=get(kwargs, :target_cv, 1.0), 
-            tolerance=get(kwargs, :tolerance, 0.1), 
-            buffer_dist=get(kwargs, :buffer_dist, 0.5), 
+            min_points=Int(get(kwargs, :min_points, 1)),
+            max_points=Int(get(kwargs, :max_points, length(input_data))),
+            min_area=get(kwargs, :min_area, 0.0),
+            max_area=get(kwargs, :max_area, Inf),
+            target_cv=get(kwargs, :target_cv, 1.0),
+            tolerance=get(kwargs, :tolerance, 0.1),
+            buffer_dist=get(kwargs, :buffer_dist, 0.5),
             t_idx=get(kwargs, :t_idx, ones(Int, length(input_data))))
 
-        hull_geom = expand_hull(input_data, cfg.buffer_dist)
-
+        # Use provided geom_hull or fallback to expanded convex hull
+        hull_geom = !isnothing(geom_hull) ? geom_hull : expand_hull(input_data, cfg.buffer_dist)
+        
         c_mid, reason = if area_method == :cvt get_cvt_centroids(input_data, cfg, hull_geom)
         elseif area_method == :kvt get_kvt_centroids(input_data, cfg, hull_geom)
         elseif area_method == :qvt get_qvt_centroids(input_data, cfg, hull_geom)
@@ -738,7 +876,6 @@ function assign_spatial_units(input_data, area_method=nothing; target_units=10, 
         else error("Unknown partitioning method: $area_method") end
 
         polys_coords, v_edges = get_voronoi_polygons_and_edges(c_mid, hull_geom)
-
         final_centroids = Tuple{Float64, Float64}[]
         lg_polys = []
         for p_coords in polys_coords
@@ -755,25 +892,21 @@ function assign_spatial_units(input_data, area_method=nothing; target_units=10, 
         n_units = length(final_centroids)
         g = SimpleGraph(n_units)
         for i in 1:n_units, j in (i+1):n_units
-            # Use robust check here too
             if LibGEOS.touches(lg_polys[i], lg_polys[j]) || LibGEOS.intersects(LibGEOS.buffer(lg_polys[i], 1e-7), lg_polys[j])
                 add_edge!(g, i, j)
             end
         end
         g = ensure_connected!(g, final_centroids)
-
         hull_coords = get_coords_from_geom(hull_geom)
         s_coord_tuple = input_data
-
-        W = Float64.( Graphs.adjacency_matrix(g) )
- 
+        W = Float64.(Graphs.adjacency_matrix(g))
     end
 
     return (centroids=final_centroids, assignments=new_assigns, polygons=polys_coords, 
             adjacency_edges=v_edges, graph=g, hull_coords=hull_coords, 
             termination_reason=reason, s_coord_tuple=s_coord_tuple, W=W, s_vals=collect(1:size(W,1)))
 end
- 
+
 
 
 
@@ -1204,3 +1337,4 @@ end
     return plt
 end
 
+    
