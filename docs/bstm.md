@@ -89,15 +89,14 @@ else
     project_directory = joinpath( "C:\\", "Users", "choij", "projects", "bstm")  # examples
 end
 
+include( joinpath( project_directory, "scripts", "startup.jl" ) ) # might need to run this a few times if there are stragglers   
 
+# or individually:
 # include( joinpath( project_directory, "src", "data_prep.jl" ) ) # support functions  
 # include( joinpath( project_directory, "src", "spatiotemporal_functions.jl" ) )       # support functions
 # include( joinpath( project_directory, "src", "spatiotemporal_turing_models.jl" ) )     # Turing models
 
-include( joinpath( project_directory, "scripts", "startup.jl" ) ) # might need to run this a few times if there are stragglers   
-
 # Pkg.instantiate()  # to force a reset if some package seems corrupted/partially installed
-
 # Pkg.update()  # to update this can break dependencies .. do this only if you really need to 
  
 ```
@@ -176,7 +175,7 @@ res = model_results_comprehensive(m, chn, inp_scot, au_scot );  # results are "O
 Random.seed!(42)
 m = bstm(inp_scot);
 
-os, inits = get_optimal_sampler(m; n_samples_adaptation=100) ; 
+os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ; 
 
 chn = sample(m, os, 5000; initial_params=inits, progress=true, drop_warmup=true ) ; 
 
@@ -255,7 +254,26 @@ Dict(k => size(v) for (k, v) in pairs(data))
 plot_kde_simple( data.s_coord_tuple, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
  
 ```
- 
+
+
+### Covariate Discretization & Transformation Rules
+
+The `bstm_options` and `assign_covariate_units` functions support several methods for preprocessing covariates and their interactions:
+
+1.  **Continuous Transformations (No Binning):**
+    *   `"unit"`: Performs Min-Max scaling, mapping values to the `[0, 1]` interval.
+    *   `"zscore"`: Performs Z-score standardization (subtract mean, divide by standard deviation).
+    *   `"log"`: Performs a log transformation: `log(x + 1.0 - min(x))`.
+    *   `0` or `nothing`: No transformation; treats as a raw continuous covariate.
+
+2.  **Discretization / Binning:**
+    *   `Int` (e.g., `9`): Discretizes into N quantiles. Useful for creating non-linear effects via random effect structures (RW2/AR1).
+    *   `"regular:XXX"` (e.g., `"regular:10"`): Creates XXX equal-width intervals between the 0.025 and 0.975 quantiles of the data.
+    *   `AbstractVector` (e.g., `[0.1, 0.5, 0.9]`): Uses the provided vector as custom bin edges.
+
+3.  **Interactions:**
+    *   Interactions are specified as `"var1*var2"`. They are calculated *after* the individual variables have been transformed (scaled/logged), ensuring interactions operate on normalized representations.
+     
 
 
 ## Discrete Bayesian Spatiotemporal Models
@@ -739,7 +757,7 @@ m = example_kriging_simple(inp_krig);  # note this model has probleme with Posit
 Random.seed!(42) # Set a seed for reproducibility
 
 
-os, inits = get_optimal_sampler(m; n_samples_adaptation=100) 
+os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
 
 # note this is really slow. Do not use too many samples .. just testing to show that it is slow..
 chn = sample(m, os, 10; initial_params=inits, progress=true, drop_warmup=true ) ; 
@@ -844,7 +862,7 @@ chn_vi = vi(m, q_init, max_iters, adtype=AutoForwardDiff(), show_progress=true; 
 # Convert to reconstruct-compatible format
 # chn = convert_advi_to_reconstruct_format(chn_vi, m, n_samples)
 
-# Reconstruct and Visualize
+# Reconstruct and Visualize: not great
 res = model_results_comprehensive(m, chn_vi, inp_scot, au_scot);
 
 pairs(res.metrics)
@@ -863,7 +881,7 @@ Any of these point estimates can be used as starting points for further MCMC run
 
 ### Reconstruction of effects and predictions 
  
-The `_reconstruct` function is the core post-processing engine of the `bstm` package. It transforms raw MCMC chains into structured summaries of latent fields, effect sizes, and model predictions. Quite often, this can be more of a struggle than the modelling! 
+The `_reconstruct` function (multiple methods, one for each Architecture) is the core post-processing engine of the `bstm` package. It transforms raw MCMC chains into structured summaries of latent fields, effect sizes, and model predictions. Quite often, this can be more of a struggle than the modelling! 
 
 
 Standardized Output Schema  
@@ -890,9 +908,9 @@ Linear Predictor Assembly: bstm reconstructs the linear predictor $\eta_{i,s}$ f
 $$\eta_{i,s} = \text{Offset}_i + \text{Spatial}_{a[i],s} + \text{Temporal}_{t[i],s} + \text{Interaction}_{a,t,s} + \sum_{k} \beta_{k, \text{level}[i],s}$$
 
 
-### Technical Reference: Linear Predictor Assembly Audit
+### Technical Reference: Linear Predictor Assembly 
 
-All `_reconstruct` methods have been verified to handle magnitude scaling via the following assembly logic:
+All `_reconstruct` methods assembly logic:
 
 $$\eta_{i,s} = \text{Offset}_i + \text{Spatial}_{a[i],s} + \text{Temporal}_{t[i],s} + \text{Interaction}_{a[i],t[i],s} + \sum \text{Covariates}_{i,s}$$
 
@@ -911,7 +929,9 @@ Architecture-Specific Logic:
 
 As we are now more or less ready to study the full spectrum of spatiotemporal models, we move to our previous simulated data set ("data") as we can readily increase or decrease and adjust the amount of data to balance the time required and see how useful these methods are and why some might be worth the extra wait and others not. 
 
-Before proceeding, we also need to agree upon a spatial partitioning scheme. We start from scratch and use the Agglomerative Voronoi Tesselation (:avt) method with a slightly larger, tolerance=0.1, which causes the algorithm to stop earlier, ultimately resulting in fewer spatial units. The balance of information (being able to resolve small spatial patterns) and costs (computational time) is one that must be judged based upon the specifics of every application.
+Before proceeding, we also need to agree upon a spatial partitioning scheme for the remainder of this document. 
+
+We start from scratch and use the Agglomerative Voronoi Tesselation (:avt) method with a slightly larger, tolerance=0.1, which causes the algorithm to stop earlier, ultimately resulting in fewer spatial units. The balance of information (being able to resolve small spatial patterns) and costs (computational time) is one that must be judged based upon the specifics of every application.
 
 ```{julia}
 #| label: Data and spatial partitioning
@@ -961,39 +981,11 @@ Note the target point density is similar to the final density.
 
 ## Model Compendium
 
-The following prepares data for the models to be examine together with a short list.
+The following prepares data for the models to be examine together with a few covariates and also creates a prediction surface to which predictions can be made to plot or examine trends in a structured manner.
 
 ```{julia}
 #| label: create structured model inputs and model_list definitions 
   
-W = assign_covariate_levels( data.w_obs, N_cat=9 )  
-Z = assign_covariate_levels( data.z_obs, N_cat=9 ) 
-covs=[ Z.mids, U.mids ]
-
-# prediction surface
-observations = DataFrame(
-    s_idx = au.assignments,
-    t_idx = tu.t_idx,
-    u_idx = tu.u_idx,
-    z = data.z_obs,
-    w1 = data.w_obs[:,1],
-    w2 = data.w_obs[:,2],
-    w3 = data.w_obs[:,3]
-)
-
-
-s_idx = au.s_vals
-t_idx = tu.t_vals
-u_idx = tu.u_vals
-
-combinations = Iterators.product( s_idx, t_idx, u_idx )
-basis = DataFrame([ (s, t, u) for (s, t, u) in combinations ], [:s_idx, :t_idx, :u_idx])
-
-# Call the function - ensure create_prediction_surface uses DataFrames.combine internally
-PS = create_prediction_surface(basis, observations)
-
-
- 
  
 # Populate standard input sets per response family
 inp_reference = bstm_options(
@@ -1004,10 +996,9 @@ inp_reference = bstm_options(
     centroids = au.centroids,
     s_idx = au.assignments, 
     W = au.W,
-    t_idx = tu.t_idx, 
-    cov = U.idx,
-    z_obs = data.z_obs,
-    w_obs = data.w_obs,
+    t_idx = tu.t_idx,  
+    z_obs = data.z_obs,  # spatial only covars
+    w_obs = data.w_obs,  # spacetime covars
     trials = data.trials,
     model_family = "poisson",   
     model_space = "besag",
@@ -1059,7 +1050,7 @@ inp_lognormal = bstm_options( inp_reference,
 
 ### Conceptual Overview: bstm - Generalized Random Markov Field Spatiotemporal Model
 
-The `bstm` (Bayesian Space-Time Model) is a highly modular and flexible framework for inference on spatiotemporal data. It decomposes observed phenomena into various underlying components, such as spatial effects, temporal trends, space-time interactions, covariate effects, and seasonal patterns. Its design emphasizes adaptability, supporting a range of model specifications and likelihood families to accommodate diverse data types and research questions.
+The `bstm` (Bayesian Space-Time Model) is a modular and flexible framework for inference on spatiotemporal data. It decomposes observed phenomena into various underlying components, such as spatial effects, temporal trends, space-time interactions, covariate effects, and seasonal patterns. Its design emphasizes adaptability, supporting a range of model specifications and likelihood families to accommodate diverse data types and research questions.
 
 The core idea is to build complex spatiotemporal models by combining different 'manifolds' (components), each with its own set of prior distributions and mathematical structures. This modularity allows researchers to tailor models precisely to the nuances of their data, from simple IID effects to Gaussian Processes or graph-based convolutions.
 
@@ -1515,11 +1506,12 @@ This defines how the observed data are generated from the latent processes.
 
 ## Reaction-Advection-Diffusion  
 
-### Mathematical Justification: `bstm` (The Physical Manifold)
+### Physical Manifold
 
-The `bstm` model extends standard spatiotemporal Bayesian models by incorporating a **mechanistic transport layer**. Instead of assuming a purely statistical interaction (like a Knorr-Held Type IV), it simulates the evolution of a latent field through a discretized **Diffusion-Advection-Reaction PDE**.
+The `bstm` model extends standard spatiotemporal Bayesian models by incorporating a **mechanistic transport layer**. Instead of assuming a purely statistical interaction (like a Knorr-Held Type IV), it can simulate the evolution of a latent field through a discretized **Diffusion-Advection-Reaction PDE**.
 
-#### 1. The Latent State Dynamics
+#### The Latent State Dynamics
+
 Let $\eta_{s,t}$ represent the latent spatiotemporal field at location $s$ and time $t$. The model evolves as:
 
 $$\eta_t = \text{logistic}(\rho_s) \odot \mu_{phys} + \epsilon_{innov}$$
@@ -1528,7 +1520,7 @@ Where $\mu_{phys}$ is the physical prediction derived from the previous state:
 
 $$\mu_{phys} = \eta_{t-1} - \underbrace{\delta (L \eta_{t-1})}_{\text{Diffusion}} - \underbrace{\alpha (L \rho_s)}_{\text{Advection}}$$
 
-#### 2. Component Breakdown
+ 
 *   **Diffusion ($\delta L \eta_{t-1}$):** 
     The Graph Laplacian $L = D - W$ acts as a discrete approximation of the negative Laplace-Beltrami operator ($-\nabla^2$). Multiplying by the diffusion coefficient $\delta$ (code: `st_diffusion`) smooths the field, causing high-intensity regions to dissipate into neighboring units.
 *   **Advection ($\alpha L \rho_s$):** 
@@ -1536,27 +1528,29 @@ $$\mu_{phys} = \eta_{t-1} - \underbrace{\delta (L \eta_{t-1})}_{\text{Diffusion}
 *   **Spatially-Varying Persistence ($\text{logistic}(\rho_s)$):**
     The model allows the "memory" of the physical process to vary by location. If $\rho_s$ is high, the location retains more of its physical momentum; if low, it is more heavily dominated by new stochastic innovations ($\epsilon_{innov}$).
 
-#### 3. Implementation Details
+#### Implementation Details
+
 *   **Precision Handling:** The model uses `MvNormalCanon` for the static spatial field $\rho_s$ to leverage the sparsity of the Graph Laplacian $L$, ensuring computational efficiency even as spatial resolution increases.
 *   **Innovation:** `st_eta_z` represents independent white noise innovations that are reshaped and scaled by `st_sigma` to provide the stochastic driving force at each time step.
 *   **Clamping & Stability:** In the linear predictor assembly, we use `clamp` and `Int` casting to ensure indices mapping to the areal units remain within the bounds of the precomputed $W$ and $L$ matrices.
+
 
 
 ```{julia}
 
 # takes a lot of RAM and so reduce problem size:
 s_N = 100  # spatial locations
-t_N = 5  # time slices ("years")
+t_N = 15  # time slices ("years")
  
 data = generate_sim_data(s_N, t_N; rndseed=42);
-
 
 # time discretization
 tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N)  ;
 
 # space discretization
 au_method = :hvt   # reasonably simple
-au = assign_spatial_units( data.s_coord_tuple, au_method;
+au = assign_spatial_units( 
+    data.s_coord_tuple, au_method;
     t_idx = tu.t_idx,
     target_units = 50,
     target_cv=1.0,
@@ -1580,7 +1574,7 @@ plot_spatial_graph( au; plot_title="Method: $au_method", domain_boundary=au.hull
 Random.seed!(42) # Set a seed for reproducibility
 
 inp_test = bstm_options(
-    y_obs = data.y_obs .* 100 , 
+    y_obs = data.y_obs , 
     s_coord_tuple = data.s_coord_tuple, 
     s_idx = au.assignments, 
     t_idx = tu.t_idx,
@@ -1588,10 +1582,19 @@ inp_test = bstm_options(
     W = au.W, 
     model_arch = "univariate",
     model_family = "gaussian", 
-    model_transport = "advection_diffusion",
-    K_total = [200.0, 100.0], 
-    r_total = [1.0, 1.0], 
-    m0_total = 100.0,
+    model_space = "besag",
+    model_time = "ar1",
+    model_st = "advection_diffusion",
+    K = [100.0, 10.0],  # these biological parameters are for "logistic_ar1" ... which is not ready yet: need to bring in suraface areas for computing totals..
+    r = [1.0, 0.25], 
+    q1 = [1.0, 0.25],
+    m0 = [0.9, 0.25],
+    bpsd = [0.25, 0.25],
+    mlim = [0.01, 1.1],
+    nM = t_N + 1,  # for projections
+    iok = findall(isfinite, data.y_obs),
+    yeartransition = 0,
+    removed = data.y_obs .* 0.25,
     s_N = length(au.centroids), 
     t_N = tu.tn, 
     fixed_N = 0
@@ -1599,18 +1602,127 @@ inp_test = bstm_options(
 
 
 m = bstm(inp_test);
+ 
+os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ;
 
-# Using NUTS instead of MH to correctly handle vector-valued latent fields
-chn = sample(m, MH(), 1000)
-res = model_results_comprehensive(m, chn, inp_test, au)
+chn = sample(m, os, 100; initial_params=inits, progress=true, drop_warmup=true ) ; 
+
+res = model_results_comprehensive(m, chn, inp_test, au, PS="lazy")
 
 
 ```
 
-An alternative is to embed the reaction (fishery dynamics and growth/mortality) at the space-time level rather than the above global model.
+The "reaction" (fishery dynamics and growth/mortality) is incomplete ("logistic_ar1") but can also be placed at the space-time level rather than in aggregate form. This will be addressed soon.
 
 
+## Size Structured Model 
 
+This is a special case application of what we have developed above. The purpose is to model size structure as a feature in space and time. The ultimate purpose is to obtain Post-Stratification Weights (PSW's) which can be used to adjust observations of individuals in a sample to population level size structure. This will be fleshed out soon.  
+
+
+```{julia} 
+ 
+s_N = 100  # spatial locations
+t_N = 15  # time slices ("years")
+ 
+data = generate_sim_data(s_N, t_N; rndseed=42);
+n_obs = length(data.y_obs)
+
+# time discretization
+tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N)  ;
+
+# space discretization
+au_method = :hvt   # reasonably simple
+au = assign_spatial_units( 
+    data.s_coord_tuple, au_method;
+    t_idx = tu.t_idx,
+    target_units = 50,
+    target_cv=1.0,
+    min_total_arealunits=5,
+    max_total_arealunits=100,
+    min_time_slices = 5,
+    buffer_dist=0.8,  # fraction of mean distance between points
+    tolerance=0.1,
+    min_points=5,
+    max_points=50,
+    min_area=0.1,
+    max_area=25);
+
+cov_df = DataFrame(
+    cw=rand(n_obs), 
+    tx=rand(n_obs), 
+    zx=rand(n_obs), 
+    sx=rand(n_obs), 
+    pca1=rand(n_obs), 
+    pca2=rand(n_obs)
+)
+
+cov = dataframe_to_named_array( cov_df ) 
+
+inp = bstm_options(
+    y_obs = data.y_binary,
+    y_N = n_obs,
+    s_N = length(au.centroids),
+    t_N = tu.tn,
+    s_coord_tuple = data.s_coord_tuple,
+    s_idx = au.assignments,
+    t_idx = tu.t_idx,
+    log_offset = zeros(length(data.y_obs)),
+    W = au.W,
+    model_arch = "univariate",
+    model_family = "bernoulli",
+    model_space = "besag",
+    model_time = "ar1",
+    model_st = "IV",
+    u_N = data.u_N,
+    cov = cov,
+    cov_discretization = Dict(:cw => 9, :tx => 9, :zx => 9, :sx => 9, :pca1 => 9, :pca2 => 9),
+    cov_interactions = ("cw*tx", "cw*zx"),
+    re_rules = Dict(:cw => "rw2", :tx => "ar1", :zx => "rw2"),
+    fixed_N = 1
+);
+ 
+
+m = bstm_size_structured(inp)
+
+os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=5) ;
+
+chn = sample(m, os, 10; initial_params=inits, progress=true, drop_warmup=true ) ; 
+
+res = model_results_comprehensive(m, chn, inp, au, PS="lazy")
+
+
+```
+
+
+### Prepare raw sample matrix from reconstruction and compute post-stratified weights
+
+```{julia}
+# We need the full [Obs x Samples] and [Strata x Samples] matrices
+# These are stored in the pstats object
+
+# Combine observed and predicted samples vertically
+samples_denoised = vcat(res.pstats.predictions_observed.mean, res.pstats.predictions_denoised.mean)
+
+# 2. Compute weights
+# Now samples_denoised has shape [(y_N + PS_N) x Samples]
+weights_mat = post_stratification_weights(res, inp, samples_denoised)
+
+# 3. Apply weights to simulation data (Size Estimates)
+# Assuming y_obs represents the observed sizes
+no_sampling_events_stations = TBD
+offset = exp(M.log_offset)   
+weighted_estimates = inp.y_obs .* weights_mat / no_sampling_events_stations / swept_area
+
+# 4. Diagnostics: Check for flat posterior/low signal
+println("Diagnostic Summary:")
+println("- Mean Weight: ", mean(weights_mat))
+println("- Weight SD: ", std(weights_mat))
+println("- Effective Sample Size (approx): ", 1.0 / sum(weights_mat.^2 / sum(weights_mat)^2))
+
+# Visualize weights across samples for a few observations
+plot(weights_mat[1:5, :]', title="Sample-wise Weights (First 5 Obs)", xlabel="Sample Index", ylabel="Weight")
+```
 
 
 
@@ -1733,7 +1845,7 @@ Sampling takes much longer than the simple model and so I have reduced the numbe
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D02_poisson_bym2(inp_count)
-os, inits = get_optimal_sampler(m; n_samples_adaptation=100) 
+os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 res = model_results_comprehensive(m, chn, inp_count, au);
 
@@ -1805,7 +1917,7 @@ This specification is robust because it automatically handles both structured sp
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D03_poisson_leroux(inp_count)
-os, inits = get_optimal_sampler(m; n_samples_adaptation=100) 
+os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 res = model_results_comprehensive(m, chn, inp_count, au);
 
@@ -1854,7 +1966,7 @@ ESS (mean) was 0.0251 !
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_4_poisson_localised(inp_count)
-os, inits = get_optimal_samplerm; n_samples_adaptation=100) 
+os, inits = get_optimal_sampler( m; nuts_n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -1902,7 +2014,7 @@ ESS (mean) was 0.0318!
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D05_poisson_sar(inp_count)
-os, inits = get_optimal_samplerm; n_samples_adaptation=100) 
+os, inits = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -1953,7 +2065,7 @@ ESS was 0.0066
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D06_poisson_svc(inp_count)
-os, inits = get_optimal_samplerm; n_samples_adaptation=100) 
+os, inits = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -2000,7 +2112,7 @@ ESS (mean): 0.0318
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D07_poisson_dag(inp_count)
-os, inits = get_optimal_sampler(m; n_samples_adaptation=100) 
+os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -2047,7 +2159,7 @@ ESS (mean): 0.0318
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D08_hurdle(inp_count)
-os, inits = get_optimal_samplerm; n_samples_adaptation=100) 
+os, inits = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -2094,7 +2206,7 @@ ESS (mean): 0.0318
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D09_poisson_ei(inp_count)
-os, inits = get_optimal_samplerm; n_samples_adaptation=100) 
+os, inits = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -2174,7 +2286,7 @@ Random.seed!(42) # Set a seed for reproducibility.
 inp_count = merge( inp_count, (y2=Int.(floor.( 100 .* (inp_count.z_obs .- minimum(inp_count.z_obs) ) ) ), ))
 
 m = model_D24_poisson_mcar(inp_count)
-os, inits = get_optimal_sampler(m; n_samples_adaptation=100) 
+os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);

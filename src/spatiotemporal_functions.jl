@@ -1315,73 +1315,7 @@ function scottish_lip_cancer_data_spacetime(n_years::Int=10; rndseed::Int=42)
         s_idx=s_idx, n_years=n_years, s_coord_tuple=s_coord_tuple, W=W, au=au
     )
 end
- 
-
-
-function get_optimal_sampler(model::DynamicPPL.Model;
-    n_samples_adaptation=50,
-    target_acceptance_ratio=0.65,
-    pg_particles=20,
-    kwargs...)
-
-    # Draw multiple samples from the prior to detect fixed parameters (e.g., Dirac)
-    init_samples = [Dict(pairs(rand(model))) for _ in 1:3]
-    full_init_dict = init_samples[1]
-
-    # 0. Identify Fixed/Degenerate Parameters (identical across prior samples)
-    fixed_params = filter(k -> all(s -> s[k] == full_init_dict[k], init_samples), keys(full_init_dict))
-
-    # 1. Stochastic Discrete Parameters (Integer/Bool and NOT fixed) -> PG
-    discrete_params = filter(k -> k ∉ fixed_params && (full_init_dict[k] isa Integer || full_init_dict[k] isa Bool), keys(full_init_dict))
-
-    # 2. Stochastic Continuous Latent Fields (Vectors and NOT fixed) -> ESS
-    latent_fields = filter(k -> begin
-        val = full_init_dict[k]
-        k ∉ fixed_params && k ∉ discrete_params && val isa AbstractVector
-    end, keys(full_init_dict))
-
-    # 3. Stochastic Continuous Hyperparameters (Scalars and NOT fixed) -> NUTS
-    active_hypers = filter(k -> begin
-        val = full_init_dict[k]
-        k ∉ fixed_params && k ∉ discrete_params && k ∉ latent_fields && val isa Real
-    end, keys(full_init_dict))
-
-    # 4. Fixed / Dirac fallback -> MH (effectively static)
-    safe_params = fixed_params
-
-    sampler_blocks = []
-
-    if !isempty(discrete_params)
-        push!(sampler_blocks, Tuple(discrete_params) => PG(pg_particles))
-        println("Discrete detected (PG): ", discrete_params)
-    end
-
-    if !isempty(fixed_params)
-        println("Parameters fixed via Dirac() or similar (MH): ", fixed_params)
-    end
-
-    if !isempty(latent_fields)
-        push!(sampler_blocks, Tuple(latent_fields) => ESS())
-    end
-
-    if !isempty(active_hypers)
-        push!(sampler_blocks, Tuple(active_hypers) => Turing.NUTS(n_samples_adaptation, target_acceptance_ratio))
-    end
-
-    if !isempty(safe_params)
-        push!(sampler_blocks, Tuple(safe_params) => MH())
-    end
-
-    # println("--- Optimized Gibbs Sampler Initialized ---")
-    # println("ESS (Fields): ", latent_fields)
-    # println("NUTS (Hypers): ", active_hypers)
-
-    inits = parameter_inits(m)
-
-    return Gibbs(sampler_blocks...), inits
-end
-
-
+  
 
 function get_initial_parameters(model::DynamicPPL.Model; n_samples=100)
     # 1. Take multiple prior samples to find a robust center. 
@@ -1425,6 +1359,7 @@ end
 
 
 
+
 function parameter_inits(model::DynamicPPL.Model; n_samples=10, 
     optimizer=SimulatedAnnealing(), #  
     maxiters = 500,     # Max optimization steps
@@ -1454,7 +1389,7 @@ initial energy spikes that can crash the NUTS sampler.
             initial_params=DynamicPPL.InitFromParams(NamedTuple(init_guess)), 
             show_trace=show_trace, iterations=maxiters, maxtime=maxtime, kwargs...) 
 
-        return DynamicPPL.InitFromParams(NamedTuple(map_res.values)) 
+        return DynamicPPL.InitFromParams(NamedTuple(map_res.params))
     catch e
         @warn "MAP refinement failed: $e. Falling back to heuristic guess."
         return DynamicPPL.InitFromParams(NamedTuple(init_guess))
@@ -1527,7 +1462,6 @@ function generate_inducing_points(coords, M_inducing, seed=42; method="kmeans")
 
     Random.seed!(seed)
     n_data = size(coords, 1)
-    @assert M_inducing <= n_data "M_inducing cannot be greater than total number of points."
     if M_inducing >= n_data
         return coords # If M >= N, just use all data points (becomes exact GP)
     end
@@ -1923,36 +1857,6 @@ function libgeos_lattice_adjacency_matrix(rows::Int, cols::Int)
 end
 
 
-function summarize_array(samples::AbstractArray; alpha=0.05)
-    # Return nothing if empty, all-missing, or all-zero (no data/component)
-    if isempty(samples) || all(isnan, samples) || all(==(0), samples)
-        return nothing
-    end
-
-    # Return as scalar if all values across all units and samples are identical (fixed)
-    if all(==(first(samples)), samples)
-        val = first(samples)
-        return val == 0 ? nothing : val
-    end
-
-    dims = size(samples)
-    n_dims = length(dims)
-
-    post_mean = mean(samples, dims=n_dims)
-    post_median = median(samples, dims=n_dims)
-    
-    # Quantile mapping across the samples dimension
-    low_bound = mapslices(x -> quantile(x, alpha/2), samples, dims=n_dims)
-    high_bound = mapslices(x -> quantile(x, 1 - alpha/2), samples, dims=n_dims)
-
-    return (
-        mean = dropdims(post_mean, dims=n_dims),
-        median = dropdims(post_median, dims=n_dims),
-        lower = dropdims(low_bound, dims=n_dims),
-        upper = dropdims(high_bound, dims=n_dims)
-    )
-end
- 
 
 
 # --- 1. Custom PC Priors ---
@@ -2067,33 +1971,6 @@ function build_cyclic_ar1_precision(n, rho, tau)
         Q[i, nxt] = -rho
     end
     return (tau / (one(T) - rho^2)) * Q
-end
-
-
-function build_ar1_precision_matrix(n::Int, rho::T, sigma::T) where {T<:Real}
-    
-    # Revised AR1 implementation for bstm_complex
-    # separates stochastic innovations from the latent states
-
-    # Q represents the precision of the stochastic process deviations
-    Q = spzeros(T, n, n)
-    if n == 1
-        return ones(T, 1, 1) ./ (sigma^2 + 1e-6)
-    end
-
-    Q[1, 1] = one(T)
-    for i in 2:(n - 1)
-        Q[i, i] = one(T) + rho^2
-    end
-    Q[n, n] = one(T)
-
-    for i in 1:(n - 1)
-        Q[i, i + 1] = -rho
-        Q[i + 1, i] = -rho
-    end
-
-    # Marginal variance scaling: Var(x_t) = sigma^2 / (1 - rho^2)
-    return ( (one(T) - rho^2) / (sigma^2 + 1e-8) ) .* Q
 end
 
 
@@ -2337,6 +2214,7 @@ end
 function bstm_options(M_previous::NamedTuple; kwargs...)
     # Convert NamedTuple to Dict to allow merging
     M_new = Dict{Symbol, Any}(pairs(M_previous))
+    
     # Update with new keyword arguments
     for (key, val) in kwargs
         if isnothing(val)
@@ -2350,463 +2228,236 @@ function bstm_options(M_previous::NamedTuple; kwargs...)
     return bstm_options(; M_new...)
 end
 
+ function bstm_options(; kwargs...)
+    M0 = Dict{Symbol, Any}(kwargs)
 
-function bstm_options(; kwargs...)
+    # --- 1. Architectural & Family Settings ---
+    model_arch   = get(M0, :model_arch, "univariate")
+    model_family = get(M0, :model_family, "gaussian")
+    model_space  = get(M0, :model_space, "bym2")
+    model_time   = get(M0, :model_time, "ar1")
+    model_season = get(M0, :model_season, "none")
+    model_st     = get(M0, :model_st, "none")
+    noise        = get(M0, :noise, 1e-6)
 
-    M_base = Dict{Symbol, Any}(kwargs)
-    
-    model_arch =  get(  M_base, :model_arch, "univariate")
-    model_family = get(  M_base, :model_family, "gaussian")  # "poisson", "gaussian", "binomial", "negbin", "lognormal"
-    model_space =  get(  M_base, :model_space, "bym2") # 
-    model_time = get(  M_base, :model_time, "ar1")  
-    model_season = get(  M_base, :model_season, "none")
+    # --- 2. Observation & Dimensionality ---
+    y_obs      = get(M0, :y_obs, nothing)
+    y_N        = get(M0, :y_N, isnothing(y_obs) ? 0 : size(y_obs, 1))
+    W          = get(M0, :W, sparse(I(1)))
+    s_N        = size(W, 1)
 
-    model_st = get(  M_base, :model_st, "none")  # type 1 separable
-        # Type of Space-time Interaction Effect:
-        #- Type I:  (IID) ε_{at} ~ N(0, σ²)
-        #- Type II: (Time-Structured) Interaction structured by AR1 in time, independent in space.
-        #- Type III: (Space-Structured) Interaction structured by ICAR in space, independent in time.
-        #- Type IV: (Fully-Structured) Interaction via Kronecker Product (s_Q ⊗ Q_tm).
-        # st_interaction_type = 1    default
-     
+    s_idx      = get(M0, :s_idx, isnothing(y_obs) ? collect(1:s_N) : ones(Int, y_N))
+    t_idx      = get(M0, :t_idx, ones(Int, y_N))
+    t_N        = get(M0, :t_N, (t_idx isa AbstractVector && !isempty(t_idx) ? maximum(t_idx) : 1))
+    u_idx      = get(M0, :u_idx, ones(Int, y_N))
+    u_N        = get(M0, :u_N, 12)
 
-    y_obs = get(M_base, :y_obs, nothing)
-    y_N = get(M_base, :y_N, size(y_obs, 1) )  # y_obs can be a matrix
-    y_has_data = findall(!ismissing, y_obs)
-
-    W = get(M_base, :W, I(1))
-
-    s_N = size(W, 1)
-    s_idx = get(M_base, :s_idx, 1)  # force to carry to make dimensional expectations simpler ..
-    @assert length(unique(s_idx)) == s_N "Unique spatial indexes must have the same number as the size of W adjacency matrix."
-     
-    s_coord_tuple = get(M_base, :s_coord_tuple, nothing)
-    s_coord = get(M_base, :s_coord, s_coord_tuple)
-    
-    if !isnothing(s_coord) && !(s_coord isa AbstractVector)
-        # If it's a matrix, wrap it in RowVecs for kernel compatibility
-        s_coord = RowVecs(s_coord)
-    elseif isnothing(s_coord) && !isnothing(s_coord_tuple)
-        s_coord = RowVecs(reduce(hcat, [collect(p) for p in s_coord_tuple])')
-    end
- 
+    s_coord_tuple = get(M0, :s_coord_tuple, nothing)
+    s_coord = isnothing(s_coord_tuple) ? nothing : RowVecs(reduce(hcat, [collect(p) for p in s_coord_tuple])')
     s_coord_unique = !isnothing(s_coord) ? unique(s_coord) : nothing
- 
-  
-    t_idx = get(M_base, :t_idx, 1)  # force to carry to make dimensional expectations simpler ..
-    t_N = get(M_base, :t_N, (t_idx === nothing ? 1 : maximum(t_idx)))
-    @assert t_N == length(unique(t_idx)) "Unique time indexes must have the same number as the value of the largest time index."
 
-    t_coord = get(M_base, :t_coord, nothing)
-    if isnothing(t_coord)
-        t_coord = t_idx
+    st_idx = get(M0, :st_idx, (t_idx .- 1) .* s_N .+ s_idx)
+
+    use_zi = get(M0, :use_zi, false)
+    use_sv = get(M0, :use_sv, false)
+
+    # --- 3. Spatial Precision & Advanced Precomputes ---
+    s_Q = sparse(I(s_N))
+    K_nystrom_proj = nothing
+    cluster_assignments = nothing
+    deep_gp_input = nothing
+
+    if model_space in ["bym2", "besag", "leroux", "sar", "dag"]
+        D_sp   = Diagonal(vec(sum(W, dims=2)))
+        Q_raw  = D_sp - W
+        eigs   = filter(x -> x > 1e-6, eigvals(Matrix(Q_raw)))
+        sf     = isempty(eigs) ? 1.0 : exp(mean(log.(eigs)))
+        s_Q    = Symmetric(sparse(Q_raw ./ sf))
     end
-    t_coord_unique = !isnothing(t_coord) ? unique(t_coord) : nothing
 
- 
-    u_N = get(M_base, :u_N, 12)
-    u_idx = get(M_base, :u_idx, 1)  # force to carry to make dimensional expectations simpler ..
-    
-    u_coord = get(M_base, :u_coord, nothing)
-    u_coord_unique = !isnothing(u_coord) ? unique(u_coord) : nothing
-    
-    
-    st_idx = get(M_base, :st_idx, (t_idx .- 1) .* t_N .+ s_idx )
-    
-    st_coord =  get(M_base, :st_coord, nothing )  # space and time
-    st_coord = !isnothing(s_coord) && !isnothing(t_coord) ? hcat([p[1] for p in s_coord], [p[2] for p in s_coord], t_coord) : hcat( (s_idx, t_idx)... )
-  
-    st_coord_normalized = !isnothing(s_coord) ?  st_coord : nothing
-    if !isnothing(st_coord_normalized)
-        for i in 1:size(st_coord_normalized, 2)
-            st_coord_normalized[:, i] = st_coord_normalized[:, i] ./ maximum(st_coord_normalized[:, i])
+    if model_space == "nystrom"
+        kernel_nystrom = get(M0, :kernel_nystrom, Matern32Kernel() ∘ ScaleTransform(1.0))
+        inducing_pts = get(M0, :inducing_points, nothing)
+        if !isnothing(s_coord) && !isnothing(inducing_pts)
+            K_nystrom_proj = precompute_nystrom_projection(s_coord, inducing_pts, kernel_nystrom)
         end
-    end 
-
-    period = get(M_base, :period, 12)
-    weights = get(M_base, :weights, ones(Float64, y_N))
-    log_offset = get(M_base, :log_offset, zeros(Float64, y_N))
-    trials = get(M_base, :trials, ones(Int, y_N))
-    
-    rnd_seed = get(M_base, :rnd_seed, 42)
-    Random.seed!(rnd_seed)
-    
-    noise = get(M_base, :noise, 1e-6)   # jitter for Pos Def
-
-    # Fixed weights for multi-fidelity/A-series models (A13-A25)
-    # --- 2. Initialize Fixed Projection Matrices (DFRFF) ---
-    # These are static weights for the functional mapping layers
-    # M_base = 40
-    # M_sig = 20
-
-    # Layer Z: Maps Space (Dim 2) to Latent Z
-    # W_z_fix = randn(2, M_base); b_z_fix = rand(M_base) .* 2π
-
-    # Layer W: Maps [Space, Time, Z] (Dim 4) to Latent U
-    # W_w_fix = randn(4, M_base); b_w_fix = rand(M_base) .* 2π
-
-    # Layer Y: Maps [Space, Time, Z, U] (Dim 5) to Output Y
-    # W_y_fix = randn(5, M_base); b_y_fix = rand(M_base) .* 2π
-
-    # Layer Sigma: Maps [Space, Time] (Dim 3) to Volatility
-    
-    # --- RFF Spectral Dimensions ---
-    M_rff = get(M_base, :M_rff, 40)
-    M_inducing_val = get( M_base, :M_inducing_val, 15)
-    
-    D_in = get(M_base, :D_in, 2)
-
-    W_fixed = randn(D_in, M_rff)
-    b_fixed = rand(M_rff) .* 2 * pi
- 
-    use_sv = get(  M_base, :use_sv, false)  # stochastic volatitity
-    stochastic_volatility_factor = nothing
-    if use_sv
-        vol_proj = (st_coord_normalized * W_f_sigmaixed) .+ b_f_sigmaixed'
-        stochastic_volatility_factor = sqrt( 2.0 / M.M_rff_sigma) .* cos.(vol_proj)
+    elseif model_space == "deepGP"
+        if !isnothing(s_coord_tuple)
+            s_coord_mat = reduce(hcat, [collect(p) for p in s_coord_tuple])'
+            deep_gp_input = hcat(s_coord_mat, Float64.(t_idx) ./ t_N)
+        end
+    elseif model_space == "local" || model_space == "mosaic"
+        n_clusters = get(M0, :n_clusters, 4)
+        if !isnothing(s_coord_unique)
+            cl_res = kmeans(reduce(hcat, [collect(p) for p in s_coord_unique])', n_clusters)
+            cluster_assignments = cl_res.assignments
+        end
     end
 
-    M_rff_sigma = get(M_base, :M_rff_sigma, 20)
-    W_sigma_fixed = randn(3, M_rff_sigma); 
- 
-    M_rff_w = get( M_base, :M_rff_w, 30)
+    # --- 4. Temporal & Seasonal Precomputes ---
+    t_Q = model_time == "ar1" ? build_bstm_ar1_template(t_N).matrix : (model_time == "rw2" ? build_bstm_rw2_template(t_N).matrix : sparse(I(t_N)))
+    u_Q = model_season == "ar1" ? build_bstm_ar1_template(u_N).matrix : (model_season == "rw2" ? build_bstm_rw2_template(u_N).matrix : sparse(I(u_N)))
 
-    W_z_fixed = randn(2, M_rff); 
-    b_z_fixed = rand(M_rff) .* 2pi
+    t_period = get(M0, :t_period, Float64(t_N))
+    t_angle = (model_time == "harmonic") ? 2pi .* (1:t_N) ./ t_period : nothing
+    u_angle = (model_season == "harmonic") ? 2pi .* (1:u_N) ./ 12.0 : nothing
 
-    W_w_fixed = randn(4, M_rff); 
-    b_w_fixed = rand(M_rff) .* 2pi
+    t_Z_rff = nothing
+    if model_time == "rff"
+        m_rff_t = get(M0, :m_rff_t, 10)
+        t_ls = get(M0, :t_ls, 0.5)
+        t_Z_rff = get_rff_trend_basis(collect(1.0:t_N) ./ t_N, m_rff_t, t_ls)
+    end
 
-    W_y_gp_fixed = randn(3, M_rff); 
-    b_y_gp_fixed = rand(M_rff) .* 2pi
+    # --- 5. Covariate Processing & Random Effect Rules ---
+    cov_re_structures = Dict{Symbol, Any}()
+    cov_groups = Dict{Symbol, Vector{Int}}()
 
-    b_sigma_fixed = rand(M_rff_sigma) .* 2pi
+    if haskey(M0, :cov) && haskey(M0, :re_rules)
+        for (c_name, rule) in M0[:re_rules]
+            c_sym = Symbol(c_name)
+            n_bins = get(get(M0, :cov_discretization, Dict()), c_sym, 10)
+            # FIX: Convert c_name to Symbol to safely index NamedArrays
+            vals = M0[:cov][:, Symbol(c_name)]
+
+            bin_edges = range(minimum(vals), maximum(vals), length=n_bins+1)
+            cov_groups[c_sym] = clamp.(searchsortedfirst.(Ref(bin_edges), vals) .- 1, 1, n_bins)
+
+            if rule == "rw2" || rule == "harmonic"
+                D1 = [i == j ? -1.0 : (j == i + 1 ? 1.0 : 0.0) for i in 1:n_bins-1, j in 1:n_bins]
+                D2 = [i == j ? -1.0 : (j == i + 1 ? 1.0 : 0.0) for i in 1:n_bins-2, j in 1:n_bins-1]
+                cov_re_structures[c_sym] = (D2 * D1)' * (D2 * D1)
+            elseif rule == "ar1"
+                cov_re_structures[c_sym] = build_ar1_precision_matrix(n_bins, 0.0, 1.0)
+            elseif rule == "iid"
+                cov_re_structures[c_sym] = Matrix(1.0I, n_bins, n_bins)
+            elseif rule == "gp"
+                coords = collect(1.0:Float64(n_bins))
+                K = kernelmatrix(SqExponentialKernel(), coords) + noise*I
+                cov_re_structures[c_sym] = inv(Symmetric(Matrix(K)))
+            elseif rule == "none"
+                cov_re_structures[c_sym] = Matrix(1e6*I, n_bins, n_bins)
+            end
+        end
+    end
+
+    # --- 6. Transport & Interaction Precomputes ---
+    st_diffusion_operator = nothing
+    if model_st in ["diffusion", "advection_diffusion"]
+        st_diffusion_operator = Matrix(Diagonal(vec(sum(W, dims=2))) - W)
+    end
+
+    # --- 7. Final Consolidation ---
+    updates = (
+        model_arch=model_arch, model_family=model_family, model_space=model_space,
+        model_time=model_time, model_season=model_season, model_st=model_st,
+        y_N=y_N, s_N=s_N, t_N=t_N, u_N=u_N, noise=noise,
+        s_idx=s_idx, t_idx=t_idx, u_idx=u_idx, st_idx=st_idx,
+        s_coord=s_coord, s_coord_unique=s_coord_unique, s_Q=s_Q, t_Q=t_Q, u_Q=u_Q,
+        t_angle=t_angle, u_angle=u_angle, t_Z_rff=t_Z_rff,
+        K_nystrom_proj=K_nystrom_proj, cluster_assignments=cluster_assignments, deep_gp_input=deep_gp_input,
+        cov_groups=cov_groups, cov_re_structures=cov_re_structures,
+        st_diffusion_operator=st_diffusion_operator,
+        use_zi=use_zi, use_sv=use_sv,
+        weights=get(M0, :weights, ones(y_N)),
+        log_offset=get(M0, :log_offset, zeros(y_N)),
+        trials=get(M0, :trials, ones(Int, y_N)),
+        fixed=get(M0, :fixed, ones(y_N, 1)),
+        fixed_N=get(M0, :fixed_N, size(get(M0, :fixed, ones(y_N, 1)), 2))
+    )
+
+    for (k, v) in pairs(updates); M0[k] = v; end
+    return NamedTuple(M0)
+end
 
 
-   
-    # linear design matrix (beta)
-    fixed = get( M_base, :fixed, ones(y_N) )  # intercept only by default
-    fixed = fixed isa AbstractMatrix ? fixed : (fixed isa AbstractVector ? hcat(fixed) : reduce(hcat, fixed))
- 
-    fixed_N = !isnothing(fixed) ? size(fixed, 2) : 0  
+function apply_discretization_logic(vals, rules)
+    groups = nothing
+    new_vals = nothing
 
-    # random effects covariates that will be smoothed outside of the design matrix (fixed) 
-    # e.g. discretizes covariates for RW2 smoothing models, etc
-    N_cat = get(M_base, :N_cat, 9)
-    
-    cov = get(M_base, :cov, nothing )
-    cov_N = !isnothing(cov) ? size(cov,2) : 0
+    if rules == 0 || isnothing(rules)
+        groups = collect(1:length(vals))
+    elseif rules == "unit"
+        min_v, max_v = minimum(vals), maximum(vals)
+        new_vals = (min_v == max_v) ? zeros(length(vals)) : (vals .- min_v) ./ (max_v - min_v)
+        groups = collect(1:length(vals))
+    elseif rules == "zscore"
+        m, s = Statistics.mean(vals), Statistics.std(vals)
+        new_vals = (s ≈ 0.0) ? zeros(length(vals)) : (vals .- m) ./ s
+        groups = collect(1:length(vals))
+    elseif rules == "log"
+        new_vals = log.(vals .+ 1.0 .- minimum(vals))
+        groups = collect(1:length(vals))
+    elseif rules isa Int
+        if rules > 1
+            qs = unique(sort(quantile(vals, (0:rules) ./ rules)))
+            groups = (length(qs) < 2) ? ones(Int, length(vals)) : clamp.(map(x -> searchsortedlast(qs, x), vals), 1, length(qs)-1)
+        else
+            groups = ones(Int, length(vals))
+        end
+    elseif rules isa AbstractString && startswith(rules, "regular:")
+        n = parse(Int, Base.split(rules, ":")[2])
+        q025, q975 = quantile(vals, 0.025), quantile(vals, 0.975)
+        bins = unique(sort(collect(range(q025, stop=q975, length=n+1))))
+        groups = (length(bins) < 2) ? ones(Int, length(vals)) : clamp.(map(x -> searchsortedlast(bins, x), vals), 1, length(bins)-1)
+    elseif rules isa AbstractVector
+        groups = clamp.(map(x -> searchsortedlast(rules, x) + 1, vals), 1, length(rules) + 1)
+    end
+    return new_vals, groups
+end
 
-    model_cov = get(M_base, :model_cov, nothing )
-    cov_indices = get(M_base, :cov_indices, nothing )
-    
-    c_period = nothing
-    c_angle = nothing
-    c_steps = nothing
+function assign_covariate_units(cov_data_base, cov_discretization, re_rules, cov_interactions)
+    cov_data_for_processing = deepcopy(cov_data_base)
+    cov_groups = Dict{Symbol, Vector{Int}}()
+    cov_re_structures = Dict{Symbol, Any}()
 
-    c_Q = nothing 
-
-    if !isnothing(model_cov) 
-
-        if isnothing(cov_indices)    
-            cov_indices = zeros(Int, y_N, cov_N)
-            if cov_N > 0
-                probs = collect(range(0.0, stop=1.0, length=N_cat + 1))
-                for i in 1:cov_N
-                    cov_indices[:,i] = map(x -> clamp(searchsortedfirst(quantile(cov[:,i], probs), x) - 1, 1, N_cat), cov[:,i])
+    if !isnothing(cov_discretization)
+        for cov_name_sym in names(cov_data_base, 1)
+            if haskey(cov_discretization, cov_name_sym)
+                rules = cov_discretization[cov_name_sym]
+                vals = cov_data_for_processing[cov_name_sym, :]
+                new_vals, groups = apply_discretization_logic(vals, rules)
+                if !isnothing(new_vals); cov_data_for_processing[cov_name_sym, :] = new_vals; end
+                if !isnothing(groups)
+                    cov_groups[cov_name_sym] = groups
+                    if haskey(re_rules, cov_name_sym) && length(unique(groups)) > 1
+                        n_bins = length(unique(groups))
+                        if re_rules[cov_name_sym] == "rw2"; cov_re_structures[cov_name_sym] = build_bstm_rw2_template(n_bins).matrix
+                        elseif re_rules[cov_name_sym] == "ar1"; cov_re_structures[cov_name_sym] = build_bstm_ar1_template(n_bins).matrix
+                        end
+                    end
                 end
             end
         end
-
-        if model_cov == "ar1"
-            c_Q =  build_bstm_ar1_template(N_cat)
-        
-        elseif model_cov == "rw2"
-            c_Q =  build_bstm_rw2_template(N_cat)
-
-        elseif model_cov == "harmonic"
-            # c_eff_mat[:, k] = (c_α_k .* sin.(2π .* c_steps ./ 12.0) .+ c_β_k .* cos.(2π .* c_steps ./ 12.0)) .* c_sigma[k]
-            c_steps =   get(M_base, :c_steps, 1 )
-            c_period =   get(M_base, :c_period, 1 )
-            c_angle = 2π * c_steps / c_period
-            c_Q = Matrix(build_bstm_harmonic_template(N_cat).matrix)
-        end
-
-
-
     end
-    
-    # Templates for timeseries effects
 
-    t_Z_trend = nothing
-    t_Z_seas = nothing
- 
-    # 3. Seasonal Precision (u_Q)
-    u_Q = nothing
-    if !isnothing(u_N) 
-        if model_season == "ar1"
-            u_Q = build_bstm_ar1_template(u_N).matrix
-        elseif model_season == "rw2"
-            u_Q = build_bstm_rw2_template(u_N).matrix
-            
-        elseif model_season =="harmonic"
-            # Simple seasonal cycle: alpha*sin(2pi*t/P) + beta*cos(2pi*t/P)
-            # t_eff = (h_α .* sin.(2π .* t_steps ./ period) .+ h_β .* cos.(2π .* t_steps ./ period)) .* t_sigma
-            u_period = 12.0 # Default period (annual)
-            u_steps = 1:u_N
-            u_angle = 2π * t_steps / t_period
-            u_Q = build_bstm_harmonic_template(u_N).matrix
-
-        elseif model_season =="rw2"
-            u_Q = build_bstm_rw2_template(u_N).matrix
-        else 
-            u_Q = I(u_N)
+    for inter_str in cov_interactions
+        parts = Base.split(inter_str, "*")
+        if length(parts) == 2
+            n1, n2 = Symbol(parts[1]), Symbol(parts[2])
+            if n1 in names(cov_data_for_processing, 1) && n2 in names(cov_data_for_processing, 1)
+                inter_val = cov_data_for_processing[n1, :] .* cov_data_for_processing[n2, :]
+                new_row = NamedArray(inter_val', (Symbol[Symbol(inter_str)], names(cov_data_for_processing, 2)))
+                cov_data_for_processing = vcat(cov_data_for_processing, new_row)
+                if !isnothing(cov_discretization) && haskey(cov_discretization, Symbol(inter_str))
+                    rule_int = cov_discretization[Symbol(inter_str)]
+                    iv_vals, iv_groups = apply_discretization_logic(inter_val, rule_int)
+                    if !isnothing(iv_vals); cov_data_for_processing[Symbol(inter_str), :] = iv_vals; end
+                    if !isnothing(iv_groups)
+                        cov_groups[Symbol(inter_str)] = iv_groups
+                        if haskey(re_rules, Symbol(inter_str)) && length(unique(iv_groups)) > 1
+                            n_bins = length(unique(iv_groups))
+                            if re_rules[Symbol(inter_str)] == "rw2"; cov_re_structures[Symbol(inter_str)] = build_bstm_rw2_template(n_bins).matrix
+                            elseif re_rules[Symbol(inter_str)] == "ar1"; cov_re_structures[Symbol(inter_str)] = build_bstm_ar1_template(n_bins).matrix
+                            end
+                        end
+                    end
+                end
+            end
         end
     end
-
-    t_period = nothing
-    t_steps = nothing
-    t_angle = nothing
-
-    # 2. Temporal Precision (t_Q)
-    t_Q = nothing
-    if !isnothing(t_N)
-        if model_time == "ar1"
-            t_Q = build_bstm_ar1_template(t_N).matrix
-        elseif model_time == "rw2"
-            t_Q = build_bstm_rw2_template(t_N).matrix
-        
-        elseif model_time == "harmonic"
-            # Simple annual cycle: alpha*sin(2pi*t/P) + beta*cos(2pi*t/P)
-            # t_eff = (h_α .* sin.(2π .* t_steps ./ period) .+ h_β .* cos.(2π .* t_steps ./ period)) .* t_sigma
-            t_period = 1.0 # Default period (annual)
-            t_steps = 1:t_N
-            t_angle = 2π * t_steps / t_period
-            
-            t_Q = build_bstm_harmonic_template(t_N).matrix
-
-        elseif model_time == "rff"
-            # Fixed Projections & RFF Bases
-            # Generating fixed weights and phases ensures stability across iterations for deep functional RFFs
-            # Trend & Seasonality Static Projection Vectors
-            m_trend = get(M_base, :m_trend, 10) 
-            m_seas = get(M_base, :m_seas, 5)
-            t_vec = get(M_base, :t_vec,  collect(1:t_N) ./ t_N )
-            Om_tr = randn(Float64, m_trend) ./ 0.5; 
-            Ph_tr = rand(Float64, m_trend) .* 2pi
-            t_Z_trend = sqrt(2/m_trend) .* cos.(t_vec * Om_tr' .+ Ph_tr')
-            t_Z_seas = zeros(Float64, t_N, 2 * m_seas)
-    #        for j in 1:m_seas
-    #            om_j = 2*pi * j; t_Z_seas[:, 2j-1] = cos.(om_j .* t_vec); t_Z_seas[:, 2j] = sin.(om_j .* t_vec)
-    #        end
-        else 
-            t_Q = I(t_N)
-        end
-    end
-
-    # spatial effects pre-computes 
-    cluster_assignments=nothing
-    n_clusters = nothing
-    n_layers = nothing
-    m_layers = nothing
- # 5. Spatial Geometric Indices
-    # Coordinates and Inducing points for FITC Sparse GPs
-
-    M_inducing_count = get(M_base, :M_inducing_count, 15)  
-    
-    Z_inducing = !isnothing(st_coord) ? generate_inducing_points(st_coord, M_inducing_count) : nothing
-     
-    # Subsets for varied fidelity resolutions
-    
-    z_obs = get(M_base, :z_obs, nothing)   # spatial only
-    w_obs = get(M_base, :w_obs, nothing)   # space-time 
-    
-    N_z = !isnothing(z_obs) ? size(z_obs, 2) : 0
-    N_w = !isnothing(w_obs) ? size(w_obs, 2) : 0 
-     
-    z_coords_s = get(M_base, :z_coords_s, nothing)  
-    w_coords_st = get(M_base, :w_coords_st, nothing)  # consider scaling time to range from 0 to 1
- 
-
-    K_nystrom_proj = nothing
-    kernel_nystrom =  get( M_base, :kernel_nystrom,  Matern32Kernel() ∘ ScaleTransform(1.0) )
-    inducing_points = get( M_base, :inducing_points, nothing)
-
-
-    s_Q = I(s_N)
- 
-    if model_space in [ "bym2", "besag", "leroux", "svc", "local" ] 
-        # Standardized Precision Scaling (BYM2 & RW2)
-        # Pre-scaling ensures that priors on sigma_sp and sigma_rw2 are interpretable as marginal scales
-        # A. Spatial Scaling (BYM2 ICAR) .. aka : Standard Graph Laplacian
-        D_sp = Diagonal(vec(sum(W, dims=2)))
-        Q_raw = D_sp - W
-        eigs = filter(x -> x > 1e-6, eigvals(Matrix(Q_raw))) 
-        # FIX: Explicitly cast to dense Matrix to prevent PDMats MethodError
-        sf = isempty(eigs) ? 1.0 : exp(mean(log.(eigs)))
-        s_Q = Symmetric(Matrix(Q_raw ./ sf))
-
-    elseif model_space == "denseGP"
-        
-        #
-
-    elseif model_space == "deepGP"
-    
-        # --- 2. Hierarchical Deep GP Construction ---
-        # Initial input: [Lon, Lat, Time]
-        
-        current_input = hcat([p[1] for p in  s_coord_tuple], [p[2] for p in  s_coord_tuple], Float64.( t_idx))
-        m_layers = get( M_base, :m_layers, m_layers=[10, 5]) 
-        n_layers = length(m_layers)
-
-    elseif model_space == "local"
-        
-        n_clusters = get(M_base, :n_clusters, 4)
-        cl_res = kmeans( M.s_coord_unique' , n_clusters)  # fix to regular grid
-        cluster_assignments = cl_res.assignments
-
-    elseif model_space == "nystrom" 
-        # Nystrom low-rank approximation
-        inducing_points = !isnothing(inducing_points) ? inducing_points : sobs[1:10,]
-        K_nystrom_proj = precompute_nystrom_projection( s_coord, inducing_points, kernel_nystrom; jitter=1e-6)
-    end
-  
-
-    # Ensure s_Q is handled as a concrete Symmetric matrix for AD
-    s_Q = if s_Q isa AbstractMatrix
-        Symmetric(Matrix(s_Q) + (noise * I))
-    else
-        Symmetric(Matrix(Diagonal(fill(1.0 + noise, s_N))))
-    end
-
-
-    updates = (
-        y_obs = y_obs,
-        
-        s_idx = s_idx, 
-        s_coord = s_coord, 
-        s_coord_unique = s_coord_unique,
-
-        t_idx = t_idx, 
-        t_coord = t_coord, 
-        t_coord_unique = t_coord_unique,
-
-        u_idx =u_idx,
-        u_coord = u_coord, 
-        u_coord_unique = u_coord_unique,
-
-        W = W, 
-        trials = trials, 
-        weights = weights, 
-        log_offset = log_offset,
-        
-        y_has_data = y_has_data,
-        st_coord = st_coord,
-        st_coord_normalized = st_coord_normalized,
-        st_idx = st_idx,
-
-        z_obs = z_obs, 
-        z_coords_s = z_coords_s,   
-        N_z=N_z,
-
-        w_obs = w_obs, 
-        w_coords_st = w_coords_st,
-        N_w=N_w,
-        
-        s_Q = s_Q, 
-        t_Q = t_Q,
-        u_Q = u_Q,
-
-        t_Z_trend = t_Z_trend, 
-        t_Z_seas = t_Z_seas, 
-        
-        t_period = t_period,
-        t_steps = t_steps,
-        t_angle = t_angle,
-  
-        c_period = c_period, 
-        c_steps = c_steps,
-        c_angle = c_angle, 
-    
-        Z_inducing = Z_inducing,
-
-        M_inducing_val = M_inducing_val,
-        K_nystrom_proj = K_nystrom_proj,
-        kernel_nystrom = kernel_nystrom,
-        M_inducing_count = M_inducing_count, 
-
-        use_sv = use_sv,
-        stochastic_volatility_factor = stochastic_volatility_factor,
-
-        M_rff = M_rff,
-        M_rff_w = M_rff_w,
-        M_rff_sigma = M_rff_sigma,
-        W_z_fixed = W_z_fixed, 
-        b_z_fixed = b_z_fixed, 
-        W_w_fixed = W_w_fixed, 
-        b_w_fixed = b_w_fixed,
-        W_y_gp_fixed = W_y_gp_fixed, 
-        b_y_gp_fixed = b_y_gp_fixed, 
-
-        W_sigma_fixed = W_sigma_fixed, 
-        b_sigma_fixed = b_sigma_fixed,
-
-        cluster_assignments = cluster_assignments,
-         
-        W_fixed = W_fixed,
-        b_fixed = b_fixed,
-        rff_scale = sqrt(2.0 / M_rff),  
-
-        model_arch = model_arch,
-        model_family = model_family,
-        model_space = model_space,
-        model_time = model_time,
-        model_season = model_season,
-        model_st = model_st,
-        model_cov = model_cov,
-        
-        fixed = fixed, 
-        cov_indices = cov_indices,
-        cov = cov,  
-
-        n_mosaics = get(M_base, :n_mosaics, 5),
-        m_rff = get(M_base, :m_rff, 20),
-         
-        s_D = size(s_coord, 2),
-        t_D = size(t_coord, 2),
-        st_D = size(s_coord, 2) + size(t_coord, 2),
-
-        period = period,  
-        
-        y_N = y_N, 
-        s_N = s_N, 
-        t_N = t_N, 
-        u_N = u_N,
-        fixed_N = fixed_N,
-        N_cat = N_cat,
-        cov_N = cov_N,
-        
-        
-        m_feat = 5,
-        m_warp = 10, 
-        m_spatial=50,
-        grid_res = get(M_base, :grid_res,  64), 
-        pad_factor = get(M_base, :pad_factor, 2),
-
-        n_clusters = n_clusters, # "localised"
-        noise=noise,
-        st_interaction_type =  get(M_base, :st_interaction_type, 0),  # default is no interaction      
-
-        use_zi = get(M_base, :use_zi, false)
-    )
-
-    for (k, v) in pairs(updates); M_base[k] = v; end
-
-    return NamedTuple(M_base)
+    return cov_data_for_processing, cov_groups, cov_re_structures
 end
- 
-
- 
 
 
 # -----------------------
@@ -2921,78 +2572,6 @@ function get_params_vector(chain, base_name, len)
 
     @warn "Parameter '$base_name' not found in chain. Returning zeros for length $len."
     return zeros(Float64, N_samples, len)
-end
-
-
-function get_params_matrix(chain, base_name, dims)
-    s_N, t_N = dims
-    names_ch = get_chain_names(chain)
-    N_samples = size(chain, 1)
-
-    println("DEBUG: Reconstructing matrix '$base_name'. Target: ($s_N x $t_N) over $N_samples samples.")
-
-    # 1. Tier 1: Multi-indexed [i,j]
-    regex_ij = Regex("^" * base_name * "\\[(\\d+),(\\d+)\\]")
-    matched_ij = filter(n -> occursin(regex_ij, n), names_ch)
-
-    if !isempty(matched_ij)
-        println("DEBUG: Found multi-indexed names for matrix '$base_name'.")
-        res = zeros(s_N, t_N, N_samples)
-        for n in matched_ij
-            m = match(regex_ij, n)
-            if m !== nothing
-                i, j = parse(Int, m.captures[1]), parse(Int, m.captures[2])
-                if i <= s_N && j <= t_N
-                    val_obj = chain[Symbol(n)]
-                    raw = hasfield(typeof(val_obj), :data) ? val_obj.data : Array(val_obj)
-                    res[i, j, :] = vec(raw)
-                end
-            end
-        end
-        return res
-    end
-
-    # 2. Tier 2: Flattened vector [k]
-    regex_k = Regex("^" * base_name * "\\[(\\d+)\\]")
-    matched_k = filter(n -> occursin(regex_k, n), names_ch)
-
-    if !isempty(matched_k)
-        println("DEBUG: Found flattened indexed names for '$base_name'.")
-        res = zeros(s_N, t_N, N_samples)
-        for n in matched_k
-            m = match(regex_k, n)
-            if m !== nothing
-                k = parse(Int, m.captures[1])
-                i = (k - 1) % s_N + 1
-                j = div(k - 1, s_N) + 1
-                if i <= s_N && j <= t_N
-                    val_obj = chain[Symbol(n)]
-                    raw = hasfield(typeof(val_obj), :data) ? val_obj.data : Array(val_obj)
-                    res[i, j, :] = vec(raw)
-                end
-            end
-        end
-        return res
-    end
-
-    # 3. Tier 3: Single entity fallback
-    if base_name in names_ch
-        println("DEBUG: Found single entity for '$base_name'.")
-        data_obj = chain[Symbol(base_name)]
-        raw_data = hasfield(typeof(data_obj), :data) ? data_obj.data : Array(data_obj)
-        if ndims(raw_data) == 3; raw_data = raw_data[:, :, 1]; end
-
-        if size(raw_data, 2) == s_N * t_N
-            res = zeros(s_N, t_N, N_samples)
-            for s in 1:N_samples
-                res[:, :, s] = reshape(raw_data[s, :], s_N, t_N)
-            end
-            return res
-        end
-    end
-
-    @warn "Parameter '$base_name' not found or dimension mismatch. Returning zeros."
-    return zeros(s_N, t_N, N_samples)
 end
 
 
@@ -3144,15 +2723,16 @@ end
 
 
 
-abstract type AbstractArchitecture end
+abstract type AbstractModelArchitecture end
 
-struct DidacticArchitecture <: AbstractArchitecture end 
-struct UnivariateArchitecture <: AbstractArchitecture end
-struct MultivariateArchitecture <: AbstractArchitecture end
-struct MultioutcomeArchitecture <: AbstractArchitecture end
-struct MultifidelityArchitecture <: AbstractArchitecture end
-struct ComplexArchitecture <: AbstractArchitecture end
-struct UnknownArchitecture <: AbstractArchitecture end
+struct DidacticArchitecture <: AbstractModelArchitecture end 
+struct UnivariateArchitecture <: AbstractModelArchitecture end
+struct MultivariateArchitecture <: AbstractModelArchitecture end
+struct MultioutcomeArchitecture <: AbstractModelArchitecture end
+struct MultifidelityArchitecture <: AbstractModelArchitecture end
+struct ComplexArchitecture <: AbstractModelArchitecture end
+struct SizeStructuredArchitecture <: AbstractModelArchitecture end
+struct UnknownArchitecture <: AbstractModelArchitecture end
 
 function get_architecture(model_arch::String)
     if model_arch=="example"
@@ -3165,6 +2745,8 @@ function get_architecture(model_arch::String)
         return MultioutcomeArchitecture()
     elseif model_arch in ["multifidelity"]
         return MultifidelityArchitecture()
+    elseif model_arch == "size_structured"
+        return SizeStructuredArchitecture()
     elseif model_arch in ["complex"]
         return ComplexArchitecture()
     else
@@ -3187,7 +2769,7 @@ function get_model_family(model_family::String)
         return GaussianFamily()
     elseif model_family == "lognormal"
         return LogNormalFamily()
-    elseif model_family == "binomial"
+    elseif model_family in ["bernoulli", "binomial"]
         return BinomialFamily()
     elseif model_family == "negbin"
         return NegativeBinomialFamily()
@@ -3229,6 +2811,7 @@ function _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sig
     noisy = zeros(N_tot, N_samples)
     log_lik = zeros(N_samples, M.y_N)
 
+    # Helper to handle parameter access across different chain types
     name_strs = string.(FlexiChains.parameters(chain))
 
     for j in 1:N_samples
@@ -3246,23 +2829,24 @@ function _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sig
         end
 
         for i in 1:N_tot
+            is_obs = i <= M.y_N
             mu_eta = eta[i, j]
 
             # --- Link Functions ---
             mu = if fam isa PoissonFamily || fam isa NegativeBinomialFamily
-                clamp(exp(mu_eta), 1e-10, 1e9) # Prevent Inf/NaN for Poisson sampling
+                clamp(exp(mu_eta), 1e-10, 1e9) 
             elseif fam isa BinomialFamily
                 logistic(mu_eta)
             elseif fam isa LogNormalFamily
-                mu_eta # Latent is mean of log(y)
+                mu_eta 
             else
                 mu_eta
             end
 
             denoised[i, j] = mu
 
-            # --- Likelihood Calculation (Audit Training Only) ---
-            if i <= M.y_N
+            # --- Likelihood Calculation (Training Data Only) ---
+            if is_obs
                 y_vals_src = isnothing(y_obs_custom) ? M.y_obs : y_obs_custom
                 y_val = y_vals_src[i]
                 log_lik[j, i] = if fam isa PoissonFamily; logpdf(Poisson(mu), y_val)
@@ -3280,16 +2864,17 @@ function _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sig
             noisy[i, j] = if fam isa GaussianFamily; mu + randn() * sig_y[i]
                           elseif fam isa LogNormalFamily; rand(LogNormal(mu, sig_y[i]))
                           elseif fam isa PoissonFamily; rand(Poisson(mu))
-                          elseif fam isa BinomialFamily; rand(Binomial(M.trials[is_obs ? i : 1], mu))
+                          elseif fam isa BinomialFamily
+                               n_trials = is_obs ? M.trials[i] : 1 
+                               rand(Binomial(n_trials, mu))
                           elseif fam isa NegativeBinomialFamily
-                               r_val = "r_nb" in name_strs ? chain[:r_nb].data[j] : 1.0 # r_nb is the parameter name from the chain
+                               r_val = "r_nb" in name_strs ? chain[:r_nb].data[j] : 1.0
                                rand(NegativeBinomial(r_val, r_val / (r_val + mu)))
                           else mu end
         end
     end
     return denoised, noisy, log_lik
 end
- 
 
 
 function _compute_waic(log_lik)
@@ -3327,103 +2912,110 @@ function _extract_beta_cov(all_names, chain, M, N_samples, alpha)
     return isempty(results) ? nothing : results
 end
 
+function create_prediction_surface(basis_df, observations_df, au; fixed_df=nothing, lambda_s=2.0, lambda_t=1.0, max_iters=5)
+    # 1. Initialization and Automatic Covariate Detection
+    mergeon = hasproperty(basis_df, :u_idx) && hasproperty(observations_df, :u_idx) ? [:s_idx, :t_idx, :u_idx] : [:s_idx, :t_idx]
 
+    # Determine covariates: columns in observations_df that are NOT merge keys
+    all_covs = setdiff(propertynames(observations_df), mergeon)
 
-function create_prediction_surface(basis_df, observations_df, au; fixed_df=nothing, lambda=2.0, st_covs=[:u1, :u2, :u3], z_cov=[:z])
+    # Join datasets
+    surface = leftjoin(basis_df, observations_df, on = mergeon)
 
-    # 1. Initialization and Join with Observations
-    if hasproperty(basis_df, :u_idx) & hasproperty(observations_df, :u_idx) 
-        mergeon = [:s_idx, :t_idx, :u_idx]
-    else 
-        mergeon = [:s_idx, :t_idx]
+    # FIX: Explicitly convert EVERY column to Float64/Missing to prevent InexactError during assignment
+    for c in propertynames(surface)
+        surface[!, c] = convert(Vector{Union{Float64, Missing}}, collect(surface[!, c]))
     end
-        
-    surface = leftjoin(basis_df, observations_df, on =mergeon)
 
-    # 2. Dynamic Merge of Fixed Effects
-    # This identifies present indices (Space, Time, Season) in fixed_df and merges accordingly
+    # Merge Fixed Effects
     if !isnothing(fixed_df)
-        join_cols = intersect( mergeon, propertynames(fixed_df))
+        join_cols = intersect(mergeon, propertynames(fixed_df))
         if !isempty(join_cols)
-            # Merge fixed effects; 'on' is determined by indices available in fixed_df
             surface = leftjoin(surface, fixed_df, on = join_cols, makeunique=true)
+            for c in propertynames(surface)
+                 surface[!, c] = convert(Vector{Union{Float64, Missing}}, collect(surface[!, c]))
+            end
         end
+    end
+
+    if isempty(all_covs)
+        return surface
     end
 
     centroids = au.centroids
     n_units = length(centroids)
-    all_covs = [z_cov; st_covs]
+    W = au.W
 
-    # Helper for safe column-wise mean
-    get_col_mean(col) = begin
-        v = filter(x -> !ismissing(x) && !isnan(x), col)
-        return isempty(v) ? NaN : mean(v)
-    end
-
-    # 3. Precompute Global Means and Distance Weights
-    global_means = nothing
-    if all(in(mergeon, propertynames(surface)) ) 
-        global_means = Dict(c => get_col_mean(surface[!, c]) for c in all_covs)
-    end
-
-    dist_mat = [sqrt(sum((c1 .- c2).^2)) for c1 in centroids, c2 in centroids]
-    weight_mat = exp.(-dist_mat.^2 ./ (2 * lambda^2))
+    # 2. Precompute Weights
+    dist_mat_s = [sqrt(sum((c1 .- c2).^2)) for c1 in centroids, c2 in centroids]
+    weight_mat_s = exp.(-dist_mat_s.^2 ./ (2 * lambda_s^2)) .* (W + I)
     for i in 1:n_units
-        weight_mat[i, :] ./= (sum(weight_mat[i, :]) + 1e-9)
+        s_row = sum(weight_mat_s[i, :])
+        if s_row > 1e-9; weight_mat_s[i, :] ./= s_row; end
     end
 
-    # Spatiotemporal Imputation via Weighted Distance (Gaussian Kernel)
-    if all(in(mergeon, propertynames(surface)) ) 
-        for t in unique(surface.t_idx), u_type in unique(surface.u_idx)
-            mask = (surface.t_idx .== t) .& (surface.u_idx .== u_type)
-            if !any(mask); continue; end
+    # 3. Iterative Spatiotemporal Imputation
+    for iter in 1:max_iters
+        missing_before = sum(ismissing.(Matrix(surface[:, all_covs])))
 
-            slice_indices = findall(mask)
-            sort!(slice_indices, by = idx -> surface.s_idx[idx])
-            current_s_ids = surface.s_idx[slice_indices]
+        for c in all_covs
+            group_cols = hasproperty(surface, :u_idx) ? [:u_idx] : []
+            for sub_df in groupby(surface, group_cols)
+                for i in 1:nrow(sub_df)
+                    if ismissing(sub_df[i, c]) || isnan(sub_df[i, c])
+                        curr_s = Int(round(sub_df[i, :s_idx]))
+                        curr_t = sub_df[i, :t_idx]
 
-            for c in st_covs
-                raw_vals = surface[slice_indices, c]
-                missing_mask = ismissing.(raw_vals) .| isnan.(raw_vals)
-                if !any(missing_mask) || all(missing_mask); continue; end
+                        # Spatial contribution
+                        spatial_mask = (sub_df.t_idx .== curr_t)
+                        spatial_neighbors = sub_df[spatial_mask, :]
+                        s_vals = filter(x -> !ismissing(x[2]) && !isnan(x[2]), collect(zip(spatial_neighbors.s_idx, spatial_neighbors[!, c])))
 
-                non_missing_idx = findall(.!missing_mask)
-                for m_idx in findall(missing_mask)
-                    target_s = current_s_ids[m_idx]
-                    weights = weight_mat[target_s, current_s_ids[non_missing_idx]]
-                    w_sum = sum(weights)
-                    if w_sum > 1e-6
-                        surface[slice_indices[m_idx], c] = sum(weights .* raw_vals[non_missing_idx]) / w_sum
-                    end
-                end
-            end
-        end
-
-        # Temporal Persistence (LOCF Fallback for remaining ST gaps)
-        sort!(surface, mergeon)
-
-        for c in st_covs
-            for unit_df in groupby(surface, :s_idx)
-                for i in 1:nrow(unit_df)
-                    if ismissing(unit_df[i, c]) || isnan(unit_df[i, c])
-                        prev_idx = i - 1
-                        while prev_idx >= 1
-                            if !ismissing(unit_df[prev_idx, c]) && !isnan(unit_df[prev_idx, c])
-                                unit_df[i, c] = unit_df[prev_idx, c]
-                                break
+                        val_s, weight_s_sum = 0.0, 0.0
+                        for (nb_s, nb_val) in s_vals
+                            idx_s = Int(round(nb_s))
+                            if idx_s >= 1 && idx_s <= n_units
+                                w = weight_mat_s[curr_s, idx_s]
+                                val_s += w * Float64(nb_val)
+                                weight_s_sum += w
                             end
-                            prev_idx -= 1
+                        end
+
+                        # Temporal contribution
+                        temporal_mask = (sub_df.s_idx .== sub_df[i, :s_idx])
+                        temporal_neighbors = sub_df[temporal_mask, :]
+                        t_vals = filter(x -> !ismissing(x[2]) && !isnan(x[2]), collect(zip(temporal_neighbors.t_idx, temporal_neighbors[!, c])))
+
+                        val_t, weight_t_sum = 0.0, 0.0
+                        for (nb_t, nb_val) in t_vals
+                            w = exp(-(curr_t - nb_t)^2 / (2 * lambda_t^2))
+                            val_t += w * Float64(nb_val)
+                            weight_t_sum += w
+                        end
+
+                        if (weight_s_sum + weight_t_sum) > 1e-6
+                            sub_df[i, c] = (val_s + val_t) / (weight_s_sum + weight_t_sum)
                         end
                     end
                 end
             end
         end
+
+        missing_after = sum(ismissing.(Matrix(surface[:, all_covs])))
+        if missing_after == 0 || missing_after == missing_before; break; end
     end
 
-    #  Final Global Fallback
-    if !isnothing(global_means)
-        for c in all_covs
-            surface[!, c] = map(x -> (ismissing(x) || isnan(x)) ? global_means[c] : x, surface[!, c])
+    # 4. Final Fallback
+    for c in all_covs
+        valid_data = filter(x -> !ismissing(x) && !isnan(x), surface[!, c])
+        m_val = isempty(valid_data) ? 0.0 : Float64(median(valid_data))
+        surface[!, c] = map(x -> (ismissing(x) || isnan(x)) ? m_val : Float64(x), surface[!, c])
+    end
+
+    # 5. POST-PROCESSING: Convert _idx columns back to Int64
+    for c in propertynames(surface)
+        if endswith(string(c), "_idx")
+            surface[!, c] = map(x -> ismissing(x) ? missing : Int64(round(x)), surface[!, c])
         end
     end
 
@@ -3431,10 +3023,9 @@ function create_prediction_surface(basis_df, observations_df, au; fixed_df=nothi
 end
 
 
-
-
 function _reconstruct(arch::DidacticArchitecture, fam::ModelFamily, chain, M, PS, alpha)
-    N_PS = isnothing(PS) ? 0 : size(PS, 1)
+    
+    N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
     N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
  
@@ -3561,7 +3152,7 @@ end
 
 function _reconstruct(arch::MultioutcomeArchitecture, fam::ModelFamily, chain, M, PS, alpha)
     
-    N_PS = isnothing(PS) ? 0 : size(PS, 1)
+    N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
     N_tot_points = M.y_N + N_PS
     
     N_samples = size(chain, 1)
@@ -3735,8 +3326,9 @@ function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M
     # Description: Reconstructs factor-based multivariate spatiotemporal fields.
     # Maps latent factor scores back to outcome space via the learned PCA loadings (Householder).
 
+    N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
+
     N_factors = get(M, :N_factors, 2)
-    N_PS = isnothing(PS) ? 0 : size(PS, 1)
     N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
     name_strs = string.(FlexiChains.parameters(chain))
@@ -3853,7 +3445,7 @@ end
 
 function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily, chain, M, PS, alpha)
 
-    N_PS = isnothing(PS) ? 0 : size(PS, 1)
+    N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
     N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
     name_strs = string.(FlexiChains.parameters(chain))
@@ -3972,10 +3564,10 @@ function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily, chain, 
 end
 
 
-function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, PS, alpha)
+function _reconstruct000(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, PS, alpha)
+  
+    N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
 
-    N_PS = isnothing(PS) ? 0 : size(PS, 1)
-    
     N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
     name_strs = string.(FlexiChains.parameters(chain))
@@ -3985,10 +3577,10 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
     s_eta_obs_denoised = zeros(M.y_N, N_samples)
     s_eta_obs_noisy = zeros(M.y_N, N_samples)
     t_eta_tot = zeros(M.t_N, N_samples)
-    u_eta_tot = zeros(M.u_N, N_samples)
+    u_eta_tot = zeros(get(M, :u_N, 1), N_samples)
     st_eta_tot = zeros(M.s_N, M.t_N, N_samples)
 
-    
+        
     # Transport Logic Flag
     is_transport = get(M, :model_transport, "none") != "none"
 
@@ -4000,14 +3592,15 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
     st_advection_samples = is_transport ? vec(get_params_vector(chain, "st_advection", 1)) : zeros(N_samples)
  
     y_sigma_samples = _extract_volatility(chain, name_strs, N_tot, N_samples)
-    c_eta_all = zeros(M.N_cat, N_samples)
+    c_eta_all = "c_eta" in name_strs ? get_params_vector(chain, "c_eta", M.N_cat)' : zeros(M.N_cat, N_samples)
+
     if "c_eta" in name_strs
         for s in 1:N_samples
             c_eta_all[:, s] = vec(chain[:c_eta].data[s])
         end
     end
 
-    fixed_effects_samples = zeros(M.fixed_N, N_samples)
+    fixed_effects_samples = M.fixed_N > 0 ? get_params_vector(chain, "d_beta", M.fixed_N)' : zeros(M.fixed_N, N_samples)
     if M.fixed_N > 0
         for d in 1:M.fixed_N
             p_name = Symbol("d_beta[$d]")
@@ -4102,12 +3695,15 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         s_idx_obs = M.s_idx isa AbstractVector ? M.s_idx : fill(M.s_idx[1], M.y_N)
         s_eta_tot[1:M.y_N, s] = field_noisy_sample[s_idx_obs]
         if N_PS > 0  && !isnothing(PS)
-            s_idx_ps = PS.s_idx isa AbstractVector ? PS.s_idx : fill(PS.s_idx[1], N_PS)
-            s_eta_tot[(M.y_N+1):end, s] = field_noisy_sample[s_idx_ps]
+            s_eta_tot[(M.y_N+1):end, s] = field_noisy_sample[PS.s_idx]
         end
+        
         s_eta_obs_denoised[:, s] = field_structured_sample[s_idx_obs]
         s_eta_obs_noisy[:, s] = field_noisy_sample[s_idx_obs]
 
+        if N_PS > 0 && !isnothing(PS)
+            s_eta_tot[(M.y_N+1):end, s] = field_noisy_sample[PS.s_idx]
+        end
 
         # 2. Temporal Manifolds
         t_sigma_sample = "t_sigma" in name_strs ? chain[:t_sigma].data[s] : 1.0
@@ -4162,7 +3758,9 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
             end
             st_eta_tot[:, :, s] = current_st_field
         elseif M.model_st in ["I", "II", "III", "IV"] 
-            st_eta_tot[:, :, s] = reshape(vec(chain[:st_raw].data[s]) .* chain[:st_sigma].data[s], M.s_N, M.t_N)
+            if "st_raw" in name_strs
+                st_eta_tot[:, :, s] = reshape(vec(chain[:st_raw].data[s]) .* chain[:st_sigma].data[s], M.s_N, M.t_N)
+            end
         end
 
     end
@@ -4171,33 +3769,54 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
 
     eta = zeros(N_tot, N_samples)
     for s in 1:N_samples
-        st_eta = M.model_st == "none"  ? zeros(M.s_N, M.t_N) : st_eta_tot[:, :, s]
+        # st_eta = M.model_st == "none"  ? zeros(M.s_N, M.t_N) : st_eta_tot[:, :, s]
         for i in 1:N_tot
             is_obs = i <= M.y_N
-            src = is_obs ? M : PS
             idx_adj = is_obs ? i : i - M.y_N
-            a = src.s_idx isa AbstractVector ? src.s_idx[idx_adj] : src.s_idx
-            t = src.t_idx isa AbstractVector ? src.t_idx[idx_adj] : src.t_idx
-            u = src.u_idx isa AbstractVector ? src.u_idx[idx_adj] : src.u_idx
-            val = (is_obs ? M.log_offset[i] : 0.0) + s_eta_tot[i, s] + t_eta_tot[t, s] + u_eta_tot[u, s] + st_eta[a, t]
+            # src = is_obs ? M : PS
+            # a = src.s_idx isa AbstractVector ? src.s_idx[idx_adj] : src.s_idx
+                        
+            t = Int(is_obs ? (M.t_idx isa AbstractVector ? M.t_idx[i] : M.t_idx) : PS.t_idx[idx_adj])
+            val = (is_obs ? M.log_offset[i] : 0.0) + s_eta_tot[i, s] + t_eta_tot[t, s]
 
-            if M.fixed_N > 0
-                fixed_mat = is_obs ? M.fixed : PS.fixed
-                for d in 1:M.fixed_N
-                    dm_val = fixed_mat isa AbstractMatrix ? fixed_mat[idx_adj, d] : (fixed_mat isa AbstractVector ? fixed_mat[idx_adj] : fixed_mat)
-                    val += fixed_effects_samples[d, s] * dm_val
-                end
+            if M.model_season != "none"
+                u = Int(is_obs ? (M.u_idx isa AbstractVector ? M.u_idx[i] : M.u_idx) : PS.u_idx[idx_adj])
+                val += u_eta_tot[u, s]
             end
 
+            # Apply fixed effects if defined in model
+ 
+            if M.fixed_N > 0
+                # Use hascolumn for DataFrames safety
+                f_mat = if is_obs
+                    M.fixed
+                elseif !isnothing(PS) && hasproperty(PS, :surface_df) && hasproperty(PS.surface_df, :fixed)
+                    PS.surface_df[!, :fixed]
+                else
+                    zeros(N_PS, M.fixed_N)
+                end
+                val += dot(fixed_effects_samples[:, s], f_mat[idx_adj, :])
+            end
+
+            # covariate effects
             if "c_eta" in name_strs
-                c_level = is_obs ? M.cov_indices[idx_adj, 1] : PS.cov_indices[idx_adj, 1]
+                c_level = Int(is_obs ? M.cov_indices[idx_adj, 1] : PS.z_indices[idx_adj, 1])
                 val += c_eta_all[c_level, s]
             end
             eta[i, s] = val
         end
     end
 
+    
     denoised_mu, noisy_y, log_lik_mat = _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples, M.y_obs)
+
+    # Post-Stratification Weight Calculation
+    s_idx_obs = M.s_idx; t_idx_obs = M.t_idx; s_N = M.s_N
+    stratum_map = [(t_idx_obs[i] - 1) * s_N + s_idx_obs[i] for i in 1:M.y_N]
+    obs_preds = denoised_mu[1:M.y_N, :]
+    strata_preds = denoised_mu[M.y_N .+ stratum_map, :]
+    weights = strata_preds ./ (obs_preds .+ 1e-9)
+
     return (
         spatial_structured = summarize_array(reshape(s_eta_obs_denoised, M.y_N, 1, N_samples); alpha=alpha),
         spatial_noisy = summarize_array(reshape(s_eta_obs_noisy, M.y_N, 1, N_samples); alpha=alpha),
@@ -4205,10 +3824,11 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         seasonal = summarize_array(reshape(u_eta_tot, M.u_N, 1, N_samples); alpha=alpha),
         volatility = summarize_array(reshape(y_sigma_samples, N_tot, 1, N_samples); alpha=alpha),
         fixed_effects = M.fixed_N > 0 ? summarize_array(reshape(fixed_effects_samples, M.fixed_N, 1, N_samples); alpha=alpha) : nothing,
-        covariate_effects = summarize_array(reshape(c_eta_all, M.N_cat, 1, N_samples); alpha=alpha),
+        covariate_random_effects = summarize_array(reshape(c_eta_all, M.N_cat, 1, N_samples); alpha=alpha),
         predictions_observed = summarize_array(reshape(denoised_mu[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
         predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
         predictions_noisy = N_PS > 0 ? summarize_array(reshape(noisy_y[(M.y_N+1):end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        post_strat_weights = (mean=vec(mean(weights, dims=2)), samples=weights),
         waic = _compute_waic(log_lik_mat[:, 1:M.y_N]), 
         family = fam, 
         arch = arch
@@ -4358,136 +3978,8 @@ end
 
  
 
-function model_results_comprehensive(model, result, M, areal_units; PS=nothing, alpha=0.05, time_slice=1, n_samples=500)
-    # Unpack 
-    if result isa Turing.Variational.VIResult 
-        # Specialized method for ADVI results produced by convert_advi_to_reconstruct_format
-        bundle = convert_advi_to_reconstruct_format(result, model, n_samples)
-        chain = bundle.chain
-    elseif result isa VNChain
-        chain = result
-    elseif result isa Turing.Optimisation.ModeResult 
-        out = convert_optim_to_reconstruct_format(result, model, n_samples; use_hessian=true)
-        chain = out.chain
-    end
- 
-    pstats = reconstruct_posteriors( chain, M, PS; alpha=alpha)
- 
-    # 3. Handle PPC Data Synthesis
-    # Skip missing values for metric and plot synthesis
-    y_obs_all = M.y_obs
-    good_idx = findall(!ismissing, y_obs_all)
-    y_obs = Float64.(y_obs_all[good_idx])
-    
-    # Use denoised observed predictions for training PPC (observation scale)
-    y_pred = vec(pstats.predictions_observed.mean)[good_idx]
-
-    # Metrics
-    rmse = sqrt(mean((y_obs .- y_pred).^2))
-    r2 = length(unique(y_pred)) > 1 ? cor(y_obs, y_pred)^2 : 0.0
-    waic_val = pstats.waic
-
-    ss = summarystats(chain) 
-  
-    # Robust diagnostic extraction - filter out NaN values before computing means
-    ess_bulk_vals = filter(!isnan, Array(ss[:, stat=At(:ess_bulk)]))
-    mean_ess_bulk = isempty(ess_bulk_vals) ? NaN : mean(ess_bulk_vals)
-
-    ess_tail_vals = filter(!isnan, Array(ss[:, stat=At(:ess_tail)]))
-    mean_ess_tail = isempty(ess_tail_vals) ? NaN : mean(ess_tail_vals)
-
-    rhat_vals = filter(!isnan, Array(ss[:, stat=At(:rhat)]))
-    mean_rhat = isempty(rhat_vals) ? NaN : mean(rhat_vals)
-    
-    pms = string.(FlexiChains.parameters(chain))
-
-    compute_time_seconds = hasproperty(chain, :_metadata) && hasproperty(chain._metadata, :sampling_time) ? only(round.(chain._metadata.sampling_time, digits=1)) : 1.0
-
-    modelname = string(model.f)
-    modelarch = string(M.model_arch)
-    modelspace = string(M.model_space)
-    modeltime = string(M.model_time)
-    modelseason = string(M.model_season)
-    modelspacetime = string(M.model_st)
-    modelcov = string(M.model_cov)
-    
-    metrics = ( modelname=modelname, modelarch=modelarch,
-        modelspace=modelspace, modeltime=modeltime, modelseason=modelseason, 
-        modelspacetime=modelspacetime, modelcov=modelcov, 
-        compute_time_seconds=compute_time_seconds,
-        rmse=rmse, r2=r2, waic=waic_val, mean_rhat=mean_rhat,
-        mean_ess_bulk=mean_ess_bulk, mean_ess_tail=mean_ess_tail, 
-        ess_per_second=mean_ess_bulk/compute_time_seconds )
-
-    showtuples( metrics ) 
-
-    # Plots
-    plt_ppc = scatter(y_pred, y_obs, alpha=0.4, label="Obs vs Pred", title="PPC (RMSE: $(round(rmse, digits=3)), WAIC: $(round(waic_val, digits=1)))", xlabel="Pred", ylabel="Obs")
-    plot!(plt_ppc, [minimum(y_obs), maximum(y_obs)], [minimum(y_obs), maximum(y_obs)], ls=:dash, lc=:red, label="Identity")
-
-    plt_tm = nothing
-    if haskey(pstats, :temporal) && !isnothing(pstats.temporal) && !(pstats.temporal isa Real)
-        plt_tm = plot(pstats.temporal.mean, 
-            ribbon=(pstats.temporal.mean .- pstats.temporal.lower, pstats.temporal.upper .- pstats.temporal.mean), 
-            title="Temporal Trend", xlabel="Time", ylabel="Effect", legend=false, fillalpha=0.3)
-    end
-
-    plt_seas = nothing
-    if haskey(pstats, :seasonal) && !isnothing(pstats.seasonal) && !(pstats.seasonal isa Real)
-        plt_seas = plot(pstats.seasonal.mean, 
-            ribbon=(pstats.seasonal.mean .- pstats.seasonal.lower, pstats.seasonal.upper .- pstats.seasonal.mean), 
-            title="Seasonal Trend", xlabel="Time", ylabel="Effect", legend=false, fillalpha=0.3)
-    end
- 
-    plt_sp = nothing 
-    if haskey(pstats, :spatial) && !isnothing(pstats.spatial) && !(pstats.spatial isa Real)
-        plt_sp = plot_posterior_results(pstats, M, areal_units; effect=:spatial)
-        title!(plt_sp, "Main Spatial Effect")
-    end
-
-    plt_sp_struct = nothing
-    if haskey(pstats, :spatial_structured) && !isnothing(pstats.spatial_structured) && !(pstats.spatial_structured isa Real)
-        plt_sp_struct = plot_posterior_results(pstats, M, areal_units; effect=:spatial_structured )
-        title!(plt_sp_struct, "Structured Spatial Effect")
-    end
-
-    plt_sp_unstruct = nothing
-    if haskey(pstats, :spatial_unstructured) && !isnothing(pstats.spatial_unstructured) && !(pstats.spatial_unstructured isa Real)
-        plt_sp_unstruct = plot_posterior_results(pstats, M, areal_units; effect=:spatial_unstructured )
-        title!(plt_sp_unstruct, "Unstructured Spatial Effect")
-    end
- 
-    
-    plt_st_denoised = nothing
-    if haskey(pstats, :predictions_denoised) && !isnothing(pstats.predictions_denoised) && !(pstats.predictions_denoised isa Real)
-        plt_st_denoised = plot_posterior_results(pstats, M, areal_units; effect=:predictions_denoised, time_slice=time_slice)
-        title!(plt_st_denoised, "Denoised Predictions (T=$time_slice)")
-    end
 
 
-    plt_st_noisy = nothing
-    if haskey(pstats, :predictions_noisy) && !isnothing(pstats.predictions_noisy) && !(pstats.predictions_noisy isa Real)
-        plt_st_noisy = plot_posterior_results(pstats, M, areal_units; effect=:predictions_noisy, time_slice=time_slice)
-        title!(plt_st_noisy, "Noisy Predictions (T=$time_slice)")
-    end
-
-    # Combine only non-nothing plots
-    plot_list = filter(!isnothing, [plt_ppc, plt_tm, plt_seas, plt_sp, plt_st_denoised])
-    
-    n_plots = length(plot_list)
-    n_rows = ceil(Int, n_plots / 2)
-    display(plot(plot_list..., layout=(n_rows, min(n_plots, 2)), size=(1000, 350*n_rows)))
-
-    return (
-        metrics=metrics, 
-        pstats=pstats,
-        summarystats=ss, 
-        plots=(ppc=plt_ppc, tm=plt_tm, seas=plt_seas, spatial=plt_sp, spatial_structured=plt_sp_struct, spatial_unstructured=plt_sp_unstruct,
-            denoised=plt_st_denoised, noisy=plt_st_noisy)
-    )
-end
-
- 
 
 function convert_advi_to_reconstruct_format(msol, model::DynamicPPL.Model, n_samples::Int=500)
     """
@@ -5065,4 +4557,557 @@ function extract_v_parameters(v_mat, ltri_indices)
     return v_mat[ltri_indices]
 end
 
+
+
+function build_ar1_precision_matrix(n, rho, sigma)
+    Q = zeros(eltype(rho), n, n)
+    if n > 0
+        inv_sigma2 = 1.0 / (sigma^2 + 1e-6)
+        Q[1, 1] = inv_sigma2
+        for i in 2:n
+            Q[i, i] = (1 + rho^2) * inv_sigma2
+            Q[i-1, i] = -rho * inv_sigma2
+            Q[i, i-1] = -rho * inv_sigma2
+        end
+        Q[n, n] = inv_sigma2
+    end
+    return Symmetric(Q)
+end
+
+
+
+"""
+    build_rw2_precision_matrix(n::Int)
+
+Constructs a Second-Order Random Walk (RW2) precision matrix for a binned covariate.
+
+Assumptions:
+- The covariate is discretized into `n` equidistant bins.
+- The RW2 prior assumes second-order differences are independent Normal: (x_i - 2x_{i-1} + x_{i-2}) ~ N(0, sigma^2).
+- The resulting matrix is singular (rank n-2) unless a small ridge (e.g., 1e-6*I) is added.
+"""
+function build_rw2_precision_matrix(n::Int)
+    Q = zeros(n, n)
+    for i in 1:n
+        if i == 1 || i == n
+            Q[i, i] = 1.0
+        elseif i == 2 || i == n - 1
+            Q[i, i] = 5.0
+        else
+            Q[i, i] = 6.0
+        end
+        if i < n
+            Q[i, i+1] = Q[i+1, i] = (i == 1 || i == n-1) ? -2.0 : -4.0
+        end
+        if i < n - 1
+            Q[i, i+2] = Q[i+2, i] = 1.0
+        end
+    end
+    return Symmetric(Q)
+end
+
+
+function get_params_matrix_sizestructured(chain, base_name, dims)
+    # Optimized for chn[:param].data[sample][row, col] access pattern
+    n_rows, n_cols = dims
+    N_samples = size(chain, 1)
+
+    if Symbol(base_name) in names(chain, :parameters)
+        res = zeros(Float64, n_rows, n_cols, N_samples)
+        data_container = chain[Symbol(base_name)].data
+
+        for s in 1:N_samples
+            samp_mat = data_container[s]
+            if size(samp_mat) == (n_rows, n_cols)
+                res[:, :, s] = samp_mat
+            elseif size(samp_mat) == (n_cols, n_rows)
+                res[:, :, s] = samp_mat'
+            end
+        end
+        return res
+    end
+    return nothing
+end
+
+
+
+ 
+function summarize_array(samples::AbstractArray; alpha=0.05)
+    if isempty(samples) || all(isnan, samples)
+        return (mean = [NaN], median = [NaN], lower = [NaN], upper = [NaN])
+    end
+
+    dims = size(samples)
+    n_dims = length(dims)
+
+    # Calculate statistics across the sample dimension
+    post_mean = dropdims(mean(samples, dims=n_dims), dims=n_dims)
+    post_median = dropdims(median(samples, dims=n_dims), dims=n_dims)
+    low_bound = dropdims(mapslices(x -> quantile(x, alpha/2), samples, dims=n_dims), dims=n_dims)
+    high_bound = dropdims(mapslices(x -> quantile(x, 1 - alpha/2), samples, dims=n_dims), dims=n_dims)
+
+    # FIX: Ensure outputs are ALWAYS Vectors, even if they contain only one element.
+    # This prevents MethodError: vec(::Float64) in downstream code.
+    force_vector(x) = begin
+        if x isa AbstractArray
+            if ndims(x) == 0 # It's a 0-dimensional array (e.g., Array{Float64, 0})
+                return [Float64(x[])] # Extract scalar and wrap in vector
+            else
+                return vec(collect(x)) # For higher-dimensional arrays, flatten to vector
+            end
+        else # It's already a scalar (e.g., Float64)
+            return [Float64(x)] # Wrap scalar in vector
+        end
+    end
+
+    return (
+        mean = force_vector(post_mean),
+        median = force_vector(post_median),
+        lower = force_vector(low_bound),
+        upper = force_vector(high_bound)
+    )
+end
+ 
+
+
+
+function model_results_comprehensive(model, result, M, areal_units; PS="lazy", alpha=0.05, time_slice=1, n_samples=500, z_cat=nothing, w_cat=nothing, kwargs...)
+    # 1. Prediction Surface Logic
+    actual_PS = if PS == "lazy"
+        s_N, t_N = M.s_N, M.t_N
+        u_N = hasproperty(M, :u_N) ? M.u_N : 1
+        n_obs = length(M.s_idx)
+        obs_df = DataFrame(
+            s_idx = M.s_idx isa AbstractVector ? M.s_idx : fill(M.s_idx, n_obs),
+            t_idx = M.t_idx isa AbstractVector ? M.t_idx : fill(M.t_idx, n_obs)
+        )
+        if hasproperty(M, :u_idx) && !isnothing(M.u_idx)
+            obs_df[!, :u_idx] = M.u_idx isa AbstractVector ? M.u_idx : fill(M.u_idx, n_obs)
+        end
+        basis_df = hasproperty(obs_df, :u_idx) ?
+                   expand_grid(s_idx = 1:s_N, t_idx = 1:t_N, u_idx = 1:u_N) :
+                   expand_grid(s_idx = 1:s_N, t_idx = 1:t_N)
+        full_surface = create_prediction_surface(basis_df, obs_df, areal_units;
+            lambda_s = get(kwargs, :lambda_s, 2.0),
+            lambda_t = get(kwargs, :lambda_t, 1.0))
+        (s_idx = Int.(full_surface.s_idx), t_idx = Int.(full_surface.t_idx),
+         u_idx = hasproperty(full_surface, :u_idx) ? Int.(full_surface.u_idx) : nothing,
+         surface_df = full_surface)
+    else
+        PS
+    end
+
+    # 2. Extract Chain
+    chain = if result isa Turing.Variational.VIResult
+        convert_advi_to_reconstruct_format(result, model, n_samples).chain
+    elseif result isa Turing.Optimisation.ModeResult
+        convert_optim_to_reconstruct_format(result, model, n_samples; use_hessian=true).chain
+    else
+        total_s = size(result, 1)
+        if total_s > n_samples
+            result[iter = (total_s - n_samples + 1):total_s]
+        else
+            result
+        end
+    end
+
+    # 3. Reconstruct
+    arch = get_architecture(M.model_arch)
+    fam = get_model_family(M.model_family)
+    pstats = _reconstruct(arch, fam, chain, M, actual_PS, alpha)
+
+    # 4. Metrics
+   
+    y_obs_all = M.y_obs
+    good_idx = findall(!ismissing, y_obs_all)
+    y_obs = Float64.(y_obs_all[good_idx])
+    y_pred = pstats.predictions_observed.mean[good_idx]
+
+    rmse = sqrt(mean((y_obs .- y_pred).^2))
+    r2 = length(unique(y_pred)) > 1 ? cor(y_obs, y_pred)^2 : 0.0
+    waic_val = hasproperty(pstats, :waic) ? first(pstats.waic) : 0.0
+
+    ss = MCMCChains.summarize(MCMCChains.Chains(chain))
+    rh = filter(!isnan, Array(ss[:, stat=At(:rhat)]))
+    mean_rhat = isempty(rh) ? 1.0 : mean(rh)
+    es = filter(!isnan, Array(ss[:, stat=At(:ess_bulk)]))
+    mean_ess = isempty(es) ? n_samples : mean(es)
+
+    metrics = (rmse=rmse, r2=r2, waic=waic_val, rhat=mean_rhat, ess=mean_ess)
+
+    showtuples(metrics)
+
+
+    # 5. Core Diagnostics Plotting
+    p_ppc = scatter(y_pred, y_obs, title="PPC", xlabel="Pred", ylabel="Obs", alpha=0.5, legend=false)
+
+    p_tm = nothing
+    if hasproperty(pstats, :temporal) && !all(isnan, pstats.temporal.mean)
+        m_vals = pstats.temporal.mean
+        p_tm = plot(m_vals, title="Temporal Trend", legend=false)
+    end
+
+    p_weight = nothing
+    if hasproperty(pstats, :post_strat_weights)
+        p_weight = histogram(vec(pstats.post_strat_weights.samples), title="Weight Posterior", bins=30, legend=false)
+    end
+
+    p_sp = nothing
+    try
+        p_sp = plot_posterior_results(pstats, M, areal_units; effect=:spatial_structured)
+    catch; end
+
+    plot_list = filter(!isnothing, [p_ppc, p_tm, p_weight, p_sp])
+    display(plot(plot_list..., layout=(2, 2), size=(900, 700)))
+
+    # 6. Specialized Extensions
+    println("\n--- Specialized Model Components ---")
+    
+    if hasproperty(pstats, :covariate_effects) && !isempty(pstats.covariate_effects)
+        println("Plotting Binned Covariate Effects...")
+        plot_binned_covariates((pstats=pstats,))
+    end
+
+    if hasproperty(pstats, :seasonal) && !all(isnan, pstats.seasonal.mean)
+        println("Plotting Seasonal Cycle...")
+        plot_seasonal_cycle((pstats=pstats,))
+    end
+
+    if hasproperty(pstats, :fixed_effects) && !isnothing(pstats.fixed_effects)
+        println("Plotting Fixed Effects...")
+        fe = pstats.fixed_effects
+        p_fe = bar(fe.mean, title="Fixed Effects Estimates", xlabel="Index", ylabel="Coefficient", legend=false)
+        display(p_fe)
+    end
+
+    return (metrics=metrics, pstats=pstats, chain=chain)
+end
+
+function get_vec(obj, key)  
+    # Helper for robust indexing
+    val = hasproperty(obj, key) ? getproperty(obj, key) : nothing
+    val isa AbstractVector ? val : [val]
+end
+
+ 
+function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, PS, alpha)
+    N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
+    N_tot = M.y_N + N_PS
+    N_samples = size(chain, 1)
+    p_syms = FlexiChains.parameters(chain)
+    p_names_str = string.(p_syms)
+
+    # 1. Global and Design Components
+    eta = zeros(N_tot, N_samples)
+    alpha_vals = vec(get_params_vector(chain, "alpha", 1))
+
+    # design matrix projection
+    fixed_effects_samples = M.fixed_N > 0 ? get_params_vector(chain, "beta_fixed", M.fixed_N) : zeros(N_samples, M.fixed_N)
+
+    # 2. Covariate Random Effects (Vectorized Mapping)
+    cov_effects_total = zeros(N_tot, N_samples)
+    binned_summaries = Dict()
+
+    if haskey(M, :cov_groups) && !isempty(M.cov_groups)
+        cov_names = collect(keys(M.cov_groups))
+        # Handle multiple sig_covs or single sigma
+        sig_covs = "sig_covs" in p_names_str ? get_params_vector(chain, "sig_covs", length(cov_names)) : ones(N_samples, length(cov_names))
+
+        for (i, c_sym) in enumerate(cov_names)
+            n_bins = size(M.cov_re_structures[c_sym], 1)
+            raw_eff = get_params_vector(chain, "raw_eff_" * string(c_sym), n_bins)
+            scaled_eff = raw_eff .* sig_covs[:, i]
+
+            # Save binned effect for results summary
+            binned_summaries[c_sym] = summarize_array(reshape(scaled_eff', n_bins, 1, N_samples); alpha=alpha)
+
+            # Map to Obs
+            idx_obs = M.cov_groups[c_sym]
+            cov_effects_total[1:M.y_N, :] .+= scaled_eff[:, idx_obs]'
+
+            # Map to Prediction Surface
+            if N_PS > 0 && haskey(PS, :cov_groups) && haskey(PS.cov_groups, c_sym)
+                idx_ps = PS.cov_groups[c_sym]
+                cov_effects_total[M.y_N+1:end, :] .+= scaled_eff[:, idx_ps]'
+            end
+        end
+    end
+
+    # 3. Manifold Recovery
+    s_sigma = vec(get_params_vector(chain, "s_sigma", 1))
+    s_eff_struct = zeros(M.s_N, N_samples)
+    s_eff_noisy = zeros(M.s_N, N_samples)
+    t_sigma = vec(get_params_vector(chain, "t_sigma", 1))
+    t_eff = zeros(M.t_N, N_samples)
+    st_eff = zeros(M.s_N, M.t_N, N_samples)
+    u_eff = :u_raw in p_syms ? reduce(hcat, chain[:u_raw].data) .* vec(get_params_vector(chain, "u_sigma", 1))' : zeros(get(M, :u_N, 1), N_samples)
+
+    for j in 1:N_samples
+        icar = vec(chain[:s_icar].data[j])
+        if M.model_space == "bym2"
+            rho = clamp(chain[:s_rho].data[j], 0.0, 1.0)
+            iid = vec(chain[:s_iid].data[j])
+            s_eff_struct[:, j] = s_sigma[j] .* sqrt(rho) .* icar
+            s_eff_noisy[:, j] = s_eff_struct[:, j] .+ (s_sigma[j] .* sqrt(1-rho) .* iid)
+        else
+            s_eff_struct[:, j] = icar .* s_sigma[j]
+            s_eff_noisy[:, j] = s_eff_struct[:, j]
+        end
+        
+        t_raw_key = :t_raw in p_syms ? :t_raw : :t_main_raw
+        t_eff[:, j] = vec(chain[t_raw_key].data[j]) .* t_sigma[j]
+
+        if M.model_st == "IV"
+            st_eff[:, :, j] = chain[:st_icar_raw].data[j] .* chain[:st_sigma].data[j]
+        elseif M.model_st in ["diffusion", "advection", "advection_diffusion"]
+            st_eff[:, :, j] = reshape(vec(chain[:st_innov].data[j]), M.s_N, M.t_N) .* chain[:st_sigma].data[j]
+        end
+    end
+
+    # 4. Linear Predictor Construction
+    for j in 1:N_samples
+        st_mat = st_eff[:, :, j]
+        for i in 1:N_tot
+            is_obs = i <= M.y_N; idx = is_obs ? i : i - M.y_N; src = is_obs ? M : PS
+            s_idx = Int(src.s_idx[idx]); t_idx = Int(src.t_idx[idx])
+
+            val = alpha_vals[j] + (is_obs ? get(M, :log_offset, zeros(M.y_N))[i] : 0.0)
+            val += s_eff_noisy[s_idx, j] + t_eff[t_idx, j] + st_mat[s_idx, t_idx]
+            if hasproperty(src, :u_idx); val += u_eff[src.u_idx[idx], j]; end
+            val += cov_effects_total[i, j]
+            if M.fixed_N > 0; val += dot(fixed_effects_samples[j, :], is_obs ? M.fixed[i, :] : PS.fixed[idx, :]); end
+            eta[i, j] = val
+        end
+    end
+
+    y_sigma_samples = _extract_volatility(chain, p_names_str, N_tot, N_samples)
+    denoised_mu, noisy_y, log_lik_mat = _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples, M.y_obs)
+
+    # 5. Weights Calculation
+    s_idx_obs = M.s_idx; t_idx_obs = M.t_idx; s_N = M.s_N
+    stratum_map = [(t_idx_obs[i] - 1) * s_N + s_idx_obs[i] for i in 1:M.y_N]
+    weights = denoised_mu[M.y_N .+ stratum_map, :] ./ (denoised_mu[1:M.y_N, :] .+ 1e-9)
+
+    return (
+        spatial_structured = summarize_array(reshape(s_eff_struct, M.s_N, 1, N_samples); alpha=alpha),
+        spatial_noisy = summarize_array(reshape(s_eff_noisy, M.s_N, 1, N_samples); alpha=alpha),
+        temporal = summarize_array(reshape(t_eff, M.t_N, 1, N_samples); alpha=alpha),
+        seasonal = summarize_array(reshape(u_eff, size(u_eff, 1), 1, N_samples); alpha=alpha),
+        fixed_effects = M.fixed_N > 0 ? summarize_array(reshape(fixed_effects_samples', M.fixed_N, 1, N_samples); alpha=alpha) : nothing,
+        binned_random_effects = binned_summaries,
+        volatility = summarize_array(reshape(y_sigma_samples, N_tot, 1, N_samples); alpha=alpha),
+        post_strat_weights = summarize_array(reshape(weights, M.y_N, 1, N_samples); alpha=alpha),
+        predictions_observed = summarize_array(reshape(denoised_mu[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+        predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        waic = _compute_waic(log_lik_mat[:, 1:M.y_N]),
+        family = fam, arch = arch
+    )
+end
+
+
+function _reconstruct(arch::SizeStructuredArchitecture, fam::ModelFamily, chain, M, PS, alpha)
+    N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
+    N_tot = M.y_N + N_PS
+    N_samples = size(chain, 1)
+    p_syms = FlexiChains.parameters(chain)
+    p_names_str = string.(p_syms)
+
+    # 1. Global and Design Components
+    eta = zeros(N_tot, N_samples)
+    alpha_vals = vec(get_params_vector(chain, "alpha", 1))
+
+    # design matrix projection
+    fixed_effects_samples = M.fixed_N > 0 ? get_params_vector(chain, "beta_fixed", M.fixed_N) : zeros(N_samples, M.fixed_N)
+
+    # 2. Covariate Random Effects (Vectorized Mapping)
+    cov_effects_total = zeros(N_tot, N_samples)
+    binned_summaries = Dict()
+    
+    if haskey(M, :cov_groups) && !isempty(M.cov_groups)
+        cov_names = collect(keys(M.cov_groups))
+        sig_covs = get_params_vector(chain, "sig_covs", length(cov_names))
+
+        for (i, c_sym) in enumerate(cov_names)
+            n_bins = size(M.cov_re_structures[c_sym], 1)
+            raw_eff = get_params_vector(chain, "raw_eff", n_bins)
+            scaled_eff = raw_eff .* sig_covs[:, i]
+            
+            # Save binned effect for results summary
+            binned_summaries[c_sym] = summarize_array(reshape(scaled_eff', n_bins, 1, N_samples); alpha=alpha)
+
+            # Map to Obs
+            idx_obs = M.cov_groups[c_sym]
+            cov_effects_total[1:M.y_N, :] .+= scaled_eff[:, idx_obs]'
+
+            # Map to Prediction Surface
+            if N_PS > 0 && haskey(PS, :cov_groups) && haskey(PS.cov_groups, c_sym)
+                idx_ps = PS.cov_groups[c_sym]
+                cov_effects_total[M.y_N+1:end, :] .+= scaled_eff[:, idx_ps]'
+            end
+        end
+    end
+
+    # 3. Manifold Recovery
+    s_sigma = vec(get_params_vector(chain, "s_sigma", 1))
+    s_eff_struct = zeros(M.s_N, N_samples)
+    s_eff_noisy = zeros(M.s_N, N_samples)
+    t_sigma = vec(get_params_vector(chain, "t_sigma_main", 1))
+    t_eff = zeros(M.t_N, N_samples)
+    st_eff = zeros(M.s_N, M.t_N, N_samples)
+    u_eff = :u_raw in p_syms ? reduce(hcat, chain[:u_raw].data) .* vec(get_params_vector(chain, "u_sigma", 1))' : zeros(get(M, :u_N, 1), N_samples)
+
+    for j in 1:N_samples
+        icar = vec(chain[:s_icar].data[j])
+        if M.model_space == "bym2"
+            rho = clamp(chain[:s_rho].data[j], 0.0, 1.0)
+            iid = vec(chain[:s_iid].data[j])
+            s_eff_struct[:, j] = s_sigma[j] .* sqrt(rho) .* icar
+            s_eff_noisy[:, j] = s_eff_struct[:, j] .+ (s_sigma[j] .* sqrt(1-rho) .* iid)
+        else
+            s_eff_struct[:, j] = icar .* s_sigma[j]
+            s_eff_noisy[:, j] = s_eff_struct[:, j]
+        end
+        t_eff[:, j] = vec(chain[:t_main_raw].data[j]) .* t_sigma[j]
+
+        if M.model_st == "IV"
+            st_eff[:, :, j] = chain[:st_icar_raw].data[j] .* chain[:st_sigma].data[j]
+        elseif M.model_st in ["diffusion", "advection", "advection_diffusion"]
+            st_eff[:, :, j] = reshape(vec(chain[:st_innov].data[j]), M.s_N, M.t_N) .* chain[:st_sigma].data[j]
+        end
+    end
+
+    # 4. Linear Predictor Construction
+    for j in 1:N_samples
+        st_mat = st_eff[:, :, j]
+        for i in 1:N_tot
+            is_obs = i <= M.y_N; idx = is_obs ? i : i - M.y_N; src = is_obs ? M : PS
+            s_idx = Int(src.s_idx[idx]); t_idx = Int(src.t_idx[idx])
+            
+            val = alpha_vals[j] + (is_obs ? get(M, :log_offset, zeros(M.y_N))[i] : 0.0)
+            val += s_eff_noisy[s_idx, j] + t_eff[t_idx, j] + st_mat[s_idx, t_idx]
+            if hasproperty(src, :u_idx); val += u_eff[src.u_idx[idx], j]; end
+            val += cov_effects_total[i, j]
+            if M.fixed_N > 0; val += dot(fixed_effects_samples[j, :], is_obs ? M.fixed[i, :] : PS.fixed[idx, :]); end
+            eta[i, j] = val
+        end
+    end
+
+    y_sigma_samples = _extract_volatility(chain, p_names_str, N_tot, N_samples)
+    denoised_mu, noisy_y, log_lik_mat = _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples, M.y_obs)
+
+    # 5. Weights Calculation
+    s_idx_obs = M.s_idx; t_idx_obs = M.t_idx; s_N = M.s_N
+    stratum_map = [(t_idx_obs[i] - 1) * s_N + s_idx_obs[i] for i in 1:M.y_N]
+    weights = denoised_mu[M.y_N .+ stratum_map, :] ./ (denoised_mu[1:M.y_N, :] .+ 1e-9)
+
+    return (
+        spatial_structured = summarize_array(reshape(s_eff_struct, M.s_N, 1, N_samples); alpha=alpha),
+        spatial_noisy = summarize_array(reshape(s_eff_noisy, M.s_N, 1, N_samples); alpha=alpha),
+        temporal = summarize_array(reshape(t_eff, M.t_N, 1, N_samples); alpha=alpha),
+        seasonal = summarize_array(reshape(u_eff, size(u_eff, 1), 1, N_samples); alpha=alpha),
+        fixed_effects = M.fixed_N > 0 ? summarize_array(reshape(fixed_effects_samples', M.fixed_N, 1, N_samples); alpha=alpha) : nothing,
+        binned_random_effects = binned_summaries,
+        volatility = summarize_array(reshape(y_sigma_samples, N_tot, 1, N_samples); alpha=alpha),
+        post_strat_weights = summarize_array(reshape(weights, M.y_N, 1, N_samples); alpha=alpha),
+        predictions_observed = summarize_array(reshape(denoised_mu[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+        predictions_denoised = N_PS > 0 ? summarize_array(reshape(denoised_mu[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        waic = _compute_waic(log_lik_mat[:, 1:M.y_N]),
+        family = fam, arch = arch
+    )
+end
+
+
+function plot_binned_covariates(res)
+    # Check if covariate effects exist in pstats
+    cov_effects = get(res.pstats, :covariate_effects, Dict())
+    if isempty(cov_effects)
+        println("No covariate effects found to plot.")
+        return nothing
+    end
+
+    plts = []
+    for (key, samples) in cov_effects
+        # Key format: :raw_rw2_cwd
+        name = replace(string(key), "raw_rw2_" => "")
+        m = vec(mean(samples, dims=2))
+        l = vec(quantile.(eachrow(samples), 0.025))
+        u = vec(quantile.(eachrow(samples), 0.975))
+        
+        p = plot(m, ribbon=(m .- l, u .- m), title="Effect: $name", 
+                 xlabel="Bin", ylabel="Value", legend=false, fillalpha=0.2)
+        push!(plts, p)
+    end
+    
+    n = length(plts)
+    if n > 0
+        display(plot(plts..., layout=(ceil(Int, n/2), 2), size=(900, 300*ceil(Int, n/2))))
+    end
+end
+
+function plot_seasonal_cycle(res)
+    if !hasproperty(res.pstats, :seasonal) || all(isnan, res.pstats.seasonal.mean)
+        println("No seasonal component found to plot.")
+        return nothing
+    end
+    
+    m = res.pstats.seasonal.mean
+    s = res.pstats.seasonal.samples
+    l = vec(quantile.(eachrow(s), 0.025))
+    u = vec(quantile.(eachrow(s), 0.975))
+    
+    plt = plot(m, ribbon=(m .- l, u .- m), title="Seasonal Cycle (Binned/Harmonic)", 
+               xlabel="Season Bin", ylabel="Effect", lw=2, fillalpha=0.3, legend=false)
+    display(plt)
+    return plt
+end
+
+
+function dataframe_to_named_array(df::DataFrame)
+    v_names = Symbol.(names(df))
+    data_mat = Matrix(df)
+    return NamedArray(data_mat, (1:size(data_mat, 1), v_names), ("Observation", "Variable"))
+end
+
+
+function get_optimal_sampler(model::DynamicPPL.Model;
+    nuts_n_samples_adaptation=50,
+    nuts_target_acceptance_ratio=0.65,
+    pg_particles=20,
+    kwargs...)
+
+    # Generate initial samples to inspect parameter types
+    init_samples = [Dict(pairs(rand(model))) for _ in 1:3]
+    full_init_dict = init_samples[1]
+
+    # 1. Identify Parameter Roles
+    fixed_params = filter(k -> all(s -> s[k] == full_init_dict[k], init_samples), keys(full_init_dict))
+    discrete_params = filter(k -> k ∉ fixed_params && (full_init_dict[k] isa Integer || full_init_dict[k] isa Bool), keys(full_init_dict))
+
+    # 2. Gaussian Filter for ESS
+    # ESS requires strictly Normal/MvNormal priors. 
+    # We route AbstractVectors (latent fields) here, but exclude structured scales like sig_covs
+    latent_fields = filter(k -> begin
+        val = full_init_dict[k]
+        k_str = string(k)
+        k ∉ fixed_params && k ∉ discrete_params && val isa AbstractVector &&
+        !occursin("sig_", k_str) && !occursin("rho", k_str) && !occursin("phi", k_str)
+    end, keys(full_init_dict))
+
+    # 3. NUTS for non-Gaussian/Positive parameters
+    active_hypers = filter(k -> begin
+        k ∉ fixed_params && k ∉ discrete_params && k ∉ latent_fields
+    end, keys(full_init_dict))
+
+    sampler_blocks = []
+    if !isempty(discrete_params); push!(sampler_blocks, Tuple(discrete_params) => PG(pg_particles)); end
+    if !isempty(latent_fields); push!(sampler_blocks, Tuple(latent_fields) => ESS()); end
+    if !isempty(active_hypers); push!(sampler_blocks, Tuple(active_hypers) => Turing.NUTS(nuts_n_samples_adaptation, nuts_target_acceptance_ratio)); end
+    if !isempty(fixed_params); push!(sampler_blocks, Tuple(fixed_params) => MH()); end
+
+    inits = parameter_inits(model)
+    return Gibbs(sampler_blocks...), inits
+end
+
 ;;
+
+

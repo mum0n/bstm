@@ -26,7 +26,8 @@ pkgs_bstm = [
   "Distributions", "Statistics", "MCMCChains", "DataFrames",  "GLM", "FlexiChains", "AbstractPPL",
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs", 
-  "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing" 
+  "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing",  
+  "Distances", "NamedArrays" 
 ]
 
 # force install all:
