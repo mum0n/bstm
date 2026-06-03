@@ -27,14 +27,14 @@ pkgs_bstm = [
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs", 
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing",  
-  "Distances", "NamedArrays" 
+  "Distances", "NamedArrays" , "CategoricalArrays", "StatsModels", "AbstractMCMC"
 ]
 
 # force install all:
-Pkg.add(pkgs_bstm)
+Pkg.add(pkgs_bstm);
 
 # load them all:
-for pk in pkgs_bstm;  @eval using $(Symbol(pk)) end
+for pk in pkgs_bstm;  @eval using $(Symbol(pk)); end
  
 # tidy loose ends:
 Pkg.gc()
@@ -67,15 +67,11 @@ print( "\nTo (re)-install required packages, run:  install_required_packages() o
   
 
 # support functions
-include( srcdir( "data_prep.jl") )
+include( srcdir( "data_prep.jl") );
 
-include( srcdir( "spatial_partitioning.jl" ))   
+include( srcdir( "spatiotemporal_functions.jl" ))   ;
 
-include( srcdir( "spatiotemporal_functions.jl" ))   
-
-include( srcdir( "spatiotemporal_turing_models.jl" ))   
-
-include( srcdir( "example_turing_models.jl" ))   
+include( srcdir( "example_turing_models.jl" ))   ;
 
 
 Random.seed!(42) # Set a seed for reproducibility.

@@ -94,7 +94,6 @@ include( joinpath( project_directory, "scripts", "startup.jl" ) ) # might need t
 # or individually:
 # include( joinpath( project_directory, "src", "data_prep.jl" ) ) # support functions  
 # include( joinpath( project_directory, "src", "spatiotemporal_functions.jl" ) )       # support functions
-# include( joinpath( project_directory, "src", "spatiotemporal_turing_models.jl" ) )     # Turing models
 
 # Pkg.instantiate()  # to force a reset if some package seems corrupted/partially installed
 # Pkg.update()  # to update this can break dependencies .. do this only if you really need to 
@@ -149,6 +148,7 @@ inp_scot = bstm_options(
   t_idx = data_scot.t_idx,  # time index
   log_offset = data_scot.log_offset, # offsets, population size on log-scale
   W = data_scot.W,  # matrix adjacency,
+  model_arch = "univariate",
   model_family = "poisson",
   model_space = "bym2",  # example_bym2_ar1_poisson is one of the simplest possible (no space-time interaction)
   model_time = "ar1",
@@ -173,11 +173,15 @@ res = model_results_comprehensive(m, chn, inp_scot, au_scot );  # results are "O
 
 # alternatively, one could use `bstm` which does almost the same thing (it has a bit more overhead to have flexibility, and uses better samplers): 
 Random.seed!(42)
-m = bstm(inp_scot);
+m = bstm( inp_scot );
 
-os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ; 
+os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ; 
+
+inits = get_inits(m) ; 
 
 chn = sample(m, os, 5000; initial_params=inits, progress=true, drop_warmup=true ) ; 
+
+StatsPlots.plot(chn[[:s_sigma, :s_rho, :t_sigma, :t_rho]], seriestype=:traceplot)
 
 res = model_results_comprehensive(m, chn, inp_scot, au_scot );  
 
@@ -254,6 +258,64 @@ Dict(k => size(v) for (k, v) in pairs(data))
 plot_kde_simple( data.s_coord_tuple, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
  
 ```
+
+
+### Simplified interface
+
+Mimicking and blending R's GLM, LME4, INLA and brms formula interfaces, here is an example running a simple analysis:
+
+```{julia}
+
+s_N, t_N = 30, 10
+data = generate_sim_data(s_N, t_N; rndseed=123)
+
+# a factorial variable
+reg = repeat(["North", "South", "East", "West"], inner=Int(length(data.y_counts)/4))
+
+# reformat simulated data into a rectangular dataframe (or namedarray the internal default):
+inp_df = DataFrame(
+  y = data.y_counts,  # y-variable
+  # Ensuring coordinates are aligned with the flattened observation vector
+  s_coord = data.s_coord_tuple,  # (x,y) as a tuple
+  t_coord = vec(data.t_coord),   # time
+  log_offset = zeros(length(data.y_counts)),
+  region = categorical(reg),  # would make sure it is used as a factorial variable or in the model statement: fe(reg)
+  z = data.z_obs,  # continuous covariate
+  w1 = data.w_obs[:,1], # more covariates 
+  w2 = data.w_obs[:,2],
+  w3 = data.w_obs[:,3],
+  trials = data.trials  # not used ..  
+)
+
+# Display first few rows to confirm alignment
+display(first(inp_df, 3))
+
+m = bstm( 
+  formula( y ~ 1 + z + region + re(s_idx, model='bym2') + re(t_idx, model='ar1') ), 
+  inp_df; 
+  family="poisson",
+  target_units=20
+);
+rand(m)
+chn = sample(m, MH(), 200);
+res = model_results_comprehensive(m , chn );
+
+```
+
+The notation is similar but with some quirks (that are again easily altered to your taste ... this is all basic Julia after all). Here I am using `re` to identify random effects: `s_idx` (spatial unit index) and `t_idx` (time unit index) have not yet been created. You can and probably should (more about that later). In the absence of that information, it is generated from an internal default method (:hvt) and here was set to 20 areal units.      
+
+### Special Formula Terms
+
+In `bstm` formulas, specific terms are used to trigger high-dimensional manifold structures. These terms tell the pre-processor how to structure the latent fields and connectivity matrices.
+
+| Term       | Name                   | Description & Examples                                                                                                                                                                                                                                                                                                                                                                          |                                                                  |
+| :-----------| :-----------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------| ------------------------------------------------------------------|
+| **`re()`** | **Random Effect**      | Used for structured spatial or temporal intercepts. <br> * **`re(s_idx, model='bym2')`**: Spatial effect with Besag-York-Molli2 2 structure (structured + iid). <br> * **`re(t_idx, model='ar1')`**: Temporal effect with an Autoregressive order 1 prior.                                                                                                                                      |                                                                  |
+| **`st()`** | **Spatiotemporal**     | Defines the interaction between space and time indices. <br> * **`st(s_idx, t_idx, type='IV')`**: Knorr-Held Type IV interaction where effects are correlated in both space and time. <br> * **`st(s_idx, t_idx, type='diffusion')`**: A physical transport manifold based on a diffusion kernel. <br> * **`st(s_idx, t_idx, type='advection')`**: Models directional movement/drift over time. |                                                                  |
+| **`ce()`** | **Covariate Effect**   | Transforms a continuous variable into a smooth non-linear effect using a GMRF prior on binned values (formerly `cv`). <br> * **`ce(elevation, model='rw2', bins=20)`**: Treats elevation as a non-linear smooth using a Second-Order Random Walk.                                                                                                                                               |                                                                  |
+| **`ie()`** | **Interaction Effect** | Creates a 2D smooth surface for the interaction between two continuous covariates (formerly `int`). <br> * **`ie(temp, humidity, model='gp')`**: Defines a 2D Gaussian Process manifold to capture how temperature and humidity interact non-linearly.                                                                                                                                          |                                                                  |
+| **`me()`** | **Mixed Effect**       | Specifically for varying slopes where a covariate effect depends on a group. <br> * **`me(x                                                                                                                                                                                                                                                                                                     | group)`**: Random slope for covariate `x` nested within `group`. |
+| **`fe()`** | **Fixed Effect**       | Explicitly defines categorical variables to be expanded into dummy/indicator columns with specific contrasts. <br> * **`fe(region, contrast='effects')`**: Expands 'region' using Sum-to-Zero coding.                                                                                                                                                                                           |                                                                  |
 
 
 ### Covariate Discretization & Transformation Rules
@@ -612,8 +674,10 @@ t_N = 15  # time slices ("years")
  
 inp_sim = generate_sim_data(s_N, t_N; rndseed=42);
 
+
+
 # time discretization
-tu = assign_time_units(inp_sim.t_coord;  method="regular", t_N=inp_sim.t_N, u_N=inp_sim.u_N)  # t_idx, t0, t1, tn
+tu = assign_time_units(inp_sim.t_coord;  time_method="regular", t_N=inp_sim.t_N, u_N=inp_sim.u_N)  # t_idx, t0, t1, tn
 
 # space discretizatio
 Random.seed!(42) # Set a seed for reproducibility.
@@ -643,7 +707,8 @@ for m in test_configs
     println("Testing method: $m")
     local au
     try
-        au = assign_spatial_units( inp_sim.s_coord_tuple, m;
+        au = assign_spatial_units( inp_sim.s_coord_tuple;
+            area_method = m,
             t_idx = tu.t_idx,
             target_units = target_units,
             target_cv=target_cv,
@@ -708,11 +773,12 @@ t_N = 15  # time slices ("years")
 data = generate_sim_data(s_N, t_N; rndseed=42);
 
 # time discretization
-tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N);
+tu = assign_time_units(data.t_coord; time_method="regular", t_N=data.t_N, u_N=data.u_N);
 
 # space discretization
 au_method = :hvt
-au = assign_spatial_units(data.s_coord_tuple, au_method;
+au = assign_spatial_units(data.s_coord_tuple;
+    area_method = au_method,
     t_idx = tu.t_idx,
     target_units = 50,
     target_cv=1.0,
@@ -742,7 +808,7 @@ inp_krig = bstm_options(
   W = au.W,
   model_arch = "example",  # Pass the struct instance, not a string
   model_family = "gaussian",
-  model_space = "kriging_simple",
+  model_space = "none",  # not a standard spatial structure in bstm
   model_time = "none",
   model_st = "none",  # ~ each year is treated separately
   model_season = "none",
@@ -752,12 +818,15 @@ inp_krig = bstm_options(
   use_zi = false
 );
  
-m = example_kriging_simple(inp_krig);  # note this model has probleme with Positive Definateness ... 
+
+m = example_kriging_simple(inp_krig);  # note this model has problems with Positive Definiteness ... 
    
 Random.seed!(42) # Set a seed for reproducibility
 
 
-os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+inits = get_inits(m) ; 
+
 
 # note this is really slow. Do not use too many samples .. just testing to show that it is slow..
 chn = sample(m, os, 10; initial_params=inits, progress=true, drop_warmup=true ) ; 
@@ -901,7 +970,7 @@ To ensure compatibility across all architectures (GMRF, Spectral, GP, etc.), the
 | `waic`                    | Widely Applicable Information Criterion.                                | `Float64`                       |
 | `family` / `architecture` | Traits identifying the model type.                                      | `ModelTrait`                    |
 
-Additional features where applicable are also presents (e.g. volatility models, multivariate or multioutcome).
+Additional features where applicable are also presents (e.g. volatility models, multivariate, multifidelity).
 
 Linear Predictor Assembly: bstm reconstructs the linear predictor $\eta_{i,s}$ for every observation $i$ and MCMC sample $s$:
 
@@ -942,12 +1011,13 @@ t_N = 15
 data = generate_sim_data(s_N, t_N; rndseed=42); # regenerate data
 
 # time discretization
-tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N)  # t_idx, t0, t1, tn
+tu = assign_time_units(data.t_coord;  time_method="regular", t_N=data.t_N, u_N=data.u_N)  # t_idx, t0, t1, tn
 
 # space discretization
 method = :avt
 
-au = assign_spatial_units( data.s_coord_tuple, method;
+au = assign_spatial_units( data.s_coord_tuple;
+  area_method = method,
   t_idx = tu.t_idx,
   target_density = 20,  # number per areal unit 
   target_units = Int(floor( size(data.s_coord_tuple, 1) / 20 )),  # ntot/target_density
@@ -1007,6 +1077,8 @@ inp_reference = bstm_options(
     model_st = "I"  # 0 (no interaction), I (iid), II (time dominant), III (space dominant), IV (spacetime inseparable) .. Knorr & Held classifications
 );
 
+
+
 ```
 
 Note when using different models, their inputs (Dict Tuple) can be adjusted or values reset using a call such as follows. Directly altering the contents is not permitted by Julia, althouhg one can use the "merge" function to do this (see the "bstm_options" code):   
@@ -1049,6 +1121,8 @@ inp_lognormal = bstm_options( inp_reference,
 ## Detailed Methods Discussion for `bstm` Model
 
 ### Conceptual Overview: bstm - Generalized Random Markov Field Spatiotemporal Model
+
+
 
 The `bstm` (Bayesian Space-Time Model) is a modular and flexible framework for inference on spatiotemporal data. It decomposes observed phenomena into various underlying components, such as spatial effects, temporal trends, space-time interactions, covariate effects, and seasonal patterns. Its design emphasizes adaptability, supporting a range of model specifications and likelihood families to accommodate diverse data types and research questions.
 
@@ -1102,6 +1176,22 @@ The core idea is to build complex spatiotemporal models by combining different '
     -   Optional **Zero-Inflation** for count data (Poisson, Negative Binomial).
 
 ### Mathematical Justification:
+ 
+The `bstm_univariate` model focuses on a single observation process $y$ driven by a combination of global and localized unobserved fields.
+
+#### 1. Linear Predictor
+$$\eta = \text{offset} + X\beta + \sum_{c} f_c(X_c) + s(s) + t(t) + st(s, t)$$
+
+*   **$X\beta$**: Global fixed effects.
+*   **$f_c(X_c)$**: Non-linear covariate effects (Random Effects) where $f_c \sim MvNormal(0, Q_c^{-1})$.
+*   **$s(s), t(t)$**: Main spatial and temporal effects.
+*   **$st(s, t)$**: Spatiotemporal interactions (Knorr-Held Types I-IV).
+
+#### 2. Precision and Scaling
+
+All structured latent fields $\theta$ use Geometric Mean Scaling to ensure prior interpretability:
+$$Q_{scaled} = Q / \exp\left(\frac{1}{n} \sum \log(\text{eigvals}(Q)_{>0})\right)$$
+$$\theta \sim MvNormalCanon(0, \tau Q_{scaled})$$ where $\tau = 1/\sigma^2$.
 
 The model constructs a linear predictor $\eta$ for each observation $i$ at space $s$ and time $t$. The specific form of $\eta$ depends on the chosen manifolds:
 
@@ -1244,7 +1334,22 @@ This model is particularly useful when analyzing phenomena that are not independ
 3.  **Modular Component Structure:** Retains the modularity of `bstm`, allowing various choices for spatial, temporal, seasonal, and interaction manifolds for each outcome. This means each outcome can have its own `s_sigma`, `t_sigma`, `st_sigma`, `s_rho`, `t_rho`, etc., providing immense flexibility.
 4.  **Flexible Likelihoods:** Supports multiple likelihood families (Gaussian, Log-Normal, Poisson, Binomial, Negative Binomial) for each outcome, with options for zero-inflation and stochastic volatility, enabling analysis of diverse data types within a single framework.
 
-### Mathematical Justification:
+
+### Mathematical Logic of Multivariate & Multi-outcome BSTM
+
+The multivariate framework extends the univariate logic by allowing $K$ outcomes to be correlated either in their magnitude or their spectral orientation.
+
+#### 1. Magnitude Correlation (LKJ)
+Outcomes can share information through a Cholesky-factored correlation matrix $L_{corr}$:
+$$\eta_{total} = \eta_{latent} \cdot L_{corr}$$
+where $L_{corr} \sim LKJ(1.0)$. This couples the variances across outcomes while maintaining distinct spatial structures.
+
+#### 2. Spectral Orientation (Householder)
+To allow outcomes to rotate in the latent space (spectral alignment), we apply a Householder reflection $H$:
+$$H = I - 2\frac{vv^T}{v^Tv}$$
+$$\eta_{rotated} = \eta_{latent} \cdot H$$
+This is particularly useful for detecting 'aligned' signals in complex spatiotemporal manifolds like SAR or Transport models.
+ 
 
 Let $Y_{i,k}$ be the observed data for the $i$-th spatiotemporal observation of the $k$-th outcome, where $k \in \{1, \ldots, N_{\text{obs}}\}$. The model assumes a multivariate structure where the linear predictor for each outcome $k$, denoted $\eta_k$, contributes to the likelihood of $Y_{i,k}$.
 
@@ -1343,6 +1448,8 @@ Where components `s_eta`, `t_eta`, `st_eta`, `c_eta`, `u_eta` (and `svc_raw`, `d
     -   `Turing.@addlogprob! logpdf(bstm_Likelihood(M.model_family, M.use_zi, M.weights, phi_zi, r_nb[k], y_sigma[k], M.trials, M.y_obs[:, k]), eta_k)`:
         -   The `bstm_Likelihood` function computes the log-likelihood for the $k$-th outcome, using its specific parameters (`r_nb[k]`, `y_sigma[k]`, `M.y_obs[:, k]`), and shared parameters (`M.model_family`, `M.use_zi`, `M.weights`, `phi_zi`, `M.trials`).
 
+
+
 ### References:
 
 *   Besag, J., York, J., & Mollié, A. (1991). Bayesian image restoration, with applications in spatial statistics. *Annals of the Institute of Statistical Mathematics*, 43(1), 1-20.
@@ -1370,6 +1477,27 @@ The `bstm_multifidelity` model is a Bayesian spatio-temporal framework designed 
 6.  **Joint Multi-fidelity Likelihood:** The model specifies likelihoods for both the multi-fidelity latent observations (`z_obs`, `w_obs`) and the primary observations (`y_obs`), linking the latent processes to the observed data. This allows the model to learn from all available data simultaneously.
 
 In essence, `bstm_multifidelity` is designed to be highly flexible, combining established spatio-temporal modeling techniques with modern multi-fidelity approaches to handle complex data structures and improve predictive performance by integrating information from diverse sources.
+
+### Mathematical Logic of Cross-Fidelity Coupling
+
+The `bstm_multifidelity` model fuses observations from two different regimes (High and Low fidelity) by anchoring them to a common unobserved state. 
+
+#### 1. The Shared Latent Process
+Both fidelities share a underlying spatiotemporal signal $\eta_{shared}(s, t)$, which represents the 'true' process we wish to estimate:
+$$\eta_{shared} = \text{Spatial}_{latent} + \text{Temporal}_{latent} + \text{Seasonal}_{latent}$$
+
+#### 2. High-Fidelity Path (Gold Standard)
+The predictor for high-fidelity observations is a direct sum of fixed effects, random covariate effects, and the shared signal:
+$$\eta_{High} = \beta X + \sum \text{Covariate}_{latent} + \eta_{shared}$$
+
+#### 3. Low-Fidelity Path (Calibration)
+The low-fidelity (proxy) observations are modeled as a linear transformation of the shared signal to account for systematic sensor bias and sensitivity differences:
+$$\eta_{Low} = \beta_{fidelity\_bias} + (\rho_{fidelity\_rho} \cdot \eta_{shared}) + \beta X + \sum \text{Covariate}_{latent}$$
+
+*   **$\beta_{fidelity\_bias}$**: Captures additive bias (constant over/under-estimation).
+*   **$\rho_{fidelity\_rho}$**: Captures multiplicative scaling (signal compression or expansion in the proxy).
+
+By sharing the $\eta_{shared}$ terms, the model 'borrows strength' from the typically high-volume low-fidelity data to refine the latent field in regions where high-fidelity data is sparse.
 
 
 The `bstm_multifidelity` model is defined by a series of hierarchical priors and likelihoods, detailed below:
@@ -1545,12 +1673,13 @@ t_N = 15  # time slices ("years")
 data = generate_sim_data(s_N, t_N; rndseed=42);
 
 # time discretization
-tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N)  ;
+tu = assign_time_units(data.t_coord;  time_method="regular", t_N=data.t_N, u_N=data.u_N)  ;
 
 # space discretization
 au_method = :hvt   # reasonably simple
 au = assign_spatial_units( 
-    data.s_coord_tuple, au_method;
+    data.s_coord_tuple, 
+    area_method = au_method,
     t_idx = tu.t_idx,
     target_units = 50,
     target_cv=1.0,
@@ -1601,13 +1730,40 @@ inp_test = bstm_options(
 );
 
 
+
+
 m = bstm(inp_test);
  
-os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ;
+
+
+os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ;
+inits = get_inits(m) ; 
+
+# or: 
+
+inp_df = DataFrame( 
+  y = data.y_counts,
+  s_coord = data.s_coord_tuple,
+  t_coord = data.t_coord,
+  # s_idx = au.assignments,
+  # t_idx = tu.t_idx,
+  log_offset = zeros(length(data.y_obs)),
+  z = data.z_obs,
+  w1 = data.w_obs[:,1],
+  w2 = data.w_obs[:,2],
+  w3 = data.w_obs[:,3],
+  trials = data.trials
+)
+
+m = bstm( 
+  "y ~ 1 + re(s_idx, model='bym2') + re(t_idx, model='ar1') ", 
+  inp_df; 
+  family="poisson" 
+)
 
 chn = sample(m, os, 100; initial_params=inits, progress=true, drop_warmup=true ) ; 
 
-res = model_results_comprehensive(m, chn, inp_test, au, PS="lazy")
+res = model_results_comprehensive(m, chn, PS="quick_approximation")
 
 
 ```
@@ -1629,12 +1785,13 @@ data = generate_sim_data(s_N, t_N; rndseed=42);
 n_obs = length(data.y_obs)
 
 # time discretization
-tu = assign_time_units(data.t_coord;  method="regular", t_N=data.t_N, u_N=data.u_N)  ;
+tu = assign_time_units(data.t_coord;  time_method="regular", t_N=data.t_N, u_N=data.u_N)  ;
 
 # space discretization
 au_method = :hvt   # reasonably simple
 au = assign_spatial_units( 
-    data.s_coord_tuple, au_method;
+    data.s_coord_tuple, 
+    area_method = au_method,
     t_idx = tu.t_idx,
     target_units = 50,
     target_cv=1.0,
@@ -1669,7 +1826,7 @@ inp = bstm_options(
     t_idx = tu.t_idx,
     log_offset = zeros(length(data.y_obs)),
     W = au.W,
-    model_arch = "univariate",
+    model_arch =  "size_structured", # "univariate",
     model_family = "bernoulli",
     model_space = "besag",
     model_time = "ar1",
@@ -1685,11 +1842,12 @@ inp = bstm_options(
 
 m = bstm_size_structured(inp)
 
-os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=5) ;
+os = get_optimal_sampler(m; nuts_n_samples_adaptation=5) ;
+inits = get_inits(m) ; 
 
 chn = sample(m, os, 10; initial_params=inits, progress=true, drop_warmup=true ) ; 
 
-res = model_results_comprehensive(m, chn, inp, au, PS="lazy")
+res = model_results_comprehensive(m, chn, PS="quick_approximation")
 
 
 ```
@@ -1725,6 +1883,57 @@ plot(weights_mat[1:5, :]', title="Sample-wise Weights (First 5 Obs)", xlabel="Sa
 ```
 
 
+
+## Multivariate
+
+```{julia}
+ 
+s_N, t_N = 30, 10
+data = generate_sim_data(s_N, t_N; rndseed=123)
+reg =repeat(["North", "South", "East", "West"], inner=Int(length(data.y_counts)/4));
+y1 = data.y_counts;
+y2 = floor.(Int, abs.(data.y_counts .* 0.5 .+ randn(length(y1)) .* 10));
+
+inp_df = DataFrame(
+  y = data.y_counts,
+  y1 = y1,
+  y2 = y2,
+  s_coord = data.s_coord_tuple,
+  t_coord = vec(data.t_coord),
+  log_offset = zeros(length(data.y_counts)),
+  region = categorical(reg),
+  z = data.z_obs,
+  w1 = data.w_obs[:,1],
+  w2 = data.w_obs[:,2],
+  w3 = data.w_obs[:,3],
+  trials = data.trials
+);
+   
+
+m = bstm( 
+  formula( y ~ 1 + z + fe(region) + re(s_idx, model='bym2') + re(t_idx, model='ar1') ), 
+  inp_df; 
+  family="poisson",
+  target_units=20
+);
+rand(m)
+chn = sample(m, MH(), 200);
+res = model_results_comprehensive(m , chn );
+
+
+# Note: model_arch='multivariate' will look for columns starting with 'y'
+m = bstm(
+  formula( y1 + y2 ~ 1 + z + re(s_idx, model='bym2') ), 
+  inp_df; 
+  model_arch="multivariate", 
+  family="poisson"
+);
+rand(m)
+chn = sample(m, MH(), 200) ;
+res = model_results_comprehensive(m , chn );
+
+
+```
 
 
 ## Discrete models
@@ -1845,7 +2054,9 @@ Sampling takes much longer than the simple model and so I have reduced the numbe
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D02_poisson_bym2(inp_count)
-os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+inits = get_inits(m) ; 
+
 chn = sample(m, os, 200, nchains=4)
 res = model_results_comprehensive(m, chn, inp_count, au);
 
@@ -1917,7 +2128,9 @@ This specification is robust because it automatically handles both structured sp
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D03_poisson_leroux(inp_count)
-os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+inits = get_inits(m) ; 
+
 chn = sample(m, os, 200, nchains=4)
 res = model_results_comprehensive(m, chn, inp_count, au);
 
@@ -1966,7 +2179,9 @@ ESS (mean) was 0.0251 !
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_4_poisson_localised(inp_count)
-os, inits = get_optimal_sampler( m; nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler( m; nuts_n_samples_adaptation=100) 
+inits = get_inits(m) ; 
+
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -2014,7 +2229,9 @@ ESS (mean) was 0.0318!
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D05_poisson_sar(inp_count)
-os, inits = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+inits = get_inits(m) ; 
+
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -2065,7 +2282,9 @@ ESS was 0.0066
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D06_poisson_svc(inp_count)
-os, inits = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+inits = get_inits(m) ; 
+
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -2112,7 +2331,9 @@ ESS (mean): 0.0318
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D07_poisson_dag(inp_count)
-os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+os  = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+inits = get_inits(m) ; 
+
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -2159,7 +2380,9 @@ ESS (mean): 0.0318
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D08_hurdle(inp_count)
-os, inits = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+inits = get_inits(m) ; 
+
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -2206,7 +2429,9 @@ ESS (mean): 0.0318
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D09_poisson_ei(inp_count)
-os, inits = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+inits = get_inits(m) ; 
+
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
@@ -2286,7 +2511,9 @@ Random.seed!(42) # Set a seed for reproducibility.
 inp_count = merge( inp_count, (y2=Int.(floor.( 100 .* (inp_count.z_obs .- minimum(inp_count.z_obs) ) ) ), ))
 
 m = model_D24_poisson_mcar(inp_count)
-os, inits = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+inits = get_inits(m) ; 
+
 chn = sample(m, os, 200, nchains=4)
 
 res = model_results_comprehensive(m, chn, inp_count, au);
