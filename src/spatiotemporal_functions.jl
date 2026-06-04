@@ -2517,19 +2517,26 @@ function rff_map(coords, W, b)
     
     return feature_map
 end
+ 
 
 function generate_informed_rff_params(coords, M_rff)
-    d = size(coords, 2)
-    # Calculate the standard deviation for each dimension of the coordinates.
-    # Add a small epsilon to avoid division by zero if a dimension has zero variance.
-    coord_scales = std(coords, dims=1) .+ 1e-6
-    # Scale random frequencies W by the inverse of coordinate scales.
-    # This helps ensure the RFFs cover the relevant range of input variations.
+    # Ensure coords is treated as a matrix for variance calculation
+    # Fix for the RowVecs/SubArray abs2 issue: convert to standard Matrix{Float64}
+    mat = coords isa AbstractMatrix ? Matrix{Float64}(coords) : 
+          reduce(hcat, [collect(p) for p in coords])'
+    
+    d = size(mat, 2)
+    # Calculate standard deviation per dimension
+    coord_scales = std(mat, dims=1) .+ 1e-6
+    
+    # Scale random frequencies W by the inverse of coordinate scales
     W = randn(d, M_rff) ./ coord_scales'
-    # Random phase shifts, uniformly distributed.
+    
+    # Random phase shifts, uniformly distributed in [0, 2π]
     b = rand(M_rff) .* (2 * pi)
     return W, b
 end
+
 
 function generate_rff_params_for_se_kernel(D_in, M_rff, lengthscale)
     # Helper function to generate RFF parameters for a Squared Exponential kernel
@@ -3031,7 +3038,15 @@ function get_rff_seasonal_basis(t, m, freq, lengthscale)
 end
 
 
-function bstm(formula, data_input::Union{DataFrame, NamedArray};
+function bstm( inp::NamedTuple )
+    arch = inp[:model_arch]
+    if arch == "multivariate" return bstm_multivariate(inp)
+    elseif arch == "multifidelity" return bstm_multifidelity(inp)
+    else return bstm_univariate(inp) end
+end
+
+
+function bstm(formula::Union{String, StatsModels.FormulaTerm}, data_input::Union{DataFrame, NamedArray};
     model_family="gaussian",
     model_arch="univariate",
     multifidelity_data=nothing,
@@ -3039,298 +3054,309 @@ function bstm(formula, data_input::Union{DataFrame, NamedArray};
     contrasts=Dict{Symbol, Any}(),
     kwargs...)
 
+    # 1. Initialize and Standardize Input
     data = data_input isa DataFrame ? copy(data_input) : DataFrame(data_input, :auto)
-    v_names = Symbol.(names(data))
     opt_kwargs = Dict{Symbol, Any}(kwargs)
+    internal_contrasts = copy(contrasts)
 
-    # 1. Automated Keyword Discovery
-    keyword_map = Dict(
-        :y_obs => [:y, :y_obs, :response],
-        :s_coord_tuple => [:s_coord, :coords, :spatial_coords],
-        :t_coord => [:t_coord, :time, :time_coords],
-        :s_idx => [:s_idx, :space_idx],
-        :t_idx => [:t_idx, :time_idx],
-        :u_idx => [:u_idx, :season_idx],
-        :log_offset => [:log_offset, :offset],
-        :weights => [:weights, :wts],
-        :trials => [:trials, :n_trials],
-        :fidelity_idx => [:fidelity, :fidelity_idx, :fid]
-    )
-
-    # 2. Formula Parsing & Manifold Discovery
+    # 2. Formula Breakdown
     f_str = string(formula)
-    lhs_side = strip(Base.split(f_str, "~")[1])
-    rhs = strip(Base.split(f_str, "~")[2])
+    sides = Base.split(f_str, "~")
+    lhs_side = strip(sides[1])
+    rhs = strip(sides[2])
 
-    # Handle Multiple Outcomes on LHS
+    # Multivariate Routing: Detect multiple response variables
     lhs_vars = Symbol.(strip.(Base.split(lhs_side, "+")))
     if length(lhs_vars) > 1
         opt_kwargs[:model_arch] = "multivariate"
-        opt_kwargs[:outcomes_N] = length(lhs_vars)
-        # Bundle outcomes into a Matrix for the model
         opt_kwargs[:y_obs] = Matrix(data[!, lhs_vars])
-        # Handle offsets/weights/trials for multivariate
-        if haskey(opt_kwargs, :log_offset) && !(opt_kwargs[:log_offset] isa AbstractMatrix)
-             opt_kwargs[:log_offset] = repeat(reshape(opt_kwargs[:log_offset], :, 1), 1, length(lhs_vars))
-        end
-        if haskey(opt_kwargs, :weights) && !(opt_kwargs[:weights] isa AbstractMatrix)
-             opt_kwargs[:weights] = repeat(reshape(opt_kwargs[:weights], :, 1), 1, length(lhs_vars))
-        end
-        if haskey(opt_kwargs, :trials) && !(opt_kwargs[:trials] isa AbstractMatrix)
-             opt_kwargs[:trials] = repeat(reshape(opt_kwargs[:trials], :, 1), 1, length(lhs_vars))
-        end
+        opt_kwargs[:outcomes_N] = length(lhs_vars)
     else
-        for (key, candidates) in keyword_map
-            if !haskey(opt_kwargs, key)
-                for cand in candidates
-                    if cand in v_names
-                        opt_kwargs[key] = vec(data[!, cand])
-                        break
-                    end
-                end
-            end
-        end
         opt_kwargs[:model_arch] = model_arch
     end
 
-    # --- START NEW LOGIC FOR AUTOMATIC UNIT ASSIGNMENT ---
-    # 1. Process Time Units if t_idx is not provided but t_coord is
-    if !haskey(opt_kwargs, :t_idx) && haskey(opt_kwargs, :t_coord) && !isnothing(opt_kwargs[:t_coord])
-        @info "bstm: Generating time units from t_coord..."
-        time_units_kwargs = filter(p -> first(p) in [:time_method, :t_N, :u_N], kwargs)
-        time_units = assign_time_units(opt_kwargs[:t_coord]; time_units_kwargs...)
-        opt_kwargs[:t_idx] = time_units.t_idx
-        opt_kwargs[:t_N] = time_units.tn
-        opt_kwargs[:u_idx] = time_units.u_idx
-        opt_kwargs[:u_N] = time_units.u_N
-        opt_kwargs[:time_units] = time_units # Store for potential later use
-    end
-
-    # 2. Process Spatial Units if s_idx is not provided but s_coord_tuple is
-    if !haskey(opt_kwargs, :s_idx) && haskey(opt_kwargs, :s_coord_tuple) && !isnothing(opt_kwargs[:s_coord_tuple])
-        @info "bstm: Generating spatial units from s_coord_tuple..."
-        spatial_units_kwargs = filter(p -> first(p) in [:area_method, :target_units, :lengthscale, :input_polygons, :geom_hull], kwargs)
-        target_units_val = get(kwargs, :target_units, 10) # Default target_units
-        areal_units = assign_spatial_units(opt_kwargs[:s_coord_tuple]; target_units=target_units_val, spatial_units_kwargs...)
-        opt_kwargs[:s_idx] = areal_units.assignments
-        opt_kwargs[:W] = areal_units.W
-        opt_kwargs[:s_N] = length(areal_units.centroids)
-        opt_kwargs[:areal_units] = areal_units # Store for potential later use (e.g., model_results_comprehensive)
-    elseif haskey(opt_kwargs, :W) && !haskey(opt_kwargs, :s_idx) && !isnothing(opt_kwargs[:W])
-        # If W is provided directly but s_idx is not, infer spatial units from W
-        @info "bstm: Inferring spatial units from adjacency matrix W..."
-        areal_units = assign_spatial_units_inferred(opt_kwargs[:W])
-        opt_kwargs[:s_idx] = collect(1:length(areal_units.centroids)) # Assuming 1:N units for consistency
-        opt_kwargs[:s_N] = length(areal_units.centroids)
-        opt_kwargs[:areal_units] = areal_units
-    end
-    # --- END NEW LOGIC ---
-
-    re_rules = Dict{String, String}()
+    # 3. Manifold Discovery (Capturing all term variants)
+    re_rules = Dict{String, Dict{Symbol, Any}}()
     fixed_parts = String[]
     mixed_terms = []
     interaction_terms = []
     eigen_terms = []
+    svc_covs = Symbol[]
+    svc_model = get(opt_kwargs, :svc_model, "rff")
 
     terms = strip.(Base.split(rhs, "+"))
-    internal_contrasts = copy(contrasts)
 
     for term in terms
-        if occursin("ee(", term)
-            m_ee = match(r"ee\((.*?)(?:,\s*model=['\"]([^'\"]+?)['\"])?.*\)", term)
-            vars_str = m_ee.captures[1]
-            model_type = m_ee.captures[2]
-            ee_vars = Symbol.(strip.(Base.split(vars_str, ",")))
-            ee_data = Matrix{Float64}(data[!, ee_vars])
-            n_dims = size(ee_data, 2)
-            ltri = Int[]
-            for k in 1:n_dims, i in k:n_dims
-                push!(ltri, i + (k-1)*n_dims)
+        # Interaction Effects (ie): 2D Smooths with RFF generation
+        if occursin("ie(", term)
+            m_ie = match(r"ie\(([^,]+),\s*([^,)]+)(?:,\s*(.*))?\)", term)
+            if !isnothing(m_ie)
+                v1, v2 = strip(m_ie.captures[1]), strip(m_ie.captures[2])
+                m_type = "gp"
+                if !isnothing(m_ie.captures[3])
+                    pm = match(r"model=['\"]([^'\"]+)['\"]", m_ie.captures[3])
+                    if !isnothing(pm) m_type = pm.captures[1] end
+                end
+                coords_ie = hcat(Vector{Float64}(data[!, Symbol(v1)]), Vector{Float64}(data[!, Symbol(v2)]))
+                M_rff_ie = get(opt_kwargs, :M_rff_ie, 20)
+                W_ie, b_ie = generate_informed_rff_params(coords_ie, M_rff_ie)
+                push!(interaction_terms, (v1=v1, v2=v2, model=m_type, coords=coords_ie, W_ie=W_ie, b_ie=b_ie, M_rff=M_rff_ie))
             end
-            push!(eigen_terms, (data=ee_data, n_dims=n_dims, ltri_indices=ltri, model=!isnothing(model_type) ? model_type : "householder", indices_for_y = 1:size(data,1)))
+        # Eigen-effects (ee): Multivariate/Factor manifolds
+        elseif occursin("ee(", term)
+            m_ee = match(r"ee\((.*?)(?:,\s*model=['\"]([^'\"]+)['\"])?.*\)", term)
+            if !isnothing(m_ee)
+                vars_str = m_ee.captures[1]
+                model_type = m_ee.captures[2]
+                ee_vars = Symbol.(strip.(Base.split(vars_str, ",")))
+                ee_data = Matrix{Float64}(data[!, ee_vars])
+                n_dims = size(ee_data, 2)
+                ltri = [i + (k-1)*n_dims for k in 1:n_dims for i in k:n_dims]
+                push!(eigen_terms, (data=ee_data, n_dims=n_dims, ltri_indices=ltri, model=!isnothing(model_type) ? model_type : "householder", indices_for_y = 1:size(data,1)))
+            end
+
+        # Mixed Effects (me): Random Slopes
         elseif occursin("me(", term)
-            m_info = create_mixed_indices(term, data)
-            if !isnothing(m_info)
-                m_lhs_match = match(r"me\((.*)\|", term)
-                m_lhs = m_lhs_match.captures[1]
-                cov_vals = (strip(m_lhs) == "1") ? ones(size(data, 1)) : Vector{Float64}(data[!, Symbol(strip(m_lhs))])
-                push!(mixed_terms, (indices=m_info.indices, n_cat=m_info.n_cat, covariate_vals=cov_vals))
+            m = match(r"me\((.*)\|(.*)\)", term)
+            if !isnothing(m)
+                lhs_parts = strip.(Base.split(m.captures[1], "+"))
+                group_var = Symbol(strip(m.captures[2]))
+                lvls = unique(data[!, group_var])
+                g_map = Dict(v => i for (i, v) in enumerate(lvls))
+                indices = [g_map[v] for v in data[!, group_var]]
+                for lp in lhs_parts
+                    cov_vals = (lp == "1") ? ones(size(data, 1)) : Vector{Float64}(data[!, Symbol(lp)])
+                    push!(mixed_terms, (indices=indices, n_cat=length(lvls), covariate_vals=cov_vals, name=group_var))
+                end
             end
-        elseif occursin("ce(", term)
-            m_ce = match(r"ce\(([^,)]+)(?:,\s*model=['\"]([^'\"]+?)['\"])?.*\)", term)
-            var_name, model_type = m_ce.captures
-            re_rules[strip(var_name)] = !isnothing(model_type) ? model_type : "rw2"
-        elseif occursin("ie(", term)
-            m_ie = match(r"ie\(([^,]+),\s*([^,)]+)(?:,\s*model=['\"]([^'\"]+?)['\"])?.*\)", term)
-            v1, v2, model_type = m_ie.captures
-            coords_ie = hcat(data[!, Symbol(strip(v1))], data[!, Symbol(strip(v2))])
-            M_rff_ie = get(opt_kwargs, :M_rff_ie, 20)
-            W_ie, b_ie = generate_informed_rff_params(coords_ie, M_rff_ie)
-            push!(interaction_terms, (v1=strip(v1), v2=strip(v2), model=!isnothing(model_type) ? model_type : "gp", coords=coords_ie, W_ie=W_ie, b_ie=b_ie, M_rff=M_rff_ie))
-        elseif occursin("fe(", term)
-            m_fe = match(r"fe\(([^,)]+)(?:,\s*contrast=['\"]([^'\"]+?)['\"])?.*\)", term)
-            var_name = Symbol(strip(m_fe.captures[1]))
-            push!(fixed_parts, string(var_name))
-            if !isnothing(m_fe.captures[2]) && m_fe.captures[2] == "effects"
-                internal_contrasts[var_name] = StatsModels.EffectsCoding()
+
+        # Spatially Varying Coefficients (svc)
+        elseif occursin("svc(", term)
+            m_svc = match(r"svc\(([^,)]+)(?:,\s*model=['\"]([^'\"]+?)['\"])?.*\)", term)
+            if !isnothing(m_svc)
+                var_name = Symbol(strip(m_svc.captures[1]))
+                push!(svc_covs, var_name)
+                if !isnothing(m_svc.captures[2]); svc_model = m_svc.captures[2]; end
+                if !(string(var_name) in fixed_parts); push!(fixed_parts, string(var_name)); end
             end
-        elseif occursin("re(", term) || occursin("st(", term)
-            m_re = match(r"(re|st)\(([^,)]+)(?:,\s*model=['\"]([^'\"]+?)['\"])?.*\)", term)
+
+        # Categorical/Structural Random Effects (ce, re, st)
+        elseif occursin("re(", term) || occursin("st(", term) || occursin("ce(", term)
+            m_re = match(r"(?:re|st|ce)\(([^,)]+)(?:,\s*(.*))?\)", term)
             if !isnothing(m_re)
-                type, var_name, model_type = m_re.captures
-                re_rules[strip(var_name)] = !isnothing(model_type) ? model_type : (type == "st" ? "IV" : "bym2")
-            else
-                push!(fixed_parts, term)
+                var_name = strip(m_re.captures[1])
+                params = Dict{Symbol, Any}()
+                if !isnothing(m_re.captures[2])
+                    p_parts = strip.(Base.split(m_re.captures[2], ","))
+                    for p in p_parts
+                        kv = strip.(Base.split(p, "="))
+                        if length(kv) == 2; params[Symbol(kv[1])] = replace(kv[2], r"['\"]" => ""); end
+                    end
+                end
+                if !haskey(params, :model); params[:model] = occursin("st(", term) ? "IV" : "bym2"; end
+                re_rules[var_name] = params
             end
         else
             push!(fixed_parts, term)
         end
     end
 
+    # 4. Packaging and Delegation to bstm_options
+    opt_kwargs[:data] = data
+    opt_kwargs[:fixed_parts] = fixed_parts
+    opt_kwargs[:contrasts] = internal_contrasts
     opt_kwargs[:re_rules] = re_rules
     opt_kwargs[:mixed_terms] = mixed_terms
     opt_kwargs[:interaction_terms] = interaction_terms
     opt_kwargs[:eigen_terms] = eigen_terms
+    opt_kwargs[:svc_covariates] = svc_covs
+    opt_kwargs[:svc_model] = svc_model
     opt_kwargs[:model_family] = model_family
-
-    # 3. Fixed Effects & Routing
-    fixed_expr = isempty(fixed_parts) ? "1" : join(fixed_parts, " + ")
-    opt_kwargs[:Xfixed] = create_fixed_design(fixed_expr, data; contrasts=internal_contrasts)
-    opt_kwargs[:Xfixed_N] = size(opt_kwargs[:Xfixed], 2)
 
     inp = bstm_options(; opt_kwargs...)
     if return_data == "inputs" return inp end
 
-    arch = opt_kwargs[:model_arch]
+    arch = inp[:model_arch]
     if arch == "multivariate" return bstm_multivariate(inp)
     elseif arch == "multifidelity" return bstm_multifidelity(inp)
     else return bstm_univariate(inp) end
 end
 
-
-function bstm_options(M_previous::NamedTuple; kwargs...)
-    # Convert NamedTuple to Dict to allow merging
-    M_new = Dict{Symbol, Any}(pairs(M_previous))
-
-    # Update with new keyword arguments
-    for (key, val) in kwargs
-        if isnothing(val)
-            delete!(M_new, key)
-            M_new[key] = nothing
-        else
-            M_new[key] = val
-        end
-    end
-    # Re-run original bstm_options to ensure all computed fields are correctly updated
-    return bstm_options(; M_new...)
-end
-
 function bstm_options(; kwargs...)
-    M0 = Dict{Symbol, Any}(kwargs)
+    # --- 1. INITIALIZATION & DICT SETUP ---
+    # Convert NamedTuple/kwargs to Dict for flexible manipulation
+    M = Dict{Symbol, Any}(kwargs)
+    data = get(M, :data, nothing)
 
-    # --- 1. Architectural & Family Settings ---
-    model_arch   = get(M0, :model_arch, "univariate")
-    model_family = get(M0, :model_family, "gaussian")
-    model_space  = get(M0, :model_space, "bym2")
-    model_time   = get(M0, :model_time, "ar1")
-    model_season = get(M0, :model_season, "none")
-    model_st     = get(M0, :model_st, "none")
-    noise        = get(M0, :noise, 1e-6)
-
-    # --- 2. Model Feature Flags ---
-    use_zi         = get(M0, :use_zi, false)
-    use_sv         = get(M0, :use_sv, false)
-    use_log_offset = get(M0, :use_log_offset, true)
-
-    # --- 3. Observation & Dimensionality ---
-    y_obs      = get(M0, :y_obs, nothing)
-    y_N        = get(M0, :y_N, isnothing(y_obs) ? 0 : size(y_obs, 1))
-    W          = get(M0, :W, sparse(I(1)))
-
-    s_N        = size(W, 1)
-
-    s_idx      = get(M0, :s_idx, isnothing(y_obs) ? collect(1:s_N) : ones(Int, y_N))
-    t_idx      = get(M0, :t_idx, ones(Int, y_N))
-    t_N        = get(M0, :t_N, (t_idx isa AbstractVector && !isempty(t_idx) ? maximum(t_idx) : 1))
-    u_idx      = get(M0, :u_idx, ones(Int, y_N))
-    u_N        = get(M0, :u_N, 12)
-
-    s_coord_tuple = get(M0, :s_coord_tuple, nothing)
-    s_coord = isnothing(s_coord_tuple) ? nothing : RowVecs(reduce(hcat, [collect(p) for p in s_coord_tuple])')
-    st_idx = get(M0, :st_idx, (t_idx .- 1) .* s_N .+ s_idx)
-
-    # --- 4. Advanced Precomputes ---
-    K_nystrom_proj = nothing
-    cluster_assignments = nothing
-    deep_gp_input = nothing
-    vol_proj = nothing
-
-    if model_space == "nystrom"
-        kernel_nystrom = get(M0, :kernel_nystrom, Matern32Kernel() ∘ ScaleTransform(1.0))
-        inducing_pts = get(M0, :inducing_points, nothing)
-        if !isnothing(s_coord) && !isnothing(inducing_pts)
-            K_nystrom_proj = precompute_nystrom_projection(s_coord, inducing_pts, kernel_nystrom)
-        end
-    elseif model_space == "deepGP"
-        if !isnothing(s_coord_tuple)
-            s_coord_mat = reduce(hcat, [collect(p) for p in s_coord_tuple])'
-            deep_gp_input = hcat(s_coord_mat, Float64.(t_idx) ./ t_N)
-        end
-    elseif model_space in ["local", "mosaic"]
-        n_clusters = get(M0, :n_clusters, 4)
-        if !isnothing(s_coord)
-            u_coords = unique(s_coord)
-            cl_res = kmeans(reduce(hcat, [collect(p) for p in u_coords])', n_clusters)
-            cluster_assignments = cl_res.assignments
+    # --- 2. AUTOMATED KEYWORD DISCOVERY ---
+    # Maps common dataset naming conventions to internal BSTM parameters
+    if !isnothing(data)
+        v_names = Symbol.(names(data))
+        keyword_map = Dict(
+            :y_obs => [:y, :y_obs, :response],
+            :s_coord_tuple => [:s_coord, :coords, :spatial_coords],
+            :t_coord => [:t_coord, :time, :time_coords],
+            :s_idx => [:s_idx, :space_idx],
+            :t_idx => [:t_idx, :time_idx, :ti],
+            :u_idx => [:u_idx, :season_idx, :ui],
+            :log_offset => [:log_offset, :offset],
+            :weights => [:weights, :wts],
+            :trials => [:trials, :n_trials]
+        )
+        for (key, candidates) in keyword_map
+            if !haskey(M, key)
+                for cand in candidates
+                    if cand in v_names
+                        M[key] = data[!, cand]
+                        break
+                    end
+                end
+            end
         end
     end
 
-    if use_sv
-        M_rff_sigma = get(M0, :M_rff_sigma, 10)
-        if !isnothing(s_coord)
-            W_vol, b_vol = generate_informed_rff_params(hcat(s_coord, t_idx ./ t_N), M_rff_sigma)
-            vol_proj = (hcat(s_coord, t_idx ./ t_N) * W_vol) .+ b_vol'
+    # --- 3. ARCHITECTURAL DEFAULTS ---
+    get!(M, :model_arch, "univariate")
+    get!(M, :model_family, "gaussian")
+    get!(M, :model_space, "bym2")
+    get!(M, :model_time, "ar1")
+    get!(M, :model_season, "none")
+    get!(M, :model_st, "none")
+    get!(M, :noise, 1e-6)
+    get!(M, :use_zi, false)
+    get!(M, :use_sv, false)
+
+    # --- 4. HARDENED VALIDATION: Field Existence ---
+    if isnothing(get(M, :y_obs, nothing))
+        @error "bstm_options: :y_obs (response variable) is missing. Model cannot be initialized."
+        throw(ArgumentError("y_obs is required"))
+    end
+
+    # --- 5. DIMENSIONALITY & INDEX SAFETY ---
+    M[:y_N] = size(M[:y_obs], 1)
+    
+    # Adjacency matrix W validation and fallback
+    if !haskey(M, :W) || isnothing(M[:W])
+        # Infer spatial units if W is missing, else default to 1
+        M[:W] = sparse(LinearAlgebra.I(get(M, :s_N, 1)))
+    elseif size(M[:W], 1) != size(M[:W], 2)
+        @error "bstm_options: Adjacency matrix W must be square."
+        throw(DimensionMismatch("W matrix dimensions $(size(M[:W])) must be square."))
+    end
+    M[:s_N] = size(M[:W], 1)
+
+    # Chronological and Seasonal indexing
+    get!(M, :t_idx, ones(Int, M[:y_N]))
+    M[:t_N] = get(M, :t_N, isempty(M[:t_idx]) ? 1 : maximum(M[:t_idx]))
+    get!(M, :u_idx, ones(Int, M[:y_N]))
+    get!(M, :u_N, 12)
+    get!(M, :s_idx, ones(Int, M[:y_N])) 
+    
+    # Derived Spatiotemporal Indexing
+    M[:st_idx] = (M[:t_idx] .- 1) .* M[:s_N] .+ M[:s_idx]
+
+    # --- 6. LIKELIHOOD VECTORIZATION SAFETY ---
+    # Ensure weights and trials match y_N length to avoid BoundsErrors in Turing likelihood
+    get!(M, :weights, ones(M[:y_N]))
+    if length(M[:weights]) != M[:y_N]
+        throw(DimensionMismatch("Weights length $(length(M[:weights])) != y_N ($(M[:y_N]))"))
+    end
+    
+    get!(M, :trials, ones(Int, M[:y_N]))
+    if length(M[:trials]) != M[:y_N]
+        throw(DimensionMismatch("Trials length $(length(M[:trials])) != y_N ($(M[:y_N]))"))
+    end
+
+    # --- 7. COORDINATE MATRICES & RFF CACHING ---
+    if !haskey(M, :s_coord_mat) && haskey(M, :s_coord_tuple)
+        try 
+            M[:s_coord_mat] = Matrix{Float64}(reduce(hcat, [collect(p) for p in M[:s_coord_tuple]])')
+        catch e
+            @error "bstm_options: Failed to convert s_coord_tuple to Matrix."
+            rethrow(e)
+        end
+    end
+    M[:s_coord] = haskey(M, :s_coord_mat) && !isnothing(M[:s_coord_mat]) ? RowVecs(M[:s_coord_mat]) : nothing
+
+    # Spatially Varying Coefficients (SVC) Basis Caching
+    if !isempty(get(M, :svc_covariates, Symbol[]))
+        get!(M, :svc_M_rff, 20)
+        if isnothing(get(M, :W_fixed_svc, nothing)) && !isnothing(M[:s_coord_mat])
+            W_s, b_s = generate_informed_rff_params(M[:s_coord_mat], M[:svc_M_rff])
+            M[:W_fixed_svc] = W_s; M[:b_fixed_svc] = b_s
+        end
+        if haskey(M, :W_fixed_svc) && !isnothing(M[:W_fixed_svc])
+            M[:svc_basis_cached] = sqrt(2.0 / M[:svc_M_rff]) .* cos.((M[:s_coord_mat] * M[:W_fixed_svc]) .+ M[:b_fixed_svc]')
         end
     end
 
-    # --- 5. Consolidated Template Construction ---
-    s_Q_template = build_structure_template(Symbol(model_space), s_N; W=W)
-    t_Q_template = build_structure_template(Symbol(model_time), t_N)
-    u_Q_template = model_season != "none" ? build_structure_template(Symbol(model_season), u_N) : nothing
+    # Interaction Terms RFF parameters generation
+    iterms = get(M, :interaction_terms, [])
+    if !isempty(iterms)
+        M_rff_ie = get(M, :M_rff_ie, 20)
+        new_iterms = []
+        for iterm in iterms
+            if !haskey(iterm, :W_ie) || isnothing(iterm.W_ie)
+                if !haskey(iterm, :coords)
+                    @error "bstm_options: Interaction term missing 'coords' for spectral generation."
+                    continue
+                end
+                W_ie, b_ie = generate_informed_rff_params(iterm.coords, M_rff_ie)
+                push!(new_iterms, merge(iterm, (W_ie=W_ie, b_ie=b_ie, M_rff=M_rff_ie)))
+            else
+                push!(new_iterms, iterm)
+            end
+        end
+        M[:interaction_terms] = new_iterms
+    end
 
-    # --- 6. Covariate Processing (Renamed to c_* prefix) ---
-    c_groups = get(M0, :cov_groups, Dict{Symbol, Vector{Int}}())
-    c_re_templates = Dict{Symbol, Any}()
+    # --- 8. DESIGN MATRIX CONSTRUCTION (CRITICAL METADATA) ---
+    if !isnothing(data) && haskey(M, :fixed_parts)
+        fixed_expr = isempty(M[:fixed_parts]) ? "1" : join(M[:fixed_parts], " + ")
+        M[:Xfixed] = Matrix{Float64}(create_fixed_design(fixed_expr, data; contrasts=get(M, :contrasts, Dict())))
+    else
+        get!(M, :Xfixed, NamedArray(ones(M[:y_N], 1), (1:M[:y_N], [:Intercept])))
+    end
+    # CRITICAL: Store Xfixed_N to ensure compatibility with get_optimal_sampler and bstm_univariate
+    M[:Xfixed_N] = size(M[:Xfixed], 2)
 
-    if haskey(M0, :cov) && haskey(M0, :re_rules)
-        for (c_name, rule) in M0[:re_rules]
+    # --- 9. HIERARCHICAL & CATEGORICAL MANIFOLDS ---
+    M[:spatial_hierarchy] = Dict{Symbol, Any}()
+    M[:c_groups] = Dict{Symbol, Vector{Int}}()
+    M[:c_re_templates] = Dict{Symbol, Any}()
+    re_rules = get(M, :re_rules, Dict{String, Any}())
+
+    if !isnothing(data)
+        for (c_name, params) in re_rules
             c_sym = Symbol(c_name)
-            n_bins = haskey(c_groups, c_sym) ? length(unique(c_groups[c_sym])) : 10
-            c_re_templates[c_sym] = build_structure_template(Symbol(rule), n_bins)
+            if c_sym in Symbol.(names(data))
+                lvls = unique(data[!, c_sym])
+                g_map = Dict(v => i for (i, v) in enumerate(lvls))
+                M[:c_groups][c_sym] = [g_map[v] for v in data[!, c_sym]]
+                m_type = params isa Dict ? get(params, :model, "bym2") : "bym2"
+                M[:spatial_hierarchy][c_sym] = (
+                    indices = M[:c_groups][c_sym],
+                    n_units = length(lvls),
+                    model = m_type,
+                    template = build_structure_template(Symbol(m_type), length(lvls); W=sparse(I(length(lvls))))
+                )
+                M[:c_re_templates][c_sym] = M[:spatial_hierarchy][c_sym].template
+            end
         end
     end
 
-    # --- 7. Final Consolidation ---
-    updates = (
-        model_arch=model_arch, model_family=model_family, model_space=model_space,
-        model_time=model_time, model_season=model_season, model_st=model_st,
-        use_zi=use_zi, use_sv=use_sv, use_log_offset=use_log_offset, noise=noise,
-        y_N=y_N, s_N=s_N, t_N=t_N, u_N=u_N,
-        s_idx=s_idx, t_idx=t_idx, u_idx=u_idx, st_idx=st_idx, s_coord=s_coord,
-        K_nystrom_proj=K_nystrom_proj, cluster_assignments=cluster_assignments, deep_gp_input=deep_gp_input, vol_proj=vol_proj,
-        s_Q_template=s_Q_template, t_Q_template=t_Q_template, u_Q_template=u_Q_template,
-        c_groups=c_groups, c_re_templates=c_re_templates,
-        weights=get(M0, :weights, ones(y_N)),
-        log_offset=use_log_offset ? get(M0, :log_offset, zeros(y_N)) : zeros(y_N),
-        trials=get(M0, :trials, ones(Int, y_N)),
-        Xfixed= NamedArray(get(M0, :Xfixed, ones(y_N, 1))),
-        Xfixed_N=get(M0, :Xfixed_N, size(get(M0, :Xfixed, ones(y_N, 1)), 2))
-    )
+    # --- 10. PRECISION TEMPLATES & CLEANUP ---
+    M[:s_Q_template] = build_structure_template(Symbol(M[:model_space]), M[:s_N]; W=M[:W])
+    M[:t_Q_template] = build_structure_template(Symbol(M[:model_time]), M[:t_N])
+    M[:u_Q_template] = (M[:model_season] != "none") ? build_structure_template(Symbol(M[:model_season]), M[:u_N]) : nothing
 
-    for (k, v) in pairs(updates); M0[k] = v; end
-    return NamedTuple(M0)
+    get!(M, :mixed_terms, [])
+    get!(M, :eigen_terms, [])
+    get!(M, :basis_matrices, Dict())
+
+    # Return as NamedTuple for drop-in compatibility with Turing models
+    return NamedTuple(M)
 end
-
 
 
 function apply_discretization_logic(vals, rules)
@@ -3646,10 +3672,13 @@ abstract type AbstractModelArchitecture end
 struct UnivariateArchitecture <: AbstractModelArchitecture end
 struct MultivariateArchitecture <: AbstractModelArchitecture end
 struct MultifidelityArchitecture <: AbstractModelArchitecture end
+struct ExampleArchitecture <: AbstractModelArchitecture end
 struct UnknownArchitecture <: AbstractModelArchitecture end
 
 function get_architecture(model_arch::String)
-    if model_arch in ["univariate"]
+    if startswith(model_arch, "example_")
+        return ExampleArchitecture() 
+    elseif model_arch in ["univariate"]
         return UnivariateArchitecture()
     elseif model_arch in ["multivariate"]
         return MultivariateArchitecture()
@@ -3684,7 +3713,6 @@ function get_model_family(model_family::String)
     end
 end
 
- 
 
 function get_model_parameters(m::DynamicPPL.Model)
     # Directly extract names from a model instance sample as a fallback discovery method
@@ -4497,7 +4525,10 @@ function model_results_comprehensive(model, result, M=nothing, areal_units=nothi
     # 3. Trait-based Reconstruction
     arch = get_architecture(M.model_arch)
     fam = get_model_family(M.model_family)
-    pstats = _reconstruct(arch, fam, chain, M, actual_PS, alpha)
+
+    modelname = string(model.f)
+
+    pstats = _reconstruct(arch, fam, modelname, chain, M, actual_PS, alpha)
 
     # 4. Metric Calculations
     y_obs = Float64.(collect(skipmissing(M.y_obs)))
@@ -4640,158 +4671,180 @@ function dataframe_to_named_array(df::DataFrame)
 end
 
 ##############
-function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, PS, alpha)
+
+
+function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, modelname, chain, M, PS, alpha)
+    # --- 1. Dimensions and Metadata Discovery ---
+    # Determine the number of post-stratification units and total target size
     N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
     N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
+    
+    # Map parameter names to strings for feature detection
     p_names_str = string.(FlexiChains.parameters(chain))
 
-    # 1. Base Parameter Extraction
-    alpha_vals = "alpha" in p_names_str ? vec(get_params_vector(chain, "alpha", 1)) : zeros(N_samples)
+    # --- 2. Global Hyperparameter Extraction ---
+    # Extract scaling factors (sigmas) for each manifold; default to 1.0 or 0.0 if not present
     s_sigmas = "s_sigma" in p_names_str ? vec(get_params_vector(chain, "s_sigma", 1)) : ones(N_samples)
     t_sigmas = "t_sigma" in p_names_str ? vec(get_params_vector(chain, "t_sigma", 1)) : ones(N_samples)
     u_sigmas = "u_sigma" in p_names_str ? vec(get_params_vector(chain, "u_sigma", 1)) : zeros(N_samples)
+    st_sigmas = "st_sigma" in p_names_str ? vec(get_params_vector(chain, "st_sigma", 1)) : zeros(N_samples)
 
-    # 2. Field Storage
+    # --- 3. Field & Effect Storage Initialization ---
     s_eff_struct = zeros(M.s_N, N_samples)
     s_eff_noisy = zeros(M.s_N, N_samples)
     t_eff = zeros(M.t_N, N_samples)
     u_eff = zeros(get(M, :u_N, 1), N_samples)
+    st_eff_map = zeros(M.s_N, M.t_N, N_samples)
 
-    # 3. Covariate effects (Fixed and Random)
+    # Hierarchical Spatial storage (Region -> County -> Unit)
+    hier_fields = Dict{Symbol, Matrix{Float64}}()
+    if haskey(M, :spatial_hierarchy)
+        for scale_sym in keys(M.spatial_hierarchy)
+            hier_fields[scale_sym] = zeros(M.spatial_hierarchy[scale_sym].n_units, N_samples)
+        end
+    end
+
+    # Regression base storage
     Xfixed_betas = (M.Xfixed_N > 0) ? zeros(M.Xfixed_N, N_samples) : nothing
-    random_eff = "c_eta" in p_names_str ? zeros(M.N_cat, N_samples) : nothing
 
-    # New effect storage
-    mixed_effects_samples = haskey(M, :mixed_terms) && !isempty(M.mixed_terms) ?
-        [zeros(term.n_cat, N_samples) for term in M.mixed_terms] : nothing
-    interaction_effects_samples = haskey(M, :interaction_terms) && !isempty(M.interaction_terms) ?
-        [zeros(M.y_N + N_PS, N_samples) for _ in M.interaction_terms] : nothing
-    eigen_effects_samples = haskey(M, :eigen_terms) && !isempty(M.eigen_terms) ?
-        [zeros(term.n_dims, N_samples) for term in M.eigen_terms] : nothing
+    # Categorical/Group effect storage (ce / re)
+    categorical_eff = Dict{Symbol, Matrix{Float64}}()
+    if haskey(M, :c_groups)
+        for c_sym in keys(M.c_groups)
+            n_lvls = size(M.c_re_templates[c_sym].matrix, 1)
+            categorical_eff[c_sym] = zeros(n_lvls, N_samples)
+        end
+    end
 
+    # Advanced structure storage (Mixed, Interaction, Eigen, SVC)
+    mixed_eff = !isempty(get(M, :mixed_terms, [])) ? [zeros(term.n_cat, N_samples) for term in M.mixed_terms] : nothing
+    interaction_eff = !isempty(get(M, :interaction_terms, [])) ? [zeros(N_tot, N_samples) for _ in M.interaction_terms] : nothing
+    eigen_eff = !isempty(get(M, :eigen_terms, [])) ? [zeros(N_tot, N_samples) for _ in M.eigen_terms] : nothing
+    svc_eff = !isempty(get(M, :svc_covariates, [])) ? [zeros(N_tot, N_samples) for _ in M.svc_covariates] : nothing
+    basis_eff = !isempty(get(M, :basis_matrices, Dict())) ? Dict(v => zeros(N_tot, N_samples) for v in keys(M.basis_matrices)) : nothing
+
+    # --- 4. Posterior Parameter Reconstruction Loop ---
     for j in 1:N_samples
-        # Manifold Extractions
+        # 4.1 Core Manifolds via Trait-based dispatch
         fs, fn = extract_manifold(SpatialTrait(), chain, M, j, s_sigmas[j])
         s_eff_struct[:, j] .= fs
         s_eff_noisy[:, j] .= fn
         t_eff[:, j] .= extract_manifold(TemporalTrait(), chain, M, j, t_sigmas[j])
-
         if M.model_season != "none"
             u_eff[:, j] .= extract_manifold(SeasonalTrait(), chain, M, j, u_sigmas[j])
         end
-        if !isnothing(Xfixed_betas)
-            Xfixed_betas[:, j] .= extract_manifold(FixedEffectTrait(), chain, M, j)
-        end
-        if !isnothing(random_eff)
-            random_eff[:, j] .= extract_manifold(RandomEffectTrait(), chain, M, j)
+
+        # 4.2 Multi-resolution hierarchical scales
+        for scale_sym in keys(hier_fields)
+            p_key = Symbol("s_latent_", scale_sym)
+            if p_key in FlexiChains.parameters(chain)
+                hier_fields[scale_sym][:, j] .= vec(chain[p_key].data[j])
+            end
         end
 
-        # Extract new effects
-        if !isnothing(mixed_effects_samples)
+        # 4.3 Spatiotemporal map (Transport or KH)
+        if "st_latent" in p_names_str
+            st_eff_map[:, :, j] .= reshape(vec(chain[:st_latent].data[j]), M.s_N, M.t_N) .* st_sigmas[j]
+        end
+
+        # 4.4 Fixed and Categorical Effects
+        if !isnothing(Xfixed_betas); Xfixed_betas[:, j] .= extract_manifold(FixedEffectTrait(), chain, M, j); end
+        for c_sym in keys(categorical_eff)
+            p_name = Symbol("c_latent_$(c_sym)")
+            if p_name in FlexiChains.parameters(chain); categorical_eff[c_sym][:, j] .= vec(chain[p_name].data[j]); end
+        end
+
+        # 4.5 Advanced Basis Components (Splines/FFT)
+        if !isnothing(basis_eff)
+            for (v_sym, B) in M.basis_matrices
+                beta_b = get_params_vector(chain, Symbol("beta_basis_", v_sym), size(B, 2))[j, :]
+                basis_eff[v_sym][1:M.y_N, j] .= B * beta_b
+            end
+        end
+
+        # 4.6 Mixed Effects (Varying Slopes)
+        if !isnothing(mixed_eff)
             for (idx, m_term) in enumerate(M.mixed_terms)
-                mixed_effects_samples[idx][:, j] .= get_params_vector(chain, Symbol("beta_group_", idx), m_term.n_cat)[j, :]
+                mixed_eff[idx][:, j] .= get_params_vector(chain, Symbol("beta_group_$(idx)"), m_term.n_cat)[j, :]
             end
         end
-        if !isnothing(interaction_effects_samples)
+
+        # 4.7 Interaction Surfaces (RFF Projections)
+        if !isnothing(interaction_eff)
             for (idx, i_term) in enumerate(M.interaction_terms)
-                sig_ie = get_params_vector(chain, Symbol("sig_ie_", idx), 1)[j]
-                ls_ie = get_params_vector(chain, Symbol("ls_ie_", idx), 1)[j]
-                beta_ie = get_params_vector(chain, Symbol("beta_ie_", idx), i_term.M_rff)[j, :]
-                all_coords_ie = if N_PS > 0
-                    vcat(i_term.coords, hcat(PS.surface_df.v1, PS.surface_df.v2))
-                else
-                    i_term.coords
-                end
-                projection = (all_coords_ie * i_term.W_ie) .+ i_term.b_ie'
-                interaction_effects_samples[idx][:, j] .= sqrt(2.0/i_term.M_rff) .* cos.(projection) * beta_ie
+                beta_ie = get_params_vector(chain, Symbol("beta_ie_$(idx)"), i_term.M_rff)[j, :]
+                # Incorporate post-stratification coordinates for full surface prediction
+                all_coords = (N_PS > 0) ? vcat(i_term.coords, hcat(PS.surface_df.lat, PS.surface_df.lon)) : i_term.coords
+                proj = (all_coords * i_term.W_ie) .+ i_term.b_ie'
+                interaction_eff[idx][:, j] .= sqrt(2.0/i_term.M_rff) .* cos.(proj) * beta_ie
             end
         end
-        if !isnothing(eigen_effects_samples)
+
+        # 4.8 Spatially Varying Coefficients (SVC via RFF basis caching)
+        if !isnothing(svc_eff) && get(M, :svc_model, "none") == "rff"
+            for (idx, c_sym) in enumerate(M.svc_covariates)
+                sig_svc = get_params_vector(chain, Symbol("sig_svc_$(c_sym)"), 1)[j]
+                beta_svc = get_params_vector(chain, Symbol("beta_svc_$(c_sym)"), M.svc_M_rff)[j, :]
+                z_k = haskey(M, :svc_basis_cached) ? M.svc_basis_cached : (sqrt(2.0 / M.svc_M_rff) .* cos.((M.s_coord * M.W_fixed_svc) .+ M.b_fixed_svc'))
+                beta_s = z_k[M.s_idx, :] * beta_svc
+                col_idx = findfirst(==(c_sym), Symbol.(names(M.Xfixed, 2)))
+                if !isnothing(col_idx); svc_eff[idx][1:M.y_N, j] .= (beta_s .* sig_svc) .* M.Xfixed[:, col_idx]; end
+            end
+        end
+
+        # 4.9 Eigen-Effects (PCA Reconstruction via Householder)
+        if !isnothing(eigen_eff)
             for (idx, e_term) in enumerate(M.eigen_terms)
-                v_pca = get_params_vector(chain, Symbol("v_pca_", idx), length(e_term.ltri_indices))[j, :]
-                pca_sd = get_params_vector(chain, Symbol("pca_sd_", idx), e_term.n_dims)[j, :]
-                pdef_sd = get_params_vector(chain, Symbol("pdef_sd_", idx), 1)[j]
-                K_pca, _, _ = householder_transform(v_pca, e_term.n_dims, e_term.n_dims, e_term.ltri_indices, pca_sd, pdef_sd, M.noise)
-                eigen_effects_samples[idx][:, j] .= vec(e_term.data * K_pca)
+                v_pca = get_params_vector(chain, Symbol("v_pca_$(idx)"), length(e_term.ltri_indices))[j, :]
+                p_sd = get_params_vector(chain, Symbol("pca_sd_$(idx)"), e_term.n_dims)[j, :]
+                pdef = get_params_vector(chain, Symbol("pdef_sd_$(idx)"), 1)[j]
+                K_pca, _, _ = householder_transform(v_pca, e_term.n_dims, e_term.n_dims, e_term.ltri_indices, p_sd, pdef, M.noise)
+                eigen_eff[idx][1:M.y_N, j] .= vec(e_term.data * K_pca)
             end
         end
     end
 
-    # 4. Predictor Reconstruction (Noisy vs Denoised)
+    # --- 5. Linear Predictor Assembly (Eta) ---
     eta_noisy = zeros(N_tot, N_samples)
     eta_denoised = zeros(N_tot, N_samples)
+    fixed_names = Symbol.(names(M.Xfixed, 2))
 
-    fixed_names = M.Xfixed isa NamedArray ? names(M.Xfixed, 2) : [Symbol("x$i") for i in 1:size(M.Xfixed, 2)]
+    for j in 1:N_samples, i in 1:N_tot
+        is_obs = i <= M.y_N; idx = is_obs ? i : i - M.y_N; src = is_obs ? M : PS
+        s_id = Int(src.s_idx[idx]); t_id = Int(src.t_idx[idx])
+        val = is_obs ? get(M, :log_offset, zeros(M.y_N))[i] : 0.0
 
-    for j in 1:N_samples
-        for i in 1:N_tot
-            is_obs = i <= M.y_N; idx = is_obs ? i : i - M.y_N; src = is_obs ? M : PS
-            s_idx = Int(src.s_idx[idx]); t_idx = Int(src.t_idx[idx])
-            u_idx_val = M.model_season != "none" ? Int(src.u_idx[idx]) : 1
+        # Regression base assembly
+        if !isnothing(Xfixed_betas); val += dot(Xfixed_betas[j, :], is_obs ? M.Xfixed[idx, :] : collect(Vector(PS.surface_df[idx, fixed_names]))); end
+        for c_sym in keys(categorical_eff); val += categorical_eff[c_sym][src.c_groups[c_sym][idx], j]; end
+        for scale_sym in keys(hier_fields); val += hier_fields[scale_sym][M.spatial_hierarchy[scale_sym].indices[idx], j]; end
 
-            base_val = alpha_vals[j] + (is_obs ? get(M, :log_offset, zeros(M.y_N))[i] : 0.0)
+        # Manifold main effects
+        val += t_eff[t_id, j]
+        if M.model_season != "none"; val += u_eff[Int(src.u_idx[idx]), j]; end
+        
+        # Sum advanced structural components
+        if !isnothing(mixed_eff); for (m_idx, m_term) in enumerate(M.mixed_terms); val += mixed_eff[m_idx][m_term.indices[idx], j] * m_term.covariate_vals[idx]; end; end
+        if !isnothing(interaction_eff); for ie in interaction_eff; val += ie[i, j]; end; end
+        if !isnothing(eigen_eff); for ee in eigen_eff; val += ee[i, j]; end; end
+        if !isnothing(svc_eff); for se in svc_eff; val += se[i, j]; end; end
+        if !isnothing(basis_eff); for be in values(basis_eff); val += be[i, j]; end; end
 
-            if !isnothing(Xfixed_betas)
-                # FIX: Use collect(Vector(...)) to handle DataFrameRow extraction
-                X_row = is_obs ? M.Xfixed[idx, :] : collect(Vector(PS.surface_df[idx, fixed_names]))
-                base_val += dot(Xfixed_betas[:, j], X_row)
-            end
-
-            if !isnothing(random_eff)
-                c_level = Int(is_obs ? M.c_groups[Symbol("s_idx")][idx] : PS.s_idx[idx])
-                base_val += random_eff[c_level, j]
-            end
-
-            if haskey(M, :c_groups) && !isempty(M.c_groups)
-                for c_sym in keys(M.c_groups)
-                    c_latent_name = Symbol("c_latent_$(c_sym)")
-                    if c_latent_name in FlexiChains.parameters(chain)
-                        c_latent_samples = get_params_vector(chain, string(c_latent_name), size(M.c_re_templates[c_sym].matrix, 1))[j, :]
-                        group_val = is_obs ? M.c_groups[c_sym][idx] : 1
-                        base_val += c_latent_samples[group_val]
-                    end
-                end
-            end
-
-            if !isnothing(mixed_effects_samples)
-                for (midx, m_term) in enumerate(M.mixed_terms)
-                    beta_group_val = mixed_effects_samples[midx][m_term.indices[idx], j]
-                    base_val += beta_group_val * m_term.covariate_vals[idx]
-                end
-            end
-
-            if !isnothing(interaction_effects_samples)
-                for (iidx, _) in enumerate(M.interaction_terms)
-                    base_val += interaction_effects_samples[iidx][i, j]
-                end
-            end
-
-            if !isnothing(eigen_effects_samples)
-                for (eidx, e_term) in enumerate(M.eigen_terms)
-                    base_val += eigen_effects_samples[eidx][e_term.indices_for_y[idx], j]
-                end
-            end
-
-            eta_denoised[i, j] = base_val + s_eff_struct[s_idx, j] + t_eff[t_idx, j]
-            eta_noisy[i, j] = base_val + s_eff_noisy[s_idx, j] + t_eff[t_idx, j]
-
-            if M.model_season != "none"
-                eta_denoised[i, j] += u_eff[u_idx_val, j]
-                eta_noisy[i, j] += u_eff[u_idx_val, j]
-            end
-        end
+        st_val = st_eff_map[s_id, t_id, j]
+        eta_denoised[i, j] = val + s_eff_struct[s_id, j] + st_val
+        eta_noisy[i, j] = val + s_eff_noisy[s_id, j] + st_val
     end
 
+    # --- 6. Post-Processing & Strata Weighting ---
     y_sigma = _extract_volatility(chain, p_names_str, N_tot, N_samples)
     preds_denoised, preds_noisy, log_lik = _process_ll_and_predictions(fam, eta_noisy, chain, M, N_tot, N_samples, y_sigma, M.y_obs)
     field_denoised, _, _ = _process_ll_and_predictions(fam, eta_denoised, chain, M, N_tot, N_samples, y_sigma, M.y_obs)
 
+    # Post-stratification weights (strata-to-unit ratios)
     weights = nothing
     if N_PS > 0
-        s_idx_obs = M.s_idx; t_idx_obs = M.t_idx; u_idx_obs = get(M, :u_idx, ones(Int, M.y_N))
-        s_N = M.s_N; t_N = M.t_N
-        stratum_map = [(Int(u_idx_obs[i])-1)*s_N*t_N + (Int(t_idx_obs[i])-1)*s_N + Int(s_idx_obs[i]) for i in 1:M.y_N]
+        stratum_map = [(Int(get(M, :u_idx, ones(M.y_N))[i])-1)*M.s_N*M.t_N + (Int(M.t_idx[i])-1)*M.s_N + Int(M.s_idx[i]) for i in 1:M.y_N]
         weights = field_denoised[M.y_N .+ stratum_map, :] ./ (field_denoised[1:M.y_N, :] .+ 1e-9)
     end
 
@@ -4799,17 +4852,15 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         spatial_structured = summarize_array(reshape(s_eff_struct, M.s_N, 1, N_samples); alpha=alpha),
         spatial_unstructured = summarize_array(reshape(s_eff_noisy .- s_eff_struct, M.s_N, 1, N_samples); alpha=alpha),
         temporal = summarize_array(reshape(t_eff, M.t_N, 1, N_samples); alpha=alpha),
-        seasonal = M.model_season != "none" ? summarize_array(reshape(u_eff, get(M, :u_N, 1), 1, N_samples); alpha=alpha) : nothing,
+        seasonal = (M.model_season != "none") ? summarize_array(reshape(u_eff, get(M, :u_N, 1), 1, N_samples); alpha=alpha) : nothing,
+        hierarchical_spatial = isempty(hier_fields) ? nothing : Dict(k => summarize_array(reshape(v, size(v,1), 1, N_samples); alpha=alpha) for (k,v) in hier_fields),
+        spatiotemporal = summarize_array(reshape(st_eff_map, M.s_N * M.t_N, 1, N_samples); alpha=alpha),
         volatility = summarize_array(reshape(y_sigma, N_tot, 1, N_samples); alpha=alpha),
         fixed_effects = !isnothing(Xfixed_betas) ? summarize_array(reshape(Xfixed_betas, M.Xfixed_N, 1, N_samples); alpha=alpha) : nothing,
-        random_effects = !isnothing(random_eff) ? summarize_array(reshape(random_eff, length(M.c_groups[first(keys(M.c_groups))]), 1, N_samples); alpha=alpha) : nothing,
-        mixed_effects = !isnothing(mixed_effects_samples) ? [summarize_array(reshape(me, size(me,1), 1, N_samples); alpha=alpha) for me in mixed_effects_samples] : nothing,
-        interaction_effects = !isnothing(interaction_effects_samples) ? [summarize_array(reshape(ie, size(ie,1), 1, N_samples); alpha=alpha) for ie in interaction_effects_samples] : nothing,
-        eigen_effects = !isnothing(eigen_effects_samples) ? [summarize_array(reshape(ee, size(ee,1), 1, N_samples); alpha=alpha) for ee in eigen_effects_samples] : nothing,
+        mixed_effects = !isnothing(mixed_eff) ? [summarize_array(reshape(me, size(me,1), 1, N_samples); alpha=alpha) for me in mixed_eff] : nothing,
+        interaction_effects = !isnothing(interaction_eff) ? [summarize_array(reshape(ie, size(ie,1), 1, N_samples); alpha=alpha) for ie in interaction_eff] : nothing,
+        eigen_effects = !isnothing(eigen_eff) ? [summarize_array(reshape(ee, size(ee,1), 1, N_samples); alpha=alpha) for ee in eigen_eff] : nothing,
         predictions_observed_denoised = summarize_array(reshape(preds_denoised[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
-        predictions_observed_noisy = summarize_array(reshape(preds_noisy[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
-        predictions_strata_denoised = N_PS > 0 ? summarize_array(reshape(preds_denoised[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
-        predictions_strata_noisy = N_PS > 0 ? summarize_array(reshape(preds_noisy[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
         post_strat_weights = isnothing(weights) ? nothing : (mean=vec(mean(weights, dims=2)), samples=weights),
         waic = _compute_waic(log_lik[:, 1:M.y_N]),
         family = fam, arch = arch
@@ -4817,8 +4868,7 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
 end
 
 
-
-function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M, PS, alpha)
+function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, modelname,  chain, M, PS, alpha)
     N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
     N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
@@ -4931,7 +4981,7 @@ function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M
 end
 
 
-function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily, chain, M, PS, alpha)
+function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily,  modelname, chain, M, PS, alpha)
     N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
     N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
@@ -5025,368 +5075,299 @@ function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily, chain, 
 end
 
 
+function _reconstruct(arch::ExampleArchitecture, fam::ModelFamily,  modelname, chain, M, PS, alpha)
+    N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
+    N_tot = M.y_N + N_PS
+    N_samples = size(chain, 1)
+    p_names_str = string.(FlexiChains.parameters(chain))
+
+    # 1. Parameter Extraction & Model Type Detection
+    is_kriging = "signal_std_dev[1]" in p_names_str
+    is_spatiotemporal_gp = "ls_s" in p_names_str && "ls_t" in p_names_str
+
+    # 2. Field Storage
+    f_latent_samples = zeros(N_tot, N_samples)
+    Xfixed_betas = (M.Xfixed_N > 0) ? zeros(M.Xfixed_N, N_samples) : nothing
+
+    for j in 1:N_samples
+        # Fixed Effects
+        if !isnothing(Xfixed_betas)
+            Xfixed_betas[:, j] .= get_params_vector(chain, "Xfixed_beta", M.Xfixed_N)[j, :]
+        end
+
+        if is_kriging
+            # --- Kriging Reconstruction Logic ---
+            # Placeholder extraction: f_latent_all is expected to hold mapped spatial field
+            if "f_latent_all" in p_names_str
+                 f_latent_samples[1:M.y_N, j] .= vec(chain[Symbol("f_latent_all")].data[j])
+            end
+            # Note: N_PS Kriging math would go here if PS indices were defined
+
+        elseif is_spatiotemporal_gp
+            # --- Spatiotemporal GP (example_gp_gaussian) ---
+            u_latent = vec(chain[:s_latent].data[j])
+            sig_st = chain[:st_sigma].data[j]
+            l_s = chain[:ls_s].data[j]
+            l_t = chain[:ls_t].data[j]
+            
+            k = (sig_st^2) * (SqExponentialKernel() ∘ ScaleTransform(inv(l_s))) ⊗ (SqExponentialKernel() ∘ ScaleTransform(inv(l_t)))
+            f_gp = GP(k)
+            
+            Ns, Nt = size(M.s_inducing, 2), size(M.t_inducing, 2)
+            s_grid = repeat(M.s_inducing, outer=(1, Nt))
+            t_grid = repeat(M.t_inducing, inner=(1, Ns))
+            X_ind = ColVecs(vcat(s_grid, t_grid))
+            
+            f_cond = condition(f_gp(X_ind, 1e-6), u_latent)
+            X_obs = ColVecs(vcat(M.s_coord.X', reshape(M.t_coord, 1, :)))
+            f_latent_samples[1:M.y_N, j] .= mean(f_cond(X_obs[M.st_idx]))
+        else
+            # Fallback
+            fs, fn = extract_manifold(SpatialTrait(), chain, M, j, 1.0)
+            for i in 1:M.y_N; f_latent_samples[i, j] = fs[M.s_idx[i]]; end
+        end
+    end
+
+    # 3. Predictor Assembly
+    eta_denoised = zeros(N_tot, N_samples)
+    eta_noisy = zeros(N_tot, N_samples)
+    fixed_names = names(M.Xfixed, 2)
+
+    for j in 1:N_samples, i in 1:N_tot
+        is_obs = i <= M.y_N; idx = is_obs ? i : i - M.y_N
+        base = (is_obs ? M.log_offset[i] : 0.0)
+        if !isnothing(Xfixed_betas)
+            X_row = is_obs ? M.Xfixed[idx, :] : Matrix(PS.surface_df[idx, fixed_names])
+            base += dot(Xfixed_betas[:, j], X_row)
+        end
+        eta_denoised[i, j] = base + f_latent_samples[i, j]
+        eta_noisy[i, j] = base + f_latent_samples[i, j]
+    end
+
+    # 4. Final Family-Aware Transformation (Standardizing outputs to match Univariate)
+    y_sigma = _extract_volatility(chain, p_names_str, N_tot, N_samples)
+    preds_denoised, preds_noisy, log_lik = _process_ll_and_predictions(fam, eta_noisy, chain, M, N_tot, N_samples, y_sigma, M.y_obs)
+
+    return (
+        spatial_structured = summarize_array(reshape(f_latent_samples[1:M.s_N, :], M.s_N, 1, N_samples); alpha=alpha),
+        spatial_unstructured = summarize_array(zeros(M.s_N, 1, N_samples); alpha=alpha), # Placeholder for parity
+        temporal = nothing,
+        seasonal = nothing,
+        volatility = summarize_array(reshape(y_sigma, N_tot, 1, N_samples); alpha=alpha),
+        fixed_effects = !isnothing(Xfixed_betas) ? summarize_array(reshape(Xfixed_betas, M.Xfixed_N, 1, N_samples); alpha=alpha) : nothing,
+        random_effects = nothing,
+        predictions_observed_denoised = summarize_array(reshape(preds_denoised[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+        predictions_observed_noisy = summarize_array(reshape(preds_noisy[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+        predictions_strata_denoised = N_PS > 0 ? summarize_array(reshape(preds_denoised[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        predictions_strata_noisy = N_PS > 0 ? summarize_array(reshape(preds_noisy[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        waic = _compute_waic(log_lik[:, 1:M.y_N]),
+        family = fam, arch = arch
+    )
+end
+
+
 
 @model function bstm_univariate(M, ::Type{T}=Float64) where {T}
     # --- 1. Global Likelihood Hyperparameters ---
-    local lik_r = 1.0; local lik_phi = 0.0
-    if M.model_family == "negbin"; lik_r ~ Exponential(1.0); end
-    if M.use_zi; lik_phi ~ Beta(1, 1); end
+    # Handles dispersion for Negative Binomial and probability for Zero-Inflation
+    local lik_r = 1.0
+    local lik_phi = 0.0
+    if M.model_family == "negbin"
+        # dispersion parameter r for NB likelihood
+        lik_r ~ NamedDist(Exponential(1.0), :lik_r)
+    end
+    if M.use_zi
+        # Probability of structural zero in zero-inflated models
+        lik_phi ~ NamedDist(Beta(1, 1), :lik_phi)
+    end
 
+    # --- 2. Stochastic Volatility (SV) / Heteroskedasticity ---
+    # Maps latent log-variance to a spatiotemporal surface using Random Fourier Features (RFF)
     local y_sigma = 1.0
     if get(M, :use_sv, false)
-        sigma_log_var ~ Exponential(1.0)
-        beta_vol_latent ~ filldist(Normal(0, 1), M.M_rff_sigma)
+        sigma_log_var ~ NamedDist(Exponential(1.0), :sigma_log_var)
+        beta_vol_latent ~ NamedDist(filldist(Normal(0, 1), M.M_rff_sigma), :beta_vol_latent)
+        # Projecting coordinates using cached spectral basis (vol_proj) from bstm_options
         y_sigma = exp.((sigma_log_var .* (sqrt(2.0 / M.M_rff_sigma) .* cos.(M.vol_proj) * beta_vol_latent)) ./ 2.0)
-    elseif M.model_family in ["gaussian", "lognormal"]; y_sigma ~ Exponential(1.0); end
+    elseif M.model_family in ["gaussian", "lognormal"]
+        # Homoskedastic observation error
+        y_sigma ~ NamedDist(Exponential(1.0), :y_sigma)
+    end
 
-    # --- 2. Fixed & Categorical Effects ---
-    Xfixed_beta ~ MvNormal(zeros(M.Xfixed_N), 5.0 * I)
-    Xfixed_eff = M.Xfixed * Xfixed_beta # Initialize with fixed effects
-
+    # --- 3. Base Predictor Initialization (Fixed Effects) ---
+    # Initialize with global intercept and fixed covariates defined in Xfixed
+    Xfixed_beta ~ NamedDist(MvNormal(zeros(M.Xfixed_N), 5.0 * I), :Xfixed_beta)
+    Xfixed_eff = M.Xfixed * Xfixed_beta
+    
+    # Initialize linear predictor (eta) with log offsets (exposure) and fixed effects
     eta = (haskey(M, :log_offset) ? M.log_offset : zeros(T, M.y_N)) .+ Xfixed_eff
 
-    # Categorical Covariate Manifolds (ce / re)
-    local c_effects_sum = zeros(T, M.y_N)
+    # --- 4. Hierarchical Multi-Resolution Spatial Manifolds ---
+    # Allows variance partitioning across nested scales (e.g., Region -> County -> Unit)
+    if haskey(M, :spatial_hierarchy) && !isempty(M.spatial_hierarchy)
+        for scale_sym in keys(M.spatial_hierarchy)
+            scale = M.spatial_hierarchy[scale_sym]
+            
+            # Resolution-specific variance and spatial correlation parameters
+            sig_scale ~ NamedDist(Exponential(1.0), Symbol("s_sigma_", scale_sym))
+            rho_scale ~ NamedDist(Beta(1, 1), Symbol("s_rho_", scale_sym))
+
+            # Recompose precision (bym2, icar, leroux, etc.) for this specific resolution
+            Q_scale = recompose_precision(Symbol(scale.model), scale.template.matrix, sig_scale; extra_param=rho_scale, noise=M.noise)
+
+            # Sample resolution-level latent field and map to observation indices
+            f_scale ~ NamedDist(MvNormalCanon(zeros(scale.n_units), Q_scale), Symbol("s_latent_", scale_sym))
+            eta .+= f_scale[scale.indices]
+        end
+    end
+
+    # --- 5. Categorical Covariate Manifolds (ce / re) ---
+    # Handles group-level random effects with structural priors (RW2, AR1, or IID)
     if haskey(M, :c_groups) && !isempty(M.c_groups)
         c_names = collect(keys(M.c_groups))
-        sig_c ~ filldist(Exponential(1.0), length(c_names))
+        sig_c ~ NamedDist(filldist(Exponential(1.0), length(c_names)), :sig_c)
         for (i, c_sym) in enumerate(c_names)
             temp = M.c_re_templates[c_sym]
             rule = Symbol(get(M.re_rules, string(c_sym), "iid"))
             c_Q = recompose_precision(rule, temp.matrix, sig_c[i]; noise=M.noise)
-            c_latent_i ~ NamedDist(MvNormalCanon(zeros(size(temp.matrix, 1)), c_Q), Symbol("c_latent_$(c_sym)"))
-            c_effects_sum .+= c_latent_i[M.c_groups[c_sym]]
+            c_latent_i ~ NamedDist(MvNormalCanon(zeros(size(temp.matrix, 1)), c_Q), Symbol("c_latent_", c_sym))
+            eta .+= c_latent_i[M.c_groups[c_sym]]
         end
     end
 
-    # Mixed Effects (me: varying slopes)
+    # --- 6. Advanced Basis Effects (P-splines, FFT, Wavelets) ---
+    # Incorporates pre-computed basis matrices for smooth non-linear components
+    if haskey(M, :basis_matrices) && !isempty(M.basis_matrices)
+        for v_sym in keys(M.basis_matrices)
+            B = M.basis_matrices[v_sym]
+            M_basis = size(B, 2)
+            sig_basis ~ NamedDist(Exponential(1.0), Symbol("sig_basis_", v_sym))
+            beta_basis ~ NamedDist(MvNormal(zeros(M_basis), sig_basis^2 * I), Symbol("beta_basis_", v_sym))
+            eta .+= B * beta_basis
+        end
+    end
+
+    # --- 7. Mixed Effects (me: Varying Slopes) ---
+    # Allows regression coefficients to vary across categorical group levels
     if haskey(M, :mixed_terms) && !isempty(M.mixed_terms)
         for (i, m_term) in enumerate(M.mixed_terms)
-            sig_me_i ~ NamedDist(Exponential(1.0), Symbol("sig_me_$(i)"))
-            beta_group_i ~ NamedDist(filldist(Normal(0, sig_me_i), m_term.n_cat), Symbol("beta_group_$(i)"))
+            sig_me_i ~ NamedDist(Exponential(1.0), Symbol("sig_me_", i))
+            beta_group_i ~ NamedDist(filldist(Normal(0, sig_me_i), m_term.n_cat), Symbol("beta_group_", i))
             eta .+= beta_group_i[m_term.indices] .* m_term.covariate_vals
         end
     end
 
-    # Interaction Smooths (ie: 2D surfaces)
+    # --- 8. Interaction Smooths (ie: 2D surfaces) ---
+    # Uses Random Fourier Features (RFF) to approximate non-linear interaction surfaces f(x,y)
     if haskey(M, :interaction_terms) && !isempty(M.interaction_terms)
         for (i, i_term) in enumerate(M.interaction_terms)
-            sig_ie_i ~ NamedDist(Exponential(1.0), Symbol("sig_ie_$(i)"))
-            ls_ie_i ~ NamedDist(Exponential(1.0), Symbol("ls_ie_$(i)"))
-            beta_ie_i ~ NamedDist(filldist(Normal(0, sig_ie_i), i_term.M_rff), Symbol("beta_ie_$(i)"))
+            sig_ie_i ~ NamedDist(Exponential(1.0), Symbol("sig_ie_", i))
+            # Projection logic: sqrt(2/M) * cos(Coords*W + b)
             projection = (i_term.coords * i_term.W_ie) .+ i_term.b_ie'
+            beta_ie_i ~ NamedDist(filldist(Normal(0, sig_ie_i), i_term.M_rff), Symbol("beta_ie_", i))
             eta .+= sqrt(2.0/i_term.M_rff) .* cos.(projection) * beta_ie_i
         end
     end
 
-    # Eigen-Effects (ee: Outcome PCA Manifolds)
+    # --- 9. Eigen-Effects (ee: PCA Outcome Manifolds) ---
+    # Maps high-dimensional auxiliary manifolds back to the univariate predictor
     if haskey(M, :eigen_terms) && !isempty(M.eigen_terms)
         for (i, e_term) in enumerate(M.eigen_terms)
-            v_pca_i ~ NamedDist(filldist(Normal(0, 1.0), length(e_term.ltri_indices)), Symbol("v_pca_$(i)"))
-            pca_sd_i ~ NamedDist(filldist(Exponential(1.0), e_term.n_dims), Symbol("pca_sd_$(i)"))
-            pdef_sd_i ~ NamedDist(Exponential(0.1), Symbol("pdef_sd_$(i)"))
+            v_pca_i ~ NamedDist(filldist(Normal(0, 1.0), length(e_term.ltri_indices)), Symbol("v_pca_", i))
+            pca_sd_i ~ NamedDist(filldist(Exponential(1.0), e_term.n_dims), Symbol("pca_sd_", i))
+            pdef_sd_i ~ NamedDist(Exponential(0.1), Symbol("pdef_sd_", i))
             K_pca, _, _ = householder_transform(v_pca_i, e_term.n_dims, e_term.n_dims, e_term.ltri_indices, pca_sd_i, pdef_sd_i, M.noise)
             eta .+= vec(e_term.data * K_pca)
         end
     end
 
-    # --- 3. Spatial Manifold ---
+    # --- 10. Spatially Varying Coefficients (SVC via RFF basis caching) ---
+    # Non-stationary relationships beta(s) * X
+    if !isempty(M.svc_covariates) && M.svc_model == "rff"
+        for (k, c_sym) in enumerate(M.svc_covariates)
+            sig_svc_k ~ NamedDist(Exponential(1.0), Symbol("sig_svc_", c_sym))
+            beta_svc_k ~ NamedDist(filldist(Normal(0, 1), M.svc_M_rff), Symbol("beta_svc_", c_sym))
+            # Use cached basis from bstm_options to avoid trigonometric overhead in sampler
+            z_k = haskey(M, :svc_basis_cached) ? M.svc_basis_cached : (sqrt(2.0 / M.svc_M_rff) .* cos.((M.s_coord * M.W_fixed_svc) .+ M.b_fixed_svc'))
+            beta_s_k = z_k[M.s_idx, :] * beta_svc_k
+            col_idx = findfirst(==(c_sym), Symbol.(names(M.Xfixed, 2)))
+            if !isnothing(col_idx)
+                eta .+= (beta_s_k .* sig_svc_k) .* M.Xfixed[:, col_idx]
+            end
+        end
+    end
+
+    # --- 11. Primary Spatial Manifold ---
     local s_eta = zeros(T, M.s_N)
-    local s_Q = I(M.s_N) # Default for Kronecker products
-
     if M.model_space != "none"
-        s_sigma ~ Exponential(1.0)
+        s_sigma ~ NamedDist(Exponential(1.0), :s_sigma)
         m_space = Symbol(M.model_space)
-
-        if m_space == :iid
-            s_iid ~ MvNormal(zeros(M.s_N), I)
-            s_eta = (s_iid .* s_sigma)
-            s_Q = I(M.s_N)
-        elseif m_space in [:rff, :ei]
-            ls_rff ~ Gamma(2, 2)
-            beta_rff ~ filldist(Normal(0, 1), M.M_rff)
-            proj = (M.s_coord * (M.W_fixed ./ ls_rff)) .+ M.b_fixed'
-            s_eta = vec((sqrt(2.0 / M.M_rff) * s_sigma) .* (cos.(proj) * beta_rff))
-            s_Q = I(M.M_rff)
-        elseif m_space == :bgcn
-            gcn_w ~ MvNormal(zeros(M.s_N), I)
-            D_inv_sqrt = Diagonal(1.0 ./ sqrt.(vec(sum(M.W, dims=2)) .+ M.noise))
-            W_norm = D_inv_sqrt * M.W * D_inv_sqrt
-            s_eta = (W_norm * gcn_w) .* s_sigma
-            s_Q = I(M.s_N)
-        elseif m_space == :fitc
-            st_ls_s ~ filldist(Gamma(2, 2), size(M.Z_inducing, 2))
-            k_st = (s_sigma^2) * (SqExponentialKernel() ∘ ARDTransform(inv.(st_ls_s .+ M.noise)))
-            K_ZZ = kernelmatrix(k_st, RowVecs(M.Z_inducing)) + M.noise * I
-            K_XZ = kernelmatrix(k_st, RowVecs(hcat(M.s_coord, M.t_coord)), RowVecs(M.Z_inducing))
-            s_inducing ~ MvNormal(zeros(size(M.Z_inducing, 1)), K_ZZ)
-            s_eta = K_XZ * (K_ZZ \ s_inducing)
-            s_Q = inv(K_ZZ) + M.noise * I
-        elseif m_space == :bym2
-            s_rho ~ Beta(1, 1)
-            s_icar_raw ~ MvNormalCanon(zeros(M.s_N), Symmetric(Matrix(M.s_Q_template.matrix + M.noise*I)) )
-            s_iid_raw ~ MvNormal(zeros(M.s_N), I)
-            s_eta = (s_sigma .* (sqrt.(s_rho) .* s_icar_raw .+ sqrt.(1 .- s_rho) .* s_iid_raw))
-            s_Q = recompose_precision(:bym2, M.s_Q_template.matrix, s_sigma; extra_param=s_rho, noise=M.noise)
-        elseif m_space == :denseGP
-            s_ls ~ Gamma(2, 2)
-            k_s_gp = SqExponentialKernel() ∘ ScaleTransform(inv(s_ls))
-            K_s_gp = (s_sigma^2) .* kernelmatrix(k_s_gp, M.s_coord_unique) + M.noise * I
-            s_eta_raw ~ MvNormal(zeros(M.s_N), Symmetric(K_s_gp))
-            s_eta = s_eta_raw
-            s_Q = inv(Symmetric(K_s_gp))
-        elseif m_space == :fitcGP
-            u_inducing ~ filldist(Normal(0, 1), M.M_inducing_count)
-            s_eta = (M.Z_inducing_proj * u_inducing) .* s_sigma
-            s_Q = I(M.M_inducing_count)
-        elseif m_space == :mosaic
-            mu_local ~ filldist(Normal(0, 1), M.n_mosaics)
-            s_eta = mu_local[M.cluster_assignments] .* s_sigma
-            s_Q = I(M.s_N)
-        elseif m_space == :warping
-            w_warp ~ filldist(Normal(0, 1), M.M_rff)
-            warp_proj = (M.s_coord * M.W_fixed) .+ M.b_fixed'
-            s_warp = (sqrt(2.0 / M.M_rff) .* cos.(warp_proj) * w_warp)
-            s_eta = vec( s_warp .* s_sigma )
-            s_Q = I(M.s_N)
-        elseif m_space == :svc
-            s_svc = Matrix{T}(undef, M.s_N, M.fixed_N)
-            svc_sigma ~ filldist(Exponential(0.5), M.fixed_N)
-            for k in 1:M.fixed_N
-                svc_raw_k ~ NamedDist(MvNormalCanon(zeros(M.s_N), M.s_Q_template.matrix + M.noise*I), Symbol("svc_raw_$(k)"))
-                s_svc[:, k] = svc_raw_k .* svc_sigma[k]
-            end
-            s_eta = zeros(T, M.s_N)
-            s_Q = I(M.s_N)
-        elseif m_space == :local
-            s_rho ~ Beta(1, 1)
-            mu_clusters ~ filldist(Normal(0, 1), M.n_clusters)
-            s_Q_base = s_rho .* M.s_Q_template.matrix .+ (1 - s_rho) .* I(M.s_N)
-            s_Q_local = (1.0 / (s_sigma^2 + M.noise)) .* s_Q_base + M.noise * I
-            s_eta_raw ~ MvNormalCanon(mu_clusters[M.cluster_assignments], s_Q_local )
-            s_eta = s_eta_raw
-            s_Q = s_Q_local
-        elseif m_space == :svgp
-            f_sigma ~ Exponential(1.0)
-            st_ls_svgp ~ filldist(Gamma(2, 2), size(M.Z_inducing_coords, 2))
-            kernel_svgp = f_sigma * SqExponentialKernel() ∘ ScaleTransform(st_ls_svgp)
-            Kuu = kernelmatrix(kernel_svgp, RowVecs(M.Z_inducing_coords))
-            m_u ~ filldist(Normal(0, 1), M.M_inducing_count)
-            s_u_diag ~ filldist(Exponential(1.0), M.M_inducing_count)
-            u_latent ~ MvNormal(m_u, Symmetric(Kuu + Diagonal(s_u_diag.^2)))
-            s_eta = vec( (M.Z_inducing_proj * u_latent) .* s_sigma )
-            s_Q = I(M.s_N)
-            curr_coords = hcat(M.s_coord, M.t_coord ./ M.t_N)
-            for l in 1:M.n_layers
-                m_l = M.m_layers[l]
-                d_in = size(curr_coords, 2)
-                ls_l ~ Gamma(2, 1)
-                w_l ~ filldist(Normal(0, 1), m_l)
-                Random.seed!(42 + l)
-                Om = randn(m_l, d_in) ./ ls_l
-                Ph = rand(m_l) .* convert(T, 2 * pi)
-                Phi = convert(T, sqrt(2 / m_l)) .* cos.(curr_coords * Om' .+ Ph')
-                if l < M.n_layers
-                    curr_coords = reshape(Phi * w_l, :, 1)
-                else
-                    s_eta = Phi * w_l
-                end
-            end
-        else
-            s_rho = nothing
-            if m_space in [:bym2, :leroux, :sar, :dag]
-                s_rho ~ Beta(1, 1)
-            elseif m_space in [:gp, :dense_gp]
-                s_ls ~ Exponential(1.0)
-                s_rho = s_ls
-            end
-            s_Q = recompose_precision(m_space, M.s_Q_template.matrix, s_sigma; extra_param=s_rho, noise=M.noise)
-            s_latent ~ MvNormalCanon(zeros(M.s_N), s_Q)
-            s_eta = s_latent
-        end
+        # Detect if the model requires a correlation/rho parameter
+        s_rho = (m_space in [:bym2, :leroux, :sar, :dag]) ? (~ NamedDist(Beta(1, 1), :s_rho)) : nothing
+        s_Q = recompose_precision(m_space, M.s_Q_template.matrix, s_sigma; extra_param=s_rho, noise=M.noise)
+        s_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N), s_Q), :s_latent)
+        s_eta = s_latent
+        eta .+= s_eta[M.s_idx]
     end
 
-    # --- 4. Temporal Manifold ---
-    local t_eta = zeros(T, M.t_N)
-    local t_Q = I(M.t_N)
-
+    # --- 12. Primary Temporal Manifold ---
     if M.model_time != "none"
-        t_sigma ~ Exponential(1.0)
+        t_sigma ~ NamedDist(Exponential(1.0), :t_sigma)
         m_time = Symbol(M.model_time)
-
-        if m_time == :harmonic
-            t_α ~ Normal(0, 1); t_β ~ Normal(0, 1)
-            t_eta = (t_α .* sin.(M.t_angle) .+ t_β .* cos.(M.t_angle)) .* t_sigma
-            t_Q = (1.0 / (t_sigma^2 + M.noise)) .* M.t_Q_template.matrix
-        elseif m_time == :gp
-            t_ls ~ InverseGamma(3, 3)
-            t_K = (t_sigma^2) .* kernelmatrix(SqExponentialKernel() ∘ ScaleTransform(inv(t_ls)), 1.0:Float64(M.t_N)) + M.noise * I
-            t_eta ~ MvNormal(zeros(M.t_N), Symmetric(t_K))
-            t_Q = inv(Symmetric(t_K))
-        elseif m_time == :iid
-            t_eta ~ MvNormal(zeros(M.t_N), t_sigma*I)
-            t_Q = I(M.t_N)
-        elseif m_time == :logistic_ar1
-            t_rho ~ Beta(2, 2)
-            K_logistic  ~ truncated(Normal(M.K[1], M.K[2]), lower=M.K[1]*0.01)
-            r_logistic  ~ truncated(Normal(M.r[1], M.r[2]), lower=0.01)
-            q1_logistic ~ truncated(Normal(M.q1[1], M.q1[2]), lower=0.01)
-            bpsd_logistic ~ truncated(Normal(M.bpsd[1], M.bpsd[2]), lower=0.01)
-
-            t_Q_innov = build_ar1_precision_matrix(M.t_N, t_rho, t_sigma)
-            t_innovations ~ MvNormalCanon(zeros(M.t_N), Matrix(t_Q_innov + M.noise*I))
-
-            m_vec = Vector{T}(undef, M.nM)
-            m_vec[1] ~ truncated(Normal(M.m0[1], M.m0[2]), lower=M.mlim[1], upper=M.mlim[2])
-
-            for i in 2:M.t_N
-                growth = r_logistic * m_vec[i-1] * (1.0 - m_vec[i-1])
-                removal = M.removed[i-1] / K_logistic
-                m_vec[i] ~ truncated(Normal(m_vec[i-1] + growth - removal, bpsd_logistic), lower=M.mlim[1], upper=M.mlim[2])
-            end
-
-            if M.nM > M.t_N
-                for i in (M.t_N + 1):M.nM
-                    m_vec[i] ~ truncated(Normal(m_vec[i-1] + r_logistic * m_vec[i-1] * (1.0 - m_vec[i-1]), bpsd_logistic), lower=M.mlim[1], upper=M.mlim[2])
-                end
-            end
-            if any(x -> x < M.mlim[1], m_vec); Turing.@addlogprob! -Inf; return nothing; end
-
-            t_eta_logistic_base = zeros(T, M.t_N)
-            if M.yeartransition == 0
-                for i in M.iok
-                    j = M.t_idx[i]
-                    t_eta_logistic_base[j] = (m_vec[j] - M.removed[j]/K_logistic) / q1_logistic
-                end
-            else
-                for i in M.iok
-                    mu_base = i < M.yeartransition ? (m_vec[i] / q1_logistic) :
-                              i == M.yeartransition ? ((m_vec[i] - (M.removed[i-1] + M.removed[i])/(2.0*K_logistic)) / q1_logistic) :
-                              ((m_vec[i] - M.removed[i]/K_logistic) / q1_logistic)
-                    t_eta_logistic_base[i] = mu_base
-                end
-            end
-            t_eta = t_eta_logistic_base .+ t_innovations
-            t_Q = t_Q_innov
-        else
-            t_rho = m_time == :ar1 ? (t_rho ~ Beta(2, 2)) : nothing
-            t_Q = recompose_precision(m_time, M.t_Q_template.matrix, t_sigma; extra_param=t_rho, noise=M.noise)
-            t_latent ~ MvNormalCanon(zeros(M.t_N), t_Q)
-            t_eta = t_latent
-        end
+        t_rho = m_time == :ar1 ? (~ NamedDist(Beta(2, 2), :t_rho)) : nothing
+        t_Q = recompose_precision(m_time, M.t_Q_template.matrix, t_sigma; extra_param=t_rho, noise=M.noise)
+        t_latent ~ NamedDist(MvNormalCanon(zeros(M.t_N), t_Q), :t_latent)
+        eta .+= t_latent[M.t_idx]
     end
 
-    # --- 5. Seasonal Manifold ---
-    local u_eta = zeros(T, M.u_N)
-    local u_Q = I(M.u_N)
-
+    # --- 13. Seasonal Manifold ---
     if M.model_season != "none"
-        u_sigma ~ Exponential(1.0)
+        u_sigma ~ NamedDist(Exponential(1.0), :u_sigma)
         m_season = Symbol(M.model_season)
-
         if m_season == :harmonic
-            u_α ~ Normal(0, 1); u_β ~ Normal(0, 1)
-            u_steps = 1:M.u_N
-            u_eta = (u_α .* sin.(2π .* u_steps ./ 12.0) .+ u_β .* cos.(2π .* u_steps ./ 12.0)) .* u_sigma
-            u_Q = recompose_precision(:seasonal, M.u_Q_template.matrix, u_sigma; noise=M.noise)
-        elseif m_season == :gp
-            u_ls ~ InverseGamma(3, 3)
-            u_K = (u_sigma^2) .* kernelmatrix(SqExponentialKernel() ∘ ScaleTransform(1.0/u_ls), 1.0:Float64(M.u_N)) + M.noise*I
-            u_gp ~ MvNormal(zeros(M.u_N), Symmetric(u_K))
-            u_eta = u_gp
-            u_Q = inv(Symmetric(u_K))
-        elseif m_season == :iid
-            u_iid ~ MvNormal(zeros(M.u_N), I)
-            u_eta = u_iid .* u_sigma
-            u_Q = I(M.u_N)
+            u_steps = 1:M.u_N; u_alpha ~ NamedDist(Normal(0, 1), :u_alpha); u_beta ~ NamedDist(Normal(0, 1), :u_beta)
+            eta .+= (u_alpha .* sin.(2π .* u_steps[M.u_idx] ./ 12.0) .+ u_beta .* cos.(2π .* u_steps[M.u_idx] ./ 12.0)) .* u_sigma
         else
-            u_rho = m_season == :ar1 ? (u_rho ~ Beta(2, 2)) : nothing
+            u_rho = m_season == :ar1 ? (~ NamedDist(Beta(2, 2), :u_rho)) : nothing
             u_Q = recompose_precision(m_season, M.u_Q_template.matrix, u_sigma; extra_param=u_rho, noise=M.noise)
-            u_latent ~ MvNormalCanon(zeros(M.u_N), u_Q)
-            u_eta = u_latent
+            u_latent ~ NamedDist(MvNormalCanon(zeros(M.u_N), u_Q), :u_latent)
+            eta .+= u_latent[M.u_idx]
         end
     end
 
-    # --- 6. Spatiotemporal Interaction Manifold (Includes Transport Logic) ---
-    local st_eta_map = zeros(T, M.s_N, M.t_N)
-
+    # --- 14. Spatiotemporal Interaction & Transport ---
     if M.model_st != "none"
-        st_sigma ~ Exponential(1.0)
+        st_sigma ~ NamedDist(Exponential(1.0), :st_sigma)
         m_st = Symbol(M.model_st)
-
         if m_st in [:diffusion, :advection, :advection_diffusion]
-            st_diffusion ~ Exponential(0.5)
-            st_advection ~ Exponential(0.5)
-            st_persistence ~ MvNormal(zeros(M.s_N), I)
-
-            st_eta_z ~ MvNormal(zeros(M.s_N * M.t_N), I)
-            st_innovation = reshape(st_eta_z, M.s_N, M.t_N) .* st_sigma
-
+            # Physics-informed transport manifolds
+            st_diff ~ NamedDist(Exponential(0.5), :st_diff); st_adv ~ NamedDist(Exponential(0.5), :st_adv); st_pers ~ NamedDist(MvNormal(zeros(M.s_N), I), :st_pers)
             L_phys = Matrix(Diagonal(vec(sum(M.W, dims=2))) - M.W)
-            st_eta_map[:, 1] = st_innovation[:, 1]
-
+            st_innov ~ filldist(Normal(0, st_sigma), M.s_N, M.t_N)
+            st_eta_map = zeros(T, M.s_N, M.t_N)
+            st_eta_map[:, 1] .= st_innov[:, 1]
             for t in 2:M.t_N
-                mu_phys_diffusion = (m_st in [:diffusion, :advection_diffusion]) ? st_diffusion .* (L_phys * st_eta_map[:, t-1]) : zeros(T, M.s_N)
-                mu_phys_advection = (m_st in [:advection, :advection_diffusion]) ? st_advection .* (L_phys * s_eta) : zeros(T, M.s_N)
-
-                mu_phys = st_eta_map[:, t-1] .- mu_phys_diffusion .- mu_phys_advection
-                st_eta_map[:, t] = logistic.(st_persistence) .* mu_phys .+ st_innovation[:, t]
+                # Numerical integration for spread: μ_t = persistence * (μ_{t-1} - Laplacian effects)
+                mu_p = st_eta_map[:, t-1] .- (m_st != :advection ? st_diff .* (L_phys * st_eta_map[:, t-1]) : 0.0) .- (m_st != :diffusion ? st_adv .* (L_phys * s_eta) : 0.0)
+                st_eta_map[:, t] .= logistic.(st_pers) .* mu_p .+ st_innov[:, t]
             end
+            for i in 1:M.y_N; eta[i] += st_eta_map[M.s_idx[i], M.t_idx[i]]; end
         else
+            # Standard Kronecker-structured Interactions (Knorr-Held Types I-IV)
             Q_s_st = (m_st in [:III, :IV]) ? M.s_Q_template.matrix : I(M.s_N)
             Q_t_st = (m_st in [:II, :IV]) ? M.t_Q_template.matrix : I(M.t_N)
-
-            local st_Q_kron
-            if m_st == :I
-                st_Q_kron = (1.0/st_sigma^2) .* I(M.s_N * M.t_N)
-            elseif m_st == :II
-                st_Q_kron = (1.0/st_sigma^2) .* kron(I(M.s_N), t_Q)
-            elseif m_st == :III
-                st_Q_kron = (1.0/st_sigma^2) .* kron(s_Q, I(M.t_N))
-            elseif m_st == :IV
-                st_Q_kron = (1.0/st_sigma^2) .* kron(s_Q, t_Q)
-            else
-                st_rho = nothing
-                if m_st in [:transport_diffusion, :transport_advection, :transport_combined]
-                    st_rho ~ Beta(1,1)
-                end
-                st_Q_kron = recompose_precision(m_st, M.st_template.matrix, st_sigma; extra_param=st_rho, noise=M.noise)
-            end
-
-            st_latent ~ MvNormalCanon(zeros(M.s_N * M.t_N), Symmetric(Matrix(st_Q_kron) + M.noise*I))
-            st_eta_map = reshape(st_latent, M.s_N, M.t_N)
+            st_Q_kron = Symmetric(kron(Q_t_st, Q_s_st) .* (1.0 / (st_sigma^2 + M.noise)) + M.noise * I)
+            st_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N * M.t_N), st_Q_kron), :st_latent)
+            eta .+= st_latent[(M.t_idx .- 1) .* M.s_N .+ M.s_idx]
         end
     end
 
-    # --- 7. Assembler ---
-    eta .+= c_effects_sum
-    eta .+= s_eta[M.s_idx]
-    eta .+= t_eta[M.t_idx]
-    eta .+= u_eta[M.u_idx]
-
-    for i in 1:M.y_N
-        eta[i] += st_eta_map[M.s_idx[i], M.t_idx[i]]
-    end
-
-    if M.model_space == "svc" && M.fixed_N > 0
-        for i in 1:M.y_N
-            a = M.s_idx[i]
-            for k in 1:M.fixed_N
-                eta[i] += s_svc[a, k] * M.fixed[i, k]
-            end
-        end
-    end
-
-    # --- 8. Likelihood (handling missing observations) ---
+    # --- 15. Likelihood Execution ---
+    # Ensure linear predictor stays within stable bounds for link functions
     eta = clamp.(eta, -20.0, 20.0)
-
-    good_indices = findall(!ismissing, M.y_obs)
-    y_obs_filtered = M.y_obs[good_indices]
-    eta_filtered = eta[good_indices]
-    weights_filtered = M.weights[good_indices]
-    trials_filtered = M.trials[good_indices]
-
-    Turing.@addlogprob! logpdf(bstm_Likelihood(M.model_family, M.use_zi, weights_filtered, lik_phi, lik_r, y_sigma, trials_filtered, y_obs_filtered), eta_filtered)
+    # Mask missing observations (Likelihood is conditional on observed data)
+    good_idx = findall(!ismissing, M.y_obs)
+    Turing.@addlogprob! logpdf(bstm_Likelihood(M.model_family, M.use_zi, M.weights[good_idx], lik_phi, lik_r, y_sigma, M.trials[good_idx], M.y_obs[good_idx]), eta[good_idx])
 end
 
 
@@ -5974,164 +5955,165 @@ end
  
 
 
-function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, PS, alpha)
+function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, modelname, chain, M, PS, alpha)
+    # --- 1. Dimensions and Metadata ---
     N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
     N_tot = M.y_N + N_PS
     N_samples = size(chain, 1)
     p_names_str = string.(FlexiChains.parameters(chain))
 
-    # 1. Base Parameter Extraction
-    alpha_vals = "alpha" in p_names_str ? vec(get_params_vector(chain, "alpha", 1)) : zeros(N_samples)
+    # --- 2. Global Hyperparameter Extraction ---
+    # Discover scaling sigmas for all latent manifolds
     s_sigmas = "s_sigma" in p_names_str ? vec(get_params_vector(chain, "s_sigma", 1)) : ones(N_samples)
     t_sigmas = "t_sigma" in p_names_str ? vec(get_params_vector(chain, "t_sigma", 1)) : ones(N_samples)
     u_sigmas = "u_sigma" in p_names_str ? vec(get_params_vector(chain, "u_sigma", 1)) : zeros(N_samples)
+    st_sigmas = "st_sigma" in p_names_str ? vec(get_params_vector(chain, "st_sigma", 1)) : zeros(N_samples)
 
-    # 2. Field Storage
+    # --- 3. Latent Field Initialization ---
     s_eff_struct = zeros(M.s_N, N_samples)
     s_eff_noisy = zeros(M.s_N, N_samples)
     t_eff = zeros(M.t_N, N_samples)
     u_eff = zeros(get(M, :u_N, 1), N_samples)
+    st_eff_map = zeros(M.s_N, M.t_N, N_samples)
 
-    # 3. Covariate effects (Fixed and Random)
+    # Feature-based regression storage
     Xfixed_betas = (M.Xfixed_N > 0) ? zeros(M.Xfixed_N, N_samples) : nothing
-    random_eff = "c_eta" in p_names_str ? zeros(M.N_cat, N_samples) : nothing
 
-    # New effect storage
-    mixed_effects_samples = haskey(M, :mixed_terms) && !isempty(M.mixed_terms) ?
-        [zeros(term.n_cat, N_samples) for term in M.mixed_terms] : nothing
-    interaction_effects_samples = haskey(M, :interaction_terms) && !isempty(M.interaction_terms) ?
-        [zeros(M.y_N + N_PS, N_samples) for _ in M.interaction_terms] : nothing
-    eigen_effects_samples = haskey(M, :eigen_terms) && !isempty(M.eigen_terms) ?
-        [zeros(term.n_dims, N_samples) for term in M.eigen_terms] : nothing
+    # Hierarchical and Categorical storage (Dictionary-driven for stability)
+    hierarchical_fields = Dict{Symbol, Matrix{Float64}}()
+    if haskey(M, :spatial_hierarchy)
+        for scale_sym in keys(M.spatial_hierarchy)
+            hierarchical_fields[scale_sym] = zeros(M.spatial_hierarchy[scale_sym].n_units, N_samples)
+        end
+    end
 
+    categorical_eff = Dict{Symbol, Matrix{Float64}}()
+    if haskey(M, :c_groups) && haskey(M, :c_re_templates)
+        for c_sym in keys(M.c_groups)
+            n_lvls = size(M.c_re_templates[c_sym].matrix, 1)
+            categorical_eff[c_sym] = zeros(n_lvls, N_samples)
+        end
+    end
+
+    # Effect-specific storage for advanced manifolds
+    mixed_eff = !isempty(get(M, :mixed_terms, [])) ? [zeros(N_tot, N_samples) for _ in M.mixed_terms] : nothing
+    interaction_eff = !isempty(get(M, :interaction_terms, [])) ? [zeros(N_tot, N_samples) for _ in M.interaction_terms] : nothing
+    eigen_eff = !isempty(get(M, :eigen_terms, [])) ? [zeros(N_tot, N_samples) for _ in M.eigen_terms] : nothing
+    svc_eff = !isempty(get(M, :svc_covariates, [])) ? [zeros(N_tot, N_samples) for _ in M.svc_covariates] : nothing
+    basis_eff = !isempty(get(M, :basis_matrices, Dict())) ? Dict(v => zeros(N_tot, N_samples) for v in keys(M.basis_matrices)) : nothing
+
+    # --- 4. Iterative Sample Reconstruction ---
     for j in 1:N_samples
-        # Manifold Extractions
+        # 4.1 Base Manifolds (Trait-based)
         fs, fn = extract_manifold(SpatialTrait(), chain, M, j, s_sigmas[j])
         s_eff_struct[:, j] .= fs
         s_eff_noisy[:, j] .= fn
         t_eff[:, j] .= extract_manifold(TemporalTrait(), chain, M, j, t_sigmas[j])
-
         if M.model_season != "none"
             u_eff[:, j] .= extract_manifold(SeasonalTrait(), chain, M, j, u_sigmas[j])
         end
-        if !isnothing(Xfixed_betas)
-            Xfixed_betas[:, j] .= extract_manifold(FixedEffectTrait(), chain, M, j)
+
+        # 4.2 Spatiotemporal & Hierarchical Map
+        if "st_latent" in p_names_str
+            st_eff_map[:, :, j] .= reshape(vec(chain[:st_latent].data[j]), M.s_N, M.t_N) .* st_sigmas[j]
         end
-        if !isnothing(random_eff)
-            random_eff[:, j] .= extract_manifold(RandomEffectTrait(), chain, M, j)
+        for scale_sym in keys(hierarchical_fields)
+            p_key = Symbol("s_latent_", scale_sym)
+            if p_key in FlexiChains.parameters(chain); hierarchical_fields[scale_sym][:, j] .= vec(chain[p_key].data[j]); end
         end
 
-        # Extract new effects
-        if !isnothing(mixed_effects_samples)
-            for (idx, m_term) in enumerate(M.mixed_terms)
-                mixed_effects_samples[idx][:, j] .= get_params_vector(chain, "beta_group_$(idx)", m_term.n_cat)[j, :]
-            end
+        # 4.3 Fixed & Categorical Effects
+        if !isnothing(Xfixed_betas); Xfixed_betas[:, j] .= extract_manifold(FixedEffectTrait(), chain, M, j); end
+        for c_sym in keys(categorical_eff)
+            c_name = Symbol("c_latent_", c_sym)
+            if c_name in FlexiChains.parameters(chain); categorical_eff[c_sym][:, j] .= vec(chain[c_name].data[j]); end
         end
-        if !isnothing(interaction_effects_samples)
+
+        # 4.4 Advanced Manifolds (RFF Interaction & SVC)
+        if !isnothing(interaction_eff)
             for (idx, i_term) in enumerate(M.interaction_terms)
-                sig_ie = get_params_vector(chain, "sig_ie_$(idx)", 1)[j]
-                ls_ie = get_params_vector(chain, "ls_ie_$(idx)", 1)[j]
-                beta_ie = get_params_vector(chain, "beta_ie_$(idx)", i_term.M_rff)[j, :]
-                # Recompute projection for the full N_tot (observations + prediction surface)
-                # PS.surface_df needs to provide coords in a compatible way for interaction terms
-                all_coords_ie = if N_PS > 0
-                    vcat(i_term.coords, hcat(PS.surface_df.v1, PS.surface_df.v2))
-                else
-                    i_term.coords
-                end
-                projection = (all_coords_ie * i_term.W_ie) .+ i_term.b_ie'
-                interaction_effects_samples[idx][:, j] .= sqrt(2.0/i_term.M_rff) .* cos.(projection) * beta_ie
+                beta_ie = get_params_vector(chain, Symbol("beta_ie_", idx), i_term.M_rff)[j, :]
+                all_coords = (N_PS > 0) ? vcat(i_term.coords, Matrix(PS.surface_df[:, [:lat, :lon]])) : i_term.coords
+                proj = (all_coords * i_term.W_ie) .+ i_term.b_ie'
+                interaction_eff[idx][:, j] .= sqrt(2.0/i_term.M_rff) .* cos.(proj) * beta_ie
             end
         end
-        if !isnothing(eigen_effects_samples)
+
+        if !isnothing(svc_eff) && get(M, :svc_model, "none") == "rff"
+            for (idx, c_sym) in enumerate(M.svc_covariates)
+                sig_svc = get_params_vector(chain, Symbol("sig_svc_", c_sym), 1)[j]
+                beta_svc = get_params_vector(chain, Symbol("beta_svc_", c_sym), M.svc_M_rff)[j, :]
+                all_s_coord = (N_PS > 0) ? vcat(M.s_coord_mat, Matrix(PS.surface_df[:, [:lat, :lon]])) : M.s_coord_mat
+                proj_svc = (all_s_coord * M.W_fixed_svc) .+ M.b_fixed_svc'
+                z_k = sqrt(2.0 / M.svc_M_rff) .* cos.(proj_svc)
+                all_s_idx = (N_PS > 0) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
+                cov_vals = (N_PS > 0) ? vcat(M.Xfixed[:, c_sym], PS.surface_df[:, c_sym]) : M.Xfixed[:, c_sym]
+                svc_eff[idx][:, j] .= (z_k[all_s_idx, :] * beta_svc .* sig_svc) .* cov_vals
+            end
+        end
+
+        # 4.5 Eigen & Basis Mapping
+        if !isnothing(eigen_eff)
             for (idx, e_term) in enumerate(M.eigen_terms)
-                v_pca = get_params_vector(chain, "v_pca_$(idx)", length(e_term.ltri_indices))[j, :]
-                pca_sd = get_params_vector(chain, "pca_sd_$(idx)", e_term.n_dims)[j, :]
-                pdef_sd = get_params_vector(chain, "pdef_sd_$(idx)", 1)[j]
-                K_pca, _, _ = householder_transform(v_pca, e_term.n_dims, e_term.n_dims, e_term.ltri_indices, pca_sd, pdef_sd, M.noise)
-                eigen_effects_samples[idx][:, j] .= vec(e_term.data * K_pca)
+                v_pca = get_params_vector(chain, Symbol("v_pca_", idx), length(e_term.ltri_indices))[j, :]
+                p_sd = get_params_vector(chain, Symbol("pca_sd_", idx), e_term.n_dims)[j, :]
+                pdef = get_params_vector(chain, Symbol("pdef_sd_", idx), 1)[j]
+                K_pca, _, _ = householder_transform(v_pca, e_term.n_dims, e_term.n_dims, e_term.ltri_indices, p_sd, pdef, M.noise)
+                eigen_eff[idx][1:M.y_N, j] .= vec(e_term.data * K_pca)
+            end
+        end
+        if !isnothing(basis_eff)
+            for (v_sym, B) in M.basis_matrices
+                beta_b = get_params_vector(chain, Symbol("beta_basis_", v_sym), size(B, 2))[j, :]
+                basis_eff[v_sym][1:M.y_N, j] .= B * beta_b
             end
         end
     end
 
-    # 4. Predictor Reconstruction (Noisy vs Denoised)
+    # --- 5. Predictor Assembler (Corrected Full Summation) ---
     eta_noisy = zeros(N_tot, N_samples)
     eta_denoised = zeros(N_tot, N_samples)
-
-    # Extract design matrix column names from the observation model
-    fixed_names = names(M.Xfixed, 2)
+    fixed_names = Symbol.(names(M.Xfixed, 2))
 
     for j in 1:N_samples
         for i in 1:N_tot
             is_obs = i <= M.y_N; idx = is_obs ? i : i - M.y_N; src = is_obs ? M : PS
-            s_idx = Int(src.s_idx[idx]); t_idx = Int(src.t_idx[idx])
-            u_idx_val = M.model_season != "none" ? Int(src.u_idx[idx]) : 1 # Default to 1 if no season
+            s_id, t_id = Int(src.s_idx[idx]), Int(src.t_idx[idx])
+            val = is_obs ? get(M, :log_offset, zeros(M.y_N))[i] : 0.0
 
-            base_val = alpha_vals[j] + (is_obs ? get(M, :log_offset, zeros(M.y_N))[i] : 0.0)
-
-            # Apply Fixed Effects using the full design matrix
+            # Fixed Part
             if !isnothing(Xfixed_betas)
-                X_row = is_obs ? M.Xfixed[idx, :] : Matrix(PS.surface_df[idx, fixed_names])
-                base_val += dot(Xfixed_betas[:, j], X_row)
+                X_row = is_obs ? M.Xfixed[idx, :] : collect(Vector(PS.surface_df[idx, fixed_names]))
+                val += dot(Xfixed_betas[:, j], X_row)
             end
 
-            # Apply Random Effects
-            if !isnothing(random_eff)
-                c_level = Int(is_obs ? M.c_groups[Symbol("s_idx")][idx] : PS.s_idx[idx]) # Assuming s_idx maps to c_groups
-                base_val += random_eff[c_level, j]
-            end
+            # Hierarchical & Categorical Manifolds
+            for scale_sym in keys(hierarchical_fields); val += hierarchical_fields[scale_sym][M.spatial_hierarchy[scale_sym].indices[idx], j]; end
+            for c_sym in keys(categorical_eff); val += categorical_eff[c_sym][src.c_groups[c_sym][idx], j]; end
 
-            # Add Categorical Covariate effects
-            if haskey(M, :c_groups) && !isempty(M.c_groups)
-                for c_sym in keys(M.c_groups)
-                    c_latent_name = Symbol("c_latent_$(c_sym)")
-                    if c_latent_name in FlexiChains.parameters(chain)
-                        c_latent_samples = get_params_vector(chain, string(c_latent_name), size(M.c_re_templates[c_sym].matrix, 1))[j, :]
-                        group_val = is_obs ? M.c_groups[c_sym][idx] : 1 # Placeholder for PS
-                        base_val += c_latent_samples[group_val]
-                    end
-                end
-            end
+            # Trend & Season
+            val += t_eff[t_id, j]
+            if M.model_season != "none"; val += u_eff[Int(src.u_idx[idx]), j]; end
 
-            # Add Mixed Effects
-            if !isnothing(mixed_effects_samples)
-                for (midx, m_term) in enumerate(M.mixed_terms)
-                    beta_group_val = mixed_effects_samples[midx][m_term.indices[idx], j]
-                    base_val += beta_group_val * m_term.covariate_vals[idx]
-                end
-            end
+            # Advanced Component Summation
+            if !isnothing(mixed_eff); for e in mixed_eff; val += e[i, j]; end; end
+            if !isnothing(interaction_eff); for e in interaction_eff; val += e[i, j]; end; end
+            if !isnothing(eigen_eff); for e in eigen_eff; val += e[i, j]; end; end
+            if !isnothing(svc_eff); for e in svc_eff; val += e[i, j]; end; end
+            if !isnothing(basis_eff); for e in values(basis_eff); val += e[i, j]; end; end
 
-            # Add Interaction Effects
-            if !isnothing(interaction_effects_samples)
-                for (iidx, _) in enumerate(M.interaction_terms)
-                    base_val += interaction_effects_samples[iidx][i, j]
-                end
-            end
-
-            # Add Eigen Effects
-            if !isnothing(eigen_effects_samples)
-                for (eidx, e_term) in enumerate(M.eigen_terms)
-                    base_val += eigen_effects_samples[eidx][e_term.indices_for_y[idx], j] # Assuming indices_for_y maps to correct data row
-                end
-            end
-
-            # Split paths: struct vs noisy spatial
-            eta_denoised[i, j] = base_val + s_eff_struct[s_idx, j] + t_eff[t_idx, j]
-            eta_noisy[i, j] = base_val + s_eff_noisy[s_idx, j] + t_eff[t_idx, j]
-
-            if M.model_season != "none"
-                eta_denoised[i, j] += u_eff[u_idx_val, j]
-                eta_noisy[i, j] += u_eff[u_idx_val, j]
-            end
+            st_val = st_eff_map[s_id, t_id, j]
+            eta_denoised[i, j] = val + s_eff_struct[s_id, j] + st_val
+            eta_noisy[i, j] = val + s_eff_noisy[s_id, j] + st_val
         end
     end
 
-    # 5. Volatility and Final Transformation
+    # --- 6. Family Transformation & Denoising Engine ---
     y_sigma = _extract_volatility(chain, p_names_str, N_tot, N_samples)
     preds_denoised, preds_noisy, log_lik = _process_ll_and_predictions(fam, eta_noisy, chain, M, N_tot, N_samples, y_sigma, M.y_obs)
     field_denoised, _, _ = _process_ll_and_predictions(fam, eta_denoised, chain, M, N_tot, N_samples, y_sigma, M.y_obs)
 
-    # 6. Post-Stratification Logic
+    # Post-stratification Weight logic
     weights = nothing
     if N_PS > 0
         s_idx_obs = M.s_idx; t_idx_obs = M.t_idx; u_idx_obs = get(M, :u_idx, ones(Int, M.y_N))
@@ -6144,22 +6126,26 @@ function _reconstruct(arch::UnivariateArchitecture, fam::ModelFamily, chain, M, 
         spatial_structured = summarize_array(reshape(s_eff_struct, M.s_N, 1, N_samples); alpha=alpha),
         spatial_unstructured = summarize_array(reshape(s_eff_noisy .- s_eff_struct, M.s_N, 1, N_samples); alpha=alpha),
         temporal = summarize_array(reshape(t_eff, M.t_N, 1, N_samples); alpha=alpha),
-        seasonal = M.model_season != "none" ? summarize_array(reshape(u_eff, get(M, :u_N, 1), 1, N_samples); alpha=alpha) : nothing,
+        seasonal = (M.model_season != "none") ? summarize_array(reshape(u_eff, get(M, :u_N, 1), 1, N_samples); alpha=alpha) : nothing,
+        spatiotemporal = summarize_array(reshape(st_eff_map, M.s_N * M.t_N, 1, N_samples); alpha=alpha),
         volatility = summarize_array(reshape(y_sigma, N_tot, 1, N_samples); alpha=alpha),
         fixed_effects = !isnothing(Xfixed_betas) ? summarize_array(reshape(Xfixed_betas, M.Xfixed_N, 1, N_samples); alpha=alpha) : nothing,
-        random_effects = !isnothing(random_eff) ? summarize_array(reshape(random_eff, length(M.c_groups[first(keys(M.c_groups))]), 1, N_samples); alpha=alpha) : nothing, # Assuming one group for now
-        mixed_effects = !isnothing(mixed_effects_samples) ? [summarize_array(reshape(me, size(me,1), 1, N_samples); alpha=alpha) for me in mixed_effects_samples] : nothing,
-        interaction_effects = !isnothing(interaction_effects_samples) ? [summarize_array(reshape(ie, size(ie,1), 1, N_samples); alpha=alpha) for ie in interaction_effects_samples] : nothing,
-        eigen_effects = !isnothing(eigen_effects_samples) ? [summarize_array(reshape(ee, size(ee,1), 1, N_samples); alpha=alpha) for ee in eigen_effects_samples] : nothing,
+        hierarchical_spatial = isempty(hierarchical_fields) ? nothing : Dict(k => summarize_array(reshape(v, size(v,1), 1, N_samples); alpha=alpha) for (k,v) in hierarchical_fields),
+        categorical_effects = isempty(categorical_eff) ? nothing : Dict(k => summarize_array(reshape(v, size(v,1), 1, N_samples); alpha=alpha) for (k,v) in categorical_eff),
+        mixed_effects = !isnothing(mixed_eff) ? [summarize_array(reshape(me, size(me,1), 1, N_samples); alpha=alpha) for me in mixed_eff] : nothing,
+        interaction_effects = !isnothing(interaction_eff) ? [summarize_array(reshape(ie, size(ie,1), 1, N_samples); alpha=alpha) for ie in interaction_eff] : nothing,
+        eigen_effects = !isnothing(eigen_eff) ? [summarize_array(reshape(ee, size(ee,1), 1, N_samples); alpha=alpha) for ee in eigen_eff] : nothing,
+        svc_effects = !isnothing(svc_eff) ? [summarize_array(reshape(svc, size(svc,1), 1, N_samples); alpha=alpha) for svc in svc_eff] : nothing,
+        basis_effects = isempty(basis_eff) ? nothing : Dict(k => summarize_array(reshape(v, size(v,1), 1, N_samples); alpha=alpha) for (k,v) in basis_eff),
         predictions_observed_denoised = summarize_array(reshape(preds_denoised[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
         predictions_observed_noisy = summarize_array(reshape(preds_noisy[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
-        predictions_strata_denoised = N_PS > 0 ? summarize_array(reshape(preds_denoised[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
-        predictions_strata_noisy = N_PS > 0 ? summarize_array(reshape(preds_noisy[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        predictions_strata_denoised = N_PS > 0 ? summarize_array(reshape(field_denoised[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
         post_strat_weights = isnothing(weights) ? nothing : (mean=vec(mean(weights, dims=2)), samples=weights),
         waic = _compute_waic(log_lik[:, 1:M.y_N]),
         family = fam, arch = arch
     )
 end
+
 
 
 function _reconstruct(arch::MultivariateArchitecture, fam::ModelFamily, chain, M, PS, alpha)
@@ -6362,6 +6348,357 @@ function _reconstruct(arch::MultifidelityArchitecture, fam::ModelFamily, chain, 
     )
 end
 
+
+function _reconstruct(arch::ExampleArchitecture, fam::ModelFamily, modelname, chain, M, PS, alpha)
+    N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
+    N_tot = M.y_N + N_PS
+    N_samples = size(chain, 1)
+    p_names_str = string.(FlexiChains.parameters(chain))
+
+    # 1. Model Type Detection using explicit modelname
+    is_kriging   = modelname == "example_kriging_simple"
+    is_hurdle    = modelname == "example_hurdle_bernoulli_poisson"
+    is_rff_2d    = modelname == "example_rff_2D"
+    is_rff_3d    = modelname == "example_rff_3D"
+    is_warping   = modelname == "example_warping_2D"
+    is_mosaic_2d = modelname == "example_rff_2D_mosaic"
+    is_mosaic_3d = modelname == "example_rff_3D_mosaic"
+    is_gp_gaussian = modelname == "example_gp_gaussian"
+
+    # 2. Field Storage (aligned with UnivariateArchitecture)
+    # f_latent_samples for the combined linear predictor before link function
+    f_latent_samples = zeros(N_tot, N_samples)
+    s_eff_struct = zeros(M.s_N, N_samples)
+    s_eff_noisy = zeros(M.s_N, N_samples)
+    t_eff = zeros(M.t_N, N_samples)
+    u_eff = zeros(get(M, :u_N, 1), N_samples)
+    st_eff_map = zeros(M.s_N, M.t_N, N_samples)
+
+    Xfixed_betas = (M.Xfixed_N > 0) ? zeros(M.Xfixed_N, N_samples) : nothing
+    random_eff = "c_eta" in p_names_str ? zeros(M.N_cat, N_samples) : nothing
+
+    mixed_effects_samples = haskey(M, :mixed_terms) && !isempty(M.mixed_terms) ?
+        [zeros(term.n_cat, N_samples) for term in M.mixed_terms] : nothing
+    interaction_effects_samples = haskey(M, :interaction_terms) && !isempty(M.interaction_terms) ?
+        [zeros(N_tot, N_samples) for _ in M.interaction_terms] : nothing
+    eigen_effects_samples = haskey(M, :eigen_terms) && !isempty(M.eigen_terms) ?
+        [zeros(term.n_dims, N_samples) for term in M.eigen_terms] : nothing
+
+    # Precompute Coordinates for Mosaic/Warping/RFF methods
+    # Adjust for PS data if available
+    all_s_coords = N_PS > 0 ? vcat(M.s_coord_tuple, [Tuple(r) for r in eachrow(Matrix(PS.surface_df[:, [:x, :y]]))]) : M.s_coord_tuple
+    xs = [p[1] for p in all_s_coords]; ys = [p[2] for p in all_s_coords]
+    pts_2d = hcat(xs, ys)
+
+    st_sigmas = "st_sigma" in p_names_str ? vec(get_params_vector(chain, "st_sigma", 1)) : zeros(N_samples)
+
+    for j in 1:N_samples
+        # Extract common parameters
+        if !isnothing(Xfixed_betas); Xfixed_betas[:, j] .= get_params_vector(chain, "Xfixed_beta", M.Xfixed_N)[j, :]; end
+
+        if is_hurdle # example_hurdle_bernoulli_poisson
+            s_h = vec(get_params_vector(chain, "s_latent_h", M.s_N)[j, :])
+            t_h = vec(get_params_vector(chain, "t_latent_h", M.t_N)[j, :])
+            s_c = vec(get_params_vector(chain, "s_latent_c", M.s_N)[j, :])
+            t_c = vec(get_params_vector(chain, "t_latent_c", M.t_N)[j, :])
+            for i in 1:N_tot
+                is_obs = i <= M.y_N; idx = is_obs ? i : i - M.y_N; src = is_obs ? M : PS
+                a, t = Int(src.s_idx[idx]), Int(src.t_idx[idx])
+                h_l = s_h[a] + t_h[t]
+                c_l = (is_obs ? M.log_offset[i] : 0.0) + s_c[a] + t_c[t]
+                f_latent_samples[i, j] = logistic(h_l) * (exp(c_l) / (1.0 - exp(-exp(c_l))))
+            end
+            s_eff_struct[:,j] .= s_h # use hurdle's spatial for structured spatial
+            t_eff[:,j] .= t_h # use hurdle's temporal for temporal
+
+        elseif is_mosaic_2d || is_mosaic_3d # example_rff_2D_mosaic / example_rff_3D_mosaic
+            mu_loc = vec(get_params_vector(chain, "mu_local", M.n_mosaics)[j, :])
+            sig_loc = vec(get_params_vector(chain, "sigma_local", M.n_mosaics)[j, :])
+            # Recalculate centroids (Note: ideally these would be in M to avoid shifts)
+            coords_for_clustering = is_mosaic_3d ? hcat((xs .- minimum(xs))./(maximum(xs)-minimum(xs)+1e-6), (ys .- minimum(ys))./(maximum(ys)-minimum(ys)+1e-6)) : pts_2d
+            R = kmeans(coords_for_clustering[1:M.y_N, :]' |> Matrix, M.n_mosaics)
+            centroids = R.centers
+
+            for i in 1:N_tot
+                pt_s_coord = coords_for_clustering[i, :]
+                dists = [sum((pt_s_coord .- centroids[:, m]).^2) for m in 1:M.n_mosaics]
+                w_st = exp.(-dists) ./ sum(exp.(-dists))
+                val_combined = 0.0
+                for m in 1:M.n_mosaics
+                    s_l_m = vec(get_params_vector(chain, "s_latent[", m, "]", M.m_rff)[j, :])
+                    Random.seed!(42) # Ensure consistent RFF projections
+                    if is_mosaic_3d
+                        l_j = vec(get_params_vector(chain, "l_joint", 3 * M.n_mosaics)[j, :])
+                        l_m = l_j[(m-1)*3+1 : m*3]
+                        Om = randn(M.m_rff, 3) .* (1.0 ./ (l_m' .+ 1e-6))
+                        t_val = (i <= M.y_N ? Float64(M.t_idx[i]) : Float64(PS.t_idx[i-M.y_N]))
+                        pt_3d = [pt_s_coord[1], pt_s_coord[2], (t_val - minimum(M.t_idx))/(maximum(M.t_idx)-minimum(M.t_idx)+1e-6)]
+                        z_proj = sqrt(2/M.m_rff) * cos.( (Om * pt_3d) .+ (rand(M.m_rff) .* 2pi) )
+                    else # is_mosaic_2d
+                        l_m = get_params_vector(chain, "l_local", M.n_mosaics)[j, m]
+                        Om = randn(M.m_rff, 2) ./ l_m
+                        z_proj = sqrt(2/M.m_rff) .* cos.( (Om * pt_s_coord) .+ (rand(M.m_rff) .* 2pi) )
+                    end
+                    val_combined += w_st[m] * (mu_loc[m] + dot(z_proj, s_l_m .* sig_loc[m]))
+                end
+                f_latent_samples[i, j] = val_combined
+            end
+            # For mosaic, spatial_structured is the mean of local mu's, no simple single s_eff_struct
+            # We can approximate with global mean of local fields
+            s_eff_struct[:, j] .= mean(mu_loc)
+
+        elseif is_warping # example_warping_2D
+            s_l = vec(get_params_vector(chain, "s_latent", M.m_spatial)[j, :])
+            w_w = vec(get_params_vector(chain, "w_warp", M.m_warp)[j, :])
+            t_l = vec(get_params_vector(chain, "t_latent", M.t_N)[j, :]) .* chain[:t_sigma].data[j]
+            s_sig = chain[:s_sigma].data[j]; l_w = chain[:l_warp].data[j]; l_s = chain[:l_spatial].data[j]
+            coords_norm = hcat((xs .- mean(xs)) ./ (std(xs)+1e-6), (ys .- mean(ys)) ./ (std(ys)+1e-6))
+            Random.seed!(44); Om_w = randn(M.m_warp, 2) ./ l_w; Ph_w = rand(M.m_warp) .* 2pi
+            warped = (sqrt(2/M.m_warp) .* cos.(coords_norm * Om_w' .+ Ph_w')) * w_w
+            Random.seed!(45); Om_s = randn(M.m_spatial, 1) ./ l_s; Ph_s = rand(M.m_spatial) .* 2pi
+            Z_sp = sqrt(2/M.m_spatial) .* cos.(reshape(warped, :, 1) * Om_s' .+ Ph_s')
+            f_latent_samples[:, j] .= (Z_sp * (s_l .* s_sig)) .+ t_l[N_PS > 0 ? vcat(M.t_idx, PS.t_idx) : M.t_idx]
+            # For warping, s_eff_struct is the warped spatial field, and t_eff is the temporal
+            s_eff_struct[:, j] .= (Z_sp * (s_l .* s_sig))[1:M.s_N] # Assuming first M.s_N map to original spatial units
+            t_eff[:, j] .= t_l
+
+        elseif is_rff_2d # example_rff_2D
+            s_l = vec(get_params_vector(chain, "s_latent", M.m_spatial)[j, :])
+            t_l_raw = vec(get_params_vector(chain, "t_raw", M.t_N)[j, :])
+            t_sig = chain[:t_sigma].data[j]
+            s_sig = chain[:s_sigma].data[j]
+            kappa_sp = chain[:kappa_sp].data[j]
+
+            coords_norm = hcat(
+                (xs .- mean(xs)) ./ (std(xs) + 1e-6),
+                (ys .- mean(ys)) ./ (std(ys) + 1e-6)
+            )
+
+            Random.seed!(42)
+            Om = randn(M.m_spatial, 2) .* kappa_sp
+            Ph = rand(M.m_spatial) .* convert(Float64, 2pi)
+
+            Z_sp = convert(Float64, sqrt(2/M.m_spatial)) .* cos.(coords_norm * Om' .+ Ph')
+            spatial_field = Z_sp * (s_l .* s_sig)
+            temporal_field = t_l_raw .* t_sig
+
+            f_latent_samples[:, j] .= spatial_field .+ temporal_field[N_PS > 0 ? vcat(M.t_idx, PS.t_idx) : M.t_idx]
+            s_eff_struct[:, j] .= spatial_field[1:M.s_N]
+            t_eff[:, j] .= temporal_field
+
+        elseif is_rff_3d # example_rff_3D
+            s_l = vec(get_params_vector(chain, "s_latent", M.m_joint)[j, :])
+            sig_joint = chain[:sigma_joint].data[j]
+            l_joint = vec(get_params_vector(chain, "l_joint", 3)[j, :])
+
+            ts_all = N_PS > 0 ? vcat(M.t_idx, PS.t_idx) : M.t_idx
+
+            X_joint = hcat(
+                (xs .- minimum(xs)) ./ (maximum(xs) - minimum(xs) + 1e-6),
+                (ys .- minimum(ys)) ./ (maximum(ys) - minimum(ys) + 1e-6),
+                (Float64.(ts_all) .- minimum(M.t_idx)) ./ (maximum(M.t_idx) - minimum(M.t_idx) + 1e-6)
+            )
+
+            Random.seed!(42)
+            Om = randn(M.m_joint, 3) .* (1.0 ./ l_joint')
+            Ph = rand(M.m_joint) .* convert(Float64, 2pi)
+
+            Z_joint = convert(Float64, sqrt(2/M.m_joint)) .* cos.(X_joint * Om' .+ Ph')
+            eta_joint = Z_joint * (s_l .* sig_joint)
+
+            f_latent_samples[:, j] .= eta_joint
+            s_eff_struct[:, j] .= eta_joint[1:M.s_N] # Approximate spatial as first part of joint effect
+
+        elseif is_kriging # example_kriging_simple
+            # In Kriging, f_latent_all contains the entire spatial field
+            f_latent_samples[1:M.y_N, j] .= vec(chain[Symbol("f_latent_all")].data[j])
+            # No easy way to extract s_eff_struct, so use first part of f_latent_samples
+            s_eff_struct[:, j] .= f_latent_samples[1:M.s_N, j]
+
+        elseif is_gp_gaussian # example_gp_gaussian
+            s_l = vec(get_params_vector(chain, "s_latent", M.M_inducing_s_N*M.M_inducing_t_N)[j, :]) # Number of inducing points
+            st_sig = chain[:st_sigma].data[j]
+            l_s = chain[:ls_s].data[j]
+            l_t = chain[:ls_t].data[j]
+
+            k = (st_sig^2) * (SqExponentialKernel(ScaleTransform(inv(l_s))) * SqExponentialKernel(ScaleTransform(inv(l_t))))
+            f_gp = GP(k)
+
+            Ns = size(M.s_inducing, 2) # Ns and Nt here refer to dimensions of inducing points
+            Nt = size(M.t_inducing, 2)
+            s_grid = repeat(M.s_inducing, outer=(1, Nt))
+            t_grid = repeat(M.t_inducing, inner=(1, Ns))
+            X_ind = ColVecs(vcat(s_grid, t_grid))
+
+            f_cond = condition(f_gp(X_ind, 1e-6), s_l)
+
+            s_obs_full = M.s_coord.X'
+            t_obs_full = reshape(M.t_coord, 1, :)
+            X_obs_all_pts = ColVecs(vcat(s_obs_full, t_obs_full)) # M.y_N observations
+            
+            # If PS exists, include its coordinates too
+            if N_PS > 0
+                PS_s_coord_mat = reduce(hcat, [collect(p) for p in PS.s_coord_tuple])'
+                PS_t_coord_vec = PS.t_idx
+                X_ps_all_pts = ColVecs(vcat(PS_s_coord_mat, reshape(PS_t_coord_vec, 1, :)))
+                all_X_coords = ColVecs(hcat(X_obs_all_pts.X, X_ps_all_pts.X))
+            else
+                all_X_coords = X_obs_all_pts
+            end
+            
+            f_latent_samples[:, j] .= mean(f_cond(all_X_coords[N_PS > 0 ? vcat(M.st_idx, PS.st_idx) : M.st_idx]))
+            s_eff_struct[:, j] .= f_latent_samples[1:M.s_N, j] # Approximate spatial as first part
+
+        else # Default / Fallback for other example models (e.g., bym2_ar1_poisson)
+            s_sigmas = "s_sigma" in p_names_str ? vec(get_params_vector(chain, "s_sigma", 1)) : ones(N_samples)
+            t_sigmas = "t_sigma" in p_names_str ? vec(get_params_vector(chain, "t_sigma", 1)) : ones(N_samples)
+            u_sigmas = "u_sigma" in p_names_str ? vec(get_params_vector(chain, "u_sigma", 1)) : zeros(N_samples)
+
+            fs, fn = extract_manifold(SpatialTrait(), chain, M, j, s_sigmas[j])
+            s_eff_struct[:, j] .= fs
+            s_eff_noisy[:, j] .= fn
+            t_eff[:, j] .= extract_manifold(TemporalTrait(), chain, M, j, t_sigmas[j])
+            if M.model_season != "none"
+                u_eff[:, j] .= extract_manifold(SeasonalTrait(), chain, M, j, u_sigmas[j])
+            end
+            # Spatiotemporal / Transport Extraction (Scaling by st_sigma)
+            if "st_latent" in p_names_str
+                st_eff_map[:, :, j] .= reshape(vec(chain[:st_latent].data[j]), M.s_N, M.t_N) .* st_sigmas[j]
+            end
+
+            # Combine generic manifolds for f_latent_samples for the rest of the loop
+            for i in 1:N_tot
+                is_obs = i <= M.y_N; idx = is_obs ? i : i - M.y_N; src = is_obs ? M : PS
+                s_idx = Int(src.s_idx[idx]); t_idx = Int(src.t_idx[idx])
+                u_idx_val = M.model_season != "none" ? Int(src.u_idx[idx]) : 1
+                f_latent_samples[i,j] = s_eff_struct[s_idx,j] + t_eff[t_idx,j] + u_eff[u_idx_val,j] + st_eff_map[s_idx, t_idx, j]
+            end
+        end
+
+        # Extract new effects (mixed, interaction, eigen) - common to all architectures
+        if !isnothing(mixed_effects_samples)
+            for (idx, m_term) in enumerate(M.mixed_terms)
+                mixed_effects_samples[idx][:, j] .= get_params_vector(chain, "beta_group_$(idx)", m_term.n_cat)[j, :]
+            end
+        end
+        if !isnothing(interaction_effects_samples)
+            for (idx, i_term) in enumerate(M.interaction_terms)
+                sig_ie = get_params_vector(chain, "sig_ie_$(idx)", 1)[j]
+                ls_ie = get_params_vector(chain, "ls_ie_$(idx)", 1)[j]
+                beta_ie = get_params_vector(chain, "beta_ie_$(idx)", i_term.M_rff)[j, :]
+                all_coords_ie = if N_PS > 0
+                    # Assume interaction terms are defined on spatial coords similar to general prediction surface
+                    vcat(i_term.coords, hcat(PS.surface_df.x, PS.surface_df.y)) # Need 'x', 'y' from PS.surface_df
+                else
+                    i_term.coords
+                end
+                projection = (all_coords_ie * i_term.W_ie) .+ i_term.b_ie'
+                interaction_effects_samples[idx][:, j] .= sqrt(2.0/i_term.M_rff) .* cos.(projection) * beta_ie
+            end
+        end
+        if !isnothing(eigen_effects_samples)
+            for (idx, e_term) in enumerate(M.eigen_terms)
+                v_pca = get_params_vector(chain, "v_pca_$(idx)", length(e_term.ltri_indices))[j, :]
+                pca_sd = get_params_vector(chain, "pca_sd_$(idx)", e_term.n_dims)[j, :]
+                pdef_sd = get_params_vector(chain, "pdef_sd_$(idx)", 1)[j]
+                K_pca, _, _ = householder_transform(v_pca, e_term.n_dims, e_term.n_dims, e_term.ltri_indices, pca_sd, pdef_sd, M.noise)
+                eigen_effects_samples[idx][:, j] .= vec(e_term.data * K_pca)
+            end
+        end
+    end
+
+    # 3. Predictor Reconstruction (Noisy vs Denoised) - General Assembly
+    eta_noisy = zeros(N_tot, N_samples)
+    eta_denoised = zeros(N_tot, N_samples)
+
+    fixed_names = names(M.Xfixed, 2)
+
+    for j in 1:N_samples, i in 1:N_tot
+        is_obs = i <= M.y_N; idx = is_obs ? i : i - M.y_N; src = is_obs ? M : PS
+        
+        base_val = (is_obs ? get(M, :log_offset, zeros(M.y_N))[i] : 0.0)
+
+        if !isnothing(Xfixed_betas)
+            X_row = is_obs ? M.Xfixed[idx, :] : collect(Vector(PS.surface_df[idx, fixed_names]))
+            base_val += dot(Xfixed_betas[:, j], X_row)
+        end
+
+        # Add other effects as in UnivariateArchitecture
+        if haskey(M, :c_groups) && !isempty(M.c_groups)
+            for c_sym in keys(M.c_groups)
+                c_latent_name = Symbol("c_latent_$(c_sym)")
+                if c_latent_name in FlexiChains.parameters(chain)
+                    c_latent_samples = get_params_vector(chain, string(c_latent_name), size(M.c_re_templates[c_sym].matrix, 1))[j, :]
+                    group_val = is_obs ? M.c_groups[c_sym][idx] : 1 # Placeholder for PS
+                    base_val += c_latent_samples[group_val]
+                end
+            end
+        end
+
+        if !isnothing(mixed_effects_samples)
+            for (midx, m_term) in enumerate(M.mixed_terms)
+                beta_group_val = mixed_effects_samples[midx][m_term.indices[idx], j]
+                base_val += beta_group_val * m_term.covariate_vals[idx]
+            end
+        end
+
+        if !isnothing(interaction_effects_samples)
+            for (iidx, _) in enumerate(M.interaction_terms)
+                base_val += interaction_effects_samples[iidx][i, j]
+            end
+        end
+
+        if !isnothing(eigen_effects_samples)
+            for (eidx, e_term) in enumerate(M.eigen_terms)
+                base_val += eigen_effects_samples[eidx][e_term.indices_for_y[idx], j] # Assuming indices_for_y maps to correct data row
+            end
+        end
+
+        # Final field values from specific models are in f_latent_samples
+        eta_denoised[i, j] = base_val + f_latent_samples[i, j]
+        eta_noisy[i, j] = base_val + f_latent_samples[i, j] # Assuming for these models, noisy == denoised for the latent field
+    end
+
+    y_sigma = _extract_volatility(chain, p_names_str, N_tot, N_samples)
+    preds_denoised, preds_noisy, log_lik = _process_ll_and_predictions(fam, eta_noisy, chain, M, N_tot, N_samples, y_sigma, M.y_obs)
+
+    # Recalculate denoised field for output consistency with UnivariateArchitecture
+    field_denoised_for_output = zeros(N_tot, N_samples)
+    for j in 1:N_samples, i in 1:N_tot
+        val = eta_denoised[i, j]
+        field_denoised_for_output[i, j] = (fam isa PoissonFamily || fam isa NegativeBinomialFamily) ? exp(val) : (fam isa BinomialFamily ? logistic(val) : val)
+    end
+
+    # Post-stratification weights (if PS is active)
+    weights = nothing
+    if N_PS > 0
+        s_idx_obs = M.s_idx; t_idx_obs = M.t_idx; u_idx_obs = get(M, :u_idx, ones(Int, M.y_N))
+        s_N = M.s_N; t_N = M.t_N
+        stratum_map = [(Int(u_idx_obs[i])-1)*s_N*t_N + (Int(t_idx_obs[i])-1)*s_N + Int(s_idx_obs[i]) for i in 1:M.y_N]
+        weights = field_denoised_for_output[M.y_N .+ stratum_map, :] ./ (field_denoised_for_output[1:M.y_N, :] .+ 1e-9)
+    end
+
+    return (
+        spatial_structured = summarize_array(reshape(s_eff_struct, M.s_N, 1, N_samples); alpha=alpha),
+        spatial_unstructured = summarize_array(reshape(s_eff_noisy .- s_eff_struct, M.s_N, 1, N_samples); alpha=alpha),
+        temporal = summarize_array(reshape(t_eff, M.t_N, 1, N_samples); alpha=alpha),
+        seasonal = M.model_season != "none" ? summarize_array(reshape(u_eff, get(M, :u_N, 1), 1, N_samples); alpha=alpha) : nothing,
+        spatiotemporal = summarize_array(reshape(st_eff_map, M.s_N * M.t_N, 1, N_samples); alpha=alpha),
+        volatility = summarize_array(reshape(y_sigma, N_tot, 1, N_samples); alpha=alpha),
+        fixed_effects = !isnothing(Xfixed_betas) ? summarize_array(reshape(Xfixed_betas, M.Xfixed_N, 1, N_samples); alpha=alpha) : nothing,
+        random_effects = !isnothing(random_eff) ? summarize_array(reshape(random_eff, M.N_cat, 1, N_samples); alpha=alpha) : nothing,
+        mixed_effects = !isnothing(mixed_effects_samples) ? [summarize_array(reshape(me, size(me,1), 1, N_samples); alpha=alpha) for me in mixed_effects_samples] : nothing,
+        interaction_effects = !isnothing(interaction_effects_samples) ? [summarize_array(reshape(ie, size(ie,1), 1, N_samples); alpha=alpha) for ie in interaction_effects_samples] : nothing,
+        eigen_effects = !isnothing(eigen_effects_samples) ? [summarize_array(reshape(ee, size(ee,1), 1, N_samples); alpha=alpha) for ee in eigen_effects_samples] : nothing,
+        predictions_observed_denoised = summarize_array(reshape(preds_denoised[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+        predictions_observed_noisy = summarize_array(reshape(preds_noisy[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
+        predictions_strata_denoised = N_PS > 0 ? summarize_array(reshape(field_denoised_for_output[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        predictions_strata_noisy = N_PS > 0 ? summarize_array(reshape(preds_noisy[M.y_N+1:end, :], N_PS, 1, N_samples); alpha=alpha) : nothing,
+        post_strat_weights = isnothing(weights) ? nothing : (mean=vec(mean(weights, dims=2)), samples=weights),
+        waic = _compute_waic(log_lik[:, 1:M.y_N]),
+        family = fam, arch = arch
+    )
+end
 
 
 

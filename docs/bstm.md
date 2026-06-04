@@ -186,9 +186,22 @@ StatsPlots.plot(chn[[:s_sigma, :s_rho, :t_sigma, :t_rho]], seriestype=:traceplot
 res = model_results_comprehensive(m, chn, inp_scot, au_scot );  
 
 # a little longer to sample but worth the wait ..
- 
+
+# yet another alternative:
+m = bstm( "y ~ 1 + re(s_idx, model='bym2') + re(t_idx, model='ar1')", 
+  DataFrame(
+    y = data_scot.y,
+    s_idx = data_scot.s_idx,
+    t_idx = data_scot.t_idx,
+    log_offset = data_scot.log_offset
+  ), 
+  model_family="poisson", 
+  W = data_scot.W
+)
+  
 ```
 The results look like this. Not great but that is because, they have not converged yet (rhat is far from 1) and the model is simple: we are ignoring covariates and spatiotemporal interactions. The bstm version does some additional work which slows it down a bit but overall, gives a better posterior predictive check (PPC). 
+
 
 
 ```
@@ -1459,6 +1472,56 @@ Where components `s_eta`, `t_eta`, `st_eta`, `c_eta`, `u_eta` (and `svc_raw`, `d
 *   Rahimi, A., & Recht, B. (2008). Random features for large-scale kernel machines. *Advances in Neural Information Processing Systems*, 20.
 
 
+## Technical Summary: BSTM Univariate Feature Set
+
+The `bstm_univariate` model is a Bayesian Spatiotemporal Model (BSTM) architecture designed for maximum flexibility in modeling complex latent structures. It builds a linear predictor $\eta$ through the additive combination of various manifolds and regression components.
+
+### 1. Main Manifolds (Spatial & Temporal)
+These are the core components used to model autocorrelation and trends.
+
+| Feature      | Formula Syntax           | Model Options                                                     | Data Expectation                                                                 | Why & How                                                                                                                     |
+| :-------------| :-------------------------| :------------------------------------------------------------------| :---------------------------------------------------------------------------------| :------------------------------------------------------------------------------------------------------------------------------|
+| **Spatial**  | `re(s_idx, model='...')` | `bym2`, `besag`, `iid`, `leroux`, `sar`, `dag`, `fitc`, `denseGP` | `s_idx`: Integer indices mapping data to units. `W`: Adjacency matrix for GMRFs. | Captures spatial dependencies. GMRF models use a precision matrix $Q$ derived from $W$; GP models use distance-based kernels. |
+| **Temporal** | `re(t_idx, model='...')` | `ar1`, `rw2`, `iid`, `gp`, `harmonic`, `logistic_ar1`             | `t_idx`: Chronological integer indices.                                          | Captures trends. `rw2` provides second-order smoothness; `ar1` models correlation between successive steps.                   |
+| **Seasonal** | `re(u_idx, model='...')` | `harmonic`, `iid`, `rw2`, `ar1`, `gp`                             | `u_idx`: Cyclic indices (e.g., 1-12 for months).                                 | Captures periodic fluctuations. `harmonic` uses sine/cosine basis; others use cyclic GMRF structures.                         |
+
+### 2. Spatio-Temporal (ST) Interaction
+Models the interaction between space and time, allowing spatial patterns to evolve over time.
+
+| Feature | Formula Syntax | Model Options | Data Expectation | Why & How |
+| :--- | :--- | :--- | :--- | :--- |
+| **ST Interaction** | `st(st_idx, model='...')` | `I`, `II`, `III`, `IV` (Knorr-Held types) | `st_idx`: Mapping index $(t-1) \times S_N + s$. | Models non-separability. Type IV uses a Kronecker product of spatial and temporal precisions: $Q_{ST} = Q_t \otimes Q_s$. |
+| **Transport** | `st(st_idx, model='...')` | `diffusion`, `advection`, `advection_diffusion` | Same as above + Adjacency `W`. | Models physical spread. Uses a physics-informed Laplacian update: $\mu_{t} = \mu_{t-1} - \text{diff} \cdot (L \mu_{t-1})$. |
+
+### 3. Advanced Regression Components
+These features modify functionality by introducing varying coefficients or outcome-space manifolds.
+
+| Feature | Formula Syntax | Submodel Options | Data Expectation | Why & How |
+| :--- | :--- | :--- | :--- | :--- |
+| **SVC** | `svc(covar, model='rff')` | `rff` (Random Fourier Features) | `covar`: Continuous covariate. `s_coord`: Coordinates for projection. | Allows covariate coefficients $\beta$ to vary across space. Approximates a GP field $\beta(s)$ using spectral basis caching. |
+| **Interaction** | `ie(v1, v2, model='gp')` | `gp` (via RFF) | `v1, v2`: Two continuous variables (e.g., Lat, Lon). | Models a non-linear 2D surface $f(v1, v2)$. Uses RFF to map inputs to a high-dimensional feature space to approximate a kernel. |
+| **Mixed Effects** | `me(1 + x \| grp)` | Intercept/Slope | `grp`: Categorical grouping variable. `x`: Covariate for random slope. | Models group-level variation. Each group gets a unique intercept/slope sampled from a shared Gaussian prior $\mathcal{N}(0, \sigma^2_{me})$. |
+| **Eigen-Effects** | `ee(y1, y2, model='...')` | `householder` (PCA-based) | `y1, y2`: Additional outcome-related variables. | Incorporates multivariate structure into a univariate model. Reconstructs a latent field based on the PCA decomposition of the provided variables. |
+| **Fixed Effects** | `fe(var, contrast='...')` | `effects`, `dummy` | `var`: Categorical or continuous. | Standard regression coefficients. Custom contrasts (like `EffectsCoding`) can be specified for categorical predictors. |
+
+### 4. Global Functionality Modifiers
+
+*   **`model_family`**: Determines the likelihood and link function (`gaussian`, `poisson`, `binomial`, `negbin`, `lognormal`).
+*   **`use_zi`**: Adds a zero-inflation parameter $\phi$, modeling the probability of structural zeros.
+*   **`use_sv`**: Activates Stochastic Volatility. The observation noise $\sigma_y$ is modeled as a latent log-variance surface across space and time using RFF mapping.
+*   **`log_offset`**: Used primarily for Poisson models (population/exposure) to model rates instead of raw counts.
+
+### Example Formula Usage
+```julia
+formula = "y ~ 1 + z + " * 
+    "fe(Region, contrast='effects') + " * # Fixed effect with effects coding
+    "re(s_idx, model='bym2') + " *        # Besag-York-Mollie spatial manifold
+    "re(t_idx, model='rw2') + " *         # Smooth temporal trend
+    "svc(z, model='rff') + " *            # Spatially varying coefficient for z
+    "ie(lat, lon, model='gp')"            # Non-linear spatial interaction surface
+```
+
+
 
 ## `bstm_multifidelity` Model Documentation
 
@@ -1732,14 +1795,15 @@ inp_test = bstm_options(
 
 
 
-m = bstm(inp_test);
- 
-
-
+m = bstm( inp_test );  # a direct call if all required information is formatted correctly
 os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ;
 inits = get_inits(m) ; 
+chn = sample(m, os, 100; initial_params=inits, progress=true, drop_warmup=true ) ; 
 
-# or: 
+res = model_results_comprehensive(m, chn )
+
+
+# or using a formulaic interface: 
 
 inp_df = DataFrame( 
   y = data.y_counts,
@@ -1754,16 +1818,60 @@ inp_df = DataFrame(
   w3 = data.w_obs[:,3],
   trials = data.trials
 )
-
-m = bstm( 
-  "y ~ 1 + re(s_idx, model='bym2') + re(t_idx, model='ar1') ", 
-  inp_df; 
-  family="poisson" 
+# Construct a DataFrame from the simulated data
+df_advdiff = DataFrame(
+    y_obs = data.y_obs,
+    s_idx = au.assignments,
+    t_idx = tu.t_idx,
+    st_idx = (tu.t_idx .- 1) .* length(au.centroids) .+ au.assignments
 )
+
+# Formulaic equivalent to the manual madvdiff setup
+m = bstm(
+    "y_obs ~ 1 + re(s_idx, model='besag') + re(t_idx, model='ar1') + st(st_idx, model='advection_diffusion')",
+    df_advdiff,
+    model_family="gaussian",
+    W = au.W
+)
+
+# Run a quick check
+rand(m)
+
+areal_units = m.args.M.areal_units  # to get it if made internally
+calculate_metrics(areal_units)
+plot_spatial_graph( areal_units; plot_title="", domain_boundary=areal_units.hull_coords)
 
 chn = sample(m, os, 100; initial_params=inits, progress=true, drop_warmup=true ) ; 
 
-res = model_results_comprehensive(m, chn, PS="quick_approximation")
+res = model_results_comprehensive(m, chn )
+
+
+
+
+# Formulaic call for BYM2 spatial, Logistic AR1 temporal, and binned covariate Z
+# We pass '12' to the covariate term or handle discretization via bstm_options
+
+m_complex = bstm(
+    "y_obs ~ 1 + re(s_idx, model='bym2') + re(t_idx, model='logistic_ar1') + re(z, model='rw2')",
+    df_advdiff, # Assuming df_advdiff or similar dataframe contains 'z'
+    model_family="poisson",
+    W = au.W,
+    target_units = 50,
+    cov_discretization = Dict(:z => 12),
+    # Biological parameters for logistic_ar1
+    K = [100.0, 10.0],
+    r = [1.0, 0.25],
+    q1 = [1.0, 0.25],
+    m0 = [0.9, 0.25],
+    bpsd = [0.25, 0.25],
+    mlim = [0.01, 1.1],
+    nM = t_N + 1,
+    removed = data.y_obs .* 0.25
+)
+
+# Inspect the model structure
+println("Model generated with manifolds: ", keys(m_complex.args.M.re_rules))
+rand(m_complex)
 
 
 ```
@@ -1931,6 +2039,17 @@ m = bstm(
 rand(m)
 chn = sample(m, MH(), 200) ;
 res = model_results_comprehensive(m , chn );
+
+
+# Explicitly specifying the PCA factor architecture for Eigen-Effects
+m = bstm(
+  "y ~ 1 + ee(y1, y2, model='householder')",
+  inp_df,
+  model_arch="univariate",
+  model_type="pca_factor",
+  N_factors=1,
+  family="gaussian")
+rand(m)
 
 
 ```

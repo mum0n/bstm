@@ -32,7 +32,7 @@
         t_idx = M.t_idx[i]
 
         # Fixed effects contribution
-        linpred_fixed = dot(M.Xfixed[i, :], Xfixed_beta)
+        linpred_fixed = dot( M.Xfixed[i, :], Xfixed_beta)
         
         # Total linear predictor
         eta = M.log_offset[i] + linpred_fixed + s_latent[s_idx] + t_latent[t_idx]
@@ -178,7 +178,7 @@ end
         eta_h = dot(M.Xfixed[i, :], beta_fixed_h) + s_latent_h[a] + t_latent_h[t]
         eta_c = M.log_offset[i] + dot(M.Xfixed[i, :], beta_fixed_c) + s_latent_c[a] + t_latent_c[t]
 
-        if M.y_obs[i] == 0
+        if M.y_obs[i] == 0  # can be moved to preproccessing step
             Turing.@addlogprob! M.weights[i] * logpdf(BernoulliLogit(eta_h), 0)
         else
             mu = exp(eta_c)
