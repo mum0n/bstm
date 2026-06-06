@@ -30,17 +30,21 @@ pkgs_bstm = [
   "Distances", "NamedArrays" , "CategoricalArrays", "StatsModels", "AbstractMCMC"
 ]
 
-# force install all:
-Pkg.add(pkgs_bstm);
-
 # load them all:
-for pk in pkgs_bstm;  @eval using $(Symbol(pk)); end
- 
-# tidy loose ends:
-Pkg.gc()
+try
+  for pk in pkgs_bstm;  @eval using $(Symbol(pk)); end
+catch e
+  # force install all (if in amn incomplete state or first run):
+  Pkg.add(pkgs_bstm);
+  for pk in pkgs_bstm;  @eval using $(Symbol(pk)); end
+  print( "\nInstall not complete or inconsistent, installing required packages. This might require multiple restarts and a bit of time...hours? \n\n" ) 
+  Pkg.instantiate()
+  Pkg.precompile()
+  Pkg.gc() # tidy loose ends:
+end
 
-# Pkg.precompile()
-# Pkg.instantiate()
+
+
 # Pkg.update()
 
 
