@@ -680,8 +680,6 @@ Here is a simple comparison of the methods using random data:
 
 ```{julia} 
 
-# (; s_coord_tuple  ) = data  # this is a simple way to copy objects into the Main environment
-
 s_N = 100  # spatial locations
 t_N = 15  # time slices ("years")
  
@@ -1500,7 +1498,7 @@ These features modify functionality by introducing varying coefficients or outco
 | :------------------| :--------------------------| :--------------------------------| :----------------------------------------------------------------------| :---------------------------------------------------------------------------------------------------------------------------------------------------| ----------------------------------------------------------------------------------------------------------------------------------------------|
 | **SVC**           | `svc(covar, model='rff')` | `rff` (Random Fourier Features) | `covar`: Continuous covariate. `s_coord`: Coordinates for projection. | Allows covariate coefficients $\beta$ to vary across space. Approximates a GP field $\beta(s)$ using spectral basis caching.                       |                                                                                                                                              |
 | **Interaction**   | `ie(v1, v2, model='gp')`  | `gp` (via RFF)                  | `v1, v2`: Two continuous variables (e.g., Lat, Lon).                  | Models a non-linear 2D surface $f(v1, v2)$. Uses RFF to map inputs to a high-dimensional feature space to approximate a kernel.                    |                                                                                                                                              |
-| **Mixed Effects** | `me(1 + x \\| grp)`                           | Intercept/Slope                                                       | `grp`: Categorical grouping variable. `x`: Covariate for random slope.                                                                             | Models group-level variation. Each group gets a unique intercept/slope sampled from a shared Gaussian prior $\mathcal{N}(0, \sigma^2_{me})$. |
+| **Mixed Effects** | `me(1 + x \\              | grp)`                           | Intercept/Slope                                                       | `grp`: Categorical grouping variable. `x`: Covariate for random slope.                                                                             | Models group-level variation. Each group gets a unique intercept/slope sampled from a shared Gaussian prior $\mathcal{N}(0, \sigma^2_{me})$. |
 | **Eigen-Effects** | `ee(y1, y2, model='...')` | `householder` (PCA-based)       | `y1, y2`: Additional outcome-related variables.                       | Incorporates multivariate structure into a univariate model. Reconstructs a latent field based on the PCA decomposition of the provided variables. |                                                                                                                                              |
 | **Fixed Effects** | `fe(var, contrast='...')` | `effects`, `dummy`              | `var`: Categorical or continuous.                                     | Standard regression coefficients. Custom contrasts (like `EffectsCoding`) can be specified for categorical predictors.                             |                                                                                                                                              |
 
