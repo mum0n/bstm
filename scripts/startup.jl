@@ -27,8 +27,9 @@ pkgs_bstm = [
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs", 
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing",  
-  "Distances", "NamedArrays" , "CategoricalArrays", "StatsModels", "AbstractMCMC"
+  "Distances", "NamedArrays" , "CategoricalArrays", "StatsModels", "AbstractMCMC", "ForwardDiff", "PDMats"
 ]
+
 
 
 # load them all:
@@ -73,9 +74,7 @@ print( "\nTo (re)-install required packages, run:  install_required_packages() o
 
 # support functions
 include( srcdir( "data_prep.jl") );
-
-include( srcdir( "structs.jl" ))   ;
-
+ 
 include( srcdir( "spatiotemporal_functions.jl" ))   ;
 
 include( srcdir( "example_turing_models.jl" ))   ;
@@ -85,16 +84,18 @@ Random.seed!(42) # Set a seed for reproducibility.
 import MCMCChains
 import DynamicPPL
 import StatsPlots
-import SpecialFunctions: logfactorial
 
 using Statistics: mean, std, median, quantile, var, cor, Diagonal, eigen
 using StatsBase: Weights, sample, midpoints
 
-using LogExpFunctions: logistic
-using LogExpFunctions: logsumexp
-using Turing: Variational
 using AbstractMCMC: logdensity # Explicitly import logdensity
- 
+
+import SpecialFunctions: logfactorial
+import LogExpFunctions: logdiffexp, logistic, logsumexp, log1mexp
+import Distributions: logpdf, _logpdf, pdf, cdf, logcdf, logccdf, rand, sampler
+
+using LogExpFunctions: logistic, logsumexp, log1mexp
+
 
 # Extend base names check for ADVI pseudo-chain
 using Turing: Variational
