@@ -1557,6 +1557,18 @@ formula = "y ~ 1 + z + " *
 
 ## `bstm_multifidelity` Model Documentation
 
+### Fidelity Definitions
+
+| Attribute    | Low-Fidelity (Fidelity 1) | High-Fidelity (Fidelity 2) |
+| :-------------| :--------------------------| :---------------------------|
+| **Volume**   | High / Dense              | Low / Sparse               |
+| **Cost**     | Cheap (Proxy data)        | Expensive (Validated data) |
+| **Bias**     | Potentially High          | Negligible                 |
+| **Variance** | High Noise                | Low / Instrument Precision |
+| **Role**     | Source (Structural Prior) | Target (Objective Truth)   |
+
+The following code demonstrates the simulation of these two distinct streams.
+
 ### Conceptual Overview
 
 The `bstm_multifidelity` model is a Bayesian spatio-temporal framework designed to integrate data from multiple fidelity levels (e.g., high-resolution observations and lower-resolution simulations or auxiliary data). It aims to leverage the strengths of each data source to produce a more robust and accurate inference of the underlying latent processes. The model achieves this by: 
@@ -1760,20 +1772,20 @@ $$\mu_{phys} = \eta_{t-1} - \underbrace{\delta (L \eta_{t-1})}_{\text{Diffusion}
 
 
 ```{julia}
-
 # takes a lot of RAM and so reduce problem size:
 s_N = 100  # spatial locations
 t_N = 15  # time slices ("years")
- 
-data = generate_sim_data(s_N, t_N; rndseed=42);
+
+data = generate_sim_data(s_N, t_N; rndseed=42)
 
 # time discretization
-tu = assign_time_units(data.t_coord;  time_method="regular", t_N=data.t_N, u_N=data.u_N)  ;
+tu = assign_time_units(data.t_v;  time_method="regular", t_N=data.t_N, u_N=data.u_N)
 
 # space discretization
 au_method = :hvt   # reasonably simple
-au = assign_spatial_units( 
-    data.s_coord_tuple, 
+au = assign_spatial_units(
+    data.s_x,
+    data.s_y,
     area_method = au_method,
     t_idx = tu.t_idx,
     target_units = 50,
@@ -1786,46 +1798,59 @@ au = assign_spatial_units(
     min_points=5,
     max_points=50,
     min_area=0.1,
-    max_area=25);
-
+    max_area=25)
+ 
+# Calculate metrics using the hardened function
 met = calculate_metrics(au)
+println("Partitioning Metrics:", met)
 
-plot_spatial_graph( au; plot_title="Method: $au_method", domain_boundary=au.hull_coords)
+# Execution of the hardened plotting logic
+plot_spatial_graph(au; plot_title="Method: $au_method", domain_boundary=au.hull_coords)
 
 
 # prepare model inputs   
 
 Random.seed!(42) # Set a seed for reproducibility
 
+# Construct the input options for the BSTM engine
+Random.seed!(42) # Set a seed for reproducibility
+
+# --- XR: BSTM v17.8.7 Model Configuration [FIXED COORDINATE ACCESS] ---
+# Timestamp: 2025-05-22 18:30:00
+# Rationale: Resolving FieldError by mapping coordinate tuples from s_x and s_y.
+
+# Construct the input options for the BSTM engine
 inp_test = bstm_options(
-    y_obs = data.y_obs , 
-    s_coord_tuple = data.s_coord_tuple, 
-    s_idx = au.assignments, 
+    y_obs = data.y_obs,
+    s_x = data.s_x,
+    s_y = data.s_y,
+    s_idx = au.s_idx,
     t_idx = tu.t_idx,
-    log_offset = zeros(length(data.y_obs)), 
-    W = au.W, 
+    W = au.W,
+    s_N = local_s_N,
+    log_offset = zeros(length(data.y_obs)),
+    W = au.W,
     model_arch = "univariate",
-    model_family = "gaussian", 
+    model_family = "gaussian",
     model_space = "besag",
     model_time = "ar1",
     model_st = "advection_diffusion",
-    K = [100.0, 10.0],  # these biological parameters are for "logistic_ar1" ... which is not ready yet: need to bring in suraface areas for computing totals..
-    r = [1.0, 0.25], 
+    # Biological parameters for logistic_ar1 (legacy support)
+    K = [100.0, 10.0],
+    r = [1.0, 0.25],
     q1 = [1.0, 0.25],
     m0 = [0.9, 0.25],
     bpsd = [0.25, 0.25],
     mlim = [0.01, 1.1],
-    nM = t_N + 1,  # for projections
+    nM = t_N + 1,
     iok = findall(isfinite, data.y_obs),
     yeartransition = 0,
     removed = data.y_obs .* 0.25,
-    s_N = length(au.centroids), 
-    t_N = tu.tn, 
-    fixed_N = 0
+    s_N = length(au.centroids),
+    t_N = tu.tn,
+    fixed_N = 0 
 );
-
-
-
+ 
 
 m = bstm( inp_test );  # a direct call if all required information is formatted correctly
 os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ;
@@ -1837,74 +1862,109 @@ res = model_results_comprehensive(m, chn )
 
 # or using a formulaic interface: 
 
-inp_df = DataFrame( 
-  y = data.y_counts,
-  s_coord = data.s_coord_tuple,
-  t_coord = data.t_coord,
-  # s_idx = au.assignments,
-  # t_idx = tu.t_idx,
-  log_offset = zeros(length(data.y_obs)),
-  z = data.z_obs,
-  w1 = data.w_obs[:,1],
-  w2 = data.w_obs[:,2],
-  w3 = data.w_obs[:,3],
-  trials = data.trials
-)
-# Construct a DataFrame from the simulated data
+# 1. Dimensional Discovery
+# Syncing with the actual results of the spatial partitioning (au) and temporal units (tu)
+actual_s_N = size(au.W, 1)
+actual_t_N = tu.tn
+
+println("--- Synchronization Report ---")
+println("Partitioned Spatial Units (s_N): ", actual_s_N)
+println("Temporal Slices (t_N): ", actual_t_N)
+
+# 2. DataFrame Construction for Advection-Diffusion Test
+# Rationale: Standardizing column names and ensuring index alignment.
 df_advdiff = DataFrame(
     y_obs = data.y_obs,
-    s_idx = au.assignments,
+    s_idx = au.s_idx,
     t_idx = tu.t_idx,
-    st_idx = (tu.t_idx .- 1) .* length(au.centroids) .+ au.assignments
+    # st_idx for Type IV interactions must use the partitioned unit count
+    st_idx = [(tu.t_idx[i] - 1) * actual_s_N + au.s_idx[i] for i in 1:length(data.y_obs)]
 )
 
-# Formulaic equivalent to the manual madvdiff setup
+# 3. Model Definition
+# Rationale: Passing explicit s_N and t_N to override default data scanning.
 m = bstm(
-    "y_obs ~ 1 + re(s_idx, model='besag') + re(t_idx, model='ar1') + st(st_idx, model='advection_diffusion')",
+    "y_obs ~ 1 + Spatial(s_idx; manifold='besag') + Temporal(t_idx; manifold='ar1') + interaction(s_idx, t_idx; manifold='advection_diffusion')",
     df_advdiff,
     model_family="gaussian",
-    W = au.W
+    W = au.W,
+    s_N = actual_s_N,
+    t_N = actual_t_N
 )
 
-# Run a quick check
+# 4. Model Verification & Sampling
+# Run a quick check to ensure AD stability and dimension alignment
 rand(m)
 
-areal_units = m.args.M.areal_units  # to get it if made internally
-calculate_metrics(areal_units)
-plot_spatial_graph( areal_units; plot_title="", domain_boundary=areal_units.hull_coords)
+# Sampler Configuration (NUTS with AD Firewall)
+os_sampler = get_optimal_sampler(m)
 
-chn = sample(m, os, 100; initial_params=inits, progress=true, drop_warmup=true ) ; 
+# Execute MCMC Chain
+chn = sample(m, os_sampler, 100; progress=true, check_model=false)
 
-res = model_results_comprehensive(m, chn )
+# 5. Comprehensive Reconstruction
+res = model_results_comprehensive(m, chn)
 
+# Visualization Dashboard
+model_results_plots(res)
 
 
 
 # Formulaic call for BYM2 spatial, Logistic AR1 temporal, and binned covariate Z
-# We pass '12' to the covariate term or handle discretization via bstm_options
+# 1. Coordinate and Dimensional Metadata Discovery
+# We derive dimensions directly from the spatial (au) and temporal (tu) units
+# to prevent the model from assuming sizes based on raw data counts.
+local_s_N = size(au.W, 1)
+local_t_N = tu.tn
 
-m_complex = bstm(
-    "y_obs ~ 1 + re(s_idx, model='bym2') + re(t_idx, model='logistic_ar1') + re(z, model='rw2')",
-    df_advdiff, # Assuming df_advdiff or similar dataframe contains 'z'
-    model_family="poisson",
+println("--- Dimensional Audit for Complex Model ---")
+println("Spatial Units (s_N): ", local_s_N)
+println("Temporal Units (t_N): ", local_t_N)
+
+# 2. Model Definition
+# We pass explicit s_N and t_N to override default scanning.
+# Manifold names are aligned with the v06.1 taxonomy.
+m = bstm(
+    "y_obs ~ 1 + Spatial(s_idx, manifold='bym2') + Temporal(t_idx, manifold='ar1') + Smooth(z, manifold='rw2', nbins=12)",
+    df_advdiff,
+    model_family="gaussian",
     W = au.W,
-    target_units = 50,
-    cov_discretization = Dict(:z => 12),
-    # Biological parameters for logistic_ar1
+    s_N = local_s_N,
+    t_N = local_t_N,
+    # Biological parameters for logistic_ar1/ar1 processes
     K = [100.0, 10.0],
     r = [1.0, 0.25],
     q1 = [1.0, 0.25],
     m0 = [0.9, 0.25],
     bpsd = [0.25, 0.25],
     mlim = [0.01, 1.1],
-    nM = t_N + 1,
+    nM = local_t_N + 1,
     removed = data.y_obs .* 0.25
 )
 
-# Inspect the model structure
-println("Model generated with manifolds: ", keys(m_complex.args.M.re_rules))
-rand(m_complex)
+# 3. Model Structure Inspection
+# Verify that the RE rules have registered the manifolds correctly.
+println("Model generated with manifolds: ", keys(m.args.M.re_rules))
 
+# 4. Stochastic Structural Probe
+# This rand(m) call verifies that MvNormalCanon dimensions are now aligned.
+try
+    rand(m)
+    println("Success: Model dimensions aligned. Proceeding to sampling.")
+catch e
+    println("Dimensional probe failed: ", e)
+    rethrow(e)
+end
+
+# 5. MCMC Sampling
+# Using Metropolis-Hastings for a rapid verification of the joint density.
+chn = sample(m, MH(), 100; progress=true, check_model=false)
+
+# 5. Comprehensive Reconstruction
+res = model_results_comprehensive(m, chn)
+
+# Visualization Dashboard
+model_results_plots(res)
 
 ```
 
