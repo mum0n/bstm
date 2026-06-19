@@ -186,7 +186,7 @@ res = model_results_comprehensive(m, chn, inp_scot, au_scot );
 # a little longer to sample but worth the wait ..
 
 # yet another alternative:
-m = bstm( "y ~ 1 + re(s_idx, model='bym2') + re(t_idx, model='ar1')", 
+m = bstm( "y ~ 1 + Spatial(s_idx, manifold='bym2') + Temporal(t_idx, manifold='ar1')", 
   DataFrame(
     y = data_scot.y,
     s_idx = data_scot.s_idx,
@@ -290,7 +290,7 @@ inp_df = DataFrame(
   s_coord = data.s_coord_tuple,  # (x,y) as a tuple
   t_coord = vec(data.t_coord),   # time
   log_offset = zeros(length(data.y_counts)),
-  region = categorical(reg),  # would make sure it is used as a factorial variable or in the model statement: fe(reg)
+  region = categorical(reg),  # would make sure it is used as a factorial variable or in the model statement: Fixed(reg)
   z = data.z_obs,  # continuous covariate
   w1 = data.w_obs[:,1], # more covariates 
   w2 = data.w_obs[:,2],
@@ -302,7 +302,7 @@ inp_df = DataFrame(
 display(first(inp_df, 3))
 
 m = bstm( 
-  formula( y ~ 1 + z + region + re(s_idx, model='bym2') + re(t_idx, model='ar1') ), 
+  formula( y ~ 1 + z + region + Spatial(s_idx, manifold='bym2') + Temporal(t_idx, manifold='ar1') ), 
   inp_df; 
   family="poisson",
   target_units=20
@@ -321,35 +321,34 @@ In `bstm` formulas, specific terms are used to trigger high-dimensional manifold
 
 # BSTM Unified Syntax & Manifold Glossary (v05.5)
 
-| Category                 | Feature / Manifold   | Formula Syntax Example             | Hyperprior Options                           | Technical Assumption / Math                                                     |                                                                                |
-| :-------------------------| :---------------------| :-----------------------------------| :---------------------------------------------| :--------------------------------------------------------------------------------| --------------------------------------------------------------------------------|
-| **Baseline**             | Intercept            | `1` or `Intercept(prior=...)`      | `Normal(0, 5)` (Default)                     | Global bias term; additive constant across all dimensions.                      |                                                                                |
-|                          | Fixed Effects        | `covariate_name`                   | `MvNormal(0, 5*I)`                           | Linear relationship with the link-transformed mean.                             |                                                                                |
-|                          | Mixed Effects        | `Mixed(x \                         | group)`                                      | `sig_me ~ Exp(1.0)`                                                             | Varying slopes/intercepts drawn from a shared Gaussian prior.                  |
-| **Spatial (Discrete)**   | ICAR                 | `Spatial(s, manifold='icar')`      | `s_sigma ~ Exp(1.0)`                         | Pure local smoothing using Graph Laplacian $Q$.                                 |                                                                                |
-|                          | Leroux               | `Spatial(s, manifold='leroux')`    | `s_sigma ~ Exp(1.0)`, `s_rho ~ Beta(1,1)`    | Convex combination $\lambda Q + (1-\lambda)I$ for dependence vs noise.          |                                                                                |
-|                          | BYM2                 | `Spatial(s, manifold='bym2')`      | `s_sigma ~ Exp(1.0)`, `s_rho ~ Beta(1,1)`    | Standardized ICAR + IID component for stable variance scales.                   |                                                                                |
-|                          | Mosaic               | `Spatial(s, manifold='mosaic')`    | `mu_local ~ Normal(0, 1)`                    | Piecewise constant field; zero correlation across defined clusters.             |                                                                                |
-|                          | Local-Adaptive       | `Spatial(s, manifold='local')`     | `local_weights ~ Gamma(2,2)`                 | Smoothing strength varies based on a secondary latent weight field.             |                                                                                |
-|                          | Network Flow         | `Spatial(s, manifold='network')`   | `s_sigma ~ Exp(1.0)`                         | Asymmetric propagation over directed graphs (e.g., river flow).                 |                                                                                |
-| **Spatial (Continuous)** | Dense GP             | `Spatial(x, y, manifold='gp')`     | `s_ls ~ InvGamma(3,3)`                       | Exact kernel-based covariance; requires $N \times N$ matrix inversion.          |                                                                                |
-|                          | FITC (Sparse GP)     | `Spatial(x, y, manifold='fitc')`   | `s_sigma ~ Exp(1.0)`, `st_ls_s ~ Gamma(2,2)` | Inducing point approximation ($M \ll N$) for large-scale continuous fields.     |                                                                                |
-|                          | SVGP                 | `Spatial(x, y, manifold='svgp')`   | `f_sigma ~ Exp(1.0)`, `m_u ~ Normal(0,1)`    | Stochastic Variational GP; uses variational distributions over inducing points. |                                                                                |
-| **Temporal**             | Random Walk (RW2)    | `Temporal(t, manifold='rw2')`      | `t_sigma ~ Exp(1.0)`                         | Second-order difference penalty; captures smooth non-linear trends.             |                                                                                |
-|                          | Autoregressive (AR1) | `Temporal(t, manifold='ar1')`      | `t_rho ~ Beta(2,2)`                          | Mean-reverting stationary process with correlation $\rho$.                      |                                                                                |
-|                          | Eigen-Temporal       | `Temporal(t, manifold='eigen')`    | `pca_sd ~ Exp(1.0)`                          | Reduced-rank approximation using top $K$ PCA basis functions.                   |                                                                                |
-| **Seasonal**             | Harmonic             | `Seasonal(u, manifold='harmonic')` | `u_alpha, u_beta ~ Normal(0,1)`              | Smooth cyclical patterns via Sine/Cosine trigonometric basis.                   |                                                                                |
-|                          | Discrete             | `Seasonal(u, period=12)`           | `u_sigma ~ Exp(1.0)`                         | Binned random effects with a hard sum-to-zero constraint.                       |                                                                                |
-| **Spectral / Basis**     | 1D/2D FFT            | `Smooth(x; manifold='fft')`        | `sig_basis ~ Exp(1.0)`                       | Frequency-domain modeling for regular lattices or periodic time-series.         |                                                                                |
-|                          | 1D/2D RFF            | `Smooth(x, y; manifold='rff')`     | `ls_rff ~ Gamma(2,2)`                        | Monte Carlo approximation of stationary kernels (SE/Matern).                    |                                                                                |
-|                          | DeepGP               | `Spatial(s, manifold='deepgp')`    | `ls_layer ~ Gamma(2,1)`                      | Hierarchical composition of RFF layers for complex non-stationarity.            |                                                                                |
-|                          | Wavelets             | `Smooth(x; manifold='wavelet')`    | `sig_wave ~ Exp(1.0)`                        | Multi-resolution analysis; localizes features in both space and frequency.      |                                                                                |
-| **Advanced Smooths**     | P-Splines            | `Smooth(x; manifold='pspline')`    | `diff_order=2` (Default)                     | B-spline basis with a discrete differencing penalty on coefficients.            |                                                                                |
-|                          | TPS (2D)             | `Smooth(x, y; manifold='tps')`     | `nbins=20` (Default)                         | Thin Plate Splines; minimizes the bending energy of a 2D surface.               |                                                                                |
-| **Operators**            | Kronecker            | `S ⊗  T`                           | `st_sigma ~ Exp(1.0)`                        | Fully separable space-time interaction (Knorr-Held Type IV).                    |                                                                                |
-|                          | SVC                  | `x \                               | Spatial(s)`                                  | `sig_svc ~ Exp(1.0)`                                                            | Spatially Varying Coefficient; slope $\beta$ is a latent function of location. |
-|                          | Direct Sum           | `A ⊕ B`                            | Additive components                          | Superposition of multiple latent manifold structures.                           |                                                                                |
-|                          | Nested / MF          | `nested(var; manifold='...')`      | `fidelity_rho ~ Normal(1, 0.5)`              | Links primary models to auxiliary data for multifidelity routing.               |                                                                                |
+| Category                 | Feature / Manifold   | Formula Syntax Example                                 | Hyperprior Options                           | Technical Assumption / Math                                                     |                                                                                |
+| :-------------------------| :---------------------| :-------------------------------------------------------| :---------------------------------------------| :--------------------------------------------------------------------------------| --------------------------------------------------------------------------------|
+| **Baseline**             | Intercept            | `1` or `Intercept(prior=...)`                          | `Normal(0, 5)` (Default)                     | Global bias term; additive constant across all dimensions.                      |                                                                                |
+|                          | Fixed Effects        | `covariate_name`                                       | `MvNormal(0, 5*I)`                           | Linear relationship with the link-transformed mean.                             |                                                                                |
+|                          | Mixed Effects        | `Mixed(x \                                             | group)`                                      | `sig_me ~ Exp(1.0)`                                                             | Varying slopes/intercepts drawn from a shared Gaussian prior.                  |
+| **Spatial (Discrete)**   | ICAR                 | `Spatial(s, manifold='icar')`                          | `s_sigma ~ Exp(1.0)`                         | Pure local smoothing using Graph Laplacian $Q$.                                 |                                                                                |
+|                          | Leroux               | `Spatial(s, manifold='leroux')`                        | `s_sigma ~ Exp(1.0)`, `s_rho ~ Beta(1,1)`    | Convex combination $\lambda Q + (1-\lambda)I$ for dependence vs noise.          |                                                                                |
+|                          | BYM2                 | `Spatial(s, manifold='bym2')`                          | `s_sigma ~ Exp(1.0)`, `s_rho ~ Beta(1,1)`    | Standardized ICAR + IID component for stable variance scales.                   |                                                                                |
+|                          | Mosaic               | `Spatial(s, manifold='mosaic')`                        | `mu_local ~ Normal(0, 1)`                    | Piecewise constant field; zero correlation across defined clusters.             |                                                                                |
+|                          | Local-Adaptive       | `Spatial(s, manifold='local')`                         | `local_weights ~ Gamma(2,2)`                 | Smoothing strength varies based on a secondary latent weight field.             |                                                                                |
+|                          | Network Flow         | `Spatial(s, manifold='network')`                       | `s_sigma ~ Exp(1.0)`                         | Asymmetric propagation over directed graphs (e.g., river flow).                 |                                                                                |
+| **Spatial (Continuous)** | Dense GP             | `Spatial(x, y, manifold='gp')`                         | `s_ls ~ InvGamma(3,3)`                       | Exact kernel-based covariance; requires $N \times N$ matrix inversion.          |                                                                                |
+|                          | FITC (Sparse GP)     | `Spatial(x, y, manifold='fitc')`                       | `s_sigma ~ Exp(1.0)`, `st_ls_s ~ Gamma(2,2)` | Inducing point approximation ($M \ll N$) for large-scale continuous fields.     |                                                                                |
+|                          | SVGP                 | `Spatial(x, y, manifold='svgp')`                       | `f_sigma ~ Exp(1.0)`, `m_u ~ Normal(0,1)`    | Stochastic Variational GP; uses variational distributions over inducing points. |                                                                                |
+| **Temporal**             | Random Walk (RW2)    | `Temporal(t, manifold='rw2')`                          | `t_sigma ~ Exp(1.0)`                         | Second-order difference penalty; captures smooth non-linear trends.             |                                                                                |
+|                          | Autoregressive (AR1) | `Temporal(t, manifold='ar1')`                          | `t_rho ~ Beta(2,2)`                          | Mean-reverting stationary process with correlation $\rho$.                      |                                                                                |
+| **Temporal-Seasonal**    | Harmonic             | `Temporal(t, u, manifold=('ar1, 'harmonic'))`          | `u_alpha, u_beta ~ Normal(0,1)`              | Smooth cyclical patterns via Sine/Cosine trigonometric basis.                   |                                                                                |
+|                          | Discrete             | `Temporal(t, u, manifold=('ar1, 'cyclic'), period=12)` | `u_sigma ~ Exp(1.0)`                         | Binned random effects with a hard sum-to-zero constraint.                       |                                                                                |
+| **Spectral / Basis**     | 1D/2D FFT            | `Smooth(x; manifold='fft')`                            | `sig_basis ~ Exp(1.0)`                       | Frequency-domain modeling for regular lattices or periodic time-series.         |                                                                                |
+|                          | 1D/2D RFF            | `Smooth(x, y; manifold='rff')`                         | `ls_rff ~ Gamma(2,2)`                        | Monte Carlo approximation of stationary kernels (SE/Matern).                    |                                                                                |
+|                          | DeepGP               | `Spatial(s, manifold='deepgp')`                        | `ls_layer ~ Gamma(2,1)`                      | Hierarchical composition of RFF layers for complex non-stationarity.            |                                                                                |
+|                          | Wavelets             | `Smooth(x; manifold='wavelet')`                        | `sig_wave ~ Exp(1.0)`                        | Multi-resolution analysis; localizes features in both space and frequency.      |                                                                                |
+| **Advanced Smooths**     | P-Splines            | `Smooth(x; manifold='pspline')`                        | `diff_order=2` (Default)                     | B-spline basis with a discrete differencing penalty on coefficients.            |                                                                                |
+|                          | TPS (2D)             | `Smooth(x, y; manifold='tps')`                         | `nbins=20` (Default)                         | Thin Plate Splines; minimizes the bending energy of a 2D surface.               |                                                                                |
+| **Operators**            | Kronecker            | `S ⊗  T`                                               | `st_sigma ~ Exp(1.0)`                        | Fully separable space-time interaction (Knorr-Held Type IV).                    |                                                                                |
+|                          | SVC                  | `x \                                                   | Spatial(s)`                                  | `sig_svc ~ Exp(1.0)`                                                            | Spatially Varying Coefficient; slope $\beta$ is a latent function of location. |
+|                          | Direct Sum           | `A ⊕ B`                                                | Additive components                          | Superposition of multiple latent manifold structures.                           |                                                                                |
+|                          | Nested / MF          | `nested(var; manifold='...')`                          | `fidelity_rho ~ Normal(1, 0.5)`              | Links primary models to auxiliary data for multifidelity routing.               |                                                                                |
 
 
 **Advanced Formula Parameters & Hyper-Prior Specification**
@@ -1511,30 +1510,30 @@ The `bstm_univariate` model is a Bayesian Spatiotemporal Model (BSTM) architectu
 ### 1. Main Manifolds (Spatial & Temporal)
 These are the core components used to model autocorrelation and trends.
 
-| Feature      | Formula Syntax           | Model Options                                                     | Data Expectation                                                                 | Why & How                                                                                                                     |
-| :-------------| :-------------------------| :------------------------------------------------------------------| :---------------------------------------------------------------------------------| :------------------------------------------------------------------------------------------------------------------------------|
-| **Spatial**  | `re(s_idx, model='...')` | `bym2`, `besag`, `iid`, `leroux`, `sar`, `dag`, `fitc`, `denseGP` | `s_idx`: Integer indices mapping data to units. `W`: Adjacency matrix for GMRFs. | Captures spatial dependencies. GMRF models use a precision matrix $Q$ derived from $W$; GP models use distance-based kernels. |
-| **Temporal** | `re(t_idx, model='...')` | `ar1`, `rw2`, `iid`, `gp`, `harmonic`, `logistic_ar1`             | `t_idx`: Chronological integer indices.                                          | Captures trends. `rw2` provides second-order smoothness; `ar1` models correlation between successive steps.                   |
-| **Seasonal** | `re(u_idx, model='...')` | `harmonic`, `iid`, `rw2`, `ar1`, `gp`                             | `u_idx`: Cyclic indices (e.g., 1-12 for months).                                 | Captures periodic fluctuations. `harmonic` uses sine/cosine basis; others use cyclic GMRF structures.                         |
+| Feature               | Formula Syntax                           | Model Options                                                     | Data Expectation                                                                 | Why & How                                                                                                                     |
+| :----------------------| :-----------------------------------------| :------------------------------------------------------------------| :---------------------------------------------------------------------------------| :------------------------------------------------------------------------------------------------------------------------------|
+| **Spatial**           | `Spatial(s_idx, manifold='...')`         | `bym2`, `besag`, `iid`, `leroux`, `sar`, `dag`, `fitc`, `denseGP` | `s_idx`: Integer indices mapping data to units. `W`: Adjacency matrix for GMRFs. | Captures spatial dependencies. GMRF models use a precision matrix $Q$ derived from $W$; GP models use distance-based kernels. |
+| **Temporal**          | `Temporal(t_idx, manifold='...')`        | `ar1`, `rw2`, `iid`, `gp`, `harmonic`, `logistic_ar1`             | `t_idx`: Chronological integer indices.                                          | Captures trends. `rw2` provides second-order smoothness; `ar1` models correlation between successive steps.                   |
+| **Temporal-Seasonal** | `Temporal(t_idx, u_idx; manifold='...')` | `harmonic`, `iid`, `rw2`, `ar1`, `gp`                             | `u_idx`: Cyclic indices (e.g., 1-12 for months).                                 | Captures periodic fluctuations. `harmonic` uses sine/cosine basis; others use cyclic GMRF structures.                         |
 
 ### 2. Spatio-Temporal (ST) Interaction
 Models the interaction between space and time, allowing spatial patterns to evolve over time.
 
-| Feature            | Formula Syntax            | Model Options                                   | Data Expectation                                | Why & How                                                                                                                  |
-| :-------------------| :--------------------------| :------------------------------------------------| :------------------------------------------------| :---------------------------------------------------------------------------------------------------------------------------|
-| **ST Interaction** | `st(st_idx, model='...')` | `I`, `II`, `III`, `IV` (Knorr-Held types)       | `st_idx`: Mapping index $(t-1) \times S_N + s$. | Models non-separability. Type IV uses a Kronecker product of spatial and temporal precisions: $Q_{ST} = Q_t \otimes Q_s$.  |
-| **Transport**      | `st(st_idx, model='...')` | `diffusion`, `advection`, `advection_diffusion` | Same as above + Adjacency `W`.                  | Models physical spread. Uses a physics-informed Laplacian update: $\mu_{t} = \mu_{t-1} - \text{diff} \cdot (L \mu_{t-1})$. |
+| Feature            | Formula Syntax                              | Model Options                                   | Data Expectation                                | Why & How                                                                                                                  |
+| :-------------------| :--------------------------------------------| :------------------------------------------------| :------------------------------------------------| :---------------------------------------------------------------------------------------------------------------------------|
+| **ST Interaction** | `Spatial(st_idx, manifold='...') \otimes  ` | `I`, `II`, `III`, `IV` (Knorr-Held types)       | `st_idx`: Mapping index $(t-1) \times S_N + s$. | Models non-separability. Type IV uses a Kronecker product of spatial and temporal precisions: $Q_{ST} = Q_t \otimes Q_s$.  |
+| **Transport**      | `Physics(st_idx, manifold='...')`           | `diffusion`, `advection`, `advection_diffusion` | Same as above + Adjacency `W`.                  | Models physical spread. Uses a physics-informed Laplacian update: $\mu_{t} = \mu_{t-1} - \text{diff} \cdot (L \mu_{t-1})$. |
 
 ### 3. Advanced Regression Components
 These features modify functionality by introducing varying coefficients or outcome-space manifolds.
 
-| Feature           | Formula Syntax            | Submodel Options                | Data Expectation                                                      | Why & How                                                                                                                                          |                                                                                                                                              |
-| :------------------| :--------------------------| :--------------------------------| :----------------------------------------------------------------------| :---------------------------------------------------------------------------------------------------------------------------------------------------| ----------------------------------------------------------------------------------------------------------------------------------------------|
-| **SVC**           | `svc(covar, model='rff')` | `rff` (Random Fourier Features) | `covar`: Continuous covariate. `s_coord`: Coordinates for projection. | Allows covariate coefficients $\beta$ to vary across space. Approximates a GP field $\beta(s)$ using spectral basis caching.                       |                                                                                                                                              |
-| **Interaction**   | `ie(v1, v2, model='gp')`  | `gp` (via RFF)                  | `v1, v2`: Two continuous variables (e.g., Lat, Lon).                  | Models a non-linear 2D surface $f(v1, v2)$. Uses RFF to map inputs to a high-dimensional feature space to approximate a kernel.                    |                                                                                                                                              |
-| **Mixed Effects** | `me(1 + x \\              | grp)`                           | Intercept/Slope                                                       | `grp`: Categorical grouping variable. `x`: Covariate for random slope.                                                                             | Models group-level variation. Each group gets a unique intercept/slope sampled from a shared Gaussian prior $\mathcal{N}(0, \sigma^2_{me})$. |
-| **Eigen-Effects** | `ee(y1, y2, model='...')` | `householder` (PCA-based)       | `y1, y2`: Additional outcome-related variables.                       | Incorporates multivariate structure into a univariate model. Reconstructs a latent field based on the PCA decomposition of the provided variables. |                                                                                                                                              |
-| **Fixed Effects** | `fe(var, contrast='...')` | `effects`, `dummy`              | `var`: Categorical or continuous.                                     | Standard regression coefficients. Custom contrasts (like `EffectsCoding`) can be specified for categorical predictors.                             |                                                                                                                                              |
+| Feature           | Formula Syntax                  | Submodel Options                | Data Expectation                                                      | Why & How                                                                                                                                          |                                                                                                                                              |
+| :------------------| :--------------------------------| :--------------------------------| :----------------------------------------------------------------------| :---------------------------------------------------------------------------------------------------------------------------------------------------| ----------------------------------------------------------------------------------------------------------------------------------------------|
+| **SVC**           | `SVC(covar, manifold='rff')`    | `rff` (Random Fourier Features) | `covar`: Continuous covariate. `s_coord`: Coordinates for projection. | Allows covariate coefficients $\beta$ to vary across space. Approximates a GP field $\beta(s)$ using spectral basis caching.                       |                                                                                                                                              |
+| **Interaction**   | `Smooth(v1, v2, manifold='gp')` | `gp` (via RFF)                  | `v1, v2`: Two continuous variables (e.g., Lat, Lon).                  | Models a non-linear 2D surface $f(v1, v2)$. Uses RFF to map inputs to a high-dimensional feature space to approximate a kernel.                    |                                                                                                                                              |
+| **Mixed Effects** | `me(1 + x \\                    | grp)`                           | Intercept/Slope                                                       | `grp`: Categorical grouping variable. `x`: Covariate for random slope.                                                                             | Models group-level variation. Each group gets a unique intercept/slope sampled from a shared Gaussian prior $\mathcal{N}(0, \sigma^2_{me})$. |
+| **Eigen-Effects** | `Eigen(y1, y2, manifold='...')` | `householder` (PCA-based)       | `y1, y2`: Additional outcome-related variables.                       | Incorporates multivariate structure into a univariate model. Reconstructs a latent field based on the PCA decomposition of the provided variables. |                                                                                                                                              |
+| **Fixed Effects** | `Fixed(var, contrast='...')`    | `effects`, `dummy`              | `var`: Categorical or continuous.                                     | Standard regression coefficients. Custom contrasts (like `EffectsCoding`) can be specified for categorical predictors.                             |                                                                                                                                              |
 
 
 ```julia
@@ -1560,7 +1559,7 @@ data_audit = DataFrame(
 println("Audit: Initializing model with Spherical Compact Basis and Moran Spectral Basis...")
 
 model_audit = bstm(
-    "y ~ 1 + smooth(age; nbins=10, manifold='spherical', range=20.0) + smooth(pollution; nbins=8, manifold='moran')",
+    "y ~ 1 + Smooth(age; nbins=10, manifold='spherical', range=20.0) + Smooth(pollution; nbins=8, manifold='moran')",
     data_audit,
     model_family = "gaussian",
     noise = 1e-4
@@ -1612,7 +1611,7 @@ data_audit = DataFrame(y = y_obs, lon = lon, lat = lat, s_idx = ones(Int, n_obs)
 # 2. Invoke BSTM with Spherical Compact Support Interaction
 println("Audit Part A: Testing Compactly Supported Spherical Interaction...")
 model_sphere = bstm(
-    "y ~ 1 + interaction(lon, lat; manifold='spherical', range=15.0, nbins=25)",
+    "y ~ 1 + Smooth(lon, lat; manifold='spherical', range=15.0, nbins=25)",
     data_audit,
     model_family = "gaussian",
     noise = 1e-4
@@ -1621,7 +1620,7 @@ model_sphere = bstm(
 # 3. Invoke BSTM with Anisotropic Spectral Interaction
 println("Audit Part B: Testing Anisotropic Spectral Surface...")
 model_aniso = bstm(
-    "y ~ 1 + interaction(lon, lat; manifold='anisotropic', ls_x=10.0, ls_y=5.0, nbins=30)",
+    "y ~ 1 + Smooth(lon, lat; manifold='anisotropic', ls_x=10.0, ls_y=5.0, nbins=30)",
     data_audit,
     model_family = "gaussian",
     noise = 1e-4
@@ -1666,11 +1665,11 @@ end
 ### Example Formula Usage
 ```julia
 formula = "y ~ 1 + z + " * 
-    "fe(Region, contrast='effects') + " * # Fixed effect with effects coding
-    "re(s_idx, model='bym2') + " *        # Besag-York-Mollie spatial manifold
-    "re(t_idx, model='rw2') + " *         # Smooth temporal trend
-    "svc(z, model='rff') + " *            # Spatially varying coefficient for z
-    "ie(lat, lon, model='gp')"            # Non-linear spatial interaction surface
+    "Fixed(Region, contrast='effects') + " * # Fixed effect with effects coding
+    "Spatial(s_idx, manifold='bym2') + " *        # Besag-York-Mollie spatial manifold
+    "Temporal(t_idx, manifold='rw2') + " *         # Smooth temporal trend
+    "SVC(z, manifold='rff') + " *            # Spatially varying coefficient for z
+    "Smooth(lat, lon, manifold='gp')"            # Non-linear spatial interaction surface
 ```
 
 
@@ -2004,7 +2003,7 @@ df_advdiff = DataFrame(
 # 3. Model Definition
 # Rationale: Passing explicit s_N and t_N to override default data scanning.
 m = bstm(
-    "y_obs ~ 1 + Spatial(s_idx; manifold='besag') + Temporal(t_idx; manifold='ar1') + interaction(s_idx, t_idx; manifold='advection_diffusion')",
+    "y_obs ~ 1 + Spatial(s_idx; manifold='besag') + Temporal(t_idx; manifold='ar1') + Physics(s_idx, t_idx; manifold='advection_diffusion')",
     df_advdiff,
     model_family="gaussian",
     W = au.W,
@@ -2243,7 +2242,7 @@ res = model_results_comprehensive(m , chn );
 
 # Note: model_arch='multivariate' will look for columns starting with 'y'
 fm = """
-  y1 + y2 ~ 1 + z + re(s_idx, manifold='bym2')
+  y1 + y2 ~ 1 + z + Spatial(s_idx, manifold='bym2')
 """
 
 m = bstm( fm, inp_df; family="poisson" );  

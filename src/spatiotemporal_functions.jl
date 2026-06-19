@@ -545,7 +545,7 @@ const BSTM_MODULE_KEYWORDS = Set([
     "mixed",
     "volatility",
     "network",
-    "physics",
+    "transport",
     "hyperbolic",
     "dynamics"
 ])
@@ -9166,7 +9166,7 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
                     opt_dict[:model_time] = string(manifold_raw)
                     opt_dict[:t_v] = time_val
                 end
-            else
+            else  # time and season
                 opt_dict[:t_idx_var] = vars_list[1]
                 opt_dict[:u_idx_var] = vars_list[2]
                 if manifold_raw isa Union{Tuple, AbstractVector}
@@ -9179,6 +9179,18 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
                 end
             end
         end
+    end
+
+    # Physics-Informed Transport Detection
+    # Checking formula for advection-diffusion transport operators
+    if occursin("advection_diffusion", formula)
+        opt_dict[:model_st] = "advection_diffusion"
+    end
+
+    # Knorr-Held Interaction Detection
+    # Identifies algebraic Kronecker operators (otimes)
+    if occursin("⊗", formula)
+        opt_dict[:model_st] = "IV"
     end
 
     # 4. Monolithic Registry Synchronization
