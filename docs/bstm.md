@@ -112,16 +112,13 @@ As a first step towards spatial modelling, we look at a minimal data series: the
 ```{julia}  
 
 data_scot = scottish_lip_cancer_data_spacetime(); # additional noise and "fake" time slices added
-au_scot = data_scot.au ; # areal unit information
 
-```
+# To interact with the data which in the above are known as `::NamedTuple`, here are a few methods:
+showall( keys(data_scot) )  # show the container's names
 
-To interact with the data which in the above are known as `tuples`, here are a few methods:
+pairs(data_scot)  # show the first few elements of each object  
 
-```{julia}
-# introspection of data:
-keys(data_scot)
-pairs(data_scot)
+keys( data_scot[:au] )  # areal unit information
 
 data_scot[:W] # the neighbourhood adjacency matrix
  
@@ -383,6 +380,9 @@ The `bstm_options` and `assign_covariate_units` functions support several method
 3.  **Interactions:**
     *   Interactions are specified as `"var1*var2"`. They are calculated *after* the individual variables have been transformed (scaled/logged), ensuring interactions operate on normalized representations.
      
+
+
+
 
 
 ## Discrete Bayesian Spatiotemporal Models
@@ -3670,6 +3670,92 @@ The *bstm* framework in Julia offers a robust, scalable environment for tackling
 
 
 
+
+## Technical summary
+
+# BSTM Formula Glossary: Manifold Implementation Syntax
+
+This glossary details the specific syntactic forms accepted by the `bstm` parser to implement the mathematical manifolds defined above.
+
+### 1. Spatial Manifolds
+*   **Intrinsic CAR (ICAR)**: `Spatial(s_idx, manifold='icar')`
+    *   *Note*: Assumes $\lambda=1$ in the Leroux formulation.
+*   **Leroux Model**: `Spatial(s_idx, manifold='leroux')`
+    *   *Note*: Introduces the mixing parameter $\lambda$ for structured vs. unstructured effects.
+*   **IID Spatial**: `Spatial(s_idx, manifold='iid')`
+    *   *Note*: Equivalent to $\lambda=0$; models independent random effects per location.
+
+### 2. Temporal Manifolds
+*   **First-Order Random Walk**: `Temporal(t_idx, manifold='rw1')`
+    *   *Note*: Useful for abrupt changes or step-like trends.
+*   **Second-Order Random Walk**: `Temporal(t_idx, manifold='rw2')`
+    *   *Note*: Preferred for smooth, locally linear non-linear trends.
+
+### 3. Seasonal Manifolds
+*   **Discrete Seasonality**: `Seasonal(u_idx, period=K)`
+    *   *Note*: Where `u_idx` is the seasonal category (e.g., month 1-12) and `K` is the periodicity.
+
+### 4. Spatiotemporal Interactions
+*   **Type I (Unstructured)**: `Spatial(s_idx) ⊗ Temporal(t_idx, manifold='iid')`
+*   **Type II (Spatial IID x Temporal RW)**: `Spatial(s_idx, manifold='iid') ⊗ Temporal(t_idx, manifold='rw2')`
+*   **Type IV (Spatial ICAR x Temporal RW)**: `Spatial(s_idx, manifold='icar') ⊗ Temporal(t_idx, manifold='rw2')`
+    *   *Note*: This is the most complex interaction, allowing spatial fields to evolve smoothly over time.
+
+### 5. Spatially Varying Coefficients (SVC)
+*   **Spatial Slope**: `x_covariate | Spatial(s_idx, manifold='leroux')`
+    *   *Note*: The pipe operator `|` denotes that the effect of `x_covariate` is conditional upon the spatial manifold.
+
+### 6. Fixed Effects & Covariates
+*   **Standard Linear**: `1 + covariate_name`
+    *   *Note*: `1` explicitly includes the global intercept.
+
+### 7. Eigen / Spectral Manifolds
+*   **Reduced Rank Field**: `Eigen(s_idx, rank=K)`
+    *   *Note*: Uses the top `K` eigenvectors of the Laplacian $Q$ as basis functions.
+
+# Extended Taxonomy: 17 Spatial Manifolds in BSTM
+
+Beyond basic ICAR and IID models, the following manifolds define the latent topology of spatial random fields. Each represents a unique assumption about how information propagates across a manifold.
+
+### Group A: Graph-Based & Conditionally Autoregressive (CAR)
+1.  **IID Manifold**: The identity manifold where $\lambda=0$. Assumes zero spatial correlation.
+2.  **Intrinsic CAR (ICAR)**: The Besag manifold ($\lambda=1$). Assumes a singular precision matrix ($Q$) where values are conditional on neighbors.
+3.  **Leroux Manifold**: A convex combination $\lambda Q + (1-\lambda)I$. Provides a flexible trade-off between local smoothing and global noise.
+4.  **Proper CAR (PCAR)**: Uses a precision matrix $(I - \rho W)$, where $\rho$ is less than the reciprocal of the maximum eigenvalue of the weight matrix $W$.
+5.  **Directed Acyclic Graph (DAG) Manifold**: Used in Vecchia approximations to impose a causal ordering on spatial locations for computational efficiency.
+
+### Group B: Spectral & Basis-Function Manifolds
+6.  **Eigen Manifold (Laplacian Spectral)**: Projects the field onto the $K$ smoothest eigenvectors of the graph Laplacian.
+7.  **Moran’s I Basis Manifold**: Uses the eigenvectors of the centered weight matrix $(I - 11'/n)W(I - 11'/n)$ to filter specific spatial scales.
+8.  **Fourier Manifold**: A spectral approach for regular grids where the manifold is treated as a torus.
+9.  **Wavelet Manifold**: Multi-resolution analysis that localizes spatial features in both space and frequency.
+
+### Group C: Geodesic & Continuous Manifolds
+10. **Matérn Manifold (SPDE)**: Derived from the Stochastic Partial Differential Equation $\kappa^2 - \Delta)^{\alpha/2} u = \mathcal{W}$. Links Gaussian Fields to the Laplacian.
+11. **Exponential Manifold**: A special case of Matérn where the correlation decays as $e^{-d/r}$ over geodesic distance $d$.
+12. **Gaussian (Squared Exponential) Manifold**: Assumes infinite differentiability of the spatial process, leading to extremely smooth surfaces.
+13. **Spherical Manifold**: A distance-based manifold where correlation is exactly zero beyond a finite range $r$.
+
+### Group D: Non-Euclidean & Hierarchical Manifolds
+14. **Hyperbolic Manifold**: Used for embedding hierarchical or tree-like spatial data where the distance metric accounts for exponential growth in volume.
+15. **River/Network Manifold**: A directed manifold where flow only moves downstream (e.g., the SSN - Spatial Stream Network models).
+16. **Adjacency-Constrained Mixture Manifold**: A non-stationary manifold where the $Q$ matrix is updated by a secondary latent process (e.g., boundary detection).
+17. **Barycentric Manifold**: Used in triangulation-based models (Delaunay/Voronoi) where the manifold is a piecewise linear surface interpolated from vertices.
+# BSTM Comprehensive Model Library & Formula Interface Summary
+
+This summary details every model type and manifold supported by the **Bayesian Spatio-Temporal Model (BSTM)** framework. It describes the latent topology, mathematical assumptions, and specific use-cases for each component.
+
+### 1. Spatial Manifolds (`Spatial`)
+Used to model geographic dependencies where proximity implies correlation.
+
+*   **Intrinsic CAR (ICAR)**: `Spatial(s_idx, manifold='icar')`
+    *   **Description**: A singular precision matrix based on the graph Laplacian. Values at a location are conditional on the mean of their neighbors.
+    *   **Utility**: Best for strong, 'pure' spatial smoothing where every unit must be influenced by its immediate neighbors.
+*   **Leroux Model**: `Spatial(s_idx, manifold='leroux')`
+    *   **Description**: A convex combination of structured (ICAR) and unstructured (IID) noise: $\lambda Q + (1-\lambda)I$.
+    *   **Utility**: The most robust default. Useful when you suspect both a spatial trend and local overdispersion/random noise exist simultaneously.
+*   **BYM2 (Besag-York-Molli
+* 
 
   
 

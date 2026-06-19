@@ -863,14 +863,16 @@ end
 
 # # BSTM Monolithic Configuration Engine v19.23.14
 
+
+
 function bstm_options(; kwargs...)
-    # # 1. Initialization and Technical Metadata Consolidation
-    # Consolidates all user-provided keyword arguments into a mutable dictionary for transformation.
+    # Initialization and Technical Metadata Consolidation
+    # Consolidates all user-provided keyword arguments into a mutable dictionary.
     M = Dict{Symbol, Any}(kwargs)
     data = get(M, :data, nothing)
 
-    # # 2. Automated Keyword Discovery
-    # Scans the provided DataFrame for standard BSTM variable names to minimize configuration overhead.
+    # Automated Keyword Discovery
+    # Scans the provided DataFrame for standard BSTM variable names.
     if !isnothing(data)
         v_names = Symbol.(names(data))
         keyword_map = Dict(
@@ -897,19 +899,16 @@ function bstm_options(; kwargs...)
         end
     end
 
-    # # 3. Dimensional Validation & Scope Discovery
-    # Response vector is mandatory; it defines the primary observation scale for the linear predictor.
+    # Dimensional Validation & Scope Discovery
     if !haskey(M, :y_obs)
         error("BSTM Error: :y_obs is required for model initialization.")
     end
 
     y_obs_raw = M[:y_obs]
-    # Handle Matrix (Multivariate), Vector of Vectors (Heterogeneous), or flat Vector responses
     y_N = (y_obs_raw isa AbstractMatrix) ? size(y_obs_raw, 1) : (y_obs_raw isa Vector{<:AbstractVector} ? length(y_obs_raw[1]) : length(y_obs_raw))
     M[:y_N] = y_N
 
-    # # 4. Manifold Index Realignment
-    # Standardizing indices as integers and discovering grid limits (s_N, t_N, u_N).
+    # Manifold Index Realignment
     s_idx_raw = get(M, :s_idx, ones(Int, y_N))
     t_idx_raw = get(M, :t_idx, ones(Int, y_N))
     u_idx_raw = get(M, :u_idx, ones(Int, y_N))
@@ -922,30 +921,30 @@ function bstm_options(; kwargs...)
     M[:t_N] = get(M, :t_N, maximum(M[:t_idx]))
     M[:u_N] = get(M, :u_N, maximum(M[:u_idx]))
 
-    # Global linear indexing for space-time tensors
+    # Global linear indexing for space-time interaction tensors
     M[:st_idx] = [(M[:t_idx][i] - 1) * M[:s_N] + M[:s_idx][i] for i in 1:y_N]
 
-    # # 5. Design Matrix Factory: Fixed Effects
-    # HARDENING: Explicit NamedArray persistence. We remove all Matrix{Float64} casts
-    # to ensure that create_fixed_design's symbolic column labels are preserved.
+    # Design Matrix Factory: Fixed Effects
     if haskey(M, :fixed_parts) && !isnothing(data)
         f_expr = isempty(M[:fixed_parts]) ? "1" : join(M[:fixed_parts], " + ")
-        # Factory call returns a NamedArray with column labels like (Intercept), x, age & sex
         M[:Xfixed] = create_fixed_design(f_expr, data; contrasts=get(M, :contrasts, Dict()))
     else
-        # Fallback for Intercept-only models
         M[:Xfixed] = NamedArray(ones(Float64, y_N, 1), (1:y_N, [:Intercept]))
     end
     M[:Xfixed_N] = size(M[:Xfixed], 2)
 
-    # # 6. GMRF Precision Matrix Template Factory
-    # Pre-calculates precision kernels for spatial, temporal, and seasonal manifolds.
-    M[:s_Q_template] = build_structure_template(Symbol(get(M, :model_space, "none")), M[:s_N]; W=get(M, :W, nothing))
-    M[:t_Q_template] = build_structure_template(Symbol(get(M, :model_time, "none")), M[:t_N])
-    M[:u_Q_template] = (get(M, :model_season, "none") != "none") ? build_structure_template(Symbol(M[:model_season]), M[:u_N]) : nothing
+    # Taxonomic Metadata Hardening
+    # Use get!() to ensure defaults are explicitly written into the dictionary.
+    get!(M, :model_space, "none")
+    get!(M, :model_time, "none")
+    get!(M, :model_season, "none")
 
-    # # 7. Advanced Hierarchical Registries
-    # Ensuring all multi-effect containers are active to prevent truncation during supervisor assembly.
+    # GMRF Precision Matrix Template Factory
+    M[:s_Q_template] = build_structure_template(Symbol(M[:model_space]), M[:s_N]; W=get(M, :W, nothing))
+    M[:t_Q_template] = build_structure_template(Symbol(M[:model_time]), M[:t_N])
+    M[:u_Q_template] = (M[:model_season] != "none") ? build_structure_template(Symbol(M[:model_season]), M[:u_N]) : nothing
+
+    # Hierarchical Registries Initialization
     get!(M, :nested_manifolds, Dict{String, Any}())
     get!(M, :spatial_hierarchy, Dict{Symbol, Any}())
     get!(M, :mixed_terms, [])
@@ -954,25 +953,23 @@ function bstm_options(; kwargs...)
     get!(M, :svc_covariates, Symbol[])
     get!(M, :basis_matrices, Dict{Symbol, Any}())
 
-    # # 8. Coordinate Sync for Continuous Kernels
+    # Coordinate Sync for Continuous Kernels
     if !haskey(M, :s_coord)
         if haskey(M, :s_x) && haskey(M, :s_y)
             M[:s_coord] = hcat(M[:s_x], M[:s_y])
         else
-            # Identity coordinates for discrete-only models
             M[:s_coord] = zeros(Float64, M[:s_N], 2)
         end
     end
 
-    # # 9. Volatility & Spectral Projection Caching
-    # Discovery of log-variance surfaces for heteroskedastic (SV) models.
+    # Volatility & Spectral Projection Caching
     if get(M, :use_sv, false)
         get!(M, :M_rff_sigma, 20)
         W_v, b_v = generate_informed_rff_params(M[:s_coord], M[:M_rff_sigma])
         M[:vol_proj] = (M[:s_coord] * W_v) .+ b_v'
     end
 
-    # # 10. Technical Flag Standardization
+    # Technical Flag Standardization
     get!(M, :model_arch, "univariate")
     get!(M, :model_family, "gaussian")
     get!(M, :noise, 1e-4)
@@ -982,8 +979,7 @@ function bstm_options(; kwargs...)
     get!(M, :trials, ones(Int, y_N))
     get!(M, :period, 12.0)
 
-    # # 11. Observation Mask Discovery
-    # Filtering valid indices for likelihood evaluation (Handling NAs/Hurdles)
+    # Observation Mask Discovery
     if !haskey(M, :y_ok)
         if y_obs_raw isa AbstractMatrix
             M[:y_ok] = [findall(!isnan, y_obs_raw[:, k]) for k in 1:get(M, :outcomes_N, 1)]
@@ -994,7 +990,6 @@ function bstm_options(; kwargs...)
 
     return NamedTuple(M)
 end
-
 
 
 
@@ -5224,15 +5219,21 @@ function _discover_manifold_realizations(chain, M, N_samples, outcomes_N, p_name
             u_eff[:, j] .= extract_manifold(season_prim, chain, M, j, u_sig, :seasonal)[1]
         end
 
-        if haskey(M, :basis_matrices)
+        # 1D-4D Smooth Basis Recovery
+        # Rationale: Iterates through all basis matrices (Splines, RFF, FFT) registered in metadata.
+        if haskey(M, :basis_matrices) && !isempty(M.basis_matrices)
             for (v_sym, B_mat) in M.basis_matrices
-                local p_key = "beta_basis_" * string(v_sym)
-                if p_key in p_names
-                    # Accumulate spline/FFT coefficients onto the training grid
-                    basis_eff_accum[:, j] .+= B_mat * get_params_vector(chain, p_key, size(B_mat, 2))[j, :]
+                p_key = "beta_basis_" * string(v_sym)
+                if p_key in p_names || any(n -> startswith(n, p_key * "["), p_names)
+                    n_basis_cols = size(B_mat, 2)
+                    # Extraction of latent coefficients for the specific manifold
+                    beta_basis_samps = get_params_vector(chain, p_key, n_basis_cols)
+                    # Volumetric projection onto the observation grid
+                    basis_eff_accum[:, j] .+= B_mat * beta_basis_samps[j, :]
                 end
             end
         end
+
 
         # 5.2 Hierarchical Scale Discovery
         # Rationale: Recovering regional/group latent fields defined in the spatial hierarchy
@@ -5291,7 +5292,7 @@ function _discover_manifold_realizations(chain, M, N_samples, outcomes_N, p_name
                 t_eff[k][:, j] .= ft
             end
 
-            # --- C. Spatiotemporal Interactions (Type IV) ---
+            # --- C. Spatiotemporal Tensors (Type IV) ---
             # Rationale: KRONECKER operator forced to :spacetime resolution
             local st_key = (outcomes_N == 1) ? "st_latent" : "st_latent_" * string(k)
             if st_key in p_names
@@ -5517,126 +5518,147 @@ end
 
 
 
+# # BSTM Monolithic Visualization Engine [v19.38.5 - World-Class Forensic Restoration]
+# Timestamp: 2025-11-05 20:00:00
+# Rationale: Expanding the dashboard to include Mixed Effects, Seasonal Cycles, and 4D smooths.
+# Requirements: 100% parity with v19.38.0 Registry. Zero-truncation of dashboard panels.
+
 function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=nothing, y_obs=nothing)
-    println("--- Rendering Hardened Posterior Dashboard v18.1.8 [Outcome: $outcome] ---")
-    
-    local pstats = res.pstats
-    local obs_src = !isnothing(y_obs) ? y_obs : res.y_obs
-    local coords = !isnothing(centroids) ? centroids : res.centroids
-    local polys = !isnothing(polygons) ? polygons : res.polygons
+    # Description: Primary exhaustive dashboard for spatiotemporal manifold verification.
+    # Requirement: Scalable grid to accommodate all recovered latent effects (S, T, U, Smooth, Mixed, Nested).
 
-    local plots_list = []
+    println("--- Rendering World-Class Forensic Dashboard v19.38.5 [Outcome: ", outcome, "] ---")
 
-    # 1. Posterior Predictive Check (PPC)
-    # Rationale: Verifying the correlation between observed data and denoised expectations.
-    local is_multivariate = (obs_src isa AbstractMatrix && size(obs_src, 2) > 1)
-    local y_p = is_multivariate ? pstats.predictions_denoised.mean[:, outcome] : vec(pstats.predictions_denoised.mean)
-    local y_o = is_multivariate ? obs_src[:, outcome] : vec(obs_src)
+    # # 1. Metadata and Result Extraction
+    # Rationale: Standardizing the posterior statistics and metadata sources for visualization.
+    pstats = res.pstats
+    # Resolving observation source (Training vs custom override)
+    obs_src = isnothing(y_obs) ? res.y_obs : y_obs
+    # Synchronizing spatial geometry for mapping
+    coords = isnothing(centroids) ? res.centroids : centroids
+    polys = isnothing(polygons) ? res.polygons : polygons
+
+    plots_list = []
+
+    # # 2. Panel 1: Posterior Predictive Check (PPC)
+    # Rationale: Core fit audit comparing expectations to observations.
+    is_mv = (obs_src isa AbstractMatrix && size(obs_src, 2) > 1)
+    y_p = is_mv ? pstats.predictions_denoised.mean[:, outcome] : vec(pstats.predictions_denoised.mean)
+    y_o = is_mv ? obs_src[:, outcome] : vec(obs_src)
 
     if length(y_p) == length(y_o)
-        local p_ppc = Plots.scatter(vec(y_p), vec(y_o), title="PPC (Outcome $outcome)", xlabel="Pred", ylabel="Obs", alpha=0.5, markersize=3, markerstrokewidth=0, legend=false)
-        local clean_p = filter(!isnan, y_p)
-        local clean_o = filter(!isnan, y_o)
+        p_ppc = Plots.scatter(vec(y_p), vec(y_o), title="PPC Audit", xlabel="Predicted", ylabel="Observed", alpha=0.5, markersize=3, markerstrokewidth=0, legend=false)
+        # Identity line reference
+        clean_p = filter(x -> !isnan(x), y_p)
+        clean_o = filter(x -> !isnan(x), y_o)
         if !isempty(clean_p) && !isempty(clean_o)
-            local m_val = max(maximum(clean_p), maximum(clean_o))
+            m_val = max(maximum(clean_p), maximum(clean_o))
             Plots.plot!(p_ppc, [0, m_val], [0, m_val], color=:red, ls=:dash, lw=1.5)
         end
         push!(plots_list, p_ppc)
     end
 
-    # 2. Spatial Mapping
-    # Rationale: Rendering the structured spatial field realization.
+    # # 3. Panel 2: Spatial Field Mapping
+    # Rationale: High-fidelity geographic rendering of structured innovations.
     if !isnothing(coords)
-        local s_field = (pstats.arch isa MultivariateArchitecture && pstats.spatial_structured isa AbstractVector) ?
-                        pstats.spatial_structured[outcome] : pstats.spatial_structured
+        s_field = (pstats.arch isa MultivariateArchitecture || pstats.arch isa MultifidelityArchitecture) ?
+                   pstats.spatial_structured[outcome] : pstats.spatial_structured
 
         if !isnothing(s_field) && hasproperty(s_field, :mean)
-            local s_mean = vec(collect(s_field.mean))
-            local p_map = Plots.plot(aspect_ratio=:equal, title="Spatial Field (Outcome $outcome)", frame=:box)
+            s_mean = vec(collect(s_field.mean))
+            p_map = Plots.plot(aspect_ratio=:equal, title="Spatial Field", frame=:box)
 
             if !isnothing(polys) && length(polys) >= length(s_mean)
                 for i in 1:length(s_mean)
-                    local px_coords = [pt[1] for pt in polys[i]]
-                    local py_coords = [pt[2] for pt in polys[i]]
-                    if !isempty(px_coords) && (px_coords[1], py_coords[1]) != (px_coords[end], py_coords[end])
-                        push!(px_coords, px_coords[1])
-                        push!(py_coords, py_coords[1])
+                    px = [pt[1] for pt in polys[i]]
+                    py = [pt[2] for pt in polys[i]]
+                    if !isempty(px) && (px[1], py[1]) != (px[end], py[end])
+                        push!(px, px[1]); push!(py, py[1])
                     end
-                    Plots.plot!(p_map, px_coords, py_coords, seriestype=:shape, fill_z=s_mean[i], c=:viridis, linecolor=:black, lw=0.2, label=nothing)
+                    Plots.plot!(p_map, px, py, seriestype=:shape, fill_z=s_mean[i], c=:viridis, linecolor=:black, lw=0.2, label=nothing)
                 end
             else
-                local cx = [c[1] for c in coords]
-                local cy = [c[2] for c in coords]
-                local n_pts = length(cx)
-                local z_vals = length(s_mean) >= n_pts ? s_mean[1:n_pts] : [s_mean; zeros(n_pts - length(s_mean))]
-                Plots.scatter!(p_map, cx, cy, marker_z=vec(z_vals), markersize=4, c=:viridis, label=nothing, colorbar=true)
+                cx = [c[1] for c in coords]; cy = [c[2] for c in coords]
+                Plots.scatter!(p_map, cx, cy, marker_z=vec(s_mean), markersize=4, c=:viridis, label=nothing, colorbar=true)
             end
             push!(plots_list, p_map)
         end
     end
 
-    # 3. Temporal Trend
-    # Rationale: Displaying the non-linear trend component with credible interval ribbon.
-    local t_field = nothing
+    # # 4. Panel 3: Temporal Trend Recovery
+    # Rationale: 1D trend component with 95% Credible Interval ribbon.
+    t_field = nothing
     if hasproperty(pstats, :temporal_effects)
-        t_field = (pstats.arch isa MultivariateArchitecture && pstats.temporal_effects isa AbstractVector) ?
+        t_field = (pstats.arch isa MultivariateArchitecture || pstats.arch isa MultifidelityArchitecture) ?
                    pstats.temporal_effects[outcome] : pstats.temporal_effects
     end
     if !isnothing(t_field) && !all(isnan, t_field.mean)
-        local tm = vec(collect(t_field.mean))
-        local tl = vec(collect(t_field.lower))
-        local tu = vec(collect(t_field.upper))
-        push!(plots_list, Plots.plot(tm, ribbon=(tm .- tl, tu .- tm), title="Temporal Trend", lw=2, fillalpha=0.2, color=:royalblue, legend=false))
+        tm, tl, tu = vec(t_field.mean), vec(t_field.lower), vec(t_field.upper)
+        push!(plots_list, Plots.plot(tm, ribbon=(tm .- tl, tu .- tm), title="Temporal Trend", lw=2, fillalpha=0.2, color=:royalblue, legend=false, xlabel="Time Index"))
     end
 
-    # 4. Seasonal Cycle (FIXED)
-    # Rationale: Standardizing seasonal discovery and ensuring ribbon-safe vectorization.
+    # # 5. Panel 4: RESTORED Seasonal Cycle Visualization
+    # Rationale: Specifically added to visualize periodic components (month, day-of-week).
     if hasproperty(pstats, :seasonal) && !isnothing(pstats.seasonal)
-        local u_field = pstats.seasonal
+        u_field = pstats.seasonal
         if !all(isnan, u_field.mean)
-            local um = vec(collect(u_field.mean))
-            local ul = vec(collect(u_field.lower))
-            local uu = vec(collect(u_field.upper))
+            um, ul, uu = vec(u_field.mean), vec(u_field.lower), vec(u_field.upper)
             push!(plots_list, Plots.plot(um, ribbon=(um .- ul, uu .- um), title="Seasonal Cycle", lw=2, fillalpha=0.2, color=:forestgreen, legend=false, xlabel="Season Bin"))
         end
     end
 
-    # 5. Fixed Effects
-    # Rationale: Bar chart for categorical or linear covariate effects.
-    if hasproperty(pstats, :fixed_effects) && !isnothing(pstats.fixed_effects)
-        local f_field = pstats.fixed_effects
-        if !all(isnan, f_field.mean)
-            local fm = vec(collect(f_field.mean))
-            local fl = vec(collect(f_field.lower))
-            local fu = vec(collect(f_field.upper))
-            push!(plots_list, Plots.bar(fm, yerror=(fm .- fl, fu .- fm), title="Fixed Effects", color=:grey, legend=false))
+    # # 6. Panel 5: RESTORED Mixed-Effect Categorical Registry
+    # Rationale: Specifically added to audit hospital/group varying intercepts.
+    # Checks for summaries of c_latent terms identified in v19.21.2.
+    if hasproperty(pstats, :mixed_effects) && !isnothing(pstats.mixed_effects)
+        for (grp_sym, m_summ) in pstats.mixed_effects
+            mm, ml, mu = vec(m_summ.mean), vec(m_summ.lower), vec(m_summ.upper)
+            push!(plots_list, Plots.bar(mm, yerror=(mm .- ml, mu .- mm), title=string("Mixed: ", grp_sym), color=:purple, legend=false, xlabel="Category ID"))
         end
     end
 
-    # 6. Smooth Basis / Accumulated Smooths (FIXED)
-    # Rationale: Aggregating non-linear spline or FFT effects with ribbon confidence.
+    # # 7. Panel 6: RESTORED Hyper-Volumetric Smooths (1D-4D)
+    # Rationale: High-dimensional surfaces projected onto the observation grid.
     if hasproperty(pstats, :smooth_effects) && !isnothing(pstats.smooth_effects)
-        local b_field = pstats.smooth_effects
-        if !all(isnan, b_field.mean)
-            local bm = vec(collect(b_field.mean))
-            local bl = vec(collect(b_field.lower))
-            local bu = vec(collect(b_field.upper))
-            push!(plots_list, Plots.plot(bm, ribbon=(bm .- bl, bu .- bm), title="Accumulated Smooths", lw=1.5, fillalpha=0.1, color=:darkorange, legend=false))
+        b_field = pstats.smooth_effects
+        if !all(isnan, b_field.mean) && Statistics.std(b_field.mean) > 1e-9
+            bm, bl, bu = vec(b_field.mean), vec(b_field.lower), vec(b_field.upper)
+            push!(plots_list, Plots.plot(bm, ribbon=(bm .- bl, bu .- bm), title="Accumulated Smooths (1D-4D)", lw=1.5, fillalpha=0.1, color=:darkorange, legend=false, xlabel="Observation Order"))
         end
     end
 
-    # Final Dashboard Assembly
-    if !isempty(plots_list)
-        local n_plots = length(plots_list)
-        local cols = min(n_plots, 2)
-        local rows = Int(ceil(n_plots / cols))
-        return Plots.plot(plots_list..., layout=(rows, cols), size=(1000, 300 * rows), margin=5Plots.mm)
+    # # 8. Panel 7: Hierarchical Supervisor Contributions
+    # Rationale: Renders signals transferred from nested supervisor processes.
+    if hasproperty(pstats, :nested_contributions) && !isnothing(pstats.nested_contributions)
+        n_field = pstats.nested_contributions
+        if !all(isnan, n_field.mean) && Statistics.std(n_field.mean) > 1e-9
+            nm, nl, nu = vec(n_field.mean), vec(n_field.lower), vec(n_field.upper)
+            push!(plots_list, Plots.plot(nm, ribbon=(nm .- nl, nu .- nm), title="Hierarchical Supervisors", lw=1.5, fillalpha=0.2, color=:brown, legend=false, xlabel="Observation Order"))
+        end
     end
-    
-    @warn "No active components discovered for dashboard rendering."
+
+    # # 9. Panel 8: Fixed Effect Coefficient Registry
+    if hasproperty(pstats, :fixed_effects) && !isnothing(pstats.fixed_effects)
+        f_field = pstats.fixed_effects
+        if !all(isnan, f_field.mean)
+            fm, fl, fu = vec(f_field.mean), vec(f_field.lower), vec(f_field.upper)
+            push!(plots_list, Plots.bar(fm, yerror=(fm .- fl, fu .- fm), title="Fixed Effect Registry", color=:grey, legend=false, xlabel="Coefficient ID"))
+        end
+    end
+
+    # # 10. Dashboard Assembly and Layout
+    # Rationale: Collating all discovered panels into a unified multi-plot object.
+    if !isempty(plots_list)
+        n_plots = length(plots_list)
+        cols = min(n_plots, 2)
+        rows = Int(ceil(n_plots / cols))
+        final_plt = Plots.plot(plots_list..., layout=(rows, cols), size=(1200, 350 * rows), margin=5Plots.mm)
+        return final_plt
+    end
+
+    @warn "BSTM Visualization: No active technical manifolds discovered for outcome $outcome."
     return nothing
 end
-
 
 
 function model_results_comprehensive(model, chain; n_samples=100, alpha=0.05)
@@ -6503,54 +6525,64 @@ end
     eta = Vector{T}(M.Xfixed * Xfixed_beta)
 
     # Apply additive offsets (e.g., exposure/offset columns) if registered
+    # Scale-Aware Offset Implementation
+    # If the family uses an identity link (Gaussian), we exponentiate the log_offset.
+    # For log-link families (Poisson, Hurdle Poisson), it remains additive in the latent space.
     if haskey(M, :log_offset)
-        eta .+= M.log_offset
+        if family in ["gaussian", "student_t", "laplace"]
+            eta .+= exp.(M.log_offset)
+        else
+            eta .+= M.log_offset
+        end
     end
 
-    # # 4. Categorical Random Effects (Grouped Mixed Effects)
-    # Rationale: Processes unstructured group-level variation via IID manifolds.
+  
+    # # Mixed Effects (Categorical Random Intercepts)
+    # Restoration: Explicitly naming scale and latent parameters per category symbol to prevent collision.
     if haskey(M, :c_groups) && !isempty(M.c_groups)
         for c_sym in keys(M.c_groups)
             c_template = M.c_re_templates[c_sym]
-            sig_c ~ NamedDist(Exponential(1.0), Symbol("sig_c_", c_sym))
+            n_levels = size(c_template.matrix, 1)
             
-            # Precision mapping for categorical variation
-            Q_c = recompose_precision(:iid, c_template.matrix, sig_c, noise=noise)
-            c_latent ~ NamedDist(MvNormalCanon(zeros(size(c_template.matrix, 1)), Q_c), Symbol("c_latent_", c_sym))
+            # Unique naming per grouping variable (e.g., sig_c_hospital, c_latent_hospital)
+            sig_c_grp ~ NamedDist(Exponential(1.0), Symbol("sig_c_", c_sym))
+            Q_c_grp = recompose_precision(:iid, c_template.matrix, sig_c_grp, noise=noise)
+            c_latent_grp ~ NamedDist(MvNormalCanon(zeros(n_levels), Q_c_grp), Symbol("c_latent_", c_sym))
 
             # Map categorical coefficients to individual observations via indices
             indices = M.c_groups[c_sym]
             for i in 1:M.y_N
-                eta[i] += c_latent[indices[i]]
+                eta[i] += c_latent_grp[indices[i]]
             end
         end
     end
 
-    # # 5. Nested Hierarchical Supervisors (Hierarchical z -> y)
-    # Rationale: Links high-fidelity responses to auxiliary supervisor processes.
+
+    
+    # # Hierarchical Nested Supervisors
+    # Restoration: Restoring full signal transfer including supervisor spatial innovation and fixed effects.
     if haskey(M, :nested_manifolds) && !isempty(M.nested_manifolds)
         for (z_key, z_meta) in M.nested_manifolds
-            # Coupling Parameter (rho) governs the strength of signal transfer
             rho_nested ~ NamedDist(Normal(1.0, 0.5), Symbol("rho_nested_", z_key))
-            
-            # Supervisor Spatial Field Projection (Structural Innovation)
+
+            # A. Supervisor Spatial Field Projection
             if haskey(z_meta, :model_space) && z_meta.model_space != "none"
                 sig_z_s ~ NamedDist(Exponential(1.0), Symbol("sig_nested_spatial_", z_key))
                 Q_z_s = recompose_precision(Symbol(z_meta.model_space), z_meta.s_Q_template.matrix, sig_z_s, noise=noise)
                 lat_z_s ~ NamedDist(MvNormalCanon(zeros(z_meta.s_N), Q_z_s), Symbol("lat_nested_spatial_", z_key))
-                
-                # Coordinate-aware signal transfer using supervisor metadata
-                z_ptr = z_meta.s_idx
+
+                z_s_ptr = z_meta.s_idx
                 for i in 1:M.y_N
-                    eta[i] += rho_nested * lat_z_s[z_ptr[i]]
+                    eta[i] += rho_nested * lat_z_s[z_s_ptr[i]]
                 end
             end
 
-            # Supervisor Fixed Effect Projection (Covariate Transfer)
+            # B. Supervisor Fixed Effect Projection (Covariate Transfer)
             if haskey(z_meta, :Xfixed)
-                beta_z_f ~ NamedDist(MvNormal(zeros(size(z_meta.Xfixed, 2)), 5.0 * I), Symbol("beta_nested_fixed_", z_key))
+                xf_z = z_meta.Xfixed
+                beta_z_f ~ NamedDist(MvNormal(zeros(size(xf_z, 2)), 5.0 * I), Symbol("beta_nested_fixed_", z_key))
                 # Projecting supervisor predictors onto the primary linear predictor
-                eta .+= rho_nested .* (z_meta.Xfixed * beta_z_f)
+                eta .+= rho_nested .* (xf_z * beta_z_f)
             end
         end
     end
@@ -6629,17 +6661,24 @@ end
             eta[i] += m_states[M.t_idx[i]] * sig_dyn
         end
     end
-
-    # # 10. Basis Smooths & Spectral Surfaces (RFF / Splines)
-    # Rationale: Accumulated basis coefficients for non-linear smooths and varying slopes.
+ 
+    # Smooth Basis Dispatch (1D, 2D, 3D, and 4D Latent Fields)
+    # Rationale: Aggregates non-linear effects discovered in the smooth() DSL blocks.
     if haskey(M, :basis_matrices) && !isempty(M.basis_matrices)
         for v_sym in keys(M.basis_matrices)
             B_mat = M.basis_matrices[v_sym]
+            n_basis_cols = size(B_mat, 2)
+            
+            # Variance scale for the specific basis expansion
             sig_basis ~ NamedDist(Exponential(1.0), Symbol("sig_basis_", v_sym))
-            beta_basis ~ NamedDist(filldist(Normal(0, sig_basis), size(B_mat, 2)), Symbol("beta_basis_", v_sym))
+            # Latent coefficients for the basis surface
+            beta_basis ~ NamedDist(filldist(Normal(0, sig_basis), n_basis_cols), Symbol("beta_basis_", v_sym))
+            
+            # Additive superposition onto the linear predictor
             eta .+= B_mat * beta_basis
         end
     end
+
 
     if haskey(M, :interaction_terms) && !isempty(M.interaction_terms)
         for (ie_idx, i_term) in enumerate(M.interaction_terms)
@@ -6748,9 +6787,17 @@ end
     mu_fixed = M.Xfixed * reshape(Xfixed_beta, M.Xfixed_N, outcomes_N)
     eta = Matrix{T}(mu_fixed)
 
+    # Scale-Aware Offset Implementation
+    # If the family uses an identity link (Gaussian), we exponentiate the log_offset.
+    # For log-link families (Poisson, Hurdle Poisson), it remains additive in the latent space.
     if haskey(M, :log_offset)
-        eta .+= M.log_offset
+        if family in ["gaussian", "student_t", "laplace"]
+            eta .+= exp.(M.log_offset)
+        else
+            eta .+= M.log_offset
+        end
     end
+
 
     # # 6. Shared Additive Manifolds (Global Mixed Effects)
     # Rationale: Categorical intercepts applied globally across all outcomes.
@@ -6842,12 +6889,23 @@ end
     end
 
     # # 10. Advanced Registries: Basis Smooths & Interactions
+    # Smooth Basis Dispatch (1D, 2D, 3D, and 4D Latent Fields)
+    # Rationale: Aggregates non-linear effects discovered in the smooth() DSL blocks across outcomes.
     if haskey(M, :basis_matrices) && !isempty(M.basis_matrices)
         for v_sym in keys(M.basis_matrices)
             B_mat = M.basis_matrices[v_sym]
+            n_basis_cols = size(B_mat, 2)
+            
+            # Variance scale for the specific basis expansion
             sig_basis ~ NamedDist(Exponential(1.0), Symbol("sig_basis_", v_sym))
-            beta_basis ~ NamedDist(filldist(Normal(0, sig_basis), size(B_mat, 2)), Symbol("beta_basis_", v_sym))
-            for k in 1:outcomes_N; eta[:, k] .+= B_mat * beta_basis; end
+            # Latent coefficients for the basis surface
+            beta_basis ~ NamedDist(filldist(Normal(0, sig_basis), n_basis_cols), Symbol("beta_basis_", v_sym))
+            
+            # Additive superposition onto all outcomes of the matrix linear predictor
+            surface_proj = B_mat * beta_basis
+            for k in 1:outcomes_N
+                eta[:, k] .+= surface_proj
+            end
         end
     end
 
@@ -6970,6 +7028,19 @@ end
                 field_k .+= sqrt(2.0 / i_term.M_rff) .* cos.(ie_proj) * beta_ie
             end
         end
+        
+        # Multi-Dimensional Smooth Basis Dispatch per Fidelity
+        # Rationale: Aggregates 1D-4D manifolds discovered in the smooth() blocks for each stream.
+        if haskey(fk, :basis_matrices) && !isempty(fk.basis_matrices)
+            for v_sym in keys(fk.basis_matrices)
+                B_mat = fk.basis_matrices[v_sym]
+                n_basis_cols = size(B_mat, 2)
+                sig_basis_k ~ NamedDist(Exponential(1.0), Symbol("sig_basis_", k, "_", v_sym))
+                beta_basis_k ~ NamedDist(filldist(Normal(0, sig_basis_k), n_basis_cols), Symbol("beta_basis_", k, "_", v_sym))
+                field_k .+= B_mat * beta_basis_k
+            end
+        end
+
 
         if haskey(fk, :eigen_terms) && !isempty(fk.eigen_terms)
             for (eg_idx, e_term) in enumerate(fk.eigen_terms)
@@ -7013,6 +7084,18 @@ end
             Xf_beta ~ NamedDist(MvNormal(zeros(fk.Xfixed_N), 5.0 * I), Symbol("Xfixed_beta_", k))
             mu_k .+= fk.Xfixed * Xf_beta
         end
+
+        
+        # Offset Implementation for Multifidelity
+        # Logic: Identity-link families exponentiate the provided log_offset.
+        if haskey(fk, :log_offset)
+            if family in ["gaussian", "student_t", "laplace"]
+                for i in 1:N_k; mu_k[i] += exp(fk.log_offset[i]); end
+            else
+                for i in 1:N_k; mu_k[i] += fk.log_offset[i]; end
+            end
+        end
+
 
         # 5.3 Spatially-Aware Coupled Innovation Transfer
         # Signals from Level 1 are projected onto Level k coordinates via rho_mf coupling.
@@ -7088,7 +7171,7 @@ function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M,
 
     # # 2. Parameter Discovery & Technical Registry Creation
     # Primary engine for recovering latent realizations (S, T, U, ST, SVC, Eigen, Smooth, Hierarchy).
-    # This enforces domain-aware extraction to resolve dual-use primitives.
+    # Enforces domain-aware extraction to populate the 1D-4D smooth basis registry.
     _validate_parameter_registry(chain, M, p_names, 1)
     registry = _discover_manifold_realizations(chain, M, N_samples, 1, p_names)
 
@@ -8479,62 +8562,82 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
 
     # # 2. Manifold Dispatch Registry for 2D Surfaces
 
-    # # 2.1 Bivariate P-Splines (Tensor Product Basis)
-    # Rationale: Expands 1D marginal bases into a 2D surface grid.
+    # Anisotropy Configuration: Extract independent lengthscales if provided, else fallback to marginal std
+    # ls_x and ls_y allow the user to control directional smoothing separately
+    ls_x = get(kwargs, :ls_x, c_std[1])
+    ls_y = get(kwargs, :ls_y, c_std[2])
+
+     # # 2.1 Anisotropic Bivariate P-Splines (Tensor Product Basis)
+    # Rationale: Expands 1D marginal bases into a 2D surface grid with directional scaling.
     if type in ["pspline", "bspline", "smooth"]
+        # n_marginal defines the resolution per dimension to reach total nbins
         n_marginal = Int(floor(sqrt(nbins)))
-        m_total = n_marginal * n_marginal
+        m_total = n_marginal^2
         B = zeros(Float64, n_obs, m_total)
-        
-        knots_x = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
-        knots_y = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
-        
+
+        # Marginal Knot Grids: Distributed evenly across the observed ranges
+        kx = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
+        ky = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
+
         idx = 1
         for i in 1:n_marginal
             for j in 1:n_marginal
-                bx = exp.(-((coords[:, 1] .- knots_x[i]).^2) ./ (2.0 * c_std[1]^2))
-                by = exp.(-((coords[:, 2] .- knots_y[j]).^2) ./ (2.0 * c_std[2]^2))
+                # Tensor product of anisotropic radial marginals
+                # bx uses ls_x; by uses ls_y to define the support width
+                bx = exp.(-((coords[:, 1] .- kx[i]).^2) ./ (2.0 * ls_x^2))
+                by = exp.(-((coords[:, 2] .- ky[j]).^2) ./ (2.0 * ls_y^2))
                 B[:, idx] .= bx .* by
                 idx += 1
             end
         end
 
-    # # 2.2 Thin Plate Splines (TPS - Bending Energy)
+    # # 2.2 Anisotropic Thin Plate Splines (TPS)
+    # Rationale: Normalizes distances relative to anisotropic scales before computing bending energy.
     elseif type == "tps"
         B = zeros(Float64, n_obs, nbins)
         n_grid = Int(floor(sqrt(nbins)))
         kx = collect(range(c_min[1], stop=c_max[1], length=n_grid))
         ky = collect(range(c_min[2], stop=c_max[2], length=n_grid))
         centers = [(x, y) for x in kx, y in ky][:]
+
         for m in 1:min(nbins, length(centers))
-            dx = coords[:, 1] .- centers[m][1]
-            dy = coords[:, 2] .- centers[m][2]
-            r = sqrt.(dx.^2 .+ dy.^2)
+            # Normalized distances relative to anisotropic scales
+            # This warps the radial basis function to match the directional lengthscales
+            dx = (coords[:, 1] .- centers[m][1]) ./ ls_x
+            dy = (coords[:, 2] .- centers[m][2]) ./ ls_y
+            r = sqrt.(dx^2 .+ dy^2)
+            # TPS Kernel: r^2 * log(r)
             B[:, m] .= (r.^2) .* log.(r .+ 1e-6)
         end
 
-    # # 2.3 Random Fourier Features (RFF - Anisotropic Support)
-    # Rationale: Allows independent lengthscales for x and y dimensions (Directional Surfaces).
+    # # 2.3 Anisotropic Random Fourier Features (RFF)
+    # Rationale: Samples frequencies from an anisotropic spectral density.
     elseif type == "rff" || type == "anisotropic"
-        ls_x = get(kwargs, :ls_x, c_std[1])
-        ls_y = get(kwargs, :ls_y, c_std[2])
-        # Sampling directional frequencies
+        # Generate 2D frequencies with directional scaling
+        # Omega[1] is scaled by ls_x; Omega[2] is scaled by ls_y
         Omega = randn(2, nbins)
         Omega[1, :] ./= ls_x
         Omega[2, :] ./= ls_y
+        
         Phi = rand(nbins) .* (2.0 * pi)
+        # Projection: feature_map = sqrt(2/M) * cos(Coords * Omega + Phi)
         B = sqrt(2.0 / nbins) .* cos.((coords * Omega) .+ Phi')
 
-    # # 2.4 2D Fast Fourier Transform (FFT - Spectral Lattice)
+    # # 2.4 2D Fast Fourier Transform (FFT - Anisotropic Spectral Lattice)
+    # Rationale: Periodic decomposition where coordinates are stretched independently.
     elseif type == "fft"
         n_marginal = Int(floor(sqrt(nbins / 2)))
         B = zeros(Float64, n_obs, nbins)
+
+        # Normalize coordinates relative to the independent dimension ranges
         nx = (coords[:, 1] .- c_min[1]) ./ (c_max[1] - c_min[1] + 1e-9)
         ny = (coords[:, 2] .- c_min[2]) ./ (c_max[2] - c_min[2] + 1e-9)
+
         idx = 1
         for mx in 1:n_marginal
             for my in 1:n_marginal
                 if idx + 1 <= nbins
+                    # The spectral lattice now stretches independently based on coordinate normalization
                     B[:, idx]   .= sin.(2.0 * pi * (mx .* nx .+ my .* ny))
                     B[:, idx+1] .= cos.(2.0 * pi * (mx .* nx .+ my .* ny))
                     idx += 2
@@ -8593,6 +8696,303 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
     return B
 end
 
+# # BSTM 3D Smooth Basis & Volumetric Factory [v19.34.0]
+# Timestamp: 2025-10-20 10:00:00
+# Rationale: Finalizing the 3D manifold registry with absolute parity to 1D/2D counterparts.
+# This implementation restores missing Moran, Spherical, and Barycentric methods with full anisotropy support.
+
+function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; kwargs...)
+    # # 1. Initialization and Technical Discovery
+    # coords is expected to be an N x 3 matrix: [dim1, dim2, dim3]
+    n_obs = size(coords, 1)
+
+    # Technical Boundary Discovery: Identifying the range and spread of input dimensions
+    c_min = [minimum(coords[:, 1]), minimum(coords[:, 2]), minimum(coords[:, 3])]
+    c_max = [maximum(coords[:, 1]), maximum(coords[:, 2]), maximum(coords[:, 3])]
+    c_std = [std(coords[:, 1]), std(coords[:, 2]), std(coords[:, 3])] .+ 1e-9
+
+    # Anisotropy Configuration: Extract independent lengthscales if provided, else fallback to marginal std
+    # ls_x, ls_y, and ls_z allow the user to control directional smoothing separately
+    ls_x = get(kwargs, :ls_x, c_std[1])
+    ls_y = get(kwargs, :ls_y, c_std[2])
+    ls_z = get(kwargs, :ls_z, c_std[3])
+
+    # # 2. Manifold Dispatch Registry for Anisotropic Volumetric Surfaces
+
+    # # 2.1 Anisotropic Trivariate P-Splines (Tensor Product Basis)
+    # Rationale: Expands 1D marginal bases into a 3D volumetric grid with directional scaling.
+    if type in ["pspline", "bspline", "smooth"]
+        # n_marginal defines the cubic root resolution to reach total nbins
+        n_marginal = Int(floor(cbrt(nbins)))
+        m_total = n_marginal^3
+        B = zeros(Float64, n_obs, m_total)
+
+        # Marginal Knot Grids: Distributed evenly across the observed ranges
+        kx = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
+        ky = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
+        kz = collect(range(c_min[3], stop=c_max[3], length=n_marginal))
+
+        idx = 1
+        for i in 1:n_marginal
+            for j in 1:n_marginal
+                for k in 1:n_marginal
+                    # Tensor product of anisotropic radial marginals
+                    bx = exp.(-((coords[:, 1] .- kx[i]).^2) ./ (2.0 * ls_x^2))
+                    by = exp.(-((coords[:, 2] .- ky[j]).^2) ./ (2.0 * ls_y^2))
+                    bz = exp.(-((coords[:, 3] .- kz[k]).^2) ./ (2.0 * ls_z^2))
+                    B[:, idx] .= bx .* by .* bz
+                    idx += 1
+                end
+            end
+        end
+
+    # # 2.2 Volumetric Random Fourier Features (RFF)
+    # Rationale: Samples frequencies from an anisotropic 3D spectral density.
+    elseif type == "rff"
+        Omega = randn(3, nbins)
+        Omega[1, :] ./= ls_x
+        Omega[2, :] ./= ls_y
+        Omega[3, :] ./= ls_z
+        
+        Phi = rand(nbins) .* (2.0 * pi)
+        B = sqrt(2.0 / nbins) .* cos.((coords * Omega) .+ Phi')
+
+    # # 2.3 3D Fast Fourier Transform (FFT - Anisotropic Spectral Lattice)
+    # Rationale: Volumetric periodic decomposition where coordinates are stretched independently.
+    elseif type == "fft"
+        n_marginal = Int(floor(cbrt(nbins / 2)))
+        B = zeros(Float64, n_obs, nbins)
+
+        # Normalize coordinates relative to the independent dimension ranges
+        nx = (coords[:, 1] .- c_min[1]) ./ (c_max[1] - c_min[1] + 1e-9)
+        ny = (coords[:, 2] .- c_min[2]) ./ (c_max[2] - c_min[2] + 1e-9)
+        nz = (coords[:, 3] .- c_min[3]) ./ (c_max[3] - c_min[3] + 1e-9)
+
+        idx = 1
+        for mx in 1:n_marginal
+            for my in 1:n_marginal
+                for mz in 1:n_marginal
+                    if idx + 1 <= nbins
+                        # Periodic projection respecting the volume stretching
+                        B[:, idx]   .= sin.(2.0 * pi * (mx .* nx .+ my .* ny .+ mz .* nz))
+                        B[:, idx+1] .= cos.(2.0 * pi * (mx .* nx .+ my .* ny .+ mz .* nz))
+                        idx += 2
+                    end
+                end
+            end
+        end
+
+    # # 2.4 Volumetric Spherical Basis (Compact Support Anisotropy)
+    # Rationale: Ensures interaction drops to zero beyond directional ranges.
+    elseif type == "spherical"
+        n_grid = Int(floor(cbrt(nbins)))
+        m_total = n_grid^3
+        B = zeros(Float64, n_obs, m_total)
+
+        # Inducing landmarks via 3D mesh
+        ix = collect(range(c_min[1], stop=c_max[1], length=n_grid))
+        iy = collect(range(c_min[2], stop=c_max[2], length=n_grid))
+        iz = collect(range(c_min[3], stop=c_max[3], length=n_grid))
+        centers = [(x, y, z) for x in ix, y in iy, z in iz][:]
+
+        for m in 1:min(m_total, length(centers))
+            # Normalized Mahalanobis-like distance for anisotropy
+            dx = (coords[:, 1] .- centers[m][1]) ./ ls_x
+            dy = (coords[:, 2] .- centers[m][2]) ./ ls_y
+            dz = (coords[:, 3] .- centers[m][3]) ./ ls_z
+            h = sqrt.(dx.^2 .+ dy.^2 .+ dz.^2)
+            
+            # Spherical Kernel with directional compact support
+            mask = h .< 1.0
+            B[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
+        end
+
+    # # 2.5 3D Moran's I Spectral Basis
+    # Rationale: Captures volumetric non-linearities at specific scales using Sine basis proxy.
+    elseif type == "moran"
+        B = zeros(Float64, n_obs, nbins)
+        for m in 1:nbins
+            # Multi-scale spectral filters for 3D volumes
+            arg = (coords[:, 1] ./ ls_x) .+ (coords[:, 2] ./ ls_y) .+ (coords[:, 3] ./ ls_z)
+            B[:, m] .= sin.(pi * m .* arg ./ 3.0)
+        end
+
+    # # 2.6 Barycentric Volumetric Interpolation (Tetrahedral Proxy)
+    # Rationale: Piecewise linear interaction for 3D scattered data.
+    elseif type == "barycentric" || type == "triangulation"
+        n_grid = Int(floor(cbrt(nbins)))
+        m_total = n_grid^3
+        B = zeros(Float64, n_obs, m_total)
+        ix = quantile(coords[:, 1], range(0, 1, length=n_grid))
+        iy = quantile(coords[:, 2], range(0, 1, length=n_grid))
+        iz = quantile(coords[:, 3], range(0, 1, length=n_grid))
+        centers = [(x, y, z) for x in ix, y in iy, z in iz][:]
+
+        for m in 1:min(m_total, length(centers))
+            # Standard 3D Hat Basis (Trilinear interpolation proxy)
+            dist_x = abs.(coords[:, 1] .- centers[m][1]) ./ ls_x
+            dist_y = abs.(coords[:, 2] .- centers[m][2]) ./ ls_y
+            dist_z = abs.(coords[:, 3] .- centers[m][3]) ./ ls_z
+            B[:, m] .= max.(0.0, 1.0 .- dist_x) .* max.(0.0, 1.0 .- dist_y) .* max.(0.0, 1.0 .- dist_z)
+        end
+
+    # # 2.7 Technical Fallback
+    else
+        B = ones(n_obs, 1)
+    end
+
+    return B
+end
+ 
+
+# # BSTM Hyper-Volumetric Factory & Entry Point [v19.36.0]
+# Timestamp: 2025-10-30 10:00:00
+# Rationale: Expanding the 4D manifold registry to include advanced methods: Spherical, Moran, and Barycentric.
+# Requirement: Absolute parity with the v06.1 Taxonomy. Ensures non-truncated hyper-volumetric surfaces.
+
+function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; kwargs...)
+    # # 1. Initialization and Hyper-Dimensional Discovery
+    # coords is expected to be an N x 4 matrix: [dim1, dim2, dim3, dim4]
+    n_obs = size(coords, 1)
+
+    # Technical Boundary Discovery: Identifying the hyper-cube extents
+    c_min = [minimum(coords[:, 1]), minimum(coords[:, 2]), minimum(coords[:, 3]), minimum(coords[:, 4])]
+    c_max = [maximum(coords[:, 1]), maximum(coords[:, 2]), maximum(coords[:, 3]), maximum(coords[:, 4])]
+    c_std = [std(coords[:, 1]), std(coords[:, 2]), std(coords[:, 3]), std(coords[:, 4])] .+ 1e-9
+
+    # Anisotropy Configuration: Independent lengthscales for 4 dimensions
+    ls_1 = get(kwargs, :ls_1, c_std[1])
+    ls_2 = get(kwargs, :ls_2, c_std[2])
+    ls_3 = get(kwargs, :ls_3, c_std[3])
+    ls_4 = get(kwargs, :ls_4, c_std[4])
+
+    # # 2. Manifold Dispatch Registry for 4D Latent Fields
+
+    # # 2.1 4D Anisotropic P-Splines (Tensor Product)
+    if type in ["pspline", "bspline", "smooth"]
+        n_marginal = Int(floor(sqrt(sqrt(nbins))))
+        m_total = n_marginal^4
+        B = zeros(Float64, n_obs, m_total)
+
+        k1 = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
+        k2 = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
+        k3 = collect(range(c_min[3], stop=c_max[3], length=n_marginal))
+        k4 = collect(range(c_min[4], stop=c_max[4], length=n_marginal))
+
+        idx = 1
+        for i in 1:n_marginal
+            for j in 1:n_marginal
+                for k in 1:n_marginal
+                    for l in 1:n_marginal
+                        b1 = exp.(-((coords[:, 1] .- k1[i]).^2) ./ (2.0 * ls_1^2))
+                        b2 = exp.(-((coords[:, 2] .- k2[j]).^2) ./ (2.0 * ls_2^2))
+                        b3 = exp.(-((coords[:, 3] .- k3[k]).^2) ./ (2.0 * ls_3^2))
+                        b4 = exp.(-((coords[:, 4] .- k4[l]).^2) ./ (2.0 * ls_4^2))
+                        B[:, idx] .= b1 .* b2 .* b3 .* b4
+                        idx += 1
+                    end
+                end
+            end
+        end
+
+    # # 2.2 4D Random Fourier Features (Spectral Anisotropy)
+    elseif type == "rff"
+        Omega = randn(4, nbins)
+        Omega[1, :] ./= ls_1
+        Omega[2, :] ./= ls_2
+        Omega[3, :] ./= ls_3
+        Omega[4, :] ./= ls_4
+        Phi = rand(nbins) .* (2.0 * pi)
+        B = sqrt(2.0 / nbins) .* cos.((coords * Omega) .+ Phi')
+
+    # # 2.3 4D Fast Fourier Transform (Spectral Lattice)
+    elseif type == "fft"
+        n_marginal = Int(floor(sqrt(sqrt(nbins / 2))))
+        B = zeros(Float64, n_obs, nbins)
+        nx1 = (coords[:, 1] .- c_min[1]) ./ (c_max[1] - c_min[1] + 1e-9)
+        nx2 = (coords[:, 2] .- c_min[2]) ./ (c_max[2] - c_min[2] + 1e-9)
+        nx3 = (coords[:, 3] .- c_min[3]) ./ (c_max[3] - c_min[3] + 1e-9)
+        nx4 = (coords[:, 4] .- c_min[4]) ./ (c_max[4] - c_min[4] + 1e-9)
+        idx = 1
+        for m1 in 1:n_marginal
+            for m2 in 1:n_marginal
+                for m3 in 1:n_marginal
+                    for m4 in 1:n_marginal
+                        if idx + 1 <= nbins
+                            arg = m1 .* nx1 .+ m2 .* nx2 .+ m3 .* nx3 .+ m4 .* nx4
+                            B[:, idx]   .= sin.(2.0 * pi * arg)
+                            B[:, idx+1] .= cos.(2.0 * pi * arg)
+                            idx += 2
+                        end
+                    end
+                end
+            end
+        end
+
+    # # 2.4 4D Spherical Basis (Anisotropic Compact Support)
+    # Rationale: Ensures latent correlation is zero beyond hyper-volumetric directional ranges.
+    elseif type == "spherical"
+        n_marginal = Int(floor(sqrt(sqrt(nbins))))
+        m_total = n_marginal^4
+        B = zeros(Float64, n_obs, m_total)
+        k1 = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
+        k2 = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
+        k3 = collect(range(c_min[3], stop=c_max[3], length=n_marginal))
+        k4 = collect(range(c_min[4], stop=c_max[4], length=n_marginal))
+        centers = [(w, x, y, z) for w in k1, x in k2, y in k3, z in k4][:]
+        for m in 1:min(m_total, length(centers))
+            d1 = (coords[:, 1] .- centers[m][1]) ./ ls_1
+            d2 = (coords[:, 2] .- centers[m][2]) ./ ls_2
+            d3 = (coords[:, 3] .- centers[m][3]) ./ ls_3
+            d4 = (coords[:, 4] .- centers[m][4]) ./ ls_4
+            h = sqrt.(d1.^2 .+ d2.^2 .+ d3.^2 .+ d4.^2)
+            mask = h .< 1.0
+            B[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
+        end
+
+    # # 2.5 4D Moran's I Spectral Basis
+    # Rationale: Hyper-dimensional multi-scale filtering using spectral Sine proxy.
+    elseif type == "moran"
+        B = zeros(Float64, n_obs, nbins)
+        for m in 1:nbins
+            arg = (coords[:, 1] ./ ls_1) .+ (coords[:, 2] ./ ls_2) .+ (coords[:, 3] ./ ls_3) .+ (coords[:, 4] ./ ls_4)
+            B[:, m] .= sin.(pi * m .* arg ./ 4.0)
+        end
+
+    # # 2.6 4D Barycentric Interpolation (Hyper-Tetrahedral Proxy)
+    # Rationale: Piecewise linear interaction across irregular 4D scattered data.
+    elseif type == "barycentric" || type == "triangulation"
+        n_marginal = Int(floor(sqrt(sqrt(nbins))))
+        m_total = n_marginal^4
+        B = zeros(Float64, n_obs, m_total)
+        k1 = quantile(coords[:, 1], range(0, 1, length=n_marginal))
+        k2 = quantile(coords[:, 2], range(0, 1, length=n_marginal))
+        k3 = quantile(coords[:, 3], range(0, 1, length=n_marginal))
+        k4 = quantile(coords[:, 4], range(0, 1, length=n_marginal))
+        centers = [(w, x, y, z) for w in k1, x in k2, y in k3, z in k4][:]
+        for m in 1:min(m_total, length(centers))
+            dw = abs.(coords[:, 1] .- centers[m][1]) ./ ls_1
+            dx = abs.(coords[:, 2] .- centers[m][2]) ./ ls_2
+            dy = abs.(coords[:, 3] .- centers[m][3]) ./ ls_3
+            dz = abs.(coords[:, 4] .- centers[m][4]) ./ ls_4
+            B[:, m] .= max.(0.0, 1.0 .- dw) .* max.(0.0, 1.0 .- dx) .* max.(0.0, 1.0 .- dy) .* max.(0.0, 1.0 .- dz)
+        end
+
+    # # 2.7 Technical Fallback
+    else
+        B = ones(n_obs, 1)
+    end
+
+    return B
+end
+
+
+#!Reference
+
+#Reference section ends
+
+
+
 
 function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
     # 1. Formula Scope Discovery
@@ -8609,6 +9009,7 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
     opt_dict[:model_time] = "none"
     opt_dict[:model_season] = "none"
     opt_dict[:model_st] = "none"
+    opt_dict[:use_dynamics] = false
 
     # Internal Technical Registries
     # Rationale: These containers must be explicitly managed to prevent truncation during the loop.
@@ -8624,9 +9025,12 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
         type = mod[:type]
         vars_list = mod[:variables]
         params = mod[:params]
+        
+        # Standardizing the variable count for smooth manifold dispatch
+        n_vars = length(vars_list)
 
         if type == "smooth"
-            if length(vars_list) == 1
+            if n_vars == 1
                 # 3.1 Smooth Module (1D Basis Splines)
                 var_sym = vars_list[1]
                 if hasproperty(data, var_sym)
@@ -8637,21 +9041,59 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
                     basis_matrices_registry[var_sym] = bstm_smooth_basis_1D(manifold_type_str, vals, nb, deg; params...)
                 end
 
-            elseif length(vars_list) == 2
+            elseif n_vars == 2
                 # 3.2 Smooth 2D Spectral Surface
-                if length(vars_list) == 2
-                    v1, v2 = vars_list[1], vars_list[2]
-                    if hasproperty(data, v1) && hasproperty(data, v2)
-                        nb = get(params, :nbins, 25) # Resolution of 2D grid
-                        manifold = string(get(params, :manifold, "rff"))
-                        coords = Matrix{Float64}(data[!, [v1, v2]])
-                        B_2d = bstm_smooth_basis_2D(manifold, coords, nb; params...)
-                        # Register as interaction term for the supervisor
-                        push!(interaction_terms_registry, (
-                            var1=v1, var2=v2, manifold=Symbol(manifold), M_rff=size(B_2d, 2),
-                            basis_mat=B_2d
-                        ))
-                    end
+                v1 = vars_list[1]
+                v2 = vars_list[2]
+                if hasproperty(data, v1) && hasproperty(data, v2)
+                    nb = get(params, :nbins, 25) # Resolution of 2D grid
+                    manifold = string(get(params, :manifold, "rff"))
+                    coords = Matrix{Float64}(data[!, [v1, v2]])
+                    B_2d = bstm_smooth_basis_2D(manifold, coords, nb; params...)
+                    # Register as interaction term for the supervisor
+                    push!(interaction_terms_registry, (
+                        var1=v1, var2=v2, manifold=Symbol(manifold), M_rff=size(B_2d, 2),
+                        basis_mat=B_2d
+                    ))
+                end
+
+            # Case C: 3D Smooth (Volumetric Fields) - RESTORED
+            elseif n_vars == 3
+                v1 = vars_list[1]
+                v2 = vars_list[2]
+                v3 = vars_list[3]
+                if hasproperty(data, v1) && hasproperty(data, v2) && hasproperty(data, v3)
+                    nb = get(params, :nbins, 64) # Increased resolution for 3D grids
+                    manifold = string(get(params, :manifold, "pspline"))
+                    coords = Matrix{Float64}(data[!, [v1, v2, v3]])
+                    
+                    # DELEGATION: Calling the 3D basis factory
+                    B_3d = bstm_smooth_basis_3D(manifold, coords, nb; params...)
+                    
+                    # Hoist into the basis registry for the supervisor assembly
+                    basis_matrices_registry[Symbol(string(v1,"_",v2,"_",v3))] = B_3d
+                    println("BSTM Registry: Volumetric 3D Smooth registered for ", vars_list)
+                end
+
+            # Case D: 4D Smooth (Hyper-Volumetric Latent Field)
+            elseif n_vars == 4
+                v1 = vars_list[1]
+                v2 = vars_list[2]
+                v3 = vars_list[3]
+                v4 = vars_list[4]
+                if hasproperty(data, v1) && hasproperty(data, v2) && hasproperty(data, v3) && hasproperty(data, v4)
+                    nb = get(params, :nbins, 81)
+                    manifold = string(get(params, :manifold, "pspline"))
+                    coords = Matrix{Float64}(data[!, [v1, v2, v3, v4]])
+                    basis_matrices_registry[Symbol(join(string.(vars_list), "_"))] = bstm_smooth_basis_4D(manifold, coords, nb; params...)
+                end
+            end
+ 
+            # AUDIT: Merging inline hyperpriors for smooth effect
+            if haskey(params, :hyperpriors)
+                local_p = params[:hyperpriors] isa Symbol ? Main.eval(params[:hyperpriors]) : params[:hyperpriors]
+                if local_p isa Dict
+                    for (hp_k, hp_v) in local_p; opt_dict[:hyperpriors][string(hp_k)] = hp_v; end
                 end
             end
 
@@ -8671,14 +9113,18 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
                     push!(mixed_terms_registry, (name=group_var, lhs=lhs, indices=indices, n_cat=length(levels)))
                 end
             end
-
+ 
         # 3.4 Mechanistic Population Dynamics
         elseif type == "dynamics"
-            opt_dict[:use_dynamics] = true
+         opt_dict[:use_dynamics] = true
             opt_dict[:dynamics_var] = vars_list[1]
             for dp in [:K, :r, :m0, :q1, :bpsd, :mlim]
-                if haskey(params, dp)
-                    opt_dict[dp] = params[dp]
+                if haskey(params, dp); opt_dict[dp] = params[dp]; end
+            end
+            if haskey(params, :hyperpriors)
+                local_priors = params[:hyperpriors] isa Symbol ? Main.eval(params[:hyperpriors]) : params[:hyperpriors]
+                if local_priors isa Dict
+                    for (hp_k, hp_v) in local_priors; opt_dict[:hyperpriors][string(hp_k)] = hp_v; end
                 end
             end
 
@@ -8702,7 +9148,7 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
             if haskey(params, :W)
                 opt_dict[:W] = params[:W] isa Symbol ? get(opt_dict, params[:W], Main.eval(params[:W])) : params[:W]
             end
-
+ 
         # 3.7 Temporal Trend Discovery
         elseif type == "temporal"
             manifold_raw = get(params, :manifold, "ar1")
@@ -8758,7 +9204,6 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
     # Delegates to the options factory to build structural templates.
     return bstm_options(; opt_dict...)
 end
- 
 
 
 function bstm(formula::Union{String, StatsModels.FormulaTerm}, data_input::Union{DataFrame, NamedArray};
@@ -9740,60 +10185,123 @@ end
 
 
  
+# # BSTM Monolithic Prediction & Projection Engine [v19.38.6 - World-Class Forensic Restoration]
+# Timestamp: 2025-11-06 10:00:00
+# Rationale: Updating out-of-sample projection to support 1D-4D smooths, nested supervisors, and mixed effects.
+# Requirements: 100% parity with v19.38.5 Results Dashboard. Zero-truncation of latent manifolds.
 
 function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100, alpha=0.05)
-    # Out-of-Sample Prediction Engine
-    # Rationale: Projects latent manifolds onto new spatiotemporal coordinates.
-    # Requirement: Verbatim interoperability with bstm_options and _reconstruct.
-    # This method enables the projection of recovered latent manifolds onto previously unseen data points. 
-    # **Technical Requirements:**
-    # 1. **Manifold Mapping**: For discrete manifolds (ICAR/Leroux), new locations must be mapped to existing units via nearest-neighbor centroid lookup.
-    # 2. **Kernel Projection**: For continuous manifolds (GP/RFF), we utilize the basis functions and lengthscales to project the surface.
-    # 3. **Coordinate Consistency**: The method must accept a new `DataFrame`, extract coordinates, and apply the same scaling/transformations used during training.
+    # Description: Primary engine for projecting recovered latent manifolds onto new spatiotemporal coordinates.
+    # Rationale: Standardizing the out-of-sample path to support the full BSTM v06.1 Taxonomy.
 
-    println("--- Starting BSTM Out-of-Sample Prediction ---")
+    println("--- Starting World-Class BSTM Out-of-Sample Prediction v19.38.6 ---")
 
-    # 1. Recover Training Metadata (M)
-    local M_train = model_obj.args.M
-    local N_samples_total = size(chain, 1)
-    local N_samps = min(n_samples, N_samples_total)
-    
-    # 2. Configure Prediction Metadata (PS)
-    # We utilize bstm_options to ensure the new data is formatted identically to training data.
-    # Note: we use dummy responses as y_obs is not used during the projection phase.
-    local PS = bstm_options(
+    # # 1. Training Metadata Recovery
+    # Rationale: M contains the configuration and technical registry established during the modular config pass.
+    M_train = model_obj.args.M
+    n_samples_total = size(chain, 1)
+    n_samps = n_samples_total < n_samples ? n_samples_total : n_samples
+
+    # # 2. Prediction Metadata Configuration (PS)
+    # Rationale: PSU utilizes bstm_options to ensure the new data is formatted identically to training data.
+    # Note: Dummy responses are used as y_obs is not utilized during the projection phase.
+    PS = bstm_options(
         data = new_data,
         y_obs = zeros(nrow(new_data)),
         model_family = M_train.model_family,
         model_space = M_train.model_space,
         model_time = M_train.model_time,
+        model_season = get(M_train, :model_season, "none"),
         svc_covariates = M_train.svc_covariates,
-        use_sv = M_train.use_sv
+        use_sv = M_train.use_sv,
+        model_arch = get(M_train, :model_arch, "univariate")
     )
 
-    # 3. Centroid Alignment for Discrete Manifolds
-    # If the training model used areal units, we map new points to the nearest training centroid.
-    if haskey(M_train, :areal_units)
-        local centroids = M_train.areal_units.centroids
-        PS_s_idx = [argmin([sum(((new_data.s_x[i], new_data.s_y[i]) .- c).^2) for c in centroids]) for i in 1:nrow(new_data)]
-        # Update PS with aligned indices
-        PS = merge(PS, (s_idx = PS_s_idx,))
+    # # 3. Manifold Coordinate Alignment
+    # Rationale: Aligning out-of-sample points with the training grid for discrete and continuous manifolds.
+    
+    # Case A: Centroid Alignment for Discrete Manifolds (ICAR/BYM2/Mosaic)
+    # If the training model utilized areal units, we map new points to the nearest training centroid.
+    if haskey(M_train, :centroids) && !isnothing(M_train.centroids)
+        centroids_train = M_train.centroids
+        # Standardizing coordinates from new_data
+        nx = hasproperty(new_data, :s_x) ? new_data.s_x : zeros(nrow(new_data))
+        ny = hasproperty(new_data, :s_y) ? new_data.s_y : zeros(nrow(new_data))
+        
+        PS_s_idx = Int[]
+        for i in 1:nrow(new_data)
+            # Find nearest neighbor in the training unit grid
+            dists = [sum(((nx[i], ny[i]) .- c).^2) for c in centroids_train]
+            push!(PS_s_idx, argmin(dists))
+        end
+        
+        # Injecting aligned indices into the PS metadata
+        PS_mut = Dict(pairs(PS))
+        PS_mut[:s_idx] = PS_s_idx
+        PS = NamedTuple(PS_mut)
     end
 
-    # 4. Invoke Architectural Reconstruction
-    # We treat the new data as a Post-Stratification (PS) object within the existing _reconstruct logic.
-    # This allows us to reuse the stable manifold retrieval and assembly code.
-    local arch_type = get_architecture(get(M_train, :model_arch, "univariate"))
-    
-    # Selecting a subset of samples for efficiency if requested
-    local chain_sub = chain[1:N_samps]
-    
-    # _reconstruct(arch, name, chain, M_training, PS_new_data, alpha)
-    local res = _reconstruct(arch_type, "prediction", chain_sub, M_train, PS, alpha)
+    # # 4. Hyper-Volumetric Basis Projection (1D-4D)
+    # Rationale: Reconstructing basis matrices (Splines/RFF/FFT) for new coordinates.
+    if haskey(M_train, :basis_matrices) && !isempty(M_train.basis_matrices)
+        ps_basis_registry = Dict{Symbol, Any}()
+        for (v_sym, B_train) in M_train.basis_matrices
+            # We discover the dimensionality of the smooth (1D-4D)
+            # and invoke the corresponding factory for the new coordinate grid.
+            v_str = string(v_sym)
+            vars = Symbol.(split(v_str, "_"))
+            n_vars = length(vars)
+            
+            nb = size(B_train, 2)
+            
+            if n_vars == 1
+                ps_basis_registry[v_sym] = bstm_basis_factory("pspline", new_data[!, vars[1]], nb, 3)
+            elseif n_vars == 2
+                coords_new = Matrix{Float64}(new_data[!, vars])
+                ps_basis_registry[v_sym] = bstm_interaction_factory("rff", coords_new, nb)
+            elseif n_vars == 3
+                coords_new = Matrix{Float64}(new_data[!, vars])
+                ps_basis_registry[v_sym] = bstm_smooth_basis_3D("pspline", coords_new, nb)
+            elseif n_vars == 4
+                coords_new = Matrix{Float64}(new_data[!, vars])
+                ps_basis_registry[v_sym] = bstm_smooth_basis_4D("pspline", coords_new, nb)
+            end
+        end
+        # Update PS with the projected basis matrices
+        PS_mut = Dict(pairs(PS))
+        PS_mut[:basis_matrices] = ps_basis_registry
+        PS = NamedTuple(PS_mut)
+    end
 
-    println("Prediction Complete. Generated samples for ", nrow(new_data), " observations.")
+    # # 5. Architectural Dispatch for Latent Recovery
+    # Rationale: Utilizing the validated _reconstruct engine to assemble the prediction tensor.
+    raw_arch = get(M_train, :model_arch, "univariate")
+    arch_type = if raw_arch == "univariate"
+        UnivariateArchitecture()
+    elseif raw_arch == "multivariate"
+        MultivariateArchitecture()
+    elseif raw_arch == "multifidelity" || raw_arch == "nested"
+        MultifidelityArchitecture()
+    else
+        UnivariateArchitecture()
+    end
 
-    return res
+    # Subset the chain for the requested number of samples
+    chain_sub = chain[1:n_samps]
+
+    # Rationale: _reconstruct treats PS as a grid for Post-Stratification, 
+    # which is mathematically equivalent to out-of-sample prediction.
+    res = _reconstruct(arch_type, "prediction_projection", chain_sub, M_train, PS, alpha)
+
+    println("--- Projection Complete [Observations: ", nrow(new_data), "] ---")
+
+    return (
+        predictions_denoised = res.predictions_denoised,
+        predictions_noisy = res.predictions_noisy,
+        pstats = res,
+        PS = PS,
+        centroids = haskey(PS, :s_coord) ? PS.s_coord : nothing
+    )
 end
 
  
@@ -9801,126 +10309,307 @@ end
 # 1. PSIS-LOO Implementation for BSTM
 # Rationale: Standardizing the extraction of log-likelihood matrices to provide 
 # Expected Log Pointwise Predictive Density (ELPD) estimates.
+function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
+    # # BSTM World-Class PSIS-LOO Engine v19.38.6
+    # Description: Calculates the Leave-One-Out Cross-Validation metrics for BSTM manifolds.
+    # Rationale: Standardizing the extraction of log-likelihood matrices to provide ELPD estimates.
+    # Requirements: Absolute parity with the v19.38.6 reconstruction path.
 
-function bstm_loo(chain, model_obj)
-    println("--- Calculating PSIS-LOO for BSTM ---")
-    
-    # Extract log-likelihood matrix [Samples x Observations]
-    # Based on our _reconstruct logic, log_lik is stored in the results object
-    # or can be pulled directly from the chain if using Turing's point_loglikelihoods
-    ### Model Selection Suite (v10.0)
+    println("--- Starting BSTM World-Class PSIS-LOO Audit v19.38.6 ---")
 
-# This suite implements robust Bayesian model comparison tools. While WAIC is a useful heuristic, **LOO-CV (PSIS-LOO)** provides a more reliable estimate of out-of-sample predictive performance by smoothing importance weights. 
+    # # 1. Metadata and Architecture Extraction
+    # Rationale: M contains the configuration and technical registry required for reconstruction.
+    M = model_obj.args.M
+    raw_arch = get(M, :model_arch, "univariate")
 
-# Additionally, we introduce **Bridge Sampling** logic to approximate the Marginal Likelihood, allowing for the calculation of **Bayes Factors** to perform formal hypothesis testing between competing manifold structures.
+    # # 2. Technical Dispatch Resolution
+    # Mapping the configuration string to the architectural dispatch types.
+    arch_type = if raw_arch == "univariate"
+        UnivariateArchitecture()
+    elseif raw_arch == "multivariate"
+        MultivariateArchitecture()
+    elseif raw_arch == "multifidelity" || raw_arch == "nested"
+        MultifidelityArchitecture()
+    else
+        UnivariateArchitecture()
+    end
 
-    local results = _reconstruct(get_architecture(model_obj.args.M.model_arch), "loo_calc", chain, model_obj.args.M, nothing, 0.05)
-    
-    # Use PosteriorStats.loo (assumes log_likelihood array is available)
-    # Note: This requires the log_lik matrix gathered during reconstruction
-    local loo_result = loo(results.log_lik_matrix)
-    
-    display(loo_result)
-    return loo_result
+    # # 3. Latent Manifold Reconstruction for Likelihood Registry
+    # Rationale: _reconstruct generates the [Samples x Observations] log-likelihood matrix.
+    # We utilize alpha for consistent summarization during the recovery phase.
+    println("Audit: Recovering pointwise log-likelihood registry...")
+    res = _reconstruct(arch_type, "loo_recovery", chain, M, nothing, alpha)
+
+    # # 4. Matrix Extraction and Validation
+    # Rationale: Ensuring the log_lik_matrix matches the observation grid dimensions.
+    log_lik = res.log_lik_matrix
+    n_samples, n_obs = size(log_lik)
+
+    println("Audit: Processing ", n_samples, " samples for ", n_obs, " observations.")
+
+    # # 5. PSIS-LOO Calculation via PosteriorStats
+    # Rationale: LOO-CV provides a reliable estimate of out-of-sample predictive performance.
+    loo_result = nothing
+    try
+        loo_result = loo(log_lik)
+    catch e
+        @error "BSTM Selection Error: PSIS-LOO calculation failed. Error: " * string(e)
+        return nothing
+    end
+
+    # # 6. Forensic Report Generation
+    println("\n--- BSTM Model Selection Report [v19.38.6] ---")
+    println("Expected Log Pointwise Predictive Density (ELPD): ", round(loo_result.estimates[:elpd_loo, :estimate], digits=2))
+    println("Effective Number of Parameters (p_loo):          ", round(loo_result.estimates[:p_loo, :estimate], digits=2))
+    println("LOO Information Criterion:                       ", round(loo_result.estimates[:looic, :estimate], digits=2))
+
+    # Check for influential observations (k > 0.7)
+    # Rationale: Identifying data points where the importance weight is unstable.
+    pareto_k = loo_result.pointwise[:pareto_k]
+    influential_count = count(x -> x > 0.7, pareto_k)
+    if influential_count > 0
+        @warn "BSTM Forensic Audit: " * string(influential_count) * " influential observations detected (Pareto k > 0.7)."
+    end
+
+    return (
+        loo_obj = loo_result,
+        metrics = (
+            elpd = loo_result.estimates[:elpd_loo, :estimate],
+            p_loo = loo_result.estimates[:p_loo, :estimate],
+            looic = loo_result.estimates[:looic, :estimate]
+        ),
+        log_lik_matrix = log_lik,
+        pareto_k = pareto_k
+    )
 end
+
+
 
 # 2. Bayes Factor Suite (Manifold Comparison)
-function compare_manifolds(model_a_results, model_b_results)
-    println("--- Manifold Comparison Dashboard ---")
-    
-    # 1. ELPD Comparison
-    local diff_elpd = model_a_results.waic.elpd - model_b_results.waic.elpd
-    
-    # 2. Bayes Factor Approximation
-    # Rationale: Using the Savage-Dickey density ratio or Bridge sampling 
-    # approximation if Marginal Likelihood is available.
-    # For this suite, we provide a structured comparison table.
-    
+
+function compare_manifolds(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])
+    # # BSTM World-Class Model Comparison Engine v19.38.6
+    # Description: Performs formal model selection between two BSTM manifold candidates.
+    # Rationale: Standardizing the assessment of ELPD differences and complexity trade-offs.
+    # Requirements: Absolute parity with the v19.38.6 PSIS-LOO metrics.
+
+    println("--- Starting BSTM World-Class Manifold Comparison v19.38.6 ---")
+
+    # # 1. LOO Object Extraction
+    # Rationale: Extracting the underlying PosteriorStats LOO objects for comparison.
+    loo_a = loo_a_report.loo_obj
+    loo_b = loo_b_report.loo_obj
+
+    # # 2. Formal Selection Metric Calculation
+    # Rationale: The difference in ELPD is the primary metric for out-of-sample performance.
+    # We utilize the compare function from PosteriorStats to compute deltas and standard errors.
+    comparison_stats = nothing
+    try
+        comparison_stats = compare([loo_a, loo_b])
+    catch e
+        @error "BSTM Comparison Error: Selection suite failed. Error: " * string(e)
+        return nothing
+    end
+
+    # # 3. Parameter and Diagnostic Extraction
+    # Rationale: Collecting effective parameter counts (p_loo) to assess complexity.
+    p_loo_a = loo_a_report.metrics.p_loo
+    p_loo_b = loo_b_report.metrics.p_loo
+
+    elpd_a = loo_a_report.metrics.elpd
+    elpd_b = loo_b_report.metrics.elpd
+
+    # # 4. Forensic Comparison Report Generation
+    println("\n--- BSTM Manifold Selection Registry [v19.38.6] ---")
+    println("Model A (", model_names[1], "): ELPD = ", round(elpd_a, digits=2), " | p_loo = ", round(p_loo_a, digits=2))
+    println("Model B (", model_names[2], "): ELPD = ", round(elpd_b, digits=2), " | p_loo = ", round(p_loo_b, digits=2))
+
+    diff_elpd = elpd_a - elpd_b
+    println("\nELPD Delta (A - B): ", round(diff_elpd, digits=2))
+
+    # Interpretation Logic
+    # Rationale: If |diff_elpd| > 4, the difference is generally considered significant.
+    if abs(diff_elpd) > 4.0
+        winning_model = diff_elpd > 0 ? model_names[1] : model_names[2]
+        println("CONCLUSION: ", winning_model, " is statistically preferred based on predictive density.")
+    else
+        println("CONCLUSION: Competing manifold structures provide indistinguishable predictive density.")
+    end
+
+    # # 5. Forensic Table Construction
     comparison_df = DataFrame(
-        Metric = ["ELPD (WAIC)", "Effective Params (p_waic)", "WAIC Score"],
-        Model_A = [model_a_results.waic.elpd, model_a_results.waic.p_waic, model_a_results.waic.waic],
-        Model_B = [model_b_results.waic.elpd, model_b_results.waic.p_waic, model_b_results.waic.waic]
+        Metric = ["ELPD (LOO)", "Effective Parameters (p_loo)", "LOO-IC"],
+        Model_A = [elpd_a, p_loo_a, loo_a_report.metrics.looic],
+        Model_B = [elpd_b, p_loo_b, loo_b_report.metrics.looic]
     )
-    
-    comparison_df[!, :Delta] = comparison_df.Model_A - comparison_df.Model_B
-    
+
+    comparison_df[!, :Delta] = comparison_df.Model_A .- comparison_df.Model_B
+
     display(comparison_df)
-    return comparison_df
+
+    return (
+        comparison_table = comparison_df,
+        elpd_diff = diff_elpd,
+        loo_objects = (loo_a, loo_b)
+    )
 end
 
+function bstm_cv_orchestrator(formula::String, data::DataFrame; method=:kfold, k=5, lolo_var=:s_idx, model_family="gaussian", n_samples=500, sampler=MH(), target_units=nothing, kwargs...)
+    # # BSTM World-Class CV Orchestrator v19.38.8
+    # Description: Performs rigorous cross-validation for spatiotemporal manifolds.
+    # Rationale: Ensuring technical metadata parity across training and testing folds.
+    # Process: Partitioning -> Forensic Coordinate Recovery -> Iterative Training -> Projection -> Accuracy Audit.
 
+    println("--- Starting BSTM World-Class CV Orchestrator v19.38.8 [Method: ", method, "] ---")
 
-function bstm_cv_orchestrator(formula::String, data::DataFrame;
-                             method=:kfold,
-                             k=5,
-                             lolo_var=:s_idx,
-                             model_family="gaussian",
-                             n_samples=500,
-                             sampler=MH(),
-                             kwargs...)
-    # Audited CV Orchestrator [v09.6 Final Coordinate Sync]
-    # Rationale: Ensures s_x and s_y are passed to bstm() to trigger dynamic 
-    # reconstruction of W-matrix (tessellation) for each fold's training set.
-
-    println("--- Starting BSTM Cross-Validation Orchestrator [Method: $method] ---")
-    local N_total = nrow(data)
-    local results_folds = []
-    local folds_indices = []
+    # # 1. Fold Index Discovery
+    # Rationale: Determining the observation subsets for training and testing.
+    # We extract the total number of observations from the provided DataFrame.
+    N_total = nrow(data)
+    results_folds = []
+    folds_indices = []
 
     if method == :kfold
-        local idx_perm = shuffle(1:N_total)
-        local fold_size = floor(Int, N_total / k)
+        # Standard K-Fold Strategy
+        # Rationale: Randomly shuffling indices to ensure i.i.d. partitions across the manifold.
+        idx_perm = shuffle(1:N_total)
+        fold_size = floor(Int, N_total / k)
         for i in 1:k
-            start_idx = (i-1) * fold_size + 1
-            end_idx = i == k ? N_total : i * fold_size
+            start_idx = (i - 1) * fold_size + 1
+            if i == k
+                end_idx = N_total
+            else
+                end_idx = i * fold_size
+            end
+            # Avoiding 'clamp' as per custom system instructions
             push!(folds_indices, idx_perm[start_idx:end_idx])
         end
     elseif method == :lolo
-        local unique_locs = unique(data[!, lolo_var])
+        # Leave-One-Location-Out (LOLO) Strategy
+        # Rationale: Grouping indices by the spatial unit variable to test geographic interpolation.
+        unique_locs = unique(data[!, lolo_var])
         for loc in unique_locs
             push!(folds_indices, findall(x -> x == loc, data[!, lolo_var]))
         end
         k = length(unique_locs)
+        println("LOLO Strategy: Detected ", k, " unique locations for spatial validation.")
+    else
+        error("BSTM CV Error: Unsupported validation method: ", method)
     end
 
+    # # 2. Iterative Validation Suite
+    # Rationale: Processing each fold independently to assess predictive density.
     for i in 1:k
-        println("\n--- Executing Fold $i / $k ---")
-        local test_idx = folds_indices[i]
-        local train_idx = setdiff(1:N_total, test_idx)
-        local train_data = data[train_idx, :]
-        local test_data = data[test_idx, :]
+        println("\n--- Executing Validation Fold ", i, " / ", k, " ---")
 
-        # Propagate training coordinates to trigger build_structure_template internally
-        # We explicitly map s_x and s_y from the DataFrame columns
-        local model_train = bstm(formula, train_data;
-            model_family=model_family,
-            s_x=collect(train_data.s_x),
-            s_y=collect(train_data.s_y),
-            kwargs...)
+        # 2.1 Data Partitioning
+        # Rationale: Isolating the hold-out set from the training geometry.
+        test_idx = folds_indices[i]
+        train_idx = setdiff(1:N_total, test_idx)
+        train_data = data[train_idx, :]
+        test_data = data[test_idx, :]
 
-        local chain_train = sample(model_train, sampler, n_samples, progress=false)
-        local res_pred = predict(model_train, chain_train, test_data; n_samples=n_samples)
+        # 2.2 Forensic Coordinate Recovery
+        # Rationale: We must ensure coordinates are passed to trigger the tessellation engine
+        # for graph-based manifolds within each fold's unique training geometry.
+        # This prevents 'manifold collapse' where all units are mapped to a single index.
+        s_x_train = nothing
+        if hasproperty(train_data, :s_x)
+            s_x_train = collect(train_data.s_x)
+        end
 
-        local y_test_obs = test_data.y_obs
-        local y_test_pred = res_pred.predictions_observed_denoised.mean
+        s_y_train = nothing
+        if hasproperty(train_data, :s_y)
+            s_y_train = collect(train_data.s_y)
+        end
 
-        local rmse = sqrt(mean((y_test_obs .- y_test_pred).^2))
-        local mae = mean(abs.(y_test_obs .- y_test_pred))
-        
-        # Safe R2 calculation
-        local r2 = (length(y_test_obs) > 1 && var(y_test_pred) > 0) ? cor(y_test_obs, y_test_pred)^2 : 0.0
+        # 2.3 Training Phase
+        # Rationale: Utilizing the world-class bstm entry point to build the latent graph.
+        model_train = nothing
+        try
+            # We explicitly calculate target_units based on the unique spatial indices in the fold
+            # if a global target was not provided by the user.
+            calc_target = nothing
+            if isnothing(target_units)
+                calc_target = length(unique(train_data.s_idx))
+            else
+                calc_target = target_units
+            end
 
-        push!(results_folds, (rmse=rmse, mae=mae, r2=r2, fold=i))
-        println("Fold $i Results -> RMSE: ", round(rmse, digits=4))
+            model_train = bstm(
+                formula,
+                train_data,
+                model_family = model_family,
+                s_x = s_x_train,
+                s_y = s_y_train,
+                target_units = calc_target,
+                kwargs...
+            )
+        catch e
+            @error "BSTM CV Error: Model initialization failed for fold " * string(i) * ". Error: " * string(e)
+            continue
+        end
+
+        # 2.4 Posterior Sampling
+        # Rationale: Drawing samples from the latent field posterior.
+        println("Audit: Sampling posterior for fold ", i, "...")
+        # check_model=false is used to ensure stability during the iterative CV pass
+        chain_train = sample(model_train, sampler, n_samples, progress=false, check_model=false)
+
+        # 2.5 Out-of-Sample Prediction
+        # Rationale: Projecting the training manifold onto the held-out test coordinates.
+        res_pred = nothing
+        try
+            res_pred = predict(model_train, chain_train, test_data; n_samples=n_samples)
+        catch e
+            @warn "BSTM CV Warning: Prediction failed for fold " * string(i) * ". Error: " * string(e)
+            continue
+        end
+
+        # 2.6 Accuracy Metric Assessment
+        # Rationale: Quantifying predictive performance in the response domain.
+        y_test_obs = test_data.y
+        y_test_pred = res_pred.predictions_denoised.mean
+
+        # Root Mean Square Error
+        rmse = sqrt(mean((y_test_obs .- y_test_pred).^2))
+        # Mean Absolute Error
+        mae = mean(abs.(y_test_obs .- y_test_pred))
+
+        # Coefficient of Determination (R2)
+        # Rationale: Ensuring non-zero variance before correlation to prevent domain errors.
+        r2 = 0.0
+        if length(y_test_obs) > 1
+            if var(y_test_pred) > 1e-9
+                r2 = cor(y_test_obs, y_test_pred)^2
+            end
+        end
+
+        push!(results_folds, (fold=i, rmse=rmse, mae=mae, r2=r2))
+        println("Fold ", i, " Results -> RMSE: ", round(rmse, digits=4), " | R2: ", round(r2, digits=4))
     end
 
+    # # 3. Final Orchestration Report
+    # Rationale: Aggregating cross-validation performance across all successful folds.
+    if isempty(results_folds)
+        @error "BSTM CV Failure: No folds completed successfully."
+        return nothing
+    end
+
+    final_df = DataFrame(results_folds)
+    mean_rmse = mean(final_df.rmse)
+    mean_r2 = mean(final_df.r2)
+
+    println("\n--- Final Spatiotemporal Cross-Validation Report ---")
+    println("Average RMSE: ", round(mean_rmse, digits=4))
+    println("Average R2:   ", round(mean_r2, digits=4))
+
+    # Return object contains both the high-level summary and the granular fold results
     return (
-        mean_rmse = mean([f.rmse for f in results_folds]),
-        mean_r2 = mean([f.r2 for f in results_folds]),
-        folds = results_folds
+        summary = (rmse = mean_rmse, r2 = mean_r2),
+        fold_results = final_df
     )
 end
-
 
 
 ### 
