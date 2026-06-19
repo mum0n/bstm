@@ -19,7 +19,7 @@ quickactivate(project_directory)
 current_directory =  @__DIR__() 
 print( "Current directory is: ", current_directory, "\n\n" )
 
-  
+
 pkgs_bstm = [
   "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", "SpecialFunctions",
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation", "OrderedCollections",  

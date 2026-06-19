@@ -1536,6 +1536,126 @@ These features modify functionality by introducing varying coefficients or outco
 | **Eigen-Effects** | `ee(y1, y2, model='...')` | `householder` (PCA-based)       | `y1, y2`: Additional outcome-related variables.                       | Incorporates multivariate structure into a univariate model. Reconstructs a latent field based on the PCA decomposition of the provided variables. |                                                                                                                                              |
 | **Fixed Effects** | `fe(var, contrast='...')` | `effects`, `dummy`              | `var`: Categorical or continuous.                                     | Standard regression coefficients. Custom contrasts (like `EffectsCoding`) can be specified for categorical predictors.                             |                                                                                                                                              |
 
+
+```julia
+# # BSTM Extraction Audit [v19.27.1]
+# Objective: Verify the recovery of high-fidelity basis types (Spherical & Moran).
+
+using Random, Statistics, Turing, DataFrames, LinearAlgebra, SparseArrays
+
+println("--- Starting BSTM v19.27.1 High-Fidelity Basis Discovery Audit ---")
+Random.seed!(2027)
+
+# 1. Setup Simulation Environment
+n_obs = 120
+data_audit = DataFrame(
+    y = randn(n_obs),
+    age = rand(n_obs) .* 80.0,
+    pollution = rand(n_obs) .* 100.0,
+    s_idx = ones(Int, n_obs),
+    t_idx = ones(Int, n_obs)
+)
+
+# 2. Invoke BSTM with Superposition of Advanced Basis Types
+println("Audit: Initializing model with Spherical Compact Basis and Moran Spectral Basis...")
+
+model_audit = bstm(
+    "y ~ 1 + smooth(age; nbins=10, manifold='spherical', range=20.0) + smooth(pollution; nbins=8, manifold='moran')",
+    data_audit,
+    model_family = "gaussian",
+    noise = 1e-4
+)
+
+# 3. Registry Assessment
+M_audit = model_audit.args.M
+basis_reg = M_audit.basis_matrices
+
+println("\n--- Registry Discovery Report ---")
+println("Age Basis (Spherical): ", haskey(basis_reg, :age) ? "[FOUND]" : "[MISSING]")
+println("Pollution Basis (Moran): ", haskey(basis_reg, :pollution) ? "[FOUND]" : "[MISSING]")
+
+if haskey(basis_reg, :age) && haskey(basis_reg, :pollution)
+    # Check for compact support in spherical basis
+    # Rationale: Some values should be exactly zero due to the range constraint
+    num_zeros_spherical = count(x -> x == 0.0, basis_reg[:age])
+    
+    println("Spherical Zeros Detected: ", num_zeros_spherical)
+    println("Moran Matrix Size (Expected 120x8): ", size(basis_reg[:pollution]))
+    
+    if num_zeros_spherical > 0
+        println("\nRESULT: AUDIT SUCCESS. Advanced basis types correctly generated with manifold-specific support.")
+    else
+        println("\nRESULT: AUDIT WARNING. Spherical basis generated but range may be too wide for zero-support.")
+    end
+else
+    println("\nRESULT: AUDIT FAILURE. Truncation detected in technical basis registry.")
+end
+
+
+### 2D
+
+using Random, Statistics, Turing, DataFrames, LinearAlgebra, SparseArrays
+
+println("--- Starting BSTM v19.29.2 Interaction Audit ---")
+Random.seed!(2029)
+
+# 1. Setup Simulation (Anisotropic directional interaction)
+n_obs = 200
+lon = rand(n_obs) .* 100.0
+lat = rand(n_obs) .* 20.0 # Note: high variation in x, low in y
+# Signal truth with directional dominance
+eta_truth = sin.(lon ./ 10.0) .* cos.(lat ./ 5.0)
+y_obs = eta_truth .+ randn(n_obs) .* 0.05
+
+data_audit = DataFrame(y = y_obs, lon = lon, lat = lat, s_idx = ones(Int, n_obs), t_idx = ones(Int, n_obs))
+
+# 2. Invoke BSTM with Spherical Compact Support Interaction
+println("Audit Part A: Testing Compactly Supported Spherical Interaction...")
+model_sphere = bstm(
+    "y ~ 1 + interaction(lon, lat; manifold='spherical', range=15.0, nbins=25)",
+    data_audit,
+    model_family = "gaussian",
+    noise = 1e-4
+)
+
+# 3. Invoke BSTM with Anisotropic Spectral Interaction
+println("Audit Part B: Testing Anisotropic Spectral Surface...")
+model_aniso = bstm(
+    "y ~ 1 + interaction(lon, lat; manifold='anisotropic', ls_x=10.0, ls_y=5.0, nbins=30)",
+    data_audit,
+    model_family = "gaussian",
+    noise = 1e-4
+)
+
+# 4. Assessment
+reg_sphere = model_sphere.args.M.interaction_terms
+reg_aniso = model_aniso.args.M.interaction_terms
+
+println("\n--- Interaction Discovery Report ---")
+
+if !isempty(reg_sphere)
+    b_mat = reg_sphere[1].basis_mat
+    num_zeros = count(==(0.0), b_mat)
+    println("Spherical Matrix Zeros (Support check): ", num_zeros)
+    if num_zeros > 0
+        println("RESULT [A]: Spherical compact support verified.")
+    else
+        println("RESULT [A]: WARNING. Spherical kernel not sparse.")
+    end
+end
+
+if !isempty(reg_aniso)
+    b_mat = reg_aniso[1].basis_mat
+    b_std = std(sum(b_mat, dims=2))
+    println("Anisotropic Surface Variation: ", round(b_std, digits=6))
+    if size(b_mat, 2) == 30 && b_std > 1e-4
+        println("RESULT [B]: Anisotropic spectral manifold recovery verified.")
+    end
+end
+
+```
+
+
 ### 4. Global Functionality Modifiers
 
 *   **`model_family`**: Determines the likelihood and link function (`gaussian`, `poisson`, `binomial`, `negbin`, `lognormal`).
@@ -2110,37 +2230,34 @@ inp_df = DataFrame(
 );
    
 
-m = bstm( 
-  formula( y ~ 1 + z + fe(region) + re(s_idx, model='bym2') + re(t_idx, model='ar1') ), 
-  inp_df; 
-  family="poisson",
-  target_units=20
-);
+# formulae are strings, using single quotes are ok but it must be on one line. for multiline triple quotes work cleanly:
+fm = """
+  y ~ 1 + z + Fixed(region) + Spatial(s_idx; manifold='bym2') + Temporal(t_idx; manifold='ar1')
+"""
+
+m = bstm( fm, inp_df; family="poisson", target_units=20 );
 rand(m)
 chn = sample(m, MH(), 200);
 res = model_results_comprehensive(m , chn );
 
 
 # Note: model_arch='multivariate' will look for columns starting with 'y'
-m = bstm(
-  formula( y1 + y2 ~ 1 + z + re(s_idx, model='bym2') ), 
-  inp_df; 
-  model_arch="multivariate", 
-  family="poisson"
-);
+fm = """
+  y1 + y2 ~ 1 + z + re(s_idx, manifold='bym2')
+"""
+
+m = bstm( fm, inp_df; family="poisson" );  
 rand(m)
 chn = sample(m, MH(), 200) ;
 res = model_results_comprehensive(m , chn );
 
 
-# Explicitly specifying the PCA factor architecture for Eigen-Effects
-m = bstm(
-  "y ~ 1 + ee(y1, y2, model='householder')",
-  inp_df,
-  model_arch="univariate",
-  model_type="pca_factor",
-  N_factors=1,
-  family="gaussian")
+# Explicitly specifying the PCA factor architecture for Eigen-Effects via Householder rotations
+fm = """
+  y ~ 1 + z + Fixed(region) + Eigen(y1, y2, w1, w2, w3; N_factors=1)
+"""
+
+m = bstm( fm, inp_df, family="gaussian")
 rand(m)
 
 
