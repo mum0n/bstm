@@ -633,7 +633,70 @@ function bstm(configs::Vector{<:NamedTuple};
     end
 end
 
-function bstm(formula::Union{String, StatsModels.FormulaTerm}, data_input::Union{DataFrame, NamedArray};
+
+function bstm(formula::Union{String, StatsModels.FormulaTerm}, data_input::DataFrames.DataFrame;
+    model_family="gaussian",
+    model_arch="univariate",
+    hyperpriors=Dict{String, Any}(),
+    hyperprior_scheme=:pcpriors,
+    auxiliary_responses=nothing,
+    auxiliary_data=nothing,
+    return_data=false,
+    contrasts=Dict{Symbol, Any}(),
+    kwargs...)
+
+    # Data Normalization
+    # Ensuring the input is a DataFrame for property discovery and index extraction.
+    data = copy(data_input)
+    opt_kwargs = Dict{Symbol, Any}(kwargs)
+    internal_contrasts = copy(contrasts)
+
+    # Formula Extraction
+    # The string representation is passed to the modular config engine for technical decomposition.
+    f_str = string(formula)
+
+    # Metadata Generation via Modular Configuration Engine
+    # The updated bstm_modular_config now dynamically parses variable names from the formula string
+    # to establish the technical mappings for Spatial, Temporal, and Smooth manifolds.
+    inp = bstm_modular_config(f_str, data;
+        model_family = model_family,
+        model_arch = model_arch,
+        hyperpriors = hyperpriors,
+        hyperprior_scheme = hyperprior_scheme,
+        contrasts = internal_contrasts,
+        opt_kwargs...)
+
+    # Auxiliary Response Integration
+    # Handling hierarchical supervisor or multifidelity responses if provided.
+    if auxiliary_responses !== nothing
+        M_mut = Dict{Symbol, Any}(pairs(inp))
+        M_mut[:model_arch] = "multifidelity"
+        M_mut[:auxiliary_responses] = auxiliary_responses
+        M_mut[:auxiliary_data] = auxiliary_data
+        inp = NamedTuple(M_mut)
+    end
+
+    # Pipeline Debugging Gateway
+    if return_data
+        return inp
+    end
+
+    # Architectural Dispatch
+    # Routing the validated metadata to the corresponding Turing model architecture.
+    arch_type = get(inp, :model_arch, "univariate")
+
+    if arch_type == "multivariate"
+        return bstm_multivariate(inp)
+    elseif arch_type == "multifidelity" || arch_type == "nested"
+        return bstm_multifidelity(inp)
+    else
+        return bstm_univariate(inp)
+    end
+end
+
+
+
+function bstm00(formula::Union{String, StatsModels.FormulaTerm}, data_input::Union{DataFrame, NamedArray};
     model_family="gaussian",
     model_arch="univariate",
     hyperpriors=Dict{String, Any}(),
@@ -6622,13 +6685,37 @@ end
 
     # # 8. Primary Spatio-Temporal Innovation Fields
     # Rationale: Standard domain manifolds for geographic and trend dependency.
+    # Spatial Innovation (BYM2, ICAR, Network, or Hyperbolic)
     if M.model_space != "none"
         s_sigma ~ NamedDist(Exponential(1.0), :s_sigma)
-        s_rho = one(T)
-        if Symbol(M.model_space) in [:bym2, :leroux, :sar, :dag]
-            s_rho ~ NamedDist(Beta(1, 1), :s_rho)
+        s_rho_val = one(T)
+        
+        # Parameters for directed flow or curvature
+        extra_param = nothing
+        if Symbol(M.model_space) in [:bym2, :leroux, :sar, :network]
+            s_rho_val ~ NamedDist(Beta(1, 1), :s_rho)
+            extra_param = s_rho_val
+        elseif Symbol(M.model_space) == :hyperbolic
+            # Hyperbolic manifolds utilize the curvature parameter registered in metadata
+            # latent fields defined on non-Euclidean manifolds.
+            # It utilizes a curvature-aware distance kernel to model spatial dependencies where Euclidean geometry is insufficient.
+            extra_param = get(M, :curvature, -1.0)
         end
-        Q_s = recompose_precision(Symbol(M.model_space), M.s_Q_template.matrix, s_sigma, extra_param=s_rho, noise=noise)
+
+        # Precision Recomposition Dispatch
+        # For :network, the dispatcher handles directed flow using the flow_direction flag.
+        # Network Module: This update allows the linear predictor to capture dependencies across directed graphs.
+        # It utilizes the flow_direction parameter (upstream, downstream, or bidirectional) to recompose
+        # asymmetric precision matrices, essential for modeling propagation in topological networks like river systems or supply chains.
+        Q_s = recompose_precision(
+            Symbol(M.model_space), 
+            M.s_Q_template.matrix, 
+            s_sigma; 
+            extra_param = extra_param,
+            noise = noise,
+            flow_direction = get(M, :flow_direction, :bidirectional)
+        )
+
         s_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N), Q_s), :s_latent)
         for i in 1:M.y_N
             eta[i] += s_latent[M.s_idx[i]]
@@ -7791,34 +7878,45 @@ function build_structure_template(type::Symbol, n::Int; scale=true, coords=nothi
     # across all manifold domains. It standardizes scaling and topological initialization.
     # Audit: Fixed SPDE scaling and DAG operator registration; added TPS 2D routing.
 
-    local Q::Matrix{Float64}
-    local sf::Float64 = 1.0
+    Q = Matrix{Float64}(undef, 0, 0)
+    sf = 1.0
 
-    # --- 1. Manifold Dispatch Registry ---
-
-    # Group 1: Identity, Spectral, and Bipartite Primitives
-    # Rationale: These manifolds operate in transformed or group-level spaces.
-    if type in [:iid, :eigen, :bgcn, :nystrom, :rff, :fft, :bspline]
-        Q = Matrix(1.0I, n, n)
+    # Group 0: Null Manifold Handling
+    # If the type is :none, we return a 1x1 identity to satisfy supervisor shapes without overhead
+    if type == :none
+        Q = Matrix(1.0I, 1, 1)
         sf = 1.0
 
-    # Group 2: Graph-Based & Conditionally Autoregressive (CAR)
+    # Group 1: Identity and Spectral Bases
+    # Rationale: These manifolds operate in transformed or group-level spaces.
+    elseif type in [:iid, :eigen, :bgcn, :nystrom, :rff, :fft, :bspline]
+        Q = Matrix(1.0I, n, n)
+        sf = 1.0
+   
+   # Group 2: Graph-Based & CAR Manifolds
     elseif type in [:icar, :besag, :bym2, :leroux, :sar]
         if isnothing(W)
-            error("BSTM Registry Error: Spatial adjacency W required for manifold type :$type")
-        end
-        local D_sp = Diagonal(vec(sum(W, dims=2)))
-        local Q_raw = Matrix(D_sp - W) # Graph Laplacian L
-
-        if scale
-            local evals = eigvals(Q_raw)
-            local nz_ev = filter(x -> x > 1e-6, evals)
-            sf = isempty(nz_ev) ? 1.0 : exp(mean(log.(nz_ev)))
-            Q = Q_raw ./ sf
+            # If W is missing but n=1, fallback to identity instead of error
+            if n <= 1
+                Q = Matrix(1.0I, 1, 1)
+                sf = 1.0
+            else
+                error("BSTM Factory Error: Adjacency matrix W required for manifold :$type with size $n")
+            end
         else
-            Q = Q_raw
-            sf = 1.0
+            D_sp = Diagonal(vec(sum(W, dims=2)))
+            Q_raw = Matrix(D_sp - W)
+            if scale
+                evals = eigvals(Q_raw)
+                nz_ev = filter(x -> x > 1e-6, evals)
+                sf = isempty(nz_ev) ? 1.0 : exp(mean(log.(nz_ev)))
+                Q = Q_raw ./ sf
+            else
+                Q = Q_raw
+                sf = 1.0
+            end
         end
+
 
     # Group 3: Temporal & Higher-Order Intrinsic GMRFs
     elseif type == :ar1
@@ -9010,6 +9108,8 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
     opt_dict[:model_season] = "none"
     opt_dict[:model_st] = "none"
     opt_dict[:use_dynamics] = false
+    opt_dict[:use_sv] = false
+
 
     # Internal Technical Registries
     # Rationale: These containers must be explicitly managed to prevent truncation during the loop.
@@ -9029,7 +9129,63 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
         # Standardizing the variable count for smooth manifold dispatch
         n_vars = length(vars_list)
 
-        if type == "smooth"
+        # Spatial Module Dispatch
+        # Dynamically maps the variable provided in Spatial(var) to the technical spatial index s_idx.
+        if type == "spatial"
+            manifold_id = string(get(params, :manifold, "bym2"))
+            opt_dict[:model_space] = manifold_id
+            
+            if n_vars == 1
+                # Discrete Graph path: the variable is the index column.
+                var_sym = vars_list[1]
+                if hasproperty(data, var_sym)
+                    opt_dict[:s_idx] = Int.(data[!, var_sym])
+                    opt_dict[:s_idx_var] = var_sym
+                end
+            else
+                # Continuous path: variables are coordinates.
+                opt_dict[:s_coord] = Matrix{Float64}(data[!, vars_list])
+            end
+
+            if haskey(params, :W)
+                opt_dict[:W] = params[:W] isa Symbol ? get(opt_dict, params[:W], Main.eval(params[:W])) : params[:W]
+            end 
+       
+        # Temporal Module Dispatch
+        # Dynamically maps the variable provided in Temporal(var) to the technical temporal index t_idx.
+        elseif type == "temporal"
+            manifold_id = string(get(params, :manifold, "ar1"))
+            opt_dict[:model_time] = manifold_id
+            
+            if n_vars == 1
+                var_sym = vars_list[1]
+                if hasproperty(data, var_sym)
+                    time_vals = data[!, var_sym]
+                    # Utilizing time unit utility to extract indices and seasonal components.
+                    tu_meta = assign_time_units(time_vals; time_method="regular")
+                    opt_dict[:t_idx] = tu_meta.t_idx
+                    opt_dict[:u_idx] = tu_meta.u_idx
+                    opt_dict[:t_idx_var] = var_sym
+                    
+                    if manifold_id == "cyclic"
+                        opt_dict[:model_season] = "cyclic"
+                    end
+                end
+            else
+                # time and season
+                opt_dict[:t_idx_var] = vars_list[1]
+                opt_dict[:u_idx_var] = vars_list[2]
+                if manifold_raw isa Union{Tuple, AbstractVector}
+                    opt_dict[:model_time] = string(manifold_raw[1])
+                    if length(manifold_raw) > 1
+                        opt_dict[:model_season] = string(manifold_raw[2])
+                    end
+                else
+                    opt_dict[:model_time] = string(manifold_raw)
+                end
+            end
+     
+        elseif type == "smooth"
             if n_vars == 1
                 # 3.1 Smooth Module (1D Basis Splines)
                 var_sym = vars_list[1]
@@ -9113,7 +9269,32 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
                     push!(mixed_terms_registry, (name=group_var, lhs=lhs, indices=indices, n_cat=length(levels)))
                 end
             end
- 
+        
+        # Process Transport Operator with direct parameter mapping
+        elseif type == "transport"
+            # Routing the manifold to the physics-informed kernel
+            opt_dict[:model_st] = string(get(params, :manifold, "advection_diffusion"))
+
+            # Map spatial and temporal pointers
+            if length(vars_list) >= 2
+                opt_dict[:s_idx_var] = vars_list[1]
+                opt_dict[:t_idx_var] = vars_list[2]
+            end
+
+            # Direct extraction of physical constants for the supervisor
+            # Parameters are mapped from DSL keywords to technical variable names
+            if haskey(params, :velocity)
+                opt_dict[:velocity_phys] = params[:velocity]
+            end
+            if haskey(params, :diffusion_coeff)
+                opt_dict[:diffusion_phys] = params[:diffusion_coeff]
+            end
+
+            # Preservation of hyperpriors for Bayesian constants
+            if haskey(params, :hyperpriors)
+                opt_dict[:hyperpriors] = merge(get(opt_dict, :hyperpriors, Dict()), params[:hyperpriors])
+            end
+
         # 3.4 Mechanistic Population Dynamics
         elseif type == "dynamics"
          opt_dict[:use_dynamics] = true
@@ -9128,56 +9309,46 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
                 end
             end
 
-        # 3.5 Hierarchical Nested Supervisors
+ 
+        # Hierarchical Nested Supervisors
+        # Updated: Parsed out dependent variables from internal formulas
         elseif type == "nested"
-            z_var = string(vars_list[1])
-            nested_manifolds_registry[z_var] = Dict(
-                :formula => get(params, :formula, "$z_var ~ 1"),
+            formula_str = get(params, :formula, "")
+            
+            # If no formula is provided in params, we assume the vars_list[1] is the variable
+            # and default to intercept-only supervisor: z ~ 1
+            if isempty(formula_str)
+                z_var_sym = vars_list[1]
+                z_formula = string(z_var_sym) * " ~ 1"
+            else
+                z_formula = formula_str
+                # Extract dependent variable from LHS of nested formula
+                sides = Base.split(z_formula, "~")
+                z_var_sym = Symbol(strip(sides[1]))
+            end
+
+            nested_manifolds_registry[string(z_var_sym)] = Dict(
+                :formula => z_formula,
                 :data => get(params, :data, :data)
             )
+ 
 
-        # 3.6 Spatial Topology Discovery
-        elseif type == "spatial"
-            manifold_id = string(get(params, :manifold, "bym2"))
-            opt_dict[:model_space] = manifold_id
+        # Process Stochastic Volatility (RFF Projection)
+        elseif type == "volatility"
+            opt_dict[:use_sv] = true
+            opt_dict[:M_rff_sigma] = get(params, :nbins, 20)
+            if haskey(params, :manifold)
+                opt_dict[:model_volatility] = string(params[:manifold])
+            end
+
+        # Process Hyperbolic Embeddings
+        elseif type == "hyperbolic"
+            opt_dict[:model_space] = "hyperbolic"
+            opt_dict[:curvature] = get(params, :curvature, -1.0)
             if length(vars_list) > 1
                 opt_dict[:s_coord] = Matrix{Float64}(data[!, vars_list])
-            else
-                opt_dict[:s_idx_var] = vars_list[1]
             end
-            if haskey(params, :W)
-                opt_dict[:W] = params[:W] isa Symbol ? get(opt_dict, params[:W], Main.eval(params[:W])) : params[:W]
-            end
- 
-        # 3.7 Temporal Trend Discovery
-        elseif type == "temporal"
-            manifold_raw = get(params, :manifold, "ar1")
-            if length(vars_list) == 1
-                time_val = data[!, vars_list[1]]
-                if manifold_raw in ["ar1", "rw1", "rw2", "cyclic"]
-                    tu_meta = assign_time_units(time_val; time_method="regular")
-                    opt_dict[:t_idx] = tu_meta.t_idx
-                    opt_dict[:u_idx] = tu_meta.u_idx
-                    opt_dict[:model_time] = string(manifold_raw)
-                    if manifold_raw == "cyclic"
-                        opt_dict[:model_season] = "cyclic"
-                    end
-                else
-                    opt_dict[:model_time] = string(manifold_raw)
-                    opt_dict[:t_v] = time_val
-                end
-            else  # time and season
-                opt_dict[:t_idx_var] = vars_list[1]
-                opt_dict[:u_idx_var] = vars_list[2]
-                if manifold_raw isa Union{Tuple, AbstractVector}
-                    opt_dict[:model_time] = string(manifold_raw[1])
-                    if length(manifold_raw) > 1
-                        opt_dict[:model_season] = string(manifold_raw[2])
-                    end
-                else
-                    opt_dict[:model_time] = string(manifold_raw)
-                end
-            end
+
         end
     end
 
@@ -9244,6 +9415,8 @@ function bstm(formula::Union{String, StatsModels.FormulaTerm}, data_input::Union
     
     # 3. Metadata Generation via Modular Configuration Engine
     # This call discovers indices, builds templates, and enforces dynamics validation.
+    # The parser within bstm_modular_config has been updated to map arbitrary spatial variables
+    # such as Spatial(county_id) or Spatial(location_index) directly from the formula.
     local inp = bstm_modular_config(f_str, data; 
         model_family = model_family, 
         model_arch = model_arch,

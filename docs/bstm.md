@@ -1353,6 +1353,20 @@ $$\text{eta}_i = M.log\_offset_i + s_{\text{eta}}[M.s_{\text{idx}}[i]] + t_{\tex
 The model's likelihood is defined by `bstm_Likelihood` function, which dispatches based on `M.model_family` (e.g., "gaussian", "poisson", "negbin"). It takes the constructed `eta`, `M.y_obs`, and other parameters (`M.use_zi`, `M.weights`, `phi_zi`, `r_nb`, `y_sigma`, `M.trials`) to compute the log-probability of the observed data given the latent parameters.
 For example, for Poisson data, it would be $Y_i \sim \text{Poisson}(\exp(\eta_i))$, potentially with zero-inflation.
 
+
+*10. Speed*
+
+Complexity Comparison: RFF vs Direct Inference
+
+| Metric | Direct GP (Dense) | GMRF (Sparse Q) | RFF (Spectral) |
+| :--- | :--- | :--- | :--- |
+| **Time Complexity** | $O(N^3)$ | $\approx O(N^{1.5})$ | $O(N \cdot M^2)$ |
+| **Memory Complexity**| $O(N^2)$ | $O(N \cdot \text{fill-in})$ | $O(N \cdot M)$ |
+| **Stationarity** | Flexible | Topology-dependent | Strictly Stationary |
+| **N Scale Limit** | $\approx 5,000$ | $\approx 100,000$ | $1,000,000+$ |
+
+Where $N$ is the number of observations and $M$ is the number of spectral features.
+
 ### References:
 
 *   Besag, J., York, J., & Mollié, A. (1991). Bayesian image restoration, with applications in spatial statistics. *Annals of the Institute of Statistical Mathematics*, 43(1), 1-20.
