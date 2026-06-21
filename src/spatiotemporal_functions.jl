@@ -536,6 +536,8 @@ end
 
 
 const BSTM_MODULE_KEYWORDS = Set([
+    "intercept",
+    "bias", 
     "spatial", 
     "temporal", 
     "smooth",  
@@ -543,6 +545,7 @@ const BSTM_MODULE_KEYWORDS = Set([
     "eigen", 
     "fixed", 
     "mixed",
+    "svc",
     "volatility",
     "network",
     "transport",
@@ -946,12 +949,27 @@ function bstm_options(; kwargs...)
             :s_idx => [:s_idx, :space_idx],
             :t_idx => [:t_idx, :time_idx],
             :u_idx => [:u_idx, :season_idx],
-            :log_offset => [:log_offset, :logoffset],
+            :log_offset => [:log_offset, :logoffset, :log_offsets],
             :weights => [:weights, :wts],
             :trials => [:trials, :n_trials]
         )
+
         for (key, candidates) in keyword_map
-            if !haskey(M, key)
+            # Check if the user explicitly provided a value for the key
+            if haskey(M, key)
+                val = M[key]
+                # Type-Safety Check: Only attempt lookup if the value is a Symbol or String
+                # If it is already a Vector or Matrix, skip to prevent lookup/bounds errors
+                if val isa Symbol || val isa AbstractString
+                    sym_val = Symbol(val)
+                    if sym_val in v_names
+                        M[key] = data[!, sym_val]
+                    else
+                        @warn "Column $sym_val not found in data for parameter $key. Keeping original value."
+                    end
+                end
+            # Fallback to candidates if key is not provided
+            else
                 for cand in candidates
                     if cand in v_names
                         M[key] = data[!, cand]
@@ -961,6 +979,7 @@ function bstm_options(; kwargs...)
             end
         end
     end
+
 
     # Dimensional Validation & Scope Discovery
     if !haskey(M, :y_obs)
@@ -2064,9 +2083,9 @@ function assign_spatial_units(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<
     end
 
     # Update the returned NamedTuple to store s_x and s_y
-    return (centroids=final_centroids, s_idx=new_assigns, polygons=polys_coords,
-            adjacency_edges=v_edges, graph=g, hull_coords=hull_coords,
-            termination_reason=reason, s_x=s_x, s_y=s_y, W=W, s_vals=collect(1:size(W,1)))
+    return (centroids=final_centroids, polygons=polys_coords,
+            adjacency_edges=v_edges, graph=g, W=W, hull_coords=hull_coords,
+            s_idx=new_assigns, s_x=s_x, s_y=s_y, s_vals=collect(1:size(W,1)), termination_reason=reason)
 end
 
 
@@ -2234,13 +2253,18 @@ function assign_spatial_units_inferred(adjacency_matrix; iterations=50, learning
 
     return (
         centroids = final_centroids,
+        polygons = polys_output,
         adjacency_edges = adjacency_edges_output,
         graph = g_final,
-        polygons = polys_output,
-        hull_coords = hull_coords_output
+        W = adjacency_matrix,
+        hull_coords = hull_coords_output,
+        s_idx = collect(1:nAU ),
+        s_x = [c[1] for c in final_centroids[1:nAU]],
+        s_y = [c[2] for c in final_centroids[1:nAU]],
+        s_vals = collect(1:nAU ),
+        termination_reason = "positions inferred from adjacency matrix"
     )
-end
-
+end 
 
  
 # Verbatim copy and refinement of get_polygon_area and get_avt_centroids
@@ -2467,46 +2491,45 @@ end
 
 
 
-function plot_spatial_graph(au; plot_title="Spatial Partitioning", domain_boundary=nothing)
-    # 1. Coordinate Synchronization: Reconstruct tuples for scatter plotting
-    local pts = tuple.(au.s_x, au.s_y)
-
+function plot_spatial_graph(; au=nothing, pts=nothing, plot_title="Spatial Partitioning")
+ 
     # 2. Base Plot Initialization
     plt = Plots.plot(aspect_ratio=:equal, legend=false)
     Plots.title!(plt, plot_title)
 
     # 3. Polygon Geometry Rendering
-    for poly_coords in au.polygons
-        if length(poly_coords) > 2
-            px = [p[1] for p in poly_coords if !isnan(p[1])]
-            py = [p[2] for p in poly_coords if !isnan(p[2])]
-            if !isempty(px) && (px[1], py[1]) != (px[end], py[end])
-                push!(px, px[1])
-                push!(py, py[1])
+        for poly_coords in au[:polygons]
+            if length(poly_coords) > 2
+                px = [p[1] for p in poly_coords if !isnan(p[1])]
+                py = [p[2] for p in poly_coords if !isnan(p[2])]
+                if !isempty(px) && (px[1], py[1]) != (px[end], py[end])
+                    push!(px, px[1])
+                    push!(py, py[1])
+                end
+                Plots.plot!(plt, px, py, seriestype=:shape, fillalpha=0.1, linecolor=:black, lw=0.5)
             end
-            Plots.plot!(plt, px, py, seriestype=:shape, fillalpha=0.1, linecolor=:black, lw=0.5)
-        end
-    end
+        end 
 
-    # 4. Adjacency Graph Edge Rendering
-    for edge in Graphs.edges(au.graph)
-        u, v = Graphs.src(edge), Graphs.dst(edge)
-        p1, p2 = au.centroids[u], au.centroids[v]
-        Plots.plot!(plt, [p1[1], p2[1]], [p1[2], p2[2]], color=:red, lw=1.5, alpha=0.6)
-    end
+    # 4. Adjacency Graph Edge Rendering 
+        for edge in Graphs.edges(au[:graph])
+            u, v = Graphs.src(edge), Graphs.dst(edge)
+            p1, p2 = au[:centroids][u], au[:centroids][v]
+            Plots.plot!(plt, [p1[1], p2[1]], [p1[2], p2[2]], color=:red, lw=1.5, alpha=0.6)
+        end 
 
-    # 5. Scatter Plotting: Points and Centroids
-    Plots.scatter!(plt, [p[1] for p in pts], [p[2] for p in pts],
-        markersize=1, color=:gray, alpha=0.3, label="Points")
-    Plots.scatter!(plt, [c[1] for c in au.centroids], [c[2] for c in au.centroids],
-        markersize=4, color=:blue, markerstrokecolor=:white, label="Centroids")
+    # 5. Scatter Plotting: Data Points and Polygon Centroids
+    if !isnothing(pts)
+        Plots.scatter!(plt, [p[1] for p in pts], [p[2] for p in pts],
+            markersize=1, color=:gray, alpha=0.3, label="Points")
+    end
+ 
+        Plots.scatter!(plt, [c[1] for c in au[:centroids]], [c[2] for c in au[:centroids]],
+            markersize=4, color=:blue, markerstrokecolor=:white, label="Centroids")
 
     # 6. Boundary Constraints
-    if !isnothing(domain_boundary)
-        bx = [p[1] for p in domain_boundary if !isnan(p[1])]
-        by = [p[2] for p in domain_boundary if !isnan(p[2])]
+        bx = [p[1] for p in au[:hull_coords] if !isnan(p[1])]
+        by = [p[2] for p in au[:hull_coords] if !isnan(p[2])]
         Plots.plot!(plt, bx, by, color=:black, lw=2, ls=:dash)
-    end
 
     return plt
 end
@@ -3173,7 +3196,7 @@ end
 
 
 
-function estimate_local_kde_with_extrapolation(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, t_idx, target_ts; grid_res=600, sd_extension_factor=0.25)
+function estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx, target_ts; grid_res=600, sd_extension_factor=0.25)
     """
     Synopsis: Estimates 2D KDE for a specific time slice with extrapolation.
     Inputs:
@@ -3186,9 +3209,7 @@ function estimate_local_kde_with_extrapolation(s_x::AbstractVector{<:Real}, s_y:
     - Tuple (x_grid, y_grid, intensity) where intensity is a matrix.
     """
     # Filter points for the target time slice
-
-    s_coord_tuple = tuple.(s_x, s_y)
-
+ 
     filtered_pts = [p for (i, p) in enumerate(s_coord_tuple) if t_idx[i] == target_ts]
     if isempty(filtered_pts)
         error("No points found for the target time slice $target_ts")
@@ -3263,7 +3284,7 @@ end
 
 
 
-function plot_kde_simple(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}; grid_res=600, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+function plot_kde_simple(s_coord_tuple; grid_res=600, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
     # Internal wrapper for estimate_local_kde_with_extrapolation
     # Description: Generates a simple 2D Heatmap of spatial intensity using Kernel Density Estimation.
     # Inputs:
@@ -3274,9 +3295,7 @@ function plot_kde_simple(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real
     # Outputs:
     #   - A Plots.Plot object (Heatmap with scatter overlay).
     # Using a dummy t_idx of 1s since plotting a static slice
-
-    s_coord_tuple = tuple.(s_x, s_y)
-
+ 
     t_idx_dummy = ones(Int, length(s_coord_tuple))
     x_g, y_g, intensity = estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx_dummy, 1; grid_res=grid_res, sd_extension_factor=sd_extension_factor)
 
@@ -3289,117 +3308,7 @@ function plot_kde_simple(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real
                    markersize=2, markercolor=:white, markeralpha=0.5, label="Points")
     return plt
 end
-
-
-
-
-function scottish_lip_cancer_data_spacetime(n_years::Int=10; rndseed::Int=42)
-    # "expand" scottish lip cancer data to a space-time version
-    # original data source:  https://mc-stan.org/users/documentation/case-studies/icar_stan.html
-
-    Random.seed!(rndseed)
-
-    # Load base spatial data
- # Base Spatial Data for 56 Counties
-    # data source:  https://mc-stan.org/users/documentation/case-studies/icar_stan.html
-
-    nAU = 56
-
-    y_base = [ 9, 39, 11, 9, 15, 8, 26, 7, 6, 20, 13, 5, 3, 8, 17, 9, 2, 7, 9, 7,
-    16, 31, 11, 7, 19, 15, 7, 10, 16, 11, 5, 3, 7, 8, 11, 9, 11, 8, 6, 4,
-    10, 8, 2, 6, 19, 3, 2, 3, 28, 6, 1, 1, 1, 1, 0, 0]
-
-    E_base = [1.4, 8.7, 3.0, 2.5, 4.3, 2.4, 8.1, 2.3, 2.0, 6.6, 4.4, 1.8, 1.1, 3.3, 7.8, 4.6,
-    1.1, 4.2, 5.5, 4.4, 10.5,22.7, 8.8, 5.6,15.5,12.5, 6.0, 9.0,14.4,10.2, 4.8, 2.9, 7.0,
-    8.5, 12.3, 10.1, 12.7, 9.4, 7.2, 5.3,  18.8,15.8, 4.3,14.6,50.7, 8.2, 5.6, 9.3, 88.7,
-    19.6, 3.4, 3.6, 5.7, 7.0, 4.2, 1.8]
-
-    x_base = [16,16,10,24,10,24,10, 7, 7,16, 7,16,10,24, 7,16,10, 7, 7,10,
-    7,16,10, 7, 1, 1, 7, 7,10,10, 7,24,10, 7, 7, 0,10, 1,16, 0,
-    1,16,16, 0, 1, 7, 1, 1, 0, 1, 1, 0, 1, 1,16,10]
-
-    adjacency = [ 5, 9,11,19, 7,10, 6,12, 18,20,28, 1,11,12,13,19,
-    3, 8, 2,10,13,16,17, 6, 1,11,17,19,23,29, 2, 7,16,22, 1, 5, 9,12,
-    3, 5,11, 5, 7,17,19, 31,32,35, 25,29,50, 7,10,17,21,22,29,
-    7, 9,13,16,19,29, 4,20,28,33,55,56, 1, 5, 9,13,17, 4,18,55,
-    16,29,50, 10,16, 9,29,34,36,37,39, 27,30,31,44,47,48,55,56,
-    15,26,29, 25,29,42,43, 24,31,32,55, 4,18,33,45, 9,15,16,17,21,23,25,
-    26,34,43,50, 24,38,42,44,45,56, 14,24,27,32,35,46,47, 14,27,31,35,
-    18,28,45,56, 23,29,39,40,42,43,51,52,54, 14,31,32,37,46,
-    23,37,39,41, 23,35,36,41,46, 30,42,44,49,51,54, 23,34,36,40,41,
-    34,39,41,49,52, 36,37,39,40,46,49,53, 26,30,34,38,43,51, 26,29,34,42,
-    24,30,38,48,49, 28,30,33,56, 31,35,37,41,47,53, 24,31,46,48,49,53,
-    24,44,47,49, 38,40,41,44,47,48,52,53,54, 15,21,29, 34,38,42,54,
-    34,40,49,54, 41,46,47,49, 34,38,49,51,52, 18,20,24,27,56,
-    18,24,30,33,45,55]
-
-    number_neighbours = [4, 2, 2, 3, 5, 2, 5, 1,  6,  4, 4, 3, 4, 3, 3, 6, 6, 6 ,5,
-    3, 3, 2, 6, 8, 3, 4, 4, 4,11,  6, 7, 4, 4, 9, 5, 4, 5, 6, 5,
-    5, 7, 6, 4, 5, 4, 6, 6, 4, 9, 3, 4, 4, 4, 5, 5, 6]
  
-    # Build graph from adjacency info
-
-    N_edges = Integer(length(adjacency) / 2)
-    node1 = fill(0, N_edges)
-    node2 = fill(0, N_edges)
-    i_adjacency = 0
-    i_edge = 0
-    for i in 1:nAU
-        for j in 1:number_neighbours[i]
-            i_adjacency += 1
-            if i < adjacency[i_adjacency]
-                i_edge += 1
-                node1[i_edge] = i
-                node2[i_edge] = adjacency[i_adjacency]
-            end
-        end
-    end
-
-    e = Edge.(node1, node2)
-    g = Graph(e)
-    W = adjacency_matrix(g)
-    # D = diagm(vec(sum(W, dims=2)))
- 
-    au = assign_spatial_units_inferred( W ) # "infer" from the adjacency network (W)
-    pts_base = au.centroids
-    
-    N_total = nAU * n_years
-
-    # 1. Random Walk Trend
-    rw_trend = cumsum(randn(n_years) .* 0.5)
-
-    # 2. Expand Data Vectors
-    y_expanded = repeat(y_base, n_years)
-    E_expanded = repeat(E_base, n_years)
-    x_expanded = repeat(x_base, n_years)
-    t_idx = repeat(1:n_years, inner=nAU)
-    s_coord_tuple = repeat(pts_base, n_years)
-
-    s_x = getindex.(s_coord_tuple, 1)
-    s_y = getindex.(s_coord_tuple, 2)
-
-    # The s_idx is the spatial unit identifier (1 to 56)
-    s_idx = repeat(1:nAU, n_years)
- 
-    # 3. Add Random Walk + Noise to Response
-    # Broadcast rw_trend across years
-    trend_component = repeat(rw_trend, inner=nAU)
-    noise = randn(N_total) .* 0.2
-
-    # Final response: base_y + trend + noise (ensuring positive counts)
-    y_final = floor.(Int, abs.(y_expanded .+ trend_component .+ noise))
-
-    # 4. Final covariate matrix and offsets
-    x_scaled = (x_expanded .- mean(x_expanded)) ./ std(x_expanded)
-    X = Matrix(DataFrame(AFF=x_scaled))
-    log_offset = log.(E_expanded)
-   
-    return (
-        y=y_final, X=X, s_x=s_x, s_y=s_y, log_offset=log_offset, t_idx=t_idx,
-        s_idx=s_idx, n_years=n_years, W=W, au=au
-    )
-end
-  
 
 
 function icar_form(theta, phi, sigma, rho)
@@ -5457,7 +5366,7 @@ function _modular_eta_assembly(N_tot_in, registry, M, PS_in)
                 # Categorize observation context: belong to Training (obs) or Prediction (PS) strata
                 local is_obs = i <= M.y_N
                 
-                # Forensic Guard: Select the correct source for indices and covariates
+                # Select the correct source for indices and covariates
                 local src = is_obs ? M : PS_in
                 local idx = is_obs ? i : i - Int(M.y_N)
 
@@ -5581,7 +5490,7 @@ end
 
 
 
-# # BSTM Monolithic Visualization Engine [v19.38.5 - World-Class Forensic Restoration]
+# # BSTM Monolithic Visualization Engine [v19.38.5 ]
 # Timestamp: 2025-11-05 20:00:00
 # Rationale: Expanding the dashboard to include Mixed Effects, Seasonal Cycles, and 4D smooths.
 # Requirements: 100% parity with v19.38.0 Registry. Zero-truncation of dashboard panels.
@@ -5590,7 +5499,7 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
     # Description: Primary exhaustive dashboard for spatiotemporal manifold verification.
     # Requirement: Scalable grid to accommodate all recovered latent effects (S, T, U, Smooth, Mixed, Nested).
 
-    println("--- Rendering World-Class Forensic Dashboard v19.38.5 [Outcome: ", outcome, "] ---")
+    println("--- Rendering Dashboard v19.38.5 [Outcome: ", outcome, "] ---")
 
     # # 1. Metadata and Result Extraction
     # Rationale: Standardizing the posterior statistics and metadata sources for visualization.
@@ -5623,50 +5532,62 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
 
     # # 3. Panel 2: Spatial Field Mapping
     # Rationale: High-fidelity geographic rendering of structured innovations.
-    if !isnothing(coords)
-        s_field = (pstats.arch isa MultivariateArchitecture || pstats.arch isa MultifidelityArchitecture) ?
-                   pstats.spatial_structured[outcome] : pstats.spatial_structured
+  if !isnothing(coords)
+        s_field = (pstats.arch isa MultivariateArchitecture || pstats.arch isa MultifidelityArchitecture) ? pstats.spatial_structured[outcome] : pstats.spatial_structured
 
         if !isnothing(s_field) && hasproperty(s_field, :mean)
             s_mean = vec(collect(s_field.mean))
-            p_map = Plots.plot(aspect_ratio=:equal, title="Spatial Field", frame=:box)
+            p_map = Plots.plot(aspect_ratio=:equal, title="Spatial Innovation", frame=:box)
 
             if !isnothing(polys) && length(polys) >= length(s_mean)
                 for i in 1:length(s_mean)
                     px = [pt[1] for pt in polys[i]]
                     py = [pt[2] for pt in polys[i]]
                     if !isempty(px) && (px[1], py[1]) != (px[end], py[end])
-                        push!(px, px[1]); push!(py, py[1])
+                        push!(px, px[1])
+                        push!(py, py[1])
                     end
                     Plots.plot!(p_map, px, py, seriestype=:shape, fill_z=s_mean[i], c=:viridis, linecolor=:black, lw=0.2, label=nothing)
                 end
             else
-                cx = [c[1] for c in coords]; cy = [c[2] for c in coords]
+                cx = [c[1] for c in coords]
+                cy = [c[2] for c in coords]
                 Plots.scatter!(p_map, cx, cy, marker_z=vec(s_mean), markersize=4, c=:viridis, label=nothing, colorbar=true)
             end
             push!(plots_list, p_map)
         end
     end
 
-    # # 4. Panel 3: Temporal Trend Recovery
-    # Rationale: 1D trend component with 95% Credible Interval ribbon.
+
+    # Panel: Temporal Trend Recovery
+    # Ensure t_field is correctly extracted for the requested outcome
     t_field = nothing
     if hasproperty(pstats, :temporal_effects)
-        t_field = (pstats.arch isa MultivariateArchitecture || pstats.arch isa MultifidelityArchitecture) ?
-                   pstats.temporal_effects[outcome] : pstats.temporal_effects
-    end
-    if !isnothing(t_field) && !all(isnan, t_field.mean)
-        tm, tl, tu = vec(t_field.mean), vec(t_field.lower), vec(t_field.upper)
-        push!(plots_list, Plots.plot(tm, ribbon=(tm .- tl, tu .- tm), title="Temporal Trend", lw=2, fillalpha=0.2, color=:royalblue, legend=false, xlabel="Time Index"))
+        raw_t = pstats.temporal_effects
+        t_field = (pstats.arch isa MultivariateArchitecture || pstats.arch isa MultifidelityArchitecture) ? raw_t[outcome] : raw_t
     end
 
-    # # 5. Panel 4: RESTORED Seasonal Cycle Visualization
-    # Rationale: Specifically added to visualize periodic components (month, day-of-week).
+    # Robust rendering of longitudinal trend with ribbons
+    if !isnothing(t_field) && hasproperty(t_field, :mean)
+        tm = vec(collect(t_field.mean))
+        tl = vec(collect(t_field.lower))
+        tu = vec(collect(t_field.upper))
+
+        if !isempty(tm) && !all(isnan, tm)
+            p_trend = Plots.plot(tm, ribbon=(tm .- tl, tu .- tm), title="Temporal Trend", lw=2.5, fillalpha=0.25, color=:royalblue, legend=false, xlabel="Time Index", ylabel="Latent Value")
+            push!(plots_list, p_trend)
+        end
+    end
+
+    # Panel: Seasonal Cycle
     if hasproperty(pstats, :seasonal) && !isnothing(pstats.seasonal)
         u_field = pstats.seasonal
-        if !all(isnan, u_field.mean)
-            um, ul, uu = vec(u_field.mean), vec(u_field.lower), vec(u_field.upper)
-            push!(plots_list, Plots.plot(um, ribbon=(um .- ul, uu .- um), title="Seasonal Cycle", lw=2, fillalpha=0.2, color=:forestgreen, legend=false, xlabel="Season Bin"))
+        if hasproperty(u_field, :mean) && !all(isnan, u_field.mean)
+            um = vec(collect(u_field.mean))
+            ul = vec(collect(u_field.lower))
+            uu = vec(collect(u_field.upper))
+            p_seas = Plots.plot(um, ribbon=(um .- ul, uu .- um), title="Seasonal Cycle", lw=2, fillalpha=0.2, color=:forestgreen, legend=false, xlabel="Season Bin")
+            push!(plots_list, p_seas)
         end
     end
 
@@ -5701,13 +5622,23 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
     end
 
     # # 9. Panel 8: Fixed Effect Coefficient Registry
+
+    # Panel: Fixed Effect Forest Plot
+    # Dot-and-whisker style for regression coefficients
     if hasproperty(pstats, :fixed_effects) && !isnothing(pstats.fixed_effects)
         f_field = pstats.fixed_effects
-        if !all(isnan, f_field.mean)
-            fm, fl, fu = vec(f_field.mean), vec(f_field.lower), vec(f_field.upper)
-            push!(plots_list, Plots.bar(fm, yerror=(fm .- fl, fu .- fm), title="Fixed Effect Registry", color=:grey, legend=false, xlabel="Coefficient ID"))
+        if hasproperty(f_field, :mean) && !all(isnan, f_field.mean)
+            fm = vec(f_field.mean)
+            fl = vec(f_field.lower)
+            fu = vec(f_field.upper)
+            n_coeffs = length(fm)
+            # Reverse indices for intuitive top-to-bottom reading in forest plots
+            p_forest = Plots.scatter(fm, 1:n_coeffs, xerror=(fm .- fl, fu .- fm), title="Fixed Effects Registry", xlabel="Coefficient Estimate", ylabel="Index", markersize=5, color=:black, legend=false, yticks=(1:n_coeffs, ["#$i" for i in 1:n_coeffs]))
+            Plots.vline!(p_forest, [0], color=:red, ls=:dash, lw=1)
+            push!(plots_list, p_forest)
         end
     end
+
 
     # # 10. Dashboard Assembly and Layout
     # Rationale: Collating all discovered panels into a unified multi-plot object.
@@ -5724,21 +5655,21 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
 end
 
 
+# # BSTM Results Engine v20.1.5
+# Timestamp: 2025-11-25 14:00:00
+# Description: Standardizes model reporting for metadata, performance metrics, and MCMC diagnostics.
+
 function model_results_comprehensive(model, chain; n_samples=100, alpha=0.05)
-    # # BSTM Monolithic Results Engine v18.1.36
-    # # Rationale: Acts as the primary data-bridge for accuracy assessment and dashboard preparation.
-    # # Requirements: Zero-truncation of technical manifolds; parity with v06.1 registry.
+    println("--- Starting Comprehensive Model Reporting ---")
 
-    println("--- Starting Audited Comprehensive Posterior Reconstruction v18.1.36 [v06.1 Sync] ---")
-
-    # # 1. Metadata and Architecture Extraction
-    # M contains the configuration, data, and spatial units used during sampling.
+    # # Metadata and Architecture Extraction
+    # Rationale: Extracting the technical configuration from the model arguments.
     M = model.args.M
     y_obs = M.y_obs
     raw_arch = get(M, :model_arch, "univariate")
+    model_family = get(M, :model_family, "gaussian")
 
-    # # 2. Technical Dispatch Resolution
-    # Mapping the configuration string to the architectural dispatch types.
+    # Mapping the configuration string to the architectural dispatch types for reconstruction
     arch_type = if raw_arch == "univariate"
         UnivariateArchitecture()
     elseif raw_arch == "multivariate"
@@ -5749,35 +5680,20 @@ function model_results_comprehensive(model, chain; n_samples=100, alpha=0.05)
         UnivariateArchitecture()
     end
 
-    # # 3. Latent Manifold Reconstruction
-    # Executes the architectural-specific reconstruction of every latent component.
-    # This call triggers _reconstruct which includes internal parameter validation for v06.1 types.
+    # # Latent Manifold Reconstruction
+    # Rationale: Executes the architectural-specific reconstruction of every latent component.
+    # The alpha parameter controls the width of the credible intervals (default 95%).
     res = _reconstruct(arch_type, "model_results", chain, M, nothing, alpha)
 
-    # # 4. Spatial Metadata Serialization for Mapping
-    # Recovery of Centroids and Polygons to ensure mapping consistency in the dashboard.
-    centroids = nothing
-    if haskey(M, :areal_units)
-        centroids = M.areal_units.centroids
-    elseif haskey(M, :s_coord)
-        # Convert coordinate matrix to vector of tuples for visualization parity
-        centroids = [(M.s_coord[i, 1], M.s_coord[i, 2]) for i in 1:size(M.s_coord, 1)]
-    end
-
-    polygons = nothing
-    if haskey(M, :areal_units) && hasproperty(M.areal_units, :polygons)
-        polygons = M.areal_units.polygons
-    end
-
-    # # 5. Global Metric Assessment (Denoised Mean vs Observation)
-    # Metrics are calculated using the posterior predictive mean (denoised expectation).
+    # # Performance Metric Assessment
+    # Rationale: Metrics are calculated using the posterior predictive mean (denoised expectation).
     y_pred = res.predictions_denoised.mean
 
     # Flatten for metric consistency across Univariate and Multivariate responses
     y_obs_flat = vec(collect(y_obs))
     y_pred_flat = vec(collect(y_pred))
 
-    # Filter valid (non-NaN) indices to handle missing data or hurdle/truncated branches
+    # Filter valid indices for calculation to handle missing values or NaNs in observed data
     valid_idx = findall(x -> !isnan(x) && !isnothing(x), y_obs_flat)
 
     rmse_val = 0.0
@@ -5787,31 +5703,87 @@ function model_results_comprehensive(model, chain; n_samples=100, alpha=0.05)
         obs_v = y_obs_flat[valid_idx]
         pred_v = y_pred_flat[valid_idx]
 
-        # Root Mean Square Error
+        # Root Mean Square Error (RMSE)
         rmse_val = sqrt(Statistics.mean((obs_v .- pred_v).^2))
 
-        # Pearson r Calculation (Correlation Strength)
+        # Pearson Correlation Coefficient (r)
         try
             r_pearson = Statistics.cor(obs_v, pred_v)
         catch
-            # Handle cases with zero variance in predictions
+            # Handle cases with zero variance in predictions to prevent domain errors
             r_pearson = 0.0
         end
     end
 
-    println("\n--- Quality Metrics ---")
-    println("RMSE: ", round(rmse_val, digits=4))
-    println("Pearson r: ", round(r_pearson, digits=4))
-    println("WAIC Score: ", round(get(res, :waic, 0.0), digits=2))
+    # FlexiChains store timing data in _metadata, not info.
+    # Rationale: Direct access to _metadata keys via Symbol lookup.
+    sampling_time = chain._metadata.sampling_time[]
 
-    # # 6. Final Registry Object Assembly
+    # Standardizing Diagnostic Extraction via DataFrames
+    # Rationale: summarystats(chain) returns a FlexiSummary which is converted to a DataFrame
+    # to ensure column-based indexing for rhat and ess_bulk is stable and type-safe.
+    sum_stats_df = DataFrame(MCMCChains.summarystats(chain))
+    
+    mean_rhat = 1.0
+    min_ess = 0.0
+
+    try
+        # Extraction of diagnostic vectors
+        rhat_vector = sum_stats_df[!, :rhat]
+        ess_bulk_vector = sum_stats_df[!, :ess_bulk]
+        
+        # Robust aggregation ignoring NaNs
+        mean_rhat = Statistics.mean(filter(!isnan, rhat_vector))
+        min_ess = Statistics.minimum(filter(!isnan, ess_bulk_vector))
+    catch
+        # Fallback to standard ess if ess_bulk is absent in the DataFrame schema
+        try
+            ess_alt = sum_stats_df[!, :ess]
+            min_ess = Statistics.minimum(filter(!isnan, ess_alt))
+        catch
+            mean_rhat = 1.0
+            min_ess = 0.0
+        end
+    end
+
+    waic_val = get(res, :waic, 0.0)
+
+    ess_rate = round(min_ess/sampling_time, digits=2)
+
+    # # Displaying the Report
+    println("\n--- Model Metadata ---")
+    println("Architecture:     ", raw_arch)
+    println("Family:           ", model_family)
+    println("Space Component:  ", get(M, :model_space, "none"))
+    println("Time Component:   ", get(M, :model_time, "none"))
+    println("Seasonal Component: ", get(M, :model_season, "none"))
+
+    println("\n--- Performance Metrics ---")
+    println("Compute Time:     ", round(sampling_time, digits=2), " seconds")
+    println("RMSE:             ", round(rmse_val, digits=4))
+    println("Pearson r:        ", round(r_pearson, digits=4))
+    println("WAIC Score:       ", round(waic_val, digits=2))
+
+    println("\n--- MCMC Diagnostics ---")
+    println("Mean R-hat:       ", round(mean_rhat, digits=4))
+    println("Minimum ESS:      ", round(min_ess, digits=2))
+    println("ESS per second:    ", ess_rate)
+
+    # # Final Registry Object Assembly
+    # Rationale: Returning the full set of metrics and reconstructed latent fields.
     return (
-        metrics = (rmse = rmse_val, r_pearson = r_pearson, waic = get(res, :waic, 0.0)),
+        metrics = (
+            rmse = rmse_val, 
+            r_pearson = r_pearson, 
+            waic = waic_val, 
+            rhat = mean_rhat, 
+            ess = min_ess, 
+            ess_rate = ess_rate,
+            sampling_time = sampling_time
+        ),
         pstats = res,
         y_obs = y_obs,
-        centroids = centroids,
-        polygons = polygons,
-        model_family = get(M, :model_family, "gaussian"),
+        model_family = model_family,
         arch = arch_type
     )
 end
@@ -6242,6 +6214,167 @@ function generate_sim_data(s_N=25, t_N=10; rndseed=42)
 
         n_total = n_total
     )
+end
+
+
+function scottish_lip_cancer_data_spacetime(n_years::Int=20, spatial_expansion::Float64=1.5, temporal_expansion::Float64=1.5; rndseed::Int=42, re_create::Bool=false)
+    # BSTM Standard Data Factory v28.3.0
+    # Timestamp: 2025-12-01 15:00:00
+    # Rationale: Resolving symmetry errors in adjacency matrix construction and scoping errors for derived variables.
+
+    cache_path = "data/scottish_lip_cancer_cache.jld2"
+
+    # Check for existing cache and bypass logic unless re_create is explicitly true
+    if isfile(cache_path) && !re_create
+        println("Loading cached dataset from: ", cache_path)
+        data_bundle = JLD2.load(cache_path)
+        return (data_bundle["primary"], data_bundle["nested"])
+    end
+
+    println("Generating new spatiotemporal dataset...")
+    Random.seed!(rndseed)
+
+    # ##########################################################################
+    # PRIMARY DATASET CONSTRUCTION (56 Districts)
+    # scottish lip cancer data to a space-time version
+    # ##########################################################################
+
+    n_districts = 56
+
+    # Canonical neighbor list (undirected counties)
+    neighbor_list = [
+        [5, 9, 11, 19], [7, 10], [6, 12], [18, 20, 28], [1, 11, 12, 13, 19],
+        [3, 8], [2, 10, 13, 16, 17], [6], [1, 11, 17, 19, 23, 29], [2, 7, 16, 22],
+        [1, 5, 9, 12], [3, 5, 11], [5, 7, 17, 19], [31, 32, 35], [25, 29, 50],
+        [7, 10, 17, 21, 22, 29], [7, 9, 13, 16, 19, 29], [4, 20, 28, 33, 55, 56], [1, 5, 9, 13, 17], [4, 18, 55],
+        [16, 29, 50], [10, 16], [9, 29, 34, 36, 37, 39], [27, 30, 31, 44, 47, 48, 55, 56], [15, 26, 29],
+        [26, 29, 42, 43], [24, 31, 32, 55], [4, 18, 33, 45], [9, 15, 16, 17, 21, 23, 25, 26, 34, 43, 50], [24, 38, 42, 44, 45, 56],
+        [14, 24, 27, 32, 35, 46, 47], [14, 27, 31, 35], [18, 28, 45, 56], [23, 29, 39, 40, 42, 43, 51, 52, 54], [14, 31, 32, 37, 46],
+        [23, 37, 39, 41], [23, 35, 36, 41, 46], [30, 42, 44, 49, 51, 54], [23, 34, 36, 40, 41], [34, 39, 41, 49, 52],
+        [36, 37, 39, 40, 46, 49, 53], [26, 30, 34, 38, 43, 51], [26, 29, 34, 42], [24, 30, 38, 48, 49], [28, 30, 33, 56],
+        [31, 35, 37, 41, 47, 53], [24, 31, 46, 48, 49, 53], [24, 44, 47, 49], [38, 40, 41, 44, 47, 48, 52, 53, 54], [15, 21, 29],
+        [34, 38, 42, 54], [34, 40, 49, 54], [41, 46, 47, 49], [34, 38, 49, 51, 52], [18, 20, 24, 27, 56], [18, 24, 30, 33, 45, 55]
+    ]
+
+    # Construct and enforce symmetry for adjacency matrix W
+    W_raw = spzeros(Int, n_districts, n_districts)
+    for i in 1:n_districts
+        for nb in neighbor_list[i]
+            W_raw[i, nb] = 1
+        end
+    end
+    # Symmetric enforcement: W_{ij} = W_{ji}
+    W = sparse(Symmetric(Matrix(W_raw + W_raw')) .> 0)
+
+    # Inferred spatial geometry using force-directed layout
+    au_primary = assign_spatial_units_inferred(W)
+    p_centroids = au_primary.centroids
+    p_hull = au_primary.hull_coords
+
+    # Clayton & Kaldor Reference Values
+    y_orig = [9,39,11,9,15,8,26,7,6,20,13,5,3,8,17,9,2,7,9,7,16,31,11,7,19,15,7,10,16,11,5,3,7,8,11,9,11,8,6,4,10,8,2,6,19,3,2,3,28,6,1,1,1,1,0,0]
+    E_orig = [1.4,8.7,3.0,2.5,4.3,2.4,8.1,2.3,2.0,6.6,4.4,1.8,1.1,3.3,7.8,4.6,1.1,4.2,5.5,4.4,10.5,22.7,8.8,5.6,15.5,12.5,6.0,9.0,14.4,10.2,4.8,2.9,7.0,8.5,12.3,10.1,12.7,9.4,7.2,5.3,18.8,15.8,4.3,14.6,50.7,8.2,5.6,9.3,88.7,19.6,3.4,3.6,5.7,7.0,4.2,1.8]
+    x_orig = [16,16,10,24,10,24,10,7,7,16,7,16,10,24,7,16,10,7,7,10,7,16,10,7,1,1,7,7,10,10,7,24,10,7,7,0,10,1,16,0,1,16,16,0,1,7,1,1,0,1,1,0,1,1,16,10]
+
+    data_primary = DataFrame()
+    for i in 1:n_districts
+        log_off = log.(fill(E_orig[i], n_years))
+        innov = cumsum(randn(n_years) .* 0.1)
+        y_p = floor.(Int, abs.(fill(y_orig[i], n_years) .+ (innov .* 4.0)))
+
+        d_df = DataFrame(
+            district = i,
+            year = 1:n_years,
+            y = y_p,
+            log_offset = log_off,
+            cov1 = fill(x_orig[i], n_years)
+        )
+        # Calculate rate within block to avoid scoping errors
+        d_df.y_rate = d_df.y ./ exp.(d_df.log_offset)
+        append!(data_primary, d_df)
+    end
+
+    # Assign binary response based on grand mean rate
+    data_primary.y_bin = [v > mean(data_primary.y_rate) ? 1 : 0 for v in data_primary.y_rate]
+
+    # Generate correlated covariates
+    data_primary.cov2 = 0.5 .* data_primary.cov1 .+ randn(nrow(data_primary))
+    # Correcting scoping by using the data frame columns
+    data_primary.cov3 = randn(nrow(data_primary)) .* (data_primary.y_rate .^ 2)
+    data_primary.cov4 = randn(nrow(data_primary)) .* log.(data_primary.y_rate .+ 1.0)
+    data_primary.cov5 = randn(nrow(data_primary)) .* exp.(data_primary.y_rate) .* 2.0
+    data_primary.cov6 = randn(nrow(data_primary))
+
+    data_primary.f1 = rand(["A", "B"], nrow(data_primary))
+    data_primary.s_idx = data_primary.district
+    data_primary.s_x =  [c[1] for c in p_centroids[data_primary.s_idx]]
+    data_primary.s_y =  [c[2] for c in p_centroids[data_primary.s_idx]]
+ 
+    au_primary = merge( au_primary, (
+        s_idx = data_primary.s_idx,
+        s_x = [c[1] for c in p_centroids[data_primary.s_idx]],
+        s_y = [c[2] for c in p_centroids[data_primary.s_idx]],
+        s_vals = collect(1:n_districts)
+    ))
+
+    # ##########################################################################
+    # NESTED DATASET CONSTRUCTION (User-Controlled Expansion)
+    # ##########################################################################
+
+    # Spatial domain boundary from primary centroids
+    px = [c[1] for c in p_centroids]
+    py = [c[2] for c in p_centroids]
+    x_min, x_max = minimum(px), maximum(px)
+    y_min, y_max = minimum(py), maximum(py)
+    x_rng, y_rng = x_max - x_min, y_max - y_min
+
+    # Expansion buffer calculations
+    s_buff = (spatial_expansion - 1.0) / 2.0
+    nx_min, nx_max = x_min - s_buff * x_rng, x_max + s_buff * x_rng
+    ny_min, ny_max = y_min - s_buff * y_rng, y_max + s_buff * y_rng
+
+    nt_max = Int(round(n_years * temporal_expansion))
+    n_obs_nested = Int(round(nrow(data_primary) * spatial_expansion * temporal_expansion))
+
+    sx_nested = rand(Uniform(nx_min, nx_max), n_obs_nested)
+    sy_nested = rand(Uniform(ny_min, ny_max), n_obs_nested)
+    time_nested = rand(1:nt_max, n_obs_nested)
+
+    # Spatial Unit Assignment for expanded domain
+    au_nested = assign_spatial_units(sx_nested, sy_nested; target_units=100)
+
+    data_nested = DataFrame(
+        s_x = sx_nested,
+        s_y = sy_nested,
+        year = time_nested,
+        district = au_nested.s_idx
+    )
+
+    # Latent signal generation for nested grid
+    s_lat_n = cumsum(randn(length(au_nested.centroids))) .* 0.3
+    t_lat_n = sin.(collect(1:nt_max) .* (2π/nt_max))
+
+    eta_n = [1.5 + s_lat_n[data_nested.district[i]] + t_lat_n[data_nested.year[i]] for i in 1:n_obs_nested]
+
+    data_nested.y = [rand(Poisson(exp(v))) for v in eta_n]
+    data_nested.y_rate = exp.(eta_n) .+ randn(n_obs_nested) .* 0.2
+    data_nested.y_bin = [v > mean(data_nested.y_rate) ? 1 : 0 for v in data_nested.y_rate]
+
+    data_nested.ncov1 = 0.6 .* eta_n .+ randn(n_obs_nested)
+    data_nested.ncov2 = randn(n_obs_nested) .* exp.(data_nested.y_rate)
+    data_nested.ncov3 = randn(n_obs_nested)
+
+    primary_out = (data=data_primary, au=au_primary )
+
+    nested_out = (data=data_nested, au=au_nested.W )
+
+    # Directory check and caching
+    if !isdir("data"); mkdir("data"); end
+    JLD2.save(cache_path, "primary", primary_out, "nested", nested_out)
+    println("Dataset successfully cached at: ", cache_path)
+
+    return (primary_out, nested_out)
+    # (p_set, n_set) = scottish_lip_cancer_data_spacetime();
 end
 
   
@@ -7242,8 +7375,6 @@ function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M,
     # Rationale: Standardizing the univariate path to support the full 13 technical primitives.
     # Requirements: Parity with v18.1.12 Multivariate and v18.1.11 Multifidelity standards.
 
-    println("--- Modular Univariate Reconstruction v18.1.30 [Forensic Feature Audit] ---")
-
     N_samples = size(chain, 1)
     p_names = string.(FlexiChains.parameters(chain))
 
@@ -7304,7 +7435,7 @@ function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M,
 
     # # 4. Modular Linear Predictor Assembly
     # Rationale: Combines all baseline manifold contributions into the eta tensor.
-    # Forensic Fix: Routes through Method 1 (Null-Safe) to ensure correct coordinate mapping.
+    # Routes through Method 1 (Null-Safe) to ensure correct coordinate mapping.
     eta_tensor = _modular_eta_assembly(N_tot, registry, M, PS)
 
     # # 5. Link-Scale Realization Mapping (Denoised and Noisy)
@@ -7413,8 +7544,6 @@ function _reconstruct(arch::MultivariateArchitecture, modelname::String, chain, 
     # Rationale: Standardizing the multivariate path to support the full 13 technical primitives.
     # Requirements: 100% parity with v18.1.30 Univariate and v06.1 Taxonomy.
 
-    println("--- Modular Multivariate Reconstruction v18.1.35 [Forensic Feature Audit] ---")
-
     N_samples = size(chain, 1)
     outcomes_N = Int(M.outcomes_N)
     p_names = string.(FlexiChains.parameters(chain))
@@ -7499,7 +7628,7 @@ function _reconstruct(arch::MultivariateArchitecture, modelname::String, chain, 
             p_den[:, k, j] .= _apply_link_and_lik(family_str, eta_jk, get(M, :use_zi, false), phi_val, r_val)
 
             # Stochastic Predictive Sampling with Heteroskedastic Surface
-            # Forensic Fix: Handle Vector vs Matrix volatility surfaces for multivariate
+            # Handle Vector vs Matrix volatility surfaces for multivariate
             sig_jk = registry.sv_surface isa Vector ? registry.sv_surface[k][:, j] : registry.sv_surface[:, j]
 
             _, noisy_jk, ll_jk = _process_ll_and_predictions(
@@ -7597,8 +7726,6 @@ function _reconstruct(arch::MultifidelityArchitecture, modelname::String, chain,
     # # BSTM Modular Multifidelity Reconstruction v18.1.35
     # Rationale: Standardizing the multifidelity path to support the full 13 technical primitives.
     # Requirements: 100% parity with v18.1.30 Univariate and v06.1 Taxonomy.
-
-    println("--- Modular Multifidelity Reconstruction v18.1.35 [Forensic Feature Audit] ---")
 
     N_samples = size(chain, 1)
     fidelities = M.fidelities
@@ -7721,9 +7848,7 @@ function _reconstruct(arch::ExampleArchitecture, modelname::String, chain, M, PS
     # # BSTM Modular Example Reconstruction v18.1.35
     # Rationale: Standardizing the example path to support the full 13 technical primitives.
     # Requirements: 100% parity with v18.1.35 Multivariate and v06.1 Taxonomy.
-
-    println("--- Modular Example Reconstruction v18.1.35 [Forensic Feature Audit] ---")
-
+ 
     N_samples = size(chain, 1)
     p_names = string.(FlexiChains.parameters(chain))
 
@@ -8476,63 +8601,95 @@ function recompose_precision(manifold_metadata::NamedTuple, param_val::Real; ext
         noise=noise
     )
 end 
-
-
-# --- BSTM Monolithic Entry Point & Modular Integrator [v19.5.0] ---
-# Timestamp: 2025-05-29 10:00:00
-# Rationale: Integrating bstm_modular_config as the primary engine for formula decomposition.
-# Requirement: Full parity with v06.1 Taxonomy; NO truncation of legacy hyperpriors or architectural logic.
  
-function parse_module_params(params_str::String)
-    # Hardened BSTM Parameter Extractor [v19.17.3 - Tuple Support]
-    # Rationale: Resolving truncation error for complex manifold tuples like manifold=('ar1', 'cyclic').
 
-    local d = Dict{Symbol, Any}()
+
+function parse_module_params(params_str::String)
+    # BSTM Parameter Extractor and Expression Realizer [v20.2.1]
+    # Timestamp: 2025-06-27 15:30:00
+    # Rationale: Resolving the evaluation gap by identifying and executing Julia code strings found in DSL parameters.
+
+    d = Dict{Symbol, Any}()
     if isempty(strip(params_str))
         return d
     end
 
-    # 1. Recursive Pair Extraction
-    # We split by top-level commas while ignoring those nested inside tuples/arrays.
-    pairs = String[]
-    depth = 0
-    current = ""
-    for char in params_str
-        if char in ['(', '[']; depth += 1; end
-        if char in [')', ']']; depth -= 1; end
-        if char == ',' && depth == 0
-            push!(pairs, strip(current))
-            current = ""
-        else
-            current *= char
-        end
-    end
-    push!(pairs, strip(current))
-
-    # 2. Key-Value Parsing
-    for p in pairs
-        if occursin("=", p)
-            parts = Base.split(p, "=", limit=2)
-            key = Symbol(strip(parts[1]))
-            val_raw = strip(parts[2])
-
-            # Handle Tuples/Arrays explicitly
-            if (startswith(val_raw, "(") && endswith(val_raw, ")")) || (startswith(val_raw, "[") && endswith(val_raw, "]"))
-                inner = strip(val_raw[2:end-1])
-                # Remove potential quotes from individual elements
-                vals = strip.(Base.split(inner, ","))
-                d[key] = [strip(v, ['\'', '"']) for v in vals]
-            elseif startswith(val_raw, "'") || startswith(val_raw, "\"")
-                d[key] = strip(val_raw, ['\'', '"'])
-            elseif !isnothing(tryparse(Int, val_raw))
-                d[key] = tryparse(Int, val_raw)
-            elseif !isnothing(tryparse(Float64, val_raw))
-                d[key] = tryparse(Float64, val_raw)
+    # Split at depth zero to handle nested structures correctly
+    function split_params(input::String)
+        parts = String[]
+        depth = 0
+        current_block = ""
+        for char in input
+            if char == '(' || char == '['
+                depth = depth + 1
+            elseif char == ')' || char == ']'
+                depth = depth - 1
+            end
+            if char == ',' && depth == 0
+                push!(parts, strip(current_block))
+                current_block = ""
             else
-                d[key] = Symbol(val_raw)
+                current_block = current_block * char
+            end
+        end
+        if !isempty(strip(current_block))
+            push!(parts, strip(current_block))
+        end
+        return parts
+    end
+
+    pairs = split_params(params_str)
+
+    for entry in pairs
+        if occursin("=", entry)
+            elements = Base.split(entry, "=", limit = 2)
+            param_key = Symbol(strip(elements[1]))
+            param_val_raw = strip(elements[2])
+
+            # Dynamic Expression Realization
+            # If the string contains indexing symbols or call symbols, evaluate it in Main scope.
+            if occursin(r"\[|:|[()]", param_val_raw) && 
+               !(startswith(param_val_raw, "(") && endswith(param_val_raw, ")")) && 
+               !(startswith(param_val_raw, "[") && endswith(param_val_raw, "]"))
+                try
+                    d[param_key] = Main.eval(Meta.parse(param_val_raw))
+                catch e
+                    @warn "BSTM Parser: Could not evaluate expression $param_val_raw. Keeping as string. Error: $e"
+                    d[param_key] = param_val_raw
+                end
+
+            # Collection Handling
+            elseif (startswith(param_val_raw, "(") && endswith(param_val_raw, ")")) || 
+                   (startswith(param_val_raw, "[") && endswith(param_val_raw, "]"))
+                content_inner = strip(param_val_raw[2:end-1])
+                parts_inner = split_params(content_inner)
+                # Map cleaned values or recursively parse if sub-pairs exist
+                d[param_key] = [occursin("=", v) ? parse_module_params(v) : strip(v, ['\'', '"']) for v in parts_inner]
+
+            # String Literals
+            elseif (startswith(param_val_raw, "'") && endswith(param_val_raw, "'")) || 
+                   (startswith(param_val_raw, "\"") && endswith(param_val_raw, "\""))
+                d[param_key] = strip(param_val_raw, ['\'', '"'])
+
+            # Numeric Literals
+            elseif !isnothing(tryparse(Int, param_val_raw))
+                d[param_key] = parse(Int, param_val_raw)
+            elseif !isnothing(tryparse(Float64, param_val_raw))
+                d[param_key] = parse(Float64, param_val_raw)
+
+            # Boolean Literals
+            elseif param_val_raw == "true"
+                d[param_key] = true
+            elseif param_val_raw == "false"
+                d[param_key] = false
+
+            # Symbolic Keywords
+            else
+                d[param_key] = Symbol(param_val_raw)
             end
         end
     end
+
     return d
 end
 
@@ -9083,15 +9240,8 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
 
     return B
 end
-
-
-#!Reference
-
-#Reference section ends
-
-
-
-
+ 
+ 
 function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
     # 1. Formula Scope Discovery
     # Utilizing the recursive parser to decompose the DSL into outcomes and technical modules.
@@ -9113,11 +9263,19 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
 
     # Internal Technical Registries
     # Rationale: These containers must be explicitly managed to prevent truncation during the loop.
+    
     fixed_parts_accumulator = String[]
     mixed_terms_registry = []
     nested_manifolds_registry = Dict{String, Any}()
     basis_matrices_registry = Dict{Symbol, Any}()
     interaction_terms_registry = []
+    svc_covariates_registry = Symbol[]
+    svc_manifolds_registry = Dict{Symbol, Any}()
+    network_registry = Dict{Symbol, Any}()
+    volatility_registry = Dict{Symbol, Any}()
+    transport_registry = Dict{Symbol, Any}()
+    knorrheld_registry = Dict{Symbol, Any}()
+
 
     # 3. Technical Module Resolution Loop
     # Iterates through Spatial, Temporal, Dynamics, Mixed, Smooth modules.
@@ -9129,9 +9287,53 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
         # Standardizing the variable count for smooth manifold dispatch
         n_vars = length(vars_list)
 
+        
+        # Metadata Functional Dispatch
+
+        # Process Bias Module: Replacing legacy Weights(), Trials(), Offsets()
+        if type == "bias"
+            # Handle Weighting
+            if haskey(params, :weight) || haskey(params, :weights)
+                w_val = get(params, :weight, get(params, :weights, nothing))
+                opt_dict[:weights] = w_val
+            end
+            # Handle Offsets
+            if haskey(params, :offsets) || haskey(params, :offset)
+                o_val = get(params, :offsets, get(params, :offset, nothing))
+                opt_dict[:log_offset] = o_val
+            end
+            # Handle Trials (Binomial)
+            if haskey(params, :trials) || haskey(params, :trial)
+                t_val = get(params, :trials, get(params, :trial, nothing))
+                opt_dict[:trials] = t_val
+            end
+
+            # Handle Censoring Bounds
+            if haskey(params, :y_L); opt_dict[:y_lower_bound] = params[:y_L]; end
+            if haskey(params, :y_U); opt_dict[:y_upper_bound] = params[:y_U]; end
+            # Handle Hurdle Thresholds
+            if haskey(params, :hurdle); opt_dict[:hurdle] = params[:hurdle]; end
+ 
+        elseif type == "intercept"
+            # Prior metadata can be extracted from params for Bayesian overrides
+            if !isempty(params)
+                get!(opt_dict, :hyperpriors, Dict{String, Any}())["intercept"] = params
+            end
+
+        # 3.3 Spatially Varying Coefficients (SVC)
+        elseif type == "svc"
+            cov_var = Symbol(mod[:covariate])
+            manifold_call = mod[:manifold_call]
+            push!(svc_covariates_registry, cov_var)
+            # Route the manifold call (e.g., Spatial(district)) to a technical registry
+            svc_manifolds_registry[cov_var] = Dict(
+                :call => manifold_call,
+                :params => params
+            )
+
         # Spatial Module Dispatch
         # Dynamically maps the variable provided in Spatial(var) to the technical spatial index s_idx.
-        if type == "spatial"
+        elseif type == "spatial"
             manifold_id = string(get(params, :manifold, "bym2"))
             opt_dict[:model_space] = manifold_id
             
@@ -9146,10 +9348,12 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
                 # Continuous path: variables are coordinates.
                 opt_dict[:s_coord] = Matrix{Float64}(data[!, vars_list])
             end
-
+     
             if haskey(params, :W)
-                opt_dict[:W] = params[:W] isa Symbol ? get(opt_dict, params[:W], Main.eval(params[:W])) : params[:W]
-            end 
+                w_raw = params[:W]
+                # Priority Evaluation: Realize expression before metadata validation
+                opt_dict[:W] = w_raw isa String ? Main.eval(Meta.parse(w_raw)) : w_raw
+            end
        
         # Temporal Module Dispatch
         # Dynamically maps the variable provided in Temporal(var) to the technical temporal index t_idx.
@@ -9270,6 +9474,21 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
                 end
             end
         
+            
+        # Network Flows and Topology Modules
+        elseif type == "network"
+            net_var = Symbol(vars_list[1])
+            network_registry[net_var] = params
+ 
+        # Separable Space-Time Interactions (Knorr-Held Types I-IV)
+        elseif type == "knorrheld"
+            kh_var = Symbol(vars_list[1])
+            # Registers parameters (e.g. type='IV') for the interaction registry
+            knorrheld_registry[kh_var] = params
+            # Map interaction type to model_st to trigger the correct precision kernel
+            opt_dict[:model_st] = string(get(params, :type, "IV"))
+
+       
         # Process Transport Operator with direct parameter mapping
         elseif type == "transport"
             # Routing the manifold to the physics-informed kernel
@@ -9355,22 +9574,26 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
     # Physics-Informed Transport Detection
     # Checking formula for advection-diffusion transport operators
     if occursin("advection_diffusion", formula)
-        opt_dict[:model_st] = "advection_diffusion"
+        opt_dict[:model_st] =  get(params, :model_st, "advection_diffusion" )
     end
 
     # Knorr-Held Interaction Detection
     # Identifies algebraic Kronecker operators (otimes)
     if occursin("⊗", formula)
-        opt_dict[:model_st] = "IV"
+        opt_dict[:model_st] =  get(params, :model_st, "IV")
     end
 
-    # 4. Monolithic Registry Synchronization
     # Rationale: Finalizing the technical containers to ensure bstm_options receives full metadata.
+    # 4. Monolithic Registry Synchronization
     opt_dict[:basis_matrices] = basis_matrices_registry
     opt_dict[:interaction_terms] = interaction_terms_registry
     opt_dict[:mixed_terms] = mixed_terms_registry
     opt_dict[:nested_manifolds] = nested_manifolds_registry
-    
+    opt_dict[:svc_covariates] = svc_covariates_registry
+    opt_dict[:svc_manifolds] = svc_manifolds_registry
+    opt_dict[:network_metadata] = network_registry
+    opt_dict[:volatility_metadata] = volatility_registry
+
     # Standardizing Fixed Components
     opt_dict[:fixed_parts] = unique(vcat(fixed_parts_accumulator, string.(metadata.fixed_effects)))
     opt_dict[:add_intercept] = metadata.has_intercept
@@ -9462,76 +9685,121 @@ through additive terms to discover latent manifold modules.
 """
 
 function decompose_bstm_formula(formula_str::String)
-    sides = Base.split(formula_str, "~", limit=2)
-    if length(sides) != 2
-        error("BSTM Parser Error: Formula must follow 'lhs ~ rhs' structure.")
+    # BSTM Formula Decomposition Engine v20.46.2
+    # Timestamp: 2025-11-21 16:30:00
+    # Rationale: Feature-complete restoration to support all technical keywords.
+
+    # Split formula into LHS (outcomes) and RHS (latent components)
+    parts = split(formula_str, "~")
+    lhs = strip(parts[1])
+    rhs = strip(parts[2])
+
+    # Outcome Discovery
+    # Standardizes univariate 'y' or multivariate '[y1, y2]' into a list
+    outcomes = String[]
+    if startswith(lhs, "[") && endswith(lhs, "]")
+        content = lhs[2:end-1]
+        outcomes = [strip(s) for s in split(content, ",")]
+    else
+        outcomes = [lhs]
     end
 
-    lhs_raw = strip(sides[1])
-    rhs_raw = strip(sides[2])
-    outcomes = Symbol.(strip.(Base.split(lhs_raw, "+")))
+    # RHS Term Decomposition
+ 
 
-    terms = String[]
-    depth = 0
-    current_term = ""
-
-    for char in rhs_raw
-        if char == '('; depth += 1; elseif char == ')'; depth -= 1; end
-        if char == '+' && depth == 0
-            push!(terms, strip(current_term))
-            current_term = ""
-        else
-            current_term *= char
-        end
-    end
-    push!(terms, strip(current_term))
-
-    modules = Dict{String, Any}()
-    fixed_effects = Symbol[]
-
-    for t in filter(!isempty, terms)
-        m_match = match(r"^(\w+)\((.*?)(?:[;,](.*))?\)$", t)
-
-        if !isnothing(m_match)
-            mod_name = lowercase(m_match.captures[1])
-            vars_raw = strip(m_match.captures[2])
-
-            # Legacy Warning System (v19.22.1)
-            if mod_name == "seasonal"
-                @warn "BSTM Deprecation: 'seasonal()' is deprecated as of v19.22.0. Please use 'temporal(manifold=(..., \'harmonic\'))' for periodic effects."
+    # Split RHS by '+' while ignoring plus signs inside parentheses
+    function split_rhs_terms(input::String)
+        terms = String[]
+        depth = 0
+        current = ""
+        for char in input
+            if char == '('
+                depth += 1
+            elseif char == ')'
+                depth -= 1
             end
-
-            if mod_name in BSTM_MODULE_KEYWORDS
-                mod_vars = mod_name == "fixed" ? [Symbol(vars_raw)] : Symbol.(strip.(Base.split(vars_raw, ",")))
-                mod_params_raw = isnothing(m_match.captures[3]) ? "" : m_match.captures[3]
-                parsed_params = parse_module_params(string(mod_params_raw))
-
-                mod_entry = Dict{Symbol, Any}(
-                    :type => mod_name,
-                    :variables => mod_vars,
-                    :params => parsed_params
-                )
-                
-                key = string(mod_name, "_", mod_vars[1])
-                modules[key] = mod_entry
+            if char == '+' && depth == 0
+                push!(terms, strip(current))
+                current = ""
             else
-                push!(fixed_effects, Symbol(t))
+                current *= char
             end
-        else
-            if t != "0" && t != "-1" && t != "1"
-                push!(fixed_effects, Symbol(t))
+        end
+        if !isempty(strip(current))
+            push!(terms, strip(current))
+        end
+        return terms
+    end
+
+    terms_raw = split_rhs_terms(rhs)
+    modules = Dict{String, Any}()
+    fixed_effects = String[]
+    has_intercept = false
+
+    for term in terms_raw
+        t_clean = strip(term)
+        if t_clean == "1"
+            has_intercept = true
+            continue
+        end
+
+        # Module Discovery Logic
+        is_module = false
+        for kw in BSTM_MODULE_KEYWORDS
+            # Case-insensitive keyword check
+            if startswith(lowercase(t_clean), kw * "(")
+                is_module = true
+                # Extract full content within the module parentheses
+                # Handles nested parentheses (e.g., Spatial(district, manifold='bym2'))
+                m_content = match(Regex(kw * "\\((.*)\\)", "i"), t_clean)
+                
+                if !isnothing(m_content)
+                    inner_str = m_content.captures[1]
+
+                    # Differentiate variables from technical parameters using the ';' delimiter
+                    v_part, p_dict = if occursin(";", inner_str)
+                        sp = split(inner_str, ";")
+                        strip(sp[1]), parse_module_params(String(sp[2]))
+                    else
+                        inner_str, Dict{Symbol, Any}()
+                    end
+
+                    # Keyword-Specific Routing
+                    if kw == "svc" && occursin("|", v_part)
+                        # Spatially Varying Coefficients: "covariate | ManifoldCall"
+                        svc_split = split(v_part, "|")
+                        cov_var = strip(svc_split[1])
+                        manifold_call = strip(svc_split[2])
+
+                        modules["svc_" * cov_var] = Dict(
+                            :type => "svc",
+                            :covariate => cov_var,
+                            :manifold_call => manifold_call,
+                            :params => p_dict
+                        )
+                    else
+                        # Standard modules: extraction of comma-separated variable list
+                        vars_list = [strip(v) for v in split(v_part, ",")]
+                        # Unique registry key based on type and primary variable
+                        modules[kw * "_" * vars_list[1]] = Dict(
+                            :type => kw,
+                            :variables => vars_list,
+                            :params => p_dict
+                        )
+                    end
+                end
+                break
             end
+        end
+
+        # If term is not a module, it is treated as a linear fixed effect
+        if !is_module && !isempty(t_clean)
+            push!(fixed_effects, t_clean)
         end
     end
 
-    return (
-        outcomes = outcomes,
-        modules = modules,
-        fixed_effects = fixed_effects,
-        has_intercept = !("0" in terms || "-1" in terms)
-    )
+    return (outcomes=outcomes, modules=modules, fixed_effects=fixed_effects, has_intercept=has_intercept)
 end
-
  
  
 # --- Comprehensive Manifold Builders and Precision Factories ---
@@ -10076,13 +10344,13 @@ function extract_manifold(m_type::Manifold, chain, M, j, sig, domain::Symbol)
     local field = zeros(n_target)
     local p_names = string.(FlexiChains.parameters(chain))
 
-    # Forensic Discovery: Check for FlexiChains vector object or indexed scalars
+    # Check for FlexiChains vector object or indexed scalars
     if key_prefix in p_names
         # Standard Vector retrieval
         local raw = chain[Symbol(key_prefix)].data[j]
         local flat_raw = vec(collect(raw))
         local n_raw = length(flat_raw)
-        # Forensic Slicing: Ensure raw samples align with target grid to prevent broadcast errors
+        #  Slicing: Ensure raw samples align with target grid to prevent broadcast errors
         field .= flat_raw[1:min(n_raw, n_target)] .* sig
     elseif any(occursin.(Regex("^" * key_prefix * "\\[\\d+\\]"), p_names))
         # Indexed Scalar retrieval using the numerically sorted helper
@@ -10370,7 +10638,7 @@ end
 
 
  
-# # BSTM Monolithic Prediction & Projection Engine [v19.38.6 - World-Class Forensic Restoration]
+# # BSTM Monolithic Prediction & Projection Engine [v19.38.6 ]
 # Timestamp: 2025-11-06 10:00:00
 # Rationale: Updating out-of-sample projection to support 1D-4D smooths, nested supervisors, and mixed effects.
 # Requirements: 100% parity with v19.38.5 Results Dashboard. Zero-truncation of latent manifolds.
@@ -10379,7 +10647,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
     # Description: Primary engine for projecting recovered latent manifolds onto new spatiotemporal coordinates.
     # Rationale: Standardizing the out-of-sample path to support the full BSTM v06.1 Taxonomy.
 
-    println("--- Starting World-Class BSTM Out-of-Sample Prediction v19.38.6 ---")
+    println("--- Starting BSTM Out-of-Sample Prediction v19.38.6 ---")
 
     # # 1. Training Metadata Recovery
     # Rationale: M contains the configuration and technical registry established during the modular config pass.
@@ -10495,12 +10763,12 @@ end
 # Rationale: Standardizing the extraction of log-likelihood matrices to provide 
 # Expected Log Pointwise Predictive Density (ELPD) estimates.
 function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
-    # # BSTM World-Class PSIS-LOO Engine v19.38.6
+    # # BSTM PSIS-LOO Engine v19.38.6
     # Description: Calculates the Leave-One-Out Cross-Validation metrics for BSTM manifolds.
     # Rationale: Standardizing the extraction of log-likelihood matrices to provide ELPD estimates.
     # Requirements: Absolute parity with the v19.38.6 reconstruction path.
 
-    println("--- Starting BSTM World-Class PSIS-LOO Audit v19.38.6 ---")
+    println("--- Starting BSTM PSIS-LOO Audit v19.38.6 ---")
 
     # # 1. Metadata and Architecture Extraction
     # Rationale: M contains the configuration and technical registry required for reconstruction.
@@ -10542,7 +10810,6 @@ function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
         return nothing
     end
 
-    # # 6. Forensic Report Generation
     println("\n--- BSTM Model Selection Report [v19.38.6] ---")
     println("Expected Log Pointwise Predictive Density (ELPD): ", round(loo_result.estimates[:elpd_loo, :estimate], digits=2))
     println("Effective Number of Parameters (p_loo):          ", round(loo_result.estimates[:p_loo, :estimate], digits=2))
@@ -10553,7 +10820,7 @@ function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
     pareto_k = loo_result.pointwise[:pareto_k]
     influential_count = count(x -> x > 0.7, pareto_k)
     if influential_count > 0
-        @warn "BSTM Forensic Audit: " * string(influential_count) * " influential observations detected (Pareto k > 0.7)."
+        @warn "BSTM: " * string(influential_count) * " influential observations detected (Pareto k > 0.7)."
     end
 
     return (
@@ -10573,12 +10840,12 @@ end
 # 2. Bayes Factor Suite (Manifold Comparison)
 
 function compare_manifolds(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])
-    # # BSTM World-Class Model Comparison Engine v19.38.6
+    # # BSTM Model Comparison Engine v19.38.6
     # Description: Performs formal model selection between two BSTM manifold candidates.
     # Rationale: Standardizing the assessment of ELPD differences and complexity trade-offs.
     # Requirements: Absolute parity with the v19.38.6 PSIS-LOO metrics.
 
-    println("--- Starting BSTM World-Class Manifold Comparison v19.38.6 ---")
+    println("--- Starting BSTM Manifold Comparison v19.38.6 ---")
 
     # # 1. LOO Object Extraction
     # Rationale: Extracting the underlying PosteriorStats LOO objects for comparison.
@@ -10604,7 +10871,7 @@ function compare_manifolds(loo_a_report, loo_b_report; model_names=["Model_A", "
     elpd_a = loo_a_report.metrics.elpd
     elpd_b = loo_b_report.metrics.elpd
 
-    # # 4. Forensic Comparison Report Generation
+    # # 4. Report Generation
     println("\n--- BSTM Manifold Selection Registry [v19.38.6] ---")
     println("Model A (", model_names[1], "): ELPD = ", round(elpd_a, digits=2), " | p_loo = ", round(p_loo_a, digits=2))
     println("Model B (", model_names[2], "): ELPD = ", round(elpd_b, digits=2), " | p_loo = ", round(p_loo_b, digits=2))
@@ -10621,7 +10888,7 @@ function compare_manifolds(loo_a_report, loo_b_report; model_names=["Model_A", "
         println("CONCLUSION: Competing manifold structures provide indistinguishable predictive density.")
     end
 
-    # # 5. Forensic Table Construction
+    # # 5. Table Construction
     comparison_df = DataFrame(
         Metric = ["ELPD (LOO)", "Effective Parameters (p_loo)", "LOO-IC"],
         Model_A = [elpd_a, p_loo_a, loo_a_report.metrics.looic],
@@ -10640,12 +10907,12 @@ function compare_manifolds(loo_a_report, loo_b_report; model_names=["Model_A", "
 end
 
 function bstm_cv_orchestrator(formula::String, data::DataFrame; method=:kfold, k=5, lolo_var=:s_idx, model_family="gaussian", n_samples=500, sampler=MH(), target_units=nothing, kwargs...)
-    # # BSTM World-Class CV Orchestrator v19.38.8
+    # # BSTM CV Orchestrator v19.38.8
     # Description: Performs rigorous cross-validation for spatiotemporal manifolds.
     # Rationale: Ensuring technical metadata parity across training and testing folds.
-    # Process: Partitioning -> Forensic Coordinate Recovery -> Iterative Training -> Projection -> Accuracy Audit.
+    # Process: Partitioning -> Coordinate Recovery -> Iterative Training -> Projection -> Accuracy Audit.
 
-    println("--- Starting BSTM World-Class CV Orchestrator v19.38.8 [Method: ", method, "] ---")
+    println("--- Starting BSTM CV Orchestrator v19.38.8 [Method: ", method, "] ---")
 
     # # 1. Fold Index Discovery
     # Rationale: Determining the observation subsets for training and testing.
@@ -10694,7 +10961,7 @@ function bstm_cv_orchestrator(formula::String, data::DataFrame; method=:kfold, k
         train_data = data[train_idx, :]
         test_data = data[test_idx, :]
 
-        # 2.2 Forensic Coordinate Recovery
+        # 2.2 Coordinate Recovery
         # Rationale: We must ensure coordinates are passed to trigger the tessellation engine
         # for graph-based manifolds within each fold's unique training geometry.
         # This prevents 'manifold collapse' where all units are mapped to a single index.
@@ -10709,7 +10976,7 @@ function bstm_cv_orchestrator(formula::String, data::DataFrame; method=:kfold, k
         end
 
         # 2.3 Training Phase
-        # Rationale: Utilizing the world-class bstm entry point to build the latent graph.
+        # Rationale: Utilizing the bstm entry point to build the latent graph.
         model_train = nothing
         try
             # We explicitly calculate target_units based on the unique spatial indices in the fold
@@ -10799,7 +11066,7 @@ end
 
 ### 
 
-# Forensic Advection-Diffusion Operator Registration
+# Advection-Diffusion Operator Registration
 function build_transport_operator(M, velocity, diffusion_coeff)
     # Rationale: Constructs the discretized transport operator on the graph manifold.
     # Requirement: Adjacency matrix W must be non-null for graph-based advection.
@@ -10818,7 +11085,7 @@ function parse_spatial_term(var_name, params_str)
     local p = parse_module_params(params_str)
     local manifold = get(p, :manifold, "bym2")
 
-    # Forensic Logic: Determine if input is index (graph) or coordinates (continuous)
+    # Logic: Determine if input is index (graph) or coordinates (continuous)
     # Graph-based requires W; Coordinate-based requires (x,y) parsing.
     return (variable=var_name, manifold=manifold, params=p)
 end

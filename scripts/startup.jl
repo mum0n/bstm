@@ -9,6 +9,7 @@ if !@isdefined project_directory
     project_directory = joinpath( homedir(), "projects", "bstm" )
 end
 
+cd(project_directory)
 quickactivate(project_directory) 
 
 # the following are now handled by DrWatson.quickactivate()
@@ -21,7 +22,7 @@ print( "Current directory is: ", current_directory, "\n\n" )
 
 
 pkgs_bstm = [
-  "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", "SpecialFunctions",
+  "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", "SpecialFunctions", "DimensionalData",
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation", "OrderedCollections",  
   "Distributions", "Statistics", "MCMCChains", "DataFrames",  "GLM", "FlexiChains", "AbstractPPL",
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",

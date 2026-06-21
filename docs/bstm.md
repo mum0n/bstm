@@ -111,20 +111,20 @@ As a first step towards spatial modelling, we look at a minimal data series: the
   
 ```{julia}  
 
-data_scot = scottish_lip_cancer_data_spacetime(); # additional noise and "fake" time slices added
+data_scot, _ = scottish_lip_cancer_data_spacetime(); # additional noise and "fake" time slices added
 
-# To interact with the data which in the above are known as `::NamedTuple`, here are a few methods:
+# To interact with the data (::NamedTuple), here are a few methods:
 showall( keys(data_scot) )  # show the container's names
 
 pairs(data_scot)  # show the first few elements of each object  
-
-keys( data_scot[:au] )  # areal unit information
-
-data_scot[:W] # the neighbourhood adjacency matrix
  
-plot_spatial_graph( au_scot; plot_title="Lip Cancer Inferred from Adjacency 'Locations'", domain_boundary=au_scot.hull_coords)
+data_scot[:au][:W] # the neighbourhood adjacency matrix
+ 
+plot_spatial_graph( au=data_scot[:au], plot_title="Lip Cancer Inferred from Adjacency 'Locations'")
 
-plot_kde_simple(data_scot.s_coord_tuple, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+pts = tuple.( data_scot[:data][!,:s_x,], data_scot[:data][!,:s_y] )
+
+plot_kde_simple(pts, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
    
 ```
 
@@ -133,70 +133,34 @@ In the tuple (*data_scot*), we have counts (y) of cancer incidence and populatio
 
 #### Spatiotemporal model: the shape of things to come
 
-Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we reformat the data (*data_scot*) with 'bstm_options()' to create a structured data object with the correct variable names and run a simple separable spatiotemporal model (example_bym2_ar1_poisson).  
+Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we format the data (*data_scot*) into a DataFrame with the correct variable names and run a simple separable spatiotemporal model. Note that we use triple quotes (""" ... """)  around the formula to allow multi-line text. Signle quotes are fine but all would need to be on a single line or contatenated by the '*' operator: ("y ~ Spatial() " * " Temporal() ", etc. )  
  
 ```{julia}
-#| label: example_bym2_ar1_poisson - Sparse GMRF Space and time effect (no interaction)   
+#| label: Example - Sparse GMRF Space and time effect (no interaction)   
+ 
+m = bstm( """ 
+  y ~ Intercept() + Spatial(s_idx, manifold='bym2',  W = data_scot[:au][:W] ) + 
+      Temporal(t_idx, manifold='ar1') + Offsets(log_offset) """ , 
+  data_scot[:data], 
+  model_family="poisson"
+)
 
-# prepare model inputs  
-inp_scot = bstm_options( 
-  y_obs = data_scot.y,         # y-value, counts of people with lip cancer
-  s_coord_tuple = data_scot.s_coord_tuple,
-  s_idx = data_scot.s_idx ,  # space index
-  t_idx = data_scot.t_idx,  # time index
-  log_offset = data_scot.log_offset, # offsets, population size on log-scale
-  W = data_scot.W,  # matrix adjacency,
-  model_arch = "univariate",
-  model_family = "poisson",
-  model_space = "bym2",  # example_bym2_ar1_poisson is one of the simplest possible (no space-time interaction)
-  model_time = "ar1",
-  model_st = "none",  # no space-time interactions (main effects only)
-  use_zi = false
-) ;
-
-Random.seed!(42) # Set a seed for reproducibility.
-
-# create model instance
-m = example_bym2_ar1_poisson(inp_scot); # m contains the Turing model object with the data .. ready to run
-
-# sample with Metropolis-Hastings: 
-chn = sample(m, MH(), 10000; num_warmup=1000, thin=20, progress=true, drop_warmup=true )  
-res = model_results_comprehensive(m, chn, inp_scot, au_scot );  # results are "OK" but looks like it has not converged
-
-# showparams( res.summarystats )
-# display(res.plots.ppc)  # there are a few more generic plots (see inside the object)
-# display(res.plots.tm)
-# display(res.plots.denoised)
-
-
-# alternatively, one could use `bstm` which does almost the same thing (it has a bit more overhead to have flexibility, and uses better samplers): 
-Random.seed!(42)
-m = bstm( inp_scot );
-
+  
 os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ; 
 
 inits = get_inits(m) ; 
 
-chn = sample(m, os, 5000; initial_params=inits, progress=true, drop_warmup=true ) ; 
+chn = sample(m, os, 100; initial_params=inits, progress=true, drop_warmup=true ) ; 
 
 StatsPlots.plot(chn[[:s_sigma, :s_rho, :t_sigma, :t_rho]], seriestype=:traceplot)
 
-res = model_results_comprehensive(m, chn, inp_scot, au_scot );  
+res = model_results_comprehensive(m, chn );  
 
-# a little longer to sample but worth the wait ..
+model_results_plots(res,
+    centroids = data_scot[:au][:centroids], 
+    polygons = data_scot[:au][:polygons])
 
-# yet another alternative:
-m = bstm( "y ~ 1 + Spatial(s_idx, manifold='bym2') + Temporal(t_idx, manifold='ar1')", 
-  DataFrame(
-    y = data_scot.y,
-    s_idx = data_scot.s_idx,
-    t_idx = data_scot.t_idx,
-    log_offset = data_scot.log_offset
-  ), 
-  model_family="poisson", 
-  W = data_scot.W
-)
-  
+
 ```
 The results look like this. Not great but that is because, they have not converged yet (rhat is far from 1) and the model is simple: we are ignoring covariates and spatiotemporal interactions. The bstm version does some additional work which slows it down a bit but overall, gives a better posterior predictive check (PPC). 
 
@@ -318,46 +282,6 @@ The notation is similar but with some quirks (that are again easily altered to y
 ### Special Formula Terms
 
 In `bstm` formulas, specific terms are used to trigger high-dimensional manifold structures. These terms tell the pre-processor how to structure the latent fields and connectivity matrices. Here is the main list for those that do not want to wait:
-
-# BSTM Unified Syntax & Manifold Glossary (v05.5)
-
-| Category                 | Feature / Manifold   | Formula Syntax Example                                 | Hyperprior Options                           | Technical Assumption / Math                                                     |                                                                                |
-| :-------------------------| :---------------------| :-------------------------------------------------------| :---------------------------------------------| :--------------------------------------------------------------------------------| --------------------------------------------------------------------------------|
-| **Baseline**             | Intercept            | `1` or `Intercept(prior=...)`                          | `Normal(0, 5)` (Default)                     | Global bias term; additive constant across all dimensions.                      |                                                                                |
-|                          | Fixed Effects        | `covariate_name`                                       | `MvNormal(0, 5*I)`                           | Linear relationship with the link-transformed mean.                             |                                                                                |
-|                          | Mixed Effects        | `Mixed(x \                                             | group)`                                      | `sig_me ~ Exp(1.0)`                                                             | Varying slopes/intercepts drawn from a shared Gaussian prior.                  |
-| **Spatial (Discrete)**   | ICAR                 | `Spatial(s, manifold='icar')`                          | `s_sigma ~ Exp(1.0)`                         | Pure local smoothing using Graph Laplacian $Q$.                                 |                                                                                |
-|                          | Leroux               | `Spatial(s, manifold='leroux')`                        | `s_sigma ~ Exp(1.0)`, `s_rho ~ Beta(1,1)`    | Convex combination $\lambda Q + (1-\lambda)I$ for dependence vs noise.          |                                                                                |
-|                          | BYM2                 | `Spatial(s, manifold='bym2')`                          | `s_sigma ~ Exp(1.0)`, `s_rho ~ Beta(1,1)`    | Standardized ICAR + IID component for stable variance scales.                   |                                                                                |
-|                          | Mosaic               | `Spatial(s, manifold='mosaic')`                        | `mu_local ~ Normal(0, 1)`                    | Piecewise constant field; zero correlation across defined clusters.             |                                                                                |
-|                          | Local-Adaptive       | `Spatial(s, manifold='local')`                         | `local_weights ~ Gamma(2,2)`                 | Smoothing strength varies based on a secondary latent weight field.             |                                                                                |
-|                          | Network Flow         | `Spatial(s, manifold='network')`                       | `s_sigma ~ Exp(1.0)`                         | Asymmetric propagation over directed graphs (e.g., river flow).                 |                                                                                |
-| **Spatial (Continuous)** | Dense GP             | `Spatial(x, y, manifold='gp')`                         | `s_ls ~ InvGamma(3,3)`                       | Exact kernel-based covariance; requires $N \times N$ matrix inversion.          |                                                                                |
-|                          | FITC (Sparse GP)     | `Spatial(x, y, manifold='fitc')`                       | `s_sigma ~ Exp(1.0)`, `st_ls_s ~ Gamma(2,2)` | Inducing point approximation ($M \ll N$) for large-scale continuous fields.     |                                                                                |
-|                          | SVGP                 | `Spatial(x, y, manifold='svgp')`                       | `f_sigma ~ Exp(1.0)`, `m_u ~ Normal(0,1)`    | Stochastic Variational GP; uses variational distributions over inducing points. |                                                                                |
-| **Temporal**             | Random Walk (RW2)    | `Temporal(t, manifold='rw2')`                          | `t_sigma ~ Exp(1.0)`                         | Second-order difference penalty; captures smooth non-linear trends.             |                                                                                |
-|                          | Autoregressive (AR1) | `Temporal(t, manifold='ar1')`                          | `t_rho ~ Beta(2,2)`                          | Mean-reverting stationary process with correlation $\rho$.                      |                                                                                |
-| **Temporal-Seasonal**    | Harmonic             | `Temporal(t, u, manifold=('ar1, 'harmonic'))`          | `u_alpha, u_beta ~ Normal(0,1)`              | Smooth cyclical patterns via Sine/Cosine trigonometric basis.                   |                                                                                |
-|                          | Discrete             | `Temporal(t, u, manifold=('ar1, 'cyclic'), period=12)` | `u_sigma ~ Exp(1.0)`                         | Binned random effects with a hard sum-to-zero constraint.                       |                                                                                |
-| **Spectral / Basis**     | 1D/2D FFT            | `Smooth(x; manifold='fft')`                            | `sig_basis ~ Exp(1.0)`                       | Frequency-domain modeling for regular lattices or periodic time-series.         |                                                                                |
-|                          | 1D/2D RFF            | `Smooth(x, y; manifold='rff')`                         | `ls_rff ~ Gamma(2,2)`                        | Monte Carlo approximation of stationary kernels (SE/Matern).                    |                                                                                |
-|                          | DeepGP               | `Spatial(s, manifold='deepgp')`                        | `ls_layer ~ Gamma(2,1)`                      | Hierarchical composition of RFF layers for complex non-stationarity.            |                                                                                |
-|                          | Wavelets             | `Smooth(x; manifold='wavelet')`                        | `sig_wave ~ Exp(1.0)`                        | Multi-resolution analysis; localizes features in both space and frequency.      |                                                                                |
-| **Advanced Smooths**     | P-Splines            | `Smooth(x; manifold='pspline')`                        | `diff_order=2` (Default)                     | B-spline basis with a discrete differencing penalty on coefficients.            |                                                                                |
-|                          | TPS (2D)             | `Smooth(x, y; manifold='tps')`                         | `nbins=20` (Default)                         | Thin Plate Splines; minimizes the bending energy of a 2D surface.               |                                                                                |
-| **Operators**            | Kronecker            | `S ⊗  T`                                               | `st_sigma ~ Exp(1.0)`                        | Fully separable space-time interaction (Knorr-Held Type IV).                    |                                                                                |
-|                          | SVC                  | `x \                                                   | Spatial(s)`                                  | `sig_svc ~ Exp(1.0)`                                                            | Spatially Varying Coefficient; slope $\beta$ is a latent function of location. |
-|                          | Direct Sum           | `A ⊕ B`                                                | Additive components                          | Superposition of multiple latent manifold structures.                           |                                                                                |
-|                          | Nested / MF          | `nested(var; manifold='...')`                          | `fidelity_rho ~ Normal(1, 0.5)`              | Links primary models to auxiliary data for multifidelity routing.               |                                                                                |
-
-
-**Advanced Formula Parameters & Hyper-Prior Specification**
-
-*   **`nbins`**: Controls the discretization density for Spline and FFT manifolds.
-*   **`M_inducing_count`**: For `fitc` and `svgp`, defines the number of landmark points (pseudo-inputs).
-*   **`n_layers` / `m_layers`**: For `deepgp`, specifies the depth and width (number of spectral features per layer).
-*   **`curvature_const`**: For `hyperbolic`, sets the manifold curvature (usually -1.0 for Poincare disk).
-*   **`ls_rff` / `ls_basis`**: Lengthscale hyperprior. Smaller values allow for higher-frequency oscillations in the manifold. 
 
 
 
@@ -778,7 +702,7 @@ for m in test_configs
           termination=au.termination_reason
         ))
 
-        p = plot_spatial_graph( au; plot_title="Method: $m", domain_boundary=au.hull_coords)
+        p = plot_spatial_graph( au; plot_title="Method: $m" )
 
         # copy plot to an output list
         push!(plots, p)
@@ -838,7 +762,7 @@ au = assign_spatial_units(data.s_coord_tuple;
 
 met = calculate_metrics(au)
 
-plot_spatial_graph( au; plot_title="Method: $au_method", domain_boundary=au.hull_coords)
+plot_spatial_graph( au; plot_title="Method: $au_method" )
 
 # prepare model inputs
 inp_krig = bstm_options(
@@ -1086,7 +1010,7 @@ display( "Mean point density: $(round( met.mean_density, sigdigits=5 ))")
 display( "SD point density: $(round( met.sd_density, sigdigits=5 ))")
 display( "CV point density: $(round( met.cv_density, sigdigits=5 ))")
  
-plot_spatial_graph( au; plot_title="Method: $method", domain_boundary=au.hull_coords)
+plot_spatial_graph( au; plot_title="Method: $method" )
  
 ```
 
@@ -1938,7 +1862,7 @@ met = calculate_metrics(au)
 println("Partitioning Metrics:", met)
 
 # Execution of the hardened plotting logic
-plot_spatial_graph(au; plot_title="Method: $au_method", domain_boundary=au.hull_coords)
+plot_spatial_graph(au; plot_title="Method: $au_method" )
 
 
 # prepare model inputs   
