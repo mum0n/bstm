@@ -548,7 +548,7 @@ const BSTM_MODULE_KEYWORDS = Set([
     "svc",
     "volatility",
     "network",
-    "transport",
+    "spacetime",
     "hyperbolic",
     "dynamics"
 ])
@@ -6783,67 +6783,69 @@ end
         end
     end
 
-    # # 6. Knorr-Held Space-Time Interactions (Type I-IV)
-    # Rationale: High-dimensional Kronecker-product manifolds for non-stationary spatial evolution.
-    if get(M, :model_st, "none") != "none"
-        st_sigma ~ NamedDist(Exponential(1.0), :st_sigma)
-        
-        # Resolve spatial and temporal precision templates from technical registry
-        Q_s_st = haskey(M, :s_Q_template) ? M.s_Q_template.matrix : sparse(I(M.s_N, M.s_N))
-        Q_t_st = haskey(M, :t_Q_template) ? M.t_Q_template.matrix : sparse(I(M.t_N, M.t_N))
 
-        # Kronecker dispatch: High-dimensional manifold precision
-        Q_full_st = kron(Q_t_st, Q_s_st) ./ (st_sigma^2 + noise)
-        st_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N * M.t_N), Q_full_st), :st_latent)
+    # Spatiotemporal Interactions and Physics-Informed Transport
+    # Iterates through the spacetime registry to support multiple interactions
+    if haskey(M, :spacetime_metadata) && !isempty(M.spacetime_metadata)
+        for (st_key, st_params) in M.spacetime_metadata
+            st_manifold = Symbol(get(st_params, :manifold, :none))
+            
+            if st_manifold != :none
+                st_sig_sym = Symbol("st_sigma_", st_key)
+                st_lat_sym = Symbol("st_latent_", st_key)
+                
+                st_sigma ~ NamedDist(Exponential(1.0), st_sig_sym)
+                
+                # Retrieve precision templates for Space and Time components
+                Q_s_st = haskey(M, :s_Q_template) ? M.s_Q_template.matrix : sparse(I(M.s_N, M.s_N))
+                Q_t_st = haskey(M, :t_Q_template) ? M.t_Q_template.matrix : sparse(I(M.t_N, M.t_N))
 
-        # Map ST grid to observations via global linear indexing
-        st_map = M.st_idx
-        for i in 1:M.y_N
-            eta[i] += st_latent[st_map[i]]
+                if st_manifold in [:advection, :diffusion, :advection_diffusion]
+                    # Physics-informed path: Discretized transport operators
+                    st_vel_sym = Symbol("velocity_phys_", st_key)
+                    velocity_phys ~ NamedDist(Normal(0, 1), st_vel_sym)
+                    
+                    Q_st = recompose_precision(st_manifold, Q_s_st, st_sigma, extra_param=velocity_phys, noise=noise)
+                    st_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N), Q_st), st_lat_sym)
+                    
+                    for i in 1:M.y_N
+                        eta[i] += st_latent[M.s_idx[i]]
+                    end
+                else
+                    # Knorr-Held path: Type I-IV Kronecker Product interactions
+                    # Q_full = Q_time ⊗ Q_space
+                    # Map interaction types to specific structure combinations
+                    Q_full_st = kron(Q_t_st, Q_s_st) ./ (st_sigma^2 + noise)
+                    st_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N * M.t_N), Q_full_st), st_lat_sym)
+                    
+                    st_map = M.st_idx
+                    for i in 1:M.y_N
+                        eta[i] += st_latent[st_map[i]]
+                    end
+                end
+            end
         end
     end
 
-    # # 7. Physics-Informed Transport (Advection-Diffusion)
-    # Rationale: Discretized transport operator applied to the graph manifold.
-    if get(M, :model_st, "none") == "advection_diffusion"
-        sig_phys ~ NamedDist(Exponential(1.0), :sig_phys)
-        velocity_phys ~ NamedDist(Normal(0, 1), :velocity_phys)
-        # Operator recomposition using the advection-diffusion kernel
-        Q_phys = recompose_precision(:advection, M.s_Q_template.matrix, sig_phys, extra_param=velocity_phys, noise=noise)
-        phys_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N), Q_phys), :phys_latent)
-        for i in 1:M.y_N
-            eta[i] += phys_latent[M.s_idx[i]]
-        end
-    end
 
-    # # 8. Primary Spatio-Temporal Innovation Fields
-    # Rationale: Standard domain manifolds for geographic and trend dependency.
-    # Spatial Innovation (BYM2, ICAR, Network, or Hyperbolic)
+ 
+    # Primary Spatial Innovations
     if M.model_space != "none"
         s_sigma ~ NamedDist(Exponential(1.0), :s_sigma)
         s_rho_val = one(T)
         
-        # Parameters for directed flow or curvature
         extra_param = nothing
         if Symbol(M.model_space) in [:bym2, :leroux, :sar, :network]
             s_rho_val ~ NamedDist(Beta(1, 1), :s_rho)
             extra_param = s_rho_val
         elseif Symbol(M.model_space) == :hyperbolic
-            # Hyperbolic manifolds utilize the curvature parameter registered in metadata
-            # latent fields defined on non-Euclidean manifolds.
-            # It utilizes a curvature-aware distance kernel to model spatial dependencies where Euclidean geometry is insufficient.
             extra_param = get(M, :curvature, -1.0)
         end
 
-        # Precision Recomposition Dispatch
-        # For :network, the dispatcher handles directed flow using the flow_direction flag.
-        # Network Module: This update allows the linear predictor to capture dependencies across directed graphs.
-        # It utilizes the flow_direction parameter (upstream, downstream, or bidirectional) to recompose
-        # asymmetric precision matrices, essential for modeling propagation in topological networks like river systems or supply chains.
         Q_s = recompose_precision(
-            Symbol(M.model_space), 
-            M.s_Q_template.matrix, 
-            s_sigma; 
+            Symbol(M.model_space),
+            M.s_Q_template.matrix,
+            s_sigma,
             extra_param = extra_param,
             noise = noise,
             flow_direction = get(M, :flow_direction, :bidirectional)
@@ -6855,6 +6857,7 @@ end
         end
     end
 
+    # Primary Temporal Innovations
     if M.model_time != "none"
         t_sigma ~ NamedDist(Exponential(1.0), :t_sigma)
         t_rho = one(T)
@@ -7075,6 +7078,40 @@ end
             t_latent_k ~ NamedDist(MvNormalCanon(zeros(M.t_N), Q_t), Symbol("t_latent_", k))
             for i in 1:y_N; field_k[i] += t_latent_k[M.t_idx[i]]; end
         end
+
+        # Standardized Spacetime Registry Dispatch (outcome-aware)
+        if haskey(M, :spacetime_metadata) && !isempty(M.spacetime_metadata)
+            for (st_key, st_params) in M.spacetime_metadata
+                st_manifold = Symbol(get(st_params, :manifold, :none))
+                
+                if st_manifold != :none
+                    st_sig_sym = Symbol("st_sigma_", st_key, "_", k)
+                    st_lat_sym = Symbol("st_latent_", st_key, "_", k)
+                    
+                    st_sigma_k ~ NamedDist(Exponential(1.0), st_sig_sym)
+                    
+                    Q_s_st = haskey(M, :s_Q_template) ? M.s_Q_template.matrix : sparse(I(M.s_N, M.s_N))
+                    Q_t_st = haskey(M, :t_Q_template) ? M.t_Q_template.matrix : sparse(I(M.t_N, M.t_N))
+
+                    if st_manifold in [:advection, :diffusion, :advection_diffusion]
+                        st_vel_sym = Symbol("velocity_phys_", st_key, "_", k)
+                        velocity_phys_k ~ NamedDist(Normal(0, 1), st_vel_sym)
+                        
+                        Q_st = recompose_precision(st_manifold, Q_s_st, st_sigma_k, extra_param=velocity_phys_k, noise=noise)
+                        st_latent_k ~ NamedDist(MvNormalCanon(zeros(M.s_N), Q_st), st_lat_sym)
+                        
+                        for i in 1:y_N; field_k[i] += st_latent_k[M.s_idx[i]]; end
+                    else
+                        Q_full_st = kron(Q_t_st, Q_s_st) ./ (st_sigma_k^2 + noise)
+                        st_latent_k ~ NamedDist(MvNormalCanon(zeros(M.s_N * M.t_N), Q_full_st), st_lat_sym)
+                        
+                        st_map = M.st_idx
+                        for i in 1:y_N; field_k[i] += st_latent_k[st_map[i]]; end
+                    end
+                end
+            end
+        end
+
         latent_innovations[:, k] .= field_k
     end
 
@@ -7096,18 +7133,7 @@ end
         end
     end
 
-    if get(M, :model_st, "none") == "advection_diffusion"
-        sig_phys ~ NamedDist(Exponential(1.0), :sig_phys)
-        velocity_phys ~ NamedDist(Normal(0, 1), :velocity_phys)
-        Q_phys = recompose_precision(:advection, M.s_Q_template.matrix, sig_phys, extra_param=velocity_phys, noise=noise)
-        phys_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N), Q_phys), :phys_latent)
-        for k in 1:outcomes_N
-            for i in 1:y_N
-                eta[i, k] += phys_latent[M.s_idx[i]]
-            end
-        end
-    end
-
+ 
     # # 10. Advanced Registries: Basis Smooths & Interactions
     # Smooth Basis Dispatch (1D, 2D, 3D, and 4D Latent Fields)
     # Rationale: Aggregates non-linear effects discovered in the smooth() DSL blocks across outcomes.
@@ -7239,7 +7265,41 @@ end
             t_latent_fields[k] = zeros(T, 1)
         end
 
-        # 4.3 Advanced Local Registries (Spectral & Eigen) per Fidelity
+
+        # Standardized Spacetime Registry Dispatch (fidelity-aware)
+        # Rationale: Standardizing Interactions and Physics Transport operators
+        if haskey(fk, :spacetime_metadata) && !isempty(fk.spacetime_metadata)
+            for (st_key, st_params) in fk.spacetime_metadata
+                st_manifold = Symbol(get(st_params, :manifold, :none))
+                
+                if st_manifold != :none
+                    st_sig_sym = Symbol("st_sigma_", st_key, "_", k)
+                    st_lat_sym = Symbol("st_latent_", st_key, "_", k)
+                    
+                    st_sigma_k ~ NamedDist(Exponential(1.0), st_sig_sym)
+                    
+                    Q_s_st = haskey(fk, :s_Q_template) ? fk.s_Q_template.matrix : sparse(I(fk.s_N, fk.s_N))
+                    Q_t_st = haskey(fk, :t_Q_template) ? fk.t_Q_template.matrix : sparse(I(fk.t_N, fk.t_N))
+
+                    if st_manifold in [:advection, :diffusion, :advection_diffusion]
+                        st_vel_sym = Symbol("velocity_phys_", st_key, "_", k)
+                        velocity_phys_k ~ NamedDist(Normal(0, 1), st_vel_sym)
+                        
+                        Q_st = recompose_precision(st_manifold, Q_s_st, st_sigma_k, extra_param=velocity_phys_k, noise=noise)
+                        st_latent_k ~ NamedDist(MvNormalCanon(zeros(fk.s_N), Q_st), st_lat_sym)
+                        
+                        for i in 1:N_k; field_k[i] += st_latent_k[fk.s_idx[i]]; end
+                    else
+                        Q_full_st = kron(Q_t_st, Q_s_st) ./ (st_sigma_k^2 + noise)
+                        st_latent_k ~ NamedDist(MvNormalCanon(zeros(fk.s_N * fk.t_N), Q_full_st), st_lat_sym)
+                        
+                        st_map = fk.st_idx
+                        for i in 1:N_k; field_k[i] += st_latent_k[st_map[i]]; end
+                    end
+                end
+            end
+        end
+                 
         if haskey(fk, :interaction_terms) && !isempty(fk.interaction_terms)
             for (ie_idx, i_term) in enumerate(fk.interaction_terms)
                 sig_ie ~ NamedDist(Exponential(1.0), Symbol("sig_ie_", k, "_", ie_idx))
@@ -8543,23 +8603,36 @@ function recompose_precision(m_type::Symbol, template_mat::AbstractMatrix, param
         local lambda_val = isnothing(extra_param) ? 0.5 : extra_param
         scale_factor .* (lambda_val .* template_mat + (1.0 - lambda_val) .* I(n))
 
+
     elseif m_type == :network
-        # Directed Graph Flow Support
-        # Rationale: (I - rho*W)'(I - rho*W) where W is the directed adjacency
-        local rho_net = isnothing(extra_param) ? 0.8 : extra_param
-        local W_net = !isnothing(directed_adj) ? directed_adj : template_mat
-        
-        # Operator mapping based on flow direction
-        local L_op = if flow_direction == :upstream
+        rho_net = (extra_param === nothing) ? 0.8 : extra_param
+        W_net = (directed_adj !== nothing) ? directed_adj : template_mat
+
+        L_op = if flow_direction == :upstream
             I(n) - rho_net .* W_net'
         elseif flow_direction == :downstream
             I(n) - rho_net .* W_net
         else
-            # Bidirectional/Symmetric fallback
             I(n) - rho_net .* (W_net + W_net') ./ 2.0
         end
-        
         scale_factor .* (L_op' * L_op)
+
+    elseif m_type in [:sar, :advection, :advection_diffusion, :dag, :proper_car]
+        # Physics-informed advection uses the (I - rho*G)'(I - rho*G) operator
+        rho_p = (extra_param === nothing) ? 0.8 : extra_param
+        L_op = I(n) - rho_p .* template_mat
+        scale_factor .* (L_op' * L_op)
+
+    # 2. Unified Knorr-Held Interactions (Types I-IV)
+    # Rationale: Standardizing Kronecker products for separable manifolds.
+    elseif m_type in [:I, :II, :III, :IV]
+        if template_t === nothing
+            error("BSTM Error: Temporal template required for Interaction dispatch.")
+        end
+        # Full separable precision: Q_total = Q_time ⊗ Q_space
+        Q_full = kron(template_t, template_mat)
+        scale_factor .* Q_full
+
 
     elseif m_type in [:sar, :advection, :dag, :proper_car]
         # Operator-Transpose product for causal/proper CAR
@@ -8602,6 +8675,73 @@ function recompose_precision(manifold_metadata::NamedTuple, param_val::Real; ext
     )
 end 
  
+
+
+# # Precision Recomposition Factory (Recursive Algebraic Dispatch)
+# This function now accepts Manifold structs or algebraic operator results.
+function recompose_precision(manifold_node::Any, M, param_sig::Real; noise=1e-4)
+    # # Base Case: Atomic Manifold Structs
+    if manifold_node isa Manifold
+        m_type = manifold_type(manifold_node)
+        # Atomic builders provide the base template Q
+        m_meta = build_model(manifold_node, M)
+        return recompose_precision(Symbol(m_type), m_meta.Q_template, param_sig; noise=noise)
+    
+    # # Algebraic Case: Composed Manifolds (⊗, ⊕)
+    elseif manifold_node isa ComposedManifold
+        # Retrieve components
+        comps = manifold_node.components
+        op = manifold_node.operator
+        
+        if op == :kronecker_product
+            # Q_total = Q1 ⊗ Q2
+            # We split the parameter variance across components or treat sig as global scale
+            Q1 = recompose_precision(comps[1], M, 1.0; noise=noise)
+            Q2 = recompose_precision(comps[2], M, 1.0; noise=noise)
+            Q_full = kron(Q1, Q2)
+            return Symmetric(Q_full ./ (param_sig^2 + noise) + noise * I)
+            
+        elseif op == :direct_sum
+            # Q_total is block diagonal if domains are distinct
+            # Here we return a list of precisions for the supervisor to iterate
+            return [recompose_precision(c, M, param_sig; noise=noise) for c in comps]
+
+        elseif op == :directed_dependency
+            # Q_total = (I - ρM1)' Q2 (I - ρM1)
+            # Rationale: Representing state-space transitions or advection operators
+            Q1 = recompose_precision(comps[1], M, 1.0; noise=noise)
+            Q2 = recompose_precision(comps[2], M, 1.0; noise=noise)
+            
+            # For directed dependencies, we return the tuple of operators for the supervisor
+            # as they typically require an explicit coupling parameter (rho)
+            return (Q_source=Q1, Q_innovation=Q2, type=:directed)
+            
+        elseif op == :composition
+            # Q_total = Q1 * Q2 * Q1 (Basis warping/Cascading dependency)
+            # Rationale: Representing the composition of two precision structures as a functional transformation.
+            Q1 = recompose_precision(comps[1], M, 1.0; noise=noise)
+            Q2 = recompose_precision(comps[2], M, 1.0; noise=noise)
+            
+            # Ensure dimensional parity for matrix multiplication in composition
+            if size(Q1) == size(Q2)
+                Q_comp = Q1 * Q2 * Q1
+                return Symmetric(Q_comp ./ (param_sig^2 + noise) + noise * I)
+            else
+                # Fallback to Kronecker if dimensions are heterogeneous
+                return Symmetric(kron(Q1, Q2) ./ (param_sig^2 + noise) + noise * I)
+            end
+
+        elseif op == :pipe
+            # Stacking: M1 |> M2 (e.g., Spatial |> AR1 for space-time evolution)
+            # This implies a state-space transition matrix
+            return recompose_precision(comps[1], M, param_sig; noise=noise)
+        end
+    end
+    
+    # Fallback for symbol-based legacy calls
+    return Matrix(1.0I, 1, 1)
+end
+
 
 
 function parse_module_params(params_str::String)
@@ -9240,8 +9380,8 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
 
     return B
 end
- 
- 
+  
+
 function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
     # 1. Formula Scope Discovery
     # Utilizing the recursive parser to decompose the DSL into outcomes and technical modules.
@@ -9259,11 +9399,13 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
     opt_dict[:model_st] = "none"
     opt_dict[:use_dynamics] = false
     opt_dict[:use_sv] = false
-
-
+    opt_dict[:algebraic_manifolds] = Dict{Symbol, Any}()
+    
     # Internal Technical Registries
     # Rationale: These containers must be explicitly managed to prevent truncation during the loop.
     
+    
+ 
     fixed_parts_accumulator = String[]
     mixed_terms_registry = []
     nested_manifolds_registry = Dict{String, Any}()
@@ -9273,22 +9415,35 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
     svc_manifolds_registry = Dict{Symbol, Any}()
     network_registry = Dict{Symbol, Any}()
     volatility_registry = Dict{Symbol, Any}()
-    transport_registry = Dict{Symbol, Any}()
-    knorrheld_registry = Dict{Symbol, Any}()
-
+    spacetime_registry = Dict{Symbol, Any}()
+    dynamics_registry = Dict{Symbol, Any}()
 
     # 3. Technical Module Resolution Loop
     # Iterates through Spatial, Temporal, Dynamics, Mixed, Smooth modules.
     for (key, mod) in metadata.modules
         type = mod[:type]
-        vars_list = mod[:variables]
         params = mod[:params]
         
-        # Standardizing the variable count for smooth manifold dispatch
-        n_vars = length(vars_list)
+        manifold_call = get(mod, :manifold_call, "")
+        graph = isempty(manifold_call) ? nothing : parse_manifold_graph(manifold_call)
 
-        
-        # Metadata Functional Dispatch
+        if !isnothing(graph)
+            opt_dict[:algebraic_manifolds][Symbol(type)] = graph
+        end
+
+      
+       if type == "svc"
+            cov_var = Symbol(mod[:covariate])
+            push!(svc_covariates_registry, cov_var)
+            svc_manifolds_registry[cov_var] = Dict(:graph => graph, :params => params)
+            continue
+        end
+
+  
+
+        # Standard variable extraction for all other modules
+        vars_list = mod[:variables]
+        n_vars = length(vars_list)
 
         # Process Bias Module: Replacing legacy Weights(), Trials(), Offsets()
         if type == "bias"
@@ -9319,24 +9474,14 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
             if !isempty(params)
                 get!(opt_dict, :hyperpriors, Dict{String, Any}())["intercept"] = params
             end
-
-        # 3.3 Spatially Varying Coefficients (SVC)
-        elseif type == "svc"
-            cov_var = Symbol(mod[:covariate])
-            manifold_call = mod[:manifold_call]
-            push!(svc_covariates_registry, cov_var)
-            # Route the manifold call (e.g., Spatial(district)) to a technical registry
-            svc_manifolds_registry[cov_var] = Dict(
-                :call => manifold_call,
-                :params => params
-            )
+ 
 
         # Spatial Module Dispatch
         # Dynamically maps the variable provided in Spatial(var) to the technical spatial index s_idx.
         elseif type == "spatial"
-            manifold_id = string(get(params, :manifold, "bym2"))
-            opt_dict[:model_space] = manifold_id
+            # Assign graph to algebraic registry if complex, else use legacy flag
             
+            opt_dict[:model_space] = string(get(params, :manifold, "bym2"))
             if n_vars == 1
                 # Discrete Graph path: the variable is the index column.
                 var_sym = vars_list[1]
@@ -9358,6 +9503,8 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
         # Temporal Module Dispatch
         # Dynamically maps the variable provided in Temporal(var) to the technical temporal index t_idx.
         elseif type == "temporal"
+            
+ 
             manifold_id = string(get(params, :manifold, "ar1"))
             opt_dict[:model_time] = manifold_id
             
@@ -9390,6 +9537,9 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
             end
      
         elseif type == "smooth"
+            # Integration: Populating the algebraic registry for Smooth modules
+            
+
             if n_vars == 1
                 # 3.1 Smooth Module (1D Basis Splines)
                 var_sym = vars_list[1]
@@ -9475,25 +9625,23 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
             end
         
             
-        # Network Flows and Topology Modules
+
+        elseif type == "volatility"
+            
+            opt_dict[:use_sv] = true
+            opt_dict[:M_rff_sigma] = get(params, :nbins, 20)
+
         elseif type == "network"
-            net_var = Symbol(vars_list[1])
-            network_registry[net_var] = params
- 
-        # Separable Space-Time Interactions (Knorr-Held Types I-IV)
-        elseif type == "knorrheld"
-            kh_var = Symbol(vars_list[1])
-            # Registers parameters (e.g. type='IV') for the interaction registry
-            knorrheld_registry[kh_var] = params
-            # Map interaction type to model_st to trigger the correct precision kernel
-            opt_dict[:model_st] = string(get(params, :type, "IV"))
+            
+            network_registry[Symbol(vars_list[1])] = params
 
-       
-        # Process Transport Operator with direct parameter mapping
-        elseif type == "transport"
-            # Routing the manifold to the physics-informed kernel
-            opt_dict[:model_st] = string(get(params, :manifold, "advection_diffusion"))
-
+        elseif type == "spacetime"
+            
+            st_manifold = string(get(params, :manifold, "none"))
+            spacetime_registry[Symbol(join(vars_list, "_"))] = params
+            # Map technical manifold to model_st trigger
+            opt_dict[:model_st] = st_manifold
+              
             # Map spatial and temporal pointers
             if length(vars_list) >= 2
                 opt_dict[:s_idx_var] = vars_list[1]
@@ -9513,10 +9661,13 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
             if haskey(params, :hyperpriors)
                 opt_dict[:hyperpriors] = merge(get(opt_dict, :hyperpriors, Dict()), params[:hyperpriors])
             end
-
+ 
+ 
         # 3.4 Mechanistic Population Dynamics
+
         elseif type == "dynamics"
-         opt_dict[:use_dynamics] = true
+            
+            opt_dict[:use_dynamics] = true
             opt_dict[:dynamics_var] = vars_list[1]
             for dp in [:K, :r, :m0, :q1, :bpsd, :mlim]
                 if haskey(params, dp); opt_dict[dp] = params[dp]; end
@@ -9532,6 +9683,7 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
         # Hierarchical Nested Supervisors
         # Updated: Parsed out dependent variables from internal formulas
         elseif type == "nested"
+            
             formula_str = get(params, :formula, "")
             
             # If no formula is provided in params, we assume the vars_list[1] is the variable
@@ -9551,17 +9703,10 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
                 :data => get(params, :data, :data)
             )
  
-
-        # Process Stochastic Volatility (RFF Projection)
-        elseif type == "volatility"
-            opt_dict[:use_sv] = true
-            opt_dict[:M_rff_sigma] = get(params, :nbins, 20)
-            if haskey(params, :manifold)
-                opt_dict[:model_volatility] = string(params[:manifold])
-            end
-
+  
         # Process Hyperbolic Embeddings
         elseif type == "hyperbolic"
+            
             opt_dict[:model_space] = "hyperbolic"
             opt_dict[:curvature] = get(params, :curvature, -1.0)
             if length(vars_list) > 1
@@ -9570,21 +9715,11 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
 
         end
     end
-
-    # Physics-Informed Transport Detection
-    # Checking formula for advection-diffusion transport operators
-    if occursin("advection_diffusion", formula)
-        opt_dict[:model_st] =  get(params, :model_st, "advection_diffusion" )
-    end
-
-    # Knorr-Held Interaction Detection
-    # Identifies algebraic Kronecker operators (otimes)
-    if occursin("⊗", formula)
-        opt_dict[:model_st] =  get(params, :model_st, "IV")
-    end
+ 
 
     # Rationale: Finalizing the technical containers to ensure bstm_options receives full metadata.
     # 4. Monolithic Registry Synchronization
+
     opt_dict[:basis_matrices] = basis_matrices_registry
     opt_dict[:interaction_terms] = interaction_terms_registry
     opt_dict[:mixed_terms] = mixed_terms_registry
@@ -9593,8 +9728,7 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
     opt_dict[:svc_manifolds] = svc_manifolds_registry
     opt_dict[:network_metadata] = network_registry
     opt_dict[:volatility_metadata] = volatility_registry
-
-    # Standardizing Fixed Components
+    opt_dict[:spacetime_metadata] = spacetime_registry
     opt_dict[:fixed_parts] = unique(vcat(fixed_parts_accumulator, string.(metadata.fixed_effects)))
     opt_dict[:add_intercept] = metadata.has_intercept
 
@@ -9690,7 +9824,7 @@ function decompose_bstm_formula(formula_str::String)
     # Rationale: Feature-complete restoration to support all technical keywords.
 
     # Split formula into LHS (outcomes) and RHS (latent components)
-    parts = split(formula_str, "~")
+    parts = Base.split(formula_str, "~")
     lhs = strip(parts[1])
     rhs = strip(parts[2])
 
@@ -9699,7 +9833,7 @@ function decompose_bstm_formula(formula_str::String)
     outcomes = String[]
     if startswith(lhs, "[") && endswith(lhs, "]")
         content = lhs[2:end-1]
-        outcomes = [strip(s) for s in split(content, ",")]
+        outcomes = [strip(s) for s in Base.split(content, ",")]
     else
         outcomes = [lhs]
     end
@@ -9708,7 +9842,7 @@ function decompose_bstm_formula(formula_str::String)
  
 
     # Split RHS by '+' while ignoring plus signs inside parentheses
-    function split_rhs_terms(input::String)
+    function split_rhs_terms(input::AbstractString)
         terms = String[]
         depth = 0
         current = ""
@@ -9758,7 +9892,7 @@ function decompose_bstm_formula(formula_str::String)
 
                     # Differentiate variables from technical parameters using the ';' delimiter
                     v_part, p_dict = if occursin(";", inner_str)
-                        sp = split(inner_str, ";")
+                        sp = Base.split(inner_str, ";")
                         strip(sp[1]), parse_module_params(String(sp[2]))
                     else
                         inner_str, Dict{Symbol, Any}()
@@ -9767,7 +9901,7 @@ function decompose_bstm_formula(formula_str::String)
                     # Keyword-Specific Routing
                     if kw == "svc" && occursin("|", v_part)
                         # Spatially Varying Coefficients: "covariate | ManifoldCall"
-                        svc_split = split(v_part, "|")
+                        svc_split = Base.split(v_part, "|")
                         cov_var = strip(svc_split[1])
                         manifold_call = strip(svc_split[2])
 
@@ -9779,7 +9913,7 @@ function decompose_bstm_formula(formula_str::String)
                         )
                     else
                         # Standard modules: extraction of comma-separated variable list
-                        vars_list = [strip(v) for v in split(v_part, ",")]
+                        vars_list = [strip(v) for v in Base.split(v_part, ",")]
                         # Unique registry key based on type and primary variable
                         modules[kw * "_" * vars_list[1]] = Dict(
                             :type => kw,
@@ -10702,7 +10836,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
             # We discover the dimensionality of the smooth (1D-4D)
             # and invoke the corresponding factory for the new coordinate grid.
             v_str = string(v_sym)
-            vars = Symbol.(split(v_str, "_"))
+            vars = Symbol.(Base.split(v_str, "_"))
             n_vars = length(vars)
             
             nb = size(B_train, 2)
