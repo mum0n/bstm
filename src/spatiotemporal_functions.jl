@@ -46,21 +46,33 @@ struct AR1 <: Manifold; rho_prior::UnivariateDistribution; sigma_prior::Univaria
 
 # 2. Continuous & Spectral Primitives (Cross-Domain)
 struct GP <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; kernel::String; end
-struct FITC <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_inducing::Int; end
-struct RFF <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; end
-struct FFT <: Manifold; sigma_prior::UnivariateDistribution; nbins::Int; end
+struct FITC <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
+struct RFF <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; kernel::String; end
+struct FFT <: Manifold; sigma_prior::UnivariateDistribution; nbins::Int; kernel::String; lengthscale_prior::UnivariateDistribution; end
 struct SPDE <: Manifold; sigma_prior::UnivariateDistribution; kappa_prior::UnivariateDistribution; end
 struct DAG <: Manifold; adjacency_matrix::AbstractMatrix; sigma_prior::UnivariateDistribution; end
+
+# v21 additions for sparse and non-stationary GPs
+struct SVGP <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
+struct Warp <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; kernel::String; end
 
 # 3. Non-Euclidean & Decay Primitives (v06.1 Expansion)
 struct ExponentialDecay <: Manifold; sigma_prior::UnivariateDistribution; decay_lengthscale_prior::UnivariateDistribution; end
 struct Hyperbolic <: Manifold; curvature::Float64; sigma_prior::UnivariateDistribution; end
 
 # 4. Basis-Function Primitives (Covariate/Smooth)
+struct Advection <: Manifold; velocity_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
+struct Diffusion <: Manifold; diffusion_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
+struct AdvectionDiffusion <: Manifold; velocity_prior::UnivariateDistribution; diffusion_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
+struct ST_I <: Manifold; sigma_prior::UnivariateDistribution; end
+struct ST_II <: Manifold; sigma_prior::UnivariateDistribution; end
+struct ST_III <: Manifold; sigma_prior::UnivariateDistribution; end
+struct ST_IV <: Manifold; sigma_prior::UnivariateDistribution; end
+
 struct TPS <: Manifold; nbins::Int; sigma_prior::UnivariateDistribution; end
 struct BSpline <: Manifold; nbins::Int; degree::Int; sigma_prior::UnivariateDistribution; end
 struct PSpline <: Manifold; nbins::Int; degree::Int; diff_order::Int; sigma_prior::UnivariateDistribution; end
-struct Wavelets <: Manifold; wavelet_family::Symbol; nbins::Int; sigma_prior::UnivariateDistribution; end
+struct Wavelets <: Manifold; wavelet_family::Symbol; nbins::Int; sigma_prior::UnivariateDistribution; kernel::String; lengthscale_prior::UnivariateDistribution; end
 
 # 5. Seasonal & Periodic (Wrappers)
 struct Harmonic <: Manifold
@@ -613,12 +625,13 @@ end
 const BSTM_MODULE_KEYWORDS = Set([
     "intercept",
     "bias", 
-    "spatial", 
-    "temporal", 
+    "spatial",
+    "temporal",
+    "seasonal",
     "smooth",  
     "nested", 
     "eigen", 
-    "fixed", 
+    "fixed",
     "mixed",
     "svc",
     "volatility",
@@ -627,6 +640,12 @@ const BSTM_MODULE_KEYWORDS = Set([
     "hyperbolic",
     "dynamics"
 ])
+
+const BSTM_TRANSFORM_KEYWORDS = Dict(
+    "log" => x -> log.(x),
+    "zscore" => x -> (x .- mean(x)) ./ std(x),
+    "unit" => x -> (x .- minimum(x)) ./ (maximum(x) - minimum(x))
+)
 
 
    
@@ -725,16 +744,54 @@ function bstm_options(; kwargs...)
     get!(M, :model_time, "none")
     get!(M, :model_season, "none")
 
-    # GMRF Precision Matrix Template Factory
- 
-    ms = string(get!(M, :model_space, "none"))
-    mt = string(get!(M, :model_time, "none"))
-    mu = string(get!(M, :model_season, "none"))
+    # --- Manifold-Based GMRF Precision Factory (v20.4.1 Refactor) ---
+    # Rationale: Replaces legacy symbol-based build_structure_template with the
+    # modern Manifold struct dispatch system via build_model. This aligns the
+    # configuration engine with the v06.1 architectural standard.
 
-    # FIXED: Build templates using the locked dimensions
-    M[:s_Q_template] = build_structure_template(Symbol(ms), M[:s_N]; W=get(M, :W, nothing))
-    M[:t_Q_template] = build_structure_template(Symbol(mt), M[:t_N])
-    M[:u_Q_template] = (mu != "none") ? build_structure_template(Symbol(mu), M[:u_N]) : nothing
+    hyper_scheme = get(M, :hyperprior_scheme, :pcpriors)
+    priors_map = get(M, :hyperpriors, Dict())
+    data_inputs = NamedTuple(M) # build_model expects a NamedTuple
+
+    # 1. Spatial Manifold Resolution
+    ms_name = string(get!(M, :model_space, "none"))
+    if ms_name != "none"
+        spatial_priors = get(priors_map, :spatial, get(priors_map, "spatial", Dict()))
+        spatial_manifold = resolve_technical_primitive(ms_name, M, spatial_priors, hyper_scheme)
+        s_model = build_model(spatial_manifold, data_inputs)
+        
+        M[:s_Q_template] = s_model.Q_template
+        M[:s_scaling_factor] = s_model.scaling_factor
+        M[:s_hyper] = s_model.hyper
+    else
+        M[:s_Q_template] = build_structure_template(:none, 1).matrix
+    end
+
+    # 2. Temporal Manifold Resolution
+    mt_name = string(get!(M, :model_time, "none"))
+    if mt_name != "none"
+        temporal_priors = get(priors_map, :temporal, get(priors_map, "temporal", Dict()))
+        temporal_manifold = resolve_technical_primitive(mt_name, M, temporal_priors, hyper_scheme)
+        t_model = build_model(temporal_manifold, data_inputs)
+
+        M[:t_Q_template] = t_model.Q_template
+        M[:t_scaling_factor] = t_model.scaling_factor
+        M[:t_hyper] = t_model.hyper
+    else
+        M[:t_Q_template] = build_structure_template(:none, 1).matrix
+    end
+    
+    # 3. Seasonal Manifold Resolution
+    mu_name = string(get!(M, :model_season, "none"))
+    M[:u_Q_template] = if mu_name != "none"
+        seasonal_priors = get(priors_map, :seasonal, get(priors_map, "seasonal", Dict()))
+        seasonal_manifold = resolve_technical_primitive(mu_name, M, seasonal_priors, hyper_scheme)
+        u_model = build_model(seasonal_manifold, data_inputs)
+        M[:u_hyper] = u_model.hyper
+        u_model.Q_template
+    else
+        nothing
+    end
 
     # Hierarchical Registries Initialization
     get!(M, :nested_manifolds, Dict{String, Any}())
@@ -785,1621 +842,8 @@ end
 
 
 
-
-
-#---------------------------------------------
-#---------------------------------------------
-#---------------------------------------------
-
-
-
-function init_params_extract(X)
-  XS = summarize(X)
-  vns = XS.nt.parameters  # var names
-  init_params = FillArrays.Fill( XS.nt[2] ) # means
-  return init_params, vns
-end
-
- 
-function discretize_decimal( x, delta=0.01 ) 
-    num_digits = Int(ceil( log10(1.0 / delta)) )   # time floating point rounding
-    out = round.( round.( x ./ delta; digits=0 ) .* delta; digits=num_digits)
-    return out
-end
- 
-
-function expand_grid(; kws...)
-    names, vals = keys(kws), values(kws)
-    return DataFrame(NamedTuple{names}(t) for t in Iterators.product(vals...))
-end
-   
-
-function showall( x )
-    # print everything to console
-    show(stdout, "text/plain", x) # display all estimates
-end 
- 
-
-function firstindexin(a::AbstractArray, b::AbstractArray)
-    bdict = Dict{eltype(b), Int}()
-    for i=length(b):-1:1
-        bdict[b[i]] = i
-    end
-    [get(bdict, i, 0) for i in a]
-end
-   
-  
-function β( mode, conc )
-    # alternate parameterization of beta distribution 
-    # conc = α + β     https://en.wikipedia.org/wiki/Beta_distribution
-    beta1 = mode *( conc - 2  ) + 1.0
-    beta2 = (1.0 - mode) * ( conc - 2  ) + 1.0
-    Beta( beta1, beta2 ) 
-end 
-  
-function modelruntime(o)
-    dt = ( o.info.stop_time- o.info.start_time )/ 60
-    showall( summarize(o) )
-    print( dt )
-end
- 
-function code_show(x)
-   # printstyled( CodeTracking.@code_string x() )
-end
-
-
-################
-
-
-
-
-function expand_hull(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, buffer_dist)
-    """
-    Synopsis: Computes the convex hull of points and expands it by a buffer distance.
-    Inputs:
-    - s_x: Vector of x-coordinates.
-    - s_y: Vector of y-coordinates.
-    - buffer_dist: Distance to buffer the convex hull.
-    Outputs:
-    - A LibGEOS Polygon geometry representing the buffered convex hull.
-    """
-
-    s_coord_tuple_local = tuple.(s_x, s_y)
-
-    if isempty(s_coord_tuple_local) return LibGEOS.Polygon([[ (0.0,0.0), (0.0,0.0), (0.0,0.0), (0.0,0.0) ]]) end
-    coords_vec = [[Float64(p[1]), Float64(p[2])] for p in s_coord_tuple_local]
-    points_geom = LibGEOS.MultiPoint(coords_vec)
-    hull = LibGEOS.convexhull(points_geom)
-    buffered_hull = LibGEOS.buffer(hull, buffer_dist)
-    return buffered_hull
-end
-
- 
-
-function get_kde_seeds(s_coord_tuple_local, target_u)
- 
-    # Basic KDE-based seeding using StatsBase weights based on local density
-    u_pts = unique(s_coord_tuple_local)
-    if isempty(u_pts) return [] end
-    n = length(u_pts)
-    dists = [sum((p1 .- p2).^2) for p1 in u_pts, p2 in u_pts]
-    # Inverse of mean distance as a density proxy
-    weights = 1.0 ./ (mean(dists, dims=2)[:] .+ 1e-6)
-    idx = StatsBase.sample(1:n, Weights(weights), min(target_u, n), replace=false)
-    return u_pts[idx]
-end
-
- 
-function is_valid_polygon_coords(poly_coords)
-    # Filters out NaN/Inf values and checks for a minimum of 3 valid points for a polygon.
-
-    valid_pts = [p for p in poly_coords if !isnan(p[1]) && !isinf(p[1]) && !isnan(p[2]) && !isinf(p[2])]
-    return length(valid_pts) >= 3
-end
- 
-
-function get_cvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
-    """
-    Synopsis: Centroidal Voronoi Tessellation (CVT) with diagnostic termination tracking.
-    """
-
-    s_coord_tuple_local = tuple.(s_x, s_y)
-
-    if length(s_coord_tuple_local) <= cfg.min_total_arealunits
-        return [ (mean(s_x), mean(s_y)) ], "not_enough_points_to_tessellate"
-    end
-
-    u_pts = unique(s_coord_tuple_local)
-    idx = StatsBase.sample(1:length(u_pts), min(cfg.target, length(u_pts)), replace=false)
-    curr_centroids = [u_pts[i] for i in idx]
-    termination_reason = "max_iterations"
-
-    # Initialize convergence tracking variables
-    last_mean_density = 0.0
-    last_cv = 0.0
-
-    for iter in 1:100
-        polys, _ = get_voronoi_polygons_and_edges(curr_centroids, hull_geom)
-        new_centroids = Tuple{Float64, Float64}[]
-        shifts = Float64[]
-
-        for i in 1:length(polys)
-            poly_coords = polys[i]
-            area = get_polygon_area(poly_coords) # Using refactored area func
-
-            if length(poly_coords) > 2 && area >= cfg.min_area && area <= cfg.max_area
-                lg_poly = LibGEOS.Polygon([[ [p[1], p[2]] for p in poly_coords ]])
-                cent_geom = LibGEOS.centroid(lg_poly)
-                seq = LibGEOS.getCoordSeq(cent_geom)
-                new_c = (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1))
-
-                dist = sqrt(sum((new_c .- curr_centroids[i]).^2))
-                push!(shifts, dist)
-                push!(new_centroids, new_c)
-            else
-                push!(new_centroids, curr_centroids[i])
-            end
-        end
-
-        if isempty(shifts) || mean(shifts) < cfg.tolerance
-            termination_reason = "convergence"
-            break
-        end
-
-        # Use original s_coord_tuple_local for assignment to clusters
-        assigns = [argmin([sum((p .- c).^2) for c in new_centroids]) for p in s_coord_tuple_local]
-        counts = [count(==(i), assigns) for i in 1:length(new_centroids)]
-
-        if isempty(counts)
-            termination_reason = "no_units_formed"
-            break
-        end
-
-        # New Density Convergence Check
-        curr_mean_density = mean(counts)
-        if abs(curr_mean_density - last_mean_density) < cfg.tolerance && iter > 1
-            termination_reason = "density_convergence"
-            break
-        end
-        last_mean_density = curr_mean_density
-
-        cv_val = std(counts) / (mean(counts) + 1e-9)
-        # CV Convergence Check
-        if abs(cv_val - last_cv) < cfg.tolerance && iter > 1
-            termination_reason = "cv_convergence"
-            break
-        end
-        last_cv = cv_val
-
-        if mean(counts) < cfg.min_points
-            termination_reason = "min_points_violation"
-            break
-        end
-
-        curr_centroids = new_centroids
-    end
-
-    return curr_centroids, termination_reason
-end
-
-
-function get_kvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
-    """
-    Synopsis: K-means Voronoi Tessellation (KVT) with diagnostic termination tracking.
-    """
-
-    s_coord_tuple_local = tuple.(s_x, s_y)
-
-
-    if length(s_coord_tuple_local) <= cfg.min_total_arealunits
-        return [ (mean(s_x), mean(s_y)) ], "not_enough_points_to_tessellate"
-    end
-
-    u_pts = unique(s_coord_tuple_local)
-    idx_init = StatsBase.sample(1:length(u_pts), min(cfg.target, length(u_pts)), replace=false)
-    c_iter = [u_pts[i] for i in idx_init]
-    data = tuple.(s_coord_tuple_local, cfg.t_idx)
-
-    damping = 0.7
-    termination_reason = "max_iterations"
-
-    # Initialize convergence tracking variables
-    last_mean_density = 0.0
-    last_cv = 0.0
-
-    for iter in 1:100
-        old_centroids = copy(c_iter)
-        assigns = [argmin([sum((p[1] .- sj).^2) for sj in c_iter]) for p in data]
-
-        polys_coords, _ = get_voronoi_polygons_and_edges(c_iter, hull_geom)
-
-        for k in 1:length(c_iter)
-            idx_cluster = findall(==(k), assigns)
-            ts_count = length(unique([data[j][2] for j in idx_cluster]))
-
-            area = 0.0
-            if k <= length(polys_coords)
-                area = get_polygon_area(polys_coords[k])
-            end
-
-            # Modified area_ok condition: require positive area
-            area_ok = (area > 0) && area >= cfg.min_area && area <= cfg.max_area
-
-            if !isempty(idx_cluster) && length(idx_cluster) >= cfg.min_points && ts_count >= cfg.min_time_slices && area_ok
-                mean_x = mean(data[j][1][1] for j in idx_cluster)
-                mean_y = mean(data[j][1][2] for j in idx_cluster)
-
-                c_iter[k] = ((1.0 - damping) * old_centroids[k][1] + damping * mean_x,
-                             (1.0 - damping) * old_centroids[k][2] + damping * mean_y)
-            end
-        end
-
-        counts = [count(==(k), assigns) for k in 1:length(c_iter)]
-        if isempty(counts)
-            termination_reason = "no_units_formed"
-            break
-        end
-
-        # New Density Convergence Check
-        curr_mean_density = mean(counts)
-        if abs(curr_mean_density - last_mean_density) < cfg.tolerance && iter > 1
-            termination_reason = "density_convergence"
-            break
-        end
-        last_mean_density = curr_mean_density
-
-        cv_val = std(counts) / (mean(counts) + 1e-9)
-        # CV Convergence Check
-        if abs(cv_val - last_cv) < cfg.tolerance && iter > 1
-            termination_reason = "cv_convergence"
-            break
-        end
-        last_cv = cv_val
-
-        if mean(counts) < cfg.min_points
-            termination_reason = "min_points_violation"
-            break
-        end
-
-        damping *= 0.99
-    end
-
-    return c_iter, termination_reason
-end
-
-
-
-function get_qvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
-    # Local helper to convert flat s_x, s_y to a vector of tuples
-
-    s_coord_tuple_local = tuple.(s_x, s_y)
-
-    if length(s_coord_tuple_local) <= cfg.min_total_arealunits
-        return [ (mean(s_x), mean(s_y)) ], "not_enough_points_to_tessellate"
-    end
- 
-    data = tuple.(s_coord_tuple_local, cfg.t_idx)
-
-    regions = [data]
-    # Track specific region objects that failed to split to avoid redundant attempts
-    unsplittable = Set{UInt64}()
-
-    effective_min_p = max(1, cfg.min_points)
-
-    if length(data) < 2 * effective_min_p # Initial check: if the whole dataset is too small to split
-        return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_tessellate"
-    end
-
-    termination_reason = "max_units_reached"
-
-    # Initialize convergence tracking variables
-    last_mean_density = 0.0
-    last_cv = 0.0
-
-    cnt = 0
-
-    while length(regions) < cfg.max_total_arealunits
-        cnt += 1
-
-        counts = length.(regions)
-        curr_mean_density = mean(counts)
-        cv_val = std(counts) / (curr_mean_density + 1e-9)
-
-        # Early breaking based on statistical stabilization and target resolution
-        if cnt > 3
-            if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
-                if length(regions) >= cfg.target && all(c -> c <= cfg.max_points, counts)
-                    termination_reason = "converged_constraints_satisfied"
-                    break
-                elseif abs(cv_val - cfg.target_cv) < cfg.tolerance
-                    termination_reason = "converged_target_cv"
-                    break
-                elseif (count(>(cfg.max_points), counts) / length(regions)) < cfg.tolerance/10
-                    termination_reason = "converged_minor_violations"
-                    break
-                end
-            end
-        end
-
-        last_mean_density = curr_mean_density
-        last_cv = cv_val
-
-        # Candidacy: regions that can be split
-        viable_indices = findall(r -> length(r) >= max(2, effective_min_p) && objectid(r) ∉ unsplittable, regions)
-        if cnt > 3
-            if isempty(viable_indices); termination_reason = "cannot_split_further"; break; end
-        end
-
-        # Split if (below min_total_arealunits) OR (below target OR has max_points violators)
-        violators = filter(i -> length(regions[i]) > cfg.max_points, viable_indices)
-        must_split = length(regions) < cfg.min_total_arealunits
-        want_split = length(regions) < cfg.target || !isempty(violators)
-        candidates = (must_split || want_split) ? (isempty(violators) ? viable_indices : violators) : []
-
-        if isempty(candidates); termination_reason = "constraints_satisfied"; break; end
-
-        # Attempt splitting the largest available candidate
-        target_idx = candidates[argmax([length(regions[i]) for i in candidates])]
-        target_region = regions[target_idx]
-
-        xs_r = [p[1][1] for p in target_region]; ys_r = [p[1][2] for p in target_region]
-
-        # Robust splitting: handle datasets with zero variance in one or more dimensions
-        if length(unique(xs_r)) > 1 || length(unique(ys_r)) > 1
-            mx = length(unique(xs_r)) > 1 ? median(xs_r) : xs_r[1]
-            my = length(unique(ys_r)) > 1 ? median(ys_r) : ys_r[1]
-            r_splits = [
-                filter(p -> p[1][1] <= mx && p[1][2] <= my, target_region),
-                filter(p -> p[1][1] > mx && p[1][2] <= my, target_region),
-                filter(p -> p[1][1] <= mx && p[1][2] > my, target_region),
-                filter(p -> p[1][1] > mx && p[1][2] > my, target_region)
-            ]
-        else
-            # All points collocated spatially: split by index to progress toward target unit count
-            mid = length(target_region) ÷ 2  # Corrected from ∈ 2 to ÷ 2
-            r_splits = [target_region[1:mid], target_region[mid+1:end], [], []]
-        end
-
-        valid_splits = filter(r -> length(r) >= effective_min_p, r_splits)
-
-        if length(valid_splits) < 2
-            # This specific region is locally unsplittable; mark it and continue with others
-            push!(unsplittable, objectid(target_region))
-            continue
-        end
-
-        deleteat!(regions, target_idx)
-        append!(regions, valid_splits)
-    end
-
-    # Post-audit: filter by final constraints (minimum time slices and point counts)
-    final_filtered_regions = filter(regions) do r
-        length(r) >= effective_min_p && length(unique([p[2] for p in r])) >= cfg.min_time_slices
-    end
-
-    if isempty(final_filtered_regions)
-        return [], "no_valid_units_after_filter"
-    end
-
-    final_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in final_filtered_regions]
-
-    polys_coords, _ = get_voronoi_polygons_and_edges(final_centroids, hull_geom)
-    area_violation = any(
-        p_coords -> !is_valid_polygon_coords(p_coords) || get_polygon_area(p_coords) < cfg.min_area,
-        polys_coords
-    )
-
-    final_status = termination_reason
-    if length(final_centroids) < cfg.min_total_arealunits
-        final_status = "insufficient_units_error"
-    elseif area_violation
-        final_status = "min_area_violation"
-    end
-
-    return final_centroids, final_status
-end
-
-
-
-function get_bvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
-    """
-    Synopsis: Binary Voronoi Tessellation (BVT) with corrected recursive splitting logic.
-    """
-
-    s_coord_tuple_local = tuple.(s_x, s_y)
-
-    if length(s_coord_tuple_local) <= cfg.min_total_arealunits
-        return [ (mean(s_x), mean(s_y)) ], "not_enough_points_to_tessellate"
-    end
-
-    data = tuple.(s_coord_tuple_local, cfg.t_idx)
-    regions = [data]
-    # Track specific region objects that failed to split to avoid redundant attempts
-
-    effective_min_p = max(1, cfg.min_points)
-    if length(data) < 2 * effective_min_p # Initial check: if the whole dataset is too small to split
-        return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_tessellate"
-    end
-
-    unsplittable = Set{UInt64}()
-    termination_reason = "max_units_reached"
-    last_mean_density = 0.0
-    last_cv = 0.0
-    cnt =0
-
-    while length(regions) < cfg.max_total_arealunits
-        cnt += 1
-
-        counts = length.(regions)
-        curr_mean_density = mean(counts)
-        cv_val = std(counts) / (curr_mean_density + 1e-9)
-
-        # Early breaking based on statistical stabilization and target resolution
-        if cnt > 3
-            if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
-                if length(regions) >= cfg.target && all(c -> c <= cfg.max_points, counts)
-                    termination_reason = "converged_constraints_satisfied"
-                    break
-                elseif (abs(cv_val - cfg.target_cv) < cfg.tolerance)
-                    termination_reason = "converged_target_cv"
-                    break
-                elseif (count(>(cfg.max_points), counts) / length(regions)) < cfg.tolerance/10
-                    termination_reason = "converged_minor_violations"
-                    break
-                end
-            end
-        end
-
-        last_mean_density = curr_mean_density
-        last_cv = cv_val
-
-        # Candidacy: regions that can be split
-        viable_indices = findall(r -> length(r) >= max(2, effective_min_p) && objectid(r) ∉ unsplittable, regions)
-        if cnt > 3
-            if isempty(viable_indices); termination_reason = "cannot_split_further"; break; end
-        end
-
-        # Split if (below min_total_arealunits) OR (below target OR has max_points violators)
-        violators = filter(i -> length(regions[i]) > cfg.max_points, viable_indices)
-        must_split = length(regions) < cfg.min_total_arealunits
-        want_split = length(regions) < cfg.target || !isempty(violators)
-        candidates = (must_split || want_split) ? (isempty(violators) ? viable_indices : violators) : []
-
-        if isempty(candidates); termination_reason = "constraints_satisfied"; break; end
-
-        # Attempt splitting the largest available candidate
-        target_idx = candidates[argmax([length(regions[i]) for i in candidates])]
-        target = regions[target_idx]
-
-        xs = [p[1][1] for p in target]; ys = [p[1][2] for p in target]
-        var_x = length(xs) > 1 ? var(xs) : 0.0
-        var_y = length(ys) > 1 ? var(ys) : 0.0
-        dim = var_x > var_y ? 1 : 2
-
-        if var_x > 1e-9 || var_y > 1e-9
-            vals = [p[1][dim] for p in target]
-            med = length(unique(vals)) > 1 ? median(vals) : vals[1]
-            r1 = filter(p -> p[1][dim] <= med, target)
-            r2 = filter(p -> p[1][dim] > med, target)
-        else
-            # Handle collocated points
-            mid = length(target) ÷ 2
-            r1, r2 = target[1:mid], target[mid+1:end]
-        end
-
-        # Validate children for point count and temporal diversity
-        v1 = length(r1) >= effective_min_p && length(unique([p[2] for p in r1])) >= cfg.min_time_slices
-        v2 = length(r2) >= effective_min_p && length(unique([p[2] for p in r2])) >= cfg.min_time_slices
-
-        if !v1 || !v2
-             push!(unsplittable, objectid(target))
-             continue
-        end
-
-        # Tentative update to check global area constraints
-        tentative_regions = copy(regions)
-        deleteat!(tentative_regions, target_idx)
-        push!(tentative_regions, r1, r2)
-
-        candidate_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in tentative_regions]
-        polys_coords, _ = get_voronoi_polygons_and_edges(candidate_centroids, hull_geom)
-
-        area_violation = any(
-            p_coords -> !is_valid_polygon_coords(p_coords) || get_polygon_area(p_coords) < cfg.min_area,
-            polys_coords
-        )
-
-        if area_violation && length(tentative_regions) > cfg.min_total_arealunits
-             push!(unsplittable, objectid(target))
-             continue
-        end
-
-        regions = tentative_regions
-    end
-
-    final_centroids_candidate = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
-
-    # if length(final_centroids_candidate) < cfg.min_total_arealunits
-    #     # Aggregate all original points (from 'data') into a single centroid
-    #     all_pts_x = [p[1][1] for p in data]
-    #     all_pts_y = [p[1][2] for p in data]
-    #     return [ (mean(all_pts_x), mean(all_pts_y)) ], "insufficient_units_error"
-    # else
-        return final_centroids_candidate, termination_reason
-    # end
-end
-
  
  
-function get_hvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom; max_iter=500)
-
-    s_coord_tuple_local = tuple.(s_x, s_y)
-
-    # Internal utility for point-to-centroid distance
-    dist(p1, p2) = sqrt(sum((p1 .- p2).^2))
-
-    # Standardized refinement loop (Lloyd's update)
-    function refine(pts_in, centroids, iters)
-        curr = deepcopy(centroids)
-        for _ in 1:iters
-            groups = [Int[] for _ in 1:length(curr)]
-            for (i, p) in enumerate(pts_in)
-                dists = [dist(p, c) for c in curr]
-                push!(groups[argmin(dists)], i)
-            end
-            new_c = [!isempty(idx) ?
-                     (mean(pts_in[j][1] for j in idx), mean(pts_in[j][2] for j in idx)) :
-                     curr[k] for (k, idx) in enumerate(groups)]
-            if all(dist(new_c[j], curr[j]) < cfg.tolerance for j in 1:length(curr))
-                return new_c
-            end
-            curr = new_c
-        end
-        return curr
-    end
-
-    # Initial Seed generation using k-means
-    # Convert s_coord_tuple_local to matrix for Clustering.jl
-    pts_matrix = hcat([p[1] for p in s_coord_tuple_local], [p[2] for p in s_coord_tuple_local])'
-    k_target = max(1, cfg.min_total_arealunits)
-
-    # Run k-means to find initial centers
-    R = kmeans(pts_matrix, k_target)
-    curr_centroids = [(R.centers[1, i], R.centers[2, i]) for i in 1:size(R.centers, 2)]
-
-    # Iterative HVT process with advanced stopping conditions
-    last_mean_density = 0.0
-    last_cv = 0.0
-    status = "max_iterations_reached"
-
-    for i in 1:max_iter
-        # 1. Assignment step to calculate metrics
-        s_idx = [argmin([dist(p, c) for c in curr_centroids]) for p in s_coord_tuple_local]
-        counts = [count(==(k), s_idx) for k in 1:length(curr_centroids)]
-
-        curr_mean_density = mean(counts)
-        cv_val = std(counts) / (curr_mean_density + 1e-9)
-
-        # Convergence logic aligned with QVT/BVT
-        if i > 5
-            if abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance
-                if length(curr_centroids) >= cfg.target && all(c -> c <= cfg.max_points, counts)
-                    status = "converged_constraints_satisfied"
-                    break
-                elseif abs(cv_val - cfg.target_cv) < cfg.tolerance
-                    status = "converged_target_cv"
-                    break
-                elseif (count(>(cfg.max_points), counts) / length(curr_centroids)) < cfg.tolerance/10
-                    status = "converged_minor_violations"
-                    break
-                end
-            end
-        end
-
-        last_mean_density = curr_mean_density
-        last_cv = cv_val
-
-        # 2. Refinement step (Lloyd's update)
-        new_centroids = refine(s_coord_tuple_local, curr_centroids, 3)
-
-        # Check for centroid position stabilization
-        if all(dist(new_centroids[j], curr_centroids[j]) < cfg.tolerance for j in 1:length(curr_centroids))
-             # If positions stabilized but constraints aren't met, check if add a unit
-             if length(curr_centroids) < cfg.max_total_arealunits && (length(curr_centroids) < cfg.target || any(counts .> cfg.max_points))
-                 # Split the largest group to improve density balance
-                 idx_to_split = argmax(counts)
-                 group_pts = s_coord_tuple_local[s_idx .== idx_to_split]
-                 if length(group_pts) >= 2 * cfg.min_points
-                     new_seeds = [(mean(p[1] for p in group_pts) * 0.99, mean(p[2] for p in group_pts) * 0.99),
-                                  (mean(p[1] for p in group_pts) * 1.01, mean(p[2] for p in group_pts) * 1.01)]
-                     deleteat!(curr_centroids, idx_to_split)
-                     append!(curr_centroids, new_seeds)
-                     continue
-                 end
-             end
-             status = "converged_stable_positions"
-             break
-        end
-
-        curr_centroids = new_centroids
-    end
-
-    return curr_centroids, status
-end
-
-
-
-
-
-"""
-    get_avt_centroids(s_x, s_y, cfg, hull_geom)
-
-Iterative Adaptive Voronoi Tessellation. Merges units that violate constraints
-on point counts, time-slice representation, or geometric area.
-"""
-function get_avt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
-    s_coord_tuple = tuple.(s_x, s_y)
-    
-    if length(s_coord_tuple) <= cfg.min_total_arealunits
-        return [ (mean(p[1] for p in s_coord_tuple), mean(p[2] for p in s_coord_tuple)) ], "not_enough_points_to_tessellate"
-    end
-
-    u_pts = unique(s_coord_tuple)
-    # Seeding centroids via KDE-based logic
-    c_init = get_kde_seeds(u_pts, min(length(u_pts), cfg.max_total_arealunits))
-    data = tuple.(s_coord_tuple, cfg.t_idx)
-    curr_c = [SVector{2, Float64}(c) for c in c_init]
-
-    termination_reason = "min_units_reached"
-    last_mean_density = 0.0
-    last_cv = 0.0
-
-    while length(curr_c) > cfg.min_total_arealunits
-        # 1. Assignment
-        assigns = [Int[] for _ in 1:length(curr_c)]
-        for i in 1:length(data)
-            d_pt = data[i][1]
-            # Finding closest centroid (Explicit loop for clarity)
-            dist_idx = argmin([sum((d_pt .- c).^2) for c in curr_c])
-            push!(assigns[dist_idx], i)
-        end
-        
-        counts = length.(assigns)
-        
-        # 2. Geometry Calculation
-        # get_voronoi_polygons_and_edges returns Vector{Vector{Tuple{Float64, Float64}}}
-        polys_coords, _ = get_voronoi_polygons_and_edges([Tuple(c) for c in curr_c], hull_geom)
-        
-        areas = fill(0.0, length(curr_c))
-        for i in 1:min(length(curr_c), length(polys_coords))
-            # Fixed Call: Passes the Vector of Tuples directly to the new method
-            areas[i] = get_polygon_area(polys_coords[i])
-        end
-
-        # 3. Violation Audit
-        violators = Int[]
-        for k in 1:length(curr_c)
-            ts_count = length(unique([data[idx][2] for idx in assigns[k]]))
-            
-            # Logic for merging: too few points, too few time slices, or area outside bounds
-            is_invalid_count = counts[k] < cfg.min_points
-            is_invalid_time = ts_count < cfg.min_time_slices
-            is_invalid_area = (areas[k] > 0 && areas[k] < cfg.min_area) || (areas[k] > cfg.max_area)
-            
-            if is_invalid_count || is_invalid_time || is_invalid_area
-                push!(violators, k)
-            end
-        end
-
-        # 4. Convergence Check
-        curr_mean_density = mean(counts)
-        cv_val = std(counts) / (mean(counts) + 1e-9)
-        
-        if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
-            termination_reason = "tolerance_reached"
-            break
-        end
-        
-        last_mean_density = curr_mean_density
-        last_cv = cv_val
-
-        # 5. Merging Step
-        # Identify target unit to merge (the one with the lowest count among violators or overall)
-        candidates_indices = isempty(violators) ? collect(1:length(curr_c)) : violators
-        v_counts = [counts[k] for k in candidates_indices]
-        target_idx = candidates_indices[argmin(v_counts)]
-
-        # Find nearest neighbor for the target centroid
-        dists = [sum((curr_c[target_idx] .- curr_c[j]).^2) for j in 1:length(curr_c)]
-        dists[target_idx] = Inf
-        neighbor_idx = argmin(dists)
-
-        # Weighted update for the merged centroid location
-        total_n = counts[target_idx] + counts[neighbor_idx]
-        curr_c[neighbor_idx] = (curr_c[target_idx] .* counts[target_idx] .+ curr_c[neighbor_idx] .* counts[neighbor_idx]) ./ (total_n + 1e-9)
-        
-        # Explicit removal (No clamp used)
-        deleteat!(curr_c, target_idx)
-    end
-    
-    return [Tuple(c) for c in curr_c], termination_reason
-end
-
-
-function get_lattice_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, lengthscale)
-    """
-    Synopsis: Generates centroids for a regular 2D lattice (grid) based on a lengthscale.
-    """
-
-    s_coord_tuple = tuple.(s_x, s_y)
-
-    if isempty(s_coord_tuple); return [], 0, 0, (0.0, 0.0, 0.0, 0.0); end
-
-    xs = [p[1] for p in s_coord_tuple]
-    ys = [p[2] for p in s_coord_tuple]
-
-    xmin, xmax = minimum(xs), maximum(xs)
-    ymin, ymax = minimum(ys), maximum(ys)
-
-    # Generate grid ranges
-    x_range = collect(xmin:lengthscale:xmax)
-    y_range = collect(ymin:lengthscale:ymax)
-
-    # Ensure at least one cell if the range is smaller than lengthscale
-    if isempty(x_range); x_range = [xmin]; end
-    if isempty(y_range); y_range = [ymin]; end
-
-    rows = length(y_range)
-    cols = length(x_range)
-
-    # Create meshgrid of centroids
-    centroids = [(x, y) for y in y_range, x in x_range][:]
-
-    return centroids, rows, cols, (xmin, xmax, ymin, ymax)
-end
-
-
-
-function load_shapefile_to_libgeos(filepath::String)
-    # Read the shapefile
-    # import Shapefile  << --- install this if you need it
-    # import LibGEOS
-    # import GeoInterface
-
-    table = Shapefile.Table(filepath)
-    
-    # Extract geometries and convert to LibGEOS
-    # GeoInterface allows LibGEOS to understand Shapefile objects automatically
-    geoms = [LibGEOS.read_geom(row.geometry) for row in table]
-    
-    return geoms, table
-end
-
-function get_user_centroids(input_polygons)
-    # Convert input to a concrete vector of LibGEOS Polygons
-    geoms = LibGEOS.Polygon[p for p in input_polygons]
-    n = length(geoms)
-    centroids = Vector{Tuple{Float64, Float64}}(undef, n)
-    polys_coords = Vector{Vector{Tuple{Float64, Float64}}}(undef, n)
-
-    for i in 1:n
-        poly = geoms[i]
-        cent_geom = LibGEOS.centroid(poly)
-        seq = LibGEOS.getCoordSeq(cent_geom)
-        centroids[i] = (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1))
-        polys_coords[i] = get_coords_from_geom(poly)
-    end
-
-    # Wrap the vector in a GeometryCollection so GeoInterface traits are recognized
-    collection = LibGEOS.GeometryCollection(geoms)
-    # Perform unaryUnion on the collection instead of the vector
-    united = LibGEOS.unaryUnion(collection)
-    hull_coords = get_coords_from_geom(united)
-
-    return centroids, polys_coords, hull_coords
-end
-
-
-function assign_spatial_units(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}; area_method=:avt, target_units=10, lengthscale=nothing, input_polygons=nothing, geom_hull=nothing, kwargs...)
-    # s_coord_tuple_local will be used for calculations that still expect a collection of points
-
-    s_coord_tuple_local = tuple.(s_x, s_y) # Using the globally defined helper
-
-    # The branch for `input_data isa AbstractMatrix` is removed, as this refactored function
-    # is specifically for coordinate-based spatial unit assignment. `bstm_options`
-    # or a similar function will call `assign_spatial_units_inferred` (or its refactored version)
-    # directly if an adjacency matrix is provided as primary input.
-
-    # 1. Handle User-Defined Polygons
-    if !isnothing(input_polygons)
-        # If geom_hull is provided, intersect the input polygons with it
-        processed_polys = isnothing(geom_hull) ? input_polygons : [LibGEOS.intersection(p, geom_hull) for p in input_polygons]
-
-        final_centroids, polys_coords, hull_coords = get_user_centroids(processed_polys)
-        reason = :user_polygons
-        n_units = length(final_centroids)
-
-        g = SimpleGraph(n_units)
-        for i in 1:n_units, j in (i+1):n_units
-            if LibGEOS.touches(processed_polys[i], processed_polys[j]) || LibGEOS.intersects(LibGEOS.buffer(processed_polys[i], 1e-7), processed_polys[j])
-                add_edge!(g, i, j)
-            end
-        end
-        g = ensure_connected!(g, final_centroids)
-        W = Float64.(Graphs.adjacency_matrix(g))
-
-        # Use s_coord_tuple_local for assignments, as it represents the original observation points
-        new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in s_coord_tuple_local]
-        v_edges = []
-
-    # 2. Handle Lattice Method
-    elseif area_method == :lattice
-        # `expand_hull` and `get_lattice_centroids` will be refactored to take s_x, s_y
-        ls = isnothing(lengthscale) ? sqrt(get_polygon_area(get_coords_from_geom(expand_hull( 0.0))) / target_units) : lengthscale # Updated call
-        final_centroids_raw, rows, cols, bbox = get_lattice_centroids(s_x, s_y, ls) # Updated call
-        reason = :lattice_grid
-
-        # Generate square polygons and clip them if geom_hull is provided
-        polys_coords = Vector{Vector{Tuple{Float64, Float64}}}()
-        lg_polys = LibGEOS.Polygon[]
-        final_centroids = Tuple{Float64, Float64}[]
-        half = ls / 2.0
-
-        for c in final_centroids_raw
-            coords = [[(c[1]-half, c[2]-half), (c[1]+half, c[2]-half), (c[1]+half, c[2]+half), (c[1]-half, c[2]+half), (c[1]-half, c[2]+half)]]
-            p_geom = LibGEOS.Polygon(coords)
-            if !isnothing(geom_hull)
-                p_geom = LibGEOS.intersection(p_geom, geom_hull)
-            end
-
-            if !LibGEOS.isEmpty(p_geom)
-                push!(lg_polys, p_geom)
-                p_c = LibGEOS.centroid(p_geom)
-                seq = LibGEOS.getCoordSeq(p_c)
-                push!(final_centroids, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
-                push!(polys_coords, get_coords_from_geom(p_geom))
-            end
-        end
-
-        n_units = length(final_centroids)
-        g = SimpleGraph(n_units)
-        for i in 1:n_units, j in (i+1):n_units
-            if LibGEOS.touches(lg_polys[i], lg_polys[j]) || LibGEOS.intersects(LibGEOS.buffer(lg_polys[i], 1e-7), lg_polys[j])
-                add_edge!(g, i, j)
-            end
-        end
-        g = ensure_connected!(g, final_centroids)
-        W = Float64.(Graphs.adjacency_matrix(g))
-
-        # Use s_coord_tuple_local for assignments
-        new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in s_coord_tuple_local]
-        v_edges = []
-        hull_coords = isnothing(geom_hull) ? [(bbox[1], bbox[3]), (bbox[2], bbox[3]), (bbox[2], bbox[4]), (bbox[1], bbox[4]), (bbox[1], bbox[3])] : get_coords_from_geom(geom_hull)
-
-    # 3. Standard Tessellation Methods
-    else
-        cfg = (
-            target=Int(target_units),
-            min_total_arealunits=Int(get(kwargs, :min_total_arealunits, 3)),
-            max_total_arealunits=Int(get(kwargs, :max_total_arealunits, target_units*2)),
-            min_time_slices=Int(get(kwargs, :min_time_slices, 1)),
-            min_points=Int(get(kwargs, :min_points, 1)),
-            max_points=Int(get(kwargs, :max_points, length(s_x))), # Use length of s_x
-            min_area=get(kwargs, :min_area, 0.0),
-            max_area=get(kwargs, :max_area, Inf),
-            target_cv=get(kwargs, :target_cv, 1.0),
-            tolerance=get(kwargs, :tolerance, 0.1),
-            buffer_dist=get(kwargs, :buffer_dist, 0.5),
-            t_idx=get(kwargs, :t_idx, ones(Int, length(s_x)))) # Use length of s_x
-
-        # `expand_hull` will be refactored to take s_x, s_y
-        hull_geom = !isnothing(geom_hull) ? geom_hull : expand_hull(s_x, s_y, cfg.buffer_dist) # Updated call
-
-        # Centroid functions will be refactored to take s_x, s_y
-        c_mid, reason = if area_method == :cvt get_cvt_centroids(s_x, s_y, cfg, hull_geom)
-        elseif area_method == :kvt get_kvt_centroids(s_x, s_y, cfg, hull_geom)
-        elseif area_method == :qvt get_qvt_centroids(s_x, s_y, cfg, hull_geom)
-        elseif area_method == :bvt get_bvt_centroids(s_x, s_y, cfg, hull_geom)
-        elseif area_method == :hvt get_hvt_centroids(s_x, s_y, cfg, hull_geom)
-        elseif area_method == :avt get_avt_centroids(s_x, s_y, cfg, hull_geom) # Updated call
-        else error("Unknown partitioning method: $area_method") end
-
-        polys_coords, v_edges = get_voronoi_polygons_and_edges(c_mid, hull_geom)
-        final_centroids = Tuple{Float64, Float64}[]
-        lg_polys = []
-        for p_coords in polys_coords
-            if isempty(p_coords); continue; end
-            # Ensure polygon is closed for LibGEOS if it's not already
-            if p_coords[1] != p_coords[end]; push!(p_coords, p_coords[1]); end
-            lg_p = LibGEOS.Polygon([[ [pt[1], pt[2]] for pt in p_coords ]])
-            push!(lg_polys, lg_p)
-            cent_g = LibGEOS.centroid(lg_p)
-            seq = LibGEOS.getCoordSeq(cent_g)
-            push!(final_centroids, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
-        end
-
-        # Use s_coord_tuple_local for assignments
-        new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in s_coord_tuple_local]
-        n_units = length(final_centroids)
-        g = SimpleGraph(n_units)
-        for i in 1:n_units, j in (i+1):n_units
-            if LibGEOS.touches(lg_polys[i], lg_polys[j]) || LibGEOS.intersects(LibGEOS.buffer(lg_polys[i], 1e-7), lg_polys[j])
-                add_edge!(g, i, j)
-            end
-        end
-        g = ensure_connected!(g, final_centroids)
-        hull_coords = get_coords_from_geom(hull_geom)
-        W = Float64.(Graphs.adjacency_matrix(g))
-    end
-
-    # Update the returned NamedTuple to store s_x and s_y
-    return (centroids=final_centroids, polygons=polys_coords,
-            adjacency_edges=v_edges, graph=g, W=W, hull_coords=hull_coords,
-            s_idx=new_assigns, s_x=s_x, s_y=s_y, s_vals=collect(1:size(W,1)), termination_reason=reason)
-end
-
-
-
-function assign_spatial_units_inferred(adjacency_matrix; iterations=50, learning_rate=0.1, buffer_dist=0.5, input_polygons = nothing)
-    """
-    Synopsis: Manually constructs a areal_units object for areal data like the Lip Cancer dataset.
-              Centroid locations are spatially inferred from connectivity using a rudimentary force-directed layout.
-    Inputs:
-    - adjacency_matrix: The adjacency matrix (W) of the areal units.
-    - iterations: Number of iterations for the force-directed layout.
-    - learning_rate: Step size for moving centroids in the layout algorithm.
-    - buffer_dist: Distance to buffer the convex hull when polygons are inferred.
-    - input_polygons: Optional. A vector of LibGEOS Polygons. If provided, centroids and hull are derived from these.
-    """
-
-    local final_centroids
-    local adjacency_edges_output
-    local polys_output
-    local hull_coords_output
-    local g_final # The final graph that will be in the result
-
-    nAU = size(adjacency_matrix, 1)
-
-
-    if input_polygons !== nothing && !isempty(input_polygons)
-        # Case 1: Polygons are provided
-        # 1. Extract centroids from input_polygons
-        final_centroids_geoms = [LibGEOS.centroid(p) for p in input_polygons]
-        final_centroids = map(final_centroids_geoms) do g_pt
-            seq = LibGEOS.getCoordSeq(g_pt)
-            (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1))
-        end
-
-        # 2. Determine hull by dissolving all internal edges
-        united_geom = LibGEOS.unaryunion(input_polygons)
-        hull_coords_output = get_coords_from_geom(united_geom)
-
-        # 3. Determine adjacency from input_polygons (using LibGEOS.touches)
-        adjacency_edges_output = []
-        for i in 1:nAU
-            g1 = input_polygons[i]
-            for j in (i+1):nAU
-                g2 = input_polygons[j]
-                if LibGEOS.touches(g1, g2)
-                    push!(adjacency_edges_output, (final_centroids[i], final_centroids[j]))
-                else
-                    # Fallback robust check, similar to get_voronoi_polygons_and_edges
-                    g1_buffered = LibGEOS.buffer(g1, 1e-6)
-                    if LibGEOS.intersects(g1_buffered, g2)
-                        inter = LibGEOS.intersection(g1_buffered, g2)
-                        if !LibGEOS.isEmpty(inter) && (LibGEOS.area(inter) > 1e-9 || LibGEOS.geomTypeId(inter) in [LibGEOS.GEOS_LINESTRING, LibGEOS.GEOS_MULTILINESTRING])
-                            push!(adjacency_edges_output, (final_centroids[i], final_centroids[j]))
-                        end
-                    end
-                end
-            end
-        end
-
-        polys_output = [get_coords_from_geom(p) for p in input_polygons]
-
-        # Build graph from the determined adjacency edges and ensure connectivity
-        g_final = SimpleGraph(nAU)
-        centroid_map = Dict(c => i for (i, c) in enumerate(final_centroids))
-        for (c1, c2) in adjacency_edges_output
-            xi = get(centroid_map, c1, 0)
-            yi = get(centroid_map, c2, 0)
-            if xi > 0 && yi > 0 && !has_edge(g_final, xi, yi)
-                add_edge!(g_final, xi, yi)
-            end
-        end
-        g_final = ensure_connected!(g_final, final_centroids) # Ensure connectivity if necessary
-
-    else
-        # Case 2: Polygons are not provided, infer centroids and use tessellation
-        # 1. Build initial graph from adjacency_matrix for force-directed layout
-        g_initial_for_layout = SimpleGraph(adjacency_matrix)
-
-        # 2. Infer initial centroids using force-directed layout
-        side = ceil(Int, sqrt(nAU))
-        initial_centroids_fd = [(Float64(i % side), Float64(i ÷ side)) for i in 0:(nAU-1)]
-        centroids_vec = [SVector{2, Float64}(c) for c in initial_centroids_fd]
-
-        for iter in 1:iterations
-            new_centroids_vec = copy(centroids_vec)
-            for i in 1:nAU
-                neighbors_i = Graphs.neighbors(g_initial_for_layout, i)
-                if !isempty(neighbors_i)
-                    avg_neighbor_pos = sum(centroids_vec[n] for n in neighbors_i) / length(neighbors_i)
-                    new_centroids_vec[i] = centroids_vec[i] + learning_rate * (avg_neighbor_pos - centroids_vec[i])
-                end
-            end
-            centroids_vec = new_centroids_vec
-        end
-        # Centroids after force-directed layout
-        forced_layout_centroids = [(p[1], p[2]) for p in centroids_vec]
-
-        # 3. Determine hull_geom from inferred centroids for clipping
-        fx = getindex.(forced_layout_centroids, 1)
-        fy = getindex.(forced_layout_centroids, 2)
-        hull_geom = expand_hull(fx, fy, buffer_dist)
-        hull_coords_output = get_coords_from_geom(hull_geom)
-
-        # 4. Use tessellation to determine polygon coordinates and initial adjacency (based on forced_layout_centroids)
-        polys_coords_raw, _ = get_voronoi_polygons_and_edges(forced_layout_centroids, hull_geom)
-
-        # 5. RECOMPUTE CENTROIDS from the generated (clipped) polygons and prepare for adjacency
-        final_centroids = Vector{Tuple{Float64, Float64}}(undef, length(polys_coords_raw))
-        lg_polygons_for_adjacency = Vector{Union{LibGEOS.Polygon, Nothing}}(undef, length(polys_coords_raw))
-        polys_output = polys_coords_raw
-
-        for (idx, poly_coord_list) in enumerate(polys_coords_raw)
-            if !isempty(poly_coord_list) && length(poly_coord_list) >= 3
-                if poly_coord_list[1] != poly_coord_list[end]
-                    push!(poly_coord_list, poly_coord_list[1])
-                end
-                lg_poly = LibGEOS.Polygon([ [Float64[p[1], p[2]] for p in poly_coord_list] ])
-                centroid_geom = LibGEOS.centroid(lg_poly)
-                seq = LibGEOS.getCoordSeq(centroid_geom)
-                final_centroids[idx] = (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1))
-                lg_polygons_for_adjacency[idx] = lg_poly
-            else
-                @warn "Invalid or empty polygon encountered in Voronoi tessellation at index $idx. Using original centroid as fallback."
-                final_centroids[idx] = forced_layout_centroids[idx]
-                lg_polygons_for_adjacency[idx] = nothing
-            end
-        end
-
-        # 6. Re-build adjacency based on the newly derived centroids and polygons
-        adjacency_edges_output = []
-        if !isempty(lg_polygons_for_adjacency)
-            for i in 1:length(lg_polygons_for_adjacency)
-                g1 = lg_polygons_for_adjacency[i]
-                if g1 === nothing continue end
-                for j in (i+1):length(lg_polygons_for_adjacency)
-                    g2 = lg_polygons_for_adjacency[j]
-                    if g2 === nothing continue end
-                    if LibGEOS.touches(g1, g2)
-                        push!(adjacency_edges_output, (final_centroids[i], final_centroids[j]))
-                    else
-                        g1_buffered = LibGEOS.buffer(g1, 1e-6)
-                        if LibGEOS.intersects(g1_buffered, g2)
-                            inter = LibGEOS.intersection(g1_buffered, g2)
-                            if !LibGEOS.isEmpty(inter) && (LibGEOS.area(inter) > 1e-9 || LibGEOS.geomTypeId(inter) in [LibGEOS.GEOS_LINESTRING, LibGEOS.GEOS_MULTILINESTRING])
-                                push!(adjacency_edges_output, (final_centroids[i], final_centroids[j]))
-                            end
-                        end
-                    end
-                end
-            end
-        end
-
-        # 7. Build final graph from the re-derived adjacency edges and ensure connectivity
-        g_final = SimpleGraph(nAU)
-        centroid_map = Dict(c => i for (i, c) in enumerate(final_centroids))
-        for (c1, c2) in adjacency_edges_output
-            xi = get(centroid_map, c1, 0)
-            yi = get(centroid_map, c2, 0)
-            if xi > 0 && yi > 0 && !has_edge(g_final, xi, yi)
-                add_edge!(g_final, xi, yi)
-            end
-        end
-        g_final = ensure_connected!(g_final, final_centroids)
-    end
-
-    return (
-        centroids = final_centroids,
-        polygons = polys_output,
-        adjacency_edges = adjacency_edges_output,
-        graph = g_final,
-        W = adjacency_matrix,
-        hull_coords = hull_coords_output,
-        s_idx = collect(1:nAU ),
-        s_x = [c[1] for c in final_centroids[1:nAU]],
-        s_y = [c[2] for c in final_centroids[1:nAU]],
-        s_vals = collect(1:nAU ),
-        termination_reason = "positions inferred from adjacency matrix"
-    )
-end 
-
- 
-# Verbatim copy and refinement of get_polygon_area and get_avt_centroids
-# This version fixes the MethodError by providing explicit dispatch for tuple vectors.
-
-"""
-    get_polygon_area(poly_coords::AbstractVector)
-
-Calculates the area of a polygon defined by a vector of (x, y) tuples using the Shoelace formula.
-Includes data cleaning for NaNs, Infs, and duplicate vertices.
-"""
-function get_polygon_area(poly_coords::AbstractVector)
-    # Filter invalid points
-    valid_pts = [p for p in poly_coords if !isnan(p[1]) && !isinf(p[1]) && !isnan(p[2]) && !isinf(p[2])]
-    
-    # Remove trailing duplicate if it matches the start
-    if length(valid_pts) > 1 && valid_pts[1] == valid_pts[end]
-        pop!(valid_pts)
-    end
-    
-    # A polygon must have at least 3 vertices
-    if length(valid_pts) < 3 
-        return 0.0 
-    end
-    
-    x = [p[1] for p in valid_pts]
-    y = [p[2] for p in valid_pts]
-    
-    # Shoelace Formula using LinearAlgebra utilities
-    return 0.5 * abs(dot(x, circshift(y, 1)) - dot(y, circshift(x, 1)))
-end
-
-function get_polygon_area(s_x, s_y)
-    # Wrapper for legacy three-argument calls
-    poly_coords = tuple.(s_x, s_y)
-    return get_polygon_area(poly_coords)
-end
-
- 
-function get_coords_from_geom(geom)
-    """
-    Synopsis: Extracts coordinates from various LibGEOS geometry types.
-    Inputs:
-    - geom: A LibGEOS geometry object.
-    Outputs:
-    - A vector of (x, y) coordinates.
-    """
-
-    coords = Tuple{Float64, Float64}[]
-    local type_id = -1
-    try
-        type_id = LibGEOS.geomTypeId(geom)
-        if type_id == LibGEOS.GEOS_POINT
-             # Access coordinate sequence directly for point types
-             seq = LibGEOS.getCoordSeq(geom)
-             push!(coords, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
-             return coords
-        elseif type_id == LibGEOS.GEOS_POLYGON
-            ring = LibGEOS.exteriorRing(geom)
-            n = LibGEOS.numPoints(ring)
-            for i in 1:n
-                p = LibGEOS.getPoint(ring, i)
-                seq = LibGEOS.getCoordSeq(p)
-                push!(coords, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
-            end
-        elseif type_id == LibGEOS.GEOS_MULTIPOLYGON
-            for i in 1:LibGEOS.numGeometries(geom)
-                poly = LibGEOS.getGeometryN(geom, i)
-                ring = LibGEOS.exteriorRing(poly)
-                n = LibGEOS.numPoints(ring)
-                for j in 1:n
-                    p = LibGEOS.getPoint(ring, j)
-                    seq = LibGEOS.getCoordSeq(p)
-                    push!(coords, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
-                end
-                if i < LibGEOS.numGeometries(geom); push!(coords, (NaN, NaN)); end
-            end
-        elseif type_id in [LibGEOS.GEOS_LINESTRING, LibGEOS.GEOS_LINEARRING]
-            n = LibGEOS.numPoints(geom)
-            for i in 1:n
-                p = LibGEOS.getPoint(geom, i)
-                seq = LibGEOS.getCoordSeq(p)
-                push!(coords, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
-            end
-        end
-    catch e
-        @warn "Coordinate extraction failed for type $type_id: $e"
-    end
-    return coords
-end
-
-
-
-
-function get_voronoi_polygons_and_edges(centroids, hull_geom, tol=1e-7)
-    """
-    Synopsis: Generates clipped Voronoi polygons with robust adjacency detection.
-    Uses a small buffer fallback to handle floating-point misalignment in LibGEOS.
-    """
-    n_c = length(centroids)
-    if n_c == 0
-        return [], []
-    elseif n_c == 1
-        return [get_coords_from_geom(hull_geom)], []
-    elseif n_c == 2
-        # Standard 2-point bisection logic
-        p1, p2 = centroids[1], centroids[2]
-        mid = ((p1[1] + p2[1]) / 2, (p1[2] + p2[2]) / 2)
-        dx, dy = p2[1] - p1[1], p2[2] - p1[2]
-        px, py = -dy, dx
-        L = 1e7
-        pt1 = (mid[1] + L*px, mid[2] + L*py)
-        pt2 = (mid[1] - L*px, mid[2] - L*py)
-        side1_pts = [pt1, pt2, (pt2[1] - L*dx, pt2[2] - L*dy), (pt1[1] - L*dx, pt1[2] - L*dy), pt1]
-        poly1_box = LibGEOS.Polygon([[[p[1], p[2]] for p in side1_pts]])
-        side2_pts = [pt1, pt2, (pt2[1] + L*dx, pt2[2] + L*dy), (pt1[1] + L*dx, pt1[2] + L*dy), pt1]
-        poly2_box = LibGEOS.Polygon([[[p[1], p[2]] for p in side2_pts]])
-        res1 = LibGEOS.intersection(hull_geom, poly1_box)
-        res2 = LibGEOS.intersection(hull_geom, poly2_box)
-        return [get_coords_from_geom(res1), get_coords_from_geom(res2)], [(p1, p2)]
-    end
-
-    # Deduplicate centroids before triangulation to suppress package warnings 
-    # and ensure the output polygon array matches the input centroid array in length.
-    u_centroids = unique(centroids)
-    if length(u_centroids) < n_c
-        u_polys, u_edges = get_voronoi_polygons_and_edges(u_centroids, hull_geom, tol)
-        return [u_polys[findfirst(==(c), u_centroids)] for c in centroids], u_edges
-    end
-
-    # 3+ points logic
-    pts_dt = [(Float64(c[1]), Float64(c[2])) for c in centroids]
-    tri = triangulate(pts_dt)
-    hull_coords = get_coords_from_geom(hull_geom)
-    xs = [p[1] for p in hull_coords if !isnan(p[1])]
-    ys = [p[2] for p in hull_coords if !isnan(p[2])]
-    if isempty(xs) || isempty(ys) return [Tuple{Float64, Float64}[] for _ in 1:length(centroids)], [] end
-    
-    bbox = (minimum(xs), maximum(xs), minimum(ys), maximum(ys))
-    vorn = voronoi(tri)
-    final_coords = [Tuple{Float64, Float64}[] for _ in 1:length(centroids)]
-    valid_geoms = Dict{Int, Any}()
-
-    for i in each_generator(vorn)
-        if i < 1 || i > length(centroids) continue end
-        vertices = get_polygon_coordinates(vorn, i, bbox)
-        if !isempty(vertices)
-            poly_pts = [[v[1], v[2]] for v in vertices]
-            if poly_pts[1] != poly_pts[end] push!(poly_pts, poly_pts[1]) end
-            try
-                lg_poly = LibGEOS.Polygon([poly_pts])
-                clipped = LibGEOS.intersection(lg_poly, hull_geom)
-                if !LibGEOS.isEmpty(clipped) && LibGEOS.geomTypeId(clipped) in [LibGEOS.GEOS_POLYGON, LibGEOS.GEOS_MULTIPOLYGON]
-                    final_coords[i] = get_coords_from_geom(clipped)
-                    valid_geoms[i] = clipped
-                end
-            catch e end
-        end
-    end
-
-    v_edges = []
-    active_ids = sort(collect(keys(valid_geoms)))
-    for idx in 1:length(active_ids)
-        i = active_ids[idx]
-        g1 = valid_geoms[i]
-        for jdx in idx+1:length(active_ids)
-            j = active_ids[jdx]
-            g2 = valid_geoms[j]
-            # Primary check: direct contact
-            if LibGEOS.touches(g1, g2)
-                push!(v_edges, (centroids[i], centroids[j]))
-            else
-                # Fallback check: microscopic overlap/buffer
-                g1_b = LibGEOS.buffer(g1, tol)
-                if LibGEOS.intersects(g1_b, g2)
-                    push!(v_edges, (centroids[i], centroids[j]))
-                end
-            end
-        end
-    end
-    return final_coords, v_edges
-end
-
-function check_connectivity(g)
-    """
-    Synopsis: Evaluates the connectivity of a spatial graph.
-    Inputs:
-    - g: A SimpleGraph.
-    Outputs:
-    - NamedTuple showing connection status and components.
-    """
-    comps = connected_components(g)
-    return (is_connected = length(comps) == 1, n_components = length(comps), components = comps)
-end
-
-
-
-function ensure_connected!(W::AbstractMatrix, centroids::Vector{<:Tuple{Real, Real}})
-    # Convert the adjacency matrix to a Graph object for component analysis
-    g = Graph(W)
-    comps = connected_components(g)
-    
-    # If the graph is already connected, no further action is required
-    if length(comps) <= 1
-        return W
-    end
-
-    # Number of components to bridge
-    n_comps = length(comps)
-    
-    # 1. Calculate Centroids for each component to reduce search space
-    # This simplifies the problem from comparing all nodes to comparing component centers
-    comp_centroids = Vector{Vector{Float64}}(undef, n_comps)
-    for i in 1:n_comps
-        pts = [ [centroids[node][1], centroids[node][2]] for node in comps[i] ]
-        comp_centroids[i] = mean(pts)
-    end
-
-    # 2. Build a KD-Tree of the component centroids for efficient spatial lookup
-    # We treat each component as a single point in this high-level search
-    centroid_matrix = hcat(comp_centroids...)
-    tree = KDTree(centroid_matrix)
-
-    # 3. Iteratively bridge components using the nearest-neighbor logic
-    # We connect the most isolated components first to ensure global connectivity
-    for i in 1:n_comps
-        # Find the nearest component other than itself
-        # knn returns indices and distances; we look for the 2 nearest (itself + neighbor)
-        idxs, dists = knn(tree, comp_centroids[i], 2)
-        target_comp_idx = idxs[2]
-        
-        # Now find the absolute closest node pair between the two identified components
-        # While this sub-step is O(Ni * Nj), the components are typically small sub-graphs
-        min_dist = Inf
-        best_pair = (0, 0)
-        
-        for u in comps[i]
-            for v in comps[target_comp_idx]
-                d = sqdist([centroids[u][1], centroids[u][2]], [centroids[v][1], centroids[v][2]])
-                if d < min_dist
-                    min_dist = d
-                    best_pair = (u, v)
-                end
-            end
-        end
-        
-        # 4. Update the sparse adjacency matrix with the new bridging edge
-        u_node, v_node = best_pair
-        if u_node != 0 && v_node != 0
-            W[u_node, v_node] = true
-            W[v_node, u_node] = true
-        end
-    end
-
-    # Verify final connectivity to ensure no orphans remain
-    final_g = Graph(W)
-    if length(connected_components(final_g)) > 1
-        # Recursive fallback for complex edge cases (e.g., non-convex boundaries)
-        return ensure_connected!(W, centroids)
-    end
-
-    return W
-end
-
-function sqdist(p1, p2)
-    return (p1[1]-p2[1])^2 + (p1[2]-p2[2])^2
-end
-
-
-function plot_spatial_graph(; au=nothing, pts=nothing, plot_title="Spatial Partitioning")
- 
-    # 2. Base Plot Initialization
-    plt = Plots.plot(aspect_ratio=:equal, legend=false)
-    Plots.title!(plt, plot_title)
-
-    # 3. Polygon Geometry Rendering
-        for poly_coords in au[:polygons]
-            if length(poly_coords) > 2
-                px = [p[1] for p in poly_coords if !isnan(p[1])]
-                py = [p[2] for p in poly_coords if !isnan(p[2])]
-                if !isempty(px) && (px[1], py[1]) != (px[end], py[end])
-                    push!(px, px[1])
-                    push!(py, py[1])
-                end
-                Plots.plot!(plt, px, py, seriestype=:shape, fillalpha=0.1, linecolor=:black, lw=0.5)
-            end
-        end 
-
-    # 4. Adjacency Graph Edge Rendering 
-        for edge in Graphs.edges(au[:graph])
-            u, v = Graphs.src(edge), Graphs.dst(edge)
-            p1, p2 = au[:centroids][u], au[:centroids][v]
-            Plots.plot!(plt, [p1[1], p2[1]], [p1[2], p2[2]], color=:red, lw=1.5, alpha=0.6)
-        end 
-
-    # 5. Scatter Plotting: Data Points and Polygon Centroids
-    if !isnothing(pts)
-        Plots.scatter!(plt, [p[1] for p in pts], [p[2] for p in pts],
-            markersize=1, color=:gray, alpha=0.3, label="Points")
-    end
- 
-        Plots.scatter!(plt, [c[1] for c in au[:centroids]], [c[2] for c in au[:centroids]],
-            markersize=4, color=:blue, markerstrokecolor=:white, label="Centroids")
-
-    # 6. Boundary Constraints
-        bx = [p[1] for p in au[:hull_coords] if !isnan(p[1])]
-        by = [p[2] for p in au[:hull_coords] if !isnan(p[2])]
-        Plots.plot!(plt, bx, by, color=:black, lw=2, ls=:dash)
-
-    return plt
-end
-
-    
-
-################
- 
-
-function turingindex( indices, sym=nothing, dims=nothing  ) 
-     
-    if isa(indices, DynamicPPL.Model)
-        _, indices = bijector(turing_model, Val(true));
-    end
-
-    if isnothing(sym)
-      out = enumerate(keys(indices))
-    elseif sym=="varnames"
-      out = keys(indices)
-    else
-      out = union(indices[sym]...)
-    end
-    
-    if !isnothing(dims)
-        out = reshape(out, dims)
-    end
-
-    return out 
-end
-
-
-function showtuples(X)
-    for k in keys(X)
-        val = getproperty(X, k)
-        # Skip displaying keys with NaN values
-        # Check if value is numeric before rounding to avoid errors
-        display_val = val isa Number ? round(val, digits=3) : val
-        println("$k: $display_val")
-    end
-end
-
-
-
-function showparams(X, keywords=["rho", "phi", "sigma",  "mu_", "l_", "ls_"]; limit=10 )
-    # Create a regex pattern by joining keywords with the pipe '|' operator
-    pattern = Regex(join(keywords, "|"))
-
-    # Filter the parameter list
-    matched_params = filter(p -> occursin(pattern, string(p)), FlexiChains.parameters(X))
-
-    # Display the filtered slice
-    if isempty(matched_params)
-        println("No parameters matched keywords: $keywords")
-    else
-        out = X[matched_params[1:min(limit, end)]]
-        # display(out)
-        return out
-    end
-end
-
-
-
-
-
-function random_correlation_matrix(d=3, eta=1)
-
-# etas = [1 10 100 1000 1e+4 1e+5];
-# d = size of matrix
-
-# EXTENDED ONION METHOD to generate random correlation matrices
-# distributed ~ det(S)^eta [or maybe det(S)^(eta-1), not sure]
-# https://stats.stackexchange.com/questions/2746/how-to-efficiently-generate-random-positive-semidefinite-correlation-matrices
-
-# LKJ modify this method slightly, in order to be able to sample correlation matrices C from a distribution 
-# proportional to [detC]η−1. The larger the η, the larger will be the determinant, meaning that generated 
-# correlation matrices will more and more approach the identity matrix. The value η=1 corresponds to uniform distribution. 
- 
-    beta = eta + (d-2)/2;
-    u = rand( Beta(beta, beta) );
-    r12 = 2*u - 1;
-    S = [1 r12; r12 1];  
-
-    for k = 3:d
-        beta = beta - 1/2;
-        y = rand( Beta((k-1)/2, beta) );  # sample from beta
-        r = sqrt(y);
-        theta = randn(k-1,1);
-        theta = theta/norm(theta);
-        w = r*theta;
-        U, E = eigen(S);
-        U = hcat(U)
-        R = U' * sqrt(E) * U; # R is a square root of S
-        q = R[].re * w;
-        S = [S q; q' 1];
-    end
-    return S
-end
-
-
-
-
-function build_st_inputs(time_indices, space_indices, spatial_coords)
-  # Space-Time Input Construction
-  # Space and Time as continuous coordinates.
-  # Inputs: 
-  #   spatial_coords: Matrix (2 x N_nodes) -> [Lat, Lon]
-  #   time_coords: Vector (T_steps)
-  # Returns:
-  #   ColVecs of 3D points (Time, Lat, Lon)
-
-  # Map indices to actual coordinates
-  # This assumes spatial_coords is 2xN
-
-  # Extract coords for every observation
-  coords = spatial_coords[:, space_indices] # 2 x y_N
-  times = time_indices' # 1 x y_N
-
-  # Stack to create 3D input: [Time; Lat; Lon]
-  return ColVecs(vcat(times, coords))
-end
-
- 
-
-
-function adjacency_matrix_to_nb( W )
-    nau = size(W)[1]
-    # W = LowerTriangular(W)  # using LinearAlgebra
-    nb = [Int[] for _ in 1:nau]
-    Threads.@threads for i in 1:nau
-        nb[i] = findall( isone, W[i,:] )
-    end
-    return nb
-end
-
-
-function nb_to_adjacency_matrix( nb )
-    nau = Integer( length( unique( reduce(vcat, nb) )) )
-    W = zeros( Int8, nau, nau )
-    Threads.@threads for i in 1:nau
-        for j in 1:length( nb[i] )
-            k = nb[i][j]
-            W[i, k] = 1
-        end
-    end
-    return(W)
-end
-
-
-function nodes( adj )
-    nau = length(adj)
-    N_edges = Integer( length( reduce(vcat, adj) )/2 )
-    node1 =  fill(0, N_edges); 
-    node2 =  fill(0, N_edges); 
-    i_edge = 0;
-    for i in 1:nau
-        u = adj[i]
-        num = length(u)
-        for j in 1:num
-            k = u[j]
-            if i < k
-                i_edge = i_edge + 1;
-                node1[i_edge] = i;
-                node2[i_edge] = k;
-            end
-        end
-    end
-
-    e = Edge.(node1, node2)
-    g = Graph(e)
-    W = Graphs.adjacency_matrix(g)
-    
-    # D = diagm(vec( sum(W, dims=2) ))
-    scalefactor = scaling_factor_bym2(W)
-
-    return node1, node2, scalefactor
-end
-
 
 
 function scaling_factor_bym2( adjacency_mat )
@@ -2470,383 +914,6 @@ function scaling_factor_bym2(node1, node2, groups=ones(length(node1)))
     return scale_factor
 end
 
- 
-
-function sample_gaussian_process( ; GPmethod="cholesky", returntype="default",
-    fkernal=nothing, kerneltype="default", kvar=nothing, kscale=nothing, gpc=GPC(),
-    Yobs, Xobs, Xinducing=nothing, lambda=0.0001 )
-    
-    if isnothing(fkernal)
-        if kerneltype=="default" || kerneltype=="squared_exponential"
-            fkernal = kvar * SqExponentialKernel() ∘ ScaleTransform( kscale) # ∘ ARDTransform(α)
-        end
-        if kerneltype=="matern32"
-            fkernal = kvar * Matern32Kernel() ∘ ScaleTransform( kscale) # ∘ ARDTransform(α)
-        end
-    end
-
-
-
-    if GPmethod=="textbook"
-        # Dimensional fix: Removed vec() to allow multi-feature inputs (N x D)
-        Ko = kernelmatrix( fkernal, Xobs )
-        Kcommon = inv(Ko + lambda*I) 
-
-        if !isnothing(Xinducing)
-            Ki = kernelmatrix( fkernal, Xinducing )
-            Kio = kernelmatrix( fkernal, Xinducing, Xobs ) 
-            Yinducing_mean_process = Kio * Kcommon * Yobs 
-            Covi = Symmetric( Ki - Kio * Kcommon * Kio'  + lambda*I )
-            MVNi = MvNormal( Yinducing_mean_process, Covi )
-
-            Yinducing_sample  = rand( MVNi )
-            Li =  cholesky(Symmetric( Ki + lambda*I)).L 
-
-            Yobs_mean_process =  Kio' * ( Li' \ (Li \ Yinducing_mean_process  ) ) 
-            Covo = Symmetric(kernelmatrix( fkernal, Xobs ) + lambda*I)
-            MVN = MvNormal(Yobs_mean_process, Covo)
-
-            if returntype=="fcovariance"
-                return MVN
-            end
-
-            Yobs_sample =  Kio' * ( Li' \ (Li \ Yinducing_sample  ) ) 
-
-            if returntype=="sample"
-                return (Yobs_sample=Yobs_sample, Yinducing_sample=Yinducing_sample, GPmethod=GPmethod)
-            end
-
-            LogLik = logpdf(MVN, Yobs)
-
-            if returntype=="sample_loglik"
-                return ( Yobs_sample=Yobs_sample, loglik=LogLik, GPmethod=GPmethod)
-            end
-
-            return (MVN=MVN, MVNi=MVNi, Li=Li, loglik=LogLik,
-                Yobs_sample=Yobs_sample, Yinducing_sample=Yinducing_sample, GPmethod=GPmethod)
-
-        else
-            mean_process = Ko * Kcommon * Yobs   
-            MVN = MvNormal(mean_process, Ko + lambda*I  ) 
-
-            if returntype=="fcovariance"
-                return MVN
-            end
-
-            Yobs_sample = rand( MVN ) 
-
-            if returntype=="sample"
-                return ( Yobs_sample=Yobs_sample, GPmethod=GPmethod )
-            end
-
-            LogLik = logpdf(MVN,Yobs)
-
-            if returntype=="sample_loglik"
-                return ( Yobs_sample=Yobs_sample, loglik=LogLik, GPmethod=GPmethod)
-            end
-
-            return ( MVN=MVN, loglik=LogLik, Yobs_sample=Yobs_sample, GPmethod=GPmethod)
-        end
-    end
-
-    if GPmethod=="cholesky"
-        if !isnothing(Xinducing)
-            Ko = kernelmatrix( fkernal, Xobs )
-            Ki = kernelmatrix( fkernal, Xinducing )
-            Kio = kernelmatrix( fkernal, Xinducing, Xobs )
-            Lo = cholesky(Symmetric( Ko + lambda*I)).L
-            Li = cholesky(Symmetric( Ki + lambda*I)).L
-            Yinducing_mean_process  = Kio * ( Lo' \ (Lo \ Yobs ) ) 
-
-            Covi = Symmetric( Ki + lambda*I)
-            MVN = MvNormal( Yinducing_mean_process, Covi )
-
-            if returntype=="fcovariance"
-                return MVN
-            end
-
-            Yobs_mean_process = Kio' * ( Li' \ (Li \ Yinducing_mean_process )) 
-            Yinducing_sample  = Yinducing_mean_process + Li * rand(Normal(0, 1), size(Li,1))
-            Yobs_sample = Yobs_mean_process + Lo * rand(Normal(0, 1), size(Lo,2))
-
-            if returntype=="sample"
-                return (Yobs_sample=Yobs_sample, Yinducing_sample=Yinducing_sample, GPmethod=GPmethod)
-            end
-
-            LogLik = logpdf(MVN, Yinducing_mean_process)
-
-            if returntype=="sample_loglik"
-                return ( Yobs_sample=Yobs_sample, loglik=LogLik, GPmethod=GPmethod)
-            end
-
-            return (MVN=MVN, Li=Li, Lo=Lo, loglik=LogLik,
-                    Yobs_sample=Yobs_sample, Yinducing_sample=Yinducing_sample, GPmethod=GPmethod)
-
-        else
-            Ko = kernelmatrix( fkernal, Xobs )
-            Lo = cholesky(Symmetric( Ko + lambda*I)).L
-            Yobs_mean_process = Ko' * ( Lo' \ (Lo \ Yobs )) 
-            Covo = Symmetric( Ko + lambda*I)
-            MVN = MvNormal( Yobs_mean_process, Covo ) 
-
-            if returntype=="fcovariance"
-                return MVN
-            end
-
-            Yobs_sample = Yobs_mean_process + Lo * rand(Normal(0, 1), size(Lo,2))
-
-            if returntype=="sample"
-                return (Yobs_sample=Yobs_sample, GPmethod=GPmethod)
-            end
-
-            LogLik = logpdf(MVN, Yobs)
-
-            if returntype=="sample_loglik"
-                return (Yobs_sample=Yobs_sample, loglik=LogLik,  GPmethod=GPmethod )
-            end
-
-            return (MVN=MVN, Lo=Lo, loglik=LogLik, Yobs_sample=Yobs_sample, GPmethod=GPmethod)
-        end
-    end
-
- 
-
-    if GPmethod=="GPexact"
-
-        fgp = atomic(AbstractGPs.GP(fkernal), gpc)
-        fobs = fgp(Xobs, lambda)
-
-        if returntype=="fcovariance"
-            return fobs
-        end 
-
-        fposterior = posterior(fobs, Yobs) 
-        
-        if returntype=="posterior"
-            return fposterior
-        end
-
-        Yobs_sample =  rand(fposterior(Xobs, lambda) )   
-
-        if returntype=="sample"
-            return ( Yobs_sample=Yobs_sample, GPmethod=GPmethod)
-        end
-
-        LogLik = logpdf(fobs, Yobs)
-       
-        if returntype=="sample_loglik"
-            return (Yobs_sample=Yobs_sample, loglik=LogLik,  GPmethod=GPmethod )
-        end
-
-        return ( fgp=fgp, fobs=fobs, fposterior=fposterior, Yobs_sample=Yobs_sample, loglik=LogLik, GPmethod=GPmethod)
-    end
- 
-    if GPmethod=="GPsparse"
-        fgp = atomic(AbstractGPs.GP(fkernal), gpc)
-        fobs = fgp( Xobs, lambda )
-        finducing = fgp( Xinducing, lambda ) 
-        fsparse = SparseFiniteGP(fobs, finducing)
-
-        if returntype=="fcovariance"
-            return fsparse
-        end 
-
-        fposterior = posterior(fsparse, Yobs)
-
-        if returntype=="posterior"
-            return fposterior
-        end
-        
-        Yobs_sample =  rand(fposterior(Xobs, lambda) )  
-        Yinducing_sample =   rand(fposterior(Xinducing, lambda))
-
-        if returntype=="sample"
-            return (Yobs_sample=Yobs_sample, Yinducing_sample=Yinducing_sample, GPmethod=GPmethod)
-        end
-
-        LogLik = logpdf(fsparse, Yobs)
-       
-        if returntype=="sample_loglik"
-            return (Yobs_sample=Yobs_sample, Yinducing_sample=Yinducing_sample, loglik=LogLik,  GPmethod=GPmethod )
-        end
-
-        return ( fgp=fgp, fobs=fobs, finducing=finducing, fsparse=fsparse, fposterior=fposterior, loglik=LogLik, 
-                Yobs_sample=Yobs_sample, Yinducing_sample=Yinducing_sample, GPmethod=GPmethod)
-
-    end
-
-    if GPmethod=="GPvfe" # Variational Free Energy
-        fgp = atomic(AbstractGPs.GP(fkernal), gpc)
-        fobs = fgp( Xobs, lambda )
-        finducing = fgp(Xinducing, lambda )
-        fsparse = VFE( finducing )
-
-        if returntype=="fcovariance"
-            return fsparse
-        end 
-        
-        fposterior = posterior(fsparse, fobs, Yobs)  # Distribution is MvNormal  
-
-        if returntype=="posterior"
-            return fposterior
-        end
-        
-        Yobs_sample =  rand(fposterior(Xobs, lambda) )  
-        Yinducing_sample =   rand(fposterior(Xinducing, lambda))
-
-        if returntype=="sample"
-            return (Yobs_sample=Yobs_sample, Yinducing_sample=Yinducing_sample, GPmethod=GPmethod)
-        end
-        
-        LogLik = AbstractGPs.elbo(fsparse, fobs, Yobs)  # to a constant
-      
-        if returntype=="sample_loglik"
-            return (Yobs_sample=Yobs_sample, Yinducing_sample=Yinducing_sample, loglik=LogLik,  GPmethod=GPmethod )
-        end
-
-        return ( fgp=fgp, fobs=fobs, finducing=finducing, fsparse=fsparse, fposterior=fposterior, loglik=LogLik, 
-                Yobs_sample=Yobs_sample, Yinducing_sample=Yinducing_sample, GPmethod=GPmethod)
-    end
-      
-end
- 
-  
-
-function plot_variational_marginals(z, sym2range)
-    # copied straight from https://turinglang.org/docs/tutorials/variational-inference/
-    ps = []
-
-    for (i, sym) in enumerate(keys(sym2range))
-        indices = union(sym2range[sym]...)  # <= array of ranges
-        if sum(length.(indices)) > 1
-            k = 1
-            for r in indices
-                p = density(
-                    z[r, :];
-                    title="$(sym)[$k]",
-                    titlefontsize=10,
-                    label="",
-                    ylabel="Density",
-                    margin=1.5mm,
-                )
-                push!(ps, p)
-                k += 1
-            end
-        else
-            p = density(
-                z[first(indices), :];
-                title="$(sym)",
-                titlefontsize=10,
-                label="",
-                ylabel="Density",
-                margin=1.5mm,
-            )
-            push!(ps, p)
-        end
-    end
-
-    return plot(ps...; layout=(length(ps), 1), size=(500, 2000), margin=4.0mm)
-end
-
-
-function fkernal( kernfunctype="squared_exp", params=nothing )
-
-    if kernfunctype=="squared_exp"
-        out = params[1] * SqExponentialKernel() ∘ ScaleTransform(params[2])  
-    end
-
-    if kernfunctype=="matern12"
-        out = params[1] * Matern12Kernel() ∘ ScaleTransform(params[2])  
-    end
-
-    if kernfunctype=="matern32"
-        out = params[1] * Matern32Kernel() ∘ ScaleTransform(params[2])  
-    end
-
-    if kernfunctype=="matern52"
-        out = params[1] * Matern52Kernel() ∘ ScaleTransform(params[2])  
-    end
-
-    # ∘ ARDTransform(α)
-
-    return out
-end
-
-
-sekernel2(v, s) = v * SqExponentialKernel() ∘ ScaleTransform(s) # ∘ ARDTransform(a);
-
-sekernel(v, s) = v * SqExponentialKernel() ∘ ScaleTransform(s) # ∘ ARDTransform(a);
- 
-
-# Squared-exponential covariance function
-sqexp_cov_fn(D, phi, noise=1e-6) = exp.(-D^2 / phi) + LinearAlgebra.I * noise
-
-# Exponential covariance function
-exp_cov_fn(D, phi) = exp.(-D / phi)
-
-
-
-# generic kernel functions 
-
-# lenscale = -1 / log(ρ)
-# σ_ar1^2 / (1 - ρ^2) = marginal variance
-# kernel_ar1(σ, ρ) = σ^2 * with_lengthscale(Matern12Kernel(), -1/log(ρ)) 
-# the softplus should not be necessary ... 
-
-kernel_ar1(σ, ρ) = σ^2 / softplus(1 - ρ^2) * with_lengthscale(Matern12Kernel(), softplus(-1 / log(ρ)) )
-
-# RW2 is equivalent to a Spline kernel or an Integrated Wiener Process
-# For simplicity, use a high-order Matern or a custom structure
-
-kernel_rw2(σ) = σ^2 * Matern52Kernel() # Matern32 is a common smooth approximation for RW2
-
-
-   
-    
-function assign_time_units(t_v; time_method="regular", t_N=nothing, u_N=12, kwargs...)
-
-    if time_method=="regular"
-
-        tint = Int.(floor.(t_v))
-        t0, t1 = minimum(tint), maximum(tint)
-        t_n = t1-t0
-        if !isnothing(t_N) 
-            if t_n != t_N
-                print("warning: time range and unique years do not match")
-            end
-        end
-
-        t_idx = tint .- t0 .+ 1
-        t_vals = collect(t0:t1) .- t0 .+ 1
-        t_yr = collect(t0:t1)
-        t_brks = (t_yr, t1+1)
-        t_mids = t_yr .+ 0.5
-        
-        u_v = t_v - tint
-
-        u_disc = discretize_data( u_v, N_cat=u_N, method="regular" )  # seasonality discretized
-
-        return (
-            t_v = t_v, 
-            t_idx = t_idx, 
-            t0=t0, 
-            t1=t1, 
-            t_vals, 
-            t_yr=t_yr, 
-            t_mids=t_mids, 
-            t_brks=t_brks,
-            tn=length(t_vals),
-            t_N= length(t_vals),
-            u_v=u_v, 
-            u_idx=u_disc.idx, 
-            u_brks=u_disc.brks,
-            u_mids=u_disc.mids, 
-            u_N=u_N,
-            u_vals=collect(1:u_N) 
-        )
-    end
-
-end
 
 
 function discretize_data(X; method="quantile", N_cat=9, brks=nothing, probs=nothing, dx=nothing, minv = 0, maxv=1)
@@ -2890,370 +957,9 @@ function discretize_data(X; method="quantile", N_cat=9, brks=nothing, probs=noth
 
     end
 
-
 end
  
  
-
-function assign_covariate_levels( X; N_cat=9, brks=nothing, probs=nothing )
-    X = Array(X)
-    U = [ discretize_data( X[:,i], N_cat=N_cat, brks=brks, probs=probs ) for i in 1:size(X, 2) ]
-    V = hcat([t[:idx] for t in  U]...)  # as matrix
-    B = hcat([t[:brks] for t in  U]...)
-    M = hcat([t[:mids] for t in  U]...)
-    P = hcat([t[:probs] for t in  U]...)
-    return( idx=V, brks=B, mids=M, probs=P )
-end
-
-
-
-function estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx, target_ts; grid_res=600, sd_extension_factor=0.25)
-    """
-    Synopsis: Estimates 2D KDE for a specific time slice with extrapolation.
-    Inputs:
-    - s_coord_tuple: Vector of (x, y) coordinates for all time points.
-    - t_idx: Vector of time indices corresponding to s_coord_tuple.
-    - target_ts: The specific time slice to estimate KDE for.
-    - grid_res: Resolution of the output grid (e.g., 100 for 100x100 grid).
-    - sd_extension_factor: Multiplier for standard deviation to define the bandwidth.
-    Outputs:
-    - Tuple (x_grid, y_grid, intensity) where intensity is a matrix.
-    """
-    # Filter points for the target time slice
- 
-    filtered_pts = [p for (i, p) in enumerate(s_coord_tuple) if t_idx[i] == target_ts]
-    if isempty(filtered_pts)
-        error("No points found for the target time slice $target_ts")
-    end
-    xs, ys = [p[1] for p in filtered_pts], [p[2] for p in filtered_pts]
-    # Calculate bandwidth based on standard deviation of points
-    bw_x = std(xs) * sd_extension_factor
-    bw_y = std(ys) * sd_extension_factor
-    # Define grid boundaries extending slightly beyond the data range
-    x_min, x_max = minimum(xs) - bw_x, maximum(xs) + bw_x
-    y_min, y_max = minimum(ys) - bw_y, maximum(ys) + bw_y
-    x_grid = collect(range(x_min, stop=x_max, length=grid_res))
-    y_grid = collect(range(y_min, stop=y_max, length=grid_res))
-    intensity = zeros(grid_res, grid_res)
-    # Gaussian KDE implementation
-    for i in 1:grid_res
-        for j in 1:grid_res
-            x_val, y_val = x_grid[i], y_grid[j]
-            for (px, py) in filtered_pts
-                dx = (x_val - px) / bw_x
-                dy = (y_val - py) / bw_y
-                intensity[i, j] += exp(-0.5 * (dx^2 + dy^2))
-            end
-        end
-    end
-    # Normalize intensity to sum to 1 (optional, depending on desired output)
-    intensity ./= sum(intensity)
-    return x_grid, y_grid, intensity
-end
-
-
-
-function calculate_metrics(au_obj)
-    # Map coordinates from constituent vectors to avoid FieldError
-    local observation_points = tuple.(au_obj.s_x, au_obj.s_y)
-    
-    # Re-calculate assignments based on nearest centroid
-    local assignments = [argmin([sum((p .- c).^2) for c in au_obj.centroids]) for p in observation_points]
-    
-    # Compute frequency counts per spatial unit
-    local unit_counts = [count(==(i), assignments) for i in 1:length(au_obj.centroids)]
-
-    # Filter valid numerical entries to prevent NaN propagation
-    local valid_entries = filter(x -> !isnan(x) && !ismissing(x), unit_counts)
-
-    if isempty(valid_entries)
-        return (mean_density=NaN, sd_density=NaN, cv_density=NaN)
-    end
-
-    local m_val = mean(valid_entries)
-    local s_val = std(valid_entries)
-    local cv_val = s_val / (m_val + 1e-9)
-
-    return (mean_density=m_val, sd_density=s_val, cv_density=cv_val)
-end
-
-
-function get_spatial_graph( centroids, adjacency_edges )
-    """
-    Synopsis: Converts partitioning results into a formal SimpleGraph. 
-    Outputs: A SimpleGraph object.
-    """
-    n = length(centroids)
-    g = SimpleGraph(n)
-    centroid_map = Dict(c => i for (i, c) in enumerate(centroids))
-    for edge in adjacency_edges
-        xi, yi = get(centroid_map, edge[1], 0), get(centroid_map, edge[2], 0)
-        if xi > 0 && yi > 0 add_edge!(g, xi, yi) end
-    end
-    return g
-end
-
-
-
-function plot_kde_simple(s_coord_tuple; grid_res=600, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
-    # Internal wrapper for estimate_local_kde_with_extrapolation
-    # Description: Generates a simple 2D Heatmap of spatial intensity using Kernel Density Estimation.
-    # Inputs:
-    #   - s_coord_tuple: Vector of (x, y) coordinate tuples.
-    #   - grid_res: Resolution of the output grid.
-    #   - sd_extension_factor: Factor to extend the bandwidth standard deviation.
-    #   - title: Title for the generated plot.
-    # Outputs:
-    #   - A Plots.Plot object (Heatmap with scatter overlay).
-    # Using a dummy t_idx of 1s since plotting a static slice
- 
-    t_idx_dummy = ones(Int, length(s_coord_tuple))
-    x_g, y_g, intensity = estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx_dummy, 1; grid_res=grid_res, sd_extension_factor=sd_extension_factor)
-
-    plt = Plots.heatmap(x_g, y_g, intensity',
-                  title=title,
-                  c=:viridis,
-                  aspect_ratio=:equal,
-                  xlabel="X", ylabel="Y")
-    Plots.scatter!(plt, [p[1] for p in s_coord_tuple], [p[2] for p in s_coord_tuple],
-                   markersize=2, markercolor=:white, markeralpha=0.5, label="Points")
-    return plt
-end
- 
-
-
-function icar_form(theta, phi, sigma, rho)
-    # https://sites.stat.columbia.edu/gelman/research/published/bym_article_SSTEproof.pdf
-    # Reibler parameterization: https://pubmed.ncbi.nlm.nih.gov/27566770/
-    # https://www.jstatsoft.org/index.php/jss/article/view/v063c01/841
-    sigma .* ( sqrt.(1 .- rho) .* theta .+ sqrt.(rho ./ scaling_factor) .* phi )  
-end
-   
-
-
- 
-function kron_matern_sample(Ns, Nt, unique_s, unique_t, ls_s, sigma_s, ls_t, sigma_t, noise_vec)
-    # Spatial Precision
-    k_s = Matern32Kernel() ∘ ScaleTransform(inv(ls_s))
-    K_s = Symmetric(sigma_s^2 * kernelmatrix(k_s, RowVecs(unique_s)) + 1e-4*I)
-    Q_s = inv(K_s)
-
-    # Temporal Precision
-    k_t = Matern32Kernel() ∘ ScaleTransform(inv(ls_t))
-    K_t = Symmetric(sigma_t^2 * kernelmatrix(k_t, unique_t) + 1e-4*I)
-    Q_t = inv(K_t)
-
-    # Full Kronecker Precision (Dense for AD compatibility)
-    Q_full = Symmetric(Matrix(kron(Q_t, Q_s)) + 1e-4*I)
-    L_q = cholesky(Q_full)
-
-    # Sample: f = (L')^-1 * noise
-    return L_q.U \ noise_vec
-end
-
-
-function get_posterior_means(ch, param_base, N)
-    # Description:
-    #   Extracts and averages posterior samples for a specific vector parameter.
-    # Inputs:
-    #   ch: MCMC sample chain.
-    #   param_base: String prefix of the parameter (e.g., "s_eff").
-    #   N: Length of the vector parameter.
-    # Outputs:
-    #   Vector of posterior means.
-
-    means = zeros(N)
-    
-    for i in 1:N
-        p_symbol = Symbol("$param_base[$i]")
-        if p_symbol in names(ch, :parameters)
-            means[i] = mean(ch[p_symbol])
-        else
-            @warn "Parameter $p_symbol not found in chain."
-        end
-    end
-    
-    return means
-end
-
-
-
-function generate_inducing_points(coords, M_inducing, seed=42; method="kmeans")
-
-    # Helper function to generate inducing points (simple random sampling for now)
-
-    Random.seed!(seed)
-    n_data = size(coords, 1)
-    if M_inducing >= n_data
-        return coords # If M >= N, just use all data points (becomes exact GP)
-    end
-
-    
-    if method=="random"
-        indices = sample(1:n_data, M_inducing, replace=false)
-        return coords[indices, :]
-    end
-
-    if method=="kmeans"
-        #   Identifies optimal inducing point locations using K-Means clustering.
-        #   Essential for Sparse/FITC Gaussian Process models.
-        # Inputs:
-        #   coords: N x D matrix of spatiotemporal coordinates.
-        #   M_inducing: Target number of inducing points.
-        # Outputs:
-        #   M x D matrix of cluster centroids.
-
-        # Transpose for Clustering.jl compatibility
-        data_matrix = Matrix(coords')
-        
-        # Execute K-Means
-        clustering_result = kmeans(data_matrix, M_inducing, maxiter=200)
-        
-        # Extract centroids and transpose back
-        inducing_points = clustering_result.centers'
-        
-        return inducing_points
-    end
-
-    if method=="furthest_point"
-
-        # Initialize with a random point
-        inducing_points_idx = [rand(1:n_data)]
-        distances = fill(Inf, n_data)
-
-        # Convert coords to the expected format for pairwise
-        coords_matrix = permutedims(coords)
-
-        for _ in 2:M_inducing
-            # Calculate distances from all points to the newest inducing point
-            last_added_idx = inducing_points_idx[end]
-            new_distances = colwise(Euclidean(), coords_matrix, coords_matrix[:, last_added_idx])
-
-            # Update minimum distances to any inducing point found so far
-            distances = min.(distances, new_distances)
-
-            # Find the point farthest from any existing inducing point
-            farthest_idx = argmax(distances)
-            push!(inducing_points_idx, farthest_idx)
-        end
-
-        return coords[inducing_points_idx, :], inducing_points_idx
-
-    end
-
-end
-
- 
-function ar1_covariance(n, rho, var, ::Type{T}=Float64) where {T}
-    # Description:
-    #   Generates a full AR1 covariance matrix.
-    # Inputs:
-    #   n: Number of time points.
-    #   rho: Correlation coefficient.
-    #   var: Marginal variance.
-    # Outputs:
-    #   n x n Covariance matrix.
-
-    vcv = zeros(T, n, n) .+ I(n)
-    
-    Threads.@threads for r in 1:n
-        for c in 1:n
-            if r >= c
-                vcv[r, c] = var * rho^(r - c)
-            end
-        end
-    end
-    
-    return Symmetric(vcv)
-end
-
- 
-
-
-function ar1_covariance_local( n, rho, var,  ::Type{T}=Float64 )  where {T} 
-    vcv = zeros( T, n, n) .+ I(n) 
-    Threads.@threads for r in 1:n
-    for c in 1:n
-        d = r-c
-        if d == 0 | d == 1
-            vcv[r,c] = var * rho^d  
-        end
-    end
-    end
-    return vcv
-end
-
-
-
-function gp_predictions(; Y, D, mu, sig2, phi, cov_fn=exp_cov_fn, nN=length(Xnew), nP=size(res, 1) ) 
-    ynew = Vector{Float64}()
-    # Threads.@threads -- to add 
-    for i in sample(1:size(res,1), nP, replace=true)
-        K = cov_fn(D, phi[i])
-        Koo_inv = inv(K[(nN+1):end, (nN+1):end])
-        Knn = K[1:nN, 1:nN]
-        Kno = K[1:nN, (nN+1):end]
-        C = Kno * Koo_inv
-        mvn = MvNormal( 
-            C * (Y .- mu[i]) .+ mu[i], 
-            Matrix(LinearAlgebra.Symmetric(Knn - C * Kno')) + sig2[i] * LinearAlgebra.I 
-        ) 
-        ynew = vcat(ynew, [rand(mvn) ] )
-    end
-    ynew = stack(ynew, dims=1)  # rehape to matrix   
-    return ynew
-end
-
-
-
-
-function variational_inference_solution(m; max_iters=100, nsamps=max_iters,  nelbo=3 )
-
-    # Fit via ADVI. minor speed benefit vs NUTS
-    _, indices = Bijectors.bijector(m, Val(true));
-    vars = keys(indices)
-
-    q0 = Variational.meanfield(m)     # initialize variational distribution (optional)
-    advi = ADVI(nelbo, max_iters)    # num_elbo_samples, max_iters
-    msol = Turing.vi(m, advi, q0) #, optimizer=Flux.ADAM(1e-1));
-    msamples = DataFrame( rand(msol, nsamps )', :auto ) 
-
-    # vectorize variable names ... needs more conditions if 2-D or higher ..
-    vns = []
-    for (i, sym) in enumerate(vars) 
-        j = union(indices[sym]...)  # <= array of ranges
-        nj = sum(length.(j)) 
-        if  nj > 1
-            k = 1
-            for r in j
-                push!(vns, "$(sym)[$k]")
-                k += 1
-            end
-        else
-            push!(vns, "$(sym)") 
-        end
-    end
-    
-    vns = Symbol.(vns)
-
-    msamples = rename(msamples, vns)
-
-    mmean = combine( msamples, [ n => (x -> mean(x)) => n for n in names(msamples)  ] )
-    mstd  = combine( msamples, [ n => (x -> std(x)) => n for n in names(msamples)  ] )
-
-    out = (
-        msol = msol,
-        msamples = msamples, 
-        mmean = mmean,
-        mstd = mstd
-    )
-    
-    return out
- 
-end
-
-  
-
 
 function rff_map(coords, W, b)
     # Description:
@@ -3302,8 +1008,10 @@ function generate_informed_rff_params(coords, M_rff)
     # 3. Scale Calculation along observation axis
     coord_scales = std(mat, dims=2) .+ 1e-6
 
-    # 4. Frequency Weight Generation
-    W = randn(d, M_rff) ./ coord_scales
+    # 4. Frequency Weight Generation using spectral sampling
+    # The lengthscale is informed by the data std, with a multiplier
+    informed_ls = mean(coord_scales) * lengthscale_mult
+    W = sample_spectral_density(kernel_name, d, M_rff, informed_ls; nu=nu)
 
     # 5. Phase Shift Generation
     b = rand(M_rff) .* (2.0 * pi)
@@ -3322,189 +1030,6 @@ function generate_rff_params_for_se_kernel(D_in, M_rff, lengthscale)
 end 
  
 
-macro save_carstm_state(file_to_save_name_sym)
-  quote
-    try
-      # Evaluate the input symbol (e.g., :state_filename) to its value (e.g., "carstm_state.jld2")
-      local filename_val = $(esc(file_to_save_name_sym))
-      @info "Saving CARSTM state to $(filename_val)..."
-      # JLD2.@save expects variable names as symbols, not their values.
-      # The variables themselves should be directly passed.
-      JLD2.@save "$(filename_val)" areal_units mod chain y_sim y_binary t_idx weights trials cov_indices cov_indices trials_sim  weights_sim adj_matrix_numeric s_N t_N area_method
-      @info "CARSTM state saved successfully."
-    catch e
-      @error "Error saving CARSTM state: $e"
-    end
-  end
-end
-
-macro load_carstm_state(filename_sym)
-  quote
-    # Evaluate the input symbol (e.g., :state_filename) to its value (e.g., "carstm_state.jld2")
-    local filename_val = $(esc(filename_sym))
-    if !isfile(filename_val)
-      @error "File $(filename_val) not found."
-      return nothing
-    end
-    try
-      @info "Loading CARSTM state from $(filename_val)..."
-      # JLD2.@load expects variable names as symbols, not their values.
-      # The variables themselves should be directly passed.
-      JLD2.@load "$(filename_val)" areal_units mod chain  y_sim y_binary t_idx weights trials cov_indices cov_indices trials_sim  weights_sim adj_matrix_numeric s_N t_N area_method
-      @info "CARSTM state loaded successfully."
-      # Variables are loaded directly into the calling scope by JLD2.@load
-      # No explicit return value from the macro itself, as it injects variables
-    catch e
-      @error "Error loading CARSTM state: $e"
-      return nothing
-    end
-  end
-end
-
-
-function init_params_extract( res=NaN; load_from_file=false, override_means=false, fn_inits = "init_params.jl2"  )
-  # Description: Extracts initial parameter values from a model result summary or loads them from a file.
-  # Inputs:
-  #   - res: Model result object (default: NaN).
-  #   - load_from_file: Boolean, if true loads params from fn_inits.
-  #   - override_means: Boolean, if true applies custom overrides for specific parameter patterns.
-  #   - fn_inits: String, filename for storage.
-  # Outputs:
-  #   - A FillArray containing the extracted or loaded mean parameter values.
-
-  if load_from_file
-    init_params = load(fn_inits )
-    return(init_params)
-  end
-
-  ressumm = summarize(res)
-  vns = ressumm.nt.parameters
-  means = ressumm.nt[2]  # means
-
-  if  override_means
-    u = findall(x-> occursin(r"^t_period\[", String(x)), vns ); vns[u]
-    if length(u) > 0 
-      means[u] = [ 1.0, 1.0, 5.0, 5.0]  # (sin, cos) X annual, 5-year (el nino)
-    end
-
-    u = findall(x-> occursin(r"^pca_sd\[", String(x)), vns ); vns[u]
-    if length(u) > 0  
-      means[u] = sigma_prior  # from basic pca
-    end
-
-    u = findall(x-> occursin(r"^v\[", String(x)), vns ); vns[u]
-    if length(u) > 0 
-      means[u] = v_prior  # from basic pca
-    end
-  end
-
-  init_params = FillArrays.Fill( means )
-  jldsave( fn_inits; init_params )
-
-  return(init_params)
-end
-
-
-function init_params_copy( res=NaN, res0=NaN; load_from_file=false, override_means=false, fn_inits = "init_params.jl2"  )
-  # using spatial parts of res0 
-  # Description: Copies parameter values from a reference result (res0) to a target result structure (res).
-  # Inputs:
-  #   - res: Target model result object.
-  #   - res0: Reference model result object.
-  #   - load_from_file: Boolean to load from fn_inits instead.
-  #   - override_means: Boolean to apply custom pattern-based overrides.
-  #   - fn_inits: String, filename for storage.
-  # Outputs:
-  #   - A FillArray containing the merged mean parameter values.
-  if load_from_file
-    init_params = load(fn_inits )
-    return(init_params)
-  end
-
-  ressumm = summarize(res)
-  vns = ressumm.nt.parameters
-  means = ressumm.nt[2]  # means
-
-  ressumm0 = summarize(res0)
-  vns0 = ressumm0.nt.parameters
-  means0 = ressumm0.nt[2]  # means
-
-  if  override_means
-    u = findall(x-> occursin(r"^t_period\[", String(x)), vns );  
-    if length(u) > 0 
-      means[u] = [ 1.0, 1.0, 5.0, 5.0, 10.0, 10.0][1:length(u)]  # (sin, cos) X annual, 5-year (el nino)
-    end
-
-    u = findall(x-> occursin(r"^pca_sd\[", String(x)), vns );  
-    if length(u) > 0  
-      u0 = findall(x-> occursin(r"^pca_sd\[", String(x)), vns0 );  
-      if length(u0) > 0  && length(u) == length(u0)
-        means[u] = means0[u0]  # from basic pca
-      end
-    end
-
-    u = findall(x-> occursin(r"^v\[", String(x)), vns );  
-    if length(u) > 0  
-      u0 = findall(x-> occursin(r"^pca_sd\[", String(x)), vns0 );  
-      if length(u0) > 0  && length(u) == length(u0)
-        means[u] = means0[u0]  # from basic pca
-      end
-    end
-  end
-  
-  init_params = FillArrays.Fill( means )
-  jldsave( fn_inits; init_params )
-
-  return(init_params)
-end
-
-
-function libgeos_lattice_adjacency_matrix(rows::Int, cols::Int)
-    """
-    libgeos_lattice_adjacency_matrix(rows, cols)
-
-    Description:
-    Generates a sparse adjacency matrix for a regular 2D lattice using LibGEOS for spatial geometry operations.
-    Constructs unit square polygons for each cell and identifies neighbors based on Queen contiguity
-    (any shared boundary point or edge).
-
-    Inputs:
-    - rows (Int): Number of rows in the lattice grid.
-    - cols (Int): Number of columns in the lattice grid.
-
-    Output:
-    - W (SparseMatrixCSC{Int, Int}): A binary sparse adjacency matrix of size (rows*cols) x (rows*cols).
-    """
-    # Create polygons for each cell in the lattice
-    polygons = []
-    for r in 1:rows, c in 1:cols
-        # Define unit square coordinates as nested vectors for LibGEOS compatibility
-        coords = [
-            [Float64(c-1), Float64(r-1)],
-            [Float64(c),   Float64(r-1)],
-            [Float64(c),   Float64(r)],
-            [Float64(c-1), Float64(r)],
-            [Float64(c-1), Float64(r-1)]
-        ]
-        # Construct LinearRing and then Polygon
-        ring = LibGEOS.LinearRing(coords)
-        push!(polygons, LibGEOS.Polygon(ring))
-    end
-
-    n = length(polygons)
-    W = spzeros(Int, n, n)
-
-    # Queen contiguity check
-    for i in 1:n
-        poly_i = polygons[i]
-        for j in (i+1):n
-            if LibGEOS.intersects(poly_i, polygons[j])
-                W[i, j] = W[j, i] = 1
-            end
-        end
-    end
-    return W
-end
 
 
 
@@ -3721,18 +1246,6 @@ end
 
 # --- 1. MODEL UTILITIES ---
 
-function NegativeBinomial2(μ, r)
-    # Description: Alternative parametrization of Negative Binomial using mean (μ) and dispersion (r).
-    # Inputs:
-    #   - μ: Mean.
-    #   - r: Size/dispersion parameter.
-    # Outputs:
-    #   - Distributions.NegativeBinomial object.
-
-    p = r / (r + μ)
-    return NegativeBinomial(r, p)
-end
-  
 
 function get_rff_deep2D_basis(X, m, lengthscale)
     # Description: Generates Random Fourier Feature (RFF) basis for 2D inputs (Spatial/Temporal).
@@ -3788,9 +1301,6 @@ function get_rff_seasonal_basis(t, m, freq, lengthscale)
     return Z
 end
 
-
-
- 
  
 
 function apply_discretization_logic(vals, rules)
@@ -3827,6 +1337,8 @@ function apply_discretization_logic(vals, rules)
     end
     return new_vals, groups
 end
+
+
 
 function assign_covariate_units(cov_data_base, cov_discretization, re_rules, cov_interactions)
     cov_data_for_processing = deepcopy(cov_data_base)
@@ -3882,16 +1394,55 @@ function assign_covariate_units(cov_data_base, cov_discretization, re_rules, cov
 end
 
 
-# -----------------------
 
 
-function get_chain_names(chain)
-    try
-        return string.(FlexiChains.parameters(chain))
-    catch
-        return string.(names(chain))
+function variational_inference_solution(m; max_iters=100, nsamps=max_iters,  nelbo=3 )
+
+    # Fit via ADVI. minor speed benefit vs NUTS
+    _, indices = Bijectors.bijector(m, Val(true));
+    vars = keys(indices)
+
+    q0 = Variational.meanfield(m)     # initialize variational distribution (optional)
+    advi = ADVI(nelbo, max_iters)    # num_elbo_samples, max_iters
+    msol = Turing.vi(m, advi, q0) #, optimizer=Flux.ADAM(1e-1));
+    msamples = DataFrame( rand(msol, nsamps )', :auto ) 
+
+    # vectorize variable names ... needs more conditions if 2-D or higher ..
+    vns = []
+    for (i, sym) in enumerate(vars) 
+        j = union(indices[sym]...)  # <= array of ranges
+        nj = sum(length.(j)) 
+        if  nj > 1
+            k = 1
+            for r in j
+                push!(vns, "$(sym)[$k]")
+                k += 1
+            end
+        else
+            push!(vns, "$(sym)") 
+        end
     end
+    
+    vns = Symbol.(vns)
+
+    msamples = rename(msamples, vns)
+
+    mmean = combine( msamples, [ n => (x -> mean(x)) => n for n in names(msamples)  ] )
+    mstd  = combine( msamples, [ n => (x -> std(x)) => n for n in names(msamples)  ] )
+
+    out = (
+        msol = msol,
+        msamples = msamples, 
+        mmean = mmean,
+        mstd = mstd
+    )
+    
+    return out
+ 
 end
+
+
+# -----------------------
 
 
 function _extract_volatility(chain, name_strs, N_tot, N_samples, outcome_idx=nothing, M=nothing)
@@ -3997,6 +1548,96 @@ Returns:
 end
   
 
+
+function generate_inducing_points(coords, M_inducing, seed=42; method="kmeans")
+
+    # Helper function to generate inducing points (simple random sampling for now)
+
+    Random.seed!(seed)
+    n_data = size(coords, 1)
+    if M_inducing >= n_data
+        return coords # If M >= N, just use all data points (becomes exact GP)
+    end
+
+    
+    if method=="random"
+        indices = sample(1:n_data, M_inducing, replace=false)
+        return coords[indices, :]
+    end
+
+    if method=="kmeans"
+        #   Identifies optimal inducing point locations using K-Means clustering.
+        #   Essential for Sparse/FITC Gaussian Process models.
+        # Inputs:
+        #   coords: N x D matrix of spatiotemporal coordinates.
+        #   M_inducing: Target number of inducing points.
+        # Outputs:
+        #   M x D matrix of cluster centroids.
+
+        # Transpose for Clustering.jl compatibility
+        data_matrix = Matrix(coords')
+        
+        # Execute K-Means
+        clustering_result = kmeans(data_matrix, M_inducing, maxiter=200)
+        
+        # Extract centroids and transpose back
+        inducing_points = clustering_result.centers'
+        
+        return inducing_points
+    end
+
+    if method=="furthest_point"
+
+        # Initialize with a random point
+        inducing_points_idx = [rand(1:n_data)]
+        distances = fill(Inf, n_data)
+
+        # Convert coords to the expected format for pairwise
+        coords_matrix = permutedims(coords)
+
+        for _ in 2:M_inducing
+            # Calculate distances from all points to the newest inducing point
+            last_added_idx = inducing_points_idx[end]
+            new_distances = colwise(Euclidean(), coords_matrix, coords_matrix[:, last_added_idx])
+
+            # Update minimum distances to any inducing point found so far
+            distances = min.(distances, new_distances)
+
+            # Find the point farthest from any existing inducing point
+            farthest_idx = argmax(distances)
+            push!(inducing_points_idx, farthest_idx)
+        end
+
+        return coords[inducing_points_idx, :], inducing_points_idx
+
+    end
+
+end
+
+
+# Squared-exponential covariance function
+sqexp_cov_fn(D, phi, noise=1e-6) = exp.(-D^2 / phi) + LinearAlgebra.I * noise
+
+# Exponential covariance function
+exp_cov_fn(D, phi) = exp.(-D / phi)
+
+
+
+function ar1_covariance_local( n, rho, var,  ::Type{T}=Float64 )  where {T} 
+    vcv = zeros( T, n, n) .+ I(n) 
+    Threads.@threads for r in 1:n
+    for c in 1:n
+        d = r-c
+        if d == 0 | d == 1
+            vcv[r,c] = var * rho^d  
+        end
+    end
+    end
+    return vcv
+end
+
+
+
 # Helper to create AR1 covariance matrix
 function ar1_covariance_matrix(times::Vector{<:Real}, rho::Real, sigma_e::Real)
     n = length(times)
@@ -4058,19 +1699,6 @@ end
 #####
 
  
-function get_architecture(model_arch::String)
-    if startswith(model_arch, "example_")
-        return ExampleArchitecture() 
-    elseif model_arch in ["univariate"]
-        return UnivariateArchitecture()
-    elseif model_arch in ["multivariate"]
-        return MultivariateArchitecture()
-    elseif model_arch in ["multifidelity"]
-        return MultifidelityArchitecture()
-    else
-        return UnknownArchitecture()
-    end
-end
 
  
 function get_model_family(model_family::String)
@@ -4102,12 +1730,6 @@ function get_model_parameters(m::DynamicPPL.Model)
     end
 end
 
-
-function check_has_parameter(m::DynamicPPL.Model, param_name::String)
-    all_p = get_model_parameters(m)
-    return any(n -> n == param_name || startswith(n, "$param_name["), all_p)
-end
- 
 
 function _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples=nothing, y_obs_custom=nothing)
     # Audited and Feature-Complete Prediction Utility (v10.5.0)
@@ -4441,7 +2063,20 @@ function resolve_technical_primitive(manifold_name::String, M, priors_dict, sche
 
     # 3. Continuous and Spectral Kernels
     elseif manifold_name == "gp"
-        return GP(resolved_priors.lengthscale_prior, resolved_priors.sigma_prior, "se")
+        kernel_str = string(get(params, :kernel, "squared_exponential"))
+        return GP(resolved_priors.lengthscale_prior, resolved_priors.sigma_prior, kernel_str)
+    elseif manifold_name == "fitc"
+        kernel_str = string(get(params, :kernel, "squared_exponential"))
+        n_inducing = get(params, :n_inducing, get(M, :n_inducing, 20))
+        return FITC(resolved_priors.lengthscale_prior, resolved_priors.sigma_prior, n_inducing, kernel_str)
+    elseif manifold_name == "svgp"
+        kernel_str = string(get(params, :kernel, "squared_exponential"))
+        n_inducing = get(params, :n_inducing, get(M, :n_inducing, 20))
+        return SVGP(resolved_priors.lengthscale_prior, resolved_priors.sigma_prior, n_inducing, kernel_str)
+    elseif manifold_name == "warp"
+        kernel_str = string(get(params, :kernel, "squared_exponential"))
+        n_features = get(params, :n_features, get(M, :nbins, 20))
+        return Warp(resolved_priors.lengthscale_prior, resolved_priors.sigma_prior, n_features, kernel_str)
     elseif manifold_name == "nystrom"
         # Low-rank kernel approximation via inducing points
         return Nystrom(resolved_priors.sigma_prior, resolved_priors.lengthscale_prior, get(M, :n_inducing, 10))
@@ -4475,6 +2110,21 @@ function resolve_technical_primitive(manifold_name::String, M, priors_dict, sche
     # 6. Basis-mapped Smooths and Defaults
     elseif manifold_name == "wavelet"
         return Wavelets(:db4, M.nbins, resolved_priors.sigma_prior)
+    elseif manifold_name == "I"
+        return ST_I(resolved_priors.sigma_prior)
+    elseif manifold_name == "II"
+        return ST_II(resolved_priors.sigma_prior)
+    elseif manifold_name == "III"
+        return ST_III(resolved_priors.sigma_prior)
+    elseif manifold_name == "IV"
+        return ST_IV(resolved_priors.sigma_prior)
+    elseif manifold_name == "advection"
+        # Using some defaults for priors on physical params
+        return Advection(Normal(0,1), resolved_priors.sigma_prior)
+    elseif manifold_name == "diffusion"
+        return Diffusion(Exponential(1.0), resolved_priors.sigma_prior)
+    elseif manifold_name == "advection_diffusion"
+        return AdvectionDiffusion(Normal(0,1), Exponential(1.0), resolved_priors.sigma_prior)
     elseif manifold_name == "fixed" || manifold_name == "iid"
         return IID(resolved_priors.sigma_prior)
     elseif manifold_name in ["pspline", "bspline", "tps", "rff", "fft"]
@@ -5076,20 +2726,7 @@ function _modular_eta_assembly(N_tot_in, registry, M, PS_in)
     return eta_container
 end
 
-
-"""
-    summarize_array(samples::AbstractArray; alpha=0.05)
-
-Primary engine for collapsing MCMC sample dimensions into posterior statistics. 
-Supports 1D (scalars over samples), 2D (vectors over samples), and 3D (matrices over samples).
-
-Inputs:
-- samples: Array where the last dimension is assumed to be the sample index.
-- alpha: Significance level for credible intervals (default: 0.05 for 95% CI).
-
-Outputs:
-- NamedTuple: (mean, median, lower, upper) where each field is a flat Vector{Float64}.
-"""
+ 
 function summarize_array(samples::AbstractArray; alpha=0.05)
     # 1. Edge Case: Empty or All-NaN Arrays
     # Rationale: Preventing computational overhead on invalid results
@@ -6205,119 +3842,6 @@ end
  
  
  
-
-
-function get_vec(obj, key)  
-    # Helper for robust indexing
-    val = hasproperty(obj, key) ? getproperty(obj, key) : nothing
-    val isa AbstractVector ? val : [val]
-end
-
-
-function summarize_lkj_correlation(chain, outcomes_N; alpha=0.05)
-    println("--- Summarizing Cross-Outcome Covariance (LKJ Prior) ---")
-    p_names = string.(FlexiChains.parameters(chain))
-
-    # Identify correlation parameters (typically stored as L_omega or CorMatrix)
-    cor_params = filter(p -> occursin("L_omega", p) || occursin("cor_mat", p), p_names)
-
-    if isempty(cor_params)
-        @warn "No correlation parameters found in chain."
-        return nothing
-    end
-
-    # For LKJ Cholesky factors (L_omega), reconstruct the correlation matrix R = L * L'
-    n_samples = size(chain, 1)
-    cor_matrices = [zeros(outcomes_N, outcomes_N) for _ in 1:n_samples]
-
-    try
-        for j in 1:n_samples
-            # This assumes a flat vector storage for Cholesky factors if not using NamedArrays
-            L_vec = get_params_vector(chain, "L_omega", Int(outcomes_N*(outcomes_N+1)/2))[j, :]
-            L = zeros(outcomes_N, outcomes_N)
-            count = 1
-            for c in 1:outcomes_N, r in c:outcomes_N
-                L[r, c] = L_vec[count]
-                count += 1
-            end
-            cor_matrices[j] .= L * L'
-        end
-    catch e
-        @warn "Correlation reconstruction failed: $e"
-        return nothing
-    end
-
-    # Calculate Mean and Quantiles
-    mean_cor = mean(cor_matrices)
-    low_cor = [quantile([m[r, c] for m in cor_matrices], alpha/2) for r in 1:outcomes_N, c in 1:outcomes_N]
-    high_cor = [quantile([m[r, c] for m in cor_matrices], 1-alpha/2) for r in 1:outcomes_N, c in 1:outcomes_N]
-
-    # Visualization
-    p_heat = heatmap(mean_cor,
-        title="Cross-Outcome Correlation (Mean)",
-        clim=(-1, 1),
-        color=:RdBu_11,
-        aspect_ratio=:equal,
-        xticks=(1:outcomes_N, ["Y$i" for i in 1:outcomes_N]),
-        yticks=(1:outcomes_N, ["Y$i" for i in 1:outcomes_N]))
-
-    display(p_heat)
-
-    return (mean=mean_cor, lower=low_cor, upper=high_cor)
-end
- 
-
-function plot_binned_covariates(res)
-    # Check if covariate effects exist in pstats
-    cov_effects = get(res.pstats, :covariate_effects, Dict())
-    if isempty(cov_effects)
-        println("No covariate effects found to plot.")
-        return nothing
-    end
-
-    plts = []
-    for (key, samples) in cov_effects
-        # Key format: :raw_rw2_cwd
-        name = replace(string(key), "raw_rw2_" => "")
-        m = vec(mean(samples, dims=2))
-        l = vec(quantile.(eachrow(samples), 0.025))
-        u = vec(quantile.(eachrow(samples), 0.975))
-        
-        p = plot(m, ribbon=(m .- l, u .- m), title="Effect: $name", 
-                 xlabel="Bin", ylabel="Value", legend=false, fillalpha=0.2)
-        push!(plts, p)
-    end
-    
-    n = length(plts)
-    if n > 0
-        display(plot(plts..., layout=(ceil(Int, n/2), 2), size=(900, 300*ceil(Int, n/2))))
-    end
-end
-
-function plot_seasonal_cycle(res)
-    if !hasproperty(res.pstats, :seasonal) || all(isnan, res.pstats.seasonal.mean)
-        println("No seasonal component found to plot.")
-        return nothing
-    end
-    
-    m = res.pstats.seasonal.mean
-    s = res.pstats.seasonal.samples
-    l = vec(quantile.(eachrow(s), 0.025))
-    u = vec(quantile.(eachrow(s), 0.975))
-    
-    plt = plot(m, ribbon=(m .- l, u .- m), title="Seasonal Cycle (Binned/Harmonic)", 
-               xlabel="Season Bin", ylabel="Effect", lw=2, fillalpha=0.3, legend=false)
-    display(plt)
-    return plt
-end
-
- 
-function dataframe_to_named_array(df::DataFrame)
-    # Converts a DataFrame to a NamedArray for internal model processing
-    mat = Matrix(df)
-    return NamedArray(mat, (1:size(mat, 1), Symbol.(names(df))))
-end
-
 
 
 
@@ -7773,6 +5297,12 @@ function build_structure_template(type::Symbol, n::Int; scale=true, coords=nothi
         sf_c = scale ? scaling_factor_bym2(W_circ) : 1.0
         return (matrix = Q_circ, scaling_factor = sf_c)
  
+ 
+    elseif type == :fft || type == :spectral || type == :wavelet
+        # # Wiener-Khinchin Spectral Path
+        # This replaces the previous basis-only FFT modeling       
+        return build_spectral_precision(n, ls, sig, kernel_type=kernel)
+ 
     else
         @warn "BSTM Registry Fallback: Manifold :$type not recognized. Initializing Identity."
         Q = Matrix(1.0I, n, n)
@@ -7783,6 +5313,279 @@ function build_structure_template(type::Symbol, n::Int; scale=true, coords=nothi
 end
 
  
+  
+# BSTM Spectral & Wavelet Precision Engine v22.25.0
+# Timestamp: 2026-06-22 10:45:00
+# Rationale: Extending the spectral engine to support wavelet-domain precision mapping and localized non-stationary kernels.
+
+function build_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=:se, periodicity=nothing, noise_floor=1e-6, wavelet_levels=3, wavelet_filter=:db2)
+    # #
+    # 1. Frequency and Basis Discovery
+    freqs = FFTW.fftfreq(n)
+    psd = zeros(n)
+
+    # #
+    # 2. Analytical PSD Definitions for Stationary Taxonomy
+
+    # Gaussian / Squared Exponential
+    if kernel_type == :gaussian || kernel_type == :se
+        psd .= (sig^2) .* sqrt(2 * pi * ls^2) .* exp.( -2 * pi^2 * ls^2 .* freqs.^2 )
+
+    # Exponential / Matern 1/2
+    elseif kernel_type == :exponential || kernel_type == :matern12
+        psd .= (sig^2) .* (2 * ls) ./ (1.0 .+ (2 * pi .* freqs .* ls).^2)
+
+    # Matern 3/2
+    elseif kernel_type == :matern32
+        psd .= (sig^2) .* (4 * ls) ./ ( (1.0 .+ (2 * pi .* freqs .* ls).^2).^2 )
+
+    # Matern 5/2
+    elseif kernel_type == :matern52
+        psd .= (sig^2) .* (16 * ls / 3.0) ./ ( (1.0 .+ (2 * pi .* freqs .* ls).^2).^3 )
+
+    # Constant Kernel (DC component)
+    elseif kernel_type == :constant
+        psd[1] = sig^2 * n
+
+    # Linear Kernel (Non-stationary approximation)
+    elseif kernel_type == :linear
+        psd .= (sig^2) ./ (abs.(freqs) .+ 1e-8).^2
+        psd[1] = sig^2
+
+    # Periodic / Seasonal
+    elseif kernel_type == :periodic
+        p = isnothing(periodicity) ? n : periodicity
+        f0 = 1.0 / p
+        for (i, f) in enumerate(freqs)
+            dist = abs(f) % f0
+            psd[i] = (sig^2) * exp(-dist / 0.01)
+        end
+
+    # #
+    # 3. Wavelet Domain Precision Mapping
+    # Rationale: For wavelet kernels, the precision is defined by the energy distribution across scales.
+    elseif kernel_type == :wavelet
+        # In the wavelet domain, we define eigenvalues based on decomposition levels.
+        # This allows for modeling multiscale dependencies.
+        wavelet_eigenvalues = zeros(n)
+        for scale in 1:wavelet_levels
+            # Energy decays with scale to ensure smoothness
+            energy = sig^2 * exp(-scale / ls)
+            # Map energy to indices corresponding to wavelet levels (approximate mapping)
+            idx_start = max(1, floor(Int, n / 2^scale))
+            idx_end = max(1, floor(Int, n / 2^(scale-1)))
+            wavelet_eigenvalues[idx_start:idx_end] .= energy
+        end
+        
+        # Map wavelet variances to real-space precision weights via inverse transform
+        # This constructs the first row of the operator assuming circulant-like structure
+        precision_eigenvalues = 1.0 ./ (wavelet_eigenvalues .+ noise_floor)
+        
+        # Standardize return to first_row_q for sparse construction
+        # Note: True wavelets are non-circulant; this is the stationary wavelet approximation.
+        first_row_q = real(FFTW.ifft(precision_eigenvalues))
+    end
+
+    # #
+    # 4. Precision Mapping via IFFT (Stationary Path)
+    if kernel_type != :wavelet
+        precision_eigenvalues = 1.0 ./ (psd .+ noise_floor)
+        first_row_q = real(FFTW.ifft(precision_eigenvalues))
+    end
+
+    # #
+    # 5. Sparse Matrix Construction
+    Q_rows = Int[]
+    Q_cols = Int[]
+    Q_vals = Float64[]
+
+    for i in 1:n
+        for j in 1:n
+            # Circulant index shift
+            shift = mod(i - j, n) + 1
+            val = first_row_q[shift]
+            if abs(val) > 1e-12
+                push!(Q_rows, i)
+                push!(Q_cols, j)
+                push!(Q_vals, val)
+            end
+        end
+    end
+
+    Q_sparse = sparse(Q_rows, Q_cols, Q_vals, n, n)
+
+    return (matrix = Q_sparse, scaling_factor = 1.0, psd = psd, weights = first_row_q)
+end
+
+ 
+
+
+ 
+
+function evaluate_kernel_matrix(dist_sq::AbstractMatrix, param_val::Real, ls::Real, kernel_type::Symbol, noise::Real; wavelet_levels=3)
+    # #
+    # Gaussian / Squared Exponential
+    if kernel_type == :gaussian || kernel_type == :se
+        return (param_val^2) .* exp.(-dist_sq ./ (2 * ls^2 + noise))
+    
+    # #
+    # Exponential / Matern 1/2
+    elseif kernel_type == :exponential || kernel_type == :matern12
+        d = sqrt.(dist_sq .+ noise)
+        return (param_val^2) .* exp.(-d ./ (ls + noise))
+    
+    # #
+    # Matern 3/2
+    elseif kernel_type == :matern32
+        d = sqrt.(dist_sq .+ noise)
+        val = sqrt(3.0) .* d ./ (ls + noise)
+        return (param_val^2) .* (1.0 .+ val) .* exp.(-val)
+    
+    # #
+    # Matern 5/2
+    elseif kernel_type == :matern52
+        d = sqrt.(dist_sq .+ noise)
+        val = sqrt(5.0) .* d ./ (ls + noise)
+        return (param_val^2) .* (1.0 .+ val .+ (val.^2 ./ 3.0)) .* exp.(-val)
+
+    # #
+    # Constant Kernel (Identity innovation)
+    elseif kernel_type == :constant
+        return fill(param_val^2, size(dist_sq))
+
+    # #
+    # Linear Kernel
+    elseif kernel_type == :linear
+        return (param_val^2) .* dist_sq
+
+    # #
+    # Wavelet Multiscale Kernel
+    # Rationale: Approximates a wavelet covariance by superposing energy scales. 
+    # In real-space, this behaves as a sum of kernels with varying lengthscales corresponding to levels.
+    elseif kernel_type == :wavelet
+        K_accum = zeros(eltype(dist_sq), size(dist_sq))
+        for scale in 1:wavelet_levels
+            # Scale-specific lengthscale and energy weight
+            ls_scale = ls / (2^(scale-1))
+            weight_scale = (param_val^2) * exp(-scale / ls)
+            
+            # Contribution from current resolution level
+            K_accum .+= weight_scale .* exp.(-dist_sq ./ (2 * ls_scale^2 + noise))
+        end
+        return K_accum
+
+    # #
+    # Fallback Dispatch
+    else
+        return (param_val^2) .* exp.(-dist_sq ./ (2 * ls^2 + noise))
+    end
+end
+
+
+
+function estimate_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=:se, periodicity=nothing, noise_floor=1e-6, wavelet_levels=3)
+    # #
+    # Frequency Grid Definition
+    # Establish discrete Fourier modes for a signal of length n
+    freqs = FFTW.fftfreq(n)
+    psd = zeros(n)
+
+    # #
+    # Analytical Power Spectral Density (PSD) Definitions
+
+    # Gaussian / Squared Exponential
+    if kernel_type == :gaussian || kernel_type == :se
+        psd .= (sig^2) .* sqrt(2 * pi * ls^2) .* exp.( -2 * pi^2 * ls^2 .* freqs.^2 )
+
+    # Exponential / Matern 1/2
+    elseif kernel_type == :matern12 || kernel_type == :exponential
+        psd .= (sig^2) .* (2 * ls) ./ (1.0 .+ (2 * pi .* freqs .* ls).^2)
+
+    # Matern 3/2
+    elseif kernel_type == :matern32
+        psd .= (sig^2) .* (4 * ls) ./ ( (1.0 .+ (2 * pi .* freqs .* ls).^2).^2 )
+
+    # Matern 5/2
+    elseif kernel_type == :matern52
+        psd .= (sig^2) .* (16 * ls / 3.0) ./ ( (1.0 .+ (2 * pi .* freqs .* ls).^2).^3 )
+
+    # Constant Kernel (DC Component)
+    elseif kernel_type == :constant
+        psd[1] = sig^2 * n
+
+    # Linear Kernel (Low-frequency approximation)
+    elseif kernel_type == :linear
+        psd .= (sig^2) ./ (abs.(freqs) .+ 1e-8).^2
+        psd[1] = sig^2
+
+    # Periodic / Seasonal harmonics
+    elseif kernel_type == :periodic
+        p = isnothing(periodicity) ? n : periodicity
+        f0 = 1.0 / p
+        for i in 1:n
+            dist = abs(freqs[i]) % f0
+            psd[i] = (sig^2) * exp(-dist / 0.01)
+        end
+
+    # Wavelet Multiscale Approximation
+    # Rationale: Maps energy distribution across decomposition scales into frequency modes.
+    elseif kernel_type == :wavelet
+        # Initialize wavelet energy spectrum
+        # In the stationary approximation, energy is assigned to frequency octaves
+        for scale in 1:wavelet_levels
+            # Energy weight for current scale level
+            energy_scale = (sig^2) * exp(-scale / ls)
+            
+            # Identify frequency indices corresponding to the current resolution level
+            # Higher scales correspond to lower frequencies (coarse features)
+            # Lower scales correspond to higher frequencies (fine details)
+            idx_low = floor(Int, n / 2^scale) + 1
+            idx_high = floor(Int, n / 2^(scale - 1))
+            
+            # Apply energy to the spectral mask
+            if idx_low <= idx_high
+                psd[idx_low:idx_high] .+= energy_scale
+            end
+        end
+    end
+
+    # #
+    # Precision Recomposition in Spectral Domain
+    # The eigenvalues of the precision matrix are the reciprocal of the spectral density
+    precision_eigenvalues = 1.0 ./ (psd .+ noise_floor)
+
+    # #
+    # Real-Space Mapping via Inverse Fourier Transform
+    # The first row of the circulant precision matrix is the IFFT of its eigenvalues
+    first_row_q = real(FFTW.ifft(precision_eigenvalues))
+
+    # #
+    # Sparse Matrix Construction
+    # Generate a sparse circulant operator based on the recovered weights
+    Q_rows = Int[]
+    Q_cols = Int[]
+    Q_vals = Float64[]
+
+    for i in 1:n
+        for j in 1:n
+            # Periodic index shift mapping
+            shift = mod(i - j, n) + 1
+            val = first_row_q[shift]
+            
+            # Sparsification using a tolerance relative to the noise floor
+            if abs(val) > 1e-12
+                push!(Q_rows, i)
+                push!(Q_cols, j)
+                push!(Q_vals, val)
+            end
+        end
+    end
+
+    Q_sparse = sparse(Q_rows, Q_cols, Q_vals, n, n)
+
+    return (matrix = Q_sparse, scaling_factor = 1.0, psd = psd, weights = first_row_q)
+end
+
  
 
 # --- 2. High-Level Manifold Builder Dispatch ---
@@ -8167,6 +5970,13 @@ function recompose_precision(
         return Symmetric(scale_factor .* (L_op' * L_op) + noise * I)
     end
 
+    # Spectral Precision via Wiener-Khinchin
+    if m_type == :spectral
+        ls = isnothing(extra_param) ? 1.0 : extra_param
+        kernel = get(kwargs, :kernel, :se)
+        return build_spectral_precision(n_s, ls, param_val; kernel_type=kernel, noise_floor=noise).matrix
+    end
+
     # 4. Continuous Distance & Difference Penalties
     if m_type == :gp
         ls = isnothing(extra_param) ? 1.0 : extra_param
@@ -8355,6 +6165,57 @@ function parse_module_params(params_str::String)
 
     return d
 end
+
+function parse_variable_and_transforms(var_str::String)
+    parts = split(var_str, "|>")
+    var_name = strip(parts[1])
+    transforms = [strip(p) for p in parts[2:end]]
+    return var_name, transforms
+end
+
+function apply_transforms(data_vector, transform_names::Vector{String})
+    v = copy(data_vector)
+    for t_name in transform_names
+        if haskey(BSTM_TRANSFORM_KEYWORDS, t_name)
+            v = BSTM_TRANSFORM_KEYWORDS[t_name](v)
+        else
+            @warn "Unknown transformation '$t_name' requested. Ignoring."
+        end
+    end
+    return v
+end
+
+function sample_spectral_density(kernel_name::String, D_in::Int, M_rff::Int, lengthscale::Real; nu::Union{Real, Nothing}=nothing)
+    k_name = lowercase(kernel_name)
+    
+    # Default to Squared Exponential if kernel is not supported for RFF
+    if !(k_name in ["squared_exponential", "se", "gaussian", "rbf", "matern12", "exponential", "matern32", "matern52"])
+        @warn "RFF sampling for kernel '$kernel_name' is not implemented. Defaulting to 'squared_exponential'."
+        k_name = "squared_exponential"
+    end
+
+    if startswith(k_name, "matern")
+        local effective_nu
+        if !isnothing(nu)
+            effective_nu = nu
+        else
+            if k_name == "matern12"; effective_nu = 0.5;
+            elseif k_name == "matern32"; effective_nu = 1.5;
+            elseif k_name == "matern52"; effective_nu = 2.5;
+            else; effective_nu = 1.5; end # Default Matern nu
+        end
+        # Matern spectral density corresponds to a scaled Student's-t distribution
+        df = 2 * effective_nu
+        dist = TDist(df)
+        scale_factor = sqrt(df) / lengthscale
+        return rand(dist, D_in, M_rff) .* scale_factor
+    else # Squared Exponential
+        sigma_spectral = 1.0 / lengthscale
+        return randn(D_in, M_rff) .* sigma_spectral
+    end
+end
+
+
 
 
 
@@ -9063,21 +6924,27 @@ function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
 
         elseif type == "smooth"
             if !isempty(vars_list)
-                nb = get(params, :nbins, 20)
+                nb = get(params, :nbins, get(params, :m_rff, 20)) # Support m_rff for rff smooths
                 manifold_type_str = string(get(params, :manifold, "pspline"))
                 reg_key = Symbol(join(vars_list, "_"))
-                if n_vars == 1
-                    v_vec = data[!, Symbol(vars_list[1])]
-                    basis_matrices_registry[reg_key] = bstm_smooth_basis_1D(manifold_type_str, v_vec, nb, get(params, :degree, 3); params...)
-                else
-                    c_mat = Matrix{Float64}(data[!, Symbol.(vars_list)])
-                    if n_vars == 2; basis_matrices_registry[reg_key] = bstm_smooth_basis_2D(manifold_type_str, c_mat, nb; params...);
-                    elseif n_vars == 3; basis_matrices_registry[reg_key] = bstm_smooth_basis_3D(manifold_type_str, c_mat, nb; params...);
-                    elseif n_vars == 4; basis_matrices_registry[reg_key] = bstm_smooth_basis_4D(manifold_type_str, c_mat, nb; params...);
+                
+                if all(hasproperty(data, Symbol(v)) for v in vars_list)
+                    if n_vars == 1
+                        v_vec = data[!, Symbol(vars_list[1])]
+                        basis_matrices_registry[reg_key] = bstm_smooth_basis_1D(manifold_type_str, v_vec, nb, get(params, :degree, 3); params...)
+                    else
+                        c_mat = Matrix{Float64}(data[!, Symbol.(vars_list)])
+                        if n_vars == 2; basis_matrices_registry[reg_key] = bstm_smooth_basis_2D(manifold_type_str, c_mat, nb; params...);
+                        elseif n_vars == 3; basis_matrices_registry[reg_key] = bstm_smooth_basis_3D(manifold_type_str, c_mat, nb; params...);
+                        elseif n_vars == 4; basis_matrices_registry[reg_key] = bstm_smooth_basis_4D(manifold_type_str, c_mat, nb; params...);
+                        end
                     end
+                else
+                    @warn "One or more variables for smooth term not found in data: $(join(vars_list, ", "))"
                 end
             end
-
+            opt_dict[:model_time] = string(get(params, :manifold, "ar1"))
+ 
         elseif type == "mixed"
             mixed_str = string(vars_list[1])
             m_match = match(r"(.+?)\s*\|\s*(.+)", mixed_str)
@@ -9195,7 +7062,7 @@ function bstm(args...; model_family="gaussian", model_arch="univariate", auxilia
         elseif options.model_arch == "multifidelity"
             return bstm_multifidelity(options)
         else
-            return bstm_univariate(options)
+            return bstm_modular(options)
         end
 
     # Mode 2: Configuration Vector for Heterogeneous Data Streams
@@ -9371,12 +7238,22 @@ function decompose_bstm_formula(formula_str::String)
                         end
                     else
                         # Standard modules: extraction of comma-separated variable list
-                        vars_list = [strip(v) for v in Base.split(v_part, ",")]
+                        raw_vars = [strip(v) for v in Base.split(v_part, ",")]
+                        final_vars = String[]
+                        transforms = Dict{String, Vector{String}}()
+                        for var_expr in raw_vars
+                            var_name, transform_list = parse_variable_and_transforms(var_expr)
+                            push!(final_vars, var_name)
+                            if !isempty(transform_list)
+                                transforms[var_name] = transform_list
+                            end
+                        end
                         # Unique registry key based on type and primary variable
-                        modules[kw * "_" * vars_list[1]] = Dict(
+                        modules[kw * "_" * final_vars[1]] = Dict(
                             :type => kw,
-                            :variables => vars_list,
-                            :params => p_dict
+                            :variables => final_vars,
+                            :params => p_dict,
+                            :transforms => transforms
                         )
                     end
  
@@ -9402,9 +7279,9 @@ end
 # --- 1. Base Builder Dispatch ---
 
 # 1. Base Generic Fallback
-function build_model(manifold::Manifold, data_inputs)
-    @warn "No specific builder for $(typeof(manifold)). Using IID identity template."
-    template = build_structure_template(:iid, data_inputs.s_N)
+function build_model(m::Manifold, data_inputs)
+    @warn "No specific builder for $(typeof(m)). Using IID identity template."
+    template = build_structure_template(:iid, get(data_inputs, :s_N, 1))
     return (
         Q_template = template.matrix,
         scaling_factor = 1.0,
@@ -9414,7 +7291,7 @@ function build_model(manifold::Manifold, data_inputs)
 end
 
 function build_model(m::Besag, data_inputs)
-    # Besag Builder: Pure spatial smoothing (equivalent to ICAR in precision form)
+    # Besag is an alias for ICAR
     local n = data_inputs.s_N
     local template = build_structure_template(:besag, n; W=get(data_inputs, :W, nothing))
     return (
@@ -9426,12 +7303,12 @@ function build_model(m::Besag, data_inputs)
 end
 
 function build_model(m::SAR, data_inputs)
-    # SAR Builder: Simultaneous Autoregressive operator (I - rho*W)'(I - rho*W)
+    # SAR Builder: Simultaneous Autoregressive
     local n = data_inputs.s_N
     local template = build_structure_template(:sar, n; W=get(data_inputs, :W, nothing))
     return (
         Q_template = template.matrix,
-        scaling_factor = template.scaling_factor,
+        scaling_factor = 1.0, # SAR precision includes rho, not scaled like BYM2
         model_type = :sar,
         hyper = (sigma_prior = m.sigma_prior, rho_prior = m.rho_prior)
     )
@@ -9439,7 +7316,7 @@ end
 
 function build_model(m::FITC, data_inputs)
     # FITC Builder: Fully Independent Training Conditional (Sparse GP)
-    # Rationale: Uses M inducing points to approximate the full covariance
+    # Uses M inducing points to approximate the full covariance
     return (
         Q_template = nothing, # Requires dynamic kernel distance matrix
         scaling_factor = 1.0,
@@ -9449,12 +7326,12 @@ function build_model(m::FITC, data_inputs)
 end
 
 function build_model(m::SPDE, data_inputs)
-    # SPDE Builder: Finite element approximation of Matern covariance via (kappa^2 I + L)^2
+    # SPDE Builder: Matern approximation via (kappa^2 I + L)^alpha
     local n = data_inputs.s_N
     local template = build_structure_template(:besag, n; W=get(data_inputs, :W, nothing))
     return (
         Q_template = template.matrix, # Base Laplacian L used in SPDE expansion
-        scaling_factor = template.scaling_factor,
+        scaling_factor = 1.0,
         model_type = :spde,
         hyper = (sigma_prior = m.sigma_prior, kappa_prior = m.kappa_prior)
     )
@@ -9463,7 +7340,7 @@ end
 
 function build_model(m::IID, data_inputs)
     # IID Builder: Unstructured random effects
-    return (
+     return (
         Q_template = Matrix(1.0I, data_inputs.s_N, data_inputs.s_N),
         scaling_factor = 1.0,
         model_type = :iid,
@@ -9472,8 +7349,8 @@ function build_model(m::IID, data_inputs)
 end
 
 # 2. Discrete Spatial Manifolds (CAR/Laplacian Family)
-function build_model(m::BYM2, data_inputs)
-    # BYM2 requires a spatial unit count and adjacency matrix W
+function build_model(m::Union{BYM2, ICAR}, data_inputs)
+    # BYM2/ICAR require a spatial unit count and adjacency matrix W
     template = build_structure_template(:bym2, data_inputs.s_N; W=data_inputs.W)
     return (
         Q_template = template.matrix,
@@ -9660,6 +7537,48 @@ function build_model(m::PSpline, data_inputs)
         scaling_factor = template.scaling_factor,
         model_type = :pspline,
         hyper = (sigma_prior = m.sigma_prior, degree = m.degree, diff_order = m.diff_order)
+    )
+end
+
+function build_model(m::Harmonic, data_inputs)
+    # Harmonic manifolds are basis-driven, not GMRF-driven
+    return (
+        Q_template = nothing,
+        scaling_factor = 1.0,
+        model_type = :harmonic,
+        hyper = (
+            sigma_prior = m.sigma_prior, 
+            amplitude_prior = m.amplitude_prior, 
+            phase_prior = m.phase_prior,
+            period = m.period
+        )
+    )
+end
+
+function build_model(m::Cyclic, data_inputs)
+    n = get(data_inputs, :u_N, get(data_inputs, :period, 12))
+    template = build_structure_template(:cyclic, n)
+    return (
+        Q_template = template.matrix,
+        scaling_factor = template.scaling_factor,
+        model_type = :cyclic,
+        hyper = (sigma_prior = m.sigma_prior, period = m.period)
+    )
+end
+
+function build_model(m::Union{FFT, Wavelets}, data_inputs)
+    # FFT/Wavelet Builder with Spectral Precision
+    # Rationale: Uses Wiener-Khinchin theorem to build a precision matrix from a kernel's spectral density.
+    n = hasproperty(m, :nbins) ? m.nbins : get(data_inputs, :t_N, get(data_inputs, :s_N, 20))
+    
+    # The template is a placeholder; the actual precision is recomposed inside the Turing model.
+    template = build_structure_template(:iid, n)
+
+    return (
+        Q_template = template.matrix, # Placeholder
+        scaling_factor = 1.0,
+        model_type = :spectral, # A new type to signify this approach
+        hyper = (sigma_prior = m.sigma_prior, lengthscale_prior = m.lengthscale_prior, kernel=m.kernel)
     )
 end
 

@@ -75,13 +75,22 @@ print( "\nTo (re)-install required packages, run:  install_required_packages() o
 
 # support functions
 include( srcdir( "data_prep.jl") );
- 
+
+
+# include( srcdir( "unit_test_functions.jl" ))   ;
+# include( srcdir( "legacy.jl" ))   ;
+
+include( srcdir( "utility_functions.jl" ))   ;
+
+include( srcdir( "spatiotemporal_partitioning_functions.jl" ))   ;
+
 include( srcdir( "spatiotemporal_functions.jl" ))   ;
 
 include( srcdir( "example_turing_models.jl" ))   ;
 
 
 Random.seed!(42) # Set a seed for reproducibility.
+
 import MCMCChains
 import DynamicPPL
 import StatsPlots
