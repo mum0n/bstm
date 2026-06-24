@@ -3,8 +3,8 @@
 # Definitions
 
 const BSTM_MODULE_KEYWORDS = Set([ 
-    "intercept", "observationmodifier", "spatial", "temporal", "seasonal",
-    "smooth", "nested", "eigen", "fixed", "mixed", "network",
+    "intercept", "observationprocess", "spatial", "temporal",
+    "smooth", "nested", "eigen", "fixed", "mixed",
     "dynamics", "transform"
 ])
 
@@ -681,7 +681,6 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
     basis_matrices_registry = Dict{Symbol, Any}()
     svc_covariates_registry = Symbol[]
     svc_manifolds_registry = Dict{Symbol, Any}()
-    network_registry = Dict{Symbol, Any}()
     volatility_registry = Dict{Symbol, Any}()
     spacetime_registry = Dict{Symbol, Any}()
     dynamics_registry = Dict{Symbol, Any}()
@@ -820,8 +819,6 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
             opt_dict[:use_sv] = true
             opt_dict[:M_rff_sigma] = get(mod_data[:params], :nbins, 20)
             volatility_registry[Symbol(mod_data[:variables][1])] = mod_data[:params]
-        elseif mod_data[:type] == :network
-            network_registry[Symbol(mod_data[:variables][1])] = mod_data[:params]
         elseif mod_data[:type] == :spacetime
             m_call = lowercase(string(get(mod_data[:params], :model, "none")))
             # Detect Kronecker operator convenience wrappers and perform shorthand expansion
@@ -860,7 +857,6 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
     opt_dict[:manifolds] = manifolds_registry
     opt_dict[:hyperpriors] = hyperprior_registry
     opt_dict[:basis_matrices] = basis_matrices_registry
-    opt_dict[:network_metadata] = network_registry
     opt_dict[:volatility_metadata] = volatility_registry
     opt_dict[:fixed_parts] = unique(vcat(fixed_parts_accumulator, string.(metadata.fixed_effects)))
     opt_dict[:add_intercept] = metadata.has_intercept
@@ -1304,7 +1300,7 @@ function resolve_hyperpriors(m_id::String, user_priors::Dict{String, Any}, schem
 
     # 4. Registry-Based Parameter Dispatch
     # Discrete Graph/CAR Manifolds
-    if m_id in ["bym2", "leroux", "sar", "ar1", "proper_car", "dag"]
+    if m_id in ["bym2", "leroux", "sar", "ar1", "proper_car", "dag", "network"]
         res = merge(res, (rho_prior = get(user_priors, "rho", defaults["rho"]),))
     end
 
@@ -1333,20 +1329,14 @@ end
 
 const BSTM_MANIFOLDS = Set([
     "intercept",
-    "bias", 
+    "observationprocess", 
     "spatial",
     "temporal",
-    "seasonal",
     "smooth",  
     "nested", 
     "eigen", 
     "fixed",
     "mixed",
-    "svc",
-    "volatility",
-    "network",
-    "spacetime",
-    "hyperbolic",
     "dynamics"
 ])
 
@@ -1392,9 +1382,6 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
     basis_matrices_registry = Dict{Symbol, Any}()
     svc_covariates_registry = Symbol[]
     svc_manifolds_registry = Dict{Symbol, Any}()
-    network_registry = Dict{Symbol, Any}()
-    volatility_registry = Dict{Symbol, Any}()
-    spacetime_registry = Dict{Symbol, Any}()
     dynamics_registry = Dict{Symbol, Any}()
     manifolds_registry = [] # New unified registry
 
@@ -1428,7 +1415,7 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
         manifold_call = get(mod, :manifold_call, "")
 
         # --- Modular Manifold Spec Assembly ---
-        if domain ∉ [:bias, :intercept, :interaction_composition, :dynamics, :svc, :mixed]
+        if domain ∉ [:observationprocess, :intercept, :interaction_composition, :dynamics, :svc, :mixed]
             vars_list = get(mod, :variables, [])
             var_sym = isempty(vars_list) ? (type == "svc" ? Symbol(mod[:covariate]) : :none) : Symbol(vars_list[1])
 
@@ -1507,9 +1494,13 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
                 end
             end
      
-        elseif type == "bias"
+        elseif type == "observationprocess"
             if haskey(params, :weight) || haskey(params, :weights)
                 opt_dict[:weights] = get(params, :weight, get(params, :weights, nothing))
+            end
+            if get(params, :volatility, false) == true
+                opt_dict[:use_sv] = true
+                opt_dict[:M_rff_sigma] = get(params, :nbins, 20)
             end
             if haskey(params, :offsets) || haskey(params, :offset)
                 opt_dict[:log_offset] = get(params, :offsets, get(params, :offset, nothing))
@@ -1527,96 +1518,78 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
             end
 
         elseif type == "spatial"
-            opt_dict[:model_space] = string(get(params, :model, "bym2"))
-            if n_vars == 1
-                var_sym = vars_list[1]
-                if hasproperty(data, var_sym)
-                    opt_dict[:s_idx] = Int.(data[!, var_sym])
-                    opt_dict[:s_idx_var] = var_sym
+            model_name = lowercase(string(get(params, :model, "bym2")))
+            opt_dict[:model_space] = model_name
+
+            if model_name == "hyperbolic"
+                opt_dict[:curvature] = get(params, :curvature, -1.0)
+                if n_vars > 0
+                    opt_dict[:s_coord] = Matrix{Float64}(data[!, Symbol.(vars_list)])
                 end
             else
-                opt_dict[:s_coord] = Matrix{Float64}(data[!, vars_list])
-            end
-            if haskey(params, :W)
-                w_raw = params[:W]
-                opt_dict[:W] = w_raw isa String ? Main.eval(Meta.parse(w_raw)) : w_raw
+                if n_vars == 1
+                    var_sym = Symbol(vars_list[1])
+                    if hasproperty(data, var_sym)
+                        opt_dict[:s_idx] = Int.(data[!, var_sym])
+                        opt_dict[:s_idx_var] = var_sym
+                    end
+                elseif n_vars > 0
+                    opt_dict[:s_coord] = Matrix{Float64}(data[!, Symbol.(vars_list)])
+                end
+                if haskey(params, :W)
+                    w_raw = params[:W]
+                    opt_dict[:W] = w_raw isa String ? Main.eval(Meta.parse(w_raw)) : w_raw
+                end
             end
 
         elseif type == "temporal"
-            manifold_id = string(get(params, :model, "ar1"))
-            opt_dict[:model_time] = manifold_id
+            manifold_id_raw = get(params, :model, "ar1")
+            if manifold_id_raw isa Vector && length(manifold_id_raw) >= 1
+                opt_dict[:model_time] = string(manifold_id_raw[1])
+                if length(manifold_id_raw) == 2
+                    opt_dict[:model_season] = string(manifold_id_raw[2])
+                end
+            else
+                opt_dict[:model_time] = string(manifold_id_raw)
+            end
             if n_vars == 1
-                var_sym = vars_list[1]
+                var_sym = Symbol(vars_list[1])
                 if hasproperty(data, var_sym)
                     tu_meta = assign_time_units(data[!, var_sym]; time_method="regular")
                     opt_dict[:t_idx] = tu_meta.t_idx
                     opt_dict[:u_idx] = tu_meta.u_idx
                     opt_dict[:t_idx_var] = var_sym
-                    if manifold_id == "cyclic"; opt_dict[:model_season] = "cyclic"; end
                 end
-            else
+            elseif n_vars == 2
                 opt_dict[:t_idx_var] = vars_list[1]
                 opt_dict[:u_idx_var] = vars_list[2]
             end
 
         elseif type == "smooth"
-            if !isempty(vars_list)
+            manifold_type_str = lowercase(string(get(params, :model, "pspline")))
+            st_models = ["i", "ii", "iii", "iv", "advection", "diffusion", "advection_diffusion"]
+
+            if manifold_type_str in st_models
+                opt_dict[:model_st] = uppercase(manifold_type_str)
+                if get(opt_dict, :model_space, "none") == "none"; opt_dict[:model_space] = "besag"; end
+                if get(opt_dict, :model_time, "none") == "none"; opt_dict[:model_time] = "ar1"; end
+            elseif !isempty(vars_list)
                 nb = get(params, :nbins, get(params, :m_rff, 20)) # Support m_rff for rff smooths
-                manifold_type_str = string(get(params, :model, "pspline"))
                 reg_key = Symbol(join(vars_list, "_"))
                 
                 if all(hasproperty(data, Symbol(v)) for v in vars_list)
                     if n_vars == 1
                         v_vec = data[!, Symbol(vars_list[1])]
                         basis_matrices_registry[reg_key] = bstm_smooth_basis_1D(manifold_type_str, v_vec, nb, get(params, :degree, 3); params...)
-                    else
+                    elseif n_vars > 1
                         c_mat = Matrix{Float64}(data[!, Symbol.(vars_list)])
                         if n_vars == 2; basis_matrices_registry[reg_key] = bstm_smooth_basis_2D(manifold_type_str, c_mat, nb; params...);
                         elseif n_vars == 3; basis_matrices_registry[reg_key] = bstm_smooth_basis_3D(manifold_type_str, c_mat, nb; params...);
                         elseif n_vars == 4; basis_matrices_registry[reg_key] = bstm_smooth_basis_4D(manifold_type_str, c_mat, nb; params...);
                         end
                     end
-                else
-                    @warn "One or more variables for smooth term not found in data: $(join(vars_list, ", "))"
                 end
             end
-            opt_dict[:model_time] = string(get(params, :model, "ar1"))
- 
-        elseif type == "volatility"
-            opt_dict[:use_sv] = true
-            opt_dict[:M_rff_sigma] = get(params, :nbins, 20)
-            volatility_registry[Symbol(vars_list[1])] = params
-
-        elseif type == "network"
-            network_registry[Symbol(vars_list[1])] = params
-
-        elseif type == "spacetime"
-            m_call = lowercase(string(get(params, :model, "none")))
-            # Detect Kronecker operator convenience wrappers and perform shorthand expansion
-            if occursin("\u2297", m_call) || occursin("otimes", m_call)
-                m_parts = split(m_call, r"\s*\u2297\s*|\s+otimes\s+")
-                if length(m_parts) >= 2
-                    ms = strip(string(m_parts[1]), ['\'', '"', ' '])
-                    mt = strip(string(m_parts[2]), ['\'', '"', ' '])
-
-                    # Convenience Shorthand Expansion: Physics Aliases
-                    if ms == "advection" && mt == "diffusion"
-                        opt_dict[:model_st] = "advection_diffusion"
-                        opt_dict[:model_space] = "besag"
-                        opt_dict[:model_time] = "ar1"
-                    else
-                        # Standard composite mapping to Space/Time registers
-                        opt_dict[:model_space] = ms
-                        opt_dict[:model_time] = mt
-                        # Automatic Knorr-Held Interaction classification (Type I-IV)
-                        if ms == "iid" && mt == "iid"; opt_dict[:model_st] = "I"
-                        elseif ms == "iid"; opt_dict[:model_st] = "II"
-                        elseif mt == "iid"; opt_dict[:model_st] = "III"
-                        else; opt_dict[:model_st] = "IV"; end
-                    end
-                end
-            end
-            spacetime_registry[key] = params
         end
     end
 
@@ -1624,8 +1597,6 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
     opt_dict[:manifolds] = manifolds_registry
     opt_dict[:hyperpriors] = hyperprior_registry
     opt_dict[:basis_matrices] = basis_matrices_registry
-    opt_dict[:network_metadata] = network_registry
-    opt_dict[:volatility_metadata] = volatility_registry
     opt_dict[:fixed_parts] = unique(vcat(fixed_parts_accumulator, string.(metadata.fixed_effects)))
     opt_dict[:add_intercept] = metadata.has_intercept
     opt_dict[:formula] = formula
@@ -2908,6 +2879,10 @@ function resolve_technical_primitive(manifold_name::String, M, priors_dict, sche
     # 6. Basis-mapped Smooths and Defaults
     elseif manifold_name == "wavelet"
         return Wavelets(:db4, M.nbins, resolved_priors.sigma_prior)
+    elseif manifold_name == "network"
+        adj_matrix = get(M, :W, sparse(I(M.s_N)))
+        flow_direction = get(M, :flow_direction, :bidirectional)
+        return NetworkFlow(resolved_priors.sigma_prior, adj_matrix, flow_direction)
     elseif manifold_name == "I"
         return ST_I(resolved_priors.sigma_prior)
     elseif manifold_name == "II"
