@@ -2,6 +2,20 @@
 
 # Definitions
 
+const BSTM_MODULE_KEYWORDS = Set([ 
+    "intercept", "observationmodifier", "spatial", "temporal", "seasonal",
+    "smooth", "nested", "eigen", "fixed", "mixed", "network",
+    "dynamics", "transform"
+])
+
+const BSTM_TRANSFORM_KEYWORDS = Dict(
+    "log" => x -> log.(x),
+    "zscore" => x -> (x .- mean(x)) ./ std(x),
+    "unit" => x -> (x .- minimum(x)) ./ (maximum(x) - minimum(x))
+)
+
+
+
 # BSTM Low-Level Manifold Registry [v06.1 - Reusable Schema] ---
 # Rationale: ManifoldModels are now defined as low-level primitives that are domain-agnostic. 
 # The context (Spatial vs Temporal) is determined at the model-building stage.
@@ -101,10 +115,6 @@ struct VaryingInteractionManifold <: ManifoldOperator
     interaction_vars::Vector{Symbol} # e.g., [:temperature, :salinity]
     model::ManifoldModel             # e.g., AR1(...) or RW2(...)
 end
-struct SharedManifold <: ManifoldOperator
-    name::Symbol
-    model::Manifold
-end
 struct SVCManifold <: ManifoldOperator
     covariate::Symbol
     model::ManifoldModel
@@ -189,16 +199,6 @@ function build_model(m::RegularizationGroupManifold, data_inputs)
             sub_manifolds = m.manifolds # Store the original structs for later lookup
         )
     )
-end
-
-function build_model(m::SharedManifold, data_inputs)
-    # This operator signals that a latent field should be shared across components.
-    # It builds the inner model's configuration and decorates it with a 'shared_as' name.
-    
-    inner_config = build_model(m.model, data_inputs)
-    
-    # The model supervisor (@model) will use this name to cache and reuse the latent field.
-    return merge(inner_config, (shared_as = m.name,))
 end
 
 function resolve_hyperpriors(m_id::Union{String, Symbol}, user_priors::Dict{String, Any}, scheme::Symbol=:pcpriors)
@@ -380,7 +380,7 @@ function _parse_module_call(module_call_str::String)
     inner_str = m_mod.captures[2]
     
     # Check if the keyword is a known BSTM manifold
-    if !(kw in BSTM_MANIFOLDS)
+    if !(kw in BSTM_MODULE_KEYWORDS)
         return Dict{Symbol, Any}(:type => :literal, :value => module_call_str)
     end
 
@@ -471,7 +471,7 @@ function parse_module_params(params_str::String)
 
             # Check if param_val_raw is a module call string
             m_mod_nested = match(r"(\w+)\((.*)\)", param_val_raw)
-            if !isnothing(m_mod_nested) && (lowercase(m_mod_nested.captures[1]) in BSTM_MANIFOLDS)
+            if !isnothing(m_mod_nested) && (lowercase(m_mod_nested.captures[1]) in BSTM_MODULE_KEYWORDS)
                 # This is a nested module call, parse it recursively
                 d[param_key] = _parse_module_call(param_val_raw)
                 continue
@@ -537,7 +537,7 @@ function decompose_bstm_formula(formula_str::String)
 
         # Check if it's a module call
         m_mod = match(r"(\w+)\((.*)\)", t_clean)
-        if !isnothing(m_mod) && (lowercase(m_mod.captures[1]) in BSTM_MANIFOLDS)
+        if !isnothing(m_mod) && (lowercase(m_mod.captures[1]) in BSTM_MODULE_KEYWORDS)
             module_data = _parse_module_call(t_clean)
             # Generate a unique key for the module based on its type and variables
             # Handle nested modules for key generation
@@ -1331,11 +1331,23 @@ end
 
 
 
-
 const BSTM_MANIFOLDS = Set([
-    "intercept", "observationmodifier", "spatial", "temporal", "seasonal",
-    "smooth", "nested", "eigen", "fixed", "mixed", "volatility", "network",
-    "dynamics", "transform"
+    "intercept",
+    "bias", 
+    "spatial",
+    "temporal",
+    "seasonal",
+    "smooth",  
+    "nested", 
+    "eigen", 
+    "fixed",
+    "mixed",
+    "svc",
+    "volatility",
+    "network",
+    "spacetime",
+    "hyperbolic",
+    "dynamics"
 ])
 
 const BSTM_TRANSFORM_KEYWORDS = Dict(
@@ -1344,7 +1356,6 @@ const BSTM_TRANSFORM_KEYWORDS = Dict(
     "unit" => x -> (x .- minimum(x)) ./ (maximum(x) - minimum(x))
 )
 
- 
 
    
 # # BSTM Monolithic Configuration Engine v19.23.14
