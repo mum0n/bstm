@@ -139,8 +139,8 @@ Before getting into the nitty gritty of the spatiotemporal models, let us go thr
 #| label: Example - Sparse GMRF Space and time effect (no interaction)   
  
 m = bstm( """ 
-  y ~ Intercept() + Spatial(s_idx, manifold='bym2',  W = data_scot[:au][:W] ) + 
-      Temporal(t_idx, manifold='ar1') + Offsets(log_offset) """ , 
+  y ~ Intercept() + Spatial(s_idx, model='bym2',  W = data_scot[:au][:W] ) + 
+      Temporal(t_idx, model='ar1') + Offsets(log_offset) """ , 
   data_scot[:data], 
   model_family="poisson"
 )
@@ -266,7 +266,7 @@ inp_df = DataFrame(
 display(first(inp_df, 3))
 
 m = bstm( 
-  formula( y ~ 1 + z + region + Spatial(s_idx, manifold='bym2') + Temporal(t_idx, manifold='ar1') ), 
+  formula( y ~ 1 + z + region + Spatial(s_idx, model='bym2') + Temporal(t_idx, model='ar1') ), 
   inp_df; 
   family="poisson",
   target_units=20
@@ -1497,7 +1497,7 @@ data_audit = DataFrame(
 println("Audit: Initializing model with Spherical Compact Basis and Moran Spectral Basis...")
 
 model_audit = bstm(
-    "y ~ 1 + Smooth(age; nbins=10, manifold='spherical', range=20.0) + Smooth(pollution; nbins=8, manifold='moran')",
+    "y ~ 1 + Smooth(age; nbins=10, model='spherical', range=20.0) + Smooth(pollution; nbins=8, model='moran')",
     data_audit,
     model_family = "gaussian",
     noise = 1e-4
@@ -1549,7 +1549,7 @@ data_audit = DataFrame(y = y_obs, lon = lon, lat = lat, s_idx = ones(Int, n_obs)
 # 2. Invoke BSTM with Spherical Compact Support Interaction
 println("Audit Part A: Testing Compactly Supported Spherical Interaction...")
 model_sphere = bstm(
-    "y ~ 1 + Smooth(lon, lat; manifold='spherical', range=15.0, nbins=25)",
+    "y ~ 1 + Smooth(lon, lat; model='spherical', range=15.0, nbins=25)",
     data_audit,
     model_family = "gaussian",
     noise = 1e-4
@@ -1558,7 +1558,7 @@ model_sphere = bstm(
 # 3. Invoke BSTM with Anisotropic Spectral Interaction
 println("Audit Part B: Testing Anisotropic Spectral Surface...")
 model_aniso = bstm(
-    "y ~ 1 + Smooth(lon, lat; manifold='anisotropic', ls_x=10.0, ls_y=5.0, nbins=30)",
+    "y ~ 1 + Smooth(lon, lat; model='anisotropic', ls_x=10.0, ls_y=5.0, nbins=30)",
     data_audit,
     model_family = "gaussian",
     noise = 1e-4
@@ -1604,10 +1604,10 @@ end
 ```julia
 formula = "y ~ 1 + z + " * 
     "Fixed(Region, contrast='effects') + " * # Fixed effect with effects coding
-    "Spatial(s_idx, manifold='bym2') + " *        # Besag-York-Mollie spatial manifold
-    "Temporal(t_idx, manifold='rw2') + " *         # Smooth temporal trend
-    "SVC(z, manifold='rff') + " *            # Spatially varying coefficient for z
-    "Smooth(lat, lon, manifold='gp')"            # Non-linear spatial interaction surface
+    "Spatial(s_idx, model='bym2') + " *        # Besag-York-Mollie spatial manifold
+    "Temporal(t_idx, model='rw2') + " *         # Smooth temporal trend
+    "SVC(z, model='rff') + " *            # Spatially varying coefficient for z
+    "Smooth(lat, lon, model='gp')"            # Non-linear spatial interaction surface
 ```
 
 

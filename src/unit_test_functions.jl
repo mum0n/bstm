@@ -65,8 +65,8 @@ function verify_transport_logic(n_s=5, n_t=4)
         println("Audit [Advection]: FAILED. Flow is spatially symmetric despite gradient.")
     end
     
-    # Visualize Flow
-    heatmap(st_results, 
+    # Visualize Flow 
+    heatmap(st_map, 
         title="Spatiotemporal Transport Flow (Validation)", 
         xlabel="Time Step", 
         ylabel="Spatial Unit (Chain)",

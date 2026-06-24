@@ -79,6 +79,7 @@ include( srcdir( "data_prep.jl") );
 
 # include( srcdir( "unit_test_functions.jl" ))   ;
 # include( srcdir( "legacy.jl" ))   ;
+# include( srcdir( "example_turing_models.jl" ))   ;
 
 include( srcdir( "utility_functions.jl" ))   ;
 
@@ -86,7 +87,6 @@ include( srcdir( "spatiotemporal_partitioning_functions.jl" ))   ;
 
 include( srcdir( "spatiotemporal_functions.jl" ))   ;
 
-include( srcdir( "example_turing_models.jl" ))   ;
 
 
 Random.seed!(42) # Set a seed for reproducibility.

@@ -145,14 +145,14 @@ The `bstm` formula language allows you to build complex models by combining modu
 ### Common Modules
 
 | Keyword     | Example Usage                        | Purpose                                                        |                                                                    |
-| :------------| :-------------------------------------| :---------------------------------------------------------------| --------------------------------------------------------------------|
-| `spatial`   | `spatial(s_idx, manifold='bym2')`    | Models spatial random effects for discrete areal units.        |                                                                    |
-| `temporal`  | `temporal(t_idx, manifold='ar1')`    | Models temporal trends using discrete time steps.              |                                                                    |
-| `seasonal`  | `seasonal(u_idx, manifold='cyclic')` | Models periodic effects (e.g., month-of-year).                 |                                                                    |
+| :------------| :-------------------------------------| :---------------------------------------------------------------| :-------------------------------------------------------------------|
+| `spatial`   | `spatial(s_idx, model='bym2')`    | Models spatial random effects for discrete areal units.        |                                                                    |
+| `temporal`  | `temporal(t_idx, model='ar1')`    | Models temporal trends using discrete time steps.              |                                                                    |
+| `seasonal`  | `seasonal(u_idx, model='cyclic')` | Models periodic effects (e.g., month-of-year).                 |                                                                    |
 | `smooth`    | `smooth(x, nbins=20)`                | Creates a non-linear smooth of a continuous covariate `x`.     |                                                                    |
-| `svc`       | `svc(x, manifold='iid')`             | Models a spatially-varying coefficient for covariate `x`.      |                                                                    |
+| `svc`       | `svc(x, model='iid')`             | Models a spatially-varying coefficient for covariate `x`.      |                                                                    |
 | `mixed`     | `mixed(1 \                           | group)`                                                        | Defines a random intercept for each level of the `group` variable. |
-| `spacetime` | `spacetime(manifold='IV')`           | Defines a joint spatiotemporal interaction field.              |                                                                    |
+| `spacetime` | `spacetime(model='IV')`           | Defines a joint spatiotemporal interaction field.              |                                                                    |
 | `bias`      | `bias(hurdle=0.1)`                   | Specifies likelihood-level parameters like hurdles or weights. |                                                                    |
 | `fixed`     | `x1 + x2`                            | Standard fixed-effect linear predictors.                       |                                                                    |
 
@@ -166,13 +166,13 @@ Use the `|>` operator inside a module to transform data on the fly.
 
 ---
 
-## Manifold Reference Table
+## Model Reference Table
 
-The `manifold` argument specifies the mathematical structure of the latent field.
+The `model` argument specifies the mathematical structure of the latent field.
 
 ### Spatial Manifolds (`spatial()`)
 
-| Manifold | `manifold='...'` | Math (Conceptual) | Use Case |
+| Manifold | `model='...'` | Math (Conceptual) | Use Case |
 | :--- | :--- | :--- | :--- |
 | **ICAR** | `'icar'`, `'besag'` | $\phi_i \sim \mathcal{N}(\text{mean}(\phi_j \text{ for } j \sim i), \sigma^2/n_i)$ | Strong, localized spatial smoothing for areal data. |
 | **BYM2** | `'bym2'` | $\phi_i = \sqrt{\rho}\phi_{str} + \sqrt{1-\rho}\phi_{unstr}$ | Robust default. Separates spatial trend from random noise. |
@@ -181,7 +181,7 @@ The `manifold` argument specifies the mathematical structure of the latent field
 
 ### Temporal & Seasonal Manifolds (`temporal()`, `seasonal()`)
 
-| Manifold | `manifold='...'` | Math (Conceptual) | Use Case |
+| Manifold | `model='...'` | Math (Conceptual) | Use Case |
 | :--- | :--- | :--- | :--- |
 | **AR1** | `'ar1'` | $\phi_t = \rho \phi_{t-1} + \epsilon_t$ | Capturing trends with short-term memory. |
 | **RW1/RW2** | `'rw1'`, `'rw2'` | $\Delta\phi_t \sim \mathcal{N}(0, \sigma^2)$ or $\Delta^2\phi_t \sim \mathcal{N}(0, \sigma^2)$ | Modeling stochastic level shifts (RW1) or smooth trends (RW2). |
@@ -190,7 +190,7 @@ The `manifold` argument specifies the mathematical structure of the latent field
 
 ### Smooth Manifolds (`smooth()`)
 
-| Manifold | `manifold='...'` | Math (Conceptual) | Use Case |
+| Manifold | `model='...'` | Math (Conceptual) | Use Case |
 | :--- | :--- | :--- | :--- |
 | **P-Spline** | `'pspline'` | B-spline basis with a random walk penalty on coefficients. | Flexible, general-purpose smoother for 1D covariates. |
 | **TPS** | `'tps'` | Thin Plate Spline basis. | Smoothing 2D spatial coordinates. |
@@ -198,7 +198,7 @@ The `manifold` argument specifies the mathematical structure of the latent field
 
 ### Spacetime Interaction Manifolds (`spacetime()`)
 
-| Manifold | `manifold='...'` | Description |
+| Manifold | `model='...'` | Description |
 | :--- | :--- | :--- |
 | **Type I** | `'I'` | Unstructured (IID) interaction over space and time. |
 | **Type II** | `'II'` | Spatially unstructured, temporally structured. |
@@ -215,7 +215,7 @@ A common model for disease mapping or species counts.
 
 ```julia
 m = bstm(
-    "counts ~ 1 + spatial(area_id, manifold='bym2') + temporal(year_id, manifold='ar1')",
+    "counts ~ 1 + spatial(area_id, model='bym2') + temporal(year_id, model='ar1')",
     my_data,
     model_family="poisson",
     W=my_adjacency_matrix
@@ -228,7 +228,7 @@ Models a continuous outcome with a non-linear effect of `temperature` and allows
 
 ```julia
 m = bstm(
-    "yield ~ 1 + smooth(temperature, nbins=20) + svc(rainfall, manifold='iid')",
+    "yield ~ 1 + smooth(temperature, nbins=20) + svc(rainfall, model='iid')",
     my_data,
     model_family="gaussian"
 )
@@ -240,7 +240,7 @@ Models prevalence (0 or 1) with a fully structured spatiotemporal interaction te
 
 ```julia
 m = bstm(
-    "prevalence ~ 1 + spatial(s_idx) + temporal(t_idx) + spacetime(manifold='IV')",
+    "prevalence ~ 1 + spatial(s_idx) + temporal(t_idx) + spacetime(model='IV')",
     my_data,
     model_family="binomial",
     W=my_adjacency_matrix
@@ -305,17 +305,17 @@ The `bstm` formula DSL is designed to be expressive and readable. The general st
 Each keyword initializes a specific type of latent manifold or model component.
 
 | Keyword      | Example Usage                        | Purpose                                                                    |                                                                    |
-| :-------------| :-------------------------------------| :---------------------------------------------------------------------------| --------------------------------------------------------------------|
+| :-------------| :-------------------------------------| :---------------------------------------------------------------------------| :-------------------------------------------------------------------|
 | `intercept`  | `intercept()`                        | Includes a global intercept term.                                          |                                                                    |
 | `bias`       | `bias(hurdle=0.1)`                   | Specifies likelihood-level parameters like hurdles or observation weights. |                                                                    |
-| `spatial`    | `spatial(s_idx, manifold='bym2')`    | Models spatial random effects using discrete areal units.                  |                                                                    |
-| `temporal`   | `temporal(t_idx, manifold='ar1')`    | Models temporal trends using discrete time steps.                          |                                                                    |
-| `seasonal`   | `seasonal(u_idx, manifold='cyclic')` | Models periodic effects (e.g., month-of-year).                             |                                                                    |
+| `spatial`    | `spatial(s_idx, model='bym2')`    | Models spatial random effects using discrete areal units.                  |                                                                    |
+| `temporal`   | `temporal(t_idx, model='ar1')`    | Models temporal trends using discrete time steps.                          |                                                                    |
+| `seasonal`   | `seasonal(u_idx, model='cyclic')` | Models periodic effects (e.g., month-of-year).                             |                                                                    |
 | `smooth`     | `smooth(x, nbins=20)`                | Creates a non-linear smooth of a continuous covariate `x`.                 |                                                                    |
-| `svc`        | `svc(x, manifold='iid')`             | Models a spatially-varying coefficient for covariate `x`.                  |                                                                    |
+| `svc`        | `svc(x, model='iid')`             | Models a spatially-varying coefficient for covariate `x`.                  |                                                                    |
 | `mixed`      | `mixed(1                             | group)`                                                                    | Defines a random intercept for each level of the `group` variable. |
 | `eigen`      | `eigen(x1, x2, n_factors=1)`         | Creates a latent field from the principal components of `x1` and `x2`.     |                                                                    |
-| `spacetime`  | `spacetime(manifold='IV')`           | Defines a joint spatiotemporal interaction field.                          |                                                                    |
+| `spacetime`  | `spacetime(model='IV')`           | Defines a joint spatiotemporal interaction field.                          |                                                                    |
 | `network`    | `network(s_idx, W=adj)`              | Models effects on a graph defined by adjacency matrix `W`.                 |                                                                    |
 | `hyperbolic` | `hyperbolic(s_idx)`                  | Placeholder for hyperbolic geometry models.                                |                                                                    |
 | `dynamics`   | `dynamics(var)`                      | Incorporates a mechanistic state-space model.                              |                                                                    |
@@ -324,9 +324,9 @@ Each keyword initializes a specific type of latent manifold or model component.
 
 ### Manifold Options
 
-The `manifold` argument within modules like `spatial`, `temporal`, and `smooth` specifies the underlying mathematical structure.
+The `model` argument within modules like `spatial`, `temporal`, and `smooth` specifies the underlying mathematical structure.
 
-| Manifold         | `manifold='...'`               | Description                                                                                 |
+| Manifold         | `model='...'`               | Description                                                                                 |
 | :-----------------| :-------------------------------| :--------------------------------------------------------------------------------------------|
 | `IID`            | `'iid'`                        | Independent and identically distributed (unstructured) random effects.                      |
 | `ICAR`           | `'icar'`, `'besag'`            | Intrinsic Conditional Autoregressive model for spatial smoothing.                           |
@@ -368,6 +368,7 @@ Manifolds can be combined algebraically within the formula string.
 
 *   `⊗` (`\otimes`): Kronecker product. Used to create inseparable spatiotemporal interactions.
     *   Example: `spacetime(manifold='spatial(s_idx) ⊗ temporal(t_idx)')`
+    *   Example: `spacetime(model='spatial(s_idx) ⊗ temporal(t_idx)')`
 *   `⊕` (`\oplus`): Direct sum. (Future support for block-diagonal structures).
 
 ## Configuration (Advanced)
@@ -409,4 +410,3 @@ preds = predict(model, chain, new_data_frame)
 It correctly handles the projection of all manifold types, including re-computing basis matrices for smooth terms on the new data grid.
 
 ---
-

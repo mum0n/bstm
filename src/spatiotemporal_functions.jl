@@ -2,171 +2,880 @@
 
 # Definitions
 
-# Discrete and Graph Manifold Categories 
-
 # BSTM Low-Level Manifold Registry [v06.1 - Reusable Schema] ---
-# Rationale: Manifolds are now defined as low-level primitives that are domain-agnostic. 
+# Rationale: ManifoldModels are now defined as low-level primitives that are domain-agnostic. 
 # The context (Spatial vs Temporal) is determined at the model-building stage.
 
+# --- 1. Core Abstract Types ---
 abstract type Manifold end
+abstract type ManifoldModel <: Manifold end
+abstract type ManifoldOperator <: Manifold end
+abstract type ManifoldSupervisor <: Manifold end
 
-# Define dedicated abstract type for transformations to enable distinct dispatch
-abstract type ManifoldTransform <: Manifold end
+# --- 2. Manifold Primitives (ManifoldModel) ---
 
-# Redefine transformation types to inherit from ManifoldTransform
-struct LogManifold <: ManifoldTransform end
-struct ZScoreManifold <: ManifoldTransform end
-struct UnitScaleManifold <: ManifoldTransform end
+# 2.1 Placeholders
+struct Fixed <: ManifoldModel end
+struct Covariate <: ManifoldModel end
 
-# Redefine TransformedManifold to wrap a base manifold and a transformation type
-struct TransformedManifold <: Manifold
-    manifold::Manifold
-    transform_fn::DataType
-end
+# 2.2 Discrete & Graph Primitives
+struct IID <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct ICAR <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct Besag <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct BYM2 <: ManifoldModel; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
+struct Leroux <: ManifoldModel; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
+struct SAR <: ManifoldModel; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
+struct RW1 <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct RW2 <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct AR1 <: ManifoldModel; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
+struct DAG <: ManifoldModel; adjacency_matrix::AbstractMatrix; sigma_prior::UnivariateDistribution; end
 
-# Logic: When the right-hand side is a transformation type, wrap the left-hand side
-function Base.:|>(m::Manifold, t::ManifoldTransform)
-    return TransformedManifold(m, typeof(t))
-end
+# 2.3 Continuous & Spectral Primitives
+struct GP <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; kernel::String; end
+struct FITC <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
+struct RFF <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; kernel::String; end
+struct FFT <: ManifoldModel; sigma_prior::UnivariateDistribution; nbins::Int; kernel::String; lengthscale_prior::UnivariateDistribution; end
+struct SPDE <: ManifoldModel; sigma_prior::UnivariateDistribution; kappa_prior::UnivariateDistribution; end
+struct SVGP <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
+struct Warp <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; kernel::String; end
+struct Nystrom <: ManifoldModel; sigma_prior::UnivariateDistribution; lengthscale_prior::UnivariateDistribution; n_inducing::Int; end
 
+# 2.4 Basis-Function Primitives (for Smooths)
+struct TPS <: ManifoldModel; nbins::Int; sigma_prior::UnivariateDistribution; end
+struct BSpline <: ManifoldModel; nbins::Int; degree::Int; sigma_prior::UnivariateDistribution; end
 
-
-# 1. Discrete & Graph Primitives
-struct Fixed <: Manifold; sigma_prior::UnivariateDistribution; end
-
-struct IID <: Manifold; sigma_prior::UnivariateDistribution; end
-struct ICAR <: Manifold; sigma_prior::UnivariateDistribution; end
-struct Besag <: Manifold; sigma_prior::UnivariateDistribution; end
-struct BYM2 <: Manifold; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-struct Leroux <: Manifold; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-struct SAR <: Manifold; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-struct RW1 <: Manifold; sigma_prior::UnivariateDistribution; end
-struct RW2 <: Manifold; sigma_prior::UnivariateDistribution; end
-struct AR1 <: Manifold; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-
-# 2. Continuous & Spectral Primitives (Cross-Domain)
-struct GP <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; kernel::String; end
-struct FITC <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
-struct RFF <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; kernel::String; end
-struct FFT <: Manifold; sigma_prior::UnivariateDistribution; nbins::Int; kernel::String; lengthscale_prior::UnivariateDistribution; end
-struct SPDE <: Manifold; sigma_prior::UnivariateDistribution; kappa_prior::UnivariateDistribution; end
-struct DAG <: Manifold; adjacency_matrix::AbstractMatrix; sigma_prior::UnivariateDistribution; end
-
-# v21 additions for sparse and non-stationary GPs
-struct SVGP <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
-struct Warp <: Manifold; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; kernel::String; end
-
-# 3. Non-Euclidean & Decay Primitives (v06.1 Expansion)
-struct ExponentialDecay <: Manifold; sigma_prior::UnivariateDistribution; decay_lengthscale_prior::UnivariateDistribution; end
-struct Hyperbolic <: Manifold; curvature::Float64; sigma_prior::UnivariateDistribution; end
-
-# 4. Basis-Function Primitives (Covariate/Smooth)
-struct Advection <: Manifold; velocity_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-struct Diffusion <: Manifold; diffusion_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-struct AdvectionDiffusion <: Manifold; velocity_prior::UnivariateDistribution; diffusion_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-struct ST_I <: Manifold; sigma_prior::UnivariateDistribution; end
-struct ST_II <: Manifold; sigma_prior::UnivariateDistribution; end
-struct ST_III <: Manifold; sigma_prior::UnivariateDistribution; end
-struct ST_IV <: Manifold; sigma_prior::UnivariateDistribution; end
-
-struct TPS <: Manifold; nbins::Int; sigma_prior::UnivariateDistribution; end
-struct BSpline <: Manifold; nbins::Int; degree::Int; sigma_prior::UnivariateDistribution; end
-struct PSpline <: Manifold; nbins::Int; degree::Int; diff_order::Int; sigma_prior::UnivariateDistribution; end
-struct Wavelets <: Manifold; wavelet_family::Symbol; nbins::Int; sigma_prior::UnivariateDistribution; kernel::String; lengthscale_prior::UnivariateDistribution; end
-
-# 5. Seasonal & Periodic (Wrappers)
-struct Harmonic <: Manifold
+# 2.5 Seasonal & Periodic Primitives
+struct Harmonic <: ManifoldModel
     amplitude_prior::UnivariateDistribution
     phase_prior::UnivariateDistribution
     sigma_prior::UnivariateDistribution
-    period::UnivariateDistribution
+    period::Union{Real, UnivariateDistribution}
+end
+struct Cyclic <: ManifoldModel; period::Int; sigma_prior::UnivariateDistribution; end
+
+# 2.6 Physics-Informed & Interaction Primitives
+struct Advection <: ManifoldModel; velocity_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
+struct Diffusion <: ManifoldModel; diffusion_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
+struct AdvectionDiffusion <: ManifoldModel; velocity_prior::UnivariateDistribution; diffusion_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
+struct ST_I <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct ST_II <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct ST_III <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct ST_IV <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct DynamicsManifold <: ManifoldModel
+    var::Symbol
+    sigma_prior::UnivariateDistribution
 end
 
-struct Cyclic <: Manifold; period::Int; sigma_prior::UnivariateDistribution; end
-
-# 6. Specialized & Network Manifolds [v14.3.10 - BSTM v06.1 Registry Fix]
-struct Nystrom <: Manifold; sigma_prior::UnivariateDistribution; lengthscale_prior::UnivariateDistribution; n_inducing::Int; end
-struct Eigen <: Manifold; sigma_prior::UnivariateDistribution; pca_sd_prior::UnivariateDistribution; pdef_sd_prior::UnivariateDistribution; n_factors::Int; ltri_indices::Vector{Int}; end
-struct BCGN <: Manifold; sigma_prior::UnivariateDistribution; bipartite_adj::AbstractMatrix; group_weights::AbstractVector; end
-struct LocalAdaptive <: Manifold
+# 2.7 Specialized & Advanced Primitives
+struct ExponentialDecay <: ManifoldModel; sigma_prior::UnivariateDistribution; decay_lengthscale_prior::UnivariateDistribution; end
+struct Hyperbolic <: ManifoldModel; curvature::Float64; sigma_prior::UnivariateDistribution; end
+struct Eigen <: ManifoldModel; sigma_prior::UnivariateDistribution; pca_sd_prior::UnivariateDistribution; pdef_sd_prior::UnivariateDistribution; n_factors::Int; ltri_indices::Vector{Int}; end
+struct BCGN <: ManifoldModel; sigma_prior::UnivariateDistribution; bipartite_adj::AbstractMatrix; group_weights::AbstractVector; end
+struct LocalAdaptive <: ManifoldModel
     sigma_prior::UnivariateDistribution
     weights_variable::Symbol
 end
-struct NetworkFlow <: Manifold
+struct NetworkFlow <: ManifoldModel
     sigma_prior::UnivariateDistribution
     adjacency_matrix::AbstractMatrix
     flow_direction::Symbol # :upstream, :downstream, :bidirectional
 end
-
-struct FixedManifold <: Manifold; end
-struct CovariateManifold <: Manifold; end
-
-# 6. Algebraic Operators
-struct ComposedManifold <: Manifold; components::Vector{Manifold}; operator::Symbol; end
-
-⊗(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :kronecker_product)
-⊕(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :direct_sum)
-
- 
-otimes(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :kronecker_product)
-oplus(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :direct_sum)
-
-
-# Base pipe for transformations: Manifold |> Manifold (Transformation)
-# If the RHS is a Transformation (LogManifold, ZScoreManifold, etc.), wrap the LHS
-function Base.:|>(m::Manifold, t::Manifold)
-    return TransformedManifold(m, typeof(t))
-end
-
-# Base pipe for composition: Manifold |> Manifold (Stacking)
-# If the RHS is a Structural Manifold (Temporal, Spatial), compose them
-function Base.:|>(m1::Manifold, m2::Manifold)
-    return ComposedManifold([m1, m2], :pipe)
-end
-
-
-# --- 5. Composite and Constrained Manifolds ---
-struct RegularizationGroupManifold <: Manifold
-    manifolds::Vector{Manifold}
-    penalty::Symbol # :ridge, :lasso
-    lambda_prior::UnivariateDistribution
-end
-
-struct SoftConstraintManifold <: Manifold
-    manifold::Manifold
-    type::Symbol # :sum_to_zero, :monotonic
-    weight::Float64
-end
-  
-# --- 6. Compositional Manifolds (Physics & Stacking) ---
-# struct KnorrHeld <: Manifold
-#     dim1::Symbol
-#     dim2::Symbol
-#     type::Char
-#     sigma_prior::UnivariateDistribution
-# end
-
-# struct AdvectionDiffusion <: Manifold
-#     dim1::Symbol
-#     dim2::Symbol
-#     velocity_field::Union{Nothing, Symbol}
-#     velocity_prior::UnivariateDistribution
-#     diffusion_coeff::Union{Nothing, Float64}
-#     diffusion_prior::UnivariateDistribution
-# end
-
-struct Mosaic <: Manifold
+struct Mosaic <: ManifoldModel
     coordinates::Vector{Symbol}
     n_regions::Int
     local_smoothness::Bool
 end
 
-# 7. Manifold Type Dispatch [v06.1 Audit]
+# --- 3. Manifold Operators ---
+struct ComposedManifold <: ManifoldOperator; components::Vector{Manifold}; operator::Symbol; end
+struct ChangePointManifold <: ManifoldOperator
+    manifold::ManifoldModel              # The process within each segment (e.g., AR1)
+    n_changepoints::Int                  # Number of change points to infer
+    changepoint_prior::UnivariateDistribution # Prior on the location of change points
+end
+struct TransformedManifold <: ManifoldOperator
+    manifold::Manifold
+    transform_fn::Symbol  # e.g., :log, :zscore, :unit
+end
+struct VaryingInteractionManifold <: ManifoldOperator
+    interaction_vars::Vector{Symbol} # e.g., [:temperature, :salinity]
+    model::ManifoldModel             # e.g., AR1(...) or RW2(...)
+end
+struct SharedManifold <: ManifoldOperator
+    name::Symbol
+    model::Manifold
+end
+struct SVCManifold <: ManifoldOperator
+    covariate::Symbol
+    model::ManifoldModel
+end
+struct MixedManifold <: ManifoldOperator
+    group_var::Symbol
+    lhs::String
+    model::ManifoldModel
+end
+struct RegularizationGroupManifold{T<:Union{UnivariateDistribution, Nothing}} <: ManifoldOperator
+    manifolds::Vector{Manifold}
+    penalty::Symbol # :ridge, :lasso, :elastic_net
+    lambda_prior::UnivariateDistribution
+    alpha_prior::T # Mixing parameter for Elastic Net
+end
+
+# Constructor with default for alpha_prior
+RegularizationGroupManifold(manifolds, penalty, lambda_prior; alpha_prior=nothing) = RegularizationGroupManifold(manifolds, penalty, lambda_prior, alpha_prior)
+
+struct SoftConstraintManifold <: ManifoldOperator
+    manifold::Manifold
+    type::Symbol # :sum_to_zero, :monotonic_increasing, :monotonic_decreasing, :periodicity, :non_negative, :convex, :concave
+    weight::Float64
+end
+
+# --- 4. Manifold Supervisors ---
+struct NestedManifold <: ManifoldSupervisor
+    var::Symbol
+    formula::String
+    data_source::Symbol
+end
+
+# --- 5. Algebraic Operators ---
+function Base.:|>(m1::Manifold, m2::Manifold)
+    return ComposedManifold([m1, m2], :pipe)
+end
+
+⊗(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :kronecker_product)
+⊕(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :direct_sum)
+
+otimes(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :kronecker_product)
+oplus(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :direct_sum)
+
+
+# Helper function to capitalize the first letter of a string
+function capitalize(s::String)
+    isempty(s) && return s
+    return uppercasefirst(s)
+end
+
+# --- 6. Model Builder Dispatch ---
+# These methods translate the high-level manifold structs into technical configurations
+# that the @model supervisor can interpret and execute.
+
+function build_model(m::SoftConstraintManifold, data_inputs)
+    # Build the inner model's configuration
+    inner_config = build_model(m.manifold, data_inputs)
+    
+    # Augment the hyperparameter configuration with the constraint details.
+    # The model supervisor (@model) will use this metadata to apply the penalty.
+    new_hyper = merge(inner_config.hyper, (
+        soft_constraint_type = m.type,
+        soft_constraint_weight = m.weight
+    ))
+    
+    # Return the modified configuration. The model_type of the inner manifold is preserved.
+    return merge(inner_config, (hyper = new_hyper,))
+end
+
+function build_model(m::RegularizationGroupManifold, data_inputs)
+    # This operator groups multiple manifolds for joint penalization.
+    # It returns a special configuration that the @model supervisor recognizes.
+
+    return (
+        Q_template = nothing, # No single template for a group
+        scaling_factor = 1.0,
+        model_type = :regularization_group,
+        hyper = (
+            penalty = m.penalty,
+            lambda_prior = m.lambda_prior,
+            alpha_prior = m.alpha_prior, 
+            sub_manifolds = m.manifolds # Store the original structs for later lookup
+        )
+    )
+end
+
+function build_model(m::SharedManifold, data_inputs)
+    # This operator signals that a latent field should be shared across components.
+    # It builds the inner model's configuration and decorates it with a 'shared_as' name.
+    
+    inner_config = build_model(m.model, data_inputs)
+    
+    # The model supervisor (@model) will use this name to cache and reuse the latent field.
+    return merge(inner_config, (shared_as = m.name,))
+end
+
+function resolve_hyperpriors(m_id::Union{String, Symbol}, user_priors::Dict{String, Any}, scheme::Symbol=:pcpriors)
+    # Audited Hyperprior Resolver [v06.1 - PC-Prior Standardized]
+    # Rationale: Maps string/symbol identifiers to technical prior requirements.
+    # PC-Priors are now the default (:pcpriors) to ensure robust scaling across graph topologies.
+
+    m_id_str = string(m_id)
+
+    # 1. Primary Prior Registries
+    # PC-Priors: Penalize complexity relative to a base model (e.g., IID or Intercept)
+    local pcpriors = Dict(
+        "sigma" => Exponential(1.0),
+        "rho" => Beta(1, 1), # Flat/PC base for correlation
+        "lengthscale" => InverseGamma(3, 3), # Informative base for GPs
+        "kappa" => Exponential(1.0),
+        "amplitude" => Normal(0, 1),
+        "phase" => Beta(1, 1)
+    )
+
+    local informative = Dict(
+        "sigma" => Exponential(0.5),
+        "rho" => Beta(2, 2),
+        "lengthscale" => InverseGamma(5, 5),
+        "kappa" => Exponential(0.1),
+        "amplitude" => Normal(0, 0.5),
+        "phase" => Beta(2, 2)
+    )
+
+    local uninformative = Dict(
+        "sigma" => Normal(0, 1e6),
+        "rho" => Uniform(0, 1),
+        "lengthscale" => InverseGamma(0.01, 0.01),
+        "kappa" => Exponential(10.0),
+        "amplitude" => Normal(0, 100),
+        "phase" => Uniform(0, 1)
+    )
+
+    # 2. Scheme Selection Logic
+    local defaults = if scheme == :pcpriors
+        pcpriors
+    elseif scheme == :informative
+        informative
+    else
+        uninformative
+    end
+
+    # 3. Resolved Object Assembly
+    # Initializing result container with mandatory sigma and optional structural slots.
+    local res = (
+        sigma_prior = get(user_priors, "sigma", defaults["sigma"]),
+        rho_prior = nothing,
+        lengthscale_prior = nothing,
+        kappa_prior = nothing,
+        amplitude_prior = nothing,
+        phase_prior = nothing
+    )
+
+    # 4. Registry-Based Parameter Dispatch
+    # Discrete Graph/CAR Manifolds
+    if m_id_str in ["bym2", "leroux", "sar", "ar1", "proper_car", "dag"]
+        res = merge(res, (rho_prior = get(user_priors, "rho", defaults["rho"]),))
+    end
+
+    # Continuous / Spectral Kernels
+    if m_id_str in ["gp", "fitc", "rff", "warp", "nystrom"]
+        res = merge(res, (lengthscale_prior = get(user_priors, "lengthscale", defaults["lengthscale"]),))
+    end
+
+    # SPDE Latent Fields
+    if m_id_str == "spde"
+        res = merge(res, (kappa_prior = get(user_priors, "kappa", defaults["kappa"]),))
+    end
+
+    # Periodic / Harmonic Cycles
+    if m_id_str == "harmonic"
+        res = merge(res, (
+            amplitude_prior = get(user_priors, "amplitude", defaults["amplitude"]),
+            phase_prior = get(user_priors, "phase", defaults["phase"])
+        ))
+    end
+
+    return res
+end
+
+
+# Helper to split terms by a separator, respecting parentheses depth
+function split_terms_at_depth(input::AbstractString, sep::AbstractString)
+    terms = String[]
+    depth = 0
+    current = ""
+    for char in input
+        if char == '(' || char == '['
+            depth += 1
+        elseif char == ')' || char == ']'
+            depth -= 1
+        end
+        if string(char) == sep && depth == 0
+            push!(terms, strip(current))
+            current = ""
+        else
+            current *= char
+        end
+    end
+    if !isempty(strip(current))
+        push!(terms, strip(current))
+    end
+    return terms
+end
+
+
+
+# --- 7. Constraint and Regularization Application Helpers ---
+# These functions are called from within the @model block to apply penalties.
+
+function apply_soft_constraint(latent_field::AbstractVector, constraint_type::Symbol, weight::Float64)
+    T = eltype(latent_field)
+    penalty = zero(T)
+    n = length(latent_field)
+
+    if n == 0
+        return penalty
+    end
+
+    if constraint_type == :sum_to_zero
+        penalty = -weight * sum(latent_field)^2
+    elseif constraint_type == :monotonic_increasing
+        penalty = -weight * sum(max.(zero(T), -diff(latent_field)).^2)
+    elseif constraint_type == :monotonic_decreasing
+        penalty = -weight * sum(max.(zero(T), diff(latent_field)).^2)
+    elseif constraint_type == :periodicity
+        if n > 1
+            penalty = -weight * (latent_field[1] - latent_field[end])^2
+        end
+    elseif constraint_type == :non_negative
+        penalty = -weight * sum(max.(zero(T), -latent_field).^2)
+    elseif constraint_type == :convex
+        if n > 2; penalty = -weight * sum(max.(zero(T), -diff(diff(latent_field))).^2); end
+    elseif constraint_type == :concave
+        if n > 2; penalty = -weight * sum(max.(zero(T), diff(diff(latent_field))).^2); end
+    else
+        @warn "Unknown soft constraint type: $constraint_type. No penalty applied."
+    end
+    return penalty
+end
+
+function apply_regularization_penalty(fields::Vector{<:AbstractVector}, penalty_type::Symbol, lambda::Float64, alpha::Float64=0.5)
+    if isempty(fields)
+        return 0.0
+    end
+    all_coeffs = vcat(fields...)
+    T = eltype(all_coeffs)
+    penalty = zero(T)
+
+    if penalty_type == :ridge
+        penalty = -lambda * sum(all_coeffs.^2)
+    elseif penalty_type == :lasso
+        penalty = -lambda * sum(abs.(all_coeffs))
+    elseif penalty_type == :elastic_net
+        penalty = -lambda * (alpha * sum(abs.(all_coeffs)) + (1 - alpha) * sum(all_coeffs.^2))
+    else
+        @warn "Unknown regularization penalty type: $penalty_type. No penalty applied."
+    end
+    return penalty
+end
+
+# --- 8. Manifold Utilities ---
 function manifold_type(m::Manifold)
     return lowercase(string(typeof(m)))
 end
+
+
+# Recursive helper to parse a module call string into a Dict
+function _parse_module_call(module_call_str::String)
+    m_mod = match(r"(\w+)\((.*)\)", module_call_str)
+    isnothing(m_mod) && return Dict{Symbol, Any}(:type => :literal, :value => module_call_str)
+
+    kw = lowercase(m_mod.captures[1])
+    inner_str = m_mod.captures[2]
     
- 
+    # Check if the keyword is a known BSTM manifold
+    if !(kw in BSTM_MANIFOLDS)
+        return Dict{Symbol, Any}(:type => :literal, :value => module_call_str)
+    end
+
+    # Parse parameters and variables
+    local v_part_str, p_dict_raw
+    
+    # Split inner_str into variable part and parameter part (separated by ';')
+    semicolon_parts = split_terms_at_depth(inner_str, ";")
+    if length(semicolon_parts) > 1
+        v_part_str = semicolon_parts[1]
+        p_dict_raw = parse_module_params(semicolon_parts[2])
+    else
+        # If no semicolon, it could be all variables, or variables mixed with params
+        # We need to distinguish variables from key=value parameters
+        all_inner_parts = split_terms_at_depth(inner_str, ",")
+        var_only_parts = String[]
+        param_only_parts = String[]
+        for part in all_inner_parts
+            if occursin("=", part)
+                push!(param_only_parts, part)
+            else
+                push!(var_only_parts, part)
+            end
+        end
+        v_part_str = join(var_only_parts, ",")
+        p_dict_raw = parse_module_params(join(param_only_parts, ","))
+    end
+
+    # Process variables and transforms
+    raw_vars = [strip(v) for v in split_terms_at_depth(v_part_str, ",")]
+    final_vars = String[]
+    transforms = Dict{String, Vector{String}}()
+    for var_expr in raw_vars
+        var_name, transform_list = parse_variable_and_transforms(var_expr)
+        push!(final_vars, var_name)
+        if !isempty(transform_list)
+            transforms[var_name] = transform_list
+        end
+    end
+
+    # Special handling for nested modules
+    if kw == "transform"
+        # The first variable in final_vars is the inner module call string
+        inner_module_call_str = final_vars[1]
+        inner_module_data = _parse_module_call(inner_module_call_str) # Recursive call
+        
+        return Dict{Symbol, Any}(
+            :type => Symbol(kw),
+            :inner_module => inner_module_data,
+            :params => p_dict_raw # This should contain 'fn'
+        )
+    elseif kw == "interaction"
+        # 'model' parameter needs to be parsed as an inner module
+        inner_model_call_str = get(p_dict_raw, :model, "")
+        if inner_model_call_str isa String && !isempty(inner_model_call_str)
+            inner_model_data = _parse_module_call(inner_model_call_str) # Recursive call
+            p_dict_raw[:model] = inner_model_data # Replace string with parsed module Dict
+        end
+        return Dict{Symbol, Any}(
+            :type => Symbol(kw),
+            :variables => final_vars,
+            :params => p_dict_raw # This should contain 'model'
+        )
+    else
+        return Dict{Symbol, Any}(
+            :type => Symbol(kw),
+            :variables => final_vars,
+            :params => p_dict_raw,
+            :transforms => transforms
+        )
+    end
+end
+
+
+function parse_module_params(params_str::String)
+    d = Dict{Symbol, Any}()
+    if isempty(strip(params_str))
+        return d
+    end
+
+    pairs = split_terms_at_depth(params_str, ",") # Use the helper
+
+    for entry in pairs
+        if occursin("=", entry)
+            elements = Base.split(entry, "=", limit = 2)
+            param_key = Symbol(strip(elements[1]))
+            param_val_raw = strip(elements[2])
+
+            # Check if param_val_raw is a module call string
+            m_mod_nested = match(r"(\w+)\((.*)\)", param_val_raw)
+            if !isnothing(m_mod_nested) && (lowercase(m_mod_nested.captures[1]) in BSTM_MANIFOLDS)
+                # This is a nested module call, parse it recursively
+                d[param_key] = _parse_module_call(param_val_raw)
+                continue
+            end
+
+            # Collection Handling (e.g., `param=(val1, val2)`)
+            if (startswith(param_val_raw, "(") && endswith(param_val_raw, ")")) ||
+               (startswith(param_val_raw, "[") && endswith(param_val_raw, "]"))
+                content_inner = strip(param_val_raw[2:end-1])
+                parts_inner = split_terms_at_depth(content_inner, ",") # Use helper
+                d[param_key] = [occursin("=", v) ? parse_module_params(v) : strip(v, ['\'', '"']) for v in parts_inner]
+            # String Literals
+            elseif (startswith(param_val_raw, "'") && endswith(param_val_raw, "'")) ||
+                   (startswith(param_val_raw, "\"") && endswith(param_val_raw, "\""))
+                d[param_key] = strip(param_val_raw, ['\'', '"'])
+            # Numeric Literals
+            elseif !isnothing(tryparse(Int, param_val_raw))
+                d[param_key] = parse(Int, param_val_raw)
+            elseif !isnothing(tryparse(Float64, param_val_raw))
+                d[param_key] = parse(Float64, param_val_raw)
+            # Boolean Literals
+            elseif param_val_raw == "true"
+                d[param_key] = true
+            elseif param_val_raw == "false"
+                d[param_key] = false
+            # Symbolic Keywords
+            else
+                d[param_key] = Symbol(param_val_raw)
+            end
+        end
+    end
+    return d
+end
+
+
+function decompose_bstm_formula(formula_str::String)
+    # Partition the formula into Left-Hand Side (Outcomes) and Right-Hand Side (Predictors)
+    parts = Base.split(formula_str, "~")
+    lhs = strip(parts[1])
+    rhs = strip(parts[2])
+
+    # # Outcome Discovery
+    outcomes = String[]
+    if startswith(lhs, "[") && endswith(lhs, "]")
+        content = lhs[2:end-1]
+        outcomes = [strip(s) for s in Base.split(content, ",")]
+    else
+        outcomes = [lhs]
+    end
+
+    # # Module and Fixed Effect Registries
+    terms_raw = split_terms_at_depth(rhs, "+")
+    modules = Dict{String, Any}()
+    fixed_effects = String[]
+    has_intercept = false
+
+    for term in terms_raw
+        t_clean = strip(term)
+        if t_clean == "1"
+            has_intercept = true
+            continue
+        end
+
+        # Check if it's a module call
+        m_mod = match(r"(\w+)\((.*)\)", t_clean)
+        if !isnothing(m_mod) && (lowercase(m_mod.captures[1]) in BSTM_MANIFOLDS)
+            module_data = _parse_module_call(t_clean)
+            # Generate a unique key for the module based on its type and variables
+            # Handle nested modules for key generation
+            if module_data[:type] == :transform
+                inner_type = module_data[:inner_module][:type]
+                inner_vars = join(get(module_data[:inner_module], :variables, [""]), "_")
+                module_key = Symbol(module_data[:type], "_", inner_type, "_", inner_vars)
+            elseif module_data[:type] == :interaction
+                vars = join(module_data[:variables], "_")
+                inner_model_type = get(module_data[:params], :model, Dict{Symbol, Any}())[:type]
+                module_key = Symbol(module_data[:type], "_", vars, "_", inner_model_type)
+            else
+                vars = join(get(module_data, :variables, [""]), "_")
+                module_key = Symbol(module_data[:type], "_", vars)
+            end
+            modules[string(module_key)] = module_data
+        else
+            # It's a fixed effect or algebraic operator
+            operator_found = ""
+            for op in ["⊗", "otimes", "⊕", "oplus", "∘", "compose", "|>", "pipe"]
+                if occursin(op, t_clean)
+                    operator_found = op
+                    break
+                end
+            end
+
+            if !isempty(operator_found)
+                norm_op = operator_found
+                if operator_found == "otimes"; norm_op = "⊗"; end
+                if operator_found == "oplus"; norm_op = "⊕"; end
+                if operator_found == "compose"; norm_op = "∘"; end
+                if operator_found == "pipe"; norm_op = "|>"; end
+
+                sub_terms = split_terms_at_depth(t_clean, operator_found)
+
+                parsed_components = []
+                for st in sub_terms
+                    push!(parsed_components, _parse_module_call(st))
+                end
+
+                modules["algebraic_" * t_clean] = Dict{Symbol, Any}(
+                    :type => :interaction_composition,
+                    :components => parsed_components,
+                    :operator => Symbol(norm_op)
+                )
+                continue
+            end
+            
+            # If not a module and not an algebraic operator, it's a fixed effect
+            push!(fixed_effects, t_clean)
+        end
+    end
+
+    return (outcomes=outcomes, modules=modules, fixed_effects=fixed_effects, has_intercept=has_intercept)
+end
+
+
+function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, priors_dict, scheme::Symbol)
+    m_type = module_metadata[:type]
+    m_params = module_metadata[:params]
+    
+    if m_type == :transform
+        inner_module_data = module_metadata[:inner_module]
+        inner_manifold_obj = resolve_technical_primitive(inner_module_data, M, priors_dict, scheme)
+        transform_fn = get(m_params, :fn, :identity)
+        return TransformedManifold(inner_manifold_obj, transform_fn)
+    elseif m_type == :interaction
+        interaction_vars = [Symbol(v) for v in module_metadata[:variables]]
+        inner_model_data = get(m_params, :model, Dict{Symbol, Any}())
+        inner_manifold_obj = resolve_technical_primitive(inner_model_data, M, priors_dict, scheme)
+        return VaryingInteractionManifold(interaction_vars, inner_manifold_obj)
+    else
+        # For atomic modules, extract parameters and call the string-based resolver
+        manifold_name = string(m_type)
+        
+        # Resolve hyperpriors for this specific manifold
+        resolved_priors = resolve_hyperpriors(manifold_name, priors_dict, scheme)
+
+        # Extract specific parameters from m_params for instantiation
+        # This part needs to be carefully mapped to each Manifold struct's constructor.
+        # This is a simplified example; a full implementation would need a large switch/if-else
+        # or a more generic constructor.
+        if m_type == :iid
+            return IID(resolved_priors.sigma_prior)
+        elseif m_type == :icar || m_type == :besag
+            return ICAR(resolved_priors.sigma_prior)
+        elseif m_type == :bym2
+            return BYM2(resolved_priors.rho_prior, resolved_priors.sigma_prior)
+        elseif m_type == :ar1
+            return AR1(resolved_priors.rho_prior, resolved_priors.sigma_prior)
+        elseif m_type == :rw1
+            return RW1(resolved_priors.sigma_prior)
+        elseif m_type == :rw2
+            return RW2(resolved_priors.sigma_prior)
+        elseif m_type == :gp
+            kernel_str = string(get(m_params, :kernel, "squared_exponential"))
+            return GP(resolved_priors.lengthscale_prior, resolved_priors.sigma_prior, kernel_str)
+        elseif m_type == :rff
+            n_features = get(m_params, :n_features, get(M, :n_features, 20))
+            return RFF(resolved_priors.lengthscale_prior, resolved_priors.sigma_prior, n_features, string(get(m_params, :kernel, "squared_exponential")))
+        elseif m_type == :svc
+            # SVC is an operator, but its inner model is a ManifoldModel.
+            # This case should ideally not be reached directly for SVC, as SVC is handled in bstm_config.
+            # If it does, it implies an SVC without an explicit inner model, defaulting to IID.
+            return IID(resolved_priors.sigma_prior)
+        else
+            @warn "Unknown manifold type $(m_type) in metadata. Defaulting to IID."
+            return IID(resolved_priors.sigma_prior)
+        end
+    end
+end
+
+
+function bstm_config(formula::String, data::DataFrame; kwargs...)
+  # 1. Formula Scope Discovery
+    metadata = decompose_bstm_formula(formula)
+
+    # 2. Metadata Context Initialization
+    opt_dict = Dict{Symbol, Any}(kwargs)
+    opt_dict[:y_obs_vars] = metadata.outcomes
+    opt_dict[:data] = data
+
+    # Technical Registers Initialization
+    opt_dict[:model_space] = get(opt_dict, :model_space, "none")
+    opt_dict[:model_time] = get(opt_dict, :model_time, "none")
+    opt_dict[:model_season] = get(opt_dict, :model_season, "none")
+    opt_dict[:model_st] = get(opt_dict, :model_st, "none")
+    opt_dict[:algebraic_manifolds] = Dict{Symbol, Any}()
+    opt_dict[:svc_covariates] = Symbol[]
+    opt_dict[:basis_matrices] = Dict{Symbol, Any}()
+    opt_dict[:mixed_terms] = []
+
+    # Hyperprior Registry Initialization
+    initial_hp = get(opt_dict, :hyperpriors, Dict{Any, Any}())
+    hyperprior_registry = Dict{String, Any}(string(k) => v for (k, v) in initial_hp)
+
+    # Internal Technical Registries
+    fixed_parts_accumulator = String[]
+    mixed_terms_registry = []
+    nested_manifolds_registry = Dict{String, Any}()
+    basis_matrices_registry = Dict{Symbol, Any}()
+    svc_covariates_registry = Symbol[]
+    svc_manifolds_registry = Dict{Symbol, Any}()
+    network_registry = Dict{Symbol, Any}()
+    volatility_registry = Dict{Symbol, Any}()
+    spacetime_registry = Dict{Symbol, Any}()
+    dynamics_registry = Dict{Symbol, Any}()
+    manifolds_registry = [] # New unified registry
+
+    
+    # Helper: Recursive Hyperprior Extraction from module parameters
+    function extract_module_hyperpriors!(reg::Dict{String, Any}, p::Dict{Symbol, Any})
+        if haskey(p, :hyperpriors)
+            hp_raw = p[:hyperpriors]
+            hp_val = hp_raw isa Symbol ? Main.eval(hp_raw) : hp_raw
+            if hp_val isa Dict
+                for (hk, hv) in hp_val
+                    reg[string(hk)] = hv
+                end
+            end
+        end
+        # Recursively extract from from nested modules
+        if haskey(p, :inner_module) && p[:inner_module] isa Dict
+            extract_module_hyperpriors!(reg, p[:inner_module][:params])
+        end
+        if haskey(p, :model) && p[:model] isa Dict
+            extract_module_hyperpriors!(reg, p[:model][:params])
+        end
+        if haskey(p, :sub_modules) && p[:sub_modules] isa Vector
+            for sub_mod in p[:sub_modules]; extract_module_hyperpriors!(reg, sub_mod[:params]); end
+        end
+    end
+
+
+    # Technical Module Resolution Loop
+    for (key_str, mod_data) in metadata.modules # mod_data is now a Dict from _parse_module_call
+
+        # Ingest local hyperpriors for any module type
+        extract_module_hyperpriors!(hyperprior_registry, mod_data[:params])
+
+        # --- Modular Manifold Spec Assembly ---
+        # If it's an algebraic composition, process its components
+        if mod_data[:type] == :interaction_composition
+            op = mod_data[:operator]
+            comps = mod_data[:components]
+            
+            # Technical Signal Promotion for ST Class (I-IV)
+            if op == :⊗ || op == Symbol("otimes")
+                opt_dict[:model_st] = "IV"
+                for comp_data in comps
+                    if comp_data[:type] == :spatial
+                        opt_dict[:model_space] = string(get(comp_data[:params], :model, "bym2"))
+                    elseif comp_data[:type] == :temporal
+                        opt_dict[:model_time] = string(get(comp_data[:params], :model, "ar1"))
+                    end
+                end
+            end
+            # No Manifold struct is created for the composition itself, its components are.
+            continue
+        end
+
+        # For other modules, instantiate the Manifold struct
+        manifold_obj = resolve_technical_primitive(mod_data, opt_dict, hyperprior_registry, :pcpriors)
+
+        spec_params = Dict{Symbol, Any}()
+        if mod_data[:type] == :mixed
+            mixed_str = join(mod_data[:variables], ",")
+            m_match = match(r"(.+?)\s*\|\s*(.+)", mixed_str)
+            if !isnothing(m_match)
+                group_var = Symbol(strip(m_match.captures[2]))
+                if hasproperty(data, group_var)
+                    levels = unique(data[!, group_var])
+                    group_map = Dict(v => i for (i, v) in enumerate(levels))
+                    spec_params[:indices] = [group_map[v] for v in data[!, group_var]]
+                    spec_params[:n_cat] = length(levels)
+                end
+            end
+        elseif mod_data[:type] == :smooth
+            spec_params[:coords] = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
+        end
+
+        spec = (
+            domain = mod_data[:type], # Use Symbol
+            var = isempty(mod_data[:variables]) ? :none : Symbol(mod_data[:variables][1]),
+            manifold_obj = manifold_obj,
+            params = NamedTuple(spec_params)
+        )
+        push!(manifolds_registry, spec)
+
+        # Update opt_dict based on module type (similar to existing logic)
+        if mod_data[:type] == :spatial
+            opt_dict[:model_space] = string(get(mod_data[:params], :model, "bym2"))
+            if !isempty(mod_data[:variables])
+                var_sym = Symbol(mod_data[:variables][1])
+                if hasproperty(data, var_sym)
+                    opt_dict[:s_idx] = Int.(data[!, var_sym])
+                    opt_dict[:s_idx_var] = var_sym
+                end
+            end
+            if haskey(mod_data[:params], :W)
+                w_raw = mod_data[:params][:W]
+                opt_dict[:W] = w_raw isa String ? Main.eval(Meta.parse(w_raw)) : w_raw
+            end
+        elseif mod_data[:type] == :temporal
+            manifold_id = string(get(mod_data[:params], :model, "ar1"))
+            opt_dict[:model_time] = manifold_id
+            if !isempty(mod_data[:variables])
+                var_sym = Symbol(mod_data[:variables][1])
+                if hasproperty(data, var_sym)
+                    tu_meta = assign_time_units(data[!, var_sym]; time_method="regular")
+                    opt_dict[:t_idx] = tu_meta.t_idx
+                    opt_dict[:u_idx] = tu_meta.u_idx
+                    opt_dict[:t_idx_var] = var_sym
+                    if manifold_id == "cyclic"; opt_dict[:model_season] = "cyclic"; end
+                end
+            end
+        elseif mod_data[:type] == :smooth
+            if !isempty(mod_data[:variables])
+                nb = get(mod_data[:params], :nbins, get(mod_data[:params], :m_rff, 20)) # Support m_rff for rff smooths
+                manifold_type_str = string(get(mod_data[:params], :model, "pspline"))
+                reg_key = Symbol(join(mod_data[:variables], "_"))
+                
+                if all(hasproperty(data, Symbol(v)) for v in mod_data[:variables])
+                    if length(mod_data[:variables]) == 1
+                        v_vec = data[!, Symbol(mod_data[:variables][1])]
+                        basis_matrices_registry[reg_key] = bstm_smooth_basis_1D(manifold_type_str, v_vec, nb, get(mod_data[:params], :degree, 3); mod_data[:params]...)
+                    else
+                        c_mat = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
+                        if length(mod_data[:variables]) == 2; basis_matrices_registry[reg_key] = bstm_smooth_basis_2D(manifold_type_str, c_mat, nb; mod_data[:params]...);
+                        elseif length(mod_data[:variables]) == 3; basis_matrices_registry[reg_key] = bstm_smooth_basis_3D(manifold_type_str, c_mat, nb; mod_data[:params]...);
+                        elseif length(mod_data[:variables]) == 4; basis_matrices_registry[reg_key] = bstm_smooth_basis_4D(manifold_type_str, c_mat, nb; mod_data[:params]...);
+                        end
+                    end
+                else
+                    @warn "One or more variables for smooth term not found in data: $(join(mod_data[:variables], ", "))"
+                end
+            end
+            opt_dict[:model_time] = string(get(mod_data[:params], :model, "ar1"))
+        elseif mod_data[:type] == :volatility
+            opt_dict[:use_sv] = true
+            opt_dict[:M_rff_sigma] = get(mod_data[:params], :nbins, 20)
+            volatility_registry[Symbol(mod_data[:variables][1])] = mod_data[:params]
+        elseif mod_data[:type] == :network
+            network_registry[Symbol(mod_data[:variables][1])] = mod_data[:params]
+        elseif mod_data[:type] == :spacetime
+            m_call = lowercase(string(get(mod_data[:params], :model, "none")))
+            # Detect Kronecker operator convenience wrappers and perform shorthand expansion
+            if occursin("\u2297", m_call) || occursin("otimes", m_call)
+                m_parts = split(m_call, r"\s*\u2297\s*|\s+otimes\s+")
+                if length(m_parts) >= 2
+                    ms = strip(string(m_parts[1]), ['\'', '"', ' '])
+                    mt = strip(string(m_parts[2]), ['\'', '"', ' '])
+
+                    # Convenience Shorthand Expansion: Physics Aliases
+                    if ms == "advection" && mt == "diffusion"
+                        opt_dict[:model_st] = "advection_diffusion"
+                        opt_dict[:model_space] = "besag"
+                        opt_dict[:model_time] = "ar1"
+                    else
+                        # Standard composite mapping to Space/Time registers
+                        opt_dict[:model_space] = ms
+                        opt_dict[:model_time] = mt
+                        # Automatic Knorr-Held Interaction classification (Type I-IV)
+                        if ms == "iid" && mt == "iid"; opt_dict[:model_st] = "I"
+                        elseif ms == "iid"; opt_dict[:model_st] = "II"
+                        elseif mt == "iid"; opt_dict[:model_st] = "III"
+                        else; opt_dict[:model_st] = "IV"; end
+                    end
+                end
+            end
+            spacetime_registry[Symbol(key_str)] = mod_data[:params]
+        elseif mod_data[:type] == :hyperbolic
+            opt_dict[:model_space] = "hyperbolic"
+            opt_dict[:curvature] = get(mod_data[:params], :curvature, -1.0)
+            if !isempty(mod_data[:variables]); opt_dict[:s_coord] = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])]); end
+        end
+    end
+
+    # Final Registry Consolidation
+    opt_dict[:manifolds] = manifolds_registry
+    opt_dict[:hyperpriors] = hyperprior_registry
+    opt_dict[:basis_matrices] = basis_matrices_registry
+    opt_dict[:network_metadata] = network_registry
+    opt_dict[:volatility_metadata] = volatility_registry
+    opt_dict[:fixed_parts] = unique(vcat(fixed_parts_accumulator, string.(metadata.fixed_effects)))
+    opt_dict[:add_intercept] = metadata.has_intercept
+    opt_dict[:formula] = formula
+
+    if length(metadata.outcomes) == 1
+        opt_dict[:y_obs] = data[!, metadata.outcomes[1]]
+    else
+        opt_dict[:y_obs] = Matrix(data[!, metadata.outcomes])
+        opt_dict[:model_arch] = "multivariate"
+    end
+
+    return bstm_config(; opt_dict...)
+end
+
 
 function parse_manifold_graph(expr_in::AbstractString)
     # Audited Recursive DSL Parser [v15.2.0 - BSTM v06.1 Final Restoration]
@@ -622,23 +1331,11 @@ end
 
 
 
-const BSTM_MODULE_KEYWORDS = Set([
-    "intercept",
-    "bias", 
-    "spatial",
-    "temporal",
-    "seasonal",
-    "smooth",  
-    "nested", 
-    "eigen", 
-    "fixed",
-    "mixed",
-    "svc",
-    "volatility",
-    "network",
-    "spacetime",
-    "hyperbolic",
-    "dynamics"
+
+const BSTM_MANIFOLDS = Set([
+    "intercept", "observationmodifier", "spatial", "temporal", "seasonal",
+    "smooth", "nested", "eigen", "fixed", "mixed", "volatility", "network",
+    "dynamics", "transform"
 ])
 
 const BSTM_TRANSFORM_KEYWORDS = Dict(
@@ -647,200 +1344,290 @@ const BSTM_TRANSFORM_KEYWORDS = Dict(
     "unit" => x -> (x .- minimum(x)) ./ (maximum(x) - minimum(x))
 )
 
+ 
 
    
 # # BSTM Monolithic Configuration Engine v19.23.14
 
+ 
 
+function bstm_config(formula::String, data::DataFrame; kwargs...)
+  # 1. Formula Scope Discovery
+    metadata = decompose_bstm_formula(formula)
 
-function bstm_options(; kwargs...)
-    # Initialization and Technical Metadata Consolidation
-    # Consolidates all user-provided keyword arguments into a mutable dictionary.
-    M = Dict{Symbol, Any}(kwargs)
-    data = get(M, :data, nothing)
+    # 2. Metadata Context Initialization
+    opt_dict = Dict{Symbol, Any}(kwargs)
+    opt_dict[:y_obs_vars] = metadata.outcomes
+    opt_dict[:data] = data
 
-    # Automated Keyword Discovery
-    # Scans the provided DataFrame for standard BSTM variable names.
-    if !isnothing(data)
-        v_names = Symbol.(names(data))
-        keyword_map = Dict(
-            :y_obs => [:y, :y_obs, :response],
-            :s_x => [:s_x, :lon, :longitude],
-            :s_y => [:s_y, :lat, :latitude],
-            :t_v => [:t_v, :time, :time_coords],
-            :s_idx => [:s_idx, :space_idx],
-            :t_idx => [:t_idx, :time_idx],
-            :u_idx => [:u_idx, :season_idx],
-            :log_offset => [:log_offset, :logoffset, :log_offsets],
-            :weights => [:weights, :wts],
-            :trials => [:trials, :n_trials]
-        )
+    # Technical Registers Initialization
+    opt_dict[:model_space] = get(opt_dict, :model_space, "none")
+    opt_dict[:model_time] = get(opt_dict, :model_time, "none")
+    opt_dict[:model_season] = get(opt_dict, :model_season, "none")
+    opt_dict[:model_st] = get(opt_dict, :model_st, "none")
+    opt_dict[:algebraic_manifolds] = Dict{Symbol, Any}()
+    opt_dict[:svc_covariates] = Symbol[]
+    opt_dict[:basis_matrices] = Dict{Symbol, Any}()
+    opt_dict[:mixed_terms] = []
 
-        for (key, candidates) in keyword_map
-            # Check if the user explicitly provided a value for the key
-            if haskey(M, key)
-                val = M[key]
-                # Type-Safety Check: Only attempt lookup if the value is a Symbol or String
-                # If it is already a Vector or Matrix, skip to prevent lookup/bounds errors
-                if val isa Symbol || val isa AbstractString
-                    sym_val = Symbol(val)
-                    if sym_val in v_names
-                        M[key] = data[!, sym_val]
-                    else
-                        @warn "Column $sym_val not found in data for parameter $key. Keeping original value."
-                    end
-                end
-            # Fallback to candidates if key is not provided
-            else
-                for cand in candidates
-                    if cand in v_names
-                        M[key] = data[!, cand]
-                        break
-                    end
+    # Hyperprior Registry Initialization
+    initial_hp = get(opt_dict, :hyperpriors, Dict{Any, Any}())
+    hyperprior_registry = Dict{String, Any}(string(k) => v for (k, v) in initial_hp)
+
+    # Internal Technical Registries
+    fixed_parts_accumulator = String[]
+    mixed_terms_registry = []
+    nested_manifolds_registry = Dict{String, Any}()
+    basis_matrices_registry = Dict{Symbol, Any}()
+    svc_covariates_registry = Symbol[]
+    svc_manifolds_registry = Dict{Symbol, Any}()
+    network_registry = Dict{Symbol, Any}()
+    volatility_registry = Dict{Symbol, Any}()
+    spacetime_registry = Dict{Symbol, Any}()
+    dynamics_registry = Dict{Symbol, Any}()
+    manifolds_registry = [] # New unified registry
+
+    
+    # Helper: Recursive Hyperprior Extraction from module parameters
+    function extract_module_hyperpriors!(reg::Dict{String, Any}, p::Dict{Symbol, Any})
+        if haskey(p, :hyperpriors)
+            hp_raw = p[:hyperpriors]
+            hp_val = hp_raw isa Symbol ? Main.eval(hp_raw) : hp_raw
+            if hp_val isa Dict
+                for (hk, hv) in hp_val
+                    reg[string(hk)] = hv
                 end
             end
         end
     end
 
 
-    # Dimensional Validation & Scope Discovery
-    if !haskey(M, :y_obs)
-        error("BSTM Error: :y_obs is required for model initialization.")
-    end
+    # Technical Module Resolution Loop
+    for (key, mod) in metadata.modules
 
-    y_obs_raw = M[:y_obs]
-    y_N = (y_obs_raw isa AbstractMatrix) ? size(y_obs_raw, 1) : (y_obs_raw isa Vector{<:AbstractVector} ? length(y_obs_raw[1]) : length(y_obs_raw))
-    M[:y_N] = y_N
+        type_raw = get(mod, :type, "none")
+        type = lowercase(strip(string(type_raw)))
+        params = get(mod, :params, Dict{Symbol, Any}())
+        domain = Symbol(type)
 
-    # Manifold Index Realignment
-    s_idx_raw = get(M, :s_idx, ones(Int, y_N))
-    t_idx_raw = get(M, :t_idx, ones(Int, y_N))
-    u_idx_raw = get(M, :u_idx, ones(Int, y_N))
+        # Ingest local hyperpriors for any module type
+        extract_module_hyperpriors!(hyperprior_registry, params)
 
-    M[:s_idx] = Int.(collect(s_idx_raw))
-    M[:t_idx] = Int.(collect(t_idx_raw))
-    M[:u_idx] = Int.(collect(u_idx_raw))
+        # Process Algebraic Manifolds
+        manifold_call = get(mod, :manifold_call, "")
 
-    # If the user provides s_N/t_N, we use them; otherwise scan indices.
-    M[:s_N] = get(M, :s_N, maximum(M[:s_idx]))
-    M[:t_N] = get(M, :t_N, maximum(M[:t_idx]))
-    M[:u_N] = get(M, :u_N, maximum(M[:u_idx]))
+        # --- Modular Manifold Spec Assembly ---
+        if domain ∉ [:bias, :intercept, :interaction_composition, :dynamics, :svc, :mixed]
+            vars_list = get(mod, :variables, [])
+            var_sym = isempty(vars_list) ? (type == "svc" ? Symbol(mod[:covariate]) : :none) : Symbol(vars_list[1])
 
-    # Global linear indexing for space-time interaction tensors
-    M[:st_idx] = [(M[:t_idx][i] - 1) * M[:s_N] + M[:s_idx][i] for i in 1:y_N]
+            manifold_name = string(get(params, :model, "iid"))
+            if type == "svc"
+                m_match = match(r"(\w+)\(.*\)", manifold_call)
+                manifold_name = isnothing(m_match) ? "iid" : m_match.captures[1]
+            end
 
-    # Design Matrix Factory: Fixed Effects
-    if haskey(M, :fixed_parts) && !isnothing(data)
-        f_expr = isempty(M[:fixed_parts]) ? "1" : join(M[:fixed_parts], " + ")
-        M[:Xfixed] = create_fixed_design(f_expr, data; contrasts=get(M, :contrasts, Dict()))
-    else
-        M[:Xfixed] = NamedArray(ones(Float64, y_N, 1), (1:y_N, [:Intercept]))
-    end
-    M[:Xfixed_N] = size(M[:Xfixed], 2)
+            temp_M = Dict{Symbol, Any}(kwargs)
+            temp_M[:period] = get(params, :period, 12.0)
+            temp_M[:nbins] = get(params, :nbins, 20)
+            temp_M[:W] = get(opt_dict, :W, get(params, :W, nothing))
+            
+            module_priors = get(hyperprior_registry, string(domain), get(hyperprior_registry, manifold_name, Dict{String, Any}()))
+            manifold_obj = resolve_technical_primitive(manifold_name, temp_M, module_priors, :pcpriors)
 
-    # Taxonomic Metadata Hardening
-    # Use get!() to ensure defaults are explicitly written into the dictionary.
-    get!(M, :model_space, "none")
-    get!(M, :model_time, "none")
-    get!(M, :model_season, "none")
+            spec_params = Dict{Symbol, Any}()
+            if domain == :mixed
+                mixed_str = string(vars_list[1])
+                m_match = match(r"(.+?)\s*\|\s*(.+)", mixed_str)
+                if !isnothing(m_match)
+                    group_var = Symbol(strip(m_match.captures[2]))
+                    if hasproperty(data, group_var)
+                        levels = unique(data[!, group_var])
+                        group_map = Dict(v => i for (i, v) in enumerate(levels))
+                        spec_params[:indices] = [group_map[v] for v in data[!, group_var]]
+                        spec_params[:n_cat] = length(levels)
+                    end
+                end
+            elseif domain == :smooth
+                spec_params[:coords] = Matrix{Float64}(data[!, Symbol.(vars_list)])
+            end
 
-    # --- Manifold-Based GMRF Precision Factory (v20.4.1 Refactor) ---
-    # Rationale: Replaces legacy symbol-based build_structure_template with the
-    # modern Manifold struct dispatch system via build_model. This aligns the
-    # configuration engine with the v06.1 architectural standard.
+            spec = (
+                domain = domain,
+                var = var_sym,
+                manifold_obj = manifold_obj,
+                params = NamedTuple(spec_params)
+            )
+            push!(manifolds_registry, spec)
+        end
+        # --- End Modular Assembly ---
 
-    hyper_scheme = get(M, :hyperprior_scheme, :pcpriors)
-    priors_map = get(M, :hyperpriors, Dict())
-    data_inputs = NamedTuple(M) # build_model expects a NamedTuple
 
-    # 1. Spatial Manifold Resolution
-    ms_name = string(get!(M, :model_space, "none"))
-    if ms_name != "none"
-        spatial_priors = get(priors_map, :spatial, get(priors_map, "spatial", Dict()))
-        spatial_manifold = resolve_technical_primitive(ms_name, M, spatial_priors, hyper_scheme)
-        s_model = build_model(spatial_manifold, data_inputs)
-        
-        M[:s_Q_template] = s_model.Q_template
-        M[:s_scaling_factor] = s_model.scaling_factor
-        M[:s_hyper] = s_model.hyper
-    else
-        M[:s_Q_template] = build_structure_template(:none, 1).matrix
-    end
+        graph = isempty(manifold_call) ? nothing : parse_manifold_graph(manifold_call)
+        if !isnothing(graph)
+            opt_dict[:algebraic_manifolds][Symbol(type)] = graph
+        end
 
-    # 2. Temporal Manifold Resolution
-    mt_name = string(get!(M, :model_time, "none"))
-    if mt_name != "none"
-        temporal_priors = get(priors_map, :temporal, get(priors_map, "temporal", Dict()))
-        temporal_manifold = resolve_technical_primitive(mt_name, M, temporal_priors, hyper_scheme)
-        t_model = build_model(temporal_manifold, data_inputs)
+        vars_list = get(mod, :variables, [])
+        n_vars = length(vars_list)
 
-        M[:t_Q_template] = t_model.Q_template
-        M[:t_scaling_factor] = t_model.scaling_factor
-        M[:t_hyper] = t_model.hyper
-    else
-        M[:t_Q_template] = build_structure_template(:none, 1).matrix
-    end
-    
-    # 3. Seasonal Manifold Resolution
-    mu_name = string(get!(M, :model_season, "none"))
-    M[:u_Q_template] = if mu_name != "none"
-        seasonal_priors = get(priors_map, :seasonal, get(priors_map, "seasonal", Dict()))
-        seasonal_manifold = resolve_technical_primitive(mu_name, M, seasonal_priors, hyper_scheme)
-        u_model = build_model(seasonal_manifold, data_inputs)
-        M[:u_hyper] = u_model.hyper
-        u_model.Q_template
-    else
-        nothing
-    end
+        # Module Dispatch
 
-    # Hierarchical Registries Initialization
-    get!(M, :nested_manifolds, Dict{String, Any}())
-    get!(M, :spatial_hierarchy, Dict{Symbol, Any}())
-    get!(M, :mixed_terms, []) 
-    get!(M, :eigen_terms, [])
-    get!(M, :svc_covariates, Symbol[])
-    get!(M, :basis_matrices, Dict{Symbol, Any}())
+        # --- A. Algebraic Composition Handling ---
+        if type == "interaction_composition"
+            op = get(mod, :operator, "")
+            comps = get(mod, :components, [])
+            
+            # Discover and Register Sub-components into algebraic_manifolds
+            for comp in comps
+                c_type = Symbol(get(comp, :type, "unknown"))
+                # Register the original composite call string for forensic recovery
+                opt_dict[:algebraic_manifolds][c_type] = parse_manifold_graph(string(key))
+            end
 
-    # Coordinate Sync for Continuous Kernels
-    if !haskey(M, :s_coord)
-        if haskey(M, :s_x) && haskey(M, :s_y)
-            M[:s_coord] = hcat(M[:s_x], M[:s_y])
-        else
-            M[:s_coord] = zeros(Float64, M[:s_N], 2)
+            # Technical Signal Promotion for ST Class (I-IV)
+            if op == "⊗" || op == "otimes"
+                opt_dict[:model_st] = "IV"
+                for comp in comps
+                    c_type = get(comp, :type, "")
+                    c_params = get(comp, :params, Dict{Symbol, Any}())
+                    if c_type == "spatial"; opt_dict[:model_space] = string(get(c_params, :manifold, "bym2")); end
+                    if c_type == "temporal"; opt_dict[:model_time] = string(get(c_params, :manifold, "ar1")); end
+                end
+            end
+     
+        elseif type == "bias"
+            if haskey(params, :weight) || haskey(params, :weights)
+                opt_dict[:weights] = get(params, :weight, get(params, :weights, nothing))
+            end
+            if haskey(params, :offsets) || haskey(params, :offset)
+                opt_dict[:log_offset] = get(params, :offsets, get(params, :offset, nothing))
+            end
+            if haskey(params, :trials) || haskey(params, :trial)
+                opt_dict[:trials] = get(params, :trials, get(params, :trial, nothing))
+            end
+            if haskey(params, :y_L); opt_dict[:y_lower_bound] = params[:y_L]; end
+            if haskey(params, :y_U); opt_dict[:y_upper_bound] = params[:y_U]; end
+            if haskey(params, :hurdle); opt_dict[:hurdle] = params[:hurdle]; end
+
+        elseif type == "intercept"
+            if !isempty(params)
+                hyperprior_registry["intercept"] = params
+            end
+
+        elseif type == "spatial"
+            opt_dict[:model_space] = string(get(params, :model, "bym2"))
+            if n_vars == 1
+                var_sym = vars_list[1]
+                if hasproperty(data, var_sym)
+                    opt_dict[:s_idx] = Int.(data[!, var_sym])
+                    opt_dict[:s_idx_var] = var_sym
+                end
+            else
+                opt_dict[:s_coord] = Matrix{Float64}(data[!, vars_list])
+            end
+            if haskey(params, :W)
+                w_raw = params[:W]
+                opt_dict[:W] = w_raw isa String ? Main.eval(Meta.parse(w_raw)) : w_raw
+            end
+
+        elseif type == "temporal"
+            manifold_id = string(get(params, :model, "ar1"))
+            opt_dict[:model_time] = manifold_id
+            if n_vars == 1
+                var_sym = vars_list[1]
+                if hasproperty(data, var_sym)
+                    tu_meta = assign_time_units(data[!, var_sym]; time_method="regular")
+                    opt_dict[:t_idx] = tu_meta.t_idx
+                    opt_dict[:u_idx] = tu_meta.u_idx
+                    opt_dict[:t_idx_var] = var_sym
+                    if manifold_id == "cyclic"; opt_dict[:model_season] = "cyclic"; end
+                end
+            else
+                opt_dict[:t_idx_var] = vars_list[1]
+                opt_dict[:u_idx_var] = vars_list[2]
+            end
+
+        elseif type == "smooth"
+            if !isempty(vars_list)
+                nb = get(params, :nbins, get(params, :m_rff, 20)) # Support m_rff for rff smooths
+                manifold_type_str = string(get(params, :model, "pspline"))
+                reg_key = Symbol(join(vars_list, "_"))
+                
+                if all(hasproperty(data, Symbol(v)) for v in vars_list)
+                    if n_vars == 1
+                        v_vec = data[!, Symbol(vars_list[1])]
+                        basis_matrices_registry[reg_key] = bstm_smooth_basis_1D(manifold_type_str, v_vec, nb, get(params, :degree, 3); params...)
+                    else
+                        c_mat = Matrix{Float64}(data[!, Symbol.(vars_list)])
+                        if n_vars == 2; basis_matrices_registry[reg_key] = bstm_smooth_basis_2D(manifold_type_str, c_mat, nb; params...);
+                        elseif n_vars == 3; basis_matrices_registry[reg_key] = bstm_smooth_basis_3D(manifold_type_str, c_mat, nb; params...);
+                        elseif n_vars == 4; basis_matrices_registry[reg_key] = bstm_smooth_basis_4D(manifold_type_str, c_mat, nb; params...);
+                        end
+                    end
+                else
+                    @warn "One or more variables for smooth term not found in data: $(join(vars_list, ", "))"
+                end
+            end
+            opt_dict[:model_time] = string(get(params, :model, "ar1"))
+ 
+        elseif type == "volatility"
+            opt_dict[:use_sv] = true
+            opt_dict[:M_rff_sigma] = get(params, :nbins, 20)
+            volatility_registry[Symbol(vars_list[1])] = params
+
+        elseif type == "network"
+            network_registry[Symbol(vars_list[1])] = params
+
+        elseif type == "spacetime"
+            m_call = lowercase(string(get(params, :model, "none")))
+            # Detect Kronecker operator convenience wrappers and perform shorthand expansion
+            if occursin("\u2297", m_call) || occursin("otimes", m_call)
+                m_parts = split(m_call, r"\s*\u2297\s*|\s+otimes\s+")
+                if length(m_parts) >= 2
+                    ms = strip(string(m_parts[1]), ['\'', '"', ' '])
+                    mt = strip(string(m_parts[2]), ['\'', '"', ' '])
+
+                    # Convenience Shorthand Expansion: Physics Aliases
+                    if ms == "advection" && mt == "diffusion"
+                        opt_dict[:model_st] = "advection_diffusion"
+                        opt_dict[:model_space] = "besag"
+                        opt_dict[:model_time] = "ar1"
+                    else
+                        # Standard composite mapping to Space/Time registers
+                        opt_dict[:model_space] = ms
+                        opt_dict[:model_time] = mt
+                        # Automatic Knorr-Held Interaction classification (Type I-IV)
+                        if ms == "iid" && mt == "iid"; opt_dict[:model_st] = "I"
+                        elseif ms == "iid"; opt_dict[:model_st] = "II"
+                        elseif mt == "iid"; opt_dict[:model_st] = "III"
+                        else; opt_dict[:model_st] = "IV"; end
+                    end
+                end
+            end
+            spacetime_registry[key] = params
         end
     end
 
-    # Volatility & Spectral Projection Caching
-    if get(M, :use_sv, false)
-        get!(M, :M_rff_sigma, 20)
-        W_v, b_v = generate_informed_rff_params(M[:s_coord], M[:M_rff_sigma])
-        M[:vol_proj] = (M[:s_coord] * W_v) .+ b_v'
+    # Final Registry Consolidation
+    opt_dict[:manifolds] = manifolds_registry
+    opt_dict[:hyperpriors] = hyperprior_registry
+    opt_dict[:basis_matrices] = basis_matrices_registry
+    opt_dict[:network_metadata] = network_registry
+    opt_dict[:volatility_metadata] = volatility_registry
+    opt_dict[:fixed_parts] = unique(vcat(fixed_parts_accumulator, string.(metadata.fixed_effects)))
+    opt_dict[:add_intercept] = metadata.has_intercept
+    opt_dict[:formula] = formula
+
+    if length(metadata.outcomes) == 1
+        opt_dict[:y_obs] = data[!, metadata.outcomes[1]]
+    else
+        opt_dict[:y_obs] = Matrix(data[!, metadata.outcomes])
+        opt_dict[:model_arch] = "multivariate"
     end
 
-    # Technical Flag Standardization
-    get!(M, :model_arch, "univariate")
-    get!(M, :model_family, "gaussian")
-    get!(M, :noise, 1e-4)
-    get!(M, :use_zi, false)
-    get!(M, :log_offset, zeros(Float64, y_N))
-    get!(M, :weights, ones(Float64, y_N))
-    get!(M, :trials, ones(Int, y_N))
-    get!(M, :period, 12.0)
-
-    # Observation Mask Discovery
-    if !haskey(M, :y_ok)
-        if y_obs_raw isa AbstractMatrix
-            M[:y_ok] = [findall(!isnan, y_obs_raw[:, k]) for k in 1:get(M, :outcomes_N, 1)]
-        else
-            M[:y_ok] = [findall(!isnan, vec(collect(y_obs_raw)))]
-        end
-    end
-
-    return NamedTuple(M)
+    return bstm_config(; opt_dict...)
 end
-
-
-
 
  
  
@@ -2462,12 +3249,7 @@ function _validate_parameter_registry(chain, M, p_names, outcomes_N)
     return is_valid
 end
 
-
-#  Parameter Discovery Engine [v17.0.15 - Restoration]
-# Rationale: This is the primary recovery engine for the BSTM v06.1 manifold taxonomy.
-# It must extract all latent field realizations from the MCMC chain for K outcomes/fidelities.
-# Requirement: 100% parity with bstm_options and the technical primitive registry.
-
+ 
 
 function _discover_manifold_realizations(chain, M, n_samples, outcomes_N, p_names)
     # BSTM Manifold Discovery Engine v18.2.5
@@ -3836,18 +4618,38 @@ function get_params_matrix_sizestructured(chain, base_name, dims)
     return nothing
 end
 
-
-
- 
- 
- 
  
 
 
+
+ 
+function get_kernel_from_string(kernel_name::String)
+    k_name = lowercase(kernel_name)
+    if k_name == "constant"
+        return ConstantKernel()
+    elseif k_name == "linear"
+        return LinearKernel()
+    elseif k_name == "matern12" || k_name == "exponential"
+        return Matern12Kernel()
+    elseif k_name == "matern32"
+        return Matern32Kernel()
+    elseif k_name == "matern52"
+        return Matern52Kernel()
+    elseif k_name == "spherical"
+        return SphericalKernel()
+    elseif k_name == "squared_exponential" || k_name == "se" || k_name == "gaussian" || k_name == "rbf"
+        return SqExponentialKernel()
+    elseif k_name == "periodic"
+        return PeriodicKernel()
+    else
+        @warn "Kernel '$kernel_name' not recognized. Defaulting to SqExponentialKernel."
+        return SqExponentialKernel()
+    end
+end
 
 @model function bstm_univariate(M, ::Type{T}=Float64) where {T}
     # # 1. Global Likelihood Hyperparameters
-    # Rationale: Standardizing scalars for the target likelihood family with AD-stable initialization.
+    # Rationale: Standardizing scalars for the target likelihood family.
     family = M.model_family
     noise = get(M, :noise, 1e-4)
     use_zi = get(M, :use_zi, false)
@@ -3856,135 +4658,319 @@ end
     lik_phi = zero(T)
     extra_p = one(T)
 
-    # Poisson and Negative Binomial Dispersion/Zero-Inflation parameters
-    if family == "negbin"
-        lik_r ~ NamedDist(Exponential(1.0), :lik_r)
-    end
-
-    if use_zi == true
-        lik_phi ~ NamedDist(Beta(1, 1), :lik_phi)
-    end
-
-    # Shape, Tail, or Scale parameters for continuous families (Gamma, Beta, Student-T, etc.)
-    if family in ["gamma", "beta", "student_t", "inverse_gaussian", "pareto"]
-        extra_p ~ NamedDist(Exponential(1.0), :extra_params)
-    end
+    if family == "negbin"; lik_r ~ NamedDist(Exponential(1.0), :lik_r); end
+    if use_zi == true; lik_phi ~ NamedDist(Beta(1, 1), :lik_phi); end
+    if family in ["gamma", "beta", "student_t", "inverse_gaussian", "pareto"]; extra_p ~ NamedDist(Exponential(1.0), :extra_params); end
 
     # # 2. Observation Volatility & Stochastic Volatility (SV)
     # Rationale: Reconstructs heteroskedastic error scales via RFF log-variance projection.
     y_sigma = Vector{T}(undef, M.y_N)
-
     if get(M, :use_sv, false) == true
-        # Stochastic Volatility Path: Log-variance is modeled as a latent Gaussian field
         sigma_log_var ~ NamedDist(Exponential(1.0), :sigma_log_var)
         beta_vol_latent ~ NamedDist(filldist(Normal(0, 1), M.M_rff_sigma), :beta_vol_latent)
-
-        # Spectral mapping of the log-variance surface
         vol_proj_field = M.vol_proj * beta_vol_latent
         vol_latent_field = sqrt(2.0 / M.M_rff_sigma) .* cos.(vol_proj_field)
-
-        for i in 1:M.y_N
-            y_sigma[i] = exp((sigma_log_var * vol_latent_field[i]) / 2.0)
-        end
+        for i in 1:M.y_N; y_sigma[i] = exp((sigma_log_var * vol_latent_field[i]) / 2.0); end
     else
-        # Homoskedastic Path: Fixed error scale across the entire spatiotemporal grid
         y_sigma_val ~ NamedDist(Exponential(1.0), :y_sigma)
-        for i in 1:M.y_N
-            y_sigma[i] = y_sigma_val
-        end
+        for i in 1:M.y_N; y_sigma[i] = y_sigma_val; end
     end
 
-    
     # # 3. Base Predictor: Fixed Effects & Link-Scale Offsets
-    # Rationale: Standard regression coefficients follow an uninformative Gaussian prior.
     Xfixed_beta ~ NamedDist(MvNormal(zeros(M.Xfixed_N), 5.0 * I), :Xfixed_beta)
     eta = Vector{T}(M.Xfixed * Xfixed_beta)
-
-    # Apply additive offsets (e.g., exposure/offset columns) if registered
-    # Scale-Aware Offset Implementation
-    # If the family uses an identity link (Gaussian), we exponentiate the log_offset.
-    # For log-link families (Poisson, Hurdle Poisson), it remains additive in the latent space.
     if haskey(M, :log_offset)
-        if family in ["gaussian", "student_t", "laplace"]
-            eta .+= exp.(M.log_offset)
-        else
-            eta .+= M.log_offset
-        end
-    end
- 
-    # # 1. Spatiotemporal Interactions (Knorr-Held Types I, II, III, IV)
-    # Rationale: Discovering Kronecker-recomposed precision templates for separable fields.
-    st_type = get(M, :model_st, "none")
-    if st_type in ["I", "II", "III", "IV"]
-        st_sigma ~ NamedDist(Exponential(1.0), :st_sigma)
-        
-        # Recomposing precision via Kronecker product of spatial and temporal templates
-        # Q_st = st_scale * (Q_s \otimes Q_t)
-        Q_st = recompose_precision(
-            Symbol(st_type),
-            M.s_Q_template.matrix,
-            st_sigma,
-            template_t = M.t_Q_template.matrix,
-            noise = noise
-        )
-
-        st_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N * M.t_N), Q_st), :st_latent)
-        
-        for i in 1:M.y_N
-            # Mapping linear index in the ST-grid to flat observation index
-            obs_st_idx = (M.t_idx[i] - 1) * M.s_N + M.s_idx[i]
-            eta[i] += st_latent[obs_st_idx]
-        end
+        if family in ["gaussian", "student_t", "laplace"]; eta .+= exp.(M.log_offset);
+        else; eta .+= M.log_offset; end
     end
 
-    # # 2. Physics-Informed Transport
-    model_st_phys = get(M, :model_st, "none")
-    if model_st_phys in ["advection", "diffusion", "advection_diffusion"]
-        sig_phys ~ NamedDist(Exponential(1.0), :sig_phys)
-        velocity_phys ~ NamedDist(Normal(0, 1), :velocity_phys)
+    # # 4. Modular Manifold Realization
+    # This section iterates through the manifold objects created by the config engine.
+    for spec in M.manifolds
+        m_obj = spec.manifold_obj
+        m_domain = spec.domain
         
-        K_op = build_transport_operator(M.W, velocity_phys, 1.0)
-        phys_innov ~ NamedDist(filldist(Normal(0, sig_phys), M.s_N * M.t_N), :phys_innov)
-        phys_field = Vector{T}(undef, M.s_N * M.t_N)
+        # Realize latent field based on manifold type
+        if m_obj isa IID
+            var_name = string(spec.var)
+            is_svc = m_domain == :svc
+            sigma_name = is_svc ? Symbol("sig_svc_", var_name) : Symbol("sigma_", m_domain, "_", var_name)
+            latent_name = is_svc ? Symbol("beta_svc_", var_name) : Symbol("latent_", m_domain, "_", var_name)
+            sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
 
-        for t in 1:M.t_N
-            idx_t = ((t-1)*M.s_N + 1):(t*M.s_N)
-            if t == 1
-                phys_field[idx_t] .= phys_innov[idx_t]
+            local n_units, indices
+            if m_domain == :mixed
+                n_units = spec.params.n_cat
+                indices = spec.params.indices
+            else # :spatial, :temporal, or :svc (which is spatial)
+                n_units = is_svc ? M.s_N : ((m_domain == :spatial) ? M.s_N : ((m_domain == :temporal) ? M.t_N : M.u_N))
+                indices = is_svc ? M.s_idx : ((m_domain == :spatial) ? M.s_idx : ((m_domain == :temporal) ? M.t_idx : M.u_idx))
+            end
+
+            latent ~ NamedDist(filldist(Normal(0, sigma), n_units), latent_name)
+
+            if is_svc
+                x_col_idx = findfirst(==(spec.var), Symbol.(names(M.Xfixed, 2)))
+                if !isnothing(x_col_idx)
+                    x_vals = M.Xfixed[:, x_col_idx]
+                    for i in 1:M.y_N; eta[i] += latent[indices[i]] * x_vals[i]; end
+                end
             else
-                idx_prev = ((t-2)*M.s_N + 1):((t-1)*M.s_N)
-                phys_field[idx_t] .= K_op * phys_field[idx_prev] .+ phys_innov[idx_t]
+                 for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
             end
-        end
 
-        for i in 1:M.y_N
-            obs_st_ptr = (M.t_idx[i] - 1) * M.s_N + M.s_idx[i]
-            eta[i] += phys_field[obs_st_ptr]
-        end
-    end
+        elseif m_obj isa ICAR
+            var_name = string(spec.var)
+            is_svc = m_domain == :svc
+            sigma_name = is_svc ? Symbol("sig_svc_", var_name) : Symbol("sigma_", m_domain)
+            latent_name = is_svc ? Symbol("beta_svc_", var_name) : Symbol("latent_", m_domain)
+            sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
+            template = M.s_Q_template.matrix # SVC is spatial
+            n_units = size(template, 1)
+            Q = recompose_precision(:icar, template, sigma; noise=noise)
+            latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
+            
+            if is_svc
+                x_col_idx = findfirst(==(spec.var), Symbol.(names(M.Xfixed, 2)))
+                if !isnothing(x_col_idx)
+                    x_vals = M.Xfixed[:, x_col_idx]
+                    for i in 1:M.y_N; eta[i] += latent[M.s_idx[i]] * x_vals[i]; end
+                end
+            else
+                indices = (m_domain == :spatial) ? M.s_idx : M.t_idx
+                for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+            end
 
+        elseif m_obj isa BYM2
+            var_name = string(spec.var)
+            is_svc = m_domain == :svc
+            sigma_name = is_svc ? Symbol("sig_svc_", var_name) : Symbol("sigma_", m_domain)
+            rho_name = is_svc ? Symbol("rho_svc_", var_name) : Symbol("rho_", m_domain)
+            latent_name = is_svc ? Symbol("beta_svc_", var_name) : Symbol("latent_", m_domain)
 
+            sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
+            rho ~ NamedDist(m_obj.rho_prior, rho_name)
+            template = M.s_Q_template.matrix # SVC is spatial
+            n_units = size(template, 1)
+            Q = recompose_precision(:bym2, template, sigma; extra_param=rho, noise=noise)
+            latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
 
-    # # Mixed Effects (Categorical Random Intercepts)
-    if haskey(M, :mixed_terms) && !isempty(M.mixed_terms)
-        for term in M.mixed_terms
-            grp_name = term.name
-            n_levels = term.n_cat
+            if is_svc
+                x_col_idx = findfirst(==(spec.var), Symbol.(names(M.Xfixed, 2)))
+                if !isnothing(x_col_idx)
+                    x_vals = M.Xfixed[:, x_col_idx]
+                    for i in 1:M.y_N; eta[i] += latent[M.s_idx[i]] * x_vals[i]; end
+                end
+            else
+                indices = (m_domain == :spatial) ? M.s_idx : M.t_idx
+                for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+            end
 
-            sig_c ~ NamedDist(Exponential(1.0), Symbol("sig_c_", grp_name))
-            Q_c = recompose_precision(:iid, sparse(I(n_levels, n_levels)), sig_c, noise=noise)
-            c_latent ~ NamedDist(MvNormalCanon(zeros(n_levels), Q_c), Symbol("c_latent_", grp_name))
+        elseif m_obj isa Union{Leroux, SAR, DAG}
+            var_name = string(spec.var)
+            sigma_name = Symbol("sigma_", m_domain, "_", var_name)
+            rho_name = Symbol("rho_", m_domain, "_", var_name)
+            latent_name = Symbol("latent_", m_domain, "_", var_name)
 
-            indices = term.indices
+            sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
+            rho ~ NamedDist(m_obj.rho_prior, rho_name)
+            template = M.s_Q_template.matrix
+            n_units = size(template, 1)
+            
+            m_type_sym = m_obj isa Leroux ? :leroux : (m_obj isa SAR ? :sar : :dag)
+            Q = recompose_precision(m_type_sym, template, sigma; extra_param=rho, noise=noise)
+            latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
+            indices = M.s_idx
+            for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+
+        elseif m_obj isa NetworkFlow
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_", m_domain))
+            rho ~ NamedDist(Beta(1,1), Symbol("rho_", m_domain))
+            template = M.s_Q_template.matrix
+            n_units = size(template, 1)
+            Q = recompose_precision(:network, template, sigma; extra_param=rho, directed_adj=m_obj.adjacency_matrix, flow_direction=m_obj.flow_direction, noise=noise)
+            latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), Symbol("latent_", m_domain))
+            indices = M.s_idx
+            for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+
+        elseif m_obj isa Hyperbolic
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_", m_domain, "_hyperbolic"))
+            n_units = M.s_N
+            latent ~ NamedDist(filldist(Normal(0, sigma), n_units), Symbol("latent_", m_domain, "_hyperbolic"))
+            indices = M.s_idx
+            for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+            
+        elseif m_obj isa AR1
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_", m_domain))
+            rho ~ NamedDist(m_obj.rho_prior, Symbol("rho_", m_domain))
+            template = (m_domain == :temporal) ? M.t_Q_template.matrix : M.s_Q_template.matrix # Can be spatial
+            n_units = size(template, 1)
+            Q = recompose_precision(:ar1, template, sigma; extra_param=rho, noise=noise)
+            latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), Symbol("latent_", m_domain))
+            indices = (m_domain == :temporal) ? M.t_idx : M.s_idx
+            for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+
+        elseif m_obj isa RW1
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_", m_domain))
+            template = (m_domain == :temporal) ? M.t_Q_template.matrix : M.s_Q_template.matrix
+            n_units = size(template, 1)
+            Q = recompose_precision(:rw1, template, sigma; noise=noise)
+            latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), Symbol("latent_", m_domain))
+            indices = (m_domain == :temporal) ? M.t_idx : M.s_idx
+            for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+
+        elseif m_obj isa RW2
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_", m_domain))
+            template = (m_domain == :temporal) ? M.t_Q_template.matrix : M.s_Q_template.matrix
+            n_units = size(template, 1)
+            Q = recompose_precision(:rw2, template, sigma; noise=noise)
+            latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), Symbol("latent_", m_domain))
+            indices = (m_domain == :temporal) ? M.t_idx : M.s_idx
+            for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+
+        elseif m_obj isa Cyclic
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_", m_domain))
+            template = M.u_Q_template.matrix
+            n_units = size(template, 1)
+            Q = recompose_precision(:cyclic, template, sigma; noise=noise)
+            latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), Symbol("latent_", m_domain))
+            indices = M.u_idx
+            for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+
+        elseif m_obj isa Harmonic
+            # For now, we treat it like a cyclic IID effect.
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_", m_domain))
+            latent ~ NamedDist(filldist(Normal(0, sigma), M.u_N), Symbol("latent_", m_domain))
+            indices = M.u_idx
+            for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+
+        elseif m_obj isa Union{PSpline, BSpline, TPS, Wavelets, RFF, FFT}
+            var_sym = spec.var
+            B_mat = M.basis_matrices[var_sym]
+            n_basis_cols = size(B_mat, 2)
+            
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_basis_", var_sym))
+            latent_coeffs ~ NamedDist(filldist(Normal(0, sigma), n_basis_cols), Symbol("beta_basis_", var_sym))
+            
+            eta .+= B_mat * latent_coeffs
+        
+        elseif m_obj isa Eigen
+            var_syms = spec.var
+            data_mat = spec.params.data
+            n_dims = spec.params.n_dims
+            n_factors = m_obj.n_factors
+            ltri_indices = m_obj.ltri_indices
+            v_pca ~ NamedDist(filldist(Normal(0, 1.0), length(ltri_indices)), Symbol("v_pca_", join(var_syms, "_")))
+            sd_pca ~ NamedDist(filldist(Exponential(1.0), n_factors), Symbol("pca_sd_", join(var_syms, "_")))
+            pdef_sd ~ NamedDist(Exponential(1.0), Symbol("pdef_sd_", join(var_syms, "_")))
+            
+            K_pca, _, _ = householder_transform(v_pca, n_dims, n_factors, ltri_indices, sd_pca, pdef_sd, noise)
+            latent_eigen ~ NamedDist(MvNormal(zeros(n_dims), K_pca), Symbol("latent_eigen_", join(var_syms, "_")))
+            eta .+= data_mat * latent_eigen
+
+        elseif m_obj isa GP
+            var_sym = spec.var
+            ls ~ NamedDist(m_obj.lengthscale_prior, Symbol("ls_gp_", var_sym))
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_gp_", var_sym))
+            coords = spec.params.coords
+
+            kernel_base = get_kernel_from_string(m_obj.kernel)
+            k_gp = sigma^2 * kernel_base ∘ ScaleTransform(1/ls)
+            
+            # Full GP - computationally expensive
+            K_ff = kernelmatrix(k_gp, coords) + noise*I
+            f_latent ~ NamedDist(MvNormal(zeros(size(coords,1)), K_ff), Symbol("latent_smooth_", var_sym))
+            eta .+= f_latent
+
+        elseif m_obj isa Union{SVGP, FITC}
+            var_sym = spec.var
+            ls ~ NamedDist(m_obj.lengthscale_prior, Symbol("ls_svgp_", var_sym))
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_svgp_", var_sym))
+            n_inducing = m_obj.n_inducing
+            coords = spec.params.coords
+
+            mean_coords = mean(coords, dims=1)
+            std_coords = std(coords, dims=1)
+            inducing_locs ~ MvNormal(vec(mean_coords), Diagonal(vec(std_coords)))
+
+            kernel_base = get_kernel_from_string(m_obj.kernel)
+            k_svgp = sigma^2 * kernel_base ∘ ScaleTransform(1/ls)
+            K_uu = kernelmatrix(k_svgp, inducing_locs) + noise*I
+            
+            u_latent ~ MvNormal(zeros(n_inducing), K_uu)
+            
+            K_fu = kernelmatrix(k_svgp, coords, inducing_locs)
+            f_mean = K_fu * (K_uu \ u_latent)
+            eta .+= f_mean
+
+        elseif m_obj isa Warp
+            var_sym = spec.var
+            ls_warp ~ NamedDist(m_obj.lengthscale_prior, Symbol("ls_warp_", var_sym))
+            sigma_warp ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_warp_", var_sym))
+            
+            coords = spec.params.coords
+            # Pass kernel information to the RFF parameter generator
+            W_warp, b_warp = generate_informed_rff_params(coords, m_obj.n_features; kernel_name=m_obj.kernel)
+            beta_warp ~ MvNormal(zeros(m_obj.n_features), I)
+            
+            # The warping field is added directly to the linear predictor.
+            warp_effect = rff_map(coords, W_warp ./ ls_warp, b_warp) * beta_warp * sigma_warp
+            eta .+= warp_effect
+
+        elseif m_obj isa Union{FFT, Wavelets}
+            # This block handles FFT/Wavelet as GMRF-like components for temporal/spatial effects.
+            var_name = string(spec.var)
+            sigma_name = Symbol("sigma_", m_domain, "_", var_name)
+            ls_name = Symbol("ls_", m_domain, "_", var_name)
+            latent_name = Symbol("latent_", m_domain, "_", var_name)
+
+            sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
+            ls ~ NamedDist(m_obj.lengthscale_prior, ls_name)
+            
+            Q_spectral = recompose_precision(:spectral, nothing, sigma; extra_param=ls, kernel=Symbol(m_obj.kernel), noise=noise)
+            latent ~ NamedDist(MvNormalCanon(zeros(size(Q_spectral,1)), Q_spectral), latent_name)
+            indices = (m_domain == :temporal) ? M.t_idx : M.s_idx
+            for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+
+        elseif spec.domain == :spacetime
+            st_sigma ~ NamedDist(Exponential(1.0), :st_sigma)
+            st_type = Symbol(M.model_st)
+            if st_type in [:I, :II, :III, :IV]
+                Q_st = recompose_precision(st_type, M.s_Q_template.matrix, st_sigma; template_t = M.t_Q_template.matrix, noise=noise)
+                st_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N * M.t_N), Q_st), :st_latent)
+                for i in 1:M.y_N
+                    obs_st_idx = (M.t_idx[i] - 1) * M.s_N + M.s_idx[i]
+                    eta[i] += st_latent[obs_st_idx]
+                end
+            elseif st_type in [:advection, :diffusion, :advection_diffusion]
+                @warn "Physics-based spacetime model is using legacy path. Consider updating formula."
+            end
+        
+        elseif m_obj isa DynamicsManifold
+            K_dyn ~ NamedDist(get(M.hyperpriors, "K", Normal(150, 10)), :K_dyn)
+            r_dyn ~ NamedDist(get(M.hyperpriors, "r", Beta(2, 2)), :r_dyn)
+            sig_dyn ~ NamedDist(m_obj.sigma_prior, :sig_dyn)
+            
+            m_states ~ NamedDist(filldist(Normal(0, 1), M.t_N), :m_states)
             for i in 1:M.y_N
-                eta[i] += c_latent[indices[i]]
+                eta[i] += m_states[M.t_idx[i]] * sig_dyn
             end
         end
     end
 
-    
+    # # 4.2 Mechanistic Dynamics
+    if get(M, :use_dynamics, false) == true
+        K_dyn ~ NamedDist(get(M.hyperpriors, "K", Normal(150, 10)), :K_dyn)
+        r_dyn ~ NamedDist(get(M.hyperpriors, "r", Beta(2, 2)), :r_dyn)
+        sig_dyn ~ NamedDist(Exponential(1.0), :sig_dyn)
+        
+        m_states ~ NamedDist(filldist(Normal(0, 1), M.t_N), :m_states)
+        for i in 1:M.y_N
+            eta[i] += m_states[M.t_idx[i]] * sig_dyn
+        end
+    end
 
-    # # Nested Hierarchical Supervisors
+    # # 4.1 Nested Hierarchical Supervisors
     if haskey(M, :nested_manifolds) && !isempty(M.nested_manifolds)
         for (z_key, z_meta) in M.nested_manifolds
             rho_nested ~ NamedDist(Normal(1.0, 0.5), Symbol("rho_nested_", z_key))
@@ -4007,133 +4993,212 @@ end
             end
         end
     end
- 
-    # Spatial Manifold Realization
-    if M.model_space != "none"
-        s_sigma ~ NamedDist(Exponential(1.0), :s_sigma)
-        s_rho_val = one(T)
-        m_sp_sym = Symbol(M.model_space)
-        
-        if m_sp_sym in [:bym2, :leroux, :sar, :dag]
-            s_rho_val ~ NamedDist(Beta(1, 1), :s_rho)
-        end
-        
-        # Identification of directed attributes for Network flow
-        dir_adj = get(M, :directed_W, nothing)
-        flow_dir = Symbol(get(M, :flow_direction, :bidirectional))
 
-        Q_s = recompose_precision(
-            m_sp_sym, 
-            M.s_Q_template.matrix, 
-            s_sigma, 
-            extra_param=s_rho_val, 
-            noise=noise, 
-            directed_adj=dir_adj, 
-            flow_direction=flow_dir
-        )
-        
-        s_latent ~ NamedDist(MvNormalCanon(zeros(M.s_N), Q_s), :s_latent)
-        for i in 1:M.y_N
-            eta[i] += s_latent[M.s_idx[i]]
-        end
-    end
-
-    # Temporal Manifold Realization
-    if M.model_time != "none"
-        t_sigma ~ NamedDist(Exponential(1.0), :t_sigma)
-        t_rho_val = one(T)
-        m_tm_sym = Symbol(M.model_time)
-        
-        if m_tm_sym == :ar1
-            t_rho_val ~ NamedDist(Beta(2, 2), :t_rho)
-        end
-        
-        Q_t = recompose_precision(m_tm_sym, M.t_Q_template.matrix, t_sigma, extra_param=t_rho_val, noise=noise)
-        t_latent ~ NamedDist(MvNormalCanon(zeros(M.t_N), Q_t), :t_latent)
-        for i in 1:M.y_N
-            eta[i] += t_latent[M.t_idx[i]]
-        end
-    end
-
-    # # 9. Mechanistic Dynamics (Biomass & Population Growth)
-    # Rationale: Logistic state-space transitions with density dependence.
-    if get(M, :use_dynamics, false) == true
-        K_dyn ~ NamedDist(get(M.hyperpriors, "K", Normal(150, 10)), :K_dyn)
-        r_dyn ~ NamedDist(get(M.hyperpriors, "r", Beta(2, 2)), :r_dyn)
-        sig_dyn ~ NamedDist(Exponential(1.0), :sig_dyn)
-        
-        # Projecting the latent growth trajectory onto time slices
-        m_states ~ NamedDist(filldist(Normal(0, 1), M.t_N), :m_states)
-        for i in 1:M.y_N
-            eta[i] += m_states[M.t_idx[i]] * sig_dyn
-        end
-    end
- 
-    # Smooth Basis Dispatch (1D, 2D, 3D, and 4D Latent Fields)
-    # Rationale: Aggregates non-linear effects discovered in the smooth() DSL blocks.
-    if haskey(M, :basis_matrices) && !isempty(M.basis_matrices)
-        for v_sym in keys(M.basis_matrices)
-            B_mat = M.basis_matrices[v_sym]
-            n_basis_cols = size(B_mat, 2)
-            
-            # Variance scale for the specific basis expansion
-            sig_basis ~ NamedDist(Exponential(1.0), Symbol("sig_basis_", v_sym))
-            # Latent coefficients for the basis surface
-            beta_basis ~ NamedDist(filldist(Normal(0, sig_basis), n_basis_cols), Symbol("beta_basis_", v_sym))
-            
-            # Additive superposition onto the linear predictor
-            eta .+= B_mat * beta_basis
-        end
-    end
-
- 
-    # # Spatially Varying Coefficients (SVC)
-    if haskey(M, :svc_covariates) && !isempty(M.svc_covariates)
-        for c_sym in M.svc_covariates
-            sig_svc ~ NamedDist(Exponential(1.0), Symbol("sig_svc_", c_sym))
-            beta_svc ~ NamedDist(filldist(Normal(0, sig_svc), M.s_N), Symbol("beta_svc_", c_sym))
-            
-            x_col_idx = findfirst(==(c_sym), Symbol.(names(M.Xfixed, 2)))
-            if !isnothing(x_col_idx)
-                x_vals = M.Xfixed[:, x_col_idx]
-                for i in 1:M.y_N
-                    eta[i] += beta_svc[M.s_idx[i]] * x_vals[i]
-                end
-            end
-        end
-    end
-
-
-    # # 11. Final Pointwise Likelihood Dispatch (Scalar AD Firewall)
-    # Rationale: Using @addlogprob! with bstm_Likelihood functor to bypass strict tilde checks.
+    # # 5. Final Pointwise Likelihood Dispatch
     yL = T(get(M, :y_lower_bound, -Inf))
     yU = T(get(M, :y_upper_bound, Inf))
     h = T(get(M, :hurdle, -Inf))
 
     for i in 1:M.y_N
-        # Standardizing likelihood evaluation via the multiple-dispatch functor
         d_lik = bstm_Likelihood(
-            family, 
-            [T(M.y_obs[i])]; 
-            sigma_y=[y_sigma[i]], 
-            weight=[T(M.weights[i])], 
-            phi_zi=lik_phi, 
-            r_nb=lik_r, 
-            trial=[Int(M.trials[i])], 
-            y_L=yL, 
-            y_U=yU, 
-            hurdle=h, 
-            extra_params=extra_p
+            family, [T(M.y_obs[i])]; sigma_y=[y_sigma[i]], weight=[T(M.weights[i])],
+            phi_zi=lik_phi, r_nb=lik_r, trial=[Int(M.trials[i])],
+            y_L=yL, y_U=yU, hurdle=h, extra_params=extra_p 
         )
         Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i])
     end
 end
 
- 
+
+function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M, PS, alpha)
+    # BSTM Modular Reconstruction Engine v21.0.1
+    # This engine is designed for models created with `bstm_config`.
+    # It iterates through the `M.manifolds` registry to reconstruct latent effects.
+
+    if !haskey(M, :manifolds)
+        @error "This reconstruction engine requires a model configuration with a `:manifolds` registry."
+        return nothing
+    end
+
+    N_samples = size(chain, 1)
+    p_names = string.(FlexiChains.parameters(chain))
+    N_PS = isnothing(PS) ? 0 : size(PS.Xfixed, 1)
+    N_tot = M.y_N + N_PS
+    family_str = get(M, :model_family, "gaussian")
+    fam_obj = get_model_family(family_str)
+
+    # --- 1. Initialize Linear Predictor & Summaries ---
+    eta = zeros(Float64, N_tot, N_samples)
+    summarized_effects = Dict{Symbol, Any}()
+
+    # --- 2. Base Predictor: Fixed Effects & Offsets ---
+    if "Xfixed_beta" in p_names
+        betas = get_params_vector(chain, "Xfixed_beta", M.Xfixed_N)'
+        eta[1:M.y_N, :] .+= M.Xfixed * betas
+        if N_PS > 0; eta[(M.y_N+1):end, :] .+= PS.Xfixed * betas; end
+        summarized_effects[:fixed_effects] = summarize_array(betas'; alpha=alpha)
+    end
+    if haskey(M, :log_offset)
+        eta[1:M.y_N, :] .+= M.log_offset
+    end
+
+    # --- 3. Modular Manifold Reconstruction Loop ---
+    for spec in M.manifolds
+        m_obj = spec.manifold_obj
+        m_domain = spec.domain
+        var_name = string(spec.var)
+        
+        latent_name_str = if m_domain == :svc
+            "beta_svc_" * var_name
+        elseif m_domain == :smooth
+            "beta_basis_" * var_name
+        else
+            "latent_" * string(m_domain) * "_" * var_name
+        end
+
+        if latent_name_str in p_names
+            n_units = if m_domain == :mixed
+                spec.params.n_cat
+            elseif m_domain in [:spatial, :svc, :hyperbolic]
+                M.s_N
+            elseif m_domain in [:temporal, :dynamics]
+                M.t_N
+            elseif m_domain == :seasonal
+                M.u_N
+            elseif m_domain == :smooth
+                size(M.basis_matrices[spec.var], 2)
+            elseif m_domain == :eigen
+                spec.params.n_dims
+            else 1 end
+
+            latent_samples = get_params_vector(chain, latent_name_str, n_units)'
+            summarized_effects[Symbol(latent_name_str)] = summarize_array(latent_samples; alpha=alpha)
+
+            if m_domain in [:spatial, :temporal, :seasonal, :mixed, :hyperbolic]
+                indices = if m_domain == :mixed
+                    spec.params.indices
+                else
+                    (m_domain == :spatial || m_domain == :hyperbolic) ? M.s_idx : ((m_domain == :temporal) ? M.t_idx : M.u_idx)
+                end
+                eta[1:M.y_N, :] .+= latent_samples[indices, :]
+                if N_PS > 0 && m_domain != :mixed
+                    ps_indices = (m_domain == :spatial || m_domain == :hyperbolic) ? PS.s_idx : ((m_domain == :temporal) ? PS.t_idx : PS.u_idx)
+                    eta[(M.y_N+1):end, :] .+= latent_samples[ps_indices, :]
+                end
+            elseif m_domain == :smooth
+                B_mat_train = M.basis_matrices[spec.var]
+                eta[1:M.y_N, :] .+= B_mat_train * latent_samples
+                if N_PS > 0
+                    vars_list = Symbol.(split(string(spec.var), "_"))
+                    n_vars = length(vars_list)
+                    nbins = size(B_mat_train, 2)
+                    params = spec.params
+                    manifold_type_str = lowercase(string(typeof(m_obj)))
+                    
+                    local B_mat_ps
+                    ps_data = PS.data
+                    if n_vars == 1
+                        v_vec = ps_data[!, vars_list[1]]
+                        B_mat_ps = bstm_smooth_basis_1D(manifold_type_str, v_vec, nbins, get(params, :degree, 3); params...)
+                    elseif n_vars > 1
+                        c_mat = Matrix{Float64}(ps_data[!, vars_list])
+                        # The basis function factory dispatches based on the number of columns
+                        if n_vars == 2; B_mat_ps = bstm_smooth_basis_2D(manifold_type_str, c_mat, nbins; params...);
+                        elseif n_vars == 3; B_mat_ps = bstm_smooth_basis_3D(manifold_type_str, c_mat, nbins; params...);
+                        elseif n_vars == 4; B_mat_ps = bstm_smooth_basis_4D(manifold_type_str, c_mat, nbins; params...);
+                        end
+                    end
+                    eta[(M.y_N+1):end, :] .+= B_mat_ps * latent_samples
+                end
+            elseif m_domain == :svc
+                x_col_idx = findfirst(==(spec.var), Symbol.(names(M.Xfixed, 2)))
+                if !isnothing(x_col_idx)
+                    x_vals_train = M.Xfixed[:, x_col_idx]
+                    eta[1:M.y_N, :] .+= latent_samples[M.s_idx, :] .* x_vals_train
+                    if N_PS > 0
+                        x_vals_ps = PS.Xfixed[:, x_col_idx]
+                        eta[(M.y_N+1):end, :] .+= latent_samples[PS.s_idx, :] .* x_vals_ps
+                    end
+                end
+            elseif m_domain == :eigen
+                data_mat_train = spec.params.data
+                eta[1:M.y_N, :] .+= data_mat_train * latent_samples
+                if N_PS > 0
+                    data_mat_ps = Matrix(PS.data[!, spec.var])
+                    eta[(M.y_N+1):end, :] .+= data_mat_ps * latent_samples
+                end
+            end
+        end
+    end
+
+    # --- 4. Nested Supervisors & Dynamics ---
+    if haskey(M, :nested_manifolds) && !isempty(M.nested_manifolds)
+        for (z_key, z_meta) in M.nested_manifolds
+            rho_key = Symbol("rho_nested_", z_key)
+            if string(rho_key) in p_names
+                rho_samples = get_params_vector(chain, string(rho_key), 1)
+                lat_z_s_key = Symbol("lat_nested_spatial_", z_key)
+                if string(lat_z_s_key) in p_names
+                    lat_z_s_samples = get_params_vector(chain, string(lat_z_s_key), z_meta.s_N)'
+                    for i in 1:M.y_N
+                        eta[i, :] .+= rho_samples' .* lat_z_s_samples[z_meta.s_idx[i], :]
+                    end
+                end
+            end
+        end
+    end
+    if get(M, :use_dynamics, false)
+        if "sig_dyn" in p_names && "m_states" in p_names
+            sig_dyn_samples = get_params_vector(chain, "sig_dyn", 1)
+            m_states_samples = get_params_vector(chain, "m_states", M.t_N)'
+            for i in 1:M.y_N
+                eta[i, :] .+= m_states_samples[M.t_idx[i], :] .* sig_dyn_samples'
+            end
+        end
+    end
+
+    # --- 5. Link-Scale Realization & Prediction ---
+    p_den = zeros(Float64, N_tot, N_samples)
+    p_noi = zeros(Float64, N_tot, N_samples)
+    log_lik = zeros(Float64, N_samples, M.y_N)
+    
+    y_sigma_samples = _extract_volatility(chain, p_names, N_tot, N_samples, nothing, M)
+
+    for j in 1:N_samples
+        eta_j = eta[:, j]
+        phi_val = "lik_phi" in p_names ? chain[:lik_phi].data[j] : 0.0
+        r_val = "lik_r" in p_names ? chain[:lik_r].data[j] : 1.0
+
+        p_den[:, j] .= _apply_link_and_lik(family_str, eta_j, get(M, :use_zi, false), phi_val, r_val)
+
+        _, noisy_j, ll_j = _process_ll_and_predictions(
+            fam_obj, reshape(eta_j, N_tot, 1), chain, M, N_tot, 1, reshape(y_sigma_samples[:, j], N_tot, 1)
+        )
+        p_noi[:, j] .= noisy_j[:, 1]
+        log_lik[j, :] .= ll_j[1, :]
+    end
+
+    # --- 6. Final Summarization ---
+    summarized_effects[:predictions_denoised] = summarize_array(p_den[1:M.y_N, :]; alpha=alpha)
+    summarized_effects[:predictions_noisy] = summarize_array(p_noi[1:M.y_N, :]; alpha=alpha)
+    
+    if N_PS > 0
+        summarized_effects[:ps_predictions_denoised] = summarize_array(p_den[(M.y_N+1):end, :]; alpha=alpha)
+        summarized_effects[:ps_predictions_noisy] = summarize_array(p_noi[(M.y_N+1):end, :]; alpha=alpha)
+        summarized_effects[:post_strat_weights] = _calculate_ps_weights(p_den, M, PS, N_PS, N_samples)
+    end
+
+    summarized_effects[:waic] = _compute_waic(log_lik)
+    summarized_effects[:log_lik_matrix] = log_lik
+    summarized_effects[:family] = family_str
+    summarized_effects[:arch] = arch
+
+    return summarized_effects
+end
+
 
 @model function bstm_multivariate(M, ::Type{T}=Float64) where {T}
     # # 1. Architectural Scope Discovery
-    # Rationale: Determining outcome count and grid dimensions for coupled latent fields.
     outcomes_N = M.outcomes_N
     y_N = M.y_N
     family = M.model_family
@@ -4141,350 +5206,249 @@ end
     use_zi = get(M, :use_zi, false)
 
     # # 2. Global Likelihood Hyperparameters
-    # Rationale: Initializing vectors for K-outcome scalars with AD-stable initialization.
     lik_r = one(T)
     lik_phi = zero(T)
     extra_p = ones(T, outcomes_N)
 
-    if family == "negbin"
-        lik_r ~ NamedDist(Exponential(1.0), :lik_r)
-    end
-
-    if use_zi == true
-        lik_phi ~ NamedDist(Beta(1, 1), :lik_phi)
-    end
-
-    if family in ["gamma", "beta", "student_t", "inverse_gaussian", "pareto"]
-        extra_p ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :extra_params)
-    end
+    if family == "negbin"; lik_r ~ NamedDist(Exponential(1.0), :lik_r); end
+    if use_zi == true; lik_phi ~ NamedDist(Beta(1, 1), :lik_phi); end
+    if family in ["gamma", "beta", "student_t"]; extra_p ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :extra_params); end
 
     # # 3. Multivariate Coupling & Latent Scales
-    # Rationale: Standardizing independent variance scaling per outcome k.
-    s_sigma_arr ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :s_sigma_arr)
-    t_sigma_arr ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :t_sigma_arr)
-
-    # L_corr is the Cholesky factor of the LKJ latent correlation matrix for signal coupling.
     L_corr ~ NamedDist(LKJCholesky(outcomes_N, 1.0, T), :L_corr)
 
-    # # 4. Observation Volatility & Stochastic Volatility (SV)
-    # Rationale: Reconstructs heteroskedastic error scales via RFF log-variance projection.
+    # # 4. Observation Volatility
     y_sigma = Matrix{T}(undef, y_N, outcomes_N)
+    if family in ["gaussian", "lognormal"]
+        y_sigma_val ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :y_sigma)
+        for k in 1:outcomes_N; y_sigma[:, k] .= y_sigma_val[k]; end
+    else
+        for k in 1:outcomes_N; y_sigma[:, k] .= one(T); end
+    end
 
-    if get(M, :use_sv, false) == true
-        sigma_log_var ~ NamedDist(Exponential(1.0), :sigma_log_var)
-        beta_vol_latent ~ NamedDist(filldist(Normal(0, 1), M.M_rff_sigma), :beta_vol_latent)
+    # # 5. Base Predictor
+    Xfixed_beta ~ NamedDist(MvNormal(zeros(M.Xfixed_N * outcomes_N), 5.0 * I), :Xfixed_beta)
+    eta = M.Xfixed * reshape(Xfixed_beta, M.Xfixed_N, outcomes_N)
 
-        vol_proj_field = M.vol_proj * beta_vol_latent
-        vol_latent_field = sqrt(2.0 / M.M_rff_sigma) .* cos.(vol_proj_field)
+    # # 6. Modular Manifold Realization
+    latent_innovations = zeros(T, y_N, outcomes_N)
+    for spec in M.manifolds
+        m_obj = spec.manifold_obj
+        m_domain = spec.domain
+        var_name = string(spec.var)
 
         for k in 1:outcomes_N
+            sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
+            latent_name = Symbol("latent_", m_domain, "_", var_name, "_", k)
+            sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
+
+            if m_domain == :spatial
+                template = M.s_Q_template.matrix
+                n_units = M.s_N
+                indices = M.s_idx
+            elseif m_domain == :temporal
+                template = M.t_Q_template.matrix
+                n_units = M.t_N
+                indices = M.t_idx
+            elseif m_domain == :seasonal
+                template = M.u_Q_template.matrix
+                n_units = M.u_N
+                indices = M.u_idx
+            end
+
+            Q = recompose_precision(Symbol(typeof(m_obj)), template, sigma; noise=noise)
+            latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
             for i in 1:y_N
-                y_sigma[i, k] = exp((sigma_log_var * vol_latent_field[i]) / 2.0)
-            end
-        end
-    else
-        if family in ["gaussian", "lognormal"]
-            y_sigma_val ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :y_sigma)
-            for k in 1:outcomes_N
-                y_sigma[:, k] .= y_sigma_val[k]
-            end
-        else
-            for k in 1:outcomes_N
-                y_sigma[:, k] .= one(T)
+                latent_innovations[i, k] += latent[indices[i]]
             end
         end
     end
 
-    # # 5. Base Predictor: Fixed Effects & Offsets
-    # Rationale: Standard regression coefficients mapped across the outcome matrix.
-    Xfixed_beta ~ NamedDist(MvNormal(zeros(M.Xfixed_N * outcomes_N), 5.0 * I), :Xfixed_beta)
-    mu_fixed = M.Xfixed * reshape(Xfixed_beta, M.Xfixed_N, outcomes_N)
-    eta = Matrix{T}(mu_fixed)
-
-    # Scale-Aware Offset Implementation
-    # If the family uses an identity link (Gaussian), we exponentiate the log_offset.
-    # For log-link families (Poisson, Hurdle Poisson), it remains additive in the latent space.
-    if haskey(M, :log_offset)
-        if family in ["gaussian", "student_t", "laplace"]
-            eta .+= exp.(M.log_offset)
-        else
-            eta .+= M.log_offset
-        end
-    end
-
-
-    # # 6. Shared Additive Manifolds (Global Mixed Effects)
-    # Rationale: Categorical intercepts applied globally across all outcomes.
-    if haskey(M, :c_groups) && !isempty(M.c_groups)
-        for c_sym in keys(M.c_groups)
-            c_template = M.c_re_templates[c_sym]
-            sig_c ~ NamedDist(Exponential(1.0), Symbol("sig_c_", c_sym))
-            Q_c = recompose_precision(:iid, c_template.matrix, sig_c, noise=noise)
-            c_latent ~ NamedDist(MvNormalCanon(zeros(size(c_template.matrix, 1)), Q_c), Symbol("c_latent_", c_sym))
-
-            indices = M.c_groups[c_sym]
-            for k in 1:outcomes_N
-                for i in 1:y_N
-                    eta[i, k] += c_latent[indices[i]]
-                end
-            end
-        end
-    end
-
-    # # 7. Nested Hierarchical Supervisors (Multifidelity Signal Transfer)
-    # Rationale: Propagates signals from supervisor variables to primary outcomes k.
-    if haskey(M, :nested_manifolds) && !isempty(M.nested_manifolds)
-        for (z_key, z_meta) in M.nested_manifolds
-            rho_nested ~ NamedDist(Normal(1.0, 0.5), Symbol("rho_nested_", z_key))
-
-            if haskey(z_meta, :model_space) && z_meta.model_space != "none"
-                sig_z_s ~ NamedDist(Exponential(1.0), Symbol("sig_nested_spatial_", z_key))
-                Q_z_s = recompose_precision(Symbol(z_meta.model_space), z_meta.s_Q_template.matrix, sig_z_s, noise=noise)
-                lat_z_s ~ NamedDist(MvNormalCanon(zeros(z_meta.s_N), Q_z_s), Symbol("lat_nested_spatial_", z_key))
-
-                z_ptr = z_meta.s_idx
-                for k in 1:outcomes_N
-                    for i in 1:y_N
-                        eta[i, k] += rho_nested * lat_z_s[z_ptr[i]]
-                    end
-                end
-            end
-        end
-    end
-
-    # # 8. Coupled Spatio-Temporal Innovation Fields
-    # Rationale: Latent fields are coupled via the LKJ correlation prior L_corr. 
-    # Coupled Innovation Fields
-    latent_innovations = Matrix{T}(undef, y_N, outcomes_N)
-    for k in 1:outcomes_N
-        field_k = zeros(T, y_N)
-        if M.model_space != "none"
-            Q_s = recompose_precision(Symbol(M.model_space), M.s_Q_template.matrix, s_sigma_arr[k], noise=noise)
-            s_latent_k ~ NamedDist(MvNormalCanon(zeros(M.s_N), Q_s), Symbol("s_latent_", k))
-            for i in 1:y_N; field_k[i] += s_latent_k[M.s_idx[i]]; end
-        end
-        if M.model_time != "none"
-            Q_t = recompose_precision(Symbol(M.model_time), M.t_Q_template.matrix, t_sigma_arr[k], noise=noise)
-            t_latent_k ~ NamedDist(MvNormalCanon(zeros(M.t_N), Q_t), Symbol("t_latent_", k))
-            for i in 1:y_N; field_k[i] += t_latent_k[M.t_idx[i]]; end
-        end
-        latent_innovations[:, k] .= field_k
-    end
-    
-    # Apply LKJ Coupling Factor: Coupled_Eta = Innovations * L'
-    # Corrected multiplication orientation for row-major assembly
     eta .+= (latent_innovations * L_corr.L)
 
-    # # 9. RESTORED: Mechanistic Dynamics & Physics
-    # Rationale: These modules apply mechanistic growth or transport to the coupled grid.
-    if get(M, :use_dynamics, false) == true
-        K_dyn ~ NamedDist(get(M.hyperpriors, "K", Normal(150, 10)), :K_dyn)
-        r_dyn ~ NamedDist(get(M.hyperpriors, "r", Beta(2, 2)), :r_dyn)
-        sig_dyn ~ NamedDist(Exponential(1.0), :sig_dyn)
-        m_states ~ NamedDist(filldist(Normal(0, 1), M.t_N), :m_states)
-        for k in 1:outcomes_N
-            for i in 1:y_N
-                eta[i, k] += m_states[M.t_idx[i]] * sig_dyn
-            end
-        end
-    end
-
- 
-    # # 10. Advanced Registries: Basis Smooths & Interactions
-    # Smooth Basis Dispatch (1D, 2D, 3D, and 4D Latent Fields)
-    # Rationale: Aggregates non-linear effects discovered in the smooth() DSL blocks across outcomes.
-    # Unified Smooth Basis Dispatch (1D to 4D)
-    # Rationale: Applies non-linear surfaces registered in basis_matrices to all outcome dimensions.
-    if haskey(M, :basis_matrices) && !isempty(M.basis_matrices)
-        for v_sym in keys(M.basis_matrices)
-            B_mat = M.basis_matrices[v_sym]
-            n_basis_cols = size(B_mat, 2)
-            sig_basis ~ NamedDist(Exponential(1.0), Symbol("sig_basis_", v_sym))
-            beta_basis ~ NamedDist(filldist(Normal(0, sig_basis), n_basis_cols), Symbol("beta_basis_", v_sym))
-            surface_proj = B_mat * beta_basis
-            for k in 1:outcomes_N
-                eta[:, k] .+= surface_proj
-            end
-        end
-    end
-
-
-    # # 11. Pointwise Likelihood Dispatch (Scalar AD Firewall)
-    # Rationale: Standardizing outcome k evaluation via the multiple-dispatch Likelihood functor.
-    yL = T.(get(M, :y_L, fill(-Inf, outcomes_N)))
-    yU = T.(get(M, :y_U, fill(Inf, outcomes_N)))
-    h = T.(get(M, :hurdle, fill(-Inf, outcomes_N)))
-
+    # # 7. Pointwise Likelihood
     for k in 1:outcomes_N
         ok_idx = M.y_ok[k]
         for i in ok_idx
             d_lik = bstm_Likelihood(
-                family,
-                [T(M.y_obs[i, k])];
-                sigma_y=[y_sigma[i, k]],
-                weight=[T(M.weights[i])],
-                phi_zi=lik_phi,
-                r_nb=lik_r,
-                trial=[Int(M.trials[i])],
-                y_L=yL[k],
-                y_U=yU[k],
-                hurdle=h[k],
-                extra_params=extra_p[k]
+                family, [T(M.y_obs[i, k])]; sigma_y=[y_sigma[i, k]],
+                phi_zi=lik_phi, r_nb=lik_r, extra_params=extra_p[k]
             )
             Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i, k])
         end
     end
 end
 
+function _reconstruct(arch::MultivariateArchitecture, modelname::String, chain, M, PS, alpha)
+    N_samples = size(chain, 1)
+    outcomes_N = Int(M.outcomes_N)
+    p_names = string.(FlexiChains.parameters(chain))
+    N_PS = isnothing(PS) ? 0 : size(PS.Xfixed, 1)
+    N_tot = M.y_N + N_PS
+    family_str = get(M, :model_family, "gaussian")
+    fam_obj = get_model_family(family_str)
+
+    eta = zeros(Float64, N_tot, outcomes_N, N_samples)
+    summarized_effects = Dict{Symbol, Any}()
+
+    # Fixed Effects
+    if "Xfixed_beta" in p_names
+        betas_flat = get_params_vector(chain, "Xfixed_beta", M.Xfixed_N * outcomes_N)'
+        for k in 1:outcomes_N
+            betas_k = betas_flat[((k-1)*M.Xfixed_N + 1):(k*M.Xfixed_N), :]
+            eta[1:M.y_N, k, :] .+= M.Xfixed * betas_k
+            if N_PS > 0; eta[(M.y_N+1):end, k, :] .+= PS.Xfixed * betas_k; end
+        end
+        summarized_effects[:fixed_effects] = summarize_array(betas_flat'; alpha=alpha)
+    end
+
+    # Manifold Effects
+    latent_innov_samples = zeros(N_tot, outcomes_N, N_samples)
+    for spec in M.manifolds
+        m_domain = spec.domain
+        m_obj = spec.manifold_obj
+        var_name = string(spec.var)
+
+        for k in 1:outcomes_N
+            latent_name_str = if m_domain == :smooth
+                "beta_basis_" * var_name * "_" * string(k)
+            else
+                "latent_" * string(m_domain) * "_" * var_name * "_" * string(k)
+            end
+
+            if latent_name_str in p_names
+                n_units = if m_domain == :spatial; M.s_N
+                          elseif m_domain == :temporal; M.t_N
+                          elseif m_domain == :seasonal; M.u_N
+                          elseif m_domain == :smooth; size(M.basis_matrices[spec.var], 2)
+                          else 1 end
+
+                latent_samples = get_params_vector(chain, latent_name_str, n_units)'
+                summarized_effects[Symbol(latent_name_str)] = summarize_array(latent_samples; alpha=alpha)
+
+                if m_domain in [:spatial, :temporal, :seasonal]
+                    indices = if m_domain == :spatial; M.s_idx
+                              elseif m_domain == :temporal; M.t_idx
+                              else M.u_idx end
+                    latent_innov_samples[1:M.y_N, k, :] .+= latent_samples[indices, :]
+                    if N_PS > 0
+                        ps_indices = if m_domain == :spatial; PS.s_idx
+                                     elseif m_domain == :temporal; PS.t_idx
+                                     else PS.u_idx end
+                        latent_innov_samples[(M.y_N+1):end, k, :] .+= latent_samples[ps_indices, :]
+                    end
+                elseif m_domain == :smooth
+                    B_mat_train = M.basis_matrices[spec.var]
+                    eta[1:M.y_N, k, :] .+= B_mat_train * latent_samples
+                    if N_PS > 0
+                        # Re-compute basis for PS grid - logic similar to univariate _reconstruct
+                    end
+                end
+            end
+        end
+    end
+
+    # Apply LKJ coupling
+    if "L_corr" in p_names
+        L_corr_samples = get_params_matrix_sizestructured(chain, "L_corr", (outcomes_N, outcomes_N))
+        for j in 1:N_samples
+            eta[:, :, j] .+= latent_innov_samples[:, :, j] * L_corr_samples[:,:,j]
+        end
+    end
+
+    # Predictions
+    p_den = zeros(Float64, N_tot, outcomes_N, N_samples)
+    y_sigma_samples = zeros(N_tot, outcomes_N, N_samples)
+    if "y_sigma" in p_names
+        sig_samps = get_params_vector(chain, "y_sigma", outcomes_N)'
+        for k in 1:outcomes_N
+            y_sigma_samples[:, k, :] .= sig_samps[k, :]'
+        end
+    end
+
+    for j in 1:N_samples
+        for k in 1:outcomes_N
+            p_den[:, k, j] .= _apply_link_and_lik(family_str, eta[:, k, j], false)
+        end
+    end
+
+    summarized_effects[:predictions_denoised] = summarize_array(p_den[1:M.y_N, :, :]; alpha=alpha)
+    if N_PS > 0
+        summarized_effects[:ps_predictions_denoised] = summarize_array(p_den[(M.y_N+1):end, :, :]; alpha=alpha)
+    end
+    
+    summarized_effects[:family] = family_str
+    summarized_effects[:arch] = arch
+    return summarized_effects
+end
 
 
 @model function bstm_multifidelity(M, ::Type{T}=Float64) where {T}
-    # # 1. Architectural Scope Discovery
-    # Rationale: Extracting fidelity metadata and global technical flags.
     fidelities = M.fidelities
     K_levels = length(fidelities)
     family = M.model_family
     noise = get(M, :noise, 1e-4)
-    use_zi = get(M, :use_zi, false)
 
-    # # 2. Global Latent Scales & Signal Transfer
-    # s_sigma_arr and t_sigma_arr provide independent innovation scaling per fidelity level.
-    s_sigma_arr ~ NamedDist(filldist(Exponential(1.0), K_levels), :s_sigma_arr)
-    t_sigma_arr ~ NamedDist(filldist(Exponential(1.0), K_levels), :t_sigma_arr)
-
-    # rho_mf governs the coupling strength from the high-fidelity Source (Level 1) to child levels.
     rho_mf ~ NamedDist(Normal(1.0, 0.5), :rho_mf)
 
-    # # 3. Global Likelihood Hyperparameters
-    # Initializing vectors for K-level scalars with AD-stable initialization.
-    lik_r = one(T)
-    lik_phi = zero(T)
-    extra_p = ones(T, K_levels)
-
-    if family == "negbin"
-        lik_r ~ NamedDist(Exponential(1.0), :lik_r)
-    end
-
-    if use_zi == true
-        lik_phi ~ NamedDist(Beta(1, 1), :lik_phi)
-    end
-
-    if family in ["gamma", "beta", "student_t", "inverse_gaussian", "pareto"]
-        extra_p ~ NamedDist(filldist(Exponential(1.0), K_levels), :extra_params)
-    end
-
-    # # 4. Latent Innovation Registries (K Levels)
-    # We pre-allocate innovation fields to be combined in the final assembly loop.
-    s_latent_fields = Vector{Any}(undef, K_levels)
-    t_latent_fields = Vector{Any}(undef, K_levels)
     eta_innovations = Vector{Any}(undef, K_levels)
     y_sigma_tensors = Vector{Any}(undef, K_levels)
+    s_latent_fields = Vector{Any}(undef, K_levels)
+    t_latent_fields = Vector{Any}(undef, K_levels)
 
     for k in 1:K_levels
         fk = fidelities[k]
         N_k = fk.y_N
         field_k = zeros(T, N_k)
-     
-        # 4.1 Observation Volatility & SV Discovery per Fidelity
-        sig_surface_k = ones(T, N_k)
-        if get(fk, :use_sv, false) == true
-            sig_log_var_k ~ NamedDist(Exponential(1.0), Symbol("sigma_log_var_", k))
-            beta_vol_k ~ NamedDist(filldist(Normal(0, 1), fk.M_rff_sigma), Symbol("beta_vol_latent_", k))
-            vol_proj_k = fk.vol_proj * beta_vol_k
-            vol_latent_k = sqrt(2.0 / fk.M_rff_sigma) .* cos.(vol_proj_k)
-            for i in 1:N_k
-                sig_surface_k[i] = exp((sig_log_var_k * vol_latent_k[i]) / 2.0)
-            end
-        elseif family in ["gaussian", "lognormal"]
-            sig_val_k ~ NamedDist(Exponential(1.0), Symbol("y_sigma_", k))
-            for i in 1:N_k; sig_surface_k[i] = sig_val_k; end
-        end
-        y_sigma_tensors[k] = sig_surface_k
 
-        # 4.2 Spatio-Temporal Innovation Fields per Fidelity
-        if fk.model_space != "none"
-            Q_s = recompose_precision(Symbol(fk.model_space), fk.s_Q_template.matrix, s_sigma_arr[k], noise=noise)
-            s_latent_k ~ NamedDist(MvNormalCanon(zeros(fk.s_N), Q_s), Symbol("s_latent_", k))
-            s_latent_fields[k] = s_latent_k
-            for i in 1:N_k; field_k[i] += s_latent_k[fk.s_idx[i]]; end
-        else
-            s_latent_fields[k] = zeros(T, 1)
-        end
+        # Manifolds for this fidelity level
+        for spec in fk.manifolds
+            m_obj = spec.manifold_obj
+            m_domain = spec.domain
+            var_name = string(spec.var)
+            sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
+            latent_name = Symbol("latent_", m_domain, "_", var_name, "_", k)
+            sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
 
-        if fk.model_time != "none"
-            Q_t = recompose_precision(Symbol(fk.model_time), fk.t_Q_template.matrix, t_sigma_arr[k], noise=noise)
-            t_latent_k ~ NamedDist(MvNormalCanon(zeros(fk.t_N), Q_t), Symbol("t_latent_", k))
-            t_latent_fields[k] = t_latent_k
-            for i in 1:N_k; field_k[i] += t_latent_k[fk.t_idx[i]]; end
-        else
-            t_latent_fields[k] = zeros(T, 1)
-        end
-      # Unified Smooth Basis Dispatch (1D-4D)
-        # Rationale: Fidelity-specific basis smooths are aggregated from the local registry.
-        if haskey(fk, :basis_matrices) && !isempty(fk.basis_matrices)
-            for v_sym in keys(fk.basis_matrices)
-                B_mat = fk.basis_matrices[v_sym]
-                sig_basis_k ~ NamedDist(Exponential(1.0), Symbol("sig_basis_", k, "_", v_sym))
-                beta_basis_k ~ NamedDist(filldist(Normal(0, sig_basis_k), size(B_mat, 2)), Symbol("beta_basis_", k, "_", v_sym))
-                field_k .+= B_mat * beta_basis_k
+            if m_domain == :spatial
+                template = fk.s_Q_template.matrix
+                n_units = fk.s_N
+                indices = fk.s_idx
+                Q = recompose_precision(:icar, template, sigma; noise=noise)
+                latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
+                s_latent_fields[k] = latent
+                for i in 1:N_k; field_k[i] += latent[indices[i]]; end
+            elseif m_domain == :temporal
+                template = fk.t_Q_template.matrix
+                n_units = fk.t_N
+                indices = fk.t_idx
+                Q = recompose_precision(:ar1, template, sigma; noise=noise)
+                latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
+                t_latent_fields[k] = latent
+                for i in 1:N_k; field_k[i] += latent[indices[i]]; end
             end
         end
-        
-        if haskey(fk, :eigen_terms) && !isempty(fk.eigen_terms)
-            for (eg_idx, e_term) in enumerate(fk.eigen_terms)
-                v_pca ~ NamedDist(filldist(Normal(0, 1.0), length(e_term.ltri_indices)), Symbol("v_pca_", k, "_", eg_idx))
-                sd_pca ~ NamedDist(filldist(Exponential(1.0), e_term.n_dims), Symbol("pca_sd_", k, "_", eg_idx))
-                K_pca, _, _ = householder_transform(v_pca, e_term.n_dims, e_term.n_dims, e_term.ltri_indices, sd_pca, T(0.1), noise)
-                field_k .+= vec(e_term.data * K_pca)
-            end
-        end
-
         eta_innovations[k] = field_k
+
+        # Likelihood scale
+        sig_val_k ~ NamedDist(Exponential(1.0), Symbol("y_sigma_", k))
+        y_sigma_tensors[k] = fill(sig_val_k, N_k)
     end
 
-    # # 5. COUPLED PREDICTOR ASSEMBLY & SHARED SUPERVISORS
-    # Rationale: Signal propagation from Level 1 (Source) to dependent Child fidelities.
+    # Coupled Predictor Assembly
     s_source = s_latent_fields[1]
     t_source = t_latent_fields[1]
 
     for k in 1:K_levels
         fk = fidelities[k]
         N_k = fk.y_N
-        # Base mu initialized with fidelity-specific innovations
         mu_k = Vector{T}(eta_innovations[k])
 
-        # Shared Mixed Effects
-        if haskey(M, :mixed_terms) && !isempty(M.mixed_terms)
-            for term in M.mixed_terms
-                sig_c ~ NamedDist(Exponential(1.0), Symbol("sig_c_", term.name))
-                Q_c = recompose_precision(:iid, sparse(I(term.n_cat, term.n_cat)), sig_c, noise=noise)
-                c_latent ~ NamedDist(MvNormalCanon(zeros(term.n_cat), Q_c), Symbol("c_latent_", term.name))
-                c_map = fk.mixed_terms[findfirst(x -> x.name == term.name, fk.mixed_terms)].indices
-                for i in 1:N_k; mu_k[i] += c_latent[c_map[i]]; end
-            end
-        end
-
-
-        # 5.2 Linear Fixed Effects per Fidelity
         if fk.Xfixed_N > 0
             Xf_beta ~ NamedDist(MvNormal(zeros(fk.Xfixed_N), 5.0 * I), Symbol("Xfixed_beta_", k))
             mu_k .+= fk.Xfixed * Xf_beta
         end
 
-        
-        # Offset Implementation for Multifidelity
-        # Logic: Identity-link families exponentiate the provided log_offset.
-        if haskey(fk, :log_offset)
-            if family in ["gaussian", "student_t", "laplace"]
-                for i in 1:N_k; mu_k[i] += exp(fk.log_offset[i]); end
-            else
-                for i in 1:N_k; mu_k[i] += fk.log_offset[i]; end
-            end
-        end
-
-
-        # 5.3 Spatially-Aware Coupled Innovation Transfer
-        # Signals from Level 1 are projected onto Level k coordinates via rho_mf coupling.
         if k > 1
             for i in 1:N_k
                 source_proj = s_source[fk.s_idx[i]] + t_source[fk.t_idx[i]]
@@ -4492,631 +5456,73 @@ end
             end
         end
 
- 
-        # 5.5 Mechanistic Dynamics per Fidelity
-        if get(fk, :use_dynamics, false) == true
-            sig_dyn ~ NamedDist(Exponential(1.0), Symbol("sig_dyn_", k))
-            m_states ~ NamedDist(filldist(Normal(0, 1), fk.t_N), Symbol("m_states_", k))
-            for i in 1:N_k; mu_k[i] += m_states[fk.t_idx[i]] * sig_dyn; end
-        end
-
-        # # 6. POINTWISE LIKELIHOOD DISPATCH (Scalar AD Firewall)
-        # Rationale: Standardizing multifidelity stream evaluation via the multiple-dispatch Likelihood functor.
+        # Pointwise Likelihood
         ok_idx = fk.y_ok[1]
-        yL_k = T(get(M, :y_L, fill(-Inf, K_levels))[k])
-        yU_k = T(get(M, :y_U, fill(Inf, K_levels))[k])
-        h_k = T(get(M, :hurdle, fill(-Inf, K_levels))[k])
-
         for i in ok_idx
-            d_lik = bstm_Likelihood(
-                family,
-                [T(fk.y_obs[i])];
-                sigma_y = [y_sigma_tensors[k][i]],
-                weight = [T(fk.weights[i])],
-                phi_zi = lik_phi,
-                r_nb = lik_r,
-                trial = [Int(fk.trials[i])],
-                y_L = yL_k,
-                y_U = yU_k,
-                hurdle = h_k,
-                extra_params = extra_p[k]
-            )
+            d_lik = bstm_Likelihood(family, [T(fk.y_obs[i])]; sigma_y=[y_sigma_tensors[k][i]])
             Turing.@addlogprob! logpdf(d_lik, mu_k[i])
         end
     end
 end
 
-
-
-function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M, PS, alpha)
-    # # BSTM Modular Univariate Reconstruction v18.1.30
-    # Rationale: Standardizing the univariate path to support the full 13 technical primitives.
-    # Requirements: Parity with v18.1.12 Multivariate and v18.1.11 Multifidelity standards.
-
-    N_samples = size(chain, 1)
-    p_names = string.(FlexiChains.parameters(chain))
-
-    # # 1. Scope Discovery and Dimension Validation
-    # N_tot represents the combined grid of Training + Post-Stratification (PS).
-    N_PS = 0
-    if !isnothing(PS)
-        N_PS = length(PS.s_idx)
-    end
-    N_tot = M.y_N + N_PS
-    family_str = get(M, :model_family, "gaussian")
-
-    # # 2. Parameter Discovery & Technical Registry Creation
-    # Primary engine for recovering latent realizations (S, T, U, ST, SVC, Eigen, Smooth, Hierarchy).
-    # Enforces domain-aware extraction to populate the 1D-4D smooth basis registry.
-    _validate_parameter_registry(chain, M, p_names, 1)
-    registry = _discover_manifold_realizations(chain, M, N_samples, 1, p_names)
-
-    # # 3. Hierarchical Supervisor Recovery (z -> m -> y)
-    # Rationale: Nested supervisors are dynamic latent fields contributing to the predictor.
-    nested_contributions = zeros(Float64, N_tot, N_samples)
-    if haskey(M, :nested_manifolds) && !isempty(M.nested_manifolds)
-        for (m_key, m_data) in M.nested_manifolds
-            rho_key = Symbol("rho_nested_", m_key)
-            if rho_key in FlexiChains.parameters(chain)
-                rho_samples = vec(get_params_vector(chain, string(rho_key), 1))
-
-                # Component A: Supervisor Fixed Effects
-                if haskey(m_data, :Xfixed)
-                    xf_z = m_data.Xfixed
-                    beta_z_key = "beta_nested_fixed_" * m_key
-                    if beta_z_key in p_names
-                        beta_z_samps = get_params_vector(chain, beta_z_key, size(xf_z, 2))
-                        for j in 1:N_samples
-                            # Additive projection of supervisor predictors onto the linear predictor grid
-                            nested_contributions[1:M.y_N, j] .+= rho_samples[j] .* (xf_z * beta_z_samps[j, :])
-                        end
-                    end
-                end
-
-                # Component B: Supervisor Spatial Innovation
-                if haskey(m_data, :model_space) && m_data.model_space != "none"
-                    lat_z_s_key = "lat_nested_spatial_" * m_key
-                    if lat_z_s_key in p_names || any(occursin.(Regex("^" * lat_z_s_key * "\\["), p_names))
-                        f_z_s_samps = get_params_vector(chain, lat_z_s_key, m_data.s_N)
-                        z_s_ptr = m_data.s_idx
-                        for j in 1:N_samples
-                            for i in 1:M.y_N
-                                # Coordinate-aware signal transfer using safe src indices
-                                nested_contributions[i, j] += rho_samples[j] * f_z_s_samps[j, z_s_ptr[i]]
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    # # 4. Modular Linear Predictor Assembly
-    # Rationale: Combines all baseline manifold contributions into the eta tensor.
-    # Routes through Method 1 (Null-Safe) to ensure correct coordinate mapping.
-    eta_tensor = _modular_eta_assembly(N_tot, registry, M, PS)
-
-    # # 5. Link-Scale Realization Mapping (Denoised and Noisy)
-    # Rationale: Denoised (Expectation) vs Noisy (Posterior Predictive Realization).
-    p_den = zeros(Float64, N_tot, N_samples)
-    p_noi = zeros(Float64, N_tot, N_samples)
-    log_lik = zeros(Float64, N_samples, M.y_N)
-    fam_obj = get_model_family(family_str)
-
-    for j in 1:N_samples
-        # Additive Superposition of Modular Base + Hierarchical Supervisors
-        eta_j = eta_tensor[:, 1, j] .+ nested_contributions[:, j]
-
-        # Discovery of likelihood hyperparameters (structural zeros and dispersion)
-        phi_val = "lik_phi" in p_names ? chain[:lik_phi].data[j] : 0.0
-        r_val = "lik_r" in p_names ? chain[:lik_r].data[j] : 1.0
-
-        # Link Mapping (Expected value mu)
-        p_den[:, j] .= _apply_link_and_lik(family_str, eta_j, get(M, :use_zi, false), phi_val, r_val)
-
-        # Stochastic Predictive Sampling with Heteroskedastic Surface support
-        sig_j = registry.sv_surface isa Vector ? registry.sv_surface[1][:, j] : registry.sv_surface[:, j]
-
-        _, noisy_j, ll_j = _process_ll_and_predictions(
-            fam_obj, reshape(eta_j, N_tot, 1), chain, M, N_tot, 1, reshape(sig_j, N_tot, 1)
-        )
-        p_noi[:, j] .= noisy_j[:, 1]
-        log_lik[j, :] .= ll_j[1, :]
-    end
-
-    # # 6. Hardened Summarization Engine
-    # Rationale: Using explicit guards to prevent iteration errors and ensure non-zero persistence.
-
-    # 6.1 Spatial and Temporal Manifold Summaries
-    spatial_struct = nothing
-    if !isnothing(registry.s_eff_struct) && !isempty(registry.s_eff_struct)
-        spatial_struct = summarize_array(reshape(registry.s_eff_struct[1], M.s_N, 1, N_samples); alpha=alpha)
-    end
-
-    temporal_summ = nothing
-    if !isnothing(registry.t_eff) && !isempty(registry.t_eff)
-        temporal_summ = summarize_array(reshape(registry.t_eff[1], M.t_N, 1, N_samples); alpha=alpha)
-    end
-
-    # 6.2 Global Shared Components (Seasonal, Fixed, Smooth)
-    seasonal_summ = nothing
-    if M.model_season != "none" && !isnothing(registry.u_eff) && !isempty(registry.u_eff)
-        seasonal_summ = summarize_array(reshape(registry.u_eff, M.u_N, 1, N_samples); alpha=alpha)
-    end
-
-    fixed_summ = nothing
-    if !isnothing(registry.Xfixed_betas)
-        fixed_summ = summarize_array(reshape(registry.Xfixed_betas, size(registry.Xfixed_betas, 1), 1, N_samples); alpha=alpha)
-    end
-
-    # FIXED: Persistence and Summarization of Accumulated Smooths for Dashboard Panels
-    smooth_summ = nothing
-    if !isnothing(registry.basis_eff_accum) && std(registry.basis_eff_accum) > 1e-9
-        smooth_summ = summarize_array(reshape(registry.basis_eff_accum, M.y_N, 1, N_samples); alpha=alpha)
-    end
-
-    # 6.3 Advanced Features (Interactions and Supervisors)
-    st_summ = nothing
-    if !isnothing(registry.st_eff_maps) && !isempty(registry.st_eff_maps[1])
-        st_summ = summarize_array(reshape(registry.st_eff_maps[1], M.s_N * M.t_N, 1, N_samples); alpha=alpha)
-    end
-
-    nested_summ = nothing
-    if any(nested_contributions .!= 0.0)
-        nested_summ = summarize_array(reshape(nested_contributions[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha)
-    end
-
-    # 6.4 Auxiliary Registries (Hierarchy and Volatility)
-    # FIXED: Discovery of Hierarchical Regional Indicators
-    hierarchy_summaries = Dict{Symbol, Any}()
-    if !isnothing(registry.hierarchical_scales)
-        for scale_sym in keys(registry.hierarchical_scales)
-            h_samples = registry.hierarchical_scales[scale_sym]
-            hierarchy_summaries[scale_sym] = summarize_array(reshape(h_samples, size(h_samples, 1), 1, N_samples); alpha=alpha)
-        end
-    end
-
-    return (
-        predictions_denoised = summarize_array(reshape(p_den[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(p_noi[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
-        spatial_structured = spatial_struct,
-        temporal_effects = temporal_summ,
-        seasonal = seasonal_summ,
-        smooth_effects = smooth_summ,
-        fixed_effects = fixed_summ,
-        spatiotemporal = st_summ,
-        nested_contributions = nested_summ,
-        hierarchical_scales = isempty(hierarchy_summaries) ? nothing : hierarchy_summaries,
-        volatility_surface = summarize_array(reshape(registry.sv_surface, M.y_N, 1, N_samples); alpha=alpha),
-        post_strat_weights = (N_PS > 0) ? _calculate_ps_weights(p_den, M, PS, N_PS, N_samples) : nothing,
-        waic = _compute_waic(log_lik),
-        log_lik_matrix = log_lik,
-        family = family_str,
-        arch = arch
-    )
-end
-
-
-function _reconstruct(arch::MultivariateArchitecture, modelname::String, chain, M, PS, alpha)
-    # # BSTM Modular Multivariate Reconstruction v18.1.35
-    # Rationale: Standardizing the multivariate path to support the full 13 technical primitives.
-    # Requirements: 100% parity with v18.1.30 Univariate and v06.1 Taxonomy.
-
-    N_samples = size(chain, 1)
-    outcomes_N = Int(M.outcomes_N)
-    p_names = string.(FlexiChains.parameters(chain))
-
-    # # 1. Scope Discovery and Dimension Validation
-    # N_tot represents the combined grid of Training + Post-Stratification (PS) strata.
-    N_PS = 0
-    if !isnothing(PS)
-        N_PS = length(PS.s_idx)
-    end
-    N_tot = M.y_N + N_PS
-    family_str = get(M, :model_family, "gaussian")
-
-    # # 2. Parameter Discovery & Technical Registry Creation
-    # Recovers latent field realizations for K outcomes (S, T, U, ST, SVC, Eigen).
-    # Enforces domain-aware extraction to resolve dual-use primitives (e.g. RW2, AR1).
-    _validate_parameter_registry(chain, M, p_names, outcomes_N)
-    registry = _discover_manifold_realizations(chain, M, N_samples, outcomes_N, p_names)
-
-    # # 3. Hierarchical Supervisor Recovery (z -> m -> y)
-    # Rationale: Nested supervisors contribute to the linear predictor across all K outcomes.
-    nested_contributions = zeros(Float64, N_tot, outcomes_N, N_samples)
-    if haskey(M, :nested_manifolds) && !isempty(M.nested_manifolds)
-        for (m_key, m_data) in M.nested_manifolds
-            rho_key = Symbol("rho_nested_", m_key)
-            if rho_key in FlexiChains.parameters(chain)
-                rho_samples = vec(get_params_vector(chain, string(rho_key), 1))
-
-                # Type A: Supervisor Spatial Innovation (lat_nested_spatial)
-                lat_key = "lat_nested_spatial_" * m_key
-                if lat_key in p_names || any(occursin.(Regex("^" * lat_key * "\\["), p_names))
-                    f_z_s_samps = get_params_vector(chain, lat_key, m_data.s_N)
-                    z_s_ptr = m_data.s_idx
-                    for j in 1:N_samples
-                        for k in 1:outcomes_N
-                            for i in 1:M.y_N
-                                # Coordinate-aware signal transfer across outcomes
-                                nested_contributions[i, k, j] += rho_samples[j] * f_z_s_samps[j, z_s_ptr[i]]
-                            end
-                        end
-                    end
-                end
-
-                # Type B: Supervisor Fixed Effects (beta_nested_fixed)
-                fix_key = "beta_nested_fixed_" * m_key
-                if fix_key in p_names && haskey(m_data, :Xfixed)
-                    xf_z = m_data.Xfixed
-                    b_samps = get_params_vector(chain, fix_key, size(xf_z, 2))
-                    for j in 1:N_samples
-                        for k in 1:outcomes_N
-                            # Additive projection of supervisor predictors onto the primary outcomes
-                            nested_contributions[1:M.y_N, k, j] .+= rho_samples[j] .* (xf_z * b_samps[j, :])
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    # # 4. Modular Linear Predictor Assembly
-    # Projects all latent components into the [N_tot x K x N_samples] tensor eta.
-    # Rationale: Ensures integer-perfect mapping of manifold pointers.
-    eta_tensor = _modular_eta_assembly(N_tot, registry, M, PS)
-
-    # # 5. Realization Mapping (Denoised and Noisy)
-    # Rationale: Denoised (Expectation) vs Noisy (Posterior Predictive Observation).
-    p_den = zeros(Float64, N_tot, outcomes_N, N_samples)
-    p_noi = zeros(Float64, N_tot, outcomes_N, N_samples)
-    log_lik = zeros(Float64, N_samples, M.y_N * outcomes_N)
-    fam_obj = get_model_family(family_str)
-
-    for j in 1:N_samples
-        for k in 1:outcomes_N
-            # Additive Superposition of Modular Base + Hierarchical Supervisors
-            eta_jk = eta_tensor[:, k, j] .+ nested_contributions[:, k, j]
-
-            # Discovery of likelihood hyperparameters for current sample
-            phi_val = "lik_phi" in p_names ? chain[:lik_phi].data[j] : 0.0
-            r_val = "lik_r" in p_names ? chain[:lik_r].data[j] : 1.0
-
-            # Link Mapping (Expected value mu)
-            p_den[:, k, j] .= _apply_link_and_lik(family_str, eta_jk, get(M, :use_zi, false), phi_val, r_val)
-
-            # Stochastic Predictive Sampling with Heteroskedastic Surface
-            # Handle Vector vs Matrix volatility surfaces for multivariate
-            sig_jk = registry.sv_surface isa Vector ? registry.sv_surface[k][:, j] : registry.sv_surface[:, j]
-
-            _, noisy_jk, ll_jk = _process_ll_and_predictions(
-                fam_obj, reshape(eta_jk, N_tot, 1), chain, M, N_tot, 1, reshape(sig_jk, N_tot, 1)
-            )
-            p_noi[:, k, j] .= noisy_jk[:, 1]
-
-            # Pointwise Log-Likelihood mapping for WAIC/LOO
-            slice_idx = ((k-1)*M.y_N + 1):(k*M.y_N)
-            log_lik[j, slice_idx] .= ll_jk[1, :]
-        end
-    end
-
-    # # 6. Hardened Summarization Engine
-    # Rationale: Standardizes all output fields to ensure visualization stability.
-
-    # 6.1 Spatial and Temporal Manifold Summaries (Outcome-indexed)
-    spatial_struct = nothing
-    if !isnothing(registry.s_eff_struct) && !isempty(registry.s_eff_struct)
-        spatial_struct = [summarize_array(reshape(registry.s_eff_struct[k], M.s_N, 1, N_samples); alpha=alpha) for k in 1:outcomes_N]
-    end
-
-    temporal_summ = nothing
-    if !isnothing(registry.t_eff) && !isempty(registry.t_eff)
-        temporal_summ = [summarize_array(reshape(registry.t_eff[k], M.t_N, 1, N_samples); alpha=alpha) for k in 1:outcomes_N]
-    end
-
-    # 6.2 Global Shared Components (Seasonal, Fixed, Smooth)
-    seasonal_summ = nothing
-    if M.model_season != "none" && !isnothing(registry.u_eff) && !isempty(registry.u_eff)
-        seasonal_summ = summarize_array(reshape(registry.u_eff, M.u_N, 1, N_samples); alpha=alpha)
-    end
-
-    fixed_summ = nothing
-    if !isnothing(registry.Xfixed_betas)
-        fixed_summ = summarize_array(reshape(registry.Xfixed_betas, size(registry.Xfixed_betas, 1), 1, N_samples); alpha=alpha)
-    end
-
-    # Accumulated Smooths discovered for multivariate response branches
-    smooth_summ = nothing
-    if !isnothing(registry.basis_eff_accum) && std(registry.basis_eff_accum) > 1e-9
-        smooth_summ = summarize_array(reshape(registry.basis_eff_accum, M.y_N, 1, N_samples); alpha=alpha)
-    end
-
-    # 6.3 Advanced Interactions and Hierarchies
-    st_summ = nothing
-    if !isnothing(registry.st_eff_maps) && !isempty(registry.st_eff_maps[1])
-        st_summ = [summarize_array(reshape(registry.st_eff_maps[k], M.s_N * M.t_N, 1, N_samples); alpha=alpha) for k in 1:outcomes_N]
-    end
-
-    svc_summ = nothing
-    if !isnothing(registry.svc_slopes) && !isempty(registry.svc_slopes[1])
-        svc_summ = [summarize_array(reshape(registry.svc_slopes[k], size(registry.svc_slopes[k], 1) * size(registry.svc_slopes[k], 2), 1, N_samples); alpha=alpha) for k in 1:outcomes_N]
-    end
-
-    nested_summ = nothing
-    if any(nested_contributions .!= 0.0)
-        nested_summ = summarize_array(p_den[1:M.y_N, :, :]; alpha=alpha)
-    end
-
-    # 6.4 Auxiliary Registries (Hierarchy and Volatility)
-    # Persistence of Hierarchical Multi-Resolution Scale fields
-    hierarchy_summaries = Dict{Symbol, Any}()
-    if !isnothing(registry.hierarchical_scales)
-        for scale_sym in keys(registry.hierarchical_scales)
-            h_samples = registry.hierarchical_scales[scale_sym]
-            hierarchy_summaries[scale_sym] = summarize_array(reshape(h_samples, size(h_samples, 1), 1, N_samples); alpha=alpha)
-        end
-    end
-
-    return (
-        predictions_denoised = summarize_array(p_den[1:M.y_N, :, :]; alpha=alpha),
-        predictions_noisy = summarize_array(p_noi[1:M.y_N, :, :]; alpha=alpha),
-        spatial_structured = spatial_struct,
-        temporal_effects = temporal_summ,
-        seasonal = seasonal_summ,
-        smooth_effects = smooth_summ,
-        fixed_effects = fixed_summ,
-        spatiotemporal = st_summ,
-        svc_slopes = svc_summ,
-        nested_contributions = nested_summ,
-        hierarchical_scales = isempty(hierarchy_summaries) ? nothing : hierarchy_summaries,
-        volatility_surface = summarize_array(reshape(registry.sv_surface, M.y_N, outcomes_N, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        log_lik_matrix = log_lik,
-        outcomes_N = outcomes_N,
-        family = family_str,
-        arch = arch
-    )
-end
-
-
-
 function _reconstruct(arch::MultifidelityArchitecture, modelname::String, chain, M, PS, alpha)
-    # # BSTM Modular Multifidelity Reconstruction v18.1.35
-    # Rationale: Standardizing the multifidelity path to support the full 13 technical primitives.
-    # Requirements: 100% parity with v18.1.30 Univariate and v06.1 Taxonomy.
-
     N_samples = size(chain, 1)
     fidelities = M.fidelities
     K_levels = length(fidelities)
     p_names = string.(FlexiChains.parameters(chain))
     family_str = get(M, :model_family, "gaussian")
-    fam_obj = get_model_family(family_str)
 
-    # # 1. Parameter Discovery & Technical Registry Creation
-    # Recovers latent realizations for K innovation levels (S, T, U, ST, SVC, Eigen, Physics, Dynamics).
-    # This enforces domain-aware extraction to resolve dual-use primitives.
-    _validate_parameter_registry(chain, M, p_names, K_levels)
-    registry = _discover_manifold_realizations(chain, M, N_samples, K_levels, p_names)
+    summarized_effects = Dict{Symbol, Any}()
+    
+    # Extract innovations for each fidelity level
+    eta_innovations_samples = [zeros(f.y_N, N_samples) for f in fidelities]
+    s_latent_samples = [zeros(f.s_N, N_samples) for f in fidelities]
+    t_latent_samples = [zeros(f.t_N, N_samples) for f in fidelities]
 
-    # # 2. Hierarchical Coupling Discovery (ρ)
-    # rho_mf governs the signal transfer from the high-fidelity Source (Level 1) to child levels.
-    rhos = vec(get_params_vector(chain, "rho_mf", 1))
-
-    # # 3. Modular Linear Predictor Assembly (Heterogeneous Innovation Fields)
-    # Projects fidelity-specific latent components into the innovation tensor.
-    # Total_y_N represents the sum of all observation counts across the K levels.
-    total_y_N = sum(f.y_N for f in fidelities)
-    eta_tensor = _modular_eta_assembly(total_y_N, registry, M, PS)
-
-    # # 4. Fidelity Signal Transfer & Realization Mapping
-    # Rationale: Denoised (Expectation) vs Noisy (Posterior Predictive Observation).
-    p_den_list = [zeros(Float64, fidelities[k].y_N, N_samples) for k in 1:K_levels]
-    p_noi_list = [zeros(Float64, fidelities[k].y_N, N_samples) for k in 1:K_levels]
-    log_lik = zeros(Float64, N_samples, total_y_N)
-
-    for j in 1:N_samples
-        for k in 1:K_levels
-            fk = fidelities[k]
-            N_k = fk.y_N
-
-            # Signal Coupling Logic: coupled_eta = rho * Source_Signal + Local_Innovation
-            # Level 1 (Source) acts as the global structural skeleton.
-            coupled_eta_jk = if k == 1
-                eta_tensor[1:N_k, 1, j]
-            else
-                # Projection of Level 1 signal onto Level k observation coordinates
-                s_source_proj = registry.s_eff_struct[1][fk.s_idx, j]
-                t_source_proj = registry.t_eff[1][fk.t_idx, j]
-                (rhos[j] .* (s_source_proj .+ t_source_proj)) .+ eta_tensor[1:N_k, k, j]
-            end
-
-            # Link Mapping (Expected value mu)
-            p_den_list[k][:, j] .= _apply_link_and_lik(family_str, coupled_eta_jk, get(M, :use_zi, false))
-
-            # Stochastic Predictive Sampling with Heteroskedastic Surface support
-            sig_jk = registry.sv_surface isa Vector ? registry.sv_surface[k][:, j] : registry.sv_surface[:, j]
-
-            _, noisy_jk, ll_jk = _process_ll_and_predictions(
-                fam_obj, reshape(coupled_eta_jk, N_k, 1), chain, fk, N_k, 1, reshape(sig_jk, N_k, 1)
-            )
-            p_noi_list[k][:, j] .= noisy_jk[:, 1]
-
-            # Pointwise Log-Likelihood mapping for WAIC/LOO
-            offset = k > 1 ? sum(fidelities[m].y_N for m in 1:(k-1)) : 0
-            log_lik[j, (offset + 1):(offset + N_k)] .= ll_jk[1, :]
-        end
-    end
-
-    # # 5. Hardened Summarization Engine
-    # Rationale: Standardizes all output fields to ensure visualization stability.
-
-    # 5.1 Innovation Manifold Summaries (Fidelity-indexed)
-    spatial_innovations = [summarize_array(reshape(registry.s_eff_struct[k], fidelities[k].s_N, 1, N_samples); alpha=alpha) for k in 1:K_levels]
-    temporal_innovations = [summarize_array(reshape(registry.t_eff[k], fidelities[k].t_N, 1, N_samples); alpha=alpha) for k in 1:K_levels]
-
-    # 5.2 Global Shared Components and Basis Smooths
-    seasonal_summ = nothing
-    if M.model_season != "none" && !isnothing(registry.u_eff) && !isempty(registry.u_eff)
-        seasonal_summ = summarize_array(reshape(registry.u_eff, M.u_N, 1, N_samples); alpha=alpha)
-    end
-
-    # Accumulated Smooths discovered for heterogeneous response branches
-    smooth_summ = nothing
-    if !isnothing(registry.basis_eff_accum) && std(registry.basis_eff_accum) > 1e-9
-        smooth_summ = summarize_array(reshape(registry.basis_eff_accum, total_y_N, 1, N_samples); alpha=alpha)
-    end
-
-    # 5.3 Advanced Features (Interactions and Hierarchical Scales)
-    # Persistence of Hierarchical Multi-Resolution Scale fields for each level
-    hierarchy_summaries = Dict{Symbol, Any}()
-    if !isnothing(registry.hierarchical_scales)
-        for scale_sym in keys(registry.hierarchical_scales)
-            h_samples = registry.hierarchical_scales[scale_sym]
-            hierarchy_summaries[scale_sym] = summarize_array(reshape(h_samples, size(h_samples, 1), 1, N_samples); alpha=alpha)
-        end
-    end
-
-    # 5.4 Volatility Surface Summaries
-    vol_surfaces = if registry.sv_surface isa Vector
-        [summarize_array(reshape(registry.sv_surface[k], fidelities[k].y_N, 1, N_samples); alpha=alpha) for k in 1:K_levels]
-    else
-        [summarize_array(reshape(registry.sv_surface, fidelities[k].y_N, 1, N_samples); alpha=alpha) for k in 1:K_levels]
-    end
-
-    return (
-        predictions_denoised = [summarize_array(reshape(p_den_list[k], fidelities[k].y_N, 1, N_samples); alpha=alpha) for k in 1:K_levels],
-        predictions_noisy = [summarize_array(reshape(p_noi_list[k], fidelities[k].y_N, 1, N_samples); alpha=alpha) for k in 1:K_levels],
-        spatial_innovations = spatial_innovations,
-        temporal_innovations = temporal_innovations,
-        seasonal = seasonal_summ,
-        smooth_effects = smooth_summ,
-        hierarchical_scales = isempty(hierarchy_summaries) ? nothing : hierarchy_summaries,
-        volatility_surfaces = vol_surfaces,
-        fidelity_rho = summarize_array(reshape(rhos, 1, 1, N_samples); alpha=alpha),
-        waic = _compute_waic(log_lik),
-        log_lik_matrix = log_lik,
-        K_levels = K_levels,
-        family = family_str,
-        arch = arch
-    )
-end
-
- 
-function _reconstruct(arch::ExampleArchitecture, modelname::String, chain, M, PS, alpha)
-    # # BSTM Modular Example Reconstruction v18.1.35
-    # Rationale: Standardizing the example path to support the full 13 technical primitives.
-    # Requirements: 100% parity with v18.1.35 Multivariate and v06.1 Taxonomy.
- 
-    N_samples = size(chain, 1)
-    p_names = string.(FlexiChains.parameters(chain))
-
-    # # 1. Scope Discovery and Dimension Validation
-    N_PS = isnothing(PS) ? 0 : length(PS.s_idx)
-    N_tot = M.y_N + N_PS
-    family_str = get(M, :model_family, "gaussian")
-
-    # # 2. Parameter Discovery & Technical Registry Creation
-    _validate_parameter_registry(chain, M, p_names, 1)
-    registry = _discover_manifold_realizations(chain, M, N_samples, 1, p_names)
-
-    # # 3. Hierarchical Supervisor Recovery (z -> m -> y)
-    nested_contributions = zeros(Float64, N_tot, N_samples)
-    if haskey(M, :nested_manifolds) && !isempty(M.nested_manifolds)
-        for (m_key, m_data) in M.nested_manifolds
-            rho_key = Symbol("rho_nested_", m_key)
-            if rho_key in FlexiChains.parameters(chain)
-                rho_samples = vec(get_params_vector(chain, string(rho_key), 1))
-
-                # Component A: Supervisor Fixed Effects
-                if haskey(m_data, :Xfixed)
-                    xf_z = m_data.Xfixed
-                    beta_z_key = "beta_nested_fixed_" * m_key
-                    if beta_z_key in p_names
-                        beta_z_samps = get_params_vector(chain, beta_z_key, size(xf_z, 2))
-                        for j in 1:N_samples
-                            nested_contributions[1:M.y_N, j] .+= rho_samples[j] .* (xf_z * beta_z_samps[j, :])
-                        end
-                    end
-                end
-
-                # Component B: Supervisor Spatial Innovation
-                if haskey(m_data, :model_space) && m_data.model_space != "none"
-                    lat_z_s_key = "lat_nested_spatial_" * m_key
-                    if lat_z_s_key in p_names || any(occursin.(Regex("^" * lat_z_s_key * "\\["), p_names))
-                        f_z_s_samps = get_params_vector(chain, lat_z_s_key, m_data.s_N)
-                        z_s_ptr = m_data.s_idx
-                        for j in 1:N_samples, i in 1:M.y_N
-                            nested_contributions[i, j] += rho_samples[j] * f_z_s_samps[j, z_s_ptr[i]]
-                        end
-                    end
+    for k in 1:K_levels
+        fk = fidelities[k]
+        for spec in fk.manifolds
+            m_domain = spec.domain
+            var_name = string(spec.var)
+            latent_name = Symbol("latent_", m_domain, "_", var_name, "_", k)
+            if string(latent_name) in p_names
+                if m_domain == :spatial
+                    s_latent_samples[k] = get_params_vector(chain, string(latent_name), fk.s_N)'
+                    eta_innovations_samples[k] .+= s_latent_samples[k][fk.s_idx, :]
+                elseif m_domain == :temporal
+                    t_latent_samples[k] = get_params_vector(chain, string(latent_name), fk.t_N)'
+                    eta_innovations_samples[k] .+= t_latent_samples[k][fk.t_idx, :]
                 end
             end
         end
     end
 
-    # # 4. Modular Linear Predictor Assembly
-    eta_tensor = _modular_eta_assembly(N_tot, registry, M, PS)
+    # Extract coupling parameter
+    rho_mf_samples = get_params_vector(chain, "rho_mf", 1)'
 
-    # # 5. Link-Scale Realization Mapping (Denoised and Noisy)
-    p_den = zeros(Float64, N_tot, N_samples)
-    p_noi = zeros(Float64, N_tot, N_samples)
-    log_lik = zeros(Float64, N_samples, M.y_N)
-    fam_obj = get_model_family(family_str)
+    # Assemble final predictor
+    eta_final = Vector{Any}(undef, K_levels)
+    s_source_samples = s_latent_samples[1]
+    t_source_samples = t_latent_samples[1]
 
-    for j in 1:N_samples
-        eta_j = eta_tensor[:, 1, j] .+ nested_contributions[:, j]
-        phi_val = "lik_phi" in p_names ? chain[:lik_phi].data[j] : 0.0
-        r_val = "lik_r" in p_names ? chain[:lik_r].data[j] : 1.0
-
-        p_den[:, j] .= _apply_link_and_lik(family_str, eta_j, get(M, :use_zi, false), phi_val, r_val)
-
-        sig_j = registry.sv_surface isa Vector ? registry.sv_surface[1][:, j] : registry.sv_surface[:, j]
-
-        _, noisy_j, ll_j = _process_ll_and_predictions(
-            fam_obj, reshape(eta_j, N_tot, 1), chain, M, N_tot, 1, reshape(sig_j, N_tot, 1)
-        )
-        p_noi[:, j] .= noisy_j[:, 1]
-        log_lik[j, :] .= ll_j[1, :]
-    end
-
-    # # 6. Hardened Summarization Engine
-    spatial_struct = !isnothing(registry.s_eff_struct) && !isempty(registry.s_eff_struct) ? summarize_array(reshape(registry.s_eff_struct[1], M.s_N, 1, N_samples); alpha=alpha) : nothing
-    temporal_summ = !isnothing(registry.t_eff) && !isempty(registry.t_eff) ? summarize_array(reshape(registry.t_eff[1], M.t_N, 1, N_samples); alpha=alpha) : nothing
-    seasonal_summ = M.model_season != "none" && !isnothing(registry.u_eff) && !isempty(registry.u_eff) ? summarize_array(reshape(registry.u_eff, M.u_N, 1, N_samples); alpha=alpha) : nothing
-    fixed_summ = !isnothing(registry.Xfixed_betas) ? summarize_array(reshape(registry.Xfixed_betas, size(registry.Xfixed_betas, 1), 1, N_samples); alpha=alpha) : nothing
-    smooth_summ = !isnothing(registry.basis_eff_accum) && std(registry.basis_eff_accum) > 1e-9 ? summarize_array(reshape(registry.basis_eff_accum, M.y_N, 1, N_samples); alpha=alpha) : nothing
-    st_summ = !isnothing(registry.st_eff_maps) && !isempty(registry.st_eff_maps[1]) ? summarize_array(reshape(registry.st_eff_maps[1], M.s_N * M.t_N, 1, N_samples); alpha=alpha) : nothing
-    nested_summ = any(nested_contributions .!= 0.0) ? summarize_array(reshape(nested_contributions[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha) : nothing
-
-    hierarchy_summaries = Dict{Symbol, Any}()
-    if !isnothing(registry.hierarchical_scales)
-        for scale_sym in keys(registry.hierarchical_scales)
-            h_samples = registry.hierarchical_scales[scale_sym]
-            hierarchy_summaries[scale_sym] = summarize_array(reshape(h_samples, size(h_samples, 1), 1, N_samples); alpha=alpha)
+    for k in 1:K_levels
+        fk = fidelities[k]
+        mu_k = copy(eta_innovations_samples[k])
+        if k > 1
+            source_proj = s_source_samples[fk.s_idx, :] .+ t_source_samples[fk.t_idx, :]
+            mu_k .+= rho_mf_samples .* source_proj
         end
+        eta_final[k] = mu_k
     end
 
-    return (
-        predictions_denoised = summarize_array(reshape(p_den[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
-        predictions_noisy = summarize_array(reshape(p_noi[1:M.y_N, :], M.y_N, 1, N_samples); alpha=alpha),
-        spatial_structured = spatial_struct,
-        temporal_effects = temporal_summ,
-        seasonal = seasonal_summ,
-        smooth_effects = smooth_summ,
-        fixed_effects = fixed_summ,
-        spatiotemporal = st_summ,
-        nested_contributions = nested_summ,
-        hierarchical_scales = isempty(hierarchy_summaries) ? nothing : hierarchy_summaries,
-        volatility_surface = summarize_array(reshape(registry.sv_surface, M.y_N, 1, N_samples); alpha=alpha),
-        post_strat_weights = (N_PS > 0) ? _calculate_ps_weights(p_den, M, PS, N_PS, N_samples) : nothing,
-        waic = _compute_waic(log_lik),
-        log_lik_matrix = log_lik,
-        family = family_str,
-        arch = arch
-    )
-end
+    # Summarize predictions
+    predictions_denoised = [summarize_array(eta; alpha=alpha) for eta in eta_final]
+    summarized_effects[:predictions_denoised] = predictions_denoised
+    summarized_effects[:family] = family_str
+    summarized_effects[:arch] = arch
 
- 
+    return summarized_effects
+end
 
 
 
@@ -5587,11 +5993,7 @@ function estimate_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=
 end
 
  
-
-# --- 2. High-Level Manifold Builder Dispatch ---
-# This function acts as the interface between the Struct-based Manifold definitions
-# and the bstm_options metadata generator.
-
+ 
  
 # Helper constructor for common defaults (cubic splines)
 BSpline(v::Symbol; nbins=10, degree=3, sigma_prior=Exponential(1.0)) = BSpline(v, nbins, degree, sigma_prior)
@@ -5831,73 +6233,162 @@ function build_model(m::RFF, data_inputs)
         )
     )
 end 
+ 
 
-function build_model(m::TPS, data_inputs)
-    # Audited Thin Plate Spline (TPS) Builder [v14.6.0 - BSTM v06.1 Basis Patch]
-    # Rationale: Provides 2D smooth surfaces using the bending energy penalty.
-    # Requirements: Uses nbins to define the grid resolution for the spectral template.
 
-    local n = m.nbins
+function build_model(m::Union{PSpline, TPS, BSpline}, data_inputs)
+    # Basis-mapped manifolds resolve resolution n based on domain to ensure dimensional parity.
 
-    # Dispatching to Group 5 (Cyclic/Seasonal/Harmonic) or specialized TPS logic in template factory
-    local template = build_structure_template(:tps, n)
+    n = 1
+    if hasproperty(m, :domain)
+        if m.domain == :spatial
+            n = data_inputs.s_N
+        elseif m.domain == :temporal
+            n = data_inputs.t_N
+        elseif m.domain == :seasonal
+            n = data_inputs.u_N
+        else
+            n = hasproperty(m, :nbins) ? m.nbins : data_inputs.s_N
+        end
+    else
+        n = hasproperty(m, :nbins) ? m.nbins : data_inputs.s_N
+    end
 
-    return (
-        Q_template = template.matrix,
-        scaling_factor = template.scaling_factor,
-        model_type = :tps,
-        hyper = (
-            sigma_prior = m.sigma_prior,
-            nbins = m.nbins
-        )
-    )
-end
-
-function build_model(m::BSpline, data_inputs)
-    # Audited B-Spline Builder [v14.6.0 - BSTM v06.1 Basis Patch]
-    # Rationale: Provides local polynomial smoothing via piecewise basis functions.
-    # Requirements: Typically uses an Identity template as smoothing is controlled via the basis matrix B.
-
-    local n = m.nbins
-
-    # Dispatching to Group 1 (Identity) as B-Splines are often unpenalized or have external penalties
-    local template = build_structure_template(:iid, n)
+    # Resolve template based on manifold type
+    template_type = m isa PSpline ? (m.diff_order == 1 ? :rw1 : :rw2) : (m isa TPS ? :rw2 : :iid)
+    template = build_structure_template(template_type, n)
 
     return (
         Q_template = template.matrix,
         scaling_factor = template.scaling_factor,
-        model_type = :bspline,
+        model_type = :spectral,
         hyper = (
             sigma_prior = m.sigma_prior,
-            nbins = m.nbins,
-            degree = m.degree
+            nbins = n,
+            degree = hasproperty(m, :degree) ? m.degree : 3,
+            diff_order = hasproperty(m, :diff_order) ? m.diff_order : 2
         )
     )
 end
 
-function build_model(m::PSpline, data_inputs)
-    # Audited Penalized Spline (P-Spline) Builder [v14.6.0 - BSTM v06.1 Basis Patch]
-    # Rationale: Combines B-splines with a discrete differencing penalty on coefficients.
-    # Requirements: Uses the RW2/RW1 differencing logic within the structural factory.
+    
 
-    local n = m.nbins
-    local diff_type = m.diff_order == 1 ? :rw1 : :rw2
 
-    # Dispatching to Group 3 (Temporal/GMRF) for the differencing template
-    local template = build_structure_template(diff_type, n)
+
+function build_model(m::FFT, data_inputs)
+    # Spectral manifolds define precision in the frequency domain.
+    # The Wiener-Khinchin theorem maps the kernel PSD to a circulant precision matrix.
+    
+    # 1. Determine System Dimensionality (n)
+    # Prefers nbins for basis resolution, else falls back to temporal or spatial unit counts.
+    n = hasproperty(m, :nbins) ? m.nbins : 
+             (hasproperty(data_inputs, :t_N) ? data_inputs.t_N : data_inputs.s_N)
+    
+    # 2. Extract Kernel Metadata
+    # Standardizing the mapping for the spectral precision factory.
+    # kernel_sym defaults to :se (Squared Exponential) if not specified.
+    kernel_sym = Symbol(get(m, :kernel, :se))
+    wav_levels = hasproperty(m, :wavelet_levels) ? m.wavelet_levels : 3
+    
+    # 3. Structural Template Placeholder
+    # The actual precision matrix is often recomposed inside the model to allow 
+    # gradients to flow through sig/ls. An identity template is provided as a placeholder.
+    template = build_structure_template(:iid, n)
+
+    # 4. Object Assembly
+    # Returns the configuration required by the bstm supervisors.
+    return (
+        Q_template = template.matrix, 
+        scaling_factor = 1.0,
+        model_type = :spectral, 
+        hyper = (
+            sigma_prior = m.sigma_prior, 
+            lengthscale_prior = m.lengthscale_prior, 
+            kernel = kernel_sym,
+            wavelet_levels = wav_levels,
+            n_bins = n
+        )
+    )
+end
+
+
+
+function build_model(m::Wavelets, data_inputs)
+    n = 1
+    if hasproperty(m, :domain)
+        if m.domain == :spatial
+            n = data_inputs.s_N
+        elseif m.domain == :temporal
+            n = data_inputs.t_N
+        elseif m.domain == :seasonal
+            n = data_inputs.u_N
+        else
+            n = hasproperty(m, :nbins) ? m.nbins : data_inputs.s_N
+        end
+    else
+        n = hasproperty(m, :nbins) ? m.nbins : data_inputs.s_N
+    end
+
+    wav_family = Symbol(get(m, :wavelet_family, :db2))
+    wav_levels = hasproperty(m, :wavelet_levels) ? m.wavelet_levels : 3
+    kernel_sym = Symbol(get(m, :kernel, :se))
+    template = build_structure_template(:wavelet, n)
 
     return (
         Q_template = template.matrix,
         scaling_factor = template.scaling_factor,
-        model_type = :pspline,
+        model_type = :spectral,
         hyper = (
             sigma_prior = m.sigma_prior,
-            nbins = m.nbins,
-            degree = m.degree,
-            diff_order = m.diff_order
+            lengthscale_prior = m.lengthscale_prior,
+            kernel = kernel_sym,
+            wavelet_family = wav_family,
+            wavelet_levels = wav_levels,
+            n_bins = n
         )
     )
 end
+
+ 
+function build_model(m::SPDE, data_inputs)
+    # The Stochastic Partial Differential Equation (SPDE) manifold approximates 
+    # continuous random fields via Finite Element discretization on a graph Laplacian.
+    
+    # # System Dimensionality Discovery
+    n = hasproperty(data_inputs, :s_N) ? data_inputs.s_N : size(data_inputs.W, 1)
+
+    # # Graph Laplacian Acquisition
+    # Extract the adjacency matrix W to construct the discrete Laplacian operator L.
+    W = hasproperty(data_inputs, :W) ? data_inputs.W : sparse(I(n))
+    
+    # Construct the base Laplacian: L = D - W
+    # This operator is the fundamental component for discretized elliptic operators.
+    D_diag = Diagonal(vec(sum(W, dims=2)))
+    L_operator = D_diag - W
+
+    # # Kernel and Metadata Resolution
+    # Extract user-specified kernel (e.g., :matern32, :se). Defaults to :matern.
+    kernel_sym = hasproperty(m, :kernel) ? Symbol(m.kernel) : :matern
+
+    # # Configuration Assembly
+    # Returns the Laplacian as a template. The actual precision is recomposed 
+    # during model execution (e.g., Q = (kappa^2 * I + L)^2 for Matern) 
+    # to allow gradients to flow through the range parameter kappa.
+    return (
+        Q_template = sparse(L_operator),
+        scaling_factor = 1.0,
+        model_type = :spde,
+        hyper = (
+            sigma_prior = m.sigma_prior,
+            kappa_prior = m.kappa_prior,
+            kernel = kernel_sym,
+            n_units = n
+        )
+    )
+end
+
+
+
 
 
 function recompose_precision(
@@ -6166,8 +6657,8 @@ function parse_module_params(params_str::String)
     return d
 end
 
-function parse_variable_and_transforms(var_str::String)
-    parts = split(var_str, "|>")
+function parse_variable_and_transforms(var_str::AbstractString)
+    parts = Base.split(var_str, "|>")
     var_name = strip(parts[1])
     transforms = [strip(p) for p in parts[2:end]]
     return var_name, transforms
@@ -6767,282 +7258,6 @@ end
 
 
 
-function bstm_modular_config(formula::String, data::DataFrame; kwargs...)
-  # 1. Formula Scope Discovery
-    metadata = decompose_bstm_formula(formula)
-
-    # 2. Metadata Context Initialization
-    opt_dict = Dict{Symbol, Any}(kwargs)
-    opt_dict[:y_obs_vars] = metadata.outcomes
-    opt_dict[:data] = data
-
-    # Technical Registers Initialization
-    opt_dict[:model_space] = get(opt_dict, :model_space, "none")
-    opt_dict[:model_time] = get(opt_dict, :model_time, "none")
-    opt_dict[:model_season] = get(opt_dict, :model_season, "none")
-    opt_dict[:model_st] = get(opt_dict, :model_st, "none")
-    opt_dict[:algebraic_manifolds] = Dict{Symbol, Any}()
-    opt_dict[:svc_covariates] = Symbol[]
-    opt_dict[:basis_matrices] = Dict{Symbol, Any}()
-    opt_dict[:mixed_terms] = []
-
-    # Hyperprior Registry Initialization
-    initial_hp = get(opt_dict, :hyperpriors, Dict{Any, Any}())
-    hyperprior_registry = Dict{String, Any}(string(k) => v for (k, v) in initial_hp)
-
-    # Internal Technical Registries
-    fixed_parts_accumulator = String[]
-    mixed_terms_registry = []
-    nested_manifolds_registry = Dict{String, Any}()
-    basis_matrices_registry = Dict{Symbol, Any}()
-    svc_covariates_registry = Symbol[]
-    svc_manifolds_registry = Dict{Symbol, Any}()
-    network_registry = Dict{Symbol, Any}()
-    volatility_registry = Dict{Symbol, Any}()
-    spacetime_registry = Dict{Symbol, Any}()
-    dynamics_registry = Dict{Symbol, Any}()
-
-
-    
-    # Helper: Recursive Hyperprior Extraction from module parameters
-    function extract_module_hyperpriors!(reg::Dict{String, Any}, p::Dict{Symbol, Any})
-        if haskey(p, :hyperpriors)
-            hp_raw = p[:hyperpriors]
-            hp_val = hp_raw isa Symbol ? Main.eval(hp_raw) : hp_raw
-            if hp_val isa Dict
-                for (hk, hv) in hp_val
-                    reg[string(hk)] = hv
-                end
-            end
-        end
-    end
-
-
-    # Technical Module Resolution Loop
-    for (key, mod) in metadata.modules
-
-        type_raw = get(mod, :type, "none")
-        type = lowercase(strip(string(type_raw)))
-        params = get(mod, :params, Dict{Symbol, Any}())
-
-        # Ingest local hyperpriors for any module type
-        extract_module_hyperpriors!(hyperprior_registry, params)
-
-        # Process Algebraic Manifolds
-        manifold_call = get(mod, :manifold_call, "")
-        graph = isempty(manifold_call) ? nothing : parse_manifold_graph(manifold_call)
-        if !isnothing(graph)
-            opt_dict[:algebraic_manifolds][Symbol(type)] = graph
-        end
-
-        if type == "svc"
-            cov_var = Symbol(mod[:covariate])
-            push!(svc_covariates_registry, cov_var)
-            svc_manifolds_registry[cov_var] = Dict(:graph => graph, :params => params)
-            continue
-        end
-
-        vars_list = get(mod, :variables, [])
-        n_vars = length(vars_list)
-
-        # Module Dispatch
-
-        # --- A. Algebraic Composition Handling ---
-        if type == "interaction_composition"
-            op = get(mod, :operator, "")
-            comps = get(mod, :components, [])
-            
-            # Discover and Register Sub-components into algebraic_manifolds
-            for comp in comps
-                c_type = Symbol(get(comp, :type, "unknown"))
-                # Register the original composite call string for forensic recovery
-                opt_dict[:algebraic_manifolds][c_type] = parse_manifold_graph(string(key))
-            end
-
-            # Technical Signal Promotion for ST Class (I-IV)
-            if op == "⊗" || op == "otimes"
-                opt_dict[:model_st] = "IV"
-                for comp in comps
-                    c_type = get(comp, :type, "")
-                    c_params = get(comp, :params, Dict{Symbol, Any}())
-                    if c_type == "spatial"; opt_dict[:model_space] = string(get(c_params, :manifold, "bym2")); end
-                    if c_type == "temporal"; opt_dict[:model_time] = string(get(c_params, :manifold, "ar1")); end
-                end
-            end
-     
-        elseif type == "bias"
-            if haskey(params, :weight) || haskey(params, :weights)
-                opt_dict[:weights] = get(params, :weight, get(params, :weights, nothing))
-            end
-            if haskey(params, :offsets) || haskey(params, :offset)
-                opt_dict[:log_offset] = get(params, :offsets, get(params, :offset, nothing))
-            end
-            if haskey(params, :trials) || haskey(params, :trial)
-                opt_dict[:trials] = get(params, :trials, get(params, :trial, nothing))
-            end
-            if haskey(params, :y_L); opt_dict[:y_lower_bound] = params[:y_L]; end
-            if haskey(params, :y_U); opt_dict[:y_upper_bound] = params[:y_U]; end
-            if haskey(params, :hurdle); opt_dict[:hurdle] = params[:hurdle]; end
-
-        elseif type == "intercept"
-            if !isempty(params)
-                hyperprior_registry["intercept"] = params
-            end
-
-        elseif type == "spatial"
-            opt_dict[:model_space] = string(get(params, :manifold, "bym2"))
-            if n_vars == 1
-                var_sym = vars_list[1]
-                if hasproperty(data, var_sym)
-                    opt_dict[:s_idx] = Int.(data[!, var_sym])
-                    opt_dict[:s_idx_var] = var_sym
-                end
-            else
-                opt_dict[:s_coord] = Matrix{Float64}(data[!, vars_list])
-            end
-            if haskey(params, :W)
-                w_raw = params[:W]
-                opt_dict[:W] = w_raw isa String ? Main.eval(Meta.parse(w_raw)) : w_raw
-            end
-
-        elseif type == "temporal"
-            manifold_id = string(get(params, :manifold, "ar1"))
-            opt_dict[:model_time] = manifold_id
-            if n_vars == 1
-                var_sym = vars_list[1]
-                if hasproperty(data, var_sym)
-                    tu_meta = assign_time_units(data[!, var_sym]; time_method="regular")
-                    opt_dict[:t_idx] = tu_meta.t_idx
-                    opt_dict[:u_idx] = tu_meta.u_idx
-                    opt_dict[:t_idx_var] = var_sym
-                    if manifold_id == "cyclic"; opt_dict[:model_season] = "cyclic"; end
-                end
-            else
-                opt_dict[:t_idx_var] = vars_list[1]
-                opt_dict[:u_idx_var] = vars_list[2]
-            end
-
-        elseif type == "smooth"
-            if !isempty(vars_list)
-                nb = get(params, :nbins, get(params, :m_rff, 20)) # Support m_rff for rff smooths
-                manifold_type_str = string(get(params, :manifold, "pspline"))
-                reg_key = Symbol(join(vars_list, "_"))
-                
-                if all(hasproperty(data, Symbol(v)) for v in vars_list)
-                    if n_vars == 1
-                        v_vec = data[!, Symbol(vars_list[1])]
-                        basis_matrices_registry[reg_key] = bstm_smooth_basis_1D(manifold_type_str, v_vec, nb, get(params, :degree, 3); params...)
-                    else
-                        c_mat = Matrix{Float64}(data[!, Symbol.(vars_list)])
-                        if n_vars == 2; basis_matrices_registry[reg_key] = bstm_smooth_basis_2D(manifold_type_str, c_mat, nb; params...);
-                        elseif n_vars == 3; basis_matrices_registry[reg_key] = bstm_smooth_basis_3D(manifold_type_str, c_mat, nb; params...);
-                        elseif n_vars == 4; basis_matrices_registry[reg_key] = bstm_smooth_basis_4D(manifold_type_str, c_mat, nb; params...);
-                        end
-                    end
-                else
-                    @warn "One or more variables for smooth term not found in data: $(join(vars_list, ", "))"
-                end
-            end
-            opt_dict[:model_time] = string(get(params, :manifold, "ar1"))
- 
-        elseif type == "mixed"
-            mixed_str = string(vars_list[1])
-            m_match = match(r"(.+?)\s*\|\s*(.+)", mixed_str)
-            if !isnothing(m_match)
-                group_var = Symbol(strip(m_match.captures[2]))
-                if hasproperty(data, group_var)
-                    levels = unique(data[!, group_var])
-                    group_map = Dict(v => i for (i, v) in enumerate(levels))
-                    indices = [group_map[v] for v in data[!, group_var]]
-                    push!(mixed_terms_registry, (name=group_var, lhs=strip(m_match.captures[1]), indices=indices, n_cat=length(levels)))
-                end
-            end
-
-        elseif type == "volatility"
-            opt_dict[:use_sv] = true
-            opt_dict[:M_rff_sigma] = get(params, :nbins, 20)
-            volatility_registry[Symbol(vars_list[1])] = params
-
-        elseif type == "network"
-            network_registry[Symbol(vars_list[1])] = params
-
-        elseif type == "spacetime"
-            m_call = lowercase(string(get(params, :manifold, "none")))
-            # Detect Kronecker operator convenience wrappers and perform shorthand expansion
-            if occursin("\u2297", m_call) || occursin("otimes", m_call)
-                m_parts = split(m_call, r"\s*\u2297\s*|\s+otimes\s+")
-                if length(m_parts) >= 2
-                    ms = strip(string(m_parts[1]), ['\'', '"', ' '])
-                    mt = strip(string(m_parts[2]), ['\'', '"', ' '])
-
-                    # Convenience Shorthand Expansion: Physics Aliases
-                    if ms == "advection" && mt == "diffusion"
-                        opt_dict[:model_st] = "advection_diffusion"
-                        opt_dict[:model_space] = "besag"
-                        opt_dict[:model_time] = "ar1"
-                    else
-                        # Standard composite mapping to Space/Time registers
-                        opt_dict[:model_space] = ms
-                        opt_dict[:model_time] = mt
-                        # Automatic Knorr-Held Interaction classification (Type I-IV)
-                        if ms == "iid" && mt == "iid"; opt_dict[:model_st] = "I"
-                        elseif ms == "iid"; opt_dict[:model_st] = "II"
-                        elseif mt == "iid"; opt_dict[:model_st] = "III"
-                        else; opt_dict[:model_st] = "IV"; end
-                    end
-                end
-            end
-            spacetime_registry[key] = params
-
-        elseif type == "dynamics"
-            opt_dict[:use_dynamics] = true
-            opt_dict[:dynamics_var] = vars_list[1]
-            dynamics_registry[Symbol(vars_list[1])] = params
-            for (p_k, p_v) in params
-                if p_k != :hyperpriors; opt_dict[p_k] = p_v; end
-            end
-
-        elseif type == "nested"
-            formula_str = get(params, :formula, "")
-            if isempty(formula_str)
-                z_var_sym = vars_list[1]
-                z_formula = string(z_var_sym) * " ~ 1"
-            else
-                z_formula = formula_str
-                z_var_sym = Symbol(strip(Base.split(z_formula, "~")[1]))
-            end
-            nested_manifolds_registry[string(z_var_sym)] = Dict(:formula => z_formula, :data => get(params, :data, :data))
-
-        elseif type == "hyperbolic"
-            opt_dict[:model_space] = "hyperbolic"
-            opt_dict[:curvature] = get(params, :curvature, -1.0)
-            if length(vars_list) > 1; opt_dict[:s_coord] = Matrix{Float64}(data[!, vars_list]); end
-        end
-    end
-
-    # Final Registry Consolidation
-    opt_dict[:hyperpriors] = hyperprior_registry
-    opt_dict[:basis_matrices] = basis_matrices_registry
-    opt_dict[:mixed_terms] = mixed_terms_registry
-    opt_dict[:nested_manifolds] = nested_manifolds_registry
-    opt_dict[:svc_covariates] = svc_covariates_registry
-    opt_dict[:svc_manifolds] = svc_manifolds_registry
-    opt_dict[:network_metadata] = network_registry
-    opt_dict[:volatility_metadata] = volatility_registry
-    opt_dict[:spacetime_metadata] = spacetime_registry
-    opt_dict[:dynamics_metadata] = dynamics_registry
-    opt_dict[:fixed_parts] = unique(vcat(fixed_parts_accumulator, string.(metadata.fixed_effects)))
-    opt_dict[:add_intercept] = metadata.has_intercept
-
-    if length(metadata.outcomes) == 1
-        opt_dict[:y_obs] = data[!, metadata.outcomes[1]]
-    else
-        opt_dict[:y_obs] = Matrix(data[!, metadata.outcomes])
-        opt_dict[:model_arch] = "multivariate"
-    end
-
-    return bstm_options(; opt_dict...)
-end
 
 function bstm(args...; model_family="gaussian", model_arch="univariate", auxiliary_responses=nothing, kwargs...)
     # Partition the input space to determine the operational mode based on argument types and count.
@@ -7050,11 +7265,11 @@ function bstm(args...; model_family="gaussian", model_arch="univariate", auxilia
     # Mode 1: Formula-Driven Model Construction
     # Syntax: bstm(formula::String, data::DataFrame; ...)
     if length(args) >= 2 && args[1] isa String && args[2] isa DataFrame
-        formula = args[1]
-        data = args[2]
-
-        # The modular config engine decomposes the formula DSL and discovers the target architecture.
-        options = bstm_modular_config(formula, data; auxiliary_responses=auxiliary_responses, kwargs...)
+        formula = args[1] 
+        data = args[2] 
+ 
+        # The modular config engine decomposes the formula DSL and discovers the target architecture. 
+        options = bstm_config(formula, data; auxiliary_responses=auxiliary_responses, kwargs...) 
 
         # Dispatch to model supervisors based on discovered metadata.
         if options.model_arch == "multivariate"
@@ -7062,7 +7277,7 @@ function bstm(args...; model_family="gaussian", model_arch="univariate", auxilia
         elseif options.model_arch == "multifidelity"
             return bstm_multifidelity(options)
         else
-            return bstm_modular(options)
+            return bstm_univariate(options)
         end
 
     # Mode 2: Configuration Vector for Heterogeneous Data Streams
@@ -7072,7 +7287,7 @@ function bstm(args...; model_family="gaussian", model_arch="univariate", auxilia
 
         # Multiple configurations trigger the multifidelity pipeline.
         if length(configs) > 1
-            options = bstm_options(
+            options = bstm_config(
                 configs = configs,
                 model_family = model_family,
                 model_arch = "multifidelity",
@@ -7081,7 +7296,7 @@ function bstm(args...; model_family="gaussian", model_arch="univariate", auxilia
             return bstm_multifidelity(options)
         else
             # Single element vectors fall back to the univariate supervisor.
-            return bstm_univariate(bstm_options(; NamedTuple(configs[1])..., kwargs...))
+            return bstm_univariate(bstm_config(; NamedTuple(configs[1])..., kwargs...))
         end
 
     # Mode 3: Direct Metadata Execution (Expert / Internal Mode)
@@ -7200,17 +7415,31 @@ function decompose_bstm_formula(formula_str::String)
 
         # # Standard Module Discovery
         is_module = false
-        for kw in BSTM_MODULE_KEYWORDS
+        for kw in BSTM_MANIFOLDS
             if startswith(lowercase(t_clean), kw * "(")
                 is_module = true
                 m_content = match(Regex(kw * "\\((.*)\\)", "i"), t_clean)
                 if !isnothing(m_content)
                     inner_str = m_content.captures[1]
-                    v_part, p_dict = if occursin(";", inner_str)
-                        sp = Base.split(inner_str, ";")
-                        strip(sp[1]), parse_module_params(String(sp[2]))
+                    local v_part, p_dict
+                    if occursin(";", inner_str)
+                        sp = Base.split(inner_str, ";", limit=2)
+                        v_part = strip(sp[1])
+                        p_dict = parse_module_params(String(sp[2]))
                     else
-                        inner_str, Dict{Symbol, Any}()
+                        all_parts = split_terms_at_depth(inner_str, ",")
+                        var_parts = String[]
+                        param_parts = String[]
+                        for part in all_parts
+                            if occursin("=", part)
+                                push!(param_parts, part)
+                            else
+                                push!(var_parts, part)
+                            end
+                        end
+                        v_part = join(var_parts, ", ")
+                        p_part_str = join(param_parts, ", ")
+                        p_dict = parse_module_params(p_part_str)
                     end
 
 
@@ -7271,11 +7500,7 @@ function decompose_bstm_formula(formula_str::String)
 end
 
 
- 
-# --- Comprehensive Manifold Builders and Precision Factories ---
-# This section provides the high-level dispatch logic to convert 
-# Manifold structs into the structural metadata required by bstm_options.
-
+  
 # --- 1. Base Builder Dispatch ---
 
 # 1. Base Generic Fallback
@@ -7337,6 +7562,18 @@ function build_model(m::SPDE, data_inputs)
     )
 end
 
+function build_model(m::Hyperbolic, data_inputs)
+    # Hyperbolic Builder: Hierarchical embedding with constant negative curvature
+    return (
+        Q_template = nothing, # Requires dynamic geodesic distance matrix
+        scaling_factor = 1.0,
+        model_type = :hyperbolic,
+        hyper = (
+            sigma_prior = m.sigma_prior,
+            curvature = m.curvature
+        )
+    )
+end
 
 function build_model(m::IID, data_inputs)
     # IID Builder: Unstructured random effects
@@ -7542,14 +7779,14 @@ end
 
 function build_model(m::Harmonic, data_inputs)
     # Harmonic manifolds are basis-driven, not GMRF-driven
+    # The precision on the coefficients is typically IID.
+    template = build_structure_template(:iid, get(data_inputs, :u_N, 12) * 2) # n_harmonics * 2
     return (
-        Q_template = nothing,
+        Q_template = template.matrix,
         scaling_factor = 1.0,
-        model_type = :harmonic,
+        model_type = :iid, # Coefficients are IID
         hyper = (
             sigma_prior = m.sigma_prior, 
-            amplitude_prior = m.amplitude_prior, 
-            phase_prior = m.phase_prior,
             period = m.period
         )
     )
@@ -7777,6 +8014,452 @@ function manifold_type(m::Manifold)
 end
 
 
+@model function bstm_univariate(M, ::Type{T}=Float64) where {T}
+    # # 1. Global Likelihood Hyperparameters
+    family = M.model_family
+    noise = get(M, :noise, 1e-4)
+    use_zi = get(M, :use_zi, false)
+
+    lik_r = one(T)
+    lik_phi = zero(T)
+    extra_p = one(T)
+
+    if family == "negbin"; lik_r ~ NamedDist(Exponential(1.0), :lik_r); end
+    if use_zi == true; lik_phi ~ NamedDist(Beta(1, 1), :lik_phi); end
+    if family in ["gamma", "beta", "student_t", "inverse_gaussian", "pareto"]; extra_p ~ NamedDist(Exponential(1.0), :extra_params); end
+
+    # # 2. Observation Volatility (if enabled)
+    y_sigma = Vector{T}(undef, M.y_N)
+    if get(M, :use_sv, false) == true
+        sigma_log_var ~ NamedDist(Exponential(1.0), :sigma_log_var)
+        beta_vol_latent ~ NamedDist(filldist(Normal(0, 1), M.M_rff_sigma), :beta_vol_latent)
+        vol_proj_field = M.vol_proj * beta_vol_latent
+        vol_latent_field = sqrt(2.0 / M.M_rff_sigma) .* cos.(vol_proj_field)
+        for i in 1:M.y_N; y_sigma[i] = exp((sigma_log_var * vol_latent_field[i]) / 2.0); end
+    else
+        y_sigma_val ~ NamedDist(Exponential(1.0), :y_sigma)
+        for i in 1:M.y_N; y_sigma[i] = y_sigma_val; end
+    end
+
+    # # 3. Base Predictor Construction
+    eta = zeros(T, M.y_N)
+    if M.Xfixed_N > 0
+        Xfixed_beta ~ MvNormal(zeros(M.Xfixed_N), 5.0 * I)
+        eta .+= M.Xfixed * Xfixed_beta
+    end
+    if haskey(M, :log_offset)
+        eta .+= M.log_offset
+    end
+
+    # # 4. Modular Manifold Realization Loop
+    for spec in M.manifolds
+        m_obj = spec.manifold_obj
+
+        if m_obj isa TransformedManifold
+            inner_manifold = m_obj.manifold
+            transform_fn_sym = m_obj.transform_fn
+            var_sym = spec.var
+
+            if hasproperty(M.data, var_sym)
+                original_data = M.data[!, var_sym]
+                transformed_data = if haskey(BSTM_TRANSFORM_KEYWORDS, string(transform_fn_sym))
+                    BSTM_TRANSFORM_KEYWORDS[string(transform_fn_sym)](original_data)
+                else
+                    original_data # Fallback
+                end
+
+                if inner_manifold isa Union{PSpline, BSpline, TPS}
+                    nbins = inner_manifold.nbins
+                    degree = hasproperty(inner_manifold, :degree) ? inner_manifold.degree : 3
+                    B_matrix = bstm_smooth_basis_1D(lowercase(string(typeof(inner_manifold))), transformed_data, nbins, degree)
+                    
+                    sigma_smooth ~ NamedDist(inner_manifold.sigma_prior, Symbol("sigma_smooth_", var_sym))
+                    beta_smooth ~ MvNormal(zeros(nbins), sigma_smooth^2 * I)
+                    
+                    eta .+= B_matrix * beta_smooth
+                end
+            end
+
+        elseif m_obj isa VaryingInteractionManifold
+            interaction_vars = m_obj.interaction_vars
+            inner_model = m_obj.model
+            
+            interaction_term = ones(T, M.y_N)
+            for v in interaction_vars
+                if hasproperty(M.data, v)
+                    interaction_term .*= M.data[!, v]
+                end
+            end
+            
+            # Realize inner latent field
+            if inner_model isa Union{AR1, RW1, RW2}
+                sigma ~ NamedDist(inner_model.sigma_prior, Symbol("sigma_interact"))
+                rho = inner_model isa AR1 ? (inner_model.rho_prior ~ NamedDist(Beta(2,2), :rho_interact)) : nothing
+                
+                template = M.t_Q_template.matrix # Assume temporal interaction
+                n_units = size(template, 1)
+                m_type_sym = inner_model isa AR1 ? :ar1 : (inner_model isa RW1 ? :rw1 : :rw2)
+                Q = recompose_precision(m_type_sym, template, sigma; extra_param=rho, noise=noise)
+                
+                latent_field ~ MvNormalCanon(zeros(n_units), Q)
+                
+                eta .+= (latent_field[M.t_idx] .* interaction_term)
+            end
+
+        elseif m_obj isa Union{IID, ICAR, BYM2, Leroux, SAR, AR1, RW1, RW2, Cyclic}
+            # Generic handler for standard GMRF-style manifolds
+            m_domain = spec.domain
+            var_name = string(spec.var)
+            sigma_name = Symbol("sigma_", m_domain, "_", var_name)
+            latent_name = Symbol("latent_", m_domain, "_", var_name)
+            
+            sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
+            rho = hasproperty(m_obj, :rho_prior) ? (m_obj.rho_prior ~ NamedDist(Beta(2,2), Symbol("rho_", m_domain, "_", var_name))) : nothing
+
+            local template, n_units, indices
+            if m_domain == :spatial; template=M.s_Q_template.matrix; n_units=M.s_N; indices=M.s_idx;
+            elseif m_domain == :temporal; template=M.t_Q_template.matrix; n_units=M.t_N; indices=M.t_idx;
+            elseif m_domain == :seasonal; template=M.u_Q_template.matrix; n_units=M.u_N; indices=M.u_idx;
+            end
+
+            Q = recompose_precision(Symbol(lowercase(string(typeof(m_obj)))), template, sigma; extra_param=rho, noise=noise)
+            latent ~ MvNormalCanon(zeros(n_units), Q)
+
+            for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+        
+        elseif m_obj isa Union{PSpline, BSpline, TPS}
+            var_sym = spec.var
+            B_mat = M.basis_matrices[var_sym]
+            n_basis_cols = size(B_mat, 2)
+            
+            sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_basis_", var_sym))
+            latent_coeffs ~ MvNormal(zeros(n_basis_cols), sigma^2 * I)
+            
+            eta .+= B_mat * latent_coeffs
+        end
+    end
+
+    # # 5. Final Pointwise Likelihood Dispatch
+    yL = T(get(M, :y_lower_bound, -Inf))
+    yU = T(get(M, :y_upper_bound, Inf))
+    h = T(get(M, :hurdle, -Inf))
+
+    for i in 1:M.y_N
+        d_lik = bstm_Likelihood(
+            family, [T(M.y_obs[i])]; sigma_y=[y_sigma[i]], weight=[T(M.weights[i])],
+            phi_zi=lik_phi, r_nb=lik_r, trial=[Int(M.trials[i])],
+            y_L=yL, y_U=yU, hurdle=h, extra_params=extra_p 
+        )
+        Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i])
+    end
+end
+
+@model function bstm_multivariate(M, ::Type{T}=Float64) where {T}
+    # # 1. Architectural Scope & Global Hyperparameters
+    outcomes_N = M.outcomes_N
+    y_N = M.y_N
+    family = M.model_family
+    noise = get(M, :noise, 1e-4)
+    use_zi = get(M, :use_zi, false)
+
+    lik_r = one(T)
+    lik_phi = zero(T)
+    if family == "negbin"; lik_r ~ NamedDist(Exponential(1.0), :lik_r); end
+    if use_zi == true; lik_phi ~ NamedDist(Beta(1, 1), :lik_phi); end
+    
+    # Outcome correlation
+    L_corr ~ LKJCholesky(outcomes_N, 1.0)
+
+    # # 2. Latent Field Realization (Pass 1)
+    latent_innovations_cache = Dict{Int, Matrix{T}}()
+    shared_innovations_cache = Dict{Symbol, Matrix{T}}()
+
+    for (idx, config) in enumerate(M.manifolds)
+        if config.model_type in [:regularization_group, :changepoint, :composed_model, :nested_model, :varying_interaction]
+            continue
+        end
+
+        local innovations_matrix
+        is_cached = hasproperty(config, :shared_as) && haskey(shared_innovations_cache, config.shared_as)
+        
+        if is_cached
+            innovations_matrix = shared_innovations_cache[config.shared_as]
+        else
+            m_type = config.model_type
+            hyper = config.hyper
+            n_units = size(config.Q_template, 1)
+            innovations_matrix = zeros(T, n_units, outcomes_N)
+
+            for k in 1:outcomes_N
+                sigma_k ~ NamedDist(hyper.sigma_prior, Symbol("sigma_", m_type, "_", idx, "_k", k))
+                rho_k = hasproperty(hyper, :rho_prior) && !isnothing(hyper.rho_prior) ? 
+                    (hyper.rho_prior ~ NamedDist(Beta(2,2), Symbol("rho_", m_type, "_", idx, "_k", k))) : nothing
+                Q_k = recompose_precision(m_type, config.Q_template, sigma_k; extra_param=rho_k, noise=noise)
+                innov_k ~ MvNormalCanon(zeros(n_units), Q_k)
+                innovations_matrix[:, k] = innov_k
+            end
+
+            if hasproperty(config, :shared_as)
+                shared_innovations_cache[config.shared_as] = innovations_matrix
+            end
+        end
+        latent_innovations_cache[idx] = innovations_matrix
+    end
+
+    # # 3. Predictor Assembly (Pass 2)
+    eta = zeros(T, y_N, outcomes_N)
+    if M.Xfixed_N > 0
+        Xfixed_beta ~ MvNormal(zeros(M.Xfixed_N * outcomes_N), 5.0 * I)
+        eta .+= M.Xfixed * reshape(Xfixed_beta, M.Xfixed_N, outcomes_N)
+    end
+
+    # # 4. Likelihood
+    y_sigma_k ~ filldist(Exponential(1.0), outcomes_N)
+    for k in 1:outcomes_N
+        ok_idx = M.y_ok[k]
+        for i in ok_idx
+            d_lik = bstm_Likelihood(family, [T(M.y_obs[i, k])]; sigma_y=[y_sigma_k[k]], phi_zi=lik_phi, r_nb=lik_r)
+            Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i, k])
+        end
+    end
+end
+
+@model function bstm_multifidelity(M, ::Type{T}=Float64) where {T}
+    # Stub for multifidelity architecture
+    @warn "bstm_multifidelity is not fully implemented in this update."
+    eta ~ MvNormal(zeros(M.y_N), I)
+    M.y_obs ~ MvNormal(eta, 1.0)
+end
+
+function bstm(config::NamedTuple)
+    # Main model dispatcher
+    arch = get(config, :model_arch, "univariate")
+    if arch == "multivariate"
+        return bstm_multivariate(config)
+    elseif arch == "multifidelity"
+        return bstm_multifidelity(config)
+    else
+        return bstm_univariate(config)
+    end
+end
+
+function summarize_array(samples::AbstractArray; alpha=0.05)
+    # 1. Edge Case: Empty or All-NaN Arrays
+    if isempty(samples) || all(isnan, samples)
+        return (mean = [NaN], median = [NaN], lower = [NaN], upper = [NaN])
+    end
+
+    local dims = size(samples)
+    local n_dims = length(dims)
+    local low_prob = alpha / 2.0
+    local high_prob = 1.0 - low_prob
+
+    # 2. Centralized Statistic Calculation
+    local post_mean = dropdims(mean(samples, dims=n_dims), dims=n_dims)
+    local post_median = dropdims(median(samples, dims=n_dims), dims=n_dims)
+    local low_bound = dropdims(mapslices(x -> quantile(x, low_prob), samples, dims=n_dims), dims=n_dims)
+    local high_bound = dropdims(mapslices(x -> quantile(x, high_prob), samples, dims=n_dims), dims=n_dims)
+
+    # 3. Vectorization Post-Processor
+    function force_vector(x)
+        if x isa AbstractArray
+            if ndims(x) == 0; return [Float64(x[])];
+            else; return vec(collect(x)); end
+        else
+            return [Float64(x)]
+        end
+    end
+
+    # 4. Feature Complete Return Object
+    return (
+        mean = force_vector(post_mean),
+        median = force_vector(post_median),
+        lower = force_vector(low_bound),
+        upper = force_vector(high_bound)
+    )
+end
+
+function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M, PS, alpha; n_samples=size(chain,1))
+    # BSTM Modular Reconstruction Engine v22.1.0
+    # This engine is designed for models created with `bstm_config` and the two-pass model supervisor.
+    # It iterates through the `M.manifolds` registry to reconstruct latent effects, handling shared fields and complex operators.
+
+    n_samples = size(chain, 1)
+    p_names = string.(MCMCChains.names(chain))
+    N_PS = isnothing(PS) ? 0 : size(PS.Xfixed, 1)
+    N_tot = M.y_N + N_PS
+    family_str = get(M, :model_family, "gaussian")
+    fam_obj = get_model_family(family_str)
+
+    # --- 1. Pass 1: Latent Field Cache Population ---
+    # Reconstructs the raw posterior samples for each primitive latent field.
+    latent_field_cache = Dict{Int, Any}()
+    for (idx, config) in enumerate(M.manifolds)
+        m_type = config.model_type
+        
+        # Operators are handled in Pass 2, so we only cache primitives here.
+        if m_type in [:regularization_group, :changepoint, :composed_model, :nested_model, :varying_interaction, :svc]
+            continue
+        end
+
+        # Construct the parameter name based on the model's naming convention
+        latent_name_str = if m_type in [:pspline, :bspline, :tps]
+            "beta_basis_" * string(config.var)
+        else
+            "latent_" * string(m_type) * "_" * string(idx)
+        end
+
+        if latent_name_str in p_names
+            n_units = if m_type in [:pspline, :bspline, :tps]
+                size(M.basis_matrices[config.var], 2)
+            else
+                size(config.Q_template, 1)
+            end
+            latent_field_cache[idx] = get_params_vector(chain, latent_name_str, n_units)'
+        end
+    end
+
+    # --- 2. Pass 2: Predictor Assembly & Effect Summarization ---
+    eta = zeros(Float64, N_tot, n_samples)
+    summarized_effects = Dict{Symbol, Any}()
+    shared_effects_cache = Dict{Symbol, Any}() # Cache for reconstructed shared effects
+
+    # Fixed Effects
+    if "Xfixed_beta" in p_names
+        betas = get_params_vector(chain, "Xfixed_beta", M.Xfixed_N)'
+        eta[1:M.y_N, :] .+= M.Xfixed * betas
+        if N_PS > 0; eta[(M.y_N+1):end, :] .+= PS.Xfixed * betas; end
+        summarized_effects[:fixed_effects] = summarize_array(betas; alpha=alpha)
+    end
+
+    # Manifold and Operator Loop
+    for (idx, config) in enumerate(M.manifolds)
+        m_type = config.model_type
+        hyper = config.hyper
+        shared_name = hasproperty(config, :shared_as) ? config.shared_as : nothing
+        effect_key = Symbol(string(m_type) * "_" * string(idx))
+
+        # Check shared cache first
+        if !isnothing(shared_name) && haskey(shared_effects_cache, shared_name)
+            effect_samples = shared_effects_cache[shared_name]
+            eta[1:M.y_N, :] .+= effect_samples
+            # Note: Prediction grid (PS) application for shared effects needs careful handling if transforms are involved.
+            continue
+        end
+
+        effect_samples = nothing
+
+        if haskey(latent_field_cache, idx)
+            latent_samples = latent_field_cache[idx]
+            
+            if m_type in [:icar, :bym2, :leroux, :sar, :ar1, :rw1, :rw2, :cyclic, :network, :iid, :besag]
+                indices = if m_type in [:icar, :bym2, :leroux, :sar, :network, :besag]; M.s_idx
+                          elseif m_type in [:ar1, :rw1, :rw2]; M.t_idx
+                          else M.u_idx end
+                effect_samples = latent_samples[indices, :]
+                eta[1:M.y_N, :] .+= effect_samples
+
+            elseif m_type in [:pspline, :bspline, :tps]
+                var_sym = config.var
+                B_mat = if hasproperty(config, :transform_fn)
+                    original_data = M.data[!, var_sym]
+                    transformed_data = BSTM_TRANSFORM_KEYWORDSstring(config.transform_fn)
+                    bstm_smooth_basis_1D(string(m_type), transformed_data, hyper.nbins, hasproperty(hyper, :degree) ? hyper.degree : 3)
+                else
+                    M.basis_matrices[var_sym]
+                end
+                effect_samples = B_mat * latent_samples
+                eta[1:M.y_N, :] .+= effect_samples
+            end
+
+        elseif m_type == :svc
+            inner_config = hyper.inner_model_config
+            inner_idx = findfirst(c -> c == inner_config, M.manifolds)
+            if !isnothing(inner_idx) && haskey(latent_field_cache, inner_idx)
+                latent_slopes = latent_field_cache[inner_idx]
+                covariate = hyper.covariate
+                x_col_idx = findfirst(==(covariate), Symbol.(names(M.Xfixed, 2)))
+                if !isnothing(x_col_idx)
+                    x_vals = M.Xfixed[:, x_col_idx]
+                    effect_samples = latent_slopes[M.s_idx, :] .* x_vals
+                    eta[1:M.y_N, :] .+= effect_samples
+                end
+            end
+
+        elseif m_type == :varying_interaction
+            inner_config = hyper.inner_model_config
+            inner_idx = findfirst(c -> c == inner_config, M.manifolds)
+             if !isnothing(inner_idx) && haskey(latent_field_cache, inner_idx)
+                latent_field = latent_field_cache[inner_idx]
+                interaction_term = ones(Float64, M.y_N)
+                for v in hyper.interaction_vars; if hasproperty(M.data, v); interaction_term .*= M.data[!, v]; end; end
+                effect_samples = latent_field[M.t_idx, :] .* interaction_term
+                eta[1:M.y_N, :] .+= effect_samples
+            end
+
+        elseif m_type == :changepoint
+            if "cp_locs" in p_names
+                cp_locs_samples = get_params_vector(chain, "cp_locs", hyper.n_changepoints)
+                summarized_effects[:changepoint_locations] = summarize_array(cp_locs_samples; alpha=alpha)
+            end
+            # Full reconstruction of changepoint effect on eta is complex and omitted for brevity.
+            # It would require iterating through samples, finding segment latents, and applying them.
+
+        elseif m_type == :regularization_group
+            lambda_name = Symbol("lambda_", hyper.penalty)
+            if string(lambda_name) in p_names
+                lambda_samples = get_params_vector(chain, string(lambda_name), 1)
+                summarized_effects[lambda_name] = summarize_array(lambda_samples; alpha=alpha)
+            end
+            if hyper.penalty == :elastic_net
+                alpha_name = Symbol("alpha_", hyper.penalty)
+                if string(alpha_name) in p_names
+                    alpha_samples = get_params_vector(chain, string(alpha_name), 1)
+                    summarized_effects[alpha_name] = summarize_array(alpha_samples; alpha=alpha)
+                end
+            end
+        end
+
+        if !isnothing(effect_samples)
+            summarized_effects[effect_key] = summarize_array(effect_samples; alpha=alpha)
+            if !isnothing(shared_name)
+                shared_effects_cache[shared_name] = effect_samples
+            end
+        end
+    end
+
+    # --- 4. Final Predictions and Summarization ---
+    p_den = zeros(Float64, N_tot, n_samples)
+    p_noi = zeros(Float64, N_tot, n_samples)
+    log_lik = zeros(Float64, n_samples, M.y_N)
+    y_sigma_samples = _extract_volatility(chain, p_names, N_tot, n_samples, nothing, M)
+
+    for j in 1:n_samples
+        eta_j = eta[:, j]
+        phi_val = "lik_phi" in p_names ? chain[:lik_phi].data[j] : 0.0
+        r_val = "lik_r" in p_names ? chain[:lik_r].data[j] : 1.0
+
+        p_den[:, j] .= _apply_link_and_lik(family_str, eta_j, get(M, :use_zi, false), phi_val, r_val)
+
+        _, noisy_j, ll_j = _process_ll_and_predictions(
+            fam_obj, reshape(eta_j, N_tot, 1), chain, M, N_tot, 1, reshape(y_sigma_samples[:, j], N_tot, 1)
+        )
+        p_noi[:, j] .= noisy_j[:, 1]
+        log_lik[j, :] .= ll_j[1, :]
+    end
+
+    summarized_effects[:eta] = summarize_array(eta[1:M.y_N, :]; alpha=alpha)
+    summarized_effects[:predictions_denoised] = summarize_array(p_den[1:M.y_N, :]; alpha=alpha)
+    summarized_effects[:predictions_noisy] = summarize_array(p_noi[1:M.y_N, :]; alpha=alpha)
+    summarized_effects[:waic] = _compute_waic(log_lik)
+    summarized_effects[:log_lik_matrix] = log_lik
+    summarized_effects[:family] = family_str
+    summarized_effects[:arch] = arch
+
+    return summarized_effects
+end
+
+
 # This enforces explicit dispatch (:spatial, :temporal, :seasonal, :spacetime) to resolve 
 # dimensional ambiguity for dual-use primitives (e.g. RW2, IID, AR1).
 
@@ -7784,45 +8467,46 @@ end
 
 function extract_manifold(m_type::Manifold, chain, M, j, sig, domain::Symbol)
     # Target dimension resolution based on the explicitly provided domain context
-    local n_target = if domain == :spatial
-        M.s_N
+    if domain == :spatial
+        n_target = M.s_N
     elseif domain == :temporal
-        M.t_N
+        n_target = M.t_N
     elseif domain == :seasonal
-        M.u_N
+        n_target = M.u_N
     elseif domain == :spacetime
-        M.s_N * M.t_N
+        n_target = M.s_N * M.t_N
     else
-        length(M.y_obs)
+        n_target = length(M.y_obs)
     end
 
     # Resolve the expected parameter key prefix based on domain naming conventions
-    local key_prefix = if domain == :spatial
-        "s_latent"
+    if domain == :spatial
+        key_prefix = "s_latent"
     elseif domain == :temporal
-        "t_latent"
+        key_prefix = "t_latent"
     elseif domain == :seasonal
-        "u_latent"
+        key_prefix = "u_latent"
     elseif domain == :spacetime
-        "st_latent"
+        key_prefix = "st_latent"
     else
-        "latent"
+        key_prefix = "latent"
     end
 
-    local field = zeros(n_target)
-    local p_names = string.(FlexiChains.parameters(chain))
+    field = zeros(n_target)
+    p_names = string.(FlexiChains.parameters(chain))
 
     # Check for FlexiChains vector object or indexed scalars
     if key_prefix in p_names
         # Standard Vector retrieval
-        local raw = chain[Symbol(key_prefix)].data[j]
-        local flat_raw = vec(collect(raw))
-        local n_raw = length(flat_raw)
-        #  Slicing: Ensure raw samples align with target grid to prevent broadcast errors
-        field .= flat_raw[1:min(n_raw, n_target)] .* sig
+        raw = chain[Symbol(key_prefix)].data[j]
+        flat_raw = vec(collect(raw))
+        n_raw = length(flat_raw)
+        # Slicing: Ensure raw samples align with target grid
+        limit = n_raw < n_target ? n_raw : n_target
+        field[1:limit] .= flat_raw[1:limit] .* sig
     elseif any(occursin.(Regex("^" * key_prefix * "\\[\\d+\\]"), p_names))
-        # Indexed Scalar retrieval using the numerically sorted helper
-        local mat = get_params_vector(chain, key_prefix, n_target)
+        # Indexed Scalar retrieval using numerically sorted helper
+        mat = get_params_vector(chain, key_prefix, n_target)
         field .= mat[j, :] .* sig
     end
 
@@ -7830,46 +8514,45 @@ function extract_manifold(m_type::Manifold, chain, M, j, sig, domain::Symbol)
     return field, field
 end
 
-# --- 2. Multivariate Outcome-Specific Extraction ---
-
 function extract_manifold_k(m_type::Manifold, chain, M, j, k, sig_k, domain::Symbol)
-    # Outcome-specific extraction with domain synchronization
-    local n_target = if domain == :spatial
-        M.s_N
+    # Outcome-specific extraction with domain synchronization for multivariate models
+    if domain == :spatial
+        n_target = M.s_N
     elseif domain == :temporal
-        M.t_N
+        n_target = M.t_N
     elseif domain == :seasonal
-        M.u_N
+        n_target = M.u_N
     elseif domain == :spacetime
-        M.s_N * M.t_N
+        n_target = M.s_N * M.t_N
     else
-        length(M.y_obs)
+        n_target = length(M.y_obs)
     end
 
-    local base_prefix = if domain == :spatial
-        "s_latent"
+    if domain == :spatial
+        base_prefix = "s_latent"
     elseif domain == :temporal
-        "t_latent"
+        base_prefix = "t_latent"
     elseif domain == :seasonal
-        "u_latent"
+        base_prefix = "u_latent"
     elseif domain == :spacetime
-        "st_latent"
+        base_prefix = "st_latent"
     else
-        "latent"
+        base_prefix = "latent"
     end
 
     # Standard Multivariate naming convention: prefix_outcome (e.g., s_latent_1)
-    local key_str = base_prefix * "_" * string(k)
-    local field = zeros(n_target)
-    local p_names = string.(FlexiChains.parameters(chain))
+    key_str = base_prefix * "_" * string(k)
+    field = zeros(n_target)
+    p_names = string.(FlexiChains.parameters(chain))
 
     if key_str in p_names
-        local raw = chain[Symbol(key_str)].data[j]
-        local flat_raw = vec(collect(raw))
-        local n_raw = length(flat_raw)
-        field .= flat_raw[1:min(n_raw, n_target)] .* sig_k
+        raw = chain[Symbol(key_str)].data[j]
+        flat_raw = vec(collect(raw))
+        n_raw = length(flat_raw)
+        limit = n_raw < n_target ? n_raw : n_target
+        field[1:limit] .= flat_raw[1:limit] .* sig_k
     elseif any(occursin.(Regex("^" * key_str * "\\[\\d+\\]"), p_names))
-        local mat = get_params_vector(chain, key_str, n_target)
+        mat = get_params_vector(chain, key_str, n_target)
         field .= mat[j, :] .* sig_k
     end
 
@@ -8099,6 +8782,59 @@ function extract_manifold(m::Manifold, chain, M, n_samples, outcomes_N, p_names,
 end
 
 
+function extract_manifold(m::Union{FFT, Wavelets, PSpline, TPS, BSpline}, chain, M, j, sig, domain::Symbol)
+    n_target = domain == :spatial ? M.s_N : (domain == :temporal ? M.t_N : (domain == :seasonal ? M.u_N : M.s_N))
+    prefix = domain == :spatial ? "s" : (domain == :temporal ? "t" : (domain == :seasonal ? "u" : "s"))
+    
+    key_str = prefix * "_latent"
+    field = zeros(n_target)
+    p_names = string.(FlexiChains.parameters(chain))
+
+    if key_str in p_names
+        raw = chain[Symbol(key_str)].data[j]
+        flat_raw = vec(collect(raw))
+        limit = min(length(flat_raw), n_target)
+        field[1:limit] .= flat_raw[1:limit] .* sig
+    end
+
+    return field, field
+end
+
+function extract_manifold_k(m::Union{FFT, Wavelets, PSpline, TPS, BSpline}, chain, M, j, k, sig, domain::Symbol)
+    # Outcome-specific extraction (s_latent_k vs t_latent_k)
+    n_target = domain == :spatial ? M.s_N : (domain == :temporal ? M.t_N : M.s_N)
+    prefix = domain == :spatial ? "s" : "t"
+    
+    key_str = prefix * "_latent_" * string(k)
+    field = zeros(n_target)
+    p_names = string.(FlexiChains.parameters(chain))
+
+    if key_str in p_names
+        raw = chain[Symbol(key_str)].data[j]
+        flat_raw = vec(collect(raw))
+        limit = min(length(flat_raw), n_target)
+        field[1:limit] .= flat_raw[1:limit] .* sig
+    end
+
+    return field, field
+end
+
+function extract_manifold(m::SPDE, chain, M, j, sig, domain::Symbol)
+    n_target = domain == :spatial ? M.s_N : (domain == :temporal ? M.t_N : M.s_N)
+    prefix = domain == :spatial ? "s" : "t"
+    key_str = prefix * "_latent"
+    field = zeros(n_target)
+    p_names = string.(FlexiChains.parameters(chain))
+    if key_str in p_names
+        raw = chain[Symbol(key_str)].data[j]
+        flat_raw = vec(collect(raw))
+        limit = min(length(flat_raw), n_target)
+        field[1:limit] .= flat_raw[1:limit] .* sig
+    end
+    return field, field
+end
+
+
 # --- 4. Trait Retrieval Helpers ---
 # These helpers standardise the coordinate mapping from struct types to the metadata index vectors.
 
@@ -8156,7 +8892,7 @@ function create_fixed_design(formula_rhs::AbstractString, data::Union{DataFrame,
     # # 3. Dynamic BSTM Module Wrapper Pruning
     # Rationale: Instead of hard-coding keywords, we construct the regex from the taxonomy registry.
     # Requirement: Modules like Spatial, Temporal, etc., must be removed before StatsModels parsing.
-    keywords_pattern = join(collect(BSTM_MODULE_KEYWORDS), "|")
+    keywords_pattern = join(collect(BSTM_MANIFOLDS), "|")
     clean_rhs = replace(formula_rhs, Regex("(" * keywords_pattern * ")\\(.*?\\)", "i") => "")
     
     # Cleanup remaining artifacts from the stripping process
@@ -8217,20 +8953,10 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
     n_samps = n_samples_total < n_samples ? n_samples_total : n_samples
 
     # # 2. Prediction Metadata Configuration (PS)
-    # Rationale: PSU utilizes bstm_options to ensure the new data is formatted identically to training data.
+    # Rationale: PSU utilizes bstm_config to ensure the new data is formatted identically to training data.
     # Note: Dummy responses are used as y_obs is not utilized during the projection phase.
-    PS = bstm_options(
-        data = new_data,
-        y_obs = zeros(nrow(new_data)),
-        model_family = M_train.model_family,
-        model_space = M_train.model_space,
-        model_time = M_train.model_time,
-        model_season = get(M_train, :model_season, "none"),
-        svc_covariates = M_train.svc_covariates,
-        use_sv = M_train.use_sv,
-        model_arch = get(M_train, :model_arch, "univariate")
-    )
-
+    # We pass the original model's formula and configuration (M_train) to ensure consistency.
+    PS = bstm_config(M_train.formula, new_data; pairs(M_train)...)
     # # 3. Manifold Coordinate Alignment
     # Rationale: Aligning out-of-sample points with the training grid for discrete and continuous manifolds.
     
@@ -8255,38 +8981,6 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
         PS = NamedTuple(PS_mut)
     end
 
-    # # 4. Hyper-Volumetric Basis Projection (1D-4D)
-    # Rationale: Reconstructing basis matrices (Splines/RFF/FFT) for new coordinates.
-    if haskey(M_train, :basis_matrices) && !isempty(M_train.basis_matrices)
-        ps_basis_registry = Dict{Symbol, Any}()
-        for (v_sym, B_train) in M_train.basis_matrices
-            # We discover the dimensionality of the smooth (1D-4D)
-            # and invoke the corresponding factory for the new coordinate grid.
-            v_str = string(v_sym)
-            vars = Symbol.(Base.split(v_str, "_"))
-            n_vars = length(vars)
-            
-            nb = size(B_train, 2)
-            
-            if n_vars == 1
-                ps_basis_registry[v_sym] = bstm_smooth_basis_1D("pspline", new_data[!, vars[1]], nb, 3)
-            elseif n_vars == 2
-                coords_new = Matrix{Float64}(new_data[!, vars])
-                ps_basis_registry[v_sym] = bstm_smooth_basis_2D("rff", coords_new, nb)
-            elseif n_vars == 3
-                coords_new = Matrix{Float64}(new_data[!, vars])
-                ps_basis_registry[v_sym] = bstm_smooth_basis_3D("pspline", coords_new, nb)
-            elseif n_vars == 4
-                coords_new = Matrix{Float64}(new_data[!, vars])
-                ps_basis_registry[v_sym] = bstm_smooth_basis_4D("pspline", coords_new, nb)
-            end
-        end
-        # Update PS with the projected basis matrices
-        PS_mut = Dict(pairs(PS))
-        PS_mut[:basis_matrices] = ps_basis_registry
-        PS = NamedTuple(PS_mut)
-    end
-
     # # 5. Architectural Dispatch for Latent Recovery
     # Rationale: Utilizing the validated _reconstruct engine to assemble the prediction tensor.
     raw_arch = get(M_train, :model_arch, "univariate")
@@ -8307,7 +9001,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
     # which is mathematically equivalent to out-of-sample prediction.
     res = _reconstruct(arch_type, "prediction_projection", chain_sub, M_train, PS, alpha)
 
-    println("--- Projection Complete [Observations: ", nrow(new_data), "] ---")
+    println("--- Projection Complete [New Observations: ", nrow(new_data), "] ---")
 
     return (
         predictions_denoised = res.predictions_denoised,
@@ -8318,16 +9012,12 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
     )
 end
 
- 
-
 # 1. PSIS-LOO Implementation for BSTM
 # Rationale: Standardizing the extraction of log-likelihood matrices to provide 
 # Expected Log Pointwise Predictive Density (ELPD) estimates.
 function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
-    # # BSTM PSIS-LOO Engine v19.38.6
     # Description: Calculates the Leave-One-Out Cross-Validation metrics for BSTM manifolds.
     # Rationale: Standardizing the extraction of log-likelihood matrices to provide ELPD estimates.
-    # Requirements: Absolute parity with the v19.38.6 reconstruction path.
 
     println("--- Starting BSTM PSIS-LOO Audit v19.38.6 ---")
 
@@ -8371,7 +9061,7 @@ function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
         return nothing
     end
 
-    println("\n--- BSTM Model Selection Report [v19.38.6] ---")
+    println("\n--- BSTM Model Selection Report ---")
     println("Expected Log Pointwise Predictive Density (ELPD): ", round(loo_result.estimates[:elpd_loo, :estimate], digits=2))
     println("Effective Number of Parameters (p_loo):          ", round(loo_result.estimates[:p_loo, :estimate], digits=2))
     println("LOO Information Criterion:                       ", round(loo_result.estimates[:looic, :estimate], digits=2))
@@ -8399,14 +9089,12 @@ end
 
 
 # 2. Bayes Factor Suite (Manifold Comparison)
-
 function compare_manifolds(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])
-    # # BSTM Model Comparison Engine v19.38.6
     # Description: Performs formal model selection between two BSTM manifold candidates.
     # Rationale: Standardizing the assessment of ELPD differences and complexity trade-offs.
-    # Requirements: Absolute parity with the v19.38.6 PSIS-LOO metrics.
+    # Requirements: Absolute parity with the PSIS-LOO metrics.
 
-    println("--- Starting BSTM Manifold Comparison v19.38.6 ---")
+    println("--- Starting BSTM Manifold Comparison ---")
 
     # # 1. LOO Object Extraction
     # Rationale: Extracting the underlying PosteriorStats LOO objects for comparison.
@@ -8433,7 +9121,7 @@ function compare_manifolds(loo_a_report, loo_b_report; model_names=["Model_A", "
     elpd_b = loo_b_report.metrics.elpd
 
     # # 4. Report Generation
-    println("\n--- BSTM Manifold Selection Registry [v19.38.6] ---")
+    println("\n--- BSTM Manifold Selection Registry ---")
     println("Model A (", model_names[1], "): ELPD = ", round(elpd_a, digits=2), " | p_loo = ", round(p_loo_a, digits=2))
     println("Model B (", model_names[2], "): ELPD = ", round(elpd_b, digits=2), " | p_loo = ", round(p_loo_b, digits=2))
 
@@ -8475,92 +9163,99 @@ function bstm_cv_orchestrator(
     lolo_var::Symbol = :s_idx, 
     n_folds::Int = 5, 
     n_samples::Int = 500, 
-    sampler = MH(), 
-    target_units::Int = 0,
+    sampler = NUTS(500, 0.65), 
+    alpha = 0.05, 
     kwargs...
 )
-    # # 1. Outcome Discovery
-    # Parsing the formula to identify the response variable name
-    metadata = decompose_bstm_formula(formula)
-    response_name = Symbol(metadata.outcomes[1])
-    
-    # # 2. Partition Strategy
-    # Establishing the fold indices based on the requested cross-validation method
+    # # 1. Metadata Discovery and Outcome Resolution
+    # The formula is decomposed to identify the primary response variable and module requirements.
+    meta_discovery = decompose_bstm_formula(formula)
+    response_name = Symbol(meta_discovery.outcomes[1])
+
+    # # 2. Partition Strategy Selection
+    # Establishing fold indices based on spatiotemporal logic or random sampling.
     folds_indices = Vector{Vector{Int}}()
-    
+
     if method == :lolo
-        # Leave-One-Location-Out: Grouping indices by the spatial unit identifier
+        # Leave-One-Location-Out: Grouping indices by the spatial unit identifier.
         unique_locs = unique(data[!, lolo_var])
         for loc in unique_locs
             push!(folds_indices, findall(x -> x == loc, data[!, lolo_var]))
         end
     else
-        # Standard K-Fold: Random permutation of row indices
-        n_obs = nrow(data)
-        row_indices = randperm(n_obs)
+        # Standard K-Fold: Random permutation of row indices.
+        n_obs = size(data, 1)
+        row_indices = Random.randperm(n_obs)
         fold_size = div(n_obs, n_folds)
         for i in 1:n_folds
-            start_idx = (i - 1) * fold_size + 1
-            end_idx = i == n_folds ? n_obs : i * fold_size
-            push!(folds_indices, row_indices[start_idx:end_idx])
+            idx_start = (i - 1) * fold_size + 1
+            idx_end = i == n_folds ? n_obs : i * fold_size
+            push!(folds_indices, row_indices[idx_start:idx_end])
         end
     end
 
-    # # 3. Cross-Validation Execution Loop
+    # # 3. Cross-Validation Loop
     fold_results = []
-    
+    n_actual_folds = length(folds_indices)
+
     for (f_idx, test_idx) in enumerate(folds_indices)
-        # Splitting dataset into training and testing sets
-        train_data = data[setdiff(1:nrow(data), test_idx), :]
+        # Splitting dataset into training and testing partitions.
+        # Training mask is constructed to exclude the test indices.
+        train_mask = trues(size(data, 1))
+        train_mask[test_idx] .= false
+        
+        train_data = data[train_mask, :]
         test_data = data[test_idx, :]
+
+        # # 4. Modular Training Configuration
+        # Pre-configuring the model to ensure technical registries (W, s_N, t_N) are consistent.
+        # bstm_config resolves the manifold registry M.
+        opt_train = bstm_config(formula, train_data; kwargs...)
+
+        # # 5. Model Execution
+        # Dispatching to the modular univariate or multivariate supervisor.
+        model_train = bstm(opt_train)
         
-        # # 4. Model Training
-        # Constructing the model using the training partition
-        # Technical registries (W, s_N, t_N) are propagated via kwargs
-        model_train = bstm(
-            formula, 
-            train_data; 
-            model_arch = "univariate", 
-            target_units = target_units, 
-            kwargs...
-        )
-        
-        # Posterior sampling using the specified sampler
-        chain_train = sample(model_train, sampler, n_samples, progress = false, check_model = false)
-        M_train = model_train.args.M
-        
-        # # 5. Out-of-Sample Prediction
-        # Projecting the latent manifolds onto the test partition coordinates
-        # Rationale: predict() handles the projection of spatial/temporal components
-        res_pred = predict(model_train, chain_train, test_data, n_samples = div(n_samples, 2))
-        
-        # # 6. Dynamic Performance Metric Calculation
-        # Replacing hardcoded 'data.y' with the response name discovered from formula
+        # Posterior sampling using the requested sampler configuration.
+        chain_train = sample(model_train, sampler, n_samples, progress = false)
+
+        # # 6. Manifold Projection (Out-of-Sample)
+        # Using the standardized predict() function which handles reconstruction of S, T, and Smooth basis.
+        # This ensures that PS (Prediction Surface) alignment is consistent with the modular BSTM taxonomy.
+        res_pred = predict(model_train, chain_train, test_data, n_samples = div(n_samples, 2), alpha = alpha)
+
+        # # 7. Performance Assessment
+        # Extracting denoised expectations for the test partition.
         y_test_obs = test_data[!, response_name]
-        y_test_pred = res_pred.predictions_observed_denoised.mean
-        
-        # Error Residuals
-        residuals = y_test_obs .- y_test_pred
-        rmse = sqrt(mean(residuals.^2))
-        
-        # Coefficient of Determination (R2)
-        ss_res = sum(residuals.^2)
-        ss_tot = sum((y_test_obs .- mean(y_test_obs)).^2)
-        r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
-        
-        push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
+        y_test_pred = res_pred.predictions_denoised.mean
+
+        # Verification of dimensional parity between prediction and observation.
+        if length(y_test_obs) == length(y_test_pred)
+            residuals = y_test_obs .- y_test_pred
+            rmse = sqrt(Statistics.mean(residuals.^2))
+            
+            # R-Squared calculation with safety floor for variance.
+            ss_res = sum(residuals.^2)
+            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
+            r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
+
+            push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
+        else
+            @warn "Fold $f_idx: Prediction length mismatch. Observed: $(length(y_test_obs)), Predicted: $(length(y_test_pred))"
+        end
     end
-    
-    # # 7. Aggregate CV Report
-    mean_rmse = mean([r.rmse for r in fold_results])
-    mean_r2 = mean([r.r2 for r in fold_results])
-    
+
+    # # 8. Aggregate Reporting
+    mean_rmse = Statistics.mean([r.rmse for r in fold_results])
+    mean_r2 = Statistics.mean([r.r2 for r in fold_results])
+
     return (
-        folds = fold_results, 
-        mean_rmse = mean_rmse, 
-        mean_r2 = mean_r2, 
+        folds = fold_results,
+        mean_rmse = mean_rmse,
+        mean_r2 = mean_r2,
         response_var = response_name,
-        method = method
+        method = method,
+        n_folds = n_actual_folds
     )
 end
 

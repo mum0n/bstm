@@ -1,4 +1,4 @@
-module bstm
+module BayesianSpatioTemporalModels
 
 # # 1. Core Dependencies
 using Turing, Distributions, LinearAlgebra, SparseArrays
@@ -13,14 +13,20 @@ using Requires
 
 # # 2. Public API Exports
 
-# Primary modeling and analysis functions
-export bstm,
-       predict,
-       model_results_comprehensive,
-       bstm_loo,
-       compare_manifolds,
-       get_optimal_sampler,
-       get_inits
+# Primary modeling and analysis functions 
+export  load_shapefile_to_libgeos,
+        assign_spatial_units,
+        assign_time_units,
+        calculate_metrics,
+        plot_spatial_graph, 
+        bstm,
+        predict,
+        model_results_comprehensive,
+        model_results_plots,
+        bstm_loo,
+        compare_manifolds,
+        get_optimal_sampler,
+        get_inits
 
 # Data utilities
 export scottish_lip_cancer_data_spacetime,
@@ -46,7 +52,8 @@ export Harmonic, Cyclic
 # Specialized & Network Manifolds
 export Eigen, BCGN, LocalAdaptive
 
+include("utility_functions.jl")
+include("spatiotemporal_partitioning_functions.jl")
 include("spatiotemporal_functions.jl")
-include("bstm_modular.jl")
 
-end # module bstm
+end # module BayesianSpatioTemporalModels

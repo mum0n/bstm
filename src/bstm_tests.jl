@@ -39,7 +39,7 @@ using Test
         """
 
         # 3. Run the config engine
-        M = bstm_modular_config(formula, data; W=W)
+        M = bstm_config(formula, data; W=W)
 
         # 4. Verify that all keywords resulted in a manifold object
         manifolds = M.manifolds
@@ -98,8 +98,8 @@ using Test
     @testset "Model Execution" begin
         # A simpler formula that is faster to run for an execution test
         formula_run = "y ~ 1 + cov1 + spatial(s_idx, manifold='icar')"
-        M_run = bstm_modular_config(formula_run, data; W=W)
-        model = bstm_modular(M_run)
+        M_run = bstm_config(formula_run, data; W=W)
+        model = bstm_univariate(M_run)
 
         # Test that the model can be instantiated and a random sample can be drawn
         @test rand(model) isa NamedTuple
