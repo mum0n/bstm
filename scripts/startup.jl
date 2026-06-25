@@ -87,6 +87,7 @@ include( srcdir( "spatiotemporal_partitioning_functions.jl" ))   ;
 
 include( srcdir( "spatiotemporal_functions.jl" ))   ;
 
+include( srcdir( "dynamics_functions.jl" ))   ;
 
 
 Random.seed!(42) # Set a seed for reproducibility.

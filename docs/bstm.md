@@ -95,6 +95,7 @@ include( joinpath( project_directory, "scripts", "startup.jl" ) ) # might need t
 # include( joinpath( project_directory, "src", "data_prep.jl" ) ) # support functions  
 # include( joinpath( project_directory, "src", "structs.jl" ) ) # architectural specifications  
 # include( joinpath( project_directory, "src", "spatiotemporal_functions.jl" ) )       # support functions
+# include( joinpath( project_directory, "src", "dynamics_functions.jl" ))   ;
 
 # Pkg.instantiate()  # to force a reset if some package seems corrupted/partially installed
 # Pkg.update()  # to update this can break dependencies .. do this only if you really need to 
