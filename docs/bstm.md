@@ -156,7 +156,7 @@ StatsPlots.plot(chn[[:s_sigma, :s_rho, :t_sigma, :t_rho]], seriestype=:traceplot
 
 res = model_results_comprehensive(m, chn );  
 
-model_results_plots(res,
+model_results_plots(res, # This function is now available in the updated spatiotemporal_functions.jl
     centroids = data_scot[:au][:centroids], 
     polygons = data_scot[:au][:polygons])
 
