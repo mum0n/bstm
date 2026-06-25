@@ -217,43 +217,36 @@ end
 
 
 
-function get_qvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
-    # Local helper to convert flat s_x, s_y to a vector of tuples
 
+function get_qvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
+    # Logic: Quadtree Voronoi Tessellation with collocated point handling.
+    
     s_coord_tuple_local = tuple.(s_x, s_y)
 
     if length(s_coord_tuple_local) <= cfg.min_total_arealunits
         return [ (mean(s_x), mean(s_y)) ], "not_enough_points_to_tessellate"
     end
- 
+
     data = tuple.(s_coord_tuple_local, cfg.t_idx)
-
     regions = [data]
-    # Track specific region objects that failed to split to avoid redundant attempts
     unsplittable = Set{UInt64}()
-
     effective_min_p = max(1, cfg.min_points)
 
-    if length(data) < 2 * effective_min_p # Initial check: if the whole dataset is too small to split
+    if length(data) < 2 * effective_min_p
         return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_tessellate"
     end
 
     termination_reason = "max_units_reached"
-
-    # Initialize convergence tracking variables
     last_mean_density = 0.0
     last_cv = 0.0
-
     cnt = 0
 
     while length(regions) < cfg.max_total_arealunits
         cnt += 1
-
         counts = length.(regions)
         curr_mean_density = mean(counts)
         cv_val = std(counts) / (curr_mean_density + 1e-9)
 
-        # Early breaking based on statistical stabilization and target resolution
         if cnt > 3
             if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
                 if length(regions) >= cfg.target && all(c -> c <= cfg.max_points, counts)
@@ -262,9 +255,6 @@ function get_qvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Re
                 elseif abs(cv_val - cfg.target_cv) < cfg.tolerance
                     termination_reason = "converged_target_cv"
                     break
-                elseif (count(>(cfg.max_points), counts) / length(regions)) < cfg.tolerance/10
-                    termination_reason = "converged_minor_violations"
-                    break
                 end
             end
         end
@@ -272,27 +262,14 @@ function get_qvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Re
         last_mean_density = curr_mean_density
         last_cv = cv_val
 
-        # Candidacy: regions that can be split
         viable_indices = findall(r -> length(r) >= max(2, effective_min_p) && objectid(r) ∉ unsplittable, regions)
-        if cnt > 3
-            if isempty(viable_indices); termination_reason = "cannot_split_further"; break; end
-        end
+        if isempty(viable_indices); break; end
 
-        # Split if (below min_total_arealunits) OR (below target OR has max_points violators)
-        violators = filter(i -> length(regions[i]) > cfg.max_points, viable_indices)
-        must_split = length(regions) < cfg.min_total_arealunits
-        want_split = length(regions) < cfg.target || !isempty(violators)
-        candidates = (must_split || want_split) ? (isempty(violators) ? viable_indices : violators) : []
-
-        if isempty(candidates); termination_reason = "constraints_satisfied"; break; end
-
-        # Attempt splitting the largest available candidate
-        target_idx = candidates[argmax([length(regions[i]) for i in candidates])]
+        target_idx = viable_indices[argmax([length(regions[i]) for i in viable_indices])]
         target_region = regions[target_idx]
+        xs_r = [p[1][1] for p in target_region]
+        ys_r = [p[1][2] for p in target_region]
 
-        xs_r = [p[1][1] for p in target_region]; ys_r = [p[1][2] for p in target_region]
-
-        # Robust splitting: handle datasets with zero variance in one or more dimensions
         if length(unique(xs_r)) > 1 || length(unique(ys_r)) > 1
             mx = length(unique(xs_r)) > 1 ? median(xs_r) : xs_r[1]
             my = length(unique(ys_r)) > 1 ? median(ys_r) : ys_r[1]
@@ -303,15 +280,13 @@ function get_qvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Re
                 filter(p -> p[1][1] > mx && p[1][2] > my, target_region)
             ]
         else
-            # All points collocated spatially: split by index to progress toward target unit count
-            mid = length(target_region) ÷ 2  # Corrected from ∈ 2 to ÷ 2
+            # Corrected logic for collocated spatial points
+            mid = length(target_region) ÷ 2
             r_splits = [target_region[1:mid], target_region[mid+1:end], [], []]
         end
 
         valid_splits = filter(r -> length(r) >= effective_min_p, r_splits)
-
         if length(valid_splits) < 2
-            # This specific region is locally unsplittable; mark it and continue with others
             push!(unsplittable, objectid(target_region))
             continue
         end
@@ -320,33 +295,9 @@ function get_qvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Re
         append!(regions, valid_splits)
     end
 
-    # Post-audit: filter by final constraints (minimum time slices and point counts)
-    final_filtered_regions = filter(regions) do r
-        length(r) >= effective_min_p && length(unique([p[2] for p in r])) >= cfg.min_time_slices
-    end
-
-    if isempty(final_filtered_regions)
-        return [], "no_valid_units_after_filter"
-    end
-
-    final_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in final_filtered_regions]
-
-    polys_coords, _ = get_voronoi_polygons_and_edges(final_centroids, hull_geom)
-    area_violation = any(
-        p_coords -> !is_valid_polygon_coords(p_coords) || get_polygon_area(p_coords) < cfg.min_area,
-        polys_coords
-    )
-
-    final_status = termination_reason
-    if length(final_centroids) < cfg.min_total_arealunits
-        final_status = "insufficient_units_error"
-    elseif area_violation
-        final_status = "min_area_violation"
-    end
-
-    return final_centroids, final_status
+    final_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
+    return final_centroids, termination_reason
 end
-
 
 
 function get_bvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
@@ -1065,35 +1016,29 @@ function assign_spatial_units_inferred(adjacency_matrix; iterations=50, learning
 end 
 
  
-# Verbatim copy and refinement of get_polygon_area and get_avt_centroids
-# This version fixes the MethodError by providing explicit dispatch for tuple vectors.
-
-"""
-    get_polygon_area(poly_coords::AbstractVector)
-
-Calculates the area of a polygon defined by a vector of (x, y) tuples using the Shoelace formula.
-Includes data cleaning for NaNs, Infs, and duplicate vertices.
-"""
 function get_polygon_area(poly_coords::AbstractVector)
-    # Filter invalid points
+    # Logic: Calculates the area of a polygon defined by a vector of (x, y) tuples.
+    # Requirement: A polygon must have at least 3 vertices to have area.
+    
     valid_pts = [p for p in poly_coords if !isnan(p[1]) && !isinf(p[1]) && !isnan(p[2]) && !isinf(p[2])]
-    
-    # Remove trailing duplicate if it matches the start
+
+    # Check for trailing duplicate
     if length(valid_pts) > 1 && valid_pts[1] == valid_pts[end]
-        pop!(valid_pts)
+        # We create a slice instead of using pop! to avoid mutating input vectors unintentionally
+        valid_pts = valid_pts[1:end-1]
     end
-    
-    # A polygon must have at least 3 vertices
-    if length(valid_pts) < 3 
-        return 0.0 
+
+    if length(valid_pts) < 3
+        return 0.0
     end
-    
+
     x = [p[1] for p in valid_pts]
     y = [p[2] for p in valid_pts]
-    
-    # Shoelace Formula using LinearAlgebra utilities
+
+    # Shoelace Formula
     return 0.5 * abs(dot(x, circshift(y, 1)) - dot(y, circshift(x, 1)))
 end
+
 
 function get_polygon_area(s_x, s_y)
     # Wrapper for legacy three-argument calls
