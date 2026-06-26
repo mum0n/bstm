@@ -123,10 +123,9 @@ data_scot[:au][:W] # the neighbourhood adjacency matrix
  
 plot_spatial_graph( au=data_scot[:au], plot_title="Lip Cancer Inferred from Adjacency 'Locations'")
 
-pts = tuple.( data_scot[:data][!,:s_x,], data_scot[:data][!,:s_y] )
-
-plot_kde_simple(pts, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+plot_kde_simple( data_scot[:data][!,[:s_x, :s_y]], sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
    
+
 ```
 
 In the tuple (*data_scot*), we have counts (y) of cancer incidence and population size in each area (log_offset). We also simulate a 10-"year" temporal process, a random walk with magnitude 0.5 and a covariate effect (X: an area-specific continuous covariate that represents the proportion of the population employed in agriculture, fishing, or forestry). An overall random uniform observation error of magnitude 0.2 is added with a count then taken as the overall, rounded integer value.

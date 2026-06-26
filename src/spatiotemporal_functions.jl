@@ -3,20 +3,6 @@
 # Definitions
 
 
-const MODULE_PROCESSORS = Dict{Symbol, Function}(
-    :spatial => process_spatial_module!,
-    :temporal => process_temporal_module!,
-    :smooth => process_smooth_module!,
-    :interaction_composition => process_interaction_module!,
-    :observationprocess => process_observationprocess_module!,
-    :intercept => process_intercept_module!
-    # :volatility => process_volatility_module!,
-    # :spacetime => process_spacetime_module!,
-    # :hyperbolic => process_hyperbolic_module!
-)
-
- 
-
 const BSTM_MODULE_KEYWORDS = Set([ 
     "intercept", "observationprocess", "spatial", "temporal",
     "smooth", "nested", "eigen", "fixed", "mixed",
@@ -287,6 +273,8 @@ end
 function build_model(m::SoftConstraintManifold, data_inputs)
     # Build the inner model's configuration
     inner_config = build_model(m.manifold, data_inputs)
+    # Add the soft constraint information to the hyperparameter tuple
+    new_hyper = merge(inner_config.hyper, (soft_constraint_type=m.type, soft_constraint_weight=m.weight))
     return merge(inner_config, (hyper = new_hyper,))
 end
  
@@ -347,7 +335,14 @@ end
 
 function build_model(m::Cyclic, data_inputs)
     # Cyclic Builder: Periodic continuity (Seasonal)
-    return _build_pass_through_model(m, data_inputs)
+    # Rationale: Enforces boundary condition y_0 = y_T via a circular Laplacian.
+    template = build_structure_template(:cyclic, m.period)
+    
+    # Use the pass-through model to package hyperparameters, but provide the correct template
+    return _build_pass_through_model(
+        m, data_inputs, model_type_sym=:cyclic, 
+        Q_template_val=template.matrix, sf_val=template.scaling_factor
+    )
 end
 
 
@@ -3491,12 +3486,20 @@ function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry)
 end
 
 
+# must come aftyer the above
+const MODULE_PROCESSORS = Dict{Symbol, Function}(
+    :spatial => process_spatial_module!,
+    :temporal => process_temporal_module!,
+    :smooth => process_smooth_module!,
+    :interaction_composition => process_interaction_module!,
+    :observationprocess => process_observationprocess_module!,
+    :intercept => process_intercept_module!
+    # :volatility => process_volatility_module!,
+    # :spacetime => process_spacetime_module!,
+    # :hyperbolic => process_hyperbolic_module!
+)
 
-
-# # BSTM Results Engine v20.1.5
-# Timestamp: 2025-11-25 14:00:00
-# Description: Standardizes model reporting for metadata, performance metrics, and MCMC diagnostics.
-
+ 
 function model_results_comprehensive(model, chain; n_samples=100, alpha=0.05)
     println("--- Starting Comprehensive Model Reporting ---")
 

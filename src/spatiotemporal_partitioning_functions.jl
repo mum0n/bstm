@@ -3,15 +3,16 @@
 
 function expand_hull(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, buffer_dist)
     """
-    Synopsis: Computes the convex hull of points and expands it by a buffer distance.
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Computes the convex hull of a set of points and expands it by a specified buffer distance.
     Inputs:
-    - s_x: Vector of x-coordinates.
-    - s_y: Vector of y-coordinates.
-    - buffer_dist: Distance to buffer the convex hull.
+        - s_x: A vector of x-coordinates.
+        - s_y: A vector of y-coordinates.
+        - buffer_dist: The distance to expand the convex hull.
     Outputs:
-    - A LibGEOS Polygon geometry representing the buffered convex hull.
+        - A `LibGEOS.Polygon` geometry representing the buffered convex hull.
     """
-
     s_coord_tuple_local = tuple.(s_x, s_y)
 
     if isempty(s_coord_tuple_local) return LibGEOS.Polygon([[ (0.0,0.0), (0.0,0.0), (0.0,0.0), (0.0,0.0) ]]) end
@@ -25,7 +26,17 @@ end
  
 
 function get_kde_seeds(s_coord_tuple_local, target_u)
- 
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Generates initial seed locations for tessellation algorithms based on Kernel Density Estimation (KDE).
+              It samples points from the input coordinates, with selection weighted by a simple density proxy.
+    Inputs:
+        - s_coord_tuple_local: A vector of (x, y) coordinate tuples.
+        - target_u: The desired number of seeds to generate.
+    Outputs:
+        - A vector of seed coordinates.
+    """
     # Basic KDE-based seeding using StatsBase weights based on local density
     u_pts = unique(s_coord_tuple_local)
     if isempty(u_pts) return [] end
@@ -39,8 +50,16 @@ end
 
  
 function is_valid_polygon_coords(poly_coords)
-    # Filters out NaN/Inf values and checks for a minimum of 3 valid points for a polygon.
-
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Validates a set of polygon coordinates by filtering out non-finite values (NaN, Inf)
+              and ensuring there are at least three valid points to form a polygon.
+    Inputs:
+        - poly_coords: A vector of (x, y) coordinate tuples representing a polygon's vertices.
+    Outputs:
+        - A boolean indicating if the coordinates form a valid polygon.
+    """
     valid_pts = [p for p in poly_coords if !isnan(p[1]) && !isinf(p[1]) && !isnan(p[2]) && !isinf(p[2])]
     return length(valid_pts) >= 3
 end
@@ -48,9 +67,18 @@ end
 
 function get_cvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
     """
-    Synopsis: Centroidal Voronoi Tessellation (CVT) with diagnostic termination tracking.
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Performs Centroidal Voronoi Tessellation (CVT) using Lloyd's algorithm to partition space.
+              The function iteratively refines centroid locations to match the geometric centroids of their
+              corresponding Voronoi cells, with multiple diagnostic termination conditions.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates.
+        - cfg: A configuration object with parameters like `target`, `min_area`, `tolerance`, etc.
+        - hull_geom: A `LibGEOS` geometry used to clip the Voronoi polygons.
+    Outputs:
+        - A tuple containing the final centroid locations and a string indicating the termination reason.
     """
-
     s_coord_tuple_local = tuple.(s_x, s_y)
 
     if length(s_coord_tuple_local) <= cfg.min_total_arealunits
@@ -133,9 +161,18 @@ end
 
 function get_kvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
     """
-    Synopsis: K-means Voronoi Tessellation (KVT) with diagnostic termination tracking.
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Performs K-means Voronoi Tessellation (KVT), a density-aware partitioning method.
+              Unlike CVT, KVT moves centroids towards the mean position of the data points within
+              each Voronoi cell, effectively balancing partitions by point density.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates.
+        - cfg: A configuration object with parameters like `target`, `min_points`, `tolerance`, etc.
+        - hull_geom: A `LibGEOS` geometry used to clip the Voronoi polygons.
+    Outputs:
+        - A tuple containing the final centroid locations and a string indicating the termination reason.
     """
-
     s_coord_tuple_local = tuple.(s_x, s_y)
 
 
@@ -219,8 +256,19 @@ end
 
 
 function get_qvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
-    # Logic: Quadtree Voronoi Tessellation with collocated point handling.
-    
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Implements Quadtree Voronoi Tessellation (QVT), a hierarchical partitioning method.
+              It recursively splits regions into four quadrants based on median coordinates, adapting
+              to spatial density variations. Includes logic to handle collocated points.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates.
+        - cfg: A configuration object with parameters like `max_total_arealunits`, `min_points`, etc.
+        - hull_geom: A `LibGEOS` geometry (not directly used in splitting but relevant for context).
+    Outputs:
+        - A tuple containing the final centroid locations and a string indicating the termination reason.
+    """
     s_coord_tuple_local = tuple.(s_x, s_y)
 
     if length(s_coord_tuple_local) <= cfg.min_total_arealunits
@@ -302,9 +350,21 @@ end
 
 function get_bvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
     """
-    Synopsis: Binary Voronoi Tessellation (BVT) with corrected recursive splitting logic.
+    BSTM Partitioning Utility v1.0.1
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Implements Binary Voronoi Tessellation (BVT), a recursive partitioning method.
+              It splits regions along the axis of maximum variance, making it efficient for
+              handling large datasets and creating balanced partitions.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates.
+        - cfg: A configuration object with parameters like `max_total_arealunits`, `min_points`, etc.
+        - hull_geom: A `LibGEOS` geometry used for clipping and area validation.
+    Outputs:
+        - A tuple containing the final centroid locations and a string indicating the termination reason.
+    Rationale for v1.0.1:
+        - Restored the fallback logic that ensures the function does not return fewer units than
+          `cfg.min_total_arealunits`. If the partitioning results in too few units, it now returns a single aggregated centroid.
     """
-
     s_coord_tuple_local = tuple.(s_x, s_y)
 
     if length(s_coord_tuple_local) <= cfg.min_total_arealunits
@@ -418,20 +478,33 @@ function get_bvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Re
 
     final_centroids_candidate = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
 
-    # if length(final_centroids_candidate) < cfg.min_total_arealunits
-    #     # Aggregate all original points (from 'data') into a single centroid
-    #     all_pts_x = [p[1][1] for p in data]
-    #     all_pts_y = [p[1][2] for p in data]
-    #     return [ (mean(all_pts_x), mean(all_pts_y)) ], "insufficient_units_error"
-    # else
+    if length(final_centroids_candidate) < cfg.min_total_arealunits
+        # Aggregate all original points (from 'data') into a single centroid
+        all_pts_x = [p[1][1] for p in data]
+        all_pts_y = [p[1][2] for p in data]
+        return [ (mean(all_pts_x), mean(all_pts_y)) ], "insufficient_units_error"
+    else
         return final_centroids_candidate, termination_reason
-    # end
+    end
 end
 
  
  
 function get_hvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom; max_iter=500)
-
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Implements Hierarchical Voronoi Tessellation (HVT), which combines K-means seeding
+              with Lloyd's algorithm refinement and an adaptive splitting mechanism. It aims to
+              create geometrically regular polygons that also respect data density constraints.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates.
+        - cfg: A configuration object with parameters like `target`, `max_points`, `tolerance`, etc.
+        - hull_geom: A `LibGEOS` geometry (not directly used but relevant for context).
+        - max_iter: The maximum number of iterations for the main refinement loop.
+    Outputs:
+        - A tuple containing the final centroid locations and a string indicating the termination reason.
+    """
     s_coord_tuple_local = tuple.(s_x, s_y)
 
     # Internal utility for point-to-centroid distance
@@ -531,12 +604,21 @@ end
 
 
 """
-    get_avt_centroids(s_x, s_y, cfg, hull_geom)
-
-Iterative Adaptive Voronoi Tessellation. Merges units that violate constraints
-on point counts, time-slice representation, or geometric area.
+BSTM Partitioning Utility v1.0.0
+Timestamp: 2026-06-26 10:01:50
+Synopsis: Implements Agglomerative Voronoi Tessellation (AVT), a bottom-up partitioning method.
+          It starts with an over-partitioned set of units and iteratively merges the smallest
+          or most "starved" units until all remaining units satisfy minimum constraints on
+          point counts, time-slice representation, and geometric area.
+Inputs:
+    - s_x, s_y: Vectors of spatial coordinates.
+    - cfg: A configuration object with parameters like `min_total_arealunits`, `min_points`, etc.
+    - hull_geom: A `LibGEOS` geometry used to clip the Voronoi polygons.
+Outputs:
+    - A tuple containing the final centroid locations and a string indicating the termination reason.
 """
 function get_avt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
+
     s_coord_tuple = tuple.(s_x, s_y)
     
     if length(s_coord_tuple) <= cfg.min_total_arealunits
@@ -627,9 +709,17 @@ end
 
 function get_lattice_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, lengthscale)
     """
-    Synopsis: Generates centroids for a regular 2D lattice (grid) based on a lengthscale.
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Generates centroids for a regular 2D lattice (grid) that covers the extent of the input points.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates used to determine the grid's bounding box.
+        - lengthscale: The side length of each square grid cell.
+    Outputs:
+        - A tuple containing:
+            - A vector of centroid coordinates.
+            - The number of rows and columns in the grid, and the bounding box.
     """
-
     s_coord_tuple = tuple.(s_x, s_y)
 
     if isempty(s_coord_tuple); return [], 0, 0, (0.0, 0.0, 0.0, 0.0); end
@@ -660,11 +750,18 @@ end
 
 
 function load_shapefile_to_libgeos(filepath::String)
-    # Read the shapefile
-    # import Shapefile  << --- install this if you need it
-    # import LibGEOS
-    # import GeoInterface
-
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Loads a shapefile and converts its geometries into `LibGEOS` objects.
+    Requires `Shapefile.jl` and `GeoInterface.jl` to be installed.
+    Inputs:
+        - filepath: The path to the .shp file.
+    Outputs:
+        - A tuple containing:
+            - A vector of `LibGEOS` geometry objects.
+            - The `Shapefile.Table` object containing attribute data.
+    """
     table = Shapefile.Table(filepath)
     
     # Extract geometries and convert to LibGEOS
@@ -675,6 +772,16 @@ function load_shapefile_to_libgeos(filepath::String)
 end
 
 function get_user_centroids(input_polygons)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Processes a vector of user-provided `LibGEOS` polygons to extract their centroids,
+              coordinate sequences, and the overall hull.
+    Inputs:
+        - input_polygons: A vector of `LibGEOS.Polygon` objects.
+    Outputs:
+        - A tuple containing the centroids, polygon coordinates, and hull coordinates.
+    """
     # Convert input to a concrete vector of LibGEOS Polygons
     geoms = LibGEOS.Polygon[p for p in input_polygons]
     n = length(geoms)
@@ -700,6 +807,23 @@ end
 
 
 function assign_spatial_units(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}; area_method=:avt, target_units=10, lengthscale=nothing, input_polygons=nothing, geom_hull=nothing, kwargs...)
+    """
+    BSTM Partitioning Utility v1.0.1
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: A high-level dispatcher for partitioning a spatial domain into discrete areal units.
+              It supports various methods including Voronoi-based tessellations, regular lattices,
+              and user-provided polygons. It generates centroids, polygons, and an adjacency graph.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates for the data points.
+        - area_method: The partitioning algorithm to use (e.g., :avt, :cvt, :lattice).
+        - kwargs: Additional parameters passed to the specific partitioning algorithm.
+    Outputs:
+        - A `NamedTuple` containing all partitioning information: centroids, polygons, adjacency graph (W),
+          point assignments (s_idx), and termination reason.
+    Rationale for v1.0.1:
+        - Corrected a `MethodError` in the `:lattice` method where `expand_hull` was called with an
+          invalid argument. The call now correctly passes the coordinate vectors `s_x` and `s_y`.
+    """
     # s_coord_tuple_local will be used for calculations that still expect a collection of points
 
     s_coord_tuple_local = tuple.(s_x, s_y) # Using the globally defined helper
@@ -734,7 +858,7 @@ function assign_spatial_units(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<
     # 2. Handle Lattice Method
     elseif area_method == :lattice
         # `expand_hull` and `get_lattice_centroids` will be refactored to take s_x, s_y
-        ls = isnothing(lengthscale) ? sqrt(get_polygon_area(get_coords_from_geom(expand_hull( 0.0))) / target_units) : lengthscale # Updated call
+        ls = isnothing(lengthscale) ? sqrt(get_polygon_area(get_coords_from_geom(expand_hull(s_x, s_y, 0.0))) / target_units) : lengthscale # Corrected call
         final_centroids_raw, rows, cols, bbox = get_lattice_centroids(s_x, s_y, ls) # Updated call
         reason = :lattice_grid
 
@@ -841,16 +965,20 @@ end
 
 function assign_spatial_units_inferred(adjacency_matrix; iterations=50, learning_rate=0.1, buffer_dist=0.5, input_polygons = nothing)
     """
-    Synopsis: Manually constructs a areal_units object for areal data like the Lip Cancer dataset.
-              Centroid locations are spatially inferred from connectivity using a rudimentary force-directed layout.
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Constructs an `areal_units` object for data where only adjacency information is available
+              (e.g., the Scottish Lip Cancer dataset). If polygons are not provided, it infers spatial
+              positions using a simple force-directed layout algorithm and then generates Voronoi polygons.
     Inputs:
-    - adjacency_matrix: The adjacency matrix (W) of the areal units.
-    - iterations: Number of iterations for the force-directed layout.
-    - learning_rate: Step size for moving centroids in the layout algorithm.
-    - buffer_dist: Distance to buffer the convex hull when polygons are inferred.
-    - input_polygons: Optional. A vector of LibGEOS Polygons. If provided, centroids and hull are derived from these.
+        - adjacency_matrix: The adjacency matrix (W) defining neighborhood relationships.
+        - iterations: Number of iterations for the force-directed layout.
+        - learning_rate: Step size for moving centroids in the layout algorithm.
+        - buffer_dist: Distance to buffer the convex hull for inferred polygons.
+        - input_polygons: Optional. A vector of `LibGEOS.Polygon` objects to use directly.
+    Outputs:
+        - A `NamedTuple` containing the inferred or provided geometric and graph information.
     """
-
     local final_centroids
     local adjacency_edges_output
     local polys_output
@@ -1017,9 +1145,17 @@ end
 
  
 function get_polygon_area(poly_coords::AbstractVector)
-    # Logic: Calculates the area of a polygon defined by a vector of (x, y) tuples.
-    # Requirement: A polygon must have at least 3 vertices to have area.
-    
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Calculates the area of a polygon using the Shoelace formula. The input is a vector
+              of (x, y) coordinate tuples. It handles non-finite values and ensures the polygon
+              has at least 3 valid vertices.
+    Inputs:
+        - poly_coords: A vector of (x, y) tuples representing the polygon's vertices.
+    Outputs:
+        - The area of the polygon as a `Float64`.
+    """
     valid_pts = [p for p in poly_coords if !isnan(p[1]) && !isinf(p[1]) && !isnan(p[2]) && !isinf(p[2])]
 
     # Check for trailing duplicate
@@ -1041,7 +1177,12 @@ end
 
 
 function get_polygon_area(s_x, s_y)
-    # Wrapper for legacy three-argument calls
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: A wrapper method for `get_polygon_area` that accepts separate x and y coordinate vectors,
+              maintaining compatibility with older function calls.
+    """
     poly_coords = tuple.(s_x, s_y)
     return get_polygon_area(poly_coords)
 end
@@ -1049,13 +1190,16 @@ end
  
 function get_coords_from_geom(geom)
     """
-    Synopsis: Extracts coordinates from various LibGEOS geometry types.
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Extracts a vector of (x, y) coordinate tuples from various `LibGEOS` geometry types,
+              including `Point`, `Polygon`, `MultiPolygon`, `LineString`, and `LinearRing`.
     Inputs:
-    - geom: A LibGEOS geometry object.
+        - geom: A `LibGEOS` geometry object.
     Outputs:
-    - A vector of (x, y) coordinates.
+        - A vector of `(Float64, Float64)` coordinate tuples. For `MultiPolygon`, NaN tuples
+          are used as separators between individual polygons.
     """
-
     coords = Tuple{Float64, Float64}[]
     local type_id = -1
     try
@@ -1104,8 +1248,17 @@ end
 
 function get_voronoi_polygons_and_edges(centroids, hull_geom, tol=1e-7)
     """
-    Synopsis: Generates clipped Voronoi polygons with robust adjacency detection.
-    Uses a small buffer fallback to handle floating-point misalignment in LibGEOS.
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Generates Voronoi polygons for a given set of centroids, clips them to a specified
+              hull geometry, and determines adjacency between the resulting polygons. It uses
+              `DelaunayTriangulation.jl` for the tessellation and `LibGEOS.jl` for geometric operations.
+    Inputs:
+        - centroids: A vector of (x, y) centroid coordinates.
+        - hull_geom: A `LibGEOS` geometry for clipping.
+        - tol: A small tolerance for robust adjacency checking.
+    Outputs:
+        - A tuple containing the polygon coordinates and a vector of adjacency edges.
     """
     n_c = length(centroids)
     if n_c == 0
@@ -1193,11 +1346,16 @@ end
 
 function check_connectivity(g)
     """
-    Synopsis: Evaluates the connectivity of a spatial graph.
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Evaluates the connectivity of a graph.
     Inputs:
-    - g: A SimpleGraph.
+        - g: A `SimpleGraph` object.
     Outputs:
-    - NamedTuple showing connection status and components.
+        - A `NamedTuple` with fields:
+            - `is_connected`: A boolean indicating if the graph is fully connected.
+            - `n_components`: The number of connected components.
+            - `components`: A vector of vectors, where each inner vector contains the nodes of a component.
     """
     comps = connected_components(g)
     return (is_connected = length(comps) == 1, n_components = length(comps), components = comps)
@@ -1205,42 +1363,51 @@ end
 
 
 
-function ensure_connected!(W::AbstractMatrix, centroids::Vector{<:Tuple{Real, Real}})
-    # Convert the adjacency matrix to a Graph object for component analysis
-    g = Graph(W)
+ 
+function ensure_connected!(g::SimpleGraph, centroids::Vector{<:Tuple{Real, Real}})
+    """
+    BSTM Partitioning Utility v1.0.1
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Ensures a spatial graph is fully connected by adding edges to bridge any
+              disconnected components. It identifies the nearest pair of nodes between
+              the two closest components and adds an edge between them, repeating if necessary.
+    Inputs:
+        - g: A `SimpleGraph` object to modify in-place.
+        - centroids: A vector of centroid coordinates corresponding to the graph's vertices.
+    Outputs:
+        - The modified, connected `SimpleGraph` object.
+    Rationale for v1.0.1:
+        - Corrected a bug in the recursive call, which was passing the adjacency matrix `W` instead of the graph `g`.
+    """
     comps = connected_components(g)
     
     # If the graph is already connected, no further action is required
     if length(comps) <= 1
-        return W
+        return g
     end
 
     # Number of components to bridge
     n_comps = length(comps)
     
     # 1. Calculate Centroids for each component to reduce search space
-    # This simplifies the problem from comparing all nodes to comparing component centers
     comp_centroids = Vector{Vector{Float64}}(undef, n_comps)
     for i in 1:n_comps
         pts = [ [centroids[node][1], centroids[node][2]] for node in comps[i] ]
         comp_centroids[i] = mean(pts)
     end
 
-    # 2. Build a KD-Tree of the component centroids for efficient spatial lookup
-    # We treat each component as a single point in this high-level search
+    # 2. Build a KD-Tree of the component centroids for efficient nearest-neighbor search
     centroid_matrix = hcat(comp_centroids...)
     tree = KDTree(centroid_matrix)
 
-    # 3. Iteratively bridge components using the nearest-neighbor logic
-    # We connect the most isolated components first to ensure global connectivity
+    # 3. Iteratively bridge components
     for i in 1:n_comps
-        # Find the nearest component other than itself
-        # knn returns indices and distances; we look for the 2 nearest (itself + neighbor)
+        if is_connected(g) break end # Stop if graph becomes connected
+        
         idxs, dists = knn(tree, comp_centroids[i], 2)
         target_comp_idx = idxs[2]
         
-        # Now find the absolute closest node pair between the two identified components
-        # While this sub-step is O(Ni * Nj), the components are typically small sub-graphs
+        # Find the closest pair of nodes between the two components
         min_dist = Inf
         best_pair = (0, 0)
         
@@ -1254,31 +1421,45 @@ function ensure_connected!(W::AbstractMatrix, centroids::Vector{<:Tuple{Real, Re
             end
         end
         
-        # 4. Update the sparse adjacency matrix with the new bridging edge
+        # Add the bridging edge to the graph
         u_node, v_node = best_pair
-        if u_node != 0 && v_node != 0
-            W[u_node, v_node] = true
-            W[v_node, u_node] = true
+        if u_node != 0 && v_node != 0 && !has_edge(g, u_node, v_node)
+            add_edge!(g, u_node, v_node)
         end
     end
 
-    # Verify final connectivity to ensure no orphans remain
-    final_g = Graph(W)
-    if length(connected_components(final_g)) > 1
-        # Recursive fallback for complex edge cases (e.g., non-convex boundaries)
-        return ensure_connected!(W, centroids)
+    # Recursive call to handle cases where bridging one pair doesn't connect all components
+    if !is_connected(g)
+        return ensure_connected!(g, centroids)
     end
 
-    return W
-end
+    return g
+end 
+
 
 function sqdist(p1, p2)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Calculates the squared Euclidean distance between two points.
+    """
     return (p1[1]-p2[1])^2 + (p1[2]-p2[2])^2
 end
 
 
 function plot_spatial_graph(; au=nothing, pts=nothing, plot_title="Spatial Partitioning")
- 
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Visualizes the results of a spatial partitioning. It plots the generated polygons,
+              the adjacency graph, the centroids, the overall hull, and optionally the raw data points.
+    Inputs:
+        - au: The `areal_units` object returned by `assign_spatial_units`.
+        - pts: Optional. A vector of (x, y) tuples representing the raw data points to overlay.
+        - plot_title: The title for the plot.
+    Outputs:
+        - A `Plots.Plot` object.
+    """
     # 2. Base Plot Initialization
     plt = Plots.plot(aspect_ratio=:equal, legend=false)
     Plots.title!(plt, plot_title)
@@ -1324,6 +1505,15 @@ end
 
 
 function adjacency_matrix_to_nb( W )
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Converts a binary adjacency matrix into a neighborhood list format (often called 'nb').
+    Inputs:
+        - W: An adjacency matrix.
+    Outputs:
+        - A vector of vectors, where each inner vector lists the indices of the neighbors for that node.
+    """
     nau = size(W)[1]
     # W = LowerTriangular(W)  # using LinearAlgebra
     nb = [Int[] for _ in 1:nau]
@@ -1335,6 +1525,15 @@ end
 
 
 function nb_to_adjacency_matrix( nb )
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Converts a neighborhood list ('nb') into a binary adjacency matrix.
+    Inputs:
+        - nb: A neighborhood list (vector of vectors).
+    Outputs:
+        - A dense adjacency matrix of `Int8`.
+    """
     nau = Integer( length( unique( reduce(vcat, nb) )) )
     W = zeros( Int8, nau, nau )
     Threads.@threads for i in 1:nau
@@ -1348,6 +1547,17 @@ end
 
 
 function nodes( adj )
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Processes a neighborhood list to extract graph edges and compute the BYM2 scaling factor.
+    Inputs:
+        - adj: A neighborhood list (vector of vectors).
+    Outputs:
+        - A tuple containing:
+            - `node1`, `node2`: Vectors representing the start and end nodes of each unique edge.
+            - `scalefactor`: The scaling factor required for the BYM2 model parameterization.
+    """
     nau = length(adj)
     N_edges = Integer( length( reduce(vcat, adj) )/2 )
     node1 =  fill(0, N_edges); 
@@ -1382,13 +1592,34 @@ end
    
     
 function assign_time_units(t_v; time_method="regular", t_N=nothing, u_N=12, kwargs...)
-
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:05:38
+    Synopsis: Discretizes a continuous time vector into integer-based temporal units (e.g., years)
+              and seasonal units (e.g., months), preparing it for use in discrete spatiotemporal models.
+    Inputs:
+        - t_v: A vector of continuous time values (e.g., fractional years).
+        - time_method: The method for discretization. Currently, only "regular" is supported, which assumes
+                       integer steps correspond to primary time units like years.
+        - t_N: Optional. The expected number of unique primary time units (e.g., years). A warning is
+               printed if the actual range of `t_v` does not match this value.
+        - u_N: The number of seasonal bins to create from the fractional part of the time values. Defaults to 12.
+        - kwargs: Additional arguments (currently unused).
+    Outputs:
+        - A `NamedTuple` containing all temporal information, including:
+            - `t_idx`: An integer index for the primary time unit of each observation.
+            - `t0`, `t1`: The start and end integer time values.
+            - `tn`, `t_N`: The total number of primary time units.
+            - `u_idx`: An integer index for the seasonal unit of each observation.
+            - `u_N`: The number of seasonal bins.
+            - And other related temporal metadata like breaks and midpoints.
+    """
     if time_method=="regular"
 
         tint = Int.(floor.(t_v))
         t0, t1 = minimum(tint), maximum(tint)
         t_n = t1-t0
-        if !isnothing(t_N) 
+        if !isnothing(t_N)
             if t_n != t_N
                 print("warning: time range and unique years do not match")
             end
@@ -1429,17 +1660,22 @@ end
 
 
 
+
 function estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx, target_ts; grid_res=600, sd_extension_factor=0.25)
     """
-    Synopsis: Estimates 2D KDE for a specific time slice with extrapolation.
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Estimates a 2D Kernel Density Estimation (KDE) for a specific time slice from a
+              spatiotemporal dataset. It uses a simple Gaussian kernel and defines the grid
+              boundaries by extrapolating from the data's spatial extent.
     Inputs:
-    - s_coord_tuple: Vector of (x, y) coordinates for all time points.
-    - t_idx: Vector of time indices corresponding to s_coord_tuple.
-    - target_ts: The specific time slice to estimate KDE for.
-    - grid_res: Resolution of the output grid (e.g., 100 for 100x100 grid).
-    - sd_extension_factor: Multiplier for standard deviation to define the bandwidth.
+        - s_coord_tuple: A vector of all (x, y) coordinates.
+        - t_idx: A vector of time indices corresponding to the coordinates.
+        - target_ts: The specific time slice to compute the KDE for.
+        - grid_res: The resolution of the output grid.
+        - sd_extension_factor: A factor to determine the kernel bandwidth based on data standard deviation.
     Outputs:
-    - Tuple (x_grid, y_grid, intensity) where intensity is a matrix.
+        - A tuple `(x_grid, y_grid, intensity)` where `intensity` is the 2D KDE matrix.
     """
     # Filter points for the target time slice
  
@@ -1476,6 +1712,17 @@ end
 
 
 function calculate_metrics(au_obj)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Calculates summary statistics for a given spatial partitioning. It computes the mean,
+              standard deviation, and coefficient of variation (CV) of the number of data points
+              assigned to each spatial unit.
+    Inputs:
+        - au_obj: The `areal_units` object containing centroids and original point coordinates.
+    Outputs:
+        - A `NamedTuple` with fields `mean_density`, `sd_density`, and `cv_density`.
+    """
     # Map coordinates from constituent vectors to avoid FieldError
     local observation_points = tuple.(au_obj.s_x, au_obj.s_y)
     
@@ -1502,8 +1749,14 @@ end
 
 function get_spatial_graph( centroids, adjacency_edges )
     """
-    Synopsis: Converts partitioning results into a formal SimpleGraph. 
-    Outputs: A SimpleGraph object.
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Converts a list of centroids and adjacency edges into a `SimpleGraph` object.
+    Inputs:
+        - centroids: A vector of centroid coordinates.
+        - adjacency_edges: A vector of tuples, where each tuple represents an edge between two centroids.
+    Outputs:
+        - A `SimpleGraph` object from the `Graphs.jl` package.
     """
     n = length(centroids)
     g = SimpleGraph(n)
@@ -1518,17 +1771,19 @@ end
 
 
 function plot_kde_simple(s_coord_tuple; grid_res=600, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
-    # Internal wrapper for estimate_local_kde_with_extrapolation
-    # Description: Generates a simple 2D Heatmap of spatial intensity using Kernel Density Estimation.
-    # Inputs:
-    #   - s_coord_tuple: Vector of (x, y) coordinate tuples.
-    #   - grid_res: Resolution of the output grid.
-    #   - sd_extension_factor: Factor to extend the bandwidth standard deviation.
-    #   - title: Title for the generated plot.
-    # Outputs:
-    #   - A Plots.Plot object (Heatmap with scatter overlay).
-    # Using a dummy t_idx of 1s since plotting a static slice
- 
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Generates a 2D heatmap of spatial intensity using Kernel Density Estimation (KDE).
+              This method is a wrapper around `estimate_local_kde_with_extrapolation` for static (non-temporal) data.
+    Inputs:
+        - s_coord_tuple: A vector of (x, y) coordinate tuples.
+        - grid_res: The resolution of the output grid.
+        - sd_extension_factor: A factor to determine the kernel bandwidth.
+        - title: The title for the plot.
+    Outputs:
+        - A `Plots.Plot` object showing the KDE heatmap with a scatter overlay of the points.
+    """
     t_idx_dummy = ones(Int, length(s_coord_tuple))
     x_g, y_g, intensity = estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx_dummy, 1; grid_res=grid_res, sd_extension_factor=sd_extension_factor)
 
@@ -1541,6 +1796,33 @@ function plot_kde_simple(s_coord_tuple; grid_res=600, sd_extension_factor=0.25, 
                    markersize=2, markercolor=:white, markeralpha=0.5, label="Points")
     return plt
 end
+
+function plot_kde_simple(df::DataFrame; x=:s_x, y=:s_y, grid_res=600, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+    """
+    BSTM Partitioning Utility v1.0.1
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: An overloaded method for `plot_kde_simple` that accepts a `DataFrame` directly,
+              assuming the presence of columns for spatial coordinates.
+    Inputs:
+        - df: A `DataFrame`.
+        - x, y: Symbols representing the names of the coordinate columns (defaults to :s_x, :s_y).
+        - kwargs: Other arguments passed to the primary `plot_kde_simple` method.
+    Outputs:
+        - A `Plots.Plot` object.
+    Rationale for v1.0.1:
+        - Corrected a typographical error ("Overwride") in the error message.
+        - Made the error message dynamic to reflect the actual column names provided by the user.
+    """
+    if !hasproperty(df, x) || !hasproperty(df, y)
+        error("Input DataFrame for plot_kde_simple expects columns `:$x` and `:$y`. Override with x=... and y=... if using different names.")
+    end
+
+    # Convert DataFrame columns to a vector of tuples
+    s_coord_tuple = tuple.(df[!,x], df[!,y])
+
+    # Call the existing method that works with a tuple vector
+    return plot_kde_simple(s_coord_tuple; grid_res=grid_res, sd_extension_factor=sd_extension_factor, title=title)
+end
  
 
 
@@ -1548,19 +1830,16 @@ end
 
 function libgeos_lattice_adjacency_matrix(rows::Int, cols::Int)
     """
-    libgeos_lattice_adjacency_matrix(rows, cols)
-
-    Description:
-    Generates a sparse adjacency matrix for a regular 2D lattice using LibGEOS for spatial geometry operations.
-    Constructs unit square polygons for each cell and identifies neighbors based on Queen contiguity
-    (any shared boundary point or edge).
-
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Generates a sparse adjacency matrix for a regular 2D lattice using `LibGEOS.jl`.
+              It constructs unit square polygons for each cell and identifies neighbors based on
+              Queen contiguity (i.e., if their geometries intersect).
     Inputs:
-    - rows (Int): Number of rows in the lattice grid.
-    - cols (Int): Number of columns in the lattice grid.
-
-    Output:
-    - W (SparseMatrixCSC{Int, Int}): A binary sparse adjacency matrix of size (rows*cols) x (rows*cols).
+        - rows: The number of rows in the lattice.
+        - cols: The number of columns in the lattice.
+    Outputs:
+        - A `SparseMatrixCSC{Int, Int}` representing the binary adjacency matrix.
     """
     # Create polygons for each cell in the lattice
     polygons = []
@@ -1592,5 +1871,3 @@ function libgeos_lattice_adjacency_matrix(rows::Int, cols::Int)
     end
     return W
 end
-
-
