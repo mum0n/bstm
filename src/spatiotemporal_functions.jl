@@ -43,6 +43,10 @@ abstract type Manifold end
 abstract type ManifoldModel <: Manifold end
 abstract type ManifoldOperator <: Manifold end
 abstract type ManifoldSupervisor <: Manifold end
+# BSTM Manifold Primitives v06.3
+# Timestamp: 2026-06-27 21:00:00
+# Rationale: Modified GP, FITC, and SVGP structs to support anisotropic lengthscales by allowing
+#            `lengthscale_prior` to be a Vector of distributions.
 
 # --- 2. Manifold Primitives (ManifoldModel) ---
 
@@ -63,12 +67,12 @@ struct AR1 <: ManifoldModel; rho_prior::UnivariateDistribution; sigma_prior::Uni
 struct DAG <: ManifoldModel; adjacency_matrix::AbstractMatrix; sigma_prior::UnivariateDistribution; end
 
 # 2.3 Continuous & Spectral Primitives
-struct GP <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; kernel::String; end
-struct FITC <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
+struct GP <: ManifoldModel; lengthscale_prior::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma_prior::UnivariateDistribution; kernel::String; end
+struct FITC <: ManifoldModel; lengthscale_prior::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
 struct RFF <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; kernel::String; end
 struct FFT <: ManifoldModel; sigma_prior::UnivariateDistribution; nbins::Int; kernel::String; lengthscale_prior::UnivariateDistribution; end
 struct SPDE <: ManifoldModel; sigma_prior::UnivariateDistribution; kappa_prior::UnivariateDistribution; end
-struct SVGP <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
+struct SVGP <: ManifoldModel; lengthscale_prior::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
 struct Warp <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; kernel::String; end
 struct Nystrom <: ManifoldModel; sigma_prior::UnivariateDistribution; lengthscale_prior::UnivariateDistribution; n_inducing::Int; end
 struct Wavelet <: ManifoldModel
@@ -86,9 +90,6 @@ struct PSpline <: ManifoldModel
     sigma_prior::UnivariateDistribution
 end
 
-# BSTM Manifold Primitives v06.2
-# Timestamp: 2026-06-27 19:30:00
-# Rationale: Adding TensorProductSmooth to support dimension-specific smooths.
 struct TensorProductSmooth <: ManifoldModel
     Q_template::AbstractMatrix
     sigma_prior::UnivariateDistribution
@@ -2527,6 +2528,150 @@ mutable struct ManifoldRegistry
     outcomes_N::Int
 end
  
+
+
+# BSTM Manifold Extraction Engine v1.0.0
+# Timestamp: 2026-06-27 20:15:00
+# Rationale: This set of functions implements the `extract_manifold` method, which was
+#            identified as a critical missing placeholder in the `_discover_manifold_realizations`
+#            engine. These methods use multiple dispatch to handle the extraction of posterior
+#            samples for each specific manifold type from a fitted MCMC chain.
+
+function _get_latent_field(chain, p_names, base_name, n_units, n_samples, outcomes_N, k, spec)
+    """
+    Internal helper to robustly extract latent field parameters for a specific outcome.
+    """
+    # Construct outcome-specific parameter names
+    var_name = string(spec.var)
+    m_domain = spec.domain
+    
+    # Generic naming convention: latent_domain_var_outcome
+    latent_name_str = "latent_$(m_domain)_$(var_name)_$(k)"
+    if !(latent_name_str in p_names)
+        # Fallback for simpler naming conventions
+        latent_name_str = "latent_$(m_domain)_$(k)"
+        if !(latent_name_str in p_names)
+             latent_name_str = base_name # Final fallback
+        end
+    end
+    
+    return get_params_vector(chain, latent_name_str, n_units)
+end
+
+function extract_manifold(m_obj::Union{ICAR, Besag, RW1, RW2, AR1, Leroux, SAR, Cyclic}, chain, M, n_samples, outcomes_N, p_names, spec)
+    structured_fields = Vector{Matrix{Float64}}()
+    
+    for k in 1:outcomes_N
+        var_name = string(spec.var)
+        m_domain = spec.domain
+        sigma_name = "sigma_$(m_domain)_$(var_name)_$(k)"
+        if !("sigma_$(m_domain)_$(var_name)_$(k)" in p_names) sigma_name = "sigma_$(m_domain)_$(k)"; end
+        
+        n_units = if m_domain == :spatial; M.s_N; elseif m_domain == :temporal; M.t_N; else M.u_N; end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)
+        latent_samples = _get_latent_field(chain, p_names, "latent_$(m_domain)", n_units, n_samples, outcomes_N, k, spec)
+        
+        # The effect is the latent field scaled by its standard deviation
+        effect = latent_samples .* sigma_samples
+        push!(structured_fields, effect)
+    end
+    
+    # For these models, the "structured" and "noisy" components are the same.
+    return (structured=structured_fields, noisy=structured_fields)
+end
+
+function extract_manifold(m_obj::BYM2, chain, M, n_samples, outcomes_N, p_names, spec)
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        var_name = string(spec.var)
+        m_domain = spec.domain
+        sigma_name = "sigma_$(m_domain)_$(var_name)_$(k)"
+        rho_name = "rho_$(m_domain)_$(var_name)_$(k)"
+        
+        sigma_samples = get_params_vector(chain, sigma_name, 1)
+        rho_samples = get_params_vector(chain, rho_name, 1)
+        
+        struct_samples = _get_latent_field(chain, p_names, "latent_struct_$(m_domain)", M.s_N, n_samples, outcomes_N, k, spec)
+        iid_samples = _get_latent_field(chain, p_names, "latent_iid_$(m_domain)", M.s_N, n_samples, outcomes_N, k, spec)
+        
+        structured_effect = (sqrt.(rho_samples) .* struct_samples) .* sigma_samples
+        noisy_effect = (sqrt.(1.0 .- rho_samples) .* iid_samples) .* sigma_samples .+ structured_effect
+        
+        push!(structured_fields, structured_effect)
+        push!(noisy_fields, noisy_effect)
+    end
+    
+    return (structured=structured_fields, noisy=noisy_fields)
+end
+
+function extract_manifold(m_obj::IID, chain, M, n_samples, outcomes_N, p_names, spec)
+    structured_fields = Vector{Matrix{Float64}}()
+    
+    for k in 1:outcomes_N
+        var_name = string(spec.var)
+        m_domain = spec.domain
+        sigma_name = "sigma_$(m_domain)_$(var_name)_$(k)"
+        
+        n_units = if m_domain == :mixed; spec.params.n_cat; elseif m_domain == :spatial; M.s_N; else M.t_N; end
+        
+        sigma_samples = get_params_vector(chain, sigma_name, 1)
+        latent_samples = _get_latent_field(chain, p_names, "latent_$(m_domain)", n_units, n_samples, outcomes_N, k, spec)
+        
+        effect = latent_samples .* sigma_samples
+        push!(structured_fields, effect)
+    end
+    
+    return (structured=structured_fields, noisy=structured_fields)
+end
+
+function extract_manifold(m_obj::Union{PSpline, BSpline, TPS, RFF, FFT}, chain, M, n_samples, outcomes_N, p_names, spec)
+    var_sym = spec.var
+    B_mat = M.basis_matrices[var_sym]
+    n_basis_cols = size(B_mat, 2)
+    
+    structured_fields = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        beta_name = "beta_basis_$(var_sym)_$(k)"
+        coeffs = get_params_vector(chain, beta_name, n_basis_cols)
+        
+        # The effect is the basis matrix multiplied by the coefficients for each sample
+        effect = B_mat * coeffs'
+        push!(structured_fields, effect') # Transpose to get [n_obs x n_samples]
+    end
+    
+    return (structured=structured_fields, noisy=structured_fields)
+end
+
+function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes_N, p_names, spec)
+    structured_fields = Vector{Matrix{Float64}}()
+    
+    for k in 1:outcomes_N
+        # Dynamics models store their full state trajectory
+        state_name = "dyn_field_$(spec.key)_$(k)"
+        if !(state_name in p_names) state_name = "dyn_field_$(spec.key)"; end
+        
+        # The state is typically [n_time_steps, n_samples]
+        latent_samples = get_params_vector(chain, state_name, M.t_N)
+        
+        # Map the temporal state to each observation
+        effect = latent_samples[M.t_idx, :]
+        push!(structured_fields, effect)
+    end
+    
+    return (structured=structured_fields, noisy=structured_fields)
+end
+
+# Fallback for other manifold types
+function extract_manifold(m_obj::ManifoldModel, chain, M, n_samples, outcomes_N, p_names, spec)
+    @warn "No specific `extract_manifold` method for $(typeof(m_obj)). Returning zero matrix."
+    zero_field = [zeros(Float64, M.y_N, n_samples) for _ in 1:outcomes_N]
+    return (structured=zero_field, noisy=zero_field)
+end
+
  
  
 
@@ -3225,76 +3370,46 @@ function process_temporal_module!(opt_dict, mod_data, registries, hyperpriors)
         else; @warn "Temporal index variable ':$t_var_sym' not found in data."; end
     end
 end
- 
-
-function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, manifolds_registry)
-    # BSTM Internal Utility v2.2.0
-    # Timestamp: 2026-06-27 19:30:00
-    # Synopsis: Processes `smooth()` modules, now with support for tensor product smooths
-    #           defined with dimension-specific models and parameters.
-    # Rationale for v2.2.0:
-    #     - Added logic to detect if the `model` parameter is a `NamedTuple`, which triggers
-    #       the new tensor product construction.
-    #     - The new path generates 1D basis and penalty matrices for each dimension and combines
-    #       them using Kronecker products (for bases) and tensor sums (for penalties).
-    #     - The resulting combined penalty matrix is stored in the module's parameters to be
-    #       picked up by the new `TensorProductSmooth` manifold constructor.
-    #     - The original logic for single-model smooths is preserved as the fallback path.
+ function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, manifolds_registry)
+    # BSTM Internal Utility v2.4.0
+    # Timestamp: 2026-06-27 22:30:00
+    # Synopsis: Processes `smooth()` modules, now with expanded support for additional basis model types.
+    # Rationale for v2.4.0:
+    #     - Added 'linear', 'invdist', and 'kriging' to the `basis_models` list, allowing the
+    #       parser to correctly route these new smoother types to the `bstm_smooth_basis_*D` functions.
 
     data = opt_dict[:data]
     params = mod_data[:params]
     model_param = get(params, :model, "pspline")
 
-    # NEW: Check for dimension-specific model definitions (tensor product smooths)
+    # Handle Tensor Product Smooths first
     if model_param isa NamedTuple
         vars = mod_data[:variables]
         n_vars = length(vars)
         
-        if n_vars < 2
-            @warn "Tensor product smooth specified for a single variable in `smooth($(join(vars, ",")))`. Treating as a 1D smooth."
-            # Fall through to the standard logic below
-        else
-            B_list = []
-            Q_list = []
-            nbins_list = []
-
+        if n_vars >= 2
+            B_list, Q_list, nbins_list = [], [], []
             for var_str in vars
                 var_sym = Symbol(var_str)
-                
-                # Extract per-variable model and parameters
                 model_i = string(get(model_param, var_sym, "pspline"))
-                
-                # Extract parameters, checking for both global and per-variable specification
                 nbins_i = get(get(params, :nbins, (;)), var_sym, get(params, :nbins, 20))
                 degree_i = get(get(params, :degree, (;)), var_sym, get(params, :degree, 3))
-                diff_order_i = get(get(params, :diff_order, (;)), var_sym, get(params, :diff_order, 2))
                 ls_i = get(get(params, :lengthscale, (;)), var_sym, get(params, :lengthscale, nothing))
                 
                 kwargs_i = Dict{Symbol, Any}()
                 if !isnothing(ls_i) kwargs_i[:lengthscale] = ls_i end
 
                 vals_i = data[!, var_sym]
-                
-                # Generate 1D basis matrix
                 push!(B_list, bstm_smooth_basis_1D(model_i, vals_i, nbins_i, degree_i; kwargs_i...))
                 
-                # Generate 1D penalty matrix
-                template_type = if model_i in ["pspline", "rw2"]; :rw2
-                                elseif model_i == "rw1"; :rw1
-                                else :iid end
+                template_type = if model_i in ["pspline", "rw2"]; :rw2 elseif model_i == "rw1"; :rw1 else :iid end
                 push!(Q_list, build_structure_template(template_type, nbins_i).matrix)
                 push!(nbins_list, nbins_i)
             end
 
-            # Combine basis matrices via Kronecker product
-            # For data ordered (x1,y1), (x2,y1), ..., (x1,y2), ..., the basis is kron(By, Bx)
-            # Assuming vars are [x, y, ...], we reverse the list for kron
             B_final = B_list[end]
-            for i in (n_vars-1):-1:1
-                B_final = kron(B_final, B_list[i])
-            end
+            for i in (n_vars-1):-1:1; B_final = kron(B_final, B_list[i]); end
 
-            # Combine penalty matrices via tensor sum
             Q_final = Q_list[1]
             n_units_total = nbins_list[1]
             for i in 2:n_vars
@@ -3306,21 +3421,21 @@ function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, man
             
             reg_key = Symbol(join(vars, "_"))
             basis_matrices_registry[reg_key] = B_final
-            
-            # Modify mod_data to be processed by the next steps
             mod_data[:params][:model] = "tensor_product_smooth"
             mod_data[:params][:Q_tensor] = Q_final
-            
-            # This path is complete, return to avoid falling through to the old logic.
-            return 
+            return
         end
     end
 
-    # --- Fallback to existing logic if model is not a NamedTuple ---
+    # --- Standard Model Processing ---
     model_str = string(model_param)
-    basis_models = ["pspline", "bspline", "tps", "rff", "fft", "moran", "spherical", "barycentric", "decay"]
+    
+    # Define categories of smoothers
+    basis_models = ["pspline", "bspline", "tps", "rff", "fft", "moran", "spherical", "barycentric", "decay", "wavelet", "linear", "invdist", "kriging"]
+    continuous_kernel_models = ["gp", "fitc", "svgp", "nystrom", "warp", "spde", "exponentialdecay"]
 
     if model_str in basis_models
+        # --- Path 1: Basis Function Models ---
         if !isempty(mod_data[:variables])
             nb = get(mod_data[:params], :nbins, get(mod_data[:params], :m_rff, 20))
             reg_key = Symbol(join(mod_data[:variables], "_"))
@@ -3339,15 +3454,18 @@ function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, man
                 end
             end
         end
+    elseif model_str in continuous_kernel_models
+        # --- Path 2: Direct Kernel Models ---
+        return
     else
-        # --- Path 2: Structured Random Effect Smoothing (Existing Logic) ---
+        # --- Path 3: Structured GMRFs on Binned Covariates ---
         if !haskey(opt_dict, :structured_smooths); opt_dict[:structured_smooths] = []; end
 
         vars = mod_data[:variables]
         nbins_param = get(mod_data[:params], :nbins, 20)
         smooth_name = Symbol(join(vars, "_"))
 
-        if occursin("⊗", model_str) # 2D Interaction Smooth
+        if occursin("⊗", model_str) # 2D Interaction
             if length(vars) != 2; @warn "Interaction smooth on $(join(vars, ",")) requires exactly 2 variables."; return; end
             
             parts = split_terms_at_depth(model_str, "⊗")
@@ -3365,9 +3483,9 @@ function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, man
                 indices = (idx1 .- 1) .* nbins2 .+ idx2,
                 Q_template = kron(Q2, Q1),
                 n_units = nbins1 * nbins2,
-                sigma_prior = Exponential(1.0) # Default prior
+                sigma_prior = Exponential(1.0)
             ))
-        else # 1D Structured Smooth
+        else # 1D GMRF Smooth
             if length(vars) != 1; @warn "1D structured smooth on $(join(vars, ",")) requires exactly 1 variable."; return; end
 
             _, indices = apply_discretization_logic(data[!, Symbol(vars[1])], nbins_param)
@@ -3378,11 +3496,12 @@ function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, man
                 indices = indices,
                 Q_template = build_structure_template(Symbol(model_str), n_units).matrix,
                 n_units = n_units,
-                sigma_prior = Exponential(1.0) # Default prior
+                sigma_prior = Exponential(1.0)
             ))
         end
     end
 end
+
  
 
 function process_dynamics_module!(opt_dict, mod_data)
@@ -4939,26 +5058,38 @@ function _apply_manifold!(eta, spec, m_obj::Eigen, M, noise)
     reconstructed_data = U * z
     for i in 1:n_obs; Turing.@addlogprob! logpdf(MvNormal(reconstructed_data[:, i], pdef_sd^2 * I), cov_data[:, i]); end
 end
-
 function _apply_manifold!(eta, spec, m_obj::GP, M, noise)
     """
-    BSTM Internal Utility v1.1.0
-    Timestamp: 2026-06-26 18:45:00
+    BSTM Internal Utility v1.2.0
+    Timestamp: 2026-06-27 21:00:00
     Synopsis: Applies a Gaussian Process manifold to the linear predictor.
-    Rationale for v1.1.0:
-        - Corrected an `UndefVarError` by explicitly declaring `ls` and `sigma` as local
-          variables before they are sampled.
+    Rationale for v1.2.0:
+        - Added support for anisotropic kernels by checking if `lengthscale_prior` is a vector.
+        - If anisotropic, it samples a vector of lengthscales and uses `ARDTransform` to create
+          a kernel with different lengthscales for each dimension.
+        - If isotropic, it retains the original behavior with a single lengthscale and `ScaleTransform`.
     """
     var_sym = spec.var
     T = eltype(eta)
-    ls::T = 0.0
+    
+    local ls
+    if m_obj.lengthscale_prior isa AbstractVector
+        ls ~ NamedDist(Product(m_obj.lengthscale_prior), Symbol("ls_gp_", var_sym))
+    else
+        ls_scalar::T = 0.0
+        ls_scalar ~ NamedDist(m_obj.lengthscale_prior, Symbol("ls_gp_", var_sym))
+        ls = ls_scalar
+    end
+
     sigma::T = 0.0
-    ls ~ NamedDist(m_obj.lengthscale_prior, Symbol("ls_gp_", var_sym))
     sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_gp_", var_sym))
     coords = spec.params.coords
 
     kernel_base = get_kernel_from_string(m_obj.kernel)
-    k_gp = sigma^2 * kernel_base ∘ ScaleTransform(1/ls)
+    
+    # Use ARDTransform for vector lengthscales (anisotropy)
+    transform = ls isa AbstractVector ? ARDTransform(1 ./ ls) : ScaleTransform(1/ls)
+    k_gp = sigma^2 * kernel_base ∘ transform
     
     K_ff = kernelmatrix(k_gp, coords) + noise*I
     f_latent ~ NamedDist(MvNormal(zeros(size(coords,1)), K_ff), Symbol("latent_smooth_", var_sym))
@@ -4968,18 +5099,28 @@ end
 
 function _apply_manifold!(eta, spec, m_obj::Union{SVGP, FITC}, M, noise)
     """
-    BSTM Internal Utility v1.1.0
-    Timestamp: 2026-06-26 18:45:00
+    BSTM Internal Utility v1.2.0
+    Timestamp: 2026-06-27 21:00:00
     Synopsis: Applies a sparse GP (SVGP or FITC) manifold to the linear predictor.
-    Rationale for v1.1.0:
-        - Corrected an `UndefVarError` by explicitly declaring `ls` and `sigma` as local
-          variables before they are sampled.
+    Rationale for v1.2.0:
+        - Added support for anisotropic kernels by checking if `lengthscale_prior` is a vector.
+        - If anisotropic, it samples a vector of lengthscales and uses `ARDTransform` to create
+          a kernel with different lengthscales for each dimension.
+        - If isotropic, it retains the original behavior with a single lengthscale and `ScaleTransform`.
     """
     var_sym = spec.var
     T = eltype(eta)
-    ls::T = 0.0
+
+    local ls
+    if m_obj.lengthscale_prior isa AbstractVector
+        ls ~ NamedDist(Product(m_obj.lengthscale_prior), Symbol("ls_svgp_", var_sym))
+    else
+        ls_scalar::T = 0.0
+        ls_scalar ~ NamedDist(m_obj.lengthscale_prior, Symbol("ls_svgp_", var_sym))
+        ls = ls_scalar
+    end
+
     sigma::T = 0.0
-    ls ~ NamedDist(m_obj.lengthscale_prior, Symbol("ls_svgp_", var_sym))
     sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_svgp_", var_sym))
     n_inducing = m_obj.n_inducing
     coords = spec.params.coords
@@ -4989,7 +5130,11 @@ function _apply_manifold!(eta, spec, m_obj::Union{SVGP, FITC}, M, noise)
     inducing_locs ~ MvNormal(vec(mean_coords), Diagonal(vec(std_coords)))
 
     kernel_base = get_kernel_from_string(m_obj.kernel)
-    k_svgp = sigma^2 * kernel_base ∘ ScaleTransform(1/ls)
+    
+    # Use ARDTransform for vector lengthscales (anisotropy)
+    transform = ls isa AbstractVector ? ARDTransform(1 ./ ls) : ScaleTransform(1/ls)
+    k_svgp = sigma^2 * kernel_base ∘ transform
+
     K_uu = kernelmatrix(k_svgp, inducing_locs) + noise*I
     
     u_latent ~ MvNormal(zeros(n_inducing), K_uu)
@@ -4998,6 +5143,8 @@ function _apply_manifold!(eta, spec, m_obj::Union{SVGP, FITC}, M, noise)
     f_mean = K_fu * (K_uu \ u_latent)
     eta .+= f_mean
 end
+
+
 
 function _apply_manifold!(eta, spec, m_obj::SPDE, M, noise)
     """
@@ -5305,13 +5452,14 @@ const UNINFORMATIVE_PRIORS = Dict(
 
 
 function _reconstruct(arch::MultivariateArchitecture, modelname::String, chain, M, PS, alpha)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: The internal reconstruction engine specifically for multivariate models. It handles
-              the extraction and summarization of parameters and latent fields for multiple,
-              correlated outcomes.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 20:15:00
+    # Synopsis: The internal reconstruction engine for multivariate models.
+    # Rationale for v1.1.0:
+    #     - Implemented the missing logic for out-of-sample prediction of `smooth()` manifolds.
+    #       It now correctly generates the basis matrix for the prediction surface (`PS`) and
+    #       applies the posterior coefficients to compute the smooth effect on the new data.
+
     N_samples = size(chain, 1)
     outcomes_N = Int(M.outcomes_N)
     p_names = string.(FlexiChains.parameters(chain))
@@ -5373,7 +5521,24 @@ function _reconstruct(arch::MultivariateArchitecture, modelname::String, chain, 
                     B_mat_train = M.basis_matrices[spec.var]
                     eta[1:M.y_N, k, :] .+= B_mat_train * latent_samples
                     if N_PS > 0
-                        # Re-compute basis for PS grid - logic similar to univariate _reconstruct
+                        # --- COMPLETED LOGIC ---
+                        # Re-compute basis matrix for the prediction surface (PS)
+                        smooth_vars = spec.variables
+                        ps_coords = Matrix{Float64}(PS.data[!, Symbol.(smooth_vars)])
+                        nbins = hasproperty(m_obj, :nbins) ? m_obj.nbins : 20
+                        
+                        local B_mat_pred
+                        if length(smooth_vars) == 1
+                            B_mat_pred = bstm_smooth_basis_1D(string(m_obj.model), ps_coords[:,1], nbins)
+                        elseif length(smooth_vars) == 2
+                            B_mat_pred = bstm_smooth_basis_2D(string(m_obj.model), ps_coords, nbins)
+                        elseif length(smooth_vars) == 3
+                            B_mat_pred = bstm_smooth_basis_3D(string(m_obj.model), ps_coords, nbins)
+                        else # 4D or more
+                            B_mat_pred = bstm_smooth_basis_4D(string(m_obj.model), ps_coords, nbins)
+                        end
+                        
+                        eta[(M.y_N+1):end, k, :] .+= B_mat_pred * latent_samples
                     end
                 end
             end
@@ -5384,7 +5549,7 @@ function _reconstruct(arch::MultivariateArchitecture, modelname::String, chain, 
     if "L_corr" in p_names
         L_corr_samples = get_params_matrix_sizestructured(chain, "L_corr", (outcomes_N, outcomes_N))
         for j in 1:N_samples
-            eta[:, :, j] .+= latent_innov_samples[:, :, j] * L_corr_samples[:,:,j]
+            eta[:, :, j] .+= latent_innov_samples[:, :, j] * L_corr_samples[:,:,j]'
         end
     end
 
@@ -6914,39 +7079,34 @@ function sample_spectral_density(kernel_name::String, D_in::Int, M_rff::Int, len
 end
 
 
+function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, degree::Int; W=nothing, kwargs...)
+    # BSTM Smooth Basis Factory v2.2.0
+    # Timestamp: 2026-06-27 22:30:00
+    # Synopsis: A factory function that generates a 1D basis matrix for various smoothers.
+    # Rationale for v2.2.0:
+    #     - Added support for 'linear', 'invdist', and 'kriging' basis types.
+    #     - 'linear' is an alias for the existing piecewise linear (hat function) basis.
+    #     - 'invdist' implements an inverse squared distance weighting basis.
+    #     - 'kriging' implements a basis using a Gaussian (Squared Exponential) kernel.
 
-
-
-# Rationale: Centralizing the generation of non-linear basis matrices (B).
-# This factory ensures absolute parity with the v06.1 manifold taxonomy.
-
-function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, degree::Int; kwargs...)
-    # # 1. Initialization and Scoping
-    # Rationale: Ensures every call returns a valid N x M matrix to prevent sampler collapse.
     n_obs = length(vals)
     B = zeros(Float64, n_obs, nbins)
     
-    # Technical Metadata Discovery
     v_min = minimum(vals)
     v_max = maximum(vals)
     v_std = std(vals) + 1e-9
 
-    # # 2. Manifold Dispatch Registry
-    
-    # # 2.1 B-Splines / P-Splines (Piecewise Polynomials)
-    if type in ["bspline", "pspline", "smooth"]
-        # Step A: Define knot sequence using a range-based sequence for full coverage.
-        knots = collect(range(v_min, stop=v_max, length=nbins - degree + 1))
-        
-        # Step B: Recursive Radial Expansion
+    if type in ["bspline", "pspline", "smooth", "barycentric", "linear"]
+        knots = collect(range(v_min, stop=v_max, length=nbins))
+        h = (v_max - v_min) / (nbins > 1 ? (nbins - 1) : 1)
+        h = h > 0 ? h : 1.0
+
         for m in 1:nbins
-            # Index resolution without 'clamp'
-            k_idx = m > length(knots) ? length(knots) : (m < 1 ? 1 : m)
-            target_knot = knots[k_idx]
-            B[:, m] .= exp.(-((vals .- target_knot).^2) ./ (2.0 * v_std^2))
+            dist = abs.(vals .- knots[m]) ./ h
+            mask = dist .< 1.0
+            B[mask, m] .= 1.0 .- dist[mask]
         end
 
-    # # 2.2 Thin Plate Splines (TPS - Bending Energy Minimization)
     elseif type == "tps"
         knots = quantile(vals, range(0, 1, length=nbins))
         for m in 1:nbins
@@ -6954,23 +7114,21 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
             B[:, m] .= (r.^2) .* log.(r .+ 1e-6)
         end
 
-    # # 2.3 Random Fourier Features (RFF - Spectral GP Approximation)
     elseif type == "rff"
         m_rff = nbins
         ls = get(kwargs, :lengthscale, v_std)
         Omega = randn(1, m_rff) ./ ls
-        Phi = rand(m_rff) .* (2.0 * pi)
-        B .= sqrt(2.0 / m_rff) .* cos.((vals * Omega) .+ Phi')
+        Phi_phases = rand(m_rff) .* (2.0 * pi)
+        B .= sqrt(2.0 / m_rff) .* cos.((vals * Omega) .+ Phi_phases')
 
-    # # 2.4 Fast Fourier Transform (FFT Basis - Toroidal Grid)
     elseif type == "fft"
-        t_coords = collect(range(0, 1, length=n_obs))
+        ls = get(kwargs, :lengthscale, v_std)
+        t_coords = vals ./ ls
         for m in 1:div(nbins, 2)
             B[:, 2m-1] .= sin.(2.0 * pi * m .* t_coords)
             B[:, 2m]   .= cos.(2.0 * pi * m .* t_coords)
         end
 
-    # # 2.5 Wavelet (Multi-Resolution Decomposition)
     elseif type == "wavelet"
         for m in 1:nbins
             center = v_min + (m/nbins) * (v_max - v_min)
@@ -6978,28 +7136,34 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
             B[:, m] .= (vals .>= center) .& (vals .< (center + width)) ? 1.0 : 0.0
         end
 
-    # # 2.6 Moran's I Basis (Spectral Filtering) - RESTORED
-    # Rationale: Uses eigenvectors of the spatial weights matrix to capture specific scales.
     elseif type == "moran"
-        # Placeholder: In production, this requires the adjacency matrix W.
-        # Here we provide a spectral sine-basis as a technical proxy.
-        for m in 1:nbins
-            B[:, m] .= sin.(pi * m * (vals .- v_min) ./ (v_max - v_min))
+        if isnothing(W)
+            @warn "Moran's I basis requires an adjacency matrix 'W'. Falling back to sine proxy."
+            for m in 1:nbins
+                B[:, m] .= sin.(pi * m * (vals .- v_min) ./ (v_max - v_min))
+            end
+        else
+            n_spatial = size(W, 1)
+            if n_spatial != n_obs
+                @warn "Moran's I basis requires W matrix size to match number of observations for 1D smooth. Using proxy."
+                 for m in 1:nbins; B[:, m] .= sin.(pi * m * (vals .- v_min) ./ (v_max - v_min)); end
+            else
+                centering_matrix = I - (1/n_spatial) * ones(n_spatial, n_spatial)
+                W_centered = centering_matrix * W * centering_matrix
+                eigen_decomp = eigen(Symmetric(Matrix(W_centered)))
+                B = eigen_decomp.vectors[:, end-nbins+1:end]
+            end
         end
 
-    # # 2.7 Spherical Basis (Compact Support) - RESTORED
-    # Rationale: Ensures correlation is exactly zero beyond a finite range R.
     elseif type == "spherical"
         range_r = get(kwargs, :range, v_std * 2.0)
         knots = quantile(vals, range(0, 1, length=nbins))
         for m in 1:nbins
             h = abs.(vals .- knots[m]) ./ range_r
-            # Spherical kernel: 1 - 1.5h + 0.5h^3 if h < 1, else 0
             mask = h .< 1.0
             B[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
         end
 
-    # # 2.8 Exponential Decay (Continuous Attenuation) - RESTORED
     elseif type == "decay"
         ls = get(kwargs, :lengthscale, v_std)
         knots = quantile(vals, range(0, 1, length=nbins))
@@ -7007,18 +7171,21 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
             B[:, m] .= exp.(-abs.(vals .- knots[m]) ./ ls)
         end
 
-    # # 2.9 Barycentric (Piecewise Linear Triangulation) - RESTORED
-    elseif type == "barycentric"
-        knots = collect(range(v_min, stop=v_max, length=nbins))
+    elseif type == "invdist"
+        knots = quantile(vals, range(0, 1, length=nbins))
         for m in 1:nbins
-            # Standard triangle/hat basis
-            h = (v_max - v_min) / (nbins - 1)
-            dist = abs.(vals .- knots[m]) ./ h
-            mask = dist .< 1.0
-            B[mask, m] .= 1.0 .- dist[mask]
+            dist_sq = (vals .- knots[m]).^2
+            B[:, m] .= 1.0 ./ (dist_sq .+ 1e-6)
         end
 
-    # # 2.10 Identity / Fixed Fallback
+    elseif type == "kriging"
+        knots = quantile(vals, range(0, 1, length=nbins))
+        ls = get(kwargs, :lengthscale, v_std)
+        for m in 1:nbins
+            dist_sq = (vals .- knots[m]).^2
+            B[:, m] .= exp.(-dist_sq ./ (2 * ls^2))
+        end
+
     else
         B = ones(n_obs, 1)
     end
@@ -7026,57 +7193,53 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
     return B
 end
 
-function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; kwargs...)
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A factory function that generates a 2D basis matrix for various types of
-              smoothers. It supports anisotropic kernels for directional smoothing by allowing
-              different lengthscales for each dimension.
-    """
-    # # 1. Initialization and Context Discovery
-    # Rationale: Ensures every call returns a valid N x M matrix to prevent sampler collapse.
-    # coords is expected to be an N x 2 matrix (e.g., [lon lat]).
+
+function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, kwargs...)
+    # BSTM Smooth Basis Factory v2.3.0
+    # Timestamp: 2026-06-27 22:30:00
+    # Synopsis: A factory function that generates a 2D basis matrix for various smoothers.
+    # Rationale for v2.3.0:
+    #     - Added support for 'linear', 'invdist', and 'kriging' basis types in 2D.
+
     n_obs = size(coords, 1)
     
-    # Technical Metadata Discovery
     c_min = [minimum(coords[:, 1]), minimum(coords[:, 2])]
     c_max = [maximum(coords[:, 1]), maximum(coords[:, 2])]
     c_std = [std(coords[:, 1]), std(coords[:, 2])] .+ 1e-9
 
-    # # 2. Manifold Dispatch Registry for 2D Surfaces
-
-    # Anisotropy Configuration: Extract independent lengthscales if provided, else fallback to marginal std
-    # ls_x and ls_y allow the user to control directional smoothing separately
     ls_x = get(kwargs, :ls_x, c_std[1])
     ls_y = get(kwargs, :ls_y, c_std[2])
 
-     # # 2.1 Anisotropic Bivariate P-Splines (Tensor Product Basis)
-    # Rationale: Expands 1D marginal bases into a 2D surface grid with directional scaling.
-    if type in ["pspline", "bspline", "smooth"]
-        # n_marginal defines the resolution per dimension to reach total nbins
+    if type in ["pspline", "bspline", "smooth", "barycentric", "linear"]
         n_marginal = Int(floor(sqrt(nbins)))
         m_total = n_marginal^2
         B = zeros(Float64, n_obs, m_total)
-
-        # Marginal Knot Grids: Distributed evenly across the observed ranges
+        
         kx = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
         ky = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
+        hx = (c_max[1] - c_min[1]) / (n_marginal > 1 ? (n_marginal - 1) : 1)
+        hy = (c_max[2] - c_min[2]) / (n_marginal > 1 ? (n_marginal - 1) : 1)
+        hx = hx > 0 ? hx : 1.0
+        hy = hy > 0 ? hy : 1.0
 
         idx = 1
         for i in 1:n_marginal
             for j in 1:n_marginal
-                # Tensor product of anisotropic radial marginals
-                # bx uses ls_x; by uses ls_y to define the support width
-                bx = exp.(-((coords[:, 1] .- kx[i]).^2) ./ (2.0 * ls_x^2))
-                by = exp.(-((coords[:, 2] .- ky[j]).^2) ./ (2.0 * ls_y^2))
-                B[:, idx] .= bx .* by
+                dist_x = abs.(coords[:, 1] .- kx[i]) ./ hx
+                dist_y = abs.(coords[:, 2] .- ky[j]) ./ hy
+                mask_x = dist_x .< 1.0
+                mask_y = dist_y .< 1.0
+                
+                b_x = zeros(n_obs)
+                b_y = zeros(n_obs)
+                b_x[mask_x] .= 1.0 .- dist_x[mask_x]
+                b_y[mask_y] .= 1.0 .- dist_y[mask_y]
+                
+                B[:, idx] .= b_x .* b_y
                 idx += 1
             end
         end
 
-    # # 2.2 Anisotropic Thin Plate Splines (TPS)
-    # Rationale: Normalizes distances relative to anisotropic scales before computing bending energy.
     elseif type == "tps"
         B = zeros(Float64, n_obs, nbins)
         n_grid = Int(floor(sqrt(nbins)))
@@ -7085,68 +7248,55 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
         centers = [(x, y) for x in kx, y in ky][:]
 
         for m in 1:min(nbins, length(centers))
-            # Normalized distances relative to anisotropic scales
-            # This warps the radial basis function to match the directional lengthscales
             dx = (coords[:, 1] .- centers[m][1]) ./ ls_x
             dy = (coords[:, 2] .- centers[m][2]) ./ ls_y
-            r = sqrt.(dx^2 .+ dy^2)
-            # TPS Kernel: r^2 * log(r)
+            r = sqrt.(dx.^2 .+ dy.^2)
             B[:, m] .= (r.^2) .* log.(r .+ 1e-6)
         end
 
-    # # 2.3 Anisotropic Random Fourier Features (RFF)
-    # Rationale: Samples frequencies from an anisotropic spectral density.
     elseif type == "rff" || type == "anisotropic"
-        # Generate 2D frequencies with directional scaling
-        # Omega[1] is scaled by ls_x; Omega[2] is scaled by ls_y
         Omega = randn(2, nbins)
         Omega[1, :] ./= ls_x
         Omega[2, :] ./= ls_y
-        
-        Phi = rand(nbins) .* (2.0 * pi)
-        # Projection: feature_map = sqrt(2/M) * cos(Coords * Omega + Phi)
-        B = sqrt(2.0 / nbins) .* cos.((coords * Omega) .+ Phi')
+        Phi_phases = rand(nbins) .* (2.0 * pi)
+        B = sqrt(2.0 / nbins) .* cos.((coords * Omega) .+ Phi_phases')
 
-    # # 2.4 2D Fast Fourier Transform (FFT - Anisotropic Spectral Lattice)
-    # Rationale: Periodic decomposition where coordinates are stretched independently.
     elseif type == "fft"
         n_marginal = Int(floor(sqrt(nbins / 2)))
         B = zeros(Float64, n_obs, nbins)
-
-        # Normalize coordinates relative to the independent dimension ranges
-        nx = (coords[:, 1] .- c_min[1]) ./ (c_max[1] - c_min[1] + 1e-9)
-        ny = (coords[:, 2] .- c_min[2]) ./ (c_max[2] - c_min[2] + 1e-9)
+        nx = coords[:, 1] ./ ls_x
+        ny = coords[:, 2] ./ ls_y
 
         idx = 1
-        for mx in 1:n_marginal
-            for my in 1:n_marginal
-                if idx + 1 <= nbins
-                    # The spectral lattice now stretches independently based on coordinate normalization
-                    B[:, idx]   .= sin.(2.0 * pi * (mx .* nx .+ my .* ny))
-                    B[:, idx+1] .= cos.(2.0 * pi * (mx .* nx .+ my .* ny))
-                    idx += 2
-                end
+        for mx in 1:n_marginal, my in 1:n_marginal
+            if idx + 1 <= nbins
+                arg = mx .* nx .+ my .* ny
+                B[:, idx]   .= sin.(2.0 * pi * arg)
+                B[:, idx+1] .= cos.(2.0 * pi * arg)
+                idx += 2
             end
         end
 
-    # # 2.5 Barycentric Triangulation (Delaunay interpolation)
-    # Rationale: Piecewise linear interaction for irregular 2D scattered data.
-    elseif type == "barycentric" || type == "triangulation"
-        B = zeros(Float64, n_obs, nbins)
-        # Inducing landmarks via quantile grid
-        n_grid = Int(floor(sqrt(nbins)))
-        kx = quantile(coords[:, 1], range(0, 1, length=n_grid))
-        ky = quantile(coords[:, 2], range(0, 1, length=n_grid))
-        centers = [(x, y) for x in kx, y in ky][:]
-        # Standard Hat Basis for triangulation nodes
-        for m in 1:min(nbins, length(centers))
-            dist_x = abs.(coords[:, 1] .- centers[m][1]) ./ (c_std[1] / 2.0)
-            dist_y = abs.(coords[:, 2] .- centers[m][2]) ./ (c_std[2] / 2.0)
-            B[:, m] .= max.(0.0, 1.0 .- dist_x) .* max.(0.0, 1.0 .- dist_y)
+    elseif type == "wavelet"
+        n_marginal = Int(floor(sqrt(nbins)))
+        m_total = n_marginal^2
+        B = zeros(Float64, n_obs, m_total)
+        
+        centers_x = c_min[1] .+ ((1:n_marginal) ./ n_marginal) .* (c_max[1] - c_min[1])
+        width_x = (c_max[1] - c_min[1]) / n_marginal
+        centers_y = c_min[2] .+ ((1:n_marginal) ./ n_marginal) .* (c_max[2] - c_min[2])
+        width_y = (c_max[2] - c_min[2]) / n_marginal
+
+        idx = 1
+        for i in 1:n_marginal
+            for j in 1:n_marginal
+                b_x = (coords[:, 1] .>= centers_x[i]) .& (coords[:, 1] .< (centers_x[i] + width_x))
+                b_y = (coords[:, 2] .>= centers_y[j]) .& (coords[:, 2] .< (centers_y[j] + width_y))
+                B[:, idx] .= b_x .* b_y
+                idx += 1
+            end
         end
 
-    # # 2.6 Spherical Compact Interaction (Zero-Correlation Support)
-    # Rationale: Interaction drops to exactly zero beyond a range R.
     elseif type == "spherical"
         B = zeros(Float64, n_obs, nbins)
         n_grid = Int(floor(sqrt(nbins)))
@@ -7159,20 +7309,46 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
             dy = coords[:, 2] .- centers[m][2]
             h = sqrt.(dx.^2 .+ dy.^2) ./ range_r
             mask = h .< 1.0
-            # Spherical Kernel polynomial
             B[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
         end
 
-    # # 2.7 Moran's I Spectral Interaction
-    # Rationale: Captures non-linearities at specific spatial scales.
     elseif type == "moran"
-        B = zeros(Float64, n_obs, nbins)
-        # Proxy for spatial weighting eigenvectors
-        for m in 1:nbins
-            B[:, m] .= sin.(pi * m .* (coords[:, 1] .+ coords[:, 2]) ./ sum(c_max))
+        if isnothing(W)
+            @warn "Moran's I basis requires an adjacency matrix 'W'. Falling back to sine proxy."
+            B = zeros(Float64, n_obs, nbins)
+            for m in 1:nbins
+                B[:, m] .= sin.(pi * m .* (coords[:, 1] .+ coords[:, 2]) ./ sum(c_max))
+            end
+        else
+            n = size(W, 1)
+            centering_matrix = I - (1/n) * ones(n, n)
+            W_centered = centering_matrix * W * centering_matrix
+            eigen_decomp = eigen(Symmetric(Matrix(W_centered)))
+            B = eigen_decomp.vectors[:, end-nbins+1:end]
         end
 
-    # # 2.8 Identity Fallback
+    elseif type == "invdist"
+        B = zeros(Float64, n_obs, nbins)
+        n_grid = Int(floor(sqrt(nbins)))
+        kx = collect(range(c_min[1], stop=c_max[1], length=n_grid))
+        ky = collect(range(c_min[2], stop=c_max[2], length=n_grid))
+        centers = [(x, y) for x in kx, y in ky][:]
+        for m in 1:min(nbins, length(centers))
+            dist_sq = (coords[:, 1] .- centers[m][1]).^2 .+ (coords[:, 2] .- centers[m][2]).^2
+            B[:, m] .= 1.0 ./ (dist_sq .+ 1e-6)
+        end
+
+    elseif type == "kriging"
+        B = zeros(Float64, n_obs, nbins)
+        n_grid = Int(floor(sqrt(nbins)))
+        kx = collect(range(c_min[1], stop=c_max[1], length=n_grid))
+        ky = collect(range(c_min[2], stop=c_max[2], length=n_grid))
+        centers = [(x, y) for x in kx, y in ky][:]
+        for m in 1:min(nbins, length(centers))
+            dist_sq = ((coords[:, 1] .- centers[m][1]).^2 ./ ls_x^2) .+ ((coords[:, 2] .- centers[m][2]).^2 ./ ls_y^2)
+            B[:, m] .= exp.(-dist_sq ./ 2.0)
+        end
+
     else
         B = ones(n_obs, 1)
     end
@@ -7180,194 +7356,177 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
     return B
 end
 
-# # BSTM 3D Smooth Basis & Volumetric Factory [v19.34.0]
-# Timestamp: 2025-10-20 10:00:00
-# Rationale: Finalizing the 3D manifold registry with absolute parity to 1D/2D counterparts.
-# This implementation restores missing Moran, Spherical, and Barycentric methods with full anisotropy support.
 
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A factory function that generates a 3D basis matrix for various types of
-              smoothers. It supports anisotropic kernels for volumetric smoothing by allowing
-              different lengthscales for each of the three dimensions.
-    """
-function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; kwargs...)
-    # # 1. Initialization and Technical Discovery
-    # coords is expected to be an N x 3 matrix: [dim1, dim2, dim3]
+function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, kwargs...)
+    # BSTM Smooth Basis Factory v2.3.0
+    # Timestamp: 2026-06-27 22:30:00
+    # Synopsis: A factory function that generates a 3D basis matrix for various smoothers.
+    # Rationale for v2.3.0:
+    #     - Added support for 'linear', 'invdist', and 'kriging' basis types in 3D.
+
     n_obs = size(coords, 1)
 
-    # Technical Boundary Discovery: Identifying the range and spread of input dimensions
     c_min = [minimum(coords[:, 1]), minimum(coords[:, 2]), minimum(coords[:, 3])]
     c_max = [maximum(coords[:, 1]), maximum(coords[:, 2]), maximum(coords[:, 3])]
     c_std = [std(coords[:, 1]), std(coords[:, 2]), std(coords[:, 3])] .+ 1e-9
 
-    # Anisotropy Configuration: Extract independent lengthscales if provided, else fallback to marginal std
-    # ls_x, ls_y, and ls_z allow the user to control directional smoothing separately
     ls_x = get(kwargs, :ls_x, c_std[1])
     ls_y = get(kwargs, :ls_y, c_std[2])
     ls_z = get(kwargs, :ls_z, c_std[3])
 
-    # # 2. Manifold Dispatch Registry for Anisotropic Volumetric Surfaces
-
-    # # 2.1 Anisotropic Trivariate P-Splines (Tensor Product Basis)
-    # Rationale: Expands 1D marginal bases into a 3D volumetric grid with directional scaling.
-    if type in ["pspline", "bspline", "smooth"]
-        # n_marginal defines the cubic root resolution to reach total nbins
+    if type in ["pspline", "bspline", "smooth", "barycentric", "linear"]
         n_marginal = Int(floor(cbrt(nbins)))
         m_total = n_marginal^3
         B = zeros(Float64, n_obs, m_total)
 
-        # Marginal Knot Grids: Distributed evenly across the observed ranges
         kx = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
         ky = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
         kz = collect(range(c_min[3], stop=c_max[3], length=n_marginal))
+        hx = (c_max[1] - c_min[1]) / (n_marginal > 1 ? (n_marginal - 1) : 1); hx = hx > 0 ? hx : 1.0
+        hy = (c_max[2] - c_min[2]) / (n_marginal > 1 ? (n_marginal - 1) : 1); hy = hy > 0 ? hy : 1.0
+        hz = (c_max[3] - c_min[3]) / (n_marginal > 1 ? (n_marginal - 1) : 1); hz = hz > 0 ? hz : 1.0
 
         idx = 1
-        for i in 1:n_marginal
-            for j in 1:n_marginal
-                for k in 1:n_marginal
-                    # Tensor product of anisotropic radial marginals
-                    bx = exp.(-((coords[:, 1] .- kx[i]).^2) ./ (2.0 * ls_x^2))
-                    by = exp.(-((coords[:, 2] .- ky[j]).^2) ./ (2.0 * ls_y^2))
-                    bz = exp.(-((coords[:, 3] .- kz[k]).^2) ./ (2.0 * ls_z^2))
-                    B[:, idx] .= bx .* by .* bz
-                    idx += 1
-                end
-            end
+        for i in 1:n_marginal, j in 1:n_marginal, k in 1:n_marginal
+            b_x = max.(0.0, 1.0 .- abs.(coords[:, 1] .- kx[i]) ./ hx)
+            b_y = max.(0.0, 1.0 .- abs.(coords[:, 2] .- ky[j]) ./ hy)
+            b_z = max.(0.0, 1.0 .- abs.(coords[:, 3] .- kz[k]) ./ hz)
+            B[:, idx] .= b_x .* b_y .* b_z
+            idx += 1
         end
 
-    # # 2.2 Volumetric Random Fourier Features (RFF)
-    # Rationale: Samples frequencies from an anisotropic 3D spectral density.
+    elseif type == "tps"
+        n_grid = Int(floor(cbrt(nbins)))
+        m_total = n_grid^3
+        B = zeros(Float64, n_obs, m_total)
+        centers = [(x, y, z) for x in range(c_min[1], c_max[1], length=n_grid), y in range(c_min[2], c_max[2], length=n_grid), z in range(c_min[3], c_max[3], length=n_grid)][:]
+        for m in 1:min(m_total, length(centers))
+            dx = (coords[:, 1] .- centers[m][1]) ./ ls_x
+            dy = (coords[:, 2] .- centers[m][2]) ./ ls_y
+            dz = (coords[:, 3] .- centers[m][3]) ./ ls_z
+            r = sqrt.(dx.^2 .+ dy.^2 .+ dz.^2)
+            B[:, m] .= (r.^2) .* log.(r .+ 1e-6)
+        end
+
     elseif type == "rff"
         Omega = randn(3, nbins)
-        Omega[1, :] ./= ls_x
-        Omega[2, :] ./= ls_y
-        Omega[3, :] ./= ls_z
-        
-        Phi = rand(nbins) .* (2.0 * pi)
-        B = sqrt(2.0 / nbins) .* cos.((coords * Omega) .+ Phi')
+        Omega[1, :] ./= ls_x; Omega[2, :] ./= ls_y; Omega[3, :] ./= ls_z
+        Phi_phases = rand(nbins) .* (2.0 * pi)
+        B = sqrt(2.0 / nbins) .* cos.((coords * Omega) .+ Phi_phases')
 
-    # # 2.3 3D Fast Fourier Transform (FFT - Anisotropic Spectral Lattice)
-    # Rationale: Volumetric periodic decomposition where coordinates are stretched independently.
     elseif type == "fft"
         n_marginal = Int(floor(cbrt(nbins / 2)))
         B = zeros(Float64, n_obs, nbins)
-
-        # Normalize coordinates relative to the independent dimension ranges
-        nx = (coords[:, 1] .- c_min[1]) ./ (c_max[1] - c_min[1] + 1e-9)
-        ny = (coords[:, 2] .- c_min[2]) ./ (c_max[2] - c_min[2] + 1e-9)
-        nz = (coords[:, 3] .- c_min[3]) ./ (c_max[3] - c_min[3] + 1e-9)
-
+        nx = coords[:, 1] ./ ls_x
+        ny = coords[:, 2] ./ ls_y
+        nz = coords[:, 3] ./ ls_z
         idx = 1
-        for mx in 1:n_marginal
-            for my in 1:n_marginal
-                for mz in 1:n_marginal
-                    if idx + 1 <= nbins
-                        # Periodic projection respecting the volume stretching
-                        B[:, idx]   .= sin.(2.0 * pi * (mx .* nx .+ my .* ny .+ mz .* nz))
-                        B[:, idx+1] .= cos.(2.0 * pi * (mx .* nx .+ my .* ny .+ mz .* nz))
-                        idx += 2
-                    end
-                end
+        for mx in 1:n_marginal, my in 1:n_marginal, mz in 1:n_marginal
+            if idx + 1 <= nbins
+                arg = mx .* nx .+ my .* ny .+ mz .* nz
+                B[:, idx]   .= sin.(2.0 * pi * arg)
+                B[:, idx+1] .= cos.(2.0 * pi * arg)
+                idx += 2
             end
         end
 
-    # # 2.4 Volumetric Spherical Basis (Compact Support Anisotropy)
-    # Rationale: Ensures interaction drops to zero beyond directional ranges.
+    elseif type == "wavelet"
+        n_marginal = Int(floor(cbrt(nbins)))
+        m_total = n_marginal^3
+        B = zeros(Float64, n_obs, m_total)
+        
+        centers_x = c_min[1] .+ ((1:n_marginal) ./ n_marginal) .* (c_max[1] - c_min[1])
+        width_x = (c_max[1] - c_min[1]) / n_marginal
+        centers_y = c_min[2] .+ ((1:n_marginal) ./ n_marginal) .* (c_max[2] - c_min[2])
+        width_y = (c_max[2] - c_min[2]) / n_marginal
+        centers_z = c_min[3] .+ ((1:n_marginal) ./ n_marginal) .* (c_max[3] - c_min[3])
+        width_z = (c_max[3] - c_min[3]) / n_marginal
+
+        idx = 1
+        for i in 1:n_marginal, j in 1:n_marginal, k in 1:n_marginal
+            b_x = (coords[:, 1] .>= centers_x[i]) .& (coords[:, 1] .< (centers_x[i] + width_x))
+            b_y = (coords[:, 2] .>= centers_y[j]) .& (coords[:, 2] .< (centers_y[j] + width_y))
+            b_z = (coords[:, 3] .>= centers_z[k]) .& (coords[:, 3] .< (centers_z[k] + width_z))
+            B[:, idx] .= b_x .* b_y .* b_z
+            idx += 1
+        end
+
     elseif type == "spherical"
         n_grid = Int(floor(cbrt(nbins)))
         m_total = n_grid^3
         B = zeros(Float64, n_obs, m_total)
-
-        # Inducing landmarks via 3D mesh
-        ix = collect(range(c_min[1], stop=c_max[1], length=n_grid))
-        iy = collect(range(c_min[2], stop=c_max[2], length=n_grid))
-        iz = collect(range(c_min[3], stop=c_max[3], length=n_grid))
-        centers = [(x, y, z) for x in ix, y in iy, z in iz][:]
-
+        centers = [(x, y, z) for x in range(c_min[1], c_max[1], length=n_grid), y in range(c_min[2], c_max[2], length=n_grid), z in range(c_min[3], c_max[3], length=n_grid)][:]
         for m in 1:min(m_total, length(centers))
-            # Normalized Mahalanobis-like distance for anisotropy
             dx = (coords[:, 1] .- centers[m][1]) ./ ls_x
             dy = (coords[:, 2] .- centers[m][2]) ./ ls_y
             dz = (coords[:, 3] .- centers[m][3]) ./ ls_z
             h = sqrt.(dx.^2 .+ dy.^2 .+ dz.^2)
-            
-            # Spherical Kernel with directional compact support
             mask = h .< 1.0
             B[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
         end
 
-    # # 2.5 3D Moran's I Spectral Basis
-    # Rationale: Captures volumetric non-linearities at specific scales using Sine basis proxy.
     elseif type == "moran"
-        B = zeros(Float64, n_obs, nbins)
-        for m in 1:nbins
-            # Multi-scale spectral filters for 3D volumes
-            arg = (coords[:, 1] ./ ls_x) .+ (coords[:, 2] ./ ls_y) .+ (coords[:, 3] ./ ls_z)
-            B[:, m] .= sin.(pi * m .* arg ./ 3.0)
+        if isnothing(W)
+            @warn "Moran's I basis requires an adjacency matrix 'W'. Using sine proxy."
+            B = zeros(Float64, n_obs, nbins)
+            for m in 1:nbins
+                B[:, m] .= sin.(pi * m .* (coords[:, 1] .+ coords[:, 2] .+ coords[:, 3]) ./ sum(c_max))
+            end
+        else
+            n = size(W, 1)
+            centering_matrix = I - (1/n) * ones(n, n)
+            W_centered = centering_matrix * W * centering_matrix
+            eigen_decomp = eigen(Symmetric(Matrix(W_centered)))
+            B = eigen_decomp.vectors[:, end-nbins+1:end]
         end
 
-    # # 2.6 Barycentric Volumetric Interpolation (Tetrahedral Proxy)
-    # Rationale: Piecewise linear interaction for 3D scattered data.
-    elseif type == "barycentric" || type == "triangulation"
+    elseif type == "invdist"
+        B = zeros(Float64, n_obs, nbins)
         n_grid = Int(floor(cbrt(nbins)))
         m_total = n_grid^3
-        B = zeros(Float64, n_obs, m_total)
-        ix = quantile(coords[:, 1], range(0, 1, length=n_grid))
-        iy = quantile(coords[:, 2], range(0, 1, length=n_grid))
-        iz = quantile(coords[:, 3], range(0, 1, length=n_grid))
-        centers = [(x, y, z) for x in ix, y in iy, z in iz][:]
-
+        centers = [(x, y, z) for x in range(c_min[1], c_max[1], length=n_grid), y in range(c_min[2], c_max[2], length=n_grid), z in range(c_min[3], c_max[3], length=n_grid)][:]
         for m in 1:min(m_total, length(centers))
-            # Standard 3D Hat Basis (Trilinear interpolation proxy)
-            dist_x = abs.(coords[:, 1] .- centers[m][1]) ./ ls_x
-            dist_y = abs.(coords[:, 2] .- centers[m][2]) ./ ls_y
-            dist_z = abs.(coords[:, 3] .- centers[m][3]) ./ ls_z
-            B[:, m] .= max.(0.0, 1.0 .- dist_x) .* max.(0.0, 1.0 .- dist_y) .* max.(0.0, 1.0 .- dist_z)
+            dist_sq = (coords[:, 1] .- centers[m][1]).^2 .+ (coords[:, 2] .- centers[m][2]).^2 .+ (coords[:, 3] .- centers[m][3]).^2
+            B[:, m] .= 1.0 ./ (dist_sq .+ 1e-6)
         end
 
-    # # 2.7 Technical Fallback
+    elseif type == "kriging"
+        B = zeros(Float64, n_obs, nbins)
+        n_grid = Int(floor(cbrt(nbins)))
+        m_total = n_grid^3
+        centers = [(x, y, z) for x in range(c_min[1], c_max[1], length=n_grid), y in range(c_min[2], c_max[2], length=n_grid), z in range(c_min[3], c_max[3], length=n_grid)][:]
+        for m in 1:min(m_total, length(centers))
+            dist_sq = ((coords[:, 1] .- centers[m][1]).^2 ./ ls_x^2) .+ ((coords[:, 2] .- centers[m][2]).^2 ./ ls_y^2) .+ ((coords[:, 3] .- centers[m][3]).^2 ./ ls_z^2)
+            B[:, m] .= exp.(-dist_sq ./ 2.0)
+        end
+
     else
         B = ones(n_obs, 1)
     end
 
     return B
 end
- 
 
-# # BSTM Hyper-Volumetric Factory & Entry Point [v19.36.0]
-# Timestamp: 2025-10-30 10:00:00
-# Rationale: Expanding the 4D manifold registry to include advanced methods: Spherical, Moran, and Barycentric.
-# Requirement: Absolute parity with the v06.1 Taxonomy. Ensures non-truncated hyper-volumetric surfaces.
 
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A factory function that generates a 4D basis matrix for various types of
-              smoothers. It supports anisotropic kernels for hyper-volumetric smoothing by
-              allowing different lengthscales for each of the four dimensions.
-    """
-function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; kwargs...)
-    # # 1. Initialization and Hyper-Dimensional Discovery
-    # coords is expected to be an N x 4 matrix: [dim1, dim2, dim3, dim4]
+function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, kwargs...)
+    # BSTM Smooth Basis Factory v2.3.0
+    # Timestamp: 2026-06-27 22:30:00
+    # Synopsis: A factory function that generates a 4D basis matrix for various smoothers.
+    # Rationale for v2.3.0:
+    #     - Added support for 'linear', 'invdist', and 'kriging' basis types in 4D.
+
     n_obs = size(coords, 1)
 
-    # Technical Boundary Discovery: Identifying the hyper-cube extents
-    c_min = [minimum(coords[:, 1]), minimum(coords[:, 2]), minimum(coords[:, 3]), minimum(coords[:, 4])]
-    c_max = [maximum(coords[:, 1]), maximum(coords[:, 2]), maximum(coords[:, 3]), maximum(coords[:, 4])]
-    c_std = [std(coords[:, 1]), std(coords[:, 2]), std(coords[:, 3]), std(coords[:, 4])] .+ 1e-9
+    c_min = [minimum(coords[:, i]) for i in 1:4]
+    c_max = [maximum(coords[:, i]) for i in 1:4]
+    c_std = [std(coords[:, i]) for i in 1:4] .+ 1e-9
 
-    # Anisotropy Configuration: Independent lengthscales for 4 dimensions
     ls_1 = get(kwargs, :ls_1, c_std[1])
     ls_2 = get(kwargs, :ls_2, c_std[2])
     ls_3 = get(kwargs, :ls_3, c_std[3])
     ls_4 = get(kwargs, :ls_4, c_std[4])
 
-    # # 2. Manifold Dispatch Registry for 4D Latent Fields
-
-    # # 2.1 4D Anisotropic P-Splines (Tensor Product)
-    if type in ["pspline", "bspline", "smooth"]
+    if type in ["pspline", "bspline", "smooth", "barycentric", "linear"]
         n_marginal = Int(floor(sqrt(sqrt(nbins))))
         m_total = n_marginal^4
         B = zeros(Float64, n_obs, m_total)
@@ -7376,68 +7535,87 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
         k2 = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
         k3 = collect(range(c_min[3], stop=c_max[3], length=n_marginal))
         k4 = collect(range(c_min[4], stop=c_max[4], length=n_marginal))
+        h1 = (c_max[1] - c_min[1]) / (n_marginal > 1 ? (n_marginal - 1) : 1); h1 = h1 > 0 ? h1 : 1.0
+        h2 = (c_max[2] - c_min[2]) / (n_marginal > 1 ? (n_marginal - 1) : 1); h2 = h2 > 0 ? h2 : 1.0
+        h3 = (c_max[3] - c_min[3]) / (n_marginal > 1 ? (n_marginal - 1) : 1); h3 = h3 > 0 ? h3 : 1.0
+        h4 = (c_max[4] - c_min[4]) / (n_marginal > 1 ? (n_marginal - 1) : 1); h4 = h4 > 0 ? h4 : 1.0
 
         idx = 1
-        for i in 1:n_marginal
-            for j in 1:n_marginal
-                for k in 1:n_marginal
-                    for l in 1:n_marginal
-                        b1 = exp.(-((coords[:, 1] .- k1[i]).^2) ./ (2.0 * ls_1^2))
-                        b2 = exp.(-((coords[:, 2] .- k2[j]).^2) ./ (2.0 * ls_2^2))
-                        b3 = exp.(-((coords[:, 3] .- k3[k]).^2) ./ (2.0 * ls_3^2))
-                        b4 = exp.(-((coords[:, 4] .- k4[l]).^2) ./ (2.0 * ls_4^2))
-                        B[:, idx] .= b1 .* b2 .* b3 .* b4
-                        idx += 1
-                    end
-                end
-            end
+        for i in 1:n_marginal, j in 1:n_marginal, k in 1:n_marginal, l in 1:n_marginal
+            b1 = max.(0.0, 1.0 .- abs.(coords[:, 1] .- k1[i]) ./ h1)
+            b2 = max.(0.0, 1.0 .- abs.(coords[:, 2] .- k2[j]) ./ h2)
+            b3 = max.(0.0, 1.0 .- abs.(coords[:, 3] .- k3[k]) ./ h3)
+            b4 = max.(0.0, 1.0 .- abs.(coords[:, 4] .- k4[l]) ./ h4)
+            B[:, idx] .= b1 .* b2 .* b3 .* b4
+            idx += 1
         end
 
-    # # 2.2 4D Random Fourier Features (Spectral Anisotropy)
+    elseif type == "tps"
+        n_marginal = Int(floor(sqrt(sqrt(nbins))))
+        m_total = n_marginal^4
+        B = zeros(Float64, n_obs, m_total)
+        centers = [(w,x,y,z) for w in range(c_min[1],c_max[1],length=n_marginal), x in range(c_min[2],c_max[2],length=n_marginal), y in range(c_min[3],c_max[3],length=n_marginal), z in range(c_min[4],c_max[4],length=n_marginal)][:]
+        for m in 1:min(m_total, length(centers))
+            d1 = (coords[:, 1] .- centers[m][1]) ./ ls_1
+            d2 = (coords[:, 2] .- centers[m][2]) ./ ls_2
+            d3 = (coords[:, 3] .- centers[m][3]) ./ ls_3
+            d4 = (coords[:, 4] .- centers[m][4]) ./ ls_4
+            r = sqrt.(d1.^2 .+ d2.^2 .+ d3.^2 .+ d4.^2)
+            B[:, m] .= (r.^2) .* log.(r .+ 1e-6)
+        end
+
     elseif type == "rff"
         Omega = randn(4, nbins)
-        Omega[1, :] ./= ls_1
-        Omega[2, :] ./= ls_2
-        Omega[3, :] ./= ls_3
-        Omega[4, :] ./= ls_4
-        Phi = rand(nbins) .* (2.0 * pi)
-        B = sqrt(2.0 / nbins) .* cos.((coords * Omega) .+ Phi')
+        Omega[1, :] ./= ls_1; Omega[2, :] ./= ls_2; Omega[3, :] ./= ls_3; Omega[4, :] ./= ls_4
+        Phi_phases = rand(nbins) .* (2.0 * pi)
+        B = sqrt(2.0 / nbins) .* cos.((coords * Omega) .+ Phi_phases')
 
-    # # 2.3 4D Fast Fourier Transform (Spectral Lattice)
     elseif type == "fft"
         n_marginal = Int(floor(sqrt(sqrt(nbins / 2))))
         B = zeros(Float64, n_obs, nbins)
-        nx1 = (coords[:, 1] .- c_min[1]) ./ (c_max[1] - c_min[1] + 1e-9)
-        nx2 = (coords[:, 2] .- c_min[2]) ./ (c_max[2] - c_min[2] + 1e-9)
-        nx3 = (coords[:, 3] .- c_min[3]) ./ (c_max[3] - c_min[3] + 1e-9)
-        nx4 = (coords[:, 4] .- c_min[4]) ./ (c_max[4] - c_min[4] + 1e-9)
+        nx1 = coords[:, 1] ./ ls_1
+        nx2 = coords[:, 2] ./ ls_2
+        nx3 = coords[:, 3] ./ ls_3
+        nx4 = coords[:, 4] ./ ls_4
         idx = 1
-        for m1 in 1:n_marginal
-            for m2 in 1:n_marginal
-                for m3 in 1:n_marginal
-                    for m4 in 1:n_marginal
-                        if idx + 1 <= nbins
-                            arg = m1 .* nx1 .+ m2 .* nx2 .+ m3 .* nx3 .+ m4 .* nx4
-                            B[:, idx]   .= sin.(2.0 * pi * arg)
-                            B[:, idx+1] .= cos.(2.0 * pi * arg)
-                            idx += 2
-                        end
-                    end
-                end
+        for m1 in 1:n_marginal, m2 in 1:n_marginal, m3 in 1:n_marginal, m4 in 1:n_marginal
+            if idx + 1 <= nbins
+                arg = m1 .* nx1 .+ m2 .* nx2 .+ m3 .* nx3 .+ m4 .* nx4
+                B[:, idx]   .= sin.(2.0 * pi * arg)
+                B[:, idx+1] .= cos.(2.0 * pi * arg)
+                idx += 2
             end
         end
 
-    # # 2.4 4D Spherical Basis (Anisotropic Compact Support)
-    # Rationale: Ensures latent correlation is zero beyond hyper-volumetric directional ranges.
+    elseif type == "wavelet"
+        n_marginal = Int(floor(sqrt(sqrt(nbins))))
+        m_total = n_marginal^4
+        B = zeros(Float64, n_obs, m_total)
+
+        centers1 = c_min[1] .+ ((1:n_marginal) ./ n_marginal) .* (c_max[1] - c_min[1])
+        width1 = (c_max[1] - c_min[1]) / n_marginal
+        centers2 = c_min[2] .+ ((1:n_marginal) ./ n_marginal) .* (c_max[2] - c_min[2])
+        width2 = (c_max[2] - c_min[2]) / n_marginal
+        centers3 = c_min[3] .+ ((1:n_marginal) ./ n_marginal) .* (c_max[3] - c_min[3])
+        width3 = (c_max[3] - c_min[3]) / n_marginal
+        centers4 = c_min[4] .+ ((1:n_marginal) ./ n_marginal) .* (c_max[4] - c_min[4])
+        width4 = (c_max[4] - c_min[4]) / n_marginal
+
+        idx = 1
+        for i in 1:n_marginal, j in 1:n_marginal, k in 1:n_marginal, l in 1:n_marginal
+            b1 = (coords[:, 1] .>= centers1[i]) .& (coords[:, 1] .< (centers1[i] + width1))
+            b2 = (coords[:, 2] .>= centers2[j]) .& (coords[:, 2] .< (centers2[j] + width2))
+            b3 = (coords[:, 3] .>= centers3[k]) .& (coords[:, 3] .< (centers3[k] + width3))
+            b4 = (coords[:, 4] .>= centers4[l]) .& (coords[:, 4] .< (centers4[l] + width4))
+            B[:, idx] .= b1 .* b2 .* b3 .* b4
+            idx += 1
+        end
+
     elseif type == "spherical"
         n_marginal = Int(floor(sqrt(sqrt(nbins))))
         m_total = n_marginal^4
         B = zeros(Float64, n_obs, m_total)
-        k1 = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
-        k2 = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
-        k3 = collect(range(c_min[3], stop=c_max[3], length=n_marginal))
-        k4 = collect(range(c_min[4], stop=c_max[4], length=n_marginal))
-        centers = [(w, x, y, z) for w in k1, x in k2, y in k3, z in k4][:]
+        centers = [(w,x,y,z) for w in range(c_min[1],c_max[1],length=n_marginal), x in range(c_min[2],c_max[2],length=n_marginal), y in range(c_min[3],c_max[3],length=n_marginal), z in range(c_min[4],c_max[4],length=n_marginal)][:]
         for m in 1:min(m_total, length(centers))
             d1 = (coords[:, 1] .- centers[m][1]) ./ ls_1
             d2 = (coords[:, 2] .- centers[m][2]) ./ ls_2
@@ -7448,35 +7626,41 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
             B[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
         end
 
-    # # 2.5 4D Moran's I Spectral Basis
-    # Rationale: Hyper-dimensional multi-scale filtering using spectral Sine proxy.
     elseif type == "moran"
-        B = zeros(Float64, n_obs, nbins)
-        for m in 1:nbins
-            arg = (coords[:, 1] ./ ls_1) .+ (coords[:, 2] ./ ls_2) .+ (coords[:, 3] ./ ls_3) .+ (coords[:, 4] ./ ls_4)
-            B[:, m] .= sin.(pi * m .* arg ./ 4.0)
+        if isnothing(W)
+            @warn "Moran's I basis requires an adjacency matrix 'W'. Using sine proxy."
+            B = zeros(Float64, n_obs, nbins)
+            for m in 1:nbins
+                B[:, m] .= sin.(pi * m .* (coords[:, 1] .+ coords[:, 2]) ./ (c_max[1] + c_max[2]))
+            end
+        else
+            n = size(W, 1)
+            centering_matrix = I - (1/n) * ones(n, n)
+            W_centered = centering_matrix * W * centering_matrix
+            eigen_decomp = eigen(Symmetric(Matrix(W_centered)))
+            B = eigen_decomp.vectors[:, end-nbins+1:end]
         end
 
-    # # 2.6 4D Barycentric Interpolation (Hyper-Tetrahedral Proxy)
-    # Rationale: Piecewise linear interaction across irregular 4D scattered data.
-    elseif type == "barycentric" || type == "triangulation"
+    elseif type == "invdist"
+        B = zeros(Float64, n_obs, nbins)
         n_marginal = Int(floor(sqrt(sqrt(nbins))))
         m_total = n_marginal^4
-        B = zeros(Float64, n_obs, m_total)
-        k1 = quantile(coords[:, 1], range(0, 1, length=n_marginal))
-        k2 = quantile(coords[:, 2], range(0, 1, length=n_marginal))
-        k3 = quantile(coords[:, 3], range(0, 1, length=n_marginal))
-        k4 = quantile(coords[:, 4], range(0, 1, length=n_marginal))
-        centers = [(w, x, y, z) for w in k1, x in k2, y in k3, z in k4][:]
+        centers = [(w,x,y,z) for w in range(c_min[1],c_max[1],length=n_marginal), x in range(c_min[2],c_max[2],length=n_marginal), y in range(c_min[3],c_max[3],length=n_marginal), z in range(c_min[4],c_max[4],length=n_marginal)][:]
         for m in 1:min(m_total, length(centers))
-            dw = abs.(coords[:, 1] .- centers[m][1]) ./ ls_1
-            dx = abs.(coords[:, 2] .- centers[m][2]) ./ ls_2
-            dy = abs.(coords[:, 3] .- centers[m][3]) ./ ls_3
-            dz = abs.(coords[:, 4] .- centers[m][4]) ./ ls_4
-            B[:, m] .= max.(0.0, 1.0 .- dw) .* max.(0.0, 1.0 .- dx) .* max.(0.0, 1.0 .- dy) .* max.(0.0, 1.0 .- dz)
+            dist_sq = (coords[:, 1] .- centers[m][1]).^2 .+ (coords[:, 2] .- centers[m][2]).^2 .+ (coords[:, 3] .- centers[m][3]).^2 .+ (coords[:, 4] .- centers[m][4]).^2
+            B[:, m] .= 1.0 ./ (dist_sq .+ 1e-6)
         end
 
-    # # 2.7 Technical Fallback
+    elseif type == "kriging"
+        B = zeros(Float64, n_obs, nbins)
+        n_marginal = Int(floor(sqrt(sqrt(nbins))))
+        m_total = n_marginal^4
+        centers = [(w,x,y,z) for w in range(c_min[1],c_max[1],length=n_marginal), x in range(c_min[2],c_max[2],length=n_marginal), y in range(c_min[3],c_max[3],length=n_marginal), z in range(c_min[4],c_max[4],length=n_marginal)][:]
+        for m in 1:min(m_total, length(centers))
+            dist_sq = ((coords[:, 1] .- centers[m][1]).^2 ./ ls_1^2) .+ ((coords[:, 2] .- centers[m][2]).^2 ./ ls_2^2) .+ ((coords[:, 3] .- centers[m][3]).^2 ./ ls_3^2) .+ ((coords[:, 4] .- centers[m][4]).^2 ./ ls_4^2)
+            B[:, m] .= exp.(-dist_sq ./ 2.0)
+        end
+
     else
         B = ones(n_obs, 1)
     end
@@ -7485,7 +7669,6 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
 end
 
 
- 
 
   
 # 1. Base Generic Fallback
