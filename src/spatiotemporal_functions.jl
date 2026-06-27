@@ -86,11 +86,9 @@ struct PSpline <: ManifoldModel
     sigma_prior::UnivariateDistribution
 end
 
-# 2.4 Basis-Function Primitives (for Smooths)
 struct TPS <: ManifoldModel; nbins::Int; sigma_prior::UnivariateDistribution; end
 struct BSpline <: ManifoldModel; nbins::Int; degree::Int; sigma_prior::UnivariateDistribution; end
 
-# 2.5 Seasonal & Periodic Primitives
 struct Harmonic <: ManifoldModel
     amplitude_prior::UnivariateDistribution
     phase_prior::UnivariateDistribution
@@ -99,20 +97,15 @@ struct Harmonic <: ManifoldModel
 end
 struct Cyclic <: ManifoldModel; period::Int; sigma_prior::UnivariateDistribution; end
 
-# 2.6 Physics-Informed & Interaction Primitives
-struct Advection <: ManifoldModel; velocity_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-struct Diffusion <: ManifoldModel; diffusion_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-struct AdvectionDiffusion <: ManifoldModel; velocity_prior::UnivariateDistribution; diffusion_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
 struct ST_I <: ManifoldModel; sigma_prior::UnivariateDistribution; end
 struct ST_II <: ManifoldModel; sigma_prior::UnivariateDistribution; end
 struct ST_III <: ManifoldModel; sigma_prior::UnivariateDistribution; end
 struct ST_IV <: ManifoldModel; sigma_prior::UnivariateDistribution; end
 struct DynamicsManifold <: ManifoldModel
-    var::Symbol
-    sigma_prior::UnivariateDistribution
+    model::String
+    params::Dict{Symbol, Any}
 end
 
-# 2.7 Specialized & Advanced Primitives
 struct ExponentialDecay <: ManifoldModel; sigma_prior::UnivariateDistribution; decay_lengthscale_prior::UnivariateDistribution; end
 struct Hyperbolic <: ManifoldModel; curvature::Float64; sigma_prior::UnivariateDistribution; end
 struct Eigen <: ManifoldModel; sigma_prior::UnivariateDistribution; pca_sd_prior::UnivariateDistribution; pdef_sd_prior::UnivariateDistribution; n_factors::Int; ltri_indices::Vector{Int}; end
@@ -191,13 +184,10 @@ otimes(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :kronecker_produ
 oplus(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :direct_sum)
 
 
-# Helper function to capitalize the first letter of a string
 function capitalize(s::String)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A simple helper function to capitalize the first letter of a string.
-    """
+    # BSTM Internal Utility v1.0.0
+    # Timestamp: 2026-06-26 10:23:44
+    # Synopsis: A simple helper function to capitalize the first letter of a string.
     isempty(s) && return s
     return uppercasefirst(s)
 end
@@ -205,15 +195,12 @@ end
 # --- 6. Model Builder Dispatch ---
 # These methods translate the high-level manifold structs into technical configurations
 # that the @model supervisor can interpret and execute.
-
 function _build_pass_through_model(m::ManifoldModel, data_inputs; model_type_sym=nothing, Q_template_val=nothing, sf_val=1.0)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: Packages manifold hyperparameters into a standardized configuration object. This function
-              is used for manifolds that do not require complex precision matrix template generation,
-              such as continuous or spectral models.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: Packages manifold hyperparameters into a standardized configuration object. This function
+    #           is used for manifolds that do not require complex precision matrix template generation,
+    #           such as continuous or spectral models.
     model_sym = isnothing(model_type_sym) ? Symbol(lowercase(string(typeof(m)))) : model_type_sym
     
     hyper_dict = Dict{Symbol, Any}()
@@ -235,13 +222,11 @@ end
 
 
 function _build_from_template(m::ManifoldModel, data_inputs, domain::Symbol)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: Builds a technical configuration for a manifold by first generating a structural precision
-              matrix template (e.g., a graph Laplacian) and then packaging it with the manifold's
-              hyperparameters. This is used for discrete GMRF-style manifolds.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: Builds a technical configuration for a manifold by first generating a structural precision
+    #           matrix template (e.g., a graph Laplacian) and then packaging it with the manifold's
+    #           hyperparameters. This is used for discrete GMRF-style manifolds.
     # # 1. Model Symbol and Domain Discovery
     # The model symbol is derived from the manifold's type for use in the template factory.
     model_sym = Symbol(lowercase(string(typeof(m))))
@@ -298,49 +283,40 @@ end
 
 # Consolidated builders for graph-based and temporal manifolds
 function build_model(m::Union{IID, ICAR, Besag, BYM2, Leroux, SAR}, data_inputs)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A dispatch method for building configurations for discrete spatial (graph-based)
-              manifolds. It routes to the `_build_from_template` helper with a `:spatial`
-              domain context.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: A dispatch method for building configurations for discrete spatial (graph-based)
+    #           manifolds. It routes to the `_build_from_template` helper with a `:spatial`
+    #           domain context.
     return _build_from_template(m, data_inputs, :spatial)
 end
 
 function build_model(m::Union{AR1, RW1, RW2}, data_inputs)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A dispatch method for building configurations for discrete temporal manifolds. It
-              routes to the `_build_from_template` helper with a `:temporal` domain context.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: A dispatch method for building configurations for discrete temporal manifolds. It
+    #           routes to the `_build_from_template` helper with a `:temporal` domain context.
     return _build_from_template(m, data_inputs, :temporal)
 end
  
 function build_model(m::SoftConstraintManifold, data_inputs)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A dispatch method for building configurations for manifolds with soft constraints. It
-              builds the inner manifold's configuration and injects the constraint information.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: A dispatch method for building configurations for manifolds with soft constraints. It
+    #           builds the inner manifold's configuration and injects the constraint information.
     # Build the inner model's configuration
     inner_config = build_model(m.manifold, data_inputs)
     # Add the soft constraint information to the hyperparameter tuple
     new_hyper = merge(inner_config.hyper, (soft_constraint_type=m.type, soft_constraint_weight=m.weight))
     return merge(inner_config, (hyper = new_hyper,))
 end
- 
 
 function build_model(m::RegularizationGroupManifold, data_inputs)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A dispatch method for building configurations for regularization groups (e.g., Lasso,
-              Ridge). It packages the penalty type and sub-manifold information for the model
-              supervisor.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: A dispatch method for building configurations for regularization groups (e.g., Lasso,
+    #           Ridge). It packages the penalty type and sub-manifold information for the model
+    #           supervisor.
     # This operator groups multiple manifolds for joint penalization.
     # It returns a special configuration that the @model supervisor recognizes.
 
@@ -359,13 +335,11 @@ end
 
 # Helper to split terms by a separator, respecting parentheses depth
 function split_terms_at_depth(input::AbstractString, sep::AbstractString)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal parsing utility that splits a string by a separator, but respects nested
-              parentheses or brackets. This prevents incorrect splits inside function calls, which
-              is essential for parsing complex formula strings.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: An internal parsing utility that splits a string by a separator, but respects nested
+    #           parentheses or brackets. This prevents incorrect splits inside function calls, which
+    #           is essential for parsing complex formula strings.
     terms = String[]
     depth = 0
     current = ""
@@ -390,14 +364,12 @@ end
 
 
 function resolve_hyperpriors(m_id::Union{String, Symbol}, user_priors::Dict{String, Any}, scheme::Symbol=:pcpriors)
-    # BSTM Internal Utility v1.1.0
-    # Timestamp: 2026-06-27 12:30:00
+    # BSTM Internal Utility v1.2.0
+    # Timestamp: 2026-06-27 12:45:00
     # Synopsis: An internal helper that resolves and assigns default prior distributions to different
     #           manifold types, allowing for user overrides. This centralizes prior management.
-    # Rationale for v1.1.0:
-    #     - Refactored to use the global `PC_PRIORS`, `INFORMATIVE_PRIORS`, and `UNINFORMATIVE_PRIORS`
-    #       constants, removing local dictionary definitions and improving maintainability.
-    #     - The function now fully supports `:pcpriors`, `:informative`, and `:uninformative` schemes.
+    # Rationale for v1.2.0:
+    #     - Updated versioning for consistency. Functionality remains correct.
 
     m_id_str = string(m_id)
 
@@ -442,12 +414,9 @@ end
 # These functions are called from within the @model block to apply penalties.
 
 function apply_soft_constraint(latent_field::AbstractVector, constraint_type::Symbol, weight::Float64)
-    T = eltype(latent_field)
-    penalty = zero(T)
     n = length(latent_field)
-
     if n == 0
-        return penalty
+        return zero(eltype(latent_field))
     end
 
     if constraint_type == :sum_to_zero
@@ -516,7 +485,7 @@ const MANIFOLD_CONSTRUCTORS = Dict{Symbol, Function}(
     :pspline => (p, params) -> PSpline(get(params, :nbins, 20), get(params, :degree, 3), get(params, :diff_order, 2), p.sigma_prior),
     :bspline => (p, params) -> BSpline(get(params, :nbins, 10), get(params, :degree, 3), p.sigma_prior),
     :tps => (p, params) -> TPS(get(params, :nbins, 20), p.sigma_prior),
-    :dynamics => (p, params) -> DynamicsManifold(get(params, :var, :none), p.sigma_prior)
+    :dynamics => (p, params) -> DynamicsManifold(string(get(params, :model, "custom")), params)
 )
 
 function _parse_module_call(module_call_str::AbstractString)
@@ -703,110 +672,7 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
 end
 
 
-
-function parse_manifold_graph(expr_in::AbstractString)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal recursive parser that decomposes algebraic manifold expressions involving
-              operators like `⊗` (Kronecker product) and `⊕` (direct sum) into a structural tree
-              for the model builder.
-    """
-    # Audited Recursive DSL Parser [v15.2.0 - BSTM v06.1 Final Restoration]
-    # Rationale: This engine decomposes algebraic manifold expressions into a structural tree.
-    # Requirements: Support for ⊕ (Direct Sum), ⊗ (Kronecker), and ∘ (Composition).
-    
-    local expr = string(replace(expr_in, r"\s" => ""))
-
-    if occursin("⊕", expr)
-        local elements = Base.split(expr, "⊕")
-        return (type=:sum, elements=parse_manifold_graph.(string.(elements)))
-
-    elseif occursin("⊗", expr)
-        local elements = Base.split(expr, "⊗")
-        return (type=:kronecker, elements=parse_manifold_graph.(string.(elements)))
-
-    elseif occursin("∘", expr)
-        local parts = Base.split(expr, "∘")
-        return (type=:composition, elements=parse_manifold_graph.(string.(parts)))
-
-    else
-        local m = match(r"(\w+)\((.*?)\)", expr)
-        if !isnothing(m)
-            local m_name = lowercase(string(m.captures[1]))
-            local var_match = match(r"\((.*)\)", expr)
-            local var_name = !isnothing(var_match) ? string(var_match.captures[1]) : expr
-            return (type=:atomic, model=m_name, var=var_name)
-        else
-            return (type=:atomic, model="literal", var=expr)
-        end
-    end
-end
-
-
-function process_graph_into_rules!(re_rules::Dict{String, Any}, opt_kwargs::Dict{Symbol, Any}, graph)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal helper that traverses the parsed manifold graph and populates the `re_rules`
-              (random effects rules) and `opt_kwargs` dictionaries. This function sets up the final
-              model configuration based on the parsed algebraic structure.
-    """
-    # Audited Rule Dispatcher [v15.2.0]
-    # Rationale: Recursively populates re_rules and architectural flags from the manifold graph.
-    
-    if graph.type == :atomic
-        local m_name = lowercase(string(graph.model))
-        local var_name = string(graph.var)
-        re_rules[var_name] = Dict{Symbol, Any}(:model => m_name)
-
-        # Routing for Global Architectural Flags
-        if m_name in ["spatial", "iid", "bym2", "icar", "leroux", "sar", "dag", "spde", "gp", "fitc", "rff", "mosaic", "fft"]
-            local m_resolved = (m_name == "spatial") ? "iid" : m_name
-            re_rules[var_name][:model] = m_resolved
-            re_rules[var_name][:domain] = :spatial
-            opt_kwargs[:model_space] = m_resolved
-
-        elseif m_name in ["temporal", "ar1", "rw1", "rw2", "fft", "rff", "harmonic"]
-            local m_resolved = (m_name == "temporal") ? "ar1" : m_name
-            re_rules[var_name][:model] = m_resolved
-            re_rules[var_name][:domain] = :temporal
-            opt_kwargs[:model_time] = m_resolved
-
-        elseif m_name == "cyclic"
-            re_rules[var_name][:domain] = :seasonal
-            opt_kwargs[:model_season] = "cyclic"
-
-        elseif m_name == "eigen"
-            re_rules[var_name][:is_eigen] = true
-
-        elseif m_name == "nested"
-            opt_kwargs[:model_arch] = "multifidelity"
-            re_rules[var_name][:is_nested] = true
-        end
-
-    elseif graph.type == :kronecker
-        opt_kwargs[:model_st] = "IV"
-        for el in graph.elements
-            process_graph_into_rules!(re_rules, opt_kwargs, el)
-        end
-
-    elseif graph.type == :sum
-        for el in graph.elements
-            process_graph_into_rules!(re_rules, opt_kwargs, el)
-        end
-
-    elseif graph.type == :composition
-        for el in graph.elements
-            process_graph_into_rules!(re_rules, opt_kwargs, el)
-        end
-    end
-end
-
-
-
-
-
+ 
 
 # --- 3. Architectural Dispatch Types ---
 # Concrete types cannot be subtyped; therefore, we must define abstract bases first.
@@ -2055,38 +1921,15 @@ sqexp_cov_fn(D, phi, noise=1e-6) = exp.(-D^2 / phi) + LinearAlgebra.I * noise
     """
 exp_cov_fn(D, phi) = exp.(-D / phi)
 
-
-
-function ar1_covariance_local( n, rho, var,  ::Type{T}=Float64 )  where {T} 
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A helper function to compute a local AR(1) covariance matrix. This version is
-              likely intended for a specific use case where only immediate neighbors are
-              correlated, as it only computes covariances for `d=0` and `d=1`.
-    """
-    vcv = zeros( T, n, n) .+ I(n) 
-    Threads.@threads for r in 1:n
-    for c in 1:n
-        d = r-c
-        if d == 0 | d == 1
-            vcv[r,c] = var * rho^d  
-        end
-    end
-    end
-    return vcv
-end
-
+ 
 
 
 # Helper to create AR1 covariance matrix
 function ar1_covariance_matrix(times::Vector{<:Real}, rho::Real, sigma_e::Real)
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A helper function to compute a full AR(1) covariance matrix based on the time
-              differences between observations.
-    """
+    # BSTM Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: A helper function to compute a full AR(1) covariance matrix based on the time
+    #           differences between observations.
     n = length(times)
     T = typeof(rho) # Get the type of the parameters
     C = Matrix{T}(undef, n, n) # Initialize matrix with this type
@@ -2100,13 +1943,11 @@ end
 
 # Helper to create AR1 cross-covariance matrix
 function ar1_cross_covariance_matrix(times_a::Vector{<:Real}, times_b::Vector{<:Real}, rho::Real, sigma_e::Real)
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A helper function to compute an AR(1) cross-covariance matrix between two
-              different sets of time points. This is useful for prediction and interpolation in
-              time series models.
-    """
+    # BSTM Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: A helper function to compute an AR(1) cross-covariance matrix between two
+    #           different sets of time points. This is useful for prediction and interpolation in
+    #           time series models.
     na = length(times_a)
     nb = length(times_b)
     T = typeof(rho) # Get the type of the parameters
@@ -2208,17 +2049,12 @@ end
 
 
 function _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples=nothing, y_obs_custom=nothing)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal post-processing engine that generates denoised predictions
-              (expectations), noisy predictions (posterior predictive samples), and pointwise
-              log-likelihood values for model assessment (e.g., WAIC).
-    """
-    # Audited and Feature-Complete Prediction Utility (v10.5.0)
-    # Rationale: Finalizing the full-taxonomy support for all 15+ model families.
-    # Requirement: Ensure posterior predictive sampling (noisy) matches the support and parameters
-    # defined in the bstm_Likelihood dispatcher and get_dist_ref factory.
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: An internal post-processing engine that generates denoised predictions
+    #           (expectations), noisy predictions (posterior predictive samples), and pointwise
+    #           log-likelihood values for model assessment (e.g., WAIC).
+    # Rationale for v1.1.0: Updated versioning for consistency.
 
     # 1. Container Initialization
     # denoised: expected value mu (response scale)
@@ -2328,13 +2164,11 @@ end
 
 
 function _calculate_ps_weights(p_denoised, M, PS, N_PS, N_samples)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal utility for calculating post-stratification weights. It compares the
-              predicted values on a prediction surface to the values at observed locations to
-              derive weights for population-level estimates.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: An internal utility for calculating post-stratification weights. It compares the
+    #           predicted values on a prediction surface to the values at observed locations to
+    #           derive weights for population-level estimates.
      
     if N_PS == 0
         return nothing
@@ -2373,13 +2207,11 @@ end
 
 
 function _ensure_matrix(field, n_units, n_samples)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal helper function that robustly converts a scalar, vector, or matrix into
-              a matrix of a specified size. It handles broadcasting and reshaping as needed to
-              ensure dimensional consistency in downstream calculations.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: An internal helper function that robustly converts a scalar, vector, or matrix into
+    #           a matrix of a specified size. It handles broadcasting and reshaping as needed to
+    #           ensure dimensional consistency in downstream calculations.
     # Null/Empty handling: Return zero-field of correct dimensions
     if isnothing(field) || isempty(field)
         return zeros(Float64, n_units, n_samples)
@@ -2431,17 +2263,12 @@ end
   
 
 function _apply_link_and_lik(family::String, eta::AbstractArray, use_zi::Bool, phi=0.0, r=1.0)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal utility that applies the appropriate inverse link function (e.g., `exp`
-              for log-link, `logistic` for logit-link) to the linear predictor `eta` to obtain
-              the expected value `mu` on the response scale.
-    """
-    # Audited and Feature-Complete Link Utility (v10.2.0)
-    # Rationale: Mirroring the full 15+ family taxonomy established in _process_ll_and_predictions.
-    # This ensures that denoised realizations (expectations) are mathematically consistent with the likelihood kernels.
-    # Audit: Verified against Reference Hierarchy to include Log-link, Logit-link, and Identity-link routing.
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: An internal utility that applies the appropriate inverse link function (e.g., `exp`
+    #           for log-link, `logistic` for logit-link) to the linear predictor `eta` to obtain
+    #           the expected value `mu` on the response scale.
+    # Rationale for v1.1.0: Updated versioning for consistency.
 
     # 1. Family-Specific Inverse Link Dispatch
     # The linear predictor 'eta' exists in the latent space (usually unbounded Real).
@@ -2482,13 +2309,11 @@ end
 
 
 function _compute_waic(log_lik)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal helper to compute the Widely Applicable Information Criterion (WAIC) from
-              a pointwise log-likelihood matrix. WAIC is a measure of out-of-sample predictive
-              accuracy that accounts for model complexity.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: An internal helper to compute the Widely Applicable Information Criterion (WAIC) from
+    #           a pointwise log-likelihood matrix. WAIC is a measure of out-of-sample predictive
+    #           accuracy that accounts for model complexity.
     nsamples, nobs = size(log_lik)
     lppd = sum(logsumexp(log_lik[:, i]) - log(nsamples) for i in 1:nobs)
     p_waic = sum(var(log_lik[:, i]) for i in 1:nobs)
@@ -2496,12 +2321,10 @@ function _compute_waic(log_lik)
 end
 
 function _extract_beta_cov(all_names, chain, M, N_samples, alpha)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal helper to extract and summarize the posterior distributions for the
-              coefficients of smoothed covariate effects, which are typically modeled as random effects.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: An internal helper to extract and summarize the posterior distributions for the
+    #           coefficients of smoothed covariate effects, which are typically modeled as random effects.
     # Identify all categorical covariate groups present in the chain
     # Matches patterns like "beta_cov[1]", "beta_cov[2]", etc.
     cov_matches = unique(map(m -> m.captures[1], filter(!isnothing, match.(r"beta_cov\[(\d+)\]", all_names))))
@@ -2572,18 +2395,12 @@ end
  
 
 function _discover_manifold_realizations(chain, M, n_samples, outcomes_N, p_names)
-    """
-    BSTM Manifold Discovery Engine v1.0.0
-    Timestamp: 2026-06-26 20:00:00
-    Synopsis: The main internal engine for discovering and extracting all latent manifold
-              realizations from a fitted MCMC chain. It iterates through the model's manifold
-              registry and uses multiple dispatch to call the correct extraction method for each component.
-    Rationale for v1.0.0:
-        - Added specific logic to detect the `MultifidelityArchitecture` and extract its unique
-          RFF-based latent fields (`z_latent`, `w_latent`), which are not part of the standard
-          manifold registry.
-        - This ensures the discovery engine is feature-complete for all `bstm` architectures.
-    """
+    # BSTM Manifold Discovery Engine v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: The main internal engine for discovering and extracting all latent manifold
+    #           realizations from a fitted MCMC chain. It iterates through the model's manifold
+    #           registry and uses multiple dispatch to call the correct extraction method for each component.
+    # Rationale for v1.1.0: Updated versioning for consistency.
     # --- 1. Initialize Manifold Registries ---
     s_eff_struct = [zeros(Float64, M.s_N, n_samples) for _ in 1:outcomes_N]
     s_eff_noisy  = [zeros(Float64, M.s_N, n_samples) for _ in 1:outcomes_N]
@@ -2679,16 +2496,11 @@ end
 
 
 function _modular_eta_assembly(N_tot_in, registry, M, PS_in)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: The primary internal engine for assembling the final linear predictor `eta`. It
-              superimposes all recovered latent fields from the manifold registry for both the
-              training data and any provided prediction grid.
-    """
-    # BSTM Linear Predictor Assembly Engine v18.1.32
-    # Timestamp: 2026-06-07 14:45:00
-    # Rationale: Optimizing SVC inner loop by precomputing column indices and avoiding redundant symbol conversion.
+    # BSTM Linear Predictor Assembly Engine v1.2.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: The primary internal engine for assembling the final linear predictor `eta`. It
+    #           superimposes all recovered latent fields from the manifold registry for both the
+    #           training data and any provided prediction grid.
 
     n_samples = registry.n_samples
     outcomes_n = registry.outcomes_N
@@ -2787,10 +2599,9 @@ end
 
 
 function summarize_array(samples::AbstractArray; alpha=0.05)
-    # BSTM Posterior Summarization  v1.0.0
-    # Timestamp: 2026-06-25 18:00:00
-    # Rationale: Adding posterior standard deviation (std) to the summary output.
-    # Refactoring the vectorization logic for improved clarity and robustness.
+    # BSTM Posterior Summarization  v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: A robust utility to compute summary statistics (mean, median, std, credible intervals) for posterior samples.
 
     # 1. Edge Case: Handle empty or invalid input arrays
     # Rationale: Prevents errors in downstream processing if a latent field is not recovered.
@@ -2846,13 +2657,11 @@ end
 
 
 function decompose_bstm_formula(formula_str::String)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: The main formula parser for the `bstm` interface. It decomposes a formula string
-              (e.g., "y ~ 1 + x + spatial(s)") into its constituent parts: outcomes, fixed
-              effects, and a structured registry of manifold modules.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: The main formula parser for the `bstm` interface. It decomposes a formula string
+    #           (e.g., "y ~ 1 + x + spatial(s)") into its constituent parts: outcomes, fixed
+    #           effects, and a structured registry of manifold modules.
 
     # Partition the formula into Left-Hand Side (Outcomes) and Right-Hand Side (Predictors)
     parts = Base.split(formula_str, "~")
@@ -2986,7 +2795,6 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
     plots_list = []
 
     # # 2. Panel 1: Posterior Predictive Check (PPC)
-    # Rationale: Core fit audit comparing expectations to observations.
     is_mv = (obs_src isa AbstractMatrix && size(obs_src, 2) > 1)
     y_p = is_mv ? pstats.predictions_denoised.mean[:, outcome] : vec(pstats.predictions_denoised.mean)
     y_o = is_mv ? obs_src[:, outcome] : vec(obs_src)
@@ -3004,7 +2812,6 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
     end
 
     # # 3. Panel 2: Spatial Field Mapping
-    # Rationale: High-fidelity geographic rendering of structured innovations.
   if !isnothing(coords)
         s_field = (pstats.arch isa MultivariateArchitecture || pstats.arch isa MultifidelityArchitecture) ? pstats.spatial_structured[outcome] : pstats.spatial_structured
 
@@ -3065,8 +2872,6 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
     end
 
     # # 6. Panel 5: RESTORED Mixed-Effect Categorical Registry
-    # Rationale: Specifically added to audit hospital/group varying intercepts.
-    # Checks for summaries of c_latent terms identified in v19.21.2.
     if hasproperty(pstats, :mixed_effects) && !isnothing(pstats.mixed_effects)
         for (grp_sym, m_summ) in pstats.mixed_effects
             mm, ml, mu = vec(m_summ.mean), vec(m_summ.lower), vec(m_summ.upper)
@@ -3075,7 +2880,6 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
     end
 
     # # 7. Panel 6: RESTORED Hyper-Volumetric Smooths (1D-4D)
-    # Rationale: High-dimensional surfaces projected onto the observation grid.
     if hasproperty(pstats, :smooth_effects) && !isnothing(pstats.smooth_effects)
         b_field = pstats.smooth_effects
         if !all(isnan, b_field.mean) && Statistics.std(b_field.mean) > 1e-9
@@ -3085,7 +2889,6 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
     end
 
     # # 8. Panel 7: Hierarchical Supervisor Contributions
-    # Rationale: Renders signals transferred from nested supervisor processes.
     if hasproperty(pstats, :nested_contributions) && !isnothing(pstats.nested_contributions)
         n_field = pstats.nested_contributions
         if !all(isnan, n_field.mean) && Statistics.std(n_field.mean) > 1e-9
@@ -3114,7 +2917,6 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
 
 
     # # 10. Dashboard Assembly and Layout
-    # Rationale: Collating all discovered panels into a unified multi-plot object.
     if !isempty(plots_list)
         n_plots = length(plots_list)
         cols = min(n_plots, 2)
@@ -3123,7 +2925,7 @@ function model_results_plots(res, ts=1; outcome=1, centroids=nothing, polygons=n
         return final_plt
     end
 
-    @warn "BSTM Visualization: No active technical manifolds discovered for outcome $outcome."
+    @warn "BSTM Visualization: No active manifolds discovered for outcome $outcome."
     return nothing
 end
 
@@ -3194,19 +2996,11 @@ end
 
 
 function process_intercept_module!(opt_dict, mod_data)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 20:45:00
-    Synopsis: Processes the `intercept()` module from the formula string. It signals that an
-              intercept should be included in the model and extracts a custom prior if one is
-              provided via the `prior` parameter.
-    Rationale for v1.0.0:
-        - Corrected the function to be effective. It now sets the `:add_intercept` flag and
-          stores any custom prior in `:intercept_prior` within the main configuration object,
-          making it accessible to the model builder.
-        - The function no longer interacts with the `hyperprior_registry`, as the intercept
-          prior is a global model parameter, not a manifold-specific one.
-    """
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: Processes the `intercept()` module. It signals the inclusion of a global
+    #           intercept and handles prior specification.
+    # Rationale for v1.1.0: This version is consistent with the latest design but was not reflected in the file.
     opt_dict[:add_intercept] = true
     params = mod_data[:params]
     if haskey(params, :prior)
@@ -3224,20 +3018,12 @@ function process_intercept_module!(opt_dict, mod_data)
 end
 
 function process_spatial_module!(opt_dict, mod_data)
-    # BSTM Internal Utility v1.1.0
-    # Timestamp: 2026-06-27 00:03:49
+    # BSTM Internal Utility v1.2.0
+    # Timestamp: 2026-06-27 12:45:00
     # Synopsis: Processes the `spatial()` module from the formula string. This function is
     #           responsible for extracting the spatial index variable, calculating the number of
     #           unique spatial units (s_N), and extracting an adjacency matrix (W) if it is
     #           provided directly within the formula.
-    # Rationale for v1.1.0:
-    #     - Verified that the function correctly extracts the spatial index (`s_idx`), the number
-    #       of spatial units (`s_N`), and an optional adjacency matrix (`W`).
-    #     - Confirmed that the function correctly avoids interpreting the `model` parameter,
-    #       properly leaving that task to downstream model-building functions. The implementation
-    #       is deemed complete and correct for its role. The signature has been updated to
-    #       accept standardized `registries` and `hyperpriors` arguments for architectural
-    #       consistency, though they are not used in this function.
 
     data = opt_dict[:data]
 
@@ -3263,25 +3049,12 @@ end
 
 
 function process_temporal_module!(opt_dict, mod_data, registries, hyperpriors)
-    # BSTM Internal Utility v2.0.0
-    # Timestamp: 2026-06-27 00:10:15
+    # BSTM Internal Utility v2.1.0
+    # Timestamp: 2026-06-27 12:45:00
     # Synopsis: Processes the `temporal()` module from the formula string. This function is
     #           responsible for extracting temporal and seasonal index variables, setting the
     #           respective model types, and passing user-defined options to the time unit
     #           discretization engine.
-    # Rationale for v2.0.0:
-    #     - Corrected a major architectural flaw where the function only processed the first
-    #       variable and a single string model. It now correctly handles the documented
-    #       `temporal(t_idx, u_idx, model=('ar1', 'cyclic'))` syntax.
-    #     - Implemented parsing for tuple-based model specifications, correctly dispatching
-    #       to `:model_time` and `:model_season`.
-    #     - Removed the hardcoded call to `assign_time_units`. The function now extracts
-    #       parameters like `time_method`, `t_N`, and `u_N` from the formula and passes
-    #       them to the discretization engine, giving the user full control.
-    #     - Decoupled seasonal model specification, removing the side-effect where
-    #       `model='cyclic'` would incorrectly set the global `:model_season` flag.
-    #     - The signature has been updated to accept standardized `registries` and `hyperpriors`
-    #       
 
     data = opt_dict[:data]
     params = mod_data[:params]
@@ -3319,21 +3092,11 @@ end
  
 
 function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, manifolds_registry)
-    # BSTM Internal Utility v2.0.0
-    # Timestamp: 2026-06-27 12:00:00
+    # BSTM Internal Utility v2.1.0
+    # Timestamp: 2026-06-27 12:45:00
     # Synopsis: Processes `smooth()` modules. This function is now a dispatcher that handles
-    #           two distinct types of smooths:
-    #           1. Basis Function Smooths (e.g., pspline, rff): Generates a basis matrix `B`
-    #              for an effect `B * beta`, where beta is IID.
-    #           2. Structured Random Effect Smooths (e.g., rw2, icar ⊗ ar1): Discretizes
-    #              covariates and configures a GMRF to be applied to the resulting indices.
-    # Rationale for v2.0.0:
-    #     - The function is now complete, supporting both basis and structured random effect smooths.
-    #     - Added a new path to handle GMRF-style models (`rw2`, `icar`, etc.) and algebraic
-    #       interactions (`⊗`) as specified by user requirements.
-    #     - This new path populates a new `:structured_smooths` registry in the configuration,
-    #       which requires a corresponding update in the main `bstm_univariate` model.
-    #     - The existing basis function logic is preserved and remains the default path.
+    #           both basis function smooths (e.g., pspline) and structured random effect smooths
+    #           (e.g., rw2 on a binned covariate).
 
     data = opt_dict[:data]
     model_str = string(get(mod_data[:params], :model, "pspline"))
@@ -4708,14 +4471,6 @@ function build_model(m::Union{FFT, Wavelet}, data_inputs)
     return _build_pass_through_model(m, data_inputs, model_type_sym=:spectral, Q_template_val=template.matrix)
 end
 
-function build_model(m::Union{Advection, Diffusion, AdvectionDiffusion}, data_inputs)
-    # Handles physics-informed transport manifolds.
-    n = data_inputs.s_N
-    W = get(data_inputs, :W, nothing)
-    template = build_structure_template(:besag, n; W=W) # Base Laplacian
-    return _build_pass_through_model(m, data_inputs, model_type_sym=Symbol(lowercase(string(typeof(m)))), Q_template_val=template.matrix, sf_val=template.scaling_factor)
-end
-
 # 7.2. Specific Dispatches for Manifolds with Unique Logic
 
 function build_model(m::SPDE, data_inputs)
@@ -4886,7 +4641,7 @@ end
 function _apply_manifold!(eta, spec, m_obj::DynamicsManifold, M, noise)
     # Rationale: This is the primary entry point for mechanistic state-space models.
     # It dispatches to the appropriate dynamics kernel based on the manifold's metadata.
-    _apply_dynamics_model!(spec, eta, M, M.hyperpriors)
+    _apply_dynamics_model!(spec, eta, M, m_obj.params)
 end
 
 function _apply_manifold!(eta, spec, m_obj::Eigen, M, noise)
@@ -6605,7 +6360,7 @@ function recompose_precision(
         return Symmetric(scale_factor * I(n_s) + noise * I)
     end
 
-    if m_type == :besag || m_type == :icar || m_type == :diffusion || m_type == :cyclic
+    if m_type == :besag || m_type == :icar || m_type == :cyclic
         return Symmetric(scale_factor .* template_s + noise * I)
     end
 
@@ -6648,7 +6403,7 @@ function recompose_precision(
         return Symmetric(scale_factor .* (L_op' * L_op) + noise * I)
     end
 
-    if m_type == :sar || m_type == :advection || m_type == :advection_diffusion || m_type == :dag || m_type == :proper_car
+    if m_type == :sar || m_type == :dag || m_type == :proper_car
         rho_p = isnothing(extra_param) ? 0.8 : extra_param
         L_op = I(n_s) - rho_p .* template_s
         return Symmetric(scale_factor .* (L_op' * L_op) + noise * I)
@@ -8705,40 +8460,7 @@ function bstm_cv_orchestrator(
     )
 end
 
-
-### 
-
-# Advection-Diffusion Operator Registration
-function build_transport_operator(M, velocity, diffusion_coeff)
-    # Rationale: Constructs the discretized transport operator on the graph manifold.
-    # Requirement: Adjacency matrix W must be non-null for graph-based advection.
-    local n = M.s_N
-    local W = get(M, :W, sparse(I(n)))
-    local D = Matrix(Diagonal(vec(sum(W, dims=2))))
-    local L = D - Matrix(W)
-
-    # Operator: (I - dt * (diffusion * L + velocity * G))
-    # For this restoration, we focus on the Diffusion Laplacian contribution.
-    return I(n) .- (diffusion_coeff .* L)
-end
-
-# Updated Parser Logic for Spatial Manifold Dispatch
-function parse_spatial_term(var_name, params_str)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal helper for the formula parser that specifically processes a `spatial()`
-              module term, extracting its variable and parameters. This function appears to be a
-              precursor to the more general `_parse_module_call` and may be redundant.
-    """
-    local p = parse_module_params(params_str)
-    local manifold = get(p, :manifold, "bym2")
-
-    # Logic: Determine if input is index (graph) or coordinates (continuous)
-    # Graph-based requires W; Coordinate-based requires (x,y) parsing.
-    return (variable=var_name, manifold=manifold, params=p)
-end
-
+ 
 
 
 function bstm(config::NamedTuple)
@@ -8758,16 +8480,12 @@ end
 
 
 function bstm(args...; model_family="gaussian", model_arch="univariate", auxiliary_responses=nothing, kwargs...)
-    """
-    BSTM Main Entry Point v1.1.0
-    Timestamp: 2026-06-26 17:15:00
-    Synopsis: The main user-facing `bstm` function. It acts as a dispatcher, accepting either a
-              formula string and data, or a pre-built configuration object, and routes to the
-              appropriate model constructor.
-    Rationale for v1.1.0:
-        - Corrected a `FieldError` by ensuring that all keyword arguments, including `model_arch`
-          and `model_family`, are correctly passed from the main `bstm` call to the `bstm_config` engine.
-    """
+    # BSTM Main Entry Point v1.2.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: The main user-facing `bstm` function. It acts as a dispatcher, accepting either a
+    #           formula string and data, or a pre-built configuration object, and routes to the
+    #           appropriate model constructor.
+    # Rationale for v1.2.0: Updated versioning for consistency.
     # Mode 1: Formula-Driven Model Construction
     if length(args) >= 2 && args[1] isa String && args[2] isa DataFrame
         formula = args[1] 
@@ -8811,19 +8529,12 @@ end
 
 
 function bstm_config(formula::String, data::DataFrame; kwargs...)
-    """
-    BSTM Utility v1.4.0
-    Timestamp: 2026-06-26 20:45:00
-    Synopsis: The main configuration engine for the formula-based interface. It parses the
-              formula string, processes all specified modules, and assembles the final technical
-              configuration `NamedTuple` required to build and run a `bstm` model.
-    Rationale for v1.4.0:
-        - Updated to correctly handle custom intercept priors. The function now checks if an
-          `:intercept_prior` is set and, if so, ensures the fixed-effects design matrix is
-          created without a default intercept column, as the intercept will be handled as a
-          separate parameter in the model.
-        - Standardized the call signatures for all module processors.
-    """
+    # BSTM Utility v1.5.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: The main configuration engine for the formula-based interface. It parses the
+    #           formula string, processes all specified modules, and assembles the final technical
+    #           configuration `NamedTuple` required to build and run a `bstm` model.
+    # Rationale for v1.5.0: Updated versioning for consistency.
     # 1. Formula Scope Discovery
     metadata = decompose_bstm_formula(formula)
 
@@ -8918,18 +8629,11 @@ end
 
 
 function parse_module_params(params_str::AbstractString)
-    # BSTM Internal Utility v1.2.0
-    # Timestamp: 2026-06-27 12:36:40
+    # BSTM Internal Utility v1.3.0
+    # Timestamp: 2026-06-27 12:45:00
     # Synopsis: An internal utility that parses the parameter part of a module string (e.g.,
     #           "model='bym2', W=data[:W]") into a dictionary of key-value pairs. It handles
     #           different data types and can evaluate Julia expressions.
-    # Rationale for v1.2.0:
-    #     - Enhanced parsing logic to robustly handle unquoted string values (e.g., `model=ar1`),
-    #       quoted string values (`model='ar1'`), and symbolic values (`model=:ar1`).
-    #     - The `try-catch` block for `Main.eval` now gracefully falls back to treating the
-    #       raw value as a string, which is the most flexible format for downstream functions
-    #       that stringify the model name anyway. This makes the behavior more predictable
-    #       and less dependent on the `Main` execution scope.
 
     d = Dict{Symbol, Any}()
     if isempty(strip(params_str))
@@ -8986,17 +8690,11 @@ end
 
 
 function get_optimal_sampler(model_obj::DynamicPPL.Model; target_acceptance=0.65, adaptation_steps=100)
-    """
-    BSTM Utility v1.1.0
-    Timestamp: 2026-06-26 17:45:12
-    Synopsis: A utility that selects an optimal MCMC sampler for a given Turing model. It
-              distinguishes between discrete and continuous parameters to construct a Gibbs
-              sampler that uses Particle Gibbs for discrete variables and NUTS for continuous ones.
-    Rationale for v1.1.0:
-        - Corrected an `UndefVarError` by replacing the call to the non-existent function
-          `DynamicPPL.get_varnames` with `keys(rand(model_obj))`. This is the current,
-          robust method for discovering all latent `VarName` objects from a model instance.
-    """
+    # BSTM Utility v1.2.0
+    # Timestamp: 2026-06-27 12:45:00
+    # Synopsis: A utility that selects an MCMC sampler for a given Turing model. It
+    #           distinguishes between discrete and continuous parameters to construct a Gibbs
+    #           sampler that uses Particle Gibbs for discrete variables and NUTS for continuous ones.
     # 1. Parameter Discovery
     all_params = keys(rand(model_obj))
     
@@ -9044,5 +8742,329 @@ function get_optimal_sampler(model_obj::DynamicPPL.Model; target_acceptance=0.65
     end
 end
 
+
+
+# --- Dynamics Model Implementations ---
+ 
+ 
+function _dynamics_logistic_fishing!(spec, eta, M, priors)
+    """
+    BSTM Dynamics Model v1.1.0
+    Timestamp: 2026-06-26 18:45:00
+    Synopsis: Implements a logistic growth model with a latent, time-varying fishing mortality (F).
+    Rationale for v1.1.0:
+        - Corrected `UndefVarError` by explicitly declaring all sampled parameters
+          (`log_r_base`, `log_K_base`, etc.) as local variables before use.
+    """
+    key = spec.key
+    params = spec.params
+    T = eltype(eta)
+
+    # 1. Define Priors with User Overrides
+    r_prior = get(priors, "r_prior", LogNormal(0, 1))
+    K_prior = get(priors, "K_prior", Normal(150, 50))
+    sig_pop_prior = get(priors, "sig_pop_prior", Exponential(1.0))
+    sig_F_prior = get(priors, "sig_F_prior", Exponential(0.5))
+
+    # 2. Declare and Sample Core Dynamics Parameters
+    log_r_base::T = 0.0
+    log_K_base::T = 0.0
+    sig_pop::T = 0.0
+    sig_F::T = 0.0
+    log_r_base ~ NamedDist(r_prior, Symbol("log_r_base_", key))
+    log_K_base ~ NamedDist(K_prior, Symbol("log_K_base_", key))
+    sig_pop ~ NamedDist(sig_pop_prior, Symbol("sig_pop_", key))
+    sig_F ~ NamedDist(sig_F_prior, Symbol("sig_F_", key))
+
+    # 3. Initialize State-Space Vectors
+    log_pop_state = Vector{T}(undef, M.t_N)
+    log_F_state = Vector{T}(undef, M.t_N)
+    log_pop_state[1] ~ Normal(log_K_base - log(2.0), 1.0)
+    log_F_state[1] ~ Normal(-2.0, 1.0)
+
+    # 4. Handle Environmental Covariates on r and K
+    r_cov_effect::T = 0.0
+    r_cov_data = nothing
+    if haskey(params, :r_covariate)
+        r_cov_effect ~ NamedDist(Normal(0, 0.1), Symbol("r_cov_effect_", key))
+        r_cov_data = M.data[!, params[:r_covariate]]
+    end
+
+    K_cov_effect::T = 0.0
+    K_cov_data = nothing
+    if haskey(params, :K_covariate)
+        K_cov_effect ~ NamedDist(Normal(0, 0.1), Symbol("K_cov_effect_", key))
+        K_cov_data = M.data[!, params[:K_covariate]]
+    end
+
+    # 5. State Transition Loop
+    for t in 2:M.t_N
+        current_r = isnothing(r_cov_data) ? exp(log_r_base) : exp(log_r_base + r_cov_effect * r_cov_data[t-1])
+        current_K = isnothing(K_cov_data) ? exp(log_K_base) : exp(log_K_base + K_cov_effect * K_cov_data[t-1])
+        prev_pop = exp(log_pop_state[t-1])
+        prev_F = exp(log_F_state[t-1])
+        growth = current_r * (1.0 - prev_pop / current_K) - prev_F
+        log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_pop)
+        log_F_state[t] ~ Normal(log_F_state[t-1], sig_F)
+    end
+
+    # 6. Link Latent Population State to Observations
+    for i in 1:M.y_N
+        eta[i] += log_pop_state[M.t_idx[i]]
+    end
+end
+
+function _dynamics_gompertz!(spec, eta, M, priors)
+    """
+    BSTM Dynamics Model v1.1.0
+    Timestamp: 2026-06-26 18:45:00
+    Synopsis: Implements a Gompertz growth model as a state-space process.
+    Rationale for v1.1.0:
+        - Corrected `UndefVarError` by explicitly declaring `r_dyn`, `K_dyn`, and `sig_dyn`.
+    """
+    key = spec.key
+    params = spec.params
+    T = eltype(eta)
+
+    r_prior = get(priors, "r_prior", LogNormal(-1.5, 0.5))
+    K_prior = get(priors, "K_prior", Normal(150, 50))
+    sig_dyn_prior = get(priors, "sig_dyn_prior", Exponential(1.0))
+
+    r_dyn::T = 0.0
+    K_dyn::T = 0.0
+    sig_dyn::T = 0.0
+    r_dyn ~ NamedDist(r_prior, Symbol("r_dyn_", key))
+    K_dyn ~ NamedDist(K_prior, Symbol("K_dyn_", key))
+    sig_dyn ~ NamedDist(sig_dyn_prior, Symbol("sig_dyn_", key))
+
+    log_pop_state = Vector{T}(undef, M.t_N)
+    log_pop_state[1] ~ Normal(log(K_dyn / 2.0), 1.0)
+
+    for t in 2:M.t_N
+        growth = r_dyn * (log(K_dyn) - log_pop_state[t-1])
+        log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_dyn)
+    end
+
+    for i in 1:M.y_N
+        eta[i] += log_pop_state[M.t_idx[i]]
+    end
+end
+
+
+
+function _dynamics_linked_K!(spec, eta, M, priors)
+    """
+    BSTM Dynamics Model v1.1.0
+    Timestamp: 2026-06-26 18:45:00
+    Synopsis: Implements a logistic growth model where K is linked to the statistical environment.
+    Rationale for v1.1.0:
+        - Corrected `UndefVarError` by explicitly declaring `r_dyn`, `sig_pop`, and `K_slope`.
+    """
+    key = spec.key
+    params = spec.params
+    T = eltype(eta)
+
+    # 1. Define Priors
+    r_prior = get(priors, "r_prior", LogNormal(0, 1))
+    sig_pop_prior = get(priors, "sig_pop_prior", Exponential(1.0))
+    K_slope_prior = get(priors, "K_slope_prior", Normal(1, 0.5))
+
+    # 2. Declare and Sample Core Dynamics Parameters
+    r_dyn::T = 0.0
+    sig_pop::T = 0.0
+    K_slope::T = 0.0
+    r_dyn ~ NamedDist(r_prior, Symbol("r_dyn_", key))
+    sig_pop ~ NamedDist(sig_pop_prior, Symbol("sig_pop_", key))
+    K_slope ~ NamedDist(K_slope_prior, Symbol("K_slope_", key))
+
+    # 3. Pre-compute time-step specific statistical effects from eta
+    eta_statistical_by_time = [mean(eta[M.t_idx .== t]) for t in 1:M.t_N]
+
+    # 4. Initialize State-Space Vector
+    log_pop_state = Vector{T}(undef, M.t_N)
+    log_K_initial = eta_statistical_by_time[1] * K_slope
+    log_pop_state[1] ~ Normal(log_K_initial - log(2.0), 1.0)
+
+    # 5. State Transition Loop
+    for t in 2:M.t_N
+        log_K_current = eta_statistical_by_time[t-1] * K_slope
+        current_K = exp(log_K_current)
+        prev_pop = exp(log_pop_state[t-1])
+        growth = r_dyn * (1.0 - prev_pop / current_K)
+        log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_pop)
+    end
+
+    # 6. Link Latent Population State back to the Linear Predictor
+    for i in 1:M.y_N
+        eta[i] += log_pop_state[M.t_idx[i]]
+    end
+end
+
+
+function _dynamics_advection!(spec, eta, M, priors)
+    """
+    BSTM Dynamics Model v1.1.0
+    Timestamp: 2026-06-26 18:45:00
+    Synopsis: Implements a simple advection (transport) model on a graph.
+    Rationale for v1.1.0:
+        - Corrected `UndefVarError` by explicitly declaring `velocity` and `sig_transport`.
+    """
+    key = spec.key
+    T = eltype(eta)
+
+    velocity_prior = get(priors, "velocity_prior", Normal(0, 0.5))
+    sigma_prior = get(priors, "sigma_prior", Exponential(1.0))
+
+    velocity::T = 0.0
+    sig_transport::T = 0.0
+    velocity ~ NamedDist(velocity_prior, Symbol("velocity_", key))
+    sig_transport ~ NamedDist(sigma_prior, Symbol("sig_transport_", key))
+
+    L = M.s_Q_template.matrix
+    n_s = M.s_N
+    n_t = M.t_N
+
+    transport_field = Matrix{T}(undef, n_s, n_t)
+    transport_field[:, 1] .~ Normal(0, 1)
+
+    for t in 2:n_t
+        drift = -velocity .* (L * transport_field[:, t-1])
+        transport_field[:, t] ~ MvNormal(transport_field[:, t-1] .+ drift, sig_transport^2 * I)
+    end
+
+    for i in 1:M.y_N
+        eta[i] += transport_field[M.s_idx[i], M.t_idx[i]]
+    end
+end
+
+function _dynamics_diffusion!(spec, eta, M, priors)
+    """
+    BSTM Dynamics Model v1.1.0
+    Timestamp: 2026-06-26 18:45:00
+    Synopsis: Implements a simple diffusion model on a graph.
+    Rationale for v1.1.0:
+        - Corrected `UndefVarError` by explicitly declaring `diffusion_coeff` and `sig_transport`.
+    """
+    key = spec.key
+    T = eltype(eta)
+    
+    diffusion_prior = get(priors, "diffusion_prior", LogNormal(-1, 1))
+    sigma_prior = get(priors, "sigma_prior", Exponential(1.0))
+
+    diffusion_coeff::T = 0.0
+    sig_transport::T = 0.0
+    diffusion_coeff ~ NamedDist(diffusion_prior, Symbol("diffusion_", key))
+    sig_transport ~ NamedDist(sigma_prior, Symbol("sig_transport_", key))
+
+    L = M.s_Q_template.matrix
+    n_s = M.s_N
+    n_t = M.t_N
+
+    transport_field = Matrix{T}(undef, n_s, n_t)
+    transport_field[:, 1] .~ Normal(0, 1)
+
+    for t in 2:n_t
+        drift = -diffusion_coeff .* (L * transport_field[:, t-1])
+        transport_field[:, t] ~ MvNormal(transport_field[:, t-1] .+ drift, sig_transport^2 * I)
+    end
+
+    for i in 1:M.y_N
+        eta[i] += transport_field[M.s_idx[i], M.t_idx[i]]
+    end
+end
+
+
+
+function _dynamics_advection_diffusion!(spec, eta, M, user_params::Dict)
+    # BSTM Dynamics Model v1.4.0
+    # Timestamp: 2026-06-27 14:55:00
+    # Synopsis: Implements a combined advection-diffusion state-space model on a graph.
+    # Rationale for v1.4.0:
+    #     - Corrected an `UndefVarError` where a variable `velocity` was sampled and used without being declared.
+    #     - Standardized parameter names to `delta` (diffusion), `c` (advection), and `sigma_dyn` (process noise).
+    #     - Implemented unique parameter naming using the `spec.key` to prevent collisions in models with multiple dynamics components.
+    #     - Corrected the use of the parameter dictionary to consistently use the passed `user_params` for retrieving priors.
+    
+    key = spec.key
+    T = eltype(eta)
+
+    # 1. Define Priors with User Overrides from the `user_params` dictionary
+    diffusion_prior = get(user_params, :diffusion_prior, LogNormal(-1, 1))
+    advection_prior = get(user_params, :advection_prior, Normal(0, 0.5))
+    sigma_prior = get(user_params, :sigma_prior, Exponential(1.0))
+ 
+    # 2. Declare and Sample Core Dynamics Parameters
+    delta::T = 0.0
+    c::T = 0.0
+    sigma_dyn::T = 0.0
+    delta ~ NamedDist(diffusion_prior, Symbol("diffusion_coeff_", key))
+    c ~ NamedDist(advection_prior, Symbol("advection_coeff_", key))
+    sigma_dyn ~ NamedDist(sigma_prior, Symbol("sigma_dynamics_", key))
+ 
+    # 3. Initialize State-Space Vector
+    dyn_field = Matrix{eltype(eta)}(undef, M.s_N, M.t_N)
+    dyn_field[:, 1] ~ MvNormal(zeros(M.s_N), I)
+
+    # 4. Define Operators
+    L = M.s_Q_template.matrix
+    W = get(M, :W, sparse(zeros(M.s_N, M.s_N))) # Adjacency matrix
+
+    # 5. State Transition Loop
+    A = I - delta .* L - c .* W
+    for t in 2:M.t_N
+        mean_t = A * dyn_field[:, t-1]
+        dyn_field[:, t] ~ MvNormal(mean_t, sigma_dyn^2 * I)
+    end
+
+    # 6. Link Latent Population State to Observations
+    for i in 1:M.y_N
+        eta[i] += dyn_field[M.s_idx[i], M.t_idx[i]]
+    end
+end
+
+function _apply_dynamics_model!(spec, eta, M, priors)
+    """
+    BSTM Dynamics Model v1.0.0
+    Timestamp: 2026-06-26 10:21:21
+    Synopsis: A dispatcher function that selects and executes the appropriate dynamics model.
+    Inputs:
+        - spec, eta, M, priors: Standard dynamics model inputs.
+    Details:
+        - Reads the `model` parameter from the `spec` to determine which dynamics function to call.
+        - Supports a set of built-in models (`logistic_fishing`, `gompertz`, etc.).
+        - Allows for user-defined custom models by specifying `model="custom"` and providing a function symbol via the `func` parameter.
+    """
+
+    params = spec.params
+    model_name = get(params, :model, "logistic_fishing")
+
+    # # 1. Dispatch to Built-in Dynamics Models
+    if model_name == "advection" # Transport models
+        _dynamics_advection!(spec, eta, M, priors)
+    elseif model_name == "diffusion"
+        _dynamics_diffusion!(spec, eta, M, priors)
+    elseif model_name == "advection_diffusion"
+        _dynamics_advection_diffusion!(spec, eta, M, priors)
+    elseif model_name == "logistic_fishing" || model_name == "ricker" || model_name == "logistic_basic"
+        _dynamics_logistic_fishing!(spec, eta, M, priors)
+    elseif model_name == "gompertz"
+        _dynamics_gompertz!(spec, eta, M, priors)
+    elseif model_name == "linked_K_logistic"
+        _dynamics_linked_K!(spec, eta, M, priors)
+    # 2. Dispatch to User-Defined Custom Model
+    elseif model_name == "custom"
+        func_sym = get(params, :func, nothing)
+        if !isnothing(func_sym) && isdefined(Main, func_sym)
+            user_func = getfield(Main, func_sym)
+            user_func(spec, eta, M, priors)
+        else
+            @warn "Custom dynamics function ':$func_sym' not found in Main scope. No dynamics applied."
+        end
+    # # 3. Fallback for Unknown Models
+    else
+        @warn "Unsupported dynamics model: '$model_name'. No dynamics applied."
+    end
+end
+ 
 ;;
  
