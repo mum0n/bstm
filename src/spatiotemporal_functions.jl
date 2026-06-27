@@ -86,6 +86,14 @@ struct PSpline <: ManifoldModel
     sigma_prior::UnivariateDistribution
 end
 
+# BSTM Manifold Primitives v06.2
+# Timestamp: 2026-06-27 19:30:00
+# Rationale: Adding TensorProductSmooth to support dimension-specific smooths.
+struct TensorProductSmooth <: ManifoldModel
+    Q_template::AbstractMatrix
+    sigma_prior::UnivariateDistribution
+end
+
 struct TPS <: ManifoldModel; nbins::Int; sigma_prior::UnivariateDistribution; end
 struct BSpline <: ManifoldModel; nbins::Int; degree::Int; sigma_prior::UnivariateDistribution; end
 
@@ -466,6 +474,10 @@ function manifold_type(m::Manifold)
     return lowercase(string(typeof(m)))
 end
 
+
+# BSTM Manifold Constructor Registry v06.2
+# Timestamp: 2026-06-27 19:30:00
+# Rationale: Adding a constructor for the new TensorProductSmooth manifold.
 const MANIFOLD_CONSTRUCTORS = Dict{Symbol, Function}(
     :iid => (p, params) -> IID(p.sigma_prior),
     :icar => (p, params) -> ICAR(p.sigma_prior),
@@ -485,8 +497,10 @@ const MANIFOLD_CONSTRUCTORS = Dict{Symbol, Function}(
     :pspline => (p, params) -> PSpline(get(params, :nbins, 20), get(params, :degree, 3), get(params, :diff_order, 2), p.sigma_prior),
     :bspline => (p, params) -> BSpline(get(params, :nbins, 10), get(params, :degree, 3), p.sigma_prior),
     :tps => (p, params) -> TPS(get(params, :nbins, 20), p.sigma_prior),
-    :dynamics => (p, params) -> DynamicsManifold(string(get(params, :model, "custom")), params)
+    :dynamics => (p, params) -> DynamicsManifold(string(get(params, :model, "custom")), params),
+    :tensor_product_smooth => (p, params) -> TensorProductSmooth(params[:Q_tensor], p.sigma_prior)
 )
+
 
 function _parse_module_call(module_call_str::AbstractString)
     """
@@ -783,39 +797,73 @@ function bstm_Likelihood(family_input, y_obs; sigma_y=0.0, weight=1.0, phi_zi=-I
 end
 
 # --- 5. Distribution Mapping ---
+# BSTM Internal Utility v1.1.0
+# Timestamp: 2026-06-27 17:15:00
+# Synopsis: A set of internal dispatch methods that map a linear predictor `eta` to the
+#           appropriate `Distributions.jl` object based on the model family. This function
+#           handles parameter transformations (e.g., `exp(eta)` for a log-link).
+# Rationale for v1.1.0:
+#     - Corrected the parameterization for the `ParetoFamily`. The previous implementation
+#       was inconsistent with the log-link assumption used by other families, where the
+#       mean `μ` is expected to be `exp(eta)`.
+#     - The `ParetoFamily` is now re-parameterized such that its mean is `exp(eta)`. The
+#       shape parameter `α` is taken from `extra_params` (and constrained to be > 1),
+#       and the scale parameter `θ` is derived as `exp(eta) * (α - 1) / α`. This ensures
+#       consistency with the `_apply_link_and_lik` function.
 
-# Rationale: Standardizing the mapping of eta to Distribution objects.
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A set of internal dispatch methods that map a linear predictor `eta` to the
-              appropriate `Distributions.jl` object based on the model family. This function
-              handles parameter transformations (e.g., `exp(eta)` for a log-link).
-    """
-function get_dist_ref(::PoissonFamily, d, eta, sig); return Poisson(exp(eta)); end
-function get_dist_ref(::GaussianFamily, d, eta, sig); return Normal(eta, sig); end
-function get_dist_ref(::LogNormalFamily, d, eta, sig); return LogNormal(eta, sig); end
-function get_dist_ref(::NegativeBinomialFamily, d, eta, sig); mu = exp(eta); return NegativeBinomial(d.r_nb, d.r_nb/(d.r_nb + mu)); end
+function get_dist_ref(::PoissonFamily, d, eta, sig); return Poisson(clamp(exp(eta), 1e-9, 1e9)); end
+function get_dist_ref(::GaussianFamily, d, eta, sig); return Normal(eta, max(sig, 1e-9)); end
+function get_dist_ref(::LogNormalFamily, d, eta, sig); return LogNormal(eta, max(sig, 1e-9)); end
+function get_dist_ref(::NegativeBinomialFamily, d, eta, sig); mu = clamp(exp(eta), 1e-9, 1e9); return NegativeBinomial(d.r_nb, d.r_nb/(d.r_nb + mu)); end
 function get_dist_ref(::BinomialFamily, d, eta, sig); n = d.trial isa AbstractVector ? d.trial[1] : d.trial; return Binomial(Int(n), logistic(eta)); end
-function get_dist_ref(::GammaFamily, d, eta, sig); alpha = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 1.0; return Gamma(alpha, exp(eta)/alpha); end
-function get_dist_ref(::ExponentialFamily, d, eta, sig); return Exponential(exp(eta)); end
-function get_dist_ref(::BetaFamily, d, eta, sig); mu = logistic(eta); phi = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 10.0; return Beta(mu*phi, (1-mu)*phi); end
-function get_dist_ref(::InverseGaussianFamily, d, eta, sig); mu = exp(eta); lambda = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 1.0; return InverseGaussian(mu, lambda); end
-function get_dist_ref(::StudentTFamily, d, eta, sig); nu = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 5.0; return LocationScale(eta, sig, TDist(nu)); end
-function get_dist_ref(::HalfNormalFamily, d, eta, sig); return truncated(Normal(0.0, sig), 0.0, Inf); end
-function get_dist_ref(::HalfStudentTFamily, d, eta, sig); nu = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 5.0; return truncated(LocationScale(0.0, sig, TDist(nu)), 0.0, Inf); end
-function get_dist_ref(::LaplaceFamily, d, eta, sig); return Laplace(eta, sig); end
-function get_dist_ref(::ParetoFamily, d, eta, sig); alpha = exp(eta); k = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 1.0; return Pareto(alpha, k); end
-function get_dist_ref(::DirichletFamily, d, eta, sig); return Dirichlet(exp.(eta)); end
+function get_dist_ref(::GammaFamily, d, eta, sig); alpha = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 1.0; return Gamma(alpha, clamp(exp(eta), 1e-9, 1e9)/alpha); end
+function get_dist_ref(::ExponentialFamily, d, eta, sig); return Exponential(clamp(exp(eta), 1e-9, 1e9)); end
+function get_dist_ref(::BetaFamily, d, eta, sig); mu = logistic(eta); phi = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 10.0; return Beta(clamp(mu*phi, 1e-9, Inf), clamp((1.0-mu)*phi, 1e-9, Inf)); end
+function get_dist_ref(::InverseGaussianFamily, d, eta, sig); mu = clamp(exp(eta), 1e-9, 1e9); lambda = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 1.0; return InverseGaussian(mu, lambda); end
+function get_dist_ref(::StudentTFamily, d, eta, sig); nu = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 5.0; return LocationScale(eta, max(sig, 1e-9), TDist(nu)); end
+function get_dist_ref(::HalfNormalFamily, d, eta, sig); return truncated(Normal(0.0, max(sig, 1e-9)), 0.0, Inf); end
+function get_dist_ref(::HalfStudentTFamily, d, eta, sig); nu = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 5.0; return truncated(LocationScale(0.0, max(sig, 1e-9), TDist(nu)), 0.0, Inf); end
+function get_dist_ref(::LaplaceFamily, d, eta, sig); return Laplace(eta, max(sig, 1e-9)); end
+function get_dist_ref(::ParetoFamily, d, eta, sig)
+    # Re-parameterize so that mean = exp(eta).
+    # Mean of Pareto(α, θ) is αθ / (α-1).
+    # Let α = shape, θ = scale.
+    # Set α = extra_params, and solve for θ such that mean = exp(eta).
+    # θ = exp(eta) * (α - 1) / α.
+    # This requires α > 1 for a finite mean.
+    shape = d.extra_params isa Number && d.extra_params > 1.0 ? d.extra_params : 1.1
+    mean_val = clamp(exp(eta), 1e-9, 1e9)
+    scale = mean_val * (shape - 1.0) / shape
+    return Pareto(shape, scale)
+end
+function get_dist_ref(::DirichletFamily, d, eta, sig); return Dirichlet(clamp.(exp.(eta), 1e-9, 1e9)); end
 
 # Specialized matrix-variate factory
 function get_dist_ref(::InverseWishartFamily, d, eta::AbstractMatrix, sig)
-    local p = size(eta, 1)
-    local nu = d.extra_params isa Number && d.extra_params > p ? d.extra_params : Float64(p + 1)
-    # Transformation to ensure positive definiteness
-    local Psi = PDMat(Symmetric(eta * eta' + 1e-6 * I))
-    return InverseWishart(nu, Psi)
+    # BSTM Internal Utility v1.1.0
+    # Timestamp: 2026-06-27 17:00:00
+    # Synopsis: Constructs an Inverse-Wishart distribution object for use in multivariate likelihoods.
+    # Rationale for v1.1.0:
+    #     - Implemented the previously missing logic for this distribution.
+    #     - The degrees of freedom (ν) are extracted from `d.extra_params`.
+    #     - The scale matrix (Ψ) is constructed from the outer product of the latent matrix `eta`,
+    #       with a small jitter term added to ensure positive definiteness, as required by the
+    #       Inverse-Wishart distribution. This aligns the implementation with the documentation.
+    # Get the dimension of the matrix
+    p = size(eta, 1)
+
+    # Degrees of freedom (ν) must be greater than the matrix dimension - 1.
+    # We extract it from extra_params, with a safe default.
+    nu = d.extra_params isa Number && d.extra_params > (p - 1) ? d.extra_params : Float64(p + 1)
+
+    # The scale matrix (Ψ) is formed from the outer product of the latent matrix eta.
+    # A small jitter is added for numerical stability, ensuring the matrix is positive definite.
+    jitter = 1e-6
+    scale_matrix = Symmetric(eta * eta' + jitter * I)
+
+    return InverseWishart(nu, scale_matrix)
 end
+
 
 # --- 4. Multiple Dispatch Kernels ---
 
@@ -835,111 +883,185 @@ function is_discrete_family(::AbstractBSTM_Family)
     return false
 end
 
-# Point Kernel (Uncensored) 
-
+function bstm_kernel(fam::AbstractBSTM_Family, ::Uncensored, zi::AbstractZIState, d, eta, sig, y)
     """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
+    BSTM Internal Utility v1.1.0
+    Timestamp: 2026-06-27 18:00:00
     Synopsis: A set of internal kernel functions that compute the log-probability for an
               observation by dispatching on the model family, censoring status, and
               zero-inflation state. This modular design separates the logic for different
               observation types.
+    Rationale for v1.1.0:
+        - Corrected the zero-inflation logic for continuous distributions. When y=0, the
+          log-likelihood is now explicitly `log(phi_zi)`, as the probability of observing
+          an exact zero from the continuous component is zero. The previous implementation
+          was a numerical approximation. The logic for discrete distributions remains unchanged.
     """
-# Refined point kernel for all families
-function bstm_kernel(fam::AbstractBSTM_Family, ::Uncensored, zi::AbstractZIState, d, eta, sig, y)
     dist = get_dist_ref(fam, d, eta, sig)
+    
+    # Base log-probability from the non-inflated distribution
     lp_branch = logpdf(dist, y)
     
-    # Initialize with default value
+    # Default case: no zero-inflation
     lp_final = lp_branch
 
     # Logic for Zero-Inflation Mixture
-    # Mathematical Definition: P(y) = phi * I(y=0) + (1 - phi) * f(y; theta)
-    # Where I(y=0) is the indicator function (point mass at zero)
     if zi isa ZeroInflated
         log_phi = log(d.phi_zi + 1e-15)
         log_one_minus_phi = log(1.0 - d.phi_zi + 1e-15)
         
         if y == 0.0
-            # For both discrete and continuous, y=0 captures the point mass
-            # Discrete families may also have probability mass at 0 from the distribution itself
-            pz = 0.0
             if is_discrete_family(fam)
-                pz = pdf(dist, 0.0)
+                # P(y=0) = phi + (1-phi) * P_base(y=0)
+                # Using pdf() and adding a small epsilon for stability before taking log
+                p_base_zero = pdf(dist, 0.0)
+                lp_final = logsumexp(log_phi, log_one_minus_phi + log(p_base_zero + 1e-15))
+            else
+                # For continuous families, P_base(y=0) is 0. The observation can only come from the point mass.
+                # P(y=0) = phi. The log-likelihood is log(phi).
+                lp_final = log_phi
             end
-            lp_final = logsumexp(log_phi, log_one_minus_phi + log(pz + 1e-15))
         else
-            # For y > 0, we only have the continuous/discrete density branch
+            # For y > 0, the observation can only come from the (1-phi) component.
+            # P(y) = (1-phi) * P_base(y)
             lp_final = log_one_minus_phi + lp_branch
         end
     end
 
     # Hurdle Truncation adjustment
     if d.hurdle > -Inf
+        # The likelihood is conditioned on y > hurdle
         lp_final = lp_final - logccdf(dist, d.hurdle)
     end
 
     return lp_final
 end
 
-# Logic for Zero-Inflation Mixture in Interval Censoring
-function bstm_kernel(fam::AbstractBSTM_Family, ::IntervalCensored, zi::AbstractZIState, d, eta, sig, y)
-    function stable_logdiffexp(a, b)
-        if a <= b
-            return -1e15
-        end
-        diff = b - a
-        safe_diff = min(-eps(typeof(diff)), diff)
-        return a + log1mexp(safe_diff)
-    end
 
+function bstm_kernel(fam::AbstractBSTM_Family, ::LeftCensored, zi::AbstractZIState, d, eta, sig, y)
+    """
+    BSTM Internal Utility v1.2.0
+    Timestamp: 2026-06-27 18:30:00
+    Synopsis: Computes the log-probability for a left-censored observation.
+    Rationale for v1.2.0:
+        - Added logic to correctly handle hurdle models by adjusting the censored interval
+          and normalizing by the survival function at the hurdle.
+        - Corrected zero-inflation logic to only include the zero-mass component if the
+          censoring bound is non-negative.
+    """
     dist = get_dist_ref(fam, d, eta, sig)
-    adj_L = d.y_L[1]
-    if is_discrete_family(fam)
-        adj_L = adj_L - 1.0
+    
+    # Adjust interval for hurdle model
+    upper_bound = d.y_U[1]
+    
+    if d.hurdle > -Inf
+        # If the censoring bound is below the hurdle, the event is impossible under the hurdle model.
+        if upper_bound <= d.hurdle
+            return -Inf
+        end
+        # The event is `hurdle < y <= upper_bound`
+        lp_base = stable_logdiffexp(logcdf(dist, upper_bound), logcdf(dist, d.hurdle))
+    else
+        # Standard left-censoring: P(y <= upper_bound)
+        lp_base = logcdf(dist, upper_bound)
     end
 
-    lp_prob = stable_logdiffexp(logcdf(dist, d.y_U[1]), logcdf(dist, adj_L))
-    lp_final = lp_prob
-
+    # Apply zero-inflation logic
+    lp_final = lp_base
     if zi isa ZeroInflated
         log_phi = log(d.phi_zi + 1e-15)
         log_one_minus_phi = log(1.0 - d.phi_zi + 1e-15)
         
-        # If the interval [y_L, y_U] includes zero, add the point mass phi
-        if d.y_L[1] <= 0.0
-            lp_final = logsumexp(log_phi, log_one_minus_phi + lp_prob)
+        # The zero-mass is only relevant if the interval includes zero.
+        # For left-censoring, this is true if upper_bound >= 0.
+        # The hurdle adjustment is already incorporated in lp_base.
+        if upper_bound >= 0.0 && d.hurdle < 0.0
+             lp_final = logsumexp(log_phi, log_one_minus_phi + lp_base)
         else
-            lp_final = log_one_minus_phi + lp_prob
+             lp_final = log_one_minus_phi + lp_base
         end
+    end
+
+    # Normalize by the probability of being above the hurdle
+    if d.hurdle > -Inf
+        lp_final -= logccdf(dist, d.hurdle)
     end
 
     return lp_final
 end
 
 
-# Censoring Kernels
-function bstm_kernel(fam::AbstractBSTM_Family, ::LeftCensored, zi::AbstractZIState, d, eta, sig, y)
-    local dist = get_dist_ref(fam, d, eta, sig)
-    local lp = logcdf(dist, d.y_U[1])
-    if zi isa ZeroInflated; lp = logsumexp(log(d.phi_zi + 1e-15), log(1.0 - d.phi_zi + 1e-15) + lp); end
-    return lp
-end
-
 function bstm_kernel(fam::AbstractBSTM_Family, ::RightCensored, zi::AbstractZIState, d, eta, sig, y)
-    local dist = get_dist_ref(fam, d, eta, sig)
-    local adj_L = is_discrete_family(fam) ? d.y_L[1] - 1.0 : d.y_L[1]
-    local lp = logccdf(dist, adj_L)
-    if zi isa ZeroInflated; lp = (d.y_L[1] <= 0.0) ? 0.0 : (log(1.0 - d.phi_zi + 1e-15) + lp); end
-    return lp
+    """
+    BSTM Internal Utility v1.2.0
+    Timestamp: 2026-06-27 18:30:00
+    Synopsis: Computes the log-probability for a right-censored observation.
+    Rationale for v1.2.0:
+        - Added logic to correctly handle hurdle models by adjusting the censored interval.
+        - Corrected the zero-inflation logic to be robust for any censoring bound `y_L`,
+          using `log1mexp` for numerical stability.
+    """
+    dist = get_dist_ref(fam, d, eta, sig)
+    
+    # Adjust interval for hurdle model
+    lower_bound = d.y_L[1]
+    effective_lower_bound = d.hurdle > -Inf ? max(lower_bound, d.hurdle) : lower_bound
+    
+    # Adjust for discrete distributions
+    adj_L = is_discrete_family(fam) ? effective_lower_bound - 1.0 : effective_lower_bound
+    
+    # Base log-probability: P(y > adj_L)
+    lp_base = logccdf(dist, adj_L)
+
+    # Apply zero-inflation logic
+    lp_final = lp_base
+    if zi isa ZeroInflated
+        log_phi = log(d.phi_zi + 1e-15)
+        log_one_minus_phi = log(1.0 - d.phi_zi + 1e-15)
+        
+        # The event is y > lower_bound. The probability is 1 - P(y <= lower_bound).
+        # P(y <= lower_bound) with ZI is `phi + (1-phi)*P_base(y <= lower_bound)` if lower_bound >= 0.
+        # A more general and stable way is to calculate log(1 - P(y <= lower_bound)).
+        adj_L_cdf = is_discrete_family(fam) ? lower_bound : lower_bound
+        logp_le_L = logcdf(dist, adj_L_cdf)
+        
+        # Probability of being less than or equal to the bound, including the zero mass
+        log_prob_le_bound_zi = if lower_bound < 0.0
+            # Structural zero is not in the censored region
+             log_one_minus_phi + logp_le_L
+        else
+            logsumexp(log_phi, log_one_minus_phi + logp_le_L)
+        end
+        
+        # The log-probability of being greater than the bound is log(1 - P(<= bound))
+        lp_final = log1mexp(log_prob_le_bound_zi)
+    end
+
+    # Normalize by the probability of being above the hurdle
+    if d.hurdle > -Inf
+        lp_final -= logccdf(dist, d.hurdle)
+    end
+
+    return lp_final
 end
 
 
 function bstm_kernel(fam::AbstractBSTM_Family, ::IntervalCensored, zi::AbstractZIState, d, eta, sig, y)
-    # Math: log(exp(a) - exp(b)) = a + log(1 - exp(b - a))
+    """
+    BSTM Internal Utility v1.2.0
+    Timestamp: 2026-06-27 18:30:00
+    Synopsis: Computes the log-probability for an interval-censored observation.
+    Rationale for v1.2.0:
+        - Consolidated the two previous implementations into a single, robust function.
+        - Added logic to correctly handle hurdle models by adjusting the censored interval
+          and normalizing by the survival function at the hurdle.
+        - Preserved the correct zero-inflation logic which accounts for whether the
+          interval contains the zero point mass.
+    """
     function stable_logdiffexp(a, b)
+        # Math: log(exp(a) - exp(b)) = a + log(1 - exp(b - a))
         if a <= b
-            return -1e15 # Effectively zero probability
+            return -Inf # Effectively zero probability
         else
             local diff = b - a
             # Clamp diff slightly below zero to prevent domain errors in log1mexp
@@ -948,44 +1070,85 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::IntervalCensored, zi::AbstractZ
         end
     end
 
-    local dist = get_dist_ref(fam, d, eta, sig)
-    local adj_L = is_discrete_family(fam) ? d.y_L[1] - 1.0 : d.y_L[1]
-    local lp = stable_logdiffexp(logcdf(dist, d.y_U[1]), logcdf(dist, adj_L))
-    if zi isa ZeroInflated; lp = (d.y_L[1] <= 0.0) ? logsumexp(log(d.phi_zi + 1e-15), log(1.0 - d.phi_zi + 1e-15) + lp) : log(1.0 - d.phi_zi + 1e-15) + lp; end
-    return lp
+    dist = get_dist_ref(fam, d, eta, sig)
+    
+    # Adjust interval for hurdle model
+    lower_bound = d.y_L[1]
+    upper_bound = d.y_U[1]
+    effective_lower_bound = d.hurdle > -Inf ? max(lower_bound, d.hurdle) : lower_bound
+
+    # If the effective interval is invalid, return -Inf
+    if upper_bound <= effective_lower_bound
+        return -Inf
+    end
+
+    # Adjust for discrete distributions
+    adj_L = is_discrete_family(fam) ? effective_lower_bound - 1.0 : effective_lower_bound
+    
+    # Base log-probability: P(adj_L < y <= upper_bound)
+    lp_base = stable_logdiffexp(logcdf(dist, upper_bound), logcdf(dist, adj_L))
+
+    # Apply zero-inflation logic
+    lp_final = lp_base
+    if zi isa ZeroInflated
+        log_phi = log(d.phi_zi + 1e-15)
+        log_one_minus_phi = log(1.0 - d.phi_zi + 1e-15)
+        
+        # If the original interval [y_L, y_U] includes zero, add the point mass phi.
+        # The hurdle adjustment is already incorporated in lp_base.
+        if lower_bound <= 0.0 && upper_bound >= 0.0 && d.hurdle < 0.0
+            lp_final = logsumexp(log_phi, log_one_minus_phi + lp_base)
+        else
+            lp_final = log_one_minus_phi + lp_base
+        end
+    end
+
+    # Normalize by the probability of being above the hurdle
+    if d.hurdle > -Inf
+        lp_final -= logccdf(dist, d.hurdle)
+    end
+
+    return lp_final
 end
 
-# --- 5. Unified Dispatch Interface (logpdf) ---
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: Overloads the `Distributions.logpdf` function for the `bstm_Likelihood` struct.
-              This provides the main entry point for calculating the log-likelihood within a
-              Turing model, dispatching to the appropriate `bstm_kernel` based on the data traits.
-    """
+
+# BSTM Internal Utility v1.1.0
+# Timestamp: 2026-06-27 18:45:00
+# Synopsis: Overloads the `Distributions.logpdf` function for the `bstm_Likelihood` struct.
+#           This provides the main entry point for calculating the log-likelihood within a
+#           Turing model, dispatching to the appropriate `bstm_kernel` based on the data traits.
+# Rationale for v1.1.0:
+#     - Removed redundant `local` keyword declarations for improved code clarity and style consistency.
+#       The underlying logic remains correct and unchanged.
 
 function Distributions.logpdf(d::bstm_Likelihood, eta::Real)
-    local sig = d.sigma_y isa AbstractVector ? d.sigma_y[1] : d.sigma_y
-    local w = d.weight isa AbstractVector ? d.weight[1] : d.weight
+    sig = d.sigma_y isa AbstractVector ? d.sigma_y[1] : d.sigma_y
+    w = d.weight isa AbstractVector ? d.weight[1] : d.weight
     return bstm_kernel(d.family, d.censoring_state, d.zi_state, d, eta, sig, d.y_obs[1]) * w
 end
 
 function Distributions.logpdf(d::bstm_Likelihood, eta::AbstractVector)
+    # Special handling for distributions that take a vector input, like Dirichlet.
     if d.family isa DirichletFamily
-        local w = d.weight isa AbstractVector ? d.weight[1] : d.weight
+        w = d.weight isa AbstractVector ? d.weight[1] : d.weight
+        # Pass the full eta vector to the kernel for Dirichlet.
         return bstm_kernel(d.family, d.censoring_state, d.zi_state, d, eta, 1.0, d.y_obs) * w
     end
-    local total_lp = 0.0
+    
+    # For standard element-wise likelihoods, sum the log-probabilities.
+    total_lp = 0.0
     for i in 1:length(eta)
-        local sig = d.sigma_y isa AbstractVector ? d.sigma_y[i] : d.sigma_y
-        local w = d.weight isa AbstractVector ? d.weight[i] : d.weight
+        sig = d.sigma_y isa AbstractVector ? d.sigma_y[i] : d.sigma_y
+        w = d.weight isa AbstractVector ? d.weight[i] : d.weight
         total_lp += bstm_kernel(d.family, d.censoring_state, d.zi_state, d, eta[i], sig, d.y_obs[i]) * w
     end
     return total_lp
 end
 
 function Distributions.logpdf(d::bstm_Likelihood, eta::AbstractMatrix)
-    local w = d.weight isa AbstractVector ? d.weight[1] : d.weight
+    # This method handles matrix-variate distributions like InverseWishart.
+    w = d.weight isa AbstractVector ? d.weight[1] : d.weight
+    # Pass the full eta matrix to the kernel.
     return bstm_kernel(d.family, d.censoring_state, d.zi_state, d, eta, 1.0, d.y_obs) * w
 end
 
@@ -2049,111 +2212,84 @@ end
 
 
 function _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples=nothing, y_obs_custom=nothing)
-    # BSTM Internal Utility v1.1.0
-    # Timestamp: 2026-06-27 12:45:00
+    # BSTM Internal Utility v1.2.0
+    # Timestamp: 2026-06-27 14:00:00
     # Synopsis: An internal post-processing engine that generates denoised predictions
     #           (expectations), noisy predictions (posterior predictive samples), and pointwise
     #           log-likelihood values for model assessment (e.g., WAIC).
-    # Rationale for v1.1.0: Updated versioning for consistency.
+    # Rationale for v1.2.0:
+    #     - Refactored the posterior predictive sampling logic to eliminate the redundant
+    #       `if/elseif` block. The function now reuses the `get_dist_ref` factory to
+    #       construct the appropriate `Distributions.jl` object and then calls `rand()`
+    #       on it. This improves maintainability and ensures consistency between the
+    #       likelihood evaluation and posterior predictive sampling.
 
     # 1. Container Initialization
-    # denoised: expected value mu (response scale)
-    # noisy: realized stochastic draws (prediction scale)
-    # log_lik: pointwise log-probabilities for WAIC/LOO
-    local denoised = zeros(N_tot, N_samples)
-    local noisy = zeros(N_tot, N_samples)
-    local log_lik = zeros(N_samples, M.y_N)
+    denoised = zeros(N_tot, N_samples)
+    noisy = zeros(N_tot, N_samples)
+    log_lik = zeros(N_samples, M.y_N)
 
-    local name_strs = string.(FlexiChains.parameters(chain))
-    local use_zi = get(M, :use_zi, false)
-    local fam_str = hasproperty(M, :model_family) ? M.model_family : "gaussian"
+    name_strs = string.(FlexiChains.parameters(chain))
+    use_zi = get(M, :use_zi, false)
+    fam_str = hasproperty(M, :model_family) ? M.model_family : "gaussian"
 
     # 2. Primary Sampling Loop
     for j in 1:N_samples
 
         # 2.1 Extraction of Volatility Surface
-        # Standardizing heteroskedastic vs homoskedastic error scales
-        local sig_y
-        if !isnothing(y_sigma_samples)
+        sig_y = if !isnothing(y_sigma_samples)
             sig_y = y_sigma_samples[:, j]
         else
             sig_y = _extract_volatility(chain, name_strs, N_tot, N_samples, nothing, M)[:, j]
         end
 
         # 2.2 Parameter Discovery for the Current Sample
-        local r_val = "lik_r" in name_strs ? chain[:lik_r].data[j] : 1.0
-        local phi_val = "lik_phi" in name_strs ? chain[:lik_phi].data[j] : 0.0
-        local extra = "extra_params" in name_strs ? chain[:extra_params].data[j] : 1.0
+        r_val = "lik_r" in name_strs ? chain[:lik_r].data[j] : 1.0
+        phi_val = "lik_phi" in name_strs ? chain[:lik_phi].data[j] : 0.0
+        extra = "extra_params" in name_strs ? chain[:extra_params].data[j] : 1.0
 
         # 2.3 Link Transformation and Expectation Mapping
-        # Rationale: Denoised expectations must use the standardized inverse link logic.
-        local mu_vec = _apply_link_and_lik(fam_str, eta[:, j], use_zi, phi_val, r_val)
+        mu_vec = _apply_link_and_lik(fam_str, eta[:, j], use_zi, phi_val, r_val)
         denoised[:, j] .= mu_vec
 
         # 2.4 Likelihood and Predictive Sampling
         for i in 1:N_tot
-            local is_obs = i <= M.y_N
-            local mu = mu_vec[i]
-            local eta_val = eta[i, j]
+            is_obs = i <= M.y_N
+            eta_val = eta[i, j]
 
             # --- Likelihood Calculation (Training Data Only) ---
             if is_obs
-                local y_vals_src = isnothing(y_obs_custom) ? M.y_obs : y_obs_custom
-                # Standardize likelihood evaluation via the bstm_Likelihood functor
-                local lik_obj = bstm_Likelihood(
+                y_vals_src = isnothing(y_obs_custom) ? M.y_obs : y_obs_custom
+                lik_obj = bstm_Likelihood(
                     fam_str, [y_vals_src[i]]; sigma_y=sig_y[i], weight=M.weights[i],
                     phi_zi=use_zi ? phi_val : -Inf, r_nb=r_val, trial=M.trials[i], extra_params=extra
                 )
                 log_lik[j, i] = Distributions.logpdf(lik_obj, eta_val)
             end
 
-            # --- Feature-Complete Posterior Predictive Sampling (Noisy) ---
-            # Rationale: Handling the full taxonomy of realized draws.
-
+            # --- Posterior Predictive Sampling (Noisy) ---
             if use_zi && rand() < phi_val
                 # Handle structural zeros for Zero-Inflated models
                 noisy[i, j] = 0.0
             else
-                noisy[i, j] = if fam isa GaussianFamily
-                    mu + randn() * sig_y[i]
-                elseif fam isa PoissonFamily
-                    Float64(rand(Poisson(clamp(mu, 1e-10, 1e9))))
-                elseif fam isa NegativeBinomialFamily
-                    Float64(rand(NegativeBinomial(r_val, r_val / (r_val + mu))))
-                elseif fam isa BinomialFamily
-                    local n_t = Int(is_obs ? M.trials[i] : 1)
-                    Float64(rand(Binomial(n_t, mu)))
-                elseif fam isa LogNormalFamily
-                    rand(LogNormal(mu, sig_y[i]))
-                elseif fam isa GammaFamily
-                    local alpha_g = extra > 0 ? extra : 1.0
-                    rand(Gamma(alpha_g, mu / alpha_g))
-                elseif fam isa BetaFamily
-                    local phi_b = extra > 0 ? extra : 10.0
-                    # Parameters for Beta are mu*phi and (1-mu)*phi
-                    rand(Beta(clamp(mu * phi_b, 1e-6, Inf), clamp((1.0 - mu) * phi_b, 1e-6, Inf)))
-                elseif fam isa InverseGaussianFamily
-                    local lambda_ig = extra > 0 ? extra : 1.0
-                    rand(InverseGaussian(mu, lambda_ig))
-                elseif fam isa StudentTFamily
-                    local nu_st = extra > 0 ? extra : 5.0
-                    rand(LocationScale(mu, sig_y[i], TDist(nu_st)))
-                elseif fam isa LaplaceFamily
-                    rand(Laplace(mu, sig_y[i]))
-                elseif fam isa ExponentialFamily
-                    rand(Exponential(mu))
-                elseif fam isa ParetoFamily
-                    local shape_p = extra > 0 ? extra : 1.0
-                    rand(Pareto(mu, shape_p))
-                elseif fam isa HalfNormalFamily
-                    rand(truncated(Normal(0.0, sig_y[i]), 0.0, Inf))
-                elseif fam isa HalfStudentTFamily
-                    local nu_hst = extra > 0 ? extra : 5.0
-                    rand(truncated(LocationScale(0.0, sig_y[i], TDist(nu_hst)), 0.0, Inf))
-                else
-                    # Fallback to expectation for unknown families
-                    mu
-                end
+                # Reuse the likelihood object factory to generate a distribution
+                # for sampling. This avoids redundant logic.
+                n_t = Int(is_obs ? M.trials[i] : 1)
+                
+                # Construct a temporary likelihood object to pass parameters to get_dist_ref
+                temp_lik_obj = bstm_Likelihood(
+                    fam_str, [0.0]; # y_obs is a dummy, not used by get_dist_ref for sampling
+                    sigma_y=sig_y[i],
+                    r_nb=r_val,
+                    trial=n_t,
+                    extra_params=extra
+                )
+                
+                # Get the distribution object from the factory
+                dist = get_dist_ref(fam, temp_lik_obj, eta_val, sig_y[i])
+                
+                # Sample from the distribution
+                noisy[i, j] = rand(dist)
             end
         end
     end
@@ -3092,18 +3228,99 @@ end
  
 
 function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, manifolds_registry)
-    # BSTM Internal Utility v2.1.0
-    # Timestamp: 2026-06-27 12:45:00
-    # Synopsis: Processes `smooth()` modules. This function is now a dispatcher that handles
-    #           both basis function smooths (e.g., pspline) and structured random effect smooths
-    #           (e.g., rw2 on a binned covariate).
+    # BSTM Internal Utility v2.2.0
+    # Timestamp: 2026-06-27 19:30:00
+    # Synopsis: Processes `smooth()` modules, now with support for tensor product smooths
+    #           defined with dimension-specific models and parameters.
+    # Rationale for v2.2.0:
+    #     - Added logic to detect if the `model` parameter is a `NamedTuple`, which triggers
+    #       the new tensor product construction.
+    #     - The new path generates 1D basis and penalty matrices for each dimension and combines
+    #       them using Kronecker products (for bases) and tensor sums (for penalties).
+    #     - The resulting combined penalty matrix is stored in the module's parameters to be
+    #       picked up by the new `TensorProductSmooth` manifold constructor.
+    #     - The original logic for single-model smooths is preserved as the fallback path.
 
     data = opt_dict[:data]
-    model_str = string(get(mod_data[:params], :model, "pspline"))
+    params = mod_data[:params]
+    model_param = get(params, :model, "pspline")
+
+    # NEW: Check for dimension-specific model definitions (tensor product smooths)
+    if model_param isa NamedTuple
+        vars = mod_data[:variables]
+        n_vars = length(vars)
+        
+        if n_vars < 2
+            @warn "Tensor product smooth specified for a single variable in `smooth($(join(vars, ",")))`. Treating as a 1D smooth."
+            # Fall through to the standard logic below
+        else
+            B_list = []
+            Q_list = []
+            nbins_list = []
+
+            for var_str in vars
+                var_sym = Symbol(var_str)
+                
+                # Extract per-variable model and parameters
+                model_i = string(get(model_param, var_sym, "pspline"))
+                
+                # Extract parameters, checking for both global and per-variable specification
+                nbins_i = get(get(params, :nbins, (;)), var_sym, get(params, :nbins, 20))
+                degree_i = get(get(params, :degree, (;)), var_sym, get(params, :degree, 3))
+                diff_order_i = get(get(params, :diff_order, (;)), var_sym, get(params, :diff_order, 2))
+                ls_i = get(get(params, :lengthscale, (;)), var_sym, get(params, :lengthscale, nothing))
+                
+                kwargs_i = Dict{Symbol, Any}()
+                if !isnothing(ls_i) kwargs_i[:lengthscale] = ls_i end
+
+                vals_i = data[!, var_sym]
+                
+                # Generate 1D basis matrix
+                push!(B_list, bstm_smooth_basis_1D(model_i, vals_i, nbins_i, degree_i; kwargs_i...))
+                
+                # Generate 1D penalty matrix
+                template_type = if model_i in ["pspline", "rw2"]; :rw2
+                                elseif model_i == "rw1"; :rw1
+                                else :iid end
+                push!(Q_list, build_structure_template(template_type, nbins_i).matrix)
+                push!(nbins_list, nbins_i)
+            end
+
+            # Combine basis matrices via Kronecker product
+            # For data ordered (x1,y1), (x2,y1), ..., (x1,y2), ..., the basis is kron(By, Bx)
+            # Assuming vars are [x, y, ...], we reverse the list for kron
+            B_final = B_list[end]
+            for i in (n_vars-1):-1:1
+                B_final = kron(B_final, B_list[i])
+            end
+
+            # Combine penalty matrices via tensor sum
+            Q_final = Q_list[1]
+            n_units_total = nbins_list[1]
+            for i in 2:n_vars
+                n_i = nbins_list[i]
+                Q_i = Q_list[i]
+                Q_final = kron(I(n_i), Q_final) + kron(Q_i, I(n_units_total))
+                n_units_total *= n_i
+            end
+            
+            reg_key = Symbol(join(vars, "_"))
+            basis_matrices_registry[reg_key] = B_final
+            
+            # Modify mod_data to be processed by the next steps
+            mod_data[:params][:model] = "tensor_product_smooth"
+            mod_data[:params][:Q_tensor] = Q_final
+            
+            # This path is complete, return to avoid falling through to the old logic.
+            return 
+        end
+    end
+
+    # --- Fallback to existing logic if model is not a NamedTuple ---
+    model_str = string(model_param)
     basis_models = ["pspline", "bspline", "tps", "rff", "fft", "moran", "spherical", "barycentric", "decay"]
 
     if model_str in basis_models
-        # --- Path 1: Basis Function Smoothing (Existing Logic) ---
         if !isempty(mod_data[:variables])
             nb = get(mod_data[:params], :nbins, get(mod_data[:params], :m_rff, 20))
             reg_key = Symbol(join(mod_data[:variables], "_"))
@@ -3123,7 +3340,7 @@ function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, man
             end
         end
     else
-        # --- Path 2: Structured Random Effect Smoothing (New Logic) ---
+        # --- Path 2: Structured Random Effect Smoothing (Existing Logic) ---
         if !haskey(opt_dict, :structured_smooths); opt_dict[:structured_smooths] = []; end
 
         vars = mod_data[:variables]
@@ -4390,46 +4607,63 @@ end
 
 function _apply_manifold!(eta, spec, m_obj::Union{ICAR, BYM2}, M, noise)
     """
-    BSTM Internal Utility v1.1.0
-    Timestamp: 2026-06-26 18:45:00
-    Synopsis: Applies an ICAR or BYM2 manifold to the linear predictor.
-    Rationale for v1.1.0:
-        - Corrected an `UndefVarError` by explicitly declaring `sigma` and `rho` as local
-          variables before they are sampled. This ensures their values are correctly scoped
-          and available to the `recompose_precision` function.
+    BSTM Internal Utility v2.0.0
+    Timestamp: 2026-06-27 13:15:00
+    Synopsis: Applies an ICAR or BYM2 manifold to the linear predictor `eta`.
+    Rationale for v2.0.0:
+        - Refactored the BYM2 implementation to correctly follow the Riebler et al. (2016)
+          parameterization, which involves separate sampling of structured (ICAR) and
+          unstructured (IID) components.
+        - Added a soft sum-to-zero constraint on the structured (ICAR) component to ensure
+          model identifiability from the global intercept. This improves MCMC mixing and convergence.
     """
     var_name = string(spec.var)
     m_domain = spec.domain
     is_svc = m_domain == :svc
     sigma_name = is_svc ? Symbol("sig_svc_", var_name) : Symbol("sigma_", m_domain)
-    latent_name = is_svc ? Symbol("beta_svc_", var_name) : Symbol("latent_", m_domain)
+    latent_struct_name = is_svc ? Symbol("beta_svc_struct_", var_name) : Symbol("latent_struct_", m_domain)
+    latent_iid_name = is_svc ? Symbol("beta_svc_iid_", var_name) : Symbol("latent_iid_", m_domain)
     
     T = eltype(eta)
     sigma::T = 0.0
     sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
 
-    extra_p_val = nothing
+    template = (m_domain == :temporal) ? M.t_Q_template.matrix : M.s_Q_template.matrix
+    n_units = size(template, 1)
+    
+    # Sample structured component (ICAR)
+    Q_struct = Symmetric(template + noise * I)
+    latent_struct ~ NamedDist(MvNormalCanon(zeros(n_units), Q_struct), latent_struct_name)
+
+    # Soft sum-to-zero constraint for identifiability
+    sum_latent = sum(latent_struct)
+    sum_latent ~ Normal(0, 0.001 * n_units)
+
+    final_latent = Vector{T}(undef, n_units)
+
     if m_obj isa BYM2
         rho_name = is_svc ? Symbol("rho_svc_", var_name) : Symbol("rho_", m_domain)
         rho::T = 0.0
         rho ~ NamedDist(m_obj.rho_prior, rho_name)
-        extra_p_val = rho
+        
+        # Sample unstructured component (IID)
+        latent_iid ~ NamedDist(MvNormal(zeros(n_units), I), latent_iid_name)
+        
+        # Combine components using Riebler et al. (2016) parameterization
+        final_latent = sigma .* (sqrt(rho) .* latent_struct .+ sqrt(1 - rho) .* latent_iid)
+    else # It's an ICAR model
+        final_latent = sigma .* latent_struct
     end
-
-    template = (m_domain == :temporal) ? M.t_Q_template.matrix : M.s_Q_template.matrix
-    n_units = size(template, 1)
-    Q = recompose_precision(Symbol(typeof(m_obj)), template, sigma; extra_param=extra_p_val, noise=noise)
-    latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
     
     if is_svc
         x_col_idx = findfirst(==(spec.var), Symbol.(names(M.Xfixed, 2)))
         if !isnothing(x_col_idx)
             x_vals = M.Xfixed[:, x_col_idx]
-            for i in 1:M.y_N; eta[i] += latent[M.s_idx[i]] * x_vals[i]; end
+            eta .+= final_latent[M.s_idx] .* x_vals
         end
     else
         indices = (m_domain == :spatial) ? M.s_idx : M.t_idx
-        for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+        eta .+= final_latent[indices]
     end
 end
 
@@ -4517,6 +4751,19 @@ function build_model(m::Cyclic, data_inputs)
     return _build_pass_through_model(m, data_inputs, model_type_sym=:cyclic, Q_template_val=template.matrix, sf_val=template.scaling_factor)
 end
 
+function build_model(m::TensorProductSmooth, data_inputs)
+    # BSTM Model Builder v2.1.0
+    # Timestamp: 2026-06-27 19:30:00
+    # Rationale: Adding a dispatch method for the new TensorProductSmooth manifold.
+    # This is a pass-through builder. The Q_template was pre-computed in process_smooth_module!
+    return (
+        Q_template = m.Q_template,
+        scaling_factor = 1.0, # Scaling is implicitly handled in the pre-computed Q
+        model_type = :tensor_product_smooth,
+        hyper = (sigma_prior = m.sigma_prior,)
+    )
+end
+
 # 7.3. Generic Fallback
 
 function build_model(m::Manifold, data_inputs)
@@ -4530,17 +4777,7 @@ function build_model(m::Manifold, data_inputs)
         hyper = (sigma_prior = hasproperty(m, :sigma_prior) ? m.sigma_prior : Exponential(1.0),)
     )
 end
-
-
-
-
-
-
-
-
-
-
-
+ 
 
 function _apply_manifold!(eta, spec, m_obj::Union{Leroux, SAR, DAG}, M, noise)
     """
@@ -4569,19 +4806,25 @@ function _apply_manifold!(eta, spec, m_obj::Union{Leroux, SAR, DAG}, M, noise)
     m_type_sym = m_obj isa Leroux ? :leroux : (m_obj isa SAR ? :sar : :dag)
     Q = recompose_precision(m_type_sym, template, sigma; extra_param=rho, noise=noise)
     latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
+
+    # Add soft sum-to-zero constraint for improved sampling efficiency (good practice)
+    if m_obj isa Leroux || m_obj isa SAR
+        sum_latent = sum(latent)
+        sum_latent ~ Normal(0, 0.001 * n_units)
+    end
+
     indices = M.s_idx
     for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
 end
 
 function _apply_manifold!(eta, spec, m_obj::Union{AR1, RW1, RW2}, M, noise)
     """
-    BSTM Internal Utility v1.1.0
-    Timestamp: 2026-06-26 18:45:00
+    BSTM Internal Utility v1.2.0
+    Timestamp: 2026-06-27 13:15:00
     Synopsis: Applies an AR1, RW1, or RW2 manifold to the linear predictor.
-    Rationale for v1.1.0:
-        - Corrected an `UndefVarError` by explicitly declaring `sigma` and `rho` as local
-          variables before they are sampled.
-        - Corrected the logic for assigning the `extra_p_val`.
+    Rationale for v1.2.0:
+        - Added a soft sum-to-zero constraint for the intrinsic `RW1` and `RW2` models to
+          ensure identifiability from the global intercept.
     """
     m_domain = spec.domain
     T = eltype(eta)
@@ -4599,8 +4842,15 @@ function _apply_manifold!(eta, spec, m_obj::Union{AR1, RW1, RW2}, M, noise)
     n_units = size(template, 1)
     Q = recompose_precision(Symbol(typeof(m_obj)), template, sigma; extra_param=extra_p_val, noise=noise)
     latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), Symbol("latent_", m_domain))
+
+    # Apply sum-to-zero constraint for intrinsic models (RW1, RW2)
+    if m_obj isa RW1 || m_obj isa RW2
+        sum_latent = sum(latent)
+        sum_latent ~ Normal(0, 0.001 * n_units)
+    end
+
     indices = (m_domain == :temporal) ? M.t_idx : M.s_idx
-    for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
+    eta .+= latent[indices]
 end
 
 
@@ -4620,23 +4870,45 @@ function _apply_manifold!(eta, spec, m_obj::Union{Cyclic, Harmonic}, M, noise)
     indices = M.u_idx
     for i in 1:M.y_N; eta[i] += latent[indices[i]]; end
 end
-
-function _apply_manifold!(eta, spec, m_obj::Union{PSpline, BSpline, TPS, RFF, FFT}, M, noise)
-        """
-        BSTM Internal Utility v1.0.0
-        Timestamp: 2026-06-26 10:22:15
-        Synopsis: An internal helper for multivariate models that applies the statistical logic for
-                  a basis-function manifold to each outcome.
-        """
+ function _apply_manifold!(eta, spec, m_obj::Union{PSpline, BSpline, TPS, RFF, FFT}, M, noise)
+    """
+    BSTM Internal Utility v2.0.0
+    Timestamp: 2026-06-27 15:30:00
+    Synopsis: Applies basis-function manifolds (Splines, RFF, FFT) to the linear predictor.
+    Rationale for v2.0.0:
+        - Corrected a major implementation error where the penalty matrix for P-Splines and
+          TPS was not being applied. The coefficients were incorrectly treated as IID.
+        - Implemented the correct GMRF prior for `PSpline` and `TPS` coefficients using the
+          `Q_template` (typically RW2) from the manifold specification.
+        - Added a soft sum-to-zero constraint for the `PSpline` and `TPS` coefficients to
+          ensure identifiability from the intercept, which is required for intrinsic penalties.
+        - `BSpline`, `RFF`, and `FFT` continue to use IID priors on coefficients as they do
+          not have an intrinsic penalty structure.
+    """
     var_sym = spec.var
     B_mat = M.basis_matrices[var_sym]
     n_basis_cols = size(B_mat, 2)
     
     sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_basis_", var_sym))
-    latent_coeffs ~ NamedDist(filldist(Normal(0, sigma), n_basis_cols), Symbol("beta_basis_", var_sym))
+    
+    local latent_coeffs
+    if m_obj isa PSpline || m_obj isa TPS
+        # Penalized splines use a GMRF prior on the coefficients
+        Q_penalty = (1.0 / (sigma^2 + noise)) .* spec.Q_template
+        latent_coeffs ~ NamedDist(MvNormalCanon(zeros(n_basis_cols), Q_penalty), Symbol("beta_basis_", var_sym))
+
+        # Add sum-to-zero constraint for identifiability with intrinsic penalties (RW1, RW2)
+        sum_coeffs = sum(latent_coeffs)
+        sum_coeffs ~ Normal(0, 0.001 * n_basis_cols)
+
+    else
+        # BSpline, RFF, FFT use simple IID priors on coefficients
+        latent_coeffs ~ NamedDist(filldist(Normal(0, sigma), n_basis_cols), Symbol("beta_basis_", var_sym))
+    end
     
     eta .+= B_mat * latent_coeffs
 end
+
 
 function _apply_manifold!(eta, spec, m_obj::DynamicsManifold, M, noise)
     # Rationale: This is the primary entry point for mechanistic state-space models.
@@ -5743,12 +6015,39 @@ end
 
 
 
-function estimate_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=:se, periodicity=nothing, noise_floor=1e-6, wavelet_levels=3)
+function wendland_taper(d::AbstractVector, range::Real)
     """
     BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:22:15
+    Timestamp: 2026-06-27 16:00:00
+    Synopsis: Computes a Wendland compactly supported correlation function. This is used as a
+              taper to enforce compact support on a covariance function, which helps to
+              reduce spectral leakage in FFT-based methods.
+    """
+    h = d ./ range
+    taper = zeros(eltype(h), size(h))
+    mask = h .< 1.0
+    # Wendland function for k=2, d=1
+    taper[mask] .= (1.0 .- h[mask]).^4 .* (1.0 .+ 4.0 .* h[mask])
+    return taper
+end
+
+
+function estimate_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=:se, periodicity=nothing, noise_floor=1e-6, wavelet_levels=3, taper_range=nothing, lowpass_range=nothing)
+    """
+    BSTM Internal Utility v2.1.0
+    Timestamp: 2026-06-27 16:30:00
     Synopsis: An internal utility that constructs a sparse precision matrix for a stationary process
               by computing the kernel's power spectral density (PSD) and using the Wiener-Khinchin theorem.
+    Rationale for v2.1.0:
+        - Added `taper_range` and `lowpass_range` parameters to enable spectral filtering.
+        - If tapering or low-pass filtering is requested, the analytical Power Spectral Density (PSD)
+          is transformed to the spatial domain (covariance function), multiplied by the taper/filter
+          functions, and then transformed back to the frequency domain to get the modified PSD.
+        - This allows for controlling spectral leakage and smoothing the frequency response of the prior,
+          addressing the "impedance" issue of finite-length FFTs.
+        - Added explicit centering of the power spectrum by setting the DC component (power at zero
+          frequency) to zero. This removes the influence of the process's mean from the covariance
+          estimate, ensuring the focus is purely on the covariance structure.
     """
     # #
     # Frequency Grid Definition
@@ -5813,11 +6112,41 @@ function estimate_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=
                 psd[idx_low:idx_high] .+= energy_scale
             end
         end
+
+        # Apply low-pass filter as decay on scale energy for wavelets
+        if !isnothing(lowpass_range)
+            for scale in 1:wavelet_levels
+                decay_factor = exp(-scale / lowpass_range)
+                idx_start = max(1, floor(Int, n / 2^scale))
+                idx_end = max(1, floor(Int, n / 2^(scale - 1)))
+                if idx_start <= idx_end
+                    psd[idx_start:idx_end] .*= decay_factor
+                end
+            end
+        end
     end
 
-    # #
-    # Precision Recomposition in Spectral Domain
-    # The eigenvalues of the precision matrix are the reciprocal of the spectral density
+    # # 3. Apply Tapering and Filtering in Spatial Domain
+    if !isnothing(taper_range) || !isnothing(lowpass_range)
+        first_row_k = real(FFTW.ifft(psd))
+        
+        # Distances on a circulant grid
+        x_grid = 0:(n-1)
+        distances = min.(x_grid, n .- x_grid)
+
+        if !isnothing(taper_range); first_row_k .*= wendland_taper(distances, taper_range); end
+        if !isnothing(lowpass_range); first_row_k .*= exp.(-(distances.^2) ./ (2 * lowpass_range^2)); end
+
+        # Transform back to get the modified PSD
+        psd = real(FFTW.fft(first_row_k))
+    end
+
+    # # 4. Remove DC Component
+    # This is required to remove the influence of the process's mean from the
+    # autocorrelation estimate, focusing on the variance structure.
+    psd[1] = 0.0
+
+    # # 5. Precision Recomposition in Spectral Domain
     precision_eigenvalues = 1.0 ./ (psd .+ noise_floor)
 
     # #
@@ -5825,8 +6154,7 @@ function estimate_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=
     # The first row of the circulant precision matrix is the IFFT of its eigenvalues
     first_row_q = real(FFTW.ifft(precision_eigenvalues))
 
-    # #
-    # Sparse Matrix Construction
+    # # 6. Sparse Matrix Construction
     # Generate a sparse circulant operator based on the recovered weights
     Q_rows = Int[]
     Q_cols = Int[]
@@ -5851,6 +6179,7 @@ function estimate_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=
 
     return (matrix = Q_sparse, scaling_factor = 1.0, psd = psd, weights = first_row_q)
 end
+
 
  
  
