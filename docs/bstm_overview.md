@@ -89,9 +89,9 @@ The user-facing bstm() function provides a high-level interface that minimizes "
 
 DSL Syntax Breakdown
 
-* spatial(s_idx; manifold='bym2'): High-level spatial effect dispatch.
-* temporal(t_idx; manifold='rw2'): High-level temporal smoothing.
-* smooth(x, y; manifold='rff'): 2D spectral smoother using informed RFF parameters.
+* spatial(s_idx; model='bym2'): High-level spatial effect dispatch.
+* temporal(t_idx; model='rw2'): High-level temporal smoothing.
+* smooth(x, y; model='rff'): 2D spectral smoother using informed RFF parameters.
 * eigen(var; rank=k): Low-rank factor analytic terms.
 
 Prior Resolution: The PC-Prior Standard
@@ -106,11 +106,11 @@ Kappa (\kappa)	Exponential(1.0)	Controls SPDE smoothness via principled shrinkag
 
 7. Illustrative Examples: Guided Model Implementation
 
-1. BYM2 Disease Mapping: y ~ 1 + spatial(s_idx; manifold='bym2'). Decomposes risk into structured spatial and unstructured IID noise.
-2. AR1 Temporal Forecasting: y ~ 1 + temporal(t_idx; manifold='ar1'). Captures geometric temporal decay.
+1. BYM2 Disease Mapping: y ~ 1 + spatial(s_idx; model='bym2'). Decomposes risk into structured spatial and unstructured IID noise.
+2. AR1 Temporal Forecasting: y ~ 1 + temporal(t_idx; model='ar1'). Captures geometric temporal decay.
 3. Spatio-Temporal Interaction: y ~ 1 + spatial(s_idx) ⊗ temporal(t_idx). Employs tensor-product logic to manage O(N \times T) complexity via the Type IV interaction template.
-4. Spatially Varying Coefficients (SVC): poverty | spatial(s_idx; manifold='icar'). Allows the impact of poverty to vary according to local spatial gradients.
-5. Spectral Splines: smooth(lon, lat; manifold='rff'). Approximates a 2D continuous field without the O(N^3) kernel inversion cost.
+4. Spatially Varying Coefficients (SVC): poverty | spatial(s_idx; model='icar'). Allows the impact of poverty to vary according to local spatial gradients.
+5. Spectral Splines: smooth(lon, lat; model='rff'). Approximates a 2D continuous field without the O(N^3) kernel inversion cost.
 6. Multifidelity Nested Supervision: nested(z_var; formula='z ~ spatial(s_idx)'). Uses the fidelity_metadata engine and y_ok masks to align observations across different quality levels.
 7. Zero-Inflated Ecology: bstm(..., model_family='poisson', use_zi=true). Uses the ZeroInflated stochastic state to handle excess zeros in count data.
 
@@ -144,17 +144,14 @@ The `bstm` formula language allows you to build complex models by combining modu
 
 ### Common Modules
 
-| Keyword     | Example Usage                        | Purpose                                                        |                                                                    |
-| :------------| :-------------------------------------| :---------------------------------------------------------------| :-------------------------------------------------------------------|
-| `spatial`   | `spatial(s_idx, model='bym2')`    | Models spatial random effects for discrete areal units.        |                                                                    |
-| `temporal`  | `temporal(t_idx, model='ar1')`    | Models temporal trends using discrete time steps.              |                                                                    |
-| `seasonal`  | `seasonal(u_idx, model='cyclic')` | Models periodic effects (e.g., month-of-year).                 |                                                                    |
-| `smooth`    | `smooth(x, nbins=20)`                | Creates a non-linear smooth of a continuous covariate `x`.     |                                                                    |
-| `svc`       | `svc(x, model='iid')`             | Models a spatially-varying coefficient for covariate `x`.      |                                                                    |
-| `mixed`     | `mixed(1 \                           | group)`                                                        | Defines a random intercept for each level of the `group` variable. |
-| `spacetime` | `spacetime(model='IV')`           | Defines a joint spatiotemporal interaction field.              |                                                                    |
-| `bias`      | `bias(hurdle=0.1)`                   | Specifies likelihood-level parameters like hurdles or weights. |                                                                    |
-| `fixed`     | `x1 + x2`                            | Standard fixed-effect linear predictors.                       |                                                                    |
+| Keyword              | Example Usage                                      | Purpose                                                                  |                                                                    |
+| :---------------------| :---------------------------------------------------| :-------------------------------------------------------------------------| :-------------------------------------------------------------------|
+| `spatial`            | `spatial(s_idx, model='bym2')`                     | Models spatial random effects for discrete areal units.                  |                                                                    |
+| `temporal`           | `temporal(t_idx, u_idx, model=('ar1', 'cyclic'))`  | Models temporal trends and/or seasonal effects.                          |                                                                    |
+| `smooth`             | `smooth(x, nbins=20)`                              | Creates a non-linear smooth of a continuous covariate `x`.               |                                                                    |
+| `mixed`              | `mixed(1 \                                         | group)`                                                                  | Defines a random intercept for each level of the `group` variable. |
+| `observationprocess` | `observationprocess(log_offsets=log_offset)`       | Specifies likelihood-level parameters. Options include: `log_offsets`, `weights`, `trials`, `hurdle`, `volatility=true`, `nbins`, `y_L`, `y_U`. |
+| `fixed`              | `x1 + x2`                                          | Standard fixed-effect linear predictors.                                 |                                                                    |
 
 ### Data Transformations
 
@@ -186,7 +183,6 @@ The `model` argument specifies the mathematical structure of the latent field.
 | **AR1** | `'ar1'` | $\phi_t = \rho \phi_{t-1} + \epsilon_t$ | Capturing trends with short-term memory. |
 | **RW1/RW2** | `'rw1'`, `'rw2'` | $\Delta\phi_t \sim \mathcal{N}(0, \sigma^2)$ or $\Delta^2\phi_t \sim \mathcal{N}(0, \sigma^2)$ | Modeling stochastic level shifts (RW1) or smooth trends (RW2). |
 | **Cyclic** | `'cyclic'` | $\phi_t \sim \text{ICAR on a circular graph}$ | Smooth seasonal patterns where Dec is adjacent to Jan. |
-| **Harmonic** | `'harmonic'` | $\phi_t = \sum a_k \sin(\omega_k t) + b_k \cos(\omega_k t)$ | Decomposing seasonality into sine/cosine waves. |
 
 ### Smooth Manifolds (`smooth()`)
 
@@ -228,7 +224,7 @@ Models a continuous outcome with a non-linear effect of `temperature` and allows
 
 ```julia
 m = bstm(
-    "yield ~ 1 + smooth(temperature, nbins=20) + svc(rainfall, model='iid')",
+    "yield ~ 1 + smooth(temperature, nbins=20) + spatial(rainfall, s_idx, model='iid')",
     my_data,
     model_family="gaussian"
 )
@@ -240,7 +236,7 @@ Models prevalence (0 or 1) with a fully structured spatiotemporal interaction te
 
 ```julia
 m = bstm(
-    "prevalence ~ 1 + spatial(s_idx) + temporal(t_idx) + spacetime(model='IV')",
+    "prevalence ~ 1 + spatial(s_idx, model='bym2') + temporal(t_idx, model='ar1') + (spatial(s_idx) ⊗ temporal(t_idx))",
     my_data,
     model_family="binomial",
     W=my_adjacency_matrix
@@ -277,7 +273,7 @@ bstm(formula::String, data::DataFrame; kwargs...)
 
 **Example:**
 ```julia
-m = bstm("y ~ 1 + x + spatial(s_idx, manifold='bym2')", my_data, model_family="poisson")
+m = bstm("y ~ 1 + x + spatial(s_idx, model='bym2')", my_data, model_family="poisson")
 ```
 
 ### 2. Configuration-Based Interface (Advanced)
@@ -367,7 +363,7 @@ bstm("y ~ smooth(x |> log, nbins=15)", my_data)
 Manifolds can be combined algebraically within the formula string.
 
 *   `⊗` (`\otimes`): Kronecker product. Used to create inseparable spatiotemporal interactions.
-    *   Example: `spacetime(manifold='spatial(s_idx) ⊗ temporal(t_idx)')`
+    *   Example: `spacetime(model='spatial(s_idx) ⊗ temporal(t_idx)')`
     *   Example: `spacetime(model='spatial(s_idx) ⊗ temporal(t_idx)')`
 *   `⊕` (`\oplus`): Direct sum. (Future support for block-diagonal structures).
 
@@ -1446,4 +1442,3 @@ vline!([true_K], label="True K", color=:red, ls=:dash)
 plot(p1, p2, layout=(1,2), size=(800, 400))
 
 ```
-

@@ -138,27 +138,19 @@ Before getting into the nitty gritty of the spatiotemporal models, let us go thr
 ```{julia}
 #| label: Example - Sparse GMRF Space and time effect (no interaction)   
  
-m = bstm( """ 
-  y ~ Intercept() + Spatial(s_idx, model='bym2',  W = data_scot[:au][:W] ) + 
-      Temporal(t_idx, model='ar1') + Offsets(log_offset) """ , 
-  data_scot[:data], 
-  model_family="poisson"
-)
+fm = """ 
+  y ~ intercept() + spatial(s_idx, model='bym2', W=data_scot[:au][:W]) +
+      temporal(t_idx, model='ar1') + observationprocess(log_offsets=log_offset) 
+""" 
 
-  
-os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ; 
-
+m = bstm( fm, data_scot[:data], model_family="poisson")
+os = get_optimal_sampler(m; adaptation_steps=100) ; 
 inits = get_inits(m) ; 
-
 chn = sample(m, os, 100; initial_params=inits, progress=true, drop_warmup=true ) ; 
 
 StatsPlots.plot(chn[[:s_sigma, :s_rho, :t_sigma, :t_rho]], seriestype=:traceplot)
-
 res = model_results_comprehensive(m, chn );  
-
-model_results_plots(res, # This function is now available in the updated spatiotemporal_functions.jl
-    centroids = data_scot[:au][:centroids], 
-    polygons = data_scot[:au][:polygons])
+model_results_plots(res, centroids = data_scot[:au][:centroids], polygons = data_scot[:au][:polygons])
 
 
 ```
@@ -240,37 +232,19 @@ plot_kde_simple( data.s_coord_tuple, sd_extension_factor=0.25, title="Spatial In
 Mimicking and blending R's GLM, LME4, INLA and brms formula interfaces, here is an example running a simple analysis:
 
 ```{julia}
+ 
+data, _ = scottish_lip_cancer_data_spacetime()
 
-s_N, t_N = 30, 10
-data = generate_sim_data(s_N, t_N; rndseed=123)
-
-# a factorial variable
-reg = repeat(["North", "South", "East", "West"], inner=Int(length(data.y_counts)/4))
-
-# reformat simulated data into a rectangular dataframe (or namedarray the internal default):
-inp_df = DataFrame(
-  y = data.y_counts,  # y-variable
-  # Ensuring coordinates are aligned with the flattened observation vector
-  s_coord = data.s_coord_tuple,  # (x,y) as a tuple
-  t_coord = vec(data.t_coord),   # time
-  log_offset = zeros(length(data.y_counts)),
-  region = categorical(reg),  # would make sure it is used as a factorial variable or in the model statement: Fixed(reg)
-  z = data.z_obs,  # continuous covariate
-  w1 = data.w_obs[:,1], # more covariates 
-  w2 = data.w_obs[:,2],
-  w3 = data.w_obs[:,3],
-  trials = data.trials  # not used ..  
-)
+inp_df = data[:data]
 
 # Display first few rows to confirm alignment
 display(first(inp_df, 3))
 
-m = bstm( 
-  formula( y ~ 1 + z + region + Spatial(s_idx, model='bym2') + Temporal(t_idx, model='ar1') ), 
-  inp_df; 
-  family="poisson",
-  target_units=20
-);
+fm = """ 
+  y ~ 1 + z + region + Spatial(s_idx, model='bym2', W=data.au.W) + Temporal(t_idx, model='ar1') 
+"""
+m = bstm( fm, inp_df; model_family="poisson", target_units=20 );
+
 rand(m)
 chn = sample(m, MH(), 200);
 res = model_results_comprehensive(m , chn );
@@ -792,7 +766,7 @@ m = example_kriging_simple(inp_krig);  # note this model has problems with Posit
 Random.seed!(42) # Set a seed for reproducibility
 
 
-os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 
@@ -1910,7 +1884,7 @@ inp_test = bstm_options(
  
 
 m = bstm( inp_test );  # a direct call if all required information is formatted correctly
-os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) ;
+os = get_optimal_sampler(m; adaptation_steps=100) ;
 inits = get_inits(m) ; 
 chn = sample(m, os, 100; initial_params=inits, progress=true, drop_warmup=true ) ; 
 
@@ -2099,7 +2073,7 @@ inp = bstm_options(
 
 m = bstm_size_structured(inp)
 
-os = get_optimal_sampler(m; nuts_n_samples_adaptation=5) ;
+os = get_optimal_sampler(m; adaptation_steps=5) ;
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 10; initial_params=inits, progress=true, drop_warmup=true ) ; 
@@ -2319,7 +2293,7 @@ Sampling takes much longer than the simple model and so I have reduced the numbe
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D02_poisson_bym2(inp_count)
-os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
@@ -2393,7 +2367,7 @@ This specification is robust because it automatically handles both structured sp
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D03_poisson_leroux(inp_count)
-os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
@@ -2444,7 +2418,7 @@ ESS (mean) was 0.0251 !
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_4_poisson_localised(inp_count)
-os = get_optimal_sampler( m; nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler( m; adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
@@ -2494,7 +2468,7 @@ ESS (mean) was 0.0318!
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D05_poisson_sar(inp_count)
-os = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
@@ -2547,7 +2521,7 @@ ESS was 0.0066
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D06_poisson_svc(inp_count)
-os = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
@@ -2596,7 +2570,7 @@ ESS (mean): 0.0318
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D07_poisson_dag(inp_count)
-os  = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+os  = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
@@ -2645,7 +2619,7 @@ ESS (mean): 0.0318
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D08_hurdle(inp_count)
-os = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
@@ -2694,7 +2668,7 @@ ESS (mean): 0.0318
 Random.seed!(42) # Set a seed for reproducibility.
 
 m = model_D09_poisson_ei(inp_count)
-os = get_optimal_sampler( m, nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
@@ -2776,7 +2750,7 @@ Random.seed!(42) # Set a seed for reproducibility.
 inp_count = merge( inp_count, (y2=Int.(floor.( 100 .* (inp_count.z_obs .- minimum(inp_count.z_obs) ) ) ), ))
 
 m = model_D24_poisson_mcar(inp_count)
-os = get_optimal_sampler(m; nuts_n_samples_adaptation=100) 
+os = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)

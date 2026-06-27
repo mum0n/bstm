@@ -1248,17 +1248,20 @@ end
 
 function get_voronoi_polygons_and_edges(centroids, hull_geom, tol=1e-7)
     """
-    BSTM Partitioning Utility v1.0.0
-    Timestamp: 2026-06-26 10:01:50
+    BSTM Partitioning Utility v1.0.1
+    Timestamp: 2026-06-26 10:12:48
     Synopsis: Generates Voronoi polygons for a given set of centroids, clips them to a specified
-              hull geometry, and determines adjacency between the resulting polygons. It uses
-              `DelaunayTriangulation.jl` for the tessellation and `LibGEOS.jl` for geometric operations.
+              hull geometry, and determines adjacency. It includes robust handling for edge cases with
+              0, 1, or 2 centroids and for duplicate input centroids.
     Inputs:
         - centroids: A vector of (x, y) centroid coordinates.
         - hull_geom: A `LibGEOS` geometry for clipping.
         - tol: A small tolerance for robust adjacency checking.
     Outputs:
         - A tuple containing the polygon coordinates and a vector of adjacency edges.
+    Rationale for v1.0.1:
+        - The bisection logic for the two-centroid case now dynamically scales the bisector line based on the
+          hull's bounding box, replacing a hardcoded large constant to ensure scale-invariance.
     """
     n_c = length(centroids)
     if n_c == 0
@@ -1266,12 +1269,26 @@ function get_voronoi_polygons_and_edges(centroids, hull_geom, tol=1e-7)
     elseif n_c == 1
         return [get_coords_from_geom(hull_geom)], []
     elseif n_c == 2
-        # Standard 2-point bisection logic
+        # Bisection logic for two centroids.
         p1, p2 = centroids[1], centroids[2]
         mid = ((p1[1] + p2[1]) / 2, (p1[2] + p2[2]) / 2)
         dx, dy = p2[1] - p1[1], p2[2] - p1[2]
         px, py = -dy, dx
-        L = 1e7
+
+        # Dynamically determine a sufficiently large length `L` for the bisector
+        # based on the bounding box of the hull geometry to avoid issues with scale.
+        env = LibGEOS.envelope(hull_geom)
+        hull_bbox_coords = get_coords_from_geom(env)
+        L = if !isempty(hull_bbox_coords)
+            min_x, max_x = minimum(c[1] for c in hull_bbox_coords), maximum(c[1] for c in hull_bbox_coords)
+            min_y, max_y = minimum(c[2] for c in hull_bbox_coords), maximum(c[2] for c in hull_bbox_coords)
+            # Use twice the diagonal of the bounding box as a safe large number
+            2.0 * sqrt((max_x - min_x)^2 + (max_y - min_y)^2) + 1.0
+        else
+            # Fallback if hull is empty or invalid
+            1e7
+        end
+
         pt1 = (mid[1] + L*px, mid[2] + L*py)
         pt2 = (mid[1] - L*px, mid[2] - L*py)
         side1_pts = [pt1, pt2, (pt2[1] - L*dx, pt2[2] - L*dy), (pt1[1] - L*dx, pt1[2] - L*dy), pt1]
