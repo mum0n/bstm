@@ -143,7 +143,15 @@ fm = """
       temporal(t_idx, model='ar1') + observationprocess(log_offsets=log_offset) 
 """ 
 
+
+fm = """ 
+  y ~ intercept() + spatial(s_idx, model=bym2, W=data_scot[:au][:W]) +
+      temporal(t_idx, model=ar1) + observationprocess(log_offsets=log_offset) 
+""" 
+
 m = bstm( fm, data_scot[:data], model_family="poisson")
+rand(m)
+
 os = get_optimal_sampler(m; adaptation_steps=100) ; 
 inits = get_inits(m) ; 
 chn = sample(m, os, 100; initial_params=inits, progress=true, drop_warmup=true ) ; 

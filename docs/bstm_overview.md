@@ -1,19 +1,19 @@
 ---
-title: "Untitled"
+title: "The Architecture of Bayesian Spatio-Temporal Modeling: A Monograph on the bstm() Framework"
 format: html
 ---
 
-The Architecture of Bayesian Spatio-Temporal Modeling: A Monograph on the bstm() Framework
+The Architecture of Bayesian Spatio-Temporal Modeling: A Monograph on the `bstm()` Framework
 
 1. Introduction: The Evolution of Latent Gaussian Models
 
 In the current landscape of computational statistics, the primary bottleneck in spatio-temporal inference is the structural rigidity of traditional monolithic models. These legacy approaches often hard-code the relationship between covariates and random effects, leading to models that are computationally fragile and difficult to extend. The bstm() framework resolves this by treating the latent process as an orthogonal, composable entity, decoupled from the observation likelihood.
 
-At the core of bstm() is the "Manifold-as-Primitive" philosophy. Rather than treating spatial or temporal effects as fixed components of a linear predictor, the framework implements them as low-level primitives inheriting from the Manifold abstract type. These primitives are domain-agnostic until the model-building stage; an AR1 structure can define a temporal process or be composed into a higher-dimensional spatial field. This architectural decoupling mitigates structural rigidity and allows for the construction of physics-informed models through a unified formulaic interface. By treating manifolds as first-class citizens in a Domain Specific Language (DSL), bstm() provides the software infrastructure necessary to bridge the gap between abstract manifold geometry and high-performance Bayesian computation.
+At the core of `bstm()` is the "Manifold-as-Primitive" philosophy. Rather than treating spatial or temporal effects as fixed components of a linear predictor, the framework implements them as low-level primitives inheriting from the `Manifold` abstract type. These primitives are domain-agnostic until the model-building stage; an `AR1` structure can define a temporal process or be composed into a higher-dimensional spatial field. This architectural decoupling mitigates structural rigidity and allows for the construction of physics-informed models through a unified formulaic interface. By treating manifolds as first-class citizens in a Domain Specific Language (DSL), `bstm()` provides the software infrastructure necessary to bridge the gap between abstract manifold geometry and high-performance Bayesian computation.
 
 2. Mathematical Foundations: Manifolds and Stochastic Primitives
 
-The mathematical registry of bstm() (v06.1) standardizes the transition from discrete graph topologies to continuous spectral approximations. This unified representation is critical for dispatching efficient kernels across varying data scales.
+The mathematical registry of `bstm()` (v06.1) standardizes the transition from discrete graph topologies to continuous spectral approximations. This unified representation is critical for dispatching efficient kernels across varying data scales.
 
 The Discrete Registry: Gaussian Markov Random Fields (GMRF)
 
@@ -31,18 +31,39 @@ AR1	\mu_t = \rho \mu_{t-1} + \epsilon_t.	Stationary temporal process with geomet
 
 Continuous, Spectral, and Advanced Manifolds
 
-To circumvent the O(N^3) cost of kernel-based Gaussian Processes, the framework utilizes spectral projections and sparse approximations found in the v06.1 registry:
+To circumvent the O(N^3) cost of kernel-based Gaussian Processes, the framework utilizes spectral projections and sparse approximations found in the `v06.1` registry:
 
 * Random Fourier Features (RFF): Maps input coordinates x into a randomized feature space to approximate the kernel. The projection is defined as z(x) = \sqrt{2/M} \cos(Wx + b), where W is the spectral frequency matrix sampled from the kernel’s Fourier transform. This transforms a non-linear GP into a linear model with M features.
 * SPDE: Represents the field as a solution to (\kappa^2 - \Delta)^{\alpha/2} u = \mathcal{W}, mapping continuous Matérn processes onto a discrete mesh.
 * Nystrom / FITC: Low-rank approximations using n\_inducing points to represent the global field.
 * BCGN: Bipartite Coordinate Graph Networks for modeling group-level dependencies.
-* NetworkFlow: Captures directed dependencies across an adjacency matrix with :upstream or :downstream dispatch.
+* NetworkFlow: Captures directed dependencies across an adjacency matrix with `:upstream` or `:downstream` dispatch.
+* Hyperbolic: Provides curvature-aware embeddings for hierarchical data representation.
+
+### Comparison of Spectral and Basis Approximation Methods: FFT, RFF, and Wavelets
+
+To handle large continuous spatial fields, `bstm` employs several methods that operate in a frequency or feature space. Understanding their differences is key to selecting the appropriate model.
+
+*   **FFT (Fast Fourier Transform) Method**: This is an **exact** computational method for stationary Gaussian Processes (GPs) on a **regular grid**. It leverages the Wiener-Khinchin theorem, which states that the covariance matrix of such a process is circulant and can be diagonalized by the Discrete Fourier Transform (DFT). Instead of performing expensive `O(N³)` matrix operations in the spatial domain, the FFT method transforms the problem to the frequency domain, where computations become element-wise and scale efficiently at `O(N log N)`. Its primary limitation is the strict requirement for gridded data and stationarity.
+
+*   **RFF (Random Fourier Features) Method**: This is a powerful **approximation** technique for stationary kernels that works on any data geometry, including **irregularly spaced points**. Based on Bochner's theorem, it approximates the kernel function by projecting the input data into a randomized feature space of `M` dimensions using sine and cosine basis functions. The frequencies of these functions are sampled from the kernel's spectral density. This transforms the non-linear GP problem into a linear one, with a computational complexity of roughly `O(NM²)`. Its accuracy is dependent on the number of features `M`.
+
+*   **Wavelet Method (as implemented in `bstm`)**: This is a hybrid approach that applies the multi-resolution philosophy of wavelets within the computationally efficient FFT framework. Unlike the smooth, continuous Power Spectral Density (PSD) used in the standard FFT method, the wavelet implementation in `bstm` models the PSD as a blocky, multi-scale function, where energy is assigned to discrete frequency bands (dyadic scales) corresponding to different wavelet levels. This allows the model to better capture processes where variance is concentrated at specific spatial scales. However, because it still relies on the FFT to construct the final precision matrix, it shares the same requirements and limitations as the FFT method: **regular grids** and an assumption of **stationarity**.
+
+| Feature              | FFT Method                                                           | RFF Method                                                                     | Wavelet Method (in `bstm`)                                                |
+| :---------------------| :---------------------------------------------------------------------| :-------------------------------------------------------------------------------| :--------------------------------------------------------------------------|
+| **Core Principle**   | Wiener-Khinchin Theorem on circulant matrices.                       | Bochner's Theorem; Monte Carlo approximation of the kernel's spectral density. | Multi-resolution analysis; models PSD in dyadic scales.                   |
+| **Data Requirement** | **Regular grid** is required.                                        | General; works on **irregularly spaced** data.                                 | **Regular grid** is required (due to FFT-based implementation).           |
+| **Nature of Method** | **Exact** computation (assuming stationarity and grid).              | **Approximation** of the kernel. Quality depends on `M`.                       | **Approximation** of the power spectrum with a multi-scale structure.     |
+| **Stationarity**     | Assumes **stationarity**.                                            | Assumes **stationarity**.                                                      | Assumes **stationarity** (as implemented).                                |
+| **Key Advantage**    | Extremely fast (`O(N log N)`) and memory efficient for gridded data. | Highly flexible, works for any data geometry, scales well with `N`.            | Better at modeling processes with energy concentrated in specific scales. |
+| **Key Disadvantage** | Restricted to regular grids and stationary processes.                | Approximation error; can be slow if `M` is large.                              | Restricted to regular grids; less flexible than a full wavelet transform. |
+| **Basis Functions**  | Global Sines and Cosines (Implicitly via DFT).                       | Random Sines and Cosines.                                                      | Localized, scaled functions (Implicitly via multi-scale PSD).             |
 * Hyperbolic: Provides curvature-aware embeddings for hierarchical data representation.
 
 3. The Algebra of Manifolds: Operators and DSL Logic
 
-The bstm() DSL operates through a recursive parser, parse_manifold_graph, which serves as the theoretical engine for model composition.
+The `bstm()` DSL operates through a recursive parser, `parse_manifold_graph`, which serves as the theoretical engine for model composition.
 
 Algebraic Operators and Recursive Parsing
 
@@ -50,7 +71,7 @@ The parser decomposes algebraic strings into a structural tree, mapping tokens t
 
 1. Direct Sum (\oplus): Represents additive effects. f(s, t) = f_s(s) + f_t(t).
 2. Kronecker Product (\otimes): Triggers "Type IV" interaction logic in the opt_kwargs. In spatio-temporal contexts, Q_{st} = Q_t \otimes Q_s, enabling the representation of space-time interactions where every spatial location has a unique, correlated temporal trend.
-3. Composition (\circ): Chains manifolds for hierarchical stacking.
+3. Composition (\circ): Chains manifolds for hierarchical stacking. 
 
 Structural Transformations and SVC
 
@@ -61,7 +82,7 @@ The Pipe (|>) operator handles both data normalization and Spatially Varying Coe
 
 4. Likelihood Architectures and Stochastic Kernels
 
-The bstm_Likelihood struct standardizes the mapping between the linear predictor (\eta) and the observation space. This architecture ensures that the latent manifold remains invariant regardless of the noise distribution.
+The `bstm_Likelihood` struct standardizes the mapping between the linear predictor (\eta) and the observation space. This architecture ensures that the latent manifold remains invariant regardless of the noise distribution.
 
 The Family Registry and Parameter Mapping
 
@@ -73,7 +94,7 @@ The framework supports a wide array of AbstractBSTM_Family types, utilizing spec
 
 Numerical Stability in Censoring
 
-For complex stochastic states, bstm() employs specialized kernels. In IntervalCensored scenarios, to prevent numerical instability, the system implements stable_logdiffexp using log1mexp for the probability mass within [y_L, y_U]:  \text{logdiffexp}(a, b) = a + \text{log1mexp}(b - a) \quad \text{where } a > b  The use of log1mexp(safe_diff) prevents domain errors and catastrophic cancellation during the evaluation of the Cumulative Distribution Function (CDF).
+For complex stochastic states, `bstm()` employs specialized kernels. In `IntervalCensored` scenarios, to prevent numerical instability, the system implements `stable_logdiffexp` using `log1mexp` for the probability mass within `[y_L, y_U]`:  `\text{logdiffexp}(a, b) = a + \text{log1mexp}(b - a) \quad \text{where } a > b`  The use of `log1mexp(safe_diff)` prevents domain errors and catastrophic cancellation during the evaluation of the Cumulative Distribution Function (CDF).
 
 5. Architectural Paradigms: Univariate, Multivariate, and Multifidelity
 
@@ -81,11 +102,11 @@ Model dispatch is handled by three core architectures, determined by the dimensi
 
 1. UnivariateArchitecture: The default kernel for single-outcome processes.
 2. MultivariateArchitecture: Models dependent outcomes through matrix-variate kernels. It utilizes the InverseWishartFamily for covariance estimation, ensuring positive definiteness via a PDMat transformation of the latent matrix \eta \eta^T + \epsilon I.
-3. MultifidelityArchitecture: Orchestrates data from heterogeneous sources. It uses a nested() supervisor discovery logic and the fidelity_metadata engine. This engine manages unit-specific templates and observation masks (y_ok) to link low-fidelity "proxies" to high-fidelity "truth," making it ideal for multi-sensor environmental monitoring.
+3. MultifidelityArchitecture: Orchestrates data from heterogeneous sources. It uses a `nested()` supervisor discovery logic and the `fidelity_metadata` engine. This engine manages unit-specific templates and observation masks (`y_ok`) to link low-fidelity "proxies" to high-fidelity "truth," making it ideal for multi-sensor environmental monitoring.
 
 6. The bstm() Formulaic Interface: User-Centric Modeling
 
-The user-facing bstm() function provides a high-level interface that minimizes "implementation debt" while maintaining full control over the underlying priors.
+The user-facing `bstm()` function provides a high-level interface that minimizes "implementation debt" while maintaining full control over the underlying priors.
 
 DSL Syntax Breakdown
 
@@ -106,13 +127,13 @@ Kappa (\kappa)	Exponential(1.0)	Controls SPDE smoothness via principled shrinkag
 
 7. Illustrative Examples: Guided Model Implementation
 
-1. BYM2 Disease Mapping: y ~ 1 + spatial(s_idx; model='bym2'). Decomposes risk into structured spatial and unstructured IID noise.
-2. AR1 Temporal Forecasting: y ~ 1 + temporal(t_idx; model='ar1'). Captures geometric temporal decay.
-3. Spatio-Temporal Interaction: y ~ 1 + spatial(s_idx) ⊗ temporal(t_idx). Employs tensor-product logic to manage O(N \times T) complexity via the Type IV interaction template.
-4. Spatially Varying Coefficients (SVC): poverty | spatial(s_idx; model='icar'). Allows the impact of poverty to vary according to local spatial gradients.
-5. Spectral Splines: smooth(lon, lat; model='rff'). Approximates a 2D continuous field without the O(N^3) kernel inversion cost.
-6. Multifidelity Nested Supervision: nested(z_var; formula='z ~ spatial(s_idx)'). Uses the fidelity_metadata engine and y_ok masks to align observations across different quality levels.
-7. Zero-Inflated Ecology: bstm(..., model_family='poisson', use_zi=true). Uses the ZeroInflated stochastic state to handle excess zeros in count data.
+1. BYM2 Disease Mapping: `y ~ 1 + spatial(s_idx; model='bym2')`. Decomposes risk into structured spatial and unstructured IID noise.
+2. AR1 Temporal Forecasting: `y ~ 1 + temporal(t_idx; model='ar1')`. Captures geometric temporal decay.
+3. Spatio-Temporal Interaction: `y ~ 1 + spatial(s_idx) ⊗ temporal(t_idx)`. Employs tensor-product logic to manage O(N \times T) complexity via the Type IV interaction template.
+4. Spatially Varying Coefficients (SVC): `poverty | spatial(s_idx; model='icar')`. Allows the impact of poverty to vary according to local spatial gradients.
+5. Spectral Splines: `smooth(lon, lat; model='rff')`. Approximates a 2D continuous field without the O(N^3) kernel inversion cost.
+6. Multifidelity Nested Supervision: `nested(z_var; formula='z ~ spatial(s_idx)')`. Uses the `fidelity_metadata` engine and `y_ok` masks to align observations across different quality levels.
+7. Zero-Inflated Ecology: `bstm(..., model_family='poisson', use_zi=true)`. Uses the `ZeroInflated` stochastic state to handle excess zeros in count data.
 
 8. Critical Evaluation: Strengths, Weaknesses, and Frontiers
 
@@ -127,7 +148,7 @@ Weaknesses
 
 Future Frontiers
 
-The expansion into Hyperbolic and NetworkFlow manifolds signals a move toward Non-Euclidean Bayesian modeling. As the framework matures, future iterations will likely focus on replacing the collect() bottlenecks with lazy evaluation and extending the multivariate kernel to the full AbstractBSTM_Family registry.
+The expansion into `Hyperbolic` and `NetworkFlow` manifolds signals a move toward Non-Euclidean Bayesian modeling. As the framework matures, future iterations will likely focus on replacing the `collect()` bottlenecks with lazy evaluation and extending the multivariate kernel to the full `AbstractBSTM_Family` registry.
 
 In summary, bstm() provides a rigorous, Julia-native environment that elevates spatio-temporal modeling from manual implementation to algebraic composition, setting a new standard for computational Bayesian research.
 
@@ -135,7 +156,7 @@ In summary, bstm() provides a rigorous, Julia-native environment that elevates s
 
 # BSTM Cheat Sheet
 
-This document provides a quick reference for the `bstm` package, covering the formula API, common manifold types, and example usage.
+This document provides a quick reference for the `bstm` package, covering the formula API, common manifold types, and example usage. 
 
 ## Formula API Quick Reference
 
@@ -145,14 +166,14 @@ The `bstm` formula language allows you to build complex models by combining modu
 
 ### Common Modules
 
-| Keyword              | Example Usage                                     | Purpose                                                                                                                                         |                                                                    |
-| :---------------------| :--------------------------------------------------| :------------------------------------------------------------------------------------------------------------------------------------------------| :-------------------------------------------------------------------|
-| `spatial`            | `spatial(s_idx, model='bym2')`                    | Models spatial random effects for discrete areal units.                                                                                         |                                                                    |
-| `temporal`           | `temporal(t_idx, u_idx, model=('ar1', 'cyclic'))` | Models temporal trends and/or seasonal effects.                                                                                                 |                                                                    |
-| `smooth`             | `smooth(x, nbins=20)`                             | Creates a non-linear smooth of a continuous covariate `x`.                                                                                      |                                                                    |
-| `mixed`              | `mixed(1 \                                        | group)`                                                                                                                                         | Defines a random intercept for each level of the `group` variable. |
-| `observationprocess` | `observationprocess(log_offsets=log_offset)`      | Specifies likelihood-level parameters. Options include: `log_offsets`, `weights`, `trials`, `hurdle`, `volatility=true`, `nbins`, `y_L`, `y_U`. |                                                                    |
-| `fixed`              | `x1 + x2`                                         | Standard fixed-effect linear predictors.                                                                                                        |                                                                    |
+| Keyword              | Example Usage                                     | Purpose                                                                                                                                         |
+| :---------------------| :--------------------------------------------------| :------------------------------------------------------------------------------------------------------------------------------------------------|
+| `spatial`            | `spatial(s_idx, model='bym2')`                    | Models spatial random effects for discrete areal units.                                                                                         |
+| `temporal`           | `temporal(t_idx, u_idx, model=('ar1', 'cyclic'))` | Models temporal trends and/or seasonal effects.                                                                                                 |
+| `smooth`             | `smooth(x, nbins=20)`                             | Creates a non-linear smooth of a continuous covariate `x`.                                                                                      |
+| `mixed`              | `mixed(1 | group)`                                | Defines a random intercept for each level of the `group` variable.                                                                              |
+| `observationprocess` | `observationprocess(log_offsets=log_offset)`      | Specifies likelihood-level parameters. Options include: `log_offsets`, `weights`, `trials`, `hurdle`, `volatility=true`, `nbins`, `y_L`, `y_U`. |
+| `fixed`              | `x1 + x2`                                         | Standard fixed-effect linear predictors.                                                                                                        |
 
 ### Data Transformations
 
@@ -168,19 +189,19 @@ Use the `|>` operator inside a module to transform data on the fly.
 
 The `model_family` argument in the main `bstm()` call specifies the observation likelihood. It determines the statistical distribution of the outcome variable and the link function used to connect it to the linear predictor `eta`.
 
-| Family             | `model_family` String(s) | Link Function (`eta` to `mu`) | Key Parameters & Priors - | Meaning, Utility, and Assumptions - |
+| Family             | `model_family` String(s) | Link Function (`eta` to `mu`) | Key Parameters & Priors | Meaning, Utility, and Assumptions |
 | :------------------- | :------------------------- | :------------------------------ |  :---- |  :---- |
-| **Poisson**        | `"poisson"`                | `exp(eta)`                      | `rate (λ)`: Determined by `exp(eta)`. - | For modeling count data (e.g., number of events, individuals). Assumes the mean of the data is equal to its variance. - |
-| **Gaussian**       | `"gaussian"`               | `identity(eta)`                 | `mean (μ)`: `eta`, `std. dev. (σ)`: `y_sigma ~ Exponential(1.0)` - | For continuous, symmetric data. Assumes constant variance (homoscedasticity) unless `observationprocess(volatility=true)` is used. - |
-| **Log-Normal**     | `"lognormal"`              | `identity(eta)`                 | `log-mean (μ)`: `eta`, `log-std. dev. (σ)`: `y_sigma ~ Exponential(1.0)` - | For continuous, positive, right-skewed data (e.g., biomass, concentrations). Assumes the logarithm of the data is normally distributed. - |
-| **Negative Binomial** | `"negbin"`                 | `exp(eta)`                      | `rate (μ)`: `exp(eta)`, `dispersion (r)`: `r_nb ~ Exponential(1.0)` - | For overdispersed count data where the variance is greater than the mean. The dispersion parameter `r` controls the degree of overdispersion. - |
-| **Binomial**       | `"binomial"`, `"bernoulli"`  | `logistic(eta)`                 | `trials (n)`: From `observationprocess(trials=...)`, `probability (p)`: `logistic(eta)` - | For data representing the number of successes in a fixed number of trials. `bernoulli` is a special case where `n=1`, used for binary (0/1) outcomes. - |
-| **Gamma**          | `"gamma"`                  | `exp(eta)`                      | `shape (α)`: `extra_params ~ Exponential(1.0)`, `scale (θ)`: `exp(eta)/α` - | For continuous, positive, right-skewed data (e.g., insurance claims, rainfall). The `extra_params` argument can be used to set a fixed shape `α`. - |
-| **Beta**           | `"beta"`                   | `logistic(eta)`                 | `mean (μ)`: `logistic(eta)`, `precision (φ)`: `extra_params ~ Exponential(1.0)` - | For data on the (0, 1) interval (e.g., proportions, percentages). The `extra_params` argument controls the precision `φ`. - |
-| **Student's T**    | `"student_t"`              | `identity(eta)`                 | `location (μ)`: `eta`, `scale (σ)`: `y_sigma ~ Exponential(1.0)`, `d.f. (ν)`: `extra_params ~ Exponential(1.0)` (default 5) - | A robust alternative to the Gaussian family for continuous data with heavy tails (i.e., more prone to outliers). The degrees of freedom `ν` control the tail thickness. - |
-| **Laplace**        | `"laplace"`                | `identity(eta)`                 | `location (μ)`: `eta`, `scale (b)`: `y_sigma ~ Exponential(1.0)` - | For continuous data with a sharper peak at the mean and heavier tails than a Gaussian distribution. It is equivalent to minimizing the Mean Absolute Error (MAE). - | 
-| **Dirichlet**      | `"dirichlet"`              | `exp(eta)`                      | `concentration (α)`: `exp(eta)` - | For modeling compositional data, where each observation is a vector of proportions that sum to 1. `eta` is a vector of log-scale parameters. - |
-| **Inverse Wishart**  | `"inverse_wishart"`        | `identity(eta)`                 | `d.f. (ν)`: `extra_params ~ Exponential(1.0)`, `Scale Matrix (Ψ)`: `PDMat(eta * eta' + jitter)` - | For modeling covariance matrices in multivariate models. `eta` is a matrix whose outer product helps form the scale matrix `Ψ`. - | 
+| **Poisson**        | `"poisson"`                | `exp(eta)`                      | `rate (λ)`: Determined by `exp(eta)`. | For modeling count data (e.g., number of events, individuals). Assumes the mean of the data is equal to its variance. |
+| **Gaussian**       | `"gaussian"`               | `identity(eta)`                 | `mean (μ)`: `eta`, `std. dev. (σ)`: `y_sigma ~ Exponential(1.0)` | For continuous, symmetric data. Assumes constant variance (homoscedasticity) unless `observationprocess(volatility=true)` is used. |
+| **Log-Normal**     | `"lognormal"`              | `identity(eta)`                 | `log-mean (μ)`: `eta`, `log-std. dev. (σ)`: `y_sigma ~ Exponential(1.0)` | For continuous, positive, right-skewed data (e.g., biomass, concentrations). Assumes the logarithm of the data is normally distributed. |
+| **Negative Binomial** | `"negbin"`                 | `exp(eta)`                      | `rate (μ)`: `exp(eta)`, `dispersion (r)`: `r_nb ~ Exponential(1.0)` | For overdispersed count data where the variance is greater than the mean. The dispersion parameter `r` controls the degree of overdispersion. |
+| **Binomial**       | `"binomial"`, `"bernoulli"`  | `logistic(eta)`                 | `trials (n)`: From `observationprocess(trials=...)`, `probability (p)`: `logistic(eta)` | For data representing the number of successes in a fixed number of trials. `bernoulli` is a special case where `n=1`, used for binary (0/1) outcomes. |
+| **Gamma**          | `"gamma"`                  | `exp(eta)`                      | `shape (α)`: `extra_params ~ Exponential(1.0)`, `scale (θ)`: `exp(eta)/α` | For continuous, positive, right-skewed data (e.g., insurance claims, rainfall). The `extra_params` argument can be used to set a fixed shape `α`. |
+| **Beta**           | `"beta"`                   | `logistic(eta)`                 | `mean (μ)`: `logistic(eta)`, `precision (φ)`: `extra_params ~ Exponential(1.0)` | For data on the (0, 1) interval (e.g., proportions, percentages). The `extra_params` argument controls the precision `φ`. |
+| **Student's T**    | `"student_t"`              | `identity(eta)`                 | `location (μ)`: `eta`, `scale (σ)`: `y_sigma ~ Exponential(1.0)`, `d.f. (ν)`: `extra_params ~ Exponential(1.0)` (default 5) | A robust alternative to the Gaussian family for continuous data with heavy tails (i.e., more prone to outliers). The degrees of freedom `ν` control the tail thickness. |
+| **Laplace**        | `"laplace"`                | `identity(eta)`                 | `location (μ)`: `eta`, `scale (b)`: `y_sigma ~ Exponential(1.0)` | For continuous data with a sharper peak at the mean and heavier tails than a Gaussian distribution. It is equivalent to minimizing the Mean Absolute Error (MAE). | 
+| **Dirichlet**      | `"dirichlet"`              | `exp(eta)`                      | `concentration (α)`: `exp(eta)` | For modeling compositional data, where each observation is a vector of proportions that sum to 1. `eta` is a vector of log-scale parameters. |
+| **Inverse Wishart**  | `"inverse_wishart"`        | `identity(eta)`                 | `d.f. (ν)`: `extra_params ~ Exponential(1.0)`, `Scale Matrix (Ψ)`: `PDMat(eta * eta' + jitter)` | For modeling covariance matrices in multivariate models. `eta` is a matrix whose outer product helps form the scale matrix `Ψ`. | 
 
 
 ---
@@ -206,11 +227,11 @@ The `observationprocess()` module is a special component that does not model a l
 
 The intercept represents the global baseline effect in the model. Its inclusion is controlled at the top level of the formula string, and the `intercept()` module provides a way to specify a custom prior for it.
 
-| Syntax / Concept      | Example Usage                            | Parameters | Default Prior   | Meaning & Assumptions -                                                                                                                                                                                                      |
+| Syntax / Concept      | Example Usage                            | Parameters | Default Prior   | Meaning & Assumptions |
 | :----------------------| :-----------------------------------------| :-----------| :----------------| :-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Include Intercept** | `y ~ 1 + ...` or `y ~ intercept() + ...` | None       | `Normal(0, 10)` | Adds a global intercept term $\beta_0$ to the model's linear predictor. Assumes a constant baseline effect across all observations. The `1` syntax is standard R-style, while `intercept()` is the explicit `bstm` module. - |
-| **Exclude Intercept** | `y ~ 0 + ...` or `y ~ -1 + ...`          | None       | N/A             | Removes the global intercept term. The model is forced to pass through the origin. Assumes the response is zero when all predictors are zero. -                                                                              |
-| **Specify Prior**     | `intercept(prior=Normal(0, 5))`          | `prior`    | `Normal(0, 10)` | Uses the `intercept()` module to assign a specific prior distribution to the intercept term $\beta_0$. -                                                                                                                     |
+| **Include Intercept** | `y ~ 1 + ...` or `y ~ intercept() + ...` | None       | `Normal(0, 10)` | Adds a global intercept term $\beta_0$ to the model's linear predictor. Assumes a constant baseline effect across all observations. The `1` syntax is standard R-style, while `intercept()` is the explicit `bstm` module. |
+| **Exclude Intercept** | `y ~ 0 + ...` or `y ~ -1 + ...`          | None       | N/A             | Removes the global intercept term. The model is forced to pass through the origin. Assumes the response is zero when all predictors are zero. |
+| **Specify Prior**     | `intercept(prior=Normal(0, 5))`          | `prior`    | `Normal(0, 10)` | Uses the `intercept()` module to assign a specific prior distribution to the intercept term $\beta_0$. |
 
 **Note on `intercept(0)`, `intercept(1)`, etc.:**
 
@@ -307,7 +328,7 @@ The `smooth()` module is used to model non-linear effects of continuous covariat
 
 ** Direct expression of Interaction:** 
 
-Spatio-Temporal Interaction are better expressed as: y ~ 1 + spatial(s_idx; model=besag) ⊗ temporal(t_idx; model=ar1). This employs tensor-product logic to manage O(N \times T) complexity via the Type IV interaction template. 
+Spatio-Temporal Interaction are better expressed as: `y ~ 1 + spatial(s_idx; model=besag) ⊗ temporal(t_idx; model=ar1)`. This employs tensor-product logic to manage O(N \times T) complexity via the Type IV interaction template. 
 
 | Manifold     | formula                                                    | Description                                                  |
 | :-------------| :-----------------------------------------------------------| :-------------------------------------------------------------|
@@ -322,24 +343,24 @@ Spatio-Temporal Interaction are better expressed as: y ~ 1 + spatial(s_idx; mode
 
 The `nested()` module is a powerful "supervisor" component used for multi-fidelity modeling and model stacking. It allows you to define a complete sub-model that is fit to a separate (often larger, lower-quality) dataset. The latent effect from this sub-model is then incorporated as a calibrated predictor into the main model, allowing the main model to "learn" from the proxy data.
 
-| Keyword / Parameter     | Example Usage                  | Data Type | Default            | Meaning & Assumptions                                                                                                                                                                                                                                 |                                                                                                                                                |
-| :------------------------| :-------------------------------| :----------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------| ------------------------------------------------------------------------------------------------------------------------------------------------|
-| `nested()`              | `nested(z_var; ...)`           | Module    | N/A                | Defines a supervised sub-model whose latent effect is added to the main model's linear predictor. The `z_var` is a symbolic name for this component.  -                                                                                               |                                                                                                                                                |
-| `formula`               | `formula="z ~ 1 + spatial(s)"` | `String`  | `""`               | A complete `bstm` formula string that defines the structure of the sub-model. This sub-model is fit to the specified `data_source`.   -                                                                                                               |                                                                                                                                                |
-| `data_source`           | `data_source=:proxy_data`      | `Symbol`  | `:data`            | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset.    -                                                                                                 |                                                                                                                                                |
-| `rho_nested` (Implicit) | N/A                            | `Float`   | `Normal(1.0, 0.5)` | A scaling coefficient that links the sub-model's latent effect to the main model's linear predictor: $\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}$. The prior assumes the sub-model is a good proxy ($\rho \approx 1$). | Calibrates the magnitude of the sub-model's contribution, accounting for systematic bias or scale differences between the proxy and main data. |
+| Keyword / Parameter     | Example Usage                  | Data Type | Default            | Meaning & Assumptions                                                                                                                                                                                                                                 |
+| :------------------------| :-------------------------------| :----------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `nested()`              | `nested(z_var; ...)`           | Module    | N/A                | Defines a supervised sub-model whose latent effect is added to the main model's linear predictor. The `z_var` is a symbolic name for this component.                                                                                                  |
+| `formula`               | `formula="z ~ 1 + spatial(s)"` | `String`  | `""`               | A complete `bstm` formula string that defines the structure of the sub-model. This sub-model is fit to the specified `data_source`.                                                                                                                   |
+| `data_source`           | `data_source=:proxy_data`      | `Symbol`  | `:data`            | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset.                                                                                                      |
+| `rho_nested` (Implicit) | N/A                            | `Float`   | `Normal(1.0, 0.5)` | A scaling coefficient that links the sub-model's latent effect to the main model's linear predictor: $\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}$. The prior assumes the sub-model is a good proxy ($\rho \approx 1$). |
 
 
 ### Eigen & Factor Model Reference (`eigen()`)
 
 The `eigen()` module implements a Bayesian Principal Component Analysis (PCA) to perform dimensionality reduction on a set of multivariate outcomes. It decomposes the input variables into a smaller set of orthogonal latent factors (principal components). The first of these factors is then added to the main model's linear predictor, allowing you to use the dominant shared signal from multiple variables as a predictor.
 
-| Keyword / Parameter | Example Usage                               | Data Type       | Default                 | Meaning & Assumptions - |
-| :-------------------- | :------------------------------------------ | :---------------- | :------------------------ | :---  |
-| `eigen()`           | `eigen(y1, y2, y3; ...)`                    | Module            | N/A                       | Defines a Bayesian PCA factor model. The variables listed (e.g., `y1, y2, y3`) are the multivariate outcomes to be decomposed.  - |
-| `n_factors`         | `n_factors=1`                               | `Int`             | `1`                       | The number of latent factors (principal components) to extract. This determines the dimensionality of the reduced latent space. - |
-| `pca_sd_prior`      | `pca_sd_prior=Exponential(0.5)`             | `Distribution`    | `Exponential(1.0)`        | The prior for the standard deviations of the principal components (latent factors). These are the "eigenvalues" of the system, controlling the variance explained by each factor. - |
-| `pdef_sd_prior`     | `pdef_sd_prior=Exponential(0.5)`            | `Distribution`    | `Exponential(1.0)`        | The prior for the standard deviation of the residual (uniqueness) noise. This captures the variance in each observed variable that is *not* explained by the shared latent factors. - |
+| Keyword / Parameter | Example Usage                    | Data Type      | Default            | Meaning & Assumptions                                                                                                                                                               |
+| :--------------------| :---------------------------------| :---------------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `eigen()`           | `eigen(y1, y2, y3; ...)`         | Module         | N/A                | Defines a Bayesian PCA factor model. The variables listed (e.g., `y1, y2, y3`) are the multivariate outcomes to be decomposed.                                                      |
+| `n_factors`         | `n_factors=1`                    | `Int`          | `1`                | The number of latent factors (principal components) to extract. This determines the dimensionality of the reduced latent space.                                                     |
+| `pca_sd_prior`      | `pca_sd_prior=Exponential(0.5)`  | `Distribution` | `Exponential(1.0)` | The prior for the standard deviations of the principal components (latent factors). These are the "eigenvalues" of the system, controlling the variance explained by each factor.   |
+| `pdef_sd_prior`     | `pdef_sd_prior=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviation of the residual (uniqueness) noise. This captures the variance in each observed variable that is *not* explained by the shared latent factors. |
 
 
 
@@ -358,15 +379,15 @@ The `eigen()` module uses a Householder transformation to construct the orthonor
 
 The `dynamics()` module is used to implement mechanistic state-space models that describe how a latent field evolves over time. This is the primary module for encoding process-based knowledge, such as population growth or physical transport, directly into the model.
 
-| Model                               | `model='...'`               | Key Parameters | Default Priors - |
+| Model                               | `model='...'`               | Key Parameters | Default Priors |
 | :--- | :--- | :--- | :--- |
-| **Logistic Growth with Fishing**    | `'logistic_fishing'`, `'ricker'` | `r_prior`, `K_prior`, `sig_pop_prior`, `sig_F_prior`, `r_covariate`, `K_covariate` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`, `sig_pop`: `Exponential(1.0)`, `sig_F`: `Exponential(0.5)` - |
-| **Gompertz Growth**                 | `'gompertz'`                | `r_prior`, `K_prior`, `sig_dyn_prior`                                         | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)`, `sig_dyn`: `Exponential(1.0)` - |
-| **Linked-K Logistic Growth**      | `'linked_K_logistic'`       | `r_prior`, `sig_pop_prior`, `K_slope_prior`                                   | `r`: `LogNormal(0,1)`, `sig_pop`: `Exponential(1.0)`, `K_slope`: `Normal(1,0.5)` - |
-| **Advection**                       | `'advection'`               | `velocity_prior`, `sigma_prior`                                             | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)` - |
-| **Diffusion**                       | `'diffusion'`               | `diffusion_prior`, `sigma_prior`                                            | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` - |
-| **Advection-Diffusion**             | `'advection_diffusion'`     | `velocity_prior`, `diffusion_prior`, `sigma_prior`                          | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` - |
-| **Custom Model**                    | `'custom'`                  | `func`                                                                      | N/A - |
+| **Logistic Growth with Fishing**    | `'logistic_fishing'`, `'ricker'` | `r_prior`, `K_prior`, `sig_pop_prior`, `sig_F_prior`, `r_covariate`, `K_covariate` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`, `sig_pop`: `Exponential(1.0)`, `sig_F`: `Exponential(0.5)` |
+| **Gompertz Growth**                 | `'gompertz'`                | `r_prior`, `K_prior`, `sig_dyn_prior`                                         | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)`, `sig_dyn`: `Exponential(1.0)` |
+| **Linked-K Logistic Growth**      | `'linked_K_logistic'`       | `r_prior`, `sig_pop_prior`, `K_slope_prior`                                   | `r`: `LogNormal(0,1)`, `sig_pop`: `Exponential(1.0)`, `K_slope`: `Normal(1,0.5)` |
+| **Advection**                       | `'advection'`               | `velocity_prior`, `sigma_prior`                                             | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)` |
+| **Diffusion**                       | `'diffusion'`               | `diffusion_prior`, `sigma_prior`                                            | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` |
+| **Advection-Diffusion**             | `'advection_diffusion'`     | `velocity_prior`, `diffusion_prior`, `sigma_prior`                          | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` |
+| **Custom Model**                    | `'custom'`                  | `func`                                                                      | N/A |
 
 
 
@@ -957,12 +978,11 @@ This defines how the observed data are generated from the latent processes.
 
 
 ## Reaction-Advection-Diffusion  
-
-### Physical Manifold
+ 
 
 The `bstm` model extends standard spatiotemporal Bayesian models by incorporating a **mechanistic transport layer**. Instead of assuming a purely statistical interaction (like a Knorr-Held Type IV), it can simulate the evolution of a latent field through a discretized **Diffusion-Advection-Reaction PDE**.
 
-#### The Latent State Dynamics
+#### The Latent State Dynamics 
 
 Let $\eta_{s,t}$ represent the latent spatiotemporal field at location $s$ and time $t$. The model evolves as:
 
