@@ -133,23 +133,23 @@ In the tuple (*data_scot*), we have counts (y) of cancer incidence and populatio
 
 #### Spatiotemporal model: the shape of things to come
 
-Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we format the data (*data_scot*) into a DataFrame with the correct variable names and run a simple separable spatiotemporal model. Note that we use triple quotes (""" ... """)  around the formula to allow multi-line text. Signle quotes are fine but all would need to be on a single line or contatenated by the '*' operator: ("y ~ Spatial() " * " Temporal() ", etc. )  
+Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we format the data (*data_scot*) into a DataFrame with the correct variable names and run a simple separable spatiotemporal model. Note that we use triple quotes (""" ... """)  around the formula to allow multi-line text. Signle quotes are fine but all would need to be on a single line or contatenated by the '*' operator: ("y ~ spatial(...) " * " temporal() ", etc. )  
  
 ```{julia}
 #| label: Example - Sparse GMRF Space and time effect (no interaction)   
- 
-fm = """ 
-  y ~ intercept() + spatial(s_idx, model='bym2', W=data_scot[:au][:W]) +
-      temporal(t_idx, model='ar1') + observationprocess(log_offsets=log_offset) 
-""" 
 
+show(data_scot[:data])  # a DataFrame
 
+# the following """ ... "" is a simple way of writing multiline text
 fm = """ 
-  y ~ intercept() + spatial(s_idx, model=bym2, W=data_scot[:au][:W]) +
-      temporal(t_idx, model=ar1) + observationprocess(log_offsets=log_offset) 
+  y ~ intercept() + 
+    spatial(s_idx, model=bym2, W=data_scot[:au][:W]) +
+    temporal(year, model=ar1) + 
+    observationprocess(log_offsets=log_offset) 
 """ 
 
 m = bstm( fm, data_scot[:data], model_family="poisson")
+
 rand(m)
 
 os = get_optimal_sampler(m; adaptation_steps=100) ; 

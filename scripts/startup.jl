@@ -85,10 +85,10 @@ include( srcdir( "utility_functions.jl" ))   ;
 
 include( srcdir( "spatiotemporal_partitioning_functions.jl" ))   ;
 
+include( srcdir( "spatiotemporal_functions.jl" ))   ;
+
 include( srcdir( "build_model_dispatch.jl" ))   ;
 
-include( srcdir( "spatiotemporal_functions.jl" ))   ;
- 
 Random.seed!(42) # Set a seed for reproducibility.
 
 import MCMCChains
