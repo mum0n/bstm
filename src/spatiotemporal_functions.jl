@@ -11,20 +11,6 @@ const BSTM_TRANSFORM_KEYWORDS = Dict(
     "zscore" => x -> (x .- mean(x)) ./ std(x),
     "unit" => x -> (x .- minimum(x)) ./ (maximum(x) - minimum(x))
 )
-
-#!Reference
-
-# Definitions
-const BSTM_MODULE_KEYWORDS = Set([ 
-    "intercept", "observationprocess", "spatial", "temporal",
-    "smooth", "nested", "eigen", "fixed", "mixed", "dynamics"
-])
-
-const BSTM_TRANSFORM_KEYWORDS = Dict(
-    "log" => x -> log.(x),
-    "zscore" => x -> (x .- mean(x)) ./ std(x),
-    "unit" => x -> (x .- minimum(x)) ./ (maximum(x) - minimum(x))
-)
 # BSTM Low-Level Manifold Registry [v06.1 - Reusable Schema] ---
 # Rationale: ManifoldModels are now defined as low-level primitives that are domain-agnostic. 
 # The context (Spatial vs Temporal) is determined at the model-building stage.
@@ -55,6 +41,9 @@ struct FFT <: ManifoldModel; sigma_prior::UnivariateDistribution; nbins::Int; ke
 struct SPDE <: ManifoldModel; sigma_prior::UnivariateDistribution; kappa_prior::UnivariateDistribution; end
 struct SVGP <: ManifoldModel; lengthscale_prior::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
 struct Warp <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; kernel::String; end
+struct Nystrom <: ManifoldModel; lengthscale_prior::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
+struct Hyperbolic <: ManifoldModel; curvature::Real; sigma_prior::UnivariateDistribution; end
+struct ExponentialDecay <: ManifoldModel; sigma_prior::UnivariateDistribution; lengthscale_prior::UnivariateDistribution; end
 
 struct PSpline <: ManifoldModel
     nbins::Int
@@ -62,6 +51,18 @@ struct PSpline <: ManifoldModel
     diff_order::Int
     sigma_prior::UnivariateDistribution
 end
+
+struct Wavelet <: ManifoldModel
+    family::Symbol
+    nbins::Int
+    sigma_prior::UnivariateDistribution
+end
+
+struct BCGN <: ManifoldModel; sigma_prior::UnivariateDistribution; bipartite_adj::AbstractMatrix; end
+struct NetworkFlow <: ManifoldModel; sigma_prior::UnivariateDistribution; adjacency_matrix::AbstractMatrix; flow_direction::Symbol; end
+struct LocalAdaptive <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct Mosaic <: ManifoldModel; sigma_prior::UnivariateDistribution; n_regions::Int; end
+struct TensorProductSmooth <: ManifoldModel; sigma_prior::UnivariateDistribution; Q_template::AbstractMatrix; end
 
 struct TPS <: ManifoldModel; nbins::Int; sigma_prior::UnivariateDistribution; end
 struct BSpline <: ManifoldModel; nbins::Int; degree::Int; sigma_prior::UnivariateDistribution; end
@@ -314,6 +315,12 @@ const MANIFOLD_CONSTRUCTORS = Dict{Symbol, Function}(
     :pspline => (p, params) -> PSpline(get(params, :nbins, 20), get(params, :degree, 3), get(params, :diff_order, 2), p.sigma_prior),
     :bspline => (p, params) -> BSpline(get(params, :nbins, 10), get(params, :degree, 3), p.sigma_prior),
     :tps => (p, params) -> TPS(get(params, :nbins, 20), p.sigma_prior),
+    :wavelet => (p, params) -> Wavelet(get(params, :family, :db4), get(params, :nbins, 32), p.sigma_prior),
+    :bcgn => (p, params) -> BCGN(p.sigma_prior, get(params, :bipartite_adj, sparse(zeros(1,1)))),
+    :networkflow => (p, params) -> NetworkFlow(p.sigma_prior, get(params, :adjacency_matrix, sparse(zeros(1,1))), get(params, :flow_direction, :bidirectional)),
+    :localadaptive => (p, params) -> LocalAdaptive(p.sigma_prior),
+    :mosaic => (p, params) -> Mosaic(p.sigma_prior, get(params, :n_regions, 4)),
+    :tensorproductsmooth => (p, params) -> TensorProductSmooth(p.sigma_prior, get(params, :Q_template, sparse(zeros(1,1)))),
     :dynamics => (p, params) -> DynamicsManifold(string(get(params, :model, "none")), params)
 )
 
@@ -3498,104 +3505,114 @@ end
 
     
 function generate_sim_data(s_N=25, t_N=10; rndseed=42)
-    # v1.0.1 (2026-06-29 17:26:00)
-    # Purpose: A utility function for generating a standardized simulated spatiotemporal dataset with
-    #          known underlying trends, seasonal effects, and covariate relationships.
-    # Inputs: s_N (number of spatial units), t_N (number of time units), rndseed.
-    # Outputs: A NamedTuple containing the simulated DataFrame and metadata.
-    # Note: This function is crucial for testing and validating model implementations.
+    # v1.0.4 (2026-06-29 18:30:00)
+    # Purpose: Generates a standardized simulated spatiotemporal dataset with a structure
+    #          mimicking the output of `scottish_lip_cancer_data_spacetime`.
+    # Inputs: s_N, t_N, rndseed, n_neighbors.
+    # Outputs: A tuple containing the simulated DataFrame and an `au` (areal unit) NamedTuple.
+    # Note: Requires NearestNeighbors.jl for constructing the adjacency matrix.
     Random.seed!(rndseed)
     n_total = s_N * t_N
 
     # 1. Spatial Coordinates (Unit Level)
     unique_pts = [(rand() * 100.0, rand() * 100.0) for _ in 1:s_N]
-    s_coord_tuple = repeat(unique_pts, inner=t_N)
-    s_x = getindex.(s_coord_tuple, 1)
-    s_y = getindex.(s_coord_tuple, 2)
+    
+    # Build adjacency matrix W from k-nearest neighbors
+    # This requires the NearestNeighbors.jl package.
+    kdtree = KDTree(hcat(unique_pts...))
+    idxs, _ = knn(kdtree, hcat(unique_pts...), n_neighbors + 1, true)
+    
+    rows = Int[]
+    cols = Int[]
+    vals = Int[]
+    
+    for i in 1:s_N
+        for j_idx in idxs[i]
+            if i != j_idx
+                push!(rows, i)
+                push!(cols, j_idx)
+                push!(vals, 1)
+            end
+        end
+    end
+    W = sparse(rows, cols, vals, s_N, s_N)
+    W = max.(W, W') # Ensure symmetry
+
+    # Compute bounding box for the domain boundary as a hull approximation
+    x_coords_au = getindex.(unique_pts, 1)
+    y_coords_au = getindex.(unique_pts, 2)
+    min_x, max_x = extrema(x_coords_au)
+    min_y, max_y = extrema(y_coords_au)
+    hull_coords = [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y), (min_x, min_y)]
+    
+    au = (
+        centroids = unique_pts,
+        hull_coords = hull_coords,
+        W = W,
+        s_idx = 1:s_N,
+        s_x = x_coords_au,
+        s_y = y_coords_au,
+        s_vals = 1:s_N
+    )
 
     # 2. Temporal/Seasonal Indices
-    t_v = repeat(collect(1:t_N), outer=s_N) .+ (rand(n_total) .* 0.05)
-    t_idx = repeat(1:t_N, outer=s_N)
-    u_N = 12
-    u_idx = mod1.(1:n_total, u_N)
+    s_idx_flat = repeat(1:s_N, inner=t_N)
+    year_flat = repeat(1:t_N, outer=s_N)
 
     # 3. Latent Fields
     period = 12.0
+    t_v = year_flat .+ (rand(n_total) .* 0.05)
     trend = 0.05 .* t_v
     seasonal = 0.8 .* cos.(2π .* t_v ./ period)
-
-        # Covariate Generation (W1, W2, W3)
-    # These simulate continuous predictors with some shared latent signal Z
-    Z = randn(n_total)
-    W1_obs = 0.5 .* sin.(t_v ./ 5.0) .+ 0.5 .* Z .+ (randn(n_total) .* 0.1)
-    W2_obs = 0.5 .* cos.(t_v ./ 5.0) .- 0.3 .* Z .+ (randn(n_total) .* 0.2)
-    W3_obs = 0.2 .* (t_v ./ t_N) .+ 0.1 .* Z .+ (randn(n_total) .* 0.3)
- 
-    # Mosaic/Cluster Effects
+    
     s_clusters = mod1.(1:s_N, 5)
     cluster_effects = [-2.5, -1.0, 0.0, 1.0, 2.5]
     cluster_assignments_full = repeat(s_clusters, inner=t_N)
     spatial_effect = cluster_effects[cluster_assignments_full]
 
     # 4. Response Construction
-    sigma_y = 0.15
-    observation_error = sigma_y .* randn(n_total)
-    eta = 1.0 .+ spatial_effect .+ trend .+ seasonal .+ observation_error
+    log_offset = log.(rand(Uniform(1.0, 20.0), n_total))
+    eta = 1.0 .+ spatial_effect .+ trend .+ seasonal
+    y = [rand(Poisson(exp(eta_val + offset_val))) for (eta_val, offset_val) in zip(eta, log_offset)]
+    y_rate = y ./ exp.(log_offset)
+    y_bin = [v > mean(y_rate) ? 1 : 0 for v in y_rate]
 
-    y_binary = Int.(eta .> (mean(eta) + 0.5))
-    y_counts = abs.(Int.(round.(exp.(eta)))) # Poisson-friendly counts
+    # 5. Covariate Generation
+    cov1 = randn(n_total)
+    cov2 = 0.5 .* sin.(t_v ./ 5.0) .+ 0.5 .* cov1 .+ (randn(n_total) .* 0.1)
+    cov3 = 0.5 .* cos.(t_v ./ 5.0) .- 0.3 .* cov1 .+ (randn(n_total) .* 0.2)
+    cov4 = 0.2 .* (t_v ./ t_N) .+ 0.1 .* cov1 .+ (randn(n_total) .* 0.3)
+    cov5 = randn(n_total)
+    cov6 = randn(n_total)
+    
+    f1_levels = ["TypeA", "TypeB", "TypeC"]
+    f1 = f1_levels[mod1.(1:n_total, 3)]
+    
+    region_levels = ["North", "South", "East", "West"]
+    region = region_levels[mod1.(s_idx_flat, 4)]
 
-    weights = ones(Float64, n_total)
-    trials = ones(Int, n_total)
-
-    # Fixed Effects Design Matrix (Standard Intercept-only approach)
-    Xfixed = ones(Float64, n_total, 1)
-
-    # a factorial variable
-    reg_indices = mod1.(1:n_total, 4)
-    reg_levels = ["North", "South", "East", "West"]
-    reg = reg_levels[reg_indices]
-
-    # reformat simulated data into a rectangular dataframe (or namedarray the internal default):
+    # 6. Assemble DataFrame
     data_df = DataFrame(
-        y = y_counts,  # y-variable
-        y_obs = eta,
-        # Ensuring coordinates are aligned with the flattened observation vector
-        s_idx = repeat(1:s_N, inner=t_N),
-        s_coord = s_coord_tuple,
-        s_x = s_x,
-        s_y = s_y,
-        t_v = t_v,
-        t_coord = vec(t_idx),   # time index
-        u_idx = u_idx,
-        u_v = seasonal,
-        log_offset = zeros(n_total),
-        region = categorical(reg),  # would make sure it is used as a factorial variable or in the model statement: Fixed(reg)
-        z = Z,  # continuous covariate
-        w1 = W1_obs, # more covariates 
-        w2 = W2_obs,
-        w3 = W3_obs,
-        cluster_assignments = cluster_assignments_full,
-
-        y_binary = y_binary,
-        y_counts = y_counts,
-
-        Xfixed = Xfixed,
-        weights = weights,
-        trials = trials     
+        district = s_idx_flat,
+        year = year_flat,
+        y = y,
+        log_offset = log_offset,
+        cov1 = cov1,
+        cov2 = cov2,
+        cov3 = cov3,
+        cov4 = cov4,
+        cov5 = cov5,
+        cov6 = cov6,
+        y_rate = y_rate,
+        y_bin = y_bin,
+        f1 = categorical(f1),
+        s_idx = s_idx_flat,
+        s_x = getindex.(au.centroids[s_idx_flat], 1),
+        s_y = getindex.(au.centroids[s_idx_flat], 2),
+        region = categorical(region)
     )
 
-    return (
-        data_df = data_df,
-        s_coord = s_coord_tuple,
-        metadata = (
-            s_N = s_N,
-            t_N = t_N,
-            u_N = u_N,
-            n_total = n_total 
-        )
-    )   
-
+    return (data=data_df, au=au)
 end
 
 
@@ -4358,8 +4375,8 @@ function build_structure_template(type::Symbol, n::Int; scale=true, coords=nothi
     sf = 1.0
 
     # Group 0: Null Manifold Handling
-    # If the type is :none, we return a 1x1 identity to satisfy supervisor shapes without overhead
-        # 'harmonic' and 'rff' are basis-driven but require a recognized identity entry in the registry.
+    # If the type is :none, we return a 1x1 identity to satisfy supervisor shapes without overhead.
+    # 'harmonic' and 'rff' are basis-driven but require a recognized identity entry in the registry.
     if type == :iid || type == :none || type == :identity || type == :harmonic || type == :rff
         return (matrix = sparse(I(n)), scaling_factor = 1.0)
     end
@@ -6417,7 +6434,4 @@ function _resolve_obs_param!(opt_dict, params, data, param_keys, target_key)
         end
     end
 end
- 
-
-;;
  
