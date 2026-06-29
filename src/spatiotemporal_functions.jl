@@ -40,6 +40,54 @@ function split_terms_at_depth(input::AbstractString, sep::AbstractString)
     return terms
 end
 
+function parse_module_params(params_str::AbstractString)
+    # v1.0.0 (2026-06-29)
+    # Purpose: Parses a string of key-value parameters (e.g., "nbins=20, model='bym2'")
+    #          into a dictionary of symbols and values.
+    # Inputs: params_str - The string of parameters.
+    # Outputs: A dictionary of parsed parameters.
+    params = Dict{Symbol, Any}()
+    if isempty(strip(params_str))
+        return params
+    end
+
+    # Use the existing utility to split at commas, respecting parentheses
+    param_parts = split_terms_at_depth(params_str, ",")
+
+    for part in param_parts
+        kv = Base.split(part, "=")
+        if length(kv) == 2
+            key = Symbol(strip(kv[1]))
+            val_str = strip(kv[2])
+
+            # Attempt to parse the value
+            # 1. Try parsing as a number
+            parsed_val = tryparse(Float64, val_str)
+            if !isnothing(parsed_val)
+                # Check if it's an integer
+                if parsed_val == floor(parsed_val)
+                    params[key] = Int(parsed_val)
+                else
+                    params[key] = parsed_val
+                end
+            # 2. Check for booleans
+            elseif val_str == "true"
+                params[key] = true
+            elseif val_str == "false"
+                params[key] = false
+            # 3. Check for strings (single or double quotes)
+            elseif (startswith(val_str, "'") && endswith(val_str, "'")) || (startswith(val_str, "\"") && endswith(val_str, "\""))
+                params[key] = val_str[2:end-1]
+            # If it looks like code, try to parse it as an expression.
+            elseif occursin(r"[:\[\]\(\)]", val_str)
+                try; params[key] = Meta.parse(val_str); catch; params[key] = Symbol(val_str); end
+            else
+                params[key] = Symbol(val_str)
+            end
+        end
+    end
+    return params
+end
 
 function resolve_hyperpriors(m_id::Union{String, Symbol}, global_priors::Dict{String, Any}, module_priors::Dict{Symbol, Any}, scheme::Symbol=:pcpriors)
     # v1.0.1 (2026-06-29 16:13:05)
@@ -5929,8 +5977,38 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
     opt_dict[:y_N] = size(data, 1)
     opt_dict[:add_intercept] = metadata.has_intercept
 
+    # Pre-evaluate any expressions passed as keyword arguments or in the formula string.
+    # This allows passing variables from the calling scope, e.g., W=my_matrix.
+    # This must be done before the main module processing loop.
+    for (key, val) in opt_dict
+        if val isa Expr
+            try
+                opt_dict[key] = Core.eval(Main, val)
+            catch e; @error "Failed to evaluate keyword argument `$key` with expression `$val`."; rethrow(e); end
+        end
+    end
+    for (key, mod_data) in metadata.modules
+        if haskey(mod_data, :params)
+            for (param_key, param_val) in mod_data[:params]
+                # Evaluate expressions and symbols that represent variables in the Main scope.
+                # This allows users to pass variables from their workspace into the formula string.
+                # A check for `isdefined` is used for Symbols to avoid attempting to evaluate
+                # option keywords (e.g., model=bym2, which is parsed to the symbol :bym2).
+                should_eval = param_val isa Expr || (param_val isa Symbol && isdefined(Main, param_val))
+
+                if should_eval
+                    try
+                        mod_data[:params][param_key] = Core.eval(Main, param_val)
+                    catch e; @error "Failed to evaluate formula parameter `$param_key` with expression `$param_val` in module `$key`."; rethrow(e); end
+                end
+            end
+        end
+    end
+
+     
     # Pre-process common coordinate columns
-    if haskey(data, :s_x) && haskey(data, :s_y)
+    # FIX: Use `hasproperty` for DataFrames instead of `haskey`.
+    if hasproperty(data, :s_x) && hasproperty(data, :s_y)
         opt_dict[:s_x] = data.s_x
         opt_dict[:s_y] = data.s_y
         opt_dict[:s_coord] = hcat(data.s_x, data.s_y)
@@ -6017,7 +6095,8 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
 
     # Post-module processing for features requiring computed components
     if get(opt_dict, :use_sv, false)
-        if haskey(data, :s_x) && haskey(data, :s_y) && haskey(opt_dict, :t_idx)
+        # FIX: Use `hasproperty` for DataFrames instead of `haskey`.
+        if hasproperty(data, :s_x) && hasproperty(data, :s_y) && haskey(opt_dict, :t_idx)
             m_rff_sigma = get(opt_dict, :M_rff_sigma, 20)
             # Use observation-level coordinates for the volatility surface
             coords_st = hcat(data.s_x, data.s_y, opt_dict[:t_idx])

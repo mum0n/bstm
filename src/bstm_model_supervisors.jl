@@ -100,7 +100,7 @@ Changes in this version:
             else
                 s_rho_value = rho_param
             end
-            s_icar ~ MvNormalCanon(zeros(M.s_N), M.s_Q + noise * I)
+            s_icar ~ MvNormalCanon(zeros(M.s_N), spec.Q_template + noise * I)
             s_iid ~ MvNormal(zeros(M.s_N), I)
             sum_icar = sum(s_icar); sum_icar ~ Normal(0, 0.001 * M.s_N)
             s_eta_structured = s_sigma_value .* (sqrt(s_rho_value) .* s_icar .+ sqrt(1.0 - s_rho_value) .* s_iid)
@@ -698,7 +698,7 @@ end
                         s_rho_value = rho_param
                     end
 
-                    s_icar ~ MvNormalCanon(zeros(M.s_N), M.s_Q + noise * I)
+                    s_icar ~ MvNormalCanon(zeros(M.s_N), spec.Q_template + noise * I)
                     s_iid ~ MvNormal(zeros(M.s_N), I)
                     sum_icar = sum(s_icar)
                     sum_icar ~ Normal(0, 0.001 * M.s_N)

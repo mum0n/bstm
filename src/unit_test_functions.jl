@@ -1,4 +1,5 @@
 
+
 using Test
 using Distributions
 using LinearAlgebra
@@ -9,6 +10,7 @@ using Random
 using LogExpFunctions
 using PDMats
 using SparseArrays
+using Graphs
 
 @testset "BSTM Full Test Suite" begin
 
@@ -17,6 +19,9 @@ using SparseArrays
             @test split_terms_at_depth("a + b(c+d) + e", "+") == ["a", "b(c+d)", "e"]
             @test split_terms_at_depth("a", "+") == ["a"]
             @test split_terms_at_depth("a |> log", "|>") == ["a", "log"]
+            @test split_terms_at_depth("a+b+c", "-") == ["a+b+c"] # No separator
+            @test split_terms_at_depth("", "+") == [""] # Empty string
+            @test split_terms_at_depth("a + ", "+") == ["a", ""] # Trailing separator
         end
 
         @testset "parse_variable_and_transforms" begin
@@ -26,6 +31,9 @@ using SparseArrays
             var, transforms = parse_variable_and_transforms("my_var")
             @test var == "my_var"
             @test isempty(transforms)
+            var, transforms = parse_variable_and_transforms(" |> log")
+            @test var == ""
+            @test transforms == ["log"]
         end
     end
 
@@ -66,6 +74,13 @@ using SparseArrays
             formula5 = "y ~ spatial(s_idx) ⊗ temporal(t_idx)"
             decomposed5 = decompose_bstm_formula(formula5)
             @test any(m -> m[:type] == :interaction_composition && m[:operator] == :⊗, values(decomposed5.modules))
+
+            # Edge case: No intercept and empty fixed effects
+            formula6 = "y ~ 0 + spatial(s_idx)"
+            decomposed6 = decompose_bstm_formula(formula6)
+            @test decomposed6.has_intercept == false
+            @test isempty(decomposed6.fixed_effects)
+            @test haskey(decomposed6.modules, "spatial_s_idx")
         end
     end
 
@@ -94,6 +109,11 @@ using SparseArrays
             @test size(template_icar.matrix) == (3,3)
             @test issparse(template_icar.matrix)
             
+            # Edge case: n=1
+            template_n1 = build_structure_template(:rw1, 1)
+            @test size(template_n1.matrix) == (1,1)
+            @test template_n1.matrix[1,1] == 1.0
+            
             template_rw2 = build_structure_template(:rw2, 10)
             @test size(template_rw2.matrix) == (10,10)
             @test isapprox(sum(template_rw2.matrix), 0.0, atol=1e-9)
@@ -108,6 +128,10 @@ using SparseArrays
             B_wavelet = bstm_smooth_basis_1D("wavelet", vals, 16, 1)
             @test size(B_wavelet) == (100, 16)
             @test all(sum(B_wavelet, dims=2) .≈ 1.0) # Haar-like basis should partition the space
+            # Edge case: nbins=1
+            B_one_bin = bstm_smooth_basis_1D("pspline", vals, 1, 3)
+            @test size(B_one_bin) == (100, 1)
+            @test all(B_one_bin .== 1.0) # Should default to a constant basis
         end
         @testset "bstm_smooth_basis_2D" begin
             coords = rand(100, 2)
@@ -117,10 +141,10 @@ using SparseArrays
     end
 
     @testset "End-to-End Smoke Tests" begin
-        s_N_test = 10
+        s_N_test = 16
         t_N_test = 5
         total_obs = s_N_test * t_N_test
-        W_test = sparse(adjacency_matrix(Graphs.grid([Int(sqrt(s_N_test)), Int(sqrt(s_N_test))])))
+        W_test = sparse(adjacency_matrix(Graphs.grid([Int(sqrt(s_N_test)), Int(sqrt(s_N_test))]))) # Now requires Graphs
 
         dummy_df = DataFrame(
             y = rand(total_obs),
@@ -132,6 +156,13 @@ using SparseArrays
         @testset "Simple BYM2+AR1" begin
             model = bstm("y ~ 1 + x_cont + spatial(s_idx, model='bym2') + temporal(t_idx, model='ar1')", dummy_df; model_family="gaussian", W=W_test)
             @test rand(model) isa Any # check if model can be sampled from
+            chain = sample(model, MH(), 10; progress=false)
+            @test chain isa Chains
+        end
+
+        @testset "Multivariate Smoke Test" begin
+            dummy_df.y2 = rand(total_obs)
+            model = bstm("[y, y2] ~ 1 + x_cont + spatial(s_idx, model='icar')", dummy_df; model_family="gaussian", W=W_test)
             chain = sample(model, MH(), 10; progress=false)
             @test chain isa Chains
         end
