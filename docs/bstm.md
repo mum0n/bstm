@@ -249,8 +249,9 @@ inp_df = data[:data]
 display(first(inp_df, 3))
 
 fm = """ 
-  y ~ 1 + z + region + Spatial(s_idx, model='bym2', W=data.au.W) + Temporal(t_idx, model='ar1') 
+  y ~ 1 + z + region + Spatial(s_idx, model=bym2, W=data.au.W) + Temporal(year, model=ar1) 
 """
+
 m = bstm( fm, inp_df; model_family="poisson", target_units=20 );
 
 rand(m)

@@ -3253,11 +3253,15 @@ end
 
 function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, manifolds_registry)
     # BSTM Internal Utility v2.4.0
-    # Timestamp: 2026-06-27 22:30:00
-    # Synopsis: Processes `smooth()` modules, now with expanded support for additional basis model types.
+    # Timestamp: 2026-06-28 19:30:00
+    # Synopsis: Processes `smooth()` modules, unifying the handling of all smoother types.
     # Rationale for v2.4.0:
-    #     - Added 'linear', 'invdist', and 'kriging' to the `basis_models` list, allowing the
-    #       parser to correctly route these new smoother types to the `bstm_smooth_basis_*D` functions.
+    #     - Refactored the logic for GMRF-based smooths (e.g., `model='rw2'`). Instead of
+    #       diverting them to a separate `structured_smooths` list, this processor now
+    #       annotates the module's parameters with the necessary indices and unit counts.
+    #     - This allows GMRF-based smooths to be processed through the main `manifolds`
+    #       registry, creating a single, consistent pipeline for all manifold types and
+    #       simplifying the supervisor model logic.
 
     data = opt_dict[:data]
     params = mod_data[:params]
@@ -3506,7 +3510,7 @@ end
 const MODULE_PROCESSORS = Dict{Symbol, Function}(
     :spatial => process_spatial_module!,
     :temporal => process_temporal_module!,
-    :smooth => (opt_dict, mod_data, registries, hyperpriors) -> process_smooth_module!(opt_dict, mod_data, registries.basis_matrices_registry, get(opt_dict, :manifolds, [])),
+    :smooth => process_smooth_module!,
     :interaction_composition => process_interaction_module!,
     :intercept => process_intercept_module!,
     :observationprocess => process_observationprocess_module!,
@@ -4525,23 +4529,19 @@ end
 
 
  
-# BSTM Univariate Model Supervisor v4.0.0
-# Timestamp: 2026-06-28 09:10:00
-# Rationale for v4.0.0:
-#     - Re-architected the model to eliminate the `_apply_manifold!` dispatch system, which was the
-#       root cause of a persistent cycle of `UndefVarError` and `MethodError` exceptions related
-#       to variable scoping within the Turing `@model` macro.
-#     - All manifold-specific logic, including dynamics models, is now inlined directly within the
-#       `bstm_univariate` model. This ensures all sampling statements (`~`) are in the top-level
-#       scope of the model, which is the context where Turing's macros operate reliably.
-#     - Implemented a robust pattern for handling optional priors without using `Dirac()` distributions.
-#       The pattern `param = if prior isa Distribution; let local s; (s ~ prior); end; else value; end`
-#       is used. This is transparent to Julia's static compiler analysis (resolving `UndefVarError`)
-#       and provides a clean symbolic variable to the `~` macro (avoiding `MethodError`).
-#     - This change represents a definitive solution to the scoping conflicts and provides a more
-#       stable and correct foundation for the `bstm` framework.
 @model function bstm_univariate(M, ::Type{T}=Float64) where {T}
-    
+    # BSTM Univariate Model Supervisor v4.2.2
+    # Timestamp: 2026-06-28 20:45:00
+    # Rationale for v4.2.0:
+    #     - Corrected a recurring `UndefVarError` by replacing all instances of the incorrect
+    #       sampling pattern `var = let ...; x ~ dist; end` with the robust pattern
+    #       `var = let x ~ dist; x; end`. This ensures that the sampled value is correctly assigned.
+    #     - Removed redundant `local` keyword within `let` blocks for improved code clarity.
+    #       explicit and robust `if/let/else` block, as per best practices for model clarity
+    #       and stability.
+    #     - This refactoring ensures all sampling statements (`~`) are in the top-level scope
+    #       of the `@model` block, which is required for correct model graph construction.
+
     # # 1. Global Likelihood Hyperparameters
     family = M.model_family
     noise = get(M, :noise, 1e-4)
@@ -4557,14 +4557,14 @@ end
 
     # # 2. Observation Volatility & Stochastic Volatility (SV)
     y_sigma = Vector{T}(undef, M.y_N)
-    if get(M, :use_sv, false) == true 
+    if get(M, :use_sv, false) == true
         sigma_log_var ~ NamedDist(Exponential(1.0), :sigma_log_var)
         beta_vol_latent ~ NamedDist(filldist(Normal(0, 1), M.M_rff_sigma), :beta_vol_latent)
         vol_proj_field = M.vol_proj * beta_vol_latent
         vol_latent_field = sqrt(2.0 / M.M_rff_sigma) .* cos.(vol_proj_field)
         for i in 1:M.y_N; y_sigma[i] = exp((sigma_log_var * vol_latent_field[i]) / 2.0); end
     else
-        y_sigma_val ~ NamedDist(get(M.hyperpriors, "y_sigma_prior", Exponential(1.0)), :y_sigma) 
+        y_sigma_val ~ NamedDist(get(M.hyperpriors, "y_sigma_prior", Exponential(1.0)), :y_sigma)
         for i in 1:M.y_N; y_sigma[i] = y_sigma_val; end
     end
 
@@ -4579,8 +4579,7 @@ end
         eta .+= M.Xfixed * Xfixed_beta
     end
     if haskey(M, :log_offset)
-        if family in ["gaussian", "student_t", "laplace"]; eta .+= exp.(M.log_offset);
-        else; eta .+= M.log_offset; end
+        if family in ["gaussian", "student_t", "laplace"]; eta .+= exp.(M.log_offset); else; eta .+= M.log_offset; end
     end
 
     # # 4. Modular Manifold Realization (INLINED)
@@ -4592,7 +4591,7 @@ end
         if m_obj isa IID
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_", m_domain, "_", var_name)
-            sigma_val = if sigma_param isa Distribution; let s; (s ~ NamedDist(sigma_param, sigma_name)); end; else sigma_param; end
+            sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
             n_units, indices = if m_domain == :mixed; (spec.params.n_cat, spec.params.indices); elseif m_domain == :spatial; (M.s_N, M.s_idx); else (M.t_N, M.t_idx); end
             latent_name = Symbol("latent_", m_domain, "_", var_name)
             latent ~ NamedDist(filldist(Normal(0, sigma_val), n_units), latent_name)
@@ -4601,10 +4600,10 @@ end
         elseif m_obj isa BYM2
             sigma_param = get(spec.params, :s_sigma, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_", m_domain, "_", var_name)
-            s_sigma_value = if sigma_param isa Distribution; let s; (s ~ NamedDist(sigma_param, sigma_name)); end; else sigma_param; end
+            s_sigma_value = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
             rho_param = get(spec.params, :s_rho, m_obj.rho_prior)
             rho_name = Symbol("rho_", m_domain, "_", var_name)
-            s_rho_value = if rho_param isa Distribution; let r; (r ~ NamedDist(rho_param, rho_name)); end; else rho_param; end
+            s_rho_value = if rho_param isa Distribution; let r ~ NamedDist(rho_param, rho_name); r; end; else rho_param; end
             s_icar ~ MvNormalCanon(zeros(M.s_N), M.s_Q + noise * I)
             s_iid ~ MvNormal(zeros(M.s_N), I)
             sum_icar = sum(s_icar); sum_icar ~ Normal(0, 0.001 * M.s_N)
@@ -4614,12 +4613,12 @@ end
         elseif m_obj isa Union{ICAR, Besag, RW1, RW2, AR1, Leroux, SAR, Cyclic}
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_", m_domain, "_", var_name)
-            sigma_val = if sigma_param isa Distribution; let s; (s ~ NamedDist(sigma_param, sigma_name)); end; else sigma_param; end
+            sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
             rho_val = nothing
             if hasproperty(m_obj, :rho_prior)
                 rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
                 rho_name = Symbol("rho_", m_domain, "_", var_name)
-                rho_val = if rho_param isa Distribution; let r; (r ~ NamedDist(rho_param, rho_name)); end; else rho_param; end
+                rho_val = if rho_param isa Distribution; let r ~ NamedDist(rho_param, rho_name); r; end; else rho_param; end
             end
             template = spec.Q_template; n_units = size(template, 1)
             Q = recompose_precision(Symbol(lowercase(string(typeof(m_obj)))), template, sigma_val; extra_param=rho_val, noise=noise)
@@ -4633,7 +4632,7 @@ end
             var_sym = spec.var; B_mat = M.basis_matrices[var_sym]; n_basis_cols = size(B_mat, 2)
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_basis_", var_sym)
-            sigma_val = if sigma_param isa Distribution; let s; (s ~ NamedDist(sigma_param, sigma_name)); end; else sigma_param; end
+            sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
             beta_name = Symbol("beta_basis_", var_sym)
             if m_obj isa PSpline || m_obj isa TPS
                 Q_penalty = (1.0 / (sigma_val^2 + noise)) .* spec.Q_template
@@ -4647,10 +4646,10 @@ end
         elseif m_obj isa GP
             var_sym = spec.var
             ls_param = get(spec.params, :lengthscale_prior, m_obj.lengthscale_prior)
-            ls = if ls_param isa AbstractVector; let l; l ~ NamedDist(Product(ls_param), Symbol("ls_gp_", var_sym)); end
-                 else let l; (l ~ NamedDist(ls_param, Symbol("ls_gp_", var_sym))); end; end
+            ls = if ls_param isa AbstractVector; let l ~ NamedDist(Product(ls_param), Symbol("ls_gp_", var_sym)); l; end
+                 else let l ~ NamedDist(ls_param, Symbol("ls_gp_", var_sym)); l; end; end
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-            sigma_val = if sigma_param isa Distribution; let s; (s ~ NamedDist(sigma_param, Symbol("sigma_gp_", var_sym))); end; else sigma_param; end
+            sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, Symbol("sigma_gp_", var_sym)); s; end; else sigma_param; end
             kernel_base = get_kernel_from_string(m_obj.kernel)
             transform = ls isa AbstractVector ? ARDTransform(1 ./ ls) : ScaleTransform(1/ls)
             k_gp = sigma_val^2 * kernel_base ∘ transform
@@ -4660,9 +4659,9 @@ end
 
         elseif m_obj isa SPDE
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-            sigma_val = if sigma_param isa Distribution; let s; (s ~ NamedDist(sigma_param, Symbol("sigma_spde_", var_name))); end; else sigma_param; end
+            sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, Symbol("sigma_spde_", var_name)); s; end; else sigma_param; end
             kappa_param = get(spec.params, :kappa_prior, m_obj.kappa_prior)
-            kappa_val = if kappa_param isa Distribution; let k; (k ~ NamedDist(kappa_param, Symbol("kappa_spde_", var_name))); end; else kappa_param; end
+            kappa_val = if kappa_param isa Distribution; let k ~ NamedDist(kappa_param, Symbol("kappa_spde_", var_name)); k; end; else kappa_param; end
             Q = recompose_precision(:spde, spec.Q_template, sigma_val; extra_param=kappa_val, noise=noise)
             latent ~ NamedDist(MvNormalCanon(zeros(size(Q,1)), Q), Symbol("latent_spde_", var_name))
             eta .+= latent[M.s_idx]
@@ -4675,11 +4674,11 @@ end
                 x_vals = M.Xfixed[:, x_col_idx]
                 inner_m_type = Symbol(lowercase(string(typeof(inner_manifold))))
                 sigma_param = get(spec.params, :sigma_prior, inner_manifold.sigma_prior)
-                sigma_val = if sigma_param isa Distribution; let s; (s ~ NamedDist(sigma_param, Symbol("sig_svc_", cov_sym))); end; else sigma_param; end
+                sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, Symbol("sig_svc_", cov_sym)); s; end; else sigma_param; end
                 rho_val = nothing
                 if hasproperty(inner_manifold, :rho_prior)
                     rho_param = get(spec.params, :rho_prior, inner_manifold.rho_prior)
-                    rho_val = if rho_param isa Distribution; let r; (r ~ NamedDist(rho_param, Symbol("rho_svc_", cov_sym))); end; else rho_param; end
+                    rho_val = if rho_param isa Distribution; let r ~ NamedDist(rho_param, Symbol("rho_svc_", cov_sym)); r; end; else rho_param; end
                 end
                 Q = recompose_precision(inner_m_type, spec.Q_template, sigma_val; extra_param=rho_val, noise=noise)
                 latent ~ NamedDist(MvNormalCanon(zeros(size(Q,1)), Q), Symbol("beta_svc_", cov_sym))
@@ -4689,9 +4688,9 @@ end
         elseif m_obj isa Union{SVGP, FITC, Nystrom}
             var_sym = spec.var; n_inducing = m_obj.n_inducing; coords = spec.params.coords; n_dims = size(coords, 2)
             ls_param = get(spec.params, :lengthscale_prior, m_obj.lengthscale_prior)
-            ls = if ls_param isa AbstractVector; let l; l ~ NamedDist(Product(ls_param), Symbol("ls_sparsegp_", var_sym)); end; else let l; (l ~ NamedDist(ls_param, Symbol("ls_sparsegp_", var_sym))); end; end
+            ls = if ls_param isa AbstractVector; let l ~ NamedDist(Product(ls_param), Symbol("ls_sparsegp_", var_sym)); l; end; else let l ~ NamedDist(ls_param, Symbol("ls_sparsegp_", var_sym)); l; end; end
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-            sigma_val = if sigma_param isa Distribution; let s; (s ~ NamedDist(sigma_param, Symbol("sigma_sparsegp_", var_sym))); end; else sigma_param; end
+            sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, Symbol("sigma_sparsegp_", var_sym)); s; end; else sigma_param; end
             mean_coords = mean(coords, dims=1); std_coords = std(coords, dims=1)
             inducing_locs ~ MvNormal(vec(mean_coords), Diagonal(vec(std_coords)))
             kernel_base = get_kernel_from_string(m_obj.kernel)
@@ -4739,19 +4738,142 @@ end
         elseif m_obj isa DynamicsManifold
             params = spec.params
             model_name = get(params, :model, "logistic_fishing")
+            key = spec.key
+            priors = M.hyperpriors
 
             if model_name == "advection"
-                _dynamics_advection!(spec, eta, M, M.hyperpriors)
+                velocity_prior = get(priors, "velocity_prior", Normal(0, 0.5))
+                sigma_prior = get(priors, "sigma_prior", Exponential(1.0))
+                velocity = let v ~ NamedDist(velocity_prior, Symbol("velocity_", key)); v; end
+                sig_transport = let s ~ NamedDist(sigma_prior, Symbol("sig_transport_", key)); s; end
+                L = M.s_Q_template.matrix
+                n_s = M.s_N
+                n_t = M.t_N
+                transport_field = Matrix{T}(undef, n_s, n_t)
+                transport_field[:, 1] .~ Normal(0, 1)
+                for t in 2:n_t
+                    drift = -velocity .* (L * transport_field[:, t-1])
+                    transport_field[:, t] ~ MvNormal(transport_field[:, t-1] .+ drift, sig_transport^2 * I)
+                end
+                for i in 1:M.y_N
+                    eta[i] += transport_field[M.s_idx[i], M.t_idx[i]]
+                end
+
             elseif model_name == "diffusion"
-                _dynamics_diffusion!(spec, eta, M, M.hyperpriors)
+                diffusion_prior = get(priors, "diffusion_prior", LogNormal(-1, 1))
+                sigma_prior = get(priors, "sigma_prior", Exponential(1.0))
+                diffusion_coeff = let d ~ NamedDist(diffusion_prior, Symbol("diffusion_", key)); d; end
+                sig_transport = let s ~ NamedDist(sigma_prior, Symbol("sig_transport_", key)); s; end
+                L = M.s_Q_template.matrix
+                n_s = M.s_N
+                n_t = M.t_N
+                transport_field = Matrix{T}(undef, n_s, n_t)
+                transport_field[:, 1] .~ Normal(0, 1)
+                for t in 2:n_t
+                    drift = -diffusion_coeff .* (L * transport_field[:, t-1])
+                    transport_field[:, t] ~ MvNormal(transport_field[:, t-1] .+ drift, sig_transport^2 * I)
+                end
+                for i in 1:M.y_N
+                    eta[i] += transport_field[M.s_idx[i], M.t_idx[i]]
+                end
+
             elseif model_name == "advection_diffusion"
-                _dynamics_advection_diffusion!(spec, eta, M, M.hyperpriors)
+                diffusion_prior = get(priors, :diffusion_prior, LogNormal(-1, 1))
+                advection_prior = get(priors, :advection_prior, Normal(0, 0.5))
+                sigma_prior = get(priors, :sigma_prior, Exponential(1.0))
+                delta = let d ~ NamedDist(diffusion_prior, Symbol("diffusion_coeff_", key)); d; end
+                c = let c_s ~ NamedDist(advection_prior, Symbol("advection_coeff_", key)); c_s; end
+                sigma_dyn = let s ~ NamedDist(sigma_prior, Symbol("sigma_dynamics_", key)); s; end
+                dyn_field = Matrix{T}(undef, M.s_N, M.t_N)
+                dyn_field[:, 1] ~ MvNormal(zeros(M.s_N), I)
+                L = M.s_Q_template.matrix
+                W = get(M, :W, sparse(zeros(M.s_N, M.s_N)))
+                A = I - delta .* L - c .* W
+                for t in 2:M.t_N
+                    mean_t = A * dyn_field[:, t-1]
+                    dyn_field[:, t] ~ MvNormal(mean_t, sigma_dyn^2 * I)
+                end
+                for i in 1:M.y_N
+                    eta[i] += dyn_field[M.s_idx[i], M.t_idx[i]]
+                end
+
             elseif model_name in ["logistic_fishing", "ricker", "logistic_basic"]
-                _dynamics_logistic_fishing!(spec, eta, M, M.hyperpriors)
+                r_prior = get(priors, "r_prior", LogNormal(0, 1))
+                K_prior = get(priors, "K_prior", Normal(150, 50))
+                sig_pop_prior = get(priors, "sig_pop_prior", Exponential(1.0))
+                sig_F_prior = get(priors, "sig_F_prior", Exponential(0.5))
+                log_r_base = let r ~ NamedDist(r_prior, Symbol("log_r_base_", key)); r; end
+                log_K_base = let k ~ NamedDist(K_prior, Symbol("log_K_base_", key)); k; end
+                sig_pop = let s ~ NamedDist(sig_pop_prior, Symbol("sig_pop_", key)); s; end
+                sig_F = let s ~ NamedDist(sig_F_prior, Symbol("sig_F_", key)); s; end
+                log_pop_state = Vector{T}(undef, M.t_N)
+                log_F_state = Vector{T}(undef, M.t_N)
+                log_pop_state[1] ~ Normal(log_K_base - log(2.0), 1.0)
+                log_F_state[1] ~ Normal(-2.0, 1.0)
+                r_cov_effect = if haskey(params, :r_covariate)
+                    let rce ~ NamedDist(Normal(0, 0.1), Symbol("r_cov_effect_", key)); rce; end
+                else
+                    0.0
+                end
+                r_cov_data = haskey(params, :r_covariate) ? M.data[!, params[:r_covariate]] : nothing
+                K_cov_effect = if haskey(params, :K_covariate)
+                    let kce ~ NamedDist(Normal(0, 0.1), Symbol("K_cov_effect_", key)); kce; end
+                else
+                    0.0
+                end
+                K_cov_data = haskey(params, :K_covariate) ? M.data[!, params[:K_covariate]] : nothing
+                for t in 2:M.t_N
+                    current_r = isnothing(r_cov_data) ? exp(log_r_base) : exp(log_r_base + r_cov_effect * r_cov_data[t-1])
+                    current_K = isnothing(K_cov_data) ? exp(log_K_base) : exp(log_K_base + K_cov_effect * K_cov_data[t-1])
+                    prev_pop = exp(log_pop_state[t-1])
+                    prev_F = exp(log_F_state[t-1])
+                    growth = current_r * (1.0 - prev_pop / current_K) - prev_F
+                    log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_pop)
+                    log_F_state[t] ~ Normal(log_F_state[t-1], sig_F)
+                end
+                for i in 1:M.y_N
+                    eta[i] += log_pop_state[M.t_idx[i]]
+                end
+
             elseif model_name == "gompertz"
-                _dynamics_gompertz!(spec, eta, M, M.hyperpriors)
+                r_prior = get(priors, "r_prior", LogNormal(-1.5, 0.5))
+                K_prior = get(priors, "K_prior", Normal(150, 50))
+                sig_dyn_prior = get(priors, "sig_dyn_prior", Exponential(1.0))
+                r_dyn = let r ~ NamedDist(r_prior, Symbol("r_dyn_", key)); r; end
+                K_dyn = let k ~ NamedDist(K_prior, Symbol("K_dyn_", key)); k; end
+                sig_dyn = let s ~ NamedDist(sig_dyn_prior, Symbol("sig_dyn_", key)); s; end
+                log_pop_state = Vector{T}(undef, M.t_N)
+                log_pop_state[1] ~ Normal(log(K_dyn / 2.0), 1.0)
+                for t in 2:M.t_N
+                    growth = r_dyn * (log(K_dyn) - log_pop_state[t-1])
+                    log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_dyn)
+                end
+                for i in 1:M.y_N
+                    eta[i] += log_pop_state[M.t_idx[i]]
+                end
+
             elseif model_name == "linked_K_logistic"
-                _dynamics_linked_K!(spec, eta, M, M.hyperpriors)
+                r_prior = get(priors, "r_prior", LogNormal(0, 1))
+                sig_pop_prior = get(priors, "sig_pop_prior", Exponential(1.0))
+                K_slope_prior = get(priors, "K_slope_prior", Normal(1, 0.5))
+                r_dyn = let r ~ NamedDist(r_prior, Symbol("r_dyn_", key)); r; end
+                sig_pop = let s ~ NamedDist(sig_pop_prior, Symbol("sig_pop_", key)); s; end
+                K_slope = let k ~ NamedDist(K_slope_prior, Symbol("K_slope_", key)); k; end
+                eta_statistical_by_time = [mean(eta[M.t_idx .== t]) for t in 1:M.t_N]
+                log_pop_state = Vector{T}(undef, M.t_N)
+                log_K_initial = eta_statistical_by_time[1] * K_slope
+                log_pop_state[1] ~ Normal(log_K_initial - log(2.0), 1.0)
+                for t in 2:M.t_N
+                    log_K_current = eta_statistical_by_time[t-1] * K_slope
+                    current_K = exp(log_K_current)
+                    prev_pop = exp(log_pop_state[t-1])
+                    growth = r_dyn * (1.0 - prev_pop / current_K)
+                    log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_pop)
+                end
+                for i in 1:M.y_N
+                    eta[i] += log_pop_state[M.t_idx[i]]
+                end
+
             elseif model_name == "custom"
                 func_sym = get(params, :func, nothing)
                 if !isnothing(func_sym) && isdefined(Main, func_sym)
@@ -4760,6 +4882,7 @@ end
                 else
                     @warn "Custom dynamics function ':$func_sym' not found in Main scope. No dynamics applied."
                 end
+
             else
                 @warn "Unsupported dynamics model: '$model_name'. No dynamics applied."
             end
@@ -4768,7 +4891,7 @@ end
             @warn "No specific inlined logic for $(typeof(m_obj)). Skipping."
         end
     end
- 
+
     # # 4.1 Structured Smooths Realization 
     if haskey(M, :structured_smooths)
         for smooth_spec in M.structured_smooths
@@ -4809,29 +4932,35 @@ end
     end
 
     # # 5. Final Pointwise Likelihood Dispatch 
-    yL = T(get(M, :y_lower_bound, -Inf)); 
-    yU = T(get(M, :y_upper_bound, Inf)); 
+    yL = T(get(M, :y_lower_bound, -Inf));
+    yU = T(get(M, :y_upper_bound, Inf));
     h = T(get(M, :hurdle, -Inf));
 
     for i in 1:M.y_N
         d_lik = bstm_Likelihood(
             family, [T(M.y_obs[i])]; sigma_y=[y_sigma[i]], weight=[T(M.weights[i])],
             phi_zi=lik_phi, r_nb=lik_r, trial=[Int(M.trials[i])],
-            y_L=yL, y_U=yU, hurdle=h, extra_params=extra_p 
+            y_L=yL, y_U=yU, hurdle=h, extra_params=extra_p
         )
         Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i])
     end
 end
 
 
+
+
 @model function bstm_multivariate(M, ::Type{T}=Float64) where {T}
-    # BSTM Multivariate Model Supervisor v4.0.0
-    # Timestamp: 2026-06-28 09:10:00
-    # Rationale for v4.0.0:
-    #     - Re-architected to eliminate the `_apply_manifold_mv!` dispatch system.
-    #     - All manifold-specific logic is now inlined directly within this model.
-    #     - Implemented the robust `if/let` pattern for handling optional priors.
-    
+    # BSTM Multivariate Model Supervisor v4.2.0
+    # Timestamp: 2026-06-28 20:45:00
+    # Rationale for v4.2.0:
+    #     - Corrected a recurring `UndefVarError` by replacing all instances of the incorrect
+    #       sampling pattern `var = let ...; x ~ dist; end` with the robust pattern
+    #       `var = let x ~ dist; x; end`. This ensures that the sampled value is correctly assigned.
+    #     - Removed redundant `local` keyword within `let` blocks for improved code clarity.
+    #       explicit and robust `if/let/else` block, as per best practices for model clarity
+    #       and stability. This affects the handling of `r_covariate` and `K_covariate` in
+    #       the inlined dynamics models.
+
     # # 1. Global Architectural Scope & Hyperpriors
     outcomes_N = M.outcomes_N
     y_N = M.y_N
@@ -4868,121 +4997,323 @@ end
         m_domain = spec.domain
         var_name = string(spec.var)
 
-        for k in 1:outcomes_N
-            # --- IID Manifold ---
-            if m_obj isa IID
-                sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-                sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
-                sigma_val = if sigma_param isa Distribution
-                    let
-                        local s_sampler
-                        (s_sampler ~ NamedDist(sigma_param, sigma_name))
+        if m_obj isa DynamicsManifold
+            params = spec.params
+            model_name = get(params, :model, "logistic_fishing")
+            key = spec.key
+            priors = M.hyperpriors
+
+            if model_name == "linked_K_logistic"
+                @warn "The 'linked_K_logistic' model has a circular dependency and is not supported in this version. Skipping dynamics."
+                continue
+            end
+
+            for k in 1:outcomes_N
+                if model_name == "advection"
+                    velocity_prior = get(priors, "velocity_prior", Normal(0, 0.5))
+                    sigma_prior = get(priors, "sigma_prior", Exponential(1.0))
+                    velocity = let v ~ NamedDist(velocity_prior, Symbol("velocity_", key, "_", k)); v; end
+                    sig_transport = let s ~ NamedDist(sigma_prior, Symbol("sig_transport_", key, "_", k)); s; end
+                    L = M.s_Q_template.matrix
+                    transport_field = Matrix{T}(undef, M.s_N, M.t_N) 
+                    transport_field[:, 1] .~ Normal(0, 1)
+                    for t in 2:M.t_N
+                        drift = -velocity .* (L * transport_field[:, t-1])
+                        transport_field[:, t] ~ MvNormal(transport_field[:, t-1] .+ drift, sig_transport^2 * I)
                     end
-                else
-                    sigma_param
-                end
+                    for i in 1:M.y_N; latent_innovations[i, k] += transport_field[M.s_idx[i], M.t_idx[i]]; end
 
-                n_units, indices = if m_domain == :mixed; (spec.params.n_cat, spec.params.indices)
-                                   elseif m_domain == :spatial; (M.s_N, M.s_idx)
-                                   else (M.t_N, M.t_idx) end
-                
-                latent_name = Symbol("latent_", m_domain, "_", var_name, "_", k)
-                latent ~ NamedDist(filldist(Normal(0, sigma_val), n_units), latent_name)
-                latent_innovations[:, k] .+= latent[indices]
-
-            # --- BYM2 Manifold ---
-            elseif m_obj isa BYM2
-                sigma_param = get(spec.params, :s_sigma, m_obj.sigma_prior)
-                sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
-                s_sigma_value = if sigma_param isa Distribution
-                    let
-                        local s_sampler
-                        (s_sampler ~ NamedDist(sigma_param, sigma_name))
+                elseif model_name == "diffusion"
+                    diffusion_prior = get(priors, "diffusion_prior", LogNormal(-1, 1))
+                    sigma_prior = get(priors, "sigma_prior", Exponential(1.0))
+                    diffusion_coeff = let d ~ NamedDist(diffusion_prior, Symbol("diffusion_", key, "_", k)); d; end
+                    sig_transport = let s ~ NamedDist(sigma_prior, Symbol("sig_transport_", key, "_", k)); s; end
+                    L = M.s_Q_template.matrix
+                    transport_field = Matrix{T}(undef, M.s_N, M.t_N)
+                    transport_field[:, 1] .~ Normal(0, 1)
+                    for t in 2:M.t_N
+                        drift = -diffusion_coeff .* (L * transport_field[:, t-1])
+                        transport_field[:, t] ~ MvNormal(transport_field[:, t-1] .+ drift, sig_transport^2 * I)
                     end
-                else
-                    sigma_param
-                end
+                    for i in 1:M.y_N; latent_innovations[i, k] += transport_field[M.s_idx[i], M.t_idx[i]]; end
 
-                rho_param = get(spec.params, :s_rho, m_obj.rho_prior)
-                rho_name = Symbol("rho_", m_domain, "_", var_name, "_", k)
-                s_rho_value = if rho_param isa Distribution
-                    let
-                        local r_sampler
-                        (r_sampler ~ NamedDist(rho_param, rho_name))
+                elseif model_name == "advection_diffusion"
+                    diffusion_prior = get(priors, :diffusion_prior, LogNormal(-1, 1))
+                    advection_prior = get(priors, :advection_prior, Normal(0, 0.5))
+                    sigma_prior = get(priors, :sigma_prior, Exponential(1.0))
+                    delta = let d ~ NamedDist(diffusion_prior, Symbol("diffusion_coeff_", key, "_", k)); d; end
+                    c = let c_s ~ NamedDist(advection_prior, Symbol("advection_coeff_", key, "_", k)); c_s; end
+                    sigma_dyn = let s ~ NamedDist(sigma_prior, Symbol("sigma_dynamics_", key, "_", k)); s; end
+                    dyn_field = Matrix{T}(undef, M.s_N, M.t_N)
+                    dyn_field[:, 1] ~ MvNormal(zeros(M.s_N), I)
+                    L = M.s_Q_template.matrix
+                    W = get(M, :W, sparse(zeros(M.s_N, M.s_N)))
+                    A = I - delta .* L - c .* W
+                    for t in 2:M.t_N
+                        mean_t = A * dyn_field[:, t-1]
+                        dyn_field[:, t] ~ MvNormal(mean_t, sigma_dyn^2 * I)
                     end
-                else
-                    rho_param
-                end
+                    for i in 1:M.y_N; latent_innovations[i, k] += dyn_field[M.s_idx[i], M.t_idx[i]]; end
 
-                s_icar ~ MvNormalCanon(zeros(M.s_N), M.s_Q + noise * I)
-                s_iid ~ MvNormal(zeros(M.s_N), I)
-                sum_icar = sum(s_icar)
-                sum_icar ~ Normal(0, 0.001 * M.s_N)
-                s_eta_structured = s_sigma_value .* (sqrt(s_rho_value) .* s_icar .+ sqrt(1.0 - s_rho_value) .* s_iid)
-                latent_innovations[:, k] .+= s_eta_structured[M.s_idx]
-
-            # --- Other GMRF Manifolds ---
-            elseif m_obj isa Union{ICAR, Besag, RW1, RW2, AR1, Leroux, SAR, Cyclic}
-                sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-                sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
-                sigma_val = if sigma_param isa Distribution
-                    let
-                        local s_sampler
-                        (s_sampler ~ NamedDist(sigma_param, sigma_name))
-                    end
-                else
-                    sigma_param
-                end
-
-                rho_val = nothing
-                if hasproperty(m_obj, :rho_prior)
-                    rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
-                    rho_name = Symbol("rho_", m_domain, "_", var_name, "_", k)
-                    rho_val = if rho_param isa Distribution
-                        let
-                            local r_sampler
-                            (r_sampler ~ NamedDist(rho_param, rho_name))
-                        end
+                elseif model_name in ["logistic_fishing", "ricker", "logistic_basic"]
+                    r_prior = get(priors, "r_prior", LogNormal(0, 1))
+                    K_prior = get(priors, "K_prior", Normal(150, 50))
+                    sig_pop_prior = get(priors, "sig_pop_prior", Exponential(1.0))
+                    sig_F_prior = get(priors, "sig_F_prior", Exponential(0.5))
+                    log_r_base = let r ~ NamedDist(r_prior, Symbol("log_r_base_", key, "_", k)); r; end
+                    log_K_base = let K ~ NamedDist(K_prior, Symbol("log_K_base_", key, "_", k)); K; end
+                    sig_pop = let s ~ NamedDist(sig_pop_prior, Symbol("sig_pop_", key, "_", k)); s; end
+                    sig_F = let s ~ NamedDist(sig_F_prior, Symbol("sig_F_", key, "_", k)); s; end
+                    log_pop_state = Vector{T}(undef, M.t_N)
+                    log_F_state = Vector{T}(undef, M.t_N)
+                    log_pop_state[1] ~ Normal(log_K_base - log(2.0), 1.0)
+                    log_F_state[1] ~ Normal(-2.0, 1.0)
+                    r_cov_effect = if haskey(params, :r_covariate)
+                        let rce ~ NamedDist(Normal(0, 0.1), Symbol("r_cov_effect_", key, "_", k)); rce; end
                     else
-                        rho_param
+                        0.0
                     end
-                end
+                    r_cov_data = haskey(params, :r_covariate) ? M.data[!, params[:r_covariate]] : nothing
+                    K_cov_effect = if haskey(params, :K_covariate)
+                        let kce ~ NamedDist(Normal(0, 0.1), Symbol("K_cov_effect_", key, "_", k)); kce; end
+                    else
+                        0.0
+                    end
+                    K_cov_data = haskey(params, :K_covariate) ? M.data[!, params[:K_covariate]] : nothing
+                    for t in 2:M.t_N
+                        current_r = isnothing(r_cov_data) ? exp(log_r_base) : exp(log_r_base + r_cov_effect * r_cov_data[t-1])
+                        current_K = isnothing(K_cov_data) ? exp(log_K_base) : exp(log_K_base + K_cov_effect * K_cov_data[t-1])
+                        prev_pop = exp(log_pop_state[t-1])
+                        prev_F = exp(log_F_state[t-1])
+                        growth = current_r * (1.0 - prev_pop / current_K) - prev_F
+                        log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_pop)
+                        log_F_state[t] ~ Normal(log_F_state[t-1], sig_F)
+                    end
+                    for i in 1:M.y_N; latent_innovations[i, k] += log_pop_state[M.t_idx[i]]; end
 
-                template = spec.Q_template
-                n_units = size(template, 1)
-                Q = recompose_precision(Symbol(lowercase(string(typeof(m_obj)))), template, sigma_val; extra_param=rho_val, noise=noise)
-                
-                latent_name = Symbol("latent_", m_domain, "_", var_name, "_", k)
-                latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
+                elseif model_name == "gompertz"
+                    r_prior = get(priors, "r_prior", LogNormal(-1.5, 0.5))
+                    K_prior = get(priors, "K_prior", Normal(150, 50))
+                    sig_dyn_prior = get(priors, "sig_dyn_prior", Exponential(1.0))
+                    r_dyn = let r ~ NamedDist(r_prior, Symbol("r_dyn_", key, "_", k)); r; end
+                    K_dyn = let K_val ~ NamedDist(K_prior, Symbol("K_dyn_", key, "_", k)); K_val; end
+                    sig_dyn = let s ~ NamedDist(sig_dyn_prior, Symbol("sig_dyn_", key, "_", k)); s; end
+                    log_pop_state = Vector{T}(undef, M.t_N)
+                    log_pop_state[1] ~ Normal(log(K_dyn / 2.0), 1.0)
+                    for t in 2:M.t_N
+                        growth = r_dyn * (log(K_dyn) - log_pop_state[t-1])
+                        log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_dyn)
+                    end
+                    for i in 1:M.y_N; latent_innovations[i, k] += log_pop_state[M.t_idx[i]]; end
 
-                if m_obj isa Union{RW1, RW2, ICAR, Besag, Leroux, SAR}
-                    sum_latent = sum(latent)
-                    sum_latent ~ Normal(0, 0.001 * n_units)
-                end
-
-                indices = if m_domain == :spatial; M.s_idx; elseif m_domain == :temporal; M.t_idx; else M.u_idx; end
-                latent_innovations[:, k] .+= latent[indices]
-            
-            # --- Basis Function Manifolds ---
-            elseif m_obj isa Union{PSpline, BSpline, TPS, RFF, FFT}
-                var_sym = spec.var
-                B_mat = M.basis_matrices[var_sym]
-                n_basis_cols = size(B_mat, 2)
-                
-                sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-                sigma_name = Symbol("sigma_basis_", var_sym, "_", k)
-                sigma_val = if sigma_param isa Distribution
-                    let
-                        local s_sampler
-                        (s_sampler ~ NamedDist(sigma_param, sigma_name))
+                elseif model_name == "custom"
+                    func_sym = get(params, :func, nothing)
+                    if !isnothing(func_sym) && isdefined(Main, func_sym)
+                        user_func = getfield(Main, func_sym)
+                        innov_k = @view latent_innovations[:, k]
+                        user_func(spec, innov_k, M, priors)
+                    else
+                        @warn "Custom dynamics function ':$func_sym' not found in Main scope. No dynamics applied for outcome $k."
                     end
                 else
-                    sigma_param
+                    @warn "Unsupported dynamics model: '$model_name'. No dynamics applied for outcome $k."
                 end
+            end
+        elseif m_obj isa Eigen
+            # Eigen is applied once to all outcomes
+            vars = spec.variables; cov_data = Matrix(M.data[!, vars])'; n_vars, n_obs = size(cov_data); n_factors = m_obj.n_factors
+            pca_sd ~ NamedDist(m_obj.pca_sd_prior, :pca_sd)
+            pdef_sd ~ NamedDist(m_obj.pdef_sd_prior, :pdef_sd)
+            v ~ NamedDist(filldist(Normal(0, 1), length(m_obj.ltri_indices)), :v)
+            v_mat = zeros(T, n_vars, n_factors); v_mat[m_obj.ltri_indices] .= v
+            U = householder_to_eigenvector(v_mat, n_vars, n_factors)
+            z ~ NamedDist(filldist(Normal(0, 1), n_factors, n_obs), :latent_scores)
+            # Add the first principal component's effect to all outcomes
+            for k in 1:outcomes_N; latent_innovations[:, k] .+= z[1, :]; end
+            # Likelihood for the observed covariates
+            reconstructed_data = U * z
+            for i in 1:n_obs; Turing.@addlogprob! logpdf(MvNormal(reconstructed_data[:, i], pdef_sd^2 * I), cov_data[:, i]); end
+        else
+            for k in 1:outcomes_N
+                # --- IID Manifold ---
+                if m_obj isa IID
+                    sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
+                    sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
+                    sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
+
+                    n_units, indices = if m_domain == :mixed; (spec.params.n_cat, spec.params.indices)
+                                    elseif m_domain == :spatial; (M.s_N, M.s_idx)
+                                    else (M.t_N, M.t_idx) end
+                    
+                    latent_name = Symbol("latent_", m_domain, "_", var_name, "_", k)
+                    latent ~ NamedDist(filldist(Normal(0, sigma_val), n_units), latent_name)
+                    latent_innovations[:, k] .+= latent[indices]
+
+                # --- BYM2 Manifold ---
+                elseif m_obj isa BYM2
+                    sigma_param = get(spec.params, :s_sigma, m_obj.sigma_prior)
+                    sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
+                    s_sigma_value = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
+
+                    rho_param = get(spec.params, :s_rho, m_obj.rho_prior)
+                    rho_name = Symbol("rho_", m_domain, "_", var_name, "_", k)
+                    s_rho_value = if rho_param isa Distribution; let r ~ NamedDist(rho_param, rho_name); r; end; else rho_param; end
+
+                    s_icar ~ MvNormalCanon(zeros(M.s_N), M.s_Q + noise * I)
+                    s_iid ~ MvNormal(zeros(M.s_N), I)
+                    sum_icar = sum(s_icar)
+                    sum_icar ~ Normal(0, 0.001 * M.s_N)
+                    s_eta_structured = s_sigma_value .* (sqrt(s_rho_value) .* s_icar .+ sqrt(1.0 - s_rho_value) .* s_iid)
+                    latent_innovations[:, k] .+= s_eta_structured[M.s_idx]
+
+                # --- Other GMRF Manifolds ---
+                elseif m_obj isa Union{ICAR, Besag, RW1, RW2, AR1, Leroux, SAR, Cyclic}
+                    sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
+                    sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
+                    sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
+
+                    rho_val = nothing
+                    if hasproperty(m_obj, :rho_prior)
+                        rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
+                        rho_name = Symbol("rho_", m_domain, "_", var_name, "_", k)
+                        rho_val = if rho_param isa Distribution; let r ~ NamedDist(rho_param, rho_name); r; end; else rho_param; end
+                    end
+
+                    template = spec.Q_template
+                    n_units = size(template, 1)
+                    Q = recompose_precision(Symbol(lowercase(string(typeof(m_obj)))), template, sigma_val; extra_param=rho_val, noise=noise)
+                    
+                    latent_name = Symbol("latent_", m_domain, "_", var_name, "_", k)
+                    latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
+
+                    if m_obj isa Union{RW1, RW2, ICAR, Besag, Leroux, SAR}
+                        sum_latent = sum(latent)
+                        sum_latent ~ Normal(0, 0.001 * n_units)
+                    end
+
+                    indices = if m_domain == :spatial; M.s_idx; elseif m_domain == :temporal; M.t_idx; else M.u_idx; end
+                    latent_innovations[:, k] .+= latent[indices]
                 
-                beta_name = Symbol("beta_basis_", var_sym, "_", k)
-                latent_coeffs ~ NamedDist(filldist(Normal(0, sigma_val), n_basis_cols), beta_name)
-                latent_innovations[:, k] .+= B_mat * latent_coeffs
+                # --- Basis Function Manifolds ---
+                elseif m_obj isa Union{PSpline, BSpline, TPS, RFF, FFT}
+                    var_sym = spec.var
+                    B_mat = M.basis_matrices[var_sym]
+                    n_basis_cols = size(B_mat, 2)
+                    
+                    sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
+                    sigma_name = Symbol("sigma_basis_", var_sym, "_", k)
+                    sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
+                    
+                    beta_name = Symbol("beta_basis_", var_sym, "_", k)
+                    latent_coeffs ~ NamedDist(filldist(Normal(0, sigma_val), n_basis_cols), beta_name)
+                    latent_innovations[:, k] .+= B_mat * latent_coeffs
+
+                # --- GP Manifold ---
+                elseif m_obj isa GP
+                    var_sym = spec.var
+                    ls_param = get(spec.params, :lengthscale_prior, m_obj.lengthscale_prior)
+                    ls_name = Symbol("ls_gp_", var_sym, "_", k)
+                    ls = if ls_param isa AbstractVector; let l ~ NamedDist(Product(ls_param), ls_name); l; end; else let l ~ NamedDist(ls_param, ls_name); l; end; end
+                    sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
+                    sigma_name = Symbol("sigma_gp_", var_sym, "_", k)
+                    sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
+                    kernel_base = get_kernel_from_string(m_obj.kernel)
+                    transform = ls isa AbstractVector ? ARDTransform(1 ./ ls) : ScaleTransform(1/ls)
+                    k_gp = sigma_val^2 * kernel_base ∘ transform
+                    K_ff = kernelmatrix(k_gp, spec.params.coords) + noise*I
+                    latent_name = Symbol("latent_smooth_", var_sym, "_", k)
+                    latent ~ NamedDist(MvNormal(zeros(size(spec.params.coords,1)), K_ff), latent_name)
+                    latent_innovations[:, k] .+= latent
+
+                # --- SPDE Manifold ---
+                elseif m_obj isa SPDE
+                    sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
+                    sigma_name = Symbol("sigma_spde_", var_name, "_", k)
+                    sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
+                    kappa_param = get(spec.params, :kappa_prior, m_obj.kappa_prior)
+                    kappa_name = Symbol("kappa_spde_", var_name, "_", k)
+                    kappa_val = if kappa_param isa Distribution; let kap ~ NamedDist(kappa_param, kappa_name); kap; end; else kappa_param; end
+                    Q = recompose_precision(:spde, spec.Q_template, sigma_val; extra_param=kappa_val, noise=noise)
+                    latent_name = Symbol("latent_spde_", var_name, "_", k)
+                    latent ~ NamedDist(MvNormalCanon(zeros(size(Q,1)), Q), latent_name)
+                    latent_innovations[:, k] .+= latent[M.s_idx]
+
+                # --- SVC Manifold ---
+                elseif m_obj isa SVCManifold
+                    inner_manifold = m_obj.model
+                    cov_sym = m_obj.covariate
+                    x_col_idx = findfirst(==(cov_sym), Symbol.(names(M.Xfixed, 2)))
+                    if !isnothing(x_col_idx)
+                        x_vals = M.Xfixed[:, x_col_idx]
+                        inner_m_type = Symbol(lowercase(string(typeof(inner_manifold))))
+                        sigma_param = get(spec.params, :sigma_prior, inner_manifold.sigma_prior)
+                        sigma_name = Symbol("sig_svc_", cov_sym, "_", k)
+                        sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
+                        rho_val = nothing
+                        if hasproperty(inner_manifold, :rho_prior)
+                            rho_param = get(spec.params, :rho_prior, inner_manifold.rho_prior)
+                            rho_name = Symbol("rho_svc_", cov_sym, "_", k)
+                            rho_val = if rho_param isa Distribution; let r ~ NamedDist(rho_param, rho_name); r; end; else rho_param; end
+                        end
+                        Q = recompose_precision(inner_m_type, spec.Q_template, sigma_val; extra_param=rho_val, noise=noise)
+                        latent_name = Symbol("beta_svc_", cov_sym, "_", k)
+                        latent ~ NamedDist(MvNormalCanon(zeros(size(Q,1)), Q), latent_name)
+                        latent_innovations[:, k] .+= latent[M.s_idx] .* x_vals
+                    end
+
+                # --- Sparse GP Manifolds ---
+                elseif m_obj isa Union{SVGP, FITC, Nystrom}
+                    var_sym = spec.var; n_inducing = m_obj.n_inducing; coords = spec.params.coords
+                    ls_param = get(spec.params, :lengthscale_prior, m_obj.lengthscale_prior)
+                    ls_name = Symbol("ls_sparsegp_", var_sym, "_", k)
+                    ls = if ls_param isa AbstractVector; let l ~ NamedDist(Product(ls_param), ls_name); l; end; else let l ~ NamedDist(ls_param, ls_name); l; end; end
+                    sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
+                    sigma_name = Symbol("sigma_sparsegp_", var_sym, "_", k)
+                    sigma_val = if sigma_param isa Distribution; let s ~ NamedDist(sigma_param, sigma_name); s; end; else sigma_param; end
+                    mean_coords = mean(coords, dims=1); std_coords = std(coords, dims=1)
+                    inducing_locs_name = Symbol("inducing_locs_", var_sym, "_", k)
+                    inducing_locs ~ MvNormal(vec(mean_coords), Diagonal(vec(std_coords)))
+                    kernel_base = get_kernel_from_string(m_obj.kernel)
+                    transform = ls isa AbstractVector ? ARDTransform(1 ./ ls) : ScaleTransform(1/ls)
+                    k_sparse = sigma_val^2 * kernel_base ∘ transform
+                    K_uu = kernelmatrix(k_sparse, inducing_locs) + noise*I
+                    u_latent_name = Symbol("u_latent_", var_sym, "_", k)
+                    u_latent ~ MvNormal(zeros(n_inducing), K_uu)
+                    K_fu = kernelmatrix(k_sparse, coords, inducing_locs)
+                    f_mean = K_fu * (K_uu \ u_latent)
+                    latent_innovations[:, k] .+= f_mean
+
+                # --- BCGN Manifold ---
+                elseif m_obj isa BCGN
+                    sigma_name = Symbol("sigma_bcgn_", var_name, "_", k)
+                    sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
+                    W_bipartite = m_obj.bipartite_adj; n_groups = size(W_bipartite, 2)
+                    latent_name = Symbol("latent_bcgn_", var_name, "_", k)
+                    group_coeffs ~ NamedDist(MvNormal(zeros(n_groups), sigma^2 * I), latent_name)
+                    latent_innovations[:, k] .+= W_bipartite * group_coeffs
+
+                # --- NetworkFlow Manifold ---
+                elseif m_obj isa NetworkFlow
+                    sigma_name = Symbol("sigma_net_", var_name, "_", k)
+                    rho_name = Symbol("rho_net_", var_name, "_", k)
+                    sigma ~ NamedDist(m_obj.sigma_prior, sigma_name)
+                    rho ~ NamedDist(Beta(1,1), rho_name)
+                    template = m_obj.adjacency_matrix; n_units = size(template, 1)
+                    Q = recompose_precision(:network, template, sigma; extra_param=rho, directed_adj=template, flow_direction=m_obj.flow_direction)
+                    latent_name = Symbol("latent_net_", var_name, "_", k)
+                    latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
+                    latent_innovations[:, k] .+= latent[M.s_idx]
+
+                # --- Mosaic Manifold ---
+                elseif m_obj isa Mosaic
+                    sigma_name = Symbol("sigma_mosaic_", var_name, "_", k)
+                    sigma ~ NamedDist(Exponential(1.0), sigma_name)
+                    n_clusters = m_obj.n_regions
+                    cluster_assignments = M.cluster_assignments[spec.var]
+                    latent_name = Symbol("latent_mosaic_", var_name, "_", k)
+                    cluster_effects ~ NamedDist(MvNormal(zeros(n_clusters), sigma^2 * I), latent_name)
+                    latent_innovations[:, k] .+= cluster_effects[cluster_assignments]
+                end
             end
         end
     end
@@ -5003,21 +5334,29 @@ end
     end
 end
 
+
+
 @model function bstm_multifidelity(M, ::Type{T}=Float64) where {T}
-    # BSTM Multifidelity Model Supervisor v4.0.0
-    # Timestamp: 2026-06-28 09:10:00
-    # Rationale for v4.0.0:
-    #     - This model was already monolithic but is updated here for consistency.
-    #     - Implemented the robust `if/let` pattern for handling optional priors.
+    # BSTM Multifidelity Model Supervisor v4.2.1
+    # Timestamp: 2026-06-28 20:45:00
+    # Rationale for v4.2.1:
+    #     - Corrected an `UndefVarError` by replacing the incorrect sampling pattern
+    #       `var = let ...; x ~ dist; end` with the robust pattern `var = let x ~ dist; x; end`
+    #       for the `t_rho` and `t_ls` parameters.
     
     # # 1. Global Hyperpriors
     family = M.model_family
     noise = get(M, :noise, 1e-4)
     use_zi = get(M, :use_zi, false)
 
-    y_sigma ~ NamedDist((family in ["gaussian", "lognormal"]) ? Exponential(1.0) : Dirac(1.0), :y_sigma)
-    r_nb ~ NamedDist((family == "negbin") ? Exponential(1.0) : Dirac(1.0), :r_nb)
-    phi_zi ~ NamedDist(use_zi ? Beta(1, 1) : Dirac(0.0), :phi_zi)
+    y_sigma_prior = if family in ["gaussian", "lognormal"]; Exponential(1.0); else Dirac(1.0); end
+    y_sigma ~ NamedDist(y_sigma_prior, :y_sigma)
+
+    r_nb_prior = if family == "negbin"; Exponential(1.0); else Dirac(1.0); end
+    r_nb ~ NamedDist(r_nb_prior, :r_nb)
+
+    phi_zi_prior = if use_zi; Beta(1, 1); else Dirac(0.0); end
+    phi_zi ~ NamedDist(phi_zi_prior, :phi_zi)
 
     z_sigma ~ NamedDist(Exponential(0.5), :z_sigma)
     w_sigma ~ NamedDist(filldist(Exponential(0.5), 3), :w_sigma)
@@ -5046,25 +5385,20 @@ end
     t_sigma ~ NamedDist(Exponential(1.0), :t_sigma)
     t_rho_param = get(M.hyperpriors, "t_rho_prior", Beta(2, 2))
     t_rho = if M.model_time == "ar1"
-        let
-            local r_sampler
-            (r_sampler ~ NamedDist(t_rho_param, :t_rho))
-        end
+        let r ~ NamedDist(t_rho_param, :t_rho); r; end
     else
         0.0
     end
 
     t_ls_param = get(M.hyperpriors, "t_ls_prior", InverseGamma(3, 3))
     t_ls = if M.model_time == "gp"
-        let
-            local l_sampler
-            (l_sampler ~ NamedDist(t_ls_param, :t_ls))
-        end
+        let l ~ NamedDist(t_ls_param, :t_ls); l; end
     else
         1.0
     end
     
-    local t_eta_full, t_Q
+    t_eta_full = zeros(T, M.N_obs)
+    t_Q = I(M.t_N)
     if M.model_time == "ar1"
         t_Q_base = Symmetric((1.0 + t_rho^2) .* I(M.t_N) .+ (t_rho) .* M.t_Q)
         t_Q = Symmetric((1.0 / (1.0 - t_rho^2 + noise)) .* t_Q_base )
@@ -5079,34 +5413,33 @@ end
         t_gp ~ NamedDist(MvNormal(zeros(M.t_N), Symmetric(K_t)), :t_gp)
         t_eta_full = t_gp[M.t_idx]
         t_Q = inv(Symmetric(K_t))
-    else
-        t_eta_full = zeros(T, M.N_obs)
-        t_Q = I(M.t_N)
     end
 
-    u_sigma ~ NamedDist((M.model_season != "none") ? Exponential(0.5) : Dirac(0.0), :u_sigma)
-    u_rho ~ NamedDist((M.model_season == "ar1") ? Beta(2, 2) : Dirac(0.0), :u_rho)
+    u_sigma_prior = if M.model_season != "none"; Exponential(0.5); else Dirac(0.0); end
+    u_sigma ~ NamedDist(u_sigma_prior, :u_sigma)
     
-    local u_eta_full
+    u_rho_prior = if M.model_season == "ar1"; Beta(2, 2); else Dirac(0.0); end
+    u_rho ~ NamedDist(u_rho_prior, :u_rho)
+    
+    u_eta_full = zeros(T, M.N_obs)
     if M.model_season == "ar1"
         u_Q_base = Symmetric((1.0 + u_rho^2) .* I(M.u_N) .+ (u_rho) .* M.u_Q)
         u_Q = Symmetric((1.0 / (1.0 - u_rho^2 + noise)) .* u_Q_base )
         u_raw ~ NamedDist(MvNormalCanon(zeros(M.u_N), u_Q), :u_raw)
         u_eta_full = (u_raw .* u_sigma)[M.u_idx]
-    else
-        u_eta_full = zeros(T, M.N_obs)
     end
 
     # # 4. Space-Time Interaction
-    st_sigma ~ NamedDist((M.model_st != "none") ? Exponential(0.5) : Dirac(0.0), :st_sigma)
-    local st_eta
-    if M.model_st == "none"
-        st_eta = zeros(T, M.N_areas, M.t_N)
-    else
-        st_Q = if M.model_st == "I"; Symmetric(I(M.N_areas * M.t_N))
-               elseif M.model_st == "II"; Symmetric(kron(I(M.N_areas), t_Q))
-               elseif M.model_st == "III"; Symmetric(kron(M.s_Q, I(M.t_N)))
-               else Symmetric(kron(M.s_Q, t_Q)) end
+    st_sigma_prior = if M.model_st != "none"; Exponential(0.5); else Dirac(0.0); end
+    st_sigma ~ NamedDist(st_sigma_prior, :st_sigma)
+
+    st_eta = zeros(T, M.N_areas, M.t_N)
+    if M.model_st != "none"
+        local st_Q
+        if M.model_st == "I"; st_Q = Symmetric(I(M.N_areas * M.t_N))
+        elseif M.model_st == "II"; st_Q = Symmetric(kron(I(M.N_areas), t_Q))
+        elseif M.model_st == "III"; st_Q = Symmetric(kron(M.s_Q, I(M.t_N)))
+        else; st_Q = Symmetric(kron(M.s_Q, t_Q)); end
         st_raw ~ NamedDist(MvNormalCanon(zeros(M.N_areas * M.t_N), st_Q), :st_raw)
         st_eta = reshape(st_raw, M.N_areas, M.t_N) .* st_sigma
     end
@@ -5129,7 +5462,6 @@ end
     Turing.@addlogprob! logpdf(bstm_Likelihood(family, M.y_obs; sigma_y=y_sigma, use_zi=use_zi, weights=M.weights, phi_zi=phi_zi, r_nb=r_nb, trials=M.trials), eta)
 end
 
- 
 # Rationale: Defining these as constants prevents re-allocation on every function call.
 
 const PC_PRIORS = Dict(
@@ -6879,15 +7211,20 @@ end
 
  
 
-
 function get_inits(model::DynamicPPL.Model; refine="map", n_samples=100, optimizer=LBFGS(), max_iters=500, maxtime=60.0, noise=nothing)
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A utility for generating sensible initial values for MCMC sampling. It uses either a
-              heuristic based on prior samples or refines these initial values via Maximum A
-              Posteriori (MAP) estimation to find a good starting point for the sampler.
-    """
+    # BSTM Utility v1.1.1
+    # Timestamp: 2026-06-28 20:45:00
+    # Synopsis: A utility for generating sensible initial values for MCMC sampling. It uses a
+    #           heuristic based on prior samples or refines these initial values via Maximum A
+    #           Posteriori (MAP) estimation to find a good starting point for the sampler.
+    # Rationale for v1.1.0:
+    #     - Replaced the use of `mean()` with `median()` for calculating the central tendency of
+    #       prior samples. This provides more robust initial values, especially for parameters
+    #       with constrained or skewed priors (e.g., `Exponential`), by preventing invalid
+    #       negative starting points and being less sensitive to outliers.
+    # Rationale for v1.1.1:
+    #     - Corrected a `MethodError` by ensuring the `mu` variable is correctly typed before use.
+
     println("--- Generating Initial Parameters ---")
 
     # 1. Heuristic Initialization from Prior Samples
@@ -6914,7 +7251,7 @@ function get_inits(model::DynamicPPL.Model; refine="map", n_samples=100, optimiz
             continue
         end
 
-        mu = mean(vals)
+        mu = median(vals)
         s_name = string(ks)
 
         if vals[1] isa AbstractVector
@@ -6923,7 +7260,7 @@ function get_inits(model::DynamicPPL.Model; refine="map", n_samples=100, optimiz
         elseif occursin(r"sigma|ls_|lengthscale|sig_", s_name)
             init_dict[ks] = max(0.1, mu)
         elseif occursin("rho", s_name)
-            init_dict[ks] = clamp(mu, -0.9, 0.9)
+            init_dict[ks] = clamp(mu, -0.99, 0.99)
         elseif occursin("phi", s_name)
             init_dict[ks] = clamp(mu, 0.01, 0.5)
         else
@@ -7545,111 +7882,45 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
     return NamedTuple(opt_dict)
 end
 
+function get_optimal_sampler(model_obj::DynamicPPL.Model; target_acceptance=0.65, adaptation_steps=100, n_particles=20)
+    # BSTM Sampler Utility v3.0.1
+    # Timestamp: 2026-06-28 20:45:00
+    # Rationale for v3.0.1:
+    #     - Corrected a `MethodError` in the parameter discovery logic. The previous implementation
+    #       incorrectly assumed `vi.metadata[vn].dists` would always exist. The logic now safely
+    #       checks for the presence of metadata before attempting to access it.
+    #       distribution (Discrete vs. Continuous), which is a more robust and principled approach.
+    #     - The number of particles for the Particle Gibbs (`PG`) sampler is now a configurable
+    #       argument (`n_particles`) with a sensible default.
+    #     - The sampler construction logic remains robust, creating a composite Gibbs sampler
+    #       only when both continuous and discrete parameters are present.
 
-
-function parse_module_params(params_str::AbstractString)
-    # BSTM Internal Utility v1.3.0
-    # Timestamp: 2026-06-27 12:45:00
-    # Synopsis: An internal utility that parses the parameter part of a module string (e.g.,
-    #           "model='bym2', W=data[:W]") into a dictionary of key-value pairs. It handles
-    #           different data types and can evaluate Julia expressions.
-
-    d = Dict{Symbol, Any}()
-    if isempty(strip(params_str))
-        return d
-    end
-
-    pairs = split_terms_at_depth(params_str, ",")
-
-    for entry in pairs
-        if occursin("=", entry)
-            elements = Base.split(entry, "=", limit = 2)
-            param_key = Symbol(strip(elements[1]))
-            param_val_raw = strip(elements[2])
-
-            # # 1. Check for nested module calls first
-            m_mod_nested = match(r"(\w+)\((.*)\)", param_val_raw)
-            if !isnothing(m_mod_nested) && (lowercase(m_mod_nested.captures[1]) in BSTM_MODULE_KEYWORDS)
-                d[param_key] = _parse_module_call(param_val_raw)
-                continue
-            end
-
-            # # 2. Handle explicit string literals
-            is_string_literal = (startswith(param_val_raw, "'") && endswith(param_val_raw, "'")) || (startswith(param_val_raw, "\"") && endswith(param_val_raw, "\""))
-            if is_string_literal
-                d[param_key] = strip(param_val_raw, ['\'', '"'])
-                continue
-            end
-
-            # # 3. Attempt to parse as simple types before falling back to expression evaluation
-            if !isnothing(tryparse(Int, param_val_raw))
-                d[param_key] = parse(Int, param_val_raw)
-            elseif !isnothing(tryparse(Float64, param_val_raw))
-                d[param_key] = parse(Float64, param_val_raw)
-            elseif param_val_raw == "true"
-                d[param_key] = true
-            elseif param_val_raw == "false"
-                d[param_key] = false
-            else
-                # # 4. If not a simple type, it could be a symbol, a complex expression, or an unquoted string.
-                # Try to evaluate it as a Julia expression. This handles symbols like `:bym2` and complex objects like `data[:W]`.
-                try
-                    d[param_key] = Main.eval(Meta.parse(param_val_raw))
-                catch e # If evaluation fails, it's likely an unquoted string intended as a column name.
-                    if e isa UndefVarError
-                        # This is the most common case for column names passed without quotes.
-                        # Treat it as a Symbol so it can be found in the DataFrame.
-                        d[param_key] = Symbol(param_val_raw)
-                    else
-                        @warn "Could not evaluate '$param_val_raw' as a Julia expression. Treating as a String. Error: $e"
-                        d[param_key] = param_val_raw
-                    end
-                end
-            end
-        end
-    end
-    return d
-end
-
-
-
-
-function get_optimal_sampler(model_obj::DynamicPPL.Model; target_acceptance=0.65, adaptation_steps=100)
-    # BSTM Sampler Utility v2.5.0
-    # Timestamp: 2026-06-28 15:20:00
-    # Rationale for v2.5.0:
-    #     - Corrected a `MethodError` that occurred because `keys(rand(model_obj))` returns
-    #       `VarName` objects, not `Symbol`s. The code was attempting to push a `VarName`
-    #       into an array of `Symbol`s, causing a type conversion failure.
-    #     - The implementation now explicitly converts the `VarName` object to a `Symbol`
-    #       using `Symbol(vn)` before it is used with the `discrete_params` and
-    #       `continuous_params` arrays. This resolves the type mismatch while retaining the
-    #       robust, behavior-based approach for parameter classification.
-
-    # # 1. Parameter Discovery and Type Introspection
-    # Generate a single sample from the prior to inspect the types of the parameters.
-    prior_sample = rand(model_obj)
-    all_param_varnames = keys(prior_sample)
+    # # 1. Parameter Discovery via Model Introspection
+    # We inspect the model's VarInfo to get metadata about each parameter's prior distribution.
+    vi = DynamicPPL.VarInfo(model_obj)
+    vns = DynamicPPL.keys(vi)
 
     # # 2. Categorization Logic
-    # We partition parameters into discrete and continuous sets based on their distribution's support.
+    # Parameters are partitioned into discrete and continuous sets based on the support
+    # of their prior distributions.
     discrete_params = Symbol[]
     continuous_params = Symbol[]
 
-    for vn in all_param_varnames
-        # Get the sampled value for the parameter.
-        val = prior_sample[vn]
-        sym = Symbol(vn)
-
-        # Check if the element type of the sampled value is an Integer.
-        # This is a robust way to detect discrete variables.
-        if eltype(val) <: Integer
-            if !(sym in discrete_params)
-                push!(discrete_params, sym)
-            end
-        else
-            if !(sym in continuous_params)
-                push!(continuous_params, sym)
+    for vn in vns
+        # Extract the prior distribution for the current variable.
+        if haskey(vi.metadata, vn) && !isempty(vi.metadata[vn].dists)
+            dist = vi.metadata[vn].dists[1]
+            sym = Symbol(vn)
+            
+            # Check if the distribution's support is Discrete.
+            if Distributions.value_support(typeof(dist)) == Distributions.Discrete
+                if !(sym in discrete_params)
+                    push!(discrete_params, sym)
+                end
+            else
+                if !(sym in continuous_params)
+                    push!(continuous_params, sym)
+                end
             end
         end
     end
@@ -7665,7 +7936,6 @@ function get_optimal_sampler(model_obj::DynamicPPL.Model; target_acceptance=0.65
 
     if !isempty(discrete_params)
         # Particle Gibbs is required for sampling discrete latent variables.
-        n_particles = 20 # A reasonable default for particle count.
         push!(sampler_blocks, PG(n_particles, discrete_params...))
     end
 
@@ -7675,292 +7945,14 @@ function get_optimal_sampler(model_obj::DynamicPPL.Model; target_acceptance=0.65
         @warn "No parameters found to sample. Returning default NUTS sampler."
         return NUTS(adaptation_steps, target_acceptance)
     elseif length(sampler_blocks) == 1
+        println("Info: All parameters are of one type. Using single sampler: $(typeof(sampler_blocks[1])).")
         return sampler_blocks[1]
     else
+        println("Info: Mixed parameter types detected. Using Gibbs sampler.")
         return Gibbs(sampler_blocks...)
     end
 end
 
-
-
-
-# --- Dynamics Model Implementations ---
- 
- 
-function _dynamics_logistic_fishing!(spec, eta, M, priors)
-    """
-    BSTM Dynamics Model v1.1.0
-    Timestamp: 2026-06-26 18:45:00
-    Synopsis: Implements a logistic growth model with a latent, time-varying fishing mortality (F).
-    Rationale for v1.1.0:
-        - Corrected `UndefVarError` by explicitly declaring all sampled parameters
-          (`log_r_base`, `log_K_base`, etc.) as local variables before use.
-    """
-    key = spec.key
-    params = spec.params
-    T = eltype(eta)
-
-    # 1. Define Priors with User Overrides
-    r_prior = get(priors, "r_prior", LogNormal(0, 1))
-    K_prior = get(priors, "K_prior", Normal(150, 50))
-    sig_pop_prior = get(priors, "sig_pop_prior", Exponential(1.0))
-    sig_F_prior = get(priors, "sig_F_prior", Exponential(0.5))
-
-    # 2. Declare and Sample Core Dynamics Parameters
-    log_r_base::T = 0.0
-    log_K_base::T = 0.0
-    sig_pop::T = 0.0
-    sig_F::T = 0.0
-    log_r_base ~ NamedDist(r_prior, Symbol("log_r_base_", key))
-    log_K_base ~ NamedDist(K_prior, Symbol("log_K_base_", key))
-    sig_pop ~ NamedDist(sig_pop_prior, Symbol("sig_pop_", key))
-    sig_F ~ NamedDist(sig_F_prior, Symbol("sig_F_", key))
-
-    # 3. Initialize State-Space Vectors
-    log_pop_state = Vector{T}(undef, M.t_N)
-    log_F_state = Vector{T}(undef, M.t_N)
-    log_pop_state[1] ~ Normal(log_K_base - log(2.0), 1.0)
-    log_F_state[1] ~ Normal(-2.0, 1.0)
-
-    # 4. Handle Environmental Covariates on r and K
-    r_cov_effect::T = 0.0
-    r_cov_data = nothing
-    if haskey(params, :r_covariate)
-        r_cov_effect ~ NamedDist(Normal(0, 0.1), Symbol("r_cov_effect_", key))
-        r_cov_data = M.data[!, params[:r_covariate]]
-    end
-
-    K_cov_effect::T = 0.0
-    K_cov_data = nothing
-    if haskey(params, :K_covariate)
-        K_cov_effect ~ NamedDist(Normal(0, 0.1), Symbol("K_cov_effect_", key))
-        K_cov_data = M.data[!, params[:K_covariate]]
-    end
-
-    # 5. State Transition Loop
-    for t in 2:M.t_N
-        current_r = isnothing(r_cov_data) ? exp(log_r_base) : exp(log_r_base + r_cov_effect * r_cov_data[t-1])
-        current_K = isnothing(K_cov_data) ? exp(log_K_base) : exp(log_K_base + K_cov_effect * K_cov_data[t-1])
-        prev_pop = exp(log_pop_state[t-1])
-        prev_F = exp(log_F_state[t-1])
-        growth = current_r * (1.0 - prev_pop / current_K) - prev_F
-        log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_pop)
-        log_F_state[t] ~ Normal(log_F_state[t-1], sig_F)
-    end
-
-    # 6. Link Latent Population State to Observations
-    for i in 1:M.y_N
-        eta[i] += log_pop_state[M.t_idx[i]]
-    end
-end
-
-function _dynamics_gompertz!(spec, eta, M, priors)
-    """
-    BSTM Dynamics Model v1.1.0
-    Timestamp: 2026-06-26 18:45:00
-    Synopsis: Implements a Gompertz growth model as a state-space process.
-    Rationale for v1.1.0:
-        - Corrected `UndefVarError` by explicitly declaring `r_dyn`, `K_dyn`, and `sig_dyn`.
-    """
-    key = spec.key
-    params = spec.params
-    T = eltype(eta)
-
-    r_prior = get(priors, "r_prior", LogNormal(-1.5, 0.5))
-    K_prior = get(priors, "K_prior", Normal(150, 50))
-    sig_dyn_prior = get(priors, "sig_dyn_prior", Exponential(1.0))
-
-    r_dyn::T = 0.0
-    K_dyn::T = 0.0
-    sig_dyn::T = 0.0
-    r_dyn ~ NamedDist(r_prior, Symbol("r_dyn_", key))
-    K_dyn ~ NamedDist(K_prior, Symbol("K_dyn_", key))
-    sig_dyn ~ NamedDist(sig_dyn_prior, Symbol("sig_dyn_", key))
-
-    log_pop_state = Vector{T}(undef, M.t_N)
-    log_pop_state[1] ~ Normal(log(K_dyn / 2.0), 1.0)
-
-    for t in 2:M.t_N
-        growth = r_dyn * (log(K_dyn) - log_pop_state[t-1])
-        log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_dyn)
-    end
-
-    for i in 1:M.y_N
-        eta[i] += log_pop_state[M.t_idx[i]]
-    end
-end
-
-
-
-function _dynamics_linked_K!(spec, eta, M, priors)
-    """
-    BSTM Dynamics Model v1.1.0
-    Timestamp: 2026-06-26 18:45:00
-    Synopsis: Implements a logistic growth model where K is linked to the statistical environment.
-    Rationale for v1.1.0:
-        - Corrected `UndefVarError` by explicitly declaring `r_dyn`, `sig_pop`, and `K_slope`.
-    """
-    key = spec.key
-    params = spec.params
-    T = eltype(eta)
-
-    # 1. Define Priors
-    r_prior = get(priors, "r_prior", LogNormal(0, 1))
-    sig_pop_prior = get(priors, "sig_pop_prior", Exponential(1.0))
-    K_slope_prior = get(priors, "K_slope_prior", Normal(1, 0.5))
-
-    # 2. Declare and Sample Core Dynamics Parameters
-    r_dyn::T = 0.0
-    sig_pop::T = 0.0
-    K_slope::T = 0.0
-    r_dyn ~ NamedDist(r_prior, Symbol("r_dyn_", key))
-    sig_pop ~ NamedDist(sig_pop_prior, Symbol("sig_pop_", key))
-    K_slope ~ NamedDist(K_slope_prior, Symbol("K_slope_", key))
-
-    # 3. Pre-compute time-step specific statistical effects from eta
-    eta_statistical_by_time = [mean(eta[M.t_idx .== t]) for t in 1:M.t_N]
-
-    # 4. Initialize State-Space Vector
-    log_pop_state = Vector{T}(undef, M.t_N)
-    log_K_initial = eta_statistical_by_time[1] * K_slope
-    log_pop_state[1] ~ Normal(log_K_initial - log(2.0), 1.0)
-
-    # 5. State Transition Loop
-    for t in 2:M.t_N
-        log_K_current = eta_statistical_by_time[t-1] * K_slope
-        current_K = exp(log_K_current)
-        prev_pop = exp(log_pop_state[t-1])
-        growth = r_dyn * (1.0 - prev_pop / current_K)
-        log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_pop)
-    end
-
-    # 6. Link Latent Population State back to the Linear Predictor
-    for i in 1:M.y_N
-        eta[i] += log_pop_state[M.t_idx[i]]
-    end
-end
-
-
-function _dynamics_advection!(spec, eta, M, priors)
-    """
-    BSTM Dynamics Model v1.1.0
-    Timestamp: 2026-06-26 18:45:00
-    Synopsis: Implements a simple advection (transport) model on a graph.
-    Rationale for v1.1.0:
-        - Corrected `UndefVarError` by explicitly declaring `velocity` and `sig_transport`.
-    """
-    key = spec.key
-    T = eltype(eta)
-
-    velocity_prior = get(priors, "velocity_prior", Normal(0, 0.5))
-    sigma_prior = get(priors, "sigma_prior", Exponential(1.0))
-
-    velocity::T = 0.0
-    sig_transport::T = 0.0
-    velocity ~ NamedDist(velocity_prior, Symbol("velocity_", key))
-    sig_transport ~ NamedDist(sigma_prior, Symbol("sig_transport_", key))
-
-    L = M.s_Q_template.matrix
-    n_s = M.s_N
-    n_t = M.t_N
-
-    transport_field = Matrix{T}(undef, n_s, n_t)
-    transport_field[:, 1] .~ Normal(0, 1)
-
-    for t in 2:n_t
-        drift = -velocity .* (L * transport_field[:, t-1])
-        transport_field[:, t] ~ MvNormal(transport_field[:, t-1] .+ drift, sig_transport^2 * I)
-    end
-
-    for i in 1:M.y_N
-        eta[i] += transport_field[M.s_idx[i], M.t_idx[i]]
-    end
-end
-
-function _dynamics_diffusion!(spec, eta, M, priors)
-    """
-    BSTM Dynamics Model v1.1.0
-    Timestamp: 2026-06-26 18:45:00
-    Synopsis: Implements a simple diffusion model on a graph.
-    Rationale for v1.1.0:
-        - Corrected `UndefVarError` by explicitly declaring `diffusion_coeff` and `sig_transport`.
-    """
-    key = spec.key
-    T = eltype(eta)
-    
-    diffusion_prior = get(priors, "diffusion_prior", LogNormal(-1, 1))
-    sigma_prior = get(priors, "sigma_prior", Exponential(1.0))
-
-    diffusion_coeff::T = 0.0
-    sig_transport::T = 0.0
-    diffusion_coeff ~ NamedDist(diffusion_prior, Symbol("diffusion_", key))
-    sig_transport ~ NamedDist(sigma_prior, Symbol("sig_transport_", key))
-
-    L = M.s_Q_template.matrix
-    n_s = M.s_N
-    n_t = M.t_N
-
-    transport_field = Matrix{T}(undef, n_s, n_t)
-    transport_field[:, 1] .~ Normal(0, 1)
-
-    for t in 2:n_t
-        drift = -diffusion_coeff .* (L * transport_field[:, t-1])
-        transport_field[:, t] ~ MvNormal(transport_field[:, t-1] .+ drift, sig_transport^2 * I)
-    end
-
-    for i in 1:M.y_N
-        eta[i] += transport_field[M.s_idx[i], M.t_idx[i]]
-    end
-end
-
-
-
-function _dynamics_advection_diffusion!(spec, eta, M, user_params::Dict)
-    # BSTM Dynamics Model v1.4.0
-    # Timestamp: 2026-06-27 14:55:00
-    # Synopsis: Implements a combined advection-diffusion state-space model on a graph.
-    # Rationale for v1.4.0:
-    #     - Corrected an `UndefVarError` where a variable `velocity` was sampled and used without being declared.
-    #     - Standardized parameter names to `delta` (diffusion), `c` (advection), and `sigma_dyn` (process noise).
-    #     - Implemented unique parameter naming using the `spec.key` to prevent collisions in models with multiple dynamics components.
-    #     - Corrected the use of the parameter dictionary to consistently use the passed `user_params` for retrieving priors.
-    
-    key = spec.key
-    T = eltype(eta)
-
-    # 1. Define Priors with User Overrides from the `user_params` dictionary
-    diffusion_prior = get(user_params, :diffusion_prior, LogNormal(-1, 1))
-    advection_prior = get(user_params, :advection_prior, Normal(0, 0.5))
-    sigma_prior = get(user_params, :sigma_prior, Exponential(1.0))
- 
-    # 2. Declare and Sample Core Dynamics Parameters
-    delta::T = 0.0
-    c::T = 0.0
-    sigma_dyn::T = 0.0
-    delta ~ NamedDist(diffusion_prior, Symbol("diffusion_coeff_", key))
-    c ~ NamedDist(advection_prior, Symbol("advection_coeff_", key))
-    sigma_dyn ~ NamedDist(sigma_prior, Symbol("sigma_dynamics_", key))
- 
-    # 3. Initialize State-Space Vector
-    dyn_field = Matrix{eltype(eta)}(undef, M.s_N, M.t_N)
-    dyn_field[:, 1] ~ MvNormal(zeros(M.s_N), I)
-
-    # 4. Define Operators
-    L = M.s_Q_template.matrix
-    W = get(M, :W, sparse(zeros(M.s_N, M.s_N))) # Adjacency matrix
-
-    # 5. State Transition Loop
-    A = I - delta .* L - c .* W
-    for t in 2:M.t_N
-        mean_t = A * dyn_field[:, t-1]
-        dyn_field[:, t] ~ MvNormal(mean_t, sigma_dyn^2 * I)
-    end
-
-    # 6. Link Latent Population State to Observations
-    for i in 1:M.y_N
-        eta[i] += dyn_field[M.s_idx[i], M.t_idx[i]]
-    end
-end
 
 
 function _resolve_obs_param!(opt_dict, params, data, param_keys, target_key)
@@ -7985,305 +7977,7 @@ function _resolve_obs_param!(opt_dict, params, data, param_keys, target_key)
         end
     end
 end
-
-@model function bstm_multivariate(M, ::Type{T}=Float64) where {T}
-    # BSTM Multivariate Model Supervisor v4.1.0
-    # Timestamp: 2026-06-28 10:45:00
-    # Rationale for v4.1.0:
-    #     - Inlined all dynamics models (`logistic_fishing`, `advection`, etc.) directly
-    #       into the main model loop, mirroring the changes in `bstm_univariate`.
-    #     - Dynamics are applied independently per outcome, and their effects are added to the
-    #       `latent_innovations` matrix before LKJ coupling.
-    #     - All sampled dynamics parameters are made unique per outcome `k`.
-    #     - The `linked_K_logistic` model is disabled with a warning.
-    
-    # # 1. Global Architectural Scope & Hyperpriors
-    outcomes_N = M.outcomes_N
-    y_N = M.y_N
-    family = M.model_family
-    noise = get(M, :noise, 1e-4)
-    use_zi = get(M, :use_zi, false)
-
-    lik_r = one(T)
-    lik_phi = zero(T)
-    extra_p = ones(T, outcomes_N)
-
-    if family == "negbin"; lik_r ~ NamedDist(Exponential(1.0), :lik_r); end
-    if use_zi == true; lik_phi ~ NamedDist(Beta(1, 1), :lik_phi); end
-    if family in ["gamma", "beta", "student_t"]; extra_p ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :extra_params); end
-
-    # # 2. Multivariate Coupling & Observation Volatility
-    L_corr ~ NamedDist(LKJCholesky(outcomes_N, 1.0, T), :L_corr)
-    y_sigma = Matrix{T}(undef, y_N, outcomes_N)
-    if family in ["gaussian", "lognormal"]
-        y_sigma_val ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :y_sigma)
-        for k in 1:outcomes_N; y_sigma[:, k] .= y_sigma_val[k]; end
-    else
-        for k in 1:outcomes_N; y_sigma[:, k] .= one(T); end
-    end
-
-    # # 3. Base Predictor: Fixed Effects
-    Xfixed_beta ~ NamedDist(MvNormal(zeros(M.Xfixed_N * outcomes_N), 5.0 * I), :Xfixed_beta)
-    eta = M.Xfixed * reshape(Xfixed_beta, M.Xfixed_N, outcomes_N)
-
-    # # 4. Modular Manifold Realization (INLINED)
-    latent_innovations = zeros(T, y_N, outcomes_N)
-    for spec in M.manifolds
-        m_obj = spec.manifold_obj
-        m_domain = spec.domain
-        var_name = string(spec.var)
-
-        if m_obj isa DynamicsManifold
-            params = spec.params
-            model_name = get(params, :model, "logistic_fishing")
-            key = spec.key
-            priors = M.hyperpriors
-
-            if model_name == "linked_K_logistic"
-                @warn "The 'linked_K_logistic' model has a circular dependency and is not supported in this version. Skipping dynamics."
-                continue
-            end
-
-            for k in 1:outcomes_N
-                if model_name == "advection"
-                    velocity_prior = get(priors, "velocity_prior", Normal(0, 0.5))
-                    sigma_prior = get(priors, "sigma_prior", Exponential(1.0))
-                velocity = let v; v ~ NamedDist(velocity_prior, Symbol("velocity_", key)); end 
-                sig_transport = let s; s ~ NamedDist(sigma_prior, Symbol("sig_transport_", key)); end 
-                    L = M.s_Q_template.matrix
-                transport_field = Matrix{T}(undef, M.s_N, M.t_N) 
-                    transport_field[:, 1] .~ Normal(0, 1)
-                    for t in 2:M.t_N
-                        drift = -velocity .* (L * transport_field[:, t-1])
-                        transport_field[:, t] ~ MvNormal(transport_field[:, t-1] .+ drift, sig_transport^2 * I)
-                    end
-                    for i in 1:M.y_N; latent_innovations[i, k] += transport_field[M.s_idx[i], M.t_idx[i]]; end
-
-                elseif model_name == "diffusion"
-                    diffusion_prior = get(priors, "diffusion_prior", LogNormal(-1, 1))
-                    sigma_prior = get(priors, "sigma_prior", Exponential(1.0))
-                diffusion_coeff = let d; d ~ NamedDist(diffusion_prior, Symbol("diffusion_", key)); end 
-                sig_transport = let s; s ~ NamedDist(sigma_prior, Symbol("sig_transport_", key)); end 
-                    L = M.s_Q_template.matrix
-                    transport_field = Matrix{T}(undef, M.s_N, M.t_N)
-                    transport_field[:, 1] .~ Normal(0, 1)
-                    for t in 2:M.t_N
-                        drift = -diffusion_coeff .* (L * transport_field[:, t-1])
-                        transport_field[:, t] ~ MvNormal(transport_field[:, t-1] .+ drift, sig_transport^2 * I)
-                    end
-                    for i in 1:M.y_N; latent_innovations[i, k] += transport_field[M.s_idx[i], M.t_idx[i]]; end
-
-                elseif model_name == "advection_diffusion"
-                    diffusion_prior = get(priors, :diffusion_prior, LogNormal(-1, 1))
-                    advection_prior = get(priors, :advection_prior, Normal(0, 0.5))
-                    sigma_prior = get(priors, :sigma_prior, Exponential(1.0))
-                delta = let d; d ~ NamedDist(diffusion_prior, Symbol("diffusion_coeff_", key)); end 
-                c = let c_s; c_s ~ NamedDist(advection_prior, Symbol("advection_coeff_", key)); end 
-                sigma_dyn = let s; s ~ NamedDist(sigma_prior, Symbol("sigma_dynamics_", key)); end 
-                    dyn_field = Matrix{T}(undef, M.s_N, M.t_N)
-                    dyn_field[:, 1] ~ MvNormal(zeros(M.s_N), I)
-                    L = M.s_Q_template.matrix
-                    W = get(M, :W, sparse(zeros(M.s_N, M.s_N)))
-                    A = I - delta .* L - c .* W
-                    for t in 2:M.t_N
-                        mean_t = A * dyn_field[:, t-1]
-                        dyn_field[:, t] ~ MvNormal(mean_t, sigma_dyn^2 * I)
-                    end
-                    for i in 1:M.y_N; latent_innovations[i, k] += dyn_field[M.s_idx[i], M.t_idx[i]]; end
-
-                elseif model_name in ["logistic_fishing", "ricker", "logistic_basic"]
-                    r_prior = get(priors, "r_prior", LogNormal(0, 1))
-                    K_prior = get(priors, "K_prior", Normal(150, 50))
-                    sig_pop_prior = get(priors, "sig_pop_prior", Exponential(1.0))
-                    sig_F_prior = get(priors, "sig_F_prior", Exponential(0.5))
-                log_r_base = let r; r ~ NamedDist(r_prior, Symbol("log_r_base_", key)); end 
-                log_K_base = let k; k ~ NamedDist(K_prior, Symbol("log_K_base_", key)); end 
-                sig_pop = let s; s ~ NamedDist(sig_pop_prior, Symbol("sig_pop_", key)); end 
-                sig_F = let s; s ~ NamedDist(sig_F_prior, Symbol("sig_F_", key)); end 
-                    log_pop_state = Vector{T}(undef, M.t_N)
-                    log_F_state = Vector{T}(undef, M.t_N)
-                    log_pop_state[1] ~ Normal(log_K_base - log(2.0), 1.0)
-                    log_F_state[1] ~ Normal(-2.0, 1.0)
-                r_cov_effect = haskey(params, :r_covariate) ? let rce; rce ~ NamedDist(Normal(0, 0.1), Symbol("r_cov_effect_", key)); end : 0.0 
-                    r_cov_data = haskey(params, :r_covariate) ? M.data[!, params[:r_covariate]] : nothing
-                K_cov_effect = haskey(params, :K_covariate) ? let kce; kce ~ NamedDist(Normal(0, 0.1), Symbol("K_cov_effect_", key)); end : 0.0 
-                    K_cov_data = haskey(params, :K_covariate) ? M.data[!, params[:K_covariate]] : nothing
-                    for t in 2:M.t_N
-                        current_r = isnothing(r_cov_data) ? exp(log_r_base) : exp(log_r_base + r_cov_effect * r_cov_data[t-1])
-                        current_K = isnothing(K_cov_data) ? exp(log_K_base) : exp(log_K_base + K_cov_effect * K_cov_data[t-1])
-                        prev_pop = exp(log_pop_state[t-1])
-                        prev_F = exp(log_F_state[t-1])
-                        growth = current_r * (1.0 - prev_pop / current_K) - prev_F
-                        log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_pop)
-                        log_F_state[t] ~ Normal(log_F_state[t-1], sig_F)
-                    end
-                    for i in 1:M.y_N; latent_innovations[i, k] += log_pop_state[M.t_idx[i]]; end
-
-                elseif model_name == "gompertz"
-                    r_prior = get(priors, "r_prior", LogNormal(-1.5, 0.5))
-                    K_prior = get(priors, "K_prior", Normal(150, 50))
-                    sig_dyn_prior = get(priors, "sig_dyn_prior", Exponential(1.0))
-                r_dyn = let r; r ~ NamedDist(r_prior, Symbol("r_dyn_", key)); end 
-                K_dyn = let k; k ~ NamedDist(K_prior, Symbol("K_dyn_", key)); end 
-                sig_dyn = let s; s ~ NamedDist(sig_dyn_prior, Symbol("sig_dyn_", key)); end 
-                    log_pop_state = Vector{T}(undef, M.t_N)
-                    log_pop_state[1] ~ Normal(log(K_dyn / 2.0), 1.0)
-                    for t in 2:M.t_N
-                        growth = r_dyn * (log(K_dyn) - log_pop_state[t-1])
-                        log_pop_state[t] ~ Normal(log_pop_state[t-1] + growth, sig_dyn)
-                    end
-                    for i in 1:M.y_N; latent_innovations[i, k] += log_pop_state[M.t_idx[i]]; end
-
-                elseif model_name == "custom"
-                    func_sym = get(params, :func, nothing)
-                    if !isnothing(func_sym) && isdefined(Main, func_sym)
-                        user_func = getfield(Main, func_sym)
-                        innov_k = @view latent_innovations[:, k]
-                        user_func(spec, innov_k, M, priors)
-                    else
-                        @warn "Custom dynamics function ':$func_sym' not found in Main scope. No dynamics applied for outcome $k."
-                    end
-                else
-                    @warn "Unsupported dynamics model: '$model_name'. No dynamics applied for outcome $k."
-                end
-            end
-        else
-            for k in 1:outcomes_N
-                # --- IID Manifold ---
-                if m_obj isa IID
-                    sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-                    sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
-                    sigma_val = if sigma_param isa Distribution
-                        let
-                            local s_sampler
-                            (s_sampler ~ NamedDist(sigma_param, sigma_name))
-                        end
-                    else
-                        sigma_param
-                    end
-
-                    n_units, indices = if m_domain == :mixed; (spec.params.n_cat, spec.params.indices)
-                                    elseif m_domain == :spatial; (M.s_N, M.s_idx)
-                                    else (M.t_N, M.t_idx) end
-                    
-                    latent_name = Symbol("latent_", m_domain, "_", var_name, "_", k)
-                    latent ~ NamedDist(filldist(Normal(0, sigma_val), n_units), latent_name)
-                    latent_innovations[:, k] .+= latent[indices]
-
-                # --- BYM2 Manifold ---
-                elseif m_obj isa BYM2
-                    sigma_param = get(spec.params, :s_sigma, m_obj.sigma_prior)
-                    sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
-                    s_sigma_value = if sigma_param isa Distribution
-                        let
-                            local s_sampler
-                            (s_sampler ~ NamedDist(sigma_param, sigma_name))
-                        end
-                    else
-                        sigma_param
-                    end
-
-                    rho_param = get(spec.params, :s_rho, m_obj.rho_prior)
-                    rho_name = Symbol("rho_", m_domain, "_", var_name, "_", k)
-                    s_rho_value = if rho_param isa Distribution
-                        let
-                            local r_sampler
-                            (r_sampler ~ NamedDist(rho_param, rho_name))
-                        end
-                    else
-                        rho_param
-                    end
-
-                    s_icar ~ MvNormalCanon(zeros(M.s_N), M.s_Q + noise * I)
-                    s_iid ~ MvNormal(zeros(M.s_N), I)
-                    sum_icar = sum(s_icar)
-                    sum_icar ~ Normal(0, 0.001 * M.s_N)
-                    s_eta_structured = s_sigma_value .* (sqrt(s_rho_value) .* s_icar .+ sqrt(1.0 - s_rho_value) .* s_iid)
-                    latent_innovations[:, k] .+= s_eta_structured[M.s_idx]
-
-                # --- Other GMRF Manifolds ---
-                elseif m_obj isa Union{ICAR, Besag, RW1, RW2, AR1, Leroux, SAR, Cyclic}
-                    sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-                    sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
-                    sigma_val = if sigma_param isa Distribution
-                        let
-                            local s_sampler
-                            (s_sampler ~ NamedDist(sigma_param, sigma_name))
-                        end
-                    else
-                        sigma_param
-                    end
-
-                    rho_val = nothing
-                    if hasproperty(m_obj, :rho_prior)
-                        rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
-                        rho_name = Symbol("rho_", m_domain, "_", var_name, "_", k)
-                        rho_val = if rho_param isa Distribution
-                            let
-                                local r_sampler
-                                (r_sampler ~ NamedDist(rho_param, rho_name))
-                            end
-                        else
-                            rho_param
-                        end
-                    end
-
-                    template = spec.Q_template
-                    n_units = size(template, 1)
-                    Q = recompose_precision(Symbol(lowercase(string(typeof(m_obj)))), template, sigma_val; extra_param=rho_val, noise=noise)
-                    
-                    latent_name = Symbol("latent_", m_domain, "_", var_name, "_", k)
-                    latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
-
-                    if m_obj isa Union{RW1, RW2, ICAR, Besag, Leroux, SAR}
-                        sum_latent = sum(latent)
-                        sum_latent ~ Normal(0, 0.001 * n_units)
-                    end
-
-                    indices = if m_domain == :spatial; M.s_idx; elseif m_domain == :temporal; M.t_idx; else M.u_idx; end
-                    latent_innovations[:, k] .+= latent[indices]
-                
-                # --- Basis Function Manifolds ---
-                elseif m_obj isa Union{PSpline, BSpline, TPS, RFF, FFT}
-                    var_sym = spec.var
-                    B_mat = M.basis_matrices[var_sym]
-                    n_basis_cols = size(B_mat, 2)
-                    
-                    sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-                    sigma_name = Symbol("sigma_basis_", var_sym, "_", k)
-                    sigma_val = if sigma_param isa Distribution
-                        let
-                            local s_sampler
-                            (s_sampler ~ NamedDist(sigma_param, sigma_name))
-                        end
-                    else
-                        sigma_param
-                    end
-                    
-                    beta_name = Symbol("beta_basis_", var_sym, "_", k)
-                    latent_coeffs ~ NamedDist(filldist(Normal(0, sigma_val), n_basis_cols), beta_name)
-                    latent_innovations[:, k] .+= B_mat * latent_coeffs
-                end
-            end
-        end
-    end
-
-    # Apply multivariate coupling to the innovations
-    eta .+= (latent_innovations * L_corr.L)
-
-    # # 5. Pointwise Likelihood Evaluation
-    for k in 1:outcomes_N
-        ok_idx = get(M, :y_ok, [1:y_N for _ in 1:outcomes_N])[k]
-        for i in ok_idx
-            d_lik = bstm_Likelihood(
-                family, [T(M.y_obs[i, k])]; sigma_y=[y_sigma[i, k]],
-                phi_zi=lik_phi, r_nb=lik_r, extra_params=extra_p[k]
-            )
-            Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i, k])
-        end
-    end
-end
-
+ 
 
 ;;
  
