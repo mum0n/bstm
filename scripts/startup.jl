@@ -82,6 +82,8 @@ include( srcdir( "data_prep.jl") );
 # include( srcdir( "example_turing_models.jl" ))   ;
 
 include( srcdir( "utility_functions.jl" ))   ;
+include( srcdir( "structs.jl" ))   ;
+
 include( srcdir( "spatiotemporal_partitioning_functions.jl" ))   ;
 include( srcdir( "spatiotemporal_functions.jl" ))   ;
 include( srcdir( "build_model_dispatch.jl" ))   ;
