@@ -299,6 +299,12 @@ const MANIFOLD_CONSTRUCTORS = Dict{Symbol, Function}(
     :ar1 => (p, params) -> AR1(p.rho_prior, p.sigma_prior),
     :rw1 => (p, params) -> RW1(p.sigma_prior),
     :rw2 => (p, params) -> RW2(p.sigma_prior),
+    :fitc => (p, params) -> FITC(p.lengthscale_prior, p.sigma_prior, get(params, :n_inducing, 20), string(get(params, :kernel, "se"))),
+    :svgp => (p, params) -> SVGP(p.lengthscale_prior, p.sigma_prior, get(params, :n_inducing, 20), string(get(params, :kernel, "se"))),
+    :nystrom => (p, params) -> Nystrom(p.lengthscale_prior, p.sigma_prior, get(params, :n_inducing, 20), string(get(params, :kernel, "se"))),
+    :warp => (p, params) -> Warp(p.lengthscale_prior, p.sigma_prior, get(params, :n_features, 20), string(get(params, :kernel, "se"))),
+    :hyperbolic => (p, params) -> Hyperbolic(get(params, :curvature, -1.0), p.sigma_prior),
+    :decay => (p, params) -> ExponentialDecay(p.sigma_prior, p.lengthscale_prior),
     :gp => (p, params) -> GP(p.lengthscale_prior, p.sigma_prior, string(get(params, :kernel, "se"))),
     :rff => (p, params) -> RFF(p.lengthscale_prior, p.sigma_prior, get(params, :n_features, 20), string(get(params, :kernel, "se"))),
     :fft => (p, params) -> FFT(p.sigma_prior, get(params, :nbins, 20), string(get(params, :kernel, "se")), p.lengthscale_prior),
@@ -584,6 +590,12 @@ function bstm_Likelihood(family_input, y_obs; sigma_y=0.0, weight=1.0, phi_zi=-I
 
     return bstm_Likelihood(fam, y_obs, z_trait, c_trait, weight, phi_zi, r_nb, sigma_y, trial, yL_val, yU_val, h_val, extra_params)
 end
+
+# v1.0.1 (2026-06-29 17:16:00)
+# Purpose: Returns a `Distributions.jl` object for a given model family and parameters.
+# Inputs: family_type, d (likelihood struct), eta (linear predictor), sig (scale/noise).
+# Outputs: A concrete distribution object (e.g., `Poisson`, `Normal`).
+
 
 function get_dist_ref(::PoissonFamily, d, eta, sig); return Poisson(clamp(exp(eta), 1e-9, 1e9)); end
 function get_dist_ref(::GaussianFamily, d, eta, sig); return Normal(eta, max(sig, 1e-9)); end
@@ -969,26 +981,29 @@ function rff_map(coords, W, b)
 end
  
 
-function generate_informed_rff_params(coords, M_rff)
-    # v1.0.1 (2026-06-29 16:13:05)
+function generate_informed_rff_params(coords, M_rff; kernel_name="se", nu=nothing, lengthscale_mult=0.5)
+    # v1.0.2 (2026-06-29 18:10:00)
     # Purpose: Generates RFF parameters (W, b) with a lengthscale informed by the input data's standard deviation.
     # Inputs: coords (matrix or vector of tuples), M_rff (number of features).
+    #         kernel_name - The kernel to use for the spectral density.
+    #         nu - Smoothness parameter for Matern kernels.
+    #         lengthscale_mult - Multiplier for the informed lengthscale.
     # Outputs: A tuple (W, b) of RFF parameters.
     mat = if coords isa AbstractMatrix && eltype(coords) <: Real
         Matrix{Float64}(coords)
     elseif coords isa AbstractVector && eltype(coords) <: Tuple
         reduce(hcat, [[Float64(p[1]), Float64(p[2])] for p in coords])'
     else
-        collect(Matrix{Float64}(reduce(hcat, collect.(coords))'))
+        Matrix{Float64}(reduce(hcat, collect.(coords))')
     end
 
     if size(mat, 1) > size(mat, 2) && size(mat, 2) <= 3
-        mat = collect(mat')
+        mat = mat'
     end
 
     d = size(mat, 1)
     
-    coord_scales = std(mat, dims=2) .+ 1e-6
+    coord_scales = vec(std(mat, dims=2)) .+ 1e-6
 
     informed_ls = mean(coord_scales) * lengthscale_mult
     W = sample_spectral_density(kernel_name, d, M_rff, informed_ls; nu=nu)
@@ -2075,6 +2090,11 @@ end
 
 # Fallback for other manifold types
 function extract_manifold(m_obj::ManifoldModel, chain, M, n_samples, outcomes_N, p_names, spec)
+    # v1.0.1 (2026-06-29 17:16:00)
+    # Purpose: A fallback method for manifold types without a specific extraction rule.
+    # Inputs: m_obj, chain, M, n_samples, outcomes_N, p_names, spec.
+    # Outputs: A NamedTuple containing zero-filled fields to prevent downstream errors.
+
     @warn "No specific `extract_manifold` method for $(typeof(m_obj)). Returning zero matrix."
     zero_field = [zeros(Float64, M.y_N, n_samples) for _ in 1:outcomes_N]
     return (structured=zero_field, noisy=zero_field)
@@ -2629,10 +2649,11 @@ function process_intercept_module!(opt_dict, mod_data, registries, hyperpriors)
 end
 
 function process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
-    # v1.0.1 (2026-06-29 16:13:05)
-    # Purpose: Processes the `spatial()` module to extract the spatial index and adjacency matrix.
+    # v1.0.2 (2026-06-29 18:10:00)
+    # Purpose: Processes the `spatial()` module to extract the spatial index and adjacency matrix,
+    #          and to prepare coordinates for continuous spatial models.
     # Inputs: opt_dict, mod_data, registries, hyperpriors.
-    # Outputs: Modifies opt_dict in place.
+    # Outputs: Modifies opt_dict and mod_data in place.
     data = opt_dict[:data]
 
     if !isempty(mod_data[:variables])
@@ -2649,6 +2670,33 @@ function process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
  
     if haskey(mod_data[:params], :W)
         opt_dict[:W] = mod_data[:params][:W]
+    end
+
+    model_name = string(get(mod_data[:params], :model, "none"))
+    if model_name in ["gp", "fitc", "svgp", "nystrom", "rff", "spde"]
+        if haskey(opt_dict, :s_coord)
+            s_N = get(opt_dict, :s_N, 0)
+            if s_N > 0
+                # Need unique coordinates per spatial unit
+                df_coords = DataFrame(s_idx=opt_dict[:s_idx], s_x=opt_dict[:s_x], s_y=opt_dict[:s_y])
+                unique_coords_df = combine(groupby(df_coords, :s_idx), :s_x => first => :s_x, :s_y => first => :s_y)
+                sort!(unique_coords_df, :s_idx)
+                if nrow(unique_coords_df) == s_N
+                    mod_data[:params][:coords] = Matrix(unique_coords_df[!, [:s_x, :s_y]])
+                else
+                     @warn "Could not determine unique coordinates for spatial GP. Number of unique coordinates does not match s_N."
+                end
+            end
+        elseif haskey(opt_dict, :centroids)
+            s_N = get(opt_dict, :s_N, 0)
+            if s_N > 0 && length(opt_dict[:centroids]) == s_N
+                mod_data[:params][:coords] = reduce(hcat, [collect(c) for c in opt_dict[:centroids]])'
+            else
+                @warn "Centroids provided but length does not match s_N. Cannot use for spatial GP."
+            end
+        else
+            @warn "Spatial GP model specified, but no coordinates (`s_x`, `s_y` in data or `centroids` kwarg) provided."
+        end
     end
 end
 
@@ -3150,14 +3198,13 @@ function create_prediction_surface(
     covariate_vars::Vector{Symbol}; 
     iterations::Int = 3
 )
-    # # 1. Grid Construction
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A utility function that creates a prediction surface (a full spatiotemporal grid)
-              and imputes missing covariate values using an iterative spatiotemporal neighborhood
-              averaging method.
-    """
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: A utility function that creates a prediction surface (a full spatiotemporal grid)
+    #          and imputes missing covariate values using an iterative spatiotemporal neighborhood
+    #          averaging method.
+    # Inputs: data_df, au_obj, tu_obj, covariate_vars, iterations.
+    # Outputs: A DataFrame representing the complete prediction surface with imputed covariates.
+
     # # 1. Grid Construction
     # Establishing a full Cartesian product of spatial centroids and temporal slices
     s_N = length(au_obj.centroids)
@@ -3273,13 +3320,12 @@ end
 
 
 function convert_advi_to_reconstruct_format(msol, model::DynamicPPL.Model, n_samples::Int=500)
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A utility to convert the output of a `Turing.jl` ADVI (variational inference) run
-              into a format compatible with the standard post-processing engine. It samples from
-              the variational posterior and formats the output as a `FlexiChain`.
-    """
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: A utility to convert the output of a `Turing.jl` ADVI (variational inference) run
+    #          into a format compatible with the standard post-processing engine. It samples from
+    #          the variational posterior and formats the output as a `FlexiChain`.
+    # Inputs: msol (VI result), model, n_samples.
+    # Outputs: A NamedTuple containing the FlexiChain and the raw reconstructed samples.
     # Sample from the variational distribution
     samples_vec = rand(msol, n_samples)
 
@@ -3336,15 +3382,14 @@ end
 
 
 function convert_optim_to_reconstruct_format(optim_result, model, n_samples::Int=500; use_hessian=true, external_hessian=nothing)
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A utility to convert a point estimate from an optimization routine (e.g., MAP, MLE)
-              into a sample-based format for post-processing. It uses a Laplace approximation
-              (sampling from a multivariate normal centered at the mode) if the Hessian is available.
-              If a Hessian is not available, it adds a small amount of Gaussian noise to the point
-              estimate to create a sample distribution.
-    """
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: A utility to convert a point estimate from an optimization routine (e.g., MAP, MLE)
+    #          into a sample-based format for post-processing. It uses a Laplace approximation
+    #          (sampling from a multivariate normal centered at the mode) if the Hessian is available.
+    #          If a Hessian is not available, it adds a small amount of Gaussian noise to the point
+    #          estimate to create a sample distribution.
+    # Inputs: optim_result, model, n_samples, and optional parameters.
+    # Outputs: A NamedTuple containing the FlexiChain and the raw reconstructed samples.
     point_est_constrained = optim_result.params # This is the named tuple of constrained parameters
 
     reconstruct_samples_namedtuple = [] # Store NamedTuple for easier handling
@@ -3416,8 +3461,8 @@ function convert_optim_to_reconstruct_format(optim_result, model, n_samples::Int
                         sample_params_dict[base_sym] = val + randn() * 1e-4
                     end
                 else
-                    sorted_keys = sort(collect(col_keys), by = k -> begin
-                        m_idx = match(r"\\[(\\d+)\\]", string(k))
+                sorted_keys = sort(collect(col_keys), by = k -> begin # Corrected regex
+                    m_idx = match(r"\[(\d+)\]", string(k))
                         m_idx !== nothing ? parse(Int, m_idx.captures[1]) : 0
                     end)
                     sample_params_dict[base_sym] = [point_est_constrained[k] + randn() * 1e-4 for k in sorted_keys]
@@ -3453,20 +3498,12 @@ end
 
     
 function generate_sim_data(s_N=25, t_N=10; rndseed=42)
-    """
-    BSTM Utility v1.0.3
-    Timestamp: 2026-06-26 13:01:15
-    Synopsis: A utility function for generating a standardized simulated spatiotemporal dataset with
-              known underlying trends, seasonal effects, and covariate relationships.
-    Rationale for v1.0.3:
-        - Corrected an `ArgumentError` in the `DataFrame` constructor. The `s_coord` column was
-          being created as a matrix, which is not a valid column type. It has been corrected to
-          be a vector of coordinate tuples.
-        - Corrected a dimension mismatch where `cluster_assignments` had length `s_N` instead of `n_total`.
-        - Made index generation for `s_clusters` and `reg` robust to cases where the number of
-          units is not perfectly divisible by the number of categories.
-        - Removed all `local` keyword usage to align with project coding standards.
-    """
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: A utility function for generating a standardized simulated spatiotemporal dataset with
+    #          known underlying trends, seasonal effects, and covariate relationships.
+    # Inputs: s_N (number of spatial units), t_N (number of time units), rndseed.
+    # Outputs: A NamedTuple containing the simulated DataFrame and metadata.
+    # Note: This function is crucial for testing and validating model implementations.
     Random.seed!(rndseed)
     n_total = s_N * t_N
 
@@ -3563,13 +3600,12 @@ end
 
 
 function scottish_lip_cancer_data_spacetime(n_years::Int=20, spatial_expansion::Float64=1.5, temporal_expansion::Float64=1.5; rndseed::Int=42, recreate::Bool=false)
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A data factory that generates a spatiotemporal version of the classic Scottish Lip
-              Cancer dataset. It also creates an expanded "nested" dataset for testing
-              multi-fidelity models.
-    """
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: A data factory that generates a spatiotemporal version of the classic Scottish Lip
+    #          Cancer dataset. It also creates an expanded "nested" dataset for testing
+    #          multi-fidelity models.
+    # Inputs: n_years, spatial_expansion, temporal_expansion, rndseed, recreate.
+    # Outputs: A tuple containing the primary and nested datasets.
     # BSTM Standard Data Factory v28.3.0
     # Timestamp: 2025-12-01 15:00:00
     # Rationale: Resolving symmetry errors in adjacency matrix construction and scoping errors for derived variables.
@@ -3757,8 +3793,6 @@ function precompute_nystrom_projection(spatial_coords, inducing_points, kernel_f
     # 3. Projection: K_nm * inv(K_mm)
     # use the backslash operator for better numerical stability than direct inversion
     K_nystrom_proj = K_nm / K_mm_stable
-    
-    # println("Generated projection matrix of size: ", size(K_nystrom_proj))
     return K_nystrom_proj
 end
 
@@ -3767,7 +3801,13 @@ end
 # --- Optimized Householder PCA Helper Functions ---
 
 function householder_to_eigenvector(v_mat::AbstractMatrix{T}, nU, n_factors) where {T}
-    # Initializes the Identity matrix to be transformed
+    # v1.0.1 (2026-06-29 17:16:00)
+    # Purpose: Constructs an orthonormal loadings matrix (eigenvectors) from a matrix of
+    #          Householder reflector vectors.
+    # Inputs: v_mat (matrix of reflector vectors), nU (number of variables), n_factors (number of factors).
+    # Outputs: An orthonormal loadings matrix [nU x n_factors].
+    # Note: Uses an efficient O(K*N^2) update.
+
     U = Matrix{T}(I, nU, nU)
 
     for k in 1:n_factors
@@ -3793,6 +3833,12 @@ function householder_to_eigenvector(v_mat::AbstractMatrix{T}, nU, n_factors) whe
 end
 
 function householder_transform(v, nU, n_factors, ltri_indices, pca_sd, pdef_sd, noise)
+    # v1.0.1 (2026-06-29 17:16:00)
+    # Purpose: Performs the full Householder transformation to reconstruct the covariance matrix
+    #          for a Bayesian PCA model.
+    # Inputs: v (vector of free parameters), nU, n_factors, ltri_indices, pca_sd, pdef_sd, noise.
+    # Outputs: A tuple containing the reconstructed covariance matrix, PCA standard deviations, and loadings matrix.
+
     T = eltype(v)
     v_mat = zeros(T, nU, n_factors)
     v_mat[ltri_indices] .= v
@@ -3814,22 +3860,13 @@ end
 
 
 function eigenvector_to_householder(U_in::AbstractMatrix{T}, n_factors) where {T}
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal helper for PCA-based models that performs the inverse operation:
-              extracting Householder reflector vectors from a given orthonormal loadings matrix.
-              This is useful for initializing a Bayesian PCA model from a frequentist result.
-    """
-# --- Optimal Vector Extraction (Orthonormal to Householder) ---
-
-# eigenvector_to_householder(U, n_factors)
-#
-# Description:
-#   Extracts the Householder reflector vectors (v) from an orthonormal loadings matrix U.
-#   This allows for initializing the Bayesian model from a frequentist PCA result.
-#
-# Complexity: O(K * N^2)
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: An internal helper for PCA-based models that performs the inverse operation:
+    #          extracting Householder reflector vectors from a given orthonormal loadings matrix.
+    #          This is useful for initializing a Bayesian PCA model from a frequentist result.
+    # Inputs: U_in (orthonormal loadings matrix), n_factors.
+    # Outputs: A matrix of Householder reflector vectors.
+    # Note: Complexity is O(K * N^2).
 
     nU = size(U_in, 1)
     # work on a copy to avoid modifying the input
@@ -4311,11 +4348,12 @@ end
 
 
 function build_structure_template(type::Symbol, n::Int; scale=true, coords=nothing, W=nothing, bipartite_adj=nothing)
-    # Consolidated Structural Factory [v14.6.0 - BSTM v06.1 Unified Registry]
-    # Rationale: This function provides the definitive factory for precision matrix templates
-    # across all manifold domains. It standardizes scaling and topological initialization.
-    # Audit: Fixed SPDE scaling and DAG operator registration; added TPS 2D routing.
-
+    # v1.0.1 (2026-06-29 17:16:00)
+    # Purpose: A factory for creating precision matrix templates for various GMRF and other structured models.
+    #          It handles different manifold types (e.g., ICAR, RW2, SPDE) and computes scaling factors.
+    # Inputs: type (Symbol), n (size), and optional parameters like W (adjacency matrix).
+    # Outputs: A NamedTuple containing the precision matrix template and a scaling factor.
+    
     Q = Matrix{Float64}(undef, 0, 0)
     sf = 1.0
 
@@ -4544,8 +4582,6 @@ function build_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=:se
             psd[i] = (sig^2) * exp(-dist / 0.01)
         end
 
-    # #
-    # 3. Wavelet Domain Precision Mapping
     # Rationale: For wavelet kernels, the precision is defined by the energy distribution across scales.
     elseif kernel_type == :wavelet
         # In the wavelet domain, we define eigenvalues based on decomposition levels.
@@ -4560,24 +4596,16 @@ function build_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=:se
             wavelet_eigenvalues[idx_start:idx_end] .= energy
         end
         
-        # Map wavelet variances to real-space precision weights via inverse transform
-        # This constructs the first row of the operator assuming circulant-like structure
         precision_eigenvalues = 1.0 ./ (wavelet_eigenvalues .+ noise_floor)
         
-        # Standardize return to first_row_q for sparse construction
-        # Note: True wavelets are non-circulant; this is the stationary wavelet approximation.
         first_row_q = real(FFTW.ifft(precision_eigenvalues))
     end
 
-    # #
-    # 4. Precision Mapping via IFFT (Stationary Path)
     if kernel_type != :wavelet
         precision_eigenvalues = 1.0 ./ (psd .+ noise_floor)
         first_row_q = real(FFTW.ifft(precision_eigenvalues))
     end
 
-    # #
-    # 5. Sparse Matrix Construction
     Q_rows = Int[]
     Q_cols = Int[]
     Q_vals = Float64[]
@@ -4667,13 +4695,12 @@ end
 
 
 function wendland_taper(d::AbstractVector, range::Real)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-27 16:00:00
-    Synopsis: Computes a Wendland compactly supported correlation function. This is used as a
-              taper to enforce compact support on a covariance function, which helps to
-              reduce spectral leakage in FFT-based methods.
-    """
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: Computes a Wendland compactly supported correlation function. This is used as a
+    #          taper to enforce compact support on a covariance function, which helps to
+    #          reduce spectral leakage in FFT-based methods.
+    # Inputs: d (distance vector), range (the range beyond which the function is zero).
+    # Outputs: A vector of taper weights.
     h = d ./ range
     taper = zeros(eltype(h), size(h))
     mask = h .< 1.0
@@ -4684,22 +4711,13 @@ end
 
 
 function estimate_spectral_precision(n::Int64, ls::Real, sig::Real; kernel_type=:se, periodicity=nothing, noise_floor=1e-6, wavelet_levels=3, taper_range=nothing, lowpass_range=nothing)
-    """
-    BSTM Internal Utility v2.1.0
-    Timestamp: 2026-06-27 16:30:00
-    Synopsis: An internal utility that constructs a sparse precision matrix for a stationary process
-              by computing the kernel's power spectral density (PSD) and using the Wiener-Khinchin theorem.
-    Rationale for v2.1.0:
-        - Added `taper_range` and `lowpass_range` parameters to enable spectral filtering.
-        - If tapering or low-pass filtering is requested, the analytical Power Spectral Density (PSD)
-          is transformed to the spatial domain (covariance function), multiplied by the taper/filter
-          functions, and then transformed back to the frequency domain to get the modified PSD.
-        - This allows for controlling spectral leakage and smoothing the frequency response of the prior,
-          addressing the "impedance" issue of finite-length FFTs.
-        - Added explicit centering of the power spectrum by setting the DC component (power at zero
-          frequency) to zero. This removes the influence of the process's mean from the covariance
-          estimate, ensuring the focus is purely on the covariance structure.
-    """
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: Constructs a sparse precision matrix for a stationary process by computing the
+    #          kernel's power spectral density (PSD), applying optional spectral filters,
+    #          and using the Wiener-Khinchin theorem.
+    # Inputs: n, ls, sig, and optional parameters for kernel type, tapering, and filtering.
+    # Outputs: A NamedTuple containing the sparse precision matrix, scaling factor, PSD, and weights.
+
     # #
     # Frequency Grid Definition
     # Establish discrete Fourier modes for a signal of length n
@@ -4856,12 +4874,13 @@ function recompose_precision(
     flow_direction=:bidirectional
 )
     """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal factory function that constructs a final precision matrix from a
-              template, a scale parameter (`param_val`), and other manifold-specific parameters
-              (e.g., correlation `rho`). This function is central to defining GMRF priors within
-              the model.
+    v1.0.1 (2026-06-29 17:16:00)
+    Purpose: An internal factory function that constructs a final precision matrix from a
+             template, a scale parameter (`param_val`), and other manifold-specific parameters
+             (e.g., correlation `rho`). This function is central to defining GMRF priors within
+             the model.
+    Inputs: m_type, template_s, param_val, and other optional parameters.
+    Outputs: A symmetric precision matrix.
     """
     # Rationale: Standardizing the inversion of the variance scale for precision mapping.
     # Requirement: Avoid ternary if/else during sampling to maintain AD stability.
@@ -4953,6 +4972,12 @@ end
 
 # POSITIONAL OVERLOAD: Dispatches from bstm_univariate metadata objects
 function recompose_precision(manifold_metadata::NamedTuple, param_val::Real; template_t=nothing, extra_param=nothing, noise=1e-4)
+    # v1.0.1 (2026-06-29 17:16:00)
+    # Purpose: An overloaded method for `recompose_precision` that dispatches based on a `NamedTuple`
+    #          containing manifold metadata.
+    # Inputs: manifold_metadata, param_val, and other optional parameters.
+    # Outputs: A symmetric precision matrix.
+
     return recompose_precision(
         Symbol(manifold_metadata.model_type), 
         manifold_metadata.Q_template, 
@@ -4966,6 +4991,12 @@ end
 # # Precision Recomposition Factory (Recursive Algebraic Dispatch)
 # This function now accepts Manifold structs or algebraic operator results.
 function recompose_precision(manifold_node::Any, M, param_sig::Real; noise=1e-4)
+    # v1.0.1 (2026-06-29 17:16:00)
+    # Purpose: A recursive version of `recompose_precision` that handles algebraic compositions
+    #          of manifolds (e.g., Kronecker products, direct sums).
+    # Inputs: manifold_node (a Manifold struct or ComposedManifold), M (model config), param_sig (scale).
+    # Outputs: A precision matrix or a structure representing the composed precision.
+
     # # Base Case: Atomic Manifold Structs
     if manifold_node isa Manifold
         m_type = manifold_type(manifold_node)
@@ -5031,12 +5062,11 @@ end
 
 
 function parse_variable_and_transforms(var_str::AbstractString)
-    """
-    BSTM Internal Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An internal helper for the formula parser that separates a variable name from any
-              piped transformation functions (e.g., "x |> log").
-    """
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: An internal helper for the formula parser that separates a variable name from any
+    #          piped transformation functions (e.g., "x |> log").
+    # Inputs: var_str (string).
+    # Outputs: A tuple containing the variable name and a vector of transform names.
     parts = Base.split(var_str, "|>")
     var_name = strip(parts[1])
     transforms = [strip(p) for p in parts[2:end]]
@@ -5215,11 +5245,13 @@ end
 
 
 function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, kwargs...)
-    # BSTM Smooth Basis Factory v2.3.0
-    # Timestamp: 2026-06-27 22:30:00
-    # Synopsis: A factory function that generates a 2D basis matrix for various smoothers.
-    # Rationale for v2.3.0:
-    #     - Added support for 'linear', 'invdist', and 'kriging' basis types in 2D.
+    # v1.0.1 (2026-06-29 17:16:00)
+    # Purpose: A factory function that generates a 2D basis matrix for various smoothers
+    #          (e.g., splines, RFF, wavelets) for 2D coordinates.
+    # Inputs: type (string), coords (N_obs x 2 matrix), nbins, and optional parameters.
+    # Outputs: A basis matrix [N_obs x nbins].
+    # Note: Used for `smooth(x, y)` terms.
+
 
     n_obs = size(coords, 1)
     
@@ -5378,11 +5410,13 @@ end
 
 
 function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, kwargs...)
-    # BSTM Smooth Basis Factory v2.3.0
-    # Timestamp: 2026-06-27 22:30:00
-    # Synopsis: A factory function that generates a 3D basis matrix for various smoothers.
-    # Rationale for v2.3.0:
-    #     - Added support for 'linear', 'invdist', and 'kriging' basis types in 3D.
+    # v1.0.1 (2026-06-29 17:16:00)
+    # Purpose: A factory function that generates a 3D basis matrix for various smoothers
+    #          (e.g., splines, RFF, wavelets) for 3D coordinates.
+    # Inputs: type (string), coords (N_obs x 3 matrix), nbins, and optional parameters.
+    # Outputs: A basis matrix [N_obs x nbins].
+    # Note: Used for `smooth(x, y, z)` terms.
+
 
     n_obs = size(coords, 1)
 
@@ -5529,11 +5563,13 @@ end
 
 
 function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, kwargs...)
-    # BSTM Smooth Basis Factory v2.3.0
-    # Timestamp: 2026-06-27 22:30:00
-    # Synopsis: A factory function that generates a 4D basis matrix for various smoothers.
-    # Rationale for v2.3.0:
-    #     - Added support for 'linear', 'invdist', and 'kriging' basis types in 4D.
+    # v1.0.1 (2026-06-29 17:16:00)
+    # Purpose: A factory function that generates a 4D basis matrix for various smoothers
+    #          (e.g., splines, RFF, wavelets) for 4D coordinates.
+    # Inputs: type (string), coords (N_obs x 4 matrix), nbins, and optional parameters.
+    # Outputs: A basis matrix [N_obs x nbins].
+    # Note: Used for `smooth(v, x, y, z)` terms.
+
 
     n_obs = size(coords, 1)
 
@@ -5692,13 +5728,12 @@ end
 
 
 function get_inits(model::DynamicPPL.Model; refine="map", n_samples=100, optimizer=LBFGS(), max_iters=500, maxtime=60.0, noise=nothing)
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A utility for generating sensible initial values for MCMC sampling. It uses either a
-              heuristic based on prior samples or refines these initial values via Maximum A
-              Posteriori (MAP) estimation to find a good starting point for the sampler.
-    """
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: A utility for generating sensible initial values for MCMC sampling. It uses either a
+    #          heuristic based on prior samples or refines these initial values via Maximum A
+    #          Posteriori (MAP) estimation to find a good starting point for the sampler.
+    # Inputs: model, and optional parameters for refinement method and optimization.
+    # Outputs: A `DynamicPPL.InitFromParams` object containing the initial values.
     println("--- Generating Initial Parameters ---")
 
     # 1. Heuristic Initialization from Prior Samples
@@ -5878,16 +5913,12 @@ end
 # 1. PSIS-LOO Implementation for BSTM
 # Rationale: Standardizing the extraction of log-likelihood matrices to provide 
 # Expected Log Pointwise Predictive Density (ELPD) estimates.
-function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
-"""
-BSTM Utility v1.0.0
-Timestamp: 2026-06-26 10:22:15
-Synopsis: A utility for performing Leave-One-Out Cross-Validation using Pareto Smoothed Importance
-          Sampling (PSIS-LOO) to assess a model's out-of-sample predictive accuracy.
-Description: Calculates the Leave-One-Out Cross-Validation metrics for BSTM manifolds.
-Rationale: Standardizing the extraction of log-likelihood matrices to provide ELPD estimates.
-"""
-
+function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)    
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: A utility for performing Leave-One-Out Cross-Validation using Pareto Smoothed Importance
+    #          Sampling (PSIS-LOO) to assess a model's out-of-sample predictive accuracy.
+    # Inputs: model_obj, chain, alpha.
+    # Outputs: A NamedTuple containing the LOO object, metrics, log-likelihood matrix, and Pareto k values.
     println("--- Starting BSTM PSIS-LOO Audit v19.38.6 ---")
 
     # # 1. Metadata and Architecture Extraction
@@ -5958,14 +5989,13 @@ end
 
 
 # 2. Bayes Factor Suite (Manifold Comparison)
-function compare_manifolds(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: A utility for formal model comparison between two fitted `bstm` models. It uses
-              their PSIS-LOO results to compute the difference in Expected Log Pointwise
-              Predictive Density (ELPD) and provides a statistical basis for model selection.
-    """
+function compare_manifolds(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])    
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: A utility for formal model comparison between two fitted `bstm` models. It uses
+    #          their PSIS-LOO results to compute the difference in Expected Log Pointwise
+    #          Predictive Density (ELPD) and provides a statistical basis for model selection.
+    # Inputs: loo_a_report, loo_b_report, model_names.
+    # Outputs: A NamedTuple containing the comparison table, ELPD difference, and LOO objects.
     # Description: Performs formal model selection between two BSTM manifold candidates.
     # Rationale: Standardizing the assessment of ELPD differences and complexity trade-offs.
     # Requirements: Absolute parity with the PSIS-LOO metrics.
@@ -6042,14 +6072,13 @@ function bstm_cv_orchestrator(
     sampler = NUTS(500, 0.65), 
     alpha = 0.05, 
     kwargs...
-)
-    """
-    BSTM Utility v1.0.0
-    Timestamp: 2026-06-26 10:23:44
-    Synopsis: An orchestration utility for performing cross-validation. It supports standard
-              k-fold and Leave-One-Location-Out (LOLO) strategies to assess model performance on
-              held-out data.
-    """
+)    
+    # v1.0.1 (2026-06-29 17:26:00)
+    # Purpose: An orchestration utility for performing cross-validation. It supports standard
+    #          k-fold and Leave-One-Location-Out (LOLO) strategies to assess model performance on
+    #          held-out data.
+    # Inputs: formula, data, and optional parameters for CV method, sampler, etc.
+    # Outputs: A NamedTuple containing fold results and summary metrics.
     # # 1. Metadata Discovery and Outcome Resolution
     # The formula is decomposed to identify the primary response variable and module requirements.
     meta_discovery = decompose_bstm_formula(formula)
@@ -6167,10 +6196,10 @@ end
 
 
 function bstm_config(formula::String, data::DataFrame; kwargs...)
-    # v1.0.1 (2026-06-29 16:13:05)
+    # v1.0.3 (2026-06-29 18:10:00)
     # Purpose: Parses the bstm formula and data to create a model configuration NamedTuple.
     # Inputs: formula::String, data::DataFrame, and other keyword arguments.
-    # Outputs: A NamedTuple containing the full model specification.
+    # Outputs: A NamedTuple containing the full model specification.    
     metadata = decompose_bstm_formula(formula)
 
     opt_dict = Dict{Symbol, Any}(kwargs)
@@ -6179,6 +6208,14 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
     opt_dict[:y_N] = size(data, 1)
     opt_dict[:add_intercept] = metadata.has_intercept
 
+    # Pre-process common coordinate columns
+    if haskey(data, :s_x) && haskey(data, :s_y)
+        opt_dict[:s_x] = data.s_x
+        opt_dict[:s_y] = data.s_y
+        opt_dict[:s_coord] = hcat(data.s_x, data.s_y)
+    end
+
+    # Initialize default model components
     opt_dict[:model_space] = get(opt_dict, :model_space, "none")
     opt_dict[:model_time] = get(opt_dict, :model_time, "none")
     opt_dict[:model_season] = get(opt_dict, :model_season, "none")
@@ -6191,6 +6228,7 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
     basis_matrices_registry = Dict{Symbol, Any}()
     manifolds_registry = []
 
+    # Process modules to populate opt_dict and registries
     for (key_str, mod_data) in metadata.modules
         m_type = mod_data[:type]
 
@@ -6199,33 +6237,56 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
             processor_func(opt_dict, mod_data, (basis_matrices_registry=basis_matrices_registry, manifolds_registry=manifolds_registry), hyperprior_registry)
         end
 
-        if m_type in [:interaction_composition, :observationprocess, :intercept, :nested]
+        # Skip modules that don't create a primary manifold in the main registry
+        if m_type in [:interaction_composition, :observationprocess, :intercept, :nested, :fixed]
             continue
         end
 
         manifold_obj = resolve_technical_primitive(mod_data, opt_dict, hyperprior_registry, :pcpriors)
-        m_meta = build_model(manifold_obj, opt_dict)
 
-        spec_params = Dict{Symbol, Any}(pairs(m_meta.hyper))
-
+        # Determine n for build_structure_template
+        n_units = 0
         if m_type == :spatial
-            opt_dict[:s_Q] = m_meta.Q_template
-            opt_dict[:s_N] = size(m_meta.Q_template, 1)
-            opt_dict[:N_areas] = size(m_meta.Q_template, 1)
+            n_units = get(opt_dict, :s_N, 0)
         elseif m_type == :temporal
-            opt_dict[:t_Q] = m_meta.Q_template
-            opt_dict[:u_N] = size(m_meta.Q_template, 1)
+            n_units = get(opt_dict, :t_N, 0)
+        elseif m_type == :seasonal
+            n_units = get(opt_dict, :u_N, 0)
+        elseif m_type == :smooth
+            reg_key = Symbol(join(mod_data[:variables], "_"))
+            if haskey(basis_matrices_registry, reg_key)
+                n_units = size(basis_matrices_registry[reg_key], 2) # number of basis functions
+            end
+        elseif m_type == :mixed
+             n_units = mod_data[:params][:n_cat]
         end
 
-        if m_type == :mixed
-            mixed_str = join(mod_data[:variables], ",")
-            m_match = match(r"(.+?)\s*\|\s*(.+)", mixed_str)
+        if n_units == 0 && !(manifold_obj isa GP) # GP doesn't need pre-set n
+             @warn "Could not determine size for manifold '$key_str'. Skipping."
+             continue
+        end
+
+        # Get the template matrix and scaling factor
+        template_info = build_structure_template(Symbol(lowercase(string(typeof(manifold_obj)))), n_units; W=get(opt_dict, :W, nothing))
+
+        spec_params = mod_data[:params]
+        if manifold_obj isa GP
+            if !haskey(spec_params, :coords)
+                # This is for smooth(x,y, model='gp') where coords are not set by process_spatial_module
+                spec_params[:coords] = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
+            end
             spec_params[:coords] = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
         end
 
         spec = (
             key = Symbol(key_str),
-            domain = m_type, 
+            domain = m_type,
+            var = isempty(mod_data[:variables]) ? :none : Symbol(mod_data[:variables][1]),
+            manifold_obj = manifold_obj,
+            Q_template = template_info.matrix,
+            scaling_factor = template_info.scaling_factor,
+            params = spec_params
+        )
         push!(manifolds_registry, spec)
     end
 
@@ -6233,24 +6294,48 @@ function bstm_config(formula::String, data::DataFrame; kwargs...)
     opt_dict[:basis_matrices] = basis_matrices_registry
     opt_dict[:formula] = formula
 
-    fixed_effects_formula_part = join(metadata.fixed_effects, " + ")
-    add_intercept_to_matrix = get(opt_dict, :add_intercept, false) && !haskey(opt_dict, :intercept_prior)
+    # Post-module processing for features requiring computed components
+    if get(opt_dict, :use_sv, false)
+        if haskey(data, :s_x) && haskey(data, :s_y) && haskey(opt_dict, :t_idx)
+            m_rff_sigma = get(opt_dict, :M_rff_sigma, 20)
+            # Use observation-level coordinates for the volatility surface
+            coords_st = hcat(data.s_x, data.s_y, opt_dict[:t_idx])
+            W_sigma, b_sigma = generate_informed_rff_params(coords_st, m_rff_sigma)
+            opt_dict[:vol_proj] = (coords_st * W_sigma) .+ b_sigma'
+        else
+             @warn "Stochastic volatility requires spatial coordinates (:s_x, :s_y) in `data` and a temporal index. SV disabled."
+             opt_dict[:use_sv] = false
+        end
+    end
 
+    # Process fixed effects
+    fixed_effects_formula_part = join(metadata.fixed_effects, " + ")
+    add_intercept_to_formula = get(opt_dict, :add_intercept, false) && !any(m -> m[:type] == :intercept, values(metadata.modules))
+
+    if add_intercept_to_formula
+        fixed_effects_formula_part = isempty(strip(fixed_effects_formula_part)) ? "1" : "1 + " * fixed_effects_formula_part
+    end
+
+    if !isempty(strip(fixed_effects_formula_part))
         opt_dict[:Xfixed] = create_fixed_design(fixed_effects_formula_part, data; contrasts=get(opt_dict, :contrasts, Dict()))
         opt_dict[:Xfixed_N] = size(opt_dict[:Xfixed], 2)
     else
-        opt_dict[:Xfixed] = NamedArray(zeros(size(data, 1), 0))
+        opt_dict[:Xfixed] = NamedArray(zeros(size(data, 1), 0), (1:size(data,1), Symbol[]))
         opt_dict[:Xfixed_N] = 0
     end
 
+    # Process outcomes
+    opt_dict[:outcomes_N] = length(metadata.outcomes)
     if length(metadata.outcomes) == 1
         opt_dict[:y_obs] = data[!, metadata.outcomes[1]]
-        opt_dict[:model_arch] = "univariate"
+        opt_dict[:model_arch] = get(opt_dict, :model_arch, "univariate") # Respect user override
     else
         opt_dict[:y_obs] = Matrix(data[!, metadata.outcomes])
         opt_dict[:model_arch] = "multivariate"
+        opt_dict[:outcomes_N] = length(metadata.outcomes)
     end
 
+    # Set defaults for observation-level parameters if not provided
     if !haskey(opt_dict, :weights); opt_dict[:weights] = ones(Float64, opt_dict[:y_N]); end
     if !haskey(opt_dict, :trials); opt_dict[:trials] = ones(Int, opt_dict[:y_N]); end
 
