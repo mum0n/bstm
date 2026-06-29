@@ -6146,8 +6146,7 @@ end
 
 
 
-
-function get_optimal_sampler(model_obj::DynamicPPL.Model; target_acceptance=0.65, adaptation_steps=100, n_particles=20)
+function get_optimal_sampler(model_obj::DynamicPPL.Model; sampler_choice=:auto, target_acceptance=0.65, adaptation_steps=100, n_particles=20, hmc_leapfrog_steps=10)
     # v1.0.1 (2026-06-29 16:13:05)
     # Purpose: Automatically selects an optimal MCMC sampler (or a composite Gibbs sampler).
     # Inputs: model_obj, target_acceptance, adaptation_steps, n_particles.
@@ -6163,37 +6162,82 @@ function get_optimal_sampler(model_obj::DynamicPPL.Model; target_acceptance=0.65
     vns = DynamicPPL.keys(vi)
     
     discrete_params = Symbol[]
+    all_gaussian_priors = true
+    num_continuous_params = 0
 
     for vn in vns
-        # Check for metadata to ensure the parameter has a defined distribution.
-        if haskey(vi.metadata, vn) && hasproperty(vi.metadata[vn], :dists) && !isempty(vi.metadata[vn].dists)
-            dist = vi.metadata[vn].dists[1]
-            sym = Symbol(vn)
-            
-            # Categorize the parameter based on the support of its prior distribution.
+        try
+            # Attempt to get the distribution for the variable using the modern API.
+            dist = DynamicPPL.getdist(vi, vn)
+            sym = Symbol(vn) # Convert VarName to Symbol
+
+            # Check if the distribution's support is discrete.
             if Distributions.value_support(typeof(dist)) == Distributions.Discrete
                 if !(sym in discrete_params)
                     push!(discrete_params, sym)
                 end
+            else # Continuous parameter
+                num_continuous_params += 1
+                # Check if the prior is a Gaussian type. If not, set the flag to false.
+                if !(dist isa Normal || dist isa MvNormal || dist isa Truncated{<:Normal})
+                    all_gaussian_priors = false
+                end
+            end
+        catch e
+            # Not all variables in VarInfo have a corresponding distribution
+            # (e.g., derived quantities). `getdist` will throw an error for these,
+            # which can be safely ignored.
+            if !(e isa KeyError)
+                # rethrow(e) # Optionally rethrow other unexpected errors
+                all_gaussian_priors = false # Assume non-Gaussian if prior is not found
             end
         end
     end
 
     # # 2. Sampler Construction and Dispatch
-    # Based on the presence of discrete parameters, construct the most appropriate sampler.
+    # Based on user choice or an informed automatic selection, construct the most appropriate sampler.
+    
+    local continuous_sampler
+    if sampler_choice == :auto
+        if all_gaussian_priors && num_continuous_params > 0
+            println("Info: All continuous priors appear Gaussian. Selecting ESS for the continuous part.")
+            continuous_sampler = ESS()
+        else
+            println("Info: Model contains non-Gaussian continuous priors or complex structure. Selecting NUTS for the continuous part.")
+            continuous_sampler = NUTS(adaptation_steps, target_acceptance)
+        end
+    elseif sampler_choice == :nuts
+        continuous_sampler = NUTS(adaptation_steps, target_acceptance)
+    elseif sampler_choice == :hmc
+        # HMC is a good alternative but requires manual tuning of leapfrog steps.
+        continuous_sampler = HMC(0.1, hmc_leapfrog_steps) # Default step size 0.1
+    elseif sampler_choice == :mh
+        # Metropolis-Hastings is a gradient-free option, useful for non-differentiable models.
+        continuous_sampler = MH()
+    elseif sampler_choice == :ess
+        # Elliptical Slice Sampling is efficient for models with Gaussian priors.
+        continuous_sampler = ESS()
+    elseif sampler_choice == :slice
+        # Slice sampling is another robust gradient-free method.
+        continuous_sampler = Slice()
+    else
+        @warn "Unknown sampler_choice ':$sampler_choice'. Defaulting to NUTS."
+        continuous_sampler = NUTS(adaptation_steps, target_acceptance)
+    end
+
     if isempty(discrete_params)
-        # If no discrete parameters are found, the entire model is continuous and differentiable.
-        # NUTS is the state-of-the-art sampler for this case.
-        println("Info: No discrete parameters found. Using NUTS sampler.")
-        return NUTS(adaptation_steps, target_acceptance)
+        # If no discrete parameters are found, return the chosen sampler for the continuous space.
+        println("Info: No discrete parameters found. Using sampler: $(nameof(typeof(continuous_sampler))).")
+        return continuous_sampler
     else
         # If discrete parameters exist, a composite Gibbs sampler is required.
         # Particle Gibbs (PG) will handle the discrete parameters.
-        # NUTS will automatically handle all other (continuous) parameters.
-        println("Info: Discrete parameters found: ", discrete_params, ". Using composite Gibbs sampler (PG + NUTS).")
-        return Gibbs(PG(n_particles, discrete_params...), NUTS(adaptation_steps, target_acceptance))
+        # The chosen continuous sampler will handle all other (continuous) parameters.
+        println("Info: Discrete parameters found: ", discrete_params, ". Using composite Gibbs sampler (PG + $(nameof(typeof(continuous_sampler)))).")
+        return Gibbs(PG(n_particles, discrete_params...), continuous_sampler)
     end
 end
+
 
 
 

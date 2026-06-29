@@ -166,14 +166,14 @@ The `bstm` formula language allows you to build complex models by combining modu
 
 ### Common Modules
 
-| Keyword              | Example Usage                                     | Purpose                                                                                                                                         |
-| :---------------------| :--------------------------------------------------| :------------------------------------------------------------------------------------------------------------------------------------------------|
-| `spatial`            | `spatial(s_idx, model='bym2')`                    | Models spatial random effects for discrete areal units.                                                                                         |
-| `temporal`           | `temporal(t_idx, u_idx, model=('ar1', 'cyclic'))` | Models temporal trends and/or seasonal effects.                                                                                                 |
-| `smooth`             | `smooth(x, nbins=20)`                             | Creates a non-linear smooth of a continuous covariate `x`.                                                                                      |
-| `mixed`              | `mixed(1 | group)`                                | Defines a random intercept for each level of the `group` variable.                                                                              |
-| `observationprocess` | `observationprocess(log_offsets=log_offset)`      | Specifies likelihood-level parameters. Options include: `log_offsets`, `weights`, `trials`, `hurdle`, `volatility=true`, `nbins`, `y_L`, `y_U`. |
-| `fixed`              | `x1 + x2`                                         | Standard fixed-effect linear predictors.                                                                                                        |
+| Keyword              | Example Usage                                     | Purpose                                                                                                                                         |                                                                    |
+| :---------------------| :--------------------------------------------------| :------------------------------------------------------------------------------------------------------------------------------------------------| --------------------------------------------------------------------|
+| `spatial`            | `spatial(s_idx, model='bym2')`                    | Models spatial random effects for discrete areal units.                                                                                         |                                                                    |
+| `temporal`           | `temporal(t_idx, u_idx, model=('ar1', 'cyclic'))` | Models temporal trends and/or seasonal effects.                                                                                                 |                                                                    |
+| `smooth`             | `smooth(x, nbins=20)`                             | Creates a non-linear smooth of a continuous covariate `x`.                                                                                      |                                                                    |
+| `mixed`              | `mixed(1                                          | group)`                                                                                                                                         | Defines a random intercept for each level of the `group` variable. |
+| `observationprocess` | `observationprocess(log_offsets=log_offset)`      | Specifies likelihood-level parameters. Options include: `log_offsets`, `weights`, `trials`, `hurdle`, `volatility=true`, `nbins`, `y_L`, `y_U`. |                                                                    |
+| `fixed`              | `x1 + x2`                                         | Standard fixed-effect linear predictors.                                                                                                        |                                                                    |
 
 ### Data Transformations
 
@@ -189,19 +189,19 @@ Use the `|>` operator inside a module to transform data on the fly.
 
 The `model_family` argument in the main `bstm()` call specifies the observation likelihood. It determines the statistical distribution of the outcome variable and the link function used to connect it to the linear predictor `eta`.
 
-| Family             | `model_family` String(s) | Link Function (`eta` to `mu`) | Key Parameters & Priors | Meaning, Utility, and Assumptions |
-| :------------------- | :------------------------- | :------------------------------ |  :---- |  :---- |
-| **Poisson**        | `"poisson"`                | `exp(eta)`                      | `rate (λ)`: Determined by `exp(eta)`. | For modeling count data (e.g., number of events, individuals). Assumes the mean of the data is equal to its variance. |
-| **Gaussian**       | `"gaussian"`               | `identity(eta)`                 | `mean (μ)`: `eta`, `std. dev. (σ)`: `y_sigma ~ Exponential(1.0)` | For continuous, symmetric data. Assumes constant variance (homoscedasticity) unless `observationprocess(volatility=true)` is used. |
-| **Log-Normal**     | `"lognormal"`              | `identity(eta)`                 | `log-mean (μ)`: `eta`, `log-std. dev. (σ)`: `y_sigma ~ Exponential(1.0)` | For continuous, positive, right-skewed data (e.g., biomass, concentrations). Assumes the logarithm of the data is normally distributed. |
-| **Negative Binomial** | `"negbin"`                 | `exp(eta)`                      | `rate (μ)`: `exp(eta)`, `dispersion (r)`: `r_nb ~ Exponential(1.0)` | For overdispersed count data where the variance is greater than the mean. The dispersion parameter `r` controls the degree of overdispersion. |
-| **Binomial**       | `"binomial"`, `"bernoulli"`  | `logistic(eta)`                 | `trials (n)`: From `observationprocess(trials=...)`, `probability (p)`: `logistic(eta)` | For data representing the number of successes in a fixed number of trials. `bernoulli` is a special case where `n=1`, used for binary (0/1) outcomes. |
-| **Gamma**          | `"gamma"`                  | `exp(eta)`                      | `shape (α)`: `extra_params ~ Exponential(1.0)`, `scale (θ)`: `exp(eta)/α` | For continuous, positive, right-skewed data (e.g., insurance claims, rainfall). The `extra_params` argument can be used to set a fixed shape `α`. |
-| **Beta**           | `"beta"`                   | `logistic(eta)`                 | `mean (μ)`: `logistic(eta)`, `precision (φ)`: `extra_params ~ Exponential(1.0)` | For data on the (0, 1) interval (e.g., proportions, percentages). The `extra_params` argument controls the precision `φ`. |
-| **Student's T**    | `"student_t"`              | `identity(eta)`                 | `location (μ)`: `eta`, `scale (σ)`: `y_sigma ~ Exponential(1.0)`, `d.f. (ν)`: `extra_params ~ Exponential(1.0)` (default 5) | A robust alternative to the Gaussian family for continuous data with heavy tails (i.e., more prone to outliers). The degrees of freedom `ν` control the tail thickness. |
-| **Laplace**        | `"laplace"`                | `identity(eta)`                 | `location (μ)`: `eta`, `scale (b)`: `y_sigma ~ Exponential(1.0)` | For continuous data with a sharper peak at the mean and heavier tails than a Gaussian distribution. It is equivalent to minimizing the Mean Absolute Error (MAE). | 
-| **Dirichlet**      | `"dirichlet"`              | `exp(eta)`                      | `concentration (α)`: `exp(eta)` | For modeling compositional data, where each observation is a vector of proportions that sum to 1. `eta` is a vector of log-scale parameters. |
-| **Inverse Wishart**  | `"inverse_wishart"`        | `identity(eta)`                 | `d.f. (ν)`: `extra_params ~ Exponential(1.0)`, `Scale Matrix (Ψ)`: `PDMat(eta * eta' + jitter)` | For modeling covariance matrices in multivariate models. `eta` is a matrix whose outer product helps form the scale matrix `Ψ`. | 
+| Family                | `model_family` String(s)    | Link Function (`eta` to `mu`) | Key Parameters & Priors                                                                                                     | Meaning, Utility, and Assumptions                                                                                                                                       |
+| :----------------------| :----------------------------| :------------------------------| :----------------------------------------------------------------------------------------------------------------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Poisson**           | `"poisson"`                 | `exp(eta)`                    | `rate (λ)`: Determined by `exp(eta)`.                                                                                       | For modeling count data (e.g., number of events, individuals). Assumes the mean of the data is equal to its variance.                                                   |
+| **Gaussian**          | `"gaussian"`                | `identity(eta)`               | `mean (μ)`: `eta`, `std. dev. (σ)`: `y_sigma ~ Exponential(1.0)`                                                            | For continuous, symmetric data. Assumes constant variance (homoscedasticity) unless `observationprocess(volatility=true)` is used.                                      |
+| **Log-Normal**        | `"lognormal"`               | `identity(eta)`               | `log-mean (μ)`: `eta`, `log-std. dev. (σ)`: `y_sigma ~ Exponential(1.0)`                                                    | For continuous, positive, right-skewed data (e.g., biomass, concentrations). Assumes the logarithm of the data is normally distributed.                                 |
+| **Negative Binomial** | `"negbin"`                  | `exp(eta)`                    | `rate (μ)`: `exp(eta)`, `dispersion (r)`: `r_nb ~ Exponential(1.0)`                                                         | For overdispersed count data where the variance is greater than the mean. The dispersion parameter `r` controls the degree of overdispersion.                           |
+| **Binomial**          | `"binomial"`, `"bernoulli"` | `logistic(eta)`               | `trials (n)`: From `observationprocess(trials=...)`, `probability (p)`: `logistic(eta)`                                     | For data representing the number of successes in a fixed number of trials. `bernoulli` is a special case where `n=1`, used for binary (0/1) outcomes.                   |
+| **Gamma**             | `"gamma"`                   | `exp(eta)`                    | `shape (α)`: `extra_params ~ Exponential(1.0)`, `scale (θ)`: `exp(eta)/α`                                                   | For continuous, positive, right-skewed data (e.g., insurance claims, rainfall). The `extra_params` argument can be used to set a fixed shape `α`.                       |
+| **Beta**              | `"beta"`                    | `logistic(eta)`               | `mean (μ)`: `logistic(eta)`, `precision (φ)`: `extra_params ~ Exponential(1.0)`                                             | For data on the (0, 1) interval (e.g., proportions, percentages). The `extra_params` argument controls the precision `φ`.                                               |
+| **Student's T**       | `"student_t"`               | `identity(eta)`               | `location (μ)`: `eta`, `scale (σ)`: `y_sigma ~ Exponential(1.0)`, `d.f. (ν)`: `extra_params ~ Exponential(1.0)` (default 5) | A robust alternative to the Gaussian family for continuous data with heavy tails (i.e., more prone to outliers). The degrees of freedom `ν` control the tail thickness. |
+| **Laplace**           | `"laplace"`                 | `identity(eta)`               | `location (μ)`: `eta`, `scale (b)`: `y_sigma ~ Exponential(1.0)`                                                            | For continuous data with a sharper peak at the mean and heavier tails than a Gaussian distribution. It is equivalent to minimizing the Mean Absolute Error (MAE).       |
+| **Dirichlet**         | `"dirichlet"`               | `exp(eta)`                    | `concentration (α)`: `exp(eta)`                                                                                             | For modeling compositional data, where each observation is a vector of proportions that sum to 1. `eta` is a vector of log-scale parameters.                            |
+| **Inverse Wishart**   | `"inverse_wishart"`         | `identity(eta)`               | `d.f. (ν)`: `extra_params ~ Exponential(1.0)`, `Scale Matrix (Ψ)`: `PDMat(eta * eta' + jitter)`                             | For modeling covariance matrices in multivariate models. `eta` is a matrix whose outer product helps form the scale matrix `Ψ`.                                         |
 
 
 ---
@@ -227,11 +227,11 @@ The `observationprocess()` module is a special component that does not model a l
 
 The intercept represents the global baseline effect in the model. Its inclusion is controlled at the top level of the formula string, and the `intercept()` module provides a way to specify a custom prior for it.
 
-| Syntax / Concept      | Example Usage                            | Parameters | Default Prior   | Meaning & Assumptions |
-| :----------------------| :-----------------------------------------| :-----------| :----------------| :-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Syntax / Concept      | Example Usage                            | Parameters | Default Prior   | Meaning & Assumptions                                                                                                                                                                                                      |
+| :----------------------| :-----------------------------------------| :-----------| :----------------| :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **Include Intercept** | `y ~ 1 + ...` or `y ~ intercept() + ...` | None       | `Normal(0, 10)` | Adds a global intercept term $\beta_0$ to the model's linear predictor. Assumes a constant baseline effect across all observations. The `1` syntax is standard R-style, while `intercept()` is the explicit `bstm` module. |
-| **Exclude Intercept** | `y ~ 0 + ...` or `y ~ -1 + ...`          | None       | N/A             | Removes the global intercept term. The model is forced to pass through the origin. Assumes the response is zero when all predictors are zero. |
-| **Specify Prior**     | `intercept(prior=Normal(0, 5))`          | `prior`    | `Normal(0, 10)` | Uses the `intercept()` module to assign a specific prior distribution to the intercept term $\beta_0$. |
+| **Exclude Intercept** | `y ~ 0 + ...` or `y ~ -1 + ...`          | None       | N/A             | Removes the global intercept term. The model is forced to pass through the origin. Assumes the response is zero when all predictors are zero.                                                                              |
+| **Specify Prior**     | `intercept(prior=Normal(0, 5))`          | `prior`    | `Normal(0, 10)` | Uses the `intercept()` module to assign a specific prior distribution to the intercept term $\beta_0$.                                                                                                                     |
 
 **Note on `intercept(0)`, `intercept(1)`, etc.:**
 
@@ -379,15 +379,15 @@ The `eigen()` module uses a Householder transformation to construct the orthonor
 
 The `dynamics()` module is used to implement mechanistic state-space models that describe how a latent field evolves over time. This is the primary module for encoding process-based knowledge, such as population growth or physical transport, directly into the model.
 
-| Model                               | `model='...'`               | Key Parameters | Default Priors |
-| :--- | :--- | :--- | :--- |
-| **Logistic Growth with Fishing**    | `'logistic_fishing'`, `'ricker'` | `r_prior`, `K_prior`, `sig_pop_prior`, `sig_F_prior`, `r_covariate`, `K_covariate` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`, `sig_pop`: `Exponential(1.0)`, `sig_F`: `Exponential(0.5)` |
-| **Gompertz Growth**                 | `'gompertz'`                | `r_prior`, `K_prior`, `sig_dyn_prior`                                         | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)`, `sig_dyn`: `Exponential(1.0)` |
-| **Linked-K Logistic Growth**      | `'linked_K_logistic'`       | `r_prior`, `sig_pop_prior`, `K_slope_prior`                                   | `r`: `LogNormal(0,1)`, `sig_pop`: `Exponential(1.0)`, `K_slope`: `Normal(1,0.5)` |
-| **Advection**                       | `'advection'`               | `velocity_prior`, `sigma_prior`                                             | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)` |
-| **Diffusion**                       | `'diffusion'`               | `diffusion_prior`, `sigma_prior`                                            | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` |
-| **Advection-Diffusion**             | `'advection_diffusion'`     | `velocity_prior`, `diffusion_prior`, `sigma_prior`                          | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` |
-| **Custom Model**                    | `'custom'`                  | `func`                                                                      | N/A |
+| Model                            | `model='...'`                    | Key Parameters                                                                     | Default Priors                                                                                           |
+| :---------------------------------| :---------------------------------| :-----------------------------------------------------------------------------------| :---------------------------------------------------------------------------------------------------------|
+| **Logistic Growth with Fishing** | `'logistic_fishing'`, `'ricker'` | `r_prior`, `K_prior`, `sig_pop_prior`, `sig_F_prior`, `r_covariate`, `K_covariate` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`, `sig_pop`: `Exponential(1.0)`, `sig_F`: `Exponential(0.5)` |
+| **Gompertz Growth**              | `'gompertz'`                     | `r_prior`, `K_prior`, `sig_dyn_prior`                                              | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)`, `sig_dyn`: `Exponential(1.0)`                         |
+| **Linked-K Logistic Growth**     | `'linked_K_logistic'`            | `r_prior`, `sig_pop_prior`, `K_slope_prior`                                        | `r`: `LogNormal(0,1)`, `sig_pop`: `Exponential(1.0)`, `K_slope`: `Normal(1,0.5)`                         |
+| **Advection**                    | `'advection'`                    | `velocity_prior`, `sigma_prior`                                                    | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)`                                                 |
+| **Diffusion**                    | `'diffusion'`                    | `diffusion_prior`, `sigma_prior`                                                   | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)`                                              |
+| **Advection-Diffusion**          | `'advection_diffusion'`          | `velocity_prior`, `diffusion_prior`, `sigma_prior`                                 | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)`                 |
+| **Custom Model**                 | `'custom'`                       | `func`                                                                             | N/A                                                                                                      |
 
 
 
@@ -1151,6 +1151,28 @@ Manifolds can be combined algebraically within the formula string.
 *   `⊕` (`\oplus`): Direct sum. (Future support for block-diagonal structures).
 
 ## Configuration (Advanced)
+
+
+
+## The Mixed-Sampler Strategy: How the Model Learns
+
+Inference in **bstm** requires a Mixed-Sampler Gibbs approach, as no single algorithm is optimal for the entire parameter space. The `get_optimal_sampler` function provides both an informed automatic choice and manual overrides. The following table summarizes the available samplers and their primary use cases.
+
+| Sampler | `sampler_choice` | Type | Key Characteristic | Best Use Case |
+| :--- | :--- | :--- | :--- | :--- |
+| **NUTS** | `:nuts`, `:auto` (default) | Gradient-Based | Adaptively tunes step size and number of steps. | The state-of-the-art, general-purpose sampler for models with continuous, differentiable parameters. It is robust and requires minimal tuning. |
+| **HMC** | `:hmc` | Gradient-Based | Requires manual tuning of leapfrog steps. | A powerful alternative to `NUTS`. It can be very efficient but may require expert tuning to find optimal parameters for a given model. |
+| **ESS** | `:ess`, `:auto` (if applicable) | Gradient-Free | Designed specifically for models with Gaussian priors. | Highly efficient for latent Gaussian models (e.g., CAR, GP models). It makes large, coherent moves through the posterior without requiring gradient information. |
+| **Slice** | `:slice` | Gradient-Free | Adapts its step size to explore the posterior slice. | A robust, general-purpose gradient-free sampler. It can be more efficient than `MH` for some problems, especially those with complex unimodal posteriors, but is generally less efficient than gradient-based methods. |
+| **MH** | `:mh` | Gradient-Free | Proposes moves from a simple proposal distribution. | A universal sampler that can work for non-differentiable models. It is often inefficient in high-dimensional, correlated parameter spaces and should be used when gradient-based methods fail. |
+| **PG** | (Internal) | Particle-Based | Used for discrete parameters within a `Gibbs` sampler. | Automatically employed by `get_optimal_sampler` to handle any discrete random variables in the model, such as those from a `Categorical` or `Poisson` prior. |
+
+A note on `SGLD` (Stochastic Gradient Langevin Dynamics): This sampler is designed for "big data" scenarios where the likelihood cannot be evaluated on the full dataset at each step. It uses mini-batches to approximate the gradient. The `bstm` framework is not currently structured for this type of data subsampling, so `SGLD` is not included as a general-purpose option.
+
+For production-grade point estimates, we may utilize ADVI (Automatic Differentiation Variational Inference). In these cases, increasing the n_samples for the ELBO gradient estimation is critical to stabilize convergence against the noise of complex spatial interactions.
+
+
+## advanced:
 
 The `bstm()` call internally uses `bstm_modular_config()` to parse the formula and create a `NamedTuple` containing all model specifications. Advanced users can call this function directly to inspect or modify the configuration before building the model.
 

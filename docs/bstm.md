@@ -142,7 +142,7 @@ data_scot, _ = scottish_lip_cancer_data_spacetime();
 
 show(data_scot[:data])  # a DataFrame
 
-# the following """ ... "" is a simple way of writing multiline text
+# the following """ ... "" is a simple way of writing the formula as multiline text
 fm = """ 
   y ~ intercept() + 
     spatial(s_idx, model=bym2, W=data_scot[:au][:W]) +
