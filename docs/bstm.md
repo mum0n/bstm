@@ -138,6 +138,8 @@ Before getting into the nitty gritty of the spatiotemporal models, let us go thr
 ```{julia}
 #| label: Example - Sparse GMRF Space and time effect (no interaction)   
 
+data_scot, _ = scottish_lip_cancer_data_spacetime();  
+
 show(data_scot[:data])  # a DataFrame
 
 # the following """ ... "" is a simple way of writing multiline text
