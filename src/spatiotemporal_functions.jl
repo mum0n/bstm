@@ -1777,15 +1777,19 @@ function extract_manifold(m_obj::Union{ICAR, Besag, RW1, RW2, AR1, Leroux, SAR, 
     for k in 1:outcomes_N
         var_name = string(spec.var)
         m_domain = spec.domain
-        sigma_name = "sigma_$(m_domain)_$(var_name)_$(k)"
-        if !("sigma_$(m_domain)_$(var_name)_$(k)" in p_names) sigma_name = "sigma_$(m_domain)_$(k)"; end
+
+        sigma_name = outcomes_N > 1 ? "sigma_$(m_domain)_$(var_name)_$(k)" : "sigma_$(m_domain)_$(var_name)"
+        if !(sigma_name in p_names) && outcomes_N == 1
+            sigma_name = "sigma_$(m_domain)_$(k)" # Fallback for generic name
+        end
         
         n_units = if m_domain == :spatial; M.s_N; elseif m_domain == :temporal; M.t_N; else M.u_N; end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)
         latent_samples = _get_latent_field(chain, p_names, "latent_$(m_domain)", n_units, n_samples, outcomes_N, k, spec)
         
-        effect = latent_samples .* sigma_samples
+        # Transpose to [n_units, n_samples] and apply scaling
+        effect = latent_samples' .* sigma_samples'
         push!(structured_fields, effect)
     end
     
@@ -1803,17 +1807,23 @@ function extract_manifold(m_obj::BYM2, chain, M, n_samples, outcomes_N, p_names,
     for k in 1:outcomes_N
         var_name = string(spec.var)
         m_domain = spec.domain
-        sigma_name = "sigma_$(m_domain)_$(var_name)_$(k)"
-        rho_name = "rho_$(m_domain)_$(var_name)_$(k)"
+
+        sigma_name = outcomes_N > 1 ? "sigma_$(m_domain)_$(var_name)_$(k)" : "sigma_$(m_domain)_$(var_name)"
+        rho_name = outcomes_N > 1 ? "rho_$(m_domain)_$(var_name)_$(k)" : "rho_$(m_domain)_$(var_name)"
+        if !(sigma_name in p_names) && outcomes_N == 1
+            sigma_name = "sigma_$(m_domain)_$(k)"
+            rho_name = "rho_$(m_domain)_$(k)"
+        end
         
         sigma_samples = get_params_vector(chain, sigma_name, 1)
         rho_samples = get_params_vector(chain, rho_name, 1)
         
-        struct_samples = _get_latent_field(chain, p_names, "latent_struct_$(m_domain)", M.s_N, n_samples, outcomes_N, k, spec)
-        iid_samples = _get_latent_field(chain, p_names, "latent_iid_$(m_domain)", M.s_N, n_samples, outcomes_N, k, spec)
+        struct_samples = _get_latent_field(chain, p_names, "latent_struct", M.s_N, n_samples, outcomes_N, k, spec)
+        iid_samples = _get_latent_field(chain, p_names, "latent_iid", M.s_N, n_samples, outcomes_N, k, spec)
         
-        structured_effect = (sqrt.(rho_samples) .* struct_samples) .* sigma_samples
-        noisy_effect = (sqrt.(1.0 .- rho_samples) .* iid_samples) .* sigma_samples .+ structured_effect
+        # Transpose to [n_units, n_samples] and apply scaling
+        structured_effect = (struct_samples' .* sqrt.(rho_samples')) .* sigma_samples'
+        noisy_effect = (iid_samples' .* sqrt.(1.0 .- rho_samples')) .* sigma_samples' .+ structured_effect
         
         push!(structured_fields, structured_effect)
         push!(noisy_fields, noisy_effect)
@@ -1832,14 +1842,19 @@ function extract_manifold(m_obj::IID, chain, M, n_samples, outcomes_N, p_names, 
     for k in 1:outcomes_N
         var_name = string(spec.var)
         m_domain = spec.domain
-        sigma_name = "sigma_$(m_domain)_$(var_name)_$(k)"
+
+        sigma_name = outcomes_N > 1 ? "sigma_$(m_domain)_$(var_name)_$(k)" : "sigma_$(m_domain)_$(var_name)"
+        if !(sigma_name in p_names) && outcomes_N == 1
+            sigma_name = "sigma_$(m_domain)_$(k)"
+        end
         
         n_units = if m_domain == :mixed; spec.params.n_cat; elseif m_domain == :spatial; M.s_N; else M.t_N; end
         
         sigma_samples = get_params_vector(chain, sigma_name, 1)
         latent_samples = _get_latent_field(chain, p_names, "latent_$(m_domain)", n_units, n_samples, outcomes_N, k, spec)
         
-        effect = latent_samples .* sigma_samples
+        # Transpose to [n_units, n_samples] and apply scaling
+        effect = latent_samples' .* sigma_samples'
         push!(structured_fields, effect)
     end
     
@@ -1861,8 +1876,8 @@ function extract_manifold(m_obj::Union{PSpline, BSpline, TPS, RFF, FFT}, chain, 
         beta_name = "beta_basis_$(var_sym)_$(k)"
         coeffs = get_params_vector(chain, beta_name, n_basis_cols)
         
-        effect = B_mat * coeffs'
-        push!(structured_fields, effect')
+        effect = B_mat * coeffs' # Result is [n_obs, n_samples]
+        push!(structured_fields, effect)
     end
     
     return (structured=structured_fields, noisy=structured_fields)
@@ -3794,7 +3809,7 @@ function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M,
     # to provide a complete set of outputs for weighted population estimates.
 
     n_samples = size(chain, 1)
-    p_names = string.(MCMCChains.names(chain))
+    p_names = string.(FlexiChains.parameters(chain))
     N_PS = isnothing(PS) ? 0 : size(PS.Xfixed, 1)
     N_tot = M.y_N + N_PS
     family_str = get(M, :model_family, "gaussian")
@@ -3844,12 +3859,14 @@ function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M,
     end
 
     # 4. Generate Predictions and Compute Log-Likelihood
+    # Reshape eta_samples to 2D for univariate case, as _process_ll_and_predictions expects [obs x samples]
+    eta_samples_2d = reshape(eta_samples, N_tot, n_samples)
     p_denoised, p_noisy, log_lik = _process_ll_and_predictions(
-        fam_obj, eta_samples, chain, M, N_tot, n_samples, registry.sv_surface
+        fam_obj, eta_samples_2d, chain, M, N_tot, n_samples, registry.sv_surface
     )
 
     # 5. Summarize Predictions and Post-Stratification Weights
-    summarized_effects[:eta] = summarize_array(eta_samples[1:M.y_N, :]; alpha=alpha)
+    summarized_effects[:eta] = summarize_array(eta_samples_2d[1:M.y_N, :]; alpha=alpha)
     summarized_effects[:predictions_denoised] = summarize_array(p_denoised[1:M.y_N, :]; alpha=alpha)
     summarized_effects[:predictions_noisy] = summarize_array(p_noisy[1:M.y_N, :]; alpha=alpha)
     if N_PS > 0
@@ -3870,7 +3887,7 @@ function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M,
     summarized_effects[:family] = family_str
     summarized_effects[:arch] = arch
 
-    return summarized_effects
+    return NamedTuple(summarized_effects)
 end
 
 
@@ -4001,7 +4018,7 @@ function _reconstruct(arch::MultivariateArchitecture, modelname::String, chain, 
     
     summarized_effects[:family] = family_str
     summarized_effects[:arch] = arch
-    return summarized_effects
+    return NamedTuple(summarized_effects)
 end
 
 
@@ -4012,7 +4029,7 @@ end
 
 function _reconstruct(arch::MultifidelityArchitecture, modelname::String, chain, M, PS, alpha)
     N_samples = size(chain, 1)
-    p_names = string.(MCMCChains.names(chain))
+    p_names = string.(FlexiChains.parameters(chain))
     family_str = get(M, :model_family, "gaussian")
     fam_obj = get_model_family(family_str)
     noise = get(M, :noise, 1e-4)
@@ -4104,8 +4121,8 @@ function _reconstruct(arch::MultifidelityArchitecture, modelname::String, chain,
     summarized_effects[:log_lik_matrix] = log_lik
     summarized_effects[:family] = family_str
     summarized_effects[:arch] = arch
-
-    return summarized_effects
+    
+    return NamedTuple(summarized_effects)
 end
  
 

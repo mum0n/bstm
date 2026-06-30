@@ -100,8 +100,8 @@ Changes in this version:
             else
                 s_rho_value = rho_param
             end
-            s_icar ~ MvNormalCanon(zeros(M.s_N), spec.Q_template + noise * I)
-            s_iid ~ MvNormal(zeros(M.s_N), I)
+            s_icar ~ NamedDist(MvNormalCanon(zeros(M.s_N), spec.Q_template + noise * I), Symbol("latent_struct_", m_domain, "_", var_name))
+            s_iid ~ NamedDist(MvNormal(zeros(M.s_N), I), Symbol("latent_iid_", m_domain, "_", var_name))
             sum_icar = sum(s_icar); sum_icar ~ Normal(0, 0.001 * M.s_N)
             s_eta_structured = s_sigma_value .* (sqrt(s_rho_value) .* s_icar .+ sqrt(1.0 - s_rho_value) .* s_iid)
             eta .+= s_eta_structured[M.s_idx]
