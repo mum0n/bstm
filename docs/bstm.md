@@ -150,16 +150,12 @@ fm = """
     observationprocess(log_offsets=log_offset) 
 """ 
 
-m = bstm( fm, data_scot[:data], model_family="poisson")
+m = bstm( fm, data_scot[:data], model_family="poisson")  # a Turing model
+ 
+chn, inits, os, model_summary = bstm_sample(m; nsample=10, testing=true )  # simple wrapper: standard 'sample(m)' will work as expected
 
-rand(m)
-
-os = get_optimal_sampler(m; adaptation_steps=100) ; 
-inits = get_inits(m) ; 
-chn = sample(m, os, 100; initial_params=inits, progress=true, drop_warmup=true ) ; 
-
-StatsPlots.plot(chn[[:s_sigma, :s_rho, :t_sigma, :t_rho]], seriestype=:traceplot)
-res = model_results_comprehensive(m, chn );  
+res = model_results_comprehensive( m, chn );
+  
 model_results_plots(res, centroids = data_scot[:au][:centroids], polygons = data_scot[:au][:polygons])
 
 

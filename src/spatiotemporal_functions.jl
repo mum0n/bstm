@@ -1,5 +1,195 @@
 #!Reference
-  
+
+function _generate_model_pseudocode(m::DynamicPPL.Model)
+    # v1.0.0 (2026-06-30)
+    # Purpose: Reconstructs a pseudo-code representation of the Turing model definition
+    #          based on the configuration object. This is for inspection and clarity, as
+    #          the actual model is built dynamically.
+    # Inputs: m - The Turing model instance.
+    # Outputs: A string containing the pseudo-code.
+    
+    config = m.args[1]
+    model_name = get(config, :model_name, nameof(m.f))
+    
+    lines = ["@model function $model_name(M)"]
+    push!(lines, "    # --- Priors & Hyperparameters ---")
+
+    # Global priors
+    family = get(config, :model_family, "gaussian")
+    if family == "negbin"
+        push!(lines, "    r_nb ~ Exponential(1.0)")
+    end
+    if get(config, :use_zi, false)
+        push!(lines, "    phi_zi ~ Beta(1, 1)")
+    end
+    if family in ["gaussian", "lognormal"] && !get(config, :use_sv, false)
+        push!(lines, "    y_sigma ~ Exponential(1.0)")
+    end
+
+    # Manifold-specific priors
+    if haskey(config, :manifolds) && !isempty(config.manifolds)
+        for spec in config.manifolds
+            m_obj = spec.manifold_obj
+            m_type_str = string(typeof(m_obj))
+            key = spec.key
+            
+            push!(lines, "\n    # Priors for manifold: $(key) ($(m_type_str))")
+            
+            if hasproperty(m_obj, :sigma_prior) && !isnothing(m_obj.sigma_prior)
+                push!(lines, "    sigma_$(key) ~ $(m_obj.sigma_prior)")
+            end
+            if hasproperty(m_obj, :rho_prior) && !isnothing(m_obj.rho_prior)
+                push!(lines, "    rho_$(key) ~ $(m_obj.rho_prior)")
+            end
+            if hasproperty(m_obj, :lengthscale_prior) && !isnothing(m_obj.lengthscale_prior)
+                push!(lines, "    ls_$(key) ~ $(m_obj.lengthscale_prior)")
+            end
+        end
+    end
+
+    # Fixed effects prior
+    if get(config, :Xfixed_N, 0) > 0
+        push!(lines, "\n    # Prior for fixed effects")
+        push!(lines, "    Xfixed_beta ~ MvNormal(0, 5.0 * I)")
+    end
+
+    push!(lines, "\n    # --- Latent Field Definitions & Linear Predictor Assembly ---")
+    eta_parts = haskey(config, :log_offset) && !all(iszero, get(config, :log_offset, [])) ? ["M.log_offset"] : []
+
+    if haskey(config, :manifolds)
+        for spec in config.manifolds
+            push!(eta_parts, string(spec.key))
+        end
+    end
+    if get(config, :Xfixed_N, 0) > 0
+        push!(eta_parts, "M.Xfixed * Xfixed_beta")
+    end
+    
+    push!(lines, "    eta = " * (isempty(eta_parts) ? "zeros(M.y_N)" : join(eta_parts, " .+ ")))
+
+    push!(lines, "\n    # --- Likelihood ---")
+    push!(lines, "    y_obs ~ bstm_Likelihood(\"$family\", eta, ...)")
+    push!(lines, "end")
+
+    return join(lines, "\n")
+end
+
+
+function show_model(m::DynamicPPL.Model)
+"""
+    show_model(m)
+
+Displays a summary of the Turing model, including its name, arguments,
+and attempts to draw a single sample from its prior to verify parameter definitions.
+This function addresses the `UndefVarError: SampleFromPrior` by ensuring
+`using Turing` is present and correctly calling the `SampleFromPrior` sampler.
+"""
+    println("\n--- Model Summary ---\n")
+
+    # The model configuration object `M` is the first argument passed to the Turing model.
+    config = m.args[1]
+
+    # Use `get` with a fallback to `nameof(m.f)` for the model name.
+    println("Model Name: ", get(config, :model_name, nameof(m.f)))
+    println("Model Architecture: ", get(config, :model_arch, "N/A"))
+    println("Model Family: ", get(config, :model_family, "N/A"))
+    println("Number of observed data points: ", get(config, :N_obs, get(config, :y_N, "N/A")))
+    println("Number of spatial units: ", get(config, :N_areas, get(config, :s_N, "N/A")))
+    println("Number of time units: ", get(config, :N_time, get(config, :t_N, "N/A")))
+    println("Number of covariates: ", get(config, :N_cov, "N/A"))
+
+    println("\n--- Model Code View ---\n")
+    println("Likelihood Family: ", get(config, :model_family, "N/A"))
+    println("Zero-Inflated: ", get(config, :use_zi, false) ? "Yes" : "No")
+    println("Hurdle Model: ", get(config, :hurdle, -Inf) > -Inf ? "Yes" : "No")
+
+    println("\nFixed Effects:")
+    if get(config, :Xfixed_N, 0) > 0
+        println("  Variables: ", join(string.(names(config.Xfixed, 2)), ", "))
+    else
+        println("  None")
+    end
+
+    println("\nManifolds:\n")
+    if haskey(config, :manifolds) && !isempty(config.manifolds)
+        for spec in config.manifolds
+            println("  - Key: ", spec.key)
+            println("    Domain: ", spec.domain)
+            println("    Variable: ", spec.var)
+            println("    Manifold Type: ", typeof(spec.manifold_obj))
+            println("    Parameters:")
+            for (p_key, p_val) in pairs(spec.params)
+                println("      ", p_key, ": ", p_val)
+            end
+        end
+    else
+        println("  None")
+    end
+
+    println("\nObservation Process:\n")
+    # Check if log_offset is present and not all zeros
+    log_offset_present = haskey(config, :log_offset) && !all(iszero, get(config, :log_offset, []))
+    println("  Log Offsets: ", log_offset_present ? "Yes" : "No")
+
+    # Check if weights are present and not all ones
+    weights_present = haskey(config, :weights) && !all(isone, get(config, :weights, []))
+    println("  Weights: ", weights_present ? "Yes" : "No")
+
+    # Check if trials are present and not all ones
+    trials_present = haskey(config, :trials) && !all(isone, get(config, :trials, []))
+    println("  Trials: ", trials_present ? "Yes" : "No")
+
+    println("  Stochastic Volatility: ", get(config, :use_sv, false) ? "Yes" : "No")
+
+    censoring_status = "None"
+    y_L = get(config, :y_lower_bound, -Inf)
+    y_U = get(config, :y_upper_bound, Inf)
+    if y_L > -Inf && y_U < Inf
+        censoring_status = "Interval"
+    elseif y_L > -Inf
+        censoring_status = "Right"
+    elseif y_U < Inf
+        censoring_status = "Left"
+    end
+    println("  Censoring: ", censoring_status)
+
+    println("\n--- End Model Code View ---")
+
+    println("\n--- Reconstructed Model Source ---\n")
+
+    println(_generate_model_pseudocode(m))
+    println("\n--- End Reconstructed Model Source ---")
+
+    
+    println("\n--- Prior Sample Check ---")
+    try
+        prior_sample_chain = sample(m, Prior(), 1)
+        println("Successfully drew 1 sample from the model's prior.")
+        display(prior_sample_chain)
+    catch e
+        println("ERROR: Failed to draw a sample from the prior.")
+        println("  Reason: ", e)
+        println("  This might indicate issues with model parameter definitions,")
+        println("  missing `using Turing` statement, or an incompatible Turing.jl version.")
+        
+        try 
+            println( "Trying a simple rand(m) test: passed\n")
+            println( "rand(m): sample\n")
+            show( rand(m) )
+
+        catch e
+            println( "Trying a simple rand(m) test: failed\n")
+            println("  Reason: ", e)
+        end
+
+
+    end
+
+    println("\n--- End Model Summary ---")
+    return nothing
+end
+
+
 function capitalize(s::String)
     # v1.0.1 (2026-06-29 16:13:05)
     # Purpose: Capitalizes the first letter of a string.
@@ -2516,6 +2706,41 @@ function process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
 end
 
 
+
+function bstm_sample(m::DynamicPPL.Model; nsample=10, testing=false, sampler_override=nothing)
+    # v1.0.0 (2026-06-30)
+    # Purpose: A utility function to streamline the process of sampling from a bstm model.
+    #          It handles initialization, sampler selection, and execution.
+    # Inputs: m - The Turing model instance.
+    #         nsample - The number of posterior samples to draw.
+    #         testing - If false, uses a fast MH() sampler for quick checks.
+    #         sampler_override - Optionally provide a pre-configured sampler.
+    # Outputs: A tuple containing the MCMC chain, initial values, the sampler used, and a model summary.
+
+    model_summary = show_model(m)
+    inits = get_inits(m)
+
+    local os # sampler object
+    if !isnothing(sampler_override)
+        os = sampler_override
+    else
+        if testing
+            nadapt = max(Int(round(nsample * 0.25)), 200)
+            os = get_optimal_sampler(m; adaptation_steps=nadapt)
+        else
+            os = MH()  # Faster sampler for non-production testing
+        end
+    end
+
+    chn = sample(m, os, nsample; initial_params=inits, progress=true, drop_warmup=true)
+
+    StatsPlots.plot(chn, seriestype=:traceplot)
+
+    return chn, inits, os, model_summary
+end
+
+
+
 function process_temporal_module!(opt_dict, mod_data, registries, hyperpriors)
     # v1.0.1 (2026-06-29 16:13:05)
     # Purpose: Processes the `temporal()` module to handle time and season indices.
@@ -3412,6 +3637,8 @@ function generate_sim_data(s_N=25, t_N=10; rndseed=42)
     )   
 
 end
+
+
 
 
 function scottish_lip_cancer_data_spacetime(n_years::Int=20, spatial_expansion::Float64=1.5, temporal_expansion::Float64=1.5; rndseed::Int=42, recreate::Bool=false)
