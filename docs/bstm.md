@@ -152,7 +152,7 @@ fm = """
 
 m = bstm( fm, data_scot[:data], model_family="poisson")  # a Turing model
  
-chn, inits, os, model_summary = bstm_sample(m; nsample=10, testing=true )  # simple wrapper: standard 'sample(m)' will work as expected
+chn, inits, os, summary, plt = bstm_sample(m; nsample=100, testing=true )  # simple wrapper: standard 'sample(m)' will work as expected
 
 res = model_results_comprehensive( m, chn );
   
@@ -160,6 +160,7 @@ model_results_plots(res, centroids = data_scot[:au][:centroids], polygons = data
 
 
 ```
+
 The results look like this. Not great but that is because, they have not converged yet (rhat is far from 1) and the model is simple: we are ignoring covariates and spatiotemporal interactions. The bstm version does some additional work which slows it down a bit but overall, gives a better posterior predictive check (PPC). 
 
 

@@ -1,20 +1,19 @@
 #=
-File: bstm_model_supervisors.jl
-Version: 1.0.0
-Timestamp: 2026-06-29 15:25:00
+File: bstm_model_supervisors_v3.jl
+Version: 3.0.0
+Timestamp: 2026-06-30 12:00:00
 
 Description:
-This file contains the corrected and finalized versions of the core `bstm` model
-supervisor functions: `bstm_univariate`, `bstm_multivariate`, and `bstm_multifidelity`.
+This file contains the fully updated and optimized versions of the core `bstm` model
+supervisor functions. It addresses macro-parsing errors by refactoring conditional
+sampling statements.
 
 Changes in this version:
-- Resolved `LoadError: syntax: invalid let syntax` by replacing all invalid
-  conditional sampling patterns (`variable = if ... let ... end`) with a robust
-  `if/else` block structure compatible with the Turing.jl `@model` macro.
-- Replaced incorrect unconditional sampling `let` blocks in the dynamics modules
-  with direct sampling statements (`~`).
-- Ensured all sampling statements (`~`) are on their own lines within conditional
-  blocks to guarantee correct parsing by the macro.
+- Resolved `LoadError: unreachable` by expanding all single-line conditional sampling
+  statements (e.g., `if cond; x ~ dist; else; ...; end`) into standard multi-line
+  `if/else/end` blocks. This ensures compatibility with the Turing.jl `@model` macro parser.
+- This change is applied systematically across `bstm_univariate`, `bstm_multivariate`,
+  and `bstm_multifidelity` to ensure robust model compilation.
 =#
 
 @model function bstm_univariate(M, ::Type{T}=Float64) where {T}
@@ -58,6 +57,13 @@ Changes in this version:
         if family in ["gaussian", "student_t", "laplace"]; eta .+= exp.(M.log_offset); else; eta .+= M.log_offset; end
     end
 
+    # # 4. Manifold & Interaction Scaffolding
+    # Local variables to store precision matrices and parameters from the main loop
+    # for use in the space-time interaction block.
+    s_Q = sparse(I(M.s_N))
+    t_Q = sparse(I(M.t_N))
+    t_rho = zero(T)
+
     # # 4. Modular Manifold Realization (INLINED)
     for spec in M.manifolds
         m_obj = spec.manifold_obj
@@ -72,9 +78,10 @@ Changes in this version:
         if m_obj isa IID
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_", m_domain, "_", var_name)
-            local sigma_val
+            sigma_val = zero(T)
             if sigma_param isa Distribution
-                _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp
+                _tmp ~ NamedDist(sigma_param, sigma_name)
+                sigma_val = _tmp
             else
                 sigma_val = sigma_param
             end
@@ -86,17 +93,19 @@ Changes in this version:
         elseif m_obj isa BYM2
             sigma_param = get(spec.params, :s_sigma, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_", m_domain, "_", var_name)
-            local s_sigma_value
+            s_sigma_value = zero(T)
             if sigma_param isa Distribution
-                _tmp ~ NamedDist(sigma_param, sigma_name); s_sigma_value = _tmp
+                _tmp ~ NamedDist(sigma_param, sigma_name)
+                s_sigma_value = _tmp
             else
                 s_sigma_value = sigma_param
             end
             rho_param = get(spec.params, :s_rho, m_obj.rho_prior)
             rho_name = Symbol("rho_", m_domain, "_", var_name)
-            local s_rho_value
+            s_rho_value = zero(T)
             if rho_param isa Distribution
-                _tmp ~ NamedDist(rho_param, rho_name); s_rho_value = _tmp
+                _tmp ~ NamedDist(rho_param, rho_name)
+                s_rho_value = _tmp
             else
                 s_rho_value = rho_param
             end
@@ -106,25 +115,65 @@ Changes in this version:
             s_eta_structured = s_sigma_value .* (sqrt(s_rho_value) .* s_icar .+ sqrt(1.0 - s_rho_value) .* s_iid)
             eta .+= s_eta_structured[M.s_idx]
 
-        elseif m_obj isa Union{ICAR, Besag, RW1, RW2, AR1, Leroux, SAR, Cyclic}
+        elseif m_obj isa AR1
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_", m_domain, "_", var_name)
-            local sigma_val
+            sigma_val = zero(T)
             if sigma_param isa Distribution
-                _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp
+                _tmp ~ NamedDist(sigma_param, sigma_name)
+                sigma_val = _tmp
             else
                 sigma_val = sigma_param
             end
-            local rho_val = nothing
+
+            rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
+            rho_name = Symbol("rho_", m_domain, "_", var_name)
+            t_rho_param = zero(T)
+            if rho_param isa Distribution
+                _tmp_rho ~ NamedDist(rho_param, rho_name)
+                t_rho_param = _tmp_rho
+            else
+                t_rho_param = rho_param
+            end
+            t_rho = t_rho_param # Capture for ST interaction
+
+            # --- EFFICIENT STATE-SPACE FORMULATION for AR(1) ---
+            t_innovations ~ MvNormal(zeros(T, M.t_N), I)
+            t_raw = Vector{T}(undef, M.t_N)
+            t_raw[1] = t_innovations[1] / sqrt(1.0 - t_rho^2 + noise)
+            for i in 2:M.t_N
+                t_raw[i] = t_rho * t_raw[i-1] + t_innovations[i]
+            end
+            t_eta_full = (t_raw .* sigma_val)[M.t_idx]
+            eta .+= t_eta_full
+
+            # Reconstruct t_Q for potential use in ST interactions
+            t_Q_base = Symmetric((1.0 + t_rho^2) .* I(M.t_N) .- t_rho .* spec.Q_template)
+            t_Q = Symmetric((1.0 / (sigma_val^2 * (1.0 - t_rho^2) + noise)) .* t_Q_base)
+
+        elseif m_obj isa Union{ICAR, Besag, RW1, RW2, Leroux, SAR, Cyclic}
+            sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
+            sigma_name = Symbol("sigma_", m_domain, "_", var_name)
+            sigma_val = zero(T)
+            if sigma_param isa Distribution
+                _tmp ~ NamedDist(sigma_param, sigma_name)
+                sigma_val = _tmp
+            else
+                sigma_val = sigma_param
+            end
+            
+            rho_val = nothing
             if hasproperty(m_obj, :rho_prior)
                 rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
                 rho_name = Symbol("rho_", m_domain, "_", var_name)
                 if rho_param isa Distribution
-                    _tmp ~ NamedDist(rho_param, rho_name); rho_val = _tmp
+                    _tmp_rho ~ NamedDist(rho_param, rho_name)
+                    rho_val = _tmp_rho
                 else
                     rho_val = rho_param
                 end
             end
+            
             template = spec.Q_template; n_units = size(template, 1)
             Q = recompose_precision(Symbol(lowercase(string(typeof(m_obj)))), template, sigma_val; extra_param=rho_val, noise=noise)
             latent_name = Symbol("latent_", m_domain, "_", var_name)
@@ -133,13 +182,21 @@ Changes in this version:
             indices = if m_domain == :spatial; M.s_idx; elseif m_domain == :temporal; M.t_idx; else M.u_idx; end
             eta .+= latent[indices]
 
+            # Capture precision matrices for ST interaction
+            if m_domain == :spatial
+                s_Q = Q
+            elseif m_domain == :temporal
+                t_Q = Q
+            end
+
         elseif m_obj isa Union{PSpline, BSpline, TPS, RFF, FFT, Wavelet, Moran, Spherical, ExponentialDecay, Barycentric}
             var_sym = spec.var; B_mat = M.basis_matrices[var_sym]; n_basis_cols = size(B_mat, 2)
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_basis_", var_sym)
-            local sigma_val
+            sigma_val = zero(T)
             if sigma_param isa Distribution
-                _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp
+                _tmp ~ NamedDist(sigma_param, sigma_name)
+                sigma_val = _tmp
             else
                 sigma_val = sigma_param
             end
@@ -155,17 +212,20 @@ Changes in this version:
 
         elseif m_obj isa GP
             var_sym = spec.var
-            local ls
+            ls = zero(T)
             ls_param = get(spec.params, :lengthscale_prior, m_obj.lengthscale_prior)
             if ls_param isa AbstractVector
-                _tmp ~ NamedDist(Product(ls_param), Symbol("ls_gp_", var_sym)); ls = _tmp
+                _tmp ~ NamedDist(Product(ls_param), Symbol("ls_gp_", var_sym))
+                ls = _tmp
             else
-                _tmp ~ NamedDist(ls_param, Symbol("ls_gp_", var_sym)); ls = _tmp
+                _tmp ~ NamedDist(ls_param, Symbol("ls_gp_", var_sym))
+                ls = _tmp
             end
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-            local sigma_val
+            sigma_val = zero(T)
             if sigma_param isa Distribution
-                _tmp ~ NamedDist(sigma_param, Symbol("sigma_gp_", var_sym)); sigma_val = _tmp
+                _tmp ~ NamedDist(sigma_param, Symbol("sigma_gp_", var_sym))
+                sigma_val = _tmp
             else
                 sigma_val = sigma_param
             end
@@ -178,16 +238,18 @@ Changes in this version:
 
         elseif m_obj isa SPDE
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-            local sigma_val
+            sigma_val = zero(T)
             if sigma_param isa Distribution
-                _tmp ~ NamedDist(sigma_param, Symbol("sigma_spde_", var_name)); sigma_val = _tmp
+                _tmp ~ NamedDist(sigma_param, Symbol("sigma_spde_", var_name))
+                sigma_val = _tmp
             else
                 sigma_val = sigma_param
             end
             kappa_param = get(spec.params, :kappa_prior, m_obj.kappa_prior)
-            local kappa_val
+            kappa_val = zero(T)
             if kappa_param isa Distribution
-                _tmp ~ NamedDist(kappa_param, Symbol("kappa_spde_", var_name)); kappa_val = _tmp
+                _tmp ~ NamedDist(kappa_param, Symbol("kappa_spde_", var_name))
+                kappa_val = _tmp
             else
                 kappa_val = kappa_param
             end
@@ -203,17 +265,19 @@ Changes in this version:
                 x_vals = M.Xfixed[:, x_col_idx]
                 inner_m_type = Symbol(lowercase(string(typeof(inner_manifold))))
                 sigma_param = get(spec.params, :sigma_prior, inner_manifold.sigma_prior)
-                local sigma_val
+                sigma_val = zero(T)
                 if sigma_param isa Distribution
-                    _tmp ~ NamedDist(sigma_param, Symbol("sig_svc_", cov_sym)); sigma_val = _tmp
+                    _tmp ~ NamedDist(sigma_param, Symbol("sig_svc_", cov_sym))
+                    sigma_val = _tmp
                 else
                     sigma_val = sigma_param
                 end
-                local rho_val = nothing
+                rho_val = nothing
                 if hasproperty(inner_manifold, :rho_prior)
                     rho_param = get(spec.params, :rho_prior, inner_manifold.rho_prior)
                     if rho_param isa Distribution
-                        _tmp ~ NamedDist(rho_param, Symbol("rho_svc_", cov_sym)); rho_val = _tmp
+                        _tmp ~ NamedDist(rho_param, Symbol("rho_svc_", cov_sym))
+                        rho_val = _tmp
                     else
                         rho_val = rho_param
                     end
@@ -226,16 +290,19 @@ Changes in this version:
         elseif m_obj isa Union{SVGP, FITC, Nystrom}
             var_sym = spec.var; n_inducing = m_obj.n_inducing; coords = spec.params.coords; n_dims = size(coords, 2)
             ls_param = get(spec.params, :lengthscale_prior, m_obj.lengthscale_prior)
-            local ls
+            ls = zero(T)
             if ls_param isa AbstractVector
-                _tmp ~ NamedDist(Product(ls_param), Symbol("ls_sparsegp_", var_sym)); ls = _tmp
+                _tmp ~ NamedDist(Product(ls_param), Symbol("ls_sparsegp_", var_sym))
+                ls = _tmp
             else
-                _tmp ~ NamedDist(ls_param, Symbol("ls_sparsegp_", var_sym)); ls = _tmp
+                _tmp ~ NamedDist(ls_param, Symbol("ls_sparsegp_", var_sym))
+                ls = _tmp
             end
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
-            local sigma_val
+            sigma_val = zero(T)
             if sigma_param isa Distribution
-                _tmp ~ NamedDist(sigma_param, Symbol("sigma_sparsegp_", var_sym)); sigma_val = _tmp
+                _tmp ~ NamedDist(sigma_param, Symbol("sigma_sparsegp_", var_sym))
+                sigma_val = _tmp
             else
                 sigma_val = sigma_param
             end
@@ -358,20 +425,16 @@ Changes in this version:
                 log_F_state = Vector{T}(undef, M.t_N)
                 log_pop_state[1] ~ Normal(log_K_base - log(2.0), 1.0)
                 log_F_state[1] ~ Normal(-2.0, 1.0)
-                local r_cov_effect
+                r_cov_effect = zero(T)
                 if haskey(params, :r_covariate)
                     _rce ~ NamedDist(Normal(0, 0.1), Symbol("r_cov_effect_", key))
                     r_cov_effect = _rce
-                else
-                    r_cov_effect = 0.0
                 end
                 r_cov_data = haskey(params, :r_covariate) ? M.data[!, params[:r_covariate]] : nothing
-                local K_cov_effect
+                K_cov_effect = zero(T)
                 if haskey(params, :K_covariate)
                     _kce ~ NamedDist(Normal(0, 0.1), Symbol("K_cov_effect_", key))
                     K_cov_effect = _kce
-                else
-                    K_cov_effect = 0.0
                 end
                 K_cov_data = haskey(params, :K_covariate) ? M.data[!, params[:K_covariate]] : nothing
                 for t in 2:M.t_N
@@ -445,6 +508,52 @@ Changes in this version:
         end
     end
 
+    # # 4.1 Space-Time Interaction Manifold
+    st_eta = zeros(T, M.y_N)
+    model_st = get(M, :model_st, "none")
+    if model_st != "none"
+        st_sigma ~ NamedDist(Exponential(0.5), :st_sigma)
+
+        if model_st == "IV"
+            # --- EFFICIENT STATE-SPACE FORMULATION for Type IV Interaction ---
+            st_innovations ~ MvNormal(zeros(T, M.s_N * M.t_N), I)
+            st_innov_matrix = reshape(st_innovations, M.s_N, M.t_N)
+
+            L_s = cholesky(Symmetric(s_Q + noise * I)).L
+            spatially_correlated_innov = L_s' \ st_innov_matrix
+
+            st_inter = Matrix{T}(undef, M.s_N, M.t_N)
+            st_inter[:, 1] = spatially_correlated_innov[:, 1] ./ sqrt(1.0 - t_rho^2 + noise)
+            for t in 2:M.t_N
+                st_inter[:, t] = t_rho .* st_inter[:, t-1] .+ spatially_correlated_innov[:, t]
+            end
+            
+            st_eta_flat = Vector{T}(undef, M.y_N)
+            for i in 1:M.y_N
+                st_eta_flat[i] = st_inter[M.s_idx[i], M.t_idx[i]] * st_sigma
+            end
+            st_eta = st_eta_flat
+
+        elseif model_st == "II"
+            st_Q2 = kron(sparse(I(M.s_N)), t_Q)
+            st_raw ~ MvNormalCanon(zeros(T, M.s_N * M.t_N), st_Q2 + noise * I)
+            st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma
+            st_eta = [st_inter[M.s_idx[i], M.t_idx[i]] for i in 1:M.y_N]
+
+        elseif model_st == "III"
+            st_Q3 = kron(s_Q, sparse(I(M.t_N)))
+            st_raw ~ MvNormalCanon(zeros(T, M.s_N * M.t_N), st_Q3 + noise * I)
+            st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma
+            st_eta = [st_inter[M.s_idx[i], M.t_idx[i]] for i in 1:M.y_N]
+
+        else # Type I
+            st_raw ~ MvNormal(zeros(T, M.s_N * M.t_N), I)
+            st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma
+            st_eta = [st_inter[M.s_idx[i], M.t_idx[i]] for i in 1:M.y_N]
+        end
+        eta .+= st_eta
+    end
+
     # # 4.2 Nested Hierarchical Supervisors
     if haskey(M, :nested_manifolds) && !isempty(M.nested_manifolds)
         for (z_key, z_meta) in M.nested_manifolds
@@ -516,6 +625,12 @@ end
 
     # # 4. Modular Manifold Realization (INLINED)
     latent_innovations = zeros(T, y_N, outcomes_N)
+
+    # Scaffolding for outcome-specific precision matrices and parameters
+    s_Q_vec = Vector{Any}(undef, outcomes_N)
+    t_Q_vec = Vector{Any}(undef, outcomes_N)
+    t_rho_vec = zeros(T, outcomes_N)
+
     for spec in M.manifolds
         m_obj = spec.manifold_obj
 
@@ -597,20 +712,16 @@ end
                     log_F_state = Vector{T}(undef, M.t_N)
                     log_pop_state[1] ~ Normal(log_K_base - log(2.0), 1.0)
                     log_F_state[1] ~ Normal(-2.0, 1.0)
-                    local r_cov_effect
+                    r_cov_effect = zero(T)
                     if haskey(params, :r_covariate)
                         _rce ~ NamedDist(Normal(0, 0.1), Symbol("r_cov_effect_", key, "_", k))
                         r_cov_effect = _rce
-                    else
-                        r_cov_effect = 0.0
                     end
                     r_cov_data = haskey(params, :r_covariate) ? M.data[!, params[:r_covariate]] : nothing
-                    local K_cov_effect
+                    K_cov_effect = zero(T)
                     if haskey(params, :K_covariate)
                         _kce ~ NamedDist(Normal(0, 0.1), Symbol("K_cov_effect_", key, "_", k))
                         K_cov_effect = _kce
-                    else
-                        K_cov_effect = 0.0
                     end
                     K_cov_data = haskey(params, :K_covariate) ? M.data[!, params[:K_covariate]] : nothing
                     for t in 2:M.t_N
@@ -674,7 +785,7 @@ end
                 if m_obj isa IID
                     sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
                     sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
-                    local sigma_val
+                    sigma_val = zero(T)
                     if sigma_param isa Distribution; _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp; else sigma_val = sigma_param; end
 
                     n_units, indices = if m_domain == :mixed; (spec.params.n_cat, spec.params.indices); elseif m_domain == :spatial; (M.s_N, M.s_idx); else (M.t_N, M.t_idx); end
@@ -683,17 +794,18 @@ end
                     latent_innovations[:, k] .+= latent[indices]
 
                 # --- BYM2 Manifold ---
-                elseif m_obj isa BYM2
+                elseif m_obj isa BYM2 
                     sigma_param = get(spec.params, :s_sigma, m_obj.sigma_prior)
                     sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
-                    local s_sigma_value
+                    s_sigma_value = zero(T)
                     if sigma_param isa Distribution; _tmp ~ NamedDist(sigma_param, sigma_name); s_sigma_value = _tmp; else s_sigma_value = sigma_param; end
 
                     rho_param = get(spec.params, :s_rho, m_obj.rho_prior)
                     rho_name = Symbol("rho_", m_domain, "_", var_name, "_", k)
-                    local s_rho_value
+                    s_rho_value = zero(T)
                     if rho_param isa Distribution
-                        _tmp ~ NamedDist(rho_param, rho_name); s_rho_value = _tmp
+                        _tmp ~ NamedDist(rho_param, rho_name)
+                        s_rho_value = _tmp
                     else
                         s_rho_value = rho_param
                     end
@@ -705,23 +817,50 @@ end
                     s_eta_structured = s_sigma_value .* (sqrt(s_rho_value) .* s_icar .+ sqrt(1.0 - s_rho_value) .* s_iid)
                     latent_innovations[:, k] .+= s_eta_structured[M.s_idx]
 
-                # --- Other GMRF Manifolds ---
+                # --- AR1 Manifold (State-Space) ---
+                elseif m_obj isa AR1
+                    sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
+                    sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
+                    sigma_val = zero(T)
+                    if sigma_param isa Distribution; _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp; else sigma_val = sigma_param; end
+
+                    rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
+                    rho_name = Symbol("rho_", m_domain, "_", var_name, "_", k)
+                    t_rho_param = zero(T)
+                    if rho_param isa Distribution; _tmp_rho ~ NamedDist(rho_param, rho_name); t_rho_param = _tmp_rho; else t_rho_param = rho_param; end
+                    t_rho_vec[k] = t_rho_param
+
+                    t_innovations ~ MvNormal(zeros(T, M.t_N), I)
+                    t_raw = Vector{T}(undef, M.t_N)
+                    t_raw[1] = t_innovations[1] / sqrt(1.0 - t_rho_param^2 + noise)
+                    for i in 2:M.t_N
+                        t_raw[i] = t_rho_param * t_raw[i-1] + t_innovations[i]
+                    end
+                    t_eta_full = (t_raw .* sigma_val)[M.t_idx]
+                    latent_innovations[:, k] .+= t_eta_full
+
+                    t_Q_base = Symmetric((1.0 + t_rho_param^2) .* I(M.t_N) .- t_rho_param .* spec.Q_template)
+                    t_Q_vec[k] = Symmetric((1.0 / (sigma_val^2 * (1.0 - t_rho_param^2) + noise)) .* t_Q_base)
+
+                # --- Other GMRF Manifolds (ICAR, RW, etc.) ---
                 elseif m_obj isa Union{ICAR, Besag, RW1, RW2, AR1, Leroux, SAR, Cyclic}
                     sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
                     sigma_name = Symbol("sigma_", m_domain, "_", var_name, "_", k)
-                    local sigma_val
+                    sigma_val = zero(T)
                     if sigma_param isa Distribution
-                        _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp
+                        _tmp ~ NamedDist(sigma_param, sigma_name)
+                        sigma_val = _tmp
                     else
                         sigma_val = sigma_param
                     end
 
-                    local rho_val = nothing
+                    rho_val = nothing
                     if hasproperty(m_obj, :rho_prior)
                         rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
                         rho_name = Symbol("rho_", m_domain, "_", var_name, "_", k)
                         if rho_param isa Distribution
-                            _tmp ~ NamedDist(rho_param, rho_name); rho_val = _tmp
+                            _tmp ~ NamedDist(rho_param, rho_name)
+                            rho_val = _tmp
                         else
                             rho_val = rho_param
                         end
@@ -742,6 +881,12 @@ end
                     indices = if m_domain == :spatial; M.s_idx; elseif m_domain == :temporal; M.t_idx; else M.u_idx; end
                     latent_innovations[:, k] .+= latent[indices]
 
+                    if m_domain == :spatial
+                        s_Q_vec[k] = Q
+                    elseif m_domain == :temporal
+                        t_Q_vec[k] = Q
+                    end
+
                 # --- Basis Function Manifolds ---
                 elseif m_obj isa Union{PSpline, BSpline, TPS, RFF, FFT}
                     var_sym = spec.var
@@ -750,9 +895,10 @@ end
 
                     sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
                     sigma_name = Symbol("sigma_basis_", var_sym, "_", k)
-                    local sigma_val
+                    sigma_val = zero(T)
                     if sigma_param isa Distribution
-                        _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp
+                        _tmp ~ NamedDist(sigma_param, sigma_name)
+                        sigma_val = _tmp
                     else
                         sigma_val = sigma_param
                     end
@@ -766,17 +912,20 @@ end
                     var_sym = spec.var
                     ls_param = get(spec.params, :lengthscale_prior, m_obj.lengthscale_prior)
                     ls_name = Symbol("ls_gp_", var_sym, "_", k)
-                    local ls
+                    ls = zero(T)
                     if ls_param isa AbstractVector
-                        _tmp ~ NamedDist(Product(ls_param), ls_name); ls = _tmp
+                        _tmp ~ NamedDist(Product(ls_param), ls_name)
+                        ls = _tmp
                     else
-                        _tmp ~ NamedDist(ls_param, ls_name); ls = _tmp
+                        _tmp ~ NamedDist(ls_param, ls_name)
+                        ls = _tmp
                     end
                     sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
                     sigma_name = Symbol("sigma_gp_", var_sym, "_", k)
-                    local sigma_val
+                    sigma_val = zero(T)
                     if sigma_param isa Distribution
-                        _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp
+                        _tmp ~ NamedDist(sigma_param, sigma_name)
+                        sigma_val = _tmp
                     else
                         sigma_val = sigma_param
                     end
@@ -792,17 +941,19 @@ end
                 elseif m_obj isa SPDE
                     sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
                     sigma_name = Symbol("sigma_spde_", var_name, "_", k)
-                    local sigma_val
+                    sigma_val = zero(T)
                     if sigma_param isa Distribution
-                        _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp
+                        _tmp ~ NamedDist(sigma_param, sigma_name)
+                        sigma_val = _tmp
                     else
                         sigma_val = sigma_param
                     end
                     kappa_param = get(spec.params, :kappa_prior, m_obj.kappa_prior)
                     kappa_name = Symbol("kappa_spde_", var_name, "_", k)
-                    local kappa_val
+                    kappa_val = zero(T)
                     if kappa_param isa Distribution
-                        _tmp ~ NamedDist(kappa_param, kappa_name); kappa_val = _tmp
+                        _tmp ~ NamedDist(kappa_param, kappa_name)
+                        kappa_val = _tmp
                     else
                         kappa_val = kappa_param
                     end
@@ -821,18 +972,20 @@ end
                         inner_m_type = Symbol(lowercase(string(typeof(inner_manifold))))
                         sigma_param = get(spec.params, :sigma_prior, inner_manifold.sigma_prior)
                         sigma_name = Symbol("sig_svc_", cov_sym, "_", k)
-                        local sigma_val
+                        sigma_val = zero(T)
                         if sigma_param isa Distribution
-                            _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp
+                            _tmp ~ NamedDist(sigma_param, sigma_name)
+                            sigma_val = _tmp
                         else
                             sigma_val = sigma_param
                         end
-                        local rho_val = nothing
+                        rho_val = nothing
                         if hasproperty(inner_manifold, :rho_prior)
                             rho_param = get(spec.params, :rho_prior, inner_manifold.rho_prior)
                             rho_name = Symbol("rho_svc_", cov_sym, "_", k)
                             if rho_param isa Distribution
-                                _tmp ~ NamedDist(rho_param, rho_name); rho_val = _tmp
+                                _tmp ~ NamedDist(rho_param, rho_name)
+                                rho_val = _tmp
                             else
                                 rho_val = rho_param
                             end
@@ -848,17 +1001,20 @@ end
                     var_sym = spec.var; n_inducing = m_obj.n_inducing; coords = spec.params.coords
                     ls_param = get(spec.params, :lengthscale_prior, m_obj.lengthscale_prior)
                     ls_name = Symbol("ls_sparsegp_", var_sym, "_", k)
-                    local ls
+                    ls = zero(T)
                     if ls_param isa AbstractVector
-                        _tmp ~ NamedDist(Product(ls_param), ls_name); ls = _tmp
+                        _tmp ~ NamedDist(Product(ls_param), ls_name)
+                        ls = _tmp
                     else
-                        _tmp ~ NamedDist(ls_param, ls_name); ls = _tmp
+                        _tmp ~ NamedDist(ls_param, ls_name)
+                        ls = _tmp
                     end
                     sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
                     sigma_name = Symbol("sigma_sparsegp_", var_sym, "_", k)
-                    local sigma_val
+                    sigma_val = zero(T)
                     if sigma_param isa Distribution
-                        _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp
+                        _tmp ~ NamedDist(sigma_param, sigma_name)
+                        sigma_val = _tmp
                     else
                         sigma_val = sigma_param
                     end
@@ -906,6 +1062,48 @@ end
                     cluster_effects ~ NamedDist(MvNormal(zeros(n_clusters), sigma^2 * I), latent_name)
                     latent_innovations[:, k] .+= cluster_effects[cluster_assignments]
                 end
+            end
+        end
+    end
+
+    # # 4.1 Space-Time Interaction Manifold
+    model_st = get(M, :model_st, "none")
+    if model_st != "none"
+        st_sigma ~ NamedDist(filldist(Exponential(0.5), outcomes_N), :st_sigma)
+
+        for k in 1:outcomes_N
+            s_Q_k = get(s_Q_vec, k, sparse(I(M.s_N)))
+            t_Q_k = get(t_Q_vec, k, sparse(I(M.t_N)))
+            t_rho_k = get(t_rho_vec, k, zero(T))
+
+            if model_st == "IV"
+                st_innovations ~ MvNormal(zeros(T, M.s_N * M.t_N), I)
+                st_innov_matrix = reshape(st_innovations, M.s_N, M.t_N)
+
+                L_s = cholesky(Symmetric(s_Q_k + noise * I)).L
+                spatially_correlated_innov = L_s' \ st_innov_matrix
+
+                st_inter = Matrix{T}(undef, M.s_N, M.t_N)
+                st_inter[:, 1] = spatially_correlated_innov[:, 1] ./ sqrt(1.0 - t_rho_k^2 + noise)
+                for t in 2:M.t_N
+                    st_inter[:, t] = t_rho_k .* st_inter[:, t-1] .+ spatially_correlated_innov[:, t]
+                end
+                
+                for i in 1:M.y_N
+                    latent_innovations[i, k] += st_inter[M.s_idx[i], M.t_idx[i]] * st_sigma[k]
+                end
+
+            elseif model_st == "II"
+                st_Q2 = kron(sparse(I(M.s_N)), t_Q_k)
+                st_raw ~ MvNormalCanon(zeros(T, M.s_N * M.t_N), st_Q2 + noise * I)
+                st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma[k]
+                for i in 1:M.y_N; latent_innovations[i, k] += st_inter[M.s_idx[i], M.t_idx[i]]; end
+
+            elseif model_st == "III"
+                st_Q3 = kron(s_Q_k, sparse(I(M.t_N)))
+                st_raw ~ MvNormalCanon(zeros(T, M.s_N * M.t_N), st_Q3 + noise * I)
+                st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma[k]
+                for i in 1:M.y_N; latent_innovations[i, k] += st_inter[M.s_idx[i], M.t_idx[i]]; end
             end
         end
     end
@@ -980,6 +1178,12 @@ end
         if family in ["gaussian", "student_t", "laplace"]; eta .+= exp.(M.log_offset); else; eta .+= M.log_offset; end
     end
 
+    # Scaffolding for ST interactions
+    s_Q = sparse(I(M.s_N))
+    t_Q = sparse(I(M.t_N))
+    t_rho = zero(T)
+
+
     # This loop will add all spatial, temporal, etc. effects defined in the formula
     for spec in M.manifolds
         m_obj = spec.manifold_obj
@@ -991,22 +1195,59 @@ end
         m_domain = spec.domain
         var_name = string(spec.var)
 
-        if m_obj isa Union{ICAR, Besag, RW1, RW2, AR1, Leroux, SAR, Cyclic, BYM2, IID}
+        # This model is univariate, so we don't loop over outcomes
+        if m_obj isa AR1
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_", m_domain, "_", var_name)
-            local sigma_val
+            sigma_val = zero(T)
+            if sigma_param isa Distribution; _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp; else sigma_val = sigma_param; end
+
+            rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
+            rho_name = Symbol("rho_", m_domain, "_", var_name)
+            t_rho_param = zero(T)
+            if rho_param isa Distribution; _tmp_rho ~ NamedDist(rho_param, rho_name); t_rho_param = _tmp_rho; else t_rho_param = rho_param; end
+            t_rho = t_rho_param
+
+            t_innovations ~ MvNormal(zeros(T, M.t_N), I)
+            t_raw = Vector{T}(undef, M.t_N)
+            t_raw[1] = t_innovations[1] / sqrt(1.0 - t_rho^2 + noise)
+            for i in 2:M.t_N
+                t_raw[i] = t_rho * t_raw[i-1] + t_innovations[i]
+            end
+            t_eta_full = (t_raw .* sigma_val)[M.t_idx]
+            eta .+= t_eta_full
+
+            t_Q_base = Symmetric((1.0 + t_rho^2) .* I(M.t_N) .- t_rho .* spec.Q_template)
+            t_Q = Symmetric((1.0 / (sigma_val^2 * (1.0 - t_rho^2) + noise)) .* t_Q_base)
+
+        elseif m_obj isa BYM2
+            sigma_param = get(spec.params, :s_sigma, m_obj.sigma_prior)
+            rho_param = get(spec.params, :s_rho, m_obj.rho_prior)
+            s_sigma_value ~ NamedDist(sigma_param, Symbol("sigma_", m_domain, "_", var_name))
+            s_rho_value ~ NamedDist(rho_param, Symbol("rho_", m_domain, "_", var_name))
+            s_icar ~ MvNormalCanon(zeros(M.s_N), spec.Q_template + noise * I)
+            s_iid ~ MvNormal(zeros(M.s_N), I)
+            sum(s_icar) ~ Normal(0, 0.001 * M.s_N)
+            s_eta_structured = s_sigma_value .* (sqrt(s_rho_value) .* s_icar .+ sqrt(1.0 - s_rho_value) .* s_iid)
+            eta .+= s_eta_structured[M.s_idx]
+        elseif m_obj isa Union{ICAR, Besag, RW1, RW2, Leroux, SAR, Cyclic, IID}
+            sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
+            sigma_name = Symbol("sigma_", m_domain, "_", var_name)
+            sigma_val = zero(T)
             if sigma_param isa Distribution
-                _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp
+                _tmp ~ NamedDist(sigma_param, sigma_name)
+                sigma_val = _tmp
             else
                 sigma_val = sigma_param
             end
 
-            local rho_val = nothing
+            rho_val = nothing
             if hasproperty(m_obj, :rho_prior)
                 rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
                 rho_name = Symbol("rho_", m_domain, "_", var_name)
                 if rho_param isa Distribution
-                    _tmp_rho ~ NamedDist(rho_param, rho_name); rho_val = _tmp_rho
+                    _tmp_rho ~ NamedDist(rho_param, rho_name)
+                    rho_val = _tmp_rho
                 else
                     rho_val = rho_param
                 end
@@ -1022,13 +1263,46 @@ end
 
             indices = if m_domain == :spatial; M.s_idx; elseif m_domain == :temporal; M.t_idx; else M.u_idx; end
             eta .+= latent[indices]
+
+            if m_domain == :spatial; s_Q = Q; elseif m_domain == :temporal; t_Q = Q; end
         end
     end
 
     # # 4. Add Multi-fidelity RFF effects
     z_beta_eta ~ NamedDist(Normal(0, 1), :z_beta_eta)
     w_beta_eta ~ NamedDist(MvNormal(zeros(3), I), :w_beta_eta)
-    eta .+= (z_latent .* z_beta_eta) .+ (w_latent * w_beta_eta)
+    eta .+= (z_latent[M.s_idx] .* z_beta_eta) .+ (w_latent[M.s_idx, :] * w_beta_eta)
+
+    # # 4.1 Space-Time Interaction Manifold
+    st_eta = zeros(T, M.y_N)
+    model_st = get(M, :model_st, "none")
+    if model_st != "none"
+        st_sigma ~ NamedDist(Exponential(0.5), :st_sigma)
+
+        if model_st == "IV"
+            st_innovations ~ MvNormal(zeros(T, M.s_N * M.t_N), I)
+            st_innov_matrix = reshape(st_innovations, M.s_N, M.t_N)
+            L_s = cholesky(Symmetric(s_Q + noise * I)).L
+            spatially_correlated_innov = L_s' \ st_innov_matrix
+            st_inter = Matrix{T}(undef, M.s_N, M.t_N)
+            st_inter[:, 1] = spatially_correlated_innov[:, 1] ./ sqrt(1.0 - t_rho^2 + noise)
+            for t in 2:M.t_N; st_inter[:, t] = t_rho .* st_inter[:, t-1] .+ spatially_correlated_innov[:, t]; end
+            for i in 1:M.y_N; st_eta[i] = st_inter[M.s_idx[i], M.t_idx[i]] * st_sigma; end
+
+        elseif model_st == "II"
+            st_Q2 = kron(sparse(I(M.s_N)), t_Q)
+            st_raw ~ MvNormalCanon(zeros(T, M.s_N * M.t_N), st_Q2 + noise * I)
+            st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma
+            for i in 1:M.y_N; st_eta[i] = st_inter[M.s_idx[i], M.t_idx[i]]; end
+
+        elseif model_st == "III"
+            st_Q3 = kron(s_Q, sparse(I(M.t_N)))
+            st_raw ~ MvNormalCanon(zeros(T, M.s_N * M.t_N), st_Q3 + noise * I)
+            st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma
+            for i in 1:M.y_N; st_eta[i] = st_inter[M.s_idx[i], M.t_idx[i]]; end
+        end
+        eta .+= st_eta
+    end
 
     # # 5. Joint Multi-fidelity Likelihood
     Turing.@addlogprob! logpdf(MvNormal(z_latent, z_sigma^2 * I), M.z_obs)

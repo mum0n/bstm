@@ -88,6 +88,7 @@ include( srcdir( "spatiotemporal_partitioning_functions.jl" ))   ;
 include( srcdir( "spatiotemporal_functions.jl" ))   ;
 include( srcdir( "build_model_dispatch.jl" ))   ;
 include( srcdir( "bstm_model_supervisors.jl" ))   ;
+include( srcdir( "reconstruction_engine.jl" ))   ;
 
 
 Random.seed!(42) # Set a seed for reproducibility.
