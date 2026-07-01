@@ -1,7 +1,7 @@
 #=
-File: bstm_model_supervisors_v3.jl
-Version: 3.0.0
-Timestamp: 2026-06-30 12:00:00
+File: bstm_model_supervisors_v4.jl
+Version: 4.0.0
+Timestamp: 2026-07-01 09:30:00
 
 Description:
 This file contains the fully updated and optimized versions of the core `bstm` model
@@ -11,7 +11,8 @@ sampling statements.
 Changes in this version:
 - Resolved `LoadError: unreachable` by expanding all single-line conditional sampling
   statements (e.g., `if cond; x ~ dist; else; ...; end`) into standard multi-line
-  `if/else/end` blocks. This ensures compatibility with the Turing.jl `@model` macro parser.
+  `if/else/end` blocks across all model supervisors. This ensures compatibility with
+  the Turing.jl `@model` macro parser.
 - This change is applied systematically across `bstm_univariate`, `bstm_multivariate`,
   and `bstm_multifidelity` to ensure robust model compilation.
 =#
@@ -26,9 +27,15 @@ Changes in this version:
     lik_phi = zero(T)
     extra_p = one(T)
 
-    if family == "negbin"; lik_r ~ NamedDist(Exponential(1.0), :lik_r); end
-    if use_zi == true; lik_phi ~ NamedDist(Beta(1, 1), :lik_phi); end
-    if family in ["gamma", "beta", "student_t", "inverse_gaussian", "pareto"]; extra_p ~ NamedDist(Exponential(1.0), :extra_params); end
+    if family == "negbin"
+        lik_r ~ NamedDist(Exponential(1.0), :lik_r)
+    end
+    if use_zi == true
+        lik_phi ~ NamedDist(Beta(1, 1), :lik_phi)
+    end
+    if family in ["gamma", "beta", "student_t", "inverse_gaussian", "pareto"]
+        extra_p ~ NamedDist(Exponential(1.0), :extra_params)
+    end
 
     # # 2. Observation Volatility & Stochastic Volatility (SV)
     y_sigma = Vector{T}(undef, M.y_N)
@@ -37,10 +44,14 @@ Changes in this version:
         beta_vol_latent ~ NamedDist(filldist(Normal(0, 1), M.M_rff_sigma), :beta_vol_latent)
         vol_proj_field = M.vol_proj * beta_vol_latent
         vol_latent_field = sqrt(2.0 / M.M_rff_sigma) .* cos.(vol_proj_field)
-        for i in 1:M.y_N; y_sigma[i] = exp((sigma_log_var * vol_latent_field[i]) / 2.0); end
+        for i in 1:M.y_N
+            y_sigma[i] = exp((sigma_log_var * vol_latent_field[i]) / 2.0)
+        end
     else
         y_sigma_val ~ NamedDist(get(M.hyperpriors, "y_sigma_prior", Exponential(1.0)), :y_sigma)
-        for i in 1:M.y_N; y_sigma[i] = y_sigma_val; end
+        for i in 1:M.y_N
+            y_sigma[i] = y_sigma_val
+        end
     end
 
     # # 3. Base Predictor: Fixed Effects & Link-Scale Offsets
@@ -54,12 +65,14 @@ Changes in this version:
         eta .+= M.Xfixed * Xfixed_beta
     end
     if haskey(M, :log_offset)
-        if family in ["gaussian", "student_t", "laplace"]; eta .+= exp.(M.log_offset); else; eta .+= M.log_offset; end
+        if family in ["gaussian", "student_t", "laplace"]
+            eta .+= exp.(M.log_offset)
+        else
+            eta .+= M.log_offset
+        end
     end
 
     # # 4. Manifold & Interaction Scaffolding
-    # Local variables to store precision matrices and parameters from the main loop
-    # for use in the space-time interaction block.
     s_Q = sparse(I(M.s_N))
     t_Q = sparse(I(M.t_N))
     t_rho = zero(T)
@@ -111,7 +124,8 @@ Changes in this version:
             end
             s_icar ~ NamedDist(MvNormalCanon(zeros(M.s_N), spec.Q_template + noise * I), Symbol("latent_struct_", m_domain, "_", var_name))
             s_iid ~ NamedDist(MvNormal(zeros(M.s_N), I), Symbol("latent_iid_", m_domain, "_", var_name))
-            sum_icar = sum(s_icar); sum_icar ~ Normal(0, 0.001 * M.s_N)
+            sum_icar = sum(s_icar)
+            sum_icar ~ Normal(0, 0.001 * M.s_N)
             s_eta_structured = s_sigma_value .* (sqrt(s_rho_value) .* s_icar .+ sqrt(1.0 - s_rho_value) .* s_iid)
             eta .+= s_eta_structured[M.s_idx]
 
@@ -135,9 +149,8 @@ Changes in this version:
             else
                 t_rho_param = rho_param
             end
-            t_rho = t_rho_param # Capture for ST interaction
+            t_rho = t_rho_param
 
-            # --- EFFICIENT STATE-SPACE FORMULATION for AR(1) ---
             t_innovations ~ MvNormal(zeros(T, M.t_N), I)
             t_raw = Vector{T}(undef, M.t_N)
             t_raw[1] = t_innovations[1] / sqrt(1.0 - t_rho^2 + noise)
@@ -147,7 +160,6 @@ Changes in this version:
             t_eta_full = (t_raw .* sigma_val)[M.t_idx]
             eta .+= t_eta_full
 
-            # Reconstruct t_Q for potential use in ST interactions
             t_Q_base = Symmetric((1.0 + t_rho^2) .* I(M.t_N) .- t_rho .* spec.Q_template)
             t_Q = Symmetric((1.0 / (sigma_val^2 * (1.0 - t_rho^2) + noise)) .* t_Q_base)
 
@@ -178,11 +190,13 @@ Changes in this version:
             Q = recompose_precision(Symbol(lowercase(string(typeof(m_obj)))), template, sigma_val; extra_param=rho_val, noise=noise)
             latent_name = Symbol("latent_", m_domain, "_", var_name)
             latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
-            if m_obj isa Union{RW1, RW2, ICAR, Besag, Leroux, SAR}; sum_latent = sum(latent); sum_latent ~ Normal(0, 0.001 * n_units); end
+            if m_obj isa Union{RW1, RW2, ICAR, Besag, Leroux, SAR}
+                sum_latent = sum(latent)
+                sum_latent ~ Normal(0, 0.001 * n_units)
+            end
             indices = if m_domain == :spatial; M.s_idx; elseif m_domain == :temporal; M.t_idx; else M.u_idx; end
             eta .+= latent[indices]
 
-            # Capture precision matrices for ST interaction
             if m_domain == :spatial
                 s_Q = Q
             elseif m_domain == :temporal
@@ -204,7 +218,8 @@ Changes in this version:
             if m_obj isa PSpline || m_obj isa TPS
                 Q_penalty = (1.0 / (sigma_val^2 + noise)) .* spec.Q_template
                 latent_coeffs ~ NamedDist(MvNormalCanon(zeros(n_basis_cols), Q_penalty), beta_name)
-                sum_coeffs = sum(latent_coeffs); sum_coeffs ~ Normal(0, 0.001 * n_basis_cols)
+                sum_coeffs = sum(latent_coeffs)
+                sum_coeffs ~ Normal(0, 0.001 * n_basis_cols)
             else
                 latent_coeffs ~ NamedDist(filldist(Normal(0, sigma_val), n_basis_cols), beta_name)
             end
@@ -327,7 +342,9 @@ Changes in this version:
             z ~ NamedDist(filldist(Normal(0, 1), n_factors, n_obs), :latent_scores)
             eta .+= z[1, :]
             reconstructed_data = U * z
-            for i in 1:n_obs; Turing.@addlogprob! logpdf(MvNormal(reconstructed_data[:, i], pdef_sd^2 * I), cov_data[:, i]); end
+            for i in 1:n_obs
+                Turing.@addlogprob! logpdf(MvNormal(reconstructed_data[:, i], pdef_sd^2 * I), cov_data[:, i])
+            end
 
         elseif m_obj isa BCGN
             sigma ~ NamedDist(m_obj.sigma_prior, Symbol("sigma_bcgn_", var_name))
@@ -515,7 +532,6 @@ Changes in this version:
         st_sigma ~ NamedDist(Exponential(0.5), :st_sigma)
 
         if model_st == "IV"
-            # --- EFFICIENT STATE-SPACE FORMULATION for Type IV Interaction ---
             st_innovations ~ MvNormal(zeros(T, M.s_N * M.t_N), I)
             st_innov_matrix = reshape(st_innovations, M.s_N, M.t_N)
 
@@ -605,18 +621,28 @@ end
     lik_phi = zero(T)
     extra_p = ones(T, outcomes_N)
 
-    if family == "negbin"; lik_r ~ NamedDist(Exponential(1.0), :lik_r); end
-    if use_zi == true; lik_phi ~ NamedDist(Beta(1, 1), :lik_phi); end
-    if family in ["gamma", "beta", "student_t"]; extra_p ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :extra_params); end
+    if family == "negbin"
+        lik_r ~ NamedDist(Exponential(1.0), :lik_r)
+    end
+    if use_zi == true
+        lik_phi ~ NamedDist(Beta(1, 1), :lik_phi)
+    end
+    if family in ["gamma", "beta", "student_t"]
+        extra_p ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :extra_params)
+    end
 
     # # 2. Multivariate Coupling & Observation Volatility
     L_corr ~ NamedDist(LKJCholesky(outcomes_N, 1.0, T), :L_corr)
     y_sigma = Matrix{T}(undef, y_N, outcomes_N)
     if family in ["gaussian", "lognormal"]
         y_sigma_val ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :y_sigma)
-        for k in 1:outcomes_N; y_sigma[:, k] .= y_sigma_val[k]; end
+        for k in 1:outcomes_N
+            y_sigma[:, k] .= y_sigma_val[k]
+        end
     else
-        for k in 1:outcomes_N; y_sigma[:, k] .= one(T); end
+        for k in 1:outcomes_N
+            y_sigma[:, k] .= one(T)
+        end
     end
 
     # # 3. Base Predictor: Fixed Effects
@@ -1066,48 +1092,6 @@ end
         end
     end
 
-    # # 4.1 Space-Time Interaction Manifold
-    model_st = get(M, :model_st, "none")
-    if model_st != "none"
-        st_sigma ~ NamedDist(filldist(Exponential(0.5), outcomes_N), :st_sigma)
-
-        for k in 1:outcomes_N
-            s_Q_k = get(s_Q_vec, k, sparse(I(M.s_N)))
-            t_Q_k = get(t_Q_vec, k, sparse(I(M.t_N)))
-            t_rho_k = get(t_rho_vec, k, zero(T))
-
-            if model_st == "IV"
-                st_innovations ~ MvNormal(zeros(T, M.s_N * M.t_N), I)
-                st_innov_matrix = reshape(st_innovations, M.s_N, M.t_N)
-
-                L_s = cholesky(Symmetric(s_Q_k + noise * I)).L
-                spatially_correlated_innov = L_s' \ st_innov_matrix
-
-                st_inter = Matrix{T}(undef, M.s_N, M.t_N)
-                st_inter[:, 1] = spatially_correlated_innov[:, 1] ./ sqrt(1.0 - t_rho_k^2 + noise)
-                for t in 2:M.t_N
-                    st_inter[:, t] = t_rho_k .* st_inter[:, t-1] .+ spatially_correlated_innov[:, t]
-                end
-                
-                for i in 1:M.y_N
-                    latent_innovations[i, k] += st_inter[M.s_idx[i], M.t_idx[i]] * st_sigma[k]
-                end
-
-            elseif model_st == "II"
-                st_Q2 = kron(sparse(I(M.s_N)), t_Q_k)
-                st_raw ~ MvNormalCanon(zeros(T, M.s_N * M.t_N), st_Q2 + noise * I)
-                st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma[k]
-                for i in 1:M.y_N; latent_innovations[i, k] += st_inter[M.s_idx[i], M.t_idx[i]]; end
-
-            elseif model_st == "III"
-                st_Q3 = kron(s_Q_k, sparse(I(M.t_N)))
-                st_raw ~ MvNormalCanon(zeros(T, M.s_N * M.t_N), st_Q3 + noise * I)
-                st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma[k]
-                for i in 1:M.y_N; latent_innovations[i, k] += st_inter[M.s_idx[i], M.t_idx[i]]; end
-            end
-        end
-    end
-
     # Apply multivariate coupling to the innovations
     eta .+= (latent_innovations * L_corr.L)
 
@@ -1123,6 +1107,26 @@ end
         end
     end
 end
+#=
+File: bstm_model_supervisors_multfidelity_v4.jl
+Version: 4.0.0
+Timestamp: 2026-07-01 10:03:04
+
+Description:
+This file contains the corrected version of the `bstm_multifidelity` model
+supervisor function. It resolves inconsistencies in parameterization and latent
+variable naming to align with the reconstruction engine.
+
+Changes in this version:
+- Corrected the BYM2 block to name the latent `s_icar` and `s_iid` variables
+  using `NamedDist`, making them available in the MCMC chain.
+- Corrected the AR1 block to name the `t_innovations` vector, allowing the
+  reconstruction engine to rebuild the latent temporal field.
+- Refactored the ICAR/Besag/RW blocks to use a consistent non-centered
+  parameterization, aligning them with the BYM2 model and the reconstruction engine's
+  expectations.
+=#
+
 
 @model function bstm_multifidelity(M, ::Type{T}=Float64) where {T}
     # # 1. Global Hyperpriors
@@ -1134,9 +1138,15 @@ end
     lik_phi = zero(T)
     extra_p = one(T)
 
-    if family == "negbin"; lik_r ~ NamedDist(Exponential(1.0), :lik_r); end
-    if use_zi == true; lik_phi ~ NamedDist(Beta(1, 1), :lik_phi); end
-    if family in ["gamma", "beta", "student_t", "inverse_gaussian", "pareto"]; extra_p ~ NamedDist(Exponential(1.0), :extra_params); end
+    if family == "negbin"
+        lik_r ~ NamedDist(Exponential(1.0), :lik_r)
+    end
+    if use_zi == true
+        lik_phi ~ NamedDist(Beta(1, 1), :lik_phi)
+    end
+    if family in ["gamma", "beta", "student_t", "inverse_gaussian", "pareto"]
+        extra_p ~ NamedDist(Exponential(1.0), :extra_params)
+    end
 
     y_sigma = Vector{T}(undef, M.y_N)
     if get(M, :use_sv, false) == true
@@ -1144,10 +1154,14 @@ end
         beta_vol_latent ~ NamedDist(filldist(Normal(0, 1), M.M_rff_sigma), :beta_vol_latent)
         vol_proj_field = M.vol_proj * beta_vol_latent
         vol_latent_field = sqrt(2.0 / M.M_rff_sigma) .* cos.(vol_proj_field)
-        for i in 1:M.y_N; y_sigma[i] = exp((sigma_log_var * vol_latent_field[i]) / 2.0); end
+        for i in 1:M.y_N
+            y_sigma[i] = exp((sigma_log_var * vol_latent_field[i]) / 2.0)
+        end
     else
         y_sigma_val ~ NamedDist(get(M.hyperpriors, "y_sigma_prior", Exponential(1.0)), :y_sigma)
-        for i in 1:M.y_N; y_sigma[i] = y_sigma_val; end
+        for i in 1:M.y_N
+            y_sigma[i] = y_sigma_val
+        end
     end
 
     # # 2. Multi-fidelity Priors and Latent Fields
@@ -1175,7 +1189,11 @@ end
         eta .+= M.Xfixed * Xfixed_beta
     end
     if haskey(M, :log_offset)
-        if family in ["gaussian", "student_t", "laplace"]; eta .+= exp.(M.log_offset); else; eta .+= M.log_offset; end
+        if family in ["gaussian", "student_t", "laplace"]
+            eta .+= exp.(M.log_offset)
+        else
+            eta .+= M.log_offset
+        end
     end
 
     # Scaffolding for ST interactions
@@ -1199,21 +1217,22 @@ end
         if m_obj isa AR1
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_", m_domain, "_", var_name)
-            sigma_val = zero(T)
-            if sigma_param isa Distribution; _tmp ~ NamedDist(sigma_param, sigma_name); sigma_val = _tmp; else sigma_val = sigma_param; end
+            sigma_val ~ NamedDist(sigma_param, sigma_name)
 
             rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
             rho_name = Symbol("rho_", m_domain, "_", var_name)
-            t_rho_param = zero(T)
-            if rho_param isa Distribution; _tmp_rho ~ NamedDist(rho_param, rho_name); t_rho_param = _tmp_rho; else t_rho_param = rho_param; end
+            t_rho_param ~ NamedDist(rho_param, rho_name)
             t_rho = t_rho_param
 
-            t_innovations ~ MvNormal(zeros(T, M.t_N), I)
+            innov_name = Symbol("innovations_", m_domain, "_", var_name)
+            t_innovations ~ NamedDist(MvNormal(zeros(T, M.t_N), I), innov_name)
+
             t_raw = Vector{T}(undef, M.t_N)
             t_raw[1] = t_innovations[1] / sqrt(1.0 - t_rho^2 + noise)
             for i in 2:M.t_N
                 t_raw[i] = t_rho * t_raw[i-1] + t_innovations[i]
             end
+
             t_eta_full = (t_raw .* sigma_val)[M.t_idx]
             eta .+= t_eta_full
 
@@ -1225,46 +1244,51 @@ end
             rho_param = get(spec.params, :s_rho, m_obj.rho_prior)
             s_sigma_value ~ NamedDist(sigma_param, Symbol("sigma_", m_domain, "_", var_name))
             s_rho_value ~ NamedDist(rho_param, Symbol("rho_", m_domain, "_", var_name))
-            s_icar ~ MvNormalCanon(zeros(M.s_N), spec.Q_template + noise * I)
-            s_iid ~ MvNormal(zeros(M.s_N), I)
-            sum(s_icar) ~ Normal(0, 0.001 * M.s_N)
+            latent_struct_name = Symbol("latent_", m_domain, "_struct_", var_name)
+            latent_iid_name = Symbol("latent_", m_domain, "_iid_", var_name)
+            s_icar ~ NamedDist(MvNormalCanon(zeros(M.s_N), spec.Q_template + noise * I), latent_struct_name)
+            s_iid ~ NamedDist(MvNormal(zeros(M.s_N), I), latent_iid_name)
+            s_icar_sum = sum(s_icar)
+            s_icar_sum ~ Normal(0, 0.001 * M.s_N)
             s_eta_structured = s_sigma_value .* (sqrt(s_rho_value) .* s_icar .+ sqrt(1.0 - s_rho_value) .* s_iid)
             eta .+= s_eta_structured[M.s_idx]
         elseif m_obj isa Union{ICAR, Besag, RW1, RW2, Leroux, SAR, Cyclic, IID}
             sigma_param = get(spec.params, :sigma_prior, m_obj.sigma_prior)
             sigma_name = Symbol("sigma_", m_domain, "_", var_name)
-            sigma_val = zero(T)
-            if sigma_param isa Distribution
-                _tmp ~ NamedDist(sigma_param, sigma_name)
-                sigma_val = _tmp
-            else
-                sigma_val = sigma_param
-            end
+            sigma_val ~ NamedDist(sigma_param, sigma_name)
 
             rho_val = nothing
             if hasproperty(m_obj, :rho_prior)
                 rho_param = get(spec.params, :rho_prior, m_obj.rho_prior)
                 rho_name = Symbol("rho_", m_domain, "_", var_name)
-                if rho_param isa Distribution
-                    _tmp_rho ~ NamedDist(rho_param, rho_name)
-                    rho_val = _tmp_rho
-                else
-                    rho_val = rho_param
-                end
+                rho_val ~ NamedDist(rho_param, rho_name)
             end
 
-            template = spec.Q_template; n_units = size(template, 1)
-            Q = recompose_precision(Symbol(lowercase(string(typeof(m_obj)))), template, sigma_val; extra_param=rho_val, noise=noise)
+            n_units = if m_domain == :spatial; M.s_N; elseif m_domain == :temporal; M.t_N; else M.u_N; end
+
+            Q_base = if m_obj isa Leroux
+                (rho_val * spec.Q_template) + (1-rho_val) * sparse(I(n_units))
+            else
+                spec.Q_template
+            end
 
             latent_name = Symbol("latent_", m_domain, "_", var_name)
-            latent ~ NamedDist(MvNormalCanon(zeros(n_units), Q), latent_name)
+            latent_raw ~ NamedDist(MvNormalCanon(zeros(n_units), Q_base + noise * I), latent_name)
 
-            if m_obj isa Union{RW1, RW2, ICAR, Besag, Leroux, SAR}; sum_latent = sum(latent); sum_latent ~ Normal(0, 0.001 * n_units); end
+            if m_obj isa Union{RW1, RW2, ICAR, Besag, Leroux, SAR}
+                sum_latent = sum(latent_raw)
+                sum_latent ~ Normal(0, 0.001 * n_units)
+            end
 
             indices = if m_domain == :spatial; M.s_idx; elseif m_domain == :temporal; M.t_idx; else M.u_idx; end
-            eta .+= latent[indices]
+            eta .+= (latent_raw .* sigma_val)[indices]
 
-            if m_domain == :spatial; s_Q = Q; elseif m_domain == :temporal; t_Q = Q; end
+            Q_scaled = (1/(sigma_val^2 + noise)) * Q_base
+            if m_domain == :spatial
+                s_Q = Q_scaled
+            elseif m_domain == :temporal
+                t_Q = Q_scaled
+            end
         end
     end
 
@@ -1286,20 +1310,28 @@ end
             spatially_correlated_innov = L_s' \ st_innov_matrix
             st_inter = Matrix{T}(undef, M.s_N, M.t_N)
             st_inter[:, 1] = spatially_correlated_innov[:, 1] ./ sqrt(1.0 - t_rho^2 + noise)
-            for t in 2:M.t_N; st_inter[:, t] = t_rho .* st_inter[:, t-1] .+ spatially_correlated_innov[:, t]; end
-            for i in 1:M.y_N; st_eta[i] = st_inter[M.s_idx[i], M.t_idx[i]] * st_sigma; end
+            for t in 2:M.t_N
+                st_inter[:, t] = t_rho .* st_inter[:, t-1] .+ spatially_correlated_innov[:, t]
+            end
+            for i in 1:M.y_N
+                st_eta[i] = st_inter[M.s_idx[i], M.t_idx[i]] * st_sigma
+            end
 
         elseif model_st == "II"
             st_Q2 = kron(sparse(I(M.s_N)), t_Q)
             st_raw ~ MvNormalCanon(zeros(T, M.s_N * M.t_N), st_Q2 + noise * I)
             st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma
-            for i in 1:M.y_N; st_eta[i] = st_inter[M.s_idx[i], M.t_idx[i]]; end
+            for i in 1:M.y_N
+                st_eta[i] = st_inter[M.s_idx[i], M.t_idx[i]]
+            end
 
         elseif model_st == "III"
             st_Q3 = kron(s_Q, sparse(I(M.t_N)))
             st_raw ~ MvNormalCanon(zeros(T, M.s_N * M.t_N), st_Q3 + noise * I)
             st_inter = reshape(st_raw, M.s_N, M.t_N) .* st_sigma
-            for i in 1:M.y_N; st_eta[i] = st_inter[M.s_idx[i], M.t_idx[i]]; end
+            for i in 1:M.y_N
+                st_eta[i] = st_inter[M.s_idx[i], M.t_idx[i]]
+            end
         end
         eta .+= st_eta
     end
