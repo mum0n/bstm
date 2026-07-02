@@ -1143,3 +1143,14 @@ function _reconstruct(arch::MultifidelityArchitecture, modelname::String, chain,
 
     return NamedTuple(summarized_effects)
 end
+
+
+function to_vector(x)
+    if x isa AbstractArray
+        return vec(collect(Float64, x))
+    else
+        return [Float64(x)]
+    end
+end
+  
+

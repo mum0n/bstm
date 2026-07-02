@@ -73,38 +73,6 @@ end
 print( "\nTo (re)-install required packages, run:  install_required_packages() or Pkg.instantiate() \n\n" ) 
   
 
-# support functions
-# include( srcdir( "data_prep.jl") );
-# include( srcdir( "unit_test_functions.jl" ))   ;
-# include( srcdir( "legacy.jl" ))   ;
-# include( srcdir( "example_turing_models.jl" ))   ;
-
-include( srcdir( "utility_functions.jl" ))   ;
-include( srcdir( "structs.jl" ))   ;
-
-include( srcdir( "spatiotemporal_partitioning_functions.jl" ))   ;
-include( srcdir( "spatiotemporal_functions.jl" ))   ;
-include( srcdir( "build_model_dispatch.jl" ))   ;
-include( srcdir( "bstm_model_supervisors.jl" ))   ;
-include( srcdir( "reconstruction_engine.jl" ))   ;
-include( srcdir( "visualization_engine.jl" ))   ;
-
-
-   
-allfiles = unique( pushfirst!( readdir(srcdir() ), "structs.jl" ) )
-
-for filename in allfiles 
-  if endswith(filename, ".jl")
-    filepath = joinpath(directory_path, filename)
-    try
-        include(filepath)
-    catch e
-        @error "Error including file '$filepath':" e
-    end
-end
- 
-
-Random.seed!(42) # Set a seed for reproducibility.
 
 import MCMCChains
 import DynamicPPL
@@ -134,3 +102,42 @@ DEBUG = Ref{Any}()  # initiate
 print( "\nTo Debug a variable, place some like the following into your function: \n
   Main.DEBUG[] = y,p,t  # this stores y, p, t into Main.DEBUG \n
 which means, you can see what these values are by typing: DEBUG.y, etc... \n")
+
+# support functions
+# include( srcdir( "data_prep.jl") );
+# include( srcdir( "unit_test_functions.jl" ))   ;
+# include( srcdir( "legacy.jl" ))   ;
+# include( srcdir( "example_turing_models.jl" ))   ;
+
+# include( srcdir( "utility_functions.jl" ))   ;
+# include( srcdir( "structs.jl" ))   ;
+
+# include( srcdir( "spatiotemporal_partitioning_functions.jl" ))   ;
+# include( srcdir( "spatiotemporal_functions.jl" ))   ;
+# include( srcdir( "build_model_dispatch.jl" ))   ;
+# include( srcdir( "bstm_model_supervisors.jl" ))   ;
+# include( srcdir( "reconstruction_engine.jl" ))   ;
+# include( srcdir( "visualization_engine.jl" ))   ;
+
+function load_project_functions( src_dir=srcdir() )
+    
+  # structs.jl must come first   
+  allfiles = unique( pushfirst!( readdir( src_dir ), "structs.jl" ) )  
+
+  for filename in allfiles 
+    if endswith(filename, ".jl")
+      filepath = joinpath(src_dir, filename)
+      try
+        println(filepath)  
+        include(filepath)
+      catch e
+          @error "Error including file '$filepath':" e
+      end
+    end
+  end
+
+end
+
+load_project_functions( srcdir() )
+
+Random.seed!(42) # Set a seed for reproducibility.

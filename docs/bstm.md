@@ -89,13 +89,10 @@ else
     project_directory = joinpath( "C:\\", "Users", "choij", "projects", "bstm")  # examples
 end
 
-include( joinpath( project_directory, "scripts", "startup.jl" ) ) # might need to run this a few times if there are stragglers   
+include( joinpath( project_directory, "startup.jl" ) ) # might need to run this a few times if there are stragglers   
 
-# or individually:
-# include( joinpath( project_directory, "src", "data_prep.jl" ) ) # support functions  
-# include( joinpath( project_directory, "src", "structs.jl" ) ) # architectural specifications  
-# include( joinpath( project_directory, "src", "spatiotemporal_functions.jl" ) )       # support functions
-# include( joinpath( project_directory, "src", "dynamics_functions.jl" ))   ;
+# or to reload just the functions (after an edit) 
+# load_project_functions( srcdir() )
 
 # Pkg.instantiate()  # to force a reset if some package seems corrupted/partially installed
 # Pkg.update()  # to update this can break dependencies .. do this only if you really need to 
@@ -156,7 +153,7 @@ chn, inits, os, summary, plt = bstm_sample(m; nsample=100, testing=true )  # sim
 
 res = model_results_comprehensive( m, chn );
   
-model_results_plots(res, centroids = data_scot[:au][:centroids], polygons = data_scot[:au][:polygons])
+model_results_plots(res, data_scot[:data], centroids = data_scot[:au][:centroids], polygons = data_scot[:au][:polygons])
 
 
 ```
