@@ -122,7 +122,7 @@ which means, you can see what these values are by typing: DEBUG.y, etc... \n")
 function load_project_functions( src_dir=srcdir() )
     
   # structs.jl must come first   
-  allfiles = unique( pushfirst!( readdir( src_dir ), "structs.jl" ) )  
+  allfiles = readdir( src_dir )  
 
   for filename in allfiles 
     if endswith(filename, ".jl")

@@ -8,12 +8,10 @@ The Architecture of Bayesian Spatio-Temporal Modeling: A Monograph on the `bstm(
 1. Introduction: The Evolution of Latent Gaussian Models
 
 In the current landscape of computational statistics, the primary bottleneck in spatio-temporal inference is the structural rigidity of traditional monolithic models. These legacy approaches often hard-code the relationship between covariates and random effects, leading to models that are computationally fragile and difficult to extend. The bstm() framework resolves this by treating the latent process as an orthogonal, composable entity, decoupled from the observation likelihood.
-
-At the core of `bstm()` is the "Manifold-as-Primitive" philosophy. Rather than treating spatial or temporal effects as fixed components of a linear predictor, the framework implements them as low-level primitives inheriting from the `Manifold` abstract type. These primitives are domain-agnostic until the model-building stage; an `AR1` structure can define a temporal process or be composed into a higher-dimensional spatial field. This architectural decoupling mitigates structural rigidity and allows for the construction of physics-informed models through a unified formulaic interface. By treating manifolds as first-class citizens in a Domain Specific Language (DSL), `bstm()` provides the software infrastructure necessary to bridge the gap between abstract manifold geometry and high-performance Bayesian computation.
-
+ 
 2. Mathematical Foundations: Manifolds and Stochastic Primitives
 
-The mathematical registry of `bstm()` (v06.1) standardizes the transition from discrete graph topologies to continuous spectral approximations. This unified representation is critical for dispatching efficient kernels across varying data scales.
+The mathematical registry of `bstm()` standardizes the transition from discrete graph topologies to continuous spectral approximations. This unified representation is critical for dispatching efficient kernels across varying data scales.
 
 The Discrete Registry: Gaussian Markov Random Fields (GMRF)
 
@@ -31,7 +29,7 @@ AR1	\mu_t = \rho \mu_{t-1} + \epsilon_t.	Stationary temporal process with geomet
 
 Continuous, Spectral, and Advanced Manifolds
 
-To circumvent the O(N^3) cost of kernel-based Gaussian Processes, the framework utilizes spectral projections and sparse approximations found in the `v06.1` registry:
+To circumvent the O(N^3) cost of kernel-based Gaussian Processes, the framework utilizes spectral projections and sparse approximations found in the `` registry:
 
 * Random Fourier Features (RFF): Maps input coordinates x into a randomized feature space to approximate the kernel. The projection is defined as z(x) = \sqrt{2/M} \cos(Wx + b), where W is the spectral frequency matrix sampled from the kernel’s Fourier transform. This transforms a non-linear GP into a linear model with M features.
 * SPDE: Represents the field as a solution to (\kappa^2 - \Delta)^{\alpha/2} u = \mathcal{W}, mapping continuous Matérn processes onto a discrete mesh.
@@ -100,9 +98,9 @@ For complex stochastic states, `bstm()` employs specialized kernels. In `Interva
 
 Model dispatch is handled by three core architectures, determined by the dimensionality and quality of the response data.
 
-1. UnivariateArchitecture: The default kernel for single-outcome processes.
-2. MultivariateArchitecture: Models dependent outcomes through matrix-variate kernels. It utilizes the InverseWishartFamily for covariance estimation, ensuring positive definiteness via a PDMat transformation of the latent matrix \eta \eta^T + \epsilon I.
-3. MultifidelityArchitecture: Orchestrates data from heterogeneous sources. It uses a `nested()` supervisor discovery logic and the `fidelity_metadata` engine. This engine manages unit-specific templates and observation masks (`y_ok`) to link low-fidelity "proxies" to high-fidelity "truth," making it ideal for multi-sensor environmental monitoring.
+- UnivariateArchitecture: The default kernel for single-outcome processes.
+- MultivariateArchitecture: Models dependent outcomes through matrix-variate kernels. It utilizes the InverseWishartFamily for covariance estimation, ensuring positive definiteness via a PDMat transformation of the latent matrix \eta \eta^T + \epsilon I.
+ 
 
 6. The bstm() Formulaic Interface: User-Centric Modeling
 
@@ -110,10 +108,10 @@ The user-facing `bstm()` function provides a high-level interface that minimizes
 
 DSL Syntax Breakdown
 
-* spatial(s_idx; model='bym2'): High-level spatial effect dispatch.
-* temporal(t_idx; model='rw2'): High-level temporal smoothing.
-* smooth(x, y; model='rff'): 2D spectral smoother using informed RFF parameters.
-* eigen(var; rank=k): Low-rank factor analytic terms.
+* spatial(s_idx; model=bym2): High-level spatial effect dispatch.
+* temporal(t_idx; model=rw2): High-level temporal smoothing.
+* smooth(x, y; model=rff): 2D spectral smoother using informed RFF parameters.
+* eigen(var; rank=k): Low-rank factor with k analytic terms.
 
 Prior Resolution: The PC-Prior Standard
 
@@ -127,11 +125,11 @@ Kappa (\kappa)	Exponential(1.0)	Controls SPDE smoothness via principled shrinkag
 
 7. Illustrative Examples: Guided Model Implementation
 
-1. BYM2 Disease Mapping: `y ~ 1 + spatial(s_idx; model='bym2')`. Decomposes risk into structured spatial and unstructured IID noise.
-2. AR1 Temporal Forecasting: `y ~ 1 + temporal(t_idx; model='ar1')`. Captures geometric temporal decay.
+1. BYM2 Disease Mapping: `y ~ 1 + spatial(s_idx; model=bym2)`. Decomposes risk into structured spatial and unstructured IID noise.
+2. AR1 Temporal Forecasting: `y ~ 1 + temporal(t_idx; model=ar1)`. Captures geometric temporal decay.
 3. Spatio-Temporal Interaction: `y ~ 1 + spatial(s_idx) ⊗ temporal(t_idx)`. Employs tensor-product logic to manage O(N \times T) complexity via the Type IV interaction template.
-4. Spatially Varying Coefficients (SVC): `poverty | spatial(s_idx; model='icar')`. Allows the impact of poverty to vary according to local spatial gradients.
-5. Spectral Splines: `smooth(lon, lat; model='rff')`. Approximates a 2D continuous field without the O(N^3) kernel inversion cost.
+4. Spatially Varying Coefficients (SVC): `poverty | spatial(s_idx; model=icar)`. Allows the impact of poverty to vary according to local spatial gradients.
+5. Spectral Splines: `smooth(lon, lat; model=rff)`. Approximates a 2D continuous field without the O(N^3) kernel inversion cost.
 6. Multifidelity Nested Supervision: `nested(z_var; formula='z ~ spatial(s_idx)')`. Uses the `fidelity_metadata` engine and `y_ok` masks to align observations across different quality levels.
 7. Zero-Inflated Ecology: `bstm(..., model_family='poisson', use_zi=true)`. Uses the `ZeroInflated` stochastic state to handle excess zeros in count data.
 
@@ -166,14 +164,14 @@ The `bstm` formula language allows you to build complex models by combining modu
 
 ### Common Modules
 
-| Keyword              | Example Usage                                     | Purpose                                                                                                                                         |                                                                    |
-| :---------------------| :--------------------------------------------------| :------------------------------------------------------------------------------------------------------------------------------------------------| --------------------------------------------------------------------|
-| `spatial`            | `spatial(s_idx, model='bym2')`                    | Models spatial random effects for discrete areal units.                                                                                         |                                                                    |
-| `temporal`           | `temporal(t_idx, u_idx, model=('ar1', 'cyclic'))` | Models temporal trends and/or seasonal effects.                                                                                                 |                                                                    |
-| `smooth`             | `smooth(x, nbins=20)`                             | Creates a non-linear smooth of a continuous covariate `x`.                                                                                      |                                                                    |
-| `mixed`              | `mixed(1                                          | group)`                                                                                                                                         | Defines a random intercept for each level of the `group` variable. |
-| `observationprocess` | `observationprocess(log_offsets=log_offset)`      | Specifies likelihood-level parameters. Options include: `log_offsets`, `weights`, `trials`, `hurdle`, `volatility=true`, `nbins`, `y_L`, `y_U`. |                                                                    |
-| `fixed`              | `x1 + x2`                                         | Standard fixed-effect linear predictors.                                                                                                        |                                                                    |
+| Keyword              | Example Usage                                 | Purpose                                                                                                                                         |                                                                    |
+| :---------------------| :----------------------------------------------| :------------------------------------------------------------------------------------------------------------------------------------------------| --------------------------------------------------------------------|
+| `spatial`            | `spatial(s_idx, model=bym2)`                  | Models spatial random effects for discrete areal units.                                                                                         |                                                                    |
+| `temporal`           | `temporal(t_idx, u_idx, model=(ar1, cyclic))` | Models temporal trends and/or seasonal effects.                                                                                                 |                                                                    |
+| `smooth`             | `smooth(x, nbins=20)`                         | Creates a non-linear smooth of a continuous covariate `x`.                                                                                      |                                                                    |
+| `mixed`              | `mixed(1                                      | group)`                                                                                                                                         | Defines a random intercept for each level of the `group` variable. |
+| `observationprocess` | `observationprocess(log_offsets=log_offset)`  | Specifies likelihood-level parameters. Options include: `log_offsets`, `weights`, `trials`, `hurdle`, `volatility=true`, `nbins`, `y_L`, `y_U`. |                                                                    |
+| `fixed`              | `x1 + x2`                                     | Standard fixed-effect linear predictors.                                                                                                        |                                                                    |
 
 ### Data Transformations
 
@@ -311,11 +309,11 @@ The `smooth()` module is used to model non-linear effects of continuous covariat
 | :----------------------------| :-----------------------------------------------------| :-----------------------------------------------| :----------------------------------------------------------------------| :-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------| :-------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **P-Spline**                | `'pspline'`                                          | `nbins`, `degree`, `diff_order`                | `sigma_prior`: `Exponential(1.0)`                                     | The effect is a linear combination of B-spline basis functions, with a random walk penalty on the basis coefficients to enforce smoothness.                                  | The most common and flexible general-purpose smoother for 1D covariates. `diff_order=2` (the default) penalizes deviations from a straight line.             |
 | **B-Spline**                | `'bspline'`                                          | `nbins`, `degree`                              | `sigma_prior`: `Exponential(1.0)`                                     | The effect is a linear combination of B-spline basis functions with IID coefficients. Assumes the basis functions themselves provide sufficient smoothness.                  | A simpler spline smoother than P-splines. Useful when less regularization is desired.                                                                        |
-| **Thin Plate Spline**       | `'tps'`                                              | `nbins`                                        | `sigma_prior`: `Exponential(1.0)`                                     | The basis functions are derived from a kernel that minimizes a bending energy penalty, $k(r) = r^2 \log(r)$.                                                                 | The classic choice for smoothing 2D spatial coordinates (e.g., `smooth(lon, lat, model='tps')`). It is isotropic (direction-agnostic).                       |
+| **Thin Plate Spline**       | `'tps'`                                              | `nbins`                                        | `sigma_prior`: `Exponential(1.0)`                                     | The basis functions are derived from a kernel that minimizes a bending energy penalty, $k(r) = r^2 \log(r)$.                                                                 | The classic choice for smoothing 2D spatial coordinates (e.g., `smooth(lon, lat, model=tps)`). It is isotropic (direction-agnostic).                         |
 | **Random Fourier Features** | `'rff'`                                              | `n_features` (or `m_rff`), `lengthscale_prior` | `sigma_prior`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Approximates a stationary Gaussian Process kernel (e.g., Squared Exponential) by projecting the covariate into a randomized feature space: $\phi(x) = \sqrt{2/M}\cos(Wx+b)$. | A highly scalable method for approximating a full Gaussian Process smooth. Excellent for very large datasets where the $O(N^3)$ cost of a GP is prohibitive. |
 | **Random Walk (on bins)**   | `'rw1'`, `'rw2'`                                     | `nbins`                                        | `sigma_prior`: `Exponential(1.0)`                                     | Discretizes the continuous covariate into `nbins` ordered categories and applies a first-order (`rw1`) or second-order (`rw2`) random walk GMRF to the bin indices.          | A powerful way to model a non-linear effect as a structured random effect. It is a discrete approximation to a continuous smooth, often used in INLA.        |
 | **ICAR (on bins)**          | `'icar'`, `'besag'`                                  | `nbins`                                        | `sigma_prior`: `Exponential(1.0)`                                     | Discretizes the covariate and applies a spatial ICAR model to the bin indices, assuming adjacent bins are correlated.                                                        | Less common for smoothing a single covariate, but can be used to model effects where adjacent bins have a neighborhood-like dependency.                      |
-| **Interaction Smooth**      | `'icar ⊗ ar1'`  `NOTE: direct interaction is better` | `nbins` (can be a tuple, e.g., `(10, 12)`)     | `sigma_prior`: `Exponential(1.0)`                                     | Discretizes two covariates into a 2D grid and applies a tensor product of two GMRF precision matrices (e.g., a spatial ICAR and a temporal AR1) to the grid indices.         | Models a smooth, non-linear interaction surface between two continuous covariates. For example, `smooth(temperature, depth, model='rw2 ⊗ rw2')`.             |
+| **Interaction Smooth**      | `'icar ⊗ ar1'`  `NOTE: direct interaction is better` | `nbins` (can be a tuple, e.g., `(10, 12)`)     | `sigma_prior`: `Exponential(1.0)`                                     | Discretizes two covariates into a 2D grid and applies a tensor product of two GMRF precision matrices (e.g., a spatial ICAR and a temporal AR1) to the grid indices.         | Models a smooth, non-linear interaction surface between two continuous covariates. For example, `smooth(temperature, depth, model=rw2 ⊗ rw2)`.               |
 | **FFT Basis**               | `'fft'`                                              | `nbins`                                        | `sigma_prior`: `Exponential(1.0)`                                     | The effect is a linear combination of sine and cosine basis functions (a Fourier series).                                                                                    | Best for modeling periodic or cyclical non-linear effects of a covariate.                                                                                    |
 | **Moran's I Basis**         | `'moran'`                                            | `nbins`                                        | `sigma_prior`: `Exponential(1.0)`                                     | Uses eigenvectors of a spatial weights matrix as basis functions to capture effects at different spatial scales. (Proxy used in `bstm`).                                     | Advanced use for filtering or modeling effects at specific spatial frequencies.                                                                              |
 | **Spherical Basis**         | `'spherical'`                                        | `nbins`, `range`                               | `sigma_prior`: `Exponential(1.0)`                                     | Uses a kernel with compact support, meaning the correlation between points is exactly zero beyond a specified `range`.                                                       | Useful when the influence of a covariate is known to be strictly local.                                                                                      |
@@ -1016,7 +1014,7 @@ A common model for disease mapping or species counts.
 
 ```julia
 m = bstm(
-    "counts ~ 1 + spatial(area_id, model='bym2') + temporal(year_id, model='ar1')",
+    "counts ~ 1 + spatial(area_id, model=bym2) + temporal(year_id, model=ar1)",
     my_data,
     model_family="poisson",
     W=my_adjacency_matrix
@@ -1029,7 +1027,7 @@ Models a continuous outcome with a non-linear effect of `temperature` and allows
 
 ```julia
 m = bstm(
-    "yield ~ 1 + smooth(temperature, nbins=20) + spatial(rainfall, s_idx, model='iid')",
+    "yield ~ 1 + smooth(temperature, nbins=20) + spatial(rainfall, s_idx, model=iid)",
     my_data,
     model_family="gaussian"
 )
@@ -1041,7 +1039,7 @@ Models prevalence (0 or 1) with a fully structured spatiotemporal interaction te
 
 ```julia
 m = bstm(
-    "prevalence ~ 1 + spatial(s_idx, model='bym2') + temporal(t_idx, model='ar1') + (spatial(s_idx) ⊗ temporal(t_idx))",
+    "prevalence ~ 1 + spatial(s_idx, model=bym2) + temporal(t_idx, model=ar1) + (spatial(s_idx) ⊗ temporal(t_idx))",
     my_data,
     model_family="binomial",
     W=my_adjacency_matrix
@@ -1078,7 +1076,7 @@ bstm(formula::String, data::DataFrame; kwargs...)
 
 **Example:**
 ```julia
-m = bstm("y ~ 1 + x + spatial(s_idx, model='bym2')", my_data, model_family="poisson")
+m = bstm("y ~ 1 + x + spatial(s_idx, model=bym2)", my_data, model_family="poisson")
 ```
 
 ### 2. Configuration-Based Interface (Advanced)
@@ -1105,7 +1103,7 @@ The `bstm` formula DSL is designed to be expressive and readable. The general st
 
 The `model` argument within modules like `spatial`, `temporal`, and `smooth` specifies the underlying mathematical structure.
 
-| Manifold         | `model='...'`                  | Description                                                                                 |
+| Manifold         | `model=...'`                   | Description                                                                                 |
 | :-----------------| :-------------------------------| :--------------------------------------------------------------------------------------------|
 | `IID`            | `'iid'`                        | Independent and identically distributed (unstructured) random effects.                      |
 | `ICAR`           | `'icar'`, `'besag'`            | Intrinsic Conditional Autoregressive model for spatial smoothing.                           |
@@ -1146,8 +1144,8 @@ bstm("y ~ smooth(x |> log, nbins=15)", my_data)
 Manifolds can be combined algebraically within the formula string.
 
 *   `⊗` (`\otimes`): Kronecker product. Used to create inseparable spatiotemporal interactions.
-    *   Example: `spacetime(model='spatial(s_idx) ⊗ temporal(t_idx)')`
-    *   Example: `spacetime(model='spatial(s_idx) ⊗ temporal(t_idx)')`
+    *   Example: `spacetime(model=spatial(s_idx) ⊗ temporal(t_idx))`
+    *   Example: `spacetime(model=spatial(s_idx) ⊗ temporal(t_idx))`
 *   `⊕` (`\oplus`): Direct sum. (Future support for block-diagonal structures).
 
 ## Configuration (Advanced)
@@ -1158,14 +1156,14 @@ Manifolds can be combined algebraically within the formula string.
 
 Inference in **bstm** requires a Mixed-Sampler Gibbs approach, as no single algorithm is optimal for the entire parameter space. The `get_optimal_sampler` function provides both an informed automatic choice and manual overrides. The following table summarizes the available samplers and their primary use cases.
 
-| Sampler | `sampler_choice` | Type | Key Characteristic | Best Use Case |
-| :--- | :--- | :--- | :--- | :--- |
-| **NUTS** | `:nuts`, `:auto` (default) | Gradient-Based | Adaptively tunes step size and number of steps. | The state-of-the-art, general-purpose sampler for models with continuous, differentiable parameters. It is robust and requires minimal tuning. |
-| **HMC** | `:hmc` | Gradient-Based | Requires manual tuning of leapfrog steps. | A powerful alternative to `NUTS`. It can be very efficient but may require expert tuning to find optimal parameters for a given model. |
-| **ESS** | `:ess`, `:auto` (if applicable) | Gradient-Free | Designed specifically for models with Gaussian priors. | Highly efficient for latent Gaussian models (e.g., CAR, GP models). It makes large, coherent moves through the posterior without requiring gradient information. |
-| **Slice** | `:slice` | Gradient-Free | Adapts its step size to explore the posterior slice. | A robust, general-purpose gradient-free sampler. It can be more efficient than `MH` for some problems, especially those with complex unimodal posteriors, but is generally less efficient than gradient-based methods. |
-| **MH** | `:mh` | Gradient-Free | Proposes moves from a simple proposal distribution. | A universal sampler that can work for non-differentiable models. It is often inefficient in high-dimensional, correlated parameter spaces and should be used when gradient-based methods fail. |
-| **PG** | (Internal) | Particle-Based | Used for discrete parameters within a `Gibbs` sampler. | Automatically employed by `get_optimal_sampler` to handle any discrete random variables in the model, such as those from a `Categorical` or `Poisson` prior. |
+| Sampler   | `sampler_choice`                | Type           | Key Characteristic                                     | Best Use Case                                                                                                                                                                                                          |
+| :----------| :--------------------------------| :---------------| :-------------------------------------------------------| :-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **NUTS**  | `:nuts`, `:auto` (default)      | Gradient-Based | Adaptively tunes step size and number of steps.        | The state-of-the-art, general-purpose sampler for models with continuous, differentiable parameters. It is robust and requires minimal tuning.                                                                         |
+| **HMC**   | `:hmc`                          | Gradient-Based | Requires manual tuning of leapfrog steps.              | A powerful alternative to `NUTS`. It can be very efficient but may require expert tuning to find optimal parameters for a given model.                                                                                 |
+| **ESS**   | `:ess`, `:auto` (if applicable) | Gradient-Free  | Designed specifically for models with Gaussian priors. | Highly efficient for latent Gaussian models (e.g., CAR, GP models). It makes large, coherent moves through the posterior without requiring gradient information.                                                       |
+| **Slice** | `:slice`                        | Gradient-Free  | Adapts its step size to explore the posterior slice.   | A robust, general-purpose gradient-free sampler. It can be more efficient than `MH` for some problems, especially those with complex unimodal posteriors, but is generally less efficient than gradient-based methods. |
+| **MH**    | `:mh`                           | Gradient-Free  | Proposes moves from a simple proposal distribution.    | A universal sampler that can work for non-differentiable models. It is often inefficient in high-dimensional, correlated parameter spaces and should be used when gradient-based methods fail.                         |
+| **PG**    | (Internal)                      | Particle-Based | Used for discrete parameters within a `Gibbs` sampler. | Automatically employed by `get_optimal_sampler` to handle any discrete random variables in the model, such as those from a `Categorical` or `Poisson` prior.                                                           |
 
 A note on `SGLD` (Stochastic Gradient Langevin Dynamics): This sampler is designed for "big data" scenarios where the likelihood cannot be evaluated on the full dataset at each step. It uses mini-batches to approximate the gradient. The `bstm` framework is not currently structured for this type of data subsampling, so `SGLD` is not included as a general-purpose option.
 
@@ -1197,6 +1195,9 @@ This function takes a fitted model and chain and produces a comprehensive summar
 **Syntax:**
 ```julia
 res = model_results_comprehensive(model, chain)
+
+model_results_plots(res)  # plots are already created (above), this displays them
+
 ```
 
 ### `predict()`
@@ -1214,6 +1215,9 @@ It correctly handles the projection of all manifold types, including re-computin
 ---
 
 # write your own model:
+
+This is still not possible at present, as Turing is not fully modular. All sampling statements must be made in the same macro. One potential solution is to use string manipulation to inject the sampling statements into the model. At present, the following can, after development, be directly copied into a copy of bstm_univariate() and run. This is therefore, a placemarker and a template for how to get it done now.
+
 
 ```
 using bstm, Turing, DataFrames, Random, Distributions
@@ -1262,7 +1266,7 @@ sim_data = DataFrame(y = counts, t_idx = time_steps)
 # 3. Run the bstm model with the custom dynamics
 # Ensure the spatiotemporal_functions.jl file with the diff is loaded
 m = bstm(
-    "y ~ 1 + dynamics(t_idx, model=\"custom\", func=:custom_schaefer_model, K_prior=Normal(200,50))",
+    "y ~ 1 + dynamics(t_idx, model=custom, func=:custom_schaefer_model, K_prior=Normal(200,50))",
     sim_data,
     model_family="poisson"
 );
@@ -1339,7 +1343,7 @@ df = DataFrame(
 
 # Define the formula. Each outcome (y1, y2, y3) is a species.
 # The dynamics() module will apply to all of them jointly.
-formula = "y1 + y2 + y3 ~ 1 + dynamics(t_idx, model=\"n-species_lotka_volterra\")"
+formula = "y1 + y2 + y3 ~ 1 + dynamics(t_idx, model=n-species_lotka_volterra)"
 
 # Build the Turing model instance
 # We use a Poisson likelihood as our observations are counts.
@@ -1500,7 +1504,7 @@ df = DataFrame(
 # --- 2. Define and Run the bstm Model ---
 
 # The formula MUST include a spatial() term to provide W and s_idx to the model
-formula = "y1 + y2 + y3 ~ 1 + spatial(s_idx) + dynamics(t_idx, model=\"n-species_lotka_volterra_spatial_K\")"
+formula = "y1 + y2 + y3 ~ 1 + spatial(s_idx) + dynamics(t_idx, model=n-species_lotka_volterra_spatial_K)"
 
 # Build and sample the model
 m = bstm(formula, df, model_family="poisson", W=W);
@@ -1588,7 +1592,7 @@ df = DataFrame(
 # --- 2. Define and Run the bstm Model ---
 
 # Define the formula with the new dynamics model
-formula = "y ~ 1 + dynamics(t_idx, model=\"logistic_f\")"
+formula = "y ~ 1 + dynamics(t_idx, model=logistic_f)"
 
 # Build and sample the model
 m = bstm(formula, df, model_family="poisson");
@@ -1662,7 +1666,7 @@ To use this feature, you simply need to add the r_covariate parameter to your dy
 
 ```{julia}
 
-formula = "y ~ 1 + dynamics(t_idx, model=\"logistic_f\", r_covariate=:temperature)"
+formula = "y ~ 1 + dynamics(t_idx, model=logistic_f, r_covariate=:temperature)"
 
 using bstm, Turing, DataFrames, Random, Distributions, Plots
 
@@ -1731,7 +1735,7 @@ df = DataFrame(
 # --- 2. Define and Run the bstm Model ---
 
 # Define the formula with the new r_covariate parameter
-formula = "y ~ 1 + dynamics(t_idx, model=\"logistic_f\", r_covariate=:temperature)"
+formula = "y ~ 1 + dynamics(t_idx, model=logistic_f, r_covariate=:temperature)"
 
 # Build and sample the model
 m = bstm(formula, df, model_family="poisson");
@@ -1800,7 +1804,7 @@ To use this feature, you add the K_covariate parameter to your dynamics module c
 
 Example Formula:
 
-formula = "y ~ 1 + dynamics(t_idx, model=\"logistic_f\", r_covariate=:temperature, K_covariate=:habitat_quality)"
+formula = "y ~ 1 + dynamics(t_idx, model=logistic_f, r_covariate=:temperature, K_covariate=:habitat_quality)"
 
 This tells bstm to use the temperature column to model the growth rate r and the habitat_quality column to model the carrying capacity K.
 
@@ -1876,7 +1880,7 @@ df = DataFrame(
 # --- 2. Define and Run the bstm Model ---
 
 # Define the formula with the new K_covariate parameter
-formula = "y ~ 1 + dynamics(t_idx, model=\"logistic_f\", K_covariate=:habitat_quality)"
+formula = "y ~ 1 + dynamics(t_idx, model=logistic_f, K_covariate=:habitat_quality)"
 
 # Build and sample the model
 m = bstm(formula, df, model_family="poisson");
@@ -1935,7 +1939,7 @@ Combined State-Space Model: The population's evolution over time is then governe
 How to Use It: The bstm Formula
 To implement this model, you simply include both the r_covariate and K_covariate parameters in your dynamics module call within the formula string.
 
-formula = "y ~ 1 + dynamics(t_idx, model=\"logistic_f\", r_covariate=:temperature, K_covariate=:habitat_quality)"
+formula = "y ~ 1 + dynamics(t_idx, model=logistic_f, r_covariate=:temperature, K_covariate=:habitat_quality)"
 
 This single line instructs bstm to:
 
@@ -2033,7 +2037,7 @@ df = DataFrame(
 # --- 2. Define and Run the bstm Model ---
 
 # Define the formula with both covariate parameters
-formula = "y ~ 1 + dynamics(t_idx, model=\"logistic_f\", r_covariate=:temperature, K_covariate=:habitat_quality)"
+formula = "y ~ 1 + dynamics(t_idx, model=logistic_f, r_covariate=:temperature, K_covariate=:habitat_quality)"
 
 # Build and sample the model
 m = bstm(formula, df, model_family="poisson");
@@ -2092,7 +2096,7 @@ The Ricker Model: This is a classic discrete-time population model, typically wr
 
 The Continuous Logistic Model: This model is defined by the differential equation: $$ \frac{dN}{dt} = rN\left(1 - \frac{N}{K}\right) $$ To implement this in a discrete-time state-space model, we can use the Euler-Maruyama method on the log-transformed population, $X_t = \log(N_t)$. The corresponding differential equation for the log-population is $d(\log N)/dt = r(1 - N/K)$. The discrete-time approximation is: $$ X_{t+1} \approx X_t + r\left(1 - \frac{\exp(X_t)}{K}\right) + \epsilon_t $$
 
-You'll notice that the state-transition equation for the log-population is identical for both the discrete Ricker model and the Euler-discretized continuous logistic model. The existing dynamics(..., model="basic_logistic") in bstm already implements this exact structure.
+You'll notice that the state-transition equation for the log-population is identical for both the discrete Ricker model and the Euler-discretized continuous logistic model. The existing dynamics(..., model=basic_logistic) in bstm already implements this exact structure.
 
 However, for the sake of clarity, extensibility, and to directly answer your request, I will show you how to add an explicit ricker model option. This serves as a perfect template for adding any other custom univariate population model in the future.
 
@@ -2144,7 +2148,7 @@ df = DataFrame(
 
 # Define the formula using the new "ricker" model
 # We can also provide custom priors for r and K
-formula = "counts ~ 1 + dynamics(time, model=\"ricker\", r_prior=LogNormal(0,1), K_prior=Normal(700, 200))"
+formula = "counts ~ 1 + dynamics(time, model=ricker, r_prior=LogNormal(0,1), K_prior=Normal(700, 200))"
 
 # Build and sample the model
 # Using a Poisson likelihood as our observations are counts
@@ -2225,7 +2229,7 @@ df = DataFrame(
 # --- 2. Define and Run the bstm Model with the Gompertz Dynamic ---
 
 # Define the formula using the new "gompertz" model
-formula = "y ~ 1 + dynamics(time_idx, model=\"gompertz\")"
+formula = "y ~ 1 + dynamics(time_idx, model=gompertz)"
 
 # Build and sample the model
 # Using a Poisson likelihood as our observations are counts

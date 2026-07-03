@@ -141,20 +141,24 @@ show(data_scot[:data])  # a DataFrame
 
 # the following """ ... "" is a simple way of writing the formula as multiline text
 fm = """ 
+
   y ~ intercept() + 
     spatial(s_idx, model=bym2, W=data_scot[:au][:W]) +
     temporal(year, model=ar1) + 
     observationprocess(log_offsets=log_offset) 
+
 """ 
 
 m = bstm( fm, data_scot[:data], model_family="poisson")  # a Turing model
  
-chn, inits, os, summary, plt = bstm_sample(m; nsample=100, testing=true )  # simple wrapper: standard 'sample(m)' will work as expected
+# bstm_sample is a simple wrapper: standard 'sample(m)' will work as expected; testing =true means use MH() as a quick check
+chn, inits, os, summary, plt = bstm_sample(m; nsample=100, testing=true )  
 
 res = model_results_comprehensive( m, chn );
   
-model_results_plots(res, data_scot[:data], centroids = data_scot[:au][:centroids], polygons = data_scot[:au][:polygons])
+model_results_plots(res)
 
+ 
 
 ```
 
