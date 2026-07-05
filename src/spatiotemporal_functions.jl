@@ -5225,6 +5225,43 @@ function get_inits(model::DynamicPPL.Model; refine="map", n_samples=100, optimiz
         end
     end
 
+    # # 2. Data-Driven Initialization for Specialized Manifolds
+    # Rationale: For complex manifolds like Eigen/PCA, initializing from the data structure
+    #            is more robust than random sampling from the prior. This section reintegrates
+    #            the `eigenvector_to_householder` utility to provide informed initial values.
+    M = model.args.M
+    if haskey(M, :manifolds)
+        for spec in M.manifolds
+            if spec.manifold_obj isa Eigen
+                try
+                    key = spec.key
+                    vars = spec.variables
+                    n_factors = spec.manifold_obj.n_factors
+                    
+                    # Run a standard PCA to get initial eigenvectors
+                    pca_data = Matrix(M.data[!, vars])
+                    
+                    # NOTE: Assumes a `pca_standard` utility function is available in the environment,
+                    # as its usage is documented in the project. This function should return
+                    # eigenvectors as the first element of a tuple.
+                    # e.g., evecs, _, _, _, _, _ = pca_standard(pca_data, n_factors=n_factors)
+                    evecs = Main.pca_standard(pca_data, n_factors=n_factors)[1]
+
+                    # Use the `eigenvector_to_householder` function to convert eigenvectors
+                    # into the Householder 'v' parameters used by the model.
+                    v_mat = eigenvector_to_householder(evecs, n_factors)
+                    
+                    # Extract the vector of free parameters for initialization.
+                    v_params = extract_v_parameters(v_mat, spec.manifold_obj.ltri_indices)
+                    init_dict[Symbol("v_", key)] = v_params
+                    println("Info: Initialized Eigen manifold '$key' from frequentist PCA.")
+                catch e
+                    @warn "Failed to initialize Eigen manifold from data. Using prior-based initialization. Error: $e"
+                end
+            end
+        end
+    end
+
     # 2. Optimization Refinement
     if refine == "map"
         try
