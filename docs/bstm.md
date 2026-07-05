@@ -135,21 +135,24 @@ Before getting into the nitty gritty of the spatiotemporal models, let us go thr
 ```{julia}
 #| label: Example - Sparse GMRF Space and time effect (no interaction)   
 
+# load_project_functions( srcdir() )
+
 data_scot, _ = scottish_lip_cancer_data_spacetime();  
 
 show(data_scot[:data])  # a DataFrame
 
 # the following """ ... "" is a simple way of writing the formula as multiline text
-fm = """ 
+# m is just a regular Turing model
 
+m = bstm( """ 
   y ~ intercept() + 
     spatial(s_idx, model=bym2, W=data_scot[:au][:W]) +
     temporal(year, model=ar1) + 
     observationprocess(log_offsets=log_offset) 
-
-""" 
-
-m = bstm( fm, data_scot[:data], model_family="poisson")  # a Turing model
+  """,  
+  data_scot[:data], 
+  model_family="poisson"
+)  
  
 # bstm_sample is a simple wrapper: standard 'sample(m)' will work as expected; testing =true means use MH() as a quick check
 chn, inits, os, summary, plt = bstm_sample(m; nsample=100, testing=true )  
