@@ -144,23 +144,24 @@ show(data_scot[:data])  # a DataFrame
 # the following """ ... "" is a simple way of writing the formula as multiline text
 # m is just a regular Turing model
 
-m = bstm( """ 
-  y ~ intercept() + 
-    spatial(s_idx, model=bym2, W=data_scot[:au][:W]) +
-    temporal(year, model=ar1) + 
-    observationprocess(log_offsets=log_offset) 
-  """,  
-  data_scot[:data], 
-  model_family="poisson"
+
+m = @bstm(  likelihood(y, family=poisson, offsets=log_offset) ~ 
+    intercept() + 
+    spatial(s_idx, model=besag) + 
+    temporal(year, model=ar1) +
+    spacetime(s_idx, year; model=(besag, ar1)),
+    data_scot[:data],
+    W=data_scot[:au][:W]  # Pass adjacency matrix as a keyword argument
 )  
  
 # bstm_sample is a simple wrapper: standard 'sample(m)' will work as expected; testing =true means use MH() as a quick check
-chn, inits, os, summary, plt = bstm_sample(m; nsample=100, testing=true )  
+chn, inits, os, summary, plt = bstm_sample(m; nsample=1000, testing=true )  
 
-res = model_results_comprehensive( m, chn );
+res = model_results_comprehensive( m, chn; au=data_scot[:au] );
   
 model_results_plots(res)
 
+StatsPlots.plot(chn, seriestype = :traceplot)
  
 
 ```
@@ -252,10 +253,10 @@ inp_df = data[:data]
 display(first(inp_df, 3))
 
 fm = """ 
-  y ~ 1 + z + region + Spatial(s_idx, model=bym2, W=data.au.W) + Temporal(year, model=ar1) 
+  likelihood(y, family="poisson") ~ 1 + z + region + spatial(s_idx, model=bym2, W=data.au.W) + temporal(year, model=ar1) 
 """
 
-m = bstm( fm, inp_df; model_family="poisson", target_units=20 );
+m = bstm( fm, inp_df; target_units=20 )
 
 rand(m)
 chn = sample(m, MH(), 200);
