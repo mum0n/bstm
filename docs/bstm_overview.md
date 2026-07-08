@@ -410,24 +410,24 @@ This section provides a detailed quick-reference guide to the main modules avail
 
 ### 8.2. Likelihood Families
 
-| Family | `family=...` | Link Function | Key Parameters & Priors |
-|:---|:---|:---|:---|
-| **Poisson** | `:poisson` | `exp(eta)` | `rate (λ)`: Determined by `exp(eta)`. |
-| **Gaussian** | `:gaussian` | `identity(eta)` | `mean (μ)`: `eta`, `std. dev. (σ)`: `y_sigma ~ Exponential(1.0)` |
-| **Log-Normal** | `:lognormal` | `identity(eta)` | `log-mean (μ)`: `eta`, `log-std. dev. (σ)`: `y_sigma ~ Exponential(1.0)` |
-| **Negative Binomial** | `:negbin` | `exp(eta)` | `rate (μ)`: `exp(eta)`, `dispersion (r)`: `r_nb ~ Exponential(1.0)` |
-| **Binomial** | `:binomial` | `logistic(eta)` | `trials (n)`: From `likelihood(trials=...)`, `probability (p)`: `logistic(eta)` |
-| **Gamma** | `:gamma` | `exp(eta)` | `shape (α)`: `extra_params ~ Exponential(1.0)`, `scale (θ)`: `exp(eta)/α` |
-| **Beta** | `:beta` | `logistic(eta)` | `mean (μ)`: `logistic(eta)`, `precision (φ)`: `extra_params ~ Exponential(1.0)` |
-| **Student's T** | `:student_t` | `identity(eta)` | `location (μ)`: `eta`, `scale (σ)`: `y_sigma ~ Exponential(1.0)`, `d.f. (ν)`: `extra_params ~ Exponential(1.0)` |
-| **Exponential** | `:exponential` | `exp(eta)` | `rate (λ)`: `1 / exp(eta)`. |
-| **Inverse Gaussian** | `:inverse_gaussian` | `exp(eta)` | `mean (μ)`: `exp(eta)`, `shape (λ)`: `extra_params ~ Exponential(1.0)` |
-| **Half-Normal** | `:half_normal` | `identity(eta)` | `std. dev. (σ)`: `y_sigma ~ Exponential(1.0)`. Mean is implicitly 0. |
-| **Half-Student's T** | `:half_student_t` | `identity(eta)` | `scale (σ)`: `y_sigma ~ Exponential(1.0)`, `d.f. (ν)`: `extra_params ~ Exponential(1.0)` |
-| **Laplace** | `:laplace` | `identity(eta)` | `location (μ)`: `eta`, `scale (b)`: `y_sigma ~ Exponential(1.0)` |
-| **Pareto** | `:pareto` | `exp(eta)` | `shape (α)`: `extra_params ~ Exponential(1.0)`, `scale (θ)` from mean. |
-| **Dirichlet** | `:dirichlet` | `exp(eta)` | `concentration (α)`: `exp.(eta)`. For multivariate compositional data. |
-| **Inverse Wishart** | `:inverse_wishart` | `identity(eta)` | `d.f. (ν)`: `extra_params`, `Scale Matrix (Ψ)` from `eta`. For covariance modeling. |
+| Family                | `family=...`        | Link Function   | Key Parameters & Priors                                                                                         |
+| :----------------------| :--------------------| :----------------| :----------------------------------------------------------------------------------------------------------------|
+| **Poisson**           | `:poisson`          | `exp(eta)`      | `rate (λ)`: Determined by `exp(eta)`.                                                                           |
+| **Gaussian**          | `:gaussian`         | `identity(eta)` | `mean (μ)`: `eta`, `std. dev. (σ)`: `y_sigma ~ Exponential(1.0)`                                                |
+| **Log-Normal**        | `:lognormal`        | `identity(eta)` | `log-mean (μ)`: `eta`, `log-std. dev. (σ)`: `y_sigma ~ Exponential(1.0)`                                        |
+| **Negative Binomial** | `:negbin`           | `exp(eta)`      | `rate (μ)`: `exp(eta)`, `dispersion (r)`: `r_nb ~ Exponential(1.0)`                                             |
+| **Binomial**          | `:binomial`         | `logistic(eta)` | `trials (n)`: From `likelihood(trials=...)`, `probability (p)`: `logistic(eta)`                                 |
+| **Gamma**             | `:gamma`            | `exp(eta)`      | `shape (α)`: `extra_params ~ Exponential(1.0)`, `scale (θ)`: `exp(eta)/α`                                       |
+| **Beta**              | `:beta`             | `logistic(eta)` | `mean (μ)`: `logistic(eta)`, `precision (φ)`: `extra_params ~ Exponential(1.0)`                                 |
+| **Student's T**       | `:student_t`        | `identity(eta)` | `location (μ)`: `eta`, `scale (σ)`: `y_sigma ~ Exponential(1.0)`, `d.f. (ν)`: `extra_params ~ Exponential(1.0)` |
+| **Exponential**       | `:exponential`      | `exp(eta)`      | `rate (λ)`: `1 / exp(eta)`.                                                                                     |
+| **Inverse Gaussian**  | `:inverse_gaussian` | `exp(eta)`      | `mean (μ)`: `exp(eta)`, `shape (λ)`: `extra_params ~ Exponential(1.0)`                                          |
+| **Half-Normal**       | `:half_normal`      | `identity(eta)` | `std. dev. (σ)`: `y_sigma ~ Exponential(1.0)`. Mean is implicitly 0.                                            |
+| **Half-Student's T**  | `:half_student_t`   | `identity(eta)` | `scale (σ)`: `y_sigma ~ Exponential(1.0)`, `d.f. (ν)`: `extra_params ~ Exponential(1.0)`                        |
+| **Laplace**           | `:laplace`          | `identity(eta)` | `location (μ)`: `eta`, `scale (b)`: `y_sigma ~ Exponential(1.0)`                                                |
+| **Pareto**            | `:pareto`           | `exp(eta)`      | `shape (α)`: `extra_params ~ Exponential(1.0)`, `scale (θ)` from mean.                                          |
+| **Dirichlet**         | `:dirichlet`        | `exp(eta)`      | `concentration (α)`: `exp.(eta)`. For multivariate compositional data.                                          |
+| **Inverse Wishart**   | `:inverse_wishart`  | `identity(eta)` | `d.f. (ν)`: `extra_params`, `Scale Matrix (Ψ)` from `eta`. For covariance modeling.                             |
 
 ### 8.3. `spatial()` Module
 
@@ -468,19 +468,19 @@ This section provides a detailed quick-reference guide to the main modules avail
 
 *Note: Direct censoring of covariates in `smooth()` is not supported. See Section 6.5 for the recommended two-stage modeling approach.*
 
-| Manifold / Method | `model='...'` | Key Parameters | Default Priors | Use Case & Utility |
-|:---|:---|:---|:---|:---|
-| **P-Spline** | `'pspline'` | `nbins`, `degree`, `diff_order` | `sigma_prior`: `Exponential(1.0)` | The most flexible general-purpose smoother for 1D covariates. |
-| **B-Spline** | `'bspline'` | `nbins`, `degree` | `sigma_prior`: `Exponential(1.0)` | A simpler spline smoother than P-splines, useful when less regularization is desired. |
-| **Thin Plate Spline** | `'tps'` | `nbins` | `sigma_prior`: `Exponential(1.0)` | The classic choice for smoothing 2D spatial coordinates (e.g., `smooth(lon, lat, model=tps)`). |
-| **Random Fourier Features** | `'rff'` | `n_features`, `lengthscale_prior` | `sigma_prior`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A highly scalable method for approximating a full Gaussian Process smooth. |
-| **Random Walk (on bins)** | `'rw1'`, `'rw2'` | `nbins` | `sigma_prior`: `Exponential(1.0)` | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
-| **Gaussian Process (on coords)** | `'gp'` | `lengthscale_prior` | `sigma_prior`: `Exponential(1.0)` | Gold-standard continuous smoother, computationally intensive. |
-| **FFT Basis** | `'fft'` | `nbins` | `sigma_prior`: `Exponential(1.0)` | For modeling periodic non-linear effects of a covariate. |
-| **Moran's I Basis** | `'moran'` | `nbins`, `W` | `sigma_prior`: `Exponential(1.0)` | Uses eigenvectors of a spatial weights matrix as basis functions. |
-| **Spherical Basis** | `'spherical'` | `nbins`, `range_prior` | `sigma_prior`: `Exponential(1.0)` | For effects with a strictly local influence (compact support). |
-| **Exponential Decay Basis** | `'decay'` | `nbins`, `lengthscale` | `sigma_prior`: `Exponential(1.0)` | For effects with a strong, rapidly decaying influence. |
-| **Barycentric Basis** | `'barycentric'` | `nbins` | `sigma_prior`: `Exponential(1.0)` | Simple, interpretable piecewise linear smoother. |
+| Manifold / Method                | `model='...'`    | Key Parameters                    | Default Priors                                                        | Use Case & Utility                                                                             |
+| :---------------------------------| :-----------------| :----------------------------------| :----------------------------------------------------------------------| :-----------------------------------------------------------------------------------------------|
+| **P-Spline**                     | `'pspline'`      | `nbins`, `degree`, `diff_order`   | `sigma_prior`: `Exponential(1.0)`                                     | The most flexible general-purpose smoother for 1D covariates.                                  |
+| **B-Spline**                     | `'bspline'`      | `nbins`, `degree`                 | `sigma_prior`: `Exponential(1.0)`                                     | A simpler spline smoother than P-splines, useful when less regularization is desired.          |
+| **Thin Plate Spline**            | `'tps'`          | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | The classic choice for smoothing 2D spatial coordinates (e.g., `smooth(lon, lat, model=tps)`). |
+| **Random Fourier Features**      | `'rff'`          | `n_features`, `lengthscale_prior` | `sigma_prior`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A highly scalable method for approximating a full Gaussian Process smooth.                     |
+| **Random Walk (on bins)**        | `'rw1'`, `'rw2'` | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
+| **Gaussian Process (on coords)** | `'gp'`           | `lengthscale_prior`               | `sigma_prior`: `Exponential(1.0)`                                     | Gold-standard continuous smoother, computationally intensive.                                  |
+| **FFT Basis**                    | `'fft'`          | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | For modeling periodic non-linear effects of a covariate.                                       |
+| **Moran's I Basis**              | `'moran'`        | `nbins`, `W`                      | `sigma_prior`: `Exponential(1.0)`                                     | Uses eigenvectors of a spatial weights matrix as basis functions.                              |
+| **Spherical Basis**              | `'spherical'`    | `nbins`, `range_prior`            | `sigma_prior`: `Exponential(1.0)`                                     | For effects with a strictly local influence (compact support).                                 |
+| **Exponential Decay Basis**      | `'decay'`        | `nbins`, `lengthscale`            | `sigma_prior`: `Exponential(1.0)`                                     | For effects with a strong, rapidly decaying influence.                                         |
+| **Barycentric Basis**            | `'barycentric'`  | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | Simple, interpretable piecewise linear smoother.                                               |
 
 ### 8.6. `mixed()` Module
 
@@ -563,10 +563,10 @@ These modules provide explicit control over standard regression components.
 
 #### `intercept()` Module Reference
 
-| Keyword / Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
-|:---|:---|:---|:---|:---|
-| `intercept()` | `intercept(prior=...)` | Module | N/A | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
-| `prior` | `prior=Normal(0, 10)` | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple. |
+| Keyword / Parameter | Example Usage          | Data Type                 | Default        | Meaning & Assumptions                                                                                                                |
+| :--------------------| :-----------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
+| `intercept()`       | `intercept(prior=...)` | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
+| `prior`             | `prior=Normal(0, 10)`  | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
 
 ## 9. Conclusion
 
