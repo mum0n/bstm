@@ -24,14 +24,14 @@ print( "Current directory is: ", current_directory, "\n\n" )
 pkgs_bstm = [
   "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", "SpecialFunctions", "DimensionalData",
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation", "OrderedCollections",  
-  "Distributions", "Statistics", "MCMCChains", "DataFrames",  "GLM", "FlexiChains", "AbstractPPL",
+  "Distributions", "Statistics",  "DataFrames",  "GLM", "FlexiChains", "AbstractPPL",
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs", 
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing",  
   "Distances", "NamedArrays" , "CategoricalArrays", "StatsModels", "AbstractMCMC", "ForwardDiff", "PDMats"
 ]
 
-
+# "MCMCChains",
 
 # load them all:
 try
@@ -99,7 +99,7 @@ using Turing: Variational
 # Main.DEBUG[] = y,p,t  # this stores y, p, t into Main.DEBUG 
 DEBUG = Ref{Any}()  # initiate
 
-print( "\nTo Debug a variable, place some like the following into your function: \n
+print( "\nTo Debug a variable, place something like the following into your function: \n
   Main.DEBUG[] = y,p,t  # this stores y, p, t into Main.DEBUG \n
 which means, you can see what these values are by typing: DEBUG.y, etc... \n")
 

@@ -865,6 +865,151 @@ function _extract_volatility(chain, name_strs, N_tot, N_samples, outcomes_N, M=n
     return all_y_sig_samples
 end
 
+
+
+
+function _compute_waic(log_lik)
+    # v1.2.0 (2026-06-29 16:13:05)
+    # Purpose: Computes the Widely Applicable Information Criterion (WAIC). 
+    # Inputs: log_lik - A matrix of pointwise log-likelihoods [N_samples x N_obs].
+    # Outputs: The WAIC value.
+    nsamples, nobs = size(log_lik)
+    lppd = sum(logsumexp(log_lik[:, i]) - log(nsamples) for i in 1:nobs)
+    p_waic = sum(var(log_lik[:, i]) for i in 1:nobs)
+    return -2 * (lppd - p_waic)
+end
+
+function _process_ll_and_predictions(fam, eta, chain, M, N_tot, N_samples, y_sigma_samples=nothing, y_obs_custom=nothing)
+    # v1.2.0 (2026-06-29 16:13:05)
+    # Purpose: Generates predictions and pointwise log-likelihood values. 
+    # Inputs: fam, eta, chain, M, N_tot, N_samples, y_sigma_samples, y_obs_custom.
+    # Outputs: A tuple (denoised_predictions, noisy_predictions, log_likelihood_matrix).
+    denoised = zeros(N_tot, N_samples)
+    noisy = zeros(N_tot, N_samples)
+    log_lik = zeros(N_samples, M.y_N)
+
+    name_strs = string.(FlexiChains.parameters(chain))
+    use_zi = get(M, :use_zi, false)
+    fam_str = hasproperty(M, :model_family) ? M.model_family : "gaussian"
+
+    for j in 1:N_samples
+
+        sig_y = if !isnothing(y_sigma_samples)
+            sig_y = y_sigma_samples[:, j]
+        else
+            sig_y = _extract_volatility(chain, name_strs, N_tot, N_samples, nothing, M)[:, j]
+        end
+
+        r_val = "lik_r" in name_strs ? chain[:lik_r].data[j] : 1.0
+        phi_val = "lik_phi" in name_strs ? chain[:lik_phi].data[j] : 0.0
+        extra = "extra_params" in name_strs ? chain[:extra_params].data[j] : 1.0
+
+        mu_vec = _apply_link_and_lik(fam_str, eta[:, j], use_zi, phi_val, r_val)
+        denoised[:, j] .= mu_vec
+
+        for i in 1:N_tot
+            is_obs = i <= M.y_N
+            eta_val = eta[i, j]
+
+            if is_obs
+                y_vals_src = isnothing(y_obs_custom) ? M.y_obs : y_obs_custom
+                lik_obj = bstm_Likelihood(
+                    fam_str, [y_vals_src[i]]; sigma_y=sig_y[i], weight=M.weights[i],
+                    phi_zi=use_zi ? phi_val : -Inf, r_nb=r_val, trial=M.trials[i], extra_params=extra
+                )
+                log_lik[j, i] = Distributions.logpdf(lik_obj, eta_val)
+            end
+
+            if use_zi && rand() < phi_val
+                noisy[i, j] = 0.0
+            else
+                n_t = Int(is_obs ? M.trials[i] : 1)
+
+                temp_lik_obj = bstm_Likelihood(
+                    fam_str, [0.0];
+                    sigma_y=sig_y[i],
+                    r_nb=r_val,
+                    trial=n_t,
+                    extra_params=extra
+                )
+
+                dist = get_dist_ref(fam, temp_lik_obj, eta_val, sig_y[i])
+
+                noisy[i, j] = rand(dist)
+            end
+        end
+    end
+
+    return denoised, noisy, log_lik
+end
+
+function _calculate_ps_weights(p_denoised, M, PS, N_PS, N_samples)
+    # v1.2.0 (2026-06-29 16:13:05)
+    # Purpose: Calculates post-stratification weights. 
+    # Inputs: p_denoised, M, PS, N_PS, N_samples.
+    # Outputs: A matrix of post-stratification weights [N_PS x N_samples].
+    if N_PS == 0
+        return nothing
+    end
+
+    local ps_weights = zeros(N_PS, N_samples)
+
+    for k in 1:N_PS
+        local s_target = PS.s_idx[k]
+        local t_target = PS.t_idx[k]
+        local u_target = PS.u_idx[k]
+
+        local obs_match_idx = findfirst(i -> M.s_idx[i] == s_target && M.t_idx[i] == t_target && M.u_idx[i] == u_target, 1:M.y_N)
+
+        if !isnothing(obs_match_idx)
+            for j in 1:N_samples
+                ps_weights[k, j] = p_denoised[M.y_N + k, j] / (p_denoised[obs_match_idx, j] + 1e-9)
+            end
+        else
+            local sample_mean_obs = mean(p_denoised[1:M.y_N, :], dims=1)
+            for j in 1:N_samples
+                ps_weights[k, j] = p_denoised[M.y_N + k, j] / (sample_mean_obs[j] + 1e-9)
+            end
+        end
+    end
+
+    return ps_weights
+end
+
+ 
+
+
+function _apply_link_and_lik(family::String, eta::AbstractArray, use_zi::Bool, phi=0.0, r=1.0)
+    # v1.2.0 (2026-06-29 16:13:05)
+    # Purpose: Applies the inverse link function to the linear predictor `eta`. 
+    # Inputs: family, eta, use_zi, phi, r.
+    # Outputs: The expected value `mu` on the response scale. 
+    local mu
+
+    if family in ["poisson", "negbin", "gamma", "exponential", "inverse_gaussian", "pareto"]
+        mu = exp.(eta)
+
+    elseif family in ["bernoulli", "binomial", "beta"]
+        mu = logistic.(eta)
+
+    elseif family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
+        mu = eta
+
+    else
+        mu = eta
+    end
+
+    if use_zi
+        mu = (1.0 .- phi) .* mu
+    end
+
+    return mu
+end
+
+
+
+
+
 function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M, PS, alpha)
     n_samples = size(chain, 1)
     p_names = string.(FlexiChains.parameters(chain))
@@ -1474,3 +1619,577 @@ function model_results_plots(res)
     end
     println("--- End of plots ---")
 end
+
+
+
+function plot_choropleth(values::AbstractVector, polygons::Vector; title="Spatial Distribution", cmap=:viridis)
+    plt = Plots.plot(aspect_ratio=:equal, title=title, legend=true)
+
+    for i in 1:min(length(polygons), length(values))
+        poly_coords = polygons[i]
+        if length(poly_coords) > 2
+            px = [pt[1] for pt in poly_coords if !isnan(pt[1])]
+            py = [pt[2] for pt in poly_coords if !isnan(pt[2])]
+
+            if !isempty(px)
+                if (px[1], py[1]) != (px[end], py[end])
+                    push!(px, px[1])
+                    push!(py, py[1])
+                end
+
+                Plots.plot!(plt, px, py,
+                    seriestype=:shape,
+                    fill_z=values[i],
+                    c=cmap,
+                    linecolor=:black,
+                    lw=0.5,
+                    fillalpha=0.8,
+                    label=nothing
+                )
+            end
+        end
+    end
+    return plt
+end
+
+ 
+ 
+
+function plot_posterior_results(stats, M=nothing, areal_units=nothing; s_x=nothing, s_y=nothing, time_slice=nothing, effect=:spatial, cov_idx=1, show_pts=false)
+    # v1.2.0 (2026-06-29 16:13:05)
+    # Purpose: Comprehensive visualization for posterior results from bstm models. 
+    # Inputs: stats (results object), M (model config), areal_units, and various plotting options.
+    # Outputs: A Plots.jl plot object.
+    st = getproperty(stats, effect)
+    isnothing(st) && return nothing
+    if st isa Real
+        return Plots.plot(title="$effect (Fixed: $st)")
+    end
+ 
+    if effect == :beta_cov
+        b_list = get(stats, :beta_cov, nothing)
+        isnothing(b_list) && return nothing
+        b_stats = b_list isa AbstractVector ? b_list[cov_idx] : b_list
+        (isnothing(b_stats) || b_stats isa Real) && return nothing
+        n_levels = size(b_stats.mean, 1)
+        return StatsPlots.bar(1:n_levels, b_stats.mean[:,1],
+                  yerror=(b_stats.mean[:,1] .- b_stats.lower[:,1], b_stats.upper[:,1] .- b_stats.mean[:,1]),
+                  title="Covariate $cov_idx Effects", xlabel="Level", ylabel="Effect Size", legend=false)
+
+    elseif effect == :b_class1 || effect == :b_class2
+        b_stats = st
+        if isnothing(b_stats) || b_stats isa Real; return nothing; end
+        n_levels = size(b_stats.mean, 1)
+        return StatsPlots.bar(1:n_levels, b_stats.mean[:,1],
+                  yerror=(b_stats.mean[:,1] .- b_stats.lower[:,1], b_stats.upper[:,1] .- b_stats.mean[:,1]),
+                  title="$effect Levels", xlabel="Class Index", ylabel="Effect Size", legend=false)
+
+    elseif effect == :temporal
+        t_stats = st
+        if isnothing(t_stats) || t_stats isa Real; return nothing; end
+        n_times = length(t_stats.mean)
+        return StatsPlots.plot(1:n_times, t_stats.mean,
+                   ribbon=(t_stats.mean .- t_stats.lower, t_stats.upper .- t_stats.mean),
+                   fillalpha=0.2, lw=2, title="Temporal Main Effect", xlabel="Time Index", ylabel="Effect (Latent Scale)", legend=false)
+
+    elseif effect == :seasonal
+        t_stats = st
+        if isnothing(t_stats) || t_stats isa Real; return nothing; end
+        n_times = length(t_stats.mean)
+        return StatsPlots.plot(1:n_times, t_stats.mean,
+                   ribbon=(t_stats.mean .- t_stats.lower, t_stats.upper .- t_stats.mean),
+                   fillalpha=0.2, lw=2, title="Seasonal Effect", xlabel="Time Index", ylabel="Effect (Latent Scale)", legend=false)
+
+    elseif effect in [:spatial, :spatial_structured, :spatial_unstructured, :predictions_denoised, :predictions_noisy, :residuals, :eta_gp, :hidden_layer]
+        plt = StatsPlots.plot(aspect_ratio=:equal, title="$effect (T=$(time_slice))", legend=true)
+
+        values = if hasproperty(st, :mean)
+            st.mean
+        elseif effect == :spatial_structured
+            stats.spatial_structured.mean
+        elseif effect == :spatial_unstructured
+            stats.spatial_unstructured.mean
+        elseif effect == :eta_gp
+            haskey(stats, :eta_gp) ? stats.eta_gp.mean : error("eta_gp not found in stats")
+        elseif effect == :hidden_layer
+            haskey(stats, :h1) ? stats.h1.mean : error("hidden layer h1 not found in stats")
+        elseif effect == :predictions_denoised && !isnothing(time_slice)
+            stats.predictions_denoised.mean[:, time_slice]
+        elseif effect == :predictions_noisy && !isnothing(time_slice)
+            stats.predictions_noisy.mean[:, time_slice]
+        else
+            error("Effect $effect requires specific keys in stats or time_slice index")
+        end
+
+        n_to_plot = min(length(areal_units.polygons), length(values))
+
+        for i in 1:n_to_plot
+            poly_coords = areal_units.polygons[i]
+            if length(poly_coords) > 2
+                px = [pt[1] for pt in poly_coords if !isnan(pt[1])]
+                py = [pt[2] for pt in poly_coords if !isnan(pt[2])]
+
+                if !isempty(px)
+                    if (px[1], py[1]) != (px[end], py[end])
+                        push!(px, px[1]); push!(py, py[1])
+                    end
+
+                    val = values[i]
+                    StatsPlots.plot!(plt, px, py,
+                        seriestype=:shape,
+                        fill_z=val,
+                        c=:RdYlBu,
+                        linecolor=:black,
+                        linewidth=0.5,
+                        fillalpha=0.8,
+                        legend=false
+                    )
+                end
+            end
+        end
+
+        if show_pts
+            StatsPlots.scatter!(plt, s_x, s_y,
+                markersize=1, markercolor=:gray, alpha=0.2, label="Observations")
+        end
+
+        StatsPlots.scatter!(plt, [c[1] for c in areal_units.centroids], [c[2] for c in areal_units.centroids],
+            markersize=2, markercolor=:white, markerstrokecolor=:black, alpha=0.5, label="Centroids")
+
+        return plt
+    else
+        error("Effect $effect not recognized.")
+    end
+end
+
+
+
+
+function plot_posterior_vs_prior(model::DynamicPPL.Model, chain::MCMCChains.Chains, param_sym::Symbol; n_prior_samples=1000, title="Posterior vs Prior")
+    # v1.2.0 (2026-06-29 16:13:05)
+    # Purpose: Overlays the posterior density of a parameter with its prior density. 
+    # Inputs: model, chain, param_sym, n_prior_samples, title.
+    # Outputs: A Plots.jl plot object.
+
+    post_samples = vec(chain[param_sym].data)
+
+    prior_chain = sample(model, Prior(), n_prior_samples, progress=false)
+    prior_samples = vec(prior_chain[param_sym].data)
+
+    plt = StatsPlots.density(post_samples, label="Posterior: $param_sym", lw=3, color=:blue, fill=(0, 0.2, :blue))
+    StatsPlots.density!(plt, prior_samples, label="Prior (sampled)", lw=2, ls=:dash, color=:red)
+
+    title!(plt, title)
+    xlabel!(plt, "Value")
+    ylabel!(plt, "Density")
+
+    return plt
+end
+
+
+
+function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100, alpha=0.05)
+    # Description: Primary engine for projecting recovered latent manifolds onto new spatiotemporal coordinates.
+    # Rationale: Standardizing the out-of-sample path to support the full  Taxonomy.
+    # Timestamp: 2026-07-03 10:00:00
+    # Rationale: Overhauled the prediction configuration (`PS`) generation to be robust. Instead of
+    #            re-running `bstm_config`, this version creates a new configuration by inheriting
+    #            the training model's structure and selectively updating data-dependent fields.
+    #            This resolves a critical flaw where smoother types and parameters were not correctly
+    #            propagated to the prediction set.
+ 
+    # # 1. Training Metadata Recovery
+    # Rationale: M_train contains the complete configuration and technical registry from the training phase.
+    M_train = model_obj.args.M
+    n_samples_total = size(chain, 1)
+    n_samps = min(n_samples_total, n_samples)
+
+    # # 2. Prediction Metadata Configuration (PS)
+    # Rationale: Create a new configuration `PS` for the prediction data. We start by copying the
+    #            training configuration and then update only the data-dependent parts. This ensures
+    #            that the model structure (manifolds, priors, etc.) is identical.
+    
+    # Convert NamedTuple to a mutable dictionary for updates
+    PS_dict = Dict(pairs(M_train))
+
+    # Update with new data and dimensions
+    PS_dict[:data] = new_data
+    PS_dict[:y_obs] = zeros(nrow(new_data)) # Dummy response
+    PS_dict[:y_N] = nrow(new_data)
+    PS_dict[:log_offset] = hasproperty(new_data, :log_offset) ? new_data.log_offset : zeros(nrow(new_data))
+    PS_dict[:weights] = hasproperty(new_data, :weights) ? new_data.weights : ones(nrow(new_data))
+    PS_dict[:trials] = hasproperty(new_data, :trials) ? new_data.trials : ones(Int, nrow(new_data))
+
+    # Re-create fixed effects design matrix for the new data using the original formula part
+    if haskey(M_train, :formula)
+        decomposed_formula = decompose_bstm_formula(M_train.formula)
+        fixed_effects_formula_part = join(decomposed_formula.fixed_effects, " + ")
+        if decomposed_formula.has_intercept
+             fixed_effects_formula_part = isempty(strip(fixed_effects_formula_part)) ? "1" : "1 + " * fixed_effects_formula_part
+        end
+        if !isempty(strip(fixed_effects_formula_part))
+            PS_dict[:Xfixed] = create_fixed_design(fixed_effects_formula_part, new_data; contrasts=get(M_train, :contrasts, Dict()))
+            PS_dict[:Xfixed_N] = size(PS_dict[:Xfixed], 2)
+        end
+    end
+
+    # Update indices from new_data
+    if haskey(M_train, :s_idx_var) && !isnothing(M_train.s_idx_var) && hasproperty(new_data, M_train.s_idx_var)
+        PS_dict[:s_idx] = new_data[!, M_train.s_idx_var]
+    end
+    if haskey(M_train, :t_idx_var) && !isnothing(M_train.t_idx_var) && hasproperty(new_data, M_train.t_idx_var)
+        PS_dict[:t_idx] = new_data[!, M_train.t_idx_var]
+    end
+
+    # # 3. Manifold Coordinate Alignment
+    # Rationale: Aligning out-of-sample points with the training grid for discrete spatial models.
+    if haskey(M_train, :centroids) && !isnothing(M_train.centroids)
+        centroids_train = M_train.centroids
+        nx = hasproperty(new_data, :s_x) ? new_data.s_x : zeros(nrow(new_data))
+        ny = hasproperty(new_data, :s_y) ? new_data.s_y : zeros(nrow(new_data))
+        
+        PS_s_idx = Vector{Int}(undef, nrow(new_data))
+        for i in 1:nrow(new_data)
+            # Find nearest neighbor in the training unit grid
+            dists = [sum(((nx[i], ny[i]) .- c).^2) for c in centroids_train]
+            PS_s_idx[i] = argmin(dists)
+        end
+        PS_dict[:s_idx] = PS_s_idx
+    end
+
+    # # 4. Hyper-Volumetric Basis Projection (1D-4D)
+    # Rationale: Reconstructing basis matrices (Splines/RFF/FFT) for new coordinates
+    #            using the original model specifications from the training manifolds.
+    if haskey(M_train, :manifolds) && !isempty(M_train.manifolds)
+        ps_basis_registry = Dict{Symbol, Any}()
+        smooth_specs = filter(s -> s.domain == :smooth, M_train.manifolds)
+        
+        for spec in smooth_specs
+            # The key for the basis matrix is derived from the variable names.
+            # This logic must match the key generation in `bstm_config`.
+            v_sym = Symbol(join(spec.params.variables, "_"))
+
+            if haskey(M_train.basis_matrices, v_sym)
+                B_train = M_train.basis_matrices[v_sym]
+                m_obj = spec.manifold_obj
+                model_type_str = lowercase(string(typeof(m_obj)))
+                
+                vars = Symbol.(spec.params.variables)
+                n_vars = length(vars)
+                nb = size(B_train, 2)
+                
+                # Reconstruct the basis matrix for the new data using the correct model type and parameters
+                if n_vars == 1
+                    ps_basis_registry[v_sym] = bstm_smooth_basis_1D(model_type_str, new_data[!, vars[1]], nb; spec.params...)
+                elseif n_vars == 2
+                    coords_new = Matrix{Float64}(new_data[!, vars])
+                    ps_basis_registry[v_sym] = bstm_smooth_basis_2D(model_type_str, coords_new, nb; spec.params...)
+                elseif n_vars == 3
+                    coords_new = Matrix{Float64}(new_data[!, vars])
+                    ps_basis_registry[v_sym] = bstm_smooth_basis_3D(model_type_str, coords_new, nb; spec.params...)
+                elseif n_vars == 4
+                    coords_new = Matrix{Float64}(new_data[!, vars])
+                    ps_basis_registry[v_sym] = bstm_smooth_basis_4D(model_type_str, coords_new, nb; spec.params...)
+                end
+            end
+        end
+        PS_dict[:basis_matrices] = ps_basis_registry
+    end
+
+    # Convert dictionary back to NamedTuple for the reconstruct engine
+    PS = NamedTuple(PS_dict)
+
+    # # 5. Architectural Dispatch for Latent Recovery
+    # Rationale: Utilizing the validated _reconstruct engine to assemble the prediction tensor.
+    raw_arch = get(M_train, :model_arch, "univariate")
+    arch_type = if raw_arch == "univariate"
+        UnivariateArchitecture()
+    elseif raw_arch == "multivariate"
+        MultivariateArchitecture()
+    elseif raw_arch == "multifidelity" || raw_arch == "nested"
+        MultifidelityArchitecture()
+    else
+        UnivariateArchitecture()
+    end
+
+    # Subset the chain for the requested number of samples
+    chain_sub = chain[1:min(n_samps, end), :, :]
+
+    # Rationale: _reconstruct treats PS as a grid for Post-Stratification, 
+    # which is mathematically equivalent to out-of-sample prediction.
+    res = _reconstruct(arch_type, "prediction_projection", chain_sub, M_train, PS, alpha)
+
+    println("--- Projection Complete [Observations: ", nrow(new_data), "] ---")
+
+    return (
+        predictions_denoised = res.predictions_denoised,
+        predictions_noisy = res.predictions_noisy,
+        pstats = res,
+        PS = PS,
+        centroids = haskey(PS, :s_coord) ? PS.s_coord : nothing
+    )
+end
+ 
+
+# 1. PSIS-LOO Implementation for BSTM
+# Rationale: Standardizing the extraction of log-likelihood matrices to provide 
+# Expected Log Pointwise Predictive Density (ELPD) estimates. 
+function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)    
+    # v1.2.0 (2026-06-29 16:13:05)
+    # Purpose: A utility for performing Leave-One-Out Cross-Validation using Pareto Smoothed Importance 
+    #          Sampling (PSIS-LOO) to assess a model's out-of-sample predictive accuracy.
+    # Inputs: model_obj, chain, alpha.
+    # Outputs: A NamedTuple containing the LOO object, metrics, log-likelihood matrix, and Pareto k values.
+    
+    
+    # # 1. Metadata and Architecture Extraction
+    # Rationale: M contains the configuration and technical registry required for reconstruction.
+    M = model_obj.args.M
+    raw_arch = get(M, :model_arch, "univariate")
+
+    # # 2. Technical Dispatch Resolution
+    # Mapping the configuration string to the architectural dispatch types.
+    arch_type = if raw_arch == "univariate"
+        UnivariateArchitecture()
+    elseif raw_arch == "multivariate"
+        MultivariateArchitecture()
+    else
+        UnivariateArchitecture()
+    end
+
+    # # 3. Latent Manifold Reconstruction for Likelihood Registry
+    # Rationale: _reconstruct generates the [Samples x Observations] log-likelihood matrix.
+    # We utilize alpha for consistent summarization during the recovery phase.
+    println("Audit: Recovering pointwise log-likelihood registry...")
+    res = _reconstruct(arch_type, "loo_recovery", chain, M, nothing, alpha)
+
+    # # 4. Matrix Extraction and Validation
+    # Rationale: Ensuring the log_lik_matrix matches the observation grid dimensions.
+    log_lik = res.log_lik_matrix
+    n_samples, n_obs = size(log_lik)
+
+    println("Audit: Processing ", n_samples, " samples for ", n_obs, " observations.")
+
+    # # 5. PSIS-LOO Calculation via PosteriorStats
+    # Rationale: LOO-CV provides a reliable estimate of out-of-sample predictive performance.
+    loo_result = nothing
+    try
+        loo_result = loo(log_lik)
+    catch e
+        @error "BSTM Selection Error: PSIS-LOO calculation failed. Error: " * string(e)
+        return nothing
+    end
+
+    println("\n--- BSTM Model Selection Report ---")
+    println("Expected Log Pointwise Predictive Density (ELPD): ", round(loo_result.estimates[:elpd_loo, :estimate], digits=2))
+    println("Effective Number of Parameters (p_loo):          ", round(loo_result.estimates[:p_loo, :estimate], digits=2))
+    println("LOO Information Criterion:                       ", round(loo_result.estimates[:looic, :estimate], digits=2))
+
+    # Check for influential observations (k > 0.7)
+    # Rationale: Identifying data points where the importance weight is unstable.
+    pareto_k = loo_result.pointwise[:pareto_k]
+    influential_count = count(x -> x > 0.7, pareto_k)
+    if influential_count > 0
+        @warn "BSTM: " * string(influential_count) * " influential observations detected (Pareto k > 0.7)."
+    end
+
+    return (
+        loo_obj = loo_result,
+        metrics = (
+            elpd = loo_result.estimates[:elpd_loo, :estimate],
+            p_loo = loo_result.estimates[:p_loo, :estimate],
+            looic = loo_result.estimates[:looic, :estimate]
+        ),
+        log_lik_matrix = log_lik,
+        pareto_k = pareto_k
+    )
+end
+
+
+
+# 2. Bayes Factor Suite (Manifold Comparison)
+function compare_manifolds(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])    
+    # v1.2.0 (2026-06-29 16:13:05)
+    # Purpose: A utility for formal model comparison between two fitted `bstm` models. It uses 
+    #          their PSIS-LOO results to compute the difference in Expected Log Pointwise 
+    #          Predictive Density (ELPD) and provides a statistical basis for model selection.
+    # Inputs: loo_a_report, loo_b_report, model_names.
+    # Outputs: A NamedTuple containing the comparison table, ELPD difference, and LOO objects.
+    # Description: Performs formal model selection between two BSTM manifold candidates.
+    # Rationale: Standardizing the assessment of ELPD differences and complexity trade-offs.
+    # Requirements: Absolute parity with the PSIS-LOO metrics.
+
+    println("--- Starting BSTM Manifold Comparison ---")
+
+    # # 1. LOO Object Extraction
+    # Rationale: Extracting the underlying PosteriorStats LOO objects for comparison.
+    loo_a = loo_a_report.loo_obj
+    loo_b = loo_b_report.loo_obj
+
+    # # 2. Formal Selection Metric Calculation
+    # Rationale: The difference in ELPD is the primary metric for out-of-sample performance.
+    # We utilize the compare function from PosteriorStats to compute deltas and standard errors.
+    comparison_stats = nothing
+    try
+        comparison_stats = compare([loo_a, loo_b])
+    catch e
+        @error "BSTM Comparison Error: Selection suite failed. Error: " * string(e)
+        return nothing
+    end
+
+    # # 3. Parameter and Diagnostic Extraction
+    # Rationale: Collecting effective parameter counts (p_loo) to assess complexity.
+    p_loo_a = loo_a_report.metrics.p_loo
+    p_loo_b = loo_b_report.metrics.p_loo
+
+    elpd_a = loo_a_report.metrics.elpd
+    elpd_b = loo_b_report.metrics.elpd
+
+    # # 4. Report Generation
+    println("\n--- BSTM Manifold Selection Registry ---")
+    println("Model A (", model_names[1], "): ELPD = ", round(elpd_a, digits=2), " | p_loo = ", round(p_loo_a, digits=2))
+    println("Model B (", model_names[2], "): ELPD = ", round(elpd_b, digits=2), " | p_loo = ", round(p_loo_b, digits=2))
+
+    diff_elpd = elpd_a - elpd_b
+    println("\nELPD Delta (A - B): ", round(diff_elpd, digits=2))
+
+    # Interpretation Logic
+    # Rationale: If |diff_elpd| > 4, the difference is generally considered significant.
+    if abs(diff_elpd) > 4.0
+        winning_model = diff_elpd > 0 ? model_names[1] : model_names[2]
+        println("CONCLUSION: ", winning_model, " is statistically preferred based on predictive density.")
+    else
+        println("CONCLUSION: Competing manifold structures provide indistinguishable predictive density.")
+    end
+
+    # # 5. Table Construction
+    comparison_df = DataFrame(
+        Metric = ["ELPD (LOO)", "Effective Parameters (p_loo)", "LOO-IC"],
+        Model_A = [elpd_a, p_loo_a, loo_a_report.metrics.looic],
+        Model_B = [elpd_b, p_loo_b, loo_b_report.metrics.looic]
+    )
+
+    comparison_df[!, :Delta] = comparison_df.Model_A .- comparison_df.Model_B
+
+    display(comparison_df)
+
+    return (
+        comparison_table = comparison_df,
+        elpd_diff = diff_elpd,
+        loo_objects = (loo_a, loo_b)
+    )
+end
+
+
+function bstm_cv_orchestrator(
+    formula::String, 
+    data::DataFrame; 
+    method::Symbol = :lolo, 
+    lolo_var::Symbol = :s_idx, 
+    n_folds::Int = 5, 
+    n_samples::Int = 500, 
+    sampler = NUTS(500, 0.65), 
+    alpha = 0.05, 
+    kwargs...
+)    
+    # v1.2.0 (2026-06-29 16:13:05)
+    # Purpose: An orchestration utility for performing cross-validation. It supports standard 
+    #          k-fold and Leave-One-Location-Out (LOLO) strategies to assess model performance on 
+    #          held-out data.
+    # Inputs: formula, data, and optional parameters for CV method, sampler, etc.
+    # Outputs: A NamedTuple containing fold results and summary metrics.
+    # # 1. Metadata Discovery and Outcome Resolution
+    # The formula is decomposed to identify the primary response variable and module requirements.
+    meta_discovery = decompose_bstm_formula(formula)
+    response_name = Symbol(meta_discovery.outcomes[1])
+
+    # # 2. Partition Strategy Selection
+    # Establishing fold indices based on spatiotemporal logic or random sampling.
+    folds_indices = Vector{Vector{Int}}()
+
+    if method == :lolo
+        # Leave-One-Location-Out: Grouping indices by the spatial unit identifier.
+        unique_locs = unique(data[!, lolo_var])
+        for loc in unique_locs
+            push!(folds_indices, findall(x -> x == loc, data[!, lolo_var]))
+        end
+    else
+        # Standard K-Fold: Random permutation of row indices.
+        n_obs = size(data, 1)
+        row_indices = Random.randperm(n_obs)
+        fold_size = div(n_obs, n_folds)
+        for i in 1:n_folds
+            idx_start = (i - 1) * fold_size + 1
+            idx_end = i == n_folds ? n_obs : i * fold_size
+            push!(folds_indices, row_indices[idx_start:idx_end])
+        end
+    end
+
+    # # 3. Cross-Validation Loop
+    fold_results = []
+    n_actual_folds = length(folds_indices)
+
+    for (f_idx, test_idx) in enumerate(folds_indices)
+        # Splitting dataset into training and testing partitions.
+        # Training mask is constructed to exclude the test indices.
+        train_mask = trues(size(data, 1))
+        train_mask[test_idx] .= false
+        
+        train_data = data[train_mask, :]
+        test_data = data[test_idx, :]
+
+        # # 4. Modular Training Configuration
+        # Pre-configuring the model to ensure technical registries (W, s_N, t_N) are consistent.
+        # bstm_config resolves the manifold registry M.
+        opt_train = bstm_config(formula, train_data; kwargs...)
+
+        # # 5. Model Execution
+        # Dispatching to the modular univariate or multivariate supervisor.
+        model_train = bstm(opt_train)
+        
+        # Posterior sampling using the requested sampler configuration.
+        chain_train = sample(model_train, sampler, n_samples, progress = false)
+
+        # # 6. Manifold Projection (Out-of-Sample)
+        # Using the standardized predict() function which handles reconstruction of S, T, and Smooth basis.
+        # This ensures that PS (Prediction Surface) alignment is consistent with the modular BSTM taxonomy.
+        res_pred = predict(model_train, chain_train, test_data, n_samples = div(n_samples, 2), alpha = alpha)
+
+        # # 7. Performance Assessment
+        # Extracting denoised expectations for the test partition.
+        y_test_obs = test_data[!, response_name]
+        y_test_pred = res_pred.predictions_denoised.mean
+
+        # Verification of dimensional parity between prediction and observation.
+        if length(y_test_obs) == length(y_test_pred)
+            residuals = y_test_obs .- y_test_pred
+            rmse = sqrt(Statistics.mean(residuals.^2))
+            
+            # R-Squared calculation with safety floor for variance.
+            ss_res = sum(residuals.^2)
+            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
+            r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
+
+            push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
+        else
+            @warn "Fold $f_idx: Prediction length mismatch. Observed: $(length(y_test_obs)), Predicted: $(length(y_test_pred))"
+        end
+    end
+
+    # # 8. Aggregate Reporting
+    mean_rmse = Statistics.mean([r.rmse for r in fold_results])
+    mean_r2 = Statistics.mean([r.r2 for r in fold_results])
+
+    return (
+        folds = fold_results,
+        mean_rmse = mean_rmse,
+        mean_r2 = mean_r2,
+        response_var = response_name,
+        method = method,
+        n_folds = n_actual_folds
+    )
+end
+
+ 
+
+ 

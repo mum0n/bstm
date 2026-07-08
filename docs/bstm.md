@@ -130,8 +130,10 @@ In the tuple (*data_scot*), we have counts (y) of cancer incidence and populatio
 
 #### Spatiotemporal model: the shape of things to come
 
-Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we format the data (*data_scot*) into a DataFrame with the correct variable names and run a simple separable spatiotemporal model. Note that we use triple quotes (""" ... """)  around the formula to allow multi-line text. Signle quotes are fine but all would need to be on a single line or contatenated by the '*' operator: ("y ~ spatial(...) " * " temporal() ", etc. )  
- 
+Before getting into the nitty gritty of the spatiotemporal models, let us go through our contrived example to see what the overall workflow is like. First, we format the data (*data_scot*) into a DataFrame with the correct variable names and run a simple separable spatiotemporal model.  
+
+
+
 ```{julia}
 #| label: Example - Sparse GMRF Space and time effect (no interaction)   
 
@@ -148,14 +150,18 @@ show(data_scot[:data])  # a DataFrame
 m = @bstm(  likelihood(y, family=poisson, offsets=log_offset) ~ 
     intercept() + 
     spatial(s_idx, model=besag) + 
-    temporal(year, model=ar1) +
-    spacetime(s_idx, year; model=(besag, ar1)),
+    temporal(year, model=ar1), 
     data_scot[:data],
     W=data_scot[:au][:W]  # Pass adjacency matrix as a keyword argument
 )  
+
+# two ways of adding spacetime interaction effects
+#   + spacetime(s_idx, year; model=(besag, ar1))
+#   + spatial(s_idx, model=besag) ⊗ temporal(year, model=ar1)
+
  
 # bstm_sample is a simple wrapper: standard 'sample(m)' will work as expected; testing =true means use MH() as a quick check
-chn, inits, os, summary, plt = bstm_sample(m; nsample=1000, testing=true )  
+chn, inits, os, summary  = bstm_sample(m; nsample=1000, testing=true ) ;
 
 res = model_results_comprehensive( m, chn; au=data_scot[:au] );
   
@@ -268,9 +274,20 @@ The notation is similar but with some quirks (that are again easily altered to y
 
 ### Special Formula Terms
 
-In `bstm` formulas, specific terms are used to trigger high-dimensional manifold structures. These terms tell the pre-processor how to structure the latent fields and connectivity matrices. Here is the main list for those that do not want to wait:
+In `bstm` formulas, specific function-like terms, or "modules," are used to define the model's structure. These modules tell the pre-processor how to construct latent fields, handle covariates, and set priors.
 
-
+**Example Formula Usage**
+```julia
+formula = """
+  likelihood(y, family=:poisson, offsets=log_pop) ~ 
+    intercept(prior=Normal(0, 10)) + 
+    z + 
+    fixed(Region, contrast=effects, prior=Normal(0, 2)) + 
+    (poverty |> spatial(s_idx, model=icar)) +
+    (spatial(s_idx, model=besag) ⊗ temporal(year, model=ar1)) +
+    smooth(age, model=pspline, nbins=10)
+"""
+```
 
 ### Covariate Discretization & Transformation Rules
 
@@ -291,6 +308,20 @@ The `bstm_options` and `assign_covariate_units` functions support several method
     *   Interactions are specified as `"var1*var2"`. They are calculated *after* the individual variables have been transformed (scaled/logged), ensuring interactions operate on normalized representations.
      
 
+In `bstm` formulas, specific function-like terms, or "modules," are used to define the model's structure. These modules tell the pre-processor how to construct latent fields, handle covariates, and set priors.
+
+**Example Formula Usage**
+```julia
+formula = """
+  likelihood(y, family=:poisson, offsets=log_pop) ~ 
+    intercept(prior=Normal(0, 10)) + 
+    z + 
+    fixed(Region, contrast=effects, prior=Normal(0, 2)) + 
+    (poverty |> spatial(s_idx, model=icar)) +
+    (spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1)) +
+    smooth(age, model=pspline, nbins=10)
+"""
+```
 
 
 
@@ -2667,8 +2698,95 @@ println("First 5 values of Conditional Covariance Diagonal (diag(Cov[f|fZ])): ",
 
 ### Penalized Complexity (PC) Priors
 
-To provide principled shrinkage: To ensure priors are interpretable and as a default have an opinion, that the process being modelled should have a null hypothesis that it is not important. So for example, when a temporal autocorrelation is modelled, the prior has a density centered over zero (no autocorrelation) and only if the data suggests it is strong that the posterior will moved away from the prior. For spatial processes, the effects are scaled to a unit marginal variance which allows the $\phi$ parameter in a BYM2 model to represent the actual proportion of variance explained by the spatial effect. The prior for this variance would be a "base" state of (zero variance) unless the data provides strong evidence otherwise.
+To provide principled shrinkage, PC priors are specified based on user-defined beliefs about the scale of a parameter. Rather than setting arbitrary hyperparameter values, the user provides a quantile-based constraint. For example, for a standard deviation parameter `σ`, one can state that the probability of `σ` exceeding a value `U` is a small probability `α`, written as `P(σ > U) = α`. The `bstm` framework then computes the necessary parameter for the prior distribution (e.g., the rate `λ` for an `Exponential` prior, where `λ = -log(α) / U`) that satisfies this constraint. This method ensures that priors are interpretable and that the model defaults to a simpler "base model" (e.g., zero variance or no correlation) unless the data provides strong evidence to the contrary.
  
+#### Implementation of User-Specified PC Priors
+
+The `bstm` framework translates user-specified quantile constraints into prior distributions through a sequence of steps handled by the `@bstm` macro and its internal parser. This mechanism allows for principled prior specification directly within the model formula.
+
+**1. Syntax and Parsing:**
+
+The user specifies a PC prior constraint as a two-element tuple `(U, α)` for any `_prior` argument within a manifold call.
+
+```julia
+# Example: Specifying a PC prior for the standard deviation of a BYM2 model's spatial effect.
+# This sets the prior belief that P(sigma > 1.0) = 0.05.
+@bstm(
+    likelihood(y) ~ 1 + spatial(s_idx, model=bym2, sigma_prior=(1.0, 0.05)),
+    data, W=W
+)
+```
+
+The `@bstm` macro's parser iterates through the keyword arguments of each manifold call (e.g., `spatial`). When it encounters an argument ending in `_prior` (like `sigma_prior`), it inspects its value. If the value is a `Tuple{Real, Real}`, it recognizes it as a PC prior constraint.
+
+**2. The Prior Factory: `create_pc_prior`**
+
+Upon detecting a constraint tuple, the parser invokes an internal "prior factory" function, `create_pc_prior`. This function is responsible for generating the correct `Distribution` object based on the parameter's name and the constraint.
+
+```julia
+# Conceptual implementation of the prior factory
+function create_pc_prior(param_name::Symbol, constraint::Tuple)
+    if length(constraint) == 2
+        U, α = constraint
+        direction = :upper # Default to P(param > U) = α
+    elseif length(constraint) == 3
+        U, α, direction = constraint
+    else
+        error("PC prior constraint must be a tuple of (U, α) or (U, α, direction).")
+    end
+    
+    # Dispatch based on the parameter type to select the correct base prior
+    # and derive its hyperparameters.
+    if param_name == :sigma || endswith(string(param_name), "_sigma")
+        # For standard deviation parameters, use an Exponential prior.
+        # The constraint is P(σ > U) = α.
+        # P(σ > U) = exp(-λU) = α  =>  λ = -log(α) / U
+        λ = -log(α) / U
+        return Exponential(λ)
+
+    elseif param_name == :rho || endswith(string(param_name), "_rho")
+        # For correlation parameters on [0, 1], the PC prior shrinks towards 0 (no correlation).
+        # The prior is defined on a transformation: θ = -log(1-ρ) ~ Exponential(λ).
+        # The constraint is P(ρ > U) = α.
+        # This translates to P(θ > -log(1-U)) = exp(-λ * -log(1-U)) = (1-U)^λ = α.
+        # Solving for λ gives: λ = log(α) / log(1-U).
+        # The model then samples ρ as 1 - exp(-θ).
+        if direction != :upper
+            error("PC prior for 'rho' only supports upper tail constraints, e.g., P(rho > U) = alpha.")
+        end
+        λ = log(α) / log(1.0 - U)
+        # This returns the prior for the transformed parameter θ, not ρ directly.
+        return Exponential(λ)
+
+    elseif param_name == :lengthscale || endswith(string(param_name), "_lengthscale")
+        # For a lengthscale parameter l > 0, the PC prior is often defined on its inverse,
+        # shrinking it towards infinity (i.e., making the process smoother/more global).
+        # Let θ = 1/l ~ Exponential(λ).
+        # The constraint is P(l < U) = α (small probability of a short lengthscale).
+        # This translates to P(1/θ < U) = P(θ > 1/U) = exp(-λ/U) = α.
+        # Solving for λ gives: λ = -U * log(α).
+        if direction != :lower
+            error("PC prior for 'lengthscale' only supports lower tail constraints, e.g., P(lengthscale < U) = alpha.")
+        end
+        λ = -U * log(α)
+        return Exponential(λ)
+
+    elseif param_name == :kappa || endswith(string(param_name), "_kappa")
+        # For SPDE smoothness parameter κ, a larger κ means shorter correlation range.
+        # The PC prior shrinks towards κ=0 (infinitely smooth).
+        # The constraint is P(κ > U) = α.
+        λ = -log(α) / U
+        return Exponential(λ)
+
+    else
+        error("PC prior not defined for parameter: $param_name")
+    end
+end
+```
+
+**3. Model Construction:**
+
+The `create_pc_prior` function returns a standard `Distribution` object (e.g., `Exponential(2.9957)`). The parser then substitutes this object back into the manifold's arguments. The rest of the model construction process proceeds as if the user had manually specified the fully-formed prior distribution. This two-stage process decouples the user-friendly syntax from the underlying statistical implementation, allowing the framework to be extended with new PC priors for different parameters without changing the user-facing formula interface.
 
 
 Most of the models here are didactic, demonstrating form and approach. 
