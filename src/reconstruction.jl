@@ -1,8 +1,7 @@
 # This file contains the complete and corrected functions for the bstm posterior
 # reconstruction engine. It is designed to be a self-contained replacement for
 # the various post-processing utilities previously distributed across other files.
-
-
+ 
 function _find_parameter(p_names, base, domain, key, k=nothing)
     # v2.0.0 (2026-07-13)
     # Rationale: This function was failing to find vector-valued parameters named with
@@ -46,7 +45,7 @@ function _find_parameter(p_names, base, domain, key, k=nothing)
     # Tier 5: Suffix Cleanup (Turing Internal Naming)
     re_suffix = Regex(string("^(", base, ")(_\\d*)?\$"))
     matches = filter(n -> occursin(re_suffix, n), p_names)
-    if !isempty(matches)
+    if !isempty(matches) && length(matches) == 1 # Ensure unique match for direct return.
         return matches[1]
     end
 
@@ -54,7 +53,10 @@ function _find_parameter(p_names, base, domain, key, k=nothing)
     re_fuzzy = Regex("^$(base)_.*($(key)|$(domain)).*")
     fuzzy_matches = filter(n -> occursin(re_fuzzy, n), p_names)
     if !isempty(fuzzy_matches)
-        return fuzzy_matches[argmin(length.(fuzzy_matches))]
+        # Return the shortest match, assuming it's the most direct.
+        # Ensure it's a unique shortest match to avoid ambiguity.
+        shortest_matches = filter(n -> length(n) == minimum(length.(fuzzy_matches)), fuzzy_matches)
+        if length(shortest_matches) == 1; return shortest_matches[1]; end
     end
 
     # Return the original base name as a last resort. `get_params_vector` has its own fallback.
@@ -97,7 +99,7 @@ function get_params_vector(chain, base_name::String, expected_len::Int)
         # Standard Scalar Broadcast: If only one index is found but multiple are expected,
         # we broadcast the column to the expected length.
         if size(res_mat, 2) == 1 && expected_len > 1
-            return repeat(res_mat, 1, expected_len)
+            return repeat(res_mat, 1, expected_len) # This creates a matrix of size N_samples x expected_len
         end
 
         return res_mat
@@ -121,7 +123,7 @@ function get_params_vector(chain, base_name::String, expected_len::Int)
         if size(mat_data, 2) == expected_len
             return mat_data
         elseif size(mat_data, 2) == 1 && expected_len > 1
-            # Scalar Broadcast fallback
+            # Scalar Broadcast fallback to N_samples x expected_len
             return repeat(mat_data, 1, expected_len)
         else
             @warn "Parameter '$base_name' was found, but its length ($(size(mat_data, 2))) does not match expected length ($expected_len). Returning as is, which may cause downstream errors."
@@ -130,11 +132,483 @@ function get_params_vector(chain, base_name::String, expected_len::Int)
     end
 
     # 3. Null Safety Fallback
-    # If the parameter is missing, return a zero-matrix to prevent downstream assembly failure.
+    # If the parameter is missing, return a zero-matrix of size N_samples x expected_len to prevent downstream assembly failure.
     @warn "get_params_vector: Parameter '$base_name' not discovered in chain. Initializing with zeros (len=$expected_len)."
     return zeros(Float64, N_samples, expected_len)
 end
 
+function extract_manifold(m_obj::Union{ICAR, Besag, RW1, RW2, Leroux, SAR, Cyclic}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+    
+    for k in 1:outcomes_N
+        key = spec.key
+        m_domain = spec.domain
+        
+        sigma_name = _find_parameter(p_names, "sigma_" * string(key), string(m_domain), string(key), k)
+        latent_name = _find_parameter(p_names, "latent_" * string(key), string(m_domain), string(key), k)
+        
+        n_units = if m_domain == :spatial; M.s_N; elseif m_domain == :temporal; M.t_N; else M.u_N; end
+        
+        if isempty(sigma_name) || isempty(latent_name)
+            @warn "Parameters for manifold $(key) (domain $(m_domain), outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, n_units, n_samples))
+            push!(noisy_fields, zeros(Float64, n_units, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)
+        latent_samples = get_params_vector(chain, latent_name, n_units)
+        
+        effect = latent_samples' .* sigma_samples'
+        push!(structured_fields, effect)
+        push!(noisy_fields, effect)
+    end
+    
+    return (structured=structured_fields, noisy=noisy_fields)
+end
+ 
+function extract_manifold(m_obj::BYM2, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    structured_fields = Vector{Matrix{Float64}}()
+    unstructured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        key = string(spec.key)
+        m_domain = string(spec.domain)
+        sigma_name = _find_parameter(p_names, "sigma_" * key, m_domain, key, k)
+        rho_name = _find_parameter(p_names, "rho_" * key, m_domain, key, k)
+        struct_name = _find_parameter(p_names, "latent_struct_" * key, m_domain, key, k)
+        iid_name = _find_parameter(p_names, "latent_iid_" * key, m_domain, key, k)
+
+        if isempty(sigma_name) || isempty(rho_name) || isempty(struct_name) || isempty(iid_name)
+            @warn "Parameters for BYM2 manifold $(key) (domain $(m_domain), outcome $(k)) not found. Returning zero-matrix for effect."
+            n_units = M.s_N
+            push!(structured_fields, zeros(Float64, n_units, n_samples))
+            push!(unstructured_fields, zeros(Float64, n_units, n_samples))
+            push!(noisy_fields, zeros(Float64, n_units, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)
+        rho_samples = get_params_vector(chain, rho_name, 1)
+        struct_samples = get_params_vector(chain, struct_name, M.s_N)
+        iid_samples = get_params_vector(chain, iid_name, M.s_N)
+
+        struct_eff = (struct_samples' .* sqrt.(rho_samples')) .* sigma_samples'
+        unstruct_eff = (iid_samples' .* sqrt.(1.0 .- rho_samples')) .* sigma_samples'
+        noisy_eff = struct_eff .+ unstruct_eff
+
+        push!(structured_fields, struct_eff)
+        push!(unstructured_fields, unstruct_eff)
+        push!(noisy_fields, noisy_eff)
+    end
+    return (structured=structured_fields, unstructured=unstructured_fields, noisy=noisy_fields)
+end
+
+function extract_manifold(m_obj::AR1, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+
+    noise_val = get(M, :noise, 1e-6)
+
+    for k in 1:outcomes_N
+        key = string(spec.key)
+        m_domain = string(spec.domain)
+
+        sigma_name = _find_parameter(p_names, "sigma_" * key, m_domain, key, k)
+        rho_name = _find_parameter(p_names, "rho_" * key, m_domain, key, k)
+        innov_name = _find_parameter(p_names, "innov_" * key, m_domain, key, k)
+
+        n_units = M.t_N
+
+        if isempty(sigma_name) || isempty(rho_name) || isempty(innov_name)
+            @warn "Parameters for AR1 manifold $(key) (outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, n_units, n_samples))
+            push!(noisy_fields, zeros(Float64, n_units, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)
+        rho_samples = get_params_vector(chain, rho_name, 1)
+        innovations_samples = get_params_vector(chain, innov_name, n_units)
+
+        temporal_effect_k = zeros(Float64, n_units, n_samples)
+        for j in 1:n_samples
+            t_field_j = Vector{Float64}(undef, n_units)
+            t_field_j[1] = innovations_samples[j, 1] / sqrt(1.0 - rho_samples[j]^2 + noise_val)
+            for i in 2:n_units
+                t_field_j[i] = rho_samples[j] * t_field_j[i-1] + innovations_samples[j, i]
+            end
+            temporal_effect_k[:, j] = t_field_j .* sigma_samples[j]
+        end
+        push!(structured_fields, temporal_effect_k)
+        push!(noisy_fields, temporal_effect_k)
+    end
+    return (structured=structured_fields, noisy=noisy_fields)
+end
+
+function extract_manifold(m_obj::Union{PSpline, BSpline, TPS, RFF, FFT, Wavelet, Moran, Spherical, ExponentialDecay, Barycentric}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    var_sym = spec.var
+    
+    if !haskey(M.basis_matrices, var_sym)
+        @warn "Basis matrix for smooth manifold $(var_sym) not found in M.basis_matrices. Returning zero-matrices."
+        n_obs_or_units = if hasproperty(M, :y_N); M.y_N; else 1; end
+        return (structured=[zeros(Float64, n_obs_or_units, n_samples) for _ in 1:outcomes_N],
+                noisy=[zeros(Float64, n_obs_or_units, n_samples) for _ in 1:outcomes_N],
+                coefficients=[zeros(Float64, 1, n_samples) for _ in 1:outcomes_N])
+    end
+
+    B_mat = M.basis_matrices[var_sym]
+    n_basis_cols = size(B_mat, 2)
+
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+    coefficient_fields = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        key = spec.key
+        beta_name = outcomes_N > 1 ? Symbol("beta_basis_", key, "_", k) : Symbol("beta_basis_", key)
+        
+        if !(string(beta_name) in p_names)
+            @warn "Coefficient parameter $(beta_name) for smooth manifold $(key) (outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, size(B_mat, 1), n_samples))
+            push!(noisy_fields, zeros(Float64, size(B_mat, 1), n_samples))
+            push!(coefficient_fields, zeros(Float64, n_basis_cols, n_samples))
+            continue
+        end
+
+        coeffs = get_params_vector(chain, string(beta_name), n_basis_cols)
+        
+        push!(coefficient_fields, coeffs')
+
+        effect = B_mat * coeffs'
+        push!(structured_fields, effect)
+        push!(noisy_fields, effect)
+    end
+
+    return (structured=structured_fields, noisy=noisy_fields, coefficients=coefficient_fields)
+end
+ 
+function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        key = spec.key
+        latent_name = _find_parameter(p_names, "dyn_field_" * string(key), "dynamics", string(key), k)
+        
+        if isempty(latent_name)
+            @warn "Latent field parameter for DynamicsManifold $(key) (outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, N_tot, n_samples))
+            push!(noisy_fields, zeros(Float64, N_tot, n_samples))
+            continue
+        end
+
+        latent_samples = get_params_vector(chain, latent_name, M.s_N * M.t_N)
+
+        dyn_field_samples = reshape(latent_samples', M.s_N, M.t_N, n_samples)
+        
+        effect_k = zeros(Float64, N_tot, n_samples)
+        for j in 1:n_samples
+            for i in 1:N_tot
+                is_obs = i <= M.y_N
+                src = is_obs ? M : PS
+                idx = is_obs ? i : i - M.y_N
+                
+                s_ptr = Int(src.s_idx[idx])
+                t_ptr = Int(src.t_idx[idx])
+                
+                if s_ptr > M.s_N || t_ptr > M.t_N || s_ptr < 1 || t_ptr < 1
+                    @warn "Index out of bounds for DynamicsManifold effect reconstruction: s_ptr=$(s_ptr), t_ptr=$(t_ptr). Setting effect to zero."
+                    effect_k[i, j] = 0.0
+                else
+                    effect_k[i, j] = dyn_field_samples[s_ptr, t_ptr, j]
+                end
+            end
+        end
+        push!(structured_fields, effect_k)
+        push!(noisy_fields, effect_k)
+    end
+
+    return (structured=structured_fields, noisy=noisy_fields)
+end
+
+function extract_manifold(m_obj::SVCManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+    
+    cov_var = m_obj.covariate
+    if !hasproperty(M.data, cov_var)
+        @warn "Covariate $(cov_var) for SVCManifold not found in training data. Returning zero-matrices."
+        return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N],
+                noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
+    end
+
+    x_svc_train = M.data[!, cov_var]
+    x_svc_full = if !isnothing(PS) && hasproperty(PS.data, cov_var)
+        vcat(x_svc_train, PS.data[!, cov_var])
+    else
+        x_svc_train
+    end
+
+    s_idx_full = if !isnothing(PS)
+        vcat(M.s_idx, PS.s_idx)
+    else
+        M.s_idx
+    end
+
+    for k in 1:outcomes_N
+        key = spec.key
+        beta_name = _find_parameter(p_names, "beta_svc_" * string(key), "svc", string(cov_var), k)
+        
+        if isempty(beta_name)
+            @warn "Coefficient parameter $(beta_name) for SVCManifold $(key) (outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, N_tot, n_samples))
+            push!(noisy_fields, zeros(Float64, N_tot, n_samples))
+            continue
+        end
+
+        beta_samples = get_params_vector(chain, beta_name, M.s_N)
+        
+        effect_k = zeros(Float64, N_tot, n_samples)
+        for j in 1:n_samples
+            beta_j = beta_samples[j, :]
+            if any(idx -> idx > length(beta_j) || idx < 1, s_idx_full)
+                @warn "Spatial index out of bounds for SVCManifold effect reconstruction. Setting effect to zero."
+                effect_k[:, j] .= 0.0
+            else
+                effect_k[:, j] = beta_j[s_idx_full] .* x_svc_full
+            end
+        end
+        push!(structured_fields, effect_k)
+        push!(noisy_fields, effect_k)
+    end
+
+    return (structured=structured_fields, noisy=noisy_fields)
+end
+
+function extract_manifold(m_obj::MixedManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        n_units = spec.params.n_cat
+        latent_name = _find_parameter(p_names, "latent_" * string(spec.key), "mixed", string(spec.var), k)
+        
+        if isempty(latent_name)
+            @warn "Latent field parameter for MixedManifold $(spec.key) (outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, n_units, n_samples))
+            push!(noisy_fields, zeros(Float64, n_units, n_samples))
+            continue
+        end
+
+        latent_samples = get_params_vector(chain, latent_name, n_units)
+        push!(structured_fields, latent_samples')
+        push!(noisy_fields, latent_samples')
+    end
+
+    return (structured=structured_fields, noisy=noisy_fields)
+end
+
+function extract_manifold(m_obj::Harmonic, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+    
+    n_units = M.t_N
+    basis_coords = 1.0:Float64(n_units)
+
+    n_harmonics = get(spec.params, :n_harmonics, 2)
+    period = get(spec.params, :period, Float64(n_units))
+
+    n_basis_cols = 2 * n_harmonics 
+    B_mat = zeros(Float64, n_units, n_basis_cols)
+
+    for j in 1:n_harmonics
+        omega_j = 2.0 * pi * j / period
+        B_mat[:, 2*j - 1] = sin.(omega_j .* basis_coords)
+        B_mat[:, 2*j] = cos.(omega_j .* basis_coords)
+    end
+
+    for k in 1:outcomes_N
+        beta_name = outcomes_N > 1 ? Symbol("beta_basis_", spec.key, "_", k) : Symbol("beta_basis_", spec.key)
+        
+        if !(string(beta_name) in p_names)
+            @warn "Coefficient parameter $(beta_name) for Harmonic manifold $(spec.key) (outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, n_units, n_samples))
+            push!(noisy_fields, zeros(Float64, n_units, n_samples))
+            continue
+        end
+
+        coeffs = get_params_vector(chain, string(beta_name), n_basis_cols)
+        effect = B_mat * coeffs'
+        push!(structured_fields, effect)
+        push!(noisy_fields, effect)
+    end
+
+    return (structured=structured_fields, noisy=noisy_fields)
+end
+
+function extract_manifold(m_obj::Eigen, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        key = spec.key
+        v_name = _find_parameter(p_names, "v_" * string(key), "eigen", string(key), k)
+        
+        if isempty(v_name)
+            @warn "Reflector parameter $(v_name) for Eigen manifold $(key) (outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, N_tot, n_samples))
+            push!(noisy_fields, zeros(Float64, N_tot, n_samples))
+            continue
+        end
+
+        v_samples = get_params_vector(chain, v_name, length(spec.params.ltri_indices))
+
+        eigen_vars = spec.variables
+        
+        if !all(hasproperty(M.data, Symbol(v)) for v in eigen_vars)
+            @warn "Eigen variables $(eigen_vars) not found in training data. Returning zero-matrices."
+            push!(structured_fields, zeros(Float64, N_tot, n_samples))
+            push!(noisy_fields, zeros(Float64, N_tot, n_samples))
+            continue
+        end
+
+        Y_data_train = Matrix(M.data[!, Symbol.(eigen_vars)])
+        Y_data = if !isnothing(PS) && hasproperty(PS, :data) && all(hasproperty(PS.data, Symbol(v)) for v in eigen_vars)
+            Matrix(PS.data[!, Symbol.(eigen_vars)])
+        else
+            Y_data_train
+        end
+
+        n_vars = length(eigen_vars)
+        n_factors = spec.params.n_factors
+
+        eigen_effect = zeros(Float64, N_tot, n_samples)
+
+        for j in 1:n_samples
+            v_vec = v_samples[j, :]
+            v_mat = zeros(Float64, n_vars, n_factors)
+            
+            if any(idx -> idx > length(v_mat) || idx < 1, spec.params.ltri_indices)
+                @warn "ltri_indices out of bounds for Eigen manifold effect reconstruction. Setting effect to zero."
+                eigen_effect[:, j] .= 0.0
+                continue
+            end
+            v_mat[spec.params.ltri_indices] .= v_vec
+            
+            U = householder_to_eigenvector(v_mat, n_vars, n_factors)
+            
+            if size(Y_data, 2) != size(U, 1)
+                @warn "Dimension mismatch between Y_data ($(size(Y_data, 2))) and U ($(size(U, 1))) for Eigen manifold effect reconstruction. Setting effect to zero."
+                eigen_effect[:, j] .= 0.0
+                continue
+            end
+
+            factors = Y_data * U
+            eigen_effect[:, j] = factors[:, 1]
+        end
+        push!(structured_fields, eigen_effect)
+        push!(noisy_fields, eigen_effect)
+    end
+
+    return (structured=structured_fields, noisy=noisy_fields)
+end
+
+function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        key = spec.key
+        latent_name = _find_parameter(p_names, "latent_" * string(key), "interaction", string(key), k)
+
+        if isempty(latent_name)
+            @warn "Latent field parameter for ComposedManifold $(key) (outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, N_tot, n_samples))
+            push!(noisy_fields, zeros(Float64, N_tot, n_samples))
+            continue
+        end
+
+        latent_samples_flat = get_params_vector(chain, latent_name, 0)
+
+        if size(latent_samples_flat, 2) == 0
+            @warn "Latent field for composed manifold '$key' has zero length. Skipping."
+            push!(structured_fields, zeros(Float64, N_tot, n_samples))
+            push!(noisy_fields, zeros(Float64, N_tot, n_samples))
+            continue
+        end
+
+        indices = get(spec, :indices, nothing)
+
+        if isnothing(indices)
+             @warn "Composed manifold '$key' is missing indices. Cannot reconstruct effect."
+             push!(structured_fields, zeros(Float64, N_tot, n_samples))
+             push!(noisy_fields, zeros(Float64, N_tot, n_samples))
+             continue
+        end
+
+        effect_k = zeros(Float64, N_tot, n_samples)
+
+        if any(idx -> idx > size(latent_samples_flat, 2) || idx < 1, indices)
+            @warn "Indices for ComposedManifold effect reconstruction are out of bounds. Setting effect to zero."
+            push!(structured_fields, zeros(Float64, N_tot, n_samples))
+            push!(noisy_fields, zeros(Float64, N_tot, n_samples))
+            continue
+        end
+
+        if !isnothing(PS)
+            @warn "Prediction for ComposedManifold is not fully supported in this reconstruction path. The effect will be zero for the prediction set. The `predict` function should be used for out-of-sample prediction."
+            for j in 1:n_samples
+                field_j = latent_samples_flat[j, :]
+                effect_k[1:M.y_N, j] = field_j[indices]
+            end
+        else
+            for j in 1:n_samples
+                field_j = latent_samples_flat[j, :]
+                effect_k[:, j] = field_j[indices]
+            end
+        end
+        push!(structured_fields, effect_k)
+        push!(noisy_fields, effect_k)
+    end
+
+    return (structured=structured_fields, noisy=noisy_fields)
+end
+
+function extract_manifold(m_obj::IID, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        key = spec.key
+        m_domain = spec.domain
+        
+        sigma_name = _find_parameter(p_names, "sigma_" * string(key), string(m_domain), string(key), k)
+        latent_name = _find_parameter(p_names, "latent_" * string(key), string(m_domain), string(key), k)
+        
+        n_units = if m_domain == :spatial; M.s_N; elseif m_domain == :temporal; M.t_N; else M.u_N; end
+        
+        if isempty(sigma_name) || isempty(latent_name)
+            @warn "Parameters for IID manifold $(key) (domain $(m_domain), outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, n_units, n_samples))
+            push!(noisy_fields, zeros(Float64, n_units, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)
+        latent_samples = get_params_vector(chain, latent_name, n_units)
+        
+        effect = latent_samples' .* sigma_samples'
+        push!(structured_fields, effect)
+        push!(noisy_fields, effect)
+    end
+
+    return (structured=structured_fields, noisy=noisy_fields)
+end
+
+   
 function _quantile_along_last_dim(A::AbstractArray, q::Real; sample_dim=ndims(A))
     other_dims = size(A)[1:end-1]
     out = Array{Float64}(undef, other_dims)
@@ -174,413 +648,31 @@ function summarize_array(samples::AbstractArray; alpha=0.05)
 end
 
 
-function extract_manifold(m_obj::Union{ICAR, Besag, RW1, RW2, Leroux, SAR, Cyclic}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # v1.2.0 (2026-06-29 16:13:05)
-    # Purpose: Extracts posterior samples for standard GMRF manifold types. 
-    # Inputs: m_obj, chain, M, n_samples, outcomes_N, p_names, spec.
-    # Outputs: A NamedTuple containing structured and noisy fields.
+function _extract_simple_manifold_effect(chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot) # Added PS, N_tot for consistency
     structured_fields = Vector{Matrix{Float64}}()
+    noisy_fields = Vector{Matrix{Float64}}()
     
     for k in 1:outcomes_N
         key = spec.key
         m_domain = spec.domain
-        
-        # Use the robust finder for all parameters
+
         sigma_name = _find_parameter(p_names, "sigma_" * string(key), string(m_domain), string(key), k)
         latent_name = _find_parameter(p_names, "latent_" * string(key), string(m_domain), string(key), k)
-        
+
         n_units = if m_domain == :spatial; M.s_N; elseif m_domain == :temporal; M.t_N; else M.u_N; end
-        
-        sigma_samples = get_params_vector(chain, sigma_name, 1)
-        latent_samples = get_params_vector(chain, latent_name, n_units)
-        
-        # Transpose to [n_units, n_samples] and apply scaling
-        effect = latent_samples' .* sigma_samples'
-        push!(structured_fields, effect)
-    end
-    
-    return (structured=structured_fields, noisy=structured_fields)
-end
- 
- 
-function extract_manifold(m_obj::BYM2, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # v1.2.4 (2026-07-05)
-    # Purpose: Extracts posterior samples for the BYM2 manifold, correctly partitioning
-    #          the structured, unstructured, and total spatial effects.
-    # Rationale for v1.2.4:
-    #     - The previous implementation correctly calculated the total spatial effect but failed
-    #       to return the isolated unstructured (IID) component. This led to its truncation
-    #       in downstream analyses, causing zero-mean effects to be reported for the total
-    #       spatial field in some contexts.
-    #     - This version updates the return signature to a NamedTuple with three fields:
-    #       `structured`, `unstructured`, and `noisy` (total), ensuring all components
-    #       are available for correct accumulation and summarization.
 
-    structured_fields = Vector{Matrix{Float64}}()
-    unstructured_fields = Vector{Matrix{Float64}}()
-    noisy_fields = Vector{Matrix{Float64}}()
-
-    for k in 1:outcomes_N
-        key = string(spec.key)
-        m_domain = string(spec.domain)
-        sigma_name = _find_parameter(p_names, "sigma_" * key, m_domain, key, k)
-        rho_name = _find_parameter(p_names, "rho_" * key, m_domain, key, k)
-        struct_name = _find_parameter(p_names, "latent_struct_" * key, m_domain, key, k)
-        iid_name = _find_parameter(p_names, "latent_iid_" * key, m_domain, key, k)
-
-        sigma_samples = get_params_vector(chain, sigma_name, 1)
-        rho_samples = get_params_vector(chain, rho_name, 1)
-        struct_samples = get_params_vector(chain, struct_name, M.s_N)
-        iid_samples = get_params_vector(chain, iid_name, M.s_N)
-
-        struct_eff = (struct_samples' .* sqrt.(rho_samples')) .* sigma_samples'
-        unstruct_eff = (iid_samples' .* sqrt.(1.0 .- rho_samples')) .* sigma_samples'
-        noisy_eff = struct_eff .+ unstruct_eff
-
-        push!(structured_fields, struct_eff)
-        push!(unstructured_fields, unstruct_eff)
-        push!(noisy_fields, noisy_eff)
-    end
-    return (structured=structured_fields, unstructured=unstructured_fields, noisy=noisy_fields)
-end
-
-
-function extract_manifold(m_obj::AR1, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_fields = Vector{Matrix{Float64}}()
-    for k in 1:outcomes_N
-        key = string(spec.key)
-        m_domain = string(spec.domain)
-        
-        sigma_name = _find_parameter(p_names, "sigma_" * key, m_domain, key, k)
-        rho_name = _find_parameter(p_names, "rho_" * key, m_domain, key, k)
-        innov_name = _find_parameter(p_names, "innov_" * key, m_domain, key, k)
-
-        sigma_samples = get_params_vector(chain, sigma_name, 1)
-        rho_samples = get_params_vector(chain, rho_name, 1)
-        innov_samples = get_params_vector(chain, innov_name, M.t_N)
-
-        # Reconstruct the AR1 field from its innovations for each posterior sample.
-        n_t = M.t_N
-        t_field_samples = zeros(Float64, n_t, n_samples)
-        
-        for j in 1:n_samples
-            rho = rho_samples[j, 1]
-            sig = sigma_samples[j, 1]
-            innov = innov_samples[j, :]
-            
-            curr_field = zeros(Float64, n_t)
-            curr_field[1] = innov[1] / sqrt(1.0 - rho^2 + 1e-9)
-            for t in 2:n_t
-                curr_field[t] = rho * curr_field[t-1] + innov[t]
-            end
-            t_field_samples[:, j] = curr_field .* sig
-        end
-        
-        push!(structured_fields, t_field_samples)
-    end
-    return (structured=structured_fields, noisy=structured_fields)
-end
-
-
-
-function extract_manifold(m_obj::IID, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # v1.2.2 (2026-07-05)
-    # Purpose: Extracts posterior samples for the IID manifold, correctly separating the unstructured effect.
-    # Inputs: m_obj, chain, M, n_samples, outcomes_N, p_names, spec.
-    # Outputs: A NamedTuple containing structured and noisy fields.
-    structured_fields = Vector{Matrix{Float64}}()
-    noisy_fields = Vector{Matrix{Float64}}()
-
-    for k in 1:outcomes_N
-        key = spec.key
-        m_domain = spec.domain
-        
-        sigma_name = _find_parameter(p_names, "sigma_" * string(key), string(m_domain), string(key), k)
-        latent_base = "latent_" * string(key)
-        latent_name = _find_parameter(p_names, latent_base, string(m_domain), string(key), k)
-        
-        n_units = if m_domain == :spatial; M.s_N; elseif m_domain == :temporal; M.t_N; else M.u_N; end
-        
-        sigma_samples = get_params_vector(chain, sigma_name, 1)
-        latent_samples = get_params_vector(chain, latent_name, n_units)
-        effect = latent_samples' .* sigma_samples'
-        push!(noisy_fields, effect) # For IID, noisy and structured are the same
-        push!(structured_fields, effect) # IID effect is itself a structured component
-     end
-
-    return (structured=structured_fields, noisy=noisy_fields)
-end
-
-
-function extract_manifold(m_obj::Union{PSpline, BSpline, TPS, RFF, FFT, Wavelet, Moran, Spherical, ExponentialDecay, Barycentric}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # v1.2.0 (2026-06-29 16:13:05)
-    # Purpose: Extracts posterior samples for basis function manifolds. 
-    # Change: Returns both the final effect and the raw coefficients.
-    var_sym = spec.var
-    B_mat = M.basis_matrices[var_sym]
-    n_basis_cols = size(B_mat, 2)
-
-    structured_fields = Vector{Matrix{Float64}}()
-    coefficient_fields = Vector{Matrix{Float64}}() # This will store [n_basis, n_samples] for each outcome
-
-    for k in 1:outcomes_N
-        key = spec.key
-        beta_name = outcomes_N > 1 ? Symbol("beta_", key, "_", k) : Symbol("beta_", key)
-        coeffs = get_params_vector(chain, string(beta_name), n_basis_cols) # [n_samples, n_basis]
-        
-        push!(coefficient_fields, coeffs') # store as [n_basis, n_samples]
-
-        effect = B_mat * coeffs' # Result is [n_obs, n_samples]
-        push!(structured_fields, effect)
-    end
-
-    return (structured=structured_fields, noisy=structured_fields, coefficients=coefficient_fields)
-end
- 
-function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # v1.2.1 (2026-06-29 16:13:05)
-    # Purpose: Extracts posterior samples for dynamics manifolds.
-    #     - Corrected to handle out-of-sample prediction data (PS). The original implementation
-    #       was truncated to only process training data (M.y_N), which would cause errors
-    #       or incorrect predictions when a prediction set was provided.
-
-    structured_fields = Vector{Matrix{Float64}}()
-
-    for k in 1:outcomes_N
-        # The model samples the full dyn_field for each outcome
-        key = spec.key
-        latent_name = _find_parameter(p_names, "dyn_field_" * string(key), "dynamics", string(key), k)
-        
-        # The dynamic field is a full spatiotemporal grid
-        latent_samples = get_params_vector(chain, latent_name, M.s_N * M.t_N) # [n_samples, s_N * t_N]
-
-        # Reshape to [M.s_N, M.t_N, n_samples] and then extract relevant indices
-        dyn_field_samples = reshape(latent_samples', M.s_N, M.t_N, n_samples) # [M.s_N, M.t_N, n_samples]
-        
-        # Extract the effect at observation points
-        effect_k = zeros(Float64, N_tot, n_samples)
-        for j in 1:n_samples
-            for i in 1:N_tot
-                is_obs = i <= M.y_N
-                src = is_obs ? M : PS
-                idx = is_obs ? i : i - M.y_N
-                
-                s_ptr = Int(src.s_idx[idx])
-                t_ptr = Int(src.t_idx[idx])
-                
-                effect_k[i, j] = dyn_field_samples[s_ptr, t_ptr, j]
-            end
-        end
-        push!(structured_fields, effect_k)
-    end
-
-    return (structured=structured_fields, noisy=structured_fields)
-end
-
-function extract_manifold(m_obj::SVCManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # v1.2.0 (2026-06-29 16:13:05)
-    # Purpose: Extracts posterior samples for a Spatially Varying Coefficient (SVC) manifold. 
-    # Rationale: This method was missing, causing SVC effects to be truncated from the model results. 
-    #            This implementation correctly reconstructs the realized effect for both training
-    #            and prediction datasets.
-    structured_fields = Vector{Matrix{Float64}}()
-    
-    # Combine covariate data from training and prediction sets
-    cov_var = m_obj.covariate
-    x_svc_train = M.data[!, cov_var]
-    x_svc_full = if !isnothing(PS) && hasproperty(PS.data, cov_var)
-        vcat(x_svc_train, PS.data[!, cov_var])
-    else
-        x_svc_train
-    end
-
-    # Combine spatial indices
-    s_idx_full = if !isnothing(PS)
-        vcat(M.s_idx, PS.s_idx)
-    else
-        M.s_idx
-    end
-
-    for k in 1:outcomes_N
-        key = spec.key
-        beta_name = _find_parameter(p_names, "beta_svc_" * string(key), "svc", string(cov_var), k)
-        
-        # beta_svc is a spatial field of coefficients, so it has M.s_N elements
-        beta_samples = get_params_vector(chain, beta_name, M.s_N) # [n_samples, M.s_N]
-        
-        effect_k = zeros(Float64, N_tot, n_samples)
-        for j in 1:n_samples
-            beta_j = beta_samples[j, :]
-            effect_k[:, j] = beta_j[s_idx_full] .* x_svc_full
-        end
-        push!(structured_fields, effect_k)
-    end
-
-    return (structured=structured_fields, noisy=structured_fields)
-end
-
-function extract_manifold(m_obj::MixedManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # v1.2.0 (2026-06-29 16:13:05)
-    # Purpose: Extracts posterior samples for a Mixed Effects manifold (random intercept/slope). 
-    #          This separates the extraction logic from the main discovery loop for clarity. 
-    # Inputs: m_obj, chain, M, n_samples, outcomes_N, p_names, spec.
-    # Outputs: A NamedTuple containing the structured effect (the random effect coefficients).
-    structured_fields = Vector{Matrix{Float64}}()
-
-    for k in 1:outcomes_N
-        # For mixed effects, the 'structured' field holds the random coefficients.
-        # The model does not have a separate sigma parameter for these; the coefficients
-        # are typically sampled from a Normal(0, sigma_group) where sigma_group is a
-        # hyperparameter, but the final coefficients are what we need.
-        # The existing logic incorrectly tried to find and apply a non-existent sigma.
-        
-        n_units = spec.params.n_cat
-        latent_name = _find_parameter(p_names, "latent_" * string(spec.key), "mixed", string(spec.var), k)
-        latent_samples = get_params_vector(chain, latent_name, n_units) # [n_samples, n_units]
-        push!(structured_fields, latent_samples') # Store as [n_units, n_samples]
-    end
-
-    return (structured=structured_fields, noisy=structured_fields)
-end
-
-function extract_manifold(m_obj::Harmonic, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # v1.2.0 (2026-06-29 16:13:05)
-    # Purpose: Extracts posterior samples for a Harmonic manifold (seasonal/periodic effects). 
-    # Inputs: m_obj, chain, M, n_samples, outcomes_N, p_names, spec.
-    # Outputs: A NamedTuple containing the structured effect.
-
-    structured_fields = Vector{Matrix{Float64}}()
-    
-    # Harmonic manifold is typically applied to temporal or seasonal domain
-    n_units = M.t_N # Assuming temporal domain for now
-    basis_coords = 1.0:Float64(n_units)
-
-    # The number of harmonics and period are part of the manifold object
-    n_harmonics = get(spec.params, :n_harmonics, 2) # Default to 2 if not specified
-    period = get(spec.params, :period, Float64(n_units)) # Default to n_units if not specified
-
-    # Construct the Fourier basis matrix
-    # Each harmonic contributes a sine and cosine component
-    n_basis_cols = 2 * n_harmonics 
-    B_mat = zeros(Float64, n_units, n_basis_cols)
-
-    for j in 1:n_harmonics
-        omega_j = 2.0 * pi * j / period
-        B_mat[:, 2*j - 1] = sin.(omega_j .* basis_coords)
-        B_mat[:, 2*j] = cos.(omega_j .* basis_coords)
-    end
-
-    for k in 1:outcomes_N
-        # BSTM v3.0.0 Naming Convention Alignment
-        beta_name = "beta_basis_$(spec.key)"
-        if outcomes_N > 1; beta_name *= "_$(k)"; end
-        coeffs = get_params_vector(chain, beta_name, n_basis_cols)
-
-        effect = B_mat * coeffs'
-        push!(structured_fields, effect)
-    end
-
-    return (structured=structured_fields, noisy=structured_fields)
-end
-
-function extract_manifold(m_obj::Eigen, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # v1.2.0 (2026-06-29 16:13:05)
-    # Purpose: Extracts posterior samples for an EigenManifold (Bayesian PCA factor). 
-    # Inputs: m_obj, chain, M, n_samples, outcomes_N, p_names, spec.
-    # Outputs: A NamedTuple containing the structured effect (the first principal component).
-    # Rationale for v1.2.0:
-    #     - Modified to use both training (M) and prediction (PS) data to construct the
-    #       full effect vector, preventing truncation errors.
-
-    # 1. Get parameters from chain
-    # The parameter names are constructed based on the key of the manifold spec
-    key = spec.key
-    v_samples = get_params_vector(chain, "v_$(key)", length(spec.params.ltri_indices))
-
-    # 2. Get data for the factor model from both training and prediction sets
-    eigen_vars = spec.variables # e.g., ["y1", "y2", "w1", "w2", "w3"]
-    
-    # Combine training and prediction data if PS is available
-    Y_data_train = Matrix(M.data[!, Symbol.(eigen_vars)])
-    Y_data = if !isnothing(PS) && hasproperty(PS, :data)
-        Y_data_pred = Matrix(PS.data[!, Symbol.(eigen_vars)])
-        vcat(Y_data_train, Y_data_pred)
-    else
-        Y_data_train
-    end
-
-    n_vars = length(eigen_vars)
-    n_factors = spec.params.n_factors
-
-    # 3. Reconstruct the effect for each sample
-    eigen_effect = zeros(Float64, N_tot, n_samples)
-
-    for j in 1:n_samples
-        v_vec = v_samples[j, :]
-        v_mat = zeros(Float64, n_vars, n_factors)
-        v_mat[spec.params.ltri_indices] .= v_vec
-        U = householder_to_eigenvector(v_mat, n_vars, n_factors)
-        factors = Y_data * U
-        eigen_effect[:, j] = factors[:, 1]
-    end
-
-    structured_fields = [eigen_effect]
-    return (structured=structured_fields, noisy=structured_fields)
-end
-
-
-function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # v1.2.1 (2026-07-13)
-    # Purpose: Extracts posterior samples for algebraically composed manifolds (e.g., from ⊗).
-    # Rationale: This method was missing, causing a `MethodError` during posterior reconstruction.
-    #            This implementation correctly identifies the flattened latent field from the MCMC
-    #            chain and maps it to the observation-level linear predictor using the pre-computed
-    #            indices stored in the manifold specification.
-
-    structured_fields = Vector{Matrix{Float64}}()
-
-    for k in 1:outcomes_N
-        key = spec.key
-
-        latent_name = _find_parameter(p_names, "latent_" * string(key), "interaction", string(key), k)
-
-        # Let get_params_vector infer the size
-        latent_samples_flat = get_params_vector(chain, latent_name, 0)
-
-        if size(latent_samples_flat, 2) == 0
-            @warn "Could not find latent field for composed manifold '$key'. Skipping."
-            push!(structured_fields, zeros(Float64, N_tot, n_samples))
+        # Handle cases where parameters might not be found, returning zero-matrices
+        if isempty(sigma_name) || isempty(latent_name)
+            @warn "Parameters for manifold $(key) (domain $(m_domain), outcome $(k)) not found. Returning zero-matrix for effect."
+            push!(structured_fields, zeros(Float64, n_units, n_samples))
+            push!(noisy_fields, zeros(Float64, n_units, n_samples))
             continue
         end
-
-        indices = get(spec, :indices, nothing)
-
-        if isnothing(indices)
-             @warn "Composed manifold '$key' is missing indices. Cannot reconstruct effect."
-             push!(structured_fields, zeros(Float64, N_tot, n_samples))
-             continue
-        end
-
-        effect_k = zeros(Float64, N_tot, n_samples)
-
-        if !isnothing(PS)
-            @warn "Prediction for ComposedManifold is not fully supported in this reconstruction path. The effect will be zero for the prediction set. The `predict` function should be used for out-of-sample prediction."
-            # Only apply effect to the training data part
-            for j in 1:n_samples
-                field_j = latent_samples_flat[j, :]
-                effect_k[1:M.y_N, j] = field_j[indices]
-            end
-        else
-            for j in 1:n_samples
-                field_j = latent_samples_flat[j, :]
-                effect_k[:, j] = field_j[indices]
-            end
-        end
-        push!(structured_fields, effect_k)
-    end
-
-    return (structured=structured_fields, noisy=structured_fields)
+        sigma_samples = get_params_vector(chain, sigma_name, 1)
+        latent_samples = get_params_vector(chain, latent_name, n_units)
+    end        
 end
+
 
 function _discover_manifold_realizations(chain, M, n_samples, outcomes_N, p_names, PS, N_tot)
     # Initialization of outcome-specific latent containers
@@ -597,7 +689,7 @@ function _discover_manifold_realizations(chain, M, n_samples, outcomes_N, p_name
     st_eff_maps = [zeros(Float64, M.s_N, M.t_N, n_samples) for _ in 1:outcomes_N]
     dynamics_eff = [zeros(Float64, M.y_N, n_samples) for _ in 1:outcomes_N]
     eigen_eff = [zeros(Float64, M.y_N, n_samples) for _ in 1:outcomes_N]
-    nested_eff = [zeros(Float64, M.y_N, n_samples) for _ in 1:outcomes_N]
+    
 
     # Registry for component metadata identification used in reporting wrappers
     disc_space = "none"
@@ -733,7 +825,7 @@ function _discover_manifold_realizations(chain, M, n_samples, outcomes_N, p_name
         st_eff_maps = st_eff_maps,
         dynamics_eff = dynamics_eff,
         eigen_eff = eigen_eff,
-        nested_eff = nested_eff,
+        all_nested_effects = all_nested_effects,
         sv_surface = sv_surface,
         n_samples = n_samples,
         outcomes_N = outcomes_N,
@@ -810,7 +902,13 @@ function _modular_eta_assembly(N_tot_in, registry, M, PS_in)
                 # Add specialized manifold effects
                 if !isempty(dynamics_eff_k); val += dynamics_eff_k[i]; end
                 if !isempty(eigen_eff_k); val += eigen_eff_k[i]; end
-                if !isempty(nested_eff_k); val += nested_eff_k[i]; end
+                
+                # Add nested effects
+                if haskey(registry, :all_nested_effects) && !isempty(registry.all_nested_effects)
+                    for (_, nested_effect_samples) in registry.all_nested_effects
+                        val += nested_effect_samples[i, j]
+                    end
+                end
 
                 eta_container[i, k, j] = val
             end
@@ -1069,6 +1167,14 @@ function _reconstruct(arch::UnivariateArchitecture, modelname::String, chain, M,
     if !isnothing(xf_betas)
         summarized_effects[:fixed_effects] = summarize_array(xf_betas'; alpha=alpha)
     end
+
+    # Summarize nested effects
+    if haskey(registry, :all_nested_effects) && !isempty(registry.all_nested_effects)
+        summarized_effects[:nested_effects] = Dict{Symbol, Any}()
+        for (var_name, effect_samples) in registry.all_nested_effects
+            summarized_effects[:nested_effects][var_name] = summarize_array(effect_samples; alpha=alpha)
+        end
+    end
  
     # 4. Generate Predictions and Compute Log-Likelihood
     eta_samples_2d = reshape(eta_samples, N_tot, n_samples)
@@ -1110,7 +1216,7 @@ function _reconstruct(arch::MultivariateArchitecture, modelname::String, chain, 
     fam_obj = get_model_family(family_str)
 
     # 1. Parameter and Latent Field Discovery
-    registry = _discover_manifold_realizations(chain, M, N_samples, outcomes_N, p_names)
+    registry = _discover_manifold_realizations(chain, M, N_samples, outcomes_N, p_names, PS, N_tot)
 
     # 2. Linear Predictor Assembly
     eta_samples = _modular_eta_assembly(N_tot, registry, M, PS)
@@ -1144,6 +1250,14 @@ function _reconstruct(arch::MultivariateArchitecture, modelname::String, chain, 
     if !isnothing(registry.st_eff_maps) && !isempty(registry.st_eff_maps)
         st_summaries = [summarize_array(registry.st_eff_maps[k]; alpha=alpha) for k in 1:outcomes_N]
         summarized_effects[:spacetime_interaction] = st_summaries
+    end
+
+    # Summarize nested effects
+    if haskey(registry, :all_nested_effects) && !isempty(registry.all_nested_effects)
+        summarized_effects[:nested_effects] = Dict{Symbol, Any}()
+        for (var_name, effect_samples) in registry.all_nested_effects
+            summarized_effects[:nested_effects][var_name] = summarize_array(effect_samples; alpha=alpha)
+        end
     end
 
     # 4. Generate Predictions and Compute Log-Likelihood
@@ -1241,7 +1355,7 @@ function _reconstruct(arch::MultifidelityArchitecture, modelname::String, chain,
     # This section specifically handles the contributions from nested sub-models
     summarized_effects = Dict{Symbol, Any}()
 
-    # RFF-based multi-fidelity fields (z_latent, w_latent)
+    # RFF-based multi-fidelity fields (z_latent, w_latent) - This part is for specific RFF-based multifidelity models, not the general nested() module.
     # This logic was modularized into _extract_nested_fields but was not being called.
     # We call it here to reconstruct and summarize these core multi-fidelity components.
     if haskey(M, :z_coords_s) # Check if RFF-based multi-fidelity is active

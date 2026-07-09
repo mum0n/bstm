@@ -149,11 +149,24 @@ show(data_scot[:data])  # a DataFrame
 
 m = @bstm(  likelihood(y, family=poisson, offsets=log_offset) ~ 
     intercept() + 
-    spatial(s_idx, model=besag) + 
+    spatial(s_idx, model=besag, W=data_scot[:au][:W]) + 
     temporal(year, model=ar1), 
-    data_scot[:data],
-    W=data_scot[:au][:W]  # Pass adjacency matrix as a keyword argument
+    data_scot[:data]
 )  
+
+
+m = @bstm(  likelihood(y, family=poisson, offsets=log_offset) ~ 
+    intercept() + 
+    spatial(s_idx, model=besag, W=data_scot[:au][:W]) + 
+    temporal(year, model=ar1) +
+    cov1 +  
+    fixed(cov2) + 
+    smooth(cov3) +
+    fixed(region), 
+    data_scot[:data]
+)  
+
+show_model(m)  # pseudocode to check
 
 # two ways of adding spacetime interaction effects
 #   + spacetime(s_idx, year; model=(besag, ar1))
@@ -247,27 +260,28 @@ plot_kde_simple( data.s_coord_tuple, sd_extension_factor=0.25, title="Spatial In
 
 ### Simplified interface
 
-Mimicking and blending R's GLM, LME4, INLA and brms formula interfaces, here is an example running a simple analysis:
+The recommended way to define models is with the `@bstm` macro, which allows for a clean, unquoted formula syntax directly within your Julia code. This approach is more robust and flexible than using strings.
+
+By default, all models include an intercept. To explicitly control this, use the `intercept()` module. Bare numbers (`1`, `0`, `-1`) are supported for legacy compatibility but are no longer the recommended method.
+
+**Recommended Macro Usage:**
 
 ```{julia}
- 
-data, _ = scottish_lip_cancer_data_spacetime()
+# Assuming 'data_scot' is the NamedTuple from the Scottish Lip Cancer example
+inp_df = data_scot[:data]
+W_matrix = data_scot[:au][:W]
 
-inp_df = data[:data]
-
-# Display first few rows to confirm alignment
-display(first(inp_df, 3))
-
-fm = """ 
-  likelihood(y, family="poisson") ~ 1 + z + region + spatial(s_idx, model=bym2, W=data.au.W) + temporal(year, model=ar1) 
-"""
-
-m = bstm( fm, inp_df; target_units=20 )
-
-rand(m)
-chn = sample(m, MH(), 200);
-res = model_results_comprehensive(m , chn );
-
+# CORRECT: Use intercept() and fixed() for effects.
+# The adjacency matrix `W_matrix` is passed as a keyword argument.
+m = @bstm(
+    likelihood(y, family=:poisson, offsets=:log_offset) ~
+        intercept(prior=Normal(0, 20)) + # Specify a custom prior for the intercept
+        fixed(X) + # Assuming 'X' is the covariate column name
+        spatial(s_idx, model=:bym2) +
+        temporal(year, model=:ar1),
+    inp_df,
+    W = W_matrix
+)
 ```
 
 The notation is similar but with some quirks (that are again easily altered to your taste ... this is all basic Julia after all). Here   `s_idx` (spatial unit index) and `t_idx` (time unit index) are key words and have not yet been created. You can and probably should make it so that there is no ambiguity. Here, in the absence of that information, it is generated from an internal default method (:hvt, with a target of 20 areal units).      
@@ -280,9 +294,9 @@ In `bstm` formulas, specific function-like terms, or "modules," are used to defi
 ```julia
 formula = """
   likelihood(y, family=:poisson, offsets=log_pop) ~ 
-    intercept(prior=Normal(0, 10)) + 
-    z + 
-    fixed(Region, contrast=effects, prior=Normal(0, 2)) + 
+    intercept(prior=Normal(0, 10)) +
+    fixed(z, prior=Normal(0, 5)) +
+    fixed(Region, contrast=:effects, prior=Normal(0, 2)) +
     (poverty |> spatial(s_idx, model=icar)) +
     (spatial(s_idx, model=besag) ⊗ temporal(year, model=ar1)) +
     smooth(age, model=pspline, nbins=10)
@@ -310,18 +324,7 @@ The `bstm_options` and `assign_covariate_units` functions support several method
 
 In `bstm` formulas, specific function-like terms, or "modules," are used to define the model's structure. These modules tell the pre-processor how to construct latent fields, handle covariates, and set priors.
 
-**Example Formula Usage**
-```julia
-formula = """
-  likelihood(y, family=:poisson, offsets=log_pop) ~ 
-    intercept(prior=Normal(0, 10)) + 
-    z + 
-    fixed(Region, contrast=effects, prior=Normal(0, 2)) + 
-    (poverty |> spatial(s_idx, model=icar)) +
-    (spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1)) +
-    smooth(age, model=pspline, nbins=10)
-"""
-```
+ 
 
 
 
@@ -772,6 +775,13 @@ Note the target point density is similar to the final density.
 
 ## Model Compendium
 
+::: {.callout-warning}
+## Experimental and Non-Functional Models
+
+Many of the models listed in this compendium are experimental and contain known bugs (e.g., `matrix not positive definite`, `Dim mismatch`, `error`). They are included for development and illustrative purposes but are not guaranteed to run successfully. Use with caution.
+
+:::
+
 The following prepares data for the models to be examine together with a few covariates and also creates a prediction surface to which predictions can be made to plot or examine trends in a structured manner.
 
 ```{julia}
@@ -1176,8 +1186,8 @@ end
 ### Example Formula Usage
 ```julia
 formula = "y ~ 1 + z + " * 
-    "Fixed(Region, contrast='effects') + " * # Fixed effect with effects coding
-    "Spatial(s_idx, model='bym2') + " *        # Besag-York-Mollie spatial manifold
+    "fixed(Region, contrast=:effects) + " * # Fixed effect with effects coding
+    "spatial(s_idx, model='bym2') + " *        # Besag-York-Mollie spatial manifold
     "Temporal(t_idx, model='rw2') + " *         # Smooth temporal trend
     "SVC(z, model='rff') + " *            # Spatially varying coefficient for z
     "Smooth(lat, lon, model='gp')"            # Non-linear spatial interaction surface

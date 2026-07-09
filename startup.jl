@@ -102,23 +102,7 @@ DEBUG = Ref{Any}()  # initiate
 print( "\nTo Debug a variable, place something like the following into your function: \n
   Main.DEBUG[] = y,p,t  # this stores y, p, t into Main.DEBUG \n
 which means, you can see what these values are by typing: DEBUG.y, etc... \n")
-
-# support functions
-# include( srcdir( "data_prep.jl") );
-# include( srcdir( "unit_test_functions.jl" ))   ;
-# include( srcdir( "legacy.jl" ))   ;
-# include( srcdir( "example_turing_models.jl" ))   ;
-
-# include( srcdir( "utility_functions.jl" ))   ;
-# include( srcdir( "structs.jl" ))   ;
-
-# include( srcdir( "spatiotemporal_partitioning_functions.jl" ))   ;
-# include( srcdir( "spatiotemporal_functions.jl" ))   ;
-# include( srcdir( "build_model_dispatch.jl" ))   ;
-# include( srcdir( "bstm_model_supervisors.jl" ))   ;
-# include( srcdir( "reconstruction_engine.jl" ))   ;
-# include( srcdir( "visualization_engine.jl" ))   ;
-
+ 
 function load_project_functions( src_dir=srcdir() )
     
   # structs.jl must come first   

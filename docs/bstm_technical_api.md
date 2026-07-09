@@ -101,12 +101,13 @@ The `logpdf` function for this struct calls `bstm_kernel`, which dispatches on t
 The formula parser translates the user-provided formula string into a structured representation that the configuration engine can process.
 
 *   **`decompose_bstm_formula(formula_str)`**: This is the main entry point. It splits the formula into its Left-Hand Side (LHS) and Right-Hand Side (RHS).
-    *   **LHS**: Parsed to identify outcome variables and their likelihood specifications (e.g., `likelihood(y, family=:poisson)`).
-    *   **RHS**: Parsed by `_parse_rhs_expression` into an Abstract Syntax Tree (AST).
-    *   **Output**: Returns a `NamedTuple` containing `:outcomes`, `:modules`, `:fixed_effects`, and `:has_intercept`.
+    *   **LHS**: Parsed to identify outcome variables and their likelihood specifications (e.g., `likelihood(y, family=poisson)`).
+    *   **RHS**: Pre-processed to handle intercept control (`-1`, `0`, `intercept(false)`) and to normalize all bare terms (e.g., `z`) into explicit `fixed(z)` module calls. It is then parsed by `_parse_rhs_expression` into an Abstract Syntax Tree (AST).
+    *   **Output**: Returns a `NamedTuple` containing `:outcomes`, `:modules` (a dictionary of all parsed RHS terms), `:has_intercept`, and `:intercept_prior`. The concept of a separate `fixed_effects` list is removed from this stage.
 
 *   **`_parse_rhs_expression(term_str)`**: A recursive descent parser that respects operator precedence to build the AST for the RHS. The precedence is:
     1.  `+` (Addition of independent effects)
+    2.  `-` (Subtraction of terms, internally converted to `+ -term`)
     2.  `⊕` (Direct Sum)
     3.  `|>` (Pipe for SVC/state-space)
     4.  `⊗` (Kronecker Product)
@@ -114,7 +115,7 @@ The formula parser translates the user-provided formula string into a structured
 
 *   **`_categorize_rhs_nodes!(nodes, modules, fixed_effects)`**: Traverses the generated AST to populate the `modules` dictionary and the `fixed_effects` list. It correctly identifies composed manifolds (e.g., `spatial() ⊗ temporal()`) as a single interaction module.
 
-*   **`_parse_single_manifold_term` & `_parse_arguments_string`**: Helper functions that parse individual module calls (e.g., `spatial(s_idx; model=bym2)`) into a dictionary of variables and parameters.
+*   **`_parse_single_manifold_term` & `_parse_arguments_string`**: Helper functions that parse individual module calls (e.g., `spatial(s_idx, model=:bym2)`) into a dictionary of variables and parameters. These functions now correctly handle Julia `Symbol` literals (e.g., `:besag`) passed as arguments.
 
 ## 4. Model Configuration Engine (`modelling.jl`)
 
@@ -126,10 +127,13 @@ The `bstm_config` function is the main engine that transforms the parsed formula
 2.  **LHS Processing**: `_process_lhs!` processes the `outcomes` from the parser, sets the model architecture (`univariate`, `multivariate`), and resolves observation-level parameters like offsets and weights.
 3.  **RHS Module Processing**: This is the core loop that iterates over the `modules` dictionary from the parser. For each module, it performs:
     *   **Processor Dispatch**: Calls the appropriate function from the `MODULE_PROCESSORS` dictionary (e.g., `process_spatial_module!`). These functions handle data-dependent setup, such as creating spatial indices or basis matrices.
-    *   **Primitive Resolution**: `resolve_technical_primitive` is called to convert the parsed module data (a `Dict`) into a concrete `Manifold` struct instance (e.g., `BYM2(...)`). This step also resolves hyperpriors using `resolve_hyperpriors`.
-    *   **Template Building**: `build_model` is called on the `Manifold` object. This function is a factory that generates the technical specifications needed for the model, most importantly the precision matrix template (`Q_template`).
-    *   **Registration**: The complete manifold specification (including the `Manifold` object and its `Q_template`) is added to `M[:manifolds]`.
-4.  **Fixed Effects Processing**: `_process_fixed_effects!` uses the `fixed_effects` list from the parser to create the design matrix `Xfixed` via `create_fixed_design`. `_process_fixed_effects_priors!` then constructs the prior for the fixed effect coefficients.
+	    *   **Primitive Resolution (for non-processor-only modules)**: `resolve_technical_primitive` is called to convert the parsed module data (a `Dict`) into a concrete `Manifold` struct instance (e.g., `BYM2(...)`). This step also resolves hyperpriors using `resolve_hyperpriors`. These processors can also evaluate complex arguments passed in the formula (e.g., `W=my_matrix`) by using the `calling_module` context stored in the configuration object `M`.
+	    *   **Template Building (for non-processor-only modules)**: `build_model` is called on the `Manifold` object. This function is a factory that generates the technical specifications needed for the model, most importantly the precision matrix template (`Q_template`).
+	    *   **Registration (for non-processor-only modules)**: The complete manifold specification (including the `Manifold` object and its `Q_template`) is added to `M[:manifolds]`.
+	*   **Fixed Effects Processing**:
+	    *   `_process_fixed_effects!`: Consolidates fixed effect variables from both bare terms (parsed directly from the formula) and explicit `fixed()` module calls. It then creates the design matrix `Xfixed` via `create_fixed_design`.
+	    *   `_process_fixed_effects_priors!`: Constructs the prior for the fixed effect coefficients, incorporating any custom priors specified in `fixed()` or `intercept()` modules.
+	*   **Intercept Resolution**: The final decision on whether to include an intercept (`M[:add_intercept]`) is prioritized from the `intercept()` module. If no `intercept()` module is present, it defaults to the legacy numeric flags (`1`, `0`, `-1`) parsed from the formula string.
 5.  **Finalization**: `_finalize_config!` ensures all necessary keys exist in `M`, providing defaults where needed.
 
 ### 4.2. Key Configuration Helpers
@@ -213,14 +217,14 @@ This section provides a quick reference to the main modules available in the `bs
 
 ### 8.1. `likelihood()` Module
 
-| Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
-|:---|:---|:---|:---|:---|
-| `log_offsets` or `offsets` | `offsets=:pop_log` | `Symbol` | None | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
-| `weights` | `weights=:sample_w` | `Symbol` | `1.0` | Multiplies the log-likelihood of each observation by the specified weight. |
-| `trials` | `trials=:n_patients` | `Symbol` | `1` | Specifies the number of trials for each observation in a Binomial model. |
-| `volatility`| `volatility=true` | `Bool` | `false` | Enables a spatiotemporal stochastic volatility model for the observation noise ($\sigma_y$). |
-| `y_L`, `y_U`| `y_L=:lower_b` | `Symbol` | `-Inf`, `+Inf` | Defines the lower (`y_L`) and upper (`y_U`) bounds for censored observations. |
-| `hurdle` | `hurdle=0` | `Number` | `-Inf` | Implements a hurdle model by truncating the likelihood below the specified threshold. |
+| Parameter                  | Example Usage        | Data Type | Default        | Meaning & Assumptions                                                                                               |
+| :---------------------------| :---------------------| :----------| :---------------| :--------------------------------------------------------------------------------------------------------------------|
+| `log_offsets` or `offsets` | `offsets=pop_log`   | `Symbol`  | None           | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
+| `weights`                  | `weights=sample_w`  | `Symbol`  | `1.0`          | Multiplies the log-likelihood of each observation by the specified weight.                                          |
+| `trials`                   | `trials=n_patients` | `Symbol`  | `1`            | Specifies the number of trials for each observation in a Binomial model.                                            |
+| `volatility`               | `volatility=true`    | `Bool`    | `false`        | Enables a spatiotemporal stochastic volatility model for the observation noise ($\sigma_y$).                        |
+| `y_L`, `y_U`               | `y_L=lower_b`       | `Symbol`  | `-Inf`, `+Inf` | Defines the lower (`y_L`) and upper (`y_U`) bounds for censored observations.                                       |
+| `hurdle`                   | `hurdle=0`           | `Number`  | `-Inf`         | Implements a hurdle model by truncating the likelihood below the specified threshold.                               |
 
 ### 8.2. `spatial()` Module
 
@@ -279,8 +283,8 @@ This section provides a quick reference to the main modules available in the `bs
 | Keyword / Parameter     | Example Usage                  | Data Type | Default            | Meaning & Assumptions                                                                                                                                                                                                                                 |
 | :------------------------| :-------------------------------| :----------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `nested()`              | `nested(z_var; ...)`           | Module    | N/A                | Defines a supervised sub-model whose latent effect is added to the main model's linear predictor. The `z_var` is a symbolic name for this component.                                                                                                   |
-| `formula`               | `formula="likelihood(z, family=:gaussian) ~ 1 + spatial(s)"` | `String`  | `""`               | A complete `bstm` formula string that defines the structure of the sub-model, including its own likelihood. This sub-model is fit to the specified `data_source`.                                                                                                                   |
-| `data_source`           | `data_source=:proxy_data`      | `Symbol`  | `:data`            | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset.                                                                                                       |
+| `formula`               | `formula="likelihood(z, family=gaussian) ~ 1 + spatial(s)"` | `String`  | `""`               | A complete `bstm` formula string that defines the structure of the sub-model, including its own likelihood. This sub-model is fit to the specified `data_source`.                                                                                                                   |
+| `data_source`           | `data_source=proxy_data`      | `Symbol`  | `:data`            | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset.                                                                                                       |
 | `rho_nested` (Implicit) | N/A                            | `Float`   | `Normal(1.0, 0.5)` | A scaling coefficient that links the sub-model's latent effect to the main model's linear predictor: $\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}$. The prior assumes the sub-model is a good proxy ($\rho \approx 1$).  |
 
 #### `eigen()` Module Reference
@@ -299,7 +303,7 @@ This section provides a quick reference to the main modules available in the `bs
 | Keyword / Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
 |:---|:---|:---|:---|:---|
 | `fixed()` | `fixed(Region, ...)` | Module | N/A | Explicitly marks a variable as a fixed effect. Primarily used to specify contrasts or priors. |
-| `contrast` | `contrast=effects` | `Symbol` | `DummyCoding` | Specifies the contrast coding for a categorical variable (e.g., `:effects`, `:helmert`). |
+| `contrast` | `contrast=:effects` | `Symbol` | `DummyCoding` | Specifies the contrast coding for a categorical variable (e.g., `:effects`, `:helmert`). |
 | `prior` | `prior=Normal(0, 2)` | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the coefficient(s) of this fixed effect. Can be a `Distribution` or a PC prior tuple. |
 
 #### `intercept()` Module Reference
@@ -385,7 +389,7 @@ The formula is constructed to explicitly define the model structure, including p
 # contrasts or priors. Continuous variables can be included directly.
 
 fx_mx_formula = """
-    likelihood(y, family=:gaussian) ~
+    likelihood(y, family=gaussian) ~
         intercept(prior=Normal(0, 20)) +
         temperature +
         fixed(region, contrast=effects, prior=(3.0, 0.05)) +

@@ -1,16 +1,68 @@
 # CORE FORMULA PARSING UTILITIES
 
 
-const BSTM_MODULE_KEYWORDS = Set([ # v2.1.0: Expanded keyword registry
-    "intercept", "spatial", "temporal", "seasonal", "smooth", "fixed",
-    "nested", "eigen", "mixed", "dynamics", "spacetime", "interaction"
+
+
+# v2.1.0: Expanded keyword registry
+const BSTM_MODULE_KEYWORDS = Set([ 
+    :intercept, :spatial, :temporal, :seasonal, :smooth, :fixed,
+    :nested, :eigen, :mixed, :dynamics, :spacetime, :interaction
 ]);
 
+
+
+# This file contains refactored versions of the core formula parsing and
+# configuration functions for the bstm framework. These functions provide
+# a more robust and maintainable pipeline for model specification.
+
+
+function split_terms_at_depth(input::AbstractString, sep::AbstractString)
+    # v1.2.0 (2026-07-08)
+    # Purpose: Splits a string by a separator, but only at a parenthesis depth of zero.
+    #          This is crucial for correctly parsing complex formula terms that may
+    #          contain nested function calls.
+    # Inputs: input (string), sep (separator string).
+    # Outputs: A vector of strings.
+    terms = String[]
+    current_term = ""
+    depth = 0
+    i = 1
+    sep_len = length(sep)
+
+    while i <= length(input)
+        char = input[i]
+        if char == '(' || char == '['
+            depth += 1
+        elseif char == ')' || char == ']'
+            depth -= 1
+        end
+
+        if depth == 0 && i <= length(input) - sep_len + 1 && SubString(input, i, i + sep_len - 1) == sep
+            push!(terms, strip(current_term))
+            current_term = ""
+            i += sep_len
+            continue
+        end
+        
+        current_term *= char
+        i += 1
+    end
+    if !isempty(strip(current_term))
+        push!(terms, strip(current_term))
+    end
+    
+    return terms
+end
+
+
 function _parse_value(val_str::String)
+    # v1.2.0 (2026-07-08)
+    # Purpose: A helper function to parse a string value from a formula argument into
+    #          the appropriate Julia type (Tuple, String, Number, or Expression).
     val_str = strip(val_str)
     if startswith(val_str, "(") && endswith(val_str, ")") # Tuple
         inner_val_str = val_str[2:end-1]
-        tuple_parts = Base.split(inner_val_str, r",\s*")
+        tuple_parts = split_terms_at_depth(inner_val_str, r",\s*")
         parsed_tuple = []
         for tp in tuple_parts
             if !isempty(tp)
@@ -20,12 +72,15 @@ function _parse_value(val_str::String)
         return Tuple(parsed_tuple)
     elseif startswith(val_str, "\"") && endswith(val_str, "\"") # String
         return val_str[2:end-1]
+    elseif startswith(val_str, ":")
+        # Handle quoted symbols like :besag by converting them directly to a Symbol.
+        # This ensures `model=:besag` is parsed identically to `model=besag`.
+        return Symbol(val_str[2:end])
     else
         try_num = tryparse(Float64, val_str)
         if try_num !== nothing
             return try_num
         else
-            # Return as an expression to be evaluated later
             return Meta.parse(val_str)
         end
     end
@@ -36,6 +91,9 @@ function _parse_value(val_str::SubString{String})
 end
 
 function _add_parsed_arg!(args_dict::Dict{Symbol, Any}, positional_args::Vector{Any}, arg_val::String)
+    # v1.2.0 (2026-07-08)
+    # Purpose: A helper to add a parsed argument to either the keyword argument
+    #          dictionary or the positional argument vector.
     if contains(arg_val, "=")
         key_val = Base.split(arg_val, "=", limit=2)
         key = Symbol(strip(key_val[1]))
@@ -47,13 +105,15 @@ function _add_parsed_arg!(args_dict::Dict{Symbol, Any}, positional_args::Vector{
 end
 
 function _parse_arguments_string(args_str::String)
+    # v1.2.0 (2026-07-08)
+    # Purpose: Parses the argument string from within a module call's parentheses.
     args_dict = Dict{Symbol, Any}()
     positional_args = []
     current_arg = ""
-    depth = 0 # Unified counter for parentheses and brackets
+    depth = 0
 
     for char in args_str
-        if (char == ',' || char == ';') && depth == 0
+        if char == ',' && depth == 0
             arg_val = String(strip(current_arg))
             if !isempty(arg_val)
                 _add_parsed_arg!(args_dict, positional_args, arg_val)
@@ -82,10 +142,13 @@ function _parse_arguments_string(args_str::String)
 end
 
 function _parse_single_manifold_term(term_str::String)
+    # v1.2.0 (2026-07-08)
+    # Purpose: Parses a single module call string (e.g., "spatial(...)") into a structured NamedTuple.
     term_str = strip(term_str)
-    m = match(r"^\s*(\w+)\s*\((.*)\)\s*$", term_str)
+    m = match(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)\)\s*$", term_str)
+    
     if m === nothing
-        return (module_type = :fixed, args = Dict(:name => term_str))
+        error("Internal Parser Error: Expected a module call (e.g., 'name(...)'), but got non-module term '$term_str'.")
     end
 
     module_name = Symbol(m.captures[1])
@@ -93,22 +156,203 @@ function _parse_single_manifold_term(term_str::String)
     args_dict = _parse_arguments_string(args_str)
 
     return (module_type = module_name, args = args_dict)
+end 
+
+function _parse_rhs_expression(term_str::String)
+    # v1.2.0 (2026-07-08)
+    # Purpose: A recursive descent parser for the formula's right-hand side, respecting operator precedence.
+    parts = split_terms_at_depth(term_str, " ⊕ ")
+    if length(parts) > 1; return (type=:operator, op=:direct_sum, children=[_parse_rhs_expression(p) for p in parts]); end
+
+    parts = split_terms_at_depth(term_str, " |> ")
+    if length(parts) > 1; return (type=:operator, op=:pipe, children=[_parse_rhs_expression(parts[1]), _parse_rhs_expression(join(parts[2:end], " |> "))]); end
+
+    parts = split_terms_at_depth(term_str, " ⊗ ")
+    if length(parts) > 1; return (type=:operator, op=:kronecker_product, children=[_parse_rhs_expression(p) for p in parts]); end
+
+    parts = split_terms_at_depth(term_str, " ∘ ")
+    if length(parts) > 1; return (type=:operator, op=:composition, children=[_parse_rhs_expression(p) for p in parts]); end
+
+    return _parse_single_manifold_term(term_str)
 end
+
+ 
+
+function _categorize_rhs_nodes!(nodes, modules)
+    # v2.6.0 (2026-07-08)
+    # Purpose: Traverses the AST from the parser and categorizes the nodes into a
+    #          dictionary of modules, giving each a unique key.
+    for node in nodes
+        if hasproperty(node, :type) && node.type == :operator
+            key = "composed_$(length(modules)+1)"
+            modules[key] = (module_type = :interaction, args = Dict(:operator => node.op, :components => node.children))
+
+        elseif hasproperty(node, :module_type) && node.module_type in BSTM_MODULE_KEYWORDS
+            key_parts = [string(node.module_type)]
+            if haskey(node.args, :positional_args) && !isempty(node.args[:positional_args])
+                pos_arg_str = string(node.args[:positional_args][1])
+                push!(key_parts, pos_arg_str)
+            end
+            base_key = join(key_parts, "_")
+            module_key = base_key
+            counter = 1
+            while haskey(modules, module_key)
+                counter += 1
+                module_key = base_key * "_$counter"
+            end
+            modules[module_key] = node
+        else
+            @warn "Unrecognized node type '$(node.module_type)' during categorization. Skipping."
+        end
+    end
+end
+
+function bstm_config(formula::String, data::DataFrame; calling_module::Module = Main, kwargs...)
+    # v2.7.0 (2026-07-09)
+    # Purpose: The main configuration engine. It orchestrates the entire process of
+    #          transforming a formula string and data into a complete, model-ready
+    #          configuration object.
+    # Rationale: This version adds a pre-processing step to handle categorical variable
+    #            conversions before the design matrix is created. This version also ensures
+    #            that the categorical conversion happens before completecases filtering.
+
+    decomposed_formula = decompose_bstm_formula(formula)
+
+    # --- Variable Discovery and Data Filtering ---
+    # Rationale: Identify all variables used in the formula to filter for complete cases
+    # before any configuration is built. This prevents dimension mismatches where
+    # StatsModels.jl drops rows with missings, but other parts of the model do not.
+    all_vars = Set{Symbol}()
+    for out_spec in decomposed_formula.outcomes
+        push!(all_vars, Symbol(out_spec[:var]))
+        # Also consider offsets, weights, etc. from likelihood
+        for key in [:offsets, :log_offsets, :weights, :trials, :y_L, :y_U]
+            if haskey(out_spec[:params], key)
+                val = out_spec[:params][key]
+                if val isa Symbol
+                    push!(all_vars, val)
+                end
+            end
+        end
+    end
+    for fe in decomposed_formula.fixed_effects
+        push!(all_vars, Symbol(fe))
+    end
+    for (_, mod_data) in pairs(decomposed_formula.modules)
+        if haskey(mod_data.args, :positional_args)
+            for arg in mod_data.args[:positional_args]
+                if arg isa Symbol
+                    push!(all_vars, arg)
+                elseif arg isa Expr
+                    # Recursively find all symbols in expressions like `cov1*cov2`.
+                    _extract_symbols_from_expr!(all_vars, arg)
+                end
+            end
+        end
+    end
+    
+    # --- Categorical Conversion (Pre-filtering) ---
+    # Rationale: Convert specified columns to CategoricalArrays *before* completecases filtering.
+    # This ensures `completecases` correctly handles missing values in categorical columns.
+    df_processed = deepcopy(data) # Work on a copy to avoid modifying original data
+    vars_to_categorize = Set{Symbol}() # Collect variables that need to be categorized
+    
+    # Collect variables from `fixed()` modules that might need categorization
+    for (_, mod_data_nt) in decomposed_formula.modules
+        if mod_data_nt.module_type == :fixed
+            if haskey(mod_data_nt.args, :positional_args)
+                for var_sym in mod_data_nt.args[:positional_args]
+                    if var_sym isa Symbol
+                        # If a contrast is specified or model=:categorical, it's categorical
+                        if haskey(mod_data_nt.args, :contrast) || get(mod_data_nt.args, :model, nothing) == :categorical
+                            push!(vars_to_categorize, var_sym)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    for var_sym in vars_to_categorize
+        if hasproperty(df_processed, var_sym) && !(eltype(df_processed[!, var_sym]) <: CategoricalValue)
+            df_processed[!, var_sym] = categorical(df_processed[!, var_sym])
+        end
+    end
+
+    # --- Data Filtering for Complete Cases ---
+    # Now, apply completecases on the already-categorized data.
+    valid_vars_in_data = filter(v -> hasproperty(df_processed, v), all_vars)
+    filtered_data = DataFrame(df_processed[completecases(df_processed, collect(valid_vars_in_data)), :])
+    if nrow(filtered_data) < nrow(data)
+        @warn "Missing values detected in formula variables. $(nrow(data) - nrow(filtered_data)) rows were removed."
+    end
+
+    M = _initialize_config(filtered_data, merge(Dict(kwargs), Dict(:calling_module => calling_module)))
+    M[:formula] = formula
+    _process_lhs!(M, decomposed_formula.outcomes)
+    M[:N_cov] = 0 # Initialize N_cov, will be updated after fixed effects processing
+    M[:add_intercept] = decomposed_formula.has_intercept
+
+    if !isnothing(decomposed_formula.intercept_prior)
+        M[:intercept_prior] = decomposed_formula.intercept_prior
+    end
+
+    M[:hyperpriors] = get(M, :hyperpriors, Dict{String, Any}())
+    M[:prior_scheme] = get(M, :prior_scheme, :pcpriors)
+    # M[:vars_to_categorize] is now handled earlier
+
+    # Process modules (fixed effects are now handled by _replace_bare_effects and then _process_fixed_effects!)
+    for (key, mod_data_nt) in decomposed_formula.modules
+        mod_type = mod_data_nt.module_type
+ 
+        # Retrieve the processor function for the current module type.
+        processor! = get(MODULE_PROCESSORS, mod_type, nothing)
+ 
+        mod_data_dict = Dict(
+            :type => mod_data_nt.module_type,
+            :variables => get(mod_data_nt.args, :positional_args, []),
+            :params => mod_data_nt.args
+        )
+ 
+        # If a processor exists for this module, execute it.
+        if !isnothing(processor!)
+            processor!(M, mod_data_dict, M, M[:hyperpriors])
+        end
+ 
+        # Modules like `fixed` are processor-only and do not create a manifold.
+        # After their processor runs, we skip to the next module.
+        if mod_type in [:fixed]
+            continue
+        end
+ 
+        manifold_obj = resolve_technical_primitive(mod_data_dict, M, M[:hyperpriors], M[:prior_scheme])
+        manifold_spec_built = build_model(manifold_obj, M)
+
+        spec = (key=Symbol(key), domain=mod_data_dict[:type], var=join(mod_data_dict[:variables], "_"), manifold_obj=manifold_obj, params=mod_data_dict[:params], Q_template=manifold_spec_built.Q_template, scaling_factor=manifold_spec_built.scaling_factor)
+        push!(M[:manifolds], spec)
+    end
+
+    # Consolidate and process fixed effects after all modules have been parsed
+    # The `fixed_effects` list from `decomposed_formula` is now empty due to `_replace_bare_effects`.
+    # `M[:fixed_effects]` is populated by `process_fixed_module!`.
+    all_fixed_effects = get(M, :fixed_effects, String[]) # This now contains the unique fixed effect names
+    _process_fixed_effects!(M, get(M, :fixed_effects, String[]), decomposed_formula.has_intercept)
+    _process_fixed_effects_priors!(M)
+    _finalize_config!(M)
+
+    return NamedTuple(M)
+end
+
+
 
 function _parse_single_manifold_term(term_str::SubString{String})
     _parse_single_manifold_term(String(term_str))
 end
-
+ 
 function _parse_rhs_expression(term_str::SubString{String})
     _parse_rhs_expression(String(term_str))
 end
 
 function parse_module_params(params_str::AbstractString)
-    # v1.2.0 (2026-06-29 16:13:05)
-    # Purpose: Parses a string of key-value parameters (e.g., "nbins=20, model='bym2'") 
-    #          into a dictionary of symbols and values.
-    # Inputs: params_str - The string of parameters.
-    # Outputs: A dictionary of parsed parameters.
     params = Dict{Symbol, Any}()
     if isempty(strip(params_str))
         return params
@@ -308,12 +552,8 @@ function _parse_module_call(module_call_str::AbstractString)
 end
 
 
+
 function _resolve_obs_param!(opt_dict, params, data, param_keys, target_key)
-    # v1.2.0 (2026-06-29 16:13:05)
-    # Purpose: Resolves observation-level parameters (e.g., offsets, weights) from symbols to data vectors. 
-    # Inputs: opt_dict, params, data, param_keys, target_key. 
-    # Outputs: Modifies opt_dict in place.
-    # Note: It checks for a symbol in the `params` dict and extracts the corresponding column from the `data` DataFrame.
     for key in param_keys
         if haskey(params, key)
             val = params[key]
@@ -324,329 +564,135 @@ function _resolve_obs_param!(opt_dict, params, data, param_keys, target_key)
             else
                 @warn "Observation parameter ':$val' for '$target_key' not found in data or is not a vector. Ignoring."
             end
-            return # Exit after the first matching key is found and processed
+            return
         end
     end
 end
+
+  
  
+function _process_fixed_effects!(M::Dict, fixed_effects_vars::Vector{String}, has_intercept::Bool)
+    rhs = has_intercept ? "1" : "0"
+    if !isempty(fixed_effects_vars)
+        rhs_vars = join(fixed_effects_vars, " + ")
+        rhs = (rhs == "0") ? rhs_vars : rhs * " + " * rhs_vars
+    end
+    Xfixed_named = create_fixed_design(rhs, M[:data]; contrasts=get(M, :contrasts, Dict()))
     
- 
-
-function decompose_bstm_formula(formula_str::String)
-    # BSTM Formula Decomposer v2.1.0
-    # Timestamp: 2026-07-08
-    # Synopsis: This function is the main entry point for formula parsing. It separates the
-    #           formula into its Left-Hand Side (LHS) for likelihood specification and
-    #           Right-Hand Side (RHS) for the latent process definition. It now uses a
-    #           recursive descent parser for the RHS to correctly handle complex algebraic
-    #           expressions between manifolds.
-
-    parts = Base.split(formula_str, "~")
-    lhs = strip(parts[1])
-    rhs = strip(parts[2])
-
-    # --- 1. Parse the Left-Hand Side (LHS) for Outcomes and Likelihood Specs ---
-    outcome_specs = []
-    lhs_terms = split_terms_at_depth(lhs, "+")
-    for term in lhs_terms
-        term = strip(term)
-        m = match(r"likelihood\((.*)\)", term)
-        if !isnothing(m)
-            # Handles `likelihood(y1+y2, family=:poisson, ...)`
-            inner_content = m.captures[1]
-            args = split_terms_at_depth(inner_content, ",")
-            !isempty(args) || continue
-            outcome_var = strip(args[1])
-            params_str = join(args[2:end], ",")
-            params = _parse_arguments_string(params_str)
-            # Handle multiple outcomes within one likelihood call
-            for ov in Base.split(outcome_var, '+')
-                push!(outcome_specs, Dict(:var => strip(ov), :params => params))
-            end
-        else
-            # Handles `y1 + y2 ~ ...`
-            push!(outcome_specs, Dict(:var => term, :params => Dict()))
+    # Robustness check: Ensure Xfixed has the same number of rows as y_N
+    if size(Xfixed_named, 1) != M[:y_N]
+        @warn "Dimension mismatch in fixed effects design matrix: Expected $(M[:y_N]) rows, but got $(size(Xfixed_named, 1)). Attempting to reconcile."
+        if size(Xfixed_named, 1) < M[:y_N]
+            # Pad with zeros if Xfixed_named has fewer rows
+            padded_Xfixed = zeros(M[:y_N], size(Xfixed_named, 2))
+            padded_Xfixed[1:size(Xfixed_named, 1), :] = Matrix(Xfixed_named)
+            M[:Xfixed] = padded_Xfixed
+        else # If Xfixed_named has more rows (should not happen after completecases)
+            M[:Xfixed] = Matrix(Xfixed_named[1:M[:y_N], :])
         end
+    else
+        M[:Xfixed] = Matrix(Xfixed_named)
     end
 
-    # --- 2. Parse the Right-Hand Side (RHS) into an Abstract Syntax Tree (AST) ---
-    rhs_ast = _parse_rhs_expression(rhs)
-
-    # --- 3. Traverse the AST to separate modules from fixed effects ---
-    modules = Dict{String, Any}()
-    fixed_effects = String[]
-    has_intercept = false
-
-    # The top-level operator in a formula is always '+', so we can iterate through its children.
-    top_level_nodes = (rhs_ast.type == :operator && rhs_ast.op == :+) ? rhs_ast.children : [rhs_ast]
-
-    has_intercept = _categorize_rhs_nodes!(top_level_nodes, modules, fixed_effects)
-
-    return (outcomes=outcome_specs, modules=modules, fixed_effects=fixed_effects, has_intercept=has_intercept)
+    M[:Xfixed_N] = size(M[:Xfixed], 2)
+    M[:Xfixed_names] = size(Xfixed_named, 2) > 0 ? names(Xfixed_named, 2) : Symbol[]
 end
 
-function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
-    # BSTM Internal Parser v2.1.0
-    # Traverses the list of top-level nodes from the RHS AST and categorizes them
-    # as modules, fixed effects, or an intercept.
-    local_has_intercept = false
-    for node in nodes
-        if node.type == :operator
-            # Any expression involving operators (⊗, ⊕, |>, etc.) is treated as a single complex module.
-            key = "composed_$(length(modules)+1)"
-            modules[key] = (module_type = :interaction, args = Dict(:operator => node.op, :components => node.children))
+"""
+    create_pc_prior(param_name::Symbol, constraint::Tuple)
 
-        elseif node.module_type in BSTM_MODULE_KEYWORDS
-            key_parts = [string(node.module_type)]
-            if haskey(node.args, :positional_args) && !isempty(node.args[:positional_args])
-                push!(key_parts, string(node.args[:positional_args][1]))
-            end
-            base_key = join(key_parts, "_")
-            module_key = base_key
-            counter = 1
-            while haskey(modules, module_key)
-                counter += 1
-                module_key = base_key * "_$counter"
-            end
-            modules[module_key] = node
-
-        elseif node.module_type == :fixed && haskey(node.args, :name)
-            # This handles literal terms parsed as fixed effects
-            if node.args[:name] == "1"
-                local_has_intercept = true
-            else
-                push!(fixed_effects, node.args[:name])
-            end
-        end
-    end
-    return local_has_intercept
-end
-
-function split_terms_at_depth(input::AbstractString, sep::AbstractString)
-    terms = String[]
-    depth = 0
-    current = ""
-    for char in input
-        if char == '(' || char == '['; depth += 1;
-        elseif char == ')' || char == ']'; depth -= 1;
-        end
-        if string(char) == sep && depth == 0
-            push!(terms, strip(current))
-            current = ""
-        else
-            current *= char
-        end
-    end
-    if !isempty(strip(current))
-        push!(terms, strip(current))
-    end
-    return terms
-end
-
-
-function _parse_rhs_expression(term_str::String)
-    # BSTM Internal Parser v2.1.0
-    # Timestamp: 2026-07-08
-    # Synopsis: A recursive descent parser to convert the RHS of a formula string into an
-    #           Abstract Syntax Tree (AST). It correctly handles operator precedence and
-    #           associativity, which is critical for complex manifold compositions.
-    #
-    # Operator Precedence (from lowest to highest):
-    # 1. `+` (Addition of independent effects)
-    # 2. `⊕` (Direct Sum - shared hyperparameters)
-    # 3. `|>` (Pipe - state-space evolution or SVC)
-    # 4. `⊗` (Kronecker Product - interactions)
-    # 5. `∘` (Composition)
-
-    term_str = strip(term_str)
-
-    # Define operators with their symbol and associativity (:left or :right)
-    operators = [
-        (" + ", :+, :left),
-        (" ⊕ ", :direct_sum, :left),
-        (" |> ", :pipe, :left),
-        (" ⊗ ", :kronecker_product, :left),
-        (" ∘ ", :composition, :left)
-    ]
-
-    for (op_str, op_sym, associativity) in operators
-        parts = split_terms_at_depth(term_str, op_str)
-        if length(parts) > 1
-            if associativity == :left
-                # Build the tree from left to right for left-associative operators
-                node = _parse_rhs_expression(parts[1])
-                for i in 2:length(parts)
-                    right_node = _parse_rhs_expression(parts[i])
-                    node = (type=:operator, op=op_sym, children=[node, right_node])
-                end
-                return node
-            else # :right
-                # Build the tree from right to left for right-associative operators
-                node = _parse_rhs_expression(parts[end])
-                for i in (length(parts)-1):-1:1
-                    left_node = _parse_rhs_expression(parts[i])
-                    node = (type=:operator, op=op_sym, children=[left_node, node])
-                end
-                return node
-            end
-        end
-    end
-
-    # Base case: No operators found, so it's a single manifold term or a fixed effect.
-    return _parse_single_manifold_term(term_str)
-end
-
-function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
-    # BSTM Internal Parser v2.1.0
-    # Traverses the list of top-level nodes from the RHS AST and categorizes them
-    # as modules, fixed effects, or an intercept.
-    local_has_intercept = false
-    for node in nodes
-        if node.type == :operator
-            # Any expression involving operators (⊗, ⊕, |>, etc.) is treated as a single complex module.
-            key = "composed_$(length(modules)+1)"
-            modules[key] = (module_type = :interaction, args = Dict(:operator => node.op, :components => node.children))
-
-        elseif node.module_type in BSTM_MODULE_KEYWORDS
-            key_parts = [string(node.module_type)]
-            if haskey(node.args, :positional_args) && !isempty(node.args[:positional_args])
-                push!(key_parts, string(node.args[:positional_args][1]))
-            end
-            base_key = join(key_parts, "_")
-            module_key = base_key
-            counter = 1
-            while haskey(modules, module_key)
-                counter += 1
-                module_key = base_key * "_$counter"
-            end
-            modules[module_key] = node
-
-        elseif node.module_type == :fixed && haskey(node.args, :name)
-            # This handles literal terms parsed as fixed effects
-            if node.args[:name] == "1"
-                local_has_intercept = true
-            else
-                push!(fixed_effects, node.args[:name])
-            end
-        end
-    end
-    return local_has_intercept
-end
-
-function bstm_config(formula::String, data::DataFrame; kwargs...)
+Creates a prior distribution from a Penalized Complexity (PC) prior constraint.
+This function interprets a tuple like `(U, α)` to generate a prior distribution
+based on the type of parameter.
+"""
+function create_pc_prior(param_name::Symbol, constraint::Tuple)
     # #
-    # bstm_config v2.1.0 (2026-07-08)
+    # This function creates a prior distribution from a PC prior constraint.
+    # It dispatches based on the parameter name to apply the correct formula.
     #
-    # This function serves as the primary configuration engine for the bstm framework. It parses
-    # a formula string and a dataset to construct a detailed configuration object (`M`) that is
-    # passed to the Turing models for inference.
-    #
-    # Key Change in v2.1.0:
-    # Rationale: This function now correctly orchestrates the parsing and processing pipeline.
-    #            It iterates over the `modules` dictionary produced by the AST parser
-    #            in `decompose_bstm_formula`, ensuring that complex algebraic compositions
-    #            of manifolds are handled correctly and only once.
+    
+    # # Default to upper tail constraint P(param > U) = alpha
+    U, α = constraint[1], constraint[2]
+    direction = length(constraint) > 2 ? constraint[3] : :upper
 
-    # # 1. Initialization
-    M = _initialize_config(data, kwargs)
-
-    # # 2. Formula Decomposition
-    # The formula is decomposed into LHS (outcomes) and RHS (modules, fixed effects).
-    decomposed_formula = decompose_bstm_formula(formula)
-    M[:formula] = formula
-
-    # # 3. Likelihood and Architecture Processing (LHS)
-    _process_lhs!(M, decomposed_formula.outcomes)
-
-    # # 4. Manifold and Module Processing (RHS)
-    # This section now correctly processes the pre-parsed modules from the AST.
-    M[:hyperpriors] = get(M, :hyperpriors, Dict())
-    M[:prior_scheme] = get(M, :prior_scheme, :pcpriors)
-
-    for (key, mod_data_nt) in decomposed_formula.modules
-        mod_type = mod_data_nt.module_type
-
-        if haskey(MODULE_PROCESSORS, mod_type)
-            processor! = MODULE_PROCESSORS[mod_type]
-            
-            # Convert the parser's NamedTuple into a mutable Dict for modification by processors.
-            mod_data_dict = Dict(
-                :type => mod_data_nt.module_type,
-                :variables => get(mod_data_nt.args, :positional_args, []),
-                :params => mod_data_nt.args
-            )
-
-            # The processor function modifies the main config `M` and the module's data dict.
-            processor!(M, mod_data_dict, M, M[:hyperpriors])
-            
-            # Resolve the module into a concrete Manifold object.
-            manifold_obj = resolve_technical_primitive(mod_data_dict, M, M[:hyperpriors], M[:prior_scheme])
-            
-            # Build the technical specification (e.g., Q_template) for the manifold.
-            manifold_spec_built = build_model(manifold_obj, M)
-
-            # Add the complete manifold specification to the registry, including the built template.
-            spec = (
-                key = Symbol(key),
-                domain = mod_data_dict[:type], # Use the potentially updated domain from the processor
-                var = join(mod_data_dict[:variables], "_"),
-                manifold_obj = manifold_obj,
-                params = mod_data_dict[:params],
-                Q_template = manifold_spec_built.Q_template,
-                scaling_factor = manifold_spec_built.scaling_factor
-            )
-            push!(M[:manifolds], spec)
-        end
+    if U <= 0 || α <= 0 || α >= 1
+        error("Invalid PC prior constraint: U > 0 and 0 < α < 1 required.")
     end
 
-    # # 5. Fixed Effects Processing
-    # Rationale: Consolidating fixed effects from literal terms (e.g., `~ z`) and `fixed()` modules.
-    _process_fixed_effects_priors!(M)
+    param_str = string(param_name)
+    if occursin("sigma", param_str) || occursin("amplitude", param_str)
+        # # For standard deviation parameters, use an Exponential prior.
+        # # Constraint: P(σ > U) = α
+        if direction != :upper; error("PC prior for sigma-like parameters only supports upper tail constraints."); end
+        λ = -log(α) / U
+        return Exponential(λ)
 
-    # # 6. Finalization
-    _finalize_config!(M)
+    # # Other cases for rho, lengthscale, etc., would be added here.
 
-    return NamedTuple(M)
+    else # # Assume it's a regression coefficient (beta)
+        # # Constraint: P(|beta| > U) = alpha
+        # # We solve for the standard deviation of a Normal(0, sigma) prior.
+        sigma = -U / quantile(Normal(0, 1), α / 2)
+        return Normal(0, sigma)
+    end
 end
 
+
+"""
+    _process_fixed_effects_priors!(M::Dict)
+
+Constructs the prior distribution for the fixed effects coefficient vector (`Xfixed_beta`).
+It combines default priors with any custom priors specified in the formula for the
+intercept or other fixed effects, including PC prior tuples.
+"""
 function _process_fixed_effects_priors!(M::Dict)
-    if !haskey(M, :Xfixed_N) || M[:Xfixed_N] == 0
-        M[:Xfixed_prior] = MvNormal(zeros(0), Diagonal(zeros(0)))
+    # #
+    # This function constructs the prior for the vector of fixed effect coefficients.
+    #
+    n_fixed = get(M, :Xfixed_N, 0)
+    if n_fixed == 0
+        M[:Xfixed_priors_vec] = UnivariateDistribution[]
         return
     end
-
-    default_prior_std = 5.0
-    priors_map = get(M, :fixed_effects_priors, Dict{Symbol, Any}())
-    coef_names = M[:Xfixed_names]
     
-    variances = fill(default_prior_std^2, M[:Xfixed_N])
-
-    for (i, coef_name_sym) in enumerate(coef_names)
+    coef_names = get(M, :Xfixed_names, Symbol[])
+    custom_priors = get(M, :fixed_effects_priors, Dict{Symbol, Any}())
+    intercept_prior_val = get(M, :intercept_prior, nothing)
+    
+    default_prior = Normal(0, 5)
+    priors_vec = Vector{UnivariateDistribution}(undef, n_fixed)
+    
+    for i in 1:n_fixed
+        coef_name_sym = coef_names[i]
         coef_name_str = string(coef_name_sym)
         
-        # Clean up names like "(Intercept)"
-        clean_coef_name = replace(coef_name_str, r"[\(\)]" => "")
+        # # Priority 1: Check for a specific intercept prior from an `intercept()` call.
+        if coef_name_str == "(Intercept)" && !isnothing(intercept_prior_val)
+            prior = intercept_prior_val
+            priors_vec[i] = prior isa Tuple ? create_pc_prior(:intercept, prior) : prior
+            continue
+        end
         
-        # Try to find a matching prior
-        found_prior = false
-        for (var_sym, prior_dist) in priors_map
+        # # Priority 2: Check for custom priors on other variables from `fixed()` calls.
+        found_custom = false
+        for (var_sym, prior) in custom_priors
             var_str = string(var_sym)
-            
-            # Match if the coefficient name is the variable name, or starts with "variable:"
-            if clean_coef_name == var_str || startswith(clean_coef_name, var_str * ":")
-                if prior_dist isa Normal
-                    variances[i] = prior_dist.σ^2
-                    found_prior = true
-                    break # First match wins
-                else
-                    @warn "Prior for '$coef_name_sym' (from '$var_str') is not a Normal distribution. Using default."
-                end
+            if coef_name_str == var_str || startswith(coef_name_str, var_str * ":")
+                priors_vec[i] = prior isa Tuple ? create_pc_prior(var_sym, prior) : prior
+                found_custom = true
+                break
             end
+        end
+        
+        # # Priority 3: Use the default prior if no custom one is found.
+        if !found_custom
+            priors_vec[i] = default_prior
         end
     end
     
-    M[:Xfixed_prior] = MvNormal(zeros(M[:Xfixed_N]), Diagonal(variances))
+    M[:Xfixed_priors_vec] = priors_vec
 end
+
 
 function process_fixed_module!(opt_dict, mod_data, registries, hyperpriors)
     # v1.2.1 (2026-07-08)
@@ -664,12 +710,21 @@ function process_fixed_module!(opt_dict, mod_data, registries, hyperpriors)
     if !haskey(opt_dict, :fixed_effects_priors)
         opt_dict[:fixed_effects_priors] = Dict{Symbol, Any}()
     end
+    if !haskey(opt_dict, :vars_to_categorize)
+        opt_dict[:vars_to_categorize] = Set{Symbol}()
+    end
     params = mod_data[:params]
     vars = mod_data[:variables]
     append!(opt_dict[:fixed_effects], string.(vars))
     if haskey(params, :contrast)
         if !isempty(vars)
-            opt_dict[:contrasts][Symbol(vars[1])] = params[:contrast]
+            contrast_sym = params[:contrast]
+            if haskey(STATSMODELS_CONTRASTS, contrast_sym)
+                opt_dict[:contrasts][Symbol(vars[1])] = STATSMODELS_CONTRASTS[contrast_sym]
+            else
+                @warn "Unknown contrast coding ':$contrast_sym'. Using default (DummyCoding)."
+                opt_dict[:contrasts][Symbol(vars[1])] = StatsModels.DummyCoding()
+            end
         else
             @warn "A 'contrast' was specified in a fixed() module with no variable. Ignoring."
         end
@@ -679,12 +734,15 @@ function process_fixed_module!(opt_dict, mod_data, registries, hyperpriors)
             opt_dict[:fixed_effects_priors][Symbol(var)] = params[:prior]
         end
     end
+    if get(params, :model, nothing) == :categorical || haskey(params, :contrast)
+        for var in vars
+            push!(opt_dict[:vars_to_categorize], Symbol(var))
+        end
+    end
 end
 
-
+ 
 function _initialize_config(data::DataFrame, kwargs)
-    # BSTM Internal Utility v2.0.0
-    # Initializes the main configuration dictionary `M`.
     M = Dict{Symbol, Any}()
     M[:data] = data
     M[:y_N] = nrow(data)
@@ -695,12 +753,8 @@ function _initialize_config(data::DataFrame, kwargs)
     return M
 end
 
-function _process_lhs!(M::Dict, outcome_specs::Vector{Dict})
-    # BSTM Internal Utility v2.1.0
-    # Processes the LHS of the formula to set up outcomes and likelihood specifications.
-    # It now accepts the `outcome_specs` structure directly from the formula decomposer.
 
-    # Extract outcome names and parameter dictionaries from the specs.
+function _process_lhs!(M::Dict, outcome_specs::Vector{<:Dict})
     outcomes = [Symbol(spec[:var]) for spec in outcome_specs]
     likelihood_specs = [spec[:params] for spec in outcome_specs]
     
@@ -710,58 +764,112 @@ function _process_lhs!(M::Dict, outcome_specs::Vector{Dict})
         M[:model_arch] = "multivariate"
         M[:outcomes_N] = length(outcomes)
         M[:y_obs] = Matrix(M[:data][!, M[:outcomes]])
-        
-        # The parser creates a spec for each outcome. If a single likelihood() block
-        # was used for multiple outcomes, the parameter dicts will be the same object.
-        # The current parser already handles this correctly.
         M[:likelihood_specs] = likelihood_specs
-
     else
         M[:model_arch] = get(M, :model_arch, "univariate")
         M[:outcomes_N] = 1
         M[:y_obs] = M[:data][!, M[:outcomes][1]]
-        M[:likelihood_specs] = likelihood_specs # Should be a vector with one element
+        M[:likelihood_specs] = likelihood_specs
     end
 
-    # For resolving obs params (offset, weights, trials), the framework assumes these are
-    # shared across outcomes if specified in a single likelihood() block. We use the
-    # parameters from the first outcome spec as the reference.
     representative_params = !isempty(likelihood_specs) ? likelihood_specs[1] : Dict()
 
-    # Resolve observation-level parameters
     _resolve_obs_param!(M, representative_params, M[:data], [:offsets, :log_offsets], :log_offset)
     _resolve_obs_param!(M, representative_params, M[:data], [:weights], :weights)
     _resolve_obs_param!(M, representative_params, M[:data], [:trials], :trials)
 end
 
-function _process_fixed_effects!(M::Dict, fixed_effects::Vector{String}, has_intercept::Bool)
-    # BSTM Internal Utility v2.0.0
-    # Handles the creation of the fixed effects design matrix.
-    
-    M[:add_intercept] = has_intercept
-    fixed_effects_formula = join(fixed_effects, " + ")
-    
-    if !isempty(strip(fixed_effects_formula)) || has_intercept
-        # The intercept is handled separately in the model, so we add "0" to the formula
-        # if we don't want StatsModels to add one automatically.
-        rhs = has_intercept ? "1 + " * fixed_effects_formula : "0 + " * fixed_effects_formula
-        
-        Xfixed_named = create_fixed_design(rhs, M[:data]; contrasts=get(M, :contrasts, Dict()))
-        M[:Xfixed] = Matrix(Xfixed_named)
-        M[:Xfixed_N] = size(M[:Xfixed], 2)
-        M[:Xfixed_names] = names(Xfixed_named, 2)
-    else
-        M[:Xfixed] = zeros(M[:y_N], 0)
-        M[:Xfixed_N] = 0
-        M[:Xfixed_names] = []
+
+
+function decompose_bstm_formula(formula_str::String) # v2.6.1
+    parts = Base.split(formula_str, "~")
+    lhs = strip(parts[1])
+    rhs = strip(parts[2])
+
+    # # 1. Parse the Left-Hand Side (LHS) for Outcomes and Likelihood Specs
+    outcome_specs = Dict{Symbol, Any}[]
+    lhs_terms = split_terms_at_depth(lhs, "+")
+    for term in lhs_terms
+        term = strip(term)
+        m = match(r"likelihood\((.*)\)", term)
+        if !isnothing(m)
+            inner_content = m.captures[1]
+            args = split_terms_at_depth(inner_content, ",")
+            !isempty(args) || continue
+            outcome_var = strip(args[1])
+            params_str = join(args[2:end], ",")
+            params = _parse_arguments_string(params_str)
+            for ov in Base.split(outcome_var, '+')
+                push!(outcome_specs, Dict(:var => strip(ov), :params => params))
+            end
+        else
+            push!(outcome_specs, Dict(:var => term, :params => Dict()))
+        end
     end
+
+    # # 2. Pre-process and Normalize Right-Hand Side (RHS) Terms
+    # This turns 'a - b' into 'a + -b', making it splittable by ' + '.
+    # Using `\s*` handles cases with or without spaces around the minus operator.
+    rhs_normalized = replace(rhs, r"\s*-\s*" => " + -")
+    rhs_terms = split_terms_at_depth(rhs_normalized, " + ")
+
+    has_intercept = true
+    intercept_prior = nothing
+    fixed_effects = String[]
+    module_terms = String[]
+    intercept_module_found = false
+
+    for term in rhs_terms
+        term_stripped = strip(term)
+        
+        # New authoritative logic for intercept control via intercept() module
+        if startswith(term_stripped, "intercept(")
+            if intercept_module_found
+                @warn "Multiple intercept() modules found. Only the first will be evaluated for intercept control."
+            else
+                intercept_module_found = true
+                intercept_data = _parse_single_manifold_term(term_stripped)
+                pos_args = get(intercept_data.args, :positional_args, [])
+                
+                # `intercept(false)` disables the intercept.
+                if !isempty(pos_args) && pos_args[1] == false
+                    has_intercept = false
+                else
+                    has_intercept = true
+                end
+
+                # Extract prior if specified, e.g., intercept(prior=Normal(0,10))
+                if haskey(intercept_data.args, :prior)
+                    intercept_prior = intercept_data.args[:prior]
+                end
+            end
+            # The intercept module's job is done; it is not passed to the main module loop.
+            continue
+        
+        # Legacy numeric intercept control
+        elseif term_stripped == "0" || term_stripped == "-1"
+            has_intercept = false
+        elseif term_stripped == "1"
+            # This term is just for intercept control, do nothing.
+        else
+            if !occursin('(', term_stripped)
+                push!(fixed_effects, term_stripped)
+            else
+                push!(module_terms, term_stripped)
+            end
+        end
+    end
+
+    top_level_nodes = [_parse_rhs_expression(term) for term in module_terms]
+
+    modules = Dict{String, Any}()
+    _categorize_rhs_nodes!(top_level_nodes, modules)
+
+    return (outcomes=outcome_specs, modules=modules, fixed_effects=fixed_effects, has_intercept=has_intercept, intercept_prior=intercept_prior)
 end
 
+
 function _finalize_config!(M::Dict)
-    # BSTM Internal Utility v2.0.0
-    # Performs final checks and clean-up on the configuration dictionary.
-    
-    # Ensure essential keys exist with default values
     defaults = Dict(
         :s_N => 0, :t_N => 0, :u_N => 0,
         :s_idx => ones(Int, M[:y_N]),
@@ -782,10 +890,28 @@ function _finalize_config!(M::Dict)
 end
  
 
+ 
 function process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
     data = opt_dict[:data]
     params = mod_data[:params]
     variables = mod_data[:variables]
+    
+    # Check if W is provided inside the spatial() module call.
+    # This has higher precedence than a globally passed W.
+    if haskey(params, :W)
+        w_val = params[:W]
+        if w_val isa Expr
+            # Evaluate the expression in the calling module's context
+            calling_mod = get(opt_dict, :calling_module, Main)
+            try
+                opt_dict[:W] = Core.eval(calling_mod, w_val)
+            catch e
+                error("Could not evaluate `W` argument `$(w_val)` in spatial module. Error: $e")
+            end
+        else # It's already a value (e.g., if passed via bstm_config directly)
+            opt_dict[:W] = w_val
+        end
+    end
     
     if !haskey(opt_dict, :W)
         @warn "Adjacency matrix 'W' not provided for spatial module. Attempting to infer from coordinates."
@@ -866,49 +992,59 @@ function process_intercept_module!(opt_dict, mod_data, registries, hyperpriors)
     end
 end
 
+function process_temporal_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
+    #
+    # bstm Module Processor: Temporal
+    #
+    # This function processes the `temporal()` module from the formula. It is responsible for
+    # identifying the primary time index variable from the data, calling the `assign_time_units`
+    # utility to create discrete time steps, and registering the resulting indices and total
+    # number of time units into the main model configuration dictionary.
+    #
 
-const MODULE_PROCESSORS = Dict{Symbol, Function}(
-    :spatial => process_spatial_module!,
-    :temporal => process_temporal_module!,
-    :seasonal => process_seasonal_module!,
-    :smooth => process_smooth_module!,
-    :intercept => process_intercept_module!,
-    :dynamics => process_dynamics_module!,
-    :eigen => process_eigen_module!,
-    :mixed => process_mixed_module!,
-    :nested => process_nested_module!,
-    :interaction => process_interaction_module!,
-    :spacetime => process_spacetime_module!,
-    :fixed => process_fixed_module!
-);
-
-
-
-
-function process_temporal_module!(opt_dict, mod_data, registries, hyperpriors)
-    # v1.2.0 (2026-06-29 16:13:05)
-    # Purpose: Processes the `temporal()` module to handle the primary time index. 
-    # Note: This version is simplified, as seasonal components are now handled by 
-    #       a pre-processing step in `bstm_config` that creates a `seasonal()` module.
+    # #
+    # 1. Extract data and module specifications.
     data = opt_dict[:data]
-    
     params = mod_data[:params]
     variables = mod_data[:variables]
 
+    # #
+    # 2. Identify and process the time index variable.
+    # The first positional argument in `temporal()` is assumed to be the time variable.
     if !isempty(variables)
         t_var_sym = Symbol(variables[1])
+
         if hasproperty(data, t_var_sym)
-            time_opts = Dict(:time_method => get(params, :time_method, "regular"), :t_N => get(params, :t_N, nothing), :u_N => get(params, :u_N, nothing))
+            # #
+            # 3. Configure and call the time unit assignment utility.
+            # Parameters for `assign_time_units` can be passed via the `temporal()` module.
+            time_opts = Dict(
+                :time_method => get(params, :time_method, "regular"),
+                :t_N => get(params, :t_N, nothing),
+                :u_N => get(params, :u_N, nothing)
+            )
+            # Remove any parameters that were not explicitly provided.
             filter!(p -> !isnothing(p.second), time_opts)
+
+            # Call the utility to get time unit metadata.
             tu_meta = assign_time_units(data[!, t_var_sym]; time_opts...)
+
+            # #
+            # 4. Register the results into the main configuration dictionary.
             opt_dict[:t_idx] = tu_meta.t_idx
             opt_dict[:t_N] = tu_meta.tn
             opt_dict[:t_idx_var] = t_var_sym
         else
-            @warn "Temporal index variable ':$t_var_sym' not found in data."
+            # Issue a warning if the specified time variable is not found in the data.
+            @warn "Temporal index variable ':$t_var_sym' not found in data. Temporal effects may not be correctly applied."
         end
+    else
+        @warn "The `temporal()` module was called without specifying a time variable. Temporal effects will be ignored."
     end
 end
+
+
+ 
 
 function process_seasonal_module!(opt_dict, mod_data, registries, hyperpriors)
     # v1.2.0 (2026-06-29 16:13:05)
@@ -1021,11 +1157,24 @@ function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, man
     # --- 3. Continuous Kernel Models ---
     # Handles `smooth(lon, lat, model='gp')`
     elseif model_str in continuous_kernel_models
-        if all(v -> hasproperty(data, Symbol(v)), mod_data[:variables])
-            mod_data[:params][:coords] = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
+        if all(v -> hasproperty(data, Symbol(v)), mod_data[:variables])            
+            coords = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
+            mod_data[:params][:coords] = coords
+            
+            # Pre-compute inducing points for sparse GP models to avoid doing it inside the Turing model.
+            if model_str in ["fitc", "svgp", "nystrom", "gp"] # Treat 'gp' as sparse for scalability
+                n_inducing_default = min(100, size(coords, 1)) # Sensible default
+                n_inducing = get(mod_data[:params], :n_inducing, n_inducing_default)
+                
+                # Using a fixed seed for reproducibility of inducing points across runs.
+                # The generate_inducing_points function should be available in the environment.
+                Z_inducing = generate_inducing_points(coords, n_inducing; seed=42, method="kmeans")
+                mod_data[:params][:Z_inducing] = Z_inducing
+            end
         else
             @warn "Continuous kernel smooth specified, but coordinate variables not found in data. Manifold may be misspecified."
         end
+
     # --- 4. GMRF-on-Bins Models ---
     # Handles `smooth(x, model='rw2')`
     elseif model_str in gmrfs_on_bins_models
@@ -1141,41 +1290,41 @@ function process_nested_module!(opt_dict, mod_data, registries, hyperpriors)
     end
     sub_data = opt_dict[data_source_sym]
     
-    sub_config = Dict{Symbol, Any}()
-    sub_config[:data] = sub_data
+    # Initialize a configuration dictionary for the sub-model.
+    sub_config = _initialize_config(sub_data, Dict(:calling_module => get(opt_dict, :calling_module, Main)))
+    
+    # Decompose the sub-formula.
     sub_metadata = decompose_bstm_formula(sub_formula)
     
-    # 2. Extract and configure the outcome variable for the nested model.
-    if isempty(sub_metadata.outcomes)
-        @warn "No outcome variable specified in nested formula for '$var'. Skipping."
-        return
-    end
-    sub_outcome_sym = Symbol(sub_metadata.outcomes[1])
-    if !hasproperty(sub_data, sub_outcome_sym)
-        @warn "Outcome variable ':$sub_outcome_sym' for nested module on '$var' not found in data source ':$data_source_sym'. Skipping."
-        return
-    end
-    sub_config[:y_obs] = sub_data[!, sub_outcome_sym]
-    sub_config[:y_N] = length(sub_config[:y_obs])
-    sub_config[:model_family] = get(params, :model_family, "gaussian")
+    # 2. Process the LHS of the sub-formula to get outcome and likelihood specs.
+    _process_lhs!(sub_config, sub_metadata.outcomes)
 
-    # 3. Process spatial components within the nested formula.
-    spatial_mod_data_pair = filter(m -> m.second[:type] == :spatial, sub_metadata.modules)
-    if !isempty(spatial_mod_data_pair)
-        spatial_mod_data = first(spatial_mod_data_pair).second
-        process_spatial_module!(sub_config, spatial_mod_data, registries, hyperpriors)
-        sub_config[:model_space] = get(spatial_mod_data[:params], :model, "bym2")
-        sub_config[:s_Q_template] = build_structure_template(Symbol(sub_config[:model_space]), sub_config[:s_N]; W=get(sub_config, :W, nothing))
+    # 3. Process RHS modules for the sub-model.
+    sub_config[:manifolds] = [] # Initialize manifolds for the sub-model.
+    for (key, mod_data_nt) in sub_metadata.modules
+        mod_type = mod_data_nt.module_type
+        processor! = get(MODULE_PROCESSORS, mod_type, nothing)
+        isnothing(processor!) && continue
+
+        mod_data_dict = Dict(:type => mod_data_nt.module_type, :variables => get(mod_data_nt.args, :positional_args, []), :params => mod_data_nt.args)
+        
+        # Call the processor for the specific module type on the sub_config.
+        processor!(sub_config, mod_data_dict, sub_config, hyperpriors)
+
+        # Resolve the manifold object and build its template.
+        manifold_obj = resolve_technical_primitive(mod_data_dict, sub_config, hyperpriors, get(opt_dict, :prior_scheme, :pcpriors))
+        manifold_spec_built = build_model(manifold_obj, sub_config)
+
+        spec = (key=Symbol(key), domain=mod_data_dict[:type], var=join(mod_data_dict[:variables], "_"), manifold_obj=manifold_obj, params=mod_data_dict[:params], Q_template=manifold_spec_built.Q_template, scaling_factor=manifold_spec_built.scaling_factor)
+        push!(sub_config[:manifolds], spec)
     end
-    
-    # 4. Process fixed effects within the nested formula.
-    fixed_effects_formula_part = join(sub_metadata.fixed_effects, " + ")
-    if sub_metadata.has_intercept
-        fixed_effects_formula_part = isempty(fixed_effects_formula_part) ? "1" : "1 + " * fixed_effects_formula_part
-    end
-    if !isempty(fixed_effects_formula_part)
-        sub_config[:Xfixed] = create_fixed_design(fixed_effects_formula_part, sub_data)
-    end
+
+    # 4. Process fixed effects for the sub-model.
+    _process_fixed_effects!(sub_config, sub_metadata.fixed_effects, sub_metadata.has_intercept)
+    _process_fixed_effects_priors!(sub_config)
+
+    # Finalize the sub-configuration.
+    _finalize_config!(sub_config)
     
     # 5. Register the fully configured nested manifold.
     opt_dict[:nested_manifolds][var] = sub_config
@@ -1237,10 +1386,21 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
         return SVCManifold(cov_sym, inner_manifold)
     else
         default_model = if m_type in [:spatial, :temporal, :smooth]
-                            "none"
-                        else string(m_type) end
-        
-        model_name = string(get(m_params, :model, default_model))
+            "none"
+        elseif m_type == :intercept || m_type == :fixed
+            "none"
+        else
+            string(m_type)
+        end
+                
+        model_val = get(m_params, :model, default_model)
+        model_name = if model_val isa Symbol
+            # Use String() to convert a symbol to a string without the leading colon.
+            String(model_val)
+        else
+            string(model_val)
+        end
+
         model_sym = Symbol(model_name)
 
         resolved_priors = resolve_hyperpriors(model_name, priors_dict, m_params, scheme)
@@ -1254,3 +1414,75 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
         end
     end
 end
+
+
+"""
+    @bstm(formula, data, kwargs...)
+
+A macro to simplify the `bstm` formula syntax. It captures the formula as an
+unevaluated expression, converts it to a string, and passes it to the `bstm`
+function along with the calling module's context for correct evaluation of
+parameters.
+"""
+macro bstm(formula, data, kwargs...)
+    formula_str = string(formula)
+    data_esc = esc(data)
+    kwargs_esc = [esc(kw) for kw in kwargs]
+    # Pass the calling module's context to the bstm function
+    return :(bstm($formula_str, $data_esc, @__MODULE__; $(kwargs_esc...)))
+end
+
+"""
+    bstm(formula::String, data::DataFrame; kwargs...)
+
+The primary user-facing function for creating a `bstm` model. This version is
+for direct string-based formula calls and defaults to the `Main` module for
+evaluation context.
+"""
+function bstm(formula::String, data::DataFrame; kwargs...)
+    return bstm(formula, data, Main; kwargs...)
+end
+
+"""
+    bstm(formula::String, data::DataFrame, calling_module::Module; kwargs...)
+
+Internal entry point that receives the calling module's context. It orchestrates
+the configuration and construction of the Turing model.
+"""
+function bstm(formula::String, data::DataFrame, calling_module::Module; kwargs...) 
+    options = bstm_config(formula, data; calling_module=calling_module, kwargs...)
+    return bstm(options)
+end
+
+"""
+    bstm(config::NamedTuple)
+
+The core model dispatcher. It takes a fully resolved configuration `NamedTuple`
+and calls the appropriate model supervisor (`bstm_univariate`, `bstm_multivariate`, etc.).
+"""
+function bstm(config::NamedTuple)
+    arch = get(config, :model_arch, "univariate")
+    
+    if arch == "multivariate"
+        return bstm_multivariate(config)
+    elseif arch == "multifidelity"
+        return bstm_multifidelity(config)
+    else
+        return bstm_univariate(config) 
+    end
+end
+ 
+
+const MODULE_PROCESSORS = Dict{Symbol, Function}(
+    :spatial => process_spatial_module!,
+    :temporal => process_temporal_module!,
+    :seasonal => process_seasonal_module!,
+    :smooth => process_smooth_module!,
+    :dynamics => process_dynamics_module!,
+    :eigen => process_eigen_module!,
+    :mixed => process_mixed_module!,
+    :nested => process_nested_module!,
+    :interaction => process_interaction_module!,
+    :spacetime => process_spacetime_module!,
+    :fixed => process_fixed_module!
+);

@@ -53,7 +53,7 @@ The general structure of a `bstm` model call is:
 
 ```julia
 m = @bstm(
-    likelihood(outcome_var, family=:poisson, ...) ~ 1 + fixed_effects + modules(...),
+    likelihood(outcome_var, family=poisson, ...) ~ 1 + fixed_effects + modules(...),
     data_frame,
     keyword_arguments...
 )
@@ -65,19 +65,19 @@ The `likelihood()` module on the LHS specifies the observation model and its par
 
 | Parameter    | Example Usage       | Description                                                                    |
 | :-------------| :--------------------| :-------------------------------------------------------------------------------|
-| `family`     | `family=:poisson`   | Sets the likelihood distribution (e.g., `:poisson`, `:gaussian`, `:binomial`). |
-| `offsets`    | `offsets=:log_pop`  | Specifies a log-scale offset, typically for exposure in count models.          |
-| `weights`    | `weights=:sample_w` | Applies observation-level weights to the log-likelihood.                       |
+| `family`     | `family=poisson`   | Sets the likelihood distribution (e.g., `:poisson`, `:gaussian`, `:binomial`). |
+| `offsets`    | `offsets=log_pop`  | Specifies a log-scale offset, typically for exposure in count models.          |
+| `weights`    | `weights=sample_w` | Applies observation-level weights to the log-likelihood.                       |
 | `trials`     | `trials=n_patients` | Defines the number of trials for a binomial likelihood.                        |
 | `zi`         | `zi=true`           | Enables a zero-inflation component for count models.                           |
 | `hurdle`     | `hurdle=0`          | Implements a hurdle model, separating the zero-generating process.             |
 | `volatility` | `volatility=true`   | Enables a spatiotemporal stochastic volatility model for observation noise.    |
-| `y_L`, `y_U` | `y_L=:lower_b`      | Defines lower and upper bounds for censored data.                              |
+| `y_L`, `y_U` | `y_L=lower_b`      | Defines lower and upper bounds for censored data.                              |
 
 ### 2.3. Illustrative Examples
 
 1.  **BYM2 Disease Mapping:**
-    `@bstm(likelihood(y, family=:poisson) ~ 1 + spatial(s_idx, model=bym2), data, W=W)`
+    `@bstm(likelihood(y, family=poisson) ~ 1 + spatial(s_idx, model=bym2), data, W=W)`
     Decomposes risk into structured spatial and unstructured IID noise.
 
 2.  **AR1 Temporal Forecasting:**
@@ -302,7 +302,7 @@ A logistic growth model for a population can be specified as:
 
 ```julia
 @bstm(
-    likelihood(counts, family=:poisson) ~ 1 + dynamics(time, model=logistic_f, r_covariate=:temp),
+    likelihood(counts, family=poisson) ~ 1 + dynamics(time, model=logistic_f, r_covariate=temp),
     data
 )
 ```
@@ -315,7 +315,7 @@ The `nested()` module is a "supervisor" component for multi-fidelity modeling. I
 
 ```julia
 @bstm(
-    likelihood(y_hq) ~ 1 + spatial(s_idx) + nested(proxy_signal, formula="likelihood(y_lq, family=:poisson) ~ 1 + smooth(x)", data_source=:low_quality_data),
+    likelihood(y_hq) ~ 1 + spatial(s_idx) + nested(proxy_signal, formula="likelihood(y_lq, family=poisson) ~ 1 + smooth(x)", data_source=low_quality_data),
     high_quality_data,
     low_quality_data = df_low_quality
 )
@@ -347,9 +347,9 @@ In this setup, the `nested()` module defines a complete sub-model for the censor
 # The latent effect from this sub-model is then automatically added as a predictor to the main model.
 
 joint_model = @bstm(
-    likelihood(y, family=:poisson) ~ 1 + z1 +
+    likelihood(y, family=poisson) ~ 1 + z1 +
         nested(x_latent_process,
-            formula="likelihood(x_censored, family=:gaussian, y_L=:x_L, y_U=:x_U) ~ 1 + z1"
+            formula="likelihood(x_censored, family=gaussian, y_L=x_L, y_U=x_U) ~ 1 + z1"
         ),
     my_data
 )
@@ -435,11 +435,11 @@ This section provides a detailed quick-reference guide to the main modules avail
 
 | Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
 |:---|:---|:---|:---|:---|
-| `log_offsets` or `offsets` | `offsets=:pop_log` | `Symbol` | None | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
-| `weights` | `weights=:sample_w` | `Symbol` | `1.0` | Multiplies the log-likelihood of each observation by the specified weight. |
-| `trials` | `trials=:n_patients` | `Symbol` | `1` | Specifies the number of trials for each observation in a Binomial model. |
+| `log_offsets` or `offsets` | `offsets=pop_log` | `Symbol` | None | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
+| `weights` | `weights=sample_w` | `Symbol` | `1.0` | Multiplies the log-likelihood of each observation by the specified weight. |
+| `trials` | `trials=n_patients` | `Symbol` | `1` | Specifies the number of trials for each observation in a Binomial model. |
 | `volatility`| `volatility=true` | `Bool` | `false` | Enables a spatiotemporal stochastic volatility model for the observation noise ($\sigma_y$). |
-| `y_L`, `y_U`| `y_L=:lower_b` | `Symbol` | `-Inf`, `+Inf` | Defines the lower (`y_L`) and upper (`y_U`) bounds for censored observations. |
+| `y_L`, `y_U`| `y_L=lower_b` | `Symbol` | `-Inf`, `+Inf` | Defines the lower (`y_L`) and upper (`y_U`) bounds for censored observations. |
 | `hurdle` | `hurdle=0` | `Number` | `-Inf` | Implements a hurdle model by truncating the likelihood below the specified threshold. |
 
 ### 8.2. Likelihood Families
@@ -548,8 +548,8 @@ The `nested()` module is a powerful "supervisor" component used for multi-fideli
 | Keyword / Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
 |:---|:---|:---|:---|:---|
 | `nested()` | `nested(z_var; ...)` | Module | N/A | Defines a supervised sub-model whose latent effect is added to the main model's linear predictor. The `z_var` is a symbolic name for this component. |
-| `formula` | `formula="likelihood(z, family=:gaussian) ~ 1 + spatial(s)"` | `String` | `""` | A complete `bstm` formula string that defines the structure of the sub-model, including its own likelihood. This sub-model is fit to the specified `data_source`. |
-| `data_source` | `data_source=:proxy_data` | `Symbol` | `:data` | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset. |
+| `formula` | `formula="likelihood(z, family=gaussian) ~ 1 + spatial(s)"` | `String` | `""` | A complete `bstm` formula string that defines the structure of the sub-model, including its own likelihood. This sub-model is fit to the specified `data_source`. |
+| `data_source` | `data_source=proxy_data` | `Symbol` | `:data` | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset. |
 | `rho_nested` (Implicit) | N/A | `Float` | `Normal(1.0, 0.5)` | A scaling coefficient that links the sub-model's latent effect to the main model's linear predictor: $\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}$. The prior assumes the sub-model is a good proxy ($\rho \approx 1$). |
 
 #### `eigen()` Module Reference
