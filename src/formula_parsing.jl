@@ -5,8 +5,8 @@
 
 # v2.1.0: Expanded keyword registry
 const BSTM_MODULE_KEYWORDS = Set([ 
-    :intercept, :spatial, :temporal, :seasonal, :smooth, :fixed,
-    :nested, :eigen, :mixed, :dynamics, :spacetime, :interaction
+    :intercept, :spatial, :temporal, :smooth, :fixed, :nested, :eigen,
+    :mixed, :dynamics, :spacetime, :interact, :custom
 ]);
 
 
@@ -185,7 +185,7 @@ function _categorize_rhs_nodes!(nodes, modules)
     for node in nodes
         if hasproperty(node, :type) && node.type == :operator
             key = "composed_$(length(modules)+1)"
-            modules[key] = (module_type = :interaction, args = Dict(:operator => node.op, :components => node.children))
+            modules[key] = (module_type = :interact, args = Dict(:operator => node.op, :components => node.children))
 
         elseif hasproperty(node, :module_type) && node.module_type in BSTM_MODULE_KEYWORDS
             key_parts = [string(node.module_type)]
@@ -742,6 +742,14 @@ function process_fixed_module!(opt_dict, mod_data, registries, hyperpriors)
 end
 
  
+function process_custom_module!(opt_dict, mod_data, registries, hyperpriors)
+    # v1.0.0 (2026-07-10)
+    # Purpose: Processes the `custom()` module. This module is a pass-through for user-defined
+    #          code fragments, so no specific configuration is needed at this stage. This
+    #          function exists to satisfy the module processor dispatch table.
+end
+
+ 
 function _initialize_config(data::DataFrame, kwargs)
     M = Dict{Symbol, Any}()
     M[:data] = data
@@ -938,7 +946,7 @@ function process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
 end
  
 
-function process_interaction_module!(opt_dict, mod_data, registries, hyperpriors)
+function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
     #
     # Processes algebraic interaction modules (`⊗`, `⊕`, `∘`, `|>`).
     #
@@ -992,82 +1000,74 @@ function process_intercept_module!(opt_dict, mod_data, registries, hyperpriors)
     end
 end
 
-function process_temporal_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
-    #
-    # bstm Module Processor: Temporal
-    #
-    # This function processes the `temporal()` module from the formula. It is responsible for
-    # identifying the primary time index variable from the data, calling the `assign_time_units`
-    # utility to create discrete time steps, and registering the resulting indices and total
-    # number of time units into the main model configuration dictionary.
-    #
 
+function process_temporal_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
+  
+    # #
+    # bstm Module Processor: Temporal & Seasonal
+    # v2.9.0 (2026-07-10)
+    # This function now handles both primary time trends and seasonal/periodic components.
+    # It also now correctly processes basis-function models (e.g., pspline, rff) applied
+    # to a temporal variable by invoking the same logic as `process_smooth_module!`.
+ 
     # #
     # 1. Extract data and module specifications.
     data = opt_dict[:data]
     params = mod_data[:params]
     variables = mod_data[:variables]
-
+    
     # #
-    # 2. Identify and process the time index variable.
+    # 2. Identify model type and determine processing path.
+    # Heuristic: A model is considered seasonal if its type is explicitly cyclic/harmonic,
+    # or if a `period` parameter is provided.
+    model_type = get(params, :model, nothing)
+    is_seasonal = (model_type in [:cyclic, :harmonic]) || haskey(params, :period)
+    
+    basis_models = [:pspline, :bspline, :tps, :rff, :fft, :moran, :spherical, :barycentric, :decay, :wavelet, :linear, :invdist, :kriging, :gp, :fitc, :svgp, :nystrom, :warp, :spde]
+    is_basis_model = model_type in basis_models
+ 
+    # #
+    # 3. Identify and process the index variable.
     # The first positional argument in `temporal()` is assumed to be the time variable.
     if !isempty(variables)
         t_var_sym = Symbol(variables[1])
-
+ 
         if hasproperty(data, t_var_sym)
-            # #
-            # 3. Configure and call the time unit assignment utility.
-            # Parameters for `assign_time_units` can be passed via the `temporal()` module.
-            time_opts = Dict(
-                :time_method => get(params, :time_method, "regular"),
-                :t_N => get(params, :t_N, nothing),
-                :u_N => get(params, :u_N, nothing)
-            )
-            # Remove any parameters that were not explicitly provided.
-            filter!(p -> !isnothing(p.second), time_opts)
-
-            # Call the utility to get time unit metadata.
-            tu_meta = assign_time_units(data[!, t_var_sym]; time_opts...)
-
-            # #
-            # 4. Register the results into the main configuration dictionary.
-            opt_dict[:t_idx] = tu_meta.t_idx
-            opt_dict[:t_N] = tu_meta.tn
-            opt_dict[:t_idx_var] = t_var_sym
+            if is_seasonal
+                # #
+                # 3a. This is a seasonal component. Set up `u_idx` and `u_N`.
+                # The user provides a column with discrete seasonal indices (e.g., month 1-12).
+                opt_dict[:u_idx] = data[!, t_var_sym]
+                opt_dict[:u_N] = length(unique(opt_dict[:u_idx]))
+                opt_dict[:u_idx_var] = t_var_sym
+            elseif is_basis_model
+                # #
+                # 3b. This is a temporal smoother. Use the smooth processor logic.
+                # This will create the necessary basis matrix and register it.
+                process_smooth_module!(opt_dict, mod_data, opt_dict[:basis_matrices], opt_dict[:manifolds])
+            else
+                # #
+                # 3c. This is a primary temporal trend component (e.g., ar1, rw2). Set up `t_idx` and `t_N`.
+                time_opts = Dict(
+                    :time_method => get(params, :time_method, "regular"),
+                )
+                filter!(p -> !isnothing(p.second), time_opts)
+                # Call the utility to get time unit metadata for the trend.
+                tu_meta = assign_time_units(data[!, t_var_sym]; time_opts...)
+                opt_dict[:t_idx] = tu_meta.t_idx
+                opt_dict[:t_N] = tu_meta.tn
+                opt_dict[:t_idx_var] = t_var_sym
+            end
         else
-            # Issue a warning if the specified time variable is not found in the data.
-            @warn "Temporal index variable ':$t_var_sym' not found in data. Temporal effects may not be correctly applied."
+            @warn "Temporal/Seasonal index variable ':$t_var_sym' not found in data. Effects may not be correctly applied."
         end
     else
         @warn "The `temporal()` module was called without specifying a time variable. Temporal effects will be ignored."
     end
 end
-
-
  
 
-function process_seasonal_module!(opt_dict, mod_data, registries, hyperpriors)
-    # v1.2.0 (2026-06-29 16:13:05)
-    # Purpose: Processes a `seasonal()` module, which is created by the pre-processor 
-    #          in `bstm_config` from a dual `temporal()` call. 
-    data = opt_dict[:data]
-    variables = mod_data[:variables]
-    
-    # Ensure seasonal indices are initialized to avoid errors if the module is present but data is not.
-    if !haskey(opt_dict, :u_idx); opt_dict[:u_idx] = nothing; end
-    if !haskey(opt_dict, :u_N); opt_dict[:u_N] = 0; end
-
-    if !isempty(variables)
-        u_var_sym = Symbol(variables[1])
-        if hasproperty(data, u_var_sym)
-            opt_dict[:u_idx] = data[!, u_var_sym]
-            opt_dict[:u_N] = length(unique(opt_dict[:u_idx]))
-        else
-            @warn "Seasonal index variable ':$u_var_sym' not found in data. A default seasonal index may be used if available from `assign_time_units`."
-        end
-    end
-end
-
+ 
 function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, manifolds_registry)
     # v1.2.0 (2026-06-29 16:13:05)
     # Purpose: Processes `smooth()` modules for non-linear covariate effects. 
@@ -1476,13 +1476,13 @@ end
 const MODULE_PROCESSORS = Dict{Symbol, Function}(
     :spatial => process_spatial_module!,
     :temporal => process_temporal_module!,
-    :seasonal => process_seasonal_module!,
     :smooth => process_smooth_module!,
     :dynamics => process_dynamics_module!,
     :eigen => process_eigen_module!,
     :mixed => process_mixed_module!,
     :nested => process_nested_module!,
-    :interaction => process_interaction_module!,
+    :interact => process_interact_module!,
     :spacetime => process_spacetime_module!,
-    :fixed => process_fixed_module!
+    :fixed => process_fixed_module!,
+    :custom => process_custom_module!
 );

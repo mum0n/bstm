@@ -1,0 +1,1079 @@
+### BSTM Modular Fragment Dispatch v7.4.2
+# Timestamp: 2026-07-16 18:30:00
+# Rationale: Modular functions that generate Turing model code fragments (priors and updates).
+
+function clean_dist_str(d)
+    s = string(d)
+    m = match(r"^([a-zA-Z0-9]+)\{?[^}]*\}?\(([^)]*)\)", s)
+    if isnothing(m) return s end
+    name = m.captures[1]
+    args = m.captures[2]
+    clean_args = replace(args, r"[a-zA-Zę-ωΑ-Ω]+\s*=\s*" => "")
+    return "$(name)($(clean_args))"
+end
+
+# --- 1. Spatial Manifold Dispatch ---
+function spatial(m_obj::Besag, key::String, architecture::String, k::Union{Int, Nothing}=nothing)
+    # naming pattern: [domain]_[key](_[k])
+    suffix = architecture == "multivariate" ? "spatial_$(key)_$(k)" : "spatial_$(key)"
+    priors = """
+    $(suffix)_sigma ~ NamedDist($(clean_dist_str(m_obj.sigma_prior)), :$(suffix)_sigma)
+    $(suffix) ~ NamedDist(MvNormalCanon(zeros(M.s_N), spec_registry[\"$(key)\"].Q_template + noise * I), :$(suffix))"""
+    update = architecture == "multivariate" ?
+        "eta_latent[:, $k] .+= view($(suffix), M.s_idx)" :
+        "eta .+= view($(suffix), M.s_idx)"
+    return (priors = priors, update = update)
+end
+
+function spatial(m_obj::BYM2, key::String, architecture::String, k::Union{Int, Nothing}=nothing)
+    # Refactored BYM2 Naming: [domain]_[key]_struct(_k) and [domain]_[key]_iid(_k)
+    base_name = architecture == "multivariate" ? "spatial_$(key)" : "spatial_$(key)"
+    suffix = architecture == "multivariate" ? "_$(k)" : ""
+    
+    sigma_sym = "$(base_name)_sigma$(suffix)"
+    rho_sym = "$(base_name)_rho$(suffix)"
+    struct_sym = "$(base_name)_struct$(suffix)"
+    iid_sym = "$(base_name)_iid$(suffix)"
+
+    priors = """
+    $(sigma_sym) ~ NamedDist($(clean_dist_str(m_obj.sigma_prior)), :$(sigma_sym))
+    $(rho_sym) ~ NamedDist($(clean_dist_str(m_obj.rho_prior)), :$(rho_sym))
+    $(struct_sym) ~ NamedDist(MvNormalCanon(zeros(M.s_N), spec_registry[\"$(key)\"].Q_template + noise * I), :$(struct_sym))
+    $(iid_sym) ~ NamedDist(MvNormal(zeros(M.s_N), I), :$(iid_sym))"""
+    
+    target = architecture == "multivariate" ? "eta_latent[:, $k]" : "eta"
+    update = "$(target) .+= view($(sigma_sym) .* (sqrt($(rho_sym)) .* $(struct_sym) .+ sqrt(1.0 - $(rho_sym)) .* $(iid_sym)), M.s_idx)"
+    
+    return (priors = priors, update = update)
+end
+
+function spatial(m_obj::IID, key::String, architecture::String, k::Union{Int, Nothing}=nothing)
+    suffix = architecture == "multivariate" ? "spatial_$(key)_$(k)" : "spatial_$(key)"
+    priors = """
+    $(suffix)_sigma ~ NamedDist($(clean_dist_str(m_obj.sigma_prior)), :$(suffix)_sigma)
+    $(suffix) ~ NamedDist(filldist(Normal(0, $(suffix)_sigma), M.s_N), :$(suffix))"""
+    update = architecture == "multivariate" ?
+        "eta_latent[:, $k] .+= view($(suffix), M.s_idx)" :
+        "eta .+= view($(suffix), M.s_idx)"
+    return (priors = priors, update = update)
+end
+
+function spatial(m_obj::ICAR, key::String, architecture::String, k::Union{Int, Nothing}=nothing)
+    suffix = architecture == "multivariate" ? "spatial_$(key)_$(k)" : "spatial_$(key)"
+    priors = """
+    $(suffix)_sigma ~ NamedDist($(clean_dist_str(m_obj.sigma_prior)), :$(suffix)_sigma)
+    Q_$(suffix) = (1.0 / ($(suffix)_sigma^2 + noise)) .* spec_registry[\"$(key)\"].Q_template + noise * I
+    $(suffix)_raw ~ NamedDist(MvNormalCanon(zeros(M.s_N), Q_$(suffix)), :$(suffix)_raw)
+    Turing.@addlogprob! logpdf(Normal(0, 0.001 * M.s_N), sum($(suffix)_raw))
+    $(suffix) = vec($(suffix)_raw)
+    """
+    update = architecture == "multivariate" ?
+        "eta_latent[:, $k] .+= view($(suffix), M.s_idx)" :
+        "eta .+= view($(suffix), M.s_idx)"
+    return (priors = priors, update = update)
+end
+
+function spatial(m_obj::Leroux, key::String, architecture::String, k::Union{Int, Nothing}=nothing)
+    suffix = architecture == "multivariate" ? "spatial_$(key)_$(k)" : "spatial_$(key)"
+    priors = """
+    $(suffix)_sigma ~ NamedDist($(clean_dist_str(m_obj.sigma_prior)), :$(suffix)_sigma)
+    $(suffix)_rho ~ NamedDist($(clean_dist_str(m_obj.rho_prior)), :$(suffix)_rho)
+    Q_$(suffix) = (1.0 / ($(suffix)_sigma^2 + noise)) .* ($(suffix)_rho .* spec_registry[\"$(key)\"].Q_template + (1.0 - $(suffix)_rho) .* I(M.s_N)) + noise * I
+    $(suffix)_raw ~ NamedDist(MvNormalCanon(zeros(M.s_N), Q_$(suffix)), :$(suffix)_raw)
+    Turing.@addlogprob! logpdf(Normal(0, 0.001 * M.s_N), sum($(suffix)_raw))
+    $(suffix) = vec($(suffix)_raw)
+    """
+    update = architecture == "multivariate" ? "eta_latent[:, $k] .+= view($(suffix), M.s_idx)" : "eta .+= view($(suffix), M.s_idx)"
+    return (priors = priors, update = update)
+end
+
+# --- 2. Temporal Manifold Dispatch ---
+function temporal(m_obj::AR1, key::String, architecture::String, k::Union{Int, Nothing}=nothing)
+    suffix = architecture == "multivariate" ? "temporal_$(key)_$(k)" : "temporal_$(key)"
+    priors = """
+    $(suffix)_sigma ~ NamedDist($(clean_dist_str(m_obj.sigma_prior)), :$(suffix)_sigma)
+    $(suffix)_rho ~ NamedDist($(clean_dist_str(m_obj.rho_prior)), :$(suffix)_rho)
+    $(suffix)_innov ~ NamedDist(MvNormal(zeros(M.t_N), I), :$(suffix)_innov)"""
+    target_eta = architecture == "multivariate" ? "eta_latent[:, $k]" : "eta"
+    update = """
+    begin
+        $(suffix)_field = Vector{T}(undef, M.t_N)
+        $(suffix)_field[1] = $(suffix)_innov[1] / sqrt(1.0 - $(suffix)_rho^2 + noise)
+        for i in 2:M.t_N
+            $(suffix)_field[i] = $(suffix)_rho * $(suffix)_field[i-1] + $(suffix)_innov[i]
+        end
+        $(target_eta) .+= view($(suffix)_field .* $(suffix)_sigma, M.t_idx)
+    end"""
+    return (priors = priors, update = update)
+end
+
+function temporal(m_obj::RW1, key::String, architecture::String, k::Union{Int, Nothing}=nothing)
+    suffix = architecture == "multivariate" ? "temporal_$(key)_$(k)" : "temporal_$(key)"
+    priors = """
+    $(suffix)_sigma ~ NamedDist($(clean_dist_str(m_obj.sigma_prior)), :$(suffix)_sigma)
+    $(suffix) ~ NamedDist(MvNormalCanon(zeros(M.t_N), (1.0 / ($(suffix)_sigma^2 + noise)) .* spec_registry[\"$(key)\"].Q_template + noise * I), :$(suffix))"""
+    update = architecture == "multivariate" ?
+        "eta_latent[:, $k] .+= view($(suffix), M.t_idx)" :
+        "eta .+= view($(suffix), M.t_idx)"
+    return (priors = priors, update = update)
+end
+
+function temporal(m_obj::RW2, key::String, architecture::String, k::Union{Int, Nothing}=nothing)
+    suffix = architecture == "multivariate" ? "temporal_$(key)_$(k)" : "temporal_$(key)"
+    priors = """
+    $(suffix)_sigma ~ NamedDist($(clean_dist_str(m_obj.sigma_prior)), :$(suffix)_sigma)
+    Q_$(suffix) = (1.0 / ($(suffix)_sigma^2 + noise)) .* spec_registry[\"$(key)\"].Q_template + noise * I
+    $(suffix)_raw ~ NamedDist(MvNormalCanon(zeros(M.t_N), Q_$(suffix)), :$(suffix)_raw)
+    Turing.@addlogprob! logpdf(Normal(0, 0.001 * M.t_N), sum($(suffix)_raw))
+    $(suffix) = vec($(suffix)_raw)
+    """
+    update = architecture == "multivariate" ?
+        "eta_latent[:, $k] .+= view($(suffix), M.t_idx)" :
+        "eta .+= view($(suffix), M.t_idx)"
+    return (priors = priors, update = update)
+end
+
+# --- 3. Smooth Manifold Dispatch ---
+function smooth(m_obj::PSpline, key::String, architecture::String, k::Union{Int, Nothing}=nothing)
+    base_name = architecture == "multivariate" ? "smooth_$(key)_$(k)" : "smooth_$(key)"
+    
+    priors = """
+    $(base_name)_sigma ~ NamedDist($(clean_dist_str(m_obj.sigma_prior)), Symbol("$(base_name)_sigma"))
+    n_basis_$(key) = size(spec_registry[\"$(key)\"].Q_template, 1)
+    Q_penalty_$(key) = (1.0 / ($(base_name)_sigma^2 + noise)) .* spec_registry[\"$(key)\"].Q_template
+    $(base_name)_coeffs_raw ~ NamedDist(MvNormalCanon(zeros(n_basis_$(key)), Q_penalty_$(key)), Symbol("$(base_name)_coeffs_raw"))
+    Turing.@addlogprob! logpdf(Normal(0, 0.001 * n_basis_$(key)), sum($(base_name)_coeffs_raw))
+    $(base_name)_coeffs = vec($(base_name)_coeffs_raw)
+    """
+
+    target = architecture == "multivariate" ? "eta_latent[:, $k]" : "eta"
+    # The assembler must substitute <VAR_NAME> with the actual variable name.
+    update = "$(target) .+= M.basis_matrices[Symbol(\"<VAR_NAME>\")] * $(base_name)_coeffs"
+    
+    return (priors = priors, update = update)
+end
+
+# --- 4. Spatially Varying Coefficients (SVC) Dispatch ---
+function svc(m_obj::SVCManifold, key::String, architecture::String, k::Union{Int, Nothing}=nothing)
+    # This handles the spatially varying coefficient for a specific covariate.
+    # The covariate name is stored in m_obj.covariate.
+    # The inner spatial model (e.g., IID, BYM2) is in m_obj.model.
+    
+    cov_var = m_obj.covariate
+    inner_model = m_obj.model
+    
+    # Generate the fragment for the inner spatial model.
+    # We pass the inner model object to the `spatial` dispatcher.
+    inner_frag = spatial(inner_model, key, architecture, k)
+    
+    # The `inner_frag` contains priors and an update string.
+    # We need to modify the update string to include the covariate multiplication.
+    
+    # The name of the final spatial field from the inner fragment is `spatial_$(key)` or `spatial_$(key)_$(k)`.
+    field_name = architecture == "multivariate" ? "spatial_$(key)_$(k)" : "spatial_$(key)"
+    
+    # The original update adds the field to eta. We need to intercept this.
+    # The original update is like: "eta .+= view(spatial_field, M.s_idx)"
+    # We change it to: "eta .+= view(spatial_field, M.s_idx) .* M.data[!, :$(cov_var)]"
+    
+    modified_update = replace(inner_frag.update, "M.s_idx)" => "M.s_idx) .* M.data[!, :$(cov_var)]")
+
+    return (priors = inner_frag.priors, update = modified_update)
+end
+
+
+### BSTM Multifidelity Fragment Dispatch v8.0.0
+# Timestamp: 2026-07-16 22:45:00
+# Rationale: Implementing modular text-fragments for multi-fidelity specific components.
+
+# --- 5. Multifidelity-Specific Fragments ---
+
+# 5.1. Z-Latent Spatial Field (RFF-based High-Fidelity Signal)
+function multifidelity_z(m_obj::Manifold, key::String, architecture::String)
+    # naming: z_latent_[key]
+    priors = """
+    z_ls_$(key) ~ NamedDist(Gamma(2, 2), :z_ls_$(key))
+    z_beta_$(key) ~ NamedDist(filldist(Normal(0, 1), M.M_rff), :z_beta_$(key))
+    z_beta_eta_$(key) ~ NamedDist(Normal(0, 1), :z_beta_eta_$(key))"""
+    
+    update = """
+    begin
+        z_proj_$(key) = (M.z_coords_s * (M.W_fixed[1:size(M.z_coords_s, 2), :] ./ z_ls_$(key))) .+ M.b_fixed'
+        z_latent_field_$(key) = M.rff_scale .* (cos.(z_proj_$(key)) * z_beta_$(key))
+        eta .+= z_latent_field_$(key) .* z_beta_eta_$(key)
+    end"""
+    return (priors = priors, update = update)
+end
+
+# 5.2. W-Latent Spatiotemporal Field (Augmented RFF Signal)
+function multifidelity_w(m_obj::Manifold, key::String, architecture::String)
+    # naming: w_latent_[key]
+    priors = """
+    w_ls_$(key) ~ NamedDist(Gamma(2, 2), :w_ls_$(key))
+    w_beta_flat_$(key) ~ NamedDist(filldist(Normal(0, 1), M.M_rff * 3), :w_beta_$(key))
+    w_beta_$(key) = reshape(w_beta_flat_$(key), M.M_rff, 3)
+    w_beta_eta_$(key) ~ NamedDist(MvNormal(zeros(3), I), :w_beta_eta_$(key))"""
+
+    update = """
+    begin
+        w_coords_augmented_$(key) = hcat(M.w_coords_st, z_latent_field_$(key)[1:size(M.w_coords_st, 1)])
+        w_proj_$(key) = (w_coords_augmented_$(key) * (M.W_fixed[1:size(w_coords_augmented_$(key), 2), :] ./ w_ls_$(key))) .+ M.b_fixed'
+        w_latent_field_$(key) = M.rff_scale .* (cos.(w_proj_$(key)) * w_beta_$(key))
+        eta .+= w_latent_field_$(key) * w_beta_eta_$(key)
+    end"""
+    return (priors = priors, update = update)
+end
+
+# 5.3. Observation Volatility Fragment
+function observation_volatility(M)
+    if get(M, :use_sv, false) == true
+        priors = """
+        sigma_log_var ~ NamedDist(Exponential(1.0), :sigma_log_var)
+        beta_vol_latent ~ NamedDist(filldist(Normal(0, 1), M.M_rff_sigma), :beta_vol_latent)"""
+        
+        calculation = """
+        vol_proj_field = M.vol_proj * beta_vol_latent
+        vol_latent_field = sqrt(2.0 / M.M_rff_sigma) .* cos.(vol_proj_field)
+        y_sigma = exp.((sigma_log_var .* vol_latent_field[1:M.y_N]) ./ 2.0)"""
+    else
+        priors = ""
+        calculation = "y_sigma = fill(y_sigma_const, M.y_N)"
+    end
+    return (priors = priors, calculation = calculation)
+end
+
+
+### BSTM Unified Text Assembler v9.1.0
+# Rationale: Consolidating univariate, multivariate, and multifidelity assemblers into a
+# single, dispatch-oriented function for maintainability and consistency.
+# This replaces bstm_text_assembler_v7_3, bstm_text_assembler_multifidelity, and bstm_univariate_assembler_v9.
+function bstm_text_assembler_v7_3(M)
+    arch_flag = get(M, :model_arch, "univariate")
+    is_multivariate = arch_flag == "multivariate"
+    outcomes_N = is_multivariate ? M.outcomes_N : 1
+    model_func_name = is_multivariate ? :bstm_text_generated_multivariate : :bstm_text_generated_univariate
+
+    spec_registry = Dict{String, Any}()
+    priors_acc = String[]
+    updates_acc = String[]
+
+    for spec in M.manifolds
+        spec_registry[string(spec.key)] = spec
+        domain_fn = getfield(Main, spec.domain)
+
+        for k in 1:outcomes_N
+            outcome_idx = is_multivariate ? k : nothing            
+            frag = domain_fn(spec.manifold_obj, string(spec.key), arch_flag, outcome_idx)
+            
+            # Substitute placeholders in the update string if necessary
+            update_str = if spec.domain == :smooth
+                replace(frag.update, "<VAR_NAME>" => string(spec.var))
+            else
+                frag.update
+            end
+
+            push!(priors_acc, frag.priors)
+            push!(updates_acc, frag.update)
+        end
+    end
+
+    model_string = """
+    @model function $model_func_name(M, spec_registry, ::Type{T}=Float64) where {T}
+        noise = get(M, :noise, 1e-6)
+        N = M.y_N
+        K = $(is_multivariate ? "M.outcomes_N" : "1")
+
+        # --- Observation Noise ---
+        y_sigma ~ NamedDist($(is_multivariate ? "filldist(Exponential(1.0), K)" : "Exponential(1.0)"), :y_sigma)
+
+        # --- Correlation Coupling ---
+        $(is_multivariate ? "L_corr ~ NamedDist(LKJCholesky(K, 1.0), :L_corr)" : "")
+
+        # --- Manifold Priors ---
+        $(join(priors_acc, "\n        "))
+
+        # --- Linear Predictor ---
+        $(is_multivariate ? "eta_latent = zeros(T, N, K)" : "eta = zeros(T, N)")
+
+        $(is_multivariate ? "" : """
+        if get(M, :add_intercept, false)
+            intercept ~ NamedDist(get(M, :intercept_prior, Normal(0, 5)), :intercept)
+            eta .+= intercept
+        end
+        """)
+
+        $(is_multivariate ?
+            "eta_latent .+= reshape(get(M, :log_offset, zeros(T, N)), N, 1)" :
+            "eta .+= get(M, :log_offset, zeros(T, N))")
+
+        # --- Latent Field Updates ---
+        $(join(updates_acc, "\n        "))
+
+        $(is_multivariate ? """
+        eta = eta_latent * L_corr.L
+
+        for k in 1:K
+            fam_k = M.likelihood_specs[k][:family]
+            for i in 1:N
+                d_lik = bstm_Likelihood(fam_k, [T(M.y_obs[i, k])]; sigma_y=[y_sigma[k]])
+                Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i, k])
+            end
+        end
+        """ : """
+        family = M.likelihood_specs[1][:family]
+        for i in 1:N
+            d_lik = bstm_Likelihood(family, [T(M.y_obs[i])]; sigma_y=[y_sigma])
+            Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i])
+        end
+        """)
+    end
+    """
+    return Meta.parse(model_string), spec_registry
+end
+
+function bstm_text_assembler_multifidelity(M)
+    arch_flag = "multifidelity"
+    model_func_name = :bstm_text_generated_multifidelity
+
+    spec_registry = Dict{String, Any}()
+    priors_acc = String[]
+    updates_acc = String[]
+
+    # 1. Process Standard Manifolds
+    for spec in M.manifolds
+        spec_registry[string(spec.key)] = spec
+        # Use a safe lookup for domain functions defined in the global scope
+        domain_fn = getfield(Main, spec.domain)        
+        frag = domain_fn(spec.manifold_obj, string(spec.key), arch_flag, nothing)
+        
+        # Substitute placeholders
+        update_str = if spec.domain == :smooth
+            replace(frag.update, "<VAR_NAME>" => string(spec.var))
+        else
+            frag.update
+        end
+        
+        if !isempty(strip(frag.priors))
+            push!(priors_acc, "    # Manifold Prior: $(spec.key)")
+            push!(priors_acc, frag.priors)
+        end
+        if !isempty(strip(frag.update))
+            push!(updates_acc, "    # Manifold Update: $(spec.key)")
+            push!(updates_acc, update_str)
+        end
+    end
+
+    # 2. Nested Hierarchical Supervisors
+    nested_priors = String[]
+    nested_updates = String[]
+    if haskey(M, :nested_manifolds)
+        for (z_key, z_meta) in M.nested_manifolds
+            push!(nested_priors, """
+    rho_nested_$(z_key) ~ NamedDist(Normal(1.0, 0.5), :rho_nested_$(z_key))
+    y_sigma_nested_$(z_key) ~ NamedDist(Exponential(1.0), :y_sigma_nested_$(z_key))""")
+            push!(nested_updates, "    eta .+= rho_nested_$(z_key) .* spatial_$(z_key)[M.s_idx]")
+        end
+    end
+
+    vol_frag = observation_volatility(M)
+
+    # 3. Final String Assembly
+    # Rationale: Using a strict template with preserved indentation to prevent Meta.parse failures.
+    model_string = """
+@model function $model_func_name(M, spec_registry, ::Type{T}=Float64) where {T}
+    noise = get(M, :noise, 1e-6)
+    N = M.y_N
+    family = M.likelihood_specs[1][:family]
+
+    # --- Observation Noise & Volatility ---
+    y_sigma_const ~ NamedDist(Exponential(1.0), :y_sigma_const)
+    $(vol_frag.priors)
+    $(vol_frag.calculation)
+
+    # --- Nested Linking Priors ---
+    $(join(nested_priors, "\n"))
+
+    # --- Manifold Priors ---
+    $(join(priors_acc, "\n"))
+
+    # --- Linear Predictor ---
+    eta = zeros(T, N)
+    if get(M, :add_intercept, false)
+        intercept ~ NamedDist(get(M, :intercept_prior, Normal(0, 5)), :intercept)
+        eta .+= intercept
+    end
+
+    eta .+= get(M, :log_offset, zeros(T, N))
+
+    # --- Latent Field Updates ---
+    $(join(updates_acc, "\n"))
+    $(join(nested_updates, "\n"))
+
+    # --- Likelihood ---
+    for i in 1:N
+        d_lik = bstm_Likelihood(family, [T(M.y_obs[i])]; sigma_y=[y_sigma[i]])
+        Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i])
+    end
+end"""
+
+    try
+        return Meta.parse(model_string), spec_registry
+    catch e
+        println("PARSE ERROR ENCOUNTERED IN GENERATED STRING:")
+        println(model_string)
+        rethrow(e)
+    end
+end
+
+function bstm_univariate_assembler_v9(M)
+    model_func_name = :bstm_generated_univariate_modular
+    spec_registry = Dict{String, Any}()
+    priors_acc = String[]
+    updates_acc = String[]
+
+    for spec in M.manifolds
+        spec_registry[string(spec.key)] = spec
+        domain_fn = getfield(Main, spec.domain)
+        frag = domain_fn(spec.manifold_obj, string(spec.key), "univariate", nothing)
+
+        # Substitute placeholders
+        update_str = if spec.domain == :smooth
+            replace(frag.update, "<VAR_NAME>" => string(spec.var))
+        else
+            frag.update
+        end
+
+        if !isempty(strip(frag.priors))
+            push!(priors_acc, frag.priors)
+        end
+        if !isempty(strip(frag.update))
+            push!(updates_acc, update_str)
+        end
+    end
+
+    model_string = """
+@model function $model_func_name(M, spec_registry, ::Type{T}=Float64) where {T}
+    noise = get(M, :noise, 1e-6)
+    N = M.y_N
+    family = M.likelihood_specs[1][:family]
+
+    y_sigma ~ NamedDist(Exponential(1.0), :y_sigma)
+
+    intercept = zero(T)
+    if get(M, :add_intercept, false)
+        intercept_prior = get(M, :intercept_prior, Normal(0, 5))
+        intercept ~ NamedDist(intercept_prior, :intercept)
+    end
+
+    $(join(priors_acc, "\\n"))
+
+    eta = zeros(T, N)
+    if get(M, :add_intercept, false)
+        eta .+= intercept
+    end
+
+    eta .+= get(M, :log_offset, zeros(T, N))
+
+    if M.Xfixed_N > 0
+        Xfixed_beta ~ NamedDist(MvNormal(zeros(M.Xfixed_N), 5.0 * I), :Xfixed_beta)
+        eta .+= M.Xfixed * Xfixed_beta
+    end
+
+    $(join(updates_acc, "\\n"))
+
+    for i in 1:N
+        # Force observation into a vector for multivariate logpdf dispatch
+        d_lik = bstm_Likelihood(
+            family, 
+            [T(M.y_obs[i])]; 
+            sigma_y=[y_sigma], 
+            trial=[Int(get(M.trials, i, 1))]
+        )
+        Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i])
+    end
+end"""
+
+    try
+        return Meta.parse(model_string), spec_registry
+    catch e
+        rethrow(e)
+    end
+end
+
+
+### BSTM Univariate Execution Bridge
+# Timestamp: 2026-07-17 10:46:00
+# Rationale: Standardizing the compilation and instantiation of the dynamically generated model.
+
+function bstm_dynamic_univariate(config::NamedTuple)
+    # 1. Generate model expression and technical registry
+    expr, registry = bstm_univariate_assembler_v9(config)
+    
+    # 2. Evaluate expression in Main scope to define the model function
+    # Base.invokelatest is used to manage world-age increments
+    Base.invokelatest(eval, expr)
+    
+    # 3. Instantiate the Turing model object
+    model_func = getfield(Main, :bstm_generated_univariate_modular)
+    return Base.invokelatest(model_func, config, registry)
+end
+
+
+
+
+# v5.1.0 (2026-07-14 10:15:00)
+# Rationale: Extending the code-gen pipeline for Multivariate architectures.
+
+function build_multivariate_model_expression(M)
+    model_name = :bstm_generated_multivariate
+    outcomes_N = M.outcomes_N
+
+    spec_registry = Dict{String, Any}()
+    all_samples = String[]
+    all_updates = String[]
+
+    for spec in M.manifolds
+        spec_registry[string(spec.key)] = spec
+        key = string(spec.key)
+        manifold_obj = spec.manifold_obj
+        domain = spec.domain
+
+        # Generate outcome-specific parameters for each outcome k
+        for k in 1:outcomes_N
+            suffix = "$(key)_$k"
+            if manifold_obj isa IID
+                push!(all_samples, "sigma_$suffix ~ NamedDist($(manifold_obj.sigma_prior), :sigma_$suffix)")
+                push!(all_samples, "latent_$suffix ~ NamedDist(filldist(Normal(0, sigma_$suffix), $(domain == :spatial ? "M.s_N" : "M.t_N")), :latent_$suffix)")
+                push!(all_updates, "eta_latent[$(domain == :spatial ? "M.s_idx" : "M.t_idx"), $k] .+= latent_$suffix")
+
+            elseif manifold_obj isa BYM2
+                push!(all_samples, "sigma_$suffix ~ NamedDist($(manifold_obj.sigma_prior), :sigma_$suffix)")
+                push!(all_samples, "rho_$suffix ~ NamedDist($(manifold_obj.rho_prior), :rho_$suffix)")
+                push!(all_samples, "latent_struct_$suffix ~ NamedDist(MvNormalCanon(zeros(M.s_N), spec_registry[\"$key\"].Q_template + noise * I), :latent_struct_$suffix)")
+                push!(all_samples, "latent_iid_$suffix ~ NamedDist(MvNormal(zeros(M.s_N), I), :latent_iid_$suffix)")
+                push!(all_updates, "eta_latent[M.s_idx, $k] .+= sigma_$suffix .* (sqrt(rho_$suffix) .* latent_struct_$suffix .+ sqrt(1.0 - rho_$suffix) .* latent_iid_$suffix)")
+            end
+        end
+    end
+
+    body_str = """
+    @model function $model_name(M, spec_registry, ::Type{T}=Float64) where {T}
+        noise = get(M, :noise, 1e-6)
+        outcomes_N = M.outcomes_N
+
+        # --- Global Multivariate Priors ---
+        L_corr ~ NamedDist(LKJCholesky(outcomes_N, 1.0, T), :L_corr)
+        y_sigma ~ NamedDist(filldist(Exponential(1.0), outcomes_N), :y_sigma)
+
+        # --- Modular Manifold Samples ---
+        $(join(all_samples, "\n        "))
+
+        # --- Linear Predictor Assembly ---
+        eta_latent = zeros(T, M.y_N, outcomes_N)
+        $(join(all_updates, "\n        "))
+
+        # Apply Coupling
+        eta = eta_latent * L_corr.L
+
+        # --- Likelihood ---
+        for k in 1:outcomes_N
+            family_k = M.likelihood_specs[k][:family]
+            for i in 1:M.y_N
+                d_lik = bstm_Likelihood(family_k, [T(M.y_obs[i, k])]; sigma_y=[y_sigma[k]])
+                Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i, k])
+            end
+        end
+    end
+    """
+
+    return Meta.parse(body_str), spec_registry
+end
+
+function compile_generated_model(M)
+    arch = get(M, :model_arch, "univariate")
+    expr, registry = if arch == "multivariate"
+        build_multivariate_model_expression(M)
+    else
+        build_turing_model_expression(M)
+    end
+
+    # Evaluate the expression in the Main module context to define the function
+    Base.invokelatest(eval, expr)
+    return registry
+end
+
+
+# v5.3.5 (2026-07-14 14:00:00)
+# Rationale: Correcting Expr constructor (using :block symbol instead of string) to resolve TypeError.
+
+# 1. Update the Manifold Constructors with robust alias handling
+function robust_symbol(s)
+    str = string(s)
+    # Strip leading colon if it exists in the string representation
+    clean_str = startswith(str, ":") ? str[2:end] : str
+    return Symbol(clean_str)
+end
+
+MANIFOLD_CONSTRUCTORS[:intercept] = (p, params) -> NoneManifold()
+MANIFOLD_CONSTRUCTORS[:spatial] = (p, params) -> begin
+    model_key = robust_symbol(get(params, :model, :besag))
+    MANIFOLD_CONSTRUCTORS[model_key](p, params)
+end
+MANIFOLD_CONSTRUCTORS[:temporal] = (p, params) -> begin
+    model_key = robust_symbol(get(params, :model, :ar1))
+    MANIFOLD_CONSTRUCTORS[model_key](p, params)
+end
+
+# 2. Re-Define the @bstm Macro
+macro bstm(expr, data, kwargs...)
+    kw_dict = Dict{Symbol, Any}()
+    for arg in kwargs
+        if arg isa Expr && arg.head == :(=)
+            kw_dict[arg.args[1]] = arg.args[2]
+        end
+    end
+
+    return quote
+        formula_str = $(string(expr))
+        decomposed = decompose_bstm_formula(formula_str)
+
+        M_dict = Dict{Symbol, Any}(
+            :data => $(esc(data)),
+            :likelihood_specs => decomposed.outcomes,
+            :add_intercept => decomposed.has_intercept,
+            :y_N => size($(esc(data)), 1),
+            :model_arch => "univariate"
+        )
+
+        # Fix: Using :block (Symbol) instead of "block" (String)
+        $(Expr(:block, [:(M_dict[$(QuoteNode(k))] = $(esc(v))) for (k, v) in kw_dict]...))
+
+        if haskey(M_dict, :W)
+             M_dict[:s_N] = size(M_dict[:W], 1)
+        else
+             M_dict[:s_N] = 56
+        end
+        M_dict[:t_N] = 10
+
+        M_dict[:manifolds] = []
+        for (key_str, mod) in decomposed.modules
+             m_obj = MANIFOLD_CONSTRUCTORS[mod.module_type]((sigma_prior=Exponential(1.0), rho_prior=Beta(1,1)), mod.args)
+             push!(M_dict[:manifolds], (key=Symbol(key_str), manifold_obj=m_obj, domain=mod.module_type, params=mod.args))
+        end
+
+        (args = (M = NamedTuple(M_dict),),)
+    end
+end
+
+
+
+
+function split_terms_at_depth(input::AbstractString, sep::AbstractString)
+    terms = String[]
+    current_term = ""
+    depth = 0
+    i = 1
+    sep_len = length(sep)
+
+    while i <= length(input)
+        char = input[i]
+        if char == '(' || char == '['
+            depth += 1
+        elseif char == ')' || char == ']'
+            depth -= 1
+        end
+
+        if depth == 0 && i <= length(input) - sep_len + 1 && SubString(input, i, i + sep_len - 1) == sep
+            push!(terms, strip(current_term))
+            current_term = ""
+            i += sep_len
+            continue
+        end
+
+        current_term *= char
+        i += 1
+    end
+    if !isempty(strip(current_term))
+        push!(terms, strip(current_term))
+    end
+
+    return terms
+end
+
+function _parse_value(val_str::String)
+    val_str = strip(val_str)
+    if startswith(val_str, "(") && endswith(val_str, ")") # Tuple
+        inner_val_str = val_str[2:end-1]
+        tuple_parts = split_terms_at_depth(inner_val_str, ",")
+        parsed_tuple = []
+        for tp in tuple_parts
+            if !isempty(tp)
+                push!(parsed_tuple, _parse_value(String(tp)))
+            	end
+        end
+        return Tuple(parsed_tuple)
+    elseif startswith(val_str, "\"") && endswith(val_str, "\"") # String
+        return val_str[2:end-1]
+    elseif startswith(val_str, ":")
+        return Symbol(val_str[2:end])
+    else
+        try_num = tryparse(Float64, val_str)
+        if try_num !== nothing
+            return try_num
+        else
+            return Meta.parse(val_str)
+        end
+    end
+end
+
+function _add_parsed_arg!(args_dict::Dict{Symbol, Any}, positional_args::Vector{Any}, arg_val::String)
+    if contains(arg_val, "=")
+        key_val = Base.split(arg_val, "=", limit=2)
+        key = Symbol(strip(key_val[1]))
+        val_str = String(strip(key_val[2]))
+        args_dict[key] = _parse_value(val_str)
+    else
+        push!(positional_args, _parse_value(arg_val))
+    end
+end
+
+function _parse_arguments_string(args_str::String)
+    args_dict = Dict{Symbol, Any}()
+    positional_args = []
+    current_arg = ""
+    depth = 0
+
+    for char in args_str
+        if char == ',' && depth == 0
+            arg_val = String(strip(current_arg))
+            if !isempty(arg_val)
+                _add_parsed_arg!(args_dict, positional_args, arg_val)
+            end
+            current_arg = ""
+        else
+            current_arg *= char
+            if char == '(' || char == '['
+                depth += 1
+            elseif char == ')' || char == ']'
+                depth -= 1
+            end
+        end
+    end
+
+    arg_val = String(strip(current_arg))
+    if !isempty(arg_val)
+        _add_parsed_arg!(args_dict, positional_args, arg_val)
+    end
+
+    if !isempty(positional_args)
+        args_dict[:positional_args] = positional_args
+    end
+
+    return args_dict
+end
+
+function _parse_single_manifold_term(term_str::String)
+    term_str = strip(term_str)
+    m = match(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)\)\s*$", term_str)
+
+    if m === nothing
+        error("Internal Parser Error: Expected a module call (e.g., 'name(...)'), but got non-module term '$term_str'.")
+    end
+
+    module_name = Symbol(m.captures[1])
+    args_str = String(m.captures[2])
+    args_dict = _parse_arguments_string(args_str)
+
+    return (module_type = module_name, args = args_dict)
+end
+
+function _parse_rhs_expression(term_str::String)
+    parts = split_terms_at_depth(term_str, " ⊕ ")
+    if length(parts) > 1; return (type=:operator, op=:direct_sum, children=[_parse_rhs_expression(p) for p in parts]); end
+
+    parts = split_terms_at_depth(term_str, " |> ")
+    if length(parts) > 1; return (type=:operator, op=:pipe, children=[_parse_rhs_expression(parts[1]), _parse_rhs_expression(join(parts[2:end], " |> "))]); end
+
+    parts = split_terms_at_depth(term_str, " ⊗ ")
+    if length(parts) > 1; return (type=:operator, op=:kronecker_product, children=[_parse_rhs_expression(p) for p in parts]); end
+
+    parts = split_terms_at_depth(term_str, " ∘ ")
+    if length(parts) > 1; return (type=:operator, op=:composition, children=[_parse_rhs_expression(p) for p in parts]); end
+
+    return _parse_single_manifold_term(term_str)
+end
+
+function resolve_technical_primitive(mod_data_dict, M, hyperpriors, prior_scheme)
+    mod_type = mod_data_dict[:type]
+    params = mod_data_dict[:params]
+
+    # v2.1.4: Explicit support for nested module resolution
+    if mod_type == :nested
+        var = Symbol(mod_data_dict[:variables][1])
+        formula_str = get(params, :formula, "")
+        data_source = get(params, :data_source, :data)
+        return NestedManifold(var, string(formula_str), Symbol(data_source))
+    end
+
+    model_key = Symbol(get(params, :model, :none))
+    constructor = get(MANIFOLD_CONSTRUCTORS, model_key, nothing)
+
+    if isnothing(constructor)
+        error("Unknown manifold model '$model_key' for module '$mod_type'. Supported models are: $(sort(collect(keys(MANIFOLD_CONSTRUCTORS))))")
+    end
+
+    # Resolve priors based on scheme
+    priors = (sigma_prior=get(hyperpriors, "sigma", Exponential(1.0)),
+              rho_prior=get(hyperpriors, "rho", Beta(1,1)),
+              lengthscale_prior=get(hyperpriors, "lengthscale", InverseGamma(3,3)),
+              kappa_prior=get(hyperpriors, "kappa", Exponential(1.0)))
+
+    return constructor(priors, params)
+end
+
+function process_nested_module!(opt_dict, mod_data, registries, hyperpriors)
+    if !haskey(opt_dict, :nested_manifolds); opt_dict[:nested_manifolds] = Dict{Symbol, Any}(); end
+
+    var = Symbol(mod_data[:variables][1])
+    params = mod_data[:params]
+    sub_formula = string(get(params, :formula, ""))
+    data_source_sym = get(params, :data_source, :data)
+
+    if !haskey(opt_dict, data_source_sym)
+        @warn "Data source ':$data_source_sym' for nested module on '$var' not found. Skipping."
+        return
+    end
+    sub_data = opt_dict[data_source_sym]
+
+    sub_config = _initialize_config(sub_data, Dict(:calling_module => get(opt_dict, :calling_module, Main)))
+    sub_metadata = decompose_bstm_formula(sub_formula)
+
+    # v2.1.3: Handle RHS-only nested formulas
+    if !isempty(sub_metadata.outcomes)
+        _process_lhs!(sub_config, sub_metadata.outcomes)
+    else
+        sub_config[:y_N] = size(sub_data, 1)
+        sub_config[:y_obs] = zeros(sub_config[:y_N])
+    end
+
+    sub_config[:manifolds] = []
+    for (key, mod_data_nt) in sub_metadata.modules
+        mod_type = mod_data_nt.module_type
+        processor! = get(MODULE_PROCESSORS, mod_type, nothing)
+        isnothing(processor!) && continue
+        m_data_dict = Dict(:type => mod_data_nt.module_type, :variables => get(mod_data_nt.args, :positional_args, []), :params => mod_data_nt.args)
+        processor!(sub_config, m_data_dict, sub_config, hyperpriors)
+        manifold_obj = resolve_technical_primitive(m_data_dict, sub_config, hyperpriors, get(opt_dict, :prior_scheme, :pcpriors))
+        manifold_spec_built = build_model(manifold_obj, sub_config)
+        spec = (key=Symbol(key), domain=m_data_dict[:type], var=join(m_data_dict[:variables], "_"), manifold_obj=manifold_obj, params=m_data_dict[:params], Q_template=manifold_spec_built.Q_template, scaling_factor=manifold_spec_built.scaling_factor)
+        push!(sub_config[:manifolds], spec)
+    end
+
+    _process_fixed_effects!(sub_config, sub_metadata.fixed_effects, sub_metadata.has_intercept)
+    _process_fixed_effects_priors!(sub_config)
+    _finalize_config!(sub_config)
+    opt_dict[:nested_manifolds][var] = sub_config
+end
+
+
+
+### BSTM Parameter Extraction Utility v3.0.0
+# Timestamp: 2026-07-17 11:30:00
+# Rationale: Refactoring get_params_vector to prioritize [domain]_[key]_[parameter] naming.
+
+function get_params_vector(chain, base_name, expected_len)
+    # 1. Attempt discovery using the new hierarchical naming convention
+    # The naming logic now expects: domain_key_parameter (e.g., temporal_year_sigma)
+    p_names = string.(FlexiChains.parameters(chain))
+    
+    # Check if the base_name itself exists in the chain
+    if base_name in p_names
+        vals = chain[Symbol(base_name)].data
+        return dropdims(mean(vals, dims=1), dims=1)
+    end
+
+    # 2. Check for indexed parameters (e.g., spatial_s_idx[1])
+    regex_indexed = Regex("^" * escape_string(base_name) * "\\[(\\d+)\\]")
+    matching_indices = Int[]
+    for n in p_names
+        m = match(regex_indexed, n)
+        if m !== nothing
+            push!(matching_indices, parse(Int, m.captures[1]))
+        end
+    end
+
+    if !isempty(matching_indices)
+        max_idx = maximum(matching_indices)
+        # We return the mean across samples for each index
+        results = zeros(Float64, max_idx)
+        for i in 1:max_idx
+            p_sym = Symbol("$(base_name)[$i]")
+            if p_sym in FlexiChains.parameters(chain)
+                results[i] = mean(chain[p_sym].data)
+            end
+        end
+        return results
+    end
+
+    # 3. Fallback: Check for common suffixes if base_name is a manifold key
+    # This handles cases where the user passed just the key (e.g., 'temporal_year')
+    # but the parameter is 'temporal_year_sigma'
+    for suffix in ["_sigma", "_rho", "_kappa", "_phi"]
+        potential_name = base_name * suffix
+        if potential_name in p_names
+            vals = chain[Symbol(potential_name)].data
+            return dropdims(mean(vals, dims=1), dims=1)
+        end
+    end
+
+    # 4. Final Warning & Default Initialization
+    # If no parameters are found, initialize with zeros to prevent downstream FieldErrors
+    @warn "get_params_vector: Parameter '$base_name' not discovered in chain. Initializing with zeros (len=$expected_len)."
+    return zeros(Float64, expected_len)
+end
+
+function _discover_manifold_realizations(chain, M, n_samples, outcomes_N, p_names, PS, N_tot)
+    # Initialization of outcome-specific latent containers
+    s_eff_struct = [zeros(Float64, M.s_N, n_samples) for _ in 1:outcomes_N]
+    s_eff_unstruct = [zeros(Float64, M.s_N, n_samples) for _ in 1:outcomes_N]
+    s_eff_noisy  = [zeros(Float64, M.s_N, n_samples) for _ in 1:outcomes_N]
+    t_eff = [zeros(Float64, M.t_N, n_samples) for _ in 1:outcomes_N]
+    u_eff = zeros(Float64, M.u_N, n_samples)
+
+    basis_eff_accum = zeros(Float64, N_tot, n_samples)
+    basis_coeffs = Dict{Symbol, Vector{Matrix{Float64}}}()
+    st_eff_maps = [zeros(Float64, M.s_N, M.t_N, n_samples) for _ in 1:outcomes_N]
+    dynamics_eff = [zeros(Float64, M.y_N, n_samples) for _ in 1:outcomes_N]
+    eigen_eff = [zeros(Float64, M.y_N, n_samples) for _ in 1:outcomes_N]
+    all_nested_effects = Dict{Symbol, Matrix{Float64}}()
+
+    disc_space = "none"
+    disc_time = "none"
+
+    # Global Intercept Discovery
+    intercept_eff = nothing
+    intercept_name = _find_parameter(p_names, "intercept", "", "")
+    if !isempty(intercept_name) && intercept_name in p_names
+        intercept_samples = get_params_vector(chain, intercept_name, outcomes_N)
+        intercept_eff = intercept_samples'
+    end
+
+    log_offset_eff = get(M, :log_offset, nothing)
+
+    # Main Manifold Discovery Loop using Refactored Naming
+    if haskey(M, :manifolds)
+        for spec in M.manifolds
+            m_obj = spec.manifold_obj
+            if m_obj isa NoneManifold; continue; end
+
+            # Extract using the standardized naming convention: domain_key
+            prefix = "$(string(spec.domain))_$(string(spec.key))"
+            extracted = extract_manifold(m_obj, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+
+            if spec.domain == :spatial
+                disc_space = string(typeof(m_obj))
+                for k in 1:outcomes_N
+                    s_eff_struct[k] .+= extracted.structured[k]
+                    if hasproperty(extracted, :unstructured)
+                        s_eff_unstruct[k] .+= extracted.unstructured[k]
+                    end
+                    s_eff_noisy[k] .+= extracted.noisy[k]
+                end
+            elseif spec.domain == :temporal
+                disc_time = string(typeof(m_obj))
+                for k in 1:outcomes_N
+                    t_eff[k] .+= extracted.structured[k]
+                end
+            elseif spec.domain == :seasonal
+                u_eff .+= extracted.structured[1]
+            elseif spec.domain == :smooth
+                if hasproperty(extracted, :coefficients)
+                    basis_coeffs[spec.var] = extracted.coefficients
+                end
+                if hasproperty(extracted, :structured) && !isempty(extracted.structured)
+                    basis_eff_accum .+= extracted.structured[1]
+                end
+            end
+        end
+    end
+
+    return (
+        Xfixed_betas = M.Xfixed_N > 0 ? get_params_vector(chain, "Xfixed_beta", M.Xfixed_N * outcomes_N)' : nothing,
+        intercept_eff = intercept_eff,
+        log_offset_eff = log_offset_eff,
+        s_eff_struct = s_eff_struct,
+        s_eff_unstruct = s_eff_unstruct,
+        s_eff_noisy = s_eff_noisy,
+        t_eff = t_eff,
+        u_eff = u_eff,
+        basis_eff_accum = basis_eff_accum,
+        basis_coeffs = basis_coeffs,
+        st_eff_maps = st_eff_maps,
+        dynamics_eff = dynamics_eff,
+        eigen_eff = eigen_eff,
+        all_nested_effects = all_nested_effects,
+        sv_surface = _extract_volatility(chain, p_names, N_tot, n_samples, outcomes_N, M),
+        n_samples = n_samples,
+        outcomes_N = outcomes_N,
+        model_space = disc_space,
+        model_time = disc_time
+    )
+end
+
+### Likelihood Factory v1.2.9
+# Timestamp: 2026-07-17 12:45:00
+# Rationale: Resolving MethodError by implementing consistent scalar and vector logpdf overloads.
+
+struct bstm_Likelihood{F, Z, C, W, P, R, S, T, TR, TL, TU, HT, EX} <: ContinuousMultivariateDistribution
+    family::F
+    y_obs::TR
+    zi_state::Z
+    censoring_state::C
+    weight::W
+    phi_zi::P
+    r_nb::R
+    sigma_y::S
+    trial::T
+    y_L::TL
+    y_U::TU
+    hurdle::HT
+    extra_params::EX
+end
+
+# Keyword-aware constructor
+function bstm_Likelihood(family_input::Union{String, Symbol}, y_obs;
+    zi_state=nothing, censoring_state=nothing, weight=nothing,
+    phi_zi=-Inf, r_nb=1.0, sigma_y=1.0, trial=1,
+    y_L=-Inf, y_U=Inf, hurdle=nothing, extra_params=nothing
+)
+    f_trait = get_model_family(family_input)
+    y_vec = y_obs isa AbstractVector ? y_obs : [y_obs]
+    return bstm_Likelihood(f_trait, y_vec, zi_state, censoring_state, weight, phi_zi, r_nb, sigma_y, trial, y_L, y_U, hurdle, extra_params)
+end
+
+# Required interface methods
+Base.length(d::bstm_Likelihood) = length(d.y_obs)
+Base.size(d::bstm_Likelihood) = (length(d.y_obs),)
+
+# Internal logpdf implementation for vector-based observations
+function Distributions._logpdf(d::bstm_Likelihood, x::AbstractVector{<:Real})
+    logp = 0.0
+    # Handle sigma_y as either a scalar parameter or a per-observation vector
+    for i in 1:length(x)
+        sig = d.sigma_y isa AbstractVector ? d.sigma_y[i] : d.sigma_y
+        logp += Distributions.logpdf(d.family, x[i], sig)
+    end
+    return logp
+end
+
+# Public scalar overload
+# This is explicitly called by bstm_univariate_assembler_v9 logic: Distributions.logpdf(d_lik, eta[i])
+function Distributions.logpdf(d::bstm_Likelihood, y::Real)
+    sig = d.sigma_y isa AbstractVector ? d.sigma_y[1] : d.sigma_y
+    return Distributions.logpdf(d.family, y, sig)
+end
+
+# Public vector overload to maintain MultivariateDistribution compliance
+function Distributions.logpdf(d::bstm_Likelihood, y::AbstractVector{<:Real})
+    return Distributions._logpdf(d, y)
+end

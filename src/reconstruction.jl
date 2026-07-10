@@ -63,79 +63,59 @@ function _find_parameter(p_names, base, domain, key, k=nothing)
     return base
 end
 
-function get_params_vector(chain, base_name::String, expected_len::Int)
-    # Audited and Hardened Parameter Extraction Engine (v1.2.0)
-    # Rationale: This utility acts as the primary data-bridge between raw MCMC chains
-    # and the posterior reconstruction assembly. It must robustly handle FlexiChains
-    # nesting and ensure that indexed parameters are recovered in numerical order.
 
-    local N_samples = size(chain, 1)
-    local all_names = string.(FlexiChains.parameters(chain))
+function get_params_vector(chain, base_name, expected_len)
+    # 1. Attempt discovery using the new hierarchical naming convention
+    # The naming logic now expects: domain_key_parameter (e.g., temporal_year_sigma)
+    p_names = string.(FlexiChains.parameters(chain))
+    
+    # Check if the base_name itself exists in the chain
+    if base_name in p_names
+        vals = chain[Symbol(base_name)].data
+        return dropdims(mean(vals, dims=1), dims=1)
+    end
 
-    # 1. Tier 1: Regex-based Indexed Recovery (Numerical Sorting)
-    # Rationale: Standard string sorting often places 'beta[10]' before 'beta[2]'.
-    # This Regex captures the integer index to ensure strictly numerical alignment.
-    local regex = Regex("^" * base_name * "\\[(\\d+)\\]")
-    local matched_names = filter(n -> occursin(regex, n), all_names)
+    # 2. Check for indexed parameters (e.g., spatial_s_idx[1])
+    regex_indexed = Regex("^" * escape_string(base_name) * "\\[(\\d+)\\]")
+    matching_indices = Int[]
+    for n in p_names
+        m = match(regex_indexed, n)
+        if m !== nothing
+            push!(matching_indices, parse(Int, m.captures[1]))
+        end
+    end
 
-    if !isempty(matched_names)
-        # Sort by the captured integer index to maintain dimensional alignment
-        sort!(matched_names, by = n -> parse(Int, match(regex, n).captures[1]))
-
-        local res_mat = zeros(Float64, N_samples, length(matched_names))
-
-        for (idx, n) in enumerate(matched_names)
-            local val_obj = chain[Symbol(n)]
-            # Extract raw data while handling potential vector wrapping from FlexiChains
-            local raw = hasproperty(val_obj, :data) ? val_obj.data : collect(val_obj)
-
-            # Map each sample to a Float64 scalar. If the sample is a 1-element vector, extract index 1.
-            for s in 1:N_samples
-                local v = raw[s]
-                res_mat[s, idx] = (v isa AbstractVector) ? Float64(v[1]) : Float64(v)
+    if !isempty(matching_indices)
+        max_idx = maximum(matching_indices)
+        # We return the mean across samples for each index
+        results = zeros(Float64, max_idx)
+        for i in 1:max_idx
+            p_sym = Symbol("$(base_name)[$i]")
+            if p_sym in FlexiChains.parameters(chain)
+                results[i] = mean(chain[p_sym].data)
             end
         end
-
-        # Standard Scalar Broadcast: If only one index is found but multiple are expected,
-        # we broadcast the column to the expected length.
-        if size(res_mat, 2) == 1 && expected_len > 1
-            return repeat(res_mat, 1, expected_len) # This creates a matrix of size N_samples x expected_len
-        end
-
-        return res_mat
+        return results
     end
 
-    # 2. Tier 2: Vectorized/Single Entity Recovery
-    # Handles cases where parameters are stored as a single vector (e.g., 's_sigma_arr')
-    if base_name in all_names
-        local val_obj = chain[Symbol(base_name)]
-        local raw_data = hasproperty(val_obj, :data) ? val_obj.data : collect(val_obj)
-
-        # Standardize to Matrix [Samples x Params]
-        # We iterate through samples to flatten any nested Matrix{Vector} artifacts.
-        local mat_data = if eltype(raw_data) <: AbstractVector
-             reduce(hcat, [vec(collect(v)) for v in raw_data])'
-        else
-             Matrix{Float64}(reshape(collect(raw_data), N_samples, :))
-        end
-
-        # Dimensional Realignment and Broadcasting
-        if size(mat_data, 2) == expected_len
-            return mat_data
-        elseif size(mat_data, 2) == 1 && expected_len > 1
-            # Scalar Broadcast fallback to N_samples x expected_len
-            return repeat(mat_data, 1, expected_len)
-        else
-            @warn "Parameter '$base_name' was found, but its length ($(size(mat_data, 2))) does not match expected length ($expected_len). Returning as is, which may cause downstream errors."
-            return mat_data
+    # 3. Fallback: Check for common suffixes if base_name is a manifold key
+    # This handles cases where the user passed just the key (e.g., 'temporal_year')
+    # but the parameter is 'temporal_year_sigma'
+    for suffix in ["_sigma", "_rho", "_kappa", "_phi"]
+        potential_name = base_name * suffix
+        if potential_name in p_names
+            vals = chain[Symbol(potential_name)].data
+            return dropdims(mean(vals, dims=1), dims=1)
         end
     end
 
-    # 3. Null Safety Fallback
-    # If the parameter is missing, return a zero-matrix of size N_samples x expected_len to prevent downstream assembly failure.
+    # 4. Final Warning & Default Initialization
+    # If no parameters are found, initialize with zeros to prevent downstream FieldErrors
     @warn "get_params_vector: Parameter '$base_name' not discovered in chain. Initializing with zeros (len=$expected_len)."
-    return zeros(Float64, N_samples, expected_len)
+    return zeros(Float64, expected_len)
 end
+
+
 
 function extract_manifold(m_obj::Union{ICAR, Besag, RW1, RW2, Leroux, SAR, Cyclic}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     structured_fields = Vector{Matrix{Float64}}()
