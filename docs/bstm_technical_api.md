@@ -107,10 +107,10 @@ The formula parser translates the user-provided formula string into a structured
     *   **Output**: Returns a `NamedTuple` containing `:outcomes`, `:modules` (a dictionary of all parsed RHS terms), `:fixed_effects` (a list of bare variable names), `:has_intercept`, and `:intercept_prior`.
 
 *   **`_parse_rhs_expression(term_str)`**: A recursive descent parser that respects operator precedence to build the AST for the RHS. The precedence is:
-    1.  `+` (Addition of independent effects)
-    2.  `|>` (Pipe for SVC/state-space)
-    4.  `⊗` (Kronecker Product)
-    5.  `∘` (Composition)
+    The parser is called on sub-expressions after the formula has been split by the `+` operator (which has the lowest precedence). The parser then handles operators in the following order of precedence (from highest to lowest):
+    1.  `|>` (Pipe for state-space models)
+    2.  `⊗` (Kronecker Product)
+    3.  `∘` (Composition)
 
 *   **`_categorize_rhs_nodes!(nodes, modules, fixed_effects)`**: Traverses the generated AST to populate the `modules` dictionary and the `fixed_effects` list. It correctly identifies composed manifolds (e.g., `spatial() ⊗ temporal()`) as a single interaction module.
 
@@ -202,6 +202,22 @@ The reconstruction engine is responsible for post-processing the MCMC `chain` to
 *   **`create_fixed_design(...)`**: A wrapper around `StatsModels.jl` that takes a formula string and a `DataFrame` and returns the corresponding design matrix `Xfixed`, correctly handling contrasts and factor variables.
 
 *   **`get_optimal_sampler(...)`**: A utility that inspects the model's parameters and their prior distributions to construct an efficient composite `Gibbs` sampler. It assigns specialized samplers (`ESS`, `Slice`, `PG`) to different parameter blocks to improve MCMC efficiency.
+    *   **Purpose**: To automatically construct an efficient composite Gibbs sampler tailored to the `bstm` model structure.
+    *   **Rationale**: Different MCMC algorithms exhibit varying performance depending on the characteristics of the target distribution. A composite `Gibbs` sampler, which applies different samplers to different blocks of parameters, can significantly outperform a single, general-purpose sampler. This function automates the construction of such a sampler.
+    *   **Workflow**:
+        1.  **Manual Override**: The function first checks if a specific sampler has been provided via the `sampler_choice` argument or if a `sampler_map` dictionary has been passed to assign specific samplers to certain parameters. These manual assignments take the highest precedence.
+        2.  **Manifold Grouping**: If `group_manifolds=true` (the default), the function identifies all parameters that belong to the same manifold instance (e.g., `spatial_main_sigma`, `spatial_main_rho`, and `spatial_main_latent`). It groups these parameters into a single block and assigns a `NUTS` sampler to them. This is a critical step for efficiency, as it allows the sampler to jointly explore the highly correlated posterior geometry of a latent field and its hyperparameters, reducing the "funnel" problems common in hierarchical models.
+        3.  **Default Parameter Categorization**: For all remaining parameters that were not part of a manifold group or manual assignment, the function categorizes them based on their prior distributions:
+            *   `:discrete`: Parameters with discrete support (e.g., from `Categorical` or `Poisson` priors).
+            *   `:gaussian`: Parameters with `Normal` or `MvNormal` priors.
+            *   `:bounded`: Continuous parameters with one or two-sided bounds (e.g., from `Uniform`, `Beta`, `Exponential`, `InverseGamma`).
+            *   `:other_continuous`: All other unbounded, non-Gaussian continuous parameters.
+        4.  **Sampler Assignment**: It assigns an optimal MCMC algorithm to each category:
+            *   `PG` (Particle Gibbs) is assigned to `:discrete` parameters.
+            *   `ESS` (Elliptical Slice Sampler) is assigned to `:gaussian` parameters. This is highly efficient for latent Gaussian models.
+            *   `Slice` sampling is assigned to `:bounded` parameters, as it robustly handles the boundaries without requiring gradient information.
+            *   `NUTS` is assigned to all remaining `:other_continuous` parameters.
+        5.  **Composite Sampler Construction**: Finally, it combines all the individually assigned samplers (from the manual map, manifold groups, and default categories) into a single `Gibbs(...)` sampler object, which is then returned.
 
 *   **`get_inits(...)`**: Generates initial values for MCMC sampling. It can use a heuristic based on prior samples or run a fast MAP optimization to find a high-density starting point.
 

@@ -58,9 +58,9 @@ The `likelihood()` module on the LHS specifies the observation model and its par
     `@bstm(likelihood(y) ~ 1 + (poverty |> spatial(s_idx, model=icar)), data, W=W)`
     Allows the impact of `poverty` to vary according to local spatial gradients.
 
-5.  **Spectral Splines:**
-    `@bstm(likelihood(y) ~ 1 + smooth(lon, lat, model=rff), data)`
-    Approximates a 2D continuous field without the $O(N^3)$ kernel inversion cost.
+5.  **Spatially Varying Curves:**
+    `@bstm(likelihood(y) ~ 1 + (spatial(s_idx, model=icar) |> smooth(time, model=pspline)), data, W=W)`
+    Models a temporal trend that varies smoothly across space.
 
 ## 3. The Algebra of Manifolds: Composition and State-Space Models
 
@@ -68,16 +68,14 @@ The `bstm` domain-specific language operates through a recursive parser that all
 
 ### 3.1. Algebraic Operators
 
-1.  **Direct Sum (⊕)**: Creates a block-diagonal precision matrix from its component manifolds, i.e., $Q_{total} = \text{diag}(Q_1, Q_2)$. This is used to model components that are structurally independent but are specified to share a common hyperparameter (e.g., variance). For simple additive effects with separate, unshared hyperparameters, use `+`.
-2.  **Kronecker Product (⊗)**: Used for creating inseparable interaction effects, such as the Knorr-Held Type IV model (`spatial() ⊗ temporal()`). This builds a joint precision matrix $Q_{st} = Q_t \otimes Q_s$, enabling the representation of space-time interactions where every spatial location has a unique, correlated temporal trend.
-3.  **Composition (∘)**: Represents the composition of two precision structures as a functional transformation, e.g., $Q_{total} = Q_1 * Q_2 * Q_1$. This can be used for basis warping or creating cascading dependencies between manifolds of the same dimension.
+1.  **Kronecker Product (⊗)**: Used for creating inseparable interaction effects, such as the Knorr-Held Type IV model (`spatial() ⊗ temporal()`). This builds a joint precision matrix $Q_{st} = Q_t \otimes Q_s$, enabling the representation of space-time interactions where every spatial location has a unique, correlated temporal trend.
+2.  **Composition (∘)**: Represents the functional composition of two manifolds, where one manifold modulates the parameters of another. This is a powerful tool for creating non-stationary models. For example, in `spatial() ∘ smooth(x)`, the output of the `smooth(x)` manifold can be used to define a spatially-varying variance for the `spatial()` effect.
 
 ### 3.2. Structural Transformations and State-Space Models
 
-The pipe (`|>`) operator handles data normalization, Spatially Varying Coefficients (SVC), and state-space evolution.
+The pipe (`|>`) operator handles data normalization and state-space evolution.
 
 *   **Transformations**: Objects like `ZScoreManifold` or `LogManifold` act as wrappers that normalize inputs before they enter the latent process.
-*   **SVC Logic**: The notation `covariate |> spatial()` instructs the parser to generate a random slope for the covariate that is spatially structured by the specified manifold, effectively modeling local non-stationarity.
 *   **State-Space Evolution**: The pipe operator defines a state-space model where one manifold evolves over the domain of another. This supports both discrete-time dynamics (e.g., `spatial() |> temporal(model=ar1)`) and the creation of spatially-varying curves (e.g., `spatial() |> smooth(time, model=pspline)`), where the coefficients of the temporal basis functions are modeled as spatial fields.
 
 ## 4. Core Components: Manifolds and Priors

@@ -46,7 +46,13 @@ struct Wavelet <: ManifoldModel
     lengthscale_prior::UnivariateDistribution
 end
 
-struct Eigen <: ManifoldModel; n_factors::Int; pca_sd_prior::UnivariateDistribution; pdef_sd_prior::UnivariateDistribution; ltri_indices::Vector{Int}; end
+struct Eigen <: ManifoldModel
+    n_vars::Int
+    n_factors::Int
+    pca_sd_prior::UnivariateDistribution
+    pdef_sd_prior::UnivariateDistribution
+    ltri_indices::Vector{Int}
+end
 struct Moran <: ManifoldModel; sigma_prior::UnivariateDistribution; end
 struct Spherical <: ManifoldModel; sigma_prior::UnivariateDistribution; range_prior::UnivariateDistribution; end
 struct Barycentric <: ManifoldModel; sigma_prior::UnivariateDistribution; end
@@ -257,11 +263,10 @@ const MANIFOLD_CONSTRUCTORS = Dict{Symbol, Function}(
     :bspline => (p, params) -> BSpline(get(params, :nbins, 10), get(params, :degree, 3), p.sigma_prior),
     :tps => (p, params) -> TPS(get(params, :nbins, 20), p.sigma_prior),
     :wavelet => (p, params) -> Wavelet(get(params, :family, :db4), get(params, :nbins, 32), p.sigma_prior, p.lengthscale_prior),
-    :eigen => (p, params) -> Eigen(get(params, :n_factors, 1), p.pca_sd_prior, p.pdef_sd_prior, get(params, :ltri_indices, Int[])),
+    :eigen => (p, params) -> Eigen(get(params, :n_vars, 0), get(params, :n_factors, 1), p.pca_sd_prior, p.pdef_sd_prior, get(params, :ltri_indices, Int[])),
     :moran => (p, params) -> Moran(p.sigma_prior),
     :spherical => (p, params) -> Spherical(p.sigma_prior, p.range_prior),
     :barycentric => (p, params) -> Barycentric(p.sigma_prior),
-    :kriging => (p, params) -> Kriging(p.lengthscale_prior, p.sigma_prior, string(get(params, :kernel, "se"))),
     :bcgn => (p, params) -> BCGN(p.sigma_prior, get(params, :bipartite_adj, sparse(zeros(1,1)))),
     :networkflow => (p, params) -> NetworkFlow(p.sigma_prior, get(params, :adjacency_matrix, sparse(zeros(1,1))), get(params, :flow_direction, :bidirectional)),
     :kriging => (p, params) -> GP(p.lengthscale_prior, p.sigma_prior, string(get(params, :kernel, "se"))),
@@ -276,12 +281,12 @@ function Base.:|>(m1::Manifold, m2::Manifold)
     return ComposedManifold([m1, m2], :pipe)
 end
 
-⊗(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :kronecker_product)
-⊕(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :direct_sum)
+∘(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :composition)
+composition(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :composition)
 
 otimes(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :kronecker_product)
-oplus(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :direct_sum)
 
+⊗(m1::Manifold, m2::Manifold) = ComposedManifold([m1, m2], :kronecker_product)
 
 # ==============================================================================
 # SECTION 3: FORMULA PARSING ENGINE
@@ -297,10 +302,6 @@ function split_terms_at_depth(input::AbstractString, sep::AbstractString)
     #   - sep: The separator string.
     # Outputs: A vector of strings.
     terms = String[]
-    current_term = ""
-    depth = 0
-    i = 1
-    sep_len = length(sep)
 
     while i <= length(input)
         char = input[i]
@@ -448,10 +449,6 @@ function _parse_rhs_expression(term_str::String)
     # Inputs:
     #   - term_str: The RHS string or a substring of it.
     # Outputs: A nested NamedTuple representing the parsed structure.
-    parts = split_terms_at_depth(term_str, " ⊕ ")
-    if length(parts) > 1
-        return (type=:operator, op=:direct_sum, children=[_parse_rhs_expression(p) for p in parts])
-    end
     parts = split_terms_at_depth(term_str, " |> ")
     if length(parts) > 1
         return (type=:operator, op=:pipe, children=[_parse_rhs_expression(parts[1]), _parse_rhs_expression(join(parts[2:end], " |> "))])
@@ -778,40 +775,43 @@ function _process_fixed_effects_priors!(M::Dict)
     #   - M: The model configuration dictionary.
     # Outputs: None (mutates `M`).
     n_fixed = get(M, :Xfixed_N, 0) 
-    if n_fixed == 0 
-        M[:Xfixed_priors_vec] = UnivariateDistribution[] 
-        return 
-    end 
-    coef_names = get(M, :Xfixed_names, Symbol[]) 
-    custom_priors = get(M, :fixed_effects_priors, Dict{Symbol, Any}()) 
-    intercept_prior_val = get(M, :intercept_prior, nothing) 
-    default_prior = Normal(0, 5) 
-    priors_vec = Vector{Union{UnivariateDistribution, Nothing}}(undef, n_fixed) 
-    fill!(priors_vec, nothing) 
- 
-    # Pass 1: Apply specific and interaction priors
-    for (var_sym, prior) in custom_priors 
-        var_str = string(var_sym) 
-        
-        # Applying priors to compound terms like 'a*b' is ambiguous and not supported.
-        # The documented approach is to set priors on individual terms ('a', 'b', 'a&b') separately.
-        if occursin('*', var_str)
-            @warn "Applying priors to compound terms like 'a*b' is not supported. The prior for '$var_str' will be ignored. Please set priors on individual terms (e.g., 'a', 'b', 'a&b') separately."
-            continue
-        end
-
-        # Handle simple terms and explicit interactions like 'a&b'
-        begin
-            for i in 1:n_fixed 
-                coef_name_str = string(coef_names[i]) 
-                # Match exact name or categorical level name (e.g., region: R2)
-                if coef_name_str == var_str || startswith(coef_name_str, var_str * ": ") 
-                    priors_vec[i] = prior isa Tuple ? create_pc_prior(var_sym, prior) : prior 
-                end 
-            end 
-        end 
+    if n_fixed == 0
+        M[:Xfixed_priors_vec] = UnivariateDistribution[]
+        return
     end
- 
+    coef_names = get(M, :Xfixed_names, Symbol[])
+    custom_priors = get(M, :fixed_effects_priors, Dict{Symbol, Any}())
+    intercept_prior_val = get(M, :intercept_prior, nothing)
+    default_prior = Normal(0, 5)
+    priors_vec = Vector{Union{UnivariateDistribution, Nothing}}(undef, n_fixed)
+    fill!(priors_vec, nothing)
+
+    # Normalize prior keys for matching against StatsModels coefficient names
+    normalized_priors = Dict{String, Any}()
+    for (key, prior) in custom_priors
+        # StatsModels uses "&" for interactions, so we normalize user input for consistency.
+        # This replaces both "*" and ":" with "&" and removes whitespace.
+        norm_key = replace(string(key), r"\s*[\*:]\s*" => "&")
+        norm_key = replace(norm_key, r"\s*&\s*" => "&")
+        normalized_priors[norm_key] = prior
+    end
+
+    # Pass 1: Apply specific and interaction priors by matching normalized names
+    for i in 1:n_fixed
+        coef_name_str = string(coef_names[i])
+        # Normalize the coefficient name from StatsModels
+        norm_coef_name = replace(coef_name_str, r"\s*&\s*" => "&")
+
+        # Attempt to find a matching prior
+        for (prior_name, prior) in normalized_priors
+            # Match exact name (e.g., "x" or "x&y") or categorical level (e.g., "cat_var: level2")
+            if norm_coef_name == prior_name || startswith(coef_name_str, prior_name * ": ")
+                priors_vec[i] = prior isa Tuple ? create_pc_prior(Symbol(prior_name), prior) : prior
+                break # Found a match, move to the next coefficient
+            end
+        end
+    end
+
     # Pass 2: Fill in defaults for any remaining coefficients
     for i in 1:n_fixed 
         if isnothing(priors_vec[i]) 
@@ -1076,6 +1076,7 @@ function process_eigen_module!(opt_dict, mod_data, registries, hyperpriors)
     ltri_indices = findall(vec(ltri_mask))
     mod_data[:params][:ltri_indices] = ltri_indices
     mod_data[:params][:n_factors] = n_factors
+    mod_data[:params][:n_vars] = n_vars
     return true
 end
 
@@ -1191,6 +1192,80 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
             push!(opt_dict[:fixed_effects], interaction_term)
             
             return false # This interaction is fully handled by the fixed effects design matrix.
+
+        elseif op == :composition && length(components) == 2
+            base_node, modifier_node = components[1], components[2]
+            is_nonstationary_variance = base_node.module_type == :spatial && modifier_node.module_type == :smooth
+
+            if is_nonstationary_variance
+                # Process the modifier (smoother) to generate its basis matrix.
+                modifier_vars = get(modifier_node.args, :positional_args, [])
+                if isempty(modifier_vars); @warn "The modifier component (smooth) of a composition operator is missing variables. Skipping."; return false; end
+                
+                smooth_mod_data = Dict(:type => :smooth, :variables => modifier_vars, :params => modifier_node.args)
+                process_smooth_module!(opt_dict, smooth_mod_data, opt_dict[:basis_matrices], opt_dict[:manifolds])
+                
+                basis_key = Symbol(join(modifier_vars, "_"))
+                mod_data[:params][:modifier_basis_key] = basis_key
+
+                # Resolve the manifold objects to get their properties.
+                scheme = get(opt_dict, :prior_scheme, :pcpriors)
+                base_manifold_obj = resolve_technical_primitive(Dict(:type => base_node.module_type, :params => base_node.args, :variables => get(base_node.args, :positional_args, [])), opt_dict, hyperpriors, scheme)
+                modifier_manifold_obj = resolve_technical_primitive(smooth_mod_data, opt_dict, hyperpriors, scheme)
+                
+                # Inject the custom code fragments for this specific composition type.
+                key_str = string(mod_data[:key])
+                nbins = modifier_manifold_obj.nbins
+                mod_data[:params][:priors] = """
+                    $(key_str)_sv_sigma_smoother ~ NamedDist(Exponential(1.0), :$(key_str)_sv_sigma_smoother)
+                    $(key_str)_sv_coeffs_smoother ~ NamedDist(MvNormal(zeros(T, $(nbins)), I), :$(key_str)_sv_coeffs_smoother)
+                    $(key_str)_sv_icar_raw ~ NamedDist(MvNormal(zeros(T, M.s_N), I), :$(key_str)_sv_icar_raw)
+                """
+                mod_data[:params][:update] = """
+                    begin
+                        local Q_smoother_template = build_structure_template(:rw2, $(nbins)).matrix; local F_smoother = cholesky(Symmetric(Q_smoother_template + noise * I)); local smoother_latent = $(key_str)_sv_sigma_smoother .* (F_smoother.U \\ $(key_str)_sv_coeffs_smoother); local log_sigma_field = M.basis_matrices[:$(basis_key)] * smoother_latent; local spatially_varying_sigma = exp.(log_sigma_field); local Q_icar_template = spec_registry["$(key_str)"].hyper.base_spec.Q_template; local F_icar = cholesky(Symmetric(Q_icar_template + noise * I)); local icar_latent = F_icar.U \\ $(key_str)_sv_icar_raw; local final_effect = view(icar_latent, M.s_idx) .* spatially_varying_sigma; eta .+= final_effect;
+                    end
+                """
+                mod_data[:params][:base_manifold_obj] = base_manifold_obj
+                mod_data[:params][:modifier_manifold_obj] = modifier_manifold_obj
+                return true
+            end
+
+        elseif op == :pipe && length(components) == 2
+            state_node, dynamic_node = components[1], components[2]
+            is_spatially_varying_curve = state_node.module_type == :spatial && dynamic_node.module_type == :smooth
+    
+            if is_spatially_varying_curve
+                # This handles `spatial(...) |> smooth(...)`, creating spatially varying curves.
+                # The coefficients of the smoother's basis functions are modeled as spatial fields.
+    
+                # 1. Process the dynamic (smooth) part to generate its basis matrix.
+                dynamic_vars = get(dynamic_node.args, :positional_args, [])
+                if isempty(dynamic_vars)
+                    @warn "The dynamic component (smooth) of a pipe operator is missing variables. Skipping."
+                    return false
+                end
+                
+                smooth_mod_data = Dict(:type => :smooth, :variables => dynamic_vars, :params => dynamic_node.args)
+                process_smooth_module!(opt_dict, smooth_mod_data, opt_dict[:basis_matrices], opt_dict[:manifolds])
+    
+                # 2. Store information needed by the code generator in the composed manifold's parameters.
+                basis_key = Symbol(join(dynamic_vars, "_"))
+                mod_data[:params][:dynamic_basis_key] = basis_key
+    
+                # 3. Resolve the dynamic manifold object to get its properties (e.g., nbins).
+                # This is needed by the code generator to know how many spatial fields to create.
+                scheme = get(opt_dict, :prior_scheme, :pcpriors)
+                dynamic_manifold_obj = resolve_technical_primitive(smooth_mod_data, opt_dict, hyperpriors, scheme)
+                mod_data[:params][:dynamic_manifold_obj] = dynamic_manifold_obj
+    
+                # 4. The state manifold (spatial) will be resolved by the main loop's call to `build_model`.
+                # The `build_model` for ComposedManifold will attach the state spec.
+                
+                return true # Proceed to create the ComposedManifold object.
+            end
+
+
 
         elseif !isnothing(fixed_node) && !isnothing(smooth_node)
             fixed_var_sym = Symbol(get(fixed_node.args, :positional_args, [])[1])
@@ -1411,7 +1486,9 @@ function process_localadaptive_module!(opt_dict, mod_data, registries, hyperprio
         @warn "Number of spatial units ($(size(centroids, 1))) is less than the requested number of clusters ($n_clusters). Adjusting n_clusters to $(size(centroids, 1))."
         n_clusters = size(centroids, 1)
     end
-    kmeans_result = kmeans(centroids', n_clusters; maxiter=200, display=:none)
+    # Convert the vector of tuples to a 2xN matrix for Clustering.jl
+    centroids_matrix = hcat(collect.(centroids)...)
+    kmeans_result = kmeans(centroids_matrix, n_clusters; maxiter=200, display=:none)
     
     opt_dict[:cluster_assignments] = assignments(kmeans_result)
     opt_dict[:n_clusters] = nclusters(kmeans_result)
@@ -1706,8 +1783,16 @@ function build_model(m::ComposedManifold, data_inputs::Dict)
         hyper_dict[:state_spec] = state_spec
         
         return (Q_template=nothing, scaling_factor=1.0, model_type=:composed, hyper=NamedTuple(hyper_dict))
+    elseif m.operator == :composition
+        # For spatial ∘ smooth, we need the spec of the base (spatial) model.
+        base_manifold = get(m.components, 1, nothing)
+        if isnothing(base_manifold); error("Composition manifold is missing its base component."); end
+        base_spec = build_model(base_manifold, data_inputs)
+        hyper_dict = Dict(:base_spec => base_spec)
+        return (Q_template=base_spec.Q_template, scaling_factor=1.0, model_type=:composed, hyper=NamedTuple(hyper_dict))
+
     else
-        # For other operators like ⊗, ⊕, no special template is needed at this stage.
+        # For other operators like ⊗, no special template is needed at this stage.
         return _build_pass_through_model(m, data_inputs)
     end
 end
@@ -1809,6 +1894,274 @@ function observation_volatility(M::NamedTuple)
 end
 
 
+# ==============================================================================
+# SECTION 7.5: MANIFOLD CODE GENERATORS
+# ==============================================================================
+
+function _generate_manifold_code_fragments(spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing})
+    # Purpose: Dispatches code generation to a specific method based on the manifold object type.
+    # Rationale: This is the entry point for converting a high-level manifold specification
+    #            into low-level Turing model code strings.
+    return _generate_manifold_code_fragments(spec.manifold_obj, spec, arch, outcome_idx)
+end
+
+function _generate_manifold_code_fragments(m::ManifoldModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing})
+    # Purpose: Generic fallback for simple GMRF-style manifolds (IID, ICAR, RW1, etc.).
+    # Rationale: Implements a standard non-centered parameterization for Gaussian Markov Random Fields.
+    #            This reduces code duplication for many common spatial and temporal models.
+    
+    key = string(spec.key)
+    params = spec.params
+    n_latent = size(spec.Q_template, 1)
+    is_multivariate = arch == "multivariate"
+    is_first_outcome = outcome_idx == 1
+
+    # Determine if hyperparameters are shared across outcomes
+    is_shared = get(params, :shared, false)
+
+    # Generate unique names for parameters and latent variables
+    # For shared parameters in multivariate models, the name is not indexed by outcome.
+    # For non-shared parameters, the name is indexed.
+    # For univariate models, the name is not indexed.
+    sigma_name_str = if is_multivariate && !is_shared; "$(key)_sigma_$(outcome_idx)"; else; "$(key)_sigma"; end
+    rho_name_str = if is_multivariate && !is_shared; "$(key)_rho_$(outcome_idx)"; else; "$(key)_rho"; end
+    latent_raw_name_str = is_multivariate ? "$(key)_raw_$(outcome_idx)" : "$(key)_raw"
+    
+    sigma_name = Symbol(sigma_name_str)
+    rho_name = Symbol(rho_name_str)
+    latent_raw_name = Symbol(latent_raw_name_str)
+    latent_name = Symbol(is_multivariate ? "$(key)_latent_$(outcome_idx)" : "$(key)_latent")
+
+    priors_acc = String[]
+
+    # Generate hyperparameter priors only once if they are shared
+    if !is_multivariate || !is_shared || (is_shared && is_first_outcome)
+        if hasproperty(m, :sigma_prior)
+            push!(priors_acc, "$(sigma_name) ~ NamedDist($(m.sigma_prior), :$(sigma_name))")
+        end
+        if hasproperty(m, :rho_prior)
+            push!(priors_acc, "$(rho_name) ~ NamedDist($(m.rho_prior), :$(rho_name))")
+        end
+    end
+
+    # The raw latent field is always outcome-specific in multivariate models
+    push!(priors_acc, "$(latent_raw_name) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(latent_raw_name))")
+    
+    priors_str = join(priors_acc, "\n        ")
+    
+    # Determine the correct index variable to use for applying the effect
+    index_var = if spec.domain == :spatial
+        "s_idx"
+    elseif spec.domain == :temporal
+        typeof(m) <: Union{Cyclic, Harmonic} ? "u_idx" : "t_idx"
+    else
+        string(spec.domain) * "_idx"
+    end
+
+    # Determine which eta to update
+    eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
+
+    # Code to construct the precision matrix and the latent field
+    update_str = """
+        begin
+            local Q_template = spec_registry["$key"].Q_template
+            local m_type = spec_registry["$(key)"].manifold_obj |> typeof |> Symbol
+            local rho_val = $(hasproperty(m, :rho_prior) ? rho_name_str : "nothing")
+            
+            local Q_final = recompose_precision(m_type, Q_template, 1.0; extra_param=rho_val)
+
+            local F = cholesky(Symmetric(Q_final + noise * I))
+            local $(latent_name) = $(sigma_name_str) .* (F.U \\ $(latent_raw_name))
+            
+            if Symbol("$(spec.domain)") == :smooth
+                $(eta_update_target) .+= M.basis_matrices[:$(spec.var)] * $(latent_name)
+            else
+                $(eta_update_target) .+= view($(latent_name), M.$(index_var))
+            end
+        end
+    """
+    
+    return (priors=priors_str, update=update_str)
+end
+
+function _generate_manifold_code_fragments(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing})
+    # Purpose: Generates code for the Bayesian PCA (`eigen`) manifold.
+    # Rationale: Implements the Householder reflection parameterization for the loading matrix.
+
+    key = string(spec.key)
+    n_vars = m.n_vars
+    n_factors = m.n_factors
+
+    if n_vars == 0
+        error("Eigen manifold '$(key)' has n_vars=0, which is invalid. This typically occurs if the manifold was not processed correctly from the formula (e.g., no variables specified for eigen()).")
+    end
+
+    priors_str = """
+        pca_sd_priors = $(m.pca_sd_prior)
+        pdef_sd_priors = $(m.pdef_sd_prior)
+
+        v_raw_$(key) ~ NamedDist(MvNormal(zeros(T, $(length(m.ltri_indices))), 1.0), :v_raw_$(key))
+        d_raw_$(key) ~ NamedDist(MvNormal(zeros(T, $(n_factors)), 1.0), :d_raw_$(key))
+        
+        pca_sds_$(key) ~ NamedDist(filldist(pca_sd_priors, $(n_factors)), :pca_sds_$(key))
+        pdef_sds_$(key) ~ NamedDist(filldist(pdef_sd_priors, $(n_factors)), :pdef_sds_$(key))
+
+        factors_$(key) ~ NamedDist(MvNormal(zeros(T, M.y_N * $(n_factors)), I), :factors_$(key))
+    """
+
+    update_str = """
+        begin
+            local v_mat_$(key) = zeros(T, $(n_vars), $(n_factors))
+            v_mat_$(key)[$(m.ltri_indices)] .= v_raw_$(key)
+
+            local U_$(key) = householder_to_eigenvector(v_mat_$(key), $(n_vars), $(n_factors))
+            
+            local d_trans_$(key) = exp.(d_raw_$(key) .* pdef_sds_$(key))
+            local D_mat_$(key) = Diagonal(d_trans_$(key))
+
+            local L_$(key) = U_$(key) * D_mat_$(key)
+
+            local F_matrix_$(key) = reshape(factors_$(key), M.y_N, $(n_factors))
+            local eigen_effects = (F_matrix_$(key) * L_$(key)') .* pca_sds_$(key)'
+
+            eta .+= sum(eigen_effects, dims=2)
+        end
+    """
+    return (priors=priors_str, update=update_str)
+end
+
+function _generate_manifold_code_fragments(m::ComposedManifold, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing})
+    # Purpose: Generates code fragments for composed manifolds, such as state-space models.
+    # Rationale: This function handles complex interactions defined by operators like `|>`.
+    #            It currently supports spatially varying curves, e.g., `spatial() |> smooth()`.
+
+    if m.operator == :pipe
+        # This block handles state-space evolution, specifically for spatially varying curves.
+        state_manifold = m.components[1]
+        dynamic_manifold = get(spec.params, :dynamic_manifold_obj, nothing)
+
+        # Validate that the composition is a supported type.
+        if !(state_manifold isa Union{ICAR, Besag, BYM2, Leroux, SAR}) || !(dynamic_manifold isa Union{PSpline, BSpline, TPS})
+            error("Pipe operator `spatial |> smooth` currently only supports GMRF spatial models and Spline-based smoothers.")
+        end
+
+        key = string(spec.key)
+        is_multivariate = arch == "multivariate"
+        eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
+
+        # Extract specifications for the state (spatial) and dynamic (smooth) components.
+        state_spec = spec.hyper.state_spec
+        Q_spatial_template = state_spec.Q_template
+        n_spatial = size(Q_spatial_template, 1)
+        
+        n_basis = dynamic_manifold.nbins
+        basis_key = get(spec.params, :dynamic_basis_key, nothing)
+        if isnothing(basis_key)
+            error("Could not find basis matrix key for piped manifold $(key).")
+        end
+
+        # --- Priors ---
+        # We need to define `n_basis` independent spatial fields, one for each basis function of the smoother.
+        # These fields share common hyperparameters for scale and correlation.
+        priors_acc = String[]
+
+        sigma_name = Symbol("$(key)_sigma")
+        rho_name = Symbol("$(key)_rho")
+        
+        if hasproperty(state_manifold, :sigma_prior); push!(priors_acc, "$(sigma_name) ~ NamedDist($(state_manifold.sigma_prior), :$(sigma_name))"); end
+        if hasproperty(state_manifold, :rho_prior); push!(priors_acc, "$(rho_name) ~ NamedDist($(state_manifold.rho_prior), :$(rho_name))"); end
+
+        # Define raw latent variables for the `n_basis` spatial fields.
+        coeffs_raw_name = Symbol("$(key)_coeffs_raw")
+        push!(priors_acc, "$(coeffs_raw_name) ~ NamedDist(MvNormal(zeros(T, $(n_spatial * n_basis)), I), :$(coeffs_raw_name))")
+        
+        priors_str = join(priors_acc, "\n        ")
+
+        # --- Update ---
+        # This block generates the code to construct the spatially varying effect.
+        update_str = """
+            begin
+                local Q_spatial_template = spec_registry["$(spec.key)"].hyper.state_spec.Q_template
+                local state_m_type = spec_registry["$(spec.key)"].hyper.state_spec.model_type
+                local rho_val = $(hasproperty(state_manifold, :rho_prior) ? string(rho_name) : "nothing")
+                local Q_spatial = recompose_precision(state_m_type, Q_spatial_template, 1.0; extra_param=rho_val)
+                local F_spatial = cholesky(Symmetric(Q_spatial + noise * I))
+                local coeffs_raw_matrix = reshape($(coeffs_raw_name), $(n_spatial), $(n_basis))
+                local spatial_coeffs = $(sigma_name) .* (F_spatial.U \\ coeffs_raw_matrix)
+                local B_smooth = M.basis_matrices[:$(basis_key)]
+                $(eta_update_target) .+= sum(B_smooth .* spatial_coeffs[M.s_idx, :], dims=2)
+            end
+        """
+        return (priors=priors_str, update=update_str)
+    end
+
+    # Fallback for other operators
+    return (priors="", update="")
+end
+
+function _generate_manifold_code_fragments(m::ComposedManifold, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing})
+    # Purpose: Generates code fragments for composed manifolds, such as state-space models.
+    # Rationale: This function handles complex interactions defined by operators like `|>` and `∘`.
+
+    if m.operator == :pipe
+        # This block handles state-space evolution, specifically for spatially varying curves.
+        state_manifold = m.components[1]
+        dynamic_manifold = get(spec.params, :dynamic_manifold_obj, nothing)
+
+        if !(state_manifold isa Union{ICAR, Besag, BYM2, Leroux, SAR}) || !(dynamic_manifold isa Union{PSpline, BSpline, TPS})
+            error("Pipe operator `spatial |> smooth` currently only supports GMRF spatial models and Spline-based smoothers.")
+        end
+
+        key = string(spec.key)
+        is_multivariate = arch == "multivariate"
+        eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
+
+        state_spec = spec.hyper.state_spec
+        Q_spatial_template = state_spec.Q_template
+        n_spatial = size(Q_spatial_template, 1)
+        
+        n_basis = dynamic_manifold.nbins
+        basis_key = get(spec.params, :dynamic_basis_key, nothing)
+        if isnothing(basis_key); error("Could not find basis matrix key for piped manifold $(key)."); end
+
+        priors_acc = String[]
+        sigma_name = Symbol("$(key)_sigma")
+        rho_name = Symbol("$(key)_rho")
+        if hasproperty(state_manifold, :sigma_prior); push!(priors_acc, "$(sigma_name) ~ NamedDist($(state_manifold.sigma_prior), :$(sigma_name))"); end
+        if hasproperty(state_manifold, :rho_prior); push!(priors_acc, "$(rho_name) ~ NamedDist($(state_manifold.rho_prior), :$(rho_name))"); end
+        coeffs_raw_name = Symbol("$(key)_coeffs_raw")
+        push!(priors_acc, "$(coeffs_raw_name) ~ NamedDist(MvNormal(zeros(T, $(n_spatial * n_basis)), I), :$(coeffs_raw_name))")
+        priors_str = join(priors_acc, "\n        ")
+
+        update_str = """
+            begin
+                local Q_spatial_template = spec_registry["$(spec.key)"].hyper.state_spec.Q_template
+                local state_m_type = spec_registry["$(spec.key)"].hyper.state_spec.model_type
+                local rho_val = $(hasproperty(state_manifold, :rho_prior) ? string(rho_name) : "nothing")
+                local Q_spatial = recompose_precision(state_m_type, Q_spatial_template, 1.0; extra_param=rho_val)
+                local F_spatial = cholesky(Symmetric(Q_spatial + noise * I))
+                local coeffs_raw_matrix = reshape($(coeffs_raw_name), $(n_spatial), $(n_basis))
+                local spatial_coeffs = $(sigma_name) .* (F_spatial.U \\ coeffs_raw_matrix)
+                local B_smooth = M.basis_matrices[:$(basis_key)]
+                $(eta_update_target) .+= sum(B_smooth .* spatial_coeffs[M.s_idx, :], dims=2)
+            end
+        """
+        return (priors=priors_str, update=update_str)
+
+    elseif m.operator == :composition
+        # Handles non-stationary variance: spatial() ∘ smooth()
+        priors_code = get(spec.params, :priors, "")
+        update_code = get(spec.params, :update, "")
+        if isempty(priors_code) || isempty(update_code)
+            @warn "Composition manifold '$(spec.key)' is missing custom code fragments. It will have no effect. Please use `custom()` to define the composition logic."
+            return (priors="", update="")
+        end
+        return (priors=priors_code, update=update_code)
+    end
+
+    return (priors="", update="")
+end
+
 function bstm_text_assembler(M::NamedTuple)
     # Purpose: Dynamically generates the Turing `@model` function as a string.
     # Rationale: Allows for extreme flexibility in model specification via the formula interface.
@@ -1838,12 +2191,9 @@ function bstm_text_assembler(M::NamedTuple)
 
     for spec in M.manifolds
         spec_registry[string(spec.key)] = spec
-        calling_mod = get(M, :calling_module, Main)
-        domain_fn = getfield(calling_mod, spec.domain)
-        
         for k in 1:outcomes_N
             outcome_idx = arch == "multivariate" ? k : nothing
-            frag = domain_fn(spec.manifold_obj, string(spec.key), arch, outcome_idx)
+            frag = _generate_manifold_code_fragments(spec, arch, outcome_idx)
             
             push!(priors_acc, frag.priors)
             push!(updates_acc, frag.update)
@@ -1896,11 +2246,23 @@ function bstm_text_assembler(M::NamedTuple)
 
     fixed_effects_block = if M.Xfixed_N > 0
         if is_multivariate
-            beta_count = "M.Xfixed_N * K"
-            update = "$(eta_name) .+= M.Xfixed * reshape(Xfixed_beta, M.Xfixed_N, K)"
             """
-            Xfixed_beta ~ NamedDist(MvNormal(zeros($(beta_count)), 5.0 * I), :Xfixed_beta)
-            $(update)
+            begin
+                # Sample each coefficient individually to allow for custom priors,
+                # then flatten into a single vector consistent with reconstruction logic.
+                local Xfixed_beta_flat = Vector{T}(undef, M.Xfixed_N * K)
+                local priors = get(M, :Xfixed_priors_vec, [Normal(0, 5) for _ in 1:M.Xfixed_N])
+                
+                for k in 1:K
+                    for i in 1:M.Xfixed_N
+                        local flat_idx = (k - 1) * M.Xfixed_N + i
+                        # The prior for coefficient `i` is shared across all outcomes `k`.
+                        Xfixed_beta_flat[flat_idx] ~ NamedDist(priors[i], Symbol("Xfixed_beta[", flat_idx, "]"))
+                    end
+                end
+
+                eta_latent .+= M.Xfixed * reshape(Xfixed_beta_flat, M.Xfixed_N, K)
+            end
             """
         else
             """
@@ -2158,6 +2520,8 @@ function get_model_family(model_family::String)
 end
 
 function get_dist_ref(::PoissonFamily, d, eta, sig); return Poisson(clamp(exp(eta), 1e-9, 1e9)); end
+function get_dist_ref(::DirichletFamily, d, eta, sig); error("The Dirichlet likelihood is for compositional outcomes and is not supported in the current univariate response framework."); end
+function get_dist_ref(::InverseWishartFamily, d, eta, sig); error("The Inverse-Wishart likelihood is for covariance matrix outcomes and is not supported in the current univariate response framework."); end
 function get_dist_ref(::GaussianFamily, d, eta, sig); return Normal(eta, max(sig, 1e-9)); end
 function get_dist_ref(::LogNormalFamily, d, eta, sig); return LogNormal(eta, max(sig, 1e-9)); end
 function get_dist_ref(::NegativeBinomialFamily, d, eta, sig); mu = clamp(exp(eta), 1e-9, 1e9); return NegativeBinomial(d.r_nb, d.r_nb/(d.r_nb + mu)); end

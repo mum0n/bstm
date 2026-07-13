@@ -581,70 +581,72 @@ end
 
 function extract_manifold(m_obj::Eigen, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     # Purpose: Reconstructs the effect of the Eigen (Bayesian PCA) manifold.
-    # Rationale: The model samples latent factors and their regression coefficients directly.
-    #            This function extracts these posterior samples and computes the total contribution
-    #            (factors * beta) to the linear predictor.
+    # Rationale: This function reconstructs the principal component effects from the
+    #            posterior samples of the Householder parameterization.
     # Inputs: Standard `extract_manifold` arguments.
     # Outputs: A NamedTuple with the reconstructed effect of all principal components.
     structured_effects = Vector{Matrix{Float64}}()
-    
-    # The latent factors are global, so we extract them once.
+    key = string(spec.key)
     domain = string(spec.domain)
     var = string(spec.var)
-    factors_name = _find_parameter_new(p_names, domain, var, "factors", nothing)
     
-    if isempty(factors_name)
-        @warn "Latent factors for Eigen manifold $(spec.key) not found. Returning zero-matrices for all outcomes."
-        for k in 1:outcomes_N
-            push!(structured_effects, zeros(Float64, N_tot, n_samples))
-        end
+    # Extract parameters from the chain
+    v_raw_name = _find_parameter_new(p_names, domain, var, "v_raw", nothing)
+    d_raw_name = _find_parameter_new(p_names, domain, var, "d_raw", nothing)
+    pca_sds_name = _find_parameter_new(p_names, domain, var, "pca_sds", nothing)
+    pdef_sds_name = _find_parameter_new(p_names, domain, var, "pdef_sds", nothing)
+    factors_name = _find_parameter_new(p_names, domain, var, "factors", nothing)
+
+    if isempty(v_raw_name) || isempty(d_raw_name) || isempty(pca_sds_name) || isempty(pdef_sds_name) || isempty(factors_name)
+        @warn "Parameters for Eigen manifold $(key) not found. Returning zero-matrix."
+        push!(structured_effects, zeros(Float64, N_tot, n_samples))
         return (structured=structured_effects, noisy=structured_effects)
     end
 
+    n_vars = m_obj.n_vars
     n_factors = m_obj.n_factors
+    ltri_indices = m_obj.ltri_indices
+
+    v_raw_samples = get_params_vector(chain, v_raw_name, length(ltri_indices))
+    d_raw_samples = get_params_vector(chain, d_raw_name, n_factors)
+    pca_sds_samples = get_params_vector(chain, pca_sds_name, n_factors)
+    pdef_sds_samples = get_params_vector(chain, pdef_sds_name, n_factors)
     factors_samples = get_params_vector(chain, factors_name, M.y_N * n_factors)
 
+    total_effect = zeros(Float64, M.y_N, n_samples)
+
+    for j in 1:n_samples
+        # Reconstruct U (eigenvectors) from Householder reflectors
+        v_mat_j = zeros(n_vars, n_factors)
+        v_mat_j[ltri_indices] .= v_raw_samples[j, :]
+        U_j = householder_to_eigenvector(v_mat_j, n_vars, n_factors)
+
+        # Reconstruct D (eigenvalues)
+        d_trans_j = exp.(d_raw_samples[j, :] .* pdef_sds_samples[j, :])
+        D_mat_j = Diagonal(d_trans_j)
+
+        # Reconstruct loadings matrix L
+        L_j = U_j * D_mat_j
+
+        # Reconstruct factors matrix F
+        F_matrix_j = reshape(factors_samples[j, :], M.y_N, n_factors)
+
+        # Calculate the final eigen effects
+        eigen_effects_j = (F_matrix_j * L_j') .* pca_sds_samples[j, :]'
+        
+        # Sum effects across components
+        total_effect[:, j] = sum(eigen_effects_j, dims=2)
+    end
+
+    if N_tot > M.y_N
+        @warn "Prediction for Eigen manifold is not fully implemented and will be zero for out-of-sample points."
+        total_effect = vcat(total_effect, zeros(Float64, N_tot - M.y_N, n_samples))
+    end
+
+    # The Eigen effect is univariate; it applies the same effect to all outcomes.
+    # We replicate the single reconstructed effect for each outcome.
     for k in 1:outcomes_N
-        # Regression coefficients are per-outcome.
-        beta_name = _find_parameter_new(p_names, domain, var, "beta", k)
-        
-        if isempty(beta_name)
-            @warn "Beta coefficients for Eigen manifold $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_tot, n_samples))
-            continue
-        end
-
-        beta_samples = get_params_vector(chain, beta_name, n_factors)
-        
-        effect_k = zeros(Float64, M.y_N, n_samples)
-        for j in 1:n_samples
-            factors_matrix_j = reshape(factors_samples[j, :], M.y_N, n_factors)
-            beta_j = beta_samples[j, :]
-            effect_k[:, j] = factors_matrix_j * beta_j
-        end
-
-        if !isnothing(PS)
-            # Approximate factor scores for new data via nearest neighbor in covariate space
-            X_train = M.Xfixed
-            X_pred = get(PS, :Xfixed, nothing)
-            if !isnothing(X_pred) && size(X_pred, 2) == size(X_train, 2)
-                kdtree = KDTree(X_train')
-                idxs, _ = knn(kdtree, X_pred', 1)
-                
-                pred_effect = zeros(PS.y_N, n_samples)
-                for j in 1:n_samples
-                    factors_matrix_j = reshape(factors_samples[j, :], M.y_N, n_factors)
-                    beta_j = beta_samples[j, :]
-                    pred_factors_j = factors_matrix_j[[i[1] for i in idxs], :]
-                    pred_effect[:, j] = pred_factors_j * beta_j
-                end
-                effect_k = vcat(effect_k, pred_effect)
-            else
-                effect_k = vcat(effect_k, zeros(Float64, PS.y_N, n_samples))
-            end
-        end
-
-        push!(structured_effects, effect_k)
+        push!(structured_effects, total_effect)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
@@ -733,70 +735,59 @@ function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes
         # of the dynamic manifold are themselves structured by the state manifold.
         if length(m_obj.components) != 2; error("Pipe operator reconstruction requires exactly two components: state |> dynamic."); end
 
-        state_manifold_obj = m_obj.components[1]
-        dynamic_manifold_obj = m_obj.components[2]
+        state_manifold_obj = m_obj.components[1] 
+        dynamic_manifold_obj = get(spec.params, :dynamic_manifold_obj, nothing)
 
-        # Reconstruct the dynamic part to get the basis matrix
-        dynamic_spec = _find_spec_by_obj(dynamic_manifold_obj, M.manifolds)
-        if isnothing(dynamic_spec) || !haskey(M.basis_matrices, Symbol(dynamic_spec.var))
+        if isnothing(dynamic_manifold_obj)
+            @warn "Could not resolve dynamic manifold for piped manifold '$(key)'. Skipping."
+            return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
+        end
+
+        basis_key = get(spec.params, :dynamic_basis_key, nothing)
+        if isnothing(basis_key) || !haskey(M.basis_matrices, basis_key)
             @warn "Could not find basis matrix for dynamic component of piped manifold '$(key)'. Skipping."
             return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
         end
-        B_dynamic_train = M.basis_matrices[Symbol(dynamic_spec.var)]
-        B_dynamic_full = if !isnothing(PS) && haskey(PS, :basis_matrices) && haskey(PS.basis_matrices, Symbol(dynamic_spec.var))
-            vcat(B_dynamic_train, PS.basis_matrices[Symbol(dynamic_spec.var)])
+
+        B_dynamic_train = M.basis_matrices[basis_key]
+        B_dynamic_full = if !isnothing(PS) && haskey(PS, :basis_matrices) && haskey(PS.basis_matrices, basis_key)
+            vcat(B_dynamic_train, PS.basis_matrices[basis_key])
         else
             B_dynamic_train
         end
         n_basis = size(B_dynamic_full, 2)
-
-        # Reconstruct the state part, which models the coefficients
-        state_spec = _find_spec_by_obj(state_manifold_obj, M.manifolds)
-        if isnothing(state_spec); @warn "Could not find state component of piped manifold '$(key)'. Skipping."; return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]); end
+        n_spatial = M.s_N
 
         all_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
 
         for k in 1:outcomes_N
-            # Assumes the assembler created one large parameter vector for all coefficients
-            coeffs_name = _find_parameter_new(p_names, "interact", key, "coeffs", k)
-            n_state_units = if state_spec.domain == :spatial; M.s_N; elseif state_spec.domain == :temporal; M.t_N; else 1; end
-            
-            if isempty(coeffs_name); @warn "Coefficients for piped manifold '$(key)' (outcome $k) not found."; continue; end
+            sigma_name = _find_parameter_new(p_names, "interact", key, "sigma", k)
+            rho_name = _find_parameter_new(p_names, "interact", key, "rho", k)
+            coeffs_raw_name = _find_parameter_new(p_names, "interact", key, "coeffs_raw", k)
 
-            coeffs_flat = get_params_vector(chain, coeffs_name, n_state_units * n_basis)
+            if isempty(sigma_name) || isempty(coeffs_raw_name); continue; end
+
+            sigma_samples = get_params_vector(chain, sigma_name, 1)
+            rho_samples = hasproperty(state_manifold_obj, :rho_prior) ? get_params_vector(chain, rho_name, 1) : nothing
+            coeffs_raw_samples = get_params_vector(chain, coeffs_raw_name, n_spatial * n_basis)
+
+            Q_spatial_template = spec.hyper.state_spec.Q_template
+            state_m_type = spec.hyper.state_spec.model_type
             s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
 
             for j in 1:n_samples
-                coeffs_reshaped = reshape(coeffs_flat[j, :], n_state_units, n_basis)
-                for i in 1:N_tot
-                    s_i = s_idx_full[i]
-                    basis_row_i = B_dynamic_full[i, :]
-                    coeffs_row_i = coeffs_reshaped[s_i, :]
-                    all_effects[k][i, j] = dot(basis_row_i, coeffs_row_i)
-                end
+                rho_val = isnothing(rho_samples) ? nothing : rho_samples[j, 1]
+                Q_spatial = recompose_precision(state_m_type, Q_spatial_template, 1.0; extra_param=rho_val)
+                F_spatial = cholesky(Symmetric(Q_spatial + 1e-6 * I))
+
+                coeffs_raw_matrix = reshape(coeffs_raw_samples[j, :], n_spatial, n_basis)
+                spatial_coeffs = sigma_samples[j, 1] .* (F_spatial.U \\ coeffs_raw_matrix)
+
+                all_effects[k][:, j] = sum(B_dynamic_full .* spatial_coeffs[s_idx_full, :], dims=2)
             end
         end
         return (structured=all_effects, noisy=all_effects)
 
-    elseif op == :direct_sum
-        structured_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
-        noisy_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
-
-        for component_obj in m_obj.components
-            comp_spec = _find_spec_by_obj(component_obj, M.manifolds)
-            if isnothing(comp_spec)
-                @warn "Could not find specification for a component of direct sum '$(key)'. Skipping this component."
-                continue
-            end
-            
-            comp_effects = extract_manifold(comp_spec.manifold_obj, chain, M, n_samples, outcomes_N, p_names, comp_spec, PS, N_tot)
-            
-            for k in 1:outcomes_N
-                structured_effects[k] .+= comp_effects.structured[k]
-                noisy_effects[k] .+= hasproperty(comp_effects, :noisy) ? comp_effects.noisy[k] : comp_effects.structured[k]
-            end
-        end
-        return (structured=structured_effects, noisy=noisy_effects)
     else
         @warn "Reconstruction for ComposedManifold with operator ':$op' is not implemented. Returning zero-effect for '$(key)'."
         return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
