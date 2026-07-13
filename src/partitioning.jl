@@ -1676,6 +1676,54 @@ end
 
 
 
+function discretize_data(X; method="quantile", N_cat=9, brks=nothing, probs=nothing, dx=nothing, minv = 0, maxv=1)
+    # v1.2.0 (2026-06-29 16:13:05)
+    # Purpose: Discretizes a continuous vector into categories. 
+    # Inputs: X (vector), method, N_cat, and other optional parameters.
+    # Outputs: A NamedTuple with indices, breaks, and midpoints.
+    
+    if method=="quantile" 
+        probs = isnothing(probs) ? collect(range(0.0, stop=1.0, length=N_cat + 1)) : probs
+        brks = isnothing(brks) ? quantile(X, probs) : brks
+        mids = brks[1:N_cat] + diff(brks) 
+        idx = map(x -> clamp(searchsortedfirst(brks, x) - 1, 1, N_cat), X)
+        return ( idx=idx, brks=brks, mids=mids, probs )
+
+    elseif method == "regular"
+        dx = isnothing(dx) ? (maxv - minv) / N_cat : dx
+        probs = nothing
+        brks = collect(minv:dx:maxv)
+        mids = brks[1:N_cat] + diff(brks) 
+        idx = map(x -> clamp(searchsortedfirst(brks, x) - 1, 1, N_cat), X)
+        return ( idx=idx, brks=brks, mids=mids, probs, dx=dx )
+    
+    elseif method=="regular_resolution"    
+
+        xd = round.(Int, X ./ dx ) .* dx
+        brks = collect( minimum(xd):dx:maximum(xd) + dx  ) 
+        mids = midpoints(brks)
+        N_cats = length(mids)
+        
+        xd_cut = cut(X, brks, extend=true)
+        xi = levelcode.(xd_cut)
+        return xd, xi, mids, N_cats, dx
+
+    elseif method=="quantile_resolution"
+    
+        brks = quantile(X, range(0, 1, length=N_cats+1))
+        mids = midpoints(brks)
+        xd_cut = cut(X, brks, extend=true)  # from CategoricalArrays
+        xi = levelcode.(xd_cut)
+        dx = diff(mids)[1]
+        xd = mids[xi] 
+        return xd, xi, mids, N_cats, dx
+
+    end
+
+end
+
+
+
 
 
 function estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx, target_ts; grid_res=600, sd_extension_factor=0.25)

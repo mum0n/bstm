@@ -23,7 +23,7 @@ print( "Current directory is: ", current_directory, "\n\n" )
 
 pkgs_bstm = [
   "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", "SpecialFunctions", "DimensionalData",
-  "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation", "OrderedCollections",  
+  "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation", "OrderedCollections", "NearestNeighbors",  
   "Distributions", "Statistics",  "DataFrames",  "GLM", "FlexiChains", "AbstractPPL",
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs", 
@@ -92,6 +92,7 @@ using LogExpFunctions: logistic, logsumexp, log1mexp
 
 # Extend base names check for ADVI pseudo-chain
 using Turing: Variational
+using Turing.Inference
 
 # MCMCChains.names(chain::NamedTuple) = collect(keys(chain.data))  # USED? 
 

@@ -542,19 +542,16 @@ The `eigen()` module uses a Householder transformation to construct the orthonor
 
 ### 8.9. Spacetime Interaction Manifolds
 
-Spatiotemporal interactions are specified using the Kronecker product operator (`⊗`). The `bstm` framework supports the four canonical interaction types defined by Knorr-Held (2000).
+Spatiotemporal interactions are specified using either the Kronecker product operator (`⊗`) or the `spacetime()` module. The `bstm` framework supports the four canonical interaction types defined by Knorr-Held (2000), which are automatically inferred based on the structure of the component models.
 
-| Manifold | Formula Syntax | Description |
-|:---|:---|:---|
-| **Type I** | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=iid)` | Unstructured (IID) interaction over space and time. |
-| **Type II** | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=ar1)` | Spatially unstructured, temporally structured. |
-| **Type III** | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=iid)` | Spatially structured, temporally unstructured. |
-| **Type IV** | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1)` | Fully structured in both space and time (Kronecker product). |
+| Type         | Description                                    | `spacetime()` Syntax                  | `⊗` Operator Syntax                                |
+| :-------------| :-----------------------------------------------| :--------------------------------------| :---------------------------------------------------|
+| **Type I**   | Unstructured (IID) in both space and time.     | `spacetime(s, t, model=(iid, iid))`   | `spatial(s, model=iid) ⊗ temporal(t, model=iid)`   |
+| **Type II**  | Spatially unstructured, temporally structured. | `spacetime(s, t, model=(iid, ar1))`   | `spatial(s, model=iid) ⊗ temporal(t, model=ar1)`   |
+| **Type III** | Spatially structured, temporally unstructured. | `spacetime(s, t, model=(besag, iid))` | `spatial(s, model=besag) ⊗ temporal(t, model=iid)` |
+| **Type IV**  | Fully structured in both space and time.       | `spacetime(s, t, model=(besag, ar1))` | `spatial(s, model=besag) ⊗ temporal(t, model=ar1)` |
 
-As a convenient shorthand for the common Type IV interaction, the `spacetime()` module can be used. The following two specifications are equivalent:
-
-`... + spatial(s, model=besag) ⊗ temporal(t, model=ar1)`
-`... + spacetime(s, t, model=(besag, ar1))`
+The `spacetime()` module serves as a convenient shorthand. The framework determines the interaction type by checking if the provided spatial and temporal models are structured (e.g., `besag`, `ar1`) or unstructured (`iid`).
 
 ### 8.10. `fixed()` and `intercept()` Modules
 
@@ -562,11 +559,11 @@ These modules provide explicit control over standard regression components.
 
 #### `fixed()` Module Reference
 
-| Keyword / Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
-|:---|:---|:---|:---|:---|
-| `fixed()` | `fixed(Region, ...)` | Module | N/A | Explicitly marks a variable as a fixed effect. Primarily used to specify contrasts or priors. |
-| `contrast` | `contrast=:effects` | `Symbol` | `DummyCoding` | Specifies the contrast coding for a categorical variable (e.g., `:effects`, `:helmert`). |
-| `prior` | `prior=Normal(0, 2)` | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the coefficient(s) of this fixed effect. Can be a `Distribution` or a PC prior tuple. |
+| Keyword / Parameter | Example Usage        | Data Type                 | Default        | Meaning & Assumptions                                                                                    |
+| :--------------------| :---------------------| :--------------------------| :---------------| :---------------------------------------------------------------------------------------------------------|
+| `fixed()`           | `fixed(Region, ...)` | Module                    | N/A            | Explicitly marks a variable as a fixed effect. Primarily used to specify contrasts or priors.            |
+| `contrast`          | `contrast=:effects`  | `Symbol`                  | `DummyCoding`  | Specifies the contrast coding for a categorical variable (e.g., `:effects`, `:helmert`).                 |
+| `prior`             | `prior=Normal(0, 2)` | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the coefficient(s) of this fixed effect. Can be a `Distribution` or a PC prior tuple. |
 
 #### `intercept()` Module Reference
 

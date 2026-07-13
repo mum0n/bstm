@@ -104,19 +104,18 @@ The formula parser translates the user-provided formula string into a structured
     *   **LHS**: Parsed to identify outcome variables and their likelihood specifications (e.g., `likelihood(y, family=poisson)`).
     *   **RHS**: Pre-processed to handle intercept control (`-1`, `0`, `intercept(false)`) and to normalize all bare terms (e.g., `z`) into explicit `fixed(z)` module calls. It is then parsed by `_parse_rhs_expression` into an Abstract Syntax Tree (AST).
     *   **Output**: Returns a `NamedTuple` containing `:outcomes`, `:modules` (a dictionary of all parsed RHS terms), `:has_intercept`, and `:intercept_prior`. The concept of a separate `fixed_effects` list is removed from this stage.
+    *   **Output**: Returns a `NamedTuple` containing `:outcomes`, `:modules` (a dictionary of all parsed RHS terms), `:fixed_effects` (a list of bare variable names), `:has_intercept`, and `:intercept_prior`.
 
 *   **`_parse_rhs_expression(term_str)`**: A recursive descent parser that respects operator precedence to build the AST for the RHS. The precedence is:
     1.  `+` (Addition of independent effects)
-    2.  `-` (Subtraction of terms, internally converted to `+ -term`)
-    2.  `⊕` (Direct Sum)
-    3.  `|>` (Pipe for SVC/state-space)
+    2.  `|>` (Pipe for SVC/state-space)
     4.  `⊗` (Kronecker Product)
     5.  `∘` (Composition)
 
 *   **`_categorize_rhs_nodes!(nodes, modules, fixed_effects)`**: Traverses the generated AST to populate the `modules` dictionary and the `fixed_effects` list. It correctly identifies composed manifolds (e.g., `spatial() ⊗ temporal()`) as a single interaction module.
 
-*   **`_parse_single_manifold_term` & `_parse_arguments_string`**: Helper functions that parse individual module calls (e.g., `spatial(s_idx, model=:bym2)`) into a dictionary of variables and parameters. These functions now correctly handle Julia `Symbol` literals (e.g., `:besag`) passed as arguments.
 
+*   **`_parse_single_manifold_term` & `_parse_arguments_string`**: Helper functions that parse individual module calls (e.g., `spatial(s_idx, model=:bym2)`) into a dictionary of variables and parameters. These functions correctly handle Julia `Symbol` literals (e.g., `:besag`) passed as arguments.
 ## 4. Model Configuration Engine (`modelling.jl`)
 
 The `bstm_config` function is the main engine that transforms the parsed formula and data into a complete configuration object (`M`) for the Turing models.
@@ -129,10 +128,9 @@ The `bstm_config` function is the main engine that transforms the parsed formula
     *   **Processor Dispatch**: Calls the appropriate function from the `MODULE_PROCESSORS` dictionary (e.g., `process_spatial_module!`). These functions handle data-dependent setup, such as creating spatial indices or basis matrices.
 	    *   **Primitive Resolution (for non-processor-only modules)**: `resolve_technical_primitive` is called to convert the parsed module data (a `Dict`) into a concrete `Manifold` struct instance (e.g., `BYM2(...)`). This step also resolves hyperpriors using `resolve_hyperpriors`. These processors can also evaluate complex arguments passed in the formula (e.g., `W=my_matrix`) by using the `calling_module` context stored in the configuration object `M`.
 	    *   **Template Building (for non-processor-only modules)**: `build_model` is called on the `Manifold` object. This function is a factory that generates the technical specifications needed for the model, most importantly the precision matrix template (`Q_template`).
-	    *   **Registration (for non-processor-only modules)**: The complete manifold specification (including the `Manifold` object and its `Q_template`) is added to `M[:manifolds]`.
+	    *   **Registration (for non-processor-only modules)**: The complete manifold specification (including the `Manifold` object and its `Q_template`) is added to `M[:manifolds]`. The `process_interact_module!` for `⊗` also sets the global `M[:model_st]` parameter to ensure the interaction is included in the model.
 	*   **Fixed Effects Processing**:
-	    *   `_process_fixed_effects!`: Consolidates fixed effect variables from both bare terms (parsed directly from the formula) and explicit `fixed()` module calls. It then creates the design matrix `Xfixed` via `create_fixed_design`.
-	    *   `_process_fixed_effects_priors!`: Constructs the prior for the fixed effect coefficients, incorporating any custom priors specified in `fixed()` or `intercept()` modules.
+	    *   `_process_fixed_effects!`: Consolidates fixed effect variables from both bare terms (parsed directly from the formula) and explicit `fixed()` module calls. It then create io es
 	*   **Intercept Resolution**: The final decision on whether to include an intercept (`M[:add_intercept]`) is prioritized from the `intercept()` module. If no `intercept()` module is present, it defaults to the legacy numeric flags (`1`, `0`, `-1`) parsed from the formula string.
 5.  **Finalization**: `_finalize_config!` ensures all necessary keys exist in `M`, providing defaults where needed.
 
@@ -186,9 +184,9 @@ The reconstruction engine is responsible for post-processing the MCMC `chain` to
 *   **`_discover_manifold_realizations(...)`**: This is the core discovery function.
     *   It initializes containers for all possible latent effects (spatial, temporal, etc.).
     *   It iterates through the `M[:manifolds]` specification. For each manifold, it calls `extract_manifold`.
-    *   **`extract_manifold(m_obj, ...)`**: This function dispatches on the `Manifold` type (`m_obj`). Each method knows how to find its parameters in the chain and reconstruct its specific effect. For example, `extract_manifold(m_obj::BYM2, ...)` finds the `sigma`, `rho`, `latent_struct`, and `latent_iid` samples and combines them to produce the structured, unstructured, and total spatial fields.
-    *   **`_find_parameter` & `get_params_vector`**: These are the workhorse utilities for robustly extracting parameter samples from the MCMC chain, handling Turing's naming conventions and ensuring correct numerical ordering of indexed parameters.
-    *   **Output**: Returns a `registry` `NamedTuple` containing the posterior samples for every latent field discovered in the model.
+    *   **`extract_manifold(m_obj, ...)`**: This function dispatches on the `Manifold` type (`m_obj`). Each method knows how to find its parameters in the chain and reconstruct its specific effect.
+        *   For simple manifolds like `BYM2`, it finds `sigma`, `rho`, `latent_struct`, and `latent_iid` samples and combines them to produce the structured, unstructured, and total spatial fields.
+        *   For `ComposedManifold` with a `kronecker_product` operator, it reconstructsrisn numerical ordO
 
 *   **`_modular_eta_assembly(...)`**: Takes the `registry` of discovered fields and reassembles the full linear predictor `eta` for each posterior sample. This process mirrors the assembly logic within the Turing model itself but operates on the posterior samples. It correctly handles both in-sample (`M`) and out-of-sample (`PS`) data.
 
@@ -312,6 +310,31 @@ This section provides a quick reference to the main modules available in the `bs
 | :--------------------| :-----------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
 | `intercept()`       | `intercept(prior=...)` | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
 | `prior`             | `prior=Normal(0, 10)`  | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
+
+
+#### Interaction Effects
+
+Interaction effects between fixed covariates are specified using the standard `*` and `&` operators from `StatsModels.jl`. The `bstm` framework also supports the `:` operator as a synonym for `&`. These operators can be used both as bare terms in the formula and within the `fixed()` module.
+
+*   `cov1 * cov2`: Expands to `cov1 + cov2 + cov1 & cov2` (main effects and interaction).
+*   `cov1 & cov2`: Includes only the interaction term.
+*   `cov1 : cov2`: Equivalent to `cov1 & cov2`.
+
+**Example:**
+
+```julia
+# These three formulas are equivalent and include main effects and the interaction.
+m1 = @bstm(likelihood(y) ~ 1 + cov1 * cov2, data)
+m2 = @bstm(likelihood(y) ~ 1 + fixed(cov1 * cov2), data)
+m3 = @bstm(likelihood(y) ~ 1 + fixed(cov1) + fixed(cov2) + fixed(cov1 & cov2), data)
+
+# These formulas include only the interaction term.
+m4 = @bstm(likelihood(y) ~ 1 + cov1 & cov2, data)
+m5 = @bstm(likelihood(y) ~ 1 + cov1 : cov2, data)
+```
+
+**Note on Priors:** Applying a custom prior to an interaction term (e.g., `fixed(cov1 * cov2, prior=...)`) is not directly supported, as the prior would be ambiguous across the expanded main and interaction effects. To assign a specific prior to an interaction, you must first manually create the interaction term as a new column in your `DataFrame` and then apply the `fixed()` module with a `prior` to that new column.
+
 
 ## 9. Detailed Modeling Examples
 
