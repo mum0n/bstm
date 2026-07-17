@@ -103,8 +103,8 @@ The formula parser translates the user-provided formula string into a structured
 *   **`decompose_bstm_formula(formula_str)`**: This is the main entry point. It splits the formula into its Left-Hand Side (LHS) and Right-Hand Side (RHS).
     *   **LHS**: Parsed to identify outcome variables and their likelihood specifications (e.g., `likelihood(y, family=poisson)`).
     *   **RHS**: Pre-processed to handle intercept control (`-1`, `0`, `intercept(false)`) and to normalize all bare terms (e.g., `z`) into explicit `fixed(z)` module calls. It is then parsed by `_parse_rhs_expression` into an Abstract Syntax Tree (AST).
-    *   **Output**: Returns a `NamedTuple` containing `:outcomes`, `:modules` (a dictionary of all parsed RHS terms), `:has_intercept`, and `:intercept_prior`. The concept of a separate `fixed_effects` list is removed from this stage.
-    *   **Output**: Returns a `NamedTuple` containing `:outcomes`, `:modules` (a dictionary of all parsed RHS terms), `:fixed_effects` (a list of bare variable names), `:has_intercept`, and `:intercept_prior`.
+    *   v1.2.1 (2026-07-16)
+    *   **Output**: Returns a `NamedTuple` containing `:outcomes`, `:modules` (a dictionary of all parsed RHS terms), `:fixed_effects` (a list of bare variable names parsed from the RHS), `:has_intercept`, and `:intercept_prior`.
 
 *   **`_parse_rhs_expression(term_str)`**: A recursive descent parser that respects operator precedence to build the AST for the RHS. The precedence is:
     The parser is called on sub-expressions after the formula has been split by the `+` operator (which has the lowest precedence). The parser then handles operators in the following order of precedence (from highest to lowest):
@@ -117,6 +117,7 @@ The formula parser translates the user-provided formula string into a structured
 
 *   **`_parse_single_manifold_term` & `_parse_arguments_string`**: Helper functions that parse individual module calls (e.g., `spatial(s_idx, model=:bym2)`) into a dictionary of variables and parameters. These functions correctly handle Julia `Symbol` literals (e.g., `:besag`) passed as arguments.
 ## 4. Model Configuration Engine (`modelling.jl`)
+
 
 The `bstm_config` function is the main engine that transforms the parsed formula and data into a complete configuration object (`M`) for the Turing models.
 
@@ -136,6 +137,7 @@ The `bstm_config` function is the main engine that transforms the parsed formula
 
 ### 4.2. Key Configuration Helpers
 
+v1.2.1 (2026-07-16)
 *   **`resolve_hyperpriors(...)`**: Implements the three-level precedence for prior specification:
     1.  **Local**: A prior specified directly in a module call (e.g., `sigma_prior=...`).
     2.  **Global**: A prior specified in the `hyperpriors` dictionary passed to `bstm_config`.
@@ -150,6 +152,7 @@ The `bstm` framework uses a set of core Turing `@model` definitions that are dyn
 
 ### 5.1. `bstm_univariate(M, ::Type{T})`
 
+v1.2.1 (2026-07-16)
 This is the model for single-outcome processes.
 
 *   **Structure**:
@@ -167,6 +170,7 @@ This is the model for single-outcome processes.
 
 ### 5.2. `bstm_multivariate(M, ::Type{T})`
 
+v1.2.1 (2026-07-16)
 This model handles multiple, correlated outcomes.
 
 *   **Key Differences**:
@@ -181,12 +185,14 @@ The reconstruction engine is responsible for post-processing the MCMC `chain` to
 
 *   **`_reconstruct(arch, ...)`**: The main entry point, which dispatches on the model architecture (`UnivariateArchitecture`, `MultivariateArchitecture`, etc.). It orchestrates the discovery and assembly of posterior effects.
 
+v1.2.1 (2026-07-16)
 *   **`_discover_manifold_realizations(...)`**: This is the core discovery function.
     *   It initializes containers for all possible latent effects (spatial, temporal, etc.).
     *   It iterates through the `M[:manifolds]` specification. For each manifold, it calls `extract_manifold`.
     *   **`extract_manifold(m_obj, ...)`**: This function dispatches on the `Manifold` type (`m_obj`). Each method knows how to find its parameters in the chain and reconstruct its specific effect.
+        v1.2.1 (2026-07-16)
         *   For simple manifolds like `BYM2`, it finds `sigma`, `rho`, `latent_struct`, and `latent_iid` samples and combines them to produce the structured, unstructured, and total spatial fields.
-        *   For `ComposedManifold` with a `kronecker_product` operator, it reconstructsrisn numerical ordO
+        *   For a `ComposedManifold` with a `kronecker_product` operator, it reconstructs the interaction field by finding the corresponding latent field and hyperparameters in the chain and applying the correct scaling and reshaping.
 
 *   **`_modular_eta_assembly(...)`**: Takes the `registry` of discovered fields and reassembles the full linear predictor `eta` for each posterior sample. This process mirrors the assembly logic within the Turing model itself but operates on the posterior samples. It correctly handles both in-sample (`M`) and out-of-sample (`PS`) data.
 
@@ -199,12 +205,14 @@ The reconstruction engine is responsible for post-processing the MCMC `chain` to
 
 *   **`assign_spatial_units(...)`**: Discretizes continuous spatial coordinates into areal units using various methods (`:cvt`, `:kvt`, `:bvt`, `:avt`, `:qvt`, `:hvt`, `:lattice`). It returns an object containing the adjacency matrix `W`, assignments, and centroids.
 
+v1.2.1 (2026-07-16)
 *   **`create_fixed_design(...)`**: A wrapper around `StatsModels.jl` that takes a formula string and a `DataFrame` and returns the corresponding design matrix `Xfixed`, correctly handling contrasts and factor variables.
 
 *   **`get_optimal_sampler(...)`**: A utility that inspects the model's parameters and their prior distributions to construct an efficient composite `Gibbs` sampler. It assigns specialized samplers (`ESS`, `Slice`, `PG`) to different parameter blocks to improve MCMC efficiency.
     *   **Purpose**: To automatically construct an efficient composite Gibbs sampler tailored to the `bstm` model structure.
     *   **Rationale**: Different MCMC algorithms exhibit varying performance depending on the characteristics of the target distribution. A composite `Gibbs` sampler, which applies different samplers to different blocks of parameters, can significantly outperform a single, general-purpose sampler. This function automates the construction of such a sampler.
     *   **Workflow**:
+        v1.2.1 (2026-07-16)
         1.  **Manual Override**: The function first checks if a specific sampler has been provided via the `sampler_choice` argument or if a `sampler_map` dictionary has been passed to assign specific samplers to certain parameters. These manual assignments take the highest precedence.
         2.  **Manifold Grouping**: If `group_manifolds=true` (the default), the function identifies all parameters that belong to the same manifold instance (e.g., `spatial_main_sigma`, `spatial_main_rho`, and `spatial_main_latent`). It groups these parameters into a single block and assigns a `NUTS` sampler to them. This is a critical step for efficiency, as it allows the sampler to jointly explore the highly correlated posterior geometry of a latent field and its hyperparameters, reducing the "funnel" problems common in hierarchical models.
         3.  **Default Parameter Categorization**: For all remaining parameters that were not part of a manifold group or manual assignment, the function categorizes them based on their prior distributions:
@@ -219,10 +227,13 @@ The reconstruction engine is responsible for post-processing the MCMC `chain` to
             *   `NUTS` is assigned to all remaining `:other_continuous` parameters.
         5.  **Composite Sampler Construction**: Finally, it combines all the individually assigned samplers (from the manual map, manifold groups, and default categories) into a single `Gibbs(...)` sampler object, which is then returned.
 
+v1.2.1 (2026-07-16)
 *   **`get_inits(...)`**: Generates initial values for MCMC sampling. It can use a heuristic based on prior samples or run a fast MAP optimization to find a high-density starting point.
 
+v1.2.1 (2026-07-16)
 *   **`predict(...)`**: The main function for out-of-sample prediction. It creates a prediction-set configuration object (`PS`) by inheriting the structure of the training model (`M`) and updating it with the new data. It then calls `_reconstruct` to generate predictions on the new grid.
 
+v1.2.1 (2026-07-16)
 *   **`bstm_loo(...)` & `compare_manifolds(...)`**: Wrappers around `PosteriorStats.jl` for performing Leave-One-Out Cross-Validation and formal model comparison based on the ELPD metric.
 
 ## 8. API Reference: `bstm` Formula Modules
@@ -265,7 +276,7 @@ This section provides a quick reference to the main modules available in the `bs
 | **Cyclic** | `'cyclic'` | `sigma_prior`, `period` | `Exponential(1.0)` | Modeling smooth, periodic effects like day-of-week or month-of-year. |
 | **Harmonic** | `'harmonic'` | `amplitude_prior`, `phase_prior`, `period` | `amplitude`: `Normal(0,1)`, `phase`: `Beta(1,1)` | Capturing sharp, regular periodic patterns with sine and cosine waves. |
 
-### 8.4. `smooth()` Module
+### 8.4. `smooth()` Module (Covariate Smoothers)
 
 | Manifold / Method | `model='...'` | Key Parameters | Default Priors | Use Case & Utility |
 |:---|:---|:---|:---|:---|
@@ -323,9 +334,9 @@ This section provides a quick reference to the main modules available in the `bs
 #### `intercept()` Module Reference
 
 | Keyword / Parameter | Example Usage          | Data Type                 | Default        | Meaning & Assumptions                                                                                                                |
-| :--------------------| :-----------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
-| `intercept()`       | `intercept(prior=...)` | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
-| `prior`             | `prior=Normal(0, 10)`  | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
+| :--------------------| :-------------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
+| `intercept()`       | `intercept(prior=...)`   | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
+| `prior`             | `prior=Normal(0, 10)`   | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
 
 
 #### Interaction Effects

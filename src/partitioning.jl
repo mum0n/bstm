@@ -1936,3 +1936,5 @@ function libgeos_lattice_adjacency_matrix(rows::Int, cols::Int)
     end
     return W
 end
+
+

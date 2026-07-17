@@ -578,10 +578,10 @@ Spatiotemporal interactions are specified using the Kronecker product operator (
 
 | Manifold | Formula Syntax | Description |
 |:---|:---|:---|
-| **Type I** | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=iid)` | Unstructured (IID) interaction over space and time. |
-| **Type II** | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=ar1)` | Spatially unstructured, temporally structured. |
+| **Type I**   | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=iid)`   | Unstructured (IID) interaction over space and time.     |
+| **Type II**  | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=ar1)`   | Spatially unstructured, temporally structured. |
 | **Type III** | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=iid)` | Spatially structured, temporally unstructured. |
-| **Type IV** | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1)` | Fully structured in both space and time (Kronecker product). |
+| **Type IV**  | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1)` | Fully structured in both space and time (Kronecker product). |
 
 ### 8.10. `fixed()` and `intercept()` Modules
 
@@ -598,9 +598,9 @@ These modules provide explicit control over standard regression components.
 #### `intercept()` Module Reference
 
 | Keyword / Parameter | Example Usage          | Data Type                 | Default        | Meaning & Assumptions                                                                                                                |
-| :--------------------| :-----------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
-| `intercept()`       | `intercept(prior=...)` | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
-| `prior`             | `prior=Normal(0, 10)`  | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
+| :--------------------| :-------------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
+| `intercept()`       | `intercept(prior=...)`   | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
+| `prior`             | `prior=Normal(0, 10)`   | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
 
 ## 9. Conclusion
 

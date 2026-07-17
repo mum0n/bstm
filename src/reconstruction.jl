@@ -124,7 +124,7 @@ function extract_manifold(m_obj::Union{ICAR, Besag, RW1, RW2, Leroux, SAR, Cycli
     
     for k in 1:outcomes_N
         domain = string(spec.domain)
-        var = string(spec.var)
+        var = string(spec.key)
         
         sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
         latent_name = _find_parameter_new(p_names, domain, var, "latent", k)
@@ -155,7 +155,7 @@ function extract_manifold(m_obj::BYM2, chain, M, n_samples, outcomes_N, p_names,
 
     for k in 1:outcomes_N
         domain = string(spec.domain)
-        var = string(spec.var)
+        var = string(spec.key)
 
         sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
         rho_name = _find_parameter_new(p_names, domain, var, "rho", k)
@@ -192,7 +192,7 @@ function extract_manifold(m_obj::AR1, chain, M, n_samples, outcomes_N, p_names, 
 
     for k in 1:outcomes_N
         domain = string(spec.domain)
-        var = string(spec.var)
+        var = string(spec.key)
 
         sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
         rho_name = _find_parameter_new(p_names, domain, var, "rho", k)
@@ -277,7 +277,7 @@ function extract_manifold(m_obj::Harmonic, chain, M, n_samples, outcomes_N, p_na
 
     for k in 1:outcomes_N
         domain = string(spec.domain)
-        var = string(spec.var)
+        var = string(spec.key)
         
         coeffs_name = _find_parameter_new(p_names, domain, var, "coeffs", k)
         
@@ -349,7 +349,7 @@ function extract_manifold(m_obj::Union{GP, FITC, SVGP, Nystrom}, chain, M, n_sam
 
     for k in 1:outcomes_N
         domain = string(spec.domain)
-        var = string(spec.var)
+        var = string(spec.key)
         
         sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
         ls_name = _find_parameter_new(p_names, domain, var, "ls", k)
@@ -414,7 +414,7 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
 
         if model_type == "advection" || model_type == "diffusion"
             param_name = model_type == "advection" ? "v" : "d"
-            rate_name = _find_parameter_new(p_names, domain, var, param_name, k)
+            rate_name = _find_parameter_new(p_names, domain, key, param_name, k)
             sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
             innov_name = _find_parameter_new(p_names, domain, var, "innov", k)
 
@@ -460,10 +460,10 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
             push!(structured_effects, effect_k)
 
         elseif model_type == "advection_diffusion" 
-            v_name = _find_parameter_new(p_names, domain, var, "v", k) 
-            d_name = _find_parameter_new(p_names, domain, var, "d", k) 
-            sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k) 
-            innov_name = _find_parameter_new(p_names, domain, var, "innov", k) 
+            v_name = _find_parameter_new(p_names, domain, key, "v", k) 
+            d_name = _find_parameter_new(p_names, domain, key, "d", k) 
+            sigma_name = _find_parameter_new(p_names, domain, key, "sigma", k) 
+            innov_name = _find_parameter_new(p_names, domain, key, "innov", k) 
  
             if isempty(v_name) || isempty(d_name) || isempty(sigma_name) || isempty(innov_name) 
                 @warn "Parameters for advection-diffusion manifold $(key) not found. Returning zero-matrix." 
@@ -496,8 +496,8 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
             push!(structured_effects, effect_k) 
 
         elseif model_type == "gompertz" || model_type == "logistic_basic"
-            r_name = _find_parameter_new(p_names, domain, var, "r", k)
-            K_name = _find_parameter_new(p_names, domain, var, "K", k)
+            r_name = _find_parameter_new(p_names, domain, key, "r", k)
+            K_name = _find_parameter_new(p_names, domain, key, "K", k)
 
             if isempty(r_name) || isempty(K_name)
                 @warn "Parameters for Dynamics manifold $(key) (outcome $(k)) not found. Returning zero-matrix."
@@ -538,7 +538,7 @@ function extract_manifold(m_obj::MixedManifold, chain, M, n_samples, outcomes_N,
         structured_effects = Vector{Matrix{Float64}}()
         for k in 1:outcomes_N
             domain = string(spec.domain)
-            var = string(spec.var)
+            var = string(spec.key)
             coeffs_name = _find_parameter_new(p_names, domain, var, "coeffs", k)
             n_cat = spec.params.n_cat
             
@@ -557,7 +557,7 @@ function extract_manifold(m_obj::MixedManifold, chain, M, n_samples, outcomes_N,
         correlated_effects = Dict{Symbol, Vector{Matrix{Float64}}}()
         for k in 1:outcomes_N
             domain = string(spec.domain)
-            var = string(spec.var)
+            var = string(spec.key)
             coeffs_name = _find_parameter_new(p_names, domain, var, "coeffs_correlated", k)
             n_cat = spec.params.n_cat
 
@@ -588,7 +588,7 @@ function extract_manifold(m_obj::Eigen, chain, M, n_samples, outcomes_N, p_names
     structured_effects = Vector{Matrix{Float64}}()
     key = string(spec.key)
     domain = string(spec.domain)
-    var = string(spec.var)
+    var = string(spec.key)
     
     # Extract parameters from the chain
     v_raw_name = _find_parameter_new(p_names, domain, var, "v_raw", nothing)
@@ -658,8 +658,8 @@ function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes
     #            such as Knorr-Held spatiotemporal interactions. This logic mirrors the model generation in the assembler.
     # Inputs: Standard `extract_manifold` arguments.
     # Outputs: A NamedTuple with the reconstructed effects.
-    op = m_obj.operator
-    key = string(spec.var)
+    op = m_obj.operator 
+    key = string(spec.key)
 
     function _find_spec_by_obj(obj, specs)
         idx = findfirst(s -> s.manifold_obj === obj, specs)
@@ -668,8 +668,6 @@ function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes
 
     if op == :kronecker_product && haskey(M, :model_st) && M.model_st != "none"
         # This block handles the reconstruction of a global spatiotemporal interaction term.
-        # It assumes that the model defines global 'st_sigma' and 'st_raw' parameters.
- 
         spatial_comp_obj = m_obj.components[1] # By convention
         temporal_comp_obj = m_obj.components[2]
 
@@ -685,49 +683,69 @@ function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes
         t_Q = temporal_spec.Q_template
         model_st = M.model_st
         noise = get(M, :noise, 1e-6)
-
-        st_effect = zeros(Float64, N_tot, n_samples)
-
-        # This reconstruction is for a single, global ST effect, not per-outcome.
-        st_sigma_samples = get_params_vector(chain, "st_sigma", 1)
-        st_raw_samples = get_params_vector(chain, "st_raw", M.s_N * M.t_N)
-
-        t_rho_samples = zeros(n_samples)
-        if model_st == "IV" && temporal_spec.manifold_obj isa AR1
-            t_rho_name = _find_parameter_new(p_names, "temporal", string(temporal_spec.var), "rho", 1)
-            if !isempty(t_rho_name); t_rho_samples = get_params_vector(chain, t_rho_name, 1)[:, 1]; end
-        end
-
+        
         C_s = cholesky(Symmetric(Matrix(s_Q) + noise * I))
         C_t = cholesky(Symmetric(Matrix(t_Q) + noise * I))
 
         s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
         t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx
 
-        for j in 1:n_samples
-            st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
-            st_inter = zeros(Float64, M.s_N, M.t_N)
+        all_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
 
-            if model_st == "I"; st_inter = st_innov_matrix .* st_sigma_samples[j];
-            elseif model_st == "II"; st_inter = (C_t.U \ st_innov_matrix')' .* st_sigma_samples[j];
-            elseif model_st == "III"; st_inter = (C_s.U \ st_innov_matrix) .* st_sigma_samples[j];
-            elseif model_st == "IV"
-                t_rho_j = t_rho_samples[j]
-                if abs(t_rho_j) < 1.0
-                    st_inter[:, 1] = (C_s.U \ st_innov_matrix[:, 1]) ./ sqrt(1.0 - t_rho_j^2 + noise)
-                    for t in 2:M.t_N; st_inter[:, t] = t_rho_j .* st_inter[:, t-1] .+ (C_s.U \ st_innov_matrix[:, t]); end
-                    st_inter .*= st_sigma_samples[j]
-                else # Fallback for non-stationary case
+        for k in 1:outcomes_N
+            t_rho_samples = zeros(n_samples)
+            if model_st == "IV" && temporal_spec.manifold_obj isa AR1
+                t_rho_name = _find_parameter_new(p_names, "temporal", string(temporal_spec.key), "rho", k)
+                if !isempty(t_rho_name); t_rho_samples = get_params_vector(chain, t_rho_name, 1)[:, 1]; end
+            end
+
+            local st_sigma_samples, st_raw_samples
+            if outcomes_N > 1
+                st_sigma_samples = get_params_vector(chain, "st_interaction_sigma", outcomes_N)[:, k]
+                st_raw_flat = get_params_vector(chain, "st_interaction_raw_flat", M.s_N * M.t_N * outcomes_N)
+                st_raw_samples = st_raw_flat[:, (k-1)*M.s_N*M.t_N+1 : k*M.s_N*M.t_N]
+            else
+                st_sigma_samples = get_params_vector(chain, "st_interaction_sigma", 1)[:, 1]
+                st_raw_samples = get_params_vector(chain, "st_interaction_raw", M.s_N * M.t_N)
+            end
+
+            st_effect_k = zeros(Float64, N_tot, n_samples)
+
+            if model_st == "I"
+                for j in 1:n_samples
+                    st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
+                    st_inter = st_innov_matrix .* st_sigma_samples[j]
+                    for i in 1:N_tot; st_effect_k[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]; end
+                end
+            elseif model_st == "II"
+                for j in 1:n_samples
+                    st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
+                    st_inter = (C_t.U \ st_innov_matrix')' .* st_sigma_samples[j]
+                    for i in 1:N_tot; st_effect_k[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]; end
+                end
+            elseif model_st == "III"
+                for j in 1:n_samples
+                    st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
                     st_inter = (C_s.U \ st_innov_matrix) .* st_sigma_samples[j]
+                    for i in 1:N_tot; st_effect_k[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]; end
+                end
+            elseif model_st == "IV"
+                for j in 1:n_samples
+                    st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
+                    st_inter = zeros(Float64, M.s_N, M.t_N)
+                    t_rho_j = t_rho_samples[j]
+                    if abs(t_rho_j) < 1.0
+                        st_inter[:, 1] = (C_s.U \ st_innov_matrix[:, 1]) ./ sqrt(1.0 - t_rho_j^2 + noise)
+                        for t in 2:M.t_N; st_inter[:, t] = t_rho_j .* st_inter[:, t-1] .+ (C_s.U \ st_innov_matrix[:, t]); end
+                        st_inter .*= st_sigma_samples[j]
+                    else # Fallback
+                        st_inter = (C_s.U \ st_innov_matrix) .* st_sigma_samples[j]
+                    end
+                    for i in 1:N_tot; st_effect_k[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]; end
                 end
             end
-            
-            for i in 1:N_tot
-                st_effect[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]
-            end
+            all_effects[k] = st_effect_k
         end
-        
-        all_effects = [st_effect for _ in 1:outcomes_N]
         return (structured=all_effects, noisy=all_effects)
 
     elseif op == :pipe
@@ -781,7 +799,7 @@ function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes
                 F_spatial = cholesky(Symmetric(Q_spatial + 1e-6 * I))
 
                 coeffs_raw_matrix = reshape(coeffs_raw_samples[j, :], n_spatial, n_basis)
-                spatial_coeffs = sigma_samples[j, 1] .* (F_spatial.U \\ coeffs_raw_matrix)
+                spatial_coeffs = sigma_samples[j, 1] .* (F_spatial.U \ coeffs_raw_matrix)
 
                 all_effects[k][:, j] = sum(B_dynamic_full .* spatial_coeffs[s_idx_full, :], dims=2)
             end
@@ -793,6 +811,7 @@ function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes
         return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
     end
 end
+
 
 function extract_manifold(m_obj::CustomManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     reconstruct_func = get(m_obj.params, :reconstruct_func, nothing)
@@ -1490,9 +1509,10 @@ end
 
 function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100, alpha=0.05)
     # Purpose: The primary engine for projecting a fitted model onto new data.
-    # Rationale: This function constructs a "prediction set" configuration (PS) that mirrors
-    #            the training configuration (M) but is adapted for the `new_data`. It correctly
-    #            handles the projection of fixed effects, smooth basis functions, and nested models.
+    # Rationale: This function constructs a "prediction set" configuration (PS) that mirrors the training configuration (M)
+    #            but is adapted for the `new_data`. It correctly handles the projection of fixed effects, smooth basis functions,
+    #            and nested models.
+    # v1.2.8 (2026-07-17)
     # Inputs:
     #   - model_obj: The fitted Turing model object.
     #   - chain: The MCMC chain result.
@@ -1505,30 +1525,35 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
 
     PS_dict = Dict(pairs(M_train))
     PS_dict[:data] = new_data
-    PS_dict[:y_obs] = zeros(nrow(new_data))
+    PS_dict[:y_obs] = zeros(nrow(new_data)) # Placeholder
     PS_dict[:y_N] = nrow(new_data)
 
-    # #
     # Re-create fixed effects design matrix for the new data
     if haskey(M_train, :formula)
         decomposed_formula = decompose_bstm_formula(M_train.formula)
-        fixed_effects_formula_part = join(vcat(decomposed_formula.fixed_effects, [m.args[:positional_args] for (k,m) in decomposed_formula.modules if m.module_type == :fixed]...), " + ")
-        if decomposed_formula.has_intercept
-            fixed_effects_formula_part = isempty(strip(fixed_effects_formula_part)) ? "1" : "1 + " * fixed_effects_formula_part
+        fixed_effects_vars = String[]
+        append!(fixed_effects_vars, decomposed_formula.fixed_effects)
+        for (_, mod_data_nt) in decomposed_formula.modules
+            if mod_data_nt.module_type == :fixed && haskey(mod_data_nt.args, :positional_args)
+                append!(fixed_effects_vars, string.(mod_data_nt.args[:positional_args]))
+            end
         end
-        if !isempty(strip(fixed_effects_formula_part))
-            PS_dict[:Xfixed] = create_fixed_design(fixed_effects_formula_part, new_data; contrasts=get(M_train, :contrasts, Dict()))
-            PS_dict[:Xfixed_N] = size(PS_dict[:Xfixed], 2)
+        fixed_effects_vars = unique(fixed_effects_vars)
+
+        if !isempty(fixed_effects_vars)
+            rhs = "0 + " * join(fixed_effects_vars, " + ")
+            Xfixed_pred, _ = create_fixed_design(rhs, new_data; contrasts=get(M_train, :contrasts, Dict()))
+            PS_dict[:Xfixed] = Matrix(Xfixed_pred)
+            PS_dict[:Xfixed_N] = size(Xfixed_pred, 2)
+            PS_dict[:Xfixed_names] = names(Xfixed_pred, 2)
         end
     end
 
-    # #
     # Update indices from new_data
     if haskey(M_train, :s_idx_var) && hasproperty(new_data, M_train.s_idx_var); PS_dict[:s_idx] = new_data[!, M_train.s_idx_var]; end
     if haskey(M_train, :t_idx_var) && hasproperty(new_data, M_train.t_idx_var); PS_dict[:t_idx] = new_data[!, M_train.t_idx_var]; end
     if haskey(M_train, :u_idx_var) && hasproperty(new_data, M_train.u_idx_var); PS_dict[:u_idx] = new_data[!, M_train.u_idx_var]; end
 
-    # #
     # Re-create basis matrices for smoothers on the new data
     if haskey(M_train, :manifolds)
         ps_basis_registry = Dict{Symbol, Any}()
@@ -1556,29 +1581,73 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
         PS_dict[:basis_matrices] = ps_basis_registry
     end
 
-    # #
     # Create prediction sets for nested sub-models
     if haskey(M_train, :nested_manifolds) && !isempty(M_train.nested_manifolds)
         PS_dict[:nested_prediction_sets] = Dict{Symbol, Any}()
         for (key, sub_M) in M_train.nested_manifolds
             sub_PS_dict = Dict(pairs(sub_M))
             sub_PS_dict[:data] = new_data
-            sub_PS_dict[:y_obs] = zeros(nrow(new_data))
+            sub_PS_dict[:y_obs] = zeros(nrow(new_data)) # Placeholder
             sub_PS_dict[:y_N] = nrow(new_data)
 
             if haskey(sub_M, :formula)
                 sub_decomposed = decompose_bstm_formula(sub_M.formula)
-                _process_fixed_effects!(sub_PS_dict, sub_decomposed.fixed_effects, sub_decomposed.has_intercept)
+                
+                sub_fixed_effects_vars = String[]
+                append!(sub_fixed_effects_vars, sub_decomposed.fixed_effects)
+                for (_, mod_data_nt) in sub_decomposed.modules
+                    if mod_data_nt.module_type == :fixed && haskey(mod_data_nt.args, :positional_args)
+                        append!(sub_fixed_effects_vars, string.(mod_data_nt.args[:positional_args]))
+                    end
+                end
+                sub_fixed_effects_vars = unique(sub_fixed_effects_vars)
 
+                if !isempty(sub_fixed_effects_vars)
+                    rhs = "0 + " * join(sub_fixed_effects_vars, " + ")
+                    Xfixed_sub, _ = create_fixed_design(rhs, new_data; contrasts=get(sub_M, :contrasts, Dict()))
+                    sub_PS_dict[:Xfixed] = Matrix(Xfixed_sub)
+                    sub_PS_dict[:Xfixed_N] = size(Xfixed_sub, 2)
+                    sub_PS_dict[:Xfixed_names] = names(Xfixed_sub, 2)
+                else
+                    sub_PS_dict[:Xfixed] = zeros(nrow(new_data), 0)
+                    sub_PS_dict[:Xfixed_N] = 0
+                    sub_PS_dict[:Xfixed_names] = Symbol[]
+                end
+            end
+
+            if haskey(sub_M, :manifolds)
                 sub_ps_basis_registry = Dict{Symbol, Any}()
                 sub_smooth_specs = filter(s -> s.domain == :smooth, sub_M.manifolds)
                 for spec in sub_smooth_specs
                     v_sym = Symbol(spec.var)
-                    nb = size(sub_M.basis_matrices[v_sym], 2)
-                    sub_ps_basis_registry[v_sym] = bstm_smooth_basis_1D(string(spec.manifold_obj.model), new_data[!, v_sym], nb; spec.params...)
+                    vars = get(spec.params, :positional_args, [])
+                    n_vars = length(vars)
+                    if haskey(sub_M.basis_matrices, v_sym) && all(hasproperty(new_data, Symbol(v)) for v in vars)
+                        m_obj = spec.manifold_obj
+                        model_type_str = lowercase(string(typeof(m_obj)))
+                        nb = size(sub_M.basis_matrices[v_sym], 2)
+                        if n_vars == 1
+                            sub_ps_basis_registry[v_sym] = bstm_smooth_basis_1D(model_type_str, new_data[!, Symbol(vars[1])], nb; spec.params...)
+                        elseif n_vars > 1
+                            coords_new = Matrix{Float64}(new_data[!, Symbol.(vars)])
+                            if n_vars == 2; sub_ps_basis_registry[v_sym] = bstm_smooth_basis_2D(model_type_str, coords_new, nb; spec.params...);
+                            elseif n_vars == 3; sub_ps_basis_registry[v_sym] = bstm_smooth_basis_3D(model_type_str, coords_new, nb; spec.params...);
+                            elseif n_vars == 4; sub_ps_basis_registry[v_sym] = bstm_smooth_basis_4D(model_type_str, coords_new, nb; spec.params...);
+                            end
+                        end
+                    end
                 end
                 sub_PS_dict[:basis_matrices] = sub_ps_basis_registry
             end
+
+            if haskey(sub_M, :likelihood_specs) && !isempty(sub_M.likelihood_specs)
+                sub_lik_params = sub_M.likelihood_specs[1]
+                _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:offsets, :log_offsets], :log_offset)
+                _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:weights], :weights)
+                _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:trials], :trials)
+            end
+            _precompute_likelihood_params!(sub_PS_dict)
+
             PS_dict[:nested_prediction_sets][key] = NamedTuple(sub_PS_dict)
         end
     end
@@ -1594,8 +1663,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
 
     res = _reconstruct(arch_type, "prediction", chain_sub, M_train, PS, alpha)
 
-    # The old return was buggy, it tried to access fields that don't exist.
-    # The new logic slices the prediction part from the full summary.
+    # Slice the prediction part from the full summary.
     N_train = M_train.y_N
     
     function slice_summary(summary)

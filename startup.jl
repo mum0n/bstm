@@ -123,6 +123,4 @@ function load_project_functions( src_dir=srcdir() )
 
 end
 
-load_project_functions( srcdir() )
-
 Random.seed!(42) # Set a seed for reproducibility.

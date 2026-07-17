@@ -543,11 +543,11 @@ The `eigen()` module uses a Householder transformation to construct the orthonor
 Spatiotemporal interactions are specified using either the Kronecker product operator (`⊗`) or the `spacetime()` module. The `bstm` framework supports the four canonical interaction types defined by Knorr-Held (2000), which are automatically inferred based on the structure of the component models.
 
 | Type         | Description                                    | `spacetime()` Syntax                  | `⊗` Operator Syntax                                |
-| :-------------| :-----------------------------------------------| :--------------------------------------| :---------------------------------------------------|
-| **Type I**   | Unstructured (IID) in both space and time.     | `spacetime(s, t, model=(iid, iid))`   | `spatial(s, model=iid) ⊗ temporal(t, model=iid)`   |
-| **Type II**  | Spatially unstructured, temporally structured. | `spacetime(s, t, model=(iid, ar1))`   | `spatial(s, model=iid) ⊗ temporal(t, model=ar1)`   |
-| **Type III** | Spatially structured, temporally unstructured. | `spacetime(s, t, model=(besag, iid))` | `spatial(s, model=besag) ⊗ temporal(t, model=iid)` |
-| **Type IV**  | Fully structured in both space and time.       | `spacetime(s, t, model=(besag, ar1))` | `spatial(s, model=besag) ⊗ temporal(t, model=ar1)` |
+| :-------------| :-----------------------------------------------| :--------------------------------------------| :---------------------------------------------------|
+| **Type I**   | Unstructured (IID) in both space and time.     | `spacetime(s_idx, t_idx, model=(iid, iid))`   | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=iid)`   |
+| **Type II**  | Spatially unstructured, temporally structured. | `spacetime(s_idx, t_idx, model=(iid, ar1))`   | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=ar1)`   |
+| **Type III** | Spatially structured, temporally unstructured. | `spacetime(s_idx, t_idx, model=(besag, iid))` | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=iid)` |
+| **Type IV**  | Fully structured in both space and time.       | `spacetime(s_idx, t_idx, model=(besag, ar1))` | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1)` |
 
 The `spacetime()` module serves as a convenient shorthand. The framework determines the interaction type by checking if the provided spatial and temporal models are structured (e.g., `besag`, `ar1`) or unstructured (`iid`).
 

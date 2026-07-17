@@ -302,6 +302,10 @@ function split_terms_at_depth(input::AbstractString, sep::AbstractString)
     #   - sep: The separator string.
     # Outputs: A vector of strings.
     terms = String[]
+    current_term = ""
+    depth = 0
+    i = 1
+    sep_len = length(sep)
 
     while i <= length(input)
         char = input[i]
@@ -421,7 +425,7 @@ function _parse_arguments_string(args_str::String)
     return args_dict
 end
 
-function _parse_single_manifold_term(term_str::String)
+function _parse_single_manifold_term(term_str::AbstractString)
     # Purpose: Parses a single module call string like "spatial(s_idx, model=bym2)".
     # Rationale: Extracts the module name and its arguments.
     # Assumptions: The input is a single, well-formed module call.
@@ -432,7 +436,8 @@ function _parse_single_manifold_term(term_str::String)
     m = match(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)\)\s*$", term_str)
     
     if m === nothing
-        error("Internal Parser Error: Expected a module call (e.g., 'name(...)'), but got non-module term '$term_str'.")
+        # This error is thrown when a term without parentheses is incorrectly passed to this function.
+        error("Internal Parser Error: _parse_single_manifold_term was called with a non-module term '$term_str'. This indicates a logic error in the parent parser.")
     end
 
     module_name = Symbol(m.captures[1])
@@ -440,53 +445,125 @@ function _parse_single_manifold_term(term_str::String)
     args_dict = _parse_arguments_string(args_str)
 
     return (module_type = module_name, args = args_dict)
-end 
+end
 
-function _parse_rhs_expression(term_str::String)
+function resolve_hyperpriors(model_name::String, global_priors::Dict, local_params::Dict, scheme::Symbol, calling_mod::Module)
+    # Purpose: Resolves hyperpriors for a given manifold based on a 3-level precedence.
+    # Rationale: This version is updated to correctly evaluate `Expr` objects for priors,
+    #            allowing users to specify distributions directly in the formula string.
+    # v1.2.8 (2026-07-17)
+    # Precedence:
+    #   1. Local: A prior specified directly in the module call (e.g., `sigma_prior=...`).
+    #   2. Global: A prior specified in the `hyperpriors` dictionary passed to `bstm()`.
+    #   3. Scheme: The default prior from the selected scheme (`:pcpriors`, `:informative`, etc.).
+    # Inputs:
+    #   - model_name, global_priors, local_params, scheme, calling_mod.
+    # Outputs: A NamedTuple containing the resolved prior distributions for the manifold.
+
+    prior_defaults = if scheme == :pcpriors
+        PC_PRIORS
+    elseif scheme == :informative
+        INFORMATIVE_PRIORS
+    else
+        UNINFORMATIVE_PRIORS
+    end
+
+    possible_priors = [:sigma_prior, :rho_prior, :lengthscale_prior, :kappa_prior, :amplitude_prior, :phase_prior, :pca_sd_prior, :pdef_sd_prior, :range_prior]
+    
+    resolved = Dict{Symbol, Any}()
+
+    for p_sym in possible_priors
+        p_base_name = Symbol(replace(string(p_sym), "_prior" => ""))
+
+        # 1. Check for local override in the module call.
+        if haskey(local_params, p_sym)
+            prior_val = local_params[p_sym]
+            if prior_val isa Tuple # PC Prior constraint
+                resolved[p_sym] = create_pc_prior(p_base_name, prior_val)
+            elseif prior_val isa Expr
+                try
+                    resolved[p_sym] = Core.eval(calling_mod, prior_val)
+                catch e
+                    error("Could not evaluate `prior` argument `$(prior_val)` for manifold '$model_name'. Error: $e")
+                end
+            else # Assumed to be a Distribution object
+                resolved[p_sym] = prior_val
+            end
+            continue
+        end
+
+        # 2. Check for global override in the `hyperpriors` dictionary.
+        global_key_model = Symbol(model_name, "_", p_base_name)
+        global_key_param = p_base_name
+        
+        if haskey(global_priors, global_key_model)
+            resolved[p_sym] = global_priors[global_key_model]
+            continue
+        elseif haskey(global_priors, global_key_param)
+            resolved[p_sym] = global_priors[global_key_param]
+            continue
+        end
+
+        # 3. Fallback to the default scheme.
+        if haskey(prior_defaults, string(p_base_name))
+            resolved[p_sym] = prior_defaults[string(p_base_name)]
+        end
+    end
+
+    return NamedTuple(resolved)
+end
+
+
+
+function _parse_rhs_expression(term_str::AbstractString)
     # Purpose: Recursively parses the right-hand side of a formula, respecting operator precedence.
     # Rationale: Builds an Abstract Syntax Tree (AST) representing the model structure.
     # Assumptions: Operators are space-padded (e.g., " ⊗ ").
+    # v1.2.1 (2026-07-16)
     # Inputs:
     #   - term_str: The RHS string or a substring of it.
     # Outputs: A nested NamedTuple representing the parsed structure.
-    parts = split_terms_at_depth(term_str, " |> ")
+    term_str_stripped = strip(term_str)
+    parts = split_terms_at_depth(term_str_stripped, " |> ")
     if length(parts) > 1
         return (type=:operator, op=:pipe, children=[_parse_rhs_expression(parts[1]), _parse_rhs_expression(join(parts[2:end], " |> "))])
     end
-    parts = split_terms_at_depth(term_str, " ⊗ ")
+    parts = split_terms_at_depth(term_str_stripped, " ⊗ ")
     if length(parts) > 1
         return (type=:operator, op=:kronecker_product, children=[_parse_rhs_expression(p) for p in parts])
     end
-    parts = split_terms_at_depth(term_str, " ∘ ")
+    parts = split_terms_at_depth(term_str_stripped, " ∘ ")
     if length(parts) > 1
         return (type=:operator, op=:composition, children=[_parse_rhs_expression(p) for p in parts])
     end
-    return _parse_single_manifold_term(term_str)
-    try
-        return _parse_single_manifold_term(term_str)
-    catch e
-        term_str_stripped = strip(term_str)
-        if occursin(r"^[a-zA-Z_][a-zA-Z0-9_]*$", term_str_stripped)
-            return (module_type = :fixed, args = Dict(:positional_args => [Symbol(term_str_stripped)]))
-        else
-            rethrow(e)
-        end
+
+    if occursin(r"\(.*\)", term_str_stripped)
+        return _parse_single_manifold_term(term_str_stripped)
+    else
+        return (module_type = :fixed, args = Dict(:positional_args => [term_str_stripped]))
     end
 end
 
-function _categorize_rhs_nodes!(nodes, modules)
+function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
     # Purpose: Traverses the parsed AST and categorizes nodes into a flat dictionary of modules.
     # Rationale: Simplifies processing by converting the tree structure into a key-value store.
     # Assumptions: `nodes` is a vector of parsed AST nodes.
+    # v1.2.1 (2026-07-16)
     # Inputs:
     #   - nodes: The vector of AST nodes from `_parse_rhs_expression`.
     #   - modules: The dictionary to populate.
+    #   - fixed_effects: The list to populate with fixed effect variable names.
     # Outputs: None (mutates `modules`).
     for node in nodes
         if hasproperty(node, :type) && node.type == :operator
             key = "composed_$(length(modules)+1)"
             modules[key] = (module_type = :interact, args = Dict(:operator => node.op, :components => node.children))
         elseif hasproperty(node, :module_type) && node.module_type in BSTM_MODULE_KEYWORDS
+            if node.module_type == :fixed
+                if haskey(node.args, :positional_args)
+                    append!(fixed_effects, string.(node.args[:positional_args]))
+                end
+            end
             key_parts = [string(node.module_type)]
             if haskey(node.args, :positional_args) && !isempty(node.args[:positional_args])
                 pos_arg_str = join([string(a) for a in node.args[:positional_args]], "_")
@@ -506,6 +583,7 @@ function _categorize_rhs_nodes!(nodes, modules)
     end
 end
 
+
 function _extract_symbols_from_expr!(sym_set::Set{Symbol}, ex::Expr)
     # Purpose: Recursively extracts all symbols from a Julia expression.
     # Rationale: Used to find all variable names mentioned in the formula to check for their presence in the data.
@@ -523,82 +601,79 @@ function _extract_symbols_from_expr!(sym_set::Set{Symbol}, ex::Expr)
     end
 end
 
+function _parse_lhs_term(term::String)
+    # Purpose: Parses a single term from the left-hand side of the formula.
+    # Rationale: Handles both `likelihood()` blocks and bare outcome variables,
+    #            including multiple outcomes specified with `+`.
+    # Inputs:
+    #   - term: A string representing one part of the LHS.
+    # Outputs: A vector of outcome specification dictionaries.
+    term = strip(term)
+    m = match(r"likelihood\((.*)\)", term)
+    specs = Dict{Symbol, Any}[]
+    if !isnothing(m)
+        inner_content = m.captures[1]
+        args = split_terms_at_depth(inner_content, ",")
+        if isempty(args); return specs; end
+        outcome_var_str = strip(args[1])
+        params_str = join(args[2:end], ",")
+        params = _parse_arguments_string(params_str)
+        for ov in [strip(s) for s in Base.split(outcome_var_str, '+')]; push!(specs, Dict(:var => ov, :params => params)); end
+    else
+        for ov in [strip(s) for s in Base.split(term, '+')]; push!(specs, Dict(:var => ov, :params => Dict())); end
+    end
+    return specs
+end
+
 function decompose_bstm_formula(formula_str::String)
     # Purpose: The main entry point for formula parsing.
     # Rationale: Decomposes the entire formula string into its constituent parts: outcomes, modules, and fixed effects.
     # Assumptions: Formula is in the format `lhs ~ rhs`.
+    # v1.2.1 (2026-07-16)
     # Inputs:
     #   - formula_str: The complete model formula.
     # Outputs: A NamedTuple with `:outcomes`, `:modules`, `:fixed_effects`, `:has_intercept`, and `:intercept_prior`.
     parts = Base.split(formula_str, "~")
-    lhs = strip(parts[1])
-    rhs = strip(parts[2])
-    outcome_specs = Dict{Symbol, Any}[]
-    lhs_terms = split_terms_at_depth(lhs, "+")
-    for term in lhs_terms
-        term = strip(term)
-        m = match(r"likelihood\((.*)\)", term)
-        if !isnothing(m)
-            inner_content = m.captures[1]
-            args = split_terms_at_depth(inner_content, ",")
-            !isempty(args) || continue
-            outcome_var = strip(args[1])
-            params_str = join(args[2:end], ",")
-            params = _parse_arguments_string(params_str)
-            for ov in Base.split(outcome_var, '+')
-                push!(outcome_specs, Dict(:var => strip(ov), :params => params))
-            end
-        else
-            push!(outcome_specs, Dict(:var => term, :params => Dict()))
-        end
-    end
-    rhs_normalized = replace(rhs, r"\s*-\s*" => " + -")
+    lhs_str = strip(parts[1])
+    rhs_str = strip(parts[2])
+    outcome_specs = vcat([_parse_lhs_term(term) for term in split_terms_at_depth(lhs_str, "+")]...)
+
+    rhs_normalized = replace(rhs_str, r"\s*-\s*" => " + -")
     rhs_terms = split_terms_at_depth(rhs_normalized, " + ")
-    has_intercept = true
+    
+    has_intercept = !("0" in rhs_terms || "-1" in rhs_terms)
     intercept_prior = nothing
-    fixed_effects = String[]
     module_terms = String[]
     intercept_module_found = false
+
     for term in rhs_terms
         term_stripped = strip(term)
-        if startswith(term_stripped, "intercept(")
+        if term_stripped == "0" || term_stripped == "-1" || term_stripped == "1"
+            continue # Intercept handled by has_intercept flag
+        elseif startswith(term_stripped, "intercept(")
             if intercept_module_found
                 @warn "Multiple intercept() modules found. Only the first will be evaluated for intercept control."
             else
                 intercept_module_found = true
                 intercept_data = _parse_single_manifold_term(term_stripped)
-                pos_args = get(intercept_data.args, :positional_args, [])
-                if !isempty(pos_args) && pos_args[1] == false
-                    has_intercept = false
-                else
-                    has_intercept = true
-                end
+                # The intercept() module with `false` is a way to explicitly remove the intercept.
+                # e.g., `intercept(false)` or `intercept(prior=..., false)`
+                has_intercept = get(intercept_data.args, :positional_args, [true])[1] != false
                 if haskey(intercept_data.args, :prior)
                     intercept_prior = intercept_data.args[:prior]
                 end
             end
-            continue
-        elseif term_stripped == "0" || term_stripped == "-1"
-            has_intercept = false
-        elseif term_stripped == "1"
-            # Do nothing, intercept is on by default
         else
-            # Check if the term corresponds to a known BSTM module keyword.
-            # This correctly separates fixed effects (including transformations like log(x) or interactions x*z)
-            # from the special bstm module calls.
-            m = match(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)", term_stripped)
-            is_bstm_module = !isnothing(m) && Symbol(m.captures[1]) in BSTM_MODULE_KEYWORDS
-            if !is_bstm_module
-                push!(fixed_effects, term_stripped)
-            else
-                push!(module_terms, term_stripped)
-            end
+            # Pass all other terms to the robust parser.
+            push!(module_terms, term_stripped)
         end
     end
+
     top_level_nodes = [_parse_rhs_expression(term) for term in module_terms]
     modules = Dict{String, Any}()
-    _categorize_rhs_nodes!(top_level_nodes, modules)
-    return (outcomes=outcome_specs, modules=modules, fixed_effects=fixed_effects, has_intercept=has_intercept, intercept_prior=intercept_prior)
+    fixed_effects = String[] # This will be populated by _categorize_rhs_nodes!
+    _categorize_rhs_nodes!(top_level_nodes, modules, fixed_effects)
+    return (outcomes=outcome_specs, modules=modules, fixed_effects=unique(fixed_effects), has_intercept=has_intercept, intercept_prior=intercept_prior)
 end
 
 
@@ -606,15 +681,78 @@ end
 # SECTION 4: MODEL CONFIGURATION ENGINE
 # ==============================================================================
 
+function _precompute_likelihood_params!(M::Dict)
+    # Purpose: Ensures all likelihood-related parameters (offsets, weights, etc.) are present in the
+    #          model configuration `M` with the correct type (scalar or vector) and default values.
+    # Rationale: This version avoids broadcasting scalars into vectors, preserving their scalar nature.
+    #            This allows the model code generator to create more efficient and readable code by
+    #            distinguishing between scalar and vector parameters at runtime.
+    # v1.2.5 (2026-07-17)
+    # Assumptions: M[:y_N] (number of observations) and M[:outcomes_N] (number of outcomes) are set.
+    # Inputs:
+    #   - M: The model configuration dictionary, which is mutated by this function.
+    # Outputs: None.
+
+    N = M[:y_N]
+    K = M[:outcomes_N]
+    is_multivariate = K > 1
+
+    param_defaults = [
+        (:y_L, -Inf),
+        (:y_U, Inf),
+        (:hurdle, -Inf),
+        (:trials, 1),
+        (:weights, 1.0),
+        (:log_offset, 0.0)
+    ]
+
+    for (key, default_val) in param_defaults
+        if !haskey(M, key)
+            # Parameter not provided, store the scalar default.
+            M[key] = default_val
+        else
+            val = M[key]
+            if is_multivariate
+                if val isa Real
+                    # Keep as scalar, it will be broadcast at runtime if needed.
+                    M[key] = val
+                elseif val isa AbstractVector && length(val) == N
+                    # This is a vector intended for all outcomes. It will be indexed at runtime.
+                    # No change needed here.
+                elseif val isa AbstractMatrix && size(val) == (N, K)
+                    # Correctly specified matrix. No change needed.
+                else
+                    @warn "Likelihood parameter `:$key` has incorrect dimensions for multivariate model. Expected ($N, $K) or ($N,). Using default."
+                    M[key] = default_val
+                end
+            else # Univariate case
+                if val isa Real
+                    # It's a scalar, leave it as is.
+                    M[key] = val
+                elseif !(val isa AbstractVector)
+                    # Ensure it's a vector if it's not a scalar (e.g., a 1-column matrix)
+                    M[key] = vec(val)
+                end
+                
+                # Check vector length only if it is a vector
+                if M[key] isa AbstractVector && length(M[key]) != N
+                    @warn "Likelihood parameter `:$key` has incorrect length for univariate model. Expected length $N, got $(length(M[key])). Using default."
+                    M[key] = default_val
+                end
+            end
+        end
+    end
+end
+
+
+
 function bstm_config(formula::String, data::DataFrame; calling_module::Module=Main, kwargs...)
     # Purpose: The main configuration function that translates a formula and data into a detailed model specification.
-    # Rationale: This is the central pipeline that orchestrates parsing, data processing, and manifold setup.
+    # Rationale: This version is updated to correctly evaluate the `prior` argument for the `intercept()` module.
+    # v1.2.8 (2026-07-17)
     # Assumptions: `formula` and `data` are provided correctly.
     # Inputs:
-    #   - formula: The model formula string.
-    #   - data: The input DataFrame.
-    #   - calling_module: The module from which `@bstm` was called, for evaluating expressions.
-    #   - kwargs: Additional keyword arguments (e.g., `W`, `hyperpriors`).
+    #   - formula, data, calling_module, kwargs.
     # Outputs: A NamedTuple `M` containing the complete model configuration.
     decomposed_formula = decompose_bstm_formula(formula)
     all_vars = Set{Symbol}()
@@ -631,9 +769,21 @@ function bstm_config(formula::String, data::DataFrame; calling_module::Module=Ma
     M = _initialize_config(filtered_data, merge(Dict(kwargs), Dict(:calling_module => calling_module)))
     M[:formula] = formula
     _process_lhs!(M, decomposed_formula.outcomes)
+
+    _precompute_likelihood_params!(M)
+
     M[:N_cov] = 0
     M[:add_intercept] = decomposed_formula.has_intercept
-    if !isnothing(decomposed_formula.intercept_prior); M[:intercept_prior] = decomposed_formula.intercept_prior; end
+    if !isnothing(decomposed_formula.intercept_prior)
+        prior_val = decomposed_formula.intercept_prior
+        if prior_val isa Expr
+            try
+                M[:intercept_prior] = Core.eval(calling_module, prior_val)
+            catch e
+                error("Could not evaluate `prior` argument `$(prior_val)` in intercept() module. Error: $e")
+            end
+        else; M[:intercept_prior] = prior_val; end
+    end
     M[:hyperpriors] = get(M, :hyperpriors, Dict{String, Any}())
     M[:prior_scheme] = get(M, :prior_scheme, :pcpriors)
     for (key, mod_data_nt) in decomposed_formula.modules
@@ -651,12 +801,567 @@ function bstm_config(formula::String, data::DataFrame; calling_module::Module=Ma
         spec = (key=Symbol(key), domain=mod_data_dict[:type], var=join(mod_data_dict[:variables], "_"), manifold_obj=manifold_obj, params=mod_data_dict[:params], Q_template=manifold_spec_built.Q_template, scaling_factor=manifold_spec_built.scaling_factor)
         push!(M[:manifolds], spec)
     end
-    all_fixed_effects = get(M, :fixed_effects, String[])
-    _process_fixed_effects!(M, get(M, :fixed_effects, String[]), decomposed_formula.has_intercept)
+    _process_fixed_effects!(M, unique(decomposed_formula.fixed_effects))
     _process_fixed_effects_priors!(M)
+    
+    _precompute_static_manifolds!(M)
+
     _finalize_config!(M)
     return NamedTuple(M)
 end
+
+
+function _generate_manifold_code_fragments(m::ManifoldModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # Purpose: Generates code fragments for simple GMRF-style manifolds (IID, ICAR, etc.).
+    # Rationale: Implements a standard non-centered parameterization for Gaussian Markov Random Fields.
+    #            This version checks if a manifold is static and uses a pre-computed Cholesky factor
+    # v1.2.1 (2026-07-16)
+    #            to optimize sampling. It also handles multivariate parameter naming conventions.
+ 
+    key_str = string(spec.key)
+    if isempty(prefix)
+        prefixed_key = key_str
+    else
+        prefixed_key = "$(prefix)_$(key_str)"
+    end
+
+    params = spec.params
+    n_latent = size(spec.Q_template, 1)
+    is_multivariate = arch == "multivariate"
+    is_first_outcome = outcome_idx == 1
+    is_shared = get(params, :shared, false)
+
+    # Determine parameter names based on architecture (univariate vs. multivariate)
+    # and whether parameters are shared across outcomes.
+    local sigma_name_str, rho_name_str, latent_raw_name_str, latent_name_str
+    if is_multivariate && !is_shared
+        sigma_name_str = "$(prefixed_key)_sigma_$(outcome_idx)"
+        rho_name_str = "$(prefixed_key)_rho_$(outcome_idx)"
+        latent_raw_name_str = "$(prefixed_key)_raw_$(outcome_idx)"
+        latent_name_str = "$(prefixed_key)_latent_$(outcome_idx)"
+    else
+        sigma_name_str = "$(prefixed_key)_sigma"
+        rho_name_str = "$(prefixed_key)_rho"
+        if is_multivariate
+            latent_raw_name_str = "$(prefixed_key)_raw_$(outcome_idx)"
+            latent_name_str = "$(prefixed_key)_latent_$(outcome_idx)"
+        else
+            latent_raw_name_str = "$(prefixed_key)_raw"
+            latent_name_str = "$(prefixed_key)_latent"
+        end
+    end
+
+    sigma_name = Symbol(sigma_name_str)
+    rho_name = Symbol(rho_name_str)
+    latent_raw_name = Symbol(latent_raw_name_str)
+    latent_name = Symbol(latent_name_str)
+
+    priors_acc = String[]
+
+    # Generate priors only once for shared parameters in multivariate models.
+    if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
+        if hasproperty(m, :sigma_prior)
+            push!(priors_acc, "$(sigma_name) ~ NamedDist($(_distribution_to_string(m.sigma_prior)), :$(sigma_name))")
+        end
+        if hasproperty(m, :rho_prior)
+            push!(priors_acc, "$(rho_name) ~ NamedDist($(_distribution_to_string(m.rho_prior)), :$(rho_name))")
+        end
+    end
+
+    # The raw latent effect is always sampled from a standard normal.
+    push!(priors_acc, "$(latent_raw_name) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(latent_raw_name))")
+    priors_str = join(priors_acc, "\n")
+    
+    # Determine the correct indexing variable based on the manifold's domain.
+    local index_var
+    if spec.domain == :spatial
+        index_var = "s_idx"
+    elseif spec.domain == :temporal
+        if typeof(m) <: Union{Cyclic, Harmonic}
+            index_var = "u_idx"
+        else
+            index_var = "t_idx"
+        end
+    else
+        index_var = string(spec.domain) * "_idx"
+    end
+
+    # Determine the target for updating the linear predictor.
+    local eta_update_target
+    if is_multivariate
+        eta_update_target = "eta_latent[:, $(outcome_idx)]"
+    else
+        eta_update_target = "eta"
+    end
+
+    local effect_application_str
+    if spec.domain == :smooth
+        effect_application_str = "$(eta_update_target) .+= M.basis_matrices[:$(spec.var)] * $(latent_name)"
+    else
+        effect_application_str = "$(eta_update_target) .+= view($(latent_name), M.$(index_var))"
+    end
+
+    local update_str
+    if get(spec, :is_static, false)
+        update_str = """
+        begin
+            # Using pre-computed Cholesky factor for static manifold '$(key_str)'
+            F = spec_registry["$(key_str)"].cholesky_factor
+            $(latent_name) = $(sigma_name_str) .* (F.U \\ $(latent_raw_name))
+            $(effect_application_str)
+        end
+        """
+    else
+        update_str = """
+        begin
+            Q_template = spec_registry["$(key_str)"].Q_template
+            m_type = spec_registry["$(key_str)"].manifold_obj |> typeof |> Symbol
+            rho_val = $(hasproperty(m, :rho_prior) ? rho_name_str : "nothing")
+            
+            Q_final = recompose_precision(m_type, Q_template, 1.0; extra_param=rho_val)
+            F = cholesky(Symmetric(Q_final + noise * I))
+            $(latent_name) = $(sigma_name_str) .* (F.U \\ $(latent_raw_name))
+            $(effect_application_str)
+        end
+        """
+    end
+    
+    return (priors=priors_str, update=update_str)
+end
+
+
+
+function _generate_manifold_code_fragments(m::AR1, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # This is a specialized implementation for AR(1) processes.
+    # It uses a state-space formulation for numerical stability and efficiency,
+    # avoiding the construction and Cholesky decomposition of a dense precision matrix.
+
+    key_str = string(spec.key)
+    if isempty(prefix)
+        prefixed_key = key_str
+    else
+        prefixed_key = "$(prefix)_$(key_str)"
+    end
+
+    params = spec.params
+    n_latent = size(spec.Q_template, 1)
+    is_multivariate = arch == "multivariate"
+    is_first_outcome = outcome_idx == 1
+    is_shared = get(params, :shared, false)
+
+    # Determine parameter names
+    local sigma_name_str, rho_name_str, innov_name_str, latent_name_str
+    if is_multivariate && !is_shared
+        sigma_name_str = "$(prefixed_key)_sigma_$(outcome_idx)"
+        rho_name_str = "$(prefixed_key)_rho_$(outcome_idx)"
+        innov_name_str = "$(prefixed_key)_innov_$(outcome_idx)"
+        latent_name_str = "$(prefixed_key)_latent_$(outcome_idx)"
+    else
+        sigma_name_str = "$(prefixed_key)_sigma"
+        rho_name_str = "$(prefixed_key)_rho"
+        if is_multivariate
+            innov_name_str = "$(prefixed_key)_innov_$(outcome_idx)"
+            latent_name_str = "$(prefixed_key)_latent_$(outcome_idx)"
+        else
+            innov_name_str = "$(prefixed_key)_innov"
+            latent_name_str = "$(prefixed_key)_latent"
+        end
+    end
+
+    sigma_name = Symbol(sigma_name_str)
+    rho_name = Symbol(rho_name_str)
+    innov_name = Symbol(innov_name_str)
+    latent_name = Symbol(latent_name_str)
+
+    priors_acc = String[]
+
+    # Generate priors only once for shared parameters
+    if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
+        push!(priors_acc, "$(sigma_name) ~ NamedDist($(_distribution_to_string(m.sigma_prior)), :$(sigma_name))")
+        # The prior for rho is truncated to ensure stationarity and numerical stability.
+        push!(priors_acc, "$(rho_name) ~ NamedDist(truncated($(_distribution_to_string(m.rho_prior)), -0.9999, 0.9999), :$(rho_name))")
+    end
+
+    # Sample standard normal innovations
+    push!(priors_acc, "$(innov_name) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(innov_name))")
+    priors_str = join(priors_acc, "\n")
+
+    # Determine the target for updating the linear predictor
+    eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    index_var = "t_idx" # AR1 is always temporal
+
+    # The update block performs the sequential calculation
+    update_str = """
+    begin
+        # AR1 state-space evolution for $(key_str)
+        $(latent_name) = Vector{T}(undef, $(n_latent))
+        
+        rho_val = $(rho_name) # No clamp needed due to truncated prior
+
+        # Initialize the first state and evolve
+        $(latent_name)[1] = $(innov_name)[1] / sqrt(1.0 - rho_val^2 + noise)
+        for t in 2:$(n_latent)
+            $(latent_name)[t] = rho_val * $(latent_name)[t-1] + $(innov_name)[t]
+        end
+        
+        # Scale by sigma and apply to eta
+        $(latent_name) .*= $(sigma_name_str)
+        $(eta_update_target) .+= view($(latent_name), M.$(index_var))
+    end
+    """
+    
+    return (priors=priors_str, update=update_str)
+end
+
+
+function _generate_manifold_code_fragments(m::RW1, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # Specialized implementation for RW1 processes using a state-space formulation.
+    key_str = string(spec.key)
+    prefixed_key = isempty(prefix) ? key_str : "$(prefix)_$(key_str)"
+    
+    n_latent = size(spec.Q_template, 1)
+    is_multivariate = arch == "multivariate"
+    is_shared = get(spec.params, :shared, false)
+
+    # Determine parameter names
+    local sigma_name_str, innov_name_str, latent_name_str
+    if is_multivariate && !is_shared
+        sigma_name_str = "$(prefixed_key)_sigma_$(outcome_idx)"
+        innov_name_str = "$(prefixed_key)_innov_$(outcome_idx)"
+        latent_name_str = "$(prefixed_key)_latent_$(outcome_idx)"
+    else
+        sigma_name_str = "$(prefixed_key)_sigma"
+        if is_multivariate
+            innov_name_str = "$(prefixed_key)_innov_$(outcome_idx)"
+            latent_name_str = "$(prefixed_key)_latent_$(outcome_idx)"
+        else
+            innov_name_str = "$(prefixed_key)_innov"
+            latent_name_str = "$(prefixed_key)_latent"
+        end
+    end
+
+    sigma_name = Symbol(sigma_name_str)
+    innov_name = Symbol(innov_name_str)
+    latent_name = Symbol(latent_name_str)
+
+    priors_acc = String[]
+    if !is_multivariate || (is_multivariate && (!is_shared || outcome_idx == 1))
+        push!(priors_acc, "$(sigma_name) ~ NamedDist($(_distribution_to_string(m.sigma_prior)), :$(sigma_name))")
+    end
+    push!(priors_acc, "$(innov_name) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(innov_name))")
+    priors_str = join(priors_acc, "\n")
+
+    eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    index_var = "t_idx"
+
+    update_str = """
+    begin
+        # RW1 state-space evolution for $(key_str)
+        innovations = $(innov_name)
+        latent_field_raw = cumsum(innovations)
+        
+        # Apply sum-to-zero constraint for identifiability
+        if $(n_latent) > 0
+            $(latent_name) = (latent_field_raw .- mean(latent_field_raw)) .* $(sigma_name_str)
+            $(eta_update_target) .+= view($(latent_name), M.$(index_var))
+        end
+    end
+    """
+    
+    return (priors=priors_str, update=update_str)
+end
+
+
+function _generate_manifold_code_fragments(m::RW2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # Specialized implementation for RW2 processes using a state-space formulation.
+    key_str = string(spec.key)
+    prefixed_key = isempty(prefix) ? key_str : "$(prefix)_$(key_str)"
+    
+    n_latent = size(spec.Q_template, 1)
+    is_multivariate = arch == "multivariate"
+    is_shared = get(spec.params, :shared, false)
+
+    # Determine parameter names
+    local sigma_name_str, innov_name_str, latent_name_str
+    if is_multivariate && !is_shared
+        sigma_name_str = "$(prefixed_key)_sigma_$(outcome_idx)"
+        innov_name_str = "$(prefixed_key)_innov_$(outcome_idx)"
+        latent_name_str = "$(prefixed_key)_latent_$(outcome_idx)"
+    else
+        sigma_name_str = "$(prefixed_key)_sigma"
+        if is_multivariate
+            innov_name_str = "$(prefixed_key)_innov_$(outcome_idx)"
+            latent_name_str = "$(prefixed_key)_latent_$(outcome_idx)"
+        else
+            innov_name_str = "$(prefixed_key)_innov"
+            latent_name_str = "$(prefixed_key)_latent"
+        end
+    end
+
+    sigma_name = Symbol(sigma_name_str)
+    innov_name = Symbol(innov_name_str)
+    latent_name = Symbol(latent_name_str)
+
+    priors_acc = String[]
+    if !is_multivariate || (is_multivariate && (!is_shared || outcome_idx == 1))
+        push!(priors_acc, "$(sigma_name) ~ NamedDist($(_distribution_to_string(m.sigma_prior)), :$(sigma_name))")
+    end
+    push!(priors_acc, "$(innov_name) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(innov_name))")
+    priors_str = join(priors_acc, "\n")
+
+    eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    index_var = "t_idx"
+
+    update_str = """
+    begin
+        # RW2 state-space evolution for $(key_str)
+        innovations = $(innov_name)
+        latent_field_raw = Vector{T}(undef, $(n_latent))
+        
+        if $(n_latent) > 0; latent_field_raw[1] = innovations[1]; end
+        if $(n_latent) > 1; latent_field_raw[2] = 2*latent_field_raw[1] + innovations[2]; end
+
+        for t in 3:$(n_latent)
+            latent_field_raw[t] = 2*latent_field_raw[t-1] - latent_field_raw[t-2] + innovations[t]
+        end
+        
+        # Apply sum-to-zero constraint for identifiability
+        if $(n_latent) > 0
+            $(latent_name) = (latent_field_raw .- mean(latent_field_raw)) .* $(sigma_name_str)
+            $(eta_update_target) .+= view($(latent_name), M.$(index_var))
+        end
+    end
+    """
+    
+    return (priors=priors_str, update=update_str)
+end
+
+
+
+
+
+function _generate_manifold_code_fragments(m::ComposedManifold, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # Purpose: Generates code fragments for composed manifolds, such as state-space models (`|>`).
+    # Rationale: This version is updated to prepend the manifold's domain type to parameter names,
+    #            ensuring they are correctly identified by the `get_optimal_sampler` grouping logic.
+    # v1.2.8 (2026-07-17)
+    
+    if m.operator == :pipe
+        # This block handles state-space evolution, specifically for spatially varying curves.
+        state_manifold = m.components[1]
+        dynamic_manifold = get(spec.params, :dynamic_manifold_obj, nothing)
+
+        key_str = string(spec.key)
+        domain_str = string(spec.domain)
+        if isempty(prefix)
+            prefixed_key = "$(domain_str)_$(key_str)"
+        else
+            prefixed_key = "$(prefix)_$(domain_str)_$(key_str)"
+        end
+        
+        is_multivariate = arch == "multivariate"
+        is_first_outcome = outcome_idx == 1
+        is_shared = get(spec.params, :shared, false)
+
+        if is_multivariate
+            eta_update_target = "eta_latent[:, $(outcome_idx)]"
+        else
+            eta_update_target = "eta"
+        end
+
+        # Define outcome-specific or shared parameter names
+        local sigma_name_str, rho_name_str, coeffs_raw_name_str
+        if is_multivariate && !is_shared
+            sigma_name_str = "$(prefixed_key)_sigma_$(outcome_idx)"
+            rho_name_str = "$(prefixed_key)_rho_$(outcome_idx)"
+            coeffs_raw_name_str = "$(prefixed_key)_coeffs_raw_$(outcome_idx)"
+        else
+            sigma_name_str = "$(prefixed_key)_sigma"
+            rho_name_str = "$(prefixed_key)_rho"
+            coeffs_raw_name_str = "$(prefixed_key)_coeffs_raw"
+        end
+        sigma_name = Symbol(sigma_name_str)
+        rho_name = Symbol(rho_name_str)
+        coeffs_raw_name = Symbol(coeffs_raw_name_str)
+
+        state_spec = spec.hyper.state_spec
+        n_spatial = size(state_spec.Q_template, 1)
+        
+        n_basis = dynamic_manifold.nbins
+        basis_key = get(spec.params, :dynamic_basis_key, nothing)
+        if isnothing(basis_key); error("Could not find basis matrix key for piped manifold $(key_str)."); end
+
+        priors_acc = String[]
+        # Generate priors only once for shared parameters, or for each outcome for non-shared
+        if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
+            if hasproperty(state_manifold, :sigma_prior); push!(priors_acc, "$(sigma_name) ~ NamedDist($(_distribution_to_string(state_manifold.sigma_prior)), :$(sigma_name))"); end
+            if hasproperty(state_manifold, :rho_prior); push!(priors_acc, "$(rho_name) ~ NamedDist($(_distribution_to_string(state_manifold.rho_prior)), :$(rho_name))"); end
+        end
+
+        push!(priors_acc, "$(coeffs_raw_name) ~ NamedDist(MvNormal(zeros(T, $(n_spatial * n_basis)), I), :$(coeffs_raw_name))")
+        priors_str = join(priors_acc, "\n        ")
+
+        is_state_static = get(state_spec, :is_static, false)
+
+        local cholesky_block
+        if is_state_static
+            cholesky_block = """
+    # Using pre-computed Cholesky factor for static state manifold in '$(prefixed_key)'
+    F_spatial = spec_registry["$(key_str)"].hyper.state_spec.cholesky_factor
+            """
+        else
+            cholesky_block = """
+    Q_spatial_template = spec_registry["$(key_str)"].hyper.state_spec.Q_template
+    state_m_type = spec_registry["$(key_str)"].hyper.state_spec.model_type
+    rho_val = $(hasproperty(state_manifold, :rho_prior) ? rho_name_str : "nothing")
+    Q_spatial = recompose_precision(state_m_type, Q_spatial_template, 1.0; extra_param=rho_val)
+    F_spatial = cholesky(Symmetric(Q_spatial + noise * I))
+            """
+        end
+
+        update_str = """
+    begin
+        $(cholesky_block)
+        
+        coeffs_raw_matrix = reshape($(coeffs_raw_name), $(n_spatial), $(n_basis))
+        spatial_coeffs = $(sigma_name_str) .* (F_spatial.U \\ coeffs_raw_matrix)
+        B_smooth = M.basis_matrices[:$(basis_key)]
+        $(eta_update_target) .+= sum(B_smooth .* spatial_coeffs[M.s_idx, :], dims=2)
+    end
+        """
+        return (priors=priors_str, update=update_str)
+    end
+    return (priors="", update="")
+end
+
+
+
+
+function _process_fixed_effects!(M::Dict, fixed_effects_vars::Vector{String})
+    # Purpose: Creates the design matrix for all fixed effects, excluding the intercept.
+    # Rationale: Consolidates fixed effects from bare terms and `fixed()` modules into a single design matrix.
+    #            The intercept is handled separately by the `intercept()` module and its assembler block.
+    # v1.2.1 (2026-07-16)
+    # Assumptions: `fixed_effects_vars` contains the names of fixed effect variable names.
+    # Inputs:
+    #   - M: The model configuration dictionary.
+    #   - fixed_effects_vars: A vector of fixed effect variable names.
+    # Outputs: None (mutates `M`).
+    
+    if isempty(fixed_effects_vars)
+        M[:Xfixed] = zeros(M[:y_N], 0)
+        M[:Xfixed_N] = 0
+        M[:Xfixed_names] = Symbol[]
+        M[:Xfixed_applied_formula] = nothing
+        return
+    end
+
+    rhs_vars = join(fixed_effects_vars, " + ")
+    # We explicitly add "0" to the formula to tell StatsModels.jl NOT to create an intercept column.
+    # The intercept is handled separately by the `intercept()` module logic in the assembler.
+    rhs = "0 + " * rhs_vars
+    
+    Xfixed_named, applied_formula = create_fixed_design(rhs, M[:data]; contrasts=get(M, :contrasts, Dict()))
+    if size(Xfixed_named, 1) != M[:y_N]
+        @warn "Dimension mismatch in fixed effects design matrix: Expected $(M[:y_N]) rows, but got $(size(Xfixed_named, 1)). Attempting to reconcile."
+        if size(Xfixed_named, 1) < M[:y_N]
+            padded_Xfixed = zeros(M[:y_N], size(Xfixed_named, 2))
+            padded_Xfixed[1:size(Xfixed_named, 1), :] = Matrix(Xfixed_named)
+            M[:Xfixed] = padded_Xfixed
+        else
+            M[:Xfixed] = Matrix(Xfixed_named[1:M[:y_N], :])
+        end
+    else
+        M[:Xfixed] = Matrix(Xfixed_named)
+    end
+    M[:Xfixed_N] = size(M[:Xfixed], 2)
+    M[:Xfixed_names] = size(Xfixed_named, 2) > 0 ? names(Xfixed_named, 2) : Symbol[]
+    M[:Xfixed_applied_formula] = applied_formula
+end
+
+function _canonical_term_string(term::StatsModels.AbstractTerm)
+    if term isa StatsModels.InteractionTerm
+        # Sort term names for canonical representation, e.g., "a&b" is the same as "b&a"
+        term_names = sort([string(t.sym) for t in term.terms])
+        return join(term_names, "&")
+    elseif term isa StatsModels.Term
+        return string(term.sym)
+    elseif term isa StatsModels.ConstantTerm
+        return "(Intercept)"
+    else
+        # Fallback for other term types like FunctionTerm, etc.
+        # This might not be perfectly canonical but is a reasonable default.
+        return string(term)
+    end
+end
+
+
+
+function _precompute_static_manifolds!(M::Dict)
+    # Purpose: Pre-computes the Cholesky factorization for static manifolds.
+    # Rationale: Moves constant computations out of the MCMC loop to improve sampling speed.
+    #            A manifold is "static" if its precision matrix structure does not depend on a
+    # v1.2.1 (2026-07-16)
+    #            hyperparameter that is sampled within the model (e.g., a `rho` parameter).
+    # Inputs:
+    #   - M: The model configuration dictionary, which is mutated.
+    # Outputs: None.
+    noise = get(M, :noise, 1e-6)
+    new_manifolds = []
+    # Define manifold types that do not have dynamic structure parameters like `rho`.
+    static_manifold_types = [IID, ICAR, Besag, RW1, RW2, Cyclic, PSpline, TPS, BSpline, Eigen, Moran, Spherical, Barycentric, TensorProductSmooth]
+
+    for spec_in in M[:manifolds]
+        current_spec = spec_in
+        m_obj = current_spec.manifold_obj
+
+        # Handle nested static manifolds within a ComposedManifold
+        if m_obj isa ComposedManifold && m_obj.operator == :pipe
+            state_spec = get(current_spec.hyper, :state_spec, nothing)
+            if !isnothing(state_spec)
+                state_m_obj = state_spec.manifold_obj
+                is_state_static = any(T -> state_m_obj isa T, static_manifold_types)
+
+                if is_state_static && !isnothing(state_spec.Q_template) && size(state_spec.Q_template, 1) > 0
+                    try
+                        Q_concrete = sparse(state_spec.Q_template)
+                        F = cholesky(Symmetric(Q_concrete + noise * I))
+                        new_state_spec = merge(state_spec, (is_static=true, cholesky_factor=F))
+                        new_hyper = merge(current_spec.hyper, (state_spec=new_state_spec,))
+                        current_spec = merge(current_spec, (hyper=new_hyper,))
+                    catch e
+                        @warn "Cholesky factorization failed for static state manifold in $(current_spec.key). Reverting to dynamic computation. Error: $e"
+                    end
+                end
+            end
+        end
+
+        # Now check the main manifold object of the (potentially updated) current_spec
+        is_main_static = !(current_spec.manifold_obj isa ComposedManifold) && any(T -> current_spec.manifold_obj isa T, static_manifold_types)
+
+        if is_main_static && !isnothing(current_spec.Q_template) && size(current_spec.Q_template, 1) > 0
+            try
+                # Ensure Q_template is a concrete sparse matrix for Cholesky
+                Q_concrete = sparse(current_spec.Q_template)
+                F = cholesky(Symmetric(Q_concrete + noise * I))
+                final_spec = merge(current_spec, (is_static=true, cholesky_factor=F))
+                push!(new_manifolds, final_spec)
+            catch e
+                @warn "Cholesky factorization failed for static manifold $(current_spec.key). Reverting to dynamic computation. Error: $e"
+                final_spec = merge(current_spec, (is_static=false,))
+                push!(new_manifolds, final_spec)
+            end
+        else
+            # For composed manifolds or dynamic manifolds, just add them.
+            # The is_static flag for the composed manifold itself remains false.
+            final_spec = merge(current_spec, (is_static=get(current_spec, :is_static, false),))
+            push!(new_manifolds, final_spec)
+        end
+    end
+    M[:manifolds] = new_manifolds
+end
+
+
 
 function _initialize_config(data::DataFrame, kwargs)
     # Purpose: Creates the initial model configuration dictionary.
@@ -712,7 +1417,9 @@ end
 
 function _resolve_obs_param!(opt_dict, params, data, param_keys, target_key)
     # Purpose: Finds an observation-level parameter (like offsets or weights) in the data and adds it to the config.
-    # Rationale: A helper to avoid repetitive code in `_process_lhs!`.
+    # Rationale: This version is updated to correctly handle scalar numeric inputs for parameters like y_L, y_U,
+    #            and hurdle, which was a source of user-reported errors. It also improves the warning message.
+    # v1.2.4 (2026-07-17)
     # Assumptions: `data` is a DataFrame.
     # Inputs:
     #   - opt_dict: The configuration dictionary to update.
@@ -726,51 +1433,29 @@ function _resolve_obs_param!(opt_dict, params, data, param_keys, target_key)
             val = params[key]
             if val isa Symbol && hasproperty(data, val)
                 opt_dict[target_key] = data[!, val]
+                opt_dict[Symbol("user_provided_", target_key)] = true
             elseif val isa AbstractVector
                 opt_dict[target_key] = val
+                opt_dict[Symbol("user_provided_", target_key)] = true
+            elseif val isa Number
+                opt_dict[target_key] = val
+                opt_dict[Symbol("user_provided_", target_key)] = true
             else
-                @warn "Observation parameter ':$val' for '$target_key' not found in data or is not a vector. Ignoring."
+                @warn "Observation parameter '$val' for '$target_key' is not a valid column name, vector, or scalar. Ignoring."
             end
             return
         end
     end
 end
 
-function _process_fixed_effects!(M::Dict, fixed_effects_vars::Vector{String}, has_intercept::Bool)
-    # Purpose: Creates the design matrix for all fixed effects.
-    # Rationale: Consolidates fixed effects from bare terms and `fixed()` modules into a single design matrix.
-    # Assumptions: `fixed_effects_vars` contains the names of fixed effect variables.
-    # Inputs:
-    #   - M: The model configuration dictionary.
-    #   - fixed_effects_vars: A vector of fixed effect variable names.
-    #   - has_intercept: A boolean indicating if an intercept should be included.
-    # Outputs: None (mutates `M`).
-    rhs = has_intercept ? "1" : "0"
-    if !isempty(fixed_effects_vars)
-        rhs_vars = join(fixed_effects_vars, " + ")
-        rhs = (rhs == "0") ? rhs_vars : rhs * " + " * rhs_vars
-    end
-    Xfixed_named = create_fixed_design(rhs, M[:data]; contrasts=get(M, :contrasts, Dict()))
-    if size(Xfixed_named, 1) != M[:y_N]
-        @warn "Dimension mismatch in fixed effects design matrix: Expected $(M[:y_N]) rows, but got $(size(Xfixed_named, 1)). Attempting to reconcile."
-        if size(Xfixed_named, 1) < M[:y_N]
-            padded_Xfixed = zeros(M[:y_N], size(Xfixed_named, 2))
-            padded_Xfixed[1:size(Xfixed_named, 1), :] = Matrix(Xfixed_named)
-            M[:Xfixed] = padded_Xfixed
-        else
-            M[:Xfixed] = Matrix(Xfixed_named[1:M[:y_N], :])
-        end
-    else
-        M[:Xfixed] = Matrix(Xfixed_named)
-    end
-    M[:Xfixed_N] = size(M[:Xfixed], 2)
-    M[:Xfixed_names] = size(Xfixed_named, 2) > 0 ? names(Xfixed_named, 2) : Symbol[]
-end 
- 
+
+
 function _process_fixed_effects_priors!(M::Dict) 
     # Purpose: Resolves and stores the prior distributions for each fixed effect coefficient.
-    # Rationale: Allows for custom priors on specific coefficients, falling back to a default.
-    # Assumptions: `M[:Xfixed_names]` and `M[:fixed_effects_priors]` are set.
+    # Rationale: This version is updated to correctly evaluate `Expr` objects for priors,
+    #            allowing users to specify distributions directly in the formula string.
+    # v1.2.8 (2026-07-17)
+    # Assumptions: `M[:Xfixed_applied_formula]` is populated by `_process_fixed_effects!`.
     # Inputs:
     #   - M: The model configuration dictionary.
     # Outputs: None (mutates `M`).
@@ -779,54 +1464,81 @@ function _process_fixed_effects_priors!(M::Dict)
         M[:Xfixed_priors_vec] = UnivariateDistribution[]
         return
     end
-    coef_names = get(M, :Xfixed_names, Symbol[])
+
+    calling_mod = get(M, :calling_module, Main)
     custom_priors = get(M, :fixed_effects_priors, Dict{Symbol, Any}())
     intercept_prior_val = get(M, :intercept_prior, nothing)
     default_prior = Normal(0, 5)
     priors_vec = Vector{Union{UnivariateDistribution, Nothing}}(undef, n_fixed)
     fill!(priors_vec, nothing)
 
-    # Normalize prior keys for matching against StatsModels coefficient names
     normalized_priors = Dict{String, Any}()
     for (key, prior) in custom_priors
-        # StatsModels uses "&" for interactions, so we normalize user input for consistency.
-        # This replaces both "*" and ":" with "&" and removes whitespace.
         norm_key = replace(string(key), r"\s*[\*:]\s*" => "&")
         norm_key = replace(norm_key, r"\s*&\s*" => "&")
+        
+        if occursin("&", norm_key)
+            parts = sort(Base.split(norm_key, '&'))
+            norm_key = join(parts, '&')
+        end
         normalized_priors[norm_key] = prior
     end
 
-    # Pass 1: Apply specific and interaction priors by matching normalized names
-    for i in 1:n_fixed
-        coef_name_str = string(coef_names[i])
-        # Normalize the coefficient name from StatsModels
-        norm_coef_name = replace(coef_name_str, r"\s*&\s*" => "&")
+    applied_formula = get(M, :Xfixed_applied_formula, nothing)
+    if isnothing(applied_formula)
+        @warn "Could not find the applied formula for fixed effects. Prior assignment may be incomplete. This is an internal issue."
+        M[:Xfixed_priors_vec] = fill(default_prior, n_fixed)
+        return
+    end
 
-        # Attempt to find a matching prior
-        for (prior_name, prior) in normalized_priors
-            # Match exact name (e.g., "x" or "x&y") or categorical level (e.g., "cat_var: level2")
-            if norm_coef_name == prior_name || startswith(coef_name_str, prior_name * ": ")
-                priors_vec[i] = prior isa Tuple ? create_pc_prior(Symbol(prior_name), prior) : prior
-                break # Found a match, move to the next coefficient
+    all_coef_names = string.(coefnames(applied_formula.rhs))
+    coef_name_to_idx = Dict(name => i for (i, name) in enumerate(all_coef_names))
+    processed_indices = Set{Int}()
+
+    for term in applied_formula.rhs.terms
+        canonical_name = _canonical_term_string(term)
+        
+        if haskey(normalized_priors, canonical_name)
+            prior_val = normalized_priors[canonical_name]
+            local prior_obj
+            if prior_val isa Expr
+                try; prior_obj = Core.eval(calling_mod, prior_val);
+                catch e; error("Could not evaluate `prior` argument `$(prior_val)` for fixed effect '$canonical_name'. Error: $e"); end
+            else
+                prior_obj = prior_val
+            end
+
+            term_coef_names = coefnames(term)
+            
+            term_coef_names_vec = term_coef_names isa AbstractString ? [term_coef_names] : term_coef_names
+
+            for coef_name in term_coef_names_vec
+                if haskey(coef_name_to_idx, coef_name)
+                    idx = coef_name_to_idx[coef_name]
+                    priors_vec[idx] = prior_obj isa Tuple ? create_pc_prior(Symbol(canonical_name), prior_obj) : prior_obj
+                    push!(processed_indices, idx)
+                else
+                    @warn "Coefficient name '$coef_name' for term '$canonical_name' not found in the full coefficient list. Prior may not be applied."
+                end
             end
         end
     end
 
-    # Pass 2: Fill in defaults for any remaining coefficients
-    for i in 1:n_fixed 
-        if isnothing(priors_vec[i]) 
-            coef_name_str = string(coef_names[i]) 
-            if coef_name_str == "(Intercept)" 
-                prior = intercept_prior_val 
-                priors_vec[i] = isnothing(prior) ? default_prior : (prior isa Tuple ? create_pc_prior(:intercept, prior) : prior) 
-            else 
-                priors_vec[i] = default_prior 
-            end 
-        end 
-    end 
- 
+    for i in 1:n_fixed
+        if !(i in processed_indices)
+            coef_name_str = all_coef_names[i]
+            if coef_name_str == "(Intercept)"
+                prior = intercept_prior_val
+                priors_vec[i] = isnothing(prior) ? default_prior : (prior isa Tuple ? create_pc_prior(:intercept, prior) : prior)
+            else
+                priors_vec[i] = default_prior
+            end
+        end
+    end
+
     M[:Xfixed_priors_vec] = convert(Vector{UnivariateDistribution}, priors_vec) 
 end 
+
 
 function _finalize_config!(M::Dict)
     # Purpose: Ensures the configuration dictionary has all necessary keys with default values.
@@ -844,7 +1556,8 @@ function _finalize_config!(M::Dict)
         :weights => ones(M[:y_N]),
         :trials => ones(Int, M[:y_N]),
         :hyperpriors => Dict(),
-        :prior_scheme => :pcpriors
+        :prior_scheme => :pcpriors,
+        :intercept_prior => Normal(0, 5)
     )
     for (key, val) in defaults
         if !haskey(M, key)
@@ -861,6 +1574,7 @@ end
 function process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `spatial()` module call.
     # Rationale: Handles the setup of the adjacency matrix `W` and spatial indices `s_idx`.
+    # v1.2.1 (2026-07-16)
     #            If `W` is not provided, it attempts to infer it from coordinates.
     # Assumptions: `data` is present in `opt_dict`.
     # Inputs:
@@ -912,6 +1626,7 @@ end
 function process_temporal_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
     # Purpose: Processes the `temporal()` or `seasonal()` module call.
     # Rationale: Sets up temporal indices (`t_idx`) or seasonal indices (`u_idx`) based on the model type.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `data` is present in `opt_dict`.
     # Inputs:
     #   - opt_dict, mod_data, registries, hyperpriors.
@@ -953,13 +1668,25 @@ end
 function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, manifolds_registry)
     # Purpose: Processes the `smooth()` module call.
     # Rationale: Generates basis matrices for spline-based or spectral smoothers, or sets up coordinates for GP-based smoothers.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `data` is present in `opt_dict`.
     # Inputs:
     #   - opt_dict, mod_data, basis_matrices_registry, manifolds_registry.
     # Outputs: None (mutates `opt_dict` and registries).
     # Returns: A boolean indicating whether a standard manifold object should be created for this module.
+    
+    local registry_to_use
+    if basis_matrices_registry isa Dict && haskey(basis_matrices_registry, :basis_matrices)
+        # This indicates the main config dict `M` was passed as the third argument.
+        registry_to_use = basis_matrices_registry[:basis_matrices]
+    else
+        # This indicates the basis_matrices dict itself was passed.
+        registry_to_use = basis_matrices_registry
+    end
+
     data = opt_dict[:data]
     params = mod_data[:params]
+    # The default model for a smooth term is a P-spline.
     model_param = get(params, :model, "pspline")
     basis_models = ["pspline", "bspline", "tps", "fft", "moran", "spherical", "barycentric", "decay", "wavelet", "linear", "invdist"]
     continuous_kernel_models = ["gp", "fitc", "svgp", "nystrom", "warp", "spde", "exponentialdecay", "rff", "kriging"]
@@ -1009,12 +1736,12 @@ function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, man
                 n_vars = length(mod_data[:variables])
                 if n_vars == 1
                     v_vec = data[!, Symbol(mod_data[:variables][1])]
-                    basis_matrices_registry[reg_key] = bstm_smooth_basis_1D(model_str, v_vec, nb, get(mod_data[:params], :degree, 3); mod_data[:params]...)
+                    registry_to_use[reg_key] = bstm_smooth_basis_1D(model_str, v_vec, nb, get(mod_data[:params], :degree, 3); mod_data[:params]...)
                 else
                     c_mat = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
-                    if n_vars == 2; basis_matrices_registry[reg_key] = bstm_smooth_basis_2D(model_str, c_mat, nb; mod_data[:params]...);
-                    elseif n_vars == 3; basis_matrices_registry[reg_key] = bstm_smooth_basis_3D(model_str, c_mat, nb; mod_data[:params]...);
-                    elseif n_vars == 4; basis_matrices_registry[reg_key] = bstm_smooth_basis_4D(model_str, c_mat, nb; mod_data[:params]...);
+                    if n_vars == 2; registry_to_use[reg_key] = bstm_smooth_basis_2D(model_str, c_mat, nb; mod_data[:params]...);
+                    elseif n_vars == 3; registry_to_use[reg_key] = bstm_smooth_basis_3D(model_str, c_mat, nb; mod_data[:params]...);
+                    elseif n_vars == 4; registry_to_use[reg_key] = bstm_smooth_basis_4D(model_str, c_mat, nb; mod_data[:params]...);
                     end
                 end
             end
@@ -1042,12 +1769,16 @@ function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, man
         mod_data[:params][:n_cat] = length(unique(indices))
         mod_data[:type] = :mixed
     end    
+    # Ensure the resolved model type is stored back for the manifold constructor.
+    mod_data[:params][:model] = model_param
+
     return true
 end
 
 function process_dynamics_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `dynamics()` module.
     # Rationale: Placeholder for future mechanistic model integration.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs:
     #   - opt_dict, mod_data, registries, hyperpriors.
@@ -1059,6 +1790,7 @@ end
 function process_eigen_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `eigen()` module for Bayesian PCA.
     # Rationale: Sets up the necessary indices for the Householder transformation parameterization.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `variables` are present in `mod_data`.
     # Inputs:
     #   - opt_dict, mod_data, registries, hyperpriors.
@@ -1083,6 +1815,7 @@ end
 function process_mixed_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `mixed()` module for random effects.
     # Rationale: Creates group indices and sets up parameters for random intercepts or slopes.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `data` is present in `opt_dict` and grouping variable exists.
     # Inputs:
     #   - opt_dict, mod_data, registries, hyperpriors.
@@ -1090,12 +1823,24 @@ function process_mixed_module!(opt_dict, mod_data, registries, hyperpriors)
     # Returns: A boolean indicating whether a standard manifold object should be created for this module.
     data = opt_dict[:data]
     vars = mod_data[:variables]
-    if length(vars) < 2
-        @warn "The mixed() module requires at least two variables: mixed(effect_var | group_var). Skipping."
+    
+    effect_var_str = ""
+    group_var_str = ""
+
+    if !isempty(vars) && vars[1] isa Expr && vars[1].head == :call && vars[1].args[1] == :|
+        # Handle `mixed(effect | group)` syntax
+        effect_expr = vars[1].args[2]
+        group_expr = vars[1].args[3]
+        effect_var_str = string(effect_expr)
+        group_var_str = string(group_expr)
+    elseif length(vars) >= 2
+        # Handle `mixed(effect, group)` syntax
+        effect_var_str = string(vars[1])
+        group_var_str = string(vars[2])
+    else
+        @warn "The mixed() module requires syntax `mixed(effect | group)` or `mixed(effect, group)`. Skipping."
         return false
     end
-    effect_var_str = vars[1]
-    group_var_str = vars[2]
     group_var_sym = Symbol(group_var_str)
     if !hasproperty(data, group_var_sym)
         @warn "Grouping variable ':$group_var_sym' for mixed() module not found in data. Skipping."
@@ -1115,6 +1860,7 @@ end
 function process_nested_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `nested()` module for multi-fidelity modeling.
     # Rationale: Recursively calls `bstm_config` to create a complete configuration for the sub-model.
+    # v1.2.1 (2026-07-16)
     # Assumptions: The specified `data_source` exists in `opt_dict`.
     # Inputs:
     #   - opt_dict, mod_data, registries, hyperpriors.
@@ -1125,12 +1871,18 @@ function process_nested_module!(opt_dict, mod_data, registries, hyperpriors)
     params = mod_data[:params]
     sub_formula = get(params, :formula, "")
     data_source_sym = get(params, :data_source, :data)
+
+    if data_source_sym != :data
+        error("Multi-fidelity models with a different `data_source` are not yet supported. The nested model must use the same data as the main model.")
+    end
+
     if !haskey(opt_dict, data_source_sym)
         @warn "Data source ':$data_source_sym' for nested module on '$var' not found. Skipping."
         return false
     end
+
     sub_data = opt_dict[data_source_sym]
-    sub_config = _initialize_config(sub_data, Dict(:calling_module => get(opt_dict, :calling_module, Main)))
+    sub_config = _initialize_config(sub_data, merge(opt_dict, Dict(:calling_module => get(opt_dict, :calling_module, Main))))
     sub_metadata = decompose_bstm_formula(sub_formula)
     _process_lhs!(sub_config, sub_metadata.outcomes)
     sub_config[:manifolds] = []
@@ -1147,14 +1899,16 @@ function process_nested_module!(opt_dict, mod_data, registries, hyperpriors)
     end
     _process_fixed_effects!(sub_config, sub_metadata.fixed_effects, sub_metadata.has_intercept)
     _process_fixed_effects_priors!(sub_config)
-    _finalize_config!(sub_config)
-    opt_dict[:nested_manifolds][var] = sub_config
-    return true
+    _precompute_static_manifolds!(sub_config) # Precompute for sub-model as well
+    _finalize_config!(sub_config) # Finalize after all processing
+    opt_dict[:nested_manifolds][var] = NamedTuple(sub_config) # Convert to NamedTuple for consistency
+    return false # Do not create a manifold object for the nested module itself
 end
 
 function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes interaction modules created by operators like `⊗` and `⊕`.
     # Rationale: Stores the components and operator type for later use by the model assembler.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `mod_data` contains `:operator` and `:components`.
     # Inputs:
     #   - opt_dict, mod_data, registries, hyperpriors.
@@ -1360,6 +2114,7 @@ end
 function process_spacetime_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `spacetime()` convenience module.
     # Rationale: Determines the Knorr-Held interaction type based on the specified spatial and temporal models.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `model` parameter is a tuple of (spatial_model, temporal_model).
     # Inputs:
     #   - opt_dict, mod_data, registries, hyperpriors.
@@ -1382,6 +2137,7 @@ end
 function process_fixed_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `fixed()` module.
     # Rationale: Gathers information about fixed effects, including custom contrasts and priors.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `mod_data` contains variables and optional parameters.
     # Inputs:
     #   - opt_dict, mod_data, registries, hyperpriors.
@@ -1393,7 +2149,8 @@ function process_fixed_module!(opt_dict, mod_data, registries, hyperpriors)
     if !haskey(opt_dict, :vars_to_categorize); opt_dict[:vars_to_categorize] = Set{Symbol}(); end
     params = mod_data[:params]
     vars = mod_data[:variables]
-    append!(opt_dict[:fixed_effects], string.(vars))
+    # The fixed effects list is now populated in `_categorize_rhs_nodes!`.
+    # This processor only handles side-effects like contrasts and priors.
     if haskey(params, :contrast)
         if !isempty(vars)
             contrast_sym = params[:contrast]
@@ -1423,6 +2180,7 @@ end
 function process_custom_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `custom()` module.
     # Rationale: Placeholder for user-defined custom model components.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs:
     #   - opt_dict, mod_data, registries, hyperpriors.
@@ -1434,6 +2192,7 @@ end
 function process_bcgn_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `bcgn()` module for bipartite graphs.
     # Rationale: Validates the provided bipartite adjacency matrix.
+    # v1.2.1 (2026-07-16)
     # Inputs: opt_dict, mod_data, registries, hyperpriors.
     # Outputs: Boolean indicating if a manifold should be created.
     params = mod_data[:params]
@@ -1447,6 +2206,7 @@ end
 function process_networkflow_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `networkflow()` module.
     # Rationale: Validates the provided adjacency matrix for the network flow model.
+    # v1.2.1 (2026-07-16)
     # Inputs: opt_dict, mod_data, registries, hyperpriors.
     # Outputs: Boolean indicating if a manifold should be created.
     params = mod_data[:params]
@@ -1462,6 +2222,7 @@ function process_localadaptive_module!(opt_dict, mod_data, registries, hyperprio
     # Purpose: Processes the `localadaptive()` module call.
     # Rationale: This module implements a localized spatial model where effects are centered
     #            around cluster-specific means. This processor handles the clustering of
+    # v1.2.1 (2026-07-16)
     #            spatial units based on their centroids.
     # Assumptions: The model requires spatial coordinates to perform clustering.
     # Inputs: opt_dict, mod_data, registries, hyperpriors.
@@ -1535,6 +2296,7 @@ end
 function bstm(formula::String, data::DataFrame; kwargs...)
     # Purpose: A wrapper for `bstm` that defaults to the `Main` module context.
     # Rationale: Simplifies calls when not inside a custom module.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs:
     #   - formula, data, kwargs.
@@ -1545,33 +2307,35 @@ end
 function bstm(formula::String, data::DataFrame, calling_module::Module; kwargs...)
     # Purpose: A wrapper that first calls `bstm_config` and then `bstm`.
     # Rationale: Separates configuration from model instantiation.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs:
     #   - formula, data, calling_module, kwargs.
     # Outputs: A Turing.jl model object.
     options = bstm_config(formula, data; calling_module=calling_module, kwargs...)
-    return bstm(options)
+    return bstm_dynamic_model(options)
 end
 
 function bstm(config::NamedTuple)
     # Purpose: The final user-facing wrapper that dispatches to the dynamic model generator.
     # Rationale: Provides a single entry point from a configuration object.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `config` is a valid model configuration.
     # Inputs:
-    #   - config: The model configuration NamedTuple.
+    #   - config: The model configuration NamedTuple from `bstm_config`.
     # Outputs: A Turing.jl model object.
     return bstm_dynamic_model(config)
 end
 
+
 function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, priors_dict, scheme::Symbol)
     # Purpose: Converts a parsed module dictionary into a concrete `Manifold` struct instance.
-    # Rationale: This is the bridge between the parsed formula and the typed manifold system.
+    # Rationale: This version provides more sensible defaults for core modules (`spatial`, `temporal`, `smooth`)
+    #            to prevent configuration errors when a model is not explicitly specified.
+    # v1.2.8 (2026-07-17)
     # Assumptions: `module_metadata` is a valid dictionary from the parser.
     # Inputs:
-    #   - module_metadata: The parsed module data.
-    #   - M: The main configuration dictionary.
-    #   - priors_dict: The dictionary of global hyperpriors.
-    #   - scheme: The prior scheme to use.
+    #   - module_metadata, M, priors_dict, scheme.
     # Outputs: A concrete `Manifold` struct instance.
     m_type = module_metadata[:type]
     m_params = module_metadata[:params]
@@ -1602,16 +2366,22 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
     elseif m_type == :svc
         cov_sym = Symbol(module_metadata[:variables][1])
         model_str = string(get(m_params, :model, "iid"))
-        inner_priors = resolve_hyperpriors(model_str, priors_dict, m_params, scheme)
+        inner_priors = resolve_hyperpriors(model_str, priors_dict, m_params, scheme, M[:calling_module])
         constructor_func = MANIFOLD_CONSTRUCTORS[Symbol(model_str)]
         inner_manifold = constructor_func(inner_priors, m_params)
         return SVCManifold(cov_sym, inner_manifold)
     else
-        default_model = if m_type in [:spatial, :temporal, :smooth]; "none"; elseif m_type == :intercept || m_type == :fixed; "none"; else string(m_type); end
+        default_model = if m_type == :spatial
+            haskey(M, :W) ? "bym2" : "iid"
+        elseif m_type == :temporal
+            "rw2"
+        elseif m_type == :smooth
+            "pspline"
+        else "none" end
         model_val = get(m_params, :model, default_model)
         model_name = if model_val isa Symbol; String(model_val); else; string(model_val); end
         model_sym = Symbol(model_name)
-        resolved_priors = resolve_hyperpriors(model_name, priors_dict, m_params, scheme)
+        resolved_priors = resolve_hyperpriors(model_name, priors_dict, m_params, scheme, M[:calling_module])
         if haskey(MANIFOLD_CONSTRUCTORS, model_sym)
             constructor_func = MANIFOLD_CONSTRUCTORS[model_sym]
             return constructor_func(resolved_priors, m_params)
@@ -1622,9 +2392,11 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
     end
 end
 
+
 function build_structure_template(type::Symbol, n::Int; scale=true, W=nothing)
     # Purpose: A factory for creating precision matrix templates for various GMRF and other structured models.
     # Rationale: Centralizes the construction of common precision matrices like ICAR, RW1, RW2, etc.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `n` is the number of units, `W` is provided for graph-based models.
     # Inputs:
     #   - type: The symbol for the model type (e.g., :icar, :rw2).
@@ -1654,22 +2426,32 @@ function build_structure_template(type::Symbol, n::Int; scale=true, W=nothing)
         Q = W 
         sf = 1.0 
     elseif type == :rw1
-        Q_rw1 = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1))
-        Q_rw1[1,1] = Q_rw1[n,n] = 1.0
-        Q = Q_rw1
-        sf = 1.0
+        Q_raw = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1))
+        Q_raw[1,1] = Q_raw[n,n] = 1.0
+        if scale
+            evals = eigvals(Matrix(Q_raw)); nz_ev = filter(x -> x > 1e-6, evals); sf = isempty(nz_ev) ? 1.0 : exp(mean(log.(nz_ev))); Q = Q_raw ./ sf;
+        else
+            Q = Q_raw
+        end
     elseif type == :ar1
         Q = spdiagm(-1 => fill(1.0, n-1), 1 => fill(1.0, n-1))
         sf = 1.0
     elseif type == :rw2
         D_rw2 = spdiagm(-2 => ones(n-2), -1 => -2*ones(n-1), 0 => ones(n), 1 => -2*ones(n-1), 2 => ones(n-2))
-        Q_rw2 = D_rw2' * D_rw2
-        Q = Q_rw2
-        sf = 1.0
+        Q_raw = D_rw2' * D_rw2
+        if scale
+            evals = eigvals(Matrix(Q_raw)); nz_ev = filter(x -> x > 1e-6, evals); sf = isempty(nz_ev) ? 1.0 : exp(mean(log.(nz_ev))); Q = Q_raw ./ sf;
+        else
+            Q = Q_raw
+        end
     elseif type == :cyclic
-        Q_cyc = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1), n-1 => [-1.0], -(n-1) => [-1.0])
-        Q_cyc[1,n] = Q_cyc[n,1] = -1.0
-        Q = Q_cyc
+        Q_raw = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1), n-1 => [-1.0], -(n-1) => [-1.0])
+        Q_raw[1,n] = Q_raw[n,1] = -1.0
+        if scale
+            evals = eigvals(Matrix(Q_raw)); nz_ev = filter(x -> x > 1e-6, evals); sf = isempty(nz_ev) ? 1.0 : exp(mean(log.(nz_ev))); Q = Q_raw ./ sf;
+        else
+            Q = Q_raw
+        end
     else
         @warn "BSTM Registry Fallback: Manifold :$type not recognized. Initializing Identity."
         Q = sparse(I(n))
@@ -1681,6 +2463,7 @@ end
 function build_model(m::Manifold, data_inputs::Dict)
     # Purpose: A generic builder that dispatches to a template-based builder.
     # Rationale: Provides a default behavior for manifold models.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs:
     #   - m: A Manifold object.
@@ -1692,6 +2475,7 @@ end
 function build_model(m::Union{IID, ICAR, Besag, BYM2, Leroux, SAR, LocalAdaptive}, data_inputs::Dict)
     # Purpose: Builder for spatial GMRF models.
     # Rationale: Dispatches to the template builder with a `:spatial` context.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs/Outputs: See `build_model`.
     return _build_from_template(m, data_inputs, :spatial)
@@ -1700,14 +2484,16 @@ end
 function build_model(m::Union{AR1, RW1, RW2}, data_inputs::Dict)
     # Purpose: Builder for temporal GMRF models.
     # Rationale: Dispatches to the template builder with a `:temporal` context.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs/Outputs: See `build_model`.
     return _build_from_template(m, data_inputs, :temporal)
 end
 
-function build_model(m::Union{GP, FITC, RFF, SVGP, Warp, Nystrom, Harmonic, Hyperbolic, ExponentialDecay, Kriging}, data_inputs::Dict)
+function build_model(m::Union{GP, FITC, RFF, SVGP, Warp, Nystrom, Harmonic, Hyperbolic, ExponentialDecay}, data_inputs::Dict)
     # Purpose: Builder for continuous, spectral, and other advanced manifolds.
     # Rationale: These models do not rely on pre-computed templates in the same way as GMRFs, so they use a pass-through builder.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs/Outputs: See `build_model`.
     return _build_pass_through_model(m, data_inputs)
@@ -1716,6 +2502,7 @@ end
 function build_model(m::Union{PSpline, TPS, BSpline}, data_inputs::Dict)
     # Purpose: Builder for spline-based smoothers.
     # Rationale: Determines the appropriate underlying GMRF template (RW1 or RW2) based on the spline type and penalty order.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs/Outputs: See `build_model`.
     n = m.nbins
@@ -1727,6 +2514,7 @@ end
 function build_model(m::Cyclic, data_inputs::Dict)
     # Purpose: Builder for the `Cyclic` manifold.
     # Rationale: Creates a circulant precision matrix for smooth periodic effects.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs/Outputs: See `build_model`.
     template = build_structure_template(:cyclic, m.period)
@@ -1736,6 +2524,7 @@ end
 function build_model(m::Eigen, data_inputs::Dict)
     # Purpose: Builder for the `Eigen` manifold.
     # Rationale: Creates an identity template, as the structure is handled dynamically within the model.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs/Outputs: See `build_model`.
     n = get(data_inputs, :s_N, 1)
@@ -1746,6 +2535,7 @@ end
 function build_model(m::DynamicsManifold, data_inputs::Dict)
     # Purpose: Builder for the `DynamicsManifold`.
     # Rationale: Provides a Laplacian template for physics-based models like advection/diffusion.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `W` is available in `data_inputs`.
     # Inputs/Outputs: See `build_model`.
     n = get(data_inputs, :s_N, 1)
@@ -1757,6 +2547,7 @@ end
 function build_model(m::TensorProductSmooth, data_inputs::Dict)
     # Purpose: Builder for the `TensorProductSmooth` manifold.
     # Rationale: This manifold is typically constructed programmatically by an interaction processor.
+    # v1.2.1 (2026-07-16)
     #            It passes the pre-computed Q_template from the manifold object to the assembler.
     # Assumptions: `m.Q_template` is correctly populated.
     hyper_dict = Dict{Symbol, Any}()
@@ -1767,6 +2558,7 @@ end
 function build_model(m::ComposedManifold, data_inputs::Dict)
     # Purpose: Builder for composed manifolds.
     # Rationale: Handles the `pipe` operator by recursively building the state manifold's spec and attaching it.
+    # v1.2.1 (2026-07-16)
     # Assumptions: For `pipe`, there are exactly two components.
     # Inputs/Outputs: See `build_model`.
     if m.operator == :pipe
@@ -1800,6 +2592,7 @@ end
 function _build_from_template(m::ManifoldModel, data_inputs::Dict, domain::Symbol)
     # Purpose: A generic builder for manifolds that use a pre-defined template.
     # Rationale: Reduces code duplication for common GMRF models.
+    # v1.2.1 (2026-07-16)
     # Assumptions: The manifold type has a corresponding entry in `build_structure_template`.
     # Inputs:
     #   - m: The ManifoldModel object.
@@ -1826,6 +2619,7 @@ end
 function _build_pass_through_model(m::ManifoldModel, data_inputs::Dict; model_type_sym=nothing, Q_template_val=nothing, sf_val=1.0)
     # Purpose: A generic builder for manifolds that do not require complex template generation.
     # Rationale: Used for models where the structure is defined by parameters (e.g., splines) or handled dynamically.
+    # v1.2.1 (2026-07-16)
     #            This version ensures a default identity Q_template is created for basis-like models.
     # Assumptions: None.
     # Inputs:
@@ -1858,6 +2652,7 @@ end
 function observation_volatility(M::NamedTuple)
     # Purpose: Generates code fragments for the observation error variance.
     # Rationale: Handles both constant variance and a spatiotemporal stochastic volatility (SV) model
+    # v1.2.1 (2026-07-16)
     #            using Random Fourier Features (RFF), activated by a flag in the model configuration.
     # Inputs:
     #   - M: The model configuration NamedTuple.
@@ -1901,302 +2696,133 @@ end
 function _generate_manifold_code_fragments(spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing})
     # Purpose: Dispatches code generation to a specific method based on the manifold object type.
     # Rationale: This is the entry point for converting a high-level manifold specification
+    # v1.2.1 (2026-07-16)
     #            into low-level Turing model code strings.
     return _generate_manifold_code_fragments(spec.manifold_obj, spec, arch, outcome_idx)
 end
+ 
 
-function _generate_manifold_code_fragments(m::ManifoldModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing})
-    # Purpose: Generic fallback for simple GMRF-style manifolds (IID, ICAR, RW1, etc.).
-    # Rationale: Implements a standard non-centered parameterization for Gaussian Markov Random Fields.
-    #            This reduces code duplication for many common spatial and temporal models.
-    
-    key = string(spec.key)
-    params = spec.params
-    n_latent = size(spec.Q_template, 1)
-    is_multivariate = arch == "multivariate"
-    is_first_outcome = outcome_idx == 1
-
-    # Determine if hyperparameters are shared across outcomes
-    is_shared = get(params, :shared, false)
-
-    # Generate unique names for parameters and latent variables
-    # For shared parameters in multivariate models, the name is not indexed by outcome.
-    # For non-shared parameters, the name is indexed.
-    # For univariate models, the name is not indexed.
-    sigma_name_str = if is_multivariate && !is_shared; "$(key)_sigma_$(outcome_idx)"; else; "$(key)_sigma"; end
-    rho_name_str = if is_multivariate && !is_shared; "$(key)_rho_$(outcome_idx)"; else; "$(key)_rho"; end
-    latent_raw_name_str = is_multivariate ? "$(key)_raw_$(outcome_idx)" : "$(key)_raw"
-    
-    sigma_name = Symbol(sigma_name_str)
-    rho_name = Symbol(rho_name_str)
-    latent_raw_name = Symbol(latent_raw_name_str)
-    latent_name = Symbol(is_multivariate ? "$(key)_latent_$(outcome_idx)" : "$(key)_latent")
-
-    priors_acc = String[]
-
-    # Generate hyperparameter priors only once if they are shared
-    if !is_multivariate || !is_shared || (is_shared && is_first_outcome)
-        if hasproperty(m, :sigma_prior)
-            push!(priors_acc, "$(sigma_name) ~ NamedDist($(m.sigma_prior), :$(sigma_name))")
-        end
-        if hasproperty(m, :rho_prior)
-            push!(priors_acc, "$(rho_name) ~ NamedDist($(m.rho_prior), :$(rho_name))")
-        end
-    end
-
-    # The raw latent field is always outcome-specific in multivariate models
-    push!(priors_acc, "$(latent_raw_name) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(latent_raw_name))")
-    
-    priors_str = join(priors_acc, "\n        ")
-    
-    # Determine the correct index variable to use for applying the effect
-    index_var = if spec.domain == :spatial
-        "s_idx"
-    elseif spec.domain == :temporal
-        typeof(m) <: Union{Cyclic, Harmonic} ? "u_idx" : "t_idx"
-    else
-        string(spec.domain) * "_idx"
-    end
-
-    # Determine which eta to update
-    eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
-
-    # Code to construct the precision matrix and the latent field
-    update_str = """
-        begin
-            local Q_template = spec_registry["$key"].Q_template
-            local m_type = spec_registry["$(key)"].manifold_obj |> typeof |> Symbol
-            local rho_val = $(hasproperty(m, :rho_prior) ? rho_name_str : "nothing")
-            
-            local Q_final = recompose_precision(m_type, Q_template, 1.0; extra_param=rho_val)
-
-            local F = cholesky(Symmetric(Q_final + noise * I))
-            local $(latent_name) = $(sigma_name_str) .* (F.U \\ $(latent_raw_name))
-            
-            if Symbol("$(spec.domain)") == :smooth
-                $(eta_update_target) .+= M.basis_matrices[:$(spec.var)] * $(latent_name)
-            else
-                $(eta_update_target) .+= view($(latent_name), M.$(index_var))
-            end
-        end
-    """
-    
-    return (priors=priors_str, update=update_str)
-end
-
-function _generate_manifold_code_fragments(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing})
+function _generate_manifold_code_fragments(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
     # Purpose: Generates code for the Bayesian PCA (`eigen`) manifold.
     # Rationale: Implements the Householder reflection parameterization for the loading matrix.
+    # v1.2.1 (2026-07-16)
 
-    key = string(spec.key)
+    key_str = string(spec.key)
+    prefixed_key = isempty(prefix) ? key_str : "$(prefix)_$(key_str)"
     n_vars = m.n_vars
     n_factors = m.n_factors
 
     if n_vars == 0
-        error("Eigen manifold '$(key)' has n_vars=0, which is invalid. This typically occurs if the manifold was not processed correctly from the formula (e.g., no variables specified for eigen()).")
+        error("Eigen manifold '$(prefixed_key)' has n_vars=0, which is invalid. This typically occurs if the manifold was not processed correctly from the formula (e.g., no variables specified for eigen()).")
     end
 
     priors_str = """
         pca_sd_priors = $(m.pca_sd_prior)
         pdef_sd_priors = $(m.pdef_sd_prior)
 
-        v_raw_$(key) ~ NamedDist(MvNormal(zeros(T, $(length(m.ltri_indices))), 1.0), :v_raw_$(key))
-        d_raw_$(key) ~ NamedDist(MvNormal(zeros(T, $(n_factors)), 1.0), :d_raw_$(key))
+        v_raw_$(prefixed_key) ~ NamedDist(MvNormal(zeros(T, $(length(m.ltri_indices))), 1.0), :v_raw_$(prefixed_key))
+        d_raw_$(prefixed_key) ~ NamedDist(MvNormal(zeros(T, $(n_factors)), 1.0), :d_raw_$(prefixed_key))
         
-        pca_sds_$(key) ~ NamedDist(filldist(pca_sd_priors, $(n_factors)), :pca_sds_$(key))
-        pdef_sds_$(key) ~ NamedDist(filldist(pdef_sd_priors, $(n_factors)), :pdef_sds_$(key))
+        pca_sds_$(prefixed_key) ~ NamedDist(filldist(pca_sd_priors, $(n_factors)), :pca_sds_$(prefixed_key))
+        pdef_sds_$(prefixed_key) ~ NamedDist(filldist(pdef_sd_priors, $(n_factors)), :pdef_sds_$(prefixed_key))
 
-        factors_$(key) ~ NamedDist(MvNormal(zeros(T, M.y_N * $(n_factors)), I), :factors_$(key))
+        factors_$(prefixed_key) ~ NamedDist(MvNormal(zeros(T, M.y_N * $(n_factors)), I), :factors_$(prefixed_key))
     """
 
     update_str = """
         begin
-            local v_mat_$(key) = zeros(T, $(n_vars), $(n_factors))
-            v_mat_$(key)[$(m.ltri_indices)] .= v_raw_$(key)
+            v_mat_$(prefixed_key) = zeros(T, $(n_vars), $(n_factors))
+            v_mat_$(prefixed_key)[$(m.ltri_indices)] .= v_raw_$(prefixed_key)
 
-            local U_$(key) = householder_to_eigenvector(v_mat_$(key), $(n_vars), $(n_factors))
+            U_$(prefixed_key) = householder_to_eigenvector(v_mat_$(prefixed_key), $(n_vars), $(n_factors))
             
-            local d_trans_$(key) = exp.(d_raw_$(key) .* pdef_sds_$(key))
-            local D_mat_$(key) = Diagonal(d_trans_$(key))
+            d_trans_$(prefixed_key) = exp.(d_raw_$(prefixed_key) .* pdef_sds_$(prefixed_key))
+            D_mat_$(prefixed_key) = Diagonal(d_trans_$(prefixed_key))
 
-            local L_$(key) = U_$(key) * D_mat_$(key)
+            L_$(prefixed_key) = U_$(prefixed_key) * D_mat_$(prefixed_key)
 
-            local F_matrix_$(key) = reshape(factors_$(key), M.y_N, $(n_factors))
-            local eigen_effects = (F_matrix_$(key) * L_$(key)') .* pca_sds_$(key)'
+            F_matrix_$(prefixed_key) = reshape(factors_$(prefixed_key), M.y_N, $(n_factors))
+            F_scaled_$(prefixed_key) = F_matrix_$(prefixed_key) .* pca_sds_$(prefixed_key)'
+            eigen_effects = F_scaled_$(prefixed_key) * L_$(prefixed_key)'
 
             eta .+= sum(eigen_effects, dims=2)
         end
     """
     return (priors=priors_str, update=update_str)
-end
+end 
 
-function _generate_manifold_code_fragments(m::ComposedManifold, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing})
-    # Purpose: Generates code fragments for composed manifolds, such as state-space models.
-    # Rationale: This function handles complex interactions defined by operators like `|>`.
-    #            It currently supports spatially varying curves, e.g., `spatial() |> smooth()`.
+ 
 
-    if m.operator == :pipe
-        # This block handles state-space evolution, specifically for spatially varying curves.
-        state_manifold = m.components[1]
-        dynamic_manifold = get(spec.params, :dynamic_manifold_obj, nothing)
+function _generate_householder_reflection_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
+    # Purpose: Generates code for the Householder reflection (spectral orientation) feature.
+    # Rationale: This allows for rotating the latent space in multivariate models to better
+    # v1.2.1 (2026-07-16)
+    #            align signals, which can be useful for processes with directional dependencies.
+    #            This is controlled by the `spectral_orientation=true` keyword argument.
+    # Inputs:
+    #   - M: The model configuration NamedTuple.
+    #   - is_multivariate: A boolean indicating if the model is multivariate.
+    #   - eta_name: The name of the latent predictor matrix (e.g., "eta_latent").
+    # Outputs: A tuple of strings (priors_str, update_str).
 
-        # Validate that the composition is a supported type.
-        if !(state_manifold isa Union{ICAR, Besag, BYM2, Leroux, SAR}) || !(dynamic_manifold isa Union{PSpline, BSpline, TPS})
-            error("Pipe operator `spatial |> smooth` currently only supports GMRF spatial models and Spline-based smoothers.")
-        end
-
-        key = string(spec.key)
-        is_multivariate = arch == "multivariate"
-        eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
-
-        # Extract specifications for the state (spatial) and dynamic (smooth) components.
-        state_spec = spec.hyper.state_spec
-        Q_spatial_template = state_spec.Q_template
-        n_spatial = size(Q_spatial_template, 1)
-        
-        n_basis = dynamic_manifold.nbins
-        basis_key = get(spec.params, :dynamic_basis_key, nothing)
-        if isnothing(basis_key)
-            error("Could not find basis matrix key for piped manifold $(key).")
-        end
-
-        # --- Priors ---
-        # We need to define `n_basis` independent spatial fields, one for each basis function of the smoother.
-        # These fields share common hyperparameters for scale and correlation.
-        priors_acc = String[]
-
-        sigma_name = Symbol("$(key)_sigma")
-        rho_name = Symbol("$(key)_rho")
-        
-        if hasproperty(state_manifold, :sigma_prior); push!(priors_acc, "$(sigma_name) ~ NamedDist($(state_manifold.sigma_prior), :$(sigma_name))"); end
-        if hasproperty(state_manifold, :rho_prior); push!(priors_acc, "$(rho_name) ~ NamedDist($(state_manifold.rho_prior), :$(rho_name))"); end
-
-        # Define raw latent variables for the `n_basis` spatial fields.
-        coeffs_raw_name = Symbol("$(key)_coeffs_raw")
-        push!(priors_acc, "$(coeffs_raw_name) ~ NamedDist(MvNormal(zeros(T, $(n_spatial * n_basis)), I), :$(coeffs_raw_name))")
-        
-        priors_str = join(priors_acc, "\n        ")
-
-        # --- Update ---
-        # This block generates the code to construct the spatially varying effect.
-        update_str = """
-            begin
-                local Q_spatial_template = spec_registry["$(spec.key)"].hyper.state_spec.Q_template
-                local state_m_type = spec_registry["$(spec.key)"].hyper.state_spec.model_type
-                local rho_val = $(hasproperty(state_manifold, :rho_prior) ? string(rho_name) : "nothing")
-                local Q_spatial = recompose_precision(state_m_type, Q_spatial_template, 1.0; extra_param=rho_val)
-                local F_spatial = cholesky(Symmetric(Q_spatial + noise * I))
-                local coeffs_raw_matrix = reshape($(coeffs_raw_name), $(n_spatial), $(n_basis))
-                local spatial_coeffs = $(sigma_name) .* (F_spatial.U \\ coeffs_raw_matrix)
-                local B_smooth = M.basis_matrices[:$(basis_key)]
-                $(eta_update_target) .+= sum(B_smooth .* spatial_coeffs[M.s_idx, :], dims=2)
-            end
-        """
-        return (priors=priors_str, update=update_str)
+    if !is_multivariate || !get(M, :spectral_orientation, true)  # false will hardly make any sense in Bayesian models
+        return "", ""
     end
 
-    # Fallback for other operators
-    return (priors="", update="")
-end
+    K = M[:outcomes_N]
+    
+    priors_str = """
+    # Householder reflection for spectral orientation
+    v_raw_reflection ~ NamedDist(MvNormal(zeros(T, $(K)), I), :v_raw_reflection)
+    """
 
-function _generate_manifold_code_fragments(m::ComposedManifold, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing})
-    # Purpose: Generates code fragments for composed manifolds, such as state-space models.
-    # Rationale: This function handles complex interactions defined by operators like `|>` and `∘`.
-
-    if m.operator == :pipe
-        # This block handles state-space evolution, specifically for spatially varying curves.
-        state_manifold = m.components[1]
-        dynamic_manifold = get(spec.params, :dynamic_manifold_obj, nothing)
-
-        if !(state_manifold isa Union{ICAR, Besag, BYM2, Leroux, SAR}) || !(dynamic_manifold isa Union{PSpline, BSpline, TPS})
-            error("Pipe operator `spatial |> smooth` currently only supports GMRF spatial models and Spline-based smoothers.")
-        end
-
-        key = string(spec.key)
-        is_multivariate = arch == "multivariate"
-        eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
-
-        state_spec = spec.hyper.state_spec
-        Q_spatial_template = state_spec.Q_template
-        n_spatial = size(Q_spatial_template, 1)
-        
-        n_basis = dynamic_manifold.nbins
-        basis_key = get(spec.params, :dynamic_basis_key, nothing)
-        if isnothing(basis_key); error("Could not find basis matrix key for piped manifold $(key)."); end
-
-        priors_acc = String[]
-        sigma_name = Symbol("$(key)_sigma")
-        rho_name = Symbol("$(key)_rho")
-        if hasproperty(state_manifold, :sigma_prior); push!(priors_acc, "$(sigma_name) ~ NamedDist($(state_manifold.sigma_prior), :$(sigma_name))"); end
-        if hasproperty(state_manifold, :rho_prior); push!(priors_acc, "$(rho_name) ~ NamedDist($(state_manifold.rho_prior), :$(rho_name))"); end
-        coeffs_raw_name = Symbol("$(key)_coeffs_raw")
-        push!(priors_acc, "$(coeffs_raw_name) ~ NamedDist(MvNormal(zeros(T, $(n_spatial * n_basis)), I), :$(coeffs_raw_name))")
-        priors_str = join(priors_acc, "\n        ")
-
-        update_str = """
-            begin
-                local Q_spatial_template = spec_registry["$(spec.key)"].hyper.state_spec.Q_template
-                local state_m_type = spec_registry["$(spec.key)"].hyper.state_spec.model_type
-                local rho_val = $(hasproperty(state_manifold, :rho_prior) ? string(rho_name) : "nothing")
-                local Q_spatial = recompose_precision(state_m_type, Q_spatial_template, 1.0; extra_param=rho_val)
-                local F_spatial = cholesky(Symmetric(Q_spatial + noise * I))
-                local coeffs_raw_matrix = reshape($(coeffs_raw_name), $(n_spatial), $(n_basis))
-                local spatial_coeffs = $(sigma_name) .* (F_spatial.U \\ coeffs_raw_matrix)
-                local B_smooth = M.basis_matrices[:$(basis_key)]
-                $(eta_update_target) .+= sum(B_smooth .* spatial_coeffs[M.s_idx, :], dims=2)
-            end
-        """
-        return (priors=priors_str, update=update_str)
-
-    elseif m.operator == :composition
-        # Handles non-stationary variance: spatial() ∘ smooth()
-        priors_code = get(spec.params, :priors, "")
-        update_code = get(spec.params, :update, "")
-        if isempty(priors_code) || isempty(update_code)
-            @warn "Composition manifold '$(spec.key)' is missing custom code fragments. It will have no effect. Please use `custom()` to define the composition logic."
-            return (priors="", update="")
-        end
-        return (priors=priors_code, update=update_code)
+    update_str = """
+    begin
+        v_reflection = v_raw_reflection / (norm(v_raw_reflection) + 1e-9)
+        H_reflection = I - 2.0 * v_reflection * v_reflection'
+        $(eta_name) = $(eta_name) * H_reflection
     end
-
-    return (priors="", update="")
+    """
+    return priors_str, update_str
 end
 
 function bstm_text_assembler(M::NamedTuple)
     # Purpose: Dynamically generates the Turing `@model` function as a string.
-    # Rationale: Allows for extreme flexibility in model specification via the formula interface.
-    #            The model structure is built at runtime based on the configuration.
+    # Rationale: This refactored version uses helper functions to generate code blocks,
+    # v1.2.1 (2026-07-16)
+    #            improving readability and maintainability.
     # Assumptions: `M` is a complete and valid model configuration from `bstm_config`.
     # Inputs:
-    #   - M: The model configuration NamedTuple.
-    # Outputs: A tuple containing the parsed model expression and the specification registry.
+    #   - M: The model configuration NamedTuple. 
+    # Outputs: A tuple containing the model string, the parsed model expression, and the specification registry.
     arch = get(M, :model_arch, "univariate")
-    is_multivariate = arch == "multivariate"
-    
-    model_func_name = if arch == "multivariate"
-        :bstm_text_generated_multivariate
-    elseif arch == "multifidelity"
-        :bstm_text_generated_multifidelity
+    local is_multivariate, model_func_name
+    if arch == "multivariate" 
+        is_multivariate = true
+        model_func_name = :bstm_text_generated_multivariate
     else
-        :bstm_text_generated_univariate
+        is_multivariate = false
+        model_func_name = :bstm_text_generated_univariate
     end
+
+    eta_name = is_multivariate ? "eta_latent" : "eta"
+    eta_init = is_multivariate ? "zeros(T, N, K)" : "zeros(T, N)"
+    outcomes_N = get(M, :outcomes_N, 1)
 
     spec_registry = Dict{String, Any}()
     priors_acc = String[]
     updates_acc = String[]
-    outcomes_N = get(M, :outcomes_N, 1)
-    
+
     main_spatial_spec = nothing
     main_temporal_spec = nothing
-
+    
     for spec in M.manifolds
         spec_registry[string(spec.key)] = spec
         for k in 1:outcomes_N
-            outcome_idx = arch == "multivariate" ? k : nothing
-            frag = _generate_manifold_code_fragments(spec, arch, outcome_idx)
-            
-            push!(priors_acc, frag.priors)
-            push!(updates_acc, frag.update)
+            outcome_idx = is_multivariate ? k : nothing            
+            frag = _generate_manifold_code_fragments(spec.manifold_obj, spec, arch, outcome_idx)
+            if !isempty(strip(frag.priors)); push!(priors_acc, frag.priors); end
+            if !isempty(strip(frag.update)); push!(updates_acc, frag.update); end
         end
 
         if spec.domain == :spatial && isnothing(main_spatial_spec)
@@ -2207,178 +2833,62 @@ function bstm_text_assembler(M::NamedTuple)
         end
     end
 
-    zi_prior_block = if get(M, :use_zi, false)
-        "lik_phi_zi ~ NamedDist(Beta(1,1), :lik_phi_zi)"
-    else
-        "lik_phi_zi = 0.0"
+    # Helper to indent a block of code for clean code generation
+    function _indent_block(text::String, level=1)
+        if isempty(strip(text)) return "" end
+        indent_str = "    " ^ level
+        return indent_str * replace(strip(text), "\n" => "\n" * indent_str)
     end
 
-    likelihood_section = if is_multivariate
-        """
-        L_corr ~ NamedDist(LKJCholesky(K, 1.0), :L_corr)
-        y_sigma ~ NamedDist(filldist(Exponential(1.0), K), :y_sigma)
-        $(zi_prior_block)
-        """
-    else
-        """
-        y_sigma_const ~ NamedDist(Exponential(1.0), :y_sigma_const)
-        $(observation_volatility(M).priors)
-        $(observation_volatility(M).calculation)
-        $(zi_prior_block)
-        """
-    end
+    # Generate all code blocks
+    likelihood_section = _generate_likelihood_section(M, is_multivariate)
+    intercept_block = _generate_intercept_block(M, is_multivariate, eta_name)
+    offset_block = _generate_offset_block(M, is_multivariate, eta_name)
+    fixed_effects_block = _generate_fixed_effects_block(M, is_multivariate, eta_name) 
+    st_interaction_block = _generate_st_interaction_block(M, main_spatial_spec, main_temporal_spec, is_multivariate)
+    householder_priors, householder_update = _generate_householder_reflection_block(M, is_multivariate, eta_name)
+    final_likelihood = _generate_final_likelihood_block(M, is_multivariate)
+    nested_priors, nested_updates, nested_likelihoods = _generate_nested_model_block(M, is_multivariate, eta_name)
 
-    eta_name = is_multivariate ? "eta_latent" : "eta"
-    eta_init = is_multivariate ? "zeros(T, N, K)" : "zeros(T, N)"
-
-    intercept_block = if get(M, :add_intercept, false)
-        dist = is_multivariate ? "filldist(get(M, :intercept_prior, Normal(0,5)), K)" : "get(M, :intercept_prior, Normal(0, 5))"
-        update = is_multivariate ? "for k in 1:K; $(eta_name)[:, k] .+= intercept[k]; end" : "$(eta_name) .+= intercept"
-        """
-        intercept ~ NamedDist($(dist), :intercept)
-        $(update)
-        """
-    else "" end
-
-    offset_block = if haskey(M, :log_offset)
-        is_multivariate ? "$(eta_name) .+= get(M, :log_offset, zeros(T, N, 1))" : "$(eta_name) .+= get(M, :log_offset, zeros(T, N))"
-    else "" end
-
-    fixed_effects_block = if M.Xfixed_N > 0
-        if is_multivariate
-            """
-            begin
-                # Sample each coefficient individually to allow for custom priors,
-                # then flatten into a single vector consistent with reconstruction logic.
-                local Xfixed_beta_flat = Vector{T}(undef, M.Xfixed_N * K)
-                local priors = get(M, :Xfixed_priors_vec, [Normal(0, 5) for _ in 1:M.Xfixed_N])
-                
-                for k in 1:K
-                    for i in 1:M.Xfixed_N
-                        local flat_idx = (k - 1) * M.Xfixed_N + i
-                        # The prior for coefficient `i` is shared across all outcomes `k`.
-                        Xfixed_beta_flat[flat_idx] ~ NamedDist(priors[i], Symbol("Xfixed_beta[", flat_idx, "]"))
-                    end
-                end
-
-                eta_latent .+= M.Xfixed * reshape(Xfixed_beta_flat, M.Xfixed_N, K)
-            end
-            """
-        else
-            """
-            begin
-                local Xfixed_beta = Vector{T}(undef, M.Xfixed_N)
-                local priors = get(M, :Xfixed_priors_vec, [Normal(0, 5) for _ in 1:M.Xfixed_N])
-                for i in 1:M.Xfixed_N
-                    Xfixed_beta[i] ~ NamedDist(priors[i], Symbol("Xfixed_beta[", i, "]"))
-                end
-                eta .+= M.Xfixed * Xfixed_beta
-            end
-            """
-        end
-    else "" end
-
-    st_interaction_block = ""
-    model_st = get(M, :model_st, "none")
-    if model_st != "none"
-        if isnothing(main_spatial_spec) || isnothing(main_temporal_spec)
-            @warn "Spacetime interaction specified, but could not find both a primary spatial and temporal manifold. Interaction term will be ignored."
-        else
-            st_interaction_block = """
-            st_sigma ~ NamedDist(Exponential(0.5), :st_sigma)
-            st_raw ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :st_raw)
-            
-            let s_Q = spec_registry["$(main_spatial_spec.key)"].Q_template,
-                t_Q = spec_registry["$(main_temporal_spec.key)"].Q_template,
-                t_rho = if $(main_temporal_spec.manifold_obj isa AR1)
-                            $(Symbol("temporal_$(main_temporal_spec.var)_rho"))
-                        else
-                            -999.0 
-                        end
-
-                st_inter = zeros(T, M.s_N, M.t_N)
-                st_innov_matrix = reshape(st_raw, M.s_N, M.t_N)
-
-                if "$(model_st)" == "I"
-                    st_inter = st_innov_matrix .* st_sigma
-                elseif "$(model_st)" == "II"
-                    C_t = cholesky(Symmetric(Matrix(t_Q) + noise * I))
-                    st_inter = (C_t.U \\ st_innov_matrix')' .* st_sigma
-                elseif "$(model_st)" == "III"
-                    C_s = cholesky(Symmetric(Matrix(s_Q) + noise * I))
-                    st_inter = (C_s.U \\ st_innov_matrix) .* st_sigma
-                elseif "$(model_st)" == "IV"
-                    if t_rho == -999.0
-                        @warn "Type IV interaction specified, but main temporal effect is not AR1. Defaulting to Type III."
-                        C_s = cholesky(Symmetric(Matrix(s_Q) + noise * I))
-                        st_inter = (C_s.U \\ st_innov_matrix) .* st_sigma
-                    else
-                        C_s = cholesky(Symmetric(Matrix(s_Q) + noise * I))
-                        st_inter[:, 1] = (C_s.U \\ st_innov_matrix[:, 1]) ./ sqrt(1.0 - t_rho^2 + noise)
-                        for t in 2:M.t_N; st_inter[:, t] = t_rho .* st_inter[:, t-1] .+ (C_s.U \\ st_innov_matrix[:, t]); end
-                        st_inter .*= st_sigma
-                    end
-                end
-
-                for i in 1:N; eta[i] += st_inter[M.s_idx[i], M.t_idx[i]]; end
-            end
-            """
-        end
-    end
-
-    final_likelihood = if is_multivariate
-        """
-        eta = eta_latent * L_corr.L
-        for k in 1:K
-            family_k = M.likelihood_specs[k][:family]
-            for i in 1:N
-                y_L_ik = get(M, :y_L, -Inf) isa AbstractMatrix ? M.y_L[i,k] : (get(M, :y_L, -Inf) isa AbstractVector ? M.y_L[i] : get(M, :y_L, -Inf))
-                y_U_ik = get(M, :y_U, Inf) isa AbstractMatrix ? M.y_U[i,k] : (get(M, :y_U, Inf) isa AbstractVector ? M.y_U[i] : get(M, :y_U, Inf))
-                hurdle_ik = get(M, :hurdle, -Inf) isa AbstractMatrix ? M.hurdle[i,k] : (get(M, :hurdle, -Inf) isa AbstractVector ? M.hurdle[i] : get(M, :hurdle, -Inf))
-                trials_ik = M.trials isa AbstractMatrix ? get(M.trials, (i, k), 1) : get(M.trials, i, 1)
-                weight_ik = M.weights[i]
-                d_lik = bstm_Likelihood(family_k, [T(M.y_obs[i, k])]; sigma_y=[y_sigma[k]], trial=[Int(trials_ik)], y_L=y_L_ik, y_U=y_U_ik, hurdle=hurdle_ik, phi_zi=lik_phi_zi, weight=weight_ik)
-                Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i, k])
-            end
-        end
-        """
-    else
-        """
-        family = M.likelihood_specs[1][:family]
-        for i in 1:N
-            y_L_i = get(M, :y_L, -Inf) isa AbstractVector ? M.y_L[i] : get(M, :y_L, -Inf)
-            y_U_i = get(M, :y_U, Inf) isa AbstractVector ? M.y_U[i] : get(M, :y_U, Inf)
-            hurdle_i = get(M, :hurdle, -Inf) isa AbstractVector ? M.hurdle[i] : get(M, :hurdle, -Inf)
-            weight_i = M.weights[i]
-            d_lik = bstm_Likelihood(family, [T(M.y_obs[i])]; sigma_y=[y_sigma[i]], trial=[Int(get(M.trials, i, 1))], y_L=y_L_i, y_U=y_U_i, hurdle=hurdle_i, phi_zi=lik_phi_zi, weight=weight_i)
-            Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i])
-        end
-        """
-    end
-
+    # Indent all code blocks before interpolation
+    priors_code = join([p for p in priors_acc if !isempty(strip(p))], "\n\n")
+    updates_code = join([u for u in updates_acc if !isempty(strip(u))], "\n\n")
+ 
     model_string = """
-    @model function $(model_func_name)(M, spec_registry, ::Type{T}=Float64) where {T}
-        noise = get(M, :noise, 1e-6)
-        N = M.y_N
-        K = $(outcomes_N)
 
-        $(likelihood_section)
+@model function $(model_func_name)(M, spec_registry, ::Type{T}=Float64) where {T}
+    noise = get(M, :noise, 1e-6)
+    N = M.y_N
+    K = $(outcomes_N)
 
-        $(join(priors_acc, "\n        "))
+$(_indent_block(likelihood_section))
+$(_indent_block(priors_code))
+$(_indent_block(householder_priors))
+$(_indent_block(nested_priors))
 
-        $(eta_name) = $(eta_init)
-        $(intercept_block)
-        $(offset_block)
-        $(fixed_effects_block)
+    # --- Linear Predictor ---
+    $(eta_name) = $(eta_init)
 
-        $(join(updates_acc, "\n        "))
+$(_indent_block(intercept_block))
+$(_indent_block(offset_block))
+$(_indent_block(fixed_effects_block))
 
-        $(st_interaction_block)
+    # --- Manifold Effects ---
+$(_indent_block(updates_code))
 
-        $(final_likelihood)
-    end
-    """
+$(_indent_block(householder_update))
+$(_indent_block(nested_updates))
+$(_indent_block(st_interaction_block))
+
+    # --- Likelihood ---
+$(_indent_block(final_likelihood))
+$(_indent_block(nested_likelihoods))
+end
+
+"""
     
+    model_string = join(filter(l -> !all(isspace, l), Base.split(model_string, '\n')), '\n')
+
     try
         return model_string, Meta.parse(model_string), spec_registry
     catch e
@@ -2388,9 +2898,11 @@ function bstm_text_assembler(M::NamedTuple)
     end
 end
 
+ 
 function bstm_dynamic_model(config::NamedTuple)
     # Purpose: A unified entry point for compiling and instantiating any dynamically generated model.
     # Rationale: Decouples model generation from execution.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `config` is a valid model configuration.
     # Inputs:
     #   - config: The model configuration NamedTuple.
@@ -2431,6 +2943,7 @@ function bstm_Likelihood(family_input::Union{String, Symbol}, y_obs;
 )
     # Purpose: Constructor for the unified likelihood structure.
     # Rationale: Provides a single, flexible constructor that uses traits to handle different likelihood modifications.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `family_input` is a valid key in `BSTM_FAMILY_REGISTRY`.
     # Inputs:
     #   - family_input: String or Symbol for the likelihood family.
@@ -2466,6 +2979,7 @@ Base.size(d::bstm_Likelihood) = (length(d.y_obs),)
 function Distributions._logpdf(d::bstm_Likelihood, eta::AbstractVector{<:Real})
     # Purpose: Internal logpdf implementation for vector-based observations.
     # Rationale: Required for `ContinuousMultivariateDistribution` compliance.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `eta` has the same length as `d.y_obs`.
     # Inputs:
     #   - d: The `bstm_Likelihood` instance.
@@ -2483,6 +2997,7 @@ end
 function Distributions.logpdf(d::bstm_Likelihood, eta::Real)
     # Purpose: Public scalar overload for `logpdf`.
     # Rationale: Provides a convenient interface for single-observation likelihood evaluation.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `d.y_obs` contains a single observation.
     # Inputs:
     #   - d: The `bstm_Likelihood` instance.
@@ -2496,6 +3011,7 @@ end
 function Distributions.logpdf(d::bstm_Likelihood, y::AbstractVector{<:Real})
     # Purpose: Public vector overload to maintain `MultivariateDistribution` compliance.
     # Rationale: Delegates to the internal `_logpdf` implementation.
+    # v1.2.1 (2026-07-16)
     # Assumptions: None.
     # Inputs:
     #   - d: The `bstm_Likelihood` instance.
@@ -2507,6 +3023,7 @@ end
 function get_model_family(model_family::String)
     # Purpose: Maps a string identifier to its corresponding concrete `AbstractBSTM_Family` type.
     # Rationale: Centralizes the mapping from string names to type instances.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `model_family` is a valid key.
     # Inputs:
     #   - model_family: The string name of the family.
@@ -2551,6 +3068,7 @@ end
 function bstm_kernel(fam::AbstractBSTM_Family, ::Uncensored, zi::AbstractZIState, d, eta, sig, y)
     # Purpose: Computes the log-probability for an uncensored observation.
     # Rationale: Handles the three cases: standard, zero-inflated, and hurdle models.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `d` is a valid `bstm_Likelihood` object.
     # Inputs:
     #   - fam, censoring_state, zi_state: Traits for dispatch.
@@ -2586,6 +3104,7 @@ end
 function bstm_kernel(fam::AbstractBSTM_Family, ::LeftCensored, zi::AbstractZIState, d, eta, sig, y)
     # Purpose: Computes the log-probability for a left-censored observation.
     # Rationale: Correctly calculates the cumulative probability for standard, ZI, and hurdle models.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `d.y_U` is finite.
     # Inputs/Outputs: See `bstm_kernel` for uncensored.
     dist = get_dist_ref(fam, d, eta, sig)
@@ -2615,6 +3134,7 @@ end
 function bstm_kernel(fam::AbstractBSTM_Family, ::RightCensored, zi::AbstractZIState, d, eta, sig, y)
     # Purpose: Computes the log-probability for a right-censored observation.
     # Rationale: Correctly calculates the complementary cumulative probability for all model types.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `d.y_L` is finite.
     # Inputs/Outputs: See `bstm_kernel` for uncensored.
     dist = get_dist_ref(fam, d, eta, sig)
@@ -2646,6 +3166,7 @@ end
 function bstm_kernel(fam::AbstractBSTM_Family, ::IntervalCensored, zi::AbstractZIState, d, eta, sig, y)
     # Purpose: Computes the log-probability for an interval-censored observation.
     # Rationale: Calculates the probability mass within the interval [y_L, y_U].
+    # v1.2.1 (2026-07-16)
     dist = get_dist_ref(fam, d, eta, sig)
     lower_bound = d.y_L[1]
     upper_bound = d.y_U[1]
@@ -2686,6 +3207,7 @@ end
 function _stable_logsubexp(a::Real, b::Real)
     # Purpose: Numerically stable computation of log(exp(a) - exp(b)).
     # Rationale: Avoids overflow and underflow by factoring out the larger term.
+    # v1.2.1 (2026-07-16)
     #            This is equivalent to LogExpFunctions.logsubexp.
     # Inputs:
     #   - a, b: Real numbers.
@@ -2699,6 +3221,7 @@ end
 function create_pc_prior(param_name::Symbol, constraint::Tuple)
     # Purpose: Creates a Penalized Complexity (PC) prior distribution from a user-specified quantile constraint.
     # Rationale: Translates an intuitive belief (e.g., "P(sigma > 1.0) = 0.05") into a formal prior distribution.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `param_name` is one of the recognized types (:sigma, :rho, etc.).
     # Inputs:
     #   - param_name: The base name of the parameter.
@@ -2732,6 +3255,7 @@ function get_optimal_sampler(
 )
     # Purpose: Automatically constructs an efficient composite Gibbs sampler for a `bstm` model.
     # Rationale: This utility inspects the model's parameters and their prior distributions to build a
+    # v1.2.1 (2026-07-16)
     #            composite `Gibbs` sampler. It assigns specialized samplers (`ESS`, `Slice`, `PG`) to
     #            different parameter blocks to improve MCMC efficiency. It also provides an option to
     #            group manifold-specific parameters for joint sampling with `NUTS` to better handle
@@ -2844,21 +3368,22 @@ end
 function create_fixed_design(formula_rhs::AbstractString, data::DataFrame; contrasts=Dict{Symbol, Any}())
     # Purpose: Creates the fixed-effects design matrix (`X`) from a formula string.
     # Rationale: A wrapper around `StatsModels.jl` to handle formula parsing and contrast coding.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `formula_rhs` contains only fixed effects terms.
     # Inputs:
     #   - formula_rhs: The RHS of the formula string.
     #   - data: The input DataFrame.
     #   - contrasts: A dictionary specifying contrast coding for categorical variables.
-    # Outputs: A NamedArray containing the design matrix.
+    # Outputs: A NamedArray containing the design matrix and the applied formula object.
     df_internal = copy(data)
     final_rhs_string = strip(formula_rhs)
 
     if isempty(final_rhs_string)
-        return NamedArray(zeros(size(df_internal, 1), 0), (1:size(df_internal, 1), Symbol[]))
+        return NamedArray(zeros(size(df_internal, 1), 0), (1:size(df_internal, 1), Symbol[])), nothing
     end
 
     if final_rhs_string == "1"
-        return NamedArray(ones(size(df_internal, 1), 1), (1:size(df_internal, 1), [:Intercept]))
+        return NamedArray(ones(size(df_internal, 1), 1), (1:size(df_internal, 1), [:Intercept])), nothing
     end
 
     try
@@ -2876,17 +3401,19 @@ function create_fixed_design(formula_rhs::AbstractString, data::DataFrame; contr
 
         label_vector = coefficient_labels isa AbstractString ? [Symbol(coefficient_labels)] : Symbol.(coefficient_labels)
 
-        return NamedArray(model_matrix_numeric, (1:size(model_matrix_numeric, 1), label_vector))
+        return NamedArray(model_matrix_numeric, (1:size(model_matrix_numeric, 1), label_vector)), applied_formula
 
     catch design_error
         @warn "BSTM Registry: create_fixed_design expansion failed for: $final_rhs_string. Error: $design_error"
-        return NamedArray(zeros(size(df_internal, 1), 0), (1:size(df_internal, 1), Symbol[]))
+        return NamedArray(zeros(size(df_internal, 1), 0), (1:size(df_internal, 1), Symbol[])), nothing
     end
 end
+
 
 function householder_to_eigenvector(v_mat::AbstractMatrix{T}, nU, n_factors) where {T}
     # Purpose: Constructs an orthonormal loadings matrix (eigenvectors) from a matrix of Householder reflector vectors.
     # Rationale: Provides a differentiable and numerically stable way to parameterize an orthonormal matrix for Bayesian PCA.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `v_mat` contains the reflector vectors.
     # Inputs:
     #   - v_mat: Matrix of reflector vectors.
@@ -2912,6 +3439,7 @@ end
 function show_model(m::DynamicPPL.Model)
     # Purpose: Displays a comprehensive summary of the `bstm` model configuration and a pseudo-code representation.
     # Rationale: Provides a user-friendly way to inspect the model structure before and after fitting.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `m` is a Turing model generated by the `bstm` framework.
     # Inputs:
     #   - m: The Turing model instance.
@@ -2970,6 +3498,7 @@ end
 function _generate_model_pseudocode(m::DynamicPPL.Model)
     # Purpose: Reconstructs a pseudo-code representation of the Turing model definition.
     # Rationale: For inspection and clarity, as the actual model is built dynamically from a string.
+    # v1.2.1 (2026-07-16)
     # Assumptions: `m` is a Turing model generated by the `bstm` framework.
     # Inputs:
     #   - m: The Turing model instance.
@@ -3051,9 +3580,9 @@ end
 # SECTION 10: ADVANCED MODELING UTILITIES (Restored)
 # ==============================================================================
 
-function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, degree::Int; W=nothing, kwargs...)
-    # BSTM Smooth Basis Factory v1.2.0
-    # Timestamp: 2026-06-29 16:13:05
+function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, degree::Int; W=nothing, knot_method::Symbol = :quantile, custom_knots::Union{AbstractVector, Nothing} = nothing, kwargs...)
+    # BSTM Smooth Basis Factory
+    # v1.2.1 (2026-07-16)
     # Synopsis: A factory function that generates a 1D basis matrix for various smoothers. 
     # Rationale for v1.2.0:
     #     - Corrected knot generation for 'invdist' and 'kriging' to use a regular grid,
@@ -3066,8 +3595,20 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
     v_max = maximum(vals)
     v_std = std(vals) + 1e-9
 
-    if type in ["pspline", "bspline", "smooth", "barycentric", "linear"]
+    # Certain basis types require a regular grid for knot placement for stability.
+    use_regular_grid = type in ["invdist", "kriging", "tps", "spherical"]
+
+    # Knot generation logic
+    local knots
+    if knot_method == :custom && !isnothing(custom_knots)
+        knots = custom_knots
+    elseif knot_method == :range || use_regular_grid
         knots = collect(range(v_min, stop=v_max, length=nbins))
+    else # :quantile or any other default
+        knots = quantile(vals, range(0, 1, length=nbins))
+    end
+
+    if type in ["pspline", "bspline", "smooth", "barycentric", "linear"]
         h = (v_max - v_min) / (nbins > 1 ? (nbins - 1) : 1)
         h = h > 0 ? h : 1.0
 
@@ -3078,7 +3619,6 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
         end
 
     elseif type == "tps"
-        knots = quantile(vals, range(0, 1, length=nbins))
         for m in 1:nbins
             r = abs.(vals .- knots[m])
             B[:, m] .= (r.^2) .* log.(r .+ 1e-6)
@@ -3127,7 +3667,6 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
 
     elseif type == "spherical"
         range_r = get(kwargs, :range, v_std * 2.0)
-        knots = quantile(vals, range(0, 1, length=nbins))
         for m in 1:nbins
             h = abs.(vals .- knots[m]) ./ range_r
             mask = h .< 1.0
@@ -3136,26 +3675,22 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
 
     elseif type == "decay"
         ls = get(kwargs, :lengthscale, v_std)
-        knots = quantile(vals, range(0, 1, length=nbins))
         for m in 1:nbins
             B[:, m] .= exp.(-abs.(vals .- knots[m]) ./ ls)
         end
-
+ 
     elseif type == "invdist"
-        knots = collect(range(v_min, stop=v_max, length=nbins))
         for m in 1:nbins
             dist_sq = (vals .- knots[m]).^2
             B[:, m] .= 1.0 ./ (dist_sq .+ 1e-6)
         end
 
     elseif type == "kriging"
-        knots = collect(range(v_min, stop=v_max, length=nbins))
         ls = get(kwargs, :lengthscale, v_std)
         for m in 1:nbins
             dist_sq = (vals .- knots[m]).^2
             B[:, m] .= exp.(-dist_sq ./ (2 * ls^2))
         end
-
     else
         B = ones(n_obs, 1)
     end
@@ -3163,9 +3698,9 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
     return B
 end
 
-function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, kwargs...)
-    # BSTM Smooth Basis Factory v1.2.0
-    # Timestamp: 2026-06-29 16:13:05
+function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, knot_method::Symbol = :quantile, custom_knots::Union{Tuple{AbstractVector, AbstractVector}, Nothing} = nothing, kwargs...)
+    # BSTM Smooth Basis Factory
+    # v1.2.1 (2026-07-16)
     # Synopsis: A factory function that generates a 2D basis matrix for various smoothers. 
     # Rationale for v1.2.0:
     #     - Corrected knot generation for 'tps', 'spherical', 'invdist', and 'kriging' to use a regular grid.
@@ -3179,13 +3714,35 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
     ls_x = get(kwargs, :ls_x, c_std[1])
     ls_y = get(kwargs, :ls_y, c_std[2])
 
+    local kx, ky
+    n_marginal = Int(floor(sqrt(nbins)))
+
+    # Certain basis types require a regular grid for knot placement for stability.
+    use_regular_grid = type in ["invdist", "kriging", "tps", "spherical"]
+
+    if knot_method == :custom && !isnothing(custom_knots)
+        if length(custom_knots) != 2 || length(custom_knots[1]) != n_marginal || length(custom_knots[2]) != n_marginal
+            @warn "Custom knots for 2D smoother must be a Tuple{AbstractVector, AbstractVector} with each vector of length n_marginal ($n_marginal). Falling back to :quantile method."
+            kx = quantile(coords[:, 1], range(0, 1, length=n_marginal))
+            ky = quantile(coords[:, 2], range(0, 1, length=n_marginal))
+        else
+            kx = custom_knots[1]
+            ky = custom_knots[2]
+        end
+    elseif knot_method == :quantile
+        kx = quantile(coords[:, 1], range(0, 1, length=n_marginal))
+        ky = quantile(coords[:, 2], range(0, 1, length=n_marginal))
+    else # :range or if regular grid is required
+        kx = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
+        ky = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
+    end
+
     if type in ["pspline", "bspline", "smooth", "barycentric", "linear"]
         n_marginal = Int(floor(sqrt(nbins)))
         m_total = n_marginal^2
         B = zeros(Float64, n_obs, m_total)
         
         kx = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
-        ky = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
         hx = (c_max[1] - c_min[1]) / (n_marginal > 1 ? (n_marginal - 1) : 1)
         hy = (c_max[2] - c_min[2]) / (n_marginal > 1 ? (n_marginal - 1) : 1)
         hx = hx > 0 ? hx : 1.0
@@ -3212,8 +3769,6 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
     elseif type == "tps"
         B = zeros(Float64, n_obs, nbins)
         n_grid = Int(floor(sqrt(nbins)))
-        kx = collect(range(c_min[1], stop=c_max[1], length=n_grid))
-        ky = collect(range(c_min[2], stop=c_max[2], length=n_grid))
         centers = [(x, y) for x in kx, y in ky][:]
 
         for m in 1:min(nbins, length(centers))
@@ -3269,8 +3824,6 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
     elseif type == "spherical"
         B = zeros(Float64, n_obs, nbins)
         n_grid = Int(floor(sqrt(nbins)))
-        kx = collect(range(c_min[1], stop=c_max[1], length=n_grid))
-        ky = collect(range(c_min[2], stop=c_max[2], length=n_grid))
         centers = [(x, y) for x in kx, y in ky][:]
         range_r = get(kwargs, :range, mean(c_std))
         for m in 1:min(nbins, length(centers))
@@ -3287,9 +3840,6 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
 
     elseif type == "invdist"
         B = zeros(Float64, n_obs, nbins)
-        n_grid = Int(floor(sqrt(nbins)))
-        kx = collect(range(c_min[1], stop=c_max[1], length=n_grid))
-        ky = collect(range(c_min[2], stop=c_max[2], length=n_grid))
         centers = [(x, y) for x in kx, y in ky][:]
         for m in 1:min(nbins, length(centers))
             dist_sq = (coords[:, 1] .- centers[m][1]).^2 .+ (coords[:, 2] .- centers[m][2]).^2
@@ -3298,9 +3848,6 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
 
     elseif type == "kriging"
         B = zeros(Float64, n_obs, nbins)
-        n_grid = Int(floor(sqrt(nbins)))
-        kx = collect(range(c_min[1], stop=c_max[1], length=n_grid))
-        ky = collect(range(c_min[2], stop=c_max[2], length=n_grid))
         centers = [(x, y) for x in kx, y in ky][:]
         for m in 1:min(nbins, length(centers))
             dist_sq = ((coords[:, 1] .- centers[m][1]).^2 ./ ls_x^2) .+ ((coords[:, 2] .- centers[m][2]).^2 ./ ls_y^2)
@@ -3314,9 +3861,9 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
     return B
 end
 
-function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, kwargs...)
-    # BSTM Smooth Basis Factory v1.2.0
-    # Timestamp: 2026-06-29 16:13:05
+function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, knot_method::Symbol = :quantile, custom_knots::Union{Tuple{AbstractVector, AbstractVector, AbstractVector}, Nothing} = nothing, kwargs...)
+    # BSTM Smooth Basis Factory
+    # v1.2.1 (2026-07-16)
     # Synopsis: A factory function that generates a 3D basis matrix for various smoothers. 
     # Rationale for v1.2.0:
     #     - Corrected knot generation for 'invdist' and 'kriging' to use a regular grid.
@@ -3331,14 +3878,38 @@ function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; 
     ls_y = get(kwargs, :ls_y, c_std[2])
     ls_z = get(kwargs, :ls_z, c_std[3])
 
+    local kx, ky, kz
+    n_marginal = Int(floor(cbrt(nbins)))
+
+    # Certain basis types require a regular grid for knot placement for stability.
+    use_regular_grid = type in ["invdist", "kriging", "tps", "spherical"]
+
+    if knot_method == :custom && !isnothing(custom_knots)
+        if length(custom_knots) != 3 || length(custom_knots[1]) != n_marginal || length(custom_knots[2]) != n_marginal || length(custom_knots[3]) != n_marginal
+            @warn "Custom knots for 3D smoother must be a Tuple{AbstractVector, AbstractVector, AbstractVector} with each vector of length n_marginal ($n_marginal). Falling back to :quantile method."
+            kx = quantile(coords[:, 1], range(0, 1, length=n_marginal))
+            ky = quantile(coords[:, 2], range(0, 1, length=n_marginal))
+            kz = quantile(coords[:, 3], range(0, 1, length=n_marginal))
+        else
+            kx = custom_knots[1]
+            ky = custom_knots[2]
+            kz = custom_knots[3]
+        end
+    elseif knot_method == :quantile
+        kx = quantile(coords[:, 1], range(0, 1, length=n_marginal))
+        ky = quantile(coords[:, 2], range(0, 1, length=n_marginal))
+        kz = quantile(coords[:, 3], range(0, 1, length=n_marginal))
+    else # :range or if regular grid is required
+        kx = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
+        ky = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
+        kz = collect(range(c_min[3], stop=c_max[3], length=n_marginal))
+    end
+
     if type in ["pspline", "bspline", "smooth", "barycentric", "linear"]
         n_marginal = Int(floor(cbrt(nbins)))
         m_total = n_marginal^3
         B = zeros(Float64, n_obs, m_total)
 
-        kx = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
-        ky = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
-        kz = collect(range(c_min[3], stop=c_max[3], length=n_marginal))
         hx = (c_max[1] - c_min[1]) / (n_marginal > 1 ? (n_marginal - 1) : 1); hx = hx > 0 ? hx : 1.0
         hy = (c_max[2] - c_min[2]) / (n_marginal > 1 ? (n_marginal - 1) : 1); hy = hy > 0 ? hy : 1.0
         hz = (c_max[3] - c_min[3]) / (n_marginal > 1 ? (n_marginal - 1) : 1); hz = hz > 0 ? hz : 1.0
@@ -3355,8 +3926,6 @@ function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; 
     elseif type == "tps"
         n_grid = Int(floor(cbrt(nbins)))
         m_total = n_grid^3
-        B = zeros(Float64, n_obs, m_total)
-        centers = [(x, y, z) for x in range(c_min[1], c_max[1], length=n_grid), y in range(c_min[2], c_max[2], length=n_grid), z in range(c_min[3], c_max[3], length=n_grid)][:]
         for m in 1:min(m_total, length(centers))
             dx = (coords[:, 1] .- centers[m][1]) ./ ls_x
             dy = (coords[:, 2] .- centers[m][2]) ./ ls_y
@@ -3411,8 +3980,6 @@ function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; 
     elseif type == "spherical"
         n_grid = Int(floor(cbrt(nbins)))
         m_total = n_grid^3
-        B = zeros(Float64, n_obs, m_total)
-        centers = [(x, y, z) for x in range(c_min[1], c_max[1], length=n_grid), y in range(c_min[2], c_max[2], length=n_grid), z in range(c_min[3], c_max[3], length=n_grid)][:]
         for m in 1:min(m_total, length(centers))
             dx = (coords[:, 1] .- centers[m][1]) ./ ls_x
             dy = (coords[:, 2] .- centers[m][2]) ./ ls_y
@@ -3428,9 +3995,6 @@ function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; 
 
     elseif type == "invdist"
         B = zeros(Float64, n_obs, nbins)
-        n_grid = Int(floor(cbrt(nbins)))
-        m_total = n_grid^3
-        centers = [(x, y, z) for x in range(c_min[1], c_max[1], length=n_grid), y in range(c_min[2], c_max[2], length=n_grid), z in range(c_min[3], c_max[3], length=n_grid)][:]
         for m in 1:min(m_total, length(centers))
             dist_sq = (coords[:, 1] .- centers[m][1]).^2 .+ (coords[:, 2] .- centers[m][2]).^2 .+ (coords[:, 3] .- centers[m][3]).^2
             B[:, m] .= 1.0 ./ (dist_sq .+ 1e-6)
@@ -3438,9 +4002,8 @@ function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; 
 
     elseif type == "kriging"
         B = zeros(Float64, n_obs, nbins)
-        n_grid = Int(floor(cbrt(nbins)))
-        m_total = n_grid^3
-        centers = [(x, y, z) for x in range(c_min[1], c_max[1], length=n_grid), y in range(c_min[2], c_max[2], length=n_grid), z in range(c_min[3], c_max[3], length=n_grid)][:]
+        m_total = n_marginal^3
+        centers = [(x,y,z) for x in kx, y in ky, z in kz][:]
         for m in 1:min(m_total, length(centers))
             dist_sq = ((coords[:, 1] .- centers[m][1]).^2 ./ ls_x^2) .+ ((coords[:, 2] .- centers[m][2]).^2 ./ ls_y^2) .+ ((coords[:, 3] .- centers[m][3]).^2 ./ ls_z^2)
             B[:, m] .= exp.(-dist_sq ./ 2.0)
@@ -3453,9 +4016,9 @@ function bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Int; 
     return B
 end
 
-function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, kwargs...)
-    # BSTM Smooth Basis Factory v1.2.0
-    # Timestamp: 2026-06-29 16:13:05
+function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; W=nothing, knot_method::Symbol = :quantile, custom_knots::Union{Tuple{AbstractVector, AbstractVector, AbstractVector, AbstractVector}, Nothing} = nothing, kwargs...)
+    # BSTM Smooth Basis Factory
+    # v1.2.1 (2026-07-16)
     # Synopsis: A factory function that generates a 4D basis matrix for various smoothers. 
     # Rationale for v1.2.0:
     #     - Corrected knot generation for 'invdist' and 'kriging' to use a regular grid.
@@ -3471,15 +4034,36 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
     ls_3 = get(kwargs, :ls_3, c_std[3])
     ls_4 = get(kwargs, :ls_4, c_std[4])
 
+    local k1, k2, k3, k4
+    n_marginal = Int(floor(sqrt(sqrt(nbins))))
+
+    # Certain basis types require a regular grid for knot placement for stability.
+    use_regular_grid = type in ["invdist", "kriging", "tps", "spherical"]
+
+    if knot_method == :custom && !isnothing(custom_knots)
+        if length(custom_knots) != 4 || length(custom_knots[1]) != n_marginal || length(custom_knots[2]) != n_marginal || length(custom_knots[3]) != n_marginal || length(custom_knots[4]) != n_marginal
+            @warn "Custom knots for 4D smoother must be a Tuple{AbstractVector, AbstractVector, AbstractVector, AbstractVector} with each vector of length n_marginal ($n_marginal). Falling back to :quantile method."
+            k1 = quantile(coords[:, 1], range(0, 1, length=n_marginal))
+            k2 = quantile(coords[:, 2], range(0, 1, length=n_marginal))
+            k3 = quantile(coords[:, 3], range(0, 1, length=n_marginal))
+            k4 = quantile(coords[:, 4], range(0, 1, length=n_marginal))
+        else
+            k1 = custom_knots[1]
+            k2 = custom_knots[2]
+            k3 = custom_knots[3]
+            k4 = custom_knots[4]
+        end
+    elseif knot_method == :quantile
+        k1 = quantile(coords[:, 1], range(0, 1, length=n_marginal)); k2 = quantile(coords[:, 2], range(0, 1, length=n_marginal)); k3 = quantile(coords[:, 3], range(0, 1, length=n_marginal)); k4 = quantile(coords[:, 4], range(0, 1, length=n_marginal))
+    else # :range or if regular grid is required
+        k1 = collect(range(c_min[1], stop=c_max[1], length=n_marginal)); k2 = collect(range(c_min[2], stop=c_max[2], length=n_marginal)); k3 = collect(range(c_min[3], stop=c_max[3], length=n_marginal)); k4 = collect(range(c_min[4], stop=c_max[4], length=n_marginal))
+    end
+
     if type in ["pspline", "bspline", "smooth", "barycentric", "linear"]
         n_marginal = Int(floor(sqrt(sqrt(nbins))))
         m_total = n_marginal^4
         B = zeros(Float64, n_obs, m_total)
 
-        k1 = collect(range(c_min[1], stop=c_max[1], length=n_marginal))
-        k2 = collect(range(c_min[2], stop=c_max[2], length=n_marginal))
-        k3 = collect(range(c_min[3], stop=c_max[3], length=n_marginal))
-        k4 = collect(range(c_min[4], stop=c_max[4], length=n_marginal))
         h1 = (c_max[1] - c_min[1]) / (n_marginal > 1 ? (n_marginal - 1) : 1); h1 = h1 > 0 ? h1 : 1.0
         h2 = (c_max[2] - c_min[2]) / (n_marginal > 1 ? (n_marginal - 1) : 1); h2 = h2 > 0 ? h2 : 1.0
         h3 = (c_max[3] - c_min[3]) / (n_marginal > 1 ? (n_marginal - 1) : 1); h3 = h3 > 0 ? h3 : 1.0
@@ -3498,7 +4082,6 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
     elseif type == "tps"
         n_marginal = Int(floor(sqrt(sqrt(nbins))))
         m_total = n_marginal^4
-        B = zeros(Float64, n_obs, m_total)
         centers = [(w,x,y,z) for w in range(c_min[1],c_max[1],length=n_marginal), x in range(c_min[2],c_max[2],length=n_marginal), y in range(c_min[3],c_max[3],length=n_marginal), z in range(c_min[4],c_max[4],length=n_marginal)][:]
         for m in 1:min(m_total, length(centers))
             d1 = (coords[:, 1] .- centers[m][1]) ./ ls_1
@@ -3559,7 +4142,6 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
     elseif type == "spherical"
         n_marginal = Int(floor(sqrt(sqrt(nbins))))
         m_total = n_marginal^4
-        B = zeros(Float64, n_obs, m_total)
         centers = [(w,x,y,z) for w in range(c_min[1],c_max[1],length=n_marginal), x in range(c_min[2],c_max[2],length=n_marginal), y in range(c_min[3],c_max[3],length=n_marginal), z in range(c_min[4],c_max[4],length=n_marginal)][:]
         for m in 1:min(m_total, length(centers))
             d1 = (coords[:, 1] .- centers[m][1]) ./ ls_1
@@ -3577,7 +4159,6 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
 
     elseif type == "invdist"
         B = zeros(Float64, n_obs, nbins)
-        n_marginal = Int(floor(sqrt(sqrt(nbins))))
         m_total = n_marginal^4
         centers = [(w,x,y,z) for w in range(c_min[1],c_max[1],length=n_marginal), x in range(c_min[2],c_max[2],length=n_marginal), y in range(c_min[3],c_max[3],length=n_marginal), z in range(c_min[4],c_max[4],length=n_marginal)][:]
         for m in 1:min(m_total, length(centers))
@@ -3587,9 +4168,8 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
 
     elseif type == "kriging"
         B = zeros(Float64, n_obs, nbins)
-        n_marginal = Int(floor(sqrt(sqrt(nbins))))
         m_total = n_marginal^4
-        centers = [(w,x,y,z) for w in range(c_min[1],c_max[1],length=n_marginal), x in range(c_min[2],c_max[2],length=n_marginal), y in range(c_min[3],c_max[3],length=n_marginal), z in range(c_min[4],c_max[4],length=n_marginal)][:]
+        centers = [(w,x,y,z) for w in k1, x in k2, y in k3, z in k4][:]
         for m in 1:min(m_total, length(centers))
             dist_sq = ((coords[:, 1] .- centers[m][1]).^2 ./ ls_1^2) .+ ((coords[:, 2] .- centers[m][2]).^2 ./ ls_2^2) .+ ((coords[:, 3] .- centers[m][3]).^2 ./ ls_3^2) .+ ((coords[:, 4] .- centers[m][4]).^2 ./ ls_4^2)
             B[:, m] .= exp.(-dist_sq ./ 2.0)
@@ -3602,8 +4182,8 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
     return B
 end
 
- 
 function evaluate_kernel_matrix(dist_sq::AbstractMatrix, param_val::Real, ls::Real, kernel_type::Symbol, noise::Real; wavelet_levels=3)
+    # v1.2.1 (2026-07-16)
     # #
     # Gaussian / Squared Exponential
     if kernel_type == :gaussian || kernel_type == :se
@@ -3662,6 +4242,15 @@ function evaluate_kernel_matrix(dist_sq::AbstractMatrix, param_val::Real, ls::Re
     end
 end
 
+"""
+    recompose_precision(...)
+
+Purpose: An internal factory function that constructs a final precision matrix from a template, 
+         a scale parameter (`param_val`), and other manifold-specific parameters (e.g., correlation `rho`). 
+         This function is central to defining GMRF priors within the model. v1.2.1 (2026-07-16)
+Inputs: m_type, template_s, param_val, and other optional parameters.
+Outputs: A symmetric precision matrix.
+"""
 function recompose_precision(
     m_type::Symbol, 
     template_s::AbstractMatrix, 
@@ -3673,47 +4262,31 @@ function recompose_precision(
     flow_direction=:bidirectional,
     kwargs...
 )
-    """v1.2.0 (2026-06-29 16:13:05)
-    Purpose: An internal factory function that constructs a final precision matrix from a 
-            template, a scale parameter (`param_val`), and other manifold-specific parameters 
-            (e.g., correlation `rho`). This function is central to defining GMRF priors within
-            the model.
-    Inputs: m_type, template_s, param_val, and other optional parameters.
-    Outputs: A symmetric precision matrix.
-    """
     n_s = size(template_s, 1)
-    scale_factor = 1.0 / (param_val^2 + noise)
 
     if m_type == :none || m_type == :fixed
-        return Symmetric(scale_factor * I(n_s) + noise * I)
+        return Symmetric(sparse(I(n_s)))
     end
 
     if m_type == :besag || m_type == :icar || m_type == :cyclic
-        return Symmetric(scale_factor .* template_s + noise * I)
+        return Symmetric(template_s)
     end
 
     if m_type == :bym2
         rho = isnothing(extra_param) ? 0.5 : extra_param
-        return Symmetric(scale_factor .* (rho .* template_s + (1.0 - rho) .* I(n_s)) + noise * I)
+        return Symmetric(rho .* template_s + (1.0 - rho) .* sparse(I(n_s)))
     end
 
-    if m_type == :ar1
-        rho = isnothing(extra_param) ? 0.8 : extra_param # Default to a reasonable correlation
-        # The precision matrix for a stationary AR(1) process is constructed.
-        # It is tridiagonal, with 1 on the main diagonal ends, 1+rho^2 elsewhere on the main
-        # diagonal, and -rho on the first off-diagonals. This is built from the template adjacency matrix.
-        Q_ar1_base = diagm(0 => fill(1.0 + rho^2, n_s)) - rho .* template_s
-        Q_ar1_base[1, 1] = 1.0
-        Q_ar1_base[n_s, n_s] = 1.0
-        # The overall scaling is (1/sigma_marginal^2) / (1 - rho^2), where sigma_marginal is the marginal
-        # standard deviation of the process (`param_val`). This correctly relates the marginal variance
-        # to the innovation variance, which is what the precision matrix Q_ar1_base is based on.
-        return Symmetric(scale_factor ./ (1.0 - rho^2 + noise) .* Q_ar1_base + noise * I)
+    if m_type == :ar1 || m_type == :rw1 || m_type == :rw2
+        # This block is intentionally deprecated. These models should be implemented
+        # via a state-space evolution for numerical stability, which is handled by a
+        # specialized code generator. Calling this indicates a dispatch error.
+        error("recompose_precision should not be called for $(m_type) models. Use the state-space implementation.")
     end
 
     if m_type == :leroux
         lambda_val = isnothing(extra_param) ? 0.5 : extra_param
-        return Symmetric(scale_factor .* (lambda_val .* template_s + (1.0 - lambda_val) .* I(n_s)) + noise * I)
+        return Symmetric(lambda_val .* template_s + (1.0 - lambda_val) .* sparse(I(n_s)))
     end
 
     if m_type == :I || m_type == :II || m_type == :III || m_type == :IV
@@ -3722,52 +4295,517 @@ function recompose_precision(
         else
             Q_full = kron(template_t, template_s)
         end
-        return Symmetric(scale_factor .* Q_full + noise * I)
+        return Symmetric(Q_full)
     end
 
     if m_type == :networkflow
         rho_net = isnothing(extra_param) ? 0.8 : extra_param
         W_net = !isnothing(directed_adj) ? directed_adj : template_s
         
-        # The operator for the SAR-like precision matrix depends on the flow direction.
         L_op = if flow_direction == :upstream
-            # Upstream influence: a node is influenced by nodes that flow into it.
-            # If W_ij=1 means flow from i to j, then W' captures this influence.
-            I(n_s) - rho_net .* W_net' # Adjacency matrix represents flow from i to j, so transpose for upstream influence
+            I(n_s) - rho_net .* W_net'
         elseif flow_direction == :downstream
-            # Downstream influence: a node is influenced by nodes it flows to.
             I(n_s) - rho_net .* W_net
-        elseif flow_direction == :bidirectional
-            # Bidirectional influence: a node is influenced by any neighbor, regardless of flow direction.
-            # We create a symmetric, unweighted adjacency matrix where an edge exists if one existed in either direction.
+        else # :bidirectional
             W_symm = sign.(W_net + W_net')
             I(n_s) - rho_net .* W_symm
         end
-
-        return Symmetric(scale_factor .* (L_op' * L_op) + noise * I)
+        return Symmetric(L_op' * L_op)
     end
 
     if m_type == :sar || m_type == :dag || m_type == :proper_car
         rho_p = isnothing(extra_param) ? 0.8 : extra_param
         L_op = I(n_s) - rho_p .* template_s
-        return Symmetric(scale_factor .* (L_op' * L_op) + noise * I)
+        return Symmetric(L_op' * L_op)
     end
 
     if m_type == :gp
         ls = isnothing(extra_param) ? 1.0 : extra_param
         K = (param_val^2) .* exp.(-(Matrix(template_s).^2) ./ (2 * ls^2 + noise))
-        return inv(Symmetric(K + noise * I(n_s)))
+        return inv(Symmetric(K))
     end
 
     if m_type == :spde
         kappa = isnothing(extra_param) ? 1.0 : extra_param
         L_spde = (kappa^2 .* I(n_s) + template_s)
-        return Symmetric(scale_factor .* (L_spde' * L_spde) + noise * I)
+        return Symmetric(L_spde' * L_spde)
     end
 
-    if m_type == :rff || m_type == :fft || m_type == :bspline || m_type == :pspline || m_type == :rw1 || m_type == :rw2 || m_type == :tps
-        return Symmetric(scale_factor .* template_s + noise * I)
+    if m_type == :rff || m_type == :fft || m_type == :bspline || m_type == :pspline || m_type == :tps
+        return Symmetric(template_s)
     end
 
-    return Symmetric(scale_factor .* template_s + noise * I)
+    return Symmetric(template_s)
+end
+
+
+function _distribution_to_string(d::Distribution)
+    # Purpose: Converts a Distribution object into a string that represents a valid constructor call.
+    # Rationale: The default `string(d)` often produces a string with keyword arguments (e.g., "Normal{Float64}(μ=0.0, σ=1.0)"),
+    # v1.2.1 (2026-07-16)
+    #            which is not valid syntax for constructing the object. This function ensures a valid
+    #            positional-argument constructor string is generated.
+    T = eltype(d)
+    dist_name = string(typeof(d).name.name)
+    
+    # For common distributions, use positional arguments which are always safe.
+    if d isa Exponential
+        # Constructor is Exponential(rate), object stores scale theta = 1/rate
+        return "$(dist_name){$T}($(1.0 / d.θ))"
+    elseif d isa Normal
+        return "$(dist_name){$T}($(d.μ), $(d.σ))"
+    elseif d isa Beta
+        return "$(dist_name){$T}($(d.α), $(d.β))"
+    elseif d isa InverseGamma
+        return "$(dist_name){$T}($(d.α), $(d.θ))"
+    elseif d isa Gamma
+        return "$(dist_name){$T}($(d.α), $(d.θ))"
+    elseif d isa Uniform
+        return "$(dist_name){$T}($(d.a), $(d.b))"
+    else
+        # Fallback for less common distributions. This might fail if their
+        # string representation uses keywords, but covers many cases.
+        return string(d)
+    end
+end 
+
+  
+
+function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
+    # Purpose: Generates code fragments for the likelihood-specific parameters (sigma, ZI, correlation).
+    # Rationale: This version only defines `y_sigma` and `lik_phi_zi` if they are explicitly
+    #            required by the model's likelihood family or options. This avoids generating
+    #            unnecessary variables for simpler models like Poisson.
+    # v1.2.3 (2026-07-17)
+    families = [get(spec, :family, "gaussian") for spec in M.likelihood_specs]
+    needs_sigma = any(f -> string(f) in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"], families)
+
+    zi_prior_block = ""
+    if get(M, :use_zi, false)
+        zi_prior_block = "lik_phi_zi ~ NamedDist(Beta(1,1), :lik_phi_zi)"
+    end
+
+    sigma_block = ""
+    if needs_sigma
+        y_sigma_prior_str = _distribution_to_string(Exponential(1.0))
+        if is_multivariate
+            sigma_block = "y_sigma ~ NamedDist(filldist($(y_sigma_prior_str), K), :y_sigma)"
+        else
+            sigma_block = "y_sigma ~ NamedDist($(y_sigma_prior_str), :y_sigma)"
+        end
+    end
+
+    corr_block = is_multivariate ? "L_corr ~ NamedDist(LKJCholesky(K, 1.0), :L_corr)" : ""
+
+    return """
+    $(corr_block)
+    $(sigma_block)
+    $(zi_prior_block)
+    """
+end
+
+function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
+    # v1.2.3 (2026-07-17)
+    # Rationale: This version makes the inclusion of `sigma_y` in the `bstm_Likelihood`
+    #            call conditional. `sigma_y` is only included for likelihood families that require it
+    #            (e.g., Gaussian), addressing user feedback about passing unnecessary parameters.
+    
+    families = [string(get(spec, :family, "gaussian")) for spec in M.likelihood_specs]
+    any_needs_sigma = any(f -> f in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"], families)
+
+    if is_multivariate
+        kwargs_parts = String[]
+        if any_needs_sigma; push!(kwargs_parts, "sigma_y=y_sigma[k]"); end
+        if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=Int(M.trials[i, k])"); end
+        if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=M.weights[i, k]"); end
+        if get(M, :user_provided_y_L, false); push!(kwargs_parts, "y_L=M.y_L[i, k]"); end
+        if get(M, :user_provided_y_U, false); push!(kwargs_parts, "y_U=M.y_U[i, k]"); end
+        if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=M.hurdle[i, k]"); end
+        if get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
+        kwargs_str = join(kwargs_parts, ", ")
+
+        return """
+        eta = eta_latent * L_corr.L
+        for k in 1:K
+            family_k = M.likelihood_specs[k][:family]
+            
+            for i in 1:N
+                d_lik = bstm_Likelihood(family_k, T(M.y_obs[i, k]); $(kwargs_str))
+                Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i, k])
+            end
+        end
+        """
+    else # Univariate
+        kwargs_parts = String[]
+        if any_needs_sigma; push!(kwargs_parts, "sigma_y=y_sigma"); end
+        if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=Int(M.trials[i])"); end
+        if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=M.weights[i]"); end
+        if get(M, :user_provided_y_L, false); push!(kwargs_parts, "y_L=M.y_L[i]"); end
+        if get(M, :user_provided_y_U, false); push!(kwargs_parts, "y_U=M.y_U[i]"); end
+        if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=M.hurdle[i]"); end
+        if get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
+        kwargs_str = join(kwargs_parts, ", ")
+
+        return """
+        family = M.likelihood_specs[1][:family] # All outcomes share the same family in univariate case
+        
+        for i in 1:N
+            d_lik = bstm_Likelihood(family, T(M.y_obs[i]); $(kwargs_str))
+            Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i])
+        end
+        """
+    end
+end
+
+
+
+
+function _generate_intercept_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
+    # v1.2.1 (2026-07-16)
+    if !get(M, :add_intercept, false) return "" end
+    
+    intercept_prior_obj = get(M, :intercept_prior, Normal(0,5))
+    local dist_str, update
+    if is_multivariate
+        dist_str = "filldist($(_distribution_to_string(intercept_prior_obj)), K)"
+        update = "for k in 1:K; $(eta_name)[:, k] .+= intercept[k]; end"
+    else
+        dist_str = _distribution_to_string(intercept_prior_obj)
+        update = "$(eta_name) .+= intercept"
+    end
+    
+    return """
+    intercept ~ NamedDist($(dist_str), :intercept)
+    $(update)
+    """
+end
+
+function _generate_offset_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
+    # v1.2.1 (2026-07-16)
+    if !haskey(M, :log_offset) return "" end
+    if is_multivariate
+        return "$(eta_name) .+= M.log_offset"
+    else
+        return "$(eta_name) .+= M.log_offset"
+    end
+end
+
+
+
+function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
+    # v1.2.8 (2026-07-17)
+    # Rationale: This version generalizes the check for identical priors beyond just the Normal
+    #            distribution. It now uses `filldist` for any set of identical priors, falling
+    #            back to `Product` only when priors truly differ. This improves efficiency for
+    #            cases where multiple fixed effects share the same non-Normal prior.
+    if get(M, :Xfixed_N, 0) == 0 return "" end
+
+    priors_vec = get(M, :Xfixed_priors_vec, [Normal(0, 5) for _ in 1:M.Xfixed_N])
+    
+    all_same = false
+    first_prior = nothing
+    if !isempty(priors_vec)
+        first_prior = priors_vec[1]
+        # Check if all elements are identical to the first one.
+        # This works for distribution objects as they are value types.
+        if all(p -> p == first_prior, priors_vec)
+            all_same = true
+        end
+    end
+
+    if is_multivariate
+        K = M.outcomes_N
+        if all_same && !isnothing(first_prior)
+            prior_str = _distribution_to_string(first_prior)
+            return """
+            Xfixed_beta_flat ~ NamedDist(filldist($(prior_str), M.Xfixed_N * K), :Xfixed_beta)
+            $(eta_name) .+= M.Xfixed * reshape(Xfixed_beta_flat, M.Xfixed_N, K)
+            """
+        else
+            full_priors_list = vcat([priors_vec for _ in 1:K]...)
+            priors_str_list = [_distribution_to_string(p) for p in full_priors_list]
+            priors_product_str = "Product([$(join(priors_str_list, ", "))])"
+            return """
+            Xfixed_beta_flat ~ NamedDist($(priors_product_str), :Xfixed_beta)
+            $(eta_name) .+= M.Xfixed * reshape(Xfixed_beta_flat, M.Xfixed_N, K)
+            """
+        end
+    else # Univariate case
+        if all_same && !isnothing(first_prior)
+            prior_str = _distribution_to_string(first_prior)
+            return """
+            Xfixed_beta ~ NamedDist(filldist($(prior_str), M.Xfixed_N), :Xfixed_beta)
+            $(eta_name) .+= M.Xfixed * Xfixed_beta
+            """
+        else
+            priors_str_list = [_distribution_to_string(p) for p in priors_vec]
+            priors_product_str = "Product([$(join(priors_str_list, ", "))])"
+            return """
+            Xfixed_beta ~ NamedDist($(priors_product_str), :Xfixed_beta)
+            $(eta_name) .+= M.Xfixed * Xfixed_beta
+            """
+        end
+    end
+end
+ 
+
+function _generate_st_interaction_block(M::NamedTuple, main_spatial_spec, main_temporal_spec, is_multivariate::Bool)
+    # v1.2.8 (2026-07-17)
+    # Rationale: This version uses more descriptive parameter names (`st_interaction_...`)
+    #            to ensure they are correctly identified and grouped by the `get_optimal_sampler` logic.
+
+    model_st = get(M, :model_st, "none")
+    if model_st == "none"
+        return ""
+    end
+ 
+    if isnothing(main_spatial_spec) || isnothing(main_temporal_spec)
+        @warn "Spacetime interaction specified, but could not find both a primary spatial and temporal manifold. Interaction term will be ignored."
+        return ""
+    end
+ 
+    s_spec = main_spatial_spec
+    t_spec = main_temporal_spec
+    s_is_static = get(s_spec, :is_static, false)
+    t_is_static = get(t_spec, :is_static, false)
+    
+    t_rho_name = if t_spec.manifold_obj isa AR1
+        is_shared = get(t_spec.params, :shared, false) 
+        local t_key_str
+        if is_multivariate && !is_shared
+            t_key_str = "$(t_spec.key)_rho_1"
+        else
+            t_key_str = "$(t_spec.key)_rho"
+        end
+        Symbol(t_key_str)
+    else
+        nothing
+    end
+
+    local transform_code
+    if model_st == "I"
+        transform_code = "st_inter_k = st_innov_matrix_k .* st_sigma_k"
+    elseif model_st == "II"
+        transform_code = "st_inter_k = transpose(C_t.U \\ transpose(st_innov_matrix_k)) .* st_sigma_k"
+    elseif model_st == "III"
+        transform_code = "st_inter_k = (C_s.U \\ st_innov_matrix_k) .* st_sigma_k"
+    elseif model_st == "IV"
+        if isnothing(t_rho_name)
+            @warn "Type IV interaction specified, but main temporal effect is not AR1. Defaulting to Type III."
+            transform_code = "st_inter_k = (C_s.U \\ st_innov_matrix_k) .* st_sigma_k"
+        else
+            transform_code = """
+            t_rho_val = $(t_rho_name)
+            st_inter_k[:, 1] = (C_s.U \\ st_innov_matrix_k[:, 1]) ./ sqrt(1.0 - t_rho_val^2 + noise)
+            for t in 2:M.t_N; st_inter_k[:, t] = t_rho_val .* st_inter_k[:, t-1] .+ (C_s.U \\ st_innov_matrix_k[:, t]); end
+            st_inter_k .*= st_sigma_k
+            """
+        end
+    else
+        return ""
+    end
+ 
+    if is_multivariate
+        K = M.outcomes_N
+        return """
+    # Multivariate Spatiotemporal Interaction (Type $(model_st))
+    st_interaction_sigma ~ NamedDist(filldist(Exponential(0.5), $(K)), :st_interaction_sigma)
+    st_interaction_raw_flat ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N * $(K)), I), :st_interaction_raw_flat)
+
+    let 
+        st_innov_tensor = reshape(st_interaction_raw_flat, M.s_N, M.t_N, $(K))
+        
+        C_s = $(s_is_static ? "spec_registry[\"$(s_spec.key)\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$(s_spec.key)\"].Q_template + noise * I))")
+        C_t = $(t_is_static ? "spec_registry[\"$(t_spec.key)\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$(t_spec.key)\"].Q_template + noise * I))")
+
+        for k in 1:$(K)
+            st_inter_k = zeros(T, M.s_N, M.t_N)
+            st_innov_matrix_k = view(st_innov_tensor, :, :, k)
+            st_sigma_k = st_interaction_sigma[k]
+
+            $(transform_code)
+
+            for i in 1:N; eta_latent[i, k] += st_inter_k[M.s_idx[i], M.t_idx[i]]; end
+        end
+    end
+"""
+    else # Univariate case
+        univariate_transform_code = replace(transform_code, "st_sigma_k" => "st_interaction_sigma")
+        univariate_transform_code = replace(univariate_transform_code, "st_innov_matrix_k" => "st_innov_matrix")
+        univariate_transform_code = replace(univariate_transform_code, "st_inter_k" => "st_inter")
+
+        return """
+    # Univariate Spatiotemporal Interaction (Type $(model_st))
+    st_interaction_sigma ~ NamedDist(Exponential(0.5), :st_interaction_sigma)
+    st_interaction_raw ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :st_interaction_raw)
+ 
+    let 
+        st_inter = zeros(T, M.s_N, M.t_N)
+        st_innov_matrix = reshape(st_interaction_raw, M.s_N, M.t_N)
+        
+        C_s = $(s_is_static ? "spec_registry[\"$(s_spec.key)\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$(s_spec.key)\"].Q_template + noise * I))")
+        C_t = $(t_is_static ? "spec_registry[\"$(t_spec.key)\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$(t_spec.key)\"].Q_template + noise * I))")
+
+        $(univariate_transform_code)
+
+        for i in 1:N; eta[i] += st_inter[M.s_idx[i], M.t_idx[i]]; end
+    end
+"""
+    end
+end
+
+
+
+function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main_eta_name::String)
+    # Purpose: Generates the complete code block for all nested sub-models.
+    # Rationale: This version generates more parsimonious code for sub-models by using
+    #            Product distributions for fixed effects and conditional keyword arguments
+    #            for the likelihood call, mirroring the optimizations in the main model assembler.
+    # v1.2.7 (2026-07-17)
+    if !haskey(M, :nested_manifolds) || isempty(M.nested_manifolds)
+        return "", "", ""
+    end
+
+    all_nested_priors = String[]
+    all_nested_updates = String[]
+    all_nested_likelihoods = String[]
+
+    for (var_key, sub_config) in pairs(M.nested_manifolds)
+        prefix = string(var_key)
+        sub_eta_name = "eta_$(prefix)"
+
+        # --- Generate Priors for Sub-Model ---
+        # Manifold priors
+        for spec in sub_config.manifolds
+            frag = _generate_manifold_code_fragments(spec.manifold_obj, spec, "univariate", nothing; prefix=prefix)
+            push!(all_nested_priors, frag.priors)
+        end
+        
+        # Fixed effects priors
+        if get(sub_config, :Xfixed_N, 0) > 0
+            priors_vec = get(sub_config, :Xfixed_priors_vec, [Normal(0, 5) for _ in 1:sub_config.Xfixed_N])
+            all_same_normal = !isempty(priors_vec) && all(p -> p isa Normal && p.μ == priors_vec[1].μ && p.σ == priors_vec[1].σ, priors_vec)
+
+            local prior_block
+            if all_same_normal
+                prior_str = _distribution_to_string(priors_vec[1])
+                prior_block = "$(prefix)_Xfixed_beta ~ NamedDist(filldist($(prior_str), $(sub_config.Xfixed_N)), :$(Symbol(prefix, "_Xfixed_beta")))"
+            else
+                priors_str_list = [_distribution_to_string(p) for p in priors_vec]
+                priors_product_str = "Product([$(join(priors_str_list, ", "))])"
+                prior_block = "$(prefix)_Xfixed_beta ~ NamedDist($(priors_product_str), :$(Symbol(prefix, "_Xfixed_beta")))"
+            end
+            push!(all_nested_priors, prior_block)
+        end
+
+        # Intercept prior
+        if get(sub_config, :add_intercept, false)
+            prior_obj = get(sub_config, :intercept_prior, Normal(0,5))
+            push!(all_nested_priors, "$(prefix)_intercept ~ NamedDist($(_distribution_to_string(prior_obj)), :$(prefix)_intercept)")
+        end
+
+        # Observation sigma prior (if needed)
+        sub_sigma_name = "$(prefix)_y_sigma"
+        sub_lik_spec = sub_config.likelihood_specs[1]
+        sub_family_str = string(get(sub_lik_spec, :family, "gaussian"))
+        sub_needs_sigma = sub_family_str in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
+        if sub_needs_sigma
+            push!(all_nested_priors, "$(sub_sigma_name) ~ NamedDist(Exponential(1.0), :$(sub_sigma_name))")
+        end
+
+        # --- Generate Updates for Sub-Model Linear Predictor ---
+        update_block = """
+        begin 
+            # Assemble predictor for nested model: $(prefix)
+            $(sub_eta_name) = zeros(T, N)
+        """
+        if get(sub_config, :add_intercept, false); update_block *= "\n    $(sub_eta_name) .+= $(prefix)_intercept"; end
+        if haskey(sub_config, :log_offset); update_block *= "\n    $(sub_eta_name) .+= M.nested_manifolds[:$(var_key)].log_offset"; end
+        if get(sub_config, :Xfixed_N, 0) > 0; update_block *= "\n    $(sub_eta_name) .+= M.nested_manifolds[:$(var_key)].Xfixed * $(prefix)_Xfixed_beta"; end
+        
+        # Manifold updates
+        for spec in sub_config.manifolds
+            frag = _generate_manifold_code_fragments(spec.manifold_obj, spec, "univariate", nothing; prefix=prefix)
+            update_block *= "\n" * frag.update
+        end
+        update_block *= "\nend"
+        push!(all_nested_updates, update_block)
+
+        # --- Generate Linking Code ---
+        rho_name = "rho_nested_$(prefix)"
+        if is_multivariate
+            K = M.outcomes_N
+            # Prior for a vector of linking parameters, one for each outcome.
+            push!(all_nested_priors, "$(rho_name) ~ NamedDist(filldist(Normal(1.0, 0.5), $(K)), :$(rho_name))")
+            
+            # Apply the outcome-specific scaled sub-model effect to each latent predictor.
+            push!(all_nested_updates, "for k in 1:$(K); $(main_eta_name)[:, k] .+= $(rho_name)[k] .* $(sub_eta_name); end")
+        else
+            # Univariate case: a single linking parameter.
+            push!(all_nested_priors, "$(rho_name) ~ NamedDist(Normal(1.0, 0.5), :$(rho_name))")
+            push!(all_nested_updates, "$(main_eta_name) .+= $(rho_name) .* $(sub_eta_name)")
+        end
+
+        # --- Generate Likelihood for Sub-Model ---
+        kwargs_parts = String[]
+        if sub_needs_sigma; push!(kwargs_parts, "sigma_y=$(sub_sigma_name)"); end
+        
+        param_keys = [:trials, :weights, :y_L, :y_U, :hurdle]
+        for key in param_keys
+            if get(sub_config, Symbol("user_provided_", key), false)
+                param_val = get(sub_config, key, nothing)
+                val_code = param_val isa AbstractVector ? "sub_M.$(key)[i]" : "sub_M.$(key)"
+                if key == :trials; val_code = "Int(" * val_code * ")"; end
+                push!(kwargs_parts, "$(key)=$(val_code)")
+            end
+        end
+        kwargs_str = join(kwargs_parts, ", ")
+
+        lik_loop = """
+        # Likelihood for nested model: $(prefix)
+        let sub_M = M.nested_manifolds[:$(var_key)]
+            sub_family = sub_M.likelihood_specs[1][:family]
+            for i in 1:N
+                d_lik_sub = bstm_Likelihood(sub_family, [T(sub_M.y_obs[i])]; $(kwargs_str))
+                Turing.@addlogprob! Distributions.logpdf(d_lik_sub, $(sub_eta_name)[i])
+            end
+        end
+        """
+        push!(all_nested_likelihoods, lik_loop)
+    end
+
+    return join(all_nested_priors, "\n\n"), join(all_nested_updates, "\n\n"), join(all_nested_likelihoods, "\n\n")
+end
+
+# to delete
+function bstm_dynamic_model(config::NamedTuple)
+    # Purpose: A unified entry point for compiling and instantiating any dynamically generated model.
+    # Rationale: Decouples model generation from execution.
+    # v1.2.1 (2026-07-16)
+    # Assumptions: `config` is a valid model configuration.
+    # Inputs:
+    #   - config: The model configuration NamedTuple.
+    # Outputs: An instantiated Turing.jl model object.
+    model_string, expr, registry = bstm_text_assembler(config)
+
+    println("\n--- Dynamically Generated Model Code ---")
+    println(model_string)
+    println("----------------------------------------\n")
+
+    config_dict = Dict(pairs(config))
+    config_dict[:generated_model_code] = model_string
+    new_config = NamedTuple(config_dict)
+
+    Base.invokelatest(eval, expr)
+
+    arch = get(config, :model_arch, "univariate")
+    model_func_name = if arch == "multivariate"
+        :bstm_text_generated_multivariate
+    elseif arch == "multifidelity"
+        :bstm_text_generated_multifidelity
+    else
+        :bstm_text_generated_univariate
+    end
+    model_func = getfield(Main, model_func_name)
+    return Base.invokelatest(model_func, new_config, registry)
 end

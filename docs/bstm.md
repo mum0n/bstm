@@ -89,14 +89,14 @@ else
     project_directory = joinpath( "C:\\", "Users", "choij", "projects", "bstm")  # examples
 end
 
-include( joinpath( project_directory, "startup.jl" ) ) # might need to run this a few times if there are stragglers   
-
-# or to reload just the functions (after an edit) 
-# load_project_functions( srcdir() )
-
+# start environment: 
+include( joinpath( project_directory, "startup.jl" ) ) 
+# you might need to run this a few times if there are out of date libraries   
 # Pkg.instantiate()  # to force a reset if some package seems corrupted/partially installed
 # Pkg.update()  # to update this can break dependencies .. do this only if you really need to 
- 
+
+# load functions 
+load_project_functions( srcdir() )
 ```
 
 If there continue to be issues with packages breaking, some more lower level package management may be required or a restart of Julia ... ;)
@@ -154,10 +154,12 @@ m = @bstm(  likelihood(y, family=poisson, offsets=log_offset) ~
     data_scot[:data]
 )  
 
+show_model(m)  # pseudocode to check
+
 
 m = @bstm(  likelihood(y, family=poisson, offsets=log_offset) ~ 
     intercept() + 
-    spatial(s_idx, model=besag, W=data_scot[:au][:W]) + 
+    spatial(s_idx, model=bym2, W=data_scot[:au][:W]) + 
     temporal(year, model=ar1) +
     cov1 +  
     fixed(cov2) + 
@@ -544,7 +546,7 @@ inp_krig = bstm_options(
   t_coord = data.t_coord,
   s_idx = au.assignments,
   t_idx = tu.t_idx,
-  u_N = s_N, 
+  u_N = data.metadata.u_N,
   log_offset = zeros(length(data.y_obs)),
   W = au.W,
   model_arch = "example",  # Pass the struct instance, not a string
@@ -1251,10 +1253,10 @@ inp_test = bstm_options(
     y_obs = data.y_obs,
     s_x = data.s_x,
     s_y = data.s_y,
-    s_idx = au.s_idx,
+    s_idx = au.assignments,
     t_idx = tu.t_idx,
     W = au.W,
-    s_N = local_s_N,
+    s_N = size(au.W, 1),
     log_offset = zeros(length(data.y_obs)),
     W = au.W,
     model_arch = "univariate",
@@ -1302,16 +1304,16 @@ println("Temporal Slices (t_N): ", actual_t_N)
 # Rationale: Standardizing column names and ensuring index alignment.
 df_advdiff = DataFrame(
     y_obs = data.y_obs,
-    s_idx = au.s_idx,
+    s_idx = au.assignments,
     t_idx = tu.t_idx,
     # st_idx for Type IV interactions must use the partitioned unit count
-    st_idx = [(tu.t_idx[i] - 1) * actual_s_N + au.s_idx[i] for i in 1:length(data.y_obs)]
+    st_idx = [(tu.t_idx[i] - 1) * actual_s_N + au.assignments[i] for i in 1:length(data.y_obs)]
 )
 
 # 3. Model Definition
 # Rationale: Passing explicit s_N and t_N to override default data scanning.
 m = bstm(
-    "y_obs ~ 1 + Spatial(s_idx; manifold='besag') + Temporal(t_idx; manifold='ar1') + Physics(s_idx, t_idx; manifold='advection_diffusion')",
+    "y_obs ~ 1 + spatial(s_idx, model='besag') + temporal(t_idx, model='ar1') + dynamics(s_idx, t_idx, model='advection_diffusion')",
     df_advdiff,
     model_family="gaussian",
     W = au.W,
@@ -1352,7 +1354,7 @@ println("Temporal Units (t_N): ", local_t_N)
 # We pass explicit s_N and t_N to override default scanning.
 # Manifold names are aligned with the v06.1 taxonomy.
 m = bstm(
-    "y_obs ~ 1 + Spatial(s_idx, manifold='bym2') + Temporal(t_idx, manifold='ar1') + Smooth(z, manifold='rw2', nbins=12)",
+    "y_obs ~ 1 + spatial(s_idx, model='bym2') + temporal(t_idx, model='ar1') + smooth(z, model='rw2', nbins=12)",
     df_advdiff,
     model_family="gaussian",
     W = au.W,
@@ -1627,10 +1629,11 @@ Computation:
 
 Random.seed!(42) # Set a seed for reproducibility.
 
-mdata = bstm_options(inp_count, model_space="bym2", cov=nothing);
-m = model_grmf(mdata);
+mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx)
+m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=bym2) + temporal(t_idx, model=ar1), 
+    mdata_df, W=inp_count.W);
 chn = sample(m, MH(), 1000, nchains=4);
-res = model_results_comprehensive(m, chn, mdata, au, PS);
+res = model_results_comprehensive(m, chn);
 
 showparams( res.summarystats )
   
@@ -1687,13 +1690,13 @@ Sampling takes much longer than the simple model and so I have reduced the numbe
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
-
-m = model_D02_poisson_bym2(inp_count)
+mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z=inp_count.z, w1=inp_count.w1)
+m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=bym2) + temporal(t_idx, model=ar1) + smooth(z, model=rw2) + smooth(w1, model=rw2),
+    mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
-
 chn = sample(m, os, 200, nchains=4)
-res = model_results_comprehensive(m, chn, inp_count, au);
+res = model_results_comprehensive(m, chn);
 
 showparams( res.summarystats 
 
@@ -1761,13 +1764,13 @@ This specification is robust because it automatically handles both structured sp
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
-
-m = model_D03_poisson_leroux(inp_count)
+mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
+m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=leroux) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+    mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
-
 chn = sample(m, os, 200, nchains=4)
-res = model_results_comprehensive(m, chn, inp_count, au);
+res = model_results_comprehensive(m, chn);
 
 
 showparams( res.summarystats 
@@ -1812,14 +1815,15 @@ ESS (mean) was 0.0251 !
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
-
-m = model_4_poisson_localised(inp_count)
+mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
+m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=localadaptive) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+    mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler( m; adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, inp_count, au);
+res = model_results_comprehensive(m, chn);
 
 
 showparams( res.summarystats 
@@ -1862,14 +1866,15 @@ ESS (mean) was 0.0318!
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
-
-m = model_D05_poisson_sar(inp_count)
+mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
+m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=sar) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+    mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, inp_count, au);
+res = model_results_comprehensive(m, chn);
 
 
 showparams( res.summarystats 
@@ -1915,14 +1920,15 @@ ESS was 0.0066
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
-
-m = model_D06_poisson_svc(inp_count)
+mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
+m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + (z_obs |> spatial(s_idx, model=besag)) + temporal(t_idx, model=ar1),
+    mdata_df, W=inp_count.W)
 os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, inp_count, au);
+res = model_results_comprehensive(m, chn);
 
 
 showparams( res.summarystats 
@@ -1964,14 +1970,15 @@ ESS (mean): 0.0318
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
-
-m = model_D07_poisson_dag(inp_count)
+mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
+m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=dag) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+    mdata_df, W=inp_count.W, model_st="IV")
 os  = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, inp_count, au);
+res = model_results_comprehensive(m, chn);
 
 
 showparams( res.summarystats 
@@ -2013,14 +2020,15 @@ ESS (mean): 0.0318
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
-
-m = model_D08_hurdle(inp_count)
+mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
+m = @bstm(likelihood(y_obs, family=poisson, hurdle=0) ~ 1 + spatial(s_idx, model=besag) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+    mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, inp_count, au);
+res = model_results_comprehensive(m, chn);
 
 
 showparams( res.summarystats 
@@ -2062,14 +2070,15 @@ ESS (mean): 0.0318
 ```{julia}
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
-
-m = model_D09_poisson_ei(inp_count)
+mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
+m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=rff) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+    mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, inp_count, au);
+res = model_results_comprehensive(m, chn);
 
 
 showparams( res.summarystats 
@@ -2145,13 +2154,15 @@ Random.seed!(42) # Set a seed for reproducibility.
 # need a count: 
 inp_count = merge( inp_count, (y2=Int.(floor.( 100 .* (inp_count.z_obs .- minimum(inp_count.z_obs) ) ) ), ))
 
-m = model_D24_poisson_mcar(inp_count)
+mdata_df = DataFrame(y1=inp_count.y_obs, y2=inp_count.y2, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx)
+m = @bstm(y1 + y2 ~ 1 + spatial(s_idx, model=besag) + temporal(t_idx, model=ar1),
+    mdata_df, W=inp_count.W)
 os = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
 
 chn = sample(m, os, 200, nchains=4)
 
-res = model_results_comprehensive(m, chn, inp_count, au);
+res = model_results_comprehensive(m, chn);
 
 
 showparams( res.summarystats )
