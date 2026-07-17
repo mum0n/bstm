@@ -29,16 +29,16 @@ m = @bstm(
 
 The `likelihood()` module on the LHS specifies the observation model and its parameters.
 
-| Parameter    | Example Usage       | Description                                                                    |
-| :-------------| :--------------------| :-------------------------------------------------------------------------------|
-| `family`     | `family=poisson`   | Sets the likelihood distribution (e.g., `:poisson`, `:gaussian`, `:binomial`). |
-| `offsets`    | `offsets=log_pop`  | Specifies a log-scale offset, typically for exposure in count models.          |
-| `weights`    | `weights=sample_w` | Applies observation-level weights to the log-likelihood.                       |
-| `trials`     | `trials=n_patients` | Defines the number of trials for a binomial likelihood.                        |
-| `zi`         | `zi=true`           | Enables a zero-inflation component for count models.                           |
-| `hurdle`     | `hurdle=0`          | Implements a hurdle model, separating the zero-generating process.             |
-| `volatility` | `volatility=true`   | Enables a spatiotemporal stochastic volatility model for observation noise.    |
-| `y_L`, `y_U` | `y_L=lower_b`      | Defines lower and upper bounds for censored data.                              |
+| Parameter                  | Example Usage       | Description                                                                                                         |
+| :---------------------------| :--------------------| :--------------------------------------------------------------------------------------------------------------------|
+| `family`                   | `family=:poisson`   | Sets the likelihood distribution. See table below for options.                                                      |
+| `log_offsets` or `offsets` | `offsets=pop_log`   | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
+| `weights`                  | `weights=sample_w`  | Applies observation-level weights to the log-likelihood.                                                            |
+| `trials`                   | `trials=n_patients` | Specifies the number of trials for each observation in a Binomial model.                                            |
+| `zi`                       | `zi=true`           | Enables a zero-inflation component for count models.                                                                |
+| `volatility`               | `volatility=true`   | Enables a spatiotemporal stochastic volatility model for the observation noise ($\sigma_y$).                        |
+| `y_L`, `y_U`               | `y_L=lower_b`       | Defines lower and upper bounds for censored data.                                                                   |
+| `hurdle`                   | `hurdle=0`          | Implements a hurdle model by truncating the likelihood below the specified threshold.                               |
 
 ### 2.3. Illustrative Examples
 
@@ -54,11 +54,9 @@ The `likelihood()` module on the LHS specifies the observation model and its par
     `@bstm(likelihood(y) ~ 1 + spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1), data, W=W)`
     Employs the Kronecker product to create a fully structured spatiotemporal interaction field.
 
-4.  **Spatially Varying Coefficients (SVC):**
+4.  **Spatially Varying Coefficients (SVC) and Curves:**
     `@bstm(likelihood(y) ~ 1 + (poverty |> spatial(s_idx, model=icar)), data, W=W)`
     Allows the impact of `poverty` to vary according to local spatial gradients.
-
-5.  **Spatially Varying Curves:**
     `@bstm(likelihood(y) ~ 1 + (spatial(s_idx, model=icar) |> smooth(time, model=pspline)), data, W=W)`
     Models a temporal trend that varies smoothly across space.
 
@@ -69,11 +67,8 @@ The `bstm` domain-specific language operates through a recursive parser that all
 ### 3.1. Algebraic Operators
 
 1.  **Kronecker Product (⊗)**: Used for creating inseparable interaction effects, such as the Knorr-Held Type IV model (`spatial() ⊗ temporal()`). This builds a joint precision matrix $Q_{st} = Q_t \otimes Q_s$, enabling the representation of space-time interactions where every spatial location has a unique, correlated temporal trend.
-2.  **Composition (∘)**: Represents the functional composition of two manifolds, where one manifold modulates the parameters of another. This is a powerful tool for creating non-stationary models. For example, in `spatial() ∘ smooth(x)`, the output of the `smooth(x)` manifold can be used to define a spatially-varying variance for the `spatial()` effect.
-
-### 3.2. Structural Transformations and State-Space Models
-
-The pipe (`|>`) operator handles data normalization and state-space evolution.
+2.  **Composition (∘)**: Represents the functional composition of two manifolds, where one manifold modulates the parameters of another. This is a powerful tool for creating non-stationary models.
+3.  **Pipe (`|>`):** The pipe operator handles data normalization and state-space evolution.
 
 *   **Transformations**: Objects like `ZScoreManifold` or `LogManifold` act as wrappers that normalize inputs before they enter the latent process.
 *   **State-Space Evolution**: The pipe operator defines a state-space model where one manifold evolves over the domain of another. This supports both discrete-time dynamics (e.g., `spatial() |> temporal(model=ar1)`) and the creation of spatially-varying curves (e.g., `spatial() |> smooth(time, model=pspline)`), where the coefficients of the temporal basis functions are modeled as spatial fields.
@@ -86,16 +81,16 @@ The `bstm` framework includes a registry of components that range from discrete 
 
 For discrete domains, `bstm` implements GMRF structures where dependency is defined by a precision matrix Q.
 
-| Manifold  | Theoretical Assumption                      | Structural Rationale                                                |
-| :----------| :--------------------------------------------| :--------------------------------------------------------------------|
-| IID       | $\epsilon \sim N(0, \sigma^2 I)$            | Unstructured exchangeability; base model for PC-shrinkage.          |
-| ICAR      | Intrinsic CAR; $Q_{ij} = -1$ for neighbors. | Pure local smoothing; identifies spatial gradients.                 |
-| Besag     | Standard CAR model.                         | Global and local spatial dependency via fixed precision.            |
-| BYM2      | Scaled Besag + IID component.               | Explicit variance partitioning ($\rho$) for better identifiability. |
-| Leroux    | Convex combination of I and $Q_{ICAR}$.     | Bridges IID and ICAR structures through a mixing parameter.         |
-| SAR       | $(I - \rho W)y = \epsilon$.                 | Simultaneous modeling of response autocorrelation.                  |
-| RW1 / RW2 | Random Walk (1st/2nd order).                | Temporal continuity and smoothing of non-stationary trends.         |
-| AR1       | $\mu_t = \rho \mu_{t-1} + \epsilon_t$.      | Stationary temporal process with geometric decay.                   |
+| Manifold | Theoretical Assumption | Structural Rationale |
+|:---|:---|:---|
+| IID | $\epsilon \sim N(0, \sigma^2 I)$ | Unstructured exchangeability; base model for PC-shrinkage. |
+| ICAR | Intrinsic CAR; $Q_{ij} = -1$ for neighbors. | Pure local smoothing; identifies spatial gradients. |
+| Besag | Standard CAR model. | Global and local spatial dependency via fixed precision. |
+| BYM2 | Scaled Besag + IID component. | Explicit variance partitioning ($\rho$) for better identifiability. |
+| Leroux | Convex combination of I and $Q_{ICAR}$. | Bridges IID and ICAR structures through a mixing parameter. |
+| SAR | $(I - \rho W)y = \epsilon$. | Simultaneous modeling of response autocorrelation. |
+| RW1 / RW2 | Random Walk (1st/2nd order). | Temporal continuity and smoothing of non-stationary trends. |
+| AR1 | $\mu_t = \rho \mu_{t-1} + \epsilon_t$. | Stationary temporal process with geometric decay. |
 
 ### 4.2. Continuous, Spectral, and Advanced Manifolds
 
@@ -213,15 +208,15 @@ The `MultifidelityArchitecture` is designed for data fusion, integrating high-vo
 
 For discrete spatial models (GMRFs), the continuous spatial domain must be discretized into "Areal Units" (AUs). The `assign_spatial_units` function provides several methods for this, balancing geometric compactness with statistical information density.
 
-| Method     | Description                         | Justification                                                                                                                    |
-| :-----------| :------------------------------------| :---------------------------------------------------------------------------------------------------------------------------------|
-| `:cvt`     | **Centroidal Voronoi Tessellation** | Iteratively minimizes variance to create geometrically regular cells.                                                            |
-| `:kvt`     | **K-Means Voronoi Tessellation**    | Uses K-Means to create units with a balanced number of observations.                                                             |
-| `:avt`     | **Agglomerative Voronoi**           | A bottom-up approach that merges small units to prevent data starvation.                                                         |
-| `:bvt`     | **Binary Vector Tree**              | Employs recursive partitioning along the axis of maximum variance to efficiently handle large datasets and balance point counts. |
-| `:qvt`     | **Quadrant Voronoi Tessellation**   | A quadtree-like recursive method that splits regions into four quadrants, adapting to multi-scale spatial clusters.              |
-| `:hvt`     | **Hierarchical Voronoi**            | Combines K-Means seeding with geometric refinement for stable, well-behaved polygons.                                            |
-| `:lattice` | **Regular Grid**                    | Simple, fast discretization into uniform squares. Assumes stationarity.                                                          |
+| Method | Description | Justification |
+|:---|:---|:---|
+| `:cvt` | **Centroidal Voronoi Tessellation** | Iteratively minimizes variance to create geometrically regular cells. |
+| `:kvt` | **K-Means Voronoi Tessellation** | Uses K-Means to create units with a balanced number of observations. |
+| `:avt` | **Agglomerative Voronoi** | A bottom-up approach that merges small units to prevent data starvation. |
+| `:bvt` | **Binary Vector Tree** | Employs recursive partitioning along the axis of maximum variance to efficiently handle large datasets and balance point counts. |
+| `:qvt` | **Quadrant Voronoi Tessellation** | A quadtree-like recursive method that splits regions into four quadrants, adapting to multi-scale spatial clusters. |
+| `:hvt` | **Hierarchical Voronoi** | Combines K-Means seeding with geometric refinement for stable, well-behaved polygons. |
+| `:lattice`| **Regular Grid** | Simple, fast discretization into uniform squares. Assumes stationarity. |
 
 When a `geom_hull` is provided, the function performs a spatial intersection ($P_{clipped} = P_{tessellated} \cap H_{hull}$) to ensure that generated units do not extend into invalid areas (e.g., water bodies). Connectivity between units is determined by `LibGEOS.touches`, and the resulting graph is used to construct the Graph Laplacian $Q = D - W$ for GMRF models.
 
@@ -399,11 +394,13 @@ This section provides a detailed quick-reference guide to the main modules avail
 
 | Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
 |:---|:---|:---|:---|:---|
-| `log_offsets` or `offsets` | `offsets=pop_log` | `Symbol` | None | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
+| `family` | `family=:poisson` | `Symbol` | `:gaussian` | Sets the likelihood distribution. See table below for options. |
+| `log_offsets` or `offsets` | `offsets=pop_log` | `Symbol` | `0.0` | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
 | `weights` | `weights=sample_w` | `Symbol` | `1.0` | Multiplies the log-likelihood of each observation by the specified weight. |
 | `trials` | `trials=n_patients` | `Symbol` | `1` | Specifies the number of trials for each observation in a Binomial model. |
+| `zi` | `zi=true` | `Bool` | `false` | Enables a zero-inflation component for count models. |
 | `volatility`| `volatility=true` | `Bool` | `false` | Enables a spatiotemporal stochastic volatility model for the observation noise ($\sigma_y$). |
-| `y_L`, `y_U`| `y_L=lower_b` | `Symbol` | `-Inf`, `+Inf` | Defines the lower (`y_L`) and upper (`y_U`) bounds for censored observations. |
+| `y_L`, `y_U`| `y_L=lower_b` | `Symbol` or `Number` | `-Inf`, `+Inf` | Defines the lower (`y_L`) and upper (`y_U`) bounds for censored data. |
 | `hurdle` | `hurdle=0` | `Number` | `-Inf` | Implements a hurdle model by truncating the likelihood below the specified threshold. |
 
 ### 8.2. Likelihood Families
@@ -486,22 +483,20 @@ The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm`
 
 *Note: Direct censoring of covariates in `mixed()` is not supported. See Section 6.5 for the recommended joint modeling approach.*
 
-| Syntax               | Example Usage                 | Key Parameters | Default Priors                    | Mathematical Assumption                                                                                                                      |
-| :---------------------| :------------------------------| :---------------| :----------------------------------| :---------------------------------------------------------------------------------------------------------------------------------------------|
-| **Random Intercept** | `mixed(1, group_var)`         | `model`        | `sigma_prior`: `Exponential(1.0)` | Assumes each level $j$ of `group_var` has a unique intercept $\alpha_j \sim \mathcal{N}(0, \sigma^2_{\text{group}})$.                        |
-| **Random Slope**     | `mixed(covariate, group_var)` | `model`        | `sigma_prior`: `Exponential(1.0)` | Assumes the effect (slope) of a `covariate` varies across the levels of `group_var`, $\beta_j \sim \mathcal{N}(0, \sigma^2_{\text{slope}})$. |
+| Syntax | Example Usage | Key Parameters | Default Priors | Mathematical Assumption |
+|:---|:---|:---|:---|:---|
+| **Random Intercept** | `mixed(1, group_var)` | `model` | `sigma_prior`: `Exponential(1.0)` | Assumes each level $j$ of `group_var` has a unique intercept $\alpha_j \sim \mathcal{N}(0, \sigma^2_{\text{group}})$. |
+| **Random Slope** | `mixed(covariate, group_var)` | `model` | `sigma_prior`: `Exponential(1.0)` | Assumes the effect (slope) of a `covariate` varies across the levels of `group_var`, $\beta_j \sim \mathcal{N}(0, \sigma^2_{\text{slope}})$. |
 
 ### 8.7. `dynamics()` Module
 
-| Model | `model='...'` | Key Parameters | Default Priors |
-|:---|:---|:---|:---|
-| **Advection** | `'advection'` | `velocity_prior`, `sigma_prior` | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)` |
-| **Diffusion** | `'diffusion'` | `diffusion_prior`, `sigma_prior` | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` |
-| **Advection-Diffusion** | `'advection_diffusion'` | `velocity_prior`, `diffusion_prior`, `sigma_prior` | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)` |
-| **Directed Spatial Process** | `'directed_spatial_process'` | `rho_prior`, `sigma_innov_prior`, `ls_innov_prior`, `kernel` | `rho`: `Beta(1,1)`, `sigma_innov`: `Exponential(1.0)` |
-| **Logistic Growth** | `'logistic_f'` | `r_prior`, `K_prior`, `sigma_F_prior` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`, `sigma_F`: `Exponential(0.5)` |
-| **Gompertz Growth** | `'gompertz'` | `r_prior`, `K_prior`, `sig_dyn_prior` | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)` |
-| **Custom Model** | `'custom'` | `func` | N/A |
+| Model | `model='...'` | Key Parameters | Default Priors | Use Case & Utility |
+|:---|:---|:---|:---|:---|
+| **Advection** | `'advection'` | `velocity_prior`, `sigma_prior` | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)` | Models transport or flow using a first-order directed operator. |
+| **Diffusion** | `'diffusion'` | `diffusion_prior`, `sigma_prior` | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` | Models spreading or dispersion using the graph Laplacian. |
+| **Advection-Diffusion** | `'advection_diffusion'` | `velocity_prior`, `diffusion_prior`, `sigma_prior` | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)` | Combines both transport and diffusion processes. |
+| **Gompertz Growth** | `'gompertz'` | `r_prior`, `K_prior`, `sig_dyn_prior` | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)` | Models population growth with asymmetric sigmoidal curve. |
+| **Logistic Growth** | `'logistic_basic'` | `r_prior`, `K_prior` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)` | Models population growth with a symmetric carrying capacity. |
 
 ### 8.8. `nested()` and `eigen()` Modules
 
@@ -557,15 +552,18 @@ These modules provide explicit control over standard regression components.
 
 #### `fixed()` Module Reference
 
-| Keyword / Parameter | Example Usage        | Data Type                 | Default        | Meaning & Assumptions                                                                                    |
-| :--------------------| :---------------------| :--------------------------| :---------------| :---------------------------------------------------------------------------------------------------------|
+| Keyword / Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
+|:---|:---|:---|:---|:---|
 | `fixed()`           | `fixed(Region, ...)` | Module                    | N/A            | Explicitly marks a variable as a fixed effect. Primarily used to specify contrasts or priors.            |
 | `contrast`          | `contrast=:effects`  | `Symbol`                  | `DummyCoding`  | Specifies the contrast coding for a categorical variable (e.g., `:effects`, `:helmert`).                 |
 | `prior`             | `prior=Normal(0, 2)` | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the coefficient(s) of this fixed effect. Can be a `Distribution` or a PC prior tuple. |
 
 #### `intercept()` Module Reference
 
-| Keyword / Parameter | Example Usage  10))` | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple. |
+| Keyword / Parameter | Example Usage          | Data Type                 | Default        | Meaning & Assumptions                                                                                                                |
+| :--------------------| :-----------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
+| `intercept()`       | `intercept(prior=...)` | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
+| `prior`             | `prior=Normal(0, 10)`  | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
 
 #### Interaction Effects
 

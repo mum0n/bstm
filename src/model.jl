@@ -2532,17 +2532,53 @@ function build_model(m::Eigen, data_inputs::Dict)
     return _build_pass_through_model(m, data_inputs, Q_template_val=template.matrix, sf_val=template.scaling_factor)
 end
 
+
 function build_model(m::DynamicsManifold, data_inputs::Dict)
     # Purpose: Builder for the `DynamicsManifold`.
-    # Rationale: Provides a Laplacian template for physics-based models like advection/diffusion.
-    # v1.2.1 (2026-07-16)
-    # Assumptions: `W` is available in `data_inputs`.
-    # Inputs/Outputs: See `build_model`.
+    # Rationale: This version correctly distinguishes between advection and diffusion operators.
+    #            It generates a second-order Laplacian operator (L) for diffusion and a first-order
+    #            directed operator (A) for advection. Both are stored in the manifold's
+    #            hyperparameter registry, ensuring consistency with the reconstruction engine.
+    # v1.3.0 (2026-07-17) - Corrected from v1.2.1
+    # Assumptions: `W` (adjacency matrix) is available in `data_inputs`.
+    # Inputs:
+    #   - m: The DynamicsManifold object.
+    #   - data_inputs: The model configuration dictionary.
+    # Outputs: A NamedTuple with the manifold's technical specification, including L and A operators.
+
     n = get(data_inputs, :s_N, 1)
     W = get(data_inputs, :W, nothing)
-    template = build_structure_template(:besag, n; W=W)
-    return _build_pass_through_model(m, data_inputs, Q_template_val=template.matrix, sf_val=template.scaling_factor)
+    if isnothing(W)
+        error("DynamicsManifold requires an adjacency matrix W, but it was not found in the model configuration.")
+    end
+
+    # 1. Build the second-order diffusion operator (Graph Laplacian).
+    # This is used for 'diffusion' and 'advection_diffusion' models.
+    L_template = build_structure_template(:besag, n; W=W).matrix
+
+    # 2. Build a first-order advection operator.
+    # This creates a simple directed graph by orienting edges from higher to lower indices,
+    # then row-normalizing to create a shift/transition operator. This is a basic approximation
+    # of advection on a graph without an explicit velocity field.
+    W_dir = tril(W, -1)
+    out_degree = sum(W_dir, dims=2)[:]
+    # Add a small epsilon to avoid division by zero for nodes with no incoming edges.
+    D_inv = spdiagm(0 => 1.0 ./ (out_degree .+ 1e-9))
+    A_template = D_inv * W_dir
+
+    # 3. Store both operators in the manifold's hyperparameter registry.
+    hyper_dict = Dict{Symbol, Any}()
+    for fn in fieldnames(typeof(m))
+        hyper_dict[fn] = getfield(m, fn)
+    end
+    hyper_dict[:L_template] = L_template
+    hyper_dict[:A_template] = A_template
+
+    # The Q_template field is still required by the generic manifold pathway. We pass the
+    # Laplacian as the default, but the specific dynamics logic will use L_template and A_template.
+    return (Q_template=L_template, scaling_factor=1.0, model_type=:dynamics, hyper=NamedTuple(hyper_dict))
 end
+
 
 function build_model(m::TensorProductSmooth, data_inputs::Dict)
     # Purpose: Builder for the `TensorProductSmooth` manifold.
@@ -4656,12 +4692,14 @@ end
 
 
 
+
 function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main_eta_name::String)
     # Purpose: Generates the complete code block for all nested sub-models.
-    # Rationale: This version generates more parsimonious code for sub-models by using
-    #            Product distributions for fixed effects and conditional keyword arguments
-    #            for the likelihood call, mirroring the optimizations in the main model assembler.
-    # v1.2.7 (2026-07-17)
+    # Rationale: This version harmonizes the fixed effects prior generation with the main model's
+    #            assembler, using a general check for identical priors to enable more efficient
+    #            code generation with `filldist` for any distribution type. This corrects a loss
+    #            of functionality where only `Normal` priors were handled efficiently.
+    # v1.2.9 (2026-07-17) - Corrected from v1.2.7
     if !haskey(M, :nested_manifolds) || isempty(M.nested_manifolds)
         return "", "", ""
     end
@@ -4684,10 +4722,17 @@ function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main
         # Fixed effects priors
         if get(sub_config, :Xfixed_N, 0) > 0
             priors_vec = get(sub_config, :Xfixed_priors_vec, [Normal(0, 5) for _ in 1:sub_config.Xfixed_N])
-            all_same_normal = !isempty(priors_vec) && all(p -> p isa Normal && p.μ == priors_vec[1].μ && p.σ == priors_vec[1].σ, priors_vec)
+            
+            local all_same
+            if isempty(priors_vec)
+                all_same = false
+            else
+                # General check for identical priors, same as in the main fixed effects block.
+                all_same = all(p -> p == priors_vec[1], priors_vec)
+            end
 
             local prior_block
-            if all_same_normal
+            if all_same && !isempty(priors_vec)
                 prior_str = _distribution_to_string(priors_vec[1])
                 prior_block = "$(prefix)_Xfixed_beta ~ NamedDist(filldist($(prior_str), $(sub_config.Xfixed_N)), :$(Symbol(prefix, "_Xfixed_beta")))"
             else
@@ -4775,9 +4820,9 @@ function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main
     end
 
     return join(all_nested_priors, "\n\n"), join(all_nested_updates, "\n\n"), join(all_nested_likelihoods, "\n\n")
-end
-
-# to delete
+end 
+ 
+ 
 function bstm_dynamic_model(config::NamedTuple)
     # Purpose: A unified entry point for compiling and instantiating any dynamically generated model.
     # Rationale: Decouples model generation from execution.

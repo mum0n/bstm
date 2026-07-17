@@ -1397,6 +1397,11 @@ model_results_plots(res)
 
 ```
 
+This example illustrates the flexibility of the `bstm` formula interface in specifying complex hierarchical models with fine-grained control over priors and parameterization, all within a readable and self-contained syntax.
+ 
+
+## Reaction
+
 The "reaction" (fishery dynamics and growth/mortality) is incomplete ("logistic_ar1") but can also be placed at the space-time level rather than in aggregate form. This will be addressed soon.
 
 

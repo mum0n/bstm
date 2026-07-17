@@ -403,9 +403,23 @@ function extract_manifold(m_obj::Union{GP, FITC, SVGP, Nystrom}, chain, M, n_sam
 end
 
 function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    # Purpose: Reconstructs the effect of the DynamicsManifold.
+    # Rationale: This version correctly distinguishes between operators for advection (first-order, non-symmetric)
+    #            and diffusion (second-order, symmetric). It uses the appropriate operators (A and L)
+    #            retrieved from the manifold's specification and employs LU factorization for the non-symmetric
+    #            advection and advection-diffusion cases, ensuring mathematical correctness.
+    # v1.3.0 (2026-07-17) - Corrected from v1.2.1
+    # Inputs: Standard `extract_manifold` arguments.
+    # Outputs: A NamedTuple with the reconstructed spatiotemporal dynamic effect.
+
     structured_effects = Vector{Matrix{Float64}}()
     model_type = m_obj.model
     key = string(spec.var)
+    
+    # Retrieve the pre-computed operators from the manifold's specification.
+    # The Laplacian L is used for diffusion, and the directed operator A for advection.
+    L = spec.hyper.L_template
+    A = spec.hyper.A_template
     noise = get(M, :noise, 1e-6)
 
     for k in 1:outcomes_N
@@ -413,13 +427,13 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
         var = key
 
         if model_type == "advection" || model_type == "diffusion"
-            param_name = model_type == "advection" ? "v" : "d"
+            param_name = model_type == "advection" ? "v" : "d" # v for velocity, d for diffusion
             rate_name = _find_parameter_new(p_names, domain, key, param_name, k)
             sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
             innov_name = _find_parameter_new(p_names, domain, var, "innov", k)
 
             if isempty(rate_name) || isempty(sigma_name) || isempty(innov_name)
-                @warn "Parameters for Dynamics manifold $(key) (outcome $(k)) not found. Returning zero-matrix."
+                @warn "Parameters for Dynamics manifold $(key) (model: $(model_type), outcome $(k)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_tot, n_samples))
                 continue
             end
@@ -428,27 +442,32 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
             sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
             innov_samples = get_params_vector(chain, innov_name, M.s_N * M.t_N)
 
-            L = M.s_Q # Graph Laplacian
             I_s = I(M.s_N)
-            
             s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
             t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx
-
             effect_k = zeros(Float64, N_tot, n_samples)
 
             for j in 1:n_samples
                 dyn_field = zeros(Float64, M.s_N, M.t_N)
                 innov_matrix = reshape(innov_samples[j, :], M.s_N, M.t_N)
                 
-                # Propagator for the implicit Euler step: (I - v*dt*L)
-                L_op = cholesky(Symmetric(I_s - rate_samples[j] * L + noise * I_s)).L
+                local propagator
+                if model_type == "diffusion"
+                    # Diffusion uses the symmetric Laplacian operator L, allowing for efficient Cholesky factorization.
+                    op_matrix = Symmetric(I_s - rate_samples[j] * L + noise * I_s)
+                    propagator = cholesky(op_matrix)
+                else # Advection
+                    # Advection uses a non-symmetric directed operator A, requiring a general LU factorization.
+                    op_matrix = I_s - rate_samples[j] * A + noise * I_s
+                    propagator = lu(op_matrix)
+                end
 
                 # Initialize first time step
                 dyn_field[:, 1] = innov_matrix[:, 1]
 
                 # Evolve over time by solving the linear system at each step
                 for t in 2:M.t_N
-                    dyn_field[:, t] = L_op' \ (L_op \ dyn_field[:, t-1]) + innov_matrix[:, t]
+                    dyn_field[:, t] = propagator \ dyn_field[:, t-1] + innov_matrix[:, t]
                 end
                 
                 dyn_field .*= sigma_samples[j]
@@ -475,18 +494,22 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
             sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1] 
             innov_samples = get_params_vector(chain, innov_name, M.s_N * M.t_N) 
  
-            L = M.s_Q 
             I_s = I(M.s_N) 
             s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx 
             t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx 
             effect_k = zeros(Float64, N_tot, n_samples) 
             for j in 1:n_samples 
                 dyn_field = zeros(Float64, M.s_N, M.t_N) 
-                innov_matrix = reshape(innov_samples[j, :], M.s_N, M.t_N) 
-                L_op = cholesky(Symmetric(I_s - v_samples[j] * L - d_samples[j] * L + noise * I_s)).L 
+                innov_matrix = reshape(innov_samples[j, :], M.s_N, M.t_N)
+                
+                # The combined operator includes a non-symmetric advection part (A) and a symmetric diffusion part (L).
+                # The resulting operator is non-symmetric, requiring LU factorization.
+                op_matrix = I_s - v_samples[j] * A - d_samples[j] * L + noise * I_s
+                propagator = lu(op_matrix)
+
                 dyn_field[:, 1] = innov_matrix[:, 1] 
                 for t in 2:M.t_N 
-                    dyn_field[:, t] = L_op' \ (L_op \ dyn_field[:, t-1]) + innov_matrix[:, t] 
+                    dyn_field[:, t] = propagator \ dyn_field[:, t-1] + innov_matrix[:, t] 
                 end 
                 dyn_field .*= sigma_samples[j] 
                 for i in 1:N_tot 
@@ -496,6 +519,7 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
             push!(structured_effects, effect_k) 
 
         elseif model_type == "gompertz" || model_type == "logistic_basic"
+            # This part of the function is unchanged.
             r_name = _find_parameter_new(p_names, domain, key, "r", k)
             K_name = _find_parameter_new(p_names, domain, key, "K", k)
 
@@ -529,6 +553,7 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
     end
     return (structured=structured_effects, noisy=structured_effects)
 end
+
 
 function extract_manifold(m_obj::MixedManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     lhs_terms = [strip(t) for t in split(m_obj.lhs, '+')]
@@ -579,10 +604,13 @@ function extract_manifold(m_obj::MixedManifold, chain, M, n_samples, outcomes_N,
     end
 end
 
+
 function extract_manifold(m_obj::Eigen, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     # Purpose: Reconstructs the effect of the Eigen (Bayesian PCA) manifold.
     # Rationale: This function reconstructs the principal component effects from the
-    #            posterior samples of the Householder parameterization.
+    #            posterior samples of the Householder parameterization. This version corrects
+    #            the order of operations to match the generative model.
+    # v1.2.9 (2026-07-17) - Corrected from v1.2.1
     # Inputs: Standard `extract_manifold` arguments.
     # Outputs: A NamedTuple with the reconstructed effect of all principal components.
     structured_effects = Vector{Matrix{Float64}}()
@@ -631,10 +659,14 @@ function extract_manifold(m_obj::Eigen, chain, M, n_samples, outcomes_N, p_names
         # Reconstruct factors matrix F
         F_matrix_j = reshape(factors_samples[j, :], M.y_N, n_factors)
 
-        # Calculate the final eigen effects
-        eigen_effects_j = (F_matrix_j * L_j') .* pca_sds_samples[j, :]'
+        # Corrected order of operations:
+        # 1. Scale the raw factors by their standard deviations.
+        F_scaled_j = F_matrix_j .* pca_sds_samples[j, :]'
         
-        # Sum effects across components
+        # 2. Then, compute the final effects by multiplying by the loadings matrix.
+        eigen_effects_j = F_scaled_j * L_j'
+        
+        # Sum effects across all principal components
         total_effect[:, j] = sum(eigen_effects_j, dims=2)
     end
 
@@ -651,6 +683,8 @@ function extract_manifold(m_obj::Eigen, chain, M, n_samples, outcomes_N, p_names
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+
+
 
 function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     # Purpose: Reconstructs effects from composed manifolds, with special handling for Kronecker product (spatiotemporal) interactions.
@@ -1803,6 +1837,270 @@ function plot_choropleth(values::AbstractVector, polygons::Vector; title="Spatia
         end
     end
     return plt
+end
+
+function bstm_cv_orchestrator(
+    formula::String, 
+    data::DataFrame; 
+    method::Symbol = :kfold, 
+    cv_var::Symbol = :s_idx, 
+    n_folds::Int = 5, 
+    n_samples::Int = 500, 
+    sampler = NUTS(500, 0.65), 
+    alpha = 0.05, 
+    cv_space_vars::Vector{Symbol} = [:s_x, :s_y],
+    kwargs...
+)    
+    # Purpose: An orchestration utility for performing cross-validation. It supports standard 
+    #          k-fold, Leave-One-Location-Out (LOLO), spatial blocking, and temporal blocking/forward-chaining
+    #          strategies to assess model performance on held-out data.
+    # Rationale: Provides a standardized and flexible way to evaluate model predictive performance
+    #            while accounting for spatial and temporal data structures.
+    # Inputs:
+    #   - formula: The bstm model formula.
+    #   - data: The input DataFrame.
+    #   - method: The CV method. One of `:kfold`, `:lolo`, `:spatial_block`, `:temporal_block`, `:temporal_forward_chain`.
+    #   - cv_var: The column name to use for grouping/blocking (for `:lolo`, `:temporal_block`, `:temporal_forward_chain`).
+    #   - n_folds: The number of folds for k-fold or blocking methods.
+    #   - sampler: The Turing sampler to use.
+    #   - cv_space_vars: Columns for spatial coordinates for `:spatial_block`.
+    #   - kwargs: Additional arguments passed to `bstm_config`.
+    # Outputs: A NamedTuple containing fold-level results and summary metrics.
+    
+    meta_discovery = decompose_bstm_formula(formula)
+    response_name = Symbol(meta_discovery.outcomes[1][:var])
+
+    folds_indices = Vector{Vector{Int}}()
+    is_forward_chain = false
+
+    if method == :lolo
+        if !hasproperty(data, cv_var); error("LOLO cross-validation requires the specified `cv_var` column ':$cv_var' in the data."); end
+        unique_locs = unique(data[!, cv_var])
+        for loc in unique_locs
+            push!(folds_indices, findall(x -> x == loc, data[!, cv_var]))
+        end
+    elseif method == :spatial_block
+        if !all(hasproperty(data, v) for v in cv_space_vars); error("Spatial block cross-validation requires coordinate columns specified in `cv_space_vars`: $cv_space_vars."); end
+        coords = Matrix(data[!, cv_space_vars])' # kmeans expects features in rows
+        R = Clustering.kmeans(coords, n_folds; maxiter=200, display=:none)
+        assignments = R.assignments
+        for k in 1:n_folds
+            fold_k_indices = findall(x -> x == k, assignments)
+            if !isempty(fold_k_indices); push!(folds_indices, fold_k_indices); end
+        end
+    elseif method == :temporal_block
+        if !hasproperty(data, cv_var); error("Temporal block cross-validation requires the specified `cv_var` column ':$cv_var' in the data."); end
+        unique_times = sort(unique(data[!, cv_var]))
+        fold_size = cld(length(unique_times), n_folds) # ceiling division
+        for i in 1:n_folds
+            start_idx = (i - 1) * fold_size + 1
+            end_idx = min(i * fold_size, length(unique_times))
+            if start_idx > length(unique_times); continue; end
+            time_block = unique_times[start_idx:end_idx]
+            push!(folds_indices, findall(t -> t in time_block, data[!, cv_var]))
+        end
+    elseif method == :temporal_forward_chain
+        if !hasproperty(data, cv_var); error("Forward-chaining cross-validation requires the specified `cv_var` column ':$cv_var' in the data."); end
+        is_forward_chain = true
+        unique_times = sort(unique(data[!, cv_var]))
+        if length(unique_times) <= n_folds; @warn "Number of unique time points ($(length(unique_times))) is less than or equal to `n_folds` ($n_folds). Consider reducing `n_folds` for forward-chaining."; end
+        test_times = unique_times[end-n_folds+1:end]
+        for t in test_times
+            push!(folds_indices, findall(x -> x == t, data[!, cv_var]))
+        end
+    else # Default to k-fold
+        n_obs = size(data, 1)
+        row_indices = Random.randperm(n_obs)
+        fold_size = cld(n_obs, n_folds)
+        for i in 1:n_folds
+            idx_start = (i - 1) * fold_size + 1
+            idx_end = min(i * fold_size, n_obs)
+            if idx_start > n_obs; continue; end
+            push!(folds_indices, row_indices[idx_start:idx_end])
+        end
+    end
+
+    fold_results = []
+    n_actual_folds = length(folds_indices)
+
+    for (f_idx, test_idx) in enumerate(folds_indices)
+        test_data = data[test_idx, :]
+        
+        train_data = if is_forward_chain
+            min_test_time = minimum(test_data[!, cv_var])
+            train_idx = findall(t -> t < min_test_time, data[!, cv_var])
+            data[train_idx, :]
+        else
+            train_mask = trues(size(data, 1))
+            train_mask[test_idx] .= false
+            data[train_mask, :]
+        end
+
+        if nrow(train_data) == 0; @warn "Fold $f_idx created an empty training set. Skipping."; continue; end
+
+        opt_train = bstm_config(formula, train_data; kwargs...)
+        model_train = bstm(opt_train)
+        chain_train = sample(model_train, sampler, n_samples; progress=false)
+        res_pred = predict(model_train, chain_train, test_data; n_samples=div(n_samples, 2), alpha=alpha)
+
+        y_test_obs = test_data[!, response_name]
+        y_test_pred = res_pred.predictions_denoised.mean
+
+        if length(y_test_obs) == length(y_test_pred)
+            residuals = y_test_obs .- y_test_pred
+            rmse = sqrt(Statistics.mean(residuals.^2))
+            ss_res = sum(residuals.^2)
+            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
+            r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
+            push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
+        else
+            @warn "Fold $f_idx: Prediction length mismatch. Observed: $(length(y_test_obs)), Predicted: $(length(y_test_pred))"
+        end
+    end
+
+    mean_rmse = Statistics.mean([r.rmse for r in fold_results])
+    mean_r2 = Statistics.mean([r.r2 for r in fold_results])
+
+    return (
+        folds = fold_results,
+        mean_rmse = mean_rmse,
+        mean_r2 = mean_r2,
+        response_var = response_name,
+        method = method,
+        n_folds = n_actual_folds
+    )
+end
+
+function bstm_cv_orchestrator(
+    formula::String, 
+    data::DataFrame; 
+    method::Symbol = :kfold, 
+    cv_var::Symbol = :s_idx, 
+    n_folds::Int = 5, 
+    n_samples::Int = 500, 
+    sampler = NUTS(500, 0.65), 
+    alpha = 0.05, 
+    cv_space_vars::Vector{Symbol} = [:s_x, :s_y],
+    kwargs...
+)    
+    # Purpose: An orchestration utility for performing cross-validation. It supports standard 
+    #          k-fold, Leave-One-Location-Out (LOLO), spatial blocking, and temporal blocking/forward-chaining
+    #          strategies to assess model performance on held-out data.
+    # Rationale: Provides a standardized and flexible way to evaluate model predictive performance
+    #            while accounting for spatial and temporal data structures.
+    # Inputs:
+    #   - formula: The bstm model formula.
+    #   - data: The input DataFrame.
+    #   - method: The CV method. One of `:kfold`, `:lolo`, `:spatial_block`, `:temporal_block`, `:temporal_forward_chain`.
+    #   - cv_var: The column name to use for grouping/blocking (for `:lolo`, `:temporal_block`, `:temporal_forward_chain`).
+    #   - n_folds: The number of folds for k-fold or blocking methods.
+    #   - sampler: The Turing sampler to use.
+    #   - cv_space_vars: Columns for spatial coordinates for `:spatial_block`.
+    #   - kwargs: Additional arguments passed to `bstm_config`.
+    # Outputs: A NamedTuple containing fold-level results and summary metrics.
+    
+    meta_discovery = decompose_bstm_formula(formula)
+    response_name = Symbol(meta_discovery.outcomes[1][:var])
+
+    folds_indices = Vector{Vector{Int}}()
+    is_forward_chain = false
+
+    if method == :lolo
+        if !hasproperty(data, cv_var); error("LOLO cross-validation requires the specified `cv_var` column ':$cv_var' in the data."); end
+        unique_locs = unique(data[!, cv_var])
+        for loc in unique_locs
+            push!(folds_indices, findall(x -> x == loc, data[!, cv_var]))
+        end
+    elseif method == :spatial_block
+        if !all(hasproperty(data, v) for v in cv_space_vars); error("Spatial block cross-validation requires coordinate columns specified in `cv_space_vars`: $cv_space_vars."); end
+        coords = Matrix(data[!, cv_space_vars])' # kmeans expects features in rows
+        R = Clustering.kmeans(coords, n_folds; maxiter=200, display=:none)
+        assignments = R.assignments
+        for k in 1:n_folds
+            fold_k_indices = findall(x -> x == k, assignments)
+            if !isempty(fold_k_indices); push!(folds_indices, fold_k_indices); end
+        end
+    elseif method == :temporal_block
+        if !hasproperty(data, cv_var); error("Temporal block cross-validation requires the specified `cv_var` column ':$cv_var' in the data."); end
+        unique_times = sort(unique(data[!, cv_var]))
+        fold_size = cld(length(unique_times), n_folds) # ceiling division
+        for i in 1:n_folds
+            start_idx = (i - 1) * fold_size + 1
+            end_idx = min(i * fold_size, length(unique_times))
+            if start_idx > length(unique_times); continue; end
+            time_block = unique_times[start_idx:end_idx]
+            push!(folds_indices, findall(t -> t in time_block, data[!, cv_var]))
+        end
+    elseif method == :temporal_forward_chain
+        if !hasproperty(data, cv_var); error("Forward-chaining cross-validation requires the specified `cv_var` column ':$cv_var' in the data."); end
+        is_forward_chain = true
+        unique_times = sort(unique(data[!, cv_var]))
+        if length(unique_times) <= n_folds; @warn "Number of unique time points ($(length(unique_times))) is less than or equal to `n_folds` ($n_folds). Consider reducing `n_folds` for forward-chaining."; end
+        test_times = unique_times[end-n_folds+1:end]
+        for t in test_times
+            push!(folds_indices, findall(x -> x == t, data[!, cv_var]))
+        end
+    else # Default to k-fold
+        n_obs = size(data, 1)
+        row_indices = Random.randperm(n_obs)
+        fold_size = cld(n_obs, n_folds)
+        for i in 1:n_folds
+            idx_start = (i - 1) * fold_size + 1
+            idx_end = min(i * fold_size, n_obs)
+            if idx_start > n_obs; continue; end
+            push!(folds_indices, row_indices[idx_start:idx_end])
+        end
+    end
+
+    fold_results = []
+    n_actual_folds = length(folds_indices)
+
+    for (f_idx, test_idx) in enumerate(folds_indices)
+        test_data = data[test_idx, :]
+        
+        train_data = if is_forward_chain
+            min_test_time = minimum(test_data[!, cv_var])
+            train_idx = findall(t -> t < min_test_time, data[!, cv_var])
+            data[train_idx, :]
+        else
+            train_mask = trues(size(data, 1))
+            train_mask[test_idx] .= false
+            data[train_mask, :]
+        end
+
+        if nrow(train_data) == 0; @warn "Fold $f_idx created an empty training set. Skipping."; continue; end
+
+        opt_train = bstm_config(formula, train_data; kwargs...)
+        model_train = bstm(opt_train)
+        chain_train = sample(model_train, sampler, n_samples; progress=false)
+        res_pred = predict(model_train, chain_train, test_data; n_samples=div(n_samples, 2), alpha=alpha)
+
+        y_test_obs = test_data[!, response_name]
+        y_test_pred = res_pred.predictions_denoised.mean
+
+        if length(y_test_obs) == length(y_test_pred)
+            residuals = y_test_obs .- y_test_pred
+            rmse = sqrt(Statistics.mean(residuals.^2))
+            ss_res = sum(residuals.^2)
+            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
+            r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
+            push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
+        else
+            @warn "Fold $f_idx: Prediction length mismatch. Observed: $(length(y_test_obs)), Predicted: $(length(y_test_pred))"
+        end
+    end
+
+    mean_rmse = Statistics.mean([r.rmse for r in fold_results])
+    mean_r2 = Statistics.mean([r.r2 for r in fold_results])
+
+    return (
+        folds = fold_results,
+        mean_rmse = mean_rmse,
+        mean_r2 = mean_r2,
+        response_var = response_name,
+        method = method,
+        n_folds = n_actual_folds
+    )
 end
 
 function bstm_cv_orchestrator(
