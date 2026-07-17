@@ -1,6 +1,14 @@
 # Bayesian Spatial-temporal Models in Julia/Turing
+
+
+## Documentation:
+
+- [bstm_overview.md]([docs/bstm_overview.md)
+- [bstm_technical_api.md]([docs/bstm_technical_api.md)
+- [bstm_examples.md]([docs/bstm_examples.md)
+- [bstm.md](docs/bstm.md)
  
- 
+
 ## Installation
 
 - Clone the repository or copy/download the Julia files (\*.jl)
@@ -33,11 +41,15 @@ include( joinpath( project_directory, "startup.jl" ) ) # might need to run this 
 ```
 
  
-*The following is a copy of docs/bstm_overview.md* 
+*The following is a copy of [bstm_overview.md](docs/bstm_overview.md)* 
  
 
-# The `bstm` Framework: An Architectural Overview
+---
+title: "The `bstm` Framework: An Architectural Overview"
+format: html
+---
 
+# The `bstm` Framework: An Architectural Overview
 
 ## 1. Introduction
 
@@ -63,16 +75,16 @@ m = @bstm(
 
 The `likelihood()` module on the LHS specifies the observation model and its parameters.
 
-| Parameter    | Example Usage       | Description                                                                    |
-| :-------------| :--------------------| :-------------------------------------------------------------------------------|
-| `family`     | `family=poisson`   | Sets the likelihood distribution (e.g., `:poisson`, `:gaussian`, `:binomial`). |
-| `offsets`    | `offsets=log_pop`  | Specifies a log-scale offset, typically for exposure in count models.          |
-| `weights`    | `weights=sample_w` | Applies observation-level weights to the log-likelihood.                       |
-| `trials`     | `trials=n_patients` | Defines the number of trials for a binomial likelihood.                        |
-| `zi`         | `zi=true`           | Enables a zero-inflation component for count models.                           |
-| `hurdle`     | `hurdle=0`          | Implements a hurdle model, separating the zero-generating process.             |
-| `volatility` | `volatility=true`   | Enables a spatiotemporal stochastic volatility model for observation noise.    |
-| `y_L`, `y_U` | `y_L=lower_b`      | Defines lower and upper bounds for censored data.                              |
+| Parameter                  | Example Usage       | Description                                                                                                         |
+| :---------------------------| :--------------------| :--------------------------------------------------------------------------------------------------------------------|
+| `family`                   | `family=:poisson`   | Sets the likelihood distribution. See table below for options.                                                      |
+| `log_offsets` or `offsets` | `offsets=pop_log`   | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
+| `weights`                  | `weights=sample_w`  | Applies observation-level weights to the log-likelihood.                                                            |
+| `trials`                   | `trials=n_patients` | Specifies the number of trials for each observation in a Binomial model.                                            |
+| `zi`                       | `zi=true`           | Enables a zero-inflation component for count models.                                                                |
+| `volatility`               | `volatility=true`   | Enables a spatiotemporal stochastic volatility model for the observation noise ($\sigma_y$).                        |
+| `y_L`, `y_U`               | `y_L=lower_b`       | Defines lower and upper bounds for censored data.                                                                   |
+| `hurdle`                   | `hurdle=0`          | Implements a hurdle model by truncating the likelihood below the specified threshold.                               |
 
 ### 2.3. Illustrative Examples
 
@@ -88,13 +100,11 @@ The `likelihood()` module on the LHS specifies the observation model and its par
     `@bstm(likelihood(y) ~ 1 + spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1), data, W=W)`
     Employs the Kronecker product to create a fully structured spatiotemporal interaction field.
 
-4.  **Spatially Varying Coefficients (SVC):**
+4.  **Spatially Varying Coefficients (SVC) and Curves:**
     `@bstm(likelihood(y) ~ 1 + (poverty |> spatial(s_idx, model=icar)), data, W=W)`
     Allows the impact of `poverty` to vary according to local spatial gradients.
-
-5.  **Spectral Splines:**
-    `@bstm(likelihood(y) ~ 1 + smooth(lon, lat, model=rff), data)`
-    Approximates a 2D continuous field without the $O(N^3)$ kernel inversion cost.
+    `@bstm(likelihood(y) ~ 1 + (spatial(s_idx, model=icar) |> smooth(time, model=pspline)), data, W=W)`
+    Models a temporal trend that varies smoothly across space.
 
 ## 3. The Algebra of Manifolds: Composition and State-Space Models
 
@@ -102,16 +112,11 @@ The `bstm` domain-specific language operates through a recursive parser that all
 
 ### 3.1. Algebraic Operators
 
-1.  **Direct Sum (⊕)**: Creates a block-diagonal precision matrix from its component manifolds, i.e., $Q_{total} = \text{diag}(Q_1, Q_2)$. This is used to model components that are structurally independent but are specified to share a common hyperparameter (e.g., variance). For simple additive effects with separate, unshared hyperparameters, use `+`.
-2.  **Kronecker Product (⊗)**: Used for creating inseparable interaction effects, such as the Knorr-Held Type IV model (`spatial() ⊗ temporal()`). This builds a joint precision matrix $Q_{st} = Q_t \otimes Q_s$, enabling the representation of space-time interactions where every spatial location has a unique, correlated temporal trend.
-3.  **Composition (∘)**: Represents the composition of two precision structures as a functional transformation, e.g., $Q_{total} = Q_1 * Q_2 * Q_1$. This can be used for basis warping or creating cascading dependencies between manifolds of the same dimension.
-
-### 3.2. Structural Transformations and State-Space Models
-
-The pipe (`|>`) operator handles data normalization, Spatially Varying Coefficients (SVC), and state-space evolution.
+1.  **Kronecker Product (⊗)**: Used for creating inseparable interaction effects, such as the Knorr-Held Type IV model (`spatial() ⊗ temporal()`). This builds a joint precision matrix $Q_{st} = Q_t \otimes Q_s$, enabling the representation of space-time interactions where every spatial location has a unique, correlated temporal trend.
+2.  **Composition (∘)**: Represents the functional composition of two manifolds, where one manifold modulates the parameters of another. This is a powerful tool for creating non-stationary models.
+3.  **Pipe (`|>`):** The pipe operator handles data normalization and state-space evolution.
 
 *   **Transformations**: Objects like `ZScoreManifold` or `LogManifold` act as wrappers that normalize inputs before they enter the latent process.
-*   **SVC Logic**: The notation `covariate |> spatial()` instructs the parser to generate a random slope for the covariate that is spatially structured by the specified manifold, effectively modeling local non-stationarity.
 *   **State-Space Evolution**: The pipe operator defines a state-space model where one manifold evolves over the domain of another. This supports both discrete-time dynamics (e.g., `spatial() |> temporal(model=ar1)`) and the creation of spatially-varying curves (e.g., `spatial() |> smooth(time, model=pspline)`), where the coefficients of the temporal basis functions are modeled as spatial fields.
 
 ## 4. Core Components: Manifolds and Priors
@@ -435,11 +440,13 @@ This section provides a detailed quick-reference guide to the main modules avail
 
 | Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
 |:---|:---|:---|:---|:---|
-| `log_offsets` or `offsets` | `offsets=pop_log` | `Symbol` | None | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
+| `family` | `family=:poisson` | `Symbol` | `:gaussian` | Sets the likelihood distribution. See table below for options. |
+| `log_offsets` or `offsets` | `offsets=pop_log` | `Symbol` | `0.0` | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
 | `weights` | `weights=sample_w` | `Symbol` | `1.0` | Multiplies the log-likelihood of each observation by the specified weight. |
 | `trials` | `trials=n_patients` | `Symbol` | `1` | Specifies the number of trials for each observation in a Binomial model. |
+| `zi` | `zi=true` | `Bool` | `false` | Enables a zero-inflation component for count models. |
 | `volatility`| `volatility=true` | `Bool` | `false` | Enables a spatiotemporal stochastic volatility model for the observation noise ($\sigma_y$). |
-| `y_L`, `y_U`| `y_L=lower_b` | `Symbol` | `-Inf`, `+Inf` | Defines the lower (`y_L`) and upper (`y_U`) bounds for censored observations. |
+| `y_L`, `y_U`| `y_L=lower_b` | `Symbol` or `Number` | `-Inf`, `+Inf` | Defines the lower (`y_L`) and upper (`y_U`) bounds for censored data. |
 | `hurdle` | `hurdle=0` | `Number` | `-Inf` | Implements a hurdle model by truncating the likelihood below the specified threshold. |
 
 ### 8.2. Likelihood Families
@@ -464,6 +471,8 @@ This section provides a detailed quick-reference guide to the main modules avail
 | **Inverse Wishart**   | `:inverse_wishart`  | `identity(eta)` | `d.f. (ν)`: `extra_params`, `Scale Matrix (Ψ)` from `eta`. For covariance modeling.                             |
 
 ### 8.3. `spatial()` Module
+
+The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm` call (e.g., `@bstm(..., W=my_matrix)`) or, preferably, directly within the `spatial` module (e.g., `spatial(s_idx, W=my_matrix)`).
 
 | Manifold | `model='...'` | Key Parameters | Default PC-Priors | Use Case & Utility |
 |:---|:---|:---|:---|:---|
@@ -527,15 +536,13 @@ This section provides a detailed quick-reference guide to the main modules avail
 
 ### 8.7. `dynamics()` Module
 
-| Model | `model='...'` | Key Parameters | Default Priors |
-|:---|:---|:---|:---|
-| **Advection** | `'advection'` | `velocity_prior`, `sigma_prior` | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)` |
-| **Diffusion** | `'diffusion'` | `diffusion_prior`, `sigma_prior` | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` |
-| **Advection-Diffusion** | `'advection_diffusion'` | `velocity_prior`, `diffusion_prior`, `sigma_prior` | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)` |
-| **Directed Spatial Process** | `'directed_spatial_process'` | `rho_prior`, `sigma_innov_prior`, `ls_innov_prior`, `kernel` | `rho`: `Beta(1,1)`, `sigma_innov`: `Exponential(1.0)` |
-| **Logistic Growth** | `'logistic_f'` | `r_prior`, `K_prior`, `sigma_F_prior` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`, `sigma_F`: `Exponential(0.5)` |
-| **Gompertz Growth** | `'gompertz'` | `r_prior`, `K_prior`, `sig_dyn_prior` | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)` |
-| **Custom Model** | `'custom'` | `func` | N/A |
+| Model | `model='...'` | Key Parameters | Default Priors | Use Case & Utility |
+|:---|:---|:---|:---|:---|
+| **Advection** | `'advection'` | `velocity_prior`, `sigma_prior` | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)` | Models transport or flow using a first-order directed operator. |
+| **Diffusion** | `'diffusion'` | `diffusion_prior`, `sigma_prior` | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` | Models spreading or dispersion using the graph Laplacian. |
+| **Advection-Diffusion** | `'advection_diffusion'` | `velocity_prior`, `diffusion_prior`, `sigma_prior` | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)` | Combines both transport and diffusion processes. |
+| **Gompertz Growth** | `'gompertz'` | `r_prior`, `K_prior`, `sig_dyn_prior` | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)` | Models population growth with asymmetric sigmoidal curve. |
+| **Logistic Growth** | `'logistic_basic'` | `r_prior`, `K_prior` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)` | Models population growth with a symmetric carrying capacity. |
 
 ### 8.8. `nested()` and `eigen()` Modules
 
@@ -574,14 +581,16 @@ The `eigen()` module uses a Householder transformation to construct the orthonor
 
 ### 8.9. Spacetime Interaction Manifolds
 
-Spatiotemporal interactions are specified using the Kronecker product operator (`⊗`). The `bstm` framework supports the four canonical interaction types defined by Knorr-Held (2000).
+Spatiotemporal interactions are specified using either the Kronecker product operator (`⊗`) or the `spacetime()` module. The `bstm` framework supports the four canonical interaction types defined by Knorr-Held (2000), which are automatically inferred based on the structure of the component models.
 
-| Manifold | Formula Syntax | Description |
-|:---|:---|:---|
-| **Type I**   | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=iid)`   | Unstructured (IID) interaction over space and time.     |
-| **Type II**  | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=ar1)`   | Spatially unstructured, temporally structured. |
-| **Type III** | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=iid)` | Spatially structured, temporally unstructured. |
-| **Type IV**  | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1)` | Fully structured in both space and time (Kronecker product). |
+| Type         | Description                                    | `spacetime()` Syntax                  | `⊗` Operator Syntax                                |
+| :-------------| :-----------------------------------------------| :--------------------------------------------| :---------------------------------------------------|
+| **Type I**   | Unstructured (IID) in both space and time.     | `spacetime(s_idx, t_idx, model=(iid, iid))`   | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=iid)`   |
+| **Type II**  | Spatially unstructured, temporally structured. | `spacetime(s_idx, t_idx, model=(iid, ar1))`   | `spatial(s_idx, model=iid) ⊗ temporal(t_idx, model=ar1)`   |
+| **Type III** | Spatially structured, temporally unstructured. | `spacetime(s_idx, t_idx, model=(besag, iid))` | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=iid)` |
+| **Type IV**  | Fully structured in both space and time.       | `spacetime(s_idx, t_idx, model=(besag, ar1))` | `spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1)` |
+
+The `spacetime()` module serves as a convenient shorthand. The framework determines the interaction type by checking if the provided spatial and temporal models are structured (e.g., `besag`, `ar1`) or unstructured (`iid`).
 
 ### 8.10. `fixed()` and `intercept()` Modules
 
@@ -591,16 +600,39 @@ These modules provide explicit control over standard regression components.
 
 | Keyword / Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
 |:---|:---|:---|:---|:---|
-| `fixed()` | `fixed(Region, ...)` | Module | N/A | Explicitly marks a variable as a fixed effect. Primarily used to specify contrasts or priors. |
-| `contrast` | `contrast=effects` | `Symbol` | `DummyCoding` | Specifies the contrast coding for a categorical variable (e.g., `:effects`, `:helmert`). |
-| `prior` | `prior=Normal(0, 2)` | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the coefficient(s) of this fixed effect. Can be a `Distribution` or a PC prior tuple. |
+| `fixed()`           | `fixed(Region, ...)` | Module                    | N/A            | Explicitly marks a variable as a fixed effect. Primarily used to specify contrasts or priors.            |
+| `contrast`          | `contrast=:effects`  | `Symbol`                  | `DummyCoding`  | Specifies the contrast coding for a categorical variable (e.g., `:effects`, `:helmert`).                 |
+| `prior`             | `prior=Normal(0, 2)` | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the coefficient(s) of this fixed effect. Can be a `Distribution` or a PC prior tuple. |
 
 #### `intercept()` Module Reference
 
 | Keyword / Parameter | Example Usage          | Data Type                 | Default        | Meaning & Assumptions                                                                                                                |
-| :--------------------| :-------------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
-| `intercept()`       | `intercept(prior=...)`   | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
-| `prior`             | `prior=Normal(0, 10)`   | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
+| :--------------------| :-----------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
+| `intercept()`       | `intercept(prior=...)` | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
+| `prior`             | `prior=Normal(0, 10)`  | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
+
+#### Interaction Effects
+
+Interaction effects between fixed covariates are specified using the standard `*` and `&` operators from `StatsModels.jl`. The `bstm` framework also supports the `:` operator as a synonym for `&`. These operators can be used both as bare terms in the formula and within the `fixed()` module.
+
+*   `cov1 * cov2`: Expands to `cov1 + cov2 + cov1 & cov2` (main effects and interaction).
+*   `cov1 & cov2`: Includes only the interaction term.
+*   `cov1 : cov2`: Equivalent to `cov1 & cov2`.
+
+**Example:**
+
+```julia
+# These three formulas are equivalent and include main effects and the interaction.
+m1 = @bstm(likelihood(y) ~ 1 + cov1 * cov2, data)
+m2 = @bstm(likelihood(y) ~ 1 + fixed(cov1 * cov2), data)
+m3 = @bstm(likelihood(y) ~ 1 + fixed(cov1) + fixed(cov2) + fixed(cov1 & cov2), data)
+
+# These formulas include only the interaction term.
+m4 = @bstm(likelihood(y) ~ 1 + cov1 & cov2, data)
+m5 = @bstm(likelihood(y) ~ 1 + cov1 : cov2, data)
+```
+
+**Note on Priors:** Applying a custom prior to an interaction term (e.g., `fixed(cov1 * cov2, prior=...)`) is not directly supported, as the prior would be ambiguous across the expanded main and interaction effects. To assign a specific prior to an interaction, you must first manually create the interaction term as a new column in your `DataFrame` and then apply the `fixed()` module with a `prior` to that new column.
 
 ## 9. Conclusion
 
