@@ -2,7 +2,7 @@
 title: "*bstm* (Bayesian SpatioTemporal Models) in Julia/Turing"
 header: "*bstm* in Julia"
 keyword: |
-	Keywords - Guassian Process / CAR, CARSTM Spatiotemporal models
+	Keywords - Gaussian Process / CAR, CARSTM Spatiotemporal models
 abstract: |
 	Bayesian SpatioTemporal Models in Julia.
 
@@ -49,7 +49,7 @@ Using Julia leverages the power and flexibility of the language (especially the 
   
 ## Introduction: The SpatioTemporal Challenge 
 
-Ecological monitoring is a pursuit of moving targets. To usefully model important variables  like bottom temperature, species composition, and the population dynamics of  species requires using utilizing incomplete or low density information from expensive surveys with limits to resources and time. The usual recourse is some variation of Random Stratified Sampling to "absorb" unaccounted errors or "externalities" as unstructured, **independent**, random effects. This can of course be fine in simple settings. In really dynamic environments, this can be a source of bias, no matter how good you think the stratification may be. In *bstm*, we do not ignore these "externalities", instead we embrace them as they are usually informative and therefore useful. Though *bstm* can be used for the former, it shines as a high-dimensional Bayesian hierarchical framework designed to decompose complex spatiotemporal data into interpretable latent components. This is because, ecological data is inherently **dependent** or structured. 
+Ecological monitoring is a pursuit of moving targets. To usefully model important variables  like bottom temperature, species composition, and the population dynamics of species, one must, almost always, deal with incomplete or low density information from expensive surveys with limits to resources and time. The usual recourse is some variation of Random Stratified Sampling to "absorb" unaccounted errors or "externalities" as unstructured, **independent**, random effects. This can of course be fine in simple settings. In really dynamic environments, this can be a source of bias, no matter how good you think the stratification may be. In *bstm*, we do not ignore these "externalities", instead we embrace them as they are usually informative and therefore useful. Though *bstm* can be used for the former, it shines as a high-dimensional Bayesian hierarchical framework designed to decompose complex spatiotemporal data into interpretable latent components. This is because, ecological data is inherently **dependent** or structured. 
 
 To address the "SpatioTemporal Challenge," *bstm* utilizes three primary components:
 
@@ -63,19 +63,10 @@ Failing to distinguish between a permanent habitat feature (captured by a spatia
 ### Computation: Getting started with the environment
 
 As this document is structured like a notebook with explanations inter-spread with examples, let us get the Julia environment set up before anything else. Here we use [Julia](https://julialang.org/), as in my experience, it is a clear didactic tool and better for long-term learning and simultaneously use in large projects due to maintainability of the code-base and high performance. It is an open-source platform created by mathematicians, engineers, natural scientists, statisticians, computer scientists and machine learning specialists, each bringing the best from their respective fields and lessons learned from domain-specific software platforms in a coherent and performative fashion. At the time of this writing, there still remain some lingering issues (start up speed, recompilation of code and incompatibility creep when there are updates to any library, most already being addressed rapidly), but the speed that is offered and code clarity in exchange is worth it in any serious data manipulation efforts. Your mileage will vary, but the lessons learned are also easily transportable to R, python, matlab, octave, etc., if forced to use those platforms. They each have their own quirks and challenges, but until their eventual convergence into something (that will likely look a lot like Julia), it is still a great platform to learn, teach and operate/develop cutting edge work. Many learning tools exist. [Have a look here for a curated list](https://julialang.org/learning/). See the Appendices for more details.
-
-The current library of functions replicates most of the functionality of the following R-packages and essentially subsumes them:
-
-- [aegis](https://github.com/jae0/aegis): basic spatial tools,
-- [aegis.polygons](https://github.com/jae0/aegis.polygons): creating and handling areal unit information, and
-- [CARSTM](https://github.com/jae0/carstm): an INLA wrapper for simple GRMF spatiotemporal models. 
-- [stmv](https://github.com/jae0/stmv): a mosaic approach to continuous, non-stationary spatiotemporal processes. 
  
-
 Installing [Julia](https://julialang.org/) is best done with [juliaup](https://github.com/JuliaLang/juliaup). It can make maintenance simpler. Most functions used here that are not part of a standard library are collected together in [Julia](https://julialang.org/) functions at [src](../src/). They can be loaded with supporting standard libraries, as follows:
- 
- 
-**WARNING**: if this is your first run, this can take up to 1 hour to install libraries and dependencies, so let it run in the background. You might need to re-start the Julia session if there is are library dependency issues. 
+  
+**WARNING**: if this is your first run, this can take up to 1 hour to install libraries and dependencies, so let it run in the background. You might need to re-start the Julia session if there is are complex/multiple library dependency issues (that require or support different versions). 
 
 
 ```{julia}
@@ -89,9 +80,10 @@ else
     project_directory = joinpath( "C:\\", "Users", "choij", "projects", "bstm")  # examples
 end
 
-# start environment: 
-include( joinpath( project_directory, "startup.jl" ) ) 
+# load libraries: 
 # you might need to run this a few times if there are out of date libraries   
+include( joinpath( project_directory, "startup.jl" ) ) 
+
 # Pkg.instantiate()  # to force a reset if some package seems corrupted/partially installed
 # Pkg.update()  # to update this can break dependencies .. do this only if you really need to 
 
@@ -157,7 +149,7 @@ m = @bstm(  likelihood(y, family=poisson, offsets=log_offset) ~
 show_model(m)  # pseudocode to check
 
 
-m = @bstm(  likelihood(y, family=poisson, offsets=log_offset) ~ 
+m = @bstm(  likelihood(y, family=poisson, offsets=log_offsets) ~ 
     intercept() + 
     spatial(s_idx, model=bym2, W=data_scot[:au][:W]) + 
     temporal(year, model=ar1) +
@@ -308,8 +300,8 @@ formula = """
 ### Covariate Discretization & Transformation Rules
 
 The `bstm_options` and `assign_covariate_units` functions support several methods for preprocessing covariates and their interactions:
-
-1.  **Continuous Transformations (No Binning):**
+ 
+1.  **Continuous Transformations (No Binning):** 
     *   `"unit"`: Performs Min-Max scaling, mapping values to the `[0, 1]` interval.
     *   `"zscore"`: Performs Z-score standardization (subtract mean, divide by standard deviation).
     *   `"log"`: Performs a log transformation: `log(x + 1.0 - min(x))`.
@@ -545,9 +537,9 @@ inp_krig = bstm_options(
   s_coord = data.s_coord,
   t_coord = data.t_coord,
   s_idx = au.assignments,
-  t_idx = tu.t_idx,
-  u_N = data.metadata.u_N,
-  log_offset = zeros(length(data.y_obs)),
+  t_idx = tu.t_idx, 
+  u_N = data.metadata.u_N, 
+  log_offsets = zeros(length(data.y_obs)),
   W = au.W,
   model_arch = "example",  # Pass the struct instance, not a string
   model_family = "gaussian",
@@ -800,7 +792,7 @@ inp_reference = bstm_options(
     s_idx = au.assignments, 
     W = au.W,
     t_idx = tu.t_idx,  
-    z_obs = data.z_obs,  # spatial only covars
+    z_obs = data.z_obs,  # spatial only covars 
     w_obs = data.w_obs,  # spacetime covars
     trials = data.trials,
     model_family = "poisson",   
@@ -1458,7 +1450,7 @@ inp = bstm_options(
     s_coord_tuple = data.s_coord_tuple,
     s_idx = au.assignments,
     t_idx = tu.t_idx,
-    log_offset = zeros(length(data.y_obs)),
+    log_offsets = zeros(length(data.y_obs)),
     W = au.W,
     model_arch =  "size_structured", # "univariate",
     model_family = "bernoulli",
@@ -1503,7 +1495,7 @@ weights_mat = post_stratification_weights(res, inp, samples_denoised)
 # 3. Apply weights to simulation data (Size Estimates)
 # Assuming y_obs represents the observed sizes
 no_sampling_events_stations = TBD
-offset = exp(M.log_offset)   
+offset = exp(M.log_offsets)   
 weighted_estimates = inp.y_obs .* weights_mat / no_sampling_events_stations / swept_area
 
 # 4. Diagnostics: Check for flat posterior/low signal
@@ -1534,7 +1526,7 @@ inp_df = DataFrame(
   y2 = y2,
   s_coord = data.s_coord_tuple,
   t_coord = vec(data.t_coord),
-  log_offset = zeros(length(data.y_counts)),
+  log_offsets = zeros(length(data.y_counts)),
   region = categorical(reg),
   z = data.z_obs,
   w1 = data.w_obs[:,1],
@@ -1557,7 +1549,7 @@ res = model_results_comprehensive(m , chn );
 
 # Note: model_arch='multivariate' will look for columns starting with 'y'
 fm = """
-  y1 + y2 ~ 1 + z + Spatial(s_idx, manifold='bym2')
+  y1 + y2 ~ intercept() + z + spatial(s_idx, model='bym2')
 """
 
 m = bstm( fm, inp_df; family="poisson" );  
@@ -1568,7 +1560,7 @@ res = model_results_comprehensive(m , chn );
 
 # Explicitly specifying the PCA factor architecture for Eigen-Effects via Householder rotations
 fm = """
-  y ~ 1 + z + Fixed(region) + Eigen(y1, y2, w1, w2, w3; N_factors=1)
+  y ~ intercept() + z + fixed(region) + eigen(y1, y2, w1, w2, w3; n_factors=1)
 """
 
 m = bstm( fm, inp_df, family="gaussian")
@@ -1635,7 +1627,7 @@ Computation:
 Random.seed!(42) # Set a seed for reproducibility.
 
 mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx)
-m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=bym2) + temporal(t_idx, model=ar1), 
+m = @bstm(likelihood(y_obs, family=poisson) ~ intercept() + spatial(s_idx, model=bym2) + temporal(t_idx, model=ar1), 
     mdata_df, W=inp_count.W);
 chn = sample(m, MH(), 1000, nchains=4);
 res = model_results_comprehensive(m, chn);
@@ -1696,7 +1688,7 @@ Sampling takes much longer than the simple model and so I have reduced the numbe
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z=inp_count.z, w1=inp_count.w1)
-m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=bym2) + temporal(t_idx, model=ar1) + smooth(z, model=rw2) + smooth(w1, model=rw2),
+m = @bstm(likelihood(y_obs, family=poisson) ~ intercept() + spatial(s_idx, model=bym2) + temporal(t_idx, model=ar1) + smooth(z, model=rw2) + smooth(w1, model=rw2),
     mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
@@ -1738,7 +1730,7 @@ ess_per_second: 0.021
 │   sigma_rw2[2]  1.4071  0.2126  0.0473   20.2005   20.2005  1.0263  1.3698  1.3698  1.3698                           │
 │   sigma_rw2[3]  0.6352  0.1096  0.0244   20.2005       NaN  1.0263  0.6544  0.6544  0.6544                           │
 │   sigma_rw2[4]  1.2697  0.1951  0.0434   20.2005       NaN  1.0263  1.3039  1.3039  1.3039                           │
-│         phi_zi  0.0000  0.0000     NaN       NaN       NaN     NaN  0.0000  0.0000  0.0000                           │
+│         phi_zero_inflated  0.0000  0.0000     NaN       NaN       NaN     NaN  0.0000  0.0000  0.0000                           │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 
   
@@ -1750,7 +1742,7 @@ ess_per_second: 0.021
 - Predictions are poor, WAIC is elevated but a little better than the base model
 - sigma space slighly higher and sigma time is lower 
 - phi (space autocorrelation) is much higher but rho (temporal autocorrelation) is lower 
-- Note: phi_zi is zero as it is a flag for zero-inflated operations. In production mode, this effect would/should be trimmed out if not used. 
+- Note: phi_zero_inflated is zero as it is a flag for zero-inflated operations. In production mode, this effect would/should be trimmed out if not used. 
 
 
  
@@ -1770,7 +1762,7 @@ This specification is robust because it automatically handles both structured sp
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
-m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=leroux) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+m = @bstm(likelihood(y_obs, family=poisson) ~ intercept() + spatial(s_idx, model=leroux) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
     mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
@@ -1821,7 +1813,7 @@ ESS (mean) was 0.0251 !
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
-m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=localadaptive) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+m = @bstm(likelihood(y_obs, family=poisson) ~ intercept() + spatial(s_idx, model=localadaptive) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
     mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler( m; adaptation_steps=100) 
 inits = get_inits(m) ; 
@@ -1872,7 +1864,7 @@ ESS (mean) was 0.0318!
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
-m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=sar) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+m = @bstm(likelihood(y_obs, family=poisson) ~ intercept() + spatial(s_idx, model=sar) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
     mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
@@ -1926,7 +1918,7 @@ ESS was 0.0066
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
-m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + (z_obs |> spatial(s_idx, model=besag)) + temporal(t_idx, model=ar1),
+m = @bstm(likelihood(y_obs, family=poisson) ~ intercept() + (z_obs |> spatial(s_idx, model=besag)) + temporal(t_idx, model=ar1),
     mdata_df, W=inp_count.W)
 os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
@@ -1976,7 +1968,7 @@ ESS (mean): 0.0318
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
-m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=dag) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+m = @bstm(likelihood(y_obs, family=poisson) ~ intercept() + spatial(s_idx, model=dag) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
     mdata_df, W=inp_count.W, model_st="IV")
 os  = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
@@ -2026,7 +2018,7 @@ ESS (mean): 0.0318
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
-m = @bstm(likelihood(y_obs, family=poisson, hurdle=0) ~ 1 + spatial(s_idx, model=besag) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+m = @bstm(likelihood(y_obs, family=poisson, hurdle=0) ~ intercept() + spatial(s_idx, model=besag) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
     mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
@@ -2076,7 +2068,7 @@ ESS (mean): 0.0318
 #| example run
 Random.seed!(42) # Set a seed for reproducibility.
 mdata_df = DataFrame(y_obs=inp_count.y_obs, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx, z_obs=inp_count.z_obs, w_obs=inp_count.w_obs)
-m = @bstm(likelihood(y_obs, family=poisson) ~ 1 + spatial(s_idx, model=rff) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
+m = @bstm(likelihood(y_obs, family=poisson) ~ intercept() + spatial(s_idx, model=rff) + temporal(t_idx, model=ar1) + smooth(z_obs, model=rw2) + smooth(w_obs, model=rw2),
     mdata_df, W=inp_count.W, model_st="IV")
 os = get_optimal_sampler( m, adaptation_steps=100) 
 inits = get_inits(m) ; 
@@ -2160,7 +2152,7 @@ Random.seed!(42) # Set a seed for reproducibility.
 inp_count = merge( inp_count, (y2=Int.(floor.( 100 .* (inp_count.z_obs .- minimum(inp_count.z_obs) ) ) ), ))
 
 mdata_df = DataFrame(y1=inp_count.y_obs, y2=inp_count.y2, s_idx=inp_count.s_idx, t_idx=inp_count.t_idx)
-m = @bstm(y1 + y2 ~ 1 + spatial(s_idx, model=besag) + temporal(t_idx, model=ar1),
+m = @bstm(y1 + y2 ~ intercept() + spatial(s_idx, model=besag) + temporal(t_idx, model=ar1),
     mdata_df, W=inp_count.W)
 os = get_optimal_sampler(m; adaptation_steps=100) 
 inits = get_inits(m) ; 
@@ -4391,9 +4383,9 @@ X, Xschema, Xcoefnames, nX = model_matrix_fixed_effects(
 
 
 # poisson of numerical abundance
-m = turing_glm_icar(  ; family="poisson", GPmethod=GPmethod, 
-  good=good, X=X,  
-  Y=y, YG=YG, G=G, Gp=Gp, nInducing=nInducing, log_offset=log_offset ) 
+m = turing_glm_icar(  ; family="poisson", GPmethod=GPmethod,
+  good=good, X=X,
+  Y=y, YG=YG, G=G, Gp=Gp, nInducing=nInducing, log_offsets=log_offsets )
 
 rand(m)
 
@@ -4418,7 +4410,7 @@ n_sample=10
 MS = turing_glm_icar_summary( 
   "mcmc", 
   msol=msol, model=m, Y=y, YG=YG, 
-  family="poisson", n_sample=n_sample, good=good, kerneltype=kerneltype,
+  family="poisson", n_sample=n_sample, good=good, kerneltype=kerneltype, 
   X=X, G=G, Gp=Gp, nInducing=nInducing )  # no offset means at standard rate (log_offset = 0) 
 
 
@@ -4446,7 +4438,7 @@ n_sample=1
 MS = turing_glm_icar_summary( 
   "optim",  GPmethod=GPmethod, 
   msol=msol, model=m, Y=y,  YG=YG, kerneltype=kerneltype,
-  family="poisson", n_sample=n_sample, good=good,
+  family="poisson", n_sample=n_sample, good=good, 
   X=X, G=G, Gp=Gp, nInducing=nInducing )  # no offset means at standard rate (log_offset = 0)
 
 # Gymu = ( msol.values[ turingindex( m, :Gymu, (:, nG) ) ] )
@@ -4469,8 +4461,8 @@ n_sample=100
 MS = turing_glm_icar_summary( 
   "variational_inference", GPmethod=GPmethod,
   msol=msol, model=m, Y=y,  YG=YG, kerneltype=kerneltype,
-  family="poisson", n_sample=n_sample, good=good,
-  X=X, G=G, Gp=Gp, nInducing=nInducing )  # no offset means at standard rate (log_offset = 0)
+  family="poisson", n_sample=n_sample, good=good, 
+  X=X, G=G, Gp=Gp, nInducing=nInducing )  # no offset means at standard rate (log_offsets = 0)
 
 
 # for vi only:
@@ -4522,8 +4514,8 @@ X, Xschema, Xcoefnames, nX = model_matrix_fixed_effects(
 # poisson of positive valued (> 0) numerical abundance
 m = turing_glm_icar_optimized( family="poisson", 
   GPmethod=GPmethod, kerneltype=kerneltype,
-  good=good,  # good == positive valued data only
-  Y=y, YG=YG, X=X, G=G, Gp=Gp, nInducing=nInducing, log_offset=log_offset, 
+  good=good,  # good == positive valued data only 
+  Y=y, YG=YG, X=X, G=G, Gp=Gp, nInducing=nInducing, log_offsets=log_offsets, 
   auid=auid, nAU=nAU, node1=node1, node2=node2, scaling_factor=scaling_factor ) 
 
 
@@ -4624,9 +4616,9 @@ n_sample=1  # ... modes ... must bring in SD
 MS = turing_glm_icar_summary( 
   "optim", 
   msol=msol, model=m, Y=y, YG=YG, GPmethod=GPmethod,
-  family="poisson", n_sample=n_sample, good=good,
+  family="poisson", n_sample=n_sample, good=good, 
   X=X, G=G, Gp=Gp, nInducing=nInducing,  kerneltype=kerneltype,
-  scaling_factor=scaling_factor, nAU=nAU, auid=auid )   # no offset means at standard rate (log_offset = 0)
+  scaling_factor=scaling_factor, nAU=nAU, auid=auid )   # no offset means at standard rate (log_offsets = 0)
  
 
 plot(MS.fixed_effects[2:11])
@@ -4678,9 +4670,9 @@ n_sample=10
 MS = turing_glm_icar_summary( 
   "mcmc", 
   msol=msol, model=m, Y=y, YG=YG,
-  family="poisson", n_sample=n_sample, good=good,
+  family="poisson", n_sample=n_sample, good=good, 
   X=X, G=G, Gp=Gp, nInducing=nInducing,  kerneltype=kerneltype,
-  scaling_factor=scaling_factor, nAU=nAU, auid=auid )  # no offset means at standard rate (log_offset = 0)
+  scaling_factor=scaling_factor, nAU=nAU, auid=auid )  # no offset means at standard rate (log_offsets = 0)
 
 
 Xcoefnames
@@ -4723,8 +4715,8 @@ using Flux; optimizer = Flux.Adam()
 
 # poisson of positive valued (> 0) numerical abundance
 m = turing_glm_icar( family="poisson", 
-  good=good,  # good == positive valued data only
-  Y=y, YG=YG, X=X, G=G, Gp=Gp, nInducing=nInducing, log_offset=log_offset, 
+  good=good,  # good == positive valued data only 
+  Y=y, YG=YG, X=X, G=G, Gp=Gp, nInducing=nInducing, log_offsets=log_offsets, 
   auid=auid, nAU=nAU, node1=node1, node2=node2, scaling_factor=scaling_factor ) 
 
 # using variational inference:
@@ -4743,9 +4735,9 @@ n_sample=100
 MS = turing_glm_icar_summary( 
   "variational_inference", 
   msol=msol, model=m, Y=y, YG=YG,
-  family="poisson", n_sample=n_sample, good=good,
+  family="poisson", n_sample=n_sample, good=good, 
   X=X, G=G, Gp=Gp, nInducing=nInducing,  kerneltype=kerneltype,
-  scaling_factor=scaling_factor, nAU=nAU, auid=auid )  # no offset means at standard rate (log_offset = 0)
+  scaling_factor=scaling_factor, nAU=nAU, auid=auid )  # no offset means at standard rate (log_offsets = 0)
 
 
 # for vi only:

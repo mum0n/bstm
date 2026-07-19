@@ -75,7 +75,7 @@ function generate_sim_data(s_N=25, t_N=10; rndseed=42)
         t_coord = vec(t_idx),   # time index
         u_idx = u_idx,
         u_v = seasonal,
-        log_offset = zeros(n_total),
+        log_offsets = zeros(n_total),
         region = categorical(reg),  # would make sure it is used as a factorial variable or in the model statement: Fixed(reg)
         z = Z,  # continuous covariate
         w1 = W1_obs, # more covariates 
@@ -180,11 +180,11 @@ function scottish_lip_cancer_data_spacetime(n_years::Int=10, spatial_expansion::
             district = i,
             year = 1:n_years,
             y = y_p,
-            log_offset = log_off,
+            log_offsets = log_off,
             cov1 = fill(x_orig[i], n_years)
         )
         # Calculate rate within block to avoid scoping errors
-        d_df.y_rate = d_df.y ./ exp.(d_df.log_offset)
+        d_df.y_rate = d_df.y ./ exp.(d_df.log_offsets)
         append!(data_primary, d_df)
     end
 

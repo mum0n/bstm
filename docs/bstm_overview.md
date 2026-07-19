@@ -19,10 +19,15 @@ The general structure of a `bstm` model call is:
 
 ```julia
 m = @bstm(
-    likelihood(outcome_var, family=poisson, ...) ~ 1 + fixed_effects + modules(...),
+    likelihood(outcome_var, family=poisson, ...) ~ intercept() + fixed_effects + modules(...),
     data_frame,
     keyword_arguments...
 )
+```
+
+Any keyword arguments provided after the `data_frame` are passed into the model's configuration. A notable general keyword is `verbose`.
+
+*   **`verbose=false`**: Suppresses the printing of the dynamically generated model code and the results of the automatic prior predictive check that runs at instantiation. This is useful for cleaner output in scripts or notebooks. The default is `true`.
 ```
 
 ### 2.2. The `likelihood()` Module
@@ -32,32 +37,32 @@ The `likelihood()` module on the LHS specifies the observation model and its par
 | Parameter                  | Example Usage       | Description                                                                                                         |
 | :---------------------------| :--------------------| :--------------------------------------------------------------------------------------------------------------------|
 | `family`                   | `family=:poisson`   | Sets the likelihood distribution. See table below for options.                                                      |
-| `log_offsets` or `offsets` | `offsets=pop_log`   | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
+| `log_offsets`  | `log_offsets=pop_log`   | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
 | `weights`                  | `weights=sample_w`  | Applies observation-level weights to the log-likelihood.                                                            |
 | `trials`                   | `trials=n_patients` | Specifies the number of trials for each observation in a Binomial model.                                            |
-| `zi`                       | `zi=true`           | Enables a zero-inflation component for count models.                                                                |
+| `zero_inflated`            | `zero_inflated=true`| Enables a zero-inflation component for count models.                                                                |
 | `volatility`               | `volatility=true`   | Enables a spatiotemporal stochastic volatility model for the observation noise ($\sigma_y$).                        |
-| `y_L`, `y_U`               | `y_L=lower_b`       | Defines lower and upper bounds for censored data.                                                                   |
+| `censor_lower`, `censor_upper`| `censor_lower=lower_b`| Defines lower and upper bounds for censored data.                                                                   |
 | `hurdle`                   | `hurdle=0`          | Implements a hurdle model by truncating the likelihood below the specified threshold.                               |
 
 ### 2.3. Illustrative Examples
 
 1.  **BYM2 Disease Mapping:**
-    `@bstm(likelihood(y, family=poisson) ~ 1 + spatial(s_idx, model=bym2), data, W=W)`
+    `@bstm(likelihood(y, family=poisson) ~ intercept() + spatial(s_idx, model=bym2), data, W=W)`
     Decomposes risk into structured spatial and unstructured IID noise.
 
 2.  **AR1 Temporal Forecasting:**
-    `@bstm(likelihood(y) ~ 1 + temporal(t_idx, model=ar1), data)`
+    `@bstm(likelihood(y) ~ intercept() + temporal(t_idx, model=ar1), data)`
     Captures geometric temporal decay.
 
 3.  **Spatio-Temporal Interaction:**
-    `@bstm(likelihood(y) ~ 1 + spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1), data, W=W)`
+    `@bstm(likelihood(y) ~ intercept() + spatial(s_idx, model=besag) ⊗ temporal(t_idx, model=ar1), data, W=W)`
     Employs the Kronecker product to create a fully structured spatiotemporal interaction field.
 
 4.  **Spatially Varying Coefficients (SVC) and Curves:**
-    `@bstm(likelihood(y) ~ 1 + (poverty |> spatial(s_idx, model=icar)), data, W=W)`
+    `@bstm(likelihood(y) ~ intercept() + (poverty |> spatial(s_idx, model=icar)), data, W=W)`
     Allows the impact of `poverty` to vary according to local spatial gradients.
-    `@bstm(likelihood(y) ~ 1 + (spatial(s_idx, model=icar) |> smooth(time, model=pspline)), data, W=W)`
+    `@bstm(likelihood(y) ~ intercept() + (spatial(s_idx, model=icar) |> smooth(time, model=pspline)), data, W=W)`
     Models a temporal trend that varies smoothly across space.
 
 ## 3. The Algebra of Manifolds: Composition and State-Space Models
@@ -130,8 +135,8 @@ This allows for a more intuitive and principled way to set priors than choosing 
 
 | Parameter | PC Prior (Default) | Informative Prior | Uninformative Prior | Rationale |
 |:---|:---|:---|:---|:---|
-| **Sigma** ($\sigma$) | `Exponential(λ)` where `λ = -log(α)/U` from `P(σ > U) = α`. A typical default might be `(U=1, α=0.05)`. | `Exponential(0.5)` | `Normal(0, 1e6)` | Controls the marginal standard deviation of a latent field. PC prior shrinks towards zero variance unless data supports a larger scale. |
-| **Rho** ($\rho$) | Transformed `Exponential(λ)` where `λ = log(α)/log(1-U)` from `P(ρ > U) = α`. A typical default might be `(U=0.5, α=0.05)`. | `Beta(2, 2)` | `Uniform(0, 1)` | Controls spatial/temporal correlation. PC prior shrinks towards 0 (no correlation). |
+| **Sigma** ($\sigma$) | `Exponential(λ)` where `λ = -log(α)/U` from `P(σ > U) = α`. A typical default might be `(1, 0.05)`. | `Exponential(0.5)` | `Normal(0, 1e6)` | Controls the marginal standard deviation of a latent field. PC prior shrinks towards zero variance unless data supports a larger scale. |
+| **Rho** ($\rho$) | For `rho` on `[0,1]` (e.g., BYM2): Transformed `Exponential(λ)` where `λ = log(α)/log(1-U)` from `P(ρ > U) = α`. For `rho` on `(-1,1)` (e.g., AR1): `Normal(0,σ)` where `σ` is derived from `P(|ρ| > U) = α`. | `Beta(2, 2)` | `Uniform(0, 1)` | Controls spatial/temporal correlation. PC prior shrinks towards 0 (no correlation). |
 | **Lengthscale** | Transformed `Exponential(λ)` where `λ = -U*log(α)` from `P(lengthscale < U) = α`. A typical default might be `(U=10, α=0.05)`. | `InverseGamma(5, 5)` | `InverseGamma(0.01, 0.01)` | Controls the range of correlation in continuous GP models. PC prior prevents overfitting by shrinking towards large lengthscales. |
 | **Kappa** ($\kappa$) | `Exponential(λ)` derived from a quantile constraint. | `Exponential(0.1)` | `Exponential(10.0)` | Controls the smoothness of an SPDE/Matérn field. PC prior shrinks towards a smoother field. |
 | **Amplitude** | `Normal(0, 1)` | `Normal(0, 0.5)` | `Normal(0, 100)` | Controls the amplitude of harmonic (seasonal) components. |
@@ -146,28 +151,28 @@ You can control prior specification at three levels of precedence:
     ```julia
     # Local Override with a pre-defined Distribution
     @bstm(
-        likelihood(y) ~ 1 + spatial(s_idx, model=bym2, sigma_prior=Exponential(0.1)),
+        likelihood(y) ~ intercept() + spatial(s_idx, model=bym2, sigma_prior=Exponential(0.1)),
         data, W=W
     )
 
     # Local Override with a PC prior quantile constraint
     # This sets P(sigma > 0.5) = 0.01 for this specific spatial component's sigma.
     @bstm(
-        likelihood(y) ~ 1 + spatial(s_idx, model=bym2, sigma_prior=(0.5, 0.01)),
+        likelihood(y) ~ intercept() + spatial(s_idx, model=bym2, sigma_prior=(0.5, 0.01)),
         data, W=W
     )
 
     # Local Override for a correlation parameter 'rho' in an AR1 model.
-    # This sets P(rho > 0.8) = 0.05, shrinking it towards zero.
+    # This sets a symmetric prior where P(|rho| > 0.8) = 0.05, shrinking it towards zero.
     @bstm(
-        likelihood(y) ~ 1 + temporal(t_idx, model=ar1, rho_prior=(0.8, 0.05)),
+        likelihood(y) ~ intercept() + temporal(t_idx, model=ar1, rho_prior=(0.8, 0.05, :symmetric)),
         data
     )
 
     # Local Override for a 'lengthscale' in a GP model.
     # This sets P(lengthscale < 10.0) = 0.05, shrinking it towards larger values.
     @bstm(
-        likelihood(y) ~ 1 + smooth(x, model=gp, lengthscale_prior=(10.0, 0.05, :lower)),
+        likelihood(y) ~ intercept() + smooth(x, model=gp, lengthscale_prior=(10.0, 0.05, :lower)),
         data
     )
     ```
@@ -261,7 +266,7 @@ A logistic growth model for a population can be specified as:
 
 ```julia
 @bstm(
-    likelihood(counts, family=poisson) ~ 1 + dynamics(time, model=logistic_f, r_covariate=temp),
+    likelihood(counts, family=poisson) ~ intercept() + dynamics(time, model=logistic_f, r_covariate=temp),
     data
 )
 ```
@@ -274,7 +279,7 @@ The `nested()` module is a "supervisor" component for multi-fidelity modeling. I
 
 ```julia
 @bstm(
-    likelihood(y_hq) ~ 1 + spatial(s_idx) + nested(proxy_signal, formula="likelihood(y_lq, family=poisson) ~ 1 + smooth(x)", data_source=low_quality_data),
+    likelihood(y_hq) ~ intercept() + spatial(s_idx) + nested(proxy_signal, formula="likelihood(y_lq, family=poisson) ~ intercept() + smooth(x)", data_source=low_quality_data),
     high_quality_data,
     low_quality_data = df_low_quality
 )
@@ -292,7 +297,7 @@ The `bstm` framework facilitates this through the `nested()` module, which allow
 
 #### Implementation with `nested()`
 
-In this setup, the `nested()` module defines a complete sub-model for the censored covariate. This sub-model has its own `likelihood()` block where the censoring bounds (`y_L`, `y_U`) are specified. The latent process estimated by this sub-model is then automatically incorporated as a predictor in the main model's linear predictor.
+In this setup, the `nested()` module defines a complete sub-model for the censored covariate. This sub-model has its own `likelihood()` block where the censoring bounds (`censor_lower`, `censor_upper`) are specified. The latent process estimated by this sub-model is then automatically incorporated as a predictor in the main model's linear predictor.
 
 **Example: Using `nested()` for a Censored Covariate**
 
@@ -302,13 +307,13 @@ In this setup, the `nested()` module defines a complete sub-model for the censor
 
 # The main model for 'y' includes a `nested()` term named `x_latent_process`.
 # This term defines a sub-model where 'x_censored' is the outcome.
-# The sub-model's `likelihood()` handles the censoring of 'x_censored'.
+# The sub-model's `likelihood()` handles the censoring of 'x_censored' using `censor_lower` and `censor_upper`.
 # The latent effect from this sub-model is then automatically added as a predictor to the main model.
 
 joint_model = @bstm(
-    likelihood(y, family=poisson) ~ 1 + z1 +
+    likelihood(y, family=poisson) ~ intercept() + z1 +
         nested(x_latent_process,
-            formula="likelihood(x_censored, family=gaussian, y_L=x_L, y_U=x_U) ~ 1 + z1"
+            formula="likelihood(x_censored, family=gaussian, censor_lower=x_L, censor_upper=x_U) ~ intercept() + z1"
         ),
     my_data
 )
@@ -395,12 +400,12 @@ This section provides a detailed quick-reference guide to the main modules avail
 | Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
 |:---|:---|:---|:---|:---|
 | `family` | `family=:poisson` | `Symbol` | `:gaussian` | Sets the likelihood distribution. See table below for options. |
-| `log_offsets` or `offsets` | `offsets=pop_log` | `Symbol` | `0.0` | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
+| `log_offsets` | `log_offsets=pop_log` | `Symbol` | `0.0` | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
 | `weights` | `weights=sample_w` | `Symbol` | `1.0` | Multiplies the log-likelihood of each observation by the specified weight. |
 | `trials` | `trials=n_patients` | `Symbol` | `1` | Specifies the number of trials for each observation in a Binomial model. |
-| `zi` | `zi=true` | `Bool` | `false` | Enables a zero-inflation component for count models. |
+| `zero_inflated` | `zero_inflated=true` | `Bool` | `false` | Enables a zero-inflation component for count models. |
 | `volatility`| `volatility=true` | `Bool` | `false` | Enables a spatiotemporal stochastic volatility model for the observation noise ($\sigma_y$). |
-| `y_L`, `y_U`| `y_L=lower_b` | `Symbol` or `Number` | `-Inf`, `+Inf` | Defines the lower (`y_L`) and upper (`y_U`) bounds for censored data. |
+| `censor_lower`, `censor_upper`| `censor_lower=lower_b` | `Symbol` or `Number` | `-Inf`, `+Inf` | Defines the lower (`censor_lower`) and upper (`censor_upper`) bounds for censored data. |
 | `hurdle` | `hurdle=0` | `Number` | `-Inf` | Implements a hurdle model by truncating the likelihood below the specified threshold. |
 
 ### 8.2. Likelihood Families
@@ -473,7 +478,7 @@ The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm`
 | **Random Fourier Features**      | `'rff'`          | `n_features`, `lengthscale_prior` | `sigma_prior`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A highly scalable method for approximating a full Gaussian Process smooth.                     |
 | **Random Walk (on bins)**        | `'rw1'`, `'rw2'` | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
 | **Gaussian Process (on coords)** | `'gp'`           | `lengthscale_prior`               | `sigma_prior`: `Exponential(1.0)`                                     | Gold-standard continuous smoother, computationally intensive.                                  |
-| **FFT Basis**                    | `'fft'`          | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | For modeling periodic non-linear effects of a covariate.                                       |
+| **FFT Basis**                    | `'fft'`          | `nbins`, `lengthscale_prior`      | `sigma_prior`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | For modeling periodic non-linear effects of a covariate with a learnable period.               |
 | **Moran's I Basis**              | `'moran'`        | `nbins`, `W`                      | `sigma_prior`: `Exponential(1.0)`                                     | Uses eigenvectors of a spatial weights matrix as basis functions.                              |
 | **Spherical Basis**              | `'spherical'`    | `nbins`, `range_prior`            | `sigma_prior`: `Exponential(1.0)`                                     | For effects with a strictly local influence (compact support).                                 |
 | **Exponential Decay Basis**      | `'decay'`        | `nbins`, `lengthscale`            | `sigma_prior`: `Exponential(1.0)`                                     | For effects with a strong, rapidly decaying influence.                                         |
@@ -509,7 +514,7 @@ The `nested()` module is a powerful "supervisor" component used for multi-fideli
 | Keyword / Parameter | Example Usage | Data Type | Default | Meaning & Assumptions |
 |:---|:---|:---|:---|:---|
 | `nested()` | `nested(z_var; ...)` | Module | N/A | Defines a supervised sub-model whose latent effect is added to the main model's linear predictor. The `z_var` is a symbolic name for this component. |
-| `formula` | `formula="likelihood(z, family=gaussian) ~ 1 + spatial(s)"` | `String` | `""` | A complete `bstm` formula string that defines the structure of the sub-model, including its own likelihood. This sub-model is fit to the specified `data_source`. |
+| `formula` | `formula="likelihood(z, family=gaussian) ~ intercept() + spatial(s)"` | `String` | `""` | A complete `bstm` formula string that defines the structure of the sub-model, including its own likelihood. This sub-model is fit to the specified `data_source`. |
 | `data_source` | `data_source=proxy_data` | `Symbol` | `:data` | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset. |
 | `rho_nested` (Implicit) | N/A | `Float` | `Normal(1.0, 0.5)` | A scaling coefficient that links the sub-model's latent effect to the main model's linear predictor: $\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}$. The prior assumes the sub-model is a good proxy ($\rho \approx 1$). |
 
@@ -574,16 +579,16 @@ Interaction effects between fixed covariates are specified using the standard `*
 *   `cov1 : cov2`: Equivalent to `cov1 & cov2`.
 
 **Example:**
-
 ```julia
-# These three formulas are equivalent and include main effects and the interaction.
-m1 = @bstm(likelihood(y) ~ 1 + cov1 * cov2, data)
-m2 = @bstm(likelihood(y) ~ 1 + fixed(cov1 * cov2), data)
-m3 = @bstm(likelihood(y) ~ 1 + fixed(cov1) + fixed(cov2) + fixed(cov1 & cov2), data)
+# These formulas are equivalent and include main effects and the interaction.
+m1 = @bstm(likelihood(y) ~ intercept() + cov1 * cov2, data)
+m2 = @bstm(likelihood(y) ~ intercept() + fixed(cov1 * cov2), data)
+m3 = @bstm(likelihood(y) ~ intercept() + fixed(cov1) * fixed(cov2), data)
+m4 = @bstm(likelihood(y) ~ intercept() + fixed(cov1) + fixed(cov2) + fixed(cov1 & cov2), data)
 
 # These formulas include only the interaction term.
-m4 = @bstm(likelihood(y) ~ 1 + cov1 & cov2, data)
-m5 = @bstm(likelihood(y) ~ 1 + cov1 : cov2, data)
+m5 = @bstm(likelihood(y) ~ intercept() + cov1 & cov2, data)
+m6 = @bstm(likelihood(y) ~ intercept() + cov1 : cov2, data)
 ```
 
 **Note on Priors:** Applying a custom prior to an interaction term (e.g., `fixed(cov1 * cov2, prior=...)`) is not directly supported, as the prior would be ambiguous across the expanded main and interaction effects. To assign a specific prior to an interaction, you must first manually create the interaction term as a new column in your `DataFrame` and then apply the `fixed()` module with a `prior` to that new column.

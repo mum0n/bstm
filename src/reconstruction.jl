@@ -1094,8 +1094,8 @@ function _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
         end
     end
 
-    if haskey(M, :log_offset)
-        offset_full = isnothing(PS) ? M.log_offset : vcat(M.log_offset, get(PS, :log_offset, zeros(PS.y_N)))
+    if haskey(M, :log_offsets)
+        offset_full = isnothing(PS) ? M.log_offsets : vcat(M.log_offsets, get(PS, :log_offsets, zeros(PS.y_N)))
         for k in 1:outcomes_N
             eta_latent[:, :, k] .+= offset_full
         end
@@ -1676,7 +1676,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
 
             if haskey(sub_M, :likelihood_specs) && !isempty(sub_M.likelihood_specs)
                 sub_lik_params = sub_M.likelihood_specs[1]
-                _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:offsets, :log_offsets], :log_offset)
+                _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:log_offsets], :log_offsets)
                 _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:weights], :weights)
                 _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:trials], :trials)
             end

@@ -7,6 +7,17 @@ format: html
 
 This document provides a comprehensive library of model specifications using the `@bstm()` formula interface. It is organized from simple to complex, covering a wide range of features from basic regression to advanced hierarchical and mechanistic models.
 
+## 0. Example data
+
+```julia
+project_directory = joinpath( "C:\\", "home", "jae", "projects", "bstm")  
+include( joinpath( project_directory, "startup.jl" ) ) 
+load_project_functions( srcdir() )
+data_scot, _ = scottish_lip_cancer_data_spacetime(); # additional noise and "fake" time slices added
+data = data_scot[:data]
+W = data_scot[:au][:W]
+```
+
 ## 1. Basic Regression & Mixed Effects
 
 These examples show how to specify standard regression components.
@@ -15,26 +26,26 @@ These examples show how to specify standard regression components.
 
 A simple linear regression model with an intercept and two continuous covariates.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + cov1 + cov2,
+    likelihood(y) ~ intercept() + fixed(cov1) + fixed(cov2),
     data
 )
 ```
-
+ 
 ### 1.2. Categorical Fixed Effects with Contrasts
 
 Models the effect of a categorical variable using custom contrast coding.
 
 **Key Features:**
 - **Module**: `fixed()`
-- **Contrast Coding**: `:effects` coding sets the sum of coefficients to zero.
+- **Contrast Coding**: `effects` coding sets the sum of coefficients to zero.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + fixed(region, contrast=:effects, prior=Normal(0, 10)),
+    likelihood(y) ~ intercept() + fixed(region, contrast=effects, prior=Normal(0, 10)),
     data
 )
 ```
@@ -47,10 +58,10 @@ Models group-level variability in the intercept.
 - **Module**: `mixed()`
 - **Random Intercept**: `mixed(1 | group)`
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + cov1 + mixed(1 | site),
+    likelihood(y) ~ intercept() + fixed(cov1) + mixed(1 | region),
     data
 )
 ```
@@ -63,11 +74,11 @@ Models group-level variability for intercepts and the effects of covariates.
 - **Module**: `mixed()`
 - **Random Slope**: `mixed(covariate | group)`
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + cov1 + 
-        mixed(1 + cov1 | site), # Correlated random intercept and slope for cov1
+    likelihood(y) ~ intercept() + cov1 + 
+        mixed( intercept() + cov1 | region ), # Correlated random intercept and slope for cov1
     data
 )
 ```
@@ -80,10 +91,11 @@ These examples demonstrate how to modify the observation model using parameters 
 
 Models a continuous outcome where some observations are censored.
 
-**Formula Equivalent:**
+
 ```julia
+y_lower_bound, y_upper_bound = 1, 100
 m = @bstm(
-    likelihood(y_obs, family=gaussian, y_L=y_lower_bound, y_U=y_upper_bound) ~ 1,
+    likelihood(y_rate, family=gaussian, censor_lower=y_lower_bound, censor_upper=y_upper_bound) ~ intercept() + fixed(region),
     data
 )
 ```
@@ -92,10 +104,10 @@ m = @bstm(
 
 Models count data with an excess of zeros.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y_counts, family=poisson, zi=true) ~ 1 + cov1,
+    likelihood(y, family=poisson, zero_inflated=true) ~ intercept() + cov1,
     data
 )
 ```
@@ -104,10 +116,10 @@ m = @bstm(
 
 A two-part model where the process for generating zeros is separate from the process for generating positive counts.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y_counts, family=poisson, hurdle=0) ~ 1 + cov1,
+    likelihood(y, family=poisson, hurdle=1) ~ intercept() + cov1,
     data
 )
 ```
@@ -116,11 +128,11 @@ m = @bstm(
 
 Models observation noise that varies over space and time.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y, family=gaussian, volatility=true) ~ 1 + spatial(s_idx, model=bym2),
-    data, W=W
+    likelihood(y_rate, family=gaussian, volatility=true) ~ intercept() + spatial(s_idx, model=bym2, W=W),
+    data
 )
 ```
 
@@ -136,10 +148,10 @@ These examples demonstrate various models for capturing spatial autocorrelation.
 
 The standard for areal disease mapping, decomposing spatial risk into structured and unstructured components.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y_counts, family=poisson) ~ 1 + spatial(s_idx, model=bym2, W=W),
+    likelihood(y, family=poisson) ~ intercept() + spatial(s_idx, model=bym2, W=W),
     data
 )
 ```
@@ -148,10 +160,10 @@ m = @bstm(
 
 A model for strong spatial smoothing based on local neighbors.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + spatial(s_idx, model=icar, W=W),
+    likelihood(y) ~ intercept() + spatial(s_idx, model=icar, W=W),
     data
 )
 ```
@@ -160,10 +172,10 @@ m = @bstm(
 
 Alternatives to BYM2 that offer different parameterizations of spatial correlation.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + spatial(s_idx, model=leroux, W=W),
+    likelihood(y) ~ intercept() + spatial(s_idx, model=leroux, W=W),
     data
 )
 ```
@@ -172,10 +184,10 @@ m = @bstm(
 
 Models spatial "spill-over" effects where the value at one location directly influences its neighbors.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + spatial(s_idx, model=sar, W=W),
+    likelihood(y) ~ intercept() + spatial(s_idx, model=sar, W=W, noise=1e-6),
     data
 )
 ```
@@ -188,10 +200,10 @@ These models are for data where exact coordinates are available.
 
 The gold-standard for continuous spatial modeling, but computationally expensive.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + smooth(lon, lat, model=gp, kernel="matern32"),
+    likelihood(y) ~ intercept() + smooth(s_x, s_y, model=gp, kernel=matern32),
     data
 )
 ```
@@ -200,10 +212,10 @@ m = @bstm(
 
 Models a continuous spatial process using an approximation to a Stochastic Partial Differential Equation, linked to the Matérn kernel.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + spatial(s_idx, model=spde, mesh=mesh_object),
+    likelihood(y) ~ intercept() + spatial(s_idx, model=spde, mesh=mesh_object),
     data, mesh=mesh_object # Requires a pre-computed mesh
 )
 ```
@@ -216,10 +228,10 @@ m = @bstm(
 
 Models a smooth, non-linear temporal trend using a second-order random walk.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + temporal(time_index, model=rw2),
+    likelihood(y) ~ intercept() + temporal(year, model=rw2),
     data
 )
 ```
@@ -228,10 +240,10 @@ m = @bstm(
 
 Models a stationary temporal process where the current value depends on the immediately preceding value.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + temporal(time_index, model=ar1),
+    likelihood(y) ~ intercept() + temporal(year, model=ar1),
     data
 )
 ```
@@ -242,10 +254,10 @@ m = @bstm(
 
 Captures periodic effects using sine and cosine basis functions.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + seasonal(month, model=harmonic, period=12),
+    likelihood(y) ~ intercept() + temporal(year, month, model=(ar1, cyclic), period=12),
     data
 )
 ```
@@ -254,10 +266,10 @@ m = @bstm(
 
 Models a smooth, periodic effect where the end of the cycle connects to the beginning.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + seasonal(day_of_week, model=cyclic, period=7),
+    likelihood(y) ~ intercept() + seasonal(day_of_week, model=cyclic, period=7),
     data
 )
 ```
@@ -268,10 +280,10 @@ m = @bstm(
 
 Models the non-linear effect of a continuous covariate using penalized splines.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + smooth(temperature, model=pspline, nbins=20),
+    likelihood(y) ~ intercept() + smooth(temperature, model=pspline, nbins=20),
     data
 )
 ```
@@ -280,10 +292,10 @@ m = @bstm(
 
 Models the smooth, non-linear interaction of two continuous covariates (e.g., spatial coordinates).
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + smooth(longitude, latitude, model=tps, nbins=50),
+    likelihood(y) ~ intercept() + smooth(s_x, s_y, model=tps, nbins=50),
     data
 )
 ```
@@ -294,10 +306,10 @@ m = @bstm(
 
 A standard model where the spatial and temporal effects are assumed to be independent and additive.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + spatial(s_idx, model=bym2, W=W) + temporal(t_idx, model=ar1),
+    likelihood(y) ~ intercept() + spatial(s_idx, model=bym2, W=W) + temporal(year, model=ar1),
     data
 )
 ```
@@ -309,8 +321,8 @@ A fully structured interaction where a spatial field (e.g., ICAR) evolves over t
 **Formula Equivalent (using `⊗`):**
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + spatial(s_idx, model=icar) + temporal(t_idx, model=ar1) +
-        (spatial(s_idx, model=icar) ⊗ temporal(t_idx, model=ar1)),
+    likelihood(y) ~ intercept() + spatial(s_idx, model=icar) + temporal(year, model=ar1) +
+        spatial(s_idx, model=icar) ⊗ temporal(year, model=ar1),
     data, W=W
 )
 ```
@@ -318,8 +330,8 @@ m = @bstm(
 **Formula Equivalent (using `spacetime`):**
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + spatial(s_idx, model=icar) + temporal(t_idx, model=ar1) +
-        spacetime(s_idx, t_idx, model=(icar, ar1)),
+    likelihood(y) ~ intercept() + spatial(s_idx, model=icar) + temporal(year, model=ar1) +
+        spacetime(s_idx, year, model=(icar, ar1)),
     data, W=W
 )
 ```
@@ -328,10 +340,10 @@ m = @bstm(
 
 Allows the effect of a covariate to vary smoothly across space.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + (poverty |> spatial(s_idx, model=icar, W=W)),
+    likelihood(y) ~ intercept() + cov1 |> spatial(s_idx, model=icar, W=W),
     data
 )
 ```
@@ -340,10 +352,10 @@ m = @bstm(
 
 Models a non-linear trend of a covariate that varies smoothly across space.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + (smooth(time, model=pspline) |> spatial(s_idx, model=icar, W=W)),
+    likelihood(y) ~ intercept() + (smooth(year, model=pspline) |> spatial(s_idx, model=icar, W=W)),
     data
 )
 ```
@@ -354,10 +366,10 @@ m = @bstm(
 
 A mechanistic model for a process that is transported (advection) and spreads (diffusion) over a graph.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(concentration) ~ 1 + dynamics(s_idx, t_idx, model=advection_diffusion, W=W),
+    likelihood(concentration) ~ intercept() + dynamics(s_idx, year, model=advection_diffusion, W=W),
     data
 )
 ```
@@ -366,10 +378,10 @@ m = @bstm(
 
 Performs dimensionality reduction on a set of covariates, using the dominant latent factor as a predictor.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y) ~ 1 + eigen(temp, salinity, depth, n_factors=1),
+    likelihood(y) ~ intercept() + eigen(cov1, cov2, cov3, n_factors=1),
     data
 )
 ```
@@ -378,13 +390,13 @@ m = @bstm(
 
 Integrates a low-fidelity (but data-rich) proxy variable to improve predictions for a high-fidelity (but data-sparse) target.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y_hq) ~ 1 + 
+    likelihood(y) ~ intercept() + 
         nested(
             proxy_model, 
-            formula="y_lq ~ 1 + smooth(x, model=pspline)"
+            formula="likelihood(y_bin, family=binomial) ~ intercept() + smooth(cov3, model=pspline)"
         ),
     data
 )
@@ -396,10 +408,10 @@ m = @bstm(
 
 A multivariate CAR model for jointly modeling multiple correlated spatial processes.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    y1 + y2 ~ 1 + spatial(s_idx, model=besag, W=W) + temporal(t_idx, model=ar1),
+    y + y_bin ~ intercept() + spatial(s_idx, model=besag, W=W) + temporal(year, model=ar1),
     data
 )
 ```
@@ -408,11 +420,11 @@ m = @bstm(
 
 Jointly models multiple outcomes where each has a different likelihood.
 
-**Formula Equivalent:**
+
 ```julia
 m = @bstm(
-    likelihood(y_counts, family=poisson) + likelihood(y_continuous, family=gaussian) ~ 
-        1 + spatial(s_idx, model=bym2, W=W),
+    likelihood(y, family=poisson) + likelihood(y_continuous, family=gaussian) ~ 
+        intercept() + spatial(s_idx, model=bym2, W=W),
     data
 )
 ```
