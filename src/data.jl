@@ -72,7 +72,7 @@ function generate_sim_data(s_N=25, t_N=10; rndseed=42)
         s_x = s_x,
         s_y = s_y,
         t_v = t_v,
-        t_coord = vec(t_idx),   # time index
+        t_coord = vec(t_idx),   # time index 
         u_idx = u_idx,
         u_v = seasonal,
         log_offsets = zeros(n_total),
@@ -198,6 +198,9 @@ function scottish_lip_cancer_data_spacetime(n_years::Int=10, spatial_expansion::
     data_primary.cov4 = randn(nrow(data_primary)) .* log.(data_primary.y_rate .+ 1.0)
     data_primary.cov5 = randn(nrow(data_primary)) .* exp.(data_primary.y_rate) .* 2.0
     data_primary.cov6 = randn(nrow(data_primary))
+    
+    data_primary.day = rand(1:365,size(data_primary, 1)) 
+    data_primary.month = Int.(round.(data_primary.day ./365 * 12)) .+ 1
 
     data_primary.f1 = rand(["A", "B"], nrow(data_primary))
     data_primary.s_idx = data_primary.district

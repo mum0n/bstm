@@ -24,7 +24,7 @@ print( "Current directory is: ", current_directory, "\n\n" )
 pkgs_bstm = [
   "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", "SpecialFunctions", "DimensionalData",
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation", "OrderedCollections", "NearestNeighbors",  
-  "Distributions", "Statistics",  "DataFrames",  "GLM", "FlexiChains", "AbstractPPL",
+  "Distributions", "Statistics",  "DataFrames",  "GLM", "FlexiChains", "AbstractPPL", "Wavelets", 
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs", 
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing",  

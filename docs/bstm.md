@@ -2724,18 +2724,18 @@ The `bstm` framework translates user-specified quantile constraints into prior d
 
 **1. Syntax and Parsing:**
 
-The user specifies a PC prior constraint as a two-element tuple `(U, α)` for any `_prior` argument within a manifold call.
+The user specifies a PC prior constraint as a two-element tuple `(U, α)` for any prior argument within a manifold call.
 
 ```julia
 # Example: Specifying a PC prior for the standard deviation of a BYM2 model's spatial effect.
 # This sets the prior belief that P(sigma > 1.0) = 0.05.
 @bstm(
-    likelihood(y) ~ 1 + spatial(s_idx, model=bym2, sigma_prior=(1.0, 0.05)),
+    likelihood(y) ~ 1 + spatial(s_idx, model=bym2, sigma=(1.0, 0.05)),
     data, W=W
 )
 ```
 
-The `@bstm` macro's parser iterates through the keyword arguments of each manifold call (e.g., `spatial`). When it encounters an argument ending in `_prior` (like `sigma_prior`), it inspects its value. If the value is a `Tuple{Real, Real}`, it recognizes it as a PC prior constraint.
+The `@bstm` macro's parser iterates through the keyword arguments of each manifold call (e.g., `spatial`). When it encounters prior (like `sigma`), it inspects its value. If the value is a `Tuple{Real, Real}`, it recognizes it as a PC prior constraint.
 
 **2. The Prior Factory: `create_pc_prior`**
 
@@ -3696,14 +3696,14 @@ Now bring data into julia for analysis
 
     noise=1.0e-9 
 
-    t_period_prior = log.([1 5; 1 5])[:, 1:ncf]
+    t_period = log.([1 5; 1 5])[:, 1:ncf]
 
 
-    v_prior = eigenvector_to_householder(evecs, nvar, nz, ltri )  
-    # householder_to_eigenvector( lower_triangle( v_prior, nvar, nz ) ) .- evecs[:,1:nz] # inverse transform
+    v = eigenvector_to_householder(evecs, nvar, nz, ltri )  
+    # householder_to_eigenvector( lower_triangle( v, nvar, nz ) ) .- evecs[:,1:nz] # inverse transform
      
     # param sequence = sigma_noise, sigma(nz), v, r=norm(v)~ 1.0 (scaled)
-    sigma_prior = log.(sqrt.(evals)[1:nz])
+    sigma = log.(sqrt.(evals)[1:nz])
 
     # direct ppca
     M0 = ppca_basic( Y' )  # pca first  

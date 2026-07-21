@@ -14,7 +14,7 @@ project_directory = joinpath( "C:\\", "home", "jae", "projects", "bstm")
 include( joinpath( project_directory, "startup.jl" ) ) 
 load_project_functions( srcdir() )
 data_scot, _ = scottish_lip_cancer_data_spacetime(); # additional noise and "fake" time slices added
-data = data_scot[:data]
+data = data_scot[:data];  
 W = data_scot[:au][:W]
 ```
 
@@ -28,10 +28,7 @@ A simple linear regression model with an intercept and two continuous covariates
 
 
 ```julia
-m = @bstm(
-    likelihood(y) ~ intercept() + fixed(cov1) + fixed(cov2),
-    data
-)
+m = @bstm( likelihood(y) ~ intercept() + fixed(cov1) + fixed(cov2), data )
 ```
  
 ### 1.2. Categorical Fixed Effects with Contrasts
@@ -44,10 +41,7 @@ Models the effect of a categorical variable using custom contrast coding.
 
 
 ```julia
-m = @bstm(
-    likelihood(y) ~ intercept() + fixed(region, contrast=effects, prior=Normal(0, 10)),
-    data
-)
+m = @bstm( likelihood(y) ~ intercept() + fixed(region, contrast=effects, prior=Normal(0, 10)), data )
 ```
 
 ### 1.3. Random Intercept Model
@@ -60,10 +54,7 @@ Models group-level variability in the intercept.
 
 
 ```julia
-m = @bstm(
-    likelihood(y) ~ intercept() + fixed(cov1) + mixed(1 | region),
-    data
-)
+m = @bstm( likelihood(y) ~ intercept(false) + fixed(cov1) + mixed( intercept() | region), data )
 ```
 
 ### 1.4. Random Slope and Intercept Model
@@ -77,8 +68,8 @@ Models group-level variability for intercepts and the effects of covariates.
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + cov1 + 
-        mixed( intercept() + cov1 | region ), # Correlated random intercept and slope for cov1
+    likelihood(y) ~ intercept(false) + cov1 + 
+        mixed( intercept(true) + cov1 | region ), # Correlated random intercept and slope for cov1
     data
 )
 ```
@@ -118,10 +109,7 @@ A two-part model where the process for generating zeros is separate from the pro
 
 
 ```julia
-m = @bstm(
-    likelihood(y, family=poisson, hurdle=1) ~ intercept() + cov1,
-    data
-)
+m = @bstm( likelihood(y, family=poisson, hurdle=1) ~ intercept() + cov1, data )
 ```
 
 ### 2.4. Stochastic Volatility Model
@@ -150,10 +138,7 @@ The standard for areal disease mapping, decomposing spatial risk into structured
 
 
 ```julia
-m = @bstm(
-    likelihood(y, family=poisson) ~ intercept() + spatial(s_idx, model=bym2, W=W),
-    data
-)
+m = @bstm( likelihood(y, family=poisson) ~ intercept() + spatial(s_idx, model=bym2, W=W), data )
 ```
 
 #### ICAR / Besag Model
@@ -162,10 +147,7 @@ A model for strong spatial smoothing based on local neighbors.
 
 
 ```julia
-m = @bstm(
-    likelihood(y) ~ intercept() + spatial(s_idx, model=icar, W=W),
-    data
-)
+m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=icar, W=W), data )
 ```
 
 #### Leroux Model
@@ -174,10 +156,7 @@ Alternatives to BYM2 that offer different parameterizations of spatial correlati
 
 
 ```julia
-m = @bstm(
-    likelihood(y) ~ intercept() + spatial(s_idx, model=leroux, W=W),
-    data
-)
+m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=leroux, W=W), data )
 ```
 
 #### SAR Model
@@ -186,10 +165,7 @@ Models spatial "spill-over" effects where the value at one location directly inf
 
 
 ```julia
-m = @bstm(
-    likelihood(y) ~ intercept() + spatial(s_idx, model=sar, W=W, noise=1e-6),
-    data
-)
+m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=sar, W=W, noise=1e-6), data)
 ```
 
 ### 3.2. Continuous & Point-Reference Models
@@ -202,10 +178,7 @@ The gold-standard for continuous spatial modeling, but computationally expensive
 
 
 ```julia
-m = @bstm(
-    likelihood(y) ~ intercept() + smooth(s_x, s_y, model=gp, kernel=matern32),
-    data
-)
+m = @bstm( likelihood(y) ~ intercept() + smooth(s_x, s_y, model=gp, kernel=matern32), data)
 ```
 
 #### SPDE Model
@@ -214,10 +187,7 @@ Models a continuous spatial process using an approximation to a Stochastic Parti
 
 
 ```julia
-m = @bstm(
-    likelihood(y) ~ intercept() + spatial(s_idx, model=spde, mesh=mesh_object),
-    data, mesh=mesh_object # Requires a pre-computed mesh
-)
+m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=spde, W=W), data )
 ```
 
 ## 4. Temporal & Seasonal Models
@@ -230,10 +200,7 @@ Models a smooth, non-linear temporal trend using a second-order random walk.
 
 
 ```julia
-m = @bstm(
-    likelihood(y) ~ intercept() + temporal(year, model=rw2),
-    data
-)
+m = @bstm( likelihood(y) ~ intercept() + temporal(year, model=rw2), data )
 ```
 
 #### Autoregressive Model (AR1)
@@ -242,10 +209,7 @@ Models a stationary temporal process where the current value depends on the imme
 
 
 ```julia
-m = @bstm(
-    likelihood(y) ~ intercept() + temporal(year, model=ar1),
-    data
-)
+m = @bstm( likelihood(y) ~ intercept() + temporal(year, model=ar1), data )
 ```
 
 ### 4.2. Seasonal Models
@@ -269,7 +233,7 @@ Models a smooth, periodic effect where the end of the cycle connects to the begi
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + seasonal(day_of_week, model=cyclic, period=7),
+    likelihood(y) ~ intercept() + temporal(day, model=cyclic, period=7),
     data
 )
 ```
@@ -283,7 +247,7 @@ Models the non-linear effect of a continuous covariate using penalized splines.
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + smooth(temperature, model=pspline, nbins=20),
+    likelihood(y) ~ intercept() + smooth(cov1, model=pspline, nbins=20),
     data
 )
 ```
@@ -374,7 +338,7 @@ m = @bstm(
 )
 ```
 
-### 7.2. Bayesian PCA (`eigen`)
+### 7.1. Bayesian PCA (`eigen`)
 
 Performs dimensionality reduction on a set of covariates, using the dominant latent factor as a predictor.
 

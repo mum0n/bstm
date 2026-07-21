@@ -31,15 +31,15 @@ function get_kernel_from_string(kernel_name::String)
     end
 end
 
-function _find_parameter_new(p_names, domain, var, param, k=nothing)
+function _find_parameter_new(p_names, var, param, k=nothing)
     # Purpose: Finds parameter names in the MCMC chain based on the new naming scheme.
     # Rationale: Provides a robust way to locate parameters, trying outcome-specific names first.
     # Inputs:
     #   - p_names: A vector of all parameter names from the chain.
-    #   - domain, var, param: The components of the parameter name.
+    #   - var, param: The components of the parameter name.
     #   - k: The optional outcome index for multivariate models.
     # Outputs: The full parameter name string, or an empty string if not found.
-    base_name = "$(domain)_$(var)_$(param)"
+    base_name = "$(var)_$(param)"
 
     if !isnothing(k)
         specific_name = "$(base_name)_$(k)"
@@ -123,11 +123,10 @@ function extract_manifold(m_obj::Union{ICAR, Besag, RW1, RW2, Leroux, SAR, Cycli
     structured_effects = Vector{Matrix{Float64}}()
     
     for k in 1:outcomes_N
-        domain = string(spec.domain)
         var = string(spec.key)
         
-        sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
-        latent_name = _find_parameter_new(p_names, domain, var, "latent", k)
+        sigma_name = _find_parameter_new(p_names, var, "sigma", k)
+        latent_name = _find_parameter_new(p_names, var, "latent", k)
         
         n_units = if domain == "spatial"; M.s_N; elseif domain == "temporal"; M.t_N; else M.u_N; end
         
@@ -148,22 +147,23 @@ function extract_manifold(m_obj::Union{ICAR, Besag, RW1, RW2, Leroux, SAR, Cycli
     return (structured=structured_effects, noisy=structured_effects)
 end
  
+
 function extract_manifold(m_obj::BYM2, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     structured_effects = Vector{Matrix{Float64}}()
     unstructured_effects = Vector{Matrix{Float64}}()
     noisy_effects = Vector{Matrix{Float64}}()
 
     for k in 1:outcomes_N
-        domain = string(spec.domain)
         var = string(spec.key)
 
-        sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
-        rho_name = _find_parameter_new(p_names, domain, var, "rho", k)
-        struct_name = _find_parameter_new(p_names, domain, var, "struct", k)
-        iid_name = _find_parameter_new(p_names, domain, var, "iid", k)
+        sigma_name = _find_parameter_new(p_names, var, "sigma", k)
+        rho_name = _find_parameter_new(p_names, var, "rho", k)
+        struct_name = _find_parameter_new(p_names, var, "struct", k)
+        iid_name = _find_parameter_new(p_names, var, "iid", k)
 
         if isempty(sigma_name) || isempty(rho_name) || isempty(struct_name) || isempty(iid_name)
             @warn "Parameters for BYM2 manifold $(spec.key) (domain $(domain), outcome $(k)) not found. Returning zero-matrix."
+
             push!(structured_effects, zeros(Float64, M.s_N, n_samples))
             push!(unstructured_effects, zeros(Float64, M.s_N, n_samples))
             push!(noisy_effects, zeros(Float64, M.s_N, n_samples))
@@ -191,15 +191,15 @@ function extract_manifold(m_obj::AR1, chain, M, n_samples, outcomes_N, p_names, 
     noise_val = get(M, :noise, 1e-6)
 
     for k in 1:outcomes_N
-        domain = string(spec.domain)
         var = string(spec.key)
 
-        sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
-        rho_name = _find_parameter_new(p_names, domain, var, "rho", k)
-        innov_name = _find_parameter_new(p_names, domain, var, "innov", k)
+        sigma_name = _find_parameter_new(p_names, var, "sigma", k)
+        rho_name = _find_parameter_new(p_names, var, "rho", k)
+        innov_name = _find_parameter_new(p_names, var, "innov", k)
 
         if isempty(sigma_name) || isempty(rho_name) || isempty(innov_name)
             @warn "Parameters for AR1 manifold $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
+
             push!(structured_effects, zeros(Float64, M.t_N, n_samples))
             continue
         end
@@ -243,13 +243,13 @@ function extract_manifold(m_obj::Union{PSpline, BSpline, TPS, FFT, Wavelet, Mora
     coefficient_effects = Vector{Matrix{Float64}}()
 
     for k in 1:outcomes_N
-        domain = string(spec.domain)
         var = string(spec.key)
         
-        coeffs_name = _find_parameter_new(p_names, domain, var, "coeffs", k)
+        coeffs_name = _find_parameter_new(p_names, var, "latent", k)
         
         if isempty(coeffs_name)
             push!(structured_effects, zeros(Float64, size(B_mat_full, 1), n_samples))
+
             push!(coefficient_effects, zeros(Float64, n_basis_cols, n_samples))
             continue
         end
@@ -265,30 +265,41 @@ function extract_manifold(m_obj::Union{PSpline, BSpline, TPS, FFT, Wavelet, Mora
     return (structured=structured_effects, noisy=structured_effects, coefficients=coefficient_effects)
 end
 
+
+ 
 function extract_manifold(m_obj::Harmonic, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    # Purpose: Reconstructs the effect of the Harmonic manifold.
+    # Rationale: This version is updated to match the two-coefficient parameterization
+    #            (`beta_cos`, `beta_sin`) used by the code generator, ensuring correct
+    #            reconstruction of the periodic effect.
+    # v1.6.0 (2026-07-20)
     structured_effects = Vector{Matrix{Float64}}()
     
-    n_harmonics = get(m_obj.params, :n_harmonics, 2)
-    n_basis = 2 * n_harmonics
-    period = m_obj.period
-    
+    # If the period was a random variable, use its posterior mean for reconstruction.
+    period_name = _find_parameter_new(p_names, string(spec.key), "period", nothing)
+    period_samples = isempty(period_name) ? fill(m_obj.period, n_samples) : get_params_vector(chain, period_name, 1)[:, 1]
+
     u_idx_full = haskey(M, :u_idx) ? (isnothing(PS) || !haskey(PS, :u_idx) ? M.u_idx : vcat(M.u_idx, PS.u_idx)) : ones(Int, N_tot)
-    B_harmonic_full = hcat([ (i % 2 == 1 ? sin : cos).(2pi * ceil(i/2) .* u_idx_full ./ period) for i in 1:n_basis]...)
 
     for k in 1:outcomes_N
-        domain = string(spec.domain)
         var = string(spec.key)
         
-        coeffs_name = _find_parameter_new(p_names, domain, var, "coeffs", k)
+        sigma_name = _find_parameter_new(p_names, var, "sigma", k)
+        beta_cos_name = _find_parameter_new(p_names, var, "beta_cos", k)
+        beta_sin_name = _find_parameter_new(p_names, var, "beta_sin", k)
         
-        if isempty(coeffs_name)
-            @warn "Coefficient parameter for Harmonic manifold $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
+        if isempty(sigma_name) || isempty(beta_cos_name) || isempty(beta_sin_name)
+            @warn "Parameters for Harmonic manifold $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_tot, n_samples))
             continue
         end
 
-        coeffs = get_params_vector(chain, coeffs_name, n_basis)
-        effect = B_harmonic_full * coeffs'
+        sigma_samples = get_params_vector(chain, sigma_name, 1)
+        beta_cos_samples = get_params_vector(chain, beta_cos_name, 1)
+        beta_sin_samples = get_params_vector(chain, beta_sin_name, 1)
+
+        angle = (2.0 * pi ./ period_samples') .* u_idx_full
+        effect = (beta_cos_samples' .* cos.(angle) .+ beta_sin_samples' .* sin.(angle)) .* sigma_samples'
         push!(structured_effects, effect)
     end
 
@@ -343,21 +354,21 @@ function extract_manifold(m_obj::Union{GP, FITC, SVGP, Nystrom}, chain, M, n_sam
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
         vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
     else
-        coords_train
+        Matrix{Float64}(coords_train)
     end
     n_obs_full = size(coords_full, 1)
 
     for k in 1:outcomes_N
-        domain = string(spec.domain)
         var = string(spec.key)
         
-        sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
-        ls_name = _find_parameter_new(p_names, domain, var, "ls", k)
-        u_raw_name = _find_parameter_new(p_names, domain, var, "u_raw", k)
-        f_innov_name = _find_parameter_new(p_names, domain, var, "f_innov", k)
+        sigma_name = _find_parameter_new(p_names, var, "sigma", k)
+        ls_name = _find_parameter_new(p_names, var, "ls", k)
+        u_raw_name = _find_parameter_new(p_names, var, "u_raw", k)
+        f_innov_name = _find_parameter_new(p_names, var, "f_raw", k)
         
         n_inducing = m_obj.n_inducing
         Z_inducing = spec.params.Z_inducing
+
         kernel_str = m_obj.kernel
         kernel = get_kernel_from_string(kernel_str)
         noise = get(M, :noise, 1e-6)
@@ -423,14 +434,13 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
     noise = get(M, :noise, 1e-6)
 
     for k in 1:outcomes_N
-        domain = "dynamics"
         var = key
 
         if model_type == "advection" || model_type == "diffusion"
-            param_name = model_type == "advection" ? "v" : "d" # v for velocity, d for diffusion
-            rate_name = _find_parameter_new(p_names, domain, key, param_name, k)
-            sigma_name = _find_parameter_new(p_names, domain, var, "sigma", k)
-            innov_name = _find_parameter_new(p_names, domain, var, "innov", k)
+            param_name = model_type == "advection" ? "velocity" : "diffusion"
+            rate_name = _find_parameter_new(p_names, key, param_name, k)
+            sigma_name = _find_parameter_new(p_names, var, "sigma", k)
+            innov_name = _find_parameter_new(p_names, var, "innov", k)
 
             if isempty(rate_name) || isempty(sigma_name) || isempty(innov_name)
                 @warn "Parameters for Dynamics manifold $(key) (model: $(model_type), outcome $(k)) not found. Returning zero-matrix."
@@ -479,10 +489,10 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
             push!(structured_effects, effect_k)
 
         elseif model_type == "advection_diffusion" 
-            v_name = _find_parameter_new(p_names, domain, key, "v", k) 
-            d_name = _find_parameter_new(p_names, domain, key, "d", k) 
-            sigma_name = _find_parameter_new(p_names, domain, key, "sigma", k) 
-            innov_name = _find_parameter_new(p_names, domain, key, "innov", k) 
+            v_name = _find_parameter_new(p_names, key, "velocity", k) 
+            d_name = _find_parameter_new(p_names, key, "diffusion", k) 
+            sigma_name = _find_parameter_new(p_names, key, "sigma", k) 
+            innov_name = _find_parameter_new(p_names, key, "innov", k) 
  
             if isempty(v_name) || isempty(d_name) || isempty(sigma_name) || isempty(innov_name) 
                 @warn "Parameters for advection-diffusion manifold $(key) not found. Returning zero-matrix." 
@@ -520,8 +530,8 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
 
         elseif model_type == "gompertz" || model_type == "logistic_basic"
             # This part of the function is unchanged.
-            r_name = _find_parameter_new(p_names, domain, key, "r", k)
-            K_name = _find_parameter_new(p_names, domain, key, "K", k)
+            r_name = _find_parameter_new(p_names, key, "r", k)
+            K_name = _find_parameter_new(p_names, key, "K", k)
 
             if isempty(r_name) || isempty(K_name)
                 @warn "Parameters for Dynamics manifold $(key) (outcome $(k)) not found. Returning zero-matrix."
@@ -555,54 +565,76 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
 end
 
 
+
+
 function extract_manifold(m_obj::MixedManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    lhs_terms = [strip(t) for t in split(m_obj.lhs, '+')]
-    n_terms = length(lhs_terms)
+    # Purpose: Reconstructs the effect of the MixedManifold.
+    # Rationale: This version is updated to handle both simple (uncorrelated) and
+    #            correlated random effects, matching the logic of the new code generator.
+    # v1.6.0 (2026-07-20)
+    lhs_effects = m_obj.lhs
+    n_terms = length(lhs_effects)
+    var = string(spec.key)
+    n_groups = get(spec.params, :n_cat, 0)
 
     if n_terms == 1
+        # --- Uncorrelated Random Effect ---
         structured_effects = Vector{Matrix{Float64}}()
         for k in 1:outcomes_N
-            domain = string(spec.domain)
-            var = string(spec.key)
-            coeffs_name = _find_parameter_new(p_names, domain, var, "coeffs", k)
-            n_cat = spec.params.n_cat
+            latent_name = _find_parameter_new(p_names, var, "latent", k)
             
-            if isempty(coeffs_name)
+            if isempty(latent_name)
                 @warn "Parameters for Mixed manifold $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, n_cat, n_samples))
+                push!(structured_effects, zeros(Float64, n_groups, n_samples))
                 continue
             end
 
-            coeffs_samples = get_params_vector(chain, coeffs_name, n_cat)
-            effect = coeffs_samples'
-            push!(structured_effects, effect)
+            latent_samples = get_params_vector(chain, latent_name, n_groups)
+            push!(structured_effects, latent_samples')
         end
-        return (type=:simple, effects=structured_effects, lhs=m_obj.lhs, indices=spec.params.indices)
+        return (type=:simple, effects=structured_effects, lhs=lhs_effects[1], indices=spec.params.indices)
     else
+        # --- Correlated Random Effects ---
         correlated_effects = Dict{Symbol, Vector{Matrix{Float64}}}()
-        for k in 1:outcomes_N
-            domain = string(spec.domain)
-            var = string(spec.key)
-            coeffs_name = _find_parameter_new(p_names, domain, var, "coeffs_correlated", k)
-            n_cat = spec.params.n_cat
+        noise = get(M, :noise, 1e-6)
+        inner_model = m_obj.model
 
-            if isempty(coeffs_name)
+        for k in 1:outcomes_N
+            l_corr_name = _find_parameter_new(p_names, var, "L_corr", k)
+            sigma_effects_name = _find_parameter_new(p_names, var, "sigma_effects", k)
+            raw_name = _find_parameter_new(p_names, var, "raw", k)
+
+            if isempty(l_corr_name) || isempty(sigma_effects_name) || isempty(raw_name)
                 @warn "Correlated coefficients for Mixed manifold $(spec.key) (outcome $(k)) not found. Returning zero-matrices."
                 continue
             end
 
-            coeffs_flat = get_params_vector(chain, coeffs_name, n_cat * n_terms)
-            
-            for (i, term) in enumerate(lhs_terms)
+            l_corr_samples = get_params_vector(chain, l_corr_name, n_terms * n_terms)
+            sigma_effects_samples = get_params_vector(chain, sigma_effects_name, n_terms)
+            raw_samples = get_params_vector(chain, raw_name, n_groups * n_terms)
+
+            effects_matrix_k = zeros(n_groups, n_terms, n_samples)
+            for s in 1:n_samples
+                L_corr_s = reshape(l_corr_samples[s, :], n_terms, n_terms)
+                L_effects_t = (Diagonal(sigma_effects_samples[s, :]) * L_corr_s)'
+                
+                L_groups_inv_t = if inner_model isa IID; sparse(I, n_groups, n_groups); else; cholesky(Symmetric(spec.hyper.inner_Q_template + noise * I)).U \ I; end
+                
+                innovations_matrix = reshape(raw_samples[s, :], n_groups, n_terms)
+                effects_matrix_k[:, :, s] = L_groups_inv_t * innovations_matrix * L_effects_t
+            end
+
+            for (i, term) in enumerate(lhs_effects)
                 term_name = term == "1" ? :intercept : Symbol("slope_$(term)")
                 if !haskey(correlated_effects, term_name) correlated_effects[term_name] = [zeros(0,0) for _ in 1:outcomes_N] end
-                term_coeffs = coeffs_flat[:, i:n_terms:end]
-                correlated_effects[term_name][k] = term_coeffs'
+                correlated_effects[term_name][k] = effects_matrix_k[:, i, :]
             end
         end
-        return (type=:correlated, effects=correlated_effects, lhs=m_obj.lhs, indices=spec.params.indices)
+        return (type=:correlated, effects=correlated_effects, lhs=lhs_effects, indices=spec.params.indices)
     end
 end
+
+
 
 
 function extract_manifold(m_obj::Eigen, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
@@ -611,19 +643,18 @@ function extract_manifold(m_obj::Eigen, chain, M, n_samples, outcomes_N, p_names
     #            posterior samples of the Householder parameterization. This version corrects
     #            the order of operations to match the generative model.
     # v1.2.9 (2026-07-17) - Corrected from v1.2.1
-    # Inputs: Standard `extract_manifold` arguments.
+   # Inputs: Standard `extract_manifold` arguments.
     # Outputs: A NamedTuple with the reconstructed effect of all principal components.
     structured_effects = Vector{Matrix{Float64}}()
     key = string(spec.key)
-    domain = string(spec.domain)
     var = string(spec.key)
     
     # Extract parameters from the chain
-    v_raw_name = _find_parameter_new(p_names, domain, var, "v_raw", nothing)
-    d_raw_name = _find_parameter_new(p_names, domain, var, "d_raw", nothing)
-    pca_sds_name = _find_parameter_new(p_names, domain, var, "pca_sds", nothing)
-    pdef_sds_name = _find_parameter_new(p_names, domain, var, "pdef_sds", nothing)
-    factors_name = _find_parameter_new(p_names, domain, var, "factors", nothing)
+    v_raw_name = _find_parameter_new(p_names, var, "v_raw", nothing)
+    d_raw_name = _find_parameter_new(p_names, var, "d_raw", nothing)
+    pca_sds_name = _find_parameter_new(p_names, var, "pca_sds", nothing)
+    pdef_sds_name = _find_parameter_new(p_names, var, "pdef_sds", nothing)
+    factors_name = _find_parameter_new(p_names, var, "factors_flat", nothing)
 
     if isempty(v_raw_name) || isempty(d_raw_name) || isempty(pca_sds_name) || isempty(pdef_sds_name) || isempty(factors_name)
         @warn "Parameters for Eigen manifold $(key) not found. Returning zero-matrix."
@@ -729,7 +760,7 @@ function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes
         for k in 1:outcomes_N
             t_rho_samples = zeros(n_samples)
             if model_st == "IV" && temporal_spec.manifold_obj isa AR1
-                t_rho_name = _find_parameter_new(p_names, "temporal", string(temporal_spec.key), "rho", k)
+                t_rho_name = _find_parameter_new(p_names, string(temporal_spec.key), "rho", k)
                 if !isempty(t_rho_name); t_rho_samples = get_params_vector(chain, t_rho_name, 1)[:, 1]; end
             end
 
@@ -813,12 +844,13 @@ function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes
         all_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
 
         for k in 1:outcomes_N
-            sigma_name = _find_parameter_new(p_names, "interact", key, "sigma", k)
-            rho_name = _find_parameter_new(p_names, "interact", key, "rho", k)
-            coeffs_raw_name = _find_parameter_new(p_names, "interact", key, "coeffs_raw", k)
+            var_name = "interact_$(key)"
+            sigma_name = _find_parameter_new(p_names, var_name, "sigma", k)
+            rho_name = _find_parameter_new(p_names, var_name, "rho", k)
+            coeffs_raw_name = _find_parameter_new(p_names, var_name, "coeffs_raw", k)
 
             if isempty(sigma_name) || isempty(coeffs_raw_name); continue; end
-
+     
             sigma_samples = get_params_vector(chain, sigma_name, 1)
             rho_samples = hasproperty(state_manifold_obj, :rho_prior) ? get_params_vector(chain, rho_name, 1) : nothing
             coeffs_raw_samples = get_params_vector(chain, coeffs_raw_name, n_spatial * n_basis)

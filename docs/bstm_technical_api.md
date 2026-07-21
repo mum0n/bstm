@@ -25,82 +25,82 @@ The manifold system is organized under a hierarchy of abstract types that define
 ### 2.2. `ManifoldModel` Structs
 
 These structs define the specific statistical models for latent fields. Their fields primarily store prior distributions for the model's hyperparameters.
-*   **`sigma_prior`**: A `UnivariateDistribution` that defines the prior for the marginal standard deviation (scale) of the latent field. It controls the overall magnitude of the effect.
-*   **`rho_prior`**: A `UnivariateDistribution` for a correlation or mixing parameter, typically on `[0, 1]`. In `BYM2` or `Leroux` models, it controls the proportion of variance attributed to the structured spatial component. In `AR1` models, it represents the temporal autocorrelation.
-*   **`lengthscale_prior`**: A `UnivariateDistribution` for the lengthscale parameter in continuous Gaussian Process models (`GP`, `RFF`, etc.). It controls the distance over which points are correlated; a larger lengthscale implies a smoother, more global process.
-*   **`kappa_prior`**: A `UnivariateDistribution` for the `kappa` parameter in `SPDE` (Matérn) models, which is inversely related to the lengthscale and controls the smoothness of the field. 
+*   **`sigma`**: A `UnivariateDistribution` that defines the prior for the marginal standard deviation (scale) of the latent field. It controls the overall magnitude of the effect.
+*   **`rho`**: A `UnivariateDistribution` for a correlation or mixing parameter, typically on `[0, 1]`. In `BYM2` or `Leroux` models, it controls the proportion of variance attributed to the structured spatial component. In `AR1` models, it represents the temporal autocorrelation.
+*   **`lengthscale`**: A `UnivariateDistribution` for the lengthscale parameter in continuous Gaussian Process models (`GP`, `RFF`, etc.). It controls the distance over which points are correlated; a larger lengthscale implies a smoother, more global process.
+*   **`kappa`**: A `UnivariateDistribution` for the `kappa` parameter in `SPDE` (Matérn) models, which is inversely related to the lengthscale and controls the smoothness of the field. 
 *   **`n_features` / `nbins`**: An `Int` specifying the number of basis functions (for `RFF`) or bins (for `PSpline`) used in approximation methods.
 *   **`degree` / `diff_order`**: `Int` parameters for spline models, controlling the polynomial degree of the basis functions and the order of the difference penalty for smoothing.
-*   **`pca_sd_prior`**: Prior for the standard deviations of the principal components (latent factors) in `Eigen` models.
-*   **`pdef_sd_prior`**: Prior for the standard deviation of the residual (uniqueness) noise in `Eigen` models.
+*   **`pca_sd`**: Prior for the standard deviations of the principal components (latent factors) in `Eigen` models.
+*   **`pdef_sd`**: Prior for the standard deviation of the residual (uniqueness) noise in `Eigen` models.
 
 ```julia
 # --- Discrete & Graph Primitives ---
-struct IID <: ManifoldModel; sigma_prior::UnivariateDistribution; end
-struct ICAR <: ManifoldModel; sigma_prior::UnivariateDistribution; end
-struct Besag <: ManifoldModel; sigma_prior::UnivariateDistribution; end
+struct IID <: ManifoldModel; sigma::UnivariateDistribution; end
+struct ICAR <: ManifoldModel; sigma::UnivariateDistribution; end
+struct Besag <: ManifoldModel; sigma::UnivariateDistribution; end
 struct BYM2 <: ManifoldModel
-    rho_prior::UnivariateDistribution       # Prior for the mixing parameter between structured and unstructured effects.
-    sigma_prior::UnivariateDistribution     # Prior for the overall spatial standard deviation.
+    rho::UnivariateDistribution       # Prior for the mixing parameter between structured and unstructured effects.
+    sigma::UnivariateDistribution     # Prior for the overall spatial standard deviation.
 end
-struct Leroux <: ManifoldModel; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end # Proper CAR model
-struct SAR <: ManifoldModel; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end # Simultaneous Autoregressive model
+struct Leroux <: ManifoldModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end # Proper CAR model
+struct SAR <: ManifoldModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end # Simultaneous Autoregressive model
 
 # --- Temporal Primitives ---
-struct RW1 <: ManifoldModel; sigma_prior::UnivariateDistribution; end
-struct RW2 <: ManifoldModel; sigma_prior::UnivariateDistribution; end
-struct AR1 <: ManifoldModel; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-struct Cyclic <: ManifoldModel; period::Int; sigma_prior::UnivariateDistribution; end
+struct RW1 <: ManifoldModel; sigma::UnivariateDistribution; end
+struct RW2 <: ManifoldModel; sigma::UnivariateDistribution; end
+struct AR1 <: ManifoldModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end
+struct Cyclic <: ManifoldModel; period::Int; sigma::UnivariateDistribution; end
 struct Harmonic <: ManifoldModel
-    amplitude_prior::UnivariateDistribution
-    phase_prior::UnivariateDistribution
-    sigma_prior::UnivariateDistribution
+    amplitude::UnivariateDistribution
+    phase::UnivariateDistribution
+    sigma::UnivariateDistribution
     period::Union{Real, UnivariateDistribution}
 end
 
 # --- Continuous, Spectral, and Advanced Manifolds ---
 struct GP <: ManifoldModel
-    lengthscale_prior::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}} # Prior for lengthscale(s). Can be a single value for isotropic kernels or a vector for ARD kernels.
-    sigma_prior::UnivariateDistribution     # Prior for the GP's signal variance.
+    lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}} # Prior for lengthscale(s). Can be a single value for isotropic kernels or a vector for ARD kernels.
+    sigma::UnivariateDistribution     # Prior for the GP's signal variance.
     kernel::String                          # Name of the kernel function (e.g., "se", "matern32").
 end
 struct RFF <: ManifoldModel
-    lengthscale_prior::UnivariateDistribution # Prior for the lengthscale of the approximated kernel.
-    sigma_prior::UnivariateDistribution     # Prior for the signal variance.
+    lengthscale::UnivariateDistribution # Prior for the lengthscale of the approximated kernel.
+    sigma::UnivariateDistribution     # Prior for the signal variance.
     n_features::Int                         # Number of random features to use in the approximation.
     kernel::String                          # The kernel being approximated.
 end
-struct FITC <: ManifoldModel; lengthscale_prior::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
-struct SVGP <: ManifoldModel; lengthscale_prior::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
-struct Nystrom <: ManifoldModel; lengthscale_prior::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma_prior::UnivariateDistribution; n_inducing::Int; kernel::String; end
-struct SPDE <: ManifoldModel; sigma_prior::UnivariateDistribution; kappa_prior::UnivariateDistribution; end
-struct FFT <: ManifoldModel; sigma_prior::UnivariateDistribution; nbins::Int; kernel::String; lengthscale_prior::UnivariateDistribution; end
-struct Warp <: ManifoldModel; lengthscale_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; n_features::Int; kernel::String; end
-struct Hyperbolic <: ManifoldModel; curvature::Real; sigma_prior::UnivariateDistribution; end
-struct ExponentialDecay <: ManifoldModel; sigma_prior::UnivariateDistribution; lengthscale_prior::UnivariateDistribution; end
+struct FITC <: ManifoldModel; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma::UnivariateDistribution; n_inducing::Int; kernel::String; end
+struct SVGP <: ManifoldModel; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma::UnivariateDistribution; n_inducing::Int; kernel::String; end
+struct Nystrom <: ManifoldModel; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma::UnivariateDistribution; n_inducing::Int; kernel::String; end
+struct SPDE <: ManifoldModel; sigma::UnivariateDistribution; kappa::UnivariateDistribution; end
+struct FFT <: ManifoldModel; sigma::UnivariateDistribution; nbins::Int; kernel::String; lengthscale::UnivariateDistribution; end
+struct Warp <: ManifoldModel; lengthscale::UnivariateDistribution; sigma::UnivariateDistribution; n_features::Int; kernel::String; end
+struct Hyperbolic <: ManifoldModel; curvature::Real; sigma::UnivariateDistribution; end
+struct ExponentialDecay <: ManifoldModel; sigma::UnivariateDistribution; lengthscale::UnivariateDistribution; end
 
 # --- Spline-based Manifolds ---
-struct PSpline <: ManifoldModel; nbins::Int; degree::Int; diff_order::Int; sigma_prior::UnivariateDistribution; end
-struct BSpline <: ManifoldModel; nbins::Int; degree::Int; sigma_prior::UnivariateDistribution; end
-struct TPS <: ManifoldModel; nbins::Int; sigma_prior::UnivariateDistribution; end
+struct PSpline <: ManifoldModel; nbins::Int; degree::Int; diff_order::Int; sigma::UnivariateDistribution; end
+struct BSpline <: ManifoldModel; nbins::Int; degree::Int; sigma::UnivariateDistribution; end
+struct TPS <: ManifoldModel; nbins::Int; sigma::UnivariateDistribution; end
 
 # --- Specialized & Basis Manifolds ---
-struct Wavelet <: ManifoldModel; family::Symbol; nbins::Int; sigma_prior::UnivariateDistribution; lengthscale_prior::UnivariateDistribution; end
+struct Wavelet <: ManifoldModel; family::Symbol; nbins::Int; sigma::UnivariateDistribution; lengthscale::UnivariateDistribution; end
 struct Eigen <: ManifoldModel
     n_vars::Int                             # Number of input variables for PCA.
     n_factors::Int                          # Number of latent factors to extract.
-    pca_sd_prior::UnivariateDistribution    # Prior for the standard deviations of the principal components.
-    pdef_sd_prior::UnivariateDistribution   # Prior for the standard deviation of the residual (uniqueness) noise.
+    pca_sd::UnivariateDistribution    # Prior for the standard deviations of the principal components.
+    pdef_sd::UnivariateDistribution   # Prior for the standard deviation of the residual (uniqueness) noise.
     ltri_indices::Vector{Int}               # Indices for the lower-triangular part of the Householder reflector matrix.
 end
-struct Moran <: ManifoldModel; sigma_prior::UnivariateDistribution; end
-struct Spherical <: ManifoldModel; sigma_prior::UnivariateDistribution; range_prior::UnivariateDistribution; end
-struct Barycentric <: ManifoldModel; sigma_prior::UnivariateDistribution; end
-struct BCGN <: ManifoldModel; sigma_prior::UnivariateDistribution; bipartite_adj::AbstractMatrix; end
-struct NetworkFlow <: ManifoldModel; sigma_prior::UnivariateDistribution; adjacency_matrix::AbstractMatrix; flow_direction::Symbol; end
-struct LocalAdaptive <: ManifoldModel; rho_prior::UnivariateDistribution; sigma_prior::UnivariateDistribution; end
-struct Mosaic <: ManifoldModel; sigma_prior::UnivariateDistribution; n_regions::Int; end
-struct TensorProductSmooth <: ManifoldModel; sigma_prior::UnivariateDistribution; Q_template::AbstractMatrix; end
+struct Moran <: ManifoldModel; sigma::UnivariateDistribution; end
+struct Spherical <: ManifoldModel; sigma::UnivariateDistribution; range::UnivariateDistribution; end
+struct Barycentric <: ManifoldModel; sigma::UnivariateDistribution; end
+struct BCGN <: ManifoldModel; sigma::UnivariateDistribution; bipartite_adj::AbstractMatrix; end
+struct NetworkFlow <: ManifoldModel; sigma::UnivariateDistribution; adjacency_matrix::AbstractMatrix; flow_direction::Symbol; end
+struct LocalAdaptive <: ManifoldModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end
+struct Mosaic <: ManifoldModel; sigma::UnivariateDistribution; n_regions::Int; end
+struct TensorProductSmooth <: ManifoldModel; sigma::UnivariateDistribution; Q_template::AbstractMatrix; end
 struct DynamicsManifold <: ManifoldModel; model::String; params::Dict{Symbol, Any}; end
 ```
 
@@ -136,7 +136,7 @@ The formula parser translates the user-provided formula string into a structured
     *   **LHS**: Parsed to identify outcome variables and their likelihood specifications (e.g., `likelihood(y, family=poisson)`).
     *   **RHS**: Pre-processed to handle intercept control (`-1`, `0`, `intercept(false)`) and to normalize all bare terms (e.g., `z`) into explicit `fixed(z)` module calls. It is then parsed by `_parse_rhs_expression` into an Abstract Syntax Tree (AST).
     *   v1.2.1 (2026-07-16)
-    *   **Output**: Returns a `NamedTuple` containing `:outcomes`, `:modules` (a dictionary of all parsed RHS terms), `:fixed_effects` (a list of bare variable names parsed from the RHS), `:has_intercept`, and `:intercept_prior`.
+    *   **Output**: Returns a `NamedTuple` containing `:outcomes`, `:modules` (a dictionary of all parsed RHS terms), `:fixed_effects` (a list of bare variable names parsed from the RHS), `:has_intercept`, and `:intercept`.
 
 *   **`_parse_rhs_expression(term_str)`**: A recursive descent parser that respects operator precedence to build the AST for the RHS. The precedence is:
     The parser is called on sub-expressions after the formula has been split by the `+` operator (which has the lowest precedence). The parser then handles operators in the following order of precedence (from highest to lowest):
@@ -171,7 +171,7 @@ The `bstm_config` function is the main engine that transforms the parsed formula
 
 v1.2.1 (2026-07-16)
 *   **`resolve_hyperpriors(...)`**: Implements the three-level precedence for prior specification:
-    1.  **Local**: A prior specified directly in a module call (e.g., `sigma_prior=...`).
+    1.  **Local**: A prior specified directly in a module call (e.g., `sigma=...`).
     2.  **Global**: A prior specified in the `hyperpriors` dictionary passed to `bstm_config`.
     3.  **Scheme**: The default prior from the selected scheme (`:pcpriors`, `:informative`, `:uninformative`).
     It also handles the conversion of PC prior quantile constraints (e.g., `(1.0, 0.05)`) into `Distribution` objects via `create_pc_prior`.
@@ -291,53 +291,53 @@ In addition to the module-specific parameters, the main `@bstm` call accepts gen
 
 ### 8.2. `spatial()` Module
 
-| Manifold             | `model='...'`       | Key Parameters                                      | Default PC-Priors                                               | Use Case & Utility                                                                                     |
-| :---------------------| :--------------------| :----------------------------------------------------| :----------------------------------------------------------------| :-------------------------------------------------------------------------------------------------------|
-| **IID**              | `'iid'`             | `sigma_prior`                                       | `Exponential(1.0)`                                              | Models non-spatial overdispersion or heterogeneity.                                                    |
-| **ICAR / Besag**     | `'icar'`, `'besag'` | `sigma_prior`                                       | `Exponential(1.0)`                                              | Provides strong, localized spatial smoothing for lattice data.                                         |
-| **BYM2**             | `'bym2'`            | `sigma_prior`, `rho_prior`                          | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | The most robust default for areal data; separates spatial clustering from random noise.                |
-| **Leroux**           | `'leroux'`          | `sigma_prior`, `rho_prior`                          | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | A flexible alternative to BYM2 that avoids the rank-deficiency of the ICAR model.                      |
-| **SAR**              | `'sar'`             | `sigma_prior`, `rho_prior`                          | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | Models spatial "spill-over" effects where the value at one location directly influences its neighbors. |
-| **SPDE**             | `'spde'`            | `sigma_prior`, `kappa_prior`                        | `sigma`: `Exponential(1.0)`, `kappa`: `Exponential(1.0)`        | A scalable and principled way to model continuous spatial processes on irregular domains.              |
-| **Gaussian Process** | `'gp'`              | `sigma_prior`, `lengthscale_prior`, `kernel`        | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Gold-standard for continuous spatial modeling but computationally expensive ($O(N^3)$).                |
-| **RFF**              | `'rff'`             | `sigma_prior`, `lengthscale_prior`, `n_features`    | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A scalable approximation to a full GP, excellent for large numbers of areal units.                     |
+| Manifold             | `model='...'`       | Key Parameters                       | Default PC-Priors                                               | Use Case & Utility                                                                                     |
+| :---------------------| :--------------------| :-------------------------------------| :----------------------------------------------------------------| :-------------------------------------------------------------------------------------------------------|
+| **IID**              | `'iid'`             | `sigma`                              | `Exponential(1.0)`                                              | Models non-spatial overdispersion or heterogeneity.                                                    |
+| **ICAR / Besag**     | `'icar'`, `'besag'` | `sigma`                              | `Exponential(1.0)`                                              | Provides strong, localized spatial smoothing for lattice data.                                         |
+| **BYM2**             | `'bym2'`            | `sigma`, `rho`                       | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | The most robust default for areal data; separates spatial clustering from random noise.                |
+| **Leroux**           | `'leroux'`          | `sigma`, `rho`                       | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | A flexible alternative to BYM2 that avoids the rank-deficiency of the ICAR model.                      |
+| **SAR**              | `'sar'`             | `sigma`, `rho`                       | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | Models spatial "spill-over" effects where the value at one location directly influences its neighbors. |
+| **SPDE**             | `'spde'`            | `sigma`, `kappa`                     | `sigma`: `Exponential(1.0)`, `kappa`: `Exponential(1.0)`        | A scalable and principled way to model continuous spatial processes on irregular domains.              |
+| **Gaussian Process** | `'gp'`              | `sigma`, `lengthscale`, `kernel`     | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Gold-standard for continuous spatial modeling but computationally expensive ($O(N^3)$).                |
+| **RFF**              | `'rff'`             | `sigma`, `lengthscale`, `n_features` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A scalable approximation to a full GP, excellent for large numbers of areal units.                     |
 
 ### 8.3. `temporal()` and `seasonal()` Modules
 
-| Manifold              | `model='...'` | Key Parameters                             | Default PC-Priors                                               | Use Case & Utility                                                                                |
-| :----------------------| :--------------| :-------------------------------------------| :----------------------------------------------------------------| :--------------------------------------------------------------------------------------------------|
-| **IID**               | `'iid'`       | `sigma_prior`                              | `Exponential(1.0)`                                              | Models unstructured temporal noise.                                                               |
-| **AR1**               | `'ar1'`       | `sigma_prior`, `rho_prior`                 | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | Modeling serially correlated time series where the influence of past events decays geometrically. |
-| **Random Walk (RW1)** | `'rw1'`       | `sigma_prior`                              | `Exponential(1.0)`                                              | Capturing abrupt changes or step-like trends.                                                     |
-| **Random Walk (RW2)** | `'rw2'`       | `sigma_prior`                              | `Exponential(1.0)`                                              | The most common choice for modeling smooth, non-linear temporal trends.                           |
-| **Gaussian Process**  | `'gp'`        | `sigma_prior`, `lengthscale_prior`         | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Flexible, non-parametric trend modeling.                                                          |
-| **Cyclic**            | `'cyclic'`    | `sigma_prior`, `period`                    | `Exponential(1.0)`                                              | Modeling smooth, periodic effects like day-of-week or month-of-year.                              |
-| **Harmonic**          | `'harmonic'`  | `amplitude_prior`, `phase_prior`, `period` | `amplitude`: `Normal(0,1)`, `phase`: `Beta(1,1)`                | Capturing sharp, regular periodic patterns with sine and cosine waves.                            |
+| Manifold              | `model='...'` | Key Parameters                 | Default PC-Priors                                               | Use Case & Utility                                                                                |
+| :----------------------| :--------------| :-------------------------------| :----------------------------------------------------------------| :--------------------------------------------------------------------------------------------------|
+| **IID**               | `'iid'`       | `sigma`                        | `Exponential(1.0)`                                              | Models unstructured temporal noise.                                                               |
+| **AR1**               | `'ar1'`       | `sigma`, `rho`                 | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | Modeling serially correlated time series where the influence of past events decays geometrically. |
+| **Random Walk (RW1)** | `'rw1'`       | `sigma`                        | `Exponential(1.0)`                                              | Capturing abrupt changes or step-like trends.                                                     |
+| **Random Walk (RW2)** | `'rw2'`       | `sigma`                        | `Exponential(1.0)`                                              | The most common choice for modeling smooth, non-linear temporal trends.                           |
+| **Gaussian Process**  | `'gp'`        | `sigma`, `lengthscale`         | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Flexible, non-parametric trend modeling.                                                          |
+| **Cyclic**            | `'cyclic'`    | `sigma`, `period`              | `Exponential(1.0)`                                              | Modeling smooth, periodic effects like day-of-week or month-of-year.                              |
+| **Harmonic**          | `'harmonic'`  | `amplitude`, `phase`, `period` | `amplitude`: `Normal(0,1)`, `phase`: `Beta(1,1)`                | Capturing sharp, regular periodic patterns with sine and cosine waves.                            |
 
 ### 8.4. `smooth()` Module (Covariate Smoothers)
 
 | Manifold / Method           | `model='...'`    | Key Parameters                    | Default Priors                                                        | Use Case & Utility                                                                             |
 | :----------------------------| :-----------------| :----------------------------------| :----------------------------------------------------------------------| :-----------------------------------------------------------------------------------------------|
-| **P-Spline**                | `'pspline'`      | `nbins`, `degree`, `diff_order`   | `sigma_prior`: `Exponential(1.0)`                                     | The most flexible general-purpose smoother for 1D covariates.                                  |
-| **B-Spline**                | `'bspline'`      | `nbins`, `degree`                 | `sigma_prior`: `Exponential(1.0)`                                     | A simpler spline smoother than P-splines, useful when less regularization is desired.          |
-| **Thin Plate Spline**       | `'tps'`          | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | The classic choice for smoothing 2D spatial coordinates (e.g., `smooth(lon, lat, model=tps)`). |
-| **Random Fourier Features** | `'rff'`          | `n_features`, `lengthscale_prior` | `sigma_prior`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A highly scalable method for approximating a full Gaussian Process smooth.                     |
-| **Random Walk (on bins)**   | `'rw1'`, `'rw2'` | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
+| **P-Spline**                | `'pspline'`      | `nbins`, `degree`, `diff_order`   | `sigma`: `Exponential(1.0)`                                     | The most flexible general-purpose smoother for 1D covariates.                                  |
+| **B-Spline**                | `'bspline'`      | `nbins`, `degree`                 | `sigma`: `Exponential(1.0)`                                     | A simpler spline smoother than P-splines, useful when less regularization is desired.          |
+| **Thin Plate Spline**       | `'tps'`          | `nbins`                           | `sigma`: `Exponential(1.0)`                                     | The classic choice for smoothing 2D spatial coordinates (e.g., `smooth(lon, lat, model=tps)`). |
+| **Random Fourier Features** | `'rff'`          | `n_features`, `lengthscale` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A highly scalable method for approximating a full Gaussian Process smooth.                     |
+| **Random Walk (on bins)**   | `'rw1'`, `'rw2'` | `nbins`                           | `sigma`: `Exponential(1.0)`                                     | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
 
 ### 8.5. `mixed()` Module
 
-| Syntax               | Example Usage                 | Key Parameters | Default Priors                    | Mathematical Assumption                                                                                                                      |
-| :---------------------| :------------------------------| :---------------| :----------------------------------| :---------------------------------------------------------------------------------------------------------------------------------------------|
-| **Random Intercept** | `mixed(1, group_var)`         | `model`        | `sigma_prior`: `Exponential(1.0)` | Assumes each level $j$ of `group_var` has a unique intercept $\alpha_j \sim \mathcal{N}(0, \sigma^2_{\text{group}})$.                        |
-| **Random Slope**     | `mixed(covariate, group_var)` | `model`        | `sigma_prior`: `Exponential(1.0)` | Assumes the effect (slope) of a `covariate` varies across the levels of `group_var`, $\beta_j \sim \mathcal{N}(0, \sigma^2_{\text{slope}})$. |
+| Syntax               | Example Usage                 | Key Parameters | Default Priors              | Mathematical Assumption                                                                                                                      |
+| :---------------------| :------------------------------| :---------------| :----------------------------| :---------------------------------------------------------------------------------------------------------------------------------------------|
+| **Random Intercept** | `mixed(1, group_var)`         | `model`        | `sigma`: `Exponential(1.0)` | Assumes each level $j$ of `group_var` has a unique intercept $\alpha_j \sim \mathcal{N}(0, \sigma^2_{\text{group}})$.                        |
+| **Random Slope**     | `mixed(covariate, group_var)` | `model`        | `sigma`: `Exponential(1.0)` | Assumes the effect (slope) of a `covariate` varies across the levels of `group_var`, $\beta_j \sim \mathcal{N}(0, \sigma^2_{\text{slope}})$. |
 
 ### 8.6. `dynamics()` Module
 
 | Model               | `model='...'`  | Key Parameters                        | Default Priors                                                              |
 | :--------------------| :---------------| :--------------------------------------| :----------------------------------------------------------------------------|
-| **Advection**       | `'advection'`  | `velocity_prior`, `sigma_prior`       | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)`                    |
-| **Diffusion**       | `'diffusion'`  | `diffusion_prior`, `sigma_prior`      | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)`                 |
-| **Logistic Growth** | `'logistic_f'` | `r_prior`, `K_prior`, `sigma_F_prior` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`, `sigma_F`: `Exponential(0.5)` |
+| **Advection**       | `'advection'`  | `velocity`, `sigma`       | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)`                    |
+| **Diffusion**       | `'diffusion'`  | `diffusion`, `sigma`      | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)`                 |
+| **Logistic Growth** | `'logistic_f'` | `r`, `K`, `sigma_F` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`, `sigma_F`: `Exponential(0.5)` |
 
 ### 8.7. `nested()` and `eigen()` Modules
 
@@ -352,12 +352,12 @@ In addition to the module-specific parameters, the main `@bstm` call accepts gen
 
 #### `eigen()` Module Reference
 
-| Keyword / Parameter | Example Usage                    | Data Type      | Default            | Meaning & Assumptions                                                                                                                                                               |
-| :--------------------| :---------------------------------| :---------------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `eigen()`           | `eigen(y1, y2, y3; ...)`         | Module         | N/A                | Defines a Bayesian PCA factor model. The variables listed (e.g., `y1, y2, y3`) are the multivariate outcomes to be decomposed.                                                      |
-| `n_factors`         | `n_factors=1`                    | `Int`          | `1`                | The number of latent factors (principal components) to extract. This determines the dimensionality of the reduced latent space.                                                     |
-| `pca_sd_prior`      | `pca_sd_prior=Exponential(0.5)`  | `Distribution` | `Exponential(1.0)` | The prior for the standard deviations of the principal components (latent factors). These are the "eigenvalues" of the system, controlling the variance explained by each factor.   |
-| `pdef_sd_prior`     | `pdef_sd_prior=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviation of the residual (uniqueness) noise. This captures the variance in each observed variable that is *not* explained by the shared latent factors. |
+| Keyword / Parameter | Example Usage              | Data Type      | Default            | Meaning & Assumptions                                                                                                                                                               |
+| :--------------------| :---------------------------| :---------------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `eigen()`           | `eigen(y1, y2, y3; ...)`   | Module         | N/A                | Defines a Bayesian PCA factor model. The variables listed (e.g., `y1, y2, y3`) are the multivariate outcomes to be decomposed.                                                      |
+| `n_factors`         | `n_factors=1`              | `Int`          | `1`                | The number of latent factors (principal components) to extract. This determines the dimensionality of the reduced latent space.                                                     |
+| `pca_sd`            | `pca_sd=Exponential(0.5)`  | `Distribution` | `Exponential(1.0)` | The prior for the standard deviations of the principal components (latent factors). These are the "eigenvalues" of the system, controlling the variance explained by each factor.   |
+| `pdef_sd`           | `pdef_sd=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviation of the residual (uniqueness) noise. This captures the variance in each observed variable that is *not* explained by the shared latent factors. |
 
 ### 8.8. `fixed()` and `intercept()` Modules
 
