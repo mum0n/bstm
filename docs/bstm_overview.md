@@ -464,7 +464,8 @@ The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm`
 | **Gaussian Process** | `'gp'` | `sigma`, `lengthscale` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Flexible, non-parametric trend modeling. |
 | **RFF** | `'rff'` | `sigma`, `lengthscale`, `n_features` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Scalable GP approximation for long time series. |
 | **Cyclic** | `'cyclic'` | `sigma`, `period` | `Exponential(1.0)` | Modeling smooth, periodic effects like day-of-week or month-of-year. |
-| **Harmonic** | `'harmonic'` | `amplitude`, `phase`, `period` | `amplitude`: `Normal(0,1)`, `phase`: `Beta(1,1)` | Capturing sharp, regular periodic patterns with sine and cosine waves. |
+| **Harmonic**          | `'harmonic'`  | `amplitude`, `phase`, `period` | `amplitude`: `Normal(0,1)`, `phase`: `Beta(1,1)`                | Capturing sharp, regular periodic patterns with sine and cosine waves.                            |
+ 
 
 ### 8.5. `smooth()` Module
 

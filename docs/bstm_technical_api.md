@@ -54,7 +54,6 @@ struct Cyclic <: ManifoldModel; period::Int; sigma::UnivariateDistribution; end
 struct Harmonic <: ManifoldModel
     amplitude::UnivariateDistribution
     phase::UnivariateDistribution
-    sigma::UnivariateDistribution
     period::Union{Real, UnivariateDistribution}
 end
 
@@ -316,13 +315,13 @@ In addition to the module-specific parameters, the main `@bstm` call accepts gen
 
 ### 8.4. `smooth()` Module (Covariate Smoothers)
 
-| Manifold / Method           | `model='...'`    | Key Parameters                    | Default Priors                                                        | Use Case & Utility                                                                             |
-| :----------------------------| :-----------------| :----------------------------------| :----------------------------------------------------------------------| :-----------------------------------------------------------------------------------------------|
-| **P-Spline**                | `'pspline'`      | `nbins`, `degree`, `diff_order`   | `sigma`: `Exponential(1.0)`                                     | The most flexible general-purpose smoother for 1D covariates.                                  |
-| **B-Spline**                | `'bspline'`      | `nbins`, `degree`                 | `sigma`: `Exponential(1.0)`                                     | A simpler spline smoother than P-splines, useful when less regularization is desired.          |
-| **Thin Plate Spline**       | `'tps'`          | `nbins`                           | `sigma`: `Exponential(1.0)`                                     | The classic choice for smoothing 2D spatial coordinates (e.g., `smooth(lon, lat, model=tps)`). |
-| **Random Fourier Features** | `'rff'`          | `n_features`, `lengthscale` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A highly scalable method for approximating a full Gaussian Process smooth.                     |
-| **Random Walk (on bins)**   | `'rw1'`, `'rw2'` | `nbins`                           | `sigma`: `Exponential(1.0)`                                     | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
+| Manifold / Method           | `model='...'`    | Key Parameters                  | Default Priors                                                  | Use Case & Utility                                                                             |
+| :----------------------------| :-----------------| :--------------------------------| :----------------------------------------------------------------| :-----------------------------------------------------------------------------------------------|
+| **P-Spline**                | `'pspline'`      | `nbins`, `degree`, `diff_order` | `sigma`: `Exponential(1.0)`                                     | The most flexible general-purpose smoother for 1D covariates.                                  |
+| **B-Spline**                | `'bspline'`      | `nbins`, `degree`               | `sigma`: `Exponential(1.0)`                                     | A simpler spline smoother than P-splines, useful when less regularization is desired.          |
+| **Thin Plate Spline**       | `'tps'`          | `nbins`                         | `sigma`: `Exponential(1.0)`                                     | The classic choice for smoothing 2D spatial coordinates (e.g., `smooth(lon, lat, model=tps)`). |
+| **Random Fourier Features** | `'rff'`          | `n_features`, `lengthscale`     | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A highly scalable method for approximating a full Gaussian Process smooth.                     |
+| **Random Walk (on bins)**   | `'rw1'`, `'rw2'` | `nbins`                         | `sigma`: `Exponential(1.0)`                                     | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
 
 ### 8.5. `mixed()` Module
 
@@ -333,22 +332,22 @@ In addition to the module-specific parameters, the main `@bstm` call accepts gen
 
 ### 8.6. `dynamics()` Module
 
-| Model               | `model='...'`  | Key Parameters                        | Default Priors                                                              |
-| :--------------------| :---------------| :--------------------------------------| :----------------------------------------------------------------------------|
-| **Advection**       | `'advection'`  | `velocity`, `sigma`       | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)`                    |
-| **Diffusion**       | `'diffusion'`  | `diffusion`, `sigma`      | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)`                 |
-| **Logistic Growth** | `'logistic_f'` | `r`, `K`, `sigma_F` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`, `sigma_F`: `Exponential(0.5)` |
+| Model               | `model='...'`  | Key Parameters       | Default Priors                                                              |
+| :--------------------| :---------------| :---------------------| :----------------------------------------------------------------------------|
+| **Advection**       | `'advection'`  | `velocity`, `sigma`  | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)`                    |
+| **Diffusion**       | `'diffusion'`  | `diffusion`, `sigma` | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)`                 |
+| **Logistic Growth** | `'logistic_f'` | `r`, `K`, `sigma_F`  | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`, `sigma_F`: `Exponential(0.5)` |
 
 ### 8.7. `nested()` and `eigen()` Modules
 
 #### `nested()` Module Reference
 
-| Keyword / Parameter     | Example Usage                                               | Data Type | Default            | Meaning & Assumptions                                                                                                                                                                                                                                 |
-| :------------------------| :------------------------------------------------------------| :----------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `nested()`              | `nested(z_var; ...)`                                        | Module    | N/A                | Defines a supervised sub-model whose latent effect is added to the main model's linear predictor. The `z_var` is a symbolic name for this component.                                                                                                  |
+| Keyword / Parameter     | Example Usage                                                         | Data Type | Default            | Meaning & Assumptions                                                                                                                                                                                                                                 |
+| :------------------------| :----------------------------------------------------------------------| :----------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `nested()`              | `nested(z_var; ...)`                                                  | Module    | N/A                | Defines a supervised sub-model whose latent effect is added to the main model's linear predictor. The `z_var` is a symbolic name for this component.                                                                                                  |
 | `formula`               | `formula="likelihood(z, family=gaussian) ~ intercept() + spatial(s)"` | `String`  | `""`               | A complete `bstm` formula string that defines the structure of the sub-model, including its own likelihood. This sub-model is fit to the specified `data_source`.                                                                                     |
-| `data_source`           | `data_source=proxy_data`                                    | `Symbol`  | `:data`            | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset.                                                                                                      |
-| `rho_nested` (Implicit) | N/A                                                         | `Float`   | `Normal(1.0, 0.5)` | A scaling coefficient that links the sub-model's latent effect to the main model's linear predictor: $\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}$. The prior assumes the sub-model is a good proxy ($\rho \approx 1$). |
+| `data_source`           | `data_source=proxy_data`                                              | `Symbol`  | `:data`            | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset.                                                                                                      |
+| `rho_nested` (Implicit) | N/A                                                                   | `Float`   | `Normal(1.0, 0.5)` | A scaling coefficient that links the sub-model's latent effect to the main model's linear predictor: $\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}$. The prior assumes the sub-model is a good proxy ($\rho \approx 1$). |
 
 #### `eigen()` Module Reference
 
@@ -372,9 +371,9 @@ In addition to the module-specific parameters, the main `@bstm` call accepts gen
 #### `intercept()` Module Reference
 
 | Keyword / Parameter | Example Usage          | Data Type                 | Default        | Meaning & Assumptions                                                                                                                |
-| :--------------------| :-------------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
-| `intercept()`       | `intercept(prior=...)`   | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
-| `prior`             | `prior=Normal(0, 10)`   | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
+| :--------------------| :-----------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
+| `intercept()`       | `intercept(prior=...)` | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
+| `prior`             | `prior=Normal(0, 10)`  | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
 
 
 #### Interaction Effects

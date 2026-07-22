@@ -169,14 +169,14 @@ This allows for a more intuitive and principled way to set priors than choosing 
 
 #### Prior Comparison Table
 
-| Parameter | PC Prior (Default) | Informative Prior | Uninformative Prior | Rationale |
-|:---|:---|:---|:---|:---|
-| **Sigma** ($\sigma$) | `Exponential(λ)` where `λ = -log(α)/U` from `P(σ > U) = α`. A typical default might be `(U=1, α=0.05)`. | `Exponential(0.5)` | `Normal(0, 1e6)` | Controls the marginal standard deviation of a latent field. PC prior shrinks towards zero variance unless data supports a larger scale. |
-| **Rho** ($\rho$) | Transformed `Exponential(λ)` where `λ = log(α)/log(1-U)` from `P(ρ > U) = α`. A typical default might be `(U=0.5, α=0.05)`. | `Beta(2, 2)` | `Uniform(0, 1)` | Controls spatial/temporal correlation. PC prior shrinks towards 0 (no correlation). |
-| **Lengthscale** | Transformed `Exponential(λ)` where `λ = -U*log(α)` from `P(lengthscale < U) = α`. A typical default might be `(U=10, α=0.05)`. | `InverseGamma(5, 5)` | `InverseGamma(0.01, 0.01)` | Controls the range of correlation in continuous GP models. PC prior prevents overfitting by shrinking towards large lengthscales. |
-| **Kappa** ($\kappa$) | `Exponential(λ)` derived from a quantile constraint. | `Exponential(0.1)` | `Exponential(10.0)` | Controls the smoothness of an SPDE/Matérn field. PC prior shrinks towards a smoother field. |
-| **Amplitude** | `Normal(0, 1)` | `Normal(0, 0.5)` | `Normal(0, 100)` | Controls the amplitude of harmonic (seasonal) components. |
-| **Phase** | `Beta(1, 1)` | `Beta(2, 2)` | `Uniform(0, 1)` | Controls the phase shift of harmonic components. |
+| Parameter            | PC Prior (Default)                                                                                                             | Informative Prior    | Uninformative Prior        | Rationale                                                                                                                               |
+| :---------------------| :-------------------------------------------------------------------------------------------------------------------------------| :---------------------| :---------------------------| :----------------------------------------------------------------------------------------------------------------------------------------|
+| **Sigma** ($\sigma$) | `Exponential(λ)` where `λ = -log(α)/U` from `P(σ > U) = α`. A typical default might be `(U=1, α=0.05)`.                        | `Exponential(0.5)`   | `Normal(0, 1e6)`           | Controls the marginal standard deviation of a latent field. PC prior shrinks towards zero variance unless data supports a larger scale. |
+| **Rho** ($\rho$)     | Transformed `Exponential(λ)` where `λ = log(α)/log(1-U)` from `P(ρ > U) = α`. A typical default might be `(U=0.5, α=0.05)`.    | `Beta(2, 2)`         | `Uniform(0, 1)`            | Controls spatial/temporal correlation. PC prior shrinks towards 0 (no correlation).                                                     |
+| **Lengthscale**      | Transformed `Exponential(λ)` where `λ = -U*log(α)` from `P(lengthscale < U) = α`. A typical default might be `(U=10, α=0.05)`. | `InverseGamma(5, 5)` | `InverseGamma(0.01, 0.01)` | Controls the range of correlation in continuous GP models. PC prior prevents overfitting by shrinking towards large lengthscales.       |
+| **Kappa** ($\kappa$) | `Exponential(λ)` derived from a quantile constraint.                                                                           | `Exponential(0.1)`   | `Exponential(10.0)`        | Controls the smoothness of an SPDE/Matérn field. PC prior shrinks towards a smoother field.                                             |
+| **Amplitude**        | `Normal(0, 1)`                                                                                                                 | `Normal(0, 0.5)`     | `Normal(0, 100)`           | Controls the amplitude of harmonic (seasonal) components.                                                                               |
+| **Phase**            | `Beta(1, 1)`                                                                                                                   | `Beta(2, 2)`         | `Uniform(0, 1)`            | Controls the phase shift of harmonic components.                                                                                        |
 
 #### Setting Priors in a Model
 
@@ -493,16 +493,17 @@ The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm`
 
 ### 8.4. `temporal()` and `seasonal()` Modules
 
-| Manifold | `model='...'` | Key Parameters | Default PC-Priors | Use Case & Utility |
-|:---|:---|:---|:---|:---|
-| **IID** | `'iid'` | `sigma_prior` | `Exponential(1.0)` | Models unstructured temporal noise. |
-| **AR1** | `'ar1'` | `sigma_prior`, `rho_prior` | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)` | Modeling serially correlated time series where the influence of past events decays geometrically. |
-| **Random Walk (RW1)** | `'rw1'` | `sigma_prior` | `Exponential(1.0)` | Capturing abrupt changes or step-like trends. |
-| **Random Walk (RW2)** | `'rw2'` | `sigma_prior` | `Exponential(1.0)` | The most common choice for modeling smooth, non-linear temporal trends. |
-| **Gaussian Process** | `'gp'` | `sigma_prior`, `lengthscale_prior` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Flexible, non-parametric trend modeling. |
-| **RFF** | `'rff'` | `sigma_prior`, `lengthscale_prior`, `n_features` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Scalable GP approximation for long time series. |
-| **Cyclic** | `'cyclic'` | `sigma_prior`, `period` | `Exponential(1.0)` | Modeling smooth, periodic effects like day-of-week or month-of-year. |
-| **Harmonic** | `'harmonic'` | `amplitude_prior`, `phase_prior`, `period` | `amplitude`: `Normal(0,1)`, `phase`: `Beta(1,1)` | Capturing sharp, regular periodic patterns with sine and cosine waves. |
+| Manifold              | `model='...'` | Key Parameters                                   | Default PC-Priors                                               | Use Case & Utility                                                                                |
+| :----------------------| :--------------| :-------------------------------------------------| :----------------------------------------------------------------| :--------------------------------------------------------------------------------------------------|
+| **IID**               | `'iid'`       | `sigma_prior`                                    | `Exponential(1.0)`                                              | Models unstructured temporal noise.                                                               |
+| **AR1**               | `'ar1'`       | `sigma_prior`, `rho_prior`                       | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | Modeling serially correlated time series where the influence of past events decays geometrically. |
+| **Random Walk (RW1)** | `'rw1'`       | `sigma_prior`                                    | `Exponential(1.0)`                                              | Capturing abrupt changes or step-like trends.                                                     |
+| **Random Walk (RW2)** | `'rw2'`       | `sigma_prior`                                    | `Exponential(1.0)`                                              | The most common choice for modeling smooth, non-linear temporal trends.                           |
+| **Gaussian Process**  | `'gp'`        | `sigma_prior`, `lengthscale_prior`               | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Flexible, non-parametric trend modeling.                                                          |
+| **RFF**               | `'rff'`       | `sigma_prior`, `lengthscale_prior`, `n_features` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Scalable GP approximation for long time series.                                                   |
+| **Cyclic**            | `'cyclic'`    | `sigma_prior`, `period`                          | `Exponential(1.0)`                                              | Modeling smooth, periodic effects like day-of-week or month-of-year.                              |
+| **Harmonic**          | `'harmonic'`  | `amplitude`, `phase`, `period`                   | `amplitude`: `Normal(0,1)`, `phase`: `Beta(1,1)`                | Capturing sharp, regular periodic patterns with sine and cosine waves.                            |
+
 
 ### 8.5. `smooth()` Module
 
@@ -526,10 +527,10 @@ The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm`
 
 *Note: Direct censoring of covariates in `mixed()` is not supported. See Section 6.5 for the recommended joint modeling approach.*
 
-| Syntax | Example Usage | Key Parameters | Default Priors | Mathematical Assumption |
-|:---|:---|:---|:---|:---|
-| **Random Intercept** | `mixed(1, group_var)` | `model` | `sigma_prior`: `Exponential(1.0)` | Assumes each level $j$ of `group_var` has a unique intercept $\alpha_j \sim \mathcal{N}(0, \sigma^2_{\text{group}})$. |
-| **Random Slope** | `mixed(covariate, group_var)` | `model` | `sigma_prior`: `Exponential(1.0)` | Assumes the effect (slope) of a `covariate` varies across the levels of `group_var`, $\beta_j \sim \mathcal{N}(0, \sigma^2_{\text{slope}})$. |
+| Syntax               | Example Usage                 | Key Parameters | Default Priors                    | Mathematical Assumption                                                                                                                      |
+| :---------------------| :------------------------------| :---------------| :----------------------------------| :---------------------------------------------------------------------------------------------------------------------------------------------|
+| **Random Intercept** | `mixed(1, group_var)`         | `model`        | `sigma_prior`: `Exponential(1.0)` | Assumes each level $j$ of `group_var` has a unique intercept $\alpha_j \sim \mathcal{N}(0, \sigma^2_{\text{group}})$.                        |
+| **Random Slope**     | `mixed(covariate, group_var)` | `model`        | `sigma_prior`: `Exponential(1.0)` | Assumes the effect (slope) of a `covariate` varies across the levels of `group_var`, $\beta_j \sim \mathcal{N}(0, \sigma^2_{\text{slope}})$. |
 
 ### 8.7. `dynamics()` Module
 

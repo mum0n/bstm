@@ -150,6 +150,7 @@ function scottish_lip_cancer_data_spacetime(n_years::Int=10, spatial_expansion::
         [34, 38, 42, 54], [34, 40, 49, 54], [41, 46, 47, 49], [34, 38, 49, 51, 52], [18, 20, 24, 27, 56], [18, 24, 30, 33, 45, 55]
     ]
 
+    
     # Construct and enforce symmetry for adjacency matrix W
     W_raw = spzeros(Int, n_districts, n_districts)
     for i in 1:n_districts
@@ -280,4 +281,123 @@ function scottish_lip_cancer_data_spacetime(n_years::Int=10, spatial_expansion::
 
     return (primary_out, nested_out)
     # (p_set, n_set) = scottish_lip_cancer_data_spacetime();
+end
+
+
+function generate_lgcp_synthetic_data_regular(grid_side=15)
+    Random.seed!(42)
+    s_N = grid_side^2
+    
+    # Create a spatial grid
+    x_coords = repeat(1:grid_side, inner=grid_side)
+    y_coords = repeat(1:grid_side, outer=grid_side)
+    
+    # Generate a smooth latent intensity field Z(s)
+    # Simulating a simple spatial trend + noise
+    Z_true = [2.0 * sin(x/3.0) * cos(y/3.0) for (x, y) in zip(x_coords, y_coords)]
+    
+    # Sample Poisson counts (y_obs) per cell
+    # lambda = exp(Z)
+    y_counts = [rand(Poisson(exp(z))) for z in Z_true]
+    
+    # Prepare the DataFrame
+    # Note: LGCP builder expects y_obs to be pre-aggregated to grid units
+    df = DataFrame(
+        s_idx = 1:s_N,
+        s_x = Float64.(x_coords),
+        s_y = Float64.(y_coords),
+        counts = y_counts
+    )
+    
+    # Adjacency matrix for the grid (Queen contiguity)
+    W = libgeos_lattice_adjacency_matrix(grid_side, grid_side)
+    
+    return df, W, s_N
+end
+
+
+function generate_irregular_lgcp_data(grid_side=10)
+    
+# Executable Demonstration - Irregular Spatial Grid
+# Rationale: Verifies that the model correctly processes varying areas for intensity estimation.
+
+# # 1. Generate Data on a grid where cell sizes vary
+# # Simulate a larger region divided into cells of different sizes
+
+    Random.seed!(99)
+    s_N = grid_side^2
+    
+    x_coords = repeat(1:grid_side, inner=grid_side)
+    y_coords = repeat(1:grid_side, outer=grid_side)
+    
+    # # Heterogeneous Areas: Cells in the center are larger
+    areas = [1.0 + 2.0 * exp(-((x - 5)^2 + (y - 5)^2) / 10.0) for (x, y) in zip(x_coords, y_coords)]
+    
+    # # Smooth latent intensity lambda(s) = 5.0 (constant for this test)
+    Z_true = fill(log(5.0), s_N)
+    
+    # # Observed counts y_s ~ Poisson(lambda_s * Area_s)
+    y_counts = [rand(Poisson(exp(z) * a)) for (z, a) in zip(Z_true, areas)]
+    
+    df = DataFrame(
+        s_idx = 1:s_N,
+        counts = y_counts,
+        cell_area = areas
+    )
+    
+    W = libgeos_lattice_adjacency_matrix(grid_side, grid_side)
+    return df, W, s_N, areas
+end
+
+
+
+
+function prepare_advanced_bstm_data()
+    Random.seed!(123)
+    n_s = 30
+    n_t = 12
+    n_obs = n_s * n_t
+
+    # # Spatial and Temporal coordinates
+    unique_coords = [(rand()*10, rand()*10) for _ in 1:n_s]
+    s_coords = repeat(unique_coords, inner=n_t)
+    s_x = [c[1] for c in s_coords]
+    s_y = [c[2] for c in s_coords]
+    t_v = repeat(collect(1:n_t), outer=n_s)
+    s_idx = repeat(collect(1:n_s), inner=n_t)
+
+    # # Latent signal generation (2D Sine wave + Trend)
+    latent_field = [sin(x/2) * cos(y/2) + 0.1*t for (x, y, t) in zip(s_x, s_y, t_v)]
+
+    # # 1. Multivariate Data (Gaussian + Poisson)
+    y1 = latent_field .+ randn(n_obs) .* 0.2
+    y2 = [rand(Poisson(exp(v))) for v in latent_field]
+
+    # # 2. Multinomial Data (3 Categories)
+    eta_mult = hcat(latent_field, -0.5 .* latent_field, zeros(n_obs))
+    y_mult = zeros(Int, n_obs, 3)
+    for i in 1:n_obs
+        p = softmax(eta_mult[i, :])
+        y_mult[i, :] = rand(Multinomial(20, p))
+    end
+
+    # # 3. Multifidelity Data (Proxy)
+    # # Low-fidelity proxy covers same spatial area but with high noise
+    proxy_y = latent_field .* 0.8 .+ randn(n_obs) .* 0.5
+
+    df = DataFrame(
+        s_idx = s_idx,
+        s_x = s_x,
+        s_y = s_y,
+        year = t_v,
+        month = mod1.(t_v, 12),
+        y_gauss = y1,
+        y_pois = y2,
+        y_cat1 = y_mult[:, 1],
+        y_cat2 = y_mult[:, 2],
+        y_cat3 = y_mult[:, 3],
+        proxy_val = proxy_y
+    )
+
+    return df
 end

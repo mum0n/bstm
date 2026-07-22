@@ -1,3 +1,5 @@
+#!Reference
+
 # ==============================================================================
 # SECTION 1: CORE DATA STRUCTURES AND TYPE DEFINITIONS
 # ==============================================================================
@@ -105,7 +107,11 @@ struct PSpline <: ManifoldModel
     sigma::UnivariateDistribution
 end
 
-struct AR1 <: ManifoldModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end
+struct AR1 <: ManifoldModel
+    rho::UnivariateDistribution
+    sigma::UnivariateDistribution
+end
+
 struct AR2 <: ManifoldModel
     rho1::UnivariateDistribution
     rho2::UnivariateDistribution
@@ -125,15 +131,14 @@ of the code generator uses a more robust two-coefficient parameterization intern
 # Fields
 - `amplitude`: Prior for the amplitude of the wave. (Note: Ignored by the new implementation).
 - `phase`: Prior for the phase shift of the wave. (Note: Ignored by the new implementation).
-- `sigma`: Prior for the overall standard deviation (scale) of the harmonic effect.
 - `period`: The period of the wave, which can be a fixed number or a random variable.
 """
 struct Harmonic <: ManifoldModel
     amplitude::UnivariateDistribution
     phase::UnivariateDistribution
-    sigma::UnivariateDistribution
     period::Union{Real, UnivariateDistribution}
 end
+ 
 
 struct Cyclic <: ManifoldModel; period::Int; sigma::UnivariateDistribution; end
 
@@ -177,6 +182,44 @@ struct NestedManifold <: ManifoldSupervisor
 end
 
 
+# SVAR allows the temporal correlation to vary across space
+struct SVAR <: ManifoldModel
+    rho_spatial::ManifoldModel # The model for the spatial distribution of rho
+    sigma::UnivariateDistribution
+end
+
+# AdaptiveSmooth learns a coordinate transformation via a simple MLP before smoothing
+struct AdaptiveSmooth <: ManifoldModel
+    nbins::Int
+    hidden_dim::Int
+    sigma::UnivariateDistribution
+end
+
+# Threshold Autoregressive (TAR): Implements regime-switching temporal dynamics where model parameters depend on a covariate threshold logic.
+struct TAR <: ManifoldModel
+    threshold_var::Symbol
+    rho_regimes::Vector{UnivariateDistribution}
+    sigma_regimes::Vector{UnivariateDistribution}
+end
+
+# Define LGCP Struct
+# Rationale: LGCP models point patterns by assuming the intensity function lambda(s) 
+# is a realization of a Log-Gaussian process: log(lambda(s)) = Z(s).
+struct LGCP <: ManifoldModel
+    model::ManifoldModel
+    sigma::UnivariateDistribution
+end
+
+struct Kriging <: ManifoldModel
+    lengthscale::UnivariateDistribution
+    sigma::UnivariateDistribution
+    kernel::String
+end
+
+
+
+
+
 abstract type AbstractModelArchitecture end
 struct UnivariateArchitecture <: AbstractModelArchitecture end
 struct MultivariateArchitecture <: AbstractModelArchitecture end
@@ -202,6 +245,28 @@ struct LaplaceFamily <: AbstractBSTM_Family end
 struct ParetoFamily <: AbstractBSTM_Family end
 struct DirichletFamily <: AbstractBSTM_Family end
 struct InverseWishartFamily <: AbstractBSTM_Family end
+
+
+# # Add trait for Dirichlet family
+struct DirichletMultinomialFamily <: AbstractBSTM_Family end
+
+# # Likelihood Kernel for Dirichlet-Multinomial
+# # Rationale: Maps the linear predictor (eta) via softmax to the probability simplex.
+function get_dist_ref(::DirichletMultinomialFamily, d, eta_vec, sig)
+    # # eta_vec is the vector of linear predictors for each category
+    # # Transform to simplex via softmax
+    probs = softmax(eta_vec)
+    # # Total count for the multinomial observation
+    n_total = sum(d.y_obs)
+    return Multinomial(Int(n_total), probs)
+end
+
+# # Specialized bstm_Likelihood method for vector outcomes (Multinomial)
+function bstm_kernel(fam::DirichletMultinomialFamily, ::Uncensored, ::NonZeroInflated, d, eta_vec, sig, y_vec)
+    dist = get_dist_ref(fam, d, eta_vec, sig)
+    return logpdf(dist, y_vec)
+end
+
 
 
 abstract type AbstractZIState end
@@ -338,7 +403,7 @@ const MANIFOLD_CONSTRUCTORS = Dict{Symbol, Function}(
     :fft => (p, params) -> FFT(p.sigma, get(params, :nbins, 20), string(get(params, :kernel, "se")), p.lengthscale),
     :spde => (p, params) -> SPDE(p.sigma, p.kappa),
     :cyclic => (p, params) -> Cyclic(get(params, :period, 12), p.sigma),
-    :harmonic => (p, params) -> Harmonic(p.amplitude, p.phase, p.sigma, get(params, :period, 12.0)),
+    :harmonic => (p, params) -> Harmonic(p.amplitude, p.phase, get(params, :period, 12.0)),
     :pspline => (p, params) -> PSpline(get(params, :nbins, 20), get(params, :degree, 3), get(params, :diff_order, 2), p.sigma),
     :bspline => (p, params) -> BSpline(get(params, :nbins, 10), get(params, :degree, 3), p.sigma),
     :tps => (p, params) -> TPS(get(params, :nbins, 20), p.sigma),
@@ -655,6 +720,45 @@ function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
         if hasproperty(node, :type) && node.type == :operator
             key = "composed_$(length(modules)+1)"
             modules[key] = (module_type = :interact, args = Dict(:operator => node.op, :components => node.children))
+            # --- v1.9.0 (2026-07-21) ---
+            # Rationale: Generate a more descriptive key for composed manifolds to improve
+            #            the readability of generated variable names. Instead of a generic
+            #            "composed_1", the key will reflect the components and operator,
+            #            e.g., "spatial_s_idx_pipe_smooth_time".
+            
+            function _get_composed_node_key_str(n)
+                if hasproperty(n, :type) && n.type == :operator
+                    op_str = string(n.op)
+                    child_keys = [_get_composed_node_key_str(child) for child in n.children]
+                    return join(child_keys, "_$(op_str)_")
+                elseif hasproperty(n, :module_type)
+                    key_parts = [string(n.module_type)]
+                    pos_args = get(n.args, :positional_args, [])
+                    
+                    local primary_vars_str = ""
+                    if n.module_type == :mixed && !isempty(pos_args)
+                        mixed_expr = pos_args[1]
+                        if mixed_expr isa Expr && mixed_expr.head == :call && mixed_expr.args[1] == :|
+                            primary_vars_str = string(mixed_expr.args[3]) # The group variable
+                        elseif length(pos_args) >= 2
+                            primary_vars_str = string(pos_args[2]) # The group variable
+                        else
+                            primary_vars_str = join([string(a) for a in pos_args], "_") # Fallback
+                        end
+                    elseif !isempty(pos_args)
+                        primary_vars_str = join([string(a) for a in pos_args], "_")
+                    end
+                    push!(key_parts, primary_vars_str)
+                    return join(filter(!isempty, key_parts), "_")
+                else
+                    return "unknown"
+                end
+            end
+
+            raw_key = _get_composed_node_key_str(node)
+            sanitized_base_key = _sanitize_variablename(raw_key)
+            module_key = isempty(sanitized_base_key) ? "composed_$(length(modules)+1)" : sanitized_base_key
+            modules[module_key] = (module_type = :interact, args = Dict(:operator => node.op, :components => node.children))
         elseif hasproperty(node, :module_type) && node.module_type in BSTM_MODULE_KEYWORDS
             if node.module_type == :fixed
                 if haskey(node.args, :positional_args)
@@ -966,6 +1070,8 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
     # --- Harmonic Model ---
     names[:beta_cos] = Symbol("$(full_prefix)_beta_cos$(hyperparam_suffix)")
     names[:beta_sin] = Symbol("$(full_prefix)_beta_sin$(hyperparam_suffix)")
+    names[:amplitude] = Symbol("$(full_prefix)_amplitude$(hyperparam_suffix)")
+    names[:phase] = Symbol("$(full_prefix)_phase$(hyperparam_suffix)")
 
     # --- Latent Fields and Innovations ---
     names[:raw] = Symbol("$(full_prefix)_raw$(latent_field_suffix)")
@@ -988,170 +1094,141 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
 end
 
 function _generate_manifold_code_fragments(m::MixedManifold, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
-    # Purpose: Generates Turing code fragments for a MixedManifold (random effect) model.
-    # Rationale: This function ensures that random intercepts and slopes are correctly parameterized,
-    #            supporting both simple uncorrelated effects and complex correlated effects across groups.
-    ### Version 1.9.0 - 2026-07-21 18:30:00
-    ### Technical Descriptor: Reinforced MixedManifold Code Generator
-    
+    # Purpose: Generates Turing code for Random Effects (MixedManifold).
+    # Rationale: Corrects term-level indexing to handle intercept strings and indices safely.
+
     v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
-    
     inner_model = m.model
-    group_var_sym = m.group_var
-    lhs_effects = m.lhs # Vector of effect strings (e.g., ["1", "cov1"])
-    k = length(lhs_effects)
+    group_var = m.group_var
+    lhs_effects = m.lhs
+    k_effects = length(lhs_effects)
     n_groups = get(spec.params, :n_cat, 0)
     
-    is_multivariate = arch == "multivariate"
-    eta_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    index_var = "mixed_idx_$(group_var_sym)"
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    index_var = "mixed_idx_$(group_var)"
 
-    # Generate fragments for the underlying process (e.g., IID, RW2)
-    # These determine how the latent units themselves are structured.
-    inner_frags = _generate_manifold_code_fragments(inner_model, spec, arch, outcome_idx, prefix=prefix)
-    priors_inner = inner_frags.priors
-    update_inner = inner_frags.update
-
-    # The inner model generator adds its own effect application (usually view(latent, idx)).
-    # We remove this line because MixedManifold applies the latent field differently (intercept vs slope).
-    effect_app_regex = Regex("\\s*$(eta_target)\\s*\\.\\+=\\s*.*")
-    update_inner_cleaned = replace(update_inner, effect_app_regex => "")
-
-    if k == 1
-        # --- Standard Uncorrelated Random Effect ---
-        # This handles a single random intercept ("1") or a single random slope.
-        local application_code
-        lhs_str = lhs_effects[1]
+    if k_effects == 1
+        # Uncorrelated Case
+        inner_frags = _generate_manifold_code_fragments(inner_model, spec, arch, outcome_idx, prefix=prefix)
+        update_inner_cleaned = replace(inner_frags.update, Regex("\\s*$(eta_target)\\s*\\.\\+=\\s*.*") => "")
         
-        if lhs_str == "1"
-            application_code = "$(eta_target) .+= view($(v.latent), M.$(index_var))"
+        lhs_str = lhs_effects[1]
+        is_intercept = (lhs_str == "1" || lhs_str == "intercept()")
+        
+        application_code = if is_intercept
+            "$(eta_target) .+= view($(v.latent), M.$(index_var))"
         else
-            cov_sym = Symbol(lhs_str)
-            application_code = "$(eta_target) .+= M.data[!, :$(cov_sym)] .* view($(v.latent), M.$(index_var))"
+            "$(eta_target) .+= M.data[!, :$(Symbol(lhs_str))] .* view($(v.latent), M.$(index_var))"
         end
 
         update_str = """
     begin
-        # Process uncorrelated mixed effect: $(lhs_str) | $(group_var_sym)
+        # Mixed Effect Logic: $(lhs_str) | $(group_var)
         $(update_inner_cleaned)
+        
+        application_code = if is_intercept
+            "$(eta_target) .+= view($(v.latent), M.$(index_var))"
+        else
+            "$(eta_target) .+= M.data[!, :$(Symbol(lhs_str))] .* view($(v.latent), M.$(index_var))"
+        end
         $(application_code)
     end
     """
-        return (priors=priors_inner, update=update_str)
+        return (priors=inner_frags.priors, update=update_str)
 
     else
-        # --- Correlated Random Effects ---
-        # This implements a vector-valued random effect for multiple covariates.
-        # The latent field is a matrix of size [n_groups x k_effects].
-        
+        # Correlated Case (Multivariate Latent)
         priors_acc = String[]
-        # The LKJ prior is for the correlation structure between different random effects.
-        push!(priors_acc, "$(v.L_corr) ~ NamedDist(LKJCholesky($(k), 1.0), :$(v.L_corr))")
-        push!(priors_acc, "$(v.sigma_effects) ~ NamedDist(filldist(Exponential(1.0), $(k)), :$(v.sigma_effects))")
-        
-        # innovations (raw) are sampled as a flat vector and then reshaped.
-        push!(priors_acc, "$(v.raw) ~ NamedDist(MvNormal(zeros(T, $(n_groups * k)), I), :$(v.raw))")
-        
-        priors_final = join(priors_acc, "\n    ")
+        push!(priors_acc, "$(v.L_corr) ~ NamedDist(LKJCholesky($(k_effects), 1.0), :$(v.L_corr))")
+        push!(priors_acc, "$(v.sigma_effects) ~ NamedDist(filldist(Exponential(1.0), $(k_effects)), :$(v.sigma_effects))")
+        push!(priors_acc, "$(v.raw) ~ NamedDist(MvNormal(zeros(T, $(n_groups * k_effects)), I), :$(v.raw))")
 
-        # The group precision matrix determines spatial/temporal structure of the units.
-        local group_chol_logic
+        local group_chol
         if inner_model isa IID
-            group_chol_logic = "L_groups_inv_t = sparse(I, $(n_groups), $(n_groups))"
+            group_chol = "L_groups_inv_t = sparse(I, $(n_groups), $(n_groups))"
         else
-            group_chol_logic = """
+            group_chol = """
         Q_groups = spec_registry[\"$(spec.key)\"].Q_template
         F_groups = cholesky(Symmetric(Q_groups + noise * I))
         L_groups_inv_t = F_groups.U \\\\ I
         """
         end
 
-        # Generate the loop that applies each of the K correlated effects to the predictor.
-        application_loop = String[]
-        push!(application_loop, "for i in 1:$(k)")
-        push!(application_loop, "    effect_vec_i = view(effects_matrix, :, i)")
-        
-        for i in 1:k
+        # Construct dynamic loop over coefficients
+                loop_acc = String[]
+        for i in 1:k_effects
             term = lhs_effects[i]
-            condition = i == 1 ? "if i == 1" : "elseif i == $(i)"
-            if term == "1"
-                push!(application_loop, "    $(condition) # intercept")
-                push!(application_loop, "        $(eta_target) .+= view(effect_vec_i, M.$(index_var))")
+            is_int = (term == "1" || term == "intercept()")
+            
+            header = (i == 1) ? "if i == 1" : "elseif i == $(i)"
+            effect_line = if is_int
+                "$(eta_target) .+= view(effect_vec_i, M.$(index_var))"
             else
-                push!(application_loop, "    $(condition) # slope for $(term)")
-                push!(application_loop, "        $(eta_target) .+= M.data[!, :$(Symbol(term))] .* view(effect_vec_i, M.$(index_var))")
+                "$(eta_target) .+= M.data[!, :$(Symbol(term))] .* view(effect_vec_i, M.$(index_var))"
             end
+            push!(loop_acc, "        $(header) # term: $(term)")
+            push!(loop_acc, "            $(effect_line)")
         end
-        push!(application_loop, "    end")
-        push!(application_loop, "end")
-        application_code = join(application_loop, "\n        ")
 
         update_str = """
     begin
-        # Process correlated mixed effects for group: $(group_var_sym)
-        # 1. Reconstruct correlation operator
+        # Correlated Mixed Effects for Group: $(group_var)
         L_effects_t = (Diagonal($(v.sigma_effects)) * $(v.L_corr).L)'
-        
-        # 2. Reconstruct group-level structure operator
-        $(group_chol_logic)
-        
-        # 3. Project innovations to correlated latent space
-        # vec(X) = (L_effects \\otimes L_groups_inv) vec(Z)
-        innovations_matrix = reshape($(v.raw), $(n_groups), $(k))
+        $(group_chol)
+        innovations_matrix = reshape($(v.raw), $(n_groups), $(k_effects))
         effects_matrix = L_groups_inv_t * innovations_matrix * L_effects_t
-
-        # 4. Map effects to linear predictor
-        $(application_code)
+        
+        for i in 1:$(k_effects)
+            effect_vec_i = view(effects_matrix, :, i)
+$(join(loop_acc, "\n"))
+        end
     end
     """
-        return (priors=priors_final, update=update_str)
+        return (priors=join(priors_acc, "\n    "), update=update_str)
     end
 end
 
 
-function _generate_manifold_code_fragments(m::SVCManifold, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
-    # Purpose: Generates Turing code fragments for a Spatially Varying Coefficient (SVC) model.
-    # Rationale: This function acts as a wrapper. It calls the code generator for its inner
-    #            spatial model (e.g., BYM2, ICAR) to get the priors and the logic for creating
-    #            the latent spatial field. It then modifies the final step, replacing the direct
-    #            addition to `eta` with a multiplication by the specified covariate. This allows
-    #            the coefficient of the covariate to vary across space according to the inner model's structure.
-    # v1.4.1 (2026-07-20)
-    # v1.4.3 (2026-07-20) - Refactored to match safer MixedManifold pattern.
-    
-    v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
-    inner_model = m.model
-    covariate_sym = m.covariate
-    
-    # Use the SVC's own key as a prefix for its internal components to ensure uniqueness.
-    inner_prefix = string(spec.key)
-    inner_frags = _generate_manifold_code_fragments(inner_model, spec, arch, outcome_idx; prefix=prefix)
-    priors_str = inner_frags.priors
-    inner_update_logic = inner_frags.update
-    
-    # This regex is designed to find and remove the final effect application line.
-    # It looks for the `eta_update_target` followed by `.+=` and the rest of the line.
-    eta_update_target = arch == "multivariate" ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    effect_application_regex = Regex("\\s*$(eta_update_target)\\s*\\.\\+=\\s*.*")
-    
-    # Clean the inner logic *before* embedding it.
-    inner_update_logic_cleaned = replace(inner_update_logic, effect_application_regex => "")
 
+function _generate_manifold_code_fragments(m::SVCManifold, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # Purpose: Generates Turing code for Spatially Varying Coefficients (SVC).
+    # Rationale: Ensures covariates are correctly indexed from the DataFrame while 
+    #            preventing invalid indexing if an intercept term is passed as a covariate.
+    # v1.4.1 (2026-07-20) - Corrected intercept handling.
+
+    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
+    inner_model = m.model
+    cov_var = m.covariate
+    
+    # Generate base spatial field logic
+    inner_frags = _generate_manifold_code_fragments(inner_model, spec, arch, outcome_idx, prefix=prefix)
+    priors_str = inner_frags.priors
+    update_inner = inner_frags.update
+
+    # Remove the standard effect application from the inner model
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    effect_app_regex = Regex("\\s*$(eta_target)\\s*\\.\\+=\\s*.*")
+    update_inner_cleaned = replace(update_inner, effect_app_regex => "")
+    
+    # Application Logic: Check if covariate is an intercept indicator
+    is_intercept = (string(cov_var) == "1" || string(cov_var) == "intercept()")
+    
+    application_code = if is_intercept
+        "$(eta_target) .+= view($(v.latent), M.s_idx)"
+    else
+        "$(eta_target) .+= M.data[!, :$(cov_var)] .* view($(v.latent), M.s_idx)"
+    end
     update_str = """
     begin
-        # --- Spatially Varying Coefficient for $(covariate_sym) ---
-        
-        # 1. Generate the spatial field for the coefficient using model: $(typeof(inner_model))
-        $(inner_update_logic_cleaned)
-        
-        # 2. Apply the spatially varying coefficient to the linear predictor.
-        # The effect is `covariate_value * spatial_coefficient`.
-        $(eta_update_target) .+= M.data[!, :$(covariate_sym)] .* view($(v.latent), M.s_idx)
+        # SVC Logic for variable: $(cov_var)
+        $(update_inner_cleaned)
+        $(application_code)
     end
     """
 
     return (priors=priors_str, update=update_str)
 end
+
 
 
 ### Version 1.9.1 - 2026-07-21 23:45:00
@@ -1325,37 +1402,60 @@ function _generate_manifold_code_fragments(m::DynamicsManifold, spec::NamedTuple
     A_op = "spec_registry[\"$(key_str)\"].hyper.A_template"
 
     # Build the evolution logic based on model type
-    local evolution_step
+    local propagator_logic, evolution_step
     if model_type == "advection"
-        evolution_step = "mean_t = dyn_field[:, t-1] - $(velocity_name) .* ($(A_op) * dyn_field[:, t-1])"
+        propagator_logic = "propagator = lu(I(M.s_N) - $(velocity_name) * $(A_op) + noise * I)"
+        evolution_step = "dyn_field[:, t] = propagator \\ (dyn_field[:, t-1] + innov_matrix[:, t])"
+        evolution_step = "dyn_field[:, t] = (propagator \\ dyn_field[:, t-1]) + innov_matrix[:, t]"
     elseif model_type == "diffusion"
-        evolution_step = "mean_t = dyn_field[:, t-1] - $(diffusion_name) .* ($(L_op) * dyn_field[:, t-1])"
+        propagator_logic = "propagator = cholesky(Symmetric(I(M.s_N) - $(diffusion_name) * $(L_op) + noise * I))"
+        evolution_step = "dyn_field[:, t] = propagator \\ (dyn_field[:, t-1] + innov_matrix[:, t])"
+        evolution_step = "dyn_field[:, t] = (propagator \\ dyn_field[:, t-1]) + innov_matrix[:, t]"
     elseif model_type == "advection_diffusion"
-        evolution_step = "mean_t = dyn_field[:, t-1] - $(velocity_name) .* ($(A_op) * dyn_field[:, t-1]) - $(diffusion_name) .* ($(L_op) * dyn_field[:, t-1])"
+        propagator_logic = "propagator = lu(I(M.s_N) - $(velocity_name) * $(A_op) - $(diffusion_name) * $(L_op) + noise * I)"
+        evolution_step = "dyn_field[:, t] = propagator \\ (dyn_field[:, t-1] + innov_matrix[:, t])"
+        evolution_step = "dyn_field[:, t] = (propagator \\ dyn_field[:, t-1]) + innov_matrix[:, t]"
     else
         # Default to a simple random walk if model is unknown
-        evolution_step = "mean_t = dyn_field[:, t-1]"
+        propagator_logic = "propagator = I(M.s_N)"
+        evolution_step = "dyn_field[:, t] = dyn_field[:, t-1] + innov_matrix[:, t]"
     end
 
     update_str = """
     begin
         # Dynamics model: $(model_type) for $(key_str)
+        # This uses an implicit Euler scheme for numerical stability.
+        # This uses an implicit Euler scheme for numerical stability and aligns with the reconstruction logic.
+        
+        # 1. Construct the time-step propagator matrix
+        $(propagator_logic)
+
         dyn_field = zeros(T, M.s_N, M.t_N)
         innov_matrix = reshape($(innov_name), M.s_N, M.t_N)
 
         # Initialize the first time step from a standard normal innovation
         dyn_field[:, 1] = innov_matrix[:, 1] .* $(sigma_name)
+        dyn_field[:, 1] = innov_matrix[:, 1]
 
         # Evolve through time using the state-space equation
+        # u_t = P⁻¹ * (u_{t-1} + innov_t)
+        # u_t = P⁻¹ * u_{t-1} + innov_t
         for t in 2:M.t_N
             $(evolution_step)
-            dyn_field[:, t] = mean_t + innov_matrix[:, t] .* $(sigma_name)
         end
         
         # Flatten the spatiotemporal field and add it to the linear predictor
         # using the pre-computed spatiotemporal index `st_idx`.
         dyn_field_flat = vec(dyn_field)
         $(eta_update_target) .+= view(dyn_field_flat, M.st_idx)
+        # Scale the entire field by sigma
+        dyn_field .*= $(sigma_name)
+
+        # Apply the 2D spatiotemporal field to the linear predictor
+        # using observation-specific spatial and temporal indices.
+        for i in 1:N
+            $(eta_update_target)[i] += dyn_field[M.s_idx[i], M.t_idx[i]]
+        end
     end
     """
     
@@ -1539,8 +1639,10 @@ function _generate_manifold_code_fragments(m::RW1, spec::NamedTuple, arch::Strin
         latent_field_raw = cumsum(innovations)
         
         # Apply sum-to-zero constraint for identifiability
+        # Apply soft sum-to-zero constraint for identifiability
         if $(n_latent) > 0
-            $(v.latent) = (latent_field_raw .- mean(latent_field_raw)) .* $(v.sigma)
+            Turing.@addlogprob! logpdf(Normal(0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            $(v.latent) = latent_field_raw .* $(v.sigma)
             $(eta_update_target) .+= view($(v.latent), M.$(index_var))
         end
     end
@@ -1586,8 +1688,10 @@ function _generate_manifold_code_fragments(m::RW2, spec::NamedTuple, arch::Strin
         end
         
         # Apply sum-to-zero constraint for identifiability
+        # Apply soft sum-to-zero constraint for identifiability
         if $(n_latent) > 0
-            $(v.latent) = (latent_field_raw .- mean(latent_field_raw)) .* $(v.sigma)
+            Turing.@addlogprob! logpdf(Normal(0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            $(v.latent) = latent_field_raw .* $(v.sigma)
             $(eta_update_target) .+= view($(v.latent), M.$(index_var))
         end
     end
@@ -1653,8 +1757,9 @@ function _generate_manifold_code_fragments(m::Union{Besag, ICAR, BCGN}, spec::Na
         F = cholesky(Symmetric(Q_template + noise * I))
         latent_field_raw = F.U \\ $(v.raw)
         
-        # Apply sum-to-zero constraint for identifiability
-        $(v.latent) = (latent_field_raw .- mean(latent_field_raw)) .* $(v.sigma)
+        # Apply soft sum-to-zero constraint for identifiability
+        Turing.@addlogprob! logpdf(Normal(0, 0.001 * $(n_latent)), sum(latent_field_raw))
+        $(v.latent) = latent_field_raw .* $(v.sigma)
         $(eta_update_target) .+= view($(v.latent), M.$(index_var))
     end
     """
@@ -1839,18 +1944,19 @@ function _generate_manifold_code_fragments(m::LocalAdaptive, spec::NamedTuple, a
     is_first_outcome = outcome_idx == 1
     is_shared = get(params, :shared, false)
 
-    # Determine parameter names based on architecture and sharing
-    local sigma_name_str, rho_name_str, latent_raw_name_str, latent_name_str, mu_clusters_raw_name_str, mu_clusters_name_str
+    # Determine parameter names based on architecture and sharing.
+    # Note: mu_clusters_name_str is removed as it's no longer needed with soft centering.
+    local sigma_name_str, rho_name_str, latent_raw_name_str, latent_name_str, mu_clusters_raw_name_str
     if is_multivariate && !is_shared
         sigma_name_str = "$(prefixed_key)_sigma_$(outcome_idx)"
         rho_name_str = "$(prefixed_key)_rho_$(outcome_idx)"
         latent_raw_name_str = "$(prefixed_key)_raw_$(outcome_idx)"
         latent_name_str = "$(prefixed_key)_latent_$(outcome_idx)"
         mu_clusters_raw_name_str = "$(prefixed_key)_mu_clusters_raw_$(outcome_idx)"
-        mu_clusters_name_str = "$(prefixed_key)_mu_clusters_$(outcome_idx)"
     else
         sigma_name_str = "$(prefixed_key)_sigma"
         rho_name_str = "$(prefixed_key)_rho"
+
         mu_clusters_raw_name_str = "$(prefixed_key)_mu_clusters_raw"
         mu_clusters_name_str = "$(prefixed_key)_mu_clusters"
         if is_multivariate
@@ -1885,11 +1991,12 @@ function _generate_manifold_code_fragments(m::LocalAdaptive, spec::NamedTuple, a
     begin
         # LocalAdaptive model for $(key_str)
         
-        # 1. Center the cluster means for identifiability with the global intercept.
-        local $(mu_clusters_name_str) = $(mu_clusters_raw_name_str) .- mean($(mu_clusters_raw_name_str))
+        # 1. Apply soft sum-to-zero constraint on cluster means for identifiability.
+        local n_clusters = spec_registry["$(key_str)"].hyper.n_clusters
+        Turing.@addlogprob! logpdf(Normal(0, 0.001 * n_clusters), sum($(mu_clusters_raw_name_str)))
         
         # 2. Construct the mean vector for the GMRF by mapping cluster means to spatial units.
-        local mean_vector = $(mu_clusters_name_str)[M.cluster_assignments]
+        local mean_vector = $(mu_clusters_raw_name_str)[M.cluster_assignments]
 
         # 3. Recompose the Leroux precision matrix.
         local Q_template = spec_registry["$(key_str)"].Q_template
@@ -1916,12 +2023,13 @@ end
 
 
 
+
 function _generate_manifold_code_fragments(m::BYM2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
     key_str = string(spec.key)
-    prefixed_key = isempty(prefix) ? key_str : "$(prefix)_$(key_str)"
+    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
 
     params = spec.params
-    n_latent = size(spec.Q_template, 1)
+    n_latent = isnothing(spec.Q_template) ? 0 : size(spec.Q_template, 1)
     is_multivariate = arch == "multivariate"
     is_first_outcome = outcome_idx == 1
     is_shared = get(params, :shared, false)
@@ -1933,14 +2041,11 @@ function _generate_manifold_code_fragments(m::BYM2, spec::NamedTuple, arch::Stri
         push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
         push!(priors_acc, "$(v.rho) ~ NamedDist($(_distribution_to_string(m.rho)), :$(v.rho))")
     end
-
-    # Priors for the two latent components (one for each outcome if multivariate)
-    # Structured component (ICAR) - using MvNormalCanon for precision matrix
-    push!(priors_acc, "$(v.struct) ~ NamedDist(MvNormalCanon(zeros(T, $(n_latent)), spec_registry[\"$(key_str)\"].Q_template + noise * I), :$(v.struct))")
-    # Unstructured component (IID) - using MvNormal for covariance matrix
-    push!(priors_acc, "$(v.iid) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.iid))")
     
-    priors_str = join(priors_acc, "\n")
+    # Priors for the raw innovations for the structured and unstructured components.
+    push!(priors_acc, "$(v.struct) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.struct))")
+    push!(priors_acc, "$(v.iid) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.iid))")
+    priors_str = join(priors_acc, "\n    ")
     
     index_var = spec.domain == :spatial ? "s_idx" : string(spec.domain) * "_idx"
     eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
@@ -1950,27 +2055,22 @@ function _generate_manifold_code_fragments(m::BYM2, spec::NamedTuple, arch::Stri
     update_str = """
     begin
         # BYM2 model for $(key_str)
-        
-        # 1. Apply sum-to-zero constraint to the structured component for identifiability.
-        # This ensures the spatial effect's mean is zero, making it identifiable
-        # from the global intercept.
-        $(v.struct)_centered = $(v.struct) .- mean($(v.struct))
-        
-        # 2. Clamp rho for numerical stability before sqrt.
-        rho_clamped = clamp($(v.rho), 0.0, 1.0)
-
-        # 3. Combine structured and unstructured components using Riebler parameterization.
-        # The total spatial effect is a weighted sum of the two components, scaled by the
-        # overall standard deviation `sigma`.
-        $(v.latent) = $(v.sigma) .* (
-            sqrt(rho_clamped) .* $(v.struct)_centered .+ 
-            sqrt(1.0 - rho_clamped) .* $(v.iid)
-        )
-        
-        # 4. Add the final effect to the linear predictor.
-        $(effect_application_str)
+        # 1. Reconstruct the structured (ICAR) component from its raw innovations.
+        local Q_template = spec_registry["$(spec.key)"].Q_template
+        if !isnothing(Q_template) && $(n_latent) > 0
+            local F = cholesky(Symmetric(Matrix(Q_template) + noise * I))
+            local struct_latent = F.U \\ $(v.struct)
+            # 2. Apply soft sum-to-zero constraint for identifiability
+            Turing.@addlogprob! logpdf(Normal(0, 0.001 * $(n_latent)), sum(struct_latent))
+            # 3. Clamp rho for numerical stability before sqrt.
+            local rho_clamped = clamp($(v.rho), 0.0, 1.0)
+            # 4. Combine structured and unstructured components using Riebler parameterization.
+            local bym2_effect = $(v.sigma) .* (sqrt(rho_clamped) .* struct_latent .+ sqrt(1.0 - rho_clamped) .* $(v.iid))
+            # 5. Add the final effect to the linear predictor.
+            $(eta_update_target) .+= view(bym2_effect, M.$(index_var))
+        end
     end
-    """
+    """    
     
     return (priors=priors_str, update=update_str)
 end
@@ -2383,6 +2483,44 @@ function _generate_manifold_code_fragments(m::ExponentialDecay, spec::NamedTuple
     end
     """
     
+    return (priors=priors_str, update=update_str)
+end
+
+
+function _generate_manifold_code_fragments(m::AR2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # Specialized implementation for AR(2) processes using a state-space formulation.
+    v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
+    
+    n_latent = size(spec.Q_template, 1)
+    is_multivariate = arch == "multivariate"
+    is_shared = get(spec.params, :shared, false)
+
+    priors_acc = String[]
+    if !is_multivariate || (is_multivariate && (!is_shared || outcome_idx == 1))
+        push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
+        push!(priors_acc, "$(v.rho1) ~ NamedDist($(_distribution_to_string(m.rho1)), :$(v.rho1))")
+        push!(priors_acc, "$(v.rho2) ~ NamedDist($(_distribution_to_string(m.rho2)), :$(v.rho2))")
+    end
+    push!(priors_acc, "$(v.innov) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.innov))")
+    priors_str = join(priors_acc, "\n")
+
+    eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    index_var = "t_idx"
+
+    update_str = """
+    begin
+        # AR2 state-space evolution for $(spec.key)
+        $(v.latent) = Vector{T}(undef, $(n_latent))
+        
+        if $(n_latent) > 0; $(v.latent)[1] = $(v.innov)[1]; end
+        if $(n_latent) > 1; $(v.latent)[2] = $(v.rho1) * $(v.latent)[1] + $(v.innov)[2]; end
+        for t in 3:$(n_latent)
+            $(v.latent)[t] = $(v.rho1) * $(v.latent)[t-1] + $(v.rho2) * $(v.latent)[t-2] + $(v.innov)[t]
+        end
+        $(v.latent) .*= $(v.sigma)
+        $(eta_update_target) .+= view($(v.latent), M.$(index_var))
+    end
+    """
     return (priors=priors_str, update=update_str)
 end
 
@@ -3030,6 +3168,20 @@ function process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
     data = opt_dict[:data]
     params = mod_data[:params]
     variables = mod_data[:variables]
+    
+    # # Check if this is a specialized point process like LGCP
+    point_process = get(params, :point_process, nothing)
+    
+    if point_process == :lgcp
+        # # Re-tag module type for correct builder dispatch
+        mod_data[:type] = :lgcp
+        # # Ensure the underlying spatial model is specified
+        if !haskey(params, :model)
+            params[:model] = :icar
+            @warn "LGCP point process requested without a model. Defaulting to :icar."
+        end
+    end
+
     if haskey(params, :W)
         w_val = params[:W]
         if w_val isa Expr || w_val isa Symbol
@@ -3043,6 +3195,7 @@ function process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
             opt_dict[:W] = w_val
         end
     end
+    
     if !haskey(opt_dict, :W)
         @warn "Adjacency matrix 'W' not provided for spatial module. Attempting to infer from coordinates."
         if hasproperty(data, :s_x) && hasproperty(data, :s_y)
@@ -3065,6 +3218,30 @@ function process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
             end
         end
     end
+    
+    # # Grid Area Resolution for LGCP
+    if point_process == :lgcp
+        if haskey(params, :grid_areas)
+            ga_val = params[:grid_areas]
+            if ga_val isa Symbol && hasproperty(data, ga_val)
+                opt_dict[:grid_areas] = data[!, ga_val]
+            elseif ga_val isa AbstractVector
+                opt_dict[:grid_areas] = ga_val
+            else
+                # # Fallback to evaluating symbol in calling module
+                calling_mod = get(opt_dict, :calling_module, Main)
+                try
+                    opt_dict[:grid_areas] = Core.eval(calling_mod, ga_val)
+                catch
+                    @warn "Could not resolve grid_areas. Defaulting to unit areas."
+                    opt_dict[:grid_areas] = ones(opt_dict[:s_N])
+                end
+            end
+        else
+            opt_dict[:grid_areas] = ones(opt_dict[:s_N])
+        end
+    end
+
     return true
 end
 
@@ -3629,6 +3806,20 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
             return true
         end
  
+    elseif op == :kronecker_product
+        # Capture custom prior for the interaction sigma if provided via `⊗`
+        if haskey(mod_data[:params], :sigma)
+            prior_val = mod_data[:params][:sigma]
+            calling_mod = get(opt_dict, :calling_module, Main)
+            if prior_val isa Tuple
+                opt_dict[:st_interaction_sigma_prior] = create_pc_prior(:sigma, prior_val)
+            elseif prior_val isa Expr
+                opt_dict[:st_interaction_sigma_prior] = Core.eval(calling_mod, prior_val)
+            else
+                opt_dict[:st_interaction_sigma_prior] = prior_val
+            end
+        end
+
     end
 
     if op == :kronecker_product
@@ -3676,6 +3867,19 @@ function process_spacetime_module!(opt_dict, mod_data, registries, hyperpriors)
     elseif !has_structured_space && has_structured_time; opt_dict[:model_st] = "II";
     elseif has_structured_space && !has_structured_time; opt_dict[:model_st] = "III";
     else opt_dict[:model_st] = "I";
+    end
+
+    # Capture and resolve custom prior for the interaction sigma
+    if haskey(mod_data[:params], :sigma)
+        prior_val = mod_data[:params][:sigma]
+        calling_mod = get(opt_dict, :calling_module, Main)
+        if prior_val isa Tuple
+            opt_dict[:st_interaction_sigma_prior] = create_pc_prior(:sigma, prior_val)
+        elseif prior_val isa Expr
+            opt_dict[:st_interaction_sigma_prior] = Core.eval(calling_mod, prior_val)
+        else
+            opt_dict[:st_interaction_sigma_prior] = prior_val
+        end
     end
     return false # Do not create a separate manifold object
 end
@@ -4107,11 +4311,45 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
         model_sym = Symbol(model_name)
         resolved_priors = resolve_hyperpriors(model_name, priors_dict, m_params, scheme, M[:calling_module])
         if haskey(MANIFOLD_CONSTRUCTORS, model_sym)
-            return MANIFOLD_CONSTRUCTORS[model_sym]
+            return MANIFOLD_CONSTRUCTORS[model_sym](resolved_priors, m_params)
         else
             error("Unknown manifold model '$model_name' for module '$m_type'.")
         end
     end
+end
+
+
+
+function _compute_scaling_factor(evals::Vector{Float64}, rank_deficiency::Int)
+    # Purpose: Computes a robust scaling factor for a precision matrix from its eigenvalues.
+    # Rationale: The scaling factor is the geometric mean of the non-zero eigenvalues.
+    #            This method avoids using a fixed tolerance to identify zero eigenvalues,
+    #            which can be sensitive to floating-point noise. Instead, it uses the known
+    #            rank deficiency of the GMRF model to correctly identify the structural zero
+    #            eigenvalues.
+    # v1.4.5 (2026-07-21)
+    # Inputs:
+    #   - evals: A vector of eigenvalues.
+    #   - rank_deficiency: The known rank deficiency of the precision matrix (e.g., 1 for ICAR, 2 for RW2).
+    # Outputs: The scaling factor.
+    
+    # Sort eigenvalues in ascending order to easily discard the smallest ones.
+    sorted_evals = sort(evals)
+    
+    n = length(sorted_evals)
+    if n <= rank_deficiency
+        return 1.0
+    end
+    
+    # Select the eigenvalues that are not part of the null space.
+    positive_evals = sorted_evals[(rank_deficiency + 1):end]
+    
+    if isempty(positive_evals)
+        return 1.0
+    end
+    
+    # The scaling factor is the geometric mean of the positive eigenvalues.
+    return exp(mean(log.(positive_evals)))
 end
 
 
@@ -4132,14 +4370,14 @@ function build_structure_template(type::Symbol, n::Int; scale=true, W=nothing)
 
     if type == :iid || type == :none || type == :identity || type == :harmonic || type == :rff
         return (matrix = sparse(I(n)), scaling_factor = 1.0)
-    elseif type in [:icar, :besag, :bym2, :leroux, :localadaptive]
+    elseif type in [:icar, :besag, :bym2, :leroux, :localadaptive, :spde]
         if isnothing(W); error("Adjacency matrix W required for manifold :$type"); end
         D_sp = spdiagm(0 => vec(sum(W, dims=2)))
         Q_raw = D_sp - W
         if scale
             evals = eigvals(Matrix(Q_raw))
-            nz_ev = filter(x -> x > 1e-6, evals)
-            sf = isempty(nz_ev) ? 1.0 : exp(mean(log.(nz_ev)))
+            # Intrinsic CAR models on a connected graph have a rank deficiency of 1.
+            sf = _compute_scaling_factor(evals, 1)
             Q = Q_raw ./ sf
         else
             Q = Q_raw
@@ -4148,12 +4386,6 @@ function build_structure_template(type::Symbol, n::Int; scale=true, W=nothing)
         if isnothing(W); error("Adjacency matrix W required for manifold :networkflow"); end
         Q = W
         sf = 1.0
-    elseif type == :spde
-        if isnothing(W); error("Adjacency matrix W required for manifold :$type"); end
-        D_sp = spdiagm(0 => vec(sum(W, dims=2)))
-        Q_raw = D_sp - W
-        if scale; evals = eigvals(Matrix(Q_raw)); nz_ev = filter(x -> x > 1e-6, evals); sf = isempty(nz_ev) ? 1.0 : exp(mean(log.(nz_ev))); Q = Q_raw ./ sf;
-        else; Q = Q_raw; end
     elseif type == :sar
         if isnothing(W); error("Adjacency matrix W required for manifold :sar"); end
         row_sums = sum(W, dims=2)
@@ -4165,17 +4397,26 @@ function build_structure_template(type::Symbol, n::Int; scale=true, W=nothing)
         Q = tril(W, -1)
         sf = 1.0
     elseif type == :rw1
+        # RW1 with Neumann boundary conditions is a proper (non-singular) GMRF.
+        # It has rank deficiency 0.
         Q_raw = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1))
         Q_raw[1,1] = Q_raw[n,n] = 1.0
-        if scale; evals = eigvals(Matrix(Q_raw)); nz_ev = filter(x -> x > 1e-6, evals); sf = isempty(nz_ev) ? 1.0 : exp(mean(log.(nz_ev))); Q = Q_raw ./ sf;
+        if scale
+            evals = eigvals(Matrix(Q_raw))
+            sf = _compute_scaling_factor(evals, 0)
+            Q = Q_raw ./ sf
         else; Q = Q_raw; end
     elseif type == :ar1
         Q = spdiagm(-1 => fill(1.0, n-1), 1 => fill(1.0, n-1))
         sf = 1.0
     elseif type == :rw2
+        # Intrinsic RW2 has a rank deficiency of 2.
         D_rw2 = spdiagm(-2 => ones(n-2), -1 => -2*ones(n-1), 0 => ones(n), 1 => -2*ones(n-1), 2 => ones(n-2))
         Q_raw = D_rw2' * D_rw2
-        if scale; evals = eigvals(Matrix(Q_raw)); nz_ev = filter(x -> x > 1e-6, evals); sf = isempty(nz_ev) ? 1.0 : exp(mean(log.(nz_ev))); Q = Q_raw ./ sf;
+        if scale
+            evals = eigvals(Matrix(Q_raw))
+            sf = _compute_scaling_factor(evals, 2)
+            Q = Q_raw ./ sf
         else; Q = Q_raw; end
     elseif type == :cyclic
 
@@ -4192,9 +4433,8 @@ function build_structure_template(type::Symbol, n::Int; scale=true, W=nothing)
         
         if scale
             evals = eigvals(Matrix(Q_raw))
-            # Filter out the zero eigenvalue for scaling
-            nz_ev = filter(x -> x > 1e-6, evals)
-            sf = isempty(nz_ev) ? 1.0 : exp(mean(log.(nz_ev)))
+            # A cyclic random walk is an intrinsic GMRF with rank deficiency 1.
+            sf = _compute_scaling_factor(evals, 1)
             Q = Q_raw ./ sf
         else
             Q = Q_raw
@@ -5170,59 +5410,31 @@ end
 
 
 """
-    _generate_manifold_code_fragments(m::Harmonic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    _generate_manifold_code_fragments(m::Harmonic, ...)
 
 Generates Turing code fragments for the `Harmonic` manifold.
 
-# Rationale for New Implementation
-The previous implementation incorrectly used a generic IID random effect generator for
-the `Harmonic` manifold, failing to produce any periodic structure. This new, specialized
-function correctly implements a harmonic model.
+# Rationale for v1.8.0 Update
+This function has been rewritten to correctly parameterize the harmonic model based on
+`amplitude` and `phase`, as specified in the struct definition. The previous implementation
+used `sigma` (marginal standard deviation) as the primary parameter, which was inconsistent.
 
-It adopts a two-coefficient parameterization (`beta_cos`, `beta_sin`) which is more
-numerically stable for MCMC sampling than directly sampling amplitude and phase. This
-approach aligns with the description in the `bstm.md` documentation. The model constructs
-the harmonic effect as `sigma * (beta_cos * cos(2πt/T) + beta_sin * sin(2πt/T))`, where
-`sigma` is the scale parameter from the `Harmonic` struct. The `amplitude` and `phase`
-fields from the struct are ignored in favor of this more robust implementation.
+The new implementation samples `amplitude` and `phase` directly from their user-specified
+priors. The internal `beta_cos` and `beta_sin` coefficients are then computed from these
+sampled values, ensuring the model's generative process matches its definition. The `sigma`
+parameter is no longer part of the `Harmonic` struct or its code generation.
 """
 function _generate_manifold_code_fragments(m::Harmonic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
-    key_str = string(spec.key)
-    prefixed_key = isempty(prefix) ? key_str : "$(prefix)_$(key_str)"
     v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
 
     is_multivariate = arch == "multivariate"
     is_shared = get(spec.params, :shared, false)
 
-    # Determine parameter names for the model
-    local sigma_name_str, period_name_str, beta_cos_name_str, beta_sin_name_str
-    if is_multivariate && !is_shared
-        sigma_name_str = "$(prefixed_key)_sigma_$(outcome_idx)"
-        period_name_str = "$(prefixed_key)_period_$(outcome_idx)"
-        beta_cos_name_str = "$(prefixed_key)_beta_cos_$(outcome_idx)"
-        beta_sin_name_str = "$(prefixed_key)_beta_sin_$(outcome_idx)"
-    else
-        sigma_name_str = "$(prefixed_key)_sigma"
-        period_name_str = "$(prefixed_key)_period"
-        beta_cos_name_str = "$(prefixed_key)_beta_cos"
-        beta_sin_name_str = "$(prefixed_key)_beta_sin"
-    end
-
     priors_acc = String[]
-
-    # Priors for the coefficients of the sine and cosine terms.
-    # These are internal to the harmonic model for stability.
-    push!(priors_acc, "$(Symbol(beta_cos_name_str)) ~ NamedDist(Normal(0,1), :$(Symbol(beta_cos_name_str)))")
-    push!(priors_acc, "$(Symbol(beta_sin_name_str)) ~ NamedDist(Normal(0,1), :$(Symbol(beta_sin_name_str)))")
-    push!(priors_acc, "$(v.beta_cos) ~ NamedDist(Normal(0,1), :$(v.beta_cos))")
-    push!(priors_acc, "$(v.beta_sin) ~ NamedDist(Normal(0,1), :$(v.beta_sin))")
-
-    # Priors for sigma and period are shared across outcomes if specified.
     if !is_multivariate || (is_multivariate && (!is_shared || outcome_idx == 1))
-        push!(priors_acc, "$(Symbol(sigma_name_str)) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(Symbol(sigma_name_str)))")
-        push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
+        push!(priors_acc, "$(v.amplitude) ~ NamedDist($(_distribution_to_string(m.amplitude)), :$(v.amplitude))")
+        push!(priors_acc, "$(v.phase) ~ NamedDist($(_distribution_to_string(m.phase)), :$(v.phase))")
         if m.period isa UnivariateDistribution
-            push!(priors_acc, "$(Symbol(period_name_str)) ~ NamedDist($(_distribution_to_string(m.period)), :$(Symbol(period_name_str)))")
             push!(priors_acc, "$(v.period) ~ NamedDist($(_distribution_to_string(m.period)), :$(v.period))")
         end
     end
@@ -5233,28 +5445,66 @@ function _generate_manifold_code_fragments(m::Harmonic, spec::NamedTuple, arch::
     # Harmonic models use the seasonal index `u_idx` by convention.
     index_var = "u_idx" 
     
-    period_val = m.period isa UnivariateDistribution ? period_name_str : m.period
-    period_val = m.period isa UnivariateDistribution ? v.period : m.period
-
     update_str = """
     begin
-        # Harmonic model for $(key_str)
-        # Harmonic model for $(spec.key)
-        # This implements the model as: sigma * (beta_cos * cos(2πt/T) + beta_sin * sin(2πt/T))
+        # Harmonic model for $(spec.key), parameterized by amplitude and phase.
+        # The effect is A*cos(ωt - φ), where φ is the phase shift.
+        local amplitude = $(v.amplitude)
+        local phase_rad = 2.0 * pi * $(v.phase)
+
+        local beta_cos = amplitude * cos(phase_rad)
+        local beta_sin = amplitude * sin(phase_rad)
         
         time_points = M.$(index_var)
-        angle = (2.0 * pi / $(period_val)) .* time_points
+        angle = (2.0 * pi / $(v.period)) .* time_points
         
         cos_term = cos.(angle)
         sin_term = sin.(angle)
         
-        harmonic_effect = ($(beta_cos_name_str) .* cos_term .+ $(beta_sin_name_str) .* sin_term) .* $(sigma_name_str)
-        harmonic_effect = ($(v.beta_cos) .* cos_term .+ $(v.beta_sin) .* sin_term) .* $(v.sigma)
+        local harmonic_effect = beta_cos .* cos_term .+ beta_sin .* sin_term # Note: No extra scaling by sigma
         
         $(eta_update_target) .+= harmonic_effect
     end
     """
     
+    return (priors=priors_str, update=update_str)
+end
+
+
+function _generate_manifold_code_fragments(m::AR2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # Specialized implementation for AR(2) processes using a state-space formulation.
+    v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
+    
+    n_latent = size(spec.Q_template, 1)
+    is_multivariate = arch == "multivariate"
+    is_shared = get(spec.params, :shared, false)
+
+    priors_acc = String[]
+    if !is_multivariate || (is_multivariate && (!is_shared || outcome_idx == 1))
+        push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
+        push!(priors_acc, "$(v.rho1) ~ NamedDist($(_distribution_to_string(m.rho1)), :$(v.rho1))")
+        push!(priors_acc, "$(v.rho2) ~ NamedDist($(_distribution_to_string(m.rho2)), :$(v.rho2))")
+    end
+    push!(priors_acc, "$(v.innov) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.innov))")
+    priors_str = join(priors_acc, "\n")
+
+    eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    index_var = "t_idx"
+
+    update_str = """
+    begin
+        # AR2 state-space evolution for $(spec.key)
+        $(v.latent) = Vector{T}(undef, $(n_latent))
+        
+        if $(n_latent) > 0; $(v.latent)[1] = $(v.innov)[1]; end
+        if $(n_latent) > 1; $(v.latent)[2] = $(v.rho1) * $(v.latent)[1] + $(v.innov)[2]; end
+        for t in 3:$(n_latent)
+            $(v.latent)[t] = $(v.rho1) * $(v.latent)[t-1] + $(v.rho2) * $(v.latent)[t-2] + $(v.innov)[t]
+        end
+        $(v.latent) .*= $(v.sigma)
+        $(eta_update_target) .+= view($(v.latent), M.$(index_var))
+    end
+    """
     return (priors=priors_str, update=update_str)
 end
 
@@ -5576,8 +5826,24 @@ function get_dist_ref(::PoissonFamily, d, eta, sig); return Poisson(clamp(exp(et
 function get_dist_ref(::DirichletFamily, d, eta, sig); error("The Dirichlet likelihood is for compositional outcomes and is not supported in the current univariate response framework."); end
 function get_dist_ref(::InverseWishartFamily, d, eta, sig); error("The Inverse-Wishart likelihood is for covariance matrix outcomes and is not supported in the current univariate response framework."); end
 function get_dist_ref(::GaussianFamily, d, eta, sig); return Normal(eta, max(sig, 1e-9)); end
-function get_dist_ref(::LogNormalFamily, d, eta, sig); return LogNormal(eta, max(sig, 1e-9)); end
-function get_dist_ref(::NegativeBinomialFamily, d, eta, sig); mu = clamp(exp(eta), 1e-9, 1e9); return NegativeBinomial(d.r_nb, d.r_nb/(d.r_nb + mu)); end
+function get_dist_ref(::LogNormalFamily, d, eta, sig)
+    # For a log-normal GLM, the standard log-link models the mean of the response, E[y] = exp(eta).
+    # The LogNormal(μ, σ) distribution has a mean of exp(μ + σ²/2).
+    # To match these, we must set μ = eta - σ²/2. This ensures the model's linear
+    # predictor `eta` correctly corresponds to the log of the expected value of the response.
+    # This also corrects the Jacobian for the transformation from the log-scale predictor
+    # to the response-scale data.
+    μ = eta - (sig^2) / 2.0
+    return LogNormal(μ, max(sig, 1e-9))
+end
+function get_dist_ref(::NegativeBinomialFamily, d, eta, sig)
+    # The mean of the Negative Binomial is modeled on the log scale: μ = exp(eta).
+    # The distribution can be parameterized by its mean (μ) and a dispersion parameter (ϕ),
+    # where the variance is μ + μ²/ϕ. In our framework, `d.r_nb` is this dispersion parameter.
+    # Using the (μ, ϕ) constructor is more direct and numerically stable than converting to the (r, p) parameterization.
+    μ = clamp(exp(eta), 1e-9, 1e9)
+    return NegativeBinomial(μ, d.r_nb)
+end
 function get_dist_ref(::BinomialFamily, d, eta, sig); n = d.trial isa AbstractVector ? d.trial[1] : d.trial; return Binomial(Int(n), logistic(eta)); end
 function get_dist_ref(::GammaFamily, d, eta, sig); alpha = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 1.0; return Gamma(alpha, clamp(exp(eta), 1e-9, 1e9)/alpha); end
 function get_dist_ref(::ExponentialFamily, d, eta, sig); return Exponential(clamp(exp(eta), 1e-9, 1e9)); end
@@ -5614,28 +5880,40 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::Uncensored, zero_inflated::Abst
     dist = get_dist_ref(fam, d, eta, sig)
     
     if zero_inflated isa ZeroInflated
-        log_phi = log(d.phi_zi + 1e-15)
-        log_one_minus_phi = log(1.0 - d.phi_zi + 1e-15)
+        # Numerically stable log-probabilities for the ZI mixture.
+        log_phi = log(d.phi_zi)
+        log_one_minus_phi = log1p(-d.phi_zi)
+        
         if y == 0.0
             if is_discrete_family(fam)
                 logp_base_zero = logpdf(dist, 0.0)
+                # log( P(zero) + (1-P(zero)) * P_base(y=0) )
                 return logsumexp(log_phi, log_one_minus_phi + logp_base_zero)
             else
+                # For continuous distributions, P(y=0) is 0, so the probability of observing 0
+                # comes entirely from the zero-inflation component.
                 return log_phi
             end
         else
+            # log( (1-P(zero)) * P_base(y) )
             return log_one_minus_phi + logpdf(dist, y)
         end
     elseif d.phi_hurdle > -Inf
-        log_phi = log(d.phi_hurdle + 1e-15)
-        log_one_minus_phi = log(1.0 - d.phi_hurdle + 1e-15)
+        # Numerically stable log-probabilities for the hurdle mixture.
+        log_phi = log(d.phi_hurdle)
+        log_one_minus_phi = log1p(-d.phi_hurdle)
+        
         if y <= d.hurdle
+            # Probability of being at or below the hurdle.
             return log_one_minus_phi
         else
+            # Probability of being above the hurdle, from the truncated distribution.
+            # log( P(above) * P_base(y | y > hurdle) )
             logp_truncated = logpdf(dist, y) - logccdf(dist, d.hurdle)
             return log_phi + logp_truncated
         end
     else
+        # Standard non-modified likelihood.
         return logpdf(dist, y)
     end
 end
@@ -5650,17 +5928,19 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::LeftCensored, zero_inflated::Ab
     upper_bound = d.censor_upper isa AbstractVector ? d.censor_upper[1] : d.censor_upper
 
     if zero_inflated isa ZeroInflated
-        log_phi = log(d.phi_zi + 1e-15)
-        log_one_minus_phi = log(1.0 - d.phi_zi + 1e-15)
+        log_phi = log(d.phi_zi)
+        log_one_minus_phi = log1p(-d.phi_zi)
         lp_base = logcdf(dist, upper_bound)
         if upper_bound >= 0.0
+            # P(y <= U) = P(y=0) + P(0 < y <= U) = phi + (1-phi)*P_base(y <= U)
             return logsumexp(log_phi, log_one_minus_phi + lp_base)
         else
+            # If U < 0, the zero component is not included in the interval.
             return log_one_minus_phi + lp_base
         end
     elseif d.phi_hurdle > -Inf
-        log_phi = log(d.phi_hurdle + 1e-15)
-        log_one_minus_phi = log(1.0 - d.phi_hurdle + 1e-15)
+        log_phi = log(d.phi_hurdle)
+        log_one_minus_phi = log1p(-d.phi_hurdle)
         if upper_bound <= d.hurdle
             return log_one_minus_phi
         end
@@ -5684,18 +5964,19 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::RightCensored, zero_inflated::A
     adj_L = is_discrete_family(fam) ? lower_bound - 1.0 : lower_bound
 
     if zero_inflated isa ZeroInflated
-        log_phi = log(d.phi_zi + 1e-15)
-        log_one_minus_phi = log(1.0 - d.phi_zi + 1e-15)
+        log_phi = log(d.phi_zi)
+        log_one_minus_phi = log1p(-d.phi_zi)
         
         log_p_le_L = if lower_bound < 0.0
             log_one_minus_phi + logcdf(dist, lower_bound)
         else
             logsumexp(log_phi, log_one_minus_phi + logcdf(dist, lower_bound))
         end
+        # P(y > L) = 1 - P(y <= L)
         return log1mexp(log_p_le_L)
 
     elseif d.phi_hurdle > -Inf
-        log_phi = log(d.phi_hurdle + 1e-15)
+        log_phi = log(d.phi_hurdle)
         adj_L = is_discrete_family(fam) ? lower_bound - 1.0 : lower_bound
         adj_hurdle = is_discrete_family(fam) ? d.hurdle - 1.0 : d.hurdle
 
@@ -5721,20 +6002,22 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::IntervalCensored, zero_inflated
     adj_L = is_discrete_family(fam) ? lower_bound - 1.0 : lower_bound
 
     if zero_inflated isa ZeroInflated
-        log_p_le_U = if upper_bound < 0.0
-            log(1-d.phi_zi) + logcdf(dist, upper_bound)
-        else
-            logsumexp(log(d.phi_zi), log(1-d.phi_zi) + logcdf(dist, upper_bound))
-        end
-        log_p_le_L = if lower_bound < 0.0
-            log(1-d.phi_zi) + logcdf(dist, lower_bound)
-        else
-            logsumexp(log(d.phi_zi), log(1-d.phi_zi) + logcdf(dist, lower_bound))
-        end
+        log_phi = log(d.phi_zi)
+        log_one_minus_phi = log1p(-d.phi_zi)
+
+        # P(y <= U) for ZI model
+        log_p_le_U = if upper_bound < 0.0; log_one_minus_phi + logcdf(dist, upper_bound);
+        else; logsumexp(log_phi, log_one_minus_phi + logcdf(dist, upper_bound)); end
+
+        # P(y <= L) for ZI model
+        log_p_le_L = if lower_bound < 0.0; log_one_minus_phi + logcdf(dist, lower_bound);
+        else; logsumexp(log_phi, log_one_minus_phi + logcdf(dist, lower_bound)); end
+
+        # P(L < y <= U) = P(y <= U) - P(y <= L)
         return _stable_logsubexp(log_p_le_U, log_p_le_L)
 
     elseif d.phi_hurdle > -Inf
-        log_phi = log(d.phi_hurdle + 1e-15)
+        log_phi = log(d.phi_hurdle)
         adj_L = is_discrete_family(fam) ? lower_bound - 1.0 : lower_bound
         adj_hurdle = is_discrete_family(fam) ? d.hurdle - 1.0 : d.hurdle
 
@@ -5755,6 +6038,75 @@ end
 # ==============================================================================
 # SECTION 9: UTILITY AND HELPER FUNCTIONS
 # ==============================================================================
+### Version 1.9.8 - 2025-05-22 17:00:00
+### Technical Descriptor: Consolidated Inducing Point Selection with KDTree Optimization
+
+function generate_inducing_points(coords::AbstractMatrix, n_inducing::Int; method::String="kmeans", seed::Int=42)
+    # Purpose: Selects a representative subset of coordinates to serve as inducing points for sparse GPs.
+    # Rationale: Inducing points must be actual or representative locations in the input space. 
+    # Systematic methods (quantile/regular) generate ideal targets that are then mapped to the 
+    # nearest available data points using an efficient KDTree search to ensure spatial fidelity.
+
+    n_obs, n_dims = size(coords)
+
+    if n_inducing >= n_obs
+        return coords
+    end
+
+    Random.seed!(seed)
+
+    if method == "random"
+        # Simple stochastic selection
+        selected_idx = StatsBase.sample(1:n_obs, n_inducing, replace=false)
+        return coords[selected_idx, :]
+
+    elseif method == "kmeans"
+        # Centroid-based selection via Clustering.jl
+        # kmeans expects observations in columns: [dims x obs]
+        kmeans_res = Clustering.kmeans(coords', n_inducing; maxiter=200, display=:none)
+        return kmeans_res.centers'
+
+    elseif method == "quantile" || method == "regular"
+        # Systematic mapping methods requiring KDTree for efficiency
+        
+        target_pts = zeros(Float64, n_inducing, n_dims)
+        
+        if method == "quantile"
+            # Density-aware target generation using marginal quantiles
+            probs = range(0.0, stop=1.0, length=n_inducing)
+            for d in 1:n_dims
+                target_pts[:, d] = Statistics.quantile(coords[:, d], probs)
+            end
+        else 
+            # method == "regular"
+            # Grid-like target generation across marginal ranges
+            for d in 1:n_dims
+                v_min, v_max = extrema(coords[:, d])
+                target_pts[:, d] = range(v_min, stop=v_max, length=n_inducing)
+            end
+        end
+
+        # Efficient Nearest Neighbor Search
+        # Build KDTree from the data points
+        tree = KDTree(coords')
+        
+        # Find the single nearest observation for each target coordinate
+        # knn returns (indices, distances)
+        nn_indices_vec, _ = knn(tree, target_pts', 1, true)
+        
+        # Extract the scalar index from each neighbor search result and deduplicate
+        unique_nn_indices = unique([idx_list[1] for idx_list in nn_indices_vec])
+        
+        return coords[unique_nn_indices, :]
+
+    else
+        @warn "Inducing point method '$method' not recognized. Falling back to random selection."
+        selected_idx = StatsBase.sample(1:n_obs, n_inducing, replace=false)
+        return coords[selected_idx, :]
+    end
+end
+ 
+
 
 function _stable_logsubexp(a::Real, b::Real)
     # Purpose: Numerically stable computation of log(exp(a) - exp(b)).
@@ -6431,13 +6783,15 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
             B[mask, m] .= 1.0 .- dist[mask]
         end
 
+
     elseif type == "tps"
+        # The radial basis function for 1D TPS (m=2, d=1) is r^3.
         for m in 1:nbins
-            # The radial basis function for 1D TPS is r = |x - c|.
             r = abs.(vals .- knots[m])
-            B[:, m] .= r
+            B[:, m] .= r.^3
         end
         return B
+
 
         
     elseif type == "rff"
@@ -6460,28 +6814,7 @@ function bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, de
         family = get(kwargs, :family, :db4)
         lengthscale = get(kwargs, :lengthscale, 0.1)
         return bstm_wavelet_basis_1D(vals, nbins, family, lengthscale)
-
-    elseif type == "moran"
-  
-        if isnothing(W)
-            error("The 'moran' basis requires a spatial weights matrix `W` to be provided via keyword argument.")
-        end
-        n = size(W, 1)
-        H = I - (1/n) * ones(n, n)
-        moran_operator = H * Matrix(W) * H
-        eig_result = eigen(Symmetric(moran_operator))
-        
-        # Use the first `nbins` eigenvectors as the basis.
-        # The basis functions are the eigenvectors themselves, evaluated at each spatial unit.
-        # We map these basis functions to the observations via the `vals` which should be spatial indices.
-        eigenvectors = eig_result.vectors[:, (end-nbins+1):end]
-        
-        # Assuming `vals` contains the spatial indices (1 to n) for each observation.
-        if eltype(vals) <: Integer && all(1 .<= vals .<= n)
-            return eigenvectors[vals, :]
-        else
-            error("For `smooth(..., model='moran')`, the input variable must be integer spatial indices.")
-        end
+ 
   
     elseif type == "spherical"
         range_r = get(kwargs, :range, v_std * 2.0)
@@ -6853,38 +7186,7 @@ function bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Int; 
         end
 
     end
-    
-    if type == "moran"
-        # This is a simplified approach for a 2D Moran basis.
-        # It assumes the two coordinate vectors represent indices on a grid.
-        if isnothing(W)
-            @warn "For `smooth(..., model='moran')` in 2D, `W` should be the adjacency matrix of the underlying spatial units. If not provided, a simple lattice adjacency will be assumed."
-            # Assuming coords[:,1] and coords[:,2] are integer indices on a grid
-            n1 = length(unique(coords[:,1]))
-            n2 = length(unique(coords[:,2]))
-            W1 = spdiagm(-1 => ones(n1-1), 1 => ones(n1-1))
-            W2 = spdiagm(-1 => ones(n2-1), 1 => ones(n2-1))
-            W = kron(W2, I(n1)) + kron(I(n2), W1)
-        end
-        
-        n = size(W, 1)
-        H = I - (1/n) * ones(n, n)
-        moran_operator = H * Matrix(W) * H
-        eig_result = eigen(Symmetric(moran_operator))
-        
-        eigenvectors = eig_result.vectors[:, (end-nbins+1):end]
-        
-        # Assuming coords are indices [s_idx1, s_idx2] and we need to map to a single index
-        n_per_dim = Int(round(sqrt(n)))
-        flat_indices = Int.((coords[:,2] .- 1) .* n_per_dim .+ coords[:,1])
-        
-        if all(1 .<= flat_indices .<= n)
-            return eigenvectors[flat_indices, :]
-        else
-            error("For 2D Moran smoother, coordinates must map to valid grid indices.")
-        end
-    end
-
+     
 
     if  type == "invdist"
         B = zeros(Float64, n_obs, nbins)
@@ -7153,9 +7455,9 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
             d2 = coords[:, 2] .- centers[m][2]
             d3 = coords[:, 3] .- centers[m][3]
             d4 = coords[:, 4] .- centers[m][4]
+            # The radial basis function for 4D TPS (m=2, d=4) is log(r).
             r = sqrt.(d1.^2 .+ d2.^2 .+ d3.^2 .+ d4.^2)
-            # The radial basis function for 4D TPS is r^2 * log(r).
-            B[:, m] .= (r.^2) .* log.(r .+ 1e-9)
+            B[:, m] .= log.(r .+ 1e-9)
         end
         return B
 
@@ -7436,6 +7738,11 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
         zi_prior_block = "lik_phi_zi ~ NamedDist(Beta(1,1), :lik_phi_zi)"
     end
 
+    nu_student_t_block = ""
+    if any(f -> string(f) == "student_t", families)
+        nu_student_t_block = "lik_nu_student_t ~ NamedDist(Exponential(1.0), :lik_nu_student_t)"
+    end
+
     sigma_block = ""
     if needs_sigma
         y_sigma_prior_str = _distribution_to_string(Exponential(1.0))
@@ -7445,6 +7752,12 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
             sigma_block = "y_sigma ~ NamedDist($(y_sigma_prior_str), :y_sigma)"
         end
     end
+    
+    extra_params_block = ""
+    # These families require an extra parameter (shape, precision, etc.)
+    if any(f -> string(f) in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"], families)
+        extra_params_block = "lik_extra_params ~ NamedDist(Exponential(1.0), :lik_extra_params)"
+    end
 
     corr_block = is_multivariate ? "L_corr ~ NamedDist(LKJCholesky(K, 1.0), :L_corr)" : ""
 
@@ -7453,6 +7766,8 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
     $(sigma_block)
     $(hurdle_prior_block)
     $(zi_prior_block)
+    $(nu_student_t_block)
+    $(extra_params_block)
     """
 end
 
@@ -7464,6 +7779,8 @@ function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
     
     families = [string(get(spec, :family, "gaussian")) for spec in M.likelihood_specs]
     any_needs_sigma = any(f -> f in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"], families)
+    any_needs_nu = any(f -> f == "student_t", families)
+    any_needs_extra = any(f -> f in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"], families)
 
     if is_multivariate
         kwargs_parts = String[]
@@ -7485,13 +7802,24 @@ function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
         end
         if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle");
         elseif get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
+
+        # Logic to select the correct extra parameter
+        extra_param_logic = if any_needs_nu && any_needs_extra
+            "local extra_p = family_k == \"student_t\" ? lik_nu_student_t : lik_extra_params"
+        elseif any_needs_nu
+            "local extra_p = lik_nu_student_t"
+        elseif any_needs_extra
+            "local extra_p = lik_extra_params"
+        else "" end
+        if !isempty(extra_param_logic); push!(kwargs_parts, "extra_params=extra_p"); end
+
         kwargs_str = join(kwargs_parts, ", ")
 
         return """
         eta = eta_latent * L_corr.L
         for k in 1:K
             family_k = M.likelihood_specs[k][:family]
-            
+            $(extra_param_logic)
             for i in 1:N
                 d_lik = bstm_Likelihood(family_k, T(M.y_obs[i, k]); $(kwargs_str))
                 Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i, k])
@@ -7518,11 +7846,22 @@ function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
         end
         if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle");
         elseif get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
+
+        # Logic to select the correct extra parameter
+        extra_param_logic = if any_needs_nu && any_needs_extra
+            "local extra_p = family == \"student_t\" ? lik_nu_student_t : lik_extra_params"
+        elseif any_needs_nu
+            "local extra_p = lik_nu_student_t"
+        elseif any_needs_extra
+            "local extra_p = lik_extra_params"
+        else "" end
+        if !isempty(extra_param_logic); push!(kwargs_parts, "extra_params=extra_p"); end
+
         kwargs_str = join(kwargs_parts, ", ")
 
         return """
         family = M.likelihood_specs[1][:family] # All outcomes share the same family in univariate case
-        
+        $(extra_param_logic)
         for i in 1:N
             d_lik = bstm_Likelihood(family, T(M.y_obs[i]); $(kwargs_str))
             Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i])
@@ -7620,134 +7959,116 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
     return prior_code, update_code
 end
  
+### Version 2.1.0 - 2025-05-22 20:30:00
+### Technical Descriptor: Reinforced Spatiotemporal Interaction Assembler with Multivariate and Multi-fidelity Logic Support
 
-"""
-    _generate_st_interaction_block(M::NamedTuple, main_spatial_spec, main_temporal_spec, is_multivariate::Bool, eta_name::String)
+# # Spatiotemporal Interaction Assembler
+# # Rationale: Implements Knorr-Held Type IV interaction logic by projecting independent 
+# # standard normal innovations through the Cholesky factors of the marginal spatial 
+# # and temporal precision matrices. Supports univariate and multivariate linear predictors.
 
-Generates Turing code fragments for Knorr-Held spatiotemporal interactions.
-
-# Rationale for Update
-This function has been updated to correctly and completely implement Type IV interactions.
-The previous implementation was only valid for AR1 temporal models and contained a bug
-in its Cholesky factor usage.
-
-The corrected logic is as follows:
-1.  **Type I, II, III**: The implementations for these interaction types were already
-    correct and are preserved.
-2.  **Type IV (AR1 Temporal)**: The state-space evolution for the `AR1` case has been
-    corrected to use the lower Cholesky factor (`C_s.L`) for the spatial transformation,
-    ensuring the mathematical correctness of the non-centered parameterization.
-3.  **Type IV (General Temporal)**: A new code path has been added to handle all other
-    structured temporal models (e.g., `RW1`, `RW2`). This implementation correctly
-    solves the full Kronecker product system `vec(X) = (L_t⁻¹ ⊗ L_s⁻¹) vec(Z)` by
-    using two sequential triangular solves (`C_s.L \\ ...` and `C_t.L \\ ...`),
-    providing a general and efficient solution for any combination of structured
-    spatial and temporal models.
-"""
-function _generate_st_interaction_block(M::NamedTuple, main_spatial_spec, main_temporal_spec, is_multivariate::Bool, eta_name::String)
-    model_st = get(M, :model_st, "none")
-    if model_st == "none"
+function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multivariate::Bool, eta_name::String)
+    # # Technical Audit: Verification of interaction existence
+    if get(M, :model_st, "none") == "none" 
         return ""
     end
- 
-    if isnothing(main_spatial_spec) || isnothing(main_temporal_spec)
-        @warn "Spacetime interaction specified, but could not find both a primary spatial and temporal manifold. Interaction term will be ignored."
+
+    # # Technical Audit: Resource Availability
+    if isnothing(s_spec) || isnothing(t_spec)
+        @warn "Spatiotemporal interaction requested but marginal specifications are missing."
         return ""
     end
- 
-    s_spec = main_spatial_spec
-    t_spec = main_temporal_spec
-    s_is_static = get(s_spec, :is_static, false)
-    t_is_static = get(t_spec, :is_static, false)
+
+    # # Reference keys for registry lookups
+    s_key = string(s_spec.key)
+    t_key = string(t_spec.key)
     
-    is_temporal_ar1 = t_spec.manifold_obj isa AR1
+    # # Precision Factor Retrieval Logic
+    # # If static, use the pre-computed Cholesky factor from the registry.
+    # # If dynamic, perform the decomposition within the model scope using the recomposed precision.
+    
+    s_chol_access = get(s_spec, :is_static, false) ? "spec_registry[\"$s_key\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$s_key\"].Q_template + noise * I))"
+    t_chol_access = get(t_spec, :is_static, false) ? "spec_registry[\"$t_key\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$t_key\"].Q_template + noise * I))"
 
-    local transform_code
-    if model_st == "I"
-        transform_code = "st_inter_k = st_innov_matrix_k .* st_sigma_k"
-    elseif model_st == "II"
-        transform_code = "st_inter_k = transpose(C_t.L \\ transpose(st_innov_matrix_k)) .* st_sigma_k"
-    elseif model_st == "III"
-        transform_code = "st_inter_k = (C_s.L \\ st_innov_matrix_k) .* st_sigma_k"
-    elseif model_st == "IV"
-        if is_temporal_ar1
-            # Use efficient state-space formulation for AR1 temporal models
-            t_rho_name = if is_multivariate && !get(t_spec.params, :shared, false)
-                "$(t_spec.key)_rho_$(outcome_idx)"
-            else
-                "$(t_spec.key)_rho"
-            end
-            transform_code = """
-            t_rho_val = $(t_rho_name)
-            st_inter_k[:, 1] = (C_s.L \\ st_innov_matrix_k[:, 1]) ./ sqrt(1.0 - t_rho_val^2 + noise)
-            for t in 2:M.t_N
-                spatial_innov = C_s.L \\ st_innov_matrix_k[:, t]
-                st_inter_k[:, t] = t_rho_val .* st_inter_k[:, t-1] .+ spatial_innov
-            end
-            st_inter_k .*= st_sigma_k
-            """
-        else
-            # Use general Kronecker product solution for other temporal models (RW1, RW2, etc.)
-            # This is equivalent to X = L_s⁻¹ * Z * (L_t')⁻¹
-            transform_code = """
-            tmp = C_s.L \\ st_innov_matrix_k
-            st_inter_k = transpose(C_t.L \\ transpose(tmp)) .* st_sigma_k
-            """
-        end
-    else
-        return ""
-    end
- 
+    # # Multivariate outcome dimensions
+    K = get(M, :outcomes_N, 1)
+
+    # # Solver Implementation
+    # # Mathematical identity for Type IV: X = L_s^{-T} * Z * L_t^{-1}
+    # # Implemented via backslash solve: C.U \\ Z provides (L')^{-1} * Z
+
     if is_multivariate
-        K = M.outcomes_N
-        return """
-    # Multivariate Spatiotemporal Interaction (Type $(model_st))
-    st_interaction_sigma ~ NamedDist(filldist(Exponential(0.5), $(K)), :st_interaction_sigma)
-    st_interaction_raw_flat ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N * $(K)), I), :st_interaction_raw_flat)
+        interaction_code = """
+    # --- Spatiotemporal Interaction Priors ---
+    local st_sigma_prior_dist_str = haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)"
+    st_interaction_sigma ~ NamedDist(filldist($(st_sigma_prior_dist_str), $K), :st_interaction_sigma)
+    
+    # --- Spatiotemporal Interaction Innovations ---
+    st_interaction_raw ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N * $K), I), :st_interaction_raw)
 
-    let 
-        st_innov_tensor = reshape(st_interaction_raw_flat, M.s_N, M.t_N, $(K))
+    let
+        # # Marginal Cholesky factors
+        C_s = $s_chol_access
+        C_t = $t_chol_access
         
-        C_s = $(s_is_static ? "spec_registry[\"$(s_spec.key)\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$(s_spec.key)\"].Q_template + noise * I))")
-        C_t = $(t_is_static ? "spec_registry[\"$(t_spec.key)\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$(t_spec.key)\"].Q_template + noise * I))")
+        # # Reshape flat innovations into (Spatial x Temporal x Outcome) tensor
+        Z_tensor = reshape(st_interaction_raw, M.s_N, M.t_N, $K)
+        
+        for k in 1:$K
+            # # Extract outcome-specific innovation matrix
+            Z_k = view(Z_tensor, :, :, k)
+            
+            # # Vectorized solve: X_k = L_s^{-T} * Z_k * L_t^{-1}
+            tmp_spatial = C_s.U \\ Z_k
+            st_field_k_unscaled = (transpose(C_t.U \\ transpose(tmp_spatial)))
+            
+            # Apply soft sum-to-zero constraint for identifiability
+            Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_k_unscaled))
+            
+            st_field_k = st_field_k_unscaled .* st_interaction_sigma[k]
 
-        for k in 1:$(K)
-            st_inter_k = zeros(T, M.s_N, M.t_N)
-            st_innov_matrix_k = view(st_innov_tensor, :, :, k)
-            st_sigma_k = st_interaction_sigma[k]
-
-            $(transform_code)
-
-            for i in 1:N; $(eta_name)[i, k] += st_inter_k[M.s_idx[i], M.t_idx[i]]; end
+            # # Apply to multivariate linear predictor
+            for i in 1:N
+                $(eta_name)[i, k] += st_field_k[M.s_idx[i], M.t_idx[i]]
+            end
         end
     end
-"""
-    else # Univariate case
-        univariate_transform_code = replace(transform_code, "st_sigma_k" => "st_interaction_sigma")
-        univariate_transform_code = replace(univariate_transform_code, "st_innov_matrix_k" => "st_innov_matrix")
-        univariate_transform_code = replace(univariate_transform_code, "st_inter_k" => "st_inter")
+    """
+    else
+        interaction_code = """
+    # --- Spatiotemporal Interaction Priors ---
+    local st_sigma_prior_dist_str = haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)"
+    st_interaction_sigma ~ NamedDist($(st_sigma_prior_dist_str), :st_interaction_sigma)
 
-        return """
-    # Univariate Spatiotemporal Interaction (Type $(model_st))
-    st_interaction_sigma ~ NamedDist(Exponential(0.5), :st_interaction_sigma)
     st_interaction_raw ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :st_interaction_raw)
- 
-    let 
-        st_inter = zeros(T, M.s_N, M.t_N)
-        st_innov_matrix = reshape(st_interaction_raw, M.s_N, M.t_N)
+
+    let
+        C_s = $s_chol_access
+        C_t = $t_chol_access
         
-        C_s = $(s_is_static ? "spec_registry[\"$(s_spec.key)\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$(s_spec.key)\"].Q_template + noise * I))")
-        C_t = $(t_is_static ? "spec_registry[\"$(t_spec.key)\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$(t_spec.key)\"].Q_template + noise * I))")
+        Z_matrix = reshape(st_interaction_raw, M.s_N, M.t_N)
+        
+        # # Vectorized solve: X = L_s^{-T} * Z * L_t^{-1}
+        tmp_spatial = C_s.U \\ Z_matrix
+        st_field_unscaled = (transpose(C_t.U \\ transpose(tmp_spatial)))
+        
+        # Apply soft sum-to-zero constraint for identifiability
+        Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_unscaled))
+        
+        st_field = st_field_unscaled .* st_interaction_sigma
 
-        $(univariate_transform_code)
-
-        for i in 1:N; $(eta_name)[i] += st_inter[M.s_idx[i], M.t_idx[i]]; end
+        # # Map field to observation indices
+        for i in 1:N
+            $(eta_name)[i] += st_field[M.s_idx[i], M.t_idx[i]]
+        end
     end
-"""
+    """
     end
+    
+    return interaction_code
 end
 
-
+ 
 
 
 

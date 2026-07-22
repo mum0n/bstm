@@ -186,6 +186,76 @@ function extract_manifold(m_obj::BYM2, chain, M, n_samples, outcomes_N, p_names,
     return (structured=structured_effects, unstructured=unstructured_effects, noisy=noisy_effects)
 end
 
+
+
+function extract_manifold(m_obj::RW1, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    # Purpose: Reconstructs the effect of the RW1 manifold using state-space logic.
+    # Rationale: This specialized method mirrors the state-space code generator for RW1,
+    #            which samples innovations and computes a cumulative sum. This ensures
+    #            consistency between model sampling and posterior reconstruction.
+    # v1.5.1 (2026-07-21)
+    structured_effects = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        var = string(spec.key)
+
+        sigma_name = _find_parameter_new(p_names, var, "sigma", k)
+        innov_name = _find_parameter_new(p_names, var, "innov", k)
+
+        if isempty(sigma_name) || isempty(innov_name)
+            @warn "Parameters for RW1 manifold $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, M.t_N, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innov_name, M.t_N)
+
+        temporal_effect_k = zeros(Float64, M.t_N, n_samples)
+        for j in 1:n_samples
+            latent_field_raw = cumsum(innovations_samples[j, :])
+            # The raw field is already soft-centered by the model's prior.
+            # We scale directly without applying a hard constraint.
+            temporal_effect_k[:, j] = latent_field_raw .* sigma_samples[j]
+        end
+        push!(structured_effects, temporal_effect_k)
+    end
+    return (structured=structured_effects, noisy=structured_effects)
+end
+
+function extract_manifold(m_obj::RW2, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    # Purpose: Reconstructs the effect of the RW2 manifold using state-space logic.
+    # Rationale: This specialized method mirrors the state-space code generator for RW2,
+    #            which uses a second-order difference equation. This ensures consistency
+    #            between model sampling and posterior reconstruction.
+    # v1.5.1 (2026-07-21)
+    structured_effects = Vector{Matrix{Float64}}()
+
+    for k in 1:outcomes_N
+        var = string(spec.key)
+        sigma_name = _find_parameter_new(p_names, var, "sigma", k)
+        innov_name = _find_parameter_new(p_names, var, "innov", k)
+        if isempty(sigma_name) || isempty(innov_name); @warn "Parameters for RW2 manifold $(spec.key) not found."; continue; end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innov_name, M.t_N)
+
+        temporal_effect_k = zeros(Float64, M.t_N, n_samples)
+        for j in 1:n_samples
+            latent_field_raw = Vector{Float64}(undef, M.t_N)
+            if M.t_N > 0; latent_field_raw[1] = innovations_samples[j, 1]; end
+            if M.t_N > 1; latent_field_raw[2] = 2*latent_field_raw[1] + innovations_samples[j, 2]; end
+            for i in 3:M.t_N; latent_field_raw[i] = 2*latent_field_raw[i-1] - latent_field_raw[i-2] + innovations_samples[j, i]; end 
+            # The raw field is already soft-centered by the model's prior.
+            # We scale directly without applying a hard constraint.
+            temporal_effect_k[:, j] = latent_field_raw .* sigma_samples[j]
+        end
+        push!(structured_effects, temporal_effect_k)
+    end
+    return (structured=structured_effects, noisy=structured_effects)
+end
+
+
 function extract_manifold(m_obj::AR1, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     structured_effects = Vector{Matrix{Float64}}()
     noise_val = get(M, :noise, 1e-6)
@@ -222,6 +292,48 @@ function extract_manifold(m_obj::AR1, chain, M, n_samples, outcomes_N, p_names, 
     return (structured=structured_effects, noisy=structured_effects)
 end
 
+function extract_manifold(m_obj::AR2, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+    # Purpose: Reconstructs the effect of the AR2 manifold.
+    # Rationale: This function implements the state-space reconstruction for an AR(2) process,
+    #            mirroring the logic in the code generator to ensure consistency between
+    #            model sampling and posterior summary.
+    # v1.5.0 (2026-07-21)
+    structured_effects = Vector{Matrix{Float64}}()
+    noise_val = get(M, :noise, 1e-6)
+
+    for k in 1:outcomes_N
+        var = string(spec.key)
+
+        sigma_name = _find_parameter_new(p_names, var, "sigma", k)
+        rho1_name = _find_parameter_new(p_names, var, "rho1", k)
+        rho2_name = _find_parameter_new(p_names, var, "rho2", k)
+        innov_name = _find_parameter_new(p_names, var, "innov", k)
+
+        if isempty(sigma_name) || isempty(rho1_name) || isempty(rho2_name) || isempty(innov_name)
+            @warn "Parameters for AR2 manifold $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, M.t_N, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        rho1_samples = get_params_vector(chain, rho1_name, 1)[:, 1]
+        rho2_samples = get_params_vector(chain, rho2_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innov_name, M.t_N)
+
+        temporal_effect_k = zeros(Float64, M.t_N, n_samples)
+        for j in 1:n_samples
+            temporal_field_j = Vector{Float64}(undef, M.t_N)
+            if M.t_N > 0; temporal_field_j[1] = innovations_samples[j, 1]; end
+            if M.t_N > 1; temporal_field_j[2] = rho1_samples[j] * temporal_field_j[1] + innovations_samples[j, 2]; end
+            for i in 3:M.t_N
+                temporal_field_j[i] = rho1_samples[j] * temporal_field_j[i-1] + rho2_samples[j] * temporal_field_j[i-2] + innovations_samples[j, i]
+            end
+            temporal_effect_k[:, j] = temporal_field_j .* sigma_samples[j]
+        end
+        push!(structured_effects, temporal_effect_k)
+    end
+    return (structured=structured_effects, noisy=structured_effects)
+end
 
 function extract_manifold(m_obj::Union{PSpline, BSpline, TPS, FFT, Wavelet, Moran, Spherical, ExponentialDecay, Barycentric}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     basis_key = Symbol(spec.var)
@@ -269,10 +381,10 @@ end
  
 function extract_manifold(m_obj::Harmonic, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     # Purpose: Reconstructs the effect of the Harmonic manifold.
-    # Rationale: This version is updated to match the two-coefficient parameterization
-    #            (`beta_cos`, `beta_sin`) used by the code generator, ensuring correct
-    #            reconstruction of the periodic effect.
-    # v1.6.0 (2026-07-20)
+    # Rationale: This version is updated to match the corrected code generator, which samples
+    #            `amplitude` and `phase` directly. This function reverses that process to
+    #            reconstruct the effect for each posterior sample.
+    # v1.8.0 (2026-07-21)
     structured_effects = Vector{Matrix{Float64}}()
     
     # If the period was a random variable, use its posterior mean for reconstruction.
@@ -284,22 +396,26 @@ function extract_manifold(m_obj::Harmonic, chain, M, n_samples, outcomes_N, p_na
     for k in 1:outcomes_N
         var = string(spec.key)
         
-        sigma_name = _find_parameter_new(p_names, var, "sigma", k)
-        beta_cos_name = _find_parameter_new(p_names, var, "beta_cos", k)
-        beta_sin_name = _find_parameter_new(p_names, var, "beta_sin", k)
+        amplitude_name = _find_parameter_new(p_names, var, "amplitude", k)
+        phase_name = _find_parameter_new(p_names, var, "phase", k)
         
-        if isempty(sigma_name) || isempty(beta_cos_name) || isempty(beta_sin_name)
+        if isempty(amplitude_name) || isempty(phase_name)
             @warn "Parameters for Harmonic manifold $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_tot, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)
-        beta_cos_samples = get_params_vector(chain, beta_cos_name, 1)
-        beta_sin_samples = get_params_vector(chain, beta_sin_name, 1)
+        amplitude_samples = get_params_vector(chain, amplitude_name, 1)[:, 1]
+        phase_samples = get_params_vector(chain, phase_name, 1)[:, 1]
+
+        # Re-derive the internal coefficients from the posterior samples of amplitude and phase
+        phase_rad_samples = 2.0 * pi .* phase_samples
+        
+        beta_cos_samples = amplitude_samples .* cos.(phase_rad_samples)
+        beta_sin_samples = amplitude_samples .* sin.(phase_rad_samples)
 
         angle = (2.0 * pi ./ period_samples') .* u_idx_full
-        effect = (beta_cos_samples' .* cos.(angle) .+ beta_sin_samples' .* sin.(angle)) .* sigma_samples'
+        effect = (beta_cos_samples' .* cos.(angle) .+ beta_sin_samples' .* sin.(angle))
         push!(structured_effects, effect)
     end
 
@@ -307,18 +423,25 @@ function extract_manifold(m_obj::Harmonic, chain, M, n_samples, outcomes_N, p_na
 end
 
 
-function extract_manifold(m_obj::SVCManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    cov_var = m_obj.covariate
-    if !hasproperty(M.data, cov_var)
-        @warn "Covariate $(cov_var) for SVCManifold not found. Returning zero-matrices."
-        return (structured=[zeros(Float64, N_tot, n_samples)], noisy=[zeros(Float64, N_tot, n_samples)])
-    end
 
-    x_svc_train = M.data[!, cov_var]
-    x_svc_full = if !isnothing(PS) && hasproperty(PS.data, cov_var)
-        vcat(x_svc_train, PS.data[!, cov_var])
+function extract_manifold(m_obj::SVCManifold, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot) 
+    cov_var = m_obj.covariate
+    is_intercept = (string(cov_var) == "1" || string(cov_var) == "intercept()")
+
+    local x_svc_full
+    if is_intercept
+        x_svc_full = ones(Float64, N_tot)
     else
-        x_svc_train
+        if !hasproperty(M.data, cov_var)
+            @warn "Covariate $(cov_var) for SVCManifold not found. Returning zero-matrices."
+            return (structured=[zeros(Float64, N_tot, n_samples)], noisy=[zeros(Float64, N_tot, n_samples)])
+        end
+        x_svc_train = M.data[!, cov_var]
+        x_svc_full = if !isnothing(PS) && hasproperty(PS.data, cov_var)
+            vcat(x_svc_train, PS.data[!, cov_var])
+        else
+            x_svc_train
+        end
     end
 
     s_idx_full = if !isnothing(PS)
@@ -326,7 +449,7 @@ function extract_manifold(m_obj::SVCManifold, chain, M, n_samples, outcomes_N, p
     else
         M.s_idx
     end
-
+    
     inner_model = m_obj.model
     inner_spec = (key=spec.key, domain=:spatial, var=spec.var, manifold_obj=inner_model)
     inner_effects = extract_manifold(inner_model, chain, M, n_samples, outcomes_N, p_names, inner_spec, PS, N_tot)
@@ -337,8 +460,8 @@ function extract_manifold(m_obj::SVCManifold, chain, M, n_samples, outcomes_N, p
         
         effect_k = zeros(Float64, N_tot, n_samples)
         for j in 1:n_samples
-            spatial_field_j = spatial_field_k[:, j]
-            effect_k[:, j] = spatial_field_j[s_idx_full] .* x_svc_full
+            spatial_field_j = view(spatial_field_k, :, j)
+            effect_k[:, j] = view(spatial_field_j, s_idx_full) .* x_svc_full
         end
         push!(structured_effects, effect_k)
     end
@@ -476,19 +599,19 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
                 dyn_field[:, 1] = innov_matrix[:, 1]
 
                 # Evolve over time by solving the linear system at each step
-                for t in 2:M.t_N
-                    dyn_field[:, t] = propagator \ dyn_field[:, t-1] + innov_matrix[:, t]
+                for t in 2:M.t_N 
+                    dyn_field[:, t] = (propagator \ dyn_field[:, t-1]) + innov_matrix[:, t]
                 end
                 
                 dyn_field .*= sigma_samples[j]
 
                 for i in 1:N_tot
-                    effect_k[i, j] = dyn_field[s_idx_full[i], t_idx_full[i]]
+                    effect_k[i, j] = dyn_field[s_idx_full[i], t_idx_full[i]] # This is correct.
                 end
             end
             push!(structured_effects, effect_k)
 
-        elseif model_type == "advection_diffusion" 
+        elseif model_type == "advection_diffusion"
             v_name = _find_parameter_new(p_names, key, "velocity", k) 
             d_name = _find_parameter_new(p_names, key, "diffusion", k) 
             sigma_name = _find_parameter_new(p_names, key, "sigma", k) 
@@ -519,7 +642,7 @@ function extract_manifold(m_obj::DynamicsManifold, chain, M, n_samples, outcomes
 
                 dyn_field[:, 1] = innov_matrix[:, 1] 
                 for t in 2:M.t_N 
-                    dyn_field[:, t] = propagator \ dyn_field[:, t-1] + innov_matrix[:, t] 
+                    dyn_field[:, t] = (propagator \ dyn_field[:, t-1]) + innov_matrix[:, t] 
                 end 
                 dyn_field .*= sigma_samples[j] 
                 for i in 1:N_tot 
@@ -757,58 +880,33 @@ function extract_manifold(m_obj::ComposedManifold, chain, M, n_samples, outcomes
 
         all_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
 
+        # This unified solver works for all Knorr-Held interaction types (I, II, III, IV)
+        # because if a component is IID, its Q matrix is Identity, and its Cholesky factor is also Identity,
+        # which makes the corresponding backslash solve an identity operation.
         for k in 1:outcomes_N
-            t_rho_samples = zeros(n_samples)
-            if model_st == "IV" && temporal_spec.manifold_obj isa AR1
-                t_rho_name = _find_parameter_new(p_names, string(temporal_spec.key), "rho", k)
-                if !isempty(t_rho_name); t_rho_samples = get_params_vector(chain, t_rho_name, 1)[:, 1]; end
-            end
-
-            local st_sigma_samples, st_raw_samples
-            if outcomes_N > 1
-                st_sigma_samples = get_params_vector(chain, "st_interaction_sigma", outcomes_N)[:, k]
+            st_sigma_samples = get_params_vector(chain, "st_interaction_sigma", outcomes_N)[:, k]
+            st_raw_samples = if outcomes_N > 1
                 st_raw_flat = get_params_vector(chain, "st_interaction_raw_flat", M.s_N * M.t_N * outcomes_N)
-                st_raw_samples = st_raw_flat[:, (k-1)*M.s_N*M.t_N+1 : k*M.s_N*M.t_N]
+                st_raw_flat[:, (k-1)*M.s_N*M.t_N+1 : k*M.s_N*M.t_N]
             else
-                st_sigma_samples = get_params_vector(chain, "st_interaction_sigma", 1)[:, 1]
-                st_raw_samples = get_params_vector(chain, "st_interaction_raw", M.s_N * M.t_N)
+                get_params_vector(chain, "st_interaction_raw", M.s_N * M.t_N)
             end
 
             st_effect_k = zeros(Float64, N_tot, n_samples)
 
-            if model_st == "I"
-                for j in 1:n_samples
-                    st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
-                    st_inter = st_innov_matrix .* st_sigma_samples[j]
-                    for i in 1:N_tot; st_effect_k[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]; end
-                end
-            elseif model_st == "II"
-                for j in 1:n_samples
-                    st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
-                    st_inter = (C_t.U \ st_innov_matrix')' .* st_sigma_samples[j]
-                    for i in 1:N_tot; st_effect_k[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]; end
-                end
-            elseif model_st == "III"
-                for j in 1:n_samples
-                    st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
-                    st_inter = (C_s.U \ st_innov_matrix) .* st_sigma_samples[j]
-                    for i in 1:N_tot; st_effect_k[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]; end
-                end
-            elseif model_st == "IV"
-                for j in 1:n_samples
-                    st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
-                    st_inter = zeros(Float64, M.s_N, M.t_N)
-                    t_rho_j = t_rho_samples[j]
-                    if abs(t_rho_j) < 1.0
-                        st_inter[:, 1] = (C_s.U \ st_innov_matrix[:, 1]) ./ sqrt(1.0 - t_rho_j^2 + noise)
-                        for t in 2:M.t_N; st_inter[:, t] = t_rho_j .* st_inter[:, t-1] .+ (C_s.U \ st_innov_matrix[:, t]); end
-                        st_inter .*= st_sigma_samples[j]
-                    else # Fallback
-                        st_inter = (C_s.U \ st_innov_matrix) .* st_sigma_samples[j]
-                    end
-                    for i in 1:N_tot; st_effect_k[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]; end
-                end
+            for j in 1:n_samples
+                st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
+                
+                # Generalized solve: X = L_s^{-T} * Z * L_t^{-1}
+                # This is implemented via backslash solves with the upper Cholesky factor:
+                # tmp = L_s' \ Z  => tmp = L_s^{-T} Z
+                # X = (L_t' \ tmp')' => X = ( (L_t^{-T} Z^T L_s^{-1})^T ) = L_s^{-T} Z L_t^{-1}
+                tmp_spatial = C_s.U \ st_innov_matrix
+                st_inter = (transpose(C_t.U \ transpose(tmp_spatial))) .* st_sigma_samples[j]
+
+                for i in 1:N_tot; st_effect_k[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]; end
             end
+
             all_effects[k] = st_effect_k
         end
         return (structured=all_effects, noisy=all_effects)
@@ -1982,7 +2080,7 @@ function bstm_cv_orchestrator(
             residuals = y_test_obs .- y_test_pred
             rmse = sqrt(Statistics.mean(residuals.^2))
             ss_res = sum(residuals.^2)
-            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
+            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2) # This can be zero if all test obs are the same.
             r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
             push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
         else
@@ -2114,7 +2212,7 @@ function bstm_cv_orchestrator(
             residuals = y_test_obs .- y_test_pred
             rmse = sqrt(Statistics.mean(residuals.^2))
             ss_res = sum(residuals.^2)
-            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
+            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2) # This can be zero if all test obs are the same.
             r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
             push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
         else
@@ -2246,7 +2344,7 @@ function bstm_cv_orchestrator(
             residuals = y_test_obs .- y_test_pred
             rmse = sqrt(Statistics.mean(residuals.^2))
             ss_res = sum(residuals.^2)
-            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
+            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2) # This can be zero if all test obs are the same.
             r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
             push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
         else

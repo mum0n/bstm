@@ -392,3 +392,156 @@ m = @bstm(
     data
 )
 ```
+
+
+# Advanced @bstm Call Examples
+
+# 3.1 Multivariate Model
+# Jointly modeling Gaussian and Poisson outcomes with spatial correlation
+# Uses continuous 2D Thin Plate Spline for space and RW2 for time
+println("Example 3.1: Constructing Multivariate Model...")
+model_mv = @bstm(
+    likelihood(y_gauss, family=gaussian) + likelihood(y_pois, family=poisson) ~
+    intercept() + 
+    smooth(s_x, s_y, model=tps, nbins=30) + 
+    temporal(year, model=rw2),
+    adv_data
+)
+
+# 3.2 Multinomial (Compositional) Model
+# Modeling counts across 3 categories using Dirichlet-Multinomial
+println("Example 3.2: Constructing Multinomial Model...")
+# Note: Multi-column LHS targets the Dirichlet-Multinomial kernel
+model_multi = @bstm(
+    likelihood(y_cat1 + y_cat2 + y_cat3, family=dirichlet_multinomial) ~
+    intercept() + 
+    smooth(s_x, s_y, model=gp, kernel=matern32, n_inducing=15),
+    adv_data
+)
+
+# 3.3 Multifidelity (Nested) Model
+# High-fidelity Gaussian outcome aided by a low-fidelity proxy sub-model
+println("Example 3.3: Constructing Multifidelity Model...")
+model_mf = @bstm(
+    likelihood(y_gauss, family=gaussian) ~
+    intercept() + 
+    temporal(year, model=ar1) + 
+    nested(
+        proxy_submodel,
+        formula = "likelihood(proxy_val, family=gaussian) ~ intercept() + smooth(s_x, s_y, model=tps, nbins=20)"
+    ),
+    adv_data
+)
+
+# 3.4 Year and Seasonal Structure
+# Combining a long-term trend (AR1) with a Harmonic seasonal component
+println("Example 3.4: Constructing Year-Seasonal Model...")
+model_season = @bstm(
+    likelihood(y_gauss) ~
+    intercept() + 
+    temporal(year, model=ar1) + 
+    temporal(month, model=harmonic, period=12),
+    adv_data
+)
+
+# Demonstration of SVAR usage in BSTM
+# Rationale: Shows how to model point-level dynamics where temporal persistence varies by region.
+
+# Prepare data with spatiotemporal index
+adv_data.st_idx = [(t-1)*30 + s for (s, t) in zip(adv_data.s_idx, adv_data.year)]
+
+# Example call: Spatially Varying Autoregressive Model
+# likelihood(y_gauss) ~ SVAR(spatial_rho = ICAR, sigma = Exp(1))
+
+# Note: This is a conceptual call to illustrate the syntax
+model_svar = @bstm(
+   likelihood(y_gauss) ~
+   intercept() +
+   custom(model=svar, rho_spatial=icar, sigma=Exponential(1.0)),
+   adv_data,
+   st_idx = adv_data.st_idx
+)
+
+println("The SVAR model allows for local temporal dynamics to be influenced by spatial proximity.")
+
+
+# Demonstration of Threshold Autoregressive logic
+
+# Prepare data for TAR example
+adv_data.price_index = 5.0 .+ cumsum(randn(nrow(adv_data)) .* 0.1)
+
+# Instantiate TAR manifold manually for demonstration of constructor-ready parameters
+tar_model_demo = @bstm(
+    likelihood(y_gauss) ~ 
+    intercept() + 
+    custom(code_fragment="""
+        # Logic for regime switching would go here in a manual call
+        # or by using the newly defined TAR Manifold object in the builder
+        """), 
+    adv_data
+)
+
+println("Advanced manifolds ready for high-fidelity structural modeling.")
+
+
+
+# Synthetic Point Pattern Data Generation
+# Rationale: LGCP models aggregated counts. We generate a smooth latent intensity 
+# on a grid and sample Poisson counts to simulate point-pattern data.
+
+
+lgcp_data, grid_W, total_cells = generate_lgcp_synthetic_data_regular(10)
+display(first(lgcp_data, 5))
+
+# LGCP Model Call Demonstration
+ 
+# Note: In the LGCP manifold, the counts in M.y_obs are modeled directly via @addlogprob!.
+# We pass the 'counts' column as the response to the likelihood module, but the LGCP
+# manifold effectively overrides the standard likelihood application for its domain.
+
+model_lgcp = @bstm(
+    likelihood(counts, family=poisson) ~ 
+    intercept() + 
+    spatial(point_process=lgcp, model=icar, sigma=Exponential(0.5)), 
+    lgcp_data, 
+    W = grid_W, 
+    s_N = total_cells,
+    grid_areas = ones(total_cells) # Unit areas for the intensity integral
+)
+ 
+
+
+irreg_df, irr_W, n_units, cell_areas = generate_irregular_lgcp_data(10)
+
+# 2. Instantiate Model specifying the area column
+# Note: we pass grid_areas to the lgcp parameters
+model_irreg = @bstm(
+    likelihood(counts, family=poisson) ~ 
+    intercept() + 
+    spatial(point_process=lgcp, model=icar, sigma=Exponential(1.0), grid_areas=cell_areas), 
+    irreg_df, 
+    W = irr_W, 
+    s_N = n_units
+)
+
+
+# Demonstration of Kriging implementation
+
+# Prepare spatial data for Kriging
+coord_data = DataFrame(
+    s_x = rand(100) .* 10.0,
+    s_y = rand(100) .* 10.0,
+    y_gauss = randn(100)
+)
+
+# Example @bstm call (conceptual structure)
+m = @bstm(
+    likelihood(y_gauss) ~ 
+    intercept() + 
+    smooth(s_x, s_y, model=kriging, lengthscale=InverseGamma(3, 3), sigma=Exponential(1.0)),
+    coord_data
+)
+
+
+  
+
