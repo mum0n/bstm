@@ -386,10 +386,9 @@ Interaction effects between fixed covariates are specified using the standard `*
 
 **Example:**
 ```julia
-# These formulas are equivalent and include main effects and the interaction.
+# These formulas are equivalent and include main effects and the interaction term.
 m1 = @bstm(likelihood(y) ~ intercept() + cov1 * cov2, data)
 m2 = @bstm(likelihood(y) ~ intercept() + fixed(cov1 * cov2), data)
-m3 = @bstm(likelihood(y) ~ intercept() + fixed(cov1) * fixed(cov2), data)
 m4 = @bstm(likelihood(y) ~ intercept() + fixed(cov1) + fixed(cov2) + fixed(cov1 & cov2), data)
 
 # These formulas include only the interaction term.

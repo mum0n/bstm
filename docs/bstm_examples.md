@@ -450,40 +450,35 @@ model_season = @bstm(
 # Prepare data with spatiotemporal index
 adv_data.st_idx = [(t-1)*30 + s for (s, t) in zip(adv_data.s_idx, adv_data.year)]
 
-# Example call: Spatially Varying Autoregressive Model
-# likelihood(y_gauss) ~ SVAR(spatial_rho = ICAR, sigma = Exp(1))
-
-# Note: This is a conceptual call to illustrate the syntax
+# Example call: Spatially Varying Autoregressive (SVAR) Model
+# This model allows the temporal autoregressive parameter `rho` to vary across space.
+# The spatial variation of `rho` is modeled by an `icar` manifold.
 model_svar = @bstm(
    likelihood(y_gauss) ~
    intercept() +
-   custom(model=svar, rho_spatial=icar, sigma=Exponential(1.0)),
-   adv_data,
-   st_idx = adv_data.st_idx
+   svar(spatial(s_idx, model=icar)),
+   adv_data, W=W
 )
 
-println("The SVAR model allows for local temporal dynamics to be influenced by spatial proximity.")
+println("The SVAR model allows local temporal dynamics to be influenced by spatial proximity.")
 
 
-# Demonstration of Threshold Autoregressive logic
+# Demonstration of Threshold Autoregressive (TAR) logic
+# This model switches between two AR(1) regimes based on a covariate's value.
 
 # Prepare data for TAR example
 adv_data.price_index = 5.0 .+ cumsum(randn(nrow(adv_data)) .* 0.1)
 
-# Instantiate TAR manifold manually for demonstration of constructor-ready parameters
-tar_model_demo = @bstm(
-    likelihood(y_gauss) ~ 
-    intercept() + 
-    custom(code_fragment="""
-        # Logic for regime switching would go here in a manual call
-        # or by using the newly defined TAR Manifold object in the builder
-        """), 
+# Example call: A TAR model where the temporal dynamics of y_gauss
+# switch based on whether `price_index` is above or below a learned threshold.
+model_tar = @bstm(
+    likelihood(y_gauss) ~
+    intercept() +
+    temporal(year, model=tar, threshold_var=price_index),
     adv_data
 )
 
-println("Advanced manifolds ready for high-fidelity structural modeling.")
-
-
+println("The TAR model allows for regime-switching temporal dynamics.")
 
 # Synthetic Point Pattern Data Generation
 # Rationale: LGCP models aggregated counts. We generate a smooth latent intensity 
@@ -544,4 +539,3 @@ m = @bstm(
 
 
   
-

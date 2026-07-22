@@ -185,30 +185,30 @@ You can control prior specification at three levels of precedence:
 1.  **Local Override (Highest Precedence)**: Specify a prior directly within a module call. This will always override any global settings.
     This can be done by passing a pre-defined `Distribution` object or by passing a `Tuple` representing a PC prior quantile constraint.
     ```julia
-    # Local Override with a pre-defined Distribution
+    # Local Override with a pre-defined Distribution. Note the use of `sigma=...`
     @bstm(
-        likelihood(y) ~ intercept() + spatial(s_idx, model=bym2, sigma_prior=Exponential(0.1)),
+        likelihood(y) ~ intercept() + spatial(s_idx, model=bym2, sigma=Exponential(0.1)),
         data, W=W
     )
 
     # Local Override with a PC prior quantile constraint
     # This sets P(sigma > 0.5) = 0.01 for this specific spatial component's sigma.
     @bstm(
-        likelihood(y) ~ intercept() + spatial(s_idx, model=bym2, sigma_prior=(0.5, 0.01)),
+        likelihood(y) ~ intercept() + spatial(s_idx, model=bym2, sigma=(0.5, 0.01)),
         data, W=W
     )
 
     # Local Override for a correlation parameter 'rho' in an AR1 model.
-    # This sets P(rho > 0.8) = 0.05, shrinking it towards zero.
+    # This sets P(rho > 0.8) = 0.05, shrinking it towards zero (no correlation).
     @bstm(
-        likelihood(y) ~ intercept() + temporal(t_idx, model=ar1, rho_prior=(0.8, 0.05)),
+        likelihood(y) ~ intercept() + temporal(t_idx, model=ar1, rho=(0.8, 0.05)),
         data
     )
 
     # Local Override for a 'lengthscale' in a GP model.
     # This sets P(lengthscale < 10.0) = 0.05, shrinking it towards larger values.
     @bstm(
-        likelihood(y) ~ intercept() + smooth(x, model=gp, lengthscale_prior=(10.0, 0.05, :lower)),
+        likelihood(y) ~ intercept() + smooth(x, model=gp, lengthscale=(10.0, 0.05, :lower)),
         data
     )
     ```

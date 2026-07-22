@@ -149,7 +149,7 @@ You can control prior specification at three levels of precedence:
 1.  **Local Override (Highest Precedence)**: Specify a prior directly within a module call. This will always override any global settings.
     This can be done by passing a pre-defined `Distribution` object or by passing a `Tuple` representing a PC prior quantile constraint.
     ```julia
-    # Local Override with a pre-defined Distribution
+    # Local Override with a pre-defined Distribution. Note the use of `sigma=...`
     @bstm(
         likelihood(y) ~ intercept() + spatial(s_idx, model=bym2, sigma=Exponential(0.1)),
         data, W=W
@@ -163,9 +163,9 @@ You can control prior specification at three levels of precedence:
     )
 
     # Local Override for a correlation parameter 'rho' in an AR1 model.
-    # This sets a symmetric prior where P(|rho| > 0.8) = 0.05, shrinking it towards zero.
+    # This sets P(rho > 0.8) = 0.05, shrinking it towards zero.
     @bstm(
-        likelihood(y) ~ intercept() + temporal(t_idx, model=ar1, rho=(0.8, 0.05, :symmetric)),
+        likelihood(y) ~ intercept() + temporal(t_idx, model=ar1, rho=(0.8, 0.05)),
         data
     )
 
@@ -581,10 +581,9 @@ Interaction effects between fixed covariates are specified using the standard `*
 
 **Example:**
 ```julia
-# These formulas are equivalent and include main effects and the interaction.
+# These formulas are equivalent and include main effects and the interaction term.
 m1 = @bstm(likelihood(y) ~ intercept() + cov1 * cov2, data)
 m2 = @bstm(likelihood(y) ~ intercept() + fixed(cov1 * cov2), data)
-m3 = @bstm(likelihood(y) ~ intercept() + fixed(cov1) * fixed(cov2), data)
 m4 = @bstm(likelihood(y) ~ intercept() + fixed(cov1) + fixed(cov2) + fixed(cov1 & cov2), data)
 
 # These formulas include only the interaction term.
