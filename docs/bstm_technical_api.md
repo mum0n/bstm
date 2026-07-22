@@ -386,14 +386,9 @@ Interaction effects between fixed covariates are specified using the standard `*
 
 **Example:**
 ```julia
-# These formulas are equivalent and include main effects and the interaction term.
+# These formulas are equivalent and include main effects and the interaction.
 m1 = @bstm(likelihood(y) ~ intercept() + cov1 * cov2, data)
 m2 = @bstm(likelihood(y) ~ intercept() + fixed(cov1 * cov2), data)
-m4 = @bstm(likelihood(y) ~ intercept() + fixed(cov1) + fixed(cov2) + fixed(cov1 & cov2), data)
-
-# These formulas include only the interaction term.
-m5 = @bstm(likelihood(y) ~ intercept() + cov1 & cov2, data)
-m6 = @bstm(likelihood(y) ~ intercept() + cov1 : cov2, data)
 ```
 
 **Note on Priors:** Applying a custom prior to an interaction term (e.g., `fixed(cov1 * cov2, prior=...)`) is not directly supported, as the prior would be ambiguous across the expanded main and interaction effects. To assign a specific prior to an interaction, you must first manually create the interaction term as a new column in your `DataFrame` and then apply the `fixed()` module with a `prior` to that new column.

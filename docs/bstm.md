@@ -139,7 +139,7 @@ show(data_scot[:data])  # a DataFrame
 # m is just a regular Turing model
 
 
-m = @bstm(  likelihood(y, family=poisson, offsets=log_offset) ~ 
+m = @bstm(  likelihood(y, family=poisson, log_offsets=log_offset) ~ 
     intercept() + 
     spatial(s_idx, model=besag, W=data_scot[:au][:W]) + 
     temporal(year, model=ar1), 
@@ -149,7 +149,7 @@ m = @bstm(  likelihood(y, family=poisson, offsets=log_offset) ~
 show_model(m)  # pseudocode to check
 
 
-m = @bstm(  likelihood(y, family=poisson, offsets=log_offsets) ~ 
+m = @bstm(  likelihood(y, family=poisson, log_offsets=log_offsets) ~ 
     intercept() + 
     spatial(s_idx, model=bym2, W=data_scot[:au][:W]) + 
     temporal(year, model=ar1) +
@@ -4710,8 +4710,6 @@ optimizer = Newton()
 optimizer = AcceleratedGradientDescent()
 optimizer = SimulatedAnnealing()
 using Flux; optimizer = Flux.Adam() 
-
- 
 
 # poisson of positive valued (> 0) numerical abundance
 m = turing_glm_icar( family="poisson", 

@@ -471,37 +471,37 @@ This section provides a detailed quick-reference guide to the main modules avail
 
 The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm` call (e.g., `@bstm(..., W=my_matrix)`) or, preferably, directly within the `spatial` module (e.g., `spatial(s_idx, W=my_matrix)`).
 
-| Manifold | `model='...'` | Key Parameters | Default PC-Priors | Use Case & Utility |
-|:---|:---|:---|:---|:---|
-| **IID** | `'iid'` | `sigma_prior` | `Exponential(1.0)` | Models non-spatial overdispersion or heterogeneity. |
-| **ICAR / Besag** | `'icar'`, `'besag'` | `sigma_prior` | `Exponential(1.0)` | Provides strong, localized spatial smoothing for lattice data. |
-| **BYM2** | `'bym2'` | `sigma_prior`, `rho_prior` | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)` | The most robust default for areal data; separates spatial clustering from random noise. |
-| **Leroux** | `'leroux'` | `sigma_prior`, `rho_prior` | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)` | A flexible alternative to BYM2 that avoids the rank-deficiency of the ICAR model. |
-| **SAR** | `'sar'` | `sigma_prior`, `rho_prior` | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)` | Models spatial "spill-over" effects where the value at one location directly influences its neighbors. |
-| **SPDE** | `'spde'` | `sigma_prior`, `kappa_prior` | `sigma`: `Exponential(1.0)`, `kappa`: `Exponential(1.0)` | A scalable and principled way to model continuous spatial processes on irregular domains. |
-| **Gaussian Process** | `'gp'` | `sigma_prior`, `lengthscale_prior`, `kernel` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Gold-standard for continuous spatial modeling but computationally expensive ($O(N^3)$). |
-| **RFF** | `'rff'` | `sigma_prior`, `lengthscale_prior`, `n_features` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A scalable approximation to a full GP, excellent for large numbers of areal units. |
-| **FITC** | `'fitc'` | `sigma_prior`, `lengthscale_prior`, `n_inducing` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Sparse GP using inducing points; good for large N. |
-| **Nystrom** | `'nystrom'` | `sigma_prior`, `lengthscale_prior`, `n_inducing` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Low-rank GP approximation, similar to FITC. |
-| **SVGP** | `'svgp'` | `sigma_prior`, `lengthscale_prior`, `n_inducing` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Sparse Variational GP, for use with VI. |
-| **Warp** | `'warp'` | `sigma_prior`, `lengthscale_prior`, `n_features` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Models non-stationary fields by warping coordinates. |
-| **NetworkFlow** | `'network'` | `sigma_prior`, `adjacency_matrix`, `flow_direction` | `Exponential(1.0)` | For directed graphs like river networks or supply chains. |
-| **DAG** | `'dag'` | `sigma_prior`, `adjacency_matrix` | `Exponential(1.0)` | For Directed Acyclic Graphs, useful in causal inference. |
-| **Mosaic** | `'mosaic'` | `sigma_prior`, `n_regions` | `Exponential(1.0)` | Partitions space into locally stationary regions. |
-| **BCGN** | `'bcgn'` | `sigma_prior`, `bipartite_adj` | `Exponential(1.0)` | For bipartite graphs (e.g., user-item interactions). |
-| **Hyperbolic** | `'hyperbolic'` | `sigma_prior`, `curvature` | `Exponential(1.0)` | For embedding hierarchical or tree-like spatial data. |
+| Manifold             | `model='...'`       | Key Parameters                                | Default PC-Priors                                               | Use Case & Utility                                                                                     |
+| :---------------------| :--------------------| :----------------------------------------------| :----------------------------------------------------------------| :-------------------------------------------------------------------------------------------------------|
+| **IID**              | `'iid'`             | `sigma`                                       | `Exponential(1.0)`                                              | Models non-spatial overdispersion or heterogeneity.                                                    |
+| **ICAR / Besag**     | `'icar'`, `'besag'` | `sigma`                                       | `Exponential(1.0)`                                              | Provides strong, localized spatial smoothing for lattice data.                                         |
+| **BYM2**             | `'bym2'`            | `sigma`, `rho`                                | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | The most robust default for areal data; separates spatial clustering from random noise.                |
+| **Leroux**           | `'leroux'`          | `sigma`, `rho`                                | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | A flexible alternative to BYM2 that avoids the rank-deficiency of the ICAR model.                      |
+| **SAR**              | `'sar'`             | `sigma`, `rho`                                | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | Models spatial "spill-over" effects where the value at one location directly influences its neighbors. |
+| **SPDE**             | `'spde'`            | `sigma`, `kappa`                              | `sigma`: `Exponential(1.0)`, `kappa`: `Exponential(1.0)`        | A scalable and principled way to model continuous spatial processes on irregular domains.              |
+| **Gaussian Process** | `'gp'`              | `sigma`, `lengthscale`, `kernel`              | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Gold-standard for continuous spatial modeling but computationally expensive ($O(N^3)$).                |
+| **RFF**              | `'rff'`             | `sigma`, `lengthscale`, `n_features`          | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A scalable approximation to a full GP, excellent for large numbers of areal units.                     |
+| **FITC**             | `'fitc'`            | `sigma`, `lengthscale`, `n_inducing`          | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Sparse GP using inducing points; good for large N.                                                     |
+| **Nystrom**          | `'nystrom'`         | `sigma`, `lengthscale`, `n_inducing`          | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Low-rank GP approximation, similar to FITC.                                                            |
+| **SVGP**             | `'svgp'`            | `sigma`, `lengthscale`, `n_inducing`          | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Sparse Variational GP, for use with VI.                                                                |
+| **Warp**             | `'warp'`            | `sigma`, `lengthscale`, `n_features`          | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Models non-stationary fields by warping coordinates.                                                   |
+| **NetworkFlow**      | `'network'`         | `sigma`, `adjacency_matrix`, `flow_direction` | `Exponential(1.0)`                                              | For directed graphs like river networks or supply chains.                                              |
+| **DAG**              | `'dag'`             | `sigma`, `adjacency_matrix`                   | `Exponential(1.0)`                                              | For Directed Acyclic Graphs, useful in causal inference.                                               |
+| **Mosaic**           | `'mosaic'`          | `sigma`, `n_regions`                          | `Exponential(1.0)`                                              | Partitions space into locally stationary regions.                                                      |
+| **BCGN**             | `'bcgn'`            | `sigma`, `bipartite_adj`                      | `Exponential(1.0)`                                              | For bipartite graphs (e.g., user-item interactions).                                                   |
+| **Hyperbolic**       | `'hyperbolic'`      | `sigma`, `curvature`                          | `Exponential(1.0)`                                              | For embedding hierarchical or tree-like spatial data.                                                  |
 
 ### 8.4. `temporal()` and `seasonal()` Modules
 
 | Manifold              | `model='...'` | Key Parameters                                   | Default PC-Priors                                               | Use Case & Utility                                                                                |
 | :----------------------| :--------------| :-------------------------------------------------| :----------------------------------------------------------------| :--------------------------------------------------------------------------------------------------|
-| **IID**               | `'iid'`       | `sigma_prior`                                    | `Exponential(1.0)`                                              | Models unstructured temporal noise.                                                               |
-| **AR1**               | `'ar1'`       | `sigma_prior`, `rho_prior`                       | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | Modeling serially correlated time series where the influence of past events decays geometrically. |
-| **Random Walk (RW1)** | `'rw1'`       | `sigma_prior`                                    | `Exponential(1.0)`                                              | Capturing abrupt changes or step-like trends.                                                     |
-| **Random Walk (RW2)** | `'rw2'`       | `sigma_prior`                                    | `Exponential(1.0)`                                              | The most common choice for modeling smooth, non-linear temporal trends.                           |
-| **Gaussian Process**  | `'gp'`        | `sigma_prior`, `lengthscale_prior`               | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Flexible, non-parametric trend modeling.                                                          |
-| **RFF**               | `'rff'`       | `sigma_prior`, `lengthscale_prior`, `n_features` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Scalable GP approximation for long time series.                                                   |
-| **Cyclic**            | `'cyclic'`    | `sigma_prior`, `period`                          | `Exponential(1.0)`                                              | Modeling smooth, periodic effects like day-of-week or month-of-year.                              |
+| **IID**               | `'iid'`       | `sigma`                                    | `Exponential(1.0)`                                              | Models unstructured temporal noise.                                                               |
+| **AR1**               | `'ar1'`       | `sigma`, `rho`                       | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | Modeling serially correlated time series where the influence of past events decays geometrically. |
+| **Random Walk (RW1)** | `'rw1'`       | `sigma`                                    | `Exponential(1.0)`                                              | Capturing abrupt changes or step-like trends.                                                     |
+| **Random Walk (RW2)** | `'rw2'`       | `sigma`                                    | `Exponential(1.0)`                                              | The most common choice for modeling smooth, non-linear temporal trends.                           |
+| **Gaussian Process**  | `'gp'`        | `sigma`, `lengthscale`               | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Flexible, non-parametric trend modeling.                                                          |
+| **RFF**               | `'rff'`       | `sigma`, `lengthscale`, `n_features` | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | Scalable GP approximation for long time series.                                                   |
+| **Cyclic**            | `'cyclic'`    | `sigma`, `period`                          | `Exponential(1.0)`                                              | Modeling smooth, periodic effects like day-of-week or month-of-year.                              |
 | **Harmonic**          | `'harmonic'`  | `amplitude`, `phase`, `period`                   | `amplitude`: `Normal(0,1)`, `phase`: `Beta(1,1)`                | Capturing sharp, regular periodic patterns with sine and cosine waves.                            |
 
 
@@ -509,19 +509,19 @@ The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm`
 
 *Note: Direct censoring of covariates in `smooth()` is not supported. See Section 6.5 for the recommended two-stage modeling approach.*
 
-| Manifold / Method                | `model='...'`    | Key Parameters                    | Default Priors                                                        | Use Case & Utility                                                                             |
-| :---------------------------------| :-----------------| :----------------------------------| :----------------------------------------------------------------------| :-----------------------------------------------------------------------------------------------|
-| **P-Spline**                     | `'pspline'`      | `nbins`, `degree`, `diff_order`   | `sigma_prior`: `Exponential(1.0)`                                     | The most flexible general-purpose smoother for 1D covariates.                                  |
-| **B-Spline**                     | `'bspline'`      | `nbins`, `degree`                 | `sigma_prior`: `Exponential(1.0)`                                     | A simpler spline smoother than P-splines, useful when less regularization is desired.          |
-| **Thin Plate Spline**            | `'tps'`          | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | The classic choice for smoothing 2D spatial coordinates (e.g., `smooth(lon, lat, model=tps)`). |
-| **Random Fourier Features**      | `'rff'`          | `n_features`, `lengthscale_prior` | `sigma_prior`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A highly scalable method for approximating a full Gaussian Process smooth.                     |
-| **Random Walk (on bins)**        | `'rw1'`, `'rw2'` | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
-| **Gaussian Process (on coords)** | `'gp'`           | `lengthscale_prior`               | `sigma_prior`: `Exponential(1.0)`                                     | Gold-standard continuous smoother, computationally intensive.                                  |
-| **FFT Basis**                    | `'fft'`          | `nbins`, `lengthscale_prior`      | `sigma_prior`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | For modeling periodic non-linear effects of a covariate with a learnable period.               |
-| **Moran's I Basis**              | `'moran'`        | `nbins`, `W`                      | `sigma_prior`: `Exponential(1.0)`                                     | Uses eigenvectors of a spatial weights matrix as basis functions.                              |
-| **Spherical Basis**              | `'spherical'`    | `nbins`, `range_prior`            | `sigma_prior`: `Exponential(1.0)`                                     | For effects with a strictly local influence (compact support).                                 |
-| **Exponential Decay Basis**      | `'decay'`        | `nbins`, `lengthscale`            | `sigma_prior`: `Exponential(1.0)`                                     | For effects with a strong, rapidly decaying influence.                                         |
-| **Barycentric Basis**            | `'barycentric'`  | `nbins`                           | `sigma_prior`: `Exponential(1.0)`                                     | Simple, interpretable piecewise linear smoother.                                               |
+| Manifold / Method                | `model='...'`    | Key Parameters                  | Default Priors                                                  | Use Case & Utility                                                                             |
+| :---------------------------------| :-----------------| :--------------------------------| :----------------------------------------------------------------| :-----------------------------------------------------------------------------------------------|
+| **P-Spline**                     | `'pspline'`      | `nbins`, `degree`, `diff_order` | `sigma`: `Exponential(1.0)`                                     | The most flexible general-purpose smoother for 1D covariates.                                  |
+| **B-Spline**                     | `'bspline'`      | `nbins`, `degree`               | `sigma`: `Exponential(1.0)`                                     | A simpler spline smoother than P-splines, useful when less regularization is desired.          |
+| **Thin Plate Spline**            | `'tps'`          | `nbins`                         | `sigma`: `Exponential(1.0)`                                     | The classic choice for smoothing 2D spatial coordinates (e.g., `smooth(lon, lat, model=tps)`). |
+| **Random Fourier Features**      | `'rff'`          | `n_features`, `lengthscale`     | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | A highly scalable method for approximating a full Gaussian Process smooth.                     |
+| **Random Walk (on bins)**        | `'rw1'`, `'rw2'` | `nbins`                         | `sigma`: `Exponential(1.0)`                                     | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
+| **Gaussian Process (on coords)** | `'gp'`           | `lengthscale`                   | `sigma`: `Exponential(1.0)`                                     | Gold-standard continuous smoother, computationally intensive.                                  |
+| **FFT Basis**                    | `'fft'`          | `nbins`, `lengthscale`          | `sigma`: `Exponential(1.0)`, `lengthscale`: `InverseGamma(3,3)` | For modeling periodic non-linear effects of a covariate with a learnable period.               |
+| **Moran's I Basis**              | `'moran'`        | `nbins`, `W`                    | `sigma`: `Exponential(1.0)`                                     | Uses eigenvectors of a spatial weights matrix as basis functions.                              |
+| **Spherical Basis**              | `'spherical'`    | `nbins`, `range`                | `sigma`: `Exponential(1.0)`                                     | For effects with a strictly local influence (compact support).                                 |
+| **Exponential Decay Basis**      | `'decay'`        | `nbins`, `lengthscale`          | `sigma`: `Exponential(1.0)`                                     | For effects with a strong, rapidly decaying influence.                                         |
+| **Barycentric Basis**            | `'barycentric'`  | `nbins`                         | `sigma`: `Exponential(1.0)`                                     | Simple, interpretable piecewise linear smoother.                                               |
 
 ### 8.6. `mixed()` Module
 
@@ -529,18 +529,18 @@ The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm`
 
 | Syntax               | Example Usage                 | Key Parameters | Default Priors                    | Mathematical Assumption                                                                                                                      |
 | :---------------------| :------------------------------| :---------------| :----------------------------------| :---------------------------------------------------------------------------------------------------------------------------------------------|
-| **Random Intercept** | `mixed(1, group_var)`         | `model`        | `sigma_prior`: `Exponential(1.0)` | Assumes each level $j$ of `group_var` has a unique intercept $\alpha_j \sim \mathcal{N}(0, \sigma^2_{\text{group}})$.                        |
-| **Random Slope**     | `mixed(covariate, group_var)` | `model`        | `sigma_prior`: `Exponential(1.0)` | Assumes the effect (slope) of a `covariate` varies across the levels of `group_var`, $\beta_j \sim \mathcal{N}(0, \sigma^2_{\text{slope}})$. |
+| **Random Intercept** | `mixed(1, group_var)`         | `model`        | `sigma`: `Exponential(1.0)` | Assumes each level $j$ of `group_var` has a unique intercept $\alpha_j \sim \mathcal{N}(0, \sigma^2_{\text{group}})$.                        |
+| **Random Slope**     | `mixed(covariate, group_var)` | `model`        | `sigma`: `Exponential(1.0)` | Assumes the effect (slope) of a `covariate` varies across the levels of `group_var`, $\beta_j \sim \mathcal{N}(0, \sigma^2_{\text{slope}})$. |
 
 ### 8.7. `dynamics()` Module
 
 | Model | `model='...'` | Key Parameters | Default Priors | Use Case & Utility |
 |:---|:---|:---|:---|:---|
-| **Advection** | `'advection'` | `velocity_prior`, `sigma_prior` | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)` | Models transport or flow using a first-order directed operator. |
-| **Diffusion** | `'diffusion'` | `diffusion_prior`, `sigma_prior` | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` | Models spreading or dispersion using the graph Laplacian. |
-| **Advection-Diffusion** | `'advection_diffusion'` | `velocity_prior`, `diffusion_prior`, `sigma_prior` | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)` | Combines both transport and diffusion processes. |
-| **Gompertz Growth** | `'gompertz'` | `r_prior`, `K_prior`, `sig_dyn_prior` | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)` | Models population growth with asymmetric sigmoidal curve. |
-| **Logistic Growth** | `'logistic_basic'` | `r_prior`, `K_prior` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)` | Models population growth with a symmetric carrying capacity. |
+| **Advection** | `'advection'` | `velocity`, `sigma` | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)` | Models transport or flow using a first-order directed operator. |
+| **Diffusion** | `'diffusion'` | `diffusion`, `sigma` | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` | Models spreading or dispersion using the graph Laplacian. |
+| **Advection-Diffusion** | `'advection_diffusion'` | `velocity`, `diffusion`, `sigma` | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)` | Combines both transport and diffusion processes. |
+| **Gompertz Growth** | `'gompertz'` | `r`, `K`, `sig_dyn` | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)` | Models population growth with asymmetric sigmoidal curve. |
+| **Logistic Growth** | `'logistic_basic'` | `r`, `K` | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)` | Models population growth with a symmetric carrying capacity. |
 
 ### 8.8. `nested()` and `eigen()` Modules
 
@@ -565,8 +565,8 @@ The `eigen()` module implements a Bayesian Principal Component Analysis (PCA) to
 |:---|:---|:---|:---|:---|
 | `eigen()` | `eigen(y1, y2, y3; ...)` | Module | N/A | Defines a Bayesian PCA factor model. The variables listed (e.g., `y1, y2, y3`) are the multivariate outcomes to be decomposed. |
 | `n_factors` | `n_factors=1` | `Int` | `1` | The number of latent factors (principal components) to extract. This determines the dimensionality of the reduced latent space. |
-| `pca_sd_prior` | `pca_sd_prior=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviations of the principal components (latent factors). These are the "eigenvalues" of the system, controlling the variance explained by each factor. |
-| `pdef_sd_prior` | `pdef_sd_prior=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviation of the residual (uniqueness) noise. This captures the variance in each observed variable that is *not* explained by the shared latent factors. |
+| `pca_sd` | `pca_sd=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviations of the principal components (latent factors). These are the "eigenvalues" of the system, controlling the variance explained by each factor. |
+| `pdef_sd` | `pdef_sd=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviation of the residual (uniqueness) noise. This captures the variance in each observed variable that is *not* explained by the shared latent factors. |
 
 ##### The Householder PCA Mechanism
 

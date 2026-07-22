@@ -28,7 +28,7 @@ A simple linear regression model with an intercept and two continuous covariates
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + fixed(cov1) + fixed(cov2), data )
+m = @bstm( likelihood(y) ~ intercept() + fixed(cov1) + fixed(cov2), data );
 ```
  
 ### 1.2. Categorical Fixed Effects with Contrasts
@@ -41,7 +41,7 @@ Models the effect of a categorical variable using custom contrast coding.
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + fixed(region, contrast=effects, prior=Normal(0, 10)), data )
+m = @bstm( likelihood(y) ~ intercept() + fixed(region, contrast=effects, prior=Normal(0, 10)), data );
 ```
 
 ### 1.3. Random Intercept Model
@@ -54,7 +54,7 @@ Models group-level variability in the intercept.
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept(false) + fixed(cov1) + mixed( intercept() | region), data )
+m = @bstm( likelihood(y) ~ intercept(false) + fixed(cov1) + mixed( intercept() | region), data );
 ```
 
 ### 1.4. Random Slope and Intercept Model
@@ -71,7 +71,7 @@ m = @bstm(
     likelihood(y) ~ intercept(false) + cov1 + 
         mixed( intercept(true) + cov1 | region ), # Correlated random intercept and slope for cov1
     data
-)
+);
 ```
 
 ## 2. Likelihood Features
@@ -88,7 +88,7 @@ y_lower_bound, y_upper_bound = 1, 100
 m = @bstm(
     likelihood(y_rate, family=gaussian, censor_lower=y_lower_bound, censor_upper=y_upper_bound) ~ intercept() + fixed(region),
     data
-)
+);
 ```
 
 ### 2.2. Zero-Inflated Model
@@ -100,7 +100,7 @@ Models count data with an excess of zeros.
 m = @bstm(
     likelihood(y, family=poisson, zero_inflated=true) ~ intercept() + cov1,
     data
-)
+);
 ```
 
 ### 2.3. Hurdle Model
@@ -109,7 +109,7 @@ A two-part model where the process for generating zeros is separate from the pro
 
 
 ```julia
-m = @bstm( likelihood(y, family=poisson, hurdle=1) ~ intercept() + cov1, data )
+m = @bstm( likelihood(y, family=poisson, hurdle=1) ~ intercept() + cov1, data );
 ```
 
 ### 2.4. Stochastic Volatility Model
@@ -121,7 +121,7 @@ Models observation noise that varies over space and time.
 m = @bstm(
     likelihood(y_rate, family=gaussian, volatility=true) ~ intercept() + spatial(s_idx, model=bym2, W=W),
     data
-)
+);
 ```
 
 ## 3. Spatial Models
@@ -138,7 +138,7 @@ The standard for areal disease mapping, decomposing spatial risk into structured
 
 
 ```julia
-m = @bstm( likelihood(y, family=poisson) ~ intercept() + spatial(s_idx, model=bym2, W=W), data )
+m = @bstm( likelihood(y, family=poisson) ~ intercept() + spatial(s_idx, model=bym2, W=W), data );
 ```
 
 #### ICAR / Besag Model
@@ -147,7 +147,7 @@ A model for strong spatial smoothing based on local neighbors.
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=icar, W=W), data )
+m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=icar, W=W), data );
 ```
 
 #### Leroux Model
@@ -156,7 +156,7 @@ Alternatives to BYM2 that offer different parameterizations of spatial correlati
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=leroux, W=W), data )
+m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=leroux, W=W), data );
 ```
 
 #### SAR Model
@@ -165,7 +165,7 @@ Models spatial "spill-over" effects where the value at one location directly inf
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=sar, W=W, noise=1e-6), data)
+m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=sar, W=W, noise=1e-6), data);
 ```
 
 ### 3.2. Continuous & Point-Reference Models
@@ -178,7 +178,7 @@ The gold-standard for continuous spatial modeling, but computationally expensive
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + smooth(s_x, s_y, model=gp, kernel=matern32), data)
+m = @bstm( likelihood(y) ~ intercept() + smooth(s_x, s_y, model=gp, kernel=matern32), data);
 ```
 
 #### SPDE Model
@@ -187,7 +187,7 @@ Models a continuous spatial process using an approximation to a Stochastic Parti
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=spde, W=W), data )
+m = @bstm( likelihood(y) ~ intercept() + spatial(s_idx, model=spde, W=W), data );
 ```
 
 ## 4. Temporal & Seasonal Models
@@ -200,7 +200,7 @@ Models a smooth, non-linear temporal trend using a second-order random walk.
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + temporal(year, model=rw2), data )
+m = @bstm( likelihood(y) ~ intercept() + temporal(year, model=rw2), data );
 ```
 
 #### Autoregressive Model (AR1)
@@ -209,7 +209,7 @@ Models a stationary temporal process where the current value depends on the imme
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + temporal(year, model=ar1), data )
+m = @bstm( likelihood(y) ~ intercept() + temporal(year, model=ar1), data );
 ```
 
 ### 4.2. Seasonal Models
@@ -223,7 +223,7 @@ Captures periodic effects using sine and cosine basis functions.
 m = @bstm(
     likelihood(y) ~ intercept() + temporal(year, month, model=(ar1, cyclic), period=12),
     data
-)
+);
 ```
 
 #### Cyclic Random Walk
@@ -235,7 +235,7 @@ Models a smooth, periodic effect where the end of the cycle connects to the begi
 m = @bstm(
     likelihood(y) ~ intercept() + temporal(day, model=cyclic, period=7),
     data
-)
+);
 ```
 
 ## 5. Covariate Smoothing (`smooth`)
@@ -249,7 +249,7 @@ Models the non-linear effect of a continuous covariate using penalized splines.
 m = @bstm(
     likelihood(y) ~ intercept() + smooth(cov1, model=pspline, nbins=20),
     data
-)
+);
 ```
 
 ### 5.2. 2D Thin Plate Spline
@@ -261,7 +261,7 @@ Models the smooth, non-linear interaction of two continuous covariates (e.g., sp
 m = @bstm(
     likelihood(y) ~ intercept() + smooth(s_x, s_y, model=tps, nbins=50),
     data
-)
+);
 ```
 
 ## 6. Interaction & Hierarchical Models
@@ -275,7 +275,7 @@ A standard model where the spatial and temporal effects are assumed to be indepe
 m = @bstm(
     likelihood(y) ~ intercept() + spatial(s_idx, model=bym2, W=W) + temporal(year, model=ar1),
     data
-)
+);
 ```
 
 ### 6.2. Spatiotemporal Interaction Model (Knorr-Held Type IV)
@@ -288,7 +288,7 @@ m = @bstm(
     likelihood(y) ~ intercept() + spatial(s_idx, model=icar) + temporal(year, model=ar1) +
         spatial(s_idx, model=icar) ⊗ temporal(year, model=ar1),
     data, W=W
-)
+);
 ```
 
 **Formula Equivalent (using `spacetime`):**
@@ -297,7 +297,7 @@ m = @bstm(
     likelihood(y) ~ intercept() + spatial(s_idx, model=icar) + temporal(year, model=ar1) +
         spacetime(s_idx, year, model=(icar, ar1)),
     data, W=W
-)
+);
 ```
 
 ### 6.3. Spatially Varying Coefficients (SVC)
@@ -309,7 +309,7 @@ Allows the effect of a covariate to vary smoothly across space.
 m = @bstm(
     likelihood(y) ~ intercept() + cov1 |> spatial(s_idx, model=icar, W=W),
     data
-)
+);
 ```
 
 ### 6.4. Spatially Varying Curves
@@ -321,7 +321,7 @@ Models a non-linear trend of a covariate that varies smoothly across space.
 m = @bstm(
     likelihood(y) ~ intercept() + (smooth(year, model=pspline) |> spatial(s_idx, model=icar, W=W)),
     data
-)
+);
 ```
 
 ## 7. Advanced & Mechanistic Models
@@ -333,9 +333,9 @@ A mechanistic model for a process that is transported (advection) and spreads (d
 
 ```julia
 m = @bstm(
-    likelihood(concentration) ~ intercept() + dynamics(s_idx, year, model=advection_diffusion, W=W),
+    likelihood(y) ~ intercept() + dynamics(s_idx, year, model=advection_diffusion, W=W),
     data
-)
+);
 ```
 
 ### 7.1. Bayesian PCA (`eigen`)
@@ -347,7 +347,7 @@ Performs dimensionality reduction on a set of covariates, using the dominant lat
 m = @bstm(
     likelihood(y) ~ intercept() + eigen(cov1, cov2, cov3, n_factors=1),
     data
-)
+);
 ```
 
 ### 7.3. Multi-fidelity Model (`nested`)
@@ -363,7 +363,7 @@ m = @bstm(
             formula="likelihood(y_bin, family=binomial) ~ intercept() + smooth(cov3, model=pspline)"
         ),
     data
-)
+);
 ```
 
 ## 8. Multivariate Models
@@ -377,7 +377,7 @@ A multivariate CAR model for jointly modeling multiple correlated spatial proces
 m = @bstm(
     y + y_bin ~ intercept() + spatial(s_idx, model=besag, W=W) + temporal(year, model=ar1),
     data
-)
+);
 ```
 
 ### 8.2. Joint Model with Different Likelihoods
@@ -390,7 +390,7 @@ m = @bstm(
     likelihood(y, family=poisson) + likelihood(y_continuous, family=gaussian) ~ 
         intercept() + spatial(s_idx, model=bym2, W=W),
     data
-)
+);
 ```
 
 
@@ -399,29 +399,27 @@ m = @bstm(
 # 3.1 Multivariate Model
 # Jointly modeling Gaussian and Poisson outcomes with spatial correlation
 # Uses continuous 2D Thin Plate Spline for space and RW2 for time
-println("Example 3.1: Constructing Multivariate Model...")
 model_mv = @bstm(
-    likelihood(y_gauss, family=gaussian) + likelihood(y_pois, family=poisson) ~
+    likelihood(y_rate, family=gaussian) + likelihood(y, family=poisson) ~
     intercept() + 
     smooth(s_x, s_y, model=tps, nbins=30) + 
     temporal(year, model=rw2),
-    adv_data
-)
+    data
+);
 
 # 3.2 Multinomial (Compositional) Model
 # Modeling counts across 3 categories using Dirichlet-Multinomial
-println("Example 3.2: Constructing Multinomial Model...")
 # Note: Multi-column LHS targets the Dirichlet-Multinomial kernel
 model_multi = @bstm(
     likelihood(y_cat1 + y_cat2 + y_cat3, family=dirichlet_multinomial) ~
     intercept() + 
     smooth(s_x, s_y, model=gp, kernel=matern32, n_inducing=15),
-    adv_data
-)
+    data
+);
 
 # 3.3 Multifidelity (Nested) Model
 # High-fidelity Gaussian outcome aided by a low-fidelity proxy sub-model
-println("Example 3.3: Constructing Multifidelity Model...")
+
 model_mf = @bstm(
     likelihood(y_gauss, family=gaussian) ~
     intercept() + 
@@ -430,25 +428,24 @@ model_mf = @bstm(
         proxy_submodel,
         formula = "likelihood(proxy_val, family=gaussian) ~ intercept() + smooth(s_x, s_y, model=tps, nbins=20)"
     ),
-    adv_data
-)
+    data
+);
 
 # 3.4 Year and Seasonal Structure
 # Combining a long-term trend (AR1) with a Harmonic seasonal component
-println("Example 3.4: Constructing Year-Seasonal Model...")
 model_season = @bstm(
     likelihood(y_gauss) ~
     intercept() + 
     temporal(year, model=ar1) + 
     temporal(month, model=harmonic, period=12),
-    adv_data
-)
+    data
+);
 
 # Demonstration of SVAR usage in BSTM
 # Rationale: Shows how to model point-level dynamics where temporal persistence varies by region.
 
 # Prepare data with spatiotemporal index
-adv_data.st_idx = [(t-1)*30 + s for (s, t) in zip(adv_data.s_idx, adv_data.year)]
+data.st_idx = [(t-1)*30 + s for (s, t) in zip(data.s_idx, data.year)]
 
 # Example call: Spatially Varying Autoregressive (SVAR) Model
 # This model allows the temporal autoregressive parameter `rho` to vary across space.
@@ -457,17 +454,14 @@ model_svar = @bstm(
    likelihood(y_gauss) ~
    intercept() +
    svar(spatial(s_idx, model=icar)),
-   adv_data, W=W
-)
-
-println("The SVAR model allows local temporal dynamics to be influenced by spatial proximity.")
-
-
+   data, W=W
+);
+ 
 # Demonstration of Threshold Autoregressive (TAR) logic
 # This model switches between two AR(1) regimes based on a covariate's value.
 
 # Prepare data for TAR example
-adv_data.price_index = 5.0 .+ cumsum(randn(nrow(adv_data)) .* 0.1)
+data.price_index = 5.0 .+ cumsum(randn(nrow(data)) .* 0.1)
 
 # Example call: A TAR model where the temporal dynamics of y_gauss
 # switch based on whether `price_index` is above or below a learned threshold.
@@ -475,10 +469,8 @@ model_tar = @bstm(
     likelihood(y_gauss) ~
     intercept() +
     temporal(year, model=tar, threshold_var=price_index),
-    adv_data
-)
-
-println("The TAR model allows for regime-switching temporal dynamics.")
+    data
+);
 
 # Synthetic Point Pattern Data Generation
 # Rationale: LGCP models aggregated counts. We generate a smooth latent intensity 
@@ -502,7 +494,7 @@ model_lgcp = @bstm(
     W = grid_W, 
     s_N = total_cells,
     grid_areas = ones(total_cells) # Unit areas for the intensity integral
-)
+);
  
 
 
@@ -517,7 +509,7 @@ model_irreg = @bstm(
     irreg_df, 
     W = irr_W, 
     s_N = n_units
-)
+);
 
 
 # Demonstration of Kriging implementation
@@ -527,7 +519,7 @@ coord_data = DataFrame(
     s_x = rand(100) .* 10.0,
     s_y = rand(100) .* 10.0,
     y_gauss = randn(100)
-)
+);
 
 # Example @bstm call (conceptual structure)
 m = @bstm(
@@ -535,7 +527,7 @@ m = @bstm(
     intercept() + 
     smooth(s_x, s_y, model=kriging, lengthscale=InverseGamma(3, 3), sigma=Exponential(1.0)),
     coord_data
-)
+);
 
 
   

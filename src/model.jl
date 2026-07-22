@@ -11,6 +11,13 @@ struct Point2D
     y::Float64
 end
 
+struct Point4D
+    x::Float64
+    y::Float64
+    z::Float64
+    t::Float64
+end
+
 struct Triangle
     v1::Int
     v2::Int
@@ -1081,22 +1088,27 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
 end
 
 
+
+
 function _generate_manifold_code_fragments(m::MixedManifold, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
-    # Generate names following the centralized standard
+    # # Retrieve centralized variable names following the established standard
     v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
+    
     inner_model = m.model
     group_var = m.group_var
     lhs_effects = m.lhs
     k_effects = length(lhs_effects)
     n_groups = get(spec.params, :n_cat, 0)
 
+    # # Resolve linear predictor target based on architecture
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     index_var = "mixed_idx_$(group_var)"
 
     if k_effects == 1
-        # Uncorrelated random effect (e.g., random intercept)
+        # # Process uncorrelated random effects (Intercept-only or single Slope)
         inner_frags = _generate_manifold_code_fragments(inner_model, spec, arch, outcome_idx, prefix=prefix)
-        # Clean inner update to prevent recursive additive errors
+        
+        # # Strip generic addition to apply custom grouping indexing via views
         update_inner_cleaned = replace(inner_frags.update, Regex("\\s*$(eta_target)\\s*\\.\\+=\\s*.*") => "")
 
         lhs_str = lhs_effects[1]
@@ -1110,7 +1122,7 @@ function _generate_manifold_code_fragments(m::MixedManifold, spec::NamedTuple, a
 
         update_str = """
     begin
-        # Mixed Effect Logic: $(lhs_str) | $(group_var)
+        # # Mixed Effect Logic (Single): $(lhs_str) | $(group_var)
         $(update_inner_cleaned)
         $(application_code)
     end
@@ -1118,49 +1130,50 @@ function _generate_manifold_code_fragments(m::MixedManifold, spec::NamedTuple, a
         return (priors=inner_frags.priors, update=update_str)
 
     else
-        # Correlated multivariate random effects
+        # # Process correlated multivariate random effects (e.g., 1 + cov | group)
         priors_acc = String[]
         push!(priors_acc, "$(v.L_corr) ~ NamedDist(LKJCholesky($(k_effects), 1.0), :$(v.L_corr))")
         push!(priors_acc, "$(v.sigma_effects) ~ NamedDist(filldist(Exponential(1.0), $(k_effects)), :$(v.sigma_effects))")
         push!(priors_acc, "$(v.raw) ~ NamedDist(MvNormal(zeros(T, $(n_groups * k_effects)), I), :$(v.raw))")
 
-        group_chol_logic = if inner_model isa IID
-            "L_groups_inv_t = sparse(I, $(n_groups), $(n_groups))"
+        # # Resolve grouping precision structure (IID or GMRF)
+        group_chol_logic = if inner_model isa IID || inner_model isa NoneManifold
+            "local L_groups_inv_t_$(spec.key) = sparse(I, $(n_groups), $(n_groups))"
         else
             """
-        Q_groups = spec_registry[\"$(spec.key)\"].Q_template
-        F_groups = cholesky(Symmetric(Q_groups + noise * I))
-        L_groups_inv_t = F_groups.U \\ I
+        local Q_groups_$(spec.key) = spec_registry[\"$(spec.key)\"].Q_template
+        local F_groups_$(spec.key) = cholesky(Symmetric(Q_groups_$(spec.key) + noise * I))
+        local L_groups_inv_t_$(spec.key) = F_groups_$(spec.key).U \\ I
         """
         end
 
-        loop_acc = String[]
+        # # Iterate through terms and generate application strings
+        # # This prevents UndefVarErrors by correctly mapping formula terms to DataFrame columns individually
+        application_loop_acc = String[]
         for i in 1:k_effects
             term = lhs_effects[i]
             is_int = (term == "1" || term == "intercept()")
 
-            conditional_header = (i == 1) ? "if i == 1" : "elseif i == $(i)"
-            effect_application = if is_int
-                "$(eta_target) .+= view(effect_vec_i, M.$(index_var))"
+            term_application = if is_int
+                "        $(eta_target) .+= view(effects_matrix_$(spec.key), M.$(index_var), $(i))"
             else
-                "$(eta_target) .+= M.data[!, :$(Symbol(term))] .* view(effect_vec_i, M.$(index_var))"
+                "        $(eta_target) .+= M.data[!, :$(Symbol(term))] .* view(effects_matrix_$(spec.key), M.$(index_var), $(i))"
             end
-            push!(loop_acc, "        $(conditional_header) # term: $(term)")
-            push!(loop_acc, "            $(effect_application)")
+            push!(application_loop_acc, "# Effect Component: $(term)")
+            push!(application_loop_acc, term_application)
         end
 
         update_str = """
     begin
-        # Correlated Mixed Effects for Group: $(group_var)
-        L_effects_t = (Diagonal($(v.sigma_effects)) * $(v.L_corr).L)'
+        # # Correlated Mixed Effects Construction for $(group_var)
+        local L_effects_t_$(spec.key) = (Diagonal($(v.sigma_effects)) * $(v.L_corr).L)'
         $(group_chol_logic)
-        innovations_matrix = reshape($(v.raw), $(n_groups), $(k_effects))
-        effects_matrix = L_groups_inv_t * innovations_matrix * L_effects_t
+        
+        local innovations_matrix_$(spec.key) = reshape($(v.raw), $(n_groups), $(k_effects))
+        local effects_matrix_$(spec.key) = L_groups_inv_t_$(spec.key) * innovations_matrix_$(spec.key) * L_effects_t_$(spec.key)
 
-        for i in 1:$(k_effects)
-            effect_vec_i = view(effects_matrix, :, i)
-$(join(loop_acc, "\n"))
-        end
+        # # Sequential contribution of decomposed terms to the linear predictor
+$(join(application_loop_acc, "\n"))
     end
     """
         return (priors=join(priors_acc, "\n    "), update=update_str)
@@ -1385,15 +1398,12 @@ function _generate_manifold_code_fragments(m::DynamicsManifold, spec::NamedTuple
     local propagator_logic, evolution_step
     if model_type == "advection"
         propagator_logic = "propagator = lu(I(M.s_N) - $(velocity_name) * $(A_op) + noise * I)"
-        evolution_step = "dyn_field[:, t] = propagator \\ (dyn_field[:, t-1] + innov_matrix[:, t])"
         evolution_step = "dyn_field[:, t] = (propagator \\ dyn_field[:, t-1]) + innov_matrix[:, t]"
     elseif model_type == "diffusion"
         propagator_logic = "propagator = cholesky(Symmetric(I(M.s_N) - $(diffusion_name) * $(L_op) + noise * I))"
-        evolution_step = "dyn_field[:, t] = propagator \\ (dyn_field[:, t-1] + innov_matrix[:, t])"
         evolution_step = "dyn_field[:, t] = (propagator \\ dyn_field[:, t-1]) + innov_matrix[:, t]"
     elseif model_type == "advection_diffusion"
         propagator_logic = "propagator = lu(I(M.s_N) - $(velocity_name) * $(A_op) - $(diffusion_name) * $(L_op) + noise * I)"
-        evolution_step = "dyn_field[:, t] = propagator \\ (dyn_field[:, t-1] + innov_matrix[:, t])"
         evolution_step = "dyn_field[:, t] = (propagator \\ dyn_field[:, t-1]) + innov_matrix[:, t]"
     else
         # Default to a simple random walk if model is unknown
@@ -1424,10 +1434,6 @@ function _generate_manifold_code_fragments(m::DynamicsManifold, spec::NamedTuple
             $(evolution_step)
         end
         
-        # Flatten the spatiotemporal field and add it to the linear predictor
-        # using the pre-computed spatiotemporal index `st_idx`.
-        dyn_field_flat = vec(dyn_field)
-        $(eta_update_target) .+= view(dyn_field_flat, M.st_idx)
         # Scale the entire field by sigma
         dyn_field .*= $(sigma_name)
 
@@ -1706,44 +1712,69 @@ This method is dispatched for `Besag`, `ICAR`, and `BCGN` because all three resu
 - A `NamedTuple` containing the `priors` and `update` code strings for the Turing model.
 """
 function _generate_manifold_code_fragments(m::Union{Besag, ICAR, BCGN}, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # # Process: Generates Turing-compatible logic for intrinsic GMRF models.
+    # # Rationale: These models are defined by singular precision matrices (rank deficiency 1).
+    # # Implementation ensures identifiability via Non-Centered Parameterization and soft sum-to-zero constraints.
+
+    # # Technical Audit: Retrieve centralized variable names
+    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
     key_str = string(spec.key)
-    v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
-    prefixed_key = isempty(prefix) ? key_str : "$(prefix)_$(key_str)"
 
     params = spec.params
     n_latent = size(spec.Q_template, 1)
     is_multivariate = arch == "multivariate"
-    is_first_outcome = outcome_idx == 1
+    is_first_outcome = (outcome_idx == 1 || isnothing(outcome_idx))
     is_shared = get(params, :shared, false)
 
     priors_acc = String[]
 
-    # Generate priors only once for shared parameters
+    # # Prior definition block
+    # # Hyperparameters defined based on shared/independent outcome logic
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
-        push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
+        if hasproperty(m, :sigma)
+            push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
+        end
     end
 
+    # # Standard Normal innovations for NCP
     push!(priors_acc, "$(v.raw) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.raw))")
-    priors_str = join(priors_acc, "\n")
+    priors_str = join(priors_acc, "\n    ")
 
+    # # Index and target resolution
     index_var = spec.domain == :spatial ? "s_idx" : string(spec.domain) * "_idx"
     eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    effect_application_str = spec.domain == :smooth ? "$(eta_update_target) .+= M.basis_matrices[:$(spec.var)] * $(latent_name)" : "$(eta_update_target) .+= view($(latent_name), M.$(index_var))"
 
+    # # Effect application logic using the resolved standard latent name
+    # # Note: v.latent is used here to match the reconstructed field in the update block
+    local effect_application_str
+    if spec.domain == :smooth
+        effect_application_str = "$(eta_update_target) .+= M.basis_matrices[:$(spec.var)] * $(v.latent)"
+    else
+        effect_application_str = "$(eta_update_target) .+= view($(v.latent), M.$(index_var))"
+    end
+
+    # # Update logic assembly
+    # # 1. Solve the intrinsic system via Cholesky
+    # # 2. Apply soft sum-to-zero constraint (identifiability)
+    # # 3. Scale and apply effect
     update_str = """
     begin
-        # Besag/ICAR/BCGN model for $(key_str)
-        Q_template = spec_registry["$(key_str)"].Q_template
-        F = cholesky(Symmetric(Q_template + noise * I))
-        latent_field_raw = F.U \\ $(v.raw)
+        # --- Intrinsic Manifold Solve: $(key_str) ---
+        local Q_template_$(key_str) = spec_registry["$(key_str)"].Q_template
+        local F_$(key_str) = cholesky(Symmetric(Q_template_$(key_str) + noise * I))
         
-        # Apply soft sum-to-zero constraint for identifiability
-        Turing.@addlogprob! logpdf(Normal(0, 0.001 * $(n_latent)), sum(latent_field_raw))
-        $(v.latent) = latent_field_raw .* $(v.sigma)
-        $(eta_update_target) .+= view($(v.latent), M.$(index_var))
+        # # Reconstruct field from innovations
+        local latent_field_raw_$(key_str) = F_$(key_str).U \\ $(v.raw)
+
+        # # Soft sum-to-zero for identifiability against the global intercept
+        Turing.@addlogprob! logpdf(Normal(0, 0.001 * $(n_latent)), sum(latent_field_raw_$(key_str)))
+        
+        # # Scale and apply transformation
+        $(v.latent) = latent_field_raw_$(key_str) .* $(v.sigma)
+        $(effect_application_str)
     end
     """
-    
+
     return (priors=priors_str, update=update_str)
 end
 
@@ -2061,7 +2092,7 @@ function _generate_manifold_code_fragments(m::BYM2, spec::NamedTuple, arch::Stri
     # Priors for the raw innovations for the structured and unstructured components.
     push!(priors_acc, "$(v.struct) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.struct))")
     push!(priors_acc, "$(v.iid) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.iid))")
-    priors_str = join(priors_acc, "\n    ")
+    priors_str = join(priors_acc, "\n")
     
     index_var = spec.domain == :spatial ? "s_idx" : string(spec.domain) * "_idx"
     eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
@@ -2078,10 +2109,8 @@ function _generate_manifold_code_fragments(m::BYM2, spec::NamedTuple, arch::Stri
             local struct_latent = F.U \\ $(v.struct)
             # 2. Apply soft sum-to-zero constraint for identifiability
             Turing.@addlogprob! logpdf(Normal(0, 0.001 * $(n_latent)), sum(struct_latent))
-            # 3. Clamp rho for numerical stability before sqrt.
-            local rho_clamped = clamp($(v.rho), 0.0, 1.0)
-            # 4. Combine structured and unstructured components using Riebler parameterization.
-            local bym2_effect = $(v.sigma) .* (sqrt(rho_clamped) .* struct_latent .+ sqrt(1.0 - rho_clamped) .* $(v.iid))
+            # 3. Combine structured and unstructured components using Riebler parameterization.
+            local bym2_effect = $(v.sigma) .* (sqrt($(v.rho)) .* struct_latent .+ sqrt(1.0 - $(v.rho)) .* $(v.iid))
             # 5. Add the final effect to the linear predictor.
             $(eta_update_target) .+= view(bym2_effect, M.$(index_var))
         end
@@ -3443,34 +3472,61 @@ end
 
 
 
-function process_dynamics_module!(opt_dict, mod_data, registries, hyperpriors)
-    # Purpose: Processes the `dynamics()` module.
-    # Rationale: Placeholder for future mechanistic model integration.
-    :interact => process_interact_module!,
-    :spacetime => process_spacetime_module!,
-    :fixed => process_fixed_module!,
-    :adaptivesmooth => process_smooth_module!, # AdaptiveSmooth is a type of smoother
-    :svar => process_svar_module!,
-    :localadaptive => process_localadaptive_module!,
-    :mosaic => process_mosaic_module!,
-    :custom => process_custom_module!,
-        components_metadata = map(c_node -> Dict(:type => c_node.module_type, :params => c_node.args, :variables => get(c_node.args, :positional_args, [])), components_data)
-        resolved_components = [resolve_technical_primitive(comp_meta, M, priors_dict, scheme) for comp_meta in components_metadata]
-        return ComposedManifold(resolved_components, op)
 
-    elseif m_type == :svar
-        rho_spatial_node = get(m_params, :rho_spatial_node, nothing)
-        if isnothing(rho_spatial_node) error("SVAR manifold is missing its inner spatial model specification.") end
-        rho_spatial_meta = Dict(:type => rho_spatial_node.module_type, :params => rho_spatial_node.args, :variables => get(rho_spatial_node.args, :positional_args, []))
-        rho_spatial_obj = resolve_technical_primitive(rho_spatial_meta, M, priors_dict, scheme)
-        resolved_priors = resolve_hyperpriors("svar", priors_dict, m_params, scheme, M[:calling_module])
-        return SVAR(rho_spatial_obj, resolved_priors.sigma)
+function process_dynamics_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
+    # 1. Initialize Spatial Context
+    # Dynamics models inherently operate on a spatial graph. We must ensure the 
+    # adjacency structure and spatial indices are resolved first.
+    process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
 
-    else
-        default_model = if m_type == :spatial; haskey(M, :W) ? "bym2" : "iid"; elseif m_type == :temporal; "rw2"; else "none"; end
-    return (Q_template=rho_spatial_spec.Q_template, scaling_factor=1.0, model_type=:svar, hyper=NamedTuple(hyper_dict))
+    params = mod_data[:params]
+    data = opt_dict[:data]
+    
+    # 2. Model Type Verification
+    # Supported models: "advection", "diffusion", "advection_diffusion"
+    model_type = string(get(params, :model, "none"))
+    if model_type == "none"
+        error("Dynamics module requires a 'model' parameter (e.g., model='advection').")
+    end
+
+    # 3. Covariate and Parameter Validation
+    # For mechanistic models, we check for required physical parameters or threshold variables.
+    if model_type in ["advection", "advection_diffusion"]
+        if !haskey(params, :velocity_prior) && !haskey(opt_dict[:hyperpriors], "velocity")
+            @warn "Advection model specified without explicit velocity priors. Using system defaults."
+        end
+    end
+
+    if model_type in ["diffusion", "advection_diffusion"]
+        if !haskey(params, :diffusion_prior) && !haskey(opt_dict[:hyperpriors], "diffusion")
+            @warn "Diffusion model specified without explicit diffusion priors. Using system defaults."
+        end
+    end
+
+    # 4. Spatiotemporal Indexing
+    # Dynamics models evolve over time; we ensure temporal indices are present.
+    if !haskey(opt_dict, :t_idx)
+        @warn "Dynamics module detected but no temporal indices found. Attempting default temporal resolution."
+        if hasproperty(data, :year)
+            opt_dict[:t_idx] = data[!, :year] .- minimum(data[!, :year]) .+ 1
+            opt_dict[:t_N] = length(unique(opt_dict[:t_idx]))
+        else
+            error("Dynamics models require temporal indices. Provide a time variable via temporal() or ensure 'year' is in data.")
+        end
+    end
+
+    # 5. Mapping Spatiotemporal State
+    # We pre-calculate the spatiotemporal flat index (st_idx) to allow the 
+    # code generator to map the [s_N, t_N] state matrix to the observation vector N.
+    s_idx = opt_dict[:s_idx]
+    t_idx = opt_dict[:t_idx]
+    s_N = opt_dict[:s_N]
+    
+    # st_idx = (t-1)*s_N + s
+    opt_dict[:st_idx] = [(t - 1) * s_N + s for (s, t) in zip(s_idx, t_idx)]
+
+    return true
 end
-
 
 """
     process_eigen_module!(opt_dict, mod_data, registries, hyperpriors)
@@ -3566,19 +3622,28 @@ are then passed to the code generator as a vector of strings. This fixes a bug w
 # Returns
 - `true` to indicate that a `MixedManifold` object should be created.
 """
+
 function process_mixed_module!(opt_dict, mod_data, registries, hyperpriors)
+    # # Process: Orchestrates the setup for random effects (MixedManifold).
+    # # Rationale: Resolves formula parsing issues by ensuring a valid response variable is present 
+    # # during schema application.
+
     data = opt_dict[:data]
     vars = mod_data[:variables]
     
+    # # Retrieve the first outcome variable to serve as a valid response placeholder for StatsModels
+    response_var = Symbol(opt_dict[:outcomes][1])
+
     local effect_expr, group_var_str
 
+    # # Logical Dispatch: Determine formula syntax style
     if !isempty(vars) && vars[1] isa Expr && vars[1].head == :call && vars[1].args[1] == :|
-        # Handle `mixed(effect | group)` syntax
+        # # Case: mixed(effect | group)
         effect_expr = vars[1].args[2]
         group_expr = vars[1].args[3]
         group_var_str = string(group_expr)
     elseif length(vars) >= 2
-        # Handle `mixed(effect, group)` syntax
+        # # Case: mixed(effect, group)
         effect_expr = vars[1]
         group_var_str = string(vars[2])
     else
@@ -3586,66 +3651,66 @@ function process_mixed_module!(opt_dict, mod_data, registries, hyperpriors)
         return false
     end
 
-    # --- New Parsing Logic ---
-    # 1. Replace `intercept()` with `1` for StatsModels.jl compatibility.
+    # # Technical Audit: Normalize 'intercept()' to '1' for StatsModels compatibility
     effect_expr_mod = replace_intercept_in_expr(effect_expr)
 
-    # 2. Use StatsModels to parse the expression and extract term names.
+    # # Formula Parsing Engine
     schema = StatsModels.schema(data)
-
     local terms
+
     if effect_expr_mod isa Number
-        # `StatsModels.term` correctly converts 1 to InterceptTerm{true} and 0 to InterceptTerm{false}.
+        # # Direct conversion for pure intercept/zero-intercept models
         terms = StatsModels.term(effect_expr_mod)
     else
-        # For symbols or expressions, wrap in a formula and then apply schema.
-        # This is the robust way to parse a formula expression at runtime.
+        # # Robust Parsing: Use the actual response variable to avoid 'nothing' KeyError
         calling_mod = get(opt_dict, :calling_module, Main)
-        form = Core.eval(calling_mod, :(@formula(nothing ~ $(effect_expr_mod))))
+        
+        # # Create a valid formula for schema validation
+        form = Core.eval(calling_mod, :(@formula($response_var ~ $(effect_expr_mod))))
+        
+        # # Apply schema to resolve categorical contrasts and variable types
         applied_form = StatsModels.apply_schema(form, schema)
         terms = applied_form.rhs
     end
 
+    # # Term Normalization: Consolidate effects into a string vector
     term_vec = terms isa Tuple ? collect(terms) : [terms]
-
     effect_names = String[]
+    
     for term in term_vec
         if term isa StatsModels.InterceptTerm{true}
             push!(effect_names, "1")
         elseif term isa StatsModels.InterceptTerm{false}
-            # This corresponds to `0` in a formula, so we add no effect.
             continue
         else
             push!(effect_names, _canonical_term_string(term))
         end
     end
-    # --- End New Parsing Logic ---
 
+    # # Index Resolution: Construct group assignments
     group_var_sym = Symbol(group_var_str)
     if !hasproperty(data, group_var_sym)
-        @warn "Grouping variable ':$group_var_sym' for mixed() module not found in data. Skipping."
-        return false
+        error("Grouping variable ':$group_var_sym' for mixed() module not found in dataset.")
     end
+    
     group_data = data[!, group_var_sym]
-    levels = unique(group_data)
-    group_map = Dict(v => i for (i, v) in enumerate(levels))
+    unique_levels = unique(group_data)
+    group_map = Dict(v => i for (i, v) in enumerate(unique_levels))
     indices = [group_map[v] for v in group_data]
-    mod_data[:params][:indices] = indices
 
-    # Store the generated indices in the main configuration object `M` (aliased as `opt_dict` here)
-    # under a unique key that the code generator can construct.
+    # # Registry Update: Store metadata for code generator
     index_key = Symbol("mixed_idx_$(group_var_str)")
     opt_dict[index_key] = indices
-    mod_data[:params][:n_cat] = length(levels)
     
-    # Store the parsed effect names as a vector of strings.
-    # This fixes the core bug.
+    mod_data[:params][:indices] = indices
+    mod_data[:params][:n_cat] = length(unique_levels)
     mod_data[:params][:lhs] = effect_names
-    
+
+    # # Domain mapping for downstream dispatch
     mod_data[:variables] = [group_var_str]
+    
     return true
 end
-
 
 
 
@@ -3996,6 +4061,102 @@ function process_custom_module!(opt_dict, mod_data, registries, hyperpriors)
     return true
 end
 
+
+function adjacency_to_bipartite(W::AbstractMatrix; force_bipartite::Bool=true)
+    # # Process: Translates a unipartite graph into a bipartite representation.
+    # # Rationale: Required for models like BCGN that operate on inter-set connectivity.
+    
+    rows, cols = size(W)
+    if rows != cols
+        error("Input matrix must be square to represent a unipartite adjacency structure.")
+    end
+    
+    n = rows
+    g = SimpleGraph(W)
+    
+    # # Coloring Algorithm: Attempt to find a natural 2-coloring (bipartition)
+    # # nodes are assigned to set 0 or set 1
+    colors = fill(-1, n)
+    is_bipartite = true
+    
+    for start_node in 1:n
+        if colors[start_node] != -1
+            continue
+        end
+        
+        colors[start_node] = 0
+        queue = [start_node]
+        
+        while !isempty(queue)
+            u = popfirst!(queue)
+            for v in Neighbors(g, u)
+                if colors[v] == -1
+                    colors[v] = 1 - colors[u]
+                    push!(queue, v)
+                elseif colors[v] == colors[u]
+                    is_bipartite = false
+                    if !force_bipartite
+                        error("Graph is not bipartite and force_bipartite is false.")
+                    end
+                end
+            end
+        end
+    end
+    
+    # # Fallback: If not bipartite, use a greedy degree-based partition to maximize cut
+    if !is_bipartite
+        @warn "Graph is not naturally bipartite. Applying greedy partitioning to maximize inter-set edges."
+        colors = fill(0, n)
+        node_degrees = degree(g)
+        sorted_nodes = sortperm(node_degrees, rev=true)
+        
+        for u in sorted_nodes
+            # # Count neighbors already in set 0 and set 1
+            n0 = 0
+            n1 = 0
+            for v in Neighbors(g, u)
+                if colors[v] == 0
+                    n0 += 1
+                else
+                    n1 += 1
+                end
+            end
+            # # Assign to the set that maximizes connections to the other set
+            colors[u] = n0 >= n1 ? 1 : 0
+        end
+    end
+    
+    # # Extraction: Construct the bipartite matrix B
+    set1_indices = findall(==(0), colors)
+    set2_indices = findall(==(1), colors)
+    
+    n1 = length(set1_indices)
+    n2 = length(set2_indices)
+    
+    if n1 == 0 || n2 == 0
+        error("Partitioning failed to create two non-empty sets. Check graph connectivity.")
+    end
+    
+    # # B is n1 x n2 matrix representing connections from Set 1 to Set 2
+    B = spzeros(Float64, n1, n2)
+    
+    for (i, u) in enumerate(set1_indices)
+        for (j, v) in enumerate(set2_indices)
+            if W[u, v] > 0
+                B[i, j] = Float64(W[u, v])
+            end
+        end
+    end
+    
+    return (
+        bipartite_adj = B,
+        set1 = set1_indices,
+        set2 = set2_indices,
+        is_natural = is_bipartite
+    )
+end
+
+
 function process_bcgn_module!(opt_dict, mod_data, registries, hyperpriors)
     # Purpose: Processes the `bcgn()` module for bipartite graphs.
     # Rationale: Validates the provided bipartite adjacency matrix.
@@ -4003,9 +4164,13 @@ function process_bcgn_module!(opt_dict, mod_data, registries, hyperpriors)
     # Inputs: opt_dict, mod_data, registries, hyperpriors.
     # Outputs: Boolean indicating if a manifold should be created.
     params = mod_data[:params]
-    if !haskey(params, :bipartite_adj) || isempty(params[:bipartite_adj]) || all(iszero, params[:bipartite_adj])
-        error("The `bcgn()` module requires a non-empty `:bipartite_adj` sparse matrix parameter.")
+    if !haskey(params, :W) || isempty(params[:W]) || all(iszero, params[:W])
+        error("The `bcgn()` module requires a non-empty `:W` sparse matrix parameter.")
     end
+
+    res = adjacency_to_bipartite(params[:W])
+    params[:bipartite_adj] = res.bipartite_adj
+
     # Further validation could be added here (e.g., check if it's actually bipartite)
     return true # Proceed with manifold creation
 end
@@ -4272,16 +4437,12 @@ function bstm(formula::String, data::DataFrame; kwargs...)
     return bstm(formula, data, Main; kwargs...)
 end
 
+
+
+
 function bstm(formula::String, data::DataFrame, calling_module::Module; kwargs...)
-    # Purpose: A wrapper that first calls `bstm_config` and then `bstm`.
-    # Rationale: Separates configuration from model instantiation.
-    # v1.2.1 (2026-07-16)
-    # Assumptions: None.
-    # Inputs:
-    #   - formula, data, calling_module, kwargs.
-    # Outputs: A Turing.jl model object.
+    # # Resolve technical model specification and generate source
     options = bstm_config(formula, data; calling_module=calling_module, kwargs...)
-    
     model_func_name, expr, new_config, registry = bstm_codegen(options)
 
     if get(new_config, :verbose, true)
@@ -4290,18 +4451,22 @@ function bstm(formula::String, data::DataFrame, calling_module::Module; kwargs..
         println("----------------------------------------\n")
     end
 
-    # This function is intended for programmatic (non-interactive) use.
-    # The `eval` happens here. For interactive use, the @bstm macro is recommended.
+    # # Evaluate the generated model expression within the calling module scope
     calling_module.eval(expr)
-    model_func = getfield(calling_module, model_func_name)
     
-    # We use invokelatest to be safe, as the function was just defined.
+    # # Retrieve a handle to the newly defined function
+    model_func = getfield(calling_module, model_func_name)
+
+    # # Resolving World-Age Issues:
+    # # Julia 1.12 requires invokelatest for functions defined and executed in the same evaluation turn.
     local model_instance = Base.invokelatest(model_func, new_config, registry)
 
     if get(new_config, :verbose, true)
         println("\n--- Running prior predictive check ---")
     end
+    
     try
+        # # The rand method for the new model must also be called via invokelatest
         local prior_sample = Base.invokelatest(rand, model_instance)
         if get(new_config, :verbose, true)
             println("Prior sample check successful. Sample values:")
@@ -4310,12 +4475,14 @@ function bstm(formula::String, data::DataFrame, calling_module::Module; kwargs..
     catch e
         _bstm_error_handler(e, model_instance)
     end
+    
     if get(new_config, :verbose, true)
         println("--------------------------------------\n")
     end
 
     return model_instance
 end
+
 
 
 
@@ -5888,7 +6055,7 @@ function get_model_family(model_family::String)
     end
 end
 
-function get_dist_ref(::PoissonFamily, d, eta, sig); return Poisson(clamp(exp(eta), 1e-9, 1e9)); end
+function get_dist_ref(::PoissonFamily, d, eta, sig); return Poisson(clamp(exp(eta), 0.0, 1e9)); end
 function get_dist_ref(::DirichletFamily, d, eta, sig); error("The Dirichlet likelihood is for compositional outcomes and is not supported in the current univariate response framework."); end
 function get_dist_ref(::InverseWishartFamily, d, eta, sig); error("The Inverse-Wishart likelihood is for covariance matrix outcomes and is not supported in the current univariate response framework."); end
 function get_dist_ref(::GaussianFamily, d, eta, sig); return Normal(eta, max(sig, 1e-9)); end
@@ -5928,15 +6095,21 @@ end
 
 # # Likelihood Kernel for Dirichlet-Multinomial
 # # Rationale: Maps the linear predictor (eta) via softmax to the probability simplex.
-# Likelihood Kernel for Dirichlet-Multinomial
-# Rationale: Maps the linear predictor (eta) via softmax to the probability simplex.
+"""
+    get_dist_ref(::DirichletMultinomialFamily, d, eta_vec, sig)
+
+Implements a true Dirichlet-Multinomial model. The linear predictor `eta`
+determines the mean probabilities of the categories via softmax. The `sig`
+parameter (aliased from `y_sigma`) controls the overall concentration `α₀`,
+which governs the overdispersion. A large `α₀` approaches a standard
+Multinomial distribution.
+"""
 function get_dist_ref(::DirichletMultinomialFamily, d, eta_vec, sig)
-    # eta_vec is the vector of linear predictors for each category
-    # Transform to simplex via softmax
-    probs = softmax(eta_vec)
-    # Total count for the multinomial observation
+    alpha_0 = max(sig, 1e-6)
+    mean_probs = softmax(eta_vec)
+    alpha_params = alpha_0 .* mean_probs
     n_total = sum(d.y_obs)
-    return Multinomial(Int(n_total), probs)
+    return DirichletMultinomial(Int(n_total), alpha_params)
 end
 
 # # Add trait for Dirichlet family
@@ -6820,6 +6993,71 @@ function bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol,
 end
 
 """
+    bstm_barycentric_basis_4D(coords::AbstractMatrix, knots::Vector{Point4D}, n_marginal::Int)
+
+Generates a 4D basis matrix using multilinear interpolation on a regular grid of knots.
+
+# Rationale
+A true barycentric interpolation in 4D would require a Delaunay triangulation of the
+knot points to form a mesh of 4-simplices (pentatopes). This is computationally
+prohibitive and not supported by standard Julia libraries.
+
+This function provides a practical and efficient approximation by constructing a basis
+from the tensor product of 1D linear "tent" functions centered at the provided knot
+points. This is equivalent to multilinear interpolation within the 4D hyper-rectangles
+defined by the grid of knots.
+
+# Arguments
+- `coords`: An `N x 4` matrix of data points.
+- `knots`: A vector of `Point4D` knot points, assumed to form a regular grid.
+- `n_marginal`: The number of knots along each of the 4 dimensions.
+
+# Returns
+- A basis matrix of size `(N, length(knots))`.
+"""
+function bstm_barycentric_basis_4D(coords::AbstractMatrix, knots::Vector{Point4D}, n_marginal::Int)
+    n_obs = size(coords, 1)
+    n_knots = length(knots)
+    B = zeros(Float64, n_obs, n_knots)
+
+    if n_knots != n_marginal^4
+        error("Number of knots must equal n_marginal^4 for 4D tensor product basis. Got n_knots=$n_knots and n_marginal^4=$(n_marginal^4).")
+    end
+
+    # Extract unique knot coordinates along each dimension and sort them
+    k1 = sort(unique([k.x for k in knots]))
+    k2 = sort(unique([k.y for k in knots]))
+    k3 = sort(unique([k.z for k in knots]))
+    k4 = sort(unique([k.t for k in knots]))
+
+    # Calculate grid spacing (h) for each dimension
+    h1 = (maximum(k1) - minimum(k1)) / (n_marginal > 1 ? (n_marginal - 1) : 1); h1 = h1 > 0 ? h1 : 1.0
+    h2 = (maximum(k2) - minimum(k2)) / (n_marginal > 1 ? (n_marginal - 1) : 1); h2 = h2 > 0 ? h2 : 1.0
+    h3 = (maximum(k3) - minimum(k3)) / (n_marginal > 1 ? (n_marginal - 1) : 1); h3 = h3 > 0 ? h3 : 1.0
+    h4 = (maximum(k4) - minimum(k4)) / (n_marginal > 1 ? (n_marginal - 1) : 1); h4 = h4 > 0 ? h4 : 1.0
+
+    idx = 1
+    # The loop order must match the order in which the knot_points vector was created.
+    # The standard is x-fastest, then y, then z, etc.
+    for l in 1:n_marginal
+        for k in 1:n_marginal
+            for j in 1:n_marginal
+                for i in 1:n_marginal
+                    b1 = max.(0.0, 1.0 .- abs.(coords[:, 1] .- k1[i]) ./ h1)
+                    b2 = max.(0.0, 1.0 .- abs.(coords[:, 2] .- k2[j]) ./ h2)
+                    b3 = max.(0.0, 1.0 .- abs.(coords[:, 3] .- k3[k]) ./ h3)
+                    b4 = max.(0.0, 1.0 .- abs.(coords[:, 4] .- k4[l]) ./ h4)
+                    B[:, idx] .= b1 .* b2 .* b3 .* b4
+                    idx += 1
+                end
+            end
+        end
+    end
+    
+    return B
+end
+
+"""
     bstm_tensor_product_wavelet_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, family::Symbol, lengthscale::Float64)
 
 Generates a tensor product wavelet basis matrix for multidimensional data.
@@ -7537,7 +7775,13 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Int; 
         return bstm_tensor_product_wavelet_basis(coords, nbins_per_dim, family, lengthscale)
     end
 
-    if type in [ "smooth", "barycentric", "linear"]
+    if type == "barycentric"
+        n_marginal = Int(floor(sqrt(sqrt(nbins))))
+        knot_points = [Point4D(i, j, k, l) for l in k4 for k in k3 for j in k2 for i in k1]
+        return bstm_barycentric_basis_4D(coords, knot_points, n_marginal)
+    end
+
+    if type in [ "smooth", "linear"]
         n_marginal = Int(floor(sqrt(sqrt(nbins))))
         m_total = n_marginal^4
         B = zeros(Float64, n_obs, m_total)
@@ -7839,8 +8083,8 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
     #            required by the model's likelihood family or options. This avoids generating
     #            unnecessary variables for simpler models like Poisson.
     # v1.2.3 (2026-07-17)
-    families = [get(spec, :family, "gaussian") for spec in M.likelihood_specs]
-    needs_sigma = any(f -> string(f) in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"], families)
+    families = [string(get(spec, :family, "gaussian")) for spec in M.likelihood_specs]
+    needs_sigma = any(f -> f in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t", "dirichlet_multinomial"], families)
 
     zi_prior_block = ""
     hurdle_prior_block = ""
@@ -8943,7 +9187,7 @@ function extract_manifold(m_obj::Union{ICAR, Besag, RW1, RW2, Leroux, SAR, Cycli
         
         effect = zeros(Float64, n_units, n_samples)
         for s in 1:n_samples
-            effect[:, s] = (F.U \\ raw_samples[s, :]) .* sigma_samples[s, 1]
+            effect[:, s] = (F.U \ raw_samples[s, :]) .* sigma_samples[s, 1]
         end
         push!(structured_effects, effect)
     end
@@ -9120,7 +9364,7 @@ function extract_manifold(m::SVAR, spec::NamedTuple, chain, M::NamedTuple, arch:
     
     rho_field_samples = Array{Float64, 2}(undef, s_N, n_samples)
     for i in 1:n_samples
-        rho_field_samples[:, i] = tanh.(F_rho.U \\ rho_spatial_raw_samples[i, :])
+        rho_field_samples[:, i] = tanh.(F_rho.U \ rho_spatial_raw_samples[i, :])
     end
     
     # Reconstruct the full spatiotemporal latent field for each sample
