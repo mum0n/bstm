@@ -1112,7 +1112,7 @@ function _generate_manifold_code_fragments(m::MixedManifold, spec::NamedTuple, a
         update_inner_cleaned = replace(inner_frags.update, Regex("\\s*$(eta_target)\\s*\\.\\+=\\s*.*") => "")
 
         lhs_str = lhs_effects[1]
-        is_intercept = (lhs_str == "1" || lhs_str == "intercept()")
+        is_intercept = (lhs_str == "1" || lhs_str == "intercept()" || lhs_str == "(Intercept)")
 
         application_code = if is_intercept
             "$(eta_target) .+= view($(v.latent), M.$(index_var))"
@@ -1152,7 +1152,7 @@ function _generate_manifold_code_fragments(m::MixedManifold, spec::NamedTuple, a
         application_loop_acc = String[]
         for i in 1:k_effects
             term = lhs_effects[i]
-            is_int = (term == "1" || term == "intercept()")
+            is_int = (term == "1" || term == "intercept()" || term == "(Intercept)")
 
             term_application = if is_int
                 "        $(eta_target) .+= view(effects_matrix_$(spec.key), M.$(index_var), $(i))"
@@ -3582,11 +3582,12 @@ end
 
 
 """
-    replace_intercept_in_expr(ex)
+    _replace_bstm_modules_in_expr(ex)
 
-Recursively traverses a Julia expression and replaces calls to `intercept()` with the integer `1`.
-This allows the `mixed()` module's formula parser to treat `intercept()` as a standard
-StatsModels.jl intercept term (`1`), enabling correct parsing of random intercept models.
+Recursively traverses a Julia expression and replaces `bstm`-specific modules
+with their `StatsModels.jl` equivalents for parsing within other modules like `mixed()`.
+- `intercept()` becomes `1`.
+- `fixed(x)` becomes `x`.
 
 # Arguments
 - `ex`: A Julia expression, symbol, or literal.
@@ -3594,11 +3595,16 @@ StatsModels.jl intercept term (`1`), enabling correct parsing of random intercep
 # Returns
 - The modified expression.
 """
-function replace_intercept_in_expr(ex)
-    if ex isa Expr && ex.head == :call && ex.args[1] == :intercept
-        return 1
+function _replace_bstm_modules_in_expr(ex)
+    if ex isa Expr && ex.head == :call
+        if ex.args[1] == :intercept
+            return 1
+        elseif ex.args[1] == :fixed && length(ex.args) > 1
+            return ex.args[2] # Return the variable inside fixed()
+        end
+        return Expr(ex.head, _replace_bstm_modules_in_expr.(ex.args)...)
     elseif ex isa Expr
-        return Expr(ex.head, replace_intercept_in_expr.(ex.args)...)
+        return Expr(ex.head, _replace_bstm_modules_in_expr.(ex.args)...)
     else
         return ex
     end
@@ -3652,7 +3658,7 @@ function process_mixed_module!(opt_dict, mod_data, registries, hyperpriors)
     end
 
     # # Technical Audit: Normalize 'intercept()' to '1' for StatsModels compatibility
-    effect_expr_mod = replace_intercept_in_expr(effect_expr)
+    effect_expr_mod = _replace_bstm_modules_in_expr(effect_expr)
 
     # # Formula Parsing Engine
     schema = StatsModels.schema(data)
@@ -4409,7 +4415,7 @@ macro bstm(exprs...)
 
     # --- Core Logic: A simple call to the `bstm` function ---
     # We pass `__module__`, the special macro variable for the caller's module,
-    # as a positional argument to the `bstm` function.
+    # as a positional argument to the `bstm` function. the ":" is the quote operator
     core_logic = :(bstm($formula_str, $data_esc, $(__module__); $(kwargs_esc...)))
 
     # --- Final Macro Expansion ---
@@ -4426,23 +4432,15 @@ macro bstm(exprs...)
 end
 
 
-function bstm(formula::String, data::DataFrame; kwargs...)
-    # Purpose: A wrapper for `bstm` that defaults to the `Main` module context.
-    # Rationale: Simplifies calls when not inside a custom module.
-    # v1.2.1 (2026-07-16)
-    # Assumptions: None.
-    # Inputs:
-    #   - formula, data, kwargs.
-    # Outputs: A Turing.jl model object.
-    return bstm(formula, data, Main; kwargs...)
-end
-
-
-
-
 function bstm(formula::String, data::DataFrame, calling_module::Module; kwargs...)
-    # # Resolve technical model specification and generate source
-    options = bstm_config(formula, data; calling_module=calling_module, kwargs...)
+    # # Process: Translates a high-level formula and dataset into a Turing model instance.
+    # # Rationale: Separates the technical configuration from the dynamic code generation
+    # # and subsequent model instantiation.
+
+    # # Generate model configuration dictionary based on formula syntax and data schema
+    options = bstm_config(formula, data, calling_module = calling_module, kwargs...)
+
+    # # Invoke the codegen engine to produce the model source string and expression
     model_func_name, expr, new_config, registry = bstm_codegen(options)
 
     if get(new_config, :verbose, true)
@@ -4451,36 +4449,53 @@ function bstm(formula::String, data::DataFrame, calling_module::Module; kwargs..
         println("----------------------------------------\n")
     end
 
-    # # Evaluate the generated model expression within the calling module scope
+    # # Evaluate the generated @model macro expression in the target module scope
     calling_module.eval(expr)
-    
-    # # Retrieve a handle to the newly defined function
+
+    # # Access the function binding from the module's global scope
+    # # getfield retrieves the handle to the function defined above
     model_func = getfield(calling_module, model_func_name)
 
-    # # Resolving World-Age Issues:
-    # # Julia 1.12 requires invokelatest for functions defined and executed in the same evaluation turn.
-    local model_instance = Base.invokelatest(model_func, new_config, registry)
+    # # Instantiation of the Turing Model Object
+    # # Julia 1.12+ requires invokelatest for accessing bindings defined in the same turn.
+    # # This prevents WorldAge errors and warnings.
+    model_instance = Base.invokelatest(model_func, new_config, registry)
 
     if get(new_config, :verbose, true)
         println("\n--- Running prior predictive check ---")
     end
-    
+
+    prior_sample = nothing
     try
-        # # The rand method for the new model must also be called via invokelatest
-        local prior_sample = Base.invokelatest(rand, model_instance)
-        if get(new_config, :verbose, true)
+        # # Prior Predictive Validation
+        # # We also use invokelatest for the rand call to ensure the dynamic method 
+        # # dispatch for the new model type is resolved correctly.
+        prior_sample = Base.invokelatest(rand, model_instance)
+        # # Redirect stderr to devnull to suppress world-age warnings during this check.
+        redirect_stderr(devnull) do
+            prior_sample = Base.invokelatest(rand, model_instance)
+        end
+    
+        if get(new_config, :verbose, true) && !isnothing(prior_sample)
             println("Prior sample check successful. Sample values:")
             display(prior_sample)
         end
-    catch e
+    catch e 
+        # # Error handling for structural or parameterization issues
         _bstm_error_handler(e, model_instance)
     end
-    
+
     if get(new_config, :verbose, true)
         println("--------------------------------------\n")
     end
 
+    # # Return the fully configured and validated model object
     return model_instance
+end
+
+function bstm(formula::String, data::DataFrame; kwargs...)
+    # # Convenience overload defaulting to the Main execution scope
+    return bstm(formula, data, Main, kwargs...)
 end
 
 
@@ -8773,6 +8788,40 @@ function _generate_manifold_code_fragments(m::AdaptiveSmooth, spec::NamedTuple, 
     return (priors=priors, update=update)
 end
 
+
+"""
+    bstm_sample_nowarn(model, sampler, n_samples; kwargs...)
+
+A wrapper around `Turing.sample` that suppresses world-age warnings by temporarily
+redirecting `stderr` to `devnull`.
+
+# Rationale
+Dynamically generated models from `@bstm` can trigger non-fatal world-age warnings
+when interacting with pre-compiled library functions inside Turing.jl. This wrapper
+provides a clean way to run the sampler without printing these warnings to the console.
+
+# Arguments
+- `model`: The Turing model object.
+- `sampler`: The MCMC sampler to use.
+- `n_samples`: The number of samples to draw.
+- `kwargs...`: Additional keyword arguments passed directly to `Turing.sample`.
+
+# Returns
+- The MCMC chain object returned by `Turing.sample`.
+
+# Example
+```julia
+m = @bstm(likelihood(y) ~ 1, data)
+chn = bstm_sample_nowarn(m, NUTS(), 1000)
+```
+"""
+function bstm_sample_nowarn(model, sampler, n_samples; kwargs...)
+    local chain
+    redirect_stderr(devnull) do
+        chain = sample(model, sampler, n_samples; kwargs...)
+    end
+    return chain
+end
 
 
 
