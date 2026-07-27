@@ -1,0 +1,2146 @@
+# spatial processing/partitioning support
+
+
+function expand_hull(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, buffer_dist)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Computes the convex hull of a set of points and expands it by a specified buffer distance.
+    Inputs:
+        - s_x: A vector of x-coordinates.
+        - s_y: A vector of y-coordinates.
+        - buffer_dist: The distance to expand the convex hull.
+    Outputs:
+        - A `LibGEOS.Polygon` geometry representing the buffered convex hull.
+    """
+    s_coord_tuple_local = tuple.(s_x, s_y)
+
+    if isempty(s_coord_tuple_local) return LibGEOS.Polygon([[ (0.0,0.0), (0.0,0.0), (0.0,0.0), (0.0,0.0) ]]) end
+    coords_vec = [[Float64(p[1]), Float64(p[2])] for p in s_coord_tuple_local]
+    points_geom = LibGEOS.MultiPoint(coords_vec)
+    hull = LibGEOS.convexhull(points_geom)
+    buffered_hull = LibGEOS.buffer(hull, buffer_dist)
+    return buffered_hull
+end
+
+ 
+
+function get_kde_seeds(s_coord_tuple_local, target_u)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Generates initial seed locations for tessellation algorithms based on Kernel Density Estimation (KDE).
+              It samples points from the input coordinates, with selection weighted by a simple density proxy.
+    Inputs:
+        - s_coord_tuple_local: A vector of (x, y) coordinate tuples.
+        - target_u: The desired number of seeds to generate.
+    Outputs:
+        - A vector of seed coordinates.
+    """
+    # Basic KDE-based seeding using StatsBase weights based on local density
+    u_pts = unique(s_coord_tuple_local)
+    if isempty(u_pts) return [] end
+    n = length(u_pts)
+    dists = [sum((p1 .- p2).^2) for p1 in u_pts, p2 in u_pts]
+    # Inverse of mean distance as a density proxy
+    weights = 1.0 ./ (mean(dists, dims=2)[:] .+ 1e-6)
+    idx = StatsBase.sample(1:n, Weights(weights), min(target_u, n), replace=false)
+    return u_pts[idx]
+end
+
+ 
+function is_valid_polygon_coords(poly_coords)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Validates a set of polygon coordinates by filtering out non-finite values (NaN, Inf)
+              and ensuring there are at least three valid points to form a polygon.
+    Inputs:
+        - poly_coords: A vector of (x, y) coordinate tuples representing a polygon's vertices.
+    Outputs:
+        - A boolean indicating if the coordinates form a valid polygon.
+    """
+    valid_pts = [p for p in poly_coords if !isnan(p[1]) && !isinf(p[1]) && !isnan(p[2]) && !isinf(p[2])]
+    return length(valid_pts) >= 3
+end
+ 
+
+function get_cvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Performs Centroidal Voronoi Tessellation (CVT) using Lloyd's algorithm to partition space.
+              The function iteratively refines centroid locations to match the geometric centroids of their
+              corresponding Voronoi cells, with multiple diagnostic termination conditions.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates.
+        - cfg: A configuration object with parameters like `target`, `min_area`, `tolerance`, etc.
+        - hull_geom: A `LibGEOS` geometry used to clip the Voronoi polygons.
+    Outputs:
+        - A tuple containing the final centroid locations and a string indicating the termination reason.
+    """
+    s_coord_tuple_local = tuple.(s_x, s_y)
+
+    if length(s_coord_tuple_local) <= cfg.min_total_arealunits
+        return [ (mean(s_x), mean(s_y)) ], "not_enough_points_to_tessellate"
+    end
+
+    u_pts = unique(s_coord_tuple_local)
+    idx = StatsBase.sample(1:length(u_pts), min(cfg.target, length(u_pts)), replace=false)
+    curr_centroids = [u_pts[i] for i in idx]
+    termination_reason = "max_iterations"
+
+    # Initialize convergence tracking variables
+    last_mean_density = 0.0
+    last_cv = 0.0
+
+    for iter in 1:100
+        polys, _ = get_voronoi_polygons_and_edges(curr_centroids, hull_geom)
+        new_centroids = Tuple{Float64, Float64}[]
+        shifts = Float64[]
+
+        for i in 1:length(polys)
+            poly_coords = polys[i]
+            area = get_polygon_area(poly_coords) # Using refactored area func
+
+            if length(poly_coords) > 2 && area >= cfg.min_area && area <= cfg.max_area
+                lg_poly = LibGEOS.Polygon([[ [p[1], p[2]] for p in poly_coords ]])
+                cent_geom = LibGEOS.centroid(lg_poly)
+                seq = LibGEOS.getCoordSeq(cent_geom)
+                new_c = (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1))
+
+                dist = sqrt(sum((new_c .- curr_centroids[i]).^2))
+                push!(shifts, dist)
+                push!(new_centroids, new_c)
+            else
+                push!(new_centroids, curr_centroids[i])
+            end
+        end
+
+        if isempty(shifts) || mean(shifts) < cfg.tolerance
+            termination_reason = "convergence"
+            break
+        end
+
+        # Use original s_coord_tuple_local for assignment to clusters
+        assigns = [argmin([sum((p .- c).^2) for c in new_centroids]) for p in s_coord_tuple_local]
+        counts = [count(==(i), assigns) for i in 1:length(new_centroids)]
+
+        if isempty(counts)
+            termination_reason = "no_units_formed"
+            break
+        end
+
+        # New Density Convergence Check
+        curr_mean_density = mean(counts)
+        if abs(curr_mean_density - last_mean_density) < cfg.tolerance && iter > 1
+            termination_reason = "density_convergence"
+            break
+        end
+        last_mean_density = curr_mean_density
+
+        cv_val = std(counts) / (mean(counts) + 1e-9)
+        # CV Convergence Check
+        if abs(cv_val - last_cv) < cfg.tolerance && iter > 1
+            termination_reason = "cv_convergence"
+            break
+        end
+        last_cv = cv_val
+
+        if mean(counts) < cfg.min_points
+            termination_reason = "min_points_violation"
+            break
+        end
+
+        curr_centroids = new_centroids
+    end
+
+    return curr_centroids, termination_reason
+end
+
+
+function get_kvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Performs K-means Voronoi Tessellation (KVT), a density-aware partitioning method.
+              Unlike CVT, KVT moves centroids towards the mean position of the data points within
+              each Voronoi cell, effectively balancing partitions by point density.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates.
+        - cfg: A configuration object with parameters like `target`, `min_points`, `tolerance`, etc.
+        - hull_geom: A `LibGEOS` geometry used to clip the Voronoi polygons.
+    Outputs:
+        - A tuple containing the final centroid locations and a string indicating the termination reason.
+    """
+    s_coord_tuple_local = tuple.(s_x, s_y)
+
+
+    if length(s_coord_tuple_local) <= cfg.min_total_arealunits
+        return [ (mean(s_x), mean(s_y)) ], "not_enough_points_to_tessellate"
+    end
+
+    u_pts = unique(s_coord_tuple_local)
+    idx_init = StatsBase.sample(1:length(u_pts), min(cfg.target, length(u_pts)), replace=false)
+    c_iter = [u_pts[i] for i in idx_init]
+    data = tuple.(s_coord_tuple_local, cfg.t_idx)
+
+    damping = 0.7
+    termination_reason = "max_iterations"
+
+    # Initialize convergence tracking variables
+    last_mean_density = 0.0
+    last_cv = 0.0
+
+    for iter in 1:100
+        old_centroids = copy(c_iter)
+        assigns = [argmin([sum((p[1] .- sj).^2) for sj in c_iter]) for p in data]
+
+        polys_coords, _ = get_voronoi_polygons_and_edges(c_iter, hull_geom)
+
+        for k in 1:length(c_iter)
+            idx_cluster = findall(==(k), assigns)
+            ts_count = length(unique([data[j][2] for j in idx_cluster]))
+
+            area = 0.0
+            if k <= length(polys_coords)
+                area = get_polygon_area(polys_coords[k])
+            end
+
+            # Modified area_ok condition: require positive area
+            area_ok = (area > 0) && area >= cfg.min_area && area <= cfg.max_area
+
+            if !isempty(idx_cluster) && length(idx_cluster) >= cfg.min_points && ts_count >= cfg.min_time_slices && area_ok
+                mean_x = mean(data[j][1][1] for j in idx_cluster)
+                mean_y = mean(data[j][1][2] for j in idx_cluster)
+
+                c_iter[k] = ((1.0 - damping) * old_centroids[k][1] + damping * mean_x,
+                             (1.0 - damping) * old_centroids[k][2] + damping * mean_y)
+            end
+        end
+
+        counts = [count(==(k), assigns) for k in 1:length(c_iter)]
+        if isempty(counts)
+            termination_reason = "no_units_formed"
+            break
+        end
+
+        # New Density Convergence Check
+        curr_mean_density = mean(counts)
+        if abs(curr_mean_density - last_mean_density) < cfg.tolerance && iter > 1
+            termination_reason = "density_convergence"
+            break
+        end
+        last_mean_density = curr_mean_density
+
+        cv_val = std(counts) / (mean(counts) + 1e-9)
+        # CV Convergence Check
+        if abs(cv_val - last_cv) < cfg.tolerance && iter > 1
+            termination_reason = "cv_convergence"
+            break
+        end
+        last_cv = cv_val
+
+        if mean(counts) < cfg.min_points
+            termination_reason = "min_points_violation"
+            break
+        end
+
+        damping *= 0.99
+    end
+
+    return c_iter, termination_reason
+end
+
+
+
+
+function get_qvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Implements Quadtree Voronoi Tessellation (QVT), a hierarchical partitioning method.
+              It recursively splits regions into four quadrants based on median coordinates, adapting
+              to spatial density variations. Includes logic to handle collocated points.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates.
+        - cfg: A configuration object with parameters like `max_total_arealunits`, `min_points`, etc.
+        - hull_geom: A `LibGEOS` geometry (not directly used in splitting but relevant for context).
+    Outputs:
+        - A tuple containing the final centroid locations and a string indicating the termination reason.
+    """
+    s_coord_tuple_local = tuple.(s_x, s_y)
+
+    if length(s_coord_tuple_local) <= cfg.min_total_arealunits
+        return [ (mean(s_x), mean(s_y)) ], "not_enough_points_to_tessellate"
+    end
+
+    data = tuple.(s_coord_tuple_local, cfg.t_idx)
+    regions = [data]
+    unsplittable = Set{UInt64}()
+    effective_min_p = max(1, cfg.min_points)
+
+    if length(data) < 2 * effective_min_p
+        return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_tessellate"
+    end
+
+    termination_reason = "max_units_reached"
+    last_mean_density = 0.0
+    last_cv = 0.0
+    cnt = 0
+
+    while length(regions) < cfg.max_total_arealunits
+        cnt += 1
+        counts = length.(regions)
+        curr_mean_density = mean(counts)
+        cv_val = std(counts) / (curr_mean_density + 1e-9)
+
+        if cnt > 3
+            if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
+                if length(regions) >= cfg.target && all(c -> c <= cfg.max_points, counts)
+                    termination_reason = "converged_constraints_satisfied"
+                    break
+                elseif abs(cv_val - cfg.target_cv) < cfg.tolerance
+                    termination_reason = "converged_target_cv"
+                    break
+                end
+            end
+        end
+
+        last_mean_density = curr_mean_density
+        last_cv = cv_val
+
+        viable_indices = findall(r -> length(r) >= max(2, effective_min_p) && objectid(r) ∉ unsplittable, regions)
+        if isempty(viable_indices); break; end
+
+        target_idx = viable_indices[argmax([length(regions[i]) for i in viable_indices])]
+        target_region = regions[target_idx]
+        xs_r = [p[1][1] for p in target_region]
+        ys_r = [p[1][2] for p in target_region]
+
+        if length(unique(xs_r)) > 1 || length(unique(ys_r)) > 1
+            mx = length(unique(xs_r)) > 1 ? median(xs_r) : xs_r[1]
+            my = length(unique(ys_r)) > 1 ? median(ys_r) : ys_r[1]
+            r_splits = [
+                filter(p -> p[1][1] <= mx && p[1][2] <= my, target_region),
+                filter(p -> p[1][1] > mx && p[1][2] <= my, target_region),
+                filter(p -> p[1][1] <= mx && p[1][2] > my, target_region),
+                filter(p -> p[1][1] > mx && p[1][2] > my, target_region)
+            ]
+        else
+            # Corrected logic for collocated spatial points
+            mid = length(target_region) ÷ 2
+            r_splits = [target_region[1:mid], target_region[mid+1:end], [], []]
+        end
+
+        valid_splits = filter(r -> length(r) >= effective_min_p, r_splits)
+        if length(valid_splits) < 2
+            push!(unsplittable, objectid(target_region))
+            continue
+        end
+
+        deleteat!(regions, target_idx)
+        append!(regions, valid_splits)
+    end
+
+    final_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
+    return final_centroids, termination_reason
+end
+
+
+function get_bvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
+    """
+    BSTM Partitioning Utility v1.0.1
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Implements Binary Voronoi Tessellation (BVT), a recursive partitioning method.
+              It splits regions along the axis of maximum variance, making it efficient for
+              handling large datasets and creating balanced partitions.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates.
+        - cfg: A configuration object with parameters like `max_total_arealunits`, `min_points`, etc.
+        - hull_geom: A `LibGEOS` geometry used for clipping and area validation.
+    Outputs:
+        - A tuple containing the final centroid locations and a string indicating the termination reason.
+    Rationale for v1.0.1:
+        - Restored the fallback logic that ensures the function does not return fewer units than
+          `cfg.min_total_arealunits`. If the partitioning results in too few units, it now returns a single aggregated centroid.
+    """
+    s_coord_tuple_local = tuple.(s_x, s_y)
+
+    if length(s_coord_tuple_local) <= cfg.min_total_arealunits
+        return [ (mean(s_x), mean(s_y)) ], "not_enough_points_to_tessellate"
+    end
+
+    data = tuple.(s_coord_tuple_local, cfg.t_idx)
+    regions = [data]
+    # Track specific region objects that failed to split to avoid redundant attempts
+
+    effective_min_p = max(1, cfg.min_points)
+    if length(data) < 2 * effective_min_p # Initial check: if the whole dataset is too small to split
+        return [(mean(p[1][1] for p in data), mean(p[1][2] for p in data))], "initial_data_too_small_to_tessellate"
+    end
+
+    unsplittable = Set{UInt64}()
+    termination_reason = "max_units_reached"
+    last_mean_density = 0.0
+    last_cv = 0.0
+    cnt =0
+
+    while length(regions) < cfg.max_total_arealunits
+        cnt += 1
+
+        counts = length.(regions)
+        curr_mean_density = mean(counts)
+        cv_val = std(counts) / (curr_mean_density + 1e-9)
+
+        # Early breaking based on statistical stabilization and target resolution
+        if cnt > 3
+            if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
+                if length(regions) >= cfg.target && all(c -> c <= cfg.max_points, counts)
+                    termination_reason = "converged_constraints_satisfied"
+                    break
+                elseif (abs(cv_val - cfg.target_cv) < cfg.tolerance)
+                    termination_reason = "converged_target_cv"
+                    break
+                elseif (count(>(cfg.max_points), counts) / length(regions)) < cfg.tolerance/10
+                    termination_reason = "converged_minor_violations"
+                    break
+                end
+            end
+        end
+
+        last_mean_density = curr_mean_density
+        last_cv = cv_val
+
+        # Candidacy: regions that can be split
+        viable_indices = findall(r -> length(r) >= max(2, effective_min_p) && objectid(r) ∉ unsplittable, regions)
+        if cnt > 3
+            if isempty(viable_indices); termination_reason = "cannot_split_further"; break; end
+        end
+
+        # Split if (below min_total_arealunits) OR (below target OR has max_points violators)
+        violators = filter(i -> length(regions[i]) > cfg.max_points, viable_indices)
+        must_split = length(regions) < cfg.min_total_arealunits
+        want_split = length(regions) < cfg.target || !isempty(violators)
+        candidates = (must_split || want_split) ? (isempty(violators) ? viable_indices : violators) : []
+
+        if isempty(candidates); termination_reason = "constraints_satisfied"; break; end
+
+        # Attempt splitting the largest available candidate
+        target_idx = candidates[argmax([length(regions[i]) for i in candidates])]
+        target = regions[target_idx]
+
+        xs = [p[1][1] for p in target]; ys = [p[1][2] for p in target]
+        var_x = length(xs) > 1 ? var(xs) : 0.0
+        var_y = length(ys) > 1 ? var(ys) : 0.0
+        dim = var_x > var_y ? 1 : 2
+
+        if var_x > 1e-9 || var_y > 1e-9
+            vals = [p[1][dim] for p in target]
+            med = length(unique(vals)) > 1 ? median(vals) : vals[1]
+            r1 = filter(p -> p[1][dim] <= med, target)
+            r2 = filter(p -> p[1][dim] > med, target)
+        else
+            # Handle collocated points
+            mid = length(target) ÷ 2
+            r1, r2 = target[1:mid], target[mid+1:end]
+        end
+
+        # Validate children for point count and temporal diversity
+        v1 = length(r1) >= effective_min_p && length(unique([p[2] for p in r1])) >= cfg.min_time_slices
+        v2 = length(r2) >= effective_min_p && length(unique([p[2] for p in r2])) >= cfg.min_time_slices
+
+        if !v1 || !v2
+             push!(unsplittable, objectid(target))
+             continue
+        end
+
+        # Tentative update to check global area constraints
+        tentative_regions = copy(regions)
+        deleteat!(tentative_regions, target_idx)
+        push!(tentative_regions, r1, r2)
+
+        candidate_centroids = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in tentative_regions]
+        polys_coords, _ = get_voronoi_polygons_and_edges(candidate_centroids, hull_geom)
+
+        area_violation = any(
+            p_coords -> !is_valid_polygon_coords(p_coords) || get_polygon_area(p_coords) < cfg.min_area,
+            polys_coords
+        )
+
+        if area_violation && length(tentative_regions) > cfg.min_total_arealunits
+             push!(unsplittable, objectid(target))
+             continue
+        end
+
+        regions = tentative_regions
+    end
+
+    final_centroids_candidate = [(mean(p[1][1] for p in r), mean(p[1][2] for p in r)) for r in regions]
+
+    if length(final_centroids_candidate) < cfg.min_total_arealunits
+        # Aggregate all original points (from 'data') into a single centroid
+        all_pts_x = [p[1][1] for p in data]
+        all_pts_y = [p[1][2] for p in data]
+        return [ (mean(all_pts_x), mean(all_pts_y)) ], "insufficient_units_error"
+    else
+        return final_centroids_candidate, termination_reason
+    end
+end
+
+ 
+ 
+function get_hvt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom; max_iter=500)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Implements Hierarchical Voronoi Tessellation (HVT), which combines K-means seeding
+              with Lloyd's algorithm refinement and an adaptive splitting mechanism. It aims to
+              create geometrically regular polygons that also respect data density constraints.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates.
+        - cfg: A configuration object with parameters like `target`, `max_points`, `tolerance`, etc.
+        - hull_geom: A `LibGEOS` geometry (not directly used but relevant for context).
+        - max_iter: The maximum number of iterations for the main refinement loop.
+    Outputs:
+        - A tuple containing the final centroid locations and a string indicating the termination reason.
+    """
+    s_coord_tuple_local = tuple.(s_x, s_y)
+
+    # Internal utility for point-to-centroid distance
+    dist(p1, p2) = sqrt(sum((p1 .- p2).^2))
+
+    # Standardized refinement loop (Lloyd's update)
+    function refine(pts_in, centroids, iters)
+        curr = deepcopy(centroids)
+        for _ in 1:iters
+            groups = [Int[] for _ in 1:length(curr)]
+            for (i, p) in enumerate(pts_in)
+                dists = [dist(p, c) for c in curr]
+                push!(groups[argmin(dists)], i)
+            end
+            new_c = [!isempty(idx) ?
+                     (mean(pts_in[j][1] for j in idx), mean(pts_in[j][2] for j in idx)) :
+                     curr[k] for (k, idx) in enumerate(groups)]
+            if all(dist(new_c[j], curr[j]) < cfg.tolerance for j in 1:length(curr))
+                return new_c
+            end
+            curr = new_c
+        end
+        return curr
+    end
+
+    # Initial Seed generation using k-means
+    # Convert s_coord_tuple_local to matrix for Clustering.jl
+    pts_matrix = hcat([p[1] for p in s_coord_tuple_local], [p[2] for p in s_coord_tuple_local])'
+    k_target = max(1, cfg.min_total_arealunits)
+
+    # Run k-means to find initial centers
+    R = kmeans(pts_matrix, k_target)
+    curr_centroids = [(R.centers[1, i], R.centers[2, i]) for i in 1:size(R.centers, 2)]
+
+    # Iterative HVT process with advanced stopping conditions
+    last_mean_density = 0.0
+    last_cv = 0.0
+    status = "max_iterations_reached"
+
+    for i in 1:max_iter
+        # 1. Assignment step to calculate metrics
+        s_idx = [argmin([dist(p, c) for c in curr_centroids]) for p in s_coord_tuple_local]
+        counts = [count(==(k), s_idx) for k in 1:length(curr_centroids)]
+
+        curr_mean_density = mean(counts)
+        cv_val = std(counts) / (curr_mean_density + 1e-9)
+
+        # Convergence logic aligned with QVT/BVT
+        if i > 5
+            if abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance
+                if length(curr_centroids) >= cfg.target && all(c -> c <= cfg.max_points, counts)
+                    status = "converged_constraints_satisfied"
+                    break
+                elseif abs(cv_val - cfg.target_cv) < cfg.tolerance
+                    status = "converged_target_cv"
+                    break
+                elseif (count(>(cfg.max_points), counts) / length(curr_centroids)) < cfg.tolerance/10
+                    status = "converged_minor_violations"
+                    break
+                end
+            end
+        end
+
+        last_mean_density = curr_mean_density
+        last_cv = cv_val
+
+        # 2. Refinement step (Lloyd's update)
+        new_centroids = refine(s_coord_tuple_local, curr_centroids, 3)
+
+        # Check for centroid position stabilization
+        if all(dist(new_centroids[j], curr_centroids[j]) < cfg.tolerance for j in 1:length(curr_centroids))
+             # If positions stabilized but constraints aren't met, check if add a unit
+             if length(curr_centroids) < cfg.max_total_arealunits && (length(curr_centroids) < cfg.target || any(counts .> cfg.max_points))
+                 # Split the largest group to improve density balance
+                 idx_to_split = argmax(counts)
+                 group_pts = s_coord_tuple_local[s_idx .== idx_to_split]
+                 if length(group_pts) >= 2 * cfg.min_points
+                     new_seeds = [(mean(p[1] for p in group_pts) * 0.99, mean(p[2] for p in group_pts) * 0.99),
+                                  (mean(p[1] for p in group_pts) * 1.01, mean(p[2] for p in group_pts) * 1.01)]
+                     deleteat!(curr_centroids, idx_to_split)
+                     append!(curr_centroids, new_seeds)
+                     continue
+                 end
+             end
+             status = "converged_stable_positions"
+             break
+        end
+
+        curr_centroids = new_centroids
+    end
+
+    return curr_centroids, status
+end
+
+
+
+
+
+"""
+BSTM Partitioning Utility v1.0.0
+Timestamp: 2026-06-26 10:01:50
+Synopsis: Implements Agglomerative Voronoi Tessellation (AVT), a bottom-up partitioning method.
+          It starts with an over-partitioned set of units and iteratively merges the smallest
+          or most "starved" units until all remaining units satisfy minimum constraints on
+          point counts, time-slice representation, and geometric area.
+Inputs:
+    - s_x, s_y: Vectors of spatial coordinates.
+    - cfg: A configuration object with parameters like `min_total_arealunits`, `min_points`, etc.
+    - hull_geom: A `LibGEOS` geometry used to clip the Voronoi polygons.
+Outputs:
+    - A tuple containing the final centroid locations and a string indicating the termination reason.
+"""
+function get_avt_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, cfg, hull_geom)
+
+    s_coord_tuple = tuple.(s_x, s_y)
+    
+    if length(s_coord_tuple) <= cfg.min_total_arealunits
+        return [ (mean(p[1] for p in s_coord_tuple), mean(p[2] for p in s_coord_tuple)) ], "not_enough_points_to_tessellate"
+    end
+
+    u_pts = unique(s_coord_tuple)
+    # Seeding centroids via KDE-based logic
+    c_init = get_kde_seeds(u_pts, min(length(u_pts), cfg.max_total_arealunits))
+    data = tuple.(s_coord_tuple, cfg.t_idx)
+    curr_c = [SVector{2, Float64}(c) for c in c_init]
+
+    termination_reason = "min_units_reached"
+    last_mean_density = 0.0
+    last_cv = 0.0
+
+    while length(curr_c) > cfg.min_total_arealunits
+        # 1. Assignment
+        assigns = [Int[] for _ in 1:length(curr_c)]
+        for i in 1:length(data)
+            d_pt = data[i][1]
+            # Finding closest centroid (Explicit loop for clarity)
+            dist_idx = argmin([sum((d_pt .- c).^2) for c in curr_c])
+            push!(assigns[dist_idx], i)
+        end
+        
+        counts = length.(assigns)
+        
+        # 2. Geometry Calculation
+        # get_voronoi_polygons_and_edges returns Vector{Vector{Tuple{Float64, Float64}}}
+        polys_coords, _ = get_voronoi_polygons_and_edges([Tuple(c) for c in curr_c], hull_geom)
+        
+        areas = fill(0.0, length(curr_c))
+        for i in 1:min(length(curr_c), length(polys_coords))
+            # Fixed Call: Passes the Vector of Tuples directly to the new method
+            areas[i] = get_polygon_area(polys_coords[i])
+        end
+
+        # 3. Violation Audit
+        violators = Int[]
+        for k in 1:length(curr_c)
+            ts_count = length(unique([data[idx][2] for idx in assigns[k]]))
+            
+            # Logic for merging: too few points, too few time slices, or area outside bounds
+            is_invalid_count = counts[k] < cfg.min_points
+            is_invalid_time = ts_count < cfg.min_time_slices
+            is_invalid_area = (areas[k] > 0 && areas[k] < cfg.min_area) || (areas[k] > cfg.max_area)
+            
+            if is_invalid_count || is_invalid_time || is_invalid_area
+                push!(violators, k)
+            end
+        end
+
+        # 4. Convergence Check
+        curr_mean_density = mean(counts)
+        cv_val = std(counts) / (mean(counts) + 1e-9)
+        
+        if last_mean_density > 0.0 && (abs(curr_mean_density - last_mean_density) < cfg.tolerance || abs(cv_val - last_cv) < cfg.tolerance)
+            termination_reason = "tolerance_reached"
+            break
+        end
+        
+        last_mean_density = curr_mean_density
+        last_cv = cv_val
+
+        # 5. Merging Step
+        # Identify target unit to merge (the one with the lowest count among violators or overall)
+        candidates_indices = isempty(violators) ? collect(1:length(curr_c)) : violators
+        v_counts = [counts[k] for k in candidates_indices]
+        target_idx = candidates_indices[argmin(v_counts)]
+
+        # Find nearest neighbor for the target centroid
+        dists = [sum((curr_c[target_idx] .- curr_c[j]).^2) for j in 1:length(curr_c)]
+        dists[target_idx] = Inf
+        neighbor_idx = argmin(dists)
+
+        # Weighted update for the merged centroid location
+        total_n = counts[target_idx] + counts[neighbor_idx]
+        curr_c[neighbor_idx] = (curr_c[target_idx] .* counts[target_idx] .+ curr_c[neighbor_idx] .* counts[neighbor_idx]) ./ (total_n + 1e-9)
+        
+        # Explicit removal (No clamp used)
+        deleteat!(curr_c, target_idx)
+    end
+    
+    return [Tuple(c) for c in curr_c], termination_reason
+end
+
+
+function get_lattice_centroids(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, lengthscale)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Generates centroids for a regular 2D lattice (grid) that covers the extent of the input points.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates used to determine the grid's bounding box.
+        - lengthscale: The side length of each square grid cell.
+    Outputs:
+        - A tuple containing:
+            - A vector of centroid coordinates.
+            - The number of rows and columns in the grid, and the bounding box.
+    """
+    s_coord_tuple = tuple.(s_x, s_y)
+
+    if isempty(s_coord_tuple); return [], 0, 0, (0.0, 0.0, 0.0, 0.0); end
+
+    xs = [p[1] for p in s_coord_tuple]
+    ys = [p[2] for p in s_coord_tuple]
+
+    xmin, xmax = minimum(xs), maximum(xs)
+    ymin, ymax = minimum(ys), maximum(ys)
+
+    # Generate grid ranges
+    x_range = collect(xmin:lengthscale:xmax)
+    y_range = collect(ymin:lengthscale:ymax)
+
+    # Ensure at least one cell if the range is smaller than lengthscale
+    if isempty(x_range); x_range = [xmin]; end
+    if isempty(y_range); y_range = [ymin]; end
+
+    rows = length(y_range)
+    cols = length(x_range)
+
+    # Create meshgrid of centroids
+    centroids = [(x, y) for y in y_range, x in x_range][:]
+
+    return centroids, rows, cols, (xmin, xmax, ymin, ymax)
+end
+
+
+
+function load_shapefile_to_libgeos(filepath::String)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Loads a shapefile and converts its geometries into `LibGEOS` objects.
+    Requires `Shapefile.jl` and `GeoInterface.jl` to be installed.
+    Inputs:
+        - filepath: The path to the .shp file.
+    Outputs:
+        - A tuple containing:
+            - A vector of `LibGEOS` geometry objects.
+            - The `Shapefile.Table` object containing attribute data.
+    """
+    table = Shapefile.Table(filepath)
+    
+    # Extract geometries and convert to LibGEOS
+    # GeoInterface allows LibGEOS to understand Shapefile objects automatically
+    geoms = [LibGEOS.read_geom(row.geometry) for row in table]
+    
+    return geoms, table
+end
+
+function get_user_centroids(input_polygons)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Processes a vector of user-provided `LibGEOS` polygons to extract their centroids,
+              coordinate sequences, and the overall hull.
+    Inputs:
+        - input_polygons: A vector of `LibGEOS.Polygon` objects.
+    Outputs:
+        - A tuple containing the centroids, polygon coordinates, and hull coordinates.
+    """
+    # Convert input to a concrete vector of LibGEOS Polygons
+    geoms = LibGEOS.Polygon[p for p in input_polygons]
+    n = length(geoms)
+    centroids = Vector{Tuple{Float64, Float64}}(undef, n)
+    polys_coords = Vector{Vector{Tuple{Float64, Float64}}}(undef, n)
+
+    for i in 1:n
+        poly = geoms[i]
+        cent_geom = LibGEOS.centroid(poly)
+        seq = LibGEOS.getCoordSeq(cent_geom)
+        centroids[i] = (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1))
+        polys_coords[i] = get_coords_from_geom(poly)
+    end
+
+    # Wrap the vector in a GeometryCollection so GeoInterface traits are recognized
+    collection = LibGEOS.GeometryCollection(geoms)
+    # Perform unaryUnion on the collection instead of the vector
+    united = LibGEOS.unaryUnion(collection)
+    hull_coords = get_coords_from_geom(united)
+
+    return centroids, polys_coords, hull_coords
+end
+
+
+function assign_spatial_units(s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}; area_method=:avt, target_units=10, lengthscale=nothing, input_polygons=nothing, geom_hull=nothing, kwargs...)
+    """
+    BSTM Partitioning Utility v1.0.1
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: A high-level dispatcher for partitioning a spatial domain into discrete areal units.
+              It supports various methods including Voronoi-based tessellations, regular lattices,
+              and user-provided polygons. It generates centroids, polygons, and an adjacency graph.
+    Inputs:
+        - s_x, s_y: Vectors of spatial coordinates for the data points.
+        - area_method: The partitioning algorithm to use (e.g., :avt, :cvt, :lattice).
+        - kwargs: Additional parameters passed to the specific partitioning algorithm.
+    Outputs:
+        - A `NamedTuple` containing all partitioning information: centroids, polygons, adjacency graph (W),
+          point assignments (s_idx), and termination reason.
+    Rationale for v1.0.1:
+        - Corrected a `MethodError` in the `:lattice` method where `expand_hull` was called with an
+          invalid argument. The call now correctly passes the coordinate vectors `s_x` and `s_y`.
+    """
+    # s_coord_tuple_local will be used for calculations that still expect a collection of points
+
+    s_coord_tuple_local = tuple.(s_x, s_y) # Using the globally defined helper
+
+    # The branch for `input_data isa AbstractMatrix` is removed, as this refactored function
+    # is specifically for coordinate-based spatial unit assignment. `bstm_options`
+    # or a similar function will call `assign_spatial_units_inferred` (or its refactored version)
+    # directly if an adjacency matrix is provided as primary input.
+
+    # 1. Handle User-Defined Polygons
+    if !isnothing(input_polygons)
+        # If geom_hull is provided, intersect the input polygons with it
+        processed_polys = isnothing(geom_hull) ? input_polygons : [LibGEOS.intersection(p, geom_hull) for p in input_polygons]
+
+        final_centroids, polys_coords, hull_coords = get_user_centroids(processed_polys)
+        reason = :user_polygons
+        n_units = length(final_centroids)
+
+        g = SimpleGraph(n_units)
+        for i in 1:n_units, j in (i+1):n_units
+            if LibGEOS.touches(processed_polys[i], processed_polys[j]) || LibGEOS.intersects(LibGEOS.buffer(processed_polys[i], 1e-7), processed_polys[j])
+                add_edge!(g, i, j)
+            end
+        end
+        g = ensure_connected!(g, final_centroids)
+        W = Float64.(Graphs.adjacency_matrix(g))
+
+        # Use s_coord_tuple_local for assignments, as it represents the original observation points
+        new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in s_coord_tuple_local]
+        v_edges = []
+
+    # 2. Handle Lattice Method
+    elseif area_method == :lattice
+        # `expand_hull` and `get_lattice_centroids` will be refactored to take s_x, s_y
+        ls = isnothing(lengthscale) ? sqrt(get_polygon_area(get_coords_from_geom(expand_hull(s_x, s_y, 0.0))) / target_units) : lengthscale # Corrected call
+        final_centroids_raw, rows, cols, bbox = get_lattice_centroids(s_x, s_y, ls) # Updated call
+        reason = :lattice_grid
+
+        # Generate square polygons and clip them if geom_hull is provided
+        polys_coords = Vector{Vector{Tuple{Float64, Float64}}}()
+        lg_polys = LibGEOS.Polygon[]
+        final_centroids = Tuple{Float64, Float64}[]
+        half = ls / 2.0
+
+        for c in final_centroids_raw
+            coords = [[(c[1]-half, c[2]-half), (c[1]+half, c[2]-half), (c[1]+half, c[2]+half), (c[1]-half, c[2]+half), (c[1]-half, c[2]+half)]]
+            p_geom = LibGEOS.Polygon(coords)
+            if !isnothing(geom_hull)
+                p_geom = LibGEOS.intersection(p_geom, geom_hull)
+            end
+
+            if !LibGEOS.isEmpty(p_geom)
+                push!(lg_polys, p_geom)
+                p_c = LibGEOS.centroid(p_geom)
+                seq = LibGEOS.getCoordSeq(p_c)
+                push!(final_centroids, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
+                push!(polys_coords, get_coords_from_geom(p_geom))
+            end
+        end
+
+        n_units = length(final_centroids)
+        g = SimpleGraph(n_units)
+        for i in 1:n_units, j in (i+1):n_units
+            if LibGEOS.touches(lg_polys[i], lg_polys[j]) || LibGEOS.intersects(LibGEOS.buffer(lg_polys[i], 1e-7), lg_polys[j])
+                add_edge!(g, i, j)
+            end
+        end
+        g = ensure_connected!(g, final_centroids)
+        W = Float64.(Graphs.adjacency_matrix(g))
+
+        # Use s_coord_tuple_local for assignments
+        new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in s_coord_tuple_local]
+        v_edges = []
+        hull_coords = isnothing(geom_hull) ? [(bbox[1], bbox[3]), (bbox[2], bbox[3]), (bbox[2], bbox[4]), (bbox[1], bbox[4]), (bbox[1], bbox[3])] : get_coords_from_geom(geom_hull)
+
+    # 3. Standard Tessellation Methods
+    else
+        cfg = (
+            target=Int(target_units),
+            min_total_arealunits=Int(get(kwargs, :min_total_arealunits, 3)),
+            max_total_arealunits=Int(get(kwargs, :max_total_arealunits, target_units*2)),
+            min_time_slices=Int(get(kwargs, :min_time_slices, 1)),
+            min_points=Int(get(kwargs, :min_points, 1)),
+            max_points=Int(get(kwargs, :max_points, length(s_x))), # Use length of s_x
+            min_area=get(kwargs, :min_area, 0.0),
+            max_area=get(kwargs, :max_area, Inf),
+            target_cv=get(kwargs, :target_cv, 1.0),
+            tolerance=get(kwargs, :tolerance, 0.1),
+            buffer_dist=get(kwargs, :buffer_dist, 0.5),
+            t_idx=get(kwargs, :t_idx, ones(Int, length(s_x)))) # Use length of s_x
+
+        # `expand_hull` will be refactored to take s_x, s_y
+        hull_geom = !isnothing(geom_hull) ? geom_hull : expand_hull(s_x, s_y, cfg.buffer_dist) # Updated call
+
+        # Centroid functions will be refactored to take s_x, s_y
+        c_mid, reason = if area_method == :cvt get_cvt_centroids(s_x, s_y, cfg, hull_geom)
+        elseif area_method == :kvt get_kvt_centroids(s_x, s_y, cfg, hull_geom)
+        elseif area_method == :qvt get_qvt_centroids(s_x, s_y, cfg, hull_geom)
+        elseif area_method == :bvt get_bvt_centroids(s_x, s_y, cfg, hull_geom)
+        elseif area_method == :hvt get_hvt_centroids(s_x, s_y, cfg, hull_geom)
+        elseif area_method == :avt get_avt_centroids(s_x, s_y, cfg, hull_geom) # Updated call
+        else error("Unknown partitioning method: $area_method") end
+
+        polys_coords, v_edges = get_voronoi_polygons_and_edges(c_mid, hull_geom)
+        final_centroids = Tuple{Float64, Float64}[]
+        lg_polys = []
+        for p_coords in polys_coords
+            if isempty(p_coords); continue; end
+            # Ensure polygon is closed for LibGEOS if it's not already
+            if p_coords[1] != p_coords[end]; push!(p_coords, p_coords[1]); end
+            lg_p = LibGEOS.Polygon([[ [pt[1], pt[2]] for pt in p_coords ]])
+            push!(lg_polys, lg_p)
+            cent_g = LibGEOS.centroid(lg_p)
+            seq = LibGEOS.getCoordSeq(cent_g)
+            push!(final_centroids, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
+        end
+
+        # Use s_coord_tuple_local for assignments
+        new_assigns = [argmin([sum((p .- sj).^2) for sj in final_centroids]) for p in s_coord_tuple_local]
+        n_units = length(final_centroids)
+        g = SimpleGraph(n_units)
+        for i in 1:n_units, j in (i+1):n_units
+            if LibGEOS.touches(lg_polys[i], lg_polys[j]) || LibGEOS.intersects(LibGEOS.buffer(lg_polys[i], 1e-7), lg_polys[j])
+                add_edge!(g, i, j)
+            end
+        end
+        g = ensure_connected!(g, final_centroids)
+        hull_coords = get_coords_from_geom(hull_geom)
+        W = Float64.(Graphs.adjacency_matrix(g))
+    end
+
+    # Update the returned NamedTuple to store s_x and s_y
+    return (centroids=final_centroids, polygons=polys_coords,
+            adjacency_edges=v_edges, graph=g, W=W, hull_coords=hull_coords,
+            s_idx=new_assigns, s_x=s_x, s_y=s_y, s_vals=collect(1:size(W,1)), termination_reason=reason)
+end
+
+
+
+function assign_spatial_units_inferred(adjacency_matrix; iterations=50, learning_rate=0.1, buffer_dist=0.5, input_polygons = nothing)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Constructs an `areal_units` object for data where only adjacency information is available
+              (e.g., the Scottish Lip Cancer dataset). If polygons are not provided, it infers spatial
+              positions using a simple force-directed layout algorithm and then generates Voronoi polygons.
+    Inputs:
+        - adjacency_matrix: The adjacency matrix (W) defining neighborhood relationships.
+        - iterations: Number of iterations for the force-directed layout.
+        - learning_rate: Step size for moving centroids in the layout algorithm.
+        - buffer_dist: Distance to buffer the convex hull for inferred polygons.
+        - input_polygons: Optional. A vector of `LibGEOS.Polygon` objects to use directly.
+    Outputs:
+        - A `NamedTuple` containing the inferred or provided geometric and graph information.
+    """
+    local final_centroids
+    local adjacency_edges_output
+    local polys_output
+    local hull_coords_output
+    local g_final # The final graph that will be in the result
+
+    nAU = size(adjacency_matrix, 1)
+
+
+    if input_polygons !== nothing && !isempty(input_polygons)
+        # Case 1: Polygons are provided
+        # 1. Extract centroids from input_polygons
+        final_centroids_geoms = [LibGEOS.centroid(p) for p in input_polygons]
+        final_centroids = map(final_centroids_geoms) do g_pt
+            seq = LibGEOS.getCoordSeq(g_pt)
+            (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1))
+        end
+
+        # 2. Determine hull by dissolving all internal edges
+        united_geom = LibGEOS.unaryunion(input_polygons)
+        hull_coords_output = get_coords_from_geom(united_geom)
+
+        # 3. Determine adjacency from input_polygons (using LibGEOS.touches)
+        adjacency_edges_output = []
+        for i in 1:nAU
+            g1 = input_polygons[i]
+            for j in (i+1):nAU
+                g2 = input_polygons[j]
+                if LibGEOS.touches(g1, g2)
+                    push!(adjacency_edges_output, (final_centroids[i], final_centroids[j]))
+                else
+                    # Fallback robust check, similar to get_voronoi_polygons_and_edges
+                    g1_buffered = LibGEOS.buffer(g1, 1e-6)
+                    if LibGEOS.intersects(g1_buffered, g2)
+                        inter = LibGEOS.intersection(g1_buffered, g2)
+                        if !LibGEOS.isEmpty(inter) && (LibGEOS.area(inter) > 1e-9 || LibGEOS.geomTypeId(inter) in [LibGEOS.GEOS_LINESTRING, LibGEOS.GEOS_MULTILINESTRING])
+                            push!(adjacency_edges_output, (final_centroids[i], final_centroids[j]))
+                        end
+                    end
+                end
+            end
+        end
+
+        polys_output = [get_coords_from_geom(p) for p in input_polygons]
+
+        # Build graph from the determined adjacency edges and ensure connectivity
+        g_final = SimpleGraph(nAU)
+        centroid_map = Dict(c => i for (i, c) in enumerate(final_centroids))
+        for (c1, c2) in adjacency_edges_output
+            xi = get(centroid_map, c1, 0)
+            yi = get(centroid_map, c2, 0)
+            if xi > 0 && yi > 0 && !has_edge(g_final, xi, yi)
+                add_edge!(g_final, xi, yi)
+            end
+        end
+        g_final = ensure_connected!(g_final, final_centroids) # Ensure connectivity if necessary
+
+    else
+        # Case 2: Polygons are not provided, infer centroids and use tessellation
+        # 1. Build initial graph from adjacency_matrix for force-directed layout
+        g_initial_for_layout = SimpleGraph(adjacency_matrix)
+
+        # 2. Infer initial centroids using force-directed layout
+        side = ceil(Int, sqrt(nAU))
+        initial_centroids_fd = [(Float64(i % side), Float64(i ÷ side)) for i in 0:(nAU-1)]
+        centroids_vec = [SVector{2, Float64}(c) for c in initial_centroids_fd]
+
+        for iter in 1:iterations
+            new_centroids_vec = copy(centroids_vec)
+            for i in 1:nAU
+                neighbors_i = Graphs.neighbors(g_initial_for_layout, i)
+                if !isempty(neighbors_i)
+                    avg_neighbor_pos = sum(centroids_vec[n] for n in neighbors_i) / length(neighbors_i)
+                    new_centroids_vec[i] = centroids_vec[i] + learning_rate * (avg_neighbor_pos - centroids_vec[i])
+                end
+            end
+            centroids_vec = new_centroids_vec
+        end
+        # Centroids after force-directed layout
+        forced_layout_centroids = [(p[1], p[2]) for p in centroids_vec]
+
+        # 3. Determine hull_geom from inferred centroids for clipping
+        fx = getindex.(forced_layout_centroids, 1)
+        fy = getindex.(forced_layout_centroids, 2)
+        hull_geom = expand_hull(fx, fy, buffer_dist)
+        hull_coords_output = get_coords_from_geom(hull_geom)
+
+        # 4. Use tessellation to determine polygon coordinates and initial adjacency (based on forced_layout_centroids)
+        polys_coords_raw, _ = get_voronoi_polygons_and_edges(forced_layout_centroids, hull_geom)
+
+        # 5. RECOMPUTE CENTROIDS from the generated (clipped) polygons and prepare for adjacency
+        final_centroids = Vector{Tuple{Float64, Float64}}(undef, length(polys_coords_raw))
+        lg_polygons_for_adjacency = Vector{Union{LibGEOS.Polygon, Nothing}}(undef, length(polys_coords_raw))
+        polys_output = polys_coords_raw
+
+        for (idx, poly_coord_list) in enumerate(polys_coords_raw)
+            if !isempty(poly_coord_list) && length(poly_coord_list) >= 3
+                if poly_coord_list[1] != poly_coord_list[end]
+                    push!(poly_coord_list, poly_coord_list[1])
+                end
+                lg_poly = LibGEOS.Polygon([ [Float64[p[1], p[2]] for p in poly_coord_list] ])
+                centroid_geom = LibGEOS.centroid(lg_poly)
+                seq = LibGEOS.getCoordSeq(centroid_geom)
+                final_centroids[idx] = (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1))
+                lg_polygons_for_adjacency[idx] = lg_poly
+            else
+                @warn "Invalid or empty polygon encountered in Voronoi tessellation at index $idx. Using original centroid as fallback."
+                final_centroids[idx] = forced_layout_centroids[idx]
+                lg_polygons_for_adjacency[idx] = nothing
+            end
+        end
+
+        # 6. Re-build adjacency based on the newly derived centroids and polygons
+        adjacency_edges_output = []
+        if !isempty(lg_polygons_for_adjacency)
+            for i in 1:length(lg_polygons_for_adjacency)
+                g1 = lg_polygons_for_adjacency[i]
+                if g1 === nothing continue end
+                for j in (i+1):length(lg_polygons_for_adjacency)
+                    g2 = lg_polygons_for_adjacency[j]
+                    if g2 === nothing continue end
+                    if LibGEOS.touches(g1, g2)
+                        push!(adjacency_edges_output, (final_centroids[i], final_centroids[j]))
+                    else
+                        g1_buffered = LibGEOS.buffer(g1, 1e-6)
+                        if LibGEOS.intersects(g1_buffered, g2)
+                            inter = LibGEOS.intersection(g1_buffered, g2)
+                            if !LibGEOS.isEmpty(inter) && (LibGEOS.area(inter) > 1e-9 || LibGEOS.geomTypeId(inter) in [LibGEOS.GEOS_LINESTRING, LibGEOS.GEOS_MULTILINESTRING])
+                                push!(adjacency_edges_output, (final_centroids[i], final_centroids[j]))
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        # 7. Build final graph from the re-derived adjacency edges and ensure connectivity
+        g_final = SimpleGraph(nAU)
+        centroid_map = Dict(c => i for (i, c) in enumerate(final_centroids))
+        for (c1, c2) in adjacency_edges_output
+            xi = get(centroid_map, c1, 0)
+            yi = get(centroid_map, c2, 0)
+            if xi > 0 && yi > 0 && !has_edge(g_final, xi, yi)
+                add_edge!(g_final, xi, yi)
+            end
+        end
+        g_final = ensure_connected!(g_final, final_centroids)
+    end
+
+    return (
+        centroids = final_centroids,
+        polygons = polys_output,
+        adjacency_edges = adjacency_edges_output,
+        graph = g_final,
+        W = adjacency_matrix,
+        hull_coords = hull_coords_output,
+        s_idx = collect(1:nAU ),
+        s_x = [c[1] for c in final_centroids[1:nAU]],
+        s_y = [c[2] for c in final_centroids[1:nAU]],
+        s_vals = collect(1:nAU ),
+        termination_reason = "positions inferred from adjacency matrix"
+    )
+end 
+
+ 
+function get_polygon_area(poly_coords::AbstractVector)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Calculates the area of a polygon using the Shoelace formula. The input is a vector
+              of (x, y) coordinate tuples. It handles non-finite values and ensures the polygon
+              has at least 3 valid vertices.
+    Inputs:
+        - poly_coords: A vector of (x, y) tuples representing the polygon's vertices.
+    Outputs:
+        - The area of the polygon as a `Float64`.
+    """
+    valid_pts = [p for p in poly_coords if !isnan(p[1]) && !isinf(p[1]) && !isnan(p[2]) && !isinf(p[2])]
+
+    # Check for trailing duplicate
+    if length(valid_pts) > 1 && valid_pts[1] == valid_pts[end]
+        # We create a slice instead of using pop! to avoid mutating input vectors unintentionally
+        valid_pts = valid_pts[1:end-1]
+    end
+
+    if length(valid_pts) < 3
+        return 0.0
+    end
+
+    x = [p[1] for p in valid_pts]
+    y = [p[2] for p in valid_pts]
+
+    # Shoelace Formula
+    return 0.5 * abs(dot(x, circshift(y, 1)) - dot(y, circshift(x, 1)))
+end
+
+
+function get_polygon_area(s_x, s_y)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: A wrapper method for `get_polygon_area` that accepts separate x and y coordinate vectors,
+              maintaining compatibility with older function calls.
+    """
+    poly_coords = tuple.(s_x, s_y)
+    return get_polygon_area(poly_coords)
+end
+
+ 
+function get_coords_from_geom(geom)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Extracts a vector of (x, y) coordinate tuples from various `LibGEOS` geometry types,
+              including `Point`, `Polygon`, `MultiPolygon`, `LineString`, and `LinearRing`.
+    Inputs:
+        - geom: A `LibGEOS` geometry object.
+    Outputs:
+        - A vector of `(Float64, Float64)` coordinate tuples. For `MultiPolygon`, NaN tuples
+          are used as separators between individual polygons.
+    """
+    coords = Tuple{Float64, Float64}[]
+    local type_id = -1
+    try
+        type_id = LibGEOS.geomTypeId(geom)
+        if type_id == LibGEOS.GEOS_POINT
+             # Access coordinate sequence directly for point types
+             seq = LibGEOS.getCoordSeq(geom)
+             push!(coords, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
+             return coords
+        elseif type_id == LibGEOS.GEOS_POLYGON
+            ring = LibGEOS.exteriorRing(geom)
+            n = LibGEOS.numPoints(ring)
+            for i in 1:n
+                p = LibGEOS.getPoint(ring, i)
+                seq = LibGEOS.getCoordSeq(p)
+                push!(coords, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
+            end
+        elseif type_id == LibGEOS.GEOS_MULTIPOLYGON
+            for i in 1:LibGEOS.numGeometries(geom)
+                poly = LibGEOS.getGeometryN(geom, i)
+                ring = LibGEOS.exteriorRing(poly)
+                n = LibGEOS.numPoints(ring)
+                for j in 1:n
+                    p = LibGEOS.getPoint(ring, j)
+                    seq = LibGEOS.getCoordSeq(p)
+                    push!(coords, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
+                end
+                if i < LibGEOS.numGeometries(geom); push!(coords, (NaN, NaN)); end
+            end
+        elseif type_id in [LibGEOS.GEOS_LINESTRING, LibGEOS.GEOS_LINEARRING]
+            n = LibGEOS.numPoints(geom)
+            for i in 1:n
+                p = LibGEOS.getPoint(geom, i)
+                seq = LibGEOS.getCoordSeq(p)
+                push!(coords, (LibGEOS.getX(seq, 1), LibGEOS.getY(seq, 1)))
+            end
+        end
+    catch e
+        @warn "Coordinate extraction failed for type $type_id: $e"
+    end
+    return coords
+end
+
+
+
+
+function get_voronoi_polygons_and_edges(centroids, hull_geom, tol=1e-7)
+    """
+    BSTM Partitioning Utility v1.0.1
+    Timestamp: 2026-06-26 10:12:48
+    Synopsis: Generates Voronoi polygons for a given set of centroids, clips them to a specified
+              hull geometry, and determines adjacency. It includes robust handling for edge cases with
+              0, 1, or 2 centroids and for duplicate input centroids.
+    Inputs:
+        - centroids: A vector of (x, y) centroid coordinates.
+        - hull_geom: A `LibGEOS` geometry for clipping.
+        - tol: A small tolerance for robust adjacency checking.
+    Outputs:
+        - A tuple containing the polygon coordinates and a vector of adjacency edges.
+    Rationale for v1.0.1:
+        - The bisection logic for the two-centroid case now dynamically scales the bisector line based on the
+          hull's bounding box, replacing a hardcoded large constant to ensure scale-invariance.
+    """
+    n_c = length(centroids)
+    if n_c == 0
+        return [], []
+    elseif n_c == 1
+        return [get_coords_from_geom(hull_geom)], []
+    elseif n_c == 2
+        # Bisection logic for two centroids.
+        p1, p2 = centroids[1], centroids[2]
+        mid = ((p1[1] + p2[1]) / 2, (p1[2] + p2[2]) / 2)
+        dx, dy = p2[1] - p1[1], p2[2] - p1[2]
+        px, py = -dy, dx
+
+        # Dynamically determine a sufficiently large length `L` for the bisector
+        # based on the bounding box of the hull geometry to avoid issues with scale.
+        env = LibGEOS.envelope(hull_geom)
+        hull_bbox_coords = get_coords_from_geom(env)
+        L = if !isempty(hull_bbox_coords)
+            min_x, max_x = minimum(c[1] for c in hull_bbox_coords), maximum(c[1] for c in hull_bbox_coords)
+            min_y, max_y = minimum(c[2] for c in hull_bbox_coords), maximum(c[2] for c in hull_bbox_coords)
+            # Use twice the diagonal of the bounding box as a safe large number
+            2.0 * sqrt((max_x - min_x)^2 + (max_y - min_y)^2) + 1.0
+        else
+            # Fallback if hull is empty or invalid
+            1e7
+        end
+
+        pt1 = (mid[1] + L*px, mid[2] + L*py)
+        pt2 = (mid[1] - L*px, mid[2] - L*py)
+        side1_pts = [pt1, pt2, (pt2[1] - L*dx, pt2[2] - L*dy), (pt1[1] - L*dx, pt1[2] - L*dy), pt1]
+        poly1_box = LibGEOS.Polygon([[[p[1], p[2]] for p in side1_pts]])
+        side2_pts = [pt1, pt2, (pt2[1] + L*dx, pt2[2] + L*dy), (pt1[1] + L*dx, pt1[2] + L*dy), pt1]
+        poly2_box = LibGEOS.Polygon([[[p[1], p[2]] for p in side2_pts]])
+        res1 = LibGEOS.intersection(hull_geom, poly1_box)
+        res2 = LibGEOS.intersection(hull_geom, poly2_box)
+        return [get_coords_from_geom(res1), get_coords_from_geom(res2)], [(p1, p2)]
+    end
+
+    # Deduplicate centroids before triangulation to suppress package warnings 
+    # and ensure the output polygon array matches the input centroid array in length.
+    u_centroids = unique(centroids)
+    if length(u_centroids) < n_c
+        u_polys, u_edges = get_voronoi_polygons_and_edges(u_centroids, hull_geom, tol)
+        return [u_polys[findfirst(==(c), u_centroids)] for c in centroids], u_edges
+    end
+
+    # 3+ points logic
+    pts_dt = [(Float64(c[1]), Float64(c[2])) for c in centroids]
+    tri = triangulate(pts_dt)
+    hull_coords = get_coords_from_geom(hull_geom)
+    xs = [p[1] for p in hull_coords if !isnan(p[1])]
+    ys = [p[2] for p in hull_coords if !isnan(p[2])]
+    if isempty(xs) || isempty(ys) return [Tuple{Float64, Float64}[] for _ in 1:length(centroids)], [] end
+    
+    bbox = (minimum(xs), maximum(xs), minimum(ys), maximum(ys))
+    vorn = voronoi(tri)
+    final_coords = [Tuple{Float64, Float64}[] for _ in 1:length(centroids)]
+    valid_geoms = Dict{Int, Any}()
+
+    for i in each_generator(vorn)
+        if i < 1 || i > length(centroids) continue end
+        vertices = get_polygon_coordinates(vorn, i, bbox)
+        if !isempty(vertices)
+            poly_pts = [[v[1], v[2]] for v in vertices]
+            if poly_pts[1] != poly_pts[end] push!(poly_pts, poly_pts[1]) end
+            try
+                lg_poly = LibGEOS.Polygon([poly_pts])
+                clipped = LibGEOS.intersection(lg_poly, hull_geom)
+                if !LibGEOS.isEmpty(clipped) && LibGEOS.geomTypeId(clipped) in [LibGEOS.GEOS_POLYGON, LibGEOS.GEOS_MULTIPOLYGON]
+                    final_coords[i] = get_coords_from_geom(clipped)
+                    valid_geoms[i] = clipped
+                end
+            catch e end
+        end
+    end
+
+    v_edges = []
+    active_ids = sort(collect(keys(valid_geoms)))
+    for idx in 1:length(active_ids)
+        i = active_ids[idx]
+        g1 = valid_geoms[i]
+        for jdx in idx+1:length(active_ids)
+            j = active_ids[jdx]
+            g2 = valid_geoms[j]
+            # Primary check: direct contact
+            if LibGEOS.touches(g1, g2)
+                push!(v_edges, (centroids[i], centroids[j]))
+            else
+                # Fallback check: microscopic overlap/buffer
+                g1_b = LibGEOS.buffer(g1, tol)
+                if LibGEOS.intersects(g1_b, g2)
+                    push!(v_edges, (centroids[i], centroids[j]))
+                end
+            end
+        end
+    end
+    return final_coords, v_edges
+end
+
+function check_connectivity(g)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Evaluates the connectivity of a graph.
+    Inputs:
+        - g: A `SimpleGraph` object.
+    Outputs:
+        - A `NamedTuple` with fields:
+            - `is_connected`: A boolean indicating if the graph is fully connected.
+            - `n_components`: The number of connected components.
+            - `components`: A vector of vectors, where each inner vector contains the nodes of a component.
+    """
+    comps = connected_components(g)
+    return (is_connected = length(comps) == 1, n_components = length(comps), components = comps)
+end
+
+
+
+ 
+function ensure_connected!(g::SimpleGraph, centroids::Vector{<:Tuple{Real, Real}})
+    """
+    BSTM Partitioning Utility v1.0.1
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Ensures a spatial graph is fully connected by adding edges to bridge any
+              disconnected components. It identifies the nearest pair of nodes between
+              the two closest components and adds an edge between them, repeating if necessary.
+    Inputs:
+        - g: A `SimpleGraph` object to modify in-place.
+        - centroids: A vector of centroid coordinates corresponding to the graph's vertices.
+    Outputs:
+        - The modified, connected `SimpleGraph` object.
+    Rationale for v1.0.1:
+        - Corrected a bug in the recursive call, which was passing the adjacency matrix `W` instead of the graph `g`.
+    """
+    comps = connected_components(g)
+    
+    # If the graph is already connected, no further action is required
+    if length(comps) <= 1
+        return g
+    end
+
+    # Number of components to bridge
+    n_comps = length(comps)
+    
+    # 1. Calculate Centroids for each component to reduce search space
+    comp_centroids = Vector{Vector{Float64}}(undef, n_comps)
+    for i in 1:n_comps
+        pts = [ [centroids[node][1], centroids[node][2]] for node in comps[i] ]
+        comp_centroids[i] = mean(pts)
+    end
+
+    # 2. Build a KD-Tree of the component centroids for efficient nearest-neighbor search
+    centroid_matrix = hcat(comp_centroids...)
+    tree = KDTree(centroid_matrix)
+
+    # 3. Iteratively bridge components
+    for i in 1:n_comps
+        if is_connected(g) break end # Stop if graph becomes connected
+        
+        idxs, dists = knn(tree, comp_centroids[i], 2)
+        target_comp_idx = idxs[2]
+        
+        # Find the closest pair of nodes between the two components
+        min_dist = Inf
+        best_pair = (0, 0)
+        
+        for u in comps[i]
+            for v in comps[target_comp_idx]
+                d = sqdist([centroids[u][1], centroids[u][2]], [centroids[v][1], centroids[v][2]])
+                if d < min_dist
+                    min_dist = d
+                    best_pair = (u, v)
+                end
+            end
+        end
+        
+        # Add the bridging edge to the graph
+        u_node, v_node = best_pair
+        if u_node != 0 && v_node != 0 && !has_edge(g, u_node, v_node)
+            add_edge!(g, u_node, v_node)
+        end
+    end
+
+    # Recursive call to handle cases where bridging one pair doesn't connect all components
+    if !is_connected(g)
+        return ensure_connected!(g, centroids)
+    end
+
+    return g
+end 
+
+
+function sqdist(p1, p2)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Calculates the squared Euclidean distance between two points.
+    """
+    return (p1[1]-p2[1])^2 + (p1[2]-p2[2])^2
+end
+
+
+function plot_spatial_graph(; au=nothing, pts=nothing, plot_title="Spatial Partitioning")
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Visualizes the results of a spatial partitioning. It plots the generated polygons,
+              the adjacency graph, the centroids, the overall hull, and optionally the raw data points.
+    Inputs:
+        - au: The `areal_units` object returned by `assign_spatial_units`.
+        - pts: Optional. A vector of (x, y) tuples representing the raw data points to overlay.
+        - plot_title: The title for the plot.
+    Outputs:
+        - A `Plots.Plot` object.
+    """
+    # 2. Base Plot Initialization
+    plt = Plots.plot(aspect_ratio=:equal, legend=false)
+    Plots.title!(plt, plot_title)
+
+    # 3. Polygon Geometry Rendering
+        for poly_coords in au[:polygons]
+            if length(poly_coords) > 2
+                px = [p[1] for p in poly_coords if !isnan(p[1])]
+                py = [p[2] for p in poly_coords if !isnan(p[2])]
+                if !isempty(px) && (px[1], py[1]) != (px[end], py[end])
+                    push!(px, px[1])
+                    push!(py, py[1])
+                end
+                Plots.plot!(plt, px, py, seriestype=:shape, fillalpha=0.1, linecolor=:black, lw=0.5)
+            end
+        end 
+
+    # 4. Adjacency Graph Edge Rendering 
+        for edge in Graphs.edges(au[:graph])
+            u, v = Graphs.src(edge), Graphs.dst(edge)
+            p1, p2 = au[:centroids][u], au[:centroids][v]
+            Plots.plot!(plt, [p1[1], p2[1]], [p1[2], p2[2]], color=:red, lw=1.5, alpha=0.6)
+        end 
+
+    # 5. Scatter Plotting: Data Points and Polygon Centroids
+    if !isnothing(pts)
+        Plots.scatter!(plt, [p[1] for p in pts], [p[2] for p in pts],
+            markersize=1, color=:gray, alpha=0.3, label="Points")
+    end
+ 
+        Plots.scatter!(plt, [c[1] for c in au[:centroids]], [c[2] for c in au[:centroids]],
+            markersize=4, color=:blue, markerstrokecolor=:white, label="Centroids")
+
+    # 6. Boundary Constraints
+        bx = [p[1] for p in au[:hull_coords] if !isnan(p[1])]
+        by = [p[2] for p in au[:hull_coords] if !isnan(p[2])]
+        Plots.plot!(plt, bx, by, color=:black, lw=2, ls=:dash)
+
+    return plt
+end
+
+
+
+
+function adjacency_matrix_to_nb( W )
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Converts a binary adjacency matrix into a neighborhood list format (often called 'nb').
+    Inputs:
+        - W: An adjacency matrix.
+    Outputs:
+        - A vector of vectors, where each inner vector lists the indices of the neighbors for that node.
+    """
+    nau = size(W)[1]
+    # W = LowerTriangular(W)  # using LinearAlgebra
+    nb = [Int[] for _ in 1:nau]
+    Threads.@threads for i in 1:nau
+        nb[i] = findall( isone, W[i,:] )
+    end
+    return nb
+end
+
+
+function nb_to_adjacency_matrix( nb )
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Converts a neighborhood list ('nb') into a binary adjacency matrix.
+    Inputs:
+        - nb: A neighborhood list (vector of vectors).
+    Outputs:
+        - A dense adjacency matrix of `Int8`.
+    """
+    nau = Integer( length( unique( reduce(vcat, nb) )) )
+    W = zeros( Int8, nau, nau )
+    Threads.@threads for i in 1:nau
+        for j in 1:length( nb[i] )
+            k = nb[i][j]
+            W[i, k] = 1
+        end
+    end
+    return(W)
+end
+
+
+function nodes( adj )
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Processes a neighborhood list to extract graph edges and compute the BYM2 scaling factor.
+    Inputs:
+        - adj: A neighborhood list (vector of vectors).
+    Outputs:
+        - A tuple containing:
+            - `node1`, `node2`: Vectors representing the start and end nodes of each unique edge.
+            - `scalefactor`: The scaling factor required for the BYM2 model parameterization.
+    """
+    nau = length(adj)
+    N_edges = Integer( length( reduce(vcat, adj) )/2 )
+    node1 =  fill(0, N_edges); 
+    node2 =  fill(0, N_edges); 
+    i_edge = 0;
+    for i in 1:nau
+        u = adj[i]
+        num = length(u)
+        for j in 1:num
+            k = u[j]
+            if i < k
+                i_edge = i_edge + 1;
+                node1[i_edge] = i;
+                node2[i_edge] = k;
+            end
+        end
+    end
+
+    e = Edge.(node1, node2)
+    g = Graph(e)
+    W = Graphs.adjacency_matrix(g)
+    
+    # D = diagm(vec( sum(W, dims=2) ))
+    scalefactor = scaling_factor_bym2(W)
+
+    return node1, node2, scalefactor
+end
+
+
+"""
+    scaling_factor_bym2(W::AbstractMatrix)
+
+A new wrapper function to compute the BYM2 scaling factor directly from an adjacency matrix `W`.
+
+# Rationale
+This function was missing from the codebase, causing an `UndefVarError`. It serves as a
+user-facing or internal API to correctly calculate the scaling factor needed for the BYM2
+model's structured component. It constructs the ICAR precision matrix from `W` and then
+calls the internal `_compute_scaling_factor` function.
+"""
+function scaling_factor_bym2(W::AbstractMatrix)
+    # Purpose: Computes the BYM2 scaling factor from a spatial adjacency matrix.
+    # Rationale: This function was called but not defined. This implementation bridges the gap
+    #            by creating the appropriate ICAR precision matrix `Q` from `W` before
+    #            passing it to the internal scaling factor calculation logic.
+
+    # #
+    # 1. Construct the ICAR Precision Matrix (Q) from the Adjacency Matrix (W)
+    # The diagonal entries of Q are the number of neighbors for each area (row sums of W).
+    # The off-diagonal entries are -1 if two areas are neighbors, and 0 otherwise.
+    if size(W, 1) != size(W, 2)
+        error("Adjacency matrix W must be square.")
+    end
+    
+    Q = Diagonal(vec(sum(W, dims=2))) - W
+    
+    # #
+    # 2. Compute the scaling factor using the internal, tested function.
+    return _compute_scaling_factor(Q)
+end
+
+
+"""
+    _compute_scaling_factor(Q_template)
+
+Computes the scaling factor required to ensure that the marginal variance of an
+intrinsic GMRF is approximately 1. This is used in the BYM2 model parameterization.
+
+# Rationale
+This is derived from the work by Riebler et al. (2016) for scaling the structured
+component in a BYM2 model. The scaling factor is the exponential of the mean of the
+logarithm of the non-zero eigenvalues of the precision matrix Q. This ensures that the
+geometric mean of the marginal variances is 1.
+
+# Arguments
+- `Q_template`: The singular precision matrix of the intrinsic GMRF.
+
+# Returns
+- A `Float64` scaling factor.
+"""
+function _compute_scaling_factor(Q_template)
+    # Process: Computes the scaling factor for intrinsic GMRF components.
+    # Rationale: This factor, when applied to the structured component (e.g., in BYM2),
+    #            ensures that the marginal variance is approximately 1, which aids in
+    #            the interpretation of the mixing parameter `rho`.
+    # Method: This is based on the geometric mean of the non-zero eigenvalues of the precision matrix.
+
+    # #
+    # 1. Eigenvalue Decomposition
+    # We only need the eigenvalues, so we use `eigvals`. The matrix is symmetric.
+    # A small amount of noise is added to the diagonal for numerical stability, which
+    # is standard practice, especially if the matrix is perfectly singular.
+    eigenvalues = eigvals(Symmetric(Matrix(Q_template)))
+    
+    # #
+    # 2. Filter near-zero eigenvalues
+    # Intrinsic GMRFs have at least one zero eigenvalue corresponding to the non-identifiable mean.
+    # We filter these out to compute the mean of the logs of the precision-related eigenvalues.
+    # A tolerance is used to handle floating-point inaccuracies.
+    non_zero_eigenvalues = eigenvalues[eigenvalues .> 1e-12]
+    
+    # #
+    # 3. Compute the scaling factor
+    # The scaling factor is exp(mean(log(1/λ))) where λ are the non-zero eigenvalues of Q.
+    # This is equivalent to exp(-mean(log(λ))).
+    if isempty(non_zero_eigenvalues)
+        return 1.0 # Fallback for an empty graph or null matrix
+    end
+    
+    log_eigenvalues = log.(non_zero_eigenvalues)
+    
+    # The scaling factor is `exp(mean(log(1/diag(Σ))))`, which simplifies to `exp(-mean(log(diag(Λ))))`
+    # where Λ is the diagonal matrix of eigenvalues of Q.
+    scaling_factor = exp(-mean(log_eigenvalues))
+    
+    return scaling_factor
+end
+
+
+
+"""
+    assign_time_units(t_v::AbstractVector; time_method="regular", t_N=nothing, u_N=nothing, kwargs...)
+
+Discretizes a time vector into categorical units. This function handles both continuous
+and integer time vectors and ensures a consistent output format.
+
+The output is a NamedTuple with the following fields:
+- `idx`: An integer vector of the same length as `t_v`, containing the bin index for each observation.
+- `brks`: A vector of break points that define the bins.
+- `mids`: A vector of midpoints for each bin.
+- `N_cat`: The total number of unique time units (bins).
+"""
+function assign_time_units(t_v::AbstractVector{<:Real}; time_method="regular", t_N=nothing, u_N=nothing, kwargs...)
+    # This method handles continuous time vectors (e.g., Float64).
+    
+    local_t_N = isnothing(t_N) ? (isnothing(u_N) ? 10 : u_N) : t_N
+
+    if time_method == "regular"
+        # Discretize into equal-width intervals between 2.5% and 97.5% quantiles.
+        q = quantile(t_v, [0.025, 0.975])
+        brks = range(q[1], q[2], length=local_t_N + 1)
+        mids = brks[1:end-1] .+ diff(brks) ./ 2
+        N_cat = length(mids)
+        
+        idx = zeros(Int, length(t_v))
+        for i in 1:length(t_v)
+            iv = findfirst(x -> t_v[i] <= x, brks)
+            if isnothing(iv) # Greater than the last break
+                idx[i] = N_cat
+            elseif iv == 1 # Smaller than the first break
+                idx[i] = 1
+            else
+                idx[i] = iv - 1
+            end
+        end
+        return (idx=idx, brks=collect(brks), mids=collect(mids), N_cat=N_cat)
+    else
+        # Placeholder for other methods like "quantile"
+        error("time_method '$time_method' is not implemented for continuous time vectors.")
+    end
+end
+
+function assign_time_units(t_v::AbstractVector{<:Integer}; time_method="unique", t_N=nothing, u_N=nothing, kwargs...)
+    # This method handles integer time vectors (e.g., year).
+    
+    unique_times = sort(unique(t_v))
+    N_cat = length(unique_times)
+
+    # Create breaks halfway between the unique integer values.
+    if N_cat > 1
+        brks = vcat([unique_times[1] - 0.5], (unique_times[1:end-1] + unique_times[2:end]) / 2, [unique_times[end] + 0.5])
+    elseif N_cat == 1
+        brks = [unique_times[1] - 0.5, unique_times[1] + 0.5]
+    else # No data
+        brks = Float64[]
+    end
+
+    # Create a dictionary to map each unique time value to its index (1 to N_cat).
+    val_to_idx = Dict(val => i for (i, val) in enumerate(unique_times))
+    idx = [val_to_idx[v] for v in t_v]
+
+    # FIX: Ensure the 'mids' field is always returned.
+    # For integer units, the midpoints are simply the unique integer values themselves.
+    mids = Float64.(unique_times)
+
+    # The original function likely omitted `mids` in its return tuple, causing the FieldError.
+    # The corrected function returns a consistently structured NamedTuple.
+    return (idx=idx, brks=brks, mids=mids, N_cat=N_cat)
+end
+   
+    
+function assign_time_units_deprecated(t_v; time_method="regular", t_N=nothing, u_N=12, kwargs...)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:05:38
+    Synopsis: Discretizes a continuous time vector into integer-based temporal units (e.g., years)
+              and seasonal units (e.g., months), preparing it for use in discrete spatiotemporal models.
+    Inputs:
+        - t_v: A vector of continuous time values (e.g., fractional years).
+        - time_method: The method for discretization. Currently, only "regular" is supported, which assumes
+                       integer steps correspond to primary time units like years.
+        - t_N: Optional. The expected number of unique primary time units (e.g., years). A warning is
+               printed if the actual range of `t_v` does not match this value.
+        - u_N: The number of seasonal bins to create from the fractional part of the time values. Defaults to 12.
+        - kwargs: Additional arguments (currently unused).
+    Outputs:
+        - A `NamedTuple` containing all temporal information, including:
+            - `t_idx`: An integer index for the primary time unit of each observation.
+            - `t0`, `t1`: The start and end integer time values.
+            - `tn`, `t_N`: The total number of primary time units.
+            - `u_idx`: An integer index for the seasonal unit of each observation.
+            - `u_N`: The number of seasonal bins.
+            - And other related temporal metadata like breaks and midpoints.
+    """
+    if time_method=="regular"
+
+        tint = Int.(floor.(t_v))
+        t0, t1 = minimum(tint), maximum(tint)
+        t_n = t1-t0
+        if !isnothing(t_N)
+            if t_n != t_N
+                print("warning: time range and unique years do not match")
+            end
+        end
+
+        t_idx = tint .- t0 .+ 1
+        t_vals = collect(t0:t1) .- t0 .+ 1
+        t_yr = collect(t0:t1)
+        t_brks = (t_yr, t1+1)
+        t_mids = t_yr .+ 0.5
+        
+        u_v = t_v - tint
+
+        u_disc = discretize_data( u_v, N_cat=u_N, method="regular" )  # seasonality discretized
+
+        return (
+            t_v = t_v, 
+            t_idx = t_idx, 
+            t0=t0, 
+            t1=t1, 
+            t_vals, 
+            t_yr=t_yr, 
+            t_mids=t_mids, 
+            t_brks=t_brks,
+            tn=length(t_vals),
+            t_N= length(t_vals),
+            u_v=u_v, 
+            u_idx=u_disc.idx, 
+            u_brks=u_disc.brks,
+            u_mids=u_disc.mids, 
+            u_N=u_N,
+            u_vals=collect(1:u_N) 
+        )
+    end
+
+end
+
+
+
+function discretize_data(X; method="quantile", N_cat=9, brks=nothing, probs=nothing, dx=nothing, minv = 0, maxv=1)
+    # Purpose: Discretizes a continuous variable into a specified number of categories.
+    # Rationale for Change (v1.1.0):
+    # This version removes the use of the `clamp` function as specifically requested. The logic
+    # is replaced with an explicit `if/elseif/else` block inside a helper function `get_idx`.
+    # This makes the boundary handling more transparent:
+    # - Values below the first break are assigned to category 1.
+    # - Values above the last break are assigned to category `N_cat`.
+    # This change maintains the original behavior while adhering to the coding standard of avoiding `clamp`.
+    #
+    # Assumptions:
+    #   - `X` is a vector of continuous data.
+    #   - `method` determines the discretization strategy.
+    #
+    # Inputs:
+    #   - X: The data vector to be discretized.
+    #   - method: One of "quantile", "regular", "custom", or "provided".
+    #   - N_cat: The desired number of categories.
+    #   - brks: (Optional) Pre-computed breaks for "provided" method.
+    #   - probs: (Optional) Probabilities for quantile calculation.
+    #   - dx, minv, maxv: Parameters for "regular" method.
+    #
+    # Outputs:
+    #   A NamedTuple containing the discretized indices (`idx`), breaks (`brks`), and number of categories (`N_cat`).
+
+    local idx
+    
+    if method=="quantile"
+        probs = isnothing(probs) ? range(0, stop=1, length=N_cat+1) : probs
+        brks = quantile(X, probs)
+        brks[end] = brks[end] + 1e-6 # Ensure the max value is included
+    elseif method=="regular"
+        minv = isnothing(minv) ? minimum(X) : minv
+        maxv = isnothing(maxv) ? maximum(X) : maxv
+        dx = isnothing(dx) ? (maxv - minv) / N_cat : dx
+        brks = minv:dx:maxv
+    elseif method=="custom"
+        # Placeholder for a more advanced discretization method
+        # For now, it defaults to quantiles
+        probs = isnothing(probs) ? range(0, stop=1, length=N_cat+1) : probs
+        brks = quantile(X, probs)
+        brks[end] = brks[end] + 1e-6
+    elseif method=="provided"
+        if isnothing(brks)
+            error("Method 'provided' requires the 'brks' argument to be supplied.")
+        end
+        N_cat = length(brks) - 1
+    else
+        error("Discretization method not recognized.")
+    end
+
+    if method=="quantile" || method=="regular"
+        
+        # Helper function to replace the banned `clamp` function.
+        function get_idx(x::Real)
+            # `searchsortedfirst` finds the index of the first element in `brks` >= x.
+            # The result is in the range [1, length(brks) + 1].
+            # For our breaks of length N_cat+1, this is [1, N_cat + 2].
+            # We subtract 1 to get bin indices, resulting in a range of [0, N_cat + 1].
+            raw_idx = searchsortedfirst(brks, x) - 1
+            
+            # Explicitly handle boundary conditions.
+            if raw_idx < 1
+                # If the value was smaller than the first break, it falls in the first category.
+                return 1
+            elseif raw_idx > N_cat
+                # If the value was larger than the last break, it falls in the last category.
+                return N_cat
+            else
+                # Otherwise, the index is valid.
+                return raw_idx
+            end
+        end
+
+        # Map the helper function over the data vector.
+        idx = map(get_idx, X)
+    
+    elseif method=="provided" || method=="custom"
+        # This logic for provided/custom methods did not use clamp and remains unchanged.
+        idx = zeros(Int, length(X))
+        for i in 1:length(X)
+            for j in 1:N_cat
+                if (X[i] >= brks[j]) & (X[i] < brks[j+1])
+                    idx[i] = j
+                    break
+                end
+            end
+        end
+        idx[X .>= brks[end]] .= N_cat
+    end
+
+    return (idx = idx, brks = brks, N_cat = N_cat)
+end
+
+
+
+
+
+function estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx, target_ts; grid_res=600, sd_extension_factor=0.25)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Estimates a 2D Kernel Density Estimation (KDE) for a specific time slice from a
+              spatiotemporal dataset. It uses a simple Gaussian kernel and defines the grid
+              boundaries by extrapolating from the data's spatial extent.
+    Inputs:
+        - s_coord_tuple: A vector of all (x, y) coordinates.
+        - t_idx: A vector of time indices corresponding to the coordinates.
+        - target_ts: The specific time slice to compute the KDE for.
+        - grid_res: The resolution of the output grid.
+        - sd_extension_factor: A factor to determine the kernel bandwidth based on data standard deviation.
+    Outputs:
+        - A tuple `(x_grid, y_grid, intensity)` where `intensity` is the 2D KDE matrix.
+    """
+    # Filter points for the target time slice
+ 
+    filtered_pts = [p for (i, p) in enumerate(s_coord_tuple) if t_idx[i] == target_ts]
+    if isempty(filtered_pts)
+        error("No points found for the target time slice $target_ts")
+    end
+    xs, ys = [p[1] for p in filtered_pts], [p[2] for p in filtered_pts]
+    # Calculate bandwidth based on standard deviation of points
+    bw_x = std(xs) * sd_extension_factor
+    bw_y = std(ys) * sd_extension_factor
+    # Define grid boundaries extending slightly beyond the data range
+    x_min, x_max = minimum(xs) - bw_x, maximum(xs) + bw_x
+    y_min, y_max = minimum(ys) - bw_y, maximum(ys) + bw_y
+    x_grid = collect(range(x_min, stop=x_max, length=grid_res))
+    y_grid = collect(range(y_min, stop=y_max, length=grid_res))
+    intensity = zeros(grid_res, grid_res)
+    # Gaussian KDE implementation
+    for i in 1:grid_res
+        for j in 1:grid_res
+            x_val, y_val = x_grid[i], y_grid[j]
+            for (px, py) in filtered_pts
+                dx = (x_val - px) / bw_x
+                dy = (y_val - py) / bw_y
+                intensity[i, j] += exp(-0.5 * (dx^2 + dy^2))
+            end
+        end
+    end
+    # Normalize intensity to sum to 1 (optional, depending on desired output)
+    intensity ./= sum(intensity)
+    return x_grid, y_grid, intensity
+end
+
+
+
+function calculate_metrics(au_obj)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Calculates summary statistics for a given spatial partitioning. It computes the mean,
+              standard deviation, and coefficient of variation (CV) of the number of data points
+              assigned to each spatial unit.
+    Inputs:
+        - au_obj: The `areal_units` object containing centroids and original point coordinates.
+    Outputs:
+        - A `NamedTuple` with fields `mean_density`, `sd_density`, and `cv_density`.
+    """
+    # Map coordinates from constituent vectors to avoid FieldError
+    local observation_points = tuple.(au_obj.s_x, au_obj.s_y)
+    
+    # Re-calculate assignments based on nearest centroid
+    local assignments = [argmin([sum((p .- c).^2) for c in au_obj.centroids]) for p in observation_points]
+    
+    # Compute frequency counts per spatial unit
+    local unit_counts = [count(==(i), assignments) for i in 1:length(au_obj.centroids)]
+
+    # Filter valid numerical entries to prevent NaN propagation
+    local valid_entries = filter(x -> !isnan(x) && !ismissing(x), unit_counts)
+
+    if isempty(valid_entries)
+        return (mean_density=NaN, sd_density=NaN, cv_density=NaN)
+    end
+
+    local m_val = mean(valid_entries)
+    local s_val = std(valid_entries)
+    local cv_val = s_val / (m_val + 1e-9)
+
+    return (mean_density=m_val, sd_density=s_val, cv_density=cv_val)
+end
+
+
+function get_spatial_graph( centroids, adjacency_edges )
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Converts a list of centroids and adjacency edges into a `SimpleGraph` object.
+    Inputs:
+        - centroids: A vector of centroid coordinates.
+        - adjacency_edges: A vector of tuples, where each tuple represents an edge between two centroids.
+    Outputs:
+        - A `SimpleGraph` object from the `Graphs.jl` package.
+    """
+    n = length(centroids)
+    g = SimpleGraph(n)
+    centroid_map = Dict(c => i for (i, c) in enumerate(centroids))
+    for edge in adjacency_edges
+        xi, yi = get(centroid_map, edge[1], 0), get(centroid_map, edge[2], 0)
+        if xi > 0 && yi > 0 add_edge!(g, xi, yi) end
+    end
+    return g
+end
+
+
+
+function plot_kde_simple(s_coord_tuple; grid_res=600, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Generates a 2D heatmap of spatial intensity using Kernel Density Estimation (KDE).
+              This method is a wrapper around `estimate_local_kde_with_extrapolation` for static (non-temporal) data.
+    Inputs:
+        - s_coord_tuple: A vector of (x, y) coordinate tuples.
+        - grid_res: The resolution of the output grid.
+        - sd_extension_factor: A factor to determine the kernel bandwidth.
+        - title: The title for the plot.
+    Outputs:
+        - A `Plots.Plot` object showing the KDE heatmap with a scatter overlay of the points.
+    """
+    t_idx_dummy = ones(Int, length(s_coord_tuple))
+    x_g, y_g, intensity = estimate_local_kde_with_extrapolation(s_coord_tuple, t_idx_dummy, 1; grid_res=grid_res, sd_extension_factor=sd_extension_factor)
+
+    plt = Plots.heatmap(x_g, y_g, intensity',
+                  title=title,
+                  c=:viridis,
+                  aspect_ratio=:equal,
+                  xlabel="X", ylabel="Y")
+    Plots.scatter!(plt, [p[1] for p in s_coord_tuple], [p[2] for p in s_coord_tuple],
+                   markersize=2, markercolor=:white, markeralpha=0.5, label="Points")
+    return plt
+end
+
+function plot_kde_simple(df::DataFrame; x=:s_x, y=:s_y, grid_res=600, sd_extension_factor=0.25, title="Spatial Intensity (KDE)")
+    """
+    BSTM Partitioning Utility v1.0.1
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: An overloaded method for `plot_kde_simple` that accepts a `DataFrame` directly,
+              assuming the presence of columns for spatial coordinates.
+    Inputs:
+        - df: A `DataFrame`.
+        - x, y: Symbols representing the names of the coordinate columns (defaults to :s_x, :s_y).
+        - kwargs: Other arguments passed to the primary `plot_kde_simple` method.
+    Outputs:
+        - A `Plots.Plot` object.
+    Rationale for v1.0.1:
+        - Corrected a typographical error ("Overwride") in the error message.
+        - Made the error message dynamic to reflect the actual column names provided by the user.
+    """
+    if !hasproperty(df, x) || !hasproperty(df, y)
+        error("Input DataFrame for plot_kde_simple expects columns `:$x` and `:$y`. Override with x=... and y=... if using different names.")
+    end
+
+    # Convert DataFrame columns to a vector of tuples
+    s_coord_tuple = tuple.(df[!,x], df[!,y])
+
+    # Call the existing method that works with a tuple vector
+    return plot_kde_simple(s_coord_tuple; grid_res=grid_res, sd_extension_factor=sd_extension_factor, title=title)
+end
+ 
+
+
+
+
+function libgeos_lattice_adjacency_matrix(rows::Int, cols::Int)
+    """
+    BSTM Partitioning Utility v1.0.0
+    Timestamp: 2026-06-26 10:01:50
+    Synopsis: Generates a sparse adjacency matrix for a regular 2D lattice using `LibGEOS.jl`.
+              It constructs unit square polygons for each cell and identifies neighbors based on
+              Queen contiguity (i.e., if their geometries intersect).
+    Inputs:
+        - rows: The number of rows in the lattice.
+        - cols: The number of columns in the lattice.
+    Outputs:
+        - A `SparseMatrixCSC{Int, Int}` representing the binary adjacency matrix.
+    """
+    # Create polygons for each cell in the lattice
+    polygons = []
+    for r in 1:rows, c in 1:cols
+        # Define unit square coordinates as nested vectors for LibGEOS compatibility
+        coords = [
+            [Float64(c-1), Float64(r-1)],
+            [Float64(c),   Float64(r-1)],
+            [Float64(c),   Float64(r)],
+            [Float64(c-1), Float64(r)],
+            [Float64(c-1), Float64(r-1)]
+        ]
+        # Construct LinearRing and then Polygon
+        ring = LibGEOS.LinearRing(coords)
+        push!(polygons, LibGEOS.Polygon(ring))
+    end
+
+    n = length(polygons)
+    W = spzeros(Int, n, n)
+
+    # Queen contiguity check
+    for i in 1:n
+        poly_i = polygons[i]
+        for j in (i+1):n
+            if LibGEOS.intersects(poly_i, polygons[j])
+                W[i, j] = W[j, i] = 1
+            end
+        end
+    end
+    return W
+end
+
+

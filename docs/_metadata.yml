@@ -1,0 +1,111 @@
+author:
+  - name: 
+      given: Jae S.
+      family: Choi
+      orcid: 0000-0003-3632-5723 
+    # email: jae.choi@dfo-mpo.gc.ca
+      email: choi.jae.seok@gmail.com
+    # corresponding: true
+    affiliation: 
+      - name: Science, Bedford Institute of Oceanography, Fisheries and Oceans Canada
+        city: Dartmouth
+        state: NS
+        url: https://sites.google.com/site/autocatalysis
+
+date: last-modified
+
+date-format: "YYYY-MM-D"
+
+toc: true
+
+toc-depth: 4
+
+number-sections: false
+
+citeproc: true
+citeproc-method: biblatex
+biblatex: true
+biblio-style: authoryear
+biblatexoptions: |
+ \usepackage[authordate, maxcitenames=1, uniquename=mininit, backend=biber, natbib]{biblatex-chicago}
+
+csl: chicago-author-date.csl
+# to get more csl's look in local directory: ~/./Zotero/styles/ 
+# or online from Zotero Style Repository https://www.zotero.org/styles
+# or others: 
+# https://raw.githubusercontent.com/citation-style-language/styles/master/harvard-anglia-ruskin-university.csl
+# https://github.com/citation-style-language/styles  
+# https://www.overleaf.com/learn/latex/Biblatex_citation_styles
+
+bibliography: references.bib
+
+# citation: 
+#  container-title: https://github.com/jae0/bio.snowcrab/
+#  doi: NA
+
+#standalone: true
+# acknowledgements: |
+
+journal: 'biorxiv'
+
+copyright: 
+  holder: Jae S. Choi
+  year: 2025
+
+
+# funding: "The snow crab scientific survey was funded by the snow crab fishers of Maritimes Region of Atlantic Canada."
+
+highlight-style: pygments
+
+lightbox: true
+
+documentclass: paper
+papersize: letterpaper
+fontsize: 11pt
+
+format:
+  pdf:
+    documentclass: report
+    margin-left: 30mm
+    margin-right: 30mm
+  pptx: 
+    toc: true
+    toc_depth: 2 
+    # highlight-style: github
+    tbl-cap-location: top
+    dpi: 144
+  docx:
+    toc: true
+    toc_depth: 2 
+    # highlight-style: github
+    tbl-cap-location: top
+    dpi: 144
+  revealjs:
+    theme: [default, custom.scss]
+    menu: false
+    self-contained: true
+    scrollable: true
+    # scroll-view: 
+    #  activate: true
+    layout: full
+    overview: true
+    slide-number: true
+    #snap: proximity
+    # chalkboard: true # does not work with self-contained
+    # smaller: true
+    dpi: 144
+  html: 
+    css: styles.css
+    html-math-method: katex
+    code-fold: true
+    code-overflow: wrap
+    self-contained: true
+    embed-resources: true
+  beamer:
+    theme: "metropolis"
+    colortheme: "seagull"
+    fonttheme: "professionalfonts"
+    fig_caption: yes
+    latex_engine: lualatex 
+    keep_tex: true 
+    format-links: false

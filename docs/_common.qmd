@@ -1,0 +1,94 @@
+ 
+```{r}
+#| eval: true
+#| output: false
+#| echo: false
+#| label: load-data-from-R
+
+  if (0) {
+    
+    # libraries
+
+    require(spsUtil)
+    quietly = spsUtil::quiet
+
+    require(flextable)
+    require(gt)  # table formatting
+    require(ggplot2)
+    require(data.table) # for speed
+    require(lubridate)
+    require(stringr) 
+    
+    require(janitor)
+  
+    require(aegis)  # basic helper tools
+    require(bio.taxonomy)  # handle species codes
+    require(bio.snowcrab)
+
+    require(MBA)
+
+    # reload these in case of local edits
+    loadfunctions( "aegis")
+    loadfunctions( "bio.snowcrab")  
+  
+  }
+
+  # params from yaml (above)
+  attach(params)  
+
+  if (0) {
+
+    media_loc = file.path( data_loc, "media" )
+
+    year_previous = year_assessment - 1
+
+
+  #### params and directories
+    p = load.environment( year.assessment=year_assessment )  
+    p$corners = data.frame(plon=c(220, 990), plat=c(4750, 5270) )
+
+    p$mapyears = year_assessment + c(-5:0 )   # default in case not specified
+  
+    years = as.character(1996: year_assessment)
+    yrs_observer = year_assessment + c(0:-4)
+  }
+
+  objects_to_not_save = ls(all.names = TRUE)
+  
+  data_dump_file = file.path( data_loc, "assessments",  year_assessment, "current_results.rdz")
+
+  if (!exists("todo")) todo=""
+
+  if ( grepl("redo_data", todo) ) {
+    if (file.exists(data_dump_file))  file.remove(data_dump_file)
+    message( "File ", data_dump_file, " deleted and recomputing ... " )
+  }
+
+  if (file.exists(data_dump_file))  {
+    out = read_write_fast(data_dump_file)
+    # invisible( out ) 
+    # invisible( list2env(out), parent.frame()) 
+    # invisible( list2env(out) ) 
+    message("Loading results from file. To refresh/force recompute, delete manually or add 'redo_data' to the 'to_get' list")
+
+  } else {
+
+    if ( grepl("redo_data", todo) ) {
+      # .. re do data here
+    }
+
+    if ( grepl("do_stuff", todo) ) {
+      # .. do stuff 
+    }
+
+    objects_to_save = setdiff( ls(all.names = TRUE), objects_to_not_save)
+    
+    read_write_fast( data=objects_to_save, fn=data_dump_file  )
+
+    message( "File saved at: ", data_dump_file )
+  
+  }
+
+
+```
+ 

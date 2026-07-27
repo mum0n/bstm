@@ -1,0 +1,431 @@
+\documentclass[$if(fontsize)$$fontsize$,$endif$$if(lang)$$lang$,$endif$$if(papersize)$$papersize$,$endif$$for(classoption)$$classoption$$sep$,$endfor$]{$documentclass$}
+
+\NeedsTeXFormat{LaTeX2e} 
+
+\usepackage{etoolbox} % Required for conditional logic and easily changing commands
+
+\newtoggle{unnumberedsections} % Create toggle for a class option
+\settoggle{unnumberedsections}{false} % Default value for the class option
+\DeclareOption{unnumberedsections}{\settoggle{unnumberedsections}{true}} % Set the class option toggle if the class option was used in the template
+
+% \DeclareOption*{\PassOptionsToClass{\CurrentOption}{article}} % Pass through any extra options specified to the base class
+\ProcessOptions\relax % Process class options
+
+% \LoadClass[twocolumn]{article} % Load the base class
+
+%----------------------------------------------------------------------------------------
+%	REQUIRED PACKAGES AND MISC CONFIGURATIONS
+%----------------------------------------------------------------------------------------
+ 
+\usepackage[bottom, hang]{footmisc} % Force footnotes to the bottom of the page and to the left margin
+\setlength{\footnotemargin}{6pt} % Horizontal space between the footnote marker and text
+
+
+\usepackage{rotating} 
+ 
+%----------------------------------------------------------------------------------------
+%	MARGINS
+%----------------------------------------------------------------------------------------
+
+\usepackage[
+	top=2.5cm, % Top margin
+	bottom=2.5cm, % Bottom margin
+	left=2.25cm, % Left margin
+	right=2.25cm, % Right margin
+	footskip=1cm, % Space from the bottom margin to the baseline of the footer
+	headsep=0.75cm, % Space from the top margin to the baseline of the header
+	columnsep=20pt, % Space between text columns (in twocolumn mode)
+	%showframe % Uncomment to show frames around the margins for debugging purposes
+]{geometry}
+
+%----------------------------------------------------------------------------------------
+%	FONTS
+%----------------------------------------------------------------------------------------
+
+\usepackage[utf8]{inputenc} % Required for inputting international characters
+\usepackage[T1]{fontenc} % Output font encoding for international characters
+
+\usepackage[sc]{mathpazo} % Use the Palatino font
+
+\linespread{1.1} % Increase line spacing slightly
+
+\usepackage{microtype} % Slightly tweak font spacing for aesthetics
+
+%----------------------------------------------------------------------------------------
+%	HEADERS AND FOOTERS
+%----------------------------------------------------------------------------------------
+
+\usepackage{fancyhdr} % Required for customizing headers and footers
+\pagestyle{fancy} % Enable custom headers and footers
+
+\renewcommand{\headrulewidth}{0pt} % Top horizontal rule thickness
+
+% \fancyhf{} % Clear default headers/footers
+
+\fancyhead[L]{\small\textit{$header$} }  
+% \fancyhead[L]{\small\textit{$header$} % Left-even page header
+
+\fancyfoot[L]{\footnotesize{$footer$} }
+% \fancyfoot[RO]{\small\textbf{\thepage}} % Right-odd page footer
+% \fancyfoot[LO]{\footnotesize\$footer$} % Left-odd page footer
+% \fancyfoot[LE]{\small\textbf{\thepage}} % Left-even page footer
+% \fancyfoot[RE]{\footnotesize\$footer$} % Left-even page footer
+ 
+ 
+%----------------------------------------------------------------------------------------
+%	SECTIONS
+%----------------------------------------------------------------------------------------
+
+\usepackage{titlesec} % Required for modifying sections
+
+\iftoggle{unnumberedsections}{ % Conditional logic for the unnumbered sections class options
+	\setcounter{secnumdepth}{0} % Don't number sections at any level
+}{
+	\setcounter{secnumdepth}{2} % Number sections down to subsections
+}
+
+\titleformat
+	{\section} % Section type being modified
+	[block] % Section layout type, can be: hang, block, display, runin, leftmargin, rightmargin, drop, wrap, frame
+	{\Large\bfseries\centering} % Text formatting of the whole section, i.e. label and title
+	{\thesection} % Section label (e.g. number) and its formatting
+	{0.5em} % Horizontal space between the section label and title
+	{} % Code before the section title
+	[] % Code after the section title
+
+%------------------------------------------------
+
+\titleformat
+	{\subsection} % Section type being modified
+	[block] % Section layout type, can be: hang, block, display, runin, leftmargin, rightmargin, drop, wrap, frame
+	{\raggedright\large\bfseries} % Text formatting of the whole section, i.e. label and title
+	{\thesubsection} % Section label (e.g. number) and its formatting
+	{0.5em} % Horizontal space between the section label and title
+	{} % Code before the section title
+	[] % Code after the section title
+
+%------------------------------------------------
+
+\titleformat
+	{\subsubsection} % Section type being modified
+	[runin] % Section layout type, can be: hang, block, display, runin, leftmargin, rightmargin, drop, wrap, frame
+	{\bfseries} % Text formatting of the whole section, i.e. label and title
+	{} % Section label (e.g. number) and its formatting
+	{5pt} % Horizontal space between the section label and title
+	{} % Code before the section title
+	[] % Code after the section title
+
+\titlespacing*{\subsubsection}{0pt}{0.5\baselineskip}{8pt} % Spacing around section titles, the order is: left, before and after
+
+%----------------------------------------------------------------------------------------
+%	TITLE SECTION CUSTOMIZATION
+%----------------------------------------------------------------------------------------
+
+\usepackage{titling} % Required for customizing the title section
+
+\setlength{\droptitle}{-4\baselineskip} % Move the title up
+
+\pretitle{\begin{center}\huge\bfseries} % Article title pre-formatting
+\posttitle{\end{center}} % Article title post-formatting
+
+\setlength{\thanksmarkwidth}{3pt} % Left margin for the first \thanks line
+\setlength{\thanksmargin}{-3pt} % Left margin for the second and onwards \thanks line
+
+\patchcmd{\maketitle}{plain}{empty}{}{} % Set the headers and footers style for the first page to empty
+
+%----------------------------------------------------------------------------------------
+%	ABSTRACT CUSTOMIZATION
+%----------------------------------------------------------------------------------------
+
+\usepackage{abstract} % Allows abstract customization
+
+\renewcommand{\abstractnamefont}{\normalfont\bfseries\vspace{0.5\baselineskip}} % Set the "Abstract" text to bold
+\renewcommand{\abstracttextfont}{\vspace{-0.5\baselineskip}\normalfont\small\itshape} % Set the abstract itself to small italic text
+ 
+%----------------------------------------------------------------------------------------
+%	TABLES
+%----------------------------------------------------------------------------------------
+
+\usepackage{booktabs} % Required for better horizontal rules in tables
+
+\usepackage{array} % Required for manipulating table columns
+
+\newcolumntype{R}[1]{>{\raggedleft\arraybackslash}p{#1}} % Define a new right-aligned paragraph column type
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}} % Define a new left-aligned (no justification) paragraph column type
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}} % Define a new centered paragraph column type
+
+%----------------------------------------------------------------------------------------
+%	CAPTIONS
+%----------------------------------------------------------------------------------------
+
+\usepackage{caption} % Required for customizing captions
+
+\captionsetup{skip=6pt} % Vertical whitespace between figures/tables and the caption (default is 10pt)
+\captionsetup{labelfont={bf,small}, textfont={it,small}} % Define caption font style
+
+%----------------------------------------------------------------------------------------
+%	LISTS
+%----------------------------------------------------------------------------------------
+
+\usepackage{enumitem} % Required for list customization
+
+\setlist{noitemsep} % Customize spacing around and inside lists
+
+%----------------------------------------------------------------------------------------
+%	LINKS
+%----------------------------------------------------------------------------------------
+
+\usepackage{hyperref} % Required for links
+
+\hypersetup{
+	colorlinks=true, % Whether to color the text of links
+	urlcolor=black, % Color for \url and \href links
+	linkcolor=black, % Color for \nameref links
+	citecolor=black, % Color of reference citations
+}
+
+%----------------------------------------------------------------------------------------
+%	CUSTOM COMMANDS
+%----------------------------------------------------------------------------------------
+
+
+\usepackage{ifxetex,ifluatex}
+
+\usepackage{lmodern}
+
+\IfFileExists{microtype.sty}{\usepackage{microtype}}{}
+
+%% The amssymb package provides various useful mathematical symbols
+\usepackage{amssymb}
+%% The amsthm package provides extended theorem environments
+%% \usepackage{amsthm}
+\usepackage{amsmath}
+
+%% The lineno packages adds line numbers. Start line numbering with
+%% \begin{linenumbers}, end it with \end{linenumbers}. Or switch it on
+%% for the whole article with \linenumbers after \end{frontmatter}.
+$if(lineno)$
+\usepackage{lineno}
+$endif$
+
+
+$if(lang)$
+\usepackage[$lang$]{babel}
+$endif$
+
+
+$if(natbib)$
+\usepackage{natbib}
+\bibliographystyle{$if(biblio-style)$$biblio-style$$else$plainnat$endif$}
+$endif$
+
+$if(biblatex)$
+$if(biblatexoptions)$
+$biblatexoptions$
+$else$
+\usepackage[backend=biber]{biblatex}
+$endif$
+% \usepackage[]{biblatex}
+% \usepackage[backend=biber, style=$biblatexstyle$]{biblatex}
+$if(bibliography)$
+\addbibresource{$bibliography$}
+$endif$
+$endif$
+
+
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+
+\setcounter{page}{1} % The page number of the first page, set this to a higher number if the article is to be part of an issue or larger work
+
+ 
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt plus 2pt minus 1pt}
+\setlength{\emergencystretch}{3em}  % prevent overfull lines
+
+
+$if(header-includes)$
+$for(header-includes)$
+$header-includes$
+$endfor$
+$endif$
+
+
+  
+\usepackage{authblk}
+ 
+$for(author)$
+$if(author.name)$
+\author[$author.footnote$ $if(author.corresponding)$,$$\ast$$ $endif$]{$author.name$}
+$endif$
+$endfor$
+
+$for(affiliation)$
+$if(affiliation.number)$
+\affil[$affiliation.number$]{$affiliation.name$}
+$endif$
+$endfor$
+
+$for(author)$
+$if(author.corresponding)$
+\affil[*]{$author.email$}
+$endif$
+$endfor$
+%%------------/AUTHORS--------------
+
+
+% % Affiliations are output in the \date{} command
+% \date{\footnotesize\textsuperscript{\textbf{1}}School of Chemistry, The University of Michigan\\ \textsuperscript{\textbf{2}}Physics Department, The University of Wisconsin\\ \textsuperscript{\textbf{3}}Biological Sciences Department, The University of Minnesota}
+\date{$date$}
+
+% Full-width abstract
+$if(abstract)$
+\renewcommand{\maketitlehookd}{%
+	\begin{abstract}
+		\noindent $abstract$
+	\end{abstract}
+}
+$endif$
+
+
+\usepackage{graphicx}
+\setkeys{Gin}{keepaspectratio}
+% Scale images if necessary, so that they will not overflow the page
+% margins by default, and it is still possible to overwrite the defaults
+% using explicit options in \includegraphics[width, height, ...]{}
+%\setkeys{Gin}{width=\maxwidth,height=\maxheight,keepaspectratio}
+
+% Redefine \includegraphics so that, unless explicit options are
+% given, the image width will not exceed the width of the page.
+% Images get their normal width if they fit onto the page, but
+% are scaled down if they would overflow the margins.
+\makeatletter
+\def\ScaleIfNeeded{%
+  \ifdim\Gin@nat@width>\linewidth
+    \linewidth
+  \else
+    \Gin@nat@width
+  \fi
+}
+\makeatother
+\let\Oldincludegraphics\includegraphics
+{%
+ \catcode`\@=11\relax%
+ \gdef\includegraphics{\@ifnextchar[{\Oldincludegraphics}{\Oldincludegraphics[width=\ScaleIfNeeded]}}%
+}%
+
+ 
+ 
+
+%----------------------------------------------------------------------------------------
+%	TITLE SECTION
+%----------------------------------------------------------------------------------------
+
+\title{$title$}
+
+$if(subtitle)$
+\subtitle{$subtitle$}
+$endif$
+
+%----------------------------------------------------------------------------------------
+
+\begin{document}
+
+\maketitle % Output the title section
+
+
+$if(keyword)$
+$keyword$
+$endif$
+
+
+$if(toc)$
+\setcounter{tocdepth}{$toc-depth$}
+\tableofcontents
+$endif$
+ 
+  
+%% main text
+$body$
+
+
+$if(acknowledgements)$
+\section*{Acknowledgements}
+$acknowledgements$
+$endif$
+
+$if(contribution)$
+\section*{Author contributions statement}
+$contribution$
+$endif$
+
+
+$if(additionalinformation)$
+\section*{Additional information}
+$additionalinformation$
+$endif$
+ 
+%% The Appendices part is started with the command \appendix;
+%% appendix sections are then done as normal sections
+%% \appendix
+
+%% \section{}
+%% \label{}
+
+%% References
+%%
+%% Following citation commands can be used in the body text:
+%% Usage of \cite is as follows:
+%%   \cite{key}          ==>>  [#]
+%%   \cite[chap. 2]{key} ==>>  [#, chap. 2]
+%%   \citet{key}         ==>>  Author [#]
+
+%% References with bibTeX database:
+
+ 
+$if(natbib)$
+$if(bibliography)$
+% \bibliographystyle{abbrvnat}
+\bibliography{$bibliography$}
+$endif$
+$endif$
+
+$if(biblatex)$
+\printbibliography$if(biblio-title)$[title=$biblio-title$]$endif$
+$endif$
+
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% SUPPLEMENTARY MATERIAL / APPENDICES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% $if(appendix)$
+% \begin{appendix}
+% \begin{appendixbox}\label{app:ttt}
+%   \input{$appendix$}
+% \end{appendixbox}
+% \end{appendix}
+% $endif$
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% ARTICLE END
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% $if(csl-refs)$
+% \newlength{\cslhangindent}
+% \setlength{\cslhangindent}{1.5em}
+% \newenvironment{CSLReferences}%
+%   {$if(csl-hanging-indent)$\setlength{\parindent}{0pt}%
+%   \everypar{\setlength{\hangindent}{\cslhangindent}}\ignorespaces$endif$}%
+%   {\par}
+% $endif$ 
+
+% % \end{CSLReferences}
+
+\end{document}
+% \endinput
