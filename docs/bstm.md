@@ -60,7 +60,6 @@ Installing [Julia](https://julialang.org/) is best done with [juliaup](https://g
 # This code sets up the project directory and loads necessary libraries and functions.
 # This step is crucial for ensuring the environment is correctly configured.
 #----------------------------------------------------------------------------------------
-println("Setting up project environment...")
 if Sys.iswindows()
     project_directory = joinpath("C:\\", "home", "jae", "projects", "bstm")
 elseif Sys.islinux()
@@ -68,12 +67,13 @@ elseif Sys.islinux()
 else
     project_directory = joinpath("C:\\", "Users", "choij", "projects", "bstm")
 end
+
 # Load libraries and project-specific functions
 include(joinpath(project_directory, "startup.jl"))
+
 # load bstm functions
 load_project_functions(srcdir())
-println("Project setup complete.")
-
+ 
 ```
 
 If there continue to be issues with packages breaking, some more lower level package management and digging may be required or a restart of Julia.
@@ -95,8 +95,6 @@ As a first step towards spatial modelling, we look at a minimal data series: the
 data_scot, _ = scottish_lip_cancer_data_spacetime()
 inp_df = data_scot.data
 W = data_scot.au.W
-
-
 
 #----------------------------------------------------------------------------------------
 # Visualize the spatial structure of the data. Since we only have adjacency information,
@@ -128,13 +126,12 @@ Note the semicolon at the end of the call: m = @bstm(); make the contents not pr
 
 ```julia
 m  = @bstm(
-    likelihood(y, family=:poisson, log_offsets=:log_offsets) ~
+    likelihood(y, family=poisson, log_offsets=log_offsets) ~
         intercept(prior=Normal(0, 10)) +
         fixed(cov1, prior=Normal(0, 5)) + # Fixed effect for covariate 1
-        random(s_idx, structure=:spatial, model=:bym2, W=W) + # Spatial random effect
-        random(year, structure=:temporal, model=:ar1), # Temporal random effect
-    inp_df,
-    verbose = false # Suppress model code printing for cleaner execution
+        random(s_idx, model=bym2, W=W) + # Spatial random effect
+        random(year, model=ar1), # Temporal random effect
+    inp_df 
 );
 
 # For demonstration, we run a short chain with a simple sampler. 
@@ -157,7 +154,8 @@ The general structure of a `bstm` model call is:
 
 ```julia
 m = @bstm(
-    likelihood(outcome_var, family=poisson, ...) ~ intercept() + fixed_effects + modules(...),
+    likelihood(outcome_var, family=poisson, ...) ~ 
+intercept() + fixed_effects + modules(...),
     data_frame,
     keyword_arguments...
 )
@@ -179,12 +177,12 @@ formula = """
     intercept(prior=Normal(0, 10)) +
     fixed(z, prior=Normal(0, 5)) +
     fixed(Region, contrast=:effects, prior=Normal(0, 2)) +
-    poverty |> random(s_idx, structure=:spatial, model=:icar) + # Spatially varying coefficient for poverty
-    random(s_idx, structure=:spatial, model=:besag) ⊗ random(year, structure=:temporal, model=:ar1) + # Spatiotemporal interaction
-    random(age, structure=:smooth, model=:pspline, nbins=10) # Smooth effect for age
+    poverty |> random(s_idx, model=:icar) + # Spatially varying coefficient for poverty
+    random(s_idx, model=:besag) ⊗ random(year, model=:ar1) + # Spatiotemporal interaction
+    random(age, model=:pspline, nbins=10) # Smooth effect for age
 """
 
-m = @bstm( formula, data, W=W );
+m = @bstm( formula, df, W=W );
 ```
   
 #### The `likelihood()` Module
@@ -194,6 +192,7 @@ The `likelihood()` module on the LHS specifies the observation model and its par
 | Parameter                      | Example Usage          | Description                                                                                                         |
 | :-------------------------------| :-----------------------| :--------------------------------------------------------------------------------------------------------------------|
 | `family`                       | `family=:poisson`      | Sets the likelihood distribution. See table below for options.                                                      |
+| `family`                       | `family=:ordinal`      | Sets the likelihood to a Proportional Odds model for ordered categorical outcomes.                                  |
 | `log_offsets`                  | `log_offsets=pop_log`  | Provides a log-scale offset to the linear predictor ($\eta' = \eta + \text{offset}$). Essential for modeling rates. |
 | `weights`                      | `weights=sample_w`     | Applies observation-level weights to the log-likelihood.                                                            |
 | `trials`                       | `trials=n_patients`    | Specifies the number of trials for each observation in a Binomial model.                                            |
@@ -205,21 +204,23 @@ The `likelihood()` module on the LHS specifies the observation model and its par
 #### Illustrative Examples
 
 1.  **BYM2 Disease Mapping (Spatial):**
-    `@bstm(likelihood(y, family=poisson) ~ intercept() + random(s_idx, structure=:spatial, model=:bym2), data, W=W)`
+    `@bstm(likelihood(y, family=poisson) ~ intercept() + random(s_idx, model=:bym2), data, W=W)`
     Decomposes risk into structured spatial and unstructured IID noise.
 
 2.  **AR1 Temporal Forecasting (Temporal):**
-    `@bstm(likelihood(y) ~ intercept() + random(t_idx, structure=:temporal, model=:ar1), data)`
+    `@bstm(likelihood(y) ~ intercept() + random(t_idx, model=:ar1), data)`
     Captures geometric temporal decay.
 
 3.  **Spatio-Temporal Interaction (Spacetime):**
-    `@bstm(likelihood(y) ~ intercept() + random(s_idx, structure=:spatial, model=:besag) ⊗ random(t_idx, structure=:temporal, model=:ar1), data, W=W)`
+    `@bstm(likelihood(y) ~ intercept() + random(s_idx, model=:besag) ⊗ random(t_idx, model=:ar1), data, W=W)`
     Employs the Kronecker product to create a fully structured spatiotemporal interaction field.
 
 4.  **Spatially Varying Coefficients (SVC) and Curves (Spatial/Smooth):**
-    `@bstm(likelihood(y) ~ intercept() + (poverty |> random(s_idx, structure=:spatial, model=:icar)), data, W=W)`
+    `@bstm(likelihood(y) ~ intercept() + (poverty |> random(s_idx, model=:icar)), data, W=W)`
     Allows the impact of `poverty` to vary according to local spatial gradients.
-    `@bstm(likelihood(y) ~ intercept() + (random(s_idx, structure=:spatial, model=:icar) |> random(t_idx, structure=:smooth, model=:pspline)), data, W=W)`
+
+    `@bstm(likelihood(y) ~ intercept() + (random(s_idx, model=:icar) |> random(t_idx, model=:pspline)), data, W=W`
+
     Models a temporal trend that varies smoothly across space. (Note: `random(t_idx, model=:pspline)` implies `structure=:smooth` for `t_idx` as a covariate).
  
 #### Covariate Discretization & Transformation Rules
@@ -236,12 +237,12 @@ The `bstm` framework supports several methods for preprocessing covariates and t
 
     ```julia
     m = @bstm(
-        likelihood(y, family=:poisson, log_offsets=:log_offset) ~ # Poisson likelihood with log offset
+        likelihood(y, family=:poisson, log_offsets=:log_offsets) ~ # Poisson likelihood with log offset
             intercept() +
             fixed(X) +
-            random(s_idx, structure=:spatial, model=:bym2) + # Spatial random effect
-            random(year, structure=:temporal, model=:ar1) + # Temporal random effect
-            random(s_idx, structure=:spatial, model=:besag) ⊗ random(year, structure=:temporal, model=:ar1), # Spatiotemporal interaction
+            random(s_idx, model=:bym2) + # Spatial random effect
+            random(year, model=:ar1) + # Temporal random effect
+            random(s_idx, model=:besag) ⊗ random(year, model=:ar1), # Spatiotemporal interaction
         inp_df,
         W = W # note as W is part of random() at multiple places, it is shorter to pass as an overall W
     );
@@ -256,7 +257,7 @@ The `bstm` structure-specific language operates through a recursive parser that 
 3.  **Pipe (`|>`):** The pipe operator handles data normalization and state-space evolution.
 
 *   **Transformations**: Objects like `ZScoreComponent` or `LogComponent` act as wrappers that normalize inputs before they enter the latent process.
-*   **State-Space Evolution**: The pipe operator defines a state-space model where one component evolves over the structure of another. This supports both discrete-time dynamics (e.g., `random(structure=:spatial) |> random(structure=:temporal, model=:ar1)`) and the creation of spatially-varying curves (e.g., `random(structure=:spatial) |> random(time, model=:pspline)`), where the coefficients of the temporal basis functions are modeled as spatial fields.
+*   **State-Space Evolution**: The pipe operator defines a state-space model where one component evolves over the structure of another. This supports both discrete-time dynamics (e.g., `random(structure=:spatial) |> random(model=:ar1)`) and the creation of spatially-varying curves (e.g., `random(structure=:spatial) |> random(time, model=:pspline)`), where the coefficients of the temporal basis functions are modeled as spatial fields.
 
 ### Core Components 
 
@@ -266,7 +267,7 @@ The `bstm` framework includes a registry of components that range from discrete 
 
 For discrete structures, `bstm` implements GMRF structures where dependency is defined by a precision matrix Q.
 
-| Component      | Theoretical Assumption                                  | Structural Rationale                                                   |
+| Component     | Theoretical Assumption                                  | Structural Rationale                                                   |
 | :--------------| :--------------------------------------------------------| :-----------------------------------------------------------------------|
 | IID           | $\epsilon \sim N(0, \sigma^2 I)$                        | Unstructured exchangeability; base model for PC-shrinkage.             |
 | ICAR          | Intrinsic CAR; $Q_{ij} = -1$ for neighbors.             | Pure local smoothing; identifies spatial gradients.                    |
@@ -336,28 +337,28 @@ You can control prior specification at three levels of precedence:
     ```julia
     # Local Override with a pre-defined Distribution. Note the use of `sigma=...`
     m = @bstm( # Spatial effect with custom sigma prior
-        likelihood(y) ~ intercept() + random(s_idx, structure=:spatial, model=:bym2, sigma=Exponential(0.1)),
+        likelihood(y) ~ intercept() + random(s_idx, model=:bym2, sigma=Exponential(0.1)),
         data, W=W
     );
 
     # Local Override with a PC prior quantile constraint
     # This sets P(sigma > 0.5) = 0.01 for this specific spatial component's sigma.
     m = @bstm( # Spatial effect with PC prior for sigma
-        likelihood(y) ~ intercept() + random(s_idx, structure=:spatial, model=:bym2, sigma=(0.5, 0.01)),
+        likelihood(y) ~ intercept() + random(s_idx, model=:bym2, sigma=(0.5, 0.01)),
         data, W=W
     );
 
     # Local Override for a correlation parameter 'rho' in an AR1 model.
     # This sets P(rho > 0.8) = 0.05, shrinking it towards zero (no correlation).
     m = @bstm( # Temporal effect with PC prior for rho
-        likelihood(y) ~ intercept() + random(t_idx, structure=:temporal, model=:ar1, rho=(0.8, 0.05)),
+        likelihood(y) ~ intercept() + random(t_idx, model=:ar1, rho=(0.8, 0.05)),
         data
     );
 
     # Local Override for a 'lengthscale' in a GP model.
     # This sets P(lengthscale < 10.0) = 0.05, shrinking it towards larger values.
     m = @bstm( # Smooth effect with PC prior for lengthscale
-        likelihood(y) ~ intercept() + random(x, structure=:smooth, model=:gp, lengthscale=(10.0, 0.05, :lower)),
+        likelihood(y) ~ intercept() + random(x, model=:gp, lengthscale=(10.0, 0.05, :lower)),
         data
     );
     ```
@@ -536,7 +537,7 @@ Its logic is as follows:
 The following table summarizes the available samplers:
 
 | Sampler   | Type           | Key Characteristic                                     | Best Use Case                                                                                        |
-| :-------- | :------------- | :----------------------------------------------------- | :--------------------------------------------------------------------------------------------------- |
+| :----------| :---------------| :-------------------------------------------------------| :-----------------------------------------------------------------------------------------------------|
 | **NUTS**  | Gradient-Based | Adaptively tunes step size and number of steps.        | The state-of-the-art, general-purpose sampler for models with continuous, differentiable parameters. |
 | **HMC**   | Gradient-Based | Requires manual tuning of leapfrog steps.              | A powerful alternative to `NUTS` that can be very efficient but may require expert tuning.           |
 | **ESS**   | Gradient-Free  | Designed specifically for models with Gaussian priors. | Highly efficient for latent Gaussian models (e.g., CAR, GP models).                                  |
@@ -577,6 +578,58 @@ The `predict()` function projects a fitted model onto a new data grid to generat
 ```julia
 preds = predict(model, chain, new_data_frame)
 ```
+
+### Cross-Validation with `bstm_cv_orchestrator`
+
+Assessing the predictive performance of spatiotemporal models requires careful cross-validation (CV) strategies that respect the inherent dependencies in the data. Standard k-fold cross-validation, which assumes data points are independent, can lead to overly optimistic performance estimates. The `bstm_cv_orchestrator` function provides a suite of specialized CV methods designed for spatiotemporal data.
+
+#### Arguments
+
+| Argument | Type | Default | Description |
+|:---|:---|:---|:---|
+| `formula` | `String` | | The `bstm` model formula. |
+| `data` | `DataFrame` | | The full dataset. |
+| `method` | `Symbol` | `:kfold` | The CV strategy. Options are: `:kfold`, `:lolo`, `:spatial_block`, `:temporal_block`, `:temporal_forward_chain`. |
+| `cv_var` | `Symbol` | `:s_idx` | The column in `data` used for grouping in `:lolo`, `:temporal_block`, and `:temporal_forward_chain` methods. |
+| `n_folds` | `Int` | `5` | The number of folds or blocks. For `:temporal_forward_chain`, it's the number of time steps to hold out for testing. |
+| `sampler` | `AbstractSampler` | `NUTS(500, 0.65)` | The Turing sampler used to fit the model in each fold. |
+| `n_samples` | `Int` | `500` | The number of posterior samples to draw in each fold. |
+| `cv_space_vars`| `Vector{Symbol}`| `[:s_x, :s_y]` | The coordinate columns used for `:spatial_block` clustering. |
+| `kwargs...` | | | Additional keyword arguments passed to the underlying `bstm_config` call. |
+
+#### Cross-Validation Methods
+
+*   **`:kfold`**: Standard random k-fold cross-validation. Suitable only when observations can be considered independent.
+*   **`:lolo` (Leave-One-Location-Out)**: Each fold consists of all observations from a unique level of the `cv_var` (e.g., a spatial unit `s_idx`). This tests the model's ability to predict at entirely new locations.
+*   **`:spatial_block`**: Creates `n_folds` spatial blocks using k-means clustering on the `cv_space_vars`. This tests spatial extrapolation performance.
+*   **`:temporal_block`**: Divides the data into `n_folds` contiguous blocks based on the `cv_var` (e.g., `year`). This tests interpolation performance for missing time periods.
+*   **`:temporal_forward_chain`**: A forecasting simulation. It iteratively trains on data up to a certain time point and tests on the next time point. This is repeated for the last `n_folds` time points.
+
+#### Example Usage
+
+```julia
+# Perform 5-fold spatial block cross-validation
+cv_results = bstm_cv_orchestrator(
+    "likelihood(y) ~ intercept() + random(s_idx, model=bym2)",
+    data,
+    method = :spatial_block,
+    n_folds = 5,
+    n_samples = 1000,
+    W = W_matrix
+)
+
+# Display the results
+println("Mean RMSE across folds: ", cv_results.mean_rmse)
+display(cv_results.folds)
+```
+
+#### Output
+
+The function returns a `NamedTuple` containing:
+*   `folds`: A vector of `NamedTuple`s, with each containing the `rmse` and `r2` for that fold.
+*   `mean_rmse`: The average RMSE across all folds.
+*   `mean_r2`: The average R-squared across all folds.
+
 
 ## Discrete Bayesian Spatiotemporal Models
 
@@ -691,7 +744,7 @@ The effective number of samples per second ("ess_per_sec") which ultimately will
 # and is not based on the standard @bstm formula interface. It is included to demonstrate
 # a dense, separable spatiotemporal GP (similar to Kriging) and to highlight the
 # computational cost compared to sparse GMRF models. The modern @bstm equivalent
-# would be `random(s_x, s_y, structure=:smooth, model=gp) + random(year, structure=:temporal, model=gp)`.
+# would be `random(s_x, s_y, model=gp) + random(year, model=gp)`.
 #----------------------------------------------------------------------------------------
 println("Demonstrating a legacy dense GP model...")
 
@@ -699,10 +752,10 @@ println("Demonstrating a legacy dense GP model...")
 # and another GP over the temporal coordinate (year). This creates a dense,
 # separable spatiotemporal model.
 m_kriging = @bstm( # Dense GP model for demonstration
-    likelihood(y, family=:poisson, log_offsets=:log_offset) ~ # Poisson likelihood with log offset
+    likelihood(y, family=:poisson, log_offsets=:log_offsets) ~ # Poisson likelihood with log offset
         intercept() +
-        random(s_x, s_y, structure=:smooth, model=:gp, kernel="se") + # Smooth GP over spatial coordinates
-        random(year, structure=:temporal, model=:gp, kernel="se"), # Temporal GP over year
+        random(s_x, s_y, model=:gp, kernel="se") + # Smooth GP over spatial coordinates
+        random(year, model=:gp, kernel="se"), # Temporal GP over year
     inp_df,
     verbose = false
 )
@@ -810,7 +863,7 @@ Models count data with an excess of zeros.
 
 ```julia
 m = @bstm( 
-  likelihood(y, family=poisson, zero_inflated=true, log_offsets=:log_offset) ~ 
+  likelihood(y, family=poisson, zero_inflated=true, log_offsets=:log_offsets) ~ 
     intercept() + fixed(region), 
   data );
 ```
@@ -824,7 +877,7 @@ A two-part model where the process for generating zeros is separate from the pro
 
 ```julia
 m = @bstm( 
-  likelihood(y, family=poisson, hurdle=1, log_offsets=:log_offset) ~ 
+  likelihood(y, family=poisson, hurdle=1, log_offsets=:log_offsets) ~ 
     intercept() + fixed(region), 
   data );
 ```
@@ -838,7 +891,7 @@ Models observation noise that varies over space and time.
 
 ```julia
 m = @bstm( 
-  likelihood(y, family=poisson, hurdle=1, log_offsets=:log_offset, volatility=true) ~ 
+  likelihood(y, family=poisson, hurdle=1, log_offsets=:log_offsets, volatility=true) ~ 
     intercept() + fixed(region), 
   data );
 ```
@@ -859,10 +912,11 @@ Models the effect of a categorical variable using custom contrast coding.
 **Key Features:**
 - **Module**: `fixed()`
 - **Contrast Coding**: `effects` coding sets the sum of coefficients to zero.
+- **Likelihood Weights**: 'weights'  
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + fixed(region, contrast=effects, prior=Normal(0, 10)), data );
+m = @bstm( likelihood(y, weights=cov5) ~ intercept() + fixed(region, contrast=effects, prior=Normal(0, 10)), data );
 ```
 
 ## Mixed Effects
@@ -910,7 +964,7 @@ Models a smooth, non-linear temporal trend using a second-order random walk.
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + random(year, structure=:temporal, model=rw2), data );
+m = @bstm( likelihood(y) ~ intercept() + random(year, model=rw2), data );
 ```
 
 #### Autoregressive Model (AR1)
@@ -919,7 +973,7 @@ Models a stationary temporal process where the current value depends on the imme
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + random(year, structure=:temporal, model=ar1), data );
+m = @bstm( likelihood(y) ~ intercept() + random(year, model=ar1), data );
 ```
  
 #### Harmonic Seasonality
@@ -929,7 +983,7 @@ Captures periodic effects using sine and cosine basis functions.
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + random(year, month, structure=:temporal, model=(ar1, cyclic), period=12), # Temporal effect with AR1 and cyclic components
+    likelihood(y) ~ intercept() + random(year, month, model=(ar1, cyclic), period=12), # Temporal effect with AR1 and cyclic components
     data # Input data
 );
 ```
@@ -941,7 +995,7 @@ Models a smooth, periodic effect where the end of the cycle connects to the begi
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + random(day, structure=:temporal, model=harmonic ), # Temporal effect with harmonic component
+    likelihood(y) ~ intercept() + random(day, model=harmonic ), # Temporal effect with harmonic component
     data # Input data
 );
 ```
@@ -955,7 +1009,7 @@ Models the non-linear effect of a continuous covariate using penalized splines.
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + random(cov1, structure=:smooth, model=pspline, nbins=20), # Smooth effect for covariate 1
+    likelihood(y) ~ intercept() + random(cov1, model=pspline, nbins=20), # Smooth effect for covariate 1
     data # Input data
 );
 ```
@@ -967,7 +1021,7 @@ Models the smooth, non-linear interaction of two continuous covariates (e.g., sp
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + random(s_x, s_y, structure=:smooth, model=tps, nbins=50), # Smooth effect for spatial coordinates
+    likelihood(y) ~ intercept() + random(s_x, s_y, model=tps, nbins=50), # Smooth effect for spatial coordinates
     data # Input data
 );
 ```
@@ -987,7 +1041,7 @@ The standard for areal disease mapping, decomposing spatial risk into structured
 
 
 ```julia
-m = @bstm( likelihood(y, family=poisson) ~ intercept() + random(s_idx, structure=:spatial, model=bym2, W=W), data );
+m = @bstm( likelihood(y, family=poisson) ~ intercept() + random(s_idx, model=bym2, W=W), data );
 ```
 
 #### ICAR / Besag Model
@@ -996,7 +1050,7 @@ A model for strong spatial smoothing based on local neighbors.
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + random(s_idx, structure=:spatial, model=icar, W=W), data );
+m = @bstm( likelihood(y) ~ intercept() + random(s_idx, model=icar, W=W), data );
 ```
 
 #### Leroux Model
@@ -1005,7 +1059,7 @@ Alternative to BYM2 that offer different parameterizations of spatial correlatio
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + random(s_idx, structure=:spatial, model=leroux, W=W), data );
+m = @bstm( likelihood(y) ~ intercept() + random(s_idx, model=leroux, W=W), data );
 ```
 
 #### SAR Model
@@ -1014,7 +1068,7 @@ Models spatial "spill-over" effects where the value at one location directly inf
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + random(s_idx, structure=:spatial, model=sar, W=W, noise=1e-6), data);
+m = @bstm( likelihood(y) ~ intercept() + random(s_idx, model=sar, W=W, noise=1e-6), data);
 ```
 
 
@@ -1035,7 +1089,7 @@ The gold-standard for continuous spatial modeling, but computationally expensive
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + random(s_x, s_y, structure=:smooth, model=gp, kernel=matern32), data);
+m = @bstm( likelihood(y) ~ intercept() + random(s_x, s_y, model=gp, kernel=matern32), data);
 ```
 
 #### SPDE Model
@@ -1044,7 +1098,7 @@ Models a continuous spatial process using an approximation to a Stochastic Parti
 
 
 ```julia
-m = @bstm( likelihood(y) ~ intercept() + random(s_idx, structure=:spatial, model=spde, W=W), data );
+m = @bstm( likelihood(y) ~ intercept() + random(s_idx, model=spde, W=W), data );
 ```
  
 
@@ -1058,7 +1112,7 @@ A standard model where the spatial and temporal effects are assumed to be indepe
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + random(s_idx, structure=:spatial, model=bym2, W=W) + random(year, structure=:temporal, model=ar1), # Spatial and temporal random effects
+    likelihood(y) ~ intercept() + random(s_idx, model=bym2, W=W) + random(year, model=ar1), # Spatial and temporal random effects
     data # Input data
 );
 ```
@@ -1071,8 +1125,8 @@ A fully structured interaction where a spatial field (e.g., ICAR) evolves over t
 **Formula Equivalent (using `⊗`):**
 ```julia
 m = @bstm( # Spatiotemporal interaction model
-    likelihood(y) ~ intercept() + random(s_idx, structure=:spatial, model=icar) + random(year, structure=:temporal, model=ar1) + # Main spatial and temporal effects
-        random(s_idx, structure=:spatial, model=icar) ⊗ random(year, structure=:temporal, model=ar1), # Kronecker product interaction
+    likelihood(y) ~ intercept() + random(s_idx, model=icar) + random(year, model=ar1) + # Main spatial and temporal effects
+        random(s_idx, model=icar) ⊗ random(year, model=ar1), # Kronecker product interaction
     data, W=W
 );
 ```
@@ -1080,7 +1134,7 @@ m = @bstm( # Spatiotemporal interaction model
 **Formula Equivalent (using `random(structure=:spacetime)`):**
 ```julia
 m = @bstm( # Spatiotemporal interaction model
-    likelihood(y) ~ intercept() + random(s_idx, structure=:spatial, model=icar) + random(year, structure=:temporal, model=ar1) + # Main spatial and temporal effects
+    likelihood(y) ~ intercept() + random(s_idx, model=icar) + random(year, model=ar1) + # Main spatial and temporal effects
         random(s_idx, year, structure=:spacetime, model=(icar, ar1)), # Spacetime interaction module
     data, W=W
 );
@@ -1093,7 +1147,7 @@ Allows the effect of a covariate to vary smoothly across space.
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + cov1 |> random(s_idx, structure=:spatial, model=icar, W=W), # Spatially varying coefficient for cov1
+    likelihood(y) ~ intercept() + cov1 |> random(s_idx, model=icar, W=W), # Spatially varying coefficient for cov1
     data # Input data
 );
 ```
@@ -1105,7 +1159,7 @@ Models a non-linear trend of a covariate that varies smoothly across space.
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + random(year, structure=:smooth, model=pspline) |> random(s_idx, structure=:spatial, model=icar, W=W), # Spatially varying curve for year
+    likelihood(y) ~ intercept() + random(year, model=pspline) |> random(s_idx, model=icar, W=W), # Spatially varying curve for year
     data # Input data
 );
 ```
@@ -1113,14 +1167,13 @@ m = @bstm(
 ### Hurdle Model (spatiotemporal no-interaction):
 
 ```julia
-m_hurdle = @bstm(
-    likelihood(y, family=:poisson, log_offsets=:log_offset, hurdle=0) ~
-        intercept() + fixed(X) +
-        random(s_idx, structure=:spatial, model=:bym2) +
-        random(year, structure=:temporal, model=:ar1),
-    inp_df, W = W, verbose = false
-)
-println("Hurdle model defined.")
+m = @bstm(
+    likelihood(y, family=:poisson, log_offsets=:log_offsets, hurdle=0) ~
+        intercept() + fixed(cov1) +
+        random(s_idx, model=:bym2) +
+        random(year, model=:ar1),
+    inp_df, W = W
+);
 ```
 
 
@@ -1158,7 +1211,7 @@ A multivariate CAR model for jointly modeling multiple correlated spatial proces
 
 ```julia
 m = @bstm(
-    y + y_bin ~ intercept() + random(s_idx, structure=:spatial, model=besag, W=W) + random(year, structure=:temporal, model=ar1), # Joint spatial and temporal effects
+    y + y_bin ~ intercept() + random(s_idx, model=besag, W=W) + random(year, model=ar1), # Joint spatial and temporal effects
     data # Input data
 );
 ```
@@ -1170,8 +1223,8 @@ Jointly models multiple outcomes where each has a different likelihood.
 
 ```julia
 m = @bstm(
-    likelihood(y, family=poisson) + likelihood(y_continuous, family=gaussian) ~ # Joint likelihoods
-        intercept() + random(s_idx, structure=:spatial, model=bym2, W=W), # Shared spatial effect
+    likelihood(y, family=poisson) + likelihood(y_rate, family=gaussian) ~ # Joint likelihoods
+        intercept() + random(s_idx, model=bym2, W=W), # Shared spatial effect
     data
 );
 ```
@@ -1179,11 +1232,11 @@ m = @bstm(
 ```julia
 # Jointly modeling Gaussian and Poisson outcomes with spatial correlation
 # Uses continuous 2D Thin Plate Spline for space and RW2 for time
-model_mv = @bstm(
+m = @bstm(
     likelihood(y_rate, family=gaussian) + likelihood(y, family=poisson, log_offsets=log_offsets) ~ # Joint likelihoods
     intercept() + # Intercept
-    random(s_x, s_y, structure=:smooth, model=tps, nbins=30) + # Smooth effect for spatial coordinates
-    random(year, structure=:temporal, model=rw2), # Temporal random walk
+    random(s_x, s_y, model=tps, nbins=30) + # Smooth effect for spatial coordinates
+    random(year, model=rw2), # Temporal random walk
     data
 );
 ```
@@ -1197,11 +1250,52 @@ Modeling counts across multiple categories using Dirichlet-Multinomial. Note: Mu
 model_multi = @bstm(
     likelihood(y_cat1 + y_cat2 + y_cat3, family=dirichlet_multinomial) ~
     intercept() + # Intercept
-    random(s_x, s_y, structure=:smooth, model=gp, kernel=matern32, n_inducing=15), # Smooth GP effect
+    random(s_x, s_y, model=gp, kernel=matern32, n_inducing=5), # Smooth GP effect
     data
 );
 ```
 
+### Proportional odds ratio model
+
+```julia
+# Define the Proportional Odds Ratio Model using @bstm
+# This model uses a three-level ordinal outcome variable 'ordinal_y'.
+# It includes:
+# - An intercept
+# - A fixed effect for 'cov1'
+# - A random intercept for 'group_id'
+# The 'family=:ordinal' automatically handles the cut-points and likelihood.
+# note: latent_dist: :normal is probit link; :logistic is logit; :student_t/ordinal_df (t degrees of freedom parameter) 
+
+inp_ord = generate_ordinal_data(); # y_ordinal is a categorical()
+   
+m_ordinal = @bstm(
+    likelihood(ordinal_y, family=:ordinal, latent_dist=:normal) ~
+        intercept() +
+        fixed(cov1) +
+        mixed(intercept() | group_id), # Random intercept for group_id
+    inp_ord
+);
+ 
+```
+
+### Nonproportional odds ratio model
+
+```julia
+
+inp_ord = generate_ordinal_data();  # y_ordinal is a categorical()
+
+m_ordinal = @bstm(
+    likelihood(ordinal_y, family=:ordinal, latent_dist=:normal) ~
+        intercept() +
+        fixed(cov1, non_proportional_effects=true) +
+        fixed(cov2, non_proportional_effects=false) +
+        fixed(cov3) +
+        mixed(intercept() | group_id), # Random intercept for group_id
+    inp_ord
+);
+
+```
 
 ### Multi-fidelity Model (`nested`)
 
@@ -1213,7 +1307,7 @@ m = @bstm(
     likelihood(y) ~ intercept() + 
         nested( # Nested sub-model
             proxy_model, # Name of the proxy sub-model
-            formula=likelihood(y_bin, family=binomial) ~ intercept() + random(cov3, structure=:smooth, model=pspline) # Formula for the sub-model
+            formula=likelihood(y_bin, family=binomial) ~ intercept() + random(cov3, model=pspline) # Formula for the sub-model
         ),
     data
 );
@@ -1228,10 +1322,10 @@ m = @bstm(
 model_mf = @bstm(
     likelihood(y_rate, family=gaussian) ~ 
     intercept() + # Intercept
-    random(year, structure=:temporal, model=ar1) + # Temporal AR1 effect
+    random(year, model=ar1) + # Temporal AR1 effect
     nested(
         proxy_submodel,
-        formula = "likelihood(proxy_val, family=gaussian) ~ intercept() + random(s_x, s_y, structure=:smooth, model=tps, nbins=20)"
+        formula = "likelihood(cov2, family=gaussian) ~ intercept() + random(s_x, s_y, model=tps, nbins=20)"
     ),
     data
 );
@@ -1250,7 +1344,7 @@ This model allows the temporal autoregressive parameter `rho` to vary across spa
 # Prepare data with spatiotemporal index
 data.st_idx = [(t-1)*30 + s for (s, t) in zip(data.s_idx, data.year)]
 
-model_svar = @bstm(
+m = @bstm(
    likelihood(y_rate) ~ 
    intercept() +
    random(s_idx, structure=:svar, model=icar), # Spatially varying AR parameter 
@@ -1266,10 +1360,10 @@ This model switches between two AR(1) regimes based on a covariate's value, wher
 # Prepare data for TAR example
 data.price_index = 5.0 .+ cumsum(randn(nrow(data)) .* 0.1)
 
-model_tar = @bstm(
+m = @bstm(
     likelihood(y_rate) ~ 
     intercept() +
-    random(year, structure=:temporal, model=tar, threshold_var=price_index), # Temporal TAR effect
+    random(year, model=tar, threshold_var=price_index), # Temporal TAR effect
     data
 );
 ```
@@ -1281,13 +1375,13 @@ LGCP models aggregated counts. We generate a smooth latent intensity on a grid a
 A Log-Gaussian Cox Process (LGCP) models point patterns by assuming the *logarithm* of the intensity function is a realization of a Gaussian Process. This is the most common point process model in spatial statistics. The syntax uses the composition operator `∘` to combine a `pointprocess` module with a latent `random` field.
 
 ```julia
-@bstm(
-    likelihood(counts, family=:poisson) ~
-        intercept() + 
-        (pointprocess(model=:lgcp, grid_areas=<areas_column>) ∘ random(s_idx, model=besag)), # Note the composition 
+m = @bstm(
+    likelihood(y, family=:poisson) ~
+        intercept() +
+        (pointprocess(model=:lgcp, grid_areas=1.0) ∘ random(s_idx, model=:icar)),
     data,
-    W = W 
-)
+    W = W
+);
 ```
 
 #### Regular lattice (surface area is constant) 
@@ -1295,7 +1389,7 @@ A Log-Gaussian Cox Process (LGCP) models point patterns by assuming the *logarit
 lgcp_data, grid_W, total_cells = generate_lgcp_synthetic_data_regular(10)
 display(first(lgcp_data, 5))
 
-model_lgcp = @bstm(
+m = @bstm(
     likelihood(counts, family=poisson) ~ 
     intercept() +  
     (pointprocess(model=:lgcp, grid_areas=ones(total_cells)) ∘ random(s_idx, model=:icar, sigma=Exponential(0.5))), # LGCP Composition  
@@ -1315,7 +1409,7 @@ irreg_df, irr_W, n_units, cell_areas = generate_irregular_lgcp_data(10)
 model_irreg = @bstm(
     likelihood(counts, family=poisson) ~ 
     intercept() + # Intercept
-    random(s_idx, structure=:spatial, point_process=lgcp, model=icar, sigma=Exponential(1.0), grid_areas=cell_areas), # LGCP spatial effect
+    random(s_idx, point_process=lgcp, model=icar, sigma=Exponential(1.0), grid_areas=cell_areas), # LGCP spatial effect
     irreg_df, 
     W = irr_W, 
     s_N = n_units
@@ -1325,19 +1419,12 @@ model_irreg = @bstm(
 
 ### Demonstration of Kriging implementation
 
-```julia
-# Prepare spatial data for Kriging
-coord_data = DataFrame(
-    s_x = rand(100) .* 10.0,
-    s_y = rand(100) .* 10.0,
-    y_rate = randn(100) 
-);
-
+```julia 
 m = @bstm(
     likelihood(y_rate) ~  
     intercept() + # Intercept
-    random(s_x, s_y, structure=:smooth, model=kriging, lengthscale=InverseGamma(3, 3), sigma=Exponential(1.0)), # Kriging smooth effect
-    coord_data
+    random(s_x, s_y, model=kriging, lengthscale=InverseGamma(3, 3), sigma=Exponential(1.0)), # Kriging smooth effect
+    inp_df
 );
 ```
 
@@ -1372,18 +1459,17 @@ This model is perhaps the most basic spatiotemporal model. We have already seen 
 # - A spatial random effect using the BYM2 model to capture structured and unstructured spatial variation.
 # - A temporal random effect using an AR1 process to capture serial correlation over years.
 # The spatial and temporal effects are "separable" as no interaction term is included.
-#----------------------------------------------------------------------------------------
-println("Defining a standard separable spatiotemporal model...")
+#---------------------------------------------------------------------------------------- 
+
 m = @bstm(
-    likelihood(y, family=:poisson, log_offsets=:log_offset) ~
+    likelihood(y, family=:poisson, log_offsets=:log_offsets) ~
         intercept(prior=Normal(0, 10)) +
         fixed(X, prior=Normal(0, 5)) + # Fixed effect for covariate X
-        random(s_idx, structure=:spatial, model=:bym2) + # Spatial random effect
-        random(year, structure=:temporal, model=:ar1), # Temporal random effect
-    inp_df,
-    W = W,
-    verbose = false # Suppress model code printing for cleaner execution
-)
+        random(s_idx, model=:bym2) + # Spatial random effect
+        random(year, model=:ar1), # Temporal random effect
+    inp_df;
+    W = W
+);
 
 println("Running a short sample chain for the separable model...")
 # For demonstration, we run a short chain with a simple sampler.
@@ -1411,15 +1497,14 @@ This model demonstrates a more realistic workflow. It adds covariates via a RW2 
 # the most complex type, where both space and time are structured.
 #----------------------------------------------------------------------------------------
 m = @bstm(
-    likelihood(y, family=:poisson, log_offsets=:log_offset) ~
+    likelihood(y, family=:poisson, log_offsets=:log_offsets) ~
         intercept() +
         fixed(X) + # Fixed effect for covariate X
-        random(s_idx, structure=:spatial, model=:bym2) + # Spatial random effect
-        random(year, structure=:temporal, model=:ar1) + # Temporal random effect
-        (random(s_idx, structure=:spatial, model=:besag) ⊗ random(year, structure=:temporal, model=:ar1)), # Spatiotemporal interaction
-    inp_df,
-    W = W,
-    verbose = false
+        random(s_idx, model=:bym2) + # Spatial random effect
+        random(year, model=:ar1) + # Temporal random effect
+        (random(s_idx, model=:besag) ⊗ random(year, model=:ar1)), # Spatiotemporal interaction
+    inp_df;
+    W = W
 );
 ```
 
@@ -1438,11 +1523,11 @@ The Leroux Model is a flexible model that mixes spatial and non-spatial variance
 
 ```julia
 m = @bstm(
-    likelihood(y, family=:poisson, log_offsets=:log_offset) ~
+    likelihood(y, family=:poisson, log_offsets=:log_offsets) ~
         intercept() + fixed(X) +
-        random(s_idx, structure=:spatial, model=:leroux) + # Leroux spatial effect
-        random(year, structure=:temporal, model=:ar1), # Temporal AR1 effect
-    inp_df, W = W, verbose = false
+        random(s_idx, model=:leroux) + # Leroux spatial effect
+        random(year, model=:ar1), # Temporal AR1 effect
+    inp_df, W = W
 );
 ```
 
@@ -1456,11 +1541,11 @@ SAR Models spatial "spill-over" effects directly.
 
 ```julia
 m = @bstm(
-    likelihood(y, family=:poisson, log_offsets=:log_offset) ~
+    likelihood(y, family=:poisson, log_offsets=:log_offsets) ~
         intercept() + fixed(X) +
-        random(s_idx, structure=:spatial, model=:sar) + # SAR spatial effect
-        random(year, structure=:temporal, model=:ar1), # Temporal AR1 effect
-    inp_df, W = W, verbose = false
+        random(s_idx, model=:sar) + # SAR spatial effect
+        random(year, model=:ar1), # Temporal AR1 effect
+    inp_df, W = W
 );
 
 ``` 
@@ -1474,11 +1559,11 @@ An SVC model allows the effect of a covariate to vary across space. Here, the ef
 
 ```julia
 m = @bstm(
-    likelihood(y, family=:poisson, log_offsets=:log_offset) ~
+    likelihood(y, family=:poisson, log_offsets=:log_offsets) ~
         intercept() +
-        (X |> random(s_idx, structure=:spatial, model=icar)) + # Spatially varying coefficient for X
-        random(year, structure=:temporal, model=:ar1), # Temporal AR1 effect
-    inp_df, W = W, verbose = false
+        cov1 |> random(s_idx, model=icar, W = W) + # Spatially varying coefficient for X
+        random(year, model=ar1), # Temporal AR1 effect
+    inp_df
 );
 ```
  
@@ -1499,38 +1584,87 @@ m = @bstm(
     y + y2 ~ # Jointly model y and y2
         intercept() +
         fixed(X) + # Fixed effect for covariate X
-        random(s_idx, structure=:spatial, model=:besag) + # A shared spatial effect
-        random(year, structure=:temporal, model=:ar1),    # A shared temporal effect
-    inp_df_multi, W = W, verbose = false
+        random(s_idx, model=:besag) + # A shared spatial effect
+        random(year, model=:ar1),    # A shared temporal effect
+    inp_df_multi, W = W
 );
 ```
 
+###  Local Adaptive Model 
 
-### Models Requiring Attention
+The `localadaptive` model is a spatial component that combines a Leroux-style
+precision structure with cluster-specific means. This allows the model to
+capture both smooth spatial correlation and abrupt shifts between regions.
+It requires spatial coordinates (e.g., `s_x`, `s_y` in the data) to perform
+k-means clustering to define the regions. The number of clusters is controlled
+by the `n_clusters` parameter.
 
-Several models in the original document (`localadaptive`, `dag`, `size_structured`) use custom or legacy APIs that do not map directly to the modern `@bstm` formula interface. These require further development to be integrated.
-   
-Model: localadaptive
-ATTENTION: The `localadaptive` model is not a standard component in the bstm formula
-API. It appears to be a custom model for detecting localized spatial clusters.
-Implementing this would require creating a custom component processor or a direct
-Turing model definition.
+Note: This example assumes `inp_df` contains `s_x` and `s_y` columns for clustering.
 
-m = @bstm( ... random(s_idx, structure=:spatial, model=:localadaptive) ... ) # This will not work.
+```julia
+m_localadaptive = @bstm(
+    likelihood(y, family=poisson, log_offsets=:log_offsets) ~
+        intercept() +
+        random(s_idx, model=:localadaptive, n_clusters=5),
+    inp_df,
+    W = W
+);
+```
 
-Model: dag
-ATTENTION: A Directed Acyclic Graph (DAG) model for spatial processes is a specialized
-model for non-reciprocal dependencies. It is not a standard component in the bstm
-formula API. Implementation would require a custom processor.
+### Directed Acyclic Graph (DAG) Model
 
-m = @bstm( ... random(s_idx, structure=:spatial, model=:dag) ... ) # This will not work.
+The `dag` model is a spatial component for modeling directed dependencies,
+which is useful for causal inference or processes with a clear directional
+flow (e.g., river networks). It requires an adjacency matrix `W` that
+represents a directed acyclic graph. For a valid DAG, this matrix should be
+strictly lower or upper triangular. For this example, we use the symmetric
+adjacency matrix for demonstration purposes, but a correctly specified DAG
+would require a custom-built `W`.
 
-Model: size_structured
-ATTENTION: This appears to be a highly specialized application-specific model from
-the original document that uses a complex, non-standard API (`bstm_size_structured`).
-Converting this to the formula interface would require a significant refactoring
-of its internal logic into custom components or a nested model structure.
+```julia
+m_dag = @bstm(
+    likelihood(y, family=poisson, log_offsets=:log_offsets) ~
+        intercept() +
+        random(s_idx, model=:dag),
+    inp_df,
+    W = W
+);
+```
 
+### Custom Model Component
+
+The `custom()` module provides an "escape hatch" for users to inject arbitrary
+Turing.jl model code directly into the `bstm` framework. The user provides
+this code as a string to the `code_fragment` parameter.
+
+This example demonstrates how to add a simple, non-spatial random effect for
+the 'cov1' variable. The code within the string defines the prior for the
+effect's standard deviation (`my_effect_sigma`), samples the raw innovations
+(`my_effect_raw`), and adds the final scaled effect to the linear predictor `eta`.
+
+The user can access the main model configuration object `M` within the fragment.
+
+custom_code = """
+    # --- Custom Code for 'cov1' Random Effect ---
+
+    # 1. Define the prior for the standard deviation of the custom effect.
+    my_effect_sigma ~ Exponential(1.0)
+
+    # 2. Sample the raw (unscaled) innovations from a standard normal.
+    #    The length must match the number of observations.
+    my_effect_raw ~ MvNormal(zeros(T, M.y_N), 1.0)
+
+    # 3. Construct the final effect and add it to the linear predictor 'eta'.
+    #    Here, the effect is the product of the raw innovations, the learned
+    #    standard deviation, and the covariate values.
+    my_effect = my_effect_raw * my_effect_sigma
+    eta .+= my_effect .* M.data[!, :cov1]
+"""
+
+m = @bstm(
+    likelihood(y) ~ intercept() + custom(code_fragment=custom_code),
+    inp_df
+);
 
 
 ## Conclusion
@@ -1593,7 +1727,7 @@ These structs define the specific statistical models for latent fields. Their fi
 *   **`pdef_sd`**: Prior for the standard deviation of the residual (uniqueness) noise in `Eigen` models.
 
 ```julia
-# --- Discrete & Graph Primitives (now part of `random(structure=:spatial, model=...)`) ---
+# --- Discrete & Graph Primitives (now part of `random(model=...)`) ---
 struct IID <: ComponentModel; sigma::UnivariateDistribution; end
 struct ICAR <: ComponentModel; sigma::UnivariateDistribution; end
 struct Besag <: ComponentModel; sigma::UnivariateDistribution; end
@@ -1602,7 +1736,7 @@ struct BYM2 <: ComponentModel
     sigma::UnivariateDistribution     # Prior for the overall spatial standard deviation.
 end
 struct Leroux <: ComponentModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end # Proper CAR model
-struct SAR <: ComponentModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end # Simultaneous Autoregressive model (now `random(structure=:spatial, model=:sar)`)
+struct SAR <: ComponentModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end # Simultaneous Autoregressive model (now `random(model=:sar)`)
 
 # --- Temporal Primitives ---
 struct RW1 <: ComponentModel; sigma::UnivariateDistribution; end
@@ -1615,7 +1749,7 @@ struct Harmonic <: ComponentModel
     period::Union{Real, UnivariateDistribution}
 end
 
-# --- Continuous, Spectral, and Advanced Components (now part of `random(structure=:smooth, model=...)` or `random(structure=:spatial, model=...)`) ---
+# --- Continuous, Spectral, and Advanced Components (now part of `random(model=...)` or `random(model=...)`) ---
 struct GP <: ComponentModel
     lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}} # Prior for lengthscale(s). Can be a single value for isotropic kernels or a vector for ARD kernels.
     sigma::UnivariateDistribution     # Prior for the GP's signal variance.
@@ -1636,7 +1770,7 @@ struct Warp <: ComponentModel; lengthscale::UnivariateDistribution; sigma::Univa
 struct Hyperbolic <: ComponentModel; curvature::Real; sigma::UnivariateDistribution; end
 struct ExponentialDecay <: ComponentModel; sigma::UnivariateDistribution; lengthscale::UnivariateDistribution; end
 
-# --- Spline-based Components (now part of `random(structure=:smooth, model=...)`) ---
+# --- Spline-based Components ---
 struct PSpline <: ComponentModel; nbins::Int; degree::Int; diff_order::Int; sigma::UnivariateDistribution; end
 struct BSpline <: ComponentModel; nbins::Int; degree::Int; sigma::UnivariateDistribution; end
 struct TPS <: ComponentModel; nbins::Int; sigma::UnivariateDistribution; end
@@ -1650,14 +1784,14 @@ struct Eigen <: ComponentModel
     pdef_sd::UnivariateDistribution   # Prior for the standard deviation of the residual (uniqueness) noise.
     ltri_indices::Vector{Int}               # Indices for the lower-triangular part of the Householder reflector matrix.
 end
-struct Moran <: ComponentModel; sigma::UnivariateDistribution; end # Now `random(structure=:smooth, model=:moran)`
-struct Spherical <: ComponentModel; sigma::UnivariateDistribution; range::UnivariateDistribution; end # Now `random(structure=:smooth, model=:spherical)`
-struct Barycentric <: ComponentModel; sigma::UnivariateDistribution; end # Now `random(structure=:smooth, model=:barycentric)`
-struct BCGN <: ComponentModel; sigma::UnivariateDistribution; bipartite_adj::AbstractMatrix; end # Now `random(structure=:spatial, model=:bcgn)`
-struct NetworkFlow <: ComponentModel; sigma::UnivariateDistribution; adjacency_matrix::AbstractMatrix; flow_direction::Symbol; end # Now `random(structure=:spatial, model=:networkflow)`
-struct LocalAdaptive <: ComponentModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end # Now `random(structure=:spatial, model=:localadaptive)`
-struct Mosaic <: ComponentModel; sigma::UnivariateDistribution; n_regions::Int; end # Now `random(structure=:spatial, model=:mosaic)`
-struct TensorProductSmooth <: ComponentModel; sigma::UnivariateDistribution; Q_template::AbstractMatrix; end # Now `random(structure=:smooth, model=:tensorproductsmooth)`
+struct Moran <: ComponentModel; sigma::UnivariateDistribution; end # Now `random(model=:moran)`
+struct Spherical <: ComponentModel; sigma::UnivariateDistribution; range::UnivariateDistribution; end # Now `random(model=:spherical)`
+struct Barycentric <: ComponentModel; sigma::UnivariateDistribution; end # Now `random(model=:barycentric)`
+struct BCGN <: ComponentModel; sigma::UnivariateDistribution; bipartite_adj::AbstractMatrix; end # Now `random(model=:bcgn)`
+struct NetworkFlow <: ComponentModel; sigma::UnivariateDistribution; adjacency_matrix::AbstractMatrix; flow_direction::Symbol; end # Now `random(model=:networkflow)`
+struct LocalAdaptive <: ComponentModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end # Now `random(model=:localadaptive)`
+struct Mosaic <: ComponentModel; sigma::UnivariateDistribution; n_regions::Int; end # Now `random(model=:mosaic)`
+struct TensorProductSmooth <: ComponentModel; sigma::UnivariateDistribution; Q_template::AbstractMatrix; end # Now `random(model=:tensorproductsmooth)`
 struct DynamicsComponent <: ComponentModel; model::String; params::Dict{Symbol, Any}; end # Now `dynamics(...)`
 ```
 
@@ -1870,56 +2004,56 @@ In addition to the module-specific parameters, the main `@bstm` call accepts gen
 
 The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm` call (e.g., `@bstm(..., W=my_matrix)`) or, preferably, directly within the `random` module (e.g., `random(s_idx, W=my_matrix)`).
 
-| Component             | `model='...'`       | Key Parameters                                | Default PC-Priors                                               | Use Case & Utility                                                                                     |
-| :---------------------| :--------------------| :----------------------------------------------| :----------------------------------------------------------------| :-------------------------------------------------------------------------------------------------------|
-| **IID**              | `'iid'`             | `sigma`                                       | `Exponential(1.0)`                                              | Models non-spatial overdispersion or heterogeneity.                                                    |
-| **ICAR / Besag**     | `'icar'`, `'besag'` | `sigma`                                       | `Exponential(1.0)`                                              | Provides strong, localized spatial smoothing for lattice data.                                         |
-| **BYM2**             | `'bym2'`            | `sigma`, `rho`                                | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)`                 | The most robust default for areal data; separates spatial clustering from random noise.                |
-| **Leroux**           | `'leroux'`          | `sigma`, `rho`                                | `Exponential(1.0)`, `Beta(1,1)`                                 | A flexible alternative to BYM2 that avoids the rank-deficiency of the ICAR model.                      |
-| **SAR**              | `'sar'`             | `sigma`, `rho`                                | `Exponential(1.0)`, `Beta(1,1)`                                 | Models spatial "spill-over" effects where the value at one location directly influences its neighbors. |
-| **SPDE**             | `'spde'`            | `sigma`, `kappa`                              | `Exponential(1.0)`, `Exponential(1.0)`                          | A scalable and principled way to model continuous spatial processes on irregular structures.              |
-| **Gaussian Process** | `'gp'`              | `sigma`, `lengthscale`, `kernel`              | `Exponential(1.0)`, `InverseGamma(3,3)`                         | Gold-standard for continuous spatial modeling but computationally expensive ($O(N^3)$).                |
-| **RFF**              | `'rff'`             | `sigma`, `lengthscale`, `n_features`          | `Exponential(1.0)`, `InverseGamma(3,3)`                         | A scalable approximation to a full GP, excellent for large numbers of areal units.                     |
-| **FITC**             | `'fitc'`            | `sigma`, `lengthscale`, `n_inducing`          | `Exponential(1.0)`, `InverseGamma(3,3)`                         | Sparse GP using inducing points; good for large N.                                                     |
-| **Nystrom**          | `'nystrom'`         | `sigma`, `lengthscale`, `n_inducing`          | `Exponential(1.0)`, `InverseGamma(3,3)`                         | Low-rank GP approximation, similar to FITC.                                                            |
-| **SVGP**             | `'svgp'`            | `sigma`, `lengthscale`, `n_inducing`          | `Exponential(1.0)`, `InverseGamma(3,3)`                         | Sparse Variational GP, for use with VI.                                                                |
-| **Warp**             | `'warp'`            | `sigma`, `lengthscale`, `n_features`          | `Exponential(1.0)`, `InverseGamma(3,3)`                         | Models non-stationary fields by warping coordinates.                                                   |
-| **NetworkFlow**      | `'network'`         | `sigma`, `adjacency_matrix`, `flow_direction` | `Exponential(1.0)`                                              | For directed graphs like river networks or supply chains.                                              |
-| **DAG**              | `'dag'`             | `sigma`, `adjacency_matrix`                   | `Exponential(1.0)`                                              | For Directed Acyclic Graphs, useful in causal inference.                                               |
-| **Mosaic**           | `'mosaic'`          | `sigma`, `n_regions`                          | `Exponential(1.0)`                                              | Partitions space into locally stationary regions.                                                      |
-| **BCGN**             | `'bcgn'`            | `sigma`, `bipartite_adj`                      | `Exponential(1.0)`                                              | For bipartite graphs (e.g., user-item interactions).                                                   |
-| **Hyperbolic**       | `'hyperbolic'`      | `sigma`, `curvature`                          | `Exponential(1.0)`                                              | For embedding hierarchical or tree-like spatial data.                                                  |
+| Component            | `model='...'`       | Key Parameters                                | Default PC-Priors                               | Use Case & Utility                                                                                     |
+| :---------------------| :--------------------| :----------------------------------------------| :------------------------------------------------| :-------------------------------------------------------------------------------------------------------|
+| **IID**              | `'iid'`             | `sigma`                                       | `Exponential(1.0)`                              | Models non-spatial overdispersion or heterogeneity.                                                    |
+| **ICAR / Besag**     | `'icar'`, `'besag'` | `sigma`                                       | `Exponential(1.0)`                              | Provides strong, localized spatial smoothing for lattice data.                                         |
+| **BYM2**             | `'bym2'`            | `sigma`, `rho`                                | `sigma`: `Exponential(1.0)`, `rho`: `Beta(1,1)` | The most robust default for areal data; separates spatial clustering from random noise.                |
+| **Leroux**           | `'leroux'`          | `sigma`, `rho`                                | `Exponential(1.0)`, `Beta(1,1)`                 | A flexible alternative to BYM2 that avoids the rank-deficiency of the ICAR model.                      |
+| **SAR**              | `'sar'`             | `sigma`, `rho`                                | `Exponential(1.0)`, `Beta(1,1)`                 | Models spatial "spill-over" effects where the value at one location directly influences its neighbors. |
+| **SPDE**             | `'spde'`            | `sigma`, `kappa`                              | `Exponential(1.0)`, `Exponential(1.0)`          | A scalable and principled way to model continuous spatial processes on irregular structures.           |
+| **Gaussian Process** | `'gp'`              | `sigma`, `lengthscale`, `kernel`              | `Exponential(1.0)`, `InverseGamma(3,3)`         | Gold-standard for continuous spatial modeling but computationally expensive ($O(N^3)$).                |
+| **RFF**              | `'rff'`             | `sigma`, `lengthscale`, `n_features`          | `Exponential(1.0)`, `InverseGamma(3,3)`         | A scalable approximation to a full GP, excellent for large numbers of areal units.                     |
+| **FITC**             | `'fitc'`            | `sigma`, `lengthscale`, `n_inducing`          | `Exponential(1.0)`, `InverseGamma(3,3)`         | Sparse GP using inducing points; good for large N.                                                     |
+| **Nystrom**          | `'nystrom'`         | `sigma`, `lengthscale`, `n_inducing`          | `Exponential(1.0)`, `InverseGamma(3,3)`         | Low-rank GP approximation, similar to FITC.                                                            |
+| **SVGP**             | `'svgp'`            | `sigma`, `lengthscale`, `n_inducing`          | `Exponential(1.0)`, `InverseGamma(3,3)`         | Sparse Variational GP, for use with VI.                                                                |
+| **Warp**             | `'warp'`            | `sigma`, `lengthscale`, `n_features`          | `Exponential(1.0)`, `InverseGamma(3,3)`         | Models non-stationary fields by warping coordinates.                                                   |
+| **NetworkFlow**      | `'network'`         | `sigma`, `adjacency_matrix`, `flow_direction` | `Exponential(1.0)`                              | For directed graphs like river networks or supply chains.                                              |
+| **DAG**              | `'dag'`             | `sigma`, `adjacency_matrix`                   | `Exponential(1.0)`                              | For Directed Acyclic Graphs, useful in causal inference.                                               |
+| **Mosaic**           | `'mosaic'`          | `sigma`, `n_regions`                          | `Exponential(1.0)`                              | Partitions space into locally stationary regions.                                                      |
+| **BCGN**             | `'bcgn'`            | `sigma`, `bipartite_adj`                      | `Exponential(1.0)`                              | For bipartite graphs (e.g., user-item interactions).                                                   |
+| **Hyperbolic**       | `'hyperbolic'`      | `sigma`, `curvature`                          | `Exponential(1.0)`                              | For embedding hierarchical or tree-like spatial data.                                                  |
 
 ### `random()` Module (Temporal and Seasonal structures)
 
-| Component              | `model='...'` | Key Parameters                                   | Default PC-Priors                                               | Use Case & Utility                                                                                |
-| :----------------------| :--------------| :-------------------------------------------------| :----------------------------------------------------------------| :--------------------------------------------------------------------------------------------------|
-| **IID**               | `'iid'`       | `sigma`                                    | `Exponential(1.0)`                                              | Models unstructured temporal noise.                                                               |
-| **AR1**               | `'ar1'`       | `sigma`, `rho`                       | `Exponential(1.0)`, `Beta(1,1)`                                 | Modeling serially correlated time series where the influence of past events decays geometrically. |
-| **Random Walk (RW1)** | `'rw1'`       | `sigma`                        | `Exponential(1.0)`                                              | Capturing abrupt changes or step-like trends.                                                     |
-| **Random Walk (RW2)** | `'rw2'`       | `sigma`                        | `Exponential(1.0)`                                              | The most common choice for modeling smooth, non-linear temporal trends.                           |
-| **Gaussian Process**  | `'gp'`        | `sigma`, `lengthscale`         | `Exponential(1.0)`, `InverseGamma(3,3)`                         | Flexible, non-parametric trend modeling.                                                          |
-| **RFF**               | `'rff'`       | `sigma`, `lengthscale`, `n_features` | `Exponential(1.0)`, `InverseGamma(3,3)`                         | Scalable GP approximation for long time series.                                                   |
-| **Cyclic**            | `'cyclic'`    | `sigma`, `period`              | `Exponential(1.0)`                                              | Modeling smooth, periodic effects like day-of-week or month-of-year.                              |
-| **Harmonic**          | `'harmonic'`  | `amplitude`, `phase`, `period` | `Normal(0,1)`, `Beta(1,1)`                                      | Capturing sharp, regular periodic patterns with sine and cosine waves.                            |
+| Component             | `model='...'` | Key Parameters                       | Default PC-Priors                       | Use Case & Utility                                                                                |
+| :----------------------| :--------------| :-------------------------------------| :----------------------------------------| :--------------------------------------------------------------------------------------------------|
+| **IID**               | `'iid'`       | `sigma`                              | `Exponential(1.0)`                      | Models unstructured temporal noise.                                                               |
+| **AR1**               | `'ar1'`       | `sigma`, `rho`                       | `Exponential(1.0)`, `Beta(1,1)`         | Modeling serially correlated time series where the influence of past events decays geometrically. |
+| **Random Walk (RW1)** | `'rw1'`       | `sigma`                              | `Exponential(1.0)`                      | Capturing abrupt changes or step-like trends.                                                     |
+| **Random Walk (RW2)** | `'rw2'`       | `sigma`                              | `Exponential(1.0)`                      | The most common choice for modeling smooth, non-linear temporal trends.                           |
+| **Gaussian Process**  | `'gp'`        | `sigma`, `lengthscale`               | `Exponential(1.0)`, `InverseGamma(3,3)` | Flexible, non-parametric trend modeling.                                                          |
+| **RFF**               | `'rff'`       | `sigma`, `lengthscale`, `n_features` | `Exponential(1.0)`, `InverseGamma(3,3)` | Scalable GP approximation for long time series.                                                   |
+| **Cyclic**            | `'cyclic'`    | `sigma`, `period`                    | `Exponential(1.0)`                      | Modeling smooth, periodic effects like day-of-week or month-of-year.                              |
+| **Harmonic**          | `'harmonic'`  | `amplitude`, `phase`, `period`       | `Normal(0,1)`, `Beta(1,1)`              | Capturing sharp, regular periodic patterns with sine and cosine waves.                            |
  
 ### `random()` Module (Smooth structure)
 
-*Note: Direct censoring of covariates in `random(structure=:smooth)` is not supported. See Section 6.5 for the recommended two-stage modeling approach.*
+*Note: Direct censoring of covariates in `random()` is not supported. See Section 6.5 for the recommended two-stage modeling approach.*
 
-| Component / Method                | `model='...'`    | Key Parameters                    | Default Priors                                                        | Use Case & Utility                                                                             |
-| :---------------------------------| :-----------------| :----------------------------------| :----------------------------------------------------------------------| :-----------------------------------------------------------------------------------------------|
-| **P-Spline**                     | `'pspline'`      | `nbins`, `degree`, `diff_order`   | `Exponential(1.0)`                                              | The most flexible general-purpose smoother for 1D covariates.                                  |
-| **B-Spline**                     | `'bspline'`      | `nbins`, `degree`                 | `Exponential(1.0)`                                              | A simpler spline smoother than P-splines, useful when less regularization is desired.          |
-| **Thin Plate Spline**            | `'tps'`          | `nbins`                           | `Exponential(1.0)`                                              | The classic choice for smoothing 2D spatial coordinates (e.g., `random(lon, lat, model=tps)`). |
-| **Random Fourier Features**      | `'rff'`          | `n_features`, `lengthscale` | `Exponential(1.0)`, `InverseGamma(3,3)`                         | A highly scalable method for approximating a full Gaussian Process smooth.                     |
-| **Random Walk (on bins)**        | `'rw1'`, `'rw2'` | `nbins`                           | `Exponential(1.0)`                                              | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
-| **Gaussian Process (on coords)** | `'gp'`           | `lengthscale`               | `Exponential(1.0)`                                              | Gold-standard continuous smoother, computationally intensive.                                  |
-| **FFT Basis**                    | `'fft'`          | `nbins`, `lengthscale`      | `Exponential(1.0)`, `InverseGamma(3,3)`                         | For modeling periodic non-linear effects of a covariate with a learnable period.               |
-| **Moran's I Basis**              | `'moran'`        | `nbins`, `W`                      | `Exponential(1.0)`                                              | Uses eigenvectors of a spatial weights matrix as basis functions.                              |
-| **Spherical Basis**              | `'spherical'`    | `nbins`, `range`            | `Exponential(1.0)`                                              | For effects with a strictly local influence (compact support).                                 |
-| **Exponential Decay Basis**      | `'decay'`        | `nbins`, `lengthscale`            | `Exponential(1.0)`                                              | For effects with a strong, rapidly decaying influence.                                         |
-| **Barycentric Basis**            | `'barycentric'`  | `nbins`                           | `Exponential(1.0)`                                              | Simple, interpretable piecewise linear smoother.                                               |
+| Component / Method               | `model='...'`    | Key Parameters                  | Default Priors                          | Use Case & Utility                                                                             |
+| :---------------------------------| :-----------------| :--------------------------------| :----------------------------------------| :-----------------------------------------------------------------------------------------------|
+| **P-Spline**                     | `'pspline'`      | `nbins`, `degree`, `diff_order` | `Exponential(1.0)`                      | The most flexible general-purpose smoother for 1D covariates.                                  |
+| **B-Spline**                     | `'bspline'`      | `nbins`, `degree`               | `Exponential(1.0)`                      | A simpler spline smoother than P-splines, useful when less regularization is desired.          |
+| **Thin Plate Spline**            | `'tps'`          | `nbins`                         | `Exponential(1.0)`                      | The classic choice for smoothing 2D spatial coordinates (e.g., `random(lon, lat, model=tps)`). |
+| **Random Fourier Features**      | `'rff'`          | `n_features`, `lengthscale`     | `Exponential(1.0)`, `InverseGamma(3,3)` | A highly scalable method for approximating a full Gaussian Process smooth.                     |
+| **Random Walk (on bins)**        | `'rw1'`, `'rw2'` | `nbins`                         | `Exponential(1.0)`                      | A powerful way to model a non-linear effect as a structured random effect on discretized bins. |
+| **Gaussian Process (on coords)** | `'gp'`           | `lengthscale`                   | `Exponential(1.0)`                      | Gold-standard continuous smoother, computationally intensive.                                  |
+| **FFT Basis**                    | `'fft'`          | `nbins`, `lengthscale`          | `Exponential(1.0)`, `InverseGamma(3,3)` | For modeling periodic non-linear effects of a covariate with a learnable period.               |
+| **Moran's I Basis**              | `'moran'`        | `nbins`, `W`                    | `Exponential(1.0)`                      | Uses eigenvectors of a spatial weights matrix as basis functions.                              |
+| **Spherical Basis**              | `'spherical'`    | `nbins`, `range`                | `Exponential(1.0)`                      | For effects with a strictly local influence (compact support).                                 |
+| **Exponential Decay Basis**      | `'decay'`        | `nbins`, `lengthscale`          | `Exponential(1.0)`                      | For effects with a strong, rapidly decaying influence.                                         |
+| **Barycentric Basis**            | `'barycentric'`  | `nbins`                         | `Exponential(1.0)`                      | Simple, interpretable piecewise linear smoother.                                               |
 
 ### 8.6. `mixed()` Module
 
@@ -1932,13 +2066,13 @@ The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm`
 
 ### 8.7. `dynamics()` Module
 
-| Model                   | `model='...'`           | Key Parameters                               | Default Priors                                                              |
-| :---------------------- | :---------------------- | :------------------------------------------- | :-------------------------------------------------------------------------- |
-| **Advection**           | `'advection'`           | `velocity`, `sigma`                          | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)`                    |
-| **Diffusion**           | `'diffusion'`           | `diffusion`, `sigma`                         | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)`                 |
-| **Advection-Diffusion** | `'advection_diffusion'` | `velocity`, `diffusion`, `sigma`             | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)`                 |
-| **Gompertz Growth**     | `'gompertz'`            | `r`, `K`, `sig_dyn`                          | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)`                           |
-| **Logistic Growth**     | `'logistic_basic'`      | `r`, `K`                                     | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`                                |
+| Model                   | `model='...'`           | Key Parameters                   | Default Priors                                              |
+| :------------------------| :------------------------| :---------------------------------| :------------------------------------------------------------|
+| **Advection**           | `'advection'`           | `velocity`, `sigma`              | `velocity`: `Normal(0,0.5)`, `sigma`: `Exponential(1.0)`    |
+| **Diffusion**           | `'diffusion'`           | `diffusion`, `sigma`             | `diffusion`: `LogNormal(-1,1)`, `sigma`: `Exponential(1.0)` |
+| **Advection-Diffusion** | `'advection_diffusion'` | `velocity`, `diffusion`, `sigma` | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)` |
+| **Gompertz Growth**     | `'gompertz'`            | `r`, `K`, `sig_dyn`              | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)`           |
+| **Logistic Growth**     | `'logistic_basic'`      | `r`, `K`                         | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`                |
 
 ### 8.8. `nested()` and `eigen()` Modules
 
@@ -1948,12 +2082,12 @@ The `nested()` and `eigen()` modules provide advanced capabilities for multi-fid
 
 The `nested()` module is a powerful "supervisor" component used for multi-fidelity modeling and model stacking. It allows you to define a complete sub-model that is fit to a separate (often larger, lower-quality) dataset. The latent effect from this sub-model is then incorporated as a calibrated predictor into the main model, allowing the main model to "learn" from the proxy data.
 
-| Keyword / Parameter     | Example Usage                                                         | Data Type | Default            | Meaning & Assumptions                                                                                                                                                                                                                                 |
-| :------------------------| :----------------------------------------------------------------------| :----------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `nested()`              | `nested(z_var; ...)`                                                  | Module    | N/A                | Defines a supervised sub-model whose latent effect is added to the main model's linear predictor. The `z_var` is a symbolic name for this component.                                                                                                  |
-| `formula`               | `formula="likelihood(z, family=gaussian) ~ intercept() + random(s, structure=:spatial)"` | `String`  | `""`               | A complete `bstm` formula string that defines the structure of the sub-model, including its own likelihood. This sub-model is fit to the specified `data_source`.                                                                                     |
-| `data_source`           | `data_source=proxy_data`                                              | `Symbol`  | `:data`            | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset.                                                                                                      |
-| `rho_nested` (Implicit) | N/A                                                                   | `Float`   | `Normal(1.0, 0.5)` | A scaling coefficient that links the sub-model's latent effect to the main model's linear predictor: $\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}$. The prior assumes the sub-model is a good proxy ($\rho \approx 1$). |
+| Keyword / Parameter     | Example Usage                                                        | Data Type | Default            | Meaning & Assumptions                                                                                                                                                                                                                                 |
+| :------------------------| :---------------------------------------------------------------------| :----------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `nested()`              | `nested(z_var; ...)`                                                 | Module    | N/A                | Defines a supervised sub-model whose latent effect is added to the main model's linear predictor. The `z_var` is a symbolic name for this component.                                                                                                  |
+| `formula`               | `formula="likelihood(z, family=gaussian) ~ intercept() + random(s)"` | `String`  | `""`               | A complete `bstm` formula string that defines the structure of the sub-model, including its own likelihood. This sub-model is fit to the specified `data_source`.                                                                                     |
+| `data_source`           | `data_source=proxy_data`                                             | `Symbol`  | `:data`            | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset.                                                                                                      |
+| `rho_nested` (Implicit) | N/A                                                                  | `Float`   | `Normal(1.0, 0.5)` | A scaling coefficient that links the sub-model's latent effect to the main model's linear predictor: $\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}$. The prior assumes the sub-model is a good proxy ($\rho \approx 1$). |
 
 #### `eigen()` Module Reference
 
@@ -1973,7 +2107,7 @@ These modules provide explicit control over standard regression components.
 #### `fixed()` Module Reference
 
 | Keyword / Parameter | Example Usage        | Data Type                 | Default        | Meaning & Assumptions                                                                                    |
-| :------------------ | :------------------- | :-------------------------- | :------------- | :------------------------------------------------------------------------------------------------------- |
+| :--------------------| :---------------------| :--------------------------| :---------------| :---------------------------------------------------------------------------------------------------------|
 | `fixed()`           | `fixed(Region, ...)` | Module                    | N/A            | Explicitly marks a variable as a fixed effect. Primarily used to specify contrasts or priors.            |
 | `contrast`          | `contrast=:effects`  | `Symbol`                  | `DummyCoding`  | Specifies the contrast coding for a categorical variable (e.g., `:effects`, `:helmert`).                 |
 | `prior`             | `prior=Normal(0, 2)` | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the coefficient(s) of this fixed effect. Can be a `Distribution` or a PC prior tuple. |
@@ -1981,7 +2115,7 @@ These modules provide explicit control over standard regression components.
 #### `intercept()` Module Reference
 
 | Keyword / Parameter | Example Usage          | Data Type                 | Default        | Meaning & Assumptions                                                                                                                |
-| :------------------ | :----------------------- | :-------------------------- | :------------- | :----------------------------------------------------------------------------------------------------------------------------------- |
+| :--------------------| :-----------------------| :--------------------------| :---------------| :-------------------------------------------------------------------------------------------------------------------------------------|
 | `intercept()`       | `intercept(prior=...)` | Module                    | N/A            | Explicitly includes a global intercept. Using `1` in the formula is equivalent. This module is mainly for specifying a custom prior. |
 | `prior`             | `prior=Normal(0, 10)`  | `Distribution` or `Tuple` | `Normal(0, 5)` | Sets the prior for the global intercept term. Can be a `Distribution` or a PC prior tuple.                                           |
 

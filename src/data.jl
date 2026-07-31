@@ -1,6 +1,94 @@
 
     
 
+function generate_ordinal_data(;
+    n_obs::Int=500, 
+    n_groups::Int=10, 
+    seed::Int=42
+)
+    # Purpose: Generates a synthetic dataset for a non-proportional odds ordinal regression model.
+    # Rationale: This function simulates data that reflects the complexity of the specified model,
+    #            including a mix of proportional and non-proportional covariate effects, and a
+    #            random intercept structure. This provides a valid dataset for testing and fitting
+    #            the advanced ordinal model.
+    # v1.0.0 (2026-07-31)
+    # Inputs:
+    #   - n_obs: The number of observations to generate.
+    #   - n_groups: The number of unique groups for the random intercept.
+    #   - seed: A random seed for reproducibility.
+    # Outputs: A DataFrame containing the simulated data.
+
+    Random.seed!(seed)
+
+    # 1. Generate covariates and grouping variable
+    cov1 = randn(n_obs)
+    cov2 = rand(n_obs) .* 2
+    cov3 = rand(-2:2, n_obs)
+    group_id = rand(1:n_groups, n_obs)
+
+    # 2. Define true underlying parameters for the data generating process
+    # Cut-points for a 3-category outcome. These act as intercepts for each cumulative logit/probit.
+    alpha_1 = -1.0  # Threshold for P(Y<=1)
+    alpha_2 = 1.5   # Threshold for P(Y<=2)
+
+    # Proportional effects (same effect across all categories)
+    beta_cov2 = 0.5
+    beta_cov3 = -0.4
+    
+    # Non-proportional effects for cov1 (different effect for each category boundary)
+    beta_cov1_cat1 = 1.2  # Effect of cov1 on the logit for P(Y<=1)
+    beta_cov1_cat2 = -0.8 # Effect of cov1 on the logit for P(Y<=2)
+
+    # Random intercept parameters
+    sigma_random_intercept = 0.7
+    random_intercepts = rand(Normal(0, sigma_random_intercept), n_groups)
+
+    # 3. Generate the ordinal outcome
+    ordinal_y = Vector{Int}(undef, n_obs)
+    
+    for i in 1:n_obs
+        # Calculate the proportional part of the linear predictor
+        eta_proportional = (beta_cov2 * cov2[i]) + (beta_cov3 * cov3[i]) + random_intercepts[group_id[i]]
+
+        # Calculate the linear predictor for each cumulative probability, including the non-proportional effect
+        # Note: The model is P(Y<=j) = F(alpha_j - eta_j). We simulate based on this structure.
+        linear_pred_1 = alpha_1 - (eta_proportional + cov1[i] * beta_cov1_cat1)
+        linear_pred_2 = alpha_2 - (eta_proportional + cov1[i] * beta_cov1_cat2)
+
+        # Apply the inverse link function (Normal CDF for probit link)
+        # P(Y <= 1)
+        cum_prob_1 = cdf(Normal(), linear_pred_1)
+        # P(Y <= 2)
+        cum_prob_2 = cdf(Normal(), linear_pred_2)
+
+        # Derive the probability for each category
+        # P(Y = 1) = P(Y <= 1)
+        prob_1 = cum_prob_1
+        # P(Y = 2) = P(Y <= 2) - P(Y <= 1)
+        prob_2 = max(0.0, cum_prob_2 - cum_prob_1)
+        # P(Y = 3) = 1 - P(Y <= 2)
+        prob_3 = max(0.0, 1.0 - cum_prob_2)
+        
+        # Normalize probabilities to ensure they sum to 1, handling potential floating point inaccuracies
+        probs = [prob_1, prob_2, prob_3]
+        probs ./= sum(probs)
+
+        # Sample the ordinal outcome from the categorical distribution
+        ordinal_y[i] = rand(Categorical(probs))
+    end
+
+    # 4. Assemble the DataFrame
+    inp_df = DataFrame(
+        ordinal_y = ordinal_y,
+        cov1 = cov1,
+        cov2 = cov2,
+        cov3 = cov3,
+        group_id = categorical(group_id) # Ensure group_id is a categorical variable
+    )
+
+    return inp_df
+end
+
     
 function generate_sim_data(s_N=25, t_N=10; rndseed=42)
     # Purpose: A utility function for generating a standardized simulated spatiotemporal dataset.

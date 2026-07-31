@@ -24,7 +24,7 @@ print( "Current directory is: ", current_directory, "\n\n" )
 pkgs_bstm = [
   "DrWatson", "Revise", "Requires", "PrecompileTools", "PackageCompiler", "SpecialFunctions", "DimensionalData",
   "Random", "Plots", "StatsPlots", "LibGEOS", "Graphs", "DelaunayTriangulation", "OrderedCollections", "NearestNeighbors",  
-  "Distributions", "Statistics",  "DataFrames",  "GLM", "FlexiChains", "AbstractPPL", "Wavelets", "NNlib",
+  "Distributions", "Statistics",  "DataFrames",  "GLM", "FlexiChains", "AbstractPPL", "Wavelets", "WaveletsExt", "NNlib",
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs", 
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing",  
@@ -79,22 +79,28 @@ import DynamicPPL
 import StatsPlots
 
 using Statistics: mean, std, median, quantile, var, cor, Diagonal, eigen
-using StatsBase: Weights, sample, midpoints
-using StatsBase: zscore, standardize, ZScoreTransform, UnitRangeTransform
+using StatsBase: Weights, sample, midpoints, quantile, zscore, standardize, ZScoreTransform, UnitRangeTransform
 
 using AbstractMCMC: logdensity # Explicitly import logdensity
 using NNlib: softmax
 
 import SpecialFunctions: logfactorial
 import LogExpFunctions: logdiffexp, logistic, logsumexp, log1mexp
-import Distributions: logpdf, _logpdf, pdf, cdf, logcdf, logccdf, rand, sampler
+# import Distributions: logpdf, _logpdf, pdf, cdf, logcdf, logccdf, rand, sampler
+# using Distributions: UnivariateDistribution, Normal, MvNormal, Exponential, Beta, Gamma, Uniform, TDist, LogNormal, Laplace, Pareto, Binomial, NegativeBinomial, InverseGaussian, Categorical, Dirichlet, InverseWishart, DirichletMultinomial, LKJCholesky, truncated, filldist, product
 
 using LogExpFunctions: logistic, logsumexp, log1mexp
 
 # Extend base names check for ADVI pseudo-chain
-using Turing: Variational
+using Turing: Variational, Turing
 using Turing.Inference
+using DynamicPPL: Model, @model, NamedDist
 
+using .Wavelets.Util: wavefun
+using Interpolations: LinearInterpolation, Flat
+
+using LinearAlgebra: I, Symmetric, cholesky, dot, mean, repeat
+ 
 # MCMCChains.names(chain::NamedTuple) = collect(keys(chain.data))  # USED? 
 
 # to help track variables, add something like this inside of a function:  
