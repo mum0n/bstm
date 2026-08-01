@@ -1247,12 +1247,18 @@ m = @bstm(
 Modeling counts across multiple categories using Dirichlet-Multinomial. Note: Multi-column LHS targets the Dirichlet-Multinomial kernel
 
 ```julia
-model_multi = @bstm(
-    likelihood(y_cat1 + y_cat2 + y_cat3, family=dirichlet_multinomial) ~
-    intercept() + # Intercept
-    random(s_x, s_y, model=gp, kernel=matern32, n_inducing=5), # Smooth GP effect
-    data
+
+df_dmm, W_dmm = generate_dirichlet_multinomial_data();
+
+m = @bstm(
+    likelihood(cat_1 + cat_2 + cat_3, family=:dirichlet_multinomial) ~
+        intercept() + 
+        random(s_idx, model=:bym2),
+    df_dmm,
+    W = W_dmm,
+    verbose = false # Suppress model code printing for cleaner output
 );
+
 ```
 
 ### Proportional odds ratio model
@@ -1668,17 +1674,48 @@ m_lotka_volterra = @bstm(
 );
 
 
-# 5. Leslie Logistic
+# 5. Leslie 
 
-df_leslie_logistic, W_ll, ga_ll, n_age_classes_ll = generate_leslie_logistic_data()
-m_leslie_logistic = @bstm(
-    likelihood(y, family=poisson) ~
-        intercept() +
-        dynamics(s_idx, year, model=leslie_logistic, K=LogNormal(log(100.0), 0.5), n_age_classes=n_age_classes_ll),
-    df_leslie_logistic,
-    W = W_ll,
-    grid_areas = ga_ll
+# Generate synthetic data for the generalized Leslie matrix model
+df_glm, W_glm, ga_glm, n_classes_glm = generate_generalized_leslie_matrix_data(
+    s_N=10, 
+    t_N=10, 
+    n_classes=4, 
+    use_effort=true, 
+    spatially_varying_K=true
 );
+
+println("Generated synthetic data for a $(n_classes_glm)-class population model:")
+display(first(df_glm, 5))
+ized Leslie Matrix model
+m_glm = @bstm(
+    likelihood(class_1 + class_2 + class_3 + class_4) ~
+        intercept() +
+        dynamics(s_idx, year, 
+            model=generalized_leslie_matrix, 
+            n_classes=n_classes_glm,
+            spatially_varying_K=true,
+            effort=:effort,
+            K=LogNormal(log(100.0), 0.5), # Prior for mean K
+            q_effort=filldist(LogNormal(-4, 1), n_classes_glm) # Prior for catchability
+        ),
+    df_glm,
+    W = W_glm,
+    grid_areas = ga_glm,
+    verbose = false
+);
+
+e summary of key parameters from the posterior chain
+param_subset = [
+    "A_flat_dynamics", "A_flat_dynamics", "A_flat_dynamics", 
+    "log_K_mean_dynamics", "sigma_K_dynamics", 
+    "q_effort", "q_effort"
+]
+display(chain_glm[param_subset])
+
+# Further analysis could involve reconstructing the full population trajectories
+# for each class using the `model_results_comprehensive` function.
+# res_glm = model_results_comprehensive(m_glm, chain_glm);
 
 
 # 6. Spatially varying K logistic
@@ -2262,10 +2299,10 @@ The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm`
 
 *Note: Direct censoring of covariates in `mixed()` is not supported. See Section 6.5 for the recommended joint modeling approach.*
 
-| Syntax               | Example Usage                 | Key Parameters | Default Priors              | Mathematical Assumption                                                                                                                      |
-| :------------------- | :------------------------------ | :------------- | :-------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Random Intercept** | `mixed(1 | group_var)`         | `model`        | `sigma`: `Exponential(1.0)` | Assumes each level $j$ of `group_var` has a unique intercept $\alpha_j \sim \mathcal{N}(0, \sigma^2_{\text{group}})$.                        |
-| **Random Slope**     | `mixed(covariate | group_var)` | `model`        | `sigma`: `Exponential(1.0)` | Assumes the effect (slope) of a `covariate` varies across the levels of `group_var`, $\beta_j \sim \mathcal{N}(0, \sigma^2_{\text{slope}})$. |
+| Syntax               | Example Usage    | Key Parameters | Default Priors | Mathematical Assumption     |                                                                                                                                              |
+| :---------------------| :-----------------| :---------------| :---------------| :----------------------------| ----------------------------------------------------------------------------------------------------------------------------------------------|
+| **Random Intercept** | `mixed(1         | group_var)`    | `model`        | `sigma`: `Exponential(1.0)` | Assumes each level $j$ of `group_var` has a unique intercept $\alpha_j \sim \mathcal{N}(0, \sigma^2_{\text{group}})$.                        |
+| **Random Slope**     | `mixed(covariate | group_var)`    | `model`        | `sigma`: `Exponential(1.0)` | Assumes the effect (slope) of a `covariate` varies across the levels of `group_var`, $\beta_j \sim \mathcal{N}(0, \sigma^2_{\text{slope}})$. |
 
 ### 8.7. `dynamics()` Module
 
@@ -2276,6 +2313,50 @@ The adjacency matrix `W` can be passed as a keyword argument to the main `@bstm`
 | **Advection-Diffusion** | `'advection_diffusion'` | `velocity`, `diffusion`, `sigma` | `velocity`: `Normal(0,0.5)`, `diffusion`: `LogNormal(-1,1)` |
 | **Gompertz Growth**     | `'gompertz'`            | `r`, `K`, `sig_dyn`              | `r`: `LogNormal(-1.5,0.5)`, `K`: `Normal(150,50)`           |
 | **Logistic Growth**     | `'logistic_basic'`      | `r`, `K`                         | `r`: `LogNormal(0,1)`, `K`: `Normal(150,50)`                |
+
+
+### 8.7.2. Biological Population Models
+
+These models describe the change in population size or structure over time.
+
+| Model                          | `model='...'`                  | Key Parameters                    | Default Priors                                                                                            | Use Case & Utility                                                                                                                                                                                        |
+| :-------------------------------| :-------------------------------| :----------------------------------| :----------------------------------------------------------------------------------------------------------| :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+ | **Logistic Growth** | `'logistic'` | `r`, `K`, `q` | `r`: `LogNormal(0,1)`, `K`: `LogNormal(log(100),1)`, `q`: `LogNormal(-2,1)` | Models population growth with a symmetric carrying capacity. Supports exploitation via `effort` (estimates `q`) or `removal` (uses removal directly). Defaults to zero exploitation if neither is provided. |
+ | **Delay-Difference** | `'delay_difference'` | `r`, `K`, `M_nat`, `q` | `r`: `LogNormal(0,1)`, `K`: `LogNormal(log(100),1)`, `M_nat`: `LogNormal(-1,0.5)`, `q`: `LogNormal(-2,1)` | A surplus production model with natural mortality. Supports `effort` or `removal`. Defaults to zero exploitation if neither is provided. |
+ | **Lotka-Volterra** | `'lotka_volterra'` | `alpha`, `beta`, `gamma`, `delta` | `LogNormal` priors | Classic two-species prey-predator dynamics. |
+ | **Leslie Matrix** | `'leslie_matrix'` | `n_age_classes`, `K`, `q` | `K`: `LogNormal(log(100),1)`, `q`: `LogNormal(-2,1)` | A full multivariate, age-structured population model. Supports exploitation via `effort` (estimates age-specific `q`) or `removal`. Requires a multivariate likelihood. |
+ | **Generalized Lotka-Volterra** | `'generalized_lotka_volterra'` | | | An n-species competition model. Requires a multivariate likelihood. |
+ 
+ **Mathematical Formulations:**
+ 
+ *   **Logistic Growth (`logistic`)**:
+     The change in population density $D$ is modeled as:
+     $$\frac{dD}{dt} = r D \left(1 - \frac{D}{K_D}\right)$$
+     In the discrete-time state-space model, this becomes:
+     $$N_{s, t+1} = N_{s,t} + r \frac{N_{s,t}}{A_s} \left(1 - \frac{N_{s,t}/A_s}{K/A_s}\right) A_s - C_{s,t} + \epsilon_{s,t}$$
+     where $N_{s,t}$ is the population in area $s$ at time $t$, $A_s$ is the area, and $K$ is the total carrying capacity. The exploitation term $C_{s,t}$ is determined by the `effort` or `removal` parameters. If `effort` is provided, removal is modeled as $C_{s,t} = q E_{s,t} N_{s,t}$. If `removal` is provided, $C_{s,t}$ is taken directly from the data.
+ 
+ *   **Delay-Difference (`delay_difference`)**:
+     A surplus production model that separates natural mortality from recruitment:
+     $$N_{s, t+1} = (N_{s,t} - C_{s,t}) e^{-M} + R_{s,t} + \epsilon_{s,t}$$
+     Where $M$ is the natural mortality rate and recruitment $R_{s,t}$ is given by the logistic growth term. Removal $C_{s,t}$ is determined by the `effort` or `removal` parameters.
+ 
+ *   **Lotka-Volterra (`lotka_volterra`)**:
+     A two-species prey-predator model defined by a system of coupled equations for prey ($N$) and predator ($P$) populations:
+     $$\frac{dN}{dt} = \alpha N - \beta NP$$
+     $$\frac{dP}{dt} = \delta NP - \gamma P$$
+     The model estimates the interaction parameters `alpha`, `beta`, `gamma`, and `delta`.
+ 
+ *   **Leslie Matrix (`leslie_matrix`)**:
+     A multivariate age-structured model where the population vector $\mathbf{n}_t$ (with elements for each age class) evolves according to:
+     $$\mathbf{n}_{t+1} = \mathbf{L} (\mathbf{n}_t - \mathbf{C}_t) + \boldsymbol{\epsilon}_t$$
+     The Leslie matrix $\mathbf{L}$ is constructed from estimated fecundity rates and survival probabilities. The removal vector $\mathbf{C}_t$ is determined by the `effort` or `removal` parameters, with age-specific catchability coefficients `q_a` estimated if `effort` is provided. Density dependence can be introduced by making fecundity a function of total population size and carrying capacity `K`. This model requires a multivariate likelihood (e.g., `likelihood(age1 + age2 + age3) ~ ...`).
+ 
+ *   **Generalized Lotka-Volterra (`generalized_lotka_volterra`)**:
+     An n-species competition model that requires a multivariate likelihood. The dynamics for each species $i$ are:
+     $$\frac{dN_i}{dt} = r_i N_i \left(1 - \frac{\sum_{j=1}^{n} \alpha_{ij} N_j}{K_i}\right)$$
+     The model estimates a vector of growth rates `r`, carrying capacities `K`, and the `n x n` interaction matrix `alpha`, where $\alpha_{ij}=1$.
+
 
 ### 8.8. `nested()` and `eigen()` Modules
 

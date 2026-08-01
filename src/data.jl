@@ -488,18 +488,38 @@ function prepare_advanced_bstm_data()
     return df
 end
 
+ 
 
-
-function generate_logistic_basic_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, seed=123)
+function generate_logistic_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, seed=123, use_effort::Bool=false, use_removal::Bool=false)
+    # Purpose: Generates synthetic data for a logistic population dynamics model, with optional exploitation.
+    # Rationale: Consolidates `generate_logistic_basic_data` and `generate_logistic_exploitation_data`
+    #            into a single flexible function.
+    # v1.0.0 (2026-08-01)
     df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
     
-    # Simulate a simple population trajectory
+    # True parameters
+    r_true = 0.5
+    K_true = 100.0
+    q_true = 0.01 # Catchability
+    
+    # Simulate exploitation data if requested
+    local effort_sim, removal_sim
+    if use_effort
+        effort_sim = rand(s_N, t_N) .* 0.5 .+ 0.1 # Random effort between 0.1 and 0.6
+    else
+        effort_sim = zeros(s_N, t_N)
+    end
+
+    if use_removal
+        removal_sim = rand(s_N, t_N) .* 5.0 # Random removal
+    else
+        removal_sim = zeros(s_N, t_N)
+    end
+
+    # Simulate population trajectory
     initial_pop = rand(s_N) * 10.0 .+ 5.0 # Initial population per spatial unit
     y_sim = zeros(s_N, t_N)
     y_sim[:, 1] = initial_pop
-
-    r_true = 0.5
-    K_true = 100.0
     
     for t in 2:t_N
         for s in 1:s_N
@@ -507,55 +527,37 @@ function generate_logistic_basic_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, seed
             D_prev = N_prev / grid_areas[s] # Convert to density
             K_density = K_true / grid_areas[s] # Carrying capacity in density terms
             growth = r_true * D_prev * (1.0 - D_prev / K_density)
-            y_sim[s, t] = max(0.0, N_prev + growth * grid_areas[s] + randn() * 2.0) # Convert growth back to total population, add noise
+            
+            exploitation = 0.0
+            if use_effort
+                exploitation += q_true * effort_sim[s, t] * N_prev
+            end
+            if use_removal
+                exploitation += removal_sim[s, t]
+            end
+
+            y_sim[s, t] = max(0.0, N_prev + growth * grid_areas[s] - exploitation + randn() * 2.0) # Convert growth back to total population, add noise
         end
     end
     
-    # FIX: The `repeat` function for a matrix requires a tuple for the `inner` keyword.
-    # The correct logic is to flatten the simulation matrix in row-major order (to match the DataFrame structure)
-    # and then repeat each element.
     df.y = repeat(vec(y_sim'), inner=n_obs_per_st_unit)
-    return df, W, grid_areas
-end
 
-function generate_logistic_exploitation_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, seed=123)
-    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
-    
-    # Add effort covariate
-    df.effort = rand(nrow(df)) * 0.5 .+ 0.1 # Random effort between 0.1 and 0.6
-    
-    # Re-simulate y with exploitation
-    y_sim = zeros(s_N, t_N)
-    initial_pop = rand(s_N) * 10.0 .+ 5.0
-    y_sim[:, 1] = initial_pop
-
-    r_true = 0.5
-    K_true = 100.0
-    q_true = 0.01 # Catchability
-    
-    for t in 2:t_N
-        for s in 1:s_N
-            N_prev = y_sim[s, t-1]
-            D_prev = N_prev / grid_areas[s]
-            K_density = K_true / grid_areas[s]
-            growth = r_true * D_prev * (1.0 - D_prev / K_density)
-            
-            # Get effort for this space-time unit (assuming effort is constant within a unit)
-            effort_st_unit = mean(df[(df.s_idx .== s) .& (df.year .== t), :effort])
-            exploitation = q_true * effort_st_unit * N_prev
-            
-            y_sim[s, t] = max(0.0, N_prev + growth * grid_areas[s] - exploitation + randn() * 2.0)
-        end
+    if use_effort
+        df.effort = repeat(vec(effort_sim'), inner=n_obs_per_st_unit)
     end
-    # FIX: Correctly flatten and repeat the simulation matrix.
-    df.y = repeat(vec(y_sim'), inner=n_obs_per_st_unit)
+    if use_removal
+        df.removal = repeat(vec(removal_sim'), inner=n_obs_per_st_unit)
+    end
+
     return df, W, grid_areas
 end
-function generate_delay_difference_data(; s_N=10, t_N=10, n_obs_per_st_unit=1, seed=123, use_effort::Bool=false)
+
+
+
+function generate_delay_difference_data(; s_N=10, t_N=10, n_obs_per_st_unit=1, seed=123, use_effort::Bool=false, use_removal::Bool=false)
     # Purpose: Generates synthetic data for a multivariate delay-difference model.
-    # Rationale: This version is updated to generate an `effort` covariate and use a
-    #            catchability parameter `q` to simulate catch when `use_effort=true`,
-    #            aligning it with the new model formulation that estimates `q`.
+    # Rationale: This version is updated to generate `effort` and `removal` covariates,
+    #            aligning it with the new model formulation.
     # v1.0.1 (2026-07-31)
     df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
     
@@ -570,12 +572,18 @@ function generate_delay_difference_data(; s_N=10, t_N=10, n_obs_per_st_unit=1, s
     population_sim = zeros(s_N, t_N)
     recruitment_sim = zeros(s_N, t_N)
     
-    local effort_sim, catch_sim
+    local effort_sim, removal_sim
     if use_effort
         q_true = 0.01
         effort_sim = rand(s_N, t_N) .* 10.0
     else
-        catch_sim = rand(s_N, t_N) .* 10.0
+        effort_sim = zeros(s_N, t_N)
+    end
+
+    if use_removal
+        removal_sim = rand(s_N, t_N) .* 5.0
+    else
+        removal_sim = zeros(s_N, t_N)
     end
 
     initial_pop = rand(s_N) .* 20.0 .+ 10.0
@@ -591,7 +599,14 @@ function generate_delay_difference_data(; s_N=10, t_N=10, n_obs_per_st_unit=1, s
             mean_rec = r_true * D_prev * (1.0 - D_prev / K_density) * grid_areas[s]
             recruitment_sim[s, t] = exp(log(mean_rec + 1e-6) + randn() * sigma_rec_true)
             
-            C_prev = use_effort ? (q_true * effort_sim[s, t-1] * N_prev) : catch_sim[s, t-1]
+            C_prev = 0.0
+            if use_effort
+                C_prev += q_true * effort_sim[s, t-1] * N_prev
+            end
+            if use_removal
+                C_prev += removal_sim[s, t-1]
+            end
+
             N_survived = (N_prev - C_prev) * exp(-M_nat_true)
             population_sim[s, t] = max(0.0, N_survived + recruitment_sim[s, t] + randn() * sigma_pop_true)
         end
@@ -602,8 +617,9 @@ function generate_delay_difference_data(; s_N=10, t_N=10, n_obs_per_st_unit=1, s
     
     if use_effort
         df.effort = repeat(vec(effort_sim'), inner=n_obs_per_st_unit)
-    else
-        df.catch_data = repeat(vec(catch_sim'), inner=n_obs_per_st_unit)
+    end
+    if use_removal
+        df.removal = repeat(vec(removal_sim'), inner=n_obs_per_st_unit)
     end
     
     return df, W, grid_areas
@@ -833,10 +849,12 @@ end
 
 
 
-function generate_leslie_matrix_data(; s_N=10, t_N=5, n_age_classes=3, n_obs_per_st_unit=1, seed=123)
+
+function generate_leslie_matrix_data(; s_N=10, t_N=5, n_age_classes=3, n_obs_per_st_unit=1, seed=123, use_effort::Bool=false, use_removal::Bool=false)
     # Purpose: Generates synthetic data for a multivariate Leslie matrix dynamics model.
-    # Rationale: Provides a test case for the `dynamics(model=leslie_matrix)` feature.
-    # v1.0.0 (2026-07-31)
+    # Rationale: Provides a test case for the `dynamics(model=leslie_matrix)` feature,
+    #            now including optional exploitation.
+    # v1.0.1 (2026-08-01)
     df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
     
     # True Leslie matrix parameters
@@ -846,6 +864,22 @@ function generate_leslie_matrix_data(; s_N=10, t_N=5, n_age_classes=3, n_obs_per
     L_true = zeros(n_age_classes, n_age_classes)
     for i in 1:(n_age_classes - 1); L_true[i+1, i] = survival_true[i]; end
     L_true[1, :] = fecundity_true
+
+    # Exploitation parameters
+    q_true = fill(0.005, n_age_classes) # Age-specific catchability
+    
+    local effort_sim, removal_sim
+    if use_effort
+        effort_sim = rand(s_N, t_N) .* 10.0
+    else
+        effort_sim = zeros(s_N, t_N)
+    end
+
+    if use_removal
+        removal_sim = rand(s_N, t_N, n_age_classes) .* 2.0
+    else
+        removal_sim = zeros(s_N, t_N, n_age_classes)
+    end
 
     # Simulate population dynamics for each age class
     pop_sim = zeros(s_N, t_N, n_age_classes)
@@ -859,7 +893,17 @@ function generate_leslie_matrix_data(; s_N=10, t_N=5, n_age_classes=3, n_obs_per
     for t in 2:t_N
         for s in 1:s_N
             N_prev = pop_sim[s, t-1, :]
-            N_projected = L_true * N_prev
+            
+            C_prev = zeros(n_age_classes)
+            if use_effort
+                C_prev .+= q_true .* effort_sim[s, t-1] .* N_prev
+            end
+            if use_removal
+                C_prev .+= removal_sim[s, t-1, :]
+            end
+            N_after_removal = max.(0.0, N_prev - C_prev)
+
+            N_projected = L_true * N_after_removal
             pop_sim[s, t, :] = max.(0.0, N_projected .+ randn(n_age_classes) .* 0.5)
         end
     end
@@ -871,7 +915,241 @@ function generate_leslie_matrix_data(; s_N=10, t_N=5, n_age_classes=3, n_obs_per
         df[!, age_col_name] = repeat(age_data_flat, inner=n_obs_per_st_unit)
     end
     
-    df.y = df.age_1
+    df.y = df.age_1 # Default outcome for univariate likelihoods
+
+    if use_effort
+        df.effort = repeat(vec(effort_sim'), inner=n_obs_per_st_unit)
+    end
+    if use_removal
+        # For removal, if it's age-specific, it needs to be stored as a matrix or multiple columns.
+        # For simplicity in this data generator, we'll store total removal if only one source.
+        # If multiple age-specific removal sources are needed, this would need to be expanded.
+        df.removal_total = repeat(vec(sum(removal_sim, dims=3)[:,:,1]'), inner=n_obs_per_st_unit)
+    end
     
     return df, W, grid_areas, n_age_classes
 end
+
+
+"""
+    generate_dirichlet_multinomial_data(;
+        n_obs_per_unit::Int=10,
+        n_units::Int=25,
+        n_categories::Int=3,
+        seed::Int=42
+    )
+
+Generates synthetic spatial data suitable for a Dirichlet-Multinomial model.
+
+The function creates a spatial domain with `n_units` and simulates compositional data
+(counts across `n_categories`) for `n_obs_per_unit` observations within each unit.
+The underlying proportions of the categories vary smoothly across space, controlled
+by latent Gaussian Processes.
+
+# Returns
+- `DataFrame`: A dataframe containing the simulated data, including category counts,
+  spatial coordinates (`s_x`, `s_y`), and the spatial unit index (`s_idx`).
+- `SparseMatrixCSC`: The adjacency matrix `W` for the spatial units.
+"""
+function generate_dirichlet_multinomial_data(;
+    n_obs_per_unit::Int=10,
+    n_units::Int=25,
+    n_categories::Int=3,
+    seed::Int=42
+)
+    # Purpose: Generates synthetic spatial data for a Dirichlet-Multinomial model.
+    # Rationale for Change (v1.0.1):
+    # Corrected a `MethodError` in the call to `assign_spatial_units`. The original
+    # implementation passed a single matrix of coordinates, whereas the function expects
+    # two separate vectors for x and y coordinates. The call has been updated to
+    # `assign_spatial_units(points_for_partition[:, 1], points_for_partition[:, 2], ...)`
+    # to correctly pass the coordinate columns.
+    #
+    # Inputs:
+    #   - n_obs_per_unit: Number of observations per spatial unit.
+    #   - n_units: The number of distinct spatial units.
+    #   - n_categories: The number of categories for the multinomial outcome.
+    #   - seed: A random seed for reproducibility.
+    #
+    # Outputs:
+    #   - A DataFrame containing the simulated data.
+    #   - The adjacency matrix `W` for the spatial units.
+
+    Random.seed!(seed)
+    
+    # 1. Create spatial structure by generating random centroids for the units.
+    centroids = rand(n_units, 2) .* 10.0
+    
+    # Use `assign_spatial_units` to get an adjacency matrix `W`.
+    # We simulate points around the centroids to give the function something to partition.
+    points_for_partition = vcat([centroids[i,:]' .+ randn(n_obs_per_unit, 2) for i in 1:n_units]...)
+    
+    # Corrected call to assign_spatial_units, passing x and y columns separately.
+    au = assign_spatial_units(points_for_partition[:, 1], points_for_partition[:, 2]; target_units=n_units, area_method=:kvt)
+    W = au.W
+    
+    # Create the final observation locations and assign them to the correct spatial unit.
+    s_coords = vcat([centroids[i,:]' .+ randn(n_obs_per_unit, 2) for i in 1:n_units]...)
+    s_idx = vcat([fill(i, n_obs_per_unit) for i in 1:n_units]...)
+
+    # 2. Define true latent spatial fields for the Dirichlet concentration parameters.
+    # We use a simple Gaussian Process to generate smooth spatial fields.
+    dist_matrix = pairwise(Euclidean(), centroids, dims=1)
+    
+    # One spatial field per category to control its prevalence.
+    alpha_fields = zeros(n_units, n_categories)
+    for k in 1:n_categories
+        ls = rand(1.5:0.1:3.0) # Lengthscale for the spatial field
+        sigma_f = rand(0.8:0.1:1.2) # Signal variance
+        K = sigma_f^2 .* exp.(-0.5 .* (dist_matrix ./ ls).^2) + I * 1e-6
+        alpha_fields[:, k] = rand(MvNormal(zeros(n_units), K))
+    end
+    
+    # 3. Generate observations from the latent fields.
+    total_counts_per_obs = rand(80:150, n_units * n_obs_per_unit)
+    category_counts = zeros(Int, n_units * n_obs_per_unit, n_categories)
+    
+    for i in 1:(n_units * n_obs_per_unit)
+        unit_idx = s_idx[i]
+        
+        # Get the concentration parameters (`alphas`) for the observation's spatial unit.
+        # The exp() transform ensures the alphas are positive.
+        alphas = exp.(alpha_fields[unit_idx, :])
+        
+        # Sample proportions for this observation from a Dirichlet distribution.
+        proportions = rand(Dirichlet(alphas))
+        
+        # Sample the final counts from a Multinomial distribution.
+        category_counts[i, :] = rand(Multinomial(total_counts_per_obs[i], proportions))
+    end
+    
+    # 4. Assemble the final DataFrame.
+    df = DataFrame(
+        s_x = s_coords[:, 1],
+        s_y = s_coords[:, 2],
+        s_idx = s_idx
+    )
+    
+    for k in 1:n_categories
+        df[!, Symbol("cat_", k)] = category_counts[:, k]
+    end
+    
+    return df, W
+end
+
+
+
+"""
+    generate_generalized_leslie_matrix_data(; s_N=10, t_N=10, n_classes=4, n_obs_per_st_unit=1, seed=123, use_effort::Bool=false, use_removal::Bool=false)
+
+Generates synthetic data for a multivariate generalized Leslie/Lefkovitch matrix model.
+
+This function simulates a stage-structured population with `n_classes` across a spatiotemporal domain.
+The population dynamics are governed by a transition matrix `A`, where `A[i, j]` represents the
+per-capita rate of production of individuals of class `i` from individuals of class `j`. This allows
+for modeling complex life cycles beyond simple age progression, including stasis (staying in the same class)
+and variable fecundity.
+
+The simulation includes options for:
+- Spatially varying carrying capacity (`K`).
+- Exploitation modeled via fishing `effort` and catchability `q`.
+- Direct `removal` of individuals from each class.
+
+# Arguments
+- `s_N`: Number of spatial units.
+- `t_N`: Number of time steps.
+- `n_classes`: The number of stages or classes in the population model.
+- `n_obs_per_st_unit`: Number of observations to generate per space-time cell.
+- `seed`: Random seed for reproducibility.
+- `use_effort`: If true, generates an `effort` covariate.
+- `use_removal`: If true, generates `removal` data for each class.
+
+# Returns
+- `DataFrame`: A dataframe containing the simulated data.
+- `SparseMatrixCSC`: The adjacency matrix `W` for the spatial units.
+- `Vector{Float64}`: A vector of grid cell areas.
+- `Int`: The number of classes.
+"""
+function generate_generalized_leslie_matrix_data(; s_N=10, t_N=10, n_classes=4, n_obs_per_st_unit=1, seed=123, use_effort::Bool=false, use_removal::Bool=false)
+    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
+
+    # True transition matrix (example for 4 classes)
+    # A[i, j] is the rate of transition from class j to class i.
+    A_true = zeros(n_classes, n_classes)
+    if n_classes == 4
+        A_true = [
+            0.0  0.1  1.5  2.0;  # Fecundity from classes 2, 3, 4 into class 1
+            0.5  0.2  0.0  0.0;  # Survival/growth from 1->2, and stasis in 2
+            0.0  0.6  0.3  0.0;  # Survival/growth from 2->3, and stasis in 3
+            0.0  0.0  0.7  0.4   # Survival/growth from 3->4, and stasis in 4
+        ]
+    else # Generic fallback
+        for i in 1:n_classes
+            A_true[1, i] = rand() * 0.5 # Fecundity
+            if i > 1; A_true[i, i-1] = rand(0.4:0.1:0.8); end # Survival to next stage
+            A_true[i, i] = rand(0.1:0.1:0.4) # Stasis
+        end
+    end
+
+
+    # Spatially varying K
+    s_coords = unique(df[!, [:s_idx, :s_x]])
+    sort!(s_coords, :s_idx)
+    K_spatial_true = 50.0 .+ 150.0 * (s_coords.s_x ./ maximum(s_coords.s_x))
+
+    # Exploitation
+    q_true = fill(0.01, n_classes) # Class-specific catchability
+    effort_sim = use_effort ? rand(s_N, t_N) .* 5.0 : zeros(s_N, t_N)
+    removal_sim = use_removal ? rand(s_N, t_N, n_classes) .* 1.0 : zeros(s_N, t_N, n_classes)
+
+    # Simulate population dynamics
+    pop_sim = zeros(s_N, t_N, n_classes)
+    initial_total_pop = rand(s_N) .* 40.0 .+ 10.0
+    for s in 1:s_N
+        pop_sim[s, 1, :] = initial_total_pop[s] .* softmax(randn(n_classes))
+    end
+
+    for t in 2:t_N
+        for s in 1:s_N
+            N_prev = pop_sim[s, t-1, :]
+            
+            C_prev = zeros(n_classes)
+            if use_effort
+                C_prev .+= q_true .* effort_sim[s, t-1] .* N_prev
+            end
+            if use_removal
+                C_prev .+= removal_sim[s, t-1, :]
+            end
+            N_after_removal = max.(0.0, N_prev - C_prev)
+            
+            L_effective = copy(A_true)
+            total_pop_prev = sum(N_after_removal)
+            K_s = K_spatial_true[s]
+            dd_factor = max(0.0, 1.0 - total_pop_prev / K_s)
+            L_effective[1, :] .*= dd_factor # Density dependence on fecundity
+
+            N_projected = L_effective * N_after_removal
+            pop_sim[s, t, :] = max.(0.0, N_projected .+ randn(n_classes) .* 0.5)
+        end
+    end
+
+    # Add class columns to the DataFrame
+    for a in 1:n_classes
+        class_col_name = Symbol("class_$(a)")
+        class_data_flat = vec(pop_sim[:, :, a]')
+        df[!, class_col_name] = repeat(class_data_flat, inner=n_obs_per_st_unit)
+    end
+    df.y = df.class_1
+
+    if use_effort
+        df.effort = repeat(vec(effort_sim'), inner=n_obs_per_st_unit)
+    end
+    if use_removal
+        for a in 1:n_classes
+            df[!, Symbol("removal_class_$(a)")] = repeat(vec(removal_sim[:, :, a]'), inner=n_obs_per_st_unit)
+        end
+    end
+    
+    return df, W, grid_areas, n_classes
+end
+ 

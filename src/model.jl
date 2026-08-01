@@ -1766,22 +1766,21 @@ within the MCMC sampler. The logic for pre-computing the Cholesky factor for sta
 group structures (e.g., ICAR) is also correctly handled to improve performance.
 """
 function _generate_component_code_fragments(m::MixedComponent, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
-    # Purpose: Generates Turing code fragments for mixed effects models, handling both simple (uncorrelated)
-    #          and complex (correlated) random effects.
-    # Rationale: This function has been updated to robustly handle cases where the formula parser
-    #            incorrectly combines multiple effects (e.g., "1 + cov") into a single string.
-    #            It also corrects the logic for generating the inverse Cholesky factor for the group-level
-    #            effect, prioritizing the efficient identity matrix for IID models to resolve a CanonicalIndexError.
-    # v1.0.2 (2026-07-30)
-    # Inputs: Standard code generation arguments.
-    # Outputs: A NamedTuple containing `priors` and `update` code strings.
+    # Purpose: Generates Turing code fragments for mixed effects models.
+    # Rationale: This function has been updated to use the correct non-centered parameterization
+    #            for correlated random effects: `β = L_g * Z * L_e'`. This replaces the previous,
+    #            more complex formulation involving inverse Cholesky factors, making the code
+    #            more readable, statistically standard, and numerically stable. It also robustly
+    #            handles cases where multiple effects are parsed as a single string.
+    # v1.0.3 (2026-07-31)
+    # Inputs/Outputs: Standard code generation arguments.
     v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
     
     inner_model = m.model
     group_var = m.group_var 
     lhs_effects_raw = m.lhs
     
-    # Handle cases where multiple terms are parsed as a single string
+    # Handle cases where multiple terms are parsed as a single string (e.g., "1 + cov")
     lhs_effects = vcat([Base.split(s, r"\s*\+\s*") for s in lhs_effects_raw]...)
     
     k_effects = length(lhs_effects)
@@ -1818,17 +1817,14 @@ function _generate_component_code_fragments(m::MixedComponent, spec::NamedTuple,
         push!(priors_acc, "$(v.sigma_effects) ~ NamedDist(filldist(Exponential(1.0), $(k_effects)), :$(v.sigma_effects))")
         push!(priors_acc, "$(v.raw) ~ NamedDist(MvNormal(zeros(T, $(n_groups * k_effects)), I), :$(v.raw))")
 
-        # --- FIX: Prioritize IID model check to avoid CanonicalIndexError ---
-        # The IID model is static, but its Cholesky factor (from a sparse identity matrix)
-        # does not support the `F.U \ I` operation. By checking for IID first, we
-        # ensure the correct and efficient identity matrix is used for L_groups_inv_t,
-        # resolving the error.
-        group_chol_logic = if inner_model isa IID || inner_model isa NoneComponent
-            "local L_groups_inv_t_$(spec.key) = sparse(I, $(n_groups), $(n_groups))"
-        elseif get(spec, :is_static, false)
-            "local F_groups_$(spec.key) = spec_registry[\"$(spec.key)\"].cholesky_factor\nlocal L_groups_inv_t_$(spec.key) = F_groups_$(spec.key).U \\ I"
+        # The correct non-centered parameterization is `β = L_g * Z * L_e'`.
+        # This requires the Cholesky factor of the covariance, not the precision.
+        # For GMRFs, Σ = Q⁻¹ = (L_Q L_Q')⁻¹ = (L_Q')⁻¹ L_Q⁻¹. So L_Σ = (L_Q')⁻¹.
+        # F.U is the upper Cholesky factor of Q, so F.U' = L_Q. Thus, L_Σ = (F.U)⁻¹.
+        group_chol_logic = if get(spec, :is_static, false)
+            "local F_groups_$(spec.key) = spec_registry[\"$(spec.key)\"].cholesky_factor\nlocal L_groups_cov_inv_t_$(spec.key) = F_groups_$(spec.key).U"
         else
-            "local Q_groups_$(spec.key) = spec_registry[\"$(spec.key)\"].Q_template\nlocal F_groups_$(spec.key) = cholesky(Symmetric(Q_groups_$(spec.key) + noise * I))\nlocal L_groups_inv_t_$(spec.key) = F_groups_$(spec.key).U \\ I"
+            "local Q_groups_$(spec.key) = spec_registry[\"$(spec.key)\"].Q_template\nlocal F_groups_$(spec.key) = cholesky(Symmetric(Q_groups_$(spec.key) + noise * I))\nlocal L_groups_cov_inv_t_$(spec.key) = F_groups_$(spec.key).U"
         end
 
         application_loop_acc = String[]
@@ -1836,7 +1832,6 @@ function _generate_component_code_fragments(m::MixedComponent, spec::NamedTuple,
             term = lhs_effects[i]
             is_int = (term == "1" || term == "intercept()" || term == "(Intercept)")
 
-            # Generate the correct application logic for each term (intercept or slope).
             term_application = if is_int
                 "$(eta_target) .+= view(effects_matrix_$(spec.key), M.$(index_var), $(i))"
             else
@@ -1852,13 +1847,19 @@ function _generate_component_code_fragments(m::MixedComponent, spec::NamedTuple,
             local L_effects_t_$(spec.key) = ($(v.L_corr).L' * Diagonal($(v.sigma_effects)))
             $(group_chol_logic)
             local innovations_matrix_$(spec.key) = reshape($(v.raw), $(n_groups), $(k_effects))
-            local effects_matrix_$(spec.key) = L_groups_inv_t_$(spec.key) * innovations_matrix_$(spec.key) * L_effects_t_$(spec.key)
+            
+            # Corrected transformation: β = L_g * Z * L_e'
+            # where L_g is the Cholesky of the covariance, which is (L_Q')⁻¹ = (F.U)⁻¹
+            local gamma_matrix_$(spec.key) = L_groups_cov_inv_t_$(spec.key) \\ innovations_matrix_$(spec.key)
+            local effects_matrix_$(spec.key) = gamma_matrix_$(spec.key) * L_effects_t_$(spec.key)
+            
             $(join(application_loop_acc, "\n        "))
         end
         """
         return (priors=join(priors_acc, "\n    "), update=update_str)
     end
 end
+
 
 
 
@@ -2005,10 +2006,10 @@ models the temporal evolution of the spatial field.
 """
 function _generate_component_code_fragments(m::DynamicsComponent, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
     # Purpose: Generates Turing code fragments for process-based `dynamics` models.
-    # Rationale: This version is updated to support both `effort` and `effort_col` for the
-    #            `logistic_exploitation` model, and defaults to zero exploitation if neither is provided.
-    #            It also ensures the `leslie_logistic` model errors if `n_age_classes` is not provided.
-    # v1.1.6 (2026-08-01)
+    # Rationale: This version adds a new block for the `generalized_leslie_matrix` model.
+    #            This new model supports a full transition matrix between classes, with options
+    #            for spatially varying rates and carrying capacity, as well as exploitation.
+    # v1.1.9 (2026-08-01)
 
     key_str = string(spec.key)
     prefixed_key = isempty(prefix) ? key_str : "$(prefix)_$(key_str)"
@@ -2016,6 +2017,88 @@ function _generate_component_code_fragments(m::DynamicsComponent, spec::NamedTup
     params = m.params
     model_type = m.model
     is_multivariate = arch == "multivariate"
+    
+    if model_type == "generalized_leslie_matrix"
+        if !is_multivariate; error("The `generalized_leslie_matrix` model requires a multivariate likelihood with an outcome for each class."); end
+        
+        n_classes = get(params, :n_classes, M.outcomes_N)
+        if n_classes != M.outcomes_N; error("Number of classes ($n_classes) must match number of outcomes ($(M.outcomes_N))."); end
+
+        spatially_varying_K = get(params, :spatially_varying_K, false)
+        spatially_varying_rates = get(params, :spatially_varying_rates, false)
+
+        priors_acc = String[]
+        
+        # Priors for transition matrix A
+        if spatially_varying_rates
+            push!(priors_acc, "A_mean_$(key_str) ~ NamedDist(filldist(Normal(0, 1), $(n_classes^2)), :A_mean_$(key_str))")
+            push!(priors_acc, "A_sigma_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_classes^2)), :A_sigma_$(key_str))")
+            push!(priors_acc, "A_raw_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * $(n_classes^2)), I), :A_raw_$(key_str))")
+        else
+            push!(priors_acc, "A_flat_$(key_str) ~ NamedDist(filldist(Normal(0, 1), $(n_classes^2)), :A_flat_$(key_str))")
+        end
+
+        # Priors for K
+        if haskey(params, :K) || spatially_varying_K
+            if spatially_varying_K
+                sigma_K_prior = get(params, :sigma_K, Exponential(1.0)); log_K_mean_prior = get(params, :log_K_mean, haskey(params, :K) && params[:K] isa LogNormal ? Normal(Distributions.params(params[:K])...) : Normal(log(100.0), 0.5))
+                push!(priors_acc, "sigma_K_$(prefixed_key) ~ NamedDist($(_distribution_to_string(sigma_K_prior)), :sigma_K_$(prefixed_key))")
+                push!(priors_acc, "log_K_mean_$(prefixed_key) ~ NamedDist($(_distribution_to_string(log_K_mean_prior)), :log_K_mean_$(prefixed_key))")
+                push!(priors_acc, "K_raw_$(prefixed_key) ~ NamedDist(MvNormal(zeros(T, M.s_N), I), :K_raw_$(prefixed_key))")
+            else
+                K_prior = get(params, :K, LogNormal(log(100.0), 1.0)); push!(priors_acc, "K_$(key_str) ~ NamedDist($(_distribution_to_string(K_prior)), :K_$(key_str))")
+            end
+        end
+
+        # Priors for exploitation
+        effort_keys = get(spec.hyper, :effort_keys, [])
+        for key in effort_keys
+            q_prior = get(params, Symbol("q_$(key)"), filldist(LogNormal(-4, 1), n_classes))
+            push!(priors_acc, "q_$(key) ~ NamedDist($(_distribution_to_string(q_prior)), :q_$(key))")
+        end
+
+        # Priors for process noise
+        push!(priors_acc, "sigma_process_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_classes)), :sigma_process_$(key_str))")
+        push!(priors_acc, "innov_process_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N * $(n_classes)), I), :innov_process_$(key_str))")
+        priors_str = join(priors_acc, "\n    ")
+
+        # Exploitation logic block
+        exploitation_block = "local C_prev = zeros(T, $(n_classes))"
+        for key in effort_keys
+            exploitation_block *= "\n            C_prev .+= q_$(key) .* spec_registry[\"$(key_str)\"].hyper.processed_params[:$(key)][s, t-1] .* N_prev"
+        end
+        removal_keys = get(spec.hyper, :removal_keys, [])
+        for key in removal_keys
+            exploitation_block *= "\n            C_prev .+= spec_registry[\"$(key_str)\"].hyper.processed_params[:$(key)][s, t-1, :]"
+        end
+
+        # Main update logic
+        update_str = """
+        begin
+            # Generalized Leslie Matrix Dynamics for $(key_str)
+            local Q_spatial = spec_registry["$(key_str)"].hyper.L_template; local F_spatial = cholesky(Symmetric(Q_spatial + noise * I)); local areas = spec_registry["$(key_str)"].hyper.areas
+            
+            local A_spatial; if $(spatially_varying_rates); A_raw_matrix = reshape(A_raw_$(key_str), M.s_N, $(n_classes^2)); A_field = F_spatial.U \\ A_raw_matrix; A_spatial = exp.(A_mean_$(key_str)' .+ A_field .* A_sigma_$(key_str)'); else; A_spatial = reshape(A_flat_$(key_str), $(n_classes), $(n_classes)); end
+            
+            local K_values_$(key_str); if $(spatially_varying_K); K_field_raw = F_spatial.U \\ K_raw_$(prefixed_key); Turing.@addlogprob! logpdf(Normal(0, 0.001 * M.s_N), sum(K_field_raw)); K_values_$(key_str) = exp.(log_K_mean_$(prefixed_key) .+ K_field_raw .* sigma_K_$(prefixed_key)); elseif haskey(spec_registry["$(key_str)"].component_obj.params, :K); K_values_$(key_str) = fill(K_$(key_str), M.s_N); end
+            
+            local innov_tensor = reshape(innov_process_$(key_str), M.s_N, M.t_N, $(n_classes)); local population_field = zeros(T, M.s_N, M.t_N, $(n_classes))
+            for c in 1:$(n_classes); population_field[:, 1, c] = max.(0.0, innov_tensor[:, 1, c] .* sigma_process_$(key_str)[c]); end
+            
+            for s in 1:M.s_N
+                local A_s; if $(spatially_varying_rates); A_s = reshape(A_spatial[s, :], $(n_classes), $(n_classes)); else; A_s = A_spatial; end
+                for t in 2:M.t_N
+                    local N_prev = view(population_field, s, t-1, :); $(exploitation_block); local N_after_removal = max.(0.0, N_prev - C_prev); local A_effective = copy(A_s)
+                    if haskey(spec_registry["$(key_str)"].component_obj.params, :K); local total_pop_prev = sum(N_after_removal); local dd_factor = max(0.0, 1.0 - total_pop_prev / K_values_$(key_str)[s]); A_effective[1, :] .*= dd_factor; end
+                    local N_projected = A_effective * N_after_removal; local current_innov = view(innov_tensor, s, t, :) .* sigma_process_$(key_str); population_field[s, t, :] = max.(0.0, N_projected .+ current_innov)
+                end
+            end
+            for k in 1:$(n_classes); for i in 1:N; eta_latent[i, k] += log(population_field[M.s_idx[i], M.t_idx[i], k] + 1e-6); end; end
+        end
+        """
+        return (priors=priors_str, update=update_str)
+    end
+
     spatially_varying_K = get(params, :spatially_varying_K, false)
     spatially_varying_r = get(params, :spatially_varying_r, false)
 
@@ -2026,32 +2109,23 @@ function _generate_component_code_fragments(m::DynamicsComponent, spec::NamedTup
     # Priors for physical transport
     has_propagator = model_type in ["advection", "diffusion", "advection_diffusion"]
     if has_propagator
-        if model_type in ["advection", "advection_diffusion"]
-            vel = get(params, :velocity, Normal(0, 0.5))
-            push!(priors_acc, "$(v.velocity) ~ NamedDist($(_distribution_to_string(vel)), :$(v.velocity))")
-        end
-        if model_type in ["diffusion", "advection_diffusion"]
-            diff = get(params, :diffusion, LogNormal(-1, 1))
-            push!(priors_acc, "$(v.diffusion) ~ NamedDist($(_distribution_to_string(diff)), :$(v.diffusion))")
-        end
+        if model_type in ["advection", "advection_diffusion"]; vel = get(params, :velocity, Normal(0, 0.5)); push!(priors_acc, "$(v.velocity) ~ NamedDist($(_distribution_to_string(vel)), :$(v.velocity))"); end
+        if model_type in ["diffusion", "advection_diffusion"]; diff = get(params, :diffusion, LogNormal(-1, 1)); push!(priors_acc, "$(v.diffusion) ~ NamedDist($(_distribution_to_string(diff)), :$(v.diffusion))"); end
     end
     
     sigma = get(params, :sigma, Exponential(1.0))
     push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(sigma)), :$(v.sigma))")
 
     # Priors for biological model parameters
-    if model_type in ["logistic_basic", "logistic_exploitation", "delay_difference", "leslie_logistic"]
-        if model_type != "leslie_logistic"
-            if spatially_varying_r
-                log_r_mean_prior = get(params, :log_r_mean, haskey(params, :r) && params[:r] isa LogNormal ? Normal(Distributions.params(params[:r])...) : Normal(0.0, 0.5))
-                sigma_r_prior = get(params, :sigma_r, Exponential(1.0))
-                push!(priors_acc, "sigma_r_$(prefixed_key) ~ NamedDist($(_distribution_to_string(sigma_r_prior)), :sigma_r_$(prefixed_key))")
-                push!(priors_acc, "log_r_mean_$(prefixed_key) ~ NamedDist($(_distribution_to_string(log_r_mean_prior)), :log_r_mean_$(prefixed_key))")
-                push!(priors_acc, "r_raw_$(prefixed_key) ~ NamedDist(MvNormal(zeros(T, M.s_N), I), :r_raw_$(prefixed_key))")
-            else
-                r = get(params, :r, LogNormal(0, 1))
-                push!(priors_acc, "$(v.r) ~ NamedDist($(_distribution_to_string(r)), :$(v.r))")
-            end
+    if model_type in ["logistic", "delay_difference"]
+        if spatially_varying_r
+            log_r_mean_prior = get(params, :log_r_mean, haskey(params, :r) && params[:r] isa LogNormal ? Normal(Distributions.params(params[:r])...) : Normal(0.0, 0.5))
+            sigma_r_prior = get(params, :sigma_r, Exponential(1.0))
+            push!(priors_acc, "sigma_r_$(prefixed_key) ~ NamedDist($(_distribution_to_string(sigma_r_prior)), :sigma_r_$(prefixed_key))")
+            push!(priors_acc, "log_r_mean_$(prefixed_key) ~ NamedDist($(_distribution_to_string(log_r_mean_prior)), :log_r_mean_$(prefixed_key))")
+            push!(priors_acc, "r_raw_$(prefixed_key) ~ NamedDist(MvNormal(zeros(T, M.s_N), I), :r_raw_$(prefixed_key))")
+        else
+            r = get(params, :r, LogNormal(0, 1)); push!(priors_acc, "$(v.r) ~ NamedDist($(_distribution_to_string(r)), :$(v.r))")
         end
 
         if spatially_varying_K
@@ -2061,23 +2135,24 @@ function _generate_component_code_fragments(m::DynamicsComponent, spec::NamedTup
             push!(priors_acc, "log_K_mean_$(prefixed_key) ~ NamedDist($(_distribution_to_string(log_K_mean_prior)), :log_K_mean_$(prefixed_key))")
             push!(priors_acc, "K_raw_$(prefixed_key) ~ NamedDist(MvNormal(zeros(T, M.s_N), I), :K_raw_$(prefixed_key))")
         else
-            K = get(params, :K, LogNormal(log(100.0), 1))
-            push!(priors_acc, "$(v.K) ~ NamedDist($(_distribution_to_string(K)), :$(v.K))")
+            K = get(params, :K, LogNormal(log(100.0), 1)); push!(priors_acc, "$(v.K) ~ NamedDist($(_distribution_to_string(K)), :$(v.K))")
         end
     end
     
-    if model_type == "delay_difference"
-        M_nat = get(params, :M_nat, LogNormal(-1, 0.5)); push!(priors_acc, "$(v.M_nat) ~ NamedDist($(_distribution_to_string(M_nat)), :$(v.M_nat))")
-        if haskey(params, :effort_col) || haskey(params, :effort)
-            q = get(params, :q, LogNormal(-2, 1)); push!(priors_acc, "$(v.q) ~ NamedDist($(_distribution_to_string(q)), :$(v.q))")
+    if model_type == "logistic" || model_type == "delay_difference"
+        effort_keys = get(spec.hyper, :effort_keys, [])
+        for key in effort_keys
+            q_prior = get(params, Symbol("q_$(key)"), LogNormal(-2, 1))
+            push!(priors_acc, "q_$(key) ~ NamedDist($(_distribution_to_string(q_prior)), :q_$(key))")
         end
     end
+    if model_type == "delay_difference"; M_nat = get(params, :M_nat, LogNormal(-1, 0.5)); push!(priors_acc, "$(v.M_nat) ~ NamedDist($(_distribution_to_string(M_nat)), :$(v.M_nat))"); end
     if model_type == "lotka_volterra"; alpha = get(params, :alpha, LogNormal(0, 1)); beta = get(params, :beta, LogNormal(-1, 1)); gamma = get(params, :gamma, LogNormal(-1, 1)); delta = get(params, :delta, LogNormal(0, 1)); push!(priors_acc, "$(v.alpha) ~ NamedDist($(_distribution_to_string(alpha)), :$(v.alpha))"); push!(priors_acc, "$(v.beta) ~ NamedDist($(_distribution_to_string(beta)), :$(v.beta))"); push!(priors_acc, "$(v.gamma) ~ NamedDist($(_distribution_to_string(gamma)), :$(v.gamma))"); push!(priors_acc, "$(v.delta) ~ NamedDist($(_distribution_to_string(delta)), :$(v.delta))"); push!(priors_acc, "$(v.innov)_predator ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :$(Symbol(string(v.innov, "_predator"))))"); end
-    if model_type == "leslie_logistic"; n_classes = get(params, :n_age_classes, error("`leslie_logistic` model requires `n_age_classes` parameter.")); push!(priors_acc, "survival_rates ~ NamedDist(filldist(Beta(9, 1), $(n_classes-1)), :survival_rates)"); push!(priors_acc, "fecundity_rates ~ NamedDist(filldist(LogNormal(0, 1), $(n_classes)), :fecundity_rates)"); end
 
     innov_name = v.innov
     push!(priors_acc, "$(innov_name) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :$(innov_name))")
-    
+    priors_str = join(priors_acc, "\n    ")
+
     eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     L_op = "spec_registry[\"$(key_str)\"].hyper.L_template"
@@ -2087,11 +2162,7 @@ function _generate_component_code_fragments(m::DynamicsComponent, spec::NamedTup
     local evolution_loop_body, propagator_setup, field_setup, K_setup_block, r_setup_block
     
     propagator_setup = ""
-    if has_propagator
-        if model_type == "advection"; propagator_setup = "local propagator = lu(I(M.s_N) - $(v.velocity) * $(A_op) + noise * I)";
-        elseif model_type == "diffusion"; propagator_setup = "local propagator = cholesky(Symmetric(I(M.s_N) - $(v.diffusion) * $(L_op) + noise * I))";
-        elseif model_type == "advection_diffusion"; propagator_setup = "local propagator = lu(I(M.s_N) - $(v.velocity) * $(A_op) - $(v.diffusion) * $(L_op) + noise * I)"; end
-    end
+    if has_propagator; if model_type == "advection"; propagator_setup = "local propagator = lu(I(M.s_N) - $(v.velocity) * $(A_op) + noise * I)"; elseif model_type == "diffusion"; propagator_setup = "local propagator = cholesky(Symmetric(I(M.s_N) - $(v.diffusion) * $(L_op) + noise * I))"; elseif model_type == "advection_diffusion"; propagator_setup = "local propagator = lu(I(M.s_N) - $(v.velocity) * $(A_op) - $(v.diffusion) * $(L_op) + noise * I)"; end; end
 
     field_setup = "dyn_field = zeros(T, M.s_N, M.t_N)\n    innov_matrix = reshape($(innov_name), M.s_N, M.t_N)\n    dyn_field[:, 1] = innov_matrix[:, 1]"
     
@@ -2103,34 +2174,33 @@ function _generate_component_code_fragments(m::DynamicsComponent, spec::NamedTup
 
     propagator_logic = has_propagator ? "dyn_field[:, t] = (propagator \\ N_intermediate) .+ innov_matrix[:, t]" : "dyn_field[:, t] = N_intermediate .+ innov_matrix[:, t]"
 
-    if model_type == "logistic_basic"; evolution_loop_body = "local areas = $(grid_areas_access)\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = $(r_variable_name) .* D_prev .* (1.0 .- D_prev ./ K_density)\n    local N_intermediate = N_prev .+ (growth .* areas)\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
-    elseif model_type == "logistic_exploitation"
-        local exploitation_logic
-        if haskey(params, :effort_col) || haskey(params, :effort)
-            q = get(params, :q, LogNormal(-2, 1)); push!(priors_acc, "$(v.q) ~ NamedDist($(_distribution_to_string(q)), :$(v.q))")
-            effort_col_sym = get(params, :effort_col, :effort)
-            exploitation_logic = "local effort_matrix = spec_registry[\"$(key_str)\"].hyper.processed_params[:$(effort_col_sym)]\n    local exploitation = $(v.q) .* effort_matrix[:, t] .* N_prev"
-        else
-            exploitation_logic = "local exploitation = 0.0"
+    function generate_exploitation_block(spec, time_var)
+        effort_keys = get(spec.hyper, :effort_keys, [])
+        removal_keys = get(spec.hyper, :removal_keys, [])
+        
+        if isempty(effort_keys) && isempty(removal_keys)
+            return "local exploitation = 0.0"
         end
+        
+        lines = ["local exploitation = zeros(T, M.s_N)"]
+        for key in effort_keys
+            push!(lines, "exploitation .+= q_$(key) .* spec_registry[\"$(spec.key)\"].hyper.processed_params[:$(key)][:, $(time_var)] .* N_prev")
+        end
+        for key in removal_keys
+            push!(lines, "exploitation .+= spec_registry[\"$(spec.key)\"].hyper.processed_params[:$(key)][:, $(time_var)]")
+        end
+        return join(lines, "\n    ")
+    end
+
+    if model_type == "logistic"
+        exploitation_logic = generate_exploitation_block(spec, "t")
         evolution_loop_body = "local areas = $(grid_areas_access)\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = $(r_variable_name) .* D_prev .* (1.0 .- D_prev ./ K_density)\n    $(exploitation_logic)\n    local N_intermediate = N_prev .+ (growth .* areas) .- exploitation\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
     elseif model_type == "delay_difference"
-        local catch_logic_block
-        if haskey(params, :effort_col)
-            effort_col_sym = params[:effort_col]
-            catch_logic_block = "local effort_matrix = spec_registry[\"$(key_str)\"].hyper.processed_params[:$(effort_col_sym)]\nlocal C_prev = $(v.q) .* effort_matrix[:, t-1] .* N_prev"
-        elseif haskey(params, :catch_data_col)
-            catch_data_col_sym = params[:catch_data_col]
-            catch_logic_block = "local catch_data_matrix = spec_registry[\"$(key_str)\"].hyper.processed_params[:$(catch_data_col_sym)]\nlocal C_prev = catch_data_matrix[:, t-1]"
-        else
-            catch_logic_block = "local C_prev = 0.0"
-        end
-        evolution_loop_body = "local areas = $(grid_areas_access)\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = $(r_variable_name) .* D_prev .* (1.0 .- D_prev ./ K_density)\n    $(catch_logic_block)\n    local N_intermediate = (N_prev .+ (growth .* areas) .- C_prev) .* exp.(-$(v.M_nat))\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
+        exploitation_logic = generate_exploitation_block(spec, "t-1")
+        evolution_loop_body = "local areas = $(grid_areas_access)\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = $(r_variable_name) .* D_prev .* (1.0 .- D_prev ./ K_density)\n    $(exploitation_logic)\n    local N_intermediate = (N_prev .+ (growth .* areas) .- exploitation) .* exp.(-$(v.M_nat))\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
     elseif model_type == "lotka_volterra"; output_species = get(params, :output_species, :prey); interaction_cov_sym = get(params, :interaction_covariate, nothing); field_setup = "dyn_field_prey = zeros(T, M.s_N, M.t_N)\ndyn_field_predator = zeros(T, M.s_N, M.t_N)\ninnov_matrix_prey = reshape($(v.innov), M.s_N, M.t_N)\ninnov_matrix_predator = reshape($(v.innov)_predator, M.s_N, M.t_N)\ndyn_field_prey[:, 1] = innov_matrix_prey[:, 1]\ndyn_field_predator[:, 1] = innov_matrix_predator[:, 1]"; evolution_loop_body = "local predator_pop_matrix = if !isnothing(Symbol(\"$(interaction_cov_sym)\"))\n    spec_registry[\"$(key_str)\"].hyper.processed_params[:$(interaction_cov_sym)]\nelse\n    nothing\nend\nfor t in 2:M.t_N\n    local N_prey_prev = dyn_field_prey[:, t-1]\n    local N_pred_prev = isnothing(predator_pop_matrix) ? dyn_field_predator[:, t-1] : predator_pop_matrix[:, t-1]\n    local d_prey = ($(v.alpha) .* N_prey_prev) .- ($(v.beta) .* N_prey_prev .* N_pred_prev)\n    local d_pred = ($(v.gamma) .* N_prey_prev .* N_pred_prev) .- ($(v.delta) .* N_pred_prev)\n    dyn_field_prey[:, t] = max.(0.0, N_prey_prev .+ d_prey .+ innov_matrix_prey[:, t])\n    dyn_field_predator[:, t] = max.(0.0, N_pred_prev .+ d_pred .+ innov_matrix_predator[:, t])\nend\nlocal dyn_field = $(output_species == :prey ? "dyn_field_prey" : "dyn_field_predator")"
-    elseif model_type == "leslie_logistic"; n_classes = get(params, :n_age_classes, error("`leslie_logistic` model requires `n_age_classes` parameter.")); evolution_loop_body = "local L = zeros(T, $(n_classes), $(n_classes))\nfor i in 1:($(n_classes)-1); L[i+1, i] = survival_rates[i]; end\nL[1, :] = fecundity_rates\nlocal r_leslie = log(maximum(abs.(eigen(L).values)))\nlocal areas = $(grid_areas_access)\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = r_leslie .* D_prev .* (1.0 .- D_prev ./ K_density)\n    local N_intermediate = N_prev .+ (growth .* areas)\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
     else; evolution_loop_body = "for t in 2:M.t_N\n    dyn_field[:, t] = (propagator \\ dyn_field[:, t-1]) + innov_matrix[:, t]\nend"; end
 
-    priors_str = join(priors_acc, "\n    ")
     update_str = "begin\n# Dynamics model: $(model_type) for $(key_str)\n$(K_setup_block)\n$(r_setup_block)\n$(propagator_setup)\n$(field_setup)\n$(evolution_loop_body)\ndyn_field .*= $(v.sigma)\nfor i in 1:N\n    $(eta_update_target)[i] += dyn_field[M.s_idx[i], M.t_idx[i]]\nend\nend"
     
     return (priors=priors_str, update=update_str)
@@ -3397,69 +3467,7 @@ function _generate_component_code_fragments(m::DAG, spec::NamedTuple, arch::Stri
 end
 
 
-
-"""
-    _generate_component_code_fragments(m::ComposedComponent, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
-
-Generates Turing code fragments for composed components, such as state-space models (`|>`)
-and non-stationary variance models (`∘`).
-
-# Rationale for Update
-This function has been updated to correctly handle the `:composition` operator. It now
-retrieves the custom `priors` and `update` code strings that were injected into the
-module's parameters by `process_interact_module!`. This completes the implementation
-for non-stationary variance models where a smoother modulates a spatial field. The
-existing logic for the `:pipe` operator (spatially-varying curves) is preserved.
-"""
-function _generate_component_code_fragments(m::ComposedComponent, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
-    op = m.operator 
-    key_str = string(spec.key)
-
-    if op == :pipe
-        state_component = m.components[1]
-        dynamic_component = get(spec.params, :dynamic_component_obj, nothing)
-        structure_str = string(spec.structure)
-        is_multivariate = arch == "multivariate"
-        is_first_outcome = outcome_idx == 1
-        is_shared = get(spec.params, :shared, false)
-        eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
-        
-        v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
-        coeffs_raw_name = v.raw
-
-        state_spec = spec.hyper.state_spec
-        n_spatial = size(state_spec.Q_template, 1)
-        n_basis = dynamic_component.nbins
-        basis_key = get(spec.params, :dynamic_basis_key, nothing)
-        if isnothing(basis_key); error("Could not find basis matrix key for piped component $(key_str)."); end
-        
-        priors_acc = String[]
-        if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
-            if hasproperty(state_component, :sigma); push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(state_component.sigma)), :$(v.sigma))"); end
-            if hasproperty(state_component, :rho); push!(priors_acc, "$(v.rho) ~ NamedDist($(_distribution_to_string(state_component.rho)), :$(v.rho))"); end
-        end
-        push!(priors_acc, "$(coeffs_raw_name) ~ NamedDist(MvNormal(zeros(T, $(n_spatial * n_basis)), I), :$(coeffs_raw_name))")
-        priors_str = join(priors_acc, "\n        ")
-        
-        is_state_static = get(state_spec, :is_static, false)
-        local cholesky_block
-        if is_state_static
-            cholesky_block = "F_spatial = spec_registry[\"$(key_str)\"].hyper.state_spec.cholesky_factor"
-        else
-            cholesky_block = "Q_spatial_template = spec_registry[\"$(key_str)\"].hyper.state_spec.Q_template\n state_m_type = spec_registry[\"$(key_str)\"].hyper.state_spec.model_type\n rho_val = $(hasproperty(state_component, :rho) ? v.rho : "nothing")\n Q_spatial = recompose_precision(state_m_type, Q_spatial_template, 1.0; extra_param=rho_val)\n F_spatial = cholesky(Symmetric(Q_spatial + noise * I))"
-        end
-        
-        update_str = "begin\n $(cholesky_block)\n coeffs_raw_matrix = reshape($(coeffs_raw_name), $(n_spatial), $(n_basis))\n spatial_coeffs = $(v.sigma) .* (F_spatial.U \\ coeffs_raw_matrix)\n B_smooth = M.basis_matrices[:$(basis_key)]\n $(eta_update_target) .+= sum(B_smooth .* spatial_coeffs[M.s_idx, :], dims=2)\nend"
-        return (priors=priors_str, update=update_str)
-    end
-    
-    # The `:composition` operator is handled by dispatching to the specific component
-    # type's code generator (e.g., `NonStationaryVariance`). This branch is no longer needed.
-    @warn "Code generation for ComposedComponent with operator ':$op' is not explicitly handled here. Relying on downstream dispatch."
-    return (priors="", update="")
-end
-
-
+ 
 
 
 
@@ -3614,18 +3622,24 @@ end
 
 
 function _generate_component_code_fragments(m::ComposedComponent, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # Purpose: Generates Turing code fragments for composed components.
+    # Rationale: This version refactors the handling of the Kronecker product (`⊗`) to be
+    #            self-contained within this function. It correctly generates the priors and
+    #            the update logic for a full spatiotemporal interaction field, removing the
+    #            need for the separate `_generate_st_interaction_block` function and making
+    #            the code generator more modular. The logic for the `pipe` operator is preserved.
+    # v1.0.2 (2026-07-30)
+    # Inputs/Outputs: Standard code generation arguments.
     op = m.operator 
     key_str = string(spec.key)
 
     if op == :pipe
         dynamic_component = get(spec.hyper, :dynamic_component_obj, nothing)
         if isnothing(dynamic_component)
-            # This check prevents the FieldError if build_model failed to populate the hyper registry.
             error("Internal Error: dynamic_component_obj not found for piped component '$(key_str)'. Check build_model logic for ComposedComponent.")
         end
         
-        state_component = m.components[2] # The state component is the second one in a `dynamic |> state` pipe
-        structure_str = string(spec.structure)
+        state_component = m.components[2]
         is_multivariate = arch == "multivariate"
         is_first_outcome = outcome_idx == 1
         is_shared = get(spec.params, :shared, false)
@@ -3658,13 +3672,76 @@ function _generate_component_code_fragments(m::ComposedComponent, spec::NamedTup
         
         update_str = "begin\n $(cholesky_block)\n coeffs_raw_matrix = reshape($(coeffs_raw_name), $(n_spatial), $(n_basis))\n spatial_coeffs = $(v.sigma) .* (F_spatial.U \\ coeffs_raw_matrix)\n B_smooth = M.basis_matrices[:$(basis_key)]\n $(eta_update_target) .+= sum(B_smooth .* spatial_coeffs[M.s_idx, :], dims=2)\nend"
         return (priors=priors_str, update=update_str)
+    
+    elseif op == :kronecker_product
+        # This logic is now self-contained for Kronecker product interactions.
+        s_spec = spec.hyper.spatial_spec
+        t_spec = spec.hyper.temporal_spec
+        
+        s_key = string(s_spec.key)
+        t_key = string(t_spec.key)
+        
+        s_chol_access = "spec_registry[\"$(s_key)\"].cholesky_factor"
+        
+        t_model_type = t_spec.component_obj |> typeof |> Symbol
+        t_rho_var_name = "rho_$(t_key)"
+        t_chol_access = "cholesky(Symmetric(recompose_precision(:$(t_model_type), spec_registry[\"$(t_key)\"].Q_template, 1.0; extra_param=$(t_rho_var_name)) + noise * I))"
+
+        K = get(M, :outcomes_N, 1)
+        v_st_interaction = generate_full_variable_names(spec, "univariate", nothing)
+        sigma_name = string(v_st_interaction.sigma)
+        raw_name = string(v_st_interaction.raw)
+
+        st_sigma_prior_dist_str = haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)"
+
+        local priors_str, update_str
+        if is_multivariate
+            priors_str = """
+            $(sigma_name) ~ NamedDist(filldist($(st_sigma_prior_dist_str), $K), :$(Symbol(sigma_name)))
+            $(raw_name) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N * $K), I), :$(Symbol(raw_name)))
+            """
+            update_str = """
+            let
+                C_s = $(s_chol_access)
+                C_t = $(t_chol_access)
+                Z_tensor = reshape($(raw_name), M.s_N, M.t_N, $K)
+                for k in 1:$K
+                    Z_k = view(Z_tensor, :, :, k)
+                    tmp_spatial = C_s.U \\ Z_k
+                    tmp_spatial_T = Matrix(transpose(tmp_spatial))
+                    st_field_k_unscaled = transpose(C_t.U \\ tmp_spatial_T)
+                    Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_k_unscaled))
+                    st_field_k = st_field_k_unscaled .* $(sigma_name)[k]
+                    for i in 1:N; eta_latent[i, k] += st_field_k[M.s_idx[i], M.t_idx[i]]; end
+                end
+            end
+            """
+        else
+            priors_str = """
+            $(sigma_name) ~ NamedDist($(st_sigma_prior_dist_str), :$(Symbol(sigma_name)))
+            $(raw_name) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :$(Symbol(raw_name)))
+            """
+            update_str = """
+            let
+                C_s = $(s_chol_access)
+                C_t = $(t_chol_access)
+                Z_matrix = reshape($(raw_name), M.s_N, M.t_N)
+                tmp_spatial = C_s.U \\ Z_matrix
+                tmp_spatial_T = Matrix(transpose(tmp_spatial))
+                st_field_unscaled = transpose(C_t.U \\ tmp_spatial_T)
+                Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_unscaled))
+                st_field = st_field_unscaled .* $(sigma_name)
+                for i in 1:N; eta[i] += st_field[M.s_idx[i], M.t_idx[i]]; end
+            end
+            """
+        end
+        return (priors=priors_str, update=update_str)
     end
     
-    # The `:composition` operator is handled by dispatching to the specific component
-    # type's code generator (e.g., `NonStationaryVariance`). This branch is no longer needed.
     @warn "Code generation for ComposedComponent with operator ':$op' is not explicitly handled here. Relying on downstream dispatch."
     return (priors="", update="")
 end
+
  
 
 
@@ -6004,6 +6081,14 @@ the `hyper` registry of the main component. This makes all necessary structural 
 available to the code generator.
 """
 function build_model(m::NonStationaryVariance, data_inputs::Dict, module_metadata::Dict)
+    # Purpose: A specialized model builder for the `NonStationaryVariance` component.
+    # Rationale: This builder constructs the technical specifications for both the `base_model`
+    #            (spatial) and `modifier_model` (smoother) by recursively calling `build_model`
+    #            on them. The resulting specifications, which include their respective precision
+    #            matrix templates, are stored in the `hyper` registry of the main component.
+    #            This makes all necessary structural information available to the code generator.
+    # v1.0.0 (2026-07-29)
+    # Inputs/Outputs: Standard model builder arguments.
     base_node = module_metadata[:params][:base_node]
     modifier_node = module_metadata[:params][:modifier_node]
 
@@ -6028,6 +6113,7 @@ end
 
 
 
+
 """
     _generate_component_code_fragments(m::NonStationaryVariance, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
 
@@ -6043,6 +6129,14 @@ It replaces the old code-injection method with a clean, structured implementatio
 5.  Finally, it reconstructs the base spatial field and scales it by the exponentiated, spatially varying sigma, adding the result to the linear predictor.
 """
 function _generate_component_code_fragments(m::NonStationaryVariance, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # Purpose: A specialized code generator for the `NonStationaryVariance` component.
+    # Rationale: This function generates the Turing model code for the non-stationary variance
+    #            model. It replaces the old code-injection method with a clean, structured
+    #            implementation that recursively calls the code generator for the `modifier_model`
+    #            (smoother), uses its latent field to construct a spatially varying log-sigma
+    #            field, and then scales the `base_model`'s effect accordingly.
+    # v1.0.0 (2026-07-29)
+    # Inputs/Outputs: Standard code generation arguments.
     key_str = string(spec.key)
     is_multivariate = arch == "multivariate"
     
@@ -6110,6 +6204,7 @@ function _generate_component_code_fragments(m::NonStationaryVariance, spec::Name
     
     return (priors=priors_str, update=update_str)
 end
+
 
 
 function _compute_scaling_factor(evals::Vector{Float64}, rank_deficiency::Int)
@@ -6359,7 +6454,6 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
     if op == :pipe && length(components) == 2
         node1, node2 = components[1], components[2]
         
-        # Infer structures if not explicitly provided.
         if node1.module_type == :random && !haskey(node1.args, :structure)
             args1 = copy(node1.args); args1[:vars] = get(node1.args, :positional_args, [])
             node1.args[:structure] = _infer_structure_from_args(args1)
@@ -6369,7 +6463,6 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
             node2.args[:structure] = _infer_structure_from_args(args2)
         end
 
-        # --- FIX: Added logic for spatially varying curves ---
         is_spatially_varying_curve = node1.module_type == :random && get(node1.args, :structure, :none) == :smooth &&
                                      node2.module_type == :random && get(node2.args, :structure, :none) == :spatial
 
@@ -6378,7 +6471,6 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
         is_svar = node1.module_type == :random && get(node1.args, :structure, :none) == :temporal && node2.module_type == :random && get(node2.args, :structure, :none) == :spatial
 
         if is_spatially_varying_curve
-            # Process the dynamic (smooth) part to create the basis matrix.
             dynamic_node = node1
             dynamic_vars = get(dynamic_node.args, :positional_args, [])
             if isempty(dynamic_vars); error("The dynamic part of a pipe operator (e.g., a smoother) must have a variable."); end
@@ -6386,16 +6478,14 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
             smooth_mod_data = Dict(:type => :smooth, :variables => dynamic_vars, :params => dynamic_node.args)
             process_smooth_module!(opt_dict, smooth_mod_data, opt_dict[:basis_matrices], opt_dict[:components])
             
-            # Process the state (spatial) part to set up W, s_idx, etc.
             state_node = node2
             spatial_mod_data = Dict(:type => :spatial, :variables => get(state_node.args, :positional_args, []), :params => state_node.args)
             process_spatial_module!(opt_dict, spatial_mod_data, registries, hyperpriors)
             
-            # Set up parameters for the ComposedComponent builder.
             mod_data[:params][:dynamic_component_node] = dynamic_node
             mod_data[:params][:state_component_node] = state_node
             
-            return true # Proceed to build the ComposedComponent.
+            return true
 
         elseif is_svc
             covariate_node = node1
@@ -6476,6 +6566,7 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
     
     return true
 end
+
 
 
 
@@ -7397,9 +7488,10 @@ end
 
 function build_model(m::DynamicsComponent, data_inputs::Dict, module_metadata::Dict)
     # Purpose: Builder for the `DynamicsComponent`.
-    # Rationale: This version is updated to handle `effort_col` for models that use it,
-    #            such as the reformulated `delay_difference` model.
-    # v1.0.6 (2026-07-31)
+    # Rationale: This version is updated to handle flexible `effort` and `removal` parameters,
+    #            supporting single or multiple sources of exploitation data. It also consolidates
+    #            logistic models and removes the deprecated leslie_logistic model.
+    # v1.0.8 (2026-08-01)
 
     n = get(data_inputs, :s_N, 1)
     W = get(data_inputs, :W, nothing)
@@ -7407,10 +7499,7 @@ function build_model(m::DynamicsComponent, data_inputs::Dict, module_metadata::D
         error("DynamicsComponent requires an adjacency matrix W, but it was not found in the model configuration.")
     end
 
-    # 1. Build the second-order diffusion operator (Graph Laplacian).
     L_template = build_structure_template(:besag, n; W=W).matrix
-
-    # 2. Build a first-order advection operator (if needed).
     A_template = if m.model in ["advection", "advection_diffusion"]
         W_dir = tril(W, -1)
         out_degree = sum(W_dir, dims=2)[:]
@@ -7420,16 +7509,12 @@ function build_model(m::DynamicsComponent, data_inputs::Dict, module_metadata::D
         spzeros(Float64, n, n)
     end
 
-    # 3. Store operators and `grid_areas` in the component's hyperparameter registry.
     hyper_dict = Dict{Symbol, Any}()
-    for fn in fieldnames(typeof(m))
-        hyper_dict[fn] = getfield(m, fn)
-    end
+    for fn in fieldnames(typeof(m)); hyper_dict[fn] = getfield(m, fn); end
     hyper_dict[:L_template] = L_template
     hyper_dict[:A_template] = A_template
-    hyper_dict[:areas] = get(data_inputs, :grid_areas, ones(n)) # Store grid_areas
+    hyper_dict[:areas] = get(data_inputs, :grid_areas, ones(n))
 
-    # 4. Process covariates passed as parameters (e.g., effort, catch_data).
     s_N = get(data_inputs, :s_N, 1)
     t_N = get(data_inputs, :t_N, 1)
     y_N = data_inputs[:y_N]
@@ -7438,35 +7523,65 @@ function build_model(m::DynamicsComponent, data_inputs::Dict, module_metadata::D
     data = data_inputs[:data]
 
     processed_params = Dict{Symbol, Any}()
-    for (key, val) in m.params
-        is_data_col_symbol = (val isa Symbol && hasproperty(data, val))
-        covariate_vector = (val isa AbstractVector && length(val) == y_N) ? val : (is_data_col_symbol ? data[!, val] : nothing)
-        
-        if !isnothing(covariate_vector) && covariate_vector isa AbstractVector && length(covariate_vector) == y_N
-            cov_matrix = zeros(s_N, t_N)
-            counts = zeros(Int, s_N, t_N)
-            for i in 1:y_N; si, ti = s_idx[i], t_idx[i]; cov_matrix[si, ti] += covariate_vector[i]; counts[si, ti] += 1; end
-            cov_matrix ./= max.(1, counts) # Average if multiple obs per cell
+    hyper_dict[:effort_keys] = Symbol[]
+    hyper_dict[:removal_keys] = Symbol[]
+
+    # Process exploitation parameters
+    for param_base_name in [:effort, :removal]
+        if haskey(m.params, param_base_name)
+            val = m.params[param_base_name]
+            target_keys_list = hyper_dict[Symbol(string(param_base_name) * "_keys")]
             
-            storage_key = is_data_col_symbol ? val : key
-            processed_params[storage_key] = cov_matrix
-        else
-            processed_params[key] = val
+            vals_to_process = if val isa Vector && !(val isa AbstractVector{<:Real})
+                val
+            elseif val isa Matrix
+                # Handle matrix by treating each column as a separate source
+                [val[:, i] for i in 1:size(val, 2)]
+            else
+                [val]
+            end
+
+            for (i, v) in enumerate(vals_to_process)
+                storage_key = length(vals_to_process) > 1 ? Symbol("$(param_base_name)_$(i)") : param_base_name
+                
+                is_data_col_symbol = (v isa Symbol && hasproperty(data, v))
+                covariate_data = if v isa AbstractVector{<:Real}; v
+                elseif is_data_col_symbol; data[!, v]
+                else; nothing; end
+
+                if !isnothing(covariate_data)
+                    if ndims(covariate_data) == 1
+                        cov_matrix = zeros(s_N, t_N)
+                        counts = zeros(Int, s_N, t_N)
+                        for obs_i in 1:y_N
+                            si, ti = s_idx[obs_i], t_idx[obs_i]
+                            cov_matrix[si, ti] += covariate_data[obs_i]
+                            counts[si, ti] += 1
+                        end
+                        cov_matrix ./= max.(1, counts)
+                        processed_params[storage_key] = cov_matrix
+                        push!(target_keys_list, storage_key)
+                    elseif ndims(covariate_data) >= 2
+                        # Assumes data is already in matrix form [s_N, t_N] or [s_N, t_N, n_age_classes]
+                        processed_params[storage_key] = covariate_data
+                        push!(target_keys_list, storage_key)
+                    end
+                end
+            end
         end
+    end
+
+    # Process other parameters
+    for (key, val) in m.params
+        if key in [:effort, :removal]; continue; end
+        processed_params[key] = val
     end
     hyper_dict[:processed_params] = processed_params
 
-    # Explicitly store symbols for catch or effort columns if present.
-    if haskey(m.params, :catch_data_col)
-        hyper_dict[:catch_data_col_sym] = m.params[:catch_data_col]
-    end
-    if haskey(m.params, :effort_col)
-        hyper_dict[:effort_col_sym] = m.params[:effort_col]
-    end
-
-    # The Q_template field is still required by the generic component pathway.
     return (Q_template=L_template, scaling_factor=1.0, model_type=:dynamics, hyper=NamedTuple(hyper_dict))
 end
+
+
 
 
 
@@ -7786,6 +7901,13 @@ end
 
 
 function _generate_component_code_fragments(m::AR2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    # Purpose: Generates Turing code for an AR(2) process.
+    # Rationale: This version is updated to call the new `ar2_statespace` helper function,
+    #            which correctly initializes the process from its stationary distribution.
+    #            This replaces the previous approximate initialization, improving the model's
+    #            statistical correctness and stability, especially for short time series.
+    # v1.1.0 (2026-08-01)
+    # Inputs/Outputs: Standard code generation arguments.
     v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
     
     n_latent = size(spec.Q_template, 1)
@@ -7795,8 +7917,9 @@ function _generate_component_code_fragments(m::AR2, spec::NamedTuple, arch::Stri
     priors_acc = String[]
     if !is_multivariate || (is_multivariate && (!is_shared || outcome_idx == 1))
         push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
-        push!(priors_acc, "$(v.rho1) ~ NamedDist($(_distribution_to_string(m.rho1)), :$(v.rho1))")
-        push!(priors_acc, "$(v.rho2) ~ NamedDist($(_distribution_to_string(m.rho2)), :$(v.rho2))")
+        # Stationarity constraints are now handled inside ar2_statespace, but priors can still be bounded.
+        push!(priors_acc, "$(v.rho1) ~ NamedDist(truncated($(_distribution_to_string(m.rho1)), -2.0, 2.0), :$(v.rho1))")
+        push!(priors_acc, "$(v.rho2) ~ NamedDist(truncated($(_distribution_to_string(m.rho2)), -1.0, 1.0), :$(v.rho2))")
     end
     push!(priors_acc, "$(v.innov) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.innov))")
     priors_str = join(priors_acc, "\n")
@@ -7807,22 +7930,13 @@ function _generate_component_code_fragments(m::AR2, spec::NamedTuple, arch::Stri
     update_str = """
     begin
         # AR2 state-space evolution for $(spec.key)
-        local $(v.latent) = Vector{T}(undef, $(n_latent))
-        
-        # NOTE: The initialization of the first two states is an approximation.
-        # A full stationary initialization would require solving the Yule-Walker equations,
-        # which is more complex. This approach is generally sufficient if the time series is long.
-        if $(n_latent) > 0; $(v.latent)[1] = $(v.innov)[1]; end
-        if $(n_latent) > 1; $(v.latent)[2] = $(v.rho1) * $(v.latent)[1] + $(v.innov)[2]; end
-        for t in 3:$(n_latent)
-            $(v.latent)[t] = $(v.rho1) * $(v.latent)[t-1] + $(v.rho2) * $(v.latent)[t-2] + $(v.innov)[t]
-        end
-        $(v.latent) .*= $(v.sigma)
+        $(v.latent) = ar2_statespace($(v.rho1), $(v.rho2), $(v.sigma), $(v.innov), $(n_latent), noise)
         $(eta_update_target) .+= view($(v.latent), M.$(index_var))
     end
     """
     return (priors=priors_str, update=update_str)
 end
+
 
 
 
@@ -8453,6 +8567,57 @@ function ar1_statespace(rho, sigma, innov, T, n_latent, noise)
     end
     return latent
 end
+
+function ar2_statespace(rho1::T, rho2::T, sigma::T, innov::AbstractVector{T}, n_latent::Int, noise::T) where {T<:Real}
+    # Purpose: Implements a stationary state-space evolution for an AR(2) process.
+    # Rationale: This function provides a statistically robust initialization for an AR(2)
+    #            process by sampling the first two time steps from their stationary joint
+    #            distribution. This avoids the non-stationary "burn-in" period of a naive
+    #            initialization and improves model stability and correctness.
+    # v1.0.0 (2026-08-01)
+    # Inputs:
+    #   - rho1, rho2: The AR(2) coefficients.
+    #   - sigma: The standard deviation of the innovations.
+    #   - innov: A vector of standard normal innovations.
+    #   - n_latent: The length of the time series.
+    #   - noise: A small jitter term for numerical stability.
+    # Outputs: A vector representing the realized AR(2) process.
+    latent = Vector{T}(undef, n_latent)
+    if n_latent == 0
+        return latent
+    end
+
+    # Stationarity constraints for AR(2) model
+    if rho1 + rho2 >= 1.0 || rho2 - rho1 >= 1.0 || abs(rho2) >= 1.0
+        # If parameters are in a non-stationary region, return a very large value
+        # to signal the MCMC sampler to reject this proposal.
+        return fill(T(1e12), n_latent)
+    end
+
+    # Calculate stationary variance (gamma_0) and lag-1 autocovariance (gamma_1)
+    var_innov = sigma^2
+    gamma_0 = var_innov * (1.0 - rho2) / ((1.0 + rho2) * ((1.0 - rho2)^2 - rho1^2) + noise)
+    gamma_1 = (rho1 / (1.0 - rho2)) * gamma_0
+
+    # Cholesky decomposition of the 2x2 covariance matrix for the first two states
+    cov_12 = [gamma_0 gamma_1; gamma_1 gamma_0]
+    L_12 = cholesky(Symmetric(cov_12 + noise * I)).L
+
+    # Sample the first two states from their stationary joint distribution
+    if n_latent >= 2
+        latent[1:2] = L_12 * innov[1:2]
+    elseif n_latent == 1
+        latent[1] = sqrt(gamma_0) * innov[1]
+    end
+
+    # Evolve the remaining states using the AR(2) recurrence relation
+    for t in 3:n_latent
+        latent[t] = rho1 * latent[t-1] + rho2 * latent[t-2] + innov[t] * sigma
+    end
+
+    return latent
+end
+
 
 function create_pc_prior(param_name::Symbol, constraint::Tuple)
     # Purpose: Creates a Penalized Complexity (PC) prior distribution from a user-specified quantile constraint.
@@ -10873,11 +11038,9 @@ end
 
 function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedTuple, M::NamedTuple)
     # Purpose: Generates Turing code for multivariate dynamics models.
-    # Rationale: This version adds branches to handle the multivariate `leslie_matrix`,
-    #            `delay_difference`, and `generalized_lotka_volterra` models.
-    #            It includes support for spatially varying K and vital rates for leslie_matrix,
-    #            and dual catch/effort modes for delay_difference.
-    # v1.0.6 (2026-08-01)
+    # Rationale: This version adds exploitation logic to the `leslie_matrix` model and updates
+    #            other models to use the standardized `effort` and `removal` parameters.
+    # v1.0.7 (2026-08-01)
     key_str = string(spec.key)
     params = m.params
     model_type = m.model
@@ -10889,268 +11052,109 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
         spatially_varying_K = get(params, :spatially_varying_K, false)
         spatially_varying_rates = get(params, :spatially_varying_rates, false)
 
-        if n_age_classes != M.outcomes_N
-            error("Number of age classes ($n_age_classes) in dynamics(model=leslie_matrix) must match number of outcomes ($(M.outcomes_N)).")
-        end
+        if n_age_classes != M.outcomes_N; error("Number of age classes ($n_age_classes) must match number of outcomes ($(M.outcomes_N))."); end
 
         priors_acc = []
-        # Priors for vital rates (scalar or spatial fields)
         if spatially_varying_rates
-            # Priors for spatially varying fecundity field
             push!(priors_acc, "log_fecundity_mean_$(key_str) ~ NamedDist(filldist(Normal(0, 1), $(n_age_classes)), :log_fecundity_mean_$(key_str))")
             push!(priors_acc, "sigma_fecundity_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_age_classes)), :sigma_fecundity_$(key_str))")
             push!(priors_acc, "fecundity_raw_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * $(n_age_classes)), I), :fecundity_raw_$(key_str))")
-            
-            # Priors for spatially varying survival field
-            push!(priors_acc, "logit_survival_mean_$(key_str) ~ NamedDist(filldist(Normal(1.5, 1), $(n_age_classes-1)), :logit_survival_mean_$(key_str))") # Prior centered around high survival
+            push!(priors_acc, "logit_survival_mean_$(key_str) ~ NamedDist(filldist(Normal(1.5, 1), $(n_age_classes-1)), :logit_survival_mean_$(key_str))")
             push!(priors_acc, "sigma_survival_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_age_classes-1)), :sigma_survival_$(key_str))")
             push!(priors_acc, "survival_raw_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * ($(n_age_classes)-1)), I), :survival_raw_$(key_str))")
         else
-            # Priors for scalar survival and fecundity
             push!(priors_acc, "survival_rates_$(key_str) ~ NamedDist(filldist(Beta(9, 1), $(n_age_classes - 1)), :survival_rates_$(key_str))")
             push!(priors_acc, "fecundity_rates_$(key_str) ~ NamedDist(filldist(LogNormal(0, 1), $(n_age_classes)), :fecundity_rates_$(key_str))")
         end
 
-        # Priors for K (scalar or spatial field)
         if haskey(params, :K) || spatially_varying_K
             if spatially_varying_K
-                sigma_K_prior = get(params, :sigma_K, Exponential(1.0))
-                log_K_mean_prior = get(params, :log_K_mean, haskey(params, :K) && params[:K] isa LogNormal ? Normal(Distributions.params(params[:K])...) : Normal(log(100.0), 0.5))
+                sigma_K_prior = get(params, :sigma_K, Exponential(1.0)); log_K_mean_prior = get(params, :log_K_mean, haskey(params, :K) && params[:K] isa LogNormal ? Normal(Distributions.params(params[:K])...) : Normal(log(100.0), 0.5))
                 push!(priors_acc, "sigma_K_$(prefixed_key) ~ NamedDist($(_distribution_to_string(sigma_K_prior)), :sigma_K_$(prefixed_key))")
                 push!(priors_acc, "log_K_mean_$(prefixed_key) ~ NamedDist($(_distribution_to_string(log_K_mean_prior)), :log_K_mean_$(prefixed_key))")
                 push!(priors_acc, "K_raw_$(prefixed_key) ~ NamedDist(MvNormal(zeros(T, M.s_N), I), :K_raw_$(prefixed_key))")
             else
-                K_prior = get(params, :K, LogNormal(log(100.0), 1.0))
-                push!(priors_acc, "K_$(key_str) ~ NamedDist($(_distribution_to_string(K_prior)), :K_$(key_str))")
+                K_prior = get(params, :K, LogNormal(log(100.0), 1.0)); push!(priors_acc, "K_$(key_str) ~ NamedDist($(_distribution_to_string(K_prior)), :K_$(key_str))")
             end
         end
 
-        # Priors for process noise
+        effort_keys = get(spec.hyper, :effort_keys, [])
+        for key in effort_keys
+            q_prior = get(params, Symbol("q_$(key)"), filldist(LogNormal(-4, 1), n_age_classes))
+            push!(priors_acc, "q_$(key) ~ NamedDist($(_distribution_to_string(q_prior)), :q_$(key))")
+        end
+
         push!(priors_acc, "sigma_process_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_age_classes)), :sigma_process_$(key_str))")
         push!(priors_acc, "innov_process_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N * $(n_age_classes)), I), :innov_process_$(key_str))")
         priors_str = join(priors_acc, "\n    ")
 
+        exploitation_block = "local C_prev = zeros(T, $(n_age_classes))"
+        for key in effort_keys
+            exploitation_block *= "\n            C_prev .+= q_$(key) .* spec_registry[\"$(key_str)\"].hyper.processed_params[:$(key)][s, t-1] .* N_prev"
+        end
+        removal_keys = get(spec.hyper, :removal_keys, [])
+        for key in removal_keys
+            exploitation_block *= "\n            C_prev .+= spec_registry[\"$(key_str)\"].hyper.processed_params[:$(key)][s, t-1, :]"
+        end
+
         update_str = """
         begin
-            # Multivariate Leslie Matrix Dynamics for $(key_str)
-            local Q_spatial = spec_registry["$(key_str)"].hyper.L_template
-            local F_spatial = cholesky(Symmetric(Q_spatial + noise * I))
-            local areas = spec_registry["$(key_str)"].hyper.areas
-
-            # Construct spatially varying vital rates if specified
-            local survival_rates_spatial, fecundity_rates_spatial
-            if $(spatially_varying_rates)
-                fecundity_raw_matrix = reshape(fecundity_raw_$(key_str), M.s_N, $(n_age_classes))
-                fecundity_field = F_spatial.U \\ fecundity_raw_matrix
-                fecundity_rates_spatial = exp.(log_fecundity_mean_$(key_str)' .+ fecundity_field .* sigma_fecundity_$(key_str)')
-
-                survival_raw_matrix = reshape(survival_raw_$(key_str), M.s_N, $(n_age_classes-1))
-                survival_field = F_spatial.U \\ survival_raw_matrix
-                survival_rates_spatial = logistic.(logit_survival_mean_$(key_str)' .+ survival_field .* sigma_survival_$(key_str)')
-            end
-
-            # Construct K field (if spatially varying)
-            local K_values_$(key_str)
-            if $(spatially_varying_K)
-                K_field_raw = F_spatial.U \\ K_raw_$(prefixed_key)
-                Turing.@addlogprob! logpdf(Normal(0, 0.001 * M.s_N), sum(K_field_raw)) # Soft sum-to-zero constraint
-                K_values_$(key_str) = exp.(log_K_mean_$(prefixed_key) .+ K_field_raw .* sigma_K_$(prefixed_key))
-            elseif haskey(spec_registry["$(key_str)"].component_obj.params, :K)
-                K_values_$(key_str) = fill(K_$(key_str), M.s_N)
-            end
-            
-            local innov_tensor_$(key_str) = reshape(innov_process_$(key_str), M.s_N, M.t_N, $(n_age_classes))
-            local population_field_$(key_str) = zeros(T, M.s_N, M.t_N, $(n_age_classes))
-
-            # Initialize first time step with scaled innovations, ensuring non-negativity
-            for a in 1:$(n_age_classes)
-                population_field_$(key_str)[:, 1, a] = max.(0.0, innov_tensor_$(key_str)[:, 1, a] .* sigma_process_$(key_str)[a])
-            end
-
-            # Evolve the system over time for each spatial cell
+            local Q_spatial = spec_registry["$(key_str)"].hyper.L_template; local F_spatial = cholesky(Symmetric(Q_spatial + noise * I)); local areas = spec_registry["$(key_str)"].hyper.areas
+            local survival_rates_spatial, fecundity_rates_spatial; if $(spatially_varying_rates); fecundity_raw_matrix = reshape(fecundity_raw_$(key_str), M.s_N, $(n_age_classes)); fecundity_field = F_spatial.U \\ fecundity_raw_matrix; fecundity_rates_spatial = exp.(log_fecundity_mean_$(key_str)' .+ fecundity_field .* sigma_fecundity_$(key_str)'); survival_raw_matrix = reshape(survival_raw_$(key_str), M.s_N, $(n_age_classes-1)); survival_field = F_spatial.U \\ survival_raw_matrix; survival_rates_spatial = logistic.(logit_survival_mean_$(key_str)' .+ survival_field .* sigma_survival_$(key_str)'); end
+            local K_values_$(key_str); if $(spatially_varying_K); K_field_raw = F_spatial.U \\ K_raw_$(prefixed_key); Turing.@addlogprob! logpdf(Normal(0, 0.001 * M.s_N), sum(K_field_raw)); K_values_$(key_str) = exp.(log_K_mean_$(prefixed_key) .+ K_field_raw .* sigma_K_$(prefixed_key)); elseif haskey(spec_registry["$(key_str)"].component_obj.params, :K); K_values_$(key_str) = fill(K_$(key_str), M.s_N); end
+            local innov_tensor_$(key_str) = reshape(innov_process_$(key_str), M.s_N, M.t_N, $(n_age_classes)); local population_field_$(key_str) = zeros(T, M.s_N, M.t_N, $(n_age_classes))
+            for a in 1:$(n_age_classes); population_field_$(key_str)[:, 1, a] = max.(0.0, innov_tensor_$(key_str)[:, 1, a] .* sigma_process_$(key_str)[a]); end
             for s in 1:M.s_N
-                local L_s = zeros(T, $(n_age_classes), $(n_age_classes))
-                if $(spatially_varying_rates)
-                    for i in 1:($(n_age_classes)-1); L_s[i+1, i] = survival_rates_spatial[s, i]; end
-                    L_s[1, :] = fecundity_rates_spatial[s, :]
-                else
-                    for i in 1:($(n_age_classes)-1); L_s[i+1, i] = survival_rates_$(key_str)[i]; end
-                    L_s[1, :] = fecundity_rates_$(key_str)
-                end
-
+                local L_s = zeros(T, $(n_age_classes), $(n_age_classes)); if $(spatially_varying_rates); for i in 1:($(n_age_classes)-1); L_s[i+1, i] = survival_rates_spatial[s, i]; end; L_s[1, :] = fecundity_rates_spatial[s, :]; else; for i in 1:($(n_age_classes)-1); L_s[i+1, i] = survival_rates_$(key_str)[i]; end; L_s[1, :] = fecundity_rates_$(key_str); end
                 for t in 2:M.t_N
-                    local N_prev = view(population_field_$(key_str), s, t-1, :)
-                    local L_effective = copy(L_s)
-                    
-                    if haskey(spec_registry["$(key_str)"].component_obj.params, :K)
-                        local total_pop_prev = sum(N_prev)
-                        local K_density = K_values_$(key_str)[s] / areas[s]
-                        local dd_factor = max(0.0, 1.0 - (total_pop_prev / areas[s]) / K_density)
-                        L_effective[1, :] .*= dd_factor
-                    end
-
-                    local N_projected = L_effective * N_prev
-                    local current_innov = view(innov_tensor_$(key_str), s, t, :) .* sigma_process_$(key_str)
-                    population_field_$(key_str)[s, t, :] = max.(0.0, N_projected .+ current_innov)
+                    local N_prev = view(population_field_$(key_str), s, t-1, :); $(exploitation_block); local N_after_removal = max.(0.0, N_prev - C_prev); local L_effective = copy(L_s)
+                    if haskey(spec_registry["$(key_str)"].component_obj.params, :K); local total_pop_prev = sum(N_after_removal); local K_density = K_values_$(key_str)[s] / areas[s]; local dd_factor = max(0.0, 1.0 - (total_pop_prev / areas[s]) / K_density); L_effective[1, :] .*= dd_factor; end
+                    local N_projected = L_effective * N_after_removal; local current_innov = view(innov_tensor_$(key_str), s, t, :) .* sigma_process_$(key_str); population_field_$(key_str)[s, t, :] = max.(0.0, N_projected .+ current_innov)
                 end
             end
-
-            # Add the log-transformed population state to the linear predictor eta_latent
-            for k in 1:$(n_age_classes)
-                for i in 1:N
-                    eta_latent[i, k] += log(population_field_$(key_str)[M.s_idx[i], M.t_idx[i], k] + 1e-6)
-                end
-            end
+            for k in 1:$(n_age_classes); for i in 1:N; eta_latent[i, k] += log(population_field_$(key_str)[M.s_idx[i], M.t_idx[i], k] + 1e-6); end; end
         end
         """
         return (priors=priors_str, update=update_str)
 
     elseif model_type == "delay_difference"
-        if M.outcomes_N != 2
-            error("The multivariate `delay_difference` model requires exactly two outcomes: population and recruitment.")
-        end
-        
-        priors_acc = []
-        push!(priors_acc, "r_$(key_str) ~ NamedDist(LogNormal(0, 1), :r_$(key_str))")
-        push!(priors_acc, "K_$(key_str) ~ NamedDist(LogNormal(log(100.0), 1.0), :K_$(key_str))")
-        push!(priors_acc, "M_nat_$(key_str) ~ NamedDist(LogNormal(-1, 0.5), :M_nat_$(key_str))")
-        push!(priors_acc, "sigma_recruitment_$(key_str) ~ NamedDist(Exponential(1.0), :sigma_recruitment_$(key_str))")
-        push!(priors_acc, "sigma_population_$(key_str) ~ NamedDist(Exponential(1.0), :sigma_population_$(key_str))")
-        push!(priors_acc, "innov_recruitment_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :innov_recruitment_$(key_str))")
-        push!(priors_acc, "innov_population_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :innov_population_$(key_str))")
-        
-        if haskey(params, :effort_col)
-            push!(priors_acc, "q_$(key_str) ~ NamedDist(LogNormal(-2, 1), :q_$(key_str))")
-        end
+        if M.outcomes_N != 2; error("The multivariate `delay_difference` model requires exactly two outcomes: population and recruitment."); end
+        priors_acc = []; push!(priors_acc, "r_$(key_str) ~ NamedDist(LogNormal(0, 1), :r_$(key_str))"); push!(priors_acc, "K_$(key_str) ~ NamedDist(LogNormal(log(100.0), 1.0), :K_$(key_str))"); push!(priors_acc, "M_nat_$(key_str) ~ NamedDist(LogNormal(-1, 0.5), :M_nat_$(key_str))"); push!(priors_acc, "sigma_recruitment_$(key_str) ~ NamedDist(Exponential(1.0), :sigma_recruitment_$(key_str))"); push!(priors_acc, "sigma_population_$(key_str) ~ NamedDist(Exponential(1.0), :sigma_population_$(key_str))"); push!(priors_acc, "innov_recruitment_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :innov_recruitment_$(key_str))"); push!(priors_acc, "innov_population_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :innov_population_$(key_str))")
+        effort_keys = get(spec.hyper, :effort_keys, []); for key in effort_keys; q_prior = get(params, Symbol("q_$(key)"), LogNormal(-2, 1)); push!(priors_acc, "q_$(key) ~ NamedDist($(_distribution_to_string(q_prior)), :q_$(key))"); end
         priors_str = join(priors_acc, "\n    ")
 
-        local catch_logic_block
-        if haskey(params, :effort_col)
-            effort_col_sym = params[:effort_col]
-            catch_logic_block = """
-            local effort_matrix = spec_registry["$(key_str)"].hyper.processed_params[:$(effort_col_sym)]
-            local C_prev = q_$(key_str) .* effort_matrix[:, t-1] .* N_prev
-            """
-        elseif haskey(params, :catch_data_col)
-            catch_data_col_sym = params[:catch_data_col]
-            catch_logic_block = """
-            local catch_data_matrix = spec_registry["$(key_str)"].hyper.processed_params[:$(catch_data_col_sym)]
-            local C_prev = catch_data_matrix[:, t-1]
-            """
-        else
-            catch_logic_block = "local C_prev = 0.0"
-        end
+        exploitation_block = "local C_prev = zeros(T, M.s_N)"; for key in effort_keys; exploitation_block *= "\n            C_prev .+= q_$(key) .* spec_registry[\"$(key_str)\"].hyper.processed_params[:$(key)][:, t-1] .* N_prev"; end; removal_keys = get(spec.hyper, :removal_keys, []); for key in removal_keys; exploitation_block *= "\n            C_prev .+= spec_registry[\"$(key_str)\"].hyper.processed_params[:$(key)][:, t-1]"; end
 
         update_str = """
         begin
-            # Multivariate Delay-Difference Dynamics for $(key_str)
-            local areas = spec_registry["$(key_str)"].hyper.areas
-            
-            local population_field = zeros(T, M.s_N, M.t_N)
-            local recruitment_field = zeros(T, M.s_N, M.t_N)
-            
-            local innov_recruitment_matrix = reshape(innov_recruitment_$(key_str), M.s_N, M.t_N)
-            local innov_population_matrix = reshape(innov_population_$(key_str), M.s_N, M.t_N)
-
-            # Initialize fields at t=1, ensuring non-negativity
-            population_field[:, 1] = max.(0.0, innov_population_matrix[:, 1] .* sigma_population_$(key_str))
-            recruitment_field[:, 1] = max.(0.0, innov_recruitment_matrix[:, 1] .* sigma_recruitment_$(key_str))
-
+            local areas = spec_registry["$(key_str)"].hyper.areas; local population_field = zeros(T, M.s_N, M.t_N); local recruitment_field = zeros(T, M.s_N, M.t_N); local innov_recruitment_matrix = reshape(innov_recruitment_$(key_str), M.s_N, M.t_N); local innov_population_matrix = reshape(innov_population_$(key_str), M.s_N, M.t_N)
+            population_field[:, 1] = max.(0.0, innov_population_matrix[:, 1] .* sigma_population_$(key_str)); recruitment_field[:, 1] = max.(0.0, innov_recruitment_matrix[:, 1] .* sigma_recruitment_$(key_str))
             for t in 2:M.t_N
-                local N_prev = population_field[:, t-1]
-                local D_prev = N_prev ./ areas
-                local K_density = K_$(key_str) ./ areas
-                
-                # 1. Stochastic Recruitment Process
-                local mean_recruitment = r_$(key_str) .* D_prev .* (1.0 .- D_prev ./ K_density) .* areas
-                recruitment_field[:, t] = exp.(log.(mean_recruitment .+ 1e-6) .+ innov_recruitment_matrix[:, t] .* sigma_recruitment_$(key_str))
-                
-                # 2. Population Dynamics Process
-                $(catch_logic_block)
-                local N_survived = (N_prev .- C_prev) .* exp.(-M_nat_$(key_str))
-                population_field[:, t] = max.(0.0, N_survived .+ recruitment_field[:, t] .+ innov_population_matrix[:, t] .* sigma_population_$(key_str))
+                local N_prev = population_field[:, t-1]; local D_prev = N_prev ./ areas; local K_density = K_$(key_str) ./ areas
+                local mean_recruitment = r_$(key_str) .* D_prev .* (1.0 .- D_prev ./ K_density) .* areas; recruitment_field[:, t] = exp.(log.(mean_recruitment .+ 1e-6) .+ innov_recruitment_matrix[:, t] .* sigma_recruitment_$(key_str))
+                $(exploitation_block)
+                local N_survived = (N_prev .- C_prev) .* exp.(-M_nat_$(key_str)); population_field[:, t] = max.(0.0, N_survived .+ recruitment_field[:, t] .+ innov_population_matrix[:, t] .* sigma_population_$(key_str))
             end
-
-            # Add effects to the respective linear predictors
-            for i in 1:N
-                s_i, t_i = M.s_idx[i], M.t_idx[i]
-                eta_latent[i, 1] += log(population_field[s_i, t_i] + 1e-6)  # Outcome 1: Population
-                eta_latent[i, 2] += log(recruitment_field[s_i, t_i] + 1e-6) # Outcome 2: Recruitment
-            end
+            for i in 1:N; s_i, t_i = M.s_idx[i], M.t_idx[i]; eta_latent[i, 1] += log(population_field[s_i, t_i] + 1e-6); eta_latent[i, 2] += log(recruitment_field[s_i, t_i] + 1e-6); end
         end
         """
         return (priors=priors_str, update=update_str)
 
      elseif model_type == "generalized_lotka_volterra"
-        spatially_varying_K = get(params, :spatially_varying_K, false)
-        priors_acc = []
-
-        # Priors for growth rates, interaction matrix, and K
-        push!(priors_acc, "r_$(key_str) ~ NamedDist(filldist(LogNormal(0, 1), $(n_species)), :r_$(key_str))")
-        
-        n_off_diag = n_species * (n_species - 1)
-        push!(priors_acc, "alpha_raw_$(key_str) ~ NamedDist(MvNormal(zeros(T, $(n_off_diag)), I), :alpha_raw_$(key_str))")
-
-        if spatially_varying_K
-            push!(priors_acc, "log_K_mean_$(key_str) ~ NamedDist(filldist(Normal(log(100.0), 1.0), $(n_species)), :log_K_mean_$(key_str))")
-            push!(priors_acc, "sigma_K_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_species)), :sigma_K_$(key_str))")
-            push!(priors_acc, "K_raw_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * $(n_species)), I), :K_raw_$(key_str))")
-        else
-            push!(priors_acc, "K_$(key_str) ~ NamedDist(filldist(LogNormal(log(100.0), 1.0), $(n_species)), :K_$(key_str))")
-        end
-
-        # Priors for process noise
-        push!(priors_acc, "sigma_process_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_species)), :sigma_process_$(key_str))")
-        push!(priors_acc, "innov_process_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N * $(n_species)), I), :innov_process_$(key_str))")
-        priors_str = join(priors_acc, "\n    ")
-
+        spatially_varying_K = get(params, :spatially_varying_K, false); priors_acc = []; push!(priors_acc, "r_$(key_str) ~ NamedDist(filldist(LogNormal(0, 1), $(n_species)), :r_$(key_str))"); n_off_diag = n_species * (n_species - 1); push!(priors_acc, "alpha_raw_$(key_str) ~ NamedDist(MvNormal(zeros(T, $(n_off_diag)), I), :alpha_raw_$(key_str))")
+        if spatially_varying_K; push!(priors_acc, "log_K_mean_$(key_str) ~ NamedDist(filldist(Normal(log(100.0), 1.0), $(n_species)), :log_K_mean_$(key_str))"); push!(priors_acc, "sigma_K_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_species)), :sigma_K_$(key_str))"); push!(priors_acc, "K_raw_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * $(n_species)), I), :K_raw_$(key_str))"); else; push!(priors_acc, "K_$(key_str) ~ NamedDist(filldist(LogNormal(log(100.0), 1.0), $(n_species)), :K_$(key_str))"); end
+        push!(priors_acc, "sigma_process_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_species)), :sigma_process_$(key_str))"); push!(priors_acc, "innov_process_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N * $(n_species)), I), :innov_process_$(key_str))"); priors_str = join(priors_acc, "\n    ")
         update_str = """
         begin
-            # Generalized Lotka-Volterra Dynamics for $(key_str)
-            local areas = spec_registry["$(key_str)"].hyper.areas
-            
-            # Construct interaction matrix alpha
-            local alpha_$(key_str) = diagm(0 => ones(T, $(n_species)))
-            local off_diag_indices = [i for i in 1:($(n_species)^2) if mod(i-1, $(n_species)+1) != 0]
-            alpha_$(key_str)[off_diag_indices] = alpha_raw_$(key_str)
-
-            # Construct K field
-            local K_values_$(key_str)
-            if $(spatially_varying_K)
-                local Q_spatial = spec_registry["$(key_str)"].hyper.L_template
-                local F_spatial = cholesky(Symmetric(Q_spatial + noise * I))
-                local K_raw_matrix = reshape(K_raw_$(key_str), M.s_N, $(n_species))
-                local K_field = F_spatial.U \\ K_raw_matrix
-                K_values_$(key_str) = exp.(log_K_mean_$(key_str)' .+ K_field .* sigma_K_$(key_str)')
-            else
-                K_values_$(key_str) = repeat(K_$(key_str)', M.s_N, 1)
-            end
-
-            local innov_tensor = reshape(innov_process_$(key_str), M.s_N, M.t_N, $(n_species))
-            local population_field = zeros(T, M.s_N, M.t_N, $(n_species))
-            population_field[:, 1, :] = max.(0.0, innov_tensor[:, 1, :] .* sigma_process_$(key_str)')
-
+            local areas = spec_registry["$(key_str)"].hyper.areas; local alpha_$(key_str) = diagm(0 => ones(T, $(n_species))); local off_diag_indices = [i for i in 1:($(n_species)^2) if mod(i-1, $(n_species)+1) != 0]; alpha_$(key_str)[off_diag_indices] = alpha_raw_$(key_str)
+            local K_values_$(key_str); if $(spatially_varying_K); local Q_spatial = spec_registry["$(key_str)"].hyper.L_template; local F_spatial = cholesky(Symmetric(Q_spatial + noise * I)); local K_raw_matrix = reshape(K_raw_$(key_str), M.s_N, $(n_species)); local K_field = F_spatial.U \\ K_raw_matrix; K_values_$(key_str) = exp.(log_K_mean_$(key_str)' .+ K_field .* sigma_K_$(key_str)'); else; K_values_$(key_str) = repeat(K_$(key_str)', M.s_N, 1); end
+            local innov_tensor = reshape(innov_process_$(key_str), M.s_N, M.t_N, $(n_species)); local population_field = zeros(T, M.s_N, M.t_N, $(n_species)); population_field[:, 1, :] = max.(0.0, innov_tensor[:, 1, :] .* sigma_process_$(key_str)')
             for s in 1:M.s_N, t in 2:M.t_N
-                local N_prev = view(population_field, s, t-1, :)
-                local D_prev = N_prev ./ areas[s]
-                local K_density = K_values_$(key_str)[s, :] ./ areas[s]
-                
-                local N_intermediate = zeros(T, $(n_species))
-                for i in 1:$(n_species)
-                    local interaction_sum_density = dot(alpha_$(key_str)[i, :], D_prev)
-                    local growth_density = r_$(key_str)[i] * D_prev[i] * (1.0 - interaction_sum_density / K_density[i])
-                    N_intermediate[i] = N_prev[i] + growth_density * areas[s]
-                end
-                
-                local current_innov = view(innov_tensor, s, t, :) .* sigma_process_$(key_str)
-                population_field[s, t, :] = max.(0.0, N_intermediate .+ current_innov)
+                local N_prev = view(population_field, s, t-1, :); local D_prev = N_prev ./ areas[s]; local K_density = K_values_$(key_str)[s, :] ./ areas[s]; local N_intermediate = zeros(T, $(n_species))
+                for i in 1:$(n_species); local interaction_sum_density = dot(alpha_$(key_str)[i, :], D_prev); local growth_density = r_$(key_str)[i] * D_prev[i] * (1.0 - interaction_sum_density / K_density[i]); N_intermediate[i] = N_prev[i] + growth_density * areas[s]; end
+                local current_innov = view(innov_tensor, s, t, :) .* sigma_process_$(key_str); population_field[s, t, :] = max.(0.0, N_intermediate .+ current_innov)
             end
-
-            for k in 1:$(n_species)
-                for i in 1:N
-                    eta_latent[i, k] += log(population_field[M.s_idx[i], M.t_idx[i], k] + 1e-6)
-                end
-            end
+            for k in 1:$(n_species); for i in 1:N; eta_latent[i, k] += log(population_field[M.s_idx[i], M.t_idx[i], k] + 1e-6); end; end
         end
         """
         return (priors=priors_str, update=update_str)
@@ -11159,6 +11163,7 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
     
     return (priors="", update="")
 end
+
 
 
 function _generate_component_code_fragments(m::SVAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="", generate_eta_update::Bool=true)
@@ -12827,14 +12832,65 @@ end
 
 function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     # Purpose: Reconstructs the effect of the DynamicsComponent.
-    # Rationale: This version adds new branches to handle the multivariate `leslie_matrix`,
-    #            `delay_difference`, and `generalized_lotka_volterra` models,
-    #            ensuring their joint dynamics are correctly reconstructed during posterior simulation.
-    # v1.1.9 (2026-08-01)
+    # Rationale: This version is updated to handle the consolidated `logistic` model, the removal of `leslie_logistic`,
+    #            and the standardized `effort`/`removal` parameters for all biological models.
+    # v1.2.0 (2026-08-01)
     model_type = m_obj.model
     key = string(spec.key)
+
+    if model_type == "generalized_leslie_matrix"
+        if outcomes_N <= 1; error("Generalized Leslie matrix reconstruction requires a multivariate model."); end
+        
+        n_classes = get(m_obj.params, :n_classes, outcomes_N)
+        spatially_varying_K = get(m_obj.params, :spatially_varying_K, false)
+        spatially_varying_rates = get(m_obj.params, :spatially_varying_rates, false)
+        
+        sigma_process_samples = get_params_vector(chain, "sigma_process_$(key)", n_classes)
+        innov_samples = get_params_vector(chain, "innov_process_$(key)", M.s_N * M.t_N * n_classes)
+        areas = spec.hyper.areas
+        noise = get(M, :noise, 1e-6)
+        L = spec.hyper.L_template
+        F_spatial = cholesky(Symmetric(L + noise * I))
+
+        local K_samples, A_samples
+        if spatially_varying_K; sigma_K_samples = get_params_vector(chain, "sigma_K_$(key)", 1)[:, 1]; log_K_mean_samples = get_params_vector(chain, "log_K_mean_$(key)", 1)[:, 1]; K_raw_samples = get_params_vector(chain, "K_raw_$(key)", M.s_N); else K_samples = get_params_vector(chain, "K_$(key)", 1)[:, 1]; end
+        if spatially_varying_rates; A_mean_samples = get_params_vector(chain, "A_mean_$(key)", n_classes^2); A_sigma_samples = get_params_vector(chain, "A_sigma_$(key)", n_classes^2); A_raw_samples = get_params_vector(chain, "A_raw_$(key)", M.s_N * n_classes^2); else A_samples = get_params_vector(chain, "A_flat_$(key)", n_classes^2); end
+        
+        effort_keys = get(spec.hyper, :effort_keys, [])
+        q_samples_dict = Dict(key => get_params_vector(chain, "q_$(key)", n_classes) for key in effort_keys)
+        removal_keys = get(spec.hyper, :removal_keys, [])
+
+        class_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:n_classes]
+        s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
+        t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx
+
+        for j in 1:n_samples
+            local K_values_j, A_spatial_j
+            if spatially_varying_K; K_field_raw = F_spatial.U \ K_raw_samples[j, :]; K_field_raw .-= mean(K_field_raw); K_values_j = exp.(log_K_mean_samples[j] .+ K_field_raw .* sigma_K_samples[j]); else K_values_j = fill(K_samples[j], M.s_N); end
+            if spatially_varying_rates; A_raw_matrix = reshape(A_raw_samples[j, :], M.s_N, n_classes^2); A_field = F_spatial.U \ A_raw_matrix; A_spatial_j = exp.(A_mean_samples[j, :]' .+ A_field .* A_sigma_samples[j, :]'); else A_spatial_j = reshape(A_samples[j, :], n_classes, n_classes); end
+
+            innov_tensor_j = reshape(innov_samples[j, :], M.s_N, M.t_N, n_classes)
+            sigma_j = sigma_process_samples[j, :]
+            population_field_j = zeros(Float64, M.s_N, M.t_N, n_classes)
+            for c in 1:n_classes; population_field_j[:, 1, c] = max.(0.0, innov_tensor_j[:, 1, c] .* sigma_j[c]); end
+
+            for s in 1:M.s_N
+                A_s = spatially_varying_rates ? reshape(A_spatial_j[s, :], n_classes, n_classes) : A_spatial_j
+                for t in 2:M.t_N
+                    N_prev = view(population_field_j, s, t-1, :); C_prev = zeros(n_classes)
+                    for e_key in effort_keys; C_prev .+= q_samples_dict[e_key][j, :] .* spec.hyper.processed_params[e_key][s, t-1] .* N_prev; end
+                    for r_key in removal_keys; C_prev .+= spec.hyper.processed_params[r_key][s, t-1, :]; end
+                    N_after_removal = max.(0.0, N_prev - C_prev); A_effective = copy(A_s)
+                    if haskey(m_obj.params, :K) || spatially_varying_K; total_pop_prev = sum(N_after_removal); dd_factor = max(0.0, 1.0 - total_pop_prev / K_values_j[s]); A_effective[1, :] .*= dd_factor; end
+                    N_projected = A_effective * N_after_removal; current_innov = view(innov_tensor_j, s, t, :) .* sigma_j; population_field_j[s, t, :] = max.(0.0, N_projected .+ current_innov)
+                end
+            end
+            
+            for c in 1:n_classes; log_pop_field = log.(view(population_field_j, :, :, c) .+ 1e-6); for i in 1:N_tot; class_effects[c][i, j] = log_pop_field[s_idx_full[i], t_idx_full[i]]; end; end
+        end
+        return (structured=class_effects, noisy=class_effects)
     
-    if model_type == "leslie_matrix"
+    elseif model_type == "leslie_matrix"
         if outcomes_N <= 1; error("Leslie matrix reconstruction requires a multivariate model."); end
 
         n_age_classes = get(m_obj.params, :n_age_classes, outcomes_N)
@@ -12851,6 +12907,10 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
         local K_samples, survival_samples, fecundity_samples
         if spatially_varying_K; sigma_K_samples = get_params_vector(chain, "sigma_K_$(key)", 1)[:, 1]; log_K_mean_samples = get_params_vector(chain, "log_K_mean_$(key)", 1)[:, 1]; K_raw_samples = get_params_vector(chain, "K_raw_$(key)", M.s_N); else K_samples = get_params_vector(chain, "K_$(key)", 1)[:, 1]; end
         if spatially_varying_rates; log_fecundity_mean_samples = get_params_vector(chain, "log_fecundity_mean_$(key)", n_age_classes); sigma_fecundity_samples = get_params_vector(chain, "sigma_fecundity_$(key)", n_age_classes); fecundity_raw_samples = get_params_vector(chain, "fecundity_raw_$(key)", M.s_N * n_age_classes); logit_survival_mean_samples = get_params_vector(chain, "logit_survival_mean_$(key)", n_age_classes - 1); sigma_survival_samples = get_params_vector(chain, "sigma_survival_$(key)", n_age_classes - 1); survival_raw_samples = get_params_vector(chain, "survival_raw_$(key)", M.s_N * (n_age_classes - 1)); else survival_samples = get_params_vector(chain, "survival_rates_$(key)", n_age_classes - 1); fecundity_samples = get_params_vector(chain, "fecundity_rates_$(key)", n_age_classes); end
+        
+        effort_keys = get(spec.hyper, :effort_keys, [])
+        q_samples_dict = Dict(key => get_params_vector(chain, "q_$(key)", n_age_classes) for key in effort_keys)
+        removal_keys = get(spec.hyper, :removal_keys, [])
 
         age_class_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:n_age_classes]
 
@@ -12890,11 +12950,23 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
 
                 for t in 2:M.t_N
                     N_prev = view(population_field_j, s, t-1, :)
+                    C_prev = zeros(n_age_classes)
+                    for key in effort_keys
+                        C_prev .+= q_samples_dict[key][j, :] .* spec.hyper.processed_params[key][s, t-1] .* N_prev
+                    end
+                    for key in removal_keys
+                        C_prev .+= spec.hyper.processed_params[key][s, t-1, :]
+                    end
+                    N_after_removal = max.(0.0, N_prev - C_prev)
+                    
                     L_effective = copy(L_s)
                     if spatially_varying_K || haskey(m_obj.params, :K)
-                        total_pop_prev = sum(N_prev); K_density = K_values[s] / areas[s]; dd_factor = max(0.0, 1.0 - (total_pop_prev / areas[s]) / K_density); L_effective[1, :] .*= dd_factor
+                        total_pop_prev = sum(N_after_removal)
+                        K_density = K_values[s] / areas[s]
+                        dd_factor = max(0.0, 1.0 - (total_pop_prev / areas[s]) / K_density)
+                        L_effective[1, :] .*= dd_factor
                     end
-                    N_projected = L_effective * N_prev
+                    N_projected = L_effective * N_after_removal
                     current_innov = view(innov_tensor_j, s, t, :) .* sigma_j
                     population_field_j[s, t, :] = max.(0.0, N_projected .+ current_innov)
                 end
@@ -12905,7 +12977,6 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
         return (structured=age_class_effects, noisy=age_class_effects)
 
     elseif model_type == "delay_difference" && M.outcomes_N > 1
-        # Multivariate delay_difference reconstruction
         r_samples = get_params_vector(chain, "r_$(key)", 1)[:, 1]
         K_samples = get_params_vector(chain, "K_$(key)", 1)[:, 1]
         M_nat_samples = get_params_vector(chain, "M_nat_$(key)", 1)[:, 1]
@@ -12916,15 +12987,9 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
         
         areas = spec.hyper.areas
         
-        local effort_matrix, q_samples, catch_data_matrix
-        if haskey(m_obj.params, :effort_col)
-            effort_col_sym = m_obj.params[:effort_col]
-            effort_matrix = spec.hyper.processed_params[effort_col_sym]
-            q_samples = get_params_vector(chain, "q_$(key)", 1)[:, 1]
-        elseif haskey(m_obj.params, :catch_data_col)
-            catch_data_col_sym = m_obj.params[:catch_data_col]
-            catch_data_matrix = spec.hyper.processed_params[catch_data_col_sym]
-        end
+        effort_keys = get(spec.hyper, :effort_keys, [])
+        q_samples_dict = Dict(key => get_params_vector(chain, "q_$(key)", 1)[:, 1] for key in effort_keys)
+        removal_keys = get(spec.hyper, :removal_keys, [])
 
         pop_effects = zeros(Float64, N_tot, n_samples)
         rec_effects = zeros(Float64, N_tot, n_samples)
@@ -12949,13 +13014,12 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
                 mean_recruitment = r_samples[j] .* D_prev .* (1.0 .- D_prev ./ K_density) .* areas
                 recruitment_field[:, t] = exp.(log.(mean_recruitment .+ 1e-6) .+ innov_rec_matrix[:, t] .* sigma_rec_samples[j])
                 
-                local C_prev
-                if haskey(m_obj.params, :effort_col)
-                    C_prev = q_samples[j] .* effort_matrix[:, t-1] .* N_prev
-                elseif haskey(m_obj.params, :catch_data_col)
-                    C_prev = catch_data_matrix[:, t-1]
-                else
-                    C_prev = 0.0
+                C_prev = zeros(M.s_N)
+                for e_key in effort_keys
+                    C_prev .+= q_samples_dict[e_key][j] .* spec.hyper.processed_params[e_key][:, t-1] .* N_prev
+                end
+                for r_key in removal_keys
+                    C_prev .+= spec.hyper.processed_params[r_key][:, t-1]
                 end
 
                 N_survived = (N_prev .- C_prev) .* exp.(-M_nat_samples[j])
@@ -12969,7 +13033,8 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
             end
         end
         return (structured=[pop_effects, rec_effects], noisy=[pop_effects, rec_effects])
-            elseif model_type == "generalized_lotka_volterra"
+
+    elseif model_type == "generalized_lotka_volterra"
         n_species = M.outcomes_N
         spatially_varying_K = get(m_obj.params, :spatially_varying_K, false)
         
@@ -13080,45 +13145,25 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
             end
             push!(structured_effects, effect_k)
 
-        elseif model_type in ["logistic_basic", "logistic_exploitation", "delay_difference", "leslie_logistic", "lotka_volterra"]
+        elseif model_type in ["logistic", "delay_difference", "lotka_volterra"]
             sigma_samples = get_params_vector(chain, string(v.sigma), 1)[:, 1]
             innov_samples = get_params_vector(chain, string(v.innov), M.s_N * M.t_N)
             areas = spec.hyper.areas
 
             local K_samples, r_samples
             if spatially_varying_K; sigma_K_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "sigma_K", k), 1)[:, 1]; log_K_mean_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "log_K_mean", k), 1)[:, 1]; K_raw_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "K_raw", k), M.s_N); F_K = cholesky(Symmetric(L + noise * I)); else K_samples = get_params_vector(chain, string(v.K), 1)[:, 1]; end
-            if spatially_varying_r; sigma_r_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "sigma_r", k), 1)[:, 1]; log_r_mean_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "log_r_mean", k), 1)[:, 1]; r_raw_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "r_raw", k), M.s_N); F_r = cholesky(Symmetric(L + noise * I)); elseif model_type != "leslie_logistic"; r_samples = get_params_vector(chain, string(v.r), 1)[:, 1]; end
+            if spatially_varying_r; sigma_r_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "sigma_r", k), 1)[:, 1]; log_r_mean_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "log_r_mean", k), 1)[:, 1]; r_raw_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "r_raw", k), M.s_N); F_r = cholesky(Symmetric(L + noise * I)); else r_samples = get_params_vector(chain, string(v.r), 1)[:, 1]; end
 
-            local q_samples, effort_matrix
-            if model_type == "logistic_exploitation"
-                if haskey(m_obj.params, :effort_col) || haskey(m_obj.params, :effort)
-                    q_samples = get_params_vector(chain, string(v.q), 1)[:, 1]
-                    effort_col_sym = get(m_obj.params, :effort_col, :effort)
-                    effort_matrix = spec.hyper.processed_params[effort_col_sym]
-                else
-                    q_samples = nothing
-                    effort_matrix = nothing
-                end
-            elseif model_type == "delay_difference" && (haskey(m_obj.params, :effort_col) || haskey(m_obj.params, :effort))
-                q_samples = get_params_vector(chain, string(v.q), 1)[:, 1]
-                effort_col_sym = get(m_obj.params, :effort_col, :effort)
-                effort_matrix = spec.hyper.processed_params[effort_col_sym]
-            else
-                q_samples = nothing
-                effort_matrix = nothing
-            end
-
-            catch_data_col_sym = get(m_obj.params, :catch_data_col, nothing)
-            catch_data_matrix = if !isnothing(catch_data_col_sym); spec.hyper.processed_params[catch_data_col_sym]; else nothing; end
+            effort_keys = get(spec.hyper, :effort_keys, [])
+            q_samples_dict = Dict(key => get_params_vector(chain, "q_$(key)", 1)[:, 1] for key in effort_keys)
+            removal_keys = get(spec.hyper, :removal_keys, [])
+            
             M_nat_samples = model_type == "delay_difference" ? get_params_vector(chain, string(v.M_nat), 1)[:, 1] : nothing
-            survival_samples = model_type == "leslie_logistic" ? get_params_vector(chain, "survival_rates", m_obj.params[:n_age_classes] - 1) : nothing
-            fecundity_samples = model_type == "leslie_logistic" ? get_params_vector(chain, "fecundity_rates", m_obj.params[:n_age_classes]) : nothing
-            n_age_classes = model_type == "leslie_logistic" ? m_obj.params[:n_age_classes] : 0
 
             for j in 1:n_samples
                 local K_values, r_values
                 if spatially_varying_K; K_field_raw = F_K.U \ K_raw_samples[j, :]; K_field_raw .-= mean(K_field_raw); K_values = exp.(log_K_mean_samples[j] .+ K_field_raw .* sigma_K_samples[j]); else K_values = K_samples[j]; end
-                if spatially_varying_r; r_field_raw = F_r.U \ r_raw_samples[j, :]; r_field_raw .-= mean(r_field_raw); r_values = exp.(log_r_mean_samples[j] .+ r_field_raw .* sigma_r_samples[j]); elseif model_type != "leslie_logistic"; r_values = r_samples[j]; end
+                if spatially_varying_r; r_field_raw = F_r.U \ r_raw_samples[j, :]; r_field_raw .-= mean(r_field_raw); r_values = exp.(log_r_mean_samples[j] .+ r_field_raw .* sigma_r_samples[j]); else r_values = r_samples[j]; end
 
                 dyn_field = zeros(Float64, M.s_N, M.t_N)
                 innov_matrix = reshape(innov_samples[j, :], M.s_N, M.t_N)
@@ -13129,21 +13174,26 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
                     D_prev = N_prev ./ areas
                     K_density = K_values ./ areas
                     
-                    local growth
-                    if model_type == "leslie_logistic"
-                        L_mat = zeros(n_age_classes, n_age_classes); for i in 1:(n_age_classes-1); L_mat[i+1, i] = survival_samples[j, i]; end; L_mat[1, :] = fecundity_samples[j, :]; r_leslie = log(maximum(abs.(eigen(L_mat).values))); growth = r_leslie .* D_prev .* (1.0 .- D_prev ./ K_density)
-                    else; growth = r_values .* D_prev .* (1.0 .- D_prev ./ K_density); end
+                    local growth = r_values .* D_prev .* (1.0 .- D_prev ./ K_density)
                     
                     local N_intermediate
-                    if model_type == "logistic_basic" || model_type == "leslie_logistic"; N_intermediate = N_prev .+ (growth .* areas)
-                    elseif model_type == "logistic_exploitation"
-                        exploitation = if !isnothing(effort_matrix); q_samples[j] .* effort_matrix[:, t] .* N_prev; else 0.0; end
+                    if model_type == "logistic"
+                        exploitation = zeros(M.s_N)
+                        for e_key in effort_keys
+                            exploitation .+= q_samples_dict[e_key][j] .* spec.hyper.processed_params[e_key][:, t] .* N_prev
+                        end
+                        for r_key in removal_keys
+                            exploitation .+= spec.hyper.processed_params[r_key][:, t]
+                        end
                         N_intermediate = N_prev .+ (growth .* areas) .- exploitation
                     elseif model_type == "delay_difference"
-                        local C_prev
-                        if !isnothing(effort_matrix); C_prev = q_samples[j] .* effort_matrix[:, t-1] .* N_prev;
-                        elseif !isnothing(catch_data_matrix); C_prev = catch_data_matrix[:, t-1];
-                        else; C_prev = 0.0; end
+                        C_prev = zeros(M.s_N)
+                        for e_key in effort_keys
+                            C_prev .+= q_samples_dict[e_key][j] .* spec.hyper.processed_params[e_key][:, t-1] .* N_prev
+                        end
+                        for r_key in removal_keys
+                            C_prev .+= spec.hyper.processed_params[r_key][:, t-1]
+                        end
                         N_intermediate = (N_prev .+ (growth .* areas) .- C_prev) .* exp(-M_nat_samples[j])
                     end
                     
@@ -13157,6 +13207,7 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
     end
     return (structured=structured_effects, noisy=structured_effects)
 end
+
 
 
 
@@ -13560,44 +13611,20 @@ function extract_component(m_obj::ComposedComponent, chain, M, n_samples, outcom
     # Purpose: Reconstructs effects from composed components (`|>`, `∘`, `⊗`).
     # Rationale: This function was incomplete. This version correctly implements reconstruction
     #            for all supported composition types, mirroring their generative logic.
+    # v1.0.1 (2026-07-29)
+    # Inputs/Outputs: Standard reconstruction arguments.
     op = m_obj.operator 
     key = string(spec.key)
     N_tot = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
 
     if op == :composition
-        # Handles non-stationary variance: base_effect * modifier_effect
-        base_component_obj = m_obj.components[1]
-        modifier_component_obj = m_obj.components[2]
-        base_spec = spec.hyper.base_spec
-        
-        # Find the modifier spec in the main component list using a heuristic key match.
-        modifier_key_str = replace(string(key), "composition" => "smooth")
-        modifier_spec_idx = findfirst(s -> string(s.key) == modifier_key_str, M.components)
-        
-        if isnothing(modifier_spec_idx)
-            @warn "Could not find modifier spec for composition component '$(key)'. Returning zero effect."
-            return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
+        # This is now handled by the NonStationaryVariance extractor.
+        # This logic is a fallback in case the component was not correctly re-typed.
+        @warn "Reconstruction for generic composition is not fully supported. Assuming NonStationaryVariance structure."
+        if m_obj isa NonStationaryVariance
+            return extract_component(m_obj, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
         end
-        modifier_spec = M.components[modifier_spec_idx]
 
-        # Recursively reconstruct both components.
-        base_effects_result = extract_component(base_component_obj, chain, M, n_samples, outcomes_N, p_names, base_spec, PS, N_tot)
-        modifier_effects_result = extract_component(modifier_component_obj, chain, M, n_samples, outcomes_N, p_names, modifier_spec, PS, N_tot)
-
-        all_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
-        for k in 1:outcomes_N
-            # The modifier effect is the log-sigma field. We exponentiate it.
-            log_sigma_field = modifier_effects_result.structured[k]
-            spatially_varying_sigma = exp.(log_sigma_field)
-            
-            # The base effect is the underlying spatial field.
-            base_field = base_effects_result.structured[k]
-            
-            # The final effect is the product.
-            all_effects[k] = base_field .* spatially_varying_sigma
-        end
-        return (structured=all_effects, noisy=all_effects)
-    
     elseif op == :kronecker_product && haskey(M, :model_st) && M.model_st != "none"
         # Handles spatiotemporal interactions.
         spatial_comp_obj = m_obj.components[1]
@@ -13698,6 +13725,8 @@ function extract_component(m_obj::ComposedComponent, chain, M, n_samples, outcom
     @warn "Reconstruction for ComposedComponent with operator ':$op' is not implemented. Returning zero-effect for '$(key)'."
     return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
 end
+
+
 
 
 
