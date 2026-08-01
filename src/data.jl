@@ -551,7 +551,6 @@ function generate_logistic_exploitation_data(; s_N=10, t_N=5, n_obs_per_st_unit=
     df.y = repeat(vec(y_sim'), inner=n_obs_per_st_unit)
     return df, W, grid_areas
 end
-
 function generate_delay_difference_data(; s_N=10, t_N=10, n_obs_per_st_unit=1, seed=123, use_effort::Bool=false)
     # Purpose: Generates synthetic data for a multivariate delay-difference model.
     # Rationale: This version is updated to generate an `effort` covariate and use a
@@ -610,6 +609,8 @@ function generate_delay_difference_data(; s_N=10, t_N=10, n_obs_per_st_unit=1, s
     return df, W, grid_areas
 end
 
+
+
 function generate_glv_data(; s_N=10, t_N=10, n_species=3, n_obs_per_st_unit=1, seed=123)
     # Purpose: Generates synthetic data for a multivariate generalized Lotka-Volterra model.
     # Rationale: Provides a test case for the `dynamics(model=generalized_lotka_volterra)` model.
@@ -664,8 +665,6 @@ function generate_glv_data(; s_N=10, t_N=10, n_species=3, n_obs_per_st_unit=1, s
     
     return df, W, grid_areas, n_species
 end
- 
-
 
 function generate_lotka_volterra_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, seed=123)
     # Purpose: Generates synthetic data for a Lotka-Volterra prey-predator dynamics model.

@@ -1678,8 +1678,6 @@ end
 
 
 
-
-
 function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
     # Purpose: Generates a standardized set of variable names for a given component.
     # Rationale: This version is updated to include the full set of biological parameters
@@ -2007,11 +2005,10 @@ models the temporal evolution of the spatial field.
 """
 function _generate_component_code_fragments(m::DynamicsComponent, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
     # Purpose: Generates Turing code fragments for process-based `dynamics` models.
-    # Rationale: This version corrects a `MethodError` caused by a local variable `params`
-    #            shadowing the `Distributions.params` function. The call is now explicitly
-    #            qualified as `Distributions.params` to correctly extract parameters from
-    #            prior distributions.
-    # v1.1.3 (2026-07-31)
+    # Rationale: This version is updated to support both `effort` and `effort_col` for the
+    #            `logistic_exploitation` model, and defaults to zero exploitation if neither is provided.
+    #            It also ensures the `leslie_logistic` model errors if `n_age_classes` is not provided.
+    # v1.1.6 (2026-08-01)
 
     key_str = string(spec.key)
     prefixed_key = isempty(prefix) ? key_str : "$(prefix)_$(key_str)"
@@ -2026,7 +2023,7 @@ function _generate_component_code_fragments(m::DynamicsComponent, spec::NamedTup
 
     priors_acc = String[]
 
-    # Define priors for the dynamics parameters (biological and spatial transport)
+    # Priors for physical transport
     has_propagator = model_type in ["advection", "diffusion", "advection_diffusion"]
     if has_propagator
         if model_type in ["advection", "advection_diffusion"]
@@ -2068,15 +2065,19 @@ function _generate_component_code_fragments(m::DynamicsComponent, spec::NamedTup
             push!(priors_acc, "$(v.K) ~ NamedDist($(_distribution_to_string(K)), :$(v.K))")
         end
     end
-    if model_type == "logistic_exploitation"; q = get(params, :q, LogNormal(-2, 1)); push!(priors_acc, "$(v.q) ~ NamedDist($(_distribution_to_string(q)), :$(v.q))"); end
-    if model_type == "delay_difference"; M_nat = get(params, :M_nat, LogNormal(-1, 0.5)); push!(priors_acc, "$(v.M_nat) ~ NamedDist($(_distribution_to_string(M_nat)), :$(v.M_nat))"); end
+    
+    if model_type == "delay_difference"
+        M_nat = get(params, :M_nat, LogNormal(-1, 0.5)); push!(priors_acc, "$(v.M_nat) ~ NamedDist($(_distribution_to_string(M_nat)), :$(v.M_nat))")
+        if haskey(params, :effort_col) || haskey(params, :effort)
+            q = get(params, :q, LogNormal(-2, 1)); push!(priors_acc, "$(v.q) ~ NamedDist($(_distribution_to_string(q)), :$(v.q))")
+        end
+    end
     if model_type == "lotka_volterra"; alpha = get(params, :alpha, LogNormal(0, 1)); beta = get(params, :beta, LogNormal(-1, 1)); gamma = get(params, :gamma, LogNormal(-1, 1)); delta = get(params, :delta, LogNormal(0, 1)); push!(priors_acc, "$(v.alpha) ~ NamedDist($(_distribution_to_string(alpha)), :$(v.alpha))"); push!(priors_acc, "$(v.beta) ~ NamedDist($(_distribution_to_string(beta)), :$(v.beta))"); push!(priors_acc, "$(v.gamma) ~ NamedDist($(_distribution_to_string(gamma)), :$(v.gamma))"); push!(priors_acc, "$(v.delta) ~ NamedDist($(_distribution_to_string(delta)), :$(v.delta))"); push!(priors_acc, "$(v.innov)_predator ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :$(Symbol(string(v.innov, "_predator"))))"); end
     if model_type == "leslie_logistic"; n_classes = get(params, :n_age_classes, error("`leslie_logistic` model requires `n_age_classes` parameter.")); push!(priors_acc, "survival_rates ~ NamedDist(filldist(Beta(9, 1), $(n_classes-1)), :survival_rates)"); push!(priors_acc, "fecundity_rates ~ NamedDist(filldist(LogNormal(0, 1), $(n_classes)), :fecundity_rates)"); end
 
     innov_name = v.innov
     push!(priors_acc, "$(innov_name) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :$(innov_name))")
-    priors_str = join(priors_acc, "\n    ")
-
+    
     eta_update_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     L_op = "spec_registry[\"$(key_str)\"].hyper.L_template"
@@ -2103,21 +2104,40 @@ function _generate_component_code_fragments(m::DynamicsComponent, spec::NamedTup
     propagator_logic = has_propagator ? "dyn_field[:, t] = (propagator \\ N_intermediate) .+ innov_matrix[:, t]" : "dyn_field[:, t] = N_intermediate .+ innov_matrix[:, t]"
 
     if model_type == "logistic_basic"; evolution_loop_body = "local areas = $(grid_areas_access)\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = $(r_variable_name) .* D_prev .* (1.0 .- D_prev ./ K_density)\n    local N_intermediate = N_prev .+ (growth .* areas)\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
-    elseif model_type == "logistic_exploitation"; evolution_loop_body = "local areas = $(grid_areas_access)\nlocal effort_matrix = spec_registry[\"$(key_str)\"].hyper.processed_params[:effort]\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = $(r_variable_name) .* D_prev .* (1.0 .- D_prev ./ K_density)\n    local exploitation = $(v.q) .* effort_matrix[:, t] .* N_prev\n    local N_intermediate = N_prev .+ (growth .* areas) .- exploitation\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
-    elseif model_type == "delay_difference"; catch_data_col_sym = spec.hyper.catch_data_col_sym; evolution_loop_body = "local areas = $(grid_areas_access)\nlocal catch_data_matrix = spec_registry[\"$(key_str)\"].hyper.processed_params[:$(catch_data_col_sym)]\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = $(r_variable_name) .* D_prev .* (1.0 .- D_prev ./ K_density)\n    local C_prev = catch_data_matrix[:, t-1]\n    local N_intermediate = (N_prev .+ (growth .* areas) .- C_prev) .* exp.(-$(v.M_nat))\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
+    elseif model_type == "logistic_exploitation"
+        local exploitation_logic
+        if haskey(params, :effort_col) || haskey(params, :effort)
+            q = get(params, :q, LogNormal(-2, 1)); push!(priors_acc, "$(v.q) ~ NamedDist($(_distribution_to_string(q)), :$(v.q))")
+            effort_col_sym = get(params, :effort_col, :effort)
+            exploitation_logic = "local effort_matrix = spec_registry[\"$(key_str)\"].hyper.processed_params[:$(effort_col_sym)]\n    local exploitation = $(v.q) .* effort_matrix[:, t] .* N_prev"
+        else
+            exploitation_logic = "local exploitation = 0.0"
+        end
+        evolution_loop_body = "local areas = $(grid_areas_access)\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = $(r_variable_name) .* D_prev .* (1.0 .- D_prev ./ K_density)\n    $(exploitation_logic)\n    local N_intermediate = N_prev .+ (growth .* areas) .- exploitation\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
+    elseif model_type == "delay_difference"
+        local catch_logic_block
+        if haskey(params, :effort_col)
+            effort_col_sym = params[:effort_col]
+            catch_logic_block = "local effort_matrix = spec_registry[\"$(key_str)\"].hyper.processed_params[:$(effort_col_sym)]\nlocal C_prev = $(v.q) .* effort_matrix[:, t-1] .* N_prev"
+        elseif haskey(params, :catch_data_col)
+            catch_data_col_sym = params[:catch_data_col]
+            catch_logic_block = "local catch_data_matrix = spec_registry[\"$(key_str)\"].hyper.processed_params[:$(catch_data_col_sym)]\nlocal C_prev = catch_data_matrix[:, t-1]"
+        else
+            catch_logic_block = "local C_prev = 0.0"
+        end
+        evolution_loop_body = "local areas = $(grid_areas_access)\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = $(r_variable_name) .* D_prev .* (1.0 .- D_prev ./ K_density)\n    $(catch_logic_block)\n    local N_intermediate = (N_prev .+ (growth .* areas) .- C_prev) .* exp.(-$(v.M_nat))\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
     elseif model_type == "lotka_volterra"; output_species = get(params, :output_species, :prey); interaction_cov_sym = get(params, :interaction_covariate, nothing); field_setup = "dyn_field_prey = zeros(T, M.s_N, M.t_N)\ndyn_field_predator = zeros(T, M.s_N, M.t_N)\ninnov_matrix_prey = reshape($(v.innov), M.s_N, M.t_N)\ninnov_matrix_predator = reshape($(v.innov)_predator, M.s_N, M.t_N)\ndyn_field_prey[:, 1] = innov_matrix_prey[:, 1]\ndyn_field_predator[:, 1] = innov_matrix_predator[:, 1]"; evolution_loop_body = "local predator_pop_matrix = if !isnothing(Symbol(\"$(interaction_cov_sym)\"))\n    spec_registry[\"$(key_str)\"].hyper.processed_params[:$(interaction_cov_sym)]\nelse\n    nothing\nend\nfor t in 2:M.t_N\n    local N_prey_prev = dyn_field_prey[:, t-1]\n    local N_pred_prev = isnothing(predator_pop_matrix) ? dyn_field_predator[:, t-1] : predator_pop_matrix[:, t-1]\n    local d_prey = ($(v.alpha) .* N_prey_prev) .- ($(v.beta) .* N_prey_prev .* N_pred_prev)\n    local d_pred = ($(v.gamma) .* N_prey_prev .* N_pred_prev) .- ($(v.delta) .* N_pred_prev)\n    dyn_field_prey[:, t] = max.(0.0, N_prey_prev .+ d_prey .+ innov_matrix_prey[:, t])\n    dyn_field_predator[:, t] = max.(0.0, N_pred_prev .+ d_pred .+ innov_matrix_predator[:, t])\nend\nlocal dyn_field = $(output_species == :prey ? "dyn_field_prey" : "dyn_field_predator")"
-    elseif model_type == "leslie_logistic"; n_classes = get(params, :n_age_classes, 1); evolution_loop_body = "local L = zeros(T, $(n_classes), $(n_classes))\nfor i in 1:($(n_classes)-1); L[i+1, i] = survival_rates[i]; end\nL[1, :] = fecundity_rates\nlocal r_leslie = log(maximum(abs.(eigen(L).values)))\nlocal areas = $(grid_areas_access)\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = r_leslie .* D_prev .* (1.0 .- D_prev ./ K_density)\n    local N_intermediate = N_prev .+ (growth .* areas)\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
+    elseif model_type == "leslie_logistic"; n_classes = get(params, :n_age_classes, error("`leslie_logistic` model requires `n_age_classes` parameter.")); evolution_loop_body = "local L = zeros(T, $(n_classes), $(n_classes))\nfor i in 1:($(n_classes)-1); L[i+1, i] = survival_rates[i]; end\nL[1, :] = fecundity_rates\nlocal r_leslie = log(maximum(abs.(eigen(L).values)))\nlocal areas = $(grid_areas_access)\nfor t in 2:M.t_N\n    local N_prev = dyn_field[:, t-1]\n    local D_prev = N_prev ./ areas\n    local K_density = $(K_variable_name) ./ areas\n    local growth = r_leslie .* D_prev .* (1.0 .- D_prev ./ K_density)\n    local N_intermediate = N_prev .+ (growth .* areas)\n    $(propagator_logic)\n    dyn_field[:, t] = max.(0.0, dyn_field[:, t])\nend"
     else; evolution_loop_body = "for t in 2:M.t_N\n    dyn_field[:, t] = (propagator \\ dyn_field[:, t-1]) + innov_matrix[:, t]\nend"; end
 
+    priors_str = join(priors_acc, "\n    ")
     update_str = "begin\n# Dynamics model: $(model_type) for $(key_str)\n$(K_setup_block)\n$(r_setup_block)\n$(propagator_setup)\n$(field_setup)\n$(evolution_loop_body)\ndyn_field .*= $(v.sigma)\nfor i in 1:N\n    $(eta_update_target)[i] += dyn_field[M.s_idx[i], M.t_idx[i]]\nend\nend"
     
     return (priors=priors_str, update=update_str)
 end
 
 
-
-
-
+ 
 
 """
     _generate_component_code_fragments(m::RFF, ...)
@@ -7449,6 +7469,7 @@ function build_model(m::DynamicsComponent, data_inputs::Dict, module_metadata::D
 end
 
 
+
  
 function build_model(m::TensorProductSmooth, data_inputs::Dict, module_metadata::Dict)
     hyper_dict = Dict{Symbol, Any}()
@@ -10852,15 +10873,16 @@ end
 
 function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedTuple, M::NamedTuple)
     # Purpose: Generates Turing code for multivariate dynamics models.
-    # Rationale: This version adds a new branch to handle the multivariate `delay_difference`
-    #            model, which treats population and recruitment as two separate, linked outcomes.
-    #            It also refactors the `leslie_matrix` logic to correctly handle the `haskey`
-    #            check for the optional carrying capacity parameter `K`.
-    # v1.0.5 (2026-07-31)
+    # Rationale: This version adds branches to handle the multivariate `leslie_matrix`,
+    #            `delay_difference`, and `generalized_lotka_volterra` models.
+    #            It includes support for spatially varying K and vital rates for leslie_matrix,
+    #            and dual catch/effort modes for delay_difference.
+    # v1.0.6 (2026-08-01)
     key_str = string(spec.key)
     params = m.params
     model_type = m.model
     prefixed_key = key_str
+    n_species = M.outcomes_N # For generalized_lotka_volterra
 
     if model_type == "leslie_matrix"
         n_age_classes = get(params, :n_age_classes, M.outcomes_N)
@@ -10872,18 +10894,24 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
         end
 
         priors_acc = []
+        # Priors for vital rates (scalar or spatial fields)
         if spatially_varying_rates
+            # Priors for spatially varying fecundity field
             push!(priors_acc, "log_fecundity_mean_$(key_str) ~ NamedDist(filldist(Normal(0, 1), $(n_age_classes)), :log_fecundity_mean_$(key_str))")
             push!(priors_acc, "sigma_fecundity_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_age_classes)), :sigma_fecundity_$(key_str))")
             push!(priors_acc, "fecundity_raw_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * $(n_age_classes)), I), :fecundity_raw_$(key_str))")
-            push!(priors_acc, "logit_survival_mean_$(key_str) ~ NamedDist(filldist(Normal(1.5, 1), $(n_age_classes-1)), :logit_survival_mean_$(key_str))")
+            
+            # Priors for spatially varying survival field
+            push!(priors_acc, "logit_survival_mean_$(key_str) ~ NamedDist(filldist(Normal(1.5, 1), $(n_age_classes-1)), :logit_survival_mean_$(key_str))") # Prior centered around high survival
             push!(priors_acc, "sigma_survival_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_age_classes-1)), :sigma_survival_$(key_str))")
             push!(priors_acc, "survival_raw_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * ($(n_age_classes)-1)), I), :survival_raw_$(key_str))")
         else
+            # Priors for scalar survival and fecundity
             push!(priors_acc, "survival_rates_$(key_str) ~ NamedDist(filldist(Beta(9, 1), $(n_age_classes - 1)), :survival_rates_$(key_str))")
             push!(priors_acc, "fecundity_rates_$(key_str) ~ NamedDist(filldist(LogNormal(0, 1), $(n_age_classes)), :fecundity_rates_$(key_str))")
         end
 
+        # Priors for K (scalar or spatial field)
         if haskey(params, :K) || spatially_varying_K
             if spatially_varying_K
                 sigma_K_prior = get(params, :sigma_K, Exponential(1.0))
@@ -10897,6 +10925,7 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
             end
         end
 
+        # Priors for process noise
         push!(priors_acc, "sigma_process_$(key_str) ~ NamedDist(filldist(Exponential(1.0), $(n_age_classes)), :sigma_process_$(key_str))")
         push!(priors_acc, "innov_process_$(key_str) ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N * $(n_age_classes)), I), :innov_process_$(key_str))")
         priors_str = join(priors_acc, "\n    ")
@@ -10924,7 +10953,7 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
             local K_values_$(key_str)
             if $(spatially_varying_K)
                 K_field_raw = F_spatial.U \\ K_raw_$(prefixed_key)
-                Turing.@addlogprob! logpdf(Normal(0, 0.001 * M.s_N), sum(K_field_raw))
+                Turing.@addlogprob! logpdf(Normal(0, 0.001 * M.s_N), sum(K_field_raw)) # Soft sum-to-zero constraint
                 K_values_$(key_str) = exp.(log_K_mean_$(prefixed_key) .+ K_field_raw .* sigma_K_$(prefixed_key))
             elseif haskey(spec_registry["$(key_str)"].component_obj.params, :K)
                 K_values_$(key_str) = fill(K_$(key_str), M.s_N)
@@ -10933,10 +10962,12 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
             local innov_tensor_$(key_str) = reshape(innov_process_$(key_str), M.s_N, M.t_N, $(n_age_classes))
             local population_field_$(key_str) = zeros(T, M.s_N, M.t_N, $(n_age_classes))
 
+            # Initialize first time step with scaled innovations, ensuring non-negativity
             for a in 1:$(n_age_classes)
                 population_field_$(key_str)[:, 1, a] = max.(0.0, innov_tensor_$(key_str)[:, 1, a] .* sigma_process_$(key_str)[a])
             end
 
+            # Evolve the system over time for each spatial cell
             for s in 1:M.s_N
                 local L_s = zeros(T, $(n_age_classes), $(n_age_classes))
                 if $(spatially_varying_rates)
@@ -10964,6 +10995,7 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
                 end
             end
 
+            # Add the log-transformed population state to the linear predictor eta_latent
             for k in 1:$(n_age_classes)
                 for i in 1:N
                     eta_latent[i, k] += log(population_field_$(key_str)[M.s_idx[i], M.t_idx[i], k] + 1e-6)
@@ -10989,8 +11021,6 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
         
         if haskey(params, :effort_col)
             push!(priors_acc, "q_$(key_str) ~ NamedDist(LogNormal(-2, 1), :q_$(key_str))")
-        elseif !haskey(params, :catch_data_col)
-            error("`delay_difference` model requires either `effort_col` or `catch_data_col` parameter.")
         end
         priors_str = join(priors_acc, "\n    ")
 
@@ -11001,12 +11031,14 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
             local effort_matrix = spec_registry["$(key_str)"].hyper.processed_params[:$(effort_col_sym)]
             local C_prev = q_$(key_str) .* effort_matrix[:, t-1] .* N_prev
             """
-        else
+        elseif haskey(params, :catch_data_col)
             catch_data_col_sym = params[:catch_data_col]
             catch_logic_block = """
             local catch_data_matrix = spec_registry["$(key_str)"].hyper.processed_params[:$(catch_data_col_sym)]
             local C_prev = catch_data_matrix[:, t-1]
             """
+        else
+            catch_logic_block = "local C_prev = 0.0"
         end
 
         update_str = """
@@ -11020,6 +11052,7 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
             local innov_recruitment_matrix = reshape(innov_recruitment_$(key_str), M.s_N, M.t_N)
             local innov_population_matrix = reshape(innov_population_$(key_str), M.s_N, M.t_N)
 
+            # Initialize fields at t=1, ensuring non-negativity
             population_field[:, 1] = max.(0.0, innov_population_matrix[:, 1] .* sigma_population_$(key_str))
             recruitment_field[:, 1] = max.(0.0, innov_recruitment_matrix[:, 1] .* sigma_recruitment_$(key_str))
 
@@ -11028,18 +11061,21 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
                 local D_prev = N_prev ./ areas
                 local K_density = K_$(key_str) ./ areas
                 
+                # 1. Stochastic Recruitment Process
                 local mean_recruitment = r_$(key_str) .* D_prev .* (1.0 .- D_prev ./ K_density) .* areas
                 recruitment_field[:, t] = exp.(log.(mean_recruitment .+ 1e-6) .+ innov_recruitment_matrix[:, t] .* sigma_recruitment_$(key_str))
                 
+                # 2. Population Dynamics Process
                 $(catch_logic_block)
                 local N_survived = (N_prev .- C_prev) .* exp.(-M_nat_$(key_str))
                 population_field[:, t] = max.(0.0, N_survived .+ recruitment_field[:, t] .+ innov_population_matrix[:, t] .* sigma_population_$(key_str))
             end
 
+            # Add effects to the respective linear predictors
             for i in 1:N
                 s_i, t_i = M.s_idx[i], M.t_idx[i]
-                eta_latent[i, 1] += log(population_field[s_i, t_i] + 1e-6)
-                eta_latent[i, 2] += log(recruitment_field[s_i, t_i] + 1e-6)
+                eta_latent[i, 1] += log(population_field[s_i, t_i] + 1e-6)  # Outcome 1: Population
+                eta_latent[i, 2] += log(recruitment_field[s_i, t_i] + 1e-6) # Outcome 2: Recruitment
             end
         end
         """
@@ -12791,17 +12827,19 @@ end
 
 function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
     # Purpose: Reconstructs the effect of the DynamicsComponent.
-    # Rationale: This version adds a new branch to handle the multivariate `delay_difference` model,
-    #            ensuring its joint dynamics are correctly reconstructed during posterior simulation.
-    #            It also restores the full logic for other biological and physical models.
-    # v1.1.8 (2026-07-31)
+    # Rationale: This version adds new branches to handle the multivariate `leslie_matrix`,
+    #            `delay_difference`, and `generalized_lotka_volterra` models,
+    #            ensuring their joint dynamics are correctly reconstructed during posterior simulation.
+    # v1.1.9 (2026-08-01)
     model_type = m_obj.model
     key = string(spec.key)
-     
+    
     if model_type == "leslie_matrix"
         if outcomes_N <= 1; error("Leslie matrix reconstruction requires a multivariate model."); end
 
         n_age_classes = get(m_obj.params, :n_age_classes, outcomes_N)
+        spatially_varying_K = get(m_obj.params, :spatially_varying_K, false)
+        spatially_varying_rates = get(m_obj.params, :spatially_varying_rates, false)
         
         sigma_samples = get_params_vector(chain, "sigma_process_$(key)", n_age_classes)
         innov_samples = get_params_vector(chain, "innov_process_$(key)", M.s_N * M.t_N * n_age_classes)
@@ -12815,6 +12853,7 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
         if spatially_varying_rates; log_fecundity_mean_samples = get_params_vector(chain, "log_fecundity_mean_$(key)", n_age_classes); sigma_fecundity_samples = get_params_vector(chain, "sigma_fecundity_$(key)", n_age_classes); fecundity_raw_samples = get_params_vector(chain, "fecundity_raw_$(key)", M.s_N * n_age_classes); logit_survival_mean_samples = get_params_vector(chain, "logit_survival_mean_$(key)", n_age_classes - 1); sigma_survival_samples = get_params_vector(chain, "sigma_survival_$(key)", n_age_classes - 1); survival_raw_samples = get_params_vector(chain, "survival_raw_$(key)", M.s_N * (n_age_classes - 1)); else survival_samples = get_params_vector(chain, "survival_rates_$(key)", n_age_classes - 1); fecundity_samples = get_params_vector(chain, "fecundity_rates_$(key)", n_age_classes); end
 
         age_class_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:n_age_classes]
+
         s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
         t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx
 
@@ -12833,8 +12872,11 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
 
             innov_tensor_j = reshape(innov_samples[j, :], M.s_N, M.t_N, n_age_classes)
             sigma_j = sigma_samples[j, :]
+
             population_field_j = zeros(Float64, M.s_N, M.t_N, n_age_classes)
-            for a in 1:n_age_classes; population_field_j[:, 1, a] = max.(0.0, innov_tensor_j[:, 1, a] .* sigma_j[a]); end
+            for a in 1:n_age_classes
+                population_field_j[:, 1, a] = max.(0.0, innov_tensor_j[:, 1, a] .* sigma_j[a])
+            end
 
             for s in 1:M.s_N
                 L_s = zeros(Float64, n_age_classes, n_age_classes)
@@ -12879,7 +12921,7 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
             effort_col_sym = m_obj.params[:effort_col]
             effort_matrix = spec.hyper.processed_params[effort_col_sym]
             q_samples = get_params_vector(chain, "q_$(key)", 1)[:, 1]
-        else
+        elseif haskey(m_obj.params, :catch_data_col)
             catch_data_col_sym = m_obj.params[:catch_data_col]
             catch_data_matrix = spec.hyper.processed_params[catch_data_col_sym]
         end
@@ -12907,7 +12949,15 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
                 mean_recruitment = r_samples[j] .* D_prev .* (1.0 .- D_prev ./ K_density) .* areas
                 recruitment_field[:, t] = exp.(log.(mean_recruitment .+ 1e-6) .+ innov_rec_matrix[:, t] .* sigma_rec_samples[j])
                 
-                C_prev = haskey(m_obj.params, :effort_col) ? (q_samples[j] .* effort_matrix[:, t-1] .* N_prev) : catch_data_matrix[:, t-1]
+                local C_prev
+                if haskey(m_obj.params, :effort_col)
+                    C_prev = q_samples[j] .* effort_matrix[:, t-1] .* N_prev
+                elseif haskey(m_obj.params, :catch_data_col)
+                    C_prev = catch_data_matrix[:, t-1]
+                else
+                    C_prev = 0.0
+                end
+
                 N_survived = (N_prev .- C_prev) .* exp.(-M_nat_samples[j])
                 population_field[:, t] = max.(0.0, N_survived .+ recruitment_field[:, t] .+ innov_pop_matrix[:, t] .* sigma_pop_samples[j])
             end
@@ -13030,7 +13080,7 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
             end
             push!(structured_effects, effect_k)
 
-        elseif model_type in ["logistic_basic", "logistic_exploitation", "delay_difference", "leslie_logistic"]
+        elseif model_type in ["logistic_basic", "logistic_exploitation", "delay_difference", "leslie_logistic", "lotka_volterra"]
             sigma_samples = get_params_vector(chain, string(v.sigma), 1)[:, 1]
             innov_samples = get_params_vector(chain, string(v.innov), M.s_N * M.t_N)
             areas = spec.hyper.areas
@@ -13039,9 +13089,25 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
             if spatially_varying_K; sigma_K_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "sigma_K", k), 1)[:, 1]; log_K_mean_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "log_K_mean", k), 1)[:, 1]; K_raw_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "K_raw", k), M.s_N); F_K = cholesky(Symmetric(L + noise * I)); else K_samples = get_params_vector(chain, string(v.K), 1)[:, 1]; end
             if spatially_varying_r; sigma_r_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "sigma_r", k), 1)[:, 1]; log_r_mean_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "log_r_mean", k), 1)[:, 1]; r_raw_samples = get_params_vector(chain, _find_parameter_new(p_names, key, "r_raw", k), M.s_N); F_r = cholesky(Symmetric(L + noise * I)); elseif model_type != "leslie_logistic"; r_samples = get_params_vector(chain, string(v.r), 1)[:, 1]; end
 
-            q_samples = if model_type in ["logistic_exploitation", "delay_difference"] && haskey(m_obj.params, :effort_col); get_params_vector(chain, string(v.q), 1)[:, 1]; else nothing; end
-            effort_col_sym = get(m_obj.params, :effort_col, nothing)
-            effort_matrix = if !isnothing(effort_col_sym); spec.hyper.processed_params[effort_col_sym]; else nothing; end
+            local q_samples, effort_matrix
+            if model_type == "logistic_exploitation"
+                if haskey(m_obj.params, :effort_col) || haskey(m_obj.params, :effort)
+                    q_samples = get_params_vector(chain, string(v.q), 1)[:, 1]
+                    effort_col_sym = get(m_obj.params, :effort_col, :effort)
+                    effort_matrix = spec.hyper.processed_params[effort_col_sym]
+                else
+                    q_samples = nothing
+                    effort_matrix = nothing
+                end
+            elseif model_type == "delay_difference" && (haskey(m_obj.params, :effort_col) || haskey(m_obj.params, :effort))
+                q_samples = get_params_vector(chain, string(v.q), 1)[:, 1]
+                effort_col_sym = get(m_obj.params, :effort_col, :effort)
+                effort_matrix = spec.hyper.processed_params[effort_col_sym]
+            else
+                q_samples = nothing
+                effort_matrix = nothing
+            end
+
             catch_data_col_sym = get(m_obj.params, :catch_data_col, nothing)
             catch_data_matrix = if !isnothing(catch_data_col_sym); spec.hyper.processed_params[catch_data_col_sym]; else nothing; end
             M_nat_samples = model_type == "delay_difference" ? get_params_vector(chain, string(v.M_nat), 1)[:, 1] : nothing
@@ -13070,8 +13136,16 @@ function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcom
                     
                     local N_intermediate
                     if model_type == "logistic_basic" || model_type == "leslie_logistic"; N_intermediate = N_prev .+ (growth .* areas)
-                    elseif model_type == "logistic_exploitation"; exploitation = q_samples[j] .* effort_matrix[:, t] .* N_prev; N_intermediate = N_prev .+ (growth .* areas) .- exploitation
-                    elseif model_type == "delay_difference"; C_prev = !isnothing(effort_matrix) ? (q_samples[j] .* effort_matrix[:, t-1] .* N_prev) : catch_data_matrix[:, t-1]; N_intermediate = (N_prev .+ (growth .* areas) .- C_prev) .* exp(-M_nat_samples[j]); end
+                    elseif model_type == "logistic_exploitation"
+                        exploitation = if !isnothing(effort_matrix); q_samples[j] .* effort_matrix[:, t] .* N_prev; else 0.0; end
+                        N_intermediate = N_prev .+ (growth .* areas) .- exploitation
+                    elseif model_type == "delay_difference"
+                        local C_prev
+                        if !isnothing(effort_matrix); C_prev = q_samples[j] .* effort_matrix[:, t-1] .* N_prev;
+                        elseif !isnothing(catch_data_matrix); C_prev = catch_data_matrix[:, t-1];
+                        else; C_prev = 0.0; end
+                        N_intermediate = (N_prev .+ (growth .* areas) .- C_prev) .* exp(-M_nat_samples[j])
+                    end
                     
                     dyn_field[:, t] = max.(0.0, N_intermediate .+ innov_matrix[:, t])
                 end
