@@ -487,3 +487,392 @@ function prepare_advanced_bstm_data()
 
     return df
 end
+
+
+
+function generate_logistic_basic_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, seed=123)
+    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
+    
+    # Simulate a simple population trajectory
+    initial_pop = rand(s_N) * 10.0 .+ 5.0 # Initial population per spatial unit
+    y_sim = zeros(s_N, t_N)
+    y_sim[:, 1] = initial_pop
+
+    r_true = 0.5
+    K_true = 100.0
+    
+    for t in 2:t_N
+        for s in 1:s_N
+            N_prev = y_sim[s, t-1]
+            D_prev = N_prev / grid_areas[s] # Convert to density
+            K_density = K_true / grid_areas[s] # Carrying capacity in density terms
+            growth = r_true * D_prev * (1.0 - D_prev / K_density)
+            y_sim[s, t] = max(0.0, N_prev + growth * grid_areas[s] + randn() * 2.0) # Convert growth back to total population, add noise
+        end
+    end
+    
+    # FIX: The `repeat` function for a matrix requires a tuple for the `inner` keyword.
+    # The correct logic is to flatten the simulation matrix in row-major order (to match the DataFrame structure)
+    # and then repeat each element.
+    df.y = repeat(vec(y_sim'), inner=n_obs_per_st_unit)
+    return df, W, grid_areas
+end
+
+function generate_logistic_exploitation_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, seed=123)
+    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
+    
+    # Add effort covariate
+    df.effort = rand(nrow(df)) * 0.5 .+ 0.1 # Random effort between 0.1 and 0.6
+    
+    # Re-simulate y with exploitation
+    y_sim = zeros(s_N, t_N)
+    initial_pop = rand(s_N) * 10.0 .+ 5.0
+    y_sim[:, 1] = initial_pop
+
+    r_true = 0.5
+    K_true = 100.0
+    q_true = 0.01 # Catchability
+    
+    for t in 2:t_N
+        for s in 1:s_N
+            N_prev = y_sim[s, t-1]
+            D_prev = N_prev / grid_areas[s]
+            K_density = K_true / grid_areas[s]
+            growth = r_true * D_prev * (1.0 - D_prev / K_density)
+            
+            # Get effort for this space-time unit (assuming effort is constant within a unit)
+            effort_st_unit = mean(df[(df.s_idx .== s) .& (df.year .== t), :effort])
+            exploitation = q_true * effort_st_unit * N_prev
+            
+            y_sim[s, t] = max(0.0, N_prev + growth * grid_areas[s] - exploitation + randn() * 2.0)
+        end
+    end
+    # FIX: Correctly flatten and repeat the simulation matrix.
+    df.y = repeat(vec(y_sim'), inner=n_obs_per_st_unit)
+    return df, W, grid_areas
+end
+
+function generate_delay_difference_data(; s_N=10, t_N=10, n_obs_per_st_unit=1, seed=123, use_effort::Bool=false)
+    # Purpose: Generates synthetic data for a multivariate delay-difference model.
+    # Rationale: This version is updated to generate an `effort` covariate and use a
+    #            catchability parameter `q` to simulate catch when `use_effort=true`,
+    #            aligning it with the new model formulation that estimates `q`.
+    # v1.0.1 (2026-07-31)
+    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
+    
+    # True parameters
+    r_true = 0.6
+    K_true = 150.0
+    M_nat_true = 0.2
+    sigma_rec_true = 0.2
+    sigma_pop_true = 0.1
+
+    # Simulate data
+    population_sim = zeros(s_N, t_N)
+    recruitment_sim = zeros(s_N, t_N)
+    
+    local effort_sim, catch_sim
+    if use_effort
+        q_true = 0.01
+        effort_sim = rand(s_N, t_N) .* 10.0
+    else
+        catch_sim = rand(s_N, t_N) .* 10.0
+    end
+
+    initial_pop = rand(s_N) .* 20.0 .+ 10.0
+    population_sim[:, 1] = initial_pop
+    recruitment_sim[:, 1] = initial_pop .* 0.2 # Initial recruitment as a fraction of pop
+
+    for t in 2:t_N
+        for s in 1:s_N
+            N_prev = population_sim[s, t-1]
+            D_prev = N_prev / grid_areas[s]
+            K_density = K_true / grid_areas[s]
+            
+            mean_rec = r_true * D_prev * (1.0 - D_prev / K_density) * grid_areas[s]
+            recruitment_sim[s, t] = exp(log(mean_rec + 1e-6) + randn() * sigma_rec_true)
+            
+            C_prev = use_effort ? (q_true * effort_sim[s, t-1] * N_prev) : catch_sim[s, t-1]
+            N_survived = (N_prev - C_prev) * exp(-M_nat_true)
+            population_sim[s, t] = max(0.0, N_survived + recruitment_sim[s, t] + randn() * sigma_pop_true)
+        end
+    end
+    
+    df.y = repeat(vec(population_sim'), inner=n_obs_per_st_unit)
+    df.recruitment = repeat(vec(recruitment_sim'), inner=n_obs_per_st_unit)
+    
+    if use_effort
+        df.effort = repeat(vec(effort_sim'), inner=n_obs_per_st_unit)
+    else
+        df.catch_data = repeat(vec(catch_sim'), inner=n_obs_per_st_unit)
+    end
+    
+    return df, W, grid_areas
+end
+
+function generate_glv_data(; s_N=10, t_N=10, n_species=3, n_obs_per_st_unit=1, seed=123)
+    # Purpose: Generates synthetic data for a multivariate generalized Lotka-Volterra model.
+    # Rationale: Provides a test case for the `dynamics(model=generalized_lotka_volterra)` model.
+    # v1.0.0 (2026-07-31)
+    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
+    
+    # True parameters
+    r_true = [0.5, 0.6, 0.7]
+    K_true = [100.0, 120.0, 150.0]
+    
+    # Interaction matrix (alpha): effect of column j on row i
+    alpha_true = [1.0 0.5 0.2; 
+                  0.3 1.0 0.6; 
+                  0.1 0.4 1.0]
+
+    sigma_process_true = [0.1, 0.1, 0.1]
+
+    # Simulate population dynamics for each species
+    pop_sim = zeros(s_N, t_N, n_species)
+    
+    # Initial population distribution
+    initial_total_pop = rand(s_N) .* 30.0 .+ 10.0
+    for s in 1:s_N
+        pop_sim[s, 1, :] = initial_total_pop[s] .* softmax(randn(n_species))
+    end
+
+    for t in 2:t_N
+        for s in 1:s_N
+            N_prev = pop_sim[s, t-1, :]
+            D_prev = N_prev ./ grid_areas[s]
+            K_density = K_true ./ grid_areas[s]
+            
+            N_intermediate = zeros(n_species)
+            for i in 1:n_species
+                interaction_sum_density = dot(alpha_true[i, :], D_prev)
+                growth_density = r_true[i] * D_prev[i] * (1.0 - interaction_sum_density / K_density[i])
+                N_intermediate[i] = N_prev[i] + growth_density * grid_areas[s]
+            end
+            
+            pop_sim[s, t, :] = max.(0.0, N_intermediate .+ randn(n_species) .* sigma_process_true)
+        end
+    end
+    
+    # Add species columns to the DataFrame
+    for a in 1:n_species
+        species_col_name = Symbol("species_$(a)")
+        species_data_flat = vec(pop_sim[:, :, a]')
+        df[!, species_col_name] = repeat(species_data_flat, inner=n_obs_per_st_unit)
+    end
+    
+    df.y = df.species_1
+    
+    return df, W, grid_areas, n_species
+end
+ 
+
+
+function generate_lotka_volterra_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, seed=123)
+    # Purpose: Generates synthetic data for a Lotka-Volterra prey-predator dynamics model.
+    # Rationale: This version corrects a `MethodError` by changing the call to `create_base_st_data`
+    #            to use keyword arguments instead of positional arguments, aligning it with the
+    #            function's definition.
+    # v1.0.1 (2026-07-31)
+    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
+    
+    # Simulate coupled prey-predator dynamics
+    prey_sim = zeros(s_N, t_N)
+    predator_sim = zeros(s_N, t_N)
+
+    initial_prey = rand(s_N) * 10.0 .+ 5.0
+    initial_predator = rand(s_N) * 2.0 .+ 1.0
+    prey_sim[:, 1] = initial_prey
+    predator_sim[:, 1] = initial_predator
+
+    alpha_true = 0.5 # Prey growth rate
+    beta_true = 0.01 # Predation rate
+    gamma_true = 0.005 # Predator growth from predation
+    delta_true = 0.2 # Predator mortality rate
+    
+    for t in 2:t_N
+        for s in 1:s_N
+            N_prey_prev = prey_sim[s, t-1]
+            N_pred_prev = predator_sim[s, t-1]
+
+            d_prey = alpha_true * N_prey_prev - beta_true * N_prey_prev * N_pred_prev
+            d_pred = gamma_true * N_prey_prev * N_pred_prev - delta_true * N_pred_prev
+            
+            prey_sim[s, t] = max(0.0, N_prey_prev + d_prey + randn() * 0.5)
+            predator_sim[s, t] = max(0.0, N_pred_prev + d_pred + randn() * 0.1)
+        end
+    end
+    
+    df.y = repeat(vec(prey_sim'), inner=n_obs_per_st_unit) # Prey is the observed outcome
+    df.predator_pop = repeat(vec(predator_sim'), inner=n_obs_per_st_unit) # Predator is the interaction covariate
+    return df, W, grid_areas
+end
+
+function generate_leslie_logistic_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, n_age_classes=3, seed=123)
+    # Purpose: Generates synthetic data for a Leslie-Logistic population dynamics model.
+    # Rationale: This version corrects a `MethodError` by changing the call to `create_base_st_data`
+    #            to use keyword arguments instead of positional arguments, aligning it with the
+    #            function's definition.
+    # v1.0.1 (2026-07-31)
+    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
+    
+    # Simulate population based on Leslie matrix-informed logistic growth
+    y_sim = zeros(s_N, t_N)
+    initial_pop = rand(s_N) * 10.0 .+ 5.0
+    y_sim[:, 1] = initial_pop
+
+    K_true = 100.0 # Carrying capacity
+    
+    # True Leslie matrix parameters (simplified for simulation)
+    survival_true = fill(0.8, n_age_classes - 1) # Survival from age i to i+1
+    fecundity_true = [0.0, 1.5, 2.0] # Fecundity for each age class
+
+    # Construct Leslie matrix
+    L_true = zeros(n_age_classes, n_age_classes)
+    for i in 1:(n_age_classes - 1); L_true[i+1, i] = survival_true[i]; end
+    L_true[1, :] = fecundity_true
+
+    # Calculate intrinsic growth rate from dominant eigenvalue
+    r_leslie_true = log(maximum(abs.(eigen(L_true).values)))
+    
+    for t in 2:t_N
+        for s in 1:s_N
+            N_prev = y_sim[s, t-1]
+            D_prev = N_prev / grid_areas[s]
+            K_density = K_true / grid_areas[s]
+            
+            growth = r_leslie_true * D_prev * (1.0 - D_prev / K_density)
+            y_sim[s, t] = max(0.0, N_prev + growth * grid_areas[s] + randn() * 2.0)
+        end
+    end
+    
+    df.y = repeat(vec(y_sim'), inner=n_obs_per_st_unit)
+    return df, W, grid_areas, n_age_classes
+end
+
+function create_base_st_data(;
+    s_N::Int=10, t_N::Int=5, n_obs_per_st_unit::Int=1, seed::Int=123
+)
+    Random.seed!(seed)
+    s_x = rand(s_N) * 10.0
+    s_y = rand(s_N) * 10.0
+    W = spzeros(Bool, s_N, s_N)
+    for i in 1:s_N
+        if i > 1; W[i, i-1] = true; end
+        if i < s_N; W[i, i+1] = true; end
+    end
+    W = max.(W, W')
+    grid_areas = rand(s_N) * 5.0 .+ 1.0
+    s_idx_flat = repeat(1:s_N, inner=t_N * n_obs_per_st_unit)
+    t_idx_flat = repeat(repeat(1:t_N, inner=n_obs_per_st_unit), s_N)
+    s_x_flat = repeat(s_x, inner=t_N * n_obs_per_st_unit)
+    s_y_flat = repeat(s_y, inner=t_N * n_obs_per_st_unit)
+    df = DataFrame(s_idx=s_idx_flat, year=t_idx_flat, s_x=s_x_flat, s_y=s_y_flat, grid_area_col=repeat(grid_areas, inner=t_N * n_obs_per_st_unit))
+    return df, W, grid_areas
+end
+
+
+function generate_logistic_spatial_K_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, seed=123)
+    # Purpose: Generates synthetic data for a logistic growth model with spatially varying carrying capacity (K).
+    # Rationale: Provides a test case for the `dynamics(..., spatially_varying_K=true)` flag.
+    # v1.0.0 (2026-07-31)
+    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
+    
+    # Simulate a spatially varying K based on the x-coordinate
+    s_coords = unique(df[!, [:s_idx, :s_x]])
+    sort!(s_coords, :s_idx)
+    K_spatial_true = 50.0 .+ 150.0 * (s_coords.s_x ./ maximum(s_coords.s_x)) # K varies from 50 to 200
+
+    y_sim = zeros(s_N, t_N)
+    initial_pop = rand(s_N) * 20.0 .+ 10.0
+    y_sim[:, 1] = initial_pop
+
+    r_true = 0.6
+    
+    for t in 2:t_N
+        for s in 1:s_N
+            N_prev = y_sim[s, t-1]
+            D_prev = N_prev / grid_areas[s]
+            K_density = K_spatial_true[s] / grid_areas[s]
+            growth = r_true * D_prev * (1.0 - D_prev / K_density)
+            y_sim[s, t] = max(0.0, N_prev + growth * grid_areas[s] + randn() * 2.5)
+        end
+    end
+    df.y = repeat(vec(y_sim'), inner=n_obs_per_st_unit)
+    return df, W, grid_areas
+end
+
+
+function generate_logistic_spatial_r_data(; s_N=10, t_N=5, n_obs_per_st_unit=1, seed=123)
+    # Purpose: Generates synthetic data for a logistic growth model with spatially varying growth rate (r).
+    # Rationale: Provides a test case for the `dynamics(..., spatially_varying_r=true)` flag.
+    # v1.0.0 (2026-07-31)
+    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
+    
+    # Simulate a spatially varying r based on the y-coordinate
+    s_coords = unique(df[!, [:s_idx, :s_y]])
+    sort!(s_coords, :s_idx)
+    r_spatial_true = 0.2 .+ 0.8 * (s_coords.s_y ./ maximum(s_coords.s_y)) # r varies from 0.2 to 1.0
+
+    y_sim = zeros(s_N, t_N)
+    initial_pop = rand(s_N) * 20.0 .+ 10.0
+    y_sim[:, 1] = initial_pop
+
+    K_true = 100.0
+    
+    for t in 2:t_N
+        for s in 1:s_N
+            N_prev = y_sim[s, t-1]
+            D_prev = N_prev / grid_areas[s]
+            K_density = K_true / grid_areas[s]
+            growth = r_spatial_true[s] * D_prev * (1.0 - D_prev / K_density)
+            y_sim[s, t] = max(0.0, N_prev + growth * grid_areas[s] + randn() * 2.5)
+        end
+    end
+    df.y = repeat(vec(y_sim'), inner=n_obs_per_st_unit)
+    return df, W, grid_areas
+end
+
+
+
+function generate_leslie_matrix_data(; s_N=10, t_N=5, n_age_classes=3, n_obs_per_st_unit=1, seed=123)
+    # Purpose: Generates synthetic data for a multivariate Leslie matrix dynamics model.
+    # Rationale: Provides a test case for the `dynamics(model=leslie_matrix)` feature.
+    # v1.0.0 (2026-07-31)
+    df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
+    
+    # True Leslie matrix parameters
+    survival_true = [0.5, 0.8] # Survival for age 1 and 2
+    fecundity_true = [0.0, 1.5, 3.0] # Fecundity for each age class
+
+    L_true = zeros(n_age_classes, n_age_classes)
+    for i in 1:(n_age_classes - 1); L_true[i+1, i] = survival_true[i]; end
+    L_true[1, :] = fecundity_true
+
+    # Simulate population dynamics for each age class
+    pop_sim = zeros(s_N, t_N, n_age_classes)
+    
+    # Initial population distribution
+    initial_total_pop = rand(s_N) * 50.0 .+ 20.0
+    for s in 1:s_N
+        pop_sim[s, 1, :] = initial_total_pop[s] .* softmax(randn(n_age_classes))
+    end
+
+    for t in 2:t_N
+        for s in 1:s_N
+            N_prev = pop_sim[s, t-1, :]
+            N_projected = L_true * N_prev
+            pop_sim[s, t, :] = max.(0.0, N_projected .+ randn(n_age_classes) .* 0.5)
+        end
+    end
+    
+    # Add age class columns to the DataFrame
+    for a in 1:n_age_classes
+        age_col_name = Symbol("age_$(a)")
+        age_data_flat = vec(pop_sim[:, :, a]')
+        df[!, age_col_name] = repeat(age_data_flat, inner=n_obs_per_st_unit)
+    end
+    
+    df.y = df.age_1
+    
+    return df, W, grid_areas, n_age_classes
+end

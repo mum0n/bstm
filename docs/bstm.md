@@ -1611,6 +1611,206 @@ m_localadaptive = @bstm(
 );
 ```
 
+### Biological models
+
+```julia
+
+# 1. Logistic Basic
+
+df_logistic_basic, W_lb, ga_lb = generate_logistic_basic_data()
+m = @bstm(
+    likelihood(y, family=poisson) ~
+        intercept() +
+        dynamics(s_idx, year, model=logistic_basic, r=LogNormal(0, 0.5), K=LogNormal(log(100.0), 0.5)),
+    df_logistic_basic,
+    W = W_lb,
+    grid_areas = ga_lb
+);
+
+
+
+# 2. Logistic Exploitation
+
+df_logistic_exploitation, W_le, ga_le = generate_logistic_exploitation_data()
+m = @bstm(
+    likelihood(y, family=poisson) ~
+        intercept() +
+        dynamics(s_idx, year, model=logistic_exploitation, r=LogNormal(0, 0.5), K=LogNormal(log(100.0), 0.5), q=LogNormal(-2, 0.5), effort=df_logistic_exploitation.effort),
+    df_logistic_exploitation,
+    W = W_le,
+    grid_areas = ga_le
+);
+
+
+# 3. Delay Difference
+
+df_delay_difference, W_dd, ga_dd = generate_delay_difference_data()
+m = @bstm(
+    likelihood(y, family=poisson) ~
+        intercept() +
+        dynamics(s_idx, year, model=delay_difference, r=LogNormal(0, 0.5), K=LogNormal(log(100.0), 0.5), M_nat=LogNormal(-1, 0.2), catch_data_col=:catch_data),
+    df_delay_difference,
+    W = W_dd,
+    grid_areas = ga_dd
+);
+
+
+# 4. Lotka-Volterra
+
+df_lotka_volterra, W_lv, ga_lv = generate_lotka_volterra_data()
+m_lotka_volterra = @bstm(
+    likelihood(y, family=poisson) ~
+        intercept() +
+        dynamics(s_idx, year, model=lotka_volterra, alpha=LogNormal(0, 0.5), beta=LogNormal(-2, 0.5), gamma=LogNormal(-2, 0.5), delta=LogNormal(0, 0.5), output_species=:prey, interaction_covariate=:predator_pop),
+    df_lotka_volterra,
+    W = W_lv,
+    grid_areas = ga_lv
+);
+
+
+# 5. Leslie Logistic
+
+df_leslie_logistic, W_ll, ga_ll, n_age_classes_ll = generate_leslie_logistic_data()
+m_leslie_logistic = @bstm(
+    likelihood(y, family=poisson) ~
+        intercept() +
+        dynamics(s_idx, year, model=leslie_logistic, K=LogNormal(log(100.0), 0.5), n_age_classes=n_age_classes_ll),
+    df_leslie_logistic,
+    W = W_ll,
+    grid_areas = ga_ll
+);
+
+
+# 6. Spatially varying K logistic
+
+#
+# The model structure is defined using the @bstm macro as follows:
+# - likelihood(y, family=poisson): The outcome 'y' (population counts) is modeled
+#   with a Poisson distribution.
+# - intercept(): A global intercept term representing the baseline log-population level.
+# - dynamics(...): The core mechanistic component.
+#   - model=logistic_basic, spatially_varying_K=true: Specifies the logistic growth model where K is a spatial field.
+#   - r=LogNormal(0, 0.5): A prior on the intrinsic growth rate 'r'.
+#   - log_K_mean=Normal(log(150.0), 0.5): A prior on the mean of the logarithm of the
+#     spatially varying carrying capacity. This sets our prior belief for the average K
+#     across the domain to be around 150.
+#   - sigma_K=Exponential(1.0): A prior on the standard deviation of the spatial field for K.
+#     This controls how much K is expected to vary across space.
+
+
+df_spatial_K, W_sk, ga_sk = generate_logistic_spatial_K_data();
+
+m_spatial_K = @bstm(
+    likelihood(y, family=poisson) ~
+        intercept() +
+        dynamics(s_idx, year,
+            model=logistic_basic,
+            spatially_varying_K=true,
+            spatially_varying_r=true,
+            r=LogNormal(0, 0.5),
+            log_K_mean=Normal(log(150.0), 0.5),
+            sigma_K=Exponential(1.0)
+        ),
+    df_spatial_K,
+    W = W_sk,
+    grid_areas = ga_sk,
+    verbose = true # Set to false to suppress detailed model code and prior check output
+);
+
+
+# 7. Leslie matrix
+
+# 1. Generate synthetic data with 3 age classes
+df_leslie_matrix, W_lm, ga_lm, n_ac_lm = generate_leslie_matrix_data(n_age_classes=3)
+
+# 2. Define the multivariate model
+# The outcomes `age_1`, `age_2`, `age_3` correspond to the age classes.
+m_leslie_matrix = @bstm(
+    likelihood(age_1 + age_2 + age_3) ~
+        intercept() +
+        dynamics(s_idx, year, model=leslie_matrix, n_age_classes=n_ac_lm),
+    df_leslie_matrix,
+    W = W_lm,
+    grid_areas = ga_lm
+);
+
+# 3. Sample from the model
+chain_leslie_matrix = sample(m_leslie_matrix, NUTS(), 500; progress=true)
+
+# 4. Display results
+# The chain will contain posterior samples for `survival_rates` and `fecundity_rates`.
+display(chain_leslie_matrix)
+
+
+
+# Delay difference 
+
+# Ensure the project environment is set up and functions are loaded.
+# This typically involves running a 'startup.jl' or similar script.
+# For this example, we assume the necessary functions like
+# `generate_delay_difference_data` are available.
+
+# 1. Generate synthetic data for a multivariate delay-difference model with effort data.
+#    The `use_effort=true` flag ensures the function generates an 'effort' column
+#    instead of a 'catch_data' column, which is appropriate for this model variant.
+println("Generating synthetic data for a multivariate delay-difference model with effort...")
+df_dd_effort, W_dd, ga_dd = generate_delay_difference_data(use_effort=true)
+println("Data generated successfully.")
+
+# 2. Define and instantiate the bstm model
+# This example specifies a multivariate delay-difference model where catch is not directly
+# observed but is instead modeled as a function of fishing effort and an unknown catchability
+# coefficient 'q'.
+#
+# The model structure is defined using the @bstm macro as follows:
+# - likelihood(y + recruitment, family=poisson): The two outcomes, total population ('y')
+#   and new recruits ('recruitment'), are jointly modeled, both assuming a Poisson distribution.
+# - intercept(): A global intercept term for both outcomes.
+# - dynamics(...): The core mechanistic component.
+#   - model=delay_difference: Specifies the delay-difference dynamics. Because two outcomes
+#     are provided in the likelihood, the multivariate version is automatically triggered.
+#   - effort_col=:effort: This crucial parameter tells the model to use the 'effort'
+#     column from the dataframe to calculate catch internally.
+#   - q=LogNormal(-4, 0.5): A prior on the catchability coefficient 'q'.
+#   - r, K, M_nat: Priors for the intrinsic growth rate, carrying capacity, and natural mortality.
+
+println("\nDefining the multivariate delay-difference model with effort...")
+m_dd_effort = @bstm(
+    likelihood(y + recruitment, family=poisson) ~
+        intercept() +
+        dynamics(s_idx, year,
+            model=delay_difference,
+            effort_col=:effort,
+            q=LogNormal(-4, 0.5),
+            r=LogNormal(0, 0.5),
+            K=LogNormal(log(150.0), 0.5),
+            M_nat=LogNormal(-1.5, 0.5)
+        ),
+    df_dd_effort,
+    W = W_dd,
+    grid_areas = ga_dd,
+    verbose = true # Set to false to suppress detailed model code and prior check output
+);
+
+# 3. Sample from the model
+# For a quick test, we can use a simple sampler. For a full analysis,
+# a more advanced sampler like NUTS is recommended.
+println("\nRunning a short MCMC chain for demonstration...")
+chain_dd_effort = sample(m_dd_effort, MH(), 500; progress=true)
+
+# 4. Display results
+# The resulting chain object can be summarized to inspect the posterior distributions
+# of the parameters, including the estimated catchability 'q'.
+println("\nSampling complete. Displaying summary of the MCMC chain:")
+display(chain_dd_effort)
+
+
+
+```
+
+
+
+
 ### Directed Acyclic Graph (DAG) Model
 
 The `dag` model is a spatial component for modeling directed dependencies,
@@ -1644,6 +1844,7 @@ effect's standard deviation (`my_effect_sigma`), samples the raw innovations
 
 The user can access the main model configuration object `M` within the fragment.
 
+```julia
 custom_code = """
     # --- Custom Code for 'cov1' Random Effect ---
 
@@ -1665,6 +1866,8 @@ m = @bstm(
     likelihood(y) ~ intercept() + custom(code_fragment=custom_code),
     inp_df
 );
+
+```
 
 
 ## Conclusion
