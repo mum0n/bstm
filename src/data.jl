@@ -1071,6 +1071,7 @@ The simulation includes options for:
 - `Int`: The number of classes.
 """
 function generate_generalized_leslie_matrix_data(; s_N=10, t_N=10, n_classes=4, n_obs_per_st_unit=1, seed=123, use_effort::Bool=false, use_removal::Bool=false)
+    
     df, W, grid_areas = create_base_st_data(s_N=s_N, t_N=t_N, n_obs_per_st_unit=n_obs_per_st_unit, seed=seed)
 
     # True transition matrix (example for 4 classes)
