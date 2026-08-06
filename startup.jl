@@ -96,6 +96,7 @@ using Turing: Variational, Turing
 using Turing.Inference
 using DynamicPPL: Model, @model, NamedDist
 
+
 using .Wavelets.Util: wavefun
 using Interpolations: LinearInterpolation, Flat
 

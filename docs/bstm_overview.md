@@ -128,18 +128,18 @@ Note the semicolon at the end of the call: m = @bstm(); make the contents not pr
 m  = @bstm(
     likelihood(y, family=:poisson, log_offsets=:log_offsets) ~
         intercept(prior=Normal(0, 10)) +
-        fixed(X, prior=Normal(0, 5)) + # Fixed effect for covariate X
-        random(s_idx, model=:bym2) + # Spatial random effect
+        fixed(cov1, prior=Normal(0, 5)) + # Fixed effect for covariate X
+        random(s_idx, model=:leroux, W=W) + # Spatial random effect
         random(year, model=:ar1), # Temporal random effect
     inp_df 
 );
 
 # For demonstration, we run a short chain with a simple sampler. 
-chn_separable = sample( m , MH(), 100; progress=false)
+chn = sample( m , MH(), 100; progress=false)
 
 # For a full analysis:
 os = get_optimal_sampler(m)
-chn = sample(m, os, 1000, nchains=4)  # you will need to tweak the number of samples, as this depends upon model and data
+chn = sample(m, os, 10, nchains=4)  # you will need to tweak the number of samples, as this depends upon model and data
 res = model_results_comprehensive( m, chn; au=data_scot.au)
 model_results_plots(res)
 ```
@@ -155,7 +155,9 @@ The general structure of a `bstm` model call is:
 ```julia
 m = @bstm(
     likelihood(outcome_var, family=poisson, ...) ~ 
-intercept() + fixed_effects + modules(...),
+      intercept() + 
+      fixed_effects + 
+      modules(...),
     data_frame,
     keyword_arguments...
 )
@@ -175,14 +177,14 @@ NOTE: using """ ... """, below, makes construction of long text strings simpler 
 formula = """
   likelihood(y, family=:poisson, offsets=log_pop) ~
     intercept(prior=Normal(0, 10)) +
-    fixed(z, prior=Normal(0, 5)) +
-    fixed(Region, contrast=:effects, prior=Normal(0, 2)) +
+    fixed(cov1, prior=Normal(0, 5)) +
+    fixed(region, contrast=:effects, prior=Normal(0, 2)) +
     poverty |> random(s_idx, model=:icar) + # Spatially varying coefficient for poverty
     random(s_idx, model=:besag) ⊗ random(year, model=:ar1) + # Spatiotemporal interaction
     random(age, model=:pspline, nbins=10) # Smooth effect for age
 """
 
-m = @bstm( formula, df, W=W );
+m = @bstm( formula, inp_df, W=W );
 ```
   
 #### The `likelihood()` Module
@@ -242,7 +244,7 @@ The `bstm` framework supports several methods for preprocessing covariates and t
     m = @bstm(
         likelihood(y, family=:poisson, log_offsets=:log_offsets) ~ # Poisson likelihood with log offset
             intercept() +
-            fixed(X) +
+            fixed(cov1) +
             random(s_idx, model=:bym2) + # Spatial random effect
             random(year, model=:ar1) + # Temporal random effect
             random(s_idx, model=:besag) ⊗ random(year, model=:ar1), # Spatiotemporal interaction
