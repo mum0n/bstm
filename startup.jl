@@ -84,6 +84,8 @@ using StatsBase: Weights, sample, midpoints, quantile, zscore, standardize, ZSco
 using AbstractMCMC: logdensity # Explicitly import logdensity
 using NNlib: softmax
 
+using ADTypes # Explicitly import ADTypes for sampler compatibility
+
 import SpecialFunctions: logfactorial
 import LogExpFunctions: logdiffexp, logistic, logsumexp, log1mexp
 # import Distributions: logpdf, _logpdf, pdf, cdf, logcdf, logccdf, rand, sampler

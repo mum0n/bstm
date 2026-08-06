@@ -1,144 +1,5 @@
 
-# Version 1.5.0 (2026-08-06)
-# Purpose: Generates the main model string for the Turing model.
-# Rationale: This version reverts to the standard Turing model signature with an explicit
-#            `T::Type=Float64` parameter. This resolves the `UndefVarError` by ensuring the
-#            type `T` is defined throughout the model's scope. It also simplifies the
-#            assembly logic by removing the complex type inference step, leading to
-#            cleaner and more robust code generation.
-function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
-    # This function assembles the full Turing model string from various code fragments.
-    # It orchestrates the inclusion of priors, the linear predictor assembly, and the
-    # final likelihood evaluation.
-
-    arch = get(M, :model_arch, "univariate")
-    is_multivariate = arch == "multivariate"
-
-    eta_name = is_multivariate ? "eta_latent" : "eta"
-    eta_init = is_multivariate ? "zeros(T, N, K)" : "zeros(T, N)"
-    outcomes_N = get(M, :outcomes_N, 1)
-
-    spec_registry = Dict{String, Any}()
-    priors_acc = String[]
-    updates_acc = String[]
-
-    main_spatial_spec = nothing
-    main_temporal_spec = nothing
-    
-    has_custom_likelihood_from_component = any(spec -> any(T -> spec.component_obj isa T, [LGCP, LogGammaCoxProcess, ShotNoiseCoxProcess]), M.components)
-    has_custom_likelihood_from_family = any(spec -> string(get(spec, :family, "")) == "ordinal", M.likelihood_specs)
-    has_custom_likelihood = has_custom_likelihood_from_component || has_custom_likelihood_from_family
-
-    # Generate all code fragments first
-    intercept_priors, intercept_update = _generate_intercept_block(M, is_multivariate, eta_name)
-    if !isempty(intercept_priors); push!(priors_acc, intercept_priors); end
-    if !isempty(intercept_update); push!(updates_acc, intercept_update); end
-
-    offset_block = _generate_offset_block(M, is_multivariate, eta_name)
-    if !isempty(offset_block); push!(updates_acc, offset_block); end
-
-    fixed_effects_priors, fixed_effects_update = _generate_fixed_effects_block(M, is_multivariate, eta_name)
-    if !isempty(fixed_effects_priors); push!(priors_acc, fixed_effects_priors); end
-    if !isempty(fixed_effects_update); push!(updates_acc, fixed_effects_update); end
-
-    if get(M, :is_multivariate_dynamics, false)
-        mv_dyn_key = M[:multivariate_dynamics_key]
-        spec_idx = findfirst(s -> string(s.key) == mv_dyn_key, M.components)
-        if !isnothing(spec_idx)
-            spec = M.components[spec_idx]
-            spec_registry[string(spec.key)] = spec
-            frags = _generate_component_code_fragments(spec.component_obj, spec, arch, nothing, M)
-            push!(priors_acc, frags.priors)
-            push!(updates_acc, frags.update)
-        end
-    end
-
-    for spec in M.components
-        if get(M, :is_multivariate_dynamics, false) && string(spec.key) == M[:multivariate_dynamics_key]
-            continue
-        end
-        spec_registry[string(spec.key)] = spec
-        for k in 1:outcomes_N
-            outcome_idx = is_multivariate ? k : nothing            
-            frag = _generate_component_code_fragments(spec.component_obj, spec, arch, outcome_idx, M)
-            if !isempty(Base.strip(frag.priors)); push!(priors_acc, frag.priors); end
-            if !isempty(Base.strip(frag.update)); push!(updates_acc, frag.update); end
-        end
-
-        if spec.structure == :spatial && isnothing(main_spatial_spec); main_spatial_spec = spec; end
-        if spec.structure == :temporal && isnothing(main_temporal_spec); main_temporal_spec = spec; end
-    end
-
-    function _indent_block(text::String, level=1)
-        if isempty(Base.strip(text)) return "" end
-        indent_str = "    " ^ level
-        return indent_str * replace(Base.strip(text), "\n" => "\n" * indent_str)
-    end
-
-    likelihood_section_priors = _generate_likelihood_section(M, is_multivariate)
-    st_interaction_block = _generate_st_interaction_block(M, main_spatial_spec, main_temporal_spec, is_multivariate, eta_name)
-    householder_priors, householder_update = _generate_householder_reflection_block(M, is_multivariate, eta_name)
-    
-    final_likelihood = if has_custom_likelihood
-        if has_custom_likelihood_from_family; _generate_final_likelihood_block(M, is_multivariate); else ""; end
-    else
-        _generate_final_likelihood_block(M, is_multivariate)
-    end
-    
-    nested_priors, nested_updates, nested_likelihoods = _generate_nested_model_block(M, is_multivariate, eta_name)
-    
-    # Add all remaining priors to the accumulator
-    if !isempty(Base.strip(likelihood_section_priors)); push!(priors_acc, likelihood_section_priors); end
-    if !isempty(Base.strip(householder_priors)); push!(priors_acc, householder_priors); end
-    if !isempty(Base.strip(nested_priors)); push!(priors_acc, nested_priors); end
-
-    priors_code = join(priors_acc, "\n\n")
-    updates_code = join(updates_acc, "\n\n")
-
-    model_string = """
-@model function $(model_func_name)(M, spec_registry; T::Type=Float64)
-    noise = T(M.noise)
-    N = M.y_N
-    K = $(outcomes_N)
-
-    # --- Priors & Hyperparameters ---
-$(_indent_block(priors_code))
-
-    # --- Linear Predictor ---
-    $(eta_name) = $(eta_init)
-
-$(_indent_block(updates_code))
-$(_indent_block(householder_update))
-$(_indent_block(nested_updates))
-$(_indent_block(st_interaction_block))
-
-    # --- Likelihood ---
-$(_indent_block(final_likelihood))
-$(_indent_block(nested_likelihoods))
-end
-"""
  
-# deprecated:
-#    optimized_model_string, analysis_warnings = _perform_final_code_pass(model_string)
-#    if !isempty(analysis_warnings) && get(M, :verbose, true)
-#        println("\n--- Code Analysis & Optimization Report ---")
-#        for warning in analysis_warnings; println("  - $warning"); end
-#        println("-----------------------------------------\n")
-#    end
-
-    model_string_to_parse = model_string
-    
-    try
-        return model_string_to_parse, Meta.parse(model_string_to_parse), spec_registry
-    catch e
-        println("BSTM Assembler Error: Failed to parse the generated model string.")
-        println(model_string_to_parse)
-        rethrow(e)
-    end
-end
-
-
-
  
 function _generate_component_code_fragments(m::Union{TensorProductSmooth, TPS, BSpline, PSpline}, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
     return _generate_component_code_fragments(m, spec, arch, outcome_idx, M, prefix=prefix)
@@ -417,13 +278,12 @@ function _generate_component_code_fragments(m::Any, spec::NamedTuple, arch::Stri
 end
 
 
-# Version 1.5.3 (2026-08-06)
+# Version 1.5.6 (2026-08-06)
 # Purpose: Generates Turing code fragments for the `MixedComponent`.
-# Rationale: This version replaces all broadcasted assignments (`.+=`) and `view()` calls
-#            with explicit `for` loops and direct indexing. This ensures maximum type
-#            stability for automatic differentiation by preventing the compiler from making
-#            incorrect type inferences about arrays containing `ForwardDiff.Dual` numbers.
-#            Covariate data is also explicitly cast to type `T` within the loop.
+# Rationale: This version is updated for AD compatibility. It replaces hard-coded
+#            `T.(I(...))` in `MvNormal` priors and `cholesky` calls with `I`, which
+#            correctly uses `UniformScaling` to allow for automatic type promotion
+#            with `Dual` numbers, preventing `MethodError` during AD.
 function _generate_component_code_fragments(m::MixedComponent, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
     v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
     inner_model = m.model
@@ -437,7 +297,6 @@ function _generate_component_code_fragments(m::MixedComponent, spec::NamedTuple,
 
     if k_effects == 1
         inner_frags = _generate_component_code_fragments(inner_model, spec, arch, outcome_idx, M, prefix=prefix)
-        # Remove any existing effect application from the inner fragment's update string.
         effect_app_regex = r"for i in 1:length\($(eta_target)\)\s*$(eta_target)\[i\] \+= .*end"
         update_inner_cleaned = replace(inner_frags.update, effect_app_regex => "")
         
@@ -453,7 +312,7 @@ function _generate_component_code_fragments(m::MixedComponent, spec::NamedTuple,
             """
         else
             application_code = """
-            local cov_data = T.(M.data[!, :$(Symbol(lhs_str))])
+            local cov_data = M.data[!, :$(Symbol(lhs_str))]
             for i in 1:length($(eta_target))
                 $(eta_target)[i] += cov_data[i] * $(v.latent)[M.$(index_var)[i]]
             end
@@ -472,13 +331,13 @@ function _generate_component_code_fragments(m::MixedComponent, spec::NamedTuple,
         priors_acc = String[]
         push!(priors_acc, "$(v.L_corr) ~ NamedDist(LKJCholesky(T($(k_effects)), T(1.0)), :$(v.L_corr))")
         push!(priors_acc, "$(v.sigma_effects) ~ NamedDist(filldist(Exponential{T}(1.0), $(k_effects)), :$(v.sigma_effects))")
-        push!(priors_acc, "$(v.raw) ~ NamedDist(MvNormal(zeros(T, $(n_groups * k_effects)), T.(I($(n_groups * k_effects)))), :$(v.raw))")
+        push!(priors_acc, "$(v.raw) ~ NamedDist(MvNormal(zeros(T, $(n_groups * k_effects)), I), :$(v.raw))")
 
         local group_chol_logic
         if get(spec, :is_static, false)
             group_chol_logic = "local F_groups_$(spec.key) = spec_registry[\"$(spec.key)\"].cholesky_factor\nlocal L_groups_cov_inv_t_$(spec.key) = F_groups_$(spec.key).L'"
         else
-            group_chol_logic = "local Q_groups_$(spec.key) = spec_registry[\"$(spec.key)\"].Q_template\nlocal F_groups_$(spec.key) = cholesky(Symmetric(Matrix(Q_groups_$(spec.key)) + noise * T.(I(size(Q_groups_$(spec.key), 1)))))\nlocal L_groups_cov_inv_t_$(spec.key) = F_groups_$(spec.key).L'"
+            group_chol_logic = "local Q_groups_$(spec.key) = spec_registry[\"$(spec.key)\"].Q_template\nlocal F_groups_$(spec.key) = cholesky(Symmetric(Matrix(Q_groups_$(spec.key)) + noise * I))\nlocal L_groups_cov_inv_t_$(spec.key) = F_groups_$(spec.key).L'"
         end
 
         application_loop_acc = String[]
@@ -494,7 +353,7 @@ function _generate_component_code_fragments(m::MixedComponent, spec::NamedTuple,
                 """
             else
                 term_application = """
-                local cov_data = T.(M.data[!, :$(Symbol(term))])
+                local cov_data = M.data[!, :$(Symbol(term))]
                 for j in 1:length($(eta_target))
                     $(eta_target)[j] += cov_data[j] * effects_matrix_$(spec.key)[M.$(index_var)[j], $(i)]
                 end
@@ -748,11 +607,11 @@ end
 
 
 
-
-# Version 1.3.11 (2026-08-05)
+# Version 1.5.6 (2026-08-06)
 # Purpose: Generates Turing code for a Random Walk 1 (RW1) process.
-# Rationale: This version replaces `view()` with direct indexing and broadcasted
-#            multiplication with a `for` loop to ensure type stability for AD.
+# Rationale: This version is updated for AD compatibility. It replaces the hard-coded
+#            `T.(I(...))` in the `MvNormal` prior with `I`, which correctly uses
+#            `UniformScaling` to allow for automatic type promotion with `Dual` numbers.
 function _generate_component_code_fragments(m::RW1, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
     key_str = string(spec.key)
     v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
@@ -765,7 +624,7 @@ function _generate_component_code_fragments(m::RW1, spec::NamedTuple, arch::Stri
     if !is_multivariate || (is_multivariate && (!is_shared || outcome_idx == 1))
         push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
     end
-    push!(priors_acc, "$(v.innov) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), T.(I($(n_latent)))), :$(v.innov))")
+    push!(priors_acc, "$(v.innov) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.innov))")
     priors_str = join(priors_acc, "\n")
 
     eta_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
@@ -802,10 +661,11 @@ function _generate_component_code_fragments(m::RW1, spec::NamedTuple, arch::Stri
 end
 
 
-# Version 1.3.11 (2026-08-05)
+# Version 1.5.6 (2026-08-06)
 # Purpose: Generates Turing code for a Random Walk 2 (RW2) process.
-# Rationale: This version replaces `view()` with direct indexing and broadcasted
-#            multiplication with a `for` loop to ensure type stability for AD.
+# Rationale: This version is updated for AD compatibility. It replaces the hard-coded
+#            `T.(I(...))` in the `MvNormal` prior with `I`, which correctly uses
+#            `UniformScaling` to allow for automatic type promotion with `Dual` numbers.
 function _generate_component_code_fragments(m::RW2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
     key_str = string(spec.key)
     v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
@@ -819,7 +679,7 @@ function _generate_component_code_fragments(m::RW2, spec::NamedTuple, arch::Stri
     if !is_multivariate || (is_multivariate && (!is_shared || outcome_idx == 1))
         push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
     end
-    push!(priors_acc, "$(v.innov) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), T.(I($(n_latent)))), :$(v.innov))")
+    push!(priors_acc, "$(v.innov) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.innov))")
     priors_str = join(priors_acc, "\n")
 
     eta_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
@@ -854,7 +714,6 @@ function _generate_component_code_fragments(m::RW2, spec::NamedTuple, arch::Stri
     
     return (priors=priors_str, update=update_str)
 end
-
 
 
 
@@ -901,54 +760,7 @@ function _generate_component_code_fragments(m::RFF, spec::NamedTuple, arch::Stri
     return (priors=priors_str, update=update)
 end
 
-
-# Version 1.5.3 (2026-08-06)
-# Purpose: Generates Turing code fragments for the `Eigen` (Bayesian PCA) component.
-# Rationale: This version is updated for AD compatibility. It ensures that the observation
-#            noise `noise` is correctly added to the diagonal of the residual covariance
-#            matrix `Psi` and that the observed data `Y_eigen_data` is converted to the
-#            generic model type `T` before being used in the `logpdf` calculation.
-function _generate_component_code_fragments(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
-    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
-    key_str = string(spec.key)
-    
-    n_vars = m.n_vars
-    n_factors = m.n_factors
-    n_obs = size(spec.hyper.eigen_data, 1)
-
-    pca_sd_prior_str = _distribution_to_string(m.pca_sd)
-    pdef_sd_prior_str = _distribution_to_string(m.pdef_sd)
-
-    priors_str = """
-    # Priors for eigen component: $(key_str)
-    $(v.v_raw) ~ NamedDist(MvNormal(zeros(T, $(length(m.ltri_indices))), T(1.0)), :$(v.v_raw))
-    $(v.pca_sd) ~ NamedDist(filldist($(pca_sd_prior_str), $(n_factors)), :$(v.pca_sd))
-    $(v.pdef_sd) ~ NamedDist(filldist($(pdef_sd_prior_str), $(n_vars)), :$(v.pdef_sd))
-    $(v.factors_flat) ~ NamedDist(MvNormal(zeros(T, $(n_obs * n_factors)), I), :$(v.factors_flat))
-    """
-
-    update_str = """
-    begin
-        # --- Factor Model for Eigen Component: $(key_str) ---
-        local v_mat = zeros(T, $(n_vars), $(n_factors)); v_mat[$(m.ltri_indices)] .= $(v.v_raw)
-        local U = householder_to_eigenvector(v_mat, $(n_vars), $(n_factors))
-        local L = U * Diagonal($(v.pca_sd))
-        local F = reshape($(v.factors_flat), $(n_obs), $(n_factors))
-        local Y_hat = F * L'
-        local Psi = Diagonal($(v.pdef_sd).^2) + (T(noise) * I)
-        
-        local Y_eigen_data = spec_registry["$(key_str)"].hyper.eigen_data
-        for i in 1:$(n_obs)
-            Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), T.(Y_eigen_data[i, :]))
-        end
-        eta .+= sum(F, dims=2)
-    end
-    """
-    return (priors=priors_str, update=update_str)
-end
-
-
-
+ 
 
 # Version 1.5.3 (2026-08-06)
 # Purpose: Generates Turing code fragments for the `TAR` component.
@@ -2086,12 +1898,12 @@ function _generate_component_code_fragments(m::CustomComponent, spec::NamedTuple
 end
 
 
-# Version 1.5.3 (2026-08-06)
+# Version 1.5.4 (2026-08-06)
 # Purpose: Generates Turing code fragments for the `LGCP` component.
-# Rationale: This version is updated for AD compatibility. It converts the precision matrix
-#            to a dense matrix before the Cholesky decomposition when the matrix contains
-#            Dual numbers. This avoids calling the sparse Cholesky factorization from CHOLMOD,
-#            which does not support Dual types, resolving the `TypeError`.
+# Rationale: This version removes the explicit cast `T(...)` from the observed data
+#            `y_st` and grid areas `A_s` inside the `logpdf` calculation. This prevents a
+#            `MethodError` during automatic differentiation when these data-derived values
+#            are involved in operations with `Dual` numbers.
 function _generate_component_code_fragments(m::LGCP, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
     v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
     key_str = string(spec.key)
@@ -2150,7 +1962,8 @@ function _generate_component_code_fragments(m::LGCP, spec::NamedTuple, arch::Str
             local A_s = grid_areas[s]
             local Z_st = log_intensity_surface[s, t]
             
-            Turing.@addlogprob! (T(y_st) * (Z_st + log(T(A_s) + T(1e-6))) - T(A_s) * exp(Z_st))
+            # Do NOT cast y_st or A_s to T, as this breaks AD.
+            Turing.@addlogprob! (y_st * (Z_st + log(A_s + T(1e-6))) - A_s * exp(Z_st))
         end
     end
     """
@@ -2195,86 +2008,14 @@ function _generate_component_code_fragments(m::TVCComponent, spec::NamedTuple, a
 end
 
 
+ 
 
-# Version 1.5.3 (2026-08-06)
-# Purpose: Generates Turing code fragments for the `LogGammaCoxProcess` component.
-# Rationale: This version ensures type stability by explicitly casting `y_st` and `A_s` to `T`.
-function _generate_component_code_fragments(m::LogGammaCoxProcess, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
-    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
-    key_str = string(spec.key)
-
-    is_spatiotemporal = hasproperty(spec.hyper, :temporal_spec)
-    n_latent_dims = is_spatiotemporal ? "M.s_N * M.t_N" : "M.s_N"
-
-    # Priors for the Gamma shape and the raw innovations for the latent field
-    priors = """
-    # Log-Gamma Cox Process Priors
-    $(v.innov) ~ NamedDist($(_distribution_to_string(m.shape)), :$(v.innov)) # Using 'innov' for the shape parameter
-    $(v.raw) ~ NamedDist(MvNormal(fill(zero(T), $(n_latent_dims)), I), :$(v.raw))
-    """
-
-    update = """
-    begin
-        # Log-Gamma Cox Process Model: $(key_str)
-        local latent_field_st = zeros(T, M.s_N, M.t_N)
-        
-        # 1. Reconstruct the latent spatiotemporal field Z(s,t)
-        if $(is_spatiotemporal)
-            local s_spec = spec_registry["$(key_str)"].hyper.inner_spec
-            local t_spec = spec_registry["$(key_str)"].hyper.temporal_spec
-            local C_s = cholesky(Symmetric(Matrix(s_spec.Q_template) + noise * I))
-            local C_t = cholesky(Symmetric(Matrix(t_spec.Q_template) + noise * I))
-            local Z_matrix = reshape($(v.raw), M.s_N, M.t_N)
-            local tmp_spatial = C_s.U \\ Z_matrix
-            latent_field_st = exp.(transpose(C_t.U \\ transpose(tmp_spatial))) # Exponentiate to ensure positivity
-        else
-            local Q_inner = spec_registry["$(key_str)"].hyper.inner_spec.Q_template
-            local F_inner = cholesky(Symmetric(Matrix(Q_inner) + noise * I))
-            local spatial_component = exp.(F_inner.U \\ $(v.raw)) # Exponentiate
-            latent_field_st = repeat(spatial_component, 1, M.t_N)
-        end
-
-        # 2. Assemble the full mean intensity surface.
-        local mean_intensity_surface = zeros(T, M.s_N, M.t_N)
-        local gamma_shape = $(v.innov) # The learned shape parameter
-
-        for t in 1:M.t_N, s in 1:M.s_N
-            obs_indices = findall(i -> M.s_idx[i] == s && M.t_idx[i] == t, 1:N)
-            base_contribution = isempty(obs_indices) ? zero(T) : mean(view(eta, obs_indices))
-            mean_intensity_surface[s, t] = exp(base_contribution) * latent_field_st[s, t]
-        end
-
-        # 3. Point Process Likelihood Evaluation using Negative Binomial
-        # A Poisson-Gamma mixture results in a Negative Binomial distribution.
-        # Mean (μ) = shape * scale = exp(eta) * latent_field
-        # Variance = μ + μ^2/shape
-        local grid_areas = spec_registry["$(key_str)"].hyper.areas
-        for t in 1:M.t_N, s in 1:M.s_N
-            local y_st = M.y_obs[s, t]
-            local A_s = grid_areas[s]
-            local mu = mean_intensity_surface[s, t] * T(A_s)
-            
-            # Parameterize Negative Binomial with successes (r=shape) and probability (p)
-            # The p parameter is r / (r + μ)
-            local r_nb = gamma_shape
-            local p_nb = r_nb / (r_nb + mu)
-            local nb_dist = NegativeBinomial(r_nb, p_nb)
-            Turing.@addlogprob! logpdf(nb_dist, T(y_st))
-        end
-
-        M[:likelihood_handled] = true
-    end
-    """
-
-    return (priors=priors, update=update)
-end
-
-
-
-# Version 1.5.3 (2026-08-06)
+# Version 1.5.6 (2026-08-06)
 # Purpose: A specialized code generator for the `NonStationaryVariance` component.
-# Rationale: This version ensures type stability by explicitly casting `T(0)` and `T(0.001)`
-#            in the `logpdf` call.
+# Rationale: This version is updated for AD compatibility. It replaces hard-coded
+#            `T.(I(...))` in `MvNormal` priors and `cholesky` calls with `I`, which
+#            correctly uses `UniformScaling` to allow for automatic type promotion
+#            with `Dual` numbers, preventing `MethodError` during AD.
 function _generate_component_code_fragments(m::NonStationaryVariance, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
     key_str = string(spec.key)
     is_multivariate = arch == "multivariate"
@@ -2289,7 +2030,7 @@ function _generate_component_code_fragments(m::NonStationaryVariance, spec::Name
     modifier_frags = _generate_component_code_fragments(m.modifier_model, modifier_spec, arch, outcome_idx, M, prefix=key_str)
     
     n_latent_base = size(base_spec.Q_template, 1)
-    base_priors = "$(v_base.raw) ~ NamedDist(MvNormal(fill(zero(T), $(n_latent_base)), T.(I($(n_latent_base)))), :$(v_base.raw))"
+    base_priors = "$(v_base.raw) ~ NamedDist(MvNormal(fill(zero(T), $(n_latent_base)), I), :$(v_base.raw))"
     
     priors_str = """
     # Priors for NonStationaryVariance component: $(key_str)
@@ -2308,11 +2049,11 @@ function _generate_component_code_fragments(m::NonStationaryVariance, spec::Name
         
         $(modifier_update_cleaned)
         
-        local log_sigma_field::Vector{T} = T.(M.basis_matrices[:$(basis_key)]) * $(v_modifier.latent)
+        local log_sigma_field::Vector{T} = M.basis_matrices[:$(basis_key)] * $(v_modifier.latent)
         local spatially_varying_sigma::Vector{T} = exp.(log_sigma_field)
         
         local Q_base_template = spec_registry["$(spec.key)"].hyper.base_spec.Q_template
-        local F_base = cholesky(Symmetric(Matrix(Q_base_template) + noise * T.(I(size(Q_base_template, 1)))))
+        local F_base = cholesky(Symmetric(Matrix(Q_base_template) + noise * I))
         local base_latent_raw::Vector{T} = F_base.L' \\ $(v_base.raw)
         
         if $(m.base_model isa Union{ICAR, Besag})
@@ -2330,87 +2071,6 @@ function _generate_component_code_fragments(m::NonStationaryVariance, spec::Name
     return (priors=priors_str, update=update_str)
 end
 
- 
-
-# Version 1.5.3 (2026-08-06)
-# Purpose: Generates Turing code fragments for the `ShotNoiseCoxProcess` component.
-# Rationale: This version ensures type stability by explicitly casting `obs_locs` components,
-#            `y_s`, and `A_s` to `T`.
-function _generate_component_code_fragments(m::ShotNoiseCoxProcess, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
-    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
-    key_str = string(spec.key)
-
-    # Determine if the number of parents is fixed or a random variable
-    n_parents_str = if m.n_parents isa Int
-        string(m.n_parents)
-    else
-        # Use 'innov' to sample the number of parents if it's a distribution
-        "$(v.innov)_n_parents"
-    end
-
-    priors_list = String[]
-    if m.n_parents isa UnivariateDistribution
-        push!(priors_list, "$(n_parents_str) ~ NamedDist($(_distribution_to_string(m.n_parents)), :$(Symbol(n_parents_str)))")
-    end
-    
-    bounds = spec.hyper.domain_bounds
-    # Priors for parent locations (2D for spatial)
-    push!(priors_list, "$(v.raw)_parent_locs_x ~ NamedDist(filldist(Uniform(T($(bounds.x_min)), T($(bounds.x_max))), $(n_parents_str)), :$(Symbol(string(v.raw, "_parent_locs_x"))))")
-    push!(priors_list, "$(v.raw)_parent_locs_y ~ NamedDist(filldist(Uniform(T($(bounds.y_min)), T($(bounds.y_max))), $(n_parents_str)), :$(Symbol(string(v.raw, "_parent_locs_y"))))")
-    
-    # Priors for kernel parameters
-    push!(priors_list, "$(v.ls) ~ NamedDist($(_distribution_to_string(m.lengthscale)), :$(v.ls))")
-    push!(priors_list, "$(v.amplitude) ~ NamedDist(filldist($(_distribution_to_string(m.amplitude)), $(n_parents_str)), :$(Symbol(string(v.amplitude))))")
-
-    priors = join(priors_list, "\n    ")
-
-    update = """
-    begin
-        # Shot-Noise Cox Process Model: $(key_str)
-        
-        # 1. Get observation locations (centroids of areal units)
-        local obs_locs = M.centroids 
-        
-        # 2. Assemble parent locations
-        local parent_locs = hcat($(v.raw)_parent_locs_x, $(v.raw)_parent_locs_y)
-        
-        # 3. Compute intensity at each observation location centroid
-        local intensity_at_obs = fill(zero(T), M.s_N)
-        for i in 1:M.s_N
-            local intensity_i = zero(T)
-            for j in 1:$(n_parents_str)
-                # Calculate squared Euclidean distance
-                local dist_sq = (T(obs_locs[i].x) - parent_locs[j, 1])^2 + (T(obs_locs[i].y) - parent_locs[j, 2])^2
-                
-                # Evaluate the kernel (e.g., Squared Exponential)
-                local kernel_val = exp(T(-0.5) * dist_sq / ($(v.ls)^2))
-                
-                # Add the "shot" to the intensity
-                intensity_i += $(v.amplitude)[j] * kernel_val
-            end
-            intensity_at_obs[i] = intensity_i
-        end
-
-        # 4. Point Process Likelihood Evaluation for areal data
-        local grid_areas = spec_registry["$(key_str)"].hyper.areas
-        for s in 1:M.s_N
-            # y_obs is assumed to be a vector of counts for each spatial unit
-            local y_s = M.y_obs[s] 
-            local A_s = grid_areas[s]
-            
-            # Approximate integrated intensity λ_s = ∫_{A_s} Λ(u)du ≈ Λ(centroid_s) * A_s
-            local lambda_s = intensity_at_obs[s] * T(A_s)
-            
-            Turing.@addlogprob! (T(y_s) * log(lambda_s + T(1e-6)) - lambda_s)
-        end
-
-        # Signal that the likelihood has been handled
-        M[:likelihood_handled] = true
-    end
-    """
-    
-    return (priors=priors_list, update=update)
-end
  
 
 # Version 1.5.3 (2026-08-06)
@@ -2463,10 +2123,11 @@ end
  
 
 
-# Version 1.5.3 (2026-08-06)
+# Version 1.5.6 (2026-08-06)
 # Purpose: Generates Turing code for an AR(2) process.
-# Rationale: This version ensures type stability by explicitly casting `T(0)` and `T(0.001)`
-#            in the `logpdf` call.
+# Rationale: This version is updated for AD compatibility. It replaces the hard-coded
+#            `T.(I(...))` in the `MvNormal` prior with `I`, which correctly uses
+#            `UniformScaling` to allow for automatic type promotion with `Dual` numbers.
 function _generate_component_code_fragments(m::AR2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
     v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
     
@@ -2480,7 +2141,7 @@ function _generate_component_code_fragments(m::AR2, spec::NamedTuple, arch::Stri
         push!(priors_acc, "$(v.rho1) ~ NamedDist(truncated($(_distribution_to_string(m.rho1)), T(-2.0), T(2.0)), :$(v.rho1))")
         push!(priors_acc, "$(v.rho2) ~ NamedDist(truncated($(_distribution_to_string(m.rho2)), T(-1.0), T(1.0)), :$(v.rho2))")
     end
-    push!(priors_acc, "$(v.innov) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), T.(I($(n_latent)))), :$(v.innov))")
+    push!(priors_acc, "$(v.innov) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.innov))")
     priors_str = join(priors_acc, "\n")
 
     eta_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
@@ -2711,114 +2372,7 @@ function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
 end
 
 
-
-
-# Version 1.5.3 (2026-08-06)
-# Purpose: Generates the final likelihood block for univariate models.
-# Rationale: This version is updated to reflect the corrected `bstm_Likelihood` API.
-#            The distribution `d_lik` is now parameterized by the linear predictor `eta[i]`,
-#            and the `logpdf` is evaluated at the observed data `M.y_obs[i]`, ensuring
-#            correct gradient flow for AD-based samplers.
-function _generate_univariate_likelihood_block(M::NamedTuple)
-    family = string(M.likelihood_specs[1][:family])
-    any_needs_sigma = family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
-    any_needs_nu = family == "student_t"
-    any_needs_extra = family in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"]
-
-    kwargs_parts = String[]
-    if any_needs_sigma; push!(kwargs_parts, "sigma_y=sigma_y"); end
-    if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=Int(M.trials[i, 1])"); end
-    if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=T(M.weights[i, 1])"); end
-    if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=T(M.censor_lower[i, 1])"); end
-    if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=T(M.censor_upper[i, 1])"); end
-    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=T(M.hurdle[i, 1])"); end
-    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle");
-    elseif get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
-
-    extra_param_logic = if any_needs_nu && any_needs_extra
-        "local extra_p = family == \"student_t\" ? lik_nu_student_t : lik_extra_params"
-    elseif any_needs_nu
-        "local extra_p = lik_nu_student_t"
-    elseif any_needs_extra
-        "local extra_p = lik_extra_params"
-    else "" end
-    if !isempty(extra_param_logic); push!(kwargs_parts, "extra_params=extra_p"); end
-
-    kwargs_str = join(kwargs_parts, ", ")
-
-    return """
-    family = M.likelihood_specs[1][:family]
-    $(extra_param_logic)
-    for i in 1:N
-        # Construct distribution parameterized by eta[i]
-        local d_lik = bstm_Likelihood(family, eta[i]; $(kwargs_str))
-        # Evaluate logpdf at the observed data M.y_obs[i]
-        Turing.@addlogprob! Distributions.logpdf(d_lik, T(M.y_obs[i]))
-    end
-    """
-end
-
-# Version 1.5.3 (2026-08-06)
-# Purpose: Generates the final likelihood block for multivariate models.
-# Rationale: This version is updated to reflect the corrected `bstm_Likelihood` API.
-#            The distribution `d_lik` is now parameterized by the linear predictor
-#            `eta_correlated`, and the `logpdf` is evaluated at the observed data `M.y_obs`,
-#            ensuring correct gradient flow for AD-based samplers.
-function _generate_multivariate_likelihood_block(M::NamedTuple)
-    families = [string(get(spec, :family, "gaussian")) for spec in M.likelihood_specs]
-    any_needs_sigma = any(f -> f in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t", "dirichlet_multinomial"], families)
-    any_needs_nu = any(f -> f == "student_t", families)
-    any_needs_extra = any(f -> f in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"], families)
-    is_multinomial = any(f -> f == "dirichlet_multinomial", families)
-
-    if is_multinomial
-        return """
-        local eta_correlated = eta_latent * L_corr.L
-        local family = M.likelihood_specs[1][:family]
-        for i in 1:N
-            # Construct distribution parameterized by eta_correlated
-            local d_lik = bstm_Likelihood(family, eta_correlated[i, :]; trial=Int(sum(M.y_obs[i, :])) )
-            # Evaluate logpdf at the observed data vector M.y_obs[i, :]
-            Turing.@addlogprob! Distributions.logpdf(d_lik, T.(M.y_obs[i, :]))
-        end
-        """
-    end
-
-    kwargs_parts = String[]
-    if any_needs_sigma; push!(kwargs_parts, "sigma_y=sigma_y[k]"); end
-    if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=Int(M.trials[i, k])"); end
-    if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=T(M.weights[i, k])"); end
-    if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=T(M.censor_lower[i, k])"); end
-    if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=T(M.censor_upper[i, k])"); end
-    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=T(M.hurdle[i, k])"); end
-    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle");
-    elseif get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
-
-    extra_param_logic = if any_needs_nu && any_needs_extra
-        "local extra_p = family_k == \"student_t\" ? lik_nu_student_t : lik_extra_params"
-    elseif any_needs_nu
-        "local extra_p = lik_nu_student_t"
-    elseif any_needs_extra
-        "local extra_p = lik_extra_params"
-    else "" end
-    if !isempty(extra_param_logic); push!(kwargs_parts, "extra_params=extra_p"); end
-
-    kwargs_str = join(kwargs_parts, ", ")
-
-    return """
-    local eta_correlated = eta_latent * L_corr.L
-    for k in 1:K
-        local family_k = M.likelihood_specs[k][:family]
-        $(extra_param_logic)
-        for i in 1:N
-            # Construct distribution parameterized by eta_correlated
-            local d_lik = bstm_Likelihood(family_k, eta_correlated[i, k]; $(kwargs_str))
-            # Evaluate logpdf at the observed data M.y_obs[i, k]
-            Turing.@addlogprob! Distributions.logpdf(d_lik, T(M.y_obs[i, k]))
-        end
-    end
-    """
-end
+ 
 
  
 
@@ -2916,119 +2470,7 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     return interaction_code
 end
 
-
-
-# Version 1.5.3 (2026-08-06)
-# Purpose: Generates the full code block for all nested sub-models.
-# Rationale: This version is updated for AD compatibility. It replaces the broadcasted
-#            addition for the sub-model's intercept with an explicit `for` loop,
-#            preventing a potential `MethodError` during automatic differentiation.
-#            The initialization of `sub_eta_name` has been made more robust to prevent
-#            compiler specialization issues that could lead to `sub_eta_name` being
-#            `Vector{Float64}` when `T` is `ForwardDiff.Dual`.
-function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main_eta_name::String)
-    if !haskey(M, :nested_components) || isempty(M.nested_components)
-        return "", "", ""
-    end
-
-    all_nested_priors = String[]
-    all_nested_updates = String[]
-    all_nested_likelihoods = String[]
-
-    for (var_key, sub_config) in pairs(M.nested_components)
-        prefix = string(var_key)
-        sub_eta_name = "eta_$(prefix)"
-
-        # --- 1. Generate Priors for Sub-Model ---
-        if get(sub_config, :add_intercept, false)
-            prior_obj = get(sub_config, :intercept_prior, Normal(T(0),T(5)))
-            push!(all_nested_priors, "$(prefix)_intercept ~ NamedDist($(_distribution_to_string(prior_obj)), :$(Symbol(prefix, "_intercept")))")
-        end
-        
-        for spec in sub_config.components
-            frag = _generate_component_code_fragments(spec.component_obj, spec, "univariate", nothing, sub_config; prefix=prefix)
-            push!(all_nested_priors, frag.priors)
-        end
-        
-        sub_lik_spec = sub_config.likelihood_specs[1]
-        sub_family_str = string(get(sub_lik_spec, :family, "gaussian"))
-        if sub_family_str in ["gaussian", "lognormal", "student_t"]
-            push!(all_nested_priors, "$(prefix)_y_sigma ~ NamedDist(Exponential(T(1.0)), :$(Symbol(prefix, "_y_sigma")))")
-        end
-
-        # --- 2. Generate Update Block for Sub-Model's Linear Predictor ---
-        intercept_block = if get(sub_config, :add_intercept, false)
-            """
-            for i in 1:sub_M.y_N
-                $(sub_eta_name)[i] += $(prefix)_intercept
-            end
-            """
-        else
-            ""
-        end
-
-        offset_block = if haskey(sub_config, :log_offsets) && !all(iszero, sub_config.log_offsets)
-            """
-            for i in 1:sub_M.y_N
-                $(sub_eta_name)[i] += T(sub_M.log_offsets[i, 1])
-            end
-            """
-        else
-            ""
-        end
-
-        # --- FIX: Robust initialization of sub_eta_name ---
-        sub_eta_initialization_code = """
-        $(sub_eta_name) = Vector{T}(undef, sub_M.y_N)
-        for n_idx in 1:sub_M.y_N
-            $(sub_eta_name)[n_idx] = zero(T)
-        end
-        """
-        # --- END FIX ---
-
-        update_block = """
-        # --- Nested Model: $(prefix) ---
-        local $(sub_eta_name)
-        let sub_M = M.nested_components[:$(var_key)]
-            # Initialize the linear predictor for the sub-model
-            \$(sub_eta_initialization_code)
-            \$(intercept_block)
-            \$(offset_block)
-        """
-        
-        for spec in sub_config.components
-            frag = _generate_component_code_fragments(spec.component_obj, spec, "univariate", nothing, sub_config; prefix=prefix)
-            update_block *= "\n" * frag.update
-        end
-        update_block *= "\n        end" # End of the `let` block
-        push!(all_nested_updates, update_block)
-
-        # --- 3. Generate Linking Code ---
-        rho_name = "rho_nested_$(prefix)"
-        push!(all_nested_priors, "$(rho_name) ~ NamedDist(Normal(T(1.0), T(0.5)), :$(rho_name))")
-        push!(all_nested_updates, "$(main_eta_name) .+= $(rho_name) .* $(sub_eta_name)")
-
-        # --- 4. Generate Likelihood for Sub-Model ---
-        kwargs_parts = String[]
-        if sub_family_str in ["gaussian", "lognormal", "student_t"]; push!(kwargs_parts, "sigma_y=$(prefix)_y_sigma"); end
-        kwargs_str = join(kwargs_parts, ", ")
-
-        lik_loop = """
-        # Likelihood for nested model: $(prefix)
-        let sub_M = M.nested_components[:$(var_key)]
-            sub_family_str = string(sub_M.likelihood_specs[1][:family])
-            for i in 1:sub_M.y_N
-                local d_lik_sub = bstm_Likelihood(sub_family_str, sub_eta_name[i]; $(kwargs_str))
-                Turing.@addlogprob! Distributions.logpdf(d_lik_sub, T(sub_M.y_obs[i]))
-            end
-        end
-        """
-        push!(all_nested_likelihoods, lik_loop)
-    end
-
-    return join(all_nested_priors, "\n\n"), join(all_nested_updates, "\n\n"), join(all_nested_likelihoods, "\n\n")
-end
-
+ 
 
 
 # Version 1.5.0 (2026-08-06)
@@ -3054,27 +2496,8 @@ function _generate_intercept_block(M::NamedTuple, is_multivariate::Bool, eta_nam
     prior_code = "intercept ~ NamedDist($(dist_str), :intercept)"
     return prior_code, update_code
 end
-# Version 1.5.3 (2026-08-06)
-# Purpose: Generates the code block for adding log-offsets to the linear predictor.
-# Rationale: This version ensures type stability by explicitly casting the log_offsets
-#            to the model's generic numeric type `T`. This prevents potential
-#            `MethodError` during automatic differentiation when `eta` is a
-#            `Vector{ForwardDiff.Dual}` and `M.log_offsets[:, 1]` is a `Vector{Float64}`.
-function _generate_offset_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
-    # This function generates the code to add log-offsets to the linear predictor.
-    if !haskey(M, :log_offsets) || all(iszero, M[:log_offsets])
-        return ""
-    end
-    
-    if is_multivariate
-        # Broadcast the matrix of offsets to the eta_latent matrix
-        return "$(eta_name) .+= T.(M.log_offsets)"
-    else
-        # Broadcast the vector of offsets to the eta vector
-        return "$(eta_name) .+= T.(M.log_offsets[:, 1])"
-    end
-end
 
+ 
 
 # Version 1.5.0 (2026-08-06)
 # Purpose: Generates the code block for adding fixed effects to the linear predictor.
@@ -3165,11 +2588,13 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
 end
 
 
-# Version 1.5.3 (2026-08-06)
-# Purpose: Generates code for standard GMRF-based components.
-# Rationale: This version simplifies the generated code by removing AD-specific workarounds
-#            and replacing explicit loops with more efficient and readable broadcasting.
-#            The `begin...end` blocks and `local` keywords are removed for clarity.
+# Version 1.5.8 (2026-08-06)
+# Purpose: Generates Turing code for standard GMRF components.
+# Rationale: This version is updated to be more AD-friendly. For dynamic components
+#            (where the precision matrix depends on a sampled parameter like `rho`), it
+#            now passes a type-stable `one` value to `recompose_precision` and uses
+#            `UniformScaling` (`I`) in the `cholesky` call. This avoids hard-coded `Float64`
+#            types that cause `MethodError` with `ForwardDiff.Dual` numbers.
 function _generate_component_code_fragments(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="", generate_eta_update::Bool=true)
     # This function generates the Turing model code for a generic GMRF component.
     # It defines priors, constructs the precision matrix, and samples the final effect.
@@ -3218,16 +2643,22 @@ function _generate_component_code_fragments(m::ComponentModel, spec::NamedTuple,
         flow_direction_kwarg = (m isa NetworkFlow) ? ", flow_direction=:$(m.flow_direction)" : ""
         """
         # Dynamic component: $(spec.key)
-        Q_template = spec_registry["$(spec.key)"].Q_template
-        model_type = spec_registry["$(spec.key)"].component_obj |> typeof |> Symbol
-        rho_value = $(hasproperty(m, :rho) ? v.rho : "nothing")
-        
-        Q_final = recompose_precision(model_type, Q_template, T(1.0); extra_param=rho_value$(flow_direction_kwarg), noise=noise)
-        F_dynamic = cholesky(Symmetric(Matrix(Q_final) + noise * T.(I(size(Q_final, 1)))))
-        
-        unscaled_latent = F_dynamic.L' \\ $(v.raw)
-        $(v.latent) = $(v.sigma) .* unscaled_latent
-        $(effect_app_str)
+        let
+            Q_template = spec_registry["$(spec.key)"].Q_template
+            model_type = spec_registry["$(spec.key)"].component_obj |> typeof |> Symbol
+            rho_value = $(hasproperty(m, :rho) ? v.rho : "nothing")
+            
+            # Pass a type-stable 1.0 to ensure promotion with Dual numbers from rho_value
+            one_val = isnothing(rho_value) ? one(T) : one(typeof(rho_value))
+            Q_final = recompose_precision(model_type, Q_template, one_val; extra_param=rho_value$(flow_direction_kwarg), noise=noise)
+            
+            # Use UniformScaling 'I' for AD-safety. Note: cholesky on a Dual matrix may still fail if it dispatches to LAPACK.
+            F_dynamic = cholesky(Symmetric(Matrix(Q_final) + noise * I))
+            
+            unscaled_latent = F_dynamic.L' \\ $(v.raw)
+            $(v.latent) = $(v.sigma) .* unscaled_latent
+            $(effect_app_str)
+        end
         """
     end
 
@@ -3235,10 +2666,13 @@ function _generate_component_code_fragments(m::ComponentModel, spec::NamedTuple,
 end
 
 
-# Version 1.5.0 (2026-08-06)
+# Version 1.5.8 (2026-08-06)
 # Purpose: Generates Turing code for an AR(1) process.
-# Rationale: This version simplifies the generated code by removing explicit loops and
-#            using efficient broadcasting with `view()`.
+# Rationale: This version corrects the prior for the `rho` parameter. Instead of using a
+#            conceptually incorrect `truncated(Beta, ...)` distribution, it now uses a `tanh`
+#            transformation on an unconstrained `Normal` variable. This correctly maps the
+#            parameter to the `(-1, 1)` range required for a stationary AR(1) process and
+#            ensures stable gradient-based sampling.
 function _generate_component_code_fragments(m::AR1, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
     # This function generates the Turing model code for an AR(1) temporal component.
     v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
@@ -3250,7 +2684,8 @@ function _generate_component_code_fragments(m::AR1, spec::NamedTuple, arch::Stri
     priors_acc = String[]
     if !is_multivariate || (is_multivariate && (!is_shared || outcome_idx == 1))
         push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
-        push!(priors_acc, "$(v.rho) ~ NamedDist(truncated($(_distribution_to_string(m.rho)), -0.9999, 0.9999), :$(v.rho))")
+        # Use a tanh transform for rho to constrain it to (-1, 1)
+        push!(priors_acc, "$(v.rho)_raw ~ NamedDist(Normal(0, 1.5), :$(Symbol(string(v.rho, "_raw"))))")
     end
     push!(priors_acc, "$(v.innov) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.innov))")
     priors_str = join(priors_acc, "\n")
@@ -3260,12 +2695,15 @@ function _generate_component_code_fragments(m::AR1, spec::NamedTuple, arch::Stri
 
     update_str = """
     # AR1 state-space evolution for $(spec.key)
+    $(v.rho) = tanh($(v.rho)_raw) # Transform to (-1, 1)
     latent_year = ar1_statespace($(v.rho), $(v.sigma), $(v.innov), $(n_latent), noise)
     $(eta_target) .+= view(latent_year, M.$(index_var))
     """
     
     return (priors=priors_str, update=update_str)
 end
+
+
 
 # Version 1.5.3 (2026-08-06)
 # Purpose: Implements a state-space evolution for an AR(1) process.
@@ -3331,4 +2769,569 @@ function ar2_statespace(rho1, rho2, sigma, innov::AbstractVector, n_latent::Int,
     end
 
     return latent
+end
+# Version 1.5.8 (2026-08-06)
+# Purpose: Generates the main model string for the Turing model.
+# Rationale: This version modifies the initialization of the linear predictor `eta`.
+#            Instead of being hardcoded to `zeros(T, ...)` (where T is often Float64),
+#            `eta` is now initialized with a type inferred from the `intercept` parameter.
+#            During automatic differentiation, `intercept` becomes a `ForwardDiff.Dual` number,
+#            so `eta` will be correctly allocated as a `Vector{Dual}`, preventing a `MethodError`
+#            when `Dual`-valued parameters are added to it.
+function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
+    # This function assembles the full Turing model string from various code fragments.
+    # It orchestrates the inclusion of priors, the linear predictor assembly, and the
+    # final likelihood evaluation.
+
+    arch = get(M, :model_arch, "univariate")
+    is_multivariate = arch == "multivariate"
+
+    eta_name = is_multivariate ? "eta_latent" : "eta"
+    # New `eta` initialization logic to ensure AD compatibility.
+    # It infers the element type from the `intercept` parameter, which will be a
+    # `ForwardDiff.Dual` during automatic differentiation.
+    eta_init = if is_multivariate
+        "zeros(typeof(intercept) <: AbstractArray ? eltype(intercept) : typeof(intercept), N, K)"
+    else
+        "zeros(typeof(intercept) <: AbstractArray ? eltype(intercept) : typeof(intercept), N)"
+    end
+    outcomes_N = get(M, :outcomes_N, 1)
+
+    spec_registry = Dict{String, Any}()
+    priors_acc = String[]
+    updates_acc = String[]
+
+    main_spatial_spec = nothing
+    main_temporal_spec = nothing
+    
+    has_custom_likelihood_from_component = any(spec -> any(T -> spec.component_obj isa T, [LGCP, LogGammaCoxProcess, ShotNoiseCoxProcess]), M.components)
+    has_custom_likelihood_from_family = any(spec -> string(get(spec, :family, "")) == "ordinal", M.likelihood_specs)
+    has_custom_likelihood = has_custom_likelihood_from_component || has_custom_likelihood_from_family
+
+    # Generate all code fragments first
+    intercept_priors, intercept_update = _generate_intercept_block(M, is_multivariate, eta_name)
+    if !isempty(intercept_priors); push!(priors_acc, intercept_priors); end
+    
+    offset_block = _generate_offset_block(M, is_multivariate, eta_name)
+    
+    fixed_effects_priors, fixed_effects_update = _generate_fixed_effects_block(M, is_multivariate, eta_name)
+    if !isempty(fixed_effects_priors); push!(priors_acc, fixed_effects_priors); end
+    
+    # The update blocks must be ordered correctly: intercept, then others.
+    push!(updates_acc, intercept_update)
+    push!(updates_acc, offset_block)
+    push!(updates_acc, fixed_effects_update)
+
+
+    if get(M, :is_multivariate_dynamics, false)
+        mv_dyn_key = M[:multivariate_dynamics_key]
+        spec_idx = findfirst(s -> string(s.key) == mv_dyn_key, M.components)
+        if !isnothing(spec_idx)
+            spec = M.components[spec_idx]
+            spec_registry[string(spec.key)] = spec
+            frags = _generate_component_code_fragments(spec.component_obj, spec, arch, nothing, M)
+            push!(priors_acc, frags.priors)
+            push!(updates_acc, frags.update)
+        end
+    end
+
+    for spec in M.components
+        if get(M, :is_multivariate_dynamics, false) && string(spec.key) == M[:multivariate_dynamics_key]
+            continue
+        end
+        spec_registry[string(spec.key)] = spec
+        for k in 1:outcomes_N
+            outcome_idx = is_multivariate ? k : nothing            
+            frag = _generate_component_code_fragments(spec.component_obj, spec, arch, outcome_idx, M)
+            if !isempty(Base.strip(frag.priors)); push!(priors_acc, frag.priors); end
+            if !isempty(Base.strip(frag.update)); push!(updates_acc, frag.update); end
+        end
+
+        if spec.structure == :spatial && isnothing(main_spatial_spec); main_spatial_spec = spec; end
+        if spec.structure == :temporal && isnothing(main_temporal_spec); main_temporal_spec = spec; end
+    end
+
+    function _indent_block(text::String, level=1)
+        if isempty(Base.strip(text)) return "" end
+        indent_str = "    " ^ level
+        return indent_str * replace(Base.strip(text), "\n" => "\n" * indent_str)
+    end
+
+    likelihood_section_priors = _generate_likelihood_section(M, is_multivariate)
+    st_interaction_block = _generate_st_interaction_block(M, main_spatial_spec, main_temporal_spec, is_multivariate, eta_name)
+    householder_priors, householder_update = _generate_householder_reflection_block(M, is_multivariate, eta_name)
+    
+    final_likelihood = if has_custom_likelihood
+        if has_custom_likelihood_from_family; _generate_final_likelihood_block(M, is_multivariate); else ""; end
+    else
+        _generate_final_likelihood_block(M, is_multivariate)
+    end
+    
+    nested_priors, nested_updates, nested_likelihoods = _generate_nested_model_block(M, is_multivariate, eta_name)
+    
+    # Add all remaining priors to the accumulator
+    if !isempty(Base.strip(likelihood_section_priors)); push!(priors_acc, likelihood_section_priors); end
+    if !isempty(Base.strip(householder_priors)); push!(priors_acc, householder_priors); end
+    if !isempty(Base.strip(nested_priors)); push!(priors_acc, nested_priors); end
+
+    priors_code = join(priors_acc, "\n\n")
+    updates_code = join(updates_acc, "\n\n")
+
+    model_string = """
+@model function $(model_func_name)(M, spec_registry; T::Type=Float64)
+    noise = T(M.noise)
+    N = M.y_N
+    K = $(outcomes_N)
+
+    # --- Priors & Hyperparameters ---
+$(_indent_block(priors_code))
+
+    # --- Linear Predictor ---
+    # Initialize eta with a type that matches the intercept to support AD.
+    $(eta_name) = $(eta_init)
+
+$(_indent_block(updates_code))
+$(_indent_block(householder_update))
+$(_indent_block(nested_updates))
+$(_indent_block(st_interaction_block))
+
+    # --- Likelihood ---
+$(_indent_block(final_likelihood))
+$(_indent_block(nested_likelihoods))
+end
+"""
+ 
+    model_string_to_parse = model_string
+    
+    try
+        return model_string_to_parse, Meta.parse(model_string_to_parse), spec_registry
+    catch e
+        println("BSTM Assembler Error: Failed to parse the generated model string.")
+        println(model_string_to_parse)
+        rethrow(e)
+    end
+end
+
+# Version 1.5.8 (2026-08-06)
+# Purpose: Generates the code block for adding log-offsets to the linear predictor.
+# Rationale: This version removes the explicit cast `T.(...)` from the log_offsets.
+#            This prevents a `MethodError` during automatic differentiation when `eta` is a
+#            `Vector{ForwardDiff.Dual}` and the code attempts to cast a `Dual` number
+#            back to `Float64`. Standard promotion rules for `Dual + Float64` are sufficient.
+function _generate_offset_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
+    # This function generates the code to add log-offsets to the linear predictor.
+    if !haskey(M, :log_offsets) || all(iszero, M[:log_offsets])
+        return ""
+    end
+    
+    if is_multivariate
+        # Broadcast the matrix of offsets to the eta_latent matrix
+        return "$(eta_name) .+= M.log_offsets"
+    else
+        # Broadcast the vector of offsets to the eta vector
+        return "$(eta_name) .+= M.log_offsets[:, 1]"
+    end
+end
+
+
+# Version 1.5.5 (2026-08-06)
+# Purpose: Generates Turing code fragments for the `Eigen` (Bayesian PCA) component.
+# Rationale: This version removes the explicit cast `T.(...)` from the observed data
+#            `Y_eigen_data` inside the `logpdf` call. This is a critical fix to prevent a
+#            `MethodError` during automatic differentiation (e.g., with NUTS), which occurs
+#            if `Y_eigen_data` is promoted to a `ForwardDiff.Dual` number and the code
+#            attempts to cast it back to `Float64`.
+function _generate_component_code_fragments(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
+    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
+    key_str = string(spec.key)
+    
+    n_vars = m.n_vars
+    n_factors = m.n_factors
+    n_obs = size(spec.hyper.eigen_data, 1)
+
+    pca_sd_prior_str = _distribution_to_string(m.pca_sd)
+    pdef_sd_prior_str = _distribution_to_string(m.pdef_sd)
+
+    priors_str = """
+    # Priors for eigen component: $(key_str)
+    $(v.v_raw) ~ NamedDist(MvNormal(zeros(T, $(length(m.ltri_indices))), T(1.0)), :$(v.v_raw))
+    $(v.pca_sd) ~ NamedDist(filldist($(pca_sd_prior_str), $(n_factors)), :$(v.pca_sd))
+    $(v.pdef_sd) ~ NamedDist(filldist($(pdef_sd_prior_str), $(n_vars)), :$(v.pdef_sd))
+    $(v.factors_flat) ~ NamedDist(MvNormal(zeros(T, $(n_obs * n_factors)), I), :$(v.factors_flat))
+    """
+
+    update_str = """
+    begin
+        # --- Factor Model for Eigen Component: $(key_str) ---
+        local v_mat = zeros(T, $(n_vars), $(n_factors)); v_mat[$(m.ltri_indices)] .= $(v.v_raw)
+        local U = householder_to_eigenvector(v_mat, $(n_vars), $(n_factors))
+        local L = U * Diagonal($(v.pca_sd))
+        local F = reshape($(v.factors_flat), $(n_obs), $(n_factors))
+        local Y_hat = F * L'
+        local Psi = Diagonal($(v.pdef_sd).^2) + (T(noise) * I)
+        
+        local Y_eigen_data = spec_registry["$(key_str)"].hyper.eigen_data
+        for i in 1:$(n_obs)
+            # Do NOT cast Y_eigen_data to T, as this breaks AD.
+            Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), Y_eigen_data[i, :])
+        end
+        eta .+= sum(F, dims=2)
+    end
+    """
+    return (priors=priors_str, update=update_str)
+end
+
+# Version 1.5.5 (2026-08-06)
+# Purpose: Generates Turing code fragments for the `LogGammaCoxProcess` component.
+# Rationale: This version removes the explicit cast `T(...)` from the observed data `y_st`
+#            inside the `logpdf` call. This prevents a `MethodError` during automatic
+#            differentiation when `y_st` is promoted to a `Dual` number.
+function _generate_component_code_fragments(m::LogGammaCoxProcess, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
+    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
+    key_str = string(spec.key)
+
+    is_spatiotemporal = hasproperty(spec.hyper, :temporal_spec)
+    n_latent_dims = is_spatiotemporal ? "M.s_N * M.t_N" : "M.s_N"
+
+    # Priors for the Gamma shape and the raw innovations for the latent field
+    priors = """
+    # Log-Gamma Cox Process Priors
+    $(v.innov) ~ NamedDist($(_distribution_to_string(m.shape)), :$(v.innov)) # Using 'innov' for the shape parameter
+    $(v.raw) ~ NamedDist(MvNormal(fill(zero(T), $(n_latent_dims)), I), :$(v.raw))
+    """
+
+    update = """
+    begin
+        # Log-Gamma Cox Process Model: $(key_str)
+        local latent_field_st = zeros(T, M.s_N, M.t_N)
+        
+        # 1. Reconstruct the latent spatiotemporal field Z(s,t)
+        if $(is_spatiotemporal)
+            local s_spec = spec_registry["$(key_str)"].hyper.inner_spec
+            local t_spec = spec_registry["$(key_str)"].hyper.temporal_spec
+            local C_s = cholesky(Symmetric(Matrix(s_spec.Q_template) + noise * I))
+            local C_t = cholesky(Symmetric(Matrix(t_spec.Q_template) + noise * I))
+            local Z_matrix = reshape($(v.raw), M.s_N, M.t_N)
+            local tmp_spatial = C_s.U \\ Z_matrix
+            latent_field_st = exp.(transpose(C_t.U \\ transpose(tmp_spatial))) # Exponentiate to ensure positivity
+        else
+            local Q_inner = spec_registry["$(key_str)"].hyper.inner_spec.Q_template
+            local F_inner = cholesky(Symmetric(Matrix(Q_inner) + noise * I))
+            local spatial_component = exp.(F_inner.U \\ $(v.raw)) # Exponentiate
+            latent_field_st = repeat(spatial_component, 1, M.t_N)
+        end
+
+        # 2. Assemble the full mean intensity surface.
+        local mean_intensity_surface = zeros(T, M.s_N, M.t_N)
+        local gamma_shape = $(v.innov) # The learned shape parameter
+
+        for t in 1:M.t_N, s in 1:M.s_N
+            obs_indices = findall(i -> M.s_idx[i] == s && M.t_idx[i] == t, 1:N)
+            base_contribution = isempty(obs_indices) ? zero(T) : mean(view(eta, obs_indices))
+            mean_intensity_surface[s, t] = exp(base_contribution) * latent_field_st[s, t]
+        end
+
+        # 3. Point Process Likelihood Evaluation using Negative Binomial
+        local grid_areas = spec_registry["$(key_str)"].hyper.areas
+        for t in 1:M.t_N, s in 1:M.s_N
+            local y_st = M.y_obs[s, t]
+            local A_s = grid_areas[s]
+            local mu = mean_intensity_surface[s, t] * A_s
+            
+            local r_nb = gamma_shape
+            local p_nb = r_nb / (r_nb + mu)
+            local nb_dist = NegativeBinomial(r_nb, p_nb)
+            # Do NOT cast y_st to T, as this breaks AD.
+            Turing.@addlogprob! logpdf(nb_dist, y_st)
+        end
+
+        M[:likelihood_handled] = true
+    end
+    """
+
+    return (priors=priors, update=update)
+end
+
+# Version 1.5.5 (2026-08-06)
+# Purpose: Generates Turing code fragments for the `ShotNoiseCoxProcess` component.
+# Rationale: This version removes the explicit cast `T(...)` from the observed data `y_s`
+#            inside the `logpdf` calculation. This prevents a `MethodError` during automatic
+#            differentiation when `y_s` is promoted to a `Dual` number.
+function _generate_component_code_fragments(m::ShotNoiseCoxProcess, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
+    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
+    key_str = string(spec.key)
+
+    n_parents_str = if m.n_parents isa Int
+        string(m.n_parents)
+    else
+        "$(v.innov)_n_parents"
+    end
+
+    priors_list = String[]
+    if m.n_parents isa UnivariateDistribution
+        push!(priors_list, "$(n_parents_str) ~ NamedDist($(_distribution_to_string(m.n_parents)), :$(Symbol(n_parents_str)))")
+    end
+    
+    bounds = spec.hyper.domain_bounds
+    push!(priors_list, "$(v.raw)_parent_locs_x ~ NamedDist(filldist(Uniform(T($(bounds.x_min)), T($(bounds.x_max))), $(n_parents_str)), :$(Symbol(string(v.raw, "_parent_locs_x"))))")
+    push!(priors_list, "$(v.raw)_parent_locs_y ~ NamedDist(filldist(Uniform(T($(bounds.y_min)), T($(bounds.y_max))), $(n_parents_str)), :$(Symbol(string(v.raw, "_parent_locs_y"))))")
+    push!(priors_list, "$(v.ls) ~ NamedDist($(_distribution_to_string(m.lengthscale)), :$(v.ls))")
+    push!(priors_list, "$(v.amplitude) ~ NamedDist(filldist($(_distribution_to_string(m.amplitude)), $(n_parents_str)), :$(Symbol(string(v.amplitude))))")
+
+    priors = join(priors_list, "\n    ")
+
+    update = """
+    begin
+        # Shot-Noise Cox Process Model: $(key_str)
+        local obs_locs = M.centroids 
+        local parent_locs = hcat($(v.raw)_parent_locs_x, $(v.raw)_parent_locs_y)
+        
+        local intensity_at_obs = fill(zero(T), M.s_N)
+        for i in 1:M.s_N
+            local intensity_i = zero(T)
+            for j in 1:$(n_parents_str)
+                local dist_sq = (obs_locs[i].x - parent_locs[j, 1])^2 + (obs_locs[i].y - parent_locs[j, 2])^2
+                local kernel_val = exp(T(-0.5) * dist_sq / ($(v.ls)^2))
+                intensity_i += $(v.amplitude)[j] * kernel_val
+            end
+            intensity_at_obs[i] = intensity_i
+        end
+
+        local grid_areas = spec_registry["$(key_str)"].hyper.areas
+        for s in 1:M.s_N
+            local y_s = M.y_obs[s] 
+            local A_s = grid_areas[s]
+            local lambda_s = intensity_at_obs[s] * A_s
+            
+            # Do NOT cast y_s to T, as this breaks AD.
+            Turing.@addlogprob! (y_s * log(lambda_s + T(1e-6)) - lambda_s)
+        end
+
+        M[:likelihood_handled] = true
+    end
+    """
+    
+    return (priors=priors, update=update)
+end
+
+# Version 1.5.5 (2026-08-06)
+# Purpose: Generates the full code block for all nested sub-models.
+# Rationale: This version removes the explicit cast `T(...)` from the observed data
+#            `sub_M.y_obs[i]` and `sub_M.log_offsets` inside the model. This prevents a
+#            `MethodError` during automatic differentiation when these data-derived values
+#            are involved in operations with `Dual` numbers.
+function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main_eta_name::String)
+    if !haskey(M, :nested_components) || isempty(M.nested_components)
+        return "", "", ""
+    end
+
+    all_nested_priors = String[]
+    all_nested_updates = String[]
+    all_nested_likelihoods = String[]
+
+    for (var_key, sub_config) in pairs(M.nested_components)
+        prefix = string(var_key)
+        sub_eta_name = "eta_$(prefix)"
+
+        # --- 1. Generate Priors for Sub-Model ---
+        if get(sub_config, :add_intercept, false)
+            prior_obj = get(sub_config, :intercept_prior, Normal(T(0),T(5)))
+            push!(all_nested_priors, "$(prefix)_intercept ~ NamedDist($(_distribution_to_string(prior_obj)), :$(Symbol(prefix, "_intercept")))")
+        end
+        
+        for spec in sub_config.components
+            frag = _generate_component_code_fragments(spec.component_obj, spec, "univariate", nothing, sub_config; prefix=prefix)
+            push!(all_nested_priors, frag.priors)
+        end
+        
+        sub_lik_spec = sub_config.likelihood_specs[1]
+        sub_family_str = string(get(sub_lik_spec, :family, "gaussian"))
+        if sub_family_str in ["gaussian", "lognormal", "student_t"]
+            push!(all_nested_priors, "$(prefix)_y_sigma ~ NamedDist(Exponential(T(1.0)), :$(Symbol(prefix, "_y_sigma")))")
+        end
+
+        # --- 2. Generate Update Block for Sub-Model's Linear Predictor ---
+        intercept_block = if get(sub_config, :add_intercept, false)
+            """
+            for i in 1:sub_M.y_N
+                $(sub_eta_name)[i] += $(prefix)_intercept
+            end
+            """
+        else
+            ""
+        end
+
+        offset_block = if haskey(sub_config, :log_offsets) && !all(iszero, sub_config.log_offsets)
+            """
+            for i in 1:sub_M.y_N
+                $(sub_eta_name)[i] += sub_M.log_offsets[i, 1]
+            end
+            """
+        else
+            ""
+        end
+
+        sub_eta_initialization_code = """
+        $(sub_eta_name) = Vector{T}(undef, sub_M.y_N)
+        for n_idx in 1:sub_M.y_N
+            $(sub_eta_name)[n_idx] = zero(T)
+        end
+        """
+
+        update_block = """
+        # --- Nested Model: $(prefix) ---
+        local $(sub_eta_name)
+        let sub_M = M.nested_components[:$(var_key)]
+            # Initialize the linear predictor for the sub-model
+            \$(sub_eta_initialization_code)
+            \$(intercept_block)
+            \$(offset_block)
+        """
+        
+        for spec in sub_config.components
+            frag = _generate_component_code_fragments(spec.component_obj, spec, "univariate", nothing, sub_config; prefix=prefix)
+            update_block *= "\n" * frag.update
+        end
+        update_block *= "\n        end" # End of the `let` block
+        push!(all_nested_updates, update_block)
+
+        # --- 3. Generate Linking Code ---
+        rho_name = "rho_nested_$(prefix)"
+        push!(all_nested_priors, "$(rho_name) ~ NamedDist(Normal(T(1.0), T(0.5)), :$(rho_name))")
+        push!(all_nested_updates, "$(main_eta_name) .+= $(rho_name) .* $(sub_eta_name)")
+
+        # --- 4. Generate Likelihood for Sub-Model ---
+        kwargs_parts = String[]
+        if sub_family_str in ["gaussian", "lognormal", "student_t"]; push!(kwargs_parts, "sigma_y=$(prefix)_y_sigma"); end
+        kwargs_str = join(kwargs_parts, ", ")
+
+        lik_loop = """
+        # Likelihood for nested model: $(prefix)
+        let sub_M = M.nested_components[:$(var_key)]
+            sub_family_str = string(sub_M.likelihood_specs[1][:family])
+            for i in 1:sub_M.y_N
+                local d_lik_sub = bstm_Likelihood(sub_family_str, $(sub_eta_name)[i]; $(kwargs_str))
+                # Do NOT cast sub_M.y_obs to T, as this breaks AD.
+                Turing.@addlogprob! Distributions.logpdf(d_lik_sub, sub_M.y_obs[i])
+            end
+        end
+        """
+        push!(all_nested_likelihoods, lik_loop)
+    end
+
+    return join(all_nested_priors, "\n\n"), join(all_nested_updates, "\n\n"), join(all_nested_likelihoods, "\n\n")
+end
+
+# Version 1.5.5 (2026-08-06)
+# Purpose: Generates the final likelihood block for univariate models.
+# Rationale: This version removes the explicit cast of the observed data `M.y_obs[i]`
+#            to the model's float type `T` inside the `logpdf` call. This is a critical
+#            fix to prevent a `MethodError` during automatic differentiation (e.g., with NUTS),
+#            which occurs if `M.y_obs` is promoted to a `ForwardDiff.Dual` number and the
+#            code attempts to cast it back to `Float64`. The `logpdf` function is robust
+#            enough to handle a `Dual`-parameterized distribution evaluated at `Float64` data.
+function _generate_univariate_likelihood_block(M::NamedTuple)
+    family = string(M.likelihood_specs[1][:family])
+    any_needs_sigma = family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
+    any_needs_nu = family == "student_t"
+    any_needs_extra = family in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"]
+
+    kwargs_parts = String[]
+    if any_needs_sigma; push!(kwargs_parts, "sigma_y=sigma_y"); end
+    if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=Int(M.trials[i, 1])"); end
+    if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=T(M.weights[i, 1])"); end
+    if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=T(M.censor_lower[i, 1])"); end
+    if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=T(M.censor_upper[i, 1])"); end
+    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=T(M.hurdle[i, 1])"); end
+    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle");
+    elseif get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
+
+    extra_param_logic = if any_needs_nu && any_needs_extra
+        "local extra_p = family == \"student_t\" ? lik_nu_student_t : lik_extra_params"
+    elseif any_needs_nu
+        "local extra_p = lik_nu_student_t"
+    elseif any_needs_extra
+        "local extra_p = lik_extra_params"
+    else "" end
+    if !isempty(extra_param_logic); push!(kwargs_parts, "extra_params=extra_p"); end
+
+    kwargs_str = join(kwargs_parts, ", ")
+
+    return """
+    family = M.likelihood_specs[1][:family]
+    $(extra_param_logic)
+    for i in 1:N
+        # Construct distribution parameterized by eta[i]
+        local d_lik = bstm_Likelihood(family, eta[i]; $(kwargs_str))
+        # Evaluate logpdf at the observed data M.y_obs[i].
+        # Do NOT cast M.y_obs[i] to T, as this breaks AD if y_obs is promoted to a Dual.
+        Turing.@addlogprob! Distributions.logpdf(d_lik, M.y_obs[i])
+    end
+    """
+end
+
+# Version 1.5.5 (2026-08-06)
+# Purpose: Generates the final likelihood block for multivariate models.
+# Rationale: This version removes the explicit cast of the observed data `M.y_obs`
+#            to the model's float type `T` inside the `logpdf` call. This is a critical
+#            fix to prevent a `MethodError` during automatic differentiation (e.g., with NUTS),
+#            which occurs if `M.y_obs` is promoted to a `ForwardDiff.Dual` number and the
+#            code attempts to cast it back to `Float64`. The `logpdf` function is robust
+#            enough to handle a `Dual`-parameterized distribution evaluated at `Float64` data.
+function _generate_multivariate_likelihood_block(M::NamedTuple)
+    families = [string(get(spec, :family, "gaussian")) for spec in M.likelihood_specs]
+    any_needs_sigma = any(f -> f in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t", "dirichlet_multinomial"], families)
+    any_needs_nu = any(f -> f == "student_t", families)
+    any_needs_extra = any(f -> f in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"], families)
+    is_multinomial = any(f -> f == "dirichlet_multinomial", families)
+
+    if is_multinomial
+        return """
+        local eta_correlated = eta_latent * L_corr.L
+        local family = M.likelihood_specs[1][:family]
+        for i in 1:N
+            # Construct distribution parameterized by eta_correlated
+            local d_lik = bstm_Likelihood(family, eta_correlated[i, :]; trial=Int(sum(M.y_obs[i, :])) )
+            # Evaluate logpdf at the observed data vector M.y_obs[i, :].
+            # Do NOT cast M.y_obs to T, as this breaks AD.
+            Turing.@addlogprob! Distributions.logpdf(d_lik, M.y_obs[i, :])
+        end
+        """
+    end
+
+    kwargs_parts = String[]
+    if any_needs_sigma; push!(kwargs_parts, "sigma_y=sigma_y[k]"); end
+    if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=Int(M.trials[i, k])"); end
+    if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=T(M.weights[i, k])"); end
+    if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=T(M.censor_lower[i, k])"); end
+    if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=T(M.censor_upper[i, k])"); end
+    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=T(M.hurdle[i, k])"); end
+    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle");
+    elseif get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
+
+    extra_param_logic = if any_needs_nu && any_needs_extra
+        "local extra_p = family_k == \"student_t\" ? lik_nu_student_t : lik_extra_params"
+    elseif any_needs_nu
+        "local extra_p = lik_nu_student_t"
+    elseif any_needs_extra
+        "local extra_p = lik_extra_params"
+    else "" end
+    if !isempty(extra_param_logic); push!(kwargs_parts, "extra_params=extra_p"); end
+
+    kwargs_str = join(kwargs_parts, ", ")
+
+    return """
+    local eta_correlated = eta_latent * L_corr.L
+    for k in 1:K
+        local family_k = M.likelihood_specs[k][:family]
+        $(extra_param_logic)
+        for i in 1:N
+            # Construct distribution parameterized by eta_correlated
+            local d_lik = bstm_Likelihood(family_k, eta_correlated[i, k]; $(kwargs_str))
+            # Evaluate logpdf at the observed data M.y_obs[i, k].
+            # Do NOT cast M.y_obs to T, as this breaks AD.
+            Turing.@addlogprob! Distributions.logpdf(d_lik, M.y_obs[i, k])
+        end
+    end
+    """
 end
