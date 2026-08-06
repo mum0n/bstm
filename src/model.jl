@@ -4442,56 +4442,51 @@ end
 
 
 
-
-"""
-    evaluate_cross_kernel_matrix(coords1, coords2, param_val, ls, kernel_type)
-
-Computes the cross-covariance kernel matrix between two sets of coordinates.
-
-# Rationale
-This function is essential for sparse GP methods like FITC, which require the
-computation of the covariance between the data points (X) and the inducing points (Z).
-It supports both isotropic and Automatic Relevance Determination (ARD) kernels.
-"""
+# Version 1.5.3 (2026-08-06)
+# Purpose: Computes the cross-covariance kernel matrix between two sets of coordinates.
+# Rationale: This version ensures type stability by explicitly casting `coords1` and `coords2` to `T`.
 function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
     local dist_sq
+    T = promote_type(eltype(coords1), eltype(coords2), typeof(param_val), eltype(ls))
+    coords1_T = T.(coords1)
+    coords2_T = T.(coords2)
+
     if ls isa AbstractVector # ARD case
-        if size(coords1, 2) != length(ls) || size(coords2, 2) != length(ls)
+        if size(coords1_T, 2) != length(ls) || size(coords2_T, 2) != length(ls)
             error("Dimension mismatch for ARD kernel: Number of coordinate dimensions does not match number of lengthscales.")
         end
         # Calculate weighted squared Euclidean distance
-        dist_sq = pairwise(SqEuclidean(), coords1 ./ ls', coords2 ./ ls', dims=1)
+        dist_sq = pairwise(SqEuclidean(), coords1_T ./ T.(ls)', coords2_T ./ T.(ls)', dims=1)
     else # Isotropic case
-        dist_sq = pairwise(SqEuclidean(), coords1, coords2, dims=1) ./ ls^2
+        dist_sq = pairwise(SqEuclidean(), coords1_T, coords2_T, dims=1) ./ T(ls)^2
     end
 
     # Gaussian / Squared Exponential
     if kernel_type == :gaussian || kernel_type == :se
-        return (param_val^2) .* exp.(-0.5 .* dist_sq)
+        return (T(param_val)^2) .* exp.(T(-0.5) .* dist_sq)
     
     # Exponential / Matern 1/2
     elseif kernel_type == :exponential || kernel_type == :matern12
         d = sqrt.(dist_sq)
-        return (param_val^2) .* exp.(-d)
+        return (T(param_val)^2) .* exp.(-d)
     
     # Matern 3/2
     elseif kernel_type == :matern32
         d = sqrt.(dist_sq)
-        val = sqrt(3.0) .* d
-        return (param_val^2) .* (1.0 .+ val) .* exp.(-val)
+        val = T(sqrt(3.0)) .* d
+        return (T(param_val)^2) .* (T(1.0) .+ val) .* exp.(-val)
     
     # Matern 5/2
     elseif kernel_type == :matern52
         d = sqrt.(dist_sq)
-        val = sqrt(5.0) .* d
-        return (param_val^2) .* (1.0 .+ val .+ (val.^2 ./ 3.0)) .* exp.(-val)
+        val = T(sqrt(5.0)) .* d
+        return (T(param_val)^2) .* (T(1.0) .+ val .+ (val.^2 ./ T(3.0))) .* exp.(-val)
 
     # Fallback Dispatch
     else
-        return (param_val^2) .* exp.(-0.5 .* dist_sq)
+        return (T(param_val)^2) .* exp.(T(-0.5) .* dist_sq)
     end
 end
-
 
 
 
@@ -6120,76 +6115,76 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Union
 end
 
 
-"""
-    evaluate_kernel_matrix(coords, param_val, ls, kernel_type, noise; ...)
-
-Computes the covariance kernel matrix for a given set of coordinates.
-
-# Rationale for Update
-This version corrects a `MethodError` that occurred when adding the `noise` term
-(nugget) to the kernel matrix. The original implementation used broadcast addition (`.+`),
-which is incompatible with the `UniformScaling` type of `LinearAlgebra.I`. The fix
-replaces `.+ (noise * I)` with standard matrix addition `+ (noise * I)`, which correctly
-materializes the identity matrix and adds the noise to the diagonal, resolving the error.
-"""
+# Version 1.5.3 (2026-08-06)
+# Purpose: Computes the covariance kernel matrix for a given set of coordinates.
+# Rationale: This version ensures type stability by explicitly casting `coords` to `T`
+#            and `noise` to `T` before use.
 function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol, noise::Real; wavelet_levels=3)
+    T = promote_type(eltype(coords), typeof(param_val), eltype(ls), typeof(noise))
+    coords_T = T.(coords)
+
     local dist_sq
     if ls isa AbstractVector # ARD case
-        if size(coords, 2) != length(ls)
-            error("Dimension mismatch for ARD kernel: Number of coordinate dimensions ($(size(coords, 2))) does not match number of lengthscales ($(length(ls))).")
+        if size(coords_T, 2) != length(ls)
+            error("Dimension mismatch for ARD kernel: Number of coordinate dimensions ($(size(coords_T, 2))) does not match number of lengthscales ($(length(ls))).")
         end
         # Calculate weighted squared Euclidean distance
-        dist_sq = pairwise(SqEuclidean(), coords ./ ls', dims=1)
+        dist_sq = pairwise(SqEuclidean(), coords_T ./ T.(ls)', dims=1)
     else # Isotropic case
-        dist_sq = pairwise(SqEuclidean(), coords, dims=1) ./ ls^2
+        dist_sq = pairwise(SqEuclidean(), coords_T, dims=1) ./ T(ls)^2
     end
 
     # Gaussian / Squared Exponential
     if kernel_type == :gaussian || kernel_type == :se
-        return (param_val^2) .* exp.(-0.5 .* dist_sq) + (noise * I)
+        return (T(param_val)^2) .* exp.(T(-0.5) .* dist_sq) + (T(noise) * I)
     
     # Exponential / Matern 1/2
     elseif kernel_type == :exponential || kernel_type == :matern12 
         d = sqrt.(dist_sq) # distance is now scaled (already done by pairwise)
-        return (param_val^2) .* exp.(-d) + (noise * I)
+        return (T(param_val)^2) .* exp.(-d) + (T(noise) * I)
     
     # Matern 3/2
     elseif kernel_type == :matern32 
         d = sqrt.(dist_sq) # distance is now scaled (already done by pairwise)
-        val = sqrt(3.0) .* d
-        return (param_val^2) .* (1.0 .+ val) .* exp.(-val) + (noise * I)
+        val = T(sqrt(3.0)) .* d
+        return (T(param_val)^2) .* (T(1.0) .+ val) .* exp.(-val) + (T(noise) * I)
     
     # Matern 5/2
     elseif kernel_type == :matern52 
         d = sqrt.(dist_sq) # distance is now scaled (already done by pairwise)
-        val = sqrt(5.0) .* d
-        return (param_val^2) .* (1.0 .+ val .+ (val.^2 ./ 3.0)) .* exp.(-val) + (noise * I)
+        val = T(sqrt(5.0)) .* d
+        return (T(param_val)^2) .* (T(1.0) .+ val .+ (val.^2 ./ T(3.0))) .* exp.(-val) + (T(noise) * I)
 
     # Constant Kernel (Identity innovation)
     elseif kernel_type == :constant
-        return fill(param_val^2, size(dist_sq))
+        return fill(T(param_val)^2, size(dist_sq))
 
     # Linear Kernel
     elseif kernel_type == :linear
-        return (param_val^2) .* dist_sq
+        return (T(param_val)^2) .* dist_sq
 
     # Wavelet Multiscale Kernel
     elseif kernel_type == :wavelet
-        K_accum = zeros(eltype(dist_sq), size(dist_sq))
+        K_accum = zeros(T, size(dist_sq))
         for wv_scale in 1:wavelet_levels
-            ls_scale_sq = (ls isa Real ? ls^2 : 1.0) / (4^(wv_scale-1))
-            weight_scale = (param_val^2) * exp(-wv_scale / ls)
-            K_accum .+= weight_scale .* exp.(-0.5 .* dist_sq ./ ls_scale_sq) # Element-wise addition
+            ls_scale_sq = (ls isa Real ? T(ls)^2 : T(1.0)) / (T(4.0)^(wv_scale-1))
+            weight_scale = (T(param_val)^2) * exp(T(-wv_scale) / T(ls))
+            K_accum .+= weight_scale .* exp.(T(-0.5) .* dist_sq ./ ls_scale_sq) # Element-wise addition
         end
-        return K_accum + (noise * I) # Changed .+ to +
+        return K_accum + (T(noise) * I) # Changed .+ to +
 
     # Fallback Dispatch
     else
-        return (param_val^2) .* exp.(-0.5 .* dist_sq) + (noise * I)
+        return (T(param_val)^2) .* exp.(T(-0.5) .* dist_sq) + (T(noise) * I)
     end
 end
 
 
+
+# Version 1.5.3 (2026-08-06)
+# Purpose: Recomposes a precision matrix based on model type and parameters.
+# Rationale: This version ensures type stability by explicitly casting `param_val` to `T_num`
+#            and using `T_num(1.0)` for numeric literals.
 function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_val::Real; extra_param=nothing, noise=1e-4, kwargs...)
     n_s = size(template_s, 1)
     T_num = promote_type(typeof(param_val), typeof(noise), eltype(template_s))
@@ -6198,10 +6193,10 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
         kappa = isnothing(extra_param) ? T_num(1.0) : extra_param
         local Q_kappa
         if kappa isa Real
-            Q_kappa = kappa^2 * I(n_s)
+            Q_kappa = T_num(kappa)^2 * I(n_s)
         else
             if length(kappa) != n_s; error("Anisotropic kappa vector length must match number of spatial units."); end
-            Q_kappa = Diagonal(kappa.^2)
+            Q_kappa = Diagonal(T_num.(kappa).^2)
         end
         L_spde = Q_kappa + template_s
         return Symmetric(L_spde' * L_spde)
@@ -6266,7 +6261,7 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
 
     if m_type == :GP
         ls = isnothing(extra_param) ? T_num(1.0) : extra_param
-        K = (param_val^2) .* exp.(-(Matrix(template_s).^2) ./ (T_num(2.0) * ls^2 + noise))
+        K = (T_num(param_val)^2) .* exp.(-(Matrix(template_s).^2) ./ (T_num(2.0) * ls^2 + T_num(noise)))
         return inv(Symmetric(K))
     end
 
@@ -6279,18 +6274,21 @@ end
 
 
 
+
+
+
+# Version 1.5.3 (2026-08-06)
+# Purpose: Generates the code block for calculating exploitation in dynamics models.
+# Rationale: This version is updated to use `T_num_dyn(0.0)` for the default exploitation value.
+#            This ensures that the `exploitation` variable has the correct generic type `T_num_dyn`
+#            (which becomes `ForwardDiff.Dual` during automatic differentiation), resolving
+#            a type instability that caused a `MethodError`.
 function generate_exploitation_block(spec, time_var)
-    # Purpose: Generates the code block for calculating exploitation in dynamics models.
-    # Rationale: This version is updated to use `T_num(0.0)` for the default exploitation value.
-    #            This ensures that the `exploitation` variable has the correct generic type `T_num`
-    #            (which becomes `ForwardDiff.Dual` during automatic differentiation), resolving
-    #            a type instability that caused a `MethodError`.
-    # v1.0.2 (2026-08-03)
     effort_keys = get(spec.hyper, :effort_keys, [])
     removal_keys = get(spec.hyper, :removal_keys, [])
     
     if isempty(effort_keys) && isempty(removal_keys)
-        return "local exploitation = T_num_dyn(0.0)"
+        return "local exploitation = zero(T_num_dyn)"
     end
     
     lines = ["local exploitation = zeros(T_num_dyn, M.s_N)"]
@@ -6302,6 +6300,7 @@ function generate_exploitation_block(spec, time_var)
     end
     return join(lines, "\n    ")
 end
+
  
 
 function _distribution_to_string(d::Distribution)

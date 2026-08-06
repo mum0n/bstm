@@ -32,15 +32,17 @@ struct IntervalCensored <: AbstractCensoringState end
 
  
 
-# Version 1.5.1 (2026-08-06)
+
+
+# Version 1.5.3 (2026-08-06)
 # Purpose: Defines the observation model for bstm.
-# Rationale: This version corrects the type of the `trial` field to `Int`
-#            as it represents a count for binomial models. It also ensures
-#            that all numeric fields are correctly typed to prevent `Float64`
-#            contamination during automatic differentiation.
-struct bstm_Likelihood{F, Z, C, W, P, R, S, TR, TL, TU, HT, EX} <: ContinuousMultivariateDistribution
+# Rationale: This version refactors the struct to be parameterized by the linear predictor
+#            `eta` instead of the observed data `y`. The `y_obs` field is renamed to `param`
+#            to reflect this change. This is a critical fix to align with the standard
+#            `Distributions.jl` API and enable correct gradient calculations for AD-based samplers.
+struct bstm_Likelihood{F, Z, C, W, P, R, S, PR, TL, TU, HT, EX} <: ContinuousMultivariateDistribution
     family::F
-    y_obs::TR
+    param::PR # Renamed from y_obs; now holds the linear predictor `eta`.
     zi_state::Z
     censoring_state::C
     weight::W
@@ -48,7 +50,7 @@ struct bstm_Likelihood{F, Z, C, W, P, R, S, TR, TL, TU, HT, EX} <: ContinuousMul
     phi_hurdle::P
     r_nb::R
     sigma_y::S
-    trial::Int # Corrected type to Int
+    trial::Int
     censor_lower::TL
     censor_upper::TU
     hurdle::HT
@@ -127,11 +129,20 @@ function get_dist_ref(::ParetoFamily, d, eta, sig)
     scale = mean_val * (shape - 1.0) / shape
     return Pareto(shape, scale)
 end
+
+
+
+# Version 1.5.2 (2026-08-06)
+# Purpose: Creates a DirichletMultinomial distribution instance.
+# Rationale: This version is updated to use `d.trial` to get the total number of trials,
+#            making it consistent with the Binomial family and decoupling it from the
+#            observation data `y_obs`, which is no longer stored in the distribution object.
 function get_dist_ref(::DirichletMultinomialFamily, d, eta_vec, sig)
     alpha_0 = max(sig, 1e-6)
     mean_probs = softmax(eta_vec)
     alpha_params = alpha_0 .* mean_probs
-    n_total = sum(d.y_obs)
+    # The total number of trials is now passed via the `trial` keyword argument.
+    n_total = d.trial
     return DirichletMultinomial(Int(n_total), alpha_params)
 end
 
@@ -151,19 +162,22 @@ function bstm_kernel(fam::DirichletMultinomialFamily, ::Uncensored, ::NonZeroInf
 end
  
 
-# Constructor handles the conversion of trait names to concrete trait types
-# Version 1.5.1 (2026-08-06)
+# Version 1.5.2 (2026-08-06)
 # Purpose: Constructor for bstm_Likelihood.
-# Rationale: Ensures all numeric parameters are correctly typed to prevent
-#            `Float64` contamination during automatic differentiation.
-function bstm_Likelihood(family_input::Union{String, Symbol}, y_obs;
+# Rationale: This version is updated to accept the linear predictor parameter `param`
+#            instead of the observation `y_obs`. This aligns the constructor with the
+#            refactored struct definition and the correct `logpdf` evaluation flow.
+function bstm_Likelihood(family_input::Union{String, Symbol}, param;
     zi_state=nothing, censoring_state=nothing, weight=1.0,
-    phi_zi=-Inf, phi_hurdle=-Inf, r_nb=1.0, sigma_y=1.0, trial::Int=1, # trial is explicitly Int
+    phi_zi=-Inf, phi_hurdle=-Inf, r_nb=1.0, sigma_y=1.0, trial::Int=1,
     censor_lower=-Inf, censor_upper=Inf, hurdle=-Inf, extra_params=nothing
 )
+    # This function constructs the bstm_Likelihood object, which acts as a wrapper
+    # for various distributions and handles censoring, zero-inflation, and hurdles.
     f_trait = get_model_family(string(family_input))
-    # Ensure all numeric values are promoted to a common type, typically Float64,
-    # but will be Dual if any input is Dual.
+    
+    # Promote all numeric parameters to a common type to ensure type stability.
+    # This will become `ForwardDiff.Dual` if any input parameter is a Dual number.
     promoted_type = promote_type(typeof(weight), typeof(phi_zi), typeof(phi_hurdle), typeof(r_nb), typeof(sigma_y), typeof(censor_lower), typeof(censor_upper), typeof(hurdle))
 
     h_val = isnothing(hurdle) ? promoted_type(-Inf) : promoted_type(hurdle)
@@ -181,59 +195,71 @@ function bstm_Likelihood(family_input::Union{String, Symbol}, y_obs;
         IntervalCensored() 
     end
 
-    y_vec = y_obs isa AbstractVector ? y_obs : [y_obs]
+    # Ensure the parameter `param` (eta) is stored as a vector.
+    param_vec = param isa AbstractVector ? param : [param]
 
-    return bstm_Likelihood(f_trait, y_vec, zi_trait, censor_trait, promoted_type(weight), promoted_type(phi_zi), promoted_type(phi_hurdle), promoted_type(r_nb), promoted_type(sigma_y), trial, yL_val, yU_val, h_val, extra_params)
+    return bstm_Likelihood(f_trait, param_vec, zi_trait, censor_trait, promoted_type(weight), promoted_type(phi_zi), promoted_type(phi_hurdle), promoted_type(r_nb), promoted_type(sigma_y), trial, yL_val, yU_val, h_val, extra_params)
 end
 
-# Specialized logpdf using a where {V<:Real} clause to capture the Dual type during NUTS sampling
-# Version 1.5.1 (2026-08-06)
+# Version 1.5.2 (2026-08-06)
 # Purpose: Computes the log-probability for a vector of observations.
-# Rationale: Initializes `logp` with `zero(V)` to ensure type stability.
-function Distributions._logpdf(d::bstm_Likelihood, eta::AbstractVector{V}) where {V<:Real}
-    # CRITICAL: Initialize logp with zero of type V to prevent Float64 conversion error
+# Rationale: The signature is changed to `_logpdf(d, y)` to conform to the standard API.
+#            It now extracts the linear predictor `eta` from `d.param` and evaluates the
+#            log-pdf at the given observation vector `y`. This is only used for vector-
+#            valued likelihoods like DirichletMultinomial.
+function Distributions._logpdf(d::bstm_Likelihood, y::AbstractVector{V}) where {V<:Real}
     logp = zero(V) 
     
     if d.family isa DirichletMultinomialFamily
+        eta = d.param
         sig = d.sigma_y isa AbstractVector ? d.sigma_y[1] : d.sigma_y
         w = d.weight isa AbstractVector ? d.weight[1] : d.weight
-        return bstm_kernel(d.family, d.censoring_state, d.zi_state, d, eta, sig, d.y_obs) * w
+        return bstm_kernel(d.family, d.censoring_state, d.zi_state, d, eta, sig, y) * w
     else
-        for i in 1:length(eta)
-            sig = d.sigma_y isa AbstractVector ? d.sigma_y[i] : d.sigma_y
-            w = d.weight isa AbstractVector ? d.weight[i] : d.weight
-            # Kernel must also be generic over V
-            logp += bstm_kernel(d.family, d.censoring_state, d.zi_state, d, eta[i], sig, d.y_obs[i]) * w
+        # This path is not typically used for univariate models which loop outside.
+        for i in 1:length(y)
+            eta_i = d.param isa AbstractVector ? d.param[i] : d.param
+            sig_i = d.sigma_y isa AbstractVector ? d.sigma_y[i] : d.sigma_y
+            w_i = d.weight isa AbstractVector ? d.weight[i] : d.weight
+            logp += bstm_kernel(d.family, d.censoring_state, d.zi_state, d, eta_i, sig_i, y[i]) * w_i
         end
         return logp
     end
 end
 
-# Version 1.5.1 (2026-08-06)
-# Purpose: Public scalar overload for `logpdf`.
-# Rationale: Provides a convenient interface for single-observation likelihood evaluation.
-function Distributions.logpdf(d::bstm_Likelihood, eta::Real)
-    # This method is for a single scalar observation. It is not used by the DirichletMultinomial path.
-    # It is preserved for backward compatibility with existing univariate likelihoods.
-    if d.family isa DirichletMultinomialFamily
-        error("DirichletMultinomial likelihood requires a vector of linear predictors, but received a scalar.")
-    end
 
+# Version 1.5.2 (2026-08-06)
+# Purpose: Public scalar overload for `logpdf`.
+# Rationale: The signature is changed to `logpdf(d, y)` to conform to the standard API.
+#            It now extracts the linear predictor `eta` from `d.param` and evaluates the
+#            log-pdf at the given observation `y`.
+function Distributions.logpdf(d::bstm_Likelihood, y::Real)
+    # This method handles the logpdf evaluation for a single scalar observation.
+    if d.family isa DirichletMultinomialFamily
+        error("DirichletMultinomial likelihood requires a vector of observations, but received a scalar.")
+    end
+    
+    # Extract the linear predictor `eta` from the distribution object.
+    eta = d.param isa AbstractVector ? d.param[1] : d.param
     sig = d.sigma_y isa AbstractVector ? d.sigma_y[1] : d.sigma_y
     w = d.weight isa AbstractVector ? d.weight[1] : d.weight
-    return bstm_kernel(d.family, d.censoring_state, d.zi_state, d, eta, sig, d.y_obs[1]) * w
+    
+    # Delegate to the appropriate kernel based on family, censoring, and zero-inflation traits.
+    return bstm_kernel(d.family, d.censoring_state, d.zi_state, d, eta, sig, y) * w
 end
 
-# Version 1.5.1 (2026-08-06)
+# Version 1.5.2 (2026-08-06)
 # Purpose: Public vector overload to maintain `MultivariateDistribution` compliance.
 # Rationale: Delegates to the internal `_logpdf` implementation.
 function Distributions.logpdf(d::bstm_Likelihood, y::AbstractVector{<:Real})
     return Distributions._logpdf(d, y)
 end
 
-# Version 1.5.1 (2026-08-06)
+
+# Version 1.5.3 (2026-08-06)
 # Purpose: Computes the log-probability for an uncensored observation.
 # Rationale: Ensures all intermediate values (log_phi, etc.) respect type V.
+#            The comparison `y == 0.0` is changed to `y == zero(V)` for type stability.
 function bstm_kernel(fam::AbstractBSTM_Family, ::Uncensored, zero_inflated::AbstractZIState, d, eta::V, sig, y) where {V<:Real}
     dist = get_dist_ref(fam, d, eta, sig)
 
@@ -241,7 +267,7 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::Uncensored, zero_inflated::Abst
         log_phi = V(log(d.phi_zi)) # Cast to V
         log_one_minus_phi = V(log1p(-d.phi_zi)) # Cast to V
 
-        if y == 0.0
+        if y == zero(V) # Changed from y == 0.0
             if is_discrete_family(fam)
                 return logsumexp(log_phi, log_one_minus_phi + logpdf(dist, zero(V)))
             else
@@ -264,6 +290,7 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::Uncensored, zero_inflated::Abst
         return logpdf(dist, V(y))
     end
 end
+
 
 # Version 1.5.1 (2026-08-06)
 # Purpose: Computes the log-probability for a left-censored observation.
