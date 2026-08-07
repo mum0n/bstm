@@ -161,7 +161,7 @@ end
 # Purpose: Summarizes the posterior samples for all discovered component effects.
 # Rationale: This version is updated to create a more informative summary object. Instead of
 #            only summarizing one effect per component, it now iterates through all effect
-#            types returned by `extract_component` (e.g., `structured`, `unstructured`, `noisy`)
+#            (e.g., `structured`, `unstructured`, `noisy`)
 #            and summarizes each one. This allows downstream functions like `bstm_plots` to
 #            visualize different aspects of a component (e.g., the structured vs. unstructured
 #            parts of a BYM2 model) separately.
@@ -173,7 +173,7 @@ function _summarize_effects_registry(registry, M, outcomes_N, alpha)
         if key in [:intercept, :fixed]; continue; end
 
         spec_idx = findfirst(s -> s.key == key, M.components)
-        if !isnothing(spec_idx) && M.components[spec_idx].component_obj isa MixedComponent
+        if !isnothing(spec_idx) && M.components[spec_idx].component_obj isa Mixed
             # --- Handle Mixed Effects Separately ---
             summaries_per_outcome = [Dict{Symbol, Any}() for _ in 1:outcomes_N]
             if effects.type == :simple
@@ -261,42 +261,35 @@ function summarize_predictions(samples::AbstractArray; alpha=0.05)
         upper = to_vector(high_bound)
     )
 end
-# Version 1.6.1 (2026-08-06)
-# Purpose: Reconstructs posterior summaries for univariate models.
-# Rationale: This version corrects a `MethodError` that occurred when calling `summarize_predictions`.
-#            The fix involves two changes:
-#            1. The prediction arrays `p_denoised` and `p_noisy`, which had dimensions [N, S, 1],
-#               are reshaped to 2D arrays [N, S] using `dropdims` to match the expected input.
-#            2. The call to `summarize_predictions` is updated to pass `alpha` as a keyword
-#               argument (`alpha=alpha`), resolving the incorrect method dispatch.
-#            This version also includes an incremented version number to reflect ongoing updates.
+
+
+"""
+    _reconstruct(arch::UnivariateArchitecture, mode::String, chain, M::NamedTuple, PS, alpha::Float64)
+
+Reconstructs posterior summaries for univariate models.
+
+# Rationale for Update
+This function is updated to call the refactored `_discover_component_realizations`
+without the obsolete `all_vars` (parameter names) argument, aligning it with the
+new explicit component interface where components manage their own parameter discovery.
+"""
 function _reconstruct(arch::UnivariateArchitecture, mode::String, chain, M::NamedTuple, PS, alpha::Float64)
-    # This is the main entry point for post-processing MCMC chains for single-outcome models.
-    # It orchestrates the discovery of latent fields, assembly of the linear predictor,
-    # and generation of predictions.
-
-    # --- 1. Metadata and Parameter Name Extraction ---
-    all_vars = string.(keys(chain))
-
-    # --- 2. Dimension Discovery ---
+    # --- 1. Metadata and Dimension Discovery ---
     n_samples_val = size(chain, 1)
     N_tot_val = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
     outcomes_N_val = M.outcomes_N # For univariate, this is always 1.
 
-    # --- 3. Latent Field Reconstruction ---
-    registry = _discover_component_realizations(chain, M, PS, n_samples_val, all_vars, outcomes_N_val, N_tot_val)
+    # --- 2. Latent Field Reconstruction ---
+    # The `all_vars` argument is removed from this call.
+    registry = _discover_component_realizations(chain, M, PS, n_samples_val, outcomes_N_val, N_tot_val)
 
-    # --- 4. Linear Predictor Assembly ---
+    # --- 3. Linear Predictor Assembly ---
     eta_post = _modular_eta_assembly(registry, M, PS, n_samples_val, outcomes_N_val)
 
-    # --- 5. Prediction and Log-Likelihood Calculation ---
-    # For univariate models, eta_post is [N, S, 1]. _process_ll_and_predictions will return
-    # predictions with the same 3D shape.
+    # --- 4. Prediction and Log-Likelihood Calculation ---
     p_denoised, p_noisy, log_lik = _process_ll_and_predictions(eta_post, chain, M, PS, outcomes_N_val, 1)
 
-    # --- 6. Final Result Consolidation ---
-    # Use `dropdims` to convert the 3D prediction arrays to 2D before summarizing.
-    # Call `summarize_predictions` with a keyword argument for `alpha`.
+    # --- 5. Final Result Consolidation ---
     pstats = (
         effects=_summarize_effects_registry(registry, M, outcomes_N_val, alpha),
         predictions_denoised=summarize_predictions(dropdims(p_denoised, dims=3); alpha=alpha),
@@ -310,56 +303,45 @@ function _reconstruct(arch::UnivariateArchitecture, mode::String, chain, M::Name
 end
 
 
-# Version 1.6.1 (2026-08-06)
-# Purpose: Reconstructs posterior summaries for multivariate models.
-# Rationale: This version corrects a `MethodError` that occurred when processing chains
-#            of type `VNChain` (from FlexiChains.jl). The original implementation used
-#            `names(chain)`, which is not defined for this chain type. The fix replaces
-#            this call with `string.(keys(chain))`. It also ensures that `_modular_eta_assembly`
-#            receives the correct number of arguments.
-#            This version also includes an incremented version number to reflect ongoing updates.
+
+"""
+    _reconstruct(arch::MultivariateArchitecture, mode::String, chain, M::NamedTuple, PS, alpha::Float64)
+
+Reconstructs posterior summaries for multivariate models.
+
+# Rationale for Update
+This function is updated to call the refactored `_discover_component_realizations`
+without the obsolete `all_vars` (parameter names) argument, aligning it with the
+new explicit component interface.
+"""
 function _reconstruct(arch::MultivariateArchitecture, mode::String, chain, M::NamedTuple, PS, alpha::Float64)
-    # This function handles the reconstruction of multiple, correlated outcomes by assembling
-    # independent latent fields, applying the learned correlation structure, and then
-    # generating predictions for each outcome.
-
-    # --- 1. Metadata and Parameter Name Extraction ---
-    # Use `keys(chain)` to be compatible with different chain backends.
-    all_vars = string.(keys(chain))
-
-    # --- 2. Dimension Discovery ---
+    # --- 1. Metadata and Dimension Discovery ---
     n_samples_val = size(chain, 1)
     N_tot_val = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
     outcomes_N_val = M.outcomes_N
 
-    # --- 3. Latent Field Reconstruction ---
-    # Reconstruct the independent (uncorrelated) latent effects for all components.
-    registry = _discover_component_realizations(chain, M, PS, n_samples_val, all_vars, outcomes_N_val, N_tot_val)
+    # --- 2. Latent Field Reconstruction ---
+    # The `all_vars` argument is removed from this call.
+    registry = _discover_component_realizations(chain, M, PS, n_samples_val, outcomes_N_val, N_tot_val)
   
-    # --- 4. Linear Predictor Assembly ---
-    # Assemble the full latent predictor matrix `eta_latent` from the reconstructed components.
+    # --- 3. Linear Predictor Assembly ---
     eta_latent_post = _modular_eta_assembly(registry, M, PS, n_samples_val, outcomes_N_val)
 
-    # --- 5. Apply Correlation Structure ---
-    # Apply the learned correlation structure using the sampled Cholesky factor from the LKJ prior.
-    # This transforms the independent latent fields into correlated ones.
+    # --- 4. Apply Correlation Structure ---
     L_corr_samples = chain["L_corr"]
     eta_post = similar(eta_latent_post)
     for s in 1:size(eta_latent_post, 3)
         eta_post[:, :, s] = eta_latent_post[:, :, s] * L_corr_samples[s].L
     end
 
-    # --- 6. Prediction and Log-Likelihood Calculation ---
-    # Loop over each outcome to generate predictions and log-likelihoods, as
-    # _process_ll_and_predictions is designed for a single outcome at a time.
+    # --- 5. Prediction and Log-Likelihood Calculation ---
     all_pred_results = [_process_ll_and_predictions(eta_post[:,:,k], chain, M, PS, outcomes_N_val, k) for k in 1:outcomes_N_val]
     
-    # Aggregate results from all outcomes.
     p_denoised_summaries = [summarize_array(res.p_denoised, alpha=alpha) for res in all_pred_results]
     p_noisy_summaries = [summarize_array(res.p_noisy, alpha=alpha) for res in all_pred_results]
     all_log_lik = hcat([res.log_lik for res in all_pred_results]...)
 
-    # --- 7. Final Result Consolidation ---
+    # --- 6. Final Result Consolidation ---
     pstats = (
         effects=_summarize_effects_registry(registry, M, outcomes_N_val, alpha),
         predictions_denoised=p_denoised_summaries,
@@ -372,15 +354,25 @@ end
 
 
 
-function _discover_component_realizations(chain, M, PS, n_samples, p_names, outcomes_N, N_tot)
-    # Purpose: Extracts all latent effects from the MCMC chain.
-    # Rationale: Iterates through all specified components and fixed effects, calling the appropriate
-    #            extraction function for each to populate a central registry of posterior samples.
-    # Inputs: Standard reconstruction arguments.
-    # Outputs: A NamedTuple registry containing posterior samples for each model component.
+"""
+    _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
+
+Extracts all latent effects from the MCMC chain by dispatching to the `get_effects`
+method of each component.
+
+# Rationale for Update
+This function is the core of the refactored posterior reconstruction engine. It replaces
+the legacy `extract_component` dispatch system with a standardized loop that calls the
+`get_effects` method defined in the explicit interface of each `ComponentModel`. This
+delegates the responsibility of reconstruction to the components themselves, simplifying
+the orchestration logic and making the system more modular and extensible. The `p_names`
+argument has been removed, as each `get_effects` method is now responsible for generating
+its own required parameter names.
+"""
+function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
     registry = Dict{Symbol, Any}()
 
-    # Fixed effects
+    # --- Fixed effects and Intercept (logic remains the same) ---
     if M.Xfixed_N > 0
         Xfixed_train = M.Xfixed
         Xfixed_pred = if isnothing(PS) || !haskey(PS, :Xfixed) || isempty(PS.Xfixed)
@@ -406,7 +398,6 @@ function _discover_component_realizations(chain, M, PS, n_samples, p_names, outc
         registry[:fixed] = zeros(Float64, N_tot, n_samples, outcomes_N)
     end
 
-    # Intercept
     if M.add_intercept
         intercept_samples = get_params_vector(chain, "intercept", outcomes_N)
         intercept_effects = zeros(Float64, N_tot, n_samples, outcomes_N)
@@ -418,14 +409,18 @@ function _discover_component_realizations(chain, M, PS, n_samples, p_names, outc
         registry[:intercept] = zeros(Float64, N_tot, n_samples, outcomes_N)
     end
 
-    # Components
+    # --- NEW: Main Component Loop using get_effects ---
     for spec in M.components
-        effects = extract_component(spec.component_obj, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
+        # Call the get_effects method for the component. This method is now responsible
+        # for all logic, including handling multivariate cases and finding its own
+        # parameters in the chain.
+        effects = get_effects(spec.component_obj, chain, M, n_samples, outcomes_N, spec, PS, N_tot)
         registry[spec.key] = effects
     end
 
     return NamedTuple(registry)
 end
+
 
 
 
@@ -492,7 +487,7 @@ function _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
                 eta_latent[:, :, k] .+= effect_set[k]
             elseif spec.structure == :mixed
                 # Mixed effects (random intercepts/slopes).
-                # The `extract_component` for MixedComponent returns `effects.indices` which is
+                # The `extract_component` for Mixed returns `effects.indices` which is
                 # the full observation-level index vector for grouping levels.
                 idx_full = effects.indices
                 
@@ -660,34 +655,24 @@ function _process_multinomial_predictions(eta_samples, chain, M, PS)
 end
  
 
+
 """
     _reconstruct(arch::MultifidelityArchitecture, mode::String, chain, M, PS, alpha)
 
 Main reconstruction entry point for multi-fidelity models.
 
 # Rationale for Update
-This function orchestrates the hierarchical reconstruction of a main model and its
-nested sub-models. This updated version includes more detailed comments to clarify
-the recursive nature of the process and how the sub-model effects are calibrated
-and integrated into the main model's linear predictor.
-
-The process is as follows:
-1.  Reconstruct the main model's base effects (fixed, spatial, temporal, etc.).
-2.  Iterate through each nested sub-model defined in `M[:nested_components]`.
-3.  For each sub-model, recursively call `_reconstruct` to get its full posterior summary.
-4.  The sub-model's linear predictor (`eta_sub`) is then scaled by its learned `rho_nested`
-    coefficient and added to the main model's linear predictor (`eta_main`).
-5.  Finally, the main model's predictions and likelihood are computed based on the
-    completed `eta_main`.
+This function is updated to call the refactored `_discover_component_realizations`
+without the obsolete `p_names` argument, aligning it with the new explicit
+component interface.
 """
 function _reconstruct(arch::MultifidelityArchitecture, mode::String, chain, M::NamedTuple, PS, alpha::Float64)
     n_samples = size(chain, 1)
-    p_names = string.(names(chain))
     N_tot = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
     outcomes_N = M.outcomes_N
 
     # 1. Reconstruct the main model's components (excluding nested effects)
-    main_registry = _discover_component_realizations(chain, M, PS, n_samples, p_names, outcomes_N, N_tot)
+    main_registry = _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
     
     # 2. Assemble the main model's base eta
     eta_main = _modular_eta_assembly(main_registry, M, PS, n_samples, outcomes_N)
@@ -696,21 +681,17 @@ function _reconstruct(arch::MultifidelityArchitecture, mode::String, chain, M::N
     nested_results = Dict{Symbol, Any}()
     if haskey(M, :nested_components)
         for (key, sub_M) in M.nested_components
-            # Determine if a corresponding prediction set exists for the sub-model
             sub_PS = if !isnothing(PS) && haskey(PS, :nested_prediction_sets)
                 get(PS.nested_prediction_sets, key, nothing)
             else
                 nothing
             end
 
-            # Recursively call _reconstruct for the sub-model. This is the core of the
-            # hierarchical reconstruction. The sub-model is treated as a complete, standalone model.
             sub_outcomes_N = get(sub_M, :outcomes_N, 1)
             sub_N_tot = isnothing(sub_PS) ? sub_M.y_N : sub_M.y_N + sub_PS.y_N
-            sub_registry = _discover_component_realizations(chain, sub_M, sub_PS, n_samples, p_names, sub_outcomes_N, sub_N_tot)
+            sub_registry = _discover_component_realizations(chain, sub_M, sub_PS, n_samples, sub_outcomes_N, sub_N_tot)
             eta_sub = _modular_eta_assembly(sub_registry, sub_M, sub_PS, n_samples, sub_outcomes_N)
 
-            # Get the scaling parameter `rho` that links the sub-model to the main model.
             rho_name = "rho_nested_$(key)"
             rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
 
@@ -723,10 +704,8 @@ function _reconstruct(arch::MultifidelityArchitecture, mode::String, chain, M::N
                 @warn "Multi-fidelity connection between multivariate models is not fully supported. Assuming a 1-to-1 outcome mapping." 
             end
             
-            # Add the calibrated sub-model effect to the main linear predictor.
             eta_main .+= reshape(rho_samples, 1, n_samples, 1) .* eta_sub
 
-            # Store the full results of the sub-model reconstruction.
             sub_arch_raw = get(sub_M, :model_arch, "univariate")
             sub_arch_type = sub_arch_raw == "multivariate" ? MultivariateArchitecture() : UnivariateArchitecture()
             nested_results[key] = _reconstruct(sub_arch_type, mode, chain, sub_M, sub_PS, alpha)
@@ -767,6 +746,7 @@ function _reconstruct(arch::MultifidelityArchitecture, mode::String, chain, M::N
         arch = arch
     )
 end
+
 
 
 # ==============================================================================
@@ -1703,1829 +1683,4 @@ const MODULE_PROCESSORS = Dict{Symbol, Function}(
 );
 
 
-
-# Proposed updates for 'c:\\home\\jae\\projects\\bstm\src\reconstruction.jl'
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for ICAR, Besag, Cyclic, and IID components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::Union{ICAR, Besag, Cyclic, IID}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    structure = spec.structure
-    n_units = if structure == :spatial; M.s_N; elseif structure == :temporal; M.t_N; else M.u_N; end
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        v = generate_full_variable_names(spec, "univariate", k)
-        sigma_name = _find_parameter(p_names, var, "sigma", k)
-        latent_name = _find_parameter(p_names, var, "raw", k)
-        
-        if isempty(sigma_name) || isempty(latent_name)
-            @warn "Parameters for component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, n_units, n_samples))
-        else
-            Q_template = spec.Q_template
-            F = cholesky(Symmetric(sparse(Q_template) + M.noise * I))
-            sigma_samples = get_params_vector(chain, sigma_name, 1)
-            raw_samples = get_params_vector(chain, latent_name, n_units)
-            
-            effect = zeros(Float64, n_units, n_samples)
-            for s in 1:n_samples
-                latent_field_raw = F.U \ raw_samples[s, :]
-                if m_obj isa Union{ICAR, Besag, Cyclic}; latent_field_raw .-= mean(latent_field_raw); end
-                effect[:, s] = latent_field_raw .* sigma_samples[s, 1]
-            end
-            push!(structured_effects, effect)
-        end
-    end
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for BYM2 components.
-# Rationale: Ensures that `structured_effects`, `unstructured_effects`, and `noisy_effects`
-#            are always populated for each outcome, even if parameters are not found.
-#            This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::BYM2, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    unstructured_effects = Vector{Matrix{Float64}}()
-    noisy_effects = Vector{Matrix{Float64}}()
-    n_latent = size(spec.Q_template, 1)
-    noise = get(M, :noise, 1e-6)
-    F = cholesky(Symmetric(sparse(spec.Q_template) + noise * I))
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        sigma_name = _find_parameter(p_names, var, "sigma", k)
-        rho_name = _find_parameter(p_names, var, "rho", k)
-        struct_raw_name = _find_parameter(p_names, var, "struct", k)
-        iid_name = _find_parameter(p_names, var, "iid", k)
-
-        if isempty(sigma_name)
-            @warn "Parameters for BYM2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, n_latent, n_samples))
-            push!(unstructured_effects, zeros(Float64, n_latent, n_samples))
-            push!(noisy_effects, zeros(Float64, n_latent, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-            struct_raw_samples = get_params_vector(chain, struct_raw_name, n_latent)
-            iid_samples = get_params_vector(chain, iid_name, n_latent)
-
-            struct_effect = zeros(Float64, n_latent, n_samples)
-            unstruct_effect = zeros(Float64, n_latent, n_samples)
-
-            for s in 1:n_samples
-                struct_latent = F.U \ struct_raw_samples[s, :]
-                struct_latent_centered = struct_latent .- mean(struct_latent)
-                struct_latent_scaled = struct_latent_centered ./ (std(struct_latent_centered) + 1e-9)
-                struct_effect[:, s] = (sqrt(rho_samples[s]) .* struct_latent_scaled) .* sigma_samples[s]
-                unstruct_effect[:, s] = (sqrt(1.0 - rho_samples[s]) .* iid_samples[s, :]) .* sigma_samples[s]
-            end
-            
-            push!(structured_effects, struct_effect)
-            push!(unstructured_effects, unstruct_effect)
-            push!(noisy_effects, struct_effect .+ unstruct_effect)
-        end
-    end
-    return (structured=structured_effects, unstructured=unstructured_effects, noisy=noisy_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for RW1, RW2, AR1, and AR2 components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::Union{RW1, RW2, AR1, AR2}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        sigma_name = _find_parameter(p_names, var, "sigma", k)
-        innov_name = _find_parameter(p_names, var, "innov", k)
-        
-        if isempty(sigma_name) || isempty(innov_name)
-            @warn "Parameters for $(typeof(m_obj)) component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, M.t_N, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innovations_samples = get_params_vector(chain, innov_name, M.t_N)
-            
-            temporal_effect_k = zeros(Float64, M.t_N, n_samples)
-            
-            if m_obj isa RW1
-                for j in 1:n_samples; latent_field_raw = cumsum(innovations_samples[j, :]); temporal_effect_k[:, j] = (latent_field_raw .- mean(latent_field_raw)) .* sigma_samples[j]; end
-            elseif m_obj isa RW2
-                for j in 1:n_samples; latent_field_raw = Vector{Float64}(undef, M.t_N); if M.t_N > 0; latent_field_raw[1] = innovations_samples[j, 1]; end; if M.t_N > 1; latent_field_raw[2] = 2*latent_field_raw[1] + innovations_samples[j, 2]; end; for i in 3:M.t_N; latent_field_raw[i] = 2*latent_field_raw[i-1] - latent_field_raw[i-2] + innovations_samples[j, i]; end; temporal_effect_k[:, j] = (latent_field_raw .- mean(latent_field_raw)) .* sigma_samples[j]; end
-            elseif m_obj isa AR1
-                rho_name = _find_parameter(p_names, var, "rho", k)
-                rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-                for j in 1:n_samples; temporal_effect_k[:, j] = ar1_statespace(rho_samples[j], sigma_samples[j], innovations_samples[j, :], Float64, M.t_N, M.noise); end
-            elseif m_obj isa AR2
-                rho1_name = _find_parameter(p_names, var, "rho1", k); rho2_name = _find_parameter(p_names, var, "rho2", k)
-                rho1_samples = get_params_vector(chain, rho1_name, 1)[:, 1]; rho2_samples = get_params_vector(chain, rho2_name, 1)[:, 1]
-                for j in 1:n_samples; temporal_effect_k[:, j] = ar2_statespace(rho1_samples[j], rho2_samples[j], sigma_samples[j], innovations_samples[j, :], M.t_N, M.noise); end
-            end
-            push!(structured_effects, temporal_effect_k)
-        end
-    end
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for Leroux and SAR components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::Union{Leroux, SAR}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    
-    structure = spec.structure
-    n_units = if structure == :spatial; M.s_N; elseif structure == :temporal; M.t_N; else M.u_N; end
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        
-        v = generate_full_variable_names(spec, "univariate", k)
-        sigma_name = string(v.sigma)
-        rho_name = string(v.rho)
-        latent_name = string(v.raw)
-        
-        if isempty(_find_parameter(p_names, var, "sigma", k)) || isempty(_find_parameter(p_names, var, "rho", k)) || isempty(_find_parameter(p_names, var, "raw", k))
-            @warn "Parameters for component $(spec.key) (structure $(structure), outcome $(k)) not found. Returning zero-matrix for effect."
-            push!(structured_effects, zeros(Float64, n_units, n_samples))
-        else
-            Q_template = spec.Q_template
-            sigma_samples = get_params_vector(chain, sigma_name, 1)
-            rho_samples = get_params_vector(chain, rho_name, 1)
-            raw_samples = get_params_vector(chain, latent_name, n_units)
-            
-            effect = zeros(Float64, n_units, n_samples)
-            m_type = Symbol(lowercase(string(typeof(m_obj))))
-
-            for s in 1:n_samples
-                Q_final = recompose_precision(m_type, Q_template, 1.0; extra_param=rho_samples[s, 1], noise=M.noise)
-                F = cholesky(Symmetric(Q_final))
-                effect[:, s] = (F.U \ raw_samples[s, :]) .* sigma_samples[s, 1]
-            end
-            push!(structured_effects, effect)
-        end
-    end
-    
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for SVAR components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::SVAR, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot; prefix::String="")
-    structured_effects = Vector{Matrix{Float64}}()
-    s_N = M.s_N
-    t_N = M.t_N
-    noise_val = get(M, :noise, 1e-6)
-    s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-    t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx
-    N_tot = length(s_idx_full)
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        prefixed_key = isempty(prefix) ? var : "$(prefix)_$(var)"
-        
-        v = generate_full_variable_names(spec, "univariate", k, prefix=prefix)
-        sigma_samples_name = string(v.sigma)
-        innov_samples_name = string(v.innov)
-        
-        if isempty(_find_parameter(p_names, var, "sigma", k)) || isempty(_find_parameter(p_names, var, "innov", k))
-            @warn "Parameters for SVAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_tot, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_samples_name, 1)[:, 1]
-            innov_samples = get_params_vector(chain, innov_samples_name, s_N * t_N)
-            
-            rho_spatial_spec = spec.hyper.rho_spatial_spec
-            rho_spatial_prefix = prefixed_key * "_rho_spatial"
-            
-            rho_field_results = extract_component(rho_spatial_spec.component_obj, chain, M, n_samples, 1, p_names, rho_spatial_spec, nothing, M.s_N; prefix=rho_spatial_prefix)
-            rho_field_untransformed_samples = rho_field_results.structured[1]
-            
-            rho_field_samples = tanh.(rho_field_untransformed_samples)
-            
-            latent_field_samples = Array{Float64, 2}(undef, s_N * t_N, n_samples)
-            
-            for j in 1:n_samples
-                rho_s_j = rho_field_samples[:, j]
-                sigma_j = sigma_samples[j]
-                innov_matrix_j = reshape(innov_samples[j, :], s_N, t_N)
-                
-                latent_field_j = zeros(Float64, s_N, t_N)
-                for s in 1:s_N
-                    latent_field_j[s, :] = ar1_statespace(rho_s_j[s], sigma_j, innov_matrix_j[s, :], Float64, t_N, noise_val)
-                end
-                latent_field_samples[:, j] = vec(latent_field_j)
-            end
-            
-            effect_k = zeros(Float64, N_tot, n_samples)
-            st_idx_full = (t_idx_full .- 1) .* s_N .+ s_idx_full
-            for i in 1:N_tot
-                effect_k[i, :] = latent_field_samples[st_idx_full[i], :]
-            end
-            push!(structured_effects, effect_k)
-        end
-    end
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for Spherical and ExponentialDecay components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::Union{Spherical, ExponentialDecay}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    
-    coord_vars = get(spec.params, :positional_args, [])
-    coords_train = spec.hyper.coords
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
-    else
-        coords_train
-    end
-    n_obs_full = size(coords_full, 1)
-    noise = get(M, :noise, 1e-6)
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        v = generate_full_variable_names(spec, "univariate", k)
-        sigma_name = string(v.sigma)
-        param_name_str = m_obj isa Spherical ? "range" : "ls"
-        param_name = _find_parameter(p_names, var, param_name_str, k)
-
-        if isempty(_find_parameter(p_names, var, "sigma", k)) || isempty(param_name)
-            @warn "Parameters for $(typeof(m_obj)) component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            param_samples = get_params_vector(chain, param_name, 1)[:, 1]
-            raw_samples = get_params_vector(chain, string(v.raw), n_obs_full)
-
-            effect_k = zeros(Float64, n_obs_full, n_samples)
-            dist_matrix = pairwise(Euclidean(), coords_full, dims=1)
-
-            for j in 1:n_samples
-                local K_mat
-                if m_obj isa Spherical
-                    h = dist_matrix ./ param_samples[j]
-                    K_mat = zeros(Float64, size(h))
-                    mask = h .< 1.0
-                    K_mat[mask] = (sigma_samples[j]^2) .* (1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3)
-                else # ExponentialDecay
-                    K_mat = (sigma_samples[j]^2) .* exp.(-dist_matrix ./ param_samples[j])
-                end
-                K_mat += (noise * I)
-                
-                F = cholesky(Symmetric(K_mat))
-                effect_k[:, j] = F.L * raw_samples[j, :]
-            end
-            push!(structured_effects, effect_k)
-        end
-    end
-    
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for Moran components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::Moran, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    eigenvectors = spec.hyper.moran_eigenvectors
-    n_basis = size(eigenvectors, 2)
-    s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        v = generate_full_variable_names(spec, "univariate", k)
-        sigma_name = string(v.sigma)
-        coeffs_name = string(v.raw)
-
-        if isempty(_find_parameter(p_names, var, "sigma", k)) || isempty(_find_parameter(p_names, var, "raw", k))
-            @warn "Parameters for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_tot, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            coeffs_samples = get_params_vector(chain, coeffs_name, n_basis)
-
-            effect_k = zeros(Float64, N_tot, n_samples)
-            for j in 1:n_samples
-                scaled_coeffs = coeffs_samples[j, :] .* sigma_samples[j]
-                spatial_field = eigenvectors * scaled_coeffs
-                effect_k[:, j] = view(spatial_field, s_idx_full)
-            end
-            push!(structured_effects, effect_k)
-        end
-    end
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for Nystrom components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::Nystrom, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    
-    coords_train = spec.hyper.coords
-    coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
-    else
-        coords_train
-    end
-
-    Z_inducing = spec.hyper.Z_inducing
-    kernel_str = m_obj.kernel
-    noise = get(M, :noise, 1e-6)
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        
-        sigma_name = _find_parameter(p_names, var, "sigma", k)
-        ls_name = _find_parameter(p_names, var, "ls", k)
-        v_latent_name = _find_parameter(p_names, var, "raw", k)
-
-        if isempty(sigma_name) || isempty(ls_name) || isempty(v_latent_name)
-            @warn "Parameters for Nystrom component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            ls_samples = get_params_vector(chain, ls_name, 1)[:, 1]
-            v_latent_samples = get_params_vector(chain, v_latent_name, m_obj.n_inducing)
-
-            effect_k = zeros(Float64, size(coords_full, 1), n_samples)
-            for j in 1:n_samples
-                K_UU = evaluate_kernel_matrix(Z_inducing, sigma_samples[j], ls_samples[j], Symbol(kernel_str), noise)
-                K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, sigma_samples[j], ls_samples[j], Symbol(kernel_str))
-                L_UU = cholesky(Symmetric(K_UU)).L
-                
-                effect_k[:, j] = K_XU * (L_UU' \ v_latent_samples[j, :])
-            end
-            push!(structured_effects, effect_k)
-        end
-    end
-    
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for LGCP components.
-# Rationale: Ensures that `log_intensity_surfaces` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::LGCP, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    log_intensity_surfaces = Vector{Array{Float64, 3}}() # [s_N, t_N, n_samples]
-
-    key = string(spec.key)
-    is_spatiotemporal = hasproperty(spec.hyper, :temporal_spec)
-    noise = get(M, :noise, 1e-6)
-
-    eta_base = zeros(Float64, N_tot, n_samples)
-    if haskey(M, :fixed_effects_posterior)
-        eta_base .+= M.fixed_effects_posterior
-    end
-    if haskey(M, :intercept_posterior)
-        eta_base .+= M.intercept_posterior
-    end
-
-    for k in 1:outcomes_N
-        var = key
-        v = generate_full_variable_names(spec, "univariate", k)
-        sigma_samples_name = string(v.sigma)
-        
-        n_latent_dims = is_spatiotemporal ? M.s_N * M.t_N : M.s_N
-        raw_samples_name = string(v.raw)
-
-        if isempty(_find_parameter(p_names, var, "sigma", k)) || isempty(_find_parameter(p_names, var, "raw", k))
-            @warn "Parameters for LGCP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(log_intensity_surfaces, zeros(Float64, M.s_N, M.t_N, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_samples_name, 1)[:, 1]
-            raw_samples = get_params_vector(chain, raw_samples_name, n_latent_dims)
-
-            log_intensity_k = zeros(Float64, M.s_N, M.t_N, n_samples)
-
-            for j in 1:n_samples
-                local latent_field_st
-                if is_spatiotemporal
-                    s_spec = spec.hyper.inner_spec
-                    t_spec = spec.hyper.temporal_spec
-                    C_s = cholesky(Symmetric(s_spec.Q_template + noise * I))
-                    C_t = cholesky(Symmetric(t_spec.Q_template + noise * I))
-                    Z_matrix = reshape(raw_samples[j, :], M.s_N, M.t_N)
-                    tmp_spatial = C_s.U \ Z_matrix
-                    latent_field_st = (transpose(C_t.U \ transpose(tmp_spatial))) .* sigma_samples[j]
-                else
-                    Q_lgcp = spec.hyper.inner_spec.Q_template
-                    F_lgcp = cholesky(Symmetric(Q_lgcp + noise * I))
-                    spatial_component = (F_lgcp.U \ raw_samples[j, :]) .* sigma_samples[j]
-                    latent_field_st = repeat(spatial_component, 1, M.t_N)
-                end
-
-                log_intensity_surface = zeros(Float64, M.s_N, M.t_N)
-                for t in 1:M.t_N, s in 1:M.s_N
-                    obs_indices = findall(i -> M.s_idx[i] == s && M.t_idx[i] == t, 1:M.y_N)
-                    base_contribution = isempty(obs_indices) ? 0.0 : mean(view(eta_base, obs_indices, j))
-                    log_intensity_surface[s, t] = base_contribution + latent_field_st[s, t]
-                end
-                log_intensity_k[:, :, j] = log_intensity_surface
-            end
-            push!(log_intensity_surfaces, log_intensity_k)
-        end
-    end
-    
-    return (structured=log_intensity_surfaces, noisy=log_intensity_surfaces)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for AR2 components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::AR2, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # Specialized state-space reconstruction for AR2, now handling prediction sets.
-    structured_effects = Vector{Matrix{Float64}}()
-    t_N_train = M.t_N
-    t_N_full = isnothing(PS) ? t_N_train : max(maximum(M.t_idx), maximum(PS.t_idx))
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        v = generate_full_variable_names(spec, "univariate", k)
-        sigma_name = string(v.sigma)
-        rho1_name = string(v.rho1)
-        rho2_name = string(v.rho2)
-        innov_name = string(v.innov)
-
-        if isempty(_find_parameter(p_names, var, "sigma", k)) || isempty(_find_parameter(p_names, var, "rho1", k)) || isempty(_find_parameter(p_names, var, "rho2", k)) || isempty(_find_parameter(p_names, var, "innov", k))
-            @warn "Parameters for AR2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, t_N_full, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            rho1_samples = get_params_vector(chain, rho1_name, 1)[:, 1]
-            rho2_samples = get_params_vector(chain, rho2_name, 1)[:, 1]
-            innovations_samples = get_params_vector(chain, innov_name, t_N_train)
-
-            temporal_effect_k = zeros(Float64, t_N_full, n_samples)
-            for j in 1:n_samples
-                temporal_field_j = Vector{Float64}(undef, t_N_full)
-                
-                # Reconstruct training part
-                if t_N_train > 0; temporal_field_j[1] = innovations_samples[j, 1]; end
-                if t_N_train > 1; temporal_field_j[2] = rho1_samples[j] * temporal_field_j[1] + innovations_samples[j, 2]; end
-                for i in 3:t_N_train
-                    temporal_field_j[i] = rho1_samples[j] * temporal_field_j[i-1] + rho2_samples[j] * temporal_field_j[i-2] + innovations_samples[j, i]
-                end
-
-                # Predict future part by sampling new innovations
-                if t_N_full > t_N_train
-                    new_innovs = randn(t_N_full - t_N_train)
-                    for i in (t_N_train + 1):t_N_full
-                        temporal_field_j[i] = rho1_samples[j] * temporal_field_j[i-1] + rho2_samples[j] * temporal_field_j[i-2] + new_innovs[i - t_N_train]
-                    end
-                end
-                
-                temporal_effect_k[:, j] = temporal_field_j .* sigma_samples[j]
-            end
-            push!(structured_effects, temporal_effect_k)
-        end
-    end
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for PSpline, BSpline, TPS, FFT, Wavelet, and Barycentric components.
-# Rationale: Ensures that `structured_effects` and `coefficient_effects` are always populated for each outcome,
-#            even if parameters are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::Union{PSpline, BSpline, TPS, FFT, Wavelet, Barycentric}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    basis_key = Symbol(spec.var)
-    
-    if !haskey(M.basis_matrices, basis_key)
-        @warn "Basis matrix for smooth component $(basis_key) not found. Returning zero-matrices."
-        structured_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
-        coefficient_effects = [zeros(Float64, 1, n_samples) for _ in 1:outcomes_N] # Default to 1 coefficient
-        return (structured=structured_effects, noisy=structured_effects, coefficients=coefficient_effects)
-    end
-
-    B_mat_train = M.basis_matrices[basis_key]
-    B_mat_full = if !isnothing(PS) && haskey(PS, :basis_matrices) && haskey(PS.basis_matrices, basis_key)
-        vcat(B_mat_train, PS.basis_matrices[basis_key])
-    else
-        B_mat_train
-    end
-    n_basis_cols = size(B_mat_full, 2)
-
-    structured_effects = Vector{Matrix{Float64}}()
-    coefficient_effects = Vector{Matrix{Float64}}()
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        
-        coeffs_name = _find_parameter(p_names, var, "latent", k)
-        
-        if isempty(coeffs_name)
-            @warn "Coefficients for smooth component $(spec.key) (outcome $k) not found. Returning zero-matrices."
-            push!(structured_effects, zeros(Float64, size(B_mat_full, 1), n_samples))
-            push!(coefficient_effects, zeros(Float64, n_basis_cols, n_samples))
-        else
-            coeffs = get_params_vector(chain, coeffs_name, n_basis_cols)
-            
-            push!(coefficient_effects, coeffs')
-
-            effect = B_mat_full * coeffs'
-            push!(structured_effects, effect)
-        end
-    end
-
-    return (structured=structured_effects, noisy=structured_effects, coefficients=coefficient_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for Harmonic components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::Harmonic, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    nharmonics = m_obj.nharmonics
-    
-    local period_samples_matrix
-    if m_obj.period isa Real
-        period_samples_matrix = fill(m_obj.period, n_samples, nharmonics)
-    elseif m_obj.period isa UnivariateDistribution
-        period_name = _find_parameter(p_names, string(spec.key), "period", nothing)
-        period_samps_vec = isempty(period_name) ? fill(mean(m_obj.period), n_samples) : get_params_vector(chain, period_name, 1)[:, 1]
-        period_samples_matrix = repeat(period_samps_vec, 1, nharmonics)
-    elseif m_obj.period isa Vector
-        period_samples_matrix = zeros(Float64, n_samples, nharmonics)
-        for i in 1:nharmonics
-            period_name_i = _find_parameter(p_names, string(spec.key), "period_$(i)", nothing)
-            if !isempty(period_name_i)
-                period_samples_matrix[:, i] = get_params_vector(chain, period_name_i, 1)[:, 1]
-            else
-                @warn "Period parameter for harmonic $(i) not found. Using prior mean."
-                period_samples_matrix[:, i] .= mean(m_obj.period[i])
-            end
-        end
-    end
-
-    u_idx_full = haskey(M, :u_idx) ? (isnothing(PS) || !haskey(PS, :u_idx) ? M.u_idx : vcat(M.u_idx, PS.u_idx)) : ones(Int, N_tot)
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        v = generate_full_variable_names(spec, "univariate", k)
-        
-        amplitude_raw_name = string(v.amplitude) * "_raw"
-        phase_name = string(v.phase)
-        
-        if isempty(_find_parameter(p_names, var, "amplitude_raw", k)) || isempty(_find_parameter(p_names, var, "phase", k))
-            @warn "Parameters for Harmonic component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_tot, n_samples))
-        else
-            amplitude_raw_samples = get_params_vector(chain, amplitude_raw_name, nharmonics)
-            phase_samples = get_params_vector(chain, phase_name, nharmonics)
-
-            total_effect = zeros(Float64, N_tot, n_samples)
-            for s in 1:n_samples
-                amplitudes_s = abs.(amplitude_raw_samples[s, :])
-                phases_s = phase_samples[s, :]
-                periods_s = period_samples_matrix[s, :]
-                
-                harmonic_effect_s = zeros(Float64, N_tot)
-                for m in 1:nharmonics
-                    phase_rad = 2.0 * pi * phases_s[m]
-                    angle = (2.0 * pi / periods_s[m]) .* u_idx_full
-                    
-                    beta_cos = amplitudes_s[m] * cos(phase_rad)
-                    beta_sin = amplitudes_s[m] * sin(phase_rad)
-                    
-                    harmonic_effect_s .+= beta_cos .* cos.(angle) .+ beta_sin .* sin.(angle)
-                end
-                total_effect[:, s] = harmonic_effect_s
-            end
-            push!(structured_effects, total_effect)
-        end
-    end
-
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for RFF components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::RFF, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    
-    coords_train = spec.hyper.coords
-    coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
-    else
-        coords_train
-    end
-    n_obs_full = size(coords_full, 1)
-    in_dims = size(coords_full, 2)
-    n_features = m_obj.n_features
-
-    var = string(spec.key)
-    W_name = "$(var)_W"
-    b_name = "$(var)_b"
-    
-    if isempty(_find_parameter(p_names, var, "W", nothing))
-        @warn "Shared parameters for RFF component $(spec.key) not found. Returning zero-matrix for all outcomes."
-        for k in 1:outcomes_N
-            push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
-        end
-        return (structured=structured_effects, noisy=structured_effects)
-    end
-
-    W_samples = get_params_vector(chain, W_name, in_dims * n_features)
-    b_samples = get_params_vector(chain, b_name, n_features)
-
-    for k in 1:outcomes_N
-        v = generate_full_variable_names(spec, "univariate", k)
-        
-        beta_name = string(v.innov)
-        sigma_name = string(v.sigma)
-        ls_name = string(v.ls)
-
-        if isempty(_find_parameter(p_names, var, "innov", k)) || isempty(_find_parameter(p_names, var, "sigma", k)) || isempty(_find_parameter(p_names, var, "ls", k))
-             @warn "Parameters for RFF component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
-             continue
-        end
-
-        beta_samples = get_params_vector(chain, beta_name, n_features)
-        sigma_samples = get_params_vector(chain, sigma_name, 1)
-        ls_samples = get_params_vector(chain, ls_name, 1)
-
-        effect_samples = Array{Float64, 2}(undef, n_obs_full, n_samples)
-        
-        for i in 1:n_samples
-            W_matrix = reshape(W_samples[i, :], in_dims, n_features) ./ ls_samples[i, 1]
-            b_vec = b_samples[i, :]
-            Phi = sqrt(2.0 / n_features) .* cos.((coords_full * W_matrix) .+ b_vec')
-            scaled_beta = beta_samples[i, :] .* sigma_samples[i, 1]
-            effect_samples[:, i] = Phi * scaled_beta
-        end
-        push!(structured_effects, effect_samples)
-    end
-    
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for SVCComponent.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::SVCComponent, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot) 
-    cov_var = m_obj.covariate
-    is_intercept = (string(cov_var) == "1" || string(cov_var) == "intercept()")
-
-    local x_svc_full
-    if is_intercept
-        x_svc_full = ones(Float64, N_tot)
-    else
-        if !hasproperty(M.data, cov_var)
-            @warn "Covariate $(cov_var) for SVCComponent not found. Returning zero-matrices for all outcomes."
-            structured_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
-            return (structured=structured_effects, noisy=structured_effects)
-        end
-        x_svc_train = M.data[!, cov_var]
-        x_svc_full = if !isnothing(PS) && hasproperty(PS.data, cov_var)
-            vcat(x_svc_train, PS.data[!, cov_var])
-        else
-            x_svc_train
-        end
-    end
-
-    s_idx_full = if !isnothing(PS)
-        vcat(M.s_idx, PS.s_idx)
-    else
-        M.s_idx
-    end
-    
-    inner_model = m_obj.model
-    inner_spec = (key=spec.key, structure=:spatial, var=spec.var, component_obj=inner_model)
-    inner_effects = extract_component(inner_model, chain, M, n_samples, outcomes_N, p_names, inner_spec, PS, N_tot)
-
-    structured_effects = Vector{Matrix{Float64}}()
-    for k in 1:outcomes_N
-        # Ensure inner_effects.structured[k] is valid before accessing
-        if k > length(inner_effects.structured) || isempty(inner_effects.structured[k])
-            @warn "Inner spatial effect for SVCComponent $(spec.key) (outcome $k) not found or empty. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_tot, n_samples))
-        else
-            spatial_field_k = inner_effects.structured[k] # This is [s_N x n_samples]
-            
-            effect_k = zeros(Float64, N_tot, n_samples)
-            for j in 1:n_samples
-                spatial_field_j = view(spatial_field_k, :, j)
-                effect_k[:, j] = view(spatial_field_j, s_idx_full) .* x_svc_full
-            end
-            push!(structured_effects, effect_k)
-        end
-    end
-
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for GP and Kriging components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::Union{GP, Kriging}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    
-    coord_vars = get(spec.params, :positional_args, [])
-    coords_train = spec.Q_template
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
-    else
-        Matrix{Float64}(coords_train)
-    end
-    n_obs_full = size(coords_full, 1)
-    noise = get(M, :noise, 1e-6)
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        v = generate_full_variable_names(spec, "univariate", k)
-        sigma_name = string(v.sigma)
-        ls_name = string(v.ls)
-        raw_name = string(v.raw)
-
-        if isempty(sigma_name) || isempty(ls_name) || isempty(raw_name)
-            @warn "Parameters for GP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            ls_samples = get_params_vector(chain, ls_name, 1)[:, 1]
-            raw_samples = get_params_vector(chain, raw_name, n_obs_full)
-
-            effect_k = zeros(Float64, n_obs_full, n_samples)
-            for j in 1:n_samples
-                K_mat = evaluate_kernel_matrix(coords_full, sigma_samples[j], ls_samples[j], Symbol(m_obj.kernel), noise)
-                F_gp = cholesky(Symmetric(K_mat))
-                effect_k[:, j] = F_gp.L * raw_samples[j, :]
-            end
-            push!(structured_effects, effect_k)
-        end
-    end
-    
-    return (structured=structured_effects, noisy=structured_effects)
-end
-  
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for DAG components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::DAG, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-    n_latent = size(spec.Q_template, 1)
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        v = generate_full_variable_names(spec, "univariate", k)
-        sigma_name = string(v.sigma)
-        rho_name = string(v.rho)
-        innov_name = string(v.innov)
-
-        if isempty(sigma_name) || isempty(rho_name) || isempty(innov_name)
-            @warn "Parameters for DAG component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_tot, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-            innov_samples = get_params_vector(chain, innov_name, n_latent)
-
-            effect_k = zeros(Float64, N_tot, n_samples)
-            W_dag = spec.Q_template
-
-            for j in 1:n_samples
-                latent_field = zeros(Float64, n_latent)
-                for i in 1:n_latent
-                    parent_effect = 0.0
-                    for j_ptr in nzrange(W_dag, i)
-                        parent_idx = W_dag.rowval[j_ptr]
-                        parent_effect += W_dag.nzval[j_ptr] * latent_field[parent_idx]
-                    end
-                    latent_field[i] = rho_samples[j] * parent_effect + innov_samples[j, i]
-                end
-                latent_field .*= sigma_samples[j]
-                effect_k[:, j] = view(latent_field, s_idx_full)
-            end
-            push!(structured_effects, effect_k)
-        end
-    end
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for LocalAdaptive components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::LocalAdaptive, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-    n_latent = size(spec.Q_template, 1)
-    n_clusters = spec.hyper.n_clusters
-    cluster_assignments = M.cluster_assignments
-    noise = M.noise
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        v = generate_full_variable_names(spec, "univariate", k)
-        sigma_name = string(v.sigma)
-        rho_name = string(v.rho)
-        raw_name = string(v.raw)
-        mu_clusters_raw_name = _find_parameter(p_names, var, "innov", k) # Assuming 'innov' for mu_clusters
-
-        if isempty(sigma_name) || isempty(rho_name) || isempty(raw_name) || isempty(mu_clusters_raw_name)
-            @warn "Parameters for LocalAdaptive component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_tot, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-            raw_samples = get_params_vector(chain, raw_name, n_latent)
-            mu_clusters_raw_samples = get_params_vector(chain, mu_clusters_raw_name, n_clusters)
-
-            effect_k = zeros(Float64, N_tot, n_samples)
-            
-            for j in 1:n_samples
-                mu_clusters_centered = mu_clusters_raw_samples[j, :] .- mean(mu_clusters_raw_samples[j, :])
-                mean_vector = mu_clusters_centered[cluster_assignments]
-                
-                Q_final = recompose_precision(:localadaptive, spec.Q_template, 1.0; extra_param=rho_samples[j])
-                F = cholesky(Symmetric(Q_final + noise * I))
-                latent_field_centered_part = F.U \ raw_samples[j, :]
-                
-                latent_field = (mean_vector .+ latent_field_centered_part) .* sigma_samples[j]
-                
-                effect_k[:, j] = view(latent_field, s_idx_full)
-            end
-            push!(structured_effects, effect_k)
-        end
-    end
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for NetworkFlow components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::NetworkFlow, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-    n_latent = size(spec.Q_template, 1)
-    noise = M.noise
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        v = generate_full_variable_names(spec, "univariate", k)
-        sigma_name = string(v.sigma)
-        rho_name = string(v.rho)
-        raw_name = string(v.raw)
-
-        if isempty(sigma_name) || isempty(rho_name) || isempty(raw_name)
-            @warn "Parameters for NetworkFlow component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_tot, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-            raw_samples = get_params_vector(chain, raw_name, n_latent)
-
-            effect_k = zeros(Float64, N_tot, n_samples)
-            W_net = spec.Q_template
-
-            for j in 1:n_samples
-                L_op = if m_obj.flow_direction == :upstream
-                    I(n_latent) - rho_samples[j] .* W_net'
-                elseif m_obj.flow_direction == :downstream
-                    I(n_latent) - rho_samples[j] .* W_net
-                else
-                    W_symm = sparse((W_net + W_net') .> 0)
-                    I(n_latent) - rho_samples[j] .* W_symm
-                end
-                
-                Q_final = Symmetric(L_op' * L_op + noise * I)
-                F = cholesky(Q_final)
-                
-                latent_field = (F.U \ raw_samples[j, :]) .* sigma_samples[j]
-                effect_k[:, j] = view(latent_field, s_idx_full)
-            end
-            push!(structured_effects, effect_k)
-        end
-    end
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for FITC and SVGP components.
-# Rationale: Ensures that `structured_effects` is always populated for each outcome, even if parameters
-#            are not found. This prevents `BoundsError` in downstream summarization functions.
-function extract_component(m_obj::Union{FITC, SVGP}, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    
-    coord_vars = get(spec.params, :positional_args, [])
-    coords_train = haskey(spec.params, :coords) ? spec.params.coords : Matrix{Float64}(M.data[!, Symbol.(coord_vars)])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
-    else
-        Matrix{Float64}(coords_train)
-    end
-    n_obs_full = size(coords_full, 1)
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        
-        sigma_name = _find_parameter(p_names, var, "sigma", k)
-        ls_name = _find_parameter(p_names, var, "ls", k)
-        u_raw_name = _find_parameter(p_names, var, "raw", k)
-        f_innov_name = _find_parameter(p_names, var, "innov", k)
-        
-        n_inducing = m_obj.n_inducing
-        Z_inducing = spec.params.Z_inducing
-
-        kernel_str = m_obj.kernel
-        kernel = get_kernel_from_string(kernel_str)
-        noise = get(M, :noise, 1e-6)
-
-        if isempty(sigma_name) || isempty(ls_name) || isempty(u_raw_name) || isempty(f_innov_name)
-            @warn "Parameters for GP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
-        else
-            sigma_samples = get_params_vector(chain, sigma_name, 1)
-            ls_samples = get_params_vector(chain, ls_name, 1)
-            u_raw_samples = get_params_vector(chain, u_raw_name, n_inducing)
-            f_innov_samples = get_params_vector(chain, f_innov_name, n_obs_full)
-
-            gp_effect_k = zeros(Float64, n_obs_full, n_samples)
-
-            for j in 1:n_samples
-                sigma_j = sigma_samples[j, 1]
-                ls_j = ls_samples[j, 1]
-                u_raw_j = u_raw_samples[j, :]
-                f_innov_j = f_innov_samples[j, 1:n_obs_full]
-
-                kernel_scaled = sigma_j^2 * (kernel ∘ ScaleTransform(1.0 / ls_j))
-                
-                K_uu = kernelmatrix(kernel_scaled, RowVecs(Z_inducing)) + noise * I
-                K_uf = kernelmatrix(kernel_scaled, RowVecs(Z_inducing), RowVecs(coords_full))
-                k_ff_diag = diag(kernelmatrix(kernel_scaled, RowVecs(coords_full)))
-
-                L_uu = cholesky(Symmetric(K_uu)).L
-                u_latent = L_uu * u_raw_j
-
-                A = (L_uu') \ K_uf
-                mean_f = A' * u_latent
-                var_f = k_ff_diag - vec(sum(A.^2, dims=1))
-
-                gp_effect_k[:, j] = mean_f + sqrt.(max.(var_f, 0.0) .+ noise) .* f_innov_j
-            end
-            push!(structured_effects, gp_effect_k)
-        end
-    end
-    
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for DynamicsComponent.
-# Rationale: Ensures that effect vectors are always populated for each outcome, even if parameters
-#            are not found or the model type is not recognized. This prevents `BoundsError` in
-#            downstream summarization functions and ensures explicit returns for all code paths.
-function extract_component(m_obj::DynamicsComponent, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    model_type = m_obj.model
-    key = string(spec.key)
-    structured_effects = Vector{Matrix{Float64}}()
-
-    if model_type == "generalized_leslie_matrix"
-        if outcomes_N <= 1; @warn "Generalized Leslie matrix reconstruction requires a multivariate model. Returning zero-effects."; return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]); end
-        
-        n_classes = get(m_obj.params, :n_classes, outcomes_N)
-        spatially_varying_K = get(m_obj.params, :spatially_varying_K, false)
-        spatially_varying_rates = get(m_obj.params, :spatially_varying_rates, false)
-        
-        sigma_process_samples_name = _find_parameter(p_names, key, "sigma_process", nothing)
-        innov_samples_name = _find_parameter(p_names, key, "innov_process", nothing)
-        
-        if isempty(sigma_process_samples_name) || isempty(innov_samples_name)
-            @warn "Parameters for DynamicsComponent (generalized_leslie_matrix) $(key) not found. Returning zero-effects."
-            return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
-        end
-
-        sigma_process_samples = get_params_vector(chain, sigma_process_samples_name, n_classes)
-        innov_samples = get_params_vector(chain, innov_samples_name, M.s_N * M.t_N * n_classes)
-        areas = spec.hyper.areas
-        noise = get(M, :noise, 1e-6)
-        L = spec.hyper.L_template
-        F_spatial = cholesky(Symmetric(L + noise * I))
-
-        local K_samples, A_samples
-        if spatially_varying_K; sigma_K_samples = get_params_vector(chain, _find_parameter(p_names, key, "sigma_K", nothing), 1)[:, 1]; log_K_mean_samples = get_params_vector(chain, _find_parameter(p_names, key, "log_K_mean", nothing), 1)[:, 1]; K_raw_samples = get_params_vector(chain, _find_parameter(p_names, key, "K_raw", nothing), M.s_N); else K_samples = get_params_vector(chain, _find_parameter(p_names, key, "K", nothing), 1)[:, 1]; end
-        if spatially_varying_rates; A_mean_samples = get_params_vector(chain, _find_parameter(p_names, key, "A_mean", nothing), n_classes^2); A_sigma_samples = get_params_vector(chain, _find_parameter(p_names, key, "A_sigma", nothing), n_classes^2); A_raw_samples = get_params_vector(chain, _find_parameter(p_names, key, "A_raw", nothing), M.s_N * n_classes^2); else A_samples = get_params_vector(chain, _find_parameter(p_names, key, "A_flat", nothing), n_classes^2); end
-        
-        effort_keys = get(spec.hyper, :effort_keys, [])
-        q_samples_dict = Dict(key => get_params_vector(chain, "q_$(key)", n_classes) for key in effort_keys)
-        removal_keys = get(spec.hyper, :removal_keys, [])
-
-        class_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:n_classes]
-        s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-        t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx
-
-        for j in 1:n_samples
-            local K_values_j, A_spatial_j
-            if spatially_varying_K; K_field_raw = F_spatial.U \ K_raw_samples[j, :]; K_field_raw .-= mean(K_field_raw); K_values_j = exp.(log_K_mean_samples[j] .+ K_field_raw .* sigma_K_samples[j]); else K_values_j = fill(K_samples[j], M.s_N); end
-            if spatially_varying_rates; A_raw_matrix = reshape(A_raw_samples[j, :], M.s_N, n_classes^2); A_field = F_spatial.U \ A_raw_matrix; A_spatial_j = exp.(A_mean_samples[j, :]' .+ A_field .* A_sigma_samples[j, :]'); else A_spatial_j = reshape(A_samples[j, :], n_classes, n_classes); end
-
-            innov_tensor_j = reshape(innov_samples[j, :], M.s_N, M.t_N, n_classes)
-            sigma_j = sigma_process_samples[j, :]
-            population_field_j = zeros(Float64, M.s_N, M.t_N, n_classes)
-            for c in 1:n_classes; population_field_j[:, 1, c] = max.(0.0, innov_tensor_j[:, 1, c] .* sigma_j[c]); end
-
-            for s in 1:M.s_N
-                A_s = spatially_varying_rates ? reshape(A_spatial_j[s, :], n_classes, n_classes) : A_spatial_j
-                for t in 2:M.t_N
-                    N_prev = view(population_field_j, s, t-1, :); C_prev = zeros(n_classes)
-                    for e_key in effort_keys; C_prev .+= q_samples_dict[e_key][j, :] .* spec.hyper.processed_params[e_key][s, t-1] .* N_prev; end
-                    for r_key in removal_keys; C_prev .+= spec.hyper.processed_params[r_key][s, t-1, :]; end
-                    N_after_removal = max.(0.0, N_prev - C_prev); A_effective = copy(A_s)
-                    if haskey(m_obj.params, :K) || spatially_varying_K; total_pop_prev = sum(N_after_removal); dd_factor = max(0.0, 1.0 - total_pop_prev / K_values_j[s]); A_effective[1, :] .*= dd_factor; end
-                    N_projected = A_effective * N_after_removal; current_innov = view(innov_tensor_j, s, t, :) .* sigma_j; population_field_j[s, t, :] = max.(0.0, N_projected .+ current_innov)
-                end
-            end
-            
-            for c in 1:n_classes; log_pop_field = log.(view(population_field_j, :, :, c) .+ 1e-6); for i in 1:N_tot; class_effects[c][i, j] = log_pop_field[s_idx_full[i], t_idx_full[i]]; end; end
-        end
-        return (structured=class_effects, noisy=class_effects)
-    
-    elseif model_type == "leslie_matrix"
-        if outcomes_N <= 1; @warn "Leslie matrix reconstruction requires a multivariate model. Returning zero-effects."; return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]); end
-
-        n_age_classes = get(m_obj.params, :n_age_classes, outcomes_N)
-        spatially_varying_K = get(m_obj.params, :spatially_varying_K, false)
-        spatially_varying_rates = get(m_obj.params, :spatially_varying_rates, false)
-        
-        sigma_samples_name = _find_parameter(p_names, key, "sigma_process", nothing)
-        innov_samples_name = _find_parameter(p_names, key, "innov_process", nothing)
-
-        if isempty(sigma_samples_name) || isempty(innov_samples_name)
-            @warn "Parameters for DynamicsComponent (leslie_matrix) $(key) not found. Returning zero-effects."
-            return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
-        end
-
-        sigma_samples = get_params_vector(chain, sigma_samples_name, n_age_classes)
-        innov_samples = get_params_vector(chain, innov_samples_name, M.s_N * M.t_N * n_age_classes)
-        areas = spec.hyper.areas
-        noise = get(M, :noise, 1e-6)
-        L = spec.hyper.L_template
-        F_spatial = cholesky(Symmetric(L + noise * I))
-
-        local K_samples, survival_samples, fecundity_samples
-        if spatially_varying_K; sigma_K_samples = get_params_vector(chain, _find_parameter(p_names, key, "sigma_K", nothing), 1)[:, 1]; log_K_mean_samples = get_params_vector(chain, _find_parameter(p_names, key, "log_K_mean", nothing), 1)[:, 1]; K_raw_samples = get_params_vector(chain, _find_parameter(p_names, key, "K_raw", nothing), M.s_N); else K_samples = get_params_vector(chain, _find_parameter(p_names, key, "K", nothing), 1)[:, 1]; end
-        if spatially_varying_rates; log_fecundity_mean_samples = get_params_vector(chain, _find_parameter(p_names, key, "log_fecundity_mean", nothing), n_age_classes); sigma_fecundity_samples = get_params_vector(chain, _find_parameter(p_names, key, "sigma_fecundity", nothing), n_age_classes); fecundity_raw_samples = get_params_vector(chain, _find_parameter(p_names, key, "fecundity_raw", nothing), M.s_N * n_age_classes); logit_survival_mean_samples = get_params_vector(chain, _find_parameter(p_names, key, "logit_survival_mean", nothing), n_age_classes - 1); sigma_survival_samples = get_params_vector(chain, _find_parameter(p_names, key, "sigma_survival", nothing), n_age_classes - 1); survival_raw_samples = get_params_vector(chain, _find_parameter(p_names, key, "survival_raw", nothing), M.s_N * (n_age_classes - 1)); else survival_samples = get_params_vector(chain, _find_parameter(p_names, key, "survival_rates", nothing), n_age_classes - 1); fecundity_samples = get_params_vector(chain, _find_parameter(p_names, key, "fecundity_rates", nothing), n_age_classes); end
-        
-        effort_keys = get(spec.hyper, :effort_keys, [])
-        q_samples_dict = Dict(key => get_params_vector(chain, "q_$(key)", n_age_classes) for key in effort_keys)
-        removal_keys = get(spec.hyper, :removal_keys, [])
-
-        age_class_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:n_age_classes]
-
-        s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-        t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx
-
-        for j in 1:n_samples
-            local K_values, survival_rates_spatial, fecundity_rates_spatial
-            if spatially_varying_K; K_field_raw = F_spatial.U \ K_raw_samples[j, :]; K_field_raw .-= mean(K_field_raw); K_values = exp.(log_K_mean_samples[j] .+ K_field_raw .* sigma_K_samples[j]); else K_values = fill(K_samples[j], M.s_N); end
-            if spatially_varying_rates
-                fecundity_raw_matrix = reshape(fecundity_raw_samples[j, :], M.s_N, n_age_classes)
-                fecundity_field = F_spatial.U \ fecundity_raw_matrix
-                fecundity_rates_spatial = exp.(log_fecundity_mean_samples[j, :]' .+ fecundity_field .* sigma_fecundity_samples[j, :]')
-                
-                survival_raw_matrix = reshape(survival_raw_samples[j, :], M.s_N, n_age_classes - 1)
-                survival_field = F_spatial.U \ survival_raw_matrix
-                survival_rates_spatial = logistic.(logit_survival_mean_samples[j, :]' .+ survival_field .* sigma_survival_samples[j, :]')
-            end
-
-            innov_tensor_j = reshape(innov_samples[j, :], M.s_N, M.t_N, n_age_classes)
-            sigma_j = sigma_samples[j, :]
-
-            population_field_j = zeros(Float64, M.s_N, M.t_N, n_age_classes)
-            for a in 1:n_age_classes
-                population_field_j[:, 1, a] = max.(0.0, innov_tensor_j[:, 1, a] .* sigma_j[a])
-            end
-
-            for s in 1:M.s_N
-                L_s = zeros(Float64, n_age_classes, n_age_classes)
-                if spatially_varying_rates
-                    for i in 1:(n_age_classes-1); L_s[i+1, i] = survival_rates_spatial[s, i]; end
-                    L_s[1, :] = fecundity_rates_spatial[s, :]
-                else
-                    for i in 1:(n_age_classes-1); L_s[i+1, i] = survival_samples[j, i]; end
-                    L_s[1, :] = fecundity_samples[j, :]
-                end
-
-                for t in 2:M.t_N
-                    N_prev = view(population_field_j, s, t-1, :)
-                    C_prev = zeros(n_age_classes)
-                    for key in effort_keys
-                        C_prev .+= q_samples_dict[key][j, :] .* spec.hyper.processed_params[key][s, t-1] .* N_prev
-                    end
-                    for key in removal_keys
-                        C_prev .+= spec.hyper.processed_params[key][s, t-1, :]
-                    end
-                    N_after_removal = max.(0.0, N_prev - C_prev)
-                    
-                    L_effective = copy(L_s)
-                    if spatially_varying_K || haskey(m_obj.params, :K)
-                        total_pop_prev = sum(N_after_removal)
-                        K_density = K_values[s] / areas[s]
-                        dd_factor = max(0.0, 1.0 - (total_pop_prev / areas[s]) / K_density)
-                        L_effective[1, :] .*= dd_factor
-                    end
-                    N_projected = L_effective * N_after_removal
-                    current_innov = view(innov_tensor_j, s, t, :) .* sigma_j
-                    population_field_j[s, t, :] = max.(0.0, N_projected .+ current_innov)
-                end
-            end
-            
-            for a in 1:n_age_classes; log_pop_field = log.(view(population_field_j, :, :, a) .+ 1e-6); for i in 1:N_tot; age_class_effects[a][i, j] = log_pop_field[s_idx_full[i], t_idx_full[i]]; end; end
-        end
-        return (structured=age_class_effects, noisy=age_class_effects)
-
-    elseif model_type == "delay_difference" && M.outcomes_N > 1
-        r_samples_name = _find_parameter(p_names, key, "r", nothing)
-        K_samples_name = _find_parameter(p_names, key, "K", nothing)
-        M_nat_samples_name = _find_parameter(p_names, key, "M_nat", nothing)
-        sigma_rec_samples_name = _find_parameter(p_names, key, "sigma_recruitment", nothing)
-        sigma_pop_samples_name = _find_parameter(p_names, key, "sigma_population", nothing)
-        innov_rec_samples_name = _find_parameter(p_names, key, "innov_recruitment", nothing)
-        innov_pop_samples_name = _find_parameter(p_names, key, "innov_population", nothing)
-
-        if isempty(r_samples_name) || isempty(K_samples_name) || isempty(M_nat_samples_name) || isempty(sigma_rec_samples_name) || isempty(sigma_pop_samples_name) || isempty(innov_rec_samples_name) || isempty(innov_pop_samples_name)
-            @warn "Parameters for DynamicsComponent (delay_difference) $(key) not found. Returning zero-effects."
-            return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
-        end
-
-        r_samples = get_params_vector(chain, r_samples_name, 1)[:, 1]
-        K_samples = get_params_vector(chain, K_samples_name, 1)[:, 1]
-        M_nat_samples = get_params_vector(chain, M_nat_samples_name, 1)[:, 1]
-        sigma_rec_samples = get_params_vector(chain, sigma_rec_samples_name, 1)[:, 1]
-        sigma_pop_samples = get_params_vector(chain, sigma_pop_samples_name, 1)[:, 1]
-        innov_rec_samples = get_params_vector(chain, innov_rec_samples_name, M.s_N * M.t_N)
-        innov_pop_samples = get_params_vector(chain, innov_pop_samples_name, M.s_N * M.t_N)
-        
-        areas = spec.hyper.areas
-        
-        effort_keys = get(spec.hyper, :effort_keys, [])
-        q_samples_dict = Dict(key => get_params_vector(chain, "q_$(key)", 1)[:, 1] for key in effort_keys)
-        removal_keys = get(spec.hyper, :removal_keys, [])
-
-        pop_effects = zeros(Float64, N_tot, n_samples)
-        rec_effects = zeros(Float64, N_tot, n_samples)
-        
-        s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-        t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx
-
-        for j in 1:n_samples
-            innov_rec_matrix = reshape(innov_rec_samples[j, :], M.s_N, M.t_N)
-            innov_pop_matrix = reshape(innov_pop_samples[j, :], M.s_N, M.t_N)
-            
-            population_field = zeros(M.s_N, M.t_N)
-            recruitment_field = zeros(M.s_N, M.t_N)
-            population_field[:, 1] = max.(0.0, innov_pop_matrix[:, 1] .* sigma_pop_samples[j])
-            recruitment_field[:, 1] = max.(0.0, innov_rec_matrix[:, 1] .* sigma_rec_samples[j])
-
-            for t in 2:M.t_N
-                N_prev = population_field[:, t-1]
-                D_prev = N_prev ./ areas
-                K_density = K_samples[j] ./ areas
-                
-                mean_recruitment = r_samples[j] .* D_prev .* (1.0 .- D_prev ./ K_density) .* areas
-                recruitment_field[:, t] = exp.(log.(mean_recruitment .+ 1e-6) .+ innov_rec_matrix[:, t] .* sigma_rec_samples[j])
-                
-                C_prev = zeros(M.s_N)
-                for e_key in effort_keys
-                    C_prev .+= q_samples_dict[e_key][j] .* spec.hyper.processed_params[e_key][:, t-1] .* N_prev
-                end
-                for r_key in removal_keys
-                    C_prev .+= spec.hyper.processed_params[r_key][:, t-1]
-                end
-
-                N_survived = (N_prev .- C_prev) .* exp.(-M_nat_samples[j])
-                population_field[:, t] = max.(0.0, N_survived .+ recruitment_field[:, t] .+ innov_pop_matrix[:, t] .* sigma_pop_samples[j])
-            end
-
-            for i in 1:N_tot
-                s_i, t_i = s_idx_full[i], t_idx_full[i]
-                pop_effects[i, j] = log(population_field[s_i, t_i] + 1e-6)
-                rec_effects[i, j] = log(recruitment_field[s_i, t_i] + 1e-6)
-            end
-        end
-        return (structured=[pop_effects, rec_effects], noisy=[pop_effects, rec_effects])
-
-    elseif model_type == "generalized_lotka_volterra"
-        n_species = M.outcomes_N
-        spatially_varying_K = get(m_obj.params, :spatially_varying_K, false)
-        
-        r_samples_name = _find_parameter(p_names, key, "r", nothing)
-        alpha_raw_samples_name = _find_parameter(p_names, key, "alpha_raw", nothing)
-        sigma_process_samples_name = _find_parameter(p_names, key, "sigma_process", nothing)
-        innov_process_samples_name = _find_parameter(p_names, key, "innov_process", nothing)
-
-        if isempty(r_samples_name) || isempty(alpha_raw_samples_name) || isempty(sigma_process_samples_name) || isempty(innov_process_samples_name)
-            @warn "Parameters for DynamicsComponent (generalized_lotka_volterra) $(key) not found. Returning zero-effects."
-            return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
-        end
-
-        r_samples = get_params_vector(chain, r_samples_name, n_species)
-        alpha_raw_samples = get_params_vector(chain, alpha_raw_samples_name, n_species * (n_species - 1))
-        sigma_process_samples = get_params_vector(chain, sigma_process_samples_name, n_species)
-        innov_process_samples = get_params_vector(chain, innov_process_samples_name, M.s_N * M.t_N * n_species)
-        
-        areas = spec.hyper.areas
-        noise = get(M, :noise, 1e-6)
-        L = spec.hyper.L_template
-        F_spatial = cholesky(Symmetric(L + noise * I))
-
-        local K_samples
-        if spatially_varying_K
-            log_K_mean_samples = get_params_vector(chain, _find_parameter(p_names, key, "log_K_mean", nothing), n_species)
-            sigma_K_samples = get_params_vector(chain, _find_parameter(p_names, key, "sigma_K", nothing), n_species)
-            K_raw_samples = get_params_vector(chain, _find_parameter(p_names, key, "K_raw", nothing), M.s_N * n_species)
-        else
-            K_samples = get_params_vector(chain, _find_parameter(p_names, key, "K", nothing), n_species)
-        end
-
-        species_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:n_species]
-        s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-        t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx
-
-        for j in 1:n_samples
-            alpha_j = diagm(0 => ones(n_species))
-            off_diag_indices = [i for i in 1:(n_species^2) if mod(i-1, n_species+1) != 0]
-            alpha_j[off_diag_indices] = alpha_raw_samples[j, :]
-
-            local K_values_j
-            if spatially_varying_K
-                K_raw_matrix = reshape(K_raw_samples[j, :], M.s_N, n_species)
-                K_field = F_spatial.U \ K_raw_matrix
-                K_values_j = exp.(log_K_mean_samples[j, :]' .+ K_field .* sigma_K_samples[j, :]')
-            else
-                K_values_j = repeat(K_samples[j, :]', M.s_N, 1)
-            end
-
-            innov_tensor_j = reshape(innov_process_samples[j, :], M.s_N, M.t_N, n_species)
-            population_field_j = zeros(M.s_N, M.t_N, n_species)
-            population_field_j[:, 1, :] = max.(0.0, innov_tensor_j[:, 1, :] .* sigma_process_samples[j, :]')
-
-            for s in 1:M.s_N, t in 2:M.t_N
-                N_prev = view(population_field_j, s, t-1, :)
-                D_prev = N_prev ./ areas[s]
-                K_density = K_values_j[s, :] ./ areas[s]
-                
-                N_intermediate = zeros(n_species)
-                for i in 1:n_species
-                    interaction_sum_density = dot(alpha_j[i, :], D_prev)
-                    growth_density = r_samples[j, i] * D_prev[i] * (1.0 - interaction_sum_density / K_density[i])
-                    N_intermediate[i] = N_prev[i] + growth_density * areas[s]
-                end
-                
-                current_innov = view(innov_tensor_j, s, t, :) .* sigma_process_samples[j, :]
-                population_field_j[s, t, :] = max.(0.0, N_intermediate .+ current_innov)
-            end
-
-            for i in 1:n_species
-                log_pop_field = log.(view(population_field_j, :, :, i) .+ 1e-6)
-                for obs_idx in 1:N_tot
-                    species_effects[i][obs_idx, j] = log_pop_field[s_idx_full[obs_idx], t_idx_full[obs_idx]]
-                end
-            end
-        end
-        return (structured=species_effects, noisy=species_effects)
-
-    end
-
-    # Default return for model_type not explicitly handled
-    @warn "Reconstruction for DynamicsComponent with model type '$(model_type)' is not implemented. Returning zero-effect for '$(key)'."
-    structured_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-# Version 1.6.1 (2026-08-06)
-# Purpose: Extracts all latent effects from the MCMC chain for ComposedComponent.
-# Rationale: Ensures that effect vectors are always populated for each outcome, even if the
-#            composition operator is not fully supported. This prevents `BoundsError` in
-#            downstream summarization functions and ensures explicit returns for all code paths.
-function extract_component(m_obj::ComposedComponent, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    op = m_obj.operator 
-    key = string(spec.key)
-    N_tot = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
-
-    if op == :composition
-        @warn "Reconstruction for generic composition is not fully supported. Assuming NonStationaryVariance structure."
-        if m_obj isa NonStationaryVariance
-            return extract_component(m_obj, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-        else
-            # If op is :composition but not NonStationaryVariance, return zero effects.
-            structured_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
-            return (structured=structured_effects, noisy=structured_effects)
-        end
-
-    elseif op == :kronecker_product && haskey(M, :model_st) && M.model_st != "none"
-        spatial_comp_obj = m_obj.components[1]
-        temporal_comp_obj = m_obj.components[2]
-
-        spatial_spec_idx = findfirst(s -> s.component_obj === spatial_comp_obj, M.components)
-        temporal_spec_idx = findfirst(s -> s.component_obj === temporal_comp_obj, M.components)
-
-        if isnothing(spatial_spec_idx) || isnothing(temporal_spec_idx)
-            @warn "Could not resolve components for Kronecker product '$(key)'. ST effect reconstruction skipped."
-            return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
-        end
-
-        s_Q = M.components[spatial_spec_idx].Q_template
-        t_Q = M.components[temporal_spec_idx].Q_template
-        noise = get(M, :noise, 1e-6)
-        
-        C_s = cholesky(Symmetric(Matrix(s_Q) + noise * I))
-        C_t = cholesky(Symmetric(Matrix(t_Q) + noise * I))
-
-        s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-        t_idx_full = !isnothing(PS) ? vcat(M.t_idx, PS.t_idx) : M.t_idx
-
-        all_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
-
-        for k in 1:outcomes_N
-            st_sigma_samples = get_params_vector(chain, _find_parameter(p_names, "st_interaction", "sigma", k), 1)[:, 1]
-            st_raw_samples = if outcomes_N > 1
-                st_raw_flat = get_params_vector(chain, _find_parameter(p_names, "st_interaction", "raw", nothing), M.s_N * M.t_N * outcomes_N)
-                st_raw_flat[:, (k-1)*M.s_N*M.t_N+1 : k*M.s_N*M.t_N]
-            else
-                get_params_vector(chain, _find_parameter(p_names, "st_interaction", "raw", nothing), M.s_N * M.t_N)
-            end
-
-            st_effect_k = zeros(Float64, N_tot, n_samples)
-
-            for j in 1:n_samples
-                st_innov_matrix = reshape(st_raw_samples[j, :], M.s_N, M.t_N)
-                tmp_spatial = C_s.U \ st_innov_matrix
-                st_inter = (transpose(C_t.U \ transpose(tmp_spatial))) .* st_sigma_samples[j]
-                for i in 1:N_tot; st_effect_k[i, j] = st_inter[s_idx_full[i], t_idx_full[i]]; end
-            end
-            all_effects[k] = st_effect_k
-        end
-        return (structured=all_effects, noisy=all_effects)
-
-    elseif op == :pipe
-        state_component_obj = m_obj.components[1] 
-        dynamic_component_obj = get(spec.params, :dynamic_component_obj, nothing)
-
-        if isnothing(dynamic_component_obj); @warn "Could not resolve dynamic component for piped component '$(key)'."; return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]); end
-
-        basis_key = get(spec.params, :dynamic_basis_key, nothing)
-        if isnothing(basis_key) || !haskey(M.basis_matrices, basis_key); @warn "Could not find basis matrix for dynamic component of piped component '$(key)'."; return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]); end
-
-        B_dynamic_train = M.basis_matrices[basis_key]
-        B_dynamic_full = if !isnothing(PS) && haskey(PS, :basis_matrices) && haskey(PS.basis_matrices, basis_key)
-            vcat(B_dynamic_train, PS.basis_matrices[basis_key])
-        else
-            B_dynamic_train
-        end
-        n_basis = size(B_dynamic_full, 2)
-        n_spatial = M.s_N
-
-        all_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
-
-        for k in 1:outcomes_N
-            v = generate_full_variable_names(spec, "univariate", k)
-            sigma_name = string(v.sigma)
-            rho_name = string(v.rho)
-            coeffs_raw_name = string(v.raw)
-
-            if isempty(_find_parameter(p_names, string(spec.key), "sigma", k)) || isempty(_find_parameter(p_names, string(spec.key), "raw", k))
-                @warn "Parameters for piped component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                all_effects[k] = zeros(Float64, N_tot, n_samples)
-                continue
-            end
-     
-            sigma_samples = get_params_vector(chain, sigma_name, 1)
-            rho_samples = hasproperty(state_component_obj, :rho) ? get_params_vector(chain, rho_name, 1) : nothing
-            coeffs_raw_samples = get_params_vector(chain, coeffs_raw_name, n_spatial * n_basis)
-
-            Q_spatial_template = spec.hyper.state_spec.Q_template
-            state_m_type = spec.hyper.state_spec.model_type
-            s_idx_full = !isnothing(PS) ? vcat(M.s_idx, PS.s_idx) : M.s_idx
-
-            for j in 1:n_samples
-                rho_val = isnothing(rho_samples) ? nothing : rho_samples[j, 1]
-                Q_spatial = recompose_precision(state_m_type, Q_spatial_template, 1.0; extra_param=rho_val)
-                F_spatial = cholesky(Symmetric(Q_spatial + 1e-6 * I))
-
-                coeffs_raw_matrix = reshape(coeffs_raw_samples[j, :], n_spatial, n_basis)
-                spatial_coeffs = sigma_samples[j, 1] .* (F_spatial.U \ coeffs_raw_matrix)
-
-                all_effects[k][:, j] = sum(B_dynamic_full .* spatial_coeffs[s_idx_full, :], dims=2)
-            end
-        end
-        return (structured=all_effects, noisy=all_effects)
-    end
-    
-    @warn "Reconstruction for ComposedComponent with operator ':$op' is not implemented. Returning zero-effect for '$(key)'."
-    return (structured=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N], noisy=[zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N])
-end
-
-
-
-function extract_component(m_obj::MixedComponent, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    lhs_effects = m_obj.lhs
-    n_terms = length(lhs_effects)
-    var = string(spec.key)
-    group_var_sym = m_obj.group_var
-    inner_m = m_obj.model
-    noise_val = get(M, :noise, 1e-6)
-
-    # Determine all unique levels across training and prediction sets
-    train_levels = unique(M.data[!, group_var_sym])
-    n_groups_train = length(train_levels)
-    
-    all_levels = train_levels
-    has_new_levels = false
-    if !isnothing(PS) && hasproperty(PS.data, group_var_sym)
-        pred_levels = unique(PS.data[!, group_var_sym])
-        if !isempty(setdiff(pred_levels, train_levels))
-            has_new_levels = true
-        end
-        all_levels = unique(vcat(train_levels, pred_levels))
-    end
-    n_all_groups = length(all_levels)
-    
-    # Create a map from level value to index
-    level_map = Dict(level => i for (i, level) in enumerate(all_levels))
-    
-    # Get indices for the full dataset (train + pred)
-    full_indices = if !isnothing(PS) && hasproperty(PS.data, group_var_sym)
-        [level_map[v] for v in vcat(M.data[!, group_var_sym], PS.data[!, group_var_sym])]
-    else
-        [level_map[v] for v in M.data[!, group_var_sym]]
-    end
-
-    # --- Case 1: Simple (uncorrelated) random effects ---
-    if n_terms == 1
-        structured_effects = Vector{Matrix{Float64}}()
-        for k in 1:outcomes_N
-            v = generate_full_variable_names(spec, "univariate", k)
-            sigma_name = string(v.sigma)
-            latent_name = string(v.raw) # Raw innovations for the training set
-
-            if isempty(_find_parameter(p_names, "sigma", var, k)) || isempty(_find_parameter(p_names, "raw", var, k))
-                @warn "Parameters for simple MixedComponent $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, n_all_groups, n_samples))
-                continue
-            end
-
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            raw_samples_train = get_params_vector(chain, latent_name, n_groups_train)
-
-            effect_k = zeros(Float64, n_all_groups, n_samples)
-            train_level_indices = [level_map[level] for level in train_levels]
-            
-            # Reconstruct the latent field for training levels
-            Q_train_template = spec.Q_template
-            F_train = cholesky(Symmetric(Q_train_template + noise_val * I))
-            latent_samples_train = (F_train.U \ raw_samples_train')' .* sigma_samples'
-
-            effect_k[train_level_indices, :] = latent_samples_train'
-
-            # --- Out-of-sample prediction logic ---
-            if has_new_levels
-                new_level_indices = setdiff(1:n_all_groups, train_level_indices)
-                W_full = get(PS, :W, nothing)
-                
-                # Use structured prediction if possible, otherwise fall back to IID.
-                if !isnothing(W_full) && inner_m isa Union{ICAR, Besag, Leroux, SAR}
-                    model_type_sym = Symbol(lowercase(string(typeof(inner_m))))
-                    Q_full_template = build_structure_template(model_type_sym, n_all_groups; W=W_full).matrix
-                    
-                    rho_samples = hasproperty(inner_m, :rho) ? get_params_vector(chain, string(v.rho), 1)[:, 1] : nothing
-
-                    for s in 1:n_samples
-                        rho_s = isnothing(rho_samples) ? nothing : rho_samples[s]
-                        Q_full = recompose_precision(model_type_sym, Q_full_template, 1.0; extra_param=rho_s)
-                        
-                        Q_nn = Q_full[new_level_indices, new_level_indices]
-                        Q_nt = Q_full[new_level_indices, train_level_indices]
-                        
-                        Q_nn_inv = inv(Symmetric(Matrix(Q_nn)) + noise_val * I)
-                        
-                        mu_cond = -Q_nn_inv * Q_nt * latent_samples_train[s, :]
-                        Sigma_cond = Symmetric(Q_nn_inv) # Variance is 1 before scaling by sigma
-                        
-                        # Sample new effects from the conditional distribution
-                        new_effects_raw = rand(MvNormal(mu_cond, Sigma_cond))
-                        effect_k[new_level_indices, s] = new_effects_raw .* sigma_samples[s]
-                    end
-                else
-                    # Fallback to IID sampling
-                    if inner_m isa Union{ICAR, Besag, Leroux, SAR}; @warn "Structured prediction for MixedComponent '$(spec.key)' requires a full adjacency matrix `W` in the prediction set. Falling back to IID sampling."; end
-                    for s in 1:n_samples
-                        new_effects = rand(Normal(0, sigma_samples[s]), length(new_level_indices))
-                        effect_k[new_level_indices, s] = new_effects
-                    end
-                end
-            end
-            push!(structured_effects, effect_k)
-        end
-        return (type=:simple, effects=structured_effects, lhs=lhs_effects[1], indices=full_indices)
-    
-    # --- Case 2: Correlated random effects ---
-    else
-        correlated_effects = Dict{Symbol, Vector{Matrix{Float64}}}()
-        for k in 1:outcomes_N
-            v = generate_full_variable_names(spec, "univariate", k)
-            l_corr_name = string(v.L_corr)
-            sigma_effects_name = string(v.sigma_effects)
-            raw_name = string(v.raw)
-
-            if isempty(_find_parameter(p_names, "L_corr", var, k)) || isempty(_find_parameter(p_names, "sigma_effects", var, k)) || isempty(_find_parameter(p_names, "raw", var, k))
-                continue
-            end
-
-            l_corr_samps = get_params_vector(chain, l_corr_name, n_terms * n_terms)
-            sigma_eff_samps = get_params_vector(chain, sigma_effects_name, n_terms)
-            raw_samps = get_params_vector(chain, raw_name, n_groups_train * n_terms)
-
-            recon_matrix_k_full = zeros(n_all_groups, n_terms, n_samples)
-
-            for s in 1:n_samples
-                L_corr_s = reshape(l_corr_samps[s, :], n_terms, n_terms)
-                L_eff_t = (Diagonal(sigma_eff_samps[s, :]) * L_corr_s)'
-                
-                L_grp_inv_t = if inner_m isa IID
-                    sparse(I, n_groups_train, n_groups_train)
-                else
-                    cholesky(Symmetric(spec.Q_template + noise_val * I)).U \ I
-                end
-                
-                innov_mat_train = reshape(raw_samps[s, :], n_groups_train, n_terms)
-                gamma_train = L_grp_inv_t * innov_mat_train
-                recon_matrix_train = gamma_train * L_eff_t
-                
-                train_level_indices = [level_map[level] for level in train_levels]
-                recon_matrix_k_full[train_level_indices, :, s] = recon_matrix_train
-
-                # --- Out-of-sample prediction logic ---
-                if has_new_levels
-                    new_level_indices = setdiff(1:n_all_groups, train_level_indices)
-                    n_new = length(new_level_indices)
-                    gamma_new = zeros(n_new, n_terms)
-                    
-                    W_full = get(PS, :W, nothing)
-                    if !isnothing(W_full) && inner_m isa Union{ICAR, Besag, Leroux, SAR}
-                        model_type_sym = Symbol(lowercase(string(typeof(inner_m))))
-                        Q_full_template = build_structure_template(model_type_sym, n_all_groups; W=W_full).matrix
-                        Q_full = recompose_precision(model_type_sym, Q_full_template, 1.0; extra_param=nothing) # Assuming no rho for simplicity
-
-                        Q_nn = Q_full[new_level_indices, new_level_indices]
-                        Q_nt = Q_full[new_level_indices, train_level_indices]
-                        
-                        Q_nn_inv = inv(Symmetric(Matrix(Q_nn)) + noise_val * I)
-                        Sigma_cond = Symmetric(Q_nn_inv)
-
-                        for j in 1:n_terms
-                            mu_cond_j = -Q_nn_inv * Q_nt * gamma_train[:, j]
-                            gamma_new[:, j] = rand(MvNormal(mu_cond_j, Sigma_cond))
-                        end
-                    else
-                        if inner_m isa Union{ICAR, Besag, Leroux, SAR}; @warn "Structured prediction for correlated MixedComponent '$(spec.key)' requires a full adjacency matrix `W` in the prediction set. Falling back to IID sampling."; end
-                        gamma_new = randn(n_new, n_terms)
-                    end
-                    
-                    recon_matrix_new = gamma_new * L_eff_t
-                    recon_matrix_k_full[new_level_indices, :, s] = recon_matrix_new
-                end
-            end
-
-            for (i, term) in enumerate(lhs_effects)
-                is_intercept_term = (term == "1" || term == "intercept()")
-                term_key = is_intercept_term ? :intercept : Symbol("slope_$(term)")
-                if !haskey(correlated_effects, term_key)
-                    correlated_effects[term_key] = [zeros(0,0) for _ in 1:outcomes_N]
-                end
-                correlated_effects[term_key][k] = recon_matrix_k_full[:, i, :]
-            end
-        end
-        return (type=:correlated, effects=correlated_effects, lhs=lhs_effects, indices=full_indices)
-    end
-end
-
-function extract_component(m_obj::Eigen, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    key = string(spec.key)
-    var = string(spec.key)
-    
-    n_factors = m_obj.n_factors
-    n_obs_train = M.y_N
-    
-    factors_name = _find_parameter(p_names, "factors_flat", var, nothing)
-
-    if isempty(factors_name)
-        @warn "Latent factors for Eigen component $(key) not found in chain. Returning zero-matrix."
-        push!(structured_effects, zeros(Float64, N_tot, n_samples))
-        return (structured=structured_effects, noisy=structured_effects)
-    end
-
-    factors_samples = get_params_vector(chain, factors_name, n_obs_train * n_factors)
-    
-    # Reconstruct the effect that was added to eta, which is the sum of the factor scores.
-    total_effect = zeros(Float64, n_obs_train, n_samples)
-    for j in 1:n_samples
-        F_matrix_j = reshape(factors_samples[j, :], n_obs_train, n_factors)
-        total_effect[:, j] = sum(F_matrix_j, dims=2)
-    end
-
-    # Handle prediction set (PS) if provided
-    if N_tot > n_obs_train
-        # For out-of-sample prediction, the latent factors are unknown.
-        # A common approach is to use the mean effect (which is zero for standard normal factors).
-        # Here, we will pad with zeros, assuming the effect is centered.
-        pred_effect = zeros(Float64, N_tot - n_obs_train, n_samples)
-        total_effect = vcat(total_effect, pred_effect)
-    end
-
-    # The Eigen effect is univariate; it applies the same effect to all outcomes.
-    for k in 1:outcomes_N
-        push!(structured_effects, total_effect)
-    end
-    
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-function extract_component(m_obj::TAR, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    t_N_train = M.t_N
-    t_N_full = isnothing(PS) ? t_N_train : max(maximum(M.t_idx), maximum(PS.t_idx))
-    
-    threshold_data_train = spec.hyper.threshold_data
-    threshold_data_full = if !isnothing(PS) && hasproperty(PS.data, m_obj.threshold_var)
-        vcat(threshold_data_train, PS.data[!, m_obj.threshold_var])
-    else
-        threshold_data_train
-    end
-    if length(threshold_data_full) < t_N_full
-        @warn "Threshold data for TAR model is shorter than the full time series. Predictions may be unreliable."
-        threshold_data_full = vcat(threshold_data_full, fill(mean(threshold_data_full), t_N_full - length(threshold_data_full)))
-    end
-
-    v = generate_full_variable_names(spec, "univariate", 1)
-    rho1_name = string(v.rho) * "_1"
-    rho2_name = string(v.rho) * "_2"
-    sigma1_name = string(v.sigma) * "_1"
-    sigma2_name = string(v.sigma) * "_2"
-    thresh_raw_name = string(v.raw) * "_thresh"
-    innov_name = string(v.innov)
-
-    rho1_samples = get_params_vector(chain, rho1_name, 1)[:,1]
-    rho2_samples = get_params_vector(chain, rho2_name, 1)[:,1]
-    sigma1_samples = get_params_vector(chain, sigma1_name, 1)[:,1]
-    sigma2_samples = get_params_vector(chain, sigma2_name, 1)[:,1]
-    thresh_raw_samples = get_params_vector(chain, thresh_raw_name, 1)[:,1]
-    innov_samples_train = get_params_vector(chain, innov_name, t_N_train)
-
-    mean_threshold_data = mean(threshold_data_train)
-    noise = M.noise
-
-    latent_field_samples = Array{Float64, 2}(undef, t_N_full, n_samples)
-    
-    for i in 1:n_samples
-        threshold_level = mean_threshold_data + thresh_raw_samples[i]
-        
-        innov_full = vcat(innov_samples_train[i, :], randn(t_N_full - t_N_train))
-
-        for t in 1:t_N_full
-            regime_indicator = threshold_data_full[t] > threshold_level
-            
-            curr_rho = regime_indicator ? rho2_samples[i] : rho1_samples[i]
-            curr_sigma = regime_indicator ? sigma2_samples[i] : sigma1_samples[i]
-            
-            if t == 1
-                latent_field_samples[t, i] = (innov_full[t] * curr_sigma) / sqrt(1.0 - curr_rho^2 + noise)
-            else
-                latent_field_samples[t, i] = curr_rho * latent_field_samples[t-1, i] + innov_full[t] * curr_sigma
-            end
-        end
-    end
-    
-    return (structured=[latent_field_samples], noisy=[latent_field_samples])
-end
-
-
-function extract_component(m_obj::AdaptiveSmooth, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    structured_effects = Vector{Matrix{Float64}}()
-    
-    coords_train = spec.hyper.coords
-    coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
-    else
-        coords_train
-    end
-    n_obs_full = size(coords_full, 1)
-
-    for k in 1:outcomes_N
-        var = string(spec.key)
-        v = generate_full_variable_names(spec, "univariate", k)
-        
-        W1_name = string(v.raw) * "_W1"
-        b1_name = string(v.raw) * "_b1"
-        W2_name = string(v.raw) * "_W2"
-        coeffs_name = string(v.innov)
-        sigma_name = string(v.sigma)
-
-        if isempty(_find_parameter(p_names, "raw_W1", var, k))
-             @warn "Parameters for AdaptiveSmooth component $(spec.key) not found. Returning zero-matrix."
-             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
-             continue
-        end
-
-        W1_samples = get_params_vector(chain, W1_name, spec.hyper.in_dim * spec.hyper.hidden_dim)
-        b1_samples = get_params_vector(chain, b1_name, spec.hyper.hidden_dim)
-        W2_samples = get_params_vector(chain, W2_name, spec.hyper.hidden_dim * m_obj.nbins)
-        coeffs_samples = get_params_vector(chain, coeffs_name, m_obj.nbins)
-        sigma_samples = get_params_vector(chain, sigma_name, 1)
-
-        effect_samples = Array{Float64, 2}(undef, n_obs_full, n_samples)
-        
-        for i in 1:n_samples
-            # Reconstruct MLP weights for this sample
-            W1 = reshape(W1_samples[i, :], spec.hyper.in_dim, spec.hyper.hidden_dim)
-            b1 = b1_samples[i, :]
-            W2 = reshape(W2_samples[i, :], spec.hyper.hidden_dim, m_obj.nbins)
-            
-            # Reconstruct basis coefficients for this sample
-            scaled_coeffs = coeffs_samples[i, :] .* sigma_samples[i, 1]
-            
-            # Compute the adaptive basis matrix B for the full coordinate set
-            H = tanh.(coords_full * W1 .+ b1')
-            B_adaptive = H * W2
-            
-            # Compute the final effect
-            effect_samples[:, i] = B_adaptive * scaled_coeffs
-        end
-        push!(structured_effects, effect_samples)
-    end
-    
-    return (structured=structured_effects, noisy=structured_effects)
-end
-
-
-function extract_component(m_obj::CustomComponent, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    reconstruct_func = get(m_obj.params, :reconstruct_func, nothing)
-
-    if !isnothing(reconstruct_func) && isa(reconstruct_func, Function)
-        try
-            return reconstruct_func(chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-        catch e
-            @error "The custom reconstruction function for component '$(spec.key)' failed."
-            rethrow(e)
-        end
-    else
-        @warn "Reconstruction for custom component '$(spec.key)' is not defined. Returning a zero-effect. Please provide a `reconstruct_func` to the `custom()` module to enable posterior reconstruction."
-        structured_effects = [zeros(Float64, N_tot, n_samples) for _ in 1:outcomes_N]
-        return (structured=structured_effects, noisy=structured_effects)
-    end
-end
-
-function extract_component(m_obj::Component, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    @warn "No specific reconstruction logic for component type $(typeof(m_obj)). Returning zero effects."
-    n_units = if spec.structure == :spatial; M.s_N; elseif spec.structure == :temporal; M.t_N; else 1; end
-    return (structured=[zeros(Float64, n_units, n_samples)], noisy=[zeros(Float64, n_units, n_samples)])
-end
-
-
+ 

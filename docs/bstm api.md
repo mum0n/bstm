@@ -33,7 +33,7 @@ The component system is organized under a hierarchy of abstract types that defin
 
 *   **`abstract type Component end`**: The root type for all structural components.
 *   **`abstract type ComponentModel <: Component end`**: Represents a base-level statistical model for a latent field (e.g., `ICAR`, `AR1`, `GP`). These are the fundamental building blocks.
-*   **`abstract type ComponentOperator <: Component end`**: Represents an operation that combines or transforms one or more `Component` objects (e.g., `ComposedComponent` for `⊗`, `SVCComponent` for `|>`).
+*   **`abstract type ComponentOperator <: Component end`**: Represents an operation that combines or transforms one or more `Component` objects (e.g., `Composed` for `⊗`, `SVCComponent` for `|>`).
 *   **`abstract type ComponentSupervisor <: Component end`**: A special type for modules that manage entire sub-models, such as the `nested()` module.
 
 #### `ComponentModel` Structs
@@ -111,16 +111,15 @@ struct Spherical <: ComponentModel; sigma::UnivariateDistribution; range::Univar
 struct Barycentric <: ComponentModel; sigma::UnivariateDistribution; end # Now `random(model=:barycentric)`
 struct BCGN <: ComponentModel; sigma::UnivariateDistribution; bipartite_adj::AbstractMatrix; end # Now `random(model=:bcgn)`
 struct NetworkFlow <: ComponentModel; sigma::UnivariateDistribution; adjacency_matrix::AbstractMatrix; flow_direction::Symbol; end # Now `random(model=:networkflow)`
-struct LocalAdaptive <: ComponentModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end # Now `random(model=:localadaptive)` 
-struct TensorProductSmooth <: ComponentModel; sigma::UnivariateDistribution; Q_template::AbstractMatrix; end # Now `random(model=:tensorproductsmooth)`
-struct DynamicsComponent <: ComponentModel; model::String; params::Dict{Symbol, Any}; end # Now `dynamics(...)`
+struct LocalAdaptive <: ComponentModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end # Now `random(model=:localadaptive)`   
+struct Dynamics <: ComponentModel; model::String; params::Dict{Symbol, Any}; end # Now `dynamics(...)`
 ```
 
 #### `ComponentOperator` Structs
 
 These structs implement the algebraic composition of components.
 
-*   **`struct ComposedComponent <: ComponentOperator`**: Represents algebraic compositions like `⊗` (Kronecker product) and `⊕` (direct sum). It holds a vector of component `Component` objects and an `operator` symbol.
+*   **`struct Composed <: ComponentOperator`**: Represents algebraic compositions like `⊗` (Kronecker product) and `⊕` (direct sum). It holds a vector of component `Component` objects and an `operator` symbol.
 *   **`struct SVCComponent <: ComponentOperator`**: Represents a Spatially Varying Coefficient model, created by the `|>` operator (e.g., `poverty |> random(...)`). It links a covariate to a spatial component.
 *   **`struct MixedComponent <: ComponentOperator`**: Represents a random effect (intercept or slope) for a specified grouping variable.
 
@@ -239,7 +238,7 @@ The reconstruction engine is responsible for post-processing the MCMC `chain` to
     *   It iterates through the `M[:components]` specification. For each component, it calls `extract_component`.
     *   **`extract_component(m_obj, ...)`**: This function dispatches on the `Component` type (`m_obj`). Each method knows how to find its parameters in the chain and reconstruct its specific effect.
         *   For simple components like `BYM2`, it finds `sigma`, `rho`, `latent_struct`, and `latent_iid` samples and combines them to produce the structured, unstructured, and total spatial fields.
-        *   For a `ComposedComponent` with a `kronecker_product` operator, it reconstructs the interaction field by finding the corresponding latent field and hyperparameters in the chain and applying the correct scaling and reshaping.
+        *   For a `Composed` with a `kronecker_product` operator, it reconstructs the interaction field by finding the corresponding latent field and hyperparameters in the chain and applying the correct scaling and reshaping.
 
 *   **`_modular_eta_assembly(...)`**: Takes the `registry` of discovered fields and reassembles the full linear predictor `eta` for each posterior sample. This process mirrors the assembly logic within the Turing model itself but operates on the posterior samples. It correctly handles both in-sample (`M`) and out-of-sample (`PS`) data.
 

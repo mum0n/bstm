@@ -1,8 +1,55 @@
-#!Reference
+
 
 # ==============================================================================
 # SECTION 1: CORE DATA STRUCTURES AND TYPE DEFINITIONS
 # ==============================================================================
+
+
+abstract type Component end
+
+abstract type ComponentOperator <: Component end
+
+# All component models must inherit from ComponentModel
+abstract type ComponentModel <: Component end
+
+struct None <: ComponentModel end
+
+
+# these constructors will be added upon by each component file
+const COMPONENT_CONSTRUCTORS = Dict{Symbol, Function}(
+    :none => (p, params) -> None()  
+)
+
+# these structures will be added to where required in the component file
+const MODEL_TO_STRUCTURE_MAP = Dict{Symbol, Symbol}(
+    :none => :none  # dummy value to initiate the map 
+)
+
+
+
+ 
+abstract type AbstractModelArchitecture end
+struct UnivariateArchitecture <: AbstractModelArchitecture end
+struct MultivariateArchitecture <: AbstractModelArchitecture end
+struct MultifidelityArchitecture <: AbstractModelArchitecture end
+struct ExampleArchitecture <: AbstractModelArchitecture end
+struct UnknownArchitecture <: AbstractModelArchitecture end
+
+
+
+# ==============================================================================
+# SECTION 2: CONSTANTS, REGISTRIES, AND OPERATOR OVERLOADS
+# ==============================================================================
+
+const BSTM_MODULE_KEYWORDS = Set([ 
+    :intercept, :fixed, :mixed, :random, :nested, :eigen, :dynamics, :pointprocess, :custom,
+    :zscore, :log, :center, :scale, :sciml
+]);
+ 
+ 
+const TRANSFORMATION_FUNCTIONS = Set([:zscore, :log, :center, :scale])
+ 
+
 
 # Define simple structs for geometric primitives
 struct Point2D
@@ -24,323 +71,186 @@ struct Triangle
 end
 
 
-abstract type Component end
-abstract type ComponentModel <: Component end
-abstract type ComponentOperator <: Component end
-
-struct NoneComponent <: ComponentModel end
-
-struct IID <: ComponentModel; sigma::UnivariateDistribution; end
-struct ICAR <: ComponentModel; sigma::UnivariateDistribution; end
-struct Besag <: ComponentModel; sigma::UnivariateDistribution; end
-
-"""
-    BYM2 <: ComponentModel
-
-The Besag-York-Mollié 2 (BYM2) model, which provides an intuitive and well-identified
-parameterization for spatial effects by separating them into a structured (ICAR)
-and an unstructured (IID) component.
-
-# Fields
-- `rho`: The prior for the mixing parameter, controlling the proportion of
-  variance attributed to the structured spatial effect.
-- `sigma`: The prior for the overall marginal standard deviation of the
-  total spatial effect.
-"""
-struct BYM2 <: ComponentModel
-    rho::UnivariateDistribution
-    sigma::UnivariateDistribution
-end
-
-struct Leroux <: ComponentModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end
-struct SAR <: ComponentModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end
-struct DAG <: ComponentModel; rho::UnivariateDistribution; sigma::UnivariateDistribution; end
-
-
-
-# --- Continuous, Spectral, and Advanced Components ---
-struct GP <: ComponentModel; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma::UnivariateDistribution; kernel::String; end
-struct RFF <: ComponentModel; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma::UnivariateDistribution; n_features::Int; kernel::String; end
-struct FITC <: ComponentModel; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma::UnivariateDistribution; n_inducing::Int; kernel::String; end
-struct SVGP <: ComponentModel; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma::UnivariateDistribution; n_inducing::Int; kernel::String; end
-struct Nystrom <: ComponentModel; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma::UnivariateDistribution; n_inducing::Int; kernel::String; end
-struct SPDE <: ComponentModel; sigma::UnivariateDistribution; kappa::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; end
-struct FFT <: ComponentModel; sigma::UnivariateDistribution; nbins::Int; kernel::String; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; end
-struct Warp <: ComponentModel; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma::UnivariateDistribution; n_features::Int; kernel::String; end
-struct ExponentialDecay <: ComponentModel; sigma::UnivariateDistribution; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; end
-struct Kriging <: ComponentModel; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; sigma::UnivariateDistribution; kernel::String; end
-
-# --- Specialized & Basis Manifolds ---
-struct Wavelet <: ComponentModel; family::Symbol; nbins::Int; sigma::UnivariateDistribution; lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}; end
-struct Hyperbolic <: ComponentModel; curvature::Real; sigma::UnivariateDistribution; end
-
-struct BCGN <: ComponentModel; sigma::UnivariateDistribution; bipartite_adj::AbstractMatrix; end
-struct NetworkFlow <: ComponentModel; sigma::UnivariateDistribution; adjacency_matrix::AbstractMatrix; flow_direction::Symbol; end
-
-"""
-    LocalAdaptive <: ComponentModel
-
-A component for localized spatial effects. It combines a Leroux-style precision matrix
-with cluster-specific means, allowing the spatial field to have different average
-levels in different regions of the domain.
-"""
-struct LocalAdaptive <: ComponentModel
-    rho::UnivariateDistribution
-    sigma::UnivariateDistribution
-end
-
-
- 
-struct Eigen <: ComponentModel
-    n_vars::Int
-    n_factors::Int
-    pca_sd::UnivariateDistribution
-    pdef_sd::UnivariateDistribution
-    ltri_indices::Vector{Int}
-end
-struct Moran <: ComponentModel; sigma::UnivariateDistribution; end
-struct Spherical <: ComponentModel; sigma::UnivariateDistribution; range::UnivariateDistribution; end
-struct Barycentric <: ComponentModel; sigma::UnivariateDistribution; end
-struct TensorProductSmooth <: ComponentModel; sigma::UnivariateDistribution; Q_template::AbstractMatrix; end
-
-struct TPS <: ComponentModel; nbins::Int; sigma::UnivariateDistribution; end
-struct BSpline <: ComponentModel; nbins::Int; degree::Int; sigma::UnivariateDistribution; end
-
-struct PSpline <: ComponentModel
-    nbins::Int
-    degree::Int
-    diff_order::Int
-    sigma::UnivariateDistribution
-end
-
-struct AR1 <: ComponentModel
-    rho::UnivariateDistribution
-    sigma::UnivariateDistribution
-end
-
-struct AR2 <: ComponentModel
-    rho1::UnivariateDistribution
-    rho2::UnivariateDistribution
-    sigma::UnivariateDistribution
-end
-
-struct RW1 <: ComponentModel; sigma::UnivariateDistribution; end
-struct RW2 <: ComponentModel; sigma::UnivariateDistribution; end
-
-"""
-    Harmonic <: ComponentModel
-
-A component for modeling periodic effects as a sum of sinusoids.
-
-# Fields
-- `nharmonics`: The number of harmonic pairs (sine and cosine) to include.
-- `amplitude`: Prior for the amplitudes of the waves.
-- `phase`: Prior for the phase shifts of the waves.
-- `period`: The period of each wave. Can be a single `Real` or `UnivariateDistribution`
-  (if all harmonics share the same period), or a `Vector{<:UnivariateDistribution}`
-  to specify an independent prior for each harmonic's period.
-"""
-struct Harmonic <: ComponentModel
-    nharmonics::Int
-    amplitude::UnivariateDistribution
-    phase::UnivariateDistribution
-    period::Union{Real, UnivariateDistribution, Vector{<:UnivariateDistribution}}
-end
-
-
-struct Cyclic <: ComponentModel; period::Int; sigma::UnivariateDistribution; end
-
-struct ST_I <: ComponentModel; sigma::UnivariateDistribution; end
-struct ST_II <: ComponentModel; sigma::UnivariateDistribution; end
-struct ST_III <: ComponentModel; sigma::UnivariateDistribution; end
-struct ST_IV <: ComponentModel; sigma::UnivariateDistribution; end
-
-struct CustomComponent <: ComponentModel
-    code_fragment::String
-    params::Dict{Symbol, Any}
-end
-
-struct DynamicsComponent <: ComponentModel; model::String; params::Dict{Symbol, Any}; end
-
-
-struct ComposedComponent <: ComponentOperator; components::Vector{Component}; operator::Symbol; end
-struct SVCComponent <: ComponentOperator
-    covariate::Symbol
-    model::ComponentModel
-end
-
-"""
-    MixedComponent <: ComponentOperator
-
-Represents a random effect (intercept or slope) for a specified grouping variable.
-The `lhs` field is now a `Vector{String}` to correctly handle multiple correlated
-effects (e.g., `(1 + cov1 | group)`), fixing a bug where it was treated as a single string.
-"""
-struct MixedComponent <: ComponentOperator
-    group_var::Symbol
-    lhs::Vector{String}
-    model::ComponentModel
-end
-
-abstract type ComponentSupervisor <: Component end
-struct NestedComponent <: ComponentSupervisor
-    var::Symbol
-    formula::String
-    data_source::Symbol
-end
-
-
-# SVAR allows the temporal correlation to vary across space
-struct SVAR <: ComponentModel
-    rho_spatial::ComponentModel # The model for the spatial distribution of rho
-    sigma::UnivariateDistribution
-end
-
-"""
-    TVCComponent <: ComponentOperator
-
-Represents a Temporally Varying Coefficient model, created by the syntax:
-`covariate |> random(time, model=...)`. It links a covariate to a temporal model.
-"""
-struct TVCComponent <: ComponentOperator
-    covariate::Symbol
-    model::ComponentModel
-end
-
-  
-# AdaptiveSmooth learns a coordinate transformation via a simple MLP before smoothing
-struct AdaptiveSmooth <: ComponentModel
-    hidden_dim::Int
-    nbins::Int
-    sigma::UnivariateDistribution
-end
-
-
-# Threshold Autoregressive (TAR): Implements regime-switching temporal dynamics where model parameters depend on a covariate threshold logic.
-struct TAR <: ComponentModel
-    threshold_var::Symbol
-    rho_regimes::Vector{UnivariateDistribution}
-    sigma_regimes::Vector{UnivariateDistribution}
-end
-
-# Define LGCP Struct
-# Rationale: LGCP models point patterns by assuming the intensity function lambda(s) 
-# is a realization of a Log-Gaussian process: log(lambda(s)) = Z(s).
-struct LGCP <: ComponentModel
-    model::ComponentModel
-    sigma::UnivariateDistribution
-    inner_model_node::NamedTuple 
-end
-
+# interface definitions
 
 
 """
-    LogGammaCoxProcess <: ComponentModel
+    get_datastructures!(m_type::Type{<:ComponentModel}, M::Dict, mod_data::Dict)::Bool
 
-A component for Log-Gamma Cox Processes. It models point patterns by assuming the
-intensity function Λ(s) is a realization of a Gamma-distributed random field.
+Performs data-dependent setup and validation for a component type.
 
-# Fields
-- `model::ComponentModel`: The inner spatial model for the latent field (e.g., ICAR).
-- `shape::UnivariateDistribution`: The prior for the shape parameter of the Gamma distribution.
+This method is dispatched on the component's *type* (e.g., `IID`, `AR1`) and runs
+early in the `bstm_config` pipeline. It is responsible for:
+1.  Preparing necessary data structures (e.g., adjacency matrix `W`, basis functions, indices).
+2.  Modifying the global model configuration `M` (e.g., setting `M[:s_N]`, `M[:s_idx]`).
+
+# Arguments
+- `m_type`: The `Type` of the `ComponentModel` (e.g., `IID`, `AR1`).
+- `M`: The main model configuration dictionary, which can be mutated.
+- `mod_data`: A dictionary containing parsed module data (e.g., variables, parameters).
+
+# Returns
+- `true`: If a component object should be created for this module.
+- `false`: If this module only performs setup and does not require a component object
+           (e.g., interaction flags that are handled globally).
+
+# Assumptions
+- This method is called before the component object itself is instantiated.
+- It is responsible for ensuring that all data-related prerequisites for the
+  component's `get_precomputes` method are met.
 """
-struct LogGammaCoxProcess <: ComponentModel
-    model::ComponentModel
-    shape::UnivariateDistribution
-end
-
-
-"""
-    ShotNoiseCoxProcess <: ComponentModel
-
-A component for Shot-Noise Cox Processes. It models point patterns by assuming the
-intensity function is a sum of kernel functions centered at random "parent" points.
-
-# Fields
-- `n_parents`: The number of parent points, which can be a fixed integer or a distribution.
-- `kernel`: The name of the kernel function for the shots (e.g., "se").
-- `lengthscale`: The prior for the kernel's lengthscale (bandwidth).
-- `amplitude`: The prior for the amplitude of each shot.
-"""
-struct ShotNoiseCoxProcess <: ComponentModel
-    n_parents::Union{Int, UnivariateDistribution}
-    kernel::String
-    lengthscale::UnivariateDistribution
-    amplitude::UnivariateDistribution
-end
-
-
-struct Kriging <: ComponentModel
-    lengthscale::UnivariateDistribution
-    sigma::UnivariateDistribution
-    kernel::String
-end
-
+function get_datastructures! end
 
 """
-    NonStationaryVariance <: ComponentOperator
+    get_precomputes(m::ComponentModel, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-A dedicated component representing a non-stationary variance model, created by
-the composition operator (`∘`), e.g., `random(structure=:spatial) ∘ random(structure=:smooth)`.
+Performs data-independent pre-calculations for a component instance.
 
-This component models a process where the variance of a `base_model` (typically spatial)
-is modulated by a `modifier_model` (typically a smoother).
+This method is dispatched on the `ComponentModel` instance and runs after the
+component has been instantiated. It is responsible for:
+1.  Building template matrices (e.g., `Q_template` for GMRFs).
+2.  Computing spectral decompositions (`U`, `L` for AD-friendly sampling).
+3.  Generating fixed basis functions or other static structures.
 
-# Fields
-- `base_model::ComponentModel`: The underlying component whose variance is being modulated (e.g., `ICAR`).
-- `modifier_model::ComponentModel`: The component that defines the non-stationary (log) variance field (e.g., `PSpline`).
+# Arguments
+- `m`: The `ComponentModel` instance.
+- `M`: The main model configuration `NamedTuple`.
+- `mod_data`: A dictionary containing parsed module data.
+
+# Returns
+- A `NamedTuple` containing all precomputed items necessary for code generation
+  and posterior reconstruction (e.g., `(Q_template=..., U=..., L=...)`).
+
+# Assumptions
+- All data-dependent setup (e.g., `s_N`, `t_N`, `W`) has already been performed
+  by `get_datastructures!`.
 """
-struct NonStationaryVariance <: ComponentOperator
-    base_model::ComponentModel
-    modifier_model::ComponentModel
-end
-
+function get_precomputes end
 
 """
-    ProcessConvolution <: ComponentModel
+    get_priors(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
 
-A component for modeling a non-stationary spatial process using process convolution.
+Generates the Turing code string for the component's priors.
 
-This is achieved by allowing kernel parameters (currently the `lengthscale`) to vary
-spatially. The spatial variation of the lengthscale is itself modeled by a nested
-`ComponentModel`, allowing for flexible and complex non-stationary covariance structures.
+This method is dispatched on the `ComponentModel` instance and is responsible for
+producing Julia/Turing code snippets that define:
+1.  Priors for the component's hyperparameters (e.g., `sigma`, `rho`).
+2.  Priors for the component's latent fields (e.g., `raw ~ MvNormal(...)`).
 
-# Fields
-- `n_knots::Int`: The number of knots (or basis centers) for the convolution process.
-- `base_sigma::UnivariateDistribution`: The prior for the standard deviation of the base process at the knots.
-- `kernel::String`: The family of the convolution kernel (e.g., "se", "matern32").
-- `lengthscale_model::ComponentModel`: A nested `ComponentModel` that defines the spatially varying lengthscale field.
+# Arguments
+- `m`: The `ComponentModel` instance.
+- `spec`: A `NamedTuple` containing the component's full specification (key, structure, etc.).
+- `arch`: The model architecture (`"univariate"`, `"multivariate"`).
+- `outcome_idx`: The index of the outcome for multivariate models, `nothing` otherwise.
+- `M`: The main model configuration `NamedTuple`.
+
+# Returns
+- A `String` containing the generated Turing code for priors.
 """
-struct ProcessConvolution <: ComponentModel
-    n_knots::Int
-    base_sigma::UnivariateDistribution
-    kernel::String
-    lengthscale_model::ComponentModel
-end
+function get_priors end
 
- 
- 
-abstract type AbstractModelArchitecture end
-struct UnivariateArchitecture <: AbstractModelArchitecture end
-struct MultivariateArchitecture <: AbstractModelArchitecture end
-struct MultifidelityArchitecture <: AbstractModelArchitecture end
-struct ExampleArchitecture <: AbstractModelArchitecture end
-struct UnknownArchitecture <: AbstractModelArchitecture end
+"""
+    get_updates(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+
+Generates the Turing code string for constructing the component's effect and adding it to the linear predictor.
+
+This method is dispatched on the `ComponentModel` instance and is responsible for
+producing Julia/Turing code snippets that define:
+1.  The logic for transforming sampled latent variables into the component's effect.
+2.  Adding this effect to the linear predictor (`eta`).
+
+# Arguments
+- `m`: The `ComponentModel` instance.
+- `spec`: A `NamedTuple` containing the component's full specification.
+- `arch`: The model architecture (`"univariate"`, `"multivariate"`).
+- `outcome_idx`: The index of the outcome for multivariate models, `nothing` otherwise.
+- `M`: The main model configuration `NamedTuple`.
+
+# Returns
+- A `String` containing the generated Turing code for the component's update logic.
+"""
+function get_updates end
+
+"""
+    get_effects(m::ComponentModel, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+
+Reconstructs the component's effect from the MCMC chain's posterior samples for diagnostics and visualization.
+
+This method is dispatched on the `ComponentModel` instance and is responsible for:
+1.  Extracting relevant parameter samples from the MCMC `chain`.
+2.  Reconstructing the component's contribution to the linear predictor for each sample.
+3.  Returning structured results (e.g., mean, lower, upper credible intervals) of the effect.
+
+# Arguments
+- `m`: The `ComponentModel` instance.
+- `chain`: The MCMC chain object containing posterior samples.
+- `M`: The main model configuration `NamedTuple`.
+- `n_samples`: The total number of posterior samples.
+- `outcomes_N`: The total number of outcomes in the model.
+- `p_names`: A `NamedTuple` of parameter names for easy access.
+- `spec`: A `NamedTuple` containing the component's full specification.
+- `PS`: A `NamedTuple` containing prediction set data, or `nothing` for in-sample reconstruction.
+- `N_total`: The total number of observations (training + prediction).
+
+# Returns
+- A `NamedTuple` (e.g., `(structured=..., noisy=...)`) containing the reconstructed effects.
+"""
+function get_effects end
 
 
 
-# ==============================================================================
-# SECTION 2: CONSTANTS, REGISTRIES, AND OPERATOR OVERLOADS
-# ==============================================================================
+const COMPONENT_TYPE_REGISTRY = Dict{Symbol, Type{<:ComponentModel}}(
+    :none => NoneComponent,
+    :iid => IID,
+    :icar => ICAR,
+    :besag => Besag,
+    :bym2 => BYM2,
+    :leroux => Leroux,
+    :sar => SAR,
+    :proper_car => SAR,
+    :dag => DAG,
+    :ar1 => AR1,
+    :ar2 => AR2,
+    :rw1 => RW1,
+    :rw2 => RW2,
+    :fitc => FITC,
+    :svgp => SVGP,
+    :nystrom => Nystrom,
+    :warp => Warp,
+    :hyperbolic => Hyperbolic,
+    :decay => ExponentialDecay,
+    :exponentialdecay => ExponentialDecay,
+    :gp => GP,
+    :rff => RFF,
+    :fft => FFT,
+    :spde => SPDE,
+    :cyclic => Cyclic,
+    :harmonic => Harmonic,
+    :pspline => PSpline,
+    :bspline => BSpline,
+    :tps => TPS,
+    :wavelet => Wavelet,
+    :eigen => Eigen,
+    :moran => Moran,
+    :spherical => Spherical,
+    :barycentric => Barycentric,
+    :bcgn => BCGN,
+    :networkflow => NetworkFlow,
+    :svar => SVAR,
+    :kriging => Kriging,
+    :localadaptive => LocalAdaptive,
+    :tar => TAR,
+    :dynamics => Dynamics,
+    :custom => Custom,
+    :composed => Composed,
+    :nonstationary_variance => NonStationaryVariance,
+    :adaptivesmooth => AdaptiveSmooth,
+    :lgcp => LGCP,
+    :lgammap => LogGammaCoxProcess,
+    :sncp => ShotNoiseCoxProcess
+)
 
-const BSTM_MODULE_KEYWORDS = Set([ 
-    :intercept, :fixed, :mixed, :random, :nested, :eigen, :dynamics, :pointprocess, :custom,
-    :zscore, :log, :center, :scale, :sciml
-]);
- 
 
-
-const TRANSFORMATION_FUNCTIONS = Set([:zscore, :log, :center, :scale])
 
 
 """
@@ -437,46 +347,99 @@ function _rewrite_transformations!(nodes::Vector, data::DataFrame)
     return new_nodes
 end
 
+"""
+    generate_rff_params(...)
+
+Generates random projection weights (W) and biases (b) for RFF approximation.
+This version is included for completeness and supports ARD.
+"""
+function generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String)
+    b = rand(Uniform(0, 2 * pi), n_features)
+    W = Matrix{Float64}(undef, in_dims, n_features)
+    k_name = lowercase(kernel_name)
+
+    if k_name in ["se", "gaussian", "rbf"]
+        if lengthscale isa Real
+            W .= rand(Normal(0, 1.0 / lengthscale), in_dims, n_features)
+        else
+            if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
+            for d in 1:in_dims; W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features); end
+        end
+    elseif occursin("matern", k_name)
+        nu = if k_name == "matern12"; 0.5; elseif k_name == "matern32"; 1.5; else 2.5; end
+        df = 2 * nu
+        if lengthscale isa Real
+            W .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
+        else
+            if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
+            for d in 1:in_dims; W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features); end
+        end
+    else
+        @warn "Kernel '$kernel_name' not recognized for RFF. Defaulting to SE."
+        return generate_rff_params(in_dims, n_features, lengthscale, "se")
+    end
+    return W, b
+end
+
+
+
+ 
 
 
 """
     MODEL_TO_STRUCTURE_MAP
 
-The updated mapping from unambiguous model names to their corresponding structure type.
-Models like `kriging`, `pspline`, `tps`, `wavelet`, `spherical`, and `barycentric` have
-been removed as their structure is context-dependent and better handled by the inference engine.
+v1.9.1 (2026-08-07) - This dictionary maps `ComponentModel` types to their primary
+structure type (e.g., `:spatial`, `:temporal`). This is used for internal dispatch
+and configuration.
+
+The mapping for `Besag` has been added.
 """
-const MODEL_TO_STRUCTURE_MAP = Dict{Symbol, Symbol}(
-    # Spatial Models (primarily for discrete, graph-based structures)
-    :icar => :spatial,
-    :proper_car => :spatial,
-    :besag => :spatial,
-    :bym2 => :spatial,
-    :leroux => :spatial,
-    :sar => :spatial,
-    :spde => :spatial,
-    :dag => :spatial,
-    :moran => :spatial,
-    :bcgn => :spatial,
-    :networkflow => :spatial,
-    :localadaptive => :spatial, 
-    :lgcp => :spatial,
-
-    # Temporal Models (for time-series structures)
-    :rw1 => :temporal,
-    :rw2 => :temporal,
-    :ar1 => :temporal,
-    :ar2 => :temporal,
-    :cyclic => :temporal,
-    :harmonic => :temporal,
-    :tar => :temporal,
-
-    # Smooth Models (unambiguous cases)
-    :tensorproductsmooth => :smooth,
-
-    # Other specific structures
-    :svar => :svar
-);
+const MODEL_TO_STRUCTURE_MAP = Dict{Type{<:ComponentModel}, Symbol}(
+    IID => :any, # IID can be spatial, temporal, mixed, etc.
+    ICAR => :spatial,
+    Besag => :spatial,
+    BYM2 => :spatial,
+    Leroux => :spatial,
+    SAR => :spatial,
+    DAG => :spatial,
+    RW1 => :temporal,
+    RW2 => :temporal,
+    AR1 => :temporal,
+    AR2 => :temporal,
+    Cyclic => :temporal,
+    Harmonic => :temporal,
+    SPDE => :spatial,
+    GP => :smooth, # GP can be spatial, temporal, or smooth
+    RFF => :smooth, # RFF can be spatial, temporal, or smooth
+    FFT => :smooth, # FFT can be spatial, temporal, or smooth
+    PSpline => :smooth,
+    BSpline => :smooth,
+    TPS => :smooth,
+    Wavelet => :smooth,
+    Eigen => :any, # Eigen can be applied to any set of variables
+    Moran => :spatial,
+    Spherical => :spatial, # Spherical is a continuous spatial kernel
+    Barycentric => :spatial, # Barycentric is a continuous spatial kernel
+    BCGN => :spatial,
+    NetworkFlow => :spatial,
+    LocalAdaptive => :spatial,
+    TAR => :temporal,
+    TensorProductSmooth => :smooth,
+    Dynamics => :spacetime, # Dynamics components are inherently spatiotemporal
+    Custom => :any, # Custom components can be anything
+    LGCP => :spatial, # Log-Gaussian Cox Process is spatial
+    LogGammaCoxProcess => :spatial, # Log-Gamma Cox Process is spatial
+    ShotNoiseCoxProcess => :spatial, # Shot-Noise Cox Process is spatial
+    SVAR => :spacetime, # Spatially Varying Autoregressive is spatiotemporal
+    SVC => :spatial, # Spatially Varying Coefficient is spatial
+    TVC => :temporal, # Temporally Varying Coefficient is temporal
+    Composed => :any, # Composed components are context-dependent
+    NonStationaryVariance => :spatial, # Non-stationary variance is spatial
+    AdaptiveSmooth => :smooth, # Adaptive smooth is a smooth component
+    Kriging => :smooth, # Kriging is a smooth component
+    None => :none # Placeholder
+)
 
 """
     AMBIGUOUS_MODELS
@@ -585,88 +548,16 @@ const STATSMODELS_CONTRASTS = Dict(
     :treatment => StatsModels.DummyCoding()
 )
 
-const COMPONENT_CONSTRUCTORS = Dict{Symbol, Function}(
-    :none => (p, params) -> NoneComponent(),
-    :iid => (p, params) -> IID(p.sigma),
-    :icar => (p, params) -> ICAR(p.sigma),
-    :besag => (p, params) -> Besag(p.sigma),
-    :bym2 => (p, params) -> BYM2(p.rho, p.sigma),
-    :leroux => (p, params) -> Leroux(p.rho, p.sigma),
-    :proper_car => (p, params) -> SAR(p.rho, p.sigma), # Alias for SAR
-    :sar => (p, params) -> SAR(p.rho, p.sigma),
-    :dag => (p, params) -> DAG(p.rho, p.sigma),
-    :ar1 => (p, params) -> AR1(p.rho, p.sigma),
-    :ar2 => (p, params) -> AR2(p.rho1, p.rho2, p.sigma),  
-    :rw1 => (p, params) -> RW1(p.sigma),
-    :rw2 => (p, params) -> RW2(p.sigma),
-    :fitc => (p, params) -> FITC(p.lengthscale, p.sigma, get(params, :n_inducing, 20), string(get(params, :kernel, "se"))),
-    :svgp => (p, params) -> SVGP(p.lengthscale, p.sigma, get(params, :n_inducing, 20), string(get(params, :kernel, "se"))),
-    :nystrom => (p, params) -> Nystrom(p.lengthscale, p.sigma, get(params, :n_inducing, 20), string(get(params, :kernel, "se"))),
-    :warp => (p, params) -> Warp(p.lengthscale, p.sigma, get(params, :n_features, 20), string(get(params, :kernel, "se"))),
-    :hyperbolic => (p, params) -> Hyperbolic(get(params, :curvature, -1.0), p.sigma),
-    :decay => (p, params) -> ExponentialDecay(p.sigma, p.lengthscale),
-    :gp => (p, params) -> GP(p.lengthscale, p.sigma, string(get(params, :kernel, "se"))),
-    :rff => (p, params) -> RFF(p.lengthscale, p.sigma, get(params, :n_features, 20), string(get(params, :kernel, "se"))),
-    :fft => (p, params) -> FFT(p.sigma, get(params, :nbins, 20), string(get(params, :kernel, "se")), p.lengthscale),
-    :spde => (p, params) -> SPDE(p.sigma, p.kappa),
-    :cyclic => (p, params) -> Cyclic(get(params, :period, 12), p.sigma),
-    :harmonic => (p, params) -> begin
-        nharmonics = get(params, :nharmonics, 1)
-        period_param = get(params, :period, 12.0)
-        
-        if nharmonics > 1
-            if period_param isa Real
-                error("For `nharmonics > 1`, `period` must be a `Distribution` or a `Vector{<:Distribution}` to be estimated, not a fixed Real value.")
-            end
-            if period_param isa UnivariateDistribution
-                period_param = [period_param for _ in 1:nharmonics]
-            end
-            if period_param isa Vector && length(period_param) != nharmonics
-                error("Length of `period` vector ($(length(period_param))) must match `nharmonics` ($(nharmonics)).")
-            end
-        else # nharmonics == 1
-            if period_param isa Vector
-                error("For `nharmonics = 1`, `period` must be a Real or a single UnivariateDistribution, not a Vector.")
-            end
-        end
-        
-        Harmonic(nharmonics, p.amplitude, p.phase, period_param)
-    end,
-    :pspline => (p, params) -> PSpline(get(params, :nbins, 20), get(params, :degree, 3), get(params, :diff_order, 2), p.sigma),
-    :bspline => (p, params) -> BSpline(get(params, :nbins, 10), get(params, :degree, 3), p.sigma),
-    :tps => (p, params) -> TPS(get(params, :nbins, 20), p.sigma),
-    :wavelet => (p, params) -> Wavelet(get(params, :family, :db4), get(params, :nbins, 32), p.sigma, p.lengthscale),
-    :eigen => (p, params) -> Eigen(get(params, :n_vars, 0), get(params, :n_factors, 1), p.pca_sd, p.pdef_sd, get(params, :ltri_indices, Int[])),
-    :moran => (p, params) -> Moran(p.sigma),
-    :spherical => (p, params) -> Spherical(p.sigma, p.range),
-    :barycentric => (p, params) -> Barycentric(p.sigma),
-    :bcgn => (p, params) -> BCGN(p.sigma, get(params, :bipartite_adj, sparse(zeros(1,1)))),
-    :networkflow => (p, params) -> NetworkFlow(p.sigma, get(params, :adjacency_matrix, sparse(zeros(1,1))), get(params, :flow_direction, :bidirectional)),
-    :svar => (p, params) -> SVAR(get(params, :rho_spatial_obj, ICAR(p.sigma)), p.sigma),
-    :kriging => (p, params) -> Kriging(p.lengthscale, p.sigma, string(get(params, :kernel, "se"))),
-    :localadaptive => (p, params) -> LocalAdaptive(p.rho, p.sigma),
-    :tar => (p, params) -> TAR(
-        get(params, :threshold_var, error("TAR model requires a `threshold_var` parameter.")),
-        get(params, :rho_regimes, [Beta(1,1), Beta(1,1)]),
-        get(params, :sigma_regimes, [Exponential(1.0), Exponential(1.0)])
-    ),
-    :tensorproductsmooth => (p, params) -> TensorProductSmooth(p.sigma, get(params, :Q_template, sparse(zeros(1,1)))),
-    :dynamics => (p, params) -> DynamicsComponent(string(get(params, :model, "none")), params),
-    :custom => (p, params) -> CustomComponent(get(params, :code_fragment, ""), get(params, :params, Dict{Symbol, Any}()))
-    # Note: LGCP and LogGammaCoxProcess are handled specially in `resolve_technical_primitive`
-    # and do not need a direct constructor here.
-
-)
 
 function Base.:|>(m1::Component, m2::Component)
-    return ComposedComponent([m1, m2], :pipe)
+    return Composed([m1, m2], :pipe)
 end
 
-composition(m1::Component, m2::Component) = ComposedComponent([m1, m2], :composition)
-∘(m1::Component, m2::Component) = ComposedComponent([m1, m2], :composition)
+composition(m1::Component, m2::Component) = Composed([m1, m2], :composition)
+∘(m1::Component, m2::Component) = Composed([m1, m2], :composition)
 
-otimes(m1::Component, m2::Component) = ComposedComponent([m1, m2], :kronecker_product)
-⊗(m1::Component, m2::Component) = ComposedComponent([m1, m2], :kronecker_product)
+otimes(m1::Component, m2::Component) = Composed([m1, m2], :kronecker_product)
+⊗(m1::Component, m2::Component) = Composed([m1, m2], :kronecker_product)
 
 # ==============================================================================
 # SECTION 3: FORMULA PARSING ENGINE
@@ -1493,77 +1384,17 @@ function _precompute_likelihood_params!(M::Dict)
 end
 
 
-function bstm_config(formula::String, data::DataFrame; calling_module::Module=Main, kwargs...)
-    # Purpose: Constructs the complete model configuration from a formula and data.
-    # Rationale: This version is updated to correctly consolidate fixed effects from both
-    #            bare terms (which are parsed into implicit `fixed()` modules) and explicit
-    #            `fixed()` modules. It combines the variables collected by `process_fixed_module!`
-    #            with any other fixed effects before creating the final design matrix. This
-    #            resolves the bug where `fixed(cov1)` was being ignored.
-    # v1.1.0 (2026-08-03)
+"""
+    bstm_config(formula::String, data::DataFrame; calling_module::Module=Main, kwargs...)
 
+Constructs the complete model configuration by parsing the formula, processing data,
+and assembling component specifications using the explicit component interface.
+"""
+function bstm_config(formula::String, data::DataFrame; calling_module::Module=Main, kwargs...)
     df_processed = deepcopy(data)
     decomposed_formula = decompose_bstm_formula(formula, df_processed)
 
-    all_vars = Set{Symbol}()
-    for out_spec in decomposed_formula.outcomes
-        push!(all_vars, Symbol(out_spec[:var]))
-        for key in [:log_offsets, :offsets, :weights, :trials, :censor_lower, :censor_upper, :threshold_var]
-            if haskey(out_spec[:params], key)
-                val = out_spec[:params][key]
-                if val isa Symbol; push!(all_vars, val); end
-            end
-        end
-    end
-    for fe in decomposed_formula.fixed_effects; push!(all_vars, Symbol(fe)); end
-    for (_, mod_data) in pairs(decomposed_formula.modules)
-        if haskey(mod_data.args, :positional_args)
-            for arg in mod_data.args[:positional_args]
-                if arg isa Symbol; push!(all_vars, arg);
-                elseif arg isa Expr; _extract_symbols_from_expr!(all_vars, arg); end
-            end
-        end
-        if haskey(mod_data.args, :threshold_var)
-            val = mod_data.args[:threshold_var]
-            if val isa Symbol; push!(all_vars, val); end
-        end
-    end
-
-    df_processed = deepcopy(data)
-    vars_to_categorize = Set{Symbol}()
-    for (_, mod_data_nt) in decomposed_formula.modules
-        if mod_data_nt.module_type == :fixed
-            if haskey(mod_data_nt.args, :positional_args)
-                for var_sym in mod_data_nt.args[:positional_args]
-                    if var_sym isa Symbol
-                        if haskey(mod_data_nt.args, :contrast) || get(mod_data_nt.args, :model, nothing) == :categorical
-                            push!(vars_to_categorize, var_sym)
-                        end
-                    end
-                end
-            end
-        end
-    end
-    for var_sym in vars_to_categorize
-        if hasproperty(df_processed, var_sym) && !(eltype(df_processed[!, var_sym]) <: CategoricalValue)
-            df_processed[!, var_sym] = categorical(df_processed[!, var_sym])
-        end
-    end
-
-    valid_vars_in_data = filter(v -> hasproperty(df_processed, v), all_vars)
-    if !isempty(valid_vars_in_data)
-        filtered_data = DataFrame(df_processed[completecases(df_processed, collect(valid_vars_in_data)), :])
-        if nrow(filtered_data) < nrow(data)
-            @warn "Missing values detected. $(nrow(data) - nrow(filtered_data)) rows were removed."
-        end
-    else
-        filtered_data = df_processed
-        if !isempty(all_vars)
-            @warn "None of the variables specified in the formula were found in the data: $(all_vars). Proceeding without removing rows for missing data."
-        end
-    end
-
-    M = _initialize_config(filtered_data, merge(Dict(kwargs), Dict(:calling_module => calling_module)))
+    M = _initialize_config(df_processed, merge(Dict(kwargs), Dict(:calling_module => calling_module)))
     M[:formula] = formula
     
     _process_lhs!(M, decomposed_formula.outcomes)
@@ -1580,25 +1411,8 @@ function bstm_config(formula::String, data::DataFrame; calling_module::Module=Ma
         end
     end
 
-    non_prop_effects = Symbol[]
-    is_ordinal = any(spec -> string(get(spec, :family, "")) == "ordinal", M[:likelihood_specs])
-    if is_ordinal
-        for (_, mod_data_nt) in decomposed_formula.modules
-            if mod_data_nt.module_type == :fixed && get(mod_data_nt.args, :non_proportional_effects, false) == true
-                vars = get(mod_data_nt.args, :positional_args, [])
-                for v in vars
-                    if v isa Symbol
-                        push!(non_prop_effects, v)
-                    end
-                end
-            end
-        end
-    end
-    M[:non_proportional_effects] = unique(non_prop_effects)
-
     _precompute_likelihood_params!(M)
 
-    M[:N_cov] = 0
     M[:add_intercept] = decomposed_formula.has_intercept
     if !isnothing(decomposed_formula.intercept_prior)
         prior_val = decomposed_formula.intercept_prior
@@ -1608,13 +1422,18 @@ function bstm_config(formula::String, data::DataFrame; calling_module::Module=Ma
         else; M[:intercept_prior] = prior_val; end
     end
 
+    # --- NEW MAIN COMPONENT PROCESSING LOOP ---
     for (key, mod_data_nt) in decomposed_formula.modules
         mod_type = mod_data_nt.module_type
-        # --- FIX: Add the component key to the dictionary for downstream processors ---
         mod_data_dict = Dict(:key => key, :type => mod_type, :variables => get(mod_data_nt.args, :positional_args, []), :params => mod_data_nt.args)
-        
-        effective_processor_key = mod_type
-        
+
+        if mod_type == :fixed
+            if !haskey(M, :fixed_effects_from_modules); M[:fixed_effects_from_modules] = String[]; end
+            for var in mod_data_dict[:variables]; push!(M[:fixed_effects_from_modules], string(var)); end
+            if haskey(mod_data_dict[:params], :prior); M[:fixed_effects_priors][Symbol(mod_data_dict[:variables][1])] = mod_data_dict[:params][:prior]; end
+            continue
+        end
+
         if mod_type == :random
             params = mod_data_dict[:params]
             if !haskey(params, :structure)
@@ -1625,47 +1444,56 @@ function bstm_config(formula::String, data::DataFrame; calling_module::Module=Ma
             mod_data_dict[:type] = params[:structure]
         end
 
-        processor! = get(MODULE_PROCESSORS, effective_processor_key, nothing)
-        
-        create_component_for_module = true
-        if !isnothing(processor!)
-            create_component_for_module = processor!(M, mod_data_dict, M, M[:hyperpriors])
+        model_name = get(mod_data_dict[:params], :model, :iid)
+        if mod_type == :interact; model_name = :composed; end
+        if !haskey(COMPONENT_TYPE_REGISTRY, model_name)
+            error("Model type ':$model_name' not found in COMPONENT_TYPE_REGISTRY.")
         end
-        
-        if mod_type == :fixed || !create_component_for_module
+        component_type = COMPONENT_TYPE_REGISTRY[model_name]
+
+        # For Composed, we need the child objects to dispatch get_datastructures!
+        if component_type <: Composed
+            temp_obj = resolve_technical_primitive(mod_data_dict, M, M[:hyperpriors], M[:prior_scheme])
+            mod_data_dict[:component_obj] = temp_obj
+        end
+
+        # Call get_datastructures!
+        create_component = get_datastructures!(component_type, M, mod_data_dict)
+
+        if !create_component
             continue
         end
-        
+
+        # Instantiate the final component object
         component_obj = resolve_technical_primitive(mod_data_dict, M, M[:hyperpriors], M[:prior_scheme])
-        component_spec_built = build_model(component_obj, M, mod_data_dict)
-        
+        mod_data_dict[:component_obj] = component_obj
+
+        # Call get_precomputes
+        M_nt = NamedTuple(M)
+        precomputes = get_precomputes(component_obj, M_nt, mod_data_dict)
+
+        # Assemble the final spec
         spec = (
             key=Symbol(key), 
             structure=mod_data_dict[:type], 
             var=join(string.(mod_data_dict[:variables]), "_"), 
             component_obj=component_obj, 
             params=mod_data_dict[:params], 
-            Q_template=component_spec_built.Q_template, 
-            scaling_factor=component_spec_built.scaling_factor,
-            hyper=component_spec_built.hyper
+            hyper=precomputes
         )
         push!(M[:components], spec)
     end
 
-    # --- NEW: Consolidate fixed effects from bare terms and `fixed()` modules ---
     all_fixed_effects = copy(decomposed_formula.fixed_effects)
     if haskey(M, :fixed_effects_from_modules)
         append!(all_fixed_effects, M[:fixed_effects_from_modules])
     end
-    # --- END NEW ---
-
     _process_fixed_effects!(M, unique(all_fixed_effects))
     _process_fixed_effects_priors!(M)
-    _precompute_static_components!(M)
     _finalize_config!(M)
+    
     return NamedTuple(M)
 end
-
 
 
 # Version 1.0.0 (2026-08-06)
@@ -1784,7 +1612,7 @@ function _precompute_static_components!(M::Dict)
         current_spec = spec_in
         m_obj = current_spec.component_obj
 
-        if m_obj isa MixedComponent || m_obj isa SVCComponent
+        if m_obj isa MixedComponent || m_obj isa SVC
             inner_model = m_obj.model
             is_inner_static = any(T -> inner_model isa T, static_component_types)
             if is_inner_static && !isnothing(current_spec.Q_template) && size(current_spec.Q_template, 1) > 0
@@ -1801,7 +1629,7 @@ function _precompute_static_components!(M::Dict)
             end
         end
 
-        if m_obj isa ComposedComponent && m_obj.operator == :pipe
+        if m_obj isa Composed && m_obj.operator == :pipe
             state_spec = get(current_spec.hyper, :state_spec, nothing)
             if !isnothing(state_spec)
                 state_m_obj = m_obj.components[2]
@@ -1822,7 +1650,7 @@ function _precompute_static_components!(M::Dict)
             end
         end
 
-        is_main_static = !(current_spec.component_obj isa ComposedComponent) && any(T -> current_spec.component_obj isa T, static_component_types)
+        is_main_static = !(current_spec.component_obj isa Composed) && any(T -> current_spec.component_obj isa T, static_component_types)
 
         if is_main_static && !isnothing(current_spec.Q_template) && size(current_spec.Q_template, 1) > 0
             try
@@ -2257,421 +2085,6 @@ end
 
  
 
-function process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
-    # Purpose: Processes the `spatial()` module call.
-    # Rationale: Handles the setup of the adjacency matrix `W` and spatial indices `s_idx`.
-    # v1.0.0 (2026-07-16)
-    #            If `W` is not provided, it attempts to infer it from coordinates.
-    # Assumptions: `data` is present in `opt_dict`.
-    # Inputs:
-    #   - opt_dict: The main configuration dictionary.
-    #   - mod_data: The parsed data for this specific module.
-    #   - registries, hyperpriors: Not used here, but part of the standard processor signature.
-    # Outputs: None (mutates `opt_dict`).
-    data = opt_dict[:data]
-    params = mod_data[:params]
-    variables = mod_data[:variables]
-    
-    # # Check if this is a specialized point process like LGCP
-    point_process = get(params, :point_process, nothing)
-    
-    if point_process == :lgcp
-        # # Re-tag module type for correct builder dispatch
-        mod_data[:type] = :lgcp
-        # # Ensure the underlying spatial model is specified
-        if !haskey(params, :model)
-            params[:model] = :icar
-            @warn "LGCP point process requested without a model. Defaulting to :icar."
-        end
-    end
-
-    if haskey(params, :W)
-        w_val = params[:W]
-        if w_val isa Expr || w_val isa Symbol
-            calling_mod = get(opt_dict, :calling_module, Main)
-            try
-                opt_dict[:W] = Core.eval(calling_mod, w_val)
-            catch e
-                error("Could not evaluate `W` argument `$(w_val)` in spatial module. Error: $e")
-            end
-        else
-            opt_dict[:W] = w_val
-        end
-    end
-    
-    if !haskey(opt_dict, :W)
-        @warn "Adjacency matrix 'W' not provided for spatial module. Attempting to infer from coordinates."
-        if hasproperty(data, :s_x) && hasproperty(data, :s_y)
-            au = assign_spatial_units(Matrix(data[!, [:s_x, :s_y]]); target_units=get(params, :target_units, 50))
-            opt_dict[:W] = au.W
-            opt_dict[:s_idx] = au.s_idx
-            opt_dict[:s_N] = size(au.W, 1)
-            opt_dict[:centroids] = au.centroids
-        else
-            error("Cannot infer spatial structure without 'W' or coordinate columns 's_x', 's_y'.")
-        end
-    else
-        opt_dict[:s_N] = size(opt_dict[:W], 1)
-        if !isempty(variables)
-            s_var_sym = Symbol(variables[1])
-            if hasproperty(data, s_var_sym)
-                opt_dict[:s_idx] = data[!, s_var_sym]
-            else
-                @warn "Spatial index variable ':$s_var_sym' not found. Ensure data is aligned with W."
-            end
-        end
-    end
-    
-    # # Grid Area Resolution for LGCP
-    if point_process == :lgcp
-        if haskey(params, :grid_areas)
-            ga_val = params[:grid_areas]
-            if ga_val isa Symbol && hasproperty(data, ga_val)
-                opt_dict[:grid_areas] = data[!, ga_val]
-            elseif ga_val isa AbstractVector
-                opt_dict[:grid_areas] = ga_val
-            else
-                # # Fallback to evaluating symbol in calling module
-                calling_mod = get(opt_dict, :calling_module, Main)
-                try
-                    opt_dict[:grid_areas] = Core.eval(calling_mod, ga_val)
-                catch
-                    @warn "Could not resolve grid_areas. Defaulting to unit areas."
-                    opt_dict[:grid_areas] = ones(opt_dict[:s_N])
-                end
-            end
-        else
-            opt_dict[:grid_areas] = ones(opt_dict[:s_N])
-        end
-    end
-
-    return true
-end
- 
-"""
-    process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, components_registry)
-
-Processes the `smooth()` module call, with updated logic for dynamic basis models.
-
-# Rationale for Update
-This version introduces a distinction between static basis models (like `pspline`) and
-dynamic basis models (`wavelet`, `fft`). For dynamic models, where the basis functions
-depend on a hyperparameter like `lengthscale`, this function no longer pre-computes the
-basis matrix. Instead, it stores the coordinate data in the module's parameters. This
-allows a specialized code generator to construct the basis matrix dynamically inside the
-Turing model using the sampled `lengthscale` value, thus making `lengthscale` an
-estimated parameter. It also correctly computes and stores the number of bins per
-dimension (`nbins_per_dim`) for use by the code generators.
-"""
-function process_smooth_module!(opt_dict, mod_data, basis_matrices_registry, components_registry)
-    local registry_to_use
-    if basis_matrices_registry isa Dict && haskey(basis_matrices_registry, :basis_matrices)
-        registry_to_use = basis_matrices_registry[:basis_matrices]
-    else
-        registry_to_use = basis_matrices_registry
-    end
-    data = opt_dict[:data]
-    params = mod_data[:params]
-    model_param = get(params, :model, "pspline")
-    original_nbins_param = get(params, :nbins, 20)
-    variables = mod_data[:variables]
-    n_vars = length(variables)
-    
-    local total_bins_for_component_obj
-    local nbins_per_dim_vec
-    if n_vars > 0
-        if original_nbins_param isa Int
-            nbins_per_dim_vec = fill(original_nbins_param, n_vars)
-            total_bins_for_component_obj = original_nbins_param^n_vars
-        elseif original_nbins_param isa Vector{Int}
-            if length(original_nbins_param) != n_vars
-                error("`nbins` vector length must match number of variables for smooth. Got $(length(original_nbins_param)) for $n_vars variables.")
-            end
-            nbins_per_dim_vec = original_nbins_param
-            total_bins_for_component_obj = prod(original_nbins_param)
-        else
-            calling_mod = get(opt_dict, :calling_module, Main)
-            try
-                evaluated_nbins = Core.eval(calling_mod, original_nbins_param)
-                temp_params = copy(params)
-                temp_params[:nbins] = evaluated_nbins
-                temp_mod_data = Dict(:type => mod_data[:type], :params => temp_params, :variables => variables)
-                return process_smooth_module!(opt_dict, temp_mod_data, basis_matrices_registry, components_registry)
-            catch e
-                error("Could not evaluate `nbins` parameter `$(original_nbins_param)`. Error: $e")
-            end
-        end
-        mod_data[:params][:nbins] = total_bins_for_component_obj
-        if @isdefined nbins_per_dim_vec; mod_data[:params][:nbins_per_dim] = nbins_per_dim_vec; end
-    end
-    basis_models = ["pspline", "bspline", "tps", "moran", "spherical", "barycentric", "decay", "linear", "invdist", "kriging"]
-    dynamic_basis_models = ["wavelet", "fft"]
-    continuous_kernel_models = ["gp", "fitc", "svgp", "nystrom", "warp", "spde", "exponentialdecay", "rff", "kriging"]
-    gmrfs_on_bins_models = ["rw1", "rw2", "ar1", "icar", "besag", "cyclic"]
-    model_str = string(model_param)
-    if model_str in dynamic_basis_models
-        if all(v -> hasproperty(data, Symbol(v)), mod_data[:variables])
-            coords = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
-            mod_data[:params][:coords] = coords
-        else
-            error("Coordinate variables for smooth model not found in data: $(mod_data[:variables])")
-        end
-        return true
-    end
-    if model_str in basis_models
-        if !isempty(mod_data[:variables]) 
-            reg_key = Symbol(join(mod_data[:variables], "_"))
-            if all(hasproperty(data, Symbol(v)) for v in mod_data[:variables])
-                n_vars = length(mod_data[:variables])
-                
-                local_kwargs = Dict(params)
-                delete!(local_kwargs, :nbins)
-                local B_smooth_matrix
-                local actual_nbins_for_component = total_bins_for_component_obj # Default, will be updated for 1D
-                if n_vars == 1
-                    v_vec = data[!, Symbol(mod_data[:variables][1])]
-                    B_smooth_matrix, actual_nbins_for_component = bstm_smooth_basis_1D(model_str, v_vec, nbins_per_dim_vec[1], get(params, :degree, 3); local_kwargs...)
-                else
-                    c_mat = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
-                    if n_vars == 2; B_smooth_matrix = bstm_smooth_basis_2D(model_str, c_mat, nbins_per_dim_vec; local_kwargs...);
-                    elseif n_vars == 3; B_smooth_matrix = bstm_smooth_basis_3D(model_str, c_mat, nbins_per_dim_vec; local_kwargs...);
-                    elseif n_vars == 4; B_smooth_matrix = bstm_smooth_basis_4D(model_str, c_mat, nbins_per_dim_vec; local_kwargs...);
-                    end
-                    actual_nbins_for_component = size(B_smooth_matrix, 2) # For multi-D, actual is size of matrix
-                end
-                registry_to_use[reg_key] = B_smooth_matrix
-                mod_data[:params][:nbins] = actual_nbins_for_component # Update nbins with the actual count
-            end
-        end
-    elseif model_str in continuous_kernel_models
-        if all(v -> hasproperty(data, Symbol(v)), mod_data[:variables])
-            coords = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
-            mod_data[:params][:coords] = coords
-            if model_str in ["fitc", "svgp", "nystrom", "gp"]
-                n_inducing_default = min(100, size(coords, 1))
-                n_inducing = get(mod_data[:params], :n_inducing, n_inducing_default)
-                Z_inducing = generate_inducing_points(coords, n_inducing; seed=42, method="kmeans")
-                mod_data[:params][:Z_inducing] = Z_inducing
-            end
-        else
-            @warn "Continuous kernel smooth specified, but coordinate variables not found in data. Component may be misspecified."
-        end
-    elseif model_str in gmrfs_on_bins_models
-        vars = mod_data[:variables]
-        if length(vars) != 1; @warn "GMRF smooth on $(join(vars, ",")) requires exactly 1 variable. Skipping."; return true; end
-        
-        index_key = Symbol("mixed_idx_$(string(vars[1]))")
-        var_sym = Symbol(vars[1])
-        nbins = get(mod_data[:params], :nbins, 20)
-        _, indices = apply_discretization_logic(data[!, var_sym], nbins)
-        opt_dict[index_key] = indices
-        mod_data[:params][:indices] = indices
-        mod_data[:params][:n_cat] = length(unique(indices))
-        mod_data[:type] = :mixed
-    end    
-    mod_data[:params][:model] = model_param
-    return true
-end
-
-
- 
-
-function process_lgcp_module!(opt_dict, mod_data, registries, hyperpriors)
-    # The LGCP module itself doesn't directly set spatial indices, its inner model does.
-    # We need to ensure the spatial context for the inner model is established in opt_dict.
-
-    # Create a temporary mod_data_dict for the inner spatial component.
-    # This will be passed to process_spatial_module! to set opt_dict[:s_N], opt_dict[:s_idx], opt_dict[:W].
-    inner_spatial_mod_data = Dict(
-        :type => :spatial, # Explicitly process as a spatial module
-        :params => mod_data[:params], # Pass all parameters from the LGCP module, including W, s_idx, etc.
-        :variables => get(mod_data[:params], :positional_args, []) # Positional args for the inner random()
-    )
-    
-    # Call the spatial processor. This will set opt_dict[:s_N], opt_dict[:s_idx], opt_dict[:W]
-    # based on the parameters provided in the LGCP module (which came from the inner random()).
-    process_spatial_module!(opt_dict, inner_spatial_mod_data, registries, hyperpriors)
-
-    # Now handle LGCP-specific parameters like grid_areas, which depend on s_N.
-    if haskey(mod_data[:params], :grid_areas)
-        ga_val = mod_data[:params][:grid_areas]
-        if ga_val isa Symbol && hasproperty(opt_dict[:data], ga_val)
-            opt_dict[:grid_areas] = opt_dict[:data][!, ga_val]
-        elseif ga_val isa AbstractVector
-            opt_dict[:grid_areas] = ga_val
-        else
-            calling_mod = get(opt_dict, :calling_module, Main)
-            try
-                opt_dict[:grid_areas] = Core.eval(calling_mod, ga_val)
-            catch
-                @warn "Could not resolve grid_areas. Defaulting to unit areas."
-                opt_dict[:grid_areas] = ones(opt_dict[:s_N])
-            end
-        end
-    else
-        # If grid_areas is not specified, default to ones(s_N).
-        # This requires s_N to be set by process_spatial_module! already.
-        opt_dict[:grid_areas] = ones(opt_dict[:s_N])
-    end
-
-    return true # Continue to create the LGCP component object via resolve_technical_primitive
-end
-
-
-
-
-function process_dynamics_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
-    # Purpose: Processes the `dynamics()` module, ensuring spatial and temporal contexts are established.
-    # Rationale: This version explicitly extracts spatial and temporal index variables from the module's
-    #            positional arguments, resolving the "no temporal indices found" warning. It also ensures
-    #            `s_N` and `t_N` are correctly derived from these indices and that `grid_areas` are available.
-    # v1.0.2 (2026-08-03)
-
-    params = mod_data[:params]
-    data = opt_dict[:data]
-    variables = mod_data[:variables] # Positional arguments to dynamics()
-
-    # 1. Explicitly handle spatial and temporal index variables from positional arguments
-    if length(variables) < 2
-        error("Dynamics module requires at least two positional arguments: a spatial index and a temporal index (e.g., dynamics(s_idx, year, ...)).")
-    end
-
-    spatial_idx_var_sym = Symbol(variables[1])
-    temporal_idx_var_sym = Symbol(variables[2])
-
-    if !hasproperty(data, spatial_idx_var_sym)
-        error("Spatial index variable ':$spatial_idx_var_sym' for dynamics module not found in data.")
-    end
-    opt_dict[:s_idx] = data[!, spatial_idx_var_sym]
-    opt_dict[:s_N] = length(unique(opt_dict[:s_idx])) # Ensure s_N is set from the actual s_idx
-
-    if !hasproperty(data, temporal_idx_var_sym)
-        error("Temporal index variable ':$temporal_idx_var_sym' for dynamics module not found in data.")
-    end
-    opt_dict[:t_idx] = data[!, temporal_idx_var_sym]
-    opt_dict[:t_N] = length(unique(opt_dict[:t_idx])) # Ensure t_N is set from the actual t_idx
-
-    # 2. Call process_spatial_module! to handle W, but prevent it from inferring s_idx from variables.
-    # This ensures W is correctly processed without overwriting the s_idx we just set.
-    spatial_mod_data_for_w = Dict(
-        :type => :spatial,
-        :params => Dict(:W => get(params, :W, get(opt_dict, :W, nothing))), # Pass W explicitly
-        :variables => [] # Crucial: Prevent process_spatial_module! from using positional args for s_idx
-    )
-    process_spatial_module!(opt_dict, spatial_mod_data_for_w, registries, hyperpriors)
-    
-    # Validate consistency between s_idx and W (if W is provided)
-    if haskey(opt_dict, :W) && opt_dict[:s_N] != size(opt_dict[:W], 1)
-        error("Number of unique spatial indices ($(opt_dict[:s_N])) does not match the dimension of the provided adjacency matrix W ($(size(opt_dict[:W], 1))).")
-    end
-
-    # 3. Model Type Verification
-    model_type = string(get(params, :model, "none"))
-    if model_type == "none"
-        error("Dynamics module requires a 'model' parameter (e.g., model='advection').")
-    end
-
-    # 4. Covariate and Parameter Validation
-    if model_type in ["advection", "advection_diffusion"]
-        if !haskey(params, :velocity_prior) && !haskey(opt_dict[:hyperpriors], "velocity")
-            @warn "Advection model specified without explicit velocity priors. Using system defaults."
-        end
-    end
-
-    if model_type in ["diffusion", "advection_diffusion"]
-        if !haskey(params, :diffusion_prior) && !haskey(opt_dict[:hyperpriors], "diffusion")
-            @warn "Diffusion model specified without explicit diffusion priors. Using system defaults."
-        end
-    end
-
-    # 5. Ensure `grid_areas` are available for density-based models
-    if !haskey(opt_dict, :grid_areas)
-        if haskey(params, :grid_areas)
-            ga_val = params[:grid_areas]
-            if ga_val isa Symbol && hasproperty(data, ga_val)
-                opt_dict[:grid_areas] = data[!, ga_val]
-            elseif ga_val isa AbstractVector
-                opt_dict[:grid_areas] = ga_val
-            else
-                calling_mod = get(opt_dict, :calling_module, Main)
-                try
-                    opt_dict[:grid_areas] = Core.eval(calling_mod, ga_val)
-                catch
-                    @warn "Could not resolve grid_areas. Defaulting to unit areas."
-                    opt_dict[:grid_areas] = ones(opt_dict[:s_N])
-                end
-            end
-        else
-            # Default to unit areas if not specified
-            opt_dict[:grid_areas] = ones(opt_dict[:s_N])
-        end
-    end
-
-    # 6. Mapping Spatiotemporal State
-    s_idx = opt_dict[:s_idx]
-    t_idx = opt_dict[:t_idx]
-    s_N = opt_dict[:s_N]
-    
-    opt_dict[:st_idx] = [(t - 1) * s_N + s for (s, t) in zip(s_idx, t_idx)]
-
-    return true
-end
-
-
-
-"""
-    process_eigen_module!(opt_dict, mod_data, registries, hyperpriors)
-
-Processes the `eigen()` module call.
-
-# Rationale for Update
-The original implementation did not extract the data for the variables specified in the
-`eigen()` call, making it impossible to perform PCA. This updated version correctly
-extracts the relevant columns from the data frame, centers them, and stores the
-resulting matrix in the module's parameters for use by the model builder and code
-generator. It also validates the number of factors against the number of variables.
-"""
-function process_eigen_module!(opt_dict, mod_data, registries, hyperpriors)
-    params = mod_data[:params]
-    vars_str = mod_data[:variables]
-    vars_sym = Symbol.(vars_str)
-    
-    if isempty(vars_sym)
-        error("The `eigen()` module was called without any variables specified.")
-    end
-
-    data = opt_dict[:data]
-    if !all(hasproperty(data, v) for v in vars_sym)
-        missing_vars = filter(v -> !hasproperty(data, v), vars_sym)
-        error("Eigen module variables not found in data: $(missing_vars)")
-    end
-    
-    # Extract the data and center it (a standard assumption for PCA).
-    eigen_data_matrix = Matrix(data[!, vars_sym])
-    eigen_data_matrix .-= mean(eigen_data_matrix, dims=1)
-    
-    # Store the data matrix in the module's parameters for the builder to access.
-    mod_data[:params][:eigen_data] = eigen_data_matrix
-    
-    n_vars = length(vars_sym)
-    n_factors = get(params, :n_factors, 1)
-    if n_factors >= n_vars
-        @warn "Number of factors ($n_factors) for eigen() module should be less than the number of variables ($n_vars). Setting to $(n_vars - 1)."
-        n_factors = n_vars - 1
-    end
-    
-    # Pre-calculate indices for the lower-triangular part of the Householder matrix.
-    ltri_mask = [r >= c for r in 1:n_vars, c in 1:n_factors]
-    ltri_indices = findall(vec(ltri_mask))
-    
-    mod_data[:params][:ltri_indices] = ltri_indices
-    mod_data[:params][:n_factors] = n_factors
-    mod_data[:params][:n_vars] = n_vars
-    
-    return true # Proceed with component creation.
-end
-
-
 """
     _replace_bstm_modules_in_expr(ex)
 
@@ -2700,218 +2113,6 @@ function _replace_bstm_modules_in_expr(ex)
         return ex
     end
 end
-
-
-"""
-    process_mixed_module!(opt_dict, mod_data, registries, hyperpriors)
-
-Processes the `mixed()` module for random effects. This version uses `StatsModels.jl`
-to correctly parse the effects part of the mixed model formula (e.g., `intercept() + cov1`).
-It handles `intercept()` by converting it to `1` and correctly identifies all terms, which
-are then passed to the code generator as a vector of strings. This fixes a bug where
-`intercept()` was treated as a string literal, causing a `ParseError`.
-
-# Arguments
-- `opt_dict`: The main model configuration dictionary.
-- `mod_data`: The parsed data for the `mixed()` module.
-- `registries`, `hyperpriors`: Additional configuration dictionaries.
-
-# Returns
-- `true` to indicate that a `MixedComponent` object should be created.
-"""
-function process_mixed_module!(opt_dict, mod_data, registries, hyperpriors)
-    data = opt_dict[:data]
-    vars = mod_data[:variables]
-    
-    response_var = Symbol(opt_dict[:outcomes][1])
-
-    local effect_expr, group_var_str
-    if !isempty(vars) && vars[1] isa Expr && vars[1].head == :call && vars[1].args[1] == :|
-        effect_expr = vars[1].args[2]
-        group_expr = vars[1].args[3]
-        group_var_str = string(group_expr)
-    elseif length(vars) >= 2
-        effect_expr = vars[1]
-        group_var_str = string(vars[2])
-    else
-        @warn "The mixed() module requires syntax `mixed(effect | group)` or `mixed(effect, group)`. Skipping."
-        return false
-    end
-
-    effect_expr_mod = _replace_bstm_modules_in_expr(effect_expr)
-    schema = StatsModels.schema(data)
-    local terms
-
-    if effect_expr_mod isa Number
-        terms = StatsModels.term(effect_expr_mod)
-    else
-        calling_mod = get(opt_dict, :calling_module, Main)
-        form = Core.eval(calling_mod, :(@formula($response_var ~ $(effect_expr_mod))))
-        applied_form = StatsModels.apply_schema(form, schema)
-        terms = applied_form.rhs
-    end
-
-    # Correctly handle Tuple and TupleTerm from StatsModels to decompose multi-term effects.
-    term_vec = if terms isa StatsModels.TupleTerm
-        terms.terms
-    elseif terms isa StatsModels.AbstractTerm
-        (terms,) # Wrap single AbstractTerm in a tuple for consistent iteration
-    elseif terms isa Tuple # Fallback for raw tuples, though less common from StatsModels.jl
-        collect(terms)
-    else
-        [terms]
-    end
-    
-    effect_names = String[]
-    for term in term_vec
-        if term isa StatsModels.InterceptTerm{true}
-            push!(effect_names, "1")
-        elseif term isa StatsModels.InterceptTerm{false}
-            continue
-        else
-            push!(effect_names, _canonical_term_string(term))
-        end
-    end
-
-    group_var_sym = Symbol(group_var_str)
-    if !hasproperty(data, group_var_sym)
-        error("Grouping variable ':$group_var_sym' for mixed() module not found in dataset.")
-    end
-    
-    group_data = data[!, group_var_sym]
-    unique_levels = unique(group_data)
-    group_map = Dict(v => i for (i, v) in enumerate(unique_levels))
-    indices = [group_map[v] for v in group_data]
-
-    index_key = Symbol("mixed_idx_$(group_var_str)")
-    opt_dict[index_key] = indices
-    
-    mod_data[:params][:indices] = indices
-    mod_data[:params][:n_cat] = length(unique_levels)
-    mod_data[:params][:lhs] = effect_names
-    mod_data[:variables] = [group_var_str]
-    
-    return true
-end
-
- 
-
-function process_spacetime_module!(opt_dict, mod_data, registries, hyperpriors)
-    models = get(mod_data[:params], :model, (:iid, :iid))
-    
-    local spatial_model, temporal_model
-    if models isa Expr && models.head == :tuple && length(models.args) == 2
-        spatial_model = string(models.args[1])
-        temporal_model = string(models.args[2])
-    elseif models isa Tuple && length(models) == 2
-        spatial_model = string(models[1])
-        temporal_model = string(models[2])
-    else
-        error("The `model` for a spacetime interaction must be a tuple of two models, e.g., `model=(icar, ar1)`.")
-    end
-
-    has_structured_space = spatial_model != "iid"
-    has_structured_time = temporal_model != "iid"
-
-    if has_structured_space && has_structured_time
-        opt_dict[:model_st] = "IV"
-    elseif !has_structured_space && has_structured_time
-        opt_dict[:model_st] = "II"
-    elseif has_structured_space && !has_structured_time
-        opt_dict[:model_st] = "III"
-    else # !has_structured_space && !has_structured_time
-        opt_dict[:model_st] = "I"
-    end
-
-    if haskey(mod_data[:params], :sigma)
-        prior_val = mod_data[:params][:sigma]
-        calling_mod = get(opt_dict, :calling_module, Main)
-        if prior_val isa Tuple
-            opt_dict[:st_interaction_sigma_prior] = create_pc_prior(:sigma, prior_val)
-        elseif prior_val isa Expr
-            try
-                opt_dict[:st_interaction_sigma_prior] = Core.eval(calling_mod, prior_val)
-            catch e
-                error("Could not evaluate `prior` argument `$(prior_val)` for spacetime interaction. Error: $e")
-            end
-        else
-            opt_dict[:st_interaction_sigma_prior] = prior_val
-        end
-    end
-    
-    # This module only sets flags; it does not create a component itself.
-    return false
-end
- 
-
-function process_fixed_module!(opt_dict, mod_data, registries, hyperpriors)
-    # Purpose: Processes the `fixed()` module.
-    # Rationale: Gathers information about fixed effects, including custom contrasts and priors.
-    #            This version is updated to collect the variable names from the `fixed()` call
-    #            and store them in `opt_dict[:fixed_effects_from_modules]`. This ensures that
-    #            fixed effects specified via `fixed()` are correctly included in the model's
-    #            design matrix.
-    # v1.1.0 (2026-08-03)
-    if !haskey(opt_dict, :fixed_effects); opt_dict[:fixed_effects] = String[]; end
-    if !haskey(opt_dict, :contrasts); opt_dict[:contrasts] = Dict{Symbol, Any}(); end
-    if !haskey(opt_dict, :fixed_effects_priors); opt_dict[:fixed_effects_priors] = Dict{Symbol, Any}(); end
-    if !haskey(opt_dict, :vars_to_categorize); opt_dict[:vars_to_categorize] = Set{Symbol}(); end
-    
-    params = mod_data[:params]
-    vars = mod_data[:variables]
-
-    # --- NEW: Collect fixed effect variables ---
-    if !haskey(opt_dict, :fixed_effects_from_modules)
-        opt_dict[:fixed_effects_from_modules] = String[]
-    end
-    for var in vars
-        push!(opt_dict[:fixed_effects_from_modules], string(var))
-    end
-    # --- END NEW ---
-
-    if haskey(params, :contrast)
-        if !isempty(vars)
-            contrast_sym = params[:contrast]
-            if haskey(STATSMODELS_CONTRASTS, contrast_sym)
-                opt_dict[:contrasts][Symbol(vars[1])] = STATSMODELS_CONTRASTS[contrast_sym]
-            else
-                @warn "Unknown contrast coding ':$contrast_sym'. Using default (DummyCoding)."
-                opt_dict[:contrasts][Symbol(vars[1])] = StatsModels.DummyCoding()
-            end
-        else
-            @warn "A 'contrast' was specified in a fixed() module with no variable. Ignoring."
-        end
-    end
-    if haskey(params, :prior)
-        for var in vars
-            opt_dict[:fixed_effects_priors][Symbol(var)] = params[:prior]
-        end
-    end
-    if get(params, :model, nothing) == :categorical || haskey(params, :contrast)
-        for var in vars
-            push!(opt_dict[:vars_to_categorize], Symbol(var))
-        end
-    end
-    return false # fixed() modules do not create components in the main loop.
-end
-
-
-
-
-
-function process_custom_module!(opt_dict, mod_data, registries, hyperpriors)
-    # Purpose: Processes the `custom()` module.
-    # Rationale: Placeholder for user-defined custom model components.
-    # v1.0.0 (2026-07-16)
-    # Assumptions: None.
-    # Inputs:
-    #   - opt_dict, mod_data, registries, hyperpriors.
-    # Outputs: None.
-    # Returns: A boolean indicating whether a standard component object should be created for this module.
-    return true
-end
-
-
 
 
 
@@ -3009,176 +2210,6 @@ function adjacency_to_bipartite(W::AbstractMatrix; force_bipartite::Bool=true)
     )
 end
 
-
-function process_bcgn_module!(opt_dict, mod_data, registries, hyperpriors)
-    # Purpose: Processes the `bcgn()` module for bipartite graphs.
-    # Rationale: Validates the provided bipartite adjacency matrix.
-    # v1.0.0 (2026-07-16)
-    # Inputs: opt_dict, mod_data, registries, hyperpriors.
-    # Outputs: Boolean indicating if a component should be created.
-    params = mod_data[:params]
-    if !haskey(params, :W) || isempty(params[:W]) || all(iszero, params[:W])
-        error("The `bcgn()` module requires a non-empty `:W` sparse matrix parameter.")
-    end
-
-    res = adjacency_to_bipartite(params[:W])
-    params[:bipartite_adj] = res.bipartite_adj
-
-    # Further validation could be added here (e.g., check if it's actually bipartite)
-    return true # Proceed with component creation
-end
-
-function process_networkflow_module!(opt_dict, mod_data, registries, hyperpriors)
-    # Purpose: Processes the `networkflow()` module.
-    # Rationale: Validates the provided adjacency matrix for the network flow model.
-    # v1.0.0 (2026-07-16)
-    # Inputs: opt_dict, mod_data, registries, hyperpriors.
-    # Outputs: Boolean indicating if a component should be created.
-    params = mod_data[:params]
-    if !haskey(params, :adjacency_matrix) || isempty(params[:adjacency_matrix]) || all(iszero, params[:adjacency_matrix])
-        error("The `networkflow()` module requires a non-empty `:adjacency_matrix` sparse matrix parameter.")
-    end
-    return true # Proceed with component creation
-end
-
-
-function process_localadaptive_module!(opt_dict, mod_data, registries, hyperpriors)
-    # Purpose: Processes the `localadaptive` module, ensuring centroids and cluster assignments are correctly computed for all spatial units.
-    # Rationale: This version corrects a `DimensionMismatch` error. The original logic computed centroids only for the spatial units present in the observation data, leading to a `cluster_assignments` vector shorter than the total number of spatial units (`s_N`). This fix ensures that centroids are resolved for all `s_N` units. It first attempts to find a complete list of centroids. If not available, it constructs them from coordinate columns (`s_x`, `s_y`), but now validates that these coordinates cover all `s_N` units by creating a map from `s_idx` to unique coordinates. This guarantees that the k-means clustering and the resulting `cluster_assignments` vector have the correct dimension (`s_N`), resolving the error.
-    # v1.0.2 (2026-08-02)
-    # Inputs/Outputs: Standard module processor arguments.
-
-    # First, run the standard spatial processor to set up W, s_idx, s_N, etc.
-    process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
-    s_N = opt_dict[:s_N]
-    data = opt_dict[:data]
-
-    # The localadaptive model requires centroids for clustering.
-    if !haskey(opt_dict, :centroids)
-        @info "Centroids not found for localadaptive model. Attempting to compute from s_x and s_y coordinates."
-        if hasproperty(data, :s_x) && hasproperty(data, :s_y) && hasproperty(data, :s_idx)
-            
-            # Create a map from each spatial index to its unique coordinate.
-            coord_map = Dict{Int, Point2D}()
-            for i in 1:nrow(data)
-                idx = data.s_idx[i]
-                if !haskey(coord_map, idx)
-                    coord_map[idx] = Point2D(data.s_x[i], data.s_y[i])
-                end
-            end
-
-            # Check if we have coordinates for all s_N units.
-            if length(coord_map) < s_N
-                error("The `localadaptive` model requires coordinates for all $(s_N) spatial units, but only found coordinates for $(length(coord_map)) unique units in the data. Please provide a complete `centroids` vector as a keyword argument.")
-            end
-
-            # Reconstruct the full, ordered list of centroids.
-            centroids = Vector{Point2D}(undef, s_N)
-            for i in 1:s_N
-                if !haskey(coord_map, i)
-                     error("Coordinate for spatial unit `s_idx = $i` not found in the data. The `localadaptive` model requires complete coordinate information.")
-                end
-                centroids[i] = coord_map[i]
-            end
-            opt_dict[:centroids] = centroids
-        else
-            error("The `localadaptive()` model requires centroids for clustering. Provide them via the `centroids` keyword argument, or ensure spatial coordinates (s_x, s_y) and indices (s_idx) are in the data frame.")
-        end
-    end
-    
-    centroids = opt_dict[:centroids]
-    if length(centroids) != s_N
-        error("The number of provided centroids ($(length(centroids))) does not match the number of spatial units s_N ($(s_N)).")
-    end
-
-    params = mod_data[:params]
-    n_clusters = get(params, :n_clusters, 5)
-    
-    if length(centroids) < n_clusters
-        @warn "Number of spatial units ($(length(centroids))) is less than the requested number of clusters ($n_clusters). Adjusting n_clusters to $(length(centroids))."
-        n_clusters = length(centroids)
-    end
-    
-    # Clustering.jl expects a [dims x n_points] matrix
-    centroids_matrix = hcat([c.x for c in centroids], [c.y for c in centroids])'
-    
-    # Perform k-means clustering on the centroids
-    kmeans_result = kmeans(centroids_matrix, n_clusters; maxiter=200, display=:none)
-    
-    # The assignments map each of the s_N centroids to a cluster. This vector now has the correct length.
-    opt_dict[:cluster_assignments] = assignments(kmeans_result)
-    opt_dict[:n_clusters] = nclusters(kmeans_result)
-    
-    return true
-end
-
-
-
- 
-
-function process_nested_module!(opt_dict, mod_data, registries, hyperpriors)
-    # Purpose: Processes the `nested()` module for multi-fidelity or joint models.
-    # Rationale: This version is updated to correctly handle the `formula` argument.
-    #            It now robustly handles cases where the formula is passed as a string literal,
-    #            a variable name (Symbol), or a direct expression (Expr). It evaluates symbols
-    #            in the correct scope and converts expressions to strings, ensuring the
-    #            recursive configuration call receives a valid formula.
-    # v1.0.4 (2026-08-02)
-    # Inputs/Outputs: Standard module processor arguments.
-
-    if !haskey(opt_dict, :nested_components); opt_dict[:nested_components] = Dict{Symbol, Any}(); end
-    
-    var = Symbol(mod_data[:variables][1])
-    params = mod_data[:params]
-    sub_formula_raw = get(params, :formula, "")
-    data_source_sym = get(params, :data_source, :data)
-
-    if !haskey(opt_dict, data_source_sym)
-        @warn "Data source ':$data_source_sym' for nested module on '$var' not found. Skipping."
-        return false
-    end
-
-    sub_data = opt_dict[data_source_sym]
-    
-    # The kwargs passed to the sub-model should not include the sub-model's own data source key
-    # or the parent model's formula.
-    sub_config_kwargs = Dict(pairs(NamedTuple(opt_dict)))
-    delete!(sub_config_kwargs, :data)
-    delete!(sub_config_kwargs, data_source_sym)
-    delete!(sub_config_kwargs, :formula)
-    
-    # --- Robustly handle formula passed as String, Symbol, or Expr ---
-    local sub_formula_str::String
-    if sub_formula_raw isa String
-        sub_formula_str = sub_formula_raw
-    elseif sub_formula_raw isa Symbol
-        calling_mod = get(opt_dict, :calling_module, Main)
-        try
-            sub_formula_str = Core.eval(calling_mod, sub_formula_raw)
-        catch e
-            error("Could not evaluate the `formula` variable `$(sub_formula_raw)` for the nested module. Ensure it is defined in the calling scope. Error: $e")
-        end
-    elseif sub_formula_raw isa Expr
-        sub_formula_str = string(sub_formula_raw)
-    else
-        error("Unsupported type for `formula` argument in nested module: $(typeof(sub_formula_raw))")
-    end
-
-    if !(sub_formula_str isa String)
-        error("The `formula` argument for the nested module must resolve to a String. Got type: $(typeof(sub_formula_str))")
-    end
-    
-    # Recursively call bstm_config for the sub-model.
-    sub_config = bstm_config(sub_formula_str, sub_data; sub_config_kwargs...)
-    
-    opt_dict[:nested_components][var] = sub_config
-    
-    # The nested module itself does not create a component in the main model.
-    return false
-end
-
-
- 
 
  
 
@@ -3589,6 +2620,182 @@ function bstm(formula::String, data::DataFrame; kwargs...)
 end
 
 
+"""
+    bstm_text_assembler(config::NamedTuple, model_func_name::Symbol)
+
+Assembles the full Turing model code as a string and a Julia `Expr` by iterating
+through the components defined in the configuration and calling their `get_priors`
+and `get_updates` methods.
+
+# Rationale for Update
+This function is the core of the refactored code generation engine. It replaces the
+legacy `_generate_component_code_fragments` function with direct calls to the explicit
+`get_priors` and `get_updates` interface methods. This change makes the assembler
+simpler, more transparent, and directly aligned with the new component contract. It
+iterates through the component specifications, collects the prior and update code
+fragments for each, and then interpolates them into a complete `@model` block.
+"""
+function bstm_text_assembler(config::NamedTuple, model_func_name::Symbol)
+    priors_acc = String[]
+    updates_acc = String[]
+    
+    is_multivariate = config.model_arch == "multivariate"
+    arch_str = config.model_arch
+
+    # --- 1. Likelihood-specific Priors ---
+    # These are global parameters for the observation model.
+    push!(priors_acc, "# --- Likelihood Priors ---")
+    for (i, spec) in enumerate(config.likelihood_specs)
+        family = get(spec, :family, "gaussian")
+        suffix = is_multivariate ? "_$i" : ""
+        if family == "negbin"
+            push!(priors_acc, "r_nb$(suffix) ~ NamedDist(Exponential(1.0), :r_nb$(suffix))")
+        end
+        if family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"] && !get(config, :volatility, false)
+            push!(priors_acc, "y_sigma$(suffix) ~ NamedDist(Exponential(1.0), :y_sigma$(suffix))")
+        end
+        if get(config, :use_zi, false)
+            push!(priors_acc, "phi_zi$(suffix) ~ NamedDist(Beta(1, 1), :phi_zi$(suffix))")
+        end
+    end
+
+    # --- 2. Intercept and Fixed Effects Priors ---
+    if config.add_intercept
+        push!(priors_acc, "# --- Intercept Prior ---")
+        intercept_prior_str = _distribution_to_string(config.intercept_prior)
+        if is_multivariate
+            push!(priors_acc, "intercept ~ NamedDist(MvNormal(zeros(T, $(config.outcomes_N)), $(config.intercept_prior.σ) * I), :intercept)")
+        else
+            push!(priors_acc, "intercept ~ NamedDist($(intercept_prior_str), :intercept)")
+        end
+    end
+
+    if get(config, :Xfixed_N, 0) > 0
+        push!(priors_acc, "# --- Fixed Effects Priors ---")
+        if is_multivariate
+            # For multivariate, create a block of priors for each outcome
+            for k in 1:config.outcomes_N
+                for i in 1:config.Xfixed_N
+                    prior_str = _distribution_to_string(config.Xfixed_priors_vec[i])
+                    push!(priors_acc, "Xfixed_beta_$(k)_$(i) ~ NamedDist($(prior_str), :Xfixed_beta_$(k)_$(i))")
+                end
+            end
+        else
+            priors_str = join(["NamedDist($(_distribution_to_string(p)), :Xfixed_beta_$(i))" for (i, p) in enumerate(config.Xfixed_priors_vec)], ", ")
+            push!(priors_acc, "Xfixed_beta ~ NamedDist(Product([$(priors_str)]), :Xfixed_beta)")
+        end
+    end
+
+    # --- 3. Multivariate Correlation Prior ---
+    if is_multivariate
+        push!(priors_acc, "# --- Multivariate Correlation Prior ---")
+        push!(priors_acc, "L_corr ~ NamedDist(LKJCholesky($(config.outcomes_N), T(1.0)), :L_corr)")
+    end
+
+    # --- 4. Main Component Loop ---
+    # This loop iterates through all defined components (spatial, temporal, smooth, etc.)
+    # and calls their specific `get_priors` and `get_updates` methods.
+    for spec in config.components
+        m_obj = spec.component_obj
+        
+        # Skip components that are handled globally or have no code to generate
+        if m_obj isa NoneComponent; continue; end
+
+        push!(priors_acc, "\n# --- Priors for component: $(spec.key) ---")
+        push!(updates_acc, "\n# --- Updates for component: $(spec.key) ---")
+
+        if is_multivariate
+            for k in 1:config.outcomes_N
+                push!(priors_acc, get_priors(m_obj, spec, arch_str, k, config))
+                push!(updates_acc, get_updates(m_obj, spec, arch_str, k, config))
+            end
+        else # Univariate
+            push!(priors_acc, get_priors(m_obj, spec, arch_str, nothing, config))
+            push!(updates_acc, get_updates(m_obj, spec, arch_str, nothing, config))
+        end
+    end
+
+    # --- 5. Assemble Code Fragments ---
+    priors_code = join(filter(!isempty, priors_acc), "\n    ")
+    updates_code = join(filter(!isempty, updates_acc), "\n")
+
+    # --- 6. Construct Linear Predictor and Likelihood ---
+    eta_assembly_code = ""
+    likelihood_code = ""
+
+    if is_multivariate
+        # Assemble beta matrix for fixed effects
+        beta_matrix_assembly = if get(config, :Xfixed_N, 0) > 0
+            "local Xfixed_beta = hcat($([ "vcat($(["Xfixed_beta_$(k)_$(i)" for i in 1:config.Xfixed_N]))" for k in 1:config.outcomes_N ]...))"
+        else
+            "local Xfixed_beta = zeros(T, 0, $(config.outcomes_N))"
+        end
+
+        eta_assembly_code = """
+        # --- Linear Predictor Assembly (Multivariate) ---
+        local eta_latent = zeros(T, M.y_N, M.outcomes_N)
+        if M.add_intercept; eta_latent .+= intercept'; end
+        if M.Xfixed_N > 0
+            $(beta_matrix_assembly)
+            eta_latent .+= M.Xfixed * Xfixed_beta
+        end
+        
+        $(updates_code)
+        
+        local eta = eta_latent * L_corr.L'
+        """
+        
+        # Construct likelihood block for multivariate models
+        lik_lines = ["for i in 1:M.y_N"]
+        for k in 1:config.outcomes_N
+            lik_spec = config.likelihood_specs[k]
+            fam = get(lik_spec, :family, "gaussian")
+            lik_params = "family=\"$fam\", trial=M.trials[i,$k], phi_zi=phi_zi$k, r_nb=r_nb$k, sigma_y=y_sigma$k, censor_lower=M.censor_lower[i,$k], censor_upper=M.censor_upper[i,$k], hurdle=M.hurdle[i,$k]"
+            push!(lik_lines, "    M.y_obs[i,$k] ~ bstm_Likelihood(eta[i,$k]; $(lik_params))")
+        end
+        push!(lik_lines, "end")
+        likelihood_code = join(lik_lines, "\n")
+
+    else # Univariate
+        eta_assembly_code = """
+        # --- Linear Predictor Assembly (Univariate) ---
+        local eta = zeros(T, M.y_N)
+        if M.add_intercept; eta .+= intercept; end
+        if M.Xfixed_N > 0; eta .+= M.Xfixed * Xfixed_beta; end
+        
+        $(updates_code)
+        """
+        
+        lik_spec = config.likelihood_specs[1]
+        fam = get(lik_spec, :family, "gaussian")
+        lik_params = "family=\"$fam\", trial=M.trials, phi_zi=phi_zi, r_nb=r_nb, sigma_y=y_sigma, censor_lower=M.censor_lower, censor_upper=M.censor_upper, hurdle=M.hurdle"
+        likelihood_code = "M.y_obs ~ bstm_Likelihood(eta; $(lik_params))"
+    end
+
+    # --- 7. Final Model Assembly ---
+    model_string = """
+    @model function $(model_func_name)(M, spec_registry; T=Float64)
+        # --- Priors ---
+        $(priors_code)
+
+        # --- Model Definition ---
+        $(eta_assembly_code)
+        
+        # --- Likelihood ---
+        if !get(M, :likelihood_handled, false)
+            $(likelihood_code)
+        end
+    end
+    """
+
+    # --- 8. Create Spec Registry and Expression ---
+    spec_registry = NamedTuple(spec.key => spec for spec in config.components)
+    expr = Meta.parse(model_string)
+
+    return model_string, expr, spec_registry
+end
+
+
 function bstm_codegen(config::NamedTuple)
     # Purpose: Generates the necessary components to define and instantiate a Turing model.
     # Rationale: Decouples code generation from evaluation to better handle Julia's world-age issues.
@@ -3612,236 +2819,42 @@ function bstm_codegen(config::NamedTuple)
 end
 
 
-# Version 1.0.1 (2026-08-06)
-# Purpose: Maps a parsed formula module to a concrete Component object.
-# Rationale: This version adds a new branch to handle the `process_convolution` model.
-#            When `model=:process_convolution` is detected, it recursively parses and
-#            resolves the nested `lengthscale_model` component. This allows for the
-#            construction of hierarchical models where one component's parameters are
-#            governed by another latent process.
+"""
+    resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, priors_dict, scheme::Symbol)
+
+Instantiates a `ComponentModel` object from its parsed formula representation. This function
+acts as a factory, resolving hyperpriors and calling the appropriate constructor from the
+`COMPONENT_CONSTRUCTORS` registry.
+"""
 function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, priors_dict, scheme::Symbol)
     m_type = module_metadata[:type]
     m_params = module_metadata[:params]
+    calling_mod = get(M, :calling_module, Main)
 
-    if m_type == :lgcp # Log-Gaussian Cox Process
-        inner_model_name = get(m_params, :model, :icar)
-        
-        inner_mod_data = Dict(
-            :type => :spatial,
-            :params => merge(m_params, Dict(:model => inner_model_name)),
-            :variables => get(module_metadata, :variables, [])
-        )
-        
-        inner_component_obj = resolve_technical_primitive(inner_mod_data, M, priors_dict, scheme)
-        
-        if !(inner_component_obj isa ComponentModel)
-            error("LGCP's inner spatial model is invalid. Expected a ComponentModel, but received $(typeof(inner_component_obj)).")
-        end
-
-        resolved_priors = resolve_hyperpriors("lgcp", priors_dict, m_params, scheme, M[:calling_module])
-        
-        dummy_inner_node = (module_type=:random, args=m_params, positional_args=get(m_params, :positional_args, []))
-        return LGCP(inner_component_obj, resolved_priors.sigma, dummy_inner_node)
-
-    elseif m_type == :lgammap
-        inner_model_node = get(m_params, :inner_model_node, error("LogGammaCoxProcess is missing inner model node."))
-        inner_mod_data = Dict(:type => inner_model_node.module_type, :params => inner_model_node.args, :variables => get(inner_model_node.args, :positional_args, []))
-        inner_component_obj = resolve_technical_primitive(inner_mod_data, M, priors_dict, scheme)
-        shape_prior = get(m_params, :shape, Gamma(2, 2))
-        if shape_prior isa Expr; try; shape_prior = Core.eval(M[:calling_module], shape_prior); catch; end; end
-        return LogGammaCoxProcess(inner_component_obj, shape_prior)
-
-    elseif m_type == :sncp
-        n_parents = get(m_params, :n_parents, 50)
-        kernel = get(m_params, :kernel, "se")
-        resolved_priors = resolve_hyperpriors("sncp", priors_dict, m_params, scheme, M[:calling_module])
-        return ShotNoiseCoxProcess(n_parents, kernel, resolved_priors.lengthscale, resolved_priors.amplitude)
-
-    elseif m_type == :tar
-        model_name = "tar"
-        resolved_priors = resolve_hyperpriors(model_name, priors_dict, m_params, scheme, M[:calling_module])
-        
-        threshold_var = get(m_params, :threshold_var, nothing)
-        if isnothing(threshold_var); error("TAR model requires a `threshold_var` parameter."); end
-        if threshold_var isa Expr; threshold_var = Core.eval(M[:calling_module], threshold_var); end
-
-        rho_regimes = get(m_params, :rho_regimes, [Beta(1,1), Beta(1,1)])
-        if rho_regimes isa Expr; rho_regimes = Core.eval(M[:calling_module], rho_regimes); end
-        if rho_regimes isa Tuple; rho_regimes = [create_pc_prior(:rho, r) for r in rho_regimes]; end
-
-        sigma_regimes = get(m_params, :sigma_regimes, [Exponential(1.0), Exponential(1.0)])
-        if sigma_regimes isa Expr; sigma_regimes = Core.eval(M[:calling_module], sigma_regimes); end
-        if sigma_regimes isa Tuple; sigma_regimes = [create_pc_prior(:sigma, s) for s in sigma_regimes]; end
-
-        return TAR(threshold_var, rho_regimes, sigma_regimes)
-  
-    elseif m_type == :svar
-        inner_model_name = get(m_params, :model, nothing)
-        if isnothing(inner_model_name)
-            error("SVAR model is missing its inner spatial model specification. Use `model=...` to specify it (e.g., model=icar).")
-        end
-        
-        inner_mod_data = Dict(
-            :type => :spatial, 
-            :params => merge(m_params, Dict(:model => inner_model_name)),
-            :variables => get(module_metadata, :variables, []) 
-        )
-        
-        inner_component_obj = resolve_technical_primitive(inner_mod_data, M, priors_dict, scheme)
-        
-        if !(inner_component_obj isa ComponentModel)
-            error("SVAR model's inner spatial model specification is invalid. Expected a ComponentModel, but received $(typeof(inner_component_obj)).")
-        end
-
-        resolved_priors = resolve_hyperpriors("svar", priors_dict, m_params, scheme, M[:calling_module])
-        return SVAR(inner_component_obj, resolved_priors.sigma)
-
-    elseif m_type == :svc
-        covariate_sym = Symbol(get(m_params, :covariate, :unknown))
-        spatial_model_spec_node = get(m_params, :spatial_model_spec, nothing)
-        spatial_mod_data = Dict(:type => spatial_model_spec_node.module_type, :params => spatial_model_spec_node.args, :variables => get(spatial_model_spec_node.args, :positional_args, []))
-        inner_component_obj = resolve_technical_primitive(spatial_mod_data, M, priors_dict, scheme)
-        return SVCComponent(covariate_sym, inner_component_obj)
-  
-    elseif m_type == :tvc
-        covariate_sym = Symbol(get(m_params, :covariate, :unknown))
-        temporal_model_spec_node = get(m_params, :temporal_model_spec, nothing)
-        temporal_mod_data = Dict(:type => temporal_model_spec_node.module_type, :params => temporal_model_spec_node.args, :variables => get(temporal_model_spec_node.args, :positional_args, []))
-        inner_component_obj = resolve_technical_primitive(temporal_mod_data, M, priors_dict, scheme)
-        return TVCComponent(covariate_sym, inner_component_obj)
-   
-    elseif m_type == :mixed
-        group_var_sym = Symbol(module_metadata[:variables][1])
-        lhs_str = module_metadata[:params][:lhs]
-        model_name = string(get(m_params, :model, "iid"))
-        resolved_priors = resolve_hyperpriors(model_name, priors_dict, m_params, scheme, M[:calling_module])
-        model_key = Symbol(model_name)
-        if !haskey(COMPONENT_CONSTRUCTORS, model_key); error("Component model ':$model_key' for mixed effect is not a recognized model type."); end
-        constructor_func = COMPONENT_CONSTRUCTORS[model_key]
-        return MixedComponent(group_var_sym, lhs_str, constructor_func(resolved_priors, m_params))
-
-    elseif m_type == :interact
+    # Handle composed components recursively
+    if m_type == :interact
         op = m_params[:operator]
         components_data = m_params[:components]
-        components_metadata = map(c_node -> Dict(:type => c_node.module_type, :params => c_node.args, :variables => get(c_node.args, :positional_args, [])), components_data)
+        components_metadata = map(c_node -> Dict(:key=>"temp", :type => c_node.module_type, :params => c_node.args, :variables => get(c_node.args, :positional_args, [])), components_data)
         resolved_components = [resolve_technical_primitive(comp_meta, M, priors_dict, scheme) for comp_meta in components_metadata]
-        return ComposedComponent(resolved_components, op)
-
-    elseif m_type == :spacetime 
-        return NoneComponent()
-
-    elseif m_type == :nonstationary_variance
-        base_node = m_params[:base_node]
-        modifier_node = m_params[:modifier_node]
-        base_mod_data = Dict(:type => base_node.module_type, :params => base_node.args, :variables => get(base_node.args, :positional_args, []))
-        base_component_obj = resolve_technical_primitive(base_mod_data, M, priors_dict, scheme)
-        modifier_mod_data = Dict(:type => modifier_node.module_type, :params => modifier_node.args, :variables => get(modifier_node.args, :positional_args, []))
-        modifier_component_obj = resolve_technical_primitive(modifier_mod_data, M, priors_dict, scheme)
-        return NonStationaryVariance(base_component_obj, modifier_component_obj)
-
-    elseif m_type == :adaptivesmooth
-        resolved_priors = resolve_hyperpriors("adaptivesmooth", priors_dict, m_params, scheme, M[:calling_module])
-        h_dim = get(m_params, :hidden_dim, 10)
-        n_bins = get(m_params, :nbins, 20)
-        return AdaptiveSmooth(h_dim, n_bins, resolved_priors.sigma)
-    
-    elseif m_type == :dynamics
-        model_name_raw = get(m_params, :model, "none")
-        model_name = String(lstrip(string(model_name_raw), ':'))
-        
-        calling_mod = get(M, :calling_module, Main)
-        evaluated_params = Dict{Symbol, Any}()
-        for (k, v) in m_params
-            if k in [:model, :catch_data_col, :interaction_covariate, :output_species]
-                evaluated_params[k] = v
-                continue
-            end
-
-            if v isa Expr || (v isa Symbol && isdefined(calling_mod, v))
-                try; evaluated_params[k] = Core.eval(calling_mod, v);
-                catch e; if v isa Symbol; evaluated_params[k] = v; else; error("Could not evaluate parameter `$(v)`. Error: $e"); end; end
-            else
-                evaluated_params[k] = v
-            end
-        end
-        
-        return DynamicsComponent(model_name, evaluated_params)
-
-    elseif m_type == :eigen
-        model_name = "eigen"
-        resolved_priors = resolve_hyperpriors(model_name, priors_dict, m_params, scheme, M[:calling_module])
-        
-        n_vars = get(m_params, :n_vars, 0)
-        n_factors = get(m_params, :n_factors, 0)
-        ltri_indices = get(m_params, :ltri_indices, Int[])
-
-        return Eigen(n_vars, n_factors, resolved_priors.pca_sd, resolved_priors.pdef_sd, ltri_indices)
-
-    elseif m_type == :custom
-        code_fragment_val = get(m_params, :code_fragment, "")
-        
-        local final_code_fragment::String
-        if code_fragment_val isa Symbol
-            calling_mod = get(M, :calling_module, Main)
-            try; final_code_fragment = Core.eval(calling_mod, code_fragment_val);
-            catch e; error("Could not evaluate `code_fragment` variable `$(code_fragment_val)`. Error: $e"); end
-        elseif code_fragment_val isa String; final_code_fragment = code_fragment_val;
-        elseif code_fragment_val isa Expr; try; final_code_fragment = Core.eval(get(M, :calling_module, Main), code_fragment_val); catch e; error("Could not evaluate `code_fragment` expression `$(code_fragment_val)`. Error: $e"); end
-        else; error("Unsupported type for `code_fragment`: $(typeof(code_fragment_val))"); end
-
-        if !(final_code_fragment isa String); error("`code_fragment` must resolve to a String. Got: $(typeof(final_code_fragment))"); end
-
-        return CustomComponent(final_code_fragment, get(m_params, :params, Dict{Symbol, Any}()))
-
-    elseif m_type == :random
-        model_name_raw = get(m_params, :model, :iid)
-        model_name = Symbol(string(model_name_raw))
-
-        if model_name == :process_convolution
-            ls_model_expr = get(m_params, :lengthscale_model, nothing)
-            if isnothing(ls_model_expr) || !isa(ls_model_expr, Expr) || ls_model_expr.head != :call
-                error("`process_convolution` model requires a `lengthscale_model` argument specifying another `random()` component, e.g., `lengthscale_model=random(s_x, s_y, model=:gp)`")
-            end
-
-            inner_module_type = ls_model_expr.args[1]
-            inner_args_dict = _parse_arguments_from_expr(ls_model_expr.args[2:end])
-            inner_mod_data = Dict(:type => inner_module_type, :params => inner_args_dict, :variables => get(inner_args_dict, :vars, []))
-
-            if inner_module_type == :random && !haskey(inner_args_dict, :structure)
-                args_for_inference = copy(inner_args_dict); args_for_inference[:vars] = get(inner_mod_data, :variables, [])
-                inner_args_dict[:structure] = _infer_structure_from_args(args_for_inference)
-            end
-            inner_mod_data[:type] = get(inner_args_dict, :structure, inner_module_type)
-
-            ls_model_obj = resolve_technical_primitive(inner_mod_data, M, priors_dict, scheme)
-            m_params[:lengthscale_model_obj] = ls_model_obj
-
-            ls_model_spec = build_model(ls_model_obj, M, inner_mod_data)
-            m_params[:lengthscale_model_spec] = ls_model_spec
-
-            resolved_priors = resolve_hyperpriors("process_convolution", priors_dict, m_params, scheme, M[:calling_module])
-            constructor_func = COMPONENT_CONSTRUCTORS[:process_convolution]
-            return constructor_func(resolved_priors, m_params)
-        end
-
-        model_name_str = string(model_name)
-        resolved_priors = resolve_hyperpriors(model_name_str, priors_dict, m_params, scheme, M[:calling_module])
-        
-        if !haskey(COMPONENT_CONSTRUCTORS, model_name); error("Component model ':$model_name' is not a recognized model type."); end
-        constructor_func = COMPONENT_CONSTRUCTORS[model_name]
-        return constructor_func(resolved_priors, m_params)
-
-    else
-        default_model = if m_type == :spatial; haskey(M, :W) ? "bym2" : "iid"; elseif m_type == :temporal; "rw2"; else "none"; end
-        model_name_raw = get(m_params, :model, default_model)
-        model_name = String(lstrip(string(model_name_raw), ':'))
-        resolved_priors = resolve_hyperpriors(model_name, priors_dict, m_params, scheme, M[:calling_module])
-        model_key = Symbol(model_name)
-        if !haskey(COMPONENT_CONSTRUCTORS, model_key); error("Component model ':$model_key' is not a recognized model type. Check for typos in the `model=` parameter."); end
-        constructor_func = COMPONENT_CONSTRUCTORS[model_key]
-        return constructor_func(resolved_priors, m_params)
+        return Composed(resolved_components, op)
     end
+
+    # Handle standard components
+    model_name = get(m_params, :model, :iid)
+    if m_type in keys(LEGACY_MODULES); model_name = m_type; end
+
+    model_name_str = string(model_name)
+    resolved_priors = resolve_hyperpriors(model_name_str, priors_dict, m_params, scheme, calling_mod)
+    
+    if !haskey(COMPONENT_CONSTRUCTORS, model_name)
+        error("Component model ':$model_name' is not a recognized model type.")
+    end
+    
+    constructor_func = COMPONENT_CONSTRUCTORS[model_name]
+    return constructor_func(resolved_priors, m_params)
 end
+
 
 
 # Version 1.5.3 (2026-08-06)
@@ -3963,466 +2976,6 @@ function _compute_scaling_factor(evals::Vector{Float64}, rank_deficiency::Int)
     # This is a standard method for ensuring the determinant of the scaled precision matrix is 1.
     return exp(mean(log.(positive_evals)))
 end
-
-
-
-"""
-    process_random_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
-
-The main processor for the `random()` module, updated to support hierarchical mosaic models.
-
-This version corrects an order-of-operations error. It now ensures that the primary
-model structure (e.g., `:spatial`) is processed and its context (like `s_N`) is
-established *before* attempting to process the `mosaic` modifier. This resolves
-the "s_N not established" error.
-"""
-function process_random_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
-    params = mod_data[:params]
-    data = opt_dict[:data]
-    variables = mod_data[:variables]
-    
-    # --- 1. Infer Structure and Handle Special Models ---
-    is_anisotropic = get(params, :anisotropic, false)
-    ls_prior = get(params, :lengthscale, get(params, :kappa, nothing))
-    
-    if ls_prior isa Expr && ls_prior.head == :vect && length(ls_prior.args) > 1
-        is_anisotropic = true
-    end
-    params[:anisotropic] = is_anisotropic
-
-    if !isempty(variables); params[:in_dims] = length(variables); end
-
-    if !haskey(params, :structure)
-        args_for_inference = copy(params)
-        args_for_inference[:vars] = get(mod_data, :variables, [])
-        params[:structure] = _infer_structure_from_args(args_for_inference)
-    end
-    structure = params[:structure]
-    
-    model_name = get(params, :model, :iid)
-
-    # Handle special models that have their own dedicated processors
-    if model_name == :localadaptive
-        process_localadaptive_module!(opt_dict, mod_data, registries, hyperpriors)
-        return true
-    elseif structure == :svar
-        process_svar_module!(opt_dict, mod_data, registries, hyperpriors)
-        return true
-    end
-
-    # --- 2. Set up Context Based on Structure ---
-    if structure == :spatial
-        if haskey(params, :W)
-            w_val = params[:W]
-            if w_val isa Expr || w_val isa Symbol
-                calling_mod = get(opt_dict, :calling_module, Main)
-                try; opt_dict[:W] = Core.eval(calling_mod, w_val); catch e; error("Could not evaluate `W` argument `$(w_val)`. Error: $e"); end
-            else
-                opt_dict[:W] = w_val
-            end
-        end
-        if !haskey(opt_dict, :W); error("Spatial model requires an adjacency matrix `W`."); end
-        
-        opt_dict[:s_N] = size(opt_dict[:W], 1)
-        if !isempty(variables)
-            s_var_sym = Symbol(variables[1])
-            if hasproperty(data, s_var_sym); opt_dict[:s_idx] = data[!, s_var_sym]; else; @warn "Spatial index ':$s_var_sym' not found."; end
-        end
-
-        # --- 2a. Process Mosaic Component (now that spatial context exists) ---
-        if haskey(params, :mosaic)
-            grouping_info = _process_mosaic_grouping!(opt_dict, mod_data)
-            
-            mosaic_key = "mosaic_$(mod_data[:key])"
-            group_col_name = grouping_info.group_col_name
-
-            mosaic_params = Dict(
-                :model => :iid,
-                :n_cat => grouping_info.n_regions,
-                :lhs => ["1"] # Specifies a random intercept.
-            )
-            
-            group_data = opt_dict[:data][!, group_col_name]
-            unique_levels = unique(group_data)
-            group_map = Dict(v => i for (i, v) in enumerate(unique_levels))
-            indices = [group_map[v] for v in group_data]
-            index_key = Symbol("mixed_idx_$(group_col_name)")
-            opt_dict[index_key] = indices
-            mosaic_params[:indices] = indices
-
-            mosaic_mod_data = Dict(
-                :type => :mixed,
-                :variables => [group_col_name],
-                :params => mosaic_params,
-                :key => mosaic_key
-            )
-            
-            mosaic_comp_obj = resolve_technical_primitive(mosaic_mod_data, opt_dict, hyperpriors, opt_dict[:prior_scheme])
-            mosaic_spec_built = build_model(mosaic_comp_obj, opt_dict, mosaic_mod_data)
-            
-            final_mosaic_spec = (
-                key=Symbol(mosaic_key), 
-                structure=:mixed, 
-                var=string(grouping_info.group_col_name), 
-                component_obj=mosaic_comp_obj, 
-                params=mosaic_mod_data[:params], 
-                Q_template=mosaic_spec_built.Q_template, 
-                scaling_factor=mosaic_spec_built.scaling_factor,
-                hyper=mosaic_spec_built.hyper
-            )
-            push!(opt_dict[:components], final_mosaic_spec)
-
-            delete!(params, :mosaic)
-            if haskey(params, :n_regions); delete!(params, :n_regions); end
-        end
-
-        # --- 2b. Process Point Process Component (now that spatial context exists) ---
-        point_process_type = get(params, :point_process, nothing)
-        if point_process_type == :lgcp || point_process_type == :sncp
-            if haskey(params, :grid_areas)
-                ga_val = params[:grid_areas]
-                if ga_val isa Symbol && hasproperty(data, ga_val)
-                    opt_dict[:grid_areas] = data[!, ga_val]
-                elseif ga_val isa AbstractVector
-                    opt_dict[:grid_areas] = ga_val
-                else
-                    try; opt_dict[:grid_areas] = Core.eval(get(opt_dict, :calling_module, Main), ga_val);
-                    catch; @warn "Could not resolve grid_areas for point process. Defaulting to unit areas."; opt_dict[:grid_areas] = ones(get(opt_dict, :s_N, 1)); end
-                end
-            else
-                @warn "$(uppercase(string(point_process_type))) model specified, but `grid_areas` parameter is missing. Defaulting to unit areas."
-                opt_dict[:grid_areas] = ones(get(opt_dict, :s_N, 1))
-            end
-        end
-
-    elseif structure == :temporal
-        if model_name == :tar
-            mod_data[:type] = :tar
-            if !haskey(params, :threshold_var)
-                error("The `tar` model requires a `threshold_var` parameter, e.g., `random(time, model=tar, threshold_var=my_covariate)`.")
-            end
-        end
-        continuous_kernel_models = [:gp, :rff, :fitc, :svgp, :nystrom, :warp, :spde, :kriging]
-        is_continuous_kernel_on_time = model_name in continuous_kernel_models
-        is_discrete_seasonal = model_name == :cyclic
-        is_continuous_periodic = model_name == :harmonic || haskey(params, :period)
-
-        if !isempty(variables)
-            t_var_sym = Symbol(variables[1])
-            if hasproperty(data, t_var_sym)
-                if is_continuous_kernel_on_time
-                    coords = Matrix{Float64}(data[!, [t_var_sym]])
-                    params[:coords] = coords
-                    mod_data[:type] = :smooth 
-                    if model_name in [:fitc, :svgp, :nystrom]
-                        n_inducing = get(params, :n_inducing, min(100, size(coords, 1)))
-                        params[:n_inducing] = n_inducing
-                        params[:Z_inducing] = generate_inducing_points(coords, n_inducing)
-                    end
-                elseif is_discrete_seasonal || is_continuous_periodic
-                    opt_dict[:u_idx] = data[!, t_var_sym]
-                    opt_dict[:u_N] = length(unique(opt_dict[:u_idx]))
-                    opt_dict[:u_idx_var] = t_var_sym
-                else
-                    time_opts = Dict(:time_method => get(params, :time_method, "regular"))
-                    tu_meta = assign_time_units(data[!, t_var_sym]; time_opts...)
-                    opt_dict[:t_idx] = tu_meta.idx
-                    opt_dict[:t_N] = tu_meta.N_cat
-                    opt_dict[:t_idx_var] = t_var_sym
-                end
-            else
-                @warn "Temporal index ':$t_var_sym' not found."
-            end
-        end
-
-    elseif structure == :smooth
-        continuous_kernel_models = [:gp, :rff, :fitc, :svgp, :nystrom, :warp, :spde, :kriging]
-        if model_name in continuous_kernel_models
-            if all(v -> hasproperty(data, Symbol(v)), variables)
-                coords = Matrix{Float64}(data[!, Symbol.(variables)])
-                params[:coords] = coords
-                if model_name in [:fitc, :svgp, :nystrom]
-                    n_inducing = get(params, :n_inducing, min(100, size(coords, 1)))
-                    params[:n_inducing] = n_inducing
-                    params[:Z_inducing] = generate_inducing_points(coords, n_inducing)
-                end
-            else
-                error("Coordinate variables for smooth model not found in data: $(variables)")
-            end
-        else
-            process_smooth_module!(opt_dict, mod_data, opt_dict[:basis_matrices], opt_dict[:components])
-        end
-    
-    elseif string(structure) == "spacetime"
-        process_spacetime_module!(opt_dict, mod_data, registries, hyperpriors)
-        return false
-        
-    else
-        @warn "Processing for structure ':$structure' is not fully implemented in `process_random_module!`. A default component will be created."
-    end
-
-    return true
-end
-
- 
- 
-"""
-    _process_mosaic_grouping!(opt_dict, mod_data)
-
-A helper function to handle the grouping logic for mosaic models. It partitions
-the spatial domain based on the `mosaic` parameter in a `random()` call.
-
-This function is introduced to centralize the logic for creating mosaic groups.
-It supports two modes:
-1.  `:kmeans`: Performs k-means clustering on the spatial coordinates.
-2.  A `Symbol` pointing to a column in the data that contains pre-defined group assignments.
-
-It creates a new column in the main DataFrame for the observation-level group
-assignments and returns the necessary information for the main processor to create
-the hierarchical model components.
-"""
-function _process_mosaic_grouping!(opt_dict, mod_data)
-    s_N = get(opt_dict, :s_N, 0)
-    if s_N == 0; error("Mosaic models require a spatial context (`s_N`) to be established first."); end
-    
-    data = opt_dict[:data]
-    params = mod_data[:params]
-    mosaic_param = get(params, :mosaic, :none)
-
-    local cluster_assignments::Vector{Int}
-    local n_regions::Int
-    
-    group_col_name = Symbol("mosaic_group_for_", mod_data[:key])
-
-    if mosaic_param == :kmeans
-        # --- K-Means Clustering Logic ---
-        if !haskey(opt_dict, :centroids)
-            if hasproperty(data, :s_x) && hasproperty(data, :s_y) && hasproperty(data, :s_idx)
-                coord_map = Dict{Int, Point2D}()
-                for i in 1:nrow(data); idx = data.s_idx[i]; if !haskey(coord_map, idx); coord_map[idx] = Point2D(data.s_x[i], data.s_y[i]); end; end
-                if length(coord_map) < s_N; error("Mosaic k-means requires coordinates for all $(s_N) spatial units, but only found $(length(coord_map))."); end
-                opt_dict[:centroids] = [coord_map[i] for i in 1:s_N]
-            else
-                error("Mosaic k-means requires centroids or `s_x`/`s_y` coordinates.")
-            end
-        end
-        
-        centroids = opt_dict[:centroids]
-        if length(centroids) != s_N; error("Number of centroids ($(length(centroids))) does not match s_N ($(s_N))."); end
-
-        # --- FIX: Evaluate n_regions parameter ---
-        n_regions_raw = get(params, :n_regions, 5)
-        local n_regions_req::Int
-        if n_regions_raw isa Symbol
-            calling_mod = get(opt_dict, :calling_module, Main)
-            try
-                n_regions_req = Core.eval(calling_mod, n_regions_raw)
-            catch e
-                error("Could not evaluate `n_regions` variable `:$(n_regions_raw)`. Ensure it is defined. Error: $e")
-            end
-        elseif n_regions_raw isa Int
-            n_regions_req = n_regions_raw
-        else
-            error("`n_regions` must be an Integer or a Symbol pointing to an Integer. Got: $(typeof(n_regions_raw))")
-        end
-        # --- END FIX ---
-
-        if length(centroids) < n_regions_req; n_regions_req = length(centroids); end
-        
-        centroids_matrix = hcat([c.x for c in centroids], [c.y for c in centroids])'
-        kmeans_result = kmeans(centroids_matrix, n_regions_req; maxiter=200, display=:none)
-        
-        cluster_assignments = assignments(kmeans_result)
-        n_regions = nclusters(kmeans_result)
-
-    elseif mosaic_param isa Symbol
-        # --- Pre-defined Grouping Column Logic ---
-        if !hasproperty(data, mosaic_param)
-            error("The specified mosaic grouping column `:$(mosaic_param)` was not found in the data.")
-        end
-        group_data = data[!, mosaic_param]
-        unique_levels = unique(group_data)
-        n_regions = length(unique_levels)
-        level_map = Dict(level => i for (i, level) in enumerate(unique_levels))
-        
-        s_idx_to_group = Dict{Int, Int}()
-        for i in 1:nrow(data)
-            s_idx_i = data.s_idx[i]
-            group_val = group_data[i]
-            if !haskey(s_idx_to_group, s_idx_i)
-                s_idx_to_group[s_idx_i] = level_map[group_val]
-            end
-        end
-        cluster_assignments = [get(s_idx_to_group, i, 1) for i in 1:s_N]
-    else
-        error("Invalid `mosaic` parameter. Must be `:kmeans` or a Symbol pointing to a grouping column.")
-    end
-
-    # Create the observation-level grouping column needed by the `mixed` processor.
-    opt_dict[:data][!, group_col_name] = cluster_assignments[opt_dict[:data].s_idx]
-    
-    return (group_col_name=group_col_name, n_regions=n_regions)
-end
-
-
-
-
-function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
-    # Purpose: Processes interaction modules like `|>` (pipe) and `⊗` (Kronecker product).
-    # Rationale: This version is updated to correctly handle the `random |> random` syntax
-    #            for spatially varying curves. It now detects this pattern, infers the
-    #            structures of the child components, and explicitly calls the necessary
-    #            processors (`process_smooth_module!` and `process_spatial_module!`) to
-    #            ensure that basis matrices and spatial configurations are correctly set up
-    #            before the model building phase. This resolves the `KeyError` for `:year`.
-    # v1.0.1 (2026-07-30)
-    # Inputs/Outputs: Standard module processor arguments.
-
-    op = get(mod_data, :operator, get(mod_data[:params], :operator, nothing))
-    components = get(mod_data, :components, get(mod_data[:params], :components, []))
-    if isnothing(op) || isempty(components); return false; end
-    
-    if op == :composition && length(components) == 2
-        outer_node, inner_node = components[1], components[2]
-        
-        if outer_node.module_type == :pointprocess
-            return true
-        end
-
-        is_nonstationary_variance = outer_node.module_type == :random && get(outer_node.args, :structure, :none) == :spatial && inner_node.module_type == :random && get(inner_node.args, :structure, :none) == :smooth
-        if is_nonstationary_variance
-            modifier_vars = get(inner_node.args, :positional_args, [])
-            if isempty(modifier_vars); @warn "The modifier component (smooth) of a composition operator is missing variables. Skipping."; return false; end
-            
-            smooth_mod_data = Dict(:type => :smooth, :variables => modifier_vars, :params => inner_node.args)
-            process_smooth_module!(opt_dict, smooth_mod_data, opt_dict[:basis_matrices], opt_dict[:components])
-            
-            mod_data[:type] = :nonstationary_variance
-            mod_data[:params][:base_node] = outer_node
-            mod_data[:params][:modifier_node] = inner_node
-            mod_data[:params][:modifier_basis_key] = Symbol(join(modifier_vars, "_"))
-            
-            return true 
-        end
-    end
-
-    if op == :pipe && length(components) == 2
-        node1, node2 = components[1], components[2]
-        
-        if node1.module_type == :random && !haskey(node1.args, :structure)
-            args1 = copy(node1.args); args1[:vars] = get(node1.args, :positional_args, [])
-            node1.args[:structure] = _infer_structure_from_args(args1)
-        end
-        if node2.module_type == :random && !haskey(node2.args, :structure)
-            args2 = copy(node2.args); args2[:vars] = get(node2.args, :positional_args, [])
-            node2.args[:structure] = _infer_structure_from_args(args2)
-        end
-
-        is_spatially_varying_curve = node1.module_type == :random && get(node1.args, :structure, :none) == :smooth &&
-                                     node2.module_type == :random && get(node2.args, :structure, :none) == :spatial
-
-        is_svc = node1.module_type == :fixed && node2.module_type == :random && get(node2.args, :structure, :none) == :spatial
-        is_tvc = node1.module_type == :fixed && node2.module_type == :random && get(node2.args, :structure, :none) == :temporal
-        is_svar = node1.module_type == :random && get(node1.args, :structure, :none) == :temporal && node2.module_type == :random && get(node2.args, :structure, :none) == :spatial
-
-        if is_spatially_varying_curve
-            dynamic_node = node1
-            dynamic_vars = get(dynamic_node.args, :positional_args, [])
-            if isempty(dynamic_vars); error("The dynamic part of a pipe operator (e.g., a smoother) must have a variable."); end
-            
-            smooth_mod_data = Dict(:type => :smooth, :variables => dynamic_vars, :params => dynamic_node.args)
-            process_smooth_module!(opt_dict, smooth_mod_data, opt_dict[:basis_matrices], opt_dict[:components])
-            
-            state_node = node2
-            spatial_mod_data = Dict(:type => :spatial, :variables => get(state_node.args, :positional_args, []), :params => state_node.args)
-            process_spatial_module!(opt_dict, spatial_mod_data, registries, hyperpriors)
-            
-            mod_data[:params][:dynamic_component_node] = dynamic_node
-            mod_data[:params][:state_component_node] = state_node
-            
-            return true
-
-        elseif is_svc
-            covariate_node = node1
-            spatial_node = node2
-            cov_args = get(covariate_node.args, :positional_args, [])
-            if isempty(cov_args); @warn "SVC model is missing a covariate. Skipping."; return false; end
-            covariate_name = cov_args[1]
-            
-            mod_data[:type] = :svc
-            mod_data[:variables] = [covariate_name, get(spatial_node.args, :positional_args, [])...]
-            mod_data[:params][:covariate] = covariate_name
-            mod_data[:params][:spatial_model_spec] = spatial_node
-            return true
-
-        elseif is_tvc
-            covariate_node = node1
-            temporal_node = node2
-            cov_args = get(covariate_node.args, :positional_args, [])
-            if isempty(cov_args); @warn "TVC model is missing a covariate. Skipping."; return false; end
-            covariate_name = cov_args[1]
-
-            mod_data[:type] = :tvc
-            mod_data[:variables] = [covariate_name, get(temporal_node.args, :positional_args, [])...]
-            mod_data[:params][:covariate] = covariate_name
-            mod_data[:params][:temporal_model_spec] = temporal_node
-            return true
-            
-        elseif is_svar
-            temporal_node = node1
-            spatial_node = node2
-            
-            process_random_module!(opt_dict, Dict(:type => :temporal, :params => temporal_node.args, :variables => get(temporal_node.args, :positional_args, [])), registries, hyperpriors)
-            process_random_module!(opt_dict, Dict(:type => :spatial, :params => spatial_node.args, :variables => get(spatial_node.args, :positional_args, [])), registries, hyperpriors)
-
-            mod_data[:type] = :svar
-            mod_data[:params][:rho_spatial_node] = spatial_node
-            mod_data[:params][:base_temporal_node] = temporal_node
-            return true
-        end
-    end
-
-    if op == :kronecker_product
-        if haskey(mod_data[:params], :sigma)
-            prior_val = mod_data[:params][:sigma]
-            calling_mod = get(opt_dict, :calling_module, Main)
-            if prior_val isa Tuple
-                opt_dict[:st_interaction_sigma_prior] = create_pc_prior(:sigma, prior_val)
-            elseif prior_val isa Expr
-                opt_dict[:st_interaction_sigma_prior] = Core.eval(calling_mod, prior_val)
-            else
-                opt_dict[:st_interaction_sigma_prior] = prior_val
-            end
-        end
-        
-        if length(components) == 2
-            s_idx = get(opt_dict, :s_idx, nothing); t_idx = get(opt_dict, :t_idx, nothing); s_N = get(opt_dict, :s_N, nothing)
-            if !isnothing(s_idx) && !isnothing(t_idx) && !isnothing(s_N); mod_data[:params][:indices] = [(t - 1) * s_N + s for (s, t) in zip(s_idx, t_idx)];
-            else @warn "Could not compute Kronecker product indices for '$(mod_data[:variables])'. Ensure spatial and temporal components are defined."; end
-            
-            c1_type = get(components[1], :module_type, :unknown); c2_type = get(components[2], :module_type, :unknown)
-            
-            spatial_node = c1_type == :random && get(components[1].args, :structure, :none) == :spatial ? components[1] : (c2_type == :random && get(components[2].args, :structure, :none) == :spatial ? components[2] : nothing)
-            temporal_node = c1_type == :random && get(components[1].args, :structure, :none) == :temporal ? components[1] : (c2_type == :random && get(components[2].args, :structure, :none) == :temporal ? components[2] : nothing)
-            
-            if !isnothing(spatial_node) && !isnothing(temporal_node)
-                spatial_model_str = string(get(spatial_node.args, :model, :iid)); temporal_model_str = string(get(temporal_node.args, :model, :iid))
-                has_structured_space = spatial_model_str != "iid"; has_structured_time = temporal_model_str != "iid"
-                if has_structured_space && has_structured_time; opt_dict[:model_st] = "IV";
-                elseif !has_structured_space && has_structured_time; opt_dict[:model_st] = "II";
-                elseif has_structured_space && !has_structured_time; opt_dict[:model_st] = "III";
-                else opt_dict[:model_st] = "I"; end
-            end
-            return false
-        else
-            @warn "Kronecker product with more than 2 components is not yet supported in process_interact_module!."
-        end
-    end
-    
-    return true
-end
-
-
 
 
 
@@ -6244,7 +4797,7 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
         return Symmetric(L_spde' * L_spde)
     end
 
-    if m_type == :NoneComponent || m_type == :FIXED
+    if m_type == :None || m_type == :FIXED
         return Symmetric(sparse(I, n_s, n_s))
     end
 
