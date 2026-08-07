@@ -1501,6 +1501,162 @@ model_irreg = @bstm(
 );
 ```
 
+### Modeling Non-Stationarity with Process Convolution
+
+Standard spatial models, like Gaussian Processes with a fixed kernel, assume stationarity—meaning the correlation between two points depends only on the distance between them, not their absolute location. This assumption is often violated in real-world data where spatial processes can be smoother in some areas and more variable in others.
+
+The ProcessConvolution component addresses this by allowing the kernel's parameters, specifically the lengthscale, to vary across the spatial domain. It achieves this by modeling the lengthscale itself as a latent spatial field.
+
+The model is constructed as a convolution of a simple, stationary "base" process defined at a set of knots with a spatially varying kernel. The final, non-stationary field $f(s)$ at a location $s$ is given by:
+
+$f(s) = \sum_{k=1}^{N_{knots}} K(s, c_k; \ell(s)) \cdot w_k$
+
+where:
+
+$w_k$ are the weights of the base process at the knot locations $c_k$.
+$K(\cdot, \cdot)$ is a kernel function (e.g., squared exponential).
+$\ell(s)$ is the spatially varying lengthscale, which is the output of its own nested spatial model.
+This example will walk through:
+
+Generating synthetic data from a known non-stationary process.
+Defining a ProcessConvolution model where the lengthscale is governed by a nested Gaussian Process.
+Estimating the model's parameters and visualizing the recovered non-stationary field and the underlying lengthscale field.
+
+```julia
+# --- 1. Setup and Package Loading ---
+using bstm
+using Turing
+using Distributions
+using DataFrames
+using Random
+using Plots
+
+# --- 2. Generate Synthetic Non-Stationary Data ---
+# We will create a true latent field where the spatial correlation changes
+# from one side of the domain to the other.
+
+function generate_nonstationary_data(; n_obs=400, n_knots=25)
+    # a. Define the spatial domain
+    grid_dim = Int(sqrt(n_obs))
+    s_coords = hcat(
+        repeat(range(0, 1, length=grid_dim), inner=grid_dim),
+        repeat(range(0, 1, length=grid_dim), outer=grid_dim)
+    )
+
+    # b. Define a spatially varying lengthscale field
+    # The lengthscale will be small on the left (x=0) and large on the right (x=1).
+    # This means the process will be rough on the left and smooth on the right.
+    true_ls_field = 0.05 .+ 0.4 .* s_coords[:, 1]
+
+    # c. Generate the true non-stationary latent field via process convolution
+    #    i. Define knot locations and a "base process" at the knots.
+    knots = hcat(
+        repeat(range(0, 1, length=Int(sqrt(n_knots))), inner=Int(sqrt(n_knots))),
+        repeat(range(0, 1, length=Int(sqrt(n_knots))), outer=Int(sqrt(n_knots)))
+    )
+    true_base_process = rand(Normal(0, 1.0), n_knots)
+
+    #    ii. Convolve the base process with the spatially varying kernel.
+    true_latent_field = zeros(n_obs)
+    for i in 1:n_obs
+        local_ls = true_ls_field[i]
+        kernel_weights = [exp(-0.5 * sum((s_coords[i, :] .- knots[k, :]).^2) / local_ls^2) for k in 1:n_knots]
+        true_latent_field[i] = dot(kernel_weights, true_base_process)
+    end
+
+    # d. Add observation noise
+    y_obs = true_latent_field .+ rand(Normal(0, 0.2), n_obs)
+
+    # e. Assemble the DataFrame
+    df = DataFrame(
+        y = y_obs,
+        s_x = s_coords[:, 1],
+        s_y = s_coords[:, 2],
+        s_idx = 1:n_obs # Each observation is its own spatial unit here
+    )
+
+    return df, true_latent_field, true_ls_field
+end
+
+println("Generating synthetic non-stationary data...")
+df_pc, true_field, true_ls = generate_nonstationary_data()
+println("Data generation complete.")
+
+
+# --- 3. Define and Run the bstm Model ---
+println("\nDefining the bstm model with a ProcessConvolution component...")
+
+# The `random()` module with `model=:process_convolution` requires:
+# - `n_knots`: The number of basis centers for the base process.
+# - `base_sigma`: A prior for the standard deviation of the base process.
+# - `kernel`: The convolution kernel type.
+# - `lengthscale_model`: A nested `random()` call defining the model for the
+#   spatially varying lengthscale. This nested model must be a continuous smoother.
+m_pc = @bstm(
+    likelihood(y, family=gaussian) ~
+        intercept() +
+        random(s_x, s_y,
+            model = :process_convolution,
+            n_knots = 25,
+            base_sigma = Exponential(1.0),
+            kernel = "se",
+            # This nested model defines the process for the log-lengthscale field.
+            # We model it as a simple isotropic Gaussian Process.
+            lengthscale_model = random(s_x, s_y,
+                model = :gp,
+                lengthscale = 0.5,
+                sigma = Exponential(0.5)
+            )
+        ),
+    df_pc,
+    # The ProcessConvolution component does not use a global W matrix.
+    verbose = false
+);
+
+# Sample from the posterior. For a real analysis, more samples would be needed.
+println("Sampling from the posterior (this may take a moment)...")
+chain_pc = bstm_sample_nowarn(m_pc, NUTS(0.65), 500; progress=true)
+
+println("Sampling complete.")
+display(chain_pc)
+
+
+# --- 4. Analyze and Visualize Results ---
+println("\nExtracting and visualizing results...")
+
+# Use model_results_comprehensive to get posterior predictions.
+res = model_results_comprehensive(m_pc, chain_pc);
+
+# a. Extract the main non-stationary spatial effect
+# The key is based on the variables used: `s_x_s_y`
+main_effect_key = Symbol("s_x_s_y")
+est_field = res.pstats.effects[main_effect_key].mean
+
+# b. Extract the estimated lengthscale field from the nested model
+# The key for the nested model is constructed from the main key plus "_ls"
+ls_model_key = Symbol("s_x_s_y_ls")
+# The output of the nested GP model is the log-lengthscale, so we exponentiate it.
+est_ls_field = exp.(res.pstats.effects[ls_model_key].mean)
+
+# c. Reshape fields into grids for heatmap plotting
+grid_dim = Int(sqrt(nrow(df_pc)))
+true_field_grid = reshape(true_field, grid_dim, grid_dim)
+est_field_grid = reshape(est_field, grid_dim, grid_dim)
+true_ls_grid = reshape(true_ls, grid_dim, grid_dim)
+est_ls_grid = reshape(est_ls_field, grid_dim, grid_dim)
+
+# d. Create plots
+p1 = heatmap(true_field_grid', title="True Latent Field", c=:viridis, clims=extrema(true_field))
+p2 = heatmap(est_field_grid', title="Estimated Latent Field", c=:viridis, clims=extrema(true_field))
+p3 = heatmap(true_ls_grid', title="True Lengthscale Field", c=:plasma, clims=extrema(true_ls))
+p4 = heatmap(est_ls_grid', title="Estimated Lengthscale Field", c=:plasma, clims=extrema(true_ls))
+
+plot(p1, p2, p3, p4, layout=(2, 2), size=(1000, 800))
+
+
+```
+
+
 
 ### Demonstration of Kriging implementation
 
@@ -2275,9 +2431,711 @@ display(chain_dd_effort)
 
 ```
 
+Delay differnce model at each spatial node: 
+
+```julia
+# Ensure all necessary packages are loaded
+using bstm, Turing, Distributions, DataFrames, Random, Plots, SparseArrays
+
+# --- 1. Generate Synthetic Spatiotemporal Data ---
+# We will simulate a true population trajectory based on the delay-difference model
+# and then generate noisy observations from it.
+
+function generate_delay_difference_data(;
+    s_N=15, t_N=20, r_true=0.6, K_true=200.0, M_nat_true=0.2, obs_error=0.3
+)
+    # a. Define spatial grid and adjacency matrix
+    grid_dim = Int(sqrt(s_N))
+    s_coords = hcat(repeat(1:grid_dim, inner=grid_dim), repeat(1:grid_dim, outer=grid_dim))
+    W = spzeros(Int, s_N, s_N)
+    for i in 1:s_N, j in (i+1):s_N
+        dist = sqrt(sum((s_coords[i, :] .- s_coords[j, :]).^2))
+        if dist <= 1.5; W[i, j] = W[j, i] = 1; end
+    end
+
+    # b. Define true parameters and initial state
+    N_true = zeros(s_N, t_N)
+    N_true[:, 1] .= K_true * 0.8 # Start population at 80% of K
+
+    # c. Simulate catch data (e.g., a pulse in the middle of the time series)
+    catch_data = zeros(s_N, t_N)
+    catch_pulse_years = (t_N ÷ 2 - 2):(t_N ÷ 2 + 2)
+    catch_data[:, catch_pulse_years] .= K_true * 0.1
+
+    # d. Simulate the true population dynamics over time
+    for t in 1:(t_N - 1)
+        biomass_after_catch = max.(0, N_true[:, t] .- catch_data[:, t])
+        biomass_after_mortality = biomass_after_catch .* exp(-M_nat_true)
+        
+        # Recruitment (logistic growth based on previous year's biomass)
+        recruitment = r_true .* N_true[:, t] .* (1.0 .- N_true[:, t] ./ K_true)
+        
+        # Add process noise (e.g., environmental stochasticity)
+        process_noise = rand(Normal(0, 0.05 * K_true), s_N)
+        
+        N_true[:, t+1] = max.(0, biomass_after_mortality .+ recruitment .+ process_noise)
+    end
+
+    # e. Generate noisy observations (e.g., from a survey)
+    y_obs_flat = vec(N_true) .+ rand(Normal(0, obs_error * K_true), s_N * t_N)
+    y_obs_flat = max.(0, y_obs_flat) # Ensure observations are non-negative
+
+    # f. Assemble the DataFrame
+    df = DataFrame(
+        y = y_obs_flat,
+        s_idx = repeat(1:s_N, outer=t_N),
+        year = repeat(1:t_N, inner=s_N),
+        catch_data = vec(catch_data)
+    )
+    
+    return df, W, N_true
+end
+
+println("Generating synthetic data for the delay-difference model...")
+df_dd, W_dd, N_true = generate_delay_difference_data()
+println("Data generation complete.")
 
 
+# --- 2. Define and Run the bstm Model ---
+println("\nDefining the bstm model with a dynamics() component...")
 
+# The `dynamics()` module for delay_difference requires:
+# - Spatial and temporal index variables (`s_idx`, `year`).
+# - `model=:delay_difference`.
+# - Priors for the biological parameters: `r`, `K`, `M_nat`.
+# - A way to specify removals, here via `catch_data_col=:catch_data`.
+m_dd = @bstm(
+    likelihood(y, family=gaussian) ~
+        intercept() +
+        dynamics(s_idx, year,
+            model = :delay_difference,
+            r = LogNormal(log(0.5), 0.5),
+            K = LogNormal(log(200.0), 0.5),
+            M_nat = LogNormal(log(0.2), 0.5),
+            catch_data_col = :catch_data
+        ),
+    df_dd,
+    W = W_dd,
+    verbose = false # Suppress model code printing for this example
+);
+
+# Sample from the posterior. For a real analysis, more samples would be needed.
+println("Sampling from the posterior (this may take a moment)...")
+chain_dd = bstm_sample_nowarn(m_dd, NUTS(0.65), 1000; progress=true)
+
+println("Sampling complete.")
+display(chain_dd)
+
+
+# --- 3. Analyze and Visualize Results ---
+println("\nExtracting and visualizing results...")
+
+# Use model_results_comprehensive to get posterior predictions.
+# The effect of the dynamics component is automatically reconstructed.
+res = model_results_comprehensive(m_dd, chain_dd);
+
+# Extract the posterior mean of the latent population dynamics.
+# The effect is stored under a key like `:dynamics_s_idx_year`.
+dynamics_effect_key = first(filter(k -> startswith(string(k), "dynamics"), keys(res.pstats.effects)))
+pred_mean_flat = res.pstats.effects[dynamics_effect_key].mean
+pred_mean = reshape(pred_mean_flat, size(N_true))
+
+# Calculate the average population trend across all spatial locations
+true_avg_trend = mean(N_true, dims=1)[:]
+pred_avg_trend = mean(pred_mean, dims=1)[:]
+
+# Plot the results
+p = plot(
+    1:size(N_true, 2), true_avg_trend,
+    lw=3, color=:black, ls=:dash,
+    label="True Average Population",
+    title="Delay-Difference Parameter Estimation with bstm",
+    xlabel="Year", ylabel="Average Population Biomass"
+)
+
+# Add the posterior predictive mean for the average population trend
+plot!(p, 1:size(N_true, 2), pred_avg_trend,
+      lw=2, color=:blue, label="Posterior Mean Population")
+
+# Add credible intervals for the average trend
+# Note: This requires summarizing the full posterior samples, which is more involved.
+# For simplicity, this example only plots the mean.
+
+# Add the noisy observations for a single spatial location for context
+scatter!(p, df_dd.year[df_dd.s_idx .== 1], df_dd.y[df_dd.s_idx .== 1],
+         label="Observations (Site 1)", color=:red, alpha=0.4, markersize=3)
+
+display(p)
+
+println("\nExample complete. The plot shows the model's ability to recover the underlying population trend from noisy data.")
+```
+
+
+### SciML integration
+
+```julia
+# Ensure all necessary packages are loaded, especially DifferentialEquations
+using bstm, Turing, Distributions, DifferentialEquations, DataFrames, Random, Plots
+
+# --- 1. Define the Differential Equation System ---
+# The function must follow the SciML standard signature: f(du, u, p, t)
+# It defines the change du for each state variable in u, given parameters p at time t.
+
+function lotka_volterra!(du, u, p, t)
+    # u: state variables [prey, predator]
+    # p: parameters [alpha, beta, gamma, delta]
+    x, y = u
+    α, β, γ, δ = p
+    du[1] = dx = α*x - β*x*y  # Change in prey population
+    du[2] = dy = -δ*y + γ*x*y # Change in predator population
+end
+
+# --- 2. Generate Synthetic Data ---
+# We will solve the ODE with known parameters and add noise to simulate real-world observations.
+
+# True parameters and initial conditions
+u0_true = [1.0, 0.5]
+p_true = [1.5, 1.0, 3.0, 1.0] # [α, β, γ, δ]
+tspan = (0.0, 10.0)
+solver = Tsit5() # A standard, efficient solver
+
+# Solve the ODE to get the ground truth
+prob_true = ODEProblem(lotka_volterra!, u0_true, tspan, p_true)
+sol_true = solve(prob_true, solver, saveat=0.1)
+
+# Extract the true prey population and add observation noise
+t_obs = sol_true.t
+prey_true = sol_true[1, :]
+prey_obs = prey_true .+ rand(Normal(0, 0.2), length(prey_true))
+
+# Create a DataFrame for the bstm model
+df = DataFrame(
+    time = t_obs,
+    prey_observed = prey_obs
+);
+
+# --- 3. Define and Run the bstm Model ---
+# We now define a model to recover the parameters (α, β, γ, δ) and initial conditions (u0).
+
+println("Defining the bstm model with a sciml() component...")
+
+# The `sciml()` module requires:
+# - A time variable (`time`).
+# - `model_func`: The name of our ODE function.
+# - `u0_prior`: A prior for the initial conditions.
+# - `p_priors`: A NamedTuple of priors for the ODE parameters.
+# - `tspan`: The integration time span.
+# - `solver`: The DE solver to use.
+
+m_sciml = @bstm(
+    likelihood(prey_observed, family=gaussian) ~
+        sciml(time,
+            model_func = :lotka_volterra!,
+            de_type = :ODE,
+            u0_prior = MvNormal([1.0, 1.0], 0.5),
+            p_priors = (
+                alpha = LogNormal(log(1.5), 0.5),
+                beta  = LogNormal(log(1.0), 0.5),
+                gamma = LogNormal(log(3.0), 0.5),
+                delta = LogNormal(log(1.0), 0.5)
+            ),
+            tspan = tspan,
+            solver = solver,
+            saveat = 0.1
+        ),
+    df,
+    verbose = false # Suppress model code printing for this example
+);
+
+# Sample from the posterior. For a real analysis, more samples would be needed.
+println("Sampling from the posterior...")
+chain_sciml = bstm_sample_nowarn(m_sciml, NUTS(500, 0.65), 1000; progress=true)
+
+println("Sampling complete.")
+display(chain_sciml)
+
+
+# --- 4. Analyze and Visualize Results ---
+
+# Use model_results_comprehensive to get posterior predictions
+# The `sciml` component's effect is automatically reconstructed.
+res = model_results_comprehensive(m_sciml, chain_sciml);
+
+# Plot the results
+p = plot(
+    sol_true,
+    lw=3, color=[:blue :red], ls=:dash,
+    label=["True Prey" "True Predator"],
+    title="Lotka-Volterra Parameter Estimation with bstm",
+    xlabel="Time", ylabel="Population"
+)
+
+# Add the noisy observations
+scatter!(p, t_obs, prey_obs, label="Observed Prey", color=:blue, alpha=0.5, markersize=3)
+
+# Add the posterior predictive mean for the prey population
+# The effect of the sciml component is stored under its key (e.g., :sciml_time)
+plot!(p, t_obs, res.pstats.effects.sciml_time.mean,
+      ribbon=(res.pstats.effects.sciml_time.mean .- res.pstats.effects.sciml_time.lower, res.pstats.effects.sciml_time.upper .- res.pstats.effects.sciml_time.mean),
+      fillalpha=0.2, color=:green, lw=2, label="Posterior Mean (Prey)")
+
+display(p)
+``` 
+
+And a delay differenital model:
+
+```julia
+# Ensure all necessary packages are loaded
+using bstm, Turing, Distributions, DifferentialEquations, DataFrames, Random, Plots
+
+# --- 1. Define the Delay Differential Equation System ---
+# The function must follow the SciML DDE signature: f(du, u, h, p, t)
+# - u: current state N(t)
+# - h: history function to access past states, e.g., h(p, t-τ)
+# - p: parameters [r, K, τ]
+# - t: current time
+
+function delayed_logistic!(du, u, h, p, t)
+    r, K, τ = p
+    N = u[1]
+    
+    # Get the population at the delayed time t-τ
+    # h(p, t-τ) returns a vector of states; we take the first element.
+    N_past = h(p, t - τ)[1]
+    
+    # The delayed logistic equation
+    du[1] = r * N * (1.0 - N_past / K)
+end
+
+# --- 2. Generate Synthetic Data ---
+# We will solve the DDE with known parameters and add noise to simulate real-world observations.
+
+println("Generating synthetic data from the delayed logistic DDE...")
+
+# True parameters
+p_true = [0.4, 100.0, 1.0] # [r, K, τ]
+tspan = (0.0, 50.0)
+
+# Define the history function for the true model (constant history before t=0)
+h_true(p, t) = [10.0] 
+u0_true = [10.0] # Initial value at t=0
+
+# Define the DDE problem
+# For DDEs, we need to specify the dependent-variable lags, which is τ (p[3])
+prob_true = DDEProblem(delayed_logistic!, u0_true, h_true, tspan, p_true;
+                       dependent_lags = (p, t) -> p[3])
+
+# Use a DDE-compatible solver
+solver = MethodOfSteps(Tsit5())
+
+# Solve the DDE to get the ground truth
+sol_true = solve(prob_true, solver, saveat=0.5)
+
+# Extract the true population and add observation noise
+t_obs = sol_true.t
+N_true = sol_true[1, :]
+N_obs = N_true .+ rand(Normal(0, 5.0), length(N_true))
+
+# Create a DataFrame for the bstm model
+df = DataFrame(
+    time = t_obs,
+    N_observed = N_obs
+);
+println("Data generation complete.")
+
+
+# --- 3. Define and Run the bstm Model ---
+# We now define a model to recover the parameters (r, K, τ) and the constant history value.
+
+println("\nDefining the bstm model with a sciml() component for DDE...")
+
+# The `sciml()` module for a DDE requires:
+# - `de_type = :DDE`.
+# - `u0_prior`: A prior for the constant history value.
+# - `p_priors`: Priors for the DDE parameters, including the delay `tau`.
+# - `solver`: A DDE-compatible solver.
+# - `dependent_lags`: A function specifying the delays.
+
+m_dde = @bstm(
+    likelihood(N_observed, family=gaussian) ~
+        sciml(time,
+            model_func = :delayed_logistic!,
+            de_type = :DDE,
+            # Prior for the constant history value before t=0
+            u0_prior = Normal(10.0, 5.0),
+            # Priors for the DDE parameters [r, K, τ]
+            p_priors = (
+                r   = LogNormal(log(0.5), 0.5),
+                K   = LogNormal(log(100.0), 0.5),
+                tau = LogNormal(log(1.0), 0.2) # Delay parameter must be positive
+            ),
+            tspan = tspan,
+            solver = solver,
+            # This function tells the solver which parameter corresponds to the delay
+            dependent_lags = (p, t) -> p.tau,
+            saveat = 0.5
+        ),
+    df,
+    verbose = false # Suppress model code printing for this example
+);
+
+# Sample from the posterior. For a real analysis, more samples would be needed.
+println("Sampling from the posterior (this may take a moment)...")
+chain_dde = bstm_sample_nowarn(m_dde, NUTS(0.65), 1000; progress=true)
+
+println("Sampling complete.")
+display(chain_dde)
+
+
+# --- 4. Analyze and Visualize Results ---
+println("\nExtracting and visualizing results...")
+
+# Use model_results_comprehensive to get posterior predictions.
+# The effect of the sciml component is automatically reconstructed.
+res = model_results_comprehensive(m_dde, chain_dde);
+
+# Plot the results
+p = plot(
+    sol_true.t, sol_true[1,:],
+    lw=3, color=:black, ls=:dash,
+    label="True Population",
+    title="Delayed Logistic DDE Parameter Estimation with bstm",
+    xlabel="Time", ylabel="Population (N)"
+)
+
+# Add the noisy observations
+scatter!(p, t_obs, N_obs, label="Observed Population", color=:red, alpha=0.5, markersize=3)
+
+# Add the posterior predictive mean for the population
+# The effect of the sciml component is stored under its key (e.g., :sciml_time)
+plot!(p, t_obs, res.pstats.effects.sciml_time.mean,
+      ribbon=(res.pstats.effects.sciml_time.mean .- res.pstats.effects.sciml_time.lower, res.pstats.effects.sciml_time.upper .- res.pstats.effects.sciml_time.mean),
+      fillalpha=0.2, color=:blue, lw=2, label="Posterior Mean Population")
+
+display(p)
+
+println("\nExample complete. The plot shows the model's ability to recover the underlying population dynamics from noisy data.")
+
+
+```
+
+# Multistage delay differntial model with habitat 
+
+```julia
+# --- 1. Setup and Package Loading ---
+using bstm
+using Turing
+using Distributions
+using DifferentialEquations
+using DataFrames
+using Random
+using Plots
+using Interpolations
+
+# --- 2. Define DDE System and Global Constants ---
+# Define global constants for the DDE function. This is a practical workaround
+# for passing fixed data/parameters to the DDE within the bstm framework.
+const PM = (
+    nS = 6,  # Number of state variables (size classes)
+    nB = 3,  # Number of birth lag years
+    nG = 4,  # Number of growth transitions
+    BLY = [7.0, 8.0, 9.0] # Birth lag years
+);
+
+# Define a dummy habitat suitability function (hsa) for this example.
+# In a real scenario, this would be an interpolation of actual data.
+dummy_hsa(t, idxs) = ones(length(idxs));
+const solver_params = (
+    abstol = 1e-9,
+    hsa = dummy_hsa
+);
+
+# Define the DDE function. It must have the signature f(du, u, h, p, t).
+# This version is adapted to be compatible with Automatic Differentiation (AD).
+function size_structured_dde!(du, u, h, p, t)
+    # Unpack parameters. These will be `Dual` numbers during AD.
+    b5, b6, K, d, d2, v = p
+
+    # Determine the element type from the state vector `u`. This is crucial for AD.
+    T = eltype(u)
+
+    # Ensure state variables are non-negative for biological realism.
+    ux = max.(T(solver_params.abstol), u)
+
+    # Retrieve historical values for recruitment calculation using the history function `h`.
+    trg = [h(p, t - j)[6] for j in PM.BLY]
+
+    # Calculate growth transitions between size classes with a 1-year lag.
+    tr = v .* h(p, t - 1.0)[2:5]
+
+    # Calculate density-dependent and habitat-dependent mortality.
+    dh = d2 .* ux ./ solver_params.hsa(t, 1:6)
+    dr = d .* ux .+ dh .* ux
+
+    # Define the change for each of the 6 state variables (size classes).
+    du[1] = tr[1] * K[2] / K[1] - dr[1]
+    du[2] = tr[2] * K[3] / K[2] - tr[1] - dr[2]
+    du[3] = tr[3] * K[4] / K[3] - tr[2] - dr[3]
+    du[4] = tr[4] * K[5] / K[4] - tr[3] - dr[4]
+    du[5] = b5' * trg * K[6] / K[5] - tr[4] - dr[5]
+    du[6] = b6' * trg - dr[6]
+end
+
+# --- 3. Generate Synthetic Data ---
+println("Generating synthetic data from the size-structured DDE...")
+
+# Define true parameters for the simulation
+p_true = (
+    b5 = [1.1, 1.0, 0.9],
+    b6 = [1.2, 1.1, 1.0],
+    K  = [150.0, 160.0, 170.0, 180.0, 190.0, 200.0],
+    d  = [0.15, 0.11, 0.14, 0.17, 0.16, 0.19],
+    d2 = [0.4, 0.4, 0.4, 0.4, 0.4, 0.4],
+    v  = [0.65, 0.68, 0.61, 0.79]
+);
+
+# Define true initial conditions and history function
+u0_true = [100.0, 110.0, 120.0, 130.0, 140.0, 150.0]
+h_true(p, t) = u0_true # Constant history before t=0
+tspan = (0.0, 25.0)
+constant_lags = [1.0; PM.BLY]
+
+# Define the DDE problem
+prob_true = DDEProblem(size_structured_dde!, u0_true, h_true, tspan, p_true; constant_lags=constant_lags)
+
+# Use a DDE-compatible solver
+solver = MethodOfSteps(Tsit5())
+
+# Solve the DDE to get the ground truth trajectories
+sol_true = solve(prob_true, solver, saveat=1.0)
+
+# Extract true trajectories and add observation noise
+t_obs = sol_true.t
+# Create a matrix where each column is a state variable's trajectory
+true_trajectories = hcat([sol_true[i, :] for i in 1:PM.nS]...)
+# Add Gaussian noise to simulate observations
+observed_data = true_trajectories .+ rand(Normal(0, 10.0), size(true_trajectories))
+
+# Create a DataFrame for the bstm model
+df = DataFrame(observed_data, [:M0, :M1, :M2, :M3, :M4, :f_mat])
+df.time = t_obs
+println("Data generation complete.")
+
+# --- 4. Define and Run the bstm Model ---
+println("\nDefining the bstm model with a sciml() component for the DDE...")
+
+# The `sciml()` module requires:
+# - `de_type = :DDE`.
+# - `u0_prior`: A prior for the constant history value.
+# - `p_priors`: Priors for the DDE parameters.
+# - `solver`: A DDE-compatible solver.
+# - `constant_lags`: A vector of the time delays.
+m_dde = @bstm(
+    likelihood(M0 + M1 + M2 + M3 + M4 + f_mat, family=gaussian) ~
+        sciml(time,
+            model_func = :size_structured_dde!,
+            de_type = :DDE,
+            # Prior for the initial conditions (a 6-element vector)
+            u0_prior = MvNormal(ones(PM.nS) .* 120.0, 20.0),
+            # Priors for the DDE parameters
+            p_priors = (
+                b5 = filldist(LogNormal(log(1.0), 0.2), PM.nB),
+                b6 = filldist(LogNormal(log(1.1), 0.2), PM.nB),
+                K  = filldist(LogNormal(log(175.0), 0.2), PM.nS),
+                d  = filldist(LogNormal(log(0.15), 0.2), PM.nS),
+                d2 = filldist(LogNormal(log(0.4), 0.2), PM.nS),
+                v  = filldist(LogNormal(log(0.7), 0.2), PM.nG)
+            ),
+            tspan = tspan,
+            solver = solver,
+            constant_lags = constant_lags,
+            saveat = 1.0
+        ),
+    df,
+    verbose = false # Suppress model code printing for this example
+);
+
+# Sample from the posterior. For a real analysis, more samples would be needed.
+println("Sampling from the posterior (this may take a moment)...")
+chain_dde = bstm_sample_nowarn(m_dde, NUTS(0.65), 500; progress=true)
+println("Sampling complete.")
+display(chain_dde)
+
+# --- 5. Analyze and Visualize Results ---
+println("\nExtracting and visualizing results...")
+
+# Use model_results_comprehensive to get posterior predictions.
+res = model_results_comprehensive(m_dde, chain_dde);
+
+# The effect of the sciml component is a matrix where each column is a state variable.
+# We can plot the results for one of the state variables, e.g., the first one (M0).
+sciml_effect = res.pstats.effects.sciml_time
+m0_mean = sciml_effect.mean[:, 1]
+m0_lower = sciml_effect.lower[:, 1]
+m0_upper = sciml_effect.upper[:, 1]
+
+# Plot the results for the first state variable
+p = plot(
+    sol_true.t, sol_true[1,:],
+    lw=3, color=:black, ls=:dash,
+    label="True Population (M0)",
+    title="Size-Structured DDE Parameter Estimation with bstm",
+    xlabel="Time", ylabel="Population"
+)
+scatter!(p, t_obs, df.M0, label="Observed Population (M0)", color=:red, alpha=0.5, markersize=3)
+plot!(p, t_obs, m0_mean,
+      ribbon=(m0_mean .- m0_lower, m0_upper .- m0_mean),
+      fillalpha=0.2, color=:blue, lw=2, label="Posterior Mean (M0)")
+
+display(p)
+println("\nExample complete. The plot shows the model's ability to recover the underlying dynamics.")
+
+
+```
+
+Jump process (SIR):
+
+```julia
+# --- 1. Setup and Package Loading ---
+using bstm
+using Turing
+using Distributions
+using DifferentialEquations
+using DataFrames
+using Random
+using Plots
+
+# --- 2. Define the Jump Process System ---
+# We need to define the rate of each jump and its effect on the state variables.
+
+# a. Define the rate and effect for the INFECTION jump (S -> I)
+# The rate is β * S * I / N, where N is the total population.
+rate_infection(u, p, t) = p[1] * u[1] * u[2] / sum(u)
+# The effect is that S decreases by 1 and I increases by 1.
+function affect_infection!(integrator)
+    integrator.u[1] -= 1 # S -= 1
+    integrator.u[2] += 1 # I += 1
+end
+jump_infection = ConstantRateJump(rate_infection, affect_infection!)
+
+# b. Define the rate and effect for the RECOVERY jump (I -> R)
+# The rate is γ * I.
+rate_recovery(u, p, t) = p[2] * u[2]
+# The effect is that I decreases by 1 and R increases by 1.
+function affect_recovery!(integrator)
+    integrator.u[2] -= 1 # I -= 1
+    integrator.u[3] += 1 # R += 1
+end
+jump_recovery = ConstantRateJump(rate_recovery, affect_recovery!)
+
+# c. Create the wrapper function that bstm will call.
+# This function must accept u0, p, and tspan and return a JumpProblem.
+function create_sir_jump_problem(u0, p, tspan)
+    # The underlying problem is discrete, as there's no continuous change between jumps.
+    dprob = DiscreteProblem(u0, tspan, p)
+    
+    # The JumpProblem combines the discrete problem with the defined jumps.
+    # We use the Direct method, which is an efficient way to choose the next jump.
+    jprob = JumpProblem(dprob, Direct(), jump_infection, jump_recovery)
+    
+    return jprob
+end
+
+# --- 3. Generate Synthetic Data ---
+println("Generating synthetic data from the stochastic SIR model...")
+
+# True parameters for the simulation
+p_true_jump = [0.1, 0.05] # [β, γ]
+u0_true_jump = [990.0, 10.0, 0.0] # [S, I, R]
+tspan_jump = (0.0, 150.0)
+
+# Create the true problem using our constructor function
+prob_true_jump = create_sir_jump_problem(u0_true_jump, p_true_jump, tspan_jump)
+
+# Use a jump-specific algorithm (Stochastic Simulation Algorithm)
+solver_jump = SSAStepper()
+
+# Solve to get the ground truth trajectory
+sol_true_jump = solve(prob_true_jump, solver_jump, saveat=1.0)
+
+# Extract the 'Infected' compartment and add observation noise
+t_obs_jump = sol_true_jump.t
+infected_true = sol_true_jump[2, :]
+infected_obs = infected_true .+ rand(Normal(0, 5.0), length(infected_true))
+infected_obs = max.(0, infected_obs) # Ensure observations are non-negative
+
+# Create a DataFrame for the bstm model
+df_jump = DataFrame(
+    time = t_obs_jump,
+    infected_observed = infected_obs
+)
+println("Data generation complete.")
+
+# --- 4. Define and Run the bstm Model ---
+println("\nDefining the bstm model with a sciml() component for a Jump Process...")
+
+# The `sciml()` module for a Jump process requires:
+# - `de_type = :Jump`.
+# - `model_func`: The name of our JumpProblem constructor function.
+# - `u0_prior`: A prior for the initial state vector [S₀, I₀, R₀].
+# - `p_priors`: Priors for the jump rate parameters [β, γ].
+# - `solver`: A jump-compatible solver.
+m_jump = @bstm(
+    likelihood(infected_observed, family=gaussian) ~
+        sciml(time,
+            model_func = :create_sir_jump_problem,
+            de_type = :Jump,
+            u0_prior = MvNormal([990.0, 10.0, 0.0], 10.0),
+            p_priors = (
+                beta = LogNormal(log(0.1), 0.5),
+                gamma = LogNormal(log(0.05), 0.5)
+            ),
+            tspan = tspan_jump,
+            solver = solver_jump,
+            saveat = 1.0
+        ),
+    df_jump,
+    verbose = false # Suppress model code printing for this example
+);
+
+# Sample from the posterior. For a real analysis, more samples would be needed.
+println("Sampling from the posterior (this may take a moment)...")
+chain_jump = bstm_sample_nowarn(m_jump, NUTS(0.65), 500; progress=true)
+
+println("Sampling complete.")
+display(chain_jump)
+
+# --- 5. Analyze and Visualize Results ---
+println("\nExtracting and visualizing results...")
+
+# Use model_results_comprehensive to get posterior predictions.
+# The effect of the sciml component is automatically reconstructed.
+res = model_results_comprehensive(m_jump, chain_jump);
+
+# Plot the results
+p = plot(
+    sol_true_jump.t, sol_true_jump[2,:],
+    lw=3, color=:black, ls=:dash,
+    label="True Infected Count",
+    title="Stochastic SIR Model Estimation with bstm",
+    xlabel="Time", ylabel="Number of Individuals"
+)
+
+# Add the noisy observations
+scatter!(p, t_obs_jump, infected_obs, label="Observed Infected", color=:red, alpha=0.5, markersize=3)
+
+# Add the posterior predictive mean for the 'Infected' population
+# The effect of the sciml component is stored under its key (e.g., :sciml_time)
+# The output is a matrix where columns correspond to state variables. We take the 2nd column for 'Infected'.
+plot!(p, t_obs_jump, res.pstats.effects.sciml_time.mean[:, 2],
+      ribbon=(res.pstats.effects.sciml_time.mean[:, 2] .- res.pstats.effects.sciml_time.lower[:, 2], res.pstats.effects.sciml_time.upper[:, 2] .- res.pstats.effects.sciml_time.mean[:, 2]),
+      fillalpha=0.2, color=:blue, lw=2, label="Posterior Mean (Infected)")
+
+display(p)
+
+println("\nExample complete. The plot shows the model's ability to recover the underlying stochastic dynamics from noisy data.")
+
+```
 
 ### Custom Model Component
 

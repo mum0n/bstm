@@ -296,6 +296,29 @@ struct NonStationaryVariance <: ComponentOperator
 end
 
 
+"""
+    ProcessConvolution <: ComponentModel
+
+A component for modeling a non-stationary spatial process using process convolution.
+
+This is achieved by allowing kernel parameters (currently the `lengthscale`) to vary
+spatially. The spatial variation of the lengthscale is itself modeled by a nested
+`ComponentModel`, allowing for flexible and complex non-stationary covariance structures.
+
+# Fields
+- `n_knots::Int`: The number of knots (or basis centers) for the convolution process.
+- `base_sigma::UnivariateDistribution`: The prior for the standard deviation of the base process at the knots.
+- `kernel::String`: The family of the convolution kernel (e.g., "se", "matern32").
+- `lengthscale_model::ComponentModel`: A nested `ComponentModel` that defines the spatially varying lengthscale field.
+"""
+struct ProcessConvolution <: ComponentModel
+    n_knots::Int
+    base_sigma::UnivariateDistribution
+    kernel::String
+    lengthscale_model::ComponentModel
+end
+
+ 
  
 abstract type AbstractModelArchitecture end
 struct UnivariateArchitecture <: AbstractModelArchitecture end
@@ -1644,6 +1667,13 @@ function bstm_config(formula::String, data::DataFrame; calling_module::Module=Ma
 end
 
 
+
+# Version 1.0.0 (2026-08-06)
+# Purpose: Generates a NamedTuple of full variable names for a given component.
+# Rationale: This utility function centralizes the naming convention for all parameters
+#            associated with a model component, ensuring consistency across the framework.
+#            It handles suffixes for multivariate models and prefixes for different parameter types.
+# Assumptions: The component specification `spec` contains a unique `key`.
 function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
     base_key = string(spec.key)
     full_key = isempty(prefix) ? base_key : "$(prefix)_$(base_key)"
@@ -1657,17 +1687,11 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
     
     all_prefixes = [
         :sigma, :rho, :rho1, :rho2, :kappa, :ls, :range, :period, :amplitude, :phase,
-        :velocity, :diffusion,
-        :pca_sd, :pdef_sd,
-        :L_corr, :sigma_effects,
+        :velocity, :diffusion, :pca_sd, :pdef_sd, :L_corr, :sigma_effects,
         :r, :K, :q, :M_nat, :alpha, :beta, :gamma, :delta,
         :raw, :innov, :latent, :struct, :iid, :beta_cos, :beta_sin, :rho_field,
-        :W, :b, # RFF
-        :v_raw, :factors_flat, # Eigen
-        :thresh_raw, # TAR
-        :W1, :b1, :W2, # AdaptiveSmooth
-        :amplitude_raw, # Harmonic
-        :innov_predator # Lotka-Volterra
+        :W, :b, :v_raw, :factors_flat, :thresh_raw, :W1, :b1, :W2, :amplitude_raw,
+        :innov_predator
     ]
 
     for p in all_prefixes
@@ -1741,16 +1765,16 @@ end
 
 
 
-
+# Version 1.0.2 (2026-08-06)
+# Purpose: Pre-computes a matrix factorization for static components.
+# Rationale: This version reverts to using `cholesky` factorization instead of `lu`.
+#            The `CanonicalIndexError` that previously prompted the switch to `lu` is now
+#            addressed in the code generator by explicitly creating a `SparseMatrixCSC`
+#            from the Cholesky factor before solving. This change restores the use of the
+#            more efficient and appropriate Cholesky decomposition for symmetric
+#            positive-definite precision matrices.
+# Assumptions: The input `Q_template` is a sparse matrix representing a valid precision structure.
 function _precompute_static_components!(M::Dict)
-    # Purpose: Pre-computes the Cholesky factorization for static components.
-    # Rationale: Moves constant computations out of the MCMC loop to improve sampling speed.
-    #            A component is "static" if its precision matrix structure does not depend on a
-    #            hyperparameter that is sampled within the model (e.g., a `rho` parameter).
-    # v1.0.1 (2026-07-27) - Corrected access to nested component objects.
-    # Inputs:
-    #   - M: The model configuration dictionary, which is mutated.
-    # Outputs: None.
     noise = M[:noise]
     new_components = []
     # Define component types that do not have dynamic structure parameters like `rho`.
@@ -1760,23 +1784,17 @@ function _precompute_static_components!(M::Dict)
         current_spec = spec_in
         m_obj = current_spec.component_obj
 
-        # --- v1.0.0 (2026-07-20) ---
-        # Rationale: This block is added to correctly handle wrapper components like
-        #            MixedComponent and SVCComponent. It checks if their *inner* model
-        #            is static. If so, it pre-computes the Cholesky factor and attaches
-        #            it to the wrapper's spec. This resolves a FieldError where the
-        #            code generator for the inner model would look for a `cholesky_factor`
-        #            on the wrapper's spec, which didn't exist.
         if m_obj isa MixedComponent || m_obj isa SVCComponent
             inner_model = m_obj.model
             is_inner_static = any(T -> inner_model isa T, static_component_types)
             if is_inner_static && !isnothing(current_spec.Q_template) && size(current_spec.Q_template, 1) > 0
                 try
                     Q_concrete = sparse(current_spec.Q_template)
+                    # Revert to cholesky
                     F = cholesky(Symmetric(Q_concrete + noise * I))
                     final_spec = merge(current_spec, (is_static=true, cholesky_factor=F))
                     push!(new_components, final_spec)
-                    continue # Proceed to the next component in the loop
+                    continue
                 catch e
                     @warn "Cholesky factorization failed for static inner model in $(current_spec.key). Reverting to dynamic computation. Error: $e"
                 end
@@ -1786,13 +1804,13 @@ function _precompute_static_components!(M::Dict)
         if m_obj isa ComposedComponent && m_obj.operator == :pipe
             state_spec = get(current_spec.hyper, :state_spec, nothing)
             if !isnothing(state_spec)
-                # The state component is the second element in a `dynamic |> state` pipe.
                 state_m_obj = m_obj.components[2]
                 is_state_static = any(T -> state_m_obj isa T, static_component_types)
 
                 if is_state_static && !isnothing(state_spec.Q_template) && size(state_spec.Q_template, 1) > 0
                     try
                         Q_concrete = sparse(state_spec.Q_template)
+                        # Revert to cholesky
                         F = cholesky(Symmetric(Q_concrete + noise * I))
                         new_state_spec = merge(state_spec, (is_static=true, cholesky_factor=F))
                         new_hyper = merge(current_spec.hyper, (state_spec=new_state_spec,))
@@ -1804,13 +1822,12 @@ function _precompute_static_components!(M::Dict)
             end
         end
 
-        # Now check the main component object of the (potentially updated) current_spec
         is_main_static = !(current_spec.component_obj isa ComposedComponent) && any(T -> current_spec.component_obj isa T, static_component_types)
 
         if is_main_static && !isnothing(current_spec.Q_template) && size(current_spec.Q_template, 1) > 0
             try
-                # Ensure Q_template is a concrete sparse matrix for Cholesky
                 Q_concrete = sparse(current_spec.Q_template)
+                # Revert to cholesky
                 F = cholesky(Symmetric(Q_concrete + noise * I))
                 final_spec = merge(current_spec, (is_static=true, cholesky_factor=F))
                 push!(new_components, final_spec)
@@ -1820,8 +1837,6 @@ function _precompute_static_components!(M::Dict)
                 push!(new_components, final_spec)
             end
         else
-            # For composed components or dynamic components, just add them.
-            # The is_static flag for the composed component itself remains false.
             final_spec = merge(current_spec, (is_static=get(current_spec, :is_static, false),))
             push!(new_components, final_spec)
         end
@@ -1829,8 +1844,6 @@ function _precompute_static_components!(M::Dict)
     M[:components] = new_components
 end
 
-
- 
  
 
 
@@ -3599,12 +3612,14 @@ function bstm_codegen(config::NamedTuple)
 end
 
 
+# Version 1.0.1 (2026-08-06)
+# Purpose: Maps a parsed formula module to a concrete Component object.
+# Rationale: This version adds a new branch to handle the `process_convolution` model.
+#            When `model=:process_convolution` is detected, it recursively parses and
+#            resolves the nested `lengthscale_model` component. This allows for the
+#            construction of hierarchical models where one component's parameters are
+#            governed by another latent process.
 function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, priors_dict, scheme::Symbol)
-    # Purpose: Maps a parsed formula module to a concrete Component object.
-    # Rationale: This version is updated to evaluate symbol-based parameters (like `n_age_classes=n_age_classes_ll`)
-    #            within the `dynamics()` module. This ensures that the integer value is passed to the
-    #            component constructor, resolving a `KeyError` or `MethodError` in the code generator.
-    # v1.0.5 (2026-07-31)
     m_type = module_metadata[:type]
     m_params = module_metadata[:params]
 
@@ -3737,24 +3752,14 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
         calling_mod = get(M, :calling_module, Main)
         evaluated_params = Dict{Symbol, Any}()
         for (k, v) in m_params
-            # Exclude symbols that are part of the DSL and not variables
             if k in [:model, :catch_data_col, :interaction_covariate, :output_species]
                 evaluated_params[k] = v
                 continue
             end
 
-            # Try to evaluate expressions and symbols that are defined in the calling module
             if v isa Expr || (v isa Symbol && isdefined(calling_mod, v))
-                try
-                    evaluated_params[k] = Core.eval(calling_mod, v)
-                catch e
-                    # If evaluation fails, it might be a string-like symbol, so keep it as is.
-                    if v isa Symbol
-                        evaluated_params[k] = v
-                    else
-                        error("Could not evaluate parameter `$(v)` for dynamics model '$model_name'. Error: $e")
-                    end
-                end
+                try; evaluated_params[k] = Core.eval(calling_mod, v);
+                catch e; if v isa Symbol; evaluated_params[k] = v; else; error("Could not evaluate parameter `$(v)`. Error: $e"); end; end
             else
                 evaluated_params[k] = v
             end
@@ -3778,35 +3783,53 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
         local final_code_fragment::String
         if code_fragment_val isa Symbol
             calling_mod = get(M, :calling_module, Main)
-            try
-                evaluated_val = Core.eval(calling_mod, code_fragment_val)
-                if evaluated_val isa String
-                    final_code_fragment = evaluated_val
-                else
-                    error("The `code_fragment` argument for the custom() module must be a variable containing a String, but '$(code_fragment_val)' evaluated to a '$(typeof(evaluated_val))'.")
-                end
-            catch e
-                error("Could not evaluate the variable `$(code_fragment_val)` for the `code_fragment` argument. Ensure it is defined in the calling scope. Error: $e")
-            end
-        elseif code_fragment_val isa String
-            final_code_fragment = code_fragment_val
-        elseif code_fragment_val isa Expr
-             calling_mod = get(M, :calling_module, Main)
-             try
-                evaluated_val = Core.eval(calling_mod, code_fragment_val)
-                if evaluated_val isa String
-                    final_code_fragment = evaluated_val
-                else
-                    error("The `code_fragment` argument for the custom() module must be a variable containing a String, but '$(code_fragment_val)' evaluated to a '$(typeof(evaluated_val))'.")
-                end
-            catch e
-                error("Could not evaluate the expression `$(code_fragment_val)` for the `code_fragment` argument. Error: $e")
-            end
-        else
-            error("The `code_fragment` argument must be a String or a variable/expression that evaluates to a String. Got type: $(typeof(code_fragment_val))")
-        end
+            try; final_code_fragment = Core.eval(calling_mod, code_fragment_val);
+            catch e; error("Could not evaluate `code_fragment` variable `$(code_fragment_val)`. Error: $e"); end
+        elseif code_fragment_val isa String; final_code_fragment = code_fragment_val;
+        elseif code_fragment_val isa Expr; try; final_code_fragment = Core.eval(get(M, :calling_module, Main), code_fragment_val); catch e; error("Could not evaluate `code_fragment` expression `$(code_fragment_val)`. Error: $e"); end
+        else; error("Unsupported type for `code_fragment`: $(typeof(code_fragment_val))"); end
+
+        if !(final_code_fragment isa String); error("`code_fragment` must resolve to a String. Got: $(typeof(final_code_fragment))"); end
 
         return CustomComponent(final_code_fragment, get(m_params, :params, Dict{Symbol, Any}()))
+
+    elseif m_type == :random
+        model_name_raw = get(m_params, :model, :iid)
+        model_name = Symbol(string(model_name_raw))
+
+        if model_name == :process_convolution
+            ls_model_expr = get(m_params, :lengthscale_model, nothing)
+            if isnothing(ls_model_expr) || !isa(ls_model_expr, Expr) || ls_model_expr.head != :call
+                error("`process_convolution` model requires a `lengthscale_model` argument specifying another `random()` component, e.g., `lengthscale_model=random(s_x, s_y, model=:gp)`")
+            end
+
+            inner_module_type = ls_model_expr.args[1]
+            inner_args_dict = _parse_arguments_from_expr(ls_model_expr.args[2:end])
+            inner_mod_data = Dict(:type => inner_module_type, :params => inner_args_dict, :variables => get(inner_args_dict, :vars, []))
+
+            if inner_module_type == :random && !haskey(inner_args_dict, :structure)
+                args_for_inference = copy(inner_args_dict); args_for_inference[:vars] = get(inner_mod_data, :variables, [])
+                inner_args_dict[:structure] = _infer_structure_from_args(args_for_inference)
+            end
+            inner_mod_data[:type] = get(inner_args_dict, :structure, inner_module_type)
+
+            ls_model_obj = resolve_technical_primitive(inner_mod_data, M, priors_dict, scheme)
+            m_params[:lengthscale_model_obj] = ls_model_obj
+
+            ls_model_spec = build_model(ls_model_obj, M, inner_mod_data)
+            m_params[:lengthscale_model_spec] = ls_model_spec
+
+            resolved_priors = resolve_hyperpriors("process_convolution", priors_dict, m_params, scheme, M[:calling_module])
+            constructor_func = COMPONENT_CONSTRUCTORS[:process_convolution]
+            return constructor_func(resolved_priors, m_params)
+        end
+
+        model_name_str = string(model_name)
+        resolved_priors = resolve_hyperpriors(model_name_str, priors_dict, m_params, scheme, M[:calling_module])
+        
+        if !haskey(COMPONENT_CONSTRUCTORS, model_name); error("Component model ':$model_name' is not a recognized model type."); end
+        constructor_func = COMPONENT_CONSTRUCTORS[model_name]
+        return constructor_func(resolved_priors, m_params)
 
     else
         default_model = if m_type == :spatial; haskey(M, :W) ? "bym2" : "iid"; elseif m_type == :temporal; "rw2"; else "none"; end
@@ -3821,7 +3844,7 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
 end
 
 
-# Version 1.5.2 (2026-08-06)
+# Version 1.5.3 (2026-08-06)
 # Purpose: Creates a precision matrix template and its spectral decomposition for a GMRF model.
 # Rationale: This version is updated to pre-compute and return the eigendecomposition (eigenvectors `U`
 #            and eigenvalues `L`) of the precision matrix template. This enables the use of AD-friendly
@@ -3912,20 +3935,16 @@ end
 
 
 
+# Version 1.0.0 (2026-07-21)
+# Purpose: Computes a robust scaling factor for a precision matrix from its eigenvalues.
+# Rationale: The scaling factor is the geometric mean of the non-zero eigenvalues.
+#            This method avoids using a fixed tolerance to identify zero eigenvalues,
+#            which can be sensitive to floating-point noise. Instead, it uses the known
+#            rank deficiency of the GMRF model to correctly identify the structural zero
+#            eigenvalues.
+# Assumptions: `evals` is a vector of eigenvalues from a symmetric matrix.
 function _compute_scaling_factor(evals::Vector{Float64}, rank_deficiency::Int)
-    # Purpose: Computes a robust scaling factor for a precision matrix from its eigenvalues.
-    # Rationale: The scaling factor is the geometric mean of the non-zero eigenvalues.
-    #            This method avoids using a fixed tolerance to identify zero eigenvalues,
-    #            which can be sensitive to floating-point noise. Instead, it uses the known
-    #            rank deficiency of the GMRF model to correctly identify the structural zero
-    #            eigenvalues.
-    # v1.0.0 (2026-07-21)
-    # Inputs:
-    #   - evals: A vector of eigenvalues.
-    #   - rank_deficiency: The known rank deficiency of the precision matrix (e.g., 1 for ICAR, 2 for RW2).
-    # Outputs: The scaling factor.
-    
-    # Sort eigenvalues in ascending order to easily discard the smallest ones.
+    # Sort eigenvalues in ascending order to easily discard the smallest ones, which correspond to the null space.
     sorted_evals = sort(evals)
     
     n = length(sorted_evals)
@@ -3941,6 +3960,7 @@ function _compute_scaling_factor(evals::Vector{Float64}, rank_deficiency::Int)
     end
     
     # The scaling factor is the geometric mean of the positive eigenvalues.
+    # This is a standard method for ensuring the determinant of the scaled precision matrix is 1.
     return exp(mean(log.(positive_evals)))
 end
 
@@ -4408,51 +4428,57 @@ end
 
 
 
-# Version 1.5.3 (2026-08-06)
+# Version 1.5.4 (2026-08-06)
 # Purpose: Computes the cross-covariance kernel matrix between two sets of coordinates.
-# Rationale: This version ensures type stability by explicitly casting `coords1` and `coords2` to `T`.
+# Rationale: This version is updated for improved type stability and AD-friendliness,
+#            mirroring the changes in `evaluate_kernel_matrix`. It avoids explicit
+#            casts by using `convert` and relying on Julia's promotion system, which is
+#            safer for automatic differentiation.
+# Assumptions: `coords1` and `coords2` are matrices of data points.
 function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
-    local dist_sq
     T = promote_type(eltype(coords1), eltype(coords2), typeof(param_val), eltype(ls))
-    coords1_T = T.(coords1)
-    coords2_T = T.(coords2)
+    coords1_T = convert(AbstractMatrix{T}, coords1)
+    coords2_T = convert(AbstractMatrix{T}, coords2)
+    ls_T = convert(typeof(ls) <: Real ? T : AbstractVector{T}, ls)
 
+    local dist_sq
     if ls isa AbstractVector # ARD case
-        if size(coords1_T, 2) != length(ls) || size(coords2_T, 2) != length(ls)
+        if size(coords1_T, 2) != length(ls_T) || size(coords2_T, 2) != length(ls_T)
             error("Dimension mismatch for ARD kernel: Number of coordinate dimensions does not match number of lengthscales.")
         end
         # Calculate weighted squared Euclidean distance
-        dist_sq = pairwise(SqEuclidean(), coords1_T ./ T.(ls)', coords2_T ./ T.(ls)', dims=1)
+        dist_sq = pairwise(SqEuclidean(), coords1_T ./ ls_T', coords2_T ./ ls_T', dims=1)
     else # Isotropic case
-        dist_sq = pairwise(SqEuclidean(), coords1_T, coords2_T, dims=1) ./ T(ls)^2
+        dist_sq = pairwise(SqEuclidean(), coords1_T, coords2_T, dims=1) ./ ls_T^2
     end
 
     # Gaussian / Squared Exponential
     if kernel_type == :gaussian || kernel_type == :se
-        return (T(param_val)^2) .* exp.(T(-0.5) .* dist_sq)
+        return param_val^2 .* exp.(-one(T)/2 .* dist_sq)
     
     # Exponential / Matern 1/2
     elseif kernel_type == :exponential || kernel_type == :matern12
         d = sqrt.(dist_sq)
-        return (T(param_val)^2) .* exp.(-d)
+        return param_val^2 .* exp.(-d)
     
     # Matern 3/2
     elseif kernel_type == :matern32
         d = sqrt.(dist_sq)
-        val = T(sqrt(3.0)) .* d
-        return (T(param_val)^2) .* (T(1.0) .+ val) .* exp.(-val)
+        val = sqrt(convert(T, 3.0)) .* d
+        return param_val^2 .* (one(T) .+ val) .* exp.(-val)
     
     # Matern 5/2
     elseif kernel_type == :matern52
         d = sqrt.(dist_sq)
-        val = T(sqrt(5.0)) .* d
-        return (T(param_val)^2) .* (T(1.0) .+ val .+ (val.^2 ./ T(3.0))) .* exp.(-val)
+        val = sqrt(convert(T, 5.0)) .* d
+        return param_val^2 .* (one(T) .+ val .+ (val.^2 ./ convert(T, 3.0))) .* exp.(-val)
 
     # Fallback Dispatch
     else
-        return (T(param_val)^2) .* exp.(T(-0.5) .* dist_sq)
+        return param_val^2 .* exp.(-one(T)/2 .* dist_sq)
     end
 end
+
 
 
 
@@ -4632,11 +4658,13 @@ end
 
 # Version 1.2.0 (2026-08-06)
 # Purpose: Automatically constructs an efficient composite Gibbs sampler for a `bstm` model.
-# Rationale: This version adds an `adtype` keyword argument to allow explicit selection of the
-#            automatic differentiation backend for NUTS samplers. It also includes a more
-#            comprehensive docstring to clarify the multi-stage sampler selection logic,
-#            including component grouping and default categorization, improving user
-#            understanding and resolving documentation inconsistencies.
+# Rationale: This version implements a sophisticated block-Gibbs strategy. It groups component-specific
+#            parameters (e.g., a spatial field and its hyperparameters) into a single block for joint
+#            sampling with NUTS, which is crucial for handling the "funnel" geometry in hierarchical models.
+#            For remaining parameters, it assigns specialized samplers based on their prior's support:
+#            ESS for Gaussian, Slice for bounded, and PG for discrete parameters. This hybrid approach
+#            significantly improves sampling efficiency and convergence over a single, general-purpose sampler.
+#            It also adds an `adtype` keyword to allow user control over the AD backend for NUTS.
 function get_optimal_sampler(
     model_obj::DynamicPPL.Model;
     sampler_choice=:auto,
@@ -4783,7 +4811,6 @@ function get_optimal_sampler(
         return Gibbs(sampler_assignments...)
     end
 end
-
 
 
 
@@ -6117,95 +6144,108 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Union
 end
 
 
-# Version 1.5.3 (2026-08-06)
+# Version 1.5.4 (2026-08-06)
 # Purpose: Computes the covariance kernel matrix for a given set of coordinates.
-# Rationale: This version ensures type stability by explicitly casting `coords` to `T`
-#            and `noise` to `T` before use.
+# Rationale: This version is updated for improved type stability and AD-friendliness.
+#            It replaces explicit type casts like `T(val)` with `convert(T, val)` or
+#            relies on Julia's promotion system. For example, `T(noise) * I` is replaced
+#            with `noise * I`, as `UniformScaling` correctly promotes types during addition.
+#            Numeric literals are also handled via `convert` or promotion to avoid issues
+#            with AD libraries.
+# Assumptions: `coords` contains the data points, and other arguments define the kernel.
 function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol, noise::Real; wavelet_levels=3)
     T = promote_type(eltype(coords), typeof(param_val), eltype(ls), typeof(noise))
-    coords_T = T.(coords)
+    coords_T = convert(AbstractMatrix{T}, coords)
+    ls_T = convert(typeof(ls) <: Real ? T : AbstractVector{T}, ls)
 
     local dist_sq
     if ls isa AbstractVector # ARD case
-        if size(coords_T, 2) != length(ls)
-            error("Dimension mismatch for ARD kernel: Number of coordinate dimensions ($(size(coords_T, 2))) does not match number of lengthscales ($(length(ls))).")
+        if size(coords_T, 2) != length(ls_T)
+            error("Dimension mismatch for ARD kernel: Number of coordinate dimensions ($(size(coords_T, 2))) does not match number of lengthscales ($(length(ls_T))).")
         end
         # Calculate weighted squared Euclidean distance
-        dist_sq = pairwise(SqEuclidean(), coords_T ./ T.(ls)', dims=1)
+        dist_sq = pairwise(SqEuclidean(), coords_T ./ ls_T', dims=1)
     else # Isotropic case
-        dist_sq = pairwise(SqEuclidean(), coords_T, dims=1) ./ T(ls)^2
+        dist_sq = pairwise(SqEuclidean(), coords_T, dims=1) ./ ls_T^2
     end
 
     # Gaussian / Squared Exponential
     if kernel_type == :gaussian || kernel_type == :se
-        return (T(param_val)^2) .* exp.(T(-0.5) .* dist_sq) + (T(noise) * I)
+        return param_val^2 .* exp.(-one(T)/2 .* dist_sq) .+ (noise * I)
     
     # Exponential / Matern 1/2
     elseif kernel_type == :exponential || kernel_type == :matern12 
-        d = sqrt.(dist_sq) # distance is now scaled (already done by pairwise)
-        return (T(param_val)^2) .* exp.(-d) + (T(noise) * I)
+        d = sqrt.(dist_sq)
+        return param_val^2 .* exp.(-d) .+ (noise * I)
     
     # Matern 3/2
     elseif kernel_type == :matern32 
-        d = sqrt.(dist_sq) # distance is now scaled (already done by pairwise)
-        val = T(sqrt(3.0)) .* d
-        return (T(param_val)^2) .* (T(1.0) .+ val) .* exp.(-val) + (T(noise) * I)
+        d = sqrt.(dist_sq)
+        val = sqrt(convert(T, 3.0)) .* d
+        return param_val^2 .* (one(T) .+ val) .* exp.(-val) .+ (noise * I)
     
     # Matern 5/2
     elseif kernel_type == :matern52 
-        d = sqrt.(dist_sq) # distance is now scaled (already done by pairwise)
-        val = T(sqrt(5.0)) .* d
-        return (T(param_val)^2) .* (T(1.0) .+ val .+ (val.^2 ./ T(3.0))) .* exp.(-val) + (T(noise) * I)
+        d = sqrt.(dist_sq)
+        val = sqrt(convert(T, 5.0)) .* d
+        return param_val^2 .* (one(T) .+ val .+ (val.^2 ./ convert(T, 3.0))) .* exp.(-val) .+ (noise * I)
 
     # Constant Kernel (Identity innovation)
     elseif kernel_type == :constant
-        return fill(T(param_val)^2, size(dist_sq))
+        return fill(convert(T, param_val^2), size(dist_sq))
 
     # Linear Kernel
     elseif kernel_type == :linear
-        return (T(param_val)^2) .* dist_sq
+        return param_val^2 .* dist_sq
 
     # Wavelet Multiscale Kernel
     elseif kernel_type == :wavelet
         K_accum = zeros(T, size(dist_sq))
         for wv_scale in 1:wavelet_levels
-            ls_scale_sq = (ls isa Real ? T(ls)^2 : T(1.0)) / (T(4.0)^(wv_scale-1))
-            weight_scale = (T(param_val)^2) * exp(T(-wv_scale) / T(ls))
-            K_accum .+= weight_scale .* exp.(T(-0.5) .* dist_sq ./ ls_scale_sq) # Element-wise addition
+            ls_scale_sq = (ls isa Real ? ls_T^2 : one(T)) / (convert(T, 4.0)^(wv_scale-1))
+            weight_scale = param_val^2 * exp(convert(T, -wv_scale) / ls_T)
+            K_accum .+= weight_scale .* exp.(-one(T)/2 .* dist_sq ./ ls_scale_sq)
         end
-        return K_accum + (T(noise) * I) # Changed .+ to +
+        return K_accum + (noise * I)
 
     # Fallback Dispatch
     else
-        return (T(param_val)^2) .* exp.(T(-0.5) .* dist_sq) + (T(noise) * I)
+        return param_val^2 .* exp.(-one(T)/2 .* dist_sq) .+ (noise * I)
     end
 end
 
 
 
-# Version 1.5.3 (2026-08-06)
-# Purpose: Recomposes a precision matrix based on model type and parameters.
-# Rationale: This version ensures type stability by explicitly casting `param_val` to `T_num`
-#            and using `T_num(1.0)` for numeric literals.
+
+# Version 1.5.4 (2026-08-06)
+# Purpose: Recomposes a precision matrix from a template and hyperparameters.
+# Rationale: This version is updated for improved type stability and AD-friendliness.
+#            It replaces explicit type casts like `T_num(1.0)` with `one(T_num)` and
+#            `T_num(0.0)` with `zero(T_num)`. It also ensures that identity matrices
+#            are constructed with the correct element type, preventing potential
+#            type mismatches when using AD libraries like ForwardDiff.jl.
+#            The use of `convert(T_num, 0.5)` is preferred over `T_num(0.5)` for
+#            consistency with Julia's promotion system.
+# Assumptions: The input `template_s` is a parameter-free structure matrix.
 function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_val::Real; extra_param=nothing, noise=1e-4, kwargs...)
     n_s = size(template_s, 1)
-    T_num = promote_type(typeof(param_val), typeof(noise), eltype(template_s))
+    T_num = promote_type(typeof(param_val), typeof(noise), eltype(template_s), typeof(extra_param))
 
     if m_type == :SPDE
-        kappa = isnothing(extra_param) ? T_num(1.0) : extra_param
+        kappa = isnothing(extra_param) ? one(T_num) : extra_param
         local Q_kappa
         if kappa isa Real
-            Q_kappa = T_num(kappa)^2 * I(n_s)
+            Q_kappa = kappa^2 * I(n_s) # UniformScaling promotes correctly
         else
             if length(kappa) != n_s; error("Anisotropic kappa vector length must match number of spatial units."); end
-            Q_kappa = Diagonal(T_num.(kappa).^2)
+            Q_kappa = Diagonal(kappa.^2) # Let promotion handle eltype
         end
         L_spde = Q_kappa + template_s
         return Symmetric(L_spde' * L_spde)
     end
 
     if m_type == :NoneComponent || m_type == :FIXED
-        return Symmetric(sparse(I(n_s)))
+        return Symmetric(sparse(I, n_s, n_s))
     end
 
     if m_type == :Besag || m_type == :ICAR || m_type == :Cyclic
@@ -6213,12 +6253,12 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
     end
 
     if m_type == :AR1
-        rho = isnothing(extra_param) ? T_num(0.0) : extra_param
+        rho = isnothing(extra_param) ? zero(T_num) : extra_param
         
-        Q = spdiagm(0 => fill(T_num(1.0) + rho^2, n_s))
+        Q = spdiagm(0 => fill(one(T_num) + rho^2, n_s))
         if n_s > 0
-            Q[1, 1] = T_num(1.0)
-            Q[n_s, n_s] = T_num(1.0)
+            Q[1, 1] = one(T_num)
+            Q[n_s, n_s] = one(T_num)
         end
         
         Q .+= rho .* template_s
@@ -6230,8 +6270,9 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
     end
 
     if m_type == :Leroux || m_type == :LocalAdaptive
-        lambda_val = isnothing(extra_param) ? T_num(0.5) : extra_param
-        return Symmetric(lambda_val .* template_s + (T_num(1.0) - lambda_val) .* sparse(I(n_s)))
+        lambda_val = isnothing(extra_param) ? convert(T_num, 0.5) : extra_param
+        I_prom = spdiagm(0 => ones(T_num, n_s))
+        return Symmetric(lambda_val .* template_s + (one(T_num) - lambda_val) .* I_prom)
     end
 
     if m_type == :ST_I || m_type == :ST_II || m_type == :ST_III || m_type == :ST_IV
@@ -6239,7 +6280,7 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
     end
 
     if m_type == :NetworkFlow
-        rho_net = isnothing(extra_param) ? T_num(0.8) : extra_param
+        rho_net = isnothing(extra_param) ? convert(T_num, 0.8) : extra_param
         W_net = template_s
         flow_direction = get(kwargs, :flow_direction, :bidirectional)
         
@@ -6256,14 +6297,14 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
     end
 
     if m_type == :SAR || m_type == :DAG
-        rho_p = isnothing(extra_param) ? T_num(0.8) : extra_param
+        rho_p = isnothing(extra_param) ? convert(T_num, 0.8) : extra_param
         L_op = I(n_s) - rho_p .* template_s
         return Symmetric(L_op' * L_op)
     end
 
     if m_type == :GP
-        ls = isnothing(extra_param) ? T_num(1.0) : extra_param
-        K = (T_num(param_val)^2) .* exp.(-(Matrix(template_s).^2) ./ (T_num(2.0) * ls^2 + T_num(noise)))
+        ls = isnothing(extra_param) ? one(T_num) : extra_param
+        K = param_val^2 .* exp.(-(Matrix(template_s).^2) ./ (convert(T_num, 2.0) * ls^2 + convert(T_num, noise)))
         return inv(Symmetric(K))
     end
 
@@ -6277,20 +6318,20 @@ end
 
 
 
-
-
 # Version 1.5.3 (2026-08-06)
 # Purpose: Generates the code block for calculating exploitation in dynamics models.
-# Rationale: This version is updated to use `T_num_dyn(0.0)` for the default exploitation value.
-#            This ensures that the `exploitation` variable has the correct generic type `T_num_dyn`
-#            (which becomes `ForwardDiff.Dual` during automatic differentiation), resolving
-#            a type instability that caused a `MethodError`.
+# Rationale: This version is updated to use `zeros(T_num_dyn, M.s_N)` for the default exploitation value.
+#            This ensures that the `exploitation` variable is always initialized as a vector of the
+#            correct generic type `T_num_dyn` (which becomes `ForwardDiff.Dual` during automatic
+#            differentiation), resolving a type instability that caused a `MethodError` when no
+#            effort or removal data was provided.
 function generate_exploitation_block(spec, time_var)
     effort_keys = get(spec.hyper, :effort_keys, [])
     removal_keys = get(spec.hyper, :removal_keys, [])
     
     if isempty(effort_keys) && isempty(removal_keys)
-        return "local exploitation = zero(T_num_dyn)"
+        # Always initialize as a vector of the correct type and size.
+        return "local exploitation = zeros(T_num_dyn, M.s_N)"
     end
     
     lines = ["local exploitation = zeros(T_num_dyn, M.s_N)"]
@@ -6303,8 +6344,16 @@ function generate_exploitation_block(spec, time_var)
     return join(lines, "\n    ")
 end
 
- 
 
+
+ 
+# Version 1.0.1 (2026-08-06)
+# Purpose: Converts a `Distribution` object into a type-stable string for code generation.
+# Rationale: This version adds explicit handling for `filldist` and `Product` distributions.
+#            It recursively calls `_distribution_to_string` on the inner distributions,
+#            ensuring that complex, nested distribution types are correctly and robustly
+#            represented in the generated Turing model code. This prevents errors and
+#            improves the clarity of the generated model.
 function _distribution_to_string(d::Distribution)
     dist_name = string(typeof(d).name.name)
     if d isa Exponential

@@ -78,14 +78,6 @@ end
 
 # --- SECTION 3: MODEL BUILDING AND ASSEMBLY ---
 
-# This function should be added to the `resolve_technical_primitive` dispatch in `model.jl`.
-# For this proposal, it is included here to show the complete logic.
-# function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, priors_dict, scheme::Symbol)
-#     if module_metadata[:type] == :sciml
-#         ...
-#     end
-# end
-
 """
     build_model(m::SciMLComponent, data_inputs::Dict, module_metadata::Dict)
 
@@ -164,38 +156,40 @@ end
 
 # --- SECTION 4: POSTERIOR RECONSTRUCTION ---
 
-"""
-    extract_component(m_obj::SciMLComponent, chain, M, ...)
-
-Reconstructs the posterior trajectories of a SciML model.
-"""
+# Version 1.0.1 (2026-08-06)
+# Purpose: Re-solves the differential equation for each posterior sample of its parameters
+#          to reconstruct the component's effect.
+# Rationale: This version is updated for improved type stability. It determines the element type `T`
+#            from the MCMC chain's value type, rather than hard-coding `Float64`. This ensures
+#            that the `trajectories` matrix is allocated with the correct numeric type (e.g., Float32, Float64),
+#            avoiding potential type-related issues and adhering to best practices for generic code.
+#            It also ensures `NaN` values are cast to the correct type.
+# Assumptions: The MCMC chain object `chain` has a `value` field from which `eltype` can be inferred.
 function extract_component(m_obj::SciMLComponent, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot)
-    # Purpose: Re-solves the differential equation for each posterior sample of its parameters.
-    # Version: 1.0.0 (2026-08-06)
-
     key = spec.key
     hyper = spec.hyper
     p_priors = hyper.p_priors
     param_names = keys(p_priors)
 
-    # Extract posterior samples for u0 and parameters
+    # Extract posterior samples for u0 and parameters from the MCMC chain.
     u0_samples = get_params_vector(chain, "u0_$(key)", length(m_obj.u0_prior))
     p_samples = Dict(p_name => get_params_vector(chain, "$(p_name)_$(key)", 1) for p_name in param_names)
 
-    # Determine the full time grid for reconstruction (training + prediction)
+    # Determine the full time grid for reconstruction, combining training and prediction time points if necessary.
     t_coords_full = if isnothing(PS)
         M.t_coords
     else
-        # This assumes time coordinates are consistent and sorted
+        # This assumes time coordinates are consistent and sorted.
         vcat(M.t_coords, PS.data[!, M.t_idx_var])
     end
     tspan_full = (minimum(t_coords_full), maximum(t_coords_full))
 
-    # Initialize storage for the reconstructed trajectories
-    # Assuming the first state variable is the output
-    trajectories = zeros(Float64, N_tot, n_samples)
+    # --- Type-aware allocation of the results matrix ---
+    # Determine the element type from the chain's values for robust type handling.
+    T = eltype(chain.value)
+    trajectories = zeros(T, N_tot, n_samples)
 
-    # Re-solve the DE for each posterior sample
+    # Re-solve the differential equation for each posterior sample.
     for s in 1:n_samples
         u0_s = u0_samples[s, :]
         p_s = Tuple(p_samples[p_name][s, 1] for p_name in param_names)
@@ -206,18 +200,17 @@ function extract_component(m_obj::SciMLComponent, chain, M, n_samples, outcomes_
         sol_s = solve(prob_s, M.sciml_solver; saveat=t_coords_full)
 
         if SciMLBase.successful_retcode(sol_s)
-            # Extract the first state variable at the required time points
+            # Extract the first state variable at the required time points.
+            # The solution `sol_s` will have the correct numeric type.
             trajectories[:, s] = sol_s[1, :]
         else
-            # If solver fails, fill with NaNs to indicate failure
-            trajectories[:, s] .= NaN
+            # If the solver fails, fill with NaNs of the correct type to indicate failure.
+            trajectories[:, s] .= T(NaN)
         end
     end
 
-    # The effect is the same for all outcomes in a multivariate model unless specified otherwise
+    # The effect is assumed to be the same for all outcomes in a multivariate model unless specified otherwise.
     structured_effects = [trajectories for _ in 1:outcomes_N]
     
     return (structured=structured_effects, noisy=structured_effects)
 end
-
-

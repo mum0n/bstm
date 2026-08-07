@@ -1155,3 +1155,33 @@ function _build_pass_through_model(m::ComponentModel, data_inputs::Dict, module_
     if haskey(hyper_dict, :Q_template); delete!(hyper_dict, :Q_template); end
     return (Q_template=Q_template_val, scaling_factor=sf_val, model_type=model_sym, hyper=NamedTuple(hyper_dict))
 end
+
+
+
+
+# Version 1.0.1 (2026-08-06)
+# Purpose: Model builder for the `ProcessConvolution` component.
+# Rationale: This function prepares the `ProcessConvolution` component for code generation.
+#            It generates the knot locations for the convolution process and packages all
+#            necessary information—priors, kernel type, knots, and the pre-built spec
+#            for the inner lengthscale model—into the `hyper` registry.
+function build_model(m::ProcessConvolution, data_inputs::Dict, module_metadata::Dict)
+    hyper_dict = Dict{Symbol, Any}()
+    hyper_dict[:n_knots] = m.n_knots
+    hyper_dict[:kernel] = m.kernel
+    hyper_dict[:base_sigma_prior] = m.base_sigma
+
+    # Generate knot locations for the convolution.
+    coords = get(module_metadata[:params], :coords, nothing)
+    if isnothing(coords); error("ProcessConvolution model requires coordinates."); end
+    knots = generate_inducing_points(coords, m.n_knots)
+    hyper_dict[:knots] = knots
+
+    # The inner model spec for the lengthscale was already built in `resolve_technical_primitive`
+    # and is passed through the metadata. We just need to store it in the hyper registry.
+    hyper_dict[:lengthscale_model_obj] = module_metadata[:params][:lengthscale_model_obj]
+    hyper_dict[:lengthscale_model_spec] = module_metadata[:params][:lengthscale_model_spec]
+
+    # No single Q_template is needed for the main component, as it's constructed dynamically.
+    return (Q_template=nothing, scaling_factor=1.0, model_type=:process_convolution, hyper=NamedTuple(hyper_dict))
+end

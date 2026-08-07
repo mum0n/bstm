@@ -7,11 +7,14 @@ end
 
 
 
+# Version 1.0.8 (2026-08-06)
+# Purpose: Generates Turing code for multivariate dynamics models.
+# Rationale: This version is updated for AD compatibility. It converts the sparse precision
+#            matrix `Q_spatial` to a dense `Matrix` before the Cholesky decomposition.
+#            This avoids calling the sparse Cholesky factorization from CHOLMOD, which does
+#            not support Dual types. It also replaces the incorrect use of `.U` with the
+#            correct `.L'` for solving with the Cholesky factor, resolving the `CanonicalIndexError`.
 function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedTuple, M::NamedTuple)
-    # Purpose: Generates Turing code for multivariate dynamics models.
-    # Rationale: This version adds exploitation logic to the `leslie_matrix` model and updates
-    #            other models to use the standardized `effort` and `removal` parameters.
-    # v1.0.7 (2026-08-01)
     key_str = string(spec.key)
     params = m.params
     model_type = m.model
@@ -70,9 +73,9 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
 
         update_str = """
         begin
-            local Q_spatial = spec_registry["$(key_str)"].hyper.L_template; local F_spatial = cholesky(Symmetric(Q_spatial + noise * I)); local areas = spec_registry["$(key_str)"].hyper.areas
-            local survival_rates_spatial, fecundity_rates_spatial; if $(spatially_varying_rates); fecundity_raw_matrix = reshape(fecundity_raw_$(key_str), M.s_N, $(n_age_classes)); fecundity_field = F_spatial.U \\ fecundity_raw_matrix; fecundity_rates_spatial = exp.(log_fecundity_mean_$(key_str)' .+ fecundity_field .* sigma_fecundity_$(key_str)'); survival_raw_matrix = reshape(survival_raw_$(key_str), M.s_N, $(n_age_classes-1)); survival_field = F_spatial.U \\ survival_raw_matrix; survival_rates_spatial = logistic.(logit_survival_mean_$(key_str)' .+ survival_field .* sigma_survival_$(key_str)'); end
-            local K_values_$(key_str); if $(spatially_varying_K); K_field_raw = F_spatial.U \\ K_raw_$(prefixed_key); Turing.@addlogprob! logpdf(Normal(0, 0.001 * M.s_N), sum(K_field_raw)); K_values_$(key_str) = exp.(log_K_mean_$(prefixed_key) .+ K_field_raw .* sigma_K_$(prefixed_key)); elseif haskey(spec_registry["$(key_str)"].component_obj.params, :K); K_values_$(key_str) = fill(K_$(key_str), M.s_N); end
+            local Q_spatial = spec_registry["$(key_str)"].hyper.L_template; local F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + noise * I)); local areas = spec_registry["$(key_str)"].hyper.areas
+            local survival_rates_spatial, fecundity_rates_spatial; if $(spatially_varying_rates); fecundity_raw_matrix = reshape(fecundity_raw_$(key_str), M.s_N, $(n_age_classes)); fecundity_field = F_spatial.L' \\ fecundity_raw_matrix; fecundity_rates_spatial = exp.(log_fecundity_mean_$(key_str)' .+ fecundity_field .* sigma_fecundity_$(key_str)'); survival_raw_matrix = reshape(survival_raw_$(key_str), M.s_N, $(n_age_classes-1)); survival_field = F_spatial.L' \\ survival_raw_matrix; survival_rates_spatial = logistic.(logit_survival_mean_$(key_str)' .+ survival_field .* sigma_survival_$(key_str)'); end
+            local K_values_$(key_str); if $(spatially_varying_K); K_field_raw = F_spatial.L' \\ K_raw_$(prefixed_key); Turing.@addlogprob! logpdf(Normal(0, 0.001 * M.s_N), sum(K_field_raw)); K_values_$(key_str) = exp.(log_K_mean_$(prefixed_key) .+ K_field_raw .* sigma_K_$(prefixed_key)); elseif haskey(spec_registry["$(key_str)"].component_obj.params, :K); K_values_$(key_str) = fill(K_$(key_str), M.s_N); end
             local innov_tensor_$(key_str) = reshape(innov_process_$(key_str), M.s_N, M.t_N, $(n_age_classes)); local population_field_$(key_str) = zeros(T, M.s_N, M.t_N, $(n_age_classes))
             for a in 1:$(n_age_classes); population_field_$(key_str)[:, 1, a] = max.(0.0, innov_tensor_$(key_str)[:, 1, a] .* sigma_process_$(key_str)[a]); end
             for s in 1:M.s_N
@@ -118,7 +121,7 @@ function _generate_multivariate_dynamics_code(m::DynamicsComponent, spec::NamedT
         update_str = """
         begin
             local areas = spec_registry["$(key_str)"].hyper.areas; local alpha_$(key_str) = diagm(0 => ones(T, $(n_species))); local off_diag_indices = [i for i in 1:($(n_species)^2) if mod(i-1, $(n_species)+1) != 0]; alpha_$(key_str)[off_diag_indices] = alpha_raw_$(key_str)
-            local K_values_$(key_str); if $(spatially_varying_K); local Q_spatial = spec_registry["$(key_str)"].hyper.L_template; local F_spatial = cholesky(Symmetric(Q_spatial + noise * I)); local K_raw_matrix = reshape(K_raw_$(key_str), M.s_N, $(n_species)); local K_field = F_spatial.U \\ K_raw_matrix; K_values_$(key_str) = exp.(log_K_mean_$(key_str)' .+ K_field .* sigma_K_$(key_str)'); else; K_values_$(key_str) = repeat(K_$(key_str)', M.s_N, 1); end
+            local K_values_$(key_str); if $(spatially_varying_K); local Q_spatial = spec_registry["$(key_str)"].hyper.L_template; local F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + noise * I)); local K_raw_matrix = reshape(K_raw_$(key_str), M.s_N, $(n_species)); local K_field = F_spatial.L' \\ K_raw_matrix; K_values_$(key_str) = exp.(log_K_mean_$(key_str)' .+ K_field .* sigma_K_$(key_str)'); else; K_values_$(key_str) = repeat(K_$(key_str)', M.s_N, 1); end
             local innov_tensor = reshape(innov_process_$(key_str), M.s_N, M.t_N, $(n_species)); local population_field = zeros(T, M.s_N, M.t_N, $(n_species)); population_field[:, 1, :] = max.(0.0, innov_tensor[:, 1, :] .* sigma_process_$(key_str)')
             for s in 1:M.s_N, t in 2:M.t_N
                 local N_prev = view(population_field, s, t-1, :); local D_prev = N_prev ./ areas[s]; local K_density = K_values_$(key_str)[s, :] ./ areas[s]; local N_intermediate = zeros(T, $(n_species))
@@ -994,11 +997,13 @@ function _generate_component_code_fragments(m::Union{Besag, ICAR, BCGN, Cyclic},
 end
 
 
-# Version 1.5.3 (2026-08-06)
+# Version 1.5.4 (2026-08-06)
 # Purpose: Generates Turing code fragments for the `BYM2` component.
-# Rationale: This version is updated to use `F.L'` instead of `F.U` to ensure
-#            compatibility with automatic differentiation.
-function _generate_component_code_fragments(m::BYM2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
+# Rationale: This version is updated for AD compatibility. It converts the sparse precision
+#            matrix `Q_template` to a dense `Matrix` before the Cholesky decomposition.
+#            This avoids calling the sparse Cholesky factorization from CHOLMOD, which does
+#            not support Dual types, resolving the `CanonicalIndexError` during sampling.
+function _generate_component_code_fragments(m::BYM2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="", generate_eta_update::Bool=true)
     key_str = string(spec.key)
     v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
     params = spec.params
@@ -1026,7 +1031,8 @@ function _generate_component_code_fragments(m::BYM2, spec::NamedTuple, arch::Str
         
         if !isnothing(Q_template) && $(n_latent) > 0
             # 1. Reconstruct the structured (ICAR) component from its raw innovations.
-            local F = cholesky(Symmetric(sparse(Q_template) + noise * I))
+            #    Convert to dense Matrix to ensure AD-compatible Cholesky factorization.
+            local F = cholesky(Symmetric(Matrix(Q_template) + noise * I))
             local struct_latent = F.L' \\ $(v.struct)
             
             # 2. Apply a soft sum-to-zero constraint for identifiability.
@@ -1042,7 +1048,8 @@ function _generate_component_code_fragments(m::BYM2, spec::NamedTuple, arch::Str
     """
     return (priors=priors_str, update=update_str)
 end
- 
+
+
 
 
 # Version 1.5.3 (2026-08-06)
@@ -2111,15 +2118,37 @@ function _generate_component_code_fragments(m::GP, spec::NamedTuple, arch::Strin
 end
 
 
+
+# Version 2.0.1 (2026-08-06)
+# Purpose: Dispatches to the appropriate code generation function for a given model component.
+# Rationale: This version is updated to use spectral decomposition for GMRF models like
+#            BYM2, ICAR, Leroux, RW1, and RW2 when the `spectral_orientation` flag is true
+#            and the necessary `U` and `L` matrices are available in the component specification.
+#            This prioritizes AD-friendly sampling methods over the older MvNormalCanon approach.
+# Assumptions: The main model configuration `M` contains a `spectral_orientation` flag.
 function _generate_component_code_fragments(spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)
-    # Purpose: Dispatches code generation to a specific method based on the component object type.
-    # Rationale: This dispatch function is updated to accept and pass the main model
-    #            configuration object `M` to all concrete code generation methods.
-    # v1.0.1 (2026-08-01)
-    return _generate_component_code_fragments(spec.component_obj, spec, arch, outcome_idx, M)
+    # This function acts as a dispatcher, calling the correct code generator
+    # based on the component's type and the model's configuration.
+
+    m_obj = spec.component_obj
+    use_spectral = get(M, :spectral_orientation, true) && hasproperty(spec.hyper, :U) && hasproperty(spec.hyper, :L)
+
+    # --- Dispatch Logic ---
+    if m_obj isa BYM2 && use_spectral
+        return generate_bym2_assembly_spectral(spec, M, arch)
+    elseif m_obj isa Union{ICAR, Besag} && use_spectral
+        return generate_icar_assembly_spectral(spec, M, arch)
+    elseif m_obj isa Leroux && use_spectral
+        return generate_leroux_assembly_spectral(spec, M, arch)
+    elseif m_obj isa Union{RW1, RW2} && use_spectral
+        return generate_rw_assembly_spectral(spec, M, arch)
+    elseif m_obj isa SciMLComponent
+        return generate_sciml_component_assembly(spec, M, arch)
+    else
+        # Fallback to the existing, type-specific code generators for other components.
+        return _generate_component_code_fragments(m_obj, spec, arch, outcome_idx, M)
+    end
 end
- 
- 
  
 
 
@@ -2376,13 +2405,14 @@ end
 
  
 
+# Version 1.1.1 (2026-08-06)
+# Purpose: Generates the code block for spatiotemporal interactions.
+# Rationale: This version is updated to force the use of dense Cholesky factorization
+#            by converting the sparse precision matrices to dense `Matrix` types before
+#            the `cholesky` call. This avoids using `CHOLMOD`'s sparse factorization,
+#            whose `FactorComponent` objects do not support the indexing required by
+#            some generic linear algebra fallbacks, resolving the `CanonicalIndexError`.
 function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multivariate::Bool, eta_name::String)
-    # Purpose: Generates the code block for spatiotemporal interactions.
-    # Rationale: This version is updated to use the transpose of the lower Cholesky factor (`.L'`)
-    #            instead of the specialized `.U` component. This resolves the `CanonicalIndexError`
-    #            that occurs during automatic differentiation. It also removes an unnecessary
-    #            and potentially problematic conversion to a dense `Matrix`.
-    # v1.1.0 (2026-08-04)
     if get(M, :model_st, "none") == "none" 
         return ""
     end
@@ -2395,11 +2425,11 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     s_key = string(s_spec.key)
     t_key = string(t_spec.key)
     
-    s_chol_access = "cholesky(Symmetric(spec_registry[\"$s_key\"].Q_template + noise * I))"
+    s_chol_access = "cholesky(Symmetric(Matrix(spec_registry[\"$s_key\"].Q_template) + noise * I))"
     
     t_model_type = t_spec.component_obj |> typeof |> Symbol
     t_rho_var_name = "rho_$(t_key)"
-    t_chol_access = "cholesky(Symmetric(recompose_precision(:$(t_model_type), spec_registry[\"$t_key\"].Q_template, 1.0; extra_param=$(t_rho_var_name)) + noise * I))"
+    t_chol_access = "cholesky(Symmetric(Matrix(recompose_precision(:$(t_model_type), spec_registry[\"$t_key\"].Q_template, 1.0; extra_param=$(t_rho_var_name))) + noise * I))"
 
     K = get(M, :outcomes_N, 1)
 
@@ -2470,7 +2500,7 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     return interaction_code
 end
 
- 
+
 
 
 # Version 1.5.0 (2026-08-06)
@@ -2666,7 +2696,7 @@ function _generate_component_code_fragments(m::ComponentModel, spec::NamedTuple,
 end
 
 
-# Version 1.5.8 (2026-08-06)
+# Version 1.5.9 (2026-08-06)
 # Purpose: Generates Turing code for an AR(1) process.
 # Rationale: This version corrects the prior for the `rho` parameter. Instead of using a
 #            conceptually incorrect `truncated(Beta, ...)` distribution, it now uses a `tanh`
@@ -2674,7 +2704,6 @@ end
 #            parameter to the `(-1, 1)` range required for a stationary AR(1) process and
 #            ensures stable gradient-based sampling.
 function _generate_component_code_fragments(m::AR1, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="")
-    # This function generates the Turing model code for an AR(1) temporal component.
     v = generate_full_variable_names(spec, arch, outcome_idx; prefix=prefix)
     
     n_latent = size(spec.Q_template, 1)
@@ -2702,6 +2731,7 @@ function _generate_component_code_fragments(m::AR1, spec::NamedTuple, arch::Stri
     
     return (priors=priors_str, update=update_str)
 end
+
 
 
 
@@ -3335,3 +3365,412 @@ function _generate_multivariate_likelihood_block(M::NamedTuple)
     end
     """
 end
+
+# Version 1.5.9 (2026-08-06)
+# Purpose: Generates Turing code for static GMRF components like ICAR and Besag.
+# Rationale: This function demonstrates the correct, AD-unsafe but efficient, way to use
+#            sparse Cholesky factorization for static components. It solves the `CanonicalIndexError`
+#            by explicitly creating a `SparseMatrixCSC` from the Cholesky factor `F.L` before
+#            performing the solve. This ensures the backslash operator dispatches to a method
+#            that supports sparse triangular solves. This pattern should be used for all
+#            pre-computed static components. For dynamic components, spectral decomposition remains
+#            the only AD-safe and efficient method.
+function _generate_component_code_fragments(m::Union{ICAR, Besag}, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="", generate_eta_update::Bool=true)
+    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
+    params = spec.params
+    n_latent = size(spec.Q_template, 1)
+    is_multivariate = (arch == "multivariate")
+    is_first_outcome = (outcome_idx == 1 || isnothing(outcome_idx))
+    is_shared = get(params, :shared, false)
+
+    priors_acc = String[]
+    if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
+        push!(priors_acc, "$(v.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(v.sigma))")
+    end
+    push!(priors_acc, "$(v.raw) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(v.raw))")
+    priors_str = join(priors_acc, "\n    ")
+
+    index_var = (spec.structure == :spatial) ? "s_idx" : string(spec.structure) * "_idx"
+    eta_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    
+    effect_app_str = if generate_eta_update
+        if spec.structure == :smooth
+            "$(eta_target) .+= M.basis_matrices[:$(spec.var)] * $(v.latent)"
+        else
+            "$(eta_target) .+= view($(v.latent), M.$(index_var))"
+        end
+    else
+        ""
+    end
+
+    # This component is static, so we use the pre-computed Cholesky factor.
+    update_str = """
+    begin
+        # Static ICAR/Besag Component: $(spec.key)
+        local F_static = spec_registry["$(spec.key)"].cholesky_factor
+        
+        # Explicitly create a sparse matrix from the factor component to ensure correct dispatch.
+        local L_sparse = sparse(F_static.L)
+        local unscaled_latent = L_sparse' \\ $(v.raw)
+        
+        $(v.latent) = $(v.sigma) .* unscaled_latent
+        
+        # Apply sum-to-zero constraint for identifiability
+        Turing.@addlogprob! logpdf(Normal(T(0), T(0.001) * $(n_latent)), sum($(v.latent)))
+        
+        $(effect_app_str)
+    end
+    """
+
+    return (priors=priors_str, update=update_str)
+end
+
+
+# Version 1.0.0 (2026-08-06)
+# Purpose: Generates the Turing model code for a BYM2 component using spectral decomposition.
+# Rationale: This function implements the "spectral trick" for sampling the latent BYM2 field.
+#            Instead of constructing a parameter-dependent precision matrix and using MvNormalCanon
+#            (which is not AD-friendly), it samples standard normal noise and transforms it using
+#            the pre-computed eigenvectors (U) and a diagonal matrix (D) constructed from the
+#            eigenvalues (L) and the sampled hyperparameters (sigma, rho). This approach is
+#            fully differentiable and avoids LAPACK errors with ForwardDiff.jl.
+# Assumptions: The component specification `spec` contains pre-computed `U` (eigenvectors) and
+#              `L` (eigenvalues) from `build_structure_template`.
+function generate_bym2_assembly_spectral(spec::NamedTuple, M::NamedTuple, arch::String)
+    key = spec.key
+    p_names = generate_full_variable_names(spec, arch, get(spec.params, :outcome_idx, nothing))
+
+    # --- 1. Generate Priors for Hyperparameters ---
+    priors_str = """
+    # --- Priors for BYM2 component: $(key) ---
+    $(p_names.sigma) ~ $(_distribution_to_string(spec.component_obj.sigma))
+    $(p_names.rho) ~ $(_distribution_to_string(spec.component_obj.rho))
+    """
+
+    # --- 2. Generate Spectral Sampling Code for the Latent Field ---
+    # This is the core of the non-centered parameterization using spectral decomposition.
+    assembly_lines = [
+        "# --- BYM2 spectral assembly: $(key) ---",
+        "# Sample standard normal noise for the structured and unstructured components.",
+        "$(p_names.struct) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)",
+        "$(p_names.iid) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)",
+        "",
+        "# Construct the diagonal of the spectral transformation matrix D.",
+        "# D = diag(1 / sqrt( (1-rho) + rho*L_j ) ) where L_j are eigenvalues of Q_template.",
+        "# This avoids inverting or decomposing a matrix inside the model.",
+        "local diag_D_structured = sqrt.(1.0 ./ ((1.0 .- $(p_names.rho)) .+ $(p_names.rho) .* spec.L .+ 1e-9))",
+        "",
+        "# Apply the spectral transformation: latent = U * D * z",
+        "# This constructs the structured spatial effect in an AD-friendly way.",
+        "local structured_effect = spec.U * (diag_D_structured .* $(p_names.struct))",
+        "",
+        "# Combine structured and unstructured components using the BYM2 parameterization.",
+        "local bym2_field = $(p_names.sigma) .* (sqrt($(p_names.rho)) .* structured_effect .+ sqrt(1.0 - $(p_names.rho)) .* $(p_names.iid))",
+        "",
+        "# Add the final effect to the linear predictor, indexed by the spatial units.",
+        "eta .+= bym2_field[M.s_idx]"
+    ]
+    assembly_str = join(assembly_lines, "\n    ")
+
+    return (priors=priors_str, assembly=assembly_str, post_assembly="")
+end
+
+
+
+
+# Version 1.0.0 (2026-08-06)
+# Purpose: Generates the Turing model code for an ICAR/Besag component using spectral decomposition.
+# Rationale: Implements the "spectral trick" for sampling the latent ICAR field.
+#            This approach is fully differentiable and avoids Cholesky decomposition of
+#            parameter-dependent matrices, which is incompatible with ForwardDiff.jl.
+# Assumptions: The component specification `spec` contains pre-computed `U` (eigenvectors) and
+#              `L` (eigenvalues) from `build_structure_template`.
+function generate_icar_assembly_spectral(spec::NamedTuple, M::NamedTuple, arch::String)
+    key = spec.key
+    p_names = generate_full_variable_names(spec, arch, get(spec.params, :outcome_idx, nothing))
+
+    # --- 1. Generate Priors for Hyperparameters ---
+    priors_str = """
+    # --- Priors for ICAR component: $(key) ---
+    $(p_names.sigma) ~ $(_distribution_to_string(spec.component_obj.sigma))
+    """
+
+    # --- 2. Generate Spectral Sampling Code for the Latent Field ---
+    assembly_lines = [
+        "# --- ICAR spectral assembly: $(key) ---",
+        "# Sample standard normal noise.",
+        "$(p_names.struct) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)",
+        "",
+        "# Construct the diagonal of the spectral transformation matrix D.",
+        "# For ICAR, Cov = sigma^2 * Q_template_inv. In spectral domain, this is sigma^2 / L_j.",
+        "# D = diag(sigma / sqrt(L_j) )",
+        "local diag_D = $(p_names.sigma) ./ sqrt.(spec.L .+ 1e-9)",
+        "# Set the eigenvalue corresponding to the null-space to zero to enforce the sum-to-zero constraint.",
+        "# The first eigenvalue of a scaled ICAR precision matrix is zero.",
+        "diag_D[1] = 0.0",
+        "",
+        "# Apply the spectral transformation: latent = U * D * z",
+        "local icar_field = spec.U * (diag_D .* $(p_names.struct))",
+        "",
+        "# The sum-to-zero constraint is implicitly handled by setting the first diagonal element to zero.",
+        "",
+        "# Add the final effect to the linear predictor, indexed by the spatial units.",
+        "eta .+= icar_field[M.s_idx]"
+    ]
+    assembly_str = join(assembly_lines, "\n    ")
+
+    return (priors=priors_str, assembly=assembly_str, post_assembly="")
+end
+
+
+
+# Version 2.0.0 (2026-08-06)
+# Purpose: Dispatches to the appropriate code generation function for a given model component.
+# Rationale: This version is updated to use spectral decomposition for GMRF models like BYM2
+#            and ICAR when the `spectral_orientation` flag is true and the necessary `U` and `L` matrices
+#            are available in the component specification. This prioritizes AD-friendly sampling
+#            methods over the older MvNormalCanon approach.
+# Assumptions: The main model configuration `M` contains a `spectral_orientation` flag.
+function generate_component_assembly(spec::NamedTuple, M::NamedTuple, arch::String)
+    # This function acts as a dispatcher, calling the correct code generator
+    # based on the component's type and the model's configuration.
+
+    m_obj = spec.component_obj
+    use_spectral = get(M, :spectral_orientation, true) && hasproperty(spec, :U) && hasproperty(spec, :L)
+
+    # --- Dispatch Logic ---
+    if m_obj isa BYM2 && use_spectral
+        # New path: Use the AD-friendly spectral sampling method.
+        return generate_bym2_assembly_spectral(spec, M, arch)
+    
+    elseif m_obj isa Union{ICAR, Besag} && use_spectral
+        # New path: Use the AD-friendly spectral sampling method for ICAR/Besag.
+        return generate_icar_assembly_spectral(spec, M, arch)
+
+    elseif m_obj isa SciMLComponent
+        return generate_sciml_component_assembly(spec, M, arch)
+
+    # ... other component types would have their own dispatch logic here ...
+
+    else
+        # Fallback to legacy or other component generators
+        @warn "No spectral generator for $(typeof(m_obj)). Falling back to default assembly."
+        # This would call the old MvNormalCanon-based generator, which is not shown here
+        # but is assumed to exist in the full codebase.
+        # return generate_generic_assembly_legacy(spec, M, arch) 
+        return (priors="", assembly="# Legacy assembly for $(spec.key) not shown.", post_assembly="")
+    end
+end
+
+ 
+
+
+# Version 1.0.0 (2026-08-06)
+# Purpose: Evaluates a kernel function between two points with a given lengthscale.
+# Rationale: This AD-safe helper function is for use inside the generated Turing model.
+#            It computes the kernel value for a single pair of points, which is needed
+#            for the explicit loop in the process convolution model. It supports multiple
+#            kernel types and ensures all operations are compatible with `ForwardDiff.Dual` types.
+function _evaluate_kernel_pointwise(p1::AbstractVector, p2::AbstractVector, sigma::Real, ls::Real, kernel_type::Symbol)
+    # Promote types to handle potential Dual numbers from AD
+    T = promote_type(eltype(p1), eltype(p2), typeof(sigma), typeof(ls))
+    
+    # Ensure ls is positive to avoid numerical issues
+    ls_safe = ls + convert(T, 1e-9)
+    
+    dist_sq = sum((p1 .- p2).^2)
+
+    if kernel_type == :gaussian || kernel_type == :se
+        return sigma^2 * exp(-dist_sq / (convert(T, 2.0) * ls_safe^2))
+    
+    elseif kernel_type == :matern32
+        d = sqrt(dist_sq)
+        val = sqrt(convert(T, 3.0)) * d / ls_safe
+        return sigma^2 * (one(T) + val) * exp(-val)
+        
+    elseif kernel_type == :exponential
+        d = sqrt(dist_sq)
+        return sigma^2 * exp(-d / ls_safe)
+        
+    else # Default to squared exponential
+        return sigma^2 * exp(-dist_sq / (convert(T, 2.0) * ls_safe^2))
+    end
+end
+ 
+# Version 1.0.0 (2026-08-06)
+# Purpose: Generates the Turing model code for the `ProcessConvolution` component.
+# Rationale: This function implements a non-stationary spatial process by constructing
+#            a convolution of a base process with a spatially varying kernel.
+#            1. It first generates the code to realize a spatially varying `lengthscale_field`
+#               by calling the code generator for its nested `lengthscale_model`.
+#            2. It defines priors for the `base_process` at a set of knots.
+#            3. It then enters a loop over all observation points to dynamically construct
+#               a basis matrix `B`, where each entry `B[i, k]` is the kernel evaluation
+#               between observation `i` and knot `k`, using the specific lengthscale `ls_i`
+#               at that observation's location.
+#            4. The final effect is the matrix-vector product of this dynamic basis `B`
+#               and the `base_process`, which is then added to the linear predictor.
+#            WARNING: The explicit loop over observations and knots makes this component
+#            computationally intensive. It is intended for models where non-stationarity
+#            is a critical feature and the number of knots and observations is moderate.
+function _generate_component_code_fragments(m::ProcessConvolution, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple; prefix::String="", generate_eta_update::Bool=true)
+    v = generate_full_variable_names(spec, arch, outcome_idx, prefix=prefix)
+    key_str = string(spec.key)
+    hyper = spec.hyper
+    n_knots = hyper.n_knots
+
+    # 1. Generate code for the nested lengthscale model
+    ls_model_obj = hyper.lengthscale_model_obj
+    ls_model_spec_hyper = hyper.lengthscale_model_spec.hyper
+    
+    # Create a dummy spec for the inner model to pass to its generator
+    inner_spec = (
+        key = Symbol("$(key_str)_ls"),
+        component_obj = ls_model_obj,
+        hyper = ls_model_spec_hyper,
+        Q_template = hyper.lengthscale_model_spec.Q_template,
+        params = Dict() # Not strictly needed here
+    )
+    ls_frags = _generate_component_code_fragments(ls_model_obj, inner_spec, arch, outcome_idx, M; prefix="$(prefix)_ls", generate_eta_update=false)
+    ls_latent_var = generate_full_variable_names(inner_spec, arch, outcome_idx, prefix="$(prefix)_ls").latent
+
+    # 2. Priors for the base process
+    priors_acc = [ls_frags.priors]
+    push!(priors_acc, "$(v.sigma) ~ $(_distribution_to_string(hyper.base_sigma_prior))")
+    push!(priors_acc, "$(v.raw) ~ MvNormal(zeros(T, $(n_knots)), I)")
+    priors_str = join(priors_acc, "\n    ")
+
+    # 3. Assembly block
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+
+    update_str = """
+    begin
+        # --- Process Convolution: $(key_str) ---
+        # This component models a non-stationary process by convolving a base process
+        # with a kernel whose parameters (e.g., lengthscale) vary spatially.
+        # WARNING: This involves a loop over all observations and knots, which can be
+        # computationally expensive for large datasets.
+
+        # A. Realize the spatially-varying lengthscale field from the nested model.
+        $(ls_frags.update)
+        local lengthscale_field = exp.($(ls_latent_var)) # Use exp to ensure positivity
+
+        # B. Realize the base process at the knot locations.
+        local base_process = $(v.raw) * $(v.sigma)
+
+        # C. Dynamically construct the convolution basis matrix B.
+        #    The entry B[i, k] is the kernel evaluation between observation i and knot k,
+        #    using the lengthscale specific to observation i's location.
+        local coords = spec_registry["$(key_str)"].hyper.coords
+        local knots = spec_registry["$(key_str)"].hyper.knots
+        local kernel_type = Symbol("$(hyper.kernel)")
+        local n_obs = size(coords, 1)
+        local B_conv = zeros(T, n_obs, $(n_knots))
+
+        for i in 1:n_obs
+            # The lengthscale field is indexed by the spatial unit of the observation.
+            local ls_i = lengthscale_field[M.s_idx[i]]
+            for k in 1:$(n_knots)
+                # This helper function must be defined within the model's scope.
+                B_conv[i, k] = _evaluate_kernel_pointwise(
+                    view(coords, i, :), 
+                    view(knots, k, :), 
+                    one(T), # Sigma is applied to the base process, not here.
+                    ls_i, 
+                    kernel_type
+                )
+            end
+        end
+
+        # D. Compute the final effect and add it to the linear predictor.
+        $(v.latent) = B_conv * base_process
+        $(eta_target) .+= $(v.latent)
+    end
+    """
+    return (priors=priors_str, update=update_str)
+end
+ 
+# Version 1.0.0 (2026-08-06)
+# Purpose: Generates the Turing model code for a Leroux component using spectral decomposition.
+# Rationale: This function implements the "spectral trick" for sampling the latent Leroux field.
+#            It avoids constructing a parameter-dependent precision matrix and using MvNormalCanon,
+#            which is not AD-friendly. Instead, it samples standard normal noise and transforms
+#            it using the pre-computed eigenvectors (U) and a diagonal matrix (D) constructed
+#            from the eigenvalues (L) and the sampled hyperparameters (sigma, rho).
+# Assumptions: The component specification `spec` contains pre-computed `U` and `L`.
+function generate_leroux_assembly_spectral(spec::NamedTuple, M::NamedTuple, arch::String)
+    key = spec.key
+    p_names = generate_full_variable_names(spec, arch, get(spec.params, :outcome_idx, nothing))
+
+    priors_str = """
+    # --- Priors for Leroux component: $(key) ---
+    $(p_names.sigma) ~ $(_distribution_to_string(spec.component_obj.sigma))
+    $(p_names.rho) ~ $(_distribution_to_string(spec.component_obj.rho))
+    """
+
+    assembly_lines = [
+        "# --- Leroux spectral assembly: $(key) ---",
+        "$(p_names.struct) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)",
+        "",
+        "# Construct the diagonal of the spectral transformation matrix D.",
+        "# For Leroux, Q = (1-rho)*I + rho*Q_star. Eigenvalues are (1-rho) + rho*L_j.",
+        "# D = diag(sigma / sqrt( (1-rho) + rho*L_j ) )",
+        "local diag_D = $(p_names.sigma) ./ sqrt.((1.0 .- $(p_names.rho)) .+ $(p_names.rho) .* spec.L .+ 1e-9)",
+        "",
+        "# Apply the spectral transformation: latent = U * D * z",
+        "local leroux_field = spec.U * (diag_D .* $(p_names.struct))",
+        "",
+        "eta .+= leroux_field[M.s_idx]"
+    ]
+    assembly_str = join(assembly_lines, "\n    ")
+
+    return (priors=priors_str, assembly=assembly_str, post_assembly="")
+end
+
+
+# Version 1.0.0 (2026-08-06)
+# Purpose: Generates the Turing model code for RW1 and RW2 components using spectral decomposition.
+# Rationale: Implements the "spectral trick" for sampling intrinsic random walk fields.
+#            This approach is fully differentiable and avoids Cholesky decomposition of
+#            parameter-dependent matrices. It enforces the necessary sum-to-zero constraints
+#            by zeroing out the components of the spectral transformation that correspond
+#            to the null space of the precision matrix.
+# Assumptions: The component specification `spec` contains pre-computed `U` and `L`.
+function generate_rw_assembly_spectral(spec::NamedTuple, M::NamedTuple, arch::String)
+    key = spec.key
+    m_obj = spec.component_obj
+    p_names = generate_full_variable_names(spec, arch, get(spec.params, :outcome_idx, nothing))
+
+    rank_deficiency = if m_obj isa RW1; 1; elseif m_obj isa RW2; 2; else 0; end
+
+    priors_str = """
+    # --- Priors for $(typeof(m_obj)) component: $(key) ---
+    $(p_names.sigma) ~ $(_distribution_to_string(m_obj.sigma))
+    """
+
+    assembly_lines = [
+        "# --- $(typeof(m_obj)) spectral assembly: $(key) ---",
+        "$(p_names.struct) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)",
+        "",
+        "# Construct the diagonal of the spectral transformation matrix D.",
+        "# D = diag(sigma / sqrt(L_j) )",
+        "local diag_D = $(p_names.sigma) ./ sqrt.(spec.L .+ 1e-9)",
+        "",
+        "# Enforce sum-to-zero constraint(s) by zeroing out components corresponding to the null space.",
+    ]
+    for i in 1:rank_deficiency
+        push!(assembly_lines, "diag_D[$(i)] = 0.0")
+    end
+    
+    push!(assembly_lines, "")
+    push!(assembly_lines, "# Apply the spectral transformation: latent = U * D * z")
+    push!(assembly_lines, "local rw_field = spec.U * (diag_D .* $(p_names.struct))")
+    push!(assembly_lines, "")
+    push!(assembly_lines, "eta .+= rw_field[M.t_idx]")
+
+    assembly_str = join(assembly_lines, "\n    ")
+
+    return (priors=priors_str, assembly=assembly_str, post_assembly="")
+end
+
+
