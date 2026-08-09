@@ -127,18 +127,24 @@ end
 
 
 
-# Purpose: Implements a state-space evolution for an AR(1) process.
-# Rationale: This version is simplified by removing the explicit `T_model` argument and
-#            replacing the final scaling loop with more efficient broadcasting.
+"""
+    ar1_statespace(rho, sigma, innov, n_latent, noise)
+
+Computes the state-space evolution of an AR(1) process in a type-stable manner.
+
+This function is designed to be compatible with Automatic Differentiation by
+inferring the numeric type (`T_num`) from its arguments. This ensures that if
+parameters like `rho` or `sigma` are `Dual` numbers, the entire calculation
+is performed with `Dual` numbers, avoiding type errors.
+"""
 function ar1_statespace(rho, sigma, innov, n_latent, noise)
-    # This function computes the state-space evolution of an AR(1) process.
-    # It is designed to be type-stable and work with different numeric types.
-    
+    # Promote the types of all numeric inputs to ensure type stability.
     T_num = promote_type(typeof(rho), typeof(sigma), eltype(innov), typeof(noise))
     latent = Vector{T_num}(undef, n_latent)
     
     if n_latent > 0
         # Initialize the first state using the stationary variance of the AR(1) process.
+        # `one(T_num)` and `T_num(noise)` ensure all terms have the correct type.
         latent[1] = innov[1] / sqrt(one(T_num) - rho^2 + T_num(noise))
         
         # Evolve the process for subsequent time steps.

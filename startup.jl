@@ -115,18 +115,24 @@ print( "\nTo Debug a variable, place something like the following into your func
 which means, you can see what these values are by typing: DEBUG.y, etc... \n")
  
 function load_project_functions( src_dir=srcdir() )
-    
-  fns = [ joinpath( src_dir, "definitions.jl" ) ]
+   
+  fns_main = [
+    "definitions.jl",
+    "data.jl", 
+    "partitioning.jl", 
+    "model.jl", 
+    "likelihoods.jl", 
+    "reconstruction.jl"
+  ]
+
+  fns = joinpath.( src_dir, fns_main )
 
   fnc = readdir( joinpath( src_dir, "components" ) )
   for fn in fnc 
     push!(fns, joinpath(src_dir, "components", fn) )
   end
 
-  fns = [ fns;  
-    joinpath.( src_dir, [ "data.jl", "partitioning.jl", "model.jl", "likelihoods.jl", "reconstruction.jl" ] )
-  ]
- 
+  
   for fn in fns 
     if endswith(fn, ".jl")
       try

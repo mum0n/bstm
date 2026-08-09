@@ -196,3 +196,101 @@ function get_effects(
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+
+
+
+
+function adjacency_to_bipartite(W::AbstractMatrix; force_bipartite::Bool=true)
+    # # Process: Translates a unipartite graph into a bipartite representation.
+    # # Rationale: Required for models like BCGN that operate on inter-set connectivity.
+    
+    rows, cols = size(W)
+    if rows != cols
+        error("Input matrix must be square to represent a unipartite adjacency structure.")
+    end
+    
+    n = rows
+    g = SimpleGraph(W)
+    
+    # # Coloring Algorithm: Attempt to find a natural 2-coloring (bipartition)
+    # # nodes are assigned to set 0 or set 1
+    colors = fill(-1, n)
+    is_bipartite = true
+    
+    for start_node in 1:n
+        if colors[start_node] != -1
+            continue
+        end
+        
+        colors[start_node] = 0
+        queue = [start_node]
+        
+        while !isempty(queue)
+            u = popfirst!(queue)
+            for v in Neighbors(g, u)
+                if colors[v] == -1
+                    colors[v] = 1 - colors[u]
+                    push!(queue, v)
+                elseif colors[v] == colors[u]
+                    is_bipartite = false
+                    if !force_bipartite
+                        error("Graph is not bipartite and force_bipartite is false.")
+                    end
+                end
+            end
+        end
+    end
+    
+    # # Fallback: If not bipartite, use a greedy degree-based partition to maximize cut
+    if !is_bipartite
+        @warn "Graph is not naturally bipartite. Applying greedy partitioning to maximize inter-set edges."
+        colors = fill(0, n)
+        node_degrees = degree(g)
+        sorted_nodes = sortperm(node_degrees, rev=true)
+        
+        for u in sorted_nodes
+            # # Count neighbors already in set 0 and set 1
+            n0 = 0
+            n1 = 0
+            for v in Neighbors(g, u)
+                if colors[v] == 0
+                    n0 += 1
+                else
+                    n1 += 1
+                end
+            end
+            # # Assign to the set that maximizes connections to the other set
+            colors[u] = n0 >= n1 ? 1 : 0
+        end
+    end
+    
+    # # Extraction: Construct the bipartite matrix B
+    set1_indices = findall(==(0), colors)
+    set2_indices = findall(==(1), colors)
+    
+    n1 = length(set1_indices)
+    n2 = length(set2_indices)
+    
+    if n1 == 0 || n2 == 0
+        error("Partitioning failed to create two non-empty sets. Check graph connectivity.")
+    end
+    
+    # # B is n1 x n2 matrix representing connections from Set 1 to Set 2
+    B = spzeros(Float64, n1, n2)
+    
+    for (i, u) in enumerate(set1_indices)
+        for (j, v) in enumerate(set2_indices)
+            if W[u, v] > 0
+                B[i, j] = Float64(W[u, v])
+            end
+        end
+    end
+    
+    return (
+        bipartite_adj = B,
+        set1 = set1_indices,
+        set2 = set2_indices,
+        is_natural = is_bipartite
+    )
+end
+

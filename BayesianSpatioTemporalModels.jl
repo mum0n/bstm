@@ -52,8 +52,25 @@ export Harmonic, Cyclic
 # Specialized & Network Manifolds
 export Eigen, BCGN, LocalAdaptive
 
-include("utility_functions.jl")
-include("spatiotemporal_partitioning_functions.jl")
-include("spatiotemporal_functions.jl")
+include("definitions.jl")
+include("data.jl")
+include("partitioning.jl")
+include("likelihoods.jl")
+include("model.jl")
+include("reconstruction.jl")
+
+
+  fnc = readdir( "components" )
+   
+  for fn in fnc 
+    if endswith(fn, ".jl")
+      try
+        println(fn)  
+        include(fn)
+      catch e
+          @error "Error including file '$fn':" e
+      end
+    end
+  end
 
 end # module BayesianSpatioTemporalModels

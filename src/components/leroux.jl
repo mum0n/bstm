@@ -187,10 +187,10 @@ function get_updates(
         # 1. Construct the diagonal of the spectral transformation matrix D.
         #    For Leroux, Q = (1-ρ)I + ρQ*. The eigenvalues are (1-ρ) + ρλ_j.
         #    The standard deviation of the transformed variable is σ / sqrt(eigenvalue).
-        local diag_D = $(v.sigma) ./ sqrt.((1.0 .- $(v.rho)) .+ $(v.rho) .* spec.hyper.L .+ M.noise)
+        diag_D = $(v.sigma) ./ sqrt.((1.0 .- $(v.rho)) .+ $(v.rho) .* spec_registry[:$(spec.key)].hyper.L .+ M.noise)
         
         # 2. Apply the spectral transformation: latent = U * D * z
-        $(v.latent) = spec.hyper.U * (diag_D .* $(v.raw))
+        $(v.latent) = spec_registry[:$(spec.key)].hyper.U * (diag_D .* $(v.raw))
         
         # 3. Add the final effect to the linear predictor.
         $(eta_target) .+= view($(v.latent), M.$(index_var))
@@ -201,14 +201,14 @@ function get_updates(
         # This block constructs the Leroux spatial effect using a dense Cholesky decomposition.
         
         # 1. Recompose the full Leroux precision matrix.
-        local Q_template = spec_registry[:$(spec.key)].hyper.Q_template
-        local Q_final = (1.0 - $(v.rho)) .* I(size(Q_template, 1)) .+ $(v.rho) .* Q_template
+        Q_template = spec_registry[:$(spec.key)].hyper.Q_template
+        Q_final = (1.0 - $(v.rho)) .* I(size(Q_template, 1)) .+ $(v.rho) .* Q_template
         
         # 2. Perform a dense Cholesky decomposition.
-        local F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
+        F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
         
         # 3. Sample the latent field using the Cholesky factor (non-centered).
-        local unscaled_latent = F.L' \\ $(v.raw)
+        unscaled_latent = F.L' \\ $(v.raw)
         $(v.latent) = $(v.sigma) .* unscaled_latent
         
         # 4. Add the final effect to the linear predictor.
@@ -221,6 +221,7 @@ function get_updates(
         )
     end
 end
+
 
 """
     get_effects(m::Leroux, chain, M::NamedTuple, ...)

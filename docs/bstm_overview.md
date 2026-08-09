@@ -2210,7 +2210,6 @@ m = @bstm(
 
 #### Biological models
 ```julia
-```julia
 
 # 1. Logistic Basic
 
@@ -2237,8 +2236,7 @@ m = @bstm(
     W = W_le,
     grid_areas = ga_le
 );
-
-# ```julia
+ 
 # 3. Delay Difference
 
 df_delay_difference, W_dd, ga_dd = generate_delay_difference_data()
@@ -2250,8 +2248,7 @@ m = @bstm(
     W = W_dd,
     grid_areas = ga_dd
 );
-
-# ```julia
+ 
 # 4. Lotka-Volterra
 
 df_lotka_volterra, W_lv, ga_lv = generate_lotka_volterra_data()
@@ -2263,8 +2260,7 @@ m_lotka_volterra = @bstm(
     W = W_lv,
     grid_areas = ga_lv
 );
-
-# ```julia
+ 
 # 5. Generalized Leslie
 
 # Generate synthetic data for the generalized Leslie matrix model
@@ -2431,7 +2427,7 @@ display(chain_dd_effort)
 
 ```
 
-Delay differnce model at each spatial node: 
+Delay difference model at each spatial node: 
 
 ```julia
 # Ensure all necessary packages are loaded
@@ -2572,6 +2568,9 @@ println("\nExample complete. The plot shows the model's ability to recover the u
 
 
 ### SciML integration
+
+SciML is a major set of Julia libraries that operates upon Differential Equation models and much much more. 
+
 
 ```julia
 # Ensure all necessary packages are loaded, especially DifferentialEquations

@@ -1,4 +1,3 @@
- 
 abstract type AbstractBSTM_Family end
 struct PoissonFamily <: AbstractBSTM_Family end
 struct GaussianFamily <: AbstractBSTM_Family end
@@ -30,16 +29,19 @@ struct LeftCensored <: AbstractCensoringState end
 struct RightCensored <: AbstractCensoringState end
 struct IntervalCensored <: AbstractCensoringState end
 
- 
+"""
+    bstm_Likelihood
 
+Defines the observation model for `bstm`, parameterized by the linear predictor `eta`.
 
-
-# Version 1.5.3 (2026-08-06)
-# Purpose: Defines the observation model for bstm.
-# Rationale: This version refactors the struct to be parameterized by the linear predictor
-#            `eta` instead of the observed data `y`. The `y_obs` field is renamed to `param`
-#            to reflect this change. This is a critical fix to align with the standard
-#            `Distributions.jl` API and enable correct gradient calculations for AD-based samplers.
+# Rationale for Update
+This version refactors the struct to be parameterized by the linear predictor `eta`
+instead of the observed data `y`. The `y_obs` field is renamed to `param` to reflect
+this change. This is a critical fix to align with the standard `Distributions.jl` API
+and enable correct gradient calculations for AD-based samplers. The `Base.length` and
+`Base.size` methods have also been updated to use `d.param`, resolving a `MethodError`
+introduced by the field rename.
+"""
 struct bstm_Likelihood{F, Z, C, W, P, R, S, PR, TL, TU, HT, EX} <: ContinuousMultivariateDistribution
     family::F
     param::PR # Renamed from y_obs; now holds the linear predictor `eta`.
@@ -57,11 +59,8 @@ struct bstm_Likelihood{F, Z, C, W, P, R, S, PR, TL, TU, HT, EX} <: ContinuousMul
     extra_params::EX
 end
 
-
-
-
-Base.length(d::bstm_Likelihood) = length(d.y_obs)
-Base.size(d::bstm_Likelihood) = (length(d.y_obs),)
+Base.length(d::bstm_Likelihood) = length(d.param)
+Base.size(d::bstm_Likelihood) = (length(d.param),)
 
 function get_model_family(model_family::String)
     # Purpose: Maps a string identifier to its corresponding concrete `AbstractBSTM_Family` type.
@@ -396,4 +395,3 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::IntervalCensored, zero_inflated
         return _stable_logsubexp(logcdf(dist, upper_bound), logcdf(dist, adj_L))
     end
 end
-

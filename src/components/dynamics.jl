@@ -239,37 +239,69 @@ function get_precomputes(
     )
 end
 
-"""
-    _generate_exploitation_block(spec, time_var)
 
-A helper function to generate the Turing code block for calculating exploitation
-(e.g., catch from fishing effort) within a dynamics model simulation loop.
 """
-function _generate_exploitation_block(spec, time_var)
+    generate_exploitation_block(spec, time_var)
+
+Generates a Turing code fragment for calculating exploitation (e.g., catch or removals)
+within a `dynamics` component.
+
+# Rationale
+This function is a helper for the `get_updates` method of the `Dynamics` component. It
+is not deprecated and is consistent with the refactored architecture. Its purpose is
+to dynamically construct the code that calculates total removals from a population
+based on `effort` and/or `removal` parameters specified in the model formula.
+
+This approach is consistent with the refactor's goals:
+- **Modularity**: It encapsulates the specific logic for handling exploitation,
+  keeping the main `dynamics` code generator cleaner.
+- **Flexibility**: It supports multiple sources of exploitation (e.g., multiple
+  fishing fleets with different catchability coefficients `q`) by iterating
+  through the `effort_keys` and `removal_keys` stored in the component's
+  `hyper` registry.
+- **AD Compatibility**: The generated code initializes the `exploitation` variable
+  as `zeros(T_num_dyn, M.s_N)`, where `T_num_dyn` is the promoted numeric type
+  (e.g., `ForwardDiff.Dual`) within the dynamics loop. This ensures type stability
+  and prevents `MethodError` during automatic differentiation, a key requirement
+  of the refactor.
+
+# Arguments
+- `spec`: The `NamedTuple` specification for the `Dynamics` component.
+- `time_var`: A string representing the time index variable in the generated code (e.g., "t" or "t-1").
+
+# Returns
+- A `String` containing the generated Turing code for the exploitation block.
+"""
+function generate_exploitation_block(spec, time_var)
     effort_keys = get(spec.hyper, :effort_keys, [])
     removal_keys = get(spec.hyper, :removal_keys, [])
     
     if isempty(effort_keys) && isempty(removal_keys)
+        # If no exploitation is specified, return a zero-initialized vector.
+        # This is initialized with the correct numeric type for AD safety.
         return "local exploitation = zeros(T_num_dyn, M.s_N)"
     end
     
+    # Initialize the exploitation vector. The `local` keyword is necessary to
+    # ensure the variable is scoped correctly within the generated model code.
     lines = ["local exploitation = zeros(T_num_dyn, M.s_N)"]
+
+    # Add exploitation from effort-based removals.
+    # Assumes a catchability coefficient `q_...` is defined in the model.
     for key in effort_keys
-        push!(
-            lines,
-            "exploitation .+= q_$(key) .* " *
-            "spec_registry[:$(spec.key)].hyper.processed_params[:$(key)][:, $(time_var)] .* N_prev"
-        )
+        push!(lines, "exploitation .+= q_$(key) .* spec_registry[\"$(spec.key)\"].hyper.processed_params[:$(key)][:, $(time_var)] .* N_prev")
     end
+
+    # Add exploitation from direct removals.
     for key in removal_keys
-        push!(
-            lines,
-            "exploitation .+= " *
-            "spec_registry[:$(spec.key)].hyper.processed_params[:$(key)][:, $(time_var)]"
-        )
+        push!(lines, "exploitation .+= spec_registry[\"$(spec.key)\"].hyper.processed_params[:$(key)][:, $(time_var)]")
     end
+
     return join(lines, "\n    ")
 end
+
+
+
 
 """
     get_priors(m::Dynamics, spec::NamedTuple, arch::String, outcome_idx, M)::String
