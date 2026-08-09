@@ -1,5 +1,3 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
 
 """
     PSpline <: ComponentModel
@@ -7,6 +5,37 @@
 A component model for a P-spline (Penalized B-spline) smoother. This component
 creates a basis of B-spline functions and applies a discrete penalty (typically a
 random walk) to the coefficients to ensure smoothness and prevent overfitting.
+
+# Version
+v1.0.0 (2026-08-08)
+
+# Mathematical Summary
+The P-spline models a smooth function \$f(x)\$ as a linear combination of \$K\$ B-spline
+basis functions \$B_k(x)\$:
+\$f(x) = \\sum_{k=1}^{K} \\beta_k B_k(x)\$
+To enforce smoothness, a penalty is applied to the coefficients \$\\boldsymbol{\\beta}\$.
+This is achieved by assuming the coefficients follow a Gaussian Markov Random Field
+(GMRF) structure. A common choice is a second-order random walk (RW2), which
+penalizes deviations from a local linear trend:
+\$\\Delta^2 \\beta_k = \\beta_k - 2\\beta_{k-1} + \\beta_{k-2} \\sim \\mathcal{N}(0, \\sigma^{-2})\$
+The precision matrix \$\\mathbf{Q}\$ for the coefficients is derived from this random
+walk structure. The model then samples the coefficients from
+\$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\sigma^2 \\mathbf{Q})^{-1})\$.
+
+# Assumptions
+- The underlying function to be smoothed is continuous and smooth.
+- The number of basis functions (`nbins`) is large enough to capture the function's
+  curvature, as smoothness is enforced by the penalty, not the basis itself.
+
+# Best Use Case
+Flexible non-linear smoothing of continuous covariates. It is a powerful and widely
+used alternative to Gaussian Processes for 1D smoothing, often with better
+computational performance for large datasets.
+
+# Key References
+- Eilers, P. H., & Marx, B. D. (1996). Flexible smoothing with B-splines and
+  penalties. *Statistical Science*, 11(2), 89-102.
+- Wikipedia: P-spline
 
 # Fields
 - `nbins::Int`: The number of basis functions to generate.
@@ -21,11 +50,16 @@ struct PSpline <: ComponentModel
     sigma::Distribution
 end
 
-# Add to the central component constructor registry.
-COMPONENT_CONSTRUCTORS[:pspline] = (p, params) -> PSpline(get(params, :nbins, 20), get(params, :degree, 3), get(params, :diff_order, 2), p.sigma)
+COMPONENT_TYPE_REGISTRY[:pspline] = PSpline
 
-# Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[PSpline] = :smooth
+COMPONENT_CONSTRUCTORS[:pspline] = (p, params) -> PSpline(
+    get(params, :nbins, 20),
+    get(params, :degree, 3),
+    get(params, :diff_order, 2),
+    p.sigma
+)
+
+MODEL_TO_STRUCTURE_MAP[:pspline] = :smooth
 
 """
     get_datastructures!(m_type::Type{<:PSpline}, M::Dict, mod_data::Dict)::Bool
@@ -37,7 +71,10 @@ function get_datastructures!(m_type::Type{<:PSpline}, M::Dict, mod_data::Dict)::
     variables = mod_data[:variables]
 
     if isempty(variables)
-        error("The PSpline model requires at least one coordinate variable, e.g., `random(x, model=:pspline)`.")
+        error(
+            "The PSpline model requires at least one coordinate variable, e.g., " *
+            "`random(x, model=:pspline)`."
+        )
     end
 
     for var_sym in variables
@@ -62,24 +99,21 @@ for the random walk penalty on the coefficients.
 function get_precomputes(m::PSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
     if isnothing(coords)
-        error("PSpline component precomputes failed: coordinates not found in module data.")
+        error("PSpline precomputes failed: coordinates not found in module data.")
     end
     
     if size(coords, 2) > 1
-        @warn "PSpline is designed for 1D smooths. For multi-dimensional smoothing, consider `tps` or creating tensor products manually."
+        @warn "PSpline is designed for 1D smooths. For multi-dimensional smoothing, " *
+              "consider `tps` or creating tensor products manually."
     end
     
-    # bstm_bspline_basis is a helper function that should be available.
-    # It returns the basis matrix and the actual number of basis functions.
     B, actual_nbins = bstm_bspline_basis(coords[:, 1], m.nbins, m.degree)
     n_latent = actual_nbins
 
-    # Create penalty matrix Q based on the difference order.
     penalty_type = m.diff_order == 1 ? :rw1 : :rw2
     template = build_structure_template(penalty_type, n_latent)
     Q_template = template.matrix
     
-    # Spectral decomposition for AD-friendly sampling of coefficients.
     rank_deficiency = m.diff_order
     eig_decomp = eigen(Symmetric(Matrix(Q_template)))
     U = eig_decomp.vectors
@@ -100,93 +134,117 @@ function get_precomputes(m::PSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    get_priors(m::PSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::PSpline, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates the Turing code string for the `PSpline` component's priors.
 It defines the prior for `sigma` and the `raw` coefficients for the basis functions.
 """
-function get_priors(m::PSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(
+    m::PSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     sigma_prior_str = _distribution_to_string(m.sigma)
+    n_latent = spec.hyper.n_latent
     
     return """
-        $(p_names.sigma) ~ NamedDist($(sigma_prior_str), :$(p_names.sigma))
-        $(p_names.raw) ~ NamedDist(MvNormal(zeros(T, spec_registry[:$(spec.key)].precomputes.n_latent), I), :$(p_names.raw))
+        $(p_names.sigma) ~ $(sigma_prior_str)
+        $(p_names.raw) ~ MvNormal(zeros($(n_latent)), I)
     """
 end
 
 """
-    get_updates(m::PSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::PSpline, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates the Turing code string for constructing the `PSpline` smooth effect.
 """
-function get_updates(m::PSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(
+    m::PSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     return """
         # --- P-Spline Smoother Component: $(spec.key) ---
-        local precomputes = spec_registry[:$(spec.key)].precomputes
-        
-        # Reconstruct latent coefficients using spectral decomposition of the penalty matrix
-        local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
-        # Enforce sum-to-zero constraint(s)
-        for i in 1:$(m.diff_order); diag_D[i] = zero(T); end
-        
-        local coeffs = precomputes.U * (diag_D .* $(p_names.raw))
-        
-        # Compute final effect by multiplying basis matrix with coefficients
-        local $(p_names.latent) = T.(precomputes.basis_matrix) * coeffs
-        
-        $(eta_target) .+= $(p_names.latent)
+        let
+            local precomputes = spec_registry[:$(spec.key)].precomputes
+            
+            # Reconstruct latent coefficients using spectral decomposition of the penalty matrix
+            local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
+            # Enforce sum-to-zero constraint(s)
+            for i in 1:$(m.diff_order); diag_D[i] = 0.0; end
+            
+            local coeffs = precomputes.U * (diag_D .* $(p_names.raw))
+            
+            # Compute final effect by multiplying basis matrix with coefficients
+            local $(p_names.latent) = precomputes.basis_matrix * coeffs
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
     """
 end
 
 """
-    get_effects(m::PSpline, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::PSpline, chain, M::NamedTuple, ...)
 
 Reconstructs the `PSpline` component's effect from the MCMC chain's posterior samples.
 """
-function get_effects(m::PSpline, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    sigma_samples = get(chain, p_names.sigma)
-    raw_samples = get(chain, p_names.raw)
-
-    precomputes = spec.precomputes
-    U = precomputes.U
-    L = precomputes.L
-    noise = M.noise
+function get_effects(
+    m::PSpline, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
     
-    # The `predict` function is responsible for creating the basis matrix for the prediction set.
-    # Here, we assume it is available in PS.basis_matrices if a prediction set is provided.
-    B_train = precomputes.basis_matrix
-    B_full = if !isnothing(PS) && haskey(PS, :basis_matrices) && haskey(PS.basis_matrices, spec.key)
-        vcat(B_train, PS.basis_matrices[spec.key])
+    coord_vars = get(spec.params, :positional_args, [])
+    if isempty(coord_vars)
+        error("PSpline effect reconstruction failed: coordinate variable not found.")
+    end
+    coord_var_sym = Symbol(coord_vars[1])
+
+    B_train = spec.hyper.basis_matrix
+    
+    B_full = if !isnothing(PS) && hasproperty(PS.data, coord_var_sym)
+        coords_pred = PS.data[!, coord_var_sym]
+        B_pred, _ = bstm_bspline_basis(coords_pred, m.nbins, m.degree)
+        vcat(B_train, B_pred)
     else
         B_train
     end
-    
+
     if size(B_full, 1) != N_total
         @warn "PSpline effect reconstruction: dimension mismatch. Using in-sample effects only."
         B_full = B_train
     end
 
-    reconstructed_effects = zeros(n_samples, size(B_full, 1))
+    precomputes = spec.hyper
+    U = precomputes.U
+    L = precomputes.L
+    noise = M.noise
 
-    for i in 1:n_samples
-        current_sigma = sigma_samples[i]
-        current_raw = raw_samples[i, :]
+    for k in 1:outcomes_N
+        p_names = generate_full_variable_names(spec, M.model_arch, k)
         
-        diag_D = current_sigma ./ sqrt.(L .+ noise)
-        for j in 1:m.diff_order; diag_D[j] = 0.0; end
-        
-        coeffs = U * (diag_D .* current_raw)
-        reconstructed_effects[i, :] = B_full * coeffs
+        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
+        raw_samples = get_params_vector(
+            chain, string(p_names.raw), precomputes.n_latent
+        )
+
+        effect_k = zeros(Float64, size(B_full, 1), n_samples)
+
+        for i in 1:n_samples
+            current_sigma = sigma_samples[i]
+            current_raw = raw_samples[i, :]
+            
+            diag_D = current_sigma ./ sqrt.(L .+ noise)
+            for j in 1:m.diff_order; diag_D[j] = 0.0; end
+            
+            coeffs = U * (diag_D .* current_raw)
+            effect_k[:, i] = B_full * coeffs
+        end
+        push!(structured_effects, effect_k)
     end
-
-    mean_effect = mean(reconstructed_effects, dims=1)[:]
-    lower_ci = quantile(reconstructed_effects, 0.025, dims=1)[:]
-    upper_ci = quantile(reconstructed_effects, 0.975, dims=1)[:]
-
-    return (structured=(mean=mean_effect, lower=lower_ci, upper=upper_ci),)
+    
+    return (structured=structured_effects, noisy=structured_effects)
 end

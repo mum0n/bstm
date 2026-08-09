@@ -1,19 +1,47 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
 
 """
     FFT <: ComponentModel
 
 A component model for a Fourier-based smoother. This component creates a basis of
-sine and cosine functions at different frequencies. The effect is a linear combination
-of these basis functions, with coefficients regularized by a random walk prior to
-ensure smoothness.
+sine and cosine functions at different frequencies. The effect is a linear
+combination of these basis functions, with coefficients regularized by a random
+walk prior to ensure smoothness.
+
+# Version
+v1.0.2 (2026-08-08)
+
+# Mathematical Summary
+The component models a smooth function \$f(x)\$ as a linear combination of Fourier
+basis functions:
+\$f(x) = \\sum_{j=1}^{M} \\beta_{s,j} \\sin(2\\pi j \\cdot x / \\ell) + \\beta_{c,j} \\cos(2\\pi j \\cdot x / \\ell)\$
+where \$M\$ is half the number of bins, \$\\ell\$ is the lengthscale that controls the
+periodicity, and \$\\beta\$ are the Fourier coefficients.
+
+To ensure smoothness, a penalty is applied to the coefficients, typically a
+second-order random walk (RW2) prior, which penalizes deviations from a linear
+trend in the coefficient space.
+
+# Assumptions
+- The relationship between the covariate and the outcome is smooth and potentially
+  periodic.
+- The number of bins (`nbins`) is large enough to capture the underlying trend.
+
+# Best Use Case
+Modeling periodic or oscillating non-linear effects of continuous covariates. It is
+an alternative to P-splines when the underlying function is expected to have a
+cyclical nature.
+
+# Key References
+- **Fourier Series**: Wikipedia: Fourier Series
+- **Spectral Analysis**: Bloomfield, P. (2000). *Fourier Analysis of Time Series:
+  An Introduction*. Wiley.
 
 # Fields
-- `sigma::Distribution`: The prior for the standard deviation of the Fourier coefficients.
+- `sigma::Distribution`: The prior for the standard deviation of the Fourier
+  coefficients.
 - `nbins::Int`: The total number of basis functions (sine/cosine pairs).
-- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the lengthscale(s),
-  which control the period of the basis functions.
+- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the
+  lengthscale(s), which control the period of the basis functions.
 """
 struct FFT <: ComponentModel
     sigma::Distribution
@@ -21,21 +49,21 @@ struct FFT <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
 end
 
-# Add to the central component constructor registry.
+COMPONENT_TYPE_REGISTRY[:fft] = FFT
+
 COMPONENT_CONSTRUCTORS[:fft] = (p, params) -> FFT(
     p.sigma,
     get(params, :nbins, 20),
     p.lengthscale
 )
 
-# Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[FFT] = :smooth
+MODEL_TO_STRUCTURE_MAP[:fft] = :smooth
 
 """
     get_datastructures!(m_type::Type{<:FFT}, M::Dict, mod_data::Dict)::Bool
 
-Performs data-dependent setup for the `FFT` component.
-It ensures that coordinate variables are provided and stores them in the module data.
+Performs data-dependent setup for the `FFT` component. It ensures that coordinate
+variables are provided and stores them in the module data.
 """
 function get_datastructures!(m_type::Type{<:FFT}, M::Dict, mod_data::Dict)::Bool
     variables = mod_data[:variables]
@@ -50,18 +78,16 @@ function get_datastructures!(m_type::Type{<:FFT}, M::Dict, mod_data::Dict)::Bool
         end
     end
 
-    # Store the coordinates matrix in the module's parameters for later use.
     mod_data[:params][:coords] = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-
     return true
 end
 
 """
     get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Performs data-independent pre-calculations for the `FFT` component.
-This involves storing the coordinate matrix and pre-computing the penalty matrix
-and its spectral decomposition for the Fourier coefficients.
+Performs data-independent pre-calculations for the `FFT` component. This involves
+storing the coordinate matrix and pre-computing the penalty matrix and its spectral
+decomposition for the Fourier coefficients.
 """
 function get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
@@ -72,17 +98,14 @@ function get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
     n_latent = m.nbins
     n_dims = size(coords, 2)
 
-    # Determine number of bins per dimension for basis generation
     nbins_per_dim = fill(round(Int, n_latent^(1/n_dims)), n_dims)
     while prod(nbins_per_dim) < n_latent
         nbins_per_dim[1] += 1
     end
 
-    # Create penalty matrix Q for the coefficients (RW2 is a common choice for smoothness)
     template = build_structure_template(:rw2, n_latent)
     Q_template = template.matrix
     
-    # Spectral decomposition for AD-friendly sampling of coefficients
     rank_deficiency = 2 # RW2
     eig_decomp = eigen(Symmetric(Matrix(Q_template)))
     U = eig_decomp.vectors
@@ -104,42 +127,52 @@ function get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    get_priors(m::FFT, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::FFT, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for the `FFT` component's priors.
-It defines priors for `sigma`, `lengthscale`, and the `raw` coefficients.
+Generates priors for `sigma`, `lengthscale` (`ls`), and the `raw` coefficients.
 """
-function get_priors(m::FFT, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(
+    m::FFT, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(p_names.sigma))")
+    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     if m.lengthscale isa Vector
         ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ NamedDist(Product([$(ls_priors_str)]), :$(p_names.ls))")
+        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
     else
         ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ NamedDist($(ls_prior_str), :$(p_names.ls))")
+        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.raw) ~ NamedDist(MvNormal(zeros(T, spec.precomputes.n_latent), I), :$(p_names.raw))")
+    push!(
+        priors,
+        "$(p_names.raw) ~ MvNormal(zeros(T, spec.precomputes.n_latent), I)"
+    )
 
     return join(priors, "\n    ")
 end
 
 """
-    bstm_fourier_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, lengthscale::Union{Real, AbstractVector})
+    bstm_fourier_basis(coords, nbins_per_dim, lengthscale)
 
 Helper function to generate a tensor product Fourier basis matrix.
 """
-function bstm_fourier_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, lengthscale::Union{Real, AbstractVector})
+function bstm_fourier_basis(
+    coords::AbstractMatrix, nbins_per_dim::Vector{Int},
+    lengthscale::Union{Real, AbstractVector}
+)
     n_obs, n_dims = size(coords)
     
     ls_vec = if lengthscale isa Real
         fill(Float64(lengthscale), n_dims)
     else
-        if length(lengthscale) != n_dims; error("Length of lengthscale vector must match coordinate dimensions."); end
+        if length(lengthscale) != n_dims
+            error("Length of lengthscale vector must match coordinate dimensions.")
+        end
         lengthscale
     end
 
@@ -180,49 +213,51 @@ function bstm_fourier_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, 
 end
 
 """
-    get_updates(m::FFT, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::FFT, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for constructing the `FFT` smooth effect.
+Generates the Turing code for constructing the `FFT` smooth effect.
 """
-function get_updates(m::FFT, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(
+    m::FFT, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     return """
         # --- FFT Smoother Component: $(spec.key) ---
-        local precomputes = spec_registry[:$(spec.key)].precomputes
-        
-        # 1. Dynamically generate the Fourier basis matrix using the sampled lengthscale
-        local B_fft = bstm_fourier_basis(
-            T.(precomputes.coords),
-            precomputes.nbins_per_dim,
-            $(p_names.ls)
-        )
-        
-        # 2. Reconstruct latent coefficients using spectral decomposition of the penalty matrix
-        local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
-        # Enforce sum-to-zero constraints for RW2 penalty
-        diag_D[1] = zero(T)
-        diag_D[2] = zero(T)
-        
-        local coeffs = precomputes.U * (diag_D .* $(p_names.raw))
-        
-        # 3. Compute final effect by multiplying basis matrix with coefficients
-        local $(p_names.latent) = B_fft * coeffs
-        
-        $(eta_target) .+= $(p_names.latent)
+        let
+            local precomputes = spec.precomputes
+            
+            local B_fft = bstm_fourier_basis(
+                precomputes.coords,
+                precomputes.nbins_per_dim,
+                $(p_names.ls)
+            )
+            
+            local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
+            diag_D[1] = 0.0
+            diag_D[2] = 0.0
+            
+            local coeffs = precomputes.U * (diag_D .* $(p_names.raw))
+            
+            local $(p_names.latent) = B_fft * coeffs
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
     """
 end
 
 """
-    get_effects(m::FFT, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::FFT, chain, M::NamedTuple, ...)::NamedTuple
 
 Reconstructs the `FFT` component's effect from the MCMC chain's posterior samples.
 """
-function get_effects(m::FFT, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    sigma_samples = get(chain, p_names.sigma)
-    ls_samples = get(chain, p_names.ls)
-    raw_samples = get(chain, p_names.raw)
+function get_effects(
+    m::FFT, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
 
     precomputes = spec.precomputes
     U = precomputes.U
@@ -239,28 +274,30 @@ function get_effects(m::FFT, chain, M::NamedTuple, n_samples::Int, outcomes_N::I
         coords_train
     end
 
-    reconstructed_effects = zeros(n_samples, size(coords_full, 1))
+    for k in 1:outcomes_N
+        p_names = generate_full_variable_names(spec, M.model_arch, k)
+        
+        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
+        ls_samples = get_params_vector(chain, string(p_names.ls), length(m.lengthscale))
+        raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
 
-    for i in 1:n_samples
-        current_sigma = sigma_samples[i]
-        current_ls = if m.lengthscale isa Vector; ls_samples[i, :]; else ls_samples[i]; end
-        current_raw = raw_samples[i, :]
-        
-        # Reconstruct basis matrix for the current lengthscale sample
-        B_fft_i = bstm_fourier_basis(coords_full, nbins_per_dim, current_ls)
-        
-        # Reconstruct coefficients
-        diag_D = current_sigma ./ sqrt.(L .+ noise)
-        diag_D[1] = 0.0
-        diag_D[2] = 0.0
-        coeffs = U * (diag_D .* current_raw)
-        
-        reconstructed_effects[i, :] = B_fft_i * coeffs
+        effect_k = zeros(Float64, size(coords_full, 1), n_samples)
+
+        for i in 1:n_samples
+            current_ls = if m.lengthscale isa Vector; ls_samples[i, :]; else ls_samples[i]; end
+            
+            B_fft_i = bstm_fourier_basis(coords_full, nbins_per_dim, current_ls)
+            
+            diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
+            diag_D[1] = 0.0
+            diag_D[2] = 0.0
+            
+            coeffs = U * (diag_D .* raw_samples[i, :])
+            
+            effect_k[:, i] = B_fft_i * coeffs
+        end
+        push!(structured_effects, effect_k)
     end
-
-    mean_effect = mean(reconstructed_effects, dims=1)[:]
-    lower_ci = quantile(reconstructed_effects, 0.025, dims=1)[:]
-    upper_ci = quantile(reconstructed_effects, 0.975, dims=1)[:]
-
-    return (structured=(mean=mean_effect, lower=lower_ci, upper=upper_ci),)
+    
+    return (structured=structured_effects, noisy=structured_effects)
 end

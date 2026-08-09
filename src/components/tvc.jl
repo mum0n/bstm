@@ -1,12 +1,45 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
-
 """
     TVC <: ComponentModel
 
 A component model for Temporally Varying Coefficients (TVC), allowing the effect of a
 covariate to vary smoothly over time. It acts as an orchestrator, applying an inner
 temporal `ComponentModel` to a specified covariate.
+
+# Version
+v1.0.1 (2026-08-09)
+
+# Mathematical Summary
+A TVC model replaces a fixed regression coefficient \$\\beta\$ with a time-indexed
+coefficient \$\\beta(t)\$. The contribution to the linear predictor \$\\eta\$ for an
+observation at time \$t_i\$ with covariate value \$x_i\$ is given by:
+
+\$\\eta_i = \\dots + \\beta(t_i) x_i\$
+
+The time-varying coefficient \$\\boldsymbol{\\beta} = (\\beta(t_1), \\dots, \\beta(t_{t_N}))\$
+is itself modeled as a latent temporal process, governed by the `inner_model`. For
+example, if the inner model is a second-order random walk (RW2), then:
+
+\$\\beta(t) = 2\\beta(t-1) - \\beta(t-2) + \\omega_t, \\quad \\omega_t \\sim \\mathcal{N}(0, \\sigma^2_{\\beta})\$
+
+This allows the model to learn how the influence of a covariate changes over time.
+
+# Assumptions
+- The relationship between the covariate and the outcome is linear at any given
+  time point, but the slope of that relationship can change over time.
+- The temporal variation of the coefficient can be adequately captured by the
+  specified inner temporal model (e.g., `RW2`, `AR1`).
+
+# Best Use Case
+Modeling relationships that are not constant over time. For example, the effect of
+an economic policy on GDP may change as the economy adapts, or the effectiveness of
+a drug may change over the course of a long-term study.
+
+# Key References
+- West, M., & Harrison, J. (1997). *Bayesian forecasting and dynamic models*.
+  Springer Science & Business Media.
+- Prisma, C., & Frühwirth-Schnatter, S. (2021). Bayesian analysis of time-varying
+  coefficient models: A new look at the role of the forgetting factor. *Econometrics
+  and Statistics*, 18, 136-151.
 
 # Fields
 - `covariate::Symbol`: The symbol of the covariate whose coefficient varies over time.
@@ -15,13 +48,13 @@ temporal `ComponentModel` to a specified covariate.
 """
 struct TVC <: ComponentModel
     covariate::Symbol
-    model::ComponentModel # The inner temporal model
+    model::ComponentModel
 end
 
-# Add to the central component constructor registry.
-# This constructor expects the inner model to be already resolved and passed in `params`.
-# The `resolve_technical_primitive` function is responsible for resolving the inner model
-# and then calling this constructor.
+COMPONENT_TYPE_REGISTRY[:tvc] = TVC
+
+# The constructor is called by `resolve_technical_primitive`, which resolves the
+# inner model object and passes it in the `params` dictionary.
 COMPONENT_CONSTRUCTORS[:tvc] = (p, params) -> begin
     covariate = get(params, :covariate, error("TVC constructor requires a `covariate` parameter."))
     inner_model_obj = get(params, :inner_model_obj, error("TVC constructor requires an `inner_model_obj` parameter."))
@@ -29,58 +62,61 @@ COMPONENT_CONSTRUCTORS[:tvc] = (p, params) -> begin
     TVC(covariate, inner_model_obj)
 end
 
-# Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[TVC] = :temporal
+MODEL_TO_STRUCTURE_MAP[:tvc] = :temporal
 
 """
     get_datastructures!(m_type::Type{<:TVC}, M::Dict, mod_data::Dict)::Bool
 
-Performs data-dependent setup for the `TVC`.
-It ensures that the `covariate` variable is present in the data and delegates
-data structure setup to the inner temporal model.
+Data-dependent setup for the TVC component.
+Ensures the specified `covariate` exists in the data and delegates further temporal
+setup to the inner temporal model's `get_datastructures!` method.
 """
 function get_datastructures!(m_type::Type{<:TVC}, M::Dict, mod_data::Dict)::Bool
     params = mod_data[:params]
     cov_var = get(params, :covariate, nothing)
 
     if isnothing(cov_var)
-        error("TVC model requires a `covariate` parameter.")
+        error("TVC model '$(mod_data[:key])' requires a `covariate` parameter.")
     end
 
     if !hasproperty(M[:data], cov_var)
-        error("Covariate variable ':$cov_var' for TVC model not found in data.")
+        error("Covariate ':$cov_var' for TVC model '$(mod_data[:key])' not found in data.")
     end
 
-    # Delegate data structure setup to the inner temporal model
-    # The inner model's mod_data needs to be constructed from the TVC's mod_data.
+    # Delegate data structure setup to the inner temporal model.
     inner_model_spec_node = get(params, :temporal_model_spec, nothing)
     if isnothing(inner_model_spec_node)
-        error("TVC model requires a `temporal_model_spec` parameter in its module data.")
+        error("TVC model '$(mod_data[:key])' is missing the inner `temporal_model_spec`.")
     end
 
+    # The component object `m` is not yet the final TVC object at this stage,
+    # so we need to get the inner model type from the parsed formula node.
+    inner_model_name = get(inner_model_spec_node.args, :model, :rw2)
+    if !haskey(COMPONENT_TYPE_REGISTRY, inner_model_name)
+        error("Inner model ':$inner_model_name' for TVC not found in COMPONENT_TYPE_REGISTRY.")
+    end
+    inner_model_type = COMPONENT_TYPE_REGISTRY[inner_model_name]
+
     inner_mod_data = Dict(
-        :key => Symbol("$(mod_data[:key])_inner"), # Create a unique key for the inner model
+        :key => Symbol("$(mod_data[:key])_inner"),
         :type => inner_model_spec_node.module_type,
         :variables => get(inner_model_spec_node.args, :positional_args, []),
         :params => inner_model_spec_node.args
     )
     
-    # Call the inner model's get_datastructures!
-    inner_model_type = typeof(mod_data[:component_obj].model) # Access the actual inner model type
     return get_datastructures!(inner_model_type, M, inner_mod_data)
 end
 
 """
     get_precomputes(m::TVC, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Performs data-independent pre-calculations for the `TVC`.
-It delegates pre-computation to the inner temporal model and stores its results.
+Pre-computes structures for the TVC component.
+Delegates pre-computation to the inner temporal model and stores the results.
 """
 function get_precomputes(m::TVC, M::NamedTuple, mod_data::Dict)::NamedTuple
-    # Delegate pre-computation to the inner temporal model
     inner_model_spec_node = get(mod_data[:params], :temporal_model_spec, nothing)
     if isnothing(inner_model_spec_node)
-        error("TVC model's mod_data missing `temporal_model_spec` for precomputes.")
+        error("TVC model '$(mod_data[:key])' missing `temporal_model_spec` for precomputes.")
     end
 
     inner_mod_data = Dict(
@@ -89,52 +125,20 @@ function get_precomputes(m::TVC, M::NamedTuple, mod_data::Dict)::NamedTuple
         :variables => get(inner_model_spec_node.args, :positional_args, []),
         :params => inner_model_spec_node.args
     )
-
+    
     inner_precomputes = get_precomputes(m.model, M, inner_mod_data)
     
-    # The TVC component itself doesn't have a Q_template, U, L directly,
-    # but its inner model does. We store the inner model's precomputes.
     return (inner_precomputes=inner_precomputes,)
 end
 
 """
-    get_priors(m::TVC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::TVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for the `TVC`'s priors.
-It delegates prior generation to the inner temporal model.
+Generates the Turing code for the TVC component's priors.
+Delegates prior generation to the inner temporal model, ensuring that parameter
+names for the inner model are correctly scoped to avoid collisions.
 """
-function get_priors(m::TVC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-    # Construct a spec for the inner model to pass to its get_priors function.
-    # The inner model's key should be unique, derived from the TVC's key.
-    inner_spec_key = Symbol("$(spec.key)_inner")
-    inner_spec = (
-        key = inner_spec_key,
-        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.model)], # Get structure of inner model
-        var = spec.var, # Inherit variable from TVC for naming consistency
-        component_obj = m.model,
-        params = spec.params, # Pass TVC's params, as inner model's params are nested within
-        Q_template = spec.hyper.inner_precomputes.Q_template, # Use inner model's Q_template
-        scaling_factor = spec.hyper.inner_precomputes.scaling_factor,
-        hyper = spec.hyper.inner_precomputes # Pass all inner precomputes as hyper for inner model
-    )
-    
-    # Delegate prior generation to the inner temporal model
-    return get_priors(m.model, inner_spec, arch, outcome_idx, M)
-end
-
-"""
-    get_updates(m::TVC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-
-Generates the Turing code string for constructing the `TVC`'s effect
-and adding it to the linear predictor (`eta`).
-It delegates the inner model's effect construction and then applies the covariate.
-"""
-function get_updates(m::TVC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-    p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    cov_var = m.covariate
-
-    # Construct a spec for the inner model to pass to its get_updates function.
+function get_priors(m::TVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
     inner_spec_key = Symbol("$(spec.key)_inner")
     inner_spec = (
         key = inner_spec_key,
@@ -142,55 +146,63 @@ function get_updates(m::TVC, spec::NamedTuple, arch::String, outcome_idx::Union{
         var = spec.var,
         component_obj = m.model,
         params = spec.params,
-        Q_template = spec.hyper.inner_precomputes.Q_template,
-        scaling_factor = spec.hyper.inner_precomputes.scaling_factor,
-        hyper = spec.hyper.inner_precomputes
+        hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
+    )
+    
+    return get_priors(m.model, inner_spec, arch, outcome_idx, M)
+end
+
+"""
+    get_updates(m::TVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
+
+Generates Turing code for the TVC component's effect.
+Delegates the construction of the time-varying coefficient field to the inner
+model, and then multiplies this field by the specified covariate value for each
+observation before adding it to the linear predictor `eta`.
+"""
+function get_updates(m::TVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    cov_var = m.covariate
+
+    inner_spec_key = Symbol("$(spec.key)_inner")
+    inner_spec = (
+        key = inner_spec_key,
+        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.model)],
+        var = spec.var,
+        component_obj = m.model,
+        params = spec.params,
+        hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
     )
 
-    # Get the update code from the inner temporal model.
-    # We need to ensure the inner model's latent effect is assigned to a variable
-    # that we can then use, and its direct eta update is suppressed.
-    inner_frags = get_updates(m.model, inner_spec, arch, outcome_idx, M)
-    
-    # The inner model's latent effect variable name will be based on its own spec key.
+    inner_updates_code = get_updates(m.model, inner_spec, arch, outcome_idx, M)
     inner_p_names = generate_full_variable_names(inner_spec, arch, outcome_idx)
     inner_latent_var = inner_p_names.latent
 
-    # Remove any direct `eta` update from the inner fragment, as TVC will handle it.
-    # This regex needs to be robust to different spacing and variable names.
-    # It looks for `eta_target .+= ...` or `eta_target[i] += ...`
-    effect_app_regex_1 = Regex("$(eta_target) \\.\\+= .*")
-    effect_app_regex_2 = Regex("for i in 1:length\\($(eta_target)\\)\\s*$(eta_target)\\[i\\] \\+= .*end")
-    
-    update_inner_cleaned = replace(inner_frags, effect_app_regex_1 => "")
-    update_inner_cleaned = replace(update_inner_cleaned, effect_app_regex_2 => "")
+    effect_app_regex = Regex("$(eta_target) .*\\.=")
+    update_inner_cleaned = replace(inner_updates_code, effect_app_regex => "# (eta update handled by TVC)")
 
-    # The inner model's latent effect is assumed to be indexed by M.t_idx.
-    # This is consistent with the original `_generate_component_code_fragments` logic.
-    application_code = """
-        local cov_data::Vector{T} = T.(M.data[!, :$(cov_var)])
-        for i in 1:length($(eta_target))
-            $(eta_target)[i] += cov_data[i] * $(inner_latent_var)[M.t_idx[i]]
-        end
-    """
+    application_code = "$(eta_target) .+= M.data[!, :$(cov_var)] .* view($(inner_latent_var), M.t_idx)"
     
     return """
-        # --- Temporally Varying Coefficient (TVC) for: $(cov_var) (Component: $(spec.key)) ---
+        # --- Temporally Varying Coefficient (TVC) for: $(cov_var) ---
+        # 1. Generate the latent temporal field for the coefficient.
         $(update_inner_cleaned)
+
+        # 2. Apply the time-varying coefficient to the linear predictor.
         $(application_code)
     """
 end
 
 """
-    get_effects(m::TVC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::TVC, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
 
-Reconstructs the `TVC`'s effect from the MCMC chain's posterior samples.
-It reconstructs the inner model's effects and then applies the covariate.
+Reconstructs the TVC component's effect from posteriors.
+Reconstructs the inner temporal field for each posterior sample and then multiplies
+it by the covariate values to get the final TVC effect for each observation.
 """
-function get_effects(m::TVC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+function get_effects(m::TVC, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
     cov_var = m.covariate
     
-    # Construct a spec for the inner model to pass to its get_effects function.
     inner_spec_key = Symbol("$(spec.key)_inner")
     inner_spec = (
         key = inner_spec_key,
@@ -198,44 +210,35 @@ function get_effects(m::TVC, chain, M::NamedTuple, n_samples::Int, outcomes_N::I
         var = spec.var,
         component_obj = m.model,
         params = spec.params,
-        Q_template = spec.hyper.inner_precomputes.Q_template,
-        scaling_factor = spec.hyper.inner_precomputes.scaling_factor,
-        hyper = spec.hyper.inner_precomputes
+        hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
     )
 
-    # Generate parameter names for the inner model
-    inner_p_names = generate_full_variable_names(inner_spec, M.model_arch, nothing) # Pass nothing for outcome_idx, as get_effects handles multivariate internally
-
-    # Reconstruct the inner model's effects
+    inner_p_names = generate_full_variable_names(inner_spec, M.model_arch, nothing)
     inner_effects_result = get_effects(m.model, chain, M, n_samples, outcomes_N, inner_p_names, inner_spec, PS, N_total)
     
-    # The inner model's effects are typically structured (mean, lower, upper) over its latent dimension.
-    # For TVC, this is usually M.t_N.
-    inner_mean_effect = inner_effects_result.structured.mean
-    inner_lower_effect = inner_effects_result.structured.lower
-    inner_upper_effect = inner_effects_result.structured.upper
-
-    # Extract covariate data. If PS is provided, use its data, otherwise use M.data.
-    data_source = isnothing(PS) ? M.data : PS.data
-    cov_data_full = data_source[!, cov_var]
-    
-    # The inner effects are typically reconstructed for the full latent dimension (e.g., M.t_N).
-    # We need to index these effects by M.t_idx (or PS.t_idx) and multiply by the covariate.
-    idx_to_use = isnothing(PS) ? M.t_idx : PS.t_idx
-
-    # Initialize arrays for the final TVC effect
-    final_mean_effect = zeros(eltype(inner_mean_effect), length(idx_to_use))
-    final_lower_effect = zeros(eltype(inner_lower_effect), length(idx_to_use))
-    final_upper_effect = zeros(eltype(inner_upper_effect), length(idx_to_use))
-
-    for i in 1:length(idx_to_use)
-        t_idx_val = idx_to_use[i]
-        cov_val = cov_data_full[i]
-        
-        final_mean_effect[i] = cov_val * inner_mean_effect[t_idx_val]
-        final_lower_effect[i] = cov_val * inner_lower_effect[t_idx_val]
-        final_upper_effect[i] = cov_val * inner_upper_effect[t_idx_val]
+    cov_data_full = if !isnothing(PS) && hasproperty(PS.data, cov_var)
+        vcat(M.data[!, cov_var], PS.data[!, cov_var])
+    else
+        M.data[!, cov_var]
     end
 
-    return (structured=(mean=final_mean_effect, lower=final_lower_effect, upper=final_upper_effect),)
+    t_idx_full = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
+        vcat(M.t_idx, PS.data[!, :t_idx])
+    else
+        M.t_idx
+    end
+
+    structured_effects = Vector{Matrix{Float64}}()
+    for k in 1:outcomes_N
+        temporal_field_k = inner_effects_result.structured[k]
+        effect_k = zeros(Float64, N_total, n_samples)
+
+        for s in 1:n_samples
+            temporal_field_sample = view(temporal_field_k, :, s)
+            effect_k[:, s] = view(temporal_field_sample, t_idx_full) .* cov_data_full
+        end
+        push!(structured_effects, effect_k)
+    end
+
+    return (structured=structured_effects, noisy=structured_effects)
 end

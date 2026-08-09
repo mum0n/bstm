@@ -1,20 +1,57 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
-
 """
     Wavelet <: ComponentModel
 
-A component model for a wavelet-based smoother. This component creates a basis of
+A component for a wavelet-based smoother. This component creates a basis of
 wavelet functions at different scales and locations across the covariate space. The
 effect is a linear combination of these basis functions, with coefficients regularized by
 a random walk prior to ensure smoothness.
 
+# Version
+v1.0.0 (2026-08-09)
+
+# Mathematical Summary
+The wavelet smoother models a function \$f(x)\$ as a linear combination of scaled and
+translated mother wavelets \$\\psi\$:
+
+\$f(x) = \\sum_{j,k} \\beta_{jk} \\psi_{jk}(x)\$
+
+where \$\\psi_{jk}(x) = 2^{j/2} \\psi(2^j x - k)\$ represents a wavelet at scale \$j\$ and
+location \$k\$. In this implementation, the basis functions \$B_m(x)\$ are generated
+from a chosen mother wavelet family (e.g., Daubechies 'db4') at different scales
+and locations determined by the `lengthscale` and the data distribution. The effect
+is then:
+
+\$f(x) = \\sum_{m=1}^{M} \\beta_m B_m(x)\$
+
+The coefficients \$\\boldsymbol{\\beta} = (\\beta_1, \\dots, \\beta_M)\$ are given a smoothing
+prior, typically a second-order random walk (RW2), to regularize the function and
+prevent overfitting:
+
+\$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\tau \\mathbf{Q}_{RW2})^{-1})\$
+
+# Distinction from other smoothers
+- **P-Splines**: Use a basis of B-spline functions, which are localized polynomials.
+  Wavelets are self-similar and localized in both space and frequency.
+- **Gaussian Processes**: Assume a global correlation structure defined by a kernel.
+  Wavelets provide a multi-resolution basis that can be more efficient for functions
+  with both smooth regions and sharp, localized features.
+
+# Best Use Case
+Modeling functions with sharp, localized changes, spikes, or discontinuities, where
+a global smoother like a GP or a low-order spline might struggle. It is effective
+for signal denoising and capturing features at multiple scales.
+
+# Key References
+- Donoho, D. L., & Johnstone, I. M. (1994). Ideal spatial adaptation by wavelet
+  shrinkage. *Biometrika*, 81(3), 425-455.
+- Wikipedia: Wavelet transform
+
 # Fields
 - `family::Symbol`: The wavelet family to use (e.g., `:db4`, `:haar`).
 - `nbins::Int`: The total number of basis functions (wavelets) to generate.
-- `sigma::Distribution`: The prior for the standard deviation of the wavelet coefficients.
-- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the lengthscale(s),
-  which control the dilation of the wavelets.
+- `sigma::Distribution`: The prior for the std. dev. of the wavelet coefficients.
+- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: Prior for the
+  lengthscale(s), which control the dilation of the wavelets.
 """
 struct Wavelet <: ComponentModel
     family::Symbol
@@ -23,7 +60,8 @@ struct Wavelet <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
 end
 
-# Add to the central component constructor registry.
+COMPONENT_TYPE_REGISTRY[:wavelet] = Wavelet
+
 COMPONENT_CONSTRUCTORS[:wavelet] = (p, params) -> Wavelet(
     get(params, :family, :db4),
     get(params, :nbins, 32),
@@ -31,20 +69,17 @@ COMPONENT_CONSTRUCTORS[:wavelet] = (p, params) -> Wavelet(
     p.lengthscale
 )
 
-# Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[Wavelet] = :smooth
+MODEL_TO_STRUCTURE_MAP[:wavelet] = :smooth
 
 """
     get_datastructures!(m_type::Type{<:Wavelet}, M::Dict, mod_data::Dict)::Bool
 
-Performs data-dependent setup for the `Wavelet` component.
-It ensures that coordinate variables are provided and stores them in the module data.
+Ensures that coordinate variables are provided and stores them in the module data.
 """
 function get_datastructures!(m_type::Type{<:Wavelet}, M::Dict, mod_data::Dict)::Bool
     variables = mod_data[:variables]
-
     if isempty(variables)
-        error("The Wavelet model requires coordinate variables, e.g., `random(x, y, model=:wavelet)`.")
+        error("Wavelet model requires coordinate variables, e.g., `random(x, model=:wavelet)`.")
     end
 
     for var_sym in variables
@@ -53,40 +88,34 @@ function get_datastructures!(m_type::Type{<:Wavelet}, M::Dict, mod_data::Dict)::
         end
     end
 
-    # Store the coordinates matrix in the module's parameters for later use.
     mod_data[:params][:coords] = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-
     return true
 end
 
 """
     get_precomputes(m::Wavelet, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Performs data-independent pre-calculations for the `Wavelet` component.
-This involves storing the coordinate matrix and pre-computing the penalty matrix
-and its spectral decomposition for the wavelet coefficients.
+Stores the coordinate matrix and pre-computes the penalty matrix and its spectral
+decomposition for the wavelet coefficients.
 """
 function get_precomputes(m::Wavelet, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
     if isnothing(coords)
-        error("Wavelet component precomputes failed: coordinates not found in module data.")
+        error("Wavelet component precomputes failed: coordinates not found.")
     end
     
     n_latent = m.nbins
     n_dims = size(coords, 2)
 
-    # Determine number of bins per dimension for basis generation
     nbins_per_dim = fill(round(Int, n_latent^(1/n_dims)), n_dims)
     while prod(nbins_per_dim) < n_latent
         nbins_per_dim[1] += 1
     end
 
-    # Create penalty matrix Q for the coefficients (RW2 is a common choice for smoothness)
     template = build_structure_template(:rw2, n_latent)
     Q_template = template.matrix
     
-    # Spectral decomposition for AD-friendly sampling of coefficients
-    rank_deficiency = 2 # RW2
+    rank_deficiency = 2 # RW2 penalty
     eig_decomp = eigen(Symmetric(Matrix(Q_template)))
     U = eig_decomp.vectors
     L = eig_decomp.values
@@ -107,77 +136,74 @@ function get_precomputes(m::Wavelet, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    get_priors(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for the `Wavelet` component's priors.
-It defines priors for `sigma`, `lengthscale`, and the `raw` coefficients.
+Generates priors for `sigma`, `lengthscale`, and the `raw` coefficients.
 """
-function get_priors(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx, M)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(p_names.sigma))")
+    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     if m.lengthscale isa Vector
         ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ NamedDist(Product([$(ls_priors_str)]), :$(p_names.ls))")
+        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
     else
         ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ NamedDist($(ls_prior_str), :$(p_names.ls))")
+        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.raw) ~ NamedDist(MvNormal(zeros(T, spec.precomputes.n_latent), I), :$(p_names.raw))")
+    push!(priors, "$(p_names.raw) ~ MvNormal(zeros(spec.precomputes.n_latent), I)")
 
     return join(priors, "\n    ")
 end
 
 """
-    get_updates(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for constructing the `Wavelet` smooth effect.
+Generates the Turing code for constructing the `Wavelet` smooth effect.
 """
-function get_updates(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx, M)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     return """
         # --- Wavelet Smoother Component: $(spec.key) ---
-        local precomputes = spec_registry[:$(spec.key)].precomputes
+        local precomputes = spec.hyper
         
-        # 1. Dynamically generate the wavelet basis matrix using the sampled lengthscale
+        # 1. Dynamically generate the wavelet basis matrix using the sampled lengthscale.
         local B_wavelet = bstm_tensor_product_wavelet_basis(
-            T.(precomputes.coords),
+            precomputes.coords,
             precomputes.nbins_per_dim,
             Symbol("$(m.family)"),
             $(p_names.ls)
         )
         
-        # 2. Reconstruct latent coefficients using spectral decomposition of the penalty matrix
+        # 2. Reconstruct latent coefficients using spectral decomposition of the penalty.
         local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
-        # Enforce sum-to-zero constraints for RW2 penalty
-        diag_D[1] = zero(T)
-        diag_D[2] = zero(T)
+        # Enforce sum-to-zero constraints for RW2 penalty.
+        diag_D[1] = 0.0
+        diag_D[2] = 0.0
         
         local coeffs = precomputes.U * (diag_D .* $(p_names.raw))
         
-        # 3. Compute final effect by multiplying basis matrix with coefficients
-        local $(p_names.latent) = B_wavelet * coeffs
+        # 3. Compute final effect by multiplying basis matrix with coefficients.
+        $(v.latent) = B_wavelet * coeffs
         
-        $(eta_target) .+= $(p_names.latent)
+        $(eta_target) .+= $(v.latent)
     """
 end
 
 """
-    get_effects(m::Wavelet, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::Wavelet, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
 
-Reconstructs the `Wavelet` component's effect from the MCMC chain's posterior samples.
+Reconstructs the `Wavelet` component's effect from posterior samples.
 """
-function get_effects(m::Wavelet, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    sigma_samples = get(chain, p_names.sigma)
-    ls_samples = get(chain, p_names.ls)
-    raw_samples = get(chain, p_names.raw)
+function get_effects(m::Wavelet, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
 
-    precomputes = spec.precomputes
+    precomputes = spec.hyper
     U = precomputes.U
     L = precomputes.L
     noise = M.noise
@@ -191,29 +217,34 @@ function get_effects(m::Wavelet, chain, M::NamedTuple, n_samples::Int, outcomes_
     else
         coords_train
     end
+    n_obs_full = size(coords_full, 1)
 
-    reconstructed_effects = zeros(n_samples, size(coords_full, 1))
+    for k in 1:outcomes_N
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        
+        sigma_samples = get_params_vector(chain, string(v.sigma), 1)
+        ls_samples = get_params_vector(chain, string(v.ls), length(m.lengthscale))
+        raw_samples = get_params_vector(chain, string(v.raw), n_latent)
 
-    for i in 1:n_samples
-        current_sigma = sigma_samples[i]
-        current_ls = if m.lengthscale isa Vector; ls_samples[i, :]; else ls_samples[i]; end
-        current_raw = raw_samples[i, :]
-        
-        # Reconstruct basis matrix for the current lengthscale sample
-        B_wavelet_i = bstm_tensor_product_wavelet_basis(coords_full, nbins_per_dim, m.family, current_ls)
-        
-        # Reconstruct coefficients
-        diag_D = current_sigma ./ sqrt.(L .+ noise)
-        diag_D[1] = 0.0
-        diag_D[2] = 0.0
-        coeffs = U * (diag_D .* current_raw)
-        
-        reconstructed_effects[i, :] = B_wavelet_i * coeffs
+        effect_k = Matrix{Float64}(undef, n_obs_full, n_samples)
+
+        for i in 1:n_samples
+            current_sigma = sigma_samples[i, 1]
+            current_ls = if m.lengthscale isa Vector; ls_samples[i, :]; else ls_samples[i, 1]; end
+            current_raw = raw_samples[i, :]
+            
+            B_wavelet_i = bstm_tensor_product_wavelet_basis(coords_full, nbins_per_dim, m.family, current_ls)
+            
+            diag_D = current_sigma ./ sqrt.(L .+ noise)
+            diag_D[1] = 0.0
+            diag_D[2] = 0.0
+            
+            coeffs = U * (diag_D .* current_raw)
+            
+            effect_k[:, i] = B_wavelet_i * coeffs
+        end
+        push!(structured_effects, effect_k)
     end
 
-    mean_effect = mean(reconstructed_effects, dims=1)[:]
-    lower_ci = quantile(reconstructed_effects, 0.025, dims=1)[:]
-    upper_ci = quantile(reconstructed_effects, 0.975, dims=1)[:]
-
-    return (structured=(mean=mean_effect, lower=lower_ci, upper=upper_ci),)
+    return (structured=structured_effects, noisy=structured_effects)
 end

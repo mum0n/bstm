@@ -1,16 +1,55 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
 
 """
     ICAR <: ComponentModel
 
-A component model for the Intrinsic Conditional Autoregressive (ICAR) effect,
-also known as the Besag model. It implements a spatial random walk, where the
-value at each location is conditionally dependent on its neighbors.
+A component for an Intrinsic Conditional Autoregressive (ICAR) model, also known as
+a Besag model. This is a fundamental model for spatial data on a lattice or graph,
+where the value at a location is assumed to be conditionally dependent on the
+average of its neighbors.
+
+# Version
+v1.1.1 (2026-08-08)
+
+# Mathematical Summary
+The ICAR model defines a Gaussian Markov Random Field (GMRF) with a singular
+precision matrix (the graph Laplacian), making it an "intrinsic" GMRF. The
+conditional distribution of the spatial effect \$\\phi_i\$ at location \$i\$, given all
+other locations, is:
+\$\\phi_i | \\phi_{j \\ne i} \\sim \\mathcal{N}\\left( \\frac{1}{d_i} \\sum_{j \\sim i} \\phi_j, \\frac{\\sigma^2}{d_i} \\right)\$
+where \$j \\sim i\$ denotes that \$j\$ is a neighbor of \$i\$, and \$d_i\$ is the number of
+neighbors.
+
+The joint precision matrix is the graph Laplacian, \$Q = D - W\$, where \$D\$ is the
+diagonal degree matrix and \$W\$ is the adjacency matrix. Because \$Q\$ is
+rank-deficient (its rows sum to zero), a sum-to-zero constraint
+(\$\\sum_i \\phi_i = 0\$) is imposed on the latent field to ensure identifiability
+from the global intercept.
+
+# Assumptions
+- The spatial process is locally smooth, with values at neighboring locations being
+  similar.
+- The provided adjacency matrix `W` represents a single connected graph.
+  Disconnected "islands" will lead to a rank deficiency greater than 1 and cause
+  the model to fail.
+
+# Best Use Case
+Modeling structured spatial random effects for areal or lattice data, such as
+disease mapping, real estate analysis, or ecological modeling, where there is a
+strong prior belief in local spatial smoothing.
+
+# Key References
+- Besag, J. (1974). Spatial interaction and the statistical analysis of lattice
+  systems. *Journal of the Royal Statistical Society: Series B (Methodological)*,
+  36(2), 192-225.
+- Rue, H., & Held, L. (2005). *Gaussian Markov Random Fields: Theory and
+  Applications*. CRC Press.
+- Wikipedia: Conditional autoregressive model
 
 # Fields
-- `sigma::Distribution`: The prior distribution for the standard deviation of the ICAR effect.
-- `method::Symbol`: The computational method to use, e.g., `:spectral` (default) or `:cholesky`.
+- `sigma::Distribution`: The prior distribution for the standard deviation of the
+  ICAR effect.
+- `method::Symbol`: The computational method to use, e.g., `:spectral` (default)
+  or `:cholesky`.
 """
 struct ICAR <: ComponentModel
     sigma::Distribution
@@ -18,196 +57,163 @@ struct ICAR <: ComponentModel
 end
 
 # Add to the central component constructor registry.
-# This constructor allows specifying the computational method.
-COMPONENT_CONSTRUCTORS[:icar] = (p, params) -> ICAR(p.sigma, get(params, :method, :spectral))
+COMPONENT_TYPE_REGISTRY[:icar] = ICAR
+COMPONENT_CONSTRUCTORS[:icar] = (p, params) -> ICAR(
+    p.sigma, get(params, :method, :spectral)
+)
 
 # Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[ICAR] = :spatial
+MODEL_TO_STRUCTURE_MAP[:icar] = :spatial
 
 """
     get_datastructures!(m_type::Type{<:ICAR}, M::Dict, mod_data::Dict)::Bool
 
-Performs data-dependent setup for the `ICAR` component.
-It ensures that an adjacency matrix `W` is provided and sets up the spatial context
-(`s_idx`, `s_N`) in the main model configuration `M`.
+Ensures a spatial context (`s_idx`, `s_N`, `W`) is established by calling the main
+spatial processor.
+
+# Assumptions
+- A base adjacency matrix `W` must be provided in the main `@bstm` call or within
+  the `random()` module.
+- A spatial index variable must be provided in the `random()` call.
 """
 function get_datastructures!(m_type::Type{<:ICAR}, M::Dict, mod_data::Dict)::Bool
-    params = mod_data[:params]
-    variables = mod_data[:variables]
-
-    # Ensure W is available, either directly in params or in M
-    if haskey(params, :W)
-        w_val = params[:W]
-        if w_val isa Expr || w_val isa Symbol
-            calling_mod = get(M, :calling_module, Main)
-            try
-                M[:W] = Core.eval(calling_mod, w_val)
-            catch e
-                error("Could not evaluate `W` argument `$(w_val)` for ICAR component. Error: $e")
-            end
-        else
-            M[:W] = w_val
-        end
-    end
-
-    if !haskey(M, :W)
-        error("ICAR model requires an adjacency matrix `W` to be provided.")
-    end
-
-    if !hiskind(M[:W], AbstractMatrix) || isempty(M[:W])
-        error("Provided `W` for ICAR model is not a valid non-empty matrix.")
-    end
-
-    M[:s_N] = size(M[:W], 1)
-
-    if isempty(variables)
-        # If no variable is provided, assume s_idx is 1:s_N
-        M[:s_idx] = collect(1:M[:s_N])
-        @warn "Spatial index variable not provided for ICAR. Assuming `s_idx = 1:s_N`."
-    else
-        s_var_sym = Symbol(variables[1])
-        if !hasproperty(M[:data], s_var_sym)
-            error("Spatial index variable ':$s_var_sym' for ICAR model not found in data.")
-        end
-        M[:s_idx] = M[:data][!, s_var_sym]
-    end
-
+    process_spatial_module!(M, mod_data, Dict(), Dict())
     return true
 end
 
 """
     get_precomputes(m::ICAR, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Performs data-independent pre-calculations for the `ICAR` component,
-specifically building the `Q_template` for the ICAR precision matrix
-and its spectral decomposition if the method is `:spectral`.
+Pre-computes the graph Laplacian precision matrix (`Q_template = D - W`) and its
+spectral decomposition for efficient sampling.
 """
 function get_precomputes(m::ICAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     n = M.s_N
     W = M.W
-
-    # Build the Q_template for ICAR
-    W_sym = sparse((W + W') .> 0) # Ensure symmetry and binary
-    D = spdiagm(0 => vec(sum(W_sym, dims=2)))
-    Q_template = D - W_sym
-
-    rank_deficiency = 1 # ICAR has a rank deficiency of 1
-
-    # Compute eigendecomposition for spectral sampling
-    eig_decomp = eigen(Symmetric(Matrix(Q_template)))
-    U = eig_decomp.vectors
-    L = eig_decomp.values
-
-    # Compute scaling factor (geometric mean of non-zero eigenvalues)
-    scaling_factor = _compute_scaling_factor(L, rank_deficiency)
     
-    # Rescale Q_template and eigenvalues
-    Q_template_scaled = Q_template ./ scaling_factor
-    L_scaled = L ./ scaling_factor
-
-    return (Q_template=Q_template_scaled, scaling_factor=scaling_factor, U=U, L=L_scaled, n_latent=n)
+    template = build_structure_template(:icar, n; W=W)
+    
+    # Pre-compute the Cholesky factor for the cholesky method.
+    F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
+    
+    return (
+        Q_template=template.matrix, 
+        scaling_factor=template.scaling_factor, 
+        U=template.U, 
+        L=template.L, 
+        n_latent=n, 
+        cholesky_factor=F
+    )
 end
 
 """
-    get_priors(m::ICAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::ICAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for the `ICAR` component's priors.
-It defines the prior for `sigma` and the latent field `raw`.
+Generates priors for the scale parameter `sigma` and the raw innovations `raw`.
 """
-function get_priors(m::ICAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(
+    m::ICAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    
-    sigma_prior_str = _distribution_to_string(m.sigma)
-    
-    # Latent field prior (non-centered parameterization)
-    # For spectral method: raw ~ MvNormal(zeros(T, n_latent), I)
-    # For cholesky method: raw ~ MvNormal(zeros(T, n_latent), I)
+    n_latent = spec.hyper.n_latent
     
     return """
-        $(p_names.sigma) ~ NamedDist($(sigma_prior_str), :$(p_names.sigma))
-        $(p_names.raw) ~ NamedDist(MvNormal(zeros(T, spec_registry[:$(spec.key)].precomputes.n_latent), I), :$(p_names.raw))
+    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+    $(p_names.raw) ~ MvNormal(zeros($(n_latent)), I)
     """
 end
 
 """
-    get_updates(m::ICAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::ICAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for constructing the `ICAR` component's effect
-and adding it to the linear predictor (`eta`).
-It supports both `:spectral` and `:cholesky` methods.
+Generates code to sample the latent spatial field using either the `:spectral` or
+`:cholesky` method, and applies a sum-to-zero constraint for identifiability.
 """
-function get_updates(m::ICAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(
+    m::ICAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    
+    key = spec.key
+    n_latent = spec.hyper.n_latent
+
     if m.method == :spectral
-        # Spectral method: latent = sigma * U * Diagonal(1 ./ sqrt.(L .+ M.noise)) * raw
-        # Sum-to-zero constraint is handled by setting the first eigenvalue to zero.
         return """
-            # --- ICAR Component: $(spec.key) (Spectral Method) ---
-            local diag_D = $(p_names.sigma) ./ sqrt.(spec_registry[:$(spec.key)].precomputes.L .+ M.noise)
-            diag_D[1] = zero(T) # Enforce sum-to-zero constraint
-            local $(p_names.latent) = spec_registry[:$(spec.key)].precomputes.U * (diag_D .* $(p_names.raw))
-            $(eta_target) .+= $(p_names.latent)[M.s_idx]
+            # --- ICAR Component: $(key) (Spectral Method) ---
+            let
+                local U = spec_registry[:$(key)].hyper.U
+                local L = spec_registry[:$(key)].hyper.L
+                local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
+                diag_D[1] = 0.0 # Enforce sum-to-zero constraint
+                local $(p_names.latent) = U * (diag_D .* $(p_names.raw))
+                $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            end
         """
-    else # :cholesky method (default or explicit)
-        # Cholesky method: latent = sigma * inv(L') * raw
-        # Sum-to-zero constraint is applied as a soft constraint.
+    else # :cholesky method
         return """
-            # --- ICAR Component: $(spec.key) (Cholesky Method) ---
-            local Q_template = spec_registry[:$(spec.key)].precomputes.Q_template
-            local F = cholesky(Symmetric(Matrix(Q_template) + M.noise * I))
-            local $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
-            Turing.@addlogprob! logpdf(Normal(zero(T), T(0.001) * spec_registry[:$(spec.key)].precomputes.n_latent), sum($(p_names.latent))) # Soft sum-to-zero
-            $(eta_target) .+= $(p_names.latent)[M.s_idx]
+            # --- ICAR Component: $(key) (Cholesky Method) ---
+            let
+                local F = spec_registry[:$(key)].hyper.cholesky_factor
+                local latent_field_raw = F.L' \\ $(p_names.raw)
+                
+                # Apply soft sum-to-zero constraint for identifiability
+                Turing.@addlogprob! logpdf(
+                    Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw)
+                )
+                
+                local $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
+                
+                $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            end
         """
     end
 end
 
 """
-    get_effects(m::ICAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::ICAR, chain, M::NamedTuple, ...)::NamedTuple
 
-Reconstructs the `ICAR` component's effect from the MCMC chain's posterior samples.
+Reconstructs the `ICAR` component's spatial effect from posterior samples, applying a
+sum-to-zero constraint for identifiability.
 """
-function get_effects(m::ICAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    sigma_samples = get(chain, p_names.sigma)
-    raw_samples = get(chain, p_names.raw)
-
-    n_latent = spec.precomputes.n_latent
+function get_effects(
+    m::ICAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
+    n_latent = spec.hyper.n_latent
     noise = M.noise
 
-    # Determine indices for reconstruction (training or prediction)
-    idx_to_use = isnothing(PS) ? M.s_idx : PS.s_idx
-    
-    reconstructed_effects = zeros(n_samples, n_latent)
+    for k in 1:outcomes_N
+        p_names = generate_full_variable_names(spec, M.model_arch, k)
+        
+        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
+        raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
 
-    if m.method == :spectral
-        U = spec.precomputes.U
-        L = spec.precomputes.L
-        for i in 1:n_samples
-            current_sigma = sigma_samples[i]
-            current_raw = raw_samples[i, :]
-            diag_D = current_sigma ./ sqrt.(L .+ noise)
-            diag_D[1] = 0.0 # Enforce sum-to-zero
-            reconstructed_effects[i, :] = U * (diag_D .* current_raw)
+        effect_k = zeros(Float64, n_latent, n_samples)
+
+        if m.method == :spectral
+            U = spec.hyper.U
+            L = spec.hyper.L
+            for j in 1:n_samples
+                diag_D = sigma_samples[j] ./ sqrt.(L .+ noise)
+                diag_D[1] = 0.0 # Enforce sum-to-zero
+                effect_k[:, j] = U * (diag_D .* raw_samples[j, :])
+            end
+        else # :cholesky method
+            F = spec.hyper.cholesky_factor
+            for j in 1:n_samples
+                latent_field_raw = F.L' \ raw_samples[j, :]
+                latent_field_centered = latent_field_raw .- mean(latent_field_raw)
+                effect_k[:, j] = latent_field_centered .* sigma_samples[j]
+            end
         end
-    else # :cholesky method
-        Q_template = spec.precomputes.Q_template
-        for i in 1:n_samples
-            current_sigma = sigma_samples[i]
-            current_raw = raw_samples[i, :]
-            F = cholesky(Symmetric(Matrix(Q_template) + noise * I))
-            reconstructed_effects[i, :] = current_sigma .* (F.L' \ current_raw)
-        end
+        
+        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
+        indexed_effects = effect_k[s_idx_full, :]
+        push!(structured_effects, indexed_effects)
     end
-
-    mean_effect = mean(reconstructed_effects, dims=1)[:]
-    lower_ci = quantile(reconstructed_effects, 0.025, dims=1)[:]
-    upper_ci = quantile(reconstructed_effects, 0.975, dims=1)[:]
-
-    indexed_mean = mean_effect[idx_to_use]
-    indexed_lower = lower_ci[idx_to_use]
-    indexed_upper = upper_ci[idx_to_use]
-
-    return (structured=(mean=indexed_mean, lower=indexed_lower, upper=indexed_upper),)
+    
+    return (structured=structured_effects, noisy=structured_effects)
 end

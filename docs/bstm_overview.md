@@ -2203,13 +2203,13 @@ A mechanistic model for a process that is transported (advection) and spreads (d
 
 ```julia
 m = @bstm(
-    likelihood(y) ~ intercept() + dynamics(s_idx, year, model=advection_diffusion, W=W),
+    likelihood(y) ~ intercept() + dynamics(s_idx, year, model=:advection_diffusion, W=W),
     data
 );
 ```
 
 #### Biological models
- 
+```julia
 ```julia
 
 # 1. Logistic Basic
@@ -2238,7 +2238,7 @@ m = @bstm(
     grid_areas = ga_le
 );
 
-# 
+# ```julia
 # 3. Delay Difference
 
 df_delay_difference, W_dd, ga_dd = generate_delay_difference_data()
@@ -2251,7 +2251,7 @@ m = @bstm(
     grid_areas = ga_dd
 );
 
-# 
+# ```julia
 # 4. Lotka-Volterra
 
 df_lotka_volterra, W_lv, ga_lv = generate_lotka_volterra_data()
@@ -2264,7 +2264,7 @@ m_lotka_volterra = @bstm(
     grid_areas = ga_lv
 );
 
-
+# ```julia
 # 5. Generalized Leslie
 
 # Generate synthetic data for the generalized Leslie matrix model
@@ -2340,7 +2340,7 @@ m_spatial_K = @bstm(
     verbose = true # Set to false to suppress detailed model code and prior check output
 );
 
-# 
+# ```julia
 # 7. Leslie matrix
 
 # 1. Generate synthetic data with 3 age classes
@@ -2357,7 +2357,7 @@ m_leslie_matrix = @bstm(
     grid_areas = ga_lm
 );
 
-# 3. Sample from the model
+# 3. Sample from the model (assuming `m_leslie_matrix` is defined)
 chain_leslie_matrix = sample(m_leslie_matrix, NUTS(), 500; progress=true)
 
 # 4. Display results
@@ -2591,7 +2591,7 @@ function lotka_volterra!(du, u, p, t)
 end
 
 # --- 2. Generate Synthetic Data ---
-# We will solve the ODE with known parameters and add noise to simulate real-world observations.
+# We will solve the ODE with known parameters and add noise to simulate real-world observations. (assuming `lotka_volterra!` is defined)
 
 # True parameters and initial conditions
 u0_true = [1.0, 0.5]
@@ -2615,7 +2615,7 @@ df = DataFrame(
 );
 
 # --- 3. Define and Run the bstm Model ---
-# We now define a model to recover the parameters (α, β, γ, δ) and initial conditions (u0).
+# We now define a model to recover the parameters (α, β, γ, δ) and initial conditions (u0). (assuming `prey_observed`, `time`, `df` are defined)
 
 println("Defining the bstm model with a sciml() component...")
 

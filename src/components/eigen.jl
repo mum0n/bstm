@@ -1,12 +1,46 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
+
 
 """
     Eigen <: ComponentModel
 
 A component model for Bayesian Principal Component Analysis (PCA) or Factor Analysis.
 It decomposes a set of multivariate outcomes into a smaller set of orthogonal latent
-factors, and uses the sum of these factors as a predictor in the main model.
+factors, and uses the dominant latent factor as a predictor in the main model.
+
+# Version
+v1.0.1 (2026-08-08)
+
+# Mathematical Summary
+The `Eigen` component models a set of \$N_{vars}\$ observed variables \$Y \\in \\mathbb{R}^{N_{obs} \\times N_{vars}}\$
+as a linear combination of \$N_{factors}\$ latent factors \$F \\in \\mathbb{R}^{N_{obs} \\times N_{factors}}\$
+and a loadings matrix \$L \\in \\mathbb{R}^{N_{vars} \\times N_{factors}}\$, plus idiosyncratic noise \$\\Psi\$:
+\$Y = F L^T + \\Psi\$
+where \$F_{i,j} \\sim \\mathcal{N}(0, \\sigma_{pca,j}^2)\$ and \$\\Psi_{i,j} \\sim \\mathcal{N}(0, \\sigma_{pdef,j}^2)\$.
+
+To ensure the loadings matrix \$L\$ is identifiable and orthonormal, it is constructed
+using a sequence of Householder reflections. This parameterization ensures \$L^T L = I\$.
+The latent factors \$F\$ are typically sampled from standard normal distributions.
+
+The effect added to the linear predictor `eta` of the main model is the first
+(dominant) latent factor \$F_{:,1}\$.
+
+# Assumptions
+- The input variables are centered (mean-subtracted). This is handled automatically
+  by `get_datastructures!`.
+- The number of factors `n_factors` is less than the number of variables `n_vars`.
+- The Householder transformation provides a stable and differentiable way to
+  parameterize orthonormal matrices.
+
+# Best Use Case
+Dimensionality reduction for multivariate data, identifying the dominant shared
+signal across multiple correlated variables, and using this signal as a predictor
+in a larger model. Useful in ecology for species assemblages, in finance for
+portfolio analysis, or in neuroscience for brain activity patterns.
+
+# Key References
+- **Bayesian PCA**: Tipping, M. E., & Bishop, C. M. (1999). *Probabilistic Principal Component Analysis*. Journal of the Royal Statistical Society: Series B (Statistical Methodology), 61(3), 611-622.
+- **Householder Transformation**: Golub, G. H., & Van Loan, C. F. (2013). *Matrix Computations*. Johns Hopkins University Press.
+- **Wikipedia**: Householder transformation
 
 # Fields
 - `n_vars::Int`: The number of variables (outcomes) to be decomposed.
@@ -23,6 +57,8 @@ struct Eigen <: ComponentModel
     ltri_indices::Vector{Int}
 end
 
+COMPONENT_TYPE_REGISTRY[:eigen] = Eigen
+
 # Add to the central component constructor registry.
 # The parameters are populated by `get_datastructures!`.
 COMPONENT_CONSTRUCTORS[:eigen] = (p, params) -> Eigen(
@@ -34,14 +70,18 @@ COMPONENT_CONSTRUCTORS[:eigen] = (p, params) -> Eigen(
 )
 
 # Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[Eigen] = :any
+MODEL_TO_STRUCTURE_MAP[:eigen] = :any
 
 """
     get_datastructures!(m_type::Type{<:Eigen}, M::Dict, mod_data::Dict)::Bool
 
 Performs data-dependent setup for the `Eigen` component. It extracts the multivariate
-data to be decomposed, validates dimensions, and pre-calculates indices for the
-Householder transformation used to ensure orthonormal loadings.
+data to be decomposed, centers it, validates dimensions, and pre-calculates indices
+for the Householder transformation used to ensure orthonormal loadings.
+
+# Assumptions
+- The `eigen()` call provides one or more variables representing the multivariate data.
+- The data should be continuous.
 """
 function get_datastructures!(m_type::Type{<:Eigen}, M::Dict, mod_data::Dict)::Bool
     params = mod_data[:params]
@@ -72,6 +112,7 @@ function get_datastructures!(m_type::Type{<:Eigen}, M::Dict, mod_data::Dict)::Bo
     end
     
     # Pre-calculate indices for the lower-triangular part of the Householder matrix.
+    # This is used to map the flat `v_raw` vector to the `v_mat` for Householder.
     ltri_mask = [r >= c for r in 1:n_vars, c in 1:n_factors]
     ltri_indices = findall(vec(ltri_mask))
     
@@ -98,7 +139,7 @@ function get_precomputes(m::Eigen, M::NamedTuple, mod_data::Dict)::NamedTuple
 
     return (
         eigen_data=eigen_data,
-        n_latent=n_obs # The main effect is per-observation
+        n_latent=n_obs # The main effect added to eta is per-observation
     )
 end
 
@@ -117,7 +158,7 @@ function get_priors(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Union
 
     return """
         # Priors for Eigen component: $(spec.key)
-        $(p_names.v_raw) ~ NamedDist(MvNormal(zeros(T, $(length(m.ltri_indices))), T(1.0)), :$(p_names.v_raw))
+        $(p_names.v_raw) ~ NamedDist(MvNormal(zeros(T, $(length(m.ltri_indices))), 1.0), :$(p_names.v_raw))
         $(p_names.pca_sd) ~ NamedDist(filldist($(pca_sd_prior_str), $(m.n_factors)), :$(p_names.pca_sd))
         $(p_names.pdef_sd) ~ NamedDist(filldist($(pdef_sd_prior_str), $(m.n_vars)), :$(p_names.pdef_sd))
         $(p_names.factors_flat) ~ NamedDist(MvNormal(zeros(T, $(n_obs * m.n_factors)), I), :$(p_names.factors_flat))
@@ -128,7 +169,8 @@ end
     get_updates(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
 
 Generates the Turing code for the `Eigen` component. This includes the likelihood
-for the factor analysis and the construction of the effect to be added to `eta`.
+for the factor analysis and the construction of the dominant latent factor to be
+added to the linear predictor `eta`.
 """
 function get_updates(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
@@ -138,57 +180,71 @@ function get_updates(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Unio
 
     return """
         # --- Factor Model for Eigen Component: $(spec.key) ---
-        local v_mat = zeros(T, $(m.n_vars), $(m.n_factors))
-        v_mat[$(m.ltri_indices)] .= $(p_names.v_raw)
-        
-        local U = householder_to_eigenvector(v_mat, $(m.n_vars), $(m.n_factors))
-        local L = U * Diagonal($(p_names.pca_sd))
-        local F = reshape($(p_names.factors_flat), $(n_obs), $(m.n_factors))
-        local Y_hat = F * L'
-        local Psi = Diagonal($(p_names.pdef_sd).^2) + (T(M.noise) * I)
-        
-        local Y_eigen_data = spec_registry[:$(spec.key)].precomputes.eigen_data
-        for i in 1:$(n_obs)
-            # This component has its own likelihood for the factor analysis part.
-            Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), Y_eigen_data[i, :])
+        let
+            local v_mat = zeros(T, $(m.n_vars), $(m.n_factors))
+            v_mat[$(m.ltri_indices)] .= $(p_names.v_raw)
+            
+            local U = householder_to_eigenvector(v_mat, $(m.n_vars), $(m.n_factors))
+            local L = U * Diagonal($(p_names.pca_sd))
+            local F = reshape($(p_names.factors_flat), $(n_obs), $(m.n_factors))
+            local Y_hat = F * L'
+            local Psi = Diagonal($(p_names.pdef_sd).^2) + (T(M.noise) * I)
+            
+            local Y_eigen_data = spec_registry[:$(spec.key)].precomputes.eigen_data
+            for i in 1:$(n_obs)
+                # This component has its own likelihood for the factor analysis part.
+                # Do NOT cast Y_eigen_data to T, as this breaks AD.
+                Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), Y_eigen_data[i, :])
+            end
+            
+            # The effect added to the main model's linear predictor is the first latent factor.
+            $(eta_target) .+= view(F, :, 1)
         end
-        
-        # The effect added to the main model is the sum of the factor scores.
-        $(eta_target) .+= sum(F, dims=2)
     """
 end
 
 """
     get_effects(m::Eigen, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
 
-Reconstructs the `Eigen` component's effect (sum of factor scores) from the MCMC chain.
+Reconstructs the `Eigen` component's effect (the dominant latent factor) from the MCMC chain.
 """
 function get_effects(m::Eigen, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    factors_samples = get(chain, p_names.factors_flat)
+    structured_effects = Vector{Matrix{Float64}}()
     
     n_obs_train = size(spec.precomputes.eigen_data, 1)
     n_factors = m.n_factors
 
-    # The effect is the sum of factor scores for each observation.
-    total_effect = zeros(n_samples, n_obs_train)
-    for j in 1:n_samples
-        F_matrix_j = reshape(factors_samples[j, :], n_obs_train, n_factors)
-        total_effect[j, :] = sum(F_matrix_j, dims=2)
-    end
+    # Extract samples for the flat factors
+    factors_samples = get(chain, p_names.factors_flat)
 
     # Handle prediction set (PS) if provided.
     # For out-of-sample prediction, the latent factors are unknown.
-    # A common approach is to use the mean effect (which is zero for standard normal factors).
-    # Here, we will pad with zeros, assuming the effect is centered.
-    if !isnothing(PS)
-        n_pred = PS.y_N
-        pred_effect = zeros(n_samples, n_pred)
-        total_effect = hcat(total_effect, pred_effect)
+    # A common approach is to assume they are zero or sample from their prior.
+    # Here, we pad with zeros for prediction points.
+    n_obs_full = N_total # Total observations (train + pred)
+    
+    # Reconstruct the first latent factor for each sample.
+    first_factor_samples = zeros(Float64, n_obs_full, n_samples)
+    
+    for j in 1:n_samples
+        # Reshape the flat factors into a matrix of scores for the training data.
+        F_matrix_j = reshape(factors_samples[j, :], n_obs_train, n_factors)
+        
+        # The effect is the first latent factor (first column of F).
+        first_factor_samples[1:n_obs_train, j] = view(F_matrix_j, :, 1)
+        
+        # Prediction points (if any) are assumed to have zero effect for factors.
+        # This is a simplification; a more complex model might sample them or impute.
+        if n_obs_full > n_obs_train
+            first_factor_samples[(n_obs_train+1):n_obs_full, j] .= 0.0
+        end
     end
 
-    mean_effect = mean(total_effect, dims=1)[:]
-    lower_ci = quantile(total_effect, 0.025, dims=1)[:]
-    upper_ci = quantile(total_effect, 0.975, dims=1)[:]
-
-    return (structured=(mean=mean_effect, lower=lower_ci, upper=upper_ci),)
-end 
+    # The Eigen effect is univariate (the dominant factor); it applies the same effect to all outcomes.
+    # We replicate the single reconstructed effect for each outcome.
+    for k in 1:outcomes_N
+        push!(structured_effects, first_factor_samples)
+    end
+    
+    return (structured=structured_effects, noisy=structured_effects)
+end

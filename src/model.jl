@@ -1,257 +1,19 @@
 
 
-# ==============================================================================
-# SECTION 1: CORE DATA STRUCTURES AND TYPE DEFINITIONS
-# ==============================================================================
 
-
-abstract type Component end
-
-abstract type ComponentOperator <: Component end
-
-# All component models must inherit from ComponentModel
-abstract type ComponentModel <: Component end
-
-struct None <: ComponentModel end
-
-
-# these constructors will be added upon by each component file
-const COMPONENT_CONSTRUCTORS = Dict{Symbol, Function}(
-    :none => (p, params) -> None()  
-)
-
-# these structures will be added to where required in the component file
-const MODEL_TO_STRUCTURE_MAP = Dict{Symbol, Symbol}(
-    :none => :none  # dummy value to initiate the map 
-)
-
-
-
- 
-abstract type AbstractModelArchitecture end
-struct UnivariateArchitecture <: AbstractModelArchitecture end
-struct MultivariateArchitecture <: AbstractModelArchitecture end
-struct MultifidelityArchitecture <: AbstractModelArchitecture end
-struct ExampleArchitecture <: AbstractModelArchitecture end
-struct UnknownArchitecture <: AbstractModelArchitecture end
-
-
-
-# ==============================================================================
-# SECTION 2: CONSTANTS, REGISTRIES, AND OPERATOR OVERLOADS
-# ==============================================================================
-
-const BSTM_MODULE_KEYWORDS = Set([ 
-    :intercept, :fixed, :mixed, :random, :nested, :eigen, :dynamics, :pointprocess, :custom,
-    :zscore, :log, :center, :scale, :sciml
-]);
- 
- 
-const TRANSFORMATION_FUNCTIONS = Set([:zscore, :log, :center, :scale])
- 
-
-
-# Define simple structs for geometric primitives
-struct Point2D
-    x::Float64
-    y::Float64
+function Base.:|>(m1::Component, m2::Component)
+    return Composed([m1, m2], :pipe)
 end
 
-struct Point4D
-    x::Float64
-    y::Float64
-    z::Float64
-    t::Float64
-end
+composition(m1::Component, m2::Component) = Composed([m1, m2], :composition)
+∘(m1::Component, m2::Component) = Composed([m1, m2], :composition)
 
-struct Triangle
-    v1::Int
-    v2::Int
-    v3::Int
-end
+otimes(m1::Component, m2::Component) = Composed([m1, m2], :kronecker_product)
+⊗(m1::Component, m2::Component) = Composed([m1, m2], :kronecker_product)
 
-
-# interface definitions
-
-
-"""
-    get_datastructures!(m_type::Type{<:ComponentModel}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup and validation for a component type.
-
-This method is dispatched on the component's *type* (e.g., `IID`, `AR1`) and runs
-early in the `bstm_config` pipeline. It is responsible for:
-1.  Preparing necessary data structures (e.g., adjacency matrix `W`, basis functions, indices).
-2.  Modifying the global model configuration `M` (e.g., setting `M[:s_N]`, `M[:s_idx]`).
-
-# Arguments
-- `m_type`: The `Type` of the `ComponentModel` (e.g., `IID`, `AR1`).
-- `M`: The main model configuration dictionary, which can be mutated.
-- `mod_data`: A dictionary containing parsed module data (e.g., variables, parameters).
-
-# Returns
-- `true`: If a component object should be created for this module.
-- `false`: If this module only performs setup and does not require a component object
-           (e.g., interaction flags that are handled globally).
-
-# Assumptions
-- This method is called before the component object itself is instantiated.
-- It is responsible for ensuring that all data-related prerequisites for the
-  component's `get_precomputes` method are met.
-"""
-function get_datastructures! end
-
-"""
-    get_precomputes(m::ComponentModel, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Performs data-independent pre-calculations for a component instance.
-
-This method is dispatched on the `ComponentModel` instance and runs after the
-component has been instantiated. It is responsible for:
-1.  Building template matrices (e.g., `Q_template` for GMRFs).
-2.  Computing spectral decompositions (`U`, `L` for AD-friendly sampling).
-3.  Generating fixed basis functions or other static structures.
-
-# Arguments
-- `m`: The `ComponentModel` instance.
-- `M`: The main model configuration `NamedTuple`.
-- `mod_data`: A dictionary containing parsed module data.
-
-# Returns
-- A `NamedTuple` containing all precomputed items necessary for code generation
-  and posterior reconstruction (e.g., `(Q_template=..., U=..., L=...)`).
-
-# Assumptions
-- All data-dependent setup (e.g., `s_N`, `t_N`, `W`) has already been performed
-  by `get_datastructures!`.
-"""
-function get_precomputes end
-
-"""
-    get_priors(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-
-Generates the Turing code string for the component's priors.
-
-This method is dispatched on the `ComponentModel` instance and is responsible for
-producing Julia/Turing code snippets that define:
-1.  Priors for the component's hyperparameters (e.g., `sigma`, `rho`).
-2.  Priors for the component's latent fields (e.g., `raw ~ MvNormal(...)`).
-
-# Arguments
-- `m`: The `ComponentModel` instance.
-- `spec`: A `NamedTuple` containing the component's full specification (key, structure, etc.).
-- `arch`: The model architecture (`"univariate"`, `"multivariate"`).
-- `outcome_idx`: The index of the outcome for multivariate models, `nothing` otherwise.
-- `M`: The main model configuration `NamedTuple`.
-
-# Returns
-- A `String` containing the generated Turing code for priors.
-"""
-function get_priors end
-
-"""
-    get_updates(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-
-Generates the Turing code string for constructing the component's effect and adding it to the linear predictor.
-
-This method is dispatched on the `ComponentModel` instance and is responsible for
-producing Julia/Turing code snippets that define:
-1.  The logic for transforming sampled latent variables into the component's effect.
-2.  Adding this effect to the linear predictor (`eta`).
-
-# Arguments
-- `m`: The `ComponentModel` instance.
-- `spec`: A `NamedTuple` containing the component's full specification.
-- `arch`: The model architecture (`"univariate"`, `"multivariate"`).
-- `outcome_idx`: The index of the outcome for multivariate models, `nothing` otherwise.
-- `M`: The main model configuration `NamedTuple`.
-
-# Returns
-- A `String` containing the generated Turing code for the component's update logic.
-"""
-function get_updates end
-
-"""
-    get_effects(m::ComponentModel, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-
-Reconstructs the component's effect from the MCMC chain's posterior samples for diagnostics and visualization.
-
-This method is dispatched on the `ComponentModel` instance and is responsible for:
-1.  Extracting relevant parameter samples from the MCMC `chain`.
-2.  Reconstructing the component's contribution to the linear predictor for each sample.
-3.  Returning structured results (e.g., mean, lower, upper credible intervals) of the effect.
-
-# Arguments
-- `m`: The `ComponentModel` instance.
-- `chain`: The MCMC chain object containing posterior samples.
-- `M`: The main model configuration `NamedTuple`.
-- `n_samples`: The total number of posterior samples.
-- `outcomes_N`: The total number of outcomes in the model.
-- `p_names`: A `NamedTuple` of parameter names for easy access.
-- `spec`: A `NamedTuple` containing the component's full specification.
-- `PS`: A `NamedTuple` containing prediction set data, or `nothing` for in-sample reconstruction.
-- `N_total`: The total number of observations (training + prediction).
-
-# Returns
-- A `NamedTuple` (e.g., `(structured=..., noisy=...)`) containing the reconstructed effects.
-"""
-function get_effects end
-
-
-
-const COMPONENT_TYPE_REGISTRY = Dict{Symbol, Type{<:ComponentModel}}(
-    :none => NoneComponent,
-    :iid => IID,
-    :icar => ICAR,
-    :besag => Besag,
-    :bym2 => BYM2,
-    :leroux => Leroux,
-    :sar => SAR,
-    :proper_car => SAR,
-    :dag => DAG,
-    :ar1 => AR1,
-    :ar2 => AR2,
-    :rw1 => RW1,
-    :rw2 => RW2,
-    :fitc => FITC,
-    :svgp => SVGP,
-    :nystrom => Nystrom,
-    :warp => Warp,
-    :hyperbolic => Hyperbolic,
-    :decay => ExponentialDecay,
-    :exponentialdecay => ExponentialDecay,
-    :gp => GP,
-    :rff => RFF,
-    :fft => FFT,
-    :spde => SPDE,
-    :cyclic => Cyclic,
-    :harmonic => Harmonic,
-    :pspline => PSpline,
-    :bspline => BSpline,
-    :tps => TPS,
-    :wavelet => Wavelet,
-    :eigen => Eigen,
-    :moran => Moran,
-    :spherical => Spherical,
-    :barycentric => Barycentric,
-    :bcgn => BCGN,
-    :networkflow => NetworkFlow,
-    :svar => SVAR,
-    :kriging => Kriging,
-    :localadaptive => LocalAdaptive,
-    :tar => TAR,
-    :dynamics => Dynamics,
-    :custom => Custom,
-    :composed => Composed,
-    :nonstationary_variance => NonStationaryVariance,
-    :adaptivesmooth => AdaptiveSmooth,
-    :lgcp => LGCP,
-    :lgammap => LogGammaCoxProcess,
-    :sncp => ShotNoiseCoxProcess
-)
-
-
-
+# ==============================================================================
+# SECTION 3: FORMULA PARSING ENGINE
+# ==============================================================================
 
 """
     apply_transformation(func_name::Symbol, data_vector::AbstractVector)
@@ -382,187 +144,6 @@ function generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{R
 end
 
 
-
- 
-
-
-"""
-    MODEL_TO_STRUCTURE_MAP
-
-v1.9.1 (2026-08-07) - This dictionary maps `ComponentModel` types to their primary
-structure type (e.g., `:spatial`, `:temporal`). This is used for internal dispatch
-and configuration.
-
-The mapping for `Besag` has been added.
-"""
-const MODEL_TO_STRUCTURE_MAP = Dict{Type{<:ComponentModel}, Symbol}(
-    IID => :any, # IID can be spatial, temporal, mixed, etc.
-    ICAR => :spatial,
-    Besag => :spatial,
-    BYM2 => :spatial,
-    Leroux => :spatial,
-    SAR => :spatial,
-    DAG => :spatial,
-    RW1 => :temporal,
-    RW2 => :temporal,
-    AR1 => :temporal,
-    AR2 => :temporal,
-    Cyclic => :temporal,
-    Harmonic => :temporal,
-    SPDE => :spatial,
-    GP => :smooth, # GP can be spatial, temporal, or smooth
-    RFF => :smooth, # RFF can be spatial, temporal, or smooth
-    FFT => :smooth, # FFT can be spatial, temporal, or smooth
-    PSpline => :smooth,
-    BSpline => :smooth,
-    TPS => :smooth,
-    Wavelet => :smooth,
-    Eigen => :any, # Eigen can be applied to any set of variables
-    Moran => :spatial,
-    Spherical => :spatial, # Spherical is a continuous spatial kernel
-    Barycentric => :spatial, # Barycentric is a continuous spatial kernel
-    BCGN => :spatial,
-    NetworkFlow => :spatial,
-    LocalAdaptive => :spatial,
-    TAR => :temporal,
-    TensorProductSmooth => :smooth,
-    Dynamics => :spacetime, # Dynamics components are inherently spatiotemporal
-    Custom => :any, # Custom components can be anything
-    LGCP => :spatial, # Log-Gaussian Cox Process is spatial
-    LogGammaCoxProcess => :spatial, # Log-Gamma Cox Process is spatial
-    ShotNoiseCoxProcess => :spatial, # Shot-Noise Cox Process is spatial
-    SVAR => :spacetime, # Spatially Varying Autoregressive is spatiotemporal
-    SVC => :spatial, # Spatially Varying Coefficient is spatial
-    TVC => :temporal, # Temporally Varying Coefficient is temporal
-    Composed => :any, # Composed components are context-dependent
-    NonStationaryVariance => :spatial, # Non-stationary variance is spatial
-    AdaptiveSmooth => :smooth, # Adaptive smooth is a smooth component
-    Kriging => :smooth, # Kriging is a smooth component
-    None => :none # Placeholder
-)
-
-"""
-    AMBIGUOUS_MODELS
-
-The updated set of model names whose structure is ambiguous and must be inferred from
-the input variables. This set has been expanded to include versatile smoothers and
-continuous-space models that were previously in the static map.
-"""
-const AMBIGUOUS_MODELS = Set([
-    # General purpose
-    :iid, 
-    :gp, 
-    
-    # Spectral & Sparse GP Approximations
-    :rff, 
-    :fft,
-    :fitc, 
-    :svgp, 
-    :nystrom, 
-
-    # Continuous-space models
-    :kriging,
-    :spherical,
-    :barycentric,
-    :exponentialdecay,
-    :hyperbolic,
-    :warp,
-
-    # Spline and Wavelet smoothers
-    :pspline, 
-    :bspline, 
-    :tps,
-    :wavelet
-]);
-
-
-const PC_PRIORS = Dict(
-    "sigma" => Exponential(1.0),
-    "rho" => Beta(1, 1),
-    "rho1" => Normal(0, 0.5),
-    "rho2" => Normal(0, 0.5),
-    "lengthscale" => InverseGamma(3, 3),
-    "kappa" => Exponential(1.0),
-    "amplitude" => Normal(0, 1),
-    "phase" => Beta(1, 1),
-    "pca_sd" => Exponential(1.0), 
-    "pdef_sd" => Exponential(1.0),
-    "range" => InverseGamma(3,3)
-)
-
-const INFORMATIVE_PRIORS = Dict(
-    "sigma" => Exponential(0.5),
-    "rho" => Beta(2, 2),
-    "rho1" => Normal(0, 1.0),
-    "rho2" => Normal(0, 1.0),
-    "lengthscale" => InverseGamma(5, 5),
-    "kappa" => Exponential(0.1),
-    "amplitude" => Normal(0, 0.5),
-    "phase" => Beta(2, 2),
-    "pca_sd" => Exponential(0.5), 
-    "pdef_sd" => Exponential(0.5),
-    "range" => InverseGamma(5,5)
-)
-
-const UNINFORMATIVE_PRIORS = Dict(
-    "sigma" => Normal(0, 1e6),
-    "rho" => Uniform(-1, 1),
-    "rho1" => Normal(0, 10),
-    "rho2" => Normal(0, 10),
-    "lengthscale" => InverseGamma(0.01, 0.01),
-    "kappa" => Exponential(10.0),
-    "amplitude" => Normal(0, 100),
-    "phase" => Uniform(0, 1),
-    "pca_sd" => Normal(0, 1e6), 
-    "pdef_sd" => Normal(0, 1e6),
-    "range" => InverseGamma(0.01, 0.01)
-)
-
-
-const BSTM_FAMILY_REGISTRY = Dict{String, AbstractBSTM_Family}(
-    "poisson" => PoissonFamily(),
-    "gaussian" => GaussianFamily(),
-    "lognormal" => LogNormalFamily(),
-    "bernoulli" => BinomialFamily(),
-    "binomial" => BinomialFamily(),
-    "negbin" => NegativeBinomialFamily(),
-    "gamma" => GammaFamily(),
-    "exponential" => ExponentialFamily(),
-    "beta" => BetaFamily(),
-    "inverse_gaussian" => InverseGaussianFamily(),
-    "student_t" => StudentTFamily(),
-    "half_normal" => HalfNormalFamily(),
-    "half_student_t" => HalfStudentTFamily(),
-    "laplace" => LaplaceFamily(),
-    "pareto" => ParetoFamily(),
-    "dirichlet" => DirichletFamily(),
-    "inverse_wishart" => InverseWishartFamily(),
-    "dirichlet_multinomial" => DirichletMultinomialFamily(),
-    "ordinal" => OrdinalFamily()
-)
-
-const STATSMODELS_CONTRASTS = Dict(
-    :dummy => StatsModels.DummyCoding(),
-    :effects => StatsModels.EffectsCoding(),
-    :helmert => StatsModels.HelmertCoding(),
-    :treatment => StatsModels.DummyCoding()
-)
-
-
-function Base.:|>(m1::Component, m2::Component)
-    return Composed([m1, m2], :pipe)
-end
-
-composition(m1::Component, m2::Component) = Composed([m1, m2], :composition)
-∘(m1::Component, m2::Component) = Composed([m1, m2], :composition)
-
-otimes(m1::Component, m2::Component) = Composed([m1, m2], :kronecker_product)
-⊗(m1::Component, m2::Component) = Composed([m1, m2], :kronecker_product)
-
-# ==============================================================================
-# SECTION 3: FORMULA PARSING ENGINE
-# ==============================================================================
-
 function split_terms_at_depth(input::AbstractString, sep::AbstractString)
     # Purpose: Splits a string by a separator, but only when the separator is not inside parentheses or brackets.
     # Rationale: This version uses a robust iteration pattern that correctly handles multi-byte characters
@@ -610,103 +191,116 @@ end
 """
     _infer_structure_from_args(args::Dict)
 
-Infers the `structure` of a `random()` module call based on its arguments. This function
-implements the core logic for consolidating multiple modules into `random()`.
+Infers the `structure` of a `random()` module call based on its arguments.
 
-# Inference Logic
-1.  If `structure` or the legacy `domain` keyword is explicitly provided, it is used.
-2.  If the `model` is a tuple (e.g., `model=(icar, ar1)`), it is inferred as a `:spacetime` interaction.
-3.  The `model` is checked against a map of unambiguous models (e.g., `:bym2` is always `:spatial`).
-4.  For ambiguous models (e.g., `:gp`, `:iid`), the number and names of the input variables are inspected to infer the structure. For example, two variables are assumed to be spatial coordinates, while a single variable named 'year' implies a temporal structure. The presence of a `W` matrix with an `:iid` model also implies a spatial structure.
-5.  If inference fails, an error is thrown, prompting the user to specify the `structure` explicitly.
+# Rationale
+This function implements a hierarchical inference logic to automatically determine the
+structural type of a model component (e.g., :spatial, :temporal, :smooth) when it is
+not explicitly provided by the user. This restores a key convenience feature from
+previous versions, reducing verbosity in model formulas.
+
+The inference follows a specific order of precedence to ensure robustness:
+1.  **Explicit User Input**: If `structure` or the legacy `domain` keyword is provided,
+    it is always respected.
+2.  **Spacetime Tuple Syntax**: The syntax `model=(m1, m2)` is unambiguously inferred
+    as a `:spacetime` interaction.
+3.  **Hardcoded Unambiguous Models**: A comprehensive, hardcoded map (`KNOWN_UNAMBIGUOUS_MODELS`)
+    is checked. This provides a robust fallback for all standard, built-in models
+    (e.g., `:leroux` is always `:spatial`), ensuring inference works even if component
+    files have not been loaded or registered correctly at parse time.
+4.  **Runtime-Registered Models**: The `MODEL_TO_STRUCTURE_MAP`, which is populated at
+    runtime as component files are loaded, is checked. This allows user-defined
+    components to integrate with the inference system.
+5.  **Ambiguous Models**: For a small set of truly ambiguous models (e.g., `:iid`, `:gp`),
+    the function inspects the number and names of the input variables to infer the
+    structure (e.g., a variable named `year` implies `:temporal`).
+6.  **Special Keywords**: Catches other specific cases, like `point_process=:lgcp`.
+7.  **Error**: If no structure can be inferred, an informative error is thrown.
+
+This version prioritizes the hardcoded map over the runtime map to guarantee that
+core model types are always resolved correctly, addressing failures where component
+files might not be loaded in time for parsing.
+
+# Version
+v1.0.3 (2026-08-08)
+
+# Arguments
+- `args::Dict`: A dictionary of parsed arguments from the module call.
+
+# Returns
+- `Symbol`: The inferred structure (e.g., :spatial, :temporal, :smooth).
 """
 function _infer_structure_from_args(args::Dict)
-    # Purpose: Infers the `structure` of a `random()` module call based on its arguments.
-    # Rationale: This version is updated to prioritize the model type over the variable name
-    #            when inferring the structure. If a model is explicitly a smoother (e.g., :pspline, :gp),
-    #            the structure is correctly set to `:smooth`, regardless of the variable name (e.g., 'year').
-    #            This resolves a key ambiguity in the parser.
-    # v1.0.1 (2026-07-30)
-    # Inputs:
-    #   - args: A dictionary of parsed arguments from the module call.
-    # Outputs: The inferred structure as a Symbol (e.g., :spatial, :temporal, :smooth).
-
     # Priority 1: Explicit user-provided structure.
     if haskey(args, :structure)
         return args[:structure]
     end
-    if haskey(args, :domain) # Support legacy 'domain' keyword
+    if haskey(args, :domain) # Support legacy `domain` keyword
         return args[:domain]
     end
 
     model = get(args, :model, nothing)
     vars = get(args, :vars, [])
 
-    # Priority 2: Spacetime interaction syntax `random(s, t, model=(m1, m2))`.
+    # Priority 2: Spacetime interaction syntax, e.g., `random(s, t, model=(m1, m2))`.
     if model isa Tuple && length(vars) >= 2
         return :spacetime
     end
 
-    # --- Explicitly handle aliases and missing models ---
-    if model == :dag
-        return :spatial
-    end
-    if model == :proper_car # Alias for SAR
-        return :spatial
-    end
-    if model == :decay # Alias for ExponentialDecay
-        model = :exponentialdecay # Remap to the canonical name
+    # Handle aliases before performing lookups.
+    # if model == :proper_car; model = :sar; end
+ 
+    # Priority 3: Check against the hardcoded map of known, unambiguous models.
+    # This is the most robust fallback for built-in models.
+    if haskey(KNOWN_UNAMBIGUOUS_MODELS, model)
+        return KNOWN_UNAMBIGUOUS_MODELS[model]
     end
 
-    # Priority 3: Unambiguous model-to-structure mapping.
+    # Priority 4: Check the runtime-populated map from loaded component files.
     if haskey(MODEL_TO_STRUCTURE_MAP, model)
         return MODEL_TO_STRUCTURE_MAP[model]
     end
 
-    # Priority 4: Ambiguous models requiring variable inspection.
+    # Priority 5: Ambiguous models requiring variable inspection.
+    # These models can be spatial, temporal, or smooth depending on the input variables.
     if model in AMBIGUOUS_MODELS
-        # --- NEW: Check for explicit smoother models first ---
-        smoother_models = Set([:pspline, :bspline, :tps, :gp, :rff, :fitc, :svgp, :nystrom, :warp, :kriging, :wavelet, :fft, :spherical, :barycentric, :exponentialdecay])
-        if model in smoother_models
-            return :smooth
-        end
-        # --- End new check ---
-
         num_vars = length(vars)
         if num_vars >= 2
+            # Check for explicit spatiotemporal variable names.
             if num_vars == 2
                 var1_name = string(vars[1])
                 var2_name = string(vars[2])
                 
-                is_sp_1 = occursin(r"spatial|space|s_idx|region|area|location"i, var1_name)
+                is_sp_1 = occursin(r"spatial|space|s_idx|auid|region|area|location"i, var1_name)
                 is_t_1 = occursin(r"year|time|t_idx|month|day"i, var1_name)
                 
-                is_sp_2 = occursin(r"spatial|space|s_idx|region|area|location"i, var2_name)
+                is_sp_2 = occursin(r"spatial|space|s_idx|auid|region|area|location"i, var2_name)
                 is_t_2 = occursin(r"year|time|t_idx|month|day"i, var2_name)
 
                 if (is_sp_1 && is_t_2) || (is_t_1 && is_sp_2)
                     return :spacetime
                 end
             end
-            return :smooth
+            return :smooth # Default for 2+ variables if not explicitly spatiotemporal.
         elseif num_vars == 1
             var_name = string(first(vars))
-            if haskey(args, :W) && model == :iid
+            # If 'iid' model with 'W' matrix, it's spatial.
+            if model == :iid && haskey(args, :W)
                 return :spatial
             end
-            if occursin(r"year|time|t_idx|month|day"i, var_name)
+            if occursin(r"year|time|t_idx|tuid|month|day"i, var_name) # Variable name suggests temporal.
                 return :temporal
-            elseif occursin(r"spatial|space|s_idx|region|area|location"i, var_name)
+            elseif occursin(r"spatial|space|s_idx|auid|region|area|location"i, var_name) # Variable name suggests spatial.
                 return :spatial
             else
-                return :smooth
+                return :smooth # Default for a single, non-specific variable.
             end
         else 
             error("Ambiguous model '$model' used with no variables. Please specify a `structure` (e.g., structure=:spatial).")
         end
     end
     
-    # Priority 5: Special keyword arguments like `point_process`.
+    # Priority 6: Special keyword arguments like `point_process`.
     if haskey(args, :point_process) && args[:point_process] == :lgcp
         return :spatial
     end
@@ -1104,16 +698,6 @@ end
 
 
 
-# This new constant maps legacy module names to their corresponding structure type.
-const LEGACY_MODULES = Dict(
-    :spatial => :spatial,
-    :temporal => :temporal,
-    :smooth => :smooth,
-    :seasonal => :seasonal,
-    :spacetime => :spacetime
-);
-
- 
 
 function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
     for node in nodes
@@ -2392,44 +1976,6 @@ function _print_param(name, value, status; indent=4)
 end
  
 
-"""
-    COMPONENT_CONFIG_ARGS
-
-A registry holding the default values for non-prior configuration arguments
-for various `random()` model types. This allows the parameter summary to show
-all applicable settings, even those not explicitly set by the user.
-"""
-const COMPONENT_CONFIG_ARGS = Dict(
-    # Spline models
-    :pspline => Dict(:nbins => 20, :degree => 3, :diff_order => 2, :knot_method => :quantile),
-    :bspline => Dict(:nbins => 10, :degree => 3, :knot_method => :quantile),
-    :tps => Dict(:nbins => 20, :knot_method => :quantile),
-    
-    # Continuous kernel models
-    :gp => Dict(:kernel => "se", :anisotropic => false),
-    :kriging => Dict(:kernel => "se", :anisotropic => false),
-    :rff => Dict(:n_features => 20, :kernel => "se", :anisotropic => false),
-    :fitc => Dict(:n_inducing => 20, :kernel => "se", :anisotropic => false),
-    :svgp => Dict(:n_inducing => 20, :kernel => "se", :anisotropic => false),
-    :nystrom => Dict(:n_inducing => 20, :kernel => "se", :anisotropic => false),
-    :warp => Dict(:n_features => 20, :kernel => "se", :anisotropic => false),
-    :spde => Dict(:anisotropic => false),
-
-    # Temporal models
-    :harmonic => Dict(:nharmonics => 1, :period => 12.0),
-    :cyclic => Dict(:period => 12),
-    
-    # Other models
-    :dynamics => Dict(:model => "none"),
-    :svar => Dict(),
-    :tar => Dict(),
-    :lgcp => Dict(:model => :icar, :grid_areas => "unit"),
-    :sncp => Dict(:n_parents => 50, :kernel => "se"),
-    :localadaptive => Dict(:n_clusters => 5),
-    :eigen => Dict(:n_factors => 1)
-)
-
-
 # --- Updated function to print finalized parameters ---
 """
     _print_finalized_parameters(config::NamedTuple)
@@ -2443,6 +1989,7 @@ used in the model and indicates whether this value was explicitly provided by th
 or if it was assigned a system default. This provides clarity on the model's exact
 specification before sampling begins.
 """
+
 function _print_finalized_parameters(config::NamedTuple)
     println("\n--- Finalized Model Configuration ---")
 
@@ -2508,12 +2055,22 @@ function _print_finalized_parameters(config::NamedTuple)
             println("    - Type: $(typeof(component_obj))")
             
             latent_dim_val = 0
-            if !isnothing(spec.Q_template) && spec.Q_template isa AbstractMatrix; latent_dim_val = size(spec.Q_template, 1);
-            elseif hasproperty(component_obj, :nbins); latent_dim_val = component_obj.nbins;
-            elseif hasproperty(component_obj, :n_features); latent_dim_val = component_obj.n_features;
-            elseif hasproperty(component_obj, :n_inducing); latent_dim_val = component_obj.n_inducing;
+            # Corrected access: Q_template is inside spec.hyper
+            if hasproperty(spec.hyper, :Q_template) && spec.hyper.Q_template isa AbstractMatrix
+                latent_dim_val = size(spec.hyper.Q_template, 1)
+            elseif hasproperty(component_obj, :nbins)
+                latent_dim_val = component_obj.nbins
+            elseif hasproperty(component_obj, :n_features)
+                latent_dim_val = component_obj.n_features
+            elseif hasproperty(component_obj, :n_inducing)
+                latent_dim_val = component_obj.n_inducing
+            elseif hasproperty(spec.hyper, :n_latent) # Fallback for components that explicitly define n_latent in hyper
+                latent_dim_val = spec.hyper.n_latent
             end
-            if latent_dim_val > 0; println("    - Latent Field Dimension: $(latent_dim_val)"); end
+            
+            if latent_dim_val > 0
+                println("    - Latent Field Dimension: $(latent_dim_val)")
+            end
 
             println("    - Parameters:")
             user_provided_params_raw = spec.params 
@@ -2654,8 +2211,12 @@ function bstm_text_assembler(config::NamedTuple, model_func_name::Symbol)
         if family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"] && !get(config, :volatility, false)
             push!(priors_acc, "y_sigma$(suffix) ~ NamedDist(Exponential(1.0), :y_sigma$(suffix))")
         end
-        if get(config, :use_zi, false)
-            push!(priors_acc, "phi_zi$(suffix) ~ NamedDist(Beta(1, 1), :phi_zi$(suffix))")
+        # Correctly define priors for hurdle and zero-inflation parameters with 'lik_' prefix.
+        if get(config, :user_provided_hurdle, false)
+            push!(priors_acc, "lik_phi_hurdle$(suffix) ~ NamedDist(Beta(1, 1), :lik_phi_hurdle$(suffix))")
+        elseif get(config, :use_zi, false)
+            # Use 'lik_' prefix to match the variable name used in the likelihood block.
+            push!(priors_acc, "lik_phi_zi$(suffix) ~ NamedDist(Beta(1, 1), :lik_phi_zi$(suffix))")
         end
     end
 
@@ -2689,7 +2250,7 @@ function bstm_text_assembler(config::NamedTuple, model_func_name::Symbol)
     # --- 3. Multivariate Correlation Prior ---
     if is_multivariate
         push!(priors_acc, "# --- Multivariate Correlation Prior ---")
-        push!(priors_acc, "L_corr ~ NamedDist(LKJCholesky($(config.outcomes_N), T(1.0)), :L_corr)")
+        push!(priors_acc, "L_corr ~ NamedDist(LKJCholesky($(config.outcomes_N), 1.0), :L_corr)")
     end
 
     # --- 4. Main Component Loop ---
@@ -2699,7 +2260,7 @@ function bstm_text_assembler(config::NamedTuple, model_func_name::Symbol)
         m_obj = spec.component_obj
         
         # Skip components that are handled globally or have no code to generate
-        if m_obj isa NoneComponent; continue; end
+        if m_obj isa None; continue; end
 
         push!(priors_acc, "\n# --- Priors for component: $(spec.key) ---")
         push!(updates_acc, "\n# --- Updates for component: $(spec.key) ---")
@@ -2841,8 +2402,13 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
     end
 
     # Handle standard components
-    model_name = get(m_params, :model, :iid)
-    if m_type in keys(LEGACY_MODULES); model_name = m_type; end
+    local model_name
+    if haskey(m_params, :model)
+        model_name = m_params[:model]
+    else
+        # Infer default model based on the structure if no model is specified.
+        model_name = if m_type == :spatial; haskey(M, :W) ? :bym2 : :iid; elseif m_type == :temporal; :rw2; else :iid; end
+    end
 
     model_name_str = string(model_name)
     resolved_priors = resolve_hyperpriors(model_name_str, priors_dict, m_params, scheme, calling_mod)
@@ -4985,11 +4551,7 @@ end
 
 
 
-
-
-# Code Generators for Advanced Components
- 
-
+  
 """
     bstm_sample_nowarn(model, sampler, n_samples; kwargs...)
 
@@ -5025,3 +4587,193 @@ function bstm_sample_nowarn(model, sampler, n_samples; kwargs...)
 end
 
 
+function _generate_univariate_likelihood_block(M::NamedTuple)
+    family = string(M.likelihood_specs[1][:family])
+    any_needs_sigma = family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
+    any_needs_nu = family == "student_t"
+    any_needs_extra = family in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"]
+
+    kwargs_parts = String[]
+    if any_needs_sigma; push!(kwargs_parts, "sigma_y=y_sigma"); end
+    if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=Int(M.trials[i, 1])"); end
+    if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=M.weights[i, 1]"); end
+    if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=M.censor_lower[i, 1]"); end
+    if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=M.censor_upper[i, 1]"); end
+    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=M.hurdle[i, 1]"); end
+    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle");
+    elseif get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
+
+    extra_param_logic = if any_needs_nu && any_needs_extra
+        "local extra_p = family_k == \"student_t\" ? lik_nu_student_t : lik_extra_params"
+    elseif any_needs_nu
+        "local extra_p = lik_nu_student_t"
+    elseif any_needs_extra
+        "local extra_p = lik_extra_params"
+    else "" end
+    if !isempty(extra_param_logic); push!(kwargs_parts, "extra_params=extra_p"); end
+
+    kwargs_str = join(kwargs_parts, ", ")
+
+    return """
+    family = M.likelihood_specs[1][:family]
+    $(extra_param_logic)
+    for i in 1:M.y_N
+        # Construct distribution parameterized by eta[i]
+        d_lik = bstm_Likelihood(family, M.y_obs[i]; $(kwargs_str))
+        # Evaluate logpdf at the observed data M.y_obs[i].
+        # Do NOT cast M.y_obs[i] to T, as this breaks AD if y_obs is promoted to a Dual.
+        Turing.@addlogprob! Distributions.logpdf(d_lik, eta[i])
+    end
+    """
+end
+
+function _generate_multivariate_likelihood_block(M::NamedTuple)
+    families = [string(get(spec, :family, "gaussian")) for spec in M.likelihood_specs]
+    any_needs_sigma = any(f -> f in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t", "dirichlet_multinomial"], families)
+    any_needs_nu = any(f -> f == "student_t", families)
+    any_needs_extra = any(f -> f in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"], families)
+    is_multinomial = any(f -> f == "dirichlet_multinomial", families)
+
+    if is_multinomial
+        return """
+        local eta_correlated = eta_latent * L_corr.L
+        local family = M.likelihood_specs[1][:family]
+        for i in 1:M.y_N
+            local d_lik = bstm_Likelihood(family, M.y_obs[i, :]; trial=Int(sum(M.y_obs[i, :])) )
+            Turing.@addlogprob! Distributions.logpdf(d_lik, eta_correlated[i, :])
+        end
+        """
+    end
+
+    kwargs_parts = String[]
+    if any_needs_sigma; push!(kwargs_parts, "sigma_y=y_sigma[k]"); end
+    if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=Int(M.trials[i, k])"); end
+    if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=M.weights[i, k]"); end
+    if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=M.censor_lower[i, k]"); end
+    if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=M.censor_upper[i, k]"); end
+    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=M.hurdle[i, k]"); end
+    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle");
+    elseif get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
+
+    extra_param_logic = if any_needs_nu && any_needs_extra
+        "local extra_p = family_k == \"student_t\" ? lik_nu_student_t : lik_extra_params"
+    elseif any_needs_nu
+        "local extra_p = lik_nu_student_t"
+    elseif any_needs_extra
+        "local extra_p = lik_extra_params"
+    else "" end
+    if !isempty(extra_param_logic); push!(kwargs_parts, "extra_params=extra_p"); end
+
+    kwargs_str = join(kwargs_parts, ", ")
+
+    return """
+    local eta_correlated = eta_latent * L_corr.L
+    for k in 1:M.outcomes_N
+        local family_k = M.likelihood_specs[k][:family]
+        $(extra_param_logic)
+        for i in 1:M.y_N
+            local d_lik = bstm_Likelihood(family_k, M.y_obs[i, k]; $(kwargs_str))
+            Turing.@addlogprob! Distributions.logpdf(d_lik, eta_correlated[i, k])
+        end
+    end
+    """
+end
+
+function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
+    has_custom_likelihood_from_component = any(spec -> any(T -> spec.component_obj isa T, [LGCP, LogGammaCoxProcess, ShotNoiseCoxProcess]), M.components)
+    has_custom_likelihood_from_family = any(spec -> string(get(spec, :family, "")) == "ordinal", M.likelihood_specs)
+    
+    if has_custom_likelihood_from_component
+        return "" # The component's `get_updates` handles the likelihood.
+    end
+
+    if is_multivariate
+        return _generate_multivariate_likelihood_block(M)
+    end
+
+    # Univariate case
+    family = string(M.likelihood_specs[1][:family])
+
+    if family == "ordinal"
+        K = M.likelihood_specs[1][:K]
+        latent_dist_val = M.likelihood_specs[1][:latent_dist]
+        if K < 2; return ""; end
+
+        non_prop_terms = get(M, :non_proportional_effects, Symbol[])
+        is_npo = !isempty(non_prop_terms)
+        
+        npo_indices = findall(x -> x in non_prop_terms, M.Xfixed_names)
+        n_npo_vars = length(npo_indices)
+
+        assignment_lines = ""
+        for j in 1:(K-1)
+            assignment_lines *= "ordinal_alpha_$(j) = alphas_computed[$(j)]\n"
+        end
+
+        npo_update_block = ""
+        if is_npo && n_npo_vars > 0
+            npo_update_block = """
+            # Non-proportional effects calculation
+            local X_npo = M.Xfixed[:, $(npo_indices)]
+            local beta_npo_matrix = reshape(beta_npo, $(n_npo_vars), $(K-1))
+            local eta_npo = X_npo * beta_npo_matrix
+            """
+        end
+
+        return """
+        # Proportional Odds Likelihood
+        let
+            local alphas_computed
+            if $(K > 2)
+                alphas_computed = cumsum([ordinal_alpha_raw_1; ordinal_alpha_diffs])
+            else
+                alphas_computed = [ordinal_alpha_raw_1]
+            end
+
+            $(assignment_lines)
+            local latent_dist_symbol = :$(latent_dist_val)
+            $(npo_update_block)
+
+            for i in 1:M.y_N
+                linear_predictor_prop = eta[i]
+                
+                local linear_predictor_vec
+                if $(is_npo && n_npo_vars > 0)
+                    # Combine proportional and non-proportional parts for each cut-point
+                    linear_predictor_vec = linear_predictor_prop .+ view(eta_npo, i, :)
+                else
+                    # If fully proportional, broadcast the single predictor
+                    linear_predictor_vec = fill(linear_predictor_prop, $(K-1))
+                end
+                
+                local cumulative_probs
+                if latent_dist_symbol == :normal
+                    cumulative_probs = Distributions.cdf.(Normal(), alphas_computed .- linear_predictor_vec)
+                elseif latent_dist_symbol == :logistic
+                    cumulative_probs = logistic.(alphas_computed .- linear_predictor_vec)
+                elseif latent_dist_symbol == :student_t
+                    cumulative_probs = Distributions.cdf.(TDist(ordinal_df), alphas_computed .- linear_predictor_vec)
+                else
+                    error("Unsupported latent distribution ':\$(latent_dist_symbol)' for ordinal model.")
+                end
+                
+                probs = Vector{T}(undef, $(K))
+                if $(K > 1)
+                    probs[1] = cumulative_probs[1]
+                    for j in 2:($(K-1))
+                        probs[j] = max(0.0, cumulative_probs[j] - cumulative_probs[j-1])
+                    end
+                    probs[$(K)] = max(0.0, 1.0 - cumulative_probs[$(K-1)])
+                else
+                    probs[1] = 1.0
+                end
+
+                probs ./= (sum(probs) + 1e-9)
+                Turing.@addlogprob! logpdf(Categorical(probs), M.y_obs[i])
+            end
+        end
+        """
+    else
+        return _generate_univariate_likelihood_block(M)
+    end
+end 

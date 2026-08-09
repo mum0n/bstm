@@ -1,5 +1,3 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
 
 """
     FITC <: ComponentModel
@@ -8,8 +6,42 @@ A component model for the Fully Independent Training Conditional (FITC) sparse
 Gaussian Process. This method approximates a full GP by using a small set of
 `n_inducing` points to summarize the data, making it scalable for larger datasets.
 
+# Version
+v1.0.0 (2026-08-08)
+
+# Mathematical Summary
+The FITC approximation assumes that, conditional on the GP's values at a set of
+\$M\$ inducing points \$Z\$, the values at the \$N\$ data points \$X\$ are independent.
+The latent GP values \$f\$ are modeled as:
+\$f \\sim \\mathcal{N}(\\mu_f, \\Sigma_f)\$
+where the conditional mean and covariance are:
+- \$\\mu_f = K_{XZ} K_{ZZ}^{-1} u\$
+- \$\\Sigma_f = \\text{diag}(K_{XX} - Q_{XX}) + \\sigma_n^2 I\$
+and
+- \$u \\sim \\mathcal{N}(0, K_{ZZ})\$ are the latent values at the inducing points.
+- \$Q_{XX} = K_{XZ} K_{ZZ}^{-1} K_{ZX}\$.
+- \$K_{XZ}\$ is the cross-covariance between data and inducing points.
+- \$K_{ZZ}\$ is the covariance of the inducing points.
+
+This implementation uses a non-centered parameterization for efficient sampling.
+
+# Assumptions
+- The data points are conditionally independent given the inducing points.
+- The number of inducing points `n_inducing` is much smaller than the number of
+  data points.
+
+# Best Use Case
+Scalable Gaussian Process regression for large datasets where a full GP is
+computationally infeasible. It is a good general-purpose sparse GP method.
+
+# Key References
+- Snelson, E., & Ghahramani, Z. (2006). *Sparse Gaussian Processes using
+  Pseudo-inputs*. In Advances in neural information processing systems, 18.
+- Wikipedia: Sparse Gaussian process
+
 # Fields
-- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the kernel lengthscale(s).
+- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the
+  kernel lengthscale(s).
 - `sigma::Distribution`: The prior for the marginal standard deviation of the GP.
 - `n_inducing::Int`: The number of inducing points to use for the approximation.
 - `kernel::String`: The name of the kernel function (e.g., "se", "matern32").
@@ -21,17 +53,25 @@ struct FITC <: ComponentModel
     kernel::String
 end
 
-# Add to the central component constructor registry.
-COMPONENT_CONSTRUCTORS[:fitc] = (p, params) -> FITC(p.lengthscale, p.sigma, get(params, :n_inducing, 20), string(get(params, :kernel, "se")))
+COMPONENT_TYPE_REGISTRY[:fitc] = FITC
 
-# Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[FITC] = :smooth
+COMPONENT_CONSTRUCTORS[:fitc] = (p, params) -> FITC(
+    p.lengthscale,
+    p.sigma,
+    get(params, :n_inducing, 20),
+    string(get(params, :kernel, "se"))
+)
+
+MODEL_TO_STRUCTURE_MAP[:fitc] = :smooth
 
 """
     get_datastructures!(m_type::Type{<:FITC}, M::Dict, mod_data::Dict)::Bool
 
 Performs data-dependent setup for the `FITC` component. It ensures coordinate
 variables are provided, stores them, and generates the inducing point locations.
+
+# Assumptions
+- The `random()` call provides one or more variables representing the coordinates.
 """
 function get_datastructures!(m_type::Type{<:FITC}, M::Dict, mod_data::Dict)::Bool
     variables = mod_data[:variables]
@@ -47,11 +87,9 @@ function get_datastructures!(m_type::Type{<:FITC}, M::Dict, mod_data::Dict)::Boo
         end
     end
 
-    # Store the coordinates matrix in the module's parameters for later use.
     coords = Matrix{Float64}(M[:data][!, Symbol.(variables)])
     mod_data[:params][:coords] = coords
 
-    # Generate and store inducing points.
     n_inducing = get(params, :n_inducing, 20)
     knot_method = get(params, :knot_method, :kmeans)
     Z_inducing = generate_inducing_points(coords, n_inducing; method=knot_method)
@@ -85,86 +123,94 @@ function get_precomputes(m::FITC, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    get_priors(m::FITC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::FITC, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for the `FITC` component's priors. This includes
-priors for `sigma`, `lengthscale`, and the raw innovations for both the inducing
-points and the final latent field.
+Generates priors for `sigma`, `lengthscale`, and the raw innovations for both the
+inducing points (`raw`) and the final latent field (`innov`).
 """
-function get_priors(m::FITC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(
+    m::FITC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(p_names.sigma))")
+    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     if m.lengthscale isa Vector
         ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ NamedDist(Product([$(ls_priors_str)]), :$(p_names.ls))")
+        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
     else
         ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ NamedDist($(ls_prior_str), :$(p_names.ls))")
+        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    # Raw innovations for inducing points (u_raw) and diagonal correction (f_raw)
-    push!(priors, "$(p_names.raw) ~ NamedDist(MvNormal(zeros(T, $(m.n_inducing)), I), :$(p_names.raw))")
-    push!(priors, "$(p_names.innov) ~ NamedDist(MvNormal(zeros(T, spec.precomputes.n_latent), I), :$(p_names.innov))")
+    push!(priors, "$(p_names.raw) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
+    push!(
+        priors,
+        "$(p_names.innov) ~ MvNormal(zeros(T, spec.precomputes.n_latent), I)"
+    )
 
     return join(priors, "\n    ")
 end
 
 """
-    get_updates(m::FITC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::FITC, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for constructing the `FITC` sparse GP effect.
+Generates the Turing code for constructing the `FITC` sparse GP effect.
 """
-function get_updates(m::FITC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(
+    m::FITC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     return """
         # --- FITC Sparse GP Component: $(spec.key) ---
-        local precomputes = spec_registry[:$(spec.key)].precomputes
-        local X_coords = T.(precomputes.coords)
-        local Z_coords = T.(precomputes.Z_inducing)
-        local kernel_type = Symbol("$(m.kernel)")
-        
-        # 1. Compute kernel matrices
-        local K_UU = evaluate_kernel_matrix(Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise)
-        local K_XU = evaluate_cross_kernel_matrix(X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type)
-        
-        # 2. Sample latent values at inducing points (non-centered)
-        local L_UU = cholesky(Symmetric(K_UU)).L
-        local u_latent = L_UU * $(p_names.raw)
-        
-        # 3. Compute conditional mean and variance for FITC
-        local K_UU_inv_u = K_UU \\ u_latent
-        local mean_f = K_XU * K_UU_inv_u
-        
-        local diag_K_XX = fill($(p_names.sigma)^2, precomputes.n_latent)
-        local tmp = (L_UU' \\ K_XU')'
-        local diag_Q_ff = sum(tmp.^2, dims=2)
-        local lambda_diag = diag_K_XX - vec(diag_Q_ff)
-        
-        # 4. Sample final latent field (non-centered)
-        local $(p_names.latent) = mean_f + sqrt.(max.(lambda_diag, T(0.0)) .+ M.noise) .* $(p_names.innov)
-        
-        $(eta_target) .+= $(p_names.latent)
+        let
+            local precomputes = spec_registry[:$(spec.key)].precomputes
+            local X_coords = precomputes.coords
+            local Z_coords = precomputes.Z_inducing
+            local kernel_type = Symbol("$(m.kernel)")
+            
+            local K_UU = evaluate_kernel_matrix(
+                Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
+            )
+            local K_XU = evaluate_cross_kernel_matrix(
+                X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
+            )
+            
+            local L_UU = cholesky(Symmetric(K_UU)).L
+            local u_latent = L_UU * $(p_names.raw)
+            
+            local K_UU_inv_u = K_UU \\ u_latent
+            local mean_f = K_XU * K_UU_inv_u
+            
+            local diag_K_XX = fill($(p_names.sigma)^2, precomputes.n_latent)
+            local tmp = (L_UU' \\ K_XU')'
+            local diag_Q_ff = sum(tmp.^2, dims=2)
+            local lambda_diag = diag_K_XX - vec(diag_Q_ff)
+            
+            local $(p_names.latent) = mean_f .+
+                sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.innov)
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
     """
 end
 
 """
-    get_effects(m::FITC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::FITC, chain, M::NamedTuple, ...)::NamedTuple
 
 Reconstructs the `FITC` component's effect from the MCMC chain's posterior samples.
 """
-function get_effects(m::FITC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    # Extract posterior samples
-    sigma_samples = get(chain, p_names.sigma)
-    ls_samples = get(chain, p_names.ls)
-    u_raw_samples = get(chain, p_names.raw)
-    f_innov_samples = get(chain, p_names.innov)
-
-    # Prepare coordinates for training and prediction
+function get_effects(
+    m::FITC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
+    
     coords_train = spec.precomputes.coords
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
@@ -178,35 +224,57 @@ function get_effects(m::FITC, chain, M::NamedTuple, n_samples::Int, outcomes_N::
     kernel_type = Symbol(m.kernel)
     noise = M.noise
 
-    reconstructed_effects = zeros(n_samples, n_obs_full)
+    for k in 1:outcomes_N
+        p_names = generate_full_variable_names(spec, M.model_arch, k)
+        
+        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
+        ls_samples = get_params_vector(
+            chain, string(p_names.ls), length(m.lengthscale)
+        )
+        u_raw_samples = get_params_vector(chain, string(p_names.raw), m.n_inducing)
+        f_innov_samples = get_params_vector(
+            chain, string(p_names.innov), spec.precomputes.n_latent
+        )
 
-    for i in 1:n_samples
-        current_sigma = sigma_samples[i]
-        current_ls = if m.lengthscale isa Vector; ls_samples[i, :]; else ls_samples[i]; end
-        current_u_raw = u_raw_samples[i, :]
-        current_f_innov = f_innov_samples[i, 1:n_obs_full]
+        effect_k = zeros(Float64, n_obs_full, n_samples)
 
-        # Reconstruct kernel matrices for the current sample
-        K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
-        K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
-        
-        L_UU = cholesky(Symmetric(K_UU)).L
-        u_latent = L_UU * current_u_raw
-        
-        K_UU_inv_u = K_UU \ u_latent
-        mean_f = K_XU * K_UU_inv_u
-        
-        diag_K_XX = fill(current_sigma^2, n_obs_full)
-        tmp = (L_UU' \ K_XU')'
-        diag_Q_ff = sum(tmp.^2, dims=2)
-        lambda_diag = diag_K_XX - vec(diag_Q_ff)
-        
-        reconstructed_effects[i, :] = mean_f + sqrt.(max.(lambda_diag, 0.0) .+ noise) .* current_f_innov
+        for i in 1:n_samples
+            current_sigma = sigma_samples[i]
+            current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i]
+            current_u_raw = u_raw_samples[i, :]
+            
+            f_innov_i = if size(f_innov_samples, 2) == n_obs_full
+                f_innov_samples[i, :]
+            else
+                vcat(
+                    f_innov_samples[i, :],
+                    randn(n_obs_full - size(f_innov_samples, 2))
+                )
+            end
+
+            K_UU = evaluate_kernel_matrix(
+                Z_inducing, current_sigma, current_ls, kernel_type, noise
+            )
+            K_XU = evaluate_cross_kernel_matrix(
+                coords_full, Z_inducing, current_sigma, current_ls, kernel_type
+            )
+            
+            L_UU = cholesky(Symmetric(K_UU)).L
+            u_latent = L_UU * current_u_raw
+            
+            K_UU_inv_u = K_UU \ u_latent
+            mean_f = K_XU * K_UU_inv_u
+            
+            diag_K_XX = fill(current_sigma^2, n_obs_full)
+            tmp = (L_UU' \ K_XU')'
+            diag_Q_ff = sum(tmp.^2, dims=2)
+            lambda_diag = diag_K_XX - vec(diag_Q_ff)
+            
+            effect_k[:, i] = mean_f .+
+                sqrt.(max.(lambda_diag, 0.0) .+ noise) .* f_innov_i
+        end
+        push!(structured_effects, effect_k)
     end
-
-    mean_effect = mean(reconstructed_effects, dims=1)[:]
-    lower_ci = quantile(reconstructed_effects, 0.025, dims=1)[:]
-    upper_ci = quantile(reconstructed_effects, 0.975, dims=1)[:]
-
-    return (structured=(mean=mean_effect, lower=lower_ci, upper=upper_ci),)
+    
+    return (structured=structured_effects, noisy=structured_effects)
 end

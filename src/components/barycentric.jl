@@ -1,234 +1,301 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
-
 """
     Barycentric <: ComponentModel
 
-A component model for a barycentric interpolation smoother. This component creates a basis
-of linear "tent" functions centered at knots distributed across the covariate space. The
-effect is a linear combination of these basis functions, with coefficients regularized by
-a random walk prior to ensure smoothness.
+A component for non-linear smoothing using barycentric interpolation on a 2D Delaunay
+triangulation of knot points. This method is particularly well-suited for modeling
+smooth spatial effects on irregular domains.
+
+# Version
+v1.0.1 (2026-08-08)
+
+# Mathematical Summary
+The component models a function f(s) where s is a 2D coordinate.
+1.  **Knot Triangulation**: A set of N_knots knot points are defined over the
+    spatial domain. A Delaunay triangulation is performed on these knots to create a
+    mesh of non-overlapping triangles.
+2.  **Barycentric Coordinates**: For any observation point s_obs, the model finds
+    the triangle in the mesh that encloses it. It then computes the barycentric
+    coordinates (λ₁, λ₂, λ₃) of s_obs with respect to the triangle's vertices
+    (v₁, v₂, v₃). These coordinates are non-negative weights that sum to 1.
+3.  **Basis Construction**: The barycentric coordinates form the basis functions. For
+    an observation i falling in a triangle with vertices (j, k, l), the
+    corresponding row in the basis matrix B will have non-zero values only at
+    columns j, k, l, where B[i,j] = λ₁, B[i,k] = λ₂, and B[i,l] = λ₃.
+4.  **Final Effect**: The final smooth effect is a linear combination of the basis
+    functions, with coefficients β (representing the latent field values at the
+    knots) scaled by a standard deviation σ:
+    f(s) = (B ⋅ (βσ))(s)
+    where β ∼ N(0, I).
+
+# Assumptions
+- The spatial effect is smooth and can be reasonably approximated by a piecewise
+  linear surface over the triangulated domain.
+- The provided coordinates are 2-dimensional.
+
+# Best Use Case
+Modeling smooth spatial effects, particularly when the domain is complex or
+irregularly shaped. It is an alternative to Thin Plate Splines or Gaussian Processes
+that is computationally efficient and easy to interpret, as the coefficients
+directly correspond to the value of the field at the knot locations.
+
+# Key References
+- Wikipedia: Barycentric coordinate system
+- Amid, E., & Warmuth, M. K. (2019). TriMap: Large-scale Dimensionality Reduction
+  Using Triplets. *arXiv preprint arXiv:1910.00204*. (For applications of
+  triangulation in machine learning).
 
 # Fields
-- `sigma::Distribution`: The prior distribution for the standard deviation of the coefficients.
-- `nbins::Union{Int, Vector{Int}}`: The number of bins (and basis functions) for each dimension.
-- `diff_order::Int`: The order of the random walk penalty on the coefficients (1 for RW1, 2 for RW2).
+- `sigma::UnivariateDistribution`: The prior for the standard deviation of the basis
+  function coefficients.
 """
 struct Barycentric <: ComponentModel
-    sigma::Distribution
-    nbins::Union{Int, Vector{Int}}
-    diff_order::Int
+    sigma::UnivariateDistribution
 end
 
-# Add to the central component constructor registry.
-COMPONENT_CONSTRUCTORS[:barycentric] = (p, params) -> Barycentric(p.sigma, get(params, :nbins, 20), get(params, :diff_order, 2))
+COMPONENT_TYPE_REGISTRY[:barycentric] = Barycentric
+COMPONENT_CONSTRUCTORS[:barycentric] = (p, params) -> Barycentric(p.sigma)
+MODEL_TO_STRUCTURE_MAP[:barycentric] = :smooth
 
-# Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[Barycentric] = :smooth
 
-"""
-    get_datastructures!(m_type::Type{<:Barycentric}, M::Dict, mod_data::Dict)::Bool
+# --- Helper functions for Delaunay triangulation, restored from archive/model.jl ---
 
-Performs data-dependent setup for the `Barycentric` component.
-It ensures that coordinate variables are provided and stores them in the module data.
-"""
-function get_datastructures!(m_type::Type{<:Barycentric}, M::Dict, mod_data::Dict)::Bool
-    variables = mod_data[:variables]
+function _get_barycentric_coords(p::Point2D, p1::Point2D, p2::Point2D, p3::Point2D)
+    area_total = abs((p2.x - p1.x) * (p3.y - p1.y) - (p3.x - p1.x) * (p2.y - p1.y))
+    if area_total < 1e-9 return nothing end
+    area1 = abs((p2.x - p.x) * (p3.y - p.y) - (p3.x - p.x) * (p2.y - p.y))
+    area2 = abs((p3.x - p.x) * (p1.y - p.y) - (p1.x - p.x) * (p3.y - p.y))
+    area3 = abs((p1.x - p.x) * (p2.y - p.y) - (p2.x - p.x) * (p1.y - p.y))
+    w_sum = area1 + area2 + area3
+    if abs(w_sum - area_total) > 1e-6 return nothing end # Point is outside
+    return (area1 / area_total, area2 / area_total, area3 / area_total)
+end
 
-    if isempty(variables)
-        error("The Barycentric model requires coordinate variables, e.g., `random(x, y, model=:barycentric)`.")
+function _is_inside_triangle(p::Point2D, p1::Point2D, p2::Point2D, p3::Point2D)
+    coords = _get_barycentric_coords(p, p1, p2, p3)
+    return !isnothing(coords) && all(c -> c >= -1e-9, coords)
+end
+
+function _get_circumcircle(p1::Point2D, p2::Point2D, p3::Point2D)
+    D = 2 * (p1.x * (p2.y - p3.y) + p2.x * (p3.y - p1.y) + p3.x * (p1.y - p2.y))
+    if abs(D) < 1e-9 return nothing, nothing end
+    p1_sq, p2_sq, p3_sq = p1.x^2 + p1.y^2, p2.x^2 + p2.y^2, p3.x^2 + p3.y^2
+    center_x = (p1_sq * (p2.y - p3.y) + p2_sq * (p3.y - p1.y) + p3_sq * (p1.y - p2.y)) / D
+    center_y = (p1_sq * (p3.x - p2.x) + p2_sq * (p1.x - p3.x) + p3_sq * (p2.x - p1.x)) / D
+    center = Point2D(center_x, center_y)
+    radius_sq = (p1.x - center.x)^2 + (p1.y - center.y)^2
+    return center, radius_sq
+end
+
+function _is_in_circumcircle(p::Point2D, p1::Point2D, p2::Point2D, p3::Point2D)
+    center, radius_sq = _get_circumcircle(p1, p2, p3)
+    if isnothing(center) return false end
+    dist_sq = (p.x - center.x)^2 + (p.y - center.y)^2
+    return dist_sq < radius_sq
+end
+
+function _delaunay_triangulation(points::Vector{Point2D})
+    n = length(points)
+    if n < 3 return [] end
+    min_x, max_x = extrema(p.x for p in points); min_y, max_y = extrema(p.y for p in points)
+    dx, dy = max_x - min_x, max_y - min_y; delta_max = max(dx, dy)
+    mid_x, mid_y = (min_x + max_x) / 2, (min_y + max_y) / 2
+    p_super1 = Point2D(mid_x - 20 * delta_max, mid_y - delta_max)
+    p_super2 = Point2D(mid_x + 20 * delta_max, mid_y - delta_max)
+    p_super3 = Point2D(mid_x, mid_y + 20 * delta_max)
+    super_triangle = Triangle(n + 1, n + 2, n + 3)
+    all_points = [points; p_super1; p_super2; p_super3]
+    triangulation = [super_triangle]
+    for i in 1:n
+        point = points[i]; bad_triangles = []
+        for tri in triangulation
+            p1, p2, p3 = all_points[tri.v1], all_points[tri.v2], all_points[tri.v3]
+            if _is_in_circumcircle(point, p1, p2, p3); push!(bad_triangles, tri); end
+        end
+        polygon = []
+        for tri in bad_triangles
+            edges = [(tri.v1, tri.v2), (tri.v2, tri.v3), (tri.v3, tri.v1)]
+            for edge in edges
+                is_shared = false
+                for other_tri in bad_triangles
+                    if tri === other_tri continue end
+                    other_edges = [(other_tri.v1, other_tri.v2),
+                                   (other_tri.v2, other_tri.v3),
+                                   (other_tri.v3, other_tri.v1)]
+                    if (edge in other_edges) || ((edge[2], edge[1]) in other_edges)
+                        is_shared = true; break;
+                    end
+                end
+                if !is_shared; push!(polygon, edge); end
+            end
+        end
+        filter!(t -> !(t in bad_triangles), triangulation)
+        for edge in polygon; push!(triangulation, Triangle(edge[1], edge[2], i)); end
     end
+    filter!(t -> !(t.v1 > n || t.v2 > n || t.v3 > n), triangulation)
+    return triangulation
+end
 
-    for var_sym in variables
-        if !hasproperty(M[:data], Symbol(var_sym))
-            error("Coordinate variable ':$var_sym' for Barycentric model not found in data.")
+function bstm_barycentric_basis_2D(coords::AbstractMatrix, knots::Vector{Point2D})
+    n_obs, n_knots = size(coords, 1), length(knots)
+    B = spzeros(Float64, n_obs, n_knots)
+    triangles = _delaunay_triangulation(knots)
+    if isempty(triangles)
+        @warn "Delaunay triangulation failed. Returning empty basis."
+        return B
+    end
+    for i in 1:n_obs
+        obs_point = Point2D(coords[i, 1], coords[i, 2])
+        for tri in triangles
+            v1_idx, v2_idx, v3_idx = tri.v1, tri.v2, tri.v3
+            p1, p2, p3 = knots[v1_idx], knots[v2_idx], knots[v3_idx]
+            if _is_inside_triangle(obs_point, p1, p2, p3)
+                bary_coords = _get_barycentric_coords(obs_point, p1, p2, p3)
+                if !isnothing(bary_coords)
+                    w1, w2, w3 = bary_coords
+                    B[i, v1_idx], B[i, v2_idx], B[i, v3_idx] = w1, w2, w3
+                end
+                break
+            end
         end
     end
+    return B
+end
 
-    # Store the coordinates matrix in the module's parameters for later use.
-    mod_data[:params][:coords] = Matrix{Float64}(M[:data][!, Symbol.(variables)])
+# --- Component Interface Methods ---
 
+"""
+    get_datastructures!(m_type::Type{<:Barycentric}, M::Dict, mod_data::Dict)
+
+Extracts the 2D coordinate variables from the formula and stores them.
+
+# Assumptions
+- The `random()` call provides exactly two variables for the 2D coordinates.
+"""
+function get_datastructures!(
+    m_type::Type{<:Barycentric}, M::Dict, mod_data::Dict
+)::Bool
+    variables = mod_data[:variables]
+    if length(variables) != 2
+        error(
+            "The Barycentric model requires exactly two coordinate variables, e.g., " *
+            "`random(x, y, model=:barycentric)`."
+        )
+    end
+    coords_matrix = Matrix{Float64}(M[:data][!, Symbol.(variables)])
+    mod_data[:params][:coords] = coords_matrix
     return true
 end
 
 """
     get_precomputes(m::Barycentric, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Performs data-independent pre-calculations for the `Barycentric` component.
-This involves creating the tensor product basis of linear "tent" functions and
-the precision matrix template for the random walk penalty on the coefficients.
+Pre-computes the barycentric basis matrix by generating knots, performing Delaunay
+triangulation, and calculating barycentric coordinates for each observation.
 """
-function get_precomputes(m::Barycentric, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = get(mod_data[:params], :coords, nothing)
-    if isnothing(coords)
-        error("Barycentric component precomputes failed: coordinates not found in module data.")
+function get_precomputes(
+    m::Barycentric, M::NamedTuple, mod_data::Dict
+)::NamedTuple
+    coords = mod_data[:params][:coords]
+    nbins = get(mod_data[:params], :nbins, 25)
+    knot_method = get(mod_data[:params], :knot_method, :quantile)
+    n_marginal = Int(floor(sqrt(nbins)))
+    
+    local kx, ky
+    if knot_method == :range
+        kx = collect(range(extrema(coords[:, 1])..., length=n_marginal))
+        ky = collect(range(extrema(coords[:, 2])..., length=n_marginal))
+    else # Default to :quantile
+        kx = quantile(coords[:, 1], range(0, 1, length=n_marginal))
+        ky = quantile(coords[:, 2], range(0, 1, length=n_marginal))
     end
     
-    n_obs, n_dims = size(coords)
+    knot_points = [Point2D(x, y) for x in kx for y in ky]
+    basis_matrix = bstm_barycentric_basis_2D(coords, knot_points)
+    n_knots = length(knot_points)
 
-    # Determine number of bins per dimension
-    local nbins_per_dim::Vector{Int}
-    if m.nbins isa Int
-        nbins_per_dim = fill(m.nbins, n_dims)
-    elseif m.nbins isa Vector{Int} && length(m.nbins) == n_dims
-        nbins_per_dim = m.nbins
-    else
-        error("For a $(n_dims)D Barycentric smooth, `nbins` must be an Int or a Vector{Int} of length $(n_dims).")
-    end
-
-    # --- Helper function to create 1D linear tent basis ---
-    function _create_1d_tent_basis(vals::AbstractVector, n_knots::Int)
-        B_1d = zeros(length(vals), n_knots)
-        v_min, v_max = extrema(vals)
-        knots = range(v_min, stop=v_max, length=n_knots)
-        h = (v_max - v_min) / (n_knots > 1 ? (n_knots - 1) : 1.0)
-        h = h > 0 ? h : 1.0
-        
-        for i in 1:n_knots
-            dist = abs.(vals .- knots[i]) ./ h
-            mask = dist .< 1.0
-            B_1d[mask, i] .= 1.0 .- dist[mask]
-        end
-        return B_1d
-    end
-
-    # --- Create basis matrix B ---
-    # Generate 1D basis matrices for each dimension
-    basis_matrices_1D = [_create_1d_tent_basis(coords[:, i], nbins_per_dim[i]) for i in 1:n_dims]
-
-    # Compute the tensor product efficiently
-    B_final = basis_matrices_1D[1]
-    for i in 2:n_dims
-        B_next = basis_matrices_1D[i]
-        
-        n_obs_i, n_cols_final = size(B_final)
-        _, n_cols_next = size(B_next)
-        
-        # Reshape for broadcasting to compute row-wise outer products.
-        B_final_reshaped = reshape(B_final, n_obs_i, n_cols_final, 1)
-        B_next_reshaped = reshape(B_next, n_obs_i, 1, n_cols_next)
-        
-        tensor_prod = B_final_reshaped .* B_next_reshaped
-        
-        B_final = reshape(tensor_prod, n_obs_i, n_cols_final * n_cols_next)
-    end
-    
-    n_latent = size(B_final, 2)
-
-    # --- Create penalty matrix Q ---
-    penalty_type = m.diff_order == 1 ? :rw1 : :rw2
-    template = build_structure_template(penalty_type, n_latent)
-    Q_template = template.matrix
-    
-    # --- Spectral decomposition for AD-friendly sampling ---
-    rank_deficiency = m.diff_order
-    eig_decomp = eigen(Symmetric(Matrix(Q_template)))
-    U = eig_decomp.vectors
-    L = eig_decomp.values
-    scaling_factor = _compute_scaling_factor(L, rank_deficiency)
-    
-    Q_template_scaled = Q_template ./ scaling_factor
-    L_scaled = L ./ scaling_factor
-
-    return (
-        basis_matrix=B_final,
-        Q_template=Q_template_scaled,
-        scaling_factor=scaling_factor,
-        U=U,
-        L=L_scaled,
-        n_latent=n_latent
-    )
+    return (B=basis_matrix, n_knots=n_knots)
 end
 
 """
-    get_priors(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx, M)
 
-Generates the Turing code string for the `Barycentric` component's priors.
-It defines the prior for `sigma` and the `raw` coefficients for the basis functions.
+Generates priors for the basis coefficients (`innov`) and overall scale (`sigma`).
 """
-function get_priors(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(
+    m::Barycentric, spec::NamedTuple, arch::String,
+    outcome_idx::Union{Int, Nothing}, M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    
-    sigma_prior_str = _distribution_to_string(m.sigma)
-    
+    n_knots = spec.hyper.n_knots
     return """
-        $(p_names.sigma) ~ NamedDist($(sigma_prior_str), :$(p_names.sigma))
-        $(p_names.raw) ~ NamedDist(MvNormal(zeros(T, spec_registry[:$(spec.key)].precomputes.n_latent), I), :$(p_names.raw))
+    $(p_names.innov) ~ MvNormal(zeros(T, $(n_knots)), I)
+    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
     """
 end
 
 """
-    get_updates(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx, M)
 
-Generates the Turing code string for constructing the `Barycentric` smooth effect.
+Generates code to compute the smooth effect as a product of the basis matrix and
+the scaled coefficients, and adds it to the linear predictor `eta`.
 """
-function get_updates(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(
+    m::Barycentric, spec::NamedTuple, arch::String,
+    outcome_idx::Union{Int, Nothing}, M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    
+    key = spec.key
     return """
-        # --- Barycentric Smoother Component: $(spec.key) ---
-        local precomputes = spec_registry[:$(spec.key)].precomputes
-        
-        # Reconstruct latent coefficients using spectral decomposition of the penalty matrix
-        local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
-        # Enforce sum-to-zero constraint(s) on coefficients
-        for i in 1:$(m.diff_order); diag_D[i] = zero(T); end
-        
-        local coeffs = precomputes.U * (diag_D .* $(p_names.raw))
-        
-        # Compute final effect by multiplying basis matrix with coefficients
-        local $(p_names.latent) = T.(precomputes.basis_matrix) * coeffs
-        
-        $(eta_target) .+= $(p_names.latent)
+        # --- Barycentric Component: $(key) ---
+        let
+            local B = spec_registry[:$(key)].hyper.B
+            local scaled_coeffs = $(p_names.innov) .* $(p_names.sigma)
+            local barycentric_effect = B * scaled_coeffs
+            $(eta_target) .+= barycentric_effect
+        end
     """
 end
 
 """
-    get_effects(m::Barycentric, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::Barycentric, chain, M::NamedTuple, ...)
 
-Reconstructs the `Barycentric` component's effect from the MCMC chain's posterior samples.
+Reconstructs the barycentric smooth effect from posterior samples.
 """
-function get_effects(m::Barycentric, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    sigma_samples = get(chain, p_names.sigma)
-    raw_samples = get(chain, p_names.raw)
-
-    precomputes = spec.precomputes
-    U = precomputes.U
-    L = precomputes.L
-    noise = M.noise
-    n_latent = precomputes.n_latent
-
-    # The `predict` function is responsible for creating the basis matrix for the prediction set.
-    # Here, we assume it is available in PS.basis_matrices if a prediction set is provided.
-    B_train = precomputes.basis_matrix
-    B_full = if !isnothing(PS) && haskey(PS, :basis_matrices) && haskey(PS.basis_matrices, spec.key)
-        vcat(B_train, PS.basis_matrices[spec.key])
+function get_effects(
+    m::Barycentric, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
+    
+    # Re-create basis matrix for prediction set if it exists
+    B_train = spec.hyper.B
+    B_full = if !isnothing(PS)
+        coord_vars = get(spec.params, :positional_args, [])
+        coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+        
+        # Re-use the same knots from the training phase
+        nbins = get(spec.params, :nbins, 25)
+        n_marginal = Int(floor(sqrt(nbins)))
+        kx = quantile(spec.hyper.coords[:, 1], range(0, 1, length=n_marginal))
+        ky = quantile(spec.hyper.coords[:, 2], range(0, 1, length=n_marginal))
+        knot_points = [Point2D(x, y) for x in kx for y in ky]
+        
+        B_pred = bstm_barycentric_basis_2D(coords_pred, knot_points)
+        vcat(B_train, B_pred)
     else
         B_train
     end
+
+    for k in 1:outcomes_N
+        p_names = generate_full_variable_names(spec, M.model_arch, k)
+        innov_samples = get_params_vector(chain, string(p_names.innov), spec.hyper.n_knots)
+        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)
+        
+        scaled_coeffs = innov_samples .* sigma_samples
+        effect_k = B_full * scaled_coeffs'
+        push!(structured_effects, effect_k)
+    end
     
-    if size(B_full, 1) != N_total
-        @warn "Barycentric effect reconstruction: dimension mismatch. Using in-sample effects only."
-        B_full = B_train
-    end
-
-    reconstructed_effects = zeros(n_samples, size(B_full, 1))
-
-    for i in 1:n_samples
-        current_sigma = sigma_samples[i]
-        current_raw = raw_samples[i, :]
-        
-        diag_D = current_sigma ./ sqrt.(L .+ noise)
-        for j in 1:m.diff_order; diag_D[j] = 0.0; end
-        
-        coeffs = U * (diag_D .* current_raw)
-        reconstructed_effects[i, :] = B_full * coeffs
-    end
-
-    mean_effect = mean(reconstructed_effects, dims=1)[:]
-    lower_ci = quantile(reconstructed_effects, 0.025, dims=1)[:]
-    upper_ci = quantile(reconstructed_effects, 0.975, dims=1)[:]
-
-    return (structured=(mean=mean_effect, lower=lower_ci, upper=upper_ci),)
+    return (structured=structured_effects, noisy=structured_effects)
 end

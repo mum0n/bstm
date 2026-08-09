@@ -1,17 +1,45 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
 
 """
     Harmonic <: ComponentModel
 
-A component model for harmonic temporal effects, capturing periodic patterns using sine and cosine waves.
-This component can model one or more harmonics, each with its own amplitude, phase, and potentially its own period.
+A component model for harmonic temporal effects, capturing periodic patterns using
+sine and cosine waves. This component can model one or more harmonics, each with its
+own amplitude, phase, and potentially its own period.
+
+# Version
+v1.2.2 (2026-08-08)
+
+# Mathematical Summary
+The component models a function f(t) as a sum of sinusoids:
+f(t) = \\sum_{k=1}^{N_{harmonics}} A_k \\cos\\left(\\frac{2\\pi k}{P_k} t + \\phi_k\\right)
+where A_k is the amplitude, P_k is the period, and \\phi_k is the phase shift for
+the k-th harmonic. For improved MCMC sampling, this is internally reparameterized
+into a two-coefficient form:
+f(t) = \\sum_{k=1}^{N_{harmonics}} \\left( \\beta_{\\cos,k} \\cos\\left(\\frac{2\\pi k}{P_k} t\\right) + \\beta_{\\sin,k} \\sin\\left(\\frac{2\\pi k}{P_k} t\\right) \\right)
+
+# Assumptions
+- The underlying process has a periodic component that can be well-approximated by a
+  sum of sinusoids.
+- The seasonal index provided is discrete and regularly spaced.
+
+# Best Use Case
+Modeling seasonal effects (e.g., monthly, quarterly) or other known periodic
+phenomena in time series data where the periodicity is stable over time. It is
+particularly useful for capturing cyclical patterns in environmental data,
+economics, and epidemiology.
+
+# Key References
+- General concept of Fourier Series: [Wikipedia: Fourier Series](https://en.wikipedia.org/wiki/Fourier_series)
 
 # Fields
-- `nharmonics::Int`: The number of harmonic terms to include in the sum (e.g., 1 for annual, 2 for annual and semi-annual).
-- `amplitude::Distribution`: The prior distribution for the amplitude of the harmonic(s).
-- `phase::Distribution`: The prior distribution for the phase shift of the harmonic(s), typically on `[0, 1]`.
-- `period::Union{Real, UnivariateDistribution, Vector{<:UnivariateDistribution}}`: The period of the cycle(s).
+- `nharmonics::Int`: The number of harmonic terms to include in the sum (e.g., 1
+  for annual, 2 for annual and semi-annual).
+- `amplitude::Distribution`: The prior distribution for the amplitude of the
+  harmonic(s).
+- `phase::Distribution`: The prior distribution for the phase shift of the
+  harmonic(s), typically on `[0, 1]`.
+- `period::Union{Real, UnivariateDistribution, Vector{<:UnivariateDistribution}}`: The
+  period of the cycle(s).
   - If a `Real`, the period is fixed.
   - If a `UnivariateDistribution`, the period is estimated (only for `nharmonics=1`).
   - If a `Vector{<:UnivariateDistribution}`, each harmonic gets its own estimated period.
@@ -23,206 +51,239 @@ struct Harmonic <: ComponentModel
     period::Union{Real, UnivariateDistribution, Vector{<:UnivariateDistribution}}
 end
 
-# Add to the central component constructor registry.
-# This logic validates the parameters and constructs the Harmonic object.
+COMPONENT_TYPE_REGISTRY[:harmonic] = Harmonic
+
 COMPONENT_CONSTRUCTORS[:harmonic] = (p, params) -> begin
     nharmonics = get(params, :nharmonics, 1)
     period_param = get(params, :period, 12.0)
     
     if nharmonics > 1
         if period_param isa Real
-            error("For `nharmonics > 1`, `period` must be a `Distribution` or a `Vector{<:Distribution}` to be estimated, not a fixed Real value.")
-        end
-        if period_param isa UnivariateDistribution
+            period_param = fill(period_param, nharmonics)
+        elseif period_param isa UnivariateDistribution
             period_param = [period_param for _ in 1:nharmonics]
         end
         if period_param isa Vector && length(period_param) != nharmonics
-            error("Length of `period` vector ($(length(period_param))) must match `nharmonics` ($(nharmonics)).")
+            error(
+                "Length of `period` vector ($(length(period_param))) must match " *
+                "`nharmonics` ($(nharmonics))."
+            )
         end
     else # nharmonics == 1
         if period_param isa Vector
-            error("For `nharmonics = 1`, `period` must be a Real or a single UnivariateDistribution, not a Vector.")
+            error(
+                "For `nharmonics = 1`, `period` must be a Real or a single " *
+                "UnivariateDistribution, not a Vector."
+            )
         end
     end
     
     Harmonic(nharmonics, p.amplitude, p.phase, period_param)
 end
 
-# Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[Harmonic] = :temporal
+MODEL_TO_STRUCTURE_MAP[:harmonic] = :temporal
 
 """
     get_datastructures!(m_type::Type{<:Harmonic}, M::Dict, mod_data::Dict)::Bool
 
-Performs data-dependent setup for the `Harmonic` component. It ensures that a temporal
-index variable is provided and that the temporal context (`t_idx`, `t_N`) is set up in the
-main model configuration `M`.
+Performs data-dependent setup for the `Harmonic` component. It extracts the
+observation-level seasonal index vector (e.g., a vector of month numbers) and
+determines the number of unique seasonal units, `u_N`, which defines the
+dimensionality of the latent harmonic field.
+
+# Assumptions
+- The input data column specified in the `random()` call contains discrete,
+  integer-like indices representing seasonal units (e.g., month 1-12).
 """
-function get_datastructures!(m_type::Type{<:Harmonic}, M::Dict, mod_data::Dict)::Bool
-    params = mod_data[:params]
+function get_datastructures!(
+    m_type::Type{<:Harmonic}, M::Dict, mod_data::Dict
+)::Bool
     variables = mod_data[:variables]
-
     if isempty(variables)
-        error("The Harmonic model requires a temporal index variable, e.g., `random(month, model=:harmonic)`.")
+        error(
+            "The Harmonic model requires a seasonal index variable, e.g., " *
+            "`random(month, model=:harmonic)`."
+        )
     end
 
-    if !haskey(M, :t_idx)
-        time_var = Symbol(variables[1])
-        if !hasproperty(M[:data], time_var)
-            error("Temporal variable ':$time_var' for Harmonic model not found in data.")
-        end
-        
-        time_opts = Dict(:time_method => get(params, :time_method, "regular"))
-        period = get(params, :period, 12.0)
-        if period isa Real
-            time_opts[:t_N] = Int(period)
-        end
-
-        tu = assign_time_units(M[:data][!, time_var]; time_opts...)
-        M[:t_idx] = tu.idx
-        M[:t_N] = tu.N_cat
-        @info "Inferred temporal context for Harmonic model: t_N = $(M[:t_N])."
+    u_var_sym = Symbol(variables[1])
+    if !hasproperty(M[:data], u_var_sym)
+        error(
+            "Seasonal index variable ':$u_var_sym' for Harmonic model not found " *
+            "in data."
+        )
     end
-
+    
+    M[:u_idx] = M[:data][!, u_var_sym]
+    M[:u_N] = length(unique(M[:u_idx]))
+    M[:u_idx_var] = u_var_sym
+    
     return true
 end
 
 """
     get_precomputes(m::Harmonic, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Pre-computes the time coordinates `1:M.t_N` for constructing the harmonic basis functions.
+Generates the discrete time vector `t = [1, 2, ..., u_N]` over which the harmonic
+basis functions will be evaluated to construct the latent seasonal effect.
+
+# Assumptions
+- The seasonal units are regularly spaced and can be represented by a simple
+  integer sequence.
 """
-function get_precomputes(m::Harmonic, M::NamedTuple, mod_data::Dict)::NamedTuple
-    t_coords = collect(1.0:M.t_N)
-    return (t_coords=t_coords,)
+function get_precomputes(
+    m::Harmonic, M::NamedTuple, mod_data::Dict
+)::NamedTuple
+    u_coords = collect(1.0:M.u_N)
+    return (u_coords=u_coords,)
 end
 
 """
-    get_priors(m::Harmonic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::Harmonic, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code for the priors on amplitude, phase, and period (if estimated).
+Generates the Turing code for the priors on the harmonic component's parameters.
+For improved MCMC sampling stability, this method samples the `beta_cos` and
+`beta_sin` coefficients of the two-coefficient form directly.
+
+# Assumptions
+- A `Normal(0,1)` prior on the beta coefficients is a reasonable default.
+- If the period is estimated, the user has provided a suitable prior distribution.
 """
-function get_priors(m::Harmonic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(
+    m::Harmonic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    amp_prior_str = _distribution_to_string(m.amplitude)
-    phase_prior_str = _distribution_to_string(m.phase)
-
     priors = String[]
-    # Amplitude and Phase priors
+    
     if m.nharmonics > 1
-        push!(priors, "$(p_names.amplitude) ~ filldist($(amp_prior_str), $(m.nharmonics))")
-        push!(priors, "$(p_names.phase) ~ filldist($(phase_prior_str), $(m.nharmonics))")
+        push!(priors, "$(p_names.beta_cos) ~ filldist(Normal(0, 1), $(m.nharmonics))")
+        push!(priors, "$(p_names.beta_sin) ~ filldist(Normal(0, 1), $(m.nharmonics))")
     else
-        push!(priors, "$(p_names.amplitude) ~ $(amp_prior_str)")
-        push!(priors, "$(p_names.phase) ~ $(phase_prior_str)")
+        push!(priors, "$(p_names.beta_cos) ~ Normal(0, 1)")
+        push!(priors, "$(p_names.beta_sin) ~ Normal(0, 1)")
     end
 
-    # Period prior (if it's a distribution)
     if m.period isa UnivariateDistribution
         period_prior_str = _distribution_to_string(m.period)
         push!(priors, "$(p_names.period) ~ $(period_prior_str)")
-    elseif m.period isa Vector
-        # The constructor ensures all distributions in the vector are the same.
+    elseif m.period isa Vector{<:UnivariateDistribution}
         period_prior_str = _distribution_to_string(m.period[1])
-        push!(priors, "$(p_names.period) ~ filldist($(period_prior_str), $(m.nharmonics))")
+        push!(
+            priors,
+            "$(p_names.period) ~ filldist($(period_prior_str), $(m.nharmonics))"
+        )
     end
 
     return join(priors, "\n    ")
 end
 
 """
-    get_updates(m::Harmonic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::Harmonic, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code to construct the harmonic effect by summing the cosine waves
-and adds the result to the linear predictor `eta`.
+Generates the Turing code to construct the harmonic effect by summing the cosine
+and sine waves and adds the result to the linear predictor `eta`.
+
+# Assumptions
+- The effect of the harmonic component is additive on the scale of the linear predictor.
 """
-function get_updates(m::Harmonic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(
+    m::Harmonic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    t_coords = "spec_registry[:$(spec.key)].precomputes.t_coords"
+    u_coords = "spec_registry[:$(spec.key)].precomputes.u_coords"
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
 
-    # Define how to access the period value (fixed or sampled)
     period_expr = if m.period isa Real
+        string(m.period)
+    elseif m.period isa Vector{<:Real}
         string(m.period)
     else
         string(p_names.period)
     end
 
-    # Construct the loop to sum harmonic components
     loop_body = """
-        local amp = $(m.nharmonics > 1 ? "$(p_names.amplitude)[k]" : string(p_names.amplitude))
-        local phase = $(m.nharmonics > 1 ? "$(p_names.phase)[k]" : string(p_names.phase))
+        local b_cos = $(m.nharmonics > 1 ? "$(p_names.beta_cos)[k]" : string(p_names.beta_cos))
+        local b_sin = $(m.nharmonics > 1 ? "$(p_names.beta_sin)[k]" : string(p_names.beta_sin))
         local period = $(m.period isa Vector ? "$(period_expr)[k]" : period_expr)
         
-        # The full harmonic effect is constructed for each of the t_N time points.
-        # The phase is scaled by 2π to map from [0,1] to a full cycle.
-        $(p_names.latent) .+= amp .* cos.( (2*pi*k ./ period) .* $(t_coords) .+ (2*pi .* phase) )
+        local angle = (2 * pi * k ./ period) .* $(u_coords)
+        
+        $(p_names.latent) .+= b_cos .* cos.(angle) .+ b_sin .* sin.(angle)
     """
 
-    # Assemble the final code block
     return """
         # --- Harmonic Component: $(spec.key) ---
-        local $(p_names.latent) = zeros(T, M.t_N)
+        local $(p_names.latent) = zeros(M.u_N)
         for k in 1:$(m.nharmonics)
             $(loop_body)
         end
-        # Add the effect to the linear predictor, indexed by the observation's time unit.
-        eta .+= $(p_names.latent)[M.t_idx]
+        $(eta_target) .+= view($(p_names.latent), M.u_idx)
     """
 end
 
 """
-    get_effects(m::Harmonic, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::Harmonic, chain, M, n_samples, outcomes_N, spec, PS, N_total)::NamedTuple
 
 Reconstructs the harmonic component's effect from the MCMC chain's posterior samples.
+It retrieves the sampled coefficients and period, reconstructs the latent harmonic
+field, and maps it to the observation-level indices.
+
+# Assumptions
+- The MCMC `chain` contains posterior samples for the `beta_cos`, `beta_sin`, and
+  `period` parameters.
 """
-function get_effects(m::Harmonic, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    # Extract posterior samples
-    amp_samples = get(chain, p_names.amplitude)
-    phase_samples = get(chain, p_names.phase)
+function get_effects(
+    m::Harmonic, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
     
-    period_samples = if m.period isa Real
-        fill(m.period, n_samples)
-    else
-        get(chain, p_names.period)
-    end
+    u_coords = spec.precomputes.u_coords
+    u_idx_full = isnothing(PS) ? M.u_idx : PS.u_idx
 
-    t_coords = spec.precomputes.t_coords
-    idx_to_use = isnothing(PS) ? M.t_idx : PS.t_idx
-    
-    # Initialize array for reconstructed effects over the unique time points
-    reconstructed_effects = zeros(n_samples, M.t_N)
+    for k_outcome in 1:outcomes_N
+        p_names = generate_full_variable_names(spec, M.model_arch, k_outcome)
 
-    # Reconstruct for each sample
-    for i in 1:n_samples
-        sample_effect = zeros(M.t_N)
-        for k in 1:m.nharmonics
-            amp_ik = m.nharmonics > 1 ? amp_samples[i, k] : amp_samples[i]
-            phase_ik = m.nharmonics > 1 ? phase_samples[i, k] : phase_samples[i]
-            
-            period_ik = if m.period isa Real
-                m.period
-            elseif m.period isa Vector
-                period_samples[i, k]
-            else # UnivariateDistribution
-                period_samples[i]
-            end
-            
-            sample_effect .+= amp_ik .* cos.((2*pi*k ./ period_ik) .* t_coords .+ (2*pi .* phase_ik))
+        beta_cos_samples = get_params_vector(
+            chain, string(p_names.beta_cos), m.nharmonics
+        )
+        beta_sin_samples = get_params_vector(
+            chain, string(p_names.beta_sin), m.nharmonics
+        )
+        
+        period_samples = if m.period isa Real
+            fill(m.period, n_samples, m.nharmonics)
+        elseif m.period isa Vector{<:Real}
+            repeat(m.period', n_samples, 1)
+        else
+            get_params_vector(chain, string(p_names.period), m.nharmonics)
         end
-        reconstructed_effects[i, :] = sample_effect
+
+        reconstructed_effects_k = zeros(Float64, M.u_N, n_samples)
+
+        for i in 1:n_samples
+            sample_effect = zeros(M.u_N)
+            for k_harmonic in 1:m.nharmonics
+                b_cos_ik = m.nharmonics > 1 ?
+                    beta_cos_samples[i, k_harmonic] : beta_cos_samples[i]
+                b_sin_ik = m.nharmonics > 1 ?
+                    beta_sin_samples[i, k_harmonic] : beta_sin_samples[i]
+                period_ik = m.period isa Vector ?
+                    period_samples[i, k_harmonic] : period_samples[i]
+                
+                angle = (2 * pi * k_harmonic / period_ik) .* u_coords
+                sample_effect .+= b_cos_ik .* cos.(angle) .+ b_sin_ik .* sin.(angle)
+            end
+            reconstructed_effects_k[:, i] = sample_effect
+        end
+
+        indexed_effects = reconstructed_effects_k[u_idx_full, :]
+        push!(structured_effects, indexed_effects)
     end
 
-    # Summarize effects
-    mean_effect = mean(reconstructed_effects, dims=1)[:]
-    lower_ci = quantile(reconstructed_effects, 0.025, dims=1)[:]
-    upper_ci = quantile(reconstructed_effects, 0.975, dims=1)[:]
-
-    # Index the effects to match the observation data points
-    indexed_mean = mean_effect[idx_to_use]
-    indexed_lower = lower_ci[idx_to_use]
-    indexed_upper = upper_ci[idx_to_use]
-
-    return (structured=(mean=indexed_mean, lower=indexed_lower, upper=indexed_upper),)
+    return (structured=structured_effects, noisy=structured_effects)
 end

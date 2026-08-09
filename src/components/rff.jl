@@ -1,5 +1,4 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
+
 
 """
     RFF <: ComponentModel
@@ -9,8 +8,51 @@ approximates a stationary kernel (like Squared Exponential or Matérn) by projec
 the input coordinates into a randomized feature space. This transforms the GP into a
 more scalable Bayesian linear regression problem.
 
+# Version
+v1.0.0 (2026-08-08)
+
+# Mathematical Summary
+The RFF method approximates a stationary kernel \$k(\\tau) = k(x - x')\$ by using
+Bochner's theorem, which states that \$k(\\tau)\$ is the Fourier transform of a
+non-negative measure \$p(\\omega)\$, the spectral density. The kernel can be written as:
+\$k(\\tau) = \\mathbb{E}_{\\omega \\sim p}[\\cos(\\omega^T \\tau)]\$
+
+This expectation is approximated via Monte Carlo by drawing \$M\$ random frequencies
+\$\\{\\omega_j\\}_{j=1}^M\$ from \$p(\\omega)\$. The feature map \$\\phi(x)\$ is then:
+\$\\phi(x) = \\sqrt{2/M} [\\cos(\\omega_1^T x + b_1), \\dots, \\cos(\\omega_M^T x + b_M)]\$
+where \$b_j \\sim \\text{Uniform}(0, 2\\pi)\$. The kernel is then approximated as
+\$k(x, x') \\approx \\phi(x)^T \\phi(x')\$. The final effect is a linear combination
+of these features: \$f(x) = \\phi(x)^T \\beta\$, where \$\\beta\$ are learnable weights.
+
+# Distinction from other GP approximations
+- **Nystrom**: Approximates the full kernel matrix \$K_{XX}\$ with a low-rank version
+  \$\\tilde{K}_{XX} = K_{XU} K_{UU}^{-1} K_{UX}\$. It's a low-rank approximation of the
+  covariance matrix itself.
+- **RFF (Random Fourier Features)**: Approximates the kernel *function* \$k(x, x')\$
+  with a finite-dimensional feature map \$\\phi(x)^T \\phi(x')\$. It transforms the problem
+  into a linear model in a high-dimensional feature space.
+- **Full GP**: Computes the exact kernel matrix \$K_{XX}\$ and performs inference directly,
+  which is \$O(N^3)\$ and memory-intensive (\$O(N^2)\$). SVGP (and FITC) reduce this to
+  \$O(NM^2 + M^3)\$ for computation and \$O(NM)\$ for memory.
+
+# Assumptions
+- The underlying process is stationary.
+- The number of features `n_features` is sufficient to provide a good approximation
+  of the true kernel.
+
+# Best Use Case
+A scalable alternative to a full Gaussian Process for modeling smooth, non-linear
+effects of continuous covariates, especially when the number of observations is
+large.
+
+# Key References
+- Rahimi, A., & Recht, B. (2007). *Random features for large-scale kernel
+  machines*. In NIPS.
+- Wikipedia: Random Fourier features
+
 # Fields
-- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the lengthscale(s) of the kernel.
+- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the
+  lengthscale(s) of the kernel.
 - `sigma::Distribution`: The prior for the standard deviation of the RFF coefficients.
 - `n_features::Int`: The number of random features to use for the approximation.
 - `kernel::String`: The name of the kernel to approximate (e.g., "se", "matern32").
@@ -22,11 +64,16 @@ struct RFF <: ComponentModel
     kernel::String
 end
 
-# Add to the central component constructor registry.
-COMPONENT_CONSTRUCTORS[:rff] = (p, params) -> RFF(p.lengthscale, p.sigma, get(params, :n_features, 20), string(get(params, :kernel, "se")))
+COMPONENT_TYPE_REGISTRY[:rff] = RFF
 
-# Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[RFF] = :smooth
+COMPONENT_CONSTRUCTORS[:rff] = (p, params) -> RFF(
+    p.lengthscale,
+    p.sigma,
+    get(params, :n_features, 20),
+    string(get(params, :kernel, "se"))
+)
+
+MODEL_TO_STRUCTURE_MAP[:rff] = :smooth
 
 """
     get_datastructures!(m_type::Type{<:RFF}, M::Dict, mod_data::Dict)::Bool
@@ -47,19 +94,20 @@ function get_datastructures!(m_type::Type{<:RFF}, M::Dict, mod_data::Dict)::Bool
         end
     end
 
-    # Store the coordinates matrix in the module's parameters for later use.
     mod_data[:params][:coords] = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-
     return true
 end
 
 """
-    _generate_rff_fixed_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String)
+    _generate_rff_fixed_params(in_dims, n_features, lengthscale, kernel_name)
 
 Generates fixed random projection weights (W) and biases (b) for RFF approximation.
 This helper function is used in the precomputation stage.
 """
-function _generate_rff_fixed_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String)
+function _generate_rff_fixed_params(
+    in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector},
+    kernel_name::String
+)
     b = rand(Uniform(0, 2 * pi), n_features)
     W = Matrix{Float64}(undef, in_dims, n_features)
     k_name = lowercase(kernel_name)
@@ -68,8 +116,12 @@ function _generate_rff_fixed_params(in_dims::Int, n_features::Int, lengthscale::
         if lengthscale isa Real
             W .= rand(Normal(0, 1.0 / lengthscale), in_dims, n_features)
         else
-            if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
-            for d in 1:in_dims; W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features); end
+            if length(lengthscale) != in_dims
+                error("ARD lengthscale vector length mismatch.")
+            end
+            for d in 1:in_dims
+                W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features)
+            end
         end
     elseif occursin("matern", k_name)
         nu = if k_name == "matern12"; 0.5; elseif k_name == "matern32"; 1.5; else 2.5; end
@@ -77,8 +129,12 @@ function _generate_rff_fixed_params(in_dims::Int, n_features::Int, lengthscale::
         if lengthscale isa Real
             W .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
         else
-            if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
-            for d in 1:in_dims; W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features); end
+            if length(lengthscale) != in_dims
+                error("ARD lengthscale vector length mismatch.")
+            end
+            for d in 1:in_dims
+                W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features)
+            end
         end
     else
         @warn "Kernel '$kernel_name' not recognized for RFF. Defaulting to SE."
@@ -102,7 +158,6 @@ function get_precomputes(m::RFF, M::NamedTuple, mod_data::Dict)::NamedTuple
     
     in_dims = size(coords, 2)
     
-    # Get initial lengthscale from the prior's mean for generating fixed features.
     ls_prior = m.lengthscale
     local ls_initial
     if ls_prior isa Vector
@@ -111,7 +166,9 @@ function get_precomputes(m::RFF, M::NamedTuple, mod_data::Dict)::NamedTuple
         ls_initial = mean(ls_prior isa Truncated ? untruncated(ls_prior) : ls_prior)
     end
 
-    W_fixed, b_fixed = _generate_rff_fixed_params(in_dims, m.n_features, ls_initial, m.kernel)
+    W_fixed, b_fixed = _generate_rff_fixed_params(
+        in_dims, m.n_features, ls_initial, m.kernel
+    )
 
     return (
         coords=coords,
@@ -123,106 +180,121 @@ function get_precomputes(m::RFF, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    get_priors(m::RFF, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::RFF, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for the `RFF` component's priors.
-This defines priors for `sigma`, `lengthscale`, the adaptive feature parameters `W` and `b`,
-and the `raw` coefficients.
+Generates priors for `sigma`, `lengthscale`, the adaptive feature parameters `W`
+and `b`, and the `raw` coefficients.
 """
-function get_priors(m::RFF, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(
+    m::RFF, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(p_names.sigma))")
+    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     if m.lengthscale isa Vector
         ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ NamedDist(Product([$(ls_priors_str)]), :$(p_names.ls))")
+        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
     else
         ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ NamedDist($(ls_prior_str), :$(p_names.ls))")
+        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    # Priors for adaptive features, centered on the fixed random features.
-    push!(priors, "$(p_names.W) ~ NamedDist(MvNormal(vec(spec_registry[:$(spec.key)].precomputes.W_fixed), T(0.1)), :$(p_names.W))")
-    push!(priors, "$(p_names.b) ~ NamedDist(MvNormal(spec_registry[:$(spec.key)].precomputes.b_fixed, T(0.1)), :$(p_names.b))")
-    
-    # Prior for the raw coefficients.
-    push!(priors, "$(p_names.raw) ~ NamedDist(MvNormal(zeros(T, spec.precomputes.n_latent), I), :$(p_names.raw))")
+    push!(
+        priors,
+        "$(p_names.W) ~ MvNormal(vec(spec.precomputes.W_fixed), 0.1)"
+    )
+    push!(
+        priors,
+        "$(p_names.b) ~ MvNormal(spec.precomputes.b_fixed, 0.1)"
+    )
+    push!(
+        priors,
+        "$(p_names.raw) ~ MvNormal(zeros(T, spec.precomputes.n_latent), I)"
+    )
 
     return join(priors, "\n    ")
 end
 
 """
-    get_updates(m::RFF, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::RFF, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates the Turing code string for constructing the `RFF` smooth effect.
 """
-function get_updates(m::RFF, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(
+    m::RFF, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    precomputes = "spec_registry[:$(spec.key)].precomputes"
+    precomputes = "spec.precomputes"
     
     return """
         # --- RFF Smoother Component: $(spec.key) ---
-        local X_coords = T.($precomputes.coords)
-        local W_matrix = reshape($(p_names.W), $precomputes.in_dims, $precomputes.n_latent)
-        
-        # Compute the feature matrix Phi
-        local Phi = sqrt(T(2.0) / $precomputes.n_latent) .* cos.((X_coords * W_matrix) .+ $(p_names.b)')
-        
-        # Scale the raw coefficients and compute the final effect
-        local scaled_coeffs = $(p_names.raw) .* $(p_names.sigma)
-        local $(p_names.latent) = Phi * scaled_coeffs
-        
-        $(eta_target) .+= $(p_names.latent)
+        let
+            local X_coords = $(precomputes).coords
+            local W_matrix = reshape($(p_names.W), $(precomputes).in_dims, $(precomputes).n_latent)
+            
+            # Compute the feature matrix Phi
+            local Phi = sqrt(2.0 / $(precomputes).n_latent) .* cos.((X_coords * W_matrix) .+ $(p_names.b)')
+            
+            # Scale the raw coefficients and compute the final effect
+            local scaled_coeffs = $(p_names.raw) .* $(p_names.sigma)
+            local $(p_names.latent) = Phi * scaled_coeffs
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
     """
 end
 
 """
-    get_effects(m::RFF, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::RFF, chain, M::NamedTuple, ...)::NamedTuple
 
 Reconstructs the `RFF` component's effect from the MCMC chain's posterior samples.
 """
-function get_effects(m::RFF, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    # Extract posterior samples
-    sigma_samples = get(chain, p_names.sigma)
-    raw_samples = get(chain, p_names.raw)
-    W_samples = get(chain, p_names.W)
-    b_samples = get(chain, p_names.b)
-
+function get_effects(
+    m::RFF, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
+    
     precomputes = spec.precomputes
     in_dims = precomputes.in_dims
     n_features = precomputes.n_latent
 
-    # Use prediction set coordinates if available, otherwise use training coordinates.
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
         vcat(precomputes.coords, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
     else
         precomputes.coords
     end
-    
-    reconstructed_effects = zeros(n_samples, size(coords_full, 1))
 
-    for i in 1:n_samples
-        current_sigma = sigma_samples[i]
-        current_raw = raw_samples[i, :]
-        current_W = reshape(W_samples[i, :], in_dims, n_features)
-        current_b = b_samples[i, :]
+    for k in 1:outcomes_N
+        p_names = generate_full_variable_names(spec, M.model_arch, k)
         
-        # Reconstruct the feature matrix Phi for the current sample
-        Phi = sqrt(2.0 / n_features) .* cos.((coords_full * current_W) .+ current_b')
-        
-        # Reconstruct the scaled coefficients and the final effect
-        scaled_coeffs = current_raw .* current_sigma
-        reconstructed_effects[i, :] = Phi * scaled_coeffs
+        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)
+        raw_samples = get_params_vector(chain, string(p_names.raw), n_features)
+        W_samples = get_params_vector(chain, string(p_names.W), in_dims * n_features)
+        b_samples = get_params_vector(chain, string(p_names.b), n_features)
+
+        effect_k = zeros(Float64, size(coords_full, 1), n_samples)
+
+        for i in 1:n_samples
+            current_sigma = sigma_samples[i, 1]
+            current_raw = raw_samples[i, :]
+            current_W = reshape(W_samples[i, :], in_dims, n_features)
+            current_b = b_samples[i, :]
+            
+            Phi = sqrt(2.0 / n_features) .* cos.((coords_full * current_W) .+ current_b')
+            
+            scaled_coeffs = current_raw .* current_sigma
+            effect_k[:, i] = Phi * scaled_coeffs
+        end
+        push!(structured_effects, effect_k)
     end
-
-    mean_effect = mean(reconstructed_effects, dims=1)[:]
-    lower_ci = quantile(reconstructed_effects, 0.025, dims=1)[:]
-    upper_ci = quantile(reconstructed_effects, 0.975, dims=1)[:]
-
-    return (structured=(mean=mean_effect, lower=lower_ci, upper=upper_ci),)
+    
+    return (structured=structured_effects, noisy=structured_effects)
 end

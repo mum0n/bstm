@@ -1,16 +1,52 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
 
 """
     Kriging <: ComponentModel
 
-A component model for a full Gaussian Process, often referred to as Kriging in geostatistics.
-It computes a dense covariance matrix based on a specified kernel function and coordinate inputs.
+A component model for Kriging, which is the geostatistical term for Gaussian
+Process (GP) regression. It models a latent field by computing a dense covariance
+matrix based on a specified kernel function and coordinate inputs.
+
+# Version
+v1.0.0 (2026-08-08)
+
+# Mathematical Summary
+The component models a latent field \$f(x)\$ as a draw from a Gaussian Process with
+a zero mean and a specified covariance function (kernel):
+\$f(x) \\sim \\mathcal{GP}(0, k(x, x'))\$
+
+The kernel \$k(x, x')\$ defines the covariance between any two points. For example,
+the Squared Exponential (SE) kernel is:
+\$k(x, x') = \\sigma^2 \\exp\\left(-\\frac{\\|x - x'\\|^2}{2\\ell^2}\\right)\$
+where:
+- \$\\sigma^2\$ is the marginal variance (sill).
+- \$\\ell\$ is the characteristic lengthscale (range).
+- \$\\|x - x'\\|\$ is the Euclidean distance between points.
+
+The model samples the latent field \$f\$ from the resulting multivariate normal
+distribution \$f \\sim \\mathcal{N}(0, K)\$, where \$K\$ is the dense covariance matrix
+evaluated at all data points.
+
+# Assumptions
+- The underlying process is stationary (correlation depends only on distance).
+- The chosen kernel correctly reflects the smoothness properties of the process.
+
+# Best Use Case
+Standard non-parametric regression and spatial interpolation for small to moderate
+datasets where the computational cost of a full GP is acceptable. For larger
+datasets, consider scalable approximations like `random(..., model=:rff)` or
+`random(..., model=:fitc)`.
+
+# Key References
+- Rasmussen, C. E., & Williams, C. K. I. (2006). *Gaussian Processes for
+  Machine Learning*. MIT Press.
+- Wikipedia: Kriging
 
 # Fields
-- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior distribution(s) for the lengthscale(s) of the kernel. Can be a single distribution for isotropic kernels or a vector for ARD kernels.
-- `sigma::Distribution`: The prior distribution for the marginal standard deviation (amplitude) of the GP.
-- `kernel::String`: The name of the kernel function to use (e.g., "se" for Squared Exponential, "matern32").
+- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the
+  kernel lengthscale(s). Can be a single distribution for isotropic kernels or a
+  vector for ARD kernels.
+- `sigma::Distribution`: The prior for the marginal standard deviation of the GP.
+- `kernel::String`: The name of the kernel function (e.g., "se", "matern32").
 """
 struct Kriging <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
@@ -19,12 +55,13 @@ struct Kriging <: ComponentModel
 end
 
 # Add to the central component constructor registry.
-# This constructor allows specifying the kernel type.
-COMPONENT_CONSTRUCTORS[:kriging] = (p, params) -> Kriging(p.lengthscale, p.sigma, string(get(params, :kernel, "se")))
+COMPONENT_TYPE_REGISTRY[:kriging] = Kriging
+COMPONENT_CONSTRUCTORS[:kriging] = (p, params) -> Kriging(
+    p.lengthscale, p.sigma, string(get(params, :kernel, "se"))
+)
 
 # Add to the model-to-structure map.
-# Kriging is a continuous-space model, typically used as a smoother.
-MODEL_TO_STRUCTURE_MAP[Kriging] = :smooth
+MODEL_TO_STRUCTURE_MAP[:kriging] = :smooth
 
 """
     get_datastructures!(m_type::Type{<:Kriging}, M::Dict, mod_data::Dict)::Bool
@@ -32,11 +69,16 @@ MODEL_TO_STRUCTURE_MAP[Kriging] = :smooth
 Performs data-dependent setup for the `Kriging` component.
 It ensures that coordinate variables are provided and stores them in the module data.
 """
-function get_datastructures!(m_type::Type{<:Kriging}, M::Dict, mod_data::Dict)::Bool
+function get_datastructures!(
+    m_type::Type{<:Kriging}, M::Dict, mod_data::Dict
+)::Bool
     variables = mod_data[:variables]
 
     if isempty(variables)
-        error("The Kriging model requires coordinate variables, e.g., `random(x, y, model=:kriging)`.")
+        error(
+            "The Kriging model requires coordinate variables, e.g., " *
+            "`random(x, y, model=:kriging)`."
+        )
     end
 
     for var_sym in variables
@@ -45,9 +87,7 @@ function get_datastructures!(m_type::Type{<:Kriging}, M::Dict, mod_data::Dict)::
         end
     end
 
-    # Store the coordinates matrix in the module's parameters for later use.
     mod_data[:params][:coords] = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-
     return true
 end
 
@@ -60,124 +100,130 @@ The full covariance matrix is constructed dynamically within the model.
 function get_precomputes(m::Kriging, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
     if isnothing(coords)
-        error("Kriging component precomputes failed: coordinates not found in module data.")
+        error("Kriging precomputes failed: coordinates not found in module data.")
     end
     
     n_latent = size(coords, 1)
-
-    # For a full GP like Kriging, the "template" is the coordinate matrix itself.
-    # There is no parameter-independent precision matrix.
     return (coords=coords, n_latent=n_latent)
 end
 
 """
-    get_priors(m::Kriging, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::Kriging, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for the `Kriging` component's priors.
-It defines the priors for `sigma`, `lengthscale`, and the latent field `raw`.
+Generates priors for `sigma`, `lengthscale` (`ls`), and the `raw` innovations.
 """
-function get_priors(m::Kriging, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(
+    m::Kriging, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    sigma_prior_str = _distribution_to_string(m.sigma)
-    
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ NamedDist($(sigma_prior_str), :$(p_names.sigma))")
+    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     if m.lengthscale isa Vector
         ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ NamedDist(Product([$(ls_priors_str)]), :$(p_names.ls))")
+        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
     else
         ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ NamedDist($(ls_prior_str), :$(p_names.ls))")
+        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    # Latent field prior (non-centered parameterization)
-    # raw ~ MvNormal(zeros(T, n_latent), I)
-    push!(priors, "$(p_names.raw) ~ NamedDist(MvNormal(zeros(T, spec_registry[:$(spec.key)].precomputes.n_latent), I), :$(p_names.raw))")
+    push!(
+        priors,
+        "$(p_names.raw) ~ MvNormal(zeros(spec.precomputes.n_latent), I)"
+    )
 
     return join(priors, "\n    ")
 end
 
 """
-    get_updates(m::Kriging, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::Kriging, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for constructing the `Kriging` effect.
-It computes the kernel matrix, performs a Cholesky decomposition, and
-transforms the raw innovations to generate the latent field.
+Generates code to compute the kernel matrix, perform a Cholesky decomposition,
+and sample the latent field using a non-centered parameterization.
 """
-function get_updates(m::Kriging, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(
+    m::Kriging, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     return """
         # --- Kriging (Full GP) Component: $(spec.key) ---
-        local X_coords = T.(spec_registry[:$(spec.key)].precomputes.coords)
-        local kernel_type = Symbol("$(m.kernel)")
+        let
+            local coords = spec_registry[:$(spec.key)].precomputes.coords
+            local kernel_type = Symbol("$(m.kernel)")
 
-        # Compute the kernel matrix K_XX
-        local K_mat = evaluate_kernel_matrix(X_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise)
-        
-        # Perform Cholesky decomposition for non-centered parameterization
-        local F_krig = cholesky(Symmetric(K_mat))
-        
-        # Sample latent field: latent = L * raw
-        local $(p_names.latent) = F_krig.L * $(p_names.raw)
-        
-        $(eta_target) .+= $(p_names.latent)
+            local K_mat = evaluate_kernel_matrix(
+                coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
+            )
+            
+            local F_krig = cholesky(Symmetric(K_mat))
+            local $(p_names.latent) = F_krig.L * $(p_names.raw)
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
     """
 end
 
 """
-    get_effects(m::Kriging, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::Kriging, chain, M::NamedTuple, ...)
 
-Reconstructs the `Kriging` component's effect from the MCMC chain's posterior samples.
+Reconstructs the `Kriging` component's effect from the MCMC chain's posterior
+samples by re-evaluating the kernel for each sample.
 """
-function get_effects(m::Kriging, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    sigma_samples = get(chain, p_names.sigma)
-    ls_samples = get(chain, p_names.ls)
-    raw_samples = get(chain, p_names.raw)
-
-    # Use prediction set coordinates if available, otherwise use training coordinates.
-    coords_full = if isnothing(PS)
-        spec.precomputes.coords
-    else
-        # This assumes the component struct has a field `variables` storing the coordinate column names
-        # which is not standard. A better approach would be to get it from `spec.var` or `spec.params`.
-        # For now, we assume `spec.var` holds a string like "s_x_s_y"
-        coord_vars = Symbol.(split(spec.var, "_"))
-        Matrix{Float64}(PS.data[!, coord_vars])
-    end
+function get_effects(
+    m::Kriging, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
     
+    coord_vars = get(spec.params, :positional_args, [])
+    coords_train = spec.precomputes.coords
+    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
+    else
+        coords_train
+    end
     n_obs_full = size(coords_full, 1)
+    
     noise = M.noise
     kernel_type = Symbol(m.kernel)
 
-    reconstructed_effects = zeros(n_samples, n_obs_full)
+    for k in 1:outcomes_N
+        p_names = generate_full_variable_names(spec, M.model_arch, k)
+        
+        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
+        ls_samples = get_params_vector(
+            chain, string(p_names.ls), length(m.lengthscale)
+        )
+        raw_samples = get_params_vector(
+            chain, string(p_names.raw), spec.precomputes.n_latent
+        )
 
-    for i in 1:n_samples
-        current_sigma = sigma_samples[i]
-        current_ls = if m.lengthscale isa Vector
-            ls_samples[i, :] # For ARD kernels, ls_samples will be a row vector
-        else
-            ls_samples[i]
+        effect_k = zeros(Float64, n_obs_full, n_samples)
+
+        for i in 1:n_samples
+            current_sigma = sigma_samples[i]
+            current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i]
+            
+            K_mat = evaluate_kernel_matrix(
+                coords_full, current_sigma, current_ls, kernel_type, noise
+            )
+            F = cholesky(Symmetric(K_mat))
+            
+            raw_i = if size(raw_samples, 2) == n_obs_full
+                raw_samples[i, :]
+            else
+                vcat(raw_samples[i, :], randn(n_obs_full - size(raw_samples, 2)))
+            end
+            
+            effect_k[:, i] = F.L * raw_i
         end
-        current_raw = raw_samples[i, :]
-        
-        # Reconstruct the kernel matrix for the current sample
-        K_mat = evaluate_kernel_matrix(coords_full, current_sigma, current_ls, kernel_type, noise)
-        
-        # Perform Cholesky decomposition
-        F = cholesky(Symmetric(K_mat))
-        
-        # Reconstruct latent field
-        reconstructed_effects[i, :] = F.L * current_raw
+        push!(structured_effects, effect_k)
     end
-
-    mean_effect = mean(reconstructed_effects, dims=1)[:]
-    lower_ci = quantile(reconstructed_effects, 0.025, dims=1)[:]
-    upper_ci = quantile(reconstructed_effects, 0.975, dims=1)[:]
-
-    # For full GP models like Kriging, the effect is already at the observation level.
-    return (structured=(mean=mean_effect, lower=lower_ci, upper=upper_ci),)
+    
+    return (structured=structured_effects, noisy=structured_effects)
 end

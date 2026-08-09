@@ -1,12 +1,46 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
-
 """
     SVC <: ComponentModel
 
 A component model for Spatially Varying Coefficients (SVC), allowing the effect of a
 covariate to vary smoothly across space. It acts as an orchestrator, applying an inner
 spatial `ComponentModel` to a specified covariate.
+
+# Version
+v1.1.0 (2026-08-09)
+
+# Mathematical Summary
+An SVC model replaces a fixed regression coefficient \$\\beta\$ with a spatially-indexed
+coefficient \$\\beta(s)\$, where \$s\$ denotes a spatial location. The contribution
+to the linear predictor \$\\eta\$ for an observation at location \$s_i\$ with
+covariate value \$x_i\$ is given by:
+
+\$\\eta_i = \\dots + \\beta(s_i) x_i\$
+
+The spatially varying coefficient \$\\boldsymbol{\\beta} = (\\beta(s_1), \\dots, \\beta(s_{s_N}))\$
+is itself modeled as a latent Gaussian Process or Gaussian Markov Random Field (GMRF),
+governed by the `inner_model`. For example, if the inner model is an ICAR, then:
+
+\$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\tau \\mathbf{Q}_{ICAR})^{-1})\$
+
+This allows the model to learn how the influence of a covariate changes across the
+spatial domain.
+
+# Assumptions
+- The relationship between the covariate and the outcome is linear at any given
+  location, but the slope of that relationship can change from one location to another.
+- The spatial variation of the coefficient can be adequately captured by the
+  specified inner spatial model (e.g., ICAR, BYM2, GP).
+
+# Best Use Case
+Modeling relationships that are not constant across space. For example, the effect
+of temperature on species abundance may be stronger in some parts of a habitat
+than others. SVC models can capture these non-stationary relationships.
+
+# Key References
+- Gelfand, A. E., Kim, H. J., Sirmans, C. F., & Banerjee, S. (2003). Spatial
+  modeling with spatially varying coefficient processes. *Journal of the
+  American Statistical Association*, 98(462), 387-396.
+- Wikipedia: Geographically weighted regression (for a related concept).
 
 # Fields
 - `covariate::Symbol`: The symbol of the covariate whose coefficient varies over space.
@@ -15,13 +49,13 @@ spatial `ComponentModel` to a specified covariate.
 """
 struct SVC <: ComponentModel
     covariate::Symbol
-    model::ComponentModel # The inner spatial model
+    model::ComponentModel
 end
 
-# Add to the central component constructor registry.
-# This constructor expects the inner model to be already resolved and passed in `params`.
-# The `resolve_technical_primitive` function is responsible for resolving the inner model
-# and then calling this constructor.
+COMPONENT_TYPE_REGISTRY[:svc] = SVC
+
+# The constructor is called by `resolve_technical_primitive`, which resolves the
+# inner model object and passes it in the `params` dictionary.
 COMPONENT_CONSTRUCTORS[:svc] = (p, params) -> begin
     covariate = get(params, :covariate, error("SVC constructor requires a `covariate` parameter."))
     inner_model_obj = get(params, :inner_model_obj, error("SVC constructor requires an `inner_model_obj` parameter."))
@@ -29,33 +63,43 @@ COMPONENT_CONSTRUCTORS[:svc] = (p, params) -> begin
     SVC(covariate, inner_model_obj)
 end
 
-# Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[SVC] = :spatial
+MODEL_TO_STRUCTURE_MAP[:svc] = :spatial
 
 """
     get_datastructures!(m_type::Type{<:SVC}, M::Dict, mod_data::Dict)::Bool
 
-Performs data-dependent setup for the `SVC`.
-It ensures that the `covariate` variable is present in the data and delegates
-data structure setup to the inner spatial model.
+Data-dependent setup for the SVC component.
+Ensures the specified `covariate` exists in the data and delegates further spatial
+setup to the inner spatial model's `get_datastructures!` method.
 """
 function get_datastructures!(m_type::Type{<:SVC}, M::Dict, mod_data::Dict)::Bool
     params = mod_data[:params]
     cov_var = get(params, :covariate, nothing)
 
     if isnothing(cov_var)
-        error("SVC model requires a `covariate` parameter.")
+        error("SVC model '$(mod_data[:key])' requires a `covariate` parameter.")
     end
 
+    # The covariate '1' or :intercept is a special case for a spatially varying intercept.
     if cov_var != Symbol("1") && cov_var != :intercept && !hasproperty(M[:data], cov_var)
-        error("Covariate variable ':$cov_var' for SVC model not found in data.")
+        error("Covariate ':$cov_var' for SVC model '$(mod_data[:key])' not found in data.")
     end
 
-    # Delegate data structure setup to the inner spatial model
+    # Delegate data structure setup to the inner spatial model.
+    # This ensures that s_idx, s_N, W, etc., are correctly set up based on the
+    # inner model's requirements.
     inner_model_spec_node = get(params, :spatial_model_spec, nothing)
     if isnothing(inner_model_spec_node)
-        error("SVC model requires a `spatial_model_spec` parameter in its module data.")
+        error("SVC model '$(mod_data[:key])' is missing the inner `spatial_model_spec`.")
     end
+
+    # The component object `m` is not yet the final SVC object at this stage,
+    # so we need to get the inner model type from the parsed formula node.
+    inner_model_name = get(inner_model_spec_node.args, :model, :icar)
+    if !haskey(COMPONENT_TYPE_REGISTRY, inner_model_name)
+        error("Inner model ':$inner_model_name' for SVC not found in COMPONENT_TYPE_REGISTRY.")
+    end
+    inner_model_type = COMPONENT_TYPE_REGISTRY[inner_model_name]
 
     inner_mod_data = Dict(
         :key => Symbol("$(mod_data[:key])_inner"), # Create a unique key for the inner model
@@ -64,22 +108,20 @@ function get_datastructures!(m_type::Type{<:SVC}, M::Dict, mod_data::Dict)::Bool
         :params => inner_model_spec_node.args
     )
     
-    # Call the inner model's get_datastructures!
-    inner_model_type = typeof(mod_data[:component_obj].model) # Access the actual inner model type
     return get_datastructures!(inner_model_type, M, inner_mod_data)
 end
 
 """
     get_precomputes(m::SVC, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Performs data-independent pre-calculations for the `SVC`.
-It delegates pre-computation to the inner spatial model and stores its results.
+Pre-computes structures for the SVC component.
+Delegates pre-computation to the inner spatial model (e.g., to build its
+precision matrix template and spectral decomposition) and stores the results.
 """
 function get_precomputes(m::SVC, M::NamedTuple, mod_data::Dict)::NamedTuple
-    # Delegate pre-computation to the inner spatial model
     inner_model_spec_node = get(mod_data[:params], :spatial_model_spec, nothing)
     if isnothing(inner_model_spec_node)
-        error("SVC model's mod_data missing `spatial_model_spec` for precomputes.")
+        error("SVC model '$(mod_data[:key])' missing `spatial_model_spec` for precomputes.")
     end
 
     inner_mod_data = Dict(
@@ -88,51 +130,20 @@ function get_precomputes(m::SVC, M::NamedTuple, mod_data::Dict)::NamedTuple
         :variables => get(inner_model_spec_node.args, :positional_args, []),
         :params => inner_model_spec_node.args
     )
-
+    
     inner_precomputes = get_precomputes(m.model, M, inner_mod_data)
     
-    # The SVC component itself doesn't have a Q_template, U, L directly,
-    # but its inner model does. We store the inner model's precomputes.
     return (inner_precomputes=inner_precomputes,)
 end
 
 """
-    get_priors(m::SVC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::SVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for the `SVC`'s priors.
-It delegates prior generation to the inner spatial model.
+Generates the Turing code for the SVC component's priors.
+Delegates prior generation to the inner spatial model, ensuring that parameter
+names for the inner model are correctly scoped to avoid collisions.
 """
-function get_priors(m::SVC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-    # Construct a spec for the inner model to pass to its get_priors function.
-    inner_spec_key = Symbol("$(spec.key)_inner")
-    inner_spec = (
-        key = inner_spec_key,
-        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.model)], # Get structure of inner model
-        var = spec.var, # Inherit variable from SVC for naming consistency
-        component_obj = m.model,
-        params = spec.params, # Pass SVC's params, as inner model's params are nested within
-        Q_template = spec.hyper.inner_precomputes.Q_template, # Use inner model's Q_template
-        scaling_factor = spec.hyper.inner_precomputes.scaling_factor,
-        hyper = spec.hyper.inner_precomputes # Pass all inner precomputes as hyper for inner model
-    )
-    
-    # Delegate prior generation to the inner spatial model
-    return get_priors(m.model, inner_spec, arch, outcome_idx, M)
-end
-
-"""
-    get_updates(m::SVC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-
-Generates the Turing code string for constructing the `SVC`'s effect
-and adding it to the linear predictor (`eta`).
-It delegates the inner model's effect construction and then applies the covariate.
-"""
-function get_updates(m::SVC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-    p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    cov_var = m.covariate
-
-    # Construct a spec for the inner model to pass to its get_updates function.
+function get_priors(m::SVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
     inner_spec_key = Symbol("$(spec.key)_inner")
     inner_spec = (
         key = inner_spec_key,
@@ -140,57 +151,69 @@ function get_updates(m::SVC, spec::NamedTuple, arch::String, outcome_idx::Union{
         var = spec.var,
         component_obj = m.model,
         params = spec.params,
-        Q_template = spec.hyper.inner_precomputes.Q_template,
-        scaling_factor = spec.hyper.inner_precomputes.scaling_factor,
-        hyper = spec.hyper.inner_precomputes
+        hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
+    )
+    
+    return get_priors(m.model, inner_spec, arch, outcome_idx, M)
+end
+
+"""
+    get_updates(m::SVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
+
+Generates Turing code for the SVC component's effect.
+Delegates the construction of the spatially varying coefficient field to the inner
+model, and then multiplies this field by the specified covariate value for each
+observation before adding it to the linear predictor `eta`.
+"""
+function get_updates(m::SVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    cov_var = m.covariate
+
+    inner_spec_key = Symbol("$(spec.key)_inner")
+    inner_spec = (
+        key = inner_spec_key,
+        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.model)],
+        var = spec.var,
+        component_obj = m.model,
+        params = spec.params,
+        hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
     )
 
-    # Get the update code from the inner spatial model.
-    inner_frags = get_updates(m.model, inner_spec, arch, outcome_idx, M)
-    
-    # The inner model's latent effect variable name will be based on its own spec key.
+    inner_updates_code = get_updates(m.model, inner_spec, arch, outcome_idx, M)
     inner_p_names = generate_full_variable_names(inner_spec, arch, outcome_idx)
     inner_latent_var = inner_p_names.latent
 
-    # Remove any direct `eta` update from the inner fragment, as SVC will handle it.
-    effect_app_regex = Regex("$(eta_target) \\.\\+= .*")
-    update_inner_cleaned = replace(inner_frags, effect_app_regex => "")
+    effect_app_regex = Regex("$(eta_target) .*\\.=")
+    update_inner_cleaned = replace(inner_updates_code, effect_app_regex => "# (eta update handled by SVC)")
 
-    # The inner model's latent effect is assumed to be indexed by M.s_idx.
     is_intercept = (cov_var == Symbol("1") || cov_var == :intercept)
     
     application_code = if is_intercept
-        """
-        for i in 1:length($(eta_target))
-            $(eta_target)[i] += $(inner_latent_var)[M.s_idx[i]]
-        end
-        """
+        "$(eta_target) .+= view($(inner_latent_var), M.s_idx)"
     else
-        """
-        local cov_data::Vector{T} = T.(M.data[!, :$(cov_var)])
-        for i in 1:length($(eta_target))
-            $(eta_target)[i] += cov_data[i] * $(inner_latent_var)[M.s_idx[i]]
-        end
-        """
+        "$(eta_target) .+= M.data[!, :$(cov_var)] .* view($(inner_latent_var), M.s_idx)"
     end
     
     return """
-        # --- Spatially Varying Coefficient (SVC) for: $(cov_var) (Component: $(spec.key)) ---
+        # --- Spatially Varying Coefficient (SVC) for: $(cov_var) ---
+        # 1. Generate the latent spatial field for the coefficient.
         $(update_inner_cleaned)
+
+        # 2. Apply the spatially varying coefficient to the linear predictor.
         $(application_code)
     """
 end
 
 """
-    get_effects(m::SVC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::SVC, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
 
-Reconstructs the `SVC`'s effect from the MCMC chain's posterior samples.
-It reconstructs the inner model's effects and then applies the covariate.
+Reconstructs the SVC component's effect from posteriors.
+Reconstructs the inner spatial field for each posterior sample and then multiplies
+it by the covariate values to get the final SVC effect for each observation.
 """
-function get_effects(m::SVC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+function get_effects(m::SVC, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
     cov_var = m.covariate
     
-    # Construct a spec for the inner model to pass to its get_effects function.
     inner_spec_key = Symbol("$(spec.key)_inner")
     inner_spec = (
         key = inner_spec_key,
@@ -198,48 +221,41 @@ function get_effects(m::SVC, chain, M::NamedTuple, n_samples::Int, outcomes_N::I
         var = spec.var,
         component_obj = m.model,
         params = spec.params,
-        Q_template = spec.hyper.inner_precomputes.Q_template,
-        scaling_factor = spec.hyper.inner_precomputes.scaling_factor,
-        hyper = spec.hyper.inner_precomputes
+        hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
     )
 
-    # Generate parameter names for the inner model
     inner_p_names = generate_full_variable_names(inner_spec, M.model_arch, nothing)
-
-    # Reconstruct the inner model's effects. This returns a NamedTuple with mean, lower, upper.
     inner_effects_result = get_effects(m.model, chain, M, n_samples, outcomes_N, inner_p_names, inner_spec, PS, N_total)
     
-    # The inner model's effects are structured (mean, lower, upper) over its latent dimension (M.s_N).
-    inner_mean_effect = inner_effects_result.structured.mean
-    inner_lower_effect = inner_effects_result.structured.lower
-    inner_upper_effect = inner_effects_result.structured.upper
-
-    # Extract covariate data. If PS is provided, use its data, otherwise use M.data.
     is_intercept = (cov_var == Symbol("1") || cov_var == :intercept)
-    
-    local cov_data_full
-    if !is_intercept
-        data_source = isnothing(PS) ? M.data : PS.data
-        cov_data_full = data_source[!, cov_var]
-    end
-    
-    # The inner effects are reconstructed for the full latent dimension (M.s_N).
-    # We need to index these effects by M.s_idx (or PS.s_idx) and multiply by the covariate.
-    idx_to_use = isnothing(PS) ? M.s_idx : PS.s_idx
-
-    # Initialize arrays for the final SVC effect
-    final_mean_effect = zeros(eltype(inner_mean_effect), length(idx_to_use))
-    final_lower_effect = zeros(eltype(inner_lower_effect), length(idx_to_use))
-    final_upper_effect = zeros(eltype(inner_upper_effect), length(idx_to_use))
-
-    for i in 1:length(idx_to_use)
-        s_idx_val = idx_to_use[i]
-        cov_val = is_intercept ? 1.0 : cov_data_full[i]
-        
-        final_mean_effect[i] = cov_val * inner_mean_effect[s_idx_val]
-        final_lower_effect[i] = cov_val * inner_lower_effect[s_idx_val]
-        final_upper_effect[i] = cov_val * inner_upper_effect[s_idx_val]
+    cov_data_full = if is_intercept
+        ones(Float64, N_total)
+    else
+        train_data = M.data[!, cov_var]
+        if !isnothing(PS) && hasproperty(PS.data, cov_var)
+            vcat(train_data, PS.data[!, cov_var])
+        else
+            train_data
+        end
     end
 
-    return (structured=(mean=final_mean_effect, lower=final_lower_effect, upper=final_upper_effect),)
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        vcat(M.s_idx, PS.data[!, :s_idx])
+    else
+        M.s_idx
+    end
+
+    structured_effects = Vector{Matrix{Float64}}()
+    for k in 1:outcomes_N
+        spatial_field_k = inner_effects_result.structured[k]
+        effect_k = zeros(Float64, N_total, n_samples)
+
+        for s in 1:n_samples
+            spatial_field_sample = view(spatial_field_k, :, s)
+            effect_k[:, s] = view(spatial_field_sample, s_idx_full) .* cov_data_full
+        end
+        push!(structured_effects, effect_k)
+    end
+
+    return (structured=structured_effects, noisy=structured_effects)
 end

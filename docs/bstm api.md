@@ -23,13 +23,13 @@ execute:
 
 This document provides a detailed technical reference for the internal components of the `bstm` framework. It is intended for developers and advanced users who wish to understand, extend, or debug the framework's core machinery. It covers the component system, formula parsing engine, model configuration pipeline, Turing model definitions, and the posterior reconstruction engine.
 
-### Core Data Structures & Component System
+### The Component System
 
 The `bstm` framework is built upon a system of `Component` types that represent different structural assumptions about latent fields.
 
 #### Abstract Component Types
 
-The component system is organized under a hierarchy of abstract types that define the role of each component.
+The system is organized under a hierarchy of abstract types that define the role of each component.
 
 *   **`abstract type Component end`**: The root type for all structural components.
 *   **`abstract type ComponentModel <: Component end`**: Represents a base-level statistical model for a latent field (e.g., `ICAR`, `AR1`, `GP`). These are the fundamental building blocks.
@@ -117,10 +117,10 @@ struct Dynamics <: ComponentModel; model::String; params::Dict{Symbol, Any}; end
 
 #### `ComponentOperator` Structs
 
-These structs implement the algebraic composition of components.
+These structs implement the algebraic composition of `ComponentModel` instances.
 
-*   **`struct Composed <: ComponentOperator`**: Represents algebraic compositions like `⊗` (Kronecker product) and `⊕` (direct sum). It holds a vector of component `Component` objects and an `operator` symbol.
-*   **`struct SVCComponent <: ComponentOperator`**: Represents a Spatially Varying Coefficient model, created by the `|>` operator (e.g., `poverty |> random(...)`). It links a covariate to a spatial component.
+*   **`struct Composed <: ComponentOperator`**: Represents algebraic compositions like `⊗` (Kronecker product). It holds a vector of `ComponentModel` objects and an `operator` symbol.
+*   **`struct SVC <: ComponentOperator`**: Represents a Spatially Varying Coefficient model, created by the `|>` operator (e.g., `poverty |> random(...)`). It links a covariate to a spatial component.
 *   **`struct MixedComponent <: ComponentOperator`**: Represents a random effect (intercept or slope) for a specified grouping variable.
 
 #### `bstm_Likelihood` Struct
@@ -147,6 +147,61 @@ end
 ```
 
 The `logpdf` function for this struct calls `bstm_kernel`, which dispatches on the `family`, `censoring_state`, and `zi_state` types to compute the correct log-probability for each observation.
+
+### The `ComponentModel` Interface
+
+To extend `bstm` with a new model, a developer must define a new struct that subtypes `ComponentModel` and implement a set of five interface functions. This interface provides the contract between a component and the main `bstm` engine, allowing for seamless integration into the model building, sampling, and post-processing pipeline.
+
+#### 1. `get_datastructures!(m_type, M, mod_data)`
+
+*   **Purpose**: Performs data-dependent setup. This is the first method called for a component. It is responsible for validating that necessary data columns exist and for setting up any required data structures in the main model configuration dictionary `M`.
+*   **Arguments**:
+    *   `m_type::Type{<:ComponentModel}`: The type of the component struct being processed.
+    *   `M::Dict`: The main model configuration dictionary. This function can read from and write to `M`.
+    *   `mod_data::Dict`: A dictionary containing the parsed information for this specific component instance from the formula (e.g., its variables, parameters).
+*   **Returns**: `Bool`. Should return `true` if the component should be created and added to the model, or `false` if it should be skipped (e.g., if it's a placeholder for another component).
+*   **Example Use**: An `icar` component would use this function to check for a spatial index variable (`s_idx`) in the data and to ensure a spatial adjacency matrix (`W`) has been provided in the main `bstm` call.
+
+#### 2. `get_precomputes(m, M, mod_data)`
+
+*   **Purpose**: Performs data-independent pre-calculations. This method is called after `get_datastructures!` and is used to compute any matrices or values that can be calculated once before sampling begins.
+*   **Arguments**:
+    *   `m::ComponentModel`: An instance of the component struct.
+    *   `M::NamedTuple`: The model configuration object (now read-only).
+    *   `mod_data::Dict`: The component's metadata.
+*   **Returns**: `NamedTuple`. The results of the pre-computation (e.g., a precision matrix template `Q_template`, its spectral decomposition `U` and `L`, basis matrices, etc.). This `NamedTuple` is stored and made available to the other interface functions via the `spec.hyper` object.
+*   **Example Use**: A `pspline` component would use this to generate the B-spline basis matrix. A `bym2` component would use it to generate the `Q_template` and its spectral decomposition.
+
+#### 3. `get_priors(m, spec, arch, outcome_idx, M)`
+
+*   **Purpose**: Generates the Turing code string for the component's priors.
+*   **Arguments**:
+    *   `m::ComponentModel`: The component instance.
+    *   `spec::NamedTuple`: The full specification for this component instance, including its unique `key` and the `hyper` object from `get_precomputes`.
+    *   `arch::String`: The model architecture (`"univariate"` or `"multivariate"`).
+    *   `outcome_idx::Union{Int, Nothing}`: The index of the outcome variable in a multivariate model.
+    *   `M::NamedTuple`: The main model configuration.
+*   **Returns**: `String`. A string containing the Turing.jl code for all priors associated with this component (e.g., `sigma_mykey ~ Exponential(1.0)`).
+*   **Example Use**: An `ar1` component would return the code for the priors on its `rho` and `sigma` hyperparameters, as well as the prior for its raw innovations vector.
+
+#### 4. `get_updates(m, spec, arch, outcome_idx, M)`
+
+*   **Purpose**: Generates the Turing code string for constructing the component's latent effect and adding it to the linear predictor (`eta`).
+*   **Arguments**: Same as `get_priors`.
+*   **Returns**: `String`. A string containing the Turing.jl code to realize the latent field from its raw innovations and hyperparameters, and to add this effect to `eta`.
+*   **Example Use**: A `bym2` component would generate code to reconstruct the structured and unstructured spatial fields from their raw values, combine them using the sampled `rho` and `sigma`, and add the result to `eta` indexed by `M.s_idx`.
+
+#### 5. `get_effects(m, chain, M, ...)`
+
+*   **Purpose**: Reconstructs the posterior distribution of the component's effect from the MCMC chain. This function is called during post-processing (e.g., by `model_results_comprehensive` or `predict`).
+*   **Arguments**:
+    *   `m::ComponentModel`: The component instance.
+    *   `chain`: The `MCMCChains.Chains` object from the model fit.
+    *   `M::NamedTuple`: The main model configuration.
+    *   `n_samples::Int`: The total number of posterior samples.
+    *   `...`: Other arguments related to multivariate models and prediction sets.
+*   **Returns**: `NamedTuple`. Typically `(structured=..., noisy=...)`, where each value is a matrix of size `[N_obs x n_samples]` containing the reconstructed posterior effect for each observation and sample.
+*   **Example Use**: A `pspline` component would extract the posterior samples for its coefficients (`beta`) and its basis matrix (`B`), and for each sample, compute the effect as `B * beta`.
 
 ### Formula Parsing Engine
 
@@ -179,8 +234,8 @@ The `bstm_config` function is the main engine that transforms the parsed formula
 3.  **RHS Module Processing**: This is the core loop that iterates over the `modules` dictionary from the parser. For each module, it performs:
     *   **Processor Dispatch**: Calls the appropriate function from the `MODULE_PROCESSORS` dictionary (e.g., `process_random_module!`). These functions handle data-dependent setup, such as creating spatial indices or basis matrices.
 	    *   **Primitive Resolution (for non-processor-only modules)**: `resolve_technical_primitive` is called to convert the parsed module data (a `Dict`) into a concrete `Component` struct instance (e.g., `BYM2(...)`). This step also resolves hyperpriors using `resolve_hyperpriors`. These processors can also evaluate complex arguments passed in the formula (e.g., `W=my_matrix`) by using the `calling_module` context stored in the configuration object `M`.
-	    *   **Template Building (for non-processor-only modules)**: `build_model` is called on the `Component` object. This function is a factory that generates the technical specifications needed for the model, most importantly the precision matrix template (`Q_template`).
-	    *   **Registration (for non-processor-only modules)**: The complete component specification (including the `Component` object and its `Q_template`) is added to `M[:components]`. The `process_interact_module!` for `⊗` also sets the global `M[:model_st]` parameter to ensure the interaction is included in the model.
+	    *   **Template Building (for non-processor-only modules)**: `get_precomputes` is called on the `Component` object. This function is a factory that generates the technical specifications needed for the model, most importantly the precision matrix template (`Q_template`).
+	    *   **Registration (for non-processor-only modules)**: The complete component specification (including the `Component` object and its precomputed `hyper` object) is added to `M[:components]`. The `process_interact_module!` for `⊗` also sets the global `M[:model_st]` parameter to ensure the interaction is included in the model.
 	*   **Fixed Effects Processing**:
 	    *   `_process_fixed_effects!`: Consolidates fixed effect variables from both bare terms (parsed directly from the formula) and explicit `fixed()` module calls. It then create io es
 	*   **Intercept Resolution**: The final decision on whether to include an intercept (`M[:add_intercept]`) is prioritized from the `intercept()` module. If no `intercept()` module is present, it defaults to the legacy numeric flags (`1`, `0`, `-1`) parsed from the formula string.
@@ -197,24 +252,20 @@ The `bstm_config` function is the main engine that transforms the parsed formula
 *   **`build_structure_template(...)`**: A factory function that returns a precision matrix template (`Q`) for various GMRF models (`:icar`, `:rw2`, etc.), correctly handling scaling factors.
 ## 5. Turing Model Definitions
  
+The `bstm` framework uses a code generation engine (`bstm_text_assembler`) to dynamically construct a Turing `@model` definition from the configuration object `M`.
 
-The `bstm` framework uses a set of core Turing `@model` definitions that are dynamically configured by the `M` object.
+#### `bstm_text_assembler(config, model_func_name)`
 
-#### `bstm_univariate(M, ::Type{T})`
-
-This is the model for single-outcome processes.
+This function assembles the model code string by iterating through the components and calling their `get_priors` and `get_updates` methods.
 
 *   **Structure**:
     *   Defines global likelihood parameters (e.g., `lik_r` for Negative Binomial).
+    *   Defines priors for the intercept and fixed effects.
     *   Initializes the linear predictor `eta`.
-    *   Adds the intercept and fixed effects contributions.
-    *   Contains the main **component realization loop** (`for spec in M.components`), which is the core of the model. Inside this loop:
-        *   It dispatches on the type of the `Component` object (`m_obj`).
-        *   It samples the hyperparameters for that component (e.g., `sigma_val`, `rho_val`).
-        *   It samples the latent field itself, typically from an `MvNormal` or `MvNormalCanon` distribution, using the pre-computed `Q_template` and the sampled hyperparameters.
-        *   It adds the contribution of the latent field to `eta`.
-    *   Handles spatiotemporal interaction models (`model_st`).
-    *   Handles nested sub-models from `M[:nested_components]`.
+    *   **Component Priors Loop**: Iterates through `config.components` and calls `get_priors` for each one, appending the returned code string.
+    *   **Linear Predictor Assembly**:
+        *   Initializes `eta` with the intercept and fixed effects.
+        *   **Component Updates Loop**: Iterates through `config.components` and calls `get_updates` for each one, appending the code that constructs the latent effect and adds it to `eta`.
     *   Defines the final observation likelihood using `y_obs ~ bstm_Likelihood(...)`.
 
 ### 5.2. Multivariate Models
@@ -223,7 +274,7 @@ This model handles multiple, correlated outcomes.
 
 *   **Key Differences**:
     *   **Outcome-Specific Parameters**: Hyperparameters are sampled for each outcome (e.g., `sigma_spatial_1`, `sigma_spatial_2`).
-    *   **Latent Predictor Matrix**: The linear predictor `eta_latent` is a matrix of size `[Observations x Outcomes]`.
+    *   **Latent Predictor Matrix**: The linear predictor `eta_latent` is a matrix of size `[N_obs x N_outcomes]`.
     *   **LKJ Correlation**: It samples a Cholesky factor `L_corr` from an `LKJCholesky` distribution. This matrix captures the correlation structure between the outcomes.
     *   **Coupling**: The final linear predictor `eta` is computed by transforming the matrix of independent latent fields: `eta = eta_latent * L_corr.L`. This induces the shared correlation structure.
 
@@ -233,12 +284,12 @@ The reconstruction engine is responsible for post-processing the MCMC `chain` to
 
 *   **`_reconstruct(arch, ...)`**: The main entry point, which dispatches on the model architecture (`UnivariateArchitecture`, `MultivariateArchitecture`, etc.). It orchestrates the discovery and assembly of posterior effects.
 
-*   **`_discover_component_realizations(...)`**: This is the core discovery function.
+*   **`_discover_effects(...)`**: This is the core discovery function.
     *   It initializes containers for all possible latent effects (spatial, temporal, etc.).
     *   It iterates through the `M[:components]` specification. For each component, it calls `extract_component`.
-    *   **`extract_component(m_obj, ...)`**: This function dispatches on the `Component` type (`m_obj`). Each method knows how to find its parameters in the chain and reconstruct its specific effect.
-        *   For simple components like `BYM2`, it finds `sigma`, `rho`, `latent_struct`, and `latent_iid` samples and combines them to produce the structured, unstructured, and total spatial fields.
-        *   For a `Composed` with a `kronecker_product` operator, it reconstructs the interaction field by finding the corresponding latent field and hyperparameters in the chain and applying the correct scaling and reshaping.
+    *   **`get_effects(m_obj, ...)`**: This function dispatches on the `Component` type (`m_obj`). Each method knows how to find its parameters in the chain and reconstruct its specific effect.
+        *   For simple components like `BYM2`, it finds `sigma`, `rho`, and the raw innovations from the chain and re-runs the logic from `get_updates` to reconstruct the effect for each posterior sample.
+        *   For a `Composed` component with a `kronecker_product` operator, it reconstructs the interaction field by finding the corresponding latent field and hyperparameters in the chain and applying the correct scaling and reshaping.
 
 *   **`_modular_eta_assembly(...)`**: Takes the `registry` of discovered fields and reassembles the full linear predictor `eta` for each posterior sample. This process mirrors the assembly logic within the Turing model itself but operates on the posterior samples. It correctly handles both in-sample (`M`) and out-of-sample (`PS`) data.
 
@@ -258,7 +309,7 @@ The reconstruction engine is responsible for post-processing the MCMC `chain` to
     *   **Rationale**: Different MCMC algorithms exhibit varying performance depending on the characteristics of the target distribution. A composite `Gibbs` sampler, which applies different samplers to different blocks of parameters, can significantly outperform a single, general-purpose sampler. This function automates the construction of such a sampler.
     *   **Workflow**:
         1.  **Manual Override**: The function first checks if a specific sampler has been provided via the `sampler_choice` argument or if a `sampler_map` dictionary has been passed to assign specific samplers to certain parameters. These manual assignments take the highest precedence.
-        2.  **Component Grouping**: If `group_components=true` (the default), the function identifies all parameters that belong to the same component instance (e.g., `spatial_main_sigma`, `spatial_main_rho`, and `spatial_main_latent`). It groups these parameters into a single block and assigns a `NUTS` sampler to them. This is a critical step for efficiency, as it allows the sampler to jointly explore the highly correlated posterior geometry of a latent field and its hyperparameters, reducing the "funnel" problems common in hierarchical models.
+        2.  **Component Grouping**: If `group_components=true` (the default), the function identifies all parameters that belong to the same component instance (e.g., `sigma_spatial_main`, `rho_spatial_main`, and `raw_spatial_main`). It groups these parameters into a single block and assigns a `NUTS` sampler to them. This is a critical step for efficiency, as it allows the sampler to jointly explore the highly correlated posterior geometry of a latent field and its hyperparameters, reducing the "funnel" problems common in hierarchical models.
         3.  **Default Parameter Categorization**: For all remaining parameters that were not part of a component group or manual assignment, the function categorizes them based on their prior distributions:
             *   `:discrete`: Parameters with discrete support (e.g., from `Categorical` or `Poisson` priors).
             *   `:gaussian`: Parameters with `Normal` or `MvNormal` priors.

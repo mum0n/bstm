@@ -481,7 +481,7 @@ function _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
                     idx_vec = u_idx_full
                     eta_latent[:, :, k] .+= effect_to_add[idx_vec, :]
                 end
-            elseif spec.structure in [:smooth, :interact, :nonstationary_variance]
+            elseif spec.structure in [:smooth, :interact, :nonstationaryvariance]
                 # For smoothers, interactions, and non-stationary variance, the effect matrix
                 # is typically already expanded to [N_total x n_samples].
                 eta_latent[:, :, k] .+= effect_set[k]
@@ -1666,21 +1666,6 @@ function compare_components(loo_a_report, loo_b_report; model_names=["Model_A", 
         loo_objects = (loo_a, loo_b)
     )
 end
-
-
-
- 
-const MODULE_PROCESSORS = Dict{Symbol, Function}(
-    :fixed         => process_fixed_module!,
-    :mixed         => process_mixed_module!,
-    :nested        => process_nested_module!,
-    :eigen         => process_eigen_module!,
-    :dynamics      => process_dynamics_module!,
-    :custom        => process_custom_module!,
-    :interact      => process_interact_module!,
-    :random        => process_random_module!,
-    :lgcp          => process_lgcp_module! # Add the new LGCP processor
-);
 
 
  

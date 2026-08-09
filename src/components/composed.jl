@@ -1,42 +1,85 @@
-# This file contains the proposed new and updated functions for the bstm refactoring.
- 
-
 """
     Composed <: ComponentModel
 
 An orchestrator component that combines multiple child components using a specified
-operator (e.g., `|>` for state-space evolution, `⊗` for tensor products, `∘` for functional composition).
+operator. This component is the backbone for creating complex interactions, such as
+spatiotemporal models, spatially varying coefficients, and non-stationary variance
+models.
+
+# Version
+v1.0.0 (2026-08-08)
+
+# Mathematical Summary & Operators
+
+The `Composed` component implements different model structures based on the `operator`
+field:
+
+1.  **`:pipe` (`|>`): Spatially Varying Curves & State-Space Models**
+    -   **Use Case**: `random(t, model=pspline) |> random(s, model=icar)`
+    -   **Math**: Models a set of basis coefficients \$\\beta(s)\$ as a spatial field.
+        The final effect is \$f(s,t) = \\sum_j B_j(t) \\beta_j(s)\$, where \$B_j(t)\$ are
+        temporal basis functions and \$\\beta_j(s)\$ are spatially correlated
+        coefficients.
+
+2.  **`:kronecker_product` (`⊗`): Spatiotemporal Interactions**
+    -   **Use Case**: `random(s, model=icar) ⊗ random(t, model=ar1)`
+    -   **Math**: Implements Knorr-Held interaction models. The joint precision
+        matrix is the Kronecker product of the marginal precision matrices:
+        \$Q_{st} = Q_s \\otimes Q_t\$. This creates a fully structured spatiotemporal
+        random effect.
+
+3.  **`:composition` (`∘`): Non-Stationary Variance & Functional Composition**
+    -   **Use Case**: `random(s, model=icar) ∘ random(x, model=pspline)`
+    -   **Math**: Models non-stationary processes where one component modulates the
+        parameters of another. A common use is for non-stationary variance, where a
+        smoother on a covariate `x` defines a spatially varying standard deviation
+        \$\\sigma(x)\$ for a base spatial field \$\\phi(s)\$. The final effect is
+        \$\\phi(s) \\cdot \\sigma(x)\$.
+
+# Key References
+- Knorr-Held, L. (2000). Bayesian modelling of inseparable space-time variation
+  in disease risk. *Statistical Methods in Medical Research*. (For Kronecker
+  product interactions).
+- Gelfand, A. E., et al. (2003). Spatial modeling with spatially varying
+  coefficient processes. *Journal of the American Statistical Association*. (For
+  concepts related to spatially varying curves).
 
 # Fields
 - `components::Vector{ComponentModel}`: The child components being combined.
-- `operator::Symbol`: The operator defining the composition (e.g., `:pipe`, `:kronecker_product`, `:composition`).
+- `operator::Symbol`: The operator defining the composition (e.g., `:pipe`,
+  `:kronecker_product`, `:composition`).
 """
 struct Composed <: ComponentModel
     components::Vector{ComponentModel}
     operator::Symbol
 end
 
-# Add to the central component constructor registry.
-# This is called by `resolve_technical_primitive`.
+COMPONENT_TYPE_REGISTRY[:composed] = Composed
+
 COMPONENT_CONSTRUCTORS[:composed] = (p, params) -> begin
     components = get(params, :components, error("Composed requires child components."))
     operator = get(params, :operator, error("Composed requires an operator."))
     Composed(components, operator)
 end
 
-# Add to the model-to-structure map.
-MODEL_TO_STRUCTURE_MAP[Composed] = :any
+MODEL_TO_STRUCTURE_MAP[:composed] = :any
 
 """
     get_datastructures!(m_type::Type{<:Composed}, M::Dict, mod_data::Dict)::Bool
 
-Delegates data structure setup to the child components.
+Delegates data structure setup to the child components, ensuring that all necessary
+indices and data are processed before the pre-computation step.
 """
-function get_datastructures!(m_type::Type{<:Composed}, M::Dict, mod_data::Dict)::Bool
+function get_datastructures!(
+    m_type::Type{<:Composed}, M::Dict, mod_data::Dict
+)::Bool
     child_nodes = get(mod_data[:params], :components, [])
     
     if !haskey(mod_data, :component_obj)
-        error("Composed's get_datastructures! requires a temporary component object in mod_data.")
+        error(
+            "Composed's get_datastructures! requires a temporary component object " *
+            "in mod_data."
+        )
     end
 
     for (i, child_node) in enumerate(child_nodes)
@@ -48,10 +91,9 @@ function get_datastructures!(m_type::Type{<:Composed}, M::Dict, mod_data::Dict):
             :type => child_node.module_type,
             :variables => get(child_node.args, :positional_args, []),
             :params => child_node.args,
-            :component_obj => child_component_obj # Pass down the child object
+            :component_obj => child_component_obj
         )
         
-        # Recursively call get_datastructures! for the child
         get_datastructures!(child_component_type, M, child_mod_data)
     end
     return true
@@ -60,7 +102,8 @@ end
 """
     get_precomputes(m::Composed, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Delegates pre-computation to child components and aggregates their results.
+Delegates pre-computation to child components and aggregates their results into a
+`child_specs` list for use by the code generators.
 """
 function get_precomputes(m::Composed, M::NamedTuple, mod_data::Dict)::NamedTuple
     child_nodes = get(mod_data[:params], :components, [])
@@ -78,10 +121,11 @@ function get_precomputes(m::Composed, M::NamedTuple, mod_data::Dict)::NamedTuple
         precomputes = get_precomputes(child_component_obj, M, child_mod_data)
         push!(child_precomputes_list, precomputes)
 
-        # Also store a partial spec for the child for later use
         child_spec = (
             key = child_mod_data[:key],
-            structure = MODEL_TO_STRUCTURE_MAP[typeof(child_component_obj)],
+            structure = get(
+                MODEL_TO_STRUCTURE_MAP, typeof(child_component_obj), :unknown
+            ),
             var = join(child_mod_data[:variables], "_"),
             component_obj = child_component_obj,
             params = child_mod_data[:params],
@@ -98,12 +142,15 @@ function get_precomputes(m::Composed, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    get_priors(m::Composed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::Composed, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates priors for the `Composed`, which may involve custom logic
-or delegation to child components.
+Generates priors for the `Composed` component, dispatching on the operator to
+create the correct hierarchical prior structure.
 """
-function get_priors(m::Composed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(
+    m::Composed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     child_specs = spec.hyper.child_specs
     
@@ -111,13 +158,13 @@ function get_priors(m::Composed, spec::NamedTuple, arch::String, outcome_idx::Un
         dynamic_spec = child_specs[1]
         state_spec = child_specs[2]
         
-        # Priors for the state model's hyperparameters (e.g., sigma, rho of ICAR)
-        state_priors = get_priors(state_spec.component_obj, state_spec, arch, outcome_idx, M)
+        state_priors = get_priors(
+            state_spec.component_obj, state_spec, arch, outcome_idx, M
+        )
         
-        # Prior for the matrix of raw coefficients
         n_spatial = state_spec.hyper.n_latent
         n_basis = dynamic_spec.hyper.n_latent
-        coeffs_prior = "$(p_names.raw) ~ NamedDist(MvNormal(zeros(T, $(n_spatial * n_basis)), I), :$(p_names.raw))"
+        coeffs_prior = "$(p_names.raw) ~ MvNormal(zeros(T, $(n_spatial * n_basis)), I)"
         
         return """
         # Priors for Spatially Varying Curve: $(spec.key)
@@ -131,27 +178,29 @@ function get_priors(m::Composed, spec::NamedTuple, arch::String, outcome_idx::Un
         
         return """
         # Priors for Spatiotemporal Interaction: $(spec.key)
-        $(p_names.sigma) ~ NamedDist($(_distribution_to_string(st_sigma_prior)), :$(p_names.sigma))
-        $(p_names.raw) ~ NamedDist(MvNormal(zeros(T, $(s_N * t_N)), I), :$(p_names.raw))
+        $(p_names.sigma) ~ $(_distribution_to_string(st_sigma_prior))
+        $(p_names.raw) ~ MvNormal(zeros(T, $(s_N * t_N)), I)
         """
     elseif m.operator == :composition # Non-stationary variance
         modifier_spec = child_specs[1]
         base_spec = child_specs[2]
 
-        # Get priors for the modifier model (e.g., a smoother)
-        modifier_priors = get_priors(modifier_spec.component_obj, modifier_spec, arch, outcome_idx, M)
+        modifier_priors = get_priors(
+            modifier_spec.component_obj, modifier_spec, arch, outcome_idx, M
+        )
 
-        # Manually define priors for the base model's structural parameters and raw innovations,
-        # intentionally skipping the base model's own `sigma` prior.
         base_priors_acc = []
         base_p_names = generate_full_variable_names(base_spec, arch, outcome_idx)
         if hasproperty(base_spec.component_obj, :rho)
             rho_prior_str = _distribution_to_string(base_spec.component_obj.rho)
-            push!(base_priors_acc, "$(base_p_names.rho) ~ NamedDist($(rho_prior_str), :$(base_p_names.rho))")
+            push!(base_priors_acc, "$(base_p_names.rho) ~ $(rho_prior_str)")
         end
         
         n_latent_base = base_spec.hyper.n_latent
-        push!(base_priors_acc, "$(base_p_names.raw) ~ NamedDist(MvNormal(zeros(T, $(n_latent_base)), I), :$(base_p_names.raw))")
+        push!(
+            base_priors_acc,
+            "$(base_p_names.raw) ~ MvNormal(zeros(T, $(n_latent_base)), I)"
+        )
         base_priors = join(base_priors_acc, "\n    ")
 
         return """
@@ -160,18 +209,24 @@ function get_priors(m::Composed, spec::NamedTuple, arch::String, outcome_idx::Un
         $(base_priors)
         """
     else
-        # Default: aggregate priors from children
-        all_priors = [get_priors(cs.component_obj, cs, arch, outcome_idx, M) for cs in child_specs]
+        all_priors = [
+            get_priors(cs.component_obj, cs, arch, outcome_idx, M)
+            for cs in child_specs
+        ]
         return join(filter(!isempty, all_priors), "\n    ")
     end
 end
 
 """
-    get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code for the effect of the `Composed`.
+Generates the Turing code for the effect of the `Composed` component, dispatching
+on the operator to construct the correct interaction logic.
 """
-function get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(
+    m::Composed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     child_specs = spec.hyper.child_specs
@@ -182,7 +237,8 @@ function get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx::U
         
         state_p_names = generate_full_variable_names(state_spec, arch, outcome_idx)
         state_model_type = Symbol(lowercase(string(typeof(state_spec.component_obj))))
-        rho_value = hasproperty(state_spec.component_obj, :rho) ? state_p_names.rho : "nothing"
+        rho_value = hasproperty(state_spec.component_obj, :rho) ?
+                    string(state_p_names.rho) : "nothing"
         
         dynamic_basis_key = Symbol(join(get(dynamic_spec.params, :positional_args, []), "_"))
         basis_matrix = "M.basis_matrices[:$(dynamic_basis_key)]"
@@ -193,15 +249,15 @@ function get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx::U
         return """
         # --- Spatially Varying Curve Update: $(spec.key) ---
         local Q_spatial_template = spec_registry[:$(state_spec.key)].hyper.Q_template
-        local Q_spatial = recompose_precision(:$(state_model_type), Q_spatial_template, T(1.0); extra_param=$(rho_value))
+        local Q_spatial = recompose_precision(
+            :$(state_model_type), Q_spatial_template, 1.0; extra_param=$(rho_value)
+        )
         local F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I))
         
         local coeffs_raw_matrix = reshape($(p_names.raw), $(n_spatial), $(n_basis))
         
-        # Apply spatial smoothing to each basis coefficient's field
         local spatial_coeffs = F_spatial.L' \\ coeffs_raw_matrix
         
-        # The final effect is a row-wise dot product of the basis matrix and the spatially-indexed coefficients
         local final_effect = sum(T.($(basis_matrix)) .* spatial_coeffs[M.s_idx, :], dims=2)
         
         $(eta_target) .+= final_effect
@@ -213,13 +269,23 @@ function get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx::U
         s_model_type = Symbol(lowercase(string(typeof(s_spec.component_obj))))
         t_model_type = Symbol(lowercase(string(typeof(t_spec.component_obj))))
         
-        s_rho_val = hasproperty(s_spec.component_obj, :rho) ? generate_full_variable_names(s_spec, arch, outcome_idx).rho : "nothing"
-        t_rho_val = hasproperty(t_spec.component_obj, :rho) ? generate_full_variable_names(t_spec, arch, outcome_idx).rho : "nothing"
+        s_rho_val = hasproperty(s_spec.component_obj, :rho) ?
+                    string(generate_full_variable_names(s_spec, arch, outcome_idx).rho) :
+                    "nothing"
+        t_rho_val = hasproperty(t_spec.component_obj, :rho) ?
+                    string(generate_full_variable_names(t_spec, arch, outcome_idx).rho) :
+                    "nothing"
 
         return """
         # --- Spatiotemporal Interaction Update: $(spec.key) ---
-        local Q_s = recompose_precision(:$(s_model_type), spec_registry[:$(s_spec.key)].hyper.Q_template, T(1.0); extra_param=$(s_rho_val))
-        local Q_t = recompose_precision(:$(t_model_type), spec_registry[:$(t_spec.key)].hyper.Q_template, T(1.0); extra_param=$(t_rho_val))
+        local Q_s = recompose_precision(
+            :$(s_model_type), spec_registry[:$(s_spec.key)].hyper.Q_template,
+            1.0; extra_param=$(s_rho_val)
+        )
+        local Q_t = recompose_precision(
+            :$(t_model_type), spec_registry[:$(t_spec.key)].hyper.Q_template,
+            1.0; extra_param=$(t_rho_val)
+        )
         
         local C_s = cholesky(Symmetric(Matrix(Q_s) + M.noise * I))
         local C_t = cholesky(Symmetric(Matrix(Q_t) + M.noise * I))
@@ -229,7 +295,9 @@ function get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx::U
         local tmp_spatial = C_s.L' \\ Z_matrix
         local st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
         
-        Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_unscaled))
+        Turing.@addlogprob! logpdf(
+            Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_unscaled)
+        )
         
         local st_field = st_field_unscaled .* $(p_names.sigma)
         
@@ -239,9 +307,13 @@ function get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx::U
         modifier_spec = child_specs[1]
         base_spec = child_specs[2]
 
-        modifier_frags = get_updates(modifier_spec.component_obj, modifier_spec, arch, outcome_idx, M)
+        modifier_frags = get_updates(
+            modifier_spec.component_obj, modifier_spec, arch, outcome_idx, M
+        )
         modifier_update_cleaned = replace(modifier_frags, Regex("$(eta_target) \\.\\+= .*") => "")
-        modifier_latent_var = generate_full_variable_names(modifier_spec, arch, outcome_idx).latent
+        modifier_latent_var = generate_full_variable_names(
+            modifier_spec, arch, outcome_idx
+        ).latent
 
         base_p_names = generate_full_variable_names(base_spec, arch, outcome_idx)
         base_model_type = Symbol(lowercase(string(typeof(base_spec.component_obj))))
@@ -252,7 +324,10 @@ function get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx::U
             local base_latent_raw::Vector{T} = F_base.L' \\ $(base_p_names.raw)
             
             if $(base_model_type) in [:icar, :besag]
-                Turing.@addlogprob! logpdf(Normal(T(0), T(0.001) * $(base_spec.hyper.n_latent)), sum(base_latent_raw))
+                Turing.@addlogprob! logpdf(
+                    Normal(0.0, 0.001 * $(base_spec.hyper.n_latent)),
+                    sum(base_latent_raw)
+                )
             end
         """
         
@@ -261,18 +336,14 @@ function get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx::U
         return """
         # --- Composition (NonStationaryVariance) Update: $(spec.key) ---
         
-        # 1. Realize the log-standard deviation field from the modifier model.
         $(modifier_update_cleaned)
         local log_sigma_field::Vector{T} = M.basis_matrices[:$(modifier_basis_key)] * $(modifier_latent_var)
         local spatially_varying_sigma::Vector{T} = exp.(log_sigma_field)
         
-        # 2. Realize the raw latent field from the base model.
         $(base_latent_reconstruction_code)
         
-        # 3. Combine raw latent field with spatially varying sigma.
         local final_effect_latent = base_latent_raw .* spatially_varying_sigma
         
-        # 4. Add the final effect to the linear predictor.
         $(eta_target) .+= final_effect_latent[M.s_idx]
         """
     end
@@ -281,12 +352,14 @@ function get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx::U
 end
 
 """
-    get_effects(m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::Composed, chain, M::NamedTuple, ...)::NamedTuple
 
 Reconstructs the `Composed`'s effect from the MCMC chain's posterior samples.
-This version returns the raw posterior samples for each outcome, not a summary.
 """
-function get_effects(m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+function get_effects(
+    m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
     child_specs = spec.hyper.child_specs
     structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
 
@@ -296,7 +369,8 @@ function get_effects(m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes
         
         dynamic_basis_key = Symbol(join(get(dynamic_spec.params, :positional_args, []), "_"))
         B_dynamic_train = M.basis_matrices[dynamic_basis_key]
-        B_dynamic_full = if !isnothing(PS) && haskey(PS, :basis_matrices) && haskey(PS.basis_matrices, dynamic_basis_key)
+        B_dynamic_full = if !isnothing(PS) && haskey(PS, :basis_matrices) &&
+                            haskey(PS.basis_matrices, dynamic_basis_key)
             vcat(B_dynamic_train, PS.basis_matrices[dynamic_basis_key])
         else
             B_dynamic_train
@@ -310,7 +384,9 @@ function get_effects(m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes
             p_names = generate_full_variable_names(spec, M.model_arch, k)
             state_p_names = generate_full_variable_names(state_spec, M.model_arch, k)
             
-            coeffs_raw_samples = get_params_vector(chain, string(p_names.raw), n_spatial * n_basis)
+            coeffs_raw_samples = get_params_vector(
+                chain, string(p_names.raw), n_spatial * n_basis
+            )
             
             state_model_type = Symbol(lowercase(string(typeof(state_spec.component_obj))))
             Q_spatial_template = state_spec.hyper.Q_template
@@ -318,8 +394,12 @@ function get_effects(m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes
             effect_k = zeros(Float64, N_total, n_samples)
 
             for i in 1:n_samples
-                rho_val = hasproperty(state_spec.component_obj, :rho) ? get_params_vector(chain, string(state_p_names.rho), 1)[i, 1] : nothing
-                Q_spatial = recompose_precision(state_model_type, Q_spatial_template, 1.0; extra_param=rho_val)
+                rho_val = hasproperty(state_spec.component_obj, :rho) ?
+                          get_params_vector(chain, string(state_p_names.rho), 1)[i, 1] :
+                          nothing
+                Q_spatial = recompose_precision(
+                    state_model_type, Q_spatial_template, 1.0; extra_param=rho_val
+                )
                 F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I))
                 
                 coeffs_raw_matrix = reshape(coeffs_raw_samples[i, :], n_spatial, n_basis)
@@ -336,9 +416,15 @@ function get_effects(m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes
         base_spec = child_specs[2]
         
         for k in 1:outcomes_N
-            modifier_p_names = generate_full_variable_names(modifier_spec, M.model_arch, k)
-            modifier_raw_samples = get_params_vector(chain, string(modifier_p_names.raw), modifier_spec.hyper.n_latent)
-            modifier_sigma_samples = get_params_vector(chain, string(modifier_p_names.sigma), 1)[:, 1]
+            modifier_p_names = generate_full_variable_names(
+                modifier_spec, M.model_arch, k
+            )
+            modifier_raw_samples = get_params_vector(
+                chain, string(modifier_p_names.raw), modifier_spec.hyper.n_latent
+            )
+            modifier_sigma_samples = get_params_vector(
+                chain, string(modifier_p_names.sigma), 1
+            )[:, 1]
 
             U_mod, L_mod = modifier_spec.hyper.U, modifier_spec.hyper.L
             diff_order_mod = get(modifier_spec.component_obj, :diff_order, 0)
@@ -355,7 +441,9 @@ function get_effects(m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes
             spatially_varying_sigma_samples = exp.(log_sigma_field_samples)
 
             base_p_names = generate_full_variable_names(base_spec, M.model_arch, k)
-            base_raw_samples = get_params_vector(chain, string(base_p_names.raw), base_spec.hyper.n_latent)
+            base_raw_samples = get_params_vector(
+                chain, string(base_p_names.raw), base_spec.hyper.n_latent
+            )
             Q_base_template = base_spec.hyper.Q_template
             F_base = cholesky(Symmetric(Matrix(Q_base_template) + M.noise * I))
             base_latent_raw_samples = hcat([F_base.L' \ s for s in eachrow(base_raw_samples)]...)'
@@ -365,7 +453,8 @@ function get_effects(m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes
         end
         return (structured=structured_effects, noisy=structured_effects)
     else
-        @warn "Posterior reconstruction for Composed with operator :$(m.operator) is not fully implemented. Returning zero effects."
+        @warn "Posterior reconstruction for Composed with operator :$(m.operator) " *
+              "is not fully implemented. Returning zero effects."
         return (structured=structured_effects, noisy=structured_effects)
     end
 end

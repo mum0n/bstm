@@ -1,10 +1,36 @@
-# --- Implementation of the Explicit Interface for IID ---
-
+ 
 """
-    struct IID <: ComponentModel
+    IID <: ComponentModel
 
 A simple Independent and Identically Distributed (IID) random effect, representing
-unstructured noise or heterogeneity.
+unstructured noise or heterogeneity. Each latent effect is drawn independently from
+the same normal distribution.
+
+# Version
+v1.0.1 (2026-08-08)
+
+# Mathematical Summary
+The IID component models a latent field \$\\phi\$ where each element \$\\phi_i\$ is drawn
+independently from a zero-mean normal distribution with a shared standard deviation
+\$\\sigma\$:
+\$\\phi_i \\sim \\mathcal{N}(0, \\sigma^2)\$
+
+The joint distribution is therefore a multivariate normal with a diagonal covariance
+matrix:
+\$\\boldsymbol{\\phi} \\sim \\mathcal{N}(\\mathbf{0}, \\sigma^2 I)\$
+where \$I\$ is the identity matrix.
+
+# Assumptions
+- The random effects are independent of each other.
+- The random effects are drawn from the same distribution (identically distributed).
+
+# Best Use Case
+Modeling unstructured random effects for groups (e.g., random intercepts in a mixed
+effects model), accounting for overdispersion in count models, or serving as the
+unstructured component in more complex spatial models like the BYM2.
+
+# Key References
+- Wikipedia: Independent and identically distributed random variables
 
 # Fields
 - `sigma::UnivariateDistribution`: The prior for the standard deviation of the effect.
@@ -13,21 +39,32 @@ struct IID <: ComponentModel
     sigma::UnivariateDistribution
 end
 
-# update COMPONENT_CONSTRUCTORS 
+# Add to the central component constructor registry.
+COMPONENT_TYPE_REGISTRY[:iid] = IID
 COMPONENT_CONSTRUCTORS[:iid] = (p, params) -> IID(p.sigma)
 
-# helper to map to classes of methods (data structures), :any mean it can be used in many approaches
+# Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:iid] = :any
 
+"""
+    get_datastructures!(m_type::Type{<:IID}, M::Dict, mod_data::Dict)::Bool
 
-function get_datastructures!(m_type::Type{IID}, M::Dict, mod_data::Dict)::Bool
-    # The IID component has no specific data requirements beyond what is handled
-    # by the main configuration engine (e.g., inferring `s_N` or `t_N`).
+Performs data-dependent setup for the `IID` component. This component has no
+specific data requirements beyond what is handled by the main configuration engine
+(e.g., inferring `s_N` or `t_N` for the dimension of the effect).
+"""
+function get_datastructures!(m_type::Type{<:IID}, M::Dict, mod_data::Dict)::Bool
     return true
 end
 
+"""
+    get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
+
+For an IID component, the precision matrix `Q_template` is the identity matrix.
+This function determines the dimension of the effect based on its structure
+(e.g., spatial, temporal) and returns the appropriate identity matrix.
+"""
 function get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
-    # For an IID component, the precision matrix `Q` is the identity matrix.
     structure = get(mod_data, :type, :spatial)
     
     n = if structure == :spatial
@@ -41,17 +78,31 @@ function get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
     end
 
     if n == 0
-        @warn "Could not determine dimension for IID component '$(mod_data[:key])'. The component will have no effect."
+        @warn "Could not determine dimension for IID component '$(mod_data[:key])'. " *
+              "The component will have no effect."
     end
 
     template = build_structure_template(:iid, n)
-    return (Q_template=template.matrix, U=template.U, L=template.L, scaling_factor=template.scaling_factor)
+    return (
+        Q_template=template.matrix,
+        U=template.U,
+        L=template.L,
+        scaling_factor=template.scaling_factor,
+        n_latent=n
+    )
 end
 
-function get_priors(m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-    # Generates priors for `sigma` and the standard normal `raw` innovations.
+"""
+    get_priors(m::IID, spec::NamedTuple, arch::String, outcome_idx, M)::String
+
+Generates priors for `sigma` and the standard normal `raw` innovations.
+"""
+function get_priors(
+    m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     v = generate_full_variable_names(spec, arch, outcome_idx)
-    n_latent = size(spec.Q_template, 1)
+    n_latent = spec.hyper.n_latent
     is_multivariate = (arch == "multivariate")
     is_shared = get(spec.params, :shared, false)
     is_first_outcome = (outcome_idx == 1 || isnothing(outcome_idx))
@@ -60,12 +111,20 @@ function get_priors(m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{I
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
         push!(priors_acc, "$(v.sigma) ~ $(_distribution_to_string(m.sigma))")
     end
-    push!(priors_acc, "$(v.raw) ~ MvNormal(zeros(T, $(n_latent)), I)")
+    push!(priors_acc, "$(v.raw) ~ MvNormal(zeros($(n_latent)), I)")
     return join(priors_acc, "\n    ")
 end
 
-function get_updates(m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-    # Generates code to scale the raw innovations and add the effect to eta.
+"""
+    get_updates(m::IID, spec::NamedTuple, arch::String, outcome_idx, M)::String
+
+Generates code to scale the raw innovations by `sigma` and add the resulting
+effect to the linear predictor `eta`.
+"""
+function get_updates(
+    m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     v = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
@@ -80,25 +139,39 @@ function get_updates(m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{
     end
 
     return """
-    # --- IID Component: $(spec.key) ---
-    $(v.latent) = $(v.raw) .* $(v.sigma)
-    $(eta_target) .+= view($(v.latent), M.$(index_var))
+        # --- IID Component: $(spec.key) ---
+        $(v.latent) = $(v.raw) .* $(v.sigma)
+        $(eta_target) .+= view($(v.latent), M.$(index_var))
     """
 end
 
-function get_effects(m::IID, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
-    # Reconstructs the posterior effect from the MCMC chain.
-    structured_effects = []
+"""
+    get_effects(m::IID, chain, M::NamedTuple, ...)::NamedTuple
+
+Reconstructs the posterior effect from the MCMC chain's posterior samples by
+multiplying the raw innovations by the sampled standard deviations.
+"""
+function get_effects(
+    m::IID, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
     is_multivariate = outcomes_N > 1
     is_shared = get(spec.params, :shared, false)
+    n_latent = spec.hyper.n_latent
 
     for k in 1:outcomes_N
         outcome_idx = is_multivariate ? k : nothing
         v = generate_full_variable_names(spec, M.model_arch, outcome_idx)
-        sigma_var_name = (is_multivariate && is_shared) ? string(generate_full_variable_names(spec, M.model_arch, nothing).sigma) : string(v.sigma)
+        
+        sigma_var_name = if is_multivariate && is_shared
+            string(generate_full_variable_names(spec, M.model_arch, nothing).sigma)
+        else
+            string(v.sigma)
+        end
         
         sigma_samples = get_params_vector(chain, sigma_var_name, 1)
-        raw_samples = get_params_vector(chain, string(v.raw), size(spec.Q_template, 1))
+        raw_samples = get_params_vector(chain, string(v.raw), n_latent)
         
         effect_k = raw_samples .* sigma_samples
         push!(structured_effects, effect_k)
@@ -106,4 +179,3 @@ function get_effects(m::IID, chain, M::NamedTuple, n_samples::Int, outcomes_N::I
     
     return (structured=structured_effects, noisy=structured_effects)
 end
-

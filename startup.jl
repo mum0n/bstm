@@ -116,17 +116,24 @@ which means, you can see what these values are by typing: DEBUG.y, etc... \n")
  
 function load_project_functions( src_dir=srcdir() )
     
-  # structs.jl must come first   
-  allfiles = readdir( src_dir )  
+  fns = [ joinpath( src_dir, "definitions.jl" ) ]
 
-  for filename in allfiles 
-    if endswith(filename, ".jl")
-      filepath = joinpath(src_dir, filename)
+  fnc = readdir( joinpath( src_dir, "components" ) )
+  for fn in fnc 
+    push!(fns, joinpath(src_dir, "components", fn) )
+  end
+
+  fns = [ fns;  
+    joinpath.( src_dir, [ "data.jl", "partitioning.jl", "model.jl", "likelihoods.jl", "reconstruction.jl" ] )
+  ]
+ 
+  for fn in fns 
+    if endswith(fn, ".jl")
       try
-        println(filepath)  
-        include(filepath)
+        println(fn)  
+        include(fn)
       catch e
-          @error "Error including file '$filepath':" e
+          @error "Error including file '$fn':" e
       end
     end
   end
