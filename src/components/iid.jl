@@ -1,5 +1,4 @@
- 
-"""
+ """
     IID <: ComponentModel
 
 A simple Independent and Identically Distributed (IID) random effect, representing
@@ -7,7 +6,7 @@ unstructured noise or heterogeneity. Each latent effect is drawn independently f
 the same normal distribution.
 
 # Version
-v1.0.1 (2026-08-08)
+v1.0.2 (2026-08-10)
 
 # Mathematical Summary
 The IID component models a latent field \$\\phi\$ where each element \$\\phi_i\$ is drawn
@@ -34,17 +33,23 @@ unstructured component in more complex spatial models like the BYM2.
 
 # Fields
 - `sigma::UnivariateDistribution`: The prior for the standard deviation of the effect.
+- `method::Symbol`: The parameterization method. Can be `:noncentered` (default,
+  recommended) or `:centered` (didactic alternative).
 """
 struct IID <: ComponentModel
     sigma::UnivariateDistribution
+    method::Symbol
 end
 
 # Add to the central component constructor registry.
 COMPONENT_TYPE_REGISTRY[:iid] = IID
-COMPONENT_CONSTRUCTORS[:iid] = (p, params) -> IID(p.sigma)
+COMPONENT_CONSTRUCTORS[:iid] = (p, params) -> IID(
+    p.sigma, get(params, :method, :noncentered)
+)
 
 # Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:iid] = :any
+
 
 """
     get_datastructures!(m_type::Type{<:IID}, M::Dict, mod_data::Dict)::Bool
@@ -95,7 +100,8 @@ end
 """
     get_priors(m::IID, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates priors for `sigma` and the standard normal `raw` innovations.
+Generates priors for `sigma`. For the `:noncentered` method, it also defines a
+prior for the standard normal `raw` innovations.
 """
 function get_priors(
     m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -111,22 +117,31 @@ function get_priors(
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
         push!(priors_acc, "$(v.sigma) ~ $(_distribution_to_string(m.sigma))")
     end
-    push!(priors_acc, "$(v.raw) ~ MvNormal(zeros($(n_latent)), I)")
+
+    if m.method == :noncentered
+        push!(priors_acc, "$(v.raw) ~ MvNormal(zeros($(n_latent)), I)")
+    end
+    
     return join(priors_acc, "\n    ")
 end
+
 
 """
     get_updates(m::IID, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates code to scale the raw innovations by `sigma` and add the resulting
-effect to the linear predictor `eta`.
+Generates code to construct the IID effect. Supports two methods:
+- `:noncentered` (default): Samples standard normal noise and transforms it. This
+  is generally more efficient for MCMC.
+- `:centered`: Samples the latent field directly from the `MvNormal` distribution.
+  This can be less efficient due to posterior correlations but is a useful
+  didactic alternative.
 """
 function get_updates(
     m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
     v = generate_full_variable_names(spec, arch, outcome_idx)
-    eta_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     index_var = if spec.structure == :spatial
         "s_idx"
@@ -138,18 +153,33 @@ function get_updates(
         string(spec.structure) * "_idx"
     end
 
-    return """
-        # --- IID Component: $(spec.key) ---
+    noncentered_code = """
+        # --- IID Component (Non-Centered): $(spec.key) ---
         $(v.latent) = $(v.raw) .* $(v.sigma)
         $(eta_target) .+= view($(v.latent), M.$(index_var))
     """
+
+    centered_code = """
+        # --- IID Component (Centered): $(spec.key) ---
+        # This is a didactic alternative. It can be less efficient for MCMC sampling.
+        $(v.latent) ~ MvNormal(zeros($(spec.hyper.n_latent)), $(v.sigma)^2 * I)
+        $(eta_target) .+= view($(v.latent), M.$(index_var))
+    """
+
+    if m.method == :noncentered
+        return noncentered_code
+    elseif m.method == :centered
+        return centered_code
+    else
+        error("Unsupported method '$(m.method)' for IID component.")
+    end
 end
 
 """
     get_effects(m::IID, chain, M::NamedTuple, ...)::NamedTuple
 
-Reconstructs the posterior effect from the MCMC chain's posterior samples by
-multiplying the raw innovations by the sampled standard deviations.
+Reconstructs the posterior effect from the MCMC chain's posterior samples,
+dispatching on the method used during sampling.
 """
 function get_effects(
     m::IID, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -164,16 +194,20 @@ function get_effects(
         outcome_idx = is_multivariate ? k : nothing
         v = generate_full_variable_names(spec, M.model_arch, outcome_idx)
         
-        sigma_var_name = if is_multivariate && is_shared
-            string(generate_full_variable_names(spec, M.model_arch, nothing).sigma)
-        else
-            string(v.sigma)
+        local effect_k
+        if m.method == :noncentered
+            sigma_var_name = if is_multivariate && is_shared
+                string(generate_full_variable_names(spec, M.model_arch, nothing).sigma)
+            else
+                string(v.sigma)
+            end
+            sigma_samples = get_params_vector(chain, sigma_var_name, 1)
+            raw_samples = get_params_vector(chain, string(v.raw), n_latent)
+            effect_k = raw_samples .* sigma_samples
+        else # :centered
+            effect_k = get_params_vector(chain, string(v.latent), n_latent)
         end
         
-        sigma_samples = get_params_vector(chain, sigma_var_name, 1)
-        raw_samples = get_params_vector(chain, string(v.raw), n_latent)
-        
-        effect_k = raw_samples .* sigma_samples
         push!(structured_effects, effect_k)
     end
     

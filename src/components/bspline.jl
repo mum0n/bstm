@@ -8,7 +8,7 @@ effect is a linear combination of these basis functions, with coefficients
 regularized by a random walk prior to ensure smoothness.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 The component models a smooth function \$f(x)\$ as a linear combination of B-spline
@@ -46,17 +46,24 @@ for 1D smoothing.
   cubic).
 - `sigma::UnivariateDistribution`: The prior for the standard deviation of the
   B-spline coefficients.
+- `method::Symbol`: The computational method for regularizing coefficients. Can be
+  `:spectral` (default, AD-safe), `:cholesky` (AD-safe, dense), or
+  `:cholesky_sparse` (didactic, not AD-safe).
 """
 struct BSpline <: ComponentModel
     nbins::Int
     degree::Int
     sigma::Distribution
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:bspline] = BSpline
 
 COMPONENT_CONSTRUCTORS[:bspline] = (p, params) -> BSpline(
-    get(params, :nbins, 10), get(params, :degree, 3), p.sigma
+    get(params, :nbins, 10),
+    get(params, :degree, 3),
+    p.sigma,
+    get(params, :method, :spectral)
 )
 
 MODEL_TO_STRUCTURE_MAP[:bspline] = :smooth
@@ -98,9 +105,6 @@ end
 
 Pre-computes the B-spline basis matrix and the spectral decomposition of the RW2
 penalty matrix for the coefficients.
-
-# Assumptions
-- The `bstm_bspline_basis` helper function is available in the execution scope.
 """
 function get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
@@ -164,8 +168,9 @@ end
 """
     get_updates(m::BSpline, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code to construct the B-spline smooth effect using a spectral
-decomposition of the penalty matrix.
+Generates the Turing code to construct the B-spline smooth effect. Supports three
+methods for regularizing the coefficients: `:spectral`, `:cholesky`, and
+`:cholesky_sparse`.
 """
 function get_updates(
     m::BSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -173,33 +178,96 @@ function get_updates(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    key = spec.key
+    n_latent = spec.hyper.n_latent
     
-    return """
-        # --- B-Spline Smoother Component: $(spec.key) ---
+    common_code = """
+        local hyper = spec_registry[:$(key)].hyper
+        local B_basis = hyper.basis_matrix
+    """
+
+    spectral_code = """
+        # --- B-Spline Smoother Component (Spectral): $(key) ---
         let
-            local hyper = spec_registry[:$(spec.key)].hyper
+            $(common_code)
             
             # Reconstruct latent coefficients using spectral decomposition
             local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
-            # Enforce sum-to-zero constraints for RW2 penalty
+            # Enforce sum-to-zero constraints for RW2 penalty (rank deficiency 2)
             diag_D[1] = 0.0
             diag_D[2] = 0.0
             
             local coeffs = hyper.U * (diag_D .* $(p_names.raw))
             
             # Compute final effect by multiplying basis matrix with coefficients
-            local $(p_names.latent) = hyper.basis_matrix * coeffs
+            local $(p_names.latent) = B_basis * coeffs
             
             $(eta_target) .+= $(p_names.latent)
         end
     """
+
+    cholesky_code = """
+        # --- B-Spline Smoother Component (Cholesky, AD-Safe): $(key) ---
+        let
+            $(common_code)
+            
+            local Q_penalty = hyper.Q_template
+            local F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
+            
+            local coeffs_raw = F.L' \\ $(p_names.raw)
+            
+            # Apply soft sum-to-zero constraints for RW2 penalty (rank deficiency 2)
+            Turing.@addlogprob! logpdf(
+                Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw[1:2])
+            )
+            
+            local coeffs = $(p_names.sigma) .* coeffs_raw
+            local $(p_names.latent) = B_basis * coeffs
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    cholesky_sparse_code = """
+        # --- B-Spline Smoother Component (Sparse Cholesky, Not AD-Safe): $(key) ---
+        # WARNING: This method is for didactic purposes and is NOT compatible with
+        # automatic differentiation (e.g., NUTS sampler).
+        let
+            $(common_code)
+            
+            local Q_penalty = hyper.Q_template
+            local F = cholesky(Symmetric(Q_penalty + M.noise * I))
+            
+            local coeffs_raw = F.L' \\ $(p_names.raw)
+            
+            # Apply soft sum-to-zero constraints for RW2 penalty (rank deficiency 2)
+            Turing.@addlogprob! logpdf(
+                Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw[1:2])
+            )
+            
+            local coeffs = $(p_names.sigma) .* coeffs_raw
+            local $(p_names.latent) = B_basis * coeffs
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    else
+        error("Unsupported method '$(m.method)' for BSpline component.")
+    end
 end
 
 """
     get_effects(m::BSpline, chain, M::NamedTuple, ...)::NamedTuple
 
 Reconstructs the `BSpline` component's effect from the MCMC chain's posterior
-samples.
+samples, dispatching on the method used during sampling.
 """
 function get_effects(
     m::BSpline, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -209,14 +277,12 @@ function get_effects(
 
     for k in 1:outcomes_N
         p_names = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)
+        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
         raw_samples = get_params_vector(
             chain, string(p_names.raw), spec.hyper.n_latent
         )
 
         hyper = spec.hyper
-        U = hyper.U
-        L = hyper.L
         noise = M.noise
         
         B_train = hyper.basis_matrix
@@ -235,11 +301,23 @@ function get_effects(
         reconstructed_effects_k = zeros(size(B_full, 1), n_samples)
 
         for i in 1:n_samples
-            diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
-            diag_D[1] = 0.0
-            diag_D[2] = 0.0
-            
-            coeffs = U * (diag_D .* raw_samples[i, :])
+            local coeffs
+            if m.method == :spectral
+                U = hyper.U
+                L = hyper.L
+                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
+                diag_D[1] = 0.0
+                diag_D[2] = 0.0
+                coeffs = U * (diag_D .* raw_samples[i, :])
+            else # :cholesky or :cholesky_sparse
+                Q_penalty = hyper.Q_template
+                # For reconstruction, dense Cholesky is fine for both methods
+                F = cholesky(Symmetric(Matrix(Q_penalty) + noise * I))
+                coeffs_raw = F.L' \ raw_samples[i, :]
+                # Centering for identifiability, as done in the model
+                coeffs_centered = coeffs_raw .- mean(coeffs_raw[1:2]) # Only first two for RW2
+                coeffs = sigma_samples[i] .* coeffs_centered
+            end
             reconstructed_effects_k[:, i] = B_full * coeffs
         end
         push!(structured_effects, reconstructed_effects_k)

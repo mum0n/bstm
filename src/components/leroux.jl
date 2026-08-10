@@ -1,4 +1,3 @@
-
 """
     Leroux <: ComponentModel
 
@@ -8,7 +7,7 @@ structured (ICAR) component and an unstructured (IID) component, controlled by a
 single mixing parameter, `rho`.
 
 # Version
-v1.9.2 (2026-08-08)
+v1.9.3 (2026-08-10)
 
 # Mathematical Summary
 The Leroux model is a proper CAR model, meaning its precision matrix is always
@@ -40,9 +39,8 @@ the ICAR model and has a more direct parameterization than BYM2.
   bounded on `[0, 1]`.
 - `sigma::UnivariateDistribution`: The prior for the overall marginal standard
   deviation.
-- `method::Symbol`: The computational method for sampling the latent field. Can be
-  `:spectral` (default, efficient, and AD-safe) or `:cholesky` (dense
-  factorization, AD-safe but less efficient).
+- `method::Symbol`: The computational method. Can be `:spectral` (default, AD-safe),
+  `:cholesky` (AD-safe, dense), or `:cholesky_sparse` (didactic, not AD-safe).
 """
 struct Leroux <: ComponentModel
     rho::UnivariateDistribution
@@ -161,13 +159,22 @@ function get_priors(
     return join(priors_acc, "\n    ")
 end
 
+
 """
     get_updates(m::Leroux, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code for the Leroux component's update logic. This function
-implements a conditional logic based on the `method` field of the `Leroux` struct.
-- `:spectral` (default): Uses the efficient and AD-safe spectral sampling method.
-- `:cholesky`: Uses a dense Cholesky decomposition of the full Leroux precision matrix.
+Generates the Turing code for the Leroux component's update logic. It supports
+three methods for sampling the latent field, controlled by `m.method`:
+
+- `:spectral` (default): Uses a non-centered parameterization based on the
+  spectral decomposition of the ICAR precision matrix. This method is highly
+  efficient and AD-safe.
+- `:cholesky`: Uses a non-centered parameterization based on the Cholesky
+  decomposition of the full Leroux precision matrix. For AD-compatibility, the
+  precision matrix is converted to a dense matrix before factorization.
+- `:cholesky_sparse`: A didactic method using sparse Cholesky factorization. It is
+  not compatible with gradient-based samplers (e.g., NUTS) but can be used with
+  gradient-free methods.
 """
 function get_updates(
     m::Leroux, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -177,59 +184,65 @@ function get_updates(
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     index_var = "s_idx"
 
-    if m.method == :spectral
-        return """
+    spectral_code = """
         # --- Leroux Spectral Assembly: $(spec.key) ---
         # This block constructs the Leroux spatial effect using a non-centered
         # parameterization based on the spectral decomposition of the ICAR
-        # precision matrix. This is the default method.
+        # precision matrix. This is the default and recommended AD-safe method.
         
-        # 1. Construct the diagonal of the spectral transformation matrix D.
-        #    For Leroux, Q = (1-ρ)I + ρQ*. The eigenvalues are (1-ρ) + ρλ_j.
-        #    The standard deviation of the transformed variable is σ / sqrt(eigenvalue).
         diag_D = $(v.sigma) ./ sqrt.((1.0 .- $(v.rho)) .+ $(v.rho) .* spec_registry[:$(spec.key)].hyper.L .+ M.noise)
-        
-        # 2. Apply the spectral transformation: latent = U * D * z
         $(v.latent) = spec_registry[:$(spec.key)].hyper.U * (diag_D .* $(v.raw))
-        
-        # 3. Add the final effect to the linear predictor.
         $(eta_target) .+= view($(v.latent), M.$(index_var))
         """
+
+    cholesky_code = """
+        # --- Leroux Cholesky Assembly (Dense, AD-Safe): $(spec.key) ---
+        let
+            local Q_template = spec_registry[:$(spec.key)].hyper.Q_template
+            local rho_val = $(v.rho)
+            local Q_final = (1.0 - rho_val) .* I(size(Q_template, 1)) .+ rho_val .* Q_template
+            local F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
+            $(v.latent) = $(v.sigma) .* (F.U \\ $(v.raw))
+            $(eta_target) .+= view($(v.latent), M.$(index_var))
+        end
+        """
+
+    cholesky_sparse_code = """
+        # --- Leroux Cholesky Assembly (Sparse, Not AD-Safe): $(spec.key) ---
+        # WARNING: This method is for didactic purposes and is NOT compatible with
+        # automatic differentiation (e.g., NUTS sampler).
+        let
+            local Q_template = spec_registry[:$(spec.key)].hyper.Q_template
+            local rho_val = $(v.rho)
+            local Q_final = (1.0 - rho_val) .* sparse(I, size(Q_template)...) .+ rho_val .* Q_template
+            local F = cholesky(Symmetric(Q_final + M.noise * I))
+            $(v.latent) = $(v.sigma) .* (F.U \\ $(v.raw))
+            $(eta_target) .+= view($(v.latent), M.$(index_var))
+        end
+        """
+
+    if m.method == :spectral
+        return spectral_code
     elseif m.method == :cholesky
-        return """
-        # --- Leroux Cholesky Assembly: $(spec.key) ---
-        # This block constructs the Leroux spatial effect using a dense Cholesky decomposition.
-        
-        # 1. Recompose the full Leroux precision matrix.
-        Q_template = spec_registry[:$(spec.key)].hyper.Q_template
-        Q_final = (1.0 - $(v.rho)) .* I(size(Q_template, 1)) .+ $(v.rho) .* Q_template
-        
-        # 2. Perform a dense Cholesky decomposition.
-        F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
-        
-        # 3. Sample the latent field using the Cholesky factor (non-centered).
-        unscaled_latent = F.L' \\ $(v.raw)
-        $(v.latent) = $(v.sigma) .* unscaled_latent
-        
-        # 4. Add the final effect to the linear predictor.
-        $(eta_target) .+= view($(v.latent), M.$(index_var))
-        """
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
     else
         error(
             "Unsupported method '$(m.method)' for Leroux component. Supported " *
-            "methods are :spectral and :cholesky."
+            "methods are :spectral, :cholesky, and :cholesky_sparse."
         )
     end
 end
+
 
 
 """
     get_effects(m::Leroux, chain, M::NamedTuple, ...)
 
 Reconstructs the Leroux component's effect from posterior samples. This function
-extracts the posterior samples for `sigma`, `rho`, and `raw` from the MCMC
-chain. It then reconstructs the full posterior distribution of the latent Leroux
-field by re-running the spectral transformation for each posterior sample.
+is updated to dispatch on the `method` used during sampling to ensure the
+reconstruction logic is consistent with the model definition.
 """
 function get_effects(
     m::Leroux, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -239,11 +252,7 @@ function get_effects(
     is_multivariate = outcomes_N > 1
     is_shared = get(spec.params, :shared, false)
     n_latent = spec.hyper.n_latent
-
-    U = spec.hyper.U
-    L_eig = spec.hyper.L
-    T_el = eltype(chain.value)
-
+    
     for k in 1:outcomes_N
         outcome_idx = is_multivariate ? k : nothing
         v = generate_full_variable_names(spec, M.model_arch, outcome_idx)
@@ -259,16 +268,24 @@ function get_effects(
         rho_samples = get_params_vector(chain, rho_var_name, 1)
         raw_samples = get_params_vector(chain, string(v.raw), n_latent)
         
-        effect_k = Matrix{T_el}(undef, n_latent, n_samples)
+        effect_k = Matrix{Float64}(undef, n_latent, n_samples)
 
         for s in 1:n_samples
             sigma_s = sigma_samples[s, 1]
             rho_s = rho_samples[s, 1]
             raw_s = raw_samples[s, :]
 
-            # Re-run the spectral transformation for this posterior sample
-            diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig .+ M.noise)
-            effect_k[:, s] = U * (diag_D_s .* raw_s)
+            if m.method == :spectral
+                U = spec.hyper.U
+                L_eig = spec.hyper.L
+                diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig .+ M.noise)
+                effect_k[:, s] = U * (diag_D_s .* raw_s)
+            else # :cholesky or :cholesky_sparse
+                Q_template = spec.hyper.Q_template
+                Q_final = (1.0 - rho_s) .* I(n_latent) .+ rho_s .* Q_template
+                F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
+                effect_k[:, s] = sigma_s .* (F.U \ raw_s)
+            end
         end
         push!(structured_effects, effect_k)
     end

@@ -6,7 +6,7 @@ triangulation of knot points. This method is particularly well-suited for modeli
 smooth spatial effects on irregular domains.
 
 # Version
-v1.0.1 (2026-08-08)
+v1.0.2 (2026-08-10)
 
 # Mathematical Summary
 The component models a function f(s) where s is a 2D coordinate.
@@ -27,34 +27,237 @@ The component models a function f(s) where s is a 2D coordinate.
     f(s) = (B ⋅ (βσ))(s)
     where β ∼ N(0, I).
 
-# Assumptions
-- The spatial effect is smooth and can be reasonably approximated by a piecewise
-  linear surface over the triangulated domain.
-- The provided coordinates are 2-dimensional.
-
-# Best Use Case
-Modeling smooth spatial effects, particularly when the domain is complex or
-irregularly shaped. It is an alternative to Thin Plate Splines or Gaussian Processes
-that is computationally efficient and easy to interpret, as the coefficients
-directly correspond to the value of the field at the knot locations.
-
-# Key References
-- Wikipedia: Barycentric coordinate system
-- Amid, E., & Warmuth, M. K. (2019). TriMap: Large-scale Dimensionality Reduction
-  Using Triplets. *arXiv preprint arXiv:1910.00204*. (For applications of
-  triangulation in machine learning).
+# Computational Methods
+- `:noncentered` (default): A non-centered parameterization where coefficients are
+  sampled from a standard normal and scaled by `sigma`. Recommended for AD.
+- `:centered`: A centered parameterization where coefficients are sampled directly
+  from `N(0, sigma^2)`. Didactic, can be less efficient.
+- `:gmrfsmooth`: Imposes a spatial ICAR prior on the knot coefficients, encouraging
+  a smoother interpolation surface. AD-safe via spectral decomposition.
 
 # Fields
 - `sigma::UnivariateDistribution`: The prior for the standard deviation of the basis
   function coefficients.
+- `method::Symbol`: The computational method, one of `:noncentered`, `:centered`,
+  or `:gmrfsmooth`.
 """
 struct Barycentric <: ComponentModel
     sigma::UnivariateDistribution
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:barycentric] = Barycentric
-COMPONENT_CONSTRUCTORS[:barycentric] = (p, params) -> Barycentric(p.sigma)
+COMPONENT_CONSTRUCTORS[:barycentric] = (p, params) -> Barycentric(
+    p.sigma, get(params, :method, :noncentered)
+)
 MODEL_TO_STRUCTURE_MAP[:barycentric] = :smooth
+
+
+"""
+    get_datastructures!(m_type::Type{<:Barycentric}, M::Dict, mod_data::Dict)
+
+Extracts the 2D coordinate variables from the formula and stores them.
+
+# Assumptions
+- The `random()` call provides exactly two variables for the 2D coordinates.
+"""
+function get_datastructures!(
+    m_type::Type{<:Barycentric}, M::Dict, mod_data::Dict
+)::Bool
+    variables = mod_data[:variables]
+    if length(variables) != 2
+        error(
+            "The Barycentric model requires exactly two coordinate variables, e.g., " *
+            "`random(x, y, model=:barycentric)`."
+        )
+    end
+    coords_matrix = Matrix{Float64}(M[:data][!, Symbol.(variables)])
+    mod_data[:params][:coords] = coords_matrix
+    return true
+end
+
+
+"""
+    get_precomputes(m::Barycentric, M::NamedTuple, mod_data::Dict)::NamedTuple
+
+Pre-computes the barycentric basis matrix. For the `:gmrfsmooth` method, it also
+computes the precision matrix template and spectral decomposition for the knot grid.
+"""
+function get_precomputes(
+    m::Barycentric, M::NamedTuple, mod_data::Dict
+)::NamedTuple
+    coords = mod_data[:params][:coords]
+    nbins = get(mod_data[:params], :nbins, 25)
+    knot_method = get(mod_data[:params], :knot_method, :quantile)
+    n_marginal = Int(floor(sqrt(nbins)))
+    
+    local kx, ky
+    if knot_method == :range
+        kx = collect(range(extrema(coords[:, 1])..., length=n_marginal))
+        ky = collect(range(extrema(coords[:, 2])..., length=n_marginal))
+    else # Default to :quantile
+        kx = quantile(coords[:, 1], range(0, 1, length=n_marginal))
+        ky = quantile(coords[:, 2], range(0, 1, length=n_marginal))
+    end
+    
+    knot_points = [Point2D(x, y) for x in kx for y in ky]
+    basis_matrix = bstm_barycentric_basis_2D(coords, knot_points)
+    n_knots = length(knot_points)
+
+    precomputes = Dict{Symbol, Any}(
+        :B => basis_matrix,
+        :n_knots => n_knots,
+        :knots => knot_points
+    )
+
+    if m.method == :gmrfsmooth
+        W_knots = spzeros(Int, n_knots, n_knots)
+        for i in 1:n_knots, j in (i+1):n_knots
+            dist_sq = (knot_points[i].x - knot_points[j].x)^2 + (knot_points[i].y - knot_points[j].y)^2
+            if dist_sq <= ((kx[2]-kx[1])^2 + (ky[2]-ky[1])^2) * 1.1
+                W_knots[i, j] = W_knots[j, i] = 1
+            end
+        end
+        
+        template = build_structure_template(:besag, n_knots; W=W_knots)
+        precomputes[:Q_template] = template.matrix
+        precomputes[:U] = template.U
+        precomputes[:L] = template.L
+    end
+
+    return NamedTuple(precomputes)
+end
+
+"""
+    get_priors(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx, M)
+
+Generates priors for the basis coefficients and scale, dispatching on the method.
+"""
+function get_priors(
+    m::Barycentric, spec::NamedTuple, arch::String,
+    outcome_idx::Union{Int, Nothing}, M::NamedTuple
+)::String
+    p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    n_knots = spec.hyper.n_knots
+    
+    priors = ["$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))"]
+
+    if m.method in [:noncentered, :gmrfsmooth]
+        push!(priors, "$(p_names.innov) ~ MvNormal(zeros($(n_knots)), I)")
+    end
+
+    return join(priors, "\n    ")
+end
+
+"""
+    get_updates(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx, M)
+
+Generates code to compute the smooth effect, dispatching on the chosen method.
+"""
+function get_updates(
+    m::Barycentric, spec::NamedTuple, arch::String,
+    outcome_idx::Union{Int, Nothing}, M::NamedTuple
+)::String
+    p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    key = spec.key
+
+    noncentered_code = """
+        # --- Barycentric Component (Non-Centered): $(key) ---
+        let
+            local B = spec_registry[:$(key)].hyper.B
+            local scaled_coeffs = $(p_names.innov) .* $(p_names.sigma)
+            local barycentric_effect = B * scaled_coeffs
+            $(eta_target) .+= barycentric_effect
+        end
+    """
+
+    centered_code = """
+        # --- Barycentric Component (Centered): $(key) ---
+        let
+            local B = spec_registry[:$(key)].hyper.B
+            local n_knots = spec_registry[:$(key)].hyper.n_knots
+            local coeffs ~ MvNormal(zeros(n_knots), $(p_names.sigma)^2 * I)
+            local barycentric_effect = B * coeffs
+            $(eta_target) .+= barycentric_effect
+        end
+    """
+
+    gmrfsmooth_code = """
+        # --- Barycentric Component (GMRF Smooth): $(key) ---
+        let
+            local B = spec_registry[:$(key)].hyper.B
+            local U = spec_registry[:$(key)].hyper.U
+            local L = spec_registry[:$(key)].hyper.L
+            
+            local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
+            diag_D[1] = 0.0 # Sum-to-zero constraint for ICAR on knots
+            
+            local coeffs = U * (diag_D .* $(p_names.innov))
+            local barycentric_effect = B * coeffs
+            $(eta_target) .+= barycentric_effect
+        end
+    """
+
+    if m.method == :noncentered; return noncentered_code;
+    elseif m.method == :centered; return centered_code;
+    elseif m.method == :gmrfsmooth; return gmrfsmooth_code;
+    else; error("Unsupported method '$(m.method)' for Barycentric component."); end
+end
+
+"""
+    get_effects(m::Barycentric, chain, M::NamedTuple, ...)
+
+Reconstructs the barycentric smooth effect from posterior samples, dispatching
+on the method used during sampling.
+"""
+function get_effects(
+    m::Barycentric, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
+    
+    B_train = spec.hyper.B
+    B_full = if !isnothing(PS)
+        coord_vars = get(spec.params, :positional_args, [])
+        coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+        B_pred = bstm_barycentric_basis_2D(coords_pred, spec.hyper.knots)
+        vcat(B_train, B_pred)
+    else
+        B_train
+    end
+
+    for k in 1:outcomes_N
+        p_names = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
+        
+        local coeffs_samples
+        if m.method == :centered
+            coeffs_samples = get_params_vector(chain, string(p_names.latent), spec.hyper.n_knots)'
+        else
+            innov_samples = get_params_vector(chain, string(p_names.innov), spec.hyper.n_knots)
+            coeffs_samples = zeros(spec.hyper.n_knots, n_samples)
+            if m.method == :noncentered
+                for i in 1:n_samples
+                    coeffs_samples[:, i] = innov_samples[i, :] .* sigma_samples[i]
+                end
+            else # :gmrfsmooth
+                U, L = spec.hyper.U, spec.hyper.L
+                for i in 1:n_samples
+                    diag_D = sigma_samples[i] ./ sqrt.(L .+ M.noise)
+                    diag_D[1] = 0.0
+                    coeffs_samples[:, i] = U * (diag_D .* innov_samples[i, :])
+                end
+            end
+        end
+        
+        effect_k = B_full * coeffs_samples
+        push!(structured_effects, effect_k)
+    end
+    
+    return (structured=structured_effects, noisy=structured_effects)
+end
+
 
 
 # --- Helper functions for Delaunay triangulation, restored from archive/model.jl ---
@@ -161,141 +364,4 @@ function bstm_barycentric_basis_2D(coords::AbstractMatrix, knots::Vector{Point2D
     return B
 end
 
-# --- Component Interface Methods ---
-
-"""
-    get_datastructures!(m_type::Type{<:Barycentric}, M::Dict, mod_data::Dict)
-
-Extracts the 2D coordinate variables from the formula and stores them.
-
-# Assumptions
-- The `random()` call provides exactly two variables for the 2D coordinates.
-"""
-function get_datastructures!(
-    m_type::Type{<:Barycentric}, M::Dict, mod_data::Dict
-)::Bool
-    variables = mod_data[:variables]
-    if length(variables) != 2
-        error(
-            "The Barycentric model requires exactly two coordinate variables, e.g., " *
-            "`random(x, y, model=:barycentric)`."
-        )
-    end
-    coords_matrix = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-    mod_data[:params][:coords] = coords_matrix
-    return true
-end
-
-"""
-    get_precomputes(m::Barycentric, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Pre-computes the barycentric basis matrix by generating knots, performing Delaunay
-triangulation, and calculating barycentric coordinates for each observation.
-"""
-function get_precomputes(
-    m::Barycentric, M::NamedTuple, mod_data::Dict
-)::NamedTuple
-    coords = mod_data[:params][:coords]
-    nbins = get(mod_data[:params], :nbins, 25)
-    knot_method = get(mod_data[:params], :knot_method, :quantile)
-    n_marginal = Int(floor(sqrt(nbins)))
-    
-    local kx, ky
-    if knot_method == :range
-        kx = collect(range(extrema(coords[:, 1])..., length=n_marginal))
-        ky = collect(range(extrema(coords[:, 2])..., length=n_marginal))
-    else # Default to :quantile
-        kx = quantile(coords[:, 1], range(0, 1, length=n_marginal))
-        ky = quantile(coords[:, 2], range(0, 1, length=n_marginal))
-    end
-    
-    knot_points = [Point2D(x, y) for x in kx for y in ky]
-    basis_matrix = bstm_barycentric_basis_2D(coords, knot_points)
-    n_knots = length(knot_points)
-
-    return (B=basis_matrix, n_knots=n_knots)
-end
-
-"""
-    get_priors(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx, M)
-
-Generates priors for the basis coefficients (`innov`) and overall scale (`sigma`).
-"""
-function get_priors(
-    m::Barycentric, spec::NamedTuple, arch::String,
-    outcome_idx::Union{Int, Nothing}, M::NamedTuple
-)::String
-    p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    n_knots = spec.hyper.n_knots
-    return """
-    $(p_names.innov) ~ MvNormal(zeros(T, $(n_knots)), I)
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    """
-end
-
-"""
-    get_updates(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx, M)
-
-Generates code to compute the smooth effect as a product of the basis matrix and
-the scaled coefficients, and adds it to the linear predictor `eta`.
-"""
-function get_updates(
-    m::Barycentric, spec::NamedTuple, arch::String,
-    outcome_idx::Union{Int, Nothing}, M::NamedTuple
-)::String
-    p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    key = spec.key
-    return """
-        # --- Barycentric Component: $(key) ---
-        let
-            local B = spec_registry[:$(key)].hyper.B
-            local scaled_coeffs = $(p_names.innov) .* $(p_names.sigma)
-            local barycentric_effect = B * scaled_coeffs
-            $(eta_target) .+= barycentric_effect
-        end
-    """
-end
-
-"""
-    get_effects(m::Barycentric, chain, M::NamedTuple, ...)
-
-Reconstructs the barycentric smooth effect from posterior samples.
-"""
-function get_effects(
-    m::Barycentric, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
-)::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    
-    # Re-create basis matrix for prediction set if it exists
-    B_train = spec.hyper.B
-    B_full = if !isnothing(PS)
-        coord_vars = get(spec.params, :positional_args, [])
-        coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-        
-        # Re-use the same knots from the training phase
-        nbins = get(spec.params, :nbins, 25)
-        n_marginal = Int(floor(sqrt(nbins)))
-        kx = quantile(spec.hyper.coords[:, 1], range(0, 1, length=n_marginal))
-        ky = quantile(spec.hyper.coords[:, 2], range(0, 1, length=n_marginal))
-        knot_points = [Point2D(x, y) for x in kx for y in ky]
-        
-        B_pred = bstm_barycentric_basis_2D(coords_pred, knot_points)
-        vcat(B_train, B_pred)
-    else
-        B_train
-    end
-
-    for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        innov_samples = get_params_vector(chain, string(p_names.innov), spec.hyper.n_knots)
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)
-        
-        scaled_coeffs = innov_samples .* sigma_samples
-        effect_k = B_full * scaled_coeffs'
-        push!(structured_effects, effect_k)
-    end
-    
-    return (structured=structured_effects, noisy=structured_effects)
-end
+ 

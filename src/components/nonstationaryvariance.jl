@@ -1,4 +1,3 @@
-
 """
     NonStationaryVariance <: ComponentModel
 
@@ -9,7 +8,7 @@ with a `modifier_model` (typically a spatial smoother) to create a spatially
 varying standard deviation.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 The component models a non-stationary spatial field \$\\phi(s)\$ where the local
@@ -27,37 +26,23 @@ stationary base process \$\\phi_{base}\$ and a spatially varying scale \$\\sigma
     where \$f(x)\$ is typically a P-spline or Gaussian Process smoother. Exponentiating
     ensures the standard deviation is always positive.
 
-This structure allows the model to capture heteroscedasticity in the spatial process,
-where some regions are inherently more variable than others.
-
-# Assumptions
-- The base model is a GMRF with a valid precision structure.
-- The modifier model is a smoother that can be evaluated over the spatial domain.
-
-# Best Use Case
-Modeling spatial data where the variance is expected to change as a function of
-other spatial covariates. For example, modeling species abundance where the
-variability is higher in areas with more complex habitats, or modeling air pollution
-where variance is higher near industrial centers.
-
-# Key References
-- Gelfand, A. E., Schmidt, A. M., Banerjee, S., & Sirmans, C. F. (2005).
-  *Nonstationary multivariate process modeling through spatially varying
-  coregionalization*. Test, 14(2), 263-312. (For concepts on non-stationary
-  spatial modeling).
+# Computational Methods (for Base Model)
+- `:spectral` (default): An efficient, AD-safe method using spectral decomposition.
+- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
+- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
+  factorization, suitable for gradient-free samplers.
 
 # Fields
-- `base_model::ComponentModel`: The underlying spatial component model (e.g., `ICAR`)
-  whose variance is being modified.
-- `modifier_model::ComponentModel`: The smoother component model (e.g., `PSpline`)
-  that defines the pattern of the log-standard deviation.
+- `base_model::ComponentModel`: The underlying spatial component model.
+- `modifier_model::ComponentModel`: The smoother component model for the log-scale.
+- `method::Symbol`: The computational method for the base model.
 """
 struct NonStationaryVariance <: ComponentModel
     base_model::ComponentModel
     modifier_model::ComponentModel
+    method::Symbol
 end
 
-# Add to the central component constructor registry.
 COMPONENT_TYPE_REGISTRY[:nonstationaryvariance] = NonStationaryVariance
 COMPONENT_CONSTRUCTORS[:nonstationaryvariance] = (p, params) -> begin
     base_model_obj = get(
@@ -68,7 +53,8 @@ COMPONENT_CONSTRUCTORS[:nonstationaryvariance] = (p, params) -> begin
         params, :modifier_model_obj,
         error("NonStationaryVariance requires a `modifier_model_obj`.")
     )
-    NonStationaryVariance(base_model_obj, modifier_model_obj)
+    method = get(params, :method, :spectral)
+    NonStationaryVariance(base_model_obj, modifier_model_obj, method)
 end
 
 # Add to the model-to-structure map.
@@ -206,10 +192,12 @@ function get_priors(
     """
 end
 
+
 """
     get_updates(m::NonStationaryVariance, spec::NamedTuple, arch::String, outcome_idx, M)
 
-Generates the Turing code to construct the non-stationary variance effect.
+Generates the Turing code to construct the non-stationary variance effect,
+dispatching on the chosen method for the base model reconstruction.
 """
 function get_updates(
     m::NonStationaryVariance, spec::NamedTuple, arch::String,
@@ -251,40 +239,60 @@ function get_updates(
     modifier_basis_key = spec.hyper.modifier_basis_key
     base_model_type_sym = Symbol(lowercase(string(typeof(m.base_model))))
 
-    base_latent_reconstruction_code = """
-        local Q_base_template = spec_registry[:$(base_spec_for_updates.key)].hyper.Q_template
-        local F_base = cholesky(Symmetric(Matrix(Q_base_template) + M.noise * I))
-        local base_latent_raw = F_base.L' \\ $(base_p_names.raw)
-        
-        if $(base_model_type_sym) in [:icar, :besag]
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent_base)), sum(base_latent_raw))
-        end
-    """
+    local base_latent_reconstruction_code
+    if m.method == :spectral
+        base_latent_reconstruction_code = """
+            local base_hyper = spec_registry[:$(base_spec_key)].hyper
+            local diag_D = 1.0 ./ sqrt.(base_hyper.L .+ M.noise)
+            if $(base_model_type_sym) in [:icar, :besag]; diag_D[1] = 0.0; end
+            local base_latent_raw = base_hyper.U * (diag_D .* $(base_p_names.raw))
+        """
+    elseif m.method == :cholesky
+        base_latent_reconstruction_code = """
+            local Q_base = spec_registry[:$(base_spec_key)].hyper.Q_template
+            local F_base = cholesky(Symmetric(Matrix(Q_base) + M.noise * I))
+            local base_latent_raw = F_base.L' \\ $(base_p_names.raw)
+        """
+    else # :cholesky_sparse
+        base_latent_reconstruction_code = """
+            local Q_base = spec_registry[:$(base_spec_key)].hyper.Q_template
+            local F_base = cholesky(Symmetric(Q_base + M.noise * I))
+            local base_latent_raw = F_base.L' \\ $(base_p_names.raw)
+        """
+    end
+
+    sum_to_zero_constraint = if base_model_type_sym in [:icar, :besag]
+        "Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent_base)), sum(base_latent_raw))"
+    else
+        ""
+    end
 
     return """
         # --- NonStationaryVariance Component: $(spec.key) ---
-        
-        # 1. Realize the log-standard deviation field from the modifier model.
-        $(modifier_update_cleaned)
-        
-        local log_sigma_field = M.basis_matrices[:$(modifier_basis_key)] * $(modifier_p_names.latent)
-        local spatially_varying_sigma = exp.(log_sigma_field)
-        
-        # 2. Realize the raw latent field from the base model.
-        $(base_latent_reconstruction_code)
-        
-        # 3. Combine raw latent field with spatially varying sigma.
-        local final_effect_latent = base_latent_raw .* spatially_varying_sigma
-        
-        # 4. Add the final effect to the linear predictor.
-        $(eta_target) .+= view(final_effect_latent, M.s_idx)
+        let
+            # 1. Realize the log-standard deviation field from the modifier model.
+            $(modifier_update_cleaned)
+            local log_sigma_field = M.basis_matrices[:$(modifier_basis_key)] * $(modifier_p_names.latent)
+            local spatially_varying_sigma = exp.(log_sigma_field)
+            
+            # 2. Realize the raw latent field from the base model.
+            $(base_latent_reconstruction_code)
+            $(sum_to_zero_constraint)
+            
+            # 3. Combine raw latent field with spatially varying sigma.
+            local final_effect_latent = base_latent_raw .* spatially_varying_sigma
+            
+            # 4. Add the final effect to the linear predictor.
+            $(eta_target) .+= view(final_effect_latent, M.s_idx)
+        end
     """
 end
 
 """
     get_effects(m::NonStationaryVariance, chain, M::NamedTuple, ...)
 
-Reconstructs the `NonStationaryVariance` component's effect from posterior samples.
+Reconstructs the `NonStationaryVariance` component's effect from posterior samples,
+dispatching on the method used for the base model.
 """
 function get_effects(
     m::NonStationaryVariance, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -328,12 +336,21 @@ function get_effects(
         )
         
         n_latent_base = base_spec.hyper.n_latent
-        Q_base_template = base_spec.hyper.Q_template
-        F_base = cholesky(Symmetric(Matrix(Q_base_template) + M.noise * I))
-        
         base_latent_raw_samples = zeros(n_samples, n_latent_base)
-        for i in 1:n_samples
-            base_latent_raw_samples[i, :] = F_base.L' \ base_raw_samples[i, :]
+
+        if m.method == :spectral
+            U, L = base_spec.hyper.U, base_spec.hyper.L
+            diag_D = 1.0 ./ sqrt.(L .+ M.noise)
+            if typeof(m.base_model) in [ICAR, Besag]; diag_D[1] = 0.0; end
+            for i in 1:n_samples
+                base_latent_raw_samples[i, :] = U * (diag_D .* base_raw_samples[i, :])
+            end
+        else # :cholesky or :cholesky_sparse
+            Q_base_template = base_spec.hyper.Q_template
+            F_base = cholesky(Symmetric(Matrix(Q_base_template) + M.noise * I))
+            for i in 1:n_samples
+                base_latent_raw_samples[i, :] = F_base.L' \ base_raw_samples[i, :]
+            end
         end
 
         # --- 3. Combine and Index ---

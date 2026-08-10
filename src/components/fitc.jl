@@ -1,56 +1,50 @@
-
 """
     FITC <: ComponentModel
 
-A component model for the Fully Independent Training Conditional (FITC) sparse
-Gaussian Process. This method approximates a full GP by using a small set of
-`n_inducing` points to summarize the data, making it scalable for larger datasets.
+A component model for sparse Gaussian Processes. It supports two common
+approximations: FITC (Fully Independent Training Conditional) and VFE
+(Variational Free Energy), also known as DTC.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
-The FITC approximation assumes that, conditional on the GP's values at a set of
-\$M\$ inducing points \$Z\$, the values at the \$N\$ data points \$X\$ are independent.
+Both methods approximate a full GP using a small set of \$M\$ inducing points \$Z\$.
 The latent GP values \$f\$ are modeled as:
 \$f \\sim \\mathcal{N}(\\mu_f, \\Sigma_f)\$
-where the conditional mean and covariance are:
-- \$\\mu_f = K_{XZ} K_{ZZ}^{-1} u\$
-- \$\\Sigma_f = \\text{diag}(K_{XX} - Q_{XX}) + \\sigma_n^2 I\$
-and
-- \$u \\sim \\mathcal{N}(0, K_{ZZ})\$ are the latent values at the inducing points.
-- \$Q_{XX} = K_{XZ} K_{ZZ}^{-1} K_{ZX}\$.
-- \$K_{XZ}\$ is the cross-covariance between data and inducing points.
-- \$K_{ZZ}\$ is the covariance of the inducing points.
+where the conditional mean is \$\\mu_f = K_{XZ} K_{ZZ}^{-1} u\$, with \$u \\sim \\mathcal{N}(0, K_{ZZ})\$.
 
-This implementation uses a non-centered parameterization for efficient sampling.
-
-# Assumptions
-- The data points are conditionally independent given the inducing points.
-- The number of inducing points `n_inducing` is much smaller than the number of
-  data points.
+The methods differ in their covariance approximation:
+- **`:fitc` (default)**: Includes a diagonal correction to account for the variance
+  of data points not captured by the inducing points.
+  \$\\Sigma_f = \\text{diag}(K_{XX} - Q_{XX}) + \\sigma_n^2 I\$, where \$Q_{XX} = K_{XZ} K_{ZZ}^{-1} K_{ZX}\$.
+- **`:vfe` (didactic)**: A pure low-rank approximation, equivalent to DTC.
+  \$\\Sigma_f = Q_{XX}\$. This is simpler but can underestimate variance.
 
 # Best Use Case
 Scalable Gaussian Process regression for large datasets where a full GP is
-computationally infeasible. It is a good general-purpose sparse GP method.
+computationally infeasible. `:fitc` is generally preferred for its more accurate
+variance estimates.
 
 # Key References
 - Snelson, E., & Ghahramani, Z. (2006). *Sparse Gaussian Processes using
   Pseudo-inputs*. In Advances in neural information processing systems, 18.
-- Wikipedia: Sparse Gaussian process
+- Titsias, M. (2009). *Variational learning of inducing variables in sparse
+  Gaussian processes*. In AISTATS.
 
 # Fields
-- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the
-  kernel lengthscale(s).
-- `sigma::Distribution`: The prior for the marginal standard deviation of the GP.
-- `n_inducing::Int`: The number of inducing points to use for the approximation.
+- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: Prior for the kernel lengthscale(s).
+- `sigma::Distribution`: Prior for the marginal standard deviation of the GP.
+- `n_inducing::Int`: The number of inducing points.
 - `kernel::String`: The name of the kernel function (e.g., "se", "matern32").
+- `method::Symbol`: The approximation method, `:fitc` (default) or `:vfe`.
 """
 struct FITC <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
     sigma::Distribution
     n_inducing::Int
     kernel::String
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:fitc] = FITC
@@ -59,10 +53,12 @@ COMPONENT_CONSTRUCTORS[:fitc] = (p, params) -> FITC(
     p.lengthscale,
     p.sigma,
     get(params, :n_inducing, 20),
-    string(get(params, :kernel, "se"))
+    string(get(params, :kernel, "se")),
+    get(params, :method, :fitc)
 )
 
 MODEL_TO_STRUCTURE_MAP[:fitc] = :smooth
+
 
 """
     get_datastructures!(m_type::Type{<:FITC}, M::Dict, mod_data::Dict)::Bool
@@ -125,8 +121,8 @@ end
 """
     get_priors(m::FITC, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates priors for `sigma`, `lengthscale`, and the raw innovations for both the
-inducing points (`raw`) and the final latent field (`innov`).
+Generates priors for `sigma`, `lengthscale`, and raw innovations. The `innov`
+prior (for diagonal correction) is only included for the `:fitc` method.
 """
 function get_priors(
     m::FITC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -145,11 +141,16 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.raw) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
-    push!(
-        priors,
-        "$(p_names.innov) ~ MvNormal(zeros(T, spec.precomputes.n_latent), I)"
-    )
+    # Prior for innovations at inducing points
+    push!(priors, "$(p_names.raw) ~ MvNormal(zeros($(m.n_inducing)), I)")
+    
+    # Prior for diagonal correction innovations (only for FITC)
+    if m.method == :fitc
+        push!(
+            priors,
+            "$(p_names.innov) ~ MvNormal(zeros(spec.precomputes.n_latent), I)"
+        )
+    end
 
     return join(priors, "\n    ")
 end
@@ -157,7 +158,7 @@ end
 """
     get_updates(m::FITC, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code for constructing the `FITC` sparse GP effect.
+Generates Turing code for the sparse GP effect, dispatching on the chosen method.
 """
 function get_updates(
     m::FITC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -166,23 +167,27 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    return """
+    common_code = """
+        local precomputes = spec_registry[:$(spec.key)].precomputes
+        local X_coords = precomputes.coords
+        local Z_coords = precomputes.Z_inducing
+        local kernel_type = Symbol("$(m.kernel)")
+        
+        local K_UU = evaluate_kernel_matrix(
+            Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
+        )
+        local K_XU = evaluate_cross_kernel_matrix(
+            X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
+        )
+        
+        local L_UU = cholesky(Symmetric(K_UU)).L
+        local u_latent = L_UU * $(p_names.raw)
+    """
+
+    fitc_code = """
         # --- FITC Sparse GP Component: $(spec.key) ---
         let
-            local precomputes = spec_registry[:$(spec.key)].precomputes
-            local X_coords = precomputes.coords
-            local Z_coords = precomputes.Z_inducing
-            local kernel_type = Symbol("$(m.kernel)")
-            
-            local K_UU = evaluate_kernel_matrix(
-                Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
-            )
-            local K_XU = evaluate_cross_kernel_matrix(
-                X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
-            )
-            
-            local L_UU = cholesky(Symmetric(K_UU)).L
-            local u_latent = L_UU * $(p_names.raw)
+            $(common_code)
             
             local K_UU_inv_u = K_UU \\ u_latent
             local mean_f = K_XU * K_UU_inv_u
@@ -192,18 +197,43 @@ function get_updates(
             local diag_Q_ff = sum(tmp.^2, dims=2)
             local lambda_diag = diag_K_XX - vec(diag_Q_ff)
             
-            local $(p_names.latent) = mean_f .+
+            $(p_names.latent) = mean_f .+
                 sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.innov)
             
             $(eta_target) .+= $(p_names.latent)
         end
     """
+
+    vfe_code = """
+        # --- VFE/DTC Sparse GP Component: $(spec.key) ---
+        # This is a didactic alternative to FITC that uses a pure low-rank approximation.
+        let
+            $(common_code)
+            
+            # The VFE approximation is the conditional mean of the GP given the inducing points.
+            # f ≈ K_XU * inv(K_UU) * u
+            # This is a low-rank approximation of the full GP.
+            local K_UU_inv_u = K_UU \\ u_latent
+            $(p_names.latent) = K_XU * K_UU_inv_u
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    if m.method == :fitc
+        return fitc_code
+    elseif m.method == :vfe
+        return vfe_code
+    else
+        error("Unsupported method '$(m.method)' for FITC component. Supported methods are :fitc and :vfe.")
+    end
 end
 
 """
-    get_effects(m::FITC, chain, M::NamedTuple, ...)::NamedTuple
+    get_effects(m::FITC, chain, M::NamedTuple, ...)
 
-Reconstructs the `FITC` component's effect from the MCMC chain's posterior samples.
+Reconstructs the `FITC` component's effect from posterior samples, dispatching
+on the method used during sampling.
 """
 function get_effects(
     m::FITC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -229,29 +259,17 @@ function get_effects(
         
         sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
         ls_samples = get_params_vector(
-            chain, string(p_names.ls), length(m.lengthscale)
+            chain, string(p_names.ls), m.lengthscale isa Vector ? length(m.lengthscale) : 1
         )
         u_raw_samples = get_params_vector(chain, string(p_names.raw), m.n_inducing)
-        f_innov_samples = get_params_vector(
-            chain, string(p_names.innov), spec.precomputes.n_latent
-        )
 
         effect_k = zeros(Float64, n_obs_full, n_samples)
 
         for i in 1:n_samples
             current_sigma = sigma_samples[i]
-            current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i]
+            current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i, 1]
             current_u_raw = u_raw_samples[i, :]
             
-            f_innov_i = if size(f_innov_samples, 2) == n_obs_full
-                f_innov_samples[i, :]
-            else
-                vcat(
-                    f_innov_samples[i, :],
-                    randn(n_obs_full - size(f_innov_samples, 2))
-                )
-            end
-
             K_UU = evaluate_kernel_matrix(
                 Z_inducing, current_sigma, current_ls, kernel_type, noise
             )
@@ -261,17 +279,28 @@ function get_effects(
             
             L_UU = cholesky(Symmetric(K_UU)).L
             u_latent = L_UU * current_u_raw
-            
             K_UU_inv_u = K_UU \ u_latent
             mean_f = K_XU * K_UU_inv_u
-            
-            diag_K_XX = fill(current_sigma^2, n_obs_full)
-            tmp = (L_UU' \ K_XU')'
-            diag_Q_ff = sum(tmp.^2, dims=2)
-            lambda_diag = diag_K_XX - vec(diag_Q_ff)
-            
-            effect_k[:, i] = mean_f .+
-                sqrt.(max.(lambda_diag, 0.0) .+ noise) .* f_innov_i
+
+            if m.method == :fitc
+                f_innov_samples = get_params_vector(
+                    chain, string(p_names.innov), spec.precomputes.n_latent
+                )
+                f_innov_i = if size(f_innov_samples, 2) == n_obs_full
+                    f_innov_samples[i, :]
+                else
+                    vcat(f_innov_samples[i, :], randn(n_obs_full - size(f_innov_samples, 2)))
+                end
+
+                diag_K_XX = fill(current_sigma^2, n_obs_full)
+                tmp = (L_UU' \ K_XU')'
+                diag_Q_ff = sum(tmp.^2, dims=2)
+                lambda_diag = diag_K_XX - vec(diag_Q_ff)
+                
+                effect_k[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* f_innov_i
+            else # :vfe
+                effect_k[:, i] = mean_f
+            end
         end
         push!(structured_effects, effect_k)
     end

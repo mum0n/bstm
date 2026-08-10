@@ -1,63 +1,47 @@
 """
     SAR <: ComponentModel
 
-A component model for the Simultaneous Autoregressive (SAR) effect, also known as a proper CAR model.
-The value at each location is modeled as a linear combination of its neighbors plus an independent
-innovation term, leading to a precision matrix of the form `(I - ρW)'(I - ρW)`.
+A component model for the Simultaneous Autoregressive (SAR) effect, also known as a
+proper CAR model. The value at each location is modeled as a linear combination of
+its neighbors plus an independent innovation term, leading to a precision matrix of
+the form `(I - ρW)'(I - ρW)`.
 
 # Version
-v1.0.1 (2026-08-08)
+v1.0.2 (2026-08-10)
 
 # Mathematical Summary
-The Simultaneous Autoregressive (SAR) model, also known as a proper CAR model,
-defines a spatial random effect \$\\boldsymbol{\\phi}\$ where the value at each
-location is a linear combination of its neighbors plus an independent innovation
-term. The model is typically expressed as:
+The Simultaneous Autoregressive (SAR) model defines a spatial random effect
+\$\\boldsymbol{\\phi}\$ where the value at each location is a linear combination of its
+neighbors plus an independent innovation term. The model is typically expressed as:
 \$\\boldsymbol{\\phi} = \\rho \\mathbf{W} \\boldsymbol{\\phi} + \\boldsymbol{\\epsilon}\$
 where:
-- \$\\rho\$ is the spatial autoregressive parameter, typically constrained to \$( -1, 1)\$.
-- \$\\mathbf{W}\$ is a row-standardized adjacency matrix (i.e., \$\\sum_j W_{ij} = 1\$).
+- \$\\rho\$ is the spatial autoregressive parameter.
+- \$\\mathbf{W}\$ is a row-standardized adjacency matrix.
 - \$\\boldsymbol{\\epsilon} \\sim \\mathcal{N}(\\mathbf{0}, \\sigma^2 \\mathbf{I})\$ are independent innovations.
-
-Rearranging the equation, we get:
-\$(\\mathbf{I} - \\rho \\mathbf{W}) \\boldsymbol{\\phi} = \\boldsymbol{\\epsilon}\$
 
 The precision matrix \$\\mathbf{Q}\$ for the SAR model is then given by:
 \$\\mathbf{Q} = \\frac{1}{\\sigma^2} (\\mathbf{I} - \\rho \\mathbf{W})^T (\\mathbf{I} - \\rho \\mathbf{W})\$
 
-This model is "proper" because its precision matrix is always positive definite
-(for \$\\rho\$ within the stationarity bounds), ensuring a well-defined joint
-probability distribution for \$\\boldsymbol{\\phi}\$.
-
-# Assumptions
-- The spatial process is stationary.
-- The provided adjacency matrix `W` represents a single connected graph.
-- The effect is additive on the scale of the linear predictor.
-
-# Best Use Case
-Modeling spatial autocorrelation when a "spill-over" effect is hypothesized,
-where the value at one location directly influences its neighbors. It is a
-robust alternative to intrinsic CAR models as it results in a proper posterior
-distribution without requiring sum-to-zero constraints.
-
-# Key References
-- Cliff, A. D., & Ord, J. K. (1973). *Spatial autocorrelation*. Pion.
-- Cressie, N. A. C. (1993). *Statistics for spatial data*. Wiley.
-- Wikipedia: Simultaneous autoregressive model
+# Computational Methods
+- `:cholesky` (default): An AD-safe method using dense Cholesky factorization.
+- `:cholesky_sparse` (didactic, not AD-safe): A more memory-efficient method using
+  sparse Cholesky factorization, suitable for gradient-free samplers.
 
 # Fields
-- `rho::Distribution`: The prior distribution for the spatial autoregressive
-  parameter `rho`.
-- `sigma::Distribution`: The prior distribution for the standard deviation of
-  the SAR innovations.
+- `rho::Distribution`: The prior for the spatial autoregressive parameter `rho`.
+- `sigma::Distribution`: The prior for the standard deviation of the innovations.
+- `method::Symbol`: The computational method, `:cholesky` or `:cholesky_sparse`.
 """
 struct SAR <: ComponentModel
     rho::Distribution
     sigma::Distribution
+    method::Symbol
 end
 
-# Add to the central component constructor registry. 
-COMPONENT_CONSTRUCTORS[:sar] = (p, params) -> SAR(p.rho, p.sigma)
+COMPONENT_TYPE_REGISTRY[:sar] = SAR
+COMPONENT_CONSTRUCTORS[:sar] = (p, params) -> SAR(
+    p.rho, p.sigma, get(params, :method, :cholesky)
+)
 
 # Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:sar] = :spatial
@@ -163,48 +147,65 @@ function get_priors(m::SAR, spec::NamedTuple, arch::String, outcome_idx::Union{I
 end
 
 """
-    get_updates(m::SAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::SAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for constructing the `SAR` component's effect
-and adding it to the linear predictor (`eta`).
-It uses the Cholesky decomposition method for AD-compatibility.
+Generates the Turing code for constructing the `SAR` effect, dispatching on the
+chosen method.
 """
-function get_updates(m::SAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(
+    m::SAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
     n_latent = spec.precomputes.n_latent
 
-    return """
-        # --- SAR Component: $(spec.key) ---
+    common_code = """
         local W_std = spec_registry[:$(key)].precomputes.Q_template
-        
-        # Construct the operator (I - rho*W)
-        local L_op = I($(n_latent)) - $(p_names.rho) * W_std
-        
-        # Form the precision matrix Q_final = (L_op' * L_op) / sigma^2
-        # Add noise for numerical stability and ensure positive definiteness.
-        local Q_final = Symmetric((L_op' * L_op) / ($(p_names.sigma)^2) + M.noise * I($(n_latent)))
-        
-        # Perform Cholesky decomposition for non-centered parameterization.
-        # Convert to dense Matrix for AD-compatibility.
-        local F = cholesky(Matrix(Q_final)) # Convert to dense for AD-compatible Cholesky
-        
-        # Sample latent field: latent ~ MvNormal(0, inv(Q_final)) which is equivalent to latent = F.L' \\ raw
-        local $(p_names.latent) = F.L' \\ $(p_names.raw) # Non-centered parameterization
-        
-        $(eta_target) .+= $(p_names.latent)[M.s_idx]
+        local L_op = I - $(p_names.rho) * W_std
+        local Q_final = Symmetric((L_op' * L_op) / ($(p_names.sigma)^2) + M.noise * I)
     """
+
+    cholesky_code = """
+        # --- SAR Component (Cholesky, AD-Safe): $(key) ---
+        let
+            $(common_code)
+            local F = cholesky(Matrix(Q_final)) # Convert to dense for AD
+            local $(p_names.latent) = F.L' \\ $(p_names.raw)
+            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+        end
+    """
+
+    cholesky_sparse_code = """
+        # --- SAR Component (Sparse Cholesky, Not AD-Safe): $(key) ---
+        let
+            $(common_code)
+            local F = cholesky(Q_final) # Use sparse Cholesky
+            local $(p_names.latent) = F.L' \\ $(p_names.raw)
+            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+        end
+    """
+
+    if m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    else
+        error("Unsupported method '$(m.method)' for SAR component.")
+    end
 end
 
-
 """
-    get_effects(m::SAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::SAR, chain, M::NamedTuple, ...)
 
-Reconstructs the `SAR` component's effect from the MCMC chain's posterior samples.
-This version returns the raw posterior samples for each outcome, not a summary.
+Reconstructs the `SAR` component's effect from posterior samples. For
+reconstruction, a dense Cholesky is always used for robustness.
 """
-function get_effects(m::SAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+function get_effects(
+    m::SAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
@@ -221,19 +222,15 @@ function get_effects(m::SAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::I
         effect_k = zeros(Float64, n_latent, n_samples)
 
         for i in 1:n_samples
-            current_rho = rho_samples[i]
-            current_sigma = sigma_samples[i]
-            current_raw = raw_samples[i, :]
-
-            # Reconstruct the precision matrix for this posterior sample
-            L_op = I(n_latent) - current_rho * W_std # Operator (I - rho*W)
-            Q_final = Symmetric((L_op' * L_op) / (current_sigma^2) + noise * I(n_latent)) # Full precision matrix
+            L_op = I(n_latent) - rho_samples[i] * W_std
+            Q_final = Symmetric((L_op' * L_op) / (sigma_samples[i]^2) + noise * I)
             
-            F = cholesky(Matrix(Q_final)) # Cholesky decomposition (using dense for AD-compatibility)
+            # For reconstruction, dense Cholesky is safe and robust.
+            F = cholesky(Matrix(Q_final))
             
-            effect_k[:, i] = F.L' \ current_raw # Reconstruct latent field
+            effect_k[:, i] = F.L' \ raw_samples[i, :]
         end
-        push!(structured_effects, effect_k[s_idx_full, :]) # Index to observation level
+        push!(structured_effects, effect_k[s_idx_full, :])
     end
 
     return (structured=structured_effects, noisy=structured_effects)

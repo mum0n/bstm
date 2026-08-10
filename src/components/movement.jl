@@ -9,7 +9,7 @@ spatial processes where movement or correlation is facilitated or impeded by
 underlying environmental features.
 
 # Version
-v1.0.1 (2026-08-09)
+v1.0.2 (2026-08-10)
 
 # Mathematical Summary
 The component models a latent spatial field \$\\phi\$ as a GMRF,
@@ -29,41 +29,27 @@ The precision matrix is then constructed as the weighted graph Laplacian:
 where \$\\mathbf{W}_{\\beta}\$ is the matrix of weights \$w_{ij}\$ and \$\\mathbf{D}_{\\beta}\$ is the
 diagonal matrix of row sums of \$\\mathbf{W}_{\\beta}\$.
 
-By estimating \$\\beta\$, the model learns the degree to which the habitat influences
-the spatial correlation structure. This approach is closely related to the use of
-circuit theory in landscape ecology.
-
-# Assumptions
-- The provided adjacency matrix `W` (or the grid structure from `habitat_raster`)
-  represents the base connectivity of the spatial graph.
-- The `habitat` data represents a measure of conductivity or resistivity, and the
-  sign of the estimated `beta` will reflect this relationship.
-
-# Best Use Case
-Modeling animal movement, disease spread, or any spatial process where movement or
-correlation is not uniform but is facilitated or impeded by underlying environmental
-features. It is a powerful tool for creating non-stationary spatial models where the
-correlation structure is learned from data.
-
-# Key References
-- McRae, B. H., Dickson, B. G., Keitt, T. H., & Shah, V. B. (2008). Using circuit
-  theory to model connectivity in ecology, evolution, and conservation. *Ecology*,
-  89(10), 2712-2724.
-- Wikipedia: Laplacian matrix
+# Computational Methods
+- `:cholesky` (default): An AD-safe method using dense Cholesky factorization.
+- `:cholesky_sparse` (didactic, not AD-safe): A more memory-efficient method using
+  sparse Cholesky factorization, suitable for gradient-free samplers.
 
 # Fields
-- `beta::UnivariateDistribution`: Prior for the parameter \$\\beta\$, which controls
-  the influence of the habitat on connectivity.
-- `sigma::UnivariateDistribution`: Prior for the marginal standard deviation of the
-  latent field.
+- `beta::UnivariateDistribution`: Prior for the parameter \$\\beta\$.
+- `sigma::UnivariateDistribution`: Prior for the marginal standard deviation.
+- `method::Symbol`: The computational method, `:cholesky` or `:cholesky_sparse`.
 """
 struct Movement <: ComponentModel
     beta::UnivariateDistribution
     sigma::UnivariateDistribution
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:movement] = Movement
-COMPONENT_CONSTRUCTORS[:movement] = (p, params) -> Movement(p.beta, p.sigma)
+COMPONENT_CONSTRUCTORS[:movement] = (p, params) -> Movement(
+    p.beta, p.sigma, get(params, :method, :cholesky)
+)
+
 MODEL_TO_STRUCTURE_MAP[:movement] = :spatial
 
 function _raster_to_graph(raster::AbstractMatrix)
@@ -179,33 +165,56 @@ end
 """
     get_updates(m::Movement, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates code to construct the habitat-weighted precision matrix, sample the
-latent field, and add it to the linear predictor `eta`.
+Generates code to construct the habitat-weighted precision matrix and sample the
+latent field, dispatching on the chosen method.
 """
-function get_updates(m::Movement, spec::NamedTuple, arch::String, outcome_idx, M)::String
+function get_updates(
+    m::Movement, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
 
-    return """
-        # --- Movement Component: $(key) ---
+    common_code = """
+        local W_I = spec_registry[:$(key)].hyper.W_I
+        local W_J = spec_registry[:$(key)].hyper.W_J
+        local habitat = M[Symbol("habitat_$(key)")]
+        
+        local V_beta = exp.($(p_names.beta) .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
+        local W_beta = sparse(W_I, W_J, V_beta, M.s_N, M.s_N)
+        
+        local D_beta = Diagonal(vec(sum(W_beta, dims=2)))
+        local Q_beta = D_beta - W_beta
+    """
+
+    cholesky_code = """
+        # --- Movement Component (Cholesky, AD-Safe): $(key) ---
         let
-            local W_I = spec.hyper.W_I
-            local W_J = spec.hyper.W_J
-            local habitat = M[Symbol("habitat_$(key)")]
-            
-            local V_beta = exp.($(p_names.beta) .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
-            local W_beta = sparse(W_I, W_J, V_beta, M.s_N, M.s_N)
-            
-            local D_beta = Diagonal(vec(sum(W_beta, dims=2)))
-            local Q_beta = D_beta - W_beta
-            
+            $(common_code)
             local F = cholesky(Symmetric(Matrix(Q_beta) + M.noise * I))
             local latent_field = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
-            
             $(eta_target) .+= view(latent_field, M.s_idx)
         end
     """
+
+    cholesky_sparse_code = """
+        # --- Movement Component (Sparse Cholesky, Not AD-Safe): $(key) ---
+        let
+            $(common_code)
+            local F = cholesky(Symmetric(Q_beta + M.noise * I))
+            local latent_field = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
+            $(eta_target) .+= view(latent_field, M.s_idx)
+        end
+    """
+
+    if m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    else
+        error("Unsupported method '$(m.method)' for Movement component.")
+    end
 end
 
 """
@@ -213,7 +222,10 @@ end
 
 Reconstructs the `Movement` component's effect from posterior samples.
 """
-function get_effects(m::Movement, chain, M, n_samples, outcomes_N, spec, PS, N_total)::NamedTuple
+function get_effects(
+    m::Movement, chain, M, n_samples::Int, outcomes_N::Int, spec::NamedTuple,
+    PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     key = spec.key
     
@@ -237,6 +249,7 @@ function get_effects(m::Movement, chain, M, n_samples, outcomes_N, spec, PS, N_t
             D_beta_i = Diagonal(vec(sum(W_beta_i, dims=2)))
             Q_beta_i = D_beta_i - W_beta_i
             
+            # For reconstruction, dense Cholesky is safe and robust.
             F_i = cholesky(Symmetric(Matrix(Q_beta_i) + M.noise * I))
             reconstructed_effects_k[:, i] = sigma_samples[i] .* (F_i.L' \ raw_samples[i, :])
         end

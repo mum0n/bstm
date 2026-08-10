@@ -7,7 +7,7 @@ on a bipartite graph, where nodes are divided into two disjoint sets, and edges
 only connect nodes from different sets.
 
 # Version
-v1.0.1 (2026-08-08)
+v1.0.2 (2026-08-10)
 
 # Mathematical Summary
 The BCGN component models a latent spatial field on one partition of a bipartite
@@ -47,13 +47,18 @@ between nodes of one type based on the other types of nodes they connect to.
 # Fields
 - `sigma::UnivariateDistribution`: The prior for the marginal standard deviation of
   the latent field.
+- `method::Symbol`: The computational method. Can be `:spectral` (default, AD-safe),
+  `:cholesky` (AD-safe, dense), or `:cholesky_sparse` (didactic, not AD-safe).
 """
 struct BCGN <: ComponentModel
     sigma::UnivariateDistribution
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:bcgn] = BCGN
-COMPONENT_CONSTRUCTORS[:bcgn] = (p, params) -> BCGN(p.sigma)
+COMPONENT_CONSTRUCTORS[:bcgn] = (p, params) -> BCGN(
+    p.sigma, get(params, :method, :spectral)
+)
 MODEL_TO_STRUCTURE_MAP[:bcgn] = :spatial
 
 """
@@ -91,7 +96,7 @@ end
     get_precomputes(m::BCGN, M::NamedTuple, mod_data::Dict)::NamedTuple
 
 Pre-computes the precision matrix `Q_template` from the one-mode projection of the
-bipartite graph.
+bipartite graph, along with its spectral decomposition and Cholesky factorization.
 """
 function get_precomputes(m::BCGN, M::NamedTuple, mod_data::Dict)::NamedTuple
     B = mod_data[:params][:bipartite_adj]
@@ -108,7 +113,21 @@ function get_precomputes(m::BCGN, M::NamedTuple, mod_data::Dict)::NamedTuple
     
     n_latent = size(Q_template, 1)
 
-    return (Q_template=Q_template, n_latent=n_latent)
+    # Spectral decomposition for AD-friendly sampling
+    eig_decomp = eigen(Symmetric(Matrix(Q_template)))
+    U = eig_decomp.vectors
+    L = eig_decomp.values
+    
+    # Dense Cholesky factor for the :cholesky method
+    F = cholesky(Symmetric(Matrix(Q_template) + M.noise * I))
+
+    return (
+        Q_template=Q_template,
+        U=U,
+        L=L,
+        n_latent=n_latent,
+        cholesky_factor=F
+    )
 end
 
 """
@@ -132,6 +151,7 @@ end
     get_updates(m::BCGN, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates code to compute the BCGN effect and add it to the linear predictor `eta`.
+Supports three methods: `:spectral`, `:cholesky`, and `:cholesky_sparse`.
 """
 function get_updates(
     m::BCGN, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -140,32 +160,64 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
-    
-    return """
-        # --- BCGN Component: $(key) ---
+    n_latent = spec.hyper.n_latent
+
+    spectral_code = """
+        # --- BCGN Component (Spectral): $(key) ---
         let
-            local Q = spec_registry[:$(key)].hyper.Q_template
-            local F = cholesky(Symmetric(Matrix(Q) + M.noise * I))
-            local latent_field_raw = F.L' \\ $(p_names.raw)
+            local U = spec_registry[:$(key)].hyper.U
+            local L = spec_registry[:$(key)].hyper.L
+            local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
+            diag_D[L .< 1e-6] .= 0.0 # Enforce sum-to-zero constraint
             
-            # Apply sum-to-zero constraint for identifiability
-            Turing.@addlogprob! logpdf(
-                Normal(0, 0.001 * $(spec.hyper.n_latent)), sum(latent_field_raw)
-            )
-            
-            local latent_field = latent_field_raw .* $(p_names.sigma)
-            
-            # Note: The indexing assumes the user's s_idx corresponds to the
-            # first partition of the graph.
+            local latent_field = U * (diag_D .* $(p_names.raw))
             $(eta_target) .+= view(latent_field, M.s_idx)
         end
     """
+
+    cholesky_code = """
+        # --- BCGN Component (Cholesky, AD-Safe): $(key) ---
+        let
+            local F = spec_registry[:$(key)].hyper.cholesky_factor
+            local latent_field_raw = F.L' \\ $(p_names.raw)
+            
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            
+            local latent_field = latent_field_raw .* $(p_names.sigma)
+            $(eta_target) .+= view(latent_field, M.s_idx)
+        end
+    """
+
+    cholesky_sparse_code = """
+        # --- BCGN Component (Sparse Cholesky, Not AD-Safe): $(key) ---
+        let
+            local Q = spec_registry[:$(key)].hyper.Q_template
+            local F = cholesky(Symmetric(Q + M.noise * I))
+            local latent_field_raw = F.L' \\ $(p_names.raw)
+            
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            
+            local latent_field = latent_field_raw .* $(p_names.sigma)
+            $(eta_target) .+= view(latent_field, M.s_idx)
+        end
+    """
+
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    else
+        error("Unsupported method '$(m.method)' for BCGN component.")
+    end
 end
 
 """
     get_effects(m::BCGN, chain, M::NamedTuple, ...)::NamedTuple
 
-Reconstructs the `BCGN` component's effect from the MCMC chain's posterior samples.
+Reconstructs the `BCGN` component's effect from the MCMC chain's posterior samples,
+dispatching on the method used during sampling.
 """
 function get_effects(
     m::BCGN, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -173,8 +225,7 @@ function get_effects(
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
-    Q_template = spec.hyper.Q_template
-    F = cholesky(Symmetric(Matrix(Q_template) + M.noise * I))
+    noise = M.noise
 
     for k in 1:outcomes_N
         p_names = generate_full_variable_names(spec, M.model_arch, k)
@@ -183,10 +234,22 @@ function get_effects(
         raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
-        for j in 1:n_samples
-            latent_field_raw = F.L' \ raw_samples[j, :]
-            latent_field_raw .-= mean(latent_field_raw) # Enforce sum-to-zero
-            effect_k[:, j] = latent_field_raw .* sigma_samples[j]
+
+        if m.method == :spectral
+            U = spec.hyper.U
+            L = spec.hyper.L
+            for j in 1:n_samples
+                diag_D = sigma_samples[j] ./ sqrt.(L .+ noise)
+                diag_D[L .< 1e-6] .= 0.0
+                effect_k[:, j] = U * (diag_D .* raw_samples[j, :])
+            end
+        else # :cholesky or :cholesky_sparse
+            F = spec.hyper.cholesky_factor
+            for j in 1:n_samples
+                latent_field_raw = F.L' \ raw_samples[j, :]
+                latent_field_raw .-= mean(latent_field_raw)
+                effect_k[:, j] = latent_field_raw .* sigma_samples[j]
+            end
         end
         
         s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
@@ -196,101 +259,3 @@ function get_effects(
     
     return (structured=structured_effects, noisy=structured_effects)
 end
-
-
-
-
-function adjacency_to_bipartite(W::AbstractMatrix; force_bipartite::Bool=true)
-    # # Process: Translates a unipartite graph into a bipartite representation.
-    # # Rationale: Required for models like BCGN that operate on inter-set connectivity.
-    
-    rows, cols = size(W)
-    if rows != cols
-        error("Input matrix must be square to represent a unipartite adjacency structure.")
-    end
-    
-    n = rows
-    g = SimpleGraph(W)
-    
-    # # Coloring Algorithm: Attempt to find a natural 2-coloring (bipartition)
-    # # nodes are assigned to set 0 or set 1
-    colors = fill(-1, n)
-    is_bipartite = true
-    
-    for start_node in 1:n
-        if colors[start_node] != -1
-            continue
-        end
-        
-        colors[start_node] = 0
-        queue = [start_node]
-        
-        while !isempty(queue)
-            u = popfirst!(queue)
-            for v in Neighbors(g, u)
-                if colors[v] == -1
-                    colors[v] = 1 - colors[u]
-                    push!(queue, v)
-                elseif colors[v] == colors[u]
-                    is_bipartite = false
-                    if !force_bipartite
-                        error("Graph is not bipartite and force_bipartite is false.")
-                    end
-                end
-            end
-        end
-    end
-    
-    # # Fallback: If not bipartite, use a greedy degree-based partition to maximize cut
-    if !is_bipartite
-        @warn "Graph is not naturally bipartite. Applying greedy partitioning to maximize inter-set edges."
-        colors = fill(0, n)
-        node_degrees = degree(g)
-        sorted_nodes = sortperm(node_degrees, rev=true)
-        
-        for u in sorted_nodes
-            # # Count neighbors already in set 0 and set 1
-            n0 = 0
-            n1 = 0
-            for v in Neighbors(g, u)
-                if colors[v] == 0
-                    n0 += 1
-                else
-                    n1 += 1
-                end
-            end
-            # # Assign to the set that maximizes connections to the other set
-            colors[u] = n0 >= n1 ? 1 : 0
-        end
-    end
-    
-    # # Extraction: Construct the bipartite matrix B
-    set1_indices = findall(==(0), colors)
-    set2_indices = findall(==(1), colors)
-    
-    n1 = length(set1_indices)
-    n2 = length(set2_indices)
-    
-    if n1 == 0 || n2 == 0
-        error("Partitioning failed to create two non-empty sets. Check graph connectivity.")
-    end
-    
-    # # B is n1 x n2 matrix representing connections from Set 1 to Set 2
-    B = spzeros(Float64, n1, n2)
-    
-    for (i, u) in enumerate(set1_indices)
-        for (j, v) in enumerate(set2_indices)
-            if W[u, v] > 0
-                B[i, j] = Float64(W[u, v])
-            end
-        end
-    end
-    
-    return (
-        bipartite_adj = B,
-        set1 = set1_indices,
-        set2 = set2_indices,
-        is_natural = is_bipartite
-    )
-end
-

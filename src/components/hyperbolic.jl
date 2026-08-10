@@ -1,4 +1,3 @@
-
 """
     Hyperbolic <: ComponentModel
 
@@ -7,7 +6,7 @@ disk). This is useful for modeling data with hierarchical or tree-like structure
 where Euclidean distance is not an appropriate metric.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 The component models a latent field \$f(x)\$ as a draw from a Gaussian Process with
@@ -17,20 +16,12 @@ where \$d_h(x, x')\$ is the geodesic distance between points \$x\$ and \$x'\$ in
 Poincaré disk model of hyperbolic space. The distance is given by:
 \$d_h(u, v) = \\text{arccosh} \\left( 1 + 2 \\frac{\\|u-v\\|^2}{(1-\\|u\\|^2)(1-\\|v\\|^2)} \\right)\$
 The kernel is a standard squared exponential kernel applied to this distance:
-\$k(d_h) = \\sigma^2 \\exp\\left(-\frac{d_h^2}{2\\ell^2}\\right)\$
-In this implementation, the lengthscale \$\\ell\$ is implicitly tied to the space's
-curvature, \$\\ell = \\sqrt{-\\text{curvature}}\$.
+\$k(d_h) = \\sigma^2 \\exp\\left(-\\frac{d_h^2}{2\\ell^2}\\right)\$
 
 # Assumptions
 - The input coordinates are 2-dimensional and lie within the unit disk. The
   component will automatically scale coordinates to fit if they are outside.
 - The underlying process is stationary in the hyperbolic space.
-
-# Best Use Case
-Modeling hierarchical data, such as taxonomies, social networks, or phylogenetic
-trees, where the notion of distance is non-Euclidean. It is also useful for data
-where correlation decays based on path-like or tree-like structures rather than
-straight-line distance.
 
 # Key References
 - Nickel, M., & Kiela, D. (2017). *Poincaré Embeddings for Learning Hierarchical
@@ -40,21 +31,31 @@ straight-line distance.
 - Wikipedia: Poincaré disk model
 
 # Fields
-- `curvature::Float64`: The curvature of the hyperbolic space (must be negative).
+- `curvature::Union{Float64, Distribution}`: The curvature of the hyperbolic space
+  (must be negative). Can be fixed or a random variable with a prior.
+- `lengthscale::Distribution`: The prior for the kernel lengthscale.
 - `sigma::Distribution`: The prior for the marginal standard deviation of the GP.
+- `method::Symbol`: The parameterization method. Can be `:noncentered` (default)
+  or `:centered` (didactic alternative).
 """
 struct Hyperbolic <: ComponentModel
-    curvature::Float64
+    curvature::Union{Float64, Distribution}
+    lengthscale::Distribution
     sigma::Distribution
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:hyperbolic] = Hyperbolic
 
 COMPONENT_CONSTRUCTORS[:hyperbolic] = (p, params) -> Hyperbolic(
-    get(params, :curvature, -1.0), p.sigma
+    get(params, :curvature, -1.0),
+    p.lengthscale,
+    p.sigma,
+    get(params, :method, :noncentered)
 )
 
 MODEL_TO_STRUCTURE_MAP[:hyperbolic] = :smooth
+
 
 """
     get_datastructures!(m_type::Type{<:Hyperbolic}, M::Dict, mod_data::Dict)::Bool
@@ -115,11 +116,12 @@ function get_precomputes(m::Hyperbolic, M::NamedTuple, mod_data::Dict)::NamedTup
     return (coords=coords, n_latent=n_latent)
 end
 
+
 """
     get_priors(m::Hyperbolic, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for the `Hyperbolic` component's priors.
-It defines the priors for `sigma` and the `raw` latent field.
+Generates priors for `sigma`, `lengthscale`, and optionally `curvature`.
+For the `:noncentered` method, it also defines a prior for the `raw` innovations.
 """
 function get_priors(
     m::Hyperbolic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -127,28 +129,32 @@ function get_priors(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    sigma_prior_str = _distribution_to_string(m.sigma)
-    
-    return """
-        $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.raw) ~ MvNormal(
-            zeros(T, spec_registry[:$(spec.key)].precomputes.n_latent), I
-        )
-    """
+    priors = String[]
+    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(p_names.ls) ~ $(_distribution_to_string(m.lengthscale))")
+
+    if m.curvature isa Distribution
+        push!(priors, "$(p_names.curvature) ~ $(_distribution_to_string(m.curvature))")
+    end
+
+    if m.method == :noncentered
+        push!(priors, "$(p_names.raw) ~ MvNormal(zeros(spec.precomputes.n_latent), I)")
+    end
+
+    return join(priors, "\n    ")
 end
 
-"""
-    evaluate_hyperbolic_kernel_matrix(coords, sigma, curvature, noise)
 
-A helper function to compute the kernel matrix based on hyperbolic distances in
-the Poincaré disk. This function is intended to be available in the model's
-execution scope.
+"""
+    evaluate_hyperbolic_kernel_matrix(coords, sigma, curvature, lengthscale, noise)
+
+A helper function to compute the kernel matrix based on hyperbolic distances.
 """
 function evaluate_hyperbolic_kernel_matrix(
-    coords::AbstractMatrix, sigma::Real, curvature::Real, noise::Real
+    coords::AbstractMatrix, sigma::Real, curvature::Real, lengthscale::Real, noise::Real
 )
     n = size(coords, 1)
-    T = promote_type(eltype(coords), typeof(sigma), typeof(curvature), typeof(noise))
+    T = promote_type(eltype(coords), typeof(sigma), typeof(curvature), typeof(lengthscale), typeof(noise))
     K = zeros(T, n, n)
     
     norms_sq = sum(coords.^2, dims=2)
@@ -163,14 +169,10 @@ function evaluate_hyperbolic_kernel_matrix(
             
             dist_poincare = acosh(arg_acosh)
             
-            dist_hyperbolic = dist_poincare / sqrt(max(-curvature, 1e-9))
-            
-            kernel_val = sigma^2 * exp(-0.5 * dist_hyperbolic^2)
+            kernel_val = sigma^2 * exp(-0.5 * (dist_poincare / lengthscale)^2)
             
             K[i, j] = kernel_val
-            if i != j
-                K[j, i] = kernel_val
-            end
+            if i != j; K[j, i] = kernel_val; end
         end
     end
     
@@ -178,11 +180,12 @@ function evaluate_hyperbolic_kernel_matrix(
     return K
 end
 
+
 """
     get_updates(m::Hyperbolic, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for constructing the `Hyperbolic` GP effect.
-It calls a helper function to compute the hyperbolic kernel matrix.
+Generates code to construct the Hyperbolic GP effect. Supports `:noncentered`
+(default) and `:centered` parameterizations.
 """
 function get_updates(
     m::Hyperbolic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -191,28 +194,49 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    return """
-        # --- Hyperbolic GP Component: $(spec.key) ---
+    curvature_val = m.curvature isa Distribution ? string(p_names.curvature) : string(m.curvature)
+
+    common_code = """
+        local coords = spec_registry[:$(spec.key)].precomputes.coords
+        local K = evaluate_hyperbolic_kernel_matrix(
+            coords, $(p_names.sigma), $(curvature_val), $(p_names.ls), M.noise
+        )
+    """
+
+    noncentered_code = """
+        # --- Hyperbolic GP (Non-Centered): $(spec.key) ---
         let
-            local coords = spec_registry[:$(spec.key)].precomputes.coords
-            local curvature = $(m.curvature)
-            
-            local K = evaluate_hyperbolic_kernel_matrix(
-                coords, $(p_names.sigma), curvature, M.noise
-            )
-            
+            $(common_code)
             local F = cholesky(Symmetric(K))
-            local $(p_names.latent) = F.L * $(p_names.raw)
-            
+            $(p_names.latent) = F.L * $(p_names.raw)
             $(eta_target) .+= $(p_names.latent)
         end
     """
+
+    centered_code = """
+        # --- Hyperbolic GP (Centered): $(spec.key) ---
+        let
+            $(common_code)
+            $(p_names.latent) ~ MvNormal(zeros(size(K, 1)), Symmetric(K))
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    if m.method == :noncentered
+        return noncentered_code
+    elseif m.method == :centered
+        return centered_code
+    else
+        error("Unsupported method '$(m.method)' for Hyperbolic component.")
+    end
 end
+
 
 """
     get_effects(m::Hyperbolic, chain, M::NamedTuple, ...)
 
-Reconstructs the `Hyperbolic` GP effect from the MCMC chain's posterior samples.
+Reconstructs the `Hyperbolic` GP effect from posterior samples, dispatching
+on the method used during sampling.
 """
 function get_effects(
     m::Hyperbolic, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -227,36 +251,50 @@ function get_effects(
     else
         coords_train
     end
+    n_obs_train = size(coords_train, 1)
     n_obs_full = size(coords_full, 1)
     
     noise = M.noise
-    curvature = m.curvature
 
     for k in 1:outcomes_N
         p_names = generate_full_variable_names(spec, M.model_arch, k)
         
         sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        raw_samples = get_params_vector(
-            chain, string(p_names.raw), spec.precomputes.n_latent
-        )
+        ls_samples = get_params_vector(chain, string(p_names.ls), 1)[:, 1]
+        curvature_samples = if m.curvature isa Distribution
+            get_params_vector(chain, string(p_names.curvature), 1)[:, 1]
+        else
+            fill(m.curvature, n_samples)
+        end
 
         effect_k = zeros(Float64, n_obs_full, n_samples)
 
-        for i in 1:n_samples
-            current_sigma = sigma_samples[i]
-            
-            K = evaluate_hyperbolic_kernel_matrix(
-                coords_full, current_sigma, curvature, noise
-            )
-            F = cholesky(Symmetric(K))
-            
-            raw_i = if size(raw_samples, 2) == n_obs_full
-                raw_samples[i, :]
-            else
-                vcat(raw_samples[i, :], randn(n_obs_full - size(raw_samples, 2)))
+        if m.method == :noncentered
+            raw_samples = get_params_vector(chain, string(p_names.raw), n_obs_train)
+            for i in 1:n_samples
+                K = evaluate_hyperbolic_kernel_matrix(coords_full, sigma_samples[i], curvature_samples[i], ls_samples[i], noise)
+                F = cholesky(Symmetric(K))
+                raw_i = vcat(raw_samples[i, :], randn(n_obs_full - n_obs_train))
+                effect_k[:, i] = F.L * raw_i
             end
-            
-            effect_k[:, i] = F.L * raw_i
+        else # :centered
+            latent_samples = get_params_vector(chain, string(p_names.latent), n_obs_train)
+            for i in 1:n_samples
+                effect_k[1:n_obs_train, i] = latent_samples[i, :]
+                if n_obs_full > n_obs_train
+                    coords_pred = coords_full[(n_obs_train+1):end, :]
+                    K_ff = evaluate_hyperbolic_kernel_matrix(coords_train, sigma_samples[i], curvature_samples[i], ls_samples[i], noise)
+                    K_star_f = evaluate_cross_hyperbolic_kernel_matrix(coords_pred, coords_train, sigma_samples[i], curvature_samples[i], ls_samples[i])
+                    K_star_star = evaluate_hyperbolic_kernel_matrix(coords_pred, sigma_samples[i], curvature_samples[i], ls_samples[i], noise)
+                    
+                    L_ff = cholesky(Symmetric(K_ff)).L
+                    A = L_ff' \ (L_ff \ K_star_f')
+                    mu_pred = A' * latent_samples[i, :]
+                    Sigma_pred = K_star_star - K_star_f * A
+                    
+                    effect_k[(n_obs_train+1):end, i] = rand(MvNormal(mu_pred, Symmetric(Sigma_pred)))
+                end
+            end
         end
         push!(structured_effects, effect_k)
     end

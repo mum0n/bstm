@@ -1,4 +1,3 @@
-
 """
     SciML <: ComponentModel
 
@@ -7,39 +6,23 @@ ecosystem into a Bayesian framework. It allows for the estimation of differentia
 equation parameters and initial conditions.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 This component models an observed process \$y(t)\$ as noisy observations of a latent
 state vector \$\\mathbf{u}(t)\$, where \$\\mathbf{u}(t)\$ is the solution to a system of
-differential equations. The general form of the system is:
+differential equations:
 \$ \\frac{d\\mathbf{u}}{dt} = f(\\mathbf{u}, \\mathbf{p}, t) \$
 where \$\\mathbf{p}\$ is a vector of parameters and \$\\mathbf{u}(t_0) = \\mathbf{u}_0\$ are the
 initial conditions.
 
-The `SciML` component allows for Bayesian inference on the parameters \$\\mathbf{p}\$ and/or
-the initial conditions \$\\mathbf{u}_0\$ by defining priors on them and solving the
-differential equation within the model's generative process. The model supports
-Ordinary (ODE), Stochastic (SDE), and Delay (DDE) differential equations.
-
-# Assumptions
-- The user provides a well-defined function for the differential equation system
-  that is compatible with the SciML interface.
-- The observation times are provided as a continuous variable.
-
-# Best Use Case
-Modeling dynamic systems where the underlying mechanism is described by differential
-equations. Examples include pharmacokinetic models, epidemiological models (e.g., SIR,
-SEIR), systems biology, and chemical kinetics.
-
-# Key References
-- Rackauckas, C., & Nie, Q. (2017). *DifferentialEquations.jl – A Performant and
-  Feature-Rich Ecosystem for Solving Differential Equations in Julia*. Journal of
-  Open Research Software, 5(1).
-- Ramsay, J. O., Hooker, G., Campbell, D., & Cao, J. (2007). *Parameter estimation
-  for differential equations: a generalized smoothing approach*. Journal of the
-  Royal Statistical Society: Series B (Statistical Methodology), 69(5), 741-796.
-- Wikipedia: System identification
+# Likelihood Types
+- `:additive` (default): The solution of the DE is treated as an additive component
+  in the model's linear predictor, \$\\eta = \\dots + \\mathbf{u}(t)\$. This is for
+  when the DE models one of several influential processes.
+- `:direct`: The solution of the DE is assumed to be the mean of the observation
+  model directly, \$\\mu = \\mathbf{u}(t)\$. This is for when the DE is the complete
+  generative model for the data.
 
 # Fields
 - `model_func::Symbol`: The name of the user-defined function that specifies the
@@ -49,6 +32,7 @@ SEIR), systems biology, and chemical kinetics.
   are their prior distributions.
 - `de_type::Symbol`: The type of differential equation: `:ODE`, `:SDE`, `:DDE`, or `:Jump`.
 - `de_kwargs::Dict{Symbol, Any}`: Keyword arguments for the `DEProblem` constructor.
+- `likelihood_type::Symbol`: The likelihood evaluation method, `:additive` or `:direct`.
 """
 struct SciML <: ComponentModel
     model_func::Symbol
@@ -56,26 +40,24 @@ struct SciML <: ComponentModel
     p_priors::NamedTuple
     de_type::Symbol
     de_kwargs::Dict{Symbol, Any}
+    likelihood_type::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:sciml] = SciML
 
 COMPONENT_CONSTRUCTORS[:sciml] = (p, params) -> begin
-    # Priors are not used here; they are resolved in the main config.
-    # This constructor just populates the struct from parsed formula arguments.
     model_func = get(params, :model_func, error("SciML requires a `model_func` parameter."))
     u0_prior = get(params, :u0_prior, error("SciML requires a `u0_prior` parameter."))
     p_priors = get(params, :p_priors, error("SciML requires a `p_priors` parameter."))
     de_type = get(params, :de_type, :ODE)
+    likelihood_type = get(params, :likelihood_type, :additive)
     
     de_kwargs = Dict{Symbol, Any}()
     for key in [:constant_lags, :saveat, :h, :noise_func]
-        if haskey(params, key)
-            de_kwargs[key] = params[key]
-        end
+        if haskey(params, key); de_kwargs[key] = params[key]; end
     end
 
-    SciML(model_func, u0_prior, p_priors, de_type, de_kwargs)
+    SciML(model_func, u0_prior, p_priors, de_type, de_kwargs, likelihood_type)
 end
 
 MODEL_TO_STRUCTURE_MAP[:sciml] = :temporal
@@ -194,7 +176,8 @@ end
 """
     get_updates(m::SciML, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code for solving the SciML problem and updating `eta`.
+Generates the Turing code for solving the SciML problem, dispatching on the chosen
+`likelihood_type`.
 """
 function get_updates(
     m::SciML, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -208,25 +191,61 @@ function get_updates(
     p_vars = [Symbol("$(p_names.latent)_p_$(p)") for p in param_names]
     p_tuple_str = "local p_$(spec.key) = ($(join(p_vars, ", ")),)"
 
-    return """
-        # --- SciML component assembly: $(spec.key) ---
+    common_solve_code = """
+        $(p_tuple_str)
+        local prob_$(spec.key) = remake(
+            M.sciml_problem_templates[:$(spec.key)]; u0=$(u0_name), p=p_$(spec.key)
+        )
+        local sol_$(spec.key) = solve(
+            prob_$(spec.key), M.sciml_solver; saveat=M.sciml_saveat
+        )
+        
+        if !SciMLBase.successful_retcode(sol_$(spec.key))
+            Turing.@addlogprob! -Inf
+            return
+        end
+        
+        # Interpolate solution to observation time points
+        local sciml_effect_$(spec.key) = sol_$(spec.key)(M.t_coords)
+    """
+
+    additive_code = """
+        # --- SciML Component (Additive): $(spec.key) ---
         let
-            $(p_tuple_str)
-            local prob_$(spec.key) = remake(M.sciml_problem_templates[:$(spec.key)]; u0=$(u0_name), p=p_$(spec.key))
-            local sol_$(spec.key) = solve(prob_$(spec.key), M.sciml_solver; saveat=M.sciml_saveat)
-            
-            if !SciMLBase.successful_retcode(sol_$(spec.key))
-                Turing.@addlogprob! -Inf
-                return
-            end
-            
-            # Interpolate solution to observation time points
-            local sciml_effect_$(spec.key) = sol_$(spec.key)(M.t_coords)
-            
+            $(common_solve_code)
             # Add the first state variable's effect to the linear predictor
             $(eta_target) .+= sciml_effect_$(spec.key)[1,:]
         end
     """
+
+    direct_code = """
+        # --- SciML Component (Direct Likelihood): $(spec.key) ---
+        let
+            $(common_solve_code)
+            
+            # The solution is the mean of the observation model.
+            local mu = sciml_effect_$(spec.key)
+            
+            # Evaluate the likelihood directly.
+            # This assumes a Gaussian likelihood for simplicity.
+            # A more advanced version could inspect M.likelihood_specs.
+            y_sigma ~ Exponential(1.0)
+            for i in 1:M.y_N
+                Turing.@addlogprob! logpdf(Normal(mu[1, i], y_sigma), M.y_obs[i])
+            end
+            
+            # Signal to the assembler that the likelihood has been handled.
+            M[:likelihood_handled] = true
+        end
+    """
+
+    if m.likelihood_type == :additive
+        return additive_code
+    elseif m.likelihood_type == :direct
+        return direct_code
+    else
+        error("Unsupported `likelihood_type`: $(m.likelihood_type)")
+    end
 end
 
 """

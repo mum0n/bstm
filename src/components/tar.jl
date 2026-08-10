@@ -7,7 +7,7 @@ processes based on whether an external `threshold_var` is above or below a
 learned threshold.
 
 # Version
-v1.0.1 (2026-08-09)
+v1.0.2 (2026-08-10)
 
 # Mathematical Summary
 A TAR model defines a time series where the parameters of the autoregressive
@@ -21,33 +21,26 @@ where:
 - \$\\epsilon_{1,t} \\sim \\mathcal{N}(0, \\sigma_1^2)\$ and \$\\epsilon_{2,t} \\sim \\mathcal{N}(0, \\sigma_2^2)\$ are the innovation terms for each regime.
 - \$c\$ is the threshold value, which is learned from the data.
 
-This implementation uses a non-centered parameterization. The `rho` parameters are
-sampled on an unbounded scale and transformed with `tanh` to ensure stationarity.
-The `sigma` parameters are sampled on the log scale and transformed with `exp` to
-ensure positivity.
-
-# Best Use Case
-Modeling time series that exhibit different dynamic behaviors under different
-conditions, such as economic data that behaves differently during expansions vs.
-recessions, or ecological populations that have different dynamics in high vs.
-low resource environments.
-
-# Key References
-- Tong, H. (1978). On a threshold model. In *Pattern Recognition and Signal
-  Processing* (pp. 575-586). Sijthoff & Noordhoff.
-- Wikipedia: Threshold autoregressive model.
+# Computational Methods
+- `:statespace` (default): An efficient, non-centered parameterization that samples
+  unconstrained parameters and transforms them to ensure stationarity (`tanh` for
+  `rho`) and positivity (`exp` for `sigma`). Recommended for AD.
+- `:statespace_constrained` (didactic): A more direct parameterization that samples
+  `rho` and `sigma` from their specified (and appropriately constrained) priors.
 
 # Fields
 - `threshold_var::Symbol`: The variable used for thresholding.
-- `log_rho_regimes::Vector{<:UnivariateDistribution}`: Priors for the AR(1)
-  parameter `rho` in each regime, on an unbounded scale (for `tanh` transform).
-- `log_sigma_regimes::Vector{<:UnivariateDistribution}`: Priors for the innovation
-  std. dev. `sigma` in each regime, on the log scale (for `exp` transform).
+- `rho_regimes::Vector{<:UnivariateDistribution}`: Priors for the AR(1) parameter
+  `rho` in each regime. Priors should be constrained to `(-1, 1)`.
+- `sigma_regimes::Vector{<:UnivariateDistribution}`: Priors for the innovation
+  std. dev. `sigma` in each regime. Priors should be positive.
+- `method::Symbol`: The computational method, `:statespace` or `:statespace_constrained`.
 """
 struct TAR <: ComponentModel
     threshold_var::Symbol
-    log_rho_regimes::Vector{<:UnivariateDistribution}
-    log_sigma_regimes::Vector{<:UnivariateDistribution}
+    rho_regimes::Vector{<:UnivariateDistribution}
+    sigma_regimes::Vector{<:UnivariateDistribution}
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:tar] = TAR
@@ -55,17 +48,19 @@ COMPONENT_TYPE_REGISTRY[:tar] = TAR
 COMPONENT_CONSTRUCTORS[:tar] = (p, params) -> begin
     threshold_var = get(params, :threshold_var, error("TAR model requires a `threshold_var` parameter."))
     
-    log_rho_regimes = get(params, :log_rho_regimes, [Normal(0, 1.5), Normal(0, 1.5)])
-    log_sigma_regimes = get(params, :log_sigma_regimes, [Normal(0, 1.0), Normal(0, 1.0)])
+    # User provides priors on the natural scale.
+    rho_regimes = get(params, :rho_regimes, [truncated(Normal(0, 0.5), -1, 1), truncated(Normal(0, 0.5), -1, 1)])
+    sigma_regimes = get(params, :sigma_regimes, [Exponential(1.0), Exponential(1.0)])
+    method = get(params, :method, :statespace)
     
-    if !(log_rho_regimes isa Vector && length(log_rho_regimes) == 2)
-        error("`log_rho_regimes` for TAR model must be a Vector of two Distributions.")
+    if !(rho_regimes isa Vector && length(rho_regimes) == 2)
+        error("`rho_regimes` for TAR model must be a Vector of two Distributions.")
     end
-    if !(log_sigma_regimes isa Vector && length(log_sigma_regimes) == 2)
-        error("`log_sigma_regimes` for TAR model must be a Vector of two Distributions.")
+    if !(sigma_regimes isa Vector && length(sigma_regimes) == 2)
+        error("`sigma_regimes` for TAR model must be a Vector of two Distributions.")
     end
 
-    TAR(threshold_var, log_rho_regimes, log_sigma_regimes)
+    TAR(threshold_var, rho_regimes, sigma_regimes, method)
 end
 
 MODEL_TO_STRUCTURE_MAP[:tar] = :temporal
@@ -127,75 +122,105 @@ function get_precomputes(m::TAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     return (threshold_data=threshold_data_per_t,)
 end
 
+
 """
     get_priors(m::TAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates priors for the log-transformed `rho` and `sigma` for each regime,
-the raw threshold parameter, and the standard normal innovations.
+Generates priors for the TAR component, dispatching on the chosen method.
 """
-function get_priors(m::TAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
+function get_priors(
+    m::TAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    log_rho1_name = Symbol("$(p_names.rho)_1_log")
-    log_rho2_name = Symbol("$(p_names.rho)_2_log")
-    log_sigma1_name = Symbol("$(p_names.sigma)_1_log")
-    log_sigma2_name = Symbol("$(p_names.sigma)_2_log")
-
     priors = String[]
-    push!(priors, "$(log_rho1_name) ~ $(_distribution_to_string(m.log_rho_regimes[1]))")
-    push!(priors, "$(log_rho2_name) ~ $(_distribution_to_string(m.log_rho_regimes[2]))")
-    push!(priors, "$(log_sigma1_name) ~ $(_distribution_to_string(m.log_sigma_regimes[1]))")
-    push!(priors, "$(log_sigma2_name) ~ $(_distribution_to_string(m.log_sigma_regimes[2]))")
     push!(priors, "$(p_names.thresh_raw) ~ Normal(0.0, 1.0)")
     push!(priors, "$(p_names.innov) ~ MvNormal(zeros(M.t_N), I)")
+
+    if m.method == :statespace
+        # Priors on unconstrained "raw" parameters for the AD-friendly method.
+        push!(priors, "$(p_names.rho)_1_raw ~ Normal(0, 1.5)")
+        push!(priors, "$(p_names.rho)_2_raw ~ Normal(0, 1.5)")
+        push!(priors, "$(p_names.sigma)_1_raw ~ Normal(0, 1.0)")
+        push!(priors, "$(p_names.sigma)_2_raw ~ Normal(0, 1.0)")
+    else # :statespace_constrained
+        # Priors directly on the constrained parameters for the didactic method.
+        push!(priors, "$(p_names.rho)_1 ~ $(_distribution_to_string(m.rho_regimes[1]))")
+        push!(priors, "$(p_names.rho)_2 ~ $(_distribution_to_string(m.rho_regimes[2]))")
+        push!(priors, "$(p_names.sigma)_1 ~ $(_distribution_to_string(m.sigma_regimes[1]))")
+        push!(priors, "$(p_names.sigma)_2 ~ $(_distribution_to_string(m.sigma_regimes[2]))")
+    end
 
     return join(priors, "\n    ")
 end
 
+
 """
     get_updates(m::TAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates code to construct the TAR effect by applying regime-switching AR(1)
-logic and adds the result to the linear predictor `eta`.
+Generates code to construct the TAR effect, dispatching on the chosen method.
 """
-function get_updates(m::TAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
+function get_updates(
+    m::TAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    log_rho1_name = Symbol("$(p_names.rho)_1_log")
-    log_rho2_name = Symbol("$(p_names.rho)_2_log")
-    log_sigma1_name = Symbol("$(p_names.sigma)_1_log")
-    log_sigma2_name = Symbol("$(p_names.sigma)_2_log")
+    local param_definitions
+    if m.method == :statespace
+        param_definitions = """
+            local rho1 = tanh($(p_names.rho)_1_raw)
+            local rho2 = tanh($(p_names.rho)_2_raw)
+            local sigma1 = exp($(p_names.sigma)_1_raw)
+            local sigma2 = exp($(p_names.sigma)_2_raw)
+        """
+    else # :statespace_constrained
+        param_definitions = """
+            local rho1 = $(p_names.rho)_1
+            local rho2 = $(p_names.rho)_2
+            local sigma1 = $(p_names.sigma)_1
+            local sigma2 = $(p_names.sigma)_2
+        """
+    end
 
     return """
-        # --- TAR Component: $(spec.key) ---
-        local threshold_level = mean(spec.hyper.threshold_data) + $(p_names.thresh_raw)
-        local innovations = $(p_names.innov)
-        
-        local latent_field = Vector{eltype(innovations)}(undef, M.t_N)
-        
-        for t in 1:M.t_N
-            local regime_indicator = spec.hyper.threshold_data[t] > threshold_level
-            local curr_rho = tanh(regime_indicator ? $(log_rho2_name) : $(log_rho1_name))
-            local curr_sigma = exp(regime_indicator ? $(log_sigma2_name) : $(log_sigma1_name))
+        # --- TAR Component: $(spec.key) ($(m.method)) ---
+        let
+            $(param_definitions)
+            local threshold_level = mean(spec.hyper.threshold_data) + $(p_names.thresh_raw)
+            local innovations = $(p_names.innov)
+            
+            local latent_field = Vector{eltype(innovations)}(undef, M.t_N)
+            
+            for t in 1:M.t_N
+                local regime_indicator = spec.hyper.threshold_data[t] > threshold_level
+                local curr_rho = regime_indicator ? rho2 : rho1
+                local curr_sigma = regime_indicator ? sigma2 : sigma1
 
-            if t == 1
-                latent_field[t] = (innovations[t] * curr_sigma) / sqrt(1.0 - curr_rho^2 + M.noise)
-            else
-                latent_field[t] = curr_rho * latent_field[t-1] + innovations[t] * curr_sigma
+                if t == 1
+                    latent_field[t] = (innovations[t] * curr_sigma) / sqrt(1.0 - curr_rho^2 + M.noise)
+                else
+                    latent_field[t] = curr_rho * latent_field[t-1] + innovations[t] * curr_sigma
+                end
             end
+            $(p_names.latent) = latent_field
+            $(eta_target) .+= view($(p_names.latent), M.t_idx)
         end
-        $(p_names.latent) = latent_field
-        $(eta_target) .+= view($(p_names.latent), M.t_idx)
     """
 end
 
 """
     get_effects(m::TAR, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
 
-Reconstructs the TAR component's effect from posterior samples.
+Reconstructs the TAR component's effect from posterior samples, dispatching on
+the method used during sampling.
 """
-function get_effects(m::TAR, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
+function get_effects(
+    m::TAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
     t_N_train = M.t_N
@@ -204,28 +229,33 @@ function get_effects(m::TAR, chain, M, n_samples, outcomes_N, p_names, spec, PS,
 
     threshold_data_train = spec.hyper.threshold_data
     threshold_data_full = if !isnothing(PS) && hasproperty(PS.data, m.threshold_var)
-        # This assumes prediction data has the same temporal resolution as training data.
-        # A more robust implementation might require interpolation.
         pred_threshold_data = PS.data[!, m.threshold_var]
-        # This simple vcat assumes PS.data is ordered by time.
-        vcat(threshold_data_train, pred_threshold_data[1:(t_N_full - t_N_train)])
+        vcat(threshold_data_train, pred_threshold_data[1:min(length(pred_threshold_data), t_N_full - t_N_train)])
     else
         threshold_data_train
+    end
+    if length(threshold_data_full) < t_N_full
+        threshold_data_full = vcat(threshold_data_full, fill(mean(threshold_data_train), t_N_full - length(threshold_data_full)))
     end
 
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
-        log_rho1_name = Symbol("$(v.rho)_1_log")
-        log_rho2_name = Symbol("$(v.rho)_2_log")
-        log_sigma1_name = Symbol("$(v.sigma)_1_log")
-        log_sigma2_name = Symbol("$(v.sigma)_2_log")
-
+        
         thresh_raw_samples = get_params_vector(chain, string(v.thresh_raw), 1)
         innov_samples = get_params_vector(chain, string(v.innov), t_N_train)
-        log_rho1_samples = get_params_vector(chain, string(log_rho1_name), 1)
-        log_rho2_samples = get_params_vector(chain, string(log_rho2_name), 1)
-        log_sigma1_samples = get_params_vector(chain, string(log_sigma1_name), 1)
-        log_sigma2_samples = get_params_vector(chain, string(log_sigma2_name), 1)
+        
+        local rho1_samples, rho2_samples, sigma1_samples, sigma2_samples
+        if m.method == :statespace
+            rho1_samples = tanh.(get_params_vector(chain, string(v.rho, "_1_raw"), 1))
+            rho2_samples = tanh.(get_params_vector(chain, string(v.rho, "_2_raw"), 1))
+            sigma1_samples = exp.(get_params_vector(chain, string(v.sigma, "_1_raw"), 1))
+            sigma2_samples = exp.(get_params_vector(chain, string(v.sigma, "_2_raw"), 1))
+        else # :statespace_constrained
+            rho1_samples = get_params_vector(chain, string(v.rho, "_1"), 1)
+            rho2_samples = get_params_vector(chain, string(v.rho, "_2"), 1)
+            sigma1_samples = get_params_vector(chain, string(v.sigma, "_1"), 1)
+            sigma2_samples = get_params_vector(chain, string(v.sigma, "_2"), 1)
+        end
 
         effect_k = zeros(Float64, N_total, n_samples)
         mean_thresh_data = mean(threshold_data_train)
@@ -233,17 +263,13 @@ function get_effects(m::TAR, chain, M, n_samples, outcomes_N, p_names, spec, PS,
 
         for s in 1:n_samples
             threshold_level = mean_thresh_data + thresh_raw_samples[s, 1]
-            
-            # Combine training innovations with new random innovations for prediction period
             innov_full = vcat(innov_samples[s, :], randn(t_N_full - t_N_train))
-            
             latent_field_s = zeros(Float64, t_N_full)
 
             for t in 1:t_N_full
                 regime_indicator = threshold_data_full[t] > threshold_level
-                
-                curr_rho = tanh(regime_indicator ? log_rho2_samples[s, 1] : log_rho1_samples[s, 1])
-                curr_sigma = exp(regime_indicator ? log_sigma2_samples[s, 1] : log_sigma1_samples[s, 1])
+                curr_rho = regime_indicator ? rho2_samples[s, 1] : rho1_samples[s, 1]
+                curr_sigma = regime_indicator ? sigma2_samples[s, 1] : sigma1_samples[s, 1]
 
                 if t == 1
                     latent_field_s[t] = (innov_full[t] * curr_sigma) / sqrt(1.0 - curr_rho^2 + noise)

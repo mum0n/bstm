@@ -6,41 +6,23 @@ covariate to vary smoothly across space. It acts as an orchestrator, applying an
 spatial `ComponentModel` to a specified covariate.
 
 # Version
-v1.1.0 (2026-08-09)
+v1.1.1 (2026-08-10)
 
 # Mathematical Summary
 An SVC model replaces a fixed regression coefficient \$\\beta\$ with a spatially-indexed
-coefficient \$\\beta(s)\$, where \$s\$ denotes a spatial location. The contribution
-to the linear predictor \$\\eta\$ for an observation at location \$s_i\$ with
-covariate value \$x_i\$ is given by:
+coefficient \$\\beta(s)\$. The contribution to the linear predictor \$\\eta\$ for an
+observation at location \$s_i\$ with covariate value \$x_i\$ is given by:
 
 \$\\eta_i = \\dots + \\beta(s_i) x_i\$
 
 The spatially varying coefficient \$\\boldsymbol{\\beta} = (\\beta(s_1), \\dots, \\beta(s_{s_N}))\$
-is itself modeled as a latent Gaussian Process or Gaussian Markov Random Field (GMRF),
-governed by the `inner_model`. For example, if the inner model is an ICAR, then:
+is itself modeled as a latent Gaussian Process or GMRF, governed by the `inner_model`.
 
-\$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\tau \\mathbf{Q}_{ICAR})^{-1})\$
-
-This allows the model to learn how the influence of a covariate changes across the
-spatial domain.
-
-# Assumptions
-- The relationship between the covariate and the outcome is linear at any given
-  location, but the slope of that relationship can change from one location to another.
-- The spatial variation of the coefficient can be adequately captured by the
-  specified inner spatial model (e.g., ICAR, BYM2, GP).
-
-# Best Use Case
-Modeling relationships that are not constant across space. For example, the effect
-of temperature on species abundance may be stronger in some parts of a habitat
-than others. SVC models can capture these non-stationary relationships.
-
-# Key References
-- Gelfand, A. E., Kim, H. J., Sirmans, C. F., & Banerjee, S. (2003). Spatial
-  modeling with spatially varying coefficient processes. *Journal of the
-  American Statistical Association*, 98(462), 387-396.
-- Wikipedia: Geographically weighted regression (for a related concept).
+# Computational Methods
+The `SVC` component does not have its own methods. The computational method is
+determined by the `method` parameter of the inner spatial model. For example, to
+use a spectral decomposition for the spatially varying coefficient, you would specify:
+`... |> random(s_idx, model=icar, method=:spectral)`
 
 # Fields
 - `covariate::Symbol`: The symbol of the covariate whose coefficient varies over space.
@@ -54,8 +36,6 @@ end
 
 COMPONENT_TYPE_REGISTRY[:svc] = SVC
 
-# The constructor is called by `resolve_technical_primitive`, which resolves the
-# inner model object and passes it in the `params` dictionary.
 COMPONENT_CONSTRUCTORS[:svc] = (p, params) -> begin
     covariate = get(params, :covariate, error("SVC constructor requires a `covariate` parameter."))
     inner_model_obj = get(params, :inner_model_obj, error("SVC constructor requires an `inner_model_obj` parameter."))
@@ -160,12 +140,14 @@ end
 """
     get_updates(m::SVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates Turing code for the SVC component's effect.
-Delegates the construction of the spatially varying coefficient field to the inner
-model, and then multiplies this field by the specified covariate value for each
-observation before adding it to the linear predictor `eta`.
+Generates Turing code for the SVC component's effect. It delegates the construction
+of the spatially varying coefficient field to the inner model and then multiplies
+this field by the specified covariate value for each observation.
 """
-function get_updates(m::SVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
+function get_updates(
+    m::SVC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     cov_var = m.covariate
 
@@ -183,8 +165,13 @@ function get_updates(m::SVC, spec::NamedTuple, arch::String, outcome_idx, M)::St
     inner_p_names = generate_full_variable_names(inner_spec, arch, outcome_idx)
     inner_latent_var = inner_p_names.latent
 
-    effect_app_regex = Regex("$(eta_target) .*\\.=")
-    update_inner_cleaned = replace(inner_updates_code, effect_app_regex => "# (eta update handled by SVC)")
+    # The inner component's `get_updates` will generate code that includes adding
+    # its effect to `eta`. We must remove this part to prevent double-counting,
+    # as the SVC component applies the effect in its own way.
+    effect_app_regex = Regex("$(eta_target) \\.\\+= .*")
+    update_inner_cleaned = replace(
+        inner_updates_code, effect_app_regex => "# (eta update handled by SVC)"
+    )
 
     is_intercept = (cov_var == Symbol("1") || cov_var == :intercept)
     
@@ -205,13 +192,16 @@ function get_updates(m::SVC, spec::NamedTuple, arch::String, outcome_idx, M)::St
 end
 
 """
-    get_effects(m::SVC, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
+    get_effects(m::SVC, chain, M::NamedTuple, ...)
 
-Reconstructs the SVC component's effect from posteriors.
-Reconstructs the inner spatial field for each posterior sample and then multiplies
-it by the covariate values to get the final SVC effect for each observation.
+Reconstructs the SVC component's effect from posteriors. It reconstructs the inner
+spatial field for each posterior sample and then multiplies it by the covariate
+values to get the final SVC effect for each observation.
 """
-function get_effects(m::SVC, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
+function get_effects(
+    m::SVC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
     cov_var = m.covariate
     
     inner_spec_key = Symbol("$(spec.key)_inner")
@@ -224,8 +214,10 @@ function get_effects(m::SVC, chain, M, n_samples, outcomes_N, p_names, spec, PS,
         hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
     )
 
-    inner_p_names = generate_full_variable_names(inner_spec, M.model_arch, nothing)
-    inner_effects_result = get_effects(m.model, chain, M, n_samples, outcomes_N, inner_p_names, inner_spec, PS, N_total)
+    # Recursively call get_effects on the inner spatial model
+    inner_effects_result = get_effects(
+        m.model, chain, M, n_samples, outcomes_N, inner_spec, PS, N_total
+    )
     
     is_intercept = (cov_var == Symbol("1") || cov_var == :intercept)
     cov_data_full = if is_intercept
@@ -239,22 +231,16 @@ function get_effects(m::SVC, chain, M, n_samples, outcomes_N, p_names, spec, PS,
         end
     end
 
-    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
-        vcat(M.s_idx, PS.data[!, :s_idx])
-    else
-        M.s_idx
-    end
-
+    # The inner effect is already indexed to the observation level, so we just
+    # need to multiply it by the covariate.
     structured_effects = Vector{Matrix{Float64}}()
     for k in 1:outcomes_N
-        spatial_field_k = inner_effects_result.structured[k]
-        effect_k = zeros(Float64, N_total, n_samples)
-
-        for s in 1:n_samples
-            spatial_field_sample = view(spatial_field_k, :, s)
-            effect_k[:, s] = view(spatial_field_sample, s_idx_full) .* cov_data_full
-        end
-        push!(structured_effects, effect_k)
+        spatial_effect_k = inner_effects_result.structured[k]
+        
+        # Element-wise multiplication of the covariate and the spatial effect
+        final_effect_k = spatial_effect_k .* cov_data_full
+        
+        push!(structured_effects, final_effect_k)
     end
 
     return (structured=structured_effects, noisy=structured_effects)

@@ -7,7 +7,7 @@ space. The effect is a linear combination of these basis functions, with coeffic
 regularized by a random walk prior to ensure smoothness.
 
 # Version
-v1.0.1 (2026-08-09)
+v1.0.2 (2026-08-10)
 
 # Mathematical Summary
 A Thin Plate Spline models a function \$f(\\mathbf{x})\$ as a linear combination of
@@ -22,43 +22,34 @@ space \$\\mathbf{x}\$:
 - For odd \$d > 2\$, \$\\phi(r) = r^{2m-d}\$ (with \$m=2\$, this is \$r^{4-d}\$).
 - For even \$d > 2\$, \$\\phi(r) = r^{2m-d} \\log(r)\$.
 
-The coefficients \$\\boldsymbol{\\beta} = (\\beta_1, \\dots, \\beta_M)\$ are given a smoothing
-prior to regularize the function. This implementation uses a second-order random
-walk (RW2) prior as an approximation of the TPS penalty:
-
+The coefficients \$\\boldsymbol{\\beta}\$ are given a smoothing prior, typically a
+second-order random walk (RW2) prior:
 \$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\tau \\mathbf{Q}_{RW2})^{-1})\$
 
-# Distinction from other smoothers
-- **P-Splines**: Use a basis of B-spline functions, which are localized polynomials
-  with compact support. TPS basis functions have global support.
-- **Gaussian Processes**: Assume a global correlation structure defined by a kernel.
-  TPS can be shown to be equivalent to a GP with a specific non-stationary kernel.
-
-# Best Use Case
-Flexible, non-parametric smoothing for low-dimensional covariates (typically 1D, 2D,
-or 3D), especially for interpolating scattered data points. It is a classic choice
-for spatial smoothing when a GMRF on a lattice is not appropriate.
-
-# Key References
-- Duchon, J. (1977). Splines minimizing rotation-invariant semi-norms in Sobolev
-  spaces. In *Constructive Theory of Functions of Several Variables* (pp. 85-100).
-  Springer.
-- Wood, S. N. (2003). Thin plate regression splines. *Journal of the Royal
-  Statistical Society: Series B*, 65(1), 95-114.
-- Wikipedia: Thin plate spline
+# Computational Methods
+- `:spectral` (default): An efficient, AD-safe method using spectral decomposition.
+- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
+- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
+  factorization, suitable for gradient-free samplers.
 
 # Fields
 - `nbins::Int`: The number of knots (and basis functions) to use.
 - `sigma::Distribution`: The prior for the std. dev. of the TPS coefficients.
+- `method::Symbol`: The computational method for regularizing coefficients.
 """
 struct TPS <: ComponentModel
     nbins::Int
     sigma::Distribution
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:tps] = TPS
 
-COMPONENT_CONSTRUCTORS[:tps] = (p, params) -> TPS(get(params, :nbins, 20), p.sigma)
+COMPONENT_CONSTRUCTORS[:tps] = (p, params) -> TPS(
+    get(params, :nbins, 20),
+    p.sigma,
+    get(params, :method, :spectral)
+)
 
 MODEL_TO_STRUCTURE_MAP[:tps] = :smooth
 
@@ -84,11 +75,12 @@ function get_datastructures!(m_type::Type{<:TPS}, M::Dict, mod_data::Dict)::Bool
     return true
 end
 
+
 """
     get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Pre-computes knot locations, the radial basis function matrix, and the spectral
-decomposition of the penalty matrix for the TPS coefficients.
+Pre-computes knots, the basis matrix, the penalty matrix, and its spectral
+decomposition and dense Cholesky factorization.
 """
 function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
@@ -109,26 +101,11 @@ function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
 
     B = zeros(Float64, n_obs, n_latent)
     if n_dims == 1
-        for i in 1:n_latent
-            r = abs.(coords[:, 1] .- knots[i, 1])
-            B[:, i] .= r.^3
-        end
+        for i in 1:n_latent; r = abs.(coords[:, 1] .- knots[i, 1]); B[:, i] .= r.^3; end
     elseif n_dims == 2
-        for i in 1:n_latent
-            dist_sq = (coords[:, 1] .- knots[i, 1]).^2 .+ (coords[:, 2] .- knots[i, 2]).^2
-            r = sqrt.(dist_sq)
-            B[:, i] .= (r.^2) .* log.(r .+ 1e-9)
-        end
+        for i in 1:n_latent; dist_sq = (coords[:, 1] .- knots[i, 1]).^2 .+ (coords[:, 2] .- knots[i, 2]).^2; r = sqrt.(dist_sq); B[:, i] .= (r.^2) .* log.(r .+ 1e-9); end
     else
-        for i in 1:n_latent
-            dist_sq = sum((coords .- knots[i, :]').^2, dims=2)
-            r = sqrt.(dist_sq)
-            if isodd(n_dims)
-                B[:, i] .= r.^(4 - n_dims)
-            else
-                B[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9)
-            end
-        end
+        for i in 1:n_latent; dist_sq = sum((coords .- knots[i, :]').^2, dims=2); r = sqrt.(dist_sq); if isodd(n_dims); B[:, i] .= r.^(4 - n_dims); else; B[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9); end; end
     end
     
     template = build_structure_template(:rw2, n_latent)
@@ -143,6 +120,8 @@ function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
     Q_template_scaled = Q_template ./ scaling_factor
     L_scaled = L ./ scaling_factor
 
+    F = cholesky(Symmetric(Matrix(Q_template_scaled) + M.noise * I))
+
     return (
         basis_matrix=B,
         Q_template=Q_template_scaled,
@@ -150,9 +129,11 @@ function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
         U=U,
         L=L_scaled,
         n_latent=n_latent,
-        knots=knots
+        knots=knots,
+        cholesky_factor=F
     )
 end
+
 
 """
     get_priors(m::TPS, spec::NamedTuple, arch::String, outcome_idx, M)::String
@@ -173,49 +154,103 @@ end
 """
     get_updates(m::TPS, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code for constructing the `TPS` smooth effect.
+Generates the Turing code to construct the TPS smooth effect, dispatching on the
+chosen method.
 """
-function get_updates(m::TPS, spec::NamedTuple, arch::String, outcome_idx, M::NamedTuple)::String
+function get_updates(
+    m::TPS, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    
-    return """
-        # --- Thin Plate Spline (TPS) Smoother Component: $(spec.key) ---
-        local precomputes = spec.hyper
-        
-        # Reconstruct latent coefficients using spectral decomposition of the penalty.
-        local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
-        diag_D[1] = 0.0
-        diag_D[2] = 0.0
-        
-        local coeffs = precomputes.U * (diag_D .* $(p_names.raw))
-        
-        # Compute final effect by multiplying basis matrix with coefficients.
-        $(p_names.latent) = precomputes.basis_matrix * coeffs
-        
-        $(eta_target) .+= $(p_names.latent)
+    key = spec.key
+    n_latent = spec.hyper.n_latent
+
+    common_code = """
+        local hyper = spec_registry[:$(key)].hyper
+        local B_basis = hyper.basis_matrix
     """
+
+    spectral_code = """
+        # --- Thin Plate Spline (TPS) Smoother (Spectral): $(key) ---
+        let
+            $(common_code)
+            local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
+            diag_D[1] = 0.0; diag_D[2] = 0.0
+            local coeffs = hyper.U * (diag_D .* $(p_names.raw))
+            local $(p_names.latent) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    cholesky_code = """
+        # --- Thin Plate Spline (TPS) Smoother (Cholesky, AD-Safe): $(key) ---
+        let
+            $(common_code)
+            local F = hyper.cholesky_factor
+            local coeffs_raw = F.L' \\ $(p_names.raw)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
+            local coeffs = $(p_names.sigma) .* coeffs_raw
+            local $(p_names.latent) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    cholesky_sparse_code = """
+        # --- Thin Plate Spline (TPS) Smoother (Sparse Cholesky, Not AD-Safe): $(key) ---
+        let
+            $(common_code)
+            local Q_penalty = hyper.Q_template
+            local F = cholesky(Symmetric(Q_penalty + M.noise * I))
+            local coeffs_raw = F.L' \\ $(p_names.raw)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
+            local coeffs = $(p_names.sigma) .* coeffs_raw
+            local $(p_names.latent) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    if m.method == :spectral; return spectral_code;
+    elseif m.method == :cholesky; return cholesky_code;
+    elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
+    else; error("Unsupported method '$(m.method)' for TPS component."); end
 end
 
 """
-    get_effects(m::TPS, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
+    get_effects(m::TPS, chain, M::NamedTuple, ...)
 
-Reconstructs the `TPS` component's effect from posterior samples.
+Reconstructs the `TPS` component's effect from posterior samples, dispatching on
+the method used during sampling.
 """
-function get_effects(m::TPS, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
+function get_effects(
+    m::TPS, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
 
     precomputes = spec.hyper
-    U = precomputes.U
-    L = precomputes.L
     noise = M.noise
     n_latent = precomputes.n_latent
     knots = precomputes.knots
     n_dims = size(knots, 2)
 
     B_train = precomputes.basis_matrix
-    B_full = if !isnothing(PS) && haskey(PS, :basis_matrices) && haskey(PS.basis_matrices, spec.key)
-        vcat(B_train, PS.basis_matrices[spec.key])
+    B_full = if !isnothing(PS)
+        coord_vars = get(spec.params, :positional_args, [])
+        if all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+            coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+            B_pred = zeros(Float64, size(coords_pred, 1), n_latent)
+            if n_dims == 1
+                for i in 1:n_latent; r = abs.(coords_pred[:, 1] .- knots[i, 1]); B_pred[:, i] .= r.^3; end
+            elseif n_dims == 2
+                for i in 1:n_latent; dist_sq = (coords_pred[:, 1] .- knots[i, 1]).^2 .+ (coords_pred[:, 2] .- knots[i, 2]).^2; r = sqrt.(dist_sq); B_pred[:, i] .= (r.^2) .* log.(r .+ 1e-9); end
+            else
+                for i in 1:n_latent; dist_sq = sum((coords_pred .- knots[i, :]').^2, dims=2); r = sqrt.(dist_sq); if isodd(n_dims); B_pred[:, i] .= r.^(4 - n_dims); else; B_pred[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9); end; end
+            end
+            vcat(B_train, B_pred)
+        else
+            B_train
+        end
     else
         B_train
     end
@@ -226,22 +261,27 @@ function get_effects(m::TPS, chain, M, n_samples, outcomes_N, p_names, spec, PS,
     end
 
     for k in 1:outcomes_N
-        v = generate_full_variable_names(spec, M.model_arch, k)
+        p_names = generate_full_variable_names(spec, M.model_arch, k)
         
-        sigma_samples = get_params_vector(chain, string(v.sigma), 1)
-        raw_samples = get_params_vector(chain, string(v.raw), n_latent)
+        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
+        raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
 
-        effect_k = Matrix{Float64}(undef, size(B_full, 1), n_samples)
+        effect_k = zeros(Float64, size(B_full, 1), n_samples)
 
         for i in 1:n_samples
-            current_sigma = sigma_samples[i, 1]
-            current_raw = raw_samples[i, :]
-            
-            diag_D = current_sigma ./ sqrt.(L .+ noise)
-            diag_D[1] = 0.0
-            diag_D[2] = 0.0
-            
-            coeffs = U * (diag_D .* current_raw)
+            local coeffs
+            if m.method == :spectral
+                U, L = precomputes.U, precomputes.L
+                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
+                diag_D[1] = 0.0; diag_D[2] = 0.0
+                coeffs = U * (diag_D .* raw_samples[i, :])
+            else # :cholesky or :cholesky_sparse
+                Q_template = precomputes.Q_template
+                F = cholesky(Symmetric(Matrix(Q_template) + noise * I))
+                coeffs_raw = F.L' \ raw_samples[i, :]
+                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
+                coeffs = sigma_samples[i] .* coeffs_centered
+            end
             effect_k[:, i] = B_full * coeffs
         end
         push!(structured_effects, effect_k)

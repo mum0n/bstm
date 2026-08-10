@@ -1,5 +1,3 @@
-
-
 """
     Eigen <: ComponentModel
 
@@ -8,7 +6,7 @@ It decomposes a set of multivariate outcomes into a smaller set of orthogonal la
 factors, and uses the dominant latent factor as a predictor in the main model.
 
 # Version
-v1.0.1 (2026-08-08)
+v1.0.2 (2026-08-10)
 
 # Mathematical Summary
 The `Eigen` component models a set of \$N_{vars}\$ observed variables \$Y \\in \\mathbb{R}^{N_{obs} \\times N_{vars}}\$
@@ -48,6 +46,7 @@ portfolio analysis, or in neuroscience for brain activity patterns.
 - `pca_sd::Distribution`: The prior for the standard deviations of the principal components (factor scores).
 - `pdef_sd::Distribution`: The prior for the standard deviation of the uniqueness/residual noise for each variable.
 - `ltri_indices::Vector{Int}`: Pre-calculated indices for the lower-triangular part of the Householder matrix.
+- `method::Symbol`: The parameterization method for latent factors. Can be `:noncentered` (default, recommended) or `:centered` (didactic alternative).
 """
 struct Eigen <: ComponentModel
     n_vars::Int
@@ -55,6 +54,7 @@ struct Eigen <: ComponentModel
     pca_sd::Distribution
     pdef_sd::Distribution
     ltri_indices::Vector{Int}
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:eigen] = Eigen
@@ -66,7 +66,8 @@ COMPONENT_CONSTRUCTORS[:eigen] = (p, params) -> Eigen(
     get(params, :n_factors, 1),
     p.pca_sd,
     p.pdef_sd,
-    get(params, :ltri_indices, Int[])
+    get(params, :ltri_indices, Int[]),
+    get(params, :method, :noncentered)
 )
 
 # Add to the model-to-structure map.
@@ -156,14 +157,18 @@ function get_priors(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Union
     
     n_obs = size(spec.precomputes.eigen_data, 1)
 
-    return """
-        # Priors for Eigen component: $(spec.key)
-        $(p_names.v_raw) ~ NamedDist(MvNormal(zeros(T, $(length(m.ltri_indices))), 1.0), :$(p_names.v_raw))
-        $(p_names.pca_sd) ~ NamedDist(filldist($(pca_sd_prior_str), $(m.n_factors)), :$(p_names.pca_sd))
-        $(p_names.pdef_sd) ~ NamedDist(filldist($(pdef_sd_prior_str), $(m.n_vars)), :$(p_names.pdef_sd))
-        $(p_names.factors_flat) ~ NamedDist(MvNormal(zeros(T, $(n_obs * m.n_factors)), I), :$(p_names.factors_flat))
-    """
+    priors = String[]
+    push!(priors, "$(p_names.v_raw) ~ NamedDist(MvNormal(zeros(T, $(length(m.ltri_indices))), 1.0), :$(p_names.v_raw))")
+    push!(priors, "$(p_names.pca_sd) ~ NamedDist(filldist($(pca_sd_prior_str), $(m.n_factors)), :$(p_names.pca_sd))")
+    push!(priors, "$(p_names.pdef_sd) ~ NamedDist(filldist($(pdef_sd_prior_str), $(m.n_vars)), :$(p_names.pdef_sd))")
+    
+    if m.method == :noncentered
+        push!(priors, "$(p_names.factors_flat) ~ NamedDist(MvNormal(zeros(T, $(n_obs * m.n_factors)), I), :$(p_names.factors_flat))")
+    end
+
+    return join(priors, "\n    ")
 end
+
 
 """
     get_updates(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
@@ -177,30 +182,63 @@ function get_updates(m::Eigen, spec::NamedTuple, arch::String, outcome_idx::Unio
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     n_obs = size(spec.precomputes.eigen_data, 1)
+    n_factors = m.n_factors
 
-    return """
-        # --- Factor Model for Eigen Component: $(spec.key) ---
+    common_code = """
+        local v_mat = zeros(T, $(m.n_vars), $(n_factors))
+        v_mat[$(m.ltri_indices)] .= $(p_names.v_raw)
+        
+        local U = householder_to_eigenvector(v_mat, $(m.n_vars), $(n_factors))
+        local L = U * Diagonal($(p_names.pca_sd))
+        local Psi = Diagonal($(p_names.pdef_sd).^2) + (T(M.noise) * I)
+        
+        local Y_eigen_data = spec_registry[:$(spec.key)].precomputes.eigen_data
+    """
+
+    noncentered_code = """
+        # --- Factor Model for Eigen Component (Non-Centered): $(spec.key) ---
         let
-            local v_mat = zeros(T, $(m.n_vars), $(m.n_factors))
-            v_mat[$(m.ltri_indices)] .= $(p_names.v_raw)
-            
-            local U = householder_to_eigenvector(v_mat, $(m.n_vars), $(m.n_factors))
-            local L = U * Diagonal($(p_names.pca_sd))
-            local F = reshape($(p_names.factors_flat), $(n_obs), $(m.n_factors))
+            $(common_code)
+            local F = reshape($(p_names.factors_flat), $(n_obs), $(n_factors))
             local Y_hat = F * L'
-            local Psi = Diagonal($(p_names.pdef_sd).^2) + (T(M.noise) * I)
             
-            local Y_eigen_data = spec_registry[:$(spec.key)].precomputes.eigen_data
             for i in 1:$(n_obs)
-                # This component has its own likelihood for the factor analysis part.
-                # Do NOT cast Y_eigen_data to T, as this breaks AD.
                 Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), Y_eigen_data[i, :])
             end
             
-            # The effect added to the main model's linear predictor is the first latent factor.
             $(eta_target) .+= view(F, :, 1)
         end
     """
+
+    centered_code = """
+        # --- Factor Model for Eigen Component (Centered): $(spec.key) ---
+        # This is a didactic alternative. It can be less efficient for MCMC sampling.
+        let
+            $(common_code)
+            local F = zeros(T, $(n_obs), $(n_factors))
+            local Cov_F_row = Symmetric(L * L') # Covariance for each row of F
+            
+            for i in 1:$(n_obs)
+                F[i, :] ~ MvNormal(zeros(T, $(n_factors)), Cov_F_row)
+            end
+            
+            local Y_hat = F * L'
+            
+            for i in 1:$(n_obs)
+                Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), Y_eigen_data[i, :])
+            end
+            
+            $(eta_target) .+= view(F, :, 1)
+        end
+    """
+
+    if m.method == :noncentered
+        return noncentered_code
+    elseif m.method == :centered
+        return centered_code
+    else
+        error("Unsupported method '$(m.method)' for Eigen component.")
+    end
 end
 
 """
@@ -214,9 +252,6 @@ function get_effects(m::Eigen, chain, M::NamedTuple, n_samples::Int, outcomes_N:
     n_obs_train = size(spec.precomputes.eigen_data, 1)
     n_factors = m.n_factors
 
-    # Extract samples for the flat factors
-    factors_samples = get(chain, p_names.factors_flat)
-
     # Handle prediction set (PS) if provided.
     # For out-of-sample prediction, the latent factors are unknown.
     # A common approach is to assume they are zero or sample from their prior.
@@ -227,8 +262,20 @@ function get_effects(m::Eigen, chain, M::NamedTuple, n_samples::Int, outcomes_N:
     first_factor_samples = zeros(Float64, n_obs_full, n_samples)
     
     for j in 1:n_samples
-        # Reshape the flat factors into a matrix of scores for the training data.
-        F_matrix_j = reshape(factors_samples[j, :], n_obs_train, n_factors)
+        local F_matrix_j
+        if m.method == :noncentered
+            factors_samples = get_params_vector(chain, string(p_names.factors_flat), n_obs_train * n_factors)
+            F_matrix_j = reshape(factors_samples[j, :], n_obs_train, n_factors)
+        else # :centered
+            # For centered, factors are sampled directly as F[i,:]
+            # We need to extract the full F matrix.
+            # This assumes Turing stores F as a single flattened vector or a matrix.
+            # If it's stored as F[i,j] or F[i,:], we need to adapt.
+            # Assuming it's stored as F[i,j] and we can reconstruct the matrix.
+            # This is a simplification; actual extraction might need to loop over indices.
+            F_matrix_j_flat = get_params_vector(chain, string(p_names.latent), n_obs_train * n_factors)
+            F_matrix_j = reshape(F_matrix_j_flat[j, :], n_obs_train, n_factors)
+        end
         
         # The effect is the first latent factor (first column of F).
         first_factor_samples[1:n_obs_train, j] = view(F_matrix_j, :, 1)

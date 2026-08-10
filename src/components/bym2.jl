@@ -1,4 +1,3 @@
-
 """
     BYM2 <: ComponentModel
 
@@ -7,7 +6,7 @@ well-identified parameterization for spatial effects by separating them into a
 structured (ICAR) and an unstructured (IID) component.
 
 # Version
-v1.9.4 (2026-08-08)
+v1.9.5 (2026-08-10)
 
 # Mathematical Summary
 The BYM2 model decomposes a spatial random effect \$\\phi\$ into two independent
@@ -47,9 +46,8 @@ account for both spatial clustering and localized heterogeneity.
 - `rho::UnivariateDistribution`: The prior for the mixing parameter `rho`.
 - `sigma::UnivariateDistribution`: The prior for the overall marginal standard
   deviation `sigma`.
-- `method::Symbol`: The computational method for sampling the latent field. Can be
-  `:spectral` (default, efficient, and AD-safe) or `:cholesky` (dense
-  factorization, AD-safe but less efficient).
+- `method::Symbol`: The computational method. Can be `:spectral` (default, AD-safe),
+  `:cholesky` (AD-safe, dense), or `:cholesky_sparse` (didactic, not AD-safe).
 """
 struct BYM2 <: ComponentModel
     rho::UnivariateDistribution
@@ -192,8 +190,7 @@ end
     get_updates(m::BYM2, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates the Turing code for the BYM2 component's update logic, dispatching on
-the chosen `method` (`:spectral` or `:cholesky`). Both methods correctly implement
-the Riebler parameterization.
+the chosen `method`. All methods correctly implement the Riebler parameterization.
 """
 function get_updates(
     m::BYM2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -202,10 +199,11 @@ function get_updates(
     v = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     index_var = "s_idx"
+    key = spec.key
+    n_latent = spec.hyper.n_latent
 
-    if m.method == :spectral
-        return """
-        # --- BYM2 Spectral Assembly: $(spec.key) ---
+    spectral_code = """
+        # --- BYM2 Spectral Assembly: $(key) ---
         # This block constructs the BYM2 spatial effect using a non-centered
         # parameterization based on the spectral decomposition of the ICAR
         # precision matrix. This method is the default as it is efficient and
@@ -215,13 +213,13 @@ function get_updates(
         #    the structured part. The structured part has precision Q_star, so
         #    its covariance has eigenvalues 1/L_j. The standard deviation is
         #    1/sqrt(L_j).
-        local diag_D_structured = 1.0 ./ sqrt.(spec.hyper.L .+ M.noise)
+        local diag_D_structured = 1.0 ./ sqrt.(spec_registry[:$(key)].hyper.L .+ M.noise)
         # The first eigenvalue is 0, corresponding to the null space (intercept).
         # Set its contribution to 0 to enforce the sum-to-zero constraint.
         diag_D_structured[1] = 0.0
 
         # 2. Apply the spectral transformation to the standard normal innovations.
-        local structured_effect = spec.hyper.U * (diag_D_structured .* $(v.struct))
+        local structured_effect = spec_registry[:$(key)].hyper.U * (diag_D_structured .* $(v.struct))
 
         # 3. Combine structured and unstructured components using the Riebler parameterization.
         $(v.latent) = $(v.sigma) .* (sqrt($(v.rho)) .* structured_effect .+
@@ -230,36 +228,60 @@ function get_updates(
         # 4. Add the final effect to the linear predictor.
         $(eta_target) .+= view($(v.latent), M.$(index_var))
         """
-    elseif m.method == :cholesky
-        return """
-        # --- BYM2 Cholesky Assembly: $(spec.key) ---
-        # This block constructs the BYM2 spatial effect using a dense Cholesky
-        # decomposition of the static ICAR precision matrix. This method is
-        # AD-safe but can be less efficient than the spectral method for large N.
 
-        # 1. Get the pre-computed Cholesky factor of the ICAR precision matrix.
-        local F_struct = spec.hyper.cholesky_factor
-        
-        # 2. Sample the structured component using the Cholesky factor.
-        local structured_effect = F_struct.L' \\ $(v.struct)
-        
-        # 3. Apply a soft sum-to-zero constraint for identifiability.
-        Turing.@addlogprob! logpdf(
-            Normal(0.0, 0.001 * $(spec.hyper.n_latent)),
-            sum(structured_effect)
-        )
-        
-        # 4. Combine components using the Riebler parameterization.
-        $(v.latent) = $(v.sigma) .* (sqrt($(v.rho)) .* structured_effect .+
-                                     sqrt(1.0 - $(v.rho)) .* $(v.iid))
-        
-        # 5. Add the final effect to the linear predictor.
-        $(eta_target) .+= view($(v.latent), M.$(index_var))
+    cholesky_code = """
+        # --- BYM2 Cholesky Assembly (Dense, AD-Safe): $(key) ---
+        let
+            # 1. Get the pre-computed Cholesky factor of the ICAR precision matrix.
+            local F_struct = spec_registry[:$(key)].hyper.cholesky_factor
+            
+            # 2. Sample the structured component using the Cholesky factor.
+            local structured_effect = F_struct.L' \\ $(v.struct)
+            
+            # 3. Apply a soft sum-to-zero constraint for identifiability.
+            Turing.@addlogprob! logpdf(
+                Normal(0.0, 0.001 * $(n_latent)), sum(structured_effect)
+            )
+            
+            # 4. Combine components using the Riebler parameterization.
+            $(v.latent) = $(v.sigma) .* (sqrt($(v.rho)) .* structured_effect .+
+                                         sqrt(1.0 - $(v.rho)) .* $(v.iid))
+            
+            # 5. Add the final effect to the linear predictor.
+            $(eta_target) .+= view($(v.latent), M.$(index_var))
+        end
         """
+
+    cholesky_sparse_code = """
+        # --- BYM2 Cholesky Assembly (Sparse, Not AD-Safe): $(key) ---
+        # WARNING: This method is for didactic purposes and is NOT compatible with
+        # automatic differentiation (e.g., NUTS sampler).
+        let
+            local Q_template = spec_registry[:$(key)].hyper.Q_template
+            local F_struct = cholesky(Symmetric(Q_template + M.noise * I))
+            local structured_effect = F_struct.L' \\ $(v.struct)
+            
+            Turing.@addlogprob! logpdf(
+                Normal(0.0, 0.001 * $(n_latent)), sum(structured_effect)
+            )
+            
+            $(v.latent) = $(v.sigma) .* (sqrt($(v.rho)) .* structured_effect .+
+                                         sqrt(1.0 - $(v.rho)) .* $(v.iid))
+            
+            $(eta_target) .+= view($(v.latent), M.$(index_var))
+        end
+        """
+
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
     else
         error(
             "Unsupported method '$(m.method)' for BYM2 component. Supported " *
-            "methods are :spectral and :cholesky."
+            "methods are :spectral, :cholesky, and :cholesky_sparse."
         )
     end
 end
@@ -268,8 +290,8 @@ end
     get_effects(m::BYM2, chain, M::NamedTuple, n_samples, outcomes_N, spec, PS, N_total)::NamedTuple
 
 Reconstructs the BYM2 component's effect from posterior samples. This function
-re-runs the Riebler parameterization logic for each sample. The reconstruction uses
-the spectral method for efficiency, which is valid regardless of the fitting method.
+re-runs the Riebler parameterization logic for each sample, dispatching on the
+method used during sampling.
 """
 function get_effects(
     m::BYM2, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -278,11 +300,8 @@ function get_effects(
     structured_effects = Vector{Matrix{Float64}}()
     is_multivariate = outcomes_N > 1
     is_shared = get(spec.params, :shared, false)
-    n_latent = size(spec.hyper.Q_template, 1)
-
-    U = spec.hyper.U
-    L_eig = spec.hyper.L
-    T_el = eltype(chain.value)
+    n_latent = spec.hyper.n_latent
+    noise = M.noise
 
     for k in 1:outcomes_N
         outcome_idx = is_multivariate ? k : nothing
@@ -300,10 +319,7 @@ function get_effects(
         struct_samples = get_params_vector(chain, string(v.struct), n_latent)
         iid_samples = get_params_vector(chain, string(v.iid), n_latent)
         
-        effect_k = Matrix{T_el}(undef, n_latent, n_samples)
-
-        diag_D_structured = 1.0 ./ sqrt.(L_eig .+ M.noise)
-        diag_D_structured[1] = 0.0
+        effect_k = Matrix{Float64}(undef, n_latent, n_samples)
 
         for s in 1:n_samples
             sigma_s = sigma_samples[s, 1]
@@ -311,7 +327,18 @@ function get_effects(
             struct_innov_s = struct_samples[s, :]
             iid_s = iid_samples[s, :]
 
-            structured_effect_s = U * (diag_D_structured .* struct_innov_s)
+            local structured_effect_s
+            if m.method == :spectral
+                U = spec.hyper.U
+                L_eig = spec.hyper.L
+                diag_D_structured = 1.0 ./ sqrt.(L_eig .+ noise)
+                diag_D_structured[1] = 0.0
+                structured_effect_s = U * (diag_D_structured .* struct_innov_s)
+            else # :cholesky or :cholesky_sparse
+                F_struct = spec.hyper.cholesky_factor
+                structured_effect_raw = F_struct.L' \ struct_innov_s
+                structured_effect_s = structured_effect_raw .- mean(structured_effect_raw)
+            end
             
             effect_k[:, s] = sigma_s .* (sqrt(rho_s) .* structured_effect_s .+
                                          sqrt(1.0 - rho_s) .* iid_s)

@@ -7,7 +7,7 @@ Random Field (GMRF) on a graph with data-driven edge weights, often representing
 habitat conductivity or resistance.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 The component models a latent spatial field \$\\phi\$ as a GMRF,
@@ -27,36 +27,26 @@ where \$W_{\\beta}\$ is the matrix of weights \$w_{ij}\$ and \$D_{\\beta}\$ is t
 matrix of row sums of \$W_{\\beta}\$. By estimating \$\\beta\$, the model learns the
 degree to which the habitat influences the spatial correlation structure.
 
-# Assumptions
-- The provided adjacency matrix `W` represents the base connectivity of the graph.
-- The `habitat` data represents a measure of conductivity or resistivity.
-
-# Best Use Case
-Modeling animal movement, disease spread, or any spatial process where correlation
-is not uniform but is facilitated or impeded by environmental features. It is a
-powerful tool for creating non-stationary spatial models where the correlation
-structure is learned from data.
-
-# Key References
-- McRae, B. H. (2006). Isolation by resistance. *Evolution*, 60(8), 1551-1561.
-  (For the concept of resistance surfaces in ecology).
-- Rue, H., & Held, L. (2005). *Gaussian Markov Random Fields: Theory and
-  Applications*. CRC Press. (For the GMRF formulation).
+# Computational Methods
+- `:cholesky` (default): An AD-safe method using dense Cholesky factorization.
+- `:cholesky_sparse` (didactic, not AD-safe): A more memory-efficient method using
+  sparse Cholesky factorization, suitable for gradient-free samplers.
 
 # Fields
-- `beta::UnivariateDistribution`: Prior for the parameter \$\\beta\$, which controls
-  the influence of the habitat on connectivity.
-- `sigma::UnivariateDistribution`: Prior for the marginal standard deviation of the
-  latent field.
+- `beta::UnivariateDistribution`: Prior for the parameter \$\\beta\$.
+- `sigma::UnivariateDistribution`: Prior for the marginal standard deviation.
+- `method::Symbol`: The computational method, `:cholesky` or `:cholesky_sparse`.
 """
 struct NetworkFlow <: ComponentModel
     beta::UnivariateDistribution
     sigma::UnivariateDistribution
+    method::Symbol
 end
 
-# Add to the central component constructor registry.
 COMPONENT_TYPE_REGISTRY[:networkflow] = NetworkFlow
-COMPONENT_CONSTRUCTORS[:networkflow] = (p, params) -> NetworkFlow(p.beta, p.sigma)
+COMPONENT_CONSTRUCTORS[:networkflow] = (p, params) -> NetworkFlow(
+    p.beta, p.sigma, get(params, :method, :cholesky)
+)
 
 # Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:networkflow] = :spatial
@@ -157,11 +147,12 @@ function get_priors(
     return join(priors, "\n    ")
 end
 
+
 """
     get_updates(m::NetworkFlow, spec::NamedTuple, arch::String, outcome_idx, M)
 
-Generates the Turing code to construct the habitat-weighted precision matrix, sample
-the latent field, and add it to the linear predictor `eta`.
+Generates code to construct the habitat-weighted precision matrix and sample the
+latent field, dispatching on the chosen method.
 """
 function get_updates(
     m::NetworkFlow, spec::NamedTuple, arch::String,
@@ -171,24 +162,27 @@ function get_updates(
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
 
-    return """
-        # --- NetworkFlow Component: $(key) ---
+    common_code = """
+        # 1. Construct the weighted adjacency matrix based on habitat and beta.
+        local W_I = spec_registry[:$(key)].hyper.W_I
+        local W_J = spec_registry[:$(key)].hyper.W_J
+        local habitat = M[Symbol("habitat_$(key)")]
+        
+        local V_beta = exp.($(p_names.beta) .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
+        local W_beta = sparse(W_I, W_J, V_beta, M.s_N, M.s_N)
+        
+        # 2. Construct the weighted graph Laplacian (precision matrix).
+        local D_beta = Diagonal(vec(sum(W_beta, dims=2)))
+        local Q_beta = D_beta - W_beta
+    """
+
+    cholesky_code = """
+        # --- NetworkFlow Component (Cholesky, AD-Safe): $(key) ---
         let
-            # 1. Construct the weighted adjacency matrix based on habitat and beta.
-            local W_I = spec_registry[:$(key)].hyper.W_I
-            local W_J = spec_registry[:$(key)].hyper.W_J
-            local habitat = M[Symbol("habitat_$(key)")]
-            
-            local V_beta = exp.($(p_names.beta) .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
-            local W_beta = sparse(W_I, W_J, V_beta, M.s_N, M.s_N)
-            
-            # 2. Construct the weighted graph Laplacian (precision matrix).
-            local D_beta = Diagonal(vec(sum(W_beta, dims=2)))
-            local Q_beta = D_beta - W_beta
+            $(common_code)
             
             # 3. Sample the latent field using a non-centered parameterization.
-            #    The Cholesky factor of the precision matrix is used to transform
-            #    standard normal noise.
+            #    The Cholesky factor of the dense precision matrix is used.
             local F = cholesky(Symmetric(Matrix(Q_beta) + M.noise * I))
             local latent_field = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
             
@@ -196,13 +190,37 @@ function get_updates(
             $(eta_target) .+= view(latent_field, M.s_idx)
         end
     """
+
+    cholesky_sparse_code = """
+        # --- NetworkFlow Component (Sparse Cholesky, Not AD-Safe): $(key) ---
+        # WARNING: This method is for didactic purposes and is NOT compatible with
+        # automatic differentiation (e.g., NUTS sampler).
+        let
+            $(common_code)
+            
+            # 3. Sample the latent field using a non-centered parameterization.
+            #    The Cholesky factor of the sparse precision matrix is used.
+            local F = cholesky(Symmetric(Q_beta + M.noise * I))
+            local latent_field = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
+            
+            # 4. Add the effect to the linear predictor.
+            $(eta_target) .+= view(latent_field, M.s_idx)
+        end
+    """
+
+    if m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    else
+        error("Unsupported method '$(m.method)' for NetworkFlow component.")
+    end
 end
 
 """
     get_effects(m::NetworkFlow, chain, M::NamedTuple, ...)
 
-Reconstructs the `NetworkFlow` component's effect from the MCMC chain's posterior
-samples.
+Reconstructs the `NetworkFlow` component's effect from posterior samples.
 """
 function get_effects(
     m::NetworkFlow, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -232,6 +250,7 @@ function get_effects(
             D_beta_i = Diagonal(vec(sum(W_beta_i, dims=2)))
             Q_beta_i = D_beta_i - W_beta_i
             
+            # For reconstruction, dense Cholesky is safe and robust.
             F_i = cholesky(Symmetric(Matrix(Q_beta_i) + M.noise * I))
             
             # Reconstruct the latent field for this sample

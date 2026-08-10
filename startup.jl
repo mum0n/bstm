@@ -28,7 +28,8 @@ pkgs_bstm = [
   "LinearAlgebra", "Clustering", "StatsBase", "HypothesisTests", "KernelFunctions",
   "JLD2", "FFTW",  "SparseArrays", "StaticArrays", "FillArrays", "AbstractGPs", 
   "Bijectors", "DynamicPPL", "AdvancedVI", "Optimisers", "Optim", "PosteriorStats",  "Turing",  
-  "Distances", "NamedArrays" , "CategoricalArrays", "StatsModels", "AbstractMCMC", "ForwardDiff", "PDMats"
+  "Distances", "NamedArrays" , "CategoricalArrays", "StatsModels", "AbstractMCMC",  "PDMats",
+  "ForwardDiff", "ReverseDiff", "Enzyme"   # , "Zygote"
 ]
 
 # "MCMCChains",

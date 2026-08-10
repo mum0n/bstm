@@ -1,14 +1,13 @@
-
 """
     LocalAdaptive <: ComponentModel
 
-A component model for a Local Adaptive spatial effect. This model combines a global
+A component for a Local Adaptive spatial effect. This model combines a global
 smoothing structure (based on a Leroux-style precision matrix) with local,
 cluster-specific mean effects. This allows the model to capture both smooth spatial
 trends and abrupt shifts between distinct spatial regions.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 The `LocalAdaptive` component models a latent spatial field \$\\phi\$ as a non-zero
@@ -51,15 +50,20 @@ or disease rates across areas with different public health policies.
 # Fields
 - `rho::Distribution`: The prior for the spatial correlation parameter `rho`.
 - `sigma::Distribution`: The prior for the overall standard deviation of the effect.
+- `method::Symbol`: The computational method. Can be `:spectral` (default, AD-safe),
+  `:cholesky` (AD-safe, dense), or `:cholesky_sparse` (didactic, not AD-safe).
 """
 struct LocalAdaptive <: ComponentModel
     rho::Distribution
     sigma::Distribution
+    method::Symbol
 end
 
 # Add to the central component constructor registry.
 COMPONENT_TYPE_REGISTRY[:localadaptive] = LocalAdaptive
-COMPONENT_CONSTRUCTORS[:localadaptive] = (p, params) -> LocalAdaptive(p.rho, p.sigma)
+COMPONENT_CONSTRUCTORS[:localadaptive] = (p, params) -> LocalAdaptive(
+    p.rho, p.sigma, get(params, :method, :spectral)
+)
 
 # Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:localadaptive] = :spatial
@@ -189,13 +193,14 @@ function get_priors(
     """
 end
 
-"""
-    get_updates(m::LocalAdaptive, spec::NamedTuple, arch::String, outcome_idx, M)
 
-Generates code to construct the `LocalAdaptive` effect. It builds the non-zero
-mean vector from cluster assignments and samples the latent field using a
-non-centered parameterization.
-"""
+
+# Version 1.0.2 (2026-08-10)
+# Purpose: Generates Turing code to construct the `LocalAdaptive` effect.
+# Rationale: This version is updated to use Symbol keys (`:key`) instead of String
+#            keys (`"key"`) when accessing the `spec_registry`. This aligns it with
+#            the refactored `bstm_text_assembler`, which now uses Symbols, resolving
+#            a `KeyError` during model instantiation.
 function get_updates(
     m::LocalAdaptive, spec::NamedTuple, arch::String,
     outcome_idx::Union{Int, Nothing}, M::NamedTuple
@@ -204,33 +209,107 @@ function get_updates(
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     n_clusters = spec.precomputes.n_clusters
+    # Corrected access to use Symbol key
     cluster_assignments = "spec_registry[:$(spec.key)].precomputes.cluster_assignments"
-    
-    return """
-        # --- LocalAdaptive Component: $(spec.key) ---
-        let
-            local mu_clusters_raw = $(p_names.mu_clusters_raw)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_clusters)), sum(mu_clusters_raw))
-            local mean_vector = mu_clusters_raw[$(cluster_assignments)]
 
-            local Q_template = spec_registry[:$(spec.key)].precomputes.Q_template
-            local rho_val = $(p_names.rho)
-            local Q_final = (rho_val .* Q_template) .+ ((1.0 - rho_val) .* I)
+    # --- Method 1: Spectral Decomposition (Default, AD-Safe) ---
+    spectral_code = """
+        # --- LocalAdaptive Component (Spectral): $(spec.key) ---
+        let
+            # 1. Construct the non-stationary mean field from cluster means.
+            mu_clusters_raw = $(p_names.mu_clusters_raw)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_clusters)), sum(mu_clusters_raw))
+            mean_vector = mu_clusters_raw[$(cluster_assignments)]
+
+            # 2. Construct the centered spatial effect using the spectral method.
+            diag_D = $(p_names.sigma) ./ sqrt.((1.0 .- $(p_names.rho)) .+ $(p_names.rho) .* spec_registry[:$(spec.key)].hyper.L .+ M.noise)
+            latent_centered = spec_registry[:$(spec.key)].hyper.U * (diag_D .* $(p_names.raw))
             
-            local F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
-            local latent_centered = F.L' \\ $(p_names.raw)
+            # 3. Combine the mean field and the centered spatial effect.
+            final_latent_field = mean_vector .+ latent_centered
             
-            local final_latent_field = (mean_vector .+ latent_centered) .* $(p_names.sigma)
-            
+            # 4. Add the final effect to the linear predictor.
             $(eta_target) .+= final_latent_field[M.s_idx]
         end
     """
+
+    # --- Method 2: Cholesky Decomposition (Dense, AD-Safe) ---
+    cholesky_code = """
+        # --- LocalAdaptive Component (Cholesky): $(spec.key) ---
+        let
+            # 1. Construct the non-stationary mean field from cluster means.
+            mu_clusters_raw = $(p_names.mu_clusters_raw)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_clusters)), sum(mu_clusters_raw))
+            mean_vector = mu_clusters_raw[$(cluster_assignments)]
+
+            # 2. Recompose the Leroux precision matrix Q = (1-ρ)I + ρQ*.
+            local Q_template = spec_registry[:$(spec.key)].hyper.Q_template
+            local rho_val = $(p_names.rho)
+            local Q_final = (1.0 - rho_val) .* I(size(Q_template, 1)) .+ rho_val .* Q_template
+            
+            # 3. Perform Cholesky decomposition. Convert to dense Matrix for AD-safety.
+            local F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
+            
+            # 4. Construct the centered part of the spatial effect.
+            local latent_centered = $(p_names.sigma) .* (F.U \\ $(p_names.raw))
+            
+            # 5. Combine the mean field and the centered spatial effect.
+            final_latent_field = mean_vector .+ latent_centered
+            
+            # 6. Add the final effect to the linear predictor.
+            $(eta_target) .+= final_latent_field[M.s_idx]
+        end
+    """
+
+    # --- Method 3: Sparse Cholesky (Didactic, NOT AD-Safe) ---
+    cholesky_sparse_code = """
+        # --- LocalAdaptive Component (Sparse Cholesky): $(spec.key) ---
+        # WARNING: This method is for didactic purposes and is NOT compatible with
+        # automatic differentiation (e.g., NUTS sampler).
+        let
+            # 1. Construct the non-stationary mean field from cluster means.
+            mu_clusters_raw = $(p_names.mu_clusters_raw)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_clusters)), sum(mu_clusters_raw))
+            mean_vector = mu_clusters_raw[$(cluster_assignments)]
+
+            # 2. Recompose the Leroux precision matrix Q = (1-ρ)I + ρQ*.
+            local Q_template = spec_registry[:$(spec.key)].hyper.Q_template
+            local rho_val = $(p_names.rho)
+            local Q_final = (1.0 - rho_val) .* sparse(I, size(Q_template, 1), size(Q_template, 1)) .+ rho_val .* Q_template
+            
+            # 3. Perform sparse Cholesky decomposition.
+            local F = cholesky(Symmetric(Q_final + M.noise * I))
+            
+            # 4. Construct the centered part of the spatial effect.
+            local latent_centered = $(p_names.sigma) .* (F.U \\ $(p_names.raw))
+            
+            # 5. Combine the mean field and the centered spatial effect.
+            final_latent_field = mean_vector .+ latent_centered
+            
+            # 6. Add the final effect to the linear predictor.
+            $(eta_target) .+= final_latent_field[M.s_idx]
+        end
+    """
+
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    else
+        error("Unsupported method '$(m.method)' for LocalAdaptive component.")
+    end
 end
+
+
 
 """
     get_effects(m::LocalAdaptive, chain, M::NamedTuple, ...)
 
-Reconstructs the `LocalAdaptive` component's effect from posterior samples.
+Reconstructs the `LocalAdaptive` component's effect from posterior samples. This
+function is updated to dispatch on the `method` used during sampling to ensure
+the reconstruction logic is consistent with the model definition.
 """
 function get_effects(
     m::LocalAdaptive, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -240,7 +319,6 @@ function get_effects(
     
     n_latent = spec.precomputes.n_latent
     cluster_assignments = spec.precomputes.cluster_assignments
-    Q_template = spec.precomputes.Q_template
     noise = M.noise
     n_clusters = spec.precomputes.n_clusters
 
@@ -259,15 +337,31 @@ function get_effects(
         effect_k = zeros(Float64, N_total, n_samples)
 
         for i in 1:n_samples
+            # Reconstruct cluster means and apply sum-to-zero constraint
             mu_clusters_centered = mu_clusters_raw_samples[i, :] .- mean(mu_clusters_raw_samples[i, :])
             mean_vector = mu_clusters_centered[cluster_assignments]
             
-            Q_final = (rho_samples[i] .* Q_template) .+ ((1.0 - rho_samples[i]) .* I)
-            F = cholesky(Symmetric(Matrix(Q_final) + noise * I))
-            latent_centered = F.L' \ raw_samples[i, :]
+            sigma_s = sigma_samples[i]
+            rho_s = rho_samples[i]
+            raw_s = raw_samples[i, :]
+
+            local latent_centered
+            if m.method == :spectral
+                U = spec.precomputes.U
+                L_eig = spec.precomputes.L
+                diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig .+ noise)
+                latent_centered = U * (diag_D_s .* raw_s)
+            else # :cholesky or :cholesky_sparse
+                Q_template = spec.precomputes.Q_template
+                Q_final = (1.0 - rho_s) .* sparse(I, n_latent, n_latent) .+ rho_s .* Q_template
+                F = cholesky(Symmetric(Matrix(Q_final) + noise * I))
+                latent_centered = sigma_s .* (F.U \ raw_s)
+            end
             
-            final_latent_field = (mean_vector .+ latent_centered) .* sigma_samples[i]
+            # Combine the non-zero mean and the centered spatial effect
+            final_latent_field = mean_vector .+ latent_centered
             
+            # Map the latent field to the observation level
             effect_k[:, i] = view(final_latent_field, s_idx_full)
         end
         push!(structured_effects, effect_k)

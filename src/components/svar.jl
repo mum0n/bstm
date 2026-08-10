@@ -7,7 +7,7 @@ across spatial units. The spatial variation of `rho` is governed by a specified
 GMRF model (e.g., ICAR, Leroux).
 
 # Version
-v1.9.4 (2026-08-08)
+v1.9.5 (2026-08-10)
 
 # Mathematical Summary
 The SVAR model defines a spatiotemporal process \$\\psi_{it}\$ for spatial unit \$i\$
@@ -26,26 +26,11 @@ where \$\\mathbf{Q}_{\\rho}\$ is the precision matrix of a spatial model (e.g., 
 To ensure stationarity of the AR(1) process (\$-1 < \\rho_i < 1\$), the raw field
 is transformed using the `tanh` function: \$\\rho_i = \\tanh(\\rho_{field, i})\$.
 
-The process is initialized at \$t=1\$ from its stationary distribution:
-\$\\psi_{i,1} \\sim \\mathcal{N}(0, \\frac{\\sigma^2}{1 - \\rho_i^2})\$
-
-# Assumptions
-- The temporal process within each spatial unit is first-order autoregressive.
-- The spatial variation of the `rho` parameter can be captured by a GMRF.
-- The innovations \$\\epsilon_{it}\$ are i.i.d. across space and time.
-
-# Best Use Case
-Modeling spatiotemporal phenomena where the degree of temporal persistence or
-memory is expected to differ across geographical regions, such as modeling
-environmental processes where local geography affects temporal dynamics.
-
-# Key References
-- Rushworth, A., Lee, D., & Mitchell, R. (2014). A Spatio-Temporal Model for
-  Estimating the Long-Term Effects of Air Pollution on Respiratory Hospital
-  Admissions in Greater London. *Spatial and Spatio-temporal Epidemiology*, 10, 29-38.
-- Paul, M., & Held, L. (2011). Predictive assessment of a non-linear random
-  effects model for multivariate time series of infectious disease counts.
-  *Statistics in Medicine*, 30(10), 1118-1136.
+# Computational Methods (for the `rho` field)
+- `:spectral` (default): An efficient, AD-safe method using spectral decomposition.
+- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
+- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
+  factorization, suitable for gradient-free samplers.
 
 # Fields
 - `rho_model_type::Symbol`: The type of GMRF model for the spatial `rho` field.
@@ -53,12 +38,14 @@ environmental processes where local geography affects temporal dynamics.
 - `rho_rho::Union{UnivariateDistribution, Nothing}`: Prior for the mixing parameter
   of the `rho` field's model (used for `:bym2`, `:leroux`).
 - `sigma::UnivariateDistribution`: Prior for the std. dev. of the AR(1) innovations.
+- `method::Symbol`: The computational method for the `rho` field.
 """
 struct SVAR <: ComponentModel
     rho_model_type::Symbol
     rho_sigma::UnivariateDistribution
     rho_rho::Union{UnivariateDistribution, Nothing}
     sigma::UnivariateDistribution
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:svar] = SVAR
@@ -67,7 +54,8 @@ COMPONENT_CONSTRUCTORS[:svar] = (p, params) -> SVAR(
     get(params, :model, :icar),
     p.rho_sigma,
     get(p, :rho_rho, nothing),
-    p.sigma
+    p.sigma,
+    get(params, :method, :spectral)
 )
 
 MODEL_TO_STRUCTURE_MAP[:svar] = :spacetime
@@ -121,10 +109,9 @@ end
 """
     get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Pre-computes structures for the SVAR component.
-Builds the precision matrix template (`Q_rho_template`) and its spectral
-decomposition for the spatial GMRF model governing the `rho` parameter. This is
-essential for efficient, AD-compatible sampling of the `rho` field.
+Pre-computes structures for the SVAR component. Builds the precision matrix
+template (`Q_rho_template`) and its spectral decomposition and Cholesky
+factorization for the spatial GMRF model governing the `rho` parameter.
 """
 function get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     s_N = get(M, :s_N, 0)
@@ -134,12 +121,15 @@ function get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     W = get(M, :W, nothing)
 
     template = build_structure_template(m.rho_model_type, s_N; W=W)
+    
+    F_rho = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
 
     return (
         Q_rho_template=template.matrix,
         U_rho=template.U,
         L_rho=template.L,
-        scaling_factor_rho=template.scaling_factor
+        scaling_factor_rho=template.scaling_factor,
+        cholesky_factor_rho=F_rho
     )
 end
 
@@ -173,78 +163,90 @@ function get_priors(m::SVAR, spec::NamedTuple, arch::String, outcome_idx, M)::St
     return join(priors_acc, "\n    ")
 end
 
+
 """
     get_updates(m::SVAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code for the SVAR update logic.
-This function generates code to:
-1. Reconstruct the spatially varying `rho` field using a spectral method.
-2. Evolve the state-space model over time for each spatial unit.
-3. Map the resulting 2D spatiotemporal field to the 1D observation vector.
-4. Add the final effect to the linear predictor `eta`.
+Generates the Turing code for the SVAR update logic, dispatching on the chosen
+method for reconstructing the `rho` field.
 """
-function get_updates(m::SVAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
+function get_updates(
+    m::SVAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     v = generate_full_variable_names(spec, arch, outcome_idx)
-    eta_target = is_multivariate ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    s_N = M.s_N
-    t_N = M.t_N
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    s_N, t_N = M.s_N, M.t_N
+    key = spec.key
 
-    rho_recon_code = if m.rho_model_type in [:icar, :besag, :rw1, :rw2, :cyclic]
+    local rho_recon_code
+    if m.method == :spectral
+        rho_recon_code = """
+            local hyper_rho = spec_registry[:$(key)].hyper
+            local D_rho = $(v.rho_sigma) ./ sqrt.(hyper_rho.L_rho .+ M.noise)
+            if $(m.rho_model_type) in [:icar, :besag]; D_rho[1] = 0.0; end
+            local rho_field = hyper_rho.U_rho * (D_rho .* $(v.rho_raw))
         """
-        local D_rho = $(v.rho_sigma) ./ sqrt.(spec.hyper.L_rho .+ M.noise)
-        local rho_field = spec.hyper.U_rho * (D_rho .* $(v.rho_raw))
+    elseif m.method == :cholesky
+        rho_recon_code = """
+            local F_rho = spec_registry[:$(key)].hyper.cholesky_factor_rho
+            local rho_field_raw = F_rho.L' \\ $(v.rho_raw)
+            if $(m.rho_model_type) in [:icar, :besag]; Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(s_N)), sum(rho_field_raw)); end
+            local rho_field = rho_field_raw .* $(v.rho_sigma)
         """
-    elseif m.rho_model_type in [:leroux, :bym2]
+    else # :cholesky_sparse
+        rho_recon_code = """
+            local Q_rho = spec_registry[:$(key)].hyper.Q_rho_template
+            local F_rho = cholesky(Symmetric(Q_rho + M.noise * I))
+            local rho_field_raw = F_rho.L' \\ $(v.rho_raw)
+            if $(m.rho_model_type) in [:icar, :besag]; Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(s_N)), sum(rho_field_raw)); end
+            local rho_field = rho_field_raw .* $(v.rho_sigma)
         """
-        local L_rho_mixed = (1 .- $(v.rho_rho)) .+ $(v.rho_rho) .* spec.hyper.L_rho
-        local D_rho = $(v.rho_sigma) ./ sqrt.(L_rho_mixed .+ M.noise)
-        local rho_field = spec.hyper.U_rho * (D_rho .* $(v.rho_raw))
-        """
-    else # Default to IID
-        "local rho_field = $(v.rho_sigma) .* $(v.rho_raw)"
     end
 
     return """
-    # --- SVAR Component: $(spec.key) ---
-    # 1. Reconstruct the spatially-varying AR(1) coefficient `rho`.
-    $(rho_recon_code)
-    local rho_s = tanh.(rho_field) # Constrain rho to (-1, 1)
+        # --- SVAR Component: $(key) ($(m.method)) ---
+        let
+            # 1. Reconstruct the spatially-varying AR(1) coefficient `rho`.
+            $(rho_recon_code)
+            local rho_s = tanh.(rho_field) # Constrain rho to (-1, 1)
 
-    # 2. Evolve the SVAR state-space.
-    local latent_st = zeros(eltype(rho_s), $(s_N), $(t_N))
-    local innov_grid = reshape($(v.innov), $(s_N), $(t_N))
-    
-    # Initialize t=1 with stationary variance.
-    latent_st[:, 1] = ($(v.sigma) ./ sqrt.(1 .- rho_s.^2)) .* innov_grid[:, 1]
-    
-    # Evolve for t > 1.
-    for t in 2:$(t_N)
-        latent_st[:, t] = rho_s .* latent_st[:, t-1] .+ $(v.sigma) .* innov_grid[:, t]
-    end
-    
-    # 3. Map the 2D latent field back to the 1D observation vector.
-    $(v.latent) = [latent_st[M.s_idx[i], M.t_idx[i]] for i in 1:M.y_N]
+            # 2. Evolve the SVAR state-space.
+            local latent_st = zeros(eltype(rho_s), $(s_N), $(t_N))
+            local innov_grid = reshape($(v.innov), $(s_N), $(t_N))
+            
+            latent_st[:, 1] = ($(v.sigma) ./ sqrt.(1 .- rho_s.^2)) .* innov_grid[:, 1]
+            for t in 2:$(t_N)
+                latent_st[:, t] = rho_s .* latent_st[:, t-1] .+ $(v.sigma) .* innov_grid[:, t]
+            end
+            
+            # 3. Map the 2D latent field back to the 1D observation vector.
+            $(v.latent) = [latent_st[M.s_idx[i], M.t_idx[i]] for i in 1:M.y_N]
 
-    # 4. Add the effect to the linear predictor.
-    $(eta_target) .+= $(v.latent)
+            # 4. Add the effect to the linear predictor.
+            $(eta_target) .+= $(v.latent)
+        end
     """
 end
 
 """
     get_effects(m::SVAR, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
 
-Reconstructs the SVAR component's effect from posteriors.
-Extracts posterior samples for all hyperparameters and latent variables. For each
-sample, it reconstructs the `rho` field and re-runs the state-space evolution
-to generate the full posterior distribution of the spatiotemporal effect.
+Reconstructs the SVAR component's effect from posteriors, dispatching on the
+method used for sampling.
 """
-function get_effects(m::SVAR, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
-    structured_effects = []
+function get_effects(
+    m::SVAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
+    structured_effects = Vector{Matrix{Float64}}()
     is_multivariate = outcomes_N > 1
     is_shared = get(spec.params, :shared, false)
-    s_N = M.s_N
-    t_N = M.t_N
+    s_N, t_N, noise = M.s_N, M.t_N, M.noise
     n_latent_svar = s_N * t_N
+
+    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
+    t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, PS.t_idx)
 
     for k in 1:outcomes_N
         outcome_idx = is_multivariate ? k : nothing
@@ -254,8 +256,8 @@ function get_effects(m::SVAR, chain, M, n_samples, outcomes_N, p_names, spec, PS
         rho_sigma_var = (is_shared) ? v_shared.rho_sigma : v.rho_sigma
         sigma_var = (is_shared) ? v_shared.sigma : v.sigma
         
-        rho_sigma_samples = get_params_vector(chain, string(rho_sigma_var), 1)
-        sigma_samples = get_params_vector(chain, string(sigma_var), 1)
+        rho_sigma_samples = get_params_vector(chain, string(rho_sigma_var), 1)[:, 1]
+        sigma_samples = get_params_vector(chain, string(sigma_var), 1)[:, 1]
         rho_raw_samples = get_params_vector(chain, string(v.rho_raw), s_N)
         innov_samples = get_params_vector(chain, string(v.innov), n_latent_svar)
 
@@ -263,47 +265,38 @@ function get_effects(m::SVAR, chain, M, n_samples, outcomes_N, p_names, spec, PS
         if m.rho_model_type in [:leroux, :bym2] && !isnothing(m.rho_rho)
             rho_rho_var = (is_shared) ? v_shared.rho_rho : v.rho_rho
             if !isnothing(rho_rho_var) && Symbol(rho_rho_var) in names(chain)
-                rho_rho_samples = get_params_vector(chain, string(rho_rho_var), 1)
+                rho_rho_samples = get_params_vector(chain, string(rho_rho_var), 1)[:, 1]
             end
         end
         
-        T = eltype(chain.value)
-        effect_k = Matrix{T}(undef, M.y_N, n_samples)
-
-        U_rho = spec.hyper.U_rho
-        L_rho = spec.hyper.L_rho
+        effect_k = zeros(Float64, N_total, n_samples)
+        hyper = spec.hyper
 
         for s in 1:n_samples
-            rho_sigma_s = rho_sigma_samples[s, 1]
-            sigma_s = sigma_samples[s, 1]
-            rho_raw_s = rho_raw_samples[s, :]
-            innov_s = innov_samples[s, :]
-
             local rho_field_s
-            if m.rho_model_type in [:icar, :besag, :rw1, :rw2, :cyclic]
-                D_rho_s = rho_sigma_s ./ sqrt.(L_rho .+ M.noise)
-                rho_field_s = U_rho * (D_rho_s .* rho_raw_s)
-            elseif m.rho_model_type in [:leroux, :bym2] && !isnothing(rho_rho_samples)
-                rho_rho_s = rho_rho_samples[s, 1]
-                L_rho_mixed = (1 .- rho_rho_s) .+ rho_rho_s .* L_rho
-                D_rho_s = rho_sigma_s ./ sqrt.(L_rho_mixed .+ M.noise)
-                rho_field_s = U_rho * (D_rho_s .* rho_raw_s)
-            else # IID
-                rho_field_s = rho_sigma_s .* rho_raw_s
+            if m.method == :spectral
+                D_rho_s = rho_sigma_samples[s] ./ sqrt.(hyper.L_rho .+ noise)
+                if m.rho_model_type in [:icar, :besag]; D_rho_s[1] = 0.0; end
+                rho_field_s = hyper.U_rho * (D_rho_s .* rho_raw_samples[s, :])
+            else # :cholesky or :cholesky_sparse
+                F_rho = hyper.cholesky_factor_rho
+                rho_field_raw = F_rho.L' \ rho_raw_samples[s, :]
+                if m.rho_model_type in [:icar, :besag]; rho_field_raw .-= mean(rho_field_raw); end
+                rho_field_s = rho_field_raw .* rho_sigma_samples[s]
             end
             rho_s_s = tanh.(rho_field_s)
 
-            latent_st_s = zeros(T, s_N, t_N)
-            innov_grid_s = reshape(innov_s, s_N, t_N)
+            latent_st_s = zeros(Float64, s_N, t_N)
+            innov_grid_s = reshape(innov_samples[s, :], s_N, t_N)
             
             denom = sqrt.(max.(0, 1 .- rho_s_s.^2))
-            latent_st_s[:, 1] = (sigma_s ./ (denom .+ M.noise)) .* innov_grid_s[:, 1]
+            latent_st_s[:, 1] = (sigma_samples[s] ./ (denom .+ noise)) .* innov_grid_s[:, 1]
             for t in 2:t_N
-                latent_st_s[:, t] = rho_s_s .* latent_st_s[:, t-1] .+ sigma_s .* innov_grid_s[:, t]
+                latent_st_s[:, t] = rho_s_s .* latent_st_s[:, t-1] .+ sigma_samples[s] .* innov_grid_s[:, t]
             end
             
-            for i in 1:M.y_N
-                effect_k[i, s] = latent_st_s[M.s_idx[i], M.t_idx[i]]
+            for i in 1:N_total
+                effect_k[i, s] = latent_st_s[s_idx_full[i], t_idx_full[i]]
             end
         end
         push!(structured_effects, effect_k)

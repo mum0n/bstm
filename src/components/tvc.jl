@@ -6,7 +6,7 @@ covariate to vary smoothly over time. It acts as an orchestrator, applying an in
 temporal `ComponentModel` to a specified covariate.
 
 # Version
-v1.0.1 (2026-08-09)
+v1.0.2 (2026-08-10)
 
 # Mathematical Summary
 A TVC model replaces a fixed regression coefficient \$\\beta\$ with a time-indexed
@@ -23,23 +23,11 @@ example, if the inner model is a second-order random walk (RW2), then:
 
 This allows the model to learn how the influence of a covariate changes over time.
 
-# Assumptions
-- The relationship between the covariate and the outcome is linear at any given
-  time point, but the slope of that relationship can change over time.
-- The temporal variation of the coefficient can be adequately captured by the
-  specified inner temporal model (e.g., `RW2`, `AR1`).
-
-# Best Use Case
-Modeling relationships that are not constant over time. For example, the effect of
-an economic policy on GDP may change as the economy adapts, or the effectiveness of
-a drug may change over the course of a long-term study.
-
-# Key References
-- West, M., & Harrison, J. (1997). *Bayesian forecasting and dynamic models*.
-  Springer Science & Business Media.
-- Prisma, C., & Frühwirth-Schnatter, S. (2021). Bayesian analysis of time-varying
-  coefficient models: A new look at the role of the forgetting factor. *Econometrics
-  and Statistics*, 18, 136-151.
+# Computational Methods
+The `TVC` component does not have its own methods. The computational method is
+determined by the `method` parameter of the inner temporal model. For example, to
+use a spectral decomposition for the time-varying coefficient, you would specify:
+`... |> random(year, model=rw2, method=:spectral)`
 
 # Fields
 - `covariate::Symbol`: The symbol of the covariate whose coefficient varies over time.
@@ -63,6 +51,7 @@ COMPONENT_CONSTRUCTORS[:tvc] = (p, params) -> begin
 end
 
 MODEL_TO_STRUCTURE_MAP[:tvc] = :temporal
+
 
 """
     get_datastructures!(m_type::Type{<:TVC}, M::Dict, mod_data::Dict)::Bool
@@ -160,7 +149,10 @@ Delegates the construction of the time-varying coefficient field to the inner
 model, and then multiplies this field by the specified covariate value for each
 observation before adding it to the linear predictor `eta`.
 """
-function get_updates(m::TVC, spec::NamedTuple, arch::String, outcome_idx, M)::String
+function get_updates(
+    m::TVC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     cov_var = m.covariate
 
@@ -178,8 +170,13 @@ function get_updates(m::TVC, spec::NamedTuple, arch::String, outcome_idx, M)::St
     inner_p_names = generate_full_variable_names(inner_spec, arch, outcome_idx)
     inner_latent_var = inner_p_names.latent
 
+    # The inner component's `get_updates` will generate code that includes adding
+    # its effect to `eta`. We must remove this part to prevent double-counting,
+    # as the TVC component applies the effect in its own way (multiplied by the covariate).
     effect_app_regex = Regex("$(eta_target) .*\\.=")
-    update_inner_cleaned = replace(inner_updates_code, effect_app_regex => "# (eta update handled by TVC)")
+    update_inner_cleaned = replace(
+        inner_updates_code, effect_app_regex => "# (eta update handled by TVC)"
+    )
 
     application_code = "$(eta_target) .+= M.data[!, :$(cov_var)] .* view($(inner_latent_var), M.t_idx)"
     
@@ -200,7 +197,10 @@ Reconstructs the TVC component's effect from posteriors.
 Reconstructs the inner temporal field for each posterior sample and then multiplies
 it by the covariate values to get the final TVC effect for each observation.
 """
-function get_effects(m::TVC, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total)::NamedTuple
+function get_effects(
+    m::TVC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+)::NamedTuple
     cov_var = m.covariate
     
     inner_spec_key = Symbol("$(spec.key)_inner")
@@ -213,31 +213,28 @@ function get_effects(m::TVC, chain, M, n_samples, outcomes_N, p_names, spec, PS,
         hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
     )
 
-    inner_p_names = generate_full_variable_names(inner_spec, M.model_arch, nothing)
-    inner_effects_result = get_effects(m.model, chain, M, n_samples, outcomes_N, inner_p_names, inner_spec, PS, N_total)
+    # Recursively call get_effects on the inner temporal model
+    inner_effects_result = get_effects(
+        m.model, chain, M, n_samples, outcomes_N, inner_spec, PS, N_total
+    )
     
+    # Get the full covariate vector (training + prediction)
     cov_data_full = if !isnothing(PS) && hasproperty(PS.data, cov_var)
         vcat(M.data[!, cov_var], PS.data[!, cov_var])
     else
         M.data[!, cov_var]
     end
 
-    t_idx_full = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
-        vcat(M.t_idx, PS.data[!, :t_idx])
-    else
-        M.t_idx
-    end
-
+    # The inner effect is already indexed to the observation level, so we just
+    # need to multiply it by the covariate.
     structured_effects = Vector{Matrix{Float64}}()
     for k in 1:outcomes_N
-        temporal_field_k = inner_effects_result.structured[k]
-        effect_k = zeros(Float64, N_total, n_samples)
-
-        for s in 1:n_samples
-            temporal_field_sample = view(temporal_field_k, :, s)
-            effect_k[:, s] = view(temporal_field_sample, t_idx_full) .* cov_data_full
-        end
-        push!(structured_effects, effect_k)
+        temporal_effect_k = inner_effects_result.structured[k]
+        
+        # Element-wise multiplication of the covariate and the temporal effect
+        final_effect_k = temporal_effect_k .* cov_data_full
+        
+        push!(structured_effects, final_effect_k)
     end
 
     return (structured=structured_effects, noisy=structured_effects)

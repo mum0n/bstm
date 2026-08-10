@@ -2124,104 +2124,188 @@ is now initialized using the type of the `intercept` parameter. This ensures tha
 `eta` is allocated with the correct `Dual` number type during AD, preventing
 `MethodError` when `Dual`-valued latent effects are added to it.
 """
-function bstm_text_assembler(config::NamedTuple, model_func_name::Symbol)
-    priors_acc = String[]
-    updates_acc = String[]
-    
-    is_multivariate = config.model_arch == "multivariate"
-    arch_str = config.model_arch
+function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
+    # This function assembles the full Turing model string from various code fragments.
+    # It orchestrates the inclusion of priors, the linear predictor assembly, and the
+    # final likelihood evaluation.
 
-    # --- 1. Generate all prior definitions ---
-    push!(priors_acc, _generate_likelihood_section(config, is_multivariate))
-    
-    intercept_priors, intercept_update = _generate_intercept_block(config, is_multivariate, is_multivariate ? "eta_latent" : "eta")
-    push!(priors_acc, intercept_priors)
-    
-    fixed_effects_priors, fixed_effects_update = _generate_fixed_effects_block(config, is_multivariate, is_multivariate ? "eta_latent" : "eta")
-    push!(priors_acc, fixed_effects_priors)
+    arch = get(M, :model_arch, "univariate")
+    is_multivariate = arch == "multivariate"
 
-    # --- 2. Assemble the linear predictor updates ---
-    # NOTE: The intercept update is now handled in the initialization block below, not here.
-    push!(updates_acc, _generate_offset_block(config, is_multivariate, is_multivariate ? "eta_latent" : "eta"))
-    push!(updates_acc, fixed_effects_update)
-
-    # --- 3. Main Component Loop ---
-    for spec in config.components
-        m_obj = spec.component_obj
-        if m_obj isa None; continue; end
-
-        push!(priors_acc, "\n# --- Priors for component: $(spec.key) ---")
-        push!(updates_acc, "\n# --- Updates for component: $(spec.key) ---")
-
-        if is_multivariate
-            for k in 1:config.outcomes_N
-                push!(priors_acc, get_priors(m_obj, spec, arch_str, k, config))
-                push!(updates_acc, get_updates(m_obj, spec, arch_str, k, config))
-            end
-        else
-            push!(priors_acc, get_priors(m_obj, spec, arch_str, nothing, config))
-            push!(updates_acc, get_updates(m_obj, spec, arch_str, nothing, config))
-        end
-    end
-
-    # --- 4. Assemble Final Code Blocks ---
-    priors_code = join(filter(!isempty, priors_acc), "\n    ")
-    updates_code = join(filter(!isempty, updates_acc), "\n")
-    
-    final_likelihood_code = _generate_final_likelihood_block(config, is_multivariate)
-
-    # --- 5. Construct the final model string ---
     eta_name = is_multivariate ? "eta_latent" : "eta"
-    
-    # AD-safe initialization block for eta
-    eta_initialization_block = if get(config, :add_intercept, false)
+    # AD-safe initialization. Initialize with intercept, but ensure the base array is of type T.
+    # This handles type promotion correctly when intercept is Float64 and T is Dual.
+    eta_init = if get(M, :add_intercept, false)
         if is_multivariate
-            """
-            # Initialize eta_latent with the intercept to get the correct AD type
-            local $(eta_name) = repeat(intercept', M.y_N, 1)
-            """
+            "intercept' .+ zeros(T, N, K)"
         else
-             """
-            # Initialize eta with the intercept to get the correct AD type
-            local $(eta_name) = fill(intercept, M.y_N)
-            """
+            "intercept .+ zeros(T, N)"
         end
     else
-        # Fallback for models without an intercept. This may fail AD if the first
-        # component added to eta is a Dual number and not handled with promotion.
+        # If no intercept, initialize with zeros of type T.
         if is_multivariate
-            "local $(eta_name) = zeros(T, M.y_N, M.outcomes_N)"
+            "zeros(T, N, K)"
         else
-            "local $(eta_name) = zeros(T, M.y_N)"
+            "zeros(T, N)"
         end
     end
+
+    outcomes_N = get(M, :outcomes_N, 1)
+
+    spec_registry = Dict{Symbol, Any}()
+    priors_acc = String[]
+    updates_acc = String[]
+
+    main_spatial_spec = nothing
+    main_temporal_spec = nothing
+    
+    has_custom_likelihood_from_component = any(spec -> any(T -> spec.component_obj isa T, [LGCP, LogGammaCoxProcess, ShotNoiseCoxProcess]), M.components)
+    has_custom_likelihood_from_family = any(spec -> string(get(spec, :family, "")) == "ordinal", M.likelihood_specs)
+    has_custom_likelihood = has_custom_likelihood_from_component || has_custom_likelihood_from_family
+
+    # Generate all code fragments first
+    intercept_priors, intercept_update = _generate_intercept_block(M, is_multivariate, eta_name)
+    if !isempty(intercept_priors); push!(priors_acc, intercept_priors); end
+    
+    offset_block = _generate_offset_block(M, is_multivariate, eta_name)
+    
+    fixed_effects_priors, fixed_effects_update = _generate_fixed_effects_block(M, is_multivariate, eta_name)
+    if !isempty(fixed_effects_priors); push!(priors_acc, fixed_effects_priors); end
+    
+    # The update blocks must be ordered correctly.
+    # The intercept update is now handled by the `eta` initialization itself.
+    # push!(updates_acc, intercept_update) # This would add the intercept twice.
+    push!(updates_acc, offset_block)
+    push!(updates_acc, fixed_effects_update)
+
+
+    if get(M, :is_multivariate_dynamics, false)
+        mv_dyn_key = M[:multivariate_dynamics_key]
+        spec_idx = findfirst(s -> string(s.key) == mv_dyn_key, M.components)
+        if !isnothing(spec_idx)
+            spec = M.components[spec_idx]
+            spec_registry[spec.key] = spec
+            frags = _generate_component_code_fragments(spec.component_obj, spec, arch, nothing, M)
+            push!(priors_acc, frags.priors)
+            push!(updates_acc, frags.update)
+        end
+    end
+
+    for spec in M.components
+        if get(M, :is_multivariate_dynamics, false) && string(spec.key) == M[:multivariate_dynamics_key]
+            continue
+        end
+        # Corrected line: Use Symbol key `spec.key` instead of `string(spec.key)`.
+        spec_registry[spec.key] = spec
+        for k in 1:outcomes_N
+            outcome_idx = is_multivariate ? k : nothing            
+            frag = _generate_component_code_fragments(spec.component_obj, spec, arch, outcome_idx, M)
+            if !isempty(Base.strip(frag.priors)); push!(priors_acc, frag.priors); end
+            if !isempty(Base.strip(frag.update)); push!(updates_acc, frag.update); end
+        end
+
+        if spec.structure == :spatial && isnothing(main_spatial_spec); main_spatial_spec = spec; end
+        if spec.structure == :temporal && isnothing(main_temporal_spec); main_temporal_spec = spec; end
+    end
+
+    function _indent_block(text::String, level=1)
+        if isempty(Base.strip(text)) return "" end
+        indent_str = "    " ^ level
+        return indent_str * replace(Base.strip(text), "\n" => "\n" * indent_str)
+    end
+
+    likelihood_section_priors = _generate_likelihood_section(M, is_multivariate)
+    st_interaction_block = _generate_st_interaction_block(M, main_spatial_spec, main_temporal_spec, is_multivariate, eta_name)
+    householder_priors, householder_update = _generate_householder_reflection_block(M, is_multivariate, eta_name)
+    
+    final_likelihood = if has_custom_likelihood
+        if has_custom_likelihood_from_family; _generate_final_likelihood_block(M, is_multivariate); else ""; end
+    else
+        _generate_final_likelihood_block(M, is_multivariate)
+    end
+    
+    nested_priors, nested_updates, nested_likelihoods = _generate_nested_model_block(M, is_multivariate, eta_name)
+    
+    # Add all remaining priors to the accumulator
+    if !isempty(Base.strip(likelihood_section_priors)); push!(priors_acc, likelihood_section_priors); end
+    if !isempty(Base.strip(householder_priors)); push!(priors_acc, householder_priors); end
+    if !isempty(Base.strip(nested_priors)); push!(priors_acc, nested_priors); end
+
+    priors_code = join(priors_acc, "\n\n")
+    updates_code = join(updates_acc, "\n\n")
 
     model_string = """
-    @model function $(model_func_name)(M, spec_registry; T=Float64)
-        # --- Priors ---
-        $(priors_code)
+@model function $(model_func_name)(M, spec_registry; T::Type=Float64)
+    noise =M.noise
+    N = M.y_N
+    K = $(outcomes_N)
 
-        # --- Model Definition ---
-        # --- Linear Predictor Assembly ---
-        $(eta_initialization_block)
-        
-        $(updates_code)
-        
-        # --- Likelihood ---
-        if !get(M, :likelihood_handled, false)
-            $(final_likelihood_code)
-        end
+    # --- Priors & Hyperparameters ---
+$(_indent_block(priors_code))
+
+    # --- Linear Predictor Assembly ---
+    # Initialize eta with a type that matches the intercept to support AD. If the
+    # intercept is part of a NUTS block, it will be a Dual number, and so will eta.
+    # The intercept is added during initialization.
+    $(eta_name) = $(eta_init)
+
+$(_indent_block(updates_code))
+$(_indent_block(householder_update))
+$(_indent_block(nested_updates))
+$(_indent_block(st_interaction_block))
+
+    # --- Likelihood ---
+$(_indent_block(final_likelihood))
+$(_indent_block(nested_likelihoods))
+end
+"""
+ 
+    model_string_to_parse = model_string
+    
+    try
+        return model_string_to_parse, Meta.parse(model_string_to_parse), spec_registry
+    catch e
+        println("BSTM Assembler Error: Failed to parse the generated model string.")
+        println(model_string_to_parse)
+        rethrow(e)
     end
-    """
-
-    # --- 6. Create Spec Registry and Expression ---
-    spec_registry = NamedTuple(spec.key => spec for spec in config.components)
-    expr = Meta.parse(model_string)
-
-    return model_string, expr, spec_registry
 end
 
 
+
+# Version 1.0.0 (2026-08-10)
+# Purpose: A generic adapter to bridge the new component interface (`get_priors`,
+#          `get_updates`) with the model assembly engine, which expects a
+#          `_generate_component_code_fragments` function.
+# Rationale: During the refactor, components were updated to provide separate
+#            `get_priors` and `get_updates` methods. The model assembler, however,
+#            still calls a single `_generate_component_code_fragments` function.
+#            This generic method dispatches on the abstract `ComponentModel` type,
+#            calls the new interface methods for any given component, and returns
+#            the code fragments in the `(priors=..., update=...)` NamedTuple format
+#            that the assembler requires. This avoids having to define a legacy
+#            `_generate_...` function for every new component.
+function _generate_component_code_fragments(
+    m::ComponentModel,
+    spec::NamedTuple,
+    arch::String,
+    outcome_idx::Union{Int, Nothing},
+    M::NamedTuple;
+    prefix::String=""
+)
+    # This function acts as a generic adapter. It assumes that the component `m`
+    # has specialized `get_priors` and `get_updates` methods defined for it.
+    
+    # Generate the priors code string by calling the component's `get_priors` method.
+    priors_str = get_priors(m, spec, arch, outcome_idx, M)
+    
+    # Generate the update code string by calling the component's `get_updates` method.
+    update_str = get_updates(m, spec, arch, outcome_idx, M)
+    
+    # Return the code fragments as a NamedTuple, which is the format expected
+    # by the model assembly engine.
+    return (priors=priors_str, update=update_str)
+end
 
 
 
@@ -2642,17 +2726,19 @@ function create_pc_prior(param_name::Symbol, constraint::Tuple)
         return Normal(0, sigma)
     end
 end
+ 
 
-
-# Version 1.2.0 (2026-08-06)
-# Purpose: Automatically constructs an efficient composite Gibbs sampler for a `bstm` model.
-# Rationale: This version implements a sophisticated block-Gibbs strategy. It groups component-specific
-#            parameters (e.g., a spatial field and its hyperparameters) into a single block for joint
-#            sampling with NUTS, which is crucial for handling the "funnel" geometry in hierarchical models.
-#            For remaining parameters, it assigns specialized samplers based on their prior's support:
-#            ESS for Gaussian, Slice for bounded, and PG for discrete parameters. This hybrid approach
-#            significantly improves sampling efficiency and convergence over a single, general-purpose sampler.
-#            It also adds an `adtype` keyword to allow user control over the AD backend for NUTS.
+# Version 1.2.4 (2026-08-10)
+# Purpose: Automatically constructs an efficient composite Gibbs sampler and suggests
+#          an appropriate AD engine based on model complexity, with improved per-block AD selection.
+# Rationale: This version enhances the automatic AD engine selection. If the user does
+#            not specify an `adtype`, the function now implements a "smart default"
+#            strategy: it uses the robust `ForwardDiff.jl` for small parameter blocks
+#            (<= 10 parameters) and automatically switches to a more performant
+#            reverse-mode engine (`Enzyme.jl`) for larger blocks. If the user *does*
+#            specify an `adtype`, their choice is now respected for all blocks,
+#            resolving an issue where `ForwardDiff` was always used for small blocks.
+#            This provides both a better default experience and more user control.
 function get_optimal_sampler(
     model_obj::DynamicPPL.Model;
     sampler_choice=:auto,
@@ -2664,28 +2750,8 @@ function get_optimal_sampler(
     n_particles=20,
     hmc_leapfrog_steps=10
 )
-    # This function constructs a composite Gibbs sampler by assigning optimal MCMC algorithms
-    # to different blocks of parameters based on their characteristics. The process follows a
-    # clear hierarchy to provide both flexibility and efficiency.
-    #
-    # Sampler Selection Workflow:
-    # 1. Manual Override: If a specific sampler is provided via `sampler_choice`, it is used directly.
-    #    If a `sampler_map` is provided, it assigns specific samplers to designated parameters,
-    #    taking the highest precedence.
-    #
-    # 2. Component Grouping: If `group_components=true`, the function identifies all parameters
-    #    belonging to the same model component (e.g., a spatial field and its hyperparameters).
-    #    These are grouped into a single block and assigned a NUTS sampler. This is crucial for
-    #    efficiently exploring the correlated posterior geometry of hierarchical components.
-    #
-    # 3. Default Categorization: Any remaining parameters are categorized by their prior's support:
-    #    - `:discrete` (e.g., from Categorical priors) are assigned Particle Gibbs (PG).
-    #    - `:gaussian` (from Normal or MvNormal priors) are assigned Elliptical Slice Sampling (ESS).
-    #    - `:bounded` (from priors like Beta, Exponential) are assigned Slice sampling.
-    #    - `:other_continuous` (unbounded, non-Gaussian) are assigned NUTS.
-    #
-    # This strategy balances the use of efficient gradient-based samplers (NUTS) for complex,
-    # high-dimensional blocks with robust gradient-free samplers for simpler or constrained parameters.
+    # This function constructs a composite Gibbs sampler by assigning optimal MCMC
+    # algorithms to different blocks of parameters based on their characteristics.
 
     if sampler_choice isa AbstractMCMC.AbstractSampler
         @info "Using user-specified sampler: $(typeof(sampler_choice))"
@@ -2694,6 +2760,18 @@ function get_optimal_sampler(
 
     vi = DynamicPPL.VarInfo(model_obj)
     vns = DynamicPPL.keys(vi)
+    num_params = length(vns)
+
+    # --- AD Engine Suggestion ---
+    # Suggest a reverse-mode AD engine for models with many parameters.
+    param_threshold = 100
+    if num_params > param_threshold && adtype isa ADTypes.AbstractForwardMode
+        @info "Model has a large number of parameters ($num_params). Consider using a reverse-mode AD engine like `Enzyme.jl` or `ReverseDiff.jl` for potentially better performance. You can specify this with the `adtype=ADTypes.AutoEnzyme()` or `adtype=ADTypes.AutoReverseDiff()` argument."
+    elseif adtype isa ADTypes.AbstractReverseMode
+        @info "Model has $num_params parameters. The chosen reverse-mode AD engine ($(typeof(adtype))) is appropriate."
+    else
+        @info "Model has $num_params parameters. The current AD engine ($(typeof(adtype))) is likely appropriate."
+    end
 
     sampler_assignments = []
     all_processed_vns = Set{VarName}()
@@ -2713,44 +2791,56 @@ function get_optimal_sampler(
     # --- Stage 2: Group parameters by model component if enabled ---
     if group_components
         @info "Component grouping enabled. Grouping hyperparameters and latent fields for joint sampling."
-        component_groups = Dict{String, Set{VarName}}()
         
-        # This list contains the standard prefixes for parameters generated by `bstm`.
-        # It is used to parse variable names like `sigma_spatial_main` into a prefix (`sigma`)
-        # and a component key (`spatial_main`).
-        all_prefixes = [
-            "sigma", "rho", "rho1", "rho2", "kappa", "ls", "range", "period",
-            "amplitude", "phase", "velocity", "diffusion", "pca_sd", "pdef_sd",
-            "L_corr", "sigma_effects", "r", "K", "q", "M_nat", "alpha", "beta", "gamma", "delta",
-            "raw", "innov", "latent", "struct", "iid", "beta_cos", "beta_sin", "rho_field",
-            "W", "b", "v_raw", "factors_flat", "thresh_raw", "W1", "b1", "W2", "amplitude_raw",
-            "innov_predator"
-        ]
-        prefix_regex = Regex("^(" * join(all_prefixes, "|") * ")_(.+)\$")
+        component_keys = string.([spec.key for spec in model_obj.args.M.components])
+        sort!(component_keys, by=length, rev=true)
 
-        for vn in vns
-            if vn in all_processed_vns; continue; end
+        component_groups = Dict{String, Set{VarName}}()
+        vns_to_check = filter(vn -> !(vn in all_processed_vns), vns)
 
+        for vn in vns_to_check
             vn_str = string(DynamicPPL.getsym(vn))
-            m = match(prefix_regex, vn_str)
-            
-            if !isnothing(m)
-                component_key = m.captures[2]
-                if !haskey(component_groups, component_key)
-                    component_groups[component_key] = Set{VarName}()
+            found_key = nothing
+            for key in component_keys
+                if occursin(Regex("\\b$(key)\\b"), vn_str)
+                    found_key = key
+                    break
                 end
-                push!(component_groups[component_key], vn)
+            end
+            
+            if !isnothing(found_key)
+                if !haskey(component_groups, found_key)
+                    component_groups[found_key] = Set{VarName}()
+                end
+                push!(component_groups[found_key], vn)
             end
         end
 
-        # Assign a NUTS sampler to each identified component group.
+        # Determine if the user provided a non-default AD type.
+        is_default_ad = adtype isa ADTypes.AutoForwardDiff
+
         for (key, params_vns) in component_groups
-            if !isempty(params_vns)
-                sampler = NUTS(adaptation_steps, target_acceptance; adtype=adtype)
-                push!(sampler_assignments, Tuple(params_vns) => sampler)
-                union!(all_processed_vns, params_vns)
-                param_syms = Set(DynamicPPL.getsym.(params_vns))
-                @info "Created NUTS block for component '$(key)' with parameters: $(param_syms)"
+            params_to_sample = setdiff(params_vns, all_processed_vns)
+            if !isempty(params_to_sample)
+                # --- Per-Block AD Selection ---
+                local block_adtype
+                if is_default_ad
+                    # Smart default: Use ForwardDiff for small blocks, Enzyme for large ones.
+                    block_adtype = if length(params_to_sample) <= 10
+                        ADTypes.AutoForwardDiff()
+                    else
+                        ADTypes.AutoEnzyme()
+                    end
+                else
+                    # User override: Respect the user's choice for all blocks.
+                    block_adtype = adtype
+                end
+
+                sampler = NUTS(adaptation_steps, target_acceptance; adtype=block_adtype)
+                push!(sampler_assignments, Tuple(params_to_sample) => sampler)
+                union!(all_processed_vns, params_to_sample)
+                param_syms = Set(DynamicPPL.getsym.(params_to_sample))
+                @info "Created NUTS block for component '$(key)' with parameters: $(param_syms) using AD: $(typeof(block_adtype))"
             end
         end
     end
@@ -2776,16 +2866,33 @@ function get_optimal_sampler(
                     end
                 end
             catch e
-                # If we can't determine the distribution, default to the 'other' category.
                 push!(param_groups[:other_continuous], vn)
             end
         end
 
-        # Assign appropriate samplers to each category.
         if !isempty(param_groups[:discrete]); params = Tuple(param_groups[:discrete]); push!(sampler_assignments, params => PG(n_particles)); @info "Using Particle Gibbs (PG) for: $(DynamicPPL.getsym.(params))"; end
         if !isempty(param_groups[:gaussian]); params = Tuple(param_groups[:gaussian]); push!(sampler_assignments, params => ESS()); @info "Using Elliptical Slice Sampling (ESS) for: $(DynamicPPL.getsym.(params))"; end
         if !isempty(param_groups[:bounded]); params = Tuple(param_groups[:bounded]); push!(sampler_assignments, params => Slice()); @info "Using Slice sampling for: $(DynamicPPL.getsym.(params))"; end
-        if !isempty(param_groups[:other_continuous]); params = Tuple(param_groups[:other_continuous]); push!(sampler_assignments, params => NUTS(adaptation_steps, target_acceptance; adtype=adtype)); @info "Using NUTS for remaining continuous parameters: $(DynamicPPL.getsym.(params))"; end
+        if !isempty(param_groups[:other_continuous])
+            params = Tuple(param_groups[:other_continuous])
+            
+            is_default_ad = adtype isa ADTypes.AutoForwardDiff
+            local block_adtype
+            if is_default_ad
+                # Smart default for the final block.
+                block_adtype = if length(params) <= 10
+                    ADTypes.AutoForwardDiff()
+                else
+                    ADTypes.AutoEnzyme()
+                end
+            else
+                # User override.
+                block_adtype = adtype
+            end
+
+            push!(sampler_assignments, params => NUTS(adaptation_steps, target_acceptance; adtype=block_adtype))
+            @info "Using NUTS for remaining continuous parameters: $(DynamicPPL.getsym.(params)) using AD: $(typeof(block_adtype))"
+        end
     end
 
     # --- Stage 4: Construct and return the final composite sampler ---
@@ -2793,13 +2900,11 @@ function get_optimal_sampler(
         @warn "Could not identify any parameters to sample. Defaulting to a single NUTS sampler for all parameters."
         return NUTS(adaptation_steps, target_acceptance; adtype=adtype)
     elseif length(sampler_assignments) == 1
-        # If only one group was formed, return that sampler directly, not wrapped in Gibbs.
         return sampler_assignments[1][2]
     else
         return Gibbs(sampler_assignments...)
     end
 end
-
 
 
 
@@ -4891,21 +4996,18 @@ has also been removed to align with the project's coding standards.
 - A tuple `(priors_code::String, updates_code::String)`.
 """
 function _generate_intercept_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
-    if !get(M, :add_intercept, false)
-        return "", ""
-    end
+    # This function generates the prior for the global intercept. The update
+    # is now handled by the initialization of `eta` in `bstm_text_assembler`
+    # to ensure AD type stability.
+    if !get(M, :add_intercept, false) return "", "" end
     
-    intercept_prior_obj = get(M, :intercept_prior, Normal(0, 5))
-    
-    dist_str, update_code = if is_multivariate
-        # For multivariate, the intercept is a vector of length K.
-        # We use broadcasting with a transpose to add it to each row of the eta_latent matrix.
-        ("filldist($(_distribution_to_string(intercept_prior_obj)), K)",
-         "$(eta_name) .+= intercept'")
+    intercept_prior_obj = get(M, :intercept_prior, Normal(0,5))
+    local dist_str, prior_code
+    update_code = "" # The update is handled by eta initialization.
+    if is_multivariate
+        dist_str = "filldist($(_distribution_to_string(intercept_prior_obj)), K)"
     else
-        # For univariate, the intercept is a scalar.
-        (_distribution_to_string(intercept_prior_obj),
-         "$(eta_name) .+= intercept")
+        dist_str = _distribution_to_string(intercept_prior_obj)
     end
     
     prior_code = "intercept ~ NamedDist($(dist_str), :intercept)"
@@ -5062,78 +5164,6 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
 end
 
 
-
-"""
-    compare_models(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])
-
-A utility for formal model comparison between two fitted `bstm` models. It uses
-their PSIS-LOO results to compute the difference in Expected Log Pointwise
-Predictive Density (ELPD) and provides a statistical basis for model selection.
-
-# Rationale
-This function is updated to be consistent with the refactored `bstm` framework,
-which uses the term "component" instead of the deprecated "manifold". The function
-name and internal print statements have been updated accordingly. The core logic,
-which relies on `PosteriorStats.compare`, remains unchanged as it is correct.
-
-# Arguments
-- `loo_a_report`, `loo_b_report`: The output `NamedTuple` from `bstm_loo` for each model.
-- `model_names`: A vector of strings with names for the models being compared.
-
-# Returns
-- A `NamedTuple` containing the comparison table, ELPD difference, and the original LOO objects.
-"""
-function compare_models(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])
-    println("--- Starting BSTM Model Comparison ---")
-
-    # 1. LOO Object Extraction
-    loo_a = loo_a_report.loo_obj
-    loo_b = loo_b_report.loo_obj
-
-    # 2. Formal Selection Metric Calculation
-    comparison_stats = nothing
-    try
-        comparison_stats = compare([loo_a, loo_b])
-    catch e
-        @error "BSTM Comparison Error: Selection suite failed. Error: " * string(e)
-        return nothing
-    end
-
-    # 3. Parameter and Diagnostic Extraction
-    p_loo_a = loo_a_report.metrics.p_loo
-    p_loo_b = loo_b_report.metrics.p_loo
-    elpd_a = loo_a_report.metrics.elpd
-    elpd_b = loo_b_report.metrics.elpd
-
-    # 4. Report Generation
-    println("\n--- BSTM Model Selection Registry ---")
-    println("Model A (", model_names[1], "): ELPD = ", round(elpd_a, digits=2), " | p_loo = ", round(p_loo_a, digits=2))
-    println("Model B (", model_names[2], "): ELPD = ", round(elpd_b, digits=2), " | p_loo = ", round(p_loo_b, digits=2))
-    diff_elpd = elpd_a - elpd_b
-    println("\nELPD Delta (A - B): ", round(diff_elpd, digits=2))
-
-    if abs(diff_elpd) > 4.0
-        winning_model = diff_elpd > 0 ? model_names[1] : model_names[2]
-        println("CONCLUSION: ", winning_model, " is statistically preferred based on predictive density.")
-    else
-        println("CONCLUSION: Competing models provide indistinguishable predictive density.")
-    end
-
-    # 5. Table Construction
-    comparison_df = DataFrame(
-        Metric = ["ELPD (LOO)", "Effective Parameters (p_loo)", "LOO-IC"],
-        Model_A = [elpd_a, p_loo_a, loo_a_report.metrics.looic],
-        Model_B = [elpd_b, p_loo_b, loo_b_report.metrics.looic]
-    )
-    comparison_df[!, :Delta] = comparison_df.Model_A .- comparison_df.Model_B
-    display(comparison_df)
-
-    return (
-        comparison_table = comparison_df,
-        elpd_diff = diff_elpd,
-        loo_objects = (loo_a, loo_b)
-    )
-end
 
 
 
@@ -6262,6 +6292,103 @@ function process_random_module!(opt_dict::Dict, mod_data::Dict, registries::Dict
 
     return true
 end
+
+
+
+function adjacency_to_bipartite(W::AbstractMatrix; force_bipartite::Bool=true)
+    # # Process: Translates a unipartite graph into a bipartite representation.
+    # # Rationale: Required for models like BCGN that operate on inter-set connectivity.
+    
+    rows, cols = size(W)
+    if rows != cols
+        error("Input matrix must be square to represent a unipartite adjacency structure.")
+    end
+    
+    n = rows
+    g = SimpleGraph(W)
+    
+    # # Coloring Algorithm: Attempt to find a natural 2-coloring (bipartition)
+    # # nodes are assigned to set 0 or set 1
+    colors = fill(-1, n)
+    is_bipartite = true
+    
+    for start_node in 1:n
+        if colors[start_node] != -1
+            continue
+        end
+        
+        colors[start_node] = 0
+        queue = [start_node]
+        
+        while !isempty(queue)
+            u = popfirst!(queue)
+            for v in Neighbors(g, u)
+                if colors[v] == -1
+                    colors[v] = 1 - colors[u]
+                    push!(queue, v)
+                elseif colors[v] == colors[u]
+                    is_bipartite = false
+                    if !force_bipartite
+                        error("Graph is not bipartite and force_bipartite is false.")
+                    end
+                end
+            end
+        end
+    end
+    
+    # # Fallback: If not bipartite, use a greedy degree-based partition to maximize cut
+    if !is_bipartite
+        @warn "Graph is not naturally bipartite. Applying greedy partitioning to maximize inter-set edges."
+        colors = fill(0, n)
+        node_degrees = degree(g)
+        sorted_nodes = sortperm(node_degrees, rev=true)
+        
+        for u in sorted_nodes
+            # # Count neighbors already in set 0 and set 1
+            n0 = 0
+            n1 = 0
+            for v in Neighbors(g, u)
+                if colors[v] == 0
+                    n0 += 1
+                else
+                    n1 += 1
+                end
+            end
+            # # Assign to the set that maximizes connections to the other set
+            colors[u] = n0 >= n1 ? 1 : 0
+        end
+    end
+    
+    # # Extraction: Construct the bipartite matrix B
+    set1_indices = findall(==(0), colors)
+    set2_indices = findall(==(1), colors)
+    
+    n1 = length(set1_indices)
+    n2 = length(set2_indices)
+    
+    if n1 == 0 || n2 == 0
+        error("Partitioning failed to create two non-empty sets. Check graph connectivity.")
+    end
+    
+    # # B is n1 x n2 matrix representing connections from Set 1 to Set 2
+    B = spzeros(Float64, n1, n2)
+    
+    for (i, u) in enumerate(set1_indices)
+        for (j, v) in enumerate(set2_indices)
+            if W[u, v] > 0
+                B[i, j] = Float64(W[u, v])
+            end
+        end
+    end
+    
+    return (
+        bipartite_adj = B,
+        set1 = set1_indices,
+        set2 = set2_indices,
+        is_natural = is_bipartite
+    )
+end
+
 
 
 """

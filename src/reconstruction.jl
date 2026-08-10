@@ -1602,23 +1602,36 @@ function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
         pareto_k = pareto_k
     )
 end
+ 
 
 
-function compare_components(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])    
-    # Purpose: A utility for formal model comparison between two fitted `bstm` models. It uses 
-    #          their PSIS-LOO results to compute the difference in Expected Log Pointwise 
-    #          Predictive Density (ELPD) and provides a statistical basis for model selection.
-    # Inputs: loo_a_report, loo_b_report, model_names.
-    # Outputs: A NamedTuple containing the comparison table, ELPD difference, and LOO objects.
+"""
+    compare_models(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])
 
-    println("--- Starting BSTM Component Comparison ---")
+A utility for formal model comparison between two fitted `bstm` models. It uses
+their PSIS-LOO results to compute the difference in Expected Log Pointwise
+Predictive Density (ELPD) and provides a statistical basis for model selection.
 
-    # #
+# Rationale
+This function is updated to be consistent with the refactored `bstm` framework,
+which uses the term "component" instead of the deprecated "manifold". The function
+name and internal print statements have been updated accordingly. The core logic,
+which relies on `PosteriorStats.compare`, remains unchanged as it is correct.
+
+# Arguments
+- `loo_a_report`, `loo_b_report`: The output `NamedTuple` from `bstm_loo` for each model.
+- `model_names`: A vector of strings with names for the models being compared.
+
+# Returns
+- A `NamedTuple` containing the comparison table, ELPD difference, and the original LOO objects.
+"""
+function compare_models(loo_a_report, loo_b_report; model_names=["Model_A", "Model_B"])
+    println("--- Starting BSTM Model Comparison ---")
+
     # 1. LOO Object Extraction
     loo_a = loo_a_report.loo_obj
     loo_b = loo_b_report.loo_obj
 
-    # #
     # 2. Formal Selection Metric Calculation
     comparison_stats = nothing
     try
@@ -1628,29 +1641,26 @@ function compare_components(loo_a_report, loo_b_report; model_names=["Model_A", 
         return nothing
     end
 
-    # #
     # 3. Parameter and Diagnostic Extraction
     p_loo_a = loo_a_report.metrics.p_loo
     p_loo_b = loo_b_report.metrics.p_loo
     elpd_a = loo_a_report.metrics.elpd
     elpd_b = loo_b_report.metrics.elpd
 
-    # #
     # 4. Report Generation
-    println("\n--- BSTM Component Selection Registry ---")
+    println("\n--- BSTM Model Selection Registry ---")
     println("Model A (", model_names[1], "): ELPD = ", round(elpd_a, digits=2), " | p_loo = ", round(p_loo_a, digits=2))
     println("Model B (", model_names[2], "): ELPD = ", round(elpd_b, digits=2), " | p_loo = ", round(p_loo_b, digits=2))
     diff_elpd = elpd_a - elpd_b
     println("\nELPD Delta (A - B): ", round(diff_elpd, digits=2))
 
     if abs(diff_elpd) > 4.0
-        winning_model = diff_elpd > 0 ? model_names[1] : model_names[2] 
+        winning_model = diff_elpd > 0 ? model_names[1] : model_names[2]
         println("CONCLUSION: ", winning_model, " is statistically preferred based on predictive density.")
     else
-        println("CONCLUSION: Competing component structures provide indistinguishable predictive density.")
+        println("CONCLUSION: Competing models provide indistinguishable predictive density.")
     end
 
-    # #
     # 5. Table Construction
     comparison_df = DataFrame(
         Metric = ["ELPD (LOO)", "Effective Parameters (p_loo)", "LOO-IC"],
@@ -1666,6 +1676,3 @@ function compare_components(loo_a_report, loo_b_report; model_names=["Model_A", 
         loo_objects = (loo_a, loo_b)
     )
 end
-
-
- 

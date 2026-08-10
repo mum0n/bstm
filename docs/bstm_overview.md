@@ -1067,6 +1067,44 @@ println("  VI complete.")
 
 Any of these point estimates can be used as starting points for further MCMC runs--if you trust the point estimates to have converged to a correct solution, and not a pathological position. 
 
+### A Note on Parameterization: Centered vs. Non-Centered
+
+In many `bstm` components, you will find a `method` parameter that allows you to choose between different computational approaches, such as `:spectral`, `:cholesky`, `:noncentered`, or `:centered`. While the centered parameterization is often more intuitive to write, `bstm` defaults to a non-centered parameterization (NCP) for most of its random effect components. This choice is not arbitrary; it is a critical decision made to ensure robust and efficient MCMC sampling, particularly with gradient-based samplers like NUTS.
+
+#### The Problem with Centered Parameterization: The "Funnel of Hell"
+
+A centered parameterization (CP) directly models the hierarchy as it is written statistically. For example, a random intercept $\alpha_j$ for group $j$ with a shared standard deviation $\sigma$ would be modeled as:
+
+- $\sigma \sim \text{HalfNormal}(1)$
+- $\alpha_j \sim \text{Normal}(0, \sigma)$
+
+The issue arises when the data suggests that the group-level variance is small (i.e., $\sigma$ is close to zero). In this scenario, all the $\alpha_j$ parameters are strongly constrained to be near zero. This creates a strong dependency between the hyperparameter $\sigma$ and the parameters $\alpha_j$.
+
+This dependency manifests as a "funnel" shape in the posterior geometry. When $\sigma$ is large, the posterior for $\alpha_j$ is wide and easy to explore. When $\sigma$ is small, the posterior becomes extremely narrow and steep. Gradient-based samplers like NUTS struggle to navigate this geometry. They must drastically reduce their step size to avoid overshooting the narrow part of the funnel, which leads to inefficient exploration, a high number of divergences, and a low effective sample size (ESS).
+
+#### The Solution: Non-Centered Parameterization (NCP)
+
+The non-centered parameterization (NCP) breaks this problematic dependency by introducing an auxiliary variable. The same model is re-written as:
+
+- $\sigma \sim \text{HalfNormal}(1)$
+- $\tilde{\alpha}_j \sim \text{Normal}(0, 1)$  *(a standard normal innovation)*
+- $\alpha_j = \sigma \cdot \tilde{\alpha}_j$ *(a deterministic transformation)*
+
+In this formulation, the sampler explores the posterior for $\sigma$ and the raw innovations $\tilde{\alpha}_j$. The geometry of this joint space is much simpler and does not have the funnel shape, as the prior for $\tilde{\alpha}_j$ is independent of $\sigma$. The sampler can take large, efficient steps in this transformed space, leading to faster convergence and higher ESS.
+
+#### Why `bstm` Provides Both
+
+-   **Non-Centered (Default)**: This is the default for most random effect components (`iid`, `icar`, `bym2`, `gp`, etc.) because it provides the most robust performance with gradient-based samplers like NUTS, which are the workhorse of modern Bayesian inference. The `:spectral` method used in many GMRF components is a highly efficient form of NCP.
+
+-   **Centered (Didactic)**: The centered parameterization is retained as a didactic alternative. It is a more direct translation of the statistical model and can be easier for users to understand. Furthermore, for certain gradient-free samplers (like `Slice` or `ESS`), the funnel geometry is less of an issue, and a centered parameterization can sometimes be equally or even more efficient.
+
+#### Connection to Identifiability
+
+While NCP is primarily about sampling efficiency, it also helps in models with identifiability issues, such as the `ICAR` model. An ICAR model has a rank-deficient precision matrix, meaning its mean is not identified from the global intercept. This is typically solved by applying a sum-to-zero constraint. This non-identifiability creates a "ridge" in the posterior landscape. An efficient sampler, which NCP enables, is better at navigating these pathological geometries, even though it does not solve the fundamental identifiability problem itself.
+
+**Recommendation**: Unless you are using a specific gradient-free sampler or have a strong reason to do otherwise, it is recommended to use the default non-centered or spectral methods provided by `bstm` components to ensure robust and efficient model fitting.
+
+
 ### Reconstruction of effects and predictions 
  
 The `_reconstruct` function (multiple methods, one for each Architecture) is the core post-processing engine of the `bstm` package. It transforms raw MCMC chains into structured summaries of latent fields, effect sizes, and model predictions. Quite often, this can be more of a struggle than the modelling! But if you know what you want and how to process Turing's output, then there is no need to use these convenience extraction functions.

@@ -1,14 +1,12 @@
 """
-    GP <: ComponentModel
+    Kriging <: ComponentModel
 
-A component model for a full Gaussian Process, typically used for smooth effects.
-It computes a dense covariance matrix based on a specified kernel function. This
-component is powerful but computationally intensive (\$O(N^3)\$), making it suitable
-for datasets of small to moderate size. For larger datasets, consider scalable
-approximations like `random(..., model=:rff)` or `random(..., model=:fitc)`.
+A component model for Kriging, which is the geostatistical term for Gaussian
+Process (GP) regression. It models a latent field by computing a dense covariance
+matrix based on a specified kernel function and coordinate inputs.
 
 # Version
-v1.0.2 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 The component models a latent field \$f(x)\$ as a draw from a Gaussian Process with
@@ -17,7 +15,7 @@ a zero mean and a specified covariance function (kernel):
 
 The kernel \$k(x, x')\$ defines the covariance between any two points. For example,
 the Squared Exponential (SE) kernel is:
-\$k(x, x') = \\sigma^2 \\exp\\left(-\frac{\\|x - x'\\|^2}{2\\ell^2}\\right)\$
+\$k(x, x') = \\sigma^2 \\exp\\left(-\\frac{\\|x - x'\\|^2}{2\\ell^2}\\right)\$
 where:
 - \$\\sigma^2\$ is the marginal variance.
 - \$\\ell\$ is the characteristic lengthscale.
@@ -27,42 +25,16 @@ The model samples the latent field \$f\$ from the resulting multivariate normal
 distribution \$f \\sim \\mathcal{N}(0, K)\$, where \$K\$ is the dense covariance matrix
 evaluated at all data points.
 
-# Distinction from other GP approximations
-- **Nystrom**: Approximates the full kernel matrix \$K_{XX}\$ with a low-rank version
-  \$\\tilde{K}_{XX} = K_{XU} K_{UU}^{-1} K_{UX}\$. It's a low-rank approximation of the
-  covariance matrix itself.
-- **FITC (Fully Independent Training Conditional)**: A sparse GP method that assumes
-  data points are conditionally independent given the values at a set of `M` inducing
-  points. It approximates the covariance with a low-rank term plus a diagonal
-  correction: \$K_{FITC} = K_{XU} K_{UU}^{-1} K_{UX} + \\text{diag}(K_{XX} - Q_{XX})\$,
-  where \$Q_{XX}\$ is the Nystrom approximation. This diagonal correction accounts
-  for the variance of the data points not captured by the inducing points.
-- **SVGP (Sparse Variational Gaussian Process)**: A variational inference method that
-  introduces inducing points and optimizes a variational distribution over the GP
-  values at these points to approximate the true posterior. In a sampling context,
-  the `SVGP` component in `bstm` is implemented similarly to FITC, using a
-  non-centered parameterization.
-- **RFF (Random Fourier Features)**: Approximates the kernel *function* \$k(x, x')\$
-  with a finite-dimensional feature map \$\\phi(x)^T \\phi(x')\$. It transforms the problem
-  into a linear model in a high-dimensional feature space.
-- **Full GP**: Computes the exact kernel matrix \$K_{XX}\$ and performs inference directly,
-  which is \$O(N^3)\$ and memory-intensive (\$O(N^2)\$). SVGP (and FITC) reduce this to
-  \$O(NM^2 + M^3)\$ for computation and \$O(NM)\$ for memory.
-
-# Assumptions
-- The underlying process is stationary (correlation depends only on distance).
-- The chosen kernel correctly reflects the smoothness properties of the process.
-
 # Best Use Case
-Modeling smooth, non-linear effects of continuous covariates when the number of
-observations is not prohibitively large (e.g., < 2000). It is the gold standard
-for non-parametric regression. For larger datasets, a spectral approximation like
-`random(..., model=:rff)` is recommended.
+Standard non-parametric regression and spatial interpolation for small to moderate
+datasets where the computational cost of a full GP is acceptable. For larger
+datasets, consider scalable approximations like `random(..., model=:rff)` or
+`random(..., model=:fitc)`.
 
 # Key References
 - Rasmussen, C. E., & Williams, C. K. I. (2006). *Gaussian Processes for
   Machine Learning*. MIT Press.
-- Wikipedia: Gaussian process
+- Wikipedia: Kriging
 
 # Fields
 - `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the
@@ -70,20 +42,25 @@ for non-parametric regression. For larger datasets, a spectral approximation lik
   vector for ARD kernels.
 - `sigma::Distribution`: The prior for the marginal standard deviation of the GP.
 - `kernel::String`: The name of the kernel function (e.g., "se", "matern32").
+- `method::Symbol`: The parameterization method. Can be `:noncentered` (default,
+  recommended) or `:centered` (didactic alternative).
 """
-struct GP <: ComponentModel
+struct Kriging <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
     sigma::Distribution
     kernel::String
+    method::Symbol
 end
 
-COMPONENT_TYPE_REGISTRY[:gp] = GP
-
-COMPONENT_CONSTRUCTORS[:gp] = (p, params) -> GP(
-    p.lengthscale, p.sigma, string(get(params, :kernel, "se"))
+# Add to the central component constructor registry.
+COMPONENT_TYPE_REGISTRY[:kriging] = Kriging
+COMPONENT_CONSTRUCTORS[:kriging] = (p, params) -> Kriging(
+    p.lengthscale, p.sigma, string(get(params, :kernel, "se")),
+    get(params, :method, :noncentered)
 )
 
-MODEL_TO_STRUCTURE_MAP[:gp] = :smooth
+# Add to the model-to-structure map.
+MODEL_TO_STRUCTURE_MAP[:kriging] = :smooth
 
 """
     get_datastructures!(m_type::Type{<:GP}, M::Dict, mod_data::Dict)::Bool
@@ -124,20 +101,19 @@ function get_precomputes(m::GP, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    get_priors(m::GP, spec::NamedTuple, arch::String, outcome_idx, M)::String
+    get_priors(m::Kriging, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates priors for `sigma`, `lengthscale` (`ls`), and the `raw` innovations.
+Generates priors for `sigma` and `lengthscale` (`ls`). For the `:noncentered`
+method, it also defines a prior for the `raw` innovations.
 """
 function get_priors(
-    m::GP, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    m::Kriging, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    sigma_prior_str = _distribution_to_string(m.sigma)
-    
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ $(sigma_prior_str)")
+    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     if m.lengthscale isa Vector
         ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
@@ -147,53 +123,78 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(
-        priors,
-        "$(p_names.raw) ~ MvNormal(zeros(spec.precomputes.n_latent), I)"
-    )
+    if m.method == :noncentered
+        push!(
+            priors,
+            "$(p_names.raw) ~ MvNormal(zeros(spec.precomputes.n_latent), I)"
+        )
+    end
 
     return join(priors, "\n    ")
 end
 
 """
-    get_updates(m::GP, spec::NamedTuple, arch::String, outcome_idx, M)::String
+    get_updates(m::Kriging, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates code to compute the kernel matrix, perform a Cholesky decomposition,
-and sample the latent field using a non-centered parameterization.
+Generates code to construct the Kriging effect. Supports two methods:
+- `:noncentered` (default): Samples standard normal noise and transforms it. This
+  is generally more efficient for MCMC.
+- `:centered`: Samples the latent field directly from the `MvNormal` distribution.
+  This can be less efficient due to posterior correlations but is a useful
+  didactic alternative.
 """
 function get_updates(
-    m::GP, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    m::Kriging, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    return """
-        # --- Full Gaussian Process (GP) Component: $(spec.key) ---
-        let
-            local coords = spec.hyper.coords
-            local kernel_type = Symbol("$(m.kernel)")
+    common_code = """
+        local coords = spec.hyper.coords
+        local kernel_type = Symbol("$(m.kernel)")
 
-            local K_mat = evaluate_kernel_matrix(
-                coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
-            )
-            
-            local F_gp = cholesky(Symmetric(K_mat))
-            local $(p_names.latent) = F_gp.L * $(p_names.raw)
-            
+        local K_mat = evaluate_kernel_matrix(
+            coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
+        )
+    """
+
+    noncentered_code = """
+        # --- Kriging (Non-Centered): $(spec.key) ---
+        let
+            $(common_code)
+            local F_krig = cholesky(Symmetric(K_mat))
+            $(p_names.latent) = F_krig.L * $(p_names.raw)
             $(eta_target) .+= $(p_names.latent)
         end
     """
+
+    centered_code = """
+        # --- Kriging (Centered): $(spec.key) ---
+        let
+            $(common_code)
+            $(p_names.latent) ~ MvNormal(zeros(size(K_mat, 1)), Symmetric(K_mat))
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    if m.method == :noncentered
+        return noncentered_code
+    elseif m.method == :centered
+        return centered_code
+    else
+        error("Unsupported method '$(m.method)' for Kriging component.")
+    end
 end
 
 """
-    get_effects(m::GP, chain, M::NamedTuple, ...)::NamedTuple
+    get_effects(m::Kriging, chain, M::NamedTuple, ...)
 
-Reconstructs the `GP` component's effect from the MCMC chain's posterior samples
-by re-evaluating the kernel for each sample.
+Reconstructs the `Kriging` component's effect from posterior samples,
+dispatching on the `method` used during sampling.
 """
 function get_effects(
-    m::GP, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    m::Kriging, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
@@ -205,6 +206,7 @@ function get_effects(
     else
         coords_train
     end
+    n_obs_train = size(coords_train, 1)
     n_obs_full = size(coords_full, 1)
     
     noise = M.noise
@@ -215,30 +217,37 @@ function get_effects(
         
         sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
         ls_samples = get_params_vector(
-            chain, string(p_names.ls), length(m.lengthscale)
-        )
-        raw_samples = get_params_vector(
-            chain, string(p_names.raw), spec.precomputes.n_latent
+            chain, string(p_names.ls), m.lengthscale isa Vector ? length(m.lengthscale) : 1
         )
 
         effect_k = zeros(Float64, n_obs_full, n_samples)
 
-        for i in 1:n_samples
-            current_sigma = sigma_samples[i]
-            current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i]
-            
-            K_mat = evaluate_kernel_matrix(
-                coords_full, current_sigma, current_ls, kernel_type, noise
-            )
-            F = cholesky(Symmetric(K_mat))
-            
-            raw_i = if size(raw_samples, 2) == n_obs_full
-                raw_samples[i, :]
-            else
-                vcat(raw_samples[i, :], randn(n_obs_full - size(raw_samples, 2)))
+        if m.method == :noncentered
+            raw_samples = get_params_vector(chain, string(p_names.raw), n_obs_train)
+            for i in 1:n_samples
+                K_mat = evaluate_kernel_matrix(coords_full, sigma_samples[i], ls_samples[i,:], kernel_type, noise)
+                F = cholesky(Symmetric(K_mat))
+                raw_i = vcat(raw_samples[i, :], randn(n_obs_full - n_obs_train))
+                effect_k[:, i] = F.L * raw_i
             end
-            
-            effect_k[:, i] = F.L * raw_i
+        elseif m.method == :centered
+            latent_samples = get_params_vector(chain, string(p_names.latent), n_obs_train)
+            for i in 1:n_samples
+                effect_k[1:n_obs_train, i] = latent_samples[i, :]
+                if n_obs_full > n_obs_train
+                    coords_pred = coords_full[(n_obs_train+1):end, :]
+                    K_ff = evaluate_kernel_matrix(coords_train, sigma_samples[i], ls_samples[i,:], kernel_type, noise)
+                    K_star_f = evaluate_cross_kernel_matrix(coords_pred, coords_train, sigma_samples[i], ls_samples[i,:], kernel_type)
+                    K_star_star = evaluate_kernel_matrix(coords_pred, sigma_samples[i], ls_samples[i,:], kernel_type, noise)
+                    
+                    L_ff = cholesky(Symmetric(K_ff)).L
+                    A = L_ff' \ (L_ff \ K_star_f')
+                    mu_pred = A' * latent_samples[i, :]
+                    Sigma_pred = K_star_star - K_star_f * A
+                    
+                    effect_k[(n_obs_train+1):end, i] = rand(MvNormal(mu_pred, Symmetric(Sigma_pred)))
+                end
+            end
         end
         push!(structured_effects, effect_k)
     end

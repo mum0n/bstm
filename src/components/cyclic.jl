@@ -7,7 +7,7 @@ point smoothly connects back to the first. This is a type of Gaussian Markov
 Random Field (GMRF) with a circulant precision matrix.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 The cyclic random walk models a latent field \$\\phi\$ where the value at time \$t\$ is
@@ -37,8 +37,8 @@ phenomena where a simple harmonic function is not flexible enough.
 # Fields
 - `period::Int`: The length of the cycle (e.g., 12 for months, 7 for days).
 - `sigma::Distribution`: The prior for the standard deviation of the cyclic effect.
-- `method::Symbol`: The computational method, either `:spectral` (default) or
-  `:cholesky`.
+- `method::Symbol`: The computational method. Can be `:spectral` (default, AD-safe),
+  `:cholesky` (AD-safe, dense), or `:cholesky_sparse` (didactic, not AD-safe).
 """
 struct Cyclic <: ComponentModel
     period::Int
@@ -139,8 +139,11 @@ end
 """
     get_updates(m::Cyclic, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates code to sample the latent cyclic field using either the `:spectral` or
-`:cholesky` method, applying a sum-to-zero constraint for identifiability.
+Generates code to sample the latent cyclic field. Supports three methods:
+- `:spectral` (default): An efficient, AD-safe method using spectral decomposition.
+- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
+- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
+  factorization, suitable for gradient-free samplers.
 """
 function get_updates(
     m::Cyclic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -151,33 +154,59 @@ function get_updates(
     key = spec.key
     n_latent = spec.hyper.n_latent
 
+    spectral_code = """
+        # --- Cyclic Component: $(key) (Spectral Method) ---
+        let
+            local U = spec_registry[:$(key)].hyper.U
+            local L = spec_registry[:$(key)].hyper.L
+            local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
+            diag_D[1] = 0.0 # Enforce sum-to-zero constraint
+            local latent_field = U * (diag_D .* $(p_names.raw))
+            $(eta_target) .+= view(latent_field, M.u_idx)
+        end
+    """
+
+    cholesky_code = """
+        # --- Cyclic Component: $(key) (Cholesky Method, AD-Safe) ---
+        let
+            local F = spec_registry[:$(key)].hyper.cholesky_factor
+            local latent_field_raw = F.L' \\ $(p_names.raw)
+            
+            Turing.@addlogprob! logpdf(
+                Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw)
+            )
+            
+            local latent_field = latent_field_raw .* $(p_names.sigma)
+            $(eta_target) .+= view(latent_field, M.u_idx)
+        end
+    """
+
+    cholesky_sparse_code = """
+        # --- Cyclic Component: $(key) (Sparse Cholesky, Not AD-Safe) ---
+        # WARNING: This method is for didactic purposes and is NOT compatible with
+        # automatic differentiation (e.g., NUTS sampler).
+        let
+            local Q = spec_registry[:$(key)].hyper.Q_template
+            local F = cholesky(Symmetric(Q + M.noise * I))
+            local latent_field_raw = F.L' \\ $(p_names.raw)
+            
+            Turing.@addlogprob! logpdf(
+                Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw)
+            )
+            
+            local latent_field = latent_field_raw .* $(p_names.sigma)
+            $(eta_target) .+= view(latent_field, M.u_idx)
+        end
+    """
+
     if m.method == :spectral
-        return """
-            # --- Cyclic Component: $(key) (Spectral Method) ---
-            let
-                local U = spec_registry[:$(key)].hyper.U
-                local L = spec_registry[:$(key)].hyper.L
-                local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
-                diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-                local latent_field = U * (diag_D .* $(p_names.raw))
-                $(eta_target) .+= view(latent_field, M.u_idx)
-            end
-        """
-    else # :cholesky method
-        return """
-            # --- Cyclic Component: $(key) (Cholesky Method) ---
-            let
-                local F = spec_registry[:$(key)].hyper.cholesky_factor
-                local latent_field_raw = F.L' \\ $(p_names.raw)
-                
-                Turing.@addlogprob! logpdf(
-                    Normal(0.0,0.001 * $(n_latent)), sum(latent_field_raw)
-                )
-                
-                local latent_field = latent_field_raw .* $(p_names.sigma)
-                $(eta_target) .+= view(latent_field, M.u_idx)
-            end
-        """
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    else
+        error("Unsupported method '$(m.method)' for Cyclic component. Supported methods are :spectral, :cholesky, and :cholesky_sparse.")
     end
 end
 
@@ -185,7 +214,8 @@ end
     get_effects(m::Cyclic, chain, M::NamedTuple, ...)::NamedTuple
 
 Reconstructs the `Cyclic` component's effect from posterior samples, applying a
-sum-to-zero constraint for identifiability.
+sum-to-zero constraint for identifiability. This function dispatches on the method
+used during sampling.
 """
 function get_effects(
     m::Cyclic, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -211,7 +241,9 @@ function get_effects(
                 diag_D[1] = 0.0 # Enforce sum-to-zero
                 effect_k[:, j] = U * (diag_D .* raw_samples[j, :])
             end
-        else # :cholesky method
+        else # :cholesky or :cholesky_sparse
+            # For reconstruction, we can use the pre-computed dense factor for both
+            # Cholesky methods as it does not involve AD.
             F = spec.hyper.cholesky_factor
             for j in 1:n_samples
                 latent_field_raw = F.L' \ raw_samples[j, :]

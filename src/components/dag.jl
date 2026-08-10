@@ -3,11 +3,10 @@
 
 A component for a Directed Acyclic Graph (DAG) structure, also known as a
 unilateral autoregressive model. This model is useful for capturing causal or
-directional dependencies between spatial or other units. The effect at each node
-is a linear combination of its parents' effects plus an independent innovation.
+directional dependencies between spatial or other units.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 The DAG model defines a recursive relationship for the latent field \$\\phi\$:
@@ -20,45 +19,30 @@ This can be written in matrix form as \$\\phi = \\rho W \\phi + \\epsilon\$, whi
 \$(I - \\rho W)\\phi = \\epsilon\$. The corresponding precision matrix is
 \$Q = (I - \\rho W)^T (I - \\rho W) / \\sigma^2\$.
 
-A key feature of this model is that if \$W\$ is strictly lower (or upper)
-triangular, representing a valid topological ordering of the DAG, the latent field
-\$\\phi\$ can be sampled efficiently using forward substitution, avoiding the need to
-form or invert the dense precision matrix. This makes it highly scalable.
-
-# Assumptions
-- The adjacency matrix `W` represents a true DAG (i.e., it is acyclic). For the
-  forward substitution algorithm to be valid, `W` must be strictly lower or upper
-  triangular, which implies a topological ordering of the nodes.
-- The dependencies are linear and additive.
-
-# Best Use Case
-Modeling processes with known directional influence, such as river networks (where
-flow is downstream), gene regulatory networks, or certain causal inference problems.
-It is a computationally efficient alternative to dense GPs or symmetric GMRFs when a
-causal or directional ordering of nodes is known a priori.
-
-# Key References
-- **Bayesian Networks**: Koller, D., & Friedman, N. (2009). *Probabilistic
-  Graphical Models: Principles and Techniques*. MIT Press.
-- **Spatial Statistics**: Vecchia, A. V. (1988). Estimation and model
-  identification for continuous spatial processes. *Journal of the Royal
-  Statistical Society: Series B (Methodological)*, 50(2), 297-312. (For related
-  ideas on conditional approximations in spatial statistics).
-- **Wikipedia**: Directed acyclic graph
+# Computational Methods
+- `:forward_substitution` (default): If `W` is strictly triangular (representing a
+  valid topological ordering), the latent field can be sampled efficiently using
+  forward substitution. This is the recommended, AD-safe method.
+- `:precision` (didactic): Explicitly constructs the dense precision matrix `Q` and
+  samples the field from the corresponding `MvNormal`. This is less efficient but
+  conceptually clear and also AD-safe.
 
 # Fields
-- `rho::Distribution`: The prior for the autoregressive parameter `rho`,
-  controlling the strength of parental influence.
-- `sigma::Distribution`: The prior for the standard deviation of the innovations at
-  each node.
+- `rho::Distribution`: The prior for the autoregressive parameter `rho`.
+- `sigma::Distribution`: The prior for the standard deviation of the innovations.
+- `method::Symbol`: The computational method, `:forward_substitution` or `:precision`.
 """
 struct DAG <: ComponentModel
     rho::Distribution
     sigma::Distribution
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:dag] = DAG
-COMPONENT_CONSTRUCTORS[:dag] = (p, params) -> DAG(p.rho, p.sigma)
+COMPONENT_CONSTRUCTORS[:dag] = (p, params) -> DAG(
+    p.rho, p.sigma, get(params, :method, :forward_substitution)
+)
+
 MODEL_TO_STRUCTURE_MAP[:dag] = :spatial
 
 """
@@ -138,9 +122,8 @@ end
 """
     get_priors(m::DAG, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code for the priors on the `DAG` component's parameters.
-This includes priors for `rho`, `sigma`, and the independent innovations for each
-node.
+Generates priors for `rho`, `sigma`, and the raw innovations. The name of the
+innovation parameter (`innov` or `raw`) depends on the chosen method.
 """
 function get_priors(
     m::DAG, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -148,23 +131,24 @@ function get_priors(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    rho_prior_str = _distribution_to_string(m.rho)
-    sigma_prior_str = _distribution_to_string(m.sigma)
+    priors = [
+        "$(p_names.rho) ~ $(_distribution_to_string(m.rho))",
+        "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))"
+    ]
     
-    return """
-        $(p_names.rho) ~ $(rho_prior_str)
-        $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.innov) ~ MvNormal(
-            zeros(T, spec_registry[:$(spec.key)].hyper.n_latent), I
-        )
-    """
+    # The innovation parameter has a different conceptual role depending on the method.
+    # :forward_substitution -> innovations in the state-space equation.
+    # :precision -> standard normal noise for non-centered parameterization.
+    innov_param = m.method == :forward_substitution ? p_names.innov : p_names.raw
+    push!(priors, "$(innov_param) ~ MvNormal(zeros($(spec.hyper.n_latent)), I)")
+    
+    return join(priors, "\n    ")
 end
 
 """
     get_updates(m::DAG, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code to construct the `DAG` component's effect using forward
-substitution and adds the result to the linear predictor `eta`.
+Generates Turing code to construct the `DAG` effect, dispatching on the method.
 """
 function get_updates(
     m::DAG, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -173,8 +157,8 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    return """
-        # --- DAG Component: $(spec.key) ---
+    forward_sub_code = """
+        # --- DAG Component (Forward Substitution): $(spec.key) ---
         let
             local W_dag = spec_registry[:$(spec.key)].hyper.Q_template
             local innovations = $(p_names.innov)
@@ -185,10 +169,8 @@ function get_updates(
             local T_num = promote_type(typeof(rho_val), eltype(innovations))
             local $(p_names.latent) = zeros(T_num, n_latent)
 
-            # Assumes W_dag is lower triangular, representing a valid DAG ordering.
             for i in 1:n_latent
                 local parent_effect = zero(T_num)
-                # Efficiently iterate over non-zero elements in the i-th column.
                 for j_ptr in nzrange(W_dag, i)
                     parent_idx = W_dag.rowval[j_ptr]
                     parent_effect += W_dag.nzval[j_ptr] * $(p_names.latent)[parent_idx]
@@ -200,12 +182,38 @@ function get_updates(
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
+
+    precision_code = """
+        # --- DAG Component (Precision Matrix): $(spec.key) ---
+        # This is a didactic alternative that is less efficient than forward substitution.
+        let
+            local W_dag = spec_registry[:$(spec.key)].hyper.Q_template
+            local L_op = I - $(p_names.rho) * W_dag
+            local Q = L_op' * L_op
+            
+            # Use dense Cholesky for AD-safety
+            local F = cholesky(Symmetric(Matrix(Q) + M.noise * I))
+            
+            $(p_names.latent) = $(p_names.sigma) .* (F.U \\ $(p_names.raw))
+            
+            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+        end
+    """
+
+    if m.method == :forward_substitution
+        return forward_sub_code
+    elseif m.method == :precision
+        return precision_code
+    else
+        error("Unsupported method '$(m.method)' for DAG component.")
+    end
 end
 
 """
     get_effects(m::DAG, chain, M::NamedTuple, ...)::NamedTuple
 
-Reconstructs the `DAG` component's effect from the MCMC chain's posterior samples.
+Reconstructs the `DAG` component's effect from posterior samples, dispatching
+on the method used during sampling.
 """
 function get_effects(
     m::DAG, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -218,28 +226,37 @@ function get_effects(
         
         rho_samples = get_params_vector(chain, string(p_names.rho), 1)[:, 1]
         sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        innov_samples = get_params_vector(
-            chain, string(p_names.innov), spec.hyper.n_latent
-        )
-
+        
         n_latent = spec.hyper.n_latent
         W_dag = spec.hyper.Q_template
         s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
         
         effect_k = zeros(Float64, N_total, n_samples)
 
-        for i in 1:n_samples
-            latent_field_i = zeros(Float64, n_latent)
-            for j in 1:n_latent
-                parent_effect = 0.0
-                for j_ptr in nzrange(W_dag, j)
-                    parent_idx = W_dag.rowval[j_ptr]
-                    parent_effect += W_dag.nzval[j_ptr] * latent_field_i[parent_idx]
+        if m.method == :forward_substitution
+            innov_samples = get_params_vector(chain, string(p_names.innov), n_latent)
+            for i in 1:n_samples
+                latent_field_i = zeros(Float64, n_latent)
+                for j in 1:n_latent
+                    parent_effect = 0.0
+                    for j_ptr in nzrange(W_dag, j)
+                        parent_idx = W_dag.rowval[j_ptr]
+                        parent_effect += W_dag.nzval[j_ptr] * latent_field_i[parent_idx]
+                    end
+                    latent_field_i[j] = rho_samples[i] * parent_effect + innov_samples[i, j]
                 end
-                latent_field_i[j] = rho_samples[i] * parent_effect + innov_samples[i, j]
+                latent_field_i .*= sigma_samples[i]
+                effect_k[:, i] = view(latent_field_i, s_idx_full)
             end
-            latent_field_i .*= sigma_samples[i]
-            effect_k[:, i] = view(latent_field_i, s_idx_full)
+        else # :precision
+            raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
+            for i in 1:n_samples
+                L_op = I - rho_samples[i] * W_dag
+                Q = L_op' * L_op
+                F = cholesky(Symmetric(Matrix(Q) + M.noise * I))
+                latent_field_i = sigma_samples[i] .* (F.U \ raw_samples[i, :])
+                effect_k[:, i] = view(latent_field_i, s_idx_full)
+            end
         end
         push!(structured_effects, effect_k)
     end

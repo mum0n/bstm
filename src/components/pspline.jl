@@ -1,4 +1,3 @@
-
 """
     PSpline <: ComponentModel
 
@@ -7,7 +6,7 @@ creates a basis of B-spline functions and applies a discrete penalty (typically 
 random walk) to the coefficients to ensure smoothness and prevent overfitting.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 The P-spline models a smooth function \$f(x)\$ as a linear combination of \$K\$ B-spline
@@ -17,37 +16,30 @@ To enforce smoothness, a penalty is applied to the coefficients \$\\boldsymbol{\
 This is achieved by assuming the coefficients follow a Gaussian Markov Random Field
 (GMRF) structure. A common choice is a second-order random walk (RW2), which
 penalizes deviations from a local linear trend:
-\$\\Delta^2 \\beta_k = \\beta_k - 2\\beta_{k-1} + \\beta_{k-2} \\sim \\mathcal{N}(0, \\sigma^{-2})\$
+\$\\Delta^2 \\beta_k = \\beta_k - 2\\beta_{j-1} + \\beta_{j-2} \\sim \\mathcal{N}(0, \\sigma^{-2})\$
 The precision matrix \$\\mathbf{Q}\$ for the coefficients is derived from this random
 walk structure. The model then samples the coefficients from
 \$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\sigma^2 \\mathbf{Q})^{-1})\$.
 
-# Assumptions
-- The underlying function to be smoothed is continuous and smooth.
-- The number of basis functions (`nbins`) is large enough to capture the function's
-  curvature, as smoothness is enforced by the penalty, not the basis itself.
-
-# Best Use Case
-Flexible non-linear smoothing of continuous covariates. It is a powerful and widely
-used alternative to Gaussian Processes for 1D smoothing, often with better
-computational performance for large datasets.
-
-# Key References
-- Eilers, P. H., & Marx, B. D. (1996). Flexible smoothing with B-splines and
-  penalties. *Statistical Science*, 11(2), 89-102.
-- Wikipedia: P-spline
+# Computational Methods
+- `:spectral` (default): An efficient, AD-safe method using spectral decomposition.
+- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
+- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
+  factorization, suitable for gradient-free samplers.
 
 # Fields
 - `nbins::Int`: The number of basis functions to generate.
 - `degree::Int`: The polynomial degree of the B-spline (e.g., 1 for linear, 3 for cubic).
-- `diff_order::Int`: The order of the random walk penalty on the coefficients (1 for RW1, 2 for RW2).
-- `sigma::Distribution`: The prior for the standard deviation of the spline coefficients, which controls the smoothness.
+- `diff_order::Int`: The order of the random walk penalty on the coefficients.
+- `sigma::Distribution`: The prior for the standard deviation of the coefficients.
+- `method::Symbol`: The computational method for regularizing coefficients.
 """
 struct PSpline <: ComponentModel
     nbins::Int
     degree::Int
     diff_order::Int
     sigma::Distribution
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:pspline] = PSpline
@@ -56,7 +48,8 @@ COMPONENT_CONSTRUCTORS[:pspline] = (p, params) -> PSpline(
     get(params, :nbins, 20),
     get(params, :degree, 3),
     get(params, :diff_order, 2),
-    p.sigma
+    p.sigma,
+    get(params, :method, :spectral)
 )
 
 MODEL_TO_STRUCTURE_MAP[:pspline] = :smooth
@@ -92,9 +85,8 @@ end
 """
     get_precomputes(m::PSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Performs data-independent pre-calculations for the `PSpline` component.
-This involves creating the B-spline basis matrix and the precision matrix template
-for the random walk penalty on the coefficients.
+Pre-computes the B-spline basis matrix, the penalty matrix, and its spectral
+decomposition and dense Cholesky factorization.
 """
 function get_precomputes(m::PSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
@@ -123,15 +115,19 @@ function get_precomputes(m::PSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     Q_template_scaled = Q_template ./ scaling_factor
     L_scaled = L ./ scaling_factor
 
+    F = cholesky(Symmetric(Matrix(Q_template_scaled) + M.noise * I))
+
     return (
         basis_matrix=B,
         Q_template=Q_template_scaled,
         scaling_factor=scaling_factor,
         U=U,
         L=L_scaled,
-        n_latent=n_latent
+        n_latent=n_latent,
+        cholesky_factor=F
     )
 end
+
 
 """
     get_priors(m::PSpline, spec::NamedTuple, arch::String, outcome_idx, M)::String
@@ -157,7 +153,8 @@ end
 """
     get_updates(m::PSpline, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code string for constructing the `PSpline` smooth effect.
+Generates the Turing code to construct the P-spline smooth effect, dispatching
+on the chosen method.
 """
 function get_updates(
     m::PSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -165,31 +162,74 @@ function get_updates(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    key = spec.key
+    n_latent = spec.hyper.n_latent
     
-    return """
-        # --- P-Spline Smoother Component: $(spec.key) ---
+    common_code = """
+        local hyper = spec_registry[:$(key)].hyper
+        local B_basis = hyper.basis_matrix
+    """
+
+    spectral_code = """
+        # --- P-Spline Smoother Component (Spectral): $(key) ---
         let
-            local precomputes = spec_registry[:$(spec.key)].precomputes
-            
-            # Reconstruct latent coefficients using spectral decomposition of the penalty matrix
-            local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
-            # Enforce sum-to-zero constraint(s)
+            $(common_code)
+            local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             for i in 1:$(m.diff_order); diag_D[i] = 0.0; end
             
-            local coeffs = precomputes.U * (diag_D .* $(p_names.raw))
-            
-            # Compute final effect by multiplying basis matrix with coefficients
-            local $(p_names.latent) = precomputes.basis_matrix * coeffs
-            
+            local coeffs = hyper.U * (diag_D .* $(p_names.raw))
+            local $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
     """
+
+    cholesky_code = """
+        # --- P-Spline Smoother Component (Cholesky, AD-Safe): $(key) ---
+        let
+            $(common_code)
+            local F = hyper.cholesky_factor
+            local coeffs_raw = F.L' \\ $(p_names.raw)
+            
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
+            
+            local coeffs = $(p_names.sigma) .* coeffs_raw
+            local $(p_names.latent) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    cholesky_sparse_code = """
+        # --- P-Spline Smoother Component (Sparse Cholesky, Not AD-Safe): $(key) ---
+        let
+            $(common_code)
+            local Q_penalty = hyper.Q_template
+            local F = cholesky(Symmetric(Q_penalty + M.noise * I))
+            local coeffs_raw = F.L' \\ $(p_names.raw)
+            
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
+            
+            local coeffs = $(p_names.sigma) .* coeffs_raw
+            local $(p_names.latent) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    else
+        error("Unsupported method '$(m.method)' for PSpline component.")
+    end
 end
 
 """
     get_effects(m::PSpline, chain, M::NamedTuple, ...)
 
-Reconstructs the `PSpline` component's effect from the MCMC chain's posterior samples.
+Reconstructs the `PSpline` component's effect from posterior samples, dispatching
+on the method used during sampling.
 """
 function get_effects(
     m::PSpline, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -218,29 +258,30 @@ function get_effects(
         B_full = B_train
     end
 
-    precomputes = spec.hyper
-    U = precomputes.U
-    L = precomputes.L
+    hyper = spec.hyper
     noise = M.noise
 
     for k in 1:outcomes_N
         p_names = generate_full_variable_names(spec, M.model_arch, k)
         
         sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        raw_samples = get_params_vector(
-            chain, string(p_names.raw), precomputes.n_latent
-        )
+        raw_samples = get_params_vector(chain, string(p_names.raw), hyper.n_latent)
 
         effect_k = zeros(Float64, size(B_full, 1), n_samples)
 
         for i in 1:n_samples
-            current_sigma = sigma_samples[i]
-            current_raw = raw_samples[i, :]
-            
-            diag_D = current_sigma ./ sqrt.(L .+ noise)
-            for j in 1:m.diff_order; diag_D[j] = 0.0; end
-            
-            coeffs = U * (diag_D .* current_raw)
+            local coeffs
+            if m.method == :spectral
+                U, L = hyper.U, hyper.L
+                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
+                for j in 1:m.diff_order; diag_D[j] = 0.0; end
+                coeffs = U * (diag_D .* raw_samples[i, :])
+            else # :cholesky or :cholesky_sparse
+                F = hyper.cholesky_factor
+                coeffs_raw = F.L' \ raw_samples[i, :]
+                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
+                coeffs = sigma_samples[i] .* coeffs_centered
+            end
             effect_k[:, i] = B_full * coeffs
         end
         push!(structured_effects, effect_k)

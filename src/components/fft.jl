@@ -1,4 +1,3 @@
-
 """
     FFT <: ComponentModel
 
@@ -8,7 +7,7 @@ combination of these basis functions, with coefficients regularized by a random
 walk prior to ensure smoothness.
 
 # Version
-v1.0.2 (2026-08-08)
+v1.0.3 (2026-08-10)
 
 # Mathematical Summary
 The component models a smooth function \$f(x)\$ as a linear combination of Fourier
@@ -42,11 +41,15 @@ cyclical nature.
 - `nbins::Int`: The total number of basis functions (sine/cosine pairs).
 - `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the
   lengthscale(s), which control the period of the basis functions.
+- `method::Symbol`: The computational method for regularizing coefficients. Can be
+  `:spectral` (default, AD-safe), `:cholesky` (AD-safe, dense), or
+  `:cholesky_sparse` (didactic, not AD-safe).
 """
 struct FFT <: ComponentModel
     sigma::Distribution
     nbins::Int
     lengthscale::Union{Distribution, Vector{<:Distribution}}
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:fft] = FFT
@@ -54,7 +57,8 @@ COMPONENT_TYPE_REGISTRY[:fft] = FFT
 COMPONENT_CONSTRUCTORS[:fft] = (p, params) -> FFT(
     p.sigma,
     get(params, :nbins, 20),
-    p.lengthscale
+    p.lengthscale,
+    get(params, :method, :spectral)
 )
 
 MODEL_TO_STRUCTURE_MAP[:fft] = :smooth
@@ -215,7 +219,8 @@ end
 """
     get_updates(m::FFT, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code for constructing the `FFT` smooth effect.
+Generates the Turing code for constructing the `FFT` smooth effect. It supports
+three methods for regularizing the Fourier coefficients.
 """
 function get_updates(
     m::FFT, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -224,34 +229,79 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    return """
-        # --- FFT Smoother Component: $(spec.key) ---
+    common_basis_code = """
+        local precomputes = spec_registry[:$(spec.key)].precomputes
+        local B_fft = bstm_fourier_basis(
+            precomputes.coords,
+            precomputes.nbins_per_dim,
+            $(p_names.ls)
+        )
+    """
+
+    spectral_code = """
+        # --- FFT Smoother Component (Spectral): $(spec.key) ---
         let
-            local precomputes = spec.precomputes
-            
-            local B_fft = bstm_fourier_basis(
-                precomputes.coords,
-                precomputes.nbins_per_dim,
-                $(p_names.ls)
-            )
+            $(common_basis_code)
             
             local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
-            diag_D[1] = 0.0
-            diag_D[2] = 0.0
+            diag_D[1] = 0.0 # Enforce sum-to-zero constraint on coefficients
+            diag_D[2] = 0.0 # for RW2 penalty
             
             local coeffs = precomputes.U * (diag_D .* $(p_names.raw))
-            
             local $(p_names.latent) = B_fft * coeffs
             
             $(eta_target) .+= $(p_names.latent)
         end
     """
+
+    cholesky_code = """
+        # --- FFT Smoother Component (Cholesky, AD-Safe): $(spec.key) ---
+        let
+            $(common_basis_code)
+            
+            local Q_penalty = precomputes.Q_template
+            local F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
+            
+            local coeffs = $(p_names.sigma) .* (F.U \\ $(p_names.raw))
+            local $(p_names.latent) = B_fft * coeffs
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    cholesky_sparse_code = """
+        # --- FFT Smoother Component (Sparse Cholesky, Not AD-Safe): $(spec.key) ---
+        # WARNING: This method is for didactic purposes and is NOT compatible with
+        # automatic differentiation (e.g., NUTS sampler).
+        let
+            $(common_basis_code)
+            
+            local Q_penalty = precomputes.Q_template
+            local F = cholesky(Symmetric(Q_penalty + M.noise * I))
+            
+            local coeffs = $(p_names.sigma) .* (F.U \\ $(p_names.raw))
+            local $(p_names.latent) = B_fft * coeffs
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    else
+        error("Unsupported method '$(m.method)' for FFT component.")
+    end
 end
 
 """
     get_effects(m::FFT, chain, M::NamedTuple, ...)::NamedTuple
 
-Reconstructs the `FFT` component's effect from the MCMC chain's posterior samples.
+Reconstructs the `FFT` component's effect from posterior samples, dispatching on
+the method used during sampling.
 """
 function get_effects(
     m::FFT, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -260,8 +310,6 @@ function get_effects(
     structured_effects = Vector{Matrix{Float64}}()
 
     precomputes = spec.precomputes
-    U = precomputes.U
-    L = precomputes.L
     noise = M.noise
     n_latent = precomputes.n_latent
     nbins_per_dim = precomputes.nbins_per_dim
@@ -278,7 +326,7 @@ function get_effects(
         p_names = generate_full_variable_names(spec, M.model_arch, k)
         
         sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        ls_samples = get_params_vector(chain, string(p_names.ls), length(m.lengthscale))
+        ls_samples = get_params_vector(chain, string(p_names.ls), m.lengthscale isa Vector ? length(m.lengthscale) : 1)
         raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
 
         effect_k = zeros(Float64, size(coords_full, 1), n_samples)
@@ -288,11 +336,20 @@ function get_effects(
             
             B_fft_i = bstm_fourier_basis(coords_full, nbins_per_dim, current_ls)
             
-            diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
-            diag_D[1] = 0.0
-            diag_D[2] = 0.0
-            
-            coeffs = U * (diag_D .* raw_samples[i, :])
+            local coeffs
+            if m.method == :spectral
+                U = precomputes.U
+                L = precomputes.L
+                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
+                diag_D[1] = 0.0
+                diag_D[2] = 0.0
+                coeffs = U * (diag_D .* raw_samples[i, :])
+            else # :cholesky or :cholesky_sparse
+                Q_penalty = precomputes.Q_template
+                # For reconstruction, dense Cholesky is fine for both methods
+                F = cholesky(Symmetric(Matrix(Q_penalty) + noise * I))
+                coeffs = sigma_samples[i] .* (F.U \ raw_samples[i, :])
+            end
             
             effect_k[:, i] = B_fft_i * coeffs
         end

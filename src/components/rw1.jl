@@ -1,4 +1,3 @@
-
 """
     RW1 <: ComponentModel
 
@@ -8,7 +7,7 @@ innovation. It is an intrinsic Gaussian Markov Random Field (GMRF) with a rank
 deficiency of 1, implying a sum-to-zero constraint for identifiability.
 
 # Version
-v1.9.2 (2026-08-08)
+v1.9.3 (2026-08-10)
 
 # Mathematical Summary
 The RW1 model defines a latent temporal field \$\\phi\$ where the value at time \$t\$ is
@@ -22,24 +21,20 @@ making it an "intrinsic" GMRF. To ensure the model is identifiable from a global
 intercept, a sum-to-zero constraint (\$\\sum_i \\phi_i = 0\$) is imposed on the
 latent field.
 
-# Assumptions
-- The temporal process is non-stationary and exhibits local smoothness.
-- The time points are regularly spaced.
-
-# Best Use Case
-Modeling smooth but non-stationary temporal trends, or processes that exhibit
-step-like changes. It is a fundamental building block for time series analysis.
-
-# Key References
-- Rue, H., & Held, L. (2005). *Gaussian Markov Random Fields: Theory and
-  Applications*. CRC Press.
-- Wikipedia: Random walk
+# Computational Methods
+- `:statespace` (default): The most efficient method, constructing the RW1 process
+  via a cumulative sum of innovations. AD-safe.
+- `:spectral`: An efficient, AD-safe method using spectral decomposition of the
+  precision matrix.
+- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
+- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
+  factorization, suitable for gradient-free samplers.
 
 # Fields
 - `sigma::UnivariateDistribution`: The prior for the standard deviation of the
   innovations.
-- `method::Symbol`: The computational method, either `:statespace` (default, most
-  efficient) or `:spectral`.
+- `method::Symbol`: The computational method, one of `:statespace`, `:spectral`,
+  `:cholesky`, or `:cholesky_sparse`.
 """
 struct RW1 <: ComponentModel
     sigma::UnivariateDistribution
@@ -85,10 +80,8 @@ end
 """
     get_precomputes(m::RW1, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Pre-computes the structure matrix for the `RW1` component. The precision matrix
-template defines the first-order differences. This function calls the central
-`build_structure_template` utility to generate this matrix and its spectral
-decomposition (`U`, `L`), which are essential for the `:spectral` sampling method.
+Pre-computes the RW1 precision matrix template, its spectral decomposition (`U`, `L`),
+and its dense Cholesky factorization (`cholesky_factor`).
 """
 function get_precomputes(m::RW1, M::NamedTuple, mod_data::Dict)::NamedTuple
     t_N = get(M, :t_N, 0)
@@ -97,14 +90,20 @@ function get_precomputes(m::RW1, M::NamedTuple, mod_data::Dict)::NamedTuple
               "'$(mod_data[:key])'. The component will have no effect."
     end
     template = build_structure_template(:rw1, t_N)
+    
+    # Pre-compute the dense Cholesky factor for the :cholesky method.
+    F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
+    
     return (
         Q_template=template.matrix,
         U=template.U,
         L=template.L,
         scaling_factor=template.scaling_factor,
-        n_latent=t_N
+        n_latent=t_N,
+        cholesky_factor=F
     )
 end
+
 
 """
     get_priors(m::RW1, spec::NamedTuple, arch::String, outcome_idx, M)::String
@@ -131,11 +130,12 @@ function get_priors(
     return join(priors_acc, "\n    ")
 end
 
+
 """
     get_updates(m::RW1, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates the Turing code for the `RW1` component's update logic, dispatching on
-the chosen `method` (`:statespace` or `:spectral`).
+the chosen `method`.
 """
 function get_updates(
     m::RW1, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -146,46 +146,57 @@ function get_updates(
     key = spec.key
     n_latent = spec.hyper.n_latent
 
-    if m.method == :statespace
-        return """
-            # --- RW1 Component: $(key) (State-Space Method) ---
-            # This block constructs the RW1 effect by taking the cumulative sum
-            # of standard normal innovations. This is the most efficient method.
-            let
-                innovations = $(p_names.raw)
-                latent_field_raw = cumsum(innovations)
-                
-                # Apply a soft sum-to-zero constraint for identifiability.
-                Turing.@addlogprob! logpdf(
-                    Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw)
-                )
-                
-                $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
-                $(eta_target) .+= view($(p_names.latent), M.t_idx)
-            end
-        """
-    elseif m.method == :spectral
-        return """
-            # --- RW1 Component: $(key) (Spectral Method) ---
-            # This block constructs the RW1 effect using a non-centered
-            # parameterization based on the spectral decomposition of the
-            # precision matrix. This method is AD-safe and efficient.
-            let
-                local U = spec.hyper.U
-                local L = spec.hyper.L
-                local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
-                
-                # Enforce sum-to-zero constraint by zeroing out the component
-                # corresponding to the null space (the first eigenvalue).
-                diag_D[1] = 0.0
-                
-                $(p_names.latent) = U * (diag_D .* $(p_names.raw))
-                $(eta_target) .+= view($(p_names.latent), M.t_idx)
-            end
-        """
-    else
-        error("Unsupported method '$(m.method)' for RW1. Use :statespace or :spectral.")
-    end
+    statespace_code = """
+        # --- RW1 Component: $(key) (State-Space Method) ---
+        let
+            innovations = $(p_names.raw)
+            latent_field_raw = cumsum(innovations)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.latent), M.t_idx)
+        end
+    """
+
+    spectral_code = """
+        # --- RW1 Component: $(key) (Spectral Method) ---
+        let
+            local U = spec_registry[:$(key)].hyper.U
+            local L = spec_registry[:$(key)].hyper.L
+            local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
+            diag_D[1] = 0.0
+            $(p_names.latent) = U * (diag_D .* $(p_names.raw))
+            $(eta_target) .+= view($(p_names.latent), M.t_idx)
+        end
+    """
+
+    cholesky_code = """
+        # --- RW1 Component: $(key) (Cholesky Method, AD-Safe) ---
+        let
+            local F = spec_registry[:$(key)].hyper.cholesky_factor
+            local latent_field_raw = F.L' \\ $(p_names.raw)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.latent), M.t_idx)
+        end
+    """
+
+    cholesky_sparse_code = """
+        # --- RW1 Component: $(key) (Sparse Cholesky, Not AD-Safe) ---
+        let
+            local Q = spec_registry[:$(key)].hyper.Q_template
+            local F = cholesky(Symmetric(Q + M.noise * I))
+            local latent_field_raw = F.L' \\ $(p_names.raw)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.latent), M.t_idx)
+        end
+    """
+
+    if m.method == :statespace; return statespace_code;
+    elseif m.method == :spectral; return spectral_code;
+    elseif m.method == :cholesky; return cholesky_code;
+    elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
+    else; error("Unsupported method '$(m.method)' for RW1. Use :statespace, :spectral, :cholesky, or :cholesky_sparse."); end
 end
 
 """
@@ -215,13 +226,20 @@ function get_effects(
                 latent_field_centered = latent_field_raw .- mean(latent_field_raw)
                 effect_k[:, j] = latent_field_centered .* sigma_samples[j]
             end
-        else # :spectral
+        elseif m.method == :spectral
             U = spec.hyper.U
             L = spec.hyper.L
             for j in 1:n_samples
                 diag_D = sigma_samples[j] ./ sqrt.(L .+ M.noise)
                 diag_D[1] = 0.0 # Enforce sum-to-zero
                 effect_k[:, j] = U * (diag_D .* raw_samples[j, :])
+            end
+        else # :cholesky or :cholesky_sparse
+            F = spec.hyper.cholesky_factor
+            for j in 1:n_samples
+                latent_field_raw = F.L' \ raw_samples[j, :]
+                latent_field_centered = latent_field_raw .- mean(latent_field_raw)
+                effect_k[:, j] = latent_field_centered .* sigma_samples[j]
             end
         end
         

@@ -6,7 +6,7 @@ This provides an "escape hatch" for advanced users who need to implement logic
 not covered by the standard components.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 This component does not have a fixed mathematical form. It is a "blank canvas"
@@ -21,11 +21,14 @@ responsible for defining the mathematical logic within this code fragment.
   collisions with other model components.
 - The code must correctly modify the `eta` variable if it is intended to be part
   of the linear predictor.
+- The user is responsible for ensuring the provided code is AD-compatible if using
+  gradient-based samplers like NUTS.
 
 # Best Use Case
 Prototyping new models, implementing highly specialized statistical processes, or
 integrating logic from other libraries directly into a `bstm` model without needing
-to create a full custom component file from scratch.
+to create a full custom component file from scratch. It serves as a powerful didactic
+tool for learning how `bstm` constructs models.
 
 # Key References
 - Turing.jl Documentation: https://turing.ml/dev/docs/using-turing/
@@ -49,15 +52,16 @@ end
 
 MODEL_TO_STRUCTURE_MAP[:custom] = :any
 
+
 """
     get_datastructures!(m_type::Type{<:Custom}, M::Dict, mod_data::Dict)::Bool
 
 Resolves the `code_fragment` string from the formula, evaluating it if it is
 provided as a variable name or expression.
 
-# Assumptions
-- The `code_fragment` parameter, if a variable, must be resolvable in the calling
-  module's scope.
+# Security Warning
+This function uses `Core.eval`, which can execute arbitrary code. Only use this
+component with trusted formula inputs.
 """
 function get_datastructures!(
     m_type::Type{<:Custom}, M::Dict, mod_data::Dict
@@ -67,42 +71,34 @@ function get_datastructures!(
     
     local final_code_fragment::String
     if code_fragment_val isa Symbol
+        @warn "Evaluating `code_fragment` from symbol `$(code_fragment_val)`. Ensure this is from a trusted source."
         calling_mod = get(M, :calling_module, Main)
         try
             final_code_fragment = Core.eval(calling_mod, code_fragment_val)
         catch e
-            error(
-                "Could not evaluate `code_fragment` variable `$(code_fragment_val)`. " *
-                "Error: $e"
-            )
+            error("Could not evaluate `code_fragment` variable `$(code_fragment_val)`. Error: $e")
         end
     elseif code_fragment_val isa String
         final_code_fragment = code_fragment_val
     elseif code_fragment_val isa Expr
+        @warn "Evaluating `code_fragment` from expression. Ensure this is from a trusted source."
         try
-            final_code_fragment = Core.eval(
-                get(M, :calling_module, Main), code_fragment_val
-            )
+            final_code_fragment = Core.eval(get(M, :calling_module, Main), code_fragment_val)
         catch e
-            error(
-                "Could not evaluate `code_fragment` expression " *
-                "`$(code_fragment_val)`. Error: $e"
-            )
+            error("Could not evaluate `code_fragment` expression `$(code_fragment_val)`. Error: $e")
         end
     else
         error("Unsupported type for `code_fragment`: $(typeof(code_fragment_val))")
     end
 
     if !(final_code_fragment isa String)
-        error(
-            "`code_fragment` must resolve to a String. " *
-            "Got: $(typeof(final_code_fragment))"
-        )
+        error("`code_fragment` must resolve to a String. Got: $(typeof(final_code_fragment))")
     end
     
     params[:code_fragment] = final_code_fragment
     return true
 end
+
 
 """
     get_precomputes(m::Custom, M::NamedTuple, mod_data::Dict)::NamedTuple
@@ -130,7 +126,8 @@ end
 """
     get_updates(m::Custom, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Injects the user-provided `code_fragment` directly into the model's update block.
+Injects the user-provided `code_fragment` directly into the model's update block,
+wrapped in a `let` block to prevent variable scope leakage.
 """
 function get_updates(
     m::Custom, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -139,16 +136,19 @@ function get_updates(
     user_code = m.code_fragment
     
     if isempty(strip(user_code))
-        @warn "Custom component '$(spec.key)' has an empty `code_fragment` and will " *
-              "have no effect."
+        @warn "Custom component '$(spec.key)' has an empty `code_fragment` and will have no effect."
         return ""
     end
 
     return """
         # --- Custom Code Block for $(spec.key) ---
-        $(user_code)
+        let
+            $(user_code)
+        end
     """
 end
+
+
 
 """
     get_effects(m::Custom, chain, M::NamedTuple, ...)::NamedTuple

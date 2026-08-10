@@ -1,4 +1,3 @@
-
 """
     Dynamics <: ComponentModel
 
@@ -7,7 +6,7 @@ framework. It simulates the evolution of a latent field over space and time
 according to a user-specified differential or difference equation.
 
 # Version
-v1.0.1 (2026-08-08)
+v1.0.2 (2026-08-10)
 
 # Mathematical Summary
 Dynamics models describe the evolution of a latent field \$N(s, t)\$ over space \$s\$
@@ -36,8 +35,8 @@ including process noise \$\\epsilon(s, t)\$.
     *   **Leslie Matrix**: Age-structured population dynamics.
 
 # Assumptions
-- The spatial domain is discretized into `s_N` units, and the temporal domain into
-  `t_N` units.
+- The spatial domain is either provided as a graph (`W`) or can be discretized
+  from coordinates into a regular grid.
 - The evolution is deterministic given parameters, with additive process noise.
 - Exploitation data (effort, removal) can be mapped to the spatiotemporal grid.
 
@@ -58,16 +57,18 @@ estimation of physical or biological parameters within a Bayesian framework.
   "advection_diffusion", "leslie_matrix").
 - `params::Dict{Symbol, Any}`: A dictionary of parameters and priors for the
   specified model.
+- `resolution::Int`: The grid resolution to use when `W` is not provided (continuous mode).
 """
 struct Dynamics <: ComponentModel
     model::String
     params::Dict{Symbol, Any}
+    resolution::Int
 end
 
 COMPONENT_TYPE_REGISTRY[:dynamics] = Dynamics
 
 COMPONENT_CONSTRUCTORS[:dynamics] = (p, params) -> Dynamics(
-    string(get(params, :model, "none")), params
+    string(get(params, :model, "none")), params, get(params, :resolution, 30)
 )
 
 MODEL_TO_STRUCTURE_MAP[:dynamics] = :spacetime
@@ -75,15 +76,14 @@ MODEL_TO_STRUCTURE_MAP[:dynamics] = :spacetime
 """
     get_datastructures!(m_type::Type{<:Dynamics}, M::Dict, mod_data::Dict)::Bool
 
-Performs data-dependent setup for the `Dynamics` component. It establishes the
-spatiotemporal context (`s_N`, `t_N`, `W`), processes exploitation data (`effort`,
-`removal`), and validates the configuration for the specified dynamic model.
+Performs data-dependent setup for the `Dynamics` component. It supports two modes:
+1.  **Graph Mode (Default)**: If an adjacency matrix `W` is provided, it uses the
+    provided graph structure. Requires a spatial index variable.
+2.  **Continuous Mode**: If `W` is not provided, it discretizes the domain into a
+    regular grid based on coordinate variables and the `resolution` parameter.
 
-# Assumptions
-- Positional arguments provide spatial and temporal index variables.
-- An adjacency matrix `W` is available.
-- `grid_areas` are available or can be defaulted to ones.
-- Exploitation data (if provided) can be mapped to the spatiotemporal grid.
+In both modes, it establishes the spatiotemporal context (`s_N`, `t_N`), processes
+exploitation data (`effort`, `removal`), and validates the configuration.
 """
 function get_datastructures!(
     m_type::Type{<:Dynamics}, M::Dict, mod_data::Dict
@@ -91,50 +91,91 @@ function get_datastructures!(
     params = mod_data[:params]
     data = M[:data]
     variables = mod_data[:variables]
+    m = Dynamics(string(get(params, :model, "none")), params, get(params, :resolution, 30))
 
-    if length(variables) < 2
-        error(
-            "Dynamics module requires at least two positional arguments: a spatial " *
-            "index and a temporal index (e.g., dynamics(s_idx, year, ...))."
-        )
+    W_provided = haskey(params, :W) || haskey(M, :W)
+    local temporal_idx_var_sym::Symbol
+
+    if W_provided
+        # --- Graph-based method (W is provided) ---
+        if length(variables) < 2
+            error("Graph-based dynamics requires at least two positional arguments: a spatial index and a temporal index.")
+        end
+        spatial_idx_var_sym = Symbol(variables[1])
+        temporal_idx_var_sym = Symbol(variables[2])
+
+        if haskey(params, :W)
+            w_val = params[:W]
+            if w_val isa Expr || w_val isa Symbol
+                M[:W] = Core.eval(get(M, :calling_module, Main), w_val)
+            else
+                M[:W] = w_val
+            end
+        end
+        M[:s_N] = size(M[:W], 1)
+        
+        if !hasproperty(data, spatial_idx_var_sym)
+            error("Spatial index variable ':$spatial_idx_var_sym' not found for graph-based dynamics.")
+        end
+        M[:s_idx] = data[!, spatial_idx_var_sym]
+    else
+        # --- Continuous/Grid-based method (W is not provided) ---
+        @info "Adjacency matrix 'W' not provided for Dynamics component. Creating a regular grid from coordinates."
+        
+        if length(variables) < 3
+            error("Continuous dynamics requires three positional arguments: x-coordinate, y-coordinate, and a temporal index.")
+        end
+        x_coord_sym = Symbol(variables[1])
+        y_coord_sym = Symbol(variables[2])
+        temporal_idx_var_sym = Symbol(variables[3])
+
+        if !hasproperty(data, x_coord_sym) || !hasproperty(data, y_coord_sym)
+            error("Coordinate variables ':$x_coord_sym' or ':$y_coord_sym' not found for continuous dynamics.")
+        end
+        
+        res = m.resolution
+        M[:s_N] = res * res
+
+        x_coords = data[!, x_coord_sym]
+        y_coords = data[!, y_coord_sym]
+        grid_x = range(minimum(x_coords), maximum(x_coords), length=res)
+        grid_y = range(minimum(y_coords), maximum(y_coords), length=res)
+        
+        W_grid = spzeros(Int, M[:s_N], M[:s_N])
+        centroids = Vector{Point2D}(undef, M[:s_N])
+        for c in 1:res, r in 1:res
+            idx = (c-1)*res + r
+            centroids[idx] = Point2D(grid_x[r], grid_y[c])
+            for dr in -1:1, dc in -1:1
+                if dr == 0 && dc == 0; continue; end
+                nr, nc = r + dr, c + dc
+                if 1 <= nr <= res && 1 <= nc <= res
+                    n_idx = (nc-1)*res + nr
+                    W_grid[idx, n_idx] = 1
+                end
+            end
+        end
+        M[:W] = W_grid
+        M[:centroids] = centroids
+
+        s_idx_new = zeros(Int, nrow(data))
+        for i in 1:nrow(data)
+            obs_x, obs_y = x_coords[i], y_coords[i]
+            best_r = searchsortedfirst(grid_x, obs_x)
+            best_c = searchsortedfirst(grid_y, obs_y)
+            if best_r > 1 && abs(grid_x[best_r-1] - obs_x) < abs(grid_x[best_r] - obs_x); best_r -= 1; end
+            if best_c > 1 && abs(grid_y[best_c-1] - obs_y) < abs(grid_y[best_c] - obs_y); best_c -= 1; end
+            s_idx_new[i] = (best_c-1)*res + best_r
+        end
+        M[:s_idx] = s_idx_new
     end
 
-    spatial_idx_var_sym = Symbol(variables[1])
-    temporal_idx_var_sym = Symbol(variables[2])
-
-    if !hasproperty(data, spatial_idx_var_sym)
-        error("Spatial index variable ':$spatial_idx_var_sym' for dynamics not found.")
-    end
-    M[:s_idx] = data[!, spatial_idx_var_sym]
-    M[:s_N] = length(unique(M[:s_idx]))
-
+    # Common temporal setup
     if !hasproperty(data, temporal_idx_var_sym)
-        error("Temporal index variable ':$temporal_idx_var_sym' for dynamics not found.")
+        error("Temporal index variable ':$temporal_idx_var_sym' not found.")
     end
     M[:t_idx] = data[!, temporal_idx_var_sym]
     M[:t_N] = length(unique(M[:t_idx]))
-
-    # Process adjacency matrix W
-    if haskey(params, :W)
-        w_val = params[:W]
-        if w_val isa Expr || w_val isa Symbol
-            calling_mod = get(M, :calling_module, Main)
-            try
-                M[:W] = Core.eval(calling_mod, w_val)
-            catch e
-                error("Could not evaluate `W` argument `$(w_val)`. Error: $e")
-            end
-        else
-            M[:W] = w_val
-        end
-    end
-    if !haskey(M, :W); error("Dynamics models require an adjacency matrix `W`."); end
-    if M[:s_N] != size(M[:W], 1)
-        error(
-            "Dimension of `W` ($(size(M[:W], 1))) does not match number of " *
-            "spatial units ($(M[:s_N]))."
-        )
-    end
 
     # Process grid areas
     if !haskey(M, :grid_areas)
@@ -145,11 +186,8 @@ function get_datastructures!(
             elseif ga_val isa AbstractVector
                 M[:grid_areas] = ga_val
             else
-                try
-                    M[:grid_areas] = Core.eval(get(M, :calling_module, Main), ga_val)
-                catch
-                    M[:grid_areas] = ones(M[:s_N])
-                end
+                try; M[:grid_areas] = Core.eval(get(M, :calling_module, Main), ga_val);
+                catch; M[:grid_areas] = ones(M[:s_N]); end
             end
         else
             M[:grid_areas] = ones(M[:s_N])
@@ -163,22 +201,10 @@ function get_datastructures!(
     for param_base_name in [:effort, :removal]
         if haskey(params, param_base_name)
             val = params[param_base_name]
-            
-            vals_to_process = val isa Vector && !(val isa AbstractVector{<:Real}) ?
-                              val : [val]
-
+            vals_to_process = val isa Vector && !(val isa AbstractVector{<:Real}) ? val : [val]
             for (i, v) in enumerate(vals_to_process)
-                storage_key = length(vals_to_process) > 1 ?
-                              Symbol("$(param_base_name)_$(i)") : param_base_name
-                
-                covariate_data = if v isa AbstractArray{<:Real}
-                    v
-                elseif v isa Symbol && hasproperty(data, v)
-                    data[!, v]
-                else
-                    nothing
-                end
-
+                storage_key = length(vals_to_process) > 1 ? Symbol("$(param_base_name)_$(i)") : param_base_name
+                covariate_data = if v isa AbstractArray{<:Real}; v; elseif v isa Symbol && hasproperty(data, v); data[!, v]; else; nothing; end
                 if !isnothing(covariate_data)
                     if ndims(covariate_data) == 1
                         cov_matrix = zeros(M[:s_N], M[:t_N])

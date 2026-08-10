@@ -1,4 +1,3 @@
-
 """
     ExponentialDecay <: ComponentModel
 
@@ -7,7 +6,7 @@ The exponential kernel models correlation that decays exponentially with distanc
 representing a continuous but not smooth (non-differentiable) process.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.0.1 (2026-08-10)
 
 # Mathematical Summary
 The component models a latent field \$f(x)\$ as a draw from a Gaussian Process with
@@ -41,17 +40,21 @@ series.
 - `sigma::Distribution`: The prior for the marginal standard deviation of the GP.
 - `lengthscale::Distribution`: The prior for the characteristic lengthscale of the
   decay.
+- `method::Symbol`: The parameterization method. Can be `:noncentered` (default,
+  recommended) or `:centered` (didactic alternative).
 """
 struct ExponentialDecay <: ComponentModel
     sigma::Distribution
     lengthscale::Distribution
+    method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:exponentialdecay] = ExponentialDecay
 COMPONENT_CONSTRUCTORS[:exponentialdecay] = (p, params) -> ExponentialDecay(
-    p.sigma, p.lengthscale
+    p.sigma, p.lengthscale, get(params, :method, :noncentered)
 )
 MODEL_TO_STRUCTURE_MAP[:exponentialdecay] = :smooth
+
 
 """
     get_datastructures!(m_type::Type{<:ExponentialDecay}, M::Dict, mod_data::Dict)
@@ -106,10 +109,13 @@ function get_precomputes(
     return (coords=coords, n_latent=n_latent)
 end
 
+
+
 """
     get_priors(m::ExponentialDecay, spec::NamedTuple, arch::String, outcome_idx, M)
 
-Generates priors for `sigma`, `lengthscale` (`ls`), and the `raw` innovations.
+Generates priors for `sigma` and `lengthscale`. For the `:noncentered` method,
+it also defines a prior for the `raw` innovations.
 """
 function get_priors(
     m::ExponentialDecay, spec::NamedTuple, arch::String,
@@ -117,23 +123,26 @@ function get_priors(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    sigma_prior_str = _distribution_to_string(m.sigma)
-    ls_prior_str = _distribution_to_string(m.lengthscale)
-    
-    return """
-        $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.ls) ~ $(ls_prior_str)
-        $(p_names.raw) ~ MvNormal(
-            zeros(T, spec_registry[:$(spec.key)].precomputes.n_latent), I
-        )
-    """
+    priors = [
+        "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))",
+        "$(p_names.ls) ~ $(_distribution_to_string(m.lengthscale))"
+    ]
+
+    if m.method == :noncentered
+        push!(priors, "$(p_names.raw) ~ MvNormal(zeros(spec.precomputes.n_latent), I)")
+    end
+
+    return join(priors, "\n    ")
 end
+
+
 
 """
     get_updates(m::ExponentialDecay, spec::NamedTuple, arch::String, outcome_idx, M)
 
-Generates code to compute the exponential kernel matrix, perform a Cholesky
-decomposition, and sample the latent field using a non-centered parameterization.
+Generates code to construct the Exponential Decay GP effect. Supports two methods:
+- `:noncentered` (default): Samples standard normal noise and transforms it.
+- `:centered`: Samples the latent field directly from the `MvNormal` distribution.
 """
 function get_updates(
     m::ExponentialDecay, spec::NamedTuple, arch::String,
@@ -142,31 +151,46 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    return """
-        # --- Exponential Decay GP Component: $(spec.key) ---
+    common_code = """
+        local coords = spec_registry[:$(spec.key)].precomputes.coords
+        local dist_matrix = pairwise(Euclidean(), coords', dims=2)
+        local K = ($(p_names.sigma)^2) .* exp.(-dist_matrix ./ $(p_names.ls))
+        local K_stable = K + Diagonal(fill(M.noise, size(K, 1)))
+    """
+
+    noncentered_code = """
+        # --- Exponential Decay GP (Non-Centered): $(spec.key) ---
         let
-            local coords = spec_registry[:$(spec.key)].precomputes.coords
-            
-            # Compute pairwise Euclidean distances
-            local dist_matrix = pairwise(Euclidean(), coords', dims=2)
-            
-            # Compute exponential decay kernel matrix
-            local K = ($(p_names.sigma)^2) .* exp.(-dist_matrix ./ $(p_names.ls))
-            local K_stable = K + Diagonal(fill(M.noise, size(K, 1)))
-            
+            $(common_code)
             local F = cholesky(Symmetric(K_stable))
-            local $(p_names.latent) = F.L * $(p_names.raw)
-            
+            $(p_names.latent) = F.L * $(p_names.raw)
             $(eta_target) .+= $(p_names.latent)
         end
     """
+
+    centered_code = """
+        # --- Exponential Decay GP (Centered): $(spec.key) ---
+        let
+            $(common_code)
+            $(p_names.latent) ~ MvNormal(zeros(size(K_stable, 1)), Symmetric(K_stable))
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
+    if m.method == :noncentered
+        return noncentered_code
+    elseif m.method == :centered
+        return centered_code
+    else
+        error("Unsupported method '$(m.method)' for ExponentialDecay component.")
+    end
 end
 
 """
     get_effects(m::ExponentialDecay, chain, M::NamedTuple, ...)
 
-Reconstructs the `ExponentialDecay` GP effect from the MCMC chain's posterior
-samples by re-evaluating the kernel for each sample.
+Reconstructs the `ExponentialDecay` GP effect from posterior samples,
+dispatching on the method used during sampling.
 """
 function get_effects(
     m::ExponentialDecay, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -181,35 +205,50 @@ function get_effects(
     else
         coords_train
     end
+    n_obs_train = size(coords_train, 1)
     n_obs_full = size(coords_full, 1)
-    dist_matrix = pairwise(Euclidean(), coords_full', dims=2)
+    noise = M.noise
 
     for k in 1:outcomes_N
         p_names = generate_full_variable_names(spec, M.model_arch, k)
         
         sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
         ls_samples = get_params_vector(chain, string(p_names.ls), 1)[:, 1]
-        raw_samples = get_params_vector(
-            chain, string(p_names.raw), spec.precomputes.n_latent
-        )
 
         effect_k = zeros(Float64, n_obs_full, n_samples)
 
-        for i in 1:n_samples
-            K = (sigma_samples[i]^2) .* exp.(-dist_matrix ./ ls_samples[i])
-            K_stable = K + Diagonal(fill(M.noise, n_obs_full))
-            
-            F = cholesky(Symmetric(K_stable))
-            
-            # For prediction, we need to handle the size of raw_samples
-            raw_i = if size(raw_samples, 2) == n_obs_full
-                raw_samples[i, :]
-            else
-                # Pad with new random samples for prediction points
-                vcat(raw_samples[i, :], randn(n_obs_full - size(raw_samples, 2)))
+        if m.method == :noncentered
+            raw_samples = get_params_vector(chain, string(p_names.raw), n_obs_train)
+            dist_matrix_full = pairwise(Euclidean(), coords_full', dims=2)
+            for i in 1:n_samples
+                K = (sigma_samples[i]^2) .* exp.(-dist_matrix_full ./ ls_samples[i])
+                K_stable = K + Diagonal(fill(noise, n_obs_full))
+                F = cholesky(Symmetric(K_stable))
+                raw_i = vcat(raw_samples[i, :], randn(n_obs_full - n_obs_train))
+                effect_k[:, i] = F.L * raw_i
             end
-            
-            effect_k[:, i] = F.L * raw_i
+        else # :centered
+            latent_samples = get_params_vector(chain, string(p_names.latent), n_obs_train)
+            dist_matrix_train = pairwise(Euclidean(), coords_train', dims=2)
+            for i in 1:n_samples
+                effect_k[1:n_obs_train, i] = latent_samples[i, :]
+                if n_obs_full > n_obs_train
+                    coords_pred = coords_full[(n_obs_train+1):end, :]
+                    dist_pred_train = pairwise(Euclidean(), coords_pred', coords_train', dims=2)
+                    dist_pred_pred = pairwise(Euclidean(), coords_pred', dims=2)
+
+                    K_ff = (sigma_samples[i]^2) .* exp.(-dist_matrix_train ./ ls_samples[i]) .+ Diagonal(fill(noise, n_obs_train))
+                    K_star_f = (sigma_samples[i]^2) .* exp.(-dist_pred_train ./ ls_samples[i])
+                    K_star_star = (sigma_samples[i]^2) .* exp.(-dist_pred_pred ./ ls_samples[i]) .+ Diagonal(fill(noise, size(coords_pred, 1)))
+                    
+                    L_ff = cholesky(Symmetric(K_ff)).L
+                    A = L_ff' \ (L_ff \ K_star_f')
+                    mu_pred = A' * latent_samples[i, :]
+                    Sigma_pred = K_star_star - K_star_f * A
+                    
+                    effect_k[(n_obs_train+1):end, i] = rand(MvNormal(mu_pred, Symmetric(Sigma_pred)))
+                end
+            end
         end
         push!(structured_effects, effect_k)
     end
