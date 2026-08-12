@@ -8,7 +8,7 @@ effect is a linear combination of these basis functions, with coefficients
 regularized by a random walk prior to ensure smoothness.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 The component models a smooth function \$f(x)\$ as a linear combination of B-spline
@@ -24,31 +24,29 @@ penalty on the differences between adjacent coefficients:
 \$\\Delta^2 \\beta_j = \\beta_j - 2\\beta_{j-1} + \\beta_{j-2}\$
 This penalizes deviations from a linear trend, encouraging a smooth function.
 
-# Assumptions
-- The relationship between the covariate and the outcome is smooth.
-- The number of bins (`nbins`) is large enough to capture the underlying trend,
-  with smoothness being controlled by the penalty rather than the number of knots.
+# Computational Methods
+- `:spectral` (Default, AD-friendly): Regularizes coefficients using a spectral
+  decomposition of the RW2 penalty matrix. Recommended for gradient-based samplers.
+- `:cholesky` (AD-friendly): Uses a dense Cholesky factorization of the penalty
+  matrix. Can be less efficient for a large number of basis functions.
+- `:cholesky_sparse` (Didactic, Not AD-friendly): Uses a sparse Cholesky
+  factorization. Not compatible with AD but retained as a didactic alternative.
 
-# Best Use Case
-Modeling flexible, non-linear effects of continuous covariates in a computationally
-efficient manner. It is a robust and widely used alternative to Gaussian Processes
-for 1D smoothing.
+# Inputs
+- **Required**:
+  - One or more coordinate variables (e.g., `x`) passed to `random()`.
+- **Optional (in `random()` call)**:
+  - `nbins`: `Int`, the number of basis functions. Default: `10`.
+  - `degree`: `Int`, the polynomial degree of the B-spline. Default: `3`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the
+    coefficients. Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
+    Default: `:spectral`.
 
-# Key References
-- Eilers, P. H., & Marx, B. D. (1996). Flexible smoothing with B-splines and
-  penalties. *Statistical Science*, 11(2), 89-102.
-- De Boor, C. (1978). *A Practical Guide to Splines*. Springer-Verlag.
-- Wikipedia: B-spline
-
-# Fields
-- `nbins::Int`: The number of basis functions to generate.
-- `degree::Int`: The polynomial degree of the B-spline (e.g., 1 for linear, 3 for
-  cubic).
-- `sigma::UnivariateDistribution`: The prior for the standard deviation of the
-  B-spline coefficients.
-- `method::Symbol`: The computational method for regularizing coefficients. Can be
-  `:spectral` (default, AD-safe), `:cholesky` (AD-safe, dense), or
-  `:cholesky_sparse` (didactic, not AD-safe).
+# Outputs (Parameter Names)
+- `sigma_<key>`: The standard deviation of the B-spline coefficients.
+- `innovations_<key>`: The raw standard normal innovations for the coefficients.
+- `latent_<key>`: The final smooth effect vector.
 """
 struct BSpline <: ComponentModel
     nbins::Int
@@ -68,16 +66,6 @@ COMPONENT_CONSTRUCTORS[:bspline] = (p, params) -> BSpline(
 
 MODEL_TO_STRUCTURE_MAP[:bspline] = :smooth
 
-"""
-    get_datastructures!(m_type::Type{<:BSpline}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `BSpline` component. It ensures that
-coordinate variables are provided and stores them in the module data.
-
-# Assumptions
-- The `random()` call provides one or more variables representing the coordinates
-  to be smoothed.
-"""
 function get_datastructures!(
     m_type::Type{<:BSpline}, M::Dict, mod_data::Dict
 )::Bool
@@ -100,12 +88,6 @@ function get_datastructures!(
     return true
 end
 
-"""
-    get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Pre-computes the B-spline basis matrix and the spectral decomposition of the RW2
-penalty matrix for the coefficients.
-"""
 function get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
     if isnothing(coords)
@@ -122,18 +104,19 @@ function get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     B, actual_nbins = bstm_bspline_basis(coords[:, 1], m.nbins, m.degree)
     n_latent = actual_nbins
 
-    # A second-order random walk (RW2) is a common penalty for spline coefficients.
     template = build_structure_template(:rw2, n_latent)
     Q_template = template.matrix
     
-    # Spectral decomposition for AD-friendly sampling
     eig_decomp = eigen(Symmetric(Matrix(Q_template)))
     U = eig_decomp.vectors
     L = eig_decomp.values
-    scaling_factor = _compute_scaling_factor(L, 2) # RW2 has rank deficiency 2
+    scaling_factor = _compute_scaling_factor(L, 2)
     
     Q_template_scaled = Q_template ./ scaling_factor
     L_scaled = L ./ scaling_factor
+
+    # Pre-compute dense Cholesky factor for the :cholesky method
+    F = cholesky(Symmetric(Matrix(Q_template_scaled) + M.noise * I))
 
     return (
         basis_matrix=B,
@@ -141,15 +124,11 @@ function get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
         scaling_factor=scaling_factor,
         U=U,
         L=L_scaled,
-        n_latent=n_latent
+        n_latent=n_latent,
+        cholesky_factor=F
     )
 end
 
-"""
-    get_priors(m::BSpline, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for `sigma` and the `raw` innovations for the basis coefficients.
-"""
 function get_priors(
     m::BSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -159,19 +138,12 @@ function get_priors(
     
     return """
         $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.raw) ~ MvNormal(
-            zeros(T, spec_registry[:$(spec.key)].hyper.n_latent), I
+        $(p_names.innovations) ~ MvNormal(
+            zeros(T, spec.hyper.n_latent), I
         )
     """
 end
 
-"""
-    get_updates(m::BSpline, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code to construct the B-spline smooth effect. Supports three
-methods for regularizing the coefficients: `:spectral`, `:cholesky`, and
-`:cholesky_sparse`.
-"""
 function get_updates(
     m::BSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -182,8 +154,8 @@ function get_updates(
     n_latent = spec.hyper.n_latent
     
     common_code = """
-        local hyper = spec_registry[:$(key)].hyper
-        local B_basis = hyper.basis_matrix
+        hyper = spec_registry[:$(key)].hyper
+        B_basis = hyper.basis_matrix
     """
 
     spectral_code = """
@@ -191,16 +163,13 @@ function get_updates(
         let
             $(common_code)
             
-            # Reconstruct latent coefficients using spectral decomposition
-            local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
-            # Enforce sum-to-zero constraints for RW2 penalty (rank deficiency 2)
+            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0
             diag_D[2] = 0.0
             
-            local coeffs = hyper.U * (diag_D .* $(p_names.raw))
+            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             
-            # Compute final effect by multiplying basis matrix with coefficients
-            local $(p_names.latent) = B_basis * coeffs
+            $(p_names.latent) = B_basis * coeffs
             
             $(eta_target) .+= $(p_names.latent)
         end
@@ -211,18 +180,16 @@ function get_updates(
         let
             $(common_code)
             
-            local Q_penalty = hyper.Q_template
-            local F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
+            F = hyper.cholesky_factor
             
-            local coeffs_raw = F.L' \\ $(p_names.raw)
+            coeffs_raw = F.L' \\ $(p_names.innovations)
             
-            # Apply soft sum-to-zero constraints for RW2 penalty (rank deficiency 2)
             Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw[1:2])
             )
             
-            local coeffs = $(p_names.sigma) .* coeffs_raw
-            local $(p_names.latent) = B_basis * coeffs
+            coeffs = $(p_names.sigma) .* coeffs_raw
+            $(p_names.latent) = B_basis * coeffs
             
             $(eta_target) .+= $(p_names.latent)
         end
@@ -230,23 +197,20 @@ function get_updates(
 
     cholesky_sparse_code = """
         # --- B-Spline Smoother Component (Sparse Cholesky, Not AD-Safe): $(key) ---
-        # WARNING: This method is for didactic purposes and is NOT compatible with
-        # automatic differentiation (e.g., NUTS sampler).
         let
             $(common_code)
             
-            local Q_penalty = hyper.Q_template
-            local F = cholesky(Symmetric(Q_penalty + M.noise * I))
+            Q_penalty = hyper.Q_template
+            F = cholesky(Symmetric(Q_penalty + M.noise * I))
             
-            local coeffs_raw = F.L' \\ $(p_names.raw)
+            coeffs_raw = F.L' \\ $(p_names.innovations)
             
-            # Apply soft sum-to-zero constraints for RW2 penalty (rank deficiency 2)
             Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw[1:2])
             )
             
-            local coeffs = $(p_names.sigma) .* coeffs_raw
-            local $(p_names.latent) = B_basis * coeffs
+            coeffs = $(p_names.sigma) .* coeffs_raw
+            $(p_names.latent) = B_basis * coeffs
             
             $(eta_target) .+= $(p_names.latent)
         end
@@ -263,38 +227,46 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::BSpline, chain, M::NamedTuple, ...)::NamedTuple
-
-Reconstructs the `BSpline` component's effect from the MCMC chain's posterior
-samples, dispatching on the method used during sampling.
-"""
 function get_effects(
     m::BSpline, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        raw_samples = get_params_vector(
-            chain, string(p_names.raw), spec.hyper.n_latent
-        )
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+
+        if isempty(sigma_name) || isempty(innovations_name)
+            @warn "Parameters for BSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, spec.hyper.n_latent)
 
         hyper = spec.hyper
         noise = M.noise
         
         B_train = hyper.basis_matrix
-        B_full = if !isnothing(PS) && haskey(PS, :basis_matrices) &&
-                    haskey(PS.basis_matrices, spec.key)
-            vcat(B_train, PS.basis_matrices[spec.key])
+        B_full = if !isnothing(PS)
+            coord_vars = get(spec.params, :positional_args, [])
+            if !isempty(coord_vars) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+                coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+                B_pred, _ = bstm_bspline_basis(coords_pred[:, 1], m.nbins, m.degree)
+                vcat(B_train, B_pred)
+            else
+                B_train
+            end
         else
             B_train
         end
         
         if size(B_full, 1) != N_total
-            @warn "BSpline effect reconstruction: dimension mismatch. Using in-sample."
+            @warn "BSpline effect reconstruction: dimension mismatch. Using in-sample basis."
             B_full = B_train
         end
 
@@ -308,14 +280,11 @@ function get_effects(
                 diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
                 diag_D[1] = 0.0
                 diag_D[2] = 0.0
-                coeffs = U * (diag_D .* raw_samples[i, :])
+                coeffs = U * (diag_D .* innovations_samples[i, :])
             else # :cholesky or :cholesky_sparse
-                Q_penalty = hyper.Q_template
-                # For reconstruction, dense Cholesky is fine for both methods
-                F = cholesky(Symmetric(Matrix(Q_penalty) + noise * I))
-                coeffs_raw = F.L' \ raw_samples[i, :]
-                # Centering for identifiability, as done in the model
-                coeffs_centered = coeffs_raw .- mean(coeffs_raw[1:2]) # Only first two for RW2
+                F = hyper.cholesky_factor
+                coeffs_raw = F.L' \ innovations_samples[i, :]
+                coeffs_centered = coeffs_raw .- mean(coeffs_raw[1:2])
                 coeffs = sigma_samples[i] .* coeffs_centered
             end
             reconstructed_effects_k[:, i] = B_full * coeffs

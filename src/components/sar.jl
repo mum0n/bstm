@@ -7,7 +7,7 @@ its neighbors plus an independent innovation term, leading to a precision matrix
 the form `(I - ρW)'(I - ρW)`.
 
 # Version
-v1.0.2 (2026-08-10)
+v1.1.1 (2026-08-12)
 
 # Mathematical Summary
 The Simultaneous Autoregressive (SAR) model defines a spatial random effect
@@ -23,14 +23,36 @@ The precision matrix \$\\mathbf{Q}\$ for the SAR model is then given by:
 \$\\mathbf{Q} = \\frac{1}{\\sigma^2} (\\mathbf{I} - \\rho \\mathbf{W})^T (\\mathbf{I} - \\rho \\mathbf{W})\$
 
 # Computational Methods
-- `:cholesky` (default): An AD-safe method using dense Cholesky factorization.
-- `:cholesky_sparse` (didactic, not AD-safe): A more memory-efficient method using
+- `:cholesky` (Default, AD-friendly): An AD-safe method using dense Cholesky factorization.
+- `:cholesky_sparse` (Didactic, Not AD-friendly): A more memory-efficient method using
   sparse Cholesky factorization, suitable for gradient-free samplers.
 
-# Fields
-- `rho::Distribution`: The prior for the spatial autoregressive parameter `rho`.
-- `sigma::Distribution`: The prior for the standard deviation of the innovations.
-- `method::Symbol`: The computational method, `:cholesky` or `:cholesky_sparse`.
+**Note on Spectral Method**: A direct spectral method (using pre-computed eigenvectors
+and eigenvalues) is not provided for the SAR model because its precision matrix
+depends on the sampled parameter `rho` in a way that prevents pre-computation of
+its spectral decomposition.
+
+# Inputs
+- **Required**:
+  - A spatial index variable (e.g., `region`) passed to `random()`.
+  - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
+- **Optional (in `random()` call)**:
+  - `rho`: `UnivariateDistribution`, prior for the spatial autoregressive parameter.
+    Default: `Normal(0, 0.5)`. Should be constrained to ensure stationarity.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the innovations.
+    Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:cholesky` or `:cholesky_sparse`).
+    Default: `:cholesky`.
+
+# Outputs (Parameter Names)
+- `rho_<key>`: The spatial autoregressive parameter.
+- `sigma_<key>`: The standard deviation of the innovations.
+- `innovations_<key>`: The raw standard normal innovations for the latent field.
+- `latent_<key>`: The reconstructed latent SAR effect.
+
+# Key References
+- Cliff, A. D., & Ord, J. K. (1973). *Spatial Autocorrelation*. Pion.
+- Wikipedia: Simultaneous autoregressive model
 """
 struct SAR <: ComponentModel
     rho::Distribution
@@ -43,21 +65,12 @@ COMPONENT_CONSTRUCTORS[:sar] = (p, params) -> SAR(
     p.rho, p.sigma, get(params, :method, :cholesky)
 )
 
-# Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:sar] = :spatial
 
-"""
-    get_datastructures!(m_type::Type{<:SAR}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `SAR` component.
-It ensures that an adjacency matrix `W` is provided and sets up the spatial context
-(`s_idx`, `s_N`) in the main model configuration `M`.
-"""
 function get_datastructures!(m_type::Type{<:SAR}, M::Dict, mod_data::Dict)::Bool
     params = mod_data[:params]
     variables = mod_data[:variables]
 
-    # Ensure W is available, either directly in params or in M
     if haskey(params, :W)
         w_val = params[:W]
         if w_val isa Expr || w_val isa Symbol
@@ -83,7 +96,6 @@ function get_datastructures!(m_type::Type{<:SAR}, M::Dict, mod_data::Dict)::Bool
     M[:s_N] = size(M[:W], 1)
 
     if isempty(variables)
-        # If no variable is provided, assume s_idx is 1:s_N
         M[:s_idx] = collect(1:M[:s_N])
         @warn "Spatial index variable not provided for SAR. Assuming `s_idx = 1:s_N`."
     else
@@ -97,18 +109,10 @@ function get_datastructures!(m_type::Type{<:SAR}, M::Dict, mod_data::Dict)::Bool
     return true
 end
 
-"""
-    get_precomputes(m::SAR, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Performs data-independent pre-calculations for the `SAR` component.
-For SAR, the `Q_template` is the row-standardized adjacency matrix `W`. The full
-precision matrix is constructed dynamically within the model.
-"""
-function get_precomputes(m::SAR, M::NamedTuple, mod_data::Dict)::NamedTuple # n_latent is n
+function get_precomputes(m::SAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     n = M.s_N
-    W = sparse(M.W) # Ensure W is sparse
+    W = sparse(M.W)
 
-    # Row-standardize the adjacency matrix W
     row_sums = sum(W, dims=2)
     non_zero_rows = findall(x -> x > 0, vec(row_sums))
     
@@ -118,40 +122,26 @@ function get_precomputes(m::SAR, M::NamedTuple, mod_data::Dict)::NamedTuple # n_
         W_std[non_zero_rows, :] = D_inv * W[non_zero_rows, :]
     end
 
-    # For SAR, the Q_template is the row-standardized adjacency matrix.
-    # The full precision matrix (I - rho*W)'(I - rho*W) is constructed dynamically.
-    # No spectral decomposition is pre-computed as the precision matrix depends on rho.
-    return (Q_template=W_std, n_latent=n) # n_latent is n
+    return (Q_template=W_std, n_latent=n)
 end
 
-"""
-    get_priors(m::SAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
-
-Generates the Turing code string for the `SAR` component's priors.
-It defines the priors for `rho`, `sigma`, and the latent field `raw`.
-"""
-function get_priors(m::SAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(
+    m::SAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    n_latent = spec.precomputes.n_latent
+    n_latent = spec.hyper.n_latent
 
     rho_prior_str = _distribution_to_string(m.rho)
     sigma_prior_str = _distribution_to_string(m.sigma)
     
-    # Latent field prior (non-centered parameterization)
-    # raw ~ MvNormal(zeros(T, n_latent), I)
-    return """ 
-        $(p_names.rho) ~ NamedDist($(rho_prior_str), :$(p_names.rho))
-        $(p_names.sigma) ~ NamedDist($(sigma_prior_str), :$(p_names.sigma))
-        $(p_names.raw) ~ NamedDist(MvNormal(zeros($(n_latent)), I), :$(p_names.raw))
+    return """
+        $(p_names.rho) ~ $(rho_prior_str)
+        $(p_names.sigma) ~ $(sigma_prior_str)
+        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
     """
 end
 
-"""
-    get_updates(m::SAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code for constructing the `SAR` effect, dispatching on the
-chosen method.
-"""
 function get_updates(
     m::SAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -159,20 +149,27 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
-    n_latent = spec.precomputes.n_latent
+    n_latent = spec.hyper.n_latent
 
     common_code = """
-        local W_std = spec_registry[:$(key)].precomputes.Q_template
+        local W_std = spec_registry[:$(key)].hyper.Q_template
         local L_op = I - $(p_names.rho) * W_std
-        local Q_final = Symmetric((L_op' * L_op) / ($(p_names.sigma)^2) + M.noise * I)
+        local A_sar = L_op' * L_op
+        # Enforce numerical symmetry for AD compatibility. This is crucial when
+        # L_op contains Dual numbers, as floating-point errors can break symmetry.
+        local Q_sar = (A_sar + A_sar') / 2.0
+        local Q_final = Symmetric(Q_sar / ($(p_names.sigma)^2) + M.noise * I)
     """
 
     cholesky_code = """
         # --- SAR Component (Cholesky, AD-Safe): $(key) ---
         let
             $(common_code)
-            local F = cholesky(Matrix(Q_final)) # Convert to dense for AD
-            local $(p_names.latent) = F.L' \\ $(p_names.raw)
+            # The precision matrix Q_final must be converted to a dense Matrix
+            # for the cholesky factorization to be AD-compatible. Add a small nugget
+            # for numerical stability, especially with AD.
+            F = cholesky(Matrix(Q_final + I * 1e-9))
+            $(p_names.latent) = F.L' \\ $(p_names.innovations)
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
@@ -181,8 +178,10 @@ function get_updates(
         # --- SAR Component (Sparse Cholesky, Not AD-Safe): $(key) ---
         let
             $(common_code)
-            local F = cholesky(Q_final) # Use sparse Cholesky
-            local $(p_names.latent) = F.L' \\ $(p_names.raw)
+            # Sparse cholesky is not AD-compatible but is more memory-efficient.
+            # Add a small nugget for numerical stability.
+            F = cholesky(Q_final + I * 1e-9)
+            $(p_names.latent) = F.L' \\ $(p_names.innovations)
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
@@ -196,12 +195,6 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::SAR, chain, M::NamedTuple, ...)
-
-Reconstructs the `SAR` component's effect from posterior samples. For
-reconstruction, a dense Cholesky is always used for robustness.
-"""
 function get_effects(
     m::SAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
@@ -209,26 +202,39 @@ function get_effects(
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
+    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
     W_std = spec.hyper.Q_template
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
-        rho_samples = get_params_vector(chain, string(p_names.rho), 1)[:, 1]
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
+        rho_name = _find_parameter(p_names_vec, string(spec.key), "rho", k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+
+        if isempty(rho_name) || isempty(sigma_name) || isempty(innovations_name)
+            @warn "Parameters for SAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+
+        rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
 
         for i in 1:n_samples
             L_op = I(n_latent) - rho_samples[i] * W_std
-            Q_final = Symmetric((L_op' * L_op) / (sigma_samples[i]^2) + noise * I)
+            A_sar = L_op' * L_op
+            # Enforce numerical symmetry.
+            Q_sar = (A_sar + A_sar') / 2.0
+            Q_final = Symmetric(Q_sar / (sigma_samples[i]^2) + noise * I)
             
-            # For reconstruction, dense Cholesky is safe and robust.
-            F = cholesky(Matrix(Q_final))
+            # Add a small nugget for numerical stability before factorization.
+            F = cholesky(Matrix(Q_final + I * 1e-9))
             
-            effect_k[:, i] = F.L' \ raw_samples[i, :]
+            effect_k[:, i] = F.L' \ innovations_samples[i, :]
         end
         push!(structured_effects, effect_k[s_idx_full, :])
     end

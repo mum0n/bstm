@@ -7,7 +7,7 @@ spatiotemporal models, spatially varying coefficients, and non-stationary varian
 models.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary & Operators
 
@@ -44,13 +44,16 @@ field:
   coefficient processes. *Journal of the American Statistical Association*. (For
   concepts related to spatially varying curves).
 
-# Fields
-- `components::Vector{ComponentModel}`: The child components being combined.
-- `operator::Symbol`: The operator defining the composition (e.g., `:pipe`,
-  `:kronecker_product`, `:composition`).
-- `method::Symbol`: The computational method to use. For `:kronecker_product`, can
-  be `:spectral` (default), `:cholesky`, or `:cholesky_sparse`. For `:pipe`, can
-  be `:cholesky` (default) or `:cholesky_sparse`.
+# Inputs
+- **Required**:
+  - Two or more `random()` modules combined with an operator (`|>`, `⊗`, `∘`).
+- **Optional**:
+  - `method`: A `Symbol` specifying the computational method.
+
+# Outputs (Parameter Names)
+- **`:pipe`**: `innovations_<key>`, `sigma_<state_key>`, `rho_<state_key>`
+- **`:kronecker_product`**: `sigma_<key>`, `innovations_<key>`
+- **`:composition`**: Parameters from the child components.
 """
 struct Composed <: ComponentModel
     components::Vector{ComponentModel}
@@ -78,12 +81,6 @@ end
 
 MODEL_TO_STRUCTURE_MAP[:composed] = :any
 
-"""
-    get_datastructures!(m_type::Type{<:Composed}, M::Dict, mod_data::Dict)::Bool
-
-Delegates data structure setup to the child components, ensuring that all necessary
-indices and data are processed before the pre-computation step.
-"""
 function get_datastructures!(
     m_type::Type{<:Composed}, M::Dict, mod_data::Dict
 )::Bool
@@ -113,12 +110,6 @@ function get_datastructures!(
     return true
 end
 
-"""
-    get_precomputes(m::Composed, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Delegates pre-computation to child components and aggregates their results into a
-`child_specs` list for use by the code generators.
-"""
 function get_precomputes(m::Composed, M::NamedTuple, mod_data::Dict)::NamedTuple
     child_nodes = get(mod_data[:params], :components, [])
     child_precomputes_list = []
@@ -155,12 +146,6 @@ function get_precomputes(m::Composed, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
-"""
-    get_priors(m::Composed, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for the `Composed` component, dispatching on the operator to
-create the correct hierarchical prior structure.
-"""
 function get_priors(
     m::Composed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -178,7 +163,7 @@ function get_priors(
         
         n_spatial = state_spec.hyper.n_latent
         n_basis = dynamic_spec.hyper.n_latent
-        coeffs_prior = "$(p_names.raw) ~ MvNormal(zeros(T, $(n_spatial * n_basis)), I)"
+        coeffs_prior = "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_spatial * n_basis)), I)"
         
         return """
         # Priors for Spatially Varying Curve: $(spec.key)
@@ -193,7 +178,7 @@ function get_priors(
         return """
         # Priors for Spatiotemporal Interaction: $(spec.key)
         $(p_names.sigma) ~ $(_distribution_to_string(st_sigma_prior))
-        $(p_names.raw) ~ MvNormal(zeros(T, $(s_N * t_N)), I)
+        $(p_names.innovations) ~ MvNormal(zeros(T, $(s_N * t_N)), I)
         """
     elseif m.operator == :composition # Non-stationary variance
         modifier_spec = child_specs[1]
@@ -213,7 +198,7 @@ function get_priors(
         n_latent_base = base_spec.hyper.n_latent
         push!(
             base_priors_acc,
-            "$(base_p_names.raw) ~ MvNormal(zeros(T, $(n_latent_base)), I)"
+            "$(base_p_names.innovations) ~ MvNormal(zeros(T, $(n_latent_base)), I)"
         )
         base_priors = join(base_priors_acc, "\n    ")
 
@@ -231,12 +216,6 @@ function get_priors(
     end
 end
 
-"""
-    get_updates(m::Composed, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code for the effect of the `Composed` component, dispatching
-on the operator and method to construct the correct interaction logic.
-"""
 function get_updates(
     m::Composed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -260,18 +239,18 @@ function get_updates(
         n_basis = dynamic_spec.hyper.n_latent
 
         cholesky_base_code = """
-            local Q_spatial_template = spec_registry[:$(state_spec.key)].hyper.Q_template
-            local Q_spatial = recompose_precision(:$(state_model_type), Q_spatial_template, 1.0; extra_param=$(rho_value))
+            Q_spatial_template = spec_registry[:$(state_spec.key)].hyper.Q_template
+            Q_spatial = recompose_precision(:$(state_model_type), Q_spatial_template, 1.0; extra_param=$(rho_value))
         """
 
         cholesky_dense_code = """
             # --- Spatially Varying Curve (Cholesky): $(spec.key) ---
             let
                 $(cholesky_base_code)
-                local F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I))
-                local coeffs_raw_matrix = reshape($(p_names.raw), $(n_spatial), $(n_basis))
-                local spatial_coeffs = F_spatial.L' \\ coeffs_raw_matrix
-                local final_effect = sum($(basis_matrix) .* spatial_coeffs[M.s_idx, :], dims=2)
+                F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I))
+                coeffs_raw_matrix = reshape($(p_names.innovations), $(n_spatial), $(n_basis))
+                spatial_coeffs = F_spatial.L' \\ coeffs_raw_matrix
+                final_effect = sum($(basis_matrix) .* spatial_coeffs[M.s_idx, :], dims=2)
                 $(eta_target) .+= final_effect
             end
         """
@@ -280,10 +259,10 @@ function get_updates(
             # --- Spatially Varying Curve (Sparse Cholesky, Not AD-Safe): $(spec.key) ---
             let
                 $(cholesky_base_code)
-                local F_spatial = cholesky(Symmetric(Q_spatial + M.noise * I))
-                local coeffs_raw_matrix = reshape($(p_names.raw), $(n_spatial), $(n_basis))
-                local spatial_coeffs = F_spatial.L' \\ coeffs_raw_matrix
-                local final_effect = sum($(basis_matrix) .* spatial_coeffs[M.s_idx, :], dims=2)
+                F_spatial = cholesky(Symmetric(Q_spatial + M.noise * I))
+                coeffs_raw_matrix = reshape($(p_names.innovations), $(n_spatial), $(n_basis))
+                spatial_coeffs = F_spatial.L' \\ coeffs_raw_matrix
+                final_effect = sum($(basis_matrix) .* spatial_coeffs[M.s_idx, :], dims=2)
                 $(eta_target) .+= final_effect
             end
         """
@@ -305,41 +284,41 @@ function get_updates(
         spectral_code = """
             # --- Spatiotemporal Interaction (Spectral): $(spec.key) ---
             let
-                local s_hyper = spec_registry[:$(s_spec.key)].hyper
-                local t_hyper = spec_registry[:$(t_spec.key)].hyper
+                s_hyper = spec_registry[:$(s_spec.key)].hyper
+                t_hyper = spec_registry[:$(t_spec.key)].hyper
                 
-                local diag_Ls = (1.0 .- $(s_rho_val)) .+ $(s_rho_val) .* s_hyper.L
-                local diag_Lt = (1.0 .- $(t_rho_val)) .+ $(t_rho_val) .* t_hyper.L
+                diag_Ls = (1.0 .- $(s_rho_val)) .+ $(s_rho_val) .* s_hyper.L
+                diag_Lt = (1.0 .- $(t_rho_val)) .+ $(t_rho_val) .* t_hyper.L
                 
-                local diag_D_s = $(p_names.sigma) ./ sqrt.(diag_Ls .+ M.noise)
-                local diag_D_t = 1.0 ./ sqrt.(diag_Lt .+ M.noise)
+                diag_D_s = $(p_names.sigma) ./ sqrt.(diag_Ls .+ M.noise)
+                diag_D_t = 1.0 ./ sqrt.(diag_Lt .+ M.noise)
                 
-                local Z_matrix = reshape($(p_names.raw), M.s_N, M.t_N)
+                Z_matrix = reshape($(p_names.innovations), M.s_N, M.t_N)
                 
-                local tmp = s_hyper.U' * Z_matrix * t_hyper.U
-                local transformed = (diag_D_s .* tmp) .* diag_D_t'
-                local st_field = s_hyper.U * transformed * t_hyper.U'
+                tmp = s_hyper.U' * Z_matrix * t_hyper.U
+                transformed = (diag_D_s .* tmp) .* diag_D_t'
+                st_field = s_hyper.U * transformed * t_hyper.U'
                 
                 $(eta_target) .+= st_field[M.st_idx]
             end
         """
 
         cholesky_base_code = """
-            local Q_s = recompose_precision(:$(s_model_type), spec_registry[:$(s_spec.key)].hyper.Q_template, 1.0; extra_param=$(s_rho_val))
-            local Q_t = recompose_precision(:$(t_model_type), spec_registry[:$(t_spec.key)].hyper.Q_template, 1.0; extra_param=$(t_rho_val))
+            Q_s = recompose_precision(:$(s_model_type), spec_registry[:$(s_spec.key)].hyper.Q_template, 1.0; extra_param=$(s_rho_val))
+            Q_t = recompose_precision(:$(t_model_type), spec_registry[:$(t_spec.key)].hyper.Q_template, 1.0; extra_param=$(t_rho_val))
         """
 
         cholesky_dense_code = """
             # --- Spatiotemporal Interaction (Cholesky): $(spec.key) ---
             let
                 $(cholesky_base_code)
-                local C_s = cholesky(Symmetric(Matrix(Q_s) + M.noise * I))
-                local C_t = cholesky(Symmetric(Matrix(Q_t) + M.noise * I))
-                local Z_matrix = reshape($(p_names.raw), M.s_N, M.t_N)
-                local tmp_spatial = C_s.L' \\ Z_matrix
-                local st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
+                C_s = cholesky(Symmetric(Matrix(Q_s) + M.noise * I))
+                C_t = cholesky(Symmetric(Matrix(Q_t) + M.noise * I))
+                Z_matrix = reshape($(p_names.innovations), M.s_N, M.t_N)
+                tmp_spatial = C_s.L' \\ Z_matrix
+                st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
                 Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_unscaled))
-                local st_field = st_field_unscaled .* $(p_names.sigma)
+                st_field = st_field_unscaled .* $(p_names.sigma)
                 $(eta_target) .+= st_field[M.st_idx]
             end
         """
@@ -348,13 +327,13 @@ function get_updates(
             # --- Spatiotemporal Interaction (Sparse Cholesky, Not AD-Safe): $(spec.key) ---
             let
                 $(cholesky_base_code)
-                local C_s = cholesky(Symmetric(Q_s + M.noise * I))
-                local C_t = cholesky(Symmetric(Q_t + M.noise * I))
-                local Z_matrix = reshape($(p_names.raw), M.s_N, M.t_N)
-                local tmp_spatial = C_s.L' \\ Z_matrix
-                local st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
+                C_s = cholesky(Symmetric(Q_s + M.noise * I))
+                C_t = cholesky(Symmetric(Q_t + M.noise * I))
+                Z_matrix = reshape($(p_names.innovations), M.s_N, M.t_N)
+                tmp_spatial = C_s.L' \\ Z_matrix
+                st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
                 Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_unscaled))
-                local st_field = st_field_unscaled .* $(p_names.sigma)
+                st_field = st_field_unscaled .* $(p_names.sigma)
                 $(eta_target) .+= st_field[M.st_idx]
             end
         """
@@ -376,9 +355,9 @@ function get_updates(
         base_model_type = Symbol(lowercase(string(typeof(base_spec.component_obj))))
         
         base_latent_reconstruction_code = """
-            local Q_base_template = spec_registry[:$(base_spec.key)].hyper.Q_template
-            local F_base = cholesky(Symmetric(Matrix(Q_base_template) + M.noise * I))
-            local base_latent_raw = F_base.L' \\ $(base_p_names.raw)
+            Q_base_template = spec_registry[:$(base_spec.key)].hyper.Q_template
+            F_base = cholesky(Symmetric(Matrix(Q_base_template) + M.noise * I))
+            base_latent_raw = F_base.L' \\ $(base_p_names.innovations)
             if $(base_model_type) in [:icar, :besag]
                 Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(base_spec.hyper.n_latent)), sum(base_latent_raw))
             end
@@ -390,10 +369,10 @@ function get_updates(
         # --- Composition (NonStationaryVariance) Update: $(spec.key) ---
         let
             $(modifier_update_cleaned)
-            local log_sigma_field = M.basis_matrices[:$(modifier_basis_key)] * $(modifier_latent_var)
-            local spatially_varying_sigma = exp.(log_sigma_field)
+            log_sigma_field = M.basis_matrices[:$(modifier_basis_key)] * $(modifier_latent_var)
+            spatially_varying_sigma = exp.(log_sigma_field)
             $(base_latent_reconstruction_code)
-            local final_effect_latent = base_latent_raw .* spatially_varying_sigma
+            final_effect_latent = base_latent_raw .* spatially_varying_sigma
             $(eta_target) .+= final_effect_latent[M.s_idx]
         end
         """
@@ -402,18 +381,14 @@ function get_updates(
     return "# Operator '$(m.operator)' not implemented for get_updates in Composed"
 end
 
-
-"""
-    get_effects(m::Composed, chain, M::NamedTuple, ...)::NamedTuple
-
-Reconstructs the `Composed`'s effect from the MCMC chain's posterior samples.
-"""
 function get_effects(
     m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     child_specs = spec.hyper.child_specs
     structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     if m.operator == :pipe # Spatially varying curve
         dynamic_spec = child_specs[1]
@@ -433,13 +408,14 @@ function get_effects(
         s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
 
         for k in 1:outcomes_N
-            p_names = generate_full_variable_names(spec, M.model_arch, k)
+            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            if isempty(innovations_name)
+                @warn "Innovations for Composed component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                continue
+            end
+            innovations_samples = get_params_vector(chain, innovations_name, n_spatial * n_basis)
+            
             state_p_names = generate_full_variable_names(state_spec, M.model_arch, k)
-            
-            coeffs_raw_samples = get_params_vector(
-                chain, string(p_names.raw), n_spatial * n_basis
-            )
-            
             state_model_type = Symbol(lowercase(string(typeof(state_spec.component_obj))))
             Q_spatial_template = state_spec.hyper.Q_template
             
@@ -454,10 +430,68 @@ function get_effects(
                 )
                 F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I))
                 
-                coeffs_raw_matrix = reshape(coeffs_raw_samples[i, :], n_spatial, n_basis)
+                coeffs_raw_matrix = reshape(innovations_samples[i, :], n_spatial, n_basis)
                 spatial_coeffs = F_spatial.L' \ coeffs_raw_matrix
                 
                 effect_k[:, i] = sum(B_dynamic_full .* spatial_coeffs[s_idx_full, :], dims=2)
+            end
+            structured_effects[k] = effect_k
+        end
+        return (structured=structured_effects, noisy=structured_effects)
+
+    elseif m.operator == :kronecker_product
+        s_spec = child_specs[1]
+        t_spec = child_specs[2]
+        s_N = s_spec.hyper.n_latent
+        t_N = t_spec.hyper.n_latent
+        st_idx_full = (t_idx_full .- 1) .* s_N .+ s_idx_full
+
+        for k in 1:outcomes_N
+            sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            if isempty(sigma_name) || isempty(innovations_name)
+                @warn "Parameters for Kronecker product component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                continue
+            end
+            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+            innovations_samples = get_params_vector(chain, innovations_name, s_N * t_N)
+
+            effect_k = zeros(Float64, N_total, n_samples)
+
+            for i in 1:n_samples
+                local st_field
+                if m.method == :spectral
+                    s_hyper = s_spec.hyper; t_hyper = t_spec.hyper
+                    s_rho_val = hasproperty(s_spec.component_obj, :rho) ? get_params_vector(chain, string(generate_full_variable_names(s_spec, M.model_arch, k).rho), 1)[i, 1] : nothing
+                    t_rho_val = hasproperty(t_spec.component_obj, :rho) ? get_params_vector(chain, string(generate_full_variable_names(t_spec, M.model_arch, k).rho), 1)[i, 1] : nothing
+                    
+                    diag_Ls = (1.0 .- s_rho_val) .+ s_rho_val .* s_hyper.L
+                    diag_Lt = (1.0 .- t_rho_val) .+ t_rho_val .* t_hyper.L
+                    diag_D_s = sigma_samples[i] ./ sqrt.(diag_Ls .+ M.noise)
+                    diag_D_t = 1.0 ./ sqrt.(diag_Lt .+ M.noise)
+                    
+                    Z_matrix = reshape(innovations_samples[i, :], s_N, t_N)
+                    tmp = s_hyper.U' * Z_matrix * t_hyper.U
+                    transformed = (diag_D_s .* tmp) .* diag_D_t'
+                    st_field = s_hyper.U * transformed * t_hyper.U'
+                else # cholesky or cholesky_sparse
+                    s_model_type = Symbol(lowercase(string(typeof(s_spec.component_obj))))
+                    t_model_type = Symbol(lowercase(string(typeof(t_spec.component_obj))))
+                    s_rho_val = hasproperty(s_spec.component_obj, :rho) ? get_params_vector(chain, string(generate_full_variable_names(s_spec, M.model_arch, k).rho), 1)[i, 1] : nothing
+                    t_rho_val = hasproperty(t_spec.component_obj, :rho) ? get_params_vector(chain, string(generate_full_variable_names(t_spec, M.model_arch, k).rho), 1)[i, 1] : nothing
+                    
+                    Q_s = recompose_precision(s_model_type, s_spec.hyper.Q_template, 1.0; extra_param=s_rho_val)
+                    Q_t = recompose_precision(t_model_type, t_spec.hyper.Q_template, 1.0; extra_param=t_rho_val)
+                    
+                    C_s = cholesky(Symmetric(Matrix(Q_s) + M.noise * I))
+                    C_t = cholesky(Symmetric(Matrix(Q_t) + M.noise * I))
+                    
+                    Z_matrix = reshape(innovations_samples[i, :], s_N, t_N)
+                    tmp_spatial = C_s.L' \ Z_matrix
+                    st_field_unscaled = transpose(C_t.L' \ transpose(tmp_spatial))
+                    st_field = st_field_unscaled .* sigma_samples[i]
+                end
+                effect_k[:, i] = st_field[st_idx_full]
             end
             structured_effects[k] = effect_k
         end
@@ -468,45 +502,31 @@ function get_effects(
         base_spec = child_specs[2]
         
         for k in 1:outcomes_N
-            modifier_p_names = generate_full_variable_names(
-                modifier_spec, M.model_arch, k
-            )
-            modifier_raw_samples = get_params_vector(
-                chain, string(modifier_p_names.raw), modifier_spec.hyper.n_latent
-            )
-            modifier_sigma_samples = get_params_vector(
-                chain, string(modifier_p_names.sigma), 1
-            )[:, 1]
-
-            U_mod, L_mod = modifier_spec.hyper.U, modifier_spec.hyper.L
-            diff_order_mod = get(modifier_spec.component_obj, :diff_order, 0)
-            modifier_basis_key = Symbol(join(get(modifier_spec.params, :positional_args, []), "_"))
-            B_modifier = M.basis_matrices[modifier_basis_key]
-
-            log_sigma_field_samples = zeros(n_samples, M.s_N)
-            for i in 1:n_samples
-                diag_D_mod = modifier_sigma_samples[i] ./ sqrt.(L_mod .+ M.noise)
-                for j in 1:diff_order_mod; diag_D_mod[j] = 0.0; end
-                modifier_coeffs = U_mod * (diag_D_mod .* modifier_raw_samples[i, :])
-                log_sigma_field_samples[i, :] = B_modifier * modifier_coeffs
-            end
+            # Reconstruct modifier effect
+            modifier_effects = get_effects(modifier_spec.component_obj, chain, M, n_samples, outcomes_N, modifier_spec, PS, N_total)
+            log_sigma_field_samples = modifier_effects.structured[k]
             spatially_varying_sigma_samples = exp.(log_sigma_field_samples)
 
+            # Reconstruct base effect
             base_p_names = generate_full_variable_names(base_spec, M.model_arch, k)
-            base_raw_samples = get_params_vector(
-                chain, string(base_p_names.raw), base_spec.hyper.n_latent
-            )
+            base_innovations_name = _find_parameter(p_names_vec, string(base_spec.key), "innovations", k, is_multivariate_model)
+            if isempty(base_innovations_name)
+                @warn "Base innovations for Composed component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                continue
+            end
+            base_innovations_samples = get_params_vector(chain, base_innovations_name, base_spec.hyper.n_latent)
+            
             Q_base_template = base_spec.hyper.Q_template
             F_base = cholesky(Symmetric(Matrix(Q_base_template) + M.noise * I))
-            base_latent_raw_samples = hcat([F_base.L' \ s for s in eachrow(base_raw_samples)]...)'
+            base_latent_raw_samples = hcat([F_base.L' \ s for s in eachrow(base_innovations_samples)]...)'
 
-            reconstructed_effects = base_latent_raw_samples .* spatially_varying_sigma_samples
-            structured_effects[k] = reconstructed_effects'
+            # Combine
+            reconstructed_effects = base_latent_raw_samples' .* spatially_varying_sigma_samples
+            structured_effects[k] = reconstructed_effects
         end
         return (structured=structured_effects, noisy=structured_effects)
-    else
-        @warn "Posterior reconstruction for Composed with operator :$(m.operator) " *
-              "is not fully implemented. Returning zero effects."
-        return (structured=structured_effects, noisy=structured_effects)
     end
+    
+    @warn "Posterior reconstruction for Composed with operator :$(m.operator) is not fully implemented. Returning zero effects."
+    return (structured=structured_effects, noisy=structured_effects)
 end

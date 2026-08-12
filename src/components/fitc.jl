@@ -3,10 +3,10 @@
 
 A component model for sparse Gaussian Processes. It supports two common
 approximations: FITC (Fully Independent Training Conditional) and VFE
-(Variational Free Energy), also known as DTC.
+(Variational Free Energy), also known as DTC (Deterministic Training Conditional).
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 Both methods approximate a full GP using a small set of \$M\$ inducing points \$Z\$.
@@ -21,23 +21,30 @@ The methods differ in their covariance approximation:
 - **`:vfe` (didactic)**: A pure low-rank approximation, equivalent to DTC.
   \$\\Sigma_f = Q_{XX}\$. This is simpler but can underestimate variance.
 
-# Best Use Case
-Scalable Gaussian Process regression for large datasets where a full GP is
-computationally infeasible. `:fitc` is generally preferred for its more accurate
-variance estimates.
+# Computational Methods
+- `:fitc` (Default, AD-friendly): The Fully Independent Training Conditional approximation.
+  It is generally preferred for its more accurate variance estimates.
+- `:vfe` (Didactic, AD-friendly): The Variational Free Energy approximation, also known
+  as DTC. It is a pure low-rank approximation that can be faster but may
+  underestimate variance. Retained for didactic purposes.
 
-# Key References
-- Snelson, E., & Ghahramani, Z. (2006). *Sparse Gaussian Processes using
-  Pseudo-inputs*. In Advances in neural information processing systems, 18.
-- Titsias, M. (2009). *Variational learning of inducing variables in sparse
-  Gaussian processes*. In AISTATS.
+# Inputs
+- **Required**:
+  - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
+- **Optional (in `random()` call)**:
+  - `n_inducing`: `Int`, the number of inducing points. Default: `20`.
+  - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`). Default: `"se"`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP. Default: `Exponential(1.0)`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `method`: `Symbol`, approximation method (`:fitc` or `:vfe`). Default: `:fitc`.
+  - `knot_method`: `Symbol`, method for placing inducing points (`:kmeans`, `:random`, `:quantile`, `:range`). Default: `:kmeans`.
 
-# Fields
-- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: Prior for the kernel lengthscale(s).
-- `sigma::Distribution`: Prior for the marginal standard deviation of the GP.
-- `n_inducing::Int`: The number of inducing points.
-- `kernel::String`: The name of the kernel function (e.g., "se", "matern32").
-- `method::Symbol`: The approximation method, `:fitc` (default) or `:vfe`.
+# Outputs (Parameter Names)
+- `sigma_<key>`: The marginal standard deviation of the GP.
+- `ls_<key>`: The kernel lengthscale(s).
+- `inducing_innovations_<key>`: Raw standard normal innovations for the inducing points.
+- `diag_innovations_<key>`: Raw standard normal innovations for the diagonal correction (for `:fitc` method).
+- `latent_<key>`: The reconstructed latent GP effect.
 """
 struct FITC <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
@@ -59,16 +66,6 @@ COMPONENT_CONSTRUCTORS[:fitc] = (p, params) -> FITC(
 
 MODEL_TO_STRUCTURE_MAP[:fitc] = :smooth
 
-
-"""
-    get_datastructures!(m_type::Type{<:FITC}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `FITC` component. It ensures coordinate
-variables are provided, stores them, and generates the inducing point locations.
-
-# Assumptions
-- The `random()` call provides one or more variables representing the coordinates.
-"""
 function get_datastructures!(m_type::Type{<:FITC}, M::Dict, mod_data::Dict)::Bool
     variables = mod_data[:variables]
     params = mod_data[:params]
@@ -94,12 +91,6 @@ function get_datastructures!(m_type::Type{<:FITC}, M::Dict, mod_data::Dict)::Boo
     return true
 end
 
-"""
-    get_precomputes(m::FITC, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-For the `FITC` component, this function stores the coordinate matrix and the
-inducing point locations for use by the code generator.
-"""
 function get_precomputes(m::FITC, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
     if isnothing(coords)
@@ -118,12 +109,6 @@ function get_precomputes(m::FITC, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
-"""
-    get_priors(m::FITC, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for `sigma`, `lengthscale`, and raw innovations. The `innov`
-prior (for diagonal correction) is only included for the `:fitc` method.
-"""
 function get_priors(
     m::FITC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -141,79 +126,66 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    # Prior for innovations at inducing points
-    push!(priors, "$(p_names.raw) ~ MvNormal(zeros($(m.n_inducing)), I)")
+    push!(priors, "$(p_names.inducing_innovations) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
     
-    # Prior for diagonal correction innovations (only for FITC)
     if m.method == :fitc
-        push!(
-            priors,
-            "$(p_names.innov) ~ MvNormal(zeros(spec.precomputes.n_latent), I)"
-        )
+        push!(priors, "$(p_names.diag_innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
     end
 
     return join(priors, "\n    ")
 end
 
-"""
-    get_updates(m::FITC, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates Turing code for the sparse GP effect, dispatching on the chosen method.
-"""
 function get_updates(
     m::FITC, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    key = spec.key
     
     common_code = """
-        local precomputes = spec_registry[:$(spec.key)].precomputes
-        local X_coords = precomputes.coords
-        local Z_coords = precomputes.Z_inducing
-        local kernel_type = Symbol("$(m.kernel)")
+        hyper = spec_registry[:$(key)].hyper
+        X_coords = hyper.coords
+        Z_coords = hyper.Z_inducing
+        kernel_type = Symbol("$(m.kernel)")
         
-        local K_UU = evaluate_kernel_matrix(
+        K_UU = evaluate_kernel_matrix(
             Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
         )
-        local K_XU = evaluate_cross_kernel_matrix(
+        K_XU = evaluate_cross_kernel_matrix(
             X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
         )
         
-        local L_UU = cholesky(Symmetric(K_UU)).L
-        local u_latent = L_UU * $(p_names.raw)
+        L_UU = cholesky(Symmetric(K_UU)).L
+        u_latent = L_UU * $(p_names.inducing_innovations)
     """
 
     fitc_code = """
-        # --- FITC Sparse GP Component: $(spec.key) ---
+        # --- FITC Sparse GP Component: $(key) ---
         let
             $(common_code)
             
-            local K_UU_inv_u = K_UU \\ u_latent
-            local mean_f = K_XU * K_UU_inv_u
+            K_UU_inv_u = K_UU \\ u_latent
+            mean_f = K_XU * K_UU_inv_u
             
-            local diag_K_XX = fill($(p_names.sigma)^2, precomputes.n_latent)
-            local tmp = (L_UU' \\ K_XU')'
-            local diag_Q_ff = sum(tmp.^2, dims=2)
-            local lambda_diag = diag_K_XX - vec(diag_Q_ff)
+            diag_K_XX = fill($(p_names.sigma)^2, hyper.n_latent)
+            tmp = (L_UU' \\ K_XU')'
+            diag_Q_ff = sum(tmp.^2, dims=2)
+            lambda_diag = diag_K_XX - vec(diag_Q_ff)
             
             $(p_names.latent) = mean_f .+
-                sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.innov)
+                sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.diag_innovations)
             
             $(eta_target) .+= $(p_names.latent)
         end
     """
 
     vfe_code = """
-        # --- VFE/DTC Sparse GP Component: $(spec.key) ---
-        # This is a didactic alternative to FITC that uses a pure low-rank approximation.
+        # --- VFE/DTC Sparse GP Component: $(key) ---
         let
             $(common_code)
             
-            # The VFE approximation is the conditional mean of the GP given the inducing points.
-            # f ≈ K_XU * inv(K_UU) * u
-            # This is a low-rank approximation of the full GP.
-            local K_UU_inv_u = K_UU \\ u_latent
+            K_UU_inv_u = K_UU \\ u_latent
             $(p_names.latent) = K_XU * K_UU_inv_u
             
             $(eta_target) .+= $(p_names.latent)
@@ -229,19 +201,13 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::FITC, chain, M::NamedTuple, ...)
-
-Reconstructs the `FITC` component's effect from posterior samples, dispatching
-on the method used during sampling.
-"""
 function get_effects(
     m::FITC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
-    coords_train = spec.precomputes.coords
+    coords_train = spec.hyper.coords
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
         vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
@@ -250,32 +216,36 @@ function get_effects(
     end
     n_obs_full = size(coords_full, 1)
 
-    Z_inducing = spec.precomputes.Z_inducing
+    Z_inducing = spec.hyper.Z_inducing
     kernel_type = Symbol(m.kernel)
     noise = M.noise
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        ls_samples = get_params_vector(
-            chain, string(p_names.ls), m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        )
-        u_raw_samples = get_params_vector(chain, string(p_names.raw), m.n_inducing)
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        ls_name = _find_parameter(p_names_vec, string(spec.key), "ls", k, is_multivariate_model)
+        inducing_innov_name = _find_parameter(p_names_vec, string(spec.key), "inducing_innovations", k, is_multivariate_model)
+
+        if isempty(sigma_name) || isempty(ls_name) || isempty(inducing_innov_name)
+            @warn "Parameters for FITC component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        ls_samples = get_params_vector(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
+        inducing_innov_samples = get_params_vector(chain, inducing_innov_name, m.n_inducing)
 
         effect_k = zeros(Float64, n_obs_full, n_samples)
 
         for i in 1:n_samples
             current_sigma = sigma_samples[i]
             current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i, 1]
-            current_u_raw = u_raw_samples[i, :]
+            current_u_raw = inducing_innov_samples[i, :]
             
-            K_UU = evaluate_kernel_matrix(
-                Z_inducing, current_sigma, current_ls, kernel_type, noise
-            )
-            K_XU = evaluate_cross_kernel_matrix(
-                coords_full, Z_inducing, current_sigma, current_ls, kernel_type
-            )
+            K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
+            K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
             
             L_UU = cholesky(Symmetric(K_UU)).L
             u_latent = L_UU * current_u_raw
@@ -283,13 +253,18 @@ function get_effects(
             mean_f = K_XU * K_UU_inv_u
 
             if m.method == :fitc
-                f_innov_samples = get_params_vector(
-                    chain, string(p_names.innov), spec.precomputes.n_latent
-                )
-                f_innov_i = if size(f_innov_samples, 2) == n_obs_full
-                    f_innov_samples[i, :]
+                diag_innov_name = _find_parameter(p_names_vec, string(spec.key), "diag_innovations", k, is_multivariate_model)
+                if isempty(diag_innov_name)
+                    @warn "Diagonal innovations for FITC component $(spec.key) (outcome $k) not found. Using zero for correction."
+                    effect_k[:, i] = mean_f
+                    continue
+                end
+                
+                diag_innov_samples = get_params_vector(chain, diag_innov_name, spec.hyper.n_latent)
+                diag_innov_i = if size(diag_innov_samples, 2) == n_obs_full
+                    diag_innov_samples[i, :]
                 else
-                    vcat(f_innov_samples[i, :], randn(n_obs_full - size(f_innov_samples, 2)))
+                    vcat(diag_innov_samples[i, :], randn(n_obs_full - size(diag_innov_samples, 2)))
                 end
 
                 diag_K_XX = fill(current_sigma^2, n_obs_full)
@@ -297,7 +272,7 @@ function get_effects(
                 diag_Q_ff = sum(tmp.^2, dims=2)
                 lambda_diag = diag_K_XX - vec(diag_Q_ff)
                 
-                effect_k[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* f_innov_i
+                effect_k[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* diag_innov_i
             else # :vfe
                 effect_k[:, i] = mean_f
             end

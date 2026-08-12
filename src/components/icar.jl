@@ -7,7 +7,7 @@ where the value at a location is assumed to be conditionally dependent on the
 average of its neighbors.
 
 # Version
-v1.1.2 (2026-08-10)
+v1.2.0 (2026-08-11)
 
 # Mathematical Summary
 The ICAR model defines a Gaussian Markov Random Field (GMRF) with a singular
@@ -24,17 +24,27 @@ rank-deficient (its rows sum to zero), a sum-to-zero constraint
 (\$\\sum_i \\phi_i = 0\$) is imposed on the latent field to ensure identifiability
 from the global intercept.
 
-# Assumptions
-- The spatial process is locally smooth, with values at neighboring locations being
-  similar.
-- The provided adjacency matrix `W` represents a single connected graph.
-  Disconnected "islands" will lead to a rank deficiency greater than 1 and cause
-  the model to fail.
+# Computational Methods
+- `:spectral` (Default, AD-friendly): Regularizes coefficients using a spectral
+  decomposition of the precision matrix. Recommended for gradient-based samplers.
+- `:cholesky` (AD-friendly): Uses a pre-computed dense Cholesky factorization.
+- `:cholesky_sparse` (Didactic, Not AD-friendly): Uses sparse Cholesky factorization,
+  which is not compatible with most AD backends.
 
-# Best Use Case
-Modeling structured spatial random effects for areal or lattice data, such as
-disease mapping, real estate analysis, or ecological modeling, where there is a
-strong prior belief in local spatial smoothing.
+# Inputs
+- **Required**:
+  - A spatial index variable (e.g., `s_idx`) passed to `random()`.
+  - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
+- **Optional (in `random()` call)**:
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the
+    ICAR effect. Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
+    Default: `:spectral`.
+
+# Outputs (Parameter Names)
+- `sigma_<key>`: The standard deviation of the ICAR effect.
+- `innovations_<key>`: The raw standard normal innovations for the effect.
+- `latent_<key>`: The reconstructed latent spatial field.
 
 # Key References
 - Besag, J. (1974). Spatial interaction and the statistical analysis of lattice
@@ -43,57 +53,30 @@ strong prior belief in local spatial smoothing.
 - Rue, H., & Held, L. (2005). *Gaussian Markov Random Fields: Theory and
   Applications*. CRC Press.
 - Wikipedia: Conditional autoregressive model
-
-# Fields
-- `sigma::Distribution`: The prior distribution for the standard deviation of the
-  ICAR effect.
-- `method::Symbol`: The computational method. Can be `:spectral` (default, AD-safe),
-  `:cholesky` (AD-safe, dense), or `:cholesky_sparse` (didactic, not AD-safe).
 """
 struct ICAR <: ComponentModel
     sigma::Distribution
     method::Symbol
 end
 
-# Add to the central component constructor registry.
 COMPONENT_TYPE_REGISTRY[:icar] = ICAR
 COMPONENT_CONSTRUCTORS[:icar] = (p, params) -> ICAR(
     p.sigma, get(params, :method, :spectral)
 )
 
-# Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:icar] = :spatial
 
-
-"""
-    get_datastructures!(m_type::Type{<:ICAR}, M::Dict, mod_data::Dict)::Bool
-
-Ensures a spatial context (`s_idx`, `s_N`, `W`) is established by calling the main
-spatial processor.
-
-# Assumptions
-- A base adjacency matrix `W` must be provided in the main `@bstm` call or within
-  the `random()` module.
-- A spatial index variable must be provided in the `random()` call.
-"""
 function get_datastructures!(m_type::Type{<:ICAR}, M::Dict, mod_data::Dict)::Bool
     process_spatial_module!(M, mod_data, Dict(), Dict())
     return true
 end
 
-"""
-    get_precomputes(m::ICAR, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Pre-computes the graph Laplacian precision matrix (`Q_template = D - W`) and its
-spectral decomposition for efficient sampling.
-"""
 function get_precomputes(m::ICAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     n = M.s_N
     W = M.W
     
     template = build_structure_template(:icar, n; W=W)
     
-    # Pre-compute the Cholesky factor for the cholesky method.
     F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
     
     return (
@@ -106,11 +89,6 @@ function get_precomputes(m::ICAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
-"""
-    get_priors(m::ICAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for the scale parameter `sigma` and the raw innovations `raw`.
-"""
 function get_priors(
     m::ICAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -120,19 +98,9 @@ function get_priors(
     
     return """
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.raw) ~ MvNormal(zeros($(n_latent)), I)
+    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
     """
 end
-
-"""
-    get_updates(m::ICAR, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates code to sample the latent spatial field. Supports three methods:
-- `:spectral` (default): An efficient, AD-safe method using spectral decomposition.
-- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
-- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
-  factorization, suitable for gradient-free samplers.
-"""
 function get_updates(
     m::ICAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -145,11 +113,12 @@ function get_updates(
     spectral_code = """
         # --- ICAR Component: $(key) (Spectral Method) ---
         let
-            local U = spec_registry[:$(key)].hyper.U
-            local L = spec_registry[:$(key)].hyper.L
-            local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
+            hyper = spec_registry[:$(key)].hyper
+            U = hyper.U
+            L = hyper.L
+            diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
             diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-            local $(p_names.latent) = U * (diag_D .* $(p_names.raw))
+            $(p_names.latent) = U * (diag_D .* $(p_names.innovations))
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
@@ -157,36 +126,32 @@ function get_updates(
     cholesky_code = """
         # --- ICAR Component: $(key) (Cholesky Method, AD-Safe) ---
         let
-            local F = spec_registry[:$(key)].hyper.cholesky_factor
-            local latent_field_raw = F.L' \\ $(p_names.raw)
+            hyper = spec_registry[:$(key)].hyper
+            F = hyper.cholesky_factor
+            latent_field_raw = F.L' \\ $(p_names.innovations)
             
-            # Apply soft sum-to-zero constraint for identifiability
             Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw)
             )
             
-            local $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
-            
+            $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
 
     cholesky_sparse_code = """
         # --- ICAR Component: $(key) (Sparse Cholesky, Not AD-Safe) ---
-        # WARNING: This method is for didactic purposes and is NOT compatible with
-        # automatic differentiation (e.g., NUTS sampler).
         let
-            local Q = spec_registry[:$(key)].hyper.Q_template
-            local F = cholesky(Symmetric(Q + M.noise * I))
-            local latent_field_raw = F.L' \\ $(p_names.raw)
+            hyper = spec_registry[:$(key)].hyper
+            Q = hyper.Q_template
+            F = cholesky(Symmetric(Q + M.noise * I))
+            latent_field_raw = F.L' \\ $(p_names.innovations)
             
-            # Apply soft sum-to-zero constraint for identifiability
             Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw)
             )
             
-            local $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
-            
+            $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
@@ -198,18 +163,10 @@ function get_updates(
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
     else
-        error("Unsupported method '$(m.method)' for ICAR component. Supported methods are :spectral, :cholesky, and :cholesky_sparse.")
+        error("Unsupported method '$(m.method)' for ICAR component.")
     end
 end
 
-
-"""
-    get_effects(m::ICAR, chain, M::NamedTuple, ...)::NamedTuple
-
-Reconstructs the `ICAR` component's spatial effect from posterior samples, applying a
-sum-to-zero constraint for identifiability. This function dispatches on the method
-used during sampling.
-"""
 function get_effects(
     m::ICAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
@@ -217,12 +174,21 @@ function get_effects(
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+
+        if isempty(sigma_name) || isempty(innovations_name)
+            @warn "Parameters for ICAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
 
@@ -232,14 +198,12 @@ function get_effects(
             for j in 1:n_samples
                 diag_D = sigma_samples[j] ./ sqrt.(L .+ noise)
                 diag_D[1] = 0.0 # Enforce sum-to-zero
-                effect_k[:, j] = U * (diag_D .* raw_samples[j, :])
+                effect_k[:, j] = U * (diag_D .* innovations_samples[j, :])
             end
         else # :cholesky or :cholesky_sparse
-            # For reconstruction, we can use the pre-computed dense factor for both
-            # Cholesky methods as it does not involve AD.
             F = spec.hyper.cholesky_factor
             for j in 1:n_samples
-                latent_field_raw = F.L' \ raw_samples[j, :]
+                latent_field_raw = F.L' \ innovations_samples[j, :]
                 latent_field_centered = latent_field_raw .- mean(latent_field_raw)
                 effect_k[:, j] = latent_field_centered .* sigma_samples[j]
             end

@@ -8,7 +8,7 @@ combination of these eigenvectors, providing a spectral basis for modeling spati
 processes.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 The Moran component models a spatial field \$\\phi\$ as a linear combination of the
@@ -23,14 +23,23 @@ where:
     prior: \$\\beta_k \\sim \\mathcal{N}(0, \\sigma^2)\$.
 
 # Computational Methods
-- `:noncentered` (default): A non-centered parameterization where coefficients are
-  constructed from standard normal innovations. Recommended for AD.
-- `:centered`: A centered parameterization where coefficients are sampled directly
-  from `N(0, sigma^2)`. Didactic, can be less efficient.
+- `:noncentered` (Default, AD-friendly): A non-centered parameterization where coefficients are
+  constructed from standard normal innovations. Recommended for gradient-based samplers.
+- `:centered` (Didactic, Not AD-friendly): A centered parameterization where coefficients are sampled directly
+  from `N(0, sigma^2)`. This can be less efficient for MCMC.
 
-# Fields
-- `sigma::Distribution`: The prior for the standard deviation of the coefficients.
-- `method::Symbol`: The parameterization method, `:noncentered` or `:centered`.
+# Inputs
+- **Required**:
+  - A spatial index variable (e.g., `region`) passed to `random()`.
+  - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
+- **Optional (in `random()` call)**:
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the coefficients. Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default: `:noncentered`.
+
+# Outputs (Parameter Names)
+- `sigma_<key>`: The standard deviation of the eigenvector coefficients.
+- `innovations_<key>`: The raw standard normal innovations for the coefficients (for `:noncentered`).
+- `latent_<key>`: The latent coefficients (for `:centered`).
 """
 struct Moran <: ComponentModel
     sigma::Distribution
@@ -42,16 +51,8 @@ COMPONENT_CONSTRUCTORS[:moran] = (p, params) -> Moran(
     p.sigma, get(params, :method, :noncentered)
 )
 
-# Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:moran] = :spatial
 
-"""
-    get_datastructures!(m_type::Type{<:Moran}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `Moran` component.
-It ensures that an adjacency matrix `W` is provided and sets up the spatial context
-(`s_idx`, `s_N`) in the main model configuration `M`.
-"""
 function get_datastructures!(m_type::Type{<:Moran}, M::Dict, mod_data::Dict)::Bool
     params = mod_data[:params]
     variables = mod_data[:variables]
@@ -90,25 +91,14 @@ function get_datastructures!(m_type::Type{<:Moran}, M::Dict, mod_data::Dict)::Bo
     return true
 end
 
-"""
-    get_precomputes(m::Moran, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Performs data-independent pre-calculations for the `Moran` component.
-It computes the Moran operator `M = (I - 11'/n)W(I - 11'/n)` and calculates its
-eigenvectors, which serve as the spatial basis functions.
-"""
 function get_precomputes(m::Moran, M::NamedTuple, mod_data::Dict)::NamedTuple
     n = M.s_N
     W = M.W
 
-    # Create the centering matrix H = I - (1/n) * 1*1'
     H = I - (1/n) * ones(n, n)
-    
-    # Compute the Moran operator M = HWH
     W_mat = Matrix(W)
     moran_operator = H * W_mat * H
     
-    # Compute the eigenvectors of the symmetric Moran operator
     eig_result = eigen(Symmetric(moran_operator))
     moran_eigenvectors = eig_result.vectors
     
@@ -117,13 +107,6 @@ function get_precomputes(m::Moran, M::NamedTuple, mod_data::Dict)::NamedTuple
     return (moran_eigenvectors=moran_eigenvectors, n_latent=n_latent)
 end
 
-
-"""
-    get_priors(m::Moran, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for `sigma`. For the `:noncentered` method, it also defines a
-prior for the `raw` innovations.
-"""
 function get_priors(
     m::Moran, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -135,20 +118,13 @@ function get_priors(
     if m.method == :noncentered
         push!(
             priors,
-            "$(p_names.raw) ~ MvNormal(zeros($(spec.precomputes.n_latent)), I)"
+            "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)"
         )
     end
     
     return join(priors, "\n    ")
 end
 
-
-"""
-    get_updates(m::Moran, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code to construct the `Moran` effect, dispatching on the
-chosen method.
-"""
 function get_updates(
     m::Moran, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -156,17 +132,18 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
+    n_latent = spec.hyper.n_latent
     
     common_code = """
-        local moran_eigenvectors = spec_registry[:$(key)].precomputes.moran_eigenvectors
+        moran_eigenvectors = spec_registry[:$(key)].hyper.moran_eigenvectors
     """
 
     noncentered_code = """
         # --- Moran Eigenvector Component (Non-Centered): $(key) ---
         let
             $(common_code)
-            local scaled_coeffs = $(p_names.raw) .* $(p_names.sigma)
-            local latent_field = moran_eigenvectors * scaled_coeffs
+            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
+            latent_field = moran_eigenvectors * scaled_coeffs
             $(eta_target) .+= view(latent_field, M.s_idx)
         end
     """
@@ -175,9 +152,8 @@ function get_updates(
         # --- Moran Eigenvector Component (Centered): $(key) ---
         let
             $(common_code)
-            local n_latent = spec_registry[:$(key)].precomputes.n_latent
-            local coeffs ~ MvNormal(zeros(n_latent), $(p_names.sigma)^2 * I)
-            local latent_field = moran_eigenvectors * coeffs
+            $(p_names.latent) ~ MvNormal(zeros(T, $(n_latent)), $(p_names.sigma)^2 * I)
+            latent_field = moran_eigenvectors * $(p_names.latent)
             $(eta_target) .+= view(latent_field, M.s_idx)
         end
     """
@@ -191,37 +167,50 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::Moran, chain, M::NamedTuple, ...)
-
-Reconstructs the `Moran` component's effect from posterior samples, dispatching
-on the method used during sampling.
-"""
 function get_effects(
     m::Moran, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
-    eigenvectors = spec.precomputes.moran_eigenvectors
-    n_latent = spec.precomputes.n_latent
+    eigenvectors = spec.hyper.moran_eigenvectors
+    n_latent = spec.hyper.n_latent
     s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        if isempty(sigma_name)
+            @warn "Sigma parameter for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+
         effect_k = zeros(Float64, N_total, n_samples)
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
 
         if m.method == :noncentered
-            raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
+            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            if isempty(innovations_name)
+                @warn "Innovations for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            innovations_samples = get_params_vector(chain, innovations_name, n_latent)
             for i in 1:n_samples
-                scaled_coeffs = raw_samples[i, :] .* sigma_samples[i]
+                scaled_coeffs = innovations_samples[i, :] .* sigma_samples[i]
                 spatial_field = eigenvectors * scaled_coeffs
                 effect_k[:, i] = view(spatial_field, s_idx_full)
             end
         else # :centered
-            coeffs_samples = get_params_vector(chain, string(p_names.latent), n_latent)
+            latent_name = _find_parameter(p_names_vec, string(spec.key), "latent", k, is_multivariate_model)
+            if isempty(latent_name)
+                @warn "Latent coefficients for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            coeffs_samples = get_params_vector(chain, latent_name, n_latent)
             for i in 1:n_samples
                 spatial_field = eigenvectors * coeffs_samples[i, :]
                 effect_k[:, i] = view(spatial_field, s_idx_full)

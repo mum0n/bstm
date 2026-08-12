@@ -7,7 +7,7 @@ effect is a linear combination of these basis functions, with coefficients regul
 a random walk prior to ensure smoothness.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 The wavelet smoother models a function \$f(x)\$ as a linear combination of scaled and
@@ -23,18 +23,30 @@ second-order random walk (RW2), to regularize the function:
 \$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\tau \\mathbf{Q}_{RW2})^{-1})\$
 
 # Computational Methods
-- `:spectral` (default): An efficient, AD-safe method using spectral decomposition.
-- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
-- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
-  factorization, suitable for gradient-free samplers.
+- `:spectral` (Default, AD-friendly): Regularizes coefficients using a spectral
+  decomposition of the RW2 penalty matrix. Recommended for gradient-based samplers.
+- `:cholesky` (AD-friendly): Uses a pre-computed dense Cholesky factorization of the
+  penalty matrix.
+- `:cholesky_sparse` (Didactic, Not AD-friendly): Uses sparse Cholesky factorization,
+  which is not compatible with most AD backends.
 
-# Fields
-- `family::Symbol`: The wavelet family to use (e.g., `:db4`, `:haar`).
-- `nbins::Int`: The total number of basis functions (wavelets) to generate.
-- `sigma::Distribution`: The prior for the std. dev. of the wavelet coefficients.
-- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: Prior for the
-  lengthscale(s), which control the dilation of the wavelets.
-- `method::Symbol`: The computational method for regularizing coefficients.
+# Inputs
+- **Required**:
+  - One or more coordinate variables (e.g., `x`) passed to `random()`.
+- **Optional (in `random()` call)**:
+  - `nbins`: `Int`, the total number of basis functions (wavelets) to generate. Default: `32`.
+  - `family`: `Symbol`, the wavelet family to use (e.g., `:db4`, `:haar`). Default: `:db4`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the wavelet coefficients. Default: `Exponential(1.0)`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the
+    lengthscale(s), which control the dilation of the wavelets. Default: `Gamma(2, 0.5)`.
+  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
+    Default: `:spectral`.
+
+# Outputs (Parameter Names)
+- `sigma_<key>`: The standard deviation of the wavelet coefficients.
+- `ls_<key>`: The lengthscale(s) controlling the wavelet dilation.
+- `innovations_<key>`: The raw standard normal innovations for the coefficients.
+- `latent_<key>`: The final smooth effect vector.
 """
 struct Wavelet <: ComponentModel
     family::Symbol
@@ -56,11 +68,6 @@ COMPONENT_CONSTRUCTORS[:wavelet] = (p, params) -> Wavelet(
 
 MODEL_TO_STRUCTURE_MAP[:wavelet] = :smooth
 
-"""
-    get_datastructures!(m_type::Type{<:Wavelet}, M::Dict, mod_data::Dict)::Bool
-
-Ensures that coordinate variables are provided and stores them in the module data.
-"""
 function get_datastructures!(m_type::Type{<:Wavelet}, M::Dict, mod_data::Dict)::Bool
     variables = mod_data[:variables]
     if isempty(variables)
@@ -77,12 +84,6 @@ function get_datastructures!(m_type::Type{<:Wavelet}, M::Dict, mod_data::Dict)::
     return true
 end
 
-"""
-    get_precomputes(m::Wavelet, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Pre-computes the penalty matrix, its spectral decomposition, and its dense
-Cholesky factorization for the wavelet coefficients.
-"""
 function get_precomputes(m::Wavelet, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
     if isnothing(coords)
@@ -123,13 +124,10 @@ function get_precomputes(m::Wavelet, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
-
-"""
-    get_priors(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for `sigma`, `lengthscale`, and the `raw` coefficients.
-"""
-function get_priors(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx, M)::String
+function get_priors(
+    m::Wavelet, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
@@ -143,7 +141,7 @@ function get_priors(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx, M):
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.raw) ~ MvNormal(zeros(spec.precomputes.n_latent), I)")
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
@@ -163,10 +161,10 @@ function get_updates(
     key = spec.key
     
     common_basis_code = """
-        local precomputes = spec_registry[:$(key)].hyper
+        local hyper = spec_registry[:$(key)].hyper
         local B_wavelet = bstm_tensor_product_wavelet_basis(
-            precomputes.coords,
-            precomputes.nbins_per_dim,
+            hyper.coords,
+            hyper.nbins_per_dim,
             Symbol("$(m.family)"),
             $(p_names.ls)
         )
@@ -176,9 +174,9 @@ function get_updates(
         # --- Wavelet Smoother Component (Spectral): $(key) ---
         let
             $(common_basis_code)
-            local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
+            local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
-            local coeffs = precomputes.U * (diag_D .* $(p_names.raw))
+            local coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             local $(p_names.latent) = B_wavelet * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
@@ -188,10 +186,10 @@ function get_updates(
         # --- Wavelet Smoother Component (Cholesky, AD-Safe): $(key) ---
         let
             $(common_basis_code)
-            local F = precomputes.cholesky_factor
-            local coeffs_raw = F.L' \\ $(p_names.raw)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * precomputes.n_latent), sum(coeffs_raw))
-            local coeffs = $(p_names.sigma) .* coeffs_raw
+            local F = hyper.cholesky_factor
+            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
+            local coeffs = $(p_names.sigma) .* (coeffs_raw .- mean(coeffs_raw)) # Center for identifiability
             local $(p_names.latent) = B_wavelet * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
@@ -201,10 +199,10 @@ function get_updates(
         # --- Wavelet Smoother Component (Sparse Cholesky, Not AD-Safe): $(key) ---
         let
             $(common_basis_code)
-            local Q_penalty = precomputes.Q_template
+            local Q_penalty = hyper.Q_template
             local F = cholesky(Symmetric(Q_penalty + M.noise * I))
-            local coeffs_raw = F.L' \\ $(p_names.raw)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * precomputes.n_latent), sum(coeffs_raw))
+            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw)) # Soft sum-to-zero
             local coeffs = $(p_names.sigma) .* coeffs_raw
             local $(p_names.latent) = B_wavelet * coeffs
             $(eta_target) .+= $(p_names.latent)
@@ -217,24 +215,20 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for Wavelet component."); end
 end
 
-"""
-    get_effects(m::Wavelet, chain, M::NamedTuple, ...)
 
-Reconstructs the `Wavelet` component's effect from posterior samples, dispatching
-on the method used during sampling.
-"""
+
 function get_effects(
     m::Wavelet, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
 
-    precomputes = spec.hyper
+    hyper = spec.hyper
     noise = M.noise
-    n_latent = precomputes.n_latent
-    nbins_per_dim = precomputes.nbins_per_dim
+    n_latent = hyper.n_latent
+    nbins_per_dim = hyper.nbins_per_dim
     
-    coords_train = precomputes.coords
+    coords_train = hyper.coords
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
         vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
@@ -242,14 +236,25 @@ function get_effects(
         coords_train
     end
 
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
+
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        ls_name = _find_parameter(p_names_vec, string(spec.key), "ls", k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+
+        if isempty(sigma_name) || isempty(ls_name) || isempty(innovations_name)
+            @warn "Parameters for Wavelet component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
         ls_samples = get_params_vector(
-            chain, string(p_names.ls), m.lengthscale isa Vector ? length(m.lengthscale) : 1
+            chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1
         )
-        raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
+        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, size(coords_full, 1), n_samples)
 
@@ -261,13 +266,13 @@ function get_effects(
             
             local coeffs
             if m.method == :spectral
-                U, L = precomputes.U, precomputes.L
+                U, L = hyper.U, hyper.L
                 diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
                 diag_D[1] = 0.0; diag_D[2] = 0.0
-                coeffs = U * (diag_D .* raw_samples[i, :])
+                coeffs = U * (diag_D .* innovations_samples[i, :])
             else # :cholesky or :cholesky_sparse
-                F = precomputes.cholesky_factor
-                coeffs_raw = F.L' \ raw_samples[i, :]
+                F = hyper.cholesky_factor
+                coeffs_raw = F.L' \ innovations_samples[i, :]
                 coeffs_centered = coeffs_raw .- mean(coeffs_raw)
                 coeffs = sigma_samples[i] .* coeffs_centered
             end

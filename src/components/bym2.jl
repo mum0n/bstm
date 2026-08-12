@@ -6,7 +6,7 @@ well-identified parameterization for spatial effects by separating them into a
 structured (ICAR) and an unstructured (IID) component.
 
 # Version
-v1.9.5 (2026-08-10)
+v2.1.0 (2026-08-12)
 
 # Mathematical Summary
 The BYM2 model decomposes a spatial random effect \$\\phi\$ into two independent
@@ -25,29 +25,31 @@ This parameterization, proposed by Riebler et al. (2016), is preferred over the
 original BYM model because it avoids confounding between the two spatial components,
 leading to better MCMC convergence and more interpretable hyperparameters.
 
-# Assumptions
-- The spatial process can be decomposed into a locally smooth component and an
-  uncorrelated noise component.
-- The provided adjacency matrix `W` represents a single connected graph.
+# Computational Methods
+- `:spectral` (Default, AD-friendly): Constructs the structured component using a
+  spectral decomposition of the ICAR precision matrix. Recommended for NUTS.
+- `:cholesky` (AD-friendly): Uses a pre-computed dense Cholesky factorization.
+- `:cholesky_sparse` (Didactic, Not AD-friendly): Uses sparse Cholesky factorization,
+  which is not compatible with most AD backends.
 
-# Best Use Case
-The standard and recommended model for disease mapping and general-purpose spatial
-smoothing of areal data. It is more robust than a pure ICAR model as it can
-account for both spatial clustering and localized heterogeneity.
+# Inputs
+- **Required**:
+  - A spatial index variable (e.g., `region`) passed to `random()`.
+  - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
+- **Optional (in `random()` call)**:
+  - `rho`: A `Distribution` for the prior on the mixing parameter. Default: `Beta(1,1)`.
+  - `sigma`: A `Distribution` for the prior on the overall standard deviation. Default: `Exponential(1.0)`.
+  - `method`: A `Symbol` specifying the computational method. Default: `:spectral`.
+
+# Outputs (Parameter Names)
+- `sigma_<key>`: The overall marginal standard deviation.
+- `rho_<key>`: The mixing parameter.
+- `struct_innovations_<key>`: The raw standard normal innovations for the structured component.
+- `iid_innovations_<key>`: The raw standard normal innovations for the unstructured component.
 
 # Key References
-- Riebler, A., Sørbye, S. H., Simpson, D., & Rue, H. (2016). An intuitive
-  Bayesian spatial model for disease mapping that is exactly specified as a
-  Gaussian Markov random field. *Statistical Methods in Medical Research*, 25(2),
-  611-630.
-- Wikipedia: Conditional autoregressive model
-
-# Fields
-- `rho::UnivariateDistribution`: The prior for the mixing parameter `rho`.
-- `sigma::UnivariateDistribution`: The prior for the overall marginal standard
-  deviation `sigma`.
-- `method::Symbol`: The computational method. Can be `:spectral` (default, AD-safe),
-  `:cholesky` (AD-safe, dense), or `:cholesky_sparse` (didactic, not AD-safe).
+- Riebler, A., Sørbye, S. H., Simpson, D., & Rue, H. (2016). *An intuitive Bayesian spatial model with two hyperparameters*. Statistical Methods in Medical Research, 25(2), 1145-1160.
+- Wikipedia: Besag-York-Mollié model
 """
 struct BYM2 <: ComponentModel
     rho::UnivariateDistribution
@@ -63,18 +65,6 @@ COMPONENT_CONSTRUCTORS[:bym2] = (p, params) -> BYM2(
 
 MODEL_TO_STRUCTURE_MAP[:bym2] = :spatial
 
-"""
-    get_datastructures!(m_type::Type{<:BYM2}, M::Dict, mod_data::Dict)::Bool
-
-Establishes the spatial context for the BYM2 model. It ensures a spatial index
-variable is provided and that a valid adjacency matrix `W` is available, then sets
-the spatial index (`s_idx`) and number of spatial units (`s_N`) in the main
-configuration `M`.
-
-# Assumptions
-- A base adjacency matrix `W` must be provided.
-- A spatial index variable must be provided in the `random()` call.
-"""
 function get_datastructures!(m_type::Type{<:BYM2}, M::Dict, mod_data::Dict)::Bool
     data = M[:data]
     params = mod_data[:params]
@@ -127,14 +117,6 @@ function get_datastructures!(m_type::Type{<:BYM2}, M::Dict, mod_data::Dict)::Boo
     return true
 end
 
-"""
-    get_precomputes(m::BYM2, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Pre-computes the structure matrix for the BYM2 component. The precision matrix
-template is based on the ICAR structure. This function calls the central
-`build_structure_template` utility to generate this matrix and its spectral
-decomposition (`U`, `L`), which are essential for the AD-safe spectral sampling method.
-"""
 function get_precomputes(m::BYM2, M::NamedTuple, mod_data::Dict)::NamedTuple
     s_N = get(M, :s_N, 0)
     W = get(M, :W, nothing)
@@ -159,116 +141,99 @@ function get_precomputes(m::BYM2, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
-"""
-    get_priors(m::BYM2, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code for the BYM2 component's priors. This defines priors for
-`sigma` and `rho`, and for the standard normal innovations for the structured
-(`struct`) and unstructured (`iid`) components.
-"""
 function get_priors(
     m::BYM2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
-    v = generate_full_variable_names(spec, arch, outcome_idx)
-    n_latent = size(spec.hyper.Q_template, 1)
+    p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    n_latent = spec.hyper.n_latent
     is_multivariate = (arch == "multivariate")
     is_shared = get(spec.params, :shared, false)
     is_first_outcome = (outcome_idx == 1 || isnothing(outcome_idx))
 
+    struct_innov_name = "struct_innovations_$(spec.key)"
+    iid_innov_name = "iid_innovations_$(spec.key)"
+    if is_multivariate && !is_shared
+        struct_innov_name *= "_$(outcome_idx)"
+        iid_innov_name *= "_$(outcome_idx)"
+    end
+
     priors_acc = String[]
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
-        push!(priors_acc, "$(v.sigma) ~ $(_distribution_to_string(m.sigma))")
-        push!(priors_acc, "$(v.rho) ~ $(_distribution_to_string(m.rho))")
+        push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+        push!(priors_acc, "$(p_names.rho) ~ $(_distribution_to_string(m.rho))")
     end
-    push!(priors_acc, "$(v.struct) ~ MvNormal(zeros($(n_latent)), I)")
-    push!(priors_acc, "$(v.iid) ~ MvNormal(zeros($(n_latent)), I)")
+    push!(priors_acc, "$(struct_innov_name) ~ MvNormal(zeros(T, $(n_latent)), I)")
+    push!(priors_acc, "$(iid_innov_name) ~ MvNormal(zeros(T, $(n_latent)), I)")
     return join(priors_acc, "\n    ")
 end
 
-"""
-    get_updates(m::BYM2, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code for the BYM2 component's update logic, dispatching on
-the chosen `method`. All methods correctly implement the Riebler parameterization.
-"""
 function get_updates(
     m::BYM2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
-    v = generate_full_variable_names(spec, arch, outcome_idx)
+    p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     index_var = "s_idx"
     key = spec.key
     n_latent = spec.hyper.n_latent
 
+    is_multivariate = (arch == "multivariate")
+    is_shared = get(spec.params, :shared, false)
+    struct_innov_name = "struct_innovations_$(spec.key)"
+    iid_innov_name = "iid_innovations_$(spec.key)"
+    if is_multivariate && !is_shared
+        struct_innov_name *= "_$(outcome_idx)"
+        iid_innov_name *= "_$(outcome_idx)"
+    end
+
     spectral_code = """
         # --- BYM2 Spectral Assembly: $(key) ---
-        # This block constructs the BYM2 spatial effect using a non-centered
-        # parameterization based on the spectral decomposition of the ICAR
-        # precision matrix. This method is the default as it is efficient and
-        # safe for automatic differentiation (AD).
-
-        # 1. Construct the diagonal of the spectral transformation matrix D for
-        #    the structured part. The structured part has precision Q_star, so
-        #    its covariance has eigenvalues 1/L_j. The standard deviation is
-        #    1/sqrt(L_j).
-        local diag_D_structured = 1.0 ./ sqrt.(spec_registry[:$(key)].hyper.L .+ M.noise)
-        # The first eigenvalue is 0, corresponding to the null space (intercept).
-        # Set its contribution to 0 to enforce the sum-to-zero constraint.
-        diag_D_structured[1] = 0.0
-
-        # 2. Apply the spectral transformation to the standard normal innovations.
-        local structured_effect = spec_registry[:$(key)].hyper.U * (diag_D_structured .* $(v.struct))
-
-        # 3. Combine structured and unstructured components using the Riebler parameterization.
-        $(v.latent) = $(v.sigma) .* (sqrt($(v.rho)) .* structured_effect .+
-                                     sqrt(1.0 - $(v.rho)) .* $(v.iid))
-
-        # 4. Add the final effect to the linear predictor.
-        $(eta_target) .+= view($(v.latent), M.$(index_var))
+        let
+            hyper = spec_registry[:$(key)].hyper
+            diag_D_structured = 1.0 ./ sqrt.(hyper.L .+ M.noise)
+            diag_D_structured[1] = 0.0
+            structured_effect = hyper.U * (diag_D_structured .* $(struct_innov_name))
+            
+            $(p_names.latent) = $(p_names.sigma) .* (sqrt($(p_names.rho)) .* structured_effect .+
+                                         sqrt(1.0 - $(p_names.rho)) .* $(iid_innov_name))
+            
+            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
+        end
         """
 
     cholesky_code = """
         # --- BYM2 Cholesky Assembly (Dense, AD-Safe): $(key) ---
         let
-            # 1. Get the pre-computed Cholesky factor of the ICAR precision matrix.
-            local F_struct = spec_registry[:$(key)].hyper.cholesky_factor
+            F_struct = spec_registry[:$(key)].hyper.cholesky_factor
+            structured_effect = F_struct.L' \\ $(struct_innov_name)
             
-            # 2. Sample the structured component using the Cholesky factor.
-            local structured_effect = F_struct.L' \\ $(v.struct)
-            
-            # 3. Apply a soft sum-to-zero constraint for identifiability.
             Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * $(n_latent)), sum(structured_effect)
             )
             
-            # 4. Combine components using the Riebler parameterization.
-            $(v.latent) = $(v.sigma) .* (sqrt($(v.rho)) .* structured_effect .+
-                                         sqrt(1.0 - $(v.rho)) .* $(v.iid))
+            $(p_names.latent) = $(p_names.sigma) .* (sqrt($(p_names.rho)) .* structured_effect .+
+                                         sqrt(1.0 - $(p_names.rho)) .* $(iid_innov_name))
             
-            # 5. Add the final effect to the linear predictor.
-            $(eta_target) .+= view($(v.latent), M.$(index_var))
+            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
         end
         """
 
     cholesky_sparse_code = """
         # --- BYM2 Cholesky Assembly (Sparse, Not AD-Safe): $(key) ---
-        # WARNING: This method is for didactic purposes and is NOT compatible with
-        # automatic differentiation (e.g., NUTS sampler).
         let
-            local Q_template = spec_registry[:$(key)].hyper.Q_template
-            local F_struct = cholesky(Symmetric(Q_template + M.noise * I))
-            local structured_effect = F_struct.L' \\ $(v.struct)
+            Q_template = spec_registry[:$(key)].hyper.Q_template
+            F_struct = cholesky(Symmetric(Q_template + M.noise * I))
+            structured_effect = F_struct.L' \\ $(struct_innov_name)
             
             Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * $(n_latent)), sum(structured_effect)
             )
             
-            $(v.latent) = $(v.sigma) .* (sqrt($(v.rho)) .* structured_effect .+
-                                         sqrt(1.0 - $(v.rho)) .* $(v.iid))
+            $(p_names.latent) = $(p_names.sigma) .* (sqrt($(p_names.rho)) .* structured_effect .+
+                                         sqrt(1.0 - $(p_names.rho)) .* $(iid_innov_name))
             
-            $(eta_target) .+= view($(v.latent), M.$(index_var))
+            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
         end
         """
 
@@ -286,65 +251,67 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::BYM2, chain, M::NamedTuple, n_samples, outcomes_N, spec, PS, N_total)::NamedTuple
-
-Reconstructs the BYM2 component's effect from posterior samples. This function
-re-runs the Riebler parameterization logic for each sample, dispatching on the
-method used during sampling.
-"""
 function get_effects(
     m::BYM2, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
-    is_multivariate = outcomes_N > 1
-    is_shared = get(spec.params, :shared, false)
+    unstructured_effects = Vector{Matrix{Float64}}()
+    noisy_effects = Vector{Matrix{Float64}}()
+    
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
     n_latent = spec.hyper.n_latent
     noise = M.noise
+    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
 
     for k in 1:outcomes_N
-        outcome_idx = is_multivariate ? k : nothing
-        v = generate_full_variable_names(spec, M.model_arch, outcome_idx)
-        
-        sigma_var_name = (is_multivariate && is_shared) ?
-            string(generate_full_variable_names(spec, M.model_arch, nothing).sigma) :
-            string(v.sigma)
-        rho_var_name = (is_multivariate && is_shared) ?
-            string(generate_full_variable_names(spec, M.model_arch, nothing).rho) :
-            string(v.rho)
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        rho_name = _find_parameter(p_names_vec, string(spec.key), "rho", k, is_multivariate_model)
+        struct_innov_name = _find_parameter(p_names_vec, string(spec.key), "struct_innovations", k, is_multivariate_model)
+        iid_innov_name = _find_parameter(p_names_vec, string(spec.key), "iid_innovations", k, is_multivariate_model)
 
-        sigma_samples = get_params_vector(chain, sigma_var_name, 1)
-        rho_samples = get_params_vector(chain, rho_var_name, 1)
-        struct_samples = get_params_vector(chain, string(v.struct), n_latent)
-        iid_samples = get_params_vector(chain, string(v.iid), n_latent)
+        if isempty(sigma_name) || isempty(rho_name) || isempty(struct_innov_name) || isempty(iid_innov_name)
+            @warn "Parameters for BYM2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            push!(unstructured_effects, zeros(Float64, N_total, n_samples))
+            push!(noisy_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
+        struct_innov_samples = get_params_vector(chain, struct_innov_name, n_latent)
+        iid_samples = get_params_vector(chain, iid_innov_name, n_latent)
         
-        effect_k = Matrix{Float64}(undef, n_latent, n_samples)
+        struct_effect_k = zeros(Float64, n_latent, n_samples)
+        unstruct_effect_k = zeros(Float64, n_latent, n_samples)
 
         for s in 1:n_samples
-            sigma_s = sigma_samples[s, 1]
-            rho_s = rho_samples[s, 1]
-            struct_innov_s = struct_samples[s, :]
-            iid_s = iid_samples[s, :]
-
+            sigma_s = sigma_samples[s]
+            rho_s = rho_samples[s]
+            
             local structured_effect_s
             if m.method == :spectral
                 U = spec.hyper.U
                 L_eig = spec.hyper.L
                 diag_D_structured = 1.0 ./ sqrt.(L_eig .+ noise)
                 diag_D_structured[1] = 0.0
-                structured_effect_s = U * (diag_D_structured .* struct_innov_s)
+                structured_effect_s = U * (diag_D_structured .* struct_innov_samples[s, :])
             else # :cholesky or :cholesky_sparse
                 F_struct = spec.hyper.cholesky_factor
-                structured_effect_raw = F_struct.L' \ struct_innov_s
+                structured_effect_raw = F_struct.L' \ struct_innov_samples[s, :]
                 structured_effect_s = structured_effect_raw .- mean(structured_effect_raw)
             end
             
-            effect_k[:, s] = sigma_s .* (sqrt(rho_s) .* structured_effect_s .+
-                                         sqrt(1.0 - rho_s) .* iid_s)
+            struct_effect_k[:, s] = sigma_s .* sqrt(rho_s) .* structured_effect_s
+            unstruct_effect_k[:, s] = sigma_s .* sqrt(1.0 - rho_s) .* iid_samples[s, :]
         end
-        push!(structured_effects, effect_k)
+        
+        push!(structured_effects, struct_effect_k[s_idx_full, :])
+        push!(unstructured_effects, unstruct_effect_k[s_idx_full, :])
+        push!(noisy_effects, (struct_effect_k .+ unstruct_effect_k)[s_idx_full, :])
     end
     
-    return (structured=structured_effects, noisy=structured_effects)
+    return (structured=structured_effects, unstructured=unstructured_effects, noisy=noisy_effects)
 end

@@ -169,7 +169,7 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
     W_main_name = Symbol("$(p_names.latent)_W_main")
     b_main_name = Symbol("$(p_names.latent)_b_main")
 
-    precomputes = "spec.hyper"
+    # Access hyper from spec_registry within the generated code
     in_dims = spec.hyper.in_dims
     n_features = m.n_features
 
@@ -180,7 +180,8 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
     end
 
     common_code = """
-        local coords = $(precomputes).coords
+        local hyper = spec_registry[:$(spec.key)].hyper # Correct access to precomputed data
+        local coords = hyper.coords
         
         # 1. Construct and apply the warping function
         local W_warp_matrix = reshape($(W_warp_name), $(in_dims), $(n_features))

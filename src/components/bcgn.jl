@@ -1,13 +1,14 @@
 """
     BCGN <: ComponentModel
 
-A component for a Bipartite Graph Convolutional Network (BCGN), modeled as a
-Gaussian Markov Random Field (GMRF). This component is designed for data structured
-on a bipartite graph, where nodes are divided into two disjoint sets, and edges
-only connect nodes from different sets.
+A component for a Bipartite Graph Convolutional Network (BCGN), which models a
+latent spatial field on one partition of a bipartite graph using a Gaussian
+Markov Random Field (GMRF) approach. This component is designed for data
+structured on a bipartite graph, where nodes are divided into two disjoint sets,
+and edges only connect nodes from different sets.
 
 # Version
-v1.0.2 (2026-08-10)
+v1.0.4 (2026-08-11)
 
 # Mathematical Summary
 The BCGN component models a latent spatial field on one partition of a bipartite
@@ -19,36 +20,36 @@ between the two sets.
 The spatial correlation for nodes in one partition (e.g., \$V_1\$) is then induced
 by their shared connections in the other partition (\$V_2\$). This is achieved by
 creating a **one-mode projection** of the bipartite graph onto \$V_1\$. The adjacency
-matrix for this projected graph is given by \$W_{proj} = B B^T\$.
+matrix for this projected graph is given by \$W_{\\text{proj}} = B B^T\$.
 
 From this projected adjacency matrix, a standard graph Laplacian is constructed:
-\$Q = D_{proj} - W_{proj}\$
-where \$D_{proj}\$ is the diagonal degree matrix of \$W_{proj}\$. The latent field
-\$\\phi\$ is then modeled as a GMRF with this precision matrix:
+\$Q = D_{\\text{proj}} - W_{\\text{proj}}\$
+where \$D_{\\text{proj}}\$ is the diagonal degree matrix of \$W_{\\text{proj}}\$. The latent field
+\$\\phi\$ is then modeled as a GMRF with this precision matrix, scaled by \$\\sigma^2\$:
 \$\\phi \\sim \\mathcal{N}(0, (\\sigma^2 Q)^{-1})\$.
 
-# Assumptions
-- The underlying graph structure is bipartite or can be reasonably approximated as
-  such.
-- The spatial effect is smooth with respect to the one-mode projected graph
-  structure.
+To ensure identifiability against a global intercept, a soft sum-to-zero constraint
+is applied to the latent field.
 
-# Best Use Case
-Modeling spatial or network effects where there are two distinct types of entities,
-and interactions only occur between types (e.g., users and products, genes and
-diseases, locations and events). It is useful for understanding the similarity
-between nodes of one type based on the other types of nodes they connect to.
+# Computational Methods
+- `:spectral` (Default, AD-friendly): Uses spectral decomposition of the precision
+  matrix for efficient and AD-compatible sampling.
+- `:cholesky` (AD-friendly): Uses dense Cholesky factorization of the precision
+  matrix. AD-compatible but less efficient than spectral for large graphs.
+- `:cholesky_sparse` (Didactic, Not AD-friendly): Uses sparse Cholesky factorization.
+  Not AD-compatible for gradient-based samplers but retained as a didactic alternative.
 
-# Key References
-- **Bipartite Graphs**: [Wikipedia: Bipartite Graph](https://en.wikipedia.org/wiki/Bipartite_graph)
-- **Graph Convolutions**: Kipf, T. N., & Welling, M. (2016). *Semi-supervised
-  classification with graph convolutional networks*. arXiv preprint arXiv:1609.02907.
+# Inputs
+- **Required**:
+  - A spatial index variable (e.g., `s_idx`).
+  - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
+- **Optional (in `random()` call)**:
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`). Default: `:spectral`.
 
-# Fields
-- `sigma::UnivariateDistribution`: The prior for the marginal standard deviation of
-  the latent field.
-- `method::Symbol`: The computational method. Can be `:spectral` (default, AD-safe),
-  `:cholesky` (AD-safe, dense), or `:cholesky_sparse` (didactic, not AD-safe).
+# Outputs (Parameter Names)
+- `sigma_<key>`: The marginal standard deviation of the latent field.
+- `innovations_<key>`: The raw standard normal innovations for the latent field.
 """
 struct BCGN <: ComponentModel
     sigma::UnivariateDistribution
@@ -133,7 +134,7 @@ end
 """
     get_priors(m::BCGN, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates priors for the basis coefficients (`raw`) and overall scale (`sigma`).
+Generates priors for the innovations and overall scale (`sigma`).
 """
 function get_priors(
     m::BCGN, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -143,7 +144,7 @@ function get_priors(
     n_latent = spec.hyper.n_latent
     return """
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.raw) ~ MvNormal(zeros(T, $(n_latent)), I)
+    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
     """
 end
 
@@ -164,42 +165,43 @@ function get_updates(
 
     spectral_code = """
         # --- BCGN Component (Spectral): $(key) ---
-        let
-            local U = spec_registry[:$(key)].hyper.U
-            local L = spec_registry[:$(key)].hyper.L
-            local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
-            diag_D[L .< 1e-6] .= 0.0 # Enforce sum-to-zero constraint
-            
-            local latent_field = U * (diag_D .* $(p_names.raw))
-            $(eta_target) .+= view(latent_field, M.s_idx)
-        end
+        # This method uses spectral decomposition for AD-friendly sampling.
+        U = spec_registry[:$(key)].hyper.U
+        L = spec_registry[:$(key)].hyper.L
+        diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
+        # Enforce sum-to-zero constraint by setting components corresponding to the null space to zero.
+        diag_D[L .< 1e-6] .= 0.0
+        
+        latent_field = U * (diag_D .* $(p_names.innovations))
+        $(eta_target) .+= view(latent_field, M.s_idx)
     """
 
     cholesky_code = """
         # --- BCGN Component (Cholesky, AD-Safe): $(key) ---
-        let
-            local F = spec_registry[:$(key)].hyper.cholesky_factor
-            local latent_field_raw = F.L' \\ $(p_names.raw)
-            
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
-            
-            local latent_field = latent_field_raw .* $(p_names.sigma)
-            $(eta_target) .+= view(latent_field, M.s_idx)
-        end
+        # This method uses a dense Cholesky factorization for AD-safe sampling.
+        F = spec_registry[:$(key)].hyper.cholesky_factor
+        latent_field_raw = F.L' \\ $(p_names.innovations)
+        
+        # Apply soft sum-to-zero constraint for identifiability against the global intercept.
+        Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+        
+        latent_field = latent_field_raw .* $(p_names.sigma)
+        $(eta_target) .+= view(latent_field, M.s_idx)
     """
 
     cholesky_sparse_code = """
         # --- BCGN Component (Sparse Cholesky, Not AD-Safe): $(key) ---
-        let
-            local Q = spec_registry[:$(key)].hyper.Q_template
-            local F = cholesky(Symmetric(Q + M.noise * I))
-            local latent_field_raw = F.L' \\ $(p_names.raw)
-            
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
-            
-            local latent_field = latent_field_raw .* $(p_names.sigma)
-            $(eta_target) .+= view(latent_field, M.s_idx)
-        end
+        # This method uses sparse Cholesky factorization, which is generally not AD-safe
+        # for gradient-based samplers but is retained as a didactic alternative.
+        Q = spec_registry[:$(key)].hyper.Q_template
+        F = cholesky(Symmetric(Q + M.noise * I))
+        latent_field_raw = F.L' \\ $(p_names.innovations)
+        
+        # Apply soft sum-to-zero constraint for identifiability against the global intercept.
+        Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+        
+        latent_field = latent_field_raw .* $(p_names.sigma)
+        $(eta_target) .+= view(latent_field, M.s_idx)
     """
 
     if m.method == :spectral
@@ -209,12 +211,13 @@ function get_updates(
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
     else
-        error("Unsupported method '$(m.method)' for BCGN component.")
+        error("Unsupported method '$(m.method)' for BCGN component. Use `:spectral`, `:cholesky`, or `:cholesky_sparse`.")
     end
 end
 
+
 """
-    get_effects(m::BCGN, chain, M::NamedTuple, ...)::NamedTuple
+    get_effects(m::BCGN, chain, M::NamedTuple, n_samples, outcomes_N, spec, PS, N_total)::NamedTuple
 
 Reconstructs the `BCGN` component's effect from the MCMC chain's posterior samples,
 dispatching on the method used during sampling.
@@ -226,12 +229,21 @@ function get_effects(
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+
+        if isempty(sigma_name) || isempty(innovations_name)
+            @warn "Parameters for BCGN component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
 
@@ -241,12 +253,12 @@ function get_effects(
             for j in 1:n_samples
                 diag_D = sigma_samples[j] ./ sqrt.(L .+ noise)
                 diag_D[L .< 1e-6] .= 0.0
-                effect_k[:, j] = U * (diag_D .* raw_samples[j, :])
+                effect_k[:, j] = U * (diag_D .* innovations_samples[j, :])
             end
         else # :cholesky or :cholesky_sparse
             F = spec.hyper.cholesky_factor
             for j in 1:n_samples
-                latent_field_raw = F.L' \ raw_samples[j, :]
+                latent_field_raw = F.L' \ innovations_samples[j, :]
                 latent_field_raw .-= mean(latent_field_raw)
                 effect_k[:, j] = latent_field_raw .* sigma_samples[j]
             end

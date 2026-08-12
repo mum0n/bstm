@@ -7,7 +7,7 @@ space. The effect is a linear combination of these basis functions, with coeffic
 regularized by a random walk prior to ensure smoothness.
 
 # Version
-v1.0.2 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 A Thin Plate Spline models a function \$f(\\mathbf{x})\$ as a linear combination of
@@ -27,15 +27,28 @@ second-order random walk (RW2) prior:
 \$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\tau \\mathbf{Q}_{RW2})^{-1})\$
 
 # Computational Methods
-- `:spectral` (default): An efficient, AD-safe method using spectral decomposition.
-- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
-- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
-  factorization, suitable for gradient-free samplers.
+- `:spectral` (Default, AD-friendly): Regularizes coefficients using a spectral
+  decomposition of the penalty matrix. Recommended for gradient-based samplers.
+- `:cholesky` (AD-friendly): Uses a pre-computed dense Cholesky factorization of the
+  penalty matrix.
+- `:cholesky_sparse` (Didactic, Not AD-friendly): Uses sparse Cholesky factorization,
+  which is not compatible with most AD backends.
 
-# Fields
-- `nbins::Int`: The number of knots (and basis functions) to use.
-- `sigma::Distribution`: The prior for the std. dev. of the TPS coefficients.
-- `method::Symbol`: The computational method for regularizing coefficients.
+# Inputs
+- **Required**:
+  - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
+- **Optional (in `random()` call)**:
+  - `nbins`: `Int`, the number of knots (and basis functions) to use. Default: `20`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the TPS
+    coefficients. Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
+    Default: `:spectral`.
+  - `knot_method`: `Symbol`, method for placing knots (`:kmeans`, `:random`, `:quantile`, `:range`). Default: `:kmeans`.
+
+# Outputs (Parameter Names)
+- `sigma_<key>`: The standard deviation of the TPS coefficients.
+- `innovations_<key>`: The raw standard normal innovations for the coefficients.
+- `latent_<key>`: The final smooth effect vector.
 """
 struct TPS <: ComponentModel
     nbins::Int
@@ -53,11 +66,6 @@ COMPONENT_CONSTRUCTORS[:tps] = (p, params) -> TPS(
 
 MODEL_TO_STRUCTURE_MAP[:tps] = :smooth
 
-"""
-    get_datastructures!(m_type::Type{<:TPS}, M::Dict, mod_data::Dict)::Bool
-
-Ensures that coordinate variables are provided and stores them in the module data.
-"""
 function get_datastructures!(m_type::Type{<:TPS}, M::Dict, mod_data::Dict)::Bool
     variables = mod_data[:variables]
 
@@ -75,13 +83,6 @@ function get_datastructures!(m_type::Type{<:TPS}, M::Dict, mod_data::Dict)::Bool
     return true
 end
 
-
-"""
-    get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Pre-computes knots, the basis matrix, the penalty matrix, and its spectral
-decomposition and dense Cholesky factorization.
-"""
 function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
     if isnothing(coords)
@@ -92,7 +93,7 @@ function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
     n_latent = m.nbins
 
     knot_method = get(mod_data[:params], :knot_method, :kmeans)
-    knots = generate_inducing_points(coords, n_latent; method=knot_method)
+    knots = generate_inducing_points(coords, n_latent; method=string(knot_method))
     actual_n_knots = size(knots, 1)
     if actual_n_knots < n_latent
         @warn "TPS: Could only generate $(actual_n_knots) unique knots, requested $(n_latent). Using $(actual_n_knots)."
@@ -134,29 +135,19 @@ function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
-
-"""
-    get_priors(m::TPS, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for `sigma` and the `raw` coefficients for the basis functions.
-"""
-function get_priors(m::TPS, spec::NamedTuple, arch::String, outcome_idx, M::NamedTuple)::String
+function get_priors(
+    m::TPS, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    
     sigma_prior_str = _distribution_to_string(m.sigma)
     
     return """
         $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.raw) ~ MvNormal(zeros(spec.hyper.n_latent), I)
+        $(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)
     """
 end
 
-"""
-    get_updates(m::TPS, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code to construct the TPS smooth effect, dispatching on the
-chosen method.
-"""
 function get_updates(
     m::TPS, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -167,18 +158,18 @@ function get_updates(
     n_latent = spec.hyper.n_latent
 
     common_code = """
-        local hyper = spec_registry[:$(key)].hyper
-        local B_basis = hyper.basis_matrix
+        hyper = spec_registry[:$(key)].hyper
+        B_basis = hyper.basis_matrix
     """
 
     spectral_code = """
         # --- Thin Plate Spline (TPS) Smoother (Spectral): $(key) ---
         let
             $(common_code)
-            local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
+            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
-            local coeffs = hyper.U * (diag_D .* $(p_names.raw))
-            local $(p_names.latent) = B_basis * coeffs
+            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
+            $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
     """
@@ -187,11 +178,11 @@ function get_updates(
         # --- Thin Plate Spline (TPS) Smoother (Cholesky, AD-Safe): $(key) ---
         let
             $(common_code)
-            local F = hyper.cholesky_factor
-            local coeffs_raw = F.L' \\ $(p_names.raw)
+            F = hyper.cholesky_factor
+            coeffs_raw = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
-            local coeffs = $(p_names.sigma) .* coeffs_raw
-            local $(p_names.latent) = B_basis * coeffs
+            coeffs = $(p_names.sigma) .* coeffs_raw
+            $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
     """
@@ -200,12 +191,12 @@ function get_updates(
         # --- Thin Plate Spline (TPS) Smoother (Sparse Cholesky, Not AD-Safe): $(key) ---
         let
             $(common_code)
-            local Q_penalty = hyper.Q_template
-            local F = cholesky(Symmetric(Q_penalty + M.noise * I))
-            local coeffs_raw = F.L' \\ $(p_names.raw)
+            Q_penalty = hyper.Q_template
+            F = cholesky(Symmetric(Q_penalty + M.noise * I))
+            coeffs_raw = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
-            local coeffs = $(p_names.sigma) .* coeffs_raw
-            local $(p_names.latent) = B_basis * coeffs
+            coeffs = $(p_names.sigma) .* coeffs_raw
+            $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
     """
@@ -216,25 +207,19 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for TPS component."); end
 end
 
-"""
-    get_effects(m::TPS, chain, M::NamedTuple, ...)
-
-Reconstructs the `TPS` component's effect from posterior samples, dispatching on
-the method used during sampling.
-"""
 function get_effects(
     m::TPS, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
-
-    precomputes = spec.hyper
+    
+    hyper = spec.hyper
     noise = M.noise
-    n_latent = precomputes.n_latent
-    knots = precomputes.knots
+    n_latent = hyper.n_latent
+    knots = hyper.knots
     n_dims = size(knots, 2)
 
-    B_train = precomputes.basis_matrix
+    B_train = hyper.basis_matrix
     B_full = if !isnothing(PS)
         coord_vars = get(spec.params, :positional_args, [])
         if all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
@@ -260,25 +245,34 @@ function get_effects(
         B_full = B_train
     end
 
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
+
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+
+        if isempty(sigma_name) || isempty(innovations_name)
+            @warn "Parameters for TPS component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, size(B_full, 1), n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, size(B_full, 1), n_samples)
 
         for i in 1:n_samples
             local coeffs
             if m.method == :spectral
-                U, L = precomputes.U, precomputes.L
+                U, L = hyper.U, hyper.L
                 diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
                 diag_D[1] = 0.0; diag_D[2] = 0.0
-                coeffs = U * (diag_D .* raw_samples[i, :])
+                coeffs = U * (diag_D .* innovations_samples[i, :])
             else # :cholesky or :cholesky_sparse
-                Q_template = precomputes.Q_template
-                F = cholesky(Symmetric(Matrix(Q_template) + noise * I))
-                coeffs_raw = F.L' \ raw_samples[i, :]
+                F = hyper.cholesky_factor
+                coeffs_raw = F.L' \ innovations_samples[i, :]
                 coeffs_centered = coeffs_raw .- mean(coeffs_raw)
                 coeffs = sigma_samples[i] .* coeffs_centered
             end

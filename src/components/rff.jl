@@ -7,7 +7,7 @@ the input coordinates into a randomized feature space. This transforms the GP in
 more scalable Bayesian linear regression problem.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 The RFF method approximates a stationary kernel \$k(\\tau) = k(x - x')\$ by using
@@ -17,20 +17,33 @@ where \$\\{\\omega_j\\}\$ are random frequencies and \$\\{b_j\\}\$ are random ph
 The final effect is a linear combination of these features: \$f(x) = \\phi(x)^T \\beta\$.
 
 # Computational Methods
-- `:fixed` (default): The RFF weights `W` and biases `b` are pre-computed and fixed.
-  This is efficient and AD-safe.
-- `:adaptive`: `W` and `b` are sampled as parameters, allowing the model to learn
-  the feature space. This is more flexible but computationally more intensive.
-- `:centered` (didactic): Uses fixed features but samples the coefficients `β`
-  directly from a scaled Normal distribution, which can be less efficient for MCMC.
+- `:fixed` (Default, AD-friendly): The RFF weights `W` and biases `b` are pre-computed
+  based on the prior mean of the lengthscale and are fixed during sampling. This is
+  the most efficient and numerically stable method.
+- `:adaptive` (AD-friendly): The RFF weights `W` and biases `b` are treated as
+  parameters and sampled from priors centered on the fixed features. This allows the
+  model to learn the feature space but is computationally more intensive.
+- `:centered` (Didactic, Not AD-friendly): Uses fixed features but samples the
+  coefficients `β` directly from a scaled Normal distribution, which can be less
+  efficient for MCMC due to posterior correlations.
 
-# Fields
-- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: Prior for the kernel
-  lengthscale(s).
-- `sigma::Distribution`: Prior for the standard deviation of the RFF coefficients.
-- `n_features::Int`: The number of random features to use.
-- `kernel::String`: The name of the kernel to approximate (e.g., "se", "matern32").
-- `method::Symbol`: The computational method, one of `:fixed`, `:adaptive`, or `:centered`.
+# Inputs
+- **Required**:
+  - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
+- **Optional (in `random()` call)**:
+  - `n_features`: `Int`, the number of random features to use. Default: `20`.
+  - `kernel`: `String`, the name of the kernel to approximate (e.g., `"se"`, `"matern32"`). Default: `"se"`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the RFF coefficients. Default: `Exponential(1.0)`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `method`: `Symbol`, computational method (`:fixed`, `:adaptive`, or `:centered`). Default: `:fixed`.
+
+# Outputs (Parameter Names)
+- `sigma_<key>`: The standard deviation of the RFF coefficients.
+- `ls_<key>`: The kernel lengthscale(s).
+- `W_<key>`: The learned RFF projection weights (for `:adaptive` method).
+- `b_<key>`: The learned RFF biases (for `:adaptive` method).
+- `innovations_<key>`: Raw standard normal innovations for the RFF coefficients (for `:fixed` and `:adaptive`).
+- `latent_<key>`: The RFF coefficients (for `:centered`).
 """
 struct RFF <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
@@ -47,17 +60,11 @@ COMPONENT_CONSTRUCTORS[:rff] = (p, params) -> RFF(
     p.sigma,
     get(params, :n_features, 20),
     string(get(params, :kernel, "se")),
-    get(params, :method, :fixed) # New default method
+    get(params, :method, :fixed)
 )
 
 MODEL_TO_STRUCTURE_MAP[:rff] = :smooth
 
-"""
-    get_datastructures!(m_type::Type{<:RFF}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `RFF` component.
-It ensures that coordinate variables are provided and stores them in the module data.
-"""
 function get_datastructures!(m_type::Type{<:RFF}, M::Dict, mod_data::Dict)::Bool
     variables = mod_data[:variables]
 
@@ -75,12 +82,6 @@ function get_datastructures!(m_type::Type{<:RFF}, M::Dict, mod_data::Dict)::Bool
     return true
 end
 
-"""
-    _generate_rff_fixed_params(in_dims, n_features, lengthscale, kernel_name)
-
-Generates fixed random projection weights (W) and biases (b) for RFF approximation.
-This helper function is used in the precomputation stage.
-"""
 function _generate_rff_fixed_params(
     in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector},
     kernel_name::String
@@ -93,12 +94,8 @@ function _generate_rff_fixed_params(
         if lengthscale isa Real
             W .= rand(Normal(0, 1.0 / lengthscale), in_dims, n_features)
         else
-            if length(lengthscale) != in_dims
-                error("ARD lengthscale vector length mismatch.")
-            end
-            for d in 1:in_dims
-                W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features)
-            end
+            if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
+            for d in 1:in_dims; W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features); end
         end
     elseif occursin("matern", k_name)
         nu = if k_name == "matern12"; 0.5; elseif k_name == "matern32"; 1.5; else 2.5; end
@@ -106,12 +103,8 @@ function _generate_rff_fixed_params(
         if lengthscale isa Real
             W .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
         else
-            if length(lengthscale) != in_dims
-                error("ARD lengthscale vector length mismatch.")
-            end
-            for d in 1:in_dims
-                W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features)
-            end
+            if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
+            for d in 1:in_dims; W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features); end
         end
     else
         @warn "Kernel '$kernel_name' not recognized for RFF. Defaulting to SE."
@@ -120,13 +113,6 @@ function _generate_rff_fixed_params(
     return W, b
 end
 
-"""
-    get_precomputes(m::RFF, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Performs data-independent pre-calculations for the `RFF` component.
-It generates the fixed random features (`W_fixed`, `b_fixed`) that serve as the
-means for the priors on the adaptive feature parameters.
-"""
 function get_precomputes(m::RFF, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
     if isnothing(coords)
@@ -156,12 +142,6 @@ function get_precomputes(m::RFF, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
-"""
-    get_priors(m::RFF, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for `sigma`, `lengthscale`, and other parameters depending on the
-chosen method.
-"""
 function get_priors(
     m::RFF, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -185,18 +165,12 @@ function get_priors(
     end
 
     if m.method in [:fixed, :adaptive]
-        push!(priors, "$(p_names.raw) ~ MvNormal(zeros(spec.hyper.n_latent), I)")
+        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
     end
 
     return join(priors, "\n    ")
 end
 
-"""
-    get_updates(m::RFF, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code for constructing the RFF smooth effect, dispatching on
-the chosen method.
-"""
 function get_updates(
     m::RFF, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -204,20 +178,23 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
-    precomputes = "spec_registry[:$(key)].hyper"
+    
+    hyper_access = "spec_registry[:$(key)].hyper"
+    in_dims = spec.hyper.in_dims
+    n_latent = spec.hyper.n_latent
 
     phi_code(W_expr, b_expr) = """
-        local X_coords = $(precomputes).coords
-        local W_matrix = reshape($(W_expr), $(precomputes).in_dims, $(precomputes).n_latent)
-        local Phi = sqrt(2.0 / $(precomputes).n_latent) .* cos.((X_coords * W_matrix) .+ $(b_expr)')
+        X_coords = $(hyper_access).coords
+        W_matrix = reshape($(W_expr), $(in_dims), $(n_latent))
+        Phi = sqrt(2.0 / $(n_latent)) .* cos.((X_coords * W_matrix) .+ $(b_expr)')
     """
 
     fixed_code = """
         # --- RFF Smoother (Fixed Features): $(key) ---
         let
-            $(phi_code("$(precomputes).W_fixed", "$(precomputes).b_fixed"))
-            local scaled_coeffs = $(p_names.raw) .* $(p_names.sigma)
-            local rff_effect = Phi * scaled_coeffs
+            $(phi_code("$(hyper_access).W_fixed", "$(hyper_access).b_fixed"))
+            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
+            rff_effect = Phi * scaled_coeffs
             $(eta_target) .+= rff_effect
         end
     """
@@ -226,8 +203,8 @@ function get_updates(
         # --- RFF Smoother (Adaptive Features): $(key) ---
         let
             $(phi_code(string(p_names.W), string(p_names.b)))
-            local scaled_coeffs = $(p_names.raw) .* $(p_names.sigma)
-            local rff_effect = Phi * scaled_coeffs
+            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
+            rff_effect = Phi * scaled_coeffs
             $(eta_target) .+= rff_effect
         end
     """
@@ -235,9 +212,9 @@ function get_updates(
     centered_code = """
         # --- RFF Smoother (Centered): $(key) ---
         let
-            $(phi_code("$(precomputes).W_fixed", "$(precomputes).b_fixed"))
-            local coeffs ~ MvNormal(zeros($(precomputes).n_latent), $(p_names.sigma)^2 * I)
-            local rff_effect = Phi * coeffs
+            $(phi_code("$(hyper_access).W_fixed", "$(hyper_access).b_fixed"))
+            $(p_names.latent) ~ MvNormal(zeros(T, $(n_latent)), $(p_names.sigma)^2 * I)
+            rff_effect = Phi * $(p_names.latent)
             $(eta_target) .+= rff_effect
         end
     """
@@ -248,56 +225,76 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for RFF component."); end
 end
 
-"""
-    get_effects(m::RFF, chain, M::NamedTuple, ...)::NamedTuple
-
-Reconstructs the `RFF` component's effect from posterior samples, dispatching
-on the method used during sampling.
-"""
 function get_effects(
     m::RFF, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
-    precomputes = spec.precomputes
-    in_dims = precomputes.in_dims
-    n_features = precomputes.n_latent
+    hyper = spec.hyper
+    in_dims = hyper.in_dims
+    n_features = hyper.n_latent
 
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(precomputes.coords, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
+        vcat(hyper.coords, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
     else
-        precomputes.coords
+        hyper.coords
     end
 
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
+
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)
-        
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        if isempty(sigma_name)
+            @warn "Sigma parameter for RFF component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
+            continue
+        end
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+
         local W_samples, b_samples
         if m.method == :adaptive
-            W_samples = get_params_vector(chain, string(p_names.W), in_dims * n_features)
-            b_samples = get_params_vector(chain, string(p_names.b), n_features)
+            W_name = _find_parameter(p_names_vec, string(spec.key), "W", k, is_multivariate_model)
+            b_name = _find_parameter(p_names_vec, string(spec.key), "b", k, is_multivariate_model)
+            if isempty(W_name) || isempty(b_name)
+                @warn "Adaptive RFF parameters for component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
+                continue
+            end
+            W_samples = get_params_vector(chain, W_name, in_dims * n_features)
+            b_samples = get_params_vector(chain, b_name, n_features)
         else # :fixed or :centered
-            W_samples = repeat(vec(precomputes.W_fixed)', n_samples, 1)
-            b_samples = repeat(precomputes.b_fixed', n_samples, 1)
+            W_samples = repeat(vec(hyper.W_fixed)', n_samples, 1)
+            b_samples = repeat(hyper.b_fixed', n_samples, 1)
         end
 
         effect_k = zeros(Float64, size(coords_full, 1), n_samples)
 
         if m.method in [:fixed, :adaptive]
-            raw_samples = get_params_vector(chain, string(p_names.raw), n_features)
+            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            if isempty(innovations_name)
+                @warn "Innovations for RFF component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
+                continue
+            end
+            innovations_samples = get_params_vector(chain, innovations_name, n_features)
             for i in 1:n_samples
                 W_matrix = reshape(W_samples[i, :], in_dims, n_features)
                 b_vec = b_samples[i, :]
                 Phi = sqrt(2.0 / n_features) .* cos.((coords_full * W_matrix) .+ b_vec')
-                scaled_coeffs = raw_samples[i, :] .* sigma_samples[i, 1]
+                scaled_coeffs = innovations_samples[i, :] .* sigma_samples[i]
                 effect_k[:, i] = Phi * scaled_coeffs
             end
         else # :centered
-            coeffs_samples = get_params_vector(chain, string(p_names.latent), n_features)
+            latent_name = _find_parameter(p_names_vec, string(spec.key), "latent", k, is_multivariate_model)
+            if isempty(latent_name)
+                @warn "Latent coefficients for centered RFF component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
+                continue
+            end
+            coeffs_samples = get_params_vector(chain, latent_name, n_features)
             for i in 1:n_samples
                 W_matrix = reshape(W_samples[i, :], in_dims, n_features)
                 b_vec = b_samples[i, :]

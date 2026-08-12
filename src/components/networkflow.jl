@@ -7,7 +7,7 @@ Random Field (GMRF) on a graph with data-driven edge weights, often representing
 habitat conductivity or resistance.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 The component models a latent spatial field \$\\phi\$ as a GMRF,
@@ -28,14 +28,24 @@ matrix of row sums of \$W_{\\beta}\$. By estimating \$\\beta\$, the model learns
 degree to which the habitat influences the spatial correlation structure.
 
 # Computational Methods
-- `:cholesky` (default): An AD-safe method using dense Cholesky factorization.
-- `:cholesky_sparse` (didactic, not AD-safe): A more memory-efficient method using
+- `:cholesky` (Default, AD-friendly): An AD-safe method using dense Cholesky factorization.
+- `:cholesky_sparse` (Didactic, Not AD-friendly): A more memory-efficient method using
   sparse Cholesky factorization, suitable for gradient-free samplers.
 
-# Fields
-- `beta::UnivariateDistribution`: Prior for the parameter \$\\beta\$.
-- `sigma::UnivariateDistribution`: Prior for the marginal standard deviation.
-- `method::Symbol`: The computational method, `:cholesky` or `:cholesky_sparse`.
+# Inputs
+- **Required**:
+  - A spatial index variable (e.g., `region`) passed to `random()`.
+  - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
+  - `habitat`: A `Symbol` pointing to a column in the data, or a `Vector` of length `s_N`.
+- **Optional (in `random()` call)**:
+  - `beta`: `UnivariateDistribution`, prior for the habitat effect parameter. Default: `Normal(0, 1)`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:cholesky` or `:cholesky_sparse`). Default: `:cholesky`.
+
+# Outputs (Parameter Names)
+- `beta_<key>`: The habitat effect parameter.
+- `sigma_<key>`: The marginal standard deviation of the latent field.
+- `innovations_<key>`: The raw standard normal innovations for the latent field.
 """
 struct NetworkFlow <: ComponentModel
     beta::UnivariateDistribution
@@ -48,21 +58,8 @@ COMPONENT_CONSTRUCTORS[:networkflow] = (p, params) -> NetworkFlow(
     p.beta, p.sigma, get(params, :method, :cholesky)
 )
 
-# Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:networkflow] = :spatial
 
-"""
-    get_datastructures!(m_type::Type{<:NetworkFlow}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `NetworkFlow` component. It establishes the
-spatial context (s_idx, s_N, W) and resolves the `habitat` data from the provided
-DataFrame or keyword arguments.
-
-# Assumptions
-- A base adjacency matrix `W` must be provided.
-- The `habitat` data must be provided either as a column name in the DataFrame or
-  as a vector of length `s_N` via keyword arguments.
-"""
 function get_datastructures!(
     m_type::Type{<:NetworkFlow}, M::Dict, mod_data::Dict
 )::Bool
@@ -86,7 +83,6 @@ function get_datastructures!(
         if !hasproperty(data, habitat_val)
             error("Habitat variable ':$habitat_val' not found in the data frame.")
         end
-        # Aggregate per-observation habitat data to per-unit data by taking the mean.
         habitat_per_obs = data[!, habitat_val]
         habitat_aggregated = zeros(Float64, s_N)
         counts = zeros(Int, s_N)
@@ -116,23 +112,12 @@ function get_datastructures!(
     return true
 end
 
-"""
-    get_precomputes(m::NetworkFlow, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Pre-computes the sparse structure (I, J vectors) of the adjacency matrix `W`. This
-avoids repeatedly finding non-zero elements inside the Turing model loop.
-"""
 function get_precomputes(m::NetworkFlow, M::NamedTuple, mod_data::Dict)::NamedTuple
     W = M.W
     I, J, _ = findnz(W)
     return (W_I=I, W_J=J, n_latent=size(W, 1))
 end
 
-"""
-    get_priors(m::NetworkFlow, spec::NamedTuple, arch::String, outcome_idx, M)
-
-Generates the Turing code for the priors on `beta`, `sigma`, and the raw innovations.
-"""
 function get_priors(
     m::NetworkFlow, spec::NamedTuple, arch::String,
     outcome_idx::Union{Int, Nothing}, M::NamedTuple
@@ -142,18 +127,11 @@ function get_priors(
 
     push!(priors, "$(p_names.beta) ~ $(_distribution_to_string(m.beta))")
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.raw) ~ MvNormal(zeros(M.s_N), I)")
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, M.s_N), I)")
 
     return join(priors, "\n    ")
 end
 
-
-"""
-    get_updates(m::NetworkFlow, spec::NamedTuple, arch::String, outcome_idx, M)
-
-Generates code to construct the habitat-weighted precision matrix and sample the
-latent field, dispatching on the chosen method.
-"""
 function get_updates(
     m::NetworkFlow, spec::NamedTuple, arch::String,
     outcome_idx::Union{Int, Nothing}, M::NamedTuple
@@ -164,16 +142,16 @@ function get_updates(
 
     common_code = """
         # 1. Construct the weighted adjacency matrix based on habitat and beta.
-        local W_I = spec_registry[:$(key)].hyper.W_I
-        local W_J = spec_registry[:$(key)].hyper.W_J
-        local habitat = M[Symbol("habitat_$(key)")]
+        W_I = spec_registry[:$(key)].hyper.W_I
+        W_J = spec_registry[:$(key)].hyper.W_J
+        habitat = M[Symbol("habitat_$(key)")]
         
-        local V_beta = exp.($(p_names.beta) .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
-        local W_beta = sparse(W_I, W_J, V_beta, M.s_N, M.s_N)
+        V_beta = exp.($(p_names.beta) .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
+        W_beta = sparse(W_I, W_J, V_beta, M.s_N, M.s_N)
         
         # 2. Construct the weighted graph Laplacian (precision matrix).
-        local D_beta = Diagonal(vec(sum(W_beta, dims=2)))
-        local Q_beta = D_beta - W_beta
+        D_beta = Diagonal(vec(sum(W_beta, dims=2)))
+        Q_beta = D_beta - W_beta
     """
 
     cholesky_code = """
@@ -181,30 +159,22 @@ function get_updates(
         let
             $(common_code)
             
-            # 3. Sample the latent field using a non-centered parameterization.
-            #    The Cholesky factor of the dense precision matrix is used.
-            local F = cholesky(Symmetric(Matrix(Q_beta) + M.noise * I))
-            local latent_field = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
+            F = cholesky(Symmetric(Matrix(Q_beta) + M.noise * I))
+            $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
             
-            # 4. Add the effect to the linear predictor.
-            $(eta_target) .+= view(latent_field, M.s_idx)
+            $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
 
     cholesky_sparse_code = """
         # --- NetworkFlow Component (Sparse Cholesky, Not AD-Safe): $(key) ---
-        # WARNING: This method is for didactic purposes and is NOT compatible with
-        # automatic differentiation (e.g., NUTS sampler).
         let
             $(common_code)
             
-            # 3. Sample the latent field using a non-centered parameterization.
-            #    The Cholesky factor of the sparse precision matrix is used.
-            local F = cholesky(Symmetric(Q_beta + M.noise * I))
-            local latent_field = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
+            F = cholesky(Symmetric(Q_beta + M.noise * I))
+            $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
             
-            # 4. Add the effect to the linear predictor.
-            $(eta_target) .+= view(latent_field, M.s_idx)
+            $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
 
@@ -217,11 +187,6 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::NetworkFlow, chain, M::NamedTuple, ...)
-
-Reconstructs the `NetworkFlow` component's effect from posterior samples.
-"""
 function get_effects(
     m::NetworkFlow, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
@@ -233,29 +198,36 @@ function get_effects(
     W_J = spec.hyper.W_J
     habitat = M[Symbol("habitat_", key)]
     s_N = M.s_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k_outcome in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k_outcome)
+        beta_name = _find_parameter(p_names_vec, string(key), "beta", k_outcome, is_multivariate_model)
+        sigma_name = _find_parameter(p_names_vec, string(key), "sigma", k_outcome, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(key), "innovations", k_outcome, is_multivariate_model)
 
-        beta_samples = get_params_vector(chain, string(p_names.beta), 1)[:, 1]
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        raw_samples = get_params_vector(chain, string(p_names.raw), s_N)
+        if isempty(beta_name) || isempty(sigma_name) || isempty(innovations_name)
+            @warn "Parameters for NetworkFlow component $(key) (outcome $k_outcome) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+
+        beta_samples = get_params_vector(chain, beta_name, 1)[:, 1]
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, s_N)
 
         reconstructed_effects_k = zeros(Float64, s_N, n_samples)
 
         for i in 1:n_samples
-            # Reconstruct the precision matrix for each posterior sample
             V_beta_i = exp.(beta_samples[i] .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
             W_beta_i = sparse(W_I, W_J, V_beta_i, s_N, s_N)
             D_beta_i = Diagonal(vec(sum(W_beta_i, dims=2)))
             Q_beta_i = D_beta_i - W_beta_i
             
-            # For reconstruction, dense Cholesky is safe and robust.
             F_i = cholesky(Symmetric(Matrix(Q_beta_i) + M.noise * I))
             
-            # Reconstruct the latent field for this sample
             reconstructed_effects_k[:, i] = sigma_samples[i] .*
-                                            (F_i.L' \ raw_samples[i, :])
+                                            (F_i.L' \ innovations_samples[i, :])
         end
         
         s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)

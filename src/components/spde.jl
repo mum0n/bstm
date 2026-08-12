@@ -7,7 +7,7 @@ Gaussian Process with a Matérn covariance function and a discrete Gaussian Mark
 Random Field (GMRF), enabling scalable and principled spatial modeling.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 The SPDE approach models a Gaussian Field \$u(s)\$ as the solution to the SPDE:
@@ -26,18 +26,33 @@ the precision matrix \$\\mathbf{Q}\$ of the latent field \$\\boldsymbol{\\phi}\$
 The model then samples the latent field from \$\\boldsymbol{\\phi} \\sim \\mathcal{N}(0, (\\sigma^2 \\mathbf{Q})^{-1})\$.
 
 # Computational Methods
-- `:spectral` (default): An efficient, AD-safe method using spectral decomposition.
+- `:spectral` (Default, AD-friendly): An efficient, AD-safe method using spectral decomposition.
   Only applicable for isotropic `kappa` priors.
-- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
-- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
+- `:cholesky` (AD-friendly): An AD-safe didactic alternative using dense Cholesky factorization.
+- `:cholesky_sparse` (Didactic, Not AD-friendly): A non-AD-safe didactic method using sparse Cholesky
   factorization, suitable for gradient-free samplers.
 
-# Fields
-- `sigma::Distribution`: The prior for the marginal standard deviation of the SPDE effect.
-- `kappa::Union{Distribution, Vector{<:Distribution}}`: The prior for the `kappa`
-  parameter, which controls the spatial range. Can be a single distribution or a
-  vector for anisotropic effects.
-- `method::Symbol`: The computational method for the SPDE solver.
+# Inputs
+- **Required**:
+  - A spatial index variable (e.g., `region`) passed to `random()`.
+  - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
+- **Optional (in `random()` call)**:
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default: `Exponential(1.0)`.
+  - `kappa`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the `kappa`
+    parameter(s). Default: `LogNormal(0, 1)`.
+  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
+    Default: `:spectral`.
+
+# Outputs (Parameter Names)
+- `sigma_<key>`: The marginal standard deviation of the SPDE effect.
+- `kappa_<key>`: The spatial range parameter(s).
+- `innovations_<key>`: The raw standard normal innovations for the latent field.
+- `latent_<key>`: The reconstructed latent SPDE effect.
+
+# Key References
+- Lindgren, F., Rue, H., & Lindström, J. (2011). *An explicit link between
+  Gaussian fields and Gaussian Markov random fields: The SPDE approach*. Journal
+  of the Royal Statistical Society: Series B (Statistical Methodology), 73(4), 423-498.
 """
 struct SPDE <: ComponentModel
     sigma::Distribution
@@ -45,21 +60,13 @@ struct SPDE <: ComponentModel
     method::Symbol
 end
 
-# Add to the central component constructor registry.
 COMPONENT_TYPE_REGISTRY[:spde] = SPDE
 COMPONENT_CONSTRUCTORS[:spde] = (p, params) -> SPDE(
     p.sigma, p.kappa, get(params, :method, :spectral)
 )
 
-# Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:spde] = :spatial
 
-"""
-    get_datastructures!(m_type::Type{<:SPDE}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `SPDE` component. It ensures that an
-adjacency matrix `W` is provided and sets up the spatial context (`s_idx`, `s_N`).
-"""
 function get_datastructures!(m_type::Type{<:SPDE}, M::Dict, mod_data::Dict)::Bool
     params = mod_data[:params]
     variables = mod_data[:variables]
@@ -98,11 +105,6 @@ function get_datastructures!(m_type::Type{<:SPDE}, M::Dict, mod_data::Dict)::Boo
     return true
 end
 
-"""
-    get_precomputes(m::SPDE, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Pre-computes the graph Laplacian `Q_template` and its spectral decomposition.
-"""
 function get_precomputes(m::SPDE, M::NamedTuple, mod_data::Dict)::NamedTuple
     n = M.s_N
     W = M.W
@@ -128,11 +130,6 @@ function get_precomputes(m::SPDE, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
-"""
-    get_priors(m::SPDE, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for `sigma`, `kappa`, and the `raw` innovations.
-"""
 function get_priors(
     m::SPDE, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -152,18 +149,11 @@ function get_priors(
     
     push!(
         priors,
-        "$(p_names.raw) ~ MvNormal(zeros(spec.precomputes.n_latent), I)"
+        "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)"
     )
 
     return join(priors, "\n    ")
 end
-
-"""
-    get_updates(m::SPDE, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates code to construct the SPDE precision matrix, sample the latent field,
-and add it to the linear predictor `eta`, dispatching on the chosen method.
-"""
 function get_updates(
     m::SPDE, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -173,42 +163,42 @@ function get_updates(
     key = spec.key
     n_latent = spec.hyper.n_latent
 
-    # The spectral method is only simple for the isotropic case.
     use_spectral = m.method == :spectral && !(m.kappa isa Vector)
 
     spectral_code = """
         # --- SPDE Component (Spectral): $(key) ---
         let
-            local U = spec_registry[:$(key)].hyper.U
-            local L = spec_registry[:$(key)].hyper.L
+            hyper = spec_registry[:$(key)].hyper
+            U = hyper.U
+            L = hyper.L
             
-            # Eigenvalues of the final precision matrix are (kappa^2 + L_i)^2
-            local diag_vals = ($(p_names.kappa)^2 .+ L).^2
-            local diag_D = $(p_names.sigma) ./ sqrt.(diag_vals .+ M.noise)
+            diag_vals = ($(p_names.kappa)^2 .+ L).^2
+            diag_D = $(p_names.sigma) ./ sqrt.(diag_vals .+ M.noise)
             
-            local $(p_names.latent) = U * (diag_D .* $(p_names.raw))
+            $(p_names.latent) = U * (diag_D .* $(p_names.innovations))
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
 
     cholesky_base_code = """
-        local Q_laplacian = spec_registry[:$(key)].hyper.Q_template
-        local kappa_val = $(p_names.kappa)
-        local Q_kappa_term = if kappa_val isa AbstractVector
+        hyper = spec_registry[:$(key)].hyper
+        Q_laplacian = hyper.Q_template
+        kappa_val = $(p_names.kappa)
+        Q_kappa_term = if kappa_val isa AbstractVector
             Diagonal(kappa_val.^2)
         else
             kappa_val^2 * I
         end
-        local L_operator = Q_kappa_term + Q_laplacian
-        local Q_final = Symmetric(L_operator' * L_operator)
+        L_operator = Q_kappa_term + Q_laplacian
+        Q_final = Symmetric(L_operator' * L_operator)
     """
 
     cholesky_code = """
         # --- SPDE Component (Cholesky, AD-Safe): $(key) ---
         let
             $(cholesky_base_code)
-            local F = cholesky(Matrix(Q_final) + M.noise * I)
-            local $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
+            F = cholesky(Matrix(Q_final) + M.noise * I)
+            $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
@@ -217,8 +207,8 @@ function get_updates(
         # --- SPDE Component (Sparse Cholesky, Not AD-Safe): $(key) ---
         let
             $(cholesky_base_code)
-            local F = cholesky(Q_final + M.noise * I)
-            local $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
+            F = cholesky(Q_final + M.noise * I)
+            $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
     """
@@ -235,12 +225,7 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::SPDE, chain, M::NamedTuple, ...)
 
-Reconstructs the `SPDE` component's effect from posterior samples, dispatching
-on the method used during sampling.
-"""
 function get_effects(
     m::SPDE, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
@@ -252,15 +237,25 @@ function get_effects(
     Q_laplacian = spec.hyper.Q_template
     s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
     use_spectral = m.method == :spectral && !(m.kappa isa Vector)
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        kappa_name = _find_parameter(p_names_vec, string(spec.key), "kappa", k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+
+        if isempty(sigma_name) || isempty(kappa_name) || isempty(innovations_name)
+            @warn "Parameters for SPDE component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
         kappa_samples = get_params_vector(
-            chain, string(p_names.kappa), m.kappa isa Vector ? length(m.kappa) : 1
+            chain, kappa_name, m.kappa isa Vector ? length(m.kappa) : 1
         )
-        raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
+        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, N_total, n_samples)
 
@@ -271,7 +266,7 @@ function get_effects(
                 kappa_val = kappa_samples[i, 1]
                 diag_vals = (kappa_val^2 .+ L).^2
                 diag_D = sigma_samples[i] ./ sqrt.(diag_vals .+ noise)
-                latent_field = U * (diag_D .* raw_samples[i, :])
+                latent_field = U * (diag_D .* innovations_samples[i, :])
             else # Cholesky methods
                 current_kappa = kappa_samples[i, :]
                 Q_kappa_term = if m.kappa isa Vector
@@ -282,7 +277,7 @@ function get_effects(
                 L_operator = Q_kappa_term + Q_laplacian
                 Q_final = Symmetric(L_operator' * L_operator)
                 F = cholesky(Matrix(Q_final) + noise * I)
-                latent_field = sigma_samples[i] .* (F.L' \ raw_samples[i, :])
+                latent_field = sigma_samples[i] .* (F.L' \ innovations_samples[i, :])
             end
             effect_k[:, i] = view(latent_field, s_idx_full)
         end

@@ -6,7 +6,7 @@ approximates the full GP kernel matrix with a low-rank version based on a small 
 of `n_inducing` points, making it scalable for larger datasets.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 The Nyström method approximates the \$N \\times N\$ kernel matrix \$K_{XX}\$ of the data
@@ -30,17 +30,25 @@ where \$K_{ZZ} = L_{ZZ}L_{ZZ}^T\$. The final effect is computed as:
 - `:noncentered` (default): A non-centered parameterization where the latent values
   at inducing points are constructed from standard normal innovations. Recommended
   for efficient MCMC sampling.
-- `:centered`: A centered parameterization where the latent values at inducing points
-  are sampled directly from their `MvNormal` distribution. This is a didactic
-  alternative that can be less efficient.
+- `:centered` (didactic): A centered parameterization where the latent values at inducing points
+  are sampled directly from their `MvNormal` distribution. This can be less efficient.
 
-# Fields
-- `lengthscale::Union{Distribution, Vector{<:Distribution}}`: The prior for the
-  kernel lengthscale(s).
-- `sigma::Distribution`: The prior for the marginal standard deviation of the GP.
-- `n_inducing::Int`: The number of inducing points to use for the approximation.
-- `kernel::String`: The name of the kernel function (e.g., "se", "matern32").
-- `method::Symbol`: The parameterization method, `:noncentered` or `:centered`.
+# Inputs
+- **Required**:
+  - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
+- **Optional (in `random()` call)**:
+  - `n_inducing`: `Int`, the number of inducing points. Default: `20`.
+  - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`). Default: `"se"`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP. Default: `Exponential(1.0)`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default: `:noncentered`.
+  - `knot_method`: `Symbol`, method for placing inducing points (`:kmeans`, `:random`, `:quantile`, `:range`). Default: `:kmeans`.
+
+# Outputs (Parameter Names)
+- `sigma_<key>`: The marginal standard deviation of the GP.
+- `ls_<key>`: The kernel lengthscale(s).
+- `innovations_<key>`: Raw standard normal innovations for the inducing points (for `:noncentered`).
+- `latent_<key>`: The latent values at the inducing points (for `:centered`).
 """
 struct Nystrom <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
@@ -62,12 +70,6 @@ COMPONENT_CONSTRUCTORS[:nystrom] = (p, params) -> Nystrom(
 
 MODEL_TO_STRUCTURE_MAP[:nystrom] = :smooth
 
-"""
-    get_datastructures!(m_type::Type{<:Nystrom}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `Nystrom` component. It ensures coordinate
-variables are provided, stores them, and generates the inducing point locations.
-"""
 function get_datastructures!(m_type::Type{<:Nystrom}, M::Dict, mod_data::Dict)::Bool
     variables = mod_data[:variables]
     params = mod_data[:params]
@@ -90,18 +92,12 @@ function get_datastructures!(m_type::Type{<:Nystrom}, M::Dict, mod_data::Dict)::
 
     n_inducing = get(params, :n_inducing, 20)
     knot_method = get(params, :knot_method, :kmeans)
-    Z_inducing = generate_inducing_points(coords, n_inducing; method=knot_method)
+    Z_inducing = generate_inducing_points(coords, n_inducing; method=string(knot_method))
     mod_data[:params][:Z_inducing] = Z_inducing
 
     return true
 end
 
-"""
-    get_precomputes(m::Nystrom, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-For the `Nystrom` component, this function stores the coordinate matrix and the
-inducing point locations. The number of latent variables is `n_inducing`.
-"""
 function get_precomputes(m::Nystrom, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords = get(mod_data[:params], :coords, nothing)
     if isnothing(coords)
@@ -116,17 +112,10 @@ function get_precomputes(m::Nystrom, M::NamedTuple, mod_data::Dict)::NamedTuple
     return (
         coords=coords,
         Z_inducing=Z_inducing,
-        n_latent=m.n_inducing # The latent variable `u` is of size n_inducing
+        n_latent=m.n_inducing
     )
 end
 
-
-"""
-    get_priors(m::Nystrom, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for `sigma` and `lengthscale`. For the `:noncentered` method,
-it also defines a prior for the `raw` innovations for the inducing points.
-"""
 function get_priors(
     m::Nystrom, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -145,58 +134,52 @@ function get_priors(
     end
     
     if m.method == :noncentered
-        push!(priors, "$(p_names.raw) ~ MvNormal(zeros($(m.n_inducing)), I)")
+        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
     end
 
     return join(priors, "\n    ")
 end
 
-
-"""
-    get_updates(m::Nystrom, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code for constructing the `Nystrom` sparse GP effect,
-dispatching on the chosen method.
-"""
 function get_updates(
     m::Nystrom, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    key = spec.key
     
     common_code = """
-        local precomputes = spec_registry[:$(spec.key)].precomputes
-        local X_coords = precomputes.coords
-        local Z_coords = precomputes.Z_inducing
-        local kernel_type = Symbol("$(m.kernel)")
+        hyper = spec_registry[:$(key)].hyper
+        X_coords = hyper.coords
+        Z_coords = hyper.Z_inducing
+        kernel_type = Symbol("$(m.kernel)")
         
-        local K_UU = evaluate_kernel_matrix(
+        K_UU = evaluate_kernel_matrix(
             Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
         )
-        local K_XU = evaluate_cross_kernel_matrix(
+        K_XU = evaluate_cross_kernel_matrix(
             X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
         )
     """
 
     noncentered_code = """
-        # --- Nystrom Sparse GP (Non-Centered): $(spec.key) ---
+        # --- Nystrom Sparse GP (Non-Centered): $(key) ---
         let
             $(common_code)
-            local L_UU = cholesky(Symmetric(K_UU)).L
-            local u_latent = L_UU * $(p_names.raw)
+            L_UU = cholesky(Symmetric(K_UU)).L
+            u_latent = L_UU * $(p_names.innovations)
             $(p_names.latent) = K_XU * (K_UU \\ u_latent)
             $(eta_target) .+= $(p_names.latent)
         end
     """
 
     centered_code = """
-        # --- Nystrom Sparse GP (Centered): $(spec.key) ---
+        # --- Nystrom Sparse GP (Centered): $(key) ---
         let
             $(common_code)
-            local u_latent ~ MvNormal(zeros($(m.n_inducing)), Symmetric(K_UU))
-            $(p_names.latent) = K_XU * (K_UU \\ u_latent)
-            $(eta_target) .+= $(p_names.latent)
+            $(p_names.latent) ~ MvNormal(zeros(T, $(m.n_inducing)), Symmetric(K_UU))
+            local nystrom_effect = K_XU * (K_UU \\ $(p_names.latent))
+            $(eta_target) .+= nystrom_effect
         end
     """
 
@@ -209,19 +192,13 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::Nystrom, chain, M::NamedTuple, ...)
-
-Reconstructs the `Nystrom` component's effect from posterior samples, dispatching
-on the method used during sampling.
-"""
 function get_effects(
     m::Nystrom, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
-    coords_train = spec.precomputes.coords
+    coords_train = spec.hyper.coords
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
         vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
@@ -230,22 +207,35 @@ function get_effects(
     end
     n_obs_full = size(coords_full, 1)
 
-    Z_inducing = spec.precomputes.Z_inducing
+    Z_inducing = spec.hyper.Z_inducing
     kernel_type = Symbol(m.kernel)
     noise = M.noise
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        ls_samples = get_params_vector(
-            chain, string(p_names.ls), m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        )
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        ls_name = _find_parameter(p_names_vec, string(spec.key), "ls", k, is_multivariate_model)
+
+        if isempty(sigma_name) || isempty(ls_name)
+            @warn "Parameters for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        ls_samples = get_params_vector(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
 
         effect_k = zeros(Float64, n_obs_full, n_samples)
 
         if m.method == :noncentered
-            raw_samples = get_params_vector(chain, string(p_names.raw), m.n_inducing)
+            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            if isempty(innovations_name)
+                @warn "Innovations for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
+                continue
+            end
+            innovations_samples = get_params_vector(chain, innovations_name, m.n_inducing)
             for i in 1:n_samples
                 current_sigma = sigma_samples[i]
                 current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i, 1]
@@ -254,12 +244,17 @@ function get_effects(
                 K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
                 
                 L_UU = cholesky(Symmetric(K_UU)).L
-                u_latent = L_UU * raw_samples[i, :]
+                u_latent = L_UU * innovations_samples[i, :]
                 effect_k[:, i] = K_XU * (K_UU \ u_latent)
             end
         else # :centered
-            # For centered, the latent values at inducing points are sampled directly.
-            u_latent_samples = get_params_vector(chain, string(p_names.latent), m.n_inducing)
+            latent_name = _find_parameter(p_names_vec, string(spec.key), "latent", k, is_multivariate_model)
+            if isempty(latent_name)
+                @warn "Latent values for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
+                continue
+            end
+            u_latent_samples = get_params_vector(chain, latent_name, m.n_inducing)
             for i in 1:n_samples
                 current_sigma = sigma_samples[i]
                 current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i, 1]

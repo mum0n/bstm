@@ -6,32 +6,31 @@ triangulation of knot points. This method is particularly well-suited for modeli
 smooth spatial effects on irregular domains.
 
 # Version
-v1.0.2 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
-The component models a function f(s) where s is a 2D coordinate.
-1.  **Knot Triangulation**: A set of N_knots knot points are defined over the
+The component models a function \$f(s)\$ where \$s\$ is a 2D coordinate.
+1.  **Knot Triangulation**: A set of \$N_{\\text{knots}}\$ knot points are defined over the
     spatial domain. A Delaunay triangulation is performed on these knots to create a
     mesh of non-overlapping triangles.
-2.  **Barycentric Coordinates**: For any observation point s_obs, the model finds
+2.  **Barycentric Coordinates**: For any observation point \$s_{\\text{obs}}\$, the model finds
     the triangle in the mesh that encloses it. It then computes the barycentric
-    coordinates (λ₁, λ₂, λ₃) of s_obs with respect to the triangle's vertices
-    (v₁, v₂, v₃). These coordinates are non-negative weights that sum to 1.
+    coordinates \$(\\lambda_1, \\lambda_2, \\lambda_3)\$ of \$s_{\\text{obs}}\$ with respect to the triangle's vertices
+    \$ (v_1, v_2, v_3) \$. These coordinates are non-negative weights that sum to 1.
 3.  **Basis Construction**: The barycentric coordinates form the basis functions. For
-    an observation i falling in a triangle with vertices (j, k, l), the
-    corresponding row in the basis matrix B will have non-zero values only at
-    columns j, k, l, where B[i,j] = λ₁, B[i,k] = λ₂, and B[i,l] = λ₃.
+    an observation \$i\$ falling in a triangle with vertices \$ (j, k, l) \$, the
+    corresponding row in the basis matrix \$B\$ will have non-zero values only at
+    columns \$j, k, l\$, where \$B[i,j] = \\lambda_1\$, \$B[i,k] = \\lambda_2\$, and \$B[i,l] = \\lambda_3\$.
 4.  **Final Effect**: The final smooth effect is a linear combination of the basis
-    functions, with coefficients β (representing the latent field values at the
-    knots) scaled by a standard deviation σ:
-    f(s) = (B ⋅ (βσ))(s)
-    where β ∼ N(0, I).
+    functions, with coefficients \$\\beta\$ (representing the latent field values at the
+    knots) scaled by a standard deviation \$\\sigma\$:
+    \$f(s) = (B \\cdot \\beta)(s)\$, where the prior on \$\\beta\$ depends on the chosen method.
 
 # Computational Methods
 - `:noncentered` (default): A non-centered parameterization where coefficients are
   sampled from a standard normal and scaled by `sigma`. Recommended for AD.
 - `:centered`: A centered parameterization where coefficients are sampled directly
-  from `N(0, sigma^2)`. Didactic, can be less efficient.
+  from `N(0, sigma^2)`. Didactic, can be less efficient and not AD-friendly.
 - `:gmrfsmooth`: Imposes a spatial ICAR prior on the knot coefficients, encouraging
   a smoother interpolation surface. AD-safe via spectral decomposition.
 
@@ -40,6 +39,22 @@ The component models a function f(s) where s is a 2D coordinate.
   function coefficients.
 - `method::Symbol`: The computational method, one of `:noncentered`, `:centered`,
   or `:gmrfsmooth`.
+
+# Inputs
+- **Required**:
+  - Exactly two coordinate variables (e.g., `x`, `y`) passed to `random()`.
+- **Optional (in `random()` call)**:
+  - `nbins`: `Int`, the approximate number of knot points to use. Default: `25`.
+  - `knot_method`: `Symbol`, method for placing knots (`:quantile` or `:range`). Default: `:quantile`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the basis
+    function coefficients. Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:noncentered`, `:centered`, `:gmrfsmooth`).
+    Default: `:noncentered`.
+
+# Outputs (Parameter Names)
+- `sigma_<key>`: The standard deviation of the basis coefficients.
+- `innov_<key>`: The latent standard normal innovations for basis coefficients (for `:noncentered` and `:gmrfsmooth`).
+- `latent_<key>`: The latent basis coefficients (for `:centered`).
 """
 struct Barycentric <: ComponentModel
     sigma::UnivariateDistribution
@@ -143,7 +158,9 @@ function get_priors(
     priors = ["$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))"]
 
     if m.method in [:noncentered, :gmrfsmooth]
-        push!(priors, "$(p_names.innov) ~ MvNormal(zeros($(n_knots)), I)")
+        push!(priors, "$(p_names.innov) ~ MvNormal(zeros(T, $(n_knots)), I)")
+    elseif m.method == :centered
+        push!(priors, "$(p_names.latent) ~ MvNormal(zeros(T, $(n_knots)), I)")
     end
 
     return join(priors, "\n    ")
@@ -164,37 +181,41 @@ function get_updates(
 
     noncentered_code = """
         # --- Barycentric Component (Non-Centered): $(key) ---
-        let
-            local B = spec_registry[:$(key)].hyper.B
-            local scaled_coeffs = $(p_names.innov) .* $(p_names.sigma)
-            local barycentric_effect = B * scaled_coeffs
+        let # Access pre-computed data from spec_registry
+            hyper = spec_registry[:$(key)].hyper
+            B = hyper.B
+            innov_coeffs = $(p_names.innov)
+            scaled_coeffs = innov_coeffs .* $(p_names.sigma)
+            barycentric_effect = B * scaled_coeffs
             $(eta_target) .+= barycentric_effect
         end
     """
 
     centered_code = """
         # --- Barycentric Component (Centered): $(key) ---
-        let
-            local B = spec_registry[:$(key)].hyper.B
-            local n_knots = spec_registry[:$(key)].hyper.n_knots
-            local coeffs ~ MvNormal(zeros(n_knots), $(p_names.sigma)^2 * I)
-            local barycentric_effect = B * coeffs
+        let # Access pre-computed data from spec_registry
+            hyper = spec_registry[:$(key)].hyper
+            B = hyper.B
+            # Sample the latent coefficients directly from a centered prior.
+            $(p_names.latent) ~ MvNormal(zeros(T, hyper.n_knots), $(p_names.sigma)^2 * I)
+            coeffs = $(p_names.latent)
+            barycentric_effect = B * coeffs
             $(eta_target) .+= barycentric_effect
         end
     """
 
     gmrfsmooth_code = """
         # --- Barycentric Component (GMRF Smooth): $(key) ---
-        let
-            local B = spec_registry[:$(key)].hyper.B
-            local U = spec_registry[:$(key)].hyper.U
-            local L = spec_registry[:$(key)].hyper.L
-            
-            local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
+        let # Access pre-computed data from spec_registry
+            hyper = spec_registry[:$(key)].hyper
+            B = hyper.B
+            U = hyper.U
+            L = hyper.L
+            innov_coeffs = $(p_names.innov)
+            diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise) # Scale by sigma
             diag_D[1] = 0.0 # Sum-to-zero constraint for ICAR on knots
-            
-            local coeffs = U * (diag_D .* $(p_names.innov))
-            local barycentric_effect = B * coeffs
+            coeffs = U * (diag_D .* innov_coeffs)
+            barycentric_effect = B * coeffs
             $(eta_target) .+= barycentric_effect
         end
     """
@@ -204,6 +225,7 @@ function get_updates(
     elseif m.method == :gmrfsmooth; return gmrfsmooth_code;
     else; error("Unsupported method '$(m.method)' for Barycentric component."); end
 end
+
 
 """
     get_effects(m::Barycentric, chain, M::NamedTuple, ...)
@@ -218,6 +240,7 @@ function get_effects(
     structured_effects = Vector{Matrix{Float64}}()
     
     B_train = spec.hyper.B
+    is_multivariate_model = M.model_arch == "multivariate"
     B_full = if !isnothing(PS)
         coord_vars = get(spec.params, :positional_args, [])
         coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
@@ -227,31 +250,41 @@ function get_effects(
         B_train
     end
 
+    n_knots = spec.hyper.n_knots
+    p_names_vec = string.(FlexiChains.parameters(chain))
+
     for k in 1:outcomes_N
         p_names = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
         
-        local coeffs_samples
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        
+        if isempty(sigma_name)
+            @warn "Parameters for Barycentric component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, size(B_full, 1), n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        
+        local coeffs_samples_matrix
         if m.method == :centered
-            coeffs_samples = get_params_vector(chain, string(p_names.latent), spec.hyper.n_knots)'
-        else
-            innov_samples = get_params_vector(chain, string(p_names.innov), spec.hyper.n_knots)
-            coeffs_samples = zeros(spec.hyper.n_knots, n_samples)
+            latent_name = _find_parameter(p_names_vec, string(spec.key), "latent", k, is_multivariate_model)
+            coeffs_samples_matrix = get_params_vector(chain, latent_name, n_knots)
+        else # :noncentered or :gmrfsmooth
+            innov_name = _find_parameter(p_names_vec, string(spec.key), "innov", k, is_multivariate_model)
+            innov_samples_matrix = get_params_vector(chain, innov_name, n_knots)
+            coeffs_samples_matrix = zeros(n_knots, n_samples)
             if m.method == :noncentered
-                for i in 1:n_samples
-                    coeffs_samples[:, i] = innov_samples[i, :] .* sigma_samples[i]
-                end
+                coeffs_samples_matrix = innov_samples_matrix .* sigma_samples'
             else # :gmrfsmooth
                 U, L = spec.hyper.U, spec.hyper.L
+                noise_val = get(M, :noise, 1e-6)
                 for i in 1:n_samples
-                    diag_D = sigma_samples[i] ./ sqrt.(L .+ M.noise)
-                    diag_D[1] = 0.0
-                    coeffs_samples[:, i] = U * (diag_D .* innov_samples[i, :])
-                end
+                    diag_D = sigma_samples[i] ./ sqrt.(L .+ noise_val); diag_D[1] = 0.0; coeffs_samples_matrix[:, i] = U * (diag_D .* innov_samples_matrix[i, :]); end
             end
         end
         
-        effect_k = B_full * coeffs_samples
+        effect_k = B_full * coeffs_samples_matrix
         push!(structured_effects, effect_k)
     end
     

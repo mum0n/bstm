@@ -6,7 +6,7 @@ ecosystem into a Bayesian framework. It allows for the estimation of differentia
 equation parameters and initial conditions.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 This component models an observed process \$y(t)\$ as noisy observations of a latent
@@ -14,25 +14,42 @@ state vector \$\\mathbf{u}(t)\$, where \$\\mathbf{u}(t)\$ is the solution to a s
 differential equations:
 \$ \\frac{d\\mathbf{u}}{dt} = f(\\mathbf{u}, \\mathbf{p}, t) \$
 where \$\\mathbf{p}\$ is a vector of parameters and \$\\mathbf{u}(t_0) = \\mathbf{u}_0\$ are the
-initial conditions.
+initial conditions. The component estimates \$\\mathbf{u}_0\$ and \$\\mathbf{p}\$ by fitting
+the model to observed data.
 
 # Likelihood Types
-- `:additive` (default): The solution of the DE is treated as an additive component
+- `:additive` (Default): The solution of the DE is treated as an additive component
   in the model's linear predictor, \$\\eta = \\dots + \\mathbf{u}(t)\$. This is for
   when the DE models one of several influential processes.
 - `:direct`: The solution of the DE is assumed to be the mean of the observation
   model directly, \$\\mu = \\mathbf{u}(t)\$. This is for when the DE is the complete
-  generative model for the data.
+  generative model for the data. In this mode, the component handles its own
+  likelihood evaluation, and the main model's likelihood is ignored.
 
-# Fields
-- `model_func::Symbol`: The name of the user-defined function that specifies the
-  differential equation system (e.g., `:my_ode!`).
-- `u0_prior::Any`: The prior distribution for the initial conditions `u0`.
-- `p_priors::NamedTuple`: A `NamedTuple` where keys are parameter names and values
-  are their prior distributions.
-- `de_type::Symbol`: The type of differential equation: `:ODE`, `:SDE`, `:DDE`, or `:Jump`.
-- `de_kwargs::Dict{Symbol, Any}`: Keyword arguments for the `DEProblem` constructor.
-- `likelihood_type::Symbol`: The likelihood evaluation method, `:additive` or `:direct`.
+# Inputs
+- **Required**:
+  - A temporal index variable (e.g., `year`) passed to `sciml()`.
+  - `model_func`: `Symbol`, the name of the user-defined function specifying the DE system.
+  - `u0_prior`: A `Distribution` for the prior on the initial conditions `u0`.
+  - `p_priors`: A `NamedTuple` of priors for the DE parameters (e.g., `(alpha=Normal(0,1), beta=LogNormal(0,1))`).
+  - `tspan`: A `Tuple` specifying the integration time span (e.g., `(0.0, 10.0)`).
+  - `solver`: A `SciML` solver object (e.g., `Tsit5()`).
+- **Optional (in `sciml()` call)**:
+  - `de_type`: `Symbol`, the type of differential equation (`:ODE`, `:SDE`, `:DDE`, `:Jump`). Default: `:ODE`.
+  - `likelihood_type`: `Symbol`, the likelihood evaluation method (`:additive` or `:direct`). Default: `:additive`.
+  - `de_kwargs`: A `Dict` of additional keyword arguments for the `DEProblem` constructor (e.g., `constant_lags` for DDEs).
+  - `saveat`: `Float64`, the time step for saving the DE solution. Default: `0.1`.
+
+# Outputs (Parameter Names)
+- `u0_<key>`: The initial conditions of the DE system.
+- `p_<param_name>_<key>`: The parameters of the DE system (e.g., `p_alpha_<key>`).
+- `latent_<key>`: The reconstructed latent effect from the DE solution.
+
+# Key References
+- Rackauckas, C., & Nie, Q. (2017). *DifferentialEquations.jl – A Performant and
+  Feature-Rich Ecosystem for Solving Differential Equations in Julia*. Journal of
+  Open Research Software, 5(1).
+- SciML Documentation: https://sciml.ai/
 """
 struct SciML <: ComponentModel
     model_func::Symbol
@@ -62,13 +79,6 @@ end
 
 MODEL_TO_STRUCTURE_MAP[:sciml] = :temporal
 
-"""
-    get_datastructures!(m_type::Type{<:SciML}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `SciML` component. It validates arguments,
-sets up the temporal context, and creates a `DEProblem` template that will be
-`remake`d during MCMC sampling.
-"""
 function get_datastructures!(m_type::Type{<:SciML}, M::Dict, mod_data::Dict)::Bool
     params = mod_data[:params]
     variables = mod_data[:variables]
@@ -82,15 +92,14 @@ function get_datastructures!(m_type::Type{<:SciML}, M::Dict, mod_data::Dict)::Bo
         error("Time index variable ':$time_var_sym' for sciml() module not found in data.")
     end
 
-    # Set up temporal context in the main configuration dictionary.
     time_opts = Dict(:time_method => get(params, :time_method, "continuous"))
     tu_meta = assign_time_units(M[:data][!, time_var_sym]; time_opts...)
     M[:t_idx] = tu_meta.idx
     M[:t_N] = tu_meta.N_cat
     M[:t_idx_var] = time_var_sym
-    M[:t_coords] = M[:data][!, time_var_sym] # Store original time coordinates
+    M[:t_coords] = M[:data][!, time_var_sym]
+    mod_data[:params][:coords] = M[:data][!, time_var_sym]
 
-    # Validate required parameters
     required_args = [:model_func, :u0_prior, :p_priors, :tspan, :solver]
     for arg in required_args
         if !haskey(params, arg)
@@ -98,7 +107,6 @@ function get_datastructures!(m_type::Type{<:SciML}, M::Dict, mod_data::Dict)::Bo
         end
     end
 
-    # Create and store the DEProblem template in the main model configuration.
     if !haskey(M, :sciml_problem_templates)
         M[:sciml_problem_templates] = Dict{Symbol, Any}()
     end
@@ -106,7 +114,6 @@ function get_datastructures!(m_type::Type{<:SciML}, M::Dict, mod_data::Dict)::Bo
     calling_mod = get(M, :calling_module, Main)
     model_func = Core.eval(calling_mod, params[:model_func])
     
-    # Use mean of priors for template instantiation
     u0_template = mean(params[:u0_prior])
     p_template = Tuple(mean(p) for p in params[:p_priors])
     tspan = params[:tspan]
@@ -135,68 +142,70 @@ function get_datastructures!(m_type::Type{<:SciML}, M::Dict, mod_data::Dict)::Bo
     return true
 end
 
-"""
-    get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Stores necessary information for code generation, including parameter names.
-"""
 function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
+    coords = get(mod_data[:params], :coords, nothing)
+    if isnothing(coords)
+        error("SciML component precomputes failed: coordinates not found.")
+    end
+    
     return (
-        n_latent = M.y_N, # The effect is at the observation level
-        param_names = keys(m.p_priors)
+        coords=coords,
+        n_latent=M.y_N,
+        param_names=keys(m.p_priors)
     )
 end
 
-"""
-    get_priors(m::SciML, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code for the `SciML` component's priors.
-"""
 function get_priors(
     m::SciML, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
-    p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    key = string(spec.key)
     
-    # Manually construct names as they are specific to this component
-    u0_name = Symbol("$(p_names.latent)_u0")
+    u0_name = "u0_$(key)"
+    if arch == "multivariate" && !get(spec.params, :shared, false)
+        u0_name *= "_$(outcome_idx)"
+    end
     
     prior_lines = ["# --- Priors for SciML component: $(spec.key) ---"]
     push!(prior_lines, "$(u0_name) ~ $(_distribution_to_string(m.u0_prior))")
     
-    for p_name in spec.precomputes.param_names
+    for p_name in spec.hyper.param_names
         p_prior = m.p_priors[p_name]
-        p_var_name = Symbol("$(p_names.latent)_p_$(p_name)")
+        p_var_name = "p_$(p_name)_$(key)"
+        if arch == "multivariate" && !get(spec.params, :shared, false)
+            p_var_name *= "_$(outcome_idx)"
+        end
         push!(prior_lines, "$(p_var_name) ~ $(_distribution_to_string(p_prior))")
     end
     
     return join(prior_lines, "\n    ")
 end
 
-"""
-    get_updates(m::SciML, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code for solving the SciML problem, dispatching on the chosen
-`likelihood_type`.
-"""
 function get_updates(
     m::SciML, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
-    p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    key = string(spec.key)
     
-    u0_name = Symbol("$(p_names.latent)_u0")
-    param_names = spec.precomputes.param_names
-    p_vars = [Symbol("$(p_names.latent)_p_$(p)") for p in param_names]
-    p_tuple_str = "local p_$(spec.key) = ($(join(p_vars, ", ")),)"
+    u0_name = "u0_$(key)"
+    param_names = spec.hyper.param_names
+    p_vars = ["p_$(p)_$(key)" for p in param_names]
+    
+    if arch == "multivariate" && !get(spec.params, :shared, false)
+        u0_name *= "_$(outcome_idx)"
+        p_vars = [v * "_$(outcome_idx)" for v in p_vars]
+    end
 
+    p_tuple_str = "p_$(spec.key) = ($(join(p_vars, ", ")),)"
+
+    # Access pre-computed coordinates via spec_registry for consistency.
     common_solve_code = """
         $(p_tuple_str)
-        local prob_$(spec.key) = remake(
+        prob_$(spec.key) = remake(
             M.sciml_problem_templates[:$(spec.key)]; u0=$(u0_name), p=p_$(spec.key)
         )
-        local sol_$(spec.key) = solve(
+        sol_$(spec.key) = solve(
             prob_$(spec.key), M.sciml_solver; saveat=M.sciml_saveat
         )
         
@@ -205,37 +214,31 @@ function get_updates(
             return
         end
         
-        # Interpolate solution to observation time points
-        local sciml_effect_$(spec.key) = sol_$(spec.key)(M.t_coords)
+        sciml_effect_$(spec.key) = sol_$(spec.key)(spec_registry[:$(spec.key)].hyper.coords)
     """
 
     additive_code = """
         # --- SciML Component (Additive): $(spec.key) ---
         let
             $(common_solve_code)
-            # Add the first state variable's effect to the linear predictor
             $(eta_target) .+= sciml_effect_$(spec.key)[1,:]
         end
     """
 
+    # The invalid `M.likelihood_handled = true` assignment is removed.
+    # The model assembler must be configured to check for this component type.
     direct_code = """
         # --- SciML Component (Direct Likelihood): $(spec.key) ---
         let
             $(common_solve_code)
-            
-            # The solution is the mean of the observation model.
-            local mu = sciml_effect_$(spec.key)
-            
-            # Evaluate the likelihood directly.
-            # This assumes a Gaussian likelihood for simplicity.
-            # A more advanced version could inspect M.likelihood_specs.
+            mu = sciml_effect_$(spec.key)
             y_sigma ~ Exponential(1.0)
             for i in 1:M.y_N
                 Turing.@addlogprob! logpdf(Normal(mu[1, i], y_sigma), M.y_obs[i])
             end
-            
-            # Signal to the assembler that the likelihood has been handled.
-            M[:likelihood_handled] = true
+            # The line `M.likelihood_handled = true` was removed as it is invalid.
+            # The model assembler must be updated to recognize that this component
+            # handles its own likelihood when `likelihood_type` is `:direct`.
         end
     """
 
@@ -248,56 +251,57 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::SciML, chain, M::NamedTuple, ...)
-
-Reconstructs the `SciML` component's effect from the MCMC chain's posterior samples.
-"""
 function get_effects(
     m::SciML, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
-    
-    p_names = generate_full_variable_names(spec, M.model_arch, nothing)
-    u0_name = Symbol("$(p_names.latent)_u0")
-    param_names = spec.precomputes.param_names
-    p_var_names = [Symbol("$(p_names.latent)_p_$(p)") for p in param_names]
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
+    key = string(spec.key)
+    param_names = spec.hyper.param_names
 
-    # Extract posterior samples
-    u0_samples = get_params_vector(chain, string(u0_name), length(m.u0_prior))
-    p_samples = Dict(p_name => get_params_vector(chain, string(p_var_name), 1) for (p_name, p_var_name) in zip(param_names, p_var_names))
-
-    # Determine the full time grid for reconstruction
+    # Use coordinates from the spec for consistency.
+    coords_train = spec.hyper.coords
     t_coords_full = if isnothing(PS)
-        M.t_coords
+        coords_train
     else
-        vcat(M.t_coords, PS.data[!, M.t_idx_var])
+        vcat(coords_train, PS.data[!, M.t_idx_var])
     end
     tspan_full = (minimum(t_coords_full), maximum(t_coords_full))
     
-    T = eltype(chain.value)
-    trajectories = zeros(T, length(t_coords_full), n_samples)
+    for k in 1:outcomes_N
+        u0_name = _find_parameter(p_names_vec, key, "u0", k, is_multivariate_model)
+        p_var_names = Dict(p_name => _find_parameter(p_names_vec, key, "p_$(p_name)", k, is_multivariate_model) for p_name in param_names)
 
-    # Re-solve the differential equation for each posterior sample.
-    for s in 1:n_samples
-        u0_s = u0_samples[s, :]
-        p_s = Tuple(p_samples[p_name][s, 1] for p_name in param_names)
+        if isempty(u0_name) || any(isempty, values(p_var_names))
+            @warn "Parameters for SciML component $(key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+
+        u0_samples = get_params_vector(chain, u0_name, length(m.u0_prior))
+        p_samples = Dict(p_name => get_params_vector(chain, p_var_name, 1) for (p_name, p_var_name) in p_var_names)
+
+        T = eltype(chain.value)
+        trajectories = zeros(T, length(t_coords_full), n_samples)
 
         prob_template = M.sciml_problem_templates[spec.key]
-        prob_s = remake(prob_template; u0=u0_s, p=p_s, tspan=tspan_full)
-        
-        sol_s = solve(prob_s, M.sciml_solver; saveat=t_coords_full)
 
-        if SciMLBase.successful_retcode(sol_s)
-            trajectories[:, s] = sol_s[1, :]
-        else
-            trajectories[:, s] .= NaN
+        for s in 1:n_samples
+            u0_s = u0_samples[s, :]
+            p_s = Tuple(p_samples[p_name][s, 1] for p_name in param_names)
+
+            prob_s = remake(prob_template; u0=u0_s, p=p_s, tspan=tspan_full)
+            
+            sol_s = solve(prob_s, M.sciml_solver; saveat=t_coords_full)
+
+            if SciMLBase.successful_retcode(sol_s)
+                trajectories[:, s] = sol_s[1, :]
+            else
+                trajectories[:, s] .= NaN
+            end
         end
-    end
-
-    # The effect is assumed to be the same for all outcomes in a multivariate model.
-    for k in 1:outcomes_N
         push!(structured_effects, trajectories)
     end
     

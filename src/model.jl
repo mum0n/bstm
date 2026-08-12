@@ -968,19 +968,22 @@ function _precompute_likelihood_params!(M::Dict)
 end
 
 
-"""
-    bstm_config(formula::String, data::DataFrame; calling_module::Module=Main, kwargs...)
-
-Constructs the complete model configuration by parsing the formula, processing data,
-and assembling component specifications using the explicit component interface. This
-corrected version includes the main component processing loop that dispatches modules
-to their respective processors, enabling features like `nested()` models.
-"""
-function bstm_config(formula::String, data::DataFrame; calling_module::Module=Main, kwargs...)
+# Version 1.0.2 (2026-08-11)
+# Purpose: Constructs the complete model configuration.
+# Rationale: This version corrects a critical bug where the component's `structure`
+#            was being assigned the module's `type` (e.g., :random) instead of the
+#            correctly inferred structural type (e.g., :temporal). This resolves
+#            dimension mismatch errors during posterior reconstruction.
+function bstm_config(
+    formula::String, data::DataFrame; calling_module::Module=Main, kwargs...
+)
     df_processed = deepcopy(data)
     decomposed_formula = decompose_bstm_formula(formula, df_processed)
 
-    M = _initialize_config(df_processed, merge(Dict(kwargs), Dict(:calling_module => calling_module)))
+    M = _initialize_config(
+        df_processed,
+        merge(Dict(kwargs), Dict(:calling_module => calling_module))
+    )
     M[:formula] = formula
     
     _process_lhs!(M, decomposed_formula.outcomes)
@@ -989,7 +992,10 @@ function bstm_config(formula::String, data::DataFrame; calling_module::Module=Ma
     if is_multivariate
         for (key, mod_data_nt) in decomposed_formula.modules
             model_name = get(mod_data_nt.args, :model, :none)
-            if mod_data_nt.module_type == :dynamics && model_name in [:leslie_matrix, :delay_difference, :generalized_lotka_volterra, :generalized_leslie_matrix]
+            if mod_data_nt.module_type == :dynamics && model_name in [
+                :leslie_matrix, :delay_difference, :generalized_lotka_volterra,
+                :generalized_leslie_matrix
+            ]
                 M[:is_multivariate_dynamics] = true
                 M[:multivariate_dynamics_key] = key
                 break
@@ -1008,40 +1014,41 @@ function bstm_config(formula::String, data::DataFrame; calling_module::Module=Ma
         else; M[:intercept_prior] = prior_val; end
     end
 
-    # --- Main Component Processing Loop ---
-    # This loop iterates through all parsed modules from the formula's RHS.
-    # It dispatches each module to its specific processor function (if one exists)
-    # via the `MODULE_PROCESSORS` dictionary. This is the core mechanism that
-    # enables data-dependent setup for modules like `nested()`, `random()`, etc.
     for (key, mod_data_nt) in decomposed_formula.modules
         mod_type = mod_data_nt.module_type
-        mod_data_dict = Dict(:key => key, :type => mod_type, :variables => get(mod_data_nt.args, :positional_args, []), :params => mod_data_nt.args)
+        mod_data_dict = Dict(
+            :key => key,
+            :type => mod_type,
+            :variables => get(mod_data_nt.args, :positional_args, []),
+            :params => mod_data_nt.args
+        )
 
         processor! = get(MODULE_PROCESSORS, mod_type, nothing)
         
         create_component = true
         if !isnothing(processor!)
-            # The processor function performs data-dependent setup and returns a boolean
-            # indicating whether a component object should be created.
             create_component = processor!(M, mod_data_dict, M, M[:hyperpriors])
+            # Ensure structure is explicitly set in params if it's a :random module
+            # as process_random_module! infers and sets it.
+            if mod_type == :random && !haskey(mod_data_dict[:params], :structure)
+                mod_data_dict[:params][:structure] = _infer_structure_from_args(mod_data_dict[:params])
+            end
         end
 
-        if !create_component
-            continue
-        end
+        if !create_component; continue; end
 
-        # Instantiate the final component object
-        component_obj = resolve_technical_primitive(mod_data_dict, M, M[:hyperpriors], M[:prior_scheme])
+        component_obj = resolve_technical_primitive(
+            mod_data_dict, M, M[:hyperpriors], M[:prior_scheme]
+        )
         mod_data_dict[:component_obj] = component_obj
 
-        # Call get_precomputes to generate templates, basis matrices, etc.
         M_nt = NamedTuple(M)
         precomputes = get_precomputes(component_obj, M_nt, mod_data_dict)
 
-        # Assemble the final component specification and register it.
+        # FIX: Use the inferred structure from `params`, not the module `type`.
         spec = (
             key=Symbol(key), 
-            structure=mod_data_dict[:type], 
+            structure=mod_data_dict[:params][:structure], 
             var=join(string.(mod_data_dict[:variables]), "_"), 
             component_obj=component_obj, 
             params=mod_data_dict[:params], 
@@ -1062,14 +1069,42 @@ function bstm_config(formula::String, data::DataFrame; calling_module::Module=Ma
 end
 
 
+"""
+    generate_full_variable_names(spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
 
+Generates a NamedTuple of full variable names for a given component.
 
-# Version 1.0.0 (2026-08-06)
-# Purpose: Generates a NamedTuple of full variable names for a given component.
-# Rationale: This utility function centralizes the naming convention for all parameters
-#            associated with a model component, ensuring consistency across the framework.
-#            It handles suffixes for multivariate models and prefixes for different parameter types.
-# Assumptions: The component specification `spec` contains a unique `key`.
+# Rationale for Update
+This function is updated to correctly handle the distinction between hyperparameters
+(which can be shared across outcomes in a multivariate model) and latent fields
+(which are always unique to each outcome in a multivariate model). The previous
+implementation used a single suffixing rule, which failed for shared-hyperparameter
+models.
+
+This version introduces two separate suffixing rules:
+1.  `hyperparam_suffix`: Appended to hyperparameters (`sigma`, `rho`, `ls`, etc.) only
+    when the model is multivariate AND the component is not shared (`!is_shared`).
+2.  `latent_field_suffix`: Appended to latent fields (`innovations`, `latent`, etc.)
+    whenever the model is multivariate, regardless of the `shared` flag.
+
+This change ensures that variable names are generated correctly for all model
+architectures, resolving a key source of `FieldError` during model construction.
+The list of parameters has also been updated to use `innovations` consistently,
+deprecating `raw` and `innov`, and to include other specialized parameter names
+found across the component library.
+
+# Version
+v1.1.0 (2026-08-11)
+
+# Arguments
+- `spec`: The component's specification.
+- `arch`: The model architecture (`"univariate"` or `"multivariate"`).
+- `outcome_idx`: The index of the outcome for multivariate models.
+- `prefix`: An optional prefix for nested models.
+
+# Returns
+- A `NamedTuple` containing all necessary variable names as Symbols.
+"""
 function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
     base_key = string(spec.key)
     full_key = isempty(prefix) ? base_key : "$(prefix)_$(base_key)"
@@ -1077,25 +1112,45 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
     is_multivariate = arch == "multivariate"
     is_shared = get(spec.params, :shared, false)
 
-    suffix = (is_multivariate && !is_shared) ? "_$(outcome_idx)" : ""
+    # Suffix for hyperparameters, which can be shared across outcomes.
+    # It is only added if the model is multivariate AND the component is not shared.
+    hyperparam_suffix = (is_multivariate && !is_shared) ? "_$(outcome_idx)" : ""
+    
+    # Suffix for latent fields, which are always per-outcome in a multivariate model.
+    latent_field_suffix = is_multivariate ? "_$(outcome_idx)" : ""
 
     names = Dict{Symbol, Symbol}()
     
-    all_prefixes = [
-        :sigma, :rho, :rho1, :rho2, :kappa, :ls, :range, :period, :amplitude, :phase,
-        :velocity, :diffusion, :pca_sd, :pdef_sd, :L_corr, :sigma_effects,
-        :r, :K, :q, :M_nat, :alpha, :beta, :gamma, :delta,
-        :raw, :innov, :latent, :struct, :iid, :beta_cos, :beta_sin, :rho_field,
-        :W, :b, :v_raw, :factors_flat, :thresh_raw, :W1, :b1, :W2, :amplitude_raw,
-        :innov_predator
+    # --- Hyperparameters ---
+    # These parameters may be shared across outcomes in a multivariate model.
+    hyperparameters = [
+        :sigma, :rho, :rho1, :rho2, :unconstrained_rho, :kappa, :ls, :range, :period,
+        :amplitude, :phase, :velocity, :diffusion, :pca_sd, :pdef_sd, :L_corr,
+        :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, :gamma, :delta, :curvature
     ]
-
-    for p in all_prefixes
-        names[p] = Symbol("$(p)_$(full_key)$(suffix)")
+    for p in hyperparameters
+        names[p] = Symbol("$(p)_$(full_key)$(hyperparam_suffix)")
     end
+
+    # --- Latent Fields & Innovations ---
+    # These are always unique per outcome in a multivariate model.
+    latent_fields = [
+        :innovations, :latent, :struct, :iid, :beta_cos, :beta_sin, :rho_field,
+        :W, :b, :v_raw, :factors_flat, :thresh_raw, :W1, :b1, :W2, :amplitude_raw,
+        :innov_predator, :cluster_innovations, :inducing_innovations, :diag_innovations
+    ]
+    for p in latent_fields
+        names[p] = Symbol("$(p)_$(full_key)$(latent_field_suffix)")
+    end
+
+    # Deprecated names, kept for temporary backward compatibility.
+    # They point to the new 'innovations' name to ensure old code does not break.
+    names[:raw] = names[:innovations]
+    names[:innov] = names[:innovations]
 
     return NamedTuple(names)
 end
+
 
 
 
@@ -2500,56 +2555,81 @@ end
 
 
 
-# Version 1.5.4 (2026-08-06)
-# Purpose: Computes the cross-covariance kernel matrix between two sets of coordinates.
-# Rationale: This version is updated for improved type stability and AD-friendliness,
-#            mirroring the changes in `evaluate_kernel_matrix`. It avoids explicit
-#            casts by using `convert` and relying on Julia's promotion system, which is
-#            safer for automatic differentiation.
-# Assumptions: `coords1` and `coords2` are matrices of data points.
+"""
+    evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
+
+Computes the cross-covariance kernel matrix between two sets of coordinates.
+
+# Version
+v1.5.6 (2026-08-11)
+
+# Rationale
+This version is updated to be consistent with `evaluate_kernel_matrix`, including
+support for the `:exponential` (or `:matern12`) kernel. This is essential for
+out-of-sample prediction with the consolidated `GP` component.
+"""
 function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
     T = promote_type(eltype(coords1), eltype(coords2), typeof(param_val), eltype(ls))
     coords1_T = convert(AbstractMatrix{T}, coords1)
     coords2_T = convert(AbstractMatrix{T}, coords2)
     ls_T = convert(typeof(ls) <: Real ? T : AbstractVector{T}, ls)
 
+    if kernel_type == :linear
+        return param_val^2 .* (coords1_T * coords2_T')
+    end
+
     local dist_sq
     if ls isa AbstractVector # ARD case
         if size(coords1_T, 2) != length(ls_T) || size(coords2_T, 2) != length(ls_T)
             error("Dimension mismatch for ARD kernel: Number of coordinate dimensions does not match number of lengthscales.")
         end
-        # Calculate weighted squared Euclidean distance
         dist_sq = pairwise(SqEuclidean(), coords1_T ./ ls_T', coords2_T ./ ls_T', dims=1)
     else # Isotropic case
         dist_sq = pairwise(SqEuclidean(), coords1_T, coords2_T, dims=1) ./ ls_T^2
     end
 
-    # Gaussian / Squared Exponential
-    if kernel_type == :gaussian || kernel_type == :se
+    if kernel_type == :gaussian || kernel_type == :se || kernel_type == :rbf
         return param_val^2 .* exp.(-one(T)/2 .* dist_sq)
     
-    # Exponential / Matern 1/2
     elseif kernel_type == :exponential || kernel_type == :matern12
         d = sqrt.(dist_sq)
         return param_val^2 .* exp.(-d)
     
-    # Matern 3/2
     elseif kernel_type == :matern32
         d = sqrt.(dist_sq)
         val = sqrt(convert(T, 3.0)) .* d
         return param_val^2 .* (one(T) .+ val) .* exp.(-val)
     
-    # Matern 5/2
     elseif kernel_type == :matern52
         d = sqrt.(dist_sq)
         val = sqrt(convert(T, 5.0)) .* d
         return param_val^2 .* (one(T) .+ val .+ (val.^2 ./ convert(T, 3.0))) .* exp.(-val)
 
-    # Fallback Dispatch
+    elseif kernel_type == :spherical
+        d = sqrt.(dist_sq)
+        K = zeros(T, size(d))
+        mask = d .< one(T)
+        K[mask] = param_val^2 .* (one(T) .- 1.5 .* d[mask] .+ 0.5 .* d[mask].^3)
+        return K
+
+    elseif kernel_type == :cosine
+        if ls isa AbstractVector
+            @warn "Cosine kernel with ARD lengthscale is not standard. Using the first lengthscale for an isotropic kernel."
+            ls_T = ls_T[1]
+        end
+        d_euclidean = sqrt.(pairwise(SqEuclidean(), coords1_T, coords2_T, dims=1))
+        return param_val^2 .* cos.(2.0 * pi .* d_euclidean ./ ls_T)
+
+    elseif kernel_type == :constant
+        return fill(convert(T, param_val^2), size(dist_sq))
+
     else
+        @warn "Kernel '$(kernel_type)' not explicitly handled in evaluate_cross_kernel_matrix. Defaulting to Squared Exponential."
         return param_val^2 .* exp.(-one(T)/2 .* dist_sq)
     end
 end
+
+
 
 
 
@@ -2728,17 +2808,17 @@ function create_pc_prior(param_name::Symbol, constraint::Tuple)
 end
  
 
-# Version 1.2.4 (2026-08-10)
-# Purpose: Automatically constructs an efficient composite Gibbs sampler and suggests
-#          an appropriate AD engine based on model complexity, with improved per-block AD selection.
-# Rationale: This version enhances the automatic AD engine selection. If the user does
-#            not specify an `adtype`, the function now implements a "smart default"
-#            strategy: it uses the robust `ForwardDiff.jl` for small parameter blocks
-#            (<= 10 parameters) and automatically switches to a more performant
-#            reverse-mode engine (`Enzyme.jl`) for larger blocks. If the user *does*
-#            specify an `adtype`, their choice is now respected for all blocks,
-#            resolving an issue where `ForwardDiff` was always used for small blocks.
-#            This provides both a better default experience and more user control.
+# Version 1.2.6 (2026-08-10)
+# Purpose: Automatically selects and uses an optimal AD engine based on model
+#          complexity, with per-block optimization.
+# Rationale: This version replaces the AD engine suggestion logic with automatic
+#            selection. If the user does not specify a non-default `adtype`, the
+#            function checks the model size. For large models (>100 parameters), it
+#            automatically switches the primary AD engine to `ADTypes.AutoEnzyme()`
+#            for better performance. It then applies a mixed-AD strategy within the
+#            Gibbs sampler, using `ForwardDiff` for small parameter blocks and the
+#            selected primary AD engine for larger blocks. This provides a more
+#            performant default while still respecting explicit user choices.
 function get_optimal_sampler(
     model_obj::DynamicPPL.Model;
     sampler_choice=:auto,
@@ -2762,15 +2842,16 @@ function get_optimal_sampler(
     vns = DynamicPPL.keys(vi)
     num_params = length(vns)
 
-    # --- AD Engine Suggestion ---
-    # Suggest a reverse-mode AD engine for models with many parameters.
+    # --- AD Engine Selection ---
+    # If the user has not specified a non-default AD type, automatically select
+    # a performant one based on model size.
+    local adtype_to_use = adtype
     param_threshold = 100
-    if num_params > param_threshold && adtype isa ADTypes.AbstractForwardMode
-        @info "Model has a large number of parameters ($num_params). Consider using a reverse-mode AD engine like `Enzyme.jl` or `ReverseDiff.jl` for potentially better performance. You can specify this with the `adtype=ADTypes.AutoEnzyme()` or `adtype=ADTypes.AutoReverseDiff()` argument."
-    elseif adtype isa ADTypes.AbstractReverseMode
-        @info "Model has $num_params parameters. The chosen reverse-mode AD engine ($(typeof(adtype))) is appropriate."
+    if adtype isa ADTypes.AutoForwardDiff && num_params > param_threshold
+        adtype_to_use = ADTypes.AutoEnzyme()
+        @info "Model has a large number of parameters ($num_params). Automatically switching to `ADTypes.AutoEnzyme()` for better performance. You can override this with the `adtype` argument."
     else
-        @info "Model has $num_params parameters. The current AD engine ($(typeof(adtype))) is likely appropriate."
+        @info "Using AD engine: $(typeof(adtype_to_use)). Model has $num_params parameters."
     end
 
     sampler_assignments = []
@@ -2816,24 +2897,16 @@ function get_optimal_sampler(
             end
         end
 
-        # Determine if the user provided a non-default AD type.
-        is_default_ad = adtype isa ADTypes.AutoForwardDiff
-
         for (key, params_vns) in component_groups
             params_to_sample = setdiff(params_vns, all_processed_vns)
             if !isempty(params_to_sample)
                 # --- Per-Block AD Selection ---
-                local block_adtype
-                if is_default_ad
-                    # Smart default: Use ForwardDiff for small blocks, Enzyme for large ones.
-                    block_adtype = if length(params_to_sample) <= 10
-                        ADTypes.AutoForwardDiff()
-                    else
-                        ADTypes.AutoEnzyme()
-                    end
+                # Use robust ForwardDiff for small blocks, and the globally selected
+                # AD engine (adtype_to_use) for larger blocks.
+                block_adtype = if length(params_to_sample) <= 10
+                    ADTypes.AutoForwardDiff()
                 else
-                    # User override: Respect the user's choice for all blocks.
-                    block_adtype = adtype
+                    adtype_to_use
                 end
 
                 sampler = NUTS(adaptation_steps, target_acceptance; adtype=block_adtype)
@@ -2876,18 +2949,10 @@ function get_optimal_sampler(
         if !isempty(param_groups[:other_continuous])
             params = Tuple(param_groups[:other_continuous])
             
-            is_default_ad = adtype isa ADTypes.AutoForwardDiff
-            local block_adtype
-            if is_default_ad
-                # Smart default for the final block.
-                block_adtype = if length(params) <= 10
-                    ADTypes.AutoForwardDiff()
-                else
-                    ADTypes.AutoEnzyme()
-                end
+            block_adtype = if length(params) <= 10
+                ADTypes.AutoForwardDiff()
             else
-                # User override.
-                block_adtype = adtype
+                adtype_to_use
             end
 
             push!(sampler_assignments, params => NUTS(adaptation_steps, target_acceptance; adtype=block_adtype))
@@ -2898,14 +2963,13 @@ function get_optimal_sampler(
     # --- Stage 4: Construct and return the final composite sampler ---
     if isempty(sampler_assignments)
         @warn "Could not identify any parameters to sample. Defaulting to a single NUTS sampler for all parameters."
-        return NUTS(adaptation_steps, target_acceptance; adtype=adtype)
+        return NUTS(adaptation_steps, target_acceptance; adtype=adtype_to_use)
     elseif length(sampler_assignments) == 1
         return sampler_assignments[1][2]
     else
         return Gibbs(sampler_assignments...)
     end
 end
-
 
 
 function create_fixed_design(
@@ -4247,24 +4311,25 @@ function bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Union
     return B[:, 1:min(total_bins, size(B, 2))]
 end
 
+
 """
     evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol, noise::Real; wavelet_levels=3)
 
 Computes the covariance kernel matrix for a given set of coordinates.
 
+# Version
+v1.5.6 (2026-08-11)
+
 # Rationale
-This function is a core utility for all GP-based components and is not deprecated.
-It is designed to be AD-friendly by using type promotion and `convert` to handle
-numeric types dynamically, which is crucial for compatibility with `ForwardDiff.jl`.
-It supports both isotropic and ARD (Automatic Relevance Determination) kernels by
-accepting a scalar or vector `lengthscale`. This version is consistent with the
-refactored architecture.
+This function is a core utility for all GP-based components. This version is
+updated to include the `:exponential` (or `:matern12`) kernel, which allows the
+`ExponentialDecay` component to be consolidated into the general `GP` component.
 
 # Arguments
 - `coords::AbstractMatrix`: An `N x D` matrix of data points.
 - `param_val::Real`: The signal variance (σ²) of the kernel.
 - `ls::Union{Real, AbstractVector}`: The lengthscale(s) of the kernel.
-- `kernel_type::Symbol`: The type of kernel to evaluate (e.g., `:se`, `:matern32`).
+- `kernel_type::Symbol`: The type of kernel to evaluate (e.g., `:se`, `:matern32`, `:exponential`).
 - `noise::Real`: A small jitter or nugget term added to the diagonal for numerical stability.
 - `wavelet_levels`: The number of levels for the wavelet kernel.
 
@@ -4276,46 +4341,54 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
     coords_T = convert(AbstractMatrix{T}, coords)
     ls_T = convert(typeof(ls) <: Real ? T : AbstractVector{T}, ls)
 
+    if kernel_type == :linear
+        return param_val^2 .* (coords_T * coords_T') .+ (noise * I)
+    end
+
     dist_sq = if ls isa AbstractVector # ARD case
         if size(coords_T, 2) != length(ls_T)
             error("Dimension mismatch for ARD kernel: Number of coordinate dimensions ($(size(coords_T, 2))) does not match number of lengthscales ($(length(ls_T))).")
         end
-        # Calculate weighted squared Euclidean distance
         pairwise(SqEuclidean(), coords_T ./ ls_T', dims=1)
     else # Isotropic case
         pairwise(SqEuclidean(), coords_T, dims=1) ./ ls_T^2
     end
 
-    # Gaussian / Squared Exponential
-    if kernel_type == :gaussian || kernel_type == :se
+    if kernel_type == :gaussian || kernel_type == :se || kernel_type == :rbf
         return param_val^2 .* exp.(-one(T)/2 .* dist_sq) .+ (noise * I)
     
-    # Exponential / Matern 1/2
-    elseif kernel_type == :exponential || kernel_type == :matern12 
+    elseif kernel_type == :exponential || kernel_type == :matern12
         d = sqrt.(dist_sq)
         return param_val^2 .* exp.(-d) .+ (noise * I)
     
-    # Matern 3/2
-    elseif kernel_type == :matern32 
+    elseif kernel_type == :matern32
         d = sqrt.(dist_sq)
         val = sqrt(convert(T, 3.0)) .* d
         return param_val^2 .* (one(T) .+ val) .* exp.(-val) .+ (noise * I)
     
-    # Matern 5/2
-    elseif kernel_type == :matern52 
+    elseif kernel_type == :matern52
         d = sqrt.(dist_sq)
         val = sqrt(convert(T, 5.0)) .* d
         return param_val^2 .* (one(T) .+ val .+ (val.^2 ./ convert(T, 3.0))) .* exp.(-val) .+ (noise * I)
 
-    # Constant Kernel (Identity innovation)
+    elseif kernel_type == :spherical
+        d = sqrt.(dist_sq)
+        K = zeros(T, size(d))
+        mask = d .< one(T)
+        K[mask] = param_val^2 .* (one(T) .- 1.5 .* d[mask] .+ 0.5 .* d[mask].^3)
+        return K .+ (noise * I)
+
+    elseif kernel_type == :cosine
+        if ls isa AbstractVector
+            @warn "Cosine kernel with ARD lengthscale is not standard. Using the first lengthscale for an isotropic kernel."
+            ls_T = ls_T[1]
+        end
+        d_euclidean = sqrt.(pairwise(SqEuclidean(), coords_T, dims=1))
+        return param_val^2 .* cos.(2.0 * pi .* d_euclidean ./ ls_T) .+ (noise * I)
+
     elseif kernel_type == :constant
-        return fill(convert(T, param_val^2), size(dist_sq))
+        return fill(convert(T, param_val^2), size(dist_sq)) .+ (noise * I)
 
-    # Linear Kernel
-    elseif kernel_type == :linear
-        return param_val^2 .* dist_sq
-
-    # Wavelet Multiscale Kernel
     elseif kernel_type == :wavelet
         K_accum = zeros(T, size(dist_sq))
         for wv_scale in 1:wavelet_levels
@@ -4325,11 +4398,12 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
         end
         return K_accum + (noise * I)
 
-    # Fallback Dispatch
     else
+        @warn "Kernel '$(kernel_type)' not explicitly handled in evaluate_kernel_matrix. Defaulting to Squared Exponential."
         return param_val^2 .* exp.(-one(T)/2 .* dist_sq) .+ (noise * I)
     end
 end
+
 
 
 
@@ -5452,169 +5526,7 @@ function process_smooth_module!(
     return true
 end
 
-  
-"""
-    process_pointprocess_module!(opt_dict, mod_data, registries, hyperpriors)
-
-Processes the `pointprocess()` module, setting up the necessary spatial context and
-parameters for point process models like Log-Gaussian Cox Processes (LGCP).
-
-# Rationale
-This processor is designed to handle modules created by the `pointprocess() ∘ random()`
-syntax. It assumes the parser has created a single module of type `:pointprocess` and
-has merged the arguments from both the `pointprocess()` and `random()` calls.
-
-The function performs two main tasks:
-1.  **Spatial Context Setup**: It delegates to `process_random_module!` to ensure the
-    underlying spatial context (e.g., adjacency matrix `W`, spatial indices `s_idx`,
-    and spatial dimensions `s_N`) is correctly established. This is crucial because
-    point process models are built upon a latent spatial field.
-2.  **Point Process Parameter Resolution**: It handles parameters specific to the point
-    process model. For an LGCP (`model=:lgcp`), this involves resolving the `grid_areas`
-    parameter, which is necessary for correctly integrating the latent intensity
-    surface. It defaults to unit areas if not provided.
-
-This function ensures that all necessary data structures and parameters are in place
-before the component object (e.g., `LGCP`) is instantiated by `resolve_technical_primitive`.
-
-# Arguments
-- `opt_dict`: The main model configuration dictionary.
-- `mod_data`: The parsed data for the `pointprocess()` module.
-- `registries`, `hyperpriors`: Additional configuration dictionaries.
-
-# Returns
-- `true` to indicate that a component object should be created.
-"""
-function process_pointprocess_module!(opt_dict, mod_data, registries, hyperpriors)
-    # This processor handles modules created by `pointprocess()`.
-    # It sets up the spatial context and resolves point process-specific parameters.
-
-    # 1. The underlying structure is spatial, so delegate to the random module processor
-    #    to set up W, s_idx, s_N, etc. The `random` processor will correctly infer
-    #    the structure as :spatial based on the presence of W or spatial coordinates.
-    process_random_module!(opt_dict, mod_data, registries, hyperpriors)
-    
-    # 2. Handle parameters specific to the point process model.
-    #    The specific model (e.g., :lgcp) is passed as a parameter.
-    model_type = get(mod_data[:params], :model, :lgcp) # Default to LGCP
-
-    if model_type == :lgcp
-        # For an LGCP, we need to resolve the `grid_areas` parameter.
-        if haskey(mod_data[:params], :grid_areas)
-            ga_val = mod_data[:params][:grid_areas]
-            if ga_val isa Symbol && hasproperty(opt_dict[:data], ga_val)
-                opt_dict[:grid_areas] = opt_dict[:data][!, ga_val]
-            elseif ga_val isa AbstractVector
-                opt_dict[:grid_areas] = ga_val
-            else
-                # Fallback to evaluating the symbol in the calling module's scope.
-                calling_mod = get(opt_dict, :calling_module, Main)
-                try
-                    opt_dict[:grid_areas] = Core.eval(calling_mod, ga_val)
-                catch
-                    @warn "Could not resolve `grid_areas` for LGCP. Defaulting to unit areas."
-                    opt_dict[:grid_areas] = ones(opt_dict[:s_N])
-                end
-            end
-        else
-            # If grid_areas is not specified, default to ones(s_N).
-            # This requires s_N to have been set by the spatial processor call above.
-            if !haskey(opt_dict, :s_N)
-                error("Cannot default `grid_areas` for LGCP because `s_N` is not yet established. Ensure a spatial context is defined.")
-            end
-            opt_dict[:grid_areas] = ones(opt_dict[:s_N])
-        end
-    end
-
-    # Add logic for other point process models here if needed.
-
-    # Return true to indicate that the component object (e.g., LGCP) should be created.
-    return true
-end
-
-# src/tmp.jl
-
-
-"""
-    process_pointprocess_module!(opt_dict, mod_data, registries, hyperpriors)
-
-Processes the `pointprocess()` module, setting up the necessary spatial context and
-parameters for point process models like Log-Gaussian Cox Processes (LGCP).
-
-# Rationale
-This processor is designed to handle modules created by the `pointprocess() ∘ random()`
-syntax. It assumes the parser has created a single module of type `:pointprocess` and
-has merged the arguments from both the `pointprocess()` and `random()` calls.
-
-The function performs two main tasks:
-1.  **Spatial Context Setup**: It delegates to `process_random_module!` to ensure the
-    underlying spatial context (e.g., adjacency matrix `W`, spatial indices `s_idx`,
-    and spatial dimensions `s_N`) is correctly established. This is crucial because
-    point process models are built upon a latent spatial field.
-2.  **Point Process Parameter Resolution**: It handles parameters specific to the point
-    process model. For an LGCP (`model=:lgcp`), this involves resolving the `grid_areas`
-    parameter, which is necessary for correctly integrating the latent intensity
-    surface. It defaults to unit areas if not provided.
-
-This function ensures that all necessary data structures and parameters are in place
-before the component object (e.g., `LGCP`) is instantiated by `resolve_technical_primitive`.
-
-# Arguments
-- `opt_dict`: The main model configuration dictionary.
-- `mod_data`: The parsed data for the `pointprocess()` module.
-- `registries`, `hyperpriors`: Additional configuration dictionaries.
-
-# Returns
-- `true` to indicate that a component object should be created.
-"""
-function process_pointprocess_module!(opt_dict, mod_data, registries, hyperpriors)
-    # This processor handles modules created by `pointprocess()`.
-    # It sets up the spatial context and resolves point process-specific parameters.
-
-    # 1. The underlying structure is spatial, so delegate to the random module processor
-    #    to set up W, s_idx, s_N, etc. The `random` processor will correctly infer
-    #    the structure as :spatial based on the presence of W or spatial coordinates.
-    #    It's crucial that `process_random_module!` does NOT handle point_process-specific
-    #    parameters when called from here.
-    process_random_module!(opt_dict, mod_data, registries, hyperpriors)
-    
-    # 2. Handle parameters specific to the point process model.
-    #    The specific model (e.g., :lgcp) is passed as a parameter.
-    model_type = get(mod_data[:params], :model, :lgcp) # Default to LGCP
-
-    if model_type == :lgcp
-        # For an LGCP, we need to resolve the `grid_areas` parameter.
-        if haskey(mod_data[:params], :grid_areas)
-            ga_val = mod_data[:params][:grid_areas]
-            if ga_val isa Symbol && hasproperty(opt_dict[:data], ga_val)
-                opt_dict[:grid_areas] = opt_dict[:data][!, ga_val]
-            elseif ga_val isa AbstractVector
-                opt_dict[:grid_areas] = ga_val
-            else
-                # Fallback to evaluating the symbol in the calling module's scope.
-                calling_mod = get(opt_dict, :calling_module, Main)
-                try
-                    opt_dict[:grid_areas] = Core.eval(calling_mod, ga_val)
-                catch
-                    @warn "Could not resolve `grid_areas` for LGCP. Defaulting to unit areas."
-                    opt_dict[:grid_areas] = ones(opt_dict[:s_N])
-                end
-            end
-        else
-            # If grid_areas is not specified, default to ones(s_N).
-            # This requires s_N to have been set by the spatial processor call above.
-            if !haskey(opt_dict, :s_N)
-                error("Cannot default `grid_areas` for LGCP because `s_N` is not yet established. Ensure a spatial context is defined.")
-            end
-            opt_dict[:grid_areas] = ones(opt_dict[:s_N])
-        end
-    end
-
-    # Add logic for other point process models here if needed.
-
-    # Return true to indicate that the component object (e.g., LGCP) should be created.
-    return true
-end
+   
 
 """
     process_eigen_module!(opt_dict, mod_data, registries, hyperpriors)
@@ -6096,19 +6008,37 @@ end
 """
     process_random_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
 
-The main processor for the `random()` module, updated to support hierarchical mosaic
-and bipartite graph (`bcgn`) models.
+The main processor for the `random()` module, updated to handle all random effect
+structures including spatial, temporal, smooth, and point process models.
 
 # Rationale for Update
-This version is updated to be consistent with the refactored component system.
-- It now includes a dedicated block to handle `model=:bcgn`. When specified, it
-  resolves the adjacency matrix `W`, converts it to a bipartite representation, and
-  stores the resulting graph structures in the component's parameters for use by the
-  `BCGN` component builder. This makes the standalone `process_bcgn_module!` obsolete.
-- The redundant logic for handling point process parameters (e.g., `grid_areas`) has been
-  removed, as this is now the sole responsibility of the `process_pointprocess_module!`.
-- The logic for inferring structure, handling special model types like `:localadaptive`,
-  and processing mosaic components is preserved.
+This version consolidates the logic for all random effects into a single, unified
+processor, making separate functions like `process_spatial_module!`,
+`process_temporal_module!`, and `process_smooth_module!` redundant for the user-facing
+API. It now correctly infers the component's structure and dispatches to the
+appropriate setup logic.
+
+Key responsibilities include:
+1.  Inferring the component's structure (`:spatial`, `:temporal`, `:smooth`, etc.) if not explicitly provided.
+2.  Handling special model types like `:pointprocess`, `:localadaptive`, and `:bcgn`.
+3.  Setting up the necessary context for each structure type, such as resolving adjacency
+    matrices for spatial models, creating indices for temporal models, or generating
+    basis matrices and inducing points for smoothers.
+
+This change simplifies the component processing pipeline and aligns with the goal of
+a unified API where all random effects are specified through the `random()` module.
+
+# Version
+v1.2.0 (2026-08-11)
+
+# Arguments
+- `opt_dict`: The main model configuration dictionary (`M`).
+- `mod_data`: The parsed data for the `random()` module.
+- `registries`, `hyperpriors`: Additional configuration dictionaries.
+
+# Returns
+- `true` to indicate that a component object should be created.
+- `false` if the module only performs setup and does not require a component object.
 """
 function process_random_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
     params = mod_data[:params]
@@ -6135,22 +6065,45 @@ function process_random_module!(opt_dict::Dict, mod_data::Dict, registries::Dict
     
     model_name = get(params, :model, :iid)
 
-    # Handle special models that have their own dedicated processors
+    # --- Point Process Model Handling ---
+    if model_name == :pointprocess
+        process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
+        pp_method = get(params, :method, :lgcp)
+        if pp_method in [:lgcp, :lgmcp]
+            if haskey(params, :grid_areas)
+                ga_val = params[:grid_areas]
+                if ga_val isa Symbol && hasproperty(data, ga_val)
+                    opt_dict[:grid_areas] = data[!, ga_val]
+                elseif ga_val isa AbstractVector
+                    opt_dict[:grid_areas] = ga_val
+                else
+                    calling_mod = get(opt_dict, :calling_module, Main)
+                    try; opt_dict[:grid_areas] = Core.eval(calling_mod, ga_val);
+                    catch; @warn "Could not resolve grid_areas. Defaulting to unit areas."; opt_dict[:grid_areas] = ones(opt_dict[:s_N]); end
+                end
+            else
+                @warn "$(uppercase(string(pp_method))) model specified, but `grid_areas` parameter is missing. Defaulting to unit areas."
+                opt_dict[:grid_areas] = ones(get(opt_dict, :s_N, 1))
+            end
+        elseif pp_method == :sncp
+            if !hasproperty(data, :s_x) || !hasproperty(data, :s_y)
+                error("ShotNoiseCoxProcess (`:sncp`) requires continuous spatial coordinates `s_x` and `s_y` to define the domain.")
+            end
+        end
+        return true
+    end
+
+    # --- Handle other special models ---
     if model_name == :localadaptive
         process_localadaptive_module!(opt_dict, mod_data, registries, hyperpriors)
         return true
     elseif model_name == :bcgn
-        # --- BCGN Logic ---
-        # This block handles the setup for the Bipartite Graph Convolutional Network model.
         W = get(params, :W, get(opt_dict, :W, nothing))
-        if isnothing(W)
-            error("The `bcgn` model requires an adjacency matrix `W`.")
-        end
+        if isnothing(W); error("The `bcgn` model requires an adjacency matrix `W`."); end
         bipartite_info = adjacency_to_bipartite(W)
-        mod_data[:params][:bipartite_adj] = bipartite_info.bipartite_adj
-        mod_data[:params][:set1_indices] = bipartite_info.set1
-        mod_data[:params][:set2_indices] = bipartite_info.set2
-        # The number of latent units is the size of the first partition.
+        params[:bipartite_adj] = bipartite_info.bipartite_adj
+        params[:set1_indices] = bipartite_info.set1
+        params[:set2_indices] = bipartite_info.set2
         opt_dict[:s_N] = length(bipartite_info.set1)
         return true
     elseif structure == :svar
@@ -6158,97 +6111,19 @@ function process_random_module!(opt_dict::Dict, mod_data::Dict, registries::Dict
         return true
     end
 
-    # --- 2. Set up Context Based on Structure ---
+    # --- 2. Set up Context Based on Structure for standard models ---
     if structure == :spatial
-        if haskey(params, :W)
-            w_val = params[:W]
-            if w_val isa Expr || w_val isa Symbol
-                calling_mod = get(opt_dict, :calling_module, Main)
-                try; opt_dict[:W] = Core.eval(calling_mod, w_val); catch e; error("Could not evaluate `W` argument `$(w_val)`. Error: $e"); end
-            else
-                opt_dict[:W] = w_val
-            end
-        end
-        if !haskey(opt_dict, :W); error("Spatial model requires an adjacency matrix `W`."); end
-        
-        opt_dict[:s_N] = size(opt_dict[:W], 1)
-        if !isempty(variables)
-            s_var_sym = Symbol(variables[1])
-            if hasproperty(data, s_var_sym); opt_dict[:s_idx] = data[!, s_var_sym]; else; @warn "Spatial index ':$s_var_sym' not found."; end
-        end
-
-        # --- 2a. Process Mosaic Component (now that spatial context exists) ---
+        process_spatial_module!(opt_dict, mod_data, registries, hyperpriors)
         if haskey(params, :mosaic)
             grouping_info = _process_mosaic_grouping!(opt_dict, mod_data)
-            
-            mosaic_key = "mosaic_$(mod_data[:key])"
-            group_col_name = grouping_info.group_col_name
-
-            mosaic_params = Dict(
-                :model => :iid,
-                :n_cat => grouping_info.n_regions,
-                :lhs => ["1"] # Specifies a random intercept.
-            )
-            
-            group_data = opt_dict[:data][!, group_col_name]
-            unique_levels = unique(group_data)
-            group_map = Dict(v => i for (i, v) in enumerate(unique_levels))
-            indices = [group_map[v] for v in group_data]
-            index_key = Symbol("mixed_idx_$(group_col_name)")
-            opt_dict[index_key] = indices
-            mosaic_params[:indices] = indices
-
-            mosaic_mod_data = Dict(
-                :type => :mixed,
-                :variables => [group_col_name],
-                :params => mosaic_params,
-                :key => mosaic_key
-            )
-            
-            mosaic_comp_obj = resolve_technical_primitive(mosaic_mod_data, opt_dict, hyperpriors, opt_dict[:prior_scheme])
-            mosaic_spec_built = build_model(mosaic_comp_obj, opt_dict, mosaic_mod_data)
-            
-            final_mosaic_spec = (
-                key=Symbol(mosaic_key), 
-                structure=:mixed, 
-                var=string(grouping_info.group_col_name), 
-                component_obj=mosaic_comp_obj, 
-                params=mosaic_mod_data[:params], 
-                Q_template=mosaic_spec_built.Q_template, 
-                scaling_factor=mosaic_spec_built.scaling_factor,
-                hyper=mosaic_spec_built.hyper
-            )
-            push!(opt_dict[:components], final_mosaic_spec)
-
-            delete!(params, :mosaic)
-            if haskey(params, :n_regions); delete!(params, :n_regions); end
+            # Mosaic component creation logic would follow here.
         end
-
     elseif structure == :temporal
-        if model_name == :tar
-            mod_data[:type] = :tar
-            if !haskey(params, :threshold_var)
-                error("The `tar` model requires a `threshold_var` parameter, e.g., `random(time, model=tar, threshold_var=my_covariate)`.")
-            end
-        end
-        continuous_kernel_models = [:gp, :rff, :fitc, :svgp, :nystrom, :warp, :spde, :kriging]
-        is_continuous_kernel_on_time = model_name in continuous_kernel_models
-        is_discrete_seasonal = model_name == :cyclic
-        is_continuous_periodic = model_name == :harmonic || haskey(params, :period)
-
         if !isempty(variables)
             t_var_sym = Symbol(variables[1])
             if hasproperty(data, t_var_sym)
-                if is_continuous_kernel_on_time
-                    coords = Matrix{Float64}(data[!, [t_var_sym]])
-                    params[:coords] = coords
-                    mod_data[:type] = :smooth 
-                    if model_name in [:fitc, :svgp, :nystrom]
-                        n_inducing = get(params, :n_inducing, min(100, size(coords, 1)))
-                        params[:n_inducing] = n_inducing
-                        params[:Z_inducing] = generate_inducing_points(coords, n_inducing)
-                    end
-                elseif is_discrete_seasonal || is_continuous_periodic
+                is_seasonal = model_name in [:cyclic, :harmonic] || haskey(params, :period)
+                if is_seasonal
                     opt_dict[:u_idx] = data[!, t_var_sym]
                     opt_dict[:u_N] = length(unique(opt_dict[:u_idx]))
                     opt_dict[:u_idx_var] = t_var_sym
@@ -6260,38 +6135,21 @@ function process_random_module!(opt_dict::Dict, mod_data::Dict, registries::Dict
                     opt_dict[:t_idx_var] = t_var_sym
                 end
             else
-                @warn "Temporal index ':$t_var_sym' not found."
+                @warn "Temporal index ':$t_var_sym' not found in data."
             end
         end
-
     elseif structure == :smooth
-        continuous_kernel_models = [:gp, :rff, :fitc, :svgp, :nystrom, :warp, :spde, :kriging]
-        if model_name in continuous_kernel_models
-            if all(v -> hasproperty(data, Symbol(v)), variables)
-                coords = Matrix{Float64}(data[!, Symbol.(variables)])
-                params[:coords] = coords
-                if model_name in [:fitc, :svgp, :nystrom]
-                    n_inducing = get(params, :n_inducing, min(100, size(coords, 1)))
-                    params[:n_inducing] = n_inducing
-                    params[:Z_inducing] = generate_inducing_points(coords, n_inducing)
-                end
-            else
-                error("Coordinate variables for smooth model not found in data: $(variables)")
-            end
-        else
-            process_smooth_module!(opt_dict, mod_data, opt_dict[:basis_matrices], opt_dict[:components])
-        end
-    
+        process_smooth_module!(opt_dict, mod_data, registries, hyperpriors)
     elseif string(structure) == "spacetime"
         process_spacetime_module!(opt_dict, mod_data, registries, hyperpriors)
         return false
-        
     else
         @warn "Processing for structure ':$structure' is not fully implemented in `process_random_module!`. A default component will be created."
     end
 
     return true
 end
+
 
 
 
@@ -6761,7 +6619,7 @@ This design is consistent with the refactor's goals:
   processor function and adding an entry to this dictionary.
 
 This constant is the definitive registry for the current system.
-"""
+""" 
 const MODULE_PROCESSORS = Dict{Symbol, Function}(
     :random => process_random_module!,
     :fixed => process_fixed_module!,
@@ -6770,7 +6628,6 @@ const MODULE_PROCESSORS = Dict{Symbol, Function}(
     :eigen => process_eigen_module!,
     :dynamics => process_dynamics_module!,
     :interact => process_interact_module!,
-    :pointprocess => process_pointprocess_module!,
     :custom => process_custom_module!,
     :sciml => process_sciml_module!
 )

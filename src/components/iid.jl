@@ -1,4 +1,4 @@
- """
+"""
     IID <: ComponentModel
 
 A simple Independent and Identically Distributed (IID) random effect, representing
@@ -6,7 +6,7 @@ unstructured noise or heterogeneity. Each latent effect is drawn independently f
 the same normal distribution.
 
 # Version
-v1.0.2 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 The IID component models a latent field \$\\phi\$ where each element \$\\phi_i\$ is drawn
@@ -19,56 +19,41 @@ matrix:
 \$\\boldsymbol{\\phi} \\sim \\mathcal{N}(\\mathbf{0}, \\sigma^2 I)\$
 where \$I\$ is the identity matrix.
 
-# Assumptions
-- The random effects are independent of each other.
-- The random effects are drawn from the same distribution (identically distributed).
+# Computational Methods
+- `:noncentered` (Default, AD-friendly): Samples standard normal innovations and
+  scales them by `sigma`. Recommended for gradient-based samplers like NUTS.
+- `:centered` (Didactic, Not AD-friendly): Samples the latent effects directly from
+  the `MvNormal` distribution defined by `sigma`. This can be less efficient for
+  MCMC due to posterior correlations.
 
-# Best Use Case
-Modeling unstructured random effects for groups (e.g., random intercepts in a mixed
-effects model), accounting for overdispersion in count models, or serving as the
-unstructured component in more complex spatial models like the BYM2.
+# Inputs
+- **Required**:
+  - An index variable (e.g., `group_id`) passed to `random()`.
+- **Optional (in `random()` call)**:
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the effect. Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default: `:noncentered`.
 
-# Key References
-- Wikipedia: Independent and identically distributed random variables
-
-# Fields
-- `sigma::UnivariateDistribution`: The prior for the standard deviation of the effect.
-- `method::Symbol`: The parameterization method. Can be `:noncentered` (default,
-  recommended) or `:centered` (didactic alternative).
+# Outputs (Parameter Names)
+- `sigma_<key>`: The standard deviation of the IID effect.
+- `innovations_<key>`: The raw standard normal innovations for the effect (for `:noncentered`).
+- `latent_<key>`: The latent IID effect (for `:centered`).
 """
 struct IID <: ComponentModel
     sigma::UnivariateDistribution
     method::Symbol
 end
 
-# Add to the central component constructor registry.
 COMPONENT_TYPE_REGISTRY[:iid] = IID
 COMPONENT_CONSTRUCTORS[:iid] = (p, params) -> IID(
     p.sigma, get(params, :method, :noncentered)
 )
 
-# Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:iid] = :any
 
-
-"""
-    get_datastructures!(m_type::Type{<:IID}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `IID` component. This component has no
-specific data requirements beyond what is handled by the main configuration engine
-(e.g., inferring `s_N` or `t_N` for the dimension of the effect).
-"""
 function get_datastructures!(m_type::Type{<:IID}, M::Dict, mod_data::Dict)::Bool
     return true
 end
 
-"""
-    get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-For an IID component, the precision matrix `Q_template` is the identity matrix.
-This function determines the dimension of the effect based on its structure
-(e.g., spatial, temporal) and returns the appropriate identity matrix.
-"""
 function get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
     structure = get(mod_data, :type, :spatial)
     
@@ -76,6 +61,8 @@ function get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
         get(M, :s_N, 0)
     elseif structure == :temporal
         get(M, :t_N, 0)
+    elseif structure == :seasonal
+        get(M, :u_N, 0)
     elseif structure == :mixed
         get(mod_data[:params], :n_cat, 0)
     else # smooth, etc.
@@ -97,17 +84,11 @@ function get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
-"""
-    get_priors(m::IID, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for `sigma`. For the `:noncentered` method, it also defines a
-prior for the standard normal `raw` innovations.
-"""
 function get_priors(
     m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
-    v = generate_full_variable_names(spec, arch, outcome_idx)
+    p_names = generate_full_variable_names(spec, arch, outcome_idx)
     n_latent = spec.hyper.n_latent
     is_multivariate = (arch == "multivariate")
     is_shared = get(spec.params, :shared, false)
@@ -115,38 +96,29 @@ function get_priors(
 
     priors_acc = String[]
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
-        push!(priors_acc, "$(v.sigma) ~ $(_distribution_to_string(m.sigma))")
+        push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
     end
 
     if m.method == :noncentered
-        push!(priors_acc, "$(v.raw) ~ MvNormal(zeros($(n_latent)), I)")
+        push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
     end
     
     return join(priors_acc, "\n    ")
 end
 
-
-"""
-    get_updates(m::IID, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates code to construct the IID effect. Supports two methods:
-- `:noncentered` (default): Samples standard normal noise and transforms it. This
-  is generally more efficient for MCMC.
-- `:centered`: Samples the latent field directly from the `MvNormal` distribution.
-  This can be less efficient due to posterior correlations but is a useful
-  didactic alternative.
-"""
 function get_updates(
     m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
-    v = generate_full_variable_names(spec, arch, outcome_idx)
+    p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
     index_var = if spec.structure == :spatial
         "s_idx"
     elseif spec.structure == :temporal
         "t_idx"
+    elseif spec.structure == :seasonal
+        "u_idx"
     elseif spec.structure == :mixed
         "mixed_idx_$(spec.var)"
     else
@@ -155,15 +127,18 @@ function get_updates(
 
     noncentered_code = """
         # --- IID Component (Non-Centered): $(spec.key) ---
-        $(v.latent) = $(v.raw) .* $(v.sigma)
-        $(eta_target) .+= view($(v.latent), M.$(index_var))
+        let
+            $(p_names.latent) = $(p_names.innovations) .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
+        end
     """
 
     centered_code = """
         # --- IID Component (Centered): $(spec.key) ---
-        # This is a didactic alternative. It can be less efficient for MCMC sampling.
-        $(v.latent) ~ MvNormal(zeros($(spec.hyper.n_latent)), $(v.sigma)^2 * I)
-        $(eta_target) .+= view($(v.latent), M.$(index_var))
+        let
+            $(p_names.latent) ~ MvNormal(zeros(T, $(spec_registry[:$(spec.key)].hyper.n_latent)), $(p_names.sigma)^2 * I)
+            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
+        end
     """
 
     if m.method == :noncentered
@@ -175,39 +150,65 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::IID, chain, M::NamedTuple, ...)::NamedTuple
-
-Reconstructs the posterior effect from the MCMC chain's posterior samples,
-dispatching on the method used during sampling.
-"""
 function get_effects(
     m::IID, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
-    is_multivariate = outcomes_N > 1
-    is_shared = get(spec.params, :shared, false)
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
     n_latent = spec.hyper.n_latent
 
+    index_var_sym = if spec.structure == :spatial
+        :s_idx
+    elseif spec.structure == :temporal
+        :t_idx
+    elseif spec.structure == :seasonal
+        :u_idx
+    elseif spec.structure == :mixed
+        Symbol("mixed_idx_$(spec.var)")
+    else
+        Symbol(string(spec.structure) * "_idx")
+    end
+
+    idx_full = if haskey(M, index_var_sym)
+        isnothing(PS) || !haskey(PS, index_var_sym) ? M[index_var_sym] : vcat(M[index_var_sym], PS[index_var_sym])
+    else
+        ones(Int, N_total)
+    end
+
     for k in 1:outcomes_N
-        outcome_idx = is_multivariate ? k : nothing
-        v = generate_full_variable_names(spec, M.model_arch, outcome_idx)
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
         
-        local effect_k
+        if isempty(sigma_name)
+            @warn "Sigma parameter for IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        
+        local latent_field_samples
         if m.method == :noncentered
-            sigma_var_name = if is_multivariate && is_shared
-                string(generate_full_variable_names(spec, M.model_arch, nothing).sigma)
-            else
-                string(v.sigma)
+            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            if isempty(innovations_name)
+                @warn "Innovations for IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
             end
-            sigma_samples = get_params_vector(chain, sigma_var_name, 1)
-            raw_samples = get_params_vector(chain, string(v.raw), n_latent)
-            effect_k = raw_samples .* sigma_samples
+            innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+            latent_field_samples = innovations_samples' .* sigma_samples
         else # :centered
-            effect_k = get_params_vector(chain, string(v.latent), n_latent)
+            latent_name = _find_parameter(p_names_vec, string(spec.key), "latent", k, is_multivariate_model)
+            if isempty(latent_name)
+                @warn "Latent field for IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            latent_field_samples = get_params_vector(chain, latent_name, n_latent)'
         end
         
+        effect_k = latent_field_samples[idx_full, :]
         push!(structured_effects, effect_k)
     end
     

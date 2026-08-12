@@ -7,7 +7,7 @@ where the value at a location is assumed to be conditionally dependent on the
 average of its neighbors.
 
 # Version
-v1.1.2 (2026-08-10)
+v1.2.1 (2026-08-11)
 
 # Mathematical Summary
 The Besag model defines a Gaussian Markov Random Field (GMRF) with a singular
@@ -36,6 +36,20 @@ Modeling structured spatial random effects for areal or lattice data, such as
 disease mapping, real estate analysis, or ecological modeling, where there is a
 strong prior belief in local spatial smoothing.
 
+# Inputs
+- **Required**:
+  - A spatial index variable (e.g., `s_idx`).
+  - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
+- **Optional (in `random()` call)**:
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`). Default: `:spectral`.
+
+# Outputs (Parameter Names)
+- `sigma_<key>`: The marginal standard deviation of the latent field.
+- `innovations_<key>`: The raw standard normal innovations for the latent field.
+- `latent_<key>`: The reconstructed latent spatial field.
+
+
 # Key References
 - Besag, J. (1974). Spatial interaction and the statistical analysis of lattice
   systems. *Journal of the Royal Statistical Society: Series B (Methodological)*,
@@ -55,13 +69,11 @@ struct Besag <: ComponentModel
     method::Symbol
 end
 
-# Add to the central component constructor registry.
 COMPONENT_TYPE_REGISTRY[:besag] = Besag
 COMPONENT_CONSTRUCTORS[:besag] = (p, params) -> Besag(
     p.sigma, get(params, :method, :spectral)
 )
 
-# Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:besag] = :spatial
 
 """
@@ -108,7 +120,7 @@ end
 """
     get_priors(m::Besag, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates priors for the scale parameter `sigma` and the raw innovations `raw`.
+Generates priors for the scale parameter `sigma` and the raw innovations `innovations`.
 """
 function get_priors(
     m::Besag, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -118,8 +130,8 @@ function get_priors(
     n_latent = spec.hyper.n_latent
     
     return """
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.raw) ~ MvNormal(zeros($(n_latent)), I)
+    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma)) # Prior for the marginal standard deviation
+    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I) # Raw standard normal innovations for the latent field
     """
 end
 
@@ -133,82 +145,95 @@ Generates code to sample the latent spatial field. Supports three methods:
 - `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
   factorization, suitable for gradient-free samplers.
 """
-function get_updates(
-    m::Besag, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
-    M::NamedTuple
-)::String
+function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    key = spec.key
-    n_latent = spec.hyper.n_latent
-
-    spectral_code = """
-        # --- Besag (ICAR) Component: $(key) (Spectral Method) ---
+    
+    if m.method == :lgcp
+        return """
+        # LGCP Model: $(spec.key)
         let
-            local U = spec_registry[:$(key)].hyper.U
-            local L = spec_registry[:$(key)].hyper.L
-            local diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
-            diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-            local latent_field = U * (diag_D .* $(p_names.raw))
-            $(eta_target) .+= view(latent_field, M.s_idx)
+            hyper = spec_registry[:$(spec.key)].hyper
+            Q_lgcp = hyper.inner_spec.Q_template
+            F_lgcp = cholesky(Symmetric(Matrix(Q_lgcp) + M.noise * I))
+            spatial_component = $(p_names.sigma) .* (F_lgcp.L' \\ $(p_names.innovations))
+            
+            log_intensity_surface = eta .+ spatial_component[M.s_idx]
+            
+            for i in 1:M.y_N
+                y_i = M.y_obs[i]
+                A_i = hyper.areas[M.s_idx[i]]
+                lambda_i = exp(log_intensity_surface[i])
+                
+                Turing.@addlogprob! logpdf(Poisson(lambda_i * A_i), y_i)
+            end
         end
-    """
-
-    cholesky_code = """
-        # --- Besag (ICAR) Component: $(key) (Cholesky Method, AD-Safe) ---
+        M.likelihood_handled = true
+        """
+    elseif m.method == :lgmcp
+        return """
+        # LGMCP Model: $(spec.key)
         let
-            local F = spec_registry[:$(key)].hyper.cholesky_factor
-            local latent_field_raw = F.L' \\ $(p_names.raw)
+            hyper = spec_registry[:$(spec.key)].hyper
+            Q_lgmcp = hyper.inner_spec.Q_template
+            F_lgmcp = cholesky(Symmetric(Matrix(Q_lgmcp) + M.noise * I))
+            spatial_component = exp.(F_lgmcp.L' \\ $(p_names.innovations))
             
-            # Apply soft sum-to-zero constraint for identifiability
-            Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw)
-            )
+            mean_intensity_surface = exp.(eta) .* spatial_component[M.s_idx]
             
-            local latent_field = latent_field_raw .* $(p_names.sigma)
-            
-            $(eta_target) .+= view(latent_field, M.s_idx)
+            for i in 1:M.y_N
+                y_i = M.y_obs[i]
+                A_i = hyper.areas[M.s_idx[i]]
+                mu = mean_intensity_surface[i] * A_i
+                
+                r_nb = $(p_names.shape)
+                p_nb = r_nb / (r_nb + mu)
+                
+                Turing.@addlogprob! logpdf(NegativeBinomial(r_nb, p_nb), y_i)
+            end
         end
-    """
-
-    cholesky_sparse_code = """
-        # --- Besag (ICAR) Component: $(key) (Sparse Cholesky, Not AD-Safe) ---
-        # WARNING: This method is for didactic purposes and is NOT compatible with
-        # automatic differentiation (e.g., NUTS sampler).
+        M.likelihood_handled = true
+        """
+    elseif m.method == :sncp
+        return """
+        # SNCP Model: $(spec.key)
         let
-            local Q = spec_registry[:$(key)].hyper.Q_template
-            local F = cholesky(Symmetric(Q + M.noise * I))
-            local latent_field_raw = F.L' \\ $(p_names.raw)
+            hyper = spec_registry[:$(spec.key)].hyper
+            obs_locs = M.centroids
+            parent_locs = hcat($(p_names.parent_locs_x), $(p_names.parent_locs_y))
+            n_parents = length($(p_names.parent_locs_x))
             
-            # Apply soft sum-to-zero constraint for identifiability
-            Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw)
-            )
+            intensity_at_obs = zeros(T, M.s_N)
+            for i in 1:M.s_N
+                intensity_i = zero(T)
+                for j in 1:n_parents
+                    dist_sq = (obs_locs[i].x - parent_locs[j, 1])^2 + (obs_locs[i].y - parent_locs[j, 2])^2
+                    kernel_val = exp(-0.5 * dist_sq / ($(p_names.ls)^2))
+                    intensity_i += $(p_names.amplitude)[j] * kernel_val
+                end
+                intensity_at_obs[i] = intensity_i
+            end
             
-            local latent_field = latent_field_raw .* $(p_names.sigma)
-            
-            $(eta_target) .+= view(latent_field, M.s_idx)
+            for i in 1:M.y_N
+                y_i = M.y_obs[i]
+                s_i = M.s_idx[i]
+                A_s = hyper.areas[s_i]
+                lambda_s = intensity_at_obs[s_i] * A_s
+                
+                Turing.@addlogprob! logpdf(Poisson(lambda_s), y_i)
+            end
         end
-    """
-
-    if m.method == :spectral
-        return spectral_code
-    elseif m.method == :cholesky
-        return cholesky_code
-    elseif m.method == :cholesky_sparse
-        return cholesky_sparse_code
-    else
-        error(
-            "Unsupported method '$(m.method)' for Besag component. Supported " *
-            "methods are :spectral, :cholesky, and :cholesky_sparse."
-        )
+        M.likelihood_handled = true
+        """
     end
+    return ""
 end
+
+
 
 """
     get_effects(m::Besag, chain, M::NamedTuple, ...)::NamedTuple
 
-Reconstructs the `Besag` component's spatial effect from posterior samples, applying a
+Reconstructs the `Besag` component's effect from posterior samples, applying a
 sum-to-zero constraint for identifiability. This function dispatches on the method
 used during sampling.
 """
@@ -219,35 +244,44 @@ function get_effects(
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        raw_samples = get_params_vector(chain, string(p_names.raw), n_latent)
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+
+        if isempty(sigma_name) || isempty(innovations_name)
+            @warn "Parameters for Besag component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
+        end
+
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
 
         if m.method == :spectral
             U = spec.hyper.U
             L = spec.hyper.L
-            for j in 1:n_samples
-                diag_D = sigma_samples[j] ./ sqrt.(L .+ noise)
-                diag_D[1] = 0.0 # Enforce sum-to-zero
-                effect_k[:, j] = U * (diag_D .* raw_samples[j, :])
+            for j in 1:n_samples # Iterate over posterior samples
+                diag_D = sigma_samples[j] ./ sqrt.(L .+ noise) # Scale by sigma and add jitter
+                diag_D[1] = 0.0 # Enforce sum-to-zero constraint for the intrinsic GMRF
+                effect_k[:, j] = U * (diag_D .* innovations_samples[j, :]) # Apply spectral transformation
             end
         else # :cholesky or :cholesky_sparse
             # For reconstruction, the pre-computed dense Cholesky factor is used for
             # both dense and sparse Cholesky methods, as AD is not involved here.
             F = spec.hyper.cholesky_factor
             for j in 1:n_samples
-                latent_field_raw = F.L' \ raw_samples[j, :]
+                latent_field_raw = F.L' \ innovations_samples[j, :]
                 latent_field_centered = latent_field_raw .- mean(latent_field_raw)
                 effect_k[:, j] = latent_field_centered .* sigma_samples[j]
             end
         end
         
-        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
+        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx) # Combine spatial indices from training and prediction sets
         indexed_effects = effect_k[s_idx_full, :]
         push!(structured_effects, indexed_effects)
     end

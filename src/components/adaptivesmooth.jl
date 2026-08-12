@@ -7,21 +7,22 @@ multi-layer perceptron (MLP) to warp the coordinate space, allowing the model to
 capture complex, non-stationary patterns that would be missed by standard smoothers.
 
 # Version
-v1.0.2 (2026-08-10)
+v1.0.4 (2026-08-11)
 
 # Mathematical Summary
 The component models a function \$f(x)\$ by first transforming the input coordinates
 \$x\$ through a non-linear warping function \$g(x)\$, and then applying a linear basis
 expansion in the warped space.
+
 1.  **Warping Function (MLP)**: The input coordinates \$x \\in \\mathbb{R}^{D_{in}}\$
     are passed through a single hidden layer with a `tanh` activation function:
     \$h = \\tanh(x W_1 + b_1)\$
     where \$W_1 \\in \\mathbb{R}^{D_{in} \\times D_{hidden}}\$ and
     \$b_1 \\in \\mathbb{R}^{D_{hidden}}\$ are learned weights and biases.
 
-2.  **Basis Construction**: The output of the hidden layer, \$h\$, is then projected
-    onto a set of \$N_{bins}\$ basis functions via a second weight matrix
-    \$W_2 \\in \\mathbb{R}^{D_{hidden} \\times N_{bins}}\$:
+2.  **Adaptive Basis Construction**: The output of the hidden layer, \$h\$, is then
+    projected onto a set of \$N_{bins}\$ adaptive basis functions via a second weight
+    matrix \$W_2 \\in \\mathbb{R}^{D_{hidden} \\times N_{bins}}\$:
     \$B_{adaptive} = h W_2\$
 
 3.  **Final Effect**: The final smooth effect is a linear combination of these
@@ -31,20 +32,34 @@ expansion in the warped space.
     where the prior on \$\\beta\$ depends on the chosen method.
 
 # Computational Methods
-- `:noncentered` (default): A non-centered parameterization where coefficients are
-  sampled from a standard normal and scaled by `sigma`. Recommended for AD.
-- `:centered`: A centered parameterization where coefficients are sampled directly
-  from `N(0, sigma^2)`. Didactic, can be less efficient.
-- `:rw2_penalty`: Imposes a second-order random walk penalty on the basis
-  coefficients, encouraging a smoother final effect.
+- `:noncentered` (Default, AD-friendly): A non-centered parameterization where
+  coefficients are sampled from a standard normal and scaled by `sigma`. Recommended
+  for gradient-based samplers.
+- `:centered` (Didactic, Not AD-friendly): A centered parameterization where
+  coefficients are sampled directly from `N(0, sigma^2)`. This can be less efficient
+  for MCMC and is not AD-friendly for the `MvNormal` sampling.
+- `:rw2_penalty` (AD-friendly): Imposes a second-order random walk penalty on the
+  basis coefficients, encouraging a smoother final effect. Uses spectral decomposition
+  for AD-friendliness.
 
-# Fields
-- `hidden_dim::Int`: The number of neurons in the hidden layer of the MLP.
-- `nbins::Int`: The number of adaptive basis functions to generate.
-- `sigma::UnivariateDistribution`: The prior for the standard deviation of the basis
-  function coefficients.
-- `method::Symbol`: The computational method, one of `:noncentered`, `:centered`,
-  or `:rw2_penalty`.
+# Inputs
+- **Required**:
+  - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
+- **Optional (in `random()` call)**:
+  - `hidden_dim`: `Int`, number of neurons in the MLP hidden layer. Default: `10`.
+  - `nbins`: `Int`, number of adaptive basis functions to generate. Default: `20`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the basis
+    function coefficients. Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:noncentered`, `:centered`, `:rw2_penalty`).
+    Default: `:noncentered`.
+
+# Outputs (Parameter Names)
+- `W1_<key>`: `Matrix{Float64}`, MLP input weights.
+- `b1_<key>`: `Vector{Float64}`, MLP hidden biases.
+- `W2_<key>`: `Matrix{Float64}`, MLP output weights.
+- `sigma_<key>`: `Float64`, standard deviation of basis coefficients.
+- `innovations_<key>`: `Vector{Float64}`, raw innovations for basis coefficients (for `:noncentered` and `:rw2_penalty`).
+- `latent_<key>`: `Vector{Float64}`, basis coefficients (for `:centered`).
 """
 struct AdaptiveSmooth <: ComponentModel
     hidden_dim::Int
@@ -131,6 +146,17 @@ end
 
 Generates priors for the MLP weights, basis coefficients, and scale, dispatching
 on the chosen method.
+
+# Inputs
+- `m::AdaptiveSmooth`: The `AdaptiveSmooth` component instance.
+- `spec::NamedTuple`: The component's specification, including its `key` and `hyper` parameters.
+- `arch::String`: The model architecture (`"univariate"` or `"multivariate"`).
+- `outcome_idx::Union{Int, Nothing}`: The index of the outcome for multivariate models.
+- `M::NamedTuple`: The main model configuration.
+
+# Outputs
+- `String`: Turing code for the priors of MLP weights (`W1`, `b1`, `W2`), basis
+  coefficients (`innovations` or `latent`), and scale (`sigma`).
 """
 function get_priors(
     m::AdaptiveSmooth, spec::NamedTuple, arch::String,
@@ -141,15 +167,16 @@ function get_priors(
     in_dim = spec.hyper.in_dim
     n_bins = m.nbins
 
-    priors = [
-        "$(p_names.W1) ~ MvNormal(zeros($(in_dim * h_dim)), I)",
-        "$(p_names.b1) ~ MvNormal(zeros($(h_dim)), I)",
-        "$(p_names.W2) ~ MvNormal(zeros($(h_dim * n_bins)), I)",
-        "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))"
-    ]
+    priors = String[]
+    push!(priors, "$(p_names.W1) ~ MvNormal(zeros(T, $(in_dim * h_dim)), I)")
+    push!(priors, "$(p_names.b1) ~ MvNormal(zeros(T, $(h_dim)), I)")
+    push!(priors, "$(p_names.W2) ~ MvNormal(zeros(T, $(h_dim * n_bins)), I)")
+    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     if m.method in [:noncentered, :rw2_penalty]
-        push!(priors, "$(p_names.innov) ~ MvNormal(zeros($(n_bins)), I)")
+        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_bins)), I)")
+    elseif m.method == :centered
+        push!(priors, "$(p_names.latent) ~ MvNormal(zeros(T, $(n_bins)), I)")
     end
     
     return join(priors, "\n    ")
@@ -160,6 +187,16 @@ end
 
 Generates the Turing code to construct the adaptive basis and compute the smooth
 effect, dispatching on the chosen method.
+
+# Inputs
+- `m::AdaptiveSmooth`: The `AdaptiveSmooth` component instance.
+- `spec::NamedTuple`: The component's specification, including its `key` and `hyper` parameters.
+- `arch::String`: The model architecture (`"univariate"` or `"multivariate"`).
+- `outcome_idx::Union{Int, Nothing}`: The index of the outcome for multivariate models.
+- `M::NamedTuple`: The main model configuration.
+
+# Outputs
+- `String`: Turing code for constructing the adaptive smooth effect and adding it to the linear predictor.
 """
 function get_updates(
     m::AdaptiveSmooth, spec::NamedTuple, arch::String,
@@ -186,7 +223,7 @@ function get_updates(
         # --- AdaptiveSmooth Component (Non-Centered): $(key) ---
         let
             $(common_code)
-            local scaled_coeffs = $(p_names.innov) .* $(p_names.sigma)
+            local scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
             local adaptive_effect = B_adaptive * scaled_coeffs
             $(eta_target) .+= adaptive_effect
         end
@@ -196,8 +233,8 @@ function get_updates(
         # --- AdaptiveSmooth Component (Centered): $(key) ---
         let
             $(common_code)
-            local coeffs ~ MvNormal(zeros($(n_bins)), $(p_names.sigma)^2 * I)
-            local adaptive_effect = B_adaptive * coeffs
+            $(p_names.latent) ~ MvNormal(zeros(T, $(n_bins)), $(p_names.sigma)^2 * I)
+            local adaptive_effect = B_adaptive * $(p_names.latent)
             $(eta_target) .+= adaptive_effect
         end
     """
@@ -211,7 +248,7 @@ function get_updates(
             local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0 # RW2 constraints
             
-            local coeffs = hyper.U * (diag_D .* $(p_names.innov))
+            local coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             local adaptive_effect = B_adaptive * coeffs
             
             $(eta_target) .+= adaptive_effect
@@ -225,10 +262,24 @@ function get_updates(
 end
 
 """
-    get_effects(m::AdaptiveSmooth, chain, M::NamedTuple, ...)
+    get_effects(m::AdaptiveSmooth, chain, M::NamedTuple, n_samples, outcomes_N, spec, PS, N_total)
 
 Reconstructs the `AdaptiveSmooth` component's effect from posterior samples,
 dispatching on the method used during sampling.
+
+# Inputs
+- `m::AdaptiveSmooth`: The `AdaptiveSmooth` component instance.
+- `chain`: The MCMC chain object.
+- `M::NamedTuple`: The main model configuration.
+- `n_samples::Int`: The number of posterior samples.
+- `outcomes_N::Int`: The number of outcome variables.
+- `spec::NamedTuple`: The component's specification, including its `key` and `hyper` parameters.
+- `PS::Union{NamedTuple, Nothing}`: The prediction set configuration object, if applicable.
+- `N_total::Int`: The total number of observations (training + prediction).
+
+# Outputs
+- `NamedTuple`: A NamedTuple with `structured` and `noisy` effects, each a vector of matrices
+  `[N_total x n_samples]`.
 """
 function get_effects(
     m::AdaptiveSmooth, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -244,14 +295,25 @@ function get_effects(
         coords_train
     end
     n_obs_full = size(coords_full, 1)
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
+        W1_name = _find_parameter(p_names_vec, string(spec.key), "W1", k, is_multivariate_model)
+        b1_name = _find_parameter(p_names_vec, string(spec.key), "b1", k, is_multivariate_model)
+        W2_name = _find_parameter(p_names_vec, string(spec.key), "W2", k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
         
-        W1_samples = get_params_vector(chain, string(p_names.W1), m.hidden_dim * spec.hyper.in_dim)
-        b1_samples = get_params_vector(chain, string(p_names.b1), m.hidden_dim)
-        W2_samples = get_params_vector(chain, string(p_names.W2), m.hidden_dim * m.nbins)
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
+        if isempty(W1_name) || isempty(b1_name) || isempty(W2_name) || isempty(sigma_name)
+            @warn "MLP parameters for AdaptiveSmooth component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
+            continue
+        end
+
+        W1_samples = get_params_vector(chain, W1_name, m.hidden_dim * spec.hyper.in_dim)
+        b1_samples = get_params_vector(chain, b1_name, m.hidden_dim)
+        W2_samples = get_params_vector(chain, W2_name, m.hidden_dim * m.nbins)
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
 
         effect_k = zeros(Float64, n_obs_full, n_samples)
 
@@ -265,17 +327,29 @@ function get_effects(
             
             local coeffs
             if m.method == :centered
-                coeffs = get_params_vector(chain, string(p_names.latent), m.nbins)[i, :]
-            else
-                innov_samples = get_params_vector(chain, string(p_names.innov), m.nbins)
-                if m.method == :noncentered
-                    coeffs = innov_samples[i, :] .* sigma_samples[i]
-                else # :rw2_penalty
-                    U = spec.hyper.U
-                    L = spec.hyper.L
-                    diag_D = sigma_samples[i] ./ sqrt.(L .+ M.noise)
-                    diag_D[1] = 0.0; diag_D[2] = 0.0
-                    coeffs = U * (diag_D .* innov_samples[i, :])
+                latent_name = _find_parameter(p_names_vec, string(spec.key), "latent", k, is_multivariate_model)
+                if isempty(latent_name)
+                    @warn "Latent coefficients for centered AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
+                    coeffs = zeros(m.nbins)
+                else
+                    coeffs = get_params_vector(chain, latent_name, m.nbins)[i, :]
+                end
+            else # :noncentered or :rw2_penalty
+                innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+                if isempty(innovations_name)
+                    @warn "Innovations for AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
+                    coeffs = zeros(m.nbins)
+                else
+                    innovations_samples = get_params_vector(chain, innovations_name, m.nbins)
+                    if m.method == :noncentered
+                        coeffs = innovations_samples[i, :] .* sigma_samples[i]
+                    else # :rw2_penalty
+                        U = spec.hyper.U
+                        L = spec.hyper.L
+                        diag_D = sigma_samples[i] ./ sqrt.(L .+ M.noise)
+                        diag_D[1] = 0.0; diag_D[2] = 0.0 # RW2 constraints
+                        coeffs = U * (diag_D .* innovations_samples[i, :])
+                    end
                 end
             end
             

@@ -1,5 +1,3 @@
-
-
 """
     None <: ComponentModel
 
@@ -15,19 +13,16 @@ v1.0.0 (2026-08-08)
 This component has no mathematical form and adds nothing to the model's linear
 predictor or its likelihood. It is equivalent to adding zero.
 
-# Assumptions
-N/A
+# Inputs
+- **Required**: None.
+- **Optional**: None.
 
-# Best Use Case
-Internal use by the `bstm` framework's formula parser. It can also be used by
-developers to explicitly create a null or placeholder effect in a model template.
+# Outputs (Parameter Names)
+- This component produces no parameters.
 
 # Key References
 - This component implements the Null Object pattern.
-- Wikipedia: Null object pattern
-
-# Fields
-This component has no fields.
+ 
 """
 struct None <: ComponentModel end
 

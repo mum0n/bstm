@@ -1,56 +1,95 @@
 """
     Movement <: ComponentModel
 
-A component model for a latent spatial field whose correlation structure is
-determined by a habitat conductivity or resistivity layer. It parameterizes
-spatiotemporal paths or potentials by defining a Gaussian Markov Random Field (GMRF)
-on a graph with data-driven edge weights. This allows for modeling non-stationary
-spatial processes where movement or correlation is facilitated or impeded by
-underlying environmental features.
+A component for simulating population dynamics using an advection-diffusion
+process on a discrete spatial graph or a continuous surface. This component models
+the change in a latent field over time due to two primary processes: advection
+(directional movement with a velocity field) and diffusion (random movement from
+high to low concentration areas).
 
 # Version
-v1.0.2 (2026-08-10)
+v1.0.2 (2026-08-12)
 
 # Mathematical Summary
-The component models a latent spatial field \$\\phi\$ as a GMRF,
-\$\\boldsymbol{\\phi} \\sim \\mathcal{N}(\\mathbf{0}, (\\sigma^2 \\mathbf{Q}_{\\beta})^{-1})\$,
-where the precision matrix \$\\mathbf{Q}_{\\beta}\$ is a graph Laplacian that depends on a
-learned parameter \$\\beta\$.
+The component approximates the solution to the advection-diffusion partial
+differential equation (PDE), which describes the transport of a substance or
+quantity. A general reference can be found on Wikipedia's page for the
+[Convection-diffusion equation](https://en.wikipedia.org/wiki/Convection%E2%80%93diffusion_equation).
 
-The edge weight \$w_{ij}\$ between two connected spatial units \$i\$ and \$j\$ is defined
-as a function of the habitat conductivity/resistivity \$H\$ at those locations:
-\$w_{ij} = \\exp\\left( \\beta \\cdot \\frac{H_i + H_j}{2} \\right)\$
-A positive \$\\beta\$ implies that higher habitat values correspond to stronger
-connectivity (lower movement cost), treating \$H\$ as a conductivity layer. A
-negative \$\\beta\$ implies the opposite, treating \$H\$ as a resistivity layer.
+\$\\frac{\\partial C}{\\partial t} = \\nabla \\cdot (D \\nabla C) - \\nabla \\cdot (\\mathbf{v} C)\$
 
-The precision matrix is then constructed as the weighted graph Laplacian:
-\$\\mathbf{Q}_{\\beta} = \\mathbf{D}_{\\beta} - \\mathbf{W}_{\\beta}\$
-where \$\\mathbf{W}_{\\beta}\$ is the matrix of weights \$w_{ij}\$ and \$\\mathbf{D}_{\\beta}\$ is the
-diagonal matrix of row sums of \$\\mathbf{W}_{\\beta}\$.
+where:
+- `C` is the concentration or density of the population.
+- `D` is the diffusion coefficient, which can be spatially varying.
+- `v` is the velocity field for advection.
+
+This implementation uses a discrete state-space representation on a graph, where
+the spatial operators are derived from the graph's adjacency matrix `W`. The
+temporal evolution is modeled using either an explicit or implicit Euler scheme.
+This approach is common in hierarchical Bayesian models for ecological processes,
+such as those described by **Wikle (2003)** in "Hierarchical Bayesian models for
+predicting the spread of ecological processes."
 
 # Computational Methods
-- `:cholesky` (default): An AD-safe method using dense Cholesky factorization.
-- `:cholesky_sparse` (didactic, not AD-safe): A more memory-efficient method using
-  sparse Cholesky factorization, suitable for gradient-free samplers.
+The `Movement` component supports multiple numerical methods for temporal evolution,
+controlled by the `method` parameter in the `random()` call:
 
-# Fields
-- `beta::UnivariateDistribution`: Prior for the parameter \$\\beta\$.
-- `sigma::UnivariateDistribution`: Prior for the marginal standard deviation.
-- `method::Symbol`: The computational method, `:cholesky` or `:cholesky_sparse`.
+- **`:explicit` (Default, AD-friendly)**: Uses an explicit Euler time-stepping
+  scheme. This method is fully compatible with automatic differentiation (AD) and
+  thus suitable for gradient-based samplers like NUTS. However, it is only
+  conditionally stable and may require small time steps or strong priors on
+  `velocity` and `diffusion` to prevent numerical instability.
+  The update rule is:
+  `u_t = u_{t-1} + dt * (v*A*u_{t-1} + D*L*u_{t-1})`
+
+- **`:implicit` (Didactic, Not AD-friendly)**: Uses an implicit Euler time-stepping
+  scheme, which is unconditionally stable and often more robust for stiff problems
+  (e.g., high diffusion). This method requires solving a linear system at each
+  time step, which is done via an `lu` decomposition. This decomposition is not
+  differentiable, making this method incompatible with AD. It is retained as a
+  didactic alternative for use with gradient-free samplers.
+  The update rule is:
+  `(I - dt*(v*A + D*L)) * u_t = u_{t-1}`
+
+# Continuous Space Formulation
+If no adjacency matrix `W` is provided, the component can be configured to operate
+on a continuous domain by discretizing it into a fine lattice based on a provided
+`habitat_raster`. The values in this raster can then influence the diffusion
+parameter, allowing for spatially-varying movement dynamics.
+
+# Inputs
+- **Required**:
+  - A spatial index variable (e.g., `s_idx`).
+  - A temporal index variable (e.g., `year`).
+  - Either an adjacency matrix `W` passed as a keyword argument to `@bstm`, or a
+    `habitat_raster` matrix passed as a parameter to the `movement` module.
+- **Optional**:
+  - `habitat`: A `Symbol` pointing to a column in the data, or a `Vector` of length `s_N`.
+  - `method`: A `Symbol` specifying the numerical method (`:explicit` or `:implicit`).
+  - `velocity`: A `UnivariateDistribution` for the prior on the advection velocity. Default: `Normal(0, 0.5)`.
+  - `diffusion`: A `UnivariateDistribution` for the prior on the diffusion rate. Default: `LogNormal(-1, 1)`.
+  - `sigma`: A `UnivariateDistribution` for the prior on the process noise standard deviation. Default: `Exponential(1.0)`.
+
+# Outputs (Parameter Names)
+- `velocity_<key>`: The global advection velocity parameter.
+- `diffusion_<key>`: The base diffusion parameter.
+- `beta_habitat_diffusion_<key>`: The coefficient for the effect of the habitat
+  covariate on diffusion (only if `habitat` is provided).
+- `sigma_<key>`: The marginal standard deviation of the movement process.
+- `innovations_<key>`: The latent innovations driving the process.
 """
 struct Movement <: ComponentModel
-    beta::UnivariateDistribution
+    velocity::UnivariateDistribution
+    diffusion::UnivariateDistribution
     sigma::UnivariateDistribution
     method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:movement] = Movement
 COMPONENT_CONSTRUCTORS[:movement] = (p, params) -> Movement(
-    p.beta, p.sigma, get(params, :method, :cholesky)
+    p.velocity, p.diffusion, p.sigma, get(params, :method, :explicit)
 )
-
-MODEL_TO_STRUCTURE_MAP[:movement] = :spatial
+MODEL_TO_STRUCTURE_MAP[:movement] = :spacetime
 
 function _raster_to_graph(raster::AbstractMatrix)
     rows, cols = size(raster)
@@ -72,102 +111,87 @@ function _raster_to_graph(raster::AbstractMatrix)
     return W
 end
 
-"""
-    get_datastructures!(m_type::Type{<:Movement}, M::Dict, mod_data::Dict)::Bool
-
-Establishes the spatial context. If an adjacency matrix `W` is not provided, it
-attempts to generate one from a `habitat_raster` parameter, assuming a regular
-grid structure. It also resolves the `habitat` data vector.
-"""
 function get_datastructures!(m_type::Type{<:Movement}, M::Dict, mod_data::Dict)::Bool
     params = mod_data[:params]
     data = M[:data]
-
+    
     if !haskey(M, :W)
         if haskey(params, :habitat_raster)
             raster = params[:habitat_raster]
             if !(raster isa AbstractMatrix); error("`habitat_raster` must be a matrix."); end
             M[:W] = _raster_to_graph(raster)
-            M[:s_N] = size(raster, 1) * size(raster, 2)
-            # For raster-based models, s_idx must map observations to grid cells.
-            # This requires coordinate columns in the data.
-            if !hasproperty(data, :s_x) || !hasproperty(data, :s_y)
-                error("Raster-based Movement model requires `s_x` and `s_y` columns in data to map observations to grid cells.")
-            end
-            # This part would require a function to map continuous coordinates to grid cell indices.
-            # For simplicity, we assume this mapping is pre-computed and passed as s_idx.
-            if !haskey(M, :s_idx); error("`s_idx` must be provided for raster-based Movement models."); end
         else
-            error("The `movement` model requires either an adjacency matrix `W` or a `habitat_raster` parameter.")
+            error("The `movement` component requires either an adjacency matrix `W` or a `habitat_raster` parameter.")
         end
     end
     
-    # Now that W is guaranteed to exist, run the standard spatial processor.
     process_spatial_module!(M, mod_data, Dict(), Dict())
+    process_temporal_module!(M, mod_data, Dict(), Dict())
+    
     s_N = M[:s_N]
+    
+    if haskey(params, :habitat)
+        habitat_val = params[:habitat]
+        local habitat_data::Vector{Float64}
 
-    if !haskey(params, :habitat)
-        error("The `movement` model requires a `habitat` parameter specifying the conductivity/resistivity data.")
-    end
-
-    habitat_val = params[:habitat]
-    local habitat_data::Vector{Float64}
-
-    if habitat_val isa Symbol
-        if !hasproperty(data, habitat_val); error("Habitat variable ':$habitat_val' not found in data."); end
-        habitat_per_obs = data[!, habitat_val]
-        habitat_aggregated = zeros(Float64, s_N)
-        counts = zeros(Int, s_N)
-        for i in 1:M[:y_N]
-            s_i = M[:s_idx][i]
-            habitat_aggregated[s_i] += habitat_per_obs[i]
-            counts[s_i] += 1
+        if habitat_val isa Symbol
+            if !hasproperty(data, habitat_val); error("Habitat variable ':$habitat_val' not found in data."); end
+            habitat_per_obs = data[!, habitat_val]
+            habitat_aggregated = zeros(Float64, s_N)
+            counts = zeros(Int, s_N)
+            for i in 1:M[:y_N]
+                s_i = M[:s_idx][i]
+                habitat_aggregated[s_i] += habitat_per_obs[i]
+                counts[s_i] += 1
+            end
+            habitat_data = habitat_aggregated ./ max.(1, counts)
+        elseif habitat_val isa AbstractVector
+            if length(habitat_val) != s_N; error("Provided `habitat` vector length ($(length(habitat_val))) does not match s_N ($(s_N))."); end
+            habitat_data = convert(Vector{Float64}, habitat_val)
+        else
+            error("The `habitat` parameter must be a Symbol (column name) or a Vector of length s_N.")
         end
-        habitat_data = habitat_aggregated ./ max.(1, counts)
-    elseif habitat_val isa AbstractVector
-        if length(habitat_val) != s_N; error("Provided `habitat` vector length ($(length(habitat_val))) does not match s_N ($(s_N))."); end
-        habitat_data = convert(Vector{Float64}, habitat_val)
-    else
-        error("The `habitat` parameter must be a Symbol (column name) or a Vector of length s_N.")
+        M[Symbol("habitat_", mod_data[:key])] = habitat_data
     end
-
-    M[Symbol("habitat_", mod_data[:key])] = habitat_data
+    
     return true
 end
 
-"""
-    get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Pre-computes the sparse structure (I, J vectors) of the adjacency matrix `W`.
-"""
 function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
     W = M.W
-    I, J, _ = findnz(W)
-    return (W_I=I, W_J=J, n_latent=size(W,1))
+    s_N = M.s_N
+
+    L_template = build_structure_template(:besag, s_N; W=W).matrix
+    
+    W_dir = tril(W, -1)
+    out_degree = sum(W_dir, dims=2)[:]
+    D_inv = spdiagm(0 => 1.0 ./ (out_degree .+ 1e-9))
+    A_template = D_inv * W_dir
+
+    return (L_template=L_template, A_template=A_template, n_latent=s_N * M.t_N)
 end
 
-"""
-    get_priors(m::Movement, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for `beta`, `sigma`, and the raw innovations.
-"""
-function get_priors(m::Movement, spec::NamedTuple, arch::String, outcome_idx, M)::String
+function get_priors(
+    m::Movement, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
+    M::NamedTuple
+)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     priors = String[]
 
-    push!(priors, "$(p_names.beta) ~ $(_distribution_to_string(m.beta))")
+    push!(priors, "$(p_names.velocity) ~ $(_distribution_to_string(m.velocity))")
+    push!(priors, "$(p_names.diffusion) ~ $(_distribution_to_string(m.diffusion))")
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.raw) ~ MvNormal(zeros(spec.hyper.n_latent), I)")
+    
+    if haskey(M, Symbol("habitat_", spec.key))
+        beta_habitat_diffusion_name = "beta_habitat_diffusion_$(spec.key)"
+        push!(priors, "$(beta_habitat_diffusion_name) ~ Normal(0, 1.0)")
+    end
+    
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
 
-"""
-    get_updates(m::Movement, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates code to construct the habitat-weighted precision matrix and sample the
-latent field, dispatching on the chosen method.
-"""
 function get_updates(
     m::Movement, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -176,87 +200,138 @@ function get_updates(
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
 
-    common_code = """
-        local W_I = spec_registry[:$(key)].hyper.W_I
-        local W_J = spec_registry[:$(key)].hyper.W_J
-        local habitat = M[Symbol("habitat_$(key)")]
-        
-        local V_beta = exp.($(p_names.beta) .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
-        local W_beta = sparse(W_I, W_J, V_beta, M.s_N, M.s_N)
-        
-        local D_beta = Diagonal(vec(sum(W_beta, dims=2)))
-        local Q_beta = D_beta - W_beta
+    diffusion_field_code = if haskey(M, Symbol("habitat_", key))
+        """
+        habitat_field = M[Symbol("habitat_$(key)")]
+        diffusion_field = $(p_names.diffusion) .* exp.(beta_habitat_diffusion_$(key) .* habitat_field)
+        """
+    else
+        "diffusion_field = fill($(p_names.diffusion), M.s_N)"
+    end
+
+    common_setup = """
+        # --- Movement Dynamics: $(key) ---
+        $(diffusion_field_code)
+        T_num_dyn = eltype(diffusion_field)
+        dyn_field = zeros(T_num_dyn, M.s_N, M.t_N)
+        innov_matrix = reshape($(p_names.innovations), M.s_N, M.t_N)
+        L_op = spec_registry[:$(key)].hyper.L_template
+        A_op = spec_registry[:$(key)].hyper.A_template
     """
 
-    cholesky_code = """
-        # --- Movement Component (Cholesky, AD-Safe): $(key) ---
-        let
-            $(common_code)
-            local F = cholesky(Symmetric(Matrix(Q_beta) + M.noise * I))
-            local latent_field = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
-            $(eta_target) .+= view(latent_field, M.s_idx)
+    evolution_code = if m.method == :implicit
+        """
+        # Implicit Euler method (numerically stable, not AD-friendly)
+        for t in 2:M.t_N
+            propagator_t = lu(I(M.s_N) - $(p_names.velocity) * A_op - Diagonal(diffusion_field) * L_op)
+            dyn_field[:, t] = (propagator_t \\ dyn_field[:, t-1]) + innov_matrix[:, t]
         end
-    """
-
-    cholesky_sparse_code = """
-        # --- Movement Component (Sparse Cholesky, Not AD-Safe): $(key) ---
-        let
-            $(common_code)
-            local F = cholesky(Symmetric(Q_beta + M.noise * I))
-            local latent_field = $(p_names.sigma) .* (F.L' \\ $(p_names.raw))
-            $(eta_target) .+= view(latent_field, M.s_idx)
+        """
+    elseif m.method == :explicit
+        """
+        # Explicit Euler method (AD-friendly, conditionally stable)
+        propagator_t = $(p_names.velocity) * A_op + Diagonal(diffusion_field) * L_op
+        for t in 2:M.t_N
+            dyn_field[:, t] = dyn_field[:, t-1] + propagator_t * dyn_field[:, t-1] + innov_matrix[:, t]
         end
-    """
-
-    if m.method == :cholesky
-        return cholesky_code
-    elseif m.method == :cholesky_sparse
-        return cholesky_sparse_code
+        """
     else
         error("Unsupported method '$(m.method)' for Movement component.")
     end
+
+    application_code = """
+        dyn_field .*= $(p_names.sigma)
+        for i in 1:M.y_N
+            $(eta_target)[i] += dyn_field[M.s_idx[i], M.t_idx[i]]
+        end
+    """
+
+    return """
+    let
+        $(common_setup)
+        $(evolution_code)
+        $(application_code)
+    end
+    """
 end
 
-"""
-    get_effects(m::Movement, chain, M, n_samples, outcomes_N, spec, PS, N_total)::NamedTuple
-
-Reconstructs the `Movement` component's effect from posterior samples.
-"""
 function get_effects(
-    m::Movement, chain, M, n_samples::Int, outcomes_N::Int, spec::NamedTuple,
-    PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::Movement, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     key = spec.key
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
     
-    W_I = spec.hyper.W_I
-    W_J = spec.hyper.W_J
-    habitat = M[Symbol("habitat_", key)]
-    s_N = M.s_N
+    L_op = spec.hyper.L_template
+    A_op = spec.hyper.A_template
+    
+    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
+    t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, PS.t_idx)
+    t_N_full = maximum(t_idx_full)
 
-    for k_outcome in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k_outcome)
+    for k in 1:outcomes_N
+        velocity_name = _find_parameter(p_names_vec, string(key), "velocity", k, is_multivariate_model)
+        diffusion_name = _find_parameter(p_names_vec, string(key), "diffusion", k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names_vec, string(key), "sigma", k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(key), "innovations", k, is_multivariate_model)
 
-        beta_samples = get_params_vector(chain, string(p_names.beta), 1)[:, 1]
-        sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)[:, 1]
-        raw_samples = get_params_vector(chain, string(p_names.raw), s_N)
-
-        reconstructed_effects_k = zeros(Float64, s_N, n_samples)
-
-        for i in 1:n_samples
-            V_beta_i = exp.(beta_samples[i] .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
-            W_beta_i = sparse(W_I, W_J, V_beta_i, s_N, s_N)
-            D_beta_i = Diagonal(vec(sum(W_beta_i, dims=2)))
-            Q_beta_i = D_beta_i - W_beta_i
-            
-            # For reconstruction, dense Cholesky is safe and robust.
-            F_i = cholesky(Symmetric(Matrix(Q_beta_i) + M.noise * I))
-            reconstructed_effects_k[:, i] = sigma_samples[i] .* (F_i.L' \ raw_samples[i, :])
+        if isempty(velocity_name) || isempty(diffusion_name) || isempty(sigma_name) || isempty(innovations_name)
+            @warn "Parameters for Movement component $(key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            continue
         end
         
-        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
-        indexed_effects = reconstructed_effects_k[s_idx_full, :]
-        push!(structured_effects, indexed_effects)
+        velocity_samples = get_params_vector(chain, velocity_name, 1)[:, 1]
+        diffusion_samples = get_params_vector(chain, diffusion_name, 1)[:, 1]
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, M.s_N * M.t_N)
+        
+        beta_habitat_samples = if haskey(M, Symbol("habitat_", key))
+            beta_name = _find_parameter(p_names_vec, string(key), "beta_habitat_diffusion", k, is_multivariate_model)
+            isempty(beta_name) ? nothing : get_params_vector(chain, beta_name, 1)[:, 1]
+        else
+            nothing
+        end
+
+        reconstructed_effects_k = zeros(Float64, N_total, n_samples)
+
+        for i in 1:n_samples
+            diffusion_field = if !isnothing(beta_habitat_samples)
+                habitat_field = M[Symbol("habitat_", key)]
+                diffusion_samples[i] .* exp.(beta_habitat_samples[i] .* habitat_field)
+            else
+                fill(diffusion_samples[i], M.s_N)
+            end
+
+            dyn_field = zeros(M.s_N, t_N_full)
+            innov_matrix_train = reshape(innovations_samples[i, :], M.s_N, M.t_N)
+            innov_matrix_full = if t_N_full > M.t_N
+                hcat(innov_matrix_train, randn(M.s_N, t_N_full - M.t_N))
+            else
+                innov_matrix_train
+            end
+
+            if m.method == :implicit
+                for t in 2:t_N_full
+                    propagator_t = lu(I(M.s_N) - velocity_samples[i] * A_op - Diagonal(diffusion_field) * L_op)
+                    dyn_field[:, t] = (propagator_t \ dyn_field[:, t-1]) + innov_matrix_full[:, t]
+                end
+            else # :explicit
+                propagator_t = velocity_samples[i] * A_op + Diagonal(diffusion_field) * L_op
+                for t in 2:t_N_full
+                    dyn_field[:, t] = dyn_field[:, t-1] + propagator_t * dyn_field[:, t-1] + innov_matrix_full[:, t]
+                end
+            end
+            
+            dyn_field .*= sigma_samples[i]
+            
+            for j in 1:N_total
+                reconstructed_effects_k[j, i] = dyn_field[s_idx_full[j], t_idx_full[j]]
+            end
+        end
+        push!(structured_effects, reconstructed_effects_k)
     end
 
     return (structured=structured_effects, noisy=structured_effects)

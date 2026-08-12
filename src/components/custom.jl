@@ -6,7 +6,7 @@ This provides an "escape hatch" for advanced users who need to implement logic
 not covered by the standard components.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 This component does not have a fixed mathematical form. It is a "blank canvas"
@@ -14,6 +14,11 @@ where the user provides a `code_fragment` string containing valid Turing.jl mode
 code. This allows for the implementation of novel statistical relationships, custom
 priors, or likelihoods not covered by the standard `bstm` components. The user is
 responsible for defining the mathematical logic within this code fragment.
+
+For example, a user could implement a custom non-linear function:
+`y ~ Normal(a * x^b, sigma)`
+by providing a `code_fragment` that defines priors for `a` and `b` and adds the
+result to the linear predictor `eta`.
 
 # Assumptions
 - The user-provided `code_fragment` is syntactically correct Turing.jl code.
@@ -30,13 +35,22 @@ integrating logic from other libraries directly into a `bstm` model without need
 to create a full custom component file from scratch. It serves as a powerful didactic
 tool for learning how `bstm` constructs models.
 
+# Inputs
+- **Required**:
+  - `code_fragment`: A `String` containing valid Turing.jl model code. This can be
+    passed directly or as a variable name (Symbol) that resolves to a string in the
+    calling module.
+- **Optional**:
+  - `params`: A `Dict{Symbol, Any}` for user-defined parameters. A special key,
+    `:reconstruct_func`, can be included. Its value should be a function that
+    implements the posterior reconstruction logic for the custom component.
+
+# Outputs (Parameter Names)
+- All parameter names are defined by the user within the `code_fragment`. There are
+  no standard output parameter names for this component.
+
 # Key References
 - Turing.jl Documentation: https://turing.ml/dev/docs/using-turing/
-
-# Fields
-- `code_fragment::String`: A string containing valid Turing.jl model code.
-- `params::Dict{Symbol, Any}`: A dictionary for user-defined parameters, which can
-  include a `reconstruct_func` for posterior reconstruction.
 """
 struct Custom <: ComponentModel
     code_fragment::String
@@ -154,7 +168,9 @@ end
     get_effects(m::Custom, chain, M::NamedTuple, ...)::NamedTuple
 
 Calls a user-provided `reconstruct_func` for posterior reconstruction. If no
-function is provided, it returns a zero-effect with a warning.
+function is provided, it returns a zero-effect with a warning. The user's function
+will receive the full list of parameter names and the model's multivariate status
+to allow for correct use of `_find_parameter`.
 """
 function get_effects(
     m::Custom, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -164,8 +180,14 @@ function get_effects(
 
     if !isnothing(reconstruct_func) && isa(reconstruct_func, Function)
         try
+            # Pass additional arguments to the user's function to enable
+            # correct use of _find_parameter.
+            p_names_vec = string.(FlexiChains.parameters(chain))
+            is_multivariate_model = M.model_arch == "multivariate"
+            
             return reconstruct_func(
-                chain, M, n_samples, outcomes_N, spec, PS, N_total
+                chain, M, n_samples, outcomes_N, spec, PS, N_total,
+                p_names_vec, is_multivariate_model
             )
         catch e
             @error "The custom reconstruction function for component '$(spec.key)' failed."

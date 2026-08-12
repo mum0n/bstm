@@ -6,7 +6,7 @@ specified grouping variable. The correlation structure of the effects is determi
 by an inner `ComponentModel`.
 
 # Version
-v1.0.1 (2026-08-10)
+v1.1.0 (2026-08-11)
 
 # Mathematical Summary
 The `Mixed` component models effects that vary across the levels of a grouping
@@ -37,11 +37,20 @@ variable. It supports both simple (uncorrelated) and correlated random effects.
 - `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
   factorization, suitable for gradient-free samplers.
 
-# Fields
-- `group_var::Symbol`: The symbol of the grouping variable.
-- `lhs::Vector{String}`: A vector of strings representing the effects to be randomized.
-- `model::ComponentModel`: The inner component model defining the structure across groups.
-- `method::Symbol`: The computational method for correlated effects.
+# Inputs
+- **Required**:
+  - A grouping variable (e.g., `group_id`) passed to `random()`.
+  - One or more terms for the random effects (e.g., `1` for intercept, `covariate` for slope).
+- **Optional (in `random()` call)**:
+  - `model`: An inner `ComponentModel` defining the structure across groups (e.g., `iid()`, `ar1()`). Default: `iid()`.
+  - `method`: `Symbol`, computational method for correlated effects (`:spectral`, `:cholesky`, `:cholesky_sparse`). Default: `:spectral`.
+
+# Outputs (Parameter Names)
+- **Simple Effects**: Same as the inner model (e.g., `sigma_<key>`, `innovations_<key>`).
+- **Correlated Effects**:
+  - `L_corr_<key>`: The Cholesky factor of the correlation matrix for the effects.
+  - `sigma_effects_<key>`: The standard deviations for each random effect term.
+  - `innovations_<key>`: The raw standard normal innovations for the coefficients.
 """
 struct Mixed <: ComponentModel
     group_var::Symbol
@@ -62,16 +71,8 @@ COMPONENT_CONSTRUCTORS[:mixed] = (p, params) -> begin
     Mixed(group_var, lhs, inner_model_obj, method)
 end
 
-# Add to the model-to-structure map.
 MODEL_TO_STRUCTURE_MAP[:mixed] = :mixed
 
-"""
-    get_datastructures!(m_type::Type{<:Mixed}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `Mixed`. It validates the grouping
-variable, creates a numeric index for its levels, and stores this information in
-the main model configuration `M`.
-"""
 function get_datastructures!(m_type::Type{<:Mixed}, M::Dict, mod_data::Dict)::Bool
     params = mod_data[:params]
     group_var = get(params, :group_var, nothing)
@@ -92,50 +93,35 @@ function get_datastructures!(m_type::Type{<:Mixed}, M::Dict, mod_data::Dict)::Bo
     unique_levels = levels(group_data)
     n_cat = length(unique_levels)
     
-    # Create and store the integer index for the grouping variable.
     index_key = Symbol("mixed_idx_$(group_var)")
     M[index_key] = levelcode.(group_data)
     
-    # Store the number of categories for use in precomputes.
     params[:n_cat] = n_cat
     
     return true
 end
 
-"""
-    get_precomputes(m::Mixed, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Delegates pre-computation to the inner model to get the penalty matrix `Q_template`
-for the random effect coefficients.
-"""
 function get_precomputes(m::Mixed, M::NamedTuple, mod_data::Dict)::NamedTuple
     n_cat = get(mod_data[:params], :n_cat, 0)
     if n_cat == 0
         error("Number of categories for Mixed not determined in get_datastructures!.")
     end
 
-    # The inner model defines the structure across the group levels.
-    # We create a temporary module data dictionary to call its get_precomputes method.
     inner_mod_data = Dict(
         :key => Symbol("$(mod_data[:key])_inner"),
-        :type => :mixed, # The structure is over the mixed effect groups
+        :type => :mixed,
         :variables => [m.group_var],
-        :params => Dict(:n_cat => n_cat) # Pass n_cat for the inner model's dimension
+        :params => Dict(:n_cat => n_cat)
     )
 
     inner_precomputes = get_precomputes(m.model, M, inner_mod_data)
     
     return (
         inner_precomputes = inner_precomputes,
-        n_latent = n_cat * length(m.lhs) # Total number of latent coefficients
+        n_latent = n_cat * length(m.lhs)
     )
 end
 
-"""
-    get_priors(m::Mixed, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates priors for the `Mixed`, handling both simple and correlated effects.
-"""
 function get_priors(
     m::Mixed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -145,10 +131,8 @@ function get_priors(
     n_groups = spec.hyper.inner_precomputes.n_latent
 
     if n_terms == 1
-        # Simple random effect (uncorrelated intercept or slope)
-        # Delegate to the inner model's prior generator.
         inner_spec = (
-            key = spec.key, # Use the same key
+            key = spec.key,
             structure = :mixed,
             var = spec.var,
             component_obj = m.model,
@@ -157,55 +141,68 @@ function get_priors(
         )
         return get_priors(m.model, inner_spec, arch, outcome_idx, M)
     else
-        # Correlated random effects
         return """
         # Priors for Correlated Mixed Effects: $(spec.key)
         $(p_names.L_corr) ~ LKJCholesky($(n_terms), 1.0)
         $(p_names.sigma_effects) ~ filldist(Exponential(1.0), $(n_terms))
-        $(p_names.raw) ~ MvNormal(zeros($(n_groups * n_terms)), I)
+        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_groups * n_terms)), I)
         """
     end
 end
-
-
-"""
-    get_updates(m::Mixed, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code for constructing and applying the mixed effect,
-dispatching on the number of terms and the chosen computational method.
-"""
 function get_updates(
     m::Mixed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    index_var = Symbol("mixed_idx_$(m.group_var)")
+    index_var = "mixed_idx_$(m.group_var)"
     n_terms = length(m.lhs)
     n_groups = spec.hyper.inner_precomputes.n_latent
 
+    # This is the correct way to access the inner component's precomputed data inside the Turing model.
+    inner_hyper_access = "spec_registry[:$(spec.key)].hyper.inner_precomputes"
+
     if n_terms == 1
-        # --- Simple Random Effect (Uncorrelated Intercept or Slope) ---
-        inner_spec = (
-            key = spec.key, structure = :mixed, var = spec.var,
-            component_obj = m.model, params = spec.params,
-            hyper = spec.hyper.inner_precomputes
-        )
-        inner_update_frags = get_updates(m.model, inner_spec, arch, outcome_idx, M)
-        
-        update_inner_cleaned = replace(
-            inner_update_frags, Regex("M\\.\\w+_idx") => "M.$(index_var)"
-        )
-        
+        # --- Uncorrelated Random Effects (e.g., random(1 | group)) ---
         lhs_str = m.lhs[1]
-        if lhs_str == "1" || lhs_str == "intercept()"
-            return update_inner_cleaned
+        inner_model = m.model
+        
+        # This block generates the code to create the latent field for the random effect,
+        # mirroring the logic of the inner component's `get_updates` but with correct scope access.
+        local latent_field_code
+        if inner_model isa IID
+            # Simplest case: innovations scaled by sigma
+            latent_field_code = "$(p_names.latent) = $(p_names.innovations) .* $(p_names.sigma)"
+        elseif inner_model isa Union{ICAR, Besag, RW1, RW2, Leroux}
+            # GMRF-style models
+            if m.method == :spectral
+                latent_field_code = """
+                diag_D = $(p_names.sigma) ./ sqrt.($(inner_hyper_access).L .+ M.noise)
+                if $(inner_model isa Union{ICAR, Besag, RW1}); diag_D[1] = 0.0; end
+                if $(inner_model isa RW2); diag_D[1] = 0.0; diag_D[2] = 0.0; end
+                $(p_names.latent) = $(inner_hyper_access).U * (diag_D .* $(p_names.innovations))
+                """
+            else # :cholesky or :cholesky_sparse
+                latent_field_code = """
+                F_groups = $(inner_hyper_access).cholesky_factor
+                latent_field_raw = F_groups.L' \\ $(p_names.innovations)
+                if $(inner_model isa Union{ICAR, Besag, RW1, RW2})
+                    Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_groups)), sum(latent_field_raw))
+                end
+                $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
+                """
+            end
         else
-            update_without_eta = replace(
-                update_inner_cleaned, Regex("$(eta_target) \\.\\+= .*") => ""
-            )
-            return """
-            $(update_without_eta)
+            # Fallback for other simple models
+            latent_field_code = "$(p_names.latent) = $(p_names.innovations) .* $(p_names.sigma)"
+        end
+
+        # This block generates the code to apply the effect to the linear predictor.
+        local application_code
+        if lhs_str == "1" || lhs_str == "intercept()"
+            application_code = "$(eta_target) .+= view($(p_names.latent), M.$(index_var))"
+        else
+            application_code = """
             let cov_data = M.data[!, :$(Symbol(lhs_str))]
                 for i in 1:length($(eta_target))
                     $(eta_target)[i] += cov_data[i] * $(p_names.latent)[M.$(index_var)[i]]
@@ -213,8 +210,16 @@ function get_updates(
             end
             """
         end
+
+        return """
+        # --- Mixed Effect (Single): $(lhs_str) | $(m.group_var) ---
+        let
+            $(latent_field_code)
+            $(application_code)
+        end
+        """
     else
-        # --- Correlated Random Effects ---
+        # --- Correlated Random Effects (e.g., random(1 + cov | group)) ---
         application_loop = ""
         for i in 1:n_terms
             term = m.lhs[i]
@@ -226,20 +231,20 @@ function get_updates(
         end
 
         common_correlated_code = """
-            local L_effects_t = ($(p_names.L_corr).L' * Diagonal($(p_names.sigma_effects)))
-            local innovations_matrix = reshape($(p_names.raw), $(n_groups), $(n_terms))
+            L_effects_t = ($(p_names.L_corr).L' * Diagonal($(p_names.sigma_effects)))
+            innovations_matrix = reshape($(p_names.innovations), $(n_groups), $(n_terms))
         """
 
         spectral_code = """
             # --- Correlated Mixed Effects (Spectral): $(spec.key) ---
             let
                 $(common_correlated_code)
-                local inner_hyper = spec_registry[:$(spec.key)].hyper.inner_precomputes
-                local diag_D = 1.0 ./ sqrt.(inner_hyper.L .+ M.noise)
+                inner_hyper = $(inner_hyper_access)
+                diag_D = 1.0 ./ sqrt.(inner_hyper.L .+ M.noise)
                 if $(m.model isa ICAR || m.model isa Besag); diag_D[1] = 0.0; end
                 
-                local gamma_matrix = inner_hyper.U * (diag_D .* innovations_matrix)
-                local effects_matrix = gamma_matrix * L_effects_t
+                gamma_matrix = inner_hyper.U * (diag_D .* innovations_matrix)
+                effects_matrix = gamma_matrix * L_effects_t
                 
                 $(application_loop)
             end
@@ -249,10 +254,9 @@ function get_updates(
             # --- Correlated Mixed Effects (Cholesky): $(spec.key) ---
             let
                 $(common_correlated_code)
-                local Q_groups = spec_registry[:$(spec.key)].hyper.inner_precomputes.Q_template
-                local F_groups = cholesky(Symmetric(Matrix(Q_groups) + M.noise * I))
-                local gamma_matrix = F_groups.L' \\ innovations_matrix
-                local effects_matrix = gamma_matrix * L_effects_t
+                F_groups = $(inner_hyper_access).cholesky_factor
+                gamma_matrix = F_groups.L' \\ innovations_matrix
+                effects_matrix = gamma_matrix * L_effects_t
                 
                 $(application_loop)
             end
@@ -262,10 +266,10 @@ function get_updates(
             # --- Correlated Mixed Effects (Sparse Cholesky, Not AD-Safe): $(spec.key) ---
             let
                 $(common_correlated_code)
-                local Q_groups = spec_registry[:$(spec.key)].hyper.inner_precomputes.Q_template
-                local F_groups = cholesky(Symmetric(Q_groups + M.noise * I))
-                local gamma_matrix = F_groups.L' \\ innovations_matrix
-                local effects_matrix = gamma_matrix * L_effects_t
+                Q_groups = $(inner_hyper_access).Q_template
+                F_groups = cholesky(Symmetric(Q_groups + M.noise * I))
+                gamma_matrix = F_groups.L' \\ innovations_matrix
+                effects_matrix = gamma_matrix * L_effects_t
                 
                 $(application_loop)
             end
@@ -278,13 +282,6 @@ function get_updates(
     end
 end
 
-"""
-    get_effects(m::Mixed, chain, M::NamedTuple, ...)
-
-Reconstructs the posterior effects for each level of the grouping variable. This
-implementation handles both simple and correlated effects, and includes logic for
-out-of-sample prediction for new group levels.
-"""
 function get_effects(
     m::Mixed, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
@@ -292,6 +289,8 @@ function get_effects(
     n_terms = length(m.lhs)
     n_groups_train = spec.hyper.inner_precomputes.n_latent
     noise = M.noise
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names_vec = string.(FlexiChains.parameters(chain))
     
     group_var = m.group_var
     train_levels = unique(M.data[!, group_var])
@@ -314,29 +313,35 @@ function get_effects(
     end
 
     if n_terms == 1
-        # --- Simple (uncorrelated) random effects ---
         effects_per_outcome = Vector{Matrix{Float64}}()
         for k in 1:outcomes_N
-            p_names = generate_full_variable_names(spec, M.model_arch, k)
-            latent_samples = get_params_vector(chain, string(p_names.latent), n_groups_train)
-            
-            # Handle new levels for prediction
-            if has_new_levels
-                n_new = n_all_groups - n_groups_train
-                sigma_samples = get_params_vector(chain, string(p_names.sigma), 1)
-                new_effects = rand(Normal(0, 1), n_new, n_samples) .* sigma_samples'
-                
-                full_effects = zeros(n_all_groups, n_samples)
-                full_effects[1:n_groups_train, :] = latent_samples'
-                full_effects[(n_groups_train+1):end, :] = new_effects
-                push!(effects_per_outcome, full_effects)
-            else
-                push!(effects_per_outcome, latent_samples')
+            sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+
+            if isempty(sigma_name) || isempty(innovations_name)
+                @warn "Parameters for simple Mixed component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(effects_per_outcome, zeros(Float64, n_all_groups, n_samples))
+                continue
             end
+
+            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+            innovations_samples = get_params_vector(chain, innovations_name, n_groups_train)
+            
+            latent_samples_train = innovations_samples' .* sigma_samples'
+            
+            full_effects = zeros(Float64, n_all_groups, n_samples)
+            train_indices_map = [level_map[level] for level in train_levels]
+            full_effects[train_indices_map, :] = latent_samples_train
+
+            if has_new_levels
+                new_level_indices = setdiff(1:n_all_groups, train_indices_map)
+                new_effects = randn(length(new_level_indices), n_samples) .* sigma_samples'
+                full_effects[new_level_indices, :] = new_effects
+            end
+            push!(effects_per_outcome, full_effects)
         end
         return (type=:simple, effects=effects_per_outcome, lhs=m.lhs[1], indices=full_indices)
     else
-        # --- Correlated random effects ---
         effects_by_term = Dict{Symbol, Vector{Matrix{Float64}}}()
         for term in m.lhs
             term_key = (term == "1" || term == "intercept()") ? :intercept : Symbol("slope_$(term)")
@@ -344,16 +349,24 @@ function get_effects(
         end
 
         for k in 1:outcomes_N
-            p_names = generate_full_variable_names(spec, M.model_arch, k)
-            l_corr_samples = get_params_vector(chain, string(p_names.L_corr), n_terms * n_terms)
-            sigma_effects_samples = get_params_vector(chain, string(p_names.sigma_effects), n_terms)
-            raw_samples = get_params_vector(chain, string(p_names.raw), n_groups_train * n_terms)
+            l_corr_name = _find_parameter(p_names_vec, string(spec.key), "L_corr", k, is_multivariate_model)
+            sigma_effects_name = _find_parameter(p_names_vec, string(spec.key), "sigma_effects", k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+
+            if isempty(l_corr_name) || isempty(sigma_effects_name) || isempty(innovations_name)
+                @warn "Parameters for correlated Mixed component $(spec.key) (outcome $k) not found. Skipping."
+                continue
+            end
+
+            l_corr_samples = get_params_vector(chain, l_corr_name, n_terms * n_terms)
+            sigma_effects_samples = get_params_vector(chain, sigma_effects_name, n_terms)
+            innovations_samples = get_params_vector(chain, innovations_name, n_groups_train * n_terms)
             
             inner_precomputes = spec.hyper.inner_precomputes
 
             for s in 1:n_samples
                 L_effects_t = (reshape(l_corr_samples[s,:], n_terms, n_terms)' * Diagonal(sigma_effects_samples[s,:]))
-                innov_matrix = reshape(raw_samples[s,:], n_groups_train, n_terms)
+                innov_matrix = reshape(innovations_samples[s,:], n_groups_train, n_terms)
                 
                 local gamma_matrix
                 if m.method == :spectral
@@ -361,21 +374,20 @@ function get_effects(
                     if m.model isa ICAR || m.model isa Besag; diag_D[1] = 0.0; end
                     gamma_matrix = inner_precomputes.U * (diag_D .* innov_matrix)
                 else # :cholesky or :cholesky_sparse
-                    F_groups = cholesky(Symmetric(Matrix(inner_precomputes.Q_template) + noise * I))
+                    F_groups = inner_precomputes.cholesky_factor
                     gamma_matrix = F_groups.L' \ innov_matrix
                 end
                 
                 effects_matrix_train = gamma_matrix * L_effects_t
-                train_indices = [level_map[level] for level in train_levels]
+                train_indices_map = [level_map[level] for level in train_levels]
                 
                 for i in 1:n_terms
                     term_key = (m.lhs[i] == "1" || m.lhs[i] == "intercept()") ? :intercept : Symbol("slope_$(m.lhs[i])")
-                    effects_by_term[term_key][k][train_indices, s] = effects_matrix_train[:, i]
+                    effects_by_term[term_key][k][train_indices_map, s] = effects_matrix_train[:, i]
                 end
 
                 if has_new_levels
-                    @warn "Out-of-sample prediction for correlated mixed effects is simplified. New levels are drawn from the marginal prior."
-                    new_level_indices = setdiff(1:n_all_groups, train_indices)
+                    new_level_indices = setdiff(1:n_all_groups, train_indices_map)
                     n_new = length(new_level_indices)
                     new_innovs = randn(n_new, n_terms)
                     new_gamma = new_innovs # Simplified assumption

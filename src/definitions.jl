@@ -1,7 +1,7 @@
 
 
 # ==============================================================================
-# SECTION 1: CORE DATA STRUCTURES AND TYPE DEFINITIONS
+# SECTION 1: CORE COMPONENT STRUCTURES AND TYPE DEFINITIONS
 # ==============================================================================
 
 
@@ -12,12 +12,12 @@ abstract type ComponentOperator <: Component end
 # All component models must inherit from ComponentModel
 abstract type ComponentModel <: Component end
 
-struct None <: ComponentModel end
+struct None <: ComponentModel end # Placeholder for empty components
 
 
 # these constructors will be added upon by each component file
 const COMPONENT_CONSTRUCTORS = Dict{Symbol, Function}(
-    :none => (p, params) -> None()  
+    :none => (p, params) -> None()
 )
 
 # these structures will be added to where required in the component file
@@ -67,56 +67,6 @@ end
 const COMPONENT_TYPE_REGISTRY = Dict{Symbol, Type{<:ComponentModel}}(
     :none => None
 )
-
-
-# :iid => IID,
-#     :icar => ICAR,
-#     :besag => Besag,
-#     :bym2 => BYM2,
-#     :leroux => Leroux,
-#     :sar => SAR, 
-#     :dag => DAG,
-#     :ar1 => AR1,
-#     :ar2 => AR2,
-#     :rw1 => RW1,
-#     :rw2 => RW2,
-#     :fitc => FITC,
-#     :svgp => SVGP,
-#     :nystrom => Nystrom,
-#     :warp => Warp,
-#     :hyperbolic => Hyperbolic, 
-#     :exponentialdecay => ExponentialDecay,
-#     :gp => GP,
-#     :rff => RFF,
-#     :fft => FFT,
-#     :spde => SPDE,
-#     :cyclic => Cyclic,
-#     :harmonic => Harmonic,
-#     :pspline => PSpline,
-#     :bspline => BSpline,
-#     :tps => TPS,
-#     :wavelet => Wavelet,
-#     :eigen => Eigen,
-#     :moran => Moran,
-#     :spherical => Spherical,
-#     :barycentric => Barycentric,
-#     :bcgn => BCGN,
-#     :networkflow => NetworkFlow,
-#     :svar => SVAR,
-#     :kriging => Kriging,
-#     :localadaptive => LocalAdaptive,
-#     :tar => TAR,
-#     :dynamics => Dynamics,
-#     :custom => Custom,
-#     :composed => Composed,
-#     :nonstationaryvariance => NonStationaryVariance,
-#     :adaptivesmooth => AdaptiveSmooth,
-#     :lgcp => LGCP, # loggaussiancoxprocess
-#     :loggammacoxprocess => LogGammaCoxProcess, # loggammacoxprocess
-#     :shotnoisecoxprocess => ShotNoiseCoxProcess # shotnoisecoxprocess
-# )
-
-
 
   
 const PC_PRIORS = Dict(
@@ -206,13 +156,9 @@ const KNOWN_UNAMBIGUOUS_MODELS = Dict{Symbol, Symbol}(
     :sar => :spatial, 
     :dag => :spatial,
     :spde => :spatial,
-    :localadaptive => :spatial,
-    :mosaic => :spatial,
-    :networkflow => :spatial,
-    :lgcp => :spatial,
-    :loggammacoxprocess => :spatial,
-    :shotnoisecoxprocess => :spatial,
-    :bcgn => :spatial,
+    :localadaptive => :spatial, :mosaic => :spatial, :networkflow => :spatial,
+    :pointprocess => :spatial, # The consolidated point process component is spatial
+    :bcgn => :spatial, # Bipartite Graph Convolutional Network
 
     :ar1 => :temporal,
     :ar2 => :temporal,
@@ -224,18 +170,18 @@ const KNOWN_UNAMBIGUOUS_MODELS = Dict{Symbol, Symbol}(
 
     :pspline => :smooth,
     :bspline => :smooth,
-    :tps => :smooth,
+    :tps => :smooth, 
     :wavelet => :smooth,
+    :waveletgp => :smooth,
+    :spectralgp => :smooth,
+    
     :eigen => :smooth,
     :moran => :smooth,
-    :spherical => :smooth,
     :barycentric => :smooth, 
-    :exponentialdecay => :smooth,
-    :kriging => :smooth,
 
     :svar => :spacetime,
     :dynamics => :spacetime,
-    :composed => :spacetime,
+    :composed => :spacetime, # Default, can be overridden
     :nonstationaryvariance => :spacetime,
     :adaptivesmooth => :smooth
 )
@@ -295,9 +241,7 @@ const COMPONENT_CONFIG_ARGS = Dict(
     # Other models
     :dynamics => Dict(:model => "none"),
     :svar => Dict(),
-    :tar => Dict(),
-    :lgcp => Dict(:model => :icar, :grid_areas => "unit"),
-    :shotnoisecoxprocess => Dict(:n_parents => 50, :kernel => "se"),
+    :tar => Dict(), :pointprocess => Dict(:model => :lgcp, :inner_model => :icar, :grid_areas => "unit"),
     :localadaptive => Dict(:n_clusters => 5),
     :eigen => Dict(:n_factors => 1)
 )

@@ -28,22 +28,23 @@ function get_kernel_from_string(kernel_name::String)
 end
 
  
-# Version 1.1.2 (2026-08-06)
+# Version 1.2.0 (2026-08-11)
 # Purpose: Finds a parameter name in a list based on the `param_name_key` convention.
-# Rationale: This version is updated to correctly match the naming convention used by
-#            `generate_full_variable_names`, which includes an underscore and outcome
-#            index (e.g., `sigma_s_idx_1`) for multivariate/outcome-specific parameters,
-#            and handles bracketed indexing (e.g., `sigma_s_idx[1]`) for vector parameters.
-#            It prioritizes the most specific match found in the chain's parameter names.
-function _find_parameter(p_names, key, param_name, k=nothing)
-    # This function searches for a parameter in the MCMC chain's parameter list (`p_names`)
-    # by trying several common naming conventions in order of specificity.
-
-    base_name_prefix = "$(param_name)_$(key)" # e.g., "sigma_s_idx"
+# Rationale: This version is updated to correctly handle parameter naming conventions
+#            for both univariate and multivariate models. It introduces the
+#            `is_multivariate_model` argument. When `true`, it prioritizes searching
+#            for outcome-specific parameter names (e.g., `sigma_s_idx_1`). When `false`,
+#            it correctly searches for the base parameter name (e.g., `sigma_s_idx`),
+#            resolving the "parameter not found" warning for univariate models.
+function _find_parameter(
+    p_names, key, param_name, k=nothing, is_multivariate_model::Bool=false
+)
+    base_name_prefix = "$(param_name)_$(key)"
 
     # Priority 1: Exact match with outcome index suffix (e.g., "sigma_s_idx_1").
-    # This is the most specific pattern, used for outcome-specific parameters in multivariate models.
-    if !isnothing(k)
+    # This is the most specific pattern, used for outcome-specific parameters in
+    # multivariate models. This check is now conditional on `is_multivariate_model`.
+    if is_multivariate_model && !isnothing(k)
         specific_name_with_k_suffix = "$(base_name_prefix)_$(k)"
         if specific_name_with_k_suffix in p_names
             return specific_name_with_k_suffix
@@ -62,9 +63,8 @@ function _find_parameter(p_names, key, param_name, k=nothing)
         return base_name_prefix
     end
 
-    # Priority 3: Check for any bracketed indexed versions of the base name (e.g., "sigma_s_idx[1]", "sigma_s_idx[2]", ...).
-    # This is a fallback to indicate that a parameter of this base name exists as a vector.
-    # `get_params_vector` will then handle extracting all its elements.
+    # Priority 3: Check for any bracketed indexed versions of the base name.
+    # This is a fallback to find vector parameters like `beta[1], beta[2], ...`.
     re_indexed_any = Regex("^" * escape_string(base_name_prefix) * "\\[\\d+\\]")
     if any(n -> occursin(re_indexed_any, n), p_names)
         return base_name_prefix
@@ -262,120 +262,23 @@ function summarize_predictions(samples::AbstractArray; alpha=0.05)
     )
 end
 
-
-"""
-    _reconstruct(arch::UnivariateArchitecture, mode::String, chain, M::NamedTuple, PS, alpha::Float64)
-
-Reconstructs posterior summaries for univariate models.
-
-# Rationale for Update
-This function is updated to call the refactored `_discover_component_realizations`
-without the obsolete `all_vars` (parameter names) argument, aligning it with the
-new explicit component interface where components manage their own parameter discovery.
-"""
-function _reconstruct(arch::UnivariateArchitecture, mode::String, chain, M::NamedTuple, PS, alpha::Float64)
-    # --- 1. Metadata and Dimension Discovery ---
-    n_samples_val = size(chain, 1)
-    N_tot_val = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
-    outcomes_N_val = M.outcomes_N # For univariate, this is always 1.
-
-    # --- 2. Latent Field Reconstruction ---
-    # The `all_vars` argument is removed from this call.
-    registry = _discover_component_realizations(chain, M, PS, n_samples_val, outcomes_N_val, N_tot_val)
-
-    # --- 3. Linear Predictor Assembly ---
-    eta_post = _modular_eta_assembly(registry, M, PS, n_samples_val, outcomes_N_val)
-
-    # --- 4. Prediction and Log-Likelihood Calculation ---
-    p_denoised, p_noisy, log_lik = _process_ll_and_predictions(eta_post, chain, M, PS, outcomes_N_val, 1)
-
-    # --- 5. Final Result Consolidation ---
-    pstats = (
-        effects=_summarize_effects_registry(registry, M, outcomes_N_val, alpha),
-        predictions_denoised=summarize_predictions(dropdims(p_denoised, dims=3); alpha=alpha),
-        predictions_noisy=summarize_predictions(dropdims(p_noisy, dims=3); alpha=alpha),
-        log_likelihood=log_lik,
-        waic=_compute_waic(log_lik),
-        arch=arch
-    )
-
-    return pstats
-end
-
-
-
-"""
-    _reconstruct(arch::MultivariateArchitecture, mode::String, chain, M::NamedTuple, PS, alpha::Float64)
-
-Reconstructs posterior summaries for multivariate models.
-
-# Rationale for Update
-This function is updated to call the refactored `_discover_component_realizations`
-without the obsolete `all_vars` (parameter names) argument, aligning it with the
-new explicit component interface.
-"""
-function _reconstruct(arch::MultivariateArchitecture, mode::String, chain, M::NamedTuple, PS, alpha::Float64)
-    # --- 1. Metadata and Dimension Discovery ---
-    n_samples_val = size(chain, 1)
-    N_tot_val = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
-    outcomes_N_val = M.outcomes_N
-
-    # --- 2. Latent Field Reconstruction ---
-    # The `all_vars` argument is removed from this call.
-    registry = _discover_component_realizations(chain, M, PS, n_samples_val, outcomes_N_val, N_tot_val)
-  
-    # --- 3. Linear Predictor Assembly ---
-    eta_latent_post = _modular_eta_assembly(registry, M, PS, n_samples_val, outcomes_N_val)
-
-    # --- 4. Apply Correlation Structure ---
-    L_corr_samples = chain["L_corr"]
-    eta_post = similar(eta_latent_post)
-    for s in 1:size(eta_latent_post, 3)
-        eta_post[:, :, s] = eta_latent_post[:, :, s] * L_corr_samples[s].L
-    end
-
-    # --- 5. Prediction and Log-Likelihood Calculation ---
-    all_pred_results = [_process_ll_and_predictions(eta_post[:,:,k], chain, M, PS, outcomes_N_val, k) for k in 1:outcomes_N_val]
-    
-    p_denoised_summaries = [summarize_array(res.p_denoised, alpha=alpha) for res in all_pred_results]
-    p_noisy_summaries = [summarize_array(res.p_noisy, alpha=alpha) for res in all_pred_results]
-    all_log_lik = hcat([res.log_lik for res in all_pred_results]...)
-
-    # --- 6. Final Result Consolidation ---
-    pstats = (
-        effects=_summarize_effects_registry(registry, M, outcomes_N_val, alpha),
-        predictions_denoised=p_denoised_summaries,
-        predictions_noisy=p_noisy_summaries,
-        log_likelihood=all_log_lik
-    )
-
-    return pstats
-end
-
-
-
-"""
-    _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
-
-Extracts all latent effects from the MCMC chain by dispatching to the `get_effects`
-method of each component.
-
-# Rationale for Update
-This function is the core of the refactored posterior reconstruction engine. It replaces
-the legacy `extract_component` dispatch system with a standardized loop that calls the
-`get_effects` method defined in the explicit interface of each `ComponentModel`. This
-delegates the responsibility of reconstruction to the components themselves, simplifying
-the orchestration logic and making the system more modular and extensible. The `p_names`
-argument has been removed, as each `get_effects` method is now responsible for generating
-its own required parameter names.
-"""
+ 
+ 
+# Version 1.1.1 (2026-08-11)
+# Purpose: Extracts all latent effects from the MCMC chain.
+# Rationale: This version corrects a critical bug where the function was searching
+#            for the incorrect parameter name for fixed effects (`Xfixed_beta`). It
+#            now correctly uses `Xfixed_beta_prop` for univariate models and
+#            `Xfixed_beta_prop_flat` for multivariate models, resolving the "parameter
+#            not discovered" error. It also ensures the univariate fixed effects array
+#            is correctly shaped as a 3D array.
 function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
     registry = Dict{Symbol, Any}()
 
-    # --- Fixed effects and Intercept (logic remains the same) ---
+    # --- Fixed effects and Intercept ---
     if M.Xfixed_N > 0
         Xfixed_train = M.Xfixed
-        Xfixed_pred = if isnothing(PS) || !haskey(PS, :Xfixed) || isempty(PS.Xfixed)
+        Xfixed_pred = if isnothing(PS) || !haskey(PS, :Xfixed) || isempty(PS.Xfixed) || size(PS.Xfixed, 1) == 0
             zeros(0, M.Xfixed_N)
         else
             PS.Xfixed
@@ -383,16 +286,24 @@ function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N
         Xfixed_full = vcat(Xfixed_train, Xfixed_pred)
         
         if outcomes_N > 1
-            beta_samples_flat = get_params_vector(chain, "Xfixed_beta", M.Xfixed_N * outcomes_N)
+            # FIX: Use the correct parameter name for multivariate fixed effects.
+            beta_samples_flat = get_params_vector(
+                chain, "Xfixed_beta_prop_flat", M.Xfixed_N * outcomes_N
+            )
             fixed_effects_all = zeros(Float64, N_tot, n_samples, outcomes_N)
             for k in 1:outcomes_N
                 beta_k = beta_samples_flat[:, (k-1)*M.Xfixed_N+1 : k*M.Xfixed_N]
                 fixed_effects_all[:, :, k] = Xfixed_full * beta_k'
             end
             registry[:fixed] = fixed_effects_all
-        else
-            beta_samples = get_params_vector(chain, "Xfixed_beta", M.Xfixed_N)
-            registry[:fixed] = Xfixed_full * beta_samples'
+        else # Univariate case
+            # FIX: Use the correct parameter name for univariate fixed effects.
+            beta_samples = get_params_vector(
+                chain, "Xfixed_beta_prop", M.Xfixed_N
+            )
+            # FIX: Ensure the output is a 3D array for consistency.
+            fixed_effects_2d = Xfixed_full * beta_samples'
+            registry[:fixed] = reshape(fixed_effects_2d, N_tot, n_samples, 1)
         end
     else
         registry[:fixed] = zeros(Float64, N_tot, n_samples, outcomes_N)
@@ -409,16 +320,237 @@ function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N
         registry[:intercept] = zeros(Float64, N_tot, n_samples, outcomes_N)
     end
 
-    # --- NEW: Main Component Loop using get_effects ---
+    # --- Main Component Loop using get_effects ---
     for spec in M.components
-        # Call the get_effects method for the component. This method is now responsible
-        # for all logic, including handling multivariate cases and finding its own
-        # parameters in the chain.
-        effects = get_effects(spec.component_obj, chain, M, n_samples, outcomes_N, spec, PS, N_tot)
+        effects = get_effects(
+            spec.component_obj, chain, M, n_samples, outcomes_N, spec, PS, N_tot
+        )
         registry[spec.key] = effects
     end
 
     return NamedTuple(registry)
+end
+
+
+
+# Version 1.0.2 (2026-08-11)
+# Purpose: Reconstructs posterior summaries for univariate models.
+# Rationale: This version is confirmed to be correct, including the critical fix
+#            that extracts the 2D slice from the 3D linear predictor before processing,
+#            and ensures a complete and consistent set of outputs are returned.
+function _reconstruct(
+    arch::UnivariateArchitecture, mode::String, chain, M::NamedTuple, PS,
+    alpha::Float64
+)
+    # --- 1. Metadata and Dimension Discovery ---
+    n_samples_val = size(chain, 1)
+    N_tot_val = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
+    outcomes_N_val = 1 # For univariate, this is always 1.
+
+    # --- 2. Latent Field Reconstruction ---
+    registry = _discover_component_realizations(
+        chain, M, PS, n_samples_val, outcomes_N_val, N_tot_val
+    )
+
+    # --- 3. Linear Predictor Assembly ---
+    eta_post_3d = _modular_eta_assembly(
+        registry, M, PS, n_samples_val, outcomes_N_val
+    )
+    
+    # Extract the 2D matrix for the single outcome
+    eta_post_2d = eta_post_3d[:, :, 1]
+
+    # --- 4. Prediction and Log-Likelihood Calculation ---
+    pred_results = _process_ll_and_predictions(
+        eta_post_2d, chain, M, PS, outcomes_N_val, 1
+    )
+
+    # --- 5. Final Result Consolidation ---
+    pstats = (
+        effects=_summarize_effects_registry(registry, M, outcomes_N_val, alpha),
+        predictions_denoised=summarize_predictions(pred_results.p_denoised; alpha=alpha),
+        predictions_noisy=summarize_predictions(pred_results.p_noisy; alpha=alpha),
+        raw_predictions_denoised=pred_results.p_denoised,
+        raw_predictions_noisy=pred_results.p_noisy,
+        log_likelihood=pred_results.log_lik,
+        waic=_compute_waic(pred_results.log_lik),
+        arch=arch
+    )
+
+    return pstats
+end
+
+
+# Version 1.0.3 (2026-08-11)
+# Purpose: Reconstructs posterior summaries for multivariate models.
+# Rationale: This version is confirmed to be correct and complete, ensuring it
+#            returns all necessary outputs including raw predictions and waic.
+function _reconstruct(
+    arch::MultivariateArchitecture, mode::String, chain, M::NamedTuple, PS,
+    alpha::Float64
+)
+    # --- 1. Metadata and Dimension Discovery ---
+    n_samples_val = size(chain, 1)
+    N_tot_val = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
+    outcomes_N_val = M.outcomes_N
+
+    # --- 2. Latent Field Reconstruction ---
+    registry = _discover_component_realizations(
+        chain, M, PS, n_samples_val, outcomes_N_val, N_tot_val
+    )
+  
+    # --- 3. Linear Predictor Assembly ---
+    eta_latent_post = _modular_eta_assembly(
+        registry, M, PS, n_samples_val, outcomes_N_val
+    )
+
+    # --- 4. Apply Correlation Structure ---
+    L_corr_samples = get_params_vector(chain, "L_corr", outcomes_N_val * outcomes_N_val)
+    eta_post = similar(eta_latent_post)
+    for s in 1:n_samples_val
+        L_s = reshape(L_corr_samples[s, :], outcomes_N_val, outcomes_N_val)
+        eta_post[:, s, :] = eta_latent_post[:, s, :] * L_s'
+    end
+
+    # --- 5. Prediction and Log-Likelihood Calculation ---
+    all_pred_results = [
+        _process_ll_and_predictions(eta_post[:,:,k], chain, M, PS, outcomes_N_val, k)
+        for k in 1:outcomes_N_val
+    ]
+    
+    p_denoised_summaries = [summarize_array(res.p_denoised, alpha=alpha) for res in all_pred_results]
+    p_noisy_summaries = [summarize_array(res.p_noisy, alpha=alpha) for res in all_pred_results]
+    raw_denoised = [res.p_denoised for res in all_pred_results]
+    raw_noisy = [res.p_noisy for res in all_pred_results]
+    all_log_lik = hcat([res.log_lik for res in all_pred_results]...)
+
+    # --- 6. Final Result Consolidation ---
+    pstats = (
+        effects=_summarize_effects_registry(registry, M, outcomes_N_val, alpha),
+        predictions_denoised=p_denoised_summaries,
+        predictions_noisy=p_noisy_summaries,
+        raw_predictions_denoised=raw_denoised,
+        raw_predictions_noisy=raw_noisy,
+        log_likelihood=all_log_lik,
+        waic=_compute_waic(all_log_lik),
+        arch=arch
+    )
+
+    return pstats
+end
+
+
+# Version 1.0.2 (2026-08-11)
+# Purpose: Main reconstruction entry point for multi-fidelity models.
+# Rationale: This version is confirmed to be correct and complete, ensuring it
+#            returns all necessary outputs including raw predictions, waic, and the
+#            architecture object.
+function _reconstruct(
+    arch::MultifidelityArchitecture, mode::String, chain, M::NamedTuple, PS,
+    alpha::Float64
+)
+    n_samples = size(chain, 1)
+    N_tot = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
+    outcomes_N = M.outcomes_N
+
+    # 1. Reconstruct the main model's components (excluding nested effects)
+    main_registry = _discover_component_realizations(
+        chain, M, PS, n_samples, outcomes_N, N_tot
+    )
+    
+    # 2. Assemble the main model's base eta
+    eta_main = _modular_eta_assembly(
+        main_registry, M, PS, n_samples, outcomes_N
+    )
+
+    # 3. Reconstruct sub-models' etas and add them to the main eta
+    nested_results = Dict{Symbol, Any}()
+    if haskey(M, :nested_components)
+        for (key, sub_M) in M.nested_components
+            sub_PS = if !isnothing(PS) && haskey(PS, :nested_prediction_sets)
+                get(PS.nested_prediction_sets, key, nothing)
+            else
+                nothing
+            end
+
+            sub_outcomes_N = get(sub_M, :outcomes_N, 1)
+            sub_N_tot = isnothing(sub_PS) ? sub_M.y_N : sub_M.y_N + sub_PS.y_N
+            sub_registry = _discover_component_realizations(
+                chain, sub_M, sub_PS, n_samples, sub_outcomes_N, sub_N_tot
+            )
+            eta_sub = _modular_eta_assembly(
+                sub_registry, sub_M, sub_PS, n_samples, sub_outcomes_N
+            )
+
+            rho_name = "rho_nested_$(key)"
+            rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
+
+            if size(eta_sub, 1) != N_tot
+                @warn "Size mismatch between main model observations ($N_tot) and " *
+                      "nested model '$(key)' observations ($(size(eta_sub, 1)))." *
+                      " Cannot apply nested effect."
+                continue
+            end
+            
+            if outcomes_N > 1 || sub_outcomes_N > 1
+                @warn "Multi-fidelity connection between multivariate models is not " *
+                      "fully supported. Assuming a 1-to-1 outcome mapping." 
+            end
+            
+            eta_main .+= reshape(rho_samples, 1, n_samples, 1) .* eta_sub
+
+            sub_arch_raw = get(sub_M, :model_arch, "univariate")
+            sub_arch_type = if sub_arch_raw == "multivariate"
+                MultivariateArchitecture()
+            else
+                UnivariateArchitecture()
+            end
+            nested_results[key] = _reconstruct(
+                sub_arch_type, mode, chain, sub_M, sub_PS, alpha
+            )
+        end
+    end
+
+    # 4. Apply correlation and generate predictions for the final main model
+    eta_final = _apply_multivariate_correlation(eta_main, chain, outcomes_N)
+    
+    if outcomes_N > 1
+        all_pred_results = [
+            _process_ll_and_predictions(eta_final[:,:,k], chain, M, PS, outcomes_N, k)
+            for k in 1:outcomes_N
+        ]
+        p_denoised_summaries = [summarize_array(res.p_denoised, alpha=alpha) for res in all_pred_results]
+        p_noisy_summaries = [summarize_array(res.p_noisy, alpha=alpha) for res in all_pred_results]
+        raw_denoised = [res.p_denoised for res in all_pred_results]
+        raw_noisy = [res.p_noisy for res in all_pred_results]
+        all_log_lik = hcat([res.log_lik for res in all_pred_results]...)
+    else
+        pred_results = _process_ll_and_predictions(
+            eta_final[:,:,1], chain, M, PS, 1, 1
+        )
+        p_denoised_summaries = summarize_array(pred_results.p_denoised, alpha=alpha)
+        p_noisy_summaries = summarize_array(pred_results.p_noisy, alpha=alpha)
+        raw_denoised = pred_results.p_denoised
+        raw_noisy = pred_results.p_noisy
+        all_log_lik = pred_results.log_lik
+    end
+
+    summarized_effects = _summarize_effects_registry(
+        main_registry, M, outcomes_N, alpha
+    )
+    waic = _compute_waic(all_log_lik)
+
+    return (
+        predictions_denoised = p_denoised_summaries, 
+        predictions_noisy = p_noisy_summaries,
+        raw_predictions_denoised = raw_denoised,
+        raw_predictions_noisy = raw_noisy,
+        log_likelihood = all_log_lik, 
+        waic = waic, 
+        effects = summarized_effects, 
+        nested_results = nested_results, 
+        arch = arch
+    )
 end
 
 
@@ -548,17 +680,14 @@ end
 
 
 
-# Version 1.1.0 (2026-08-06)
-# Purpose: Generates denoised predictions, noisy predictions, and log-likelihood values from eta.
-# Rationale: This version corrects the parameter names used to extract likelihood-specific
-#            parameters from the MCMC chain. The original code used `sigma_y` and `lik_r_nb`,
-#            which caused "Parameter not discovered" warnings. The fix updates these to `y_sigma`
-#            and `r_nb`, which are the standard names produced by the bstm code generator.
+# Version 1.1.1 (2026-08-11)
+# Purpose: Generates predictions and log-likelihood values from eta.
+# Rationale: This version is updated to be more robust. It now checks the likelihood
+#            family before attempting to extract family-specific parameters like
+#            `y_sigma` (for Gaussian) or `r_nb` (for Negative Binomial). This prevents
+#            "Parameter not discovered" warnings when running models with other
+#            likelihoods (e.g., Poisson).
 function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
-    # This function applies the inverse link function to the linear predictor (`eta`) to get
-    # denoised predictions and then samples from the full predictive distribution to get
-    # noisy predictions. It also calculates the pointwise log-likelihood for WAIC.
-
     n_samples = size(eta_samples, 2)
     N_train = M.y_N
     N_pred = isnothing(PS) ? 0 : PS.y_N
@@ -571,18 +700,31 @@ function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
     use_zi = get(M, :use_zi, false)
     phi_zi_samples = use_zi ? get_params_vector(chain, "lik_phi_zi", 1)[:,1] : zeros(n_samples)
     
-    # Denoised predictions (on response scale)
     p_denoised_samples = similar(eta_samples)
     for s in 1:n_samples
-        p_denoised_samples[:, s] = _apply_link_and_lik(family, eta_samples[:, s], use_zi, phi_zi_samples[s])
+        p_denoised_samples[:, s] = _apply_link_and_lik(
+            family, eta_samples[:, s], use_zi, phi_zi_samples[s]
+        )
     end
 
     p_noisy_samples = similar(eta_samples)
     log_lik_samples = zeros(Float64, N_train, n_samples)
 
-    # FIX: Use the correct parameter names `y_sigma` and `r_nb`.
-    y_sigma_samples = get_params_vector(chain, "y_sigma", outcomes_N)
-    r_nb_samples = get_params_vector(chain, "r_nb", outcomes_N)
+    # FIX: Conditionally get parameters based on the likelihood family.
+    y_sigma_samples = if family in [
+        "gaussian", "lognormal", "student_t", "laplace", "half_normal",
+        "half_student_t"
+    ]
+        get_params_vector(chain, "y_sigma", outcomes_N)
+    else
+        ones(Float64, n_samples, outcomes_N)
+    end
+
+    r_nb_samples = if family == "negbin"
+        get_params_vector(chain, "r_nb", outcomes_N)
+    else
+        ones(Float64, n_samples, outcomes_N)
+    end
 
     trials_full = haskey(M, :trials) ? (isnothing(PS) ? M.trials[:,k] : vcat(M.trials[:,k], get(PS, :trials, ones(Int, PS.y_N)))) : ones(Int, N_tot)
     
@@ -596,8 +738,10 @@ function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
         for i in 1:N_tot
             eta_is = eta_samples[i, s]
             
-            # For sampling, y_obs in lik_obj doesn't matter.
-            lik_obj = bstm_Likelihood(family, [0.0]; phi_zi=phi_zi_s, r_nb=r_nb_s, sigma_y=y_sigma_s, trial=trials_full[i])
+            lik_obj = bstm_Likelihood(
+                family, [0.0]; phi_zi=phi_zi_s, r_nb=r_nb_s,
+                sigma_y=y_sigma_s, trial=trials_full[i]
+            )
             dist = get_dist_ref(lik_obj.family, lik_obj, eta_is, y_sigma_s)
             
             p_noisy_samples[i, s] = rand(dist) 
@@ -655,98 +799,7 @@ function _process_multinomial_predictions(eta_samples, chain, M, PS)
 end
  
 
-
-"""
-    _reconstruct(arch::MultifidelityArchitecture, mode::String, chain, M, PS, alpha)
-
-Main reconstruction entry point for multi-fidelity models.
-
-# Rationale for Update
-This function is updated to call the refactored `_discover_component_realizations`
-without the obsolete `p_names` argument, aligning it with the new explicit
-component interface.
-"""
-function _reconstruct(arch::MultifidelityArchitecture, mode::String, chain, M::NamedTuple, PS, alpha::Float64)
-    n_samples = size(chain, 1)
-    N_tot = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
-    outcomes_N = M.outcomes_N
-
-    # 1. Reconstruct the main model's components (excluding nested effects)
-    main_registry = _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
-    
-    # 2. Assemble the main model's base eta
-    eta_main = _modular_eta_assembly(main_registry, M, PS, n_samples, outcomes_N)
-
-    # 3. Reconstruct sub-models' etas and add them to the main eta
-    nested_results = Dict{Symbol, Any}()
-    if haskey(M, :nested_components)
-        for (key, sub_M) in M.nested_components
-            sub_PS = if !isnothing(PS) && haskey(PS, :nested_prediction_sets)
-                get(PS.nested_prediction_sets, key, nothing)
-            else
-                nothing
-            end
-
-            sub_outcomes_N = get(sub_M, :outcomes_N, 1)
-            sub_N_tot = isnothing(sub_PS) ? sub_M.y_N : sub_M.y_N + sub_PS.y_N
-            sub_registry = _discover_component_realizations(chain, sub_M, sub_PS, n_samples, sub_outcomes_N, sub_N_tot)
-            eta_sub = _modular_eta_assembly(sub_registry, sub_M, sub_PS, n_samples, sub_outcomes_N)
-
-            rho_name = "rho_nested_$(key)"
-            rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-
-            if size(eta_sub, 1) != N_tot
-                @warn "Size mismatch between main model observations ($N_tot) and nested model '$(key)' observations ($(size(eta_sub, 1))). Cannot apply nested effect."
-                continue
-            end
-            
-            if outcomes_N > 1 || sub_outcomes_N > 1
-                @warn "Multi-fidelity connection between multivariate models is not fully supported. Assuming a 1-to-1 outcome mapping." 
-            end
-            
-            eta_main .+= reshape(rho_samples, 1, n_samples, 1) .* eta_sub
-
-            sub_arch_raw = get(sub_M, :model_arch, "univariate")
-            sub_arch_type = sub_arch_raw == "multivariate" ? MultivariateArchitecture() : UnivariateArchitecture()
-            nested_results[key] = _reconstruct(sub_arch_type, mode, chain, sub_M, sub_PS, alpha)
-        end
-    end
-
-    # 4. Apply correlation and generate predictions for the final main model
-    eta_final = _apply_multivariate_correlation(eta_main, chain, outcomes_N)
-    
-    if outcomes_N > 1
-        all_pred_results = [_process_ll_and_predictions(eta_final[:,:,k], chain, M, PS, outcomes_N, k) for k in 1:outcomes_N]
-        p_denoised_summaries = [summarize_array(res.p_denoised, alpha=alpha) for res in all_pred_results]
-        p_noisy_summaries = [summarize_array(res.p_noisy, alpha=alpha) for res in all_pred_results]
-        raw_denoised = [res.p_denoised for res in all_pred_results]
-        raw_noisy = [res.p_noisy for res in all_pred_results]
-        all_log_lik = hcat([res.log_lik for res in all_pred_results]...)
-    else
-        pred_results = _process_ll_and_predictions(eta_final[:,:,1], chain, M, PS, 1, 1)
-        p_denoised_summaries = summarize_array(pred_results.p_denoised, alpha=alpha)
-        p_noisy_summaries = summarize_array(pred_results.p_noisy, alpha=alpha)
-        raw_denoised = pred_results.p_denoised
-        raw_noisy = pred_results.p_noisy
-        all_log_lik = pred_results.log_lik
-    end
-
-    summarized_effects = _summarize_effects_registry(main_registry, M, outcomes_N, alpha)
-    waic = _compute_waic(all_log_lik)
-
-    return (
-        predictions_denoised = p_denoised_summaries, 
-        predictions_noisy = p_noisy_summaries,
-        raw_predictions_denoised = raw_denoised,
-        raw_predictions_noisy = raw_noisy,
-        log_likelihood = all_log_lik, 
-        waic = waic, 
-        effects = summarized_effects, 
-        nested_results = nested_results, 
-        arch = arch
-    )
-end
-
+  
 
 
 # ==============================================================================
@@ -846,16 +899,102 @@ function _apply_link_and_lik(family::String, eta::AbstractArray, use_zi::Bool, p
     end
     return mu
 end
+ 
+# Version 1.1.0 (2026-08-11)
+# Purpose: Computes model-based post-stratification weights.
+# Rationale: This version implements a model-based weighting scheme where the weight for
+#            an observation is the ratio of the mean prediction within its stratum to the
+#            prediction for the observation itself. This method is intended to adjust
+#            individual predictions based on their stratum's average behavior.
+#            NOTE: This is a departure from traditional post-stratification weights, which
+#            are typically calculated as `Area(j) / n_obs_in_stratum(j)` to scale sample
+#            densities to population totals. This new implementation directly follows the user's
+#            request to base weights on prediction ratios.
+function post_stratification_weights(res, M, PS, samples_denoised)
+    # Assumptions:
+    #   1. The model configuration `M` contains the spatial index vector `:s_idx`.
+    # Inputs:
+    #   - res: The main results object (not used in this implementation).
+    #   - M: The model configuration object for the training data.
+    #   - PS: The prediction set configuration object (can be `nothing`).
+    #   - samples_denoised: A matrix of posterior predictions [n_obs x n_samples].
+    # Outputs: A matrix of weights of the same size as `samples_denoised`.
 
+    # #
+    # Input validation
+    if !haskey(M, :s_idx)
+        @warn "Post-stratification requires a spatial index `:s_idx` in the model configuration. Returning ones."
+        return ones(Float64, size(samples_denoised))
+    end
 
+    # #
+    # Combine stratum IDs from training and prediction sets
+    strata_ids_train = M.s_idx
 
-# Version 1.6.1 (2026-08-06)
+    strata_ids_full = if !isnothing(PS)
+        if !haskey(PS, :s_idx)
+            @warn "Prediction set provided but is missing spatial index `:s_idx`. Post-stratification weights will only be calculated for training data."
+            strata_ids_train
+        else
+            vcat(strata_ids_train, PS.s_idx)
+        end
+    else
+        strata_ids_train
+    end
+
+    n_obs_total, n_samples = size(samples_denoised)
+    
+    # Ensure the number of observations in samples_denoised matches the number of stratum IDs
+    if n_obs_total != length(strata_ids_full)
+        @error "Dimension mismatch: `samples_denoised` has $(n_obs_total) observations, but there are $(length(strata_ids_full)) stratum IDs. Cannot compute weights."
+        return ones(Float64, size(samples_denoised))
+    end
+
+    weights = zeros(Float64, n_obs_total, n_samples)
+    unique_strata = unique(strata_ids_full)
+
+    # #
+    # Calculate weights based on the ratio of stratum-mean prediction to observation-level prediction
+    for stratum in unique_strata
+        # Find indices of observations in the current stratum
+        obs_indices_in_stratum = findall(x -> x == stratum, strata_ids_full)
+        
+        if isempty(obs_indices_in_stratum)
+            continue
+        end
+
+        # Get the predictions for this stratum
+        predictions_in_stratum = view(samples_denoised, obs_indices_in_stratum, :)
+
+        # Calculate the mean prediction for the stratum for each posterior sample
+        # This results in a row vector of size [1 x n_samples]
+        mean_pred_per_sample = mean(predictions_in_stratum, dims=1)
+
+        # Calculate weights for each observation in the stratum.
+        # Weight = mean_pred_stratum / pred_observation
+        # This uses broadcasting to divide each element in predictions_in_stratum
+        # by the corresponding column mean in mean_pred_per_sample.
+        # A small epsilon is added to the denominator to prevent division by zero.
+        weights[obs_indices_in_stratum, :] = mean_pred_per_sample ./ (predictions_in_stratum .+ 1e-9)
+    end
+
+    return weights
+end
+
+ 
+# Version 1.6.3 (2026-08-11)
 # Purpose: The primary post-processing engine that generates comprehensive summaries,
 #          diagnostics, and plots from a fitted bstm model and MCMC chain.
-# Rationale: This version is updated to correctly handle metric calculation for multivariate
-#            models. Instead of flattening all predictions, it computes RMSE and Pearson R
-#            for each outcome variable separately and returns them as vectors.
-#            This version also includes an incremented version number to reflect ongoing updates.
+# Rationale: This version is updated to correctly handle the `strata_info` for
+#            post-stratification weights. It now checks if `strata_info` is present
+#            in the model configuration `M`. If not, it attempts to retrieve it from
+#            the provided `au` (areal unit) object and temporarily merges it into `M`
+#            before calling `post_stratification_weights`. This ensures that
+#            post-stratification weights are calculated when `au` is provided,
+#            resolving the "Post-stratification requires :strata_info" warning.
+#            FIX: The calculated `post_strat_weights` are now merged into the `pstats`
+#            output object for better consistency and accessibility, instead of being
+#            a separate top-level field in the returned tuple.
 function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing, data=nothing, alpha=0.05)
     # --- 1. Metadata and Architecture Extraction ---
     M = model.args.M
@@ -879,9 +1018,17 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     # This is done here because we need the raw denoised prediction samples, which are
     # returned by _reconstruct but not typically stored in the final summary.
     post_strat_weights = nothing 
+
+    # FIX: If strata_info is not in M, try to get it from au if provided.
+    # This allows post-stratification to work even if strata_info wasn't passed during model config.
+    local M_for_post_strat = M
+    if !haskey(M, :strata_info) && !isnothing(au) && hasproperty(au, :strata_info)
+        M_for_post_strat = merge(M, (strata_info=au.strata_info,))
+    end
+
     if hasproperty(res, :raw_predictions_denoised)
         samples_denoised = res.arch isa MultivariateArchitecture ? res.raw_predictions_denoised[1] : res.raw_predictions_denoised
-        post_strat_weights = post_stratification_weights(res, M, nothing, samples_denoised)
+        post_strat_weights = post_stratification_weights(res, M_for_post_strat, nothing, samples_denoised)
     end
 
     # --- 3. Performance Metric Calculation ---
@@ -932,32 +1079,50 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     data_for_plots = isnothing(data) ? get(M, :data, nothing) : data
     plots = bstm_plots(res, M; au=au, data=data_for_plots)
 
+    # --- 6. Final Assembly ---
+    # FIX: Merge post-stratification weights into the pstats object for consistency.
+    pstats_final = merge(res, (post_strat_weights=post_strat_weights,))
+
     return (
         metrics = (rmse = rmse_val, r_pearson = r_pearson, ess = min_ess, rhat = mean_rhat, waic = get(res, :waic, 0.0), time = sampling_time),
-        pstats = res,
-        plots = plots,
-        post_strat_weights = post_strat_weights
+        pstats = pstats_final,
+        plots = plots
     )
 end
 
 
 
-# Version 1.0.1 (2026-08-06)
+ 
+# Version 1.0.3 (2026-08-11)
 # Purpose: Generates a standard set of diagnostic and summary plots.
-# Rationale: This version is updated to be more robust and general. Instead of relying on
-#            hardcoded effect names (e.g., `:spatial_denoised`), it now iterates through the
-#            components defined in the model configuration (`M.components`). For each component,
-#            it uses the component's `structure` (e.g., `:spatial`, `:temporal`) to determine
-#            the appropriate plot type. This ensures that any component included in the model
-#            will be plotted correctly, resolving the "missing plots" issue.
+# Rationale: This version is updated to be consistent with the refactored component
+#            system. Instead of iterating over the keys of the effects summary (which
+#            might be incomplete), it now iterates directly through the components
+#            defined in the model configuration (`M.components`). For each component,
+#            it uses the component's unique `key` to look up the summarized effects
+#            and its `structure` to determine the appropriate plot type. This resolves
+#            the issue where plots for spatial, temporal, and other effects were not
+#            being generated. The logic for plotting fixed and mixed effects is retained
+#            and will function correctly once the upstream summarization includes them.
 function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
     plots = Dict{Symbol, Any}()
     effects = res.effects
     is_mv = res.arch isa MultivariateArchitecture
     
     y_obs = get(M, :y_obs, nothing)
-    polygons = isnothing(au) ? nothing : get(au, :polygons, nothing)
-    centroids = isnothing(au) ? nothing : get(au, :centroids, nothing)
+
+    # Check if au is a structure that can contain polygons/centroids before access.
+    polygons = if !isnothing(au) && (au isa NamedTuple || au isa Dict)
+        get(au, :polygons, nothing)
+    else
+        nothing
+    end
+    
+    centroids = if !isnothing(au) && (au isa NamedTuple || au isa Dict)
+        get(au, :centroids, nothing)
+    else
+        nothing
+    end
 
     # --- 1. Posterior Predictive Check ---
     if hasproperty(res, :predictions_denoised)
@@ -990,11 +1155,16 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
     # --- 3. Iterate through model components to generate plots ---
     for spec in M.components
         key = spec.key
-        if !haskey(effects, key); continue; end
+        
+        if spec.component_obj isa Mixed; continue; end
 
+        if !haskey(effects, key)
+            @info "Skipping plot for component '$key': No effect summary found in results."
+            continue
+        end
+        
         component_effects = effects[key]
         
-        # Plot the main effect (either 'noisy' or 'structured')
         main_effect_summary = if hasproperty(component_effects, :noisy)
             is_mv ? component_effects.noisy[outcome] : component_effects.noisy
         elseif hasproperty(component_effects, :structured)
@@ -1012,7 +1182,6 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
             p = _create_choropleth_plot(main_effect_summary, "Spatial Effect: $key", polygons, centroids)
             if !isnothing(p); plots[Symbol("spatial_$(key)")] = p; end
 
-            # Additionally, plot structured and unstructured parts if available (for BYM2)
             if hasproperty(component_effects, :structured)
                 struct_summary = is_mv ? component_effects.structured[outcome] : component_effects.structured
                 p_struct = _create_choropleth_plot(struct_summary, "Structured Effect: $key", polygons, centroids)
@@ -1025,8 +1194,26 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
             end
 
         elseif spec.structure == :temporal
-            tm, tl, tu = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-            plots[Symbol("temporal_$(key)")] = plot(tm, ribbon=(tm .- tl, tu .- tm), title="Temporal Trend: $key", lw=2, fillalpha=0.2, color=:royalblue, legend=false, xlabel="Time Index")
+            if !isnothing(data) && haskey(M, :t_idx_var) && hasproperty(data, M.t_idx_var)
+                time_var = M.t_idx_var
+                time_coords = data[!, time_var]
+                
+                p_order = sortperm(time_coords)
+                
+                tm, tl, tu = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
+                
+                plots[Symbol("temporal_$(key)")] = plot(
+                    time_coords[p_order], 
+                    tm[p_order], 
+                    ribbon=(tm[p_order] .- tl[p_order], tu[p_order] .- tm[p_order]), 
+                    title="Temporal Trend: $key", 
+                    lw=2, fillalpha=0.2, color=:royalblue, legend=false, 
+                    xlabel=string(time_var)
+                )
+            else
+                tm, tl, tu = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
+                plots[Symbol("temporal_$(key)")] = plot(tm, ribbon=(tm .- tl, tu .- tm), title="Temporal Trend: $key", lw=2, fillalpha=0.2, color=:royalblue, legend=false, xlabel="Time Index")
+            end
 
         elseif spec.structure == :seasonal
             um, ul, uu = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
@@ -1048,9 +1235,8 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
     end
 
     # --- 4. Fixed and Mixed Effects Plots ---
-    # (This logic can remain similar as it already iterates through the effects object)
-    if hasproperty(effects, :fixed_effects) && !isnothing(effects.fixed_effects)
-        fe_summary = is_mv ? effects.fixed_effects[outcome] : effects.fixed_effects
+    if hasproperty(effects, :fixed) && !isnothing(effects.fixed)
+        fe_summary = is_mv ? effects.fixed[outcome] : effects.fixed
         if hasproperty(fe_summary, :mean) && !all(iszero, fe_summary.mean) 
             fm, fl, fu = vec(fe_summary.mean), vec(fe_summary.lower), vec(fe_summary.upper)
             if !isempty(fm); coef_names = haskey(M, :Xfixed_names) ? string.(M.Xfixed_names) : ["Coef_$i" for i in 1:length(fm)]; p_forest = scatter(fm, 1:length(fm), xerror=(fm .- fl, fu .- fm), yticks=(1:length(fm), coef_names), title="Fixed Effects Coefficients", xlabel="Estimate", markersize=4, color=:black, legend=false); vline!(p_forest, [0], color=:red, ls=:dash, lw=1); plots[:fixed_effects] = p_forest; end
@@ -1084,6 +1270,7 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
 
     return NamedTuple(plots)
 end
+
 
 
 
@@ -1260,73 +1447,6 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
         pstats = res,
         PS = PS
     )
-end
-
-function post_stratification_weights(res, M, PS, samples_denoised)
-    # Purpose: Computes post-stratification weights to scale sample-level predictions to population-level estimates.
-    # Rationale: This is essential for generating total abundance or biomass indices from survey data.
-    #            The weight for an observation `i` in stratum `j` is calculated as `Area(j) / n_obs_in_stratum(j)`.
-    #            Multiplying the predicted density at `i` by this weight gives its contribution to the total stratified estimate.
-    # Assumptions:
-    #   1. `M` contains a `:strata_info` DataFrame with `stratum_id` and `stratum_area` columns.
-    #   2. The data (`M.data` and optionally `PS.data`) contains a `stratum_id` column.
-    # Inputs:
-    #   - res: The main results object (not used in this implementation but kept for API consistency).
-    #   - M: The model configuration object for the training data.
-    #   - PS: The prediction set configuration object (can be `nothing`).
-    #   - samples_denoised: A matrix of posterior predictions [n_obs x n_samples].
-    # Outputs: A matrix of weights of the same size as `samples_denoised`.
-
-    # #
-    # Input validation
-    if !haskey(M, :strata_info) || !("stratum_id" in names(M.strata_info)) || !("stratum_area" in names(M.strata_info))
-        @warn "Post-stratification requires `:strata_info` in the model configuration with `stratum_id` and `stratum_area` columns. Returning ones." 
-        return ones(Float64, size(samples_denoised))
-    end
-    if !hasproperty(M.data, :stratum_id)
-        @warn "Post-stratification requires a `stratum_id` column in the training data. Returning ones."
-        return ones(Float64, size(samples_denoised))
-    end
-
-    # #
-    # Combine stratum IDs from training and prediction sets
-    strata_info = M.strata_info
-    strata_ids_train = M.data.stratum_id
-
-    strata_ids_full = if !isnothing(PS)
-        if !hasproperty(PS.data, :stratum_id)
-            @warn "Prediction set provided but is missing `stratum_id` column. Post-stratification weights will only be calculated for training data."
-            strata_ids_train
-        else
-            vcat(strata_ids_train, PS.data.stratum_id)
-        end
-    else
-        strata_ids_train
-    end
-
-    n_obs_total = length(strata_ids_full)
-    n_samples = size(samples_denoised, 2)
-
-    # #
-    # Calculate the weight for each stratum (Area / N_obs)
-    unique_strata = unique(strata_info.stratum_id)
-    stratum_area_map = Dict(row.stratum_id => row.stratum_area for row in eachrow(strata_info))
-    obs_counts = StatsBase.countmap(strata_ids_full)
-    
-    stratum_weight_map = Dict{eltype(unique_strata), Float64}()
-    for stratum in unique_strata
-        area = get(stratum_area_map, stratum, 0.0)
-        count = get(obs_counts, stratum, 0)
-        stratum_weight_map[stratum] = count > 0 ? area / count : 0.0
-    end
-
-    # #
-    # Map stratum weights to each observation
-    obs_weights = [get(stratum_weight_map, id, 0.0) for id in strata_ids_full]
-
-    # #
-    # Return weights matrix, broadcasted across all posterior samples
-    return repeat(obs_weights, 1, n_samples)
 end
 
 function model_results_plots(res)

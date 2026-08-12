@@ -82,9 +82,12 @@ end
  
 
 # Distribution reference generators forced to promote inputs to V
-function get_dist_ref(::PoissonFamily, d, eta::V, sig) where {V<:Real}
-    return Poisson(exp(eta))
-end
+function get_dist_ref(::PoissonFamily, d, eta, sig)    
+    # Clamp the rate parameter lambda to a small positive value (1e-9) to avoid
+    # numerical instability (log(0)) during gradient-based sampling when eta is very small.
+    return Poisson(clamp(exp(eta), 1e-9, 1e9))
+end    
+
 
 function get_dist_ref(::DirichletFamily, d, eta, sig); error("The Dirichlet likelihood is for compositional outcomes and is not supported in the current univariate response framework."); end
 function get_dist_ref(::InverseWishartFamily, d, eta, sig); error("The Inverse-Wishart likelihood is for covariance matrix outcomes and is not supported in the current univariate response framework."); end
