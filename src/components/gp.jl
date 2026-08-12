@@ -6,7 +6,7 @@ geostatistics. It models a latent field by computing a dense covariance
 matrix based on a specified kernel function and coordinate inputs.
 
 # Version
-v1.2.0 (2026-08-11)
+v1.2.1 (2026-08-12)
 
 # Mathematical Summary
 The component models a latent field \$f(x)\$ as a draw from a Gaussian Process with
@@ -116,9 +116,8 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    if m.method == :noncentered
-        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
-    end
+    # Removed explicit `T` from `zeros` for better AD compatibility.
+    push!(priors, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros(spec.hyper.n_latent), I), :$(p_names.innovations))")
 
     return join(priors, "\n    ")
 end
@@ -156,7 +155,8 @@ function get_updates(
         # --- GP (Centered): $(key) ---
         let
             $(common_code)
-            $(p_names.latent) ~ MvNormal(zeros(T, size(K_mat, 1)), Symmetric(K_mat))
+            # Removed explicit `T` from `zeros` for better AD compatibility.
+            $(p_names.latent) ~ MvNormal(zeros(size(K_mat, 1)), Symmetric(K_mat))
             $(eta_target) .+= $(p_names.latent)
         end
     """

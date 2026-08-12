@@ -197,7 +197,7 @@ function get_updates(
     spectral_code = """
         # --- LocalAdaptive Component (Spectral): $(key) ---
         let
-            hyper = spec_registry[:$(key)].hyper
+            hyper = spec_registry[:$(key)].hyper # Access precomputed data
             mu_clusters_raw = $(p_names.cluster_innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_clusters)), sum(mu_clusters_raw))
             mean_vector = mu_clusters_raw[$(cluster_assignments_access)]
@@ -213,7 +213,7 @@ function get_updates(
     cholesky_code = """
         # --- LocalAdaptive Component (Cholesky): $(key) ---
         let
-            hyper = spec_registry[:$(key)].hyper
+            hyper = spec_registry[:$(key)].hyper # Access precomputed data
             mu_clusters_raw = $(p_names.cluster_innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_clusters)), sum(mu_clusters_raw))
             mean_vector = mu_clusters_raw[$(cluster_assignments_access)]
@@ -234,7 +234,7 @@ function get_updates(
     cholesky_sparse_code = """
         # --- LocalAdaptive Component (Sparse Cholesky): $(key) ---
         let
-            hyper = spec_registry[:$(key)].hyper
+            hyper = spec_registry[:$(key)].hyper # Access precomputed data
             mu_clusters_raw = $(p_names.cluster_innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_clusters)), sum(mu_clusters_raw))
             mean_vector = mu_clusters_raw[$(cluster_assignments_access)]
@@ -281,21 +281,21 @@ function get_effects(
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        rho_name = _find_parameter(p_names_vec, string(spec.key), "rho", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
-        cluster_innov_name = _find_parameter(p_names_vec, string(spec.key), "cluster_innovations", k, is_multivariate_model)
+        sigma_samples_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        rho_samples_name = _find_parameter(p_names_vec, string(spec.key), "rho", k, is_multivariate_model)
+        innovations_samples_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        cluster_innovations_samples_name = _find_parameter(p_names_vec, string(spec.key), "cluster_innovations", k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(rho_name) || isempty(innovations_name) || isempty(cluster_innov_name)
+        if isempty(sigma_samples_name) || isempty(rho_samples_name) || isempty(innovations_samples_name) || isempty(cluster_innovations_samples_name)
             @warn "Parameters for LocalAdaptive component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
-        cluster_innov_samples = get_params_vector(chain, cluster_innov_name, n_clusters)
+        sigma_samples = get_params_vector(chain, sigma_samples_name, 1)[:, 1]
+        rho_samples = get_params_vector(chain, rho_samples_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_samples_name, n_latent)
+        cluster_innov_samples = get_params_vector(chain, cluster_innovations_samples_name, n_clusters)
 
         effect_k = zeros(Float64, N_total, n_samples)
 

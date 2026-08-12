@@ -214,7 +214,7 @@ function get_effects(
             )
             
             innov_reshaped = reshape(innovations_samples[i, :], fill(res, n_dims)...)
-            f_tilde_complex = complex.(innov_reshaped)
+            f_tilde_complex = complex.(innov_reshaped) # Convert to complex numbers
             f_tilde_scaled = f_tilde_complex .* sqrt.(S_w)
             
             latent_field_grid = real.(ifft(f_tilde_scaled)) .* (res^(n_dims/2))

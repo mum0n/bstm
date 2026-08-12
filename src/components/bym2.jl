@@ -152,11 +152,11 @@ function get_priors(
     is_first_outcome = (outcome_idx == 1 || isnothing(outcome_idx))
 
     struct_innov_name = "struct_innovations_$(spec.key)"
-    iid_innov_name = "iid_innovations_$(spec.key)"
+    iid_innov_name = "iid_innovations_$(spec.key)" # Raw innovations for unstructured component
     if is_multivariate && !is_shared
         struct_innov_name *= "_$(outcome_idx)"
         iid_innov_name *= "_$(outcome_idx)"
-    end
+    end # Suffix for outcome index if multivariate and not shared
 
     priors_acc = String[]
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
@@ -164,8 +164,8 @@ function get_priors(
         push!(priors_acc, "$(p_names.rho) ~ $(_distribution_to_string(m.rho))")
     end
     push!(priors_acc, "$(struct_innov_name) ~ MvNormal(zeros(T, $(n_latent)), I)")
-    push!(priors_acc, "$(iid_innov_name) ~ MvNormal(zeros(T, $(n_latent)), I)")
-    return join(priors_acc, "\n    ")
+    push!(priors_acc, "$(iid_innov_name) ~ MvNormal(zeros(T, $(n_latent)), I)") # Raw innovations for unstructured component
+    return join(priors_acc, "\n    ") # Combine all priors
 end
 
 function get_updates(
@@ -181,11 +181,11 @@ function get_updates(
     is_multivariate = (arch == "multivariate")
     is_shared = get(spec.params, :shared, false)
     struct_innov_name = "struct_innovations_$(spec.key)"
-    iid_innov_name = "iid_innovations_$(spec.key)"
+    iid_innov_name = "iid_innovations_$(spec.key)" # Raw innovations for unstructured component
     if is_multivariate && !is_shared
         struct_innov_name *= "_$(outcome_idx)"
         iid_innov_name *= "_$(outcome_idx)"
-    end
+    end # Suffix for outcome index if multivariate and not shared
 
     spectral_code = """
         # --- BYM2 Spectral Assembly: $(key) ---
@@ -268,8 +268,8 @@ function get_effects(
     for k in 1:outcomes_N
         sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
         rho_name = _find_parameter(p_names_vec, string(spec.key), "rho", k, is_multivariate_model)
-        struct_innov_name = _find_parameter(p_names_vec, string(spec.key), "struct_innovations", k, is_multivariate_model)
-        iid_innov_name = _find_parameter(p_names_vec, string(spec.key), "iid_innovations", k, is_multivariate_model)
+        struct_innov_name = _find_parameter(p_names_vec, string(spec.key), "struct", k, is_multivariate_model) # Raw innovations for structured component
+        iid_innov_name = _find_parameter(p_names_vec, string(spec.key), "iid", k, is_multivariate_model) # Raw innovations for unstructured component
 
         if isempty(sigma_name) || isempty(rho_name) || isempty(struct_innov_name) || isempty(iid_innov_name)
             @warn "Parameters for BYM2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."

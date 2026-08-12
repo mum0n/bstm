@@ -1,50 +1,49 @@
  
 # bstm: Bayesian Spatiotemporal Models in Julia
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/mum-n/bstm)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-`bstm` is a Julia library for Bayesian spatiotemporal modeling, built on the Turing.jl probabilistic programming framework and many many other Julia libraries. It provides a high-level, formula-based interface inspired by R's `brms` and `lme4` to simplify the specification of complex hierarchical models. The framework is designed for composability, allowing users to combine spatial, temporal, and mechanistic components to analyze complex datasets, particularly in fields like ecology and epidemiology.
+ 
+`bstm` is a Julia library for Bayesian spatiotemporal modeling, built on the Turing.jl probabilistic programming framework and many, many other Julia libraries. It provides a high-level, formula-based interface inspired by R's `brms` and `lme4` to simplify the specification of complex hierarchical models. The framework is designed for composability, allowing users to combine spatial, temporal, and mechanistic components to analyze complex datasets, particularly in fields like ecology and epidemiology.
 
 ## Key Features
 
 *   **Formula-Based Interface**: Use the `@bstm` macro for an intuitive, R-like syntax to define complex models.
-*   **Rich Component Library**: A wide range of built-in components for modeling:
-    *   **Spatial Effects**: Discrete GMRF models (`ICAR`, `BYM2`, `Leroux`, `SAR`) and continuous-space models (`GP`, `SPDE`).
-    *   **Temporal Effects**: Autoregressive models (`AR1`), random walks (`RW1`, `RW2`), and smoothers.
-    *   **Spatiotemporal Interactions**: Knorr-Held interaction types (`I` through `IV`) via the Kronecker product (`⊗`).
-    *   **Smoothers**: P-splines, thin-plate splines, and other basis function expansions for non-linear covariate effects.
-*   **Scalable Approximations**: Advanced components for large datasets, including:
-    *   **Random Fourier Features (RFF)**: Approximates a stationary kernel by mapping input coordinates into a randomized feature space, transforming the GP into a more scalable Bayesian linear regression problem.
-    *   **SPDE (Stochastic Partial Differential Equation)**: Models a continuous Matérn field by linking it to a discrete GMRF, allowing for scalable inference via sparse precision matrices.
-    *   **Nyström / FITC (Inducing Point Methods)**: Creates a low-rank approximation of a full GP by summarizing the data through a small set of "inducing points."
-    *   **FFT (Fast Fourier Transform)**: For regularly gridded data, leverages the DFT to perform spatial filtering in $O(N \log N)$ time.
-    *   **Wavelet**: Provides a multi-resolution analysis of a field, useful for capturing both broad trends and localized, high-frequency details.
-*   **Hierarchical & Advanced Modeling**:
-    *   **Spatially-Varying Coefficients**: Model covariate effects that change across space using the `|>` operator.
-    *   **Multi-fidelity Data Fusion**: Integrate low-resolution, data-rich proxy variables to improve high-resolution predictions using the `nested()` module.
-    *   **Bayesian PCA**: Perform dimensionality reduction on outcomes with the `eigen()` module.
-    *   **Mechanistic Models**: Embed process-based differential equation models with the `dynamics()` module.
-*   **Flexible Likelihoods**: Support for numerous observation models (`Poisson`, `Binomial`, `Gaussian`, `NegativeBinomial`, etc.), including features like zero-inflation, hurdle models, and stochastic volatility.
-*   **Principled Priors**: A robust system for prior specification, featuring Penalized Complexity (PC) priors as the default to ensure model identifiability and prevent overfitting.
+*   **Rich Component Library**: A wide range of built-in components for modeling various effects:
+    *   **Spatial Effects**: Includes discrete GMRF models (`ICAR`, `BYM2`, `Leroux`, `SAR`) for areal data and continuous-space models (`GP`, `SPDE`) for point-referenced data.
+    *   **Temporal Effects**: Supports autoregressive models (`AR1`), random walks (`RW1`, `RW2`), and general-purpose smoothers for capturing trends.
+    *   **Spatiotemporal Interactions**: Implements Knorr-Held interaction types (`I` through `IV`) via the Kronecker product (`⊗`) operator for modeling complex dependencies between space and time.
+    *   **Smoothers**: Provides P-splines, thin-plate splines, and other basis function expansions for modeling non-linear covariate effects.
+*   **Scalable Approximations for Large Data**:
+    *   **Random Fourier Features (RFF)**: Approximates stationary kernels to scale Gaussian Processes to large datasets.
+    *   **SPDE (Stochastic Partial Differential Equation)**: Links continuous Matérn fields to discrete GMRFs for efficient inference.
+    *   **Inducing Point Methods (Nyström / FITC)**: Creates low-rank approximations of a full GP.
+    *   **FFT & Wavelet**: For regularly gridded data, leverages spectral methods for highly efficient filtering and multi-resolution analysis.
+*   **Advanced Hierarchical Modeling**:
+    *   **Spatially-Varying Coefficients (SVC)**: Allows covariate effects to vary across space using the `|>` operator (e.g., `covariate |> random(s_idx, model=icar)`).
+    *   **Multi-fidelity Data Fusion**: Integrates low-resolution, data-rich proxy variables to improve high-resolution predictions using the `nested()` module.
+    *   **Bayesian PCA**: Performs dimensionality reduction on a set of covariates or outcomes with the `eigen()` module.
+    *   **Mechanistic Models**: Embeds process-based differential equation models (e.g., for population dynamics) directly into the statistical framework with the `dynamics()` module.
+*   **Flexible Observation Models**: Supports numerous likelihoods (`Poisson`, `Binomial`, `Gaussian`, `NegativeBinomial`, etc.) and advanced features like zero-inflation, hurdle models, and spatiotemporal stochastic volatility.
+*   **Principled Prior Specification**: Features Penalized Complexity (PC) priors as the default to ensure model identifiability and prevent overfitting, with an intuitive syntax for setting constraints.
 
-## Installation
+## Installation and Setup
 
-The project can be installed directly from the GitHub repository.
+`bstm` is designed as a self-contained project environment rather than a standard Julia package. The recommended way to use it is to clone the repository and activate its environment.
+
+1.  **Clone the Repository**
+    ```bash
+    git clone https://github.com/mum0n/bstm.git
+    cd bstm
+    ```
+
+2.  **Set up the Julia Environment**
+    Start a Julia session from within the `bstm` directory. The following script will activate the project, install all necessary dependencies (which may take some time on the first run), and load the framework's functions.
 
 ```julia
-using Pkg
-Pkg.add(url="https://github.com/mum0n/bstm.git")
+# Set the path to your cloned bstm repository
+project_directory = pwd() # Assumes you started Julia from the 'bstm' directory
 
-# Clone the repository first
-# git clone https://github.com/mum0n/bstm.git
-
-# Define project directory
-project_directory = "path/to/your/cloned/bstm"
-
-# Activate and load
+# Activate the project and load all functions
 include(joinpath(project_directory, "startup.jl"))
-load_project_functions(srcdir())
 ``` 
 
 ## Quick start
@@ -101,3 +100,5 @@ This is a personal project that I use to facilitate my research. There will be e
 ## License
 
 This project is licensed under the MIT License - see the LICENSE.md file for details.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

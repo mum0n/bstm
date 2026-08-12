@@ -144,7 +144,7 @@ function get_priors(
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
         push!(priors_acc, "$(p_names.rho_sigma) ~ $(_distribution_to_string(m.rho_sigma))")
         if m.rho_model_type in [:leroux, :bym2] && !isnothing(m.rho_rho)
-            push!(priors_acc, "$(p_names.rho_rho) ~ $(_distribution_to_string(m.rho_rho))")
+            push!(priors_acc, "$(p_names.rho_rho) ~ $(_distribution_to_string(m.rho_rho))") # Prior for the mixing parameter
         end
         push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
     end
@@ -169,7 +169,7 @@ function get_updates(
             hyper_rho = spec_registry[:$(key)].hyper
             D_rho = $(p_names.rho_sigma) ./ sqrt.(hyper_rho.L_rho .+ M.noise)
             if $(m.rho_model_type) in [:icar, :besag]; D_rho[1] = 0.0; end
-            rho_field = hyper_rho.U_rho * (D_rho .* $(p_names.rho_innovations))
+            rho_field = hyper_rho.U_rho * (D_rho .* $(p_names.rho_innovations)) # Reconstruct rho field using spectral decomposition
         """
     elseif m.method == :cholesky
         rho_recon_code = """
@@ -181,7 +181,7 @@ function get_updates(
     else # :cholesky_sparse
         rho_recon_code = """
             Q_rho = spec_registry[:$(key)].hyper.Q_rho_template
-            F_rho = cholesky(Symmetric(Q_rho + M.noise * I))
+            F_rho = cholesky(Symmetric(Q_rho + M.noise * I)) # Cholesky factorization of the precision matrix
             rho_field_raw = F_rho.L' \\ $(p_names.rho_innovations)
             if $(m.rho_model_type) in [:icar, :besag]; Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(s_N)), sum(rho_field_raw)); end
             rho_field = rho_field_raw .* $(p_names.rho_sigma)
@@ -248,7 +248,7 @@ function get_effects(
         rho_rho_samples = nothing
         if m.rho_model_type in [:leroux, :bym2] && !isnothing(m.rho_rho)
             rho_rho_name = _find_parameter(p_names_vec, string(spec.key), "rho_rho", k, is_multivariate_model)
-            if !isempty(rho_rho_name)
+            if !isempty(rho_rho_name) # Check if rho_rho parameter exists
                 rho_rho_samples = get_params_vector(chain, rho_rho_name, 1)[:, 1]
             end
         end

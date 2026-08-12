@@ -158,7 +158,7 @@ function get_updates(
     n_latent = spec.hyper.n_latent
 
     common_code = """
-        hyper = spec_registry[:$(key)].hyper
+        hyper = spec_registry[:$(key)].hyper # Access precomputed data
         B_basis = hyper.basis_matrix
     """
 
@@ -166,7 +166,7 @@ function get_updates(
         # --- Thin Plate Spline (TPS) Smoother (Spectral): $(key) ---
         let
             $(common_code)
-            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
+            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise) # Scale by sigma and add jitter
             diag_D[1] = 0.0; diag_D[2] = 0.0
             coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             $(p_names.latent) = B_basis * coeffs
@@ -178,7 +178,7 @@ function get_updates(
         # --- Thin Plate Spline (TPS) Smoother (Cholesky, AD-Safe): $(key) ---
         let
             $(common_code)
-            F = hyper.cholesky_factor
+            F = hyper.cholesky_factor # Precomputed Cholesky factor
             coeffs_raw = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
             coeffs = $(p_names.sigma) .* coeffs_raw
@@ -191,7 +191,7 @@ function get_updates(
         # --- Thin Plate Spline (TPS) Smoother (Sparse Cholesky, Not AD-Safe): $(key) ---
         let
             $(common_code)
-            Q_penalty = hyper.Q_template
+            Q_penalty = hyper.Q_template # Precision matrix template
             F = cholesky(Symmetric(Q_penalty + M.noise * I))
             coeffs_raw = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
@@ -267,7 +267,7 @@ function get_effects(
             local coeffs
             if m.method == :spectral
                 U, L = hyper.U, hyper.L
-                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
+                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise) # Scale by sigma and add jitter
                 diag_D[1] = 0.0; diag_D[2] = 0.0
                 coeffs = U * (diag_D .* innovations_samples[i, :])
             else # :cholesky or :cholesky_sparse

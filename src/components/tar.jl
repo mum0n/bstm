@@ -128,8 +128,8 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
-    push!(priors, "$(p_names.threshold_unconstrained) ~ Normal(0.0, 1.0)")
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, M.t_N), I)")
+    push!(priors, "$(p_names.thresh_raw) ~ NamedDist(Normal(0.0, 1.0), :$(p_names.thresh_raw))") # Prior for the unconstrained threshold level
+    push!(priors, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros(T, M.t_N), I), :$(p_names.innovations))") # Prior for the AR(1) innovations
 
     if m.method == :statespace
         push!(priors, "$(p_names.unconstrained_rho)_1 ~ Normal(0, 1.5)")
@@ -156,8 +156,8 @@ function get_updates(
     local param_definitions
     if m.method == :statespace
         param_definitions = """
-            rho1 = tanh($(p_names.unconstrained_rho)_1)
-            rho2 = tanh($(p_names.unconstrained_rho)_2)
+            rho1 = tanh($(p_names.unconstrained_rho1)) # Transform unconstrained rho1 to (-1, 1)
+            rho2 = tanh($(p_names.unconstrained_rho2)) # Transform unconstrained rho2 to (-1, 1)
             sigma1 = exp($(p_names.unconstrained_sigma)_1)
             sigma2 = exp($(p_names.unconstrained_sigma)_2)
         """
@@ -173,7 +173,7 @@ function get_updates(
     return """
         # --- TAR Component: $(spec.key) ($(m.method)) ---
         let
-            $(param_definitions)
+            $(param_definitions) # Define regime-specific parameters
             threshold_level = mean(spec_registry[:$(spec.key)].hyper.threshold_data) + $(p_names.threshold_unconstrained)
             innovations = $(p_names.innovations)
             
@@ -220,20 +220,20 @@ function get_effects(
     is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
-    for k in 1:outcomes_N
-        p_names = generate_full_variable_names(spec, M.model_arch, k)
+    for k_outcome in 1:outcomes_N
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
         
-        thresh_name = _find_parameter(p_names_vec, string(spec.key), "threshold_unconstrained", k, is_multivariate_model)
-        innov_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        thresh_raw_name = _find_parameter(p_names_vec, string(spec.key), "thresh_raw", k_outcome, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k_outcome, is_multivariate_model)
 
-        if isempty(thresh_name) || isempty(innov_name)
+        if isempty(thresh_raw_name) || isempty(innovations_name)
             @warn "Base parameters for TAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        thresh_samples = get_params_vector(chain, thresh_name, 1)[:, 1]
-        innov_samples = get_params_vector(chain, innov_name, t_N_train)
+        thresh_raw_samples = get_params_vector(chain, thresh_raw_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, t_N_train)
         
         local rho1_samples, rho2_samples, sigma1_samples, sigma2_samples
         if m.method == :statespace
@@ -246,7 +246,7 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            rho1_samples = tanh.(get_params_vector(chain, rho1_raw_name, 1)[:, 1])
+            rho1_samples = tanh.(get_params_vector(chain, rho1_raw_name, 1)[:, 1]) # Transform unconstrained rho1
             rho2_samples = tanh.(get_params_vector(chain, rho2_raw_name, 1)[:, 1])
             sigma1_samples = exp.(get_params_vector(chain, sigma1_raw_name, 1)[:, 1])
             sigma2_samples = exp.(get_params_vector(chain, sigma2_raw_name, 1)[:, 1])
@@ -269,13 +269,13 @@ function get_effects(
         effect_k = zeros(Float64, N_total, n_samples)
         mean_thresh_data = mean(threshold_data_train)
         noise = M.noise
-
+        
         for s in 1:n_samples
-            threshold_level = mean_thresh_data + thresh_samples[s]
-            innov_full = vcat(innov_samples[s, :], randn(t_N_full - t_N_train))
+            threshold_level = mean_thresh_data + thresh_raw_samples[s] # Reconstruct threshold level
+            innov_full = vcat(innovations_samples[s, :], randn(t_N_full - t_N_train)) # Extend innovations for prediction
             latent_field_s = zeros(Float64, t_N_full)
 
-            for t in 1:t_N_full
+            for t in 1:t_N_full # Simulate the DDE
                 regime_indicator = threshold_data_full[t] > threshold_level
                 curr_rho = regime_indicator ? rho2_samples[s] : rho1_samples[s]
                 curr_sigma = regime_indicator ? sigma2_samples[s] : sigma1_samples[s]

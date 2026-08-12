@@ -152,7 +152,7 @@ function get_updates(
     inner_updates_code = get_updates(m.model, inner_spec, arch, outcome_idx, M)
     inner_p_names = generate_full_variable_names(inner_spec, arch, outcome_idx)
     inner_latent_var = inner_p_names.latent
-
+    
     # The generated code will try to access `spec_registry[:..._inner].hyper`.
     # The correct path is `spec_registry[:...].hyper.inner_precomputes`.
     # We perform a string replacement to fix this.

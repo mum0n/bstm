@@ -155,7 +155,7 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     n_knots = spec.hyper.n_knots
     
-    priors = ["$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))"]
+    priors = ["$(p_names.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(p_names.sigma))"] # Prior for the standard deviation
 
     if m.method in [:noncentered, :gmrfsmooth]
         push!(priors, "$(p_names.innov) ~ MvNormal(zeros(T, $(n_knots)), I)")

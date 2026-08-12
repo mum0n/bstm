@@ -130,7 +130,7 @@ function get_priors(
     s_N = child_specs[1].hyper.n_latent
     t_N = child_specs[2].hyper.n_latent
     
-    return """
+    return """ # Priors for the interaction standard deviation and raw innovations
     # Priors for Spatiotemporal Interaction: $(spec.key)
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
     $(p_names.innovations) ~ MvNormal(zeros(T, $(s_N * t_N)), I)
@@ -158,7 +158,7 @@ function get_updates(
     s_rho_val = hasproperty(s_spec.component_obj, :rho) ? string(generate_full_variable_names(s_spec, arch, outcome_idx).rho) : "nothing"
     t_rho_val = hasproperty(t_spec.component_obj, :rho) ? string(generate_full_variable_names(t_spec, arch, outcome_idx).rho) : "nothing"
 
-    # The precomputed data for the child components (s_spec, t_spec) is nested
+    # The precomputed data for the child components (s_spec, t_spec) are nested
     # within the parent TensorProductSmooth component's `hyper` object.
     # We must access it through the parent's entry in the spec_registry.
     cholesky_base_code = """
@@ -236,7 +236,7 @@ function get_effects(
         innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
         
         s_rho_name = hasproperty(s_spec.component_obj, :rho) ? _find_parameter(p_names_vec, string(s_spec.key), "rho", k, is_multivariate_model) : ""
-        t_rho_name = hasproperty(t_spec.component_obj, :rho) ? _find_parameter(p_names_vec, string(t_spec.key), "rho", k, is_multivariate_model) : ""
+        t_rho_name = hasproperty(t_spec.component_obj, :rho) ? _find_parameter(p_names_vec, string(t_spec.key), "rho", k, is_multivariate_model) : "" # Find temporal rho parameter
 
         if isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for TensorProductSmooth component $(spec.key) (outcome $k) not found. Returning zero-matrix."

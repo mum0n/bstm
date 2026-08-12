@@ -163,7 +163,7 @@ function get_priors(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx
     
     if m.method == :lgcp
         return """
-        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(p_names.sigma) ~ NamedDist($(_distribution_to_string(m.sigma)), :$(p_names.sigma)) # Prior for the standard deviation of the latent field
         $(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.s_N), I)
         """
     elseif m.method == :lgmcp

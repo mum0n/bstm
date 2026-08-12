@@ -6,7 +6,7 @@ sine and cosine waves. This component can model one or more harmonics, each with
 own amplitude, phase, and potentially its own period.
 
 # Version
-v1.3.0 (2026-08-11)
+v1.3.1 (2026-08-12)
 
 # Mathematical Summary
 The component models a function \$f(t)\$ as a sum of sinusoids. It supports two
@@ -132,23 +132,17 @@ function get_priors(
     priors = String[]
 
     if m.method == :twocoefficient
-        if m.nharmonics > 1
-            push!(priors, "$(p_names.beta_cos) ~ filldist(Normal(0, 1), $(m.nharmonics))")
-            push!(priors, "$(p_names.beta_sin) ~ filldist(Normal(0, 1), $(m.nharmonics))")
-        else
-            push!(priors, "$(p_names.beta_cos) ~ Normal(0, 1)")
-            push!(priors, "$(p_names.beta_sin) ~ Normal(0, 1)")
-        end
+        # Priors for cosine and sine coefficients
+        beta_cos_prior = _distribution_to_string(Normal(0, 1))
+        beta_sin_prior = _distribution_to_string(Normal(0, 1))
+        push!(priors, "$(p_names.beta_cos) ~ NamedDist(filldist($(beta_cos_prior), $(m.nharmonics)), :$(p_names.beta_cos))")
+        push!(priors, "$(p_names.beta_sin) ~ NamedDist(filldist($(beta_sin_prior), $(m.nharmonics)), :$(p_names.beta_sin))")
     elseif m.method == :ampphase
-        amp_prior_str = _distribution_to_string(m.amplitude)
+        # Priors for amplitude and phase
+        amplitude_prior_str = _distribution_to_string(m.amplitude)
         phase_prior_str = _distribution_to_string(m.phase)
-        if m.nharmonics > 1
-            push!(priors, "$(p_names.amplitude) ~ filldist($(amp_prior_str), $(m.nharmonics))")
-            push!(priors, "$(p_names.phase) ~ filldist($(phase_prior_str), $(m.nharmonics))")
-        else
-            push!(priors, "$(p_names.amplitude) ~ $(amp_prior_str)")
-            push!(priors, "$(p_names.phase) ~ $(phase_prior_str)")
-        end
+        push!(priors, "$(p_names.amplitude) ~ NamedDist(filldist($(amplitude_prior_str), $(m.nharmonics)), :$(p_names.amplitude))")
+        push!(priors, "$(p_names.phase) ~ NamedDist(filldist($(phase_prior_str), $(m.nharmonics)), :$(p_names.phase))")
     end
 
     if m.period isa UnivariateDistribution
@@ -166,50 +160,50 @@ function get_updates(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    # Corrected access to pre-computed data via spec_registry
     u_coords_access = "spec_registry[:$(spec.key)].hyper.u_coords"
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
 
-    # Determine how to access the period parameter(s) within the generated code
     period_access_code = if m.period isa Real
-        string(m.period) # e.g., "12.0"
+        string(m.period)
     elseif m.period isa UnivariateDistribution
-        string(p_names.period) # e.g., "period_harmonic_key"
+        string(p_names.period)
     elseif m.period isa Vector{<:Real}
-        # This will generate code like "([12.0, 6.0])[k]"
         "($(string(m.period)))[k]"
     elseif m.period isa Vector{<:UnivariateDistribution}
-        # This will generate code like "period_harmonic_key[k]"
         "$(string(p_names.period))[k]"
     else
         error("Unsupported type for m.period in get_updates.")
     end
 
-    loop_body = "" # Initialize loop_body as an empty string
+    loop_body = ""
     if m.method == :twocoefficient
         loop_body = """
-            local b_cos = $(m.nharmonics > 1 ? "$(p_names.beta_cos)[k]" : string(p_names.beta_cos))
-            local b_sin = $(m.nharmonics > 1 ? "$(p_names.beta_sin)[k]" : string(p_names.beta_sin))
-            local period_val = $(period_access_code)
+            b_cos = $(m.nharmonics > 1 ? "$(p_names.beta_cos)[k]" : string(p_names.beta_cos))
+            b_sin = $(m.nharmonics > 1 ? "$(p_names.beta_sin)[k]" : string(p_names.beta_sin))
+            period_val = $(period_access_code)
             
-            local angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
+            angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
             $(p_names.latent) .+= b_cos .* cos.(angle) .+ b_sin .* sin.(angle)
         """
     else # :ampphase
         loop_body = """
-            local amp = $(m.nharmonics > 1 ? "$(p_names.amplitude)[k]" : string(p_names.amplitude))
-            local phase = $(m.nharmonics > 1 ? "$(p_names.phase)[k]" : string(p_names.phase))
-            local period_val = $(period_access_code)
+            amp = $(m.nharmonics > 1 ? "$(p_names.amplitude)[k]" : string(p_names.amplitude))
+            phase = $(m.nharmonics > 1 ? "$(p_names.phase)[k]" : string(p_names.phase))
+            period_val = $(period_access_code)
             
-            local angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
+            angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
             $(p_names.latent) .+= amp .* cos.(angle .+ (2 * pi * phase))
         """
     end
 
+    # Initialize latent field with a type inferred from a sampled parameter.
+    init_param = if m.method == :twocoefficient; p_names.beta_cos; else; p_names.amplitude; end
+
     return """
         # --- Harmonic Component: $(spec.key) ($(m.method)) ---
-        let # Use a let block to encapsulate local variables
-            $(p_names.latent) = zeros(T, M.u_N)
+        let
+            T_num = eltype($(init_param))
+            $(p_names.latent) = zeros(T_num, M.u_N)
             for k in 1:$(m.nharmonics)
                 $(loop_body)
             end

@@ -6,7 +6,7 @@ specified grouping variable. The correlation structure of the effects is determi
 by an inner `ComponentModel`.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.1 (2026-08-12)
 
 # Mathematical Summary
 The `Mixed` component models effects that vary across the levels of a grouping
@@ -141,14 +141,16 @@ function get_priors(
         )
         return get_priors(m.model, inner_spec, arch, outcome_idx, M)
     else
+        # Removed explicit `T` from `zeros` for better AD compatibility.
         return """
         # Priors for Correlated Mixed Effects: $(spec.key)
         $(p_names.L_corr) ~ LKJCholesky($(n_terms), 1.0)
         $(p_names.sigma_effects) ~ filldist(Exponential(1.0), $(n_terms))
-        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_groups * n_terms)), I)
+        $(p_names.innovations) ~ MvNormal(zeros($(n_groups * n_terms)), I)
         """
     end
 end
+
 function get_updates(
     m::Mixed, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -159,22 +161,16 @@ function get_updates(
     n_terms = length(m.lhs)
     n_groups = spec.hyper.inner_precomputes.n_latent
 
-    # This is the correct way to access the inner component's precomputed data inside the Turing model.
     inner_hyper_access = "spec_registry[:$(spec.key)].hyper.inner_precomputes"
 
     if n_terms == 1
-        # --- Uncorrelated Random Effects (e.g., random(1 | group)) ---
         lhs_str = m.lhs[1]
         inner_model = m.model
         
-        # This block generates the code to create the latent field for the random effect,
-        # mirroring the logic of the inner component's `get_updates` but with correct scope access.
         local latent_field_code
         if inner_model isa IID
-            # Simplest case: innovations scaled by sigma
             latent_field_code = "$(p_names.latent) = $(p_names.innovations) .* $(p_names.sigma)"
         elseif inner_model isa Union{ICAR, Besag, RW1, RW2, Leroux}
-            # GMRF-style models
             if m.method == :spectral
                 latent_field_code = """
                 diag_D = $(p_names.sigma) ./ sqrt.($(inner_hyper_access).L .+ M.noise)
@@ -193,11 +189,9 @@ function get_updates(
                 """
             end
         else
-            # Fallback for other simple models
             latent_field_code = "$(p_names.latent) = $(p_names.innovations) .* $(p_names.sigma)"
         end
 
-        # This block generates the code to apply the effect to the linear predictor.
         local application_code
         if lhs_str == "1" || lhs_str == "intercept()"
             application_code = "$(eta_target) .+= view($(p_names.latent), M.$(index_var))"
@@ -219,7 +213,6 @@ function get_updates(
         end
         """
     else
-        # --- Correlated Random Effects (e.g., random(1 + cov | group)) ---
         application_loop = ""
         for i in 1:n_terms
             term = m.lhs[i]
@@ -349,18 +342,18 @@ function get_effects(
         end
 
         for k in 1:outcomes_N
-            l_corr_name = _find_parameter(p_names_vec, string(spec.key), "L_corr", k, is_multivariate_model)
-            sigma_effects_name = _find_parameter(p_names_vec, string(spec.key), "sigma_effects", k, is_multivariate_model)
-            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            l_corr_samples_name = _find_parameter(p_names_vec, string(spec.key), "L_corr", k, is_multivariate_model)
+            sigma_effects_samples_name = _find_parameter(p_names_vec, string(spec.key), "sigma_effects", k, is_multivariate_model)
+            innovations_samples_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
 
-            if isempty(l_corr_name) || isempty(sigma_effects_name) || isempty(innovations_name)
+            if isempty(l_corr_samples_name) || isempty(sigma_effects_samples_name) || isempty(innovations_samples_name)
                 @warn "Parameters for correlated Mixed component $(spec.key) (outcome $k) not found. Skipping."
                 continue
             end
 
-            l_corr_samples = get_params_vector(chain, l_corr_name, n_terms * n_terms)
-            sigma_effects_samples = get_params_vector(chain, sigma_effects_name, n_terms)
-            innovations_samples = get_params_vector(chain, innovations_name, n_groups_train * n_terms)
+            l_corr_samples = get_params_vector(chain, l_corr_samples_name, n_terms * n_terms)
+            sigma_effects_samples = get_params_vector(chain, sigma_effects_samples_name, n_terms)
+            innovations_samples = get_params_vector(chain, innovations_samples_name, n_groups_train * n_terms)
             
             inner_precomputes = spec.hyper.inner_precomputes
 

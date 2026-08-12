@@ -6,7 +6,7 @@ unstructured noise or heterogeneity. Each latent effect is drawn independently f
 the same normal distribution.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.1 (2026-08-12)
 
 # Mathematical Summary
 The IID component models a latent field \$\\phi\$ where each element \$\\phi_i\$ is drawn
@@ -100,7 +100,8 @@ function get_priors(
     end
 
     if m.method == :noncentered
-        push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
+        # Removed explicit `T` from `zeros` for better AD compatibility.
+        push!(priors_acc, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros($(n_latent)), I), :$(p_names.innovations))")
     end
     
     return join(priors_acc, "\n    ")
@@ -136,7 +137,8 @@ function get_updates(
     centered_code = """
         # --- IID Component (Centered): $(spec.key) ---
         let
-            $(p_names.latent) ~ MvNormal(zeros(T, $(spec_registry[:$(spec.key)].hyper.n_latent)), $(p_names.sigma)^2 * I)
+            # Removed explicit `T` from `zeros` for better AD compatibility.
+            $(p_names.latent) ~ MvNormal(zeros($(spec.hyper.n_latent)), $(p_names.sigma)^2 * I)
             $(eta_target) .+= view($(p_names.latent), M.$(index_var))
         end
     """

@@ -136,7 +136,7 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     sigma_prior_str = _distribution_to_string(m.sigma)
     
-    return """
+    return """ # Priors for sigma and raw innovations
         $(p_names.sigma) ~ $(sigma_prior_str)
         $(p_names.innovations) ~ MvNormal(
             zeros(T, spec.hyper.n_latent), I

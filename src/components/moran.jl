@@ -116,7 +116,7 @@ function get_priors(
     priors = ["$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))"]
 
     if m.method == :noncentered
-        push!(
+        push!( # Raw standard normal innovations for coefficients
             priors,
             "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)"
         )

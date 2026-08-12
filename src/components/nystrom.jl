@@ -133,9 +133,7 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    if m.method == :noncentered
-        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
-    end
+    push!(priors, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros(T, $(m.n_inducing)), I), :$(p_names.innovations))") # Raw standard normal innovations for inducing points
 
     return join(priors, "\n    ")
 end

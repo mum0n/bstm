@@ -117,7 +117,7 @@ function get_priors(
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
         push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
     end
-    push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
+    push!(priors_acc, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.innovations))") # Raw standard normal innovations
     return join(priors_acc, "\n    ")
 end
 
@@ -133,7 +133,7 @@ function get_updates(
     statespace_code = """
         # --- RW1 Component: $(key) (State-Space Method) ---
         let
-            innovations = $(p_names.innovations)
+            innovations = $(p_names.innovations) # Raw standard normal innovations
             latent_field_raw = cumsum(innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
             $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
@@ -145,7 +145,7 @@ function get_updates(
         # --- RW1 Component: $(key) (Spectral Method) ---
         let
             hyper = spec_registry[:$(key)].hyper
-            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
+            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise) # Scale by sigma and add jitter
             diag_D[1] = 0.0
             $(p_names.latent) = hyper.U * (diag_D .* $(p_names.innovations))
             $(eta_target) .+= view($(p_names.latent), M.t_idx)
@@ -156,7 +156,7 @@ function get_updates(
         # --- RW1 Component: $(key) (Cholesky Method, AD-Safe) ---
         let
             F = spec_registry[:$(key)].hyper.cholesky_factor
-            latent_field_raw = F.L' \\ $(p_names.innovations)
+            latent_field_raw = F.L' \\ $(p_names.innovations) # Solve for raw latent field
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
             $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
             $(eta_target) .+= view($(p_names.latent), M.t_idx)
@@ -167,7 +167,7 @@ function get_updates(
         # --- RW1 Component: $(key) (Sparse Cholesky, Not AD-Safe) ---
         let
             Q = spec_registry[:$(key)].hyper.Q_template
-            F = cholesky(Symmetric(Q + M.noise * I))
+            F = cholesky(Symmetric(Q + M.noise * I)) # Cholesky factorization of the precision matrix
             latent_field_raw = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
             $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
@@ -192,17 +192,17 @@ function get_effects(
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        sigma_samples_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        innovations_samples_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(innovations_name)
+        if isempty(sigma_samples_name) || isempty(innovations_samples_name)
             @warn "Parameters for RW1 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        sigma_samples = get_params_vector(chain, sigma_samples_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_samples_name, n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
 

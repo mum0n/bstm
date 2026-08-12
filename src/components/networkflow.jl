@@ -127,7 +127,7 @@ function get_priors(
 
     push!(priors, "$(p_names.beta) ~ $(_distribution_to_string(m.beta))")
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, M.s_N), I)")
+    push!(priors, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros(T, M.s_N), I), :$(p_names.innovations))") # Raw standard normal innovations
 
     return join(priors, "\n    ")
 end
