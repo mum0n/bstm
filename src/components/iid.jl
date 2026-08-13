@@ -101,7 +101,7 @@ function get_priors(
 
     if m.method == :noncentered
         # Removed explicit `T` from `zeros` for better AD compatibility.
-        push!(priors_acc, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros($(n_latent)), I), :$(p_names.innovations))")
+        push!(priors_acc, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros($(n_latent)), I), :$(p_names.innovations))")
     end
     
     return join(priors_acc, "\n    ")

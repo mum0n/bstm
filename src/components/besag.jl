@@ -145,89 +145,76 @@ Generates code to sample the latent spatial field. Supports three methods:
 - `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
   factorization, suitable for gradient-free samplers.
 """
-function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    key = spec.key
     
-    if m.method == :lgcp
-        return """
-        # LGCP Model: $(spec.key)
-        let
-            hyper = spec_registry[:$(spec.key)].hyper
-            Q_lgcp = hyper.inner_spec.Q_template
-            F_lgcp = cholesky(Symmetric(Matrix(Q_lgcp) + M.noise * I))
-            spatial_component = $(p_names.sigma) .* (F_lgcp.L' \\ $(p_names.innovations))
-            
-            log_intensity_surface = eta .+ spatial_component[M.s_idx]
-            
-            for i in 1:M.y_N
-                y_i = M.y_obs[i]
-                A_i = hyper.areas[M.s_idx[i]]
-                lambda_i = exp(log_intensity_surface[i])
-                
-                Turing.@addlogprob! logpdf(Poisson(lambda_i * A_i), y_i)
-            end
-        end
-        M.likelihood_handled = true
-        """
-    elseif m.method == :lgmcp
-        return """
-        # LGMCP Model: $(spec.key)
-        let
-            hyper = spec_registry[:$(spec.key)].hyper
-            Q_lgmcp = hyper.inner_spec.Q_template
-            F_lgmcp = cholesky(Symmetric(Matrix(Q_lgmcp) + M.noise * I))
-            spatial_component = exp.(F_lgmcp.L' \\ $(p_names.innovations))
-            
-            mean_intensity_surface = exp.(eta) .* spatial_component[M.s_idx]
-            
-            for i in 1:M.y_N
-                y_i = M.y_obs[i]
-                A_i = hyper.areas[M.s_idx[i]]
-                mu = mean_intensity_surface[i] * A_i
-                
-                r_nb = $(p_names.shape)
-                p_nb = r_nb / (r_nb + mu)
-                
-                Turing.@addlogprob! logpdf(NegativeBinomial(r_nb, p_nb), y_i)
-            end
-        end
-        M.likelihood_handled = true
-        """
-    elseif m.method == :sncp
-        return """
-        # SNCP Model: $(spec.key)
-        let
-            hyper = spec_registry[:$(spec.key)].hyper
-            obs_locs = M.centroids
-            parent_locs = hcat($(p_names.parent_locs_x), $(p_names.parent_locs_y))
-            n_parents = length($(p_names.parent_locs_x))
-            
-            intensity_at_obs = zeros(T, M.s_N)
-            for i in 1:M.s_N
-                intensity_i = zero(T)
-                for j in 1:n_parents
-                    dist_sq = (obs_locs[i].x - parent_locs[j, 1])^2 + (obs_locs[i].y - parent_locs[j, 2])^2
-                    kernel_val = exp(-0.5 * dist_sq / ($(p_names.ls)^2))
-                    intensity_i += $(p_names.amplitude)[j] * kernel_val
-                end
-                intensity_at_obs[i] = intensity_i
-            end
-            
-            for i in 1:M.y_N
-                y_i = M.y_obs[i]
-                s_i = M.s_idx[i]
-                A_s = hyper.areas[s_i]
-                lambda_s = intensity_at_obs[s_i] * A_s
-                
-                Turing.@addlogprob! logpdf(Poisson(lambda_s), y_i)
-            end
-        end
-        M.likelihood_handled = true
-        """
+    # --- Spectral Method (AD-safe, default) ---
+    spectral_code = """
+    # --- Besag Component (Spectral): $(key) ---
+    let
+        hyper = spec_registry[:$(key)].hyper
+        # Construct the diagonal of the spectral transformation matrix D.
+        # D = diag(sigma / sqrt(L_j) ) where L_j are eigenvalues of Q_template.
+        diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
+        # Enforce sum-to-zero constraint by zeroing out the component for the first eigenvector.
+        diag_D[1] = 0.0
+        
+        # Apply the spectral transformation: latent = U * D * innovations
+        $(p_names.latent) = hyper.U * (diag_D .* $(p_names.innovations))
+        
+        $(eta_target) .+= view($(p_names.latent), M.s_idx)
     end
-    return ""
-end
+    """
 
+    # --- Dense Cholesky Method (AD-safe, didactic) ---
+    cholesky_code = """
+    # --- Besag Component (Dense Cholesky): $(key) ---
+    let
+        # Uses the pre-computed dense Cholesky factor.
+        F = spec_registry[:$(key)].hyper.cholesky_factor
+        
+        # Solve L' * x = z for x, where z ~ N(0,I).
+        latent_field_raw = F.L' \\ $(p_names.innovations)
+        
+        # Enforce sum-to-zero constraint for identifiability.
+        latent_field_centered = latent_field_raw .- mean(latent_field_raw)
+        
+        $(p_names.latent) = latent_field_centered .* $(p_names.sigma)
+        $(eta_target) .+= view($(p_names.latent), M.s_idx)
+    end
+    """
+
+    # --- Sparse Cholesky Method (Not AD-safe, for gradient-free samplers) ---
+    cholesky_sparse_code = """
+    # --- Besag Component (Sparse Cholesky): $(key) ---
+    let
+        # Re-computes sparse Cholesky factor inside the model. Not AD-safe.
+        Q = spec_registry[:$(key)].hyper.Q_template
+        F = cholesky(Symmetric(Q + M.noise * I))
+        
+        # Explicitly create a sparse matrix from the factor to ensure correct dispatch.
+        L_sparse = sparse(F.L)
+        latent_field_raw = L_sparse' \\ $(p_names.innovations)
+        
+        latent_field_centered = latent_field_raw .- mean(latent_field_raw)
+        
+        $(p_names.latent) = latent_field_centered .* $(p_names.sigma)
+        $(eta_target) .+= view($(p_names.latent), M.s_idx)
+    end
+    """
+
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    else
+        error("Unsupported method '$(m.method)' for Besag component.")
+    end
+end
 
 
 """

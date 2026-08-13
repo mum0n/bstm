@@ -117,7 +117,7 @@ function get_priors(
     end
     
     # Removed explicit `T` from `zeros` for better AD compatibility.
-    push!(priors, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros(spec.hyper.n_latent), I), :$(p_names.innovations))")
+    push!(priors, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(spec.hyper.n_latent), I), :$(p_names.innovations))")
 
     return join(priors, "\n    ")
 end

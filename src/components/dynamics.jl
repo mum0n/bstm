@@ -646,7 +646,7 @@ function get_updates(
                     fecundity_rates_spatial = exp.(log_fecundity_mean_$(key_str)' .+ fecundity_field .* sigma_fecundity_$(key_str)');
                     survival_raw_matrix = reshape(survival_raw_$(key_str), M.s_N, $(n_classes-1));
                     survival_field = F_spatial.L' \\ survival_raw_matrix;
-                    survival_rates_spatial = logistic.(logit_survival_mean_$(key_str)' .+ survival_field .* sigma_survival_$(key_str)');
+                    survival_rates_spatial = LogExpFunctions.logistic.(logit_survival_mean_$(key_str)' .+ survival_field .* sigma_survival_$(key_str)');
                 end
                 local K_values_$(key_str);
                 if $(spatially_varying_K)
@@ -1141,7 +1141,7 @@ function get_effects(
                         
                         survival_raw_matrix_j = reshape(survival_raw_samples[j, :], M.s_N, n_classes - 1)
                         survival_field = F_spatial.L' \ survival_raw_matrix_j
-                        survival_rates_spatial = logistic.(logit_survival_mean_samples[j, :]' .+ survival_field .* sigma_survival_samples[j, :]')
+                        survival_rates_spatial = LogExpFunctions.logistic.(logit_survival_mean_samples[j, :]' .+ survival_field .* sigma_survival_samples[j, :]')
 
                         for i_age in 1:(n_classes-1); L_s[i_age+1, i_age] = survival_rates_spatial[s, i_age]; end
                         L_s[1, :] = fecundity_rates_spatial[s, :]

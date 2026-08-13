@@ -24,7 +24,7 @@ function create_chain_adj_matrix(n)
 end
 
 # Helper function for stable log-difference of exponentials
-stable_logdiffexp(a, b) = a + log1mexp(b - a)
+stable_logdiffexp(a, b) = a + LogExpFunctions.log1mexp(b - a)
 
 # --- New Helper Functions for Testing Components ---
 # These will be needed to mock inputs for get_priors, get_updates, get_effects
@@ -801,6 +801,155 @@ end
                 @test cv_results_fchain.mean_r2 isa Real
             end
         end
+    end
+
+    @testset "bstm_data Monolithic Synthetic Data Generator" begin
+        @testset "Default scottish_lip Dataset & Covariate Completeness" begin
+            p_out, n_out = bstm.bstm_data() # Default "scottish_lip"
+            df = p_out.data
+            au = p_out.au
+
+            @test df isa DataFrame
+            @test au.W isa AbstractMatrix
+            @test size(df, 1) > 0
+
+            # Required columns check
+            required_cols = [
+                :y, :y_rate, :y_bin, :y_gauss, :y_pois, :ordinal_y,
+                :y_cat1, :y_cat2, :y_cat3, :counts, :t_idx, :year, :month, :day,
+                :region, :district, :group, :group_id, :group_var, :cell_area,
+                :effort, :removal, :removal_total, :proxy_val, :predator_pop,
+                :recruitment, :habitat, :species_1, :species_2, :species_3,
+                :age_1, :age_2, :age_3, :class_1, :class_2, :class_3, :class_4,
+                :s_idx, :s_x, :s_y
+            ]
+            for col in required_cols
+                @test col in propertynames(df)
+            end
+        end
+
+        @testset "All Supported Synthetic Dataset Types" begin
+            # 1. ordinal
+            df_ord = bstm.bstm_data("ordinal"; n_obs=100)
+            @test df_ord isa DataFrame
+            @test :ordinal_y in propertynames(df_ord)
+
+            # 2. sim / spatiotemporal
+            df_sim = bstm.bstm_data("sim"; s_N=10, t_N=4)
+            @test df_sim isa DataFrame
+            @test :y_gauss in propertynames(df_sim)
+
+            # 3. lgcp_regular
+            df_lgcp, W_lgcp, s_N_lgcp = bstm.bstm_data("lgcp_regular"; grid_side=5)
+            @test df_lgcp isa DataFrame
+            @test s_N_lgcp == 25
+
+            # 4. lgcp_irregular
+            df_irr, W_irr, s_N_irr, areas_irr = bstm.bstm_data("lgcp_irregular"; grid_side=4)
+            @test df_irr isa DataFrame
+            @test length(areas_irr) == 16
+
+            # 5. advanced
+            df_adv = bstm.bstm_data("advanced")
+            @test df_adv isa DataFrame
+            @test :proxy_val in propertynames(df_adv)
+
+            # 6. logistic
+            df_log, W_log, g_log = bstm.bstm_data("logistic"; s_N=5, t_N=3, use_effort=true)
+            @test df_log isa DataFrame
+            @test :effort in propertynames(df_log)
+
+            # 7. delay_difference
+            df_dd, W_dd, g_dd = bstm.bstm_data("delay_difference"; s_N=5, t_N=3, use_removal=true)
+            @test df_dd isa DataFrame
+            @test :recruitment in propertynames(df_dd)
+
+            # 8. glv
+            df_glv, W_glv, g_glv, n_sp = bstm.bstm_data("glv"; s_N=4, t_N=3, n_species=3)
+            @test df_glv isa DataFrame
+            @test n_sp == 3
+
+            # 9. lotka_volterra
+            df_lv, W_lv, g_lv = bstm.bstm_data("lotka_volterra"; s_N=4, t_N=3)
+            @test df_lv isa DataFrame
+            @test :predator_pop in propertynames(df_lv)
+
+            # 10. leslie_logistic
+            df_les, W_les, g_les, n_age = bstm.bstm_data("leslie_logistic"; s_N=4, t_N=3, n_age_classes=3)
+            @test df_les isa DataFrame
+            @test n_age == 3
+
+            # 11. logistic_spatial_k
+            df_sk, W_sk, g_sk = bstm.bstm_data("logistic_spatial_k"; s_N=4, t_N=3)
+            @test df_sk isa DataFrame
+
+            # 12. logistic_spatial_r
+            df_sr, W_sr, g_sr = bstm.bstm_data("logistic_spatial_r"; s_N=4, t_N=3)
+            @test df_sr isa DataFrame
+
+            # 13. leslie_matrix
+            df_lm, W_lm, g_lm, n_age_m = bstm.bstm_data("leslie_matrix"; s_N=4, t_N=3, n_age_classes=3)
+            @test df_lm isa DataFrame
+
+            # 14. dirichlet_multinomial
+            df_dm, W_dm = bstm.bstm_data("dirichlet_multinomial"; n_units=5, n_obs_per_unit=2)
+            @test df_dm isa DataFrame
+
+            # 15. generalized_leslie_matrix
+            df_glm, W_glm, g_glm, n_cls = bstm.bstm_data("generalized_leslie_matrix"; s_N=4, t_N=3, n_classes=4)
+            @test df_glm isa DataFrame
+            @test n_cls == 4
+        end
+
+        @testset "Symbol Type Inputs & Error Handling" begin
+            df_sym = bstm.bstm_data(:sim; s_N=5, t_N=2)
+            @test df_sym isa DataFrame
+
+            @test_throws ArgumentError bstm.bstm_data("non_existent_dataset_type")
+        end
+
+        @testset "Legacy Wrapper Compatibility" begin
+            p_leg, n_leg = bstm.scottish_lip_cancer_data_spacetime()
+            @test p_leg.data isa DataFrame
+
+            df_sim_leg = bstm.generate_sim_data(5, 2)
+            @test df_sim_leg isa DataFrame
+        end
+    end
+
+    @testset "Likelihood Families & Distributions Correctness" begin
+        # 1. NegativeBinomial parameterization check
+        nb_lik = bstm.bstm_Likelihood("negbin", [1.0]; r_nb=2.0)
+        logp_nb = logpdf(nb_lik, 3)
+        @test isfinite(logp_nb)
+
+        # 2. Poisson
+        poi_lik = bstm.bstm_Likelihood("poisson", [0.5])
+        @test isfinite(logpdf(poi_lik, 2))
+
+        # 3. Gaussian / Normal
+        gauss_lik = bstm.bstm_Likelihood("gaussian", [0.0]; sigma_y=1.5)
+        @test isfinite(logpdf(gauss_lik, 0.5))
+
+        # 4. LogNormal
+        lgn_lik = bstm.bstm_Likelihood("lognormal", [1.0]; sigma_y=0.5)
+        @test isfinite(logpdf(lgn_lik, 2.5))
+
+        # 5. Binomial / Bernoulli
+        bin_lik = bstm.bstm_Likelihood("binomial", [0.0]; trial=10)
+        @test isfinite(logpdf(bin_lik, 4))
+
+        # 6. Gamma
+        gam_lik = bstm.bstm_Likelihood("gamma", [1.0])
+        @test isfinite(logpdf(gam_lik, 2.0))
+
+        # 7. Beta
+        beta_lik = bstm.bstm_Likelihood("beta", [0.0])
+        @test isfinite(logpdf(beta_lik, 0.5))
+
+        # 8. DirichletMultinomial
+        dm_lik = bstm.bstm_Likelihood("dirichlet_multinomial", [0.1, 0.2, -0.1]; trial=10, sigma_y=1.0)
+        @test isfinite(logpdf(dm_lik, [3, 4, 3]))
     end
 
 end

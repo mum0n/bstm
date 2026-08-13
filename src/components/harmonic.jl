@@ -135,14 +135,14 @@ function get_priors(
         # Priors for cosine and sine coefficients
         beta_cos_prior = _distribution_to_string(Normal(0, 1))
         beta_sin_prior = _distribution_to_string(Normal(0, 1))
-        push!(priors, "$(p_names.beta_cos) ~ NamedDist(filldist($(beta_cos_prior), $(m.nharmonics)), :$(p_names.beta_cos))")
-        push!(priors, "$(p_names.beta_sin) ~ NamedDist(filldist($(beta_sin_prior), $(m.nharmonics)), :$(p_names.beta_sin))")
+        push!(priors, "$(p_names.beta_cos) ~ DynamicPPL.NamedDist(filldist($(beta_cos_prior), $(m.nharmonics)), :$(p_names.beta_cos))")
+        push!(priors, "$(p_names.beta_sin) ~ DynamicPPL.NamedDist(filldist($(beta_sin_prior), $(m.nharmonics)), :$(p_names.beta_sin))")
     elseif m.method == :ampphase
         # Priors for amplitude and phase
         amplitude_prior_str = _distribution_to_string(m.amplitude)
         phase_prior_str = _distribution_to_string(m.phase)
-        push!(priors, "$(p_names.amplitude) ~ NamedDist(filldist($(amplitude_prior_str), $(m.nharmonics)), :$(p_names.amplitude))")
-        push!(priors, "$(p_names.phase) ~ NamedDist(filldist($(phase_prior_str), $(m.nharmonics)), :$(p_names.phase))")
+        push!(priors, "$(p_names.amplitude) ~ DynamicPPL.NamedDist(filldist($(amplitude_prior_str), $(m.nharmonics)), :$(p_names.amplitude))")
+        push!(priors, "$(p_names.phase) ~ DynamicPPL.NamedDist(filldist($(phase_prior_str), $(m.nharmonics)), :$(p_names.phase))")
     end
 
     if m.period isa UnivariateDistribution

@@ -1766,7 +1766,7 @@ function _bstm_error_handler(e, model)
         println("Potential Causes:")
         println("  1. Latent Field vs. Index Mismatch: The number of latent variables for a spatial, temporal, or mixed effect does not match the number of unique levels in the corresponding index variable.")
         println("     - Check `s_N`, `t_N`, or the number of levels in your `mixed()` effect's grouping variable.")
-        println("     - Ensure the data passed to `bstm()` is consistent with the dimensions inferred from the formula.")
+        println("     - Ensure the data passed to `bstm_core()` is consistent with the dimensions inferred from the formula.")
         println("  2. Matrix Multiplication: An operation like `X * beta` has incompatible dimensions.")
         println("     - Verify the number of columns in your fixed effects design matrix `X` matches the length of the `beta` vector.")
     elseif e isa BoundsError
@@ -1902,7 +1902,7 @@ macro bstm(exprs...)
     kwargs_esc = [esc(kw) for kw in collected_kwargs]
 
     # Construct the core function call
-    core_logic = :(bstm($formula_str, $data_esc, $(__module__); $(kwargs_esc...)))
+    core_logic = :(bstm_core($formula_str, $data_esc, $(__module__); $(kwargs_esc...)))
 
     # Return the appropriate expression
     if !isnothing(var_name)
@@ -2064,7 +2064,7 @@ function _print_finalized_parameters(config::NamedTuple)
 end
 
 """
-    bstm(formula::String, data::DataFrame, calling_module::Module; kwargs...)
+    bstm_core(formula::String, data::DataFrame, calling_module::Module; kwargs...)
 
 The main entry point for the `@bstm` macro. This function orchestrates the configuration,
 code generation, and instantiation of a Turing model.
@@ -2083,10 +2083,8 @@ This function is the core of the `bstm` framework and replaces the deprecated
 5.  **Validation**: It automatically runs a prior predictive check (`rand(model)`) and
     provides detailed, user-friendly diagnostics if the check fails.
 
-This function is not deprecated and is the correct, unified entry point for all
-`bstm` models.
 """
-function bstm(formula::String, data::DataFrame, calling_module::Module; kwargs...)
+function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwargs...)
     # Generate model configuration dictionary based on formula syntax and data schema
     options = bstm_config(formula, data; calling_module = calling_module, kwargs...)
 
@@ -2139,7 +2137,7 @@ end
 
 
 """
-    bstm(formula::String, data::DataFrame; kwargs...)
+    bstm_core(formula::String, data::DataFrame; kwargs...)
 
 A convenience overload for the main `bstm` constructor. This method defaults the
 model's evaluation scope to the `Main` module.
@@ -2161,11 +2159,11 @@ ensuring that the dynamically generated model code is evaluated in the correct s
 # Returns
 - An instantiated Turing model object.
 """
-function bstm(formula::String, data::DataFrame; kwargs...)
+function bstm_core(formula::String, data::DataFrame; kwargs...)
     # This overload defaults the calling_module to `Main`, which is a sensible
     # default for interactive use. The `@bstm` macro should be preferred for
     # use inside other modules to ensure correct scope resolution.
-    return bstm(formula, data, Main; kwargs...)
+    return bstm_core(formula, data, Main; kwargs...)
 end
 
 """
@@ -2655,8 +2653,8 @@ function observation_volatility(M::NamedTuple)
         end
 
         priors_str = """
-        sigma_log_var ~ NamedDist(Exponential(1.0), :sigma_log_var)
-        beta_vol ~ NamedDist(MvNormal(zeros(T, M.M_rff_sigma), sigma_log_var^2 * I), :beta_vol)
+        sigma_log_var ~ DynamicPPL.NamedDist(Exponential(1.0), :sigma_log_var)
+        beta_vol ~ DynamicPPL.NamedDist(MvNormal(zeros(T, M.M_rff_sigma), sigma_log_var^2 * I), :beta_vol)
         """
 
         # The calculation projects spatiotemporal coordinates through the RFF basis
@@ -2763,7 +2761,7 @@ function _stable_logsubexp(a::Real, b::Real)
     if a <= b
         return -Inf
     end
-    return a + log1mexp(b - a)
+    return a + LogExpFunctions.log1mexp(b - a)
 end
 
  
@@ -4679,39 +4677,39 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
 
     # Prior for Negative Binomial dispersion
     if any(f -> f == "negbin", families)
-        push!(prior_blocks, "r_nb ~ NamedDist(Exponential(1.0), :r_nb)")
+        push!(prior_blocks, "r_nb ~ DynamicPPL.NamedDist(Exponential(1.0), :r_nb)")
     end
 
     # Prior for Zero-Inflation or Hurdle probability
     if get(M, :user_provided_hurdle, false)
-        push!(prior_blocks, "lik_phi_hurdle ~ NamedDist(Beta(1,1), :lik_phi_hurdle)")
+        push!(prior_blocks, "lik_phi_hurdle ~ DynamicPPL.NamedDist(Beta(1,1), :lik_phi_hurdle)")
     elseif get(M, :use_zi, false)
-        push!(prior_blocks, "lik_phi_zi ~ NamedDist(Beta(1,1), :lik_phi_zi)")
+        push!(prior_blocks, "lik_phi_zi ~ DynamicPPL.NamedDist(Beta(1,1), :lik_phi_zi)")
     end
 
     # Prior for Student's T degrees of freedom
     if any(f -> f == "student_t", families)
-        push!(prior_blocks, "lik_nu_student_t ~ NamedDist(Exponential(1.0), :lik_nu_student_t)")
+        push!(prior_blocks, "lik_nu_student_t ~ DynamicPPL.NamedDist(Exponential(1.0), :lik_nu_student_t)")
     end
 
     # Prior for observation standard deviation (for Gaussian-like families)
     if any(f -> f in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"], families)
         y_sigma_prior_str = _distribution_to_string(Exponential(1.0))
         if is_multivariate
-            push!(prior_blocks, "y_sigma ~ NamedDist(filldist($(y_sigma_prior_str), K), :y_sigma)")
+            push!(prior_blocks, "y_sigma ~ DynamicPPL.NamedDist(filldist($(y_sigma_prior_str), K), :y_sigma)")
         else
-            push!(prior_blocks, "y_sigma ~ NamedDist($(y_sigma_prior_str), :y_sigma)")
+            push!(prior_blocks, "y_sigma ~ DynamicPPL.NamedDist($(y_sigma_prior_str), :y_sigma)")
         end
     end
     
     # Prior for extra parameters (e.g., Gamma shape, Beta precision)
     if any(f -> f in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"], families)
-        push!(prior_blocks, "lik_extra_params ~ NamedDist(Exponential(1.0), :lik_extra_params)")
+        push!(prior_blocks, "lik_extra_params ~ DynamicPPL.NamedDist(Exponential(1.0), :lik_extra_params)")
     end
 
     # Prior for multivariate correlation matrix
     if is_multivariate
-        push!(prior_blocks, "L_corr ~ NamedDist(LKJCholesky(K, 1.0), :L_corr)")
+        push!(prior_blocks, "L_corr ~ DynamicPPL.NamedDist(LKJCholesky(K, 1.0), :L_corr)")
     end
 
     # --- Priors for Ordinal Model ---
@@ -4723,16 +4721,16 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
 
         if K > 2
             # Prior for the first cut-point and the positive differences for subsequent cut-points.
-            push!(prior_blocks, "ordinal_alpha_raw_1 ~ NamedDist(Normal(0, 5), :ordinal_alpha_raw_1)")
-            push!(prior_blocks, "ordinal_alpha_diffs ~ NamedDist(filldist(Exponential(1.0), $(K - 2)), :ordinal_alpha_diffs)")
+            push!(prior_blocks, "ordinal_alpha_raw_1 ~ DynamicPPL.NamedDist(Normal(0, 5), :ordinal_alpha_raw_1)")
+            push!(prior_blocks, "ordinal_alpha_diffs ~ DynamicPPL.NamedDist(filldist(Exponential(1.0), $(K - 2)), :ordinal_alpha_diffs)")
         elseif K == 2
             # For a binary ordinal model, only one cut-point is needed.
-            push!(prior_blocks, "ordinal_alpha_raw_1 ~ NamedDist(Normal(0, 5), :ordinal_alpha_raw_1)")
+            push!(prior_blocks, "ordinal_alpha_raw_1 ~ DynamicPPL.NamedDist(Normal(0, 5), :ordinal_alpha_raw_1)")
         end
 
         # Prior for the degrees of freedom if using a Student's T latent distribution.
         if latent_dist == :student_t
-            push!(prior_blocks, "ordinal_df ~ NamedDist(Exponential(1.0), :ordinal_df)")
+            push!(prior_blocks, "ordinal_df ~ DynamicPPL.NamedDist(Exponential(1.0), :ordinal_df)")
         end
     end
 
@@ -5015,7 +5013,7 @@ function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
                     cumulative_probs = if latent_dist_symbol == :normal
                         Distributions.cdf.(Normal(), alphas_computed .- linear_predictor_vec)
                     elseif latent_dist_symbol == :logistic
-                        logistic.(alphas_computed .- linear_predictor_vec)
+                        LogExpFunctions.logistic.(alphas_computed .- linear_predictor_vec)
                     elseif latent_dist_symbol == :student_t
                         Distributions.cdf.(TDist(ordinal_df), alphas_computed .- linear_predictor_vec)
                     else
@@ -5084,7 +5082,7 @@ function _generate_intercept_block(M::NamedTuple, is_multivariate::Bool, eta_nam
         dist_str = _distribution_to_string(intercept_prior_obj)
     end
     
-    prior_code = "intercept ~ NamedDist($(dist_str), :intercept)"
+    prior_code = "intercept ~ DynamicPPL.NamedDist($(dist_str), :intercept)"
     
     return prior_code, update_code
 end
@@ -5192,11 +5190,11 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
             
             if all_same_prop
                 prior_str = _distribution_to_string(priors_prop[1])
-                push!(prior_parts, "$(beta_prop_name) ~ NamedDist(filldist($(prior_str), $(n_prop * M.outcomes_N)), :Xfixed_beta_prop)")
+                push!(prior_parts, "$(beta_prop_name) ~ DynamicPPL.NamedDist(filldist($(prior_str), $(n_prop * M.outcomes_N)), :Xfixed_beta_prop)")
             else
                 full_priors_list = vcat([priors_prop for _ in 1:M.outcomes_N]...)
                 priors_str_list = [_distribution_to_string(p) for p in full_priors_list]
-                push!(prior_parts, "$(beta_prop_name) ~ NamedDist(Product([$(join(priors_str_list, ", "))]), :Xfixed_beta_prop)")
+                push!(prior_parts, "$(beta_prop_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ", "))]), :Xfixed_beta_prop)")
             end
         else
             beta_prop_name = "Xfixed_beta_prop"
@@ -5205,10 +5203,10 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
             
             if all_same_prop
                 prior_str = _distribution_to_string(priors_prop[1])
-                push!(prior_parts, "$(beta_prop_name) ~ NamedDist(filldist($(prior_str), $(n_prop)), :Xfixed_beta_prop)")
+                push!(prior_parts, "$(beta_prop_name) ~ DynamicPPL.NamedDist(filldist($(prior_str), $(n_prop)), :Xfixed_beta_prop)")
             else
                 priors_str_list = [_distribution_to_string(p) for p in priors_prop]
-                push!(prior_parts, "$(beta_prop_name) ~ NamedDist(Product([$(join(priors_str_list, ", "))]), :Xfixed_beta_prop)")
+                push!(prior_parts, "$(beta_prop_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ", "))]), :Xfixed_beta_prop)")
             end
         end
     end
@@ -5222,11 +5220,11 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
 
         if all_same_npo
             prior_str = _distribution_to_string(priors_npo[1])
-            push!(prior_parts, "$(beta_npo_name) ~ NamedDist(filldist($(prior_str), $(n_npo_params)), :beta_npo)")
+            push!(prior_parts, "$(beta_npo_name) ~ DynamicPPL.NamedDist(filldist($(prior_str), $(n_npo_params)), :beta_npo)")
         else
             full_priors_list = vcat([priors_npo for _ in 1:(K_ordinal-1)]...)
             priors_str_list = [_distribution_to_string(p) for p in full_priors_list]
-            push!(prior_parts, "$(beta_npo_name) ~ NamedDist(Product([$(join(priors_str_list, ", "))]), :beta_npo)")
+            push!(prior_parts, "$(beta_npo_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ", "))]), :beta_npo)")
         end
         # The update logic for non-proportional effects is handled within the ordinal likelihood block.
     end
@@ -6420,26 +6418,20 @@ end
 
 
 
-
- """
-    _process_mosaic_grouping!(opt_dict, mod_data)
-
-A helper function to handle the grouping logic for mosaic models. It partitions
-the spatial domain based on the `mosaic` parameter in a `random()` call.
-
-This function is introduced to centralize the logic for creating mosaic groups.
-It supports two modes:
-1.  `:kmeans`: Performs k-means clustering on the spatial coordinates.
-2.  A `Symbol` pointing to a column in the data that contains pre-defined group assignments.
-
-It creates a new column in the main DataFrame for the observation-level group
-assignments and returns the necessary information for the main processor to create
-the hierarchical model components.
-"""
 function _process_mosaic_grouping!(opt_dict, mod_data)
+    # Purpose: Handles the grouping logic for mosaic models, partitioning the spatial domain.
+    # Rationale: Centralizes the logic for creating mosaic groups, supporting k-means clustering
+    #            or pre-defined grouping columns. This version enhances robustness and clarity,
+    #            especially for pre-defined groups, by validating consistency and completeness.
+    # v1.0.1 (2026-08-13)
+    # Inputs:
+    #   - opt_dict: The main model configuration dictionary.
+    #   - mod_data: The parsed data for the `random()` module call.
+    # Outputs: A NamedTuple containing the new observation-level grouping column name and the number of regions.
+
     s_N = get(opt_dict, :s_N, 0)
     if s_N == 0
-        error("Mosaic models require a spatial context (`s_N`) to be established first.")
+        error("Mosaic models require a spatial context (`s_N`) to be established first. Ensure a spatial variable and adjacency matrix `W` are provided.")
     end
     
     data = opt_dict[:data]
@@ -6453,7 +6445,9 @@ function _process_mosaic_grouping!(opt_dict, mod_data)
 
     if mosaic_param == :kmeans
         # --- K-Means Clustering Logic ---
+        # This path uses spatial coordinates to perform clustering.
         if !haskey(opt_dict, :centroids)
+            # Attempt to derive centroids from s_x, s_y if not explicitly provided.
             if hasproperty(data, :s_x) && hasproperty(data, :s_y) && hasproperty(data, :s_idx)
                 coord_map = Dict{Int, Point2D}()
                 for i in 1:nrow(data)
@@ -6467,7 +6461,7 @@ function _process_mosaic_grouping!(opt_dict, mod_data)
                 end
                 opt_dict[:centroids] = [coord_map[i] for i in 1:s_N]
             else
-                error("Mosaic k-means requires centroids or `s_x`/`s_y` coordinates.")
+                error("Mosaic k-means requires centroids or `s_x`/`s_y` coordinates in the data.")
             end
         end
         
@@ -6476,6 +6470,7 @@ function _process_mosaic_grouping!(opt_dict, mod_data)
             error("Number of centroids ($(length(centroids))) does not match s_N ($(s_N)).")
         end
 
+        # Resolve n_regions, allowing it to be a symbol pointing to a variable.
         n_regions_raw = get(params, :n_regions, 5)
         n_regions_req::Int = if n_regions_raw isa Symbol
             calling_mod = get(opt_dict, :calling_module, Main)
@@ -6491,6 +6486,7 @@ function _process_mosaic_grouping!(opt_dict, mod_data)
         end
 
         if length(centroids) < n_regions_req
+            @warn "Number of centroids ($(length(centroids))) is less than the requested number of regions ($n_regions_req). Adjusting n_regions to $(length(centroids))."
             n_regions_req = length(centroids)
         end
         
@@ -6501,65 +6497,89 @@ function _process_mosaic_grouping!(opt_dict, mod_data)
         n_regions = nclusters(kmeans_result)
 
     elseif mosaic_param isa Symbol
-        # --- Pre-defined Grouping Column Logic ---
+        # --- Pre-defined Grouping Column Logic (Enhanced Robustness) ---
+        # This path uses a column in the DataFrame to define the spatial groups.
         if !hasproperty(data, mosaic_param)
             error("The specified mosaic grouping column `:$(mosaic_param)` was not found in the data.")
         end
-        group_data = data[!, mosaic_param]
-        unique_levels = unique(group_data)
-        n_regions = length(unique_levels)
-        level_map = Dict(level => i for (i, level) in enumerate(unique_levels))
+
+        # Create a mapping from s_idx to the group value.
+        # Ensure each s_idx maps to a unique group value.
+        s_idx_group_pairs = unique(data[!, [:s_idx, mosaic_param]])
         
-        s_idx_to_group = Dict{Int, Int}()
-        for i in 1:nrow(data)
-            s_idx_i = data.s_idx[i]
-            group_val = group_data[i]
-            if !haskey(s_idx_to_group, s_idx_i)
-                s_idx_to_group[s_idx_i] = level_map[group_val]
+        # Validate consistency: each s_idx must map to only one group value.
+        s_idx_counts = countmap(s_idx_group_pairs.s_idx)
+        for (s_id, count) in s_idx_counts
+            if count > 1
+                error("Spatial unit `s_idx = $s_id` has multiple conflicting values in the grouping column `:$(mosaic_param)`. Each spatial unit must belong to exactly one group.")
             end
         end
-        cluster_assignments = [get(s_idx_to_group, i, 1) for i in 1:s_N]
+
+        # Map unique group levels to integers 1:n_regions.
+        unique_group_levels = unique(s_idx_group_pairs[!, mosaic_param])
+        n_regions = length(unique_group_levels)
+        level_to_int_map = Dict(level => i for (i, level) in enumerate(unique_group_levels))
+        
+        # Build the final cluster_assignments vector for all s_N units.
+        cluster_assignments = Vector{Int}(undef, s_N)
+        s_idx_to_group_map = Dict{Int, Int}()
+        for row in eachrow(s_idx_group_pairs)
+            s_idx_to_group_map[row.s_idx] = level_to_int_map[row[mosaic_param]]
+        end
+
+        for i in 1:s_N
+            if !haskey(s_idx_to_group_map, i)
+                error("Spatial unit `s_idx = $i` is missing from the grouping column `:$(mosaic_param)`. All spatial units from 1 to `s_N` must have a defined group.")
+            end
+            cluster_assignments[i] = s_idx_to_group_map[i]
+        end
+
     else
         error("Invalid `mosaic` parameter. Must be `:kmeans` or a Symbol pointing to a grouping column.")
     end
 
     # Create the observation-level grouping column needed by the `mixed` processor.
+    # This column assigns each observation to its spatial group based on its s_idx.
     opt_dict[:data][!, group_col_name] = cluster_assignments[opt_dict[:data].s_idx]
     
     return (group_col_name=group_col_name, n_regions=n_regions)
 end
 
 
+
 """
-    process_sciml_module!(opt_dict, mod_data, registries, hyperpriors)
+    process_sciml_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
 
-Processes the `sciml()` module call from the formula.
+Processes the `sciml()` module call, validating arguments and setting up temporal context.
 
-# Rationale
-This function is a necessary component processor for integrating models from the SciML
-ecosystem. It is not deprecated and is consistent with the refactored architecture.
-Its primary role is to validate the arguments provided to the `sciml()` module and
-to establish the necessary temporal context (`t_idx`, `t_N`, `t_coords`) in the main
-model configuration. It ensures that all required parameters for defining a SciML
-problem (`model_func`, `u0_prior`, `p_priors`, `tspan`, `solver`) are present before
-the model building phase.
+# Version
+v1.0.1 (2026-08-13)
+
+# Rationale for Update
+This version is updated to correctly evaluate all user-provided arguments
+(e.g., `solver`, `p_priors`) within the user's module scope. The previous
+version only checked for the presence of these arguments as symbols, but
+did not resolve them into the actual objects needed by the model builder
+and code generator. This fix ensures that functions, distributions, and
+other complex objects passed as arguments are correctly instantiated.
 
 # Arguments
-- `opt_dict`: The main model configuration dictionary.
+- `opt_dict`: The main model configuration dictionary (`M`).
 - `mod_data`: The parsed data for the `sciml()` module.
-- `registries`, `hyperpriors`: Additional configuration dictionaries (not used here).
+- `registries`, `hyperpriors`: Additional configuration dictionaries.
 
 # Returns
 - `true` to indicate that a `SciMLComponent` object should be created.
 """
-function process_sciml_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
-    # Purpose: Processes the `sciml()` module call, validating arguments and setting up temporal context.
-    # Version: 1.0.0 (2026-08-06)
-
+function process_sciml_module!(
+    opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict
+)
     data = opt_dict[:data]
     params = mod_data[:params]
     variables = mod_data[:variables]
+    calling_mod = get(opt_dict, :calling_module, Main)
 
+    # 1. Set up temporal context from the time index variable.
     if isempty(variables)
         error("The `sciml()` module requires a time index variable, e.g., `sciml(year, ...)`.")
     end
@@ -6569,7 +6589,6 @@ function process_sciml_module!(opt_dict::Dict, mod_data::Dict, registries::Dict,
         error("Time index variable ':$time_var_sym' for sciml() module not found in data.")
     end
 
-    # Set up temporal context in the main configuration dictionary.
     time_opts = Dict(:time_method => get(params, :time_method, "regular"))
     tu_meta = assign_time_units(data[!, time_var_sym]; time_opts...)
     opt_dict[:t_idx] = tu_meta.idx
@@ -6577,21 +6596,141 @@ function process_sciml_module!(opt_dict::Dict, mod_data::Dict, registries::Dict,
     opt_dict[:t_idx_var] = time_var_sym
     opt_dict[:t_coords] = data[!, time_var_sym] # Store original time coordinates for interpolation.
 
-    # Validate that all required parameters for defining a SciML problem are present.
+    # 2. Validate and evaluate all required SciML parameters.
+    # These arguments can be symbols or expressions that need to be evaluated in the user's scope.
     required_args = [:model_func, :u0_prior, :p_priors, :tspan, :solver]
     for arg in required_args
         if !haskey(params, arg)
             error("The `sciml()` module is missing the required keyword argument `:$arg`.")
         end
+        
+        raw_val = params[arg]
+        try
+            # Evaluate the argument in the user's module to resolve the object.
+            evaluated_val = Core.eval(calling_mod, raw_val)
+            # Store the evaluated object back into the parameters for the component constructor.
+            params[arg] = evaluated_val
+        catch e
+            error("Could not evaluate the `$(arg)` argument `$(raw_val)` for the sciml() module. Ensure it is defined in the calling scope. Error: $e")
+        end
     end
 
-    # Store solver and tspan in the main config for the code generator to access.
-    # This is necessary because they are not part of the ComponentModel struct itself.
+    # 3. Evaluate optional parameters.
+    if haskey(params, :saveat)
+        try
+            params[:saveat] = Core.eval(calling_mod, params[:saveat])
+        catch e
+            @warn "Could not evaluate `saveat` argument for sciml() module. Using default. Error: $e"
+        end
+    end
+
+    # 4. Store necessary evaluated parameters in the main model configuration for the code generator.
     opt_dict[:sciml_solver] = params[:solver]
     opt_dict[:sciml_tspan] = params[:tspan]
     opt_dict[:sciml_saveat] = get(params, :saveat, 0.1) # Default saveat
 
-    return true # Indicates that a component object should be created.
+    return true # Indicates that a SciMLComponent object should be created.
+end
+
+
+"""
+    process_dynamics_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
+
+Processes the `dynamics()` module, ensuring spatial and temporal contexts are established.
+
+This version is updated to be self-contained and consistent with the refactored
+architecture. It no longer calls deprecated processors. Instead, it directly
+handles the setup of spatial and temporal indices from its own arguments, resolves
+the adjacency matrix `W`, and validates all necessary parameters for the specified
+mechanistic model.
+
+# Arguments
+- `opt_dict`: The main model configuration dictionary (`M`).
+- `mod_data`: The parsed data for the `dynamics()` module.
+- `registries`, `hyperpriors`: Additional configuration dictionaries.
+
+# Returns
+- `true` to indicate that a `Dynamics` component object should be created.
+"""
+function process_dynamics_module!(
+    opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict
+)
+    params = mod_data[:params]
+    data = opt_dict[:data]
+    variables = mod_data[:variables] # Positional arguments from the formula, e.g., s_idx, year
+
+    # 1. Validate and set up spatial and temporal indices from formula arguments.
+    # The dynamics module expects at least two positional arguments: spatial_index, temporal_index
+    if length(variables) < 2
+        error("The `dynamics()` module requires at least two positional arguments: a spatial index and a temporal index (e.g., `dynamics(s_idx, year, ...)`).")
+    end
+
+    spatial_idx_var = Symbol(variables[1])
+    temporal_idx_var = Symbol(variables[2])
+
+    # Resolve spatial index and its number of levels
+    if !hasproperty(data, spatial_idx_var)
+        error("Spatial index variable ':$spatial_idx_var' for dynamics module not found in data.")
+    end
+    opt_dict[:s_idx] = data[!, spatial_idx_var]
+    opt_dict[:s_N] = length(unique(opt_dict[:s_idx])) # Number of unique spatial units
+
+    # Resolve temporal index and its number of levels
+    if !hasproperty(data, temporal_idx_var)
+        error("Temporal index variable ':$temporal_idx_var' for dynamics module not found in data.")
+    end
+    opt_dict[:t_idx] = data[!, temporal_idx_var]
+    opt_dict[:t_N] = length(unique(opt_dict[:t_idx])) # Number of unique time steps
+
+    # 2. Resolve adjacency matrix `W`.
+    # Prioritize `W` from the module's parameters, then fallback to global opt_dict.
+    if haskey(params, :W)
+        w_val = params[:W]
+        if w_val isa Expr || w_val isa Symbol
+            calling_mod = get(opt_dict, :calling_module, Main)
+            try
+                opt_dict[:W] = Core.eval(calling_mod, w_val)
+            catch e
+                error("Could not evaluate `W` argument `$(w_val)` for dynamics module. Error: $e")
+            end
+        else
+            opt_dict[:W] = w_val
+        end
+    end
+    if !haskey(opt_dict, :W)
+        error("Dynamics models require an adjacency matrix `W`, passed either to the module (e.g., `dynamics(..., W=my_W)`) or as a keyword argument to the main `@bstm` call (e.g., `@bstm(..., W=my_W)`).")
+    end
+    if opt_dict[:s_N] != size(opt_dict[:W], 1)
+        error("Number of unique spatial indices ($(opt_dict[:s_N])) does not match the dimension of the provided adjacency matrix W ($(size(opt_dict[:W], 1))).")
+    end
+
+    # 3. Model Type Verification
+    model_type = string(get(params, :model, "none"))
+    if model_type == "none"
+        error("Dynamics module requires a 'model' parameter (e.g., model='advection').")
+    end
+
+    # 4. Covariate and Parameter Validation
+    if model_type in ["advection", "advection_diffusion"]
+        if !haskey(params, :velocity_prior) && !haskey(opt_dict[:hyperpriors], "velocity")
+            @warn "Advection model specified without explicit velocity priors. Using system defaults."
+        end
+    end
+    if model_type in ["diffusion", "advection_diffusion"]
+        if !haskey(params, :diffusion_prior) && !haskey(opt_dict[:hyperpriors], "diffusion")
+            @warn "Diffusion model specified without explicit diffusion priors. Using system defaults."
+        end
+    end
+
+    # 5. Mapping Spatiotemporal State
+    # We pre-calculate the spatiotemporal flat index (st_idx) to allow the
+    # code generator to map the [s_N, t_N] state matrix to the observation vector N.
+    s_idx = opt_dict[:s_idx]
+    t_idx = opt_dict[:t_idx]
+    s_N = opt_dict[:s_N]
+    opt_dict[:st_idx] = [(t_val - 1) * s_N + s_val for (s_val, t_val) in zip(s_idx, t_idx)]
+
+    return true
 end
 
 

@@ -141,7 +141,7 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.innovations))") # Raw standard normal innovations
+    push!(priors, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.innovations))") # Raw standard normal innovations
 
     return join(priors, "\n    ")
 end

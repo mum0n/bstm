@@ -739,7 +739,7 @@ function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
             eta_is = eta_samples[i, s]
             
             lik_obj = bstm_Likelihood(
-                family, [0.0]; phi_zi=phi_zi_s, r_nb=r_nb_s,
+                family, [eta_is]; phi_zi=phi_zi_s, r_nb=r_nb_s,
                 sigma_y=y_sigma_s, trial=trials_full[i]
             )
             dist = get_dist_ref(lik_obj.family, lik_obj, eta_is, y_sigma_s)
@@ -747,7 +747,7 @@ function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
             p_noisy_samples[i, s] = rand(dist) 
 
             if i <= N_train
-                log_lik_samples[i, s] = logpdf(dist, y_obs_k[i])
+                log_lik_samples[i, s] = logpdf(lik_obj, y_obs_k[i])
             end
         end
     end
@@ -772,7 +772,7 @@ function _process_multinomial_predictions(eta_samples, chain, M, PS)
     p_denoised_samples = zeros(Float64, N_tot, K, n_samples)
     for s in 1:n_samples 
         for i in 1:N_tot
-            p_denoised_samples[i, :, s] = softmax(eta_samples[i, s, :])
+            p_denoised_samples[i, :, s] = NNlib.softmax(eta_samples[i, s, :])
         end
     end
 
@@ -873,7 +873,7 @@ function _compute_waic(log_lik)
     # The mean is taken over the posterior samples.
     # The original code `log_lik[:, i]` was incorrect as it sliced columns.
     # The correct approach is to slice rows `log_lik[i, :]`.
-    lppd = sum(logsumexp(view(log_lik, i, :)) - log(nsamples) for i in 1:nobs)
+    lppd = sum(LogExpFunctions.logsumexp(view(log_lik, i, :)) - log(nsamples) for i in 1:nobs)
     
     # p_waic: effective number of parameters.
     # This is the sum over observations of the variance of the log-likelihood for each observation.
@@ -890,7 +890,7 @@ function _apply_link_and_lik(family::String, eta::AbstractArray, use_zi::Bool, p
     if family in ["poisson", "negbin", "gamma", "exponential", "inverse_gaussian", "pareto"]
         mu = exp.(eta)
     elseif family in ["bernoulli", "binomial", "beta"]
-        mu = logistic.(eta)
+        mu = LogExpFunctions.logistic.(eta)
     else
         mu = eta 
     end

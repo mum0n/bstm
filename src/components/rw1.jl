@@ -117,7 +117,7 @@ function get_priors(
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
         push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
     end
-    push!(priors_acc, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.innovations))") # Raw standard normal innovations
+    push!(priors_acc, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.innovations))") # Raw standard normal innovations
     return join(priors_acc, "\n    ")
 end
 

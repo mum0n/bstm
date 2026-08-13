@@ -1765,73 +1765,7 @@ function assign_time_units(t_v::AbstractVector{<:Integer}; time_method="unique",
     return (idx=idx, brks=brks, mids=mids, N_cat=N_cat)
 end
    
-    
-function assign_time_units_deprecated(t_v; time_method="regular", t_N=nothing, u_N=12, kwargs...)
-    """
-    BSTM Partitioning Utility v1.0.0
-    Timestamp: 2026-06-26 10:05:38
-    Synopsis: Discretizes a continuous time vector into integer-based temporal units (e.g., years)
-              and seasonal units (e.g., months), preparing it for use in discrete spatiotemporal models.
-    Inputs:
-        - t_v: A vector of continuous time values (e.g., fractional years).
-        - time_method: The method for discretization. Currently, only "regular" is supported, which assumes
-                       integer steps correspond to primary time units like years.
-        - t_N: Optional. The expected number of unique primary time units (e.g., years). A warning is
-               printed if the actual range of `t_v` does not match this value.
-        - u_N: The number of seasonal bins to create from the fractional part of the time values. Defaults to 12.
-        - kwargs: Additional arguments (currently unused).
-    Outputs:
-        - A `NamedTuple` containing all temporal information, including:
-            - `t_idx`: An integer index for the primary time unit of each observation.
-            - `t0`, `t1`: The start and end integer time values.
-            - `tn`, `t_N`: The total number of primary time units.
-            - `u_idx`: An integer index for the seasonal unit of each observation.
-            - `u_N`: The number of seasonal bins.
-            - And other related temporal metadata like breaks and midpoints.
-    """
-    if time_method=="regular"
-
-        tint = Int.(floor.(t_v))
-        t0, t1 = minimum(tint), maximum(tint)
-        t_n = t1-t0
-        if !isnothing(t_N)
-            if t_n != t_N
-                print("warning: time range and unique years do not match")
-            end
-        end
-
-        t_idx = tint .- t0 .+ 1
-        t_vals = collect(t0:t1) .- t0 .+ 1
-        t_yr = collect(t0:t1)
-        t_brks = (t_yr, t1+1)
-        t_mids = t_yr .+ 0.5
-        
-        u_v = t_v - tint
-
-        u_disc = discretize_data( u_v, N_cat=u_N, method="regular" )  # seasonality discretized
-
-        return (
-            t_v = t_v, 
-            t_idx = t_idx, 
-            t0=t0, 
-            t1=t1, 
-            t_vals, 
-            t_yr=t_yr, 
-            t_mids=t_mids, 
-            t_brks=t_brks,
-            tn=length(t_vals),
-            t_N= length(t_vals),
-            u_v=u_v, 
-            u_idx=u_disc.idx, 
-            u_brks=u_disc.brks,
-            u_mids=u_disc.mids, 
-            u_N=u_N,
-            u_vals=collect(1:u_N) 
-        )
-    end
-
-end
-
+     
 
 
 function discretize_data(X; method="quantile", N_cat=9, brks=nothing, probs=nothing, dx=nothing, minv = 0, maxv=1)

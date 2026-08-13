@@ -133,7 +133,7 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros(T, $(m.n_inducing)), I), :$(p_names.innovations))") # Raw standard normal innovations for inducing points
+    push!(priors, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(m.n_inducing)), I), :$(p_names.innovations))") # Raw standard normal innovations for inducing points
 
     return join(priors, "\n    ")
 end

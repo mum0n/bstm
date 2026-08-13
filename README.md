@@ -39,11 +39,11 @@
     Start a Julia session from within the `bstm` directory. The following script will activate the project, install all necessary dependencies (which may take some time on the first run), and load the framework's functions.
 
 ```julia
-# Set the path to your cloned bstm repository
-project_directory = pwd() # Assumes you started Julia from the 'bstm' directory
 
-# Activate the project and load all functions
-include(joinpath(project_directory, "startup.jl"))
+cd( "/home/jae/projects/bstm" ) # where you saved it
+include("bstm.jl")
+using .bstm
+
 ``` 
 
 ## Quick start
@@ -58,8 +58,8 @@ Random.seed!(42)
 # 1. Load Data
 # The dataset includes cancer counts (y), population offsets (log_offset),
 # a covariate (X), and spatial/temporal indices.
-data_scot, _ = scottish_lip_cancer_data_spacetime()
-df = data_scot.data
+data_scot, _ = bstm_data() # Default is "scottish_lip"
+inp_df = data_scot.data
 W = data_scot.au.W
 
 # 2. Define a Spatiotemporal Model
@@ -70,7 +70,7 @@ m = @bstm(
         fixed(X) +
         random(s_idx, model=bym2) +
         random(year, model=ar1),
-    df,
+    inp_df,
     W = W,
     verbose = false # Suppress verbose output
 )

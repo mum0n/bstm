@@ -160,7 +160,7 @@ function get_priors(
     end
     
     if m.method == :adaptive
-        push!(priors, "$(p_names.W) ~ NamedDist(MvNormal(vec(spec.hyper.W_fixed), 0.1), :$(p_names.W))") # Prior for adaptive RFF weights
+        push!(priors, "$(p_names.W) ~ DynamicPPL.NamedDist(MvNormal(vec(spec.hyper.W_fixed), 0.1), :$(p_names.W))") # Prior for adaptive RFF weights
         push!(priors, "$(p_names.b) ~ NamedDist(MvNormal(spec.hyper.b_fixed, 0.1), :$(p_names.b))") # Prior for adaptive RFF biases
     end
 

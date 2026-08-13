@@ -1,33 +1,3 @@
-abstract type AbstractBSTM_Family end
-struct PoissonFamily <: AbstractBSTM_Family end
-struct GaussianFamily <: AbstractBSTM_Family end
-struct LogNormalFamily <: AbstractBSTM_Family end
-struct NegativeBinomialFamily <: AbstractBSTM_Family end
-struct BinomialFamily <: AbstractBSTM_Family end
-struct GammaFamily <: AbstractBSTM_Family end
-struct ExponentialFamily <: AbstractBSTM_Family end
-struct BetaFamily <: AbstractBSTM_Family end
-struct InverseGaussianFamily <: AbstractBSTM_Family end
-struct StudentTFamily <: AbstractBSTM_Family end
-struct HalfNormalFamily <: AbstractBSTM_Family end
-struct HalfStudentTFamily <: AbstractBSTM_Family end
-struct LaplaceFamily <: AbstractBSTM_Family end
-struct ParetoFamily <: AbstractBSTM_Family end
-struct DirichletFamily <: AbstractBSTM_Family end
-struct InverseWishartFamily <: AbstractBSTM_Family end
-struct DirichletMultinomialFamily <: AbstractBSTM_Family end
-struct OrdinalFamily <: AbstractBSTM_Family end
-
-abstract type AbstractZIState end
-struct NonZeroInflated <: AbstractZIState end
-struct ZeroInflated <: AbstractZIState end
-
-
-abstract type AbstractCensoringState end
-struct Uncensored <: AbstractCensoringState end
-struct LeftCensored <: AbstractCensoringState end
-struct RightCensored <: AbstractCensoringState end
-struct IntervalCensored <: AbstractCensoringState end
 
 """
     bstm_Likelihood
@@ -104,22 +74,24 @@ end
 
 
 function get_dist_ref(::NegativeBinomialFamily, d, eta::V, sig) where {V<:Real}
-    mu = exp(eta)
-    return NegativeBinomial(mu, V(d.r_nb))
+    r = V(d.r_nb)
+    mu = clamp(exp(eta), V(1e-9), V(1e9))
+    p = clamp(r / (r + mu), V(1e-12), V(1.0 - 1e-12))
+    return NegativeBinomial(r, p)
 end
 
 
 
 function get_dist_ref(::BinomialFamily, d, eta::V, sig) where {V<:Real}
     n = d.trial isa AbstractVector ? d.trial[1] : d.trial
-    return Binomial(Int(n), logistic(eta))
+    return Binomial(Int(n), LogExpFunctions.logistic(eta))
 end
 
 
 
 function get_dist_ref(::GammaFamily, d, eta, sig); alpha = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 1.0; return Gamma(alpha, clamp(exp(eta), 1e-9, 1e9)/alpha); end
 function get_dist_ref(::ExponentialFamily, d, eta, sig); return Exponential(clamp(exp(eta), 1e-9, 1e9)); end
-function get_dist_ref(::BetaFamily, d, eta, sig); mu = logistic(eta); phi = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 10.0; return Beta(clamp(mu*phi, 1e-9, Inf), clamp((1.0-mu)*phi, 1e-9, Inf)); end
+function get_dist_ref(::BetaFamily, d, eta, sig); mu = LogExpFunctions.logistic(eta); phi = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 10.0; return Beta(clamp(mu*phi, 1e-9, Inf), clamp((1.0-mu)*phi, 1e-9, Inf)); end
 function get_dist_ref(::InverseGaussianFamily, d, eta, sig); mu = clamp(exp(eta), 1e-9, 1e9); lambda = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 1.0; return InverseGaussian(mu, lambda); end
 function get_dist_ref(::StudentTFamily, d, eta, sig); nu = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 5.0; return LocationScale(eta, max(sig, 1e-9), TDist(nu)); end
 function get_dist_ref(::HalfNormalFamily, d, eta, sig); return truncated(Normal(0.0, max(sig, 1e-9)), 0.0, Inf); end
@@ -141,7 +113,7 @@ end
 #            observation data `y_obs`, which is no longer stored in the distribution object.
 function get_dist_ref(::DirichletMultinomialFamily, d, eta_vec, sig)
     alpha_0 = max(sig, 1e-6)
-    mean_probs = softmax(eta_vec)
+    mean_probs = NNlib.softmax(eta_vec)
     alpha_params = alpha_0 .* mean_probs
     # The total number of trials is now passed via the `trial` keyword argument.
     n_total = d.trial
@@ -271,7 +243,7 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::Uncensored, zero_inflated::Abst
 
         if y == zero(V) # Changed from y == 0.0
             if is_discrete_family(fam)
-                return logsumexp(log_phi, log_one_minus_phi + logpdf(dist, zero(V)))
+                return LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + logpdf(dist, zero(V)))
             else
                 return log_phi
             end
@@ -306,7 +278,7 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::LeftCensored, zero_inflated::Ab
         log_one_minus_phi = V(log1p(-d.phi_zi)) # Cast to V
         lp_base = logcdf(dist, upper_bound)
         if upper_bound >= V(0.0) # Cast 0.0 to V
-            return logsumexp(log_phi, log_one_minus_phi + lp_base)
+            return LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + lp_base)
         else
             return log_one_minus_phi + lp_base
         end
@@ -317,7 +289,7 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::LeftCensored, zero_inflated::Ab
             return log_one_minus_phi
         end
         log_prob_in_interval_given_hurdle = _stable_logsubexp(logcdf(dist, upper_bound), logcdf(dist, V(d.hurdle))) - logccdf(dist, V(d.hurdle)) # Cast d.hurdle to V
-        return logsumexp(log_one_minus_phi, log_phi + log_prob_in_interval_given_hurdle)
+        return LogExpFunctions.logsumexp(log_one_minus_phi, log_phi + log_prob_in_interval_given_hurdle)
     else
         return logcdf(dist, upper_bound)
     end
@@ -338,9 +310,9 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::RightCensored, zero_inflated::A
         log_p_le_L = if lower_bound < V(0.0) # Cast 0.0 to V
             log_one_minus_phi + logcdf(dist, lower_bound)
         else
-            logsumexp(log_phi, log_one_minus_phi + logcdf(dist, lower_bound))
+            LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + logcdf(dist, lower_bound))
         end
-        return log1mexp(log_p_le_L)
+        return LogExpFunctions.log1mexp(log_p_le_L)
 
     elseif d.phi_hurdle > V(-Inf) # Cast -Inf to V
         log_phi = V(log(d.phi_hurdle)) # Cast to V
@@ -372,13 +344,13 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::IntervalCensored, zero_inflated
         log_p_le_U = if upper_bound < V(0.0) # Cast 0.0 to V
             log_one_minus_phi + logcdf(dist, upper_bound)
         else
-            logsumexp(log_phi, log_one_minus_phi + logcdf(dist, upper_bound))
+            LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + logcdf(dist, upper_bound))
         end
 
         log_p_le_L = if lower_bound < V(0.0) # Cast 0.0 to V
             log_one_minus_phi + logcdf(dist, lower_bound)
         else
-            logsumexp(log_phi, log_one_minus_phi + logcdf(dist, lower_bound))
+            LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + logcdf(dist, lower_bound))
         end
         return _stable_logsubexp(log_p_le_U, log_p_le_L)
 

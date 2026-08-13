@@ -128,8 +128,8 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
-    push!(priors, "$(p_names.thresh_raw) ~ NamedDist(Normal(0.0, 1.0), :$(p_names.thresh_raw))") # Prior for the unconstrained threshold level
-    push!(priors, "$(p_names.innovations) ~ NamedDist(MvNormal(zeros(T, M.t_N), I), :$(p_names.innovations))") # Prior for the AR(1) innovations
+    push!(priors, "$(p_names.thresh_raw) ~ DynamicPPL.NamedDist(Normal(0.0, 1.0), :$(p_names.thresh_raw))") # Prior for the unconstrained threshold level
+    push!(priors, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, M.t_N), I), :$(p_names.innovations))") # Prior for the AR(1) innovations
 
     if m.method == :statespace
         push!(priors, "$(p_names.unconstrained_rho)_1 ~ Normal(0, 1.5)")

@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "b41548745a0f57ca3633fd5330881196d7965e0e"
+project_hash = "d4801f28883c404f1989dd33811c48db497bf049"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "5970c86505ae9c07bf5bc521ef2bbbb3849e8b7b"
@@ -3814,6 +3814,12 @@ deps = ["ChainRulesCore", "MacroTools"]
 git-tree-sha1 = "c6a86c133861234450ab260dee01b42abd604095"
 uuid = "700de1a5-db45-46bc-99cf-38207098b444"
 version = "0.2.8"
+
+[[deps.bstm]]
+deps = ["ADTypes", "AbstractGPs", "AbstractMCMC", "AbstractPPL", "AdvancedVI", "Bijectors", "BlackBoxOptim", "CategoricalArrays", "Clustering", "DataFrames", "DelaunayTriangulation", "DifferentialEquations", "DimensionalData", "Distances", "Distributions", "DrWatson", "DynamicPPL", "FFTW", "FillArrays", "FiniteDiff", "FlexiChains", "ForwardDiff", "GLM", "Graphs", "HypothesisTests", "Interpolations", "JLD2", "KernelFunctions", "LibGEOS", "LinearAlgebra", "MCMCChains", "NLopt", "NNlib", "NamedArrays", "NearestNeighbors", "Optim", "Optimisers", "OptimizationNLopt", "OrderedCollections", "PDMats", "PRIMA", "PackageCompiler", "Plots", "PosteriorStats", "PrecompileTools", "Random", "Requires", "ReverseDiff", "Revise", "SparseArrays", "SpecialFunctions", "StaticArrays", "Statistics", "StatsBase", "StatsModels", "StatsPlots", "Turing", "Wavelets", "WaveletsExt", "Zygote"]
+path = "."
+uuid = "a9d6ec74-ebb6-4ecd-a5cd-9826d4a3476e"
+version = "1.0.0"
 
 [[deps.eudev_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
