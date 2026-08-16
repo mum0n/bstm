@@ -8,7 +8,7 @@ with a `modifier_model` (typically a spatial smoother) to create a spatially
 varying standard deviation.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.1 (2026-08-14)
 
 # Mathematical Summary
 The component models a non-stationary spatial field \$\\phi(s)\$ where the local
@@ -73,48 +73,15 @@ end
 
 MODEL_TO_STRUCTURE_MAP[:nonstationaryvariance] = :spatial
 
-function get_datastructures!(
-    m_type::Type{<:NonStationaryVariance}, M::Dict, mod_data::Dict
-)::Bool
-    params = mod_data[:params]
-
-    base_model_spec_node = get(params, :base_model_spec, nothing)
-    if isnothing(base_model_spec_node)
-        error("NonStationaryVariance requires a `base_model_spec` parameter.")
-    end
-    base_mod_data = Dict(
-        :key => Symbol("$(mod_data[:key])_base"),
-        :type => base_model_spec_node.module_type,
-        :variables => get(base_model_spec_node.args, :positional_args, []),
-        :params => base_model_spec_node.args,
-        :component_obj => mod_data[:component_obj].base_model
-    )
-    base_model_type = typeof(mod_data[:component_obj].base_model)
-    get_datastructures!(base_model_type, M, base_mod_data)
-
-    modifier_model_spec_node = get(params, :modifier_model_spec, nothing)
-    if isnothing(modifier_model_spec_node)
-        error("NonStationaryVariance requires a `modifier_model_spec` parameter.")
-    end
-    modifier_mod_data = Dict(
-        :key => Symbol("$(mod_data[:key])_modifier"),
-        :type => modifier_model_spec_node.module_type,
-        :variables => get(modifier_model_spec_node.args, :positional_args, []),
-        :params => modifier_model_spec_node.args,
-        :component_obj => mod_data[:component_obj].modifier_model
-    )
-    modifier_model_type = typeof(mod_data[:component_obj].modifier_model)
-    get_datastructures!(modifier_model_type, M, modifier_mod_data)
-
-    return true
-end
-
 function get_precomputes(
     m::NonStationaryVariance, M::NamedTuple, mod_data::Dict
 )::NamedTuple
     params = mod_data[:params]
 
-    base_model_spec_node = get(params, :base_model_spec, nothing)
+    base_model_spec_node = get(params, :base_node, nothing)
+    if isnothing(base_model_spec_node)
+        error("NonStationaryVariance requires a `base_node` parameter.")
+    end
     base_mod_data = Dict(
         :key => Symbol("$(mod_data[:key])_base"),
         :type => base_model_spec_node.module_type,
@@ -123,7 +90,10 @@ function get_precomputes(
     )
     base_precomputes = get_precomputes(m.base_model, M, base_mod_data)
 
-    modifier_model_spec_node = get(params, :modifier_model_spec, nothing)
+    modifier_model_spec_node = get(params, :modifier_node, nothing)
+    if isnothing(modifier_model_spec_node)
+        error("NonStationaryVariance requires a `modifier_node` parameter.")
+    end
     modifier_mod_data = Dict(
         :key => Symbol("$(mod_data[:key])_modifier"),
         :type => modifier_model_spec_node.module_type,
@@ -166,117 +136,68 @@ function get_priors(
     )
 
     base_priors = get_priors(m.base_model, base_spec_for_priors, arch, outcome_idx, M)
+    # The base model's sigma is not used; variance is controlled by the modifier.
     base_priors_cleaned = replace(base_priors, r".*sigma.*" => "")
     
     modifier_priors = get_priors(
         m.modifier_model, modifier_spec_for_priors, arch, outcome_idx, M
     )
 
-    base_p_names = generate_full_variable_names(base_spec_for_priors, arch, outcome_idx)
-    n_latent_base = spec.hyper.base_precomputes.n_latent
-    base_innov_prior = "$(base_p_names.innovations) ~ MvNormal(zeros(T, $(n_latent_base)), I)"
-
     return """
         # --- Priors for NonStationaryVariance component: $(spec.key) ---
         $(base_priors_cleaned)
         $(modifier_priors)
-        $(base_innov_prior)
     """
 end
-"""
-    get_updates(m::NonStationaryVariance, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates Turing code for the `NonStationaryVariance` component.
-"""
 function get_updates(
     m::NonStationaryVariance, spec::NamedTuple, arch::String,
     outcome_idx::Union{Int, Nothing}, M::NamedTuple
 )::String
-    # Define keys for child components
+    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    
     base_spec_key = Symbol("$(spec.key)_base")
     modifier_spec_key = Symbol("$(spec.key)_modifier")
 
-    # Generate variable names for both components
-    base_p_names = generate_full_variable_names((key=base_spec_key,), arch, outcome_idx)
-    modifier_p_names = generate_full_variable_names((key=modifier_spec_key,), arch, outcome_idx)
+    base_spec = (
+        key = base_spec_key,
+        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.base_model)],
+        var = spec.var,
+        component_obj = m.base_model,
+        params = spec.params,
+        hyper = spec.hyper.base_precomputes
+    )
+    modifier_spec = (
+        key = modifier_spec_key,
+        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.modifier_model)],
+        var = spec.var,
+        component_obj = m.modifier_model,
+        params = spec.params,
+        hyper = spec.hyper.modifier_precomputes
+    )
 
-    eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
+    # Generate code for the modifier, which defines the log-sigma field.
+    modifier_updates = get_updates(m.modifier_model, modifier_spec, arch, outcome_idx, M)
+    modifier_latent_var = generate_full_variable_names(modifier_spec, arch, outcome_idx).latent
+    modifier_logic = replace(modifier_updates, Regex("$(eta_target) \\.\\+= .*") => "")
+    modifier_logic = replace(modifier_logic, modifier_latent_var => "log_sigma_field")
 
-    # --- 1. Generate code for the MODIFIER component (log-sigma field) ---
-    modifier_model = m.modifier_model
-    modifier_hyper = spec.hyper.modifier_precomputes
-    modifier_basis_key = spec.hyper.modifier_basis_key
-    
-    local modifier_effect_code
-    modifier_method = get(modifier_model, :method, :spectral)
+    # Generate code for the base model, which defines the unit-variance field.
+    base_updates = get_updates(m.base_model, base_spec, arch, outcome_idx, M)
+    base_latent_var = generate_full_variable_names(base_spec, arch, outcome_idx).latent
+    base_logic = replace(base_updates, Regex("$(eta_target) \\.\\+= .*") => "")
+    base_logic = replace(base_logic, Regex("$(base_latent_var) = .*") => "") # Remove scaling
+    base_logic = replace(base_logic, base_latent_var => "base_latent_raw")
 
-    if modifier_method == :spectral
-        modifier_effect_code = """
-            # Modifier model: $(modifier_spec_key) (Spectral)
-            local modifier_hyper = spec_registry[:$(modifier_spec_key)].hyper
-            local B_modifier = M.basis_matrices[:$(modifier_basis_key)]
-            
-            local diag_D_mod = $(modifier_p_names.sigma) ./ sqrt.(modifier_hyper.L .+ M.noise)
-            if $(typeof(modifier_model)) in [RW1, ICAR, Besag]; diag_D_mod[1] = 0.0; end
-            if $(typeof(modifier_model)) in [PSpline, RW2]; diag_D_mod[1] = 0.0; diag_D_mod[2] = 0.0; end
-            
-            local modifier_coeffs = modifier_hyper.U * (diag_D_mod .* $(modifier_p_names.innovations))
-            local log_sigma_field = B_modifier * modifier_coeffs
-        """
-    else # :cholesky or :cholesky_sparse
-        modifier_effect_code = """
-            # Modifier model: $(modifier_spec_key) (Cholesky, AD-Safe)
-            local modifier_hyper = spec_registry[:$(modifier_spec_key)].hyper
-            local B_modifier = M.basis_matrices[:$(modifier_basis_key)]
-            local Q_mod = modifier_hyper.Q_template
-            
-            local F_mod = cholesky(Symmetric(Matrix(Q_mod) + M.noise * I))
-            local coeffs_raw_mod = F_mod.L' \\ $(modifier_p_names.innovations)
-            
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(modifier_hyper.n_latent)), sum(coeffs_raw_mod))
-            
-            local modifier_coeffs = $(modifier_p_names.sigma) .* coeffs_raw_mod
-            local log_sigma_field = B_modifier * modifier_coeffs
-        """
-    end
-
-    # --- 2. Generate code for the BASE component ---
-    base_model_type_sym = Symbol(lowercase(string(typeof(m.base_model))))
-    n_latent_base = spec.hyper.base_precomputes.n_latent
-
-    local base_latent_reconstruction_code
-    if m.method == :spectral
-        base_latent_reconstruction_code = """
-            local base_hyper = spec_registry[:$(base_spec_key)].hyper
-            local diag_D_base = 1.0 ./ sqrt.(base_hyper.L .+ M.noise)
-            if $(base_model_type_sym) in [:icar, :besag]; diag_D_base[1] = 0.0; end
-            local base_latent_raw = base_hyper.U * (diag_D_base .* $(base_p_names.innovations))
-        """
-    else # :cholesky or :cholesky_sparse
-        base_latent_reconstruction_code = """
-            local Q_base = spec_registry[:$(base_spec_key)].hyper.Q_template
-            local F_base = cholesky(Symmetric(Matrix(Q_base) + M.noise * I))
-            local base_latent_raw = F_base.L' \\ $(base_p_names.innovations)
-        """
-    end
-
-    sum_to_zero_constraint = if base_model_type_sym in [:icar, :besag]
-        "Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent_base)), sum(base_latent_raw))"
-    else
-        ""
-    end
-
-    # --- 3. Assemble the final update block ---
     return """
         # --- NonStationaryVariance Component: $(spec.key) ---
         let
             # 1. Realize the log-standard deviation field from the modifier model.
-            $(modifier_effect_code)
+            $(modifier_logic)
             local spatially_varying_sigma = exp.(log_sigma_field)
             
             # 2. Realize the raw latent field from the base model.
-            $(base_latent_reconstruction_code)
-            $(sum_to_zero_constraint)
+            $(base_logic)
             
             # 3. Combine raw latent field with spatially varying sigma.
             local final_effect_latent = base_latent_raw .* spatially_varying_sigma
@@ -286,7 +207,6 @@ function get_updates(
         end
     """
 end
-
 
 function get_effects(
     m::NonStationaryVariance, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
@@ -299,11 +219,9 @@ function get_effects(
     base_spec_key = Symbol("$(spec.key)_base")
     modifier_spec_key = Symbol("$(spec.key)_modifier")
 
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
+    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
 
     for k in 1:outcomes_N
-        outcome_idx = outcomes_N > 1 ? k : nothing
-        
         modifier_spec = (
             key = modifier_spec_key,
             structure = MODEL_TO_STRUCTURE_MAP[typeof(m.modifier_model)],
@@ -327,7 +245,9 @@ function get_effects(
             hyper = spec.hyper.base_precomputes
         )
         
-        base_innovations_name = _find_parameter(p_names_vec, string(base_spec.key), "innovations", k, is_multivariate_model)
+        base_p_names = generate_full_variable_names(base_spec, M.model_arch, k)
+        base_innovations_name = _find_parameter(p_names_vec, string(base_p_names.innovations), k, is_multivariate_model)
+        
         if isempty(base_innovations_name)
             @warn "Base innovations for NonStationaryVariance component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
@@ -349,7 +269,8 @@ function get_effects(
             Q_base_template = base_spec.hyper.Q_template
             F_base = cholesky(Symmetric(Matrix(Q_base_template) + M.noise * I))
             for i in 1:n_samples
-                base_latent_raw_samples[i, :] = F_base.L' \ base_innovations_samples[i, :]
+                raw_field = F_base.L' \ base_innovations_samples[i, :]
+                base_latent_raw_samples[i, :] = raw_field .- mean(raw_field)
             end
         end
 

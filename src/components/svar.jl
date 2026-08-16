@@ -7,7 +7,7 @@ across spatial units. The spatial variation of `rho` is governed by a specified
 GMRF model (e.g., ICAR, Leroux).
 
 # Version
-v2.0.0 (2026-08-11)
+v2.0.1 (2026-08-14)
 
 # Mathematical Summary
 The SVAR model defines a spatiotemporal process \$\\psi_{it}\$ for spatial unit \$i\$
@@ -74,47 +74,27 @@ COMPONENT_CONSTRUCTORS[:svar] = (p, params) -> SVAR(
 
 MODEL_TO_STRUCTURE_MAP[:svar] = :spacetime
 
-function get_datastructures!(m_type::Type{SVAR}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
+    # Validation moved from get_datastructures!
     variables = mod_data[:variables]
     if length(variables) < 2
         error("SVAR requires a spatial and a temporal variable, e.g., `random(s, t, model=svar)`.")
     end
 
-    data = M[:data]
-    space_var_sym = Symbol(variables[1])
-    time_var_sym = Symbol(variables[2])
-
-    if !haskey(M, :s_N)
-        if !hasproperty(data, space_var_sym)
-            error("Spatial index ':$space_var_sym' for SVAR not found in data.")
-        end
-        s_idx = data[!, space_var_sym]
-        M[:s_idx] = s_idx
-        M[:s_N] = length(unique(s_idx))
-        if !haskey(M, :W)
-            @warn "Adjacency matrix `W` not provided for SVAR model."
-        end
-    end
-
-    if !haskey(M, :t_N)
-        if !hasproperty(data, time_var_sym)
-            error("Time index ':$time_var_sym' for SVAR not found in data.")
-        end
-        time_opts = Dict(:time_method => get(mod_data[:params], :time_method, "regular"))
-        tu_meta = assign_time_units(data[!, time_var_sym]; time_opts...)
-        M[:t_idx] = tu_meta.idx
-        M[:t_N] = tu_meta.N_cat
-    end
-
-    return true
-end
-
-function get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
-    s_N = get(M, :s_N, 0)
-    if s_N == 0
-        error("Could not get number of spatial units for SVAR '$(mod_data[:key])'.")
+    # The processor is now responsible for creating s_idx, t_idx, s_N, t_N.
+    # We just need to get them from the main config M.
+    s_N = get(M, :s_N, nothing)
+    t_N = get(M, :t_N, nothing)
+    if isnothing(s_N) || isnothing(t_N)
+        error(
+            "SVAR component '$(mod_data[:key])' failed: s_N or t_N not found in model " *
+            "configuration. This should have been set by the model processor."
+        )
     end
     W = get(M, :W, nothing)
+    if isnothing(W) && m.rho_model_type != :iid
+        @warn "Adjacency matrix `W` not provided for SVAR model's rho field."
+    end
 
     template = build_structure_template(m.rho_model_type, s_N; W=W)
     
@@ -125,7 +105,9 @@ function get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
         U_rho=template.U,
         L_rho=template.L,
         scaling_factor_rho=template.scaling_factor,
-        cholesky_factor_rho=F_rho
+        cholesky_factor_rho=F_rho,
+        n_latent_rho=s_N,
+        n_latent_svar=s_N * t_N
     )
 end
 
@@ -134,57 +116,57 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    s_N = M.s_N
-    n_latent_svar = M.s_N * M.t_N
-    is_multivariate = (arch == "multivariate")
-    is_shared = get(spec.params, :shared, false)
-    is_first_outcome = (outcome_idx == 1 || isnothing(outcome_idx))
+    key = spec.key
 
     priors_acc = String[]
-    if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
-        push!(priors_acc, "$(p_names.rho_sigma) ~ $(_distribution_to_string(m.rho_sigma))")
-        if m.rho_model_type in [:leroux, :bym2] && !isnothing(m.rho_rho)
-            push!(priors_acc, "$(p_names.rho_rho) ~ $(_distribution_to_string(m.rho_rho))") # Prior for the mixing parameter
-        end
-        push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors_acc, "$(p_names.rho_sigma) ~ $(_distribution_to_string(m.rho_sigma))")
+    if m.rho_model_type in [:leroux, :bym2] && !isnothing(m.rho_rho)
+        push!(priors_acc, "$(p_names.rho_rho) ~ $(_distribution_to_string(m.rho_rho))")
     end
+    push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
-    push!(priors_acc, "$(p_names.rho_innovations) ~ MvNormal(zeros(T, $(s_N)), I)")
-    push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent_svar)), I)")
+    push!(priors_acc, "$(p_names.rho_innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent_rho), I)")
+    push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent_svar), I)")
 
     return join(priors_acc, "\n    ")
 end
+
 function get_updates(
     m::SVAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    s_N, t_N = M.s_N, M.t_N
     key = spec.key
 
     local rho_recon_code
     if m.method == :spectral
         rho_recon_code = """
-            hyper_rho = spec_registry[:$(key)].hyper
-            D_rho = $(p_names.rho_sigma) ./ sqrt.(hyper_rho.L_rho .+ M.noise)
+            local hyper_rho = spec_registry[:$(key)].hyper
+            local D_rho = $(p_names.rho_sigma) ./ sqrt.(hyper_rho.L_rho .+ M.noise)
             if $(m.rho_model_type) in [:icar, :besag]; D_rho[1] = 0.0; end
-            rho_field = hyper_rho.U_rho * (D_rho .* $(p_names.rho_innovations)) # Reconstruct rho field using spectral decomposition
+            local rho_field = hyper_rho.U_rho * (D_rho .* $(p_names.rho_innovations))
         """
     elseif m.method == :cholesky
         rho_recon_code = """
-            F_rho = spec_registry[:$(key)].hyper.cholesky_factor_rho
-            rho_field_raw = F_rho.L' \\ $(p_names.rho_innovations)
-            if $(m.rho_model_type) in [:icar, :besag]; Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(s_N)), sum(rho_field_raw)); end
-            rho_field = rho_field_raw .* $(p_names.rho_sigma)
+            local hyper_rho = spec_registry[:$(key)].hyper
+            local F_rho = hyper_rho.cholesky_factor_rho
+            local rho_field_raw = F_rho.L' \\ $(p_names.rho_innovations)
+            if $(m.rho_model_type) in [:icar, :besag]
+                Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper_rho.n_latent_rho), sum(rho_field_raw))
+            end
+            local rho_field = rho_field_raw .* $(p_names.rho_sigma)
         """
     else # :cholesky_sparse
         rho_recon_code = """
-            Q_rho = spec_registry[:$(key)].hyper.Q_rho_template
-            F_rho = cholesky(Symmetric(Q_rho + M.noise * I)) # Cholesky factorization of the precision matrix
-            rho_field_raw = F_rho.L' \\ $(p_names.rho_innovations)
-            if $(m.rho_model_type) in [:icar, :besag]; Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(s_N)), sum(rho_field_raw)); end
-            rho_field = rho_field_raw .* $(p_names.rho_sigma)
+            local hyper_rho = spec_registry[:$(key)].hyper
+            local Q_rho = hyper_rho.Q_rho_template
+            local F_rho = cholesky(Symmetric(Q_rho + M.noise * I))
+            local rho_field_raw = F_rho.L' \\ $(p_names.rho_innovations)
+            if $(m.rho_model_type) in [:icar, :besag]
+                Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper_rho.n_latent_rho), sum(rho_field_raw))
+            end
+            local rho_field = rho_field_raw .* $(p_names.rho_sigma)
         """
     end
 
@@ -193,14 +175,14 @@ function get_updates(
         let
             # 1. Reconstruct the spatially-varying AR(1) coefficient `rho`.
             $(rho_recon_code)
-            rho_s = tanh.(rho_field) # Constrain rho to (-1, 1)
+            local rho_s = tanh.(rho_field) # Constrain rho to (-1, 1)
 
             # 2. Evolve the SVAR state-space.
-            latent_st = zeros(eltype(rho_s), $(s_N), $(t_N))
-            innovations_grid = reshape($(p_names.innovations), $(s_N), $(t_N))
+            local latent_st = zeros(eltype(rho_s), M.s_N, M.t_N)
+            local innovations_grid = reshape($(p_names.innovations), M.s_N, M.t_N)
             
             latent_st[:, 1] = ($(p_names.sigma) ./ sqrt.(1 .- rho_s.^2)) .* innovations_grid[:, 1]
-            for t in 2:$(t_N)
+            for t in 2:M.t_N
                 latent_st[:, t] = rho_s .* latent_st[:, t-1] .+ $(p_names.sigma) .* innovations_grid[:, t]
             end
             
@@ -214,25 +196,26 @@ function get_updates(
 end
 
 function get_effects(
-    m::SVAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SVAR, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
     
     s_N, t_N, noise = M.s_N, M.t_N, M.noise
     n_latent_svar = s_N * t_N
 
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
-    t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, PS.t_idx)
-    t_N_full = maximum(t_idx_full)
+    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, Int[]))
+    t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, Int[]))
+    t_N_full = isempty(t_idx_full) ? 0 : maximum(t_idx_full)
 
     for k in 1:outcomes_N
-        rho_sigma_name = _find_parameter(p_names_vec, string(spec.key), "rho_sigma", k, is_multivariate_model)
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        rho_innovations_name = _find_parameter(p_names_vec, string(spec.key), "rho_innovations", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        
+        rho_sigma_name = _find_parameter(p_names_vec, v.rho_sigma, k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
+        rho_innovations_name = _find_parameter(p_names_vec, v.rho_innovations, k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
         
         if isempty(rho_sigma_name) || isempty(sigma_name) || isempty(rho_innovations_name) || isempty(innovations_name)
             @warn "Parameters for SVAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -244,14 +227,6 @@ function get_effects(
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
         rho_innovations_samples = get_params_vector(chain, rho_innovations_name, s_N)
         innovations_samples = get_params_vector(chain, innovations_name, n_latent_svar)
-
-        rho_rho_samples = nothing
-        if m.rho_model_type in [:leroux, :bym2] && !isnothing(m.rho_rho)
-            rho_rho_name = _find_parameter(p_names_vec, string(spec.key), "rho_rho", k, is_multivariate_model)
-            if !isempty(rho_rho_name) # Check if rho_rho parameter exists
-                rho_rho_samples = get_params_vector(chain, rho_rho_name, 1)[:, 1]
-            end
-        end
         
         effect_k = zeros(Float64, N_total, n_samples)
         hyper = spec.hyper

@@ -7,7 +7,7 @@ combination of these basis functions, with coefficients regularized by a random
 walk prior to ensure smoothness.
 
 # Version
-v1.0.4 (2026-08-11)
+v1.0.7 (2026-08-15)
 
 # Mathematical Summary
 The component models a smooth function \$f(x)\$ as a linear combination of Fourier
@@ -42,7 +42,6 @@ scaled by \$\\sigma^2\$.
   - One or more coordinate variables (e.g., `x`) passed to `random()`.
 - **Optional (in `random()` call)**:
   - `nbins`: `Int`, the total number of basis functions (sine/cosine pairs). Default: `20`.
-  - `degree`: `Int`, the polynomial degree of the B-spline. Default: `3`.
   - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the Fourier
     coefficients. Default: `Exponential(1.0)`.
   - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`,
@@ -75,40 +74,26 @@ COMPONENT_CONSTRUCTORS[:fft] = (p, params) -> FFT(
 MODEL_TO_STRUCTURE_MAP[:fft] = :smooth
 
 """
-    get_datastructures!(m_type::Type{<:FFT}, M::Dict, mod_data::Dict)::Bool
+    get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Performs data-dependent setup for the `FFT` component. It ensures that coordinate
-variables are provided and stores them in the module data.
+Performs all data-dependent setup and pre-computation for the `FFT` component.
+This function validates that coordinate variables exist, extracts them, and then
+pre-computes the penalty matrix and its spectral decomposition for the Fourier
+coefficients.
 """
-function get_datastructures!(m_type::Type{<:FFT}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
-
     if isempty(variables)
         error("The FFT model requires coordinate variables, e.g., `random(x, model=:fft)`.")
     end
 
     for var_sym in variables
-        if !hasproperty(M[:data], Symbol(var_sym))
+        if !hasproperty(M.data, Symbol(var_sym))
             error("Coordinate variable ':$var_sym' for FFT model not found in data.")
         end
     end
 
-    mod_data[:params][:coords] = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-    return true
-end
-
-"""
-    get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Performs data-independent pre-calculations for the `FFT` component. This involves
-storing the coordinate matrix and pre-computing the penalty matrix and its spectral
-decomposition for the Fourier coefficients.
-"""
-function get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = get(mod_data[:params], :coords, nothing)
-    if isnothing(coords)
-        error("FFT component precomputes failed: coordinates not found in module data.")
-    end
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
     
     n_latent = m.nbins
     n_dims = size(coords, 2)
@@ -172,7 +157,7 @@ function get_priors(
     
     push!(
         priors,
-        "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)"
+        "$(p_names.innovations) ~ MvNormal(zeros($(spec.hyper.n_latent)), I)"
     )
 
     return join(priors, "\n    ")
@@ -206,13 +191,17 @@ function bstm_fourier_basis(
         n_basis_1d = nbins_per_dim[i]
         B_1d = zeros(eltype(t_coords), n_obs, n_basis_1d)
         
-        # Generate sine and cosine pairs for each 1D dimension
+        idx = 1
         for m in 1:div(n_basis_1d, 2)
-            if (2*m) <= n_basis_1d # Ensure we don't exceed n_basis_1d
-                arg = (2.0 * pi * m) .* t_coords
-                B_1d[:, 2*m-1] = sin.(arg)
-                B_1d[:, 2*m]   = cos.(arg)
-            end
+            arg = (2.0 * pi * m) .* t_coords
+            B_1d[:, idx] = sin.(arg)
+            B_1d[:, idx+1] = cos.(arg)
+            idx += 2
+        end
+        if isodd(n_basis_1d) && idx <= n_basis_1d
+            m = div(n_basis_1d, 2) + 1
+            arg = (2.0 * pi * m) .* t_coords
+            B_1d[:, idx] = sin.(arg)
         end
         push!(basis_matrices_1D, B_1d)
     end
@@ -253,10 +242,9 @@ function get_updates(
     n_latent = spec.hyper.n_latent # Retrieve n_latent from spec.hyper
     
     common_basis_code = """
-        local precomputes = spec_registry[:$(key)].precomputes
-        local B_fft = bstm_fourier_basis(
-            precomputes.coords,
-            precomputes.nbins_per_dim,
+        B_fft = bstm_fourier_basis(
+            spec_registry[:$(key)].hyper.coords,
+            spec_registry[:$(key)].hyper.nbins_per_dim,
             $(p_names.ls)
         )
     """
@@ -266,13 +254,13 @@ function get_updates(
         let
             $(common_basis_code)
             
-            local diag_D = $(p_names.sigma) ./ sqrt.(precomputes.L .+ M.noise)
+            diag_D = $(p_names.sigma) ./ sqrt.(spec_registry[:$(key)].hyper.L .+ M.noise)
             # Enforce sum-to-zero constraints for RW2 penalty
             diag_D[1] = 0.0
             diag_D[2] = 0.0
             
-            local coeffs = precomputes.U * (diag_D .* $(p_names.innovations))
-            local $(p_names.latent) = B_fft * coeffs
+            coeffs = spec_registry[:$(key)].hyper.U * (diag_D .* $(p_names.innovations))
+            $(p_names.latent) = B_fft * coeffs
             
             $(eta_target) .+= $(p_names.latent)
         end
@@ -283,18 +271,18 @@ function get_updates(
         let
             $(common_basis_code)
             
-            local Q_penalty = precomputes.Q_template
-            local F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
+            Q_penalty = spec_registry[:$(key)].hyper.Q_template
+            F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
             
-            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            coeffs_raw = F.L' \\ $(p_names.innovations)
             
             # Apply soft sum-to-zero constraints for RW2 penalty
-            Turing.@addlogprob! logpdf( # Interpolate n_latent
+            Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw[1:2])
             )
             
-            local coeffs = $(p_names.sigma) .* coeffs_raw
-            local $(p_names.latent) = B_fft * coeffs
+            coeffs = $(p_names.sigma) .* coeffs_raw
+            $(p_names.latent) = B_fft * coeffs
             
             $(eta_target) .+= $(p_names.latent)
         end
@@ -307,18 +295,18 @@ function get_updates(
         let
             $(common_basis_code)
             
-            local Q_penalty = precomputes.Q_template
-            local F = cholesky(Symmetric(Q_penalty + M.noise * I))
+            Q_penalty = spec_registry[:$(key)].hyper.Q_template
+            F = cholesky(Symmetric(Q_penalty + M.noise * I))
             
-            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            coeffs_raw = F.L' \\ $(p_names.innovations)
             
             # Apply soft sum-to-zero constraints for RW2 penalty
-            Turing.@addlogprob! logpdf( # Interpolate n_latent
+            Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw[1:2])
             )
             
-            local coeffs = $(p_names.sigma) .* coeffs_raw
-            local $(p_names.latent) = B_fft * coeffs
+            coeffs = $(p_names.sigma) .* coeffs_raw
+            $(p_names.latent) = B_fft * coeffs
             
             $(eta_target) .+= $(p_names.latent)
         end
@@ -336,24 +324,24 @@ function get_updates(
 end
 
 """
-    get_effects(m::FFT, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::FFT, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
 
 Reconstructs the `FFT` component's effect from posterior samples, dispatching on
 the method used during sampling.
 """
 function get_effects(
     m::FFT, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
+    N_total::Int, is_multivariate_model::Bool
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
 
-    precomputes = spec.hyper
+    hyper = spec.hyper
     noise = M.noise
-    n_latent = precomputes.n_latent
-    nbins_per_dim = precomputes.nbins_per_dim
+    n_latent = hyper.n_latent
+    nbins_per_dim = hyper.nbins_per_dim
     
-    coords_train = precomputes.coords
+    coords_train = hyper.coords
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
         vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
@@ -361,13 +349,11 @@ function get_effects(
         coords_train
     end
 
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
-
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        ls_name = _find_parameter(p_names_vec, string(spec.key), "ls", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(innovations_name)
             @warn "Parameters for FFT component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -376,8 +362,8 @@ function get_effects(
         end
         
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_samples = get_params_vector(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        ls_samples = get_params_matrix(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, size(coords_full, 1), n_samples)
 
@@ -388,16 +374,15 @@ function get_effects(
             
             local coeffs
             if m.method == :spectral
-                U = precomputes.U
-                L = precomputes.L
+                U = hyper.U
+                L = hyper.L
                 diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
                 diag_D[1] = 0.0 # Enforce sum-to-zero constraints for RW2 penalty
                 diag_D[2] = 0.0
                 coeffs = U * (diag_D .* innovations_samples[i, :])
             else # :cholesky or :cholesky_sparse
-                Q_penalty = precomputes.Q_template
                 # For reconstruction, dense Cholesky is fine for both methods as AD is not involved here.
-                F = precomputes.cholesky_factor
+                F = hyper.cholesky_factor
                 coeffs_raw = F.L' \ innovations_samples[i, :]
                 # Apply sum-to-zero constraints for RW2 penalty
                 coeffs_centered = coeffs_raw .- mean(coeffs_raw[1:2]) # Centering based on first two elements

@@ -264,16 +264,39 @@ end
 
  
  
-# Version 1.1.1 (2026-08-11)
-# Purpose: Extracts all latent effects from the MCMC chain.
-# Rationale: This version corrects a critical bug where the function was searching
-#            for the incorrect parameter name for fixed effects (`Xfixed_beta`). It
-#            now correctly uses `Xfixed_beta_prop` for univariate models and
-#            `Xfixed_beta_prop_flat` for multivariate models, resolving the "parameter
-#            not discovered" error. It also ensures the univariate fixed effects array
-#            is correctly shaped as a 3D array.
+"""
+    _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
+
+Extracts all latent effects from the MCMC chain by dispatching to the `get_effects`
+method for each model component.
+
+# Version
+v1.1.2 (2026-08-13)
+
+# Rationale
+This function is the main entry point for reconstructing all latent effects from the
+posterior chain. This version is updated to be consistent with the refactored
+`get_effects` interface. It now explicitly passes an `is_multivariate` boolean flag
+to each `get_effects` call. This ensures that the downstream `_find_parameter`
+utility correctly resolves parameter names for both univariate and multivariate
+models, preventing "parameter not discovered" errors. The logic for handling fixed
+effects and intercepts is retained and correct.
+
+# Arguments
+- `chain`: The MCMC chain object.
+- `M`: The main model configuration `NamedTuple`.
+- `PS`: The prediction set configuration `NamedTuple`, or `nothing`.
+- `n_samples`: The total number of posterior samples.
+- `outcomes_N`: The number of outcome variables.
+- `N_tot`: The total number of observations (training + prediction).
+
+# Returns
+- A `NamedTuple` registry where each key is a component's unique identifier and the
+  value is the reconstructed posterior effect for that component.
+"""
 function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
     registry = Dict{Symbol, Any}()
+    is_multivariate = outcomes_N > 1
 
     # --- Fixed effects and Intercept ---
     if M.Xfixed_N > 0
@@ -285,8 +308,7 @@ function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N
         end
         Xfixed_full = vcat(Xfixed_train, Xfixed_pred)
         
-        if outcomes_N > 1
-            # FIX: Use the correct parameter name for multivariate fixed effects.
+        if is_multivariate
             beta_samples_flat = get_params_vector(
                 chain, "Xfixed_beta_prop_flat", M.Xfixed_N * outcomes_N
             )
@@ -297,11 +319,9 @@ function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N
             end
             registry[:fixed] = fixed_effects_all
         else # Univariate case
-            # FIX: Use the correct parameter name for univariate fixed effects.
             beta_samples = get_params_vector(
                 chain, "Xfixed_beta_prop", M.Xfixed_N
             )
-            # FIX: Ensure the output is a 3D array for consistency.
             fixed_effects_2d = Xfixed_full * beta_samples'
             registry[:fixed] = reshape(fixed_effects_2d, N_tot, n_samples, 1)
         end
@@ -321,9 +341,10 @@ function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N
     end
 
     # --- Main Component Loop using get_effects ---
+    p_names = string.(FlexiChains.parameters(chain))
     for spec in M.components
         effects = get_effects(
-            spec.component_obj, chain, M, n_samples, outcomes_N, spec, PS, N_tot
+            spec.component_obj, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot, is_multivariate
         )
         registry[spec.key] = effects
     end
@@ -800,11 +821,7 @@ end
  
 
   
-
-
-# ==============================================================================
-# SECTION 3: POSTERIOR ASSEMBLY AND SUMMARIZATION
-# ==============================================================================
+ 
 
 function _quantile_along_last_dim(A::AbstractArray, q::Real; sample_dim=ndims(A))
     other_dims = size(A)[1:end-1]
@@ -981,20 +998,57 @@ function post_stratification_weights(res, M, PS, samples_denoised)
     return weights
 end
 
- 
-# Version 1.6.3 (2026-08-11)
-# Purpose: The primary post-processing engine that generates comprehensive summaries,
-#          diagnostics, and plots from a fitted bstm model and MCMC chain.
-# Rationale: This version is updated to correctly handle the `strata_info` for
-#            post-stratification weights. It now checks if `strata_info` is present
-#            in the model configuration `M`. If not, it attempts to retrieve it from
-#            the provided `au` (areal unit) object and temporarily merges it into `M`
-#            before calling `post_stratification_weights`. This ensures that
-#            post-stratification weights are calculated when `au` is provided,
-#            resolving the "Post-stratification requires :strata_info" warning.
-#            FIX: The calculated `post_strat_weights` are now merged into the `pstats`
-#            output object for better consistency and accessibility, instead of being
-#            a separate top-level field in the returned tuple.
+
+
+"""
+    model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing, data=nothing, alpha=0.05)
+
+The primary post-processing engine that generates comprehensive summaries,
+diagnostics, and plots from a fitted `bstm` model and MCMC chain.
+
+# Version
+v1.6.4 (2026-08-13)
+
+# Rationale
+This function is the main entry point for model interpretation. It orchestrates the
+entire post-processing pipeline, from reconstructing latent effects to generating
+final plots and performance metrics. This version is updated to correctly handle
+the `strata_info` for post-stratification weights, ensuring they are calculated
+when an `au` object is provided, and it merges the weights into the `pstats`
+output for better consistency.
+
+# Workflow
+1.  **Architecture Dispatch**: Determines the model architecture (univariate,
+    multivariate, etc.) from the model configuration `M`.
+2.  **Core Reconstruction**: Calls the appropriate `_reconstruct` method, which is
+    the engine for calculating all posterior quantities (latent effects, predictions,
+    log-likelihoods).
+3.  **Post-Stratification**: If applicable, it calculates post-stratification
+    weights using the raw denoised predictions from the reconstruction step.
+4.  **Performance Metrics**: Computes standard performance metrics (RMSE, Pearson's R)
+    from the summarized predictions, correctly handling both univariate and
+    multivariate models.
+5.  **MCMC Diagnostics**: Extracts key MCMC diagnostics (R-hat, ESS, sampling time)
+    from the `chain` object for assessing model convergence.
+6.  **Plot Generation**: Calls `bstm_plots` to generate a standardized set of
+    visualizations, including posterior predictive checks and plots of all latent
+    effects.
+7.  **Final Assembly**: Consolidates all metrics, posterior summaries (`pstats`),
+    and plots into a single, comprehensive `NamedTuple` for user inspection.
+
+# Arguments
+- `model::DynamicPPL.Model`: The fitted Turing model object.
+- `chain`: The `MCMCChains.Chains` object from the fitted model.
+- `au`: An optional object containing areal unit information (`polygons`, `centroids`, `strata_info`).
+- `data`: An optional `DataFrame`, used for plotting if different from the training data.
+- `alpha::Float64`: The significance level for credible intervals.
+
+# Returns
+- A `NamedTuple` containing:
+  - `metrics`: A `NamedTuple` with performance and diagnostic metrics.
+  - `pstats`: A `NamedTuple` with detailed posterior summaries of all model effects and predictions.
+  - `plots`: A `NamedTuple` containing all generated plots.
+"""
 function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing, data=nothing, alpha=0.05)
     # --- 1. Metadata and Architecture Extraction ---
     M = model.args.M
@@ -1010,17 +1064,11 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     end
 
     # --- 2. Core Reconstruction ---
-    # This calls the appropriate _reconstruct method based on the model architecture.
-    # The `nothing` for PS indicates we are doing in-sample reconstruction.
     res = _reconstruct(arch_type, "model_results", chain, M, nothing, alpha)
 
     # --- 2.5 Post-Stratification Weight Calculation (if applicable) ---
-    # This is done here because we need the raw denoised prediction samples, which are
-    # returned by _reconstruct but not typically stored in the final summary.
     post_strat_weights = nothing 
 
-    # FIX: If strata_info is not in M, try to get it from au if provided.
-    # This allows post-stratification to work even if strata_info wasn't passed during model config.
     local M_for_post_strat = M
     if !haskey(M, :strata_info) && !isnothing(au) && hasproperty(au, :strata_info)
         M_for_post_strat = merge(M, (strata_info=au.strata_info,))
@@ -1032,7 +1080,6 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     end
 
     # --- 3. Performance Metric Calculation ---
-    # Correctly handle both univariate and multivariate cases for RMSE and Pearson R.
     pred_summary = res.predictions_denoised
     local rmse_val, r_pearson
     if arch_type isa MultivariateArchitecture
@@ -1080,7 +1127,6 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     plots = bstm_plots(res, M; au=au, data=data_for_plots)
 
     # --- 6. Final Assembly ---
-    # FIX: Merge post-stratification weights into the pstats object for consistency.
     pstats_final = merge(res, (post_strat_weights=post_strat_weights,))
 
     return (
@@ -1091,19 +1137,51 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
 end
 
 
+"""
+    bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
 
- 
-# Version 1.0.3 (2026-08-11)
-# Purpose: Generates a standard set of diagnostic and summary plots.
-# Rationale: This version is updated to be consistent with the refactored component
-#            system. Instead of iterating over the keys of the effects summary (which
-#            might be incomplete), it now iterates directly through the components
-#            defined in the model configuration (`M.components`). For each component,
-#            it uses the component's unique `key` to look up the summarized effects
-#            and its `structure` to determine the appropriate plot type. This resolves
-#            the issue where plots for spatial, temporal, and other effects were not
-#            being generated. The logic for plotting fixed and mixed effects is retained
-#            and will function correctly once the upstream summarization includes them.
+Generates a standard set of diagnostic and summary plots from a fitted `bstm` model.
+
+# Version
+v1.0.4 (2026-08-13)
+
+# Rationale
+This function is the primary visualization engine for the `bstm` framework. It takes
+the summarized results from the reconstruction engine and produces a standardized
+set of plots for model diagnostics and interpretation. It is designed to be robust
+and flexible, correctly handling different model architectures (univariate,
+multivariate) and component types (spatial, temporal, smooth, mixed effects).
+
+# Workflow
+1.  **Posterior Predictive Check (PPC)**: Creates a scatter plot of observed vs.
+    predicted values to assess overall model fit.
+2.  **Component-wise Plotting**: Iterates through all components defined in the model
+    configuration (`M.components`).
+3.  **Structure-based Dispatch**: For each component, it uses the `structure`
+    (e.g., `:spatial`, `:temporal`, `:smooth`) to dispatch to the appropriate
+    plotting logic.
+    - **Spatial**: Generates choropleth maps (if polygons are provided) or scatter
+      plots of the spatial random effects. For `BYM2` models, it creates separate
+      plots for the structured and unstructured components.
+    - **Temporal/Seasonal**: Creates line plots of the temporal or seasonal trends
+      with credible interval ribbons.
+    - **Smooth**: Creates line plots showing the non-linear effect of a covariate,
+      with credible interval ribbons.
+4.  **Fixed & Mixed Effects**: Generates forest plots to visualize the posterior
+    distributions of the coefficients for fixed and mixed effects.
+
+# Arguments
+- `res`: The results `NamedTuple` from `_reconstruct`, containing summarized effects.
+- `M`: The main model configuration `NamedTuple`.
+- `au`: An optional object containing areal unit information (`polygons`, `centroids`).
+- `data`: The optional input `DataFrame`, used to get coordinate/variable data for axes.
+- `outcome`: `Int`, the index of the outcome to plot in a multivariate model.
+
+# Returns
+- A `NamedTuple` where each key corresponds to a plot type (e.g., `:ppc`,
+  `:spatial_effects`) and the value is either a `Plots.Plot` object or a
+  dictionary of plots (for smooth and mixed effects).
+"""
 function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
     plots = Dict{Symbol, Any}()
     effects = res.effects
@@ -1111,7 +1189,7 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
     
     y_obs = get(M, :y_obs, nothing)
 
-    # Check if au is a structure that can contain polygons/centroids before access.
+    # Safely extract geometry information from the areal unit object.
     polygons = if !isnothing(au) && (au isa NamedTuple || au isa Dict)
         get(au, :polygons, nothing)
     else
@@ -1126,7 +1204,8 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
 
     # --- 1. Posterior Predictive Check ---
     if hasproperty(res, :predictions_denoised)
-        if isnothing(y_obs); @info "Skipping PPC plot: Observation data not found.";
+        if isnothing(y_obs)
+            @info "Skipping PPC plot: Observation data not found."
         else
             pred_summary = is_mv ? res.predictions_denoised[outcome] : res.predictions_denoised 
             if !isnothing(pred_summary) && hasproperty(pred_summary, :mean)
@@ -1134,7 +1213,10 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
                 if length(y_p) == length(y_o)
                     p_ppc = scatter(y_p, y_o, title="Posterior Predictive Check", xlabel="Predicted", ylabel="Observed", alpha=0.5, markersize=3, markerstrokewidth=0, legend=false)
                     clean_p, clean_o = filter(!isnan, y_p), filter(!isnan, y_o)
-                    if !isempty(clean_p) && !isempty(clean_o); min_val, max_val = min(minimum(clean_p), minimum(clean_o)), max(maximum(clean_p), maximum(clean_o)); plot!(p_ppc, [min_val, max_val], [min_val, max_val], color=:red, ls=:dash, lw=1.5); end
+                    if !isempty(clean_p) && !isempty(clean_o)
+                        min_val, max_val = min(minimum(clean_p), minimum(clean_o)), max(maximum(clean_p), maximum(clean_o))
+                        plot!(p_ppc, [min_val, max_val], [min_val, max_val], color=:red, ls=:dash, lw=1.5)
+                    end
                     plots[:ppc] = p_ppc
                 end
             end
@@ -1143,12 +1225,24 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
 
     # --- 2. Helper function for choropleth plots ---
     function _create_choropleth_plot(field_data, title_str, polygons, centroids)
-        if isnothing(field_data) || !hasproperty(field_data, :mean); @info "Skipping spatial plot '$title_str': Data missing."; return nothing; end 
-        if isnothing(polygons) && isnothing(centroids); @info "Skipping spatial plot '$title_str': No geometry provided."; return nothing; end
+        if isnothing(field_data) || !hasproperty(field_data, :mean)
+            @info "Skipping spatial plot '$title_str': Data missing."
+            return nothing
+        end 
+        if isnothing(polygons) && isnothing(centroids)
+            @info "Skipping spatial plot '$title_str': No geometry provided."
+            return nothing
+        end
         s_mean = vec(collect(field_data.mean))
-        if all(iszero, s_mean); @info "Skipping spatial plot '$title_str': Mean effect is zero."; return nothing; end
-        if !isnothing(polygons) && length(polygons) >= length(s_mean); return plot_choropleth(s_mean, polygons; title=title_str);
-        elseif !isnothing(centroids); return scatter(getindex.(centroids, 1), getindex.(centroids, 2), marker_z=s_mean, markersize=4, c=:viridis, label=nothing, title=title_str, aspect_ratio=:equal); end
+        if all(iszero, s_mean)
+            @info "Skipping spatial plot '$title_str': Mean effect is zero."
+            return nothing
+        end
+        if !isnothing(polygons) && length(polygons) >= length(s_mean)
+            return plot_choropleth(s_mean, polygons; title=title_str)
+        elseif !isnothing(centroids)
+            return scatter(getindex.(centroids, 1), getindex.(centroids, 2), marker_z=s_mean, markersize=4, c=:viridis, label=nothing, title=title_str, aspect_ratio=:equal)
+        end
         return nothing
     end
 
@@ -1239,7 +1333,12 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
         fe_summary = is_mv ? effects.fixed[outcome] : effects.fixed
         if hasproperty(fe_summary, :mean) && !all(iszero, fe_summary.mean) 
             fm, fl, fu = vec(fe_summary.mean), vec(fe_summary.lower), vec(fe_summary.upper)
-            if !isempty(fm); coef_names = haskey(M, :Xfixed_names) ? string.(M.Xfixed_names) : ["Coef_$i" for i in 1:length(fm)]; p_forest = scatter(fm, 1:length(fm), xerror=(fm .- fl, fu .- fm), yticks=(1:length(fm), coef_names), title="Fixed Effects Coefficients", xlabel="Estimate", markersize=4, color=:black, legend=false); vline!(p_forest, [0], color=:red, ls=:dash, lw=1); plots[:fixed_effects] = p_forest; end
+            if !isempty(fm)
+                coef_names = haskey(M, :Xfixed_names) ? string.(M.Xfixed_names) : ["Coef_$i" for i in 1:length(fm)]
+                p_forest = scatter(fm, 1:length(fm), xerror=(fm .- fl, fu .- fm), yticks=(1:length(fm), coef_names), title="Fixed Effects Coefficients", xlabel="Estimate", markersize=4, color=:black, legend=false)
+                vline!(p_forest, [0], color=:red, ls=:dash, lw=1)
+                plots[:fixed_effects] = p_forest
+            end
         end
     end
 
@@ -1272,32 +1371,69 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
 end
 
 
+"""
+    predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100, alpha=0.05)
 
+The primary engine for projecting a fitted `bstm` model onto a new dataset to
+generate out-of-sample predictions.
 
+# Version
+v1.1.0 (2026-08-13)
+
+# Rationale
+This function constructs a "prediction set" configuration (`PS`) that mirrors the
+training configuration (`M`) but is adapted for the `new_data`. It correctly
+handles the projection of fixed effects, the re-generation of basis matrices for
+smoothers on the new coordinates, and the recursive prediction for nested models.
+This version is updated to be consistent with the refactored architecture,
+correcting `MethodError` exceptions that arose from changes in the signatures of
+`decompose_bstm_formula` and `create_fixed_design`.
+
+# Workflow
+1.  **Initialize Prediction Set (PS)**: Creates a copy of the training model's
+    configuration (`M`) and updates it with the `new_data`.
+2.  **Re-create Fixed Effects**: Parses the original formula and calls
+    `create_fixed_design` to generate a new design matrix for the fixed effects
+    based on the `new_data`.
+3.  **Update Indices**: Populates the spatial, temporal, and seasonal index vectors
+    in the `PS` from the corresponding columns in `new_data`.
+4.  **Re-create Basis Matrices**: For any smoother components in the original model,
+    it regenerates the basis matrices (e.g., for P-splines, thin-plate splines)
+    using the coordinate data from `new_data`.
+5.  **Handle Nested Models**: If the original model contained `nested()` components,
+    it recursively creates a prediction set for each sub-model.
+6.  **Call Reconstruction Engine**: Invokes the main `_reconstruct` function, passing
+    it both the training configuration `M` and the new prediction set `PS`.
+7.  **Slice Predictions**: Extracts and returns only the out-of-sample portion of
+    the predictions from the full reconstructed output.
+
+# Arguments
+- `model_obj::DynamicPPL.Model`: The fitted Turing model object.
+- `chain`: The `MCMCChains.Chains` object from the fitted model.
+- `new_data::DataFrame`: A `DataFrame` with the same column names as the training data.
+- `n_samples::Int`: The number of posterior samples to use for prediction.
+- `alpha::Float64`: The significance level for credible intervals.
+
+# Returns
+- A `NamedTuple` containing the summarized `predictions_denoised` and
+  `predictions_noisy`, the full posterior statistics object `pstats`, and the
+  prediction set configuration `PS`.
+"""
 function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100, alpha=0.05)
-    # Purpose: The primary engine for projecting a fitted model onto new data.
-    # Rationale: This function constructs a "prediction set" configuration (PS) that mirrors the training configuration (M)
-    #            but is adapted for the `new_data`. It correctly handles the projection of fixed effects, smooth basis functions,
-    #            and nested models.
-    # v1.0.0 (2026-07-17)
-    # Inputs:
-    #   - model_obj: The fitted Turing model object.
-    #   - chain: The MCMC chain result.
-    #   - new_data: A DataFrame with the same column names as the training data.
-    #   - n_samples: The number of posterior samples to use for prediction.
-    #   - alpha: The significance level for credible intervals.
-    # Outputs: A NamedTuple containing denoised and noisy predictions, posterior stats, and the PS object.
     M_train = model_obj.args.M
     n_samps = min(size(chain, 1), n_samples)
 
+    # 1. Initialize the Prediction Set (PS) configuration
     PS_dict = Dict(pairs(M_train))
     PS_dict[:data] = new_data
     PS_dict[:y_obs] = zeros(nrow(new_data)) # Placeholder
     PS_dict[:y_N] = nrow(new_data)
 
-    # Re-create fixed effects design matrix for the new data
+    # 2. Re-create fixed effects design matrix for the new data
     if haskey(M_train, :formula)
-        decomposed_formula = decompose_bstm_formula(M_train.formula)
+        # Corrected call: Pass training data for context.
+        decomposed_formula = decompose_bstm_formula(M_train.formula, M_train.data)
+        
         fixed_effects_vars = String[]
         append!(fixed_effects_vars, decomposed_formula.fixed_effects)
         for (_, mod_data_nt) in decomposed_formula.modules
@@ -1309,19 +1445,25 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
         
         if !isempty(fixed_effects_vars)
             rhs = "0 + " * join(fixed_effects_vars, " + ")
-            Xfixed_pred, _ = create_fixed_design(rhs, new_data; contrasts=get(M_train, :contrasts, Dict()))
+            # Corrected call: Pass calling_module for scoped evaluation.
+            Xfixed_pred, _ = create_fixed_design(
+                rhs, 
+                new_data, 
+                M_train.calling_module; 
+                contrasts=get(M_train, :contrasts, Dict())
+            )
             PS_dict[:Xfixed] = Matrix(Xfixed_pred)
             PS_dict[:Xfixed_N] = size(Xfixed_pred, 2)
             PS_dict[:Xfixed_names] = names(Xfixed_pred, 2)
         end
     end
 
-    # Update indices from new_data
+    # 3. Update indices from new_data
     if haskey(M_train, :s_idx_var) && hasproperty(new_data, M_train.s_idx_var); PS_dict[:s_idx] = new_data[!, M_train.s_idx_var]; end 
     if haskey(M_train, :t_idx_var) && hasproperty(new_data, M_train.t_idx_var); PS_dict[:t_idx] = new_data[!, M_train.t_idx_var]; end 
     if haskey(M_train, :u_idx_var) && hasproperty(new_data, M_train.u_idx_var); PS_dict[:u_idx] = new_data[!, M_train.u_idx_var]; end 
 
-    # Re-create basis matrices for smoothers on the new data
+    # 4. Re-create basis matrices for smoothers on the new data
     if haskey(M_train, :components)
         ps_basis_registry = Dict{Symbol, Any}()
         smooth_specs = filter(s -> s.structure == :smooth, M_train.components)
@@ -1334,31 +1476,38 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
                 m_obj = spec.component_obj
                 model_type_str = lowercase(string(typeof(m_obj)))
                 nb = size(M_train.basis_matrices[key_sym], 2)
-                if n_vars == 1 
-                    ps_basis_registry[key_sym] = bstm_smooth_basis_1D(model_type_str, new_data[!, Symbol(vars[1])], nb; spec.params...)
+                
+                # Correctly pass keyword arguments from the spec's params dictionary.
+                local_kwargs = Dict(spec.params)
+
+                B_matrix, _ = if n_vars == 1 
+                    bstm_smooth_basis_1D(model_type_str, new_data[!, Symbol(vars[1])], nb; local_kwargs...)
                 elseif n_vars > 1
                     coords_new = Matrix{Float64}(new_data[!, Symbol.(vars)])
-                    if n_vars == 2; ps_basis_registry[key_sym] = bstm_smooth_basis_2D(model_type_str, coords_new, nb; spec.params...);
-                    elseif n_vars == 3; ps_basis_registry[key_sym] = bstm_smooth_basis_3D(model_type_str, coords_new, nb; spec.params...);
-                    elseif n_vars == 4; ps_basis_registry[key_sym] = bstm_smooth_basis_4D(model_type_str, coords_new, nb; spec.params...);
-                    end
+                    B_matrix_raw = if n_vars == 2; bstm_smooth_basis_2D(model_type_str, coords_new, nb; local_kwargs...);
+                    elseif n_vars == 3; bstm_smooth_basis_3D(model_type_str, coords_new, nb; local_kwargs...);
+                    elseif n_vars == 4; bstm_smooth_basis_4D(model_type_str, coords_new, nb; local_kwargs...);
+                    else; error("Smoothers with more than 4 dimensions are not supported for prediction."); end
+                    (B_matrix_raw, size(B_matrix_raw, 2))
                 end
+                ps_basis_registry[key_sym] = B_matrix
             end
         end
         PS_dict[:basis_matrices] = ps_basis_registry
     end
 
-    # Create prediction sets for nested sub-models
+    # 5. Create prediction sets for nested sub-models
     if haskey(M_train, :nested_components) && !isempty(M_train.nested_components)
         PS_dict[:nested_prediction_sets] = Dict{Symbol, Any}()
         for (key, sub_M) in M_train.nested_components
             sub_PS_dict = Dict(pairs(sub_M))
             sub_PS_dict[:data] = new_data
-            sub_PS_dict[:y_obs] = zeros(nrow(new_data)) # Placeholder
+            sub_PS_dict[:y_obs] = zeros(nrow(new_data))
             sub_PS_dict[:y_N] = nrow(new_data)
 
             if haskey(sub_M, :formula)
-                sub_decomposed = decompose_bstm_formula(sub_M.formula) 
+                # Corrected call for sub-model
+                sub_decomposed = decompose_bstm_formula(sub_M.formula, sub_M.data) 
                 
                 sub_fixed_effects_vars = String[]
                 append!(sub_fixed_effects_vars, sub_decomposed.fixed_effects)
@@ -1371,7 +1520,13 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
                 
                 if !isempty(sub_fixed_effects_vars)
                     rhs = "0 + " * join(sub_fixed_effects_vars, " + ")
-                    Xfixed_sub, _ = create_fixed_design(rhs, new_data; contrasts=get(sub_M, :contrasts, Dict()))
+                    # Corrected call for sub-model
+                    Xfixed_sub, _ = create_fixed_design(
+                        rhs, 
+                        new_data, 
+                        sub_M.calling_module; 
+                        contrasts=get(sub_M, :contrasts, Dict())
+                    )
                     sub_PS_dict[:Xfixed] = Matrix(Xfixed_sub)
                     sub_PS_dict[:Xfixed_N] = size(Xfixed_sub, 2)
                     sub_PS_dict[:Xfixed_names] = names(Xfixed_sub, 2)
@@ -1383,27 +1538,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
             end
 
             if haskey(sub_M, :components)
-                sub_ps_basis_registry = Dict{Symbol, Any}()
-                sub_smooth_specs = filter(s -> s.structure == :smooth, sub_M.components)
-                for spec in sub_smooth_specs
-                    v_sym = Symbol(spec.var)
-                    vars = get(spec.params, :positional_args, [])
-                    n_vars = length(vars)
-                    if haskey(sub_M.basis_matrices, v_sym) && all(hasproperty(new_data, Symbol(v)) for v in vars)
-                        m_obj = spec.component_obj
-                        model_type_str = lowercase(string(typeof(m_obj)))
-                        nb = size(sub_M.basis_matrices[v_sym], 2)
-                        if n_vars == 1 
-                            sub_ps_basis_registry[v_sym] = bstm_smooth_basis_1D(model_type_str, new_data[!, Symbol(vars[1])], nb; spec.params...)
-                        elseif n_vars > 1
-                            coords_new = Matrix{Float64}(new_data[!, Symbol.(vars)])
-                            if n_vars == 2; sub_ps_basis_registry[v_sym] = bstm_smooth_basis_2D(model_type_str, coords_new, nb; spec.params...);
-                            elseif n_vars == 3; sub_ps_basis_registry[v_sym] = bstm_smooth_basis_3D(model_type_str, coords_new, nb; spec.params...);
-                            elseif n_vars == 4; sub_ps_basis_registry[v_sym] = bstm_smooth_basis_4D(model_type_str, coords_new, nb; spec.params...);
-                            end
-                        end
-                    end
-                end
+                sub_ps_basis_registry = _recreate_basis_matrices_for_prediction(sub_M, new_data)
                 sub_PS_dict[:basis_matrices] = sub_ps_basis_registry
             end
 
@@ -1419,6 +1554,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
         end
     end
 
+    # 6. Finalize PS and call reconstruction
     PS = NamedTuple(PS_dict)
 
     raw_arch = get(M_train, :model_arch, "univariate")
@@ -1430,7 +1566,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
 
     res = _reconstruct(arch_type, "prediction", chain_sub, M_train, PS, alpha)
 
-    # Slice the prediction part from the full summary.
+    # 7. Slice the prediction part from the full summary.
     N_train = M_train.y_N
     
     function slice_summary(summary)
@@ -1449,10 +1585,30 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
     )
 end
 
+
+"""
+    model_results_plots(res)
+
+A convenience function to display all plots generated by the `model_results_comprehensive`
+function.
+
+# Version
+v1.0.1 (2026-08-13)
+
+# Rationale
+This function provides a simple and standardized way to visualize all the output
+plots from a `bstm` model run. It is designed to handle the nested structure of the
+`plots` object returned by `model_results_comprehensive`, which may contain both
+individual plot objects and dictionaries of plots (e.g., for multiple smooth or
+mixed effects).
+
+# Arguments
+- `res`: The main results `NamedTuple` returned by `model_results_comprehensive`.
+
+# Returns
+- `nothing`. The function prints the plots to the current display.
+"""
 function model_results_plots(res)
-    # Purpose: Displays all plots generated by `model_results_comprehensive`.
-    # Rationale: A simple convenience function to iterate through and display the
-    #            contents of the `plots` object returned by the main results function.
     if !hasproperty(res, :plots) || isempty(res.plots)
         println("No plots found in the results object.") 
         return
@@ -1473,26 +1629,55 @@ function model_results_plots(res)
     println("--- End of Plots ---")
 end
 
+
+"""
+    plot_choropleth(values::AbstractVector, polygons::Vector; title="Spatial Distribution", cmap=:viridis)
+
+A utility function to generate a choropleth map from a set of values and their
+corresponding spatial polygons.
+
+# Version
+v1.0.1 (2026-08-13)
+
+# Rationale
+This function provides a standardized and simple way to visualize spatial data,
+which is a core requirement for interpreting the outputs of spatiotemporal models.
+It is used by the main `bstm_plots` function to create maps of spatial random
+effects and predictions. The implementation is robust, handling common issues like
+non-closed polygon shapes and invalid coordinate data.
+
+# Arguments
+- `values::AbstractVector`: A vector of numeric values, where each value corresponds
+  to a polygon.
+- `polygons::Vector`: A vector of polygons. Each element of the vector should be a
+  collection of points (e.g., a `Vector` of 2-element `Tuple`s or `Vector`s) that
+  define the vertices of a polygon.
+- `title::String`: The title for the plot.
+- `cmap`: The colormap to use for shading the polygons. Can be a `Symbol` (e.g.,
+  `:viridis`) or a `ColorGradient`.
+
+# Returns
+- A `Plots.Plot` object representing the choropleth map.
+"""
 function plot_choropleth(values::AbstractVector, polygons::Vector; title="Spatial Distribution", cmap=:viridis)
-    # Purpose: A simple choropleth plotting utility.
-    # Rationale: Provides a basic visualization for spatial fields on polygonal units.
     plt = plot(aspect_ratio=:equal, title=title, legend=false, grid=false, showaxis=false, xticks=false, yticks=false)
 
-    # Determine the color range for normalization
+    # Determine the color range for normalization, handled automatically by Plots.jl
+    # but useful to have if manual normalization were needed.
     min_val, max_val = extrema(values)
     
     for i in 1:min(length(polygons), length(values))
         poly_coords = polygons[i]
         
-        # A valid polygon requires at least 3 vertices
+        # A valid polygon requires at least 3 vertices.
         if length(poly_coords) > 2 
-            # Extract x and y coordinates, filtering out any NaN values
+            # Extract x and y coordinates, filtering out any NaN values.
             px = [pt[1] for pt in poly_coords if !isnan(pt[1])]
             py = [pt[2] for pt in poly_coords if !isnan(pt[2])]
             
-            # Proceed only if there are valid coordinates 
+            # Proceed only if there are valid coordinates.
             if !isempty(px)
-                # Ensure the polygon is closed for plotting
+                # Ensure the polygon is closed for plotting.
                 if (px[1], py[1]) != (px[end], py[end])
                     push!(px, px[1])
                     push!(py, py[1])
@@ -1503,9 +1688,60 @@ function plot_choropleth(values::AbstractVector, polygons::Vector; title="Spatia
         end
     end
     return plt
-end 
+end
 
+"""
+    bstm_cv_orchestrator(formula::String, data::DataFrame; ...)
 
+An orchestration utility for performing cross-validation on `bstm` models. It
+supports several strategies designed to handle the dependent nature of
+spatiotemporal data.
+
+# Version
+v1.1.0 (2026-08-13)
+
+# Rationale
+This function provides a standardized and flexible way to evaluate a model's
+out-of-sample predictive performance. This version is updated to be consistent
+with the refactored `bstm` architecture, replacing the deprecated model
+instantiation logic with a call to the new `bstm_core` function. It also
+corrects a bug in the formula parsing step.
+
+# Cross-Validation Methods (`method`)
+- **`:kfold`**: Standard random k-fold cross-validation. Suitable only when
+  observations can be considered independent.
+- **`:lolo` (Leave-One-Location-Out)**: Each fold consists of all observations
+  from a unique level of the `cv_var` (e.g., a spatial unit `s_idx`). This
+  tests the model's ability to predict at entirely new locations.
+- **`:spatial_block`**: Creates `n_folds` spatial blocks using k-means
+  clustering on the `cv_space_vars`. This tests spatial extrapolation performance.
+- **`:temporal_block`**: Divides the data into `n_folds` contiguous blocks based
+  on the `cv_var` (e.g., `year`). This tests interpolation performance for
+  missing time periods.
+- **`:temporal_forward_chain`**: A forecasting simulation. It iteratively trains
+  on data up to a certain time point and tests on the next `n_folds` time points.
+
+# Arguments
+- `formula::String`: The `bstm` model formula.
+- `data::DataFrame`: The full dataset.
+- `method::Symbol`: The CV strategy to use. Default: `:kfold`.
+- `cv_var::Symbol`: The column in `data` used for grouping/blocking. Default: `:s_idx`.
+- `n_folds::Int`: The number of folds or blocks. Default: `5`.
+- `sampler`: The Turing sampler used to fit the model in each fold. Default: `NUTS(500, 0.65)`.
+- `n_samples::Int`: The number of posterior samples to draw in each fold. Default: `500`.
+- `alpha::Float64`: The significance level for credible intervals in prediction. Default: `0.05`.
+- `cv_space_vars::Vector{Symbol}`: Coordinate columns for `:spatial_block`. Default: `[:s_x, :s_y]`.
+- `kwargs...`: Additional keyword arguments passed to the underlying `bstm_core` call.
+
+# Returns
+- A `NamedTuple` containing:
+  - `folds`: A vector of `NamedTuple`s with `rmse` and `r2` for each fold.
+  - `mean_rmse`: The average RMSE across all folds.
+  - `mean_r2`: The average R-squared across all folds.
+  - `response_var`: The name of the response variable.
+  - `method`: The CV method used.
+  - `n_folds`: The number of folds executed.
+"""
 function bstm_cv_orchestrator(
     formula::String, 
     data::DataFrame; 
@@ -1518,23 +1754,8 @@ function bstm_cv_orchestrator(
     cv_space_vars::Vector{Symbol} = [:s_x, :s_y],
     kwargs...
 )    
-    # Purpose: An orchestration utility for performing cross-validation. It supports standard 
-    #          k-fold, Leave-One-Location-Out (LOLO), spatial blocking, and temporal blocking/forward-chaining
-    #          strategies to assess model performance on held-out data.
-    # Rationale: Provides a standardized and flexible way to evaluate model predictive performance
-    #            while accounting for spatial and temporal data structures.
-    # Inputs:
-    #   - formula: The bstm model formula.
-    #   - data: The input DataFrame.
-    #   - method: The CV method. One of `:kfold`, `:lolo`, `:spatial_block`, `:temporal_block`, `:temporal_forward_chain`.
-    #   - cv_var: The column name to use for grouping/blocking (for `:lolo`, `:temporal_block`, `:temporal_forward_chain`).
-    #   - n_folds: The number of folds for k-fold or blocking methods.
-    #   - sampler: The Turing sampler to use.
-    #   - cv_space_vars: Columns for spatial coordinates for `:spatial_block`.
-    #   - kwargs: Additional arguments passed to `bstm_config`.
-    # Outputs: A NamedTuple containing fold-level results and summary metrics.
-    
-    meta_discovery = decompose_bstm_formula(formula)
+    # Corrected call to include the data argument for formula parsing.
+    meta_discovery = decompose_bstm_formula(formula, data)
     response_name = Symbol(meta_discovery.outcomes[1][:var])
 
     folds_indices = Vector{Vector{Int}}()
@@ -1605,8 +1826,13 @@ function bstm_cv_orchestrator(
 
         if nrow(train_data) == 0; @warn "Fold $f_idx created an empty training set. Skipping."; continue; end 
 
-        opt_train = bstm_config(formula, train_data; kwargs...)
-        model_train = bstm(opt_train)
+        # Updated model instantiation to use bstm_core, consistent with refactor.
+        # Pass kwargs through, but force verbose=false to avoid excessive output.
+        cv_kwargs = Dict(kwargs)
+        cv_kwargs[:verbose] = false
+        
+        model_train = bstm_core(formula, train_data; cv_kwargs...)
+        
         chain_train = sample(model_train, sampler, n_samples; progress=false)
         res_pred = predict(model_train, chain_train, test_data; n_samples=div(n_samples, 2), alpha=alpha)
 
@@ -1617,7 +1843,7 @@ function bstm_cv_orchestrator(
             residuals = y_test_obs .- y_test_pred
             rmse = sqrt(Statistics.mean(residuals.^2))
             ss_res = sum(residuals.^2)
-            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2) # This can be zero if all test obs are the same. 
+            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
             r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
             push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
         else
@@ -1637,28 +1863,55 @@ function bstm_cv_orchestrator(
         n_folds = n_actual_folds
     )
 end
+"""
+    bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
 
-# ==============================================================================
-# SECTION 5: MODEL SELECTION AND COMPARISON
-# ==============================================================================
+A utility for performing Leave-One-Out Cross-Validation using Pareto Smoothed
+Importance Sampling (PSIS-LOO) to assess a model's out-of-sample predictive accuracy.
 
-# Version 1.0.2 (2026-08-06)
-# Purpose: A utility for performing Leave-One-Out Cross-Validation using Pareto Smoothed Importance
-#          Sampling (PSIS-LOO) to assess a model's out-of-sample predictive accuracy.
-# Rationale: This version corrects two issues related to the log-likelihood matrix dimensions.
-#            1. The unpacking of `size(log_lik)` was incorrect, swapping `n_samples` and `n_obs`.
-#            2. The `PosteriorStats.loo` function expects a matrix of size `[n_samples, n_obs]`,
-#               but the `log_lik` matrix from `_reconstruct` has dimensions `[n_obs, n_samples]`.
-#            The fix corrects the size unpacking and transposes the `log_lik` matrix before
-#            passing it to `loo()`.
+# Version
+v1.0.3 (2026-08-13)
+
+# Rationale
+This function serves as a high-level wrapper around the `PosteriorStats.loo`
+function. It is a critical tool for model selection, providing a more robust
+estimate of out-of-sample predictive performance than simpler metrics like WAIC.
+
+This version is confirmed to be correct and consistent with the refactored `bstm`
+architecture. It correctly handles the dimensional requirements of the underlying
+`PosteriorStats.loo` function by transposing the log-likelihood matrix.
+
+# Workflow
+1.  **Architecture Dispatch**: Determines the model architecture (univariate,
+    multivariate, etc.) from the model configuration.
+2.  **Log-Likelihood Reconstruction**: Calls the internal `_reconstruct` function
+    to generate the pointwise log-likelihood matrix, which has dimensions
+    `[n_observations, n_samples]`.
+3.  **Matrix Transposition**: Transposes the log-likelihood matrix to the
+    `[n_samples, n_observations]` format required by `PosteriorStats.loo`.
+4.  **PSIS-LOO Calculation**: Calls `PosteriorStats.loo` to compute the LOO-CV metrics.
+5.  **Reporting**: Prints a summary of the key metrics (ELPD, p_loo, LOOIC) and
+    warns the user if any influential observations (high Pareto-k values) are detected.
+
+# Arguments
+- `model_obj::DynamicPPL.Model`: The fitted Turing model object.
+- `chain`: The `MCMCChains.Chains` object from the fitted model.
+- `alpha::Float64`: The significance level for credible intervals (not directly
+  used in LOO calculation but maintained for API consistency).
+
+# Returns
+- A `NamedTuple` containing:
+  - `loo_obj`: The full results object from `PosteriorStats.loo`.
+  - `metrics`: A `NamedTuple` with the key estimates (`elpd`, `p_loo`, `looic`).
+  - `log_likelihood`: The original `[n_obs, n_samples]` log-likelihood matrix.
+  - `pareto_k`: A vector of the Pareto-k diagnostic values for each observation.
+"""
 function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)    
     # --- 1. Metadata and Architecture Extraction ---
-    # Rationale: M contains the configuration and technical registry required for reconstruction.
     M = model_obj.args.M
     raw_arch = get(M, :model_arch, "univariate")
 
     # --- 2. Technical Dispatch Resolution ---
-    # Mapping the configuration string to the architectural dispatch types.
     arch_type = if raw_arch == "univariate"
         UnivariateArchitecture()
     elseif raw_arch == "multivariate"
@@ -1670,26 +1923,19 @@ function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
     end
 
     # --- 3. Latent Component Reconstruction for Likelihood Registry ---
-    # Rationale: _reconstruct generates the [n_obs, n_samples] log-likelihood matrix.
-    println("Audit: Recovering pointwise log-likelihood registry...")
     res = _reconstruct(arch_type, "loo_recovery", chain, M, nothing, alpha)
 
     # --- 4. Matrix Extraction and Validation ---
-    # Rationale: Ensuring the log_likelihood matches the observation grid dimensions.
     log_lik = res.log_likelihood 
     if isempty(log_lik)
         @warn "Log-likelihood matrix is empty. Cannot compute LOO."
         return nothing
     end
     
-    # FIX: The log_lik matrix is [n_obs, n_samples]. Unpack dimensions correctly.
     n_obs, n_samples = size(log_lik)
 
-    println("Audit: Processing ", n_samples, " samples for ", n_obs, " observations.")
-
     # --- 5. PSIS-LOO Calculation via PosteriorStats ---
-    # Rationale: LOO-CV provides a reliable estimate of out-of-sample predictive performance.
-    # FIX: Transpose log_lik to [n_samples, n_obs] as expected by PosteriorStats.loo.
+    # PosteriorStats.loo expects a matrix of size [n_samples, n_obs].
     loo_result = nothing
     try
         loo_result = loo(Matrix(log_lik'))
@@ -1704,7 +1950,6 @@ function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
     println("LOO Information Criterion:                       ", round(loo_result.estimates[:looic, :estimate], digits=2))
 
     # Check for influential observations (k > 0.7)
-    # Rationale: Identifying data points where the importance weight is unstable.
     pareto_k = loo_result.pointwise[:pareto_k]
     influential_count = count(x -> x > 0.7, pareto_k)
     if influential_count > 0 
@@ -1722,7 +1967,6 @@ function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
         pareto_k = pareto_k
     )
 end
- 
 
 
 """

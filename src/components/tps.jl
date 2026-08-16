@@ -7,7 +7,7 @@ space. The effect is a linear combination of these basis functions, with coeffic
 regularized by a random walk prior to ensure smoothness.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.1 (2026-08-14)
 
 # Mathematical Summary
 A Thin Plate Spline models a function \$f(\\mathbf{x})\$ as a linear combination of
@@ -66,7 +66,7 @@ COMPONENT_CONSTRUCTORS[:tps] = (p, params) -> TPS(
 
 MODEL_TO_STRUCTURE_MAP[:tps] = :smooth
 
-function get_datastructures!(m_type::Type{<:TPS}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
 
     if isempty(variables)
@@ -74,20 +74,12 @@ function get_datastructures!(m_type::Type{<:TPS}, M::Dict, mod_data::Dict)::Bool
     end
 
     for var_sym in variables
-        if !hasproperty(M[:data], Symbol(var_sym))
+        if !hasproperty(M.data, Symbol(var_sym))
             error("Coordinate variable ':$var_sym' for TPS model not found in data.")
         end
     end
 
-    mod_data[:params][:coords] = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-    return true
-end
-
-function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = get(mod_data[:params], :coords, nothing)
-    if isnothing(coords)
-        error("TPS component precomputes failed: coordinates not found in module data.")
-    end
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
     
     n_obs, n_dims = size(coords)
     n_latent = m.nbins
@@ -141,10 +133,11 @@ function get_priors(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     sigma_prior_str = _distribution_to_string(m.sigma)
+    key = spec.key
     
     return """
         $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)
+        $(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)
     """
 end
 
@@ -155,20 +148,19 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
-    n_latent = spec.hyper.n_latent
 
     common_code = """
-        hyper = spec_registry[:$(key)].hyper # Access precomputed data
-        B_basis = hyper.basis_matrix
+        local hyper = spec_registry[:$(key)].hyper
+        local B_basis = hyper.basis_matrix
     """
 
     spectral_code = """
         # --- Thin Plate Spline (TPS) Smoother (Spectral): $(key) ---
         let
             $(common_code)
-            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise) # Scale by sigma and add jitter
+            local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
-            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
+            local coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
@@ -178,10 +170,10 @@ function get_updates(
         # --- Thin Plate Spline (TPS) Smoother (Cholesky, AD-Safe): $(key) ---
         let
             $(common_code)
-            F = hyper.cholesky_factor # Precomputed Cholesky factor
-            coeffs_raw = F.L' \\ $(p_names.innovations)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
-            coeffs = $(p_names.sigma) .* coeffs_raw
+            local F = hyper.cholesky_factor
+            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
+            local coeffs = $(p_names.sigma) .* coeffs_raw
             $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
@@ -191,11 +183,11 @@ function get_updates(
         # --- Thin Plate Spline (TPS) Smoother (Sparse Cholesky, Not AD-Safe): $(key) ---
         let
             $(common_code)
-            Q_penalty = hyper.Q_template # Precision matrix template
-            F = cholesky(Symmetric(Q_penalty + M.noise * I))
-            coeffs_raw = F.L' \\ $(p_names.innovations)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
-            coeffs = $(p_names.sigma) .* coeffs_raw
+            local Q_penalty = hyper.Q_template
+            local F = cholesky(Symmetric(Q_penalty + M.noise * I))
+            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
+            local coeffs = $(p_names.sigma) .* coeffs_raw
             $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
@@ -208,8 +200,8 @@ function get_updates(
 end
 
 function get_effects(
-    m::TPS, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::TPS, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
@@ -245,12 +237,12 @@ function get_effects(
         B_full = B_train
     end
 
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for TPS component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -267,7 +259,7 @@ function get_effects(
             local coeffs
             if m.method == :spectral
                 U, L = hyper.U, hyper.L
-                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise) # Scale by sigma and add jitter
+                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
                 diag_D[1] = 0.0; diag_D[2] = 0.0
                 coeffs = U * (diag_D .* innovations_samples[i, :])
             else # :cholesky or :cholesky_sparse

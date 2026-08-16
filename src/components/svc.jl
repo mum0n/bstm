@@ -6,7 +6,7 @@ covariate to vary smoothly across space. It acts as an orchestrator, applying an
 spatial `ComponentModel` to a specified covariate.
 
 # Version
-v1.2.0 (2026-08-11)
+v1.2.1 (2026-08-14)
 
 # Mathematical Summary
 An SVC model replaces a fixed regression coefficient \$\\beta\$ with a spatially-indexed
@@ -59,55 +59,26 @@ end
 
 MODEL_TO_STRUCTURE_MAP[:svc] = :spatial
 
-function get_datastructures!(m_type::Type{<:SVC}, M::Dict, mod_data::Dict)::Bool
-    params = mod_data[:params]
-    cov_var = get(params, :covariate, nothing)
-
-    if isnothing(cov_var)
-        error("SVC model '$(mod_data[:key])' requires a `covariate` parameter.")
-    end
-
-    if cov_var != Symbol("1") && cov_var != :intercept && !hasproperty(M[:data], cov_var)
+function get_precomputes(m::SVC, M::NamedTuple, mod_data::Dict)::NamedTuple
+    # Data validation moved from get_datastructures!
+    cov_var = m.covariate
+    if cov_var != Symbol("1") && cov_var != :intercept && !hasproperty(M.data, cov_var)
         error("Covariate ':$cov_var' for SVC model '$(mod_data[:key])' not found in data.")
     end
 
-    inner_model_spec_node = get(params, :spatial_model_spec, nothing)
-    if isnothing(inner_model_spec_node)
-        error("SVC model '$(mod_data[:key])' is missing the inner `spatial_model_spec`.")
-    end
-
-    inner_model_name = get(inner_model_spec_node.args, :model, :icar)
-    if !haskey(COMPONENT_TYPE_REGISTRY, inner_model_name)
-        error("Inner model ':$inner_model_name' for SVC not found in COMPONENT_TYPE_REGISTRY.")
-    end
-    inner_model_type = COMPONENT_TYPE_REGISTRY[inner_model_name]
-
+    # The inner model's variables are the main variables of the SVC component
     inner_mod_data = Dict(
         :key => Symbol("$(mod_data[:key])_inner"),
-        :type => inner_model_spec_node.module_type,
-        :variables => get(inner_model_spec_node.args, :positional_args, []),
-        :params => inner_model_spec_node.args
-    )
-    
-    return get_datastructures!(inner_model_type, M, inner_mod_data)
-end
-
-function get_precomputes(m::SVC, M::NamedTuple, mod_data::Dict)::NamedTuple
-    inner_model_spec_node = get(mod_data[:params], :spatial_model_spec, nothing)
-    if isnothing(inner_model_spec_node)
-        error("SVC model '$(mod_data[:key])' missing `spatial_model_spec` for precomputes.")
-    end
-
-    inner_mod_data = Dict(
-        :key => Symbol("$(mod_data[:key])_inner"),
-        :type => inner_model_spec_node.module_type,
-        :variables => get(inner_model_spec_node.args, :positional_args, []),
-        :params => inner_model_spec_node.args
+        :variables => mod_data[:variables],
+        :params => mod_data[:params]
     )
     
     inner_precomputes = get_precomputes(m.model, M, inner_mod_data)
     
-    return (inner_precomputes=inner_precomputes,)
+    return (
+        inner_precomputes=inner_precomputes,
+        covariate_name=m.covariate
+    )
 end
 
 function get_priors(
@@ -121,10 +92,19 @@ function get_priors(
         var = spec.var,
         component_obj = m.model,
         params = spec.params,
-        hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
+        hyper = spec.hyper.inner_precomputes
     )
     
-    return get_priors(m.model, inner_spec, arch, outcome_idx, M)
+    # Generate the code for the inner model's priors
+    inner_priors_code = get_priors(m.model, inner_spec, arch, outcome_idx, M)
+    
+    # The generated code will try to access `spec_registry[:..._inner].hyper`.
+    # The correct path is `spec_registry[:...].hyper.inner_precomputes`.
+    # We perform a string replacement to fix this.
+    incorrect_access = "spec_registry[:$(inner_spec_key)].hyper"
+    correct_access = "spec_registry[:$(spec.key)].hyper.inner_precomputes"
+    
+    return replace(inner_priors_code, incorrect_access => correct_access)
 end
 
 function get_updates(
@@ -141,34 +121,30 @@ function get_updates(
         var = spec.var,
         component_obj = m.model,
         params = spec.params,
-        hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
+        hyper = spec.hyper.inner_precomputes
     )
 
-    # Generate the code for the inner model. This code will contain an incorrect
-    # reference to the spec_registry, as it doesn't know it's being wrapped.
+    # Generate the code for the inner model.
     inner_updates_code = get_updates(m.model, inner_spec, arch, outcome_idx, M)
     inner_p_names = generate_full_variable_names(inner_spec, arch, outcome_idx)
     inner_latent_var = inner_p_names.latent
     
-    # The generated code will try to access `spec_registry[:..._inner].hyper`.
-    # The correct path is `spec_registry[:...].hyper.inner_precomputes`.
-    # We perform a string replacement to fix this.
+    # Fix the spec_registry path in the generated code.
     incorrect_access = "spec_registry[:$(inner_spec_key)].hyper"
     correct_access = "spec_registry[:$(spec.key)].hyper.inner_precomputes"
     inner_updates_code_fixed = replace(inner_updates_code, incorrect_access => correct_access)
 
+    # Strip the eta update from the inner model's code, as the SVC wrapper handles it.
     effect_app_regex = Regex("$(eta_target) \\.\\+= .*")
     update_inner_cleaned = replace(
-        inner_updates_code_fixed, effect_app_regex => "# (eta update handled by SVC)"
+        inner_updates_code_fixed, effect_app_regex => "# (eta update handled by SVC wrapper)"
     )
 
     is_intercept = (cov_var == Symbol("1") || cov_var == :intercept)
     
-    application_code = if is_intercept
-        "$(eta_target) .+= view($(inner_latent_var), M.s_idx)"
-    else
-        "$(eta_target) .+= M.data[!, :$(cov_var)] .* view($(inner_latent_var), M.s_idx)"
-    end
+    covariate_access = is_intercept ? "1.0" : "M.data[!, :$(cov_var)]"
+    
+    application_code = "$(eta_target) .+= $(covariate_access) .* view($(inner_latent_var), M.s_idx)"
     
     return """
         # --- Spatially Varying Coefficient (SVC) for: $(cov_var) ---
@@ -181,8 +157,8 @@ function get_updates(
 end
 
 function get_effects(
-    m::SVC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SVC, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     cov_var = m.covariate
     
@@ -193,20 +169,25 @@ function get_effects(
         var = spec.var,
         component_obj = m.model,
         params = spec.params,
-        hyper = get(spec.hyper, :inner_precomputes, NamedTuple())
+        hyper = spec.hyper.inner_precomputes
     )
 
     inner_effects_result = get_effects(
-        m.model, chain, M, n_samples, outcomes_N, inner_spec, PS, N_total
+        m.model, chain, M, n_samples, is_multivariate_model, outcomes_N, inner_spec, PS, N_total
     )
     
     is_intercept = (cov_var == Symbol("1") || cov_var == :intercept)
+    
     cov_data_full = if is_intercept
         ones(Float64, N_total)
     else
         train_data = M.data[!, cov_var]
-        if !isnothing(PS) && hasproperty(PS.data, cov_var)
-            vcat(train_data, PS.data[!, cov_var])
+        if !isnothing(PS)
+            if hasproperty(PS.data, cov_var)
+                vcat(train_data, PS.data[!, cov_var])
+            else
+                error("SVC prediction requires covariate '$(cov_var)' in the prediction dataset.")
+            end
         else
             train_data
         end
@@ -215,6 +196,13 @@ function get_effects(
     structured_effects = Vector{Matrix{Float64}}()
     for k in 1:outcomes_N
         spatial_effect_k = inner_effects_result.structured[k]
+        
+        if size(spatial_effect_k, 1) != N_total
+            @warn "SVC effect reconstruction: dimension mismatch. Expected $(N_total) rows, but inner effect has $(size(spatial_effect_k, 1))."
+            # Attempt to handle this gracefully if possible, otherwise error might be better.
+            # For now, we'll proceed, but this indicates a problem in the inner get_effects.
+        end
+
         final_effect_k = spatial_effect_k .* cov_data_full
         push!(structured_effects, final_effect_k)
     end

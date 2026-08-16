@@ -7,7 +7,7 @@ where the value at a location is assumed to be conditionally dependent on the
 average of its neighbors.
 
 # Version
-v1.2.1 (2026-08-11)
+v1.2.4 (2026-08-15)
 
 # Mathematical Summary
 The Besag model defines a Gaussian Markov Random Field (GMRF) with a singular
@@ -77,22 +77,6 @@ COMPONENT_CONSTRUCTORS[:besag] = (p, params) -> Besag(
 MODEL_TO_STRUCTURE_MAP[:besag] = :spatial
 
 """
-    get_datastructures!(m_type::Type{<:Besag}, M::Dict, mod_data::Dict)::Bool
-
-Ensures a spatial context (`s_idx`, `s_N`, `W`) is established by calling the main
-spatial processor.
-
-# Assumptions
-- A base adjacency matrix `W` must be provided in the main `@bstm` call or within
-  the `random()` module.
-- A spatial index variable must be provided in the `random()` call.
-"""
-function get_datastructures!(m_type::Type{<:Besag}, M::Dict, mod_data::Dict)::Bool
-    process_spatial_module!(M, mod_data, Dict(), Dict())
-    return true
-end
-
-"""
     get_precomputes(m::Besag, M::NamedTuple, mod_data::Dict)::NamedTuple
 
 Pre-computes the graph Laplacian (`Q_template`), its Cholesky factorization, and its
@@ -130,8 +114,8 @@ function get_priors(
     n_latent = spec.hyper.n_latent
     
     return """
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma)) # Prior for the marginal standard deviation
-    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I) # Raw standard normal innovations for the latent field
+    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+    $(p_names.innovations) ~ MvNormal(zeros($(n_latent)), I)
     """
 end
 
@@ -150,59 +134,45 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
     
-    # --- Spectral Method (AD-safe, default) ---
     spectral_code = """
-    # --- Besag Component (Spectral): $(key) ---
-    let
-        hyper = spec_registry[:$(key)].hyper
-        # Construct the diagonal of the spectral transformation matrix D.
-        # D = diag(sigma / sqrt(L_j) ) where L_j are eigenvalues of Q_template.
-        diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
-        # Enforce sum-to-zero constraint by zeroing out the component for the first eigenvector.
-        diag_D[1] = 0.0
-        
-        # Apply the spectral transformation: latent = U * D * innovations
-        $(p_names.latent) = hyper.U * (diag_D .* $(p_names.innovations))
-        
-        $(eta_target) .+= view($(p_names.latent), M.s_idx)
-    end
+        # --- Besag Component (Spectral): $(key) ---
+        let
+            hyper = spec_registry[:$(key)].hyper
+            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
+            diag_D[1] = 0.0
+            
+            $(p_names.latent) = hyper.U * (diag_D .* $(p_names.innovations))
+            
+            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+        end
     """
 
-    # --- Dense Cholesky Method (AD-safe, didactic) ---
     cholesky_code = """
-    # --- Besag Component (Dense Cholesky): $(key) ---
-    let
-        # Uses the pre-computed dense Cholesky factor.
-        F = spec_registry[:$(key)].hyper.cholesky_factor
-        
-        # Solve L' * x = z for x, where z ~ N(0,I).
-        latent_field_raw = F.L' \\ $(p_names.innovations)
-        
-        # Enforce sum-to-zero constraint for identifiability.
-        latent_field_centered = latent_field_raw .- mean(latent_field_raw)
-        
-        $(p_names.latent) = latent_field_centered .* $(p_names.sigma)
-        $(eta_target) .+= view($(p_names.latent), M.s_idx)
-    end
+        # --- Besag Component (Dense Cholesky): $(key) ---
+        let
+            F = spec_registry[:$(key)].hyper.cholesky_factor
+            latent_field_raw = F.L' \\ $(p_names.innovations)
+            latent_field_centered = latent_field_raw .- mean(latent_field_raw)
+            
+            $(p_names.latent) = latent_field_centered .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+        end
     """
 
-    # --- Sparse Cholesky Method (Not AD-safe, for gradient-free samplers) ---
     cholesky_sparse_code = """
-    # --- Besag Component (Sparse Cholesky): $(key) ---
-    let
-        # Re-computes sparse Cholesky factor inside the model. Not AD-safe.
-        Q = spec_registry[:$(key)].hyper.Q_template
-        F = cholesky(Symmetric(Q + M.noise * I))
-        
-        # Explicitly create a sparse matrix from the factor to ensure correct dispatch.
-        L_sparse = sparse(F.L)
-        latent_field_raw = L_sparse' \\ $(p_names.innovations)
-        
-        latent_field_centered = latent_field_raw .- mean(latent_field_raw)
-        
-        $(p_names.latent) = latent_field_centered .* $(p_names.sigma)
-        $(eta_target) .+= view($(p_names.latent), M.s_idx)
-    end
+        # --- Besag Component (Sparse Cholesky): $(key) ---
+        let
+            Q = spec_registry[:$(key)].hyper.Q_template
+            F = cholesky(Symmetric(Q + M.noise * I))
+            
+            L_sparse = sparse(F.L)
+            latent_field_raw = L_sparse' \\ $(p_names.innovations)
+            
+            latent_field_centered = latent_field_raw .- mean(latent_field_raw)
+            
+            $(p_names.latent) = latent_field_centered .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+        end
     """
 
     if m.method == :spectral
@@ -218,7 +188,7 @@ end
 
 
 """
-    get_effects(m::Besag, chain, M::NamedTuple, ...)::NamedTuple
+    get_effects(m::Besag, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
 
 Reconstructs the `Besag` component's effect from posterior samples, applying a
 sum-to-zero constraint for identifiability. This function dispatches on the method
@@ -226,17 +196,16 @@ used during sampling.
 """
 function get_effects(
     m::Besag, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int, is_multivariate_model::Bool
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for Besag component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -245,21 +214,19 @@ function get_effects(
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
 
         if m.method == :spectral
             U = spec.hyper.U
             L = spec.hyper.L
-            for j in 1:n_samples # Iterate over posterior samples
-                diag_D = sigma_samples[j] ./ sqrt.(L .+ noise) # Scale by sigma and add jitter
-                diag_D[1] = 0.0 # Enforce sum-to-zero constraint for the intrinsic GMRF
-                effect_k[:, j] = U * (diag_D .* innovations_samples[j, :]) # Apply spectral transformation
+            for j in 1:n_samples
+                diag_D = sigma_samples[j] ./ sqrt.(L .+ noise)
+                diag_D[1] = 0.0
+                effect_k[:, j] = U * (diag_D .* innovations_samples[j, :])
             end
-        else # :cholesky or :cholesky_sparse
-            # For reconstruction, the pre-computed dense Cholesky factor is used for
-            # both dense and sparse Cholesky methods, as AD is not involved here.
+        else
             F = spec.hyper.cholesky_factor
             for j in 1:n_samples
                 latent_field_raw = F.L' \ innovations_samples[j, :]
@@ -268,7 +235,7 @@ function get_effects(
             end
         end
         
-        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx) # Combine spatial indices from training and prediction sets
+        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
         indexed_effects = effect_k[s_idx_full, :]
         push!(structured_effects, indexed_effects)
     end

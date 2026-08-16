@@ -6,7 +6,7 @@ unstructured noise or heterogeneity. Each latent effect is drawn independently f
 the same normal distribution.
 
 # Version
-v1.1.1 (2026-08-12)
+v1.1.2 (2026-08-14)
 
 # Mathematical Summary
 The IID component models a latent field \$\\phi\$ where each element \$\\phi_i\$ is drawn
@@ -49,11 +49,6 @@ COMPONENT_CONSTRUCTORS[:iid] = (p, params) -> IID(
 )
 
 MODEL_TO_STRUCTURE_MAP[:iid] = :any
-
-function get_datastructures!(m_type::Type{<:IID}, M::Dict, mod_data::Dict)::Bool
-    return true
-end
-
 function get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
     structure = get(mod_data, :type, :spatial)
     

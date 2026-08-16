@@ -7,7 +7,7 @@ Random Field (GMRF) on a graph with data-driven edge weights, often representing
 habitat conductivity or resistance.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.1 (2026-08-14)
 
 # Mathematical Summary
 The component models a latent spatial field \$\\phi\$ as a GMRF,
@@ -46,6 +46,7 @@ degree to which the habitat influences the spatial correlation structure.
 - `beta_<key>`: The habitat effect parameter.
 - `sigma_<key>`: The marginal standard deviation of the latent field.
 - `innovations_<key>`: The raw standard normal innovations for the latent field.
+- `latent_<key>`: The reconstructed latent spatial field.
 """
 struct NetworkFlow <: ComponentModel
     beta::UnivariateDistribution
@@ -60,14 +61,13 @@ COMPONENT_CONSTRUCTORS[:networkflow] = (p, params) -> NetworkFlow(
 
 MODEL_TO_STRUCTURE_MAP[:networkflow] = :spatial
 
-function get_datastructures!(
-    m_type::Type{<:NetworkFlow}, M::Dict, mod_data::Dict
-)::Bool
-    process_spatial_module!(M, mod_data, Dict(), Dict())
-
+function get_precomputes(m::NetworkFlow, M::NamedTuple, mod_data::Dict)::NamedTuple
+    # Ensure spatial context is established by process_random_module!
+    s_N = M.s_N
+    W = M.W
+    
     params = mod_data[:params]
-    data = M[:data]
-    s_N = M[:s_N]
+    data = M.data
 
     if !haskey(params, :habitat)
         error(
@@ -83,11 +83,12 @@ function get_datastructures!(
         if !hasproperty(data, habitat_val)
             error("Habitat variable ':$habitat_val' not found in the data frame.")
         end
+        # Aggregate habitat data to spatial units if it's per-observation
         habitat_per_obs = data[!, habitat_val]
         habitat_aggregated = zeros(Float64, s_N)
         counts = zeros(Int, s_N)
-        for i in 1:M[:y_N]
-            s_i = M[:s_idx][i]
+        for i in 1:M.y_N
+            s_i = M.s_idx[i]
             habitat_aggregated[s_i] += habitat_per_obs[i]
             counts[s_i] += 1
         end
@@ -108,14 +109,8 @@ function get_datastructures!(
         )
     end
 
-    M[Symbol("habitat_", mod_data[:key])] = habitat_data
-    return true
-end
-
-function get_precomputes(m::NetworkFlow, M::NamedTuple, mod_data::Dict)::NamedTuple
-    W = M.W
     I, J, _ = findnz(W)
-    return (W_I=I, W_J=J, n_latent=size(W, 1))
+    return (W_I=I, W_J=J, n_latent=s_N, s_N=s_N, habitat_data=habitat_data)
 end
 
 function get_priors(
@@ -127,7 +122,7 @@ function get_priors(
 
     push!(priors, "$(p_names.beta) ~ $(_distribution_to_string(m.beta))")
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, M.s_N), I), :$(p_names.innovations))") # Raw standard normal innovations
+    push!(priors, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.innovations))")
 
     return join(priors, "\n    ")
 end
@@ -142,12 +137,14 @@ function get_updates(
 
     common_code = """
         # 1. Construct the weighted adjacency matrix based on habitat and beta.
-        W_I = spec_registry[:$(key)].hyper.W_I
-        W_J = spec_registry[:$(key)].hyper.W_J
-        habitat = M[Symbol("habitat_$(key)")]
+        hyper = spec_registry[:$(key)].hyper
+        W_I = hyper.W_I
+        W_J = hyper.W_J
+        habitat = hyper.habitat_data
+        s_N = hyper.s_N
         
         V_beta = exp.($(p_names.beta) .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
-        W_beta = sparse(W_I, W_J, V_beta, M.s_N, M.s_N)
+        W_beta = sparse(W_I, W_J, V_beta, s_N, s_N)
         
         # 2. Construct the weighted graph Laplacian (precision matrix).
         D_beta = Diagonal(vec(sum(W_beta, dims=2)))
@@ -196,15 +193,16 @@ function get_effects(
     
     W_I = spec.hyper.W_I
     W_J = spec.hyper.W_J
-    habitat = M[Symbol("habitat_", key)]
-    s_N = M.s_N
+    habitat = spec.hyper.habitat_data
+    s_N = spec.hyper.s_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k_outcome in 1:outcomes_N
-        beta_name = _find_parameter(p_names_vec, string(key), "beta", k_outcome, is_multivariate_model)
-        sigma_name = _find_parameter(p_names_vec, string(key), "sigma", k_outcome, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(key), "innovations", k_outcome, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
+        beta_name = _find_parameter(p_names_vec, string(p_names_k.beta), k_outcome, is_multivariate_model)
+        sigma_name = _find_parameter(p_names_vec, string(p_names_k.sigma), k_outcome, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k_outcome, is_multivariate_model)
 
         if isempty(beta_name) || isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for NetworkFlow component $(key) (outcome $k_outcome) not found. Returning zero-matrix."

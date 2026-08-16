@@ -6,7 +6,7 @@ creates a basis of B-spline functions and applies a discrete penalty (typically 
 random walk) to the coefficients to ensure smoothness and prevent overfitting.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.2.0 (2026-08-14)
 
 # Mathematical Summary
 The P-spline models a smooth function \$f(x)\$ as a linear combination of \$K\$ B-spline
@@ -66,7 +66,7 @@ COMPONENT_CONSTRUCTORS[:pspline] = (p, params) -> PSpline(
 
 MODEL_TO_STRUCTURE_MAP[:pspline] = :smooth
 
-function get_datastructures!(m_type::Type{<:PSpline}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::PSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
 
     if isempty(variables)
@@ -77,40 +77,31 @@ function get_datastructures!(m_type::Type{<:PSpline}, M::Dict, mod_data::Dict)::
     end
 
     for var_sym in variables
-        if !hasproperty(M[:data], Symbol(var_sym))
+        if !hasproperty(M.data, Symbol(var_sym))
             error("Coordinate variable ':$var_sym' for PSpline model not found in data.")
         end
     end
 
-    mod_data[:params][:coords] = Matrix{Float64}(M[:data][!, Symbol.(variables)])
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
 
-    return true
-end
-
-function get_precomputes(m::PSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = get(mod_data[:params], :coords, nothing)
-    if isnothing(coords)
-        error("PSpline precomputes failed: coordinates not found in module data.")
-    end
-    
     if size(coords, 2) > 1
         @warn "PSpline is designed for 1D smooths. For multi-dimensional smoothing, " *
               "consider `tps` or creating tensor products manually."
     end
-    
+
     B, actual_nbins = bstm_bspline_basis(coords[:, 1], m.nbins, m.degree)
     n_latent = actual_nbins
 
     penalty_type = m.diff_order == 1 ? :rw1 : :rw2
     template = build_structure_template(penalty_type, n_latent)
     Q_template = template.matrix
-    
+
     rank_deficiency = m.diff_order
     eig_decomp = eigen(Symmetric(Matrix(Q_template)))
     U = eig_decomp.vectors
     L = eig_decomp.values
     scaling_factor = _compute_scaling_factor(L, rank_deficiency)
-    
+
     Q_template_scaled = Q_template ./ scaling_factor
     L_scaled = L ./ scaling_factor
 
@@ -133,11 +124,13 @@ function get_priors(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     sigma_prior_str = _distribution_to_string(m.sigma)
-    n_latent = spec.hyper.n_latent
-    
+    key = spec.key
+
     return """
         $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
+        $(p_names.innovations) ~ MvNormal(
+            zeros(T, spec_registry[:$(key)].hyper.n_latent), I
+        )
     """
 end
 
@@ -148,8 +141,7 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
-    n_latent = spec.hyper.n_latent
-    
+
     common_code = """
         local hyper = spec_registry[:$(key)].hyper
         local B_basis = hyper.basis_matrix
@@ -161,7 +153,7 @@ function get_updates(
             $(common_code)
             local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             for i in 1:$(m.diff_order); diag_D[i] = 0.0; end
-            
+
             coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
@@ -174,9 +166,11 @@ function get_updates(
             $(common_code)
             local F = hyper.cholesky_factor
             local coeffs_raw = F.L' \\ $(p_names.innovations)
-            
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
-            
+
+            Turing.@addlogprob! logpdf(
+                Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw)
+            )
+
             local coeffs = $(p_names.sigma) .* coeffs_raw
             $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
@@ -190,9 +184,11 @@ function get_updates(
             local Q_penalty = hyper.Q_template
             local F = cholesky(Symmetric(Q_penalty + M.noise * I))
             local coeffs_raw = F.L' \\ $(p_names.innovations)
-            
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw))
-            
+
+            Turing.@addlogprob! logpdf(
+                Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw)
+            )
+
             local coeffs = $(p_names.sigma) .* coeffs_raw
             $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
@@ -211,11 +207,11 @@ function get_updates(
 end
 
 function get_effects(
-    m::PSpline, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::PSpline, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
-    
+
     coord_vars = get(spec.params, :positional_args, [])
     if isempty(coord_vars)
         error("PSpline effect reconstruction failed: coordinate variable not found.")
@@ -223,7 +219,7 @@ function get_effects(
     coord_var_sym = Symbol(coord_vars[1])
 
     B_train = spec.hyper.basis_matrix
-    
+
     B_full = if !isnothing(PS) && hasproperty(PS.data, coord_var_sym)
         coords_pred = PS.data[!, coord_var_sym]
         B_pred, _ = bstm_bspline_basis(coords_pred, m.nbins, m.degree)
@@ -239,19 +235,23 @@ function get_effects(
 
     hyper = spec.hyper
     noise = M.noise
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+
+        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
+        innovations_name = _find_parameter(
+            p_names_vec, v.innovations, k, is_multivariate_model
+        )
 
         if isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for PSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            @warn "Parameters for PSpline component $(spec.key) (outcome $k) not found. " *
+                  "Returning zero-matrix."
             push!(structured_effects, zeros(Float64, size(B_full, 1), n_samples))
             continue
         end
-        
+
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
         innovations_samples = get_params_vector(chain, innovations_name, hyper.n_latent)
 
@@ -274,6 +274,6 @@ function get_effects(
         end
         push!(structured_effects, effect_k)
     end
-    
+
     return (structured=structured_effects, noisy=structured_effects)
 end

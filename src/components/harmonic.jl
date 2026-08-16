@@ -6,7 +6,7 @@ sine and cosine waves. This component can model one or more harmonics, each with
 own amplitude, phase, and potentially its own period.
 
 # Version
-v1.3.1 (2026-08-12)
+v1.3.3 (2026-08-14)
 
 # Mathematical Summary
 The component models a function \$f(t)\$ as a sum of sinusoids. It supports two
@@ -91,9 +91,10 @@ end
 
 MODEL_TO_STRUCTURE_MAP[:harmonic] = :temporal
 
-function get_datastructures!(
-    m_type::Type{<:Harmonic}, M::Dict, mod_data::Dict
-)::Bool
+function get_precomputes(
+    m::Harmonic, M::NamedTuple, mod_data::Dict
+)::NamedTuple
+    # Validate that a seasonal index variable is provided.
     variables = mod_data[:variables]
     if isempty(variables)
         error(
@@ -102,26 +103,21 @@ function get_datastructures!(
         )
     end
 
+    # Extract the seasonal index variable from the data.
     u_var_sym = Symbol(variables[1])
-    if !hasproperty(M[:data], u_var_sym)
+    if !hasproperty(M.data, u_var_sym)
         error(
             "Seasonal index variable ':$u_var_sym' for Harmonic model not found " *
             "in data."
         )
     end
     
-    M[:u_idx] = M[:data][!, u_var_sym]
-    M[:u_N] = length(unique(M[:u_idx]))
-    M[:u_idx_var] = u_var_sym
-    
-    return true
-end
+    u_idx = M.data[!, u_var_sym]
+    u_N = length(unique(u_idx))
+    u_idx_var = u_var_sym # Store the symbol for the variable name
 
-function get_precomputes(
-    m::Harmonic, M::NamedTuple, mod_data::Dict
-)::NamedTuple
-    u_coords = collect(1.0:M.u_N)
-    return (u_coords=u_coords,)
+    u_coords = collect(1.0:u_N) # Generate coordinates for the unique levels.
+    return (u_coords=u_coords, u_idx=u_idx, u_N=u_N, u_idx_var=u_idx_var)
 end
 
 function get_priors(
@@ -152,6 +148,7 @@ function get_priors(
         push!(priors, "$(p_names.period) ~ filldist($(period_prior_str), $(m.nharmonics))")
     end
 
+    # Prior for the innovations (raw coefficients)
     return join(priors, "\n    ")
 end
 
@@ -160,7 +157,7 @@ function get_updates(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    u_coords_access = "spec_registry[:$(spec.key)].hyper.u_coords"
+    u_coords_access = "spec_registry[:$(spec.key)].hyper.u_coords" # Access pre-computed coordinates
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
 
     period_access_code = if m.period isa Real
@@ -177,37 +174,39 @@ function get_updates(
 
     loop_body = ""
     if m.method == :twocoefficient
-        loop_body = """
-            b_cos = $(m.nharmonics > 1 ? "$(p_names.beta_cos)[k]" : string(p_names.beta_cos))
-            b_sin = $(m.nharmonics > 1 ? "$(p_names.beta_sin)[k]" : string(p_names.beta_sin))
-            period_val = $(period_access_code)
+        loop_body = """ # Use local for variables within the let block
+            local b_cos = $(m.nharmonics > 1 ? "$(p_names.beta_cos)[k]" : p_names.beta_cos)
+            local b_sin = $(m.nharmonics > 1 ? "$(p_names.beta_sin)[k]" : p_names.beta_sin)
+            local period_val = $(period_access_code)
             
-            angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
-            $(p_names.latent) .+= b_cos .* cos.(angle) .+ b_sin .* sin.(angle)
+            local angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
+            $(p_names.latent) .+= b_cos .* cos.(angle) .+ b_sin .* sin.(angle) # Accumulate effect
         """
     else # :ampphase
-        loop_body = """
-            amp = $(m.nharmonics > 1 ? "$(p_names.amplitude)[k]" : string(p_names.amplitude))
-            phase = $(m.nharmonics > 1 ? "$(p_names.phase)[k]" : string(p_names.phase))
-            period_val = $(period_access_code)
+        loop_body = """ # Use local for variables within the let block
+            local amp = $(m.nharmonics > 1 ? "$(p_names.amplitude)[k]" : p_names.amplitude)
+            local phase = $(m.nharmonics > 1 ? "$(p_names.phase)[k]" : p_names.phase)
+            local period_val = $(period_access_code)
             
-            angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
-            $(p_names.latent) .+= amp .* cos.(angle .+ (2 * pi * phase))
+            local angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
+            $(p_names.latent) .+= amp .* cos.(angle .+ (2 * pi * phase)) # Accumulate effect
         """
     end
 
     # Initialize latent field with a type inferred from a sampled parameter.
     init_param = if m.method == :twocoefficient; p_names.beta_cos; else; p_names.amplitude; end
-
+    
     return """
         # --- Harmonic Component: $(spec.key) ($(m.method)) ---
         let
-            T_num = eltype($(init_param))
-            $(p_names.latent) = zeros(T_num, M.u_N)
+            local T_num = eltype($(init_param)) # Promote numeric type for AD compatibility
+            local u_N_val = spec_registry[:$(spec.key)].hyper.u_N # Access pre-computed u_N
+            local u_idx_val = spec_registry[:$(spec.key)].hyper.u_idx # Access pre-computed u_idx
+            $(p_names.latent) = zeros(T_num, u_N_val) # Initialize latent field
             for k in 1:$(m.nharmonics)
                 $(loop_body)
             end
-            $(eta_target) .+= view($(p_names.latent), M.u_idx)
+            $(eta_target) .+= view($(p_names.latent), u_idx_val) # Add to linear predictor
         end
     """
 end
@@ -216,17 +215,20 @@ function get_effects(
     m::Harmonic, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    u_coords = spec.hyper.u_coords
-    u_idx_full = isnothing(PS) ? M.u_idx : vcat(M.u_idx, PS.u_idx)
+    structured_effects = Vector{Matrix{Float64}}() # Initialize container for effects
+    hyper = spec.hyper # Access pre-computed data from spec.hyper
+    u_coords = hyper.u_coords # Coordinates for the harmonic basis
+    u_idx_full = isnothing(PS) ? hyper.u_idx : vcat(hyper.u_idx, PS.u_idx) # Full index for train + prediction
     is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k_outcome in 1:outcomes_N
         reconstructed_effects_k = zeros(Float64, M.u_N, n_samples)
         
-        period_name = _find_parameter(p_names_vec, string(spec.key), "period", k_outcome, is_multivariate_model)
-        period_samples = if m.period isa Real
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome) # Generate outcome-specific names
+        period_name = _find_parameter(p_names_vec, string(p_names_k.period), k_outcome, is_multivariate_model)
+        
+        period_samples = if m.period isa Real # If period is a fixed real value
             fill(m.period, n_samples, m.nharmonics)
         elseif m.period isa Vector{<:Real}
             repeat(m.period', n_samples, 1)
@@ -241,37 +243,47 @@ function get_effects(
         end
 
         for i in 1:n_samples
-            sample_effect = zeros(M.u_N)
+            sample_effect = zeros(hyper.u_N) # Initialize effect for current sample
             for k_harmonic in 1:m.nharmonics
                 period_ik = m.period isa Vector ? period_samples[i, k_harmonic] : period_samples[i]
                 angle = (2 * pi * k_harmonic / period_ik) .* u_coords
                 
                 if m.method == :twocoefficient
-                    b_cos_name = _find_parameter(p_names_vec, string(spec.key), "beta_cos", k_outcome, is_multivariate_model)
-                    b_sin_name = _find_parameter(p_names_vec, string(spec.key), "beta_sin", k_outcome, is_multivariate_model)
-                    if isempty(b_cos_name) || isempty(b_sin_name); continue; end
+                    b_cos_name = _find_parameter(p_names_vec, string(p_names_k.beta_cos), k_outcome, is_multivariate_model)
+                    b_sin_name = _find_parameter(p_names_vec, string(p_names_k.beta_sin), k_outcome, is_multivariate_model)
+                    if isempty(b_cos_name) || isempty(b_sin_name)
+                        @warn "beta_cos or beta_sin parameters for Harmonic component $(spec.key) (outcome $k_outcome) not found. Skipping reconstruction for this sample."
+                        continue
+                    end
                     
+                    # Extract samples for current harmonic
                     b_cos_samps = get_params_vector(chain, b_cos_name, m.nharmonics)
                     b_sin_samps = get_params_vector(chain, b_sin_name, m.nharmonics)
                     b_cos_ik = m.nharmonics > 1 ? b_cos_samps[i, k_harmonic] : b_cos_samps[i]
                     b_sin_ik = m.nharmonics > 1 ? b_sin_samps[i, k_harmonic] : b_sin_samps[i]
-                    sample_effect .+= b_cos_ik .* cos.(angle) .+ b_sin_ik .* sin.(angle)
+                    
+                    sample_effect .+= b_cos_ik .* cos.(angle) .+ b_sin_ik .* sin.(angle) # Accumulate effect
                 else # :ampphase
-                    amp_name = _find_parameter(p_names_vec, string(spec.key), "amplitude", k_outcome, is_multivariate_model)
-                    phase_name = _find_parameter(p_names_vec, string(spec.key), "phase", k_outcome, is_multivariate_model)
-                    if isempty(amp_name) || isempty(phase_name); continue; end
+                    amp_name = _find_parameter(p_names_vec, string(p_names_k.amplitude), k_outcome, is_multivariate_model)
+                    phase_name = _find_parameter(p_names_vec, string(p_names_k.phase), k_outcome, is_multivariate_model)
+                    if isempty(amp_name) || isempty(phase_name)
+                        @warn "amplitude or phase parameters for Harmonic component $(spec.key) (outcome $k_outcome) not found. Skipping reconstruction for this sample."
+                        continue
+                    end
 
+                    # Extract samples for current harmonic
                     amp_samps = get_params_vector(chain, amp_name, m.nharmonics)
                     phase_samps = get_params_vector(chain, phase_name, m.nharmonics)
                     amp_ik = m.nharmonics > 1 ? amp_samps[i, k_harmonic] : amp_samps[i]
                     phase_ik = m.nharmonics > 1 ? phase_samps[i, k_harmonic] : phase_samps[i]
-                    sample_effect .+= amp_ik .* cos.(angle .+ (2 * pi * phase_ik))
+                    
+                    sample_effect .+= amp_ik .* cos.(angle .+ (2 * pi * phase_ik)) # Accumulate effect
                 end
             end
             reconstructed_effects_k[:, i] = sample_effect
-        end
+        end # End of samples loop
 
-        indexed_effects = reconstructed_effects_k[u_idx_full, :]
+        indexed_effects = reconstructed_effects_k[u_idx_full, :] # Index to full observation set
         push!(structured_effects, indexed_effects)
     end
 

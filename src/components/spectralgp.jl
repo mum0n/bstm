@@ -6,7 +6,7 @@ leverages the Fast Fourier Transform (FFT) to efficiently model stationary
 covariance structures, making it highly scalable for data on regular grids.
 
 # Version
-v1.2.0 (2026-08-11)
+v1.2.1 (2026-08-14)
 
 # Mathematical Summary
 This component models a latent field \$f(s)\$ by defining its properties in the
@@ -64,18 +64,19 @@ COMPONENT_CONSTRUCTORS[:spectral_gp] = (p, params) -> SpectralGP(
 )
 MODEL_TO_STRUCTURE_MAP[:spectral_gp] = :smooth
 
-function get_datastructures!(m_type::Type{<:SpectralGP}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::SpectralGP, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
     if isempty(variables)
         error("SpectralGP model requires coordinate variables.")
     end
-    coords = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-    mod_data[:params][:coords] = coords
-    return true
-end
 
-function get_precomputes(m::SpectralGP, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = mod_data[:params][:coords]
+    for var_sym in variables
+        if !hasproperty(M.data, Symbol(var_sym))
+            error("Coordinate variable ':$var_sym' for SpectralGP model not found in data.")
+        end
+    end
+
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
     res = m.resolution
     n_dims = size(coords, 2)
 
@@ -107,6 +108,7 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    key = spec.key
     priors = String[]
 
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
@@ -119,7 +121,7 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(_distribution_to_string(m.lengthscale))")
     end
     
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
@@ -167,11 +169,10 @@ function get_updates(
 end
 
 function get_effects(
-    m::SpectralGP, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SpectralGP, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
     hyper = spec.hyper
     res = hyper.resolution
@@ -184,37 +185,41 @@ function get_effects(
     else
         hyper.coords
     end
+    N_total_eff = size(coords_full, 1)
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        ls_name = _find_parameter(p_names_vec, string(spec.key), "ls", k, is_multivariate_model)
-        nu_name = _find_parameter(p_names_vec, string(spec.key), "nu", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
+        ls_name = _find_parameter(p_names_vec, v.ls, k, is_multivariate_model)
+        nu_name = _find_parameter(p_names_vec, v.nu, k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(nu_name) || isempty(innovations_name)
             @warn "Parameters for SpectralGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            push!(structured_effects, zeros(Float64, N_total_eff, n_samples))
             continue
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_samples = get_params_vector(chain, ls_name, m.lengthscale isa Vector ? n_dims : 1)
+        ls_dim = m.lengthscale isa Vector ? n_dims : 1
+        ls_samples = get_params_vector(chain, ls_name, ls_dim)
         nu_samples = get_params_vector(chain, nu_name, 1)[:, 1]
         innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
-        effect_k = zeros(Float64, N_total, n_samples)
+        effect_k = zeros(Float64, N_total_eff, n_samples)
 
         for i in 1:n_samples
+            current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
             S_w = anisotropic_matern_spectral_density(
                 hyper.freq_grids,
                 sigma_samples[i],
-                ls_samples[i, :],
+                current_ls,
                 nu_samples[i],
                 n_dims
             )
             
             innov_reshaped = reshape(innovations_samples[i, :], fill(res, n_dims)...)
-            f_tilde_complex = complex.(innov_reshaped) # Convert to complex numbers
+            f_tilde_complex = complex.(innov_reshaped)
             f_tilde_scaled = f_tilde_complex .* sqrt.(S_w)
             
             latent_field_grid = real.(ifft(f_tilde_scaled)) .* (res^(n_dims/2))

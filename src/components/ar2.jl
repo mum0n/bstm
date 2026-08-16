@@ -5,7 +5,7 @@ A component model for a second-order autoregressive (AR2) process, fundamental f
 modeling time series data with serial correlation and pseudo-periodic behavior.
 
 # Version
-v1.2.0 (2026-08-11)
+v1.2.4 (2026-08-15)
 
 # Mathematical Summary
 The AR2 process models the value of a latent field \$\\phi_t\$ at time \$t\$ as a linear
@@ -32,7 +32,7 @@ improving MCMC efficiency and stability.
 
 # Computational Methods
 This component supports multiple numerical methods for temporal evolution,
-controlled by the `method` parameter in the `random()` call:
+controlled by the `random()` call:
 1.  **:statespace** (Default, AD-friendly): Implemented using a numerically stable
     state-space formulation. This is the recommended method for most applications.
 2.  **:centered** (Didactic, Not AD-friendly): Explicitly constructs the dense
@@ -60,6 +60,9 @@ controlled by the `method` parameter in the `random()` call:
 - `sigma_<key>`: The standard deviation of the AR2 innovations.
 - `innovations_<key>`: The latent standard normal innovations driving the process (for `:statespace`).
 - `latent_<key>`: The latent field (for `:centered`).
+
+# Key References
+- Hamilton, J. D. (1994). *Time Series Analysis*. Princeton University Press.
 """
 struct AR2 <: ComponentModel
     unconstrained_rho1::Distribution
@@ -77,26 +80,13 @@ COMPONENT_CONSTRUCTORS[:ar2] = (p, params) -> AR2(
 )
 MODEL_TO_STRUCTURE_MAP[:ar2] = :temporal
 
-function get_datastructures!(m_type::Type{<:AR2}, M::Dict, mod_data::Dict)::Bool
-    variables = mod_data[:variables]
-    if isempty(variables)
-        error("The AR2 model requires a time index variable, e.g., `random(year, model=:ar2)`.")
-    end
-    t_var_sym = Symbol(variables[1])
-    if !hasproperty(M[:data], t_var_sym)
-        error("Time index variable ':$t_var_sym' for AR2 model not found in data.")
-    end
-    
-    tu_meta = assign_time_units(M[:data][!, t_var_sym])
-    M[:t_idx] = tu_meta.idx
-    M[:t_N] = tu_meta.N_cat
-    M[:t_idx_var] = t_var_sym
-    
-    return true
-end
-
 function get_precomputes(m::AR2, M::NamedTuple, mod_data::Dict)::NamedTuple
-    return (n_latent=M.t_N,)
+    t_N = get(M, :t_N, 0)
+    if t_N == 0
+        @warn "Could not determine number of time steps for AR2 component " *
+              "'$(mod_data[:key])'. The component will have no effect."
+    end
+    return (n_latent=t_N,)
 end
 
 """
@@ -113,7 +103,8 @@ function _ar2_covariance_matrix(rho1, rho2, sigma, n, noise)
     end
 
     var_innov = sigma^2
-    gamma_0 = var_innov * (one(T_num) - rho2) / ((one(T_num) + rho2) * ((one(T_num) - rho2)^2 - rho1^2) + T_num(noise))
+    gamma_0 = var_innov * (one(T_num) - rho2) / 
+              ((one(T_num) + rho2) * ((one(T_num) - rho2)^2 - rho1^2) + T_num(noise))
     gamma_1 = (rho1 / (one(T_num) - rho2)) * gamma_0
 
     C = Matrix{T_num}(undef, n, n)
@@ -135,8 +126,12 @@ end
 
 Computes the state-space evolution of a stationary AR(2) process.
 """
-function ar2_statespace(rho1, rho2, sigma, innovations::AbstractVector, n_latent::Int, noise)
-    T_num = promote_type(typeof(rho1), typeof(rho2), typeof(sigma), eltype(innovations), typeof(noise))
+function ar2_statespace(
+    rho1, rho2, sigma, innovations::AbstractVector, n_latent::Int, noise
+)
+    T_num = promote_type(
+        typeof(rho1), typeof(rho2), typeof(sigma), eltype(innovations), typeof(noise)
+    )
     latent = Vector{T_num}(undef, n_latent)
     if n_latent == 0
         return latent
@@ -147,7 +142,8 @@ function ar2_statespace(rho1, rho2, sigma, innovations::AbstractVector, n_latent
     end
 
     var_innov = sigma^2
-    gamma_0 = var_innov * (one(T_num) - rho2) / ((one(T_num) + rho2) * ((one(T_num) - rho2)^2 - rho1^2) + T_num(noise))
+    gamma_0 = var_innov * (one(T_num) - rho2) / 
+              ((one(T_num) + rho2) * ((one(T_num) - rho2)^2 - rho1^2) + T_num(noise))
     gamma_1 = (rho1 / (one(T_num) - rho2)) * gamma_0
 
     cov_12 = [gamma_0 gamma_1; gamma_1 gamma_0]
@@ -186,15 +182,10 @@ function get_priors(
 
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
         push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-        
-        unconstrained_rho1_name = "unconstrained_rho1_$(spec.key)"
-        unconstrained_rho2_name = "unconstrained_rho2_$(spec.key)"
-        if is_multivariate && !is_shared
-            unconstrained_rho1_name *= "_$(outcome_idx)"
-            unconstrained_rho2_name *= "_$(outcome_idx)"
-        end
-        push!(priors_acc, "$(unconstrained_rho1_name) ~ $(_distribution_to_string(m.unconstrained_rho1))")
-        push!(priors_acc, "$(unconstrained_rho2_name) ~ $(_distribution_to_string(m.unconstrained_rho2))")
+        push!(priors_acc, "$(p_names.unconstrained_rho1) ~ " *
+                          "$(_distribution_to_string(m.unconstrained_rho1))")
+        push!(priors_acc, "$(p_names.unconstrained_rho2) ~ " *
+                          "$(_distribution_to_string(m.unconstrained_rho2))")
     end
 
     if m.method == :statespace
@@ -220,35 +211,30 @@ function get_updates(
     index_var = "t_idx"
     n_latent = spec.hyper.n_latent
 
-    unconstrained_rho1_name = "unconstrained_rho1_$(spec.key)"
-    unconstrained_rho2_name = "unconstrained_rho2_$(spec.key)"
-    is_multivariate = arch == "multivariate"
-    is_shared = get(spec.params, :shared, false)
-    if is_multivariate && !is_shared
-        unconstrained_rho1_name *= "_$(outcome_idx)"
-        unconstrained_rho2_name *= "_$(outcome_idx)"
-    end
-
     statespace_code = """
         # --- AR2 Component (State-Space, Stationarity-Enforced): $(spec.key) ---
-        pi1 = tanh($(unconstrained_rho1_name))
-        pi2 = tanh($(unconstrained_rho2_name))
+        pi1 = tanh($(p_names.unconstrained_rho1))
+        pi2 = tanh($(p_names.unconstrained_rho2))
         rho1 = pi1 * (1 - pi2)
         rho2 = pi2
         
-        latent_field = ar2_statespace(rho1, rho2, $(p_names.sigma), $(p_names.innovations), $(n_latent), M.noise)
+        latent_field = ar2_statespace(
+            rho1, rho2, $(p_names.sigma), $(p_names.innovations), $(n_latent), M.noise
+        )
         $(eta_target) .+= view(latent_field, M.$(index_var))
     """
 
     centered_code = """
         # --- AR2 Component (Centered, Didactic): $(spec.key) ---
-        pi1 = tanh($(unconstrained_rho1_name))
-        pi2 = tanh($(unconstrained_rho2_name))
+        pi1 = tanh($(p_names.unconstrained_rho1))
+        pi2 = tanh($(p_names.unconstrained_rho2))
         rho1 = pi1 * (1 - pi2)
         rho2 = pi2
         
         let
-            K = _ar2_covariance_matrix(rho1, rho2, $(p_names.sigma), $(n_latent), M.noise)
+            K = _ar2_covariance_matrix(
+                rho1, rho2, $(p_names.sigma), $(n_latent), M.noise
+            )
             $(p_names.latent) ~ MvNormal(zeros(T, $(n_latent)), Symmetric(K))
             $(eta_target) .+= view($(p_names.latent), M.$(index_var))
         end
@@ -259,23 +245,23 @@ function get_updates(
     elseif m.method == :centered
         return centered_code
     else
-        error("Unsupported method '$(m.method)' for AR2 component. Use `:statespace` or `:centered`.")
+        error("Unsupported method '$(m.method)' for AR2 component. Use `:statespace` " *
+              "or `:centered`.")
     end
 end
 
 """
-    get_effects(m::AR2, chain, M::NamedTuple, n_samples, outcomes_N, spec, PS, N_total)::NamedTuple
+    get_effects(m::AR2, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
 
 Reconstructs the `AR2` component's effect from posterior samples.
 """
 function get_effects(
-    m::AR2, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::AR2, chain::Chains, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
+    N_total::Int, is_multivariate_model::Bool
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     noise_val = get(M, :noise, 1e-6)
-    p_names_vec = string.(FlexiChains.parameters(chain))
-    is_multivariate_model = M.model_arch == "multivariate"
     
     t_idx_full = if !isnothing(PS) && haskey(PS, :t_idx)
         vcat(M.t_idx, PS.t_idx)
@@ -285,48 +271,66 @@ function get_effects(
     t_N_full = maximum(t_idx_full)
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        unconstrained_rho1_name = _find_parameter(p_names_vec, string(spec.key), "unconstrained_rho1", k, is_multivariate_model)
-        unconstrained_rho2_name = _find_parameter(p_names_vec, string(spec.key), "unconstrained_rho2", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
-        latent_name = _find_parameter(p_names_vec, string(spec.key), "latent", k, is_multivariate_model)
+        sigma_name = _find_parameter(
+            p_names, string(p_names_k.sigma), k, is_multivariate_model
+        )
+        rho1_name = _find_parameter(
+            p_names, string(p_names_k.unconstrained_rho1), k, is_multivariate_model
+        )
+        rho2_name = _find_parameter(
+            p_names, string(p_names_k.unconstrained_rho2), k, is_multivariate_model
+        )
+        innov_name = _find_parameter(
+            p_names, string(p_names_k.innovations), k, is_multivariate_model
+        )
+        latent_name = _find_parameter(
+            p_names, string(p_names_k.latent), k, is_multivariate_model
+        )
 
-        if isempty(sigma_name) || isempty(unconstrained_rho1_name) || isempty(unconstrained_rho2_name) ||
-           (m.method == :statespace && isempty(innovations_name)) ||
+        if isempty(sigma_name) || isempty(rho1_name) || isempty(rho2_name) ||
+           (m.method == :statespace && isempty(innov_name)) ||
            (m.method == :centered && isempty(latent_name))
-            @warn "Parameters for AR2 component $(spec.key) (outcome $k, method $(m.method)) not found. Returning zero-matrix."
+            @warn "Parameters for AR2 component $(spec.key) (outcome $k, " *
+                  "method $(m.method)) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        unconstrained_rho1_samples = get_params_vector(chain, unconstrained_rho1_name, 1)[:, 1]
-        unconstrained_rho2_samples = get_params_vector(chain, unconstrained_rho2_name, 1)[:, 1]
+        rho1_unc_samples = get_params_vector(chain, rho1_name, 1)[:, 1]
+        rho2_unc_samples = get_params_vector(chain, rho2_name, 1)[:, 1]
         
-        pi1_samples = tanh.(unconstrained_rho1_samples)
-        pi2_samples = tanh.(unconstrained_rho2_samples)
+        pi1_samples = tanh.(rho1_unc_samples)
+        pi2_samples = tanh.(rho2_unc_samples)
         rho1_samples = pi1_samples .* (1 .- pi2_samples)
         rho2_samples = pi2_samples
         
         latent_field_samples = zeros(Float64, t_N_full, n_samples)
         
         if m.method == :statespace
-            innovations_samples_train = get_params_vector(chain, innovations_name, M.t_N)
+            innov_samples = get_params_matrix(chain, innov_name, M.t_N)
             
             for j in 1:n_samples
-                latent_field_train = ar2_statespace(rho1_samples[j], rho2_samples[j], sigma_samples[j], innovations_samples_train[j, :], M.t_N, noise_val)
+                latent_field_train = ar2_statespace(
+                    rho1_samples[j], rho2_samples[j], sigma_samples[j],
+                    innov_samples[j, :], M.t_N, noise_val
+                )
                 latent_field_samples[1:M.t_N, j] = latent_field_train
             end
         elseif m.method == :centered
-            latent_samples_train = get_params_vector(chain, latent_name, M.t_N)
-            latent_field_samples[1:M.t_N, :] = latent_samples_train'
+            latent_samples = get_params_matrix(chain, latent_name, M.t_N)
+            latent_field_samples[1:M.t_N, :] = latent_samples'
         end
         
         if t_N_full > M.t_N
             for j in 1:n_samples
                 for t in (M.t_N + 1):t_N_full
-                    latent_field_samples[t, j] = rho1_samples[j] * latent_field_samples[t-1, j] + rho2_samples[j] * latent_field_samples[t-2, j] + randn() * sigma_samples[j]
+                    latent_field_samples[t, j] = 
+                        rho1_samples[j] * latent_field_samples[t-1, j] + 
+                        rho2_samples[j] * latent_field_samples[t-2, j] + 
+                        randn() * sigma_samples[j]
                 end
             end
         end

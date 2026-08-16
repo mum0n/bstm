@@ -7,11 +7,14 @@ format: html
 
 ## 1. Introduction
 
-The `bstm` framework provides a composable, formula-based interface for Bayesian spatiotemporal modeling in Julia. It is designed to address the challenge of building complex models by separating the observation likelihood from the specification of the latent process. This decoupling allows for flexible construction of models that can include spatial, temporal, and mechanistic components in an additive and extensible manner.
+The `bstm` framework provides a composable, formula-based interface for Bayesian spatiotemporal modeling in Julia. It is designed to address the challenge of building complex models by separating the observation likelihood from the specification of the latent process. This decoupling allows for flexible construction of models that can include spatial, temporal, and mechanistic components in an additive and extensible manner. It is a Julia library built on the Turing.jl probabilistic programming framework and many, many other Julia libraries and many more scientists. This work really stands upon their giant shoulders. It provides a high-level, formula-based interface/front-end inspired by R's `brms` and `lme4` to simplify the specification of complex hierarchical models. The framework is designed for composability, allowing users to combine spatial, temporal, and mechanistic components to analyze complex datasets, particularly in fields like ecology and epidemiology. 
+
+`bstm` was designed to pursue my research interests and make my work-life simpler, especially as it often takes more time and effort to post-process data than actually set up the model. It is built on the strength and insights of many people and the strength and composability of Julia and Turing, in particular. It can easily be extended by others for their own purposes and provided as is, warts and all. Full disclosure: I have made heavy use of AI LLMs to restructure and expand the code, especially the crazy regex's and provide coherent descriptions and math, etc. Any errors are, of course, my own. Check your results with simulated data where possible.
+
 
 ## 2. The Formula Interface
 
-The framework uses a formula interface inspired by R's `lme4` and `brms`, but with specific modules for spatiotemporal components. The model is defined with the observation model on the left-hand side (LHS) and the latent process model on the right-hand side (RHS). The `@bstm` macro enables an unquoted formula syntax.
+The framework uses a formula interface inspired by R's `lme4` and `brms`, but with specific modules for  various classes of components. The model is defined with the observation model on the left-hand side (LHS) with the 'likelihood()' and the process models defined within the modules on the right-hand side (RHS). The `@bstm` macro enables an unquoted formula syntax.
 
 ### 2.1. Basic Structure
 
@@ -19,7 +22,11 @@ The general structure of a `bstm` model call is:
 
 ```julia
 m = @bstm(
-    likelihood(outcome_var, family=poisson, ...) ~ intercept() + fixed_effects + modules(...),
+    likelihood(outcome_variable, family=poisson, ...) ~ 
+    intercept() + 
+    fixed(...) + 
+    random(...) + 
+    other_modules(...),
     data_frame,
     keyword_arguments...
 )
@@ -29,9 +36,10 @@ Any keyword arguments provided after the `data_frame` are passed into the model'
 
 *   **`verbose=false`**: Suppresses the printing of the dynamically generated model code and the results of the automatic prior predictive check that runs at instantiation. This is useful for cleaner output in scripts or notebooks. The default is `true`.
 
-### 2.2. The `likelihood()` Module
 
-The `likelihood()` module on the LHS specifies the observation model and its parameters.
+### 2.2. The `likelihood()` 
+
+The `likelihood()` on the LHS specifies the observation model and its parameters.
 
 | Parameter                      | Example Usage          | Description                                                                                                         |
 | :-------------------------------| :-----------------------| :--------------------------------------------------------------------------------------------------------------------|
@@ -64,7 +72,61 @@ The `likelihood()` module on the LHS specifies the observation model and its par
 | **Pareto**            | `:pareto`           | `exp(eta)`      | `shape (α)`: `extra_params ~ Exponential(1.0)`, `scale (θ)` from mean.                                          |
 | **Dirichlet**         | `:dirichlet`        | `exp(eta)`      | `concentration (α)`: `exp.(eta)`. For multivariate compositional data, specified as `likelihood(y1+y2+...)`.    |
 
-### 2.3. Illustrative Examples
+
+### 2.3 Modules
+
+The `bstm` formula interface is built around a series of modules, which are special function-like terms that define the components of the latent model.
+
+| Module        | Purpose                                   | Key Parameters                | Example Usage                                    |         |
+| :--------------| :------------------------------------------| :------------------------------| :-------------------------------------------------| ---------|
+| `intercept()` | Controls the global intercept.            | `prior`                       | `intercept(prior=Normal(0, 10))`                 |         |
+| `fixed()`     | Defines fixed-effect covariates.          | `prior`, `contrast`           | `fixed(urban, contrast=:effects)`                |         |
+| `random()`    | The main module for all random effects.   | `structure`, `model`, `prior` | `random(s_idx, model=:bym2)`                     |         |
+| `mixed()`     | Defines hierarchical random effects.      | `model`                       | `mixed(1 + cov                                   | group)` |
+| `dynamics()`  | Embeds mechanistic, process-based models. | `model`, `priors...`          | `dynamics(t, model=:logistic, K=Normal(100,10))` |         |
+| `eigen()`     | Performs Bayesian PCA.                    | `n_factors`                   | `eigen(y1, y2, y3, n_factors=1)`                 |         |
+| `nested()`    | Defines a multi-fidelity sub-model.       | `formula`, `data_source`      | `nested(proxy, formula=..., data_source=...)`    |         |
+| `sciml()`     | Integrates a SciML differential equation. | `model_func`, `solver`        | `sciml(t, model_func=f, ...)`                    |         |
+| `custom()`    | Injects user-defined Turing code.         | `code_fragment`               | `custom(code_fragment="...")`                    |         |
+
+
+### `intercept()` and `fixed()`
+
+These modules handle standard regression terms.
+
+*   **`intercept()`**: Explicitly includes a global intercept. While an intercept is included by default, this module allows you to specify a custom prior for it. Use `intercept(false)` or `-1` in the formula to remove it.
+*   **`fixed()`**: Marks a variable as a fixed effect. This is primarily used to assign a specific prior or to specify contrast coding for categorical variables (e.g., `contrast=:effects` for sum-to-zero contrasts). Bare terms in the formula (e.g., `... + cov1`) are treated as `fixed(cov1)` with default priors.
+
+### `random()`
+
+This is the primary module for specifying structured and unstructured random effects. Its behavior is determined by the `structure` and `model` arguments.
+
+#### `structure=:spatial`
+
+For modeling effects that vary over discrete areal units or continuous space.
+
+| `model` | Description | Key Parameters |
+| :--- | :--- | :--- |
+| `:bym2` | The standard for disease mapping, mixing structured and unstructured effects. | `rho`, `sigma` |
+| `:icar`, `:besag` | Intrinsic CAR models for strong spatial smoothing. | `sigma` |
+| `:leroux` | A proper CAR model that mixes spatial and IID effects. | `rho`, `sigma` |
+| `:sar` | Simultaneous Autoregressive model for spatial spill-over. | `rho`, `sigma` |
+| `:gp` | A full Gaussian Process for continuous coordinates. | `kernel`, `lengthscale`, `sigma` |
+| `:rff` | A scalable GP approximation using Random Fourier Features. | `n_features`, `lengthscale`, `sigma` |
+| `:spde` | A scalable GP based on a Stochastic Partial Differential Equation. | `kappa`, `sigma` |
+| `:localadaptive` | A non-stationary model with cluster-specific means. | `n_clusters`, `rho`, `sigma` |
+
+**Usage**:
+
+```julia
+# Areal data model (requires W matrix)
+random(area_id, structure=:spatial, model=:bym2)
+
+# Continuous data model
+random(lon, lat, structure=:spatial, model=:gp, kernel="matern32")
+```
+
+### 2.4 Illustrative Examples
 
 1.  **BYM2 Disease Mapping:**
     `@bstm(likelihood(y, family=poisson) ~ intercept() + random(s_idx, model=:bym2), data, W=W)`
@@ -138,14 +200,14 @@ For discrete domains, `bstm` implements GMRF structures where dependency is defi
 
 To address the $O(N^3)$ computational cost of kernel-based Gaussian Processes, the framework utilizes spectral projections and sparse approximations.
 
-| Component                             | `model=...`     | Description                                                                                                                            |
-| :--------------------------------------| :----------------| :---------------------------------------------------------------------------------------------------------------------------------------|
-| **Random Fourier Features (RFF)**     | `:rff`           | Maps input coordinates `x` into a randomized feature space to approximate the kernel, defined as $z(x) = \sqrt{2/M} \cos(Wx + b)$.      |
-| **SPDE (Stochastic Partial Diff. Eq.)** | `:spde`          | Represents the field as a solution to $(\kappa^2 - \Delta)^{\alpha/2} u = \mathcal{W}$, linking continuous Matérn processes to a discrete mesh. |
-| **Nystrom / FITC**                      | `:nystrom`, `:fitc` | Employs low-rank approximations using a set of `n_inducing` points to represent the global field.                                        |
-| **NetworkFlow**                         | `:networkflow`   | Captures directed dependencies across an adjacency matrix with `:upstream` or `:downstream` dispatch options.                            |
-| **Wavelet**                             | `:wavelet`       | Provides a multi-resolution analysis of a spatial or temporal field, decomposing it into components at different scales.             |
-| **LGCP (Log-Gaussian Cox Process)**     | `:lgcp`          | Models point patterns where the log-intensity is a Gaussian Process. Used with the `pointprocess()` module.                            |
+| Component                               | `model=...`         | Description                                                                                                                                     |
+| :----------------------------------------| :--------------------| :------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Random Fourier Features (RFF)**       | `:rff`              | Maps input coordinates `x` into a randomized feature space to approximate the kernel, defined as $z(x) = \sqrt{2/M} \cos(Wx + b)$.              |
+| **SPDE (Stochastic Partial Diff. Eq.)** | `:spde`             | Represents the field as a solution to $(\kappa^2 - \Delta)^{\alpha/2} u = \mathcal{W}$, linking continuous Matérn processes to a discrete mesh. |
+| **Nystrom / FITC**                      | `:nystrom`, `:fitc` | Employs low-rank approximations using a set of `n_inducing` points to represent the global field.                                               |
+| **NetworkFlow**                         | `:networkflow`      | Captures directed dependencies across an adjacency matrix with `:upstream` or `:downstream` dispatch options.                                   |
+| **Wavelet**                             | `:wavelet`          | Provides a multi-resolution analysis of a spatial or temporal field, decomposing it into components at different scales.                        |
+| **LGCP (Log-Gaussian Cox Process)**     | `:lgcp`             | Models point patterns where the log-intensity is a Gaussian Process. Used with the `pointprocess()` module.                                     |
 
 ### 4.3. Priors and Identifiability
 
@@ -217,7 +279,7 @@ You can control prior specification at three levels of precedence:
     );
     ```
 
-## 5. Architectural Paradigms
+## 5. Architectures
 
 ### 5.1. Univariate Architecture
 
@@ -317,7 +379,7 @@ m = @bstm(
 # The model will now estimate the posterior distributions for 'r' and 'K'.
 ```
 
-### 6.3. Multi-fidelity and Nested Models
+### 6.3. Multi-fidelity and Nested Models: 'nested()'
 
 The `nested()` module is a "supervisor" component for multi-fidelity modeling. It allows you to define a complete sub-model that is fit to a separate (often larger, lower-quality) dataset. The latent effect from this sub-model is then incorporated as a calibrated predictor into the main model, allowing the main model to "learn" from the proxy data. The `nested()` module accepts a full formula string, including a `likelihood()` block, which enables the specification of independent likelihoods for each fidelity level.
 
@@ -332,26 +394,12 @@ The `nested()` module is a "supervisor" component for multi-fidelity modeling. I
 )
 ```
 
-### 6.4. Bayesian Factor Analysis with `eigen()`
 
-The `eigen()` module implements a Bayesian Principal Component Analysis (PCA) to perform dimensionality reduction on a set of multivariate outcomes. It decomposes the input variables into a smaller set of orthogonal latent factors. The framework uses a Householder transformation to construct the orthonormal loadings matrix, ensuring numerical stability and efficient sampling.
-
-#### `eigen()` Module Reference
-
-| Keyword / Parameter | Example Usage              | Data Type      | Default            | Meaning & Assumptions                                                                                                                                                               |
-| :--------------------| :---------------------------| :---------------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `eigen()`           | `eigen(y1, y2, y3; ...)`   | Module         | N/A                | Defines a Bayesian PCA factor model. The variables listed (e.g., `y1, y2, y3`) are the multivariate outcomes to be decomposed.                                                      |
-| `n_factors`         | `n_factors=1`              | `Int`          | `1`                | The number of latent factors (principal components) to extract. This determines the dimensionality of the reduced latent space.                                                     |
-| `pca_sd`            | `pca_sd=Exponential(0.5)`  | `Distribution` | `Exponential(1.0)` | The prior for the standard deviations of the principal components (latent factors). These are the "eigenvalues" of the system, controlling the variance explained by each factor.   |
-| `pdef_sd`           | `pdef_sd=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviation of the residual (uniqueness) noise. This captures the variance in each observed variable that is *not* explained by the shared latent factors. |
-
-### 6.5. Handling Censored Covariates via Joint Modeling
+### 6.4. Handling Censored Covariates via Joint Modeling: `nested()`
 
 A censored covariate is a predictor variable for which the true value is not always known, but is instead confined to an interval (e.g., $x_{true} > c$). The statistically robust approach to this "errors-in-variables" problem is to treat the censored covariate as a latent variable and model it jointly with the primary outcome.
 
 The `bstm` framework facilitates this through the `nested()` module, which allows for the construction of a joint model in a single step. This approach simultaneously estimates the model for the censored covariate and the main outcome model, correctly propagating all sources of uncertainty. The `nested()` module accepts a full formula string, including a `likelihood()` block, which enables the specification of independent likelihoods for each fidelity level.
-
-#### Implementation with `nested()`
 
 In this setup, the `nested()` module defines a complete sub-model for the censored covariate. This sub-model has its own `likelihood()` block where the censoring bounds (`censor_lower`, `censor_upper`) are specified. The latent process estimated by this sub-model is then automatically incorporated as a predictor in the main model's linear predictor.
 
@@ -377,6 +425,20 @@ m = @bstm(
 # Sample the joint model to estimate all parameters simultaneously.
 joint_chain = sample(m, NUTS(), 1000)
 ```
+
+### 6.5. Bayesian Factor Analysis with `eigen()`
+
+The `eigen()` module implements a Bayesian Principal Component Analysis (PCA) to perform dimensionality reduction on a set of multivariate outcomes. It decomposes the input variables into a smaller set of orthogonal latent factors. The framework uses a Householder transformation to construct the orthonormal loadings matrix, ensuring numerical stability and efficient sampling.
+
+#### `eigen()` Module Reference
+
+| Keyword / Parameter | Example Usage              | Data Type      | Default            | Meaning & Assumptions                                                                                                                                                               |
+| :--------------------| :---------------------------| :---------------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `eigen()`           | `eigen(y1, y2, y3; ...)`   | Module         | N/A                | Defines a Bayesian PCA factor model. The variables listed (e.g., `y1, y2, y3`) are the multivariate outcomes to be decomposed.                                                      |
+| `n_factors`         | `n_factors=1`              | `Int`          | `1`                | The number of latent factors (principal components) to extract. This determines the dimensionality of the reduced latent space.                                                     |
+| `pca_sd`            | `pca_sd=Exponential(0.5)`  | `Distribution` | `Exponential(1.0)` | The prior for the standard deviations of the principal components (latent factors). These are the "eigenvalues" of the system, controlling the variance explained by each factor.   |
+| `pdef_sd`           | `pdef_sd=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviation of the residual (uniqueness) noise. This captures the variance in each observed variable that is *not* explained by the shared latent factors. |
+
 
 ## 7. Inference and Post-Processing
 

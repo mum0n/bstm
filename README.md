@@ -1,8 +1,11 @@
  
 # bstm: Bayesian Spatiotemporal Models in Julia
 
- 
-`bstm` is a Julia library for Bayesian spatiotemporal modeling, built on the Turing.jl probabilistic programming framework and many, many other Julia libraries. It provides a high-level, formula-based interface inspired by R's `brms` and `lme4` to simplify the specification of complex hierarchical models. The framework is designed for composability, allowing users to combine spatial, temporal, and mechanistic components to analyze complex datasets, particularly in fields like ecology and epidemiology.
+
+The `bstm` framework provides a composable, formula-based interface for Bayesian spatiotemporal modeling in Julia. It is designed to address the challenge of building complex models by separating the observation likelihood from the specification of the latent process. This decoupling allows for flexible construction of models that can include spatial, temporal, and mechanistic components in an additive and extensible manner. It is a Julia library built on the Turing.jl probabilistic programming framework and many, many other Julia libraries and many more scientists. This work really stands upon their giant shoulders. It provides a high-level, formula-based interface/front-end inspired by R's `brms` and `lme4` to simplify the specification of complex hierarchical models. The framework is designed for composability, allowing users to combine spatial, temporal, and mechanistic components to analyze complex datasets, particularly in fields like ecology and epidemiology. 
+
+`bstm` was designed to pursue my research interests and make my work-life simpler, especially as it often takes more time and effort to post-process data than actually set up the model. It is built on the strength and insights of many people and the strength and composability of Julia and Turing, in particular. It can easily be extended by others for their own purposes and provided as is, warts and all. Full disclosure: I have made heavy use of AI LLMs to restructure and expand the code, especially the crazy regex's and provide coherent descriptions and math, etc. Any errors are, of course, my own. Check your results with simulated data where possible.
+
 
 ## Key Features
 
@@ -53,10 +56,11 @@ This example demonstrates a standard spatiotemporal model using the Scottish Lip
 ```julia
 
 # Set a seed for reproducibility
+using Random
 Random.seed!(42)
 
 # 1. Load Data
-# The dataset includes cancer counts (y), population offsets (log_offset),
+# The dataset includes cancer counts (y), population offsets (log_offsets),
 # a covariate (X), and spatial/temporal indices.
 data_scot, _ = bstm_data() # Default is "scottish_lip"
 inp_df = data_scot.data
@@ -65,15 +69,15 @@ W = data_scot.au.W
 # 2. Define a Spatiotemporal Model
 # This model uses a BYM2 prior for spatial effects and an AR1 process for time.
 m = @bstm(
-    likelihood(y, family=poisson, log_offsets=log_offset) ~
+    likelihood(y, family=poisson, log_offsets=log_offsets) ~
         intercept() +
-        fixed(X) +
+        fixed(cov1) +
         random(s_idx, model=bym2) +
         random(year, model=ar1),
     inp_df,
     W = W,
     verbose = false # Suppress verbose output
-)
+); 
 
 # 3. Sample from the Posterior
 # For a real analysis, use a more robust sampler like NUTS and more samples.

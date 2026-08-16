@@ -8,7 +8,7 @@ two sum-to-zero constraints for identifiability. It produces a smoother field th
 an RW1 model.
 
 # Version
-v2.0.0 (2026-08-11)
+v2.0.1 (2026-08-14)
 
 # Mathematical Summary
 The RW2 model defines a latent temporal field \$\\phi\$ where the value at time \$t\$ is
@@ -63,33 +63,33 @@ COMPONENT_CONSTRUCTORS[:rw2] = (p, params) -> RW2(
 
 MODEL_TO_STRUCTURE_MAP[:rw2] = :temporal
 
-function get_datastructures!(m_type::Type{<:RW2}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::RW2, M::NamedTuple, mod_data::Dict)::NamedTuple
+    # Data validation moved from get_datastructures!
     variables = mod_data[:variables]
     if isempty(variables)
         error("The RW2 model requires a time index variable, e.g., `random(year, model=:rw2)`.")
     end
 
     time_var_sym = Symbol(variables[1])
-    if !hasproperty(M[:data], time_var_sym)
+    if !hasproperty(M.data, time_var_sym)
         error("Time index variable ':$time_var_sym' for RW2 model not found in data.")
     end
 
-    time_opts = Dict(:time_method => get(mod_data[:params], :time_method, "regular"))
-    tu_meta = assign_time_units(M[:data][!, time_var_sym]; time_opts...)
-    
-    M[:t_idx] = tu_meta.idx
-    M[:t_N] = tu_meta.N_cat
-    M[:t_idx_var] = time_var_sym
-    
-    return true
-end
-
-function get_precomputes(m::RW2, M::NamedTuple, mod_data::Dict)::NamedTuple
-    t_N = get(M, :t_N, 0)
-    if t_N == 0
-        @warn "Could not determine number of time steps for RW2 component " *
-              "'$(mod_data[:key])'. The component will have no effect."
+    # The processor is now responsible for creating t_idx and t_N.
+    # We just need to get t_N from the main config M.
+    t_N = get(M, :t_N, nothing)
+    if isnothing(t_N)
+        error(
+            "RW2 component '$(mod_data[:key])' failed: t_N not found in model " *
+            "configuration. This should have been set by the model processor."
+        )
     end
+    
+    if t_N == 0
+        @warn "Number of time steps for RW2 component '$(mod_data[:key])' is zero. " *
+              "The component will have no effect."
+    end
+
     template = build_structure_template(:rw2, t_N)
     
     F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
@@ -109,18 +109,17 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    n_latent = spec.hyper.n_latent
-    is_multivariate = (arch == "multivariate")
-    is_shared = get(spec.params, :shared, false)
-    is_first_outcome = (outcome_idx == 1 || isnothing(outcome_idx))
-
-    priors_acc = String[]
-    if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
-        push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    end
-    push!(priors_acc, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.innovations))") # Raw standard normal innovations
-    return join(priors_acc, "\n    ")
+    key = spec.key
+    sigma_prior_str = _distribution_to_string(m.sigma)
+    
+    return """
+        $(p_names.sigma) ~ $(sigma_prior_str)
+        $(p_names.innovations) ~ MvNormal(
+            zeros(T, spec_registry[:$(key)].hyper.n_latent), I
+        )
+    """
 end
+
 function get_updates(
     m::RW2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -128,27 +127,24 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
-    n_latent = spec.hyper.n_latent
 
     statespace_code = """
         # --- RW2 Component: $(key) (State-Space Method) ---
         let
-            innovations = $(p_names.innovations) # Raw standard normal innovations
-            # Infer the numeric type from the sampled innovations to ensure AD compatibility.
+            innovations = $(p_names.innovations)
             T_num = eltype(innovations)
-            latent_field_raw = Vector{T_num}(undef, $(n_latent))
+            n_latent = spec_registry[:$(key)].hyper.n_latent
+            latent_field_raw = Vector{T_num}(undef, n_latent)
             
-            if $(n_latent) > 0
-                latent_field_raw[1] = innovations[1]
-            end
-            if $(n_latent) > 1
-                latent_field_raw[2] = 2 * latent_field_raw[1] + innovations[2]
-            end
-            for t in 3:$(n_latent)
+            if n_latent > 0; latent_field_raw[1] = innovations[1]; end
+            if n_latent > 1; latent_field_raw[2] = 2 * latent_field_raw[1] + innovations[2]; end
+            for t in 3:n_latent
                 latent_field_raw[t] = 2 * latent_field_raw[t-1] - latent_field_raw[t-2] + innovations[t]
             end
-            if $(n_latent) > 0
-                Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            if n_latent > 0
+                Turing.@addlogprob! logpdf(
+                    Normal(0.0, 0.001 * n_latent), sum(latent_field_raw)
+                )
             end
             
             $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
@@ -160,7 +156,7 @@ function get_updates(
         # --- RW2 Component: $(key) (Spectral Method) ---
         let
             hyper = spec_registry[:$(key)].hyper
-            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise) # Scale by sigma and add jitter
+            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
             $(p_names.latent) = hyper.U * (diag_D .* $(p_names.innovations))
             $(eta_target) .+= view($(p_names.latent), M.t_idx)
@@ -171,8 +167,11 @@ function get_updates(
         # --- RW2 Component: $(key) (Cholesky Method, AD-Safe) ---
         let
             F = spec_registry[:$(key)].hyper.cholesky_factor
-            latent_field_raw = F.L' \\ $(p_names.innovations) # Solve for raw latent field
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            latent_field_raw = F.L' \\ $(p_names.innovations)
+            Turing.@addlogprob! logpdf(
+                Normal(0.0, 0.001 * spec_registry[:$(key)].hyper.n_latent), 
+                sum(latent_field_raw)
+            )
             $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
             $(eta_target) .+= view($(p_names.latent), M.t_idx)
         end
@@ -182,9 +181,12 @@ function get_updates(
         # --- RW2 Component: $(key) (Sparse Cholesky, Not AD-Safe) ---
         let
             Q = spec_registry[:$(key)].hyper.Q_template
-            F = cholesky(Symmetric(Q + M.noise * I)) # Cholesky factorization of the precision matrix
+            F = cholesky(Symmetric(Q + M.noise * I))
             latent_field_raw = F.L' \\ $(p_names.innovations)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            Turing.@addlogprob! logpdf(
+                Normal(0.0, 0.001 * spec_registry[:$(key)].hyper.n_latent), 
+                sum(latent_field_raw)
+            )
             $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
             $(eta_target) .+= view($(p_names.latent), M.t_idx)
         end
@@ -197,28 +199,30 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for RW2. Use :statespace, :spectral, :cholesky, or :cholesky_sparse."); end
 end
 
-
 function get_effects(
-    m::RW2, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::RW2, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_samples_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        innovations_samples_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
+        innovations_name = _find_parameter(
+            p_names_vec, v.innovations, k, is_multivariate_model
+        )
 
-        if isempty(sigma_samples_name) || isempty(innovations_samples_name)
-            @warn "Parameters for RW2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        if isempty(sigma_name) || isempty(innovations_name)
+            @warn "Parameters for RW2 component $(spec.key) (outcome $k) not found. " *
+                  "Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_samples_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_samples_name, n_latent)
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
 

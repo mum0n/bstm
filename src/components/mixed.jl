@@ -6,7 +6,7 @@ specified grouping variable. The correlation structure of the effects is determi
 by an inner `ComponentModel`.
 
 # Version
-v1.1.1 (2026-08-12)
+v1.1.2 (2026-08-14)
 
 # Mathematical Summary
 The `Mixed` component models effects that vary across the levels of a grouping
@@ -73,34 +73,6 @@ end
 
 MODEL_TO_STRUCTURE_MAP[:mixed] = :mixed
 
-function get_datastructures!(m_type::Type{<:Mixed}, M::Dict, mod_data::Dict)::Bool
-    params = mod_data[:params]
-    group_var = get(params, :group_var, nothing)
-
-    if isnothing(group_var)
-        error("Mixed is missing the grouping variable.")
-    end
-
-    if !hasproperty(M[:data], group_var)
-        error("Grouping variable ':$group_var' for Mixed not found in data.")
-    end
-
-    group_data = M[:data][!, group_var]
-    if !(group_data isa CategoricalArray)
-        group_data = categorical(group_data)
-    end
-    
-    unique_levels = levels(group_data)
-    n_cat = length(unique_levels)
-    
-    index_key = Symbol("mixed_idx_$(group_var)")
-    M[index_key] = levelcode.(group_data)
-    
-    params[:n_cat] = n_cat
-    
-    return true
-end
-
 function get_precomputes(m::Mixed, M::NamedTuple, mod_data::Dict)::NamedTuple
     n_cat = get(mod_data[:params], :n_cat, 0)
     if n_cat == 0
@@ -141,12 +113,11 @@ function get_priors(
         )
         return get_priors(m.model, inner_spec, arch, outcome_idx, M)
     else
-        # Removed explicit `T` from `zeros` for better AD compatibility.
         return """
         # Priors for Correlated Mixed Effects: $(spec.key)
         $(p_names.L_corr) ~ LKJCholesky($(n_terms), 1.0)
         $(p_names.sigma_effects) ~ filldist(Exponential(1.0), $(n_terms))
-        $(p_names.innovations) ~ MvNormal(zeros($(n_groups * n_terms)), I)
+        $(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros($(n_groups * n_terms)), I), :$(p_names.innovations))
         """
     end
 end
@@ -275,6 +246,15 @@ function get_updates(
     end
 end
 
+function _get_model_symbol(m_obj::ComponentModel)
+    for (sym, typ) in COMPONENT_TYPE_REGISTRY
+        if m_obj isa typ
+            return sym
+        end
+    end
+    return :unknown
+end
+
 function get_effects(
     m::Mixed, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
     spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
@@ -308,8 +288,9 @@ function get_effects(
     if n_terms == 1
         effects_per_outcome = Vector{Matrix{Float64}}()
         for k in 1:outcomes_N
-            sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+            sigma_name = _find_parameter(p_names_vec, string(p_names_k.sigma), k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k, is_multivariate_model)
 
             if isempty(sigma_name) || isempty(innovations_name)
                 @warn "Parameters for simple Mixed component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -342,9 +323,10 @@ function get_effects(
         end
 
         for k in 1:outcomes_N
-            l_corr_samples_name = _find_parameter(p_names_vec, string(spec.key), "L_corr", k, is_multivariate_model)
-            sigma_effects_samples_name = _find_parameter(p_names_vec, string(spec.key), "sigma_effects", k, is_multivariate_model)
-            innovations_samples_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+            l_corr_samples_name = _find_parameter(p_names_vec, string(p_names_k.L_corr), k, is_multivariate_model)
+            sigma_effects_samples_name = _find_parameter(p_names_vec, string(p_names_k.sigma_effects), k, is_multivariate_model)
+            innovations_samples_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k, is_multivariate_model)
 
             if isempty(l_corr_samples_name) || isempty(sigma_effects_samples_name) || isempty(innovations_samples_name)
                 @warn "Parameters for correlated Mixed component $(spec.key) (outcome $k) not found. Skipping."

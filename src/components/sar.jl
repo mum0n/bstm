@@ -7,7 +7,7 @@ its neighbors plus an independent innovation term, leading to a precision matrix
 the form `(I - ρW)'(I - ρW)`.
 
 # Version
-v1.1.1 (2026-08-12)
+v1.1.2 (2026-08-14)
 
 # Mathematical Summary
 The Simultaneous Autoregressive (SAR) model defines a spatial random effect
@@ -67,62 +67,38 @@ COMPONENT_CONSTRUCTORS[:sar] = (p, params) -> SAR(
 
 MODEL_TO_STRUCTURE_MAP[:sar] = :spatial
 
-function get_datastructures!(m_type::Type{<:SAR}, M::Dict, mod_data::Dict)::Bool
-    params = mod_data[:params]
-    variables = mod_data[:variables]
-
-    if haskey(params, :W)
-        w_val = params[:W]
-        if w_val isa Expr || w_val isa Symbol
-            calling_mod = get(M, :calling_module, Main)
-            try
-                M[:W] = Core.eval(calling_mod, w_val)
-            catch e
-                error("Could not evaluate `W` argument `$(w_val)` for SAR component. Error: $e")
-            end
-        else
-            M[:W] = w_val
-        end
+function get_precomputes(m::SAR, M::NamedTuple, mod_data::Dict)::NamedTuple
+    # Data validation moved from get_datastructures!
+    if !hasproperty(M, :W)
+        error("SAR model requires an adjacency matrix `W` to be provided via keyword.")
     end
 
-    if !haskey(M, :W)
-        error("SAR model requires an adjacency matrix `W` to be provided.")
-    end
-
-    if !isa(M[:W], AbstractMatrix) || isempty(M[:W])
+    if !isa(M.W, AbstractMatrix) || isempty(M.W)
         error("Provided `W` for SAR model is not a valid non-empty matrix.")
     end
 
-    M[:s_N] = size(M[:W], 1)
+    s_N = size(M.W, 1)
 
-    if isempty(variables)
-        M[:s_idx] = collect(1:M[:s_N])
-        @warn "Spatial index variable not provided for SAR. Assuming `s_idx = 1:s_N`."
-    else
-        s_var_sym = Symbol(variables[1])
-        if !hasproperty(M[:data], s_var_sym)
-            error("Spatial index variable ':$s_var_sym' for SAR model not found in data.")
-        end
-        M[:s_idx] = M[:data][!, s_var_sym]
+    # The processor is now responsible for creating s_idx.
+    if !hasproperty(M, :s_idx)
+        error(
+            "SAR component '$(mod_data[:key])' failed: s_idx not found in model " *
+            "configuration. This should have been set by the model processor."
+        )
     end
 
-    return true
-end
-
-function get_precomputes(m::SAR, M::NamedTuple, mod_data::Dict)::NamedTuple
-    n = M.s_N
     W = sparse(M.W)
-
     row_sums = sum(W, dims=2)
     non_zero_rows = findall(x -> x > 0, vec(row_sums))
     
-    W_std = spzeros(Float64, n, n)
+    W_std = spzeros(Float64, s_N, s_N)
     if !isempty(non_zero_rows)
-        D_inv = spdiagm(0 => 1.0 ./ row_sums[non_zero_rows])
+        D_inv_vals = 1.0 ./ row_sums[non_zero_rows]
+        D_inv = spdiagm(0 => vec(D_inv_vals))
         W_std[non_zero_rows, :] = D_inv * W[non_zero_rows, :]
     end
 
-    return (Q_template=W_std, n_latent=n)
+    return (Q_template=W_std, n_latent=s_N)
 end
 
 function get_priors(
@@ -130,7 +106,7 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    n_latent = spec.hyper.n_latent
+    key = spec.key
 
     rho_prior_str = _distribution_to_string(m.rho)
     sigma_prior_str = _distribution_to_string(m.sigma)
@@ -138,7 +114,9 @@ function get_priors(
     return """
         $(p_names.rho) ~ $(rho_prior_str)
         $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
+        $(p_names.innovations) ~ MvNormal(
+            zeros(T, spec_registry[:$(key)].hyper.n_latent), I
+        )
     """
 end
 
@@ -149,7 +127,6 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
-    n_latent = spec.hyper.n_latent
 
     common_code = """
         local W_std = spec_registry[:$(key)].hyper.Q_template
@@ -168,7 +145,7 @@ function get_updates(
             # The precision matrix Q_final must be converted to a dense Matrix
             # for the cholesky factorization to be AD-compatible. Add a small nugget
             # for numerical stability, especially with AD.
-            F = cholesky(Matrix(Q_final + I * 1e-9))
+            F = cholesky(Matrix(Q_final) + I * 1e-9)
             $(p_names.latent) = F.L' \\ $(p_names.innovations)
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
@@ -196,24 +173,27 @@ function get_updates(
 end
 
 function get_effects(
-    m::SAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SAR, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
     s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
     W_std = spec.hyper.Q_template
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        rho_name = _find_parameter(p_names_vec, string(spec.key), "rho", k, is_multivariate_model)
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        rho_name = _find_parameter(p_names_vec, v.rho, k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
+        innovations_name = _find_parameter(
+            p_names_vec, v.innovations, k, is_multivariate_model
+        )
 
         if isempty(rho_name) || isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for SAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            @warn "Parameters for SAR component $(spec.key) (outcome $k) not found. " *
+                  "Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
@@ -232,7 +212,7 @@ function get_effects(
             Q_final = Symmetric(Q_sar / (sigma_samples[i]^2) + noise * I)
             
             # Add a small nugget for numerical stability before factorization.
-            F = cholesky(Matrix(Q_final + I * 1e-9))
+            F = cholesky(Matrix(Q_final) + I * 1e-9)
             
             effect_k[:, i] = F.L' \ innovations_samples[i, :]
         end

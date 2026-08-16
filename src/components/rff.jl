@@ -7,7 +7,7 @@ the input coordinates into a randomized feature space. This transforms the GP in
 more scalable Bayesian linear regression problem.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.2.0 (2026-08-14)
 
 # Mathematical Summary
 The RFF method approximates a stationary kernel \$k(\\tau) = k(x - x')\$ by using
@@ -65,23 +65,6 @@ COMPONENT_CONSTRUCTORS[:rff] = (p, params) -> RFF(
 
 MODEL_TO_STRUCTURE_MAP[:rff] = :smooth
 
-function get_datastructures!(m_type::Type{<:RFF}, M::Dict, mod_data::Dict)::Bool
-    variables = mod_data[:variables]
-
-    if isempty(variables)
-        error("The RFF model requires coordinate variables, e.g., `random(x, y, model=:rff)`.")
-    end
-
-    for var_sym in variables
-        if !hasproperty(M[:data], Symbol(var_sym))
-            error("Coordinate variable ':$var_sym' for RFF model not found in data.")
-        end
-    end
-
-    mod_data[:params][:coords] = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-    return true
-end
-
 function _generate_rff_fixed_params(
     in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector},
     kernel_name::String
@@ -94,8 +77,12 @@ function _generate_rff_fixed_params(
         if lengthscale isa Real
             W .= rand(Normal(0, 1.0 / lengthscale), in_dims, n_features)
         else
-            if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
-            for d in 1:in_dims; W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features); end
+            if length(lengthscale) != in_dims
+                error("ARD lengthscale vector length mismatch.")
+            end
+            for d in 1:in_dims
+                W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features)
+            end
         end
     elseif occursin("matern", k_name)
         nu = if k_name == "matern12"; 0.5; elseif k_name == "matern32"; 1.5; else 2.5; end
@@ -103,8 +90,12 @@ function _generate_rff_fixed_params(
         if lengthscale isa Real
             W .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
         else
-            if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
-            for d in 1:in_dims; W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features); end
+            if length(lengthscale) != in_dims
+                error("ARD lengthscale vector length mismatch.")
+            end
+            for d in 1:in_dims
+                W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features)
+            end
         end
     else
         @warn "Kernel '$kernel_name' not recognized for RFF. Defaulting to SE."
@@ -114,11 +105,19 @@ function _generate_rff_fixed_params(
 end
 
 function get_precomputes(m::RFF, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = get(mod_data[:params], :coords, nothing)
-    if isnothing(coords)
-        error("RFF component precomputes failed: coordinates not found in module data.")
+    variables = mod_data[:variables]
+
+    if isempty(variables)
+        error("The RFF model requires coordinate variables, e.g., `random(x, y, model=:rff)`.")
     end
-    
+
+    for var_sym in variables
+        if !hasproperty(M.data, Symbol(var_sym))
+            error("Coordinate variable ':$var_sym' for RFF model not found in data.")
+        end
+    end
+
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
     in_dims = size(coords, 2)
     
     ls_prior = m.lengthscale
@@ -147,6 +146,7 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    key = spec.key
     
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
@@ -160,12 +160,12 @@ function get_priors(
     end
     
     if m.method == :adaptive
-        push!(priors, "$(p_names.W) ~ DynamicPPL.NamedDist(MvNormal(vec(spec.hyper.W_fixed), 0.1), :$(p_names.W))") # Prior for adaptive RFF weights
-        push!(priors, "$(p_names.b) ~ NamedDist(MvNormal(spec.hyper.b_fixed, 0.1), :$(p_names.b))") # Prior for adaptive RFF biases
+        push!(priors, "$(p_names.W) ~ DynamicPPL.NamedDist(MvNormal(vec(spec_registry[:$(key)].hyper.W_fixed), 0.1), :$(p_names.W))")
+        push!(priors, "$(p_names.b) ~ NamedDist(MvNormal(spec_registry[:$(key)].hyper.b_fixed, 0.1), :$(p_names.b))")
     end
 
     if m.method in [:fixed, :adaptive]
-        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
     end
 
     return join(priors, "\n    ")
@@ -226,8 +226,8 @@ function get_updates(
 end
 
 function get_effects(
-    m::RFF, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::RFF, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
@@ -242,11 +242,12 @@ function get_effects(
         hyper.coords
     end
 
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+
+        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
         if isempty(sigma_name)
             @warn "Sigma parameter for RFF component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
@@ -256,8 +257,8 @@ function get_effects(
 
         local W_samples, b_samples
         if m.method == :adaptive
-            W_name = _find_parameter(p_names_vec, string(spec.key), "W", k, is_multivariate_model)
-            b_name = _find_parameter(p_names_vec, string(spec.key), "b", k, is_multivariate_model)
+            W_name = _find_parameter(p_names_vec, v.W, k, is_multivariate_model)
+            b_name = _find_parameter(p_names_vec, v.b, k, is_multivariate_model)
             if isempty(W_name) || isempty(b_name)
                 @warn "Adaptive RFF parameters for component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
@@ -273,7 +274,7 @@ function get_effects(
         effect_k = zeros(Float64, size(coords_full, 1), n_samples)
 
         if m.method in [:fixed, :adaptive]
-            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
             if isempty(innovations_name)
                 @warn "Innovations for RFF component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
@@ -288,7 +289,7 @@ function get_effects(
                 effect_k[:, i] = Phi * scaled_coeffs
             end
         else # :centered
-            latent_name = _find_parameter(p_names_vec, string(spec.key), "latent", k, is_multivariate_model)
+            latent_name = _find_parameter(p_names_vec, v.latent, k, is_multivariate_model)
             if isempty(latent_name)
                 @warn "Latent coefficients for centered RFF component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))

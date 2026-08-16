@@ -283,33 +283,6 @@ const COMPONENT_CONFIG_ARGS = Dict(
 
 
 # interface definitions
- 
-"""
-    get_datastructures!(m_type::Type{<:ComponentModel}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup and validation for a component type.
-
-This method is dispatched on the component's *type* (e.g., `IID`, `AR1`) and runs
-early in the `bstm_config` pipeline. It is responsible for:
-1.  Preparing necessary data structures (e.g., adjacency matrix `W`, basis functions, indices).
-2.  Modifying the global model configuration `M` (e.g., setting `M[:s_N]`, `M[:s_idx]`).
-
-# Arguments
-- `m_type`: The `Type` of the `ComponentModel` (e.g., `IID`, `AR1`).
-- `M`: The main model configuration dictionary, which can be mutated.
-- `mod_data`: A dictionary containing parsed module data (e.g., variables, parameters).
-
-# Returns
-- `true`: If a component object should be created for this module.
-- `false`: If this module only performs setup and does not require a component object
-           (e.g., interaction flags that are handled globally).
-
-# Assumptions
-- This method is called before the component object itself is instantiated.
-- It is responsible for ensuring that all data-related prerequisites for the
-  component's `get_precomputes` method are met.
-"""
-function get_datastructures! end
 
 """
     get_precomputes(m::ComponentModel, M::NamedTuple, mod_data::Dict)::NamedTuple

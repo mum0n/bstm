@@ -5,26 +5,19 @@ This document provides a detailed technical reference for the internal component
 ## The `ComponentModel` Interface
 
 To extend `bstm` with a new model, a developer must define a new struct that subtypes `ComponentModel` and implement a set of five interface functions. This interface provides the contract between a component and the main `bstm` engine, allowing for seamless integration into the model building, sampling, and post-processing pipeline.
-
-### 1. `get_datastructures!(m_type, M, mod_data)`
-*   **Purpose**: Performs data-dependent setup. This is the first method called for a component. It is responsible for validating that necessary data columns exist and for setting up any required data structures in the main model configuration dictionary `M`.
-*   **Arguments**:
-    *   `m_type::Type{<:ComponentModel}`: The type of the component struct being processed.
-    *   `M::Dict`: The main model configuration dictionary. This function can read from and write to `M`. It contains the full dataset and any keyword arguments passed to the main `@bstm` call.
-    *   `mod_data::Dict`: A dictionary containing the parsed information for this specific component instance from the formula (e.g., its variables, parameters).
-*   **Returns**: `Bool`. Should return `true` if the component should be created and added to the model, or `false` if it should be skipped (e.g., if it's a placeholder for another component).
-*   **Example Use**: An `icar` component would use this function to check for a spatial index variable (`s_idx`) in the data and to ensure a spatial adjacency matrix (`W`) has been provided in the main `bstm` call.
-
-### 2. `get_precomputes(m, M, mod_data)`
-*   **Purpose**: Performs data-independent pre-calculations. This method is called after `get_datastructures!` and is used to compute any matrices or values that can be calculated once before sampling begins.
+ 
+ 
+### 1. `get_precomputes(m, M, mod_data)`
+*   **Purpose**: Performs all data-dependent setup and pre-calculations. This method is now the primary entry point for a component to process data and prepare any necessary structures before model generation. It combines the responsibilities previously held by `get_datastructures!` and its own original purpose.
 *   **Arguments**:
     *   `m::ComponentModel`: An instance of the component struct.
     *   `M::NamedTuple`: The model configuration object (now read-only). It contains all data structures prepared by `get_datastructures!`.
     *   `mod_data::Dict`: The component's metadata.
 *   **Returns**: `NamedTuple`. The results of the pre-computation (e.g., a precision matrix template `Q_template`, its spectral decomposition `U` and `L`, basis matrices, etc.). This `NamedTuple` is stored and made available to the other interface functions via the `spec.hyper` object.
-*   **Example Use**: A `pspline` component would use this to generate the B-spline basis matrix. A `bym2` component would use it to generate the `Q_template` and its spectral decomposition.
+*   **Example Use**: An `icar` component would use this to validate the spatial index and adjacency matrix, and then generate the `Q_template` and its spectral decomposition. A `pspline` component would validate its covariate, and then generate the B-spline basis matrix.
 
-### 3. `get_priors(m, spec, arch, outcome_idx, M)`
+
+### 2. `get_priors(m, spec, arch, outcome_idx, M)`
 *   **Purpose**: Generates the Turing code string for the component's priors.
 *   **Arguments**:
     *   `m::ComponentModel`: The component instance.
@@ -35,13 +28,13 @@ To extend `bstm` with a new model, a developer must define a new struct that sub
 *   **Returns**: `String`. A block of Turing.jl code defining the priors.
 *   **Example Use**: An `icar` component would generate `sigma_icar_key ~ Exponential(1.0)` and `innovations_icar_key ~ MvNormal(...)`.
 
-### 4. `get_updates(m, spec, arch, outcome_idx, M)`
+### 3. `get_updates(m, spec, arch, outcome_idx, M)`
 *   **Purpose**: Generates the Turing code to construct the latent effect and add it to the linear predictor `eta`.
 *   **Arguments**: Same as `get_priors`.
 *   **Returns**: `String`. A block of Turing.jl code that calculates the latent field and adds it to `eta`.
 *   **Example Use**: An `icar` component would generate code to scale the `innovations` by `sigma` and the spectral components to construct the latent field.
 
-### 5. `get_effects(m, chain, M, ...)`
+### 4. `get_effects(m, chain, M, ...)`
 *   **Purpose**: Reconstructs the posterior distribution of the component's effect from the MCMC chain. This function is called during post-processing (e.g., by `model_results_comprehensive` or `predict`).
 *   **Arguments**:
     *   `m::ComponentModel`: The component instance.
@@ -862,18 +855,6 @@ The `nested()` module is a "supervisor" component for multi-fidelity modeling. I
 | `data_source`           | `data_source=proxy_data`                                             | `Symbol`  | `:data`            | A symbol pointing to a `DataFrame` passed as a keyword argument to the main `bstm()` call. This allows the sub-model to use a different dataset.                                                                                                      |
 | `rho_nested` (Implicit) | N/A                                                                  | `Float`   | `Normal(1.0, 0.5)` | A scaling coefficient that links the sub-model's latent effect to the main model's linear predictor: $\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}$. The prior assumes the sub-model is a good proxy ($\rho \approx 1$). |
 
-### Bayesian Factor Analysis with `eigen()`
-
-The `eigen()` module implements a Bayesian Principal Component Analysis (PCA) to perform dimensionality reduction on a set of multivariate outcomes. It decomposes the input variables into a smaller set of orthogonal latent factors. The framework uses a Householder transformation to construct the orthonormal loadings matrix, ensuring numerical stability and efficient sampling.
-
-#### `eigen()` Module Reference
-
-| Keyword / Parameter | Example Usage              | Data Type      | Default            | Meaning & Assumptions                                                                                                                                                               |
-| :--------------------| :---------------------------| :---------------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `eigen()`           | `eigen(y1, y2, y3; ...)`   | Module         | N/A                | Defines a Bayesian PCA factor model. The variables listed (e.g., `y1, y2, y3`) are the multivariate outcomes to be decomposed.                                                      |
-| `n_factors`         | `n_factors=1`              | `Int`          | `1`                | The number of latent factors (principal components) to extract. This determines the dimensionality of the reduced latent space.                                                     |
-| `pca_sd`            | `pca_sd=Exponential(0.5)`  | `Distribution` | `Exponential(1.0)` | The prior for the standard deviations of the principal components (latent factors). These are the "eigenvalues" of the system, controlling the variance explained by each factor.   |
-| `pdef_sd`           | `pdef_sd=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviation of the residual (uniqueness) noise. This captures the variance in each observed variable that is *not* explained by the shared latent factors. |
 
 ### Handling Censored Covariates via Joint Modeling
 
@@ -907,6 +888,21 @@ m = @bstm(
 # Sample the joint model to estimate all parameters simultaneously.
 joint_chain = sample(m, NUTS(), 1000)
 ```
+
+
+### Bayesian Factor Analysis with `eigen()`
+
+The `eigen()` module implements a Bayesian Principal Component Analysis (PCA) to perform dimensionality reduction on a set of multivariate outcomes. It decomposes the input variables into a smaller set of orthogonal latent factors. The framework uses a Householder transformation to construct the orthonormal loadings matrix, ensuring numerical stability and efficient sampling.
+
+#### `eigen()` Module Reference
+
+| Keyword / Parameter | Example Usage              | Data Type      | Default            | Meaning & Assumptions                                                                                                                                                               |
+| :--------------------| :---------------------------| :---------------| :-------------------| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `eigen()`           | `eigen(y1, y2, y3; ...)`   | Module         | N/A                | Defines a Bayesian PCA factor model. The variables listed (e.g., `y1, y2, y3`) are the multivariate outcomes to be decomposed.                                                      |
+| `n_factors`         | `n_factors=1`              | `Int`          | `1`                | The number of latent factors (principal components) to extract. This determines the dimensionality of the reduced latent space.                                                     |
+| `pca_sd`            | `pca_sd=Exponential(0.5)`  | `Distribution` | `Exponential(1.0)` | The prior for the standard deviations of the principal components (latent factors). These are the "eigenvalues" of the system, controlling the variance explained by each factor.   |
+| `pdef_sd`           | `pdef_sd=Exponential(0.5)` | `Distribution` | `Exponential(1.0)` | The prior for the standard deviation of the residual (uniqueness) noise. This captures the variance in each observed variable that is *not* explained by the shared latent factors. |
+
 
 
 ## Conclusion

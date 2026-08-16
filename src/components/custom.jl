@@ -6,7 +6,7 @@ This provides an "escape hatch" for advanced users who need to implement logic
 not covered by the standard components.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.3 (2026-08-15)
 
 # Mathematical Summary
 This component does not have a fixed mathematical form. It is a "blank canvas"
@@ -66,54 +66,6 @@ end
 
 MODEL_TO_STRUCTURE_MAP[:custom] = :any
 
-
-"""
-    get_datastructures!(m_type::Type{<:Custom}, M::Dict, mod_data::Dict)::Bool
-
-Resolves the `code_fragment` string from the formula, evaluating it if it is
-provided as a variable name or expression.
-
-# Security Warning
-This function uses `Core.eval`, which can execute arbitrary code. Only use this
-component with trusted formula inputs.
-"""
-function get_datastructures!(
-    m_type::Type{<:Custom}, M::Dict, mod_data::Dict
-)::Bool
-    params = mod_data[:params]
-    code_fragment_val = get(params, :code_fragment, "")
-    
-    local final_code_fragment::String
-    if code_fragment_val isa Symbol
-        @warn "Evaluating `code_fragment` from symbol `$(code_fragment_val)`. Ensure this is from a trusted source."
-        calling_mod = get(M, :calling_module, Main)
-        try
-            final_code_fragment = Core.eval(calling_mod, code_fragment_val)
-        catch e
-            error("Could not evaluate `code_fragment` variable `$(code_fragment_val)`. Error: $e")
-        end
-    elseif code_fragment_val isa String
-        final_code_fragment = code_fragment_val
-    elseif code_fragment_val isa Expr
-        @warn "Evaluating `code_fragment` from expression. Ensure this is from a trusted source."
-        try
-            final_code_fragment = Core.eval(get(M, :calling_module, Main), code_fragment_val)
-        catch e
-            error("Could not evaluate `code_fragment` expression `$(code_fragment_val)`. Error: $e")
-        end
-    else
-        error("Unsupported type for `code_fragment`: $(typeof(code_fragment_val))")
-    end
-
-    if !(final_code_fragment isa String)
-        error("`code_fragment` must resolve to a String. Got: $(typeof(final_code_fragment))")
-    end
-    
-    params[:code_fragment] = final_code_fragment
-    return true
-end
-
-
 """
     get_precomputes(m::Custom, M::NamedTuple, mod_data::Dict)::NamedTuple
 
@@ -162,32 +114,30 @@ function get_updates(
     """
 end
 
-
-
 """
-    get_effects(m::Custom, chain, M::NamedTuple, ...)::NamedTuple
+    get_effects(m::Custom, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
 
 Calls a user-provided `reconstruct_func` for posterior reconstruction. If no
-function is provided, it returns a zero-effect with a warning. The user's function
-will receive the full list of parameter names and the model's multivariate status
-to allow for correct use of `_find_parameter`.
+function is provided, it returns a zero-effect with a warning.
+
+The user's function is expected to have the signature:
+`(chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate) -> NamedTuple`
+where `p_names` (a `Vector{String}` of all parameter names in the chain) and
+`is_multivariate` (a `Bool`) are passed from the main reconstruction engine.
 """
 function get_effects(
     m::Custom, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
+    N_total::Int, is_multivariate_model::Bool
 )::NamedTuple
     reconstruct_func = get(m.params, :reconstruct_func, nothing)
 
     if !isnothing(reconstruct_func) && isa(reconstruct_func, Function)
         try
-            # Pass additional arguments to the user's function to enable
-            # correct use of _find_parameter.
-            p_names_vec = string.(FlexiChains.parameters(chain))
-            is_multivariate_model = M.model_arch == "multivariate"
-            
+            # The user's function is called with the standardized arguments.
             return reconstruct_func(
-                chain, M, n_samples, outcomes_N, spec, PS, N_total,
-                p_names_vec, is_multivariate_model
+                chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, 
+                is_multivariate_model
             )
         catch e
             @error "The custom reconstruction function for component '$(spec.key)' failed."

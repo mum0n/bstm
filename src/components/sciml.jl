@@ -6,7 +6,7 @@ ecosystem into a Bayesian framework. It allows for the estimation of differentia
 equation parameters and initial conditions.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.2.0 (2026-08-14)
 
 # Mathematical Summary
 This component models an observed process \$y(t)\$ as noisy observations of a latent
@@ -79,27 +79,21 @@ end
 
 MODEL_TO_STRUCTURE_MAP[:sciml] = :temporal
 
-function get_datastructures!(m_type::Type{<:SciML}, M::Dict, mod_data::Dict)::Bool
-    params = mod_data[:params]
+function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
+    # --- Data and Parameter Validation ---
     variables = mod_data[:variables]
-
     if isempty(variables)
         error("The `sciml()` module requires a time index variable, e.g., `sciml(year, ...)`.")
     end
 
     time_var_sym = Symbol(variables[1])
-    if !hasproperty(M[:data], time_var_sym)
+    if !hasproperty(M.data, time_var_sym)
         error("Time index variable ':$time_var_sym' for sciml() module not found in data.")
     end
 
-    time_opts = Dict(:time_method => get(params, :time_method, "continuous"))
-    tu_meta = assign_time_units(M[:data][!, time_var_sym]; time_opts...)
-    M[:t_idx] = tu_meta.idx
-    M[:t_N] = tu_meta.N_cat
-    M[:t_idx_var] = time_var_sym
-    M[:t_coords] = M[:data][!, time_var_sym]
-    mod_data[:params][:coords] = M[:data][!, time_var_sym]
+    coords = M.data[!, time_var_sym]
 
+    params = mod_data[:params]
     required_args = [:model_func, :u0_prior, :p_priors, :tspan, :solver]
     for arg in required_args
         if !haskey(params, arg)
@@ -107,50 +101,36 @@ function get_datastructures!(m_type::Type{<:SciML}, M::Dict, mod_data::Dict)::Bo
         end
     end
 
-    if !haskey(M, :sciml_problem_templates)
-        M[:sciml_problem_templates] = Dict{Symbol, Any}()
-    end
-    
+    # --- Problem Template Creation ---
     calling_mod = get(M, :calling_module, Main)
     model_func = Core.eval(calling_mod, params[:model_func])
     
     u0_template = mean(params[:u0_prior])
-    p_template = Tuple(mean(p) for p in params[:p_priors])
+    p_template = Tuple(mean(p) for p in values(m.p_priors))
     tspan = params[:tspan]
-    de_type = get(params, :de_type, :ODE)
-    de_kwargs = get(params, :de_kwargs, Dict())
 
     local prob_template
-    if de_type == :ODE
+    if m.de_type == :ODE
         prob_template = ODEProblem(model_func, u0_template, tspan, p_template)
-    elseif de_type == :SDE
-        noise_func = get(params, :noise_func, error("SDE requires a `noise_func`."))
+    elseif m.de_type == :SDE
+        noise_func_sym = get(params, :noise_func, error("SDE requires a `noise_func`."))
+        noise_func = Core.eval(calling_mod, noise_func_sym)
         prob_template = SDEProblem(model_func, noise_func, u0_template, tspan, p_template)
-    elseif de_type == :DDE
-        h_func = get(params, :h, error("DDE requires a history function `h`."))
-        prob_template = DDEProblem(model_func, u0_template, h_func, tspan, p_template; de_kwargs...)
-    elseif de_type == :Jump
+    elseif m.de_type == :DDE
+        h_func_sym = get(params, :h, error("DDE requires a history function `h`."))
+        h_func = Core.eval(calling_mod, h_func_sym)
+        prob_template = DDEProblem(model_func, u0_template, h_func, tspan, p_template; m.de_kwargs...)
+    elseif m.de_type == :Jump
         prob_template = model_func(u0_template, p_template, tspan)
     else
-        error("Unsupported `de_type`: $de_type")
+        error("Unsupported `de_type`: $(m.de_type)")
     end
 
-    M[:sciml_problem_templates][mod_data[:key]] = prob_template
-    M[:sciml_solver] = params[:solver]
-    M[:sciml_saveat] = get(params, :saveat, 0.1)
-
-    return true
-end
-
-function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = get(mod_data[:params], :coords, nothing)
-    if isnothing(coords)
-        error("SciML component precomputes failed: coordinates not found.")
-    end
-    
     return (
+        prob_template=prob_template,
+        solver=params[:solver],
+        saveat=get(params, :saveat, 0.1),
         coords=coords,
-        n_latent=M.y_N,
         param_names=keys(m.p_priors)
     )
 end
@@ -159,22 +139,14 @@ function get_priors(
     m::SciML, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
-    key = string(spec.key)
-    
-    u0_name = "u0_$(key)"
-    if arch == "multivariate" && !get(spec.params, :shared, false)
-        u0_name *= "_$(outcome_idx)"
-    end
+    v = generate_full_variable_names(spec, arch, outcome_idx)
     
     prior_lines = ["# --- Priors for SciML component: $(spec.key) ---"]
-    push!(prior_lines, "$(u0_name) ~ $(_distribution_to_string(m.u0_prior))")
+    push!(prior_lines, "$(v.u0) ~ $(_distribution_to_string(m.u0_prior))")
     
     for p_name in spec.hyper.param_names
         p_prior = m.p_priors[p_name]
-        p_var_name = "p_$(p_name)_$(key)"
-        if arch == "multivariate" && !get(spec.params, :shared, false)
-            p_var_name *= "_$(outcome_idx)"
-        end
+        p_var_name = getproperty(v, Symbol("p_$(p_name)"))
         push!(prior_lines, "$(p_var_name) ~ $(_distribution_to_string(p_prior))")
     end
     
@@ -186,59 +158,52 @@ function get_updates(
     M::NamedTuple
 )::String
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
-    key = string(spec.key)
+    key = spec.key
     
-    u0_name = "u0_$(key)"
+    v = generate_full_variable_names(spec, arch, outcome_idx)
     param_names = spec.hyper.param_names
-    p_vars = ["p_$(p)_$(key)" for p in param_names]
     
-    if arch == "multivariate" && !get(spec.params, :shared, false)
-        u0_name *= "_$(outcome_idx)"
-        p_vars = [v * "_$(outcome_idx)" for v in p_vars]
-    end
+    u0_name = v.u0
+    p_var_names = [getproperty(v, Symbol("p_$(p)")) for p in param_names]
+    p_tuple_str = "p_$(key) = ($(join(p_var_names, ", ")),)"
 
-    p_tuple_str = "p_$(spec.key) = ($(join(p_vars, ", ")),)"
-
-    # Access pre-computed coordinates via spec_registry for consistency.
     common_solve_code = """
         $(p_tuple_str)
-        prob_$(spec.key) = remake(
-            M.sciml_problem_templates[:$(spec.key)]; u0=$(u0_name), p=p_$(spec.key)
+        local hyper = spec_registry[:$(key)].hyper
+        prob_$(key) = remake(
+            hyper.prob_template; u0=$(u0_name), p=p_$(key)
         )
-        sol_$(spec.key) = solve(
-            prob_$(spec.key), M.sciml_solver; saveat=M.sciml_saveat
+        sol_$(key) = solve(
+            prob_$(key), hyper.solver; saveat=hyper.saveat
         )
         
-        if !SciMLBase.successful_retcode(sol_$(spec.key))
+        if !SciMLBase.successful_retcode(sol_$(key))
             Turing.@addlogprob! -Inf
             return
         end
         
-        sciml_effect_$(spec.key) = sol_$(spec.key)(spec_registry[:$(spec.key)].hyper.coords)
+        sciml_effect_$(key) = sol_$(key)(hyper.coords)
     """
 
     additive_code = """
-        # --- SciML Component (Additive): $(spec.key) ---
+        # --- SciML Component (Additive): $(key) ---
         let
             $(common_solve_code)
-            $(eta_target) .+= sciml_effect_$(spec.key)[1,:]
+            $(eta_target) .+= sciml_effect_$(key)[1,:]
         end
     """
 
-    # The invalid `M.likelihood_handled = true` assignment is removed.
-    # The model assembler must be configured to check for this component type.
     direct_code = """
-        # --- SciML Component (Direct Likelihood): $(spec.key) ---
+        # --- SciML Component (Direct Likelihood): $(key) ---
         let
             $(common_solve_code)
-            mu = sciml_effect_$(spec.key)
+            mu = sciml_effect_$(key)
             y_sigma ~ Exponential(1.0)
             for i in 1:M.y_N
                 Turing.@addlogprob! logpdf(Normal(mu[1, i], y_sigma), M.y_obs[i])
             end
-            # The line `M.likelihood_handled = true` was removed as it is invalid.
-            # The model assembler must be updated to recognize that this component
-            # handles its own likelihood when `likelihood_type` is `:direct`.
+            # The model assembler must be configured to check for this component type
+            # and skip the main likelihood evaluation if likelihood_type is :direct.
         end
     """
 
@@ -252,17 +217,16 @@ function get_updates(
 end
 
 function get_effects(
-    m::SciML, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SciML, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
-    key = string(spec.key)
-    param_names = spec.hyper.param_names
+    key = spec.key
+    hyper = spec.hyper
+    param_names = hyper.param_names
 
-    # Use coordinates from the spec for consistency.
-    coords_train = spec.hyper.coords
+    coords_train = hyper.coords
     t_coords_full = if isnothing(PS)
         coords_train
     else
@@ -271,10 +235,24 @@ function get_effects(
     tspan_full = (minimum(t_coords_full), maximum(t_coords_full))
     
     for k in 1:outcomes_N
-        u0_name = _find_parameter(p_names_vec, key, "u0", k, is_multivariate_model)
-        p_var_names = Dict(p_name => _find_parameter(p_names_vec, key, "p_$(p_name)", k, is_multivariate_model) for p_name in param_names)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        
+        u0_name = _find_parameter(p_names_vec, v.u0, k, is_multivariate_model)
+        
+        p_var_names = Dict{Symbol, String}()
+        all_params_found = true
+        for p_name in param_names
+            p_sym = Symbol("p_$(p_name)")
+            p_full_name = getproperty(v, p_sym)
+            found_name = _find_parameter(p_names_vec, p_full_name, k, is_multivariate_model)
+            if isempty(found_name)
+                all_params_found = false
+                break
+            end
+            p_var_names[p_name] = found_name
+        end
 
-        if isempty(u0_name) || any(isempty, values(p_var_names))
+        if isempty(u0_name) || !all_params_found
             @warn "Parameters for SciML component $(key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -286,7 +264,7 @@ function get_effects(
         T = eltype(chain.value)
         trajectories = zeros(T, length(t_coords_full), n_samples)
 
-        prob_template = M.sciml_problem_templates[spec.key]
+        prob_template = hyper.prob_template
 
         for s in 1:n_samples
             u0_s = u0_samples[s, :]
@@ -294,7 +272,7 @@ function get_effects(
 
             prob_s = remake(prob_template; u0=u0_s, p=p_s, tspan=tspan_full)
             
-            sol_s = solve(prob_s, M.sciml_solver; saveat=t_coords_full)
+            sol_s = solve(prob_s, hyper.solver; saveat=t_coords_full)
 
             if SciMLBase.successful_retcode(sol_s)
                 trajectories[:, s] = sol_s[1, :]

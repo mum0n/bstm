@@ -6,7 +6,7 @@ approximations: FITC (Fully Independent Training Conditional) and VFE
 (Variational Free Energy), also known as DTC (Deterministic Training Conditional).
 
 # Version
-v1.1.0 (2026-08-11)
+v1.2.2 (2026-08-15)
 
 # Mathematical Summary
 Both methods approximate a full GP using a small set of \$M\$ inducing points \$Z\$.
@@ -66,7 +66,7 @@ COMPONENT_CONSTRUCTORS[:fitc] = (p, params) -> FITC(
 
 MODEL_TO_STRUCTURE_MAP[:fitc] = :smooth
 
-function get_datastructures!(m_type::Type{<:FITC}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::FITC, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
     params = mod_data[:params]
 
@@ -75,32 +75,16 @@ function get_datastructures!(m_type::Type{<:FITC}, M::Dict, mod_data::Dict)::Boo
     end
 
     for var_sym in variables
-        if !hasproperty(M[:data], Symbol(var_sym))
+        if !hasproperty(M.data, Symbol(var_sym))
             error("Coordinate variable ':$var_sym' for FITC model not found in data.")
         end
     end
 
-    coords = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-    mod_data[:params][:coords] = coords
-
-    n_inducing = get(params, :n_inducing, 20)
-    knot_method = get(params, :knot_method, :kmeans)
-    Z_inducing = generate_inducing_points(coords, n_inducing; method=knot_method)
-    mod_data[:params][:Z_inducing] = Z_inducing
-
-    return true
-end
-
-function get_precomputes(m::FITC, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = get(mod_data[:params], :coords, nothing)
-    if isnothing(coords)
-        error("FITC component precomputes failed: coordinates not found.")
-    end
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
     
-    Z_inducing = get(mod_data[:params], :Z_inducing, nothing)
-    if isnothing(Z_inducing)
-        error("FITC component precomputes failed: inducing points not found.")
-    end
+    n_inducing = m.n_inducing
+    knot_method = string(get(params, :knot_method, "kmeans"))
+    Z_inducing = generate_inducing_points(coords, n_inducing; method=knot_method)
 
     return (
         coords=coords,
@@ -144,26 +128,26 @@ function get_updates(
     key = spec.key
     
     common_code = """
-        hyper = spec_registry[:$(key)].hyper
-        X_coords = hyper.coords
-        Z_coords = hyper.Z_inducing
-        kernel_type = Symbol("$(m.kernel)")
-        
-        K_UU = evaluate_kernel_matrix(
-            Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
-        )
-        K_XU = evaluate_cross_kernel_matrix(
-            X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
-        )
-        
-        L_UU = cholesky(Symmetric(K_UU)).L
-        u_latent = L_UU * $(p_names.inducing_innovations)
+        let
+            hyper = spec_registry[:$(key)].hyper
+            X_coords = hyper.coords
+            Z_coords = hyper.Z_inducing
+            kernel_type = Symbol("$(m.kernel)")
+            
+            K_UU = evaluate_kernel_matrix(
+                Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
+            )
+            K_XU = evaluate_cross_kernel_matrix(
+                X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
+            )
+            
+            L_UU = cholesky(Symmetric(K_UU)).L
+            u_latent = L_UU * $(p_names.inducing_innovations)
     """
 
     fitc_code = """
         # --- FITC Sparse GP Component: $(key) ---
-        let
-            $(common_code)
+        $(common_code)
             
             K_UU_inv_u = K_UU \\ u_latent
             mean_f = K_XU * K_UU_inv_u
@@ -182,8 +166,7 @@ function get_updates(
 
     vfe_code = """
         # --- VFE/DTC Sparse GP Component: $(key) ---
-        let
-            $(common_code)
+        $(common_code)
             
             K_UU_inv_u = K_UU \\ u_latent
             $(p_names.latent) = K_XU * K_UU_inv_u
@@ -203,11 +186,13 @@ end
 
 function get_effects(
     m::FITC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
+    N_total::Int, is_multivariate_model::Bool
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
-    coords_train = spec.hyper.coords
+    hyper = spec.hyper
+    coords_train = hyper.coords
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
         vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
@@ -216,16 +201,15 @@ function get_effects(
     end
     n_obs_full = size(coords_full, 1)
 
-    Z_inducing = spec.hyper.Z_inducing
+    Z_inducing = hyper.Z_inducing
     kernel_type = Symbol(m.kernel)
     noise = M.noise
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        ls_name = _find_parameter(p_names_vec, string(spec.key), "ls", k, is_multivariate_model)
-        inducing_innov_name = _find_parameter(p_names_vec, string(spec.key), "inducing_innovations", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
+        inducing_innov_name = _find_parameter(p_names, string(p_names_k.inducing_innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(inducing_innov_name)
             @warn "Parameters for FITC component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -234,8 +218,8 @@ function get_effects(
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_samples = get_params_vector(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
-        inducing_innov_samples = get_params_vector(chain, inducing_innov_name, m.n_inducing)
+        ls_samples = get_params_matrix(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
+        inducing_innov_samples = get_params_matrix(chain, inducing_innov_name, m.n_inducing)
 
         effect_k = zeros(Float64, n_obs_full, n_samples)
 
@@ -253,14 +237,14 @@ function get_effects(
             mean_f = K_XU * K_UU_inv_u
 
             if m.method == :fitc
-                diag_innov_name = _find_parameter(p_names_vec, string(spec.key), "diag_innovations", k, is_multivariate_model)
+                diag_innov_name = _find_parameter(p_names, string(p_names_k.diag_innovations), k, is_multivariate_model)
                 if isempty(diag_innov_name)
                     @warn "Diagonal innovations for FITC component $(spec.key) (outcome $k) not found. Using zero for correction."
                     effect_k[:, i] = mean_f
                     continue
                 end
                 
-                diag_innov_samples = get_params_vector(chain, diag_innov_name, spec.hyper.n_latent)
+                diag_innov_samples = get_params_matrix(chain, diag_innov_name, hyper.n_latent)
                 diag_innov_i = if size(diag_innov_samples, 2) == n_obs_full
                     diag_innov_samples[i, :]
                 else

@@ -7,7 +7,7 @@ effect is a linear combination of these basis functions, with coefficients regul
 a random walk prior to ensure smoothness.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.1 (2026-08-14)
 
 # Mathematical Summary
 The wavelet smoother models a function \$f(x)\$ as a linear combination of scaled and
@@ -47,6 +47,10 @@ second-order random walk (RW2), to regularize the function:
 - `ls_<key>`: The lengthscale(s) controlling the wavelet dilation.
 - `innovations_<key>`: The raw standard normal innovations for the coefficients.
 - `latent_<key>`: The final smooth effect vector.
+
+# Key References
+- Nason, G. P. (2008). *Wavelet Methods in Statistics with R*. Springer.
+- Daubechies, I. (1992). *Ten Lectures on Wavelets*. SIAM.
 """
 struct Wavelet <: ComponentModel
     family::Symbol
@@ -68,27 +72,20 @@ COMPONENT_CONSTRUCTORS[:wavelet] = (p, params) -> Wavelet(
 
 MODEL_TO_STRUCTURE_MAP[:wavelet] = :smooth
 
-function get_datastructures!(m_type::Type{<:Wavelet}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::Wavelet, M::NamedTuple, mod_data::Dict)::NamedTuple
+    # Data validation moved from get_datastructures!
     variables = mod_data[:variables]
     if isempty(variables)
         error("Wavelet model requires coordinate variables, e.g., `random(x, model=:wavelet)`.")
     end
 
     for var_sym in variables
-        if !hasproperty(M[:data], Symbol(var_sym))
+        if !hasproperty(M.data, Symbol(var_sym))
             error("Coordinate variable ':$var_sym' for Wavelet model not found in data.")
         end
     end
 
-    mod_data[:params][:coords] = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-    return true
-end
-
-function get_precomputes(m::Wavelet, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = get(mod_data[:params], :coords, nothing)
-    if isnothing(coords)
-        error("Wavelet component precomputes failed: coordinates not found.")
-    end
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
     
     n_latent = m.nbins
     n_dims = size(coords, 2)
@@ -129,6 +126,7 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    key = spec.key
     
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
@@ -141,17 +139,11 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.innovations))") # Raw standard normal innovations
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
 
-"""
-    get_updates(m::Wavelet, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates the Turing code to construct the wavelet smooth effect, dispatching on
-the chosen method.
-"""
 function get_updates(
     m::Wavelet, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -177,7 +169,7 @@ function get_updates(
             local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
             local coeffs = hyper.U * (diag_D .* $(p_names.innovations))
-            local $(p_names.latent) = B_wavelet * coeffs
+            $(p_names.latent) = B_wavelet * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
     """
@@ -189,8 +181,8 @@ function get_updates(
             local F = hyper.cholesky_factor
             local coeffs_raw = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
-            local coeffs = $(p_names.sigma) .* (coeffs_raw .- mean(coeffs_raw)) # Center for identifiability
-            local $(p_names.latent) = B_wavelet * coeffs
+            local coeffs = $(p_names.sigma) .* (coeffs_raw .- mean(coeffs_raw))
+            $(p_names.latent) = B_wavelet * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
     """
@@ -202,9 +194,9 @@ function get_updates(
             local Q_penalty = hyper.Q_template
             local F = cholesky(Symmetric(Q_penalty + M.noise * I))
             local coeffs_raw = F.L' \\ $(p_names.innovations)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw)) # Soft sum-to-zero
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
             local coeffs = $(p_names.sigma) .* coeffs_raw
-            local $(p_names.latent) = B_wavelet * coeffs
+            $(p_names.latent) = B_wavelet * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
     """
@@ -215,11 +207,9 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for Wavelet component."); end
 end
 
-
-
 function get_effects(
-    m::Wavelet, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::Wavelet, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -236,13 +226,13 @@ function get_effects(
         coords_train
     end
 
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        ls_name = _find_parameter(p_names_vec, string(spec.key), "ls", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
+        ls_name = _find_parameter(p_names_vec, v.ls, k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(innovations_name)
             @warn "Parameters for Wavelet component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -251,15 +241,14 @@ function get_effects(
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_samples = get_params_vector(
-            chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        )
+        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
+        ls_samples = get_params_vector(chain, ls_name, ls_dim)
         innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, size(coords_full, 1), n_samples)
 
         for i in 1:n_samples
-            current_ls = if m.lengthscale isa Vector; ls_samples[i, :]; else ls_samples[i, 1]; end
+            current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
             B_wavelet_i = bstm_tensor_product_wavelet_basis(
                 coords_full, nbins_per_dim, m.family, current_ls
             )

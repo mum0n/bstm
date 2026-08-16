@@ -7,7 +7,7 @@ Gaussian Process with a Matérn covariance function and a discrete Gaussian Mark
 Random Field (GMRF), enabling scalable and principled spatial modeling.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.1 (2026-08-14)
 
 # Mathematical Summary
 The SPDE approach models a Gaussian Field \$u(s)\$ as the solution to the SPDE:
@@ -67,48 +67,23 @@ COMPONENT_CONSTRUCTORS[:spde] = (p, params) -> SPDE(
 
 MODEL_TO_STRUCTURE_MAP[:spde] = :spatial
 
-function get_datastructures!(m_type::Type{<:SPDE}, M::Dict, mod_data::Dict)::Bool
-    params = mod_data[:params]
-    variables = mod_data[:variables]
-
-    if haskey(params, :W)
-        w_val = params[:W]
-        if w_val isa Expr || w_val isa Symbol
-            calling_mod = get(M, :calling_module, Main)
-            try
-                M[:W] = Core.eval(calling_mod, w_val)
-            catch e
-                error("Could not evaluate `W` argument `$(w_val)` for SPDE. Error: $e")
-            end
-        else
-            M[:W] = w_val
-        end
-    end
-
-    if !haskey(M, :W) || !isa(M[:W], AbstractMatrix) || isempty(M[:W])
-        error("SPDE model requires a valid, non-empty adjacency matrix `W`.")
-    end
-
-    M[:s_N] = size(M[:W], 1)
-
-    if isempty(variables)
-        M[:s_idx] = collect(1:M[:s_N])
-        @warn "Spatial index not provided for SPDE. Assuming `s_idx = 1:s_N`."
-    else
-        s_var_sym = Symbol(variables[1])
-        if !hasproperty(M[:data], s_var_sym)
-            error("Spatial index ':$s_var_sym' for SPDE not found in data.")
-        end
-        M[:s_idx] = M[:data][!, s_var_sym]
-    end
-
-    return true
-end
-
 function get_precomputes(m::SPDE, M::NamedTuple, mod_data::Dict)::NamedTuple
-    n = M.s_N
-    W = M.W
+    # Data validation moved from get_datastructures!
+    if !hasproperty(M, :W) || !isa(M.W, AbstractMatrix) || isempty(M.W)
+        error("SPDE model requires a valid, non-empty adjacency matrix `W` provided via keyword.")
+    end
 
+    s_N = size(M.W, 1)
+
+    # The processor is now responsible for creating s_idx.
+    if !hasproperty(M, :s_idx)
+        error(
+            "SPDE component '$(mod_data[:key])' failed: s_idx not found in model " *
+            "configuration. This should have been set by the model processor."
+        )
+    end
+
+    W = M.W
     W_sym = sparse((W + W') .> 0)
     D = spdiagm(0 => vec(sum(W_sym, dims=2)))
     Q_template = D - W_sym
@@ -126,7 +101,7 @@ function get_precomputes(m::SPDE, M::NamedTuple, mod_data::Dict)::NamedTuple
         scaling_factor=scaling_factor,
         U=U,
         L=L_scaled,
-        n_latent=n
+        n_latent=s_N
     )
 end
 
@@ -135,6 +110,7 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    key = spec.key
     
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
@@ -149,11 +125,12 @@ function get_priors(
     
     push!(
         priors,
-        "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)"
+        "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
     )
 
     return join(priors, "\n    ")
 end
+
 function get_updates(
     m::SPDE, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -161,7 +138,6 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
-    n_latent = spec.hyper.n_latent
 
     use_spectral = m.method == :spectral && !(m.kappa isa Vector)
 
@@ -181,23 +157,23 @@ function get_updates(
     """
 
     cholesky_base_code = """
-        hyper = spec_registry[:$(key)].hyper
-        Q_laplacian = hyper.Q_template
-        kappa_val = $(p_names.kappa)
-        Q_kappa_term = if kappa_val isa AbstractVector
+        local hyper = spec_registry[:$(key)].hyper
+        local Q_laplacian = hyper.Q_template
+        local kappa_val = $(p_names.kappa)
+        local Q_kappa_term = if kappa_val isa AbstractVector
             Diagonal(kappa_val.^2)
         else
             kappa_val^2 * I
         end
-        L_operator = Q_kappa_term + Q_laplacian
-        Q_final = Symmetric(L_operator' * L_operator)
+        local L_operator = Q_kappa_term + Q_laplacian
+        local Q_final = Symmetric(L_operator' * L_operator)
     """
 
     cholesky_code = """
         # --- SPDE Component (Cholesky, AD-Safe): $(key) ---
         let
             $(cholesky_base_code)
-            F = cholesky(Matrix(Q_final) + M.noise * I)
+            local F = cholesky(Matrix(Q_final) + M.noise * I)
             $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
@@ -207,7 +183,7 @@ function get_updates(
         # --- SPDE Component (Sparse Cholesky, Not AD-Safe): $(key) ---
         let
             $(cholesky_base_code)
-            F = cholesky(Q_final + M.noise * I)
+            local F = cholesky(Q_final + M.noise * I)
             $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
             $(eta_target) .+= view($(p_names.latent), M.s_idx)
         end
@@ -225,25 +201,24 @@ function get_updates(
     end
 end
 
-
 function get_effects(
-    m::SPDE, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SPDE, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
     n_latent = spec.hyper.n_latent
     noise = M.noise
     Q_laplacian = spec.hyper.Q_template
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
+    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
     use_spectral = m.method == :spectral && !(m.kappa isa Vector)
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        kappa_name = _find_parameter(p_names_vec, string(spec.key), "kappa", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
+        kappa_name = _find_parameter(p_names_vec, v.kappa, k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(kappa_name) || isempty(innovations_name)
             @warn "Parameters for SPDE component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -252,9 +227,8 @@ function get_effects(
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        kappa_samples = get_params_vector(
-            chain, kappa_name, m.kappa isa Vector ? length(m.kappa) : 1
-        )
+        kappa_dim = m.kappa isa Vector ? length(m.kappa) : 1
+        kappa_samples = get_params_vector(chain, kappa_name, kappa_dim)
         innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, N_total, n_samples)

@@ -3,12 +3,12 @@
 
 A component model for Moran's I Eigenvector Maps (MEM). This component decomposes
 spatial autocorrelation into a set of orthogonal spatial patterns (eigenvectors)
-derived from the Moran operator `(I - 11'/n)W(I - 11'/n)`. The effect is a linear
+derived from the Moran operator \$(I - 11'/n)W(I - 11'/n)\$. The effect is a linear
 combination of these eigenvectors, providing a spectral basis for modeling spatial
 processes.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.1 (2026-08-14)
 
 # Mathematical Summary
 The Moran component models a spatial field \$\\phi\$ as a linear combination of the
@@ -40,6 +40,10 @@ where:
 - `sigma_<key>`: The standard deviation of the eigenvector coefficients.
 - `innovations_<key>`: The raw standard normal innovations for the coefficients (for `:noncentered`).
 - `latent_<key>`: The latent coefficients (for `:centered`).
+
+# Key References
+- Griffith, D. A. (2003). *Spatial autocorrelation and spatial filtering: gaining
+  understanding through theory and practice*. Springer Science & Business Media.
 """
 struct Moran <: ComponentModel
     sigma::Distribution
@@ -52,44 +56,6 @@ COMPONENT_CONSTRUCTORS[:moran] = (p, params) -> Moran(
 )
 
 MODEL_TO_STRUCTURE_MAP[:moran] = :spatial
-
-function get_datastructures!(m_type::Type{<:Moran}, M::Dict, mod_data::Dict)::Bool
-    params = mod_data[:params]
-    variables = mod_data[:variables]
-
-    if haskey(params, :W)
-        w_val = params[:W]
-        if w_val isa Expr || w_val isa Symbol
-            calling_mod = get(M, :calling_module, Main)
-            try
-                M[:W] = Core.eval(calling_mod, w_val)
-            catch e
-                error("Could not evaluate `W` argument `$(w_val)` for Moran. Error: $e")
-            end
-        else
-            M[:W] = w_val
-        end
-    end
-
-    if !haskey(M, :W) || !isa(M[:W], AbstractMatrix) || isempty(M[:W])
-        error("Moran model requires a valid, non-empty adjacency matrix `W`.")
-    end
-
-    M[:s_N] = size(M[:W], 1)
-
-    if isempty(variables)
-        M[:s_idx] = collect(1:M[:s_N])
-        @warn "Spatial index not provided for Moran. Assuming `s_idx = 1:s_N`."
-    else
-        s_var_sym = Symbol(variables[1])
-        if !hasproperty(M[:data], s_var_sym)
-            error("Spatial index ':$s_var_sym' for Moran not found in data.")
-        end
-        M[:s_idx] = M[:data][!, s_var_sym]
-    end
-
-    return true
-end
 
 function get_precomputes(m::Moran, M::NamedTuple, mod_data::Dict)::NamedTuple
     n = M.s_N
@@ -116,9 +82,9 @@ function get_priors(
     priors = ["$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))"]
 
     if m.method == :noncentered
-        push!( # Raw standard normal innovations for coefficients
+        push!(
             priors,
-            "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)"
+            "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.innovations))"
         )
     end
     
@@ -180,7 +146,8 @@ function get_effects(
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names_vec, string(p_names_k.sigma), k, is_multivariate_model)
         if isempty(sigma_name)
             @warn "Sigma parameter for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
@@ -191,7 +158,7 @@ function get_effects(
         effect_k = zeros(Float64, N_total, n_samples)
 
         if m.method == :noncentered
-            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k, is_multivariate_model)
             if isempty(innovations_name)
                 @warn "Innovations for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
@@ -204,7 +171,7 @@ function get_effects(
                 effect_k[:, i] = view(spatial_field, s_idx_full)
             end
         else # :centered
-            latent_name = _find_parameter(p_names_vec, string(spec.key), "latent", k, is_multivariate_model)
+            latent_name = _find_parameter(p_names_vec, string(p_names_k.latent), k, is_multivariate_model)
             if isempty(latent_name)
                 @warn "Latent coefficients for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))

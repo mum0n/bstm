@@ -6,7 +6,7 @@ specifically the Poincaré disk model. This allows for modeling data with hierar
 or tree-like structures, where the notion of distance is warped.
 
 # Version
-v1.0.0 (2026-08-12)
+v1.0.2 (2026-08-15)
 
 # Mathematical Summary
 This component models a latent field \$f(s)\$ as a draw from a Gaussian Process where
@@ -46,6 +46,11 @@ Euclidean distance.
 - `sigma_<key>`: The marginal standard deviation of the GP.
 - `innovations_<key>`: The raw standard normal innovations for the latent field.
 - `latent_<key>`: The reconstructed latent hyperbolic GP effect.
+
+# Key References
+- Nickel, M., & Kiela, D. (2017). *Poincaré embeddings for learning hierarchical
+  representations*. Advances in neural information processing systems, 30.
+- Wikipedia: Poincaré disk model
 """
 struct Hyperbolic <: ComponentModel
     curvature::Real
@@ -61,33 +66,27 @@ COMPONENT_CONSTRUCTORS[:hyperbolic] = (p, params) -> Hyperbolic(
 
 MODEL_TO_STRUCTURE_MAP[:hyperbolic] = :smooth
 
-function get_datastructures!(m_type::Type{<:Hyperbolic}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::Hyperbolic, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
     if isempty(variables)
-        error("The Hyperbolic model requires coordinate variables, e.g., `random(x, y, model=:hyperbolic)`.")
+        error("The Hyperbolic model requires coordinate variables, e.g., " *
+              "`random(x, y, model=:hyperbolic)`.")
     end
 
     for var_sym in variables
-        if !hasproperty(M[:data], Symbol(var_sym))
-            error("Coordinate variable ':$var_sym' for Hyperbolic model not found in data.")
+        if !hasproperty(M.data, Symbol(var_sym))
+            error("Coordinate variable ':$var_sym' for Hyperbolic model not found " *
+                  "in data.")
         end
     end
 
-    coords = Matrix{Float64}(M[:data][!, Symbol.(variables)])
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
     
     # Validate that coordinates are within the unit disk
     if any(sum(coords.^2, dims=2) .>= 1.0)
-        @warn "Some coordinates for the Hyperbolic model lie on or outside the unit disk. The model assumes coordinates are strictly inside the disk (||s|| < 1). Results may be unstable."
-    end
-
-    mod_data[:params][:coords] = coords
-    return true
-end
-
-function get_precomputes(m::Hyperbolic, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = get(mod_data[:params], :coords, nothing)
-    if isnothing(coords)
-        error("Hyperbolic component precomputes failed: coordinates not found.")
+        @warn "Some coordinates for the Hyperbolic model lie on or outside the unit " *
+              "disk. The model assumes coordinates are strictly inside the disk " *
+              "(||s|| < 1). Results may be unstable."
     end
     
     n_latent = size(coords, 1)
@@ -172,7 +171,8 @@ end
 
 function get_effects(
     m::Hyperbolic, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
+    N_total::Int, is_multivariate_model::Bool
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
@@ -188,12 +188,11 @@ function get_effects(
     
     noise = M.noise
     curvature = m.curvature
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for Hyperbolic component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -202,7 +201,7 @@ function get_effects(
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_obs_train)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_obs_train)
 
         effect_k = zeros(Float64, n_obs_full, n_samples)
 

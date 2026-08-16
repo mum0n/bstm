@@ -7,7 +7,7 @@ It approximates a full GP using a small set of `n_inducing` points to make it
 scalable for larger datasets.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.2.0 (2026-08-14)
 
 # Mathematical Summary
 Both methods approximate a full GP posterior by introducing a set of \$M\$ inducing
@@ -76,7 +76,7 @@ COMPONENT_CONSTRUCTORS[:sparsegp] = COMPONENT_CONSTRUCTORS[:svgp]
 MODEL_TO_STRUCTURE_MAP[:svgp] = :smooth
 MODEL_TO_STRUCTURE_MAP[:sparsegp] = :smooth
 
-function get_datastructures!(m_type::Type{<:SparseGP}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::SparseGP, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
     params = mod_data[:params]
 
@@ -85,32 +85,14 @@ function get_datastructures!(m_type::Type{<:SparseGP}, M::Dict, mod_data::Dict):
     end
 
     for var_sym in variables
-        if !hasproperty(M[:data], Symbol(var_sym))
+        if !hasproperty(M.data, Symbol(var_sym))
             error("Coordinate variable ':$var_sym' for SparseGP model not found in data.")
         end
     end
 
-    coords = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-    mod_data[:params][:coords] = coords
-
-    n_inducing = get(params, :n_inducing, 20)
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
     knot_method = get(params, :knot_method, :kmeans)
-    Z_inducing = generate_inducing_points(coords, n_inducing; method=string(knot_method))
-    mod_data[:params][:Z_inducing] = Z_inducing
-
-    return true
-end
-
-function get_precomputes(m::SparseGP, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = get(mod_data[:params], :coords, nothing)
-    if isnothing(coords)
-        error("SparseGP component precomputes failed: coordinates not found.")
-    end
-    
-    Z_inducing = get(mod_data[:params], :Z_inducing, nothing)
-    if isnothing(Z_inducing)
-        error("SparseGP component precomputes failed: inducing points not found.")
-    end
+    Z_inducing = generate_inducing_points(coords, m.n_inducing; method=string(knot_method))
 
     return (
         coords=coords,
@@ -124,6 +106,7 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    key = spec.key
     
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
@@ -136,12 +119,12 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.inducing_innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(m.n_inducing)), I), :$(p_names.inducing_innovations))") # Raw standard normal innovations for inducing points
+    push!(priors, "$(p_names.inducing_innovations) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
     
     if m.method == :fitc
         push!(
             priors,
-            "$(p_names.diag_innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)"
+            "$(p_names.diag_innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
         )
     end
 
@@ -157,20 +140,20 @@ function get_updates(
     key = spec.key
     
     common_code = """
-        hyper = spec_registry[:$(key)].hyper
-        X_coords = hyper.coords
-        Z_coords = hyper.Z_inducing
-        kernel_type = Symbol("$(m.kernel)")
+        local hyper = spec_registry[:$(key)].hyper
+        local X_coords = hyper.coords
+        local Z_coords = hyper.Z_inducing
+        local kernel_type = Symbol("$(m.kernel)")
         
-        K_UU = evaluate_kernel_matrix(
+        local K_UU = evaluate_kernel_matrix(
             Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
         )
-        K_XU = evaluate_cross_kernel_matrix(
+        local K_XU = evaluate_cross_kernel_matrix(
             X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
         )
         
-        L_UU = cholesky(Symmetric(K_UU)).L
-        u_latent = L_UU * $(p_names.inducing_innovations)
+        local L_UU = cholesky(Symmetric(K_UU)).L
+        local u_latent = L_UU * $(p_names.inducing_innovations)
     """
 
     fitc_code = """
@@ -178,13 +161,13 @@ function get_updates(
         let
             $(common_code)
             
-            K_UU_inv_u = K_UU \\ u_latent
-            mean_f = K_XU * K_UU_inv_u
+            local K_UU_inv_u = K_UU \\ u_latent
+            local mean_f = K_XU * K_UU_inv_u
             
-            diag_K_XX = fill($(p_names.sigma)^2, hyper.n_latent)
-            tmp = (L_UU' \\ K_XU')'
-            diag_Q_ff = sum(tmp.^2, dims=2)
-            lambda_diag = diag_K_XX - vec(diag_Q_ff)
+            local diag_K_XX = fill($(p_names.sigma)^2, hyper.n_latent)
+            local tmp = (L_UU' \\ K_XU')'
+            local diag_Q_ff = sum(tmp.^2, dims=2)
+            local lambda_diag = diag_K_XX - vec(diag_Q_ff)
             
             $(p_names.latent) = mean_f .+
                 sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.diag_innovations)
@@ -198,7 +181,7 @@ function get_updates(
         let
             $(common_code)
             
-            K_UU_inv_u = K_UU \\ u_latent
+            local K_UU_inv_u = K_UU \\ u_latent
             $(p_names.latent) = K_XU * K_UU_inv_u
             
             $(eta_target) .+= $(p_names.latent)
@@ -215,8 +198,8 @@ function get_updates(
 end
 
 function get_effects(
-    m::SparseGP, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SparseGP, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
@@ -228,18 +211,19 @@ function get_effects(
         coords_train
     end
     n_obs_full = size(coords_full, 1)
-    n_obs_train = size(coords_train, 1)
 
     Z_inducing = spec.hyper.Z_inducing
     kernel_type = Symbol(m.kernel)
     noise = M.noise
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        ls_name = _find_parameter(p_names_vec, string(spec.key), "ls", k, is_multivariate_model)
-        inducing_innov_name = _find_parameter(p_names_vec, string(spec.key), "inducing_innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
+        ls_name = _find_parameter(p_names_vec, v.ls, k, is_multivariate_model)
+        inducing_innov_name = _find_parameter(
+            p_names_vec, v.inducing_innovations, k, is_multivariate_model
+        )
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(inducing_innov_name)
             @warn "Parameters for SparseGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -248,14 +232,15 @@ function get_effects(
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_samples = get_params_vector(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
+        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
+        ls_samples = get_params_vector(chain, ls_name, ls_dim)
         inducing_innov_samples = get_params_vector(chain, inducing_innov_name, m.n_inducing)
 
         effect_k = zeros(Float64, n_obs_full, n_samples)
 
         for i in 1:n_samples
             current_sigma = sigma_samples[i]
-            current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i, 1]
+            current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
             current_u_raw = inducing_innov_samples[i, :]
             
             K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
@@ -267,7 +252,9 @@ function get_effects(
             mean_f = K_XU * K_UU_inv_u
 
             if m.method == :fitc
-                diag_innov_name = _find_parameter(p_names_vec, string(spec.key), "diag_innovations", k, is_multivariate_model)
+                diag_innov_name = _find_parameter(
+                    p_names_vec, v.diag_innovations, k, is_multivariate_model
+                )
                 if isempty(diag_innov_name)
                     @warn "Diagonal innovations for FITC component $(spec.key) (outcome $k) not found. Using zero for correction."
                     effect_k[:, i] = mean_f

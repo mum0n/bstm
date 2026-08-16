@@ -7,7 +7,7 @@ point smoothly connects back to the first. This is a type of Gaussian Markov
 Random Field (GMRF) with a circulant precision matrix.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.3 (2026-08-15)
 
 # Mathematical Summary
 The cyclic random walk models a latent field \$\\phi\$ where the value at time \$t\$ is
@@ -41,6 +41,11 @@ sum-to-zero constraint is imposed on the latent field for identifiability.
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the cyclic effect.
 - `innovations_<key>`: The raw standard normal innovations for the effect.
+
+# Key References
+- Rue, H., & Held, L. (2005). *Gaussian Markov Random Fields: Theory and
+  Applications*. CRC Press.
+- Wikipedia: Random walk
 """
 struct Cyclic <: ComponentModel
     period::Int
@@ -57,55 +62,32 @@ COMPONENT_CONSTRUCTORS[:cyclic] = (p, params) -> Cyclic(
 MODEL_TO_STRUCTURE_MAP[:cyclic] = :seasonal
 
 """
-    get_datastructures!(m_type::Type{<:Cyclic}, M::Dict, mod_data::Dict)::Bool
-
-Performs data-dependent setup for the `Cyclic` component. It ensures a seasonal
-index variable is provided and that its number of unique levels matches the
-component's `period`.
-
-# Assumptions
-- The input data column specified in the `random()` call contains discrete,
-  integer-like indices representing seasonal units (e.g., month 1-12).
-"""
-function get_datastructures!(
-    m_type::Type{<:Cyclic}, M::Dict, mod_data::Dict
-)::Bool
-    variables = mod_data[:variables]
-    if isempty(variables)
-        error(
-            "The Cyclic model requires a seasonal index variable, e.g., " *
-            "`random(month, model=:cyclic)`."
-        )
-    end
-
-    u_var_sym = Symbol(variables[1])
-    if !hasproperty(M[:data], u_var_sym)
-        error("Seasonal index variable ':$u_var_sym' for Cyclic model not found in data.")
-    end
-    
-    M[:u_idx] = M[:data][!, u_var_sym]
-    M[:u_N] = length(unique(M[:u_idx]))
-    M[:u_idx_var] = u_var_sym
-    
-    period = get(mod_data[:params], :period, 12)
-    if period != M[:u_N]
-        error(
-            "Cyclic `period` ($period) does not match the number of unique levels " *
-            "in the index variable `$(u_var_sym)` ($(M[:u_N]))."
-        )
-    end
-
-    return true
-end
-
-"""
     get_precomputes(m::Cyclic, M::NamedTuple, mod_data::Dict)::NamedTuple
 
-Pre-computes the circulant precision matrix (`Q_template`) for the cyclic random
-walk, along with its spectral decomposition (`U`, `L`) and Cholesky factorization.
+Validates the seasonal index variable and pre-computes the circulant precision
+matrix (`Q_template`) for the cyclic random walk, along with its spectral
+decomposition (`U`, `L`) and Cholesky factorization.
 """
 function get_precomputes(m::Cyclic, M::NamedTuple, mod_data::Dict)::NamedTuple
-    n = m.period
+    # The `process_random_module!` is expected to have set up `M.u_N` and `M.u_idx`
+    # based on the seasonal index variable provided in the formula.
+    u_N = get(M, :u_N, 0)
+    if u_N == 0
+        error(
+            "The Cyclic model requires a seasonal context (`u_N`), but it has not " *
+            "been established. Ensure a seasonal index variable is provided."
+        )
+    end
+
+    # Validate the period against the number of unique levels.
+    if m.period != u_N
+        @warn "The specified period ($(m.period)) does not match the number of " *
+              "unique levels in the seasonal index variable ($(u_N)). " *
+              "Setting period to $u_N."
+        n = u_N
+    else
+        n = m.period
+    end
     
     template = build_structure_template(:cyclic, n)
     F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
@@ -124,16 +106,6 @@ end
     get_priors(m::Cyclic, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates priors for the scale parameter `sigma` and the raw innovations `innovations`.
-
-# Inputs
-- `m::Cyclic`: The `Cyclic` component instance.
-- `spec::NamedTuple`: The component's specification, including its `key` and `hyper` parameters.
-- `arch::String`: The model architecture (`"univariate"` or `"multivariate"`).
-- `outcome_idx::Union{Int, Nothing}`: The index of the outcome for multivariate models.
-- `M::NamedTuple`: The main model configuration.
-
-# Outputs
-- `String`: Turing code for the priors of `sigma` and `innovations`.
 """
 function get_priors(
     m::Cyclic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -141,9 +113,10 @@ function get_priors(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     n_latent = spec.hyper.n_latent
-    return """ # Priors for sigma and raw innovations
+    return """
+    # Priors for Cyclic component: $(spec.key)
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
+    $(p_names.innovations) ~ MvNormal(zeros($(n_latent)), I)
     """
 end
 
@@ -155,16 +128,6 @@ Generates code to sample the latent cyclic field. Supports three methods:
 - `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
 - `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
   factorization, suitable for gradient-free samplers.
-
-# Inputs
-- `m::Cyclic`: The `Cyclic` component instance.
-- `spec::NamedTuple`: The component's specification, including its `key` and `hyper` parameters.
-- `arch::String`: The model architecture (`"univariate"` or `"multivariate"`).
-- `outcome_idx::Union{Int, Nothing}`: The index of the outcome for multivariate models.
-- `M::NamedTuple`: The main model configuration.
-
-# Outputs
-- `String`: Turing code for constructing the latent cyclic field and adding it to the linear predictor.
 """
 function get_updates(
     m::Cyclic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -205,8 +168,6 @@ function get_updates(
 
     cholesky_sparse_code = """
         # --- Cyclic Component: $(key) (Sparse Cholesky, Not AD-Safe): ---
-        # This method is for didactic purposes and is NOT compatible with
-        # automatic differentiation (e.g., NUTS sampler).
         let
             hyper = spec_registry[:$(key)].hyper
             Q = hyper.Q_template
@@ -229,53 +190,47 @@ function get_updates(
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
     else
-        error("Unsupported method '$(m.method)' for Cyclic component. Supported methods are :spectral, :cholesky, and :cholesky_sparse.")
+        error(
+            "Unsupported method '$(m.method)' for Cyclic component. Supported " *
+            "methods are :spectral, :cholesky, and :cholesky_sparse."
+        )
     end
 end
 
 """
-    get_effects(m::Cyclic, chain, M::NamedTuple, n_samples, outcomes_N, spec, PS, N_total)::NamedTuple
+    get_effects(m::Cyclic, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
 
 Reconstructs the `Cyclic` component's effect from posterior samples, applying a
 sum-to-zero constraint for identifiability. This function dispatches on the method
 used during sampling.
-
-# Inputs
-- `m::Cyclic`: The `Cyclic` component instance.
-- `chain`: The MCMC chain object.
-- `M::NamedTuple`: The main model configuration.
-- `n_samples::Int`: The number of posterior samples.
-- `outcomes_N::Int`: The number of outcome variables.
-- `spec::NamedTuple`: The component's specification, including its `key` and `hyper` parameters.
-- `PS::Union{NamedTuple, Nothing}`: The prediction set configuration object, if applicable.
-- `N_total::Int`: The total number of observations (training + prediction).
-
-# Outputs
-- `NamedTuple`: A NamedTuple with `structured` and `noisy` effects, each a vector of matrices
-  `[N_total x n_samples]`.
 """
 function get_effects(
     m::Cyclic, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
+    N_total::Int, is_multivariate_model::Bool
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(
+            p_names, string(p_names_k.sigma), k, is_multivariate_model
+        )
+        innovations_name = _find_parameter(
+            p_names, string(p_names_k.innovations), k, is_multivariate_model
+        )
 
         if isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for Cyclic component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            @warn "Parameters for Cyclic component $(spec.key) (outcome $k) not " *
+                  "found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
 
@@ -288,8 +243,6 @@ function get_effects(
                 effect_k[:, j] = U * (diag_D .* innovations_samples[j, :])
             end
         else # :cholesky or :cholesky_sparse
-            # For reconstruction, we can use the pre-computed dense factor for both
-            # Cholesky methods as it does not involve AD.
             F = spec.hyper.cholesky_factor
             for j in 1:n_samples
                 latent_field_raw = F.L' \ innovations_samples[j, :]
@@ -298,7 +251,12 @@ function get_effects(
             end
         end
         
-        u_idx_full = isnothing(PS) ? M.u_idx : vcat(M.u_idx, PS.u_idx)
+        # Reconstruct u_idx_full for prediction if PS is provided
+        u_idx_full = if !isnothing(PS) && haskey(PS, :u_idx)
+            vcat(M.u_idx, PS.u_idx)
+        else
+            M.u_idx
+        end
         indexed_effects = effect_k[u_idx_full, :]
         push!(structured_effects, indexed_effects)
     end

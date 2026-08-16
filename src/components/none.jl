@@ -28,18 +28,7 @@ struct None <: ComponentModel end
 
 COMPONENT_TYPE_REGISTRY[:none] = None
 COMPONENT_CONSTRUCTORS[:none] = (p, params) -> None()
-MODEL_TO_STRUCTURE_MAP[:none] = :none
-
-"""
-    get_datastructures!(m_type::Type{<:None}, M::Dict, mod_data::Dict)::Bool
-
-A pass-through function for the `None` component. It performs no actions and
-returns `true`.
-"""
-function get_datastructures!(m_type::Type{<:None}, M::Dict, mod_data::Dict)::Bool
-    # This component does not require any data setup.
-    return true
-end
+MODEL_TO_STRUCTURE_MAP[:none] = :none 
 
 """
     get_precomputes(m::None, M::NamedTuple, mod_data::Dict)::NamedTuple

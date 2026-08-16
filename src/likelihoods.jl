@@ -370,3 +370,40 @@ function bstm_kernel(fam::AbstractBSTM_Family, ::IntervalCensored, zero_inflated
         return _stable_logsubexp(logcdf(dist, upper_bound), logcdf(dist, adj_L))
     end
 end
+
+
+
+"""
+    _stable_logsubexp(a::Real, b::Real)
+
+Computes `log(exp(a) - exp(b))` in a numerically stable way.
+
+# Version
+v1.0.1 (2026-08-13)
+
+# Rationale
+This function is a core numerical utility used in the calculation of log-probabilities
+for censored data, where the probability of an event occurring within an interval
+is required. Direct computation can lead to overflow if `a` is large or underflow
+(loss of precision) if `a` and `b` are close. This implementation uses a standard
+log-space trick to maintain numerical stability. It is equivalent to the `logsubexp`
+function from `LogExpFunctions.jl`.
+
+# Mathematical Formulation
+The function implements the identity:
+`log(exp(a) - exp(b)) = log(exp(a) * (1 - exp(b-a))) = a + log(1 - exp(b-a))`
+The term `log(1 - exp(x))` for `x < 0` is computed using the stable `LogExpFunctions.log1mexp(x)` function.
+
+# Arguments
+- `a::Real`: The larger number.
+- `b::Real`: The smaller number.
+
+# Returns
+- The value of `log(exp(a) - exp(b))`. Returns `-Inf` if `a <= b`.
+"""
+function _stable_logsubexp(a::Real, b::Real)
+    if a <= b
+        return -Inf
+    end
+    return a + LogExpFunctions.log1mexp(b - a)
+end

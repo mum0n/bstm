@@ -8,7 +8,7 @@ structured on a bipartite graph, where nodes are divided into two disjoint sets,
 and edges only connect nodes from different sets.
 
 # Version
-v1.0.4 (2026-08-11)
+v1.0.8 (2026-08-15)
 
 # Mathematical Summary
 The BCGN component models a latent spatial field on one partition of a bipartite
@@ -50,6 +50,10 @@ is applied to the latent field.
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the latent field.
 - `innovations_<key>`: The raw standard normal innovations for the latent field.
+
+# Key References
+- Kipf, T. N., & Welling, M. (2016). *Semi-supervised classification with graph convolutional networks*. arXiv preprint arXiv:1609.02907.
+- Rue, H., & Held, L. (2005). *Gaussian Markov Random Fields: Theory and Applications*. CRC Press.
 """
 struct BCGN <: ComponentModel
     sigma::UnivariateDistribution
@@ -62,45 +66,24 @@ COMPONENT_CONSTRUCTORS[:bcgn] = (p, params) -> BCGN(
 )
 MODEL_TO_STRUCTURE_MAP[:bcgn] = :spatial
 
-"""
-    get_datastructures!(m_type::Type{<:BCGN}, M::Dict, mod_data::Dict)::Bool
 
-Performs data-dependent setup for the `BCGN` component. It establishes the spatial
-context (s_idx, s_N, W) and then converts the unipartite adjacency matrix `W` into
-a bipartite representation `B`, which is stored for the pre-computation step.
-
-# Assumptions
-- A base adjacency matrix `W` must be provided.
 """
-function get_datastructures!(
-    m_type::Type{<:BCGN}, M::Dict, mod_data::Dict
-)::Bool
-    process_spatial_module!(M, mod_data, Dict(), Dict())
-    
+    get_precomputes(m::BCGN, M::NamedTuple, mod_data::Dict)::NamedTuple
+
+Pre-computes the precision matrix `Q_template` from the one-mode projection of the
+bipartite graph, along with its spectral decomposition, Cholesky factorization,
+and a mapping matrix to link latent effects to observations.
+"""
+function get_precomputes(m::BCGN, M::NamedTuple, mod_data::Dict)::NamedTuple
     W = get(M, :W, nothing)
     if isnothing(W)
         error("The `bcgn` model requires an adjacency matrix `W`.")
     end
 
     bipartite_info = adjacency_to_bipartite(W)
-    
-    mod_data[:params][:bipartite_adj] = bipartite_info.bipartite_adj
-    mod_data[:params][:set1_indices] = bipartite_info.set1
-    mod_data[:params][:set2_indices] = bipartite_info.set2
-    
-    M[:s_N] = length(bipartite_info.set1)
-    
-    return true
-end
+    B = bipartite_info.bipartite_adj
+    set1_indices = bipartite_info.set1
 
-"""
-    get_precomputes(m::BCGN, M::NamedTuple, mod_data::Dict)::NamedTuple
-
-Pre-computes the precision matrix `Q_template` from the one-mode projection of the
-bipartite graph, along with its spectral decomposition and Cholesky factorization.
-"""
-function get_precomputes(m::BCGN, M::NamedTuple, mod_data::Dict)::NamedTuple
-    B = mod_data[:params][:bipartite_adj]
     if isempty(B) || all(iszero, B)
         error("BCGN component requires a non-empty bipartite adjacency matrix.")
     end
@@ -114,12 +97,22 @@ function get_precomputes(m::BCGN, M::NamedTuple, mod_data::Dict)::NamedTuple
     
     n_latent = size(Q_template, 1)
 
-    # Spectral decomposition for AD-friendly sampling
+    set1_map = Dict(original_idx => new_idx for (new_idx, original_idx) in enumerate(set1_indices))
+    
+    N_obs = M.y_N
+    mapping_matrix = spzeros(Float64, N_obs, n_latent)
+    for i in 1:N_obs
+        original_s_idx = M.s_idx[i]
+        if haskey(set1_map, original_s_idx)
+            latent_idx = set1_map[original_s_idx]
+            mapping_matrix[i, latent_idx] = 1.0
+        end
+    end
+
     eig_decomp = eigen(Symmetric(Matrix(Q_template)))
     U = eig_decomp.vectors
     L = eig_decomp.values
     
-    # Dense Cholesky factor for the :cholesky method
     F = cholesky(Symmetric(Matrix(Q_template) + M.noise * I))
 
     return (
@@ -127,9 +120,12 @@ function get_precomputes(m::BCGN, M::NamedTuple, mod_data::Dict)::NamedTuple
         U=U,
         L=L,
         n_latent=n_latent,
-        cholesky_factor=F
+        cholesky_factor=F,
+        mapping_matrix=mapping_matrix,
+        set1_indices=set1_indices
     )
 end
+
 
 """
     get_priors(m::BCGN, spec::NamedTuple, arch::String, outcome_idx, M)::String
@@ -142,9 +138,10 @@ function get_priors(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     n_latent = spec.hyper.n_latent
-    return """ # Priors for sigma and raw innovations
+    return """
+    # Priors for BCGN component: $(spec.key)
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
+    $(p_names.innovations) ~ MvNormal(zeros($(n_latent)), I)
     """
 end
 
@@ -165,43 +162,45 @@ function get_updates(
 
     spectral_code = """
         # --- BCGN Component (Spectral): $(key) ---
-        # This method uses spectral decomposition for AD-friendly sampling.
-        U = spec_registry[:$(key)].hyper.U
-        L = spec_registry[:$(key)].hyper.L
-        diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
-        # Enforce sum-to-zero constraint by setting components corresponding to the null space to zero.
-        diag_D[L .< 1e-6] .= 0.0
-        
-        latent_field = U * (diag_D .* $(p_names.innovations))
-        $(eta_target) .+= view(latent_field, M.s_idx)
+        let
+            hyper = spec_registry[:$(key)].hyper
+            U = hyper.U
+            L = hyper.L
+            diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
+            diag_D[L .< 1e-6] .= 0.0
+            
+            latent_field = U * (diag_D .* $(p_names.innovations))
+            $(eta_target) .+= hyper.mapping_matrix * latent_field
+        end
     """
 
     cholesky_code = """
         # --- BCGN Component (Cholesky, AD-Safe): $(key) ---
-        # This method uses a dense Cholesky factorization for AD-safe sampling.
-        F = spec_registry[:$(key)].hyper.cholesky_factor
-        latent_field_raw = F.L' \\ $(p_names.innovations)
-        
-        # Apply soft sum-to-zero constraint for identifiability against the global intercept.
-        Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
-        
-        latent_field = latent_field_raw .* $(p_names.sigma)
-        $(eta_target) .+= view(latent_field, M.s_idx)
+        let
+            hyper = spec_registry[:$(key)].hyper
+            F = hyper.cholesky_factor
+            latent_field_raw = F.L' \\ $(p_names.innovations)
+            
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            
+            latent_field = latent_field_raw .* $(p_names.sigma)
+            $(eta_target) .+= hyper.mapping_matrix * latent_field
+        end
     """
 
     cholesky_sparse_code = """
         # --- BCGN Component (Sparse Cholesky, Not AD-Safe): $(key) ---
-        # This method uses sparse Cholesky factorization, which is generally not AD-safe
-        # for gradient-based samplers but is retained as a didactic alternative.
-        Q = spec_registry[:$(key)].hyper.Q_template
-        F = cholesky(Symmetric(Q + M.noise * I))
-        latent_field_raw = F.L' \\ $(p_names.innovations)
-        
-        # Apply soft sum-to-zero constraint for identifiability against the global intercept.
-        Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
-        
-        latent_field = latent_field_raw .* $(p_names.sigma)
-        $(eta_target) .+= view(latent_field, M.s_idx)
+        let
+            hyper = spec_registry[:$(key)].hyper
+            Q = hyper.Q_template
+            F = cholesky(Symmetric(Q + M.noise * I))
+            latent_field_raw = F.L' \\ $(p_names.innovations)
+            
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            
+            latent_field = latent_field_raw .* $(p_names.sigma)
+            $(eta_target) .+= hyper.mapping_matrix * latent_field
+        end
     """
 
     if m.method == :spectral
@@ -217,24 +216,36 @@ end
 
 
 """
-    get_effects(m::BCGN, chain, M::NamedTuple, n_samples, outcomes_N, spec, PS, N_total)::NamedTuple
+    get_effects(m::BCGN, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
 
 Reconstructs the `BCGN` component's effect from the MCMC chain's posterior samples,
 dispatching on the method used during sampling.
 """
 function get_effects(
     m::BCGN, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
+    N_total::Int, is_multivariate_model::Bool
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
+
+    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
+    set1_map = Dict(original_idx => new_idx for (new_idx, original_idx) in enumerate(spec.hyper.set1_indices))
+    
+    mapping_matrix_full = spzeros(Float64, N_total, n_latent)
+    for i in 1:N_total
+        original_s_idx = s_idx_full[i]
+        if haskey(set1_map, original_s_idx)
+            latent_idx = set1_map[original_s_idx]
+            mapping_matrix_full[i, latent_idx] = 1.0
+        end
+    end
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for BCGN component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -243,7 +254,7 @@ function get_effects(
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
 
@@ -264,8 +275,7 @@ function get_effects(
             end
         end
         
-        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
-        indexed_effects = effect_k[s_idx_full, :]
+        indexed_effects = mapping_matrix_full * effect_k
         push!(structured_effects, indexed_effects)
     end
     

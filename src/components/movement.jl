@@ -1,3 +1,4 @@
+
 """
     Movement <: ComponentModel
 
@@ -8,13 +9,13 @@ the change in a latent field over time due to two primary processes: advection
 high to low concentration areas).
 
 # Version
-v1.0.2 (2026-08-12)
+v1.0.4 (2026-08-14)
 
 # Mathematical Summary
 The component approximates the solution to the advection-diffusion partial
 differential equation (PDE), which describes the transport of a substance or
 quantity. A general reference can be found on Wikipedia's page for the
-[Convection-diffusion equation](https://en.wikipedia.org/wiki/Convection%E2%80%93diffusion_equation).
+Convection-diffusion equation.
 
 \$\\frac{\\partial C}{\\partial t} = \\nabla \\cdot (D \\nabla C) - \\nabla \\cdot (\\mathbf{v} C)\$
 
@@ -111,36 +112,38 @@ function _raster_to_graph(raster::AbstractMatrix)
     return W
 end
 
-function get_datastructures!(m_type::Type{<:Movement}, M::Dict, mod_data::Dict)::Bool
+function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
     params = mod_data[:params]
-    data = M[:data]
-    
-    if !haskey(M, :W)
+    data = M.data
+    variables = mod_data[:variables]
+
+    W_from_params = get(params, :W, nothing)
+    W_from_main = get(M, :W, nothing)
+    W = isnothing(W_from_params) ? W_from_main : W_from_params
+
+    if isnothing(W)
         if haskey(params, :habitat_raster)
             raster = params[:habitat_raster]
             if !(raster isa AbstractMatrix); error("`habitat_raster` must be a matrix."); end
-            M[:W] = _raster_to_graph(raster)
+            W = _raster_to_graph(raster)
         else
             error("The `movement` component requires either an adjacency matrix `W` or a `habitat_raster` parameter.")
         end
     end
-    
-    process_spatial_module!(M, mod_data, Dict(), Dict())
-    process_temporal_module!(M, mod_data, Dict(), Dict())
-    
-    s_N = M[:s_N]
-    
+
+    s_N = size(W, 1)
+    t_N = M.t_N
+
+    habitat_data = nothing
     if haskey(params, :habitat)
         habitat_val = params[:habitat]
-        local habitat_data::Vector{Float64}
-
         if habitat_val isa Symbol
             if !hasproperty(data, habitat_val); error("Habitat variable ':$habitat_val' not found in data."); end
             habitat_per_obs = data[!, habitat_val]
             habitat_aggregated = zeros(Float64, s_N)
             counts = zeros(Int, s_N)
-            for i in 1:M[:y_N]
-                s_i = M[:s_idx][i]
+            for i in 1:M.y_N
+                s_i = M.s_idx[i]
                 habitat_aggregated[s_i] += habitat_per_obs[i]
                 counts[s_i] += 1
             end
@@ -151,15 +154,7 @@ function get_datastructures!(m_type::Type{<:Movement}, M::Dict, mod_data::Dict):
         else
             error("The `habitat` parameter must be a Symbol (column name) or a Vector of length s_N.")
         end
-        M[Symbol("habitat_", mod_data[:key])] = habitat_data
     end
-    
-    return true
-end
-
-function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
-    W = M.W
-    s_N = M.s_N
 
     L_template = build_structure_template(:besag, s_N; W=W).matrix
     
@@ -168,7 +163,18 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
     D_inv = spdiagm(0 => 1.0 ./ (out_degree .+ 1e-9))
     A_template = D_inv * W_dir
 
-    return (L_template=L_template, A_template=A_template, n_latent=s_N * M.t_N)
+    precomputes = Dict{Symbol, Any}(
+        :L_template => L_template,
+        :A_template => A_template,
+        :n_latent => s_N * t_N,
+        :s_N => s_N,
+        :t_N => t_N
+    )
+    if !isnothing(habitat_data)
+        precomputes[:habitat_data] = habitat_data
+    end
+
+    return NamedTuple(precomputes)
 end
 
 function get_priors(
@@ -182,7 +188,7 @@ function get_priors(
     push!(priors, "$(p_names.diffusion) ~ $(_distribution_to_string(m.diffusion))")
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
     
-    if haskey(M, Symbol("habitat_", spec.key))
+    if hasproperty(spec.hyper, :habitat_data)
         beta_habitat_diffusion_name = "beta_habitat_diffusion_$(spec.key)"
         push!(priors, "$(beta_habitat_diffusion_name) ~ Normal(0, 1.0)")
     end
@@ -199,22 +205,24 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
+    hyper = spec.hyper
 
-    diffusion_field_code = if haskey(M, Symbol("habitat_", key))
+    diffusion_field_code = if hasproperty(hyper, :habitat_data)
+        beta_habitat_diffusion_name = "beta_habitat_diffusion_$(key)"
         """
-        habitat_field = M[Symbol("habitat_$(key)")]
-        diffusion_field = $(p_names.diffusion) .* exp.(beta_habitat_diffusion_$(key) .* habitat_field)
+        habitat_field = spec_registry[:$(key)].hyper.habitat_data
+        diffusion_field = $(p_names.diffusion) .* exp.($(beta_habitat_diffusion_name) .* habitat_field)
         """
     else
-        "diffusion_field = fill($(p_names.diffusion), M.s_N)"
+        "diffusion_field = fill($(p_names.diffusion), $(hyper.s_N))"
     end
 
     common_setup = """
         # --- Movement Dynamics: $(key) ---
         $(diffusion_field_code)
         T_num_dyn = eltype(diffusion_field)
-        dyn_field = zeros(T_num_dyn, M.s_N, M.t_N)
-        innov_matrix = reshape($(p_names.innovations), M.s_N, M.t_N)
+        dyn_field = zeros(T_num_dyn, $(hyper.s_N), $(hyper.t_N))
+        innov_matrix = reshape($(p_names.innovations), $(hyper.s_N), $(hyper.t_N))
         L_op = spec_registry[:$(key)].hyper.L_template
         A_op = spec_registry[:$(key)].hyper.A_template
     """
@@ -222,8 +230,8 @@ function get_updates(
     evolution_code = if m.method == :implicit
         """
         # Implicit Euler method (numerically stable, not AD-friendly)
-        for t in 2:M.t_N
-            propagator_t = lu(I(M.s_N) - $(p_names.velocity) * A_op - Diagonal(diffusion_field) * L_op)
+        for t in 2:$(hyper.t_N)
+            propagator_t = lu(I($(hyper.s_N)) - $(p_names.velocity) * A_op - Diagonal(diffusion_field) * L_op)
             dyn_field[:, t] = (propagator_t \\ dyn_field[:, t-1]) + innov_matrix[:, t]
         end
         """
@@ -231,7 +239,7 @@ function get_updates(
         """
         # Explicit Euler method (AD-friendly, conditionally stable)
         propagator_t = $(p_names.velocity) * A_op + Diagonal(diffusion_field) * L_op
-        for t in 2:M.t_N
+        for t in 2:$(hyper.t_N)
             dyn_field[:, t] = dyn_field[:, t-1] + propagator_t * dyn_field[:, t-1] + innov_matrix[:, t]
         end
         """
@@ -264,18 +272,22 @@ function get_effects(
     is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
     
-    L_op = spec.hyper.L_template
-    A_op = spec.hyper.A_template
+    hyper = spec.hyper
+    L_op = hyper.L_template
+    A_op = hyper.A_template
+    s_N = hyper.s_N
+    t_N = hyper.t_N
     
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
-    t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, PS.t_idx)
-    t_N_full = maximum(t_idx_full)
+    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
+    t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, []))
+    t_N_full = isempty(t_idx_full) ? 0 : maximum(t_idx_full)
 
     for k in 1:outcomes_N
-        velocity_name = _find_parameter(p_names_vec, string(key), "velocity", k, is_multivariate_model)
-        diffusion_name = _find_parameter(p_names_vec, string(key), "diffusion", k, is_multivariate_model)
-        sigma_name = _find_parameter(p_names_vec, string(key), "sigma", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(key), "innovations", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        velocity_name = _find_parameter(p_names_vec, string(p_names_k.velocity), k, is_multivariate_model)
+        diffusion_name = _find_parameter(p_names_vec, string(p_names_k.diffusion), k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names_vec, string(p_names_k.sigma), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(velocity_name) || isempty(diffusion_name) || isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for Movement component $(key) (outcome $k) not found. Returning zero-matrix."
@@ -286,10 +298,10 @@ function get_effects(
         velocity_samples = get_params_vector(chain, velocity_name, 1)[:, 1]
         diffusion_samples = get_params_vector(chain, diffusion_name, 1)[:, 1]
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, M.s_N * M.t_N)
+        innovations_samples = get_params_vector(chain, innovations_name, s_N * t_N)
         
-        beta_habitat_samples = if haskey(M, Symbol("habitat_", key))
-            beta_name = _find_parameter(p_names_vec, string(key), "beta_habitat_diffusion", k, is_multivariate_model)
+        beta_habitat_samples = if hasproperty(hyper, :habitat_data)
+            beta_name = _find_parameter(p_names_vec, "beta_habitat_diffusion_$(key)", k, is_multivariate_model)
             isempty(beta_name) ? nothing : get_params_vector(chain, beta_name, 1)[:, 1]
         else
             nothing
@@ -299,23 +311,23 @@ function get_effects(
 
         for i in 1:n_samples
             diffusion_field = if !isnothing(beta_habitat_samples)
-                habitat_field = M[Symbol("habitat_", key)]
+                habitat_field = hyper.habitat_data
                 diffusion_samples[i] .* exp.(beta_habitat_samples[i] .* habitat_field)
             else
-                fill(diffusion_samples[i], M.s_N)
+                fill(diffusion_samples[i], s_N)
             end
 
-            dyn_field = zeros(M.s_N, t_N_full)
-            innov_matrix_train = reshape(innovations_samples[i, :], M.s_N, M.t_N)
-            innov_matrix_full = if t_N_full > M.t_N
-                hcat(innov_matrix_train, randn(M.s_N, t_N_full - M.t_N))
+            dyn_field = zeros(s_N, t_N_full)
+            innov_matrix_train = reshape(innovations_samples[i, :], s_N, t_N)
+            innov_matrix_full = if t_N_full > t_N
+                hcat(innov_matrix_train, randn(s_N, t_N_full - t_N))
             else
-                innov_matrix_train
+                innov_matrix_train[:, 1:t_N_full]
             end
 
             if m.method == :implicit
                 for t in 2:t_N_full
-                    propagator_t = lu(I(M.s_N) - velocity_samples[i] * A_op - Diagonal(diffusion_field) * L_op)
+                    propagator_t = lu(I(s_N) - velocity_samples[i] * A_op - Diagonal(diffusion_field) * L_op)
                     dyn_field[:, t] = (propagator_t \ dyn_field[:, t-1]) + innov_matrix_full[:, t]
                 end
             else # :explicit

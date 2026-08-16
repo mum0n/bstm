@@ -7,7 +7,7 @@ structured (ICAR) component and an unstructured (IID) component, controlled by a
 single mixing parameter, `rho`.
 
 # Version
-v2.1.0 (2026-08-12)
+v2.1.2 (2026-08-16)
 
 # Mathematical Summary
 The Leroux model is a proper CAR model, meaning its precision matrix is always
@@ -62,47 +62,6 @@ COMPONENT_CONSTRUCTORS[:leroux] = (p, params) -> Leroux(
 
 MODEL_TO_STRUCTURE_MAP[:leroux] = :spatial
 
-function get_datastructures!(m_type::Type{<:Leroux}, M::Dict, mod_data::Dict)::Bool
-    data = M[:data]
-    params = mod_data[:params]
-    variables = mod_data[:variables]
-
-    if isempty(variables)
-        error(
-            "The Leroux model requires a spatial index variable, e.g., " *
-            "`random(region, model=:leroux)`."
-        )
-    end
-
-    if haskey(params, :W)
-        w_val = params[:W]
-        if w_val isa Expr || w_val isa Symbol
-            calling_mod = get(M, :calling_module, Main)
-            try
-                M[:W] = Core.eval(calling_mod, w_val)
-            catch e
-                error("Could not evaluate `W` argument `$(w_val)`. Error: $e")
-            end
-        else
-            M[:W] = w_val
-        end
-    end
-
-    if !haskey(M, :W) || isnothing(M[:W])
-        error("The Leroux model requires an adjacency matrix `W`.")
-    end
-
-    s_var_sym = Symbol(variables[1])
-    if !hasproperty(data, s_var_sym)
-        error("Spatial index variable ':$s_var_sym' not found in data.")
-    end
-    
-    M[:s_idx] = data[!, s_var_sym]
-    M[:s_N] = size(M[:W], 1)
-
-    return true
-end
-
 function get_precomputes(m::Leroux, M::NamedTuple, mod_data::Dict)::NamedTuple
     s_N = get(M, :s_N, 0)
     W = get(M, :W, nothing)
@@ -113,7 +72,7 @@ function get_precomputes(m::Leroux, M::NamedTuple, mod_data::Dict)::NamedTuple
         )
     end
 
-    template = build_structure_template(:leroux, s_N; W=W)
+    template = build_structure_template(:icar, s_N; W=W)
     F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
 
     return (
@@ -141,9 +100,10 @@ function get_priors(
         push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
         push!(priors_acc, "$(p_names.rho) ~ $(_distribution_to_string(m.rho))")
     end
-    push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
+    push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros($(n_latent)), I)")
     return join(priors_acc, "\n    ")
 end
+
 """
     get_updates(m::Leroux, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
@@ -163,7 +123,8 @@ function get_updates(
         # --- Leroux Spectral Assembly: $(key) ---
         let
             hyper = spec_registry[:$(key)].hyper
-            diag_D = $(p_names.sigma) ./ sqrt.((1.0 .- $(p_names.rho)) .+ $(p_names.rho) .* hyper.L .+ M.noise)
+            diag_D = $(p_names.sigma) ./ sqrt.((1.0 .- $(p_names.rho)) .+ 
+                                              $(p_names.rho) .* hyper.L .+ M.noise)
             $(p_names.latent) = hyper.U * (diag_D .* $(p_names.innovations))
             $(eta_target) .+= view($(p_names.latent), M.$(index_var))
         end
@@ -186,7 +147,8 @@ function get_updates(
         let
             Q_template = spec_registry[:$(key)].hyper.Q_template
             rho_val = $(p_names.rho)
-            Q_final = (1.0 - rho_val) .* sparse(I, size(Q_template)...) .+ rho_val .* Q_template
+            Q_final = (1.0 - rho_val) .* sparse(I, size(Q_template)...) .+ 
+                      rho_val .* Q_template
             F = cholesky(Symmetric(Q_final + M.noise * I))
             $(p_names.latent) = $(p_names.sigma) .* (F.U \\ $(p_names.innovations))
             $(eta_target) .+= view($(p_names.latent), M.$(index_var))
@@ -206,28 +168,35 @@ end
 
 function get_effects(
     m::Leroux, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
+    N_total::Int, is_multivariate_model::Bool
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
     n_latent = spec.hyper.n_latent
     s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        rho_name = _find_parameter(p_names_vec, string(spec.key), "rho", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(
+            p_names, string(p_names_k.sigma), k, is_multivariate_model
+        )
+        rho_name = _find_parameter(
+            p_names, string(p_names_k.rho), k, is_multivariate_model
+        )
+        innovations_name = _find_parameter(
+            p_names, string(p_names_k.innovations), k, is_multivariate_model
+        )
 
         if isempty(sigma_name) || isempty(rho_name) || isempty(innovations_name)
-            @warn "Parameters for Leroux component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            @warn "Parameters for Leroux component $(spec.key) (outcome $k) not found. " *
+                  "Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
         rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
         
         effect_k = zeros(Float64, n_latent, n_samples)
 

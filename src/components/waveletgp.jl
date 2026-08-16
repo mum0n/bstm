@@ -7,7 +7,7 @@ flexible, data-driven covariance structure. It is particularly effective at
 capturing processes with multi-scale features and non-stationarities.
 
 # Version
-v1.1.0 (2026-08-11)
+v1.1.1 (2026-08-14)
 
 # Mathematical Summary
 This component models a latent field \$f(s)\$ by defining the statistical properties
@@ -45,6 +45,11 @@ The model works as follows:
 - `sigma0_<key>`: The overall scale of the wavelet coefficient variances.
 - `alpha_<key>`: The smoothness/decay parameter.
 - `innovations_<key>`: The raw standard normal innovations for the wavelet coefficients.
+- `latent_<key>`: The reconstructed latent effect at the observation coordinates.
+
+# Key References
+- Nason, G. P. (2008). *Wavelet Methods in Statistics with R*. Springer.
+- Whittle, P. (1956). *On the variation of yield variance with plot size*. Biometrika, 43(3/4), 337-343.
 """
 struct WaveletGP <: ComponentModel
     sigma0::UnivariateDistribution
@@ -61,22 +66,6 @@ COMPONENT_CONSTRUCTORS[:waveletgp] = (p, params) -> WaveletGP(
     get(params, :resolution, 32)
 )
 MODEL_TO_STRUCTURE_MAP[:waveletgp] = :smooth
-
-function get_datastructures!(m_type::Type{<:WaveletGP}, M::Dict, mod_data::Dict)::Bool
-    variables = mod_data[:variables]
-    if isempty(variables)
-        error("WaveletGP model requires coordinate variables.")
-    end
-    
-    res = get(mod_data[:params], :resolution, 32)
-    if !ispow2(res)
-        error("Resolution for WaveletGP must be a power of 2. Got: $res")
-    end
-
-    coords = Matrix{Float64}(M[:data][!, Symbol.(variables)])
-    mod_data[:params][:coords] = coords
-    return true
-end
 
 """
     _get_wavelet_scale_indices_2d(res::Int, wt)
@@ -104,7 +93,23 @@ function _get_wavelet_scale_indices_2d(res::Int, wt)
 end
 
 function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTuple
-    coords = mod_data[:params][:coords]
+    # Data validation moved from get_datastructures!
+    variables = mod_data[:variables]
+    if isempty(variables)
+        error("WaveletGP model requires coordinate variables.")
+    end
+    
+    if !ispow2(m.resolution)
+        error("Resolution for WaveletGP must be a power of 2. Got: $(m.resolution)")
+    end
+
+    for var_sym in variables
+        if !hasproperty(M.data, Symbol(var_sym))
+            error("Coordinate variable ':$var_sym' for WaveletGP model not found in data.")
+        end
+    end
+
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
     res = m.resolution
     n_dims = size(coords, 2)
     
@@ -153,11 +158,12 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
+    key = spec.key
     priors = String[]
 
     push!(priors, "$(p_names.sigma0) ~ $(_distribution_to_string(m.sigma0))")
     push!(priors, "$(p_names.alpha) ~ $(_distribution_to_string(m.alpha))")
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
@@ -199,11 +205,10 @@ function get_updates(
 end
 
 function get_effects(
-    m::WaveletGP, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::WaveletGP, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
+    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
-    is_multivariate_model = M.model_arch == "multivariate"
     p_names_vec = string.(FlexiChains.parameters(chain))
     hyper = spec.hyper
     res = hyper.resolution
@@ -216,15 +221,17 @@ function get_effects(
     else
         hyper.coords
     end
+    N_total_eff = size(coords_full, 1)
 
     for k in 1:outcomes_N
-        sigma0_name = _find_parameter(p_names_vec, string(spec.key), "sigma0", k, is_multivariate_model)
-        alpha_name = _find_parameter(p_names_vec, string(spec.key), "alpha", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        sigma0_name = _find_parameter(p_names_vec, v.sigma0, k, is_multivariate_model)
+        alpha_name = _find_parameter(p_names_vec, v.alpha, k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
 
         if isempty(sigma0_name) || isempty(alpha_name) || isempty(innovations_name)
             @warn "Parameters for WaveletGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_total, n_samples))
+            push!(structured_effects, zeros(Float64, N_total_eff, n_samples))
             continue
         end
 
@@ -232,7 +239,7 @@ function get_effects(
         alpha_samples = get_params_vector(chain, alpha_name, 1)[:, 1]
         innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
-        effect_k = zeros(Float64, N_total, n_samples)
+        effect_k = zeros(Float64, N_total_eff, n_samples)
         wt = Wavelets.wavelet(m.wavelet)
 
         for i in 1:n_samples

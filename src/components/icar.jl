@@ -7,7 +7,7 @@ where the value at a location is assumed to be conditionally dependent on the
 average of its neighbors.
 
 # Version
-v1.2.0 (2026-08-11)
+v1.2.2 (2026-08-15)
 
 # Mathematical Summary
 The ICAR model defines a Gaussian Markov Random Field (GMRF) with a singular
@@ -66,11 +66,6 @@ COMPONENT_CONSTRUCTORS[:icar] = (p, params) -> ICAR(
 
 MODEL_TO_STRUCTURE_MAP[:icar] = :spatial
 
-function get_datastructures!(m_type::Type{<:ICAR}, M::Dict, mod_data::Dict)::Bool
-    process_spatial_module!(M, mod_data, Dict(), Dict())
-    return true
-end
-
 function get_precomputes(m::ICAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     n = M.s_N
     W = M.W
@@ -100,6 +95,7 @@ function get_priors(
     $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
     """
 end
+
 function get_updates(
     m::ICAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -168,26 +164,31 @@ end
 
 function get_effects(
     m::ICAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
+    N_total::Int, is_multivariate_model::Bool
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(
+            p_names, string(p_names_k.sigma), k, is_multivariate_model
+        )
+        innovations_name = _find_parameter(
+            p_names, string(p_names_k.innovations), k, is_multivariate_model
+        )
 
         if isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for ICAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            @warn "Parameters for ICAR component $(spec.key) (outcome $k) not found. " *
+                  "Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, n_latent, n_samples)
 
@@ -208,7 +209,7 @@ function get_effects(
             end
         end
         
-        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
+        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
         indexed_effects = effect_k[s_idx_full, :]
         push!(structured_effects, indexed_effects)
     end
