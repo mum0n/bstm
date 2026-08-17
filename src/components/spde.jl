@@ -83,27 +83,40 @@ function get_precomputes(m::SPDE, M::NamedTuple, mod_data::Dict)::NamedTuple
         )
     end
 
+    # Get the device transfer function (e.g., identity or CuArray)
+    to_device = M.to_device
+
     W = M.W
+    # Ensure W_sym is a sparse matrix for efficiency
     W_sym = sparse((W + W') .> 0)
     D = spdiagm(0 => vec(sum(W_sym, dims=2)))
-    Q_template = D - W_sym
+    Q_template_cpu = D - W_sym
 
-    eig_decomp = eigen(Symmetric(Matrix(Q_template)))
-    U = eig_decomp.vectors
-    L = eig_decomp.values
-    scaling_factor = _compute_scaling_factor(L, 1)
+    # Perform eigen decomposition on CPU first, as it's often more stable/optimized there
+    # for sparse matrices, then move results to device.
+    # Convert to dense matrix for eigen decomposition if Q_template_cpu is sparse
+    eig_decomp = eigen(Symmetric(Matrix(Q_template_cpu)))
+    U_cpu = eig_decomp.vectors
+    L_cpu = eig_decomp.values
+    scaling_factor = _compute_scaling_factor(L_cpu, 1)
     
-    Q_template_scaled = Q_template ./ scaling_factor
-    L_scaled = L ./ scaling_factor
+    Q_template_scaled_cpu = Q_template_cpu ./ scaling_factor
+    L_scaled_cpu = L_cpu ./ scaling_factor
+
+    # Transfer precomputed data to the target device
+    U_device = to_device(U_cpu)
+    L_device = to_device(L_scaled_cpu)
+    Q_template_scaled_device = to_device(Q_template_scaled_cpu)
 
     return (
-        Q_template=Q_template_scaled,
+        Q_template=Q_template_scaled_device,
         scaling_factor=scaling_factor,
-        U=U,
-        L=L_scaled,
+        U=U_device,
+        L=L_device,
         n_latent=s_N
     )
 end
+
 
 function get_priors(
     m::SPDE, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -201,6 +214,8 @@ function get_updates(
     end
 end
 
+
+
 function get_effects(
     m::SPDE, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
     outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
@@ -209,8 +224,21 @@ function get_effects(
     
     n_latent = spec.hyper.n_latent
     noise = M.noise
-    Q_laplacian = spec.hyper.Q_template
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
+    
+    # Get the device transfer function (e.g., identity or CuArray)
+    to_device = M.to_device
+
+    # Retrieve precomputed hyper-parameters, which are already on the device
+    # if M.to_device is a GPU type, as handled by get_precomputes.
+    Q_laplacian_device = spec.hyper.Q_template
+    U_device = spec.hyper.U
+    L_device = spec.hyper.L
+
+    # Prepare s_idx_full on the device
+    s_idx_full_cpu = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
+    s_idx_full_device = to_device(s_idx_full_cpu)
+
+    # Determine if spectral method can be used (requires isotropic kappa)
     use_spectral = m.method == :spectral && !(m.kappa isa Vector)
     p_names_vec = string.(FlexiChains.parameters(chain))
 
@@ -220,43 +248,59 @@ function get_effects(
         kappa_name = _find_parameter(p_names_vec, v.kappa, k, is_multivariate_model)
         innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
 
+        # Check if all required parameters are found in the chain
         if isempty(sigma_name) || isempty(kappa_name) || isempty(innovations_name)
             @warn "Parameters for SPDE component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        # Extract posterior samples (these are initially on CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         kappa_dim = m.kappa isa Vector ? length(m.kappa) : 1
-        kappa_samples = get_params_vector(chain, kappa_name, kappa_dim)
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        kappa_samples_cpu = get_params_vector(chain, kappa_name, kappa_dim)
+        innovations_samples_cpu = get_params_vector(chain, innovations_name, n_latent)
 
-        effect_k = zeros(Float64, N_total, n_samples)
+        # Initialize the output matrix for the current outcome on the target device
+        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
 
+        # Iterate over each posterior sample to reconstruct the effect
         for i in 1:n_samples
-            local latent_field
+            # Move current sample's parameters to the device
+            current_sigma_device = to_device(sigma_samples_cpu[i])
+            current_kappa_device = to_device(kappa_samples_cpu[i, :])
+            current_innovations_device = to_device(innovations_samples_cpu[i, :])
+            
+            local latent_field_device
             if use_spectral
-                U, L = spec.hyper.U, spec.hyper.L
-                kappa_val = kappa_samples[i, 1]
-                diag_vals = (kappa_val^2 .+ L).^2
-                diag_D = sigma_samples[i] ./ sqrt.(diag_vals .+ noise)
-                latent_field = U * (diag_D .* innovations_samples[i, :])
-            else # Cholesky methods
-                current_kappa = kappa_samples[i, :]
-                Q_kappa_term = if m.kappa isa Vector
-                    Diagonal(current_kappa.^2)
+                # U_device, L_device are already on device from precomputes
+                kappa_val_device = current_kappa_device[1] # For isotropic kappa, take the first element
+                diag_vals_device = (kappa_val_device^2 .+ L_device).^2
+                diag_D_device = current_sigma_device ./ sqrt.(diag_vals_device .+ noise)
+                latent_field_device = U_device * (diag_D_device .* current_innovations_device)
+            else # Cholesky methods (dense or sparse)
+                # Q_laplacian_device is already on device from precomputes
+                Q_kappa_term_device = if m.kappa isa Vector
+                    Diagonal(current_kappa_device.^2)
                 else
-                    current_kappa[1]^2 * I(n_latent)
+                    current_kappa_device[1]^2 * to_device(I(n_latent)) # Ensure I(n_latent) is on device
                 end
-                L_operator = Q_kappa_term + Q_laplacian
-                Q_final = Symmetric(L_operator' * L_operator)
-                F = cholesky(Matrix(Q_final) + noise * I)
-                latent_field = sigma_samples[i] .* (F.L' \ innovations_samples[i, :])
+                
+                L_operator_device = Q_kappa_term_device + Q_laplacian_device
+                Q_final_device = Symmetric(L_operator_device' * L_operator_device)
+                
+                # Perform Cholesky decomposition on the device
+                # Matrix(Q_final_device) converts sparse to dense on device if needed
+                F_device = cholesky(to_device(Matrix(Q_final_device)) + noise * to_device(I(n_latent)))
+                latent_field_device = current_sigma_device .* (F_device.L' \ current_innovations_device)
             end
-            effect_k[:, i] = view(latent_field, s_idx_full)
+            # Apply the latent field to the appropriate indices for the current sample
+            effect_k_device[:, i] = view(latent_field_device, s_idx_full_device)
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final reconstructed effect for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
-
+    
     return (structured=structured_effects, noisy=structured_effects)
 end

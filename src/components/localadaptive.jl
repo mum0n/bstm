@@ -211,22 +211,49 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for LocalAdaptive component."); end
 end
 
-function get_effects(
-    m::LocalAdaptive, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
-)::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
-    hyper = spec.hyper
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
 
+"""
+    get_effects(m::LocalAdaptive, chain, spec, M, PS)
+
+Reconstructs the `LocalAdaptive` spatial effect from posterior samples. This
+version is updated to handle GPU arrays by moving sampled parameters to the
+device for computation and moving the final results back to the CPU.
+"""
+function get_effects(
+    m::LocalAdaptive, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
+)::NamedTuple
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+    
+    hyper = spec.hyper
+    noise = M.noise
+    n_latent = hyper.n_latent
+    n_clusters = hyper.n_clusters
+
+    # --- Index Handling: Combine training and prediction sets on device ---
+    s_idx_train = M.s_idx # Already on device
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        s_idx_pred_cpu = get(PS.data, :s_idx, [])
+        vcat(s_idx_train, to_device(s_idx_pred_cpu))
+    else
+        s_idx_train
+    end
+    N_total = length(s_idx_full)
+
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names_vec, string(p_names_k.sigma), k, is_multivariate_model)
-        rho_name = _find_parameter(p_names_vec, string(p_names_k.rho), k, is_multivariate_model)
-        innov_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k, is_multivariate_model)
-        cluster_innov_name = _find_parameter(p_names_vec, string(p_names_k.cluster_innovations), k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
+        innov_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+        cluster_innov_name = _find_parameter(p_names, string(p_names_k.cluster_innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(rho_name) || isempty(innov_name) || isempty(cluster_innov_name)
             @warn "Parameters for LocalAdaptive component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -234,33 +261,47 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-        innov_samples = get_params_vector(chain, innov_name, hyper.n_latent)
-        cluster_innov_samples = get_params_vector(chain, cluster_innov_name, hyper.n_clusters)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        rho_samples_cpu = get_params_vector(chain, rho_name, 1)[:, 1]
+        innov_samples_cpu = get_params_matrix(chain, innov_name, n_latent)
+        cluster_innov_samples_cpu = get_params_matrix(chain, cluster_innov_name, n_clusters)
         
-        effect_k = zeros(Float64, N_total, n_samples)
+        # Initialize the output matrix for the full latent field on the target device
+        latent_field_device = to_device(zeros(Float64, n_latent, n_samples))
         
+        # --- Sample-wise Reconstruction on the Target Device ---
         for i in 1:n_samples
-            cluster_means_raw = cluster_innov_samples[i, :]
-            cluster_means = cluster_means_raw .- mean(cluster_means_raw)
+            # Move current sample's parameters to the device
+            sigma_s = sigma_samples_cpu[i]
+            rho_s = rho_samples_cpu[i]
+            innov_s_device = to_device(innov_samples_cpu[i, :])
+            cluster_innov_s_device = to_device(cluster_innov_samples_cpu[i, :])
+
+            # Reconstruct the mean field on the device
+            cluster_means = cluster_innov_s_device .- mean(cluster_innov_s_device)
             mu_field = cluster_means[hyper.cluster_assignments]
             
             local latent_centered
             if m.method == :spectral
-                diag_D_leroux = 1.0 ./ sqrt.((1.0 - rho_samples[i]) .+ rho_samples[i] .* hyper.L .+ M.noise)
-                latent_centered = hyper.U * (diag_D_leroux .* innov_samples[i, :])
-                latent_field = mu_field .+ latent_centered .* sigma_samples[i]
+                U = hyper.U # Already on device
+                L = hyper.L # Already on device
+                diag_D_leroux = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L .+ noise)
+                latent_centered = U * (diag_D_leroux .* innov_s_device)
+                latent_field_device[:, i] = mu_field .+ latent_centered
             else # :cholesky or :cholesky_sparse
-                Q_leroux = (1.0 - rho_samples[i]) .* I(hyper.n_latent) .+ rho_samples[i] .* hyper.Q_icar
-                F = cholesky(Symmetric(Matrix(Q_leroux) + M.noise * I))
-                latent_centered = F.L' \ innov_samples[i, :]
-                latent_field = mu_field .+ latent_centered .* sigma_samples[i]
+                Q_icar = hyper.Q_icar # Already on device
+                I_device = to_device(Matrix(I, n_latent, n_latent))
+                Q_leroux = (1.0 - rho_s) .* I_device .+ rho_s .* Q_icar
+                F = cholesky(Symmetric(Q_leroux + noise * I_device))
+                latent_centered = F.L' \ innov_s_device
+                latent_field_device[:, i] = mu_field .+ latent_centered .* sigma_s
             end
-            
-            effect_k[:, i] = latent_field[s_idx_full]
         end
-        push!(structured_effects, effect_k)
+        
+        # Index the reconstructed effects for the full observation set and move back to CPU
+        indexed_effects_device = latent_field_device[s_idx_full, :]
+        push!(structured_effects, Array(indexed_effects_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

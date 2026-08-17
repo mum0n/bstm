@@ -222,10 +222,9 @@ end
 Reconstructs the barycentric smooth effect from posterior samples, dispatching
 on the method used during sampling.
 """
-function get_effects(
-    m::Barycentric, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+function get_effects( # Line 283
+    m::Barycentric, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     structured_effects = Vector{Matrix{Float64}}()
     
@@ -233,9 +232,12 @@ function get_effects(
     B_full = if !isnothing(PS)
         coord_vars = get(spec.params, :positional_args, [])
         if all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-            coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-            B_pred = bstm_barycentric_basis_2D(coords_pred, spec.hyper.knots)
-            vcat(B_train, B_pred)
+            coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+            # bstm_barycentric_basis_2D creates a CPU sparse matrix
+            B_pred_cpu = bstm_barycentric_basis_2D(coords_pred_cpu, spec.hyper.knots)
+            # Move B_pred to the target device if GPU is enabled
+            B_pred_device = M.to_device(B_pred_cpu)
+            vcat(B_train, B_pred_device)
         else
             @warn "Prediction coordinates not found for Barycentric component " *
                   "$(spec.key). Returning effects for training data only."
@@ -244,7 +246,15 @@ function get_effects(
     else
         B_train
     end
+    n_obs_full = size(B_full, 1)
 
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device # This will be Array or CuArray etc.
+    noise_val = get(M, :noise, 1e-6)
     n_knots = spec.hyper.n_knots
 
     for k in 1:outcomes_N
@@ -262,17 +272,20 @@ function get_effects(
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        
-        coeffs_samples_matrix = zeros(Float64, n_knots, n_samples)
+        # Initialize the output matrix for coefficients on the target device
+        coeffs_samples_matrix_device = to_device(zeros(Float64, n_knots, n_samples))
         
         if m.method == :centered
             latent_name = _find_parameter(
                 p_names, string(p_names_k.latent), k, is_multivariate_model
             )
             if !isempty(latent_name)
-                latent_samples = get_params_matrix(chain, latent_name, n_knots)
+                latent_samples_cpu = get_params_matrix(chain, latent_name, n_knots)
                 for i in 1:n_samples
-                    coeffs_samples_matrix[:, i] = latent_samples[i, :] .* sigma_samples[i]
+                    # Move samples to device for computation
+                    latent_device = to_device(latent_samples_cpu[i, :])
+                    sigma_device = to_device(sigma_samples[i])
+                    coeffs_samples_matrix_device[:, i] = latent_device .* sigma_device
                 end
             else
                 @warn "Latent coefficients for centered Barycentric component " *
@@ -283,20 +296,25 @@ function get_effects(
                 p_names, string(p_names_k.innovations), k, is_multivariate_model
             )
             if !isempty(innov_name)
-                innov_samples = get_params_matrix(chain, innov_name, n_knots)
+                innov_samples_cpu = get_params_matrix(chain, innov_name, n_knots)
                 if m.method == :noncentered
                     for i in 1:n_samples
-                        coeffs_samples_matrix[:, i] = innov_samples[i, :] .* 
-                                                      sigma_samples[i]
+                        # Move samples to device for computation
+                        innov_device = to_device(innov_samples_cpu[i, :])
+                        sigma_device = to_device(sigma_samples[i])
+                        coeffs_samples_matrix_device[:, i] = innov_device .* sigma_device
                     end
                 else # :gmrfsmooth
-                    U, L = spec.hyper.U, spec.hyper.L
-                    noise_val = get(M, :noise, 1e-6)
+                    U = spec.hyper.U # Already on device
+                    L = spec.hyper.L # Already on device
                     for i in 1:n_samples
-                        diag_D = sigma_samples[i] ./ sqrt.(L .+ noise_val)
-                        diag_D[1] = 0.0
-                        coeffs_samples_matrix[:, i] = U * (diag_D .* 
-                                                      innov_samples[i, :])
+                        # Move samples to device for computation
+                        innov_device = to_device(innov_samples_cpu[i, :])
+                        sigma_device = to_device(sigma_samples[i])
+                        
+                        diag_D_device = sigma_device ./ sqrt.(L .+ noise_val)
+                        diag_D_device[1] = 0.0 # Assuming L[1] corresponds to the rank-deficient mode
+                        coeffs_samples_matrix_device[:, i] = U * (diag_D_device .* innov_device)
                     end
                 end
             else
@@ -305,8 +323,10 @@ function get_effects(
             end
         end
         
-        effect_k = B_full * coeffs_samples_matrix
-        push!(structured_effects, effect_k)
+        # Perform matrix multiplication on the device
+        effect_k_device = B_full * coeffs_samples_matrix_device
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

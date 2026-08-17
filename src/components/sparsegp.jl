@@ -1,16 +1,17 @@
+
 """
     SparseGP <: ComponentModel
 
-A component for sparse Gaussian Process approximations, supporting both FITC
-(Fully Independent Training Conditional) and VFE (Variational Free Energy) methods.
-It approximates a full GP using a small set of `n_inducing` points to make it
-scalable for larger datasets.
+A component for sparse Gaussian Process approximations, supporting FITC (Fully
+Independent Training Conditional), VFE (Variational Free Energy), and PIC
+(Partially Independent Conditional) methods. It approximates a full GP using a
+small set of `n_inducing` points to make it scalable for larger datasets.
 
 # Version
-v1.2.0 (2026-08-14)
+v1.3.1 (2026-08-17)
 
 # Mathematical Summary
-Both methods approximate a full GP posterior by introducing a set of \$M\$ inducing
+All methods approximate a full GP posterior by introducing a set of \$M\$ inducing
 points, \$\\mathbf{Z}\$. The latent GP values \$f\$ are modeled as:
 \$f \\sim \\mathcal{N}(\\mu_f, \\Sigma_f)\$
 where the conditional mean is \$\\mu_f = K_{XZ} K_{ZZ}^{-1} u\$, with \$u \\sim \\mathcal{N}(0, K_{ZZ})\$.
@@ -21,6 +22,10 @@ The methods differ in their covariance approximation:
   \$\\Sigma_f = \\text{diag}(K_{XX} - Q_{XX}) + \\sigma_n^2 I\$, where \$Q_{XX} = K_{XZ} K_{ZZ}^{-1} K_{ZX}\$.
 - **`:vfe` (didactic)**: A pure low-rank approximation, equivalent to DTC.
   \$\\Sigma_f = Q_{XX}\$. This is simpler but can underestimate variance.
+- **`:pic`**: The Partially Independent Conditional approximation, which uses a
+  block-diagonal correction for improved variance estimation. The correction term is
+  a block-diagonal matrix where each block is \$K_{C_i, C_i} - Q_{C_i, C_i}\$ for
+  cluster \$i\$.
 
 # Computational Methods
 - `:fitc` (Default, AD-friendly): The Fully Independent Training Conditional approximation.
@@ -28,16 +33,19 @@ The methods differ in their covariance approximation:
 - `:vfe` (Didactic, AD-friendly): The Variational Free Energy approximation, also known
   as DTC. It is a pure low-rank approximation that can be faster but may
   underestimate variance. Retained for didactic purposes.
+- `:pic` (AD-friendly): The Partially Independent Conditional method, using
+  block-diagonal corrections for better variance estimates.
 
 # Inputs
 - **Required**:
   - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
 - **Optional (in `random()` call)**:
   - `n_inducing`: `Int`, the number of inducing points. Default: `20`.
+  - `n_clusters`: `Int`, the number of clusters for the PIC method. Default: `10`.
   - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`). Default: `"se"`.
   - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP. Default: `Exponential(1.0)`.
   - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
-  - `method`: `Symbol`, approximation method (`:fitc` or `:vfe`). Default: `:fitc`.
+  - `method`: `Symbol`, approximation method (`:fitc`, `:vfe`, or `:pic`). Default: `:fitc`.
   - `knot_method`: `Symbol`, method for placing inducing points (`:kmeans`, `:random`, `:quantile`, `:range`). Default: `:kmeans`.
 
 # Outputs (Parameter Names)
@@ -45,6 +53,7 @@ The methods differ in their covariance approximation:
 - `ls_<key>`: The kernel lengthscale(s).
 - `inducing_innovations_<key>`: Raw standard normal innovations for the inducing points.
 - `diag_innovations_<key>`: Raw standard normal innovations for the diagonal correction (for `:fitc` method).
+- `pic_innovations_<key>`: Raw standard normal innovations for the block correction (for `:pic` method).
 - `latent_<key>`: The reconstructed latent GP effect.
 
 # Key References
@@ -52,6 +61,9 @@ The methods differ in their covariance approximation:
   Pseudo-inputs*. In Advances in neural information processing systems, 18.
 - Titsias, M. (2009). *Variational learning of inducing variables in sparse
   Gaussian processes*. In AISTATS.
+- Vanhatalo, J., & Vehtari, A. (2007). *Sparse log-Gaussian process approximations
+  for spatial epidemiology*. In Proceedings of the 7th International Workshop on
+  Bayesian Inference in the Health Sciences.
 """
 struct SparseGP <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
@@ -90,15 +102,33 @@ function get_precomputes(m::SparseGP, M::NamedTuple, mod_data::Dict)::NamedTuple
         end
     end
 
-    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
-    knot_method = get(params, :knot_method, :kmeans)
-    Z_inducing = generate_inducing_points(coords, m.n_inducing; method=string(knot_method))
+    # Get the device transfer function
+    to_device = M.to_device
 
-    return (
-        coords=coords,
-        Z_inducing=Z_inducing,
-        n_latent=size(coords, 1)
+    # Perform data processing on the CPU first
+    coords_cpu = Matrix{Float64}(M.data[!, Symbol.(variables)])
+    knot_method = get(params, :knot_method, :kmeans)
+    Z_inducing_cpu = generate_inducing_points(coords_cpu, m.n_inducing; method=string(knot_method))
+
+    precomputes = Dict{Symbol, Any}(
+        :coords => to_device(coords_cpu),
+        :Z_inducing => to_device(Z_inducing_cpu),
+        :n_latent => size(coords_cpu, 1)
     )
+
+    # If using PIC, perform k-means clustering on CPU then move results to device
+    if m.method == :pic
+        n_clusters = get(params, :n_clusters, 10)
+        if n_clusters > precomputes[:n_latent]
+            n_clusters = precomputes[:n_latent]
+            @warn "n_clusters ($(params[:n_clusters])) is greater than the number of data points. Setting n_clusters to $(n_clusters)."
+        end
+        kmeans_res = kmeans(coords_cpu', n_clusters)
+        precomputes[:cluster_assignments] = to_device(assignments(kmeans_res))
+        precomputes[:n_clusters] = nclusters(kmeans_res)
+    end
+
+    return NamedTuple(precomputes)
 end
  
 function get_priors(
@@ -125,6 +155,12 @@ function get_priors(
         push!(
             priors,
             "$(p_names.diag_innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
+        )
+    elseif m.method == :pic
+        # For PIC, innovations are for the entire latent field, then partitioned by block.
+        push!(
+            priors,
+            "$(p_names.pic_innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
         )
     end
 
@@ -188,42 +224,97 @@ function get_updates(
         end
     """
 
+    pic_code = """
+        # --- PIC Sparse GP Component: $(key) ---
+        let
+            $(common_code)
+            
+            local K_UU_inv_u = K_UU \\ u_latent
+            local mean_f = K_XU * K_UU_inv_u
+            
+            # Initialize latent field with the mean component
+            $(p_names.latent) = deepcopy(mean_f)
+            
+            # Loop over each cluster to apply the block-diagonal correction
+            for g in 1:hyper.n_clusters
+                # Find indices for the current block
+                local block_indices = findall(==(g), hyper.cluster_assignments)
+                if isempty(block_indices)
+                    continue
+                end
+                
+                # Extract coordinates and cross-covariance for the block
+                local X_coords_block = X_coords[block_indices, :]
+                local K_XU_block = K_XU[block_indices, :]
+                
+                # Compute the exact kernel matrix for the block
+                local K_block = evaluate_kernel_matrix(
+                    X_coords_block, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
+                )
+                
+                # Compute the low-rank approximation for the block
+                local Q_block = K_XU_block * (K_UU \\ K_XU_block')
+                
+                # Compute the correction matrix and its Cholesky factor
+                local C_block = K_block - Q_block
+                local L_C_block = cholesky(Symmetric(C_block + I * M.noise)).L
+                
+                # Apply the correction to the latent field for this block
+                $(p_names.latent)[block_indices] .+= L_C_block * $(p_names.pic_innovations)[block_indices]
+            end
+            
+            $(eta_target) .+= $(p_names.latent)
+        end
+    """
+
     if m.method == :fitc
         return fitc_code
     elseif m.method == :vfe
         return vfe_code
+    elseif m.method == :pic
+        return pic_code
     else
         error("Unsupported method '$(m.method)' for SparseGP component.")
     end
 end
 
 function get_effects(
-    m::SparseGP, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SparseGP, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    
-    coords_train = spec.hyper.coords
-    coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
-    else
-        coords_train
-    end
-    n_obs_full = size(coords_full, 1)
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
 
-    Z_inducing = spec.hyper.Z_inducing
+    # --- Get precomputed data (already on device) ---
+    hyper = spec.hyper
+    coords_train_device = hyper.coords
+    Z_inducing_device = hyper.Z_inducing
+    n_obs_train = hyper.n_latent
+
+    # --- Coordinate Handling: Combine training and prediction sets on device ---
+    coord_vars = get(spec.params, :positional_args, [])
+    coords_full_device = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+        vcat(coords_train_device, to_device(coords_pred_cpu))
+    else
+        coords_train_device
+    end
+    n_obs_full = size(coords_full_device, 1)
+
     kernel_type = Symbol(m.kernel)
     noise = M.noise
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    structured_effects = Vector{Matrix{Float64}}()
 
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
-        v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
-        ls_name = _find_parameter(p_names_vec, v.ls, k, is_multivariate_model)
-        inducing_innov_name = _find_parameter(
-            p_names_vec, v.inducing_innovations, k, is_multivariate_model
-        )
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
+        inducing_innov_name = _find_parameter(p_names, string(p_names_k.inducing_innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(inducing_innov_name)
             @warn "Parameters for SparseGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -231,55 +322,95 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        ls_samples = get_params_vector(chain, ls_name, ls_dim)
-        inducing_innov_samples = get_params_vector(chain, inducing_innov_name, m.n_inducing)
+        ls_samples_cpu = get_params_vector(chain, ls_name, ls_dim)
+        inducing_innov_samples_cpu = get_params_vector(chain, inducing_innov_name, m.n_inducing)
 
-        effect_k = zeros(Float64, n_obs_full, n_samples)
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, n_obs_full, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         for i in 1:n_samples
-            current_sigma = sigma_samples[i]
-            current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
-            current_u_raw = inducing_innov_samples[i, :]
+            # Move current sample's parameters to the device
+            current_sigma = to_device(sigma_samples_cpu[i])
+            current_ls = to_device(ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1])
+            current_u_raw = to_device(inducing_innov_samples_cpu[i, :])
             
-            K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
-            K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
+            # Kernel evaluation and Cholesky happen on the device
+            K_UU = evaluate_kernel_matrix(Z_inducing_device, current_sigma, current_ls, kernel_type, noise)
+            K_XU_full = evaluate_cross_kernel_matrix(coords_full_device, Z_inducing_device, current_sigma, current_ls, kernel_type)
             
             L_UU = cholesky(Symmetric(K_UU)).L
             u_latent = L_UU * current_u_raw
             K_UU_inv_u = K_UU \ u_latent
-            mean_f = K_XU * K_UU_inv_u
+            mean_f = K_XU_full * K_UU_inv_u
 
             if m.method == :fitc
-                diag_innov_name = _find_parameter(
-                    p_names_vec, v.diag_innovations, k, is_multivariate_model
-                )
+                diag_innov_name = _find_parameter(p_names, string(p_names_k.diag_innovations), k, is_multivariate_model)
                 if isempty(diag_innov_name)
                     @warn "Diagonal innovations for FITC component $(spec.key) (outcome $k) not found. Using zero for correction."
-                    effect_k[:, i] = mean_f
+                    effect_k_device[:, i] = mean_f
                     continue
                 end
                 
-                diag_innov_samples = get_params_vector(chain, diag_innov_name, spec.hyper.n_latent)
-                diag_innov_i = if size(diag_innov_samples, 2) == n_obs_full
-                    diag_innov_samples[i, :]
+                diag_innov_samples_cpu = get_params_vector(chain, diag_innov_name, n_obs_train)
+                
+                # Handle prediction innovations
+                diag_innov_i_device = if n_obs_full > n_obs_train
+                    innov_train_device = to_device(diag_innov_samples_cpu[i, :])
+                    innov_pred_device = to_device(randn(Float32, n_obs_full - n_obs_train))
+                    vcat(innov_train_device, innov_pred_device)
                 else
-                    vcat(diag_innov_samples[i, :], randn(n_obs_full - size(diag_innov_samples, 2)))
+                    to_device(diag_innov_samples_cpu[i, :])
                 end
 
                 diag_K_XX = fill(current_sigma^2, n_obs_full)
-                tmp = (L_UU' \ K_XU')'
+                tmp = (L_UU' \ K_XU_full')'
                 diag_Q_ff = sum(tmp.^2, dims=2)
                 lambda_diag = diag_K_XX - vec(diag_Q_ff)
                 
-                effect_k[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* diag_innov_i
+                effect_k_device[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* diag_innov_i_device
+            elseif m.method == :pic
+                effect_k_device[:, i] = mean_f
+                pic_innov_name = _find_parameter(p_names, string(p_names_k.pic_innovations), k, is_multivariate_model)
+                if isempty(pic_innov_name)
+                    @warn "PIC innovations for component $(spec.key) (outcome $k) not found. Using mean-only prediction."
+                    continue
+                end
+                pic_innov_samples_cpu = get_params_vector(chain, pic_innov_name, n_obs_train)
+                pic_innov_i_device = to_device(pic_innov_samples_cpu[i, :])
+
+                # The PIC correction is only applied to the training data points
+                K_XU_train = K_XU_full[1:n_obs_train, :]
+                
+                for g in 1:hyper.n_clusters
+                    block_indices = findall(==(g), hyper.cluster_assignments)
+                    if isempty(block_indices)
+                        continue
+                    end
+                    
+                    coords_block = coords_train_device[block_indices, :]
+                    K_XU_block = K_XU_train[block_indices, :]
+                    
+                    K_block = evaluate_kernel_matrix(coords_block, current_sigma, current_ls, kernel_type, noise)
+                    Q_block = K_XU_block * (K_UU \ K_XU_block')
+                    C_block = K_block - Q_block
+                    L_C_block = cholesky(Symmetric(C_block + I * noise)).L
+                    
+                    block_correction = L_C_block * pic_innov_i_device[block_indices]
+                    effect_k_device[block_indices, i] .+= block_correction
+                end
             else # :vfe
-                effect_k[:, i] = mean_f
+                effect_k_device[:, i] = mean_f
             end
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+

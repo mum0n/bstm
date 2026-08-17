@@ -208,67 +208,90 @@ function get_updates(
 end
 
 function get_effects(
-    m::Wavelet, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::Wavelet, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
 
     hyper = spec.hyper
     noise = M.noise
     n_latent = hyper.n_latent
     nbins_per_dim = hyper.nbins_per_dim
-    
-    coords_train = hyper.coords
+
+    # --- Coordinate Handling: Combine training and prediction sets on CPU ---
+    # The basis generation step requires CPU data.
+    coords_train_cpu = Array(hyper.coords)
     coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
+    coords_full_cpu = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+        vcat(coords_train_cpu, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
     else
-        coords_train
+        coords_train_cpu
     end
+    N_total = size(coords_full_cpu, 1)
 
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    structured_effects = Vector{Matrix{Float64}}()
 
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
-        v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
-        ls_name = _find_parameter(p_names_vec, v.ls, k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(innovations_name)
             @warn "Parameters for Wavelet component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        ls_samples = get_params_vector(chain, ls_name, ls_dim)
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
-        effect_k = zeros(Float64, size(coords_full, 1), n_samples)
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
 
+        # --- Sample-wise Reconstruction ---
         for i in 1:n_samples
-            current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
-            B_wavelet_i = bstm_tensor_product_wavelet_basis(
-                coords_full, nbins_per_dim, m.family, current_ls
+            # 1. Generate basis matrix on CPU
+            current_ls_cpu = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+            B_wavelet_i_cpu = bstm_tensor_product_wavelet_basis(
+                coords_full_cpu, nbins_per_dim, m.family, current_ls_cpu
             )
             
-            local coeffs
+            # 2. Move basis matrix and samples to device
+            B_wavelet_i_device = to_device(B_wavelet_i_cpu)
+            innov_i_device = to_device(innovations_samples_cpu[i, :])
+            sigma_i_device = to_device(sigma_samples_cpu[i])
+            
+            # 3. Reconstruct coefficients on device
+            local coeffs_device
             if m.method == :spectral
-                U, L = hyper.U, hyper.L
-                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
-                diag_D[1] = 0.0; diag_D[2] = 0.0
-                coeffs = U * (diag_D .* innovations_samples[i, :])
+                U = hyper.U # Already on device
+                L = hyper.L # Already on device
+                diag_D_device = sigma_i_device ./ sqrt.(L .+ noise)
+                diag_D_device[1] = 0.0; diag_D_device[2] = 0.0
+                coeffs_device = U * (diag_D_device .* innov_i_device)
             else # :cholesky or :cholesky_sparse
-                F = hyper.cholesky_factor
-                coeffs_raw = F.L' \ innovations_samples[i, :]
-                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
-                coeffs = sigma_samples[i] .* coeffs_centered
+                F = hyper.cholesky_factor # Already on device
+                coeffs_raw_device = F.L' \ innov_i_device
+                coeffs_centered_device = coeffs_raw_device .- mean(coeffs_raw_device)
+                coeffs_device = sigma_i_device .* coeffs_centered_device
             end
             
-            effect_k[:, i] = B_wavelet_i * coeffs
+            # 4. Compute effect for this sample on device
+            effect_k_device[:, i] = B_wavelet_i_device * coeffs_device
         end
-        push!(structured_effects, effect_k)
+        
+        # 5. Move final result for this outcome back to CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

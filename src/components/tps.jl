@@ -79,51 +79,53 @@ function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
         end
     end
 
-    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
+    # Ensure data is on CPU for initial processing
+    coords_cpu = Matrix{Float64}(M.data[!, Symbol.(variables)])
     
-    n_obs, n_dims = size(coords)
+    n_obs, n_dims = size(coords_cpu)
     n_latent = m.nbins
 
     knot_method = get(mod_data[:params], :knot_method, :kmeans)
-    knots = generate_inducing_points(coords, n_latent; method=string(knot_method))
-    actual_n_knots = size(knots, 1)
+    knots_cpu = generate_inducing_points(coords_cpu, n_latent; method=string(knot_method))
+    actual_n_knots = size(knots_cpu, 1)
     if actual_n_knots < n_latent
         @warn "TPS: Could only generate $(actual_n_knots) unique knots, requested $(n_latent). Using $(actual_n_knots)."
         n_latent = actual_n_knots
     end
 
-    B = zeros(Float64, n_obs, n_latent)
+    # Basis matrix calculation on CPU
+    B_cpu = zeros(Float64, n_obs, n_latent)
     if n_dims == 1
-        for i in 1:n_latent; r = abs.(coords[:, 1] .- knots[i, 1]); B[:, i] .= r.^3; end
+        for i in 1:n_latent; r = abs.(coords_cpu[:, 1] .- knots_cpu[i, 1]); B_cpu[:, i] .= r.^3; end
     elseif n_dims == 2
-        for i in 1:n_latent; dist_sq = (coords[:, 1] .- knots[i, 1]).^2 .+ (coords[:, 2] .- knots[i, 2]).^2; r = sqrt.(dist_sq); B[:, i] .= (r.^2) .* log.(r .+ 1e-9); end
+        for i in 1:n_latent; dist_sq = (coords_cpu[:, 1] .- knots_cpu[i, 1]).^2 .+ (coords_cpu[:, 2] .- knots_cpu[i, 2]).^2; r = sqrt.(dist_sq); B_cpu[:, i] .= (r.^2) .* log.(r .+ 1e-9); end
     else
-        for i in 1:n_latent; dist_sq = sum((coords .- knots[i, :]').^2, dims=2); r = sqrt.(dist_sq); if isodd(n_dims); B[:, i] .= r.^(4 - n_dims); else; B[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9); end; end
+        for i in 1:n_latent; dist_sq = sum((coords_cpu .- knots_cpu[i, :]').^2, dims=2); r = sqrt.(dist_sq); if isodd(n_dims); B_cpu[:, i] .= r.^(4 - n_dims); else; B_cpu[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9); end; end
     end
     
+    # Penalty matrix and spectral decomposition on CPU
     template = build_structure_template(:rw2, n_latent)
-    Q_template = template.matrix
+    Q_template_cpu = template.matrix
     
     rank_deficiency = 2
-    eig_decomp = eigen(Symmetric(Matrix(Q_template)))
-    U = eig_decomp.vectors
-    L = eig_decomp.values
-    scaling_factor = _compute_scaling_factor(L, rank_deficiency)
+    eig_decomp = eigen(Symmetric(Matrix(Q_template_cpu)))
+    U_cpu = eig_decomp.vectors
+    L_cpu = eig_decomp.values
+    scaling_factor = _compute_scaling_factor(L_cpu, rank_deficiency)
     
-    Q_template_scaled = Q_template ./ scaling_factor
-    L_scaled = L ./ scaling_factor
+    Q_template_scaled_cpu = Q_template_cpu ./ scaling_factor
+    L_scaled_cpu = L_cpu ./ scaling_factor
 
-    F = cholesky(Symmetric(Matrix(Q_template_scaled) + M.noise * I))
-
+    # Move precomputed structures to the target device
+    to_device = M.to_device
     return (
-        basis_matrix=B,
-        Q_template=Q_template_scaled,
-        scaling_factor=scaling_factor,
-        U=U,
-        L=L_scaled,
-        n_latent=n_latent,
-        knots=knots,
-        cholesky_factor=F
+        basis_matrix = to_device(B_cpu),
+        Q_template = to_device(Q_template_scaled_cpu),
+        scaling_factor = scaling_factor,
+        U = to_device(U_cpu),
+        L = to_device(L_scaled_cpu),
+        n_latent = n_latent,
+        knots = to_device(knots_cpu)
     )
 end
 
@@ -170,7 +172,8 @@ function get_updates(
         # --- Thin Plate Spline (TPS) Smoother (Cholesky, AD-Safe): $(key) ---
         let
             $(common_code)
-            local F = hyper.cholesky_factor
+            local Q_penalty = hyper.Q_template
+            local F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
             local coeffs_raw = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
             local coeffs = $(p_names.sigma) .* coeffs_raw
@@ -199,78 +202,111 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for TPS component."); end
 end
 
+
 function get_effects(
-    m::TPS, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::TPS, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = string.(names(chain))
+    to_device = M.to_device
+
+    # --- Get precomputed data (already on device) ---
     hyper = spec.hyper
     noise = M.noise
     n_latent = hyper.n_latent
-    knots = hyper.knots
-    n_dims = size(knots, 2)
+    knots_device = hyper.knots
+    n_dims = size(knots_device, 2)
+    B_train_device = hyper.basis_matrix
 
-    B_train = hyper.basis_matrix
-    B_full = if !isnothing(PS)
-        coord_vars = get(spec.params, :positional_args, [])
-        if all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-            coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-            B_pred = zeros(Float64, size(coords_pred, 1), n_latent)
-            if n_dims == 1
-                for i in 1:n_latent; r = abs.(coords_pred[:, 1] .- knots[i, 1]); B_pred[:, i] .= r.^3; end
-            elseif n_dims == 2
-                for i in 1:n_latent; dist_sq = (coords_pred[:, 1] .- knots[i, 1]).^2 .+ (coords_pred[:, 2] .- knots[i, 2]).^2; r = sqrt.(dist_sq); B_pred[:, i] .= (r.^2) .* log.(r .+ 1e-9); end
-            else
-                for i in 1:n_latent; dist_sq = sum((coords_pred .- knots[i, :]').^2, dims=2); r = sqrt.(dist_sq); if isodd(n_dims); B_pred[:, i] .= r.^(4 - n_dims); else; B_pred[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9); end; end
-            end
-            vcat(B_train, B_pred)
-        else
-            B_train
-        end
-    else
-        B_train
-    end
+    # --- Coordinate and Basis Matrix Handling for Prediction ---
+    coord_vars = get(spec.params, :positional_args, [])
+    has_ps = !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
     
-    if size(B_full, 1) != N_total
-        @warn "TPS effect reconstruction: dimension mismatch. Using in-sample effects only."
-        B_full = B_train
+    N_train = size(B_train_device, 1)
+    N_total = has_ps ? N_train + size(PS.data, 1) : N_train
+
+    B_full_device = if has_ps
+        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+        coords_pred_device = to_device(coords_pred_cpu)
+        
+        B_pred_device = to_device(zeros(Float64, size(coords_pred_device, 1), n_latent))
+        
+        # Vectorized basis matrix calculation
+        if n_dims == 1
+            r = abs.(coords_pred_device[:, 1] .- knots_device[:, 1]')
+            B_pred_device .= r.^3
+        elseif n_dims == 2
+            dist_sq = (coords_pred_device[:, 1] .- knots_device[:, 1]').^2 .+ (coords_pred_device[:, 2] .- knots_device[:, 2]').^2
+            r = sqrt.(dist_sq)
+            B_pred_device .= (r.^2) .* log.(r .+ 1e-9)
+        else
+            # This part is harder to vectorize without a loop over knots
+            # We keep the loop for the general case; it will be slow on GPU but correct.
+            for i in 1:n_latent
+                dist_sq = sum((coords_pred_device .- knots_device[i, :]').^2, dims=2)
+                r = sqrt.(dist_sq)
+                if isodd(n_dims)
+                    B_pred_device[:, i] .= r.^(4 - n_dims)
+                else
+                    B_pred_device[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9)
+                end
+            end
+        end
+        vcat(B_train_device, B_pred_device)
+    else
+        B_train_device
     end
 
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    structured_effects = Vector{Matrix{Float64}}()
 
+    # --- Reconstruction Loop ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for TPS component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, size(B_full, 1), n_samples))
+            push!(structured_effects, zeros(Float64, size(B_full_device, 1), n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        # Extract posterior samples (CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_vector(chain, innovations_name, n_latent)
 
-        effect_k = zeros(Float64, size(B_full, 1), n_samples)
+        # Initialize output matrix on device
+        effect_k_device = to_device(zeros(Float64, size(B_full_device, 1), n_samples))
 
+        # --- Sample-wise Reconstruction on Device ---
         for i in 1:n_samples
-            local coeffs
+            # Move current sample's parameters to device
+            sigma_i = to_device(sigma_samples_cpu[i])
+            innovations_i = to_device(innovations_samples_cpu[i, :])
+            
+            local coeffs_device
             if m.method == :spectral
-                U, L = hyper.U, hyper.L
-                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
-                diag_D[1] = 0.0; diag_D[2] = 0.0
-                coeffs = U * (diag_D .* innovations_samples[i, :])
+                U_device, L_device = hyper.U, hyper.L
+                diag_D = sigma_i ./ sqrt.(L_device .+ noise)
+                diag_D[1] = 0.0; diag_D[2] = 0.0 # Enforce sum-to-zero constraints
+                coeffs_device = U_device * (diag_D .* innovations_i)
             else # :cholesky or :cholesky_sparse
-                F = hyper.cholesky_factor
-                coeffs_raw = F.L' \ innovations_samples[i, :]
+                # Recompute Cholesky on device
+                Q_penalty_device = hyper.Q_template
+                F_device = cholesky(Symmetric(Matrix(Q_penalty_device) + noise * I))
+                coeffs_raw = F_device.L' \ innovations_i
                 coeffs_centered = coeffs_raw .- mean(coeffs_raw)
-                coeffs = sigma_samples[i] .* coeffs_centered
+                coeffs_device = sigma_i .* coeffs_centered
             end
-            effect_k[:, i] = B_full * coeffs
+            effect_k_device[:, i] = B_full_device * coeffs_device
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
 
     return (structured=structured_effects, noisy=structured_effects)

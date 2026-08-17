@@ -156,12 +156,17 @@ function get_updates(
     """
 end
 
+
 function get_effects(
-    m::SVC, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SVC, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
+    # --- Setup: Extract dimensions ---
+    outcomes_N = M.outcomes_N
     cov_var = m.covariate
     
+    # --- Construct inner specification ---
+    # This creates the specification required to call the inner model's methods.
     inner_spec_key = Symbol("$(spec.key)_inner")
     inner_spec = (
         key = inner_spec_key,
@@ -172,16 +177,20 @@ function get_effects(
         hyper = spec.hyper.inner_precomputes
     )
 
-    inner_effects_result = get_effects(
-        m.model, chain, M, n_samples, is_multivariate_model, outcomes_N, inner_spec, PS, N_total
-    )
+    # --- Get effects from the inner spatial model ---
+    # This call will return effects on the CPU as per the ComponentModel interface contract.
+    # The heavy computation (and GPU usage) happens inside this call.
+    inner_effects_result = get_effects(m.model, chain, inner_spec, M, PS)
     
+    # --- Prepare covariate data on the CPU ---
     is_intercept = (cov_var == Symbol("1") || cov_var == :intercept)
     
-    cov_data_full = if is_intercept
-        ones(Float64, N_total)
+    # This data is constructed on the CPU.
+    cov_data_full_cpu = if is_intercept
+        ones(Float64, size(inner_effects_result.structured[1], 1))
     else
-        train_data = M.data[!, cov_var]
+        # The data in M.data might be a CuArray, so we need to bring it to the CPU with Array().
+        train_data = Array(M.data[!, cov_var])
         if !isnothing(PS)
             if hasproperty(PS.data, cov_var)
                 vcat(train_data, PS.data[!, cov_var])
@@ -193,19 +202,21 @@ function get_effects(
         end
     end
 
+    # --- Apply covariate to the inner spatial effect on the CPU ---
     structured_effects = Vector{Matrix{Float64}}()
     for k in 1:outcomes_N
+        # inner_effects_result.structured[k] is already a CPU matrix.
         spatial_effect_k = inner_effects_result.structured[k]
         
-        if size(spatial_effect_k, 1) != N_total
-            @warn "SVC effect reconstruction: dimension mismatch. Expected $(N_total) rows, but inner effect has $(size(spatial_effect_k, 1))."
-            # Attempt to handle this gracefully if possible, otherwise error might be better.
-            # For now, we'll proceed, but this indicates a problem in the inner get_effects.
+        if size(spatial_effect_k, 1) != length(cov_data_full_cpu)
+             @warn "SVC effect reconstruction: dimension mismatch. Expected $(length(cov_data_full_cpu)) rows, but inner effect has $(size(spatial_effect_k, 1)). This may indicate an issue with prediction data handling."
         end
 
-        final_effect_k = spatial_effect_k .* cov_data_full
+        # Perform element-wise multiplication on the CPU. This is computationally cheap.
+        final_effect_k = spatial_effect_k .* cov_data_full_cpu
         push!(structured_effects, final_effect_k)
     end
 
     return (structured=structured_effects, noisy=structured_effects)
 end
+

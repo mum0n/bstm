@@ -96,7 +96,7 @@ function get_priors(
 
     if m.method == :noncentered
         # Removed explicit `T` from `zeros` for better AD compatibility.
-        push!(priors_acc, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros($(n_latent)), I), :$(p_names.innovations))")
+        push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros($(n_latent)), I)")
     end
     
     return join(priors_acc, "\n    ")
@@ -147,15 +147,30 @@ function get_updates(
     end
 end
 
+
+
+
+"""
+    get_effects(m::IID, chain, spec, M, PS)
+
+Reconstructs the IID effect from posterior samples.  
+handle GPU arrays by moving sampled parameters to the device for computation and
+moving the final results back to the CPU.
+"""
 function get_effects(
-    m::IID, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::IID, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    p_names = names(chain)
+    to_device = M.to_device
+    
     n_latent = spec.hyper.n_latent
 
+    # --- Index Handling: Combine training and prediction sets on device ---
     index_var_sym = if spec.structure == :spatial
         :s_idx
     elseif spec.structure == :temporal
@@ -168,14 +183,23 @@ function get_effects(
         Symbol(string(spec.structure) * "_idx")
     end
 
-    idx_full = if haskey(M, index_var_sym)
-        isnothing(PS) || !haskey(PS, index_var_sym) ? M[index_var_sym] : vcat(M[index_var_sym], PS[index_var_sym])
+    # The index in M is already on the device.
+    idx_train_device = haskey(M, index_var_sym) ? M[index_var_sym] : to_device(ones(Int, M.y_N))
+    
+    idx_full_device = if !isnothing(PS) && hasproperty(PS.data, index_var_sym)
+        idx_pred_cpu = PS.data[!, index_var_sym]
+        vcat(idx_train_device, to_device(idx_pred_cpu))
     else
-        ones(Int, N_total)
+        idx_train_device
     end
+    N_total = length(idx_full_device)
 
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop ---
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names_vec, string(spec.key), "sigma", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         
         if isempty(sigma_name)
             @warn "Sigma parameter for IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -183,30 +207,40 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        # Samples are always on CPU
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         
-        local latent_field_samples
-        if m.method == :noncentered
-            innovations_name = _find_parameter(p_names_vec, string(spec.key), "innovations", k, is_multivariate_model)
+        latent_field_samples_device = if m.method == :noncentered
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
             if isempty(innovations_name)
                 @warn "Innovations for IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            innovations_samples = get_params_vector(chain, innovations_name, n_latent)
-            latent_field_samples = innovations_samples' .* sigma_samples
+            innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
+            
+            # Move to device for computation
+            innovations_device = to_device(innovations_samples_cpu)
+            sigma_device = to_device(sigma_samples_cpu)
+            
+            # Broadcasting on the device
+            innovations_device' .* sigma_device
         else # :centered
-            latent_name = _find_parameter(p_names_vec, string(spec.key), "latent", k, is_multivariate_model)
+            latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
             if isempty(latent_name)
-                @warn "Latent field for IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                @warn "Latent field for centered IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            latent_field_samples = get_params_vector(chain, latent_name, n_latent)'
+            latent_samples_cpu = get_params_matrix(chain, latent_name, n_latent)
+            to_device(latent_samples_cpu')
         end
         
-        effect_k = latent_field_samples[idx_full, :]
-        push!(structured_effects, effect_k)
+        # Indexing on the device
+        effect_k_device = latent_field_samples_device[idx_full_device, :]
+        
+        # Move final result back to CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

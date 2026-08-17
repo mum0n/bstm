@@ -6,7 +6,7 @@ geostatistics. It models a latent field by computing a dense covariance
 matrix based on a specified kernel function and coordinate inputs.
 
 # Version
-v1.2.4 (2026-08-15)
+v1.3.0 (2026-08-17)
 
 # Mathematical Summary
 The component models a latent field \$f(x)\$ as a draw from a Gaussian Process with
@@ -78,14 +78,19 @@ function get_precomputes(m::GP, M::NamedTuple, mod_data::Dict)::NamedTuple
 
     for var_sym in variables
         if !hasproperty(M.data, Symbol(var_sym))
-            error("Coordinate variable ':$var_sym' for GP not found in data.")
+            error("Coordinate variable ':$var_sym' for GP model not found in data.")
         end
     end
 
-    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
-    n_latent = size(coords, 1)
+    # Get the device transfer function
+    to_device = M.to_device
+
+    # Extract coordinates to a CPU matrix first to handle potential GPU arrays in M.data
+    coords_cpu = Matrix{Float64}(M.data[!, Symbol.(variables)])
+    n_latent = size(coords_cpu, 1)
     
-    return (coords=coords, n_latent=n_latent)
+    # Move coordinates to the target device
+    return (coords=to_device(coords_cpu), n_latent=n_latent)
 end
 
 function get_priors(
@@ -107,7 +112,9 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+    if m.method == :noncentered
+        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+    end
 
     return join(priors, "\n    ")
 end
@@ -158,28 +165,46 @@ function get_updates(
     end
 end
 
+"""
+    get_effects(m::GP, chain, spec, M, PS)
+
+Reconstructs the `GP` component's effect from posterior samples. This version is
+updated to handle GPU arrays by moving sampled parameters and prediction data to
+the device for computation, and moving the final results back to the CPU.
+"""
 function get_effects(
-    m::GP, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::GP, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
     
+    # --- Coordinate Handling: Combine training and prediction sets on device ---
     coord_vars = get(spec.params, :positional_args, [])
-    coords_train = spec.hyper.coords
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
+    coords_train_device = spec.hyper.coords # Already on device
+    
+    coords_full_device = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+        vcat(coords_train_device, to_device(coords_pred_cpu))
     else
-        coords_train
+        coords_train_device
     end
-    n_obs_train = size(coords_train, 1)
-    n_obs_full = size(coords_full, 1)
+    n_obs_train = size(coords_train_device, 1)
+    n_obs_full = size(coords_full_device, 1)
     
     noise = M.noise
     kernel_type = Symbol(m.kernel)
+    structured_effects = Vector{Matrix{Float64}}()
 
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        
+        # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
 
@@ -189,11 +214,15 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_samples = get_params_matrix(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
+        ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
 
-        effect_k = zeros(Float64, n_obs_full, n_samples)
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, n_obs_full, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         if m.method == :noncentered
             innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
             if isempty(innovations_name)
@@ -201,13 +230,25 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            innovations_samples = get_params_matrix(chain, innovations_name, n_obs_train)
+            innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_obs_train)
+
             for i in 1:n_samples
-                current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i, 1]
-                K_mat = evaluate_kernel_matrix(coords_full, sigma_samples[i], current_ls, kernel_type, noise)
+                current_ls = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+                
+                # Kernel evaluation and Cholesky happen on the device
+                K_mat = evaluate_kernel_matrix(coords_full_device, sigma_samples_cpu[i], current_ls, kernel_type, noise)
                 F = cholesky(Symmetric(K_mat))
-                innov_i = vcat(innovations_samples[i, :], randn(n_obs_full - n_obs_train))
-                effect_k[:, i] = F.L * innov_i
+                
+                # Combine training innovations with new innovations for prediction points on the device
+                innov_train_device = to_device(innovations_samples_cpu[i, :])
+                innov_i_device = if n_obs_full > n_obs_train
+                    innov_pred_device = to_device(randn(Float32, n_obs_full - n_obs_train))
+                    vcat(innov_train_device, innov_pred_device)
+                else
+                    innov_train_device
+                end
+                
+                effect_k_device[:, i] = F.L * innov_i_device
             end
         elseif m.method == :centered
             latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
@@ -216,28 +257,37 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            latent_samples = get_params_matrix(chain, latent_name, n_obs_train)
+            latent_samples_cpu = get_params_matrix(chain, latent_name, n_obs_train)
+
             for i in 1:n_samples
-                effect_k[1:n_obs_train, i] = latent_samples[i, :]
+                # Move training samples to device
+                effect_k_device[1:n_obs_train, i] = to_device(latent_samples_cpu[i, :])
+                
                 if n_obs_full > n_obs_train
-                    coords_pred = coords_full[(n_obs_train+1):end, :]
-                    current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i, 1]
+                    coords_pred_device = coords_full_device[(n_obs_train+1):end, :]
+                    current_ls = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
                     
-                    K_ff = evaluate_kernel_matrix(coords_train, sigma_samples[i], current_ls, kernel_type, noise)
-                    K_star_f = evaluate_cross_kernel_matrix(coords_pred, coords_train, sigma_samples[i], current_ls, kernel_type)
-                    K_star_star = evaluate_kernel_matrix(coords_pred, sigma_samples[i], current_ls, kernel_type, noise)
+                    # All kernel evaluations and linear algebra happen on the device
+                    K_ff = evaluate_kernel_matrix(coords_train_device, sigma_samples_cpu[i], current_ls, kernel_type, noise)
+                    K_star_f = evaluate_cross_kernel_matrix(coords_pred_device, coords_train_device, sigma_samples_cpu[i], current_ls, kernel_type)
+                    K_star_star = evaluate_kernel_matrix(coords_pred_device, sigma_samples_cpu[i], current_ls, kernel_type, noise)
                     
                     L_ff = cholesky(Symmetric(K_ff)).L
                     A = L_ff' \ (L_ff \ K_star_f')
-                    mu_pred = A' * latent_samples[i, :]
+                    mu_pred = A' * to_device(latent_samples_cpu[i, :])
                     Sigma_pred = K_star_star - K_star_f * A
                     
-                    effect_k[(n_obs_train+1):end, i] = rand(MvNormal(mu_pred, Symmetric(Sigma_pred)))
+                    # Sample from the conditional posterior on the device
+                    pred_innov = to_device(randn(Float32, size(Sigma_pred, 1)))
+                    effect_k_device[(n_obs_train+1):end, i] = mu_pred + cholesky(Symmetric(Sigma_pred)).L * pred_innov
                 end
             end
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+

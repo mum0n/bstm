@@ -7,7 +7,7 @@ where the value at a location is assumed to be conditionally dependent on the
 average of its neighbors.
 
 # Version
-v1.2.2 (2026-08-15)
+v1.3.0 (2026-08-17)
 
 # Mathematical Summary
 The ICAR model defines a Gaussian Markov Random Field (GMRF) with a singular
@@ -69,18 +69,26 @@ MODEL_TO_STRUCTURE_MAP[:icar] = :spatial
 function get_precomputes(m::ICAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     n = M.s_N
     W = M.W
-    
+    to_device = M.to_device
+
+    # build_structure_template returns CPU arrays
     template = build_structure_template(:icar, n; W=W)
     
-    F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
+    # Move precomputed structures to the target device
+    Q_template_device = to_device(template.matrix)
+    U_device = to_device(template.U)
+    L_device = to_device(template.L)
+    
+    # Pre-compute the dense Cholesky factor for the :cholesky method on the target device
+    F_device = cholesky(Symmetric(Matrix(Q_template_device) + M.noise * I))
     
     return (
-        Q_template=template.matrix, 
+        Q_template=Q_template_device, 
         scaling_factor=template.scaling_factor, 
-        U=template.U, 
-        L=template.L, 
+        U=U_device, 
+        L=L_device, 
         n_latent=n, 
-        cholesky_factor=F
+        cholesky_factor=F_device
     )
 end
 
@@ -163,56 +171,74 @@ function get_updates(
 end
 
 function get_effects(
-    m::ICAR, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::ICAR, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
     noise = M.noise
 
+    # --- Coordinate/Index Handling: Combine training and prediction sets on device ---
+    s_idx_train_device = M.s_idx # Already on device from main config
+    s_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        s_idx_pred_cpu = get(PS.data, :s_idx, [])
+        vcat(s_idx_train_device, to_device(s_idx_pred_cpu))
+    else
+        s_idx_train_device
+    end
+    N_total = length(s_idx_full_device)
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(
-            p_names, string(p_names_k.sigma), k, is_multivariate_model
-        )
-        innovations_name = _find_parameter(
-            p_names, string(p_names_k.innovations), k, is_multivariate_model
-        )
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for ICAR component $(spec.key) (outcome $k) not found. " *
-                  "Returning zero-matrix."
+            @warn "Parameters for ICAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
-        effect_k = zeros(Float64, n_latent, n_samples)
+        # Initialize the output matrix for the full latent field on the target device
+        effect_k_latent_device = to_device(zeros(Float64, n_latent, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         if m.method == :spectral
-            U = spec.hyper.U
-            L = spec.hyper.L
+            U_device = spec.hyper.U # Already on device
+            L_device = spec.hyper.L # Already on device
             for j in 1:n_samples
-                diag_D = sigma_samples[j] ./ sqrt.(L .+ noise)
+                diag_D = sigma_samples_cpu[j] ./ sqrt.(L_device .+ noise)
                 diag_D[1] = 0.0 # Enforce sum-to-zero
-                effect_k[:, j] = U * (diag_D .* innovations_samples[j, :])
+                innov_j_device = to_device(innovations_samples_cpu[j, :])
+                effect_k_latent_device[:, j] = U_device * (diag_D .* innov_j_device)
             end
         else # :cholesky or :cholesky_sparse
-            F = spec.hyper.cholesky_factor
+            F_device = spec.hyper.cholesky_factor # Already on device
             for j in 1:n_samples
-                latent_field_raw = F.L' \ innovations_samples[j, :]
+                innov_j_device = to_device(innovations_samples_cpu[j, :])
+                latent_field_raw = F_device.L' \ innov_j_device
                 latent_field_centered = latent_field_raw .- mean(latent_field_raw)
-                effect_k[:, j] = latent_field_centered .* sigma_samples[j]
+                effect_k_latent_device[:, j] = latent_field_centered .* sigma_samples_cpu[j]
             end
         end
         
-        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
-        indexed_effects = effect_k[s_idx_full, :]
-        push!(structured_effects, indexed_effects)
+        # Indexing on the device and moving the final result to CPU
+        indexed_effects_device = effect_k_latent_device[s_idx_full_device, :]
+        push!(structured_effects, Array(indexed_effects_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+

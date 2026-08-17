@@ -264,86 +264,137 @@ function get_updates(
 end
 
 function get_effects(
-    m::Movement, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::Movement, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    key = spec.key
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    p_names = names(chain)
+    to_device = M.to_device
     
+    key = spec.key
     hyper = spec.hyper
-    L_op = hyper.L_template
-    A_op = hyper.A_template
+    L_op = hyper.L_template # Already on device
+    A_op = hyper.A_template # Already on device
     s_N = hyper.s_N
-    t_N = hyper.t_N
-    
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
-    t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, []))
-    t_N_full = isempty(t_idx_full) ? 0 : maximum(t_idx_full)
+    t_N = hyper.t_N # Training time steps
 
+    # --- Index Handling: Combine training and prediction sets on device ---
+    s_idx_train = M.s_idx # Already on device
+    t_idx_train = M.t_idx # Already on device
+
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        vcat(s_idx_train, to_device(PS.data.s_idx))
+    else
+        s_idx_train
+    end
+    t_idx_full = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
+        vcat(t_idx_train, to_device(PS.data.t_idx))
+    else
+        t_idx_train
+    end
+    
+    N_total = length(s_idx_full)
+    t_N_full = isempty(t_idx_full) ? 0 : Array(maximum(t_idx_full))[] # Get max time on CPU
+
+    # Pre-calculate flat spatiotemporal index for efficient lookups on the device
+    st_idx_full = (t_idx_full .- 1) .* s_N .+ s_idx_full
+
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        velocity_name = _find_parameter(p_names_vec, string(p_names_k.velocity), k, is_multivariate_model)
-        diffusion_name = _find_parameter(p_names_vec, string(p_names_k.diffusion), k, is_multivariate_model)
-        sigma_name = _find_parameter(p_names_vec, string(p_names_k.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k, is_multivariate_model)
+        
+        # Find parameter names
+        velocity_name = _find_parameter(p_names, string(p_names_k.velocity), k, is_multivariate_model)
+        diffusion_name = _find_parameter(p_names, string(p_names_k.diffusion), k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(velocity_name) || isempty(diffusion_name) || isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for Movement component $(key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
+
+        # Extract all posterior samples to CPU first
+        velocity_samples_cpu = get_params_vector(chain, velocity_name, 1)[:, 1]
+        diffusion_samples_cpu = get_params_vector(chain, diffusion_name, 1)[:, 1]
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, s_N * t_N)
         
-        velocity_samples = get_params_vector(chain, velocity_name, 1)[:, 1]
-        diffusion_samples = get_params_vector(chain, diffusion_name, 1)[:, 1]
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, s_N * t_N)
-        
-        beta_habitat_samples = if hasproperty(hyper, :habitat_data)
-            beta_name = _find_parameter(p_names_vec, "beta_habitat_diffusion_$(key)", k, is_multivariate_model)
+        beta_habitat_samples_cpu = if hasproperty(hyper, :habitat_data)
+            beta_name = _find_parameter(p_names, "beta_habitat_diffusion_$(key)", k, is_multivariate_model)
             isempty(beta_name) ? nothing : get_params_vector(chain, beta_name, 1)[:, 1]
         else
             nothing
         end
 
-        reconstructed_effects_k = zeros(Float64, N_total, n_samples)
+        # Move all sample data to the device at once
+        velocity_samples_device = to_device(velocity_samples_cpu)
+        diffusion_samples_device = to_device(diffusion_samples_cpu)
+        sigma_samples_device = to_device(sigma_samples_cpu)
+        innovations_samples_device = to_device(innovations_samples_cpu') # [s_N*t_N, n_samples]
 
+        beta_habitat_samples_device = if !isnothing(beta_habitat_samples_cpu)
+            to_device(beta_habitat_samples_cpu)
+        else
+            nothing
+        end
+
+        # Initialize a large matrix on the device to hold the flattened dynamic field for all samples
+        dyn_field_all_samples_device = to_device(zeros(Float64, s_N * t_N_full, n_samples))
+        I_s_device = to_device(Matrix(I, s_N, s_N))
+
+        # --- Sample-wise Reconstruction on the Target Device ---
         for i in 1:n_samples
-            diffusion_field = if !isnothing(beta_habitat_samples)
-                habitat_field = hyper.habitat_data
-                diffusion_samples[i] .* exp.(beta_habitat_samples[i] .* habitat_field)
+            # Construct diffusion field for the current sample on the device
+            diffusion_field_device = if !isnothing(beta_habitat_samples_cpu)
+                habitat_field_device = hyper.habitat_data # Already on device
+                diffusion_samples_device[i] .* exp.(beta_habitat_samples_device[i] .* habitat_field_device)
             else
-                fill(diffusion_samples[i], s_N)
+                fill(diffusion_samples_device[i], s_N)
             end
 
-            dyn_field = zeros(s_N, t_N_full)
-            innov_matrix_train = reshape(innovations_samples[i, :], s_N, t_N)
-            innov_matrix_full = if t_N_full > t_N
-                hcat(innov_matrix_train, randn(s_N, t_N_full - t_N))
+            # Prepare innovations matrix on the device, extending for prediction if needed
+            innov_matrix_train_device = reshape(innovations_samples_device[:, i], s_N, t_N)
+            innov_matrix_full_device = if t_N_full > t_N
+                hcat(innov_matrix_train_device, to_device(randn(Float32, s_N, t_N_full - t_N)))
             else
-                innov_matrix_train[:, 1:t_N_full]
+                innov_matrix_train_device[:, 1:t_N_full]
             end
 
+            # Initialize the dynamic field for this sample on the device
+            dyn_field_sample_device = to_device(zeros(Float64, s_N, t_N_full))
+            dyn_field_sample_device[:, 1] = innov_matrix_full_device[:, 1]
+
+            # Time evolution loop on the device
             if m.method == :implicit
+                # This method is not AD-friendly but can be run on GPU if lu is supported
+                propagator_t = lu(I_s_device - velocity_samples_device[i] * A_op - Diagonal(diffusion_field_device) * L_op)
                 for t in 2:t_N_full
-                    propagator_t = lu(I(s_N) - velocity_samples[i] * A_op - Diagonal(diffusion_field) * L_op)
-                    dyn_field[:, t] = (propagator_t \ dyn_field[:, t-1]) + innov_matrix_full[:, t]
+                    dyn_field_sample_device[:, t] = (propagator_t \ dyn_field_sample_device[:, t-1]) .+ innov_matrix_full_device[:, t]
                 end
             else # :explicit
-                propagator_t = velocity_samples[i] * A_op + Diagonal(diffusion_field) * L_op
+                propagator_t = velocity_samples_device[i] * A_op + Diagonal(diffusion_field_device) * L_op
                 for t in 2:t_N_full
-                    dyn_field[:, t] = dyn_field[:, t-1] + propagator_t * dyn_field[:, t-1] + innov_matrix_full[:, t]
+                    dyn_field_sample_device[:, t] = dyn_field_sample_device[:, t-1] + propagator_t * dyn_field_sample_device[:, t-1] + innov_matrix_full_device[:, t]
                 end
             end
             
-            dyn_field .*= sigma_samples[i]
-            
-            for j in 1:N_total
-                reconstructed_effects_k[j, i] = dyn_field[s_idx_full[j], t_idx_full[j]]
-            end
+            # Scale by sigma and store the flattened result
+            dyn_field_sample_device .*= sigma_samples_device[i]
+            dyn_field_all_samples_device[:, i] = vec(dyn_field_sample_device)
         end
-        push!(structured_effects, reconstructed_effects_k)
+
+        # Index the full results matrix once using the pre-calculated flat indices
+        effect_k_device = dyn_field_all_samples_device[st_idx_full, :]
+        
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
 
     return (structured=structured_effects, noisy=structured_effects)

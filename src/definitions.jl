@@ -1,10 +1,4 @@
-
-
-# ==============================================================================
-# SECTION 1: CORE COMPONENT STRUCTURES AND TYPE DEFINITIONS
-# ==============================================================================
-
-
+ 
 abstract type Component end
 
 abstract type ComponentOperator <: Component end
@@ -174,13 +168,7 @@ const STATSMODELS_CONTRASTS = Dict(
     :treatment => StatsModels.DummyCoding()
 )
 
-# Purpose: Defines a mapping for models whose structure is unambiguous.
-# Rationale: This constant provides a central registry for models that always correspond
-#            to a specific structure (e.g., :leroux is always :spatial). It is used by
-#            `_infer_structure_from_args` to automatically determine the structure,
-#            reducing the need for explicit `structure=` specification by the user.
-#            This map acts as a fallback if a component file has not yet registered its
-#            model type in `MODEL_TO_STRUCTURE_MAP`.
+# Purpose: Defines a mapping for models whose structure is unambiguous. 
 const KNOWN_UNAMBIGUOUS_MODELS = Dict{Symbol, Symbol}(
     :icar => :spatial,
     :besag => :spatial,
@@ -218,12 +206,8 @@ const KNOWN_UNAMBIGUOUS_MODELS = Dict{Symbol, Symbol}(
     :nonstationaryvariance => :spacetime,
     :adaptivesmooth => :smooth
 )
+ 
 
-# Version 1.0.3 (2026-08-08)
-# Purpose: Defines a set of model names whose structure is truly ambiguous and must be inferred from context.
-# Rationale: These models can represent different structures (spatial, temporal, or smooth) depending
-#            on the number and type of input variables. This set is intentionally small, as most models
-#            have a clear, unambiguous structure.
 const AMBIGUOUS_MODELS = Set([
     :iid, # Can be spatial (with W), temporal (with time var), or smooth (generic var)
     :gp,  # Can be spatial (coords), temporal (time var), or smooth (generic var)
@@ -231,9 +215,7 @@ const AMBIGUOUS_MODELS = Set([
     :fft, # Can be spatial (coords) or temporal (time var)
 ])
 
-
-
-# This new constant maps legacy module names to their corresponding structure type.
+ 
 const LEGACY_MODULES = Dict(
     :spatial => :spatial,
     :temporal => :temporal,

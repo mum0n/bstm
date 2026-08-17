@@ -225,85 +225,125 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for RFF component."); end
 end
 
+"""
+    get_effects(m::RFF, chain, spec, M, PS)
+
+Reconstructs the RFF effect from posterior samples. This version is updated to
+handle GPU arrays by moving sampled parameters to the device for computation and
+moving the final results back to the CPU. It is optimized to use vectorized
+operations for fixed-feature methods, avoiding inefficient per-sample loops.
+"""
 function get_effects(
-    m::RFF, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::RFF, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+
     hyper = spec.hyper
     in_dims = hyper.in_dims
     n_features = hyper.n_latent
 
+    # --- Coordinate Handling: Combine training and prediction sets on device ---
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(hyper.coords, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
+        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+        vcat(hyper.coords, to_device(coords_pred_cpu)) # hyper.coords is already on device
     else
         hyper.coords
     end
+    N_total = size(coords_full, 1)
 
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    structured_effects = Vector{Matrix{Float64}}()
 
-    for k in 1:outcomes_N
-        v = generate_full_variable_names(spec, M.model_arch, k)
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
+    for k_outcome in 1:outcomes_N
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
 
-        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome, is_multivariate_model)
         if isempty(sigma_name)
-            @warn "Sigma parameter for RFF component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
+            @warn "Sigma parameter for RFF component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
 
-        local W_samples, b_samples
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
+
         if m.method == :adaptive
-            W_name = _find_parameter(p_names_vec, v.W, k, is_multivariate_model)
-            b_name = _find_parameter(p_names_vec, v.b, k, is_multivariate_model)
-            if isempty(W_name) || isempty(b_name)
-                @warn "Adaptive RFF parameters for component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
+            # --- Adaptive Method: Per-sample loop is necessary as W and b change ---
+            W_name = _find_parameter(p_names, string(p_names_k.W), k_outcome, is_multivariate_model)
+            b_name = _find_parameter(p_names, string(p_names_k.b), k_outcome, is_multivariate_model)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model)
+            
+            if isempty(W_name) || isempty(b_name) || isempty(innovations_name)
+                @warn "Adaptive RFF parameters for component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            W_samples = get_params_vector(chain, W_name, in_dims * n_features)
-            b_samples = get_params_vector(chain, b_name, n_features)
-        else # :fixed or :centered
-            W_samples = repeat(vec(hyper.W_fixed)', n_samples, 1)
-            b_samples = repeat(hyper.b_fixed', n_samples, 1)
-        end
+            
+            W_samples_cpu = get_params_vector(chain, W_name, in_dims * n_features)
+            b_samples_cpu = get_params_vector(chain, b_name, n_features)
+            innovations_samples_cpu = get_params_vector(chain, innovations_name, n_features)
 
-        effect_k = zeros(Float64, size(coords_full, 1), n_samples)
+            for i in 1:n_samples
+                # Move current sample's parameters to device
+                W_matrix_device = to_device(reshape(W_samples_cpu[i, :], in_dims, n_features))
+                b_vec_device = to_device(b_samples_cpu[i, :])
+                innov_i_device = to_device(innovations_samples_cpu[i, :])
+                sigma_i = to_device(sigma_samples_cpu[i])
 
-        if m.method in [:fixed, :adaptive]
-            innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
-            if isempty(innovations_name)
-                @warn "Innovations for RFF component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
-                continue
+                Phi_device = sqrt(2.0 / n_features) .* cos.((coords_full * W_matrix_device) .+ b_vec_device')
+                scaled_coeffs_device = innov_i_device .* sigma_i
+                effect_k_device[:, i] = Phi_device * scaled_coeffs_device
             end
-            innovations_samples = get_params_vector(chain, innovations_name, n_features)
-            for i in 1:n_samples
-                W_matrix = reshape(W_samples[i, :], in_dims, n_features)
-                b_vec = b_samples[i, :]
-                Phi = sqrt(2.0 / n_features) .* cos.((coords_full * W_matrix) .+ b_vec')
-                scaled_coeffs = innovations_samples[i, :] .* sigma_samples[i]
-                effect_k[:, i] = Phi * scaled_coeffs
-            end
-        else # :centered
-            latent_name = _find_parameter(p_names_vec, v.latent, k, is_multivariate_model)
-            if isempty(latent_name)
-                @warn "Latent coefficients for centered RFF component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, size(coords_full, 1), n_samples))
-                continue
-            end
-            coeffs_samples = get_params_vector(chain, latent_name, n_features)
-            for i in 1:n_samples
-                W_matrix = reshape(W_samples[i, :], in_dims, n_features)
-                b_vec = b_samples[i, :]
-                Phi = sqrt(2.0 / n_features) .* cos.((coords_full * W_matrix) .+ b_vec')
-                effect_k[:, i] = Phi * coeffs_samples[i, :]
+
+        else # :fixed or :centered methods
+            # --- Vectorized approach for fixed features ---
+            # RFF projection matrix is the same for all samples, so compute it once.
+            W_matrix_device = to_device(hyper.W_fixed)
+            b_vec_device = to_device(hyper.b_fixed)
+            Phi_device = sqrt(2.0 / n_features) .* cos.((coords_full * W_matrix_device) .+ b_vec_device')
+
+            if m.method == :fixed
+                innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model)
+                if isempty(innovations_name)
+                    @warn "Innovations for RFF component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
+                    push!(structured_effects, zeros(Float64, N_total, n_samples))
+                    continue
+                end
+                innovations_samples_cpu = get_params_vector(chain, innovations_name, n_features)
+                
+                # Move all samples to device at once and perform a single matrix multiplication
+                innovations_device = to_device(innovations_samples_cpu') # [n_features x n_samples]
+                sigma_device = to_device(sigma_samples_cpu') # [1 x n_samples]
+                
+                # Broadcasting scales each column of innovations by the corresponding sigma
+                scaled_coeffs_device = innovations_device .* sigma_device
+                effect_k_device = Phi_device * scaled_coeffs_device
+
+            else # :centered
+                latent_name = _find_parameter(p_names, string(p_names_k.latent), k_outcome, is_multivariate_model)
+                if isempty(latent_name)
+                    @warn "Latent coefficients for centered RFF component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
+                    push!(structured_effects, zeros(Float64, N_total, n_samples))
+                    continue
+                end
+                coeffs_samples_cpu = get_params_vector(chain, latent_name, n_features)
+                
+                # Move all samples to device at once and perform a single matrix multiplication
+                coeffs_device = to_device(coeffs_samples_cpu') # [n_features x n_samples]
+                effect_k_device = Phi_device * coeffs_device
             end
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

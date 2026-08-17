@@ -6,7 +6,7 @@ parameterization for spatial effects by separating them into a structured (ICAR)
 and an unstructured (IID) component.
 
 # Version
-v2.0.3 (2026-08-16)
+v2.1.0 (2026-08-17)
 
 # Mathematical Summary
 The BYM2 model decomposes a spatial random effect \$\\boldsymbol{\\phi}\$ into two parts:
@@ -75,17 +75,27 @@ function get_precomputes(m::BYM2, M::NamedTuple, mod_data::Dict)::NamedTuple
               "model configuration.")
     end
 
+    # Get the device transfer function
+    to_device = M.to_device
+
+    # build_structure_template returns CPU arrays
     template = build_structure_template(:bym2, s_N; W=M.W)
     
-    F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
+    # Move precomputed structures to the target device
+    Q_template_device = to_device(template.matrix)
+    U_device = to_device(template.U)
+    L_device = to_device(template.L)
+    
+    # Pre-compute the dense Cholesky factor for the :cholesky method on the target device
+    F_device = cholesky(Symmetric(Matrix(Q_template_device) + M.noise * I))
 
     return (
-        Q_template=template.matrix,
-        U=template.U,
-        L=template.L,
+        Q_template=Q_template_device,
+        U=U_device,
+        L=L_device,
         scaling_factor=template.scaling_factor,
         n_latent=s_N,
-        cholesky_factor=F
+        cholesky_factor=F_device
     )
 end
 
@@ -102,8 +112,8 @@ function get_priors(
                     "$(_distribution_to_string(m.unconstrained_rho))")
     
     # Priors for the raw innovations for the structured and unstructured components.
-    push!(priors, "$(p_names.struct) ~ MvNormal(zeros($(n_latent)), I)")
-    push!(priors, "$(p_names.iid) ~ MvNormal(zeros($(n_latent)), I)")
+    push!(priors, "$(p_names.struct) ~ MvNormal(zeros(T, $(n_latent)), I)")
+    push!(priors, "$(p_names.iid) ~ MvNormal(zeros(T, $(n_latent)), I)")
     
     return join(priors, "\n    ")
 end
@@ -181,74 +191,100 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for BYM2 component."); end
 end
 
+
 function get_effects(
-    m::BYM2, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, 
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{Nothing, NamedTuple}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::BYM2, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{Nothing, NamedTuple}
 )::NamedTuple
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+    noise = M.noise
+    hyper = spec.hyper
+    n_latent = hyper.n_latent
+
+    # --- Coordinate/Index Handling: Combine training and prediction sets ---
+    s_idx_train_device = M.s_idx # Already on device
+    s_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        s_idx_pred_cpu = get(PS.data, :s_idx, [])
+        vcat(s_idx_train_device, to_device(s_idx_pred_cpu))
+    else
+        s_idx_train_device
+    end
+    N_total = length(s_idx_full_device)
+
     structured_effects = Vector{Matrix{Float64}}()
     unstructured_effects = Vector{Matrix{Float64}}()
     noisy_effects = Vector{Matrix{Float64}}()
-    
-    hyper = spec.hyper
-    n_latent = hyper.n_latent
-    noise = M.noise
-    
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
 
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
         
+        # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
-        rho_name = _find_parameter(
-            p_names, string(v.unconstrained_rho), k, is_multivariate_model
-        )
+        rho_name = _find_parameter(p_names, string(v.unconstrained_rho), k, is_multivariate_model)
         struct_name = _find_parameter(p_names, string(v.struct), k, is_multivariate_model)
         iid_name = _find_parameter(p_names, string(v.iid), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(rho_name) || isempty(struct_name) || 
-           isempty(iid_name)
-            @warn "Parameters for BYM2 component $(spec.key) (outcome $k) not found. " *
-                  "Returning zero-matrices."
+        if isempty(sigma_name) || isempty(rho_name) || isempty(struct_name) || isempty(iid_name)
+            @warn "Parameters for BYM2 component $(spec.key) (outcome $k) not found. Returning zero-matrices."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             push!(unstructured_effects, zeros(Float64, N_total, n_samples))
             push!(noisy_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_samples = logistic.(get_params_vector(chain, rho_name, 1)[:, 1])
-        struct_samples = get_params_matrix(chain, struct_name, n_latent)
-        iid_samples = get_params_matrix(chain, iid_name, n_latent)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        rho_samples_cpu = logistic.(get_params_vector(chain, rho_name, 1)[:, 1])
+        struct_samples_cpu = get_params_matrix(chain, struct_name, n_latent)
+        iid_samples_cpu = get_params_matrix(chain, iid_name, n_latent)
 
-        struct_effect = zeros(Float64, n_latent, n_samples)
-        unstruct_effect = zeros(Float64, n_latent, n_samples)
+        # Initialize output matrices on the target device
+        struct_effect_device = to_device(zeros(Float64, n_latent, n_samples))
+        unstruct_effect_device = to_device(zeros(Float64, n_latent, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         for s in 1:n_samples
+            # Move current sample's innovations to the device
+            struct_innov_s = to_device(struct_samples_cpu[s, :])
+            iid_innov_s = to_device(iid_samples_cpu[s, :])
+            
+            # Reconstruct the structured component
             local struct_latent_s
             if m.method == :spectral
-                U, L = hyper.U, hyper.L
-                diag_D = 1.0 ./ sqrt.(L .+ noise)
-                diag_D[1] = 0.0
-                struct_latent_s = U * (diag_D .* struct_samples[s, :])
-            else # cholesky or cholesky_sparse
-                F = hyper.cholesky_factor
-                struct_latent_s = F.L' \ struct_samples[s, :]
+                U_device, L_device = hyper.U, hyper.L # Already on device
+                diag_D = 1.0 ./ sqrt.(L_device .+ noise)
+                diag_D[1] = 0.0 # Enforce sum-to-zero constraint
+                struct_latent_s = U_device * (diag_D .* struct_innov_s)
+            else # :cholesky or :cholesky_sparse
+                F_device = hyper.cholesky_factor # Already on device
+                struct_latent_s = F_device.L' \ struct_innov_s
             end
             
             struct_latent_centered = struct_latent_s .- mean(struct_latent_s)
             
-            struct_effect[:, s] = (sqrt(rho_samples[s]) .* struct_latent_centered) .* 
-                                  sigma_samples[s]
-            unstruct_effect[:, s] = (sqrt(1.0 - rho_samples[s]) .* iid_samples[s, :]) .* 
-                                    sigma_samples[s]
+            # Combine components on the device
+            sigma_s = sigma_samples_cpu[s] # CPU scalar
+            rho_s = rho_samples_cpu[s]     # CPU scalar
+            
+            struct_effect_device[:, s] = (sqrt(rho_s) .* struct_latent_centered) .* sigma_s
+            unstruct_effect_device[:, s] = (sqrt(1.0 - rho_s) .* iid_innov_s) .* sigma_s
         end
         
-        push!(structured_effects, struct_effect[s_idx_full, :])
-        push!(unstructured_effects, unstruct_effect[s_idx_full, :])
-        push!(noisy_effects, (struct_effect .+ unstruct_effect)[s_idx_full, :])
+        # Indexing on the device and moving the final results to CPU
+        push!(structured_effects, Array(struct_effect_device[s_idx_full_device, :]))
+        push!(unstructured_effects, Array(unstruct_effect_device[s_idx_full_device, :]))
+        
+        total_effect_device = struct_effect_device .+ unstruct_effect_device
+        push!(noisy_effects, Array(total_effect_device[s_idx_full_device, :]))
     end
     
     return (structured=structured_effects, unstructured=unstructured_effects, 
             noisy=noisy_effects)
 end
+

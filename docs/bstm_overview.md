@@ -9,7 +9,7 @@ format: html
 
 The `bstm` framework provides a composable, formula-based interface for Bayesian spatiotemporal modeling in Julia. It is designed to address the challenge of building complex models by separating the observation likelihood from the specification of the latent process. This decoupling allows for flexible construction of models that can include spatial, temporal, and mechanistic components in an additive and extensible manner. It is a Julia library built on the Turing.jl probabilistic programming framework and many, many other Julia libraries and many more scientists. This work really stands upon their giant shoulders. It provides a high-level, formula-based interface/front-end inspired by R's `brms` and `lme4` to simplify the specification of complex hierarchical models. The framework is designed for composability, allowing users to combine spatial, temporal, and mechanistic components to analyze complex datasets, particularly in fields like ecology and epidemiology. 
 
-`bstm` was designed to pursue my research interests and make my work-life simpler, especially as it often takes more time and effort to post-process data than actually set up the model. It is built on the strength and insights of many people and the strength and composability of Julia and Turing, in particular. It can easily be extended by others for their own purposes and provided as is, warts and all. Full disclosure: I have made heavy use of AI LLMs to restructure and expand the code, especially the crazy regex's and provide coherent descriptions and math, etc. Any errors are, of course, my own. Check your results with simulated data where possible.
+`bstm` was designed to pursue my research interests and make my work-life simpler, especially as it often takes more time and effort to post-process data than actually set up the model. It is built on the strength and insights of many people and the strength and composability of Julia and Turing, in particular. It can easily be extended by others for their own purposes and provided as is, warts and all. Full disclosure: I have made heavy use of AI LLMs to restructure and expand the code, especially the crazy regex's, GPU programming and consistent documentation. Any errors are, of course, my own. Check your results with simulated data where possible.
 
 
 ## 2. The Formula Interface
@@ -126,7 +126,25 @@ random(area_id, structure=:spatial, model=:bym2)
 random(lon, lat, structure=:spatial, model=:gp, kernel="matern32")
 ```
 
-### 2.4 Illustrative Examples
+### 2.4 Keyword arguments
+
+
+The `@bstm` macro accepts several keyword arguments that control the model's configuration, inference, and output. These are passed after the `data_frame` argument.
+
+| Keyword Argument | Example Usage | Description |
+| :--- | :--- | :--- |
+| `W` | `W=my_adjacency_matrix` | Provides the adjacency matrix required for discrete spatial models like `:icar`, `:bym2`, and `:leroux`. |
+| `verbose` | `verbose=false` | A `Bool` that controls the amount of output. If `true` (default), it prints the generated model code and prior predictive check results. |
+| `use_gpu` | `use_gpu=true` | A `Bool` that enables GPU acceleration for computationally intensive components. Requires a compatible NVIDIA GPU and CUDA setup. |
+| `prior_scheme` | `prior_scheme=:informative` | Sets the default prior scheme for all components. Options are `:pcpriors` (default), `:informative`, and `:uninformative`. |
+| `hyperpriors` | `hyperpriors=Dict(:sigma => Exponential(0.5))` | A `Dict` to specify global priors for hyperparameters, which will be used unless a local prior is set within a module. |
+| `sampler_choice` | `sampler_choice=NUTS(0.8)` | Overrides the automatic sampler selection and uses the provided sampler for the entire model. |
+| `sampler_map` | `sampler_map=Dict(:my_param => ESS())` | A `Dict` to assign specific samplers to specific parameter groups, used by `get_optimal_sampler`. |
+| `adtype` | `adtype=ADTypes.AutoZygote()` | Specifies the automatic differentiation backend for gradient-based samplers like `NUTS`. |
+
+
+
+### 2.5 Illustrative Examples
 
 1.  **BYM2 Disease Mapping:**
     `@bstm(likelihood(y, family=poisson) ~ intercept() + random(s_idx, model=:bym2), data, W=W)`

@@ -7,7 +7,7 @@ structured (ICAR) component and an unstructured (IID) component, controlled by a
 single mixing parameter, `rho`.
 
 # Version
-v2.1.2 (2026-08-16)
+v2.2.0 (2026-08-17)
 
 # Mathematical Summary
 The Leroux model is a proper CAR model, meaning its precision matrix is always
@@ -22,10 +22,10 @@ flexible way to model spatial autocorrelation.
 # Computational Methods
 - `:spectral` (Default, AD-friendly): Regularizes coefficients using a spectral
   decomposition of the ICAR precision matrix. Recommended for gradient-based samplers.
-- `:cholesky` (AD-friendly): Uses a pre-computed dense Cholesky factorization of the
-  full Leroux precision matrix.
+- `:cholesky` (AD-friendly): Uses a dense Cholesky factorization of the
+  full Leroux precision matrix, computed on-the-fly.
 - `:cholesky_sparse` (Didactic, Not AD-friendly): Uses sparse Cholesky factorization,
-  which is not compatible with most AD backends.
+  computed on-the-fly.
 
 # Inputs
 - **Required**:
@@ -72,16 +72,20 @@ function get_precomputes(m::Leroux, M::NamedTuple, mod_data::Dict)::NamedTuple
         )
     end
 
-    template = build_structure_template(:icar, s_N; W=W)
-    F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
+    # Get the device transfer function
+    to_device = M.to_device
 
+    # build_structure_template returns CPU arrays
+    template = build_structure_template(:icar, s_N; W=W)
+    
+    # Move precomputed structures to the target device.
+    # Do not pre-compute Cholesky factor as it depends on `rho`.
     return (
-        Q_template=template.matrix,
-        U=template.U,
-        L=template.L,
+        Q_template=to_device(template.matrix),
+        U=to_device(template.U),
+        L=to_device(template.L),
         scaling_factor=template.scaling_factor,
-        n_latent=s_N,
-        cholesky_factor=F
+        n_latent=s_N
     )
 end
 
@@ -100,9 +104,10 @@ function get_priors(
         push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
         push!(priors_acc, "$(p_names.rho) ~ $(_distribution_to_string(m.rho))")
     end
-    push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros($(n_latent)), I)")
+    push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
     return join(priors_acc, "\n    ")
 end
+
 
 """
     get_updates(m::Leroux, spec::NamedTuple, arch::String, outcome_idx, M)::String
@@ -166,61 +171,80 @@ function get_updates(
     end
 end
 
+
 function get_effects(
-    m::Leroux, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::Leroux, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+
     structured_effects = Vector{Matrix{Float64}}()
     n_latent = spec.hyper.n_latent
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
+    noise = M.noise
 
+    # --- Coordinate/Index Handling: Combine training and prediction sets on device ---
+    s_idx_train_device = M.s_idx # Already on device
+    s_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        s_idx_pred_cpu = get(PS.data, :s_idx, [])
+        vcat(s_idx_train_device, to_device(s_idx_pred_cpu))
+    else
+        s_idx_train_device
+    end
+    N_total = length(s_idx_full_device)
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(
-            p_names, string(p_names_k.sigma), k, is_multivariate_model
-        )
-        rho_name = _find_parameter(
-            p_names, string(p_names_k.rho), k, is_multivariate_model
-        )
-        innovations_name = _find_parameter(
-            p_names, string(p_names_k.innovations), k, is_multivariate_model
-        )
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(rho_name) || isempty(innovations_name)
-            @warn "Parameters for Leroux component $(spec.key) (outcome $k) not found. " *
-                  "Returning zero-matrix."
+            @warn "Parameters for Leroux component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        rho_samples_cpu = get_params_vector(chain, rho_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
         
-        effect_k = zeros(Float64, n_latent, n_samples)
+        # Initialize the output matrix for the full latent field on the target device
+        effect_k_latent_device = to_device(zeros(Float64, n_latent, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         for s in 1:n_samples
-            sigma_s = sigma_samples[s]
-            rho_s = rho_samples[s]
-            innov_s = innovations_samples[s, :]
+            # These are scalars, no need to move to device explicitly
+            sigma_s = sigma_samples_cpu[s]
+            rho_s = rho_samples_cpu[s]
+            # Move vector to device
+            innov_s_device = to_device(innovations_samples_cpu[s, :])
 
             if m.method == :spectral
-                U = spec.hyper.U
-                L_eig = spec.hyper.L
-                diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig .+ M.noise)
-                effect_k[:, s] = U * (diag_D_s .* innov_s)
+                U_device = spec.hyper.U # Already on device
+                L_eig_device = spec.hyper.L # Already on device
+                diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig_device .+ noise)
+                effect_k_latent_device[:, s] = U_device * (diag_D_s .* innov_s_device)
             else # :cholesky or :cholesky_sparse
-                Q_template = spec.hyper.Q_template
-                Q_final = (1.0 - rho_s) .* I(n_latent) .+ rho_s .* Q_template
-                F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
-                effect_k[:, s] = sigma_s .* (F.U \ innov_s)
+                Q_template_device = spec.hyper.Q_template # Already on device
+                I_device = to_device(Matrix{Float64}(I, n_latent, n_latent)) # Create identity matrix on device
+                Q_final_device = (1.0 - rho_s) .* I_device .+ rho_s .* Q_template_device
+                F_device = cholesky(Symmetric(Q_final_device + noise * I_device))
+                effect_k_latent_device[:, s] = sigma_s .* (F_device.U \ innov_s_device)
             end
         end
         
-        indexed_effects = effect_k[s_idx_full, :]
-        push!(structured_effects, indexed_effects)
+        # Index the reconstructed effects for the full observation set and move back to CPU
+        indexed_effects_device = effect_k_latent_device[s_idx_full_device, :]
+        push!(structured_effects, Array(indexed_effects_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+

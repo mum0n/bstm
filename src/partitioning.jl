@@ -1694,48 +1694,187 @@ function _compute_scaling_factor(Q_template)
 end
 
 
-
 """
-    assign_time_units(t_v::AbstractVector; time_method="regular", t_N=nothing, u_N=nothing, kwargs...)
+    assign_time_units(t_v::AbstractVector{<:Real}; time_method="quantile_regular", t_N=nothing, u_N=nothing, kwargs...)
 
-Discretizes a time vector into categorical units. This function handles both continuous
-and integer time vectors and ensures a consistent output format.
+Discretizes a continuous time vector into categorical units by calling the `discretize_data` function.
 
-The output is a NamedTuple with the following fields:
-- `idx`: An integer vector of the same length as `t_v`, containing the bin index for each observation.
-- `brks`: A vector of break points that define the bins.
-- `mids`: A vector of midpoints for each bin.
-- `N_cat`: The total number of unique time units (bins).
+# Version
+v2.0.0 (2026-08-17)
+
+# Rationale
+This function is refactored to act as a wrapper around the more general `discretize_data`
+utility. This improves code modularity and consistency. The default `time_method` is
+set to `:quantile_regular` to maintain the original behavior of creating evenly spaced
+bins between the 2.5% and 97.5% quantiles of the data.
+
+# Arguments
+- `t_v::AbstractVector{<:Real}`: A vector of continuous time values.
+- `time_method::String`: The discretization method to be passed to `discretize_data`.
+  Default: `"quantile_regular"`.
+- `t_N`: The desired number of time units (bins).
+- `u_N`: An alternative way to specify the number of time units.
+- `kwargs...`: Additional keyword arguments passed to `discretize_data`.
+
+# Returns
+- A `NamedTuple` with `idx`, `brks`, `mids`, and `N_cat`.
 """
-function assign_time_units(t_v::AbstractVector{<:Real}; time_method="regular", t_N=nothing, u_N=nothing, kwargs...)
+function assign_time_units(t_v::AbstractVector{<:Real}; time_method="quantile_regular", t_N=nothing, u_N=nothing, kwargs...)
     # This method handles continuous time vectors (e.g., Float64).
     
     local_t_N = isnothing(t_N) ? (isnothing(u_N) ? 10 : u_N) : t_N
 
-    if time_method == "regular"
-        # Discretize into equal-width intervals between 2.5% and 97.5% quantiles.
-        q = quantile(t_v, [0.025, 0.975])
-        brks = range(q[1], q[2], length=local_t_N + 1)
-        mids = brks[1:end-1] .+ diff(brks) ./ 2
-        N_cat = length(mids)
-        
-        idx = zeros(Int, length(t_v))
-        for i in 1:length(t_v)
-            iv = findfirst(x -> t_v[i] <= x, brks)
-            if isnothing(iv) # Greater than the last break
-                idx[i] = N_cat
-            elseif iv == 1 # Smaller than the first break
-                idx[i] = 1
-            else
-                idx[i] = iv - 1
-            end
-        end
-        return (idx=idx, brks=collect(brks), mids=collect(mids), N_cat=N_cat)
-    else
-        # Placeholder for other methods like "quantile"
-        error("time_method '$time_method' is not implemented for continuous time vectors.")
-    end
+    # Pass all arguments and keyword arguments to the generalized discretize_data function.
+    discretization_kwargs = Dict{Symbol, Any}(kwargs)
+
+    return discretize_data(t_v; method=time_method, N_cat=local_t_N, discretization_kwargs...)
 end
+
+
+function _jenks_breaks(data::AbstractVector{<:Real}, n_classes::Int)
+    # Internal helper to compute Jenks Natural Breaks.
+    # This is a dynamic programming approach to find optimal class breaks
+    # by minimizing within-class variance.
+    
+    sort!(data)
+    n_data = length(data)
+    
+    # Create matrices to store the sum of squared deviations and break indices
+    lower_class_limits = zeros(n_data, n_classes)
+    variance_combinations = zeros(n_data, n_classes)
+    
+    # Initialize for the first class
+    for i in 1:n_data
+        lower_class_limits[i, 1] = 1
+        variance_combinations[i, 1] = sum((data[1:i] .- mean(data[1:i])).^2)
+    end
+
+    # Fill the matrices using dynamic programming
+    for k in 2:n_classes
+        for i in k:n_data
+            min_variance = Inf
+            best_break = 0
+            for j in k:i
+                # Sum of squared deviations for the current potential class
+                ssd = sum((data[j:i] .- mean(data[j:i])).^2)
+                
+                # Total variance if we make this break
+                total_variance = ssd + variance_combinations[j-1, k-1]
+                
+                if total_variance < min_variance
+                    min_variance = total_variance
+                    best_break = j
+                end
+            end
+            lower_class_limits[i, k] = best_break
+            variance_combinations[i, k] = min_variance
+        end
+    end
+
+    # Backtrack to find the class breaks
+    breaks = zeros(n_classes + 1)
+    breaks[n_classes + 1] = data[end]
+    breaks[1] = data[1]
+    
+    for k in n_classes:-1:2
+        break_index = Int(lower_class_limits[n_data, k])
+        breaks[k] = data[break_index]
+        n_data = break_index - 1
+    end
+    
+    return breaks
+end
+
+
+"""
+    discretize_data(X; method="quantile", N_cat=9, brks=nothing, ...)
+
+Discretizes a continuous variable into a specified number of categories using various methods.
+
+# Version
+v2.0.0 (2026-08-17)
+
+# Rationale
+This function is significantly enhanced to serve as a general-purpose discretization utility.
+It now includes more advanced methods like k-means clustering and Jenks Natural Breaks,
+in addition to the existing quantile and regular interval methods. It also now consistently
+returns the midpoints of the generated bins.
+
+# Methods
+- `"quantile"`: Bins are determined by the quantiles of the data.
+- `"regular"`: Bins are of equal width across the full range of the data.
+- `"quantile_regular"`: Bins are of equal width, but only between specified quantiles of the data (e.g., between 2.5% and 97.5%).
+- `"kmeans"`: Uses 1D k-means clustering to find data-driven breaks that minimize within-bin variance.
+- `"jenks"`: Uses the Jenks Natural Breaks algorithm to find optimal class intervals by minimizing within-class variance.
+- `"provided"`: Uses a pre-computed vector of breaks.
+
+# Arguments
+- `X`: The data vector to be discretized.
+- `method`: The discretization strategy.
+- `N_cat`: The desired number of categories.
+- `brks`: (Optional) Pre-computed breaks for `"provided"` method.
+- `quantile_bounds`: (Optional) The lower and upper quantiles for the `"quantile_regular"` method. Default: `[0.025, 0.975]`.
+- Other kwargs for specific methods.
+
+# Returns
+- A `NamedTuple` with `idx`, `brks`, `mids`, and `N_cat`.
+"""
+function discretize_data(X; method="quantile", N_cat=9, brks=nothing, probs=nothing, dx=nothing, minv=nothing, maxv=nothing, quantile_bounds=[0.025, 0.975])
+    local idx
+    
+    if method=="quantile"
+        probs = isnothing(probs) ? range(0, stop=1, length=N_cat+1) : probs
+        brks = quantile(X, probs)
+        brks[end] = brks[end] + 1e-6 # Ensure the max value is included
+    elseif method=="regular"
+        minv = isnothing(minv) ? minimum(X) : minv
+        maxv = isnothing(maxv) ? maximum(X) : maxv
+        dx = isnothing(dx) ? (maxv - minv) / N_cat : dx
+        brks = minv:dx:maxv
+    elseif method=="quantile_regular"
+        q = quantile(X, quantile_bounds)
+        brks = range(q[1], q[2], length=N_cat + 1)
+    elseif method=="kmeans"
+        # kmeans from Clustering.jl expects data in shape (dims, n_obs)
+        X_mat = reshape(X, 1, :)
+        R = kmeans(X_mat, N_cat)
+        centers = sort(vec(R.centers))
+        # Define breaks as midpoints between sorted cluster centers
+        brks = vcat(minimum(X), (centers[1:end-1] + centers[2:end]) / 2, maximum(X))
+    elseif method=="jenks"
+        brks = _jenks_breaks(X, N_cat)
+    elseif method=="provided"
+        if isnothing(brks)
+            error("Method 'provided' requires the 'brks' argument to be supplied.")
+        end
+        N_cat = length(brks) - 1
+    else
+        error("Discretization method '$method' not recognized.")
+    end
+
+    # Helper function to assign indices based on breaks.
+    function get_idx(x::Real, breaks, n_categories)
+        # `searchsortedfirst` finds the index of the first element in `breaks` >= x.
+        raw_idx = searchsortedfirst(breaks, x) - 1
+        
+        # Explicitly handle boundary conditions.
+        if raw_idx < 1
+            return 1
+        elseif raw_idx > n_categories
+            return n_categories
+        else
+            return raw_idx
+        end
+    end
+
+    idx = map(x -> get_idx(x, brks, N_cat), X)
+    
+    # Calculate midpoints for the bins
+    mids = brks[1:end-1] .+ diff(brks) ./ 2
+
+    return (idx = idx, brks = collect(brks), mids = mids, N_cat = N_cat)
+end
+
 
 function assign_time_units(t_v::AbstractVector{<:Integer}; time_method="unique", t_N=nothing, u_N=nothing, kwargs...)
     # This method handles integer time vectors (e.g., year).
@@ -1766,101 +1905,6 @@ function assign_time_units(t_v::AbstractVector{<:Integer}; time_method="unique",
 end
    
      
-
-
-function discretize_data(X; method="quantile", N_cat=9, brks=nothing, probs=nothing, dx=nothing, minv = 0, maxv=1)
-    # Purpose: Discretizes a continuous variable into a specified number of categories.
-    # Rationale for Change (v1.1.0):
-    # This version removes the use of the `clamp` function as specifically requested. The logic
-    # is replaced with an explicit `if/elseif/else` block inside a helper function `get_idx`.
-    # This makes the boundary handling more transparent:
-    # - Values below the first break are assigned to category 1.
-    # - Values above the last break are assigned to category `N_cat`.
-    # This change maintains the original behavior while adhering to the coding standard of avoiding `clamp`.
-    #
-    # Assumptions:
-    #   - `X` is a vector of continuous data.
-    #   - `method` determines the discretization strategy.
-    #
-    # Inputs:
-    #   - X: The data vector to be discretized.
-    #   - method: One of "quantile", "regular", "custom", or "provided".
-    #   - N_cat: The desired number of categories.
-    #   - brks: (Optional) Pre-computed breaks for "provided" method.
-    #   - probs: (Optional) Probabilities for quantile calculation.
-    #   - dx, minv, maxv: Parameters for "regular" method.
-    #
-    # Outputs:
-    #   A NamedTuple containing the discretized indices (`idx`), breaks (`brks`), and number of categories (`N_cat`).
-
-    local idx
-    
-    if method=="quantile"
-        probs = isnothing(probs) ? range(0, stop=1, length=N_cat+1) : probs
-        brks = quantile(X, probs)
-        brks[end] = brks[end] + 1e-6 # Ensure the max value is included
-    elseif method=="regular"
-        minv = isnothing(minv) ? minimum(X) : minv
-        maxv = isnothing(maxv) ? maximum(X) : maxv
-        dx = isnothing(dx) ? (maxv - minv) / N_cat : dx
-        brks = minv:dx:maxv
-    elseif method=="custom"
-        # Placeholder for a more advanced discretization method
-        # For now, it defaults to quantiles
-        probs = isnothing(probs) ? range(0, stop=1, length=N_cat+1) : probs
-        brks = quantile(X, probs)
-        brks[end] = brks[end] + 1e-6
-    elseif method=="provided"
-        if isnothing(brks)
-            error("Method 'provided' requires the 'brks' argument to be supplied.")
-        end
-        N_cat = length(brks) - 1
-    else
-        error("Discretization method not recognized.")
-    end
-
-    if method=="quantile" || method=="regular"
-        
-        # Helper function to replace the banned `clamp` function.
-        function get_idx(x::Real)
-            # `searchsortedfirst` finds the index of the first element in `brks` >= x.
-            # The result is in the range [1, length(brks) + 1].
-            # For our breaks of length N_cat+1, this is [1, N_cat + 2].
-            # We subtract 1 to get bin indices, resulting in a range of [0, N_cat + 1].
-            raw_idx = searchsortedfirst(brks, x) - 1
-            
-            # Explicitly handle boundary conditions.
-            if raw_idx < 1
-                # If the value was smaller than the first break, it falls in the first category.
-                return 1
-            elseif raw_idx > N_cat
-                # If the value was larger than the last break, it falls in the last category.
-                return N_cat
-            else
-                # Otherwise, the index is valid.
-                return raw_idx
-            end
-        end
-
-        # Map the helper function over the data vector.
-        idx = map(get_idx, X)
-    
-    elseif method=="provided" || method=="custom"
-        # This logic for provided/custom methods did not use clamp and remains unchanged.
-        idx = zeros(Int, length(X))
-        for i in 1:length(X)
-            for j in 1:N_cat
-                if (X[i] >= brks[j]) & (X[i] < brks[j+1])
-                    idx[i] = j
-                    break
-                end
-            end
-        end
-        idx[X .>= brks[end]] .= N_cat
-    end
-
-    return (idx = idx, brks = brks, N_cat = N_cat)
-end
 
 
 

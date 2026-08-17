@@ -66,7 +66,7 @@ COMPONENT_CONSTRUCTORS[:waveletgp] = (p, params) -> WaveletGP(
     get(params, :resolution, 32)
 )
 MODEL_TO_STRUCTURE_MAP[:waveletgp] = :smooth
-
+ 
 """
     _get_wavelet_scale_indices_2d(res::Int, wt)
 
@@ -81,19 +81,21 @@ function _get_wavelet_scale_indices_2d(res::Int, wt)
         half_res = current_res ÷ 2
         if half_res == 0; break; end
         
-        scale_indices_matrix[1:half_res, (half_res+1):current_res] .= level
-        scale_indices_matrix[(half_res+1):current_res, 1:half_res] .= level
-        scale_indices_matrix[(half_res+1):current_res, (half_res+1):current_res] .= level
+        # Assign level to the detail coefficient quadrants
+        scale_indices_matrix[1:half_res, (half_res+1):current_res] .= level # Horizontal details
+        scale_indices_matrix[(half_res+1):current_res, 1:half_res] .= level # Vertical details
+        scale_indices_matrix[(half_res+1):current_res, (half_res+1):current_res] .= level # Diagonal details
         
         current_res = half_res
     end
+    # Assign the highest level to the remaining approximation coefficients
     scale_indices_matrix[1:current_res, 1:current_res] .= max_level
     
     return vec(scale_indices_matrix)
 end
 
 function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTuple
-    # Data validation moved from get_datastructures!
+    # Data validation
     variables = mod_data[:variables]
     if isempty(variables)
         error("WaveletGP model requires coordinate variables.")
@@ -109,9 +111,10 @@ function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTupl
         end
     end
 
-    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
+    # Ensure data is on CPU for initial processing by explicitly converting with Array()
+    coords_cpu = Matrix{Float64}(Array(M.data[!, Symbol.(variables)]))
     res = m.resolution
-    n_dims = size(coords, 2)
+    n_dims = size(coords_cpu, 2)
     
     if n_dims > 2
         error("WaveletGP currently supports only 1D and 2D spatial inputs.")
@@ -119,39 +122,45 @@ function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTupl
 
     n_latent = res^n_dims
     
-    min_coords = minimum(coords, dims=1)
-    max_coords = maximum(coords, dims=1)
+    # These calculations are cheap and performed on the CPU
+    min_coords = minimum(coords_cpu, dims=1)
+    max_coords = maximum(coords_cpu, dims=1)
     grid_ranges = [range(min_coords[d], stop=max_coords[d], length=res) for d in 1:n_dims]
 
     wt = Wavelets.wavelet(m.wavelet)
-    local scale_indices
+    local scale_indices_cpu
     if n_dims == 1
         x_dummy = zeros(res)
         c, l = wavedec(x_dummy, wt)
-        scale_indices = zeros(Int, length(c))
+        scale_indices_cpu = zeros(Int, length(c))
         start_idx = 1
         
-        scale_indices[start_idx : start_idx + l[1] - 1] .= dwt_levels(x_dummy)
+        # Approximation coefficients scale
+        scale_indices_cpu[start_idx : start_idx + l[1] - 1] .= dwt_levels(x_dummy)
         start_idx += l[1]
         
+        # Detail coefficients scales
         for i in 2:length(l)-1
             current_level = dwt_levels(x_dummy) - (i - 1)
-            scale_indices[start_idx : start_idx + l[i] - 1] .= current_level
+            scale_indices_cpu[start_idx : start_idx + l[i] - 1] .= current_level
             start_idx += l[i]
         end
     else # 2D
-        scale_indices = _get_wavelet_scale_indices_2d(res, wt)
+        scale_indices_cpu = _get_wavelet_scale_indices_2d(res, wt)
     end
 
+    # Move large, static arrays to the target device
+    to_device = M.to_device
     return (
         resolution = res,
         n_dims = n_dims,
         n_latent = n_latent,
-        coords = coords,
-        grid_ranges = grid_ranges,
-        scale_indices = scale_indices
+        coords = to_device(coords_cpu),
+        grid_ranges = grid_ranges, # Keep on CPU for Interpolations.jl
+        scale_indices = to_device(scale_indices_cpu)
     )
 end
+
 
 function get_priors(
     m::WaveletGP, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -204,30 +213,49 @@ function get_updates(
     """
 end
 
+
+
 function get_effects(
-    m::WaveletGP, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::WaveletGP, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+    
+    # --- Get precomputed data ---
     hyper = spec.hyper
     res = hyper.resolution
     n_dims = hyper.n_dims
     n_latent = hyper.n_latent
+    scale_indices_device = hyper.scale_indices # Already on device
 
+    # --- Coordinate and Grid Handling on CPU for Interpolation ---
+    # The interpolation step requires CPU data.
     coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(hyper.coords, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
+    coords_train_cpu = Array(hyper.coords) # Move coords from device to CPU
+    
+    coords_full_cpu = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+        vcat(coords_train_cpu, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
     else
-        hyper.coords
+        coords_train_cpu
     end
-    N_total_eff = size(coords_full, 1)
+    N_total_eff = size(coords_full_cpu, 1)
+    
+    # Grid ranges are already on CPU from get_precomputes
+    grid_ranges_cpu = hyper.grid_ranges
 
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
-        v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma0_name = _find_parameter(p_names_vec, v.sigma0, k, is_multivariate_model)
-        alpha_name = _find_parameter(p_names_vec, v.alpha, k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma0_name = _find_parameter(p_names, string(p_names_k.sigma0), k, is_multivariate_model)
+        alpha_name = _find_parameter(p_names, string(p_names_k.alpha), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(sigma0_name) || isempty(alpha_name) || isempty(innovations_name)
             @warn "Parameters for WaveletGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -235,27 +263,46 @@ function get_effects(
             continue
         end
 
-        sigma0_samples = get_params_vector(chain, sigma0_name, 1)[:, 1]
-        alpha_samples = get_params_vector(chain, alpha_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        # Extract posterior samples (these are on the CPU)
+        sigma0_samples_cpu = get_params_vector(chain, sigma0_name, 1)[:, 1]
+        alpha_samples_cpu = get_params_vector(chain, alpha_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_vector(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, N_total_eff, n_samples)
         wt = Wavelets.wavelet(m.wavelet)
-
+        
+        # --- Sample-wise Reconstruction ---
+        # This loop is necessary because Interpolations.jl is CPU-bound, forcing a
+        # GPU -> CPU data transfer for each sample's reconstructed grid.
         for i in 1:n_samples
-            scale_variances = sigma0_samples[i]^2 .* (2.0 .^ (-alpha_samples[i] .* hyper.scale_indices))
-            wavelet_coeffs = innovations_samples[i, :] .* sqrt.(scale_variances)
+            # --- GPU-bound Computation ---
+            # Move current sample's parameters to device
+            sigma0_s_device = to_device(sigma0_samples_cpu[i])
+            alpha_s_device = to_device(alpha_samples_cpu[i])
+            innov_s_device = to_device(innovations_samples_cpu[i, :])
+
+            # Compute wavelet coefficients on the device
+            scale_variances_device = sigma0_s_device^2 .* (2.0 .^ (-alpha_s_device .* scale_indices_device))
+            wavelet_coeffs_device = innov_s_device .* sqrt.(scale_variances_device)
             
-            local latent_field_grid
+            # Perform inverse wavelet transform on the device
+            local latent_field_grid_device
             if n_dims == 1
-                latent_field_grid = idwt(wavelet_coeffs, wt)
+                latent_field_grid_device = idwt(wavelet_coeffs_device, wt)
             else
-                coeffs_reshaped = reshape(wavelet_coeffs, res, res)
-                latent_field_grid = idwt(coeffs_reshaped, wt)
+                coeffs_reshaped_device = reshape(wavelet_coeffs_device, res, res)
+                latent_field_grid_device = idwt(coeffs_reshaped_device, wt)
             end
             
-            itp_s = linear_interpolation(hyper.grid_ranges, latent_field_grid, extrapolation_bc=Flat())
-            coords_for_itp = ntuple(d -> coords_full[:, d], n_dims)
+            # --- CPU-bound Interpolation Step ---
+            # Move the reconstructed grid back to the CPU for this sample
+            latent_field_grid_cpu = Array(latent_field_grid_device)
+            
+            # Create interpolation object on the CPU
+            itp_s = linear_interpolation(grid_ranges_cpu, latent_field_grid_cpu, extrapolation_bc=Flat())
+            
+            # Perform interpolation on the CPU
+            coords_for_itp = ntuple(d -> view(coords_full_cpu, :, d), n_dims)
             effect_k[:, i] = itp_s(coords_for_itp...)
         end
         push!(structured_effects, effect_k)

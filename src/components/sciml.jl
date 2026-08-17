@@ -6,7 +6,7 @@ ecosystem into a Bayesian framework. It allows for the estimation of differentia
 equation parameters and initial conditions.
 
 # Version
-v1.2.0 (2026-08-14)
+v1.3.0 (2026-08-17)
 
 # Mathematical Summary
 This component models an observed process \$y(t)\$ as noisy observations of a latent
@@ -43,6 +43,7 @@ the model to observed data.
 # Outputs (Parameter Names)
 - `u0_<key>`: The initial conditions of the DE system.
 - `p_<param_name>_<key>`: The parameters of the DE system (e.g., `p_alpha_<key>`).
+- `y_sigma_<key>`: The observation noise standard deviation (for `:direct` likelihood).
 - `latent_<key>`: The reconstructed latent effect from the DE solution.
 
 # Key References
@@ -91,7 +92,11 @@ function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
         error("Time index variable ':$time_var_sym' for sciml() module not found in data.")
     end
 
-    coords = M.data[!, time_var_sym]
+    # Get device transfer function
+    to_device = M.to_device
+
+    # Extract coordinates to CPU first, then move to device
+    coords_cpu = M.data[!, time_var_sym]
 
     params = mod_data[:params]
     required_args = [:model_func, :u0_prior, :p_priors, :tspan, :solver]
@@ -101,7 +106,7 @@ function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
         end
     end
 
-    # --- Problem Template Creation ---
+    # --- Problem Template Creation (on CPU) ---
     calling_mod = get(M, :calling_module, Main)
     model_func = Core.eval(calling_mod, params[:model_func])
     
@@ -130,7 +135,7 @@ function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
         prob_template=prob_template,
         solver=params[:solver],
         saveat=get(params, :saveat, 0.1),
-        coords=coords,
+        coords=to_device(coords_cpu),
         param_names=keys(m.p_priors)
     )
 end
@@ -148,6 +153,11 @@ function get_priors(
         p_prior = m.p_priors[p_name]
         p_var_name = getproperty(v, Symbol("p_$(p_name)"))
         push!(prior_lines, "$(p_var_name) ~ $(_distribution_to_string(p_prior))")
+    end
+
+    if m.likelihood_type == :direct
+        y_sigma_name = getproperty(v, :y_sigma)
+        push!(prior_lines, "$(y_sigma_name) ~ Exponential(1.0)")
     end
     
     return join(prior_lines, "\n    ")
@@ -169,7 +179,7 @@ function get_updates(
 
     common_solve_code = """
         $(p_tuple_str)
-        local hyper = spec_registry[:$(key)].hyper
+        hyper = spec_registry[:$(key)].hyper
         prob_$(key) = remake(
             hyper.prob_template; u0=$(u0_name), p=p_$(key)
         )
@@ -197,11 +207,13 @@ function get_updates(
         # --- SciML Component (Direct Likelihood): $(key) ---
         let
             $(common_solve_code)
-            mu = sciml_effect_$(key)
-            y_sigma ~ Exponential(1.0)
-            for i in 1:M.y_N
-                Turing.@addlogprob! logpdf(Normal(mu[1, i], y_sigma), M.y_obs[i])
-            end
+            # Assuming the first state variable is the one being observed.
+            mu = sciml_effect_$(key)[1, :]
+            y_sigma = $(getproperty(v, :y_sigma))
+            
+            # Vectorized likelihood calculation
+            Turing.@addlogprob! logpdf(MvNormal(mu, y_sigma), M.y_obs)
+
             # The model assembler must be configured to check for this component type
             # and skip the main likelihood evaluation if likelihood_type is :direct.
         end
@@ -217,34 +229,43 @@ function get_updates(
 end
 
 function get_effects(
-    m::SciML, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SciML, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+    
     structured_effects = Vector{Matrix{Float64}}()
-    p_names_vec = string.(FlexiChains.parameters(chain))
     key = spec.key
     hyper = spec.hyper
     param_names = hyper.param_names
 
-    coords_train = hyper.coords
-    t_coords_full = if isnothing(PS)
-        coords_train
+    # --- Coordinate Handling: Combine training and prediction sets ---
+    coords_train_cpu = Array(hyper.coords)
+    t_coords_full_cpu = if !isnothing(PS) && hasproperty(PS.data, Symbol(spec.var))
+        vcat(coords_train_cpu, Array(PS.data[!, Symbol(spec.var)]))
     else
-        vcat(coords_train, PS.data[!, M.t_idx_var])
+        coords_train_cpu
     end
-    tspan_full = (minimum(t_coords_full), maximum(t_coords_full))
-    
+    tspan_full = (minimum(t_coords_full_cpu), maximum(t_coords_full_cpu))
+    N_total = length(t_coords_full_cpu)
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
         
-        u0_name = _find_parameter(p_names_vec, v.u0, k, is_multivariate_model)
+        u0_name = _find_parameter(p_names, string(v.u0), k, is_multivariate_model)
         
         p_var_names = Dict{Symbol, String}()
         all_params_found = true
         for p_name in param_names
             p_sym = Symbol("p_$(p_name)")
             p_full_name = getproperty(v, p_sym)
-            found_name = _find_parameter(p_names_vec, p_full_name, k, is_multivariate_model)
+            found_name = _find_parameter(p_names, string(p_full_name), k, is_multivariate_model)
             if isempty(found_name)
                 all_params_found = false
                 break
@@ -258,30 +279,47 @@ function get_effects(
             continue
         end
 
-        u0_samples = get_params_vector(chain, u0_name, length(m.u0_prior))
-        p_samples = Dict(p_name => get_params_vector(chain, p_var_name, 1) for (p_name, p_var_name) in p_var_names)
-
-        T = eltype(chain.value)
-        trajectories = zeros(T, length(t_coords_full), n_samples)
+        # Extract posterior samples (CPU)
+        u0_samples_cpu = get_params_vector(chain, u0_name, length(m.u0_prior))
+        p_samples_cpu = Dict(p_name => get_params_vector(chain, p_var_name, 1) for (p_name, p_var_name) in p_var_names)
 
         prob_template = hyper.prob_template
 
-        for s in 1:n_samples
-            u0_s = u0_samples[s, :]
-            p_s = Tuple(p_samples[p_name][s, 1] for p_name in param_names)
+        # --- Ensemble Problem Setup for Parallel GPU Execution ---
+        function prob_func(prob, i, repeat)
+            u0_s = u0_samples_cpu[i, :]
+            p_s_tuple = Tuple(p_samples_cpu[p_name][i, 1] for p_name in param_names)
+            remake(prob; u0=u0_s, p=p_s_tuple, tspan=tspan_full)
+        end
 
-            prob_s = remake(prob_template; u0=u0_s, p=p_s, tspan=tspan_full)
-            
-            sol_s = solve(prob_s, hyper.solver; saveat=t_coords_full)
+        ensemble_prob = EnsembleProblem(prob_template, prob_func=prob_func)
+        
+        # Choose ensemble algorithm based on device
+        ensemble_alg = if parent_type(to_device(zeros(1))) <: CuArray
+            @info "Using EnsembleGPUKernel for SciML reconstruction."
+            EnsembleGPUKernel(0.0) # Auto-batching
+        else
+            EnsembleThreads()
+        end
 
-            if SciMLBase.successful_retcode(sol_s)
-                trajectories[:, s] = sol_s[1, :]
+        # Solve all trajectories in parallel
+        sim = solve(ensemble_prob, hyper.solver, ensemble_alg; trajectories=n_samples, saveat=t_coords_full_cpu)
+
+        # --- Process Results ---
+        trajectories_cpu = zeros(Float64, N_total, n_samples)
+        for i in 1:n_samples
+            if SciMLBase.successful_retcode(sim[i])
+                # Solution is on CPU since the problem was defined on CPU.
+                # We extract the first state variable's trajectory.
+                trajectories_cpu[:, i] = sim[i][1, :]
             else
-                trajectories[:, s] .= NaN
+                trajectories_cpu[:, i] .= NaN
             end
         end
-        push!(structured_effects, trajectories)
+        
+        push!(structured_effects, trajectories_cpu)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+

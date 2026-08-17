@@ -75,6 +75,7 @@ end
 
 MODEL_TO_STRUCTURE_MAP[:tar] = :temporal
 
+
 function get_precomputes(m::TAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     # --- Validation from get_datastructures! ---
     threshold_var = m.threshold_var
@@ -87,24 +88,30 @@ function get_precomputes(m::TAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     end
     
     # --- Original precompute logic ---
-    threshold_data_full = M.data[!, threshold_var]
-    
-    threshold_data_per_t = zeros(eltype(threshold_data_full), M.t_N)
+    # Data might be on GPU, so bring it to CPU for this calculation
+    threshold_data_full_cpu = Array(M.data[!, threshold_var])
+    t_idx_cpu = Array(M.t_idx)
+
+    threshold_data_per_t = zeros(eltype(threshold_data_full_cpu), M.t_N)
     counts_per_t = zeros(Int, M.t_N)
 
     for i in 1:M.y_N
-        t_val = M.t_idx[i]
-        threshold_data_per_t[t_val] += threshold_data_full[i]
+        t_val = t_idx_cpu[i]
+        threshold_data_per_t[t_val] += threshold_data_full_cpu[i]
         counts_per_t[t_val] += 1
     end
 
     threshold_data_per_t ./= max.(1, counts_per_t)
 
+    # Move the result to the target device
+    to_device = M.to_device
+
     return (
-        threshold_data=threshold_data_per_t,
+        threshold_data=to_device(threshold_data_per_t),
         n_latent=M.t_N
     )
 end
+
 
 function get_priors(
     m::TAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -185,33 +192,64 @@ function get_updates(
 end
 
 function get_effects(
-    m::TAR, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::TAR, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    
-    t_N_train = M.t_N
-    t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, []))
-    t_N_full = isempty(t_idx_full) ? 0 : maximum(t_idx_full)
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = string.(names(chain))
+    to_device = M.to_device
 
-    threshold_data_train = spec.hyper.threshold_data
-    threshold_data_full = if !isnothing(PS) && hasproperty(PS.data, m.threshold_var)
-        pred_threshold_data = PS.data[!, m.threshold_var]
-        vcat(threshold_data_train, pred_threshold_data[1:min(length(pred_threshold_data), t_N_full - t_N_train)])
+    # --- Get precomputed data (already on device) ---
+    hyper = spec.hyper
+    t_N_train = hyper.n_latent
+    threshold_data_train_device = hyper.threshold_data
+
+    # --- Index and Threshold Data Handling for Training and Prediction ---
+    t_idx_train_cpu = Array(M.t_idx) # Bring to CPU for vcat
+    t_idx_full_cpu = if !isnothing(PS) && haskey(PS, :t_idx)
+        vcat(t_idx_train_cpu, get(PS, :t_idx, []))
     else
-        threshold_data_train
+        t_idx_train_cpu
     end
-    if length(threshold_data_full) < t_N_full
-        threshold_data_full = vcat(threshold_data_full, fill(mean(threshold_data_train), t_N_full - length(threshold_data_full)))
+    t_N_full = isempty(t_idx_full_cpu) ? 0 : maximum(t_idx_full_cpu)
+    N_total = length(t_idx_full_cpu)
+
+    threshold_data_train_cpu = Array(threshold_data_train_device)
+    threshold_data_full_cpu = if !isnothing(PS) && hasproperty(PS.data, m.threshold_var)
+        # NOTE: This assumes prediction data is provided at the temporal resolution (t_N).
+        # A more robust implementation might aggregate prediction data similarly to get_precomputes.
+        pred_threshold_data = PS.data[!, m.threshold_var]
+        len_pred = t_N_full - t_N_train
+        if len_pred > 0
+            pred_data_agg = pred_threshold_data[1:min(length(pred_threshold_data), len_pred)]
+            vcat(threshold_data_train_cpu, pred_data_agg)
+        else
+            threshold_data_train_cpu
+        end
+    else
+        threshold_data_train_cpu
+    end
+    # Pad if necessary, in case prediction data is shorter than the prediction time index
+    if length(threshold_data_full_cpu) < t_N_full
+        padding = fill(mean(threshold_data_train_cpu), t_N_full - length(threshold_data_full_cpu))
+        threshold_data_full_cpu = vcat(threshold_data_full_cpu, padding)
     end
 
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    # Move final data structures to the target device
+    t_idx_full_device = to_device(t_idx_full_cpu)
+    threshold_data_full_device = to_device(threshold_data_full_cpu)
 
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k_outcome in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k_outcome)
         
-        thresh_unconstrained_name = _find_parameter(p_names_vec, v.threshold_unconstrained, k_outcome, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, v.innovations, k_outcome, is_multivariate_model)
+        thresh_unconstrained_name = _find_parameter(p_names, string(v.threshold_unconstrained), k_outcome, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k_outcome, is_multivariate_model)
 
         if isempty(thresh_unconstrained_name) || isempty(innovations_name)
             @warn "Base parameters for TAR component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
@@ -219,64 +257,84 @@ function get_effects(
             continue
         end
 
-        thresh_unconstrained_samples = get_params_vector(chain, thresh_unconstrained_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, t_N_train)
+        # Extract posterior samples (these are on the CPU)
+        thresh_unconstrained_samples_cpu = get_params_vector(chain, thresh_unconstrained_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, t_N_train)
         
-        local rho1_samples, rho2_samples, sigma1_samples, sigma2_samples
+        local rho1_samples_cpu, rho2_samples_cpu, sigma1_samples_cpu, sigma2_samples_cpu
         if m.method == :statespace
-            rho1_raw_name = _find_parameter(p_names_vec, v.unconstrained_rho1, k_outcome, is_multivariate_model)
-            rho2_raw_name = _find_parameter(p_names_vec, v.unconstrained_rho2, k_outcome, is_multivariate_model)
-            sigma1_raw_name = _find_parameter(p_names_vec, v.unconstrained_sigma1, k_outcome, is_multivariate_model)
-            sigma2_raw_name = _find_parameter(p_names_vec, v.unconstrained_sigma2, k_outcome, is_multivariate_model)
+            rho1_raw_name = _find_parameter(p_names, string(v.unconstrained_rho1), k_outcome, is_multivariate_model)
+            rho2_raw_name = _find_parameter(p_names, string(v.unconstrained_rho2), k_outcome, is_multivariate_model)
+            sigma1_raw_name = _find_parameter(p_names, string(v.unconstrained_sigma1), k_outcome, is_multivariate_model)
+            sigma2_raw_name = _find_parameter(p_names, string(v.unconstrained_sigma2), k_outcome, is_multivariate_model)
             if isempty(rho1_raw_name) || isempty(rho2_raw_name) || isempty(sigma1_raw_name) || isempty(sigma2_raw_name)
                 @warn "Regime parameters for TAR component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            rho1_samples = tanh.(get_params_vector(chain, rho1_raw_name, 1)[:, 1])
-            rho2_samples = tanh.(get_params_vector(chain, rho2_raw_name, 1)[:, 1])
-            sigma1_samples = exp.(get_params_vector(chain, sigma1_raw_name, 1)[:, 1])
-            sigma2_samples = exp.(get_params_vector(chain, sigma2_raw_name, 1)[:, 1])
+            rho1_samples_cpu = tanh.(get_params_vector(chain, rho1_raw_name, 1)[:, 1])
+            rho2_samples_cpu = tanh.(get_params_vector(chain, rho2_raw_name, 1)[:, 1])
+            sigma1_samples_cpu = exp.(get_params_vector(chain, sigma1_raw_name, 1)[:, 1])
+            sigma2_samples_cpu = exp.(get_params_vector(chain, sigma2_raw_name, 1)[:, 1])
         else # :statespace_constrained
-            rho1_name = _find_parameter(p_names_vec, v.rho1, k_outcome, is_multivariate_model)
-            rho2_name = _find_parameter(p_names_vec, v.rho2, k_outcome, is_multivariate_model)
-            sigma1_name = _find_parameter(p_names_vec, v.sigma1, k_outcome, is_multivariate_model)
-            sigma2_name = _find_parameter(p_names_vec, v.sigma2, k_outcome, is_multivariate_model)
+            rho1_name = _find_parameter(p_names, string(v.rho1), k_outcome, is_multivariate_model)
+            rho2_name = _find_parameter(p_names, string(v.rho2), k_outcome, is_multivariate_model)
+            sigma1_name = _find_parameter(p_names, string(v.sigma1), k_outcome, is_multivariate_model)
+            sigma2_name = _find_parameter(p_names, string(v.sigma2), k_outcome, is_multivariate_model)
             if isempty(rho1_name) || isempty(rho2_name) || isempty(sigma1_name) || isempty(sigma2_name)
                 @warn "Regime parameters for TAR component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            rho1_samples = get_params_vector(chain, rho1_name, 1)[:, 1]
-            rho2_samples = get_params_vector(chain, rho2_name, 1)[:, 1]
-            sigma1_samples = get_params_vector(chain, sigma1_name, 1)[:, 1]
-            sigma2_samples = get_params_vector(chain, sigma2_name, 1)[:, 1]
+            rho1_samples_cpu = get_params_vector(chain, rho1_name, 1)[:, 1]
+            rho2_samples_cpu = get_params_vector(chain, rho2_name, 1)[:, 1]
+            sigma1_samples_cpu = get_params_vector(chain, sigma1_name, 1)[:, 1]
+            sigma2_samples_cpu = get_params_vector(chain, sigma2_name, 1)[:, 1]
         end
 
-        effect_k = zeros(Float64, N_total, n_samples)
-        mean_thresh_data = mean(threshold_data_train)
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
+        mean_thresh_data_cpu = mean(threshold_data_train_cpu)
         noise = M.noise
         
+        # --- Sample-wise Reconstruction on the Target Device ---
         for s in 1:n_samples
-            threshold_level = mean_thresh_data + thresh_unconstrained_samples[s]
-            innov_full = vcat(innovations_samples[s, :], randn(t_N_full - t_N_train))
-            latent_field_s = zeros(Float64, t_N_full)
+            threshold_level = mean_thresh_data_cpu + thresh_unconstrained_samples_cpu[s]
+            
+            # Generate full innovations vector on the device
+            innov_train_device = to_device(innovations_samples_cpu[s, :])
+            innov_pred_device = to_device(randn(Float32, t_N_full - t_N_train))
+            innov_full_device = vcat(innov_train_device, innov_pred_device)
+            
+            latent_field_s_device = to_device(zeros(Float64, t_N_full))
+
+            # Move current sample's parameters to device (scalars, cheap)
+            rho1_s = rho1_samples_cpu[s]
+            rho2_s = rho2_samples_cpu[s]
+            sigma1_s = sigma1_samples_cpu[s]
+            sigma2_s = sigma2_samples_cpu[s]
 
             for t in 1:t_N_full
-                regime_indicator = threshold_data_full[t] > threshold_level
-                curr_rho = regime_indicator ? rho2_samples[s] : rho1_samples[s]
-                curr_sigma = regime_indicator ? sigma2_samples[s] : sigma1_samples[s]
+                # This loop runs on the device. The condition uses a device array.
+                regime_indicator = threshold_data_full_device[t] > threshold_level
+                curr_rho = regime_indicator ? rho2_s : rho1_s
+                curr_sigma = regime_indicator ? sigma2_s : sigma1_s
 
                 if t == 1
-                    latent_field_s[t] = (innov_full[t] * curr_sigma) / sqrt(1.0 - curr_rho^2 + noise)
+                    latent_field_s_device[t] = (innov_full_device[t] * curr_sigma) / sqrt(1.0 - curr_rho^2 + noise)
                 else
-                    latent_field_s[t] = curr_rho * latent_field_s[t-1] + innov_full[t] * curr_sigma
+                    latent_field_s_device[t] = curr_rho * latent_field_s_device[t-1] + innov_full_device[t] * curr_sigma
                 end
             end
-            effect_k[:, s] = view(latent_field_s, t_idx_full)
+            effect_k_device[:, s] = view(latent_field_s_device, t_idx_full_device)
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final reconstructed effect for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
 
     return (structured=structured_effects, noisy=structured_effects)
 end
+
+
+

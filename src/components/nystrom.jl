@@ -176,31 +176,44 @@ function get_updates(
     end
 end
 
+
 function get_effects(
-    m::Nystrom, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::Nystrom, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
     
-    coords_train = spec.hyper.coords
+    hyper = spec.hyper
+    noise = M.noise
+    kernel_type = Symbol(m.kernel)
+
+    # --- Coordinate and Inducing Point Handling ---
+    coords_train = hyper.coords # Already on device
+    Z_inducing = hyper.Z_inducing # Already on device
+    
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
+        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+        vcat(coords_train, to_device(coords_pred_cpu))
     else
         coords_train
     end
     n_obs_full = size(coords_full, 1)
 
-    Z_inducing = spec.hyper.Z_inducing
-    kernel_type = Symbol(m.kernel)
-    noise = M.noise
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    structured_effects = Vector{Matrix{Float64}}()
 
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names_vec, string(p_names_k.sigma), k, is_multivariate_model)
-        ls_name = _find_parameter(p_names_vec, string(p_names_k.ls), k, is_multivariate_model)
+        
+        # Find parameter names in the MCMC chain
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name)
             @warn "Parameters for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -208,49 +221,58 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_samples = get_params_vector(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        ls_samples_cpu = get_params_matrix(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
 
-        effect_k = zeros(Float64, n_obs_full, n_samples)
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, n_obs_full, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         if m.method == :noncentered
-            innovations_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
             if isempty(innovations_name)
                 @warn "Innovations for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            innovations_samples = get_params_vector(chain, innovations_name, m.n_inducing)
+            innovations_samples_cpu = get_params_matrix(chain, innovations_name, m.n_inducing)
+
             for i in 1:n_samples
-                current_sigma = sigma_samples[i]
-                current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i, 1]
+                current_sigma = sigma_samples_cpu[i]
+                current_ls = m.lengthscale isa Vector ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
                 
+                # Kernel evaluations and linear algebra happen on the device
                 K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
                 K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
                 
                 L_UU = cholesky(Symmetric(K_UU)).L
-                u_latent = L_UU * innovations_samples[i, :]
-                effect_k[:, i] = K_XU * (K_UU \ u_latent)
+                u_latent = L_UU * to_device(innovations_samples_cpu[i, :])
+                effect_k_device[:, i] = K_XU * (K_UU \ u_latent)
             end
         else # :centered
-            latent_name = _find_parameter(p_names_vec, string(p_names_k.latent), k, is_multivariate_model)
+            latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
             if isempty(latent_name)
                 @warn "Latent values for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            u_latent_samples = get_params_vector(chain, latent_name, m.n_inducing)
+            u_latent_samples_cpu = get_params_matrix(chain, latent_name, m.n_inducing)
+
             for i in 1:n_samples
-                current_sigma = sigma_samples[i]
-                current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i, 1]
+                current_sigma = sigma_samples_cpu[i]
+                current_ls = m.lengthscale isa Vector ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
                 
+                # Kernel evaluations and linear algebra happen on the device
                 K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
                 K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
                 
-                effect_k[:, i] = K_XU * (K_UU \ u_latent_samples[i, :])
+                effect_k_device[:, i] = K_XU * (K_UU \ to_device(u_latent_samples_cpu[i, :]))
             end
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

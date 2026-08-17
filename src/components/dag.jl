@@ -161,25 +161,46 @@ function get_updates(
     end
 end
 
+
 """
-    get_effects(m::DAG, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
+    get_effects(m::DAG, chain, spec, M, PS)
 
 Reconstructs the `DAG` component's effect from posterior samples, dispatching
-on the method used during sampling.
+on the method used during sampling.   handle GPU arrays
+by moving sampled parameters to the device for computation and moving the final
+results back to the CPU.
 """
 function get_effects(
-    m::DAG, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::DAG, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+    noise = M.noise
     
     n_latent = spec.hyper.n_latent
-    W_dag = spec.hyper.Q_template
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
+    W_dag = spec.hyper.Q_template # This is already on the correct device
 
+    # --- Coordinate/Index Handling: Combine training and prediction sets ---
+    s_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        # M.s_idx is already on the device. PS.data.s_idx is on CPU.
+        vcat(M.s_idx, to_device(PS.data.s_idx))
+    else
+        M.s_idx
+    end
+    N_total = length(s_idx_full_device)
+
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        
+        # Find parameter names in the MCMC chain
         rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
@@ -190,37 +211,48 @@ function get_effects(
             continue
         end
 
-        rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
+        # Extract posterior samples (these are on the CPU)
+        rho_samples_cpu = get_params_vector(chain, rho_name, 1)[:, 1]
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
         
-        effect_k = zeros(Float64, N_total, n_samples)
+        # Initialize the output matrix for latent effects on the target device
+        latent_field_matrix_device = to_device(zeros(Float64, n_latent, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         if m.method == :forward_substitution
             for i in 1:n_samples
-                latent_field_i = zeros(Float64, n_latent)
+                innov_i_device = to_device(innovations_samples_cpu[i, :])
+                latent_field_i = to_device(zeros(Float64, n_latent))
+                
+                # This loop is sequential but operations happen on the device
                 for j in 1:n_latent
-                    parent_effect = 0.0
-                    # Sum contributions from parents (non-zero elements in the row of W_dag)
+                    parent_effect = zero(eltype(latent_field_i))
                     for j_ptr in nzrange(W_dag, j)
                         parent_idx = W_dag.rowval[j_ptr]
                         parent_effect += W_dag.nzval[j_ptr] * latent_field_i[parent_idx]
                     end
-                    latent_field_i[j] = rho_samples[i] * parent_effect + innovations_samples[i, j]
+                    latent_field_i[j] = rho_samples_cpu[i] * parent_effect + innov_i_device[j]
                 end
-                latent_field_i .*= sigma_samples[i]
-                effect_k[:, i] = view(latent_field_i, s_idx_full)
+                latent_field_matrix_device[:, i] = latent_field_i .* sigma_samples_cpu[i]
             end
         else # :precision
             for i in 1:n_samples
-                L_op = I - rho_samples[i] * W_dag
+                innov_i_device = to_device(innovations_samples_cpu[i, :])
+                
+                L_op = I - rho_samples_cpu[i] * W_dag
                 Q = L_op' * L_op
-                F = cholesky(Symmetric(Matrix(Q) + M.noise * I))
-                latent_field_i = sigma_samples[i] .* (F.U \ innovations_samples[i, :])
-                effect_k[:, i] = view(latent_field_i, s_idx_full)
+                
+                # Cholesky and back-substitution will run on the GPU if arrays are CuArrays
+                F = cholesky(Symmetric(Q + noise * I))
+                latent_field_i = sigma_samples_cpu[i] .* (F.U \ innov_i_device)
+                latent_field_matrix_device[:, i] = latent_field_i
             end
         end
-        push!(structured_effects, effect_k)
+        
+        # Indexing on the device and moving the final result to CPU
+        indexed_effects_device = latent_field_matrix_device[s_idx_full_device, :]
+        push!(structured_effects, Array(indexed_effects_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

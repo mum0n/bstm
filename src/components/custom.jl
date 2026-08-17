@@ -115,30 +115,29 @@ function get_updates(
 end
 
 """
-    get_effects(m::Custom, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
+    get_effects(m::Custom, chain, spec, M, PS)
 
 Calls a user-provided `reconstruct_func` for posterior reconstruction. If no
 function is provided, it returns a zero-effect with a warning.
 
 The user's function is expected to have the signature:
-`(chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate) -> NamedTuple`
-where `p_names` (a `Vector{String}` of all parameter names in the chain) and
-`is_multivariate` (a `Bool`) are passed from the main reconstruction engine.
+`(m::Custom, chain::Chains, spec::NamedTuple, M::NamedTuple, PS::Union{NamedTuple, Nothing}) -> NamedTuple`
+
+The user's function is responsible for all GPU-to-CPU data transfers. It will receive
+GPU-backed arrays within `M` and `spec` if `use_gpu=true`, and it **must** return a
+`NamedTuple` containing standard CPU `Array`s.
 """
 function get_effects(
-    m::Custom, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::Custom, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     reconstruct_func = get(m.params, :reconstruct_func, nothing)
 
     if !isnothing(reconstruct_func) && isa(reconstruct_func, Function)
         try
-            # The user's function is called with the standardized arguments.
-            return reconstruct_func(
-                chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, 
-                is_multivariate_model
-            )
+            # The user's function is called with the modern, standardized arguments.
+            # It is the user's responsibility to handle GPU data within this function.
+            return reconstruct_func(m, chain, spec, M, PS)
         catch e
             @error "The custom reconstruction function for component '$(spec.key)' failed."
             rethrow(e)
@@ -147,6 +146,11 @@ function get_effects(
         @warn "Reconstruction for custom component '$(spec.key)' is not defined. " *
               "Returning a zero-effect. Provide a `reconstruct_func` to the " *
               "`custom()` module to enable posterior reconstruction."
+        
+        n_samples = size(chain, 1) * size(chain, 3)
+        outcomes_N = M.outcomes_N
+        N_total = M.y_N + (isnothing(PS) ? 0 : size(PS.data, 1))
+
         structured_effects = [
             zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N
         ]

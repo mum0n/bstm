@@ -184,25 +184,44 @@ function get_updates(
     end
 end
 
-function get_effects(
-    m::NetworkFlow, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
-)::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    key = spec.key
-    
-    W_I = spec.hyper.W_I
-    W_J = spec.hyper.W_J
-    habitat = spec.hyper.habitat_data
-    s_N = spec.hyper.s_N
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
 
+function get_effects(
+    m::NetworkFlow, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
+)::NamedTuple
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+    
+    key = spec.key
+    hyper = spec.hyper
+    W_I = hyper.W_I
+    W_J = hyper.W_J
+    habitat_cpu = Array(hyper.habitat_data) # Ensure habitat data is on CPU for sparse construction
+    s_N = hyper.s_N
+    noise = M.noise
+
+    # --- Index Handling: Combine training and prediction sets on device ---
+    s_idx_train = M.s_idx # Already on device
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        s_idx_pred_cpu = get(PS.data, :s_idx, [])
+        vcat(s_idx_train, to_device(s_idx_pred_cpu))
+    else
+        s_idx_train
+    end
+    N_total = length(s_idx_full)
+
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k_outcome in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
-        beta_name = _find_parameter(p_names_vec, string(p_names_k.beta), k_outcome, is_multivariate_model)
-        sigma_name = _find_parameter(p_names_vec, string(p_names_k.sigma), k_outcome, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k_outcome, is_multivariate_model)
+        beta_name = _find_parameter(p_names, string(p_names_k.beta), k_outcome, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model)
 
         if isempty(beta_name) || isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for NetworkFlow component $(key) (outcome $k_outcome) not found. Returning zero-matrix."
@@ -210,27 +229,35 @@ function get_effects(
             continue
         end
 
-        beta_samples = get_params_vector(chain, beta_name, 1)[:, 1]
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, s_N)
+        # Extract posterior samples (these are on the CPU)
+        beta_samples_cpu = get_params_vector(chain, beta_name, 1)[:, 1]
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, s_N)
 
-        reconstructed_effects_k = zeros(Float64, s_N, n_samples)
+        # Initialize the output matrix for the full latent field on the target device
+        reconstructed_effects_k_device = to_device(zeros(Float64, s_N, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         for i in 1:n_samples
-            V_beta_i = exp.(beta_samples[i] .* (habitat[W_I] .+ habitat[W_J]) ./ 2.0)
+            # Construct precision matrix on CPU first, then move to device
+            V_beta_i = exp.(beta_samples_cpu[i] .* (habitat_cpu[W_I] .+ habitat_cpu[W_J]) ./ 2.0)
             W_beta_i = sparse(W_I, W_J, V_beta_i, s_N, s_N)
             D_beta_i = Diagonal(vec(sum(W_beta_i, dims=2)))
             Q_beta_i = D_beta_i - W_beta_i
             
-            F_i = cholesky(Symmetric(Matrix(Q_beta_i) + M.noise * I))
+            # Move matrix to device and perform factorization
+            Q_beta_i_device = to_device(Matrix(Q_beta_i))
+            F_i = cholesky(Symmetric(Q_beta_i_device + noise * I))
             
-            reconstructed_effects_k[:, i] = sigma_samples[i] .*
-                                            (F_i.L' \ innovations_samples[i, :])
+            # Move innovations to device for the solve
+            innov_i_device = to_device(innovations_samples_cpu[i, :])
+            
+            reconstructed_effects_k_device[:, i] = sigma_samples_cpu[i] .* (F_i.L' \ innov_i_device)
         end
         
-        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
-        indexed_effects = reconstructed_effects_k[s_idx_full, :]
-        push!(structured_effects, indexed_effects)
+        # Index the reconstructed effects for the full observation set and move back to CPU
+        indexed_effects_device = reconstructed_effects_k_device[s_idx_full, :]
+        push!(structured_effects, Array(indexed_effects_device))
     end
 
     return (structured=structured_effects, noisy=structured_effects)

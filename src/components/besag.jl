@@ -7,7 +7,7 @@ where the value at a location is assumed to be conditionally dependent on the
 average of its neighbors.
 
 # Version
-v1.2.4 (2026-08-15)
+v1.3.0 (2026-08-17)
 
 # Mathematical Summary
 The Besag model defines a Gaussian Markov Random Field (GMRF) with a singular
@@ -80,24 +80,32 @@ MODEL_TO_STRUCTURE_MAP[:besag] = :spatial
     get_precomputes(m::Besag, M::NamedTuple, mod_data::Dict)::NamedTuple
 
 Pre-computes the graph Laplacian (`Q_template`), its Cholesky factorization, and its
-spectral decomposition (`U`, `L`) for use by different sampling methods.
+spectral decomposition (`U`, `L`) for use by different sampling methods. All large
+data structures are moved to the target device.
 """
 function get_precomputes(m::Besag, M::NamedTuple, mod_data::Dict)::NamedTuple
     n = M.s_N
     W = M.W
-    
+    to_device = M.to_device
+
+    # build_structure_template returns CPU arrays
     template = build_structure_template(:besag, n; W=W)
     
-    # Pre-compute the dense Cholesky factor for the :cholesky method.
-    F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
+    # Move precomputed structures to the target device.
+    Q_template_device = to_device(template.matrix)
+    U_device = to_device(template.U)
+    L_device = to_device(template.L)
+
+    # Pre-compute the dense Cholesky factor for the :cholesky method on the target device.
+    F_device = cholesky(Symmetric(Matrix(Q_template_device) + M.noise * I))
     
     return (
-        Q_template=template.matrix, 
+        Q_template=Q_template_device, 
         scaling_factor=template.scaling_factor, 
-        U=template.U, 
-        L=template.L, 
+        U=U_device, 
+        L=L_device, 
         n_latent=n, 
-        cholesky_factor=F
+        cholesky_factor=F_device
     )
 end
 
@@ -115,7 +123,7 @@ function get_priors(
     
     return """
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.innovations) ~ MvNormal(zeros($(n_latent)), I)
+    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
     """
 end
 
@@ -186,24 +194,43 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
     end
 end
 
-
 """
-    get_effects(m::Besag, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
+    get_effects(m::Besag, chain, spec, M, PS)
 
 Reconstructs the `Besag` component's effect from posterior samples, applying a
 sum-to-zero constraint for identifiability. This function dispatches on the method
-used during sampling.
+used during sampling and is updated to handle GPU arrays.
 """
 function get_effects(
-    m::Besag, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int, is_multivariate_model::Bool
+    m::Besag, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    n_latent = spec.hyper.n_latent
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
     noise = M.noise
+    n_latent = spec.hyper.n_latent
 
+    # --- Coordinate/Index Handling: Combine training and prediction sets ---
+    s_idx_train_device = M.s_idx # Already on device from main config
+    s_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        s_idx_pred_cpu = get(PS.data, :s_idx, [])
+        vcat(s_idx_train_device, to_device(s_idx_pred_cpu))
+    else
+        s_idx_train_device
+    end
+    N_total = length(s_idx_full_device)
+
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
+        
+        # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
@@ -213,32 +240,46 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
-        effect_k = zeros(Float64, n_latent, n_samples)
+        # Initialize the output matrix for latent effects on the target device
+        effect_k_latent_device = to_device(zeros(Float64, n_latent, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         if m.method == :spectral
-            U = spec.hyper.U
-            L = spec.hyper.L
+            U_device = spec.hyper.U # Already on device
+            L_device = spec.hyper.L # Already on device
+            
             for j in 1:n_samples
-                diag_D = sigma_samples[j] ./ sqrt.(L .+ noise)
-                diag_D[1] = 0.0
-                effect_k[:, j] = U * (diag_D .* innovations_samples[j, :])
+                sigma_j = sigma_samples_cpu[j] # CPU scalar
+                innov_j_device = to_device(innovations_samples_cpu[j, :])
+                
+                diag_D = sigma_j ./ sqrt.(L_device .+ noise)
+                diag_D[1] = 0.0 # Enforce sum-to-zero constraint
+                effect_k_latent_device[:, j] = U_device * (diag_D .* innov_j_device)
             end
-        else
-            F = spec.hyper.cholesky_factor
+        else # :cholesky or :cholesky_sparse
+            # For reconstruction, we can use the pre-computed dense Cholesky factor for both methods
+            # as AD is not involved here.
+            F_device = spec.hyper.cholesky_factor # Already on device
+            
             for j in 1:n_samples
-                latent_field_raw = F.L' \ innovations_samples[j, :]
+                sigma_j = sigma_samples_cpu[j]
+                innov_j_device = to_device(innovations_samples_cpu[j, :])
+
+                latent_field_raw = F_device.L' \ innov_j_device
                 latent_field_centered = latent_field_raw .- mean(latent_field_raw)
-                effect_k[:, j] = latent_field_centered .* sigma_samples[j]
+                effect_k_latent_device[:, j] = latent_field_centered .* sigma_j
             end
         end
         
-        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
-        indexed_effects = effect_k[s_idx_full, :]
-        push!(structured_effects, indexed_effects)
+        # Indexing on the device and moving the final result to CPU
+        indexed_effects_device = effect_k_latent_device[s_idx_full_device, :]
+        push!(structured_effects, Array(indexed_effects_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+

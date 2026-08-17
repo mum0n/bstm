@@ -254,21 +254,27 @@ function _get_model_symbol(m_obj::ComponentModel)
     end
     return :unknown
 end
-
 function get_effects(
-    m::Mixed, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::Mixed, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+    noise = M.noise
+    
     n_terms = length(m.lhs)
     n_groups_train = spec.hyper.inner_precomputes.n_latent
-    noise = M.noise
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
     
+    # --- Grouping Level and Index Handling ---
     group_var = m.group_var
     train_levels = unique(M.data[!, group_var])
     all_levels = train_levels
     has_new_levels = false
+
     if !isnothing(PS) && hasproperty(PS.data, group_var)
         pred_levels = unique(PS.data[!, group_var])
         if !isempty(setdiff(pred_levels, train_levels))
@@ -279,18 +285,22 @@ function get_effects(
     n_all_groups = length(all_levels)
     level_map = Dict(level => i for (i, level) in enumerate(all_levels))
     
-    full_indices = if !isnothing(PS) && hasproperty(PS.data, group_var)
+    # Create the full index vector on the CPU first, then move to device
+    full_indices_cpu = if !isnothing(PS) && hasproperty(PS.data, group_var)
         [level_map[v] for v in vcat(M.data[!, group_var], PS.data[!, group_var])]
     else
         [level_map[v] for v in M.data[!, group_var]]
     end
+    full_indices_device = to_device(full_indices_cpu)
 
+    # --- Reconstruction Logic ---
     if n_terms == 1
+        # --- Case 1: Simple (Uncorrelated) Random Effects ---
         effects_per_outcome = Vector{Matrix{Float64}}()
         for k in 1:outcomes_N
             p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-            sigma_name = _find_parameter(p_names_vec, string(p_names_k.sigma), k, is_multivariate_model)
-            innovations_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k, is_multivariate_model)
+            sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
             if isempty(sigma_name) || isempty(innovations_name)
                 @warn "Parameters for simple Mixed component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -298,82 +308,102 @@ function get_effects(
                 continue
             end
 
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innovations_samples = get_params_vector(chain, innovations_name, n_groups_train)
+            # Extract samples (CPU)
+            sigma_samples_cpu = get_params_matrix(chain, sigma_name, 1)[:, 1]
+            innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_groups_train)
             
-            latent_samples_train = innovations_samples' .* sigma_samples'
+            # Move to device for computation
+            innovations_device = to_device(innovations_samples_cpu)
+            sigma_device = to_device(sigma_samples_cpu)
             
-            full_effects = zeros(Float64, n_all_groups, n_samples)
-            train_indices_map = [level_map[level] for level in train_levels]
-            full_effects[train_indices_map, :] = latent_samples_train
+            # Broadcasting on the device
+            latent_samples_train_device = innovations_device' .* sigma_device'
+            
+            full_effects_device = to_device(zeros(Float64, n_all_groups, n_samples))
+            train_indices_map_device = to_device([level_map[level] for level in train_levels])
+            full_effects_device[train_indices_map_device, :] = latent_samples_train_device
 
             if has_new_levels
-                new_level_indices = setdiff(1:n_all_groups, train_indices_map)
-                new_effects = randn(length(new_level_indices), n_samples) .* sigma_samples'
-                full_effects[new_level_indices, :] = new_effects
+                new_level_indices = setdiff(1:n_all_groups, train_indices_map_device)
+                new_effects_device = to_device(randn(Float32, length(new_level_indices), n_samples)) .* sigma_device'
+                full_effects_device[new_level_indices, :] = new_effects_device
             end
-            push!(effects_per_outcome, full_effects)
+            
+            # Move final result for this outcome back to CPU
+            push!(effects_per_outcome, Array(full_effects_device))
         end
-        return (type=:simple, effects=effects_per_outcome, lhs=m.lhs[1], indices=full_indices)
+        return (type=:simple, effects=effects_per_outcome, lhs=m.lhs[1], indices=full_indices_cpu)
     else
+        # --- Case 2: Correlated Random Effects ---
         effects_by_term = Dict{Symbol, Vector{Matrix{Float64}}}()
         for term in m.lhs
             term_key = (term == "1" || term == "intercept()") ? :intercept : Symbol("slope_$(term)")
-            effects_by_term[term_key] = [zeros(n_all_groups, n_samples) for _ in 1:outcomes_N]
+            effects_by_term[term_key] = [zeros(Float64, n_all_groups, n_samples) for _ in 1:outcomes_N]
         end
 
         for k in 1:outcomes_N
             p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-            l_corr_samples_name = _find_parameter(p_names_vec, string(p_names_k.L_corr), k, is_multivariate_model)
-            sigma_effects_samples_name = _find_parameter(p_names_vec, string(p_names_k.sigma_effects), k, is_multivariate_model)
-            innovations_samples_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k, is_multivariate_model)
+            l_corr_name = _find_parameter(p_names, string(p_names_k.L_corr), k, is_multivariate_model)
+            sigma_effects_name = _find_parameter(p_names, string(p_names_k.sigma_effects), k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-            if isempty(l_corr_samples_name) || isempty(sigma_effects_samples_name) || isempty(innovations_samples_name)
+            if isempty(l_corr_name) || isempty(sigma_effects_name) || isempty(innovations_name)
                 @warn "Parameters for correlated Mixed component $(spec.key) (outcome $k) not found. Skipping."
                 continue
             end
 
-            l_corr_samples = get_params_vector(chain, l_corr_samples_name, n_terms * n_terms)
-            sigma_effects_samples = get_params_vector(chain, sigma_effects_samples_name, n_terms)
-            innovations_samples = get_params_vector(chain, innovations_samples_name, n_groups_train * n_terms)
+            # Extract samples (CPU)
+            l_corr_samples_cpu = get_params_matrix(chain, l_corr_name, n_terms * n_terms)
+            sigma_effects_samples_cpu = get_params_matrix(chain, sigma_effects_name, n_terms)
+            innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_groups_train * n_terms)
             
             inner_precomputes = spec.hyper.inner_precomputes
 
             for s in 1:n_samples
-                L_effects_t = (reshape(l_corr_samples[s,:], n_terms, n_terms)' * Diagonal(sigma_effects_samples[s,:]))
-                innov_matrix = reshape(innovations_samples[s,:], n_groups_train, n_terms)
+                # Move current sample's parameters to device
+                l_corr_s_device = to_device(reshape(l_corr_samples_cpu[s,:], n_terms, n_terms))
+                sigma_effects_s_device = to_device(sigma_effects_samples_cpu[s,:])
+                innov_matrix_s_device = to_device(reshape(innovations_samples_cpu[s,:], n_groups_train, n_terms))
                 
-                local gamma_matrix
+                # Perform computations on device
+                L_effects_t_device = (l_corr_s_device' * Diagonal(sigma_effects_s_device))
+                
+                local gamma_matrix_device
                 if m.method == :spectral
-                    diag_D = 1.0 ./ sqrt.(inner_precomputes.L .+ noise)
-                    if m.model isa ICAR || m.model isa Besag; diag_D[1] = 0.0; end
-                    gamma_matrix = inner_precomputes.U * (diag_D .* innov_matrix)
+                    diag_D_device = 1.0 ./ sqrt.(inner_precomputes.L .+ noise)
+                    if m.model isa Union{ICAR, Besag, RW1, RW2}; diag_D_device[1] = 0.0; end
+                    if m.model isa RW2; diag_D_device[2] = 0.0; end
+                    gamma_matrix_device = inner_precomputes.U * (diag_D_device .* innov_matrix_s_device)
                 else # :cholesky or :cholesky_sparse
-                    F_groups = inner_precomputes.cholesky_factor
-                    gamma_matrix = F_groups.L' \ innov_matrix
+                    F_groups_device = inner_precomputes.cholesky_factor
+                    gamma_matrix_device = F_groups_device.L' \ innov_matrix_s_device
                 end
                 
-                effects_matrix_train = gamma_matrix * L_effects_t
+                effects_matrix_train_device = gamma_matrix_device * L_effects_t_device
+                
+                # Move results for this sample back to CPU to populate the dictionary
+                effects_matrix_train_cpu = Array(effects_matrix_train_device)
                 train_indices_map = [level_map[level] for level in train_levels]
                 
                 for i in 1:n_terms
                     term_key = (m.lhs[i] == "1" || m.lhs[i] == "intercept()") ? :intercept : Symbol("slope_$(m.lhs[i])")
-                    effects_by_term[term_key][k][train_indices_map, s] = effects_matrix_train[:, i]
+                    effects_by_term[term_key][k][train_indices_map, s] = effects_matrix_train_cpu[:, i]
                 end
 
                 if has_new_levels
                     new_level_indices = setdiff(1:n_all_groups, train_indices_map)
                     n_new = length(new_level_indices)
-                    new_innovs = randn(n_new, n_terms)
-                    new_gamma = new_innovs # Simplified assumption
-                    new_effects = new_gamma * L_effects_t
+                    new_innovs_device = to_device(randn(Float32, n_new, n_terms))
+                    new_gamma_device = new_innovs_device # Simplified assumption for new levels
+                    new_effects_device = new_gamma_device * L_effects_t_device
+                    new_effects_cpu = Array(new_effects_device)
                     for i in 1:n_terms
                         term_key = (m.lhs[i] == "1" || m.lhs[i] == "intercept()") ? :intercept : Symbol("slope_$(m.lhs[i])")
-                        effects_by_term[term_key][k][new_level_indices, s] = new_effects[:, i]
+                        effects_by_term[term_key][k][new_level_indices, s] = new_effects_cpu[:, i]
                     end
                 end
             end
         end
-        return (type=:correlated, effects=effects_by_term, lhs=m.lhs, indices=full_indices)
+        return (type=:correlated, effects=effects_by_term, lhs=m.lhs, indices=full_indices_cpu)
     end
 end

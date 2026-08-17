@@ -214,34 +214,54 @@ function get_updates(
     end
 end
 
-
 """
-    get_effects(m::BCGN, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
+    get_effects(m::BCGN, chain, spec, M, PS)
 
-Reconstructs the `BCGN` component's effect from the MCMC chain's posterior samples,
-dispatching on the method used during sampling.
+Reconstructs the `BCGN` component's effect from the MCMC chain's posterior samples.
+  handle GPU arrays by moving sampled parameters to the
+device for computation and moving the final results back to the CPU. It also uses
+the modern, simplified function signature.
 """
 function get_effects(
-    m::BCGN, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::BCGN, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    n_latent = spec.hyper.n_latent
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
     noise = M.noise
+    n_latent = spec.hyper.n_latent
 
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
+    # --- Coordinate/Index Handling: Combine training and prediction sets on CPU ---
+    s_idx_train_cpu = M.s_idx isa AbstractArray ? Array(M.s_idx) : M.s_idx
+    
+    s_idx_full_cpu = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        vcat(s_idx_train_cpu, PS.data.s_idx)
+    else
+        s_idx_train_cpu
+    end
+    N_total = length(s_idx_full_cpu)
+
+    # --- Mapping Matrix Construction: Build on CPU, then move to device ---
     set1_map = Dict(original_idx => new_idx for (new_idx, original_idx) in enumerate(spec.hyper.set1_indices))
     
-    mapping_matrix_full = spzeros(Float64, N_total, n_latent)
+    mapping_matrix_cpu = spzeros(Float64, N_total, n_latent)
     for i in 1:N_total
-        original_s_idx = s_idx_full[i]
+        original_s_idx = s_idx_full_cpu[i]
         if haskey(set1_map, original_s_idx)
             latent_idx = set1_map[original_s_idx]
-            mapping_matrix_full[i, latent_idx] = 1.0
+            mapping_matrix_cpu[i, latent_idx] = 1.0
         end
     end
+    # Move to device as a dense matrix for efficient multiplication
+    mapping_matrix_full = to_device(Matrix(mapping_matrix_cpu))
 
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
@@ -253,30 +273,42 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
+        # Extract posterior samples from the chain (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
-        effect_k = zeros(Float64, n_latent, n_samples)
+        # Initialize the output matrix for latent effects on the target device
+        effect_k_device = to_device(zeros(Float64, n_latent, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         if m.method == :spectral
-            U = spec.hyper.U
-            L = spec.hyper.L
+            U = spec.hyper.U # Already on device
+            L = spec.hyper.L # Already on device
+            innov_samples_device = to_device(innovations_samples_cpu') # Move all innovations at once
+
             for j in 1:n_samples
-                diag_D = sigma_samples[j] ./ sqrt.(L .+ noise)
+                sigma_j = sigma_samples_cpu[j] # CPU scalar
+                
+                diag_D = sigma_j ./ sqrt.(L .+ noise)
                 diag_D[L .< 1e-6] .= 0.0
-                effect_k[:, j] = U * (diag_D .* innovations_samples[j, :])
+                effect_k_device[:, j] = U * (diag_D .* innov_samples_device[:, j])
             end
         else # :cholesky or :cholesky_sparse
-            F = spec.hyper.cholesky_factor
+            F = spec.hyper.cholesky_factor # Already on device
+            innov_samples_device = to_device(innovations_samples_cpu')
+
             for j in 1:n_samples
-                latent_field_raw = F.L' \ innovations_samples[j, :]
+                sigma_j = sigma_samples_cpu[j]
+
+                latent_field_raw = F.L' \ innov_samples_device[:, j]
                 latent_field_raw .-= mean(latent_field_raw)
-                effect_k[:, j] = latent_field_raw .* sigma_samples[j]
+                effect_k_device[:, j] = latent_field_raw .* sigma_j
             end
         end
         
-        indexed_effects = mapping_matrix_full * effect_k
-        push!(structured_effects, indexed_effects)
+        # Apply mapping to get observation-level effects and move the final result to CPU
+        indexed_effects_device = mapping_matrix_full * effect_k_device
+        push!(structured_effects, Array(indexed_effects_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

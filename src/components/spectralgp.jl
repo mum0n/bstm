@@ -64,6 +64,7 @@ COMPONENT_CONSTRUCTORS[:spectral_gp] = (p, params) -> SpectralGP(
 )
 MODEL_TO_STRUCTURE_MAP[:spectral_gp] = :smooth
 
+
 function get_precomputes(m::SpectralGP, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
     if isempty(variables)
@@ -76,29 +77,31 @@ function get_precomputes(m::SpectralGP, M::NamedTuple, mod_data::Dict)::NamedTup
         end
     end
 
-    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
+    to_device = M.to_device
+    coords_cpu = Matrix{Float64}(M.data[!, Symbol.(variables)])
     res = m.resolution
-    n_dims = size(coords, 2)
+    n_dims = size(coords_cpu, 2)
 
-    min_coords = minimum(coords, dims=1)
-    max_coords = maximum(coords, dims=1)
+    min_coords = minimum(coords_cpu, dims=1)
+    max_coords = maximum(coords_cpu, dims=1)
     
-    # Grid ranges for interpolation
+    # Grid ranges for interpolation (remain on CPU)
     grid_ranges = [range(min_coords[d], stop=max_coords[d], length=res) for d in 1:n_dims]
 
-    freqs = [fftfreq(res, res / (max_coords[d] - min_coords[d])) for d in 1:n_dims]
+    # Frequencies are calculated on CPU then moved to device
+    freqs_cpu = [fftfreq(res, res / (max_coords[d] - min_coords[d])) for d in 1:n_dims]
     
-    # Create a meshgrid of frequencies
-    freq_grids = [reshape(f, (d == i ? res : 1 for i in 1:n_dims)...) for (d, f) in enumerate(freqs)]
+    # Create a meshgrid of frequencies on the target device
+    freq_grids_device = [to_device(reshape(f, (d == i ? res : 1 for i in 1:n_dims)...)) for (d, f) in enumerate(freqs_cpu)]
     
     n_latent = res^n_dims
 
     return (
-        coords = coords,
+        coords = to_device(coords_cpu),
         resolution = res,
         n_dims = n_dims,
         n_latent = n_latent,
-        freq_grids = freq_grids,
+        freq_grids = freq_grids_device,
         grid_ranges = grid_ranges
     )
 end
@@ -169,30 +172,44 @@ function get_updates(
 end
 
 function get_effects(
-    m::SpectralGP, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SpectralGP, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+
+    # --- Get precomputed data (already on device) ---
     hyper = spec.hyper
     res = hyper.resolution
     n_dims = hyper.n_dims
     n_latent = hyper.n_latent
+    coords_train_device = hyper.coords
+    freq_grids_device = hyper.freq_grids
+    grid_ranges_cpu = hyper.grid_ranges
 
+    # --- Coordinate Handling: Combine training and prediction sets on device ---
     coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(hyper.coords, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
+    coords_full_device = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+        vcat(coords_train_device, to_device(coords_pred_cpu))
     else
-        hyper.coords
+        coords_train_device
     end
-    N_total_eff = size(coords_full, 1)
+    N_total_eff = size(coords_full_device, 1)
 
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
-        ls_name = _find_parameter(p_names_vec, v.ls, k, is_multivariate_model)
-        nu_name = _find_parameter(p_names_vec, v.nu, k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
+        ls_name = _find_parameter(p_names, string(v.ls), k, is_multivariate_model)
+        nu_name = _find_parameter(p_names, string(v.nu), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(nu_name) || isempty(innovations_name)
             @warn "Parameters for SpectralGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -200,40 +217,55 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         ls_dim = m.lengthscale isa Vector ? n_dims : 1
-        ls_samples = get_params_vector(chain, ls_name, ls_dim)
-        nu_samples = get_params_vector(chain, nu_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
+        ls_samples_cpu = get_params_vector(chain, ls_name, ls_dim)
+        nu_samples_cpu = get_params_vector(chain, nu_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_vector(chain, innovations_name, n_latent)
 
-        effect_k = zeros(Float64, N_total_eff, n_samples)
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, N_total_eff, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         for i in 1:n_samples
-            current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
-            S_w = anisotropic_matern_spectral_density(
-                hyper.freq_grids,
-                sigma_samples[i],
-                current_ls,
-                nu_samples[i],
+            # Move current sample's parameters to the device
+            current_sigma = sigma_samples_cpu[i] # Scalar, no move needed
+            current_nu = nu_samples_cpu[i]     # Scalar, no move needed
+            current_ls_device = to_device(ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1])
+            current_innovations_device = to_device(innovations_samples_cpu[i, :])
+            
+            # 1. Compute Power Spectral Density on the device
+            S_w_device = anisotropic_matern_spectral_density(
+                freq_grids_device,
+                current_sigma,
+                current_ls_device,
+                current_nu,
                 n_dims
             )
             
-            innov_reshaped = reshape(innovations_samples[i, :], fill(res, n_dims)...)
-            f_tilde_complex = complex.(innov_reshaped)
-            f_tilde_scaled = f_tilde_complex .* sqrt.(S_w)
+            # 2. Construct complex Fourier coefficients on the device
+            innov_reshaped_device = reshape(current_innovations_device, fill(res, n_dims)...)
+            f_tilde_complex_device = complex.(innov_reshaped_device)
+            f_tilde_scaled_device = f_tilde_complex_device .* sqrt.(S_w_device)
             
-            latent_field_grid = real.(ifft(f_tilde_scaled)) .* (res^(n_dims/2))
+            # 3. Transform back to spatial domain using inverse FFT on the device
+            latent_field_grid_device = real.(ifft(f_tilde_scaled_device)) .* (res^(n_dims/2))
             
-            itp_s = linear_interpolation(hyper.grid_ranges, latent_field_grid, extrapolation_bc=Flat())
-            coords_for_itp = ntuple(d -> coords_full[:, d], n_dims)
-            effect_k[:, i] = itp_s(coords_for_itp...)
+            # 4. Interpolate grid values to original coordinates on the device
+            # Assumes Interpolations.jl can handle a CuArray grid with CPU ranges
+            itp_s = linear_interpolation(grid_ranges_cpu, latent_field_grid_device, extrapolation_bc=Flat())
+            coords_for_itp_device = ntuple(d -> view(coords_full_device, :, d), n_dims)
+            effect_k_device[:, i] = itp_s(coords_for_itp_device...)
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
- 
+
 
 """
     anisotropic_matern_spectral_density(freq_grids, sigma, ls, nu, n_dims)

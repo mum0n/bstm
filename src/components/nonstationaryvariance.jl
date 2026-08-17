@@ -208,80 +208,104 @@ function get_updates(
     """
 end
 
+
 function get_effects(
-    m::NonStationaryVariance, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::NonStationaryVariance, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    p_names = names(chain)
+    to_device = M.to_device
+    noise = M.noise
     
-    base_spec_key = Symbol("$(spec.key)_base")
-    modifier_spec_key = Symbol("$(spec.key)_modifier")
+    structured_effects = Vector{Matrix{Float64}}()
+    
+    # --- Index Handling: Combine training and prediction sets on device ---
+    s_idx_train = M.s_idx # Already on device
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        s_idx_pred_cpu = get(PS.data, :s_idx, [])
+        vcat(s_idx_train, to_device(s_idx_pred_cpu))
+    else
+        s_idx_train
+    end
+    N_total = length(s_idx_full)
 
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
+    # --- Define specs for inner models ---
+    base_spec = (
+        key = Symbol("$(spec.key)_base"),
+        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.base_model)],
+        var = spec.var,
+        component_obj = m.base_model,
+        params = get(spec.params, :base_node, (; args = Dict())).args,
+        hyper = spec.hyper.base_precomputes
+    )
+    modifier_spec = (
+        key = Symbol("$(spec.key)_modifier"),
+        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.modifier_model)],
+        var = spec.var,
+        component_obj = m.modifier_model,
+        params = get(spec.params, :modifier_node, (; args = Dict())).args,
+        hyper = spec.hyper.modifier_precomputes
+    )
 
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
-        modifier_spec = (
-            key = modifier_spec_key,
-            structure = MODEL_TO_STRUCTURE_MAP[typeof(m.modifier_model)],
-            var = spec.var,
-            component_obj = m.modifier_model,
-            params = spec.params,
-            hyper = spec.hyper.modifier_precomputes
-        )
-        modifier_results = get_effects(
-            m.modifier_model, chain, M, n_samples, outcomes_N, modifier_spec, PS, N_total
-        )
-        log_sigma_field_samples = modifier_results.structured[k]
-        spatially_varying_sigma_samples = exp.(log_sigma_field_samples)
-
-        base_spec = (
-            key = base_spec_key,
-            structure = MODEL_TO_STRUCTURE_MAP[typeof(m.base_model)],
-            var = spec.var,
-            component_obj = m.base_model,
-            params = spec.params,
-            hyper = spec.hyper.base_precomputes
-        )
+        # 1. Get the modifier effect (spatially varying log-sigma)
+        # This recursive call returns CPU arrays.
+        modifier_results = get_effects(m.modifier_model, chain, modifier_spec, M, PS)
+        log_sigma_field_cpu = modifier_results.structured[k]
         
+        # Move to device and compute sigma
+        log_sigma_field_device = to_device(log_sigma_field_cpu)
+        spatially_varying_sigma_device = exp.(log_sigma_field_device)
+
+        # 2. Get the base model's raw innovations
         base_p_names = generate_full_variable_names(base_spec, M.model_arch, k)
-        base_innovations_name = _find_parameter(p_names_vec, string(base_p_names.innovations), k, is_multivariate_model)
+        base_innovations_name = _find_parameter(p_names, string(base_p_names.innovations), k, is_multivariate_model)
         
         if isempty(base_innovations_name)
             @warn "Base innovations for NonStationaryVariance component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
-        base_innovations_samples = get_params_vector(chain, base_innovations_name, base_spec.hyper.n_latent)
         
+        # Extract samples (CPU) and move to device
+        base_innovations_cpu = get_params_matrix(chain, base_innovations_name, base_spec.hyper.n_latent)
+        base_innovations_device = to_device(base_innovations_cpu)
+        
+        # 3. Reconstruct the base latent field (unit variance) on the device
         n_latent_base = base_spec.hyper.n_latent
-        base_latent_raw_samples = zeros(n_samples, n_latent_base)
+        base_latent_raw_device = to_device(zeros(Float64, n_latent_base, n_samples))
 
         if m.method == :spectral
-            U, L = base_spec.hyper.U, base_spec.hyper.L
-            diag_D = 1.0 ./ sqrt.(L .+ M.noise)
+            U = base_spec.hyper.U # Already on device
+            L = base_spec.hyper.L # Already on device
+            diag_D = 1.0 ./ sqrt.(L .+ noise)
             if typeof(m.base_model) in [ICAR, Besag]; diag_D[1] = 0.0; end
-            for i in 1:n_samples
-                base_latent_raw_samples[i, :] = U * (diag_D .* base_innovations_samples[i, :])
-            end
+            
+            # Vectorized reconstruction
+            base_latent_raw_device = U * (diag_D .* base_innovations_device')
         else # :cholesky or :cholesky_sparse
-            Q_base_template = base_spec.hyper.Q_template
-            F_base = cholesky(Symmetric(Matrix(Q_base_template) + M.noise * I))
+            # Use the pre-computed Cholesky factor
+            F_base = base_spec.hyper.cholesky_factor
             for i in 1:n_samples
-                raw_field = F_base.L' \ base_innovations_samples[i, :]
-                base_latent_raw_samples[i, :] = raw_field .- mean(raw_field)
+                raw_field = F_base.L' \ base_innovations_device[i, :]
+                base_latent_raw_device[:, i] = raw_field .- mean(raw_field)
             end
         end
 
-        final_effect_k = zeros(N_total, n_samples)
-        for i in 1:n_samples
-            base_field_at_obs = view(base_latent_raw_samples[i, :], s_idx_full)
-            sigma_at_obs = spatially_varying_sigma_samples[:, i]
-            final_effect_k[:, i] = base_field_at_obs .* sigma_at_obs
-        end
+        # 4. Combine base field and sigma field on the device
+        # Index the base field to match the observation structure
+        base_field_at_obs_device = base_latent_raw_device[s_idx_full, :]
         
-        push!(structured_effects, final_effect_k)
+        # Element-wise product
+        final_effect_k_device = base_field_at_obs_device .* spatially_varying_sigma_device
+        
+        # 5. Move final result back to CPU
+        push!(structured_effects, Array(final_effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

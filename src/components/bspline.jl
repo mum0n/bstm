@@ -245,17 +245,48 @@ function get_updates(
 end
 
 """
-    get_effects(m::BSpline, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
+    get_effects(m::BSpline, chain, spec, M, PS)
 
 Reconstructs the posterior distribution of the B-spline smooth effect from the
-MCMC chain, dispatching on the computational method used during sampling.
+MCMC chain.   handle GPU arrays by moving sampled
+parameters to the device for computation and moving the final results back to the CPU.
 """
 function get_effects(
-    m::BSpline, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int, is_multivariate_model::Bool
+    m::BSpline, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+    noise = M.noise
+
+    # --- Basis Matrix Construction for Training and Prediction ---
+    B_train = spec.hyper.basis_matrix # Already on device if use_gpu=true
+
+    B_full = if !isnothing(PS)
+        coord_vars = get(spec.params, :positional_args, [])
+        if !isempty(coord_vars) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+            # Get prediction coordinates from CPU DataFrame
+            coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+            # Move coordinates to device
+            coords_pred_device = to_device(coords_pred_cpu)
+            # bstm_bspline_basis is GPU-aware, so it will return a GPU matrix
+            B_pred, _ = bstm_bspline_basis(coords_pred_device[:, 1], m.nbins, m.degree)
+            vcat(B_train, B_pred)
+        else
+            B_train
+        end
+    else
+        B_train
+    end
+    N_total = size(B_full, 1)
+
     structured_effects = Vector{Matrix{Float64}}()
 
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
@@ -267,59 +298,42 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_matrix(chain, innovations_name, spec.hyper.n_latent)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, spec.hyper.n_latent)
+
+        # Initialize the output matrix for coefficients on the target device
+        coeffs_matrix_device = to_device(zeros(Float64, spec.hyper.n_latent, n_samples))
 
         hyper = spec.hyper
-        noise = M.noise
-        
-        B_train = hyper.basis_matrix
-        
-        # Reconstruct basis matrix for full data (training + prediction)
-        B_full = if !isnothing(PS)
-            coord_vars = get(spec.params, :positional_args, [])
-            if !isempty(coord_vars) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-                coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-                # bstm_bspline_basis returns (matrix, actual_nbins), we only need the matrix
-                B_pred, _ = bstm_bspline_basis(coords_pred[:, 1], m.nbins, m.degree)
-                vcat(B_train, B_pred)
-            else
-                B_train
-            end
-        else
-            B_train
-        end
-        
-        reconstructed_effects_k = zeros(Float64, N_total, n_samples)
 
+        # --- Sample-wise Coefficient Reconstruction on the Target Device ---
         for i in 1:n_samples
-            local coeffs
+            innov_i_device = to_device(innovations_samples_cpu[i, :])
+            sigma_i = sigma_samples_cpu[i] # CPU scalar
+
+            local coeffs_device
             if m.method == :spectral
-                U = hyper.U
-                L = hyper.L
-                diag_D = sigma_samples[i] ./ sqrt.(L .+ noise)
+                U = hyper.U # Already on device
+                L = hyper.L # Already on device
+                diag_D = sigma_i ./ sqrt.(L .+ noise)
                 diag_D[1] = 0.0 # Enforce sum-to-zero constraints for RW2 penalty
                 diag_D[2] = 0.0
-                coeffs = U * (diag_D .* innovations_samples[i, :])
+                coeffs_device = U * (diag_D .* innov_i_device)
             else # :cholesky or :cholesky_sparse
-                F = hyper.cholesky_factor
-                coeffs_raw = F.L' \ innovations_samples[i, :]
+                F = hyper.cholesky_factor # Already on device
+                coeffs_raw = F.L' \ innov_i_device
                 # Apply sum-to-zero constraints for RW2 penalty
-                coeffs_centered = coeffs_raw .- mean(coeffs_raw[1:2]) # Centering based on first two elements
-                coeffs = sigma_samples[i] .* coeffs_centered
+                coeffs_centered = coeffs_raw .- mean(view(coeffs_raw, 1:2)) # Centering based on first two elements
+                coeffs_device = sigma_i .* coeffs_centered
             end
-            
-            # Compute effect for training data
-            effect_train = B_train * coeffs
-            reconstructed_effects_k[1:size(B_train, 1), i] = effect_train
-
-            # If prediction data exists, compute effect for prediction data
-            if !isnothing(PS) && size(B_full, 1) > size(B_train, 1)
-                effect_pred = B_full[(size(B_train, 1)+1):end, :] * coeffs
-                reconstructed_effects_k[(size(B_train, 1)+1):end, i] = effect_pred
-            end
+            coeffs_matrix_device[:, i] = coeffs_device
         end
-        push!(structured_effects, reconstructed_effects_k)
+
+        # Perform matrix multiplication on the device
+        effect_k_device = B_full * coeffs_matrix_device
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
 
     return (structured=structured_effects, noisy=structured_effects)

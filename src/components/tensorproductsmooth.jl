@@ -6,7 +6,7 @@ product of marginal (e.g., spatial and temporal) components. This is typically
 specified in the formula via the Kronecker product operator `⊗`.
 
 # Version
-v1.1.1 (2026-08-14)
+v1.2.0 (2026-08-17)
 
 # Mathematical Summary
 This component models an inseparable spatiotemporal random effect \$\\boldsymbol{\\delta}\$
@@ -186,34 +186,47 @@ function get_updates(
 end
 
 function get_effects(
-    m::TensorProductSmooth, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::TensorProductSmooth, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = string.(names(chain))
+    to_device = M.to_device
+
+    # --- Get precomputed data (already on device) ---
     child_specs = spec.hyper.child_specs
     s_spec, t_spec = child_specs[1], child_specs[2]
     s_N, t_N = s_spec.hyper.n_latent, t_spec.hyper.n_latent
     noise = M.noise
 
+    Q_s_template_device = s_spec.hyper.Q_template
+    Q_t_template_device = t_spec.hyper.Q_template
+
     s_model_type = Symbol(lowercase(string(typeof(s_spec.component_obj))))
     t_model_type = Symbol(lowercase(string(typeof(t_spec.component_obj))))
-    
-    p_names_vec = string.(FlexiChains.parameters(chain))
 
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
-    t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, []))
-    st_idx_full = (t_idx_full .- 1) .* s_N .+ s_idx_full
+    # --- Index Handling: Combine training and prediction sets on device ---
+    s_idx_full_cpu = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
+    t_idx_full_cpu = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, []))
+    N_total = length(s_idx_full_cpu)
+    st_idx_full_device = to_device((t_idx_full_cpu .- 1) .* s_N .+ s_idx_full_cpu)
 
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
         s_v = generate_full_variable_names(s_spec, M.model_arch, k)
         t_v = generate_full_variable_names(t_spec, M.model_arch, k)
 
-        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
         
-        s_rho_name = hasproperty(s_spec.component_obj, :rho) ? _find_parameter(p_names_vec, s_v.rho, k, is_multivariate_model) : ""
-        t_rho_name = hasproperty(t_spec.component_obj, :rho) ? _find_parameter(p_names_vec, t_v.rho, k, is_multivariate_model) : ""
+        s_rho_name = hasproperty(s_spec.component_obj, :rho) ? _find_parameter(p_names, string(s_v.rho), k, is_multivariate_model) : ""
+        t_rho_name = hasproperty(t_spec.component_obj, :rho) ? _find_parameter(p_names, string(t_v.rho), k, is_multivariate_model) : ""
 
         if isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for TensorProductSmooth component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -221,34 +234,46 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, s_N * t_N)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_vector(chain, innovations_name, s_N * t_N)
         
-        s_rho_samples = !isempty(s_rho_name) ? get_params_vector(chain, s_rho_name, 1)[:, 1] : nothing
-        t_rho_samples = !isempty(t_rho_name) ? get_params_vector(chain, t_rho_name, 1)[:, 1] : nothing
+        s_rho_samples_cpu = !isempty(s_rho_name) ? get_params_vector(chain, s_rho_name, 1)[:, 1] : nothing
+        t_rho_samples_cpu = !isempty(t_rho_name) ? get_params_vector(chain, t_rho_name, 1)[:, 1] : nothing
 
-        st_field_samples = zeros(Float64, s_N * t_N, n_samples)
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         for i in 1:n_samples
-            s_rho_val = isnothing(s_rho_samples) ? nothing : s_rho_samples[i]
-            t_rho_val = isnothing(t_rho_samples) ? nothing : t_rho_samples[i]
+            # Move current sample's parameters to device
+            sigma_i = sigma_samples_cpu[i]
+            innovations_i = to_device(innovations_samples_cpu[i, :])
+            s_rho_val = isnothing(s_rho_samples_cpu) ? nothing : s_rho_samples_cpu[i]
+            t_rho_val = isnothing(t_rho_samples_cpu) ? nothing : t_rho_samples_cpu[i]
             
-            Q_s = recompose_precision(s_model_type, s_spec.hyper.Q_template, 1.0; extra_param=s_rho_val)
-            Q_t = recompose_precision(t_model_type, t_spec.hyper.Q_template, 1.0; extra_param=t_rho_val)
+            # Recompose precision matrices on the device
+            Q_s = recompose_precision(s_model_type, Q_s_template_device, 1.0; extra_param=s_rho_val)
+            Q_t = recompose_precision(t_model_type, Q_t_template_device, 1.0; extra_param=t_rho_val)
             
+            # Perform Cholesky and back-solve on the device
             C_s = cholesky(Symmetric(Matrix(Q_s) + noise * I))
             C_t = cholesky(Symmetric(Matrix(Q_t) + noise * I))
             
-            Z_matrix = reshape(innovations_samples[i, :], s_N, t_N)
+            Z_matrix = reshape(innovations_i, s_N, t_N)
             tmp_spatial = C_s.L' \ Z_matrix
             st_field_unscaled = transpose(C_t.L' \ transpose(tmp_spatial))
             
-            st_field = st_field_unscaled .* sigma_samples[i]
-            st_field_samples[:, i] = vec(st_field)
+            # Apply sum-to-zero constraint and scale
+            st_field_unscaled .-= mean(st_field_unscaled)
+            st_field = st_field_unscaled .* sigma_i
+            
+            # Index and store the result for this sample
+            effect_k_device[:, i] = vec(st_field)[st_idx_full_device]
         end
         
-        indexed_effects = st_field_samples[st_idx_full, :]
-        push!(structured_effects, indexed_effects)
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

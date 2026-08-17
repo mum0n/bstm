@@ -30,7 +30,7 @@ end
  
 # Version 1.2.0 (2026-08-11)
 # Purpose: Finds a parameter name in a list based on the `param_name_key` convention.
-# Rationale: This version is updated to correctly handle parameter naming conventions
+# Rationale:   correctly handle parameter naming conventions
 #            for both univariate and multivariate models. It introduces the
 #            `is_multivariate_model` argument. When `true`, it prioritizes searching
 #            for outcome-specific parameter names (e.g., `sigma_s_idx_1`). When `false`,
@@ -159,7 +159,7 @@ end
 
 # Version 1.0.1 (2026-08-06)
 # Purpose: Summarizes the posterior samples for all discovered component effects.
-# Rationale: This version is updated to create a more informative summary object. Instead of
+# Rationale:   create a more informative summary object. Instead of
 #            only summarizing one effect per component, it now iterates through all effect
 #            (e.g., `structured`, `unstructured`, `noisy`)
 #            and summarizes each one. This allows downstream functions like `bstm_plots` to
@@ -263,7 +263,6 @@ function summarize_predictions(samples::AbstractArray; alpha=0.05)
 end
 
  
- 
 """
     _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
 
@@ -271,16 +270,15 @@ Extracts all latent effects from the MCMC chain by dispatching to the `get_effec
 method for each model component.
 
 # Version
-v1.1.2 (2026-08-13)
+v1.2.0 (2026-08-15)
 
 # Rationale
 This function is the main entry point for reconstructing all latent effects from the
-posterior chain. This version is updated to be consistent with the refactored
-`get_effects` interface. It now explicitly passes an `is_multivariate` boolean flag
-to each `get_effects` call. This ensures that the downstream `_find_parameter`
-utility correctly resolves parameter names for both univariate and multivariate
-models, preventing "parameter not discovered" errors. The logic for handling fixed
-effects and intercepts is retained and correct.
+posterior chain.   use the modern, simplified `get_effects`
+signature, which is part of the broader refactoring for GPU compatibility and code
+consistency. The new signature `get_effects(spec.component_obj, chain, spec, M, PS)`
+is cleaner and delegates the responsibility of parsing samples and dimensions to the
+component-specific methods.
 
 # Arguments
 - `chain`: The MCMC chain object.
@@ -302,7 +300,8 @@ function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N
     if M.Xfixed_N > 0
         Xfixed_train = M.Xfixed
         Xfixed_pred = if isnothing(PS) || !haskey(PS, :Xfixed) || isempty(PS.Xfixed) || size(PS.Xfixed, 1) == 0
-            zeros(0, M.Xfixed_N)
+            # Ensure correct type and device for the empty array
+            M.to_device(zeros(Float64, 0, M.Xfixed_N))
         else
             PS.Xfixed
         end
@@ -312,9 +311,9 @@ function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N
             beta_samples_flat = get_params_vector(
                 chain, "Xfixed_beta_prop_flat", M.Xfixed_N * outcomes_N
             )
-            fixed_effects_all = zeros(Float64, N_tot, n_samples, outcomes_N)
+            fixed_effects_all = M.to_device(zeros(Float64, N_tot, n_samples, outcomes_N))
             for k in 1:outcomes_N
-                beta_k = beta_samples_flat[:, (k-1)*M.Xfixed_N+1 : k*M.Xfixed_N]
+                beta_k = M.to_device(beta_samples_flat[:, (k-1)*M.Xfixed_N+1 : k*M.Xfixed_N])
                 fixed_effects_all[:, :, k] = Xfixed_full * beta_k'
             end
             registry[:fixed] = fixed_effects_all
@@ -322,35 +321,34 @@ function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N
             beta_samples = get_params_vector(
                 chain, "Xfixed_beta_prop", M.Xfixed_N
             )
-            fixed_effects_2d = Xfixed_full * beta_samples'
+            fixed_effects_2d = Xfixed_full * M.to_device(beta_samples')
             registry[:fixed] = reshape(fixed_effects_2d, N_tot, n_samples, 1)
         end
     else
-        registry[:fixed] = zeros(Float64, N_tot, n_samples, outcomes_N)
+        registry[:fixed] = M.to_device(zeros(Float64, N_tot, n_samples, outcomes_N))
     end
 
     if M.add_intercept
         intercept_samples = get_params_vector(chain, "intercept", outcomes_N)
-        intercept_effects = zeros(Float64, N_tot, n_samples, outcomes_N)
+        intercept_effects = M.to_device(zeros(Float64, N_tot, n_samples, outcomes_N))
         for k in 1:outcomes_N
-            intercept_effects[:, :, k] .= intercept_samples[:, k]'
+            intercept_effects[:, :, k] .= M.to_device(intercept_samples[:, k]')
         end
         registry[:intercept] = intercept_effects
     else
-        registry[:intercept] = zeros(Float64, N_tot, n_samples, outcomes_N)
+        registry[:intercept] = M.to_device(zeros(Float64, N_tot, n_samples, outcomes_N))
     end
 
     # --- Main Component Loop using get_effects ---
-    p_names = string.(FlexiChains.parameters(chain))
     for spec in M.components
-        effects = get_effects(
-            spec.component_obj, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_tot, is_multivariate
-        )
+        # Updated call to the modern, simplified get_effects signature
+        effects = get_effects(spec.component_obj, chain, spec, M, PS)
         registry[spec.key] = effects
     end
 
     return NamedTuple(registry)
 end
+
 
 
 
@@ -703,7 +701,7 @@ end
 
 # Version 1.1.1 (2026-08-11)
 # Purpose: Generates predictions and log-likelihood values from eta.
-# Rationale: This version is updated to be more robust. It now checks the likelihood
+# Rationale:   more robust. It now checks the likelihood
 #            family before attempting to extract family-specific parameters like
 #            `y_sigma` (for Gaussian) or `r_nb` (for Negative Binomial). This prevents
 #            "Parameter not discovered" warnings when running models with other
@@ -1012,7 +1010,7 @@ v1.6.4 (2026-08-13)
 # Rationale
 This function is the main entry point for model interpretation. It orchestrates the
 entire post-processing pipeline, from reconstructing latent effects to generating
-final plots and performance metrics. This version is updated to correctly handle
+final plots and performance metrics.   correctly handle
 the `strata_info` for post-stratification weights, ensuring they are calculated
 when an `au` object is provided, and it merges the weights into the `pstats`
 output for better consistency.
@@ -1385,7 +1383,7 @@ This function constructs a "prediction set" configuration (`PS`) that mirrors th
 training configuration (`M`) but is adapted for the `new_data`. It correctly
 handles the projection of fixed effects, the re-generation of basis matrices for
 smoothers on the new coordinates, and the recursive prediction for nested models.
-This version is updated to be consistent with the refactored architecture,
+  consistent with the refactored architecture,
 correcting `MethodError` exceptions that arose from changes in the signatures of
 `decompose_bstm_formula` and `create_fixed_design`.
 
@@ -1702,7 +1700,7 @@ v1.1.0 (2026-08-13)
 
 # Rationale
 This function provides a standardized and flexible way to evaluate a model's
-out-of-sample predictive performance. This version is updated to be consistent
+out-of-sample predictive performance.   consistent
 with the refactored `bstm` architecture, replacing the deprecated model
 instantiation logic with a call to the new `bstm_core` function. It also
 corrects a bug in the formula parsing step.

@@ -96,20 +96,22 @@ function get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
         @warn "Adjacency matrix `W` not provided for SVAR model's rho field."
     end
 
+    # Get the device transfer function
+    to_device = M.to_device
+
+    # This returns CPU arrays
     template = build_structure_template(m.rho_model_type, s_N; W=W)
-    
-    F_rho = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
 
     return (
-        Q_rho_template=template.matrix,
-        U_rho=template.U,
-        L_rho=template.L,
+        Q_rho_template=to_device(template.matrix),
+        U_rho=to_device(template.U),
+        L_rho=to_device(template.L),
         scaling_factor_rho=template.scaling_factor,
-        cholesky_factor_rho=F_rho,
         n_latent_rho=s_N,
         n_latent_svar=s_N * t_N
     )
 end
+
 
 function get_priors(
     m::SVAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -144,26 +146,17 @@ function get_updates(
         rho_recon_code = """
             local hyper_rho = spec_registry[:$(key)].hyper
             local D_rho = $(p_names.rho_sigma) ./ sqrt.(hyper_rho.L_rho .+ M.noise)
-            if $(m.rho_model_type) in [:icar, :besag]; D_rho[1] = 0.0; end
+            if "$(string(m.rho_model_type))" in ["icar", "besag"]; D_rho[1] = 0.0; end
             local rho_field = hyper_rho.U_rho * (D_rho .* $(p_names.rho_innovations))
         """
-    elseif m.method == :cholesky
-        rho_recon_code = """
-            local hyper_rho = spec_registry[:$(key)].hyper
-            local F_rho = hyper_rho.cholesky_factor_rho
-            local rho_field_raw = F_rho.L' \\ $(p_names.rho_innovations)
-            if $(m.rho_model_type) in [:icar, :besag]
-                Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper_rho.n_latent_rho), sum(rho_field_raw))
-            end
-            local rho_field = rho_field_raw .* $(p_names.rho_sigma)
-        """
-    else # :cholesky_sparse
+    else # :cholesky or :cholesky_sparse
         rho_recon_code = """
             local hyper_rho = spec_registry[:$(key)].hyper
             local Q_rho = hyper_rho.Q_rho_template
-            local F_rho = cholesky(Symmetric(Q_rho + M.noise * I))
+            # Recompute Cholesky on the fly, which will happen on the target device
+            local F_rho = cholesky(Symmetric(Matrix(Q_rho) + M.noise * I))
             local rho_field_raw = F_rho.L' \\ $(p_names.rho_innovations)
-            if $(m.rho_model_type) in [:icar, :besag]
+            if "$(string(m.rho_model_type))" in ["icar", "besag"]
                 Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper_rho.n_latent_rho), sum(rho_field_raw))
             end
             local rho_field = rho_field_raw .* $(p_names.rho_sigma)
@@ -181,7 +174,7 @@ function get_updates(
             local latent_st = zeros(eltype(rho_s), M.s_N, M.t_N)
             local innovations_grid = reshape($(p_names.innovations), M.s_N, M.t_N)
             
-            latent_st[:, 1] = ($(p_names.sigma) ./ sqrt.(1 .- rho_s.^2)) .* innovations_grid[:, 1]
+            latent_st[:, 1] = ($(p_names.sigma) ./ sqrt.(1 .- rho_s.^2 .+ M.noise)) .* innovations_grid[:, 1]
             for t in 2:M.t_N
                 latent_st[:, t] = rho_s .* latent_st[:, t-1] .+ $(p_names.sigma) .* innovations_grid[:, t]
             end
@@ -196,26 +189,43 @@ function get_updates(
 end
 
 function get_effects(
-    m::SVAR, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::SVAR, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    p_names_vec = string.(FlexiChains.parameters(chain))
-    
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+
+    # --- Get precomputed data (already on device) ---
+    hyper = spec.hyper
     s_N, t_N, noise = M.s_N, M.t_N, M.noise
     n_latent_svar = s_N * t_N
+    Q_rho_template_device = hyper.Q_rho_template
+    U_rho_device = hyper.U_rho
+    L_rho_device = hyper.L_rho
 
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, Int[]))
-    t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, Int[]))
-    t_N_full = isempty(t_idx_full) ? 0 : maximum(t_idx_full)
+    # --- Index Handling: Combine training and prediction sets on device ---
+    s_idx_cpu = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, Int[]))
+    t_idx_cpu = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, Int[]))
+    N_total = length(s_idx_cpu)
+    t_N_full = isempty(t_idx_cpu) ? 0 : maximum(t_idx_cpu)
+    
+    s_idx_device = to_device(s_idx_cpu)
+    t_idx_device = to_device(t_idx_cpu)
 
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
         
-        rho_sigma_name = _find_parameter(p_names_vec, v.rho_sigma, k, is_multivariate_model)
-        sigma_name = _find_parameter(p_names_vec, v.sigma, k, is_multivariate_model)
-        rho_innovations_name = _find_parameter(p_names_vec, v.rho_innovations, k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names_vec, v.innovations, k, is_multivariate_model)
+        rho_sigma_name = _find_parameter(p_names, string(v.rho_sigma), k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
+        rho_innovations_name = _find_parameter(p_names, string(v.rho_innovations), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
         
         if isempty(rho_sigma_name) || isempty(sigma_name) || isempty(rho_innovations_name) || isempty(innovations_name)
             @warn "Parameters for SVAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -223,47 +233,58 @@ function get_effects(
             continue
         end
 
-        rho_sigma_samples = get_params_vector(chain, rho_sigma_name, 1)[:, 1]
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_innovations_samples = get_params_vector(chain, rho_innovations_name, s_N)
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent_svar)
+        # Extract posterior samples (these are on the CPU)
+        rho_sigma_samples_cpu = get_params_vector(chain, rho_sigma_name, 1)[:, 1]
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        rho_innovations_samples_cpu = get_params_vector(chain, rho_innovations_name, s_N)
+        innovations_samples_cpu = get_params_vector(chain, innovations_name, n_latent_svar)
         
-        effect_k = zeros(Float64, N_total, n_samples)
-        hyper = spec.hyper
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         for s in 1:n_samples
+            # Move current sample's parameters to the device
+            rho_sigma_s = rho_sigma_samples_cpu[s] # scalar
+            sigma_s = sigma_samples_cpu[s] # scalar
+            rho_innovations_s = to_device(rho_innovations_samples_cpu[s, :])
+            innovations_s = to_device(innovations_samples_cpu[s, :])
+
             local rho_field_s
             if m.method == :spectral
-                D_rho_s = rho_sigma_samples[s] ./ sqrt.(hyper.L_rho .+ noise)
+                D_rho_s = rho_sigma_s ./ sqrt.(L_rho_device .+ noise)
                 if m.rho_model_type in [:icar, :besag]; D_rho_s[1] = 0.0; end
-                rho_field_s = hyper.U_rho * (D_rho_s .* rho_innovations_samples[s, :])
+                rho_field_s = U_rho_device * (D_rho_s .* rho_innovations_s)
             else # :cholesky or :cholesky_sparse
-                F_rho = hyper.cholesky_factor_rho
-                rho_field_raw = F_rho.L' \ rho_innovations_samples[s, :]
+                # Recompute Cholesky on device
+                F_rho_device = cholesky(Symmetric(Matrix(Q_rho_template_device) + noise * I))
+                rho_field_raw = F_rho_device.L' \ rho_innovations_s
                 if m.rho_model_type in [:icar, :besag]; rho_field_raw .-= mean(rho_field_raw); end
-                rho_field_s = rho_field_raw .* rho_sigma_samples[s]
+                rho_field_s = rho_field_raw .* rho_sigma_s
             end
             rho_s_s = tanh.(rho_field_s)
 
-            latent_st_s = zeros(Float64, s_N, t_N_full)
-            innovations_grid_train = reshape(innovations_samples[s, :], s_N, t_N)
+            latent_st_s = to_device(zeros(Float64, s_N, t_N_full))
+            innovations_grid_train = reshape(innovations_s, s_N, t_N)
             innovations_grid_full = if t_N_full > t_N
-                hcat(innovations_grid_train, randn(s_N, t_N_full - t_N))
+                hcat(innovations_grid_train, to_device(randn(Float32, s_N, t_N_full - t_N)))
             else
                 innovations_grid_train
             end
             
             denom = sqrt.(max.(0, 1 .- rho_s_s.^2))
-            latent_st_s[:, 1] = (sigma_samples[s] ./ (denom .+ noise)) .* innovations_grid_full[:, 1]
+            latent_st_s[:, 1] = (sigma_s ./ (denom .+ noise)) .* innovations_grid_full[:, 1]
             for t in 2:t_N_full
-                latent_st_s[:, t] = rho_s_s .* latent_st_s[:, t-1] .+ sigma_samples[s] .* innovations_grid_full[:, t]
+                latent_st_s[:, t] = rho_s_s .* latent_st_s[:, t-1] .+ sigma_s .* innovations_grid_full[:, t]
             end
             
-            for i in 1:N_total
-                effect_k[i, s] = latent_st_s[s_idx_full[i], t_idx_full[i]]
-            end
+            # Vectorized indexing
+            linear_indices = s_idx_device .+ (t_idx_device .- 1) .* s_N
+            effect_k_device[:, s] = vec(latent_st_s)[linear_indices]
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)

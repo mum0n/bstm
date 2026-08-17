@@ -155,12 +155,17 @@ function get_updates(
     """
 end
 
+
 function get_effects(
-    m::TVC, chain, M::NamedTuple, n_samples::Int, is_multivariate_model::Bool,
-    outcomes_N::Int, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::TVC, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
+    # --- Setup: Extract dimensions ---
+    outcomes_N = M.outcomes_N
     cov_var = m.covariate
     
+    # --- Construct inner specification ---
+    # This creates the specification required to call the inner model's methods.
     inner_spec_key = Symbol("$(spec.key)_inner")
     inner_spec = (
         key = inner_spec_key,
@@ -171,32 +176,38 @@ function get_effects(
         hyper = spec.hyper.inner_precomputes
     )
 
-    inner_effects_result = get_effects(
-        m.model, chain, M, n_samples, is_multivariate_model, outcomes_N, inner_spec, PS, N_total
-    )
+    # --- Get effects from the inner temporal model ---
+    # This call will return the latent temporal field on the CPU as per the ComponentModel interface contract.
+    # The heavy computation (and GPU usage) happens inside this call.
+    inner_effects_result = get_effects(m.model, chain, inner_spec, M, PS)
     
-    cov_data_full = if !isnothing(PS) && hasproperty(PS.data, cov_var)
-        vcat(M.data[!, cov_var], PS.data[!, cov_var])
+    # --- Prepare covariate and index data on the CPU ---
+    # The data in M.data might be a CuArray, so we need to bring it to the CPU with Array().
+    cov_data_train_cpu = Array(M.data[!, cov_var])
+    cov_data_full_cpu = if !isnothing(PS) && hasproperty(PS.data, cov_var)
+        vcat(cov_data_train_cpu, PS.data[!, cov_var])
     else
-        M.data[!, cov_var]
+        cov_data_train_cpu
     end
     
-    t_idx_full = if !isnothing(PS) && haskey(PS, :t_idx)
-        vcat(M.t_idx, PS.t_idx)
+    t_idx_train_cpu = Array(M.t_idx)
+    t_idx_full_cpu = if !isnothing(PS) && haskey(PS, :t_idx)
+        vcat(t_idx_train_cpu, get(PS, :t_idx, []))
     else
-        M.t_idx
+        t_idx_train_cpu
     end
 
     structured_effects = Vector{Matrix{Float64}}()
     for k in 1:outcomes_N
         # inner_effects_result.structured[k] is the latent temporal field, size [t_N_full x n_samples]
+        # This is already a CPU matrix.
         temporal_field_k = inner_effects_result.structured[k]
         
-        # Map the temporal field to the observation level using the time index
-        temporal_effect_at_obs = temporal_field_k[t_idx_full, :]
+        # Map the temporal field to the observation level using the time index (on CPU)
+        temporal_effect_at_obs = temporal_field_k[t_idx_full_cpu, :]
         
-        # Element-wise multiplication of the covariate and the observation-level temporal effect
-        final_effect_k = temporal_effect_at_obs .* cov_data_full
+        # Element-wise multiplication of the covariate and the observation-level temporal effect (on CPU)
+        final_effect_k = temporal_effect_at_obs .* cov_data_full_cpu
         
         push!(structured_effects, final_effect_k)
     end

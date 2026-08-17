@@ -132,59 +132,95 @@ function get_updates(
         error("Unsupported method '$(m.method)' for Moran component.")
     end
 end
+"""
+    get_effects(m::Moran, chain, spec, M, PS)
 
+Reconstructs the Moran eigenvector effect from posterior samples. This version is
+updated to handle GPU arrays by moving sampled parameters to the device for
+computation and moving the final results back to the CPU. It also uses a more
+efficient vectorized approach for reconstruction.
+"""
 function get_effects(
-    m::Moran, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::Moran, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+
     structured_effects = Vector{Matrix{Float64}}()
     
-    eigenvectors = spec.hyper.moran_eigenvectors
+    eigenvectors = spec.hyper.moran_eigenvectors # This is already on the correct device
     n_latent = spec.hyper.n_latent
-    s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, PS.s_idx)
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
 
+    # --- Index Handling: Combine training and prediction sets on device ---
+    s_idx_train = M.s_idx # Already on device
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        s_idx_pred_cpu = get(PS.data, :s_idx, [])
+        vcat(s_idx_train, to_device(s_idx_pred_cpu))
+    else
+        s_idx_train
+    end
+    N_total = length(s_idx_full)
+
+    # --- Reconstruction Loop ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names_vec, string(p_names_k.sigma), k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        
         if isempty(sigma_name)
             @warn "Sigma parameter for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
 
-        effect_k = zeros(Float64, N_total, n_samples)
-
+        # Samples are always on CPU
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        
+        local latent_field_device
         if m.method == :noncentered
-            innovations_name = _find_parameter(p_names_vec, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
             if isempty(innovations_name)
                 @warn "Innovations for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            innovations_samples = get_params_vector(chain, innovations_name, n_latent)
-            for i in 1:n_samples
-                scaled_coeffs = innovations_samples[i, :] .* sigma_samples[i]
-                spatial_field = eigenvectors * scaled_coeffs
-                effect_k[:, i] = view(spatial_field, s_idx_full)
-            end
+            innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
+            
+            # Move to device for computation
+            innovations_device = to_device(innovations_samples_cpu)
+            sigma_device = to_device(sigma_samples_cpu)
+            
+            # Vectorized reconstruction on device
+            scaled_coeffs_device = innovations_device' .* sigma_device'
+            latent_field_device = eigenvectors * scaled_coeffs_device
+
         else # :centered
-            latent_name = _find_parameter(p_names_vec, string(p_names_k.latent), k, is_multivariate_model)
+            latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
             if isempty(latent_name)
                 @warn "Latent coefficients for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            coeffs_samples = get_params_vector(chain, latent_name, n_latent)
-            for i in 1:n_samples
-                spatial_field = eigenvectors * coeffs_samples[i, :]
-                effect_k[:, i] = view(spatial_field, s_idx_full)
-            end
+            coeffs_samples_cpu = get_params_matrix(chain, latent_name, n_latent)
+            
+            # Move to device for computation
+            coeffs_device = to_device(coeffs_samples_cpu)
+            
+            # Vectorized reconstruction on device
+            latent_field_device = eigenvectors * coeffs_device'
         end
-        push!(structured_effects, effect_k)
+        
+        # Indexing on the device
+        effect_k_device = latent_field_device[s_idx_full, :]
+        
+        # Move final result back to CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+

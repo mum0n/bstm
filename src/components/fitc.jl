@@ -6,7 +6,7 @@ approximations: FITC (Fully Independent Training Conditional) and VFE
 (Variational Free Energy), also known as DTC (Deterministic Training Conditional).
 
 # Version
-v1.2.2 (2026-08-15)
+v1.3.0 (2026-08-17)
 
 # Mathematical Summary
 Both methods approximate a full GP using a small set of \$M\$ inducing points \$Z\$.
@@ -80,16 +80,20 @@ function get_precomputes(m::FITC, M::NamedTuple, mod_data::Dict)::NamedTuple
         end
     end
 
-    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
+    # Get the device transfer function
+    to_device = M.to_device
+
+    # Perform data processing on the CPU first
+    coords_cpu = Matrix{Float64}(M.data[!, Symbol.(variables)])
     
     n_inducing = m.n_inducing
     knot_method = string(get(params, :knot_method, "kmeans"))
-    Z_inducing = generate_inducing_points(coords, n_inducing; method=knot_method)
+    Z_inducing_cpu = generate_inducing_points(coords_cpu, n_inducing; method=knot_method)
 
     return (
-        coords=coords,
-        Z_inducing=Z_inducing,
-        n_latent=size(coords, 1)
+        coords=to_device(coords_cpu),
+        Z_inducing=to_device(Z_inducing_cpu),
+        n_latent=size(coords_cpu, 1)
     )
 end
 
@@ -184,29 +188,49 @@ function get_updates(
     end
 end
 
+"""
+    get_effects(m::FITC, chain, spec, M, PS)
+
+Reconstructs the sparse GP effect from posterior samples, dispatching on the
+method used during sampling. Handles GPU arrays by moving sampled parameters
+to the device for computation and moving the final results back to the CPU.
+"""
 function get_effects(
-    m::FITC, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::FITC, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
     
     hyper = spec.hyper
-    coords_train = hyper.coords
-    coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
-    else
-        coords_train
-    end
-    n_obs_full = size(coords_full, 1)
-
-    Z_inducing = hyper.Z_inducing
-    kernel_type = Symbol(m.kernel)
     noise = M.noise
+    n_latent_train = hyper.n_latent
+    kernel_type = Symbol(m.kernel)
 
+    # --- Coordinate and Inducing Point Handling ---
+    coords_train_device = hyper.coords # Already on device
+    Z_inducing_device = hyper.Z_inducing # Already on device
+    
+    coord_vars = get(spec.params, :positional_args, [])
+    coords_full_device = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+        vcat(coords_train_device, to_device(coords_pred_cpu))
+    else
+        coords_train_device
+    end
+    n_obs_full = size(coords_full_device, 1)
+
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        
+        # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
         inducing_innov_name = _find_parameter(p_names, string(p_names_k.inducing_innovations), k, is_multivariate_model)
@@ -217,22 +241,28 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_samples = get_params_matrix(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
-        inducing_innov_samples = get_params_matrix(chain, inducing_innov_name, m.n_inducing)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
+        ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
+        inducing_innov_samples_cpu = get_params_matrix(chain, inducing_innov_name, m.n_inducing)
 
-        effect_k = zeros(Float64, n_obs_full, n_samples)
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, n_obs_full, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         for i in 1:n_samples
-            current_sigma = sigma_samples[i]
-            current_ls = m.lengthscale isa Vector ? ls_samples[i, :] : ls_samples[i, 1]
-            current_u_raw = inducing_innov_samples[i, :]
+            current_sigma = sigma_samples_cpu[i]
+            current_ls = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+            current_u_raw_device = to_device(inducing_innov_samples_cpu[i, :])
             
-            K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
-            K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
+            # These kernel evaluations happen on the device
+            K_UU = evaluate_kernel_matrix(Z_inducing_device, current_sigma, current_ls, kernel_type, noise)
+            K_XU = evaluate_cross_kernel_matrix(coords_full_device, Z_inducing_device, current_sigma, current_ls, kernel_type)
             
+            # Cholesky and linear solves happen on the device
             L_UU = cholesky(Symmetric(K_UU)).L
-            u_latent = L_UU * current_u_raw
+            u_latent = L_UU * current_u_raw_device
             K_UU_inv_u = K_UU \ u_latent
             mean_f = K_XU * K_UU_inv_u
 
@@ -240,29 +270,38 @@ function get_effects(
                 diag_innov_name = _find_parameter(p_names, string(p_names_k.diag_innovations), k, is_multivariate_model)
                 if isempty(diag_innov_name)
                     @warn "Diagonal innovations for FITC component $(spec.key) (outcome $k) not found. Using zero for correction."
-                    effect_k[:, i] = mean_f
+                    effect_k_device[:, i] = mean_f
                     continue
                 end
                 
-                diag_innov_samples = get_params_matrix(chain, diag_innov_name, hyper.n_latent)
-                diag_innov_i = if size(diag_innov_samples, 2) == n_obs_full
-                    diag_innov_samples[i, :]
+                diag_innov_samples_cpu = get_params_matrix(chain, diag_innov_name, n_latent_train)
+                
+                # Handle prediction set by generating new innovations on the device
+                diag_innov_i_device = if n_obs_full > n_latent_train
+                    vcat(
+                        to_device(diag_innov_samples_cpu[i, :]),
+                        to_device(randn(Float32, n_obs_full - n_latent_train))
+                    )
                 else
-                    vcat(diag_innov_samples[i, :], randn(n_obs_full - size(diag_innov_samples, 2)))
+                    to_device(diag_innov_samples_cpu[i, :])
                 end
 
+                # Diagonal correction calculations on the device
                 diag_K_XX = fill(current_sigma^2, n_obs_full)
                 tmp = (L_UU' \ K_XU')'
                 diag_Q_ff = sum(tmp.^2, dims=2)
                 lambda_diag = diag_K_XX - vec(diag_Q_ff)
                 
-                effect_k[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* diag_innov_i
+                effect_k_device[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* diag_innov_i_device
             else # :vfe
-                effect_k[:, i] = mean_f
+                effect_k_device[:, i] = mean_f
             end
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+

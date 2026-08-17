@@ -6,7 +6,7 @@ It decomposes a set of multivariate outcomes into a smaller set of orthogonal la
 factors, and uses the dominant latent factor as a predictor in the main model.
 
 # Version
-v1.2.2 (2026-08-15)
+v1.3.1 (2026-08-17)
 
 # Mathematical Summary
 The `Eigen` component models a set of \$N_{vars}\$ observed variables 
@@ -75,6 +75,91 @@ COMPONENT_CONSTRUCTORS[:eigen] = (p, params) -> Eigen(
 
 MODEL_TO_STRUCTURE_MAP[:eigen] = :any
 
+# --- Helper functions for Householder transformations ---
+
+"""
+    householder_to_eigenvector(v_mat, p, k)
+
+Constructs a `p x k` orthonormal matrix `U` from a `p x k` matrix of Householder
+reflector vectors `v_mat`. This is used to build the loadings matrix in the `Eigen`
+component.
+
+# Arguments
+- `v_mat`: A `p x k` matrix where each column is a Householder reflector vector.
+- `p`: The number of original variables (`n_vars`).
+- `k`: The number of latent factors (`n_factors`).
+
+# Returns
+- A `p x k` matrix `U` with orthonormal columns.
+"""
+function householder_to_eigenvector(v_mat::AbstractMatrix{T}, p::Int, k::Int) where T
+    # Start with the first k columns of the identity matrix
+    U = zeros(T, p, k)
+    for i in 1:k
+        U[i, i] = one(T)
+    end
+
+    # Apply Householder reflections in reverse order
+    for i in k:-1:1
+        v = v_mat[:, i]
+        v_norm_sq = sum(abs2, v)
+        
+        if v_norm_sq > 1e-9 # Avoid division by zero
+            # Apply H_i = I - 2 * v * v' / ||v||^2 to U
+            # This is equivalent to U - 2 * v * (v' * U) / ||v||^2
+            vTU = v' * U
+            U = U - (2 / v_norm_sq) * (v * vTU)
+        end
+    end
+    return U
+end
+
+"""
+    eigenvector_to_householder(U)
+
+Performs the inverse operation of `householder_to_eigenvector`. Given an orthonormal
+matrix `U`, it finds the corresponding Householder reflector vectors `v` that can
+generate it. This is useful for initializing the `v_raw` parameters from a
+classical PCA solution.
+
+# Arguments
+- `U`: A `p x k` matrix with orthonormal columns.
+
+# Returns
+- A `p x k` matrix `v_mat` of Householder reflector vectors.
+"""
+function eigenvector_to_householder(U::AbstractMatrix{T}) where T
+    p, k = size(U)
+    v_mat = zeros(T, p, k)
+    A = copy(U)
+    
+    for i in 1:k
+        # Find the reflector for the i-th column of the remaining matrix
+        x = A[i:p, i]
+        e1 = zeros(T, length(x))
+        e1[1] = 1.0
+        
+        # The sign choice avoids catastrophic cancellation.
+        v_sign = sign(x[1]) == 0 ? one(T) : sign(x[1])
+        v = v_sign * norm(x) * e1 + x
+        
+        v_norm = norm(v)
+        if v_norm > 1e-9
+            v = v / v_norm
+        end
+        
+        # Store the reflector vector (padded with zeros at the top)
+        v_mat[i:p, i] = v
+        
+        # Apply the reflection to the remaining submatrix to continue the decomposition
+        if i < k
+            sub_A = A[i:p, (i+1):k]
+            A[i:p, (i+1):k] = sub_A - 2 * v * (v' * sub_A)
+        end
+    end
+    return v_mat
+end
+
 function get_precomputes(m::Eigen, M::NamedTuple, mod_data::Dict)::NamedTuple
     params = mod_data[:params]
     variables = mod_data[:variables]
@@ -90,9 +175,13 @@ function get_precomputes(m::Eigen, M::NamedTuple, mod_data::Dict)::NamedTuple
         error("Eigen module variables not found in data: $(missing_vars)")
     end
 
+    # Get the device transfer function from the main model object
+    to_device = M.to_device
+
     # Extract the data and center it (a standard assumption for PCA).
-    eigen_data_matrix = Matrix(data[!, vars_sym])
-    eigen_data_matrix .-= mean(eigen_data_matrix, dims=1)
+    # This is performed on the CPU.
+    eigen_data_matrix_cpu = Matrix(data[!, vars_sym])
+    eigen_data_matrix_cpu .-= mean(eigen_data_matrix_cpu, dims=1)
 
     n_vars = length(vars_sym)
     n_factors = get(params, :n_factors, 1)
@@ -103,14 +192,15 @@ function get_precomputes(m::Eigen, M::NamedTuple, mod_data::Dict)::NamedTuple
     end
 
     # Pre-calculate indices for the lower-triangular part of the Householder matrix.
+    # These are small index vectors and can remain on the CPU.
     ltri_mask = [r >= c for r in 1:n_vars, c in 1:n_factors]
     ltri_indices = findall(vec(ltri_mask))
     ltri_indices_len = length(ltri_indices)
 
-    n_obs = size(eigen_data_matrix, 1)
+    n_obs = size(eigen_data_matrix_cpu, 1)
 
     return (
-        eigen_data=eigen_data_matrix,
+        eigen_data=to_device(eigen_data_matrix_cpu),
         n_latent=n_obs,
         n_vars=n_vars,
         n_factors=n_factors,
@@ -216,52 +306,26 @@ function get_updates(
     end
 end
 
-
-"""
-    get_effects(m::Eigen, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
-
-Reconstructs the posterior distribution of the `Eigen` component's effect. The
-primary effect is the first latent factor, which is applied as a shared effect
-across all model outcomes.
-
-# Version
-v1.2.2 (2026-08-15)
-
-# Rationale
-This function is updated to align with the standardized `get_effects` interface.
-It correctly handles parameter lookup for the `Eigen` component, whose parameters
-are shared across outcomes even in a multivariate model. This is achieved by setting
-a local flag (`params_are_per_outcome = false`) that is passed to the `_find_parameter`
-utility, ensuring it searches for the base parameter names without an outcome suffix.
-This version also uses `get_params_matrix` for consistency with other components
-when retrieving posterior samples for vector or matrix-like parameters.
-
-# Arguments
-- `m::Eigen`: The component instance.
-- `chain`: The MCMC chain object.
-- `M::NamedTuple`: The main model configuration.
-- `n_samples::Int`: The number of posterior samples.
-- `outcomes_N::Int`: The number of model outcomes.
-- `p_names::Vector{String}`: A vector of all parameter names in the chain.
-- `spec::NamedTuple`: The specification for this component instance.
-- `PS::Union{NamedTuple, Nothing}`: The prediction set, if applicable.
-- `N_total::Int`: The total number of observations (training + prediction).
-- `is_multivariate_model::Bool`: A flag indicating if the overall model is multivariate.
-
-# Returns
-- A `NamedTuple` of the form `(structured=structured_effects, noisy=noisy_effects)`.
-"""
 function get_effects(
-    m::Eigen, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::Eigen, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    p_names = names(chain)
     
     hyper = spec.hyper
     n_obs_train = hyper.n_latent
     n_factors = hyper.n_factors
-    n_obs_full = N_total
+    
+    # Determine total number of observations (training + prediction)
+    n_obs_full = M.y_N + (isnothing(PS) ? 0 : size(PS.data, 1))
+    
+    if !isnothing(PS)
+        @warn "Prediction for the Eigen component '$(spec.key)' is not supported. " *
+              "Returning zero effect for the prediction set."
+    end
 
     # The Eigen component's parameters are not per-outcome. This flag ensures
     # that `_find_parameter` searches for the base parameter names without an
@@ -269,7 +333,8 @@ function get_effects(
     params_are_per_outcome = false
     p_names_k = generate_full_variable_names(spec, "univariate", nothing)
 
-    local factor_samples
+    # --- Reconstruct the latent factor effect (on CPU) ---
+    local factor_effect
     if m.method == :noncentered
         factors_flat_name = _find_parameter(
             p_names, string(p_names_k.factors_flat), nothing, params_are_per_outcome
@@ -277,16 +342,18 @@ function get_effects(
         if isempty(factors_flat_name)
             @warn "Parameter 'factors_flat' for Eigen component $(spec.key) not found. " *
                   "Returning zero-matrix."
-            factor_samples = zeros(Float64, n_obs_full, n_samples)
+            factor_effect = zeros(Float64, n_obs_full, n_samples)
         else
+            # Samples are on CPU. Reconstruction is done on CPU.
             factor_samples_train = get_params_matrix(
                 chain, factors_flat_name, n_obs_train * n_factors
             )
-            factor_samples = zeros(Float64, n_obs_full, n_samples)
+            # Initialize full effect matrix with zeros (handles prediction set)
+            factor_effect = zeros(Float64, n_obs_full, n_samples)
             for j in 1:n_samples
                 F_matrix_j = reshape(factor_samples_train[j, :], n_obs_train, n_factors)
-                # The effect is the first factor
-                factor_samples[1:n_obs_train, j] = F_matrix_j[:, 1]
+                # The effect is the first factor, applied only to training observations.
+                factor_effect[1:n_obs_train, j] = F_matrix_j[:, 1]
             end
         end
     else # :centered
@@ -296,24 +363,25 @@ function get_effects(
         if isempty(latent_name)
             @warn "Parameter 'latent' for Eigen component $(spec.key) not found. " *
                   "Returning zero-matrix."
-            factor_samples = zeros(Float64, n_obs_full, n_samples)
+            factor_effect = zeros(Float64, n_obs_full, n_samples)
         else
             latent_samples_train = get_params_matrix(
                 chain, latent_name, n_obs_train * n_factors
             )
-            factor_samples = zeros(Float64, n_obs_full, n_samples)
+            factor_effect = zeros(Float64, n_obs_full, n_samples)
             for j in 1:n_samples
                 F_matrix_j = reshape(latent_samples_train[j, :], n_obs_train, n_factors)
-                # The effect is the first factor
-                factor_samples[1:n_obs_train, j] = F_matrix_j[:, 1]
+                # The effect is the first factor, applied only to training observations.
+                factor_effect[1:n_obs_train, j] = F_matrix_j[:, 1]
             end
         end
     end
 
-    # The same dominant factor is applied as an effect to all outcomes.
-    for k in 1:outcomes_N
-        push!(structured_effects, factor_samples)
-    end
+    # The same dominant factor is applied as a shared effect to all outcomes.
+    structured_effects = [factor_effect for _ in 1:outcomes_N]
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+
+
+

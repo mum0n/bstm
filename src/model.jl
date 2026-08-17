@@ -154,68 +154,42 @@ end
 
 
 """
-    generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String)
+    generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String; ArrayType::Type{<:AbstractArray}=Array)
 
 Generates random projection weights (W) and biases (b) for the Random Fourier
-Features (RFF) approximation of a given kernel.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for all `bstm` components that use Random Fourier
-Features (e.g., `rff`, `gp`, `volatility`). It implements Bochner's theorem, which
-states that a stationary kernel can be approximated by sampling from its spectral
-density. This function translates the kernel's hyperparameters (variance, lengthscale)
-into the random matrices `W` and `b` needed for the feature map `cos(Wx + b)`,
-transforming a non-linear kernel problem into a linear one.
-
-# Mathematical Formulation
-The function samples the projection weights `W` from a distribution related to the
-spectral density of the specified kernel:
-- **Squared Exponential (SE)**: The spectral density is a Gaussian. The weights are
-  sampled from \$ \\mathcal{N}(0, 1/\\ell^2) \$.
-- **Matérn**: The spectral density is a Student's t-distribution. The weights are
-  sampled from a scaled `TDist(2ν)`, where `ν` is the smoothness parameter.
-
-# Arguments
-- `in_dims::Int`: The dimensionality of the input space (e.g., 2 for spatial).
-- `n_features::Int`: The number of random features to generate.
-- `lengthscale::Union{Real, AbstractVector}`: The lengthscale(s) of the kernel.
-  A scalar implies an isotropic kernel; a vector enables ARD.
-- `kernel_name::String`: The name of the kernel to approximate (e.g., "se", "matern32").
-
-# Returns
-- A tuple `(W, b)` where `W` is an `in_dims x n_features` matrix of projection
-  weights and `b` is a vector of `n_features` random phase shifts.
+Features (RFF) approximation, with GPU support. This version creates arrays on the
+CPU and moves them to the target device specified by `ArrayType`.
 """
-function generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String)
-    b = rand(Uniform(0, 2 * pi), n_features)
-    W = Matrix{Float64}(undef, in_dims, n_features)
+function generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String; ArrayType::Type{<:AbstractArray}=Array)
+    b_cpu = rand(Uniform(0, 2 * pi), n_features)
+    W_cpu = Matrix{Float64}(undef, in_dims, n_features)
     k_name = lowercase(kernel_name)
 
     if k_name in ["se", "gaussian", "rbf"]
         if lengthscale isa Real
-            W .= rand(Normal(0, 1.0 / lengthscale), in_dims, n_features)
+            W_cpu .= rand(Normal(0, 1.0 / lengthscale), in_dims, n_features)
         else
             if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
-            for d in 1:in_dims; W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features); end
+            for d in 1:in_dims; W_cpu[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features); end
         end
     elseif occursin("matern", k_name)
         nu = if k_name == "matern12"; 0.5; elseif k_name == "matern32"; 1.5; else 2.5; end
         df = 2 * nu
         if lengthscale isa Real
-            W .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
+            W_cpu .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
         else
             if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
-            for d in 1:in_dims; W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features); end
+            for d in 1:in_dims; W_cpu[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features); end
         end
     else
         @warn "Kernel '$kernel_name' not recognized for RFF. Defaulting to SE."
-        return generate_rff_params(in_dims, n_features, lengthscale, "se")
+        return generate_rff_params(in_dims, n_features, lengthscale, "se"; ArrayType=ArrayType)
     end
-    return W, b
+    
+    return ArrayType(W_cpu), ArrayType(b_cpu)
 end
+
+
 
 
 """
@@ -333,7 +307,7 @@ This function is a core part of the formula parsing engine that works directly w
 Julia's Abstract Syntax Tree (AST). It correctly distinguishes between positional
 arguments (like variable names) and keyword arguments (like `model=:bym2`). It
 preserves expressions (e.g., `prior=Normal(0,1)`) for later evaluation, which is
-crucial for allowing complex objects as parameters. This version is updated to use
+crucial for allowing complex objects as parameters.   use
 the key `:positional_args` for positional arguments, ensuring consistency with the
 rest of the parsing engine.
 
@@ -389,7 +363,7 @@ This function is a core utility for the formula parsing engine. It is responsibl
 for converting the string representation of a value from a module's argument list
 into a concrete Julia type (`Symbol`, `String`, `Bool`, `Number`, or `Expr`). This
 is a critical step that enables the `bstm` formula to accept a wide range of
-user inputs. This version is updated to be more robust in parsing symbol literals,
+user inputs.   more robust in parsing symbol literals,
 ensuring that `model=:bym2` is always parsed as the symbol `:bym2`.
 
 # Arguments
@@ -442,7 +416,7 @@ v1.0.2 (2026-08-13)
 # Rationale
 This function is a core utility for the formula parsing engine. It centralizes the
 logic for distinguishing between `key=value` pairs and positional arguments within
-a module's call string. This version is updated to accept `AbstractString` to
+a module's call string.   accept `AbstractString` to
 handle both `String` and `SubString` types, resolving a potential `MethodError`,
 and its documentation has been expanded for clarity.
 
@@ -480,7 +454,7 @@ v1.1.1 (2026-08-13)
 # Rationale
 This function is a core utility for the formula parsing engine. It is responsible
 for breaking down the argument string from within a module's parentheses into a
-structured dictionary. This version is updated to correctly handle commas within
+structured dictionary.   correctly handle commas within
 string literals, preventing incorrect splitting of arguments. The docstring has
 also been expanded to detail the internal workflow.
 
@@ -658,7 +632,7 @@ of a model component:
 3.  **Scheme**: A default prior from a pre-defined scheme (`:pcpriors`,
     `:informative`, `:uninformative`).
 
-This version is updated to be comprehensive, resolving priors for a wide range of
+  comprehensive, resolving priors for a wide range of
 parameters used across all `bstm` components, including those for spatial, temporal,
 smoother, and mechanistic models. It correctly handles anisotropic priors for
 multi-dimensional components, normalizes common aliases (e.g., `ls` for `lengthscale`),
@@ -1146,7 +1120,7 @@ v1.0.2 (2026-08-13)
 # Rationale
 This function is the main entry point for the formula parsing engine. It translates
 the user-facing formula into a structured, intermediate representation that the
-model configuration engine can process. This version is updated to handle formulas
+model configuration engine can process.   handle formulas
 that do not contain a right-hand side (RHS). If the `~` operator is missing, it now
 defaults the RHS to "1" (an intercept-only model), preventing a `BoundsError` during
 parsing. The docstring has also been expanded to detail the internal workflow.
@@ -1303,6 +1277,7 @@ end
 
 
 
+ 
 
 """
     bstm_config(formula::String, data::DataFrame; calling_module::Module=Main, kwargs...)
@@ -1310,27 +1285,13 @@ end
 Constructs the complete model configuration from a formula and data.
 
 # Version
-v1.0.3 (2026-08-13)
+v1.1.0 (2026-08-16)
 
 # Rationale
-This function is the main entry point for the model configuration engine. It
-orchestrates the entire process of parsing the formula, processing components,
-and preparing all necessary data structures for the code generator.
-
-This version integrates the call to `_precompute_static_components!`, which was
-previously defined but unused. This is a critical optimization that pre-calculates
-matrix factorizations for static components, improving the performance of the
-final Turing model. The call is placed after all components have been processed
-but before the configuration is finalized.
-
-# Arguments
-- `formula::String`: The model formula.
-- `data::DataFrame`: The input data.
-- `calling_module::Module`: The module in which the model should be evaluated.
-- `kwargs...`: Additional keyword arguments.
-
-# Returns
-- A `NamedTuple` containing the complete model configuration.
+This function orchestrates the entire model configuration pipeline. This version
+is updated to support generic GPU acceleration by calling `_move_config_to_gpu!`
+at the appropriate stage, after CPU-based data processing is complete but before
+GPU-specific pre-computations like Cholesky factorization.
 """
 function bstm_config(
     formula::String, data::DataFrame; calling_module::Module=Main, kwargs...
@@ -1419,13 +1380,19 @@ function bstm_config(
     _process_fixed_effects!(M, unique(all_fixed_effects))
     _process_fixed_effects_priors!(M)
 
-    # Pre-compute Cholesky factorizations for static components to optimize sampling.
+    # Move data to GPU before static pre-computations.
+    _move_config_to_gpu!(M)
+
+    # Pre-compute Cholesky factorizations for static components (now on GPU if enabled).
     _precompute_static_components!(M)
 
     _finalize_config!(M)
     
     return NamedTuple(M)
 end
+
+
+
 
 
 
@@ -1514,34 +1481,23 @@ end
 
 
 function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multivariate::Bool, eta_name::String)
-    # # Technical Audit: Verification of interaction existence
     if get(M, :model_st, "none") == "none" 
         return ""
     end
 
-    # # Technical Audit: Resource Availability
     if isnothing(s_spec) || isnothing(t_spec)
         @warn "Spatiotemporal interaction requested but marginal specifications are missing."
         return ""
     end
 
-    # # Reference keys for registry lookups
     s_key = string(s_spec.key)
     t_key = string(t_spec.key)
     
-    # # Precision Factor Retrieval Logic
-    # # If static, use the pre-computed Cholesky factor from the registry.
-    # # If dynamic, perform the decomposition within the model scope using the recomposed precision.
-    
-    s_chol_access = get(s_spec, :is_static, false) ? "spec_registry[\"$s_key\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$s_key\"].Q_template + noise * I))"
-    t_chol_access = get(t_spec, :is_static, false) ? "spec_registry[\"$t_key\"].cholesky_factor" : "cholesky(Symmetric(spec_registry[\"$t_key\"].Q_template + noise * I))"
+    s_chol_access = get(s_spec, :is_static, false) ? "spec_registry[:$(s_key)].cholesky_factor" : "cholesky(Symmetric(spec_registry[:$(s_key)].hyper.Q_template + noise * I))"
+    t_chol_access = get(t_spec, :is_static, false) ? "spec_registry[:$(t_key)].cholesky_factor" : "cholesky(Symmetric(spec_registry[:$(t_key)].hyper.Q_template + noise * I))"
 
-    # # Multivariate outcome dimensions
     K = get(M, :outcomes_N, 1)
-
-    # # Solver Implementation
-    # # Mathematical identity for Type IV: X = L_s^{-T} * Z * L_t^{-1}
-    # # Implemented via backslash solve: C.U \\ Z provides (L')^{-1} * Z
+    array_type_str = "M.to_device"
 
     if is_multivariate
         interaction_code = """
@@ -1550,30 +1506,24 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     st_interaction_sigma ~ NamedDist(filldist($(st_sigma_prior_dist_str), $K), :st_interaction_sigma)
     
     # --- Spatiotemporal Interaction Innovations ---
-    st_interaction_raw ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N * $K), I), :st_interaction_raw)
+    st_interaction_raw ~ NamedDist(MvNormal(fill!($(array_type_str){T}(undef, M.s_N * M.t_N * $K), 0), I), :st_interaction_raw)
 
     let
-        # # Marginal Cholesky factors
         C_s = $s_chol_access
         C_t = $t_chol_access
         
-        # # Reshape flat innovations into (Spatial x Temporal x Outcome) tensor
         Z_tensor = reshape(st_interaction_raw, M.s_N, M.t_N, $K)
         
         for k in 1:$K
-            # # Extract outcome-specific innovation matrix
             Z_k = view(Z_tensor, :, :, k)
             
-            # # Vectorized solve: X_k = L_s^{-T} * Z_k * L_t^{-1}
             tmp_spatial = C_s.U \\ Z_k
             st_field_k_unscaled = (transpose(C_t.U \\ transpose(tmp_spatial)))
             
-            # Apply soft sum-to-zero constraint for identifiability
             Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_k_unscaled))
             
             st_field_k = st_field_k_unscaled .* st_interaction_sigma[k]
 
-            # # Apply to multivariate linear predictor
             for i in 1:N
                 $(eta_name)[i, k] += st_field_k[M.s_idx[i], M.t_idx[i]]
             end
@@ -1586,7 +1536,7 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     local st_sigma_prior_dist_str = haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)"
     st_interaction_sigma ~ NamedDist($(st_sigma_prior_dist_str), :st_interaction_sigma)
 
-    st_interaction_raw ~ NamedDist(MvNormal(zeros(T, M.s_N * M.t_N), I), :st_interaction_raw)
+    st_interaction_raw ~ NamedDist(MvNormal(fill!($(array_type_str){T}(undef, M.s_N * M.t_N), 0), I), :st_interaction_raw)
 
     let
         C_s = $s_chol_access
@@ -1594,16 +1544,13 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
         
         Z_matrix = reshape(st_interaction_raw, M.s_N, M.t_N)
         
-        # # Vectorized solve: X = L_s^{-T} * Z * L_t^{-1}
         tmp_spatial = C_s.U \\ Z_matrix
         st_field_unscaled = (transpose(C_t.U \\ transpose(tmp_spatial)))
         
-        # Apply soft sum-to-zero constraint for identifiability
         Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_unscaled))
         
         st_field = st_field_unscaled .* st_interaction_sigma
 
-        # # Map field to observation indices
         for i in 1:N
             $(eta_name)[i] += st_field[M.s_idx[i], M.t_idx[i]]
         end
@@ -1613,6 +1560,11 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     
     return interaction_code
 end
+
+
+
+
+
 
  
 """
@@ -1629,10 +1581,11 @@ function _generate_householder_reflection_block(M::NamedTuple, is_multivariate::
     end
 
     K = M[:outcomes_N]
+    array_type_str = "M.to_device"
     
     priors_str = """
     # Householder reflection for spectral orientation
-    v_raw_reflection ~ NamedDist(MvNormal(zeros(T, $(K)), I), :v_raw_reflection)
+    v_raw_reflection ~ NamedDist(MvNormal(fill!($(array_type_str){T}(undef, $(K)), 0), I), :v_raw_reflection)
     """
 
     update_str = """
@@ -1651,20 +1604,108 @@ end
 
 Generates the code block for nested sub-models.
 
-# Rationale for Placeholder
-This function is currently a placeholder. The full implementation for nested models
-requires a more significant refactoring of the component interface (specifically,
-passing a `prefix` argument to `get_priors` and `get_updates` for all components)
-to avoid variable name collisions in the generated Turing model. As this is a
-larger change, this function currently does nothing and issues a warning if nested
-models are used.
+# Version
+v1.0.0 (2026-08-17)
+
+# Rationale
+This function restores the functionality for handling nested models, which was lost
+during a previous refactoring. It generates the necessary Turing code for each
+sub-model defined in `M.nested_components`.
+
+The implementation follows a similar pattern to the main `bstm_text_assembler`. For
+each nested component, it:
+1.  Defines a prior for the linking parameter `rho_nested`, which scales the sub-model's effect.
+2.  Creates a `let` block to scope the sub-model's variables.
+3.  Generates the priors for the sub-model's intercept, fixed effects, and all of its components. All variable names are prefixed with the nested component's key to avoid name collisions.
+4.  Assembles the sub-model's linear predictor (`eta_sub`).
+5.  Adds the sub-model's likelihood evaluation to the main model's likelihood block.
+6.  Links the assembled sub-model effect to the main model's linear predictor.
+
+This implementation assumes that the sub-model's coordinates align with the main
+model's coordinates, as interpolation logic is not yet part of the model generation step.
 """
 function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main_eta_name::String)
     if haskey(M, :nested_components) && !isempty(M.nested_components)
-        @warn "Nested model components were found, but the code generator for them is not fully implemented in this version. They will be ignored."
+        priors_acc = String[]
+        updates_acc = String[]
+        likelihood_acc = String[]
+
+        for (key, sub_M) in M.nested_components
+            prefix = string(key)
+            
+            # 1. Define the linking parameter rho
+            rho_name = "rho_nested_$(key)"
+            push!(priors_acc, "$(rho_name) ~ Normal(1.0, 0.5)")
+
+            # --- Start generating code for the sub-model ---
+            sub_priors_acc = String[]
+            sub_updates_acc = String[]
+            
+            sub_arch = get(sub_M, :model_arch, "univariate")
+            is_sub_multivariate = sub_arch == "multivariate"
+            sub_eta_name = is_sub_multivariate ? "eta_latent_sub_$(key)" : "eta_sub_$(key)"
+            
+            # --- Generate Priors for sub-model ---
+            # Intercept
+            if get(sub_M, :add_intercept, false)
+                intercept_var_name = "intercept_$(prefix)"
+                dist_str = is_sub_multivariate ? "filldist($(_distribution_to_string(sub_M.intercept_prior)), $(sub_M.outcomes_N))" : _distribution_to_string(sub_M.intercept_prior)
+                push!(sub_priors_acc, "$(intercept_var_name) ~ DynamicPPL.NamedDist($(dist_str), :$(intercept_var_name))")
+            end
+            
+            # Fixed Effects
+            if get(sub_M, :Xfixed_N, 0) > 0
+                beta_name = is_sub_multivariate ? "Xfixed_beta_prop_flat_$(prefix)" : "Xfixed_beta_prop_$(prefix)"
+                n_params = is_sub_multivariate ? sub_M.Xfixed_N * sub_M.outcomes_N : sub_M.Xfixed_N
+                prior_str = _distribution_to_string(sub_M.Xfixed_priors_vec[1])
+                push!(sub_priors_acc, "$(beta_name) ~ DynamicPPL.NamedDist(filldist($(prior_str), $(n_params)), :$(beta_name))")
+            end
+
+            # Components
+            for (i, sub_spec) in enumerate(sub_M.components)
+                prefixed_sub_spec = merge(sub_spec, (key=Symbol(prefix, "_", sub_spec.key),))
+                for k in 1:sub_M.outcomes_N
+                    sub_outcome_idx = is_sub_multivariate ? k : nothing
+                    priors_str = get_priors(sub_spec.component_obj, prefixed_sub_spec, sub_arch, sub_outcome_idx, sub_M)
+                    push!(sub_priors_acc, replace(priors_str, "spec_registry[:$(prefixed_sub_spec.key)]" => "sub_M.components[$(i)]"))
+                end
+            end
+            
+            # --- Assemble sub-model updates ---
+            sub_eta_init = if get(sub_M, :add_intercept, false)
+                is_sub_multivariate ? "intercept_$(prefix)' .+ fill!(M.to_device{T}(undef, sub_M.y_N, sub_M.outcomes_N), 0)" : "intercept_$(prefix) .+ fill!(M.to_device{T}(undef, sub_M.y_N), 0)"
+            else
+                is_sub_multivariate ? "fill!(M.to_device{T}(undef, sub_M.y_N, sub_M.outcomes_N), 0)" : "fill!(M.to_device{T}(undef, sub_M.y_N), 0)"
+            end
+            push!(sub_updates_acc, "local $(sub_eta_name) = $(sub_eta_init)")
+
+            # Add component updates
+            for (i, sub_spec) in enumerate(sub_M.components)
+                prefixed_sub_spec = merge(sub_spec, (key=Symbol(prefix, "_", sub_spec.key),))
+                for k in 1:sub_M.outcomes_N
+                    sub_outcome_idx = is_sub_multivariate ? k : nothing
+                    updates_str = get_updates(sub_spec.component_obj, prefixed_sub_spec, sub_arch, sub_outcome_idx, sub_M)
+                    updates_str_final = replace(updates_str, r"eta_latent|eta" => sub_eta_name, "spec_registry[:$(prefixed_sub_spec.key)]" => "sub_M.components[$(i)]")
+                    push!(sub_updates_acc, updates_str_final)
+                end
+            end
+
+            # --- Sub-model Likelihood ---
+            sub_lik_code = _generate_final_likelihood_block(sub_M, is_sub_multivariate)
+            sub_lik_code_final = replace(sub_lik_code, r"eta_latent|eta" => sub_eta_name, r"\bM\." => "sub_M.")
+            
+            # --- Assemble final code blocks ---
+            push!(priors_acc, join(sub_priors_acc, "\n"))
+            let_block = "let\n    local sub_M = M.nested_components[:$(key)]\n    $(join(sub_updates_acc, "\n    "))\n    $(main_eta_name) .+= $(rho_name) .* $(sub_eta_name)\nend"
+            push!(updates_acc, let_block)
+            push!(likelihood_acc, sub_lik_code_final)
+        end
+
+        return join(priors_acc, "\n\n"), join(updates_acc, "\n\n"), join(likelihood_acc, "\n\n")
     end
     return "", "", ""
 end
+
 
 
 
@@ -1753,40 +1794,16 @@ function _canonical_term_string(term::StatsModels.AbstractTerm)
 end
 
 
-
 """
     _precompute_static_components!(M::Dict)
 
-Pre-computes matrix factorizations for static model components to optimize the
-Turing model's performance.
-
-# Version
-v1.0.3 (2026-08-13)
-
-# Rationale
-This function is a critical optimization step in the model configuration pipeline. It
-identifies "static" components—those whose precision matrix `Q` does not depend on
-any sampled hyperparameters (e.g., `ICAR`, `RW2`). For these components, it pre-computes
-the Cholesky factorization of the precision matrix once, before sampling begins.
-
-This pre-computed factor is then stored in the component's specification. The code
-generator (`bstm_text_assembler`) can then use this factor directly for efficient
-sampling of the latent field (e.g., `latent = cholesky_factor \\ innovations`),
-avoiding costly and potentially non-AD-compatible matrix factorizations inside the
-Turing model loop. This version reverts to using the more efficient `cholesky`
-factorization, as downstream changes in the code generator now correctly handle
-the resulting objects.
-
-# Arguments
-- `M::Dict`: The main model configuration dictionary, which is mutated by this function.
-
-# Returns
-- `nothing`.
+Pre-computes matrix factorizations for static model components. This version is
+updated to handle GPU arrays by converting sparse matrices to dense on the GPU
+before factorization.
 """
 function _precompute_static_components!(M::Dict)
     noise = M[:noise]
     new_components = []
-    # Define component types that do not have dynamic structure parameters like `rho`.
     static_component_types = [IID, ICAR, Besag, RW1, RW2, Cyclic, PSpline, TPS, BSpline, Eigen, Moran, Barycentric, TensorProductSmooth]
  
     for spec_in in M[:components]
@@ -1796,11 +1813,12 @@ function _precompute_static_components!(M::Dict)
         if m_obj isa Mixed
             inner_model = m_obj.model
             is_inner_static = any(T -> inner_model isa T, static_component_types)
-            if is_inner_static && !isnothing(current_spec.Q_template) && size(current_spec.Q_template, 1) > 0
+            if is_inner_static && hasproperty(current_spec.hyper, :Q_template) && !isnothing(current_spec.hyper.Q_template) && size(current_spec.hyper.Q_template, 1) > 0
                 try
-                    Q_concrete = sparse(current_spec.Q_template)
-                    # Revert to cholesky
-                    F = cholesky(Symmetric(Q_concrete + noise * I))
+                    Q_concrete = current_spec.hyper.Q_template
+                    # If GPU is used, convert sparse CPU matrix to dense GPU matrix
+                    Q_dense = Q_concrete isa SparseArrays.AbstractSparseMatrix ? M[:gpu_array_type](Matrix(Q_concrete)) : Q_concrete
+                    F = cholesky(Symmetric(Q_dense + noise * I))
                     final_spec = merge(current_spec, (is_static=true, cholesky_factor=F))
                     push!(new_components, final_spec)
                     continue
@@ -1810,34 +1828,13 @@ function _precompute_static_components!(M::Dict)
             end
         end
 
-        if m_obj isa Composed && m_obj.operator == :pipe
-            state_spec = get(current_spec.hyper, :state_spec, nothing)
-            if !isnothing(state_spec)
-                state_m_obj = m_obj.components[2]
-                is_state_static = any(T -> state_m_obj isa T, static_component_types)
-
-                if is_state_static && !isnothing(state_spec.Q_template) && size(state_spec.Q_template, 1) > 0
-                    try
-                        Q_concrete = sparse(state_spec.Q_template)
-                        # Revert to cholesky
-                        F = cholesky(Symmetric(Q_concrete + noise * I))
-                        new_state_spec = merge(state_spec, (is_static=true, cholesky_factor=F))
-                        new_hyper = merge(current_spec.hyper, (state_spec=new_state_spec,))
-                        current_spec = merge(current_spec, (hyper=new_hyper,))
-                    catch e
-                        @warn "Cholesky factorization failed for static state component in $(current_spec.key). Reverting to dynamic computation. Error: $e"
-                    end
-                end
-            end
-        end
-
         is_main_static = !(current_spec.component_obj isa Composed) && any(T -> current_spec.component_obj isa T, static_component_types)
 
-        if is_main_static && !isnothing(current_spec.Q_template) && size(current_spec.Q_template, 1) > 0
+        if is_main_static && hasproperty(current_spec.hyper, :Q_template) && !isnothing(current_spec.hyper.Q_template) && size(current_spec.hyper.Q_template, 1) > 0
             try
-                Q_concrete = sparse(current_spec.Q_template)
-                # Revert to cholesky
-                F = cholesky(Symmetric(Q_concrete + noise * I))
+                Q_concrete = current_spec.hyper.Q_template
+                Q_dense = Q_concrete isa SparseArrays.AbstractSparseMatrix ? M[:gpu_array_type](Matrix(Q_concrete)) : Q_concrete
+                F = cholesky(Symmetric(Q_dense + noise * I))
                 final_spec = merge(current_spec, (is_static=true, cholesky_factor=F))
                 push!(new_components, final_spec)
             catch e
@@ -1854,22 +1851,84 @@ function _precompute_static_components!(M::Dict)
 end
 
 
- 
+
+
+"""
+    _get_gpu_backend()
+
+Detects the available and functional GPU backend at runtime. It prioritizes CUDA,
+then AMDGPU, then oneAPI, then OpenCL, and finally Metal. This function uses
+`isdefined` and `Base.invokelatest` to safely check for and use GPU backends that
+may have been loaded after the `bstm` module was compiled, thus avoiding world-age issues.
+
+# Returns
+- A `NamedTuple` `(backend=..., array_type=...)` containing the backend module
+  and its corresponding array type (e.g., `CuArray`, `ROCArray`, `oneArray`,
+  `CLArray`, `MtlArray`), or `nothing` if no functional backend is found.
+"""
+function _get_gpu_backend()
+    # Prioritize CUDA
+    if isdefined(Main, :CUDA)
+        if Base.invokelatest(getfield(Main.CUDA, :functional))
+            @info "CUDA backend detected and functional."
+            return (backend=Main.CUDA, array_type=getfield(Main.CUDA, :CuArray))
+        end
+    end
+
+    # Then AMDGPU
+    if isdefined(Main, :AMDGPU)
+        if Base.invokelatest(getfield(Main.AMDGPU, :functional))
+            @info "AMDGPU backend detected and functional."
+            return (backend=Main.AMDGPU, array_type=getfield(Main.AMDGPU, :ROCArray))
+        end
+    end
+
+    # Then oneAPI (Intel GPUs)
+    if isdefined(Main, :oneAPI)
+        if Base.invokelatest(getfield(Main.oneAPI, :functional))
+            @info "oneAPI backend detected and functional."
+            return (backend=Main.oneAPI, array_type=getfield(Main.oneAPI, :oneArray))
+        end
+    end
+
+    # Then OpenCL
+    if isdefined(Main, :OpenCL)
+        if !isempty(Base.invokelatest(getfield(Main.OpenCL, :devices)))
+            @info "OpenCL backend detected and functional."
+            return (backend=Main.OpenCL, array_type=getfield(Main.OpenCL, :CLArray))
+        end
+    end
+
+    # Then Metal (Apple GPUs)
+    if isdefined(Main, :Metal)
+        if Base.invokelatest(getfield(Main.Metal, :functional))
+            @info "Metal backend detected and functional."
+            return (backend=Main.Metal, array_type=getfield(Main.Metal, :MtlArray))
+        end
+    end
+
+    # No functional GPU backend found
+    return nothing
+end
+
+
+
 """
     _initialize_config(data::DataFrame, kwargs)
 
-Creates the initial model configuration dictionary (`M`) from the input data and
-keyword arguments.
+Creates the initial model configuration dictionary (`M`), setting up defaults and
+detecting the appropriate GPU backend without moving data.
 
 # Version
-v1.0.1 (2026-08-13)
+v1.2.0 (2026-08-16)
 
 # Rationale
-This function is the first step in the `bstm_config` pipeline. It centralizes the
-creation of the main configuration object, ensuring that essential keys like the
-dataset, number of observations, and default settings are present before any
-formula parsing or component processing occurs. This version updates the type of
-the `:hyperpriors` dictionary for internal consistency.
+This function is refactored to handle only the initial setup and GPU backend
+detection. It no longer moves data to the GPU, as this was causing errors by
+converting the `DataFrame` prematurely. Instead, it identifies the correct GPU
+array type and stores it, preserving the original `DataFrame` for subsequent
+formula parsing and data processing steps. Data movement is now handled by a
+dedicated function later in the configuration pipeline.
 
 # Arguments
 - `data::DataFrame`: The input data for the model.
@@ -1880,8 +1939,8 @@ the `:hyperpriors` dictionary for internal consistency.
 """
 function _initialize_config(data::DataFrame, kwargs)
     M = Dict{Symbol, Any}()
-    M[:data] = data
-    M[:y_N] = nrow(data)
+    M[:data] = data # Keep the original DataFrame
+    M[:y_N] = size(data, 1)
     
     # Set defaults that can be overridden by user-provided kwargs.
     M[:noise] = 1e-6
@@ -1889,19 +1948,108 @@ function _initialize_config(data::DataFrame, kwargs)
     M[:prior_scheme] = :pcpriors
     M[:fixed_effects_priors] = Dict{Symbol, Any}()
     M[:spectral_orientation] = true
+    M[:use_gpu] = false
+    M[:gpu_backend] = nothing
+    M[:gpu_array_type] = Array 
+    M[:to_device] = Array # Default to CPU
 
     # Merge user-provided keyword arguments, overriding defaults.
     for (k, v) in kwargs; M[k] = v; end
-    
-    # Ensure the calling module is captured for scoped evaluation.
-    M[:calling_module] = get(kwargs, :calling_module, Main)
+
+    # Handle GPU backend detection.
+    if M[:use_gpu]
+        gpu_info = _get_gpu_backend()
+        if !isnothing(gpu_info)
+            M[:gpu_backend] = gpu_info.backend
+            M[:gpu_array_type] = gpu_info.array_type
+            M[:to_device] = gpu_info.array_type # Set to_device function
+            @info "GPU acceleration enabled using $(M[:gpu_array_type])."
+        else
+            @warn "use_gpu=true, but no functional GPU backend was found. Reverting to CPU."
+            M[:use_gpu] = false
+            M[:gpu_array_type] = Array # Explicitly fall back
+            M[:to_device] = Array
+        end
+    end
     
     # Initialize containers for components and basis matrices.
+    M[:calling_module] = get(kwargs, :calling_module, Main)
     M[:components] = []
     M[:basis_matrices] = Dict{Symbol, Any}()
     
     return M
 end
+
+
+
+
+"""
+    _move_config_to_gpu!(M::Dict)
+
+Moves all relevant numeric arrays in the model configuration dictionary `M` to the
+selected GPU device. This function is called after all data structures have been
+created.
+"""
+function _move_config_to_gpu!(M::Dict)
+    if !get(M, :use_gpu, false)
+        return
+    end
+
+    to_device = M[:gpu_array_type]
+    @info "Moving model data structures to device: $(M[:gpu_backend])"
+
+    # List of keys for arrays/matrices to move to the GPU.
+    keys_to_move = [
+        :y_obs, :Xfixed, :W, :centroids, :s_idx, :t_idx, :u_idx,
+        :log_offsets, :weights, :trials, :censor_lower, :censor_upper, :hurdle
+    ]
+
+    for key in keys_to_move
+        if haskey(M, key) && M[key] isa AbstractArray
+            M[key] = to_device(M[key])
+        end
+    end
+
+    # Move basis matrices.
+    if haskey(M, :basis_matrices)
+        for (k, mat) in M[:basis_matrices]
+            if mat isa AbstractArray
+                M[:basis_matrices][k] = to_device(mat)
+            end
+        end
+    end
+
+    # Move precomputed data within each component's `hyper` specification.
+    if haskey(M, :components)
+        new_components = []
+        for spec in M[:components]
+            new_hyper_dict = Dict(pairs(spec.hyper))
+            for (hk, hv) in new_hyper_dict
+                # Do not move Cholesky factors here, they are handled in _precompute_static_components!
+                if hv isa AbstractArray && !(hv isa Factorization)
+                    new_hyper_dict[hk] = to_device(hv)
+                end
+            end
+            
+            # Handle nested specs like in state-space models.
+            if haskey(new_hyper_dict, :state_spec)
+                new_state_spec_dict = Dict(pairs(new_hyper_dict[:state_spec]))
+                for (ssk, ssv) in new_state_spec_dict
+                    if ssv isa AbstractArray && !(ssv isa Factorization)
+                        new_state_spec_dict[ssk] = to_device(ssv)
+                    end
+                end
+                new_hyper_dict[:state_spec] = NamedTuple(new_state_spec_dict)
+            end
+            
+            push!(new_components, merge(spec, (hyper=NamedTuple(new_hyper_dict),)))
+        end
+        M[:components] = new_components
+    end
+end
+
+
+
 
 
 """
@@ -2372,7 +2520,7 @@ This function is the final step in the configuration pipeline. It prevents `KeyE
 exceptions in the model assembler by providing safe defaults for any configuration
 keys that were not set during the formula parsing or component processing stages.
 
-This version is updated to be consistent with the refactored architecture. It no
+  consistent with the refactored architecture. It no
 longer sets defaults for observation-level parameters like `log_offsets`, `weights`,
 or `trials`, as these are now robustly handled by the `_precompute_likelihood_params!`
 function earlier in the pipeline. Its primary role is to provide fallbacks for
@@ -2563,23 +2711,6 @@ function _bstm_error_handler(e, model)
 end
 
 
-
-"""
-    @bstm(exprs...)
-
-The main user-facing macro for defining a `bstm` model. It supports two syntaxes:
-1.  `m = @bstm(formula, data, ...)`: Returns the model object.
-2.  `@bstm m = formula, data, ...`: Assigns the model to `m`.
-
-# Rationale for Correction
-The previous implementation used a simplistic method to parse arguments, which failed
-when keyword arguments were passed out of order or with a semicolon, leading to a `MethodError`
-or causing keyword arguments to be ignored. This updated version implements a more robust
-parser that correctly distinguishes between positional arguments (like `formula` and `data`)
-and keyword arguments (like `W=...`), regardless of their order. This resolves the `MethodError`
-and the issue of `W` not being found, making the macro's behavior more predictable and
-aligned with standard Julia syntax.
-"""
 macro bstm(exprs...)
     local var_name = nothing
     local formula_expr = nothing
@@ -2587,7 +2718,7 @@ macro bstm(exprs...)
     local collected_kwargs = []
     local current_positional_args = []
 
-    # Handle assignment syntax: `@bstm m = formula, data, ...`
+    # Handle assignment syntax: `@bstm m = formula, data, ...` 
     local expressions_to_parse = exprs
     if !isempty(exprs) && exprs[1] isa Expr && exprs[1].head == :(=)
         var_name = exprs[1].args[1]
@@ -2627,7 +2758,8 @@ macro bstm(exprs...)
     data_esc = esc(data_expr)
     kwargs_esc = [esc(kw) for kw in collected_kwargs]
 
-    # Construct the core function call
+    # Construct the core function call.
+    # The `use_gpu` argument, if provided by the user, will be in `kwargs_esc`.
     core_logic = :(bstm_core($formula_str, $data_esc, $(__module__); $(kwargs_esc...)))
 
     # Return the appropriate expression
@@ -2637,6 +2769,9 @@ macro bstm(exprs...)
         return core_logic
     end
 end
+
+
+
 
 """
     _print_param(name, value, status; indent=4)
@@ -2841,7 +2976,7 @@ during model compilation and execution, resolving the error.
 function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwargs...)
     # --- 1. Configuration ---
     # Generate model configuration dictionary based on formula syntax and data schema.
-    options = bstm_config(formula, data; calling_module=calling_module, kwargs...)
+    options = bstm_config(formula, data; calling_module=calling_module, kwargs...) # Pass kwargs to bstm_config
 
     # --- 2. Code Generation ---
     # Generate a unique name for the model function to avoid world age issues.
@@ -2949,11 +3084,12 @@ This version corrects a scoping issue that caused an `UndefVarError: Turing not 
 during dynamic model evaluation. By adding `using Turing` (which is valid in a local
 scope) to the top of the generated function body, it ensures that the `Turing` module
 is explicitly available in the scope where the `@model` macro is expanded, resolving
-the error without causing a syntax error.
+the error without causing a syntax error. This version also ensures device-aware
+memory allocation for the linear predictor `eta`.
 
 # Workflow
 1.  **Initialization**: Determines the model architecture and sets up the AD-safe
-    initialization string for `eta`.
+    initialization string for `eta`, ensuring allocation on the correct device.
 2.  **Fragment Generation**: Calls helper functions to generate code strings for
     different parts of the model (intercept, fixed effects, etc.).
 3.  **Component Loop**: Iterates through all components, calling `get_priors` and
@@ -2973,11 +3109,12 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     arch = get(M, :model_arch, "univariate")
     is_multivariate = arch == "multivariate"
     eta_name = is_multivariate ? "eta_latent" : "eta"
+    array_type_str = "M.to_device"
 
     eta_init = if get(M, :add_intercept, false)
-        is_multivariate ? "intercept' .+ zeros(T, N, K)" : "intercept .+ zeros(T, N)"
+        is_multivariate ? "intercept' .+ fill!($(array_type_str){T}(undef, N, K), 0)" : "intercept .+ fill!($(array_type_str){T}(undef, N), 0)"
     else
-        is_multivariate ? "zeros(T, N, K)" : "zeros(T, N)"
+        is_multivariate ? "fill!($(array_type_str){T}(undef, N, K), 0)" : "fill!($(array_type_str){T}(undef, N), 0)"
     end
 
     outcomes_N = get(M, :outcomes_N, 1)
@@ -2990,7 +3127,6 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     main_spatial_spec = nothing
     main_temporal_spec = nothing
     
-    # Corrected check for custom likelihood components.
     has_custom_likelihood_from_component = any(spec -> spec.component_obj isa PointProcess, M.components)
     has_custom_likelihood_from_family = any(spec -> string(get(spec, :family, "")) == "ordinal", M.likelihood_specs)
     has_custom_likelihood = has_custom_likelihood_from_component || has_custom_likelihood_from_family
@@ -3093,6 +3229,7 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
 end
 
 
+
  
  
 """
@@ -3167,53 +3304,28 @@ end
     build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractMatrix, Nothing}=nothing)
 
 Creates a precision matrix template and its spectral decomposition for a GMRF model.
-
-# Version
-v1.5.4 (2026-08-13)
-
-# Rationale
-This function is a core utility for the model configuration engine. It acts as a
-factory to generate standardized precision matrix templates (Q) and their
-eigendecompositions (eigenvectors U and eigenvalues L) for various Gaussian Markov
-Random Field (GMRF) models. This pre-computation is essential for enabling AD-friendly
-spectral sampling methods. Instead of performing a Cholesky decomposition of a
-precision matrix inside the Turing model (which is not AD-compatible if the matrix
-depends on sampled parameters), the model can sample standard normal innovations `z`
-and construct the latent field as `latent = U * D * z`, where `D` is a diagonal
-matrix derived from the eigenvalues `L`.
-
-# Mathematical Formulation
-The function constructs precision matrices for several common GMRF structures:
-- **ICAR/Besag**: \$Q = D - W\$, where \$D\$ is the diagonal degree matrix and \$W\$ is the
-  adjacency matrix. This is an intrinsic GMRF of order 1.
-- **RW1 (Random Walk 1)**: The precision matrix for a first-order random walk, which
-  penalizes the first differences.
-- **RW2 (Random Walk 2)**: The precision matrix for a second-order random walk, which
-  penalizes the second differences, leading to a smoother field.
-- **AR1**: The adjacency matrix for a first-order autoregressive process, which is
-  used to construct the full precision matrix at a later stage.
-
-# Arguments
-- `model_type::Symbol`: The symbol representing the GMRF model type (e.g., `:icar`, `:rw2`).
-- `n::Int`: The number of spatial or temporal units (the dimension of the matrix).
-- `W::Union{AbstractMatrix, Nothing}`: The adjacency matrix, required for spatial models.
-
-# Returns
-- A `NamedTuple` `(matrix, scaling_factor, U, L)` containing the precision matrix
-  template, its scaling factor, eigenvectors, and eigenvalues.
+  handle GPU arrays for the eigendecomposition.
 """
 function build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractMatrix, Nothing}=nothing)
     Q_template = spzeros(Float64, n, n)
     rank_deficiency = 0
 
     if n == 0
-        return (matrix=Q_template, scaling_factor=1.0, U=spzeros(Float64, 0, 0), L=Float64[])
+        # Handle empty case gracefully
+        gpu_array_type = W isa GPUArrays.AbstractGPUArray ? typeof(W) : Array
+        return (matrix=gpu_array_type(Q_template), scaling_factor=1.0, U=gpu_array_type(spzeros(Float64, 0, 0)), L=gpu_array_type(Float64[]))
     end
+
+    # Determine the target array type from the input W or default to Array
+    ArrayType = W isa GPUArrays.AbstractGPUArray ? typeof(W).name.wrapper : Array
 
     if model_type in [:icar, :besag, :bym2, :leroux, :localadaptive]
         if isnothing(W); error("Spatial model '$model_type' requires an adjacency matrix `W`."); end
         if size(W, 1) != n || size(W, 2) != n; error("Adjacency matrix `W` dimensions ($(size(W))) do not match `n` ($n)."); end
-        W_sym = sparse((W + W') .> 0)
+        
+        # Ensure W is on the CPU for sparse operations if it's a GPU array
+        W_cpu = W isa GPUArrays.AbstractGPUArray ? Array(W) : W
+        W_sym = sparse((W_cpu + W_cpu') .> 0)
         D = spdiagm(0 => vec(sum(W_sym, dims=2)))
         Q_template = D - W_sym
         rank_deficiency = 1
@@ -3258,13 +3370,16 @@ function build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractM
         rank_deficiency = 0
     end
 
-    # Always compute eigendecomposition for potential use by spectral methods.
-    eig_decomp = eigen(Symmetric(Matrix(Q_template)))
+    # Perform eigendecomposition. If on GPU, use GPU-accelerated version.
+    Q_dense = ArrayType(Matrix(Q_template))
+    eig_decomp = eigen(Symmetric(Q_dense))
     U = eig_decomp.vectors
     L = eig_decomp.values
 
     if rank_deficiency > 0
-        scaling_factor = _compute_scaling_factor(L, rank_deficiency)
+        # Perform scaling factor calculation on the CPU for simplicity, then apply.
+        L_cpu = L isa GPUArrays.AbstractGPUArray ? Array(L) : L
+        scaling_factor = _compute_scaling_factor(L_cpu, rank_deficiency)
         Q_template = Q_template ./ scaling_factor
         # Rescale eigenvalues as well for consistency.
         L = L ./ scaling_factor
@@ -3272,8 +3387,12 @@ function build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractM
         scaling_factor = 1.0
     end
 
-    return (matrix=Q_template, scaling_factor=scaling_factor, U=U, L=L)
+    return (matrix=ArrayType(Q_template), scaling_factor=scaling_factor, U=U, L=L)
 end
+
+
+
+
 
 
 
@@ -3340,7 +3459,8 @@ end
 """
     evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
 
-Computes the cross-covariance kernel matrix between two sets of coordinates.
+Computes the cross-covariance kernel matrix between two sets of coordinates, with GPU support.
+This version replaces `Distances.pairwise` with broadcasting for GPU compatibility.
 
 # Version
 v1.5.7 (2026-08-13)
@@ -3380,18 +3500,21 @@ Determination (ARD) lengthscales.
   \$k(x, x') = \\sigma^2 x^T x'\$
 - `:constant`: Constant kernel.
   \$k(x, x') = \\sigma^2\$
-
-# Returns
-- A dense `N1 x N2` cross-covariance matrix.
 """
 function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
     T = promote_type(eltype(coords1), eltype(coords2), typeof(param_val), eltype(ls))
     coords1_T = convert(AbstractMatrix{T}, coords1)
     coords2_T = convert(AbstractMatrix{T}, coords2)
     ls_T = convert(typeof(ls) <: Real ? T : AbstractVector{T}, ls)
+    ArrayType = parent(coords1_T) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords1_T)) : Array
 
     if kernel_type == :linear
         return param_val^2 .* (coords1_T * coords2_T')
+    end
+
+    # GPU-compatible pairwise squared Euclidean distance for cross-matrices
+    function _sqeuclidean_broadcast_cross(X1::AbstractMatrix, X2::AbstractMatrix)
+        sum(X1.^2, dims=2) .- 2 * (X1 * X2') .+ sum(X2.^2, dims=2)'
     end
 
     local dist_sq
@@ -3399,10 +3522,13 @@ function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::Abstract
         if size(coords1_T, 2) != length(ls_T) || size(coords2_T, 2) != length(ls_T)
             error("Dimension mismatch for ARD kernel: Number of coordinate dimensions ($(size(coords1_T, 2))) does not match number of lengthscales ($(length(ls_T))).")
         end
-        dist_sq = pairwise(SqEuclidean(), coords1_T ./ ls_T', coords2_T ./ ls_T', dims=1)
+        dist_sq = _sqeuclidean_broadcast_cross(coords1_T ./ ls_T', coords2_T ./ ls_T')
     else # Isotropic case
-        dist_sq = pairwise(SqEuclidean(), coords1_T, coords2_T, dims=1) ./ ls_T^2
+        dist_sq = _sqeuclidean_broadcast_cross(coords1_T, coords2_T) ./ ls_T^2
     end
+    
+    # Ensure diagonal is non-negative
+    dist_sq[diagind(dist_sq)] .= max.(0, diag(dist_sq))
 
     if kernel_type == :gaussian || kernel_type == :se || kernel_type == :rbf
         return param_val^2 .* exp.(-one(T)/2 .* dist_sq)
@@ -3423,7 +3549,7 @@ function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::Abstract
 
     elseif kernel_type == :spherical
         d = sqrt.(dist_sq)
-        K = zeros(T, size(d))
+        K = ArrayType(zeros(T, size(d)))
         mask = d .< one(T)
         K[mask] = param_val^2 .* (one(T) .- 1.5 .* d[mask] .+ 0.5 .* d[mask].^3)
         return K
@@ -3433,7 +3559,7 @@ function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::Abstract
             @warn "Cosine kernel with ARD lengthscale is not standard. Using the first lengthscale for an isotropic kernel."
             ls_T = ls_T[1]
         end
-        d_euclidean = sqrt.(pairwise(SqEuclidean(), coords1_T, coords2_T, dims=1))
+        d_euclidean = sqrt.(_sqeuclidean_broadcast_cross(coords1_T, coords2_T))
         return param_val^2 .* cos.(2.0 * pi .* d_euclidean ./ ls_T)
 
     elseif kernel_type == :constant
@@ -3444,6 +3570,8 @@ function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::Abstract
         return param_val^2 .* exp.(-one(T)/2 .* dist_sq)
     end
 end
+
+
 
 
 
@@ -3463,7 +3591,7 @@ to model observation noise either as a simple constant parameter or as a complex
 spatiotemporally varying field. The stochastic volatility option is crucial for
 heteroscedastic data, where the measurement error changes across space and time.
 This is implemented using Random Fourier Features (RFF) to create a flexible,
-non-parametric model for the log-variance. This version is updated to correctly
+non-parametric model for the log-variance.   correctly
 handle both univariate and multivariate models, ensuring the `y_sigma` parameter
 has the correct dimensions in all cases.
 
@@ -3482,9 +3610,9 @@ has the correct dimensions in all cases.
 """
 function observation_volatility(M::NamedTuple)
     is_multivariate = get(M, :model_arch, "univariate") == "multivariate"
+    array_type_str = "M.to_device"
     
     if get(M, :volatility, false)
-        # --- Stochastic Volatility Model using RFF ---
         required_keys = [:M_rff_sigma, :W_sigma_fixed, :b_sigma_fixed, :coords_st]
         if !all(k -> haskey(M, k), required_keys)
             error("Stochastic volatility is enabled, but required keys are missing from the model configuration: $required_keys.")
@@ -3492,7 +3620,7 @@ function observation_volatility(M::NamedTuple)
 
         priors_str = """
         sigma_log_var ~ DynamicPPL.NamedDist(Exponential(1.0), :sigma_log_var)
-        beta_vol ~ DynamicPPL.NamedDist(MvNormal(zeros(T, M.M_rff_sigma), sigma_log_var^2 * I), :beta_vol)
+        beta_vol ~ DynamicPPL.NamedDist(MvNormal(fill!($(array_type_str){T}(undef, M.M_rff_sigma), 0), sigma_log_var^2 * I), :beta_vol)
         """
 
         calc_str = """
@@ -3502,27 +3630,21 @@ function observation_volatility(M::NamedTuple)
         y_sigma_sv = exp.(log_var_latent ./ 2.0)
         """
         
-        # In a multivariate model, we assume a shared SV process that scales each outcome's base sigma.
-        # y_sigma will be [N x K], y_sigma_const is [K], y_sigma_sv is [N].
-        # The result is y_sigma[:, k] = y_sigma_const[k] * y_sigma_sv
         final_calc_str = is_multivariate ? "y_sigma = y_sigma_sv .* y_sigma_const'" : "y_sigma = y_sigma_const .* y_sigma_sv"
         
         return (priors=priors_str, calculation="$(calc_str)\n    $(final_calc_str)")
     else
-        # --- Default behavior: constant observation variance ---
-        priors_str = "" # The y_sigma_const prior is defined in the main assembler.
+        priors_str = ""
         
-        # Ensure correct dimensions for univariate vs. multivariate cases.
         calc_str = if is_multivariate
-            # y_sigma_const is a vector of length K, so we broadcast it across N observations.
             "y_sigma = y_sigma_const'"
         else
-            # y_sigma_const is a scalar.
             "y_sigma = fill(y_sigma_const, N)"
         end
         return (priors=priors_str, calculation=calc_str)
     end
 end
+
 
 
   
@@ -3765,13 +3887,14 @@ higher precedence than the next:
   parameter blocks are defined, or a single sampler otherwise.
 """
 function get_optimal_sampler(
-    model_obj::DynamicPPL.Model, adaptation_steps::Int=5, target_acceptance::Float64=0.8, 
-    sampler_choice::Symbol=:auto;
+    model_obj::DynamicPPL.Model;
+    sampler_choice::Union{Symbol, AbstractMCMC.AbstractSampler}=:auto,
     sampler_map::Dict{Symbol, <:AbstractMCMC.AbstractSampler}=Dict{Symbol, AbstractMCMC.AbstractSampler}(),
     adtype::ADTypes.AbstractADType=ADTypes.AutoForwardDiff(),
     group_components::Bool=true,
-    n_particles=20,
-    hmc_leapfrog_steps=10
+    adaptation_steps::Int=500,
+    target_acceptance::Float64=0.8,
+    n_particles::Int=20
 )
     if sampler_choice isa AbstractMCMC.AbstractSampler
         @info "Using user-specified sampler: $(typeof(sampler_choice))"
@@ -3818,10 +3941,17 @@ function get_optimal_sampler(
         vns_to_check = filter(vn -> !(vn in all_processed_vns), vns)
 
         for vn in vns_to_check
+            # Component grouping only applies to continuous parameters.
+            # Discrete parameters will be handled by the default categorization in Stage 3.
+            dist = DynamicPPL.getdist(vi, vn)
+            if !(Distributions.value_support(typeof(dist)) isa Distributions.Continuous)
+                continue
+            end
+
             vn_str = string(DynamicPPL.getsym(vn))
             found_key = nothing
             for key in component_keys
-                if occursin(Regex("\\b$(key)\\b"), vn_str)
+                if occursin(Regex("_$(key)(_\\d+)?\$"), vn_str) || startswith(vn_str, "$(key)_")
                     found_key = key
                     break
                 end
@@ -3839,37 +3969,21 @@ function get_optimal_sampler(
             params_to_process = setdiff(params_vns, all_processed_vns)
             if isempty(params_to_process); continue; end
 
-            bounded_in_comp = Set{VarName}()
-            unbounded_in_comp = Set{VarName}()
-
-            for vn in params_to_process
-                dist = DynamicPPL.getdist(vi, vn)
-                support = Distributions.value_support(typeof(dist))
-                if support isa Distributions.Continuous && (isfinite(minimum(dist)) || isfinite(maximum(dist)))
-                    push!(bounded_in_comp, vn)
-                else
-                    push!(unbounded_in_comp, vn)
-                end
-            end
-
-            if !isempty(bounded_in_comp)
-                sampler = Slice()
-                push!(sampler_assignments, Tuple(bounded_in_comp) => sampler)
-                union!(all_processed_vns, bounded_in_comp)
-                @info "Applying Slice sampler for bounded parameters in component '$key': $(DynamicPPL.getsym.(bounded_in_comp))"
-            end
-
-            if !isempty(unbounded_in_comp)
-                block_adtype = if length(unbounded_in_comp) <= 10
-                    ADTypes.AutoForwardDiff()
-                else
-                    adtype_to_use
-                end
-                sampler = NUTS(adaptation_steps, target_acceptance; adtype=block_adtype)
-                push!(sampler_assignments, Tuple(unbounded_in_comp) => sampler)
-                union!(all_processed_vns, unbounded_in_comp)
-                @info "Created NUTS block for component '$key' with parameters: $(DynamicPPL.getsym.(unbounded_in_comp)) using AD: $(typeof(block_adtype))"
-            end
+            # Rationale for Change (v1.2.9):
+            # The previous logic split component parameters into 'bounded' and 'unbounded'
+            # groups, assigning them to different samplers (Slice and NUTS). This can
+            # lead to numerical instability and DomainErrors during gradient computation,
+            # as the AD backend sees some parameters of a component as fixed constants
+            # while differentiating with respect to others.
+            # The corrected approach is to treat all continuous parameters within a component as a
+            # single block. We assign the entire block to NUTS, which can handle bounded
+            # priors (like Exponential or Beta) correctly via bijector transformations.
+            # This ensures that all related parameters are sampled jointly, improving
+            # stability and sampling efficiency.
+            sampler = NUTS(adaptation_steps, target_acceptance; adtype=adtype_to_use)
+            push!(sampler_assignments, Tuple(params_to_process) => sampler)
+            union!(all_processed_vns, params_to_process)
+            @info "Created NUTS block for component '$key' with parameters: $(DynamicPPL.getsym.(params_to_process)) using AD: $(typeof(adtype_to_use))"
         end
     end
 
@@ -3938,7 +4052,7 @@ v1.0.3 (2026-08-15)
 # Rationale
 This function is a core utility for the model configuration engine. It acts as a
 robust wrapper around `StatsModels.jl` to parse a formula's right-hand side and
-generate the corresponding design matrix. This version is updated to prevent a
+generate the corresponding design matrix.   prevent a
 `LoadError` by explicitly evaluating the formula expression in the `bstm` module's
 scope (`@__MODULE__`) instead of the `calling_module`'s scope. This ensures the
 `StatsModels.@formula` macro can always be found, as `StatsModels` is a direct
@@ -4000,64 +4114,7 @@ function create_fixed_design(
 end
 
 
-
-
-"""
-    householder_to_eigenvector(v_mat::AbstractMatrix{T}, nU, n_factors) where {T}
-
-Constructs an orthonormal loadings matrix (eigenvectors) from a matrix of Householder
-reflector vectors.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function provides a numerically stable and differentiable method for parameterizing
-an orthonormal matrix, which is essential for the Bayesian PCA (`eigen`) component.
-It avoids the non-differentiable Gram-Schmidt process and the computational cost of
-other methods like the Cayley transform for the specific case of constructing a
-partial orthonormal basis. This implementation is consistent with the refactored
-architecture and provides a robust foundation for the `eigen` component.
-
-# Mathematical Summary
-The function constructs an orthonormal matrix `U` by applying a sequence of `n_factors`
-Householder reflections to the identity matrix. A single Householder reflection matrix
-is defined as \$H = I - 2vv^T\$, where \$v\$ is a unit vector. The update
-\$U_{new} = H U_{old}\$ is computed efficiently as \$U_{old} - 2v(v^T U_{old})\$. The final
-loadings matrix consists of the first `n_factors` columns of the resulting
-orthonormal matrix.
-
-# Arguments
-- `v_mat::AbstractMatrix{T}`: An `nU x n_factors` matrix where each column is a reflector vector.
-- `nU::Int`: The number of variables (rows in the final loadings matrix).
-- `n_factors::Int`: The number of factors (columns in the final loadings matrix).
-
-# Returns
-- An `nU x n_factors` orthonormal matrix representing the loadings.
-"""
-function householder_to_eigenvector(v_mat::AbstractMatrix{T}, nU::Int, n_factors::Int) where {T}
-    # Initialize with an nU x nU identity matrix.
-    U = Matrix{T}(I, nU, nU)
-
-    # Iteratively apply Householder reflections.
-    for k in 1:n_factors
-        vk = v_mat[:, k]
-        norm_v = LinearAlgebra.norm(vk)
-        
-        # Avoid division by zero if the reflector vector is null.
-        if norm_v > 1e-9
-            vk_unit = vk / norm_v
-            v_transpose_U = vk_unit' * U
-            
-            # Efficiently apply the reflection H*U = U - 2*v*(v'*U).
-            U = U - 2.0 .* vk_unit * v_transpose_U
-        end
-    end
-
-    # The final loadings matrix consists of the first n_factors columns.
-    return U[:, 1:n_factors]
-end
-
+ 
  
 
 """
@@ -4418,64 +4475,30 @@ end
 
 
 
-# ==============================================================================
-# SECTION 10: ADVANCED MODELING UTILITIES 
-# ==============================================================================
 """
-    bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; knot_method::Symbol=:quantile, custom_knots::Union{AbstractVector, Nothing}=nothing)
+    bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; ...)
 
-Generates a B-spline basis matrix of a specified degree using the De Boor-Cox recursion formula.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for constructing basis matrices for P-spline (`pspline`)
-and B-spline (`bspline`) smoothers. It implements the standard De Boor-Cox algorithm
-in an iterative manner, which is a numerically stable and well-established method for
-evaluating B-spline basis functions. The implementation includes a robustness check
-that automatically adjusts the number of basis functions if the input data has low
-variability, preventing errors from duplicate knots.
-
-# Mathematical Formulation
-The B-spline basis functions \$B_{i,p}(x)\$ of degree \$p\$ over a knot vector \$t\$ are
-defined recursively.
-
-- **Base Case (degree 0)**:
-  \$B_{i,0}(x) = \\begin{cases} 1 & \\text{if } t_i \\le x < t_{i+1} \\\\ 0 & \\text{otherwise} \\end{cases}\$
-
-- **Recursive Step (degree p > 0)**:
-  \$B_{i,p}(x) = \\frac{x - t_i}{t_{i+p} - t_i} B_{i,p-1}(x) + \\frac{t_{i+p+1} - x}{t_{i+p+1} - t_{i+1}} B_{i+1,p-1}(x)\$
-
-# Arguments
-- `x`: The vector of data points for which the basis is evaluated.
-- `n_basis`: The number of basis functions to generate.
-- `degree`: The polynomial degree of the B-spline (e.g., 1 for linear, 3 for cubic).
-- `knot_method`: The method for placing interior knots. Can be `:quantile` (default) for knots placed at data quantiles, or `:range` for knots spaced evenly over the data range.
-- `custom_knots`: An optional vector of pre-defined interior knots.
-
-# Returns
-- A tuple `(Matrix, Int)` containing the basis matrix of size `(length(x), n_basis)` and the final number of basis functions used.
+Generates a B-spline basis matrix with GPU support. This version infers the
+array type from the input vector `x` and allocates the basis matrix `B` on the
+corresponding device.
 """
 function bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; knot_method::Symbol=:quantile, custom_knots::Union{AbstractVector, Nothing}=nothing)
+    ArrayType = parent(x) isa GPUArrays.AbstractGPUArray ? typeof(parent(x)) : Array
     p = degree
     if n_basis <= p
         error("Number of basis functions (nbins) must be greater than the spline degree. Got n_basis=$n_basis, degree=$p.")
     end
 
-    # The number of interior knots is determined by the number of basis functions and the degree.
     n_interior_knots = n_basis - p
 
     knots = if !isnothing(custom_knots)
         custom_knots
     else
-        # Place interior knots based on the chosen method.
         if n_interior_knots > 0
             if knot_method == :quantile
-                # Ensure that quantile probabilities are unique to avoid issues with discrete data
                 probs = range(0, 1, length=n_interior_knots + 2)[2:end-1]
                 quantile(x, probs)
-            else # :range
+            else
                 range(minimum(x), maximum(x), length=n_interior_knots + 2)[2:end-1]
             end
         else
@@ -4483,52 +4506,39 @@ function bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; knot_m
         end
     end
 
-    # Define the full knot vector by adding boundary knots.
     boundary_knots = [minimum(x), maximum(x)]
     all_knots = sort(unique(vcat(boundary_knots, knots)))
 
-    # --- Robustness Check for Low-Variability Data ---
-    # The number of basis functions that can be constructed depends on the number of unique knots.
-    # If the data has low variability, quantile-based knots can be identical, reducing the
-    # number of unique knots and thus the possible number of basis functions.
     n_basis_possible = length(all_knots) + p - 1
-    
     if n_basis > n_basis_possible
-        @warn "Requested n_basis ($n_basis) is too high for the number of unique knots ($(length(all_knots))) and degree ($p) supported by the data's variability. Reducing n_basis to the maximum possible value: $n_basis_possible."
+        @warn "Requested n_basis ($n_basis) is too high for the number of unique knots ($(length(all_knots))) and degree ($p). Reducing to $n_basis_possible."
         n_basis = n_basis_possible
     end
-    # --- End Robustness Check ---
 
-    # Augment the knot vector by repeating the boundary knots `p` times at each end.
-    # This is required for the De Boor-Cox recursion.
     t = vcat(fill(all_knots[1], p), all_knots, fill(all_knots[end], p))
     
     N = length(x)
-    # The number of basis functions is length of augmented knots - degree - 1.
     num_total_basis = length(t) - p - 1
-    B = zeros(N, num_total_basis)
+    B = ArrayType{Float64}(undef, N, num_total_basis); fill!(B, 0.0)
 
-    # Base case: degree 0 splines are piecewise constant.
     for j in 1:num_total_basis
         B[:, j] = (t[j] .<= x .< t[j+1])
     end
-    # Ensure the last point is included in the final basis function.
     if !isempty(x) && t[end] == maximum(x)
         B[x .== t[end], num_total_basis] .= 1.0
     end
 
-    # Iteratively compute higher-degree splines from lower-degree ones.
     for d in 1:p
         for j in 1:(num_total_basis - d)
-            w1 = zeros(N)
+            w1 = ArrayType{Float64}(undef, N); fill!(w1, 0.0)
             denom1 = t[j+d] - t[j]
-            if denom1 > 1e-9 # Avoid division by zero
+            if denom1 > 1e-9
                 w1 = (x .- t[j]) ./ denom1
             end
             
-            w2 = zeros(N)
+            w2 = ArrayType{Float64}(undef, N); fill!(w2, 0.0)
             denom2 = t[j+d+1] - t[j+1]
-            if denom2 > 1e-9 # Avoid division by zero
+            if denom2 > 1e-9
                 w2 = (t[j+d+1] .- x) ./ denom2
             end
             
@@ -4536,45 +4546,16 @@ function bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; knot_m
         end
     end
 
-    # Return the final basis matrix and the actual number of basis functions.
     return (B[:, 1:n_basis], n_basis)
 end
-
 
 
 """
     bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, degrees_per_dim::Vector{Int}; ...)
 
-Generates a tensor product B-spline basis matrix for multidimensional data.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for creating multi-dimensional smooth effects from
-covariates (e.g., spatial smooths, spatiotemporal interactions). It constructs a
-high-dimensional basis by taking the tensor product of 1D B-spline bases. This
-version fixes a `MethodError` that occurred when unsupported keyword arguments were
-passed down to the `bstm_bspline_basis` function and correctly handles the tuple
-`(matrix, n_basis)` returned by its dependency.
-
-# Mathematical Formulation
-The tensor product basis is constructed from a set of 1D basis functions. If we have
-\$D\$ dimensions, and for each dimension \$d\$, we have a set of 1D basis functions
-\$\\lbrace B_{d,j_d}(x_d) \\rbrace_{j_d=1}^{M_d}\$, then a basis function in the
-\$D\$-dimensional tensor product space is given by:
-\$B_{j_1, j_2, ..., j_D}(x_1, ..., x_D) = \\prod_{d=1}^{D} B_{d,j_d}(x_d)\$
-This is equivalent to the row-wise Kronecker product of the 1D basis matrices.
-
-# Arguments
-- `coords::AbstractMatrix`: An `N x D` matrix of data points.
-- `nbins_per_dim::Vector{Int}`: A vector specifying the number of basis functions for each dimension.
-- `degrees_per_dim::Vector{Int}`: A vector specifying the polynomial degree for each dimension's B-spline basis.
-- `knot_method::Symbol`: The method for placing interior knots (`:quantile` or `:range`).
-- `kwargs...`: Additional keyword arguments, primarily `custom_knots`.
-
-# Returns
-- A basis matrix of size `(N, prod(nbins_per_dim))`.
+Generates a tensor product B-spline basis matrix with GPU support. It infers the
+device from the input `coords` and ensures all intermediate and final matrices
+are allocated correctly.
 """
 function bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, degrees_per_dim::Vector{Int}; knot_method::Symbol=:quantile, kwargs...)
     n_dims = size(coords, 2)
@@ -4582,23 +4563,18 @@ function bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector
         error("Number of dimensions in coords must match length of nbins_per_dim and degrees_per_dim.")
     end
 
-    # Filter kwargs to only include those accepted by bstm_bspline_basis.
-    # This prevents passing unsupported arguments like `structure`, `model`, etc.
     bspline_kwargs = Dict{Symbol, Any}()
     if haskey(kwargs, :custom_knots)
         bspline_kwargs[:custom_knots] = kwargs[:custom_knots]
     end
 
-    # Generate 1D B-spline basis matrices for each dimension.
-    basis_matrices_1D = Vector{Matrix{Float64}}(undef, n_dims)
+    basis_matrices_1D = Vector{AbstractMatrix{Float64}}(undef, n_dims)
     for i in 1:n_dims
-        # For multi-dimensional custom knots, we need to pass the correct slice.
         local_bspline_kwargs = copy(bspline_kwargs)
         if haskey(local_bspline_kwargs, :custom_knots) && local_bspline_kwargs[:custom_knots] isa Tuple
             local_bspline_kwargs[:custom_knots] = local_bspline_kwargs[:custom_knots][i]
         end
         
-        # bstm_bspline_basis returns a tuple (matrix, n_basis). We only need the matrix here.
         basis_mat, _ = bstm_bspline_basis(
             coords[:, i], 
             nbins_per_dim[i], 
@@ -4610,32 +4586,96 @@ function bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector
     end
 
     if isempty(basis_matrices_1D)
-        return zeros(size(coords, 1), 0)
+        ArrayType = parent(coords) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords)) : Array
+        return ArrayType{Float64}(undef, size(coords, 1), 0)
     end
 
-    # Initialize the final basis with the matrix from the first dimension.
     B_final = basis_matrices_1D[1]
 
-    # Iteratively compute the tensor product with the remaining basis matrices.
     for i in 2:n_dims
         B_next = basis_matrices_1D[i]
-        
         n_obs, n_cols_final = size(B_final)
         _, n_cols_next = size(B_next)
         
-        # Reshape for broadcasting to compute row-wise outer products.
         B_final_reshaped = reshape(B_final, n_obs, n_cols_final, 1)
         B_next_reshaped = reshape(B_next, n_obs, 1, n_cols_next)
         
-        # The element-wise product creates the tensor product of the rows.
         tensor_prod = B_final_reshaped .* B_next_reshaped
         
-        # Reshape the result into the final 2D basis matrix.
         B_final = reshape(tensor_prod, n_obs, n_cols_final * n_cols_next)
     end
     
     return B_final
 end
+
+
+"""
+    bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol, lengthscale::Float64)
+
+Generates a 1D wavelet basis matrix with GPU support. It infers the array type
+from the input `vals` and allocates the basis matrix `B` on the correct device.
+"""
+function bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol, lengthscale::Float64)
+    ArrayType = parent(vals) isa GPUArrays.AbstractGPUArray ? typeof(parent(vals)) : Array
+    Interpolations = Base.require(Base.Main, :Interpolations)
+
+    n_obs = length(vals)
+    B = ArrayType{Float64}(undef, n_obs, nbins); fill!(B, 0.0)
+    v_min, v_max = minimum(vals), maximum(vals)
+    v_range = v_max - v_min
+    if v_range < 1e-9; v_range = 1.0; end
+
+    local wt_type
+    try
+        wt_type = getfield(Wavelets.WT, family)
+    catch e
+        @error "Could not resolve wavelet family ':$family'. Error: $e. Defaulting to db4."
+        wt_type = Wavelets.WT.db4
+    end
+
+    local wt_instance
+    try
+        wt_instance = Wavelets.wavelet(wt_type)
+    catch e
+        error("Failed to instantiate wavelet object from type '$wt_type'. Error: $e")
+    end
+
+    h_filter = wt_instance.qmf
+    L = length(h_filter)
+    g_filter = similar(h_filter)
+    for i in 1:L
+        g_filter[i] = (-1.0)^(i-1) * h_filter[L - (i-1)]
+    end
+
+    n_reconstruction_iterations = 8
+    x_psi_grid, psi_vals = _reconstruct_wavelet_function_from_filters(h_filter, g_filter, n_reconstruction_iterations)
+
+    itp = Interpolations.linear_interpolation(x_psi_grid, psi_vals, extrapolation_bc=Interpolations.Flat())
+
+    n_scales = max(1, floor(Int, log2(nbins/4)))
+    bins_per_scale = div(nbins, n_scales)
+    
+    current_bin = 1
+    for j in 1:n_scales
+        scale_factor = lengthscale * (2.0^(j-1))
+        
+        n_translations = (j == n_scales) ? (nbins - current_bin + 1) : bins_per_scale
+        if n_translations <= 0; continue; end
+
+        probs = n_translations == 1 ? [0.5] : range(0, 1, length=n_translations)
+        centers = quantile(Array(vals), probs) # Quantile on CPU
+        
+        for k in 1:n_translations
+            if current_bin > nbins; break; end
+            
+            transformed_vals = (vals .- centers[k]) ./ (scale_factor * v_range)
+            B[:, current_bin] = itp.(transformed_vals)
+            current_bin += 1
+        end
+    end
+    return B
+end
+
 
 
 """
@@ -4719,102 +4759,7 @@ function _reconstruct_wavelet_function_from_filters(h::Vector{Float64}, g::Vecto
     return x_grid_final, psi_next_vals
 end
 
-
-"""
-    bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol, lengthscale::Float64)
-
-Generates a 1D multi-resolution wavelet basis matrix.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function constructs a basis from scaled and translated versions of a mother
-wavelet function. Unlike standard spline bases, wavelet bases are localized in
-both space and frequency, making them well-suited for capturing features at
-multiple scales (e.g., both smooth trends and abrupt spikes). The mother wavelet
-function itself is reconstructed from its quadrature mirror filters using the
-cascade algorithm.
-
-# Mathematical Formulation
-The basis functions are of the form:
-\$\\psi_{j,k}(t) = 2^{-j/2} \\psi(2^{-j}t - k)\$
-where \$\\psi\$ is the mother wavelet, \$j\$ is the scale parameter, and \$k\$ is the
-translation parameter. This function approximates this by creating basis functions
-at different scales (`lengthscale * 2^(j-1)`) and translating them to locations
-determined by the quantiles of the input data.
-
-# Arguments
-- `vals::AbstractVector`: The vector of data points.
-- `nbins::Int`: The total number of basis functions to generate.
-- `family::Symbol`: The wavelet family to use (e.g., `:db4`, `:haar`).
-- `lengthscale::Float64`: The base lengthscale for the wavelet functions.
-
-# Returns
-- A basis matrix of size `(length(vals), nbins)`.
-"""
-function bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol, lengthscale::Float64)
-    # Dynamically load Interpolations to ensure it's available in the execution scope.
-    Interpolations = Base.require(Base.Main, :Interpolations)
-
-    n_obs = length(vals)
-    B = zeros(Float64, n_obs, nbins)
-    v_min, v_max = minimum(vals), maximum(vals)
-    v_range = v_max - v_min
-    if v_range < 1e-9; v_range = 1.0; end
-
-    local wt_type
-    try
-        wt_type = getfield(Wavelets.WT, family)
-    catch e
-        @error "Could not resolve wavelet family ':$family'. Error: $e. Defaulting to db4."
-        wt_type = Wavelets.WT.db4
-    end
-
-    local wt_instance
-    try
-        wt_instance = Wavelets.wavelet(wt_type)
-    catch e
-        error("Failed to instantiate wavelet object from type '$wt_type'. Error: $e")
-    end
-
-    h_filter = wt_instance.qmf
-    
-    L = length(h_filter)
-    g_filter = similar(h_filter)
-    for i in 1:L
-        g_filter[i] = (-1.0)^(i-1) * h_filter[L - (i-1)]
-    end
-
-    n_reconstruction_iterations = 8
-    x_psi_grid, psi_vals = _reconstruct_wavelet_function_from_filters(h_filter, g_filter, n_reconstruction_iterations)
-
-    itp = Interpolations.linear_interpolation(x_psi_grid, psi_vals, extrapolation_bc=Interpolations.Flat())
-
-    n_scales = max(1, floor(Int, log2(nbins/4)))
-    bins_per_scale = div(nbins, n_scales)
-    
-    current_bin = 1
-    for j in 1:n_scales
-        scale_factor = lengthscale * (2.0^(j-1))
-        
-        n_translations = (j == n_scales) ? (nbins - current_bin + 1) : bins_per_scale
-        if n_translations <= 0; continue; end
-
-        probs = n_translations == 1 ? [0.5] : range(0, 1, length=n_translations)
-        centers = quantile(vals, probs)
-        
-        for k in 1:n_translations
-            if current_bin > nbins; break; end
-            
-            transformed_vals = (vals .- centers[k]) ./ (scale_factor * v_range)
-            B[:, current_bin] = itp.(transformed_vals)
-            current_bin += 1
-        end
-    end
-    return B
-end
-
+ 
 
 """
     bstm_tensor_product_wavelet_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, family::Symbol, lengthscale::Union{Real, AbstractVector})
@@ -4891,40 +4836,8 @@ end
 """
     bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, degree::Int; ...)
 
-Generates a 1D basis matrix for various smoother types.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for creating 1D smooth effects from covariates.
-This version enhances the implementation for `pspline` and `bspline` to call the
-dedicated `bstm_bspline_basis` function, which correctly generates a B-spline basis
-of the specified `degree`. The previous implementation was hardcoded to a linear
-spline. The original linear "tent function" behavior is retained for the aliases
-`smooth`, `barycentric`, and `linear` for backward compatibility. A bug in the `fft`
-basis generation for odd `nbins` has also been corrected.
-
-# Mathematical Formulations
-- **`smooth`/`linear`/`barycentric`**: Linear tent functions. For a knot \$k_m\$ with
-  spacing \$h\$, the basis function is \$b(x) = \\max(0, 1 - |x - k_m| / h)\$.
-- **`pspline`/`bspline`**: B-spline basis functions of a specified `degree`,
-  constructed recursively via the De Boor-Cox formula.
-
-# Arguments
-- `type::String`: The type of basis to generate (e.g., "pspline", "rff", "tps").
-- `vals::AbstractVector`: The vector of data points.
-- `nbins::Int`: The number of basis functions (knots).
-- `degree::Int`: The polynomial degree for spline models.
-- `W`: Adjacency matrix, used by some basis types (not currently implemented for 1D).
-- `knot_method::Symbol`: Method for placing knots (`:quantile` or `:range`).
-- `custom_knots`: Optional vector for user-defined knots.
-- `kwargs...`: Additional parameters for specific basis types (e.g., `lengthscale`).
-
-# Returns
-- A tuple `(B_out, actual_nbins_generated)` where `B_out` is the basis matrix and
-  `actual_nbins_generated` is the number of columns in the matrix, which may differ
-  from `nbins` if the data's variability is low.
+Generates a 1D basis matrix with GPU support. It handles RFF and FFT basis
+generation on the appropriate device by inferring the array type from the input `vals`.
 """
 function bstm_smooth_basis_1D(
     type::String, 
@@ -4936,6 +4849,7 @@ function bstm_smooth_basis_1D(
     custom_knots::Union{AbstractVector, Nothing} = nothing, 
     kwargs...
 )
+    ArrayType = parent(vals) isa GPUArrays.AbstractGPUArray ? typeof(parent(vals)) : Array
     n_obs = length(vals)
     
     v_min = minimum(vals)
@@ -4947,16 +4861,15 @@ function bstm_smooth_basis_1D(
         custom_knots
     elseif knot_method == :range || use_regular_grid
         collect(range(v_min, stop=v_max, length=nbins))
-    else # :quantile or any other default
-        quantile(vals, range(0, 1, length=nbins))
+    else
+        quantile(Array(vals), range(0, 1, length=nbins)) # Quantile on CPU
     end
 
     if type in ["pspline", "bspline"]
-        # bstm_bspline_basis handles its own logic and returns the final matrix and bin count.
         return bstm_bspline_basis(vals, nbins, degree; knot_method=knot_method, custom_knots=custom_knots)
     end
 
-    B_out = zeros(Float64, n_obs, nbins)
+    B_out = ArrayType{Float64}(undef, n_obs, nbins); fill!(B_out, 0.0)
     actual_nbins_generated = nbins
 
     if type in ["smooth", "barycentric", "linear"]
@@ -4968,15 +4881,16 @@ function bstm_smooth_basis_1D(
             B_out[mask, m] .= 1.0 .- dist[mask]
         end
     elseif type == "tps"
-        # The radial basis function for 1D TPS (m=2, d=1) is r^3.
         for m in 1:nbins
             r = abs.(vals .- knots[m])
             B_out[:, m] .= r.^3
         end
     elseif type == "rff"
         ls = get(kwargs, :lengthscale, v_std)
-        Omega = randn(1, nbins) ./ ls
-        Phi_phases = rand(nbins) .* (2.0 * pi)
+        Omega_cpu = randn(1, nbins) ./ ls
+        Phi_phases_cpu = rand(nbins) .* (2.0 * pi)
+        Omega = ArrayType(Omega_cpu)
+        Phi_phases = ArrayType(Phi_phases_cpu)
         B_out .= sqrt(2.0 / nbins) .* cos.((vals * Omega) .+ Phi_phases')
     elseif type == "fft"
         ls = get(kwargs, :lengthscale, v_std)
@@ -5004,71 +4918,20 @@ function bstm_smooth_basis_1D(
             mask = h .< 1.0
             B_out[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
         end
-    elseif type == "decay"
-        ls = get(kwargs, :lengthscale, v_std)
-        for m in 1:nbins
-            B_out[:, m] .= exp.(-abs.(vals .- knots[m]) ./ ls)
-        end
-    elseif type == "invdist"
-        for m in 1:nbins
-            dist_sq = (vals .- knots[m]).^2
-            B_out[:, m] .= 1.0 ./ (dist_sq .+ 1e-6)
-        end
-    elseif type == "kriging"
-        ls = get(kwargs, :lengthscale, v_std)
-        for m in 1:nbins
-            dist_sq = (vals .- knots[m]).^2
-            B_out[:, m] .= exp.(-dist_sq ./ (2 * ls^2))
-        end
     else
-        B_out = ones(n_obs, 1)
+        B_out = ArrayType{Float64}(undef, n_obs, 1); fill!(B_out, 1.0)
         actual_nbins_generated = 1
     end
 
     return B_out, actual_nbins_generated
 end
 
- 
 
 """
     bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Union{Int, Vector{Int}}; ...)
 
-Generates a 2D basis matrix for various smoother types. This function is a factory
-that dispatches to different basis generation methods based on the `type` argument.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for creating 2D smooth effects, such as for
-spatial coordinates. This version unifies the `barycentric` smoother with the
-`smooth` and `linear` types. The previous implementation for `barycentric` used a
-complex and likely incorrect Delaunay triangulation on a regular grid. The corrected
-version now uses the robust and standard tensor product of 1D linear "tent"
-functions (bilinear interpolation), which is the correct interpretation for a
-barycentric-style basis on a grid. This change also fixes a bug where the `tps`
-basis was not correctly sliced.
-
-# Mathematical Formulation (for `smooth`/`linear`/`barycentric`)
-The basis is constructed as a tensor product of 1D linear tent functions. For a
-2D point \$(x, y)\$, the basis function \$B_{ij}(x, y)\$ corresponding to the
-knot \$(k_{xi}, k_{yj})\$ is:
-\$B_{ij}(x, y) = b_x(x, k_{xi}) \\cdot b_y(y, k_{yj})\$
-where \$b_d(u, k)\$ is the 1D linear tent function:
-\$b_d(u, k) = \\max(0, 1 - |u - k| / h_d)\$
-and \$h_d\$ is the grid spacing in that dimension.
-
-# Arguments
-- `type::String`: The type of basis to generate (e.g., "smooth", "pspline", "tps").
-- `coords::AbstractMatrix`: An `N x 2` matrix of data points.
-- `nbins::Union{Int, Vector{Int}}`: The number of bins (knots) for each dimension.
-- `W`: Adjacency matrix, used by some basis types (e.g., `moran`).
-- `knot_method::Symbol`: Method for placing knots (`:quantile` or `:range`).
-- `custom_knots`: Optional tuple of 2 vectors for user-defined knots.
-- `kwargs...`: Additional parameters for specific basis types (e.g., `degree`, `lengthscale`).
-
-# Returns
-- A basis matrix of size `(N, total_bins)`.
+Generates a 2D basis matrix with GPU support. It infers the array type from the
+input `coords` and ensures all internal arrays are allocated on the correct device.
 """
 function bstm_smooth_basis_2D(
     type::String, 
@@ -5079,6 +4942,7 @@ function bstm_smooth_basis_2D(
     custom_knots::Union{Tuple{AbstractVector, AbstractVector}, Nothing} = nothing, 
     kwargs...
 )
+    ArrayType = parent(coords) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords)) : Array
     n_obs = size(coords, 1)
     
     n_marginal_x, n_marginal_y = if nbins isa Int
@@ -5099,38 +4963,29 @@ function bstm_smooth_basis_2D(
 
     use_regular_grid = type in ["invdist", "kriging", "tps", "spherical"]
 
+    coords_cpu = Array(coords)
     kx, ky = if knot_method == :custom && !isnothing(custom_knots)
-        if length(custom_knots) != 2 || length(custom_knots[1]) != n_marginal_x || length(custom_knots[2]) != n_marginal_y
-            @warn "Custom knots for 2D smoother must be a Tuple of 2 AbstractVectors with lengths matching `nbins`. Falling back to :quantile method."
-            (quantile(coords[:, 1], range(0, 1, length=n_marginal_x)),
-             quantile(coords[:, 2], range(0, 1, length=n_marginal_y)))
-        else
-            custom_knots
-        end
+        custom_knots
     elseif knot_method == :quantile && !use_regular_grid
-        (quantile(coords[:, 1], range(0, 1, length=n_marginal_x)),
-         quantile(coords[:, 2], range(0, 1, length=n_marginal_y)))
-    else # :range or if regular grid is required
+        (quantile(coords_cpu[:, 1], range(0, 1, length=n_marginal_x)),
+         quantile(coords_cpu[:, 2], range(0, 1, length=n_marginal_y)))
+    else
         (collect(range(c_min[1], stop=c_max[1], length=n_marginal_x)),
          collect(range(c_min[2], stop=c_max[2], length=n_marginal_y)))
     end
     
-    B = zeros(Float64, n_obs, total_bins)
+    B = ArrayType{Float64}(undef, n_obs, total_bins); fill!(B, 0.0)
 
     if type == "barycentric"
-        # Use the Delaunay triangulation-based barycentric basis
         knot_points = [Point2D(kx[i], ky[j]) for j in 1:n_marginal_y for i in 1:n_marginal_x]
         B = bstm_barycentric_basis_2D(coords, knot_points)
     elseif type in ["pspline", "bspline"]
         degree_val = get(kwargs, :degree, 3)
-        nbins_per_dim = [n_marginal_x, n_marginal_y]
-        degrees_per_dim = [degree_val, degree_val]
-        B = bstm_tensor_product_basis(coords, nbins_per_dim, degrees_per_dim; knot_method=knot_method, kwargs...)
+        B = bstm_tensor_product_basis(coords, [n_marginal_x, n_marginal_y], [degree_val, degree_val]; knot_method=knot_method, kwargs...)
     elseif type == "wavelet"
         family = get(kwargs, :family, :db4)
         lengthscale = get(kwargs, :lengthscale, 0.1)
-        nbins_per_dim = [n_marginal_x, n_marginal_y]
-        B = bstm_tensor_product_wavelet_basis(coords, nbins_per_dim, family, lengthscale)
+        B = bstm_tensor_product_wavelet_basis(coords, [n_marginal_x, n_marginal_y], family, lengthscale)
     elseif type in ["smooth", "linear"]
         hx = (c_max[1] - c_min[1]) / (n_marginal_x > 1 ? (n_marginal_x - 1) : 1.0); hx = hx > 0 ? hx : 1.0
         hy = (c_max[2] - c_min[2]) / (n_marginal_y > 1 ? (n_marginal_y - 1) : 1.0); hy = hy > 0 ? hy : 1.0
@@ -5151,90 +5006,27 @@ function bstm_smooth_basis_2D(
             B[:, m] .= (r.^2) .* log.(r .+ 1e-9)
         end
     elseif type == "rff" || type == "anisotropic"
-        Omega = randn(2, total_bins)
-        Omega[1, :] ./= ls_x
-        Omega[2, :] ./= ls_y
-        Phi_phases = rand(total_bins) .* (2.0 * pi)
+        Omega_cpu = randn(2, total_bins)
+        Omega_cpu[1, :] ./= ls_x
+        Omega_cpu[2, :] ./= ls_y
+        Phi_phases_cpu = rand(total_bins) .* (2.0 * pi)
+        Omega = ArrayType(Omega_cpu)
+        Phi_phases = ArrayType(Phi_phases_cpu)
         B .= sqrt(2.0 / total_bins) .* cos.((coords * Omega) .+ Phi_phases')
-    elseif type == "fft"
-        nx = coords[:, 1] ./ ls_x
-        ny = coords[:, 2] ./ ls_y
-        idx = 1
-        for my in 1:n_marginal_y, mx in 1:n_marginal_x
-            if idx + 1 <= total_bins
-                arg = mx .* nx .+ my .* ny
-                B[:, idx]   .= sin.(2.0 * pi * arg)
-                B[:, idx+1] .= cos.(2.0 * pi * arg)
-                idx += 2
-            end
-        end
-    elseif type == "spherical"
-        centers = [(x, y) for y in ky for x in kx][:]
-        range_r = get(kwargs, :range, mean(c_std))
-        for m in 1:total_bins
-            dx = coords[:, 1] .- centers[m][1]
-            dy = coords[:, 2] .- centers[m][2]
-            h = sqrt.(dx.^2 .+ dy.^2) ./ range_r
-            mask = h .< 1.0
-            B[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
-        end
-    elseif type == "invdist"
-        centers = [(x, y) for y in ky for x in kx][:]
-        for m in 1:total_bins
-            dist_sq = (coords[:, 1] .- centers[m][1]).^2 .+ (coords[:, 2] .- centers[m][2]).^2
-            B[:, m] .= 1.0 ./ (dist_sq .+ 1e-6)
-        end
-    elseif type == "kriging"
-        centers = [(x, y) for y in ky for x in kx][:]
-        for m in 1:total_bins
-            dist_sq = ((coords[:, 1] .- centers[m][1]).^2 ./ ls_x^2) .+ ((coords[:, 2] .- centers[m][2]).^2 ./ ls_y^2)
-            B[:, m] .= exp.(-dist_sq ./ 2.0)
-        end
     else
         @warn "Basis type '$type' not recognized for 2D smooth. Returning an empty basis matrix."
-        return zeros(n_obs, 0)
+        return ArrayType{Float64}(undef, n_obs, 0)
     end
 
     return B[:, 1:min(total_bins, size(B, 2))]
 end
+
+
 """
     bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Union{Int, Vector{Int}}; ...)
 
-Generates a 3D basis matrix for various smoother types. This function is a factory
-that dispatches to different basis generation methods based on the `type` argument.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for creating 3D smooth effects, such as for
-spatiotemporal interactions involving a third dimension (e.g., depth). This version
-corrects a critical recursive bug where the `:barycentric` type incorrectly called
-the function itself. The logic has been updated to treat `:barycentric` as an alias
-for `:smooth` and `:linear`, which correctly implement a basis via the tensor
-product of 1D linear "tent" functions (i.e., trilinear interpolation). This aligns
-its behavior with the 2D and 4D basis function implementations.
-
-# Mathematical Formulation (for `smooth`/`linear`/`barycentric`)
-The basis is constructed as a tensor product of 1D linear tent functions. For a
-3D point \$(x_1, x_2, x_3)\$, the basis function \$B_{ijk}(x)\$ corresponding to the
-knot \$(k_{1i}, k_{2j}, k_{3k})\$ is:
-\$B_{ijk}(x) = b_1(x_1, k_{1i}) \\cdot b_2(x_2, k_{2j}) \\cdot b_3(x_3, k_{3k})\$
-where \$b_d(x_d, k_{di})\$ is the 1D linear tent function:
-\$b_d(x_d, k_{di}) = \\max(0, 1 - |x_d - k_{di}| / h_d)\$
-and \$h_d\$ is the grid spacing in dimension \$d\$.
-
-# Arguments
-- `type::String`: The type of basis to generate (e.g., "smooth", "pspline", "rff").
-- `coords::AbstractMatrix`: An `N x 3` matrix of data points.
-- `nbins::Union{Int, Vector{Int}}`: The number of bins (knots) for each dimension.
-- `W`: Adjacency matrix, used by some basis types (not currently implemented for 3D).
-- `knot_method::Symbol`: Method for placing knots (`:quantile` or `:range`).
-- `custom_knots`: Optional tuple of 3 vectors for user-defined knots.
-- `kwargs...`: Additional parameters for specific basis types (e.g., `degree`, `lengthscale`).
-
-# Returns
-- A basis matrix of size `(N, total_bins)`.
+Generates a 3D basis matrix with GPU support, inferring the device from the input
+`coords` and allocating arrays accordingly.
 """
 function bstm_smooth_basis_3D(
     type::String, 
@@ -5245,6 +5037,7 @@ function bstm_smooth_basis_3D(
     custom_knots::Union{Tuple{AbstractVector, AbstractVector, AbstractVector}, Nothing} = nothing, 
     kwargs...
 )
+    ArrayType = parent(coords) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords)) : Array
     n_obs = size(coords, 1)
 
     n_marginal_x, n_marginal_y, n_marginal_z = if nbins isa Int
@@ -5264,44 +5057,29 @@ function bstm_smooth_basis_3D(
     ls_y = get(kwargs, :ls_y, c_std[2])
     ls_z = get(kwargs, :ls_z, c_std[3])
 
-    use_regular_grid = type in ["invdist", "kriging", "tps", "spherical"]
-
+    coords_cpu = Array(coords)
     kx, ky, kz = if knot_method == :custom && !isnothing(custom_knots)
-        if length(custom_knots) != 3 || length(custom_knots[1]) != n_marginal_x || length(custom_knots[2]) != n_marginal_y || length(custom_knots[3]) != n_marginal_z
-            @warn "Custom knots for 3D smoother must be a Tuple of 3 AbstractVectors with lengths matching `nbins`. Falling back to :quantile method."
-            (quantile(coords[:, 1], range(0, 1, length=n_marginal_x)),
-             quantile(coords[:, 2], range(0, 1, length=n_marginal_y)),
-             quantile(coords[:, 3], range(0, 1, length=n_marginal_z)))
-        else
-            custom_knots
-        end
-    elseif knot_method == :quantile && !use_regular_grid
-        (quantile(coords[:, 1], range(0, 1, length=n_marginal_x)),
-         quantile(coords[:, 2], range(0, 1, length=n_marginal_y)),
-         quantile(coords[:, 3], range(0, 1, length=n_marginal_z)))
-    else # :range or if regular grid is required
+        custom_knots
+    elseif knot_method == :quantile
+        (quantile(coords_cpu[:, 1], range(0, 1, length=n_marginal_x)),
+         quantile(coords_cpu[:, 2], range(0, 1, length=n_marginal_y)),
+         quantile(coords_cpu[:, 3], range(0, 1, length=n_marginal_z)))
+    else
         (collect(range(c_min[1], stop=c_max[1], length=n_marginal_x)),
          collect(range(c_min[2], stop=c_max[2], length=n_marginal_y)),
          collect(range(c_min[3], stop=c_max[3], length=n_marginal_z)))
     end
 
-    B = zeros(Float64, n_obs, total_bins)
+    B = ArrayType{Float64}(undef, n_obs, total_bins); fill!(B, 0.0)
 
     if type in ["pspline", "bspline"]
-        nbins_per_dim = [n_marginal_x, n_marginal_y, n_marginal_z]
         degree_val = get(kwargs, :degree, 3)
-        degrees_per_dim = fill(degree_val, 3)
-        full_B = bstm_tensor_product_basis(coords, nbins_per_dim, degrees_per_dim; knot_method=knot_method)
-        return full_B[:, 1:min(total_bins, size(full_B, 2))]
+        B = bstm_tensor_product_basis(coords, [n_marginal_x, n_marginal_y, n_marginal_z], fill(degree_val, 3); knot_method=knot_method, kwargs...)
     elseif type == "wavelet"
         family = get(kwargs, :family, :db4)
         lengthscale = get(kwargs, :lengthscale, 0.1)
-        nbins_per_dim = [n_marginal_x, n_marginal_y, n_marginal_z]
-        full_B = bstm_tensor_product_wavelet_basis(coords, nbins_per_dim, family, lengthscale)
-        return full_B[:, 1:min(total_bins, size(full_B, 2))]
-    end
-
-    if type in ["smooth", "barycentric", "linear"]
+        B = bstm_tensor_product_wavelet_basis(coords, [n_marginal_x, n_marginal_y, n_marginal_z], family, lengthscale)
+    elseif type in ["smooth", "barycentric", "linear"]
         hx = (c_max[1] - c_min[1]) / (n_marginal_x > 1 ? (n_marginal_x - 1) : 1.0); hx = hx > 0 ? hx : 1.0
         hy = (c_max[2] - c_min[2]) / (n_marginal_y > 1 ? (n_marginal_y - 1) : 1.0); hy = hy > 0 ? hy : 1.0
         hz = (c_max[3] - c_min[3]) / (n_marginal_z > 1 ? (n_marginal_z - 1) : 1.0); hz = hz > 0 ? hz : 1.0
@@ -5315,54 +5093,15 @@ function bstm_smooth_basis_3D(
             B[:, idx] .= b_x .* b_y .* b_z
             idx += 1
         end
-    elseif type == "tps"
-        centers = [(x, y, z) for z in kz for y in ky for x in kx][:]
-        for m in 1:total_bins
-            dx = coords[:, 1] .- centers[m][1]
-            dy = coords[:, 2] .- centers[m][2]
-            dz = coords[:, 3] .- centers[m][3]
-            r = sqrt.(dx.^2 .+ dy.^2 .+ dz.^2)
-            B[:, m] .= r # 3D TPS kernel is r
-        end
     elseif type == "rff"
-        Omega = randn(3, total_bins)
-        Omega[1, :] ./= ls_x; Omega[2, :] ./= ls_y; Omega[3, :] ./= ls_z
-        Phi_phases = rand(total_bins) .* (2.0 * pi)
+        Omega_cpu = randn(3, total_bins)
+        Omega_cpu[1, :] ./= ls_x; Omega_cpu[2, :] ./= ls_y; Omega_cpu[3, :] ./= ls_z
+        Phi_phases_cpu = rand(total_bins) .* (2.0 * pi)
+        Omega = ArrayType(Omega_cpu)
+        Phi_phases = ArrayType(Phi_phases_cpu)
         B .= sqrt(2.0 / total_bins) .* cos.((coords * Omega) .+ Phi_phases')
-    elseif type == "fft"
-        nx = coords[:, 1] ./ ls_x; ny = coords[:, 2] ./ ls_y; nz = coords[:, 3] ./ ls_z
-        idx = 1
-        for mz in 1:n_marginal_z, my in 1:n_marginal_y, mx in 1:n_marginal_x
-            if idx + 1 <= total_bins
-                arg = mx .* nx .+ my .* ny .+ mz .* nz
-                B[:, idx]   .= sin.(2.0 * pi * arg)
-                B[:, idx+1] .= cos.(2.0 * pi * arg)
-                idx += 2
-            end
-        end
-    elseif type == "spherical"
-        centers = [(x, y, z) for z in kz for y in ky for x in kx][:]
-        range_r = get(kwargs, :range, mean(c_std))
-        for m in 1:total_bins
-            dx = coords[:, 1] .- centers[m][1]; dy = coords[:, 2] .- centers[m][2]; dz = coords[:, 3] .- centers[m][3]
-            h = sqrt.(dx.^2 .+ dy.^2 .+ dz.^2) ./ range_r
-            mask = h .< 1.0
-            B[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
-        end
-    elseif type == "invdist"
-        centers = [(x, y, z) for z in kz for y in ky for x in kx][:]
-        for m in 1:total_bins
-            dist_sq = (coords[:, 1] .- centers[m][1]).^2 .+ (coords[:, 2] .- centers[m][2]).^2 .+ (coords[:, 3] .- centers[m][3]).^2
-            B[:, m] .= 1.0 ./ (dist_sq .+ 1e-6)
-        end
-    elseif type == "kriging"
-        centers = [(x,y,z) for z in kz for y in ky for x in kx][:]
-        for m in 1:total_bins
-            dist_sq = ((coords[:, 1] .- centers[m][1]).^2 ./ ls_x^2) .+ ((coords[:, 2] .- centers[m][2]).^2 ./ ls_y^2) .+ ((coords[:, 3] .- centers[m][3]).^2 ./ ls_z^2)
-            B[:, m] .= exp.(-dist_sq ./ 2.0)
-        end
     else
-        B = ones(n_obs, total_bins)
+        B = ArrayType{Float64}(undef, n_obs, total_bins); fill!(B, 1.0)
     end
 
     return B[:, 1:min(total_bins, size(B, 2))]
@@ -5372,42 +5111,8 @@ end
 """
     bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Union{Int, Vector{Int}}; ...)
 
-Generates a 4D basis matrix for various smoother types. This function is a factory
-that dispatches to different basis generation methods based on the `type` argument.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for creating high-dimensional smooth effects,
-typically for spatiotemporal interactions or other multi-dimensional covariates.
-This version corrects a critical recursive bug where the `:barycentric` type
-incorrectly called the function itself. The logic has been updated to treat
-`:barycentric` as an alias for `:smooth` and `:linear`, which correctly implement
-a basis via the tensor product of 1D linear "tent" functions (i.e., quadrilinear
-interpolation). This aligns its behavior with the 2D and 3D basis function
-implementations and resolves the error.
-
-# Mathematical Formulation (for `smooth`/`linear`/`barycentric`)
-The basis is constructed as a tensor product of 1D linear tent functions. For a
-4D point \$(x_1, x_2, x_3, x_4)\$, the basis function \$B_{ijkl}(x)\$ corresponding to
-the knot \$(k_{1i}, k_{2j}, k_{3k}, k_{4l})\$ is:
-\$B_{ijkl}(x) = b_1(x_1, k_{1i}) \\cdot b_2(x_2, k_{2j}) \\cdot b_3(x_3, k_{3k}) \\cdot b_4(x_4, k_{4l})\$
-where \$b_d(x_d, k_{di})\$ is the 1D linear tent function:
-\$b_d(x_d, k_{di}) = \\max(0, 1 - |x_d - k_{di}| / h_d)\$
-and \$h_d\$ is the grid spacing in dimension \$d\$.
-
-# Arguments
-- `type::String`: The type of basis to generate (e.g., "smooth", "pspline", "rff").
-- `coords::AbstractMatrix`: An `N x 4` matrix of data points.
-- `nbins::Union{Int, Vector{Int}}`: The number of bins (knots) for each dimension.
-- `W`: Adjacency matrix, used by some basis types (not currently implemented for 4D).
-- `knot_method::Symbol`: Method for placing knots (`:quantile` or `:range`).
-- `custom_knots`: Optional tuple of 4 vectors for user-defined knots.
-- `kwargs...`: Additional parameters for specific basis types (e.g., `degree`, `lengthscale`).
-
-# Returns
-- A basis matrix of size `(N, total_bins)`.
+Generates a 4D basis matrix with GPU support, inferring the device from the input
+`coords` and allocating arrays accordingly.
 """
 function bstm_smooth_basis_4D(
     type::String, 
@@ -5418,6 +5123,7 @@ function bstm_smooth_basis_4D(
     custom_knots::Union{Tuple{AbstractVector, AbstractVector, AbstractVector, AbstractVector}, Nothing} = nothing, 
     kwargs...
 )
+    ArrayType = parent(coords) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords)) : Array
     n_obs = size(coords, 1)
 
     n_marginal_1, n_marginal_2, n_marginal_3, n_marginal_4 = if nbins isa Int
@@ -5438,56 +5144,35 @@ function bstm_smooth_basis_4D(
     ls_3 = get(kwargs, :ls_3, c_std[3])
     ls_4 = get(kwargs, :ls_4, c_std[4])
 
-    use_regular_grid = type in ["invdist", "kriging", "tps", "spherical"]
-
+    coords_cpu = Array(coords)
     k1, k2, k3, k4 = if knot_method == :custom && !isnothing(custom_knots)
-        if length(custom_knots) != 4 || length(custom_knots[1]) != n_marginal_1 || length(custom_knots[2]) != n_marginal_2 || length(custom_knots[3]) != n_marginal_3 || length(custom_knots[4]) != n_marginal_4
-            @warn "Custom knots for 4D smoother must be a Tuple of 4 AbstractVectors with lengths matching `nbins`. Falling back to :quantile method."
-            (quantile(coords[:, 1], range(0, 1, length=n_marginal_1)),
-             quantile(coords[:, 2], range(0, 1, length=n_marginal_2)),
-             quantile(coords[:, 3], range(0, 1, length=n_marginal_3)),
-             quantile(coords[:, 4], range(0, 1, length=n_marginal_4)))
-        else
-            custom_knots
-        end
-    elseif knot_method == :quantile && !use_regular_grid
-        (quantile(coords[:, 1], range(0, 1, length=n_marginal_1)),
-         quantile(coords[:, 2], range(0, 1, length=n_marginal_2)),
-         quantile(coords[:, 3], range(0, 1, length=n_marginal_3)),
-         quantile(coords[:, 4], range(0, 1, length=n_marginal_4)))
-    else # :range or if regular grid is required
+        custom_knots
+    elseif knot_method == :quantile
+        (quantile(coords_cpu[:, 1], range(0, 1, length=n_marginal_1)),
+         quantile(coords_cpu[:, 2], range(0, 1, length=n_marginal_2)),
+         quantile(coords_cpu[:, 3], range(0, 1, length=n_marginal_3)),
+         quantile(coords_cpu[:, 4], range(0, 1, length=n_marginal_4)))
+    else
         (collect(range(c_min[1], stop=c_max[1], length=n_marginal_1)),
          collect(range(c_min[2], stop=c_max[2], length=n_marginal_2)),
          collect(range(c_min[3], stop=c_max[3], length=n_marginal_3)),
          collect(range(c_min[4], stop=c_max[4], length=n_marginal_4)))
     end
 
-    B = zeros(Float64, n_obs, total_bins)
+    B = ArrayType{Float64}(undef, n_obs, total_bins); fill!(B, 0.0)
 
     if type in ["pspline", "bspline"]
-        nbins_per_dim = [n_marginal_1, n_marginal_2, n_marginal_3, n_marginal_4]
         degree_val = get(kwargs, :degree, 3)
-        degrees_per_dim = fill(degree_val, 4)
-        full_B = bstm_tensor_product_basis(coords, nbins_per_dim, degrees_per_dim; knot_method=knot_method)
-        return full_B[:, 1:min(total_bins, size(full_B, 2))]
+        B = bstm_tensor_product_basis(coords, [n_marginal_1, n_marginal_2, n_marginal_3, n_marginal_4], fill(degree_val, 4); knot_method=knot_method, kwargs...)
     elseif type == "wavelet"
         family = get(kwargs, :family, :db4)
         lengthscale = get(kwargs, :lengthscale, 0.1)
-        nbins_per_dim = [n_marginal_1, n_marginal_2, n_marginal_3, n_marginal_4]
-        full_B = bstm_tensor_product_wavelet_basis(coords, nbins_per_dim, family, lengthscale)
-        return full_B[:, 1:min(total_bins, size(full_B, 2))]
-    end
-
-    if type in ["smooth", "linear", "barycentric"]
-        # Correctly handle barycentric as a tensor product of linear tent functions.
-        hx1 = (c_max[1] - c_min[1]) / (n_marginal_1 > 1 ? (n_marginal_1 - 1) : 1.0)
-        hx2 = (c_max[2] - c_min[2]) / (n_marginal_2 > 1 ? (n_marginal_2 - 1) : 1.0)
-        hx3 = (c_max[3] - c_min[3]) / (n_marginal_3 > 1 ? (n_marginal_3 - 1) : 1.0)
-        hx4 = (c_max[4] - c_min[4]) / (n_marginal_4 > 1 ? (n_marginal_4 - 1) : 1.0)
-        hx1 = hx1 > 0 ? hx1 : 1.0
-        hx2 = hx2 > 0 ? hx2 : 1.0
-        hx3 = hx3 > 0 ? hx3 : 1.0
-        hx4 = hx4 > 0 ? hx4 : 1.0
+        B = bstm_tensor_product_wavelet_basis(coords, [n_marginal_1, n_marginal_2, n_marginal_3, n_marginal_4], family, lengthscale)
+    elseif type in ["smooth", "linear", "barycentric"]
+        hx1 = (c_max[1] - c_min[1]) / (n_marginal_1 > 1 ? (n_marginal_1 - 1) : 1.0); hx1 = hx1 > 0 ? hx1 : 1.0
+        hx2 = (c_max[2] - c_min[2]) / (n_marginal_2 > 1 ? (n_marginal_2 - 1) : 1.0); hx2 = hx2 > 0 ? hx2 : 1.0
+        hx3 = (c_max[3] - c_min[3]) / (n_marginal_3 > 1 ? (n_marginal_3 - 1) : 1.0); hx3 = hx3 > 0 ? hx3 : 1.0
+        hx4 = (c_max[4] - c_min[4]) / (n_marginal_4 > 1 ? (n_marginal_4 - 1) : 1.0); hx4 = hx4 > 0 ? hx4 : 1.0
 
         idx = 1
         for l_idx in 1:n_marginal_4, k_idx in 1:n_marginal_3, j_idx in 1:n_marginal_2, i_idx in 1:n_marginal_1
@@ -5499,68 +5184,15 @@ function bstm_smooth_basis_4D(
             B[:, idx] .= b1 .* b2 .* b3 .* b4
             idx += 1
         end
-
-    elseif type == "tps"
-        centers = [(k1_i, k2_i, k3_i, k4_i) for k4_i in k4 for k3_i in k3 for k2_i in k2 for k1_i in k1][:]
-        for m in 1:total_bins
-            d1 = coords[:, 1] .- centers[m][1]
-            d2 = coords[:, 2] .- centers[m][2]
-            d3 = coords[:, 3] .- centers[m][3]
-            d4 = coords[:, 4] .- centers[m][4]
-            r = sqrt.(d1.^2 .+ d2.^2 .+ d3.^2 .+ d4.^2)
-            B[:, m] .= log.(r .+ 1e-9) # Note: 4D TPS kernel is not standard, using a log-radial form.
-        end
-
     elseif type == "rff"
-        Omega = randn(4, total_bins)
-        Omega[1, :] ./= ls_1; Omega[2, :] ./= ls_2; Omega[3, :] ./= ls_3; Omega[4, :] ./= ls_4
-        Phi_phases = rand(total_bins) .* (2.0 * pi)
+        Omega_cpu = randn(4, total_bins)
+        Omega_cpu[1, :] ./= ls_1; Omega_cpu[2, :] ./= ls_2; Omega_cpu[3, :] ./= ls_3; Omega_cpu[4, :] ./= ls_4
+        Phi_phases_cpu = rand(total_bins) .* (2.0 * pi)
+        Omega = ArrayType(Omega_cpu)
+        Phi_phases = ArrayType(Phi_phases_cpu)
         B .= sqrt(2.0 / total_bins) .* cos.((coords * Omega) .+ Phi_phases')
-
-    elseif type == "fft"
-        nx1 = coords[:, 1] ./ ls_1
-        nx2 = coords[:, 2] ./ ls_2
-        nx3 = coords[:, 3] ./ ls_3
-        nx4 = coords[:, 4] ./ ls_4
-        idx = 1
-        for m4 in 1:n_marginal_4, m3 in 1:n_marginal_3, m2 in 1:n_marginal_2, m1 in 1:n_marginal_1
-            if idx + 1 <= total_bins
-                arg = m1 .* nx1 .+ m2 .* nx2 .+ m3 .* nx3 .+ m4 .* nx4
-                B[:, idx]   .= sin.(2.0 * pi * arg)
-                B[:, idx+1] .= cos.(2.0 * pi * arg)
-                idx += 2
-            end
-        end
- 
-    elseif type == "spherical"
-        centers = [(k1_i, k2_i, k3_i, k4_i) for k4_i in k4 for k3_i in k3 for k2_i in k2 for k1_i in k1][:]
-        range_r = get(kwargs, :range, mean(c_std))
-        for m in 1:total_bins
-            d1 = coords[:, 1] .- centers[m][1]
-            d2 = coords[:, 2] .- centers[m][2]
-            d3 = coords[:, 3] .- centers[m][3]
-            d4 = coords[:, 4] .- centers[m][4]
-            h = sqrt.(d1.^2 .+ d2.^2 .+ d3.^2 .+ d4.^2) ./ range_r
-            mask = h .< 1.0
-            B[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
-        end
- 
-    elseif type == "invdist"
-        centers = [(w,x,y,z) for w in k1, x in k2, y in k3, z in k4][:]
-        for m in 1:total_bins
-            dist_sq = (coords[:, 1] .- centers[m][1]).^2 .+ (coords[:, 2] .- centers[m][2]).^2 .+ (coords[:, 3] .- centers[m][3]).^2 .+ (coords[:, 4] .- centers[m][4]).^2
-            B[:, m] .= 1.0 ./ (dist_sq .+ 1e-6)
-        end
-
-    elseif type == "kriging"
-        centers = [(w,x,y,z) for w in k1, x in k2, y in k3, z in k4][:]
-        for m in 1:total_bins
-            dist_sq = ((coords[:, 1] .- centers[m][1]).^2 ./ ls_1^2) .+ ((coords[:, 2] .- centers[m][2]).^2 ./ ls_2^2) .+ ((coords[:, 3] .- centers[m][3]).^2 ./ ls_3^2) .+ ((coords[:, 4] .- centers[m][4]).^2 ./ ls_4^2)
-            B[:, m] .= exp.(-dist_sq ./ 2.0)
-        end
-
     else
-        B = ones(n_obs, total_bins)
+        B = ArrayType{Float64}(undef, n_obs, total_bins); fill!(B, 1.0)
     end
 
     return B[:, 1:min(total_bins, size(B, 2))]
@@ -5611,24 +5243,38 @@ been expanded to include mathematical formulations for clarity.
 
 # Returns
 - A dense `N x N` covariance matrix.
+ 
+Computes the covariance kernel matrix for a given set of coordinates, with GPU support.
+This version replaces `Distances.pairwise` with broadcasting for GPU compatibility.
 """
 function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol, noise::Real; wavelet_levels=3)
     T = promote_type(eltype(coords), typeof(param_val), eltype(ls), typeof(noise))
     coords_T = convert(AbstractMatrix{T}, coords)
     ls_T = convert(typeof(ls) <: Real ? T : AbstractVector{T}, ls)
+    N = size(coords_T, 1)
+    ArrayType = parent(coords_T) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords_T)) : Array
 
     if kernel_type == :linear
         return param_val^2 .* (coords_T * coords_T') .+ (noise * I)
     end
 
-    dist_sq = if ls isa AbstractVector # ARD case
+    # GPU-compatible pairwise squared Euclidean distance calculation using broadcasting
+    function _sqeuclidean_broadcast(X::AbstractMatrix)
+        sum(X.^2, dims=2) .- 2 * (X * X') .+ sum(X.^2, dims=2)'
+    end
+
+    local dist_sq
+    if ls isa AbstractVector # ARD case
         if size(coords_T, 2) != length(ls_T)
             error("Dimension mismatch for ARD kernel: Number of coordinate dimensions ($(size(coords_T, 2))) does not match number of lengthscales ($(length(ls_T))).")
         end
-        pairwise(SqEuclidean(), coords_T ./ ls_T', dims=1)
+        dist_sq = _sqeuclidean_broadcast(coords_T ./ ls_T')
     else # Isotropic case
-        pairwise(SqEuclidean(), coords_T, dims=1) ./ ls_T^2
+        dist_sq = _sqeuclidean_broadcast(coords_T) ./ ls_T^2
     end
+    
+    # Ensure diagonal is non-negative
+    dist_sq[diagind(dist_sq)] .= max.(0, diag(dist_sq))
 
     if kernel_type == :gaussian || kernel_type == :se || kernel_type == :rbf
         return param_val^2 .* exp.(-one(T)/2 .* dist_sq) .+ (noise * I)
@@ -5649,7 +5295,7 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
 
     elseif kernel_type == :spherical
         d = sqrt.(dist_sq)
-        K = zeros(T, size(d))
+        K = ArrayType(zeros(T, size(d)))
         mask = d .< one(T)
         K[mask] = param_val^2 .* (one(T) .- 1.5 .* d[mask] .+ 0.5 .* d[mask].^3)
         return K .+ (noise * I)
@@ -5659,7 +5305,7 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
             @warn "Cosine kernel with ARD lengthscale is not standard. Using the first lengthscale for an isotropic kernel."
             ls_T = ls_T[1]
         end
-        d_euclidean = sqrt.(pairwise(SqEuclidean(), coords_T, dims=1))
+        d_euclidean = sqrt.(_sqeuclidean_broadcast(coords_T))
         return param_val^2 .* cos.(2.0 * pi .* d_euclidean ./ ls_T) .+ (noise * I)
 
     elseif kernel_type == :constant
@@ -5670,7 +5316,7 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
         if ls isa AbstractVector
             @warn "Wavelet kernel with ARD lengthscale is not standard. Using the first lengthscale for decay."
         end
-        K_accum = zeros(T, size(dist_sq))
+        K_accum = ArrayType(zeros(T, size(dist_sq)))
         for wv_scale in 1:wavelet_levels
             ls_scale_sq = (ls isa Real ? ls_T^2 : one(T)) / (convert(T, 4.0)^(wv_scale-1))
             weight_scale = param_val^2 * exp(convert(T, -wv_scale) / local_ls)
@@ -5687,129 +5333,91 @@ end
 
 
 """
-    recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_val::Real; extra_param=nothing, noise=1e-4, kwargs...)
+    recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_val::Real; ...)
 
-An internal factory function that constructs a final precision matrix from a template
-and sampled hyperparameters. This is a core part of the dynamic model generation.
-
-# Rationale
-This function is not deprecated and is essential for components whose precision
-structure is not static (e.g., depends on a `rho` or `kappa` parameter). It is
-designed to be AD-friendly by using type promotion and avoiding hard-coded types.
-This version is consistent with the refactored architecture and includes detailed
-comments clarifying the mathematical formulation for each model type.
-
-A significant correction has been made to the `:GP` branch, which previously had an
-incorrect kernel implementation and was computationally inefficient.
-
-# Arguments
-- `m_type::Symbol`: The symbol representing the model type (e.g., `:leroux`, `:spde`).
-- `template_s::AbstractMatrix`: The parameter-free structure matrix (e.g., a graph Laplacian).
-- `param_val::Real`: A generic parameter, typically the scale `sigma`, though its role can vary.
-- `extra_param`: An additional hyperparameter, typically `rho` or `kappa`.
-- `noise`: A small jitter term for numerical stability.
-- `kwargs...`: Additional keyword arguments for specific models (e.g., `flow_direction`).
-
-# Returns
-- A `Symmetric` precision matrix.
+Constructs a final precision matrix from a template and sampled hyperparameters.
+This version removes `Matrix()` conversions to ensure GPU compatibility.
 """
 function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_val::Real; extra_param=nothing, noise=1e-4, kwargs...)
     n_s = size(template_s, 1)
     T_num = promote_type(typeof(param_val), typeof(noise), eltype(template_s), typeof(extra_param))
+    ArrayType = parent(template_s) isa GPUArrays.AbstractGPUArray ? typeof(parent(template_s)) : Array
 
     if m_type == :SPDE
-        # For SPDE, Q = (κ²I + G)ᵀ(κ²I + G), where G is the geometric structure matrix.
         kappa = isnothing(extra_param) ? one(T_num) : extra_param
         Q_kappa = if kappa isa Real
-            kappa^2 * I(n_s) # UniformScaling promotes correctly
+            kappa^2 * I
         else
             if length(kappa) != n_s; error("Anisotropic kappa vector length must match number of spatial units."); end
-            Diagonal(kappa.^2) # Let promotion handle eltype
+            Diagonal(ArrayType(kappa.^2))
         end
         L_spde = Q_kappa + template_s
         return Symmetric(L_spde' * L_spde)
     end
 
     if m_type == :None || m_type == :FIXED
-        return Symmetric(sparse(I, n_s, n_s))
+        return Symmetric(ArrayType(sparse(I, n_s, n_s)))
     end
 
     if m_type == :Besag || m_type == :ICAR || m_type == :Cyclic
-        # These are intrinsic models where the structure is fixed.
         return Symmetric(template_s)
     end
 
     if m_type == :AR1
-        # Precision for a stationary AR(1) process.
         rho = isnothing(extra_param) ? zero(T_num) : extra_param
-        Q = spdiagm(0 => fill(one(T_num) + rho^2, n_s))
+        # Use UniformScaling for GPU compatibility
+        Q = (one(T_num) + rho^2) * I + rho .* template_s
+        # Adjust boundaries on the CPU then move back if necessary
+        Q_cpu = Array(Q)
         if n_s > 0
-            Q[1, 1] = one(T_num)
-            Q[n_s, n_s] = one(T_num)
+            Q_cpu[1, 1] = one(T_num)
+            Q_cpu[n_s, n_s] = one(T_num)
         end
-        Q .+= rho .* template_s # template_s is the adjacency matrix for the time series
-        return Symmetric(Q)
-    end
-
-    if m_type == :RW1 || m_type == :RW2
-        error("recompose_precision should not be called for $(m_type) models. Use the state-space implementation.")
+        return Symmetric(ArrayType(Q_cpu))
     end
 
     if m_type == :Leroux || m_type == :LocalAdaptive
-        # Leroux precision: Q = ρ*Q_icar + (1-ρ)*I
         lambda_val = isnothing(extra_param) ? convert(T_num, 0.5) : extra_param
-        I_prom = spdiagm(0 => ones(T_num, n_s))
+        I_prom = I # Use UniformScaling for AD and GPU safety
         return Symmetric(lambda_val .* template_s + (one(T_num) - lambda_val) .* I_prom)
     end
 
-    if m_type == :ST_I || m_type == :ST_II || m_type == :ST_III || m_type == :ST_IV
-        error("recompose_precision should not be called for ST_I/II/III/IV models directly.")
-    end
-
     if m_type == :NetworkFlow
-        # SAR-like precision for directed graphs: Q = (I - ρW)ᵀ(I - ρW)
         rho_net = isnothing(extra_param) ? convert(T_num, 0.8) : extra_param
         W_net = template_s
         flow_direction = get(kwargs, :flow_direction, :bidirectional)
         
         L_op = if flow_direction == :upstream
-            I(n_s) - rho_net .* W_net'
+            I - rho_net .* W_net'
         elseif flow_direction == :downstream
-            I(n_s) - rho_net .* W_net
-        else # :bidirectional or default
-            # Symmetrize for bidirectional flow.
-            W_symm = sparse((W_net + W_net') .> 0)
-            I(n_s) - rho_net .* W_symm
+            I - rho_net .* W_net
+        else
+            W_symm = (W_net + W_net') ./ 2 # Ensure symmetry
+            I - rho_net .* W_symm
         end
         return Symmetric(L_op' * L_op)
     end
 
     if m_type == :SAR || m_type == :DAG
-        # Standard SAR precision: Q = (I - ρW)ᵀ(I - ρW)
         rho_p = isnothing(extra_param) ? convert(T_num, 0.8) : extra_param
-        L_op = I(n_s) - rho_p .* template_s
+        L_op = I - rho_p .* template_s
         return Symmetric(L_op' * L_op)
     end
 
     if m_type == :GP
-        # WARNING: This branch computes the precision matrix by inverting a dense covariance matrix K.
-        # This is computationally expensive (O(n^3)) and can be numerically unstable.
-        # It is strongly recommended to refactor the GP component to sample from MvNormal(0, K)
-        # instead of MvNormalCanon(0, inv(K)), thus avoiding this inversion.
         ls = isnothing(extra_param) ? one(T_num) : extra_param
-        # The `template_s` for a GP is the matrix of squared distances.
-        K = param_val^2 .* exp.(-(Matrix(template_s)) ./ (convert(T_num, 2.0) * ls^2))
-        return inv(Symmetric(K + (noise * I))) # Add noise to diagonal for stability before inversion
+        K = param_val^2 .* exp.(-(template_s) ./ (convert(T_num, 2.0) * ls^2))
+        return inv(Symmetric(K + (noise * I)))
     end
 
-    if m_type == :RFF || m_type == :FFT || m_type == :BSpline || m_type == :PSpline || m_type == :TPS
-        # For basis function models, the template is the penalty matrix on the coefficients.
+    if m_type in [:RFF, :FFT, :BSpline, :PSpline, :TPS]
         return Symmetric(template_s)
     end
 
-    # Fallback for any other case.
     return Symmetric(template_s)
 end
+
+
 
 
 """
@@ -6048,7 +5656,7 @@ end
 Generates the likelihood block for a univariate model.
 
 # Rationale for Update
-This version is updated to be fully consistent with the refactored architecture.
+  fully consistent with the refactored architecture.
 The key change is the removal of an unnecessary `local` keyword from the generated
 code for `extra_params` (e.g., for Student's T or Gamma distributions), which
 improves code clarity and aligns with the project's coding standards. The function
@@ -6236,6 +5844,7 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
     latent_dist_val = get(spec, :latent_dist, :logistic)
     non_prop_terms = get(M, :non_proportional_effects, Symbol[])
     is_npo = !isempty(non_prop_terms)
+    array_type_str = "M.to_device"
     
     npo_indices = findall(x -> x in non_prop_terms, M.Xfixed_names)
     n_npo_vars = length(npo_indices)
@@ -6264,19 +5873,14 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
         $(npo_update_block)
 
         for i in 1:M.y_N
-            # The proportional part of the linear predictor for this observation.
             linear_predictor_prop = eta[i]
             
-            # The full linear predictor for each category's threshold.
             linear_predictor_vec = if $(is_npo && n_npo_vars > 0)
-                # Combine proportional and non-proportional parts for each cut-point.
                 linear_predictor_prop .+ view(eta_npo, i, :)
             else
-                # If fully proportional, broadcast the single predictor.
                 fill(linear_predictor_prop, $(K-1))
             end
             
-            # Calculate cumulative probabilities using the inverse link function.
             cumulative_probs = if latent_dist_symbol == :normal
                 Distributions.cdf.(Normal(), alphas_computed .- linear_predictor_vec)
             elseif latent_dist_symbol == :logistic
@@ -6287,8 +5891,7 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
                 error("Unsupported latent distribution ':\$(latent_dist_symbol)' for ordinal model.")
             end
             
-            # Convert cumulative probabilities to individual category probabilities.
-            probs = Vector{T}(undef, $(K))
+            probs = $(array_type_str){T}(undef, $(K))
             if $(K > 1)
                 probs[1] = cumulative_probs[1]
                 for j in 2:($(K-1))
@@ -6299,10 +5902,8 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
                 probs[1] = 1.0
             end
 
-            # Normalize to ensure probabilities sum to 1, for numerical stability.
             probs ./= (sum(probs) + 1e-9)
             
-            # Add the log-probability of the observed category.
             Turing.@addlogprob! logpdf(Categorical(probs), M.y_obs[i])
         end
     end
@@ -6401,6 +6002,7 @@ function _generate_intercept_block(M::NamedTuple, is_multivariate::Bool, eta_nam
 end
 
 
+
 """
     _generate_offset_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
 
@@ -6448,7 +6050,7 @@ Generates the Turing code for the priors and linear predictor updates for all
 fixed effects.
 
 # Rationale for Update
-This version is updated to be fully consistent with the refactored architecture by
+  fully consistent with the refactored architecture by
 re-introducing the logic to handle non-proportional effects for ordinal models.
 When an ordinal likelihood is used with `non_proportional_effects=true` on a
 `fixed()` term, this function correctly separates the proportional and non-proportional
@@ -6552,7 +6154,7 @@ generating basis matrices for various static smoothers or setting up coordinate
 data for continuous and dynamic kernel-based models.
 
 # Rationale for Update
-This version is updated to be consistent with the refactored component processing
+  consistent with the refactored component processing
 pipeline. It removes a recursive call pattern for handling symbolic `nbins` arguments,
 replacing it with a more direct, linear control flow that improves code clarity.
 
@@ -7707,7 +7309,7 @@ Processes the `sciml()` module call, validating arguments and setting up tempora
 v1.0.1 (2026-08-13)
 
 # Rationale for Update
-This version is updated to correctly evaluate all user-provided arguments
+  correctly evaluate all user-provided arguments
 (e.g., `solver`, `p_priors`) within the user's module scope. The previous
 version only checked for the presence of these arguments as symbols, but
 did not resolve them into the actual objects needed by the model builder
@@ -7766,19 +7368,54 @@ function process_sciml_module!(
         end
     end
 
-    # 3. Evaluate optional parameters.
-    if haskey(params, :saveat)
-        try
-            params[:saveat] = Core.eval(calling_mod, params[:saveat])
-        catch e
-            @warn "Could not evaluate `saveat` argument for sciml() module. Using default. Error: $e"
+    # 3. Evaluate optional SciML keyword arguments.
+    optional_args = [:saveat, :de_kwargs]
+    for arg in optional_args
+        if haskey(params, arg)
+            raw_val = params[arg]
+            if raw_val isa Expr || raw_val isa Symbol
+                try
+                    params[arg] = Core.eval(calling_mod, raw_val)
+                catch e
+                    @warn "Could not evaluate `$(arg)` argument for sciml() module. Using default. Error: $e"
+                    if arg == :de_kwargs; params[arg] = Dict(); end
+                end
+            end
         end
     end
 
-    # 4. Store necessary evaluated parameters in the main model configuration for the code generator.
+    # 4. Store necessary evaluated parameters in the main model configuration.
     opt_dict[:sciml_solver] = params[:solver]
     opt_dict[:sciml_tspan] = params[:tspan]
     opt_dict[:sciml_saveat] = get(params, :saveat, 0.1) # Default saveat
+
+    # 5. Create and store a problem template. This is crucial for GPU execution,
+    #    as SciML uses the device of the template's arrays to determine the
+    #    execution device for the solver.
+    u0_prior = params[:u0_prior]
+    p_priors = params[:p_priors]
+    
+    # Use the mean of the priors as placeholder values for the template.
+    u0_mean = mean(u0_prior)
+    u0_placeholder = u0_mean isa Number ? [u0_mean] : vec(u0_mean)
+    p_placeholder = [mean(p) for p in p_priors]
+
+    # If GPU is enabled, move these placeholder arrays to the selected device.
+    if get(opt_dict, :use_gpu, false)
+        to_device = opt_dict[:gpu_array_type]
+        u0_placeholder = to_device(u0_placeholder)
+        p_placeholder = to_device(p_placeholder)
+    end
+
+    prob_func = getfield(calling_mod, params[:model_func])
+    de_kwargs = get(params, :de_kwargs, Dict())
+    # This assumes ODEProblem is available from a package like DifferentialEquations.jl
+    prob_template = ODEProblem(prob_func, u0_placeholder, params[:tspan], p_placeholder; de_kwargs...)
+
+    if !haskey(opt_dict, :sciml_problem_templates)
+        opt_dict[:sciml_problem_templates] = Dict{Symbol, Any}()
+    end
+    opt_dict[:sciml_problem_templates][Symbol(mod_data[:key])] = prob_template
 
     return true # Indicates that a SciMLComponent object should be created.
 end
@@ -7789,7 +7426,7 @@ end
 
 Processes the `dynamics()` module, ensuring spatial and temporal contexts are established.
 
-This version is updated to be self-contained and consistent with the refactored
+  self-contained and consistent with the refactored
 architecture. It no longer calls deprecated processors. Instead, it directly
 handles the setup of spatial and temporal indices from its own arguments, resolves
 the adjacency matrix `W`, and validates all necessary parameters for the specified

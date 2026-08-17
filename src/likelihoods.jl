@@ -34,7 +34,7 @@ Base.size(d::bstm_Likelihood) = (length(d.param),)
 
 function get_model_family(model_family::String)
     # Purpose: Maps a string identifier to its corresponding concrete `AbstractBSTM_Family` type.
-    # Rationale: This version is updated to be more robust to parsing artifacts. It now strips
+    # Rationale:   more robust to parsing artifacts. It now strips
     #            leading/trailing whitespace (including newlines) from the input string before
     #            looking it up in the registry. This resolves an error where a family name like
     #            "binomial \n" would cause a lookup failure.
@@ -108,7 +108,7 @@ end
 
 # Version 1.5.2 (2026-08-06)
 # Purpose: Creates a DirichletMultinomial distribution instance.
-# Rationale: This version is updated to use `d.trial` to get the total number of trials,
+# Rationale:   use `d.trial` to get the total number of trials,
 #            making it consistent with the Binomial family and decoupling it from the
 #            observation data `y_obs`, which is no longer stored in the distribution object.
 function get_dist_ref(::DirichletMultinomialFamily, d, eta_vec, sig)
@@ -138,7 +138,7 @@ end
 
 # Version 1.5.2 (2026-08-06)
 # Purpose: Constructor for bstm_Likelihood.
-# Rationale: This version is updated to accept the linear predictor parameter `param`
+# Rationale:   accept the linear predictor parameter `param`
 #            instead of the observation `y_obs`. This aligns the constructor with the
 #            refactored struct definition and the correct `logpdf` evaluation flow.
 function bstm_Likelihood(family_input::Union{String, Symbol}, param;

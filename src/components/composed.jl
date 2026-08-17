@@ -345,25 +345,34 @@ function get_updates(
 end
 
 function get_effects(
-    m::Composed, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::Composed, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+    noise = M.noise
     child_specs = spec.hyper.child_specs
-    structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
 
+    # --- Operator-Specific Reconstruction ---
     if m.operator == :pipe # Spatially varying curve
+        structured_effects = Vector{Matrix{Float64}}()
         dynamic_spec = child_specs[1]
         state_spec = child_specs[2]
         
+        # Handle basis matrix for training and prediction sets
         B_dynamic_train = dynamic_spec.hyper.basis_matrix
         B_dynamic_full = if !isnothing(PS)
             coord_vars = get(dynamic_spec.params, :positional_args, [])
             if !isempty(coord_vars) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-                coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+                coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+                coords_pred_device = to_device(coords_pred_cpu)
                 dynamic_comp_obj = dynamic_spec.component_obj
                 B_pred, _ = bstm_bspline_basis(
-                    coords_pred[:, 1], dynamic_comp_obj.nbins, dynamic_comp_obj.degree
+                    coords_pred_device[:, 1], dynamic_comp_obj.nbins, dynamic_comp_obj.degree
                 )
                 vcat(B_dynamic_train, B_pred)
             else
@@ -372,154 +381,134 @@ function get_effects(
         else
             B_dynamic_train
         end
+        N_total = size(B_dynamic_full, 1)
         
         n_spatial = state_spec.hyper.n_latent
         n_basis = dynamic_spec.hyper.n_latent
-        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
+        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, to_device(get(PS.data, :s_idx, [])))
 
         for k in 1:outcomes_N
             p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-            innov_name = _find_parameter(
-                p_names, string(p_names_k.innovations), k, is_multivariate_model
-            )
+            innov_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
             if isempty(innov_name)
                 @warn "Innovations for Composed component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            innov_samples = get_params_matrix(
-                chain, innov_name, n_spatial * n_basis
-            )
+            innov_samples_cpu = get_params_matrix(chain, innov_name, n_spatial * n_basis)
             
             state_p_names = generate_full_variable_names(state_spec, M.model_arch, k)
             state_model_type = Symbol(lowercase(string(typeof(state_spec.component_obj))))
             Q_spatial_template = state_spec.hyper.Q_template
             
-            effect_k = zeros(Float64, N_total, n_samples)
+            effect_k_device = to_device(zeros(Float64, N_total, n_samples))
 
             for i in 1:n_samples
                 rho_val = hasproperty(state_spec.component_obj, :rho) ?
                           get_params_vector(chain, string(state_p_names.rho), 1)[i, 1] :
                           nothing
-                Q_spatial = recompose_precision(
-                    state_model_type, Q_spatial_template, 1.0; extra_param=rho_val
-                )
-                F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I))
+                Q_spatial = recompose_precision(state_model_type, Q_spatial_template, 1.0; extra_param=rho_val)
+                F_spatial = cholesky(Symmetric(Q_spatial + M.noise * I))
                 
-                coeffs_raw_matrix = reshape(innov_samples[i, :], n_spatial, n_basis)
-                spatial_coeffs = F_spatial.L' \ coeffs_raw_matrix
+                coeffs_raw_matrix_device = to_device(reshape(innov_samples_cpu[i, :], n_spatial, n_basis))
+                spatial_coeffs = F_spatial.L' \ coeffs_raw_matrix_device
                 
-                effect_k[:, i] = sum(B_dynamic_full .* spatial_coeffs[s_idx_full, :], dims=2)
+                effect_k_device[:, i] = sum(B_dynamic_full .* spatial_coeffs[s_idx_full, :], dims=2)
             end
-            structured_effects[k] = effect_k
+            push!(structured_effects, Array(effect_k_device))
         end
         return (structured=structured_effects, noisy=structured_effects)
 
     elseif m.operator == :kronecker_product
+        structured_effects = Vector{Matrix{Float64}}()
         s_spec = child_specs[1]
         t_spec = child_specs[2]
         s_N = s_spec.hyper.n_latent
         t_N = t_spec.hyper.n_latent
-        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
-        t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, []))
+        
+        s_idx_full = isnothing(PS) ? M.s_idx : vcat(M.s_idx, to_device(get(PS.data, :s_idx, [])))
+        t_idx_full = isnothing(PS) ? M.t_idx : vcat(M.t_idx, to_device(get(PS.data, :t_idx, [])))
         st_idx_full = (t_idx_full .- 1) .* s_N .+ s_idx_full
+        N_total = length(st_idx_full)
 
         for k in 1:outcomes_N
             p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-            sigma_name = _find_parameter(
-                p_names, string(p_names_k.sigma), k, is_multivariate_model
-            )
-            innov_name = _find_parameter(
-                p_names, string(p_names_k.innovations), k, is_multivariate_model
-            )
+            sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+            innov_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
             if isempty(sigma_name) || isempty(innov_name)
-                @warn "Parameters for Kronecker product component $(spec.key) " *
-                      "(outcome $k) not found. Returning zero-matrix."
+                @warn "Parameters for Kronecker product component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innov_samples = get_params_matrix(chain, innov_name, s_N * t_N)
+            sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+            innov_samples_cpu = get_params_matrix(chain, innov_name, s_N * t_N)
 
-            effect_k = zeros(Float64, N_total, n_samples)
+            effect_k_device = to_device(zeros(Float64, N_total, n_samples))
 
             for i in 1:n_samples
-                local st_field
+                local st_field_device
                 if m.method == :spectral
                     s_hyper = s_spec.hyper; t_hyper = t_spec.hyper
                     s_p_names = generate_full_variable_names(s_spec, M.model_arch, k)
                     t_p_names = generate_full_variable_names(t_spec, M.model_arch, k)
-                    s_rho_val = hasproperty(s_spec.component_obj, :rho) ? 
-                                get_params_vector(chain, string(s_p_names.rho), 1)[i, 1] : 
-                                nothing
-                    t_rho_val = hasproperty(t_spec.component_obj, :rho) ? 
-                                get_params_vector(chain, string(t_p_names.rho), 1)[i, 1] : 
-                                nothing
+                    s_rho_val = hasproperty(s_spec.component_obj, :rho) ? get_params_vector(chain, string(s_p_names.rho), 1)[i, 1] : nothing
+                    t_rho_val = hasproperty(t_spec.component_obj, :rho) ? get_params_vector(chain, string(t_p_names.rho), 1)[i, 1] : nothing
                     
                     diag_Ls = (1.0 .- s_rho_val) .+ s_rho_val .* s_hyper.L
                     diag_Lt = (1.0 .- t_rho_val) .+ t_rho_val .* t_hyper.L
-                    diag_D_s = sigma_samples[i] ./ sqrt.(diag_Ls .+ M.noise)
-                    diag_D_t = 1.0 ./ sqrt.(diag_Lt .+ M.noise)
+                    diag_D_s = sigma_samples_cpu[i] ./ sqrt.(diag_Ls .+ noise)
+                    diag_D_t = 1.0 ./ sqrt.(diag_Lt .+ noise)
                     
-                    Z_matrix = reshape(innov_samples[i, :], s_N, t_N)
-                    tmp = s_hyper.U' * Z_matrix * t_hyper.U
+                    Z_matrix_device = to_device(reshape(innov_samples_cpu[i, :], s_N, t_N))
+                    tmp = s_hyper.U' * Z_matrix_device * t_hyper.U
                     transformed = (diag_D_s .* tmp) .* diag_D_t'
-                    st_field = s_hyper.U * transformed * t_hyper.U'
-                else # cholesky or cholesky_sparse
+                    st_field_device = s_hyper.U * transformed * t_hyper.U'
+                else # cholesky
                     s_model_type = Symbol(lowercase(string(typeof(s_spec.component_obj))))
                     t_model_type = Symbol(lowercase(string(typeof(t_spec.component_obj))))
                     s_p_names = generate_full_variable_names(s_spec, M.model_arch, k)
                     t_p_names = generate_full_variable_names(t_spec, M.model_arch, k)
-                    s_rho_val = hasproperty(s_spec.component_obj, :rho) ? 
-                                get_params_vector(chain, string(s_p_names.rho), 1)[i, 1] : 
-                                nothing
-                    t_rho_val = hasproperty(t_spec.component_obj, :rho) ? 
-                                get_params_vector(chain, string(t_p_names.rho), 1)[i, 1] : 
-                                nothing
+                    s_rho_val = hasproperty(s_spec.component_obj, :rho) ? get_params_vector(chain, string(s_p_names.rho), 1)[i, 1] : nothing
+                    t_rho_val = hasproperty(t_spec.component_obj, :rho) ? get_params_vector(chain, string(t_p_names.rho), 1)[i, 1] : nothing
                     
-                    Q_s = recompose_precision(
-                        s_model_type, s_spec.hyper.Q_template, 1.0; extra_param=s_rho_val
-                    )
-                    Q_t = recompose_precision(
-                        t_model_type, t_spec.hyper.Q_template, 1.0; extra_param=t_rho_val
-                    )
+                    Q_s = recompose_precision(s_model_type, s_spec.hyper.Q_template, 1.0; extra_param=s_rho_val)
+                    Q_t = recompose_precision(t_model_type, t_spec.hyper.Q_template, 1.0; extra_param=t_rho_val)
                     
-                    C_s = cholesky(Symmetric(Matrix(Q_s) + M.noise * I))
-                    C_t = cholesky(Symmetric(Matrix(Q_t) + M.noise * I))
+                    C_s = cholesky(Symmetric(Q_s + noise * I))
+                    C_t = cholesky(Symmetric(Q_t + noise * I))
                     
-                    Z_matrix = reshape(innov_samples[i, :], s_N, t_N)
-                    tmp_spatial = C_s.L' \ Z_matrix
+                    Z_matrix_device = to_device(reshape(innov_samples_cpu[i, :], s_N, t_N))
+                    tmp_spatial = C_s.L' \ Z_matrix_device
                     st_field_unscaled = transpose(C_t.L' \ transpose(tmp_spatial))
-                    st_field = st_field_unscaled .* sigma_samples[i]
+                    st_field_device = st_field_unscaled .* sigma_samples_cpu[i]
                 end
-                effect_k[:, i] = view(st_field, st_idx_full)
+                effect_k_device[:, i] = view(st_field_device, st_idx_full)
             end
-            structured_effects[k] = effect_k
+            push!(structured_effects, Array(effect_k_device))
         end
         return (structured=structured_effects, noisy=structured_effects)
 
     elseif m.operator == :composition # Non-stationary variance
+        structured_effects = Vector{Matrix{Float64}}()
         modifier_spec = child_specs[1]
         base_spec = child_specs[2]
         
+        # Recursive calls with the correct, modern signature
+        modifier_effects_all = get_effects(modifier_spec.component_obj, chain, modifier_spec, M, PS)
+        base_effects_all = get_effects(base_spec.component_obj, chain, base_spec, M, PS)
+
         for k in 1:outcomes_N
-            modifier_effects = get_effects(
-                modifier_spec.component_obj, chain, M, n_samples, outcomes_N, 
-                p_names, modifier_spec, PS, N_total, is_multivariate_model
-            )
-            log_sigma_field = modifier_effects.structured[k]
-            
-            base_effects = get_effects(
-                base_spec.component_obj, chain, M, n_samples, outcomes_N, 
-                p_names, base_spec, PS, N_total, is_multivariate_model
-            )
-            base_field = base_effects.structured[k]
+            log_sigma_field = modifier_effects_all.structured[k]
+            base_field = base_effects_all.structured[k]
             
             reconstructed_effects = base_field .* exp.(log_sigma_field)
-            structured_effects[k] = reconstructed_effects
+            push!(structured_effects, reconstructed_effects)
         end
         return (structured=structured_effects, noisy=structured_effects)
     end
     
-    @warn "Posterior reconstruction for Composed with operator :$(m.operator) is not " *
-          "fully implemented. Returning zero effects."
+    N_total = isnothing(PS) ? M.y_N : M.y_N + size(PS.data, 1)
+    structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
+    @warn "Posterior reconstruction for Composed with operator :$(m.operator) is not fully implemented. Returning zero effects."
     return (structured=structured_effects, noisy=structured_effects)
 end

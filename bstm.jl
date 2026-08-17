@@ -4,7 +4,7 @@ module bstm
     using Reexport
 
     # List of packages to be re-exported by bstm.jl.
-    # This provides a unified namespace for the user.
+    # This provides a unified namespace for the user. 
     # Only re-export Turing, as bstm is a framework built on Turing.
     # This makes Turing's @model macro and other core functionalities
     # directly available when 'using bstm'.
@@ -14,7 +14,7 @@ module bstm
     # Packages that are fundamental to bstm's internal operation
     # but whose entire API is NOT intended to be part of bstm's public API.
     # Users should explicitly 'using' these if they need their full API.
-    using AbstractGPs, AbstractMCMC, AbstractPPL, ADTypes, AdvancedVI,
+    using AbstractGPs, AbstractMCMC, AbstractPPL, ADTypes, AdvancedVI, KernelAbstractions, GPUArrays,
           Bijectors, CategoricalArrays, Clustering, DataFrames,
           DelaunayTriangulation, DimensionalData, LogExpFunctions,
           Distances, DynamicPPL, FFTW, FillArrays, FlexiChains,
@@ -30,19 +30,19 @@ module bstm
     srcdir = joinpath(rootdir, "src")
 
     # Core framework files
-    include(joinpath(srcdir, "definitions.jl"))  # must be first
-    include(joinpath(srcdir, "data.jl"))
-    include(joinpath(srcdir, "partitioning.jl"))
-    include(joinpath(srcdir, "model.jl"))
-    include(joinpath(srcdir, "likelihoods.jl"))
-    include(joinpath(srcdir, "reconstruction.jl")) 
+    includet(joinpath(srcdir, "definitions.jl"))  # must be first
+    includet(joinpath(srcdir, "data.jl"))
+    includet(joinpath(srcdir, "partitioning.jl"))
+    includet(joinpath(srcdir, "model.jl"))
+    includet(joinpath(srcdir, "likelihoods.jl"))
+    includet(joinpath(srcdir, "reconstruction.jl")) 
       
     # component definitions
     components_dir = joinpath(srcdir, "components")
     
     for f in readdir(components_dir)
         if endswith(f, ".jl")
-            include(joinpath(components_dir, f))
+            includet(joinpath(components_dir, f))
         end
     end
 
@@ -120,7 +120,7 @@ module bstm
             # This provides a unified namespace for the user.
         pkgs_bstm = [ 
             "AbstractGPs", "AbstractMCMC", "AbstractPPL", "ADTypes", "AdvancedVI", 
-            "Bijectors", "CategoricalArrays", "Clustering", "DataFrames", 
+            "Bijectors", "CategoricalArrays", "Clustering", "DataFrames", "KernelAbstractions", "GPUArrays",
             "DelaunayTriangulation", "DimensionalData", "LogExpFunctions", "Turing", 
             "Distances", "Distributions", "DynamicPPL", "FFTW", "FillArrays", "FlexiChains", 
             "NNlib", "GLM", "Graphs", "HypothesisTests", "Interpolations", "JLD2", 
@@ -145,33 +145,41 @@ module bstm
         end
     
         load_project_functions( "C:\\home\\jae\\projects\\bstm\\src" )
-        
-        data_scot, _ = bstm_data(); # Default is "scottish_lip"
-        inp_df = data_scot.data;
-        W = data_scot.au.W
+    
+        if false
 
-        m = @bstm(
-            likelihood(y, family=poisson, log_offsets=log_offsets) ~
-                intercept() +
-                fixed(cov1) +
-                random(s_idx, model=bym2) +
-                random(year, model=ar1),
-            inp_df,
-            W = W,
-            verbose = false # Suppress verbose output
-        ); 
+          cd( "/home/jae/projects/bstm" ) # where you saved it
+          include("bstm.jl")
+          using .bstm
 
-        os = get_optimal_sampler(m, 5)
+          data_scot, _ = bstm_data(); # Default is "scottish_lip"
+          inp_df = data_scot.data;
+          W = data_scot.au.W
 
-        chn = sample(m, MH(), 100; progress=false)
-        chn = sample(m, NUTS(), 10; progress=false)
-        chn = sample(m, os, 10; progress=false)
-        
-        res = model_results_comprehensive( m, chn; au=data_scot.au);
+          m = @bstm(
+              likelihood(y, family=poisson, log_offsets=log_offsets) ~
+                  intercept() +
+                  fixed(cov1) +
+                  random(s_idx, model=bym2) +
+                  random(year, model=ar1),
+              inp_df,
+              W = W,
+              use_gpu = true,
+              verbose = false # Suppress verbose output
+          ); 
 
-        println(res.summary_stats)
+          os = get_optimal_sampler(m, 5)
+
+          chn = sample(m, MH(), 100; progress=false)
+          chn = sample(m, NUTS(), 10; progress=false)
+          chn = sample(m, os, 10; progress=false)
+          
+          res = model_results_comprehensive( m, chn; au=data_scot.au);
+
+          println(res.summary_stats)
+
+        end
 
     end
 
 end # module bstm
-

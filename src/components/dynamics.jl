@@ -6,7 +6,7 @@ framework. It simulates the evolution of a latent field over space and time
 according to a user-specified differential or difference equation.
 
 # Version
-v1.0.7 (2026-08-15)
+v1.1.0 (2026-08-17)
 
 # Mathematical Summary
 Dynamics models describe the evolution of a latent field \$N(s, t)\$ over space \$s\$
@@ -130,7 +130,8 @@ This function handles two main modes for spatial setup:
     regular grid based on coordinate variables and the `resolution` parameter.
 
 It also processes exploitation data (`effort`, `removal`) into a spatiotemporal
-grid format and computes the necessary operator matrices (`L_template`, `A_template`).
+grid format and computes the necessary operator matrices (`L_template`, `A_template`),
+moving all large arrays to the target device.
 """
 function get_precomputes(
     m::Dynamics, M::NamedTuple, mod_data::Dict
@@ -138,6 +139,7 @@ function get_precomputes(
     params = mod_data[:params]
     data = M.data
     variables = mod_data[:variables]
+    to_device = M.to_device
     
     local W, s_N, s_idx, t_idx, t_N, centroids, grid_areas
 
@@ -277,18 +279,18 @@ function get_precomputes(
     removal_keys = [k for k in keys(processed_params) if startswith(string(k), "removal")]
 
     return (
-        W=W,
+        W=to_device(W),
         s_N=s_N,
         t_N=t_N,
-        s_idx=s_idx,
-        t_idx=t_idx,
-        centroids=centroids,
-        L_template=L_template,
-        A_template=A_template,
-        areas=grid_areas,
+        s_idx=to_device(s_idx),
+        t_idx=to_device(t_idx),
+        centroids=centroids, # Typically small, keep on CPU
+        L_template=to_device(L_template),
+        A_template=to_device(A_template),
+        areas=to_device(grid_areas),
         effort_keys=effort_keys,
         removal_keys=removal_keys,
-        processed_params=processed_params
+        processed_params=Dict(k => to_device(v) for (k, v) in processed_params)
     )
 end
 
@@ -332,12 +334,11 @@ function generate_exploitation_block(spec, time_var)
     if isempty(effort_keys) && isempty(removal_keys)
         # If no exploitation is specified, return a zero-initialized vector.
         # This is initialized with the correct numeric type for AD safety.
-        return "local exploitation = zeros(T_num_dyn, spec.hyper.s_N)"
+        return "exploitation = similar(N_prev, T_num_dyn, spec.hyper.s_N)"
     end
     
-    # Initialize the exploitation vector. The `local` keyword is necessary to
-    # ensure the variable is scoped correctly within the generated model code.
-    lines = ["local exploitation = zeros(T_num_dyn, spec.hyper.s_N)"]
+    # Initialize the exploitation vector.
+    lines = ["exploitation = similar(N_prev, T_num_dyn, spec.hyper.s_N)"]
 
     # Add exploitation from effort-based removals.
     # Assumes a catchability coefficient `q_...` is defined in the model.
@@ -493,38 +494,38 @@ function get_updates(
     params = m.params
     s_N = spec.hyper.s_N
     t_N = spec.hyper.t_N
+    array_type_str = "M.to_device"
 
     # Determine the numeric type for dynamic fields, ensuring AD compatibility.
-    # This promotes to Dual if any parameter is a Dual number.
-    T_num_dyn = "promote_type(eltype($(p_names.innovations)), typeof($(p_names.sigma)))"
+    T_num_dyn = "eltype($(p_names.innovations))"
 
     if arch == "univariate"
         propagator_setup = ""
         if m.model in ["advection", "advection_diffusion"]
             propagator_setup *=
-                "local propagator = lu(I($(s_N)) - $(p_names.velocity) * " *
+                "propagator = lu(I($(s_N)) - $(p_names.velocity) * " *
                 "spec_registry[:$(key_str)].hyper.A_template + M.noise * I)\n"
         end
         if m.model in ["diffusion", "advection_diffusion"]
             propagator_setup *=
-                "local propagator = cholesky(Symmetric(I($(s_N)) - " *
+                "propagator = cholesky(Symmetric(I($(s_N)) - " *
                 "$(p_names.diffusion) * spec_registry[:$(key_str)].hyper.L_template + M.noise * I))\n"
         end
         
         field_setup =
-            "local dyn_field = zeros($(T_num_dyn), $(s_N), $(t_N))\n    " *
-            "local innov_matrix = reshape($(p_names.innovations), $(s_N), $(t_N))\n    " *
+            "dyn_field = similar($(p_names.innovations), $(T_num_dyn), $(s_N), $(t_N))\n    " *
+            "innov_matrix = reshape($(p_names.innovations), $(s_N), $(t_N))\n    " *
             "dyn_field[:, 1] = innov_matrix[:, 1]"
         
         K_setup_block = ""
         K_var = string(p_names.K)
         if get(params, :spatially_varying_K, false)
             K_setup_block =
-                "local Q_K = spec_registry[:$(key_str)].hyper.L_template\n" *
-                "local F_K = cholesky(Symmetric(Matrix(Q_K) + M.noise * I))\n" *
-                "local K_field_raw = F_K.L' \\ K_raw_$(key_str)\n" *
+                "Q_K = spec_registry[:$(key_str)].hyper.L_template\n" *
+                "F_K = cholesky(Symmetric(Matrix(Q_K) + M.noise * I))\n" *
+                "K_field_raw = F_K.L' \\ K_raw_$(key_str)\n" *
                 "Turing.@addlogprob! logpdf(Normal(0.0,0.001 * $(s_N)), sum(K_field_raw))\n" *
-                "local K_spatial = exp.(log_K_mean_$(key_str) .+ K_field_raw .* sigma_K_$(key_str))"
+                "K_spatial = exp.(log_K_mean_$(key_str) .+ K_field_raw .* sigma_K_$(key_str))"
             K_var = "K_spatial"
         end
 
@@ -532,11 +533,11 @@ function get_updates(
         r_var = string(p_names.r)
         if get(params, :spatially_varying_r, false)
             r_setup_block =
-                "local Q_r = spec_registry[:$(key_str)].hyper.L_template\n" *
-                "local F_r = cholesky(Symmetric(Matrix(Q_r) + M.noise * I))\n" *
-                "local r_field_raw = F_r.L' \\ r_raw_$(key_str)\n" *
+                "Q_r = spec_registry[:$(key_str)].hyper.L_template\n" *
+                "F_r = cholesky(Symmetric(Matrix(Q_r) + M.noise * I))\n" *
+                "r_field_raw = F_r.L' \\ r_raw_$(key_str)\n" *
                 "Turing.@addlogprob! logpdf(Normal(0.0,0.001 * $(s_N)), sum(r_field_raw))\n" *
-                "local r_spatial = exp.(log_r_mean_$(key_str) .+ r_field_raw .* sigma_r_$(key_str))"
+                "r_spatial = exp.(log_r_mean_$(key_str) .+ r_field_raw .* sigma_r_$(key_str))"
             r_var = "r_spatial"
         end
         
@@ -550,50 +551,49 @@ function get_updates(
         if m.model == "logistic"
             exploitation_logic = generate_exploitation_block(spec, "t")
             evolution_loop_body =
-                "local areas = spec_registry[:$(key_str)].hyper.areas\n" *
+                "areas = spec_registry[:$(key_str)].hyper.areas\n" *
                 "for t in 2:$(t_N)\n    " *
-                "local N_prev = dyn_field[:, t-1]; local D_prev = N_prev ./ areas; " *
-                "local K_density = $(K_var) ./ areas; " *
-                "local growth = $(r_var) .* D_prev .* (1.0 .- D_prev ./ K_density); " *
+                "N_prev = dyn_field[:, t-1]; D_prev = N_prev ./ areas; " *
+                "K_density = $(K_var) ./ areas; " *
+                "growth = $(r_var) .* D_prev .* (1.0 .- D_prev ./ K_density); " *
                 "$(exploitation_logic); " *
-                "local N_intermediate = N_prev .+ (growth .* areas) .- exploitation; " *
+                "N_intermediate = N_prev .+ (growth .* areas) .- exploitation; " *
                 "$(propagator_logic); " *
                 "dyn_field[:, t] = max.(T_num_dyn(0.0), dyn_field[:, t]);\n" *
                 "end"
         elseif m.model == "delay_difference"
             exploitation_logic = generate_exploitation_block(spec, "t-1")
             evolution_loop_body =
-                "local areas = spec_registry[:$(key_str)].hyper.areas\n" *
+                "areas = spec_registry[:$(key_str)].hyper.areas\n" *
                 "for t in 2:$(t_N)\n    " *
-                "local N_prev = dyn_field[:, t-1]; local D_prev = N_prev ./ areas; " *
-                "local K_density = $(K_var) ./ areas; " *
-                "local growth = $(r_var) .* D_prev .* (1.0 .- D_prev ./ K_density); " *
+                "N_prev = dyn_field[:, t-1]; D_prev = N_prev ./ areas; " *
+                "K_density = $(K_var) ./ areas; " *
+                "growth = $(r_var) .* D_prev .* (1.0 .- D_prev ./ K_density); " *
                 "$(exploitation_logic); " *
-                "local N_survived = (N_prev .- exploitation) .* exp.(-$(p_names.M_nat)); " *
-                "local N_intermediate = N_survived .+ (growth .* areas); " *
+                "N_survived = (N_prev .- exploitation) .* exp.(-$(p_names.M_nat)); " *
+                "N_intermediate = N_survived .+ (growth .* areas); " *
                 "$(propagator_logic); " *
                 "dyn_field[:, t] = max.(T_num_dyn(0.0), dyn_field[:, t]);\n" *
                 "end"
         elseif m.model == "lotka_volterra"
             output_species = get(params, :output_species, :prey)
             field_setup =
-                "local T_num_dyn = eltype($(p_names.innovations)); " *
-                "local dyn_field_prey = zeros(T_num_dyn, $(s_N), $(t_N)); " *
-                "local dyn_field_predator = zeros(T_num_dyn, $(s_N), $(t_N)); " *
-                "local innov_matrix_prey = reshape($(p_names.innovations), $(s_N), $(t_N)); " *
-                "local innov_matrix_predator = reshape($(p_names.innovations)_predator, $(s_N), $(t_N)); " *
+                "dyn_field_prey = similar($(p_names.innovations), $(T_num_dyn), $(s_N), $(t_N)); " *
+                "dyn_field_predator = similar($(p_names.innovations), $(T_num_dyn), $(s_N), $(t_N)); " *
+                "innov_matrix_prey = reshape($(p_names.innovations), $(s_N), $(t_N)); " *
+                "innov_matrix_predator = reshape($(p_names.innovations)_predator, $(s_N), $(t_N)); " *
                 "dyn_field_prey[:, 1] = innov_matrix_prey[:, 1]; " *
                 "dyn_field_predator[:, 1] = innov_matrix_predator[:, 1]"
             evolution_loop_body =
                 "for t in 2:$(t_N)\n    " *
-                "local N_prey_prev = dyn_field_prey[:, t-1]; " *
-                "local N_pred_prev = dyn_field_predator[:, t-1]; " *
-                "local d_prey = ($(p_names.alpha) .* N_prey_prev) .- ($(p_names.beta) .* N_prey_prev .* N_pred_prev); " *
-                "local d_pred = ($(p_names.gamma) .* N_prey_prev .* N_pred_prev) .- ($(p_names.delta) .* N_pred_prev); " *
+                "N_prey_prev = dyn_field_prey[:, t-1]; " *
+                "N_pred_prev = dyn_field_predator[:, t-1]; " *
+                "d_prey = ($(p_names.alpha) .* N_prey_prev) .- ($(p_names.beta) .* N_prey_prev .* N_pred_prev); " *
+                "d_pred = ($(p_names.gamma) .* N_prey_prev .* N_pred_prev) .- ($(p_names.delta) .* N_pred_prev); " *
                 "dyn_field_prey[:, t] = max.(T_num_dyn(0.0), N_prey_prev .+ d_prey .+ innov_matrix_prey[:, t]); " *
                 "dyn_field_predator[:, t] = max.(T_num_dyn(0.0), N_pred_prev .+ d_pred .+ innov_matrix_predator[:, t]);\n" *
                 "end\n" *
-                "local dyn_field = $(output_species == :prey ? "dyn_field_prey" : "dyn_field_predator")"
+                "dyn_field = $(output_species == :prey ? "dyn_field_prey" : "dyn_field_predator")"
         else
             evolution_loop_body =
                 "for t in 2:$(t_N)\n    " *
@@ -623,7 +623,7 @@ function get_updates(
             spatially_varying_rates = get(params, :spatially_varying_rates, false)
             
             # Inlined exploitation logic for multivariate model
-            exploitation_lines = ["local exploitation = zeros(T, $(n_classes));"]
+            exploitation_lines = ["exploitation = similar(N_prev, T, $(n_classes));"]
             for e_key in spec.hyper.effort_keys
                 push!(exploitation_lines, "exploitation .+= q_$(e_key) .* spec_registry[:$(key_str)].hyper.processed_params[Symbol(\"$(e_key)\")][s, t-1] .* N_prev;")
             end
@@ -634,9 +634,9 @@ function get_updates(
 
             return """
             begin
-                local Q_spatial = spec_registry[:$(key_str)].hyper.L_template;
-                local F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I));
-                local areas = spec_registry[:$(key_str)].hyper.areas
+                Q_spatial = spec_registry[:$(key_str)].hyper.L_template;
+                F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I));
+                areas = spec_registry[:$(key_str)].hyper.areas
                 local survival_rates_spatial, fecundity_rates_spatial;
                 if $(spatially_varying_rates)
                     fecundity_raw_matrix = reshape(fecundity_raw_$(key_str), $(s_N), $(n_classes));
@@ -654,13 +654,13 @@ function get_updates(
                 else
                     K_values_$(key_str) = fill(K_$(key_str), $(s_N));
                 end
-                local innov_tensor_$(key_str) = reshape($(p_names.innovations), $(s_N), $(t_N), $(n_classes));
-                local population_field_$(key_str) = zeros(T, $(s_N), $(t_N), $(n_classes))
+                innov_tensor_$(key_str) = reshape($(p_names.innovations), $(s_N), $(t_N), $(n_classes));
+                population_field_$(key_str) = similar($(p_names.innovations), T, $(s_N), $(t_N), $(n_classes))
                 for a in 1:$(n_classes)
                     population_field_$(key_str)[:, 1, a] = max.(0.0, innov_tensor_$(key_str)[:, 1, a] .* sigma_process_$(key_str)[a]);
                 end
                 for s in 1:$(s_N)
-                    local L_s = zeros(T, $(n_classes), $(n_classes));
+                    L_s = zeros(T, $(n_classes), $(n_classes));
                     if $(spatially_varying_rates)
                         for i in 1:($(n_classes)-1); L_s[i+1, i] = survival_rates_spatial[s, i]; end;
                         L_s[1, :] = fecundity_rates_spatial[s, :];
@@ -669,18 +669,18 @@ function get_updates(
                         L_s[1, :] = fecundity_rates_$(key_str);
                     end
                     for t in 2:$(t_N)
-                        local N_prev = view(population_field_$(key_str), s, t-1, :);
+                        N_prev = view(population_field_$(key_str), s, t-1, :);
                         $(exploitation_block)
-                        local N_after_removal = max.(0.0, N_prev - exploitation);
-                        local L_effective = copy(L_s)
+                        N_after_removal = max.(0.0, N_prev - exploitation);
+                        L_effective = copy(L_s)
                         if $(spatially_varying_K) || haskey(params, :K)
-                            local total_pop_prev = sum(N_after_removal);
-                            local K_density = K_values_$(key_str)[s] / areas[s];
-                            local dd_factor = max(0.0, 1.0 - (total_pop_prev / areas[s]) / K_density);
+                            total_pop_prev = sum(N_after_removal);
+                            K_density = K_values_$(key_str)[s] / areas[s];
+                            dd_factor = max(0.0, 1.0 - (total_pop_prev / areas[s]) / K_density);
                             L_effective[1, :] .*= dd_factor;
                         end
-                        local N_projected = L_effective * N_after_removal;
-                        local current_innov = view(innov_tensor_$(key_str), s, t, :) .* sigma_process_$(key_str);
+                        N_projected = L_effective * N_after_removal;
+                        current_innov = view(innov_tensor_$(key_str), s, t, :) .* sigma_process_$(key_str);
                         population_field_$(key_str)[s, t, :] = max.(0.0, N_projected .+ current_innov)
                     end
                 end
@@ -696,34 +696,34 @@ function get_updates(
             spatially_varying_K = get(params, :spatially_varying_K, false)
             return """
             begin
-                local areas = spec_registry[:$(key_str)].hyper.areas;
-                local alpha_$(key_str) = diagm(0 => ones(T, $(n_species)));
-                local off_diag_indices = [i for i in 1:($(n_species)^2) if mod(i-1, $(n_species)+1) != 0];
+                areas = spec_registry[:$(key_str)].hyper.areas;
+                alpha_$(key_str) = diagm(0 => ones(T, $(n_species)));
+                off_diag_indices = [i for i in 1:($(n_species)^2) if mod(i-1, $(n_species)+1) != 0];
                 alpha_$(key_str)[off_diag_indices] = alpha_raw_$(key_str)
                 local K_values_$(key_str);
                 if $(spatially_varying_K)
-                    local Q_spatial = spec_registry[:$(key_str)].hyper.L_template;
-                    local F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I));
-                    local K_raw_matrix = reshape(K_raw_$(key_str), $(s_N), $(n_species));
-                    local K_field = F_spatial.L' \\ K_raw_matrix;
+                    Q_spatial = spec_registry[:$(key_str)].hyper.L_template;
+                    F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I));
+                    K_raw_matrix = reshape(K_raw_$(key_str), $(s_N), $(n_species));
+                    K_field = F_spatial.L' \\ K_raw_matrix;
                     K_values_$(key_str) = exp.(log_K_mean_$(key_str)' .+ K_field .* sigma_K_$(key_str)');
                 else
                     K_values_$(key_str) = repeat(K_$(key_str)', $(s_N), 1);
                 end
-                local innov_tensor = reshape($(p_names.innovations), $(s_N), $(t_N), $(n_species));
-                local population_field = zeros(T, $(s_N), $(t_N), $(n_species));
+                innov_tensor = reshape($(p_names.innovations), $(s_N), $(t_N), $(n_species));
+                population_field = similar($(p_names.innovations), T, $(s_N), $(t_N), $(n_species));
                 population_field[:, 1, :] = max.(0.0, innov_tensor[:, 1, :] .* sigma_process_$(key_str)')
                 for s in 1:$(s_N), t in 2:$(t_N)
-                    local N_prev = view(population_field, s, t-1, :);
-                    local D_prev = N_prev ./ areas[s];
-                    local K_density = K_values_$(key_str)[s, :] ./ areas[s];
-                    local N_intermediate = zeros(T, $(n_species))
+                    N_prev = view(population_field, s, t-1, :);
+                    D_prev = N_prev ./ areas[s];
+                    K_density = K_values_$(key_str)[s, :] ./ areas[s];
+                    N_intermediate = similar(N_prev, T, $(n_species))
                     for i in 1:$(n_species)
-                        local interaction_sum_density = dot(alpha_$(key_str)[i, :], D_prev);
-                        local growth_density = r_$(key_str)[i] * D_prev[i] * (1.0 - interaction_sum_density / K_density[i]);
+                        interaction_sum_density = dot(alpha_$(key_str)[i, :], D_prev);
+                        growth_density = r_$(key_str)[i] * D_prev[i] * (1.0 - interaction_sum_density / K_density[i]);
                         N_intermediate[i] = N_prev[i] + growth_density * areas[s];
                     end
-                    local current_innov = view(innov_tensor, s, t, :) .* sigma_process_$(key_str);
+                    current_innov = view(innov_tensor, s, t, :) .* sigma_process_$(key_str);
                     population_field[s, t, :] = max.(0.0, N_intermediate .+ current_innov)
                 end
                 for k in 1:$(n_species)
@@ -738,25 +738,47 @@ function get_updates(
     return "# Dynamics model '$(m.model)' not implemented for this architecture."
 end
 
+
+
 """
-    get_effects(m::Dynamics, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
+    get_effects(m::Dynamics, chain, spec, M, PS)
 
 Reconstructs the `Dynamics`'s effect from the MCMC chain's posterior samples.
+This version is updated to handle GPU arrays by moving sampled parameters to the
+device for computation and moving the final results back to the CPU. It now includes
+support for all dynamics models: advection-diffusion, logistic, delay-difference,
+Lotka-Volterra, Leslie matrix, and Generalized Lotka-Volterra.
 """
 function get_effects(
-    m::Dynamics, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::Dynamics, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+    
     key_str = string(spec.key)
     model_type = m.model
     params = m.params
     hyper = spec.hyper
 
-    s_idx_full = isnothing(PS) ? hyper.s_idx : vcat(hyper.s_idx, get(PS, :s_idx, []))
-    t_idx_full = isnothing(PS) ? hyper.t_idx : vcat(hyper.t_idx, get(PS, :t_idx, []))
-    t_N_full = maximum(t_idx_full) # Max time index across train and pred
+    # --- Coordinate/Index Handling: Combine training and prediction sets on device ---
+    s_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        vcat(hyper.s_idx, to_device(PS.data.s_idx))
+    else
+        hyper.s_idx
+    end
+    t_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
+        vcat(hyper.t_idx, to_device(PS.data.t_idx))
+    else
+        hyper.t_idx
+    end
+    
+    N_total = length(s_idx_full_device)
+    t_N_full_cpu = Array(maximum(t_idx_full_device))[]
 
     L_op = hyper.L_template
     A_op = hyper.A_template
@@ -765,75 +787,69 @@ function get_effects(
     s_N = hyper.s_N
     t_N = hyper.t_N
 
+    # Pre-calculate flat spatiotemporal index for efficient lookups on the device
+    st_idx_full = (t_idx_full_device .- 1) .* s_N .+ s_idx_full_device
+
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k_outcome in 1:outcomes_N
-        # Generate outcome-specific parameter names
         p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
 
         if model_type in ["advection", "diffusion", "advection_diffusion"]
             sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome, is_multivariate_model)
             innov_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model)
             
-            rate_samples = if model_type == "advection"
+            rate_samples_cpu = if model_type == "advection"
                 get_params_vector(chain, _find_parameter(p_names, string(p_names_k.velocity), k_outcome, is_multivariate_model), 1)
             elseif model_type == "diffusion"
                 get_params_vector(chain, _find_parameter(p_names, string(p_names_k.diffusion), k_outcome, is_multivariate_model), 1)
-            elseif model_type == "advection_diffusion"
+            else # advection_diffusion
                 v_samples = get_params_vector(chain, _find_parameter(p_names, string(p_names_k.velocity), k_outcome, is_multivariate_model), 1)
                 d_samples = get_params_vector(chain, _find_parameter(p_names, string(p_names_k.diffusion), k_outcome, is_multivariate_model), 1)
-                hcat(v_samples, d_samples) # Combine for easier iteration
-            else
-                nothing
+                hcat(v_samples, d_samples)
             end
 
-            if isnothing(rate_samples) || isempty(sigma_name) || isempty(innov_name)
+            if isnothing(rate_samples_cpu) || isempty(sigma_name) || isempty(innov_name)
                 @warn "Parameters for Dynamics manifold $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
 
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innov_samples = get_params_matrix(chain, innov_name, s_N * t_N)
+            sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+            innov_samples_cpu = get_params_matrix(chain, innov_name, s_N * t_N)
 
-            effect_k = zeros(Float64, N_total, n_samples)
-            I_s = Matrix(I, s_N, s_N)
+            dyn_field_all_samples = to_device(zeros(Float64, s_N * t_N_full_cpu, n_samples))
+            I_s_device = to_device(Matrix(I, s_N, s_N))
 
             for j in 1:n_samples
-                current_sigma = sigma_samples[j]
-                current_innov_flat = innov_samples[j, :]
-                
-                # Expand innov_matrix to t_N_full if prediction is beyond training data
-                innov_matrix = reshape(current_innov_flat, s_N, t_N)
-                if t_N_full > t_N
-                    innov_matrix = hcat(innov_matrix, randn(s_N, t_N_full - t_N))
+                innov_matrix_device = to_device(reshape(innov_samples_cpu[j, :], s_N, t_N))
+                if t_N_full_cpu > t_N
+                    innov_matrix_device = hcat(innov_matrix_device, to_device(randn(s_N, t_N_full_cpu - t_N)))
                 end
 
-                dyn_field = zeros(Float64, s_N, t_N_full)
+                dyn_field_device = to_device(zeros(Float64, s_N, t_N_full_cpu))
                 
                 local propagator
                 if model_type == "advection"
-                    current_velocity = rate_samples[j, 1]
-                    propagator = lu(I_s - current_velocity * A_op + noise * I_s)
+                    propagator = lu(I_s_device - rate_samples_cpu[j, 1] * A_op + noise * I_s_device)
                 elseif model_type == "diffusion"
-                    current_diffusion = rate_samples[j, 1]
-                    propagator = cholesky(Symmetric(I_s - current_diffusion * L_op + noise * I_s))
-                elseif model_type == "advection_diffusion"
-                    current_velocity = rate_samples[j, 1]
-                    current_diffusion = rate_samples[j, 2]
-                    propagator = lu(I_s - current_velocity * A_op - current_diffusion * L_op + noise * I_s)
+                    propagator = cholesky(Symmetric(I_s_device - rate_samples_cpu[j, 1] * L_op + noise * I_s_device))
+                else # advection_diffusion
+                    propagator = lu(I_s_device - rate_samples_cpu[j, 1] * A_op - rate_samples_cpu[j, 2] * L_op + noise * I_s_device)
                 end
 
-                dyn_field[:, 1] = innov_matrix[:, 1]
-                for t in 2:t_N_full
-                    dyn_field[:, t] = (propagator \ dyn_field[:, t-1]) + innov_matrix[:, t]
+                dyn_field_device[:, 1] = innov_matrix_device[:, 1]
+                for t in 2:t_N_full_cpu
+                    dyn_field_device[:, t] = (propagator \ dyn_field_device[:, t-1]) + innov_matrix_device[:, t]
                 end
                 
-                dyn_field .*= current_sigma
-                log_dyn_field = log.(dyn_field .+ 1e-6)
-
-                for obs_idx in 1:N_total
-                    effect_k[obs_idx, j] = log_dyn_field[s_idx_full[obs_idx], t_idx_full[obs_idx]]
-                end
+                dyn_field_device .*= sigma_samples_cpu[j]
+                dyn_field_all_samples[:, j] = vec(dyn_field_device)
             end
+            
+            log_dyn_field = log.(dyn_field_all_samples .+ 1e-6)
+            effect_k = Array(log_dyn_field[st_idx_full, :])
             push!(structured_effects, effect_k)
 
         elseif model_type == "logistic"
@@ -848,43 +864,37 @@ function get_effects(
                 continue
             end
 
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innov_samples = get_params_matrix(chain, innov_name, s_N * t_N)
-            r_samples = get_params_vector(chain, r_name, 1)[:, 1]
-            K_samples = get_params_vector(chain, K_name, 1)[:, 1]
+            sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+            innov_samples_cpu = get_params_matrix(chain, innov_name, s_N * t_N)
+            r_samples_cpu = get_params_vector(chain, r_name, 1)[:, 1]
+            K_samples_cpu = get_params_vector(chain, K_name, 1)[:, 1]
             
-            effect_k = zeros(Float64, N_total, n_samples)
+            dyn_field_all_samples = to_device(zeros(Float64, s_N * t_N_full_cpu, n_samples))
 
             for j in 1:n_samples
-                current_sigma = sigma_samples[j]
-                current_innov_flat = innov_samples[j, :]
-                current_r = r_samples[j]
-                current_K = K_samples[j]
-
-                innov_matrix = reshape(current_innov_flat, s_N, t_N)
-                if t_N_full > t_N
-                    innov_matrix = hcat(innov_matrix, randn(s_N, t_N_full - t_N))
+                innov_matrix_device = to_device(reshape(innov_samples_cpu[j, :], s_N, t_N))
+                if t_N_full_cpu > t_N
+                    innov_matrix_device = hcat(innov_matrix_device, to_device(randn(s_N, t_N_full_cpu - t_N)))
                 end
 
-                dyn_field = zeros(Float64, s_N, t_N_full)
-                dyn_field[:, 1] = innov_matrix[:, 1] # Initial state
+                dyn_field_device = to_device(zeros(Float64, s_N, t_N_full_cpu))
+                dyn_field_device[:, 1] = innov_matrix_device[:, 1]
 
-                for t in 2:t_N_full
-                    N_prev = dyn_field[:, t-1]
+                for t in 2:t_N_full_cpu
+                    N_prev = dyn_field_device[:, t-1]
                     D_prev = N_prev ./ areas
-                    K_density = current_K ./ areas
-                    growth = current_r .* D_prev .* (1.0 .- D_prev ./ K_density)
+                    K_density = K_samples_cpu[j] ./ areas
+                    growth = r_samples_cpu[j] .* D_prev .* (1.0 .- D_prev ./ K_density)
                     N_intermediate = N_prev .+ (growth .* areas)
-                    dyn_field[:, t] = max.(0.0, N_intermediate .+ innov_matrix[:, t])
+                    dyn_field_device[:, t] = max.(0.0, N_intermediate .+ innov_matrix_device[:, t])
                 end
                 
-                dyn_field .*= current_sigma
-                log_dyn_field = log.(dyn_field .+ 1e-6)
-                
-                for obs_idx in 1:N_total
-                    effect_k[obs_idx, j] = log_dyn_field[s_idx_full[obs_idx], t_idx_full[obs_idx]]
-                end
+                dyn_field_device .*= sigma_samples_cpu[j]
+                dyn_field_all_samples[:, j] = vec(dyn_field_device)
             end
+            
+            log_dyn_field = log.(dyn_field_all_samples .+ 1e-6)
+            effect_k = Array(log_dyn_field[st_idx_full, :])
             push!(structured_effects, effect_k)
 
         elseif model_type == "delay_difference"
@@ -900,62 +910,63 @@ function get_effects(
                 continue
             end
 
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innov_samples = get_params_matrix(chain, innov_name, s_N * t_N)
-            r_samples = get_params_vector(chain, r_name, 1)[:, 1]
-            K_samples = get_params_vector(chain, K_name, 1)[:, 1]
-            M_nat_samples = get_params_vector(chain, M_nat_name, 1)[:, 1]
+            sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+            innov_samples_cpu = get_params_matrix(chain, innov_name, s_N * t_N)
+            r_samples_cpu = get_params_vector(chain, r_name, 1)[:, 1]
+            K_samples_cpu = get_params_vector(chain, K_name, 1)[:, 1]
+            M_nat_samples_cpu = get_params_vector(chain, M_nat_name, 1)[:, 1]
             
             effort_keys = spec.hyper.effort_keys
             q_samples_dict = Dict(key => get_params_vector(chain, _find_parameter(p_names, "q_$(key)", k_outcome, is_multivariate_model), 1)[:, 1] for key in effort_keys)
-            removal_keys = spec.hyper.removal_keys
-
-            effect_k = zeros(Float64, N_total, n_samples)
+            
+            dyn_field_all_samples = to_device(zeros(Float64, s_N * t_N_full_cpu, n_samples))
 
             for j in 1:n_samples
-                current_sigma = sigma_samples[j]
-                current_innov_flat = innov_samples[j, :]
-                current_r = r_samples[j]
-                current_K = K_samples[j]
-                current_M_nat = M_nat_samples[j]
-
-                innov_matrix = reshape(current_innov_flat, s_N, t_N)
-                if t_N_full > t_N
-                    innov_matrix = hcat(innov_matrix, randn(s_N, t_N_full - t_N))
+                innov_matrix_device = to_device(reshape(innov_samples_cpu[j, :], s_N, t_N))
+                if t_N_full_cpu > t_N
+                    innov_matrix_device = hcat(innov_matrix_device, to_device(randn(s_N, t_N_full_cpu - t_N)))
                 end
 
-                dyn_field = zeros(Float64, s_N, t_N_full)
-                dyn_field[:, 1] = innov_matrix[:, 1] # Initial state
+                dyn_field_device = to_device(zeros(Float64, s_N, t_N_full_cpu))
+                dyn_field_device[:, 1] = innov_matrix_device[:, 1]
 
-                for t in 2:t_N_full
-                    N_prev = dyn_field[:, t-1]
+                for t in 2:t_N_full_cpu
+                    N_prev = dyn_field_device[:, t-1]
                     D_prev = N_prev ./ areas
-                    K_density = current_K ./ areas
-                    growth = current_r .* D_prev .* (1.0 .- D_prev ./ K_density)
+                    K_density = K_samples_cpu[j] ./ areas
+                    growth = r_samples_cpu[j] .* D_prev .* (1.0 .- D_prev ./ K_density)
                     
-                    C_prev = zeros(s_N)
+                    C_prev = to_device(zeros(Float64, s_N))
                     for e_key in effort_keys
-                        C_prev .+= q_samples_dict[e_key][j] .* spec.hyper.processed_params[e_key][:, t-1] .* N_prev
+                        effort_data = to_device(spec.hyper.processed_params[e_key][:, t-1])
+                        C_prev .+= q_samples_dict[e_key][j] .* effort_data .* N_prev
                     end
-                    for r_key in removal_keys
-                        C_prev .+= spec.hyper.processed_params[r_key][:, t-1]
+                    for r_key in spec.hyper.removal_keys
+                        removal_data = to_device(spec.hyper.processed_params[r_key][:, t-1])
+                        C_prev .+= removal_data
                     end
 
-                    N_survived = (N_prev .- C_prev) .* exp.(-current_M_nat)
+                    N_survived = (N_prev .- C_prev) .* exp(-M_nat_samples_cpu[j])
                     N_intermediate = N_survived .+ (growth .* areas)
-                    dyn_field[:, t] = max.(0.0, N_intermediate .+ innov_matrix[:, t])
+                    dyn_field_device[:, t] = max.(0.0, N_intermediate .+ innov_matrix_device[:, t])
                 end
                 
-                dyn_field .*= current_sigma
-                log_dyn_field = log.(dyn_field .+ 1e-6)
-                
-                for obs_idx in 1:N_total
-                    effect_k[obs_idx, j] = log_dyn_field[s_idx_full[obs_idx], t_idx_full[obs_idx]]
-                end
+                dyn_field_device .*= sigma_samples_cpu[j]
+                dyn_field_all_samples[:, j] = vec(dyn_field_device)
             end
+            
+            log_dyn_field = log.(dyn_field_all_samples .+ 1e-6)
+            effect_k = Array(log_dyn_field[st_idx_full, :])
             push!(structured_effects, effect_k)
 
         elseif model_type == "lotka_volterra"
+            # This model is typically univariate in this context, but we check for safety
+            if is_multivariate_model
+                @warn "Lotka-Volterra reconstruction is currently only supported for univariate models. Skipping."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+
             alpha_name = _find_parameter(p_names, string(p_names_k.alpha), k_outcome, is_multivariate_model)
             beta_name = _find_parameter(p_names, string(p_names_k.beta), k_outcome, is_multivariate_model)
             gamma_name = _find_parameter(p_names, string(p_names_k.gamma), k_outcome, is_multivariate_model)
@@ -964,325 +975,65 @@ function get_effects(
             innov_prey_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model)
             innov_predator_name = _find_parameter(p_names, string(p_names_k.innovations_predator), k_outcome, is_multivariate_model)
             
-            if isempty(alpha_name) || isempty(beta_name) || isempty(gamma_name) || isempty(delta_name) || isempty(sigma_name) || isempty(innov_prey_name) || isempty(innov_predator_name)
+            if any(isempty, [alpha_name, beta_name, gamma_name, delta_name, sigma_name, innov_prey_name, innov_predator_name])
                 @warn "Parameters for Dynamics manifold $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
 
-            alpha_samples = get_params_vector(chain, alpha_name, 1)[:, 1]
-            beta_samples = get_params_vector(chain, beta_name, 1)[:, 1]
-            gamma_samples = get_params_vector(chain, gamma_name, 1)[:, 1]
-            delta_samples = get_params_vector(chain, delta_name, 1)[:, 1]
-            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innov_prey_samples = get_params_matrix(chain, innov_prey_name, s_N * t_N)
-            innov_predator_samples = get_params_matrix(chain, innov_predator_name, s_N * t_N)
+            alpha_samples_cpu = get_params_vector(chain, alpha_name, 1)[:, 1]
+            beta_samples_cpu = get_params_vector(chain, beta_name, 1)[:, 1]
+            gamma_samples_cpu = get_params_vector(chain, gamma_name, 1)[:, 1]
+            delta_samples_cpu = get_params_vector(chain, delta_name, 1)[:, 1]
+            sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+            innov_prey_samples_cpu = get_params_matrix(chain, innov_prey_name, s_N * t_N)
+            innov_predator_samples_cpu = get_params_matrix(chain, innov_predator_name, s_N * t_N)
             
             output_species = get(params, :output_species, :prey)
-            
-            effect_k = zeros(Float64, N_total, n_samples)
+            dyn_field_all_samples = to_device(zeros(Float64, s_N * t_N_full_cpu, n_samples))
 
             for j in 1:n_samples
-                current_alpha = alpha_samples[j]
-                current_beta = beta_samples[j]
-                current_gamma = gamma_samples[j]
-                current_delta = delta_samples[j]
-                current_sigma = sigma_samples[j]
-
-                innov_matrix_prey = reshape(innov_prey_samples[j, :], s_N, t_N)
-                innov_matrix_predator = reshape(innov_predator_samples[j, :], s_N, t_N)
-                if t_N_full > t_N
-                    innov_matrix_prey = hcat(innov_matrix_prey, randn(s_N, t_N_full - t_N))
-                    innov_matrix_predator = hcat(innov_matrix_predator, randn(s_N, t_N_full - t_N))
+                innov_matrix_prey_device = to_device(reshape(innov_prey_samples_cpu[j, :], s_N, t_N))
+                innov_matrix_predator_device = to_device(reshape(innov_predator_samples_cpu[j, :], s_N, t_N))
+                if t_N_full_cpu > t_N
+                    innov_matrix_prey_device = hcat(innov_matrix_prey_device, to_device(randn(s_N, t_N_full_cpu - t_N)))
+                    innov_matrix_predator_device = hcat(innov_matrix_predator_device, to_device(randn(s_N, t_N_full_cpu - t_N)))
                 end
 
-                dyn_field_prey = zeros(Float64, s_N, t_N_full)
-                dyn_field_predator = zeros(Float64, s_N, t_N_full)
+                dyn_field_prey_device = to_device(zeros(Float64, s_N, t_N_full_cpu))
+                dyn_field_predator_device = to_device(zeros(Float64, s_N, t_N_full_cpu))
                 
-                dyn_field_prey[:, 1] = innov_matrix_prey[:, 1]
-                dyn_field_predator[:, 1] = innov_matrix_predator[:, 1]
+                dyn_field_prey_device[:, 1] = innov_matrix_prey_device[:, 1]
+                dyn_field_predator_device[:, 1] = innov_matrix_predator_device[:, 1]
 
-                for t in 2:t_N_full
-                    N_prey_prev = dyn_field_prey[:, t-1]
-                    N_pred_prev = dyn_field_predator[:, t-1]
+                for t in 2:t_N_full_cpu
+                    N_prey_prev = dyn_field_prey_device[:, t-1]
+                    N_pred_prev = dyn_field_predator_device[:, t-1]
                     
-                    d_prey = (current_alpha .* N_prey_prev) .- (current_beta .* N_prey_prev .* N_pred_prev)
-                    d_pred = (current_gamma .* N_prey_prev .* N_pred_prev) .- (current_delta .* N_pred_prev)
+                    d_prey = (alpha_samples_cpu[j] .* N_prey_prev) .- (beta_samples_cpu[j] .* N_prey_prev .* N_pred_prev)
+                    d_pred = (gamma_samples_cpu[j] .* N_prey_prev .* N_pred_prev) .- (delta_samples_cpu[j] .* N_pred_prev)
                     
-                    dyn_field_prey[:, t] = max.(0.0, N_prey_prev .+ d_prey .+ innov_matrix_prey[:, t])
-                    dyn_field_predator[:, t] = max.(0.0, N_pred_prev .+ d_pred .+ innov_matrix_predator[:, t])
+                    dyn_field_prey_device[:, t] = max.(0.0, N_prey_prev .+ d_prey .+ innov_matrix_prey_device[:, t])
+                    dyn_field_predator_device[:, t] = max.(0.0, N_pred_prev .+ d_pred .+ innov_matrix_predator_device[:, t])
                 end
                 
-                final_dyn_field = if output_species == :prey
-                    dyn_field_prey
-                else
-                    dyn_field_predator
-                end
-                final_dyn_field .*= current_sigma
-                log_final_dyn_field = log.(final_dyn_field .+ 1e-6)
-
-                for obs_idx in 1:N_total
-                    effect_k[obs_idx, j] = log_final_dyn_field[s_idx_full[obs_idx], t_idx_full[obs_idx]]
-                end
+                final_dyn_field = (output_species == :prey) ? dyn_field_prey_device : dyn_field_predator_device
+                final_dyn_field .*= sigma_samples_cpu[j]
+                dyn_field_all_samples[:, j] = vec(final_dyn_field)
             end
+
+            log_dyn_field = log.(dyn_field_all_samples .+ 1e-6)
+            effect_k = Array(log_dyn_field[st_idx_full, :])
             push!(structured_effects, effect_k)
 
-        elseif model_type == "leslie_matrix"
-            n_classes = get(params, :n_age_classes, outcomes_N)
-            spatially_varying_K = get(params, :spatially_varying_K, false)
-            spatially_varying_rates = get(params, :spatially_varying_rates, false)
-
-            sigma_process_name = _find_parameter(p_names, string(p_names_k.sigma_process), k_outcome, is_multivariate_model)
-            innov_process_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model)
-
-            if isempty(sigma_process_name) || isempty(innov_process_name)
-                @warn "Parameters for Dynamics manifold $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
-                structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
-                return (structured=structured_effects, noisy=structured_effects)
-            end
-
-            sigma_process_samples = get_params_matrix(chain, sigma_process_name, n_classes)
-            innov_process_samples = get_params_matrix(chain, innov_process_name, s_N * t_N * n_classes)
-            
-            local K_samples_j, survival_rates_spatial_j, fecundity_rates_spatial_j
-            if spatially_varying_K
-                sigma_K_name = _find_parameter(p_names, string(p_names_k.sigma_K), k_outcome, is_multivariate_model)
-                log_K_mean_name = _find_parameter(p_names, string(p_names_k.log_K_mean), k_outcome, is_multivariate_model)
-                K_raw_name = _find_parameter(p_names, string(p_names_k.K_raw), k_outcome, is_multivariate_model)
-                if isempty(sigma_K_name) || isempty(log_K_mean_name) || isempty(K_raw_name)
-                    @warn "Spatially varying K parameters for Leslie matrix not found. Returning zero-matrix."
-                    structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
-                    return (structured=structured_effects, noisy=structured_effects)
-                end
-                sigma_K_samples = get_params_vector(chain, sigma_K_name, 1)[:, 1]
-                log_K_mean_samples = get_params_vector(chain, log_K_mean_name, 1)[:, 1]
-                K_raw_samples = get_params_matrix(chain, K_raw_name, s_N)
-            else
-                K_name = _find_parameter(p_names, string(p_names_k.K), k_outcome, is_multivariate_model)
-                if isempty(K_name)
-                    @warn "K parameter for Leslie matrix not found. Returning zero-matrix."
-                    structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
-                    return (structured=structured_effects, noisy=structured_effects)
-                end
-                K_samples = get_params_vector(chain, K_name, 1)[:, 1]
-            end
-
-            if spatially_varying_rates
-                log_fecundity_mean_name = _find_parameter(p_names, string(p_names_k.log_fecundity_mean), k_outcome, is_multivariate_model)
-                sigma_fecundity_name = _find_parameter(p_names, string(p_names_k.sigma_fecundity), k_outcome, is_multivariate_model)
-                fecundity_raw_name = _find_parameter(p_names, string(p_names_k.fecundity_raw), k_outcome, is_multivariate_model)
-                logit_survival_mean_name = _find_parameter(p_names, string(p_names_k.logit_survival_mean), k_outcome, is_multivariate_model)
-                sigma_survival_name = _find_parameter(p_names, string(p_names_k.sigma_survival), k_outcome, is_multivariate_model)
-                survival_raw_name = _find_parameter(p_names, string(p_names_k.survival_raw), k_outcome, is_multivariate_model)
-                if isempty(log_fecundity_mean_name) || isempty(sigma_fecundity_name) || isempty(fecundity_raw_name) || isempty(logit_survival_mean_name) || isempty(sigma_survival_name) || isempty(survival_raw_name)
-                    @warn "Spatially varying rates parameters for Leslie matrix not found. Returning zero-matrix."
-                    structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
-                    return (structured=structured_effects, noisy=structured_effects)
-                end
-                log_fecundity_mean_samples = get_params_matrix(chain, log_fecundity_mean_name, n_classes)
-                sigma_fecundity_samples = get_params_matrix(chain, sigma_fecundity_name, n_classes)
-                fecundity_raw_samples = get_params_matrix(chain, fecundity_raw_name, s_N * n_classes)
-                logit_survival_mean_samples = get_params_matrix(chain, logit_survival_mean_name, n_classes - 1)
-                sigma_survival_samples = get_params_matrix(chain, sigma_survival_name, n_classes - 1)
-                survival_raw_samples = get_params_matrix(chain, survival_raw_name, s_N * (n_classes - 1))
-            else
-                survival_rates_name = _find_parameter(p_names, string(p_names_k.survival_rates), k_outcome, is_multivariate_model)
-                fecundity_rates_name = _find_parameter(p_names, string(p_names_k.fecundity_rates), k_outcome, is_multivariate_model)
-                if isempty(survival_rates_name) || isempty(fecundity_rates_name)
-                    @warn "Fixed rates parameters for Leslie matrix not found. Returning zero-matrix."
-                    structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
-                    return (structured=structured_effects, noisy=structured_effects)
-                end
-                survival_rates_samples = get_params_matrix(chain, survival_rates_name, n_classes - 1)
-                fecundity_rates_samples = get_params_matrix(chain, fecundity_rates_name, n_classes)
-            end
-            
-            effort_keys = spec.hyper.effort_keys
-            q_samples_dict = Dict(key => get_params_matrix(chain, _find_parameter(p_names, "q_$(key)", k_outcome, is_multivariate_model), n_classes) for key in effort_keys)
-            removal_keys = spec.hyper.removal_keys
-
-            age_class_effects = [zeros(Float64, N_total, n_samples) for _ in 1:n_classes]
-            I_s = Matrix(I, s_N, s_N)
-            F_spatial = cholesky(Symmetric(Matrix(L_op) + noise * I_s))
-
-            for j in 1:n_samples
-                current_sigma_process = sigma_process_samples[j, :]
-                current_innov_tensor_flat = innov_process_samples[j, :]
-                
-                innov_tensor = reshape(current_innov_tensor_flat, s_N, t_N, n_classes)
-                if t_N_full > t_N
-                    innov_tensor = cat(innov_tensor, randn(s_N, t_N_full - t_N, n_classes), dims=2)
-                end
-
-                local K_values_j
-                if spatially_varying_K
-                    K_raw_j = K_raw_samples[j, :]
-                    log_K_mean_j = log_K_mean_samples[j]
-                    sigma_K_j = sigma_K_samples[j]
-                    K_field_raw = F_spatial.L' \ K_raw_j
-                    K_values_j = exp.(log_K_mean_j .+ K_field_raw .* sigma_K_j)
-                else
-                    K_values_j = fill(K_samples[j], s_N)
-                end
-
-                population_field_j = zeros(Float64, s_N, t_N_full, n_classes)
-                for a in 1:n_classes
-                    population_field_j[:, 1, a] = max.(0.0, innov_tensor[:, 1, a] .* current_sigma_process[a])
-                end
-
-                for s in 1:s_N
-                    L_s = zeros(Float64, n_classes, n_classes)
-                    if spatially_varying_rates
-                        fecundity_raw_matrix_j = reshape(fecundity_raw_samples[j, :], s_N, n_classes)
-                        fecundity_field = F_spatial.L' \ fecundity_raw_matrix_j'
-                        fecundity_rates_spatial = exp.(log_fecundity_mean_samples[j, :]' .+ fecundity_field .* sigma_fecundity_samples[j, :]')
-                        
-                        survival_raw_matrix_j = reshape(survival_raw_samples[j, :], s_N, n_classes - 1)
-                        survival_field = F_spatial.L' \ survival_raw_matrix_j'
-                        survival_rates_spatial = LogExpFunctions.logistic.(logit_survival_mean_samples[j, :]' .+ survival_field .* sigma_survival_samples[j, :]')
-
-                        for i_age in 1:(n_classes-1); L_s[i_age+1, i_age] = survival_rates_spatial[s, i_age]; end
-                        L_s[1, :] = fecundity_rates_spatial[s, :]
-                    else
-                        current_survival_rates = survival_rates_samples[j, :]
-                        current_fecundity_rates = fecundity_rates_samples[j, :]
-                        for i_age in 1:(n_classes-1); L_s[i_age+1, i_age] = current_survival_rates[i_age]; end
-                        L_s[1, :] = current_fecundity_rates
-                    end
-
-                    for t in 2:t_N_full
-                        N_prev = view(population_field_j, s, t-1, :)
-                        C_prev = zeros(n_classes)
-                        for e_key in effort_keys
-                            C_prev .+= q_samples_dict[e_key][j, :] .* spec.hyper.processed_params[e_key][s, t-1] .* N_prev
-                        end
-                        for r_key in removal_keys
-                            C_prev .+= spec.hyper.processed_params[r_key][s, t-1, :]
-                        end
-                        N_after_removal = max.(0.0, N_prev - C_prev)
-                        
-                        L_effective = copy(L_s)
-                        if spatially_varying_K || haskey(params, :K)
-                            total_pop_prev = sum(N_after_removal)
-                            K_density = K_values_j[s] / areas[s]
-                            dd_factor = max(0.0, 1.0 - (total_pop_prev / areas[s]) / K_density)
-                            L_effective[1, :] .*= dd_factor
-                        end
-                        N_projected = L_effective * N_after_removal
-                        current_innov = view(innov_tensor, s, t, :) .* current_sigma_process
-                        population_field_j[s, t, :] = max.(0.0, N_projected .+ current_innov)
-                    end
-                end
-                
-                for a in 1:n_classes
-                    log_pop_field = log.(view(population_field_j, :, :, a) .+ 1e-6)
-                    for obs_idx in 1:N_total
-                        age_class_effects[a][obs_idx, j] = log_pop_field[s_idx_full[obs_idx], t_idx_full[obs_idx]]
-                    end
-                end
-            end
-            structured_effects = age_class_effects
-
-        elseif model_type == "generalized_lotka_volterra"
-            n_species = M.outcomes_N
-            spatially_varying_K = get(params, :spatially_varying_K, false)
-
-            r_name = _find_parameter(p_names, string(p_names_k.r), k_outcome, is_multivariate_model)
-            alpha_raw_name = _find_parameter(p_names, string(p_names_k.alpha_raw), k_outcome, is_multivariate_model)
-            sigma_process_name = _find_parameter(p_names, string(p_names_k.sigma_process), k_outcome, is_multivariate_model)
-            innov_process_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model)
-
-            if isempty(r_name) || isempty(alpha_raw_name) || isempty(sigma_process_name) || isempty(innov_process_name)
-                @warn "Parameters for Dynamics manifold $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
-                structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
-                return (structured=structured_effects, noisy=structured_effects)
-            end
-
-            r_samples = get_params_matrix(chain, r_name, n_species)
-            alpha_raw_samples = get_params_matrix(chain, alpha_raw_name, n_species * (n_species - 1))
-            sigma_process_samples = get_params_matrix(chain, sigma_process_name, n_species)
-            innov_process_samples = get_params_matrix(chain, innov_process_name, s_N * t_N * n_species)
-            
-            local K_values_j
-            if spatially_varying_K
-                log_K_mean_name = _find_parameter(p_names, string(p_names_k.log_K_mean), k_outcome, is_multivariate_model)
-                sigma_K_name = _find_parameter(p_names, string(p_names_k.sigma_K), k_outcome, is_multivariate_model)
-                K_raw_name = _find_parameter(p_names, string(p_names_k.K_raw), k_outcome, is_multivariate_model)
-                if isempty(log_K_mean_name) || isempty(sigma_K_name) || isempty(K_raw_name)
-                    @warn "Spatially varying K parameters for GLV not found. Returning zero-matrix."
-                    structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
-                    return (structured=structured_effects, noisy=structured_effects)
-                end
-                log_K_mean_samples = get_params_matrix(chain, log_K_mean_name, n_species)
-                sigma_K_samples = get_params_matrix(chain, sigma_K_name, n_species)
-                K_raw_samples = get_params_matrix(chain, K_raw_name, s_N * n_species)
-            else
-                K_name = _find_parameter(p_names, string(p_names_k.K), k_outcome, is_multivariate_model)
-                if isempty(K_name)
-                    @warn "K parameter for GLV not found. Returning zero-matrix."
-                    structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
-                    return (structured=structured_effects, noisy=structured_effects)
-                end
-                K_samples = get_params_matrix(chain, K_name, n_species)
-            end
-
-            species_effects = [zeros(Float64, N_total, n_samples) for _ in 1:n_species]
-            I_s = Matrix(I, s_N, s_N)
-            F_spatial = cholesky(Symmetric(Matrix(L_op) + noise * I_s))
-
-            for j in 1:n_samples
-                alpha_j = diagm(0 => ones(n_species))
-                off_diag_indices = [i for i in 1:(n_species^2) if mod(i-1, n_species+1) != 0]
-                alpha_j[off_diag_indices] = alpha_raw_samples[j, :]
-
-                if spatially_varying_K
-                    K_raw_matrix_j = reshape(K_raw_samples[j, :], s_N, n_species)
-                    K_field = F_spatial.L' \ K_raw_matrix_j
-                    K_values_j = exp.(log_K_mean_samples[j, :]' .+ K_field .* sigma_K_samples[j, :]')
-                else
-                    K_values_j = repeat(K_samples[j, :]', s_N, 1)
-                end
-
-                innov_tensor_j = reshape(innov_process_samples[j, :], s_N, t_N, n_species)
-                if t_N_full > t_N
-                    innov_tensor_j = cat(innov_tensor_j, randn(s_N, t_N_full - t_N, n_species), dims=2)
-                end
-                current_sigma_process = sigma_process_samples[j, :]
-
-                population_field_j = zeros(Float64, s_N, t_N_full, n_species)
-                population_field_j[:, 1, :] = max.(0.0, innov_tensor_j[:, 1, :] .* current_sigma_process')
-
-                for s in 1:s_N, t in 2:t_N_full
-                    N_prev = view(population_field_j, s, t-1, :)
-                    D_prev = N_prev ./ areas[s]
-                    K_density = K_values_j[s, :] ./ areas[s]
-                    
-                    N_intermediate = zeros(Float64, n_species)
-                    for i_species in 1:n_species
-                        interaction_sum_density = dot(alpha_j[i_species, :], D_prev)
-                        growth_density = r_samples[j, i_species] * D_prev[i_species] * (1.0 - interaction_sum_density / K_density[i_species])
-                        N_intermediate[i_species] = N_prev[i_species] + growth_density * areas[s]
-                    end
-                    
-                    current_innov = view(innov_tensor_j, s, t, :) .* current_sigma_process
-                    population_field_j[s, t, :] = max.(0.0, N_intermediate .+ current_innov)
-                end
-
-                for i_species in 1:n_species
-                    log_pop_field = log.(view(population_field_j, :, :, i_species) .+ 1e-6)
-                    for obs_idx in 1:N_total
-                        species_effects[i_species][obs_idx, j] = log_pop_field[s_idx_full[obs_idx], t_idx_full[obs_idx]]
-                    end
-                end
-            end
-            structured_effects = species_effects
+        else
+            @warn "Reconstruction for Dynamics model '$(model_type)' is not implemented for GPU. Returning zero effects."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
         end
     end
-
-    if isempty(structured_effects)
-        @warn "Reconstruction for Dynamics model '$(model_type)' is not implemented or parameters not found. Returning zero effects."
-        structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
-    end
     
+    # For multivariate models like Leslie, the loop over k_outcome populates this.
+    # For univariate, it's populated once.
     return (structured=structured_effects, noisy=structured_effects)
 end
+

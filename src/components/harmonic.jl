@@ -6,7 +6,7 @@ sine and cosine waves. This component can model one or more harmonics, each with
 own amplitude, phase, and potentially its own period.
 
 # Version
-v1.3.3 (2026-08-14)
+v1.4.0 (2026-08-17)
 
 # Mathematical Summary
 The component models a function \$f(t)\$ as a sum of sinusoids. It supports two
@@ -112,12 +112,24 @@ function get_precomputes(
         )
     end
     
-    u_idx = M.data[!, u_var_sym]
-    u_N = length(unique(u_idx))
-    u_idx_var = u_var_sym # Store the symbol for the variable name
+    to_device = M.to_device
+    
+    # The index vector itself is already on the device as part of M.data
+    u_idx_device = M.data[!, u_var_sym]
+    
+    # Bring to CPU for `unique` as it can be slow on GPU, but keep the original device array
+    u_idx_cpu = Array(u_idx_device)
+    u_N = length(unique(u_idx_cpu))
+    u_idx_var = u_var_sym
 
-    u_coords = collect(1.0:u_N) # Generate coordinates for the unique levels.
-    return (u_coords=u_coords, u_idx=u_idx, u_N=u_N, u_idx_var=u_idx_var)
+    u_coords_cpu = collect(1.0:u_N)
+    
+    return (
+        u_coords=to_device(u_coords_cpu), 
+        u_idx=u_idx_device, # Pass the original device array
+        u_N=u_N, 
+        u_idx_var=u_idx_var
+    )
 end
 
 function get_priors(
@@ -131,14 +143,14 @@ function get_priors(
         # Priors for cosine and sine coefficients
         beta_cos_prior = _distribution_to_string(Normal(0, 1))
         beta_sin_prior = _distribution_to_string(Normal(0, 1))
-        push!(priors, "$(p_names.beta_cos) ~ DynamicPPL.NamedDist(filldist($(beta_cos_prior), $(m.nharmonics)), :$(p_names.beta_cos))")
-        push!(priors, "$(p_names.beta_sin) ~ DynamicPPL.NamedDist(filldist($(beta_sin_prior), $(m.nharmonics)), :$(p_names.beta_sin))")
+        push!(priors, "$(p_names.beta_cos) ~ filldist($(beta_cos_prior), $(m.nharmonics))")
+        push!(priors, "$(p_names.beta_sin) ~ filldist($(beta_sin_prior), $(m.nharmonics))")
     elseif m.method == :ampphase
         # Priors for amplitude and phase
         amplitude_prior_str = _distribution_to_string(m.amplitude)
         phase_prior_str = _distribution_to_string(m.phase)
-        push!(priors, "$(p_names.amplitude) ~ DynamicPPL.NamedDist(filldist($(amplitude_prior_str), $(m.nharmonics)), :$(p_names.amplitude))")
-        push!(priors, "$(p_names.phase) ~ DynamicPPL.NamedDist(filldist($(phase_prior_str), $(m.nharmonics)), :$(p_names.phase))")
+        push!(priors, "$(p_names.amplitude) ~ filldist($(amplitude_prior_str), $(m.nharmonics))")
+        push!(priors, "$(p_names.phase) ~ filldist($(phase_prior_str), $(m.nharmonics))")
     end
 
     if m.period isa UnivariateDistribution
@@ -148,7 +160,6 @@ function get_priors(
         push!(priors, "$(p_names.period) ~ filldist($(period_prior_str), $(m.nharmonics))")
     end
 
-    # Prior for the innovations (raw coefficients)
     return join(priors, "\n    ")
 end
 
@@ -157,7 +168,7 @@ function get_updates(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    u_coords_access = "spec_registry[:$(spec.key)].hyper.u_coords" # Access pre-computed coordinates
+    u_coords_access = "spec_registry[:$(spec.key)].hyper.u_coords"
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
 
     period_access_code = if m.period isa Real
@@ -174,118 +185,150 @@ function get_updates(
 
     loop_body = ""
     if m.method == :twocoefficient
-        loop_body = """ # Use local for variables within the let block
-            local b_cos = $(m.nharmonics > 1 ? "$(p_names.beta_cos)[k]" : p_names.beta_cos)
-            local b_sin = $(m.nharmonics > 1 ? "$(p_names.beta_sin)[k]" : p_names.beta_sin)
-            local period_val = $(period_access_code)
+        loop_body = """
+            b_cos = $(m.nharmonics > 1 ? "$(p_names.beta_cos)[k]" : p_names.beta_cos)
+            b_sin = $(m.nharmonics > 1 ? "$(p_names.beta_sin)[k]" : p_names.beta_sin)
+            period_val = $(period_access_code)
             
-            local angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
-            $(p_names.latent) .+= b_cos .* cos.(angle) .+ b_sin .* sin.(angle) # Accumulate effect
+            angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
+            $(p_names.latent) .+= b_cos .* cos.(angle) .+ b_sin .* sin.(angle)
         """
     else # :ampphase
-        loop_body = """ # Use local for variables within the let block
-            local amp = $(m.nharmonics > 1 ? "$(p_names.amplitude)[k]" : p_names.amplitude)
-            local phase = $(m.nharmonics > 1 ? "$(p_names.phase)[k]" : p_names.phase)
-            local period_val = $(period_access_code)
+        loop_body = """
+            amp = $(m.nharmonics > 1 ? "$(p_names.amplitude)[k]" : p_names.amplitude)
+            phase = $(m.nharmonics > 1 ? "$(p_names.phase)[k]" : p_names.phase)
+            period_val = $(period_access_code)
             
-            local angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
-            $(p_names.latent) .+= amp .* cos.(angle .+ (2 * pi * phase)) # Accumulate effect
+            angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
+            $(p_names.latent) .+= amp .* cos.(angle .+ (2 * pi * phase))
         """
     end
 
-    # Initialize latent field with a type inferred from a sampled parameter.
     init_param = if m.method == :twocoefficient; p_names.beta_cos; else; p_names.amplitude; end
     
     return """
         # --- Harmonic Component: $(spec.key) ($(m.method)) ---
         let
-            local T_num = eltype($(init_param)) # Promote numeric type for AD compatibility
-            local u_N_val = spec_registry[:$(spec.key)].hyper.u_N # Access pre-computed u_N
-            local u_idx_val = spec_registry[:$(spec.key)].hyper.u_idx # Access pre-computed u_idx
-            $(p_names.latent) = zeros(T_num, u_N_val) # Initialize latent field
+            T_num = eltype($(init_param))
+            u_N_val = spec_registry[:$(spec.key)].hyper.u_N
+            u_idx_val = spec_registry[:$(spec.key)].hyper.u_idx
+            $(p_names.latent) = zeros(T_num, u_N_val)
             for k in 1:$(m.nharmonics)
                 $(loop_body)
             end
-            $(eta_target) .+= view($(p_names.latent), u_idx_val) # Add to linear predictor
+            $(eta_target) .+= view($(p_names.latent), u_idx_val)
         end
     """
 end
 
 function get_effects(
-    m::Harmonic, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::Harmonic, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}() # Initialize container for effects
-    hyper = spec.hyper # Access pre-computed data from spec.hyper
-    u_coords = hyper.u_coords # Coordinates for the harmonic basis
-    u_idx_full = isnothing(PS) ? hyper.u_idx : vcat(hyper.u_idx, PS.u_idx) # Full index for train + prediction
+    # --- Setup ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    p_names = names(chain)
+    to_device = M.to_device
+    hyper = spec.hyper
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names_vec = string.(FlexiChains.parameters(chain))
+    u_coords_device = hyper.u_coords
+    u_N_hyper = hyper.u_N
 
+    # --- Index Handling ---
+    u_idx_train_device = hyper.u_idx
+    u_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, hyper.u_idx_var)
+        u_idx_pred_cpu = PS.data[!, hyper.u_idx_var]
+        vcat(u_idx_train_device, to_device(u_idx_pred_cpu))
+    else
+        u_idx_train_device
+    end
+    N_total = length(u_idx_full_device)
+
+    structured_effects = Vector{Matrix{Float64}}()
+
+    # --- Reconstruction Loop ---
     for k_outcome in 1:outcomes_N
-        reconstructed_effects_k = zeros(Float64, M.u_N, n_samples)
-        
-        p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome) # Generate outcome-specific names
-        period_name = _find_parameter(p_names_vec, string(p_names_k.period), k_outcome, is_multivariate_model)
-        
-        period_samples = if m.period isa Real # If period is a fixed real value
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
+
+        # --- Get Period Samples ---
+        period_name = _find_parameter(p_names, string(p_names_k.period), k_outcome, is_multivariate_model)
+        period_samples_cpu = if m.period isa Real
             fill(m.period, n_samples, m.nharmonics)
         elseif m.period isa Vector{<:Real}
             repeat(m.period', n_samples, 1)
         else
             if isempty(period_name)
                 @warn "Period parameter for Harmonic component $(spec.key) not found. Using prior mean."
-                mean_period = m.period isa Vector ? mean.(m.period) : mean(m.period)
+                mean_period = m.period isa Vector ? mean.(m.period) : [mean(m.period)]
                 repeat(mean_period', n_samples, 1)
             else
-                get_params_vector(chain, period_name, m.nharmonics)
+                get_params_matrix(chain, period_name, m.nharmonics)
             end
         end
+        
+        # Reshape for broadcasting: [1, n_samples, n_harmonics]
+        period_samples_device = to_device(reshape(period_samples_cpu, 1, n_samples, m.nharmonics))
 
-        for i in 1:n_samples
-            sample_effect = zeros(hyper.u_N) # Initialize effect for current sample
-            for k_harmonic in 1:m.nharmonics
-                period_ik = m.period isa Vector ? period_samples[i, k_harmonic] : period_samples[i]
-                angle = (2 * pi * k_harmonic / period_ik) .* u_coords
-                
-                if m.method == :twocoefficient
-                    b_cos_name = _find_parameter(p_names_vec, string(p_names_k.beta_cos), k_outcome, is_multivariate_model)
-                    b_sin_name = _find_parameter(p_names_vec, string(p_names_k.beta_sin), k_outcome, is_multivariate_model)
-                    if isempty(b_cos_name) || isempty(b_sin_name)
-                        @warn "beta_cos or beta_sin parameters for Harmonic component $(spec.key) (outcome $k_outcome) not found. Skipping reconstruction for this sample."
-                        continue
-                    end
-                    
-                    # Extract samples for current harmonic
-                    b_cos_samps = get_params_vector(chain, b_cos_name, m.nharmonics)
-                    b_sin_samps = get_params_vector(chain, b_sin_name, m.nharmonics)
-                    b_cos_ik = m.nharmonics > 1 ? b_cos_samps[i, k_harmonic] : b_cos_samps[i]
-                    b_sin_ik = m.nharmonics > 1 ? b_sin_samps[i, k_harmonic] : b_sin_samps[i]
-                    
-                    sample_effect .+= b_cos_ik .* cos.(angle) .+ b_sin_ik .* sin.(angle) # Accumulate effect
-                else # :ampphase
-                    amp_name = _find_parameter(p_names_vec, string(p_names_k.amplitude), k_outcome, is_multivariate_model)
-                    phase_name = _find_parameter(p_names_vec, string(p_names_k.phase), k_outcome, is_multivariate_model)
-                    if isempty(amp_name) || isempty(phase_name)
-                        @warn "amplitude or phase parameters for Harmonic component $(spec.key) (outcome $k_outcome) not found. Skipping reconstruction for this sample."
-                        continue
-                    end
+        # --- Calculate Angles ---
+        # u_coords: [u_N, 1, 1], k_harmonics: [1, 1, n_harmonics]
+        u_coords_tensor = reshape(u_coords_device, u_N_hyper, 1, 1)
+        k_harmonics_tensor = to_device(reshape(1:m.nharmonics, 1, 1, m.nharmonics))
+        
+        # Broadcasting happens here
+        angle_tensor = (2 * pi .* k_harmonics_tensor ./ period_samples_device) .* u_coords_tensor
+        
+        cos_angle = cos.(angle_tensor)
+        sin_angle = sin.(angle_tensor)
 
-                    # Extract samples for current harmonic
-                    amp_samps = get_params_vector(chain, amp_name, m.nharmonics)
-                    phase_samps = get_params_vector(chain, phase_name, m.nharmonics)
-                    amp_ik = m.nharmonics > 1 ? amp_samps[i, k_harmonic] : amp_samps[i]
-                    phase_ik = m.nharmonics > 1 ? phase_samps[i, k_harmonic] : phase_samps[i]
-                    
-                    sample_effect .+= amp_ik .* cos.(angle .+ (2 * pi * phase_ik)) # Accumulate effect
-                end
+        # --- Get Coefficient Samples and Compute Effect ---
+        local reconstructed_effects_k_device
+        if m.method == :twocoefficient
+            b_cos_name = _find_parameter(p_names, string(p_names_k.beta_cos), k_outcome, is_multivariate_model)
+            b_sin_name = _find_parameter(p_names, string(p_names_k.beta_sin), k_outcome, is_multivariate_model)
+            
+            if isempty(b_cos_name) || isempty(b_sin_name)
+                @warn "beta_cos or beta_sin for Harmonic $(spec.key) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
             end
-            reconstructed_effects_k[:, i] = sample_effect
-        end # End of samples loop
 
-        indexed_effects = reconstructed_effects_k[u_idx_full, :] # Index to full observation set
-        push!(structured_effects, indexed_effects)
+            b_cos_samples_cpu = get_params_matrix(chain, b_cos_name, m.nharmonics)
+            b_sin_samples_cpu = get_params_matrix(chain, b_sin_name, m.nharmonics)
+
+            # Reshape for broadcasting: [1, n_samples, n_harmonics]
+            b_cos_tensor = to_device(reshape(b_cos_samples_cpu, 1, n_samples, m.nharmonics))
+            b_sin_tensor = to_device(reshape(b_sin_samples_cpu, 1, n_samples, m.nharmonics))
+
+            harmonic_effects = b_cos_tensor .* cos_angle .+ b_sin_tensor .* sin_angle
+            reconstructed_effects_k_device = dropdims(sum(harmonic_effects, dims=3), dims=3) # Result is [u_N, n_samples]
+
+        else # :ampphase
+            amp_name = _find_parameter(p_names, string(p_names_k.amplitude), k_outcome, is_multivariate_model)
+            phase_name = _find_parameter(p_names, string(p_names_k.phase), k_outcome, is_multivariate_model)
+
+            if isempty(amp_name) || isempty(phase_name)
+                @warn "amplitude or phase for Harmonic $(spec.key) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+
+            amp_samples_cpu = get_params_matrix(chain, amp_name, m.nharmonics)
+            phase_samples_cpu = get_params_matrix(chain, phase_name, m.nharmonics)
+
+            # Reshape for broadcasting: [1, n_samples, n_harmonics]
+            amp_tensor = to_device(reshape(amp_samples_cpu, 1, n_samples, m.nharmonics))
+            phase_tensor = to_device(reshape(phase_samples_cpu, 1, n_samples, m.nharmonics))
+
+            harmonic_effects = amp_tensor .* cos.(angle_tensor .+ (2 * pi .* phase_tensor))
+            reconstructed_effects_k_device = dropdims(sum(harmonic_effects, dims=3), dims=3) # Result is [u_N, n_samples]
+        end
+
+        # --- Index and Finalize ---
+        indexed_effects_device = reconstructed_effects_k_device[u_idx_full_device, :]
+        push!(structured_effects, Array(indexed_effects_device))
     end
 
     return (structured=structured_effects, noisy=structured_effects)
 end
+

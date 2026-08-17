@@ -105,9 +105,7 @@ function get_priors(
     
     return join(priors, "\n    ")
 end
-
-# These helper functions must be available in the scope where the Turing model is evaluated.
-# They are defined here and assumed to be loaded into the `bstm` module.
+ 
 
 function _poincare_dist_sq(u, v, curvature)
     c = sqrt(max(0.0, -curvature))
@@ -129,19 +127,39 @@ function _poincare_dist_sq(u, v, curvature)
 end
 
 function _evaluate_hyperbolic_kernel_matrix(coords, sigma, curvature, noise)
-    n = size(coords, 1)
     T = eltype(coords)
-    K = zeros(T, n, n)
-    
-    for i in 1:n
-        for j in i:n
-            dist_sq = _poincare_dist_sq(view(coords, i, :), view(coords, j, :), curvature)
-            # Using a squared exponential kernel with fixed lengthscale of 1
-            K[i, j] = K[j, i] = sigma^2 * exp(-0.5 * dist_sq)
-        end
+    n = size(coords, 1)
+    c = sqrt(max(zero(T), -T(curvature)))
+
+    if c == 0.0 # Fallback to Euclidean distance with SE kernel
+        # GPU-compatible pairwise squared Euclidean distance
+        sq_dists = sum(coords.^2, dims=2) .+ sum(coords.^2, dims=2)' .- 2 * (coords * coords')
+        K = sigma^2 .* exp.(-0.5 .* sq_dists)
+        return K + T(noise) * I
     end
-    return K + (noise * I)
+
+    # Calculate squared norms for all points
+    norm_sq = sum(coords.^2, dims=2)
+
+    # Pairwise squared Euclidean distances
+    diff_sq = norm_sq .+ norm_sq' .- 2 * (coords * coords')
+    
+    # Denominator for hyperbolic distance formula, with epsilon for stability
+    denom = (1.0 .- norm_sq .+ T(1e-9)) * (1.0 .- norm_sq' .+ T(1e-9))
+
+    # Argument for acosh, computed element-wise
+    arg = 1.0 .+ 2.0 .* diff_sq ./ denom
+
+    # Compute squared hyperbolic distance matrix
+    # acosh.(max.(one(T), arg)) ensures the argument is >= 1
+    dist_sq = (acosh.(max.(one(T), arg)) ./ c).^2
+
+    # Squared exponential kernel on hyperbolic distances
+    K = sigma^2 .* exp.(-0.5 .* dist_sq)
+    
+    return K + T(noise) * I
 end
+
 
 function get_updates(
     m::Hyperbolic, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -169,26 +187,36 @@ function get_updates(
     """
 end
 
+
 function get_effects(
-    m::Hyperbolic, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    p_names::Vector{String}, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, 
-    N_total::Int, is_multivariate_model::Bool
+    m::Hyperbolic, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    
+    # --- Setup: Extract dimensions and identify device ---
+    n_samples = size(chain, 1) * size(chain, 3)
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = names(chain)
+    to_device = M.to_device
+
+    # --- Coordinate Handling: Combine training and prediction sets on device ---
     coord_vars = get(spec.params, :positional_args, [])
-    coords_train = spec.hyper.coords
+    coords_train = spec.hyper.coords # Already on device
+
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        vcat(coords_train, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
+        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+        vcat(coords_train, to_device(coords_pred_cpu))
     else
         coords_train
     end
     n_obs_train = size(coords_train, 1)
     n_obs_full = size(coords_full, 1)
-    
+
     noise = M.noise
     curvature = m.curvature
+    structured_effects = Vector{Matrix{Float64}}()
 
+    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
@@ -200,18 +228,33 @@ function get_effects(
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_matrix(chain, innovations_name, n_obs_train)
+        # Extract posterior samples (these are on the CPU)
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_obs_train)
 
-        effect_k = zeros(Float64, n_obs_full, n_samples)
+        # Initialize the output matrix for the full effect on the target device
+        effect_k_device = to_device(zeros(Float64, n_obs_full, n_samples))
 
+        # --- Sample-wise Reconstruction on the Target Device ---
         for i in 1:n_samples
-            K_mat = _evaluate_hyperbolic_kernel_matrix(coords_full, sigma_samples[i], curvature, noise)
+            # Kernel evaluation and Cholesky happen on the device
+            K_mat = _evaluate_hyperbolic_kernel_matrix(coords_full, sigma_samples_cpu[i], curvature, noise)
             F = cholesky(Symmetric(K_mat))
-            innov_i = vcat(innovations_samples[i, :], randn(n_obs_full - n_obs_train))
-            effect_k[:, i] = F.L * innov_i
+
+            # Combine training innovations with new innovations for prediction points on the device
+            innov_train_device = to_device(innovations_samples_cpu[i, :])
+            innov_i_device = if n_obs_full > n_obs_train
+                innov_pred_device = to_device(randn(Float32, n_obs_full - n_obs_train))
+                vcat(innov_train_device, innov_pred_device)
+            else
+                innov_train_device
+            end
+
+            effect_k_device[:, i] = F.L * innov_i_device
         end
-        push!(structured_effects, effect_k)
+        
+        # Move the final result for this outcome back to the CPU
+        push!(structured_effects, Array(effect_k_device))
     end
     
     return (structured=structured_effects, noisy=structured_effects)
