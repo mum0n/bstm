@@ -5092,7 +5092,6 @@ function _distribution_to_string(d::Distribution)
     end
 end
 
-
 """
     get_optimal_sampler(model_obj::DynamicPPL.Model; ...)
 
@@ -5100,21 +5099,31 @@ Constructs an efficient composite MCMC sampler for a `bstm` model by assigning
 specialized samplers to different parameter blocks.
 
 # Version
-v1.4.8 (2026-08-20)
+v1.5.1 (2026-08-20)
 
 # Rationale
 This function is a core utility for the `bstm` inference engine. It replaces a
 simple, one-size-fits-all sampler selection with a sophisticated, multi-stage
 process that builds a composite `Gibbs` sampler tailored to the model's structure.
 
-This version corrects a `MethodError` that occurred when indexing the `vi.values`
-`VarNamedTuple` and addresses warnings about the use of non-public `DynamicPPL`
-functions. The `MethodError` was resolved by using the `VarName` object `vn`
-directly for indexing (i.e., `vi.values[vn]`). The warnings are resolved by:
-1.  Replacing the internal `DynamicPPL.keys(vi)` with the public API `keys(vi)`.
-2.  Replacing the internal `DynamicPPL.getsym(vn)` with the public field accessor `vn.name`.
-These changes ensure the function is robust, idiomatic, and aligned with the current
-`DynamicPPL` API.
+This version has been rewritten to use the modern, public API of `DynamicPPL.jl`,
+resolving `MethodError` and deprecation warnings from previous versions. The key
+corrections are:
+1.  **Correct Parameter Name Matching**: Uses `vn.name` to match parameter symbols
+    (e.g., in `sampler_map`) and `string(vn)` for string-based matching (e.g., for
+    component grouping), replacing the incorrect use of `vn.optic`.
+2.  **Public API for `VarInfo`**: Uses `keys(vi)` and `get(vi, vn)` which are part of
+    the public API, ensuring forward compatibility.
+3.  **Robust Type Inference**: Uses `eltype(get(vi, vn))` for determining parameter
+    types, which correctly handles the underlying data structures of `VarInfo`.
+4.  **Generalization**: The logic for categorizing parameters has been made more
+    general and less reliant on internal implementation details of `DynamicPPL`.
+5.  **Dense Mass Matrix Adaptation**: Introduces an option to use `DenseEuclideanMetric`
+    for `NUTS` samplers assigned to model component groups, where parameters are
+    often highly correlated, leading to more efficient exploration of the posterior.
+6.  **Refined AD Backend Selection**: The heuristic for selecting the AD backend
+    (e.g., `AutoForwardDiff` vs. `AutoEnzyme`) is now applied at the block level,
+    allowing for more granular optimization based on the size of each parameter block.
 
 # Workflow
 The function constructs the sampler in a series of stages, with each stage having
@@ -5129,6 +5138,7 @@ higher precedence than the next:
     samplers to specific parameter groups.
 4.  **Component Grouping**: If `group_components=true`, the function identifies all
     parameters belonging to the same model component and assigns them to a joint `NUTS` sampler.
+    For these blocks, a `DenseEuclideanMetric` can be optionally used.
 5.  **Default Categorization**: Any remaining parameters are categorized by their support,
     inferred from their value type and transform strategy:
     - **Discrete**: Inferred if the parameter's value is an `Integer`. Assigned to `PG`.
@@ -5140,11 +5150,12 @@ higher precedence than the next:
 - `sampler_choice`: A specific sampler instance to use, or `:auto` for automatic selection.
 - `sampler_map`: A `Dict` mapping parameter `Symbol`s to specific samplers.
 - `adtype`: The automatic differentiation backend to use for gradient-based samplers.
-- `target_acceptance`: The target acceptance rate for HMC-based samplers.
-- `adaptation_steps`: The number of adaptation steps for HMC-based samplers.
 - `group_components`: A `Bool` indicating whether to group component parameters for joint sampling.
+- `use_dense_metric_for_components::Bool`: If `true`, `DenseEuclideanMetric` is used for `NUTS` samplers assigned to component groups. Otherwise, `DiagEuclideanMetric` is used.
+- `adaptation_steps`: The number of adaptation steps for HMC-based samplers.
+- `target_acceptance`: The target acceptance rate for HMC-based samplers.
 - `n_particles`: The number of particles for the `PG` sampler.
-- `n_chains::Int`: The number of chains to be run. Default: `1`.
+- `n_chains::Int`: The number of chains to be run. This parameter is primarily used by the `sample` function and does not directly affect the construction of the `Gibbs` or `NUTS` samplers themselves.
 
 # Returns
 - An `AbstractMCMC.AbstractSampler` object.
@@ -5155,33 +5166,42 @@ function get_optimal_sampler(
     sampler_map::Dict{Symbol, <:AbstractMCMC.AbstractSampler}=Dict{Symbol, AbstractMCMC.AbstractSampler}(),
     adtype::ADTypes.AbstractADType=ADTypes.AutoForwardDiff(),
     group_components::Bool=true,
+    use_dense_metric_for_components::Bool=true, # New argument for dense mass matrix
     adaptation_steps::Int=500,
     target_acceptance::Float64=0.8,
     n_particles::Int=20,
-    n_chains::Int=1
+    n_chains::Int=1 # Kept for consistency, but primarily for `sample` call
 )
+    # --- Stage 0: Handle direct sampler choice ---
+    # If a specific sampler instance is provided, use it directly.
     if sampler_choice isa AbstractMCMC.AbstractSampler
         return sampler_choice
     end
 
+    # --- Initialize VarInfo and determine global AD backend ---
     # Instantiate and populate the VarInfo object to get variable names and types.
     vi = DynamicPPL.VarInfo(model_obj)
     vns = keys(vi)
     num_params = length(vns)
 
-    # --- AD Engine Selection ---
+    # Determine the global AD backend to use based on model size.
+    # For large models, Enzyme is often more performant.
     adtype_to_use = adtype
     param_threshold = 100
     if adtype isa ADTypes.AutoForwardDiff && num_params > param_threshold
         adtype_to_use = ADTypes.AutoEnzyme()
+        @info "Model has > $(param_threshold) parameters. Switching global AD backend to Enzyme for performance."
     end
 
+    # Initialize lists to store sampler assignments and track processed variables.
     sampler_assignments = []
     all_processed_vns = Set{VarName}()
 
     # --- Stage 1: Handle user-provided sampler map (highest precedence) ---
+    # Iterate through the user's sampler map and assign samplers to specified parameters.
     for (param_sym, sampler) in sampler_map
-        sym_vns = filter(vn -> vn.optic == param_sym, vns)
+        # Match VarNames by their symbolic name (vn.name).
+        sym_vns = filter(vn -> vn.name == param_sym, vns)
         if !isempty(sym_vns)
             push!(sampler_assignments, Tuple(sym_vns) => sampler)
             union!(all_processed_vns, sym_vns)
@@ -5191,47 +5211,65 @@ function get_optimal_sampler(
     end
 
     # --- Stage 2: Group parameters by model component if enabled ---
-    if group_components
+    # Identify parameters belonging to the same model component and group them for joint sampling.
+    if group_components && hasproperty(model_obj.args.M, :components)
+        # Get component keys from the model configuration.
         component_keys = string.([spec.key for spec in model_obj.args.M.components])
+        # Sort by length in reverse to prioritize longer, more specific keys (e.g., "spatial_key" before "key").
         sort!(component_keys, by=length, rev=true)
 
         component_groups = Dict{String, Set{VarName}}()
-        vns_to_check = filter(vn -> !(vn in all_processed_vns), vns)
+        # Only consider variables not yet processed by the user's sampler map.
+        vns_to_check = setdiff(vns, all_processed_vns)
 
         for vn in vns_to_check
-            if !(eltype(vi.values[vn]) <: Integer)
-                vn_str = string(vn.optic)
-                found_key = nothing
-                for key in component_keys
-                    if occursin(Regex("_$(key)(_\\d+)?\$"), vn_str) || startswith(vn_str, "$(key)_")
-                        found_key = key
-                        break
-                    end
+            # Use `string(vn)` for matching, which produces names like `param[1]`.
+            # The symbol is `vn.name`.
+            vn_str = string(vn)
+            found_key = nothing
+            for key in component_keys
+                # Match if the variable name ends with `_key` or `_key_d` (for indexed parameters).
+                # Or if it starts with `key_` (for parameters directly named after the component).
+                if occursin(Regex("_$(key)(_\\d+)?\$"), vn_str) || startswith(vn_str, "$(key)_")
+                    found_key = key
+                    break
                 end
-                
-                if !isnothing(found_key)
-                    if !haskey(component_groups, found_key)
-                        component_groups[found_key] = Set{VarName}()
-                    end
-                    push!(component_groups[found_key], vn)
+            end
+            
+            if !isnothing(found_key)
+                if !haskey(component_groups, found_key)
+                    component_groups[found_key] = Set{VarName}()
                 end
+                push!(component_groups[found_key], vn)
             end
         end
 
         for (key, params_vns) in component_groups
+            # Ensure we don't re-process variables already handled by the user map.
             params_to_process = setdiff(params_vns, all_processed_vns)
             if isempty(params_to_process); continue; end
 
-            sampler = NUTS(adaptation_steps, target_acceptance; adtype=adtype_to_use)
+            # Refined AD backend selection for this specific block.
+            # Use ForwardDiff for very small blocks, otherwise the global AD backend.
+            block_adtype = if length(params_to_process) <= 10
+                ADTypes.AutoForwardDiff()
+            else
+                adtype_to_use
+            end
+
+            # Use DenseEuclideanMetric for component groups if enabled, as parameters
+            # within a component are often highly correlated.
+            metric_type = use_dense_metric_for_components ? DenseEuclideanMetric() : DiagEuclideanMetric()
+            sampler = NUTS(adaptation_steps, target_acceptance; adtype=block_adtype, metric=metric_type)
             push!(sampler_assignments, Tuple(params_to_process) => sampler)
             union!(all_processed_vns, params_to_process)
         end
     end
 
     # --- Stage 3: Assign samplers to remaining parameters based on their support ---
-    remaining_vns = filter(vn -> !(vn in all_processed_vns), vns)
+    # Categorize any remaining parameters (not yet assigned) by their type and support.
+    remaining_vns = setdiff(vns, all_processed_vns)
     if !isempty(remaining_vns)
-
         param_groups = Dict(
             :discrete => Set{VarName}(), 
             :bounded => Set{VarName}(), 
@@ -5240,19 +5278,24 @@ function get_optimal_sampler(
 
         for vn in remaining_vns
             try
-                if eltype(vi.values[vn]) <: Integer
+                # Check for discrete parameters (e.g., integer types).
+                if eltype(get(vi, vn)) <: Integer
                     push!(param_groups[:discrete], vn)
                     continue
                 end
 
+                # Check for bounded parameters by inspecting their transform strategy.
+                # This is the most reliable way to infer support from DynamicPPL.
                 if haskey(vi.transform_strategy, vn)
                     transform = vi.transform_strategy[vn]
                     if transform isa Bijectors.Exp || transform isa Bijectors.Logistic
                         push!(param_groups[:bounded], vn)
                     else 
+                        # If a transform exists but is not Exp or Logistic, assume unbounded continuous.
                         push!(param_groups[:other_continuous], vn)
                     end
                 else
+                    # If no specific transform, assume unbounded continuous.
                     push!(param_groups[:other_continuous], vn)
                 end
             catch e
@@ -5261,42 +5304,47 @@ function get_optimal_sampler(
             end
         end
 
+        # Assign PG sampler to discrete parameters.
         if !isempty(param_groups[:discrete])
-            params = Tuple(param_groups[:discrete])
-            push!(sampler_assignments, params => PG(n_particles))
+            push!(sampler_assignments, Tuple(param_groups[:discrete]) => PG(n_particles))
         end
 
+        # Assign Slice sampler to bounded continuous parameters.
         if !isempty(param_groups[:bounded])
-            params = Tuple(param_groups[:bounded])
-            push!(sampler_assignments, params => Slice())
+            push!(sampler_assignments, Tuple(param_groups[:bounded]) => Slice())
         end
 
+        # Assign NUTS sampler to other unbounded continuous parameters.
         if !isempty(param_groups[:other_continuous])
             params = Tuple(param_groups[:other_continuous])
             
+            # Refined AD backend selection for this block.
             block_adtype = if length(params) <= 10
                 ADTypes.AutoForwardDiff()
             else
                 adtype_to_use
             end
 
+            # Default to DiagEuclideanMetric for general continuous blocks.
             push!(sampler_assignments, 
-                params => NUTS(adaptation_steps, target_acceptance; adtype=block_adtype)
+                params => NUTS(adaptation_steps, target_acceptance; adtype=block_adtype, metric=DiagEuclideanMetric())
             )
         end
     end
 
     # --- Stage 4: Construct and return the final composite sampler ---
+    # If no parameters were identified for sampling, default to a single NUTS sampler.
     if isempty(sampler_assignments)
         @warn "Could not identify any parameters to sample. Defaulting to a single NUTS sampler for all parameters."
         return NUTS(adaptation_steps, target_acceptance; adtype=adtype_to_use)
+    # If only one sampler assignment exists, return that sampler directly.
     elseif length(sampler_assignments) == 1
         return sampler_assignments[1][2]
+    # Otherwise, construct a Gibbs sampler from all the assignments.
     else
         return Gibbs(sampler_assignments...)
     end
 end
-
 
 
 
