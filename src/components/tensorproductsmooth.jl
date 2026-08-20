@@ -86,7 +86,7 @@ function get_precomputes(m::TensorProductSmooth, M::NamedTuple, mod_data::Dict):
 
         child_spec = (
             key = child_mod_data[:key],
-            structure = MODEL_TO_STRUCTURE_MAP[typeof(child_component_obj)],
+            structure = get_component_structure(child_component_obj),
             var = join(child_mod_data[:variables], "_"),
             component_obj = child_component_obj,
             params = child_mod_data[:params],
@@ -111,7 +111,7 @@ function get_priors(
     return """
     # Priors for Spatiotemporal Interaction: $(spec.key)
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.innovations) ~ MvNormal(
+    $(p_names.ure) ~ MvNormal(
         zeros(T, spec_registry[:$(key)].hyper.n_latent), I
     )
     """
@@ -151,7 +151,7 @@ function get_updates(
             $(cholesky_base_code)
             local C_s = cholesky(Symmetric(Matrix(Q_s) + M.noise * I))
             local C_t = cholesky(Symmetric(Matrix(Q_t) + M.noise * I))
-            local Z_matrix = reshape($(p_names.innovations), $(s_N), $(t_N))
+            local Z_matrix = reshape($(p_names.ure), $(s_N), $(t_N))
             local tmp_spatial = C_s.L' \\ Z_matrix
             local st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
             Turing.@addlogprob! logpdf(Normal(0, 0.001 * ($(s_N) * $(t_N))), sum(st_field_unscaled))
@@ -166,7 +166,7 @@ function get_updates(
             $(cholesky_base_code)
             local C_s = cholesky(Symmetric(Q_s + M.noise * I))
             local C_t = cholesky(Symmetric(Q_t + M.noise * I))
-            local Z_matrix = reshape($(p_names.innovations), $(s_N), $(t_N))
+            local Z_matrix = reshape($(p_names.ure), $(s_N), $(t_N))
             local tmp_spatial = C_s.L' \\ Z_matrix
             local st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
             Turing.@addlogprob! logpdf(Normal(0, 0.001 * ($(s_N) * $(t_N))), sum(st_field_unscaled))
@@ -223,12 +223,12 @@ function get_effects(
         t_v = generate_full_variable_names(t_spec, M.model_arch, k)
 
         sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
         
         s_rho_name = hasproperty(s_spec.component_obj, :rho) ? _find_parameter(p_names, string(s_v.rho), k, is_multivariate_model) : ""
         t_rho_name = hasproperty(t_spec.component_obj, :rho) ? _find_parameter(p_names, string(t_v.rho), k, is_multivariate_model) : ""
 
-        if isempty(sigma_name) || isempty(innovations_name)
+        if isempty(sigma_name) || isempty(ure_name)
             @warn "Parameters for TensorProductSmooth component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -236,7 +236,7 @@ function get_effects(
 
         # Extract posterior samples (CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, s_N * t_N)
+        ure_samples_cpu = get_params_matrix(chain, ure_name, s_N * t_N)
         
         s_rho_samples_cpu = !isempty(s_rho_name) ? get_params_vector(chain, s_rho_name, 1)[:, 1] : nothing
         t_rho_samples_cpu = !isempty(t_rho_name) ? get_params_vector(chain, t_rho_name, 1)[:, 1] : nothing
@@ -247,7 +247,7 @@ function get_effects(
         # --- Sample-wise Reconstruction on the CPU ---
         for i in 1:n_samples
             sigma_i = sigma_samples_cpu[i]
-            innovations_i = innovations_samples_cpu[i, :]
+            innovations_i = ure_samples_cpu[i, :]
             s_rho_val = isnothing(s_rho_samples_cpu) ? nothing : s_rho_samples_cpu[i]
             t_rho_val = isnothing(t_rho_samples_cpu) ? nothing : t_rho_samples_cpu[i]
             

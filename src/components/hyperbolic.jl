@@ -75,8 +75,7 @@ function get_precomputes(m::Hyperbolic, M::NamedTuple, mod_data::Dict)::NamedTup
 
     for var_sym in variables
         if !hasproperty(M.data, Symbol(var_sym))
-            error("Coordinate variable ':' for Hyperbolic model not found " *
-                  "in data.")
+            error("Coordinate variable ':$var_sym' for Hyperbolic model not found in data.")
         end
     end
 
@@ -101,7 +100,7 @@ function get_priors(
     
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
     
     return join(priors, "\n    ")
 end
@@ -179,9 +178,9 @@ function get_updates(
             )
             
             F_gp = cholesky(Symmetric(K_mat))
-            $(p_names.latent) = F_gp.L * $(p_names.innovations)
+            $(p_names.sre) = F_gp.L * $(p_names.ure)
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 end
@@ -222,17 +221,17 @@ function get_effects(
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for Hyperbolic component $(spec.key) (outcome ) not found. Returning zero-matrix."
+        if isempty(sigma_name) || isempty(ure_name)
+            @warn "Parameters for Hyperbolic component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-        innovations_samples = get_params_matrix(chain, innovations_name, n_obs_train) # (n_samples, n_obs_train)
+        ure_samples = get_params_matrix(chain, ure_name, n_obs_train) # (n_samples, n_obs_train)
 
         # Initialize the output matrix for the full effect
         effect_k_matrix = zeros(Float64, n_obs_full, n_samples)
@@ -244,7 +243,7 @@ function get_effects(
             F = cholesky(Symmetric(K_mat))
 
             # Combine training innovations with new innovations for prediction points (if any)
-            innov_train = innovations_samples[i, :]
+            innov_train = ure_samples[i, :]
             innov_i = if n_obs_full > n_obs_train
                 innov_pred = randn(Float64, n_obs_full - n_obs_train)
                 vcat(innov_train, innov_pred)

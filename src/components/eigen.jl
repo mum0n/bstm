@@ -222,7 +222,7 @@ function get_priors(
     ltri_indices_len = hyper.ltri_indices_len
 
     priors = String[]
-    push!(priors, "$(p_names.v_raw) ~ MvNormal(zeros(T, $(ltri_indices_len)), I)")
+    push!(priors, "$(p_names.v_unscaled) ~ MvNormal(zeros(T, $(ltri_indices_len)), I)")
     push!(priors, "$(p_names.pca_sd) ~ filldist($(pca_sd_prior_str), $(n_factors))")
     push!(priors, "$(p_names.pdef_sd) ~ filldist($(pdef_sd_prior_str), $(n_vars))")
     
@@ -248,7 +248,7 @@ function get_updates(
     
     common_code = """
         v_mat = zeros(T, $(n_vars), $(n_factors))
-        v_mat[spec_registry[:$(key)].hyper.ltri_indices] .= $(p_names.v_raw)
+        v_mat[spec_registry[:$(key)].hyper.ltri_indices] .= $(p_names.v_unscaled)
         
         U = householder_to_eigenvector(v_mat, spec_registry[:$(key)].hyper.n_vars, spec_registry[:$(key)].hyper.n_factors)
         L = U * Diagonal($(p_names.pca_sd))
@@ -277,20 +277,20 @@ function get_updates(
         let
             $(common_code)
             # Define the latent factors matrix that will be sampled row-by-row
-            $(p_names.latent) = Matrix{T}(undef, $(n_obs), $(n_factors))
+            $(p_names.sre) = Matrix{T}(undef, $(n_obs), $(n_factors))
             Cov_F_row = Symmetric(L * L')
             
             for i in 1:$(n_obs)
-                $(p_names.latent)[i, :] ~ MvNormal(zeros(T, $(n_factors)), Cov_F_row)
+                $(p_names.sre)[i, :] ~ MvNormal(zeros(T, $(n_factors)), Cov_F_row)
             end
             
-            Y_hat = $(p_names.latent) * L'
+            Y_hat = $(p_names.sre) * L'
             
             for i in 1:$(n_obs)
                 Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), Y_eigen_data[i, :])
             end
             
-            $(eta_target) .+= view($(p_names.latent), :, 1)
+            $(eta_target) .+= view($(p_names.sre), :, 1)
         end
     """
 
@@ -321,7 +321,7 @@ function get_effects(
         size(chain, 1) * size(chain, 3)
     end
     outcomes_N = M.outcomes_N
-    p_names = string.(names(DataFrame(chain)))
+    p_names = string.(keys(chain))
     
     hyper = spec.hyper
     n_obs_train = hyper.n_latent
@@ -368,16 +368,16 @@ function get_effects(
             factor_effect[1:n_obs_train, :] = F_tensor[:, 1, :]
         end
     else # :centered
-        latent_name = _find_parameter(
-            p_names, string(p_names_k.latent), nothing, params_are_per_outcome
+        sre_name = _find_parameter(
+            p_names, string(p_names_k.sre), nothing, params_are_per_outcome
         )
-        if isempty(latent_name)
-            @warn "Parameter 'latent' for Eigen component $(spec.key) not found. " *
+        if isempty(sre_name)
+            @warn "Parameter 'sre' for Eigen component $(spec.key) not found. " *
                   "Returning zero-matrix."
             factor_effect = zeros(Float64, n_obs_full, n_samples)
         else
             latent_samples_train = get_params_matrix(
-                chain, latent_name, n_obs_train * n_factors
+                chain, sre_name, n_obs_train * n_factors
             )
             # Reshape the flat [n_samples, n_params] matrix into a 3D tensor
             # [n_obs, n_factors, n_samples]

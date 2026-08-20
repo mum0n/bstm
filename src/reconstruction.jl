@@ -26,46 +26,98 @@ function get_kernel_from_string(kernel_name::String)
 end
 
  
-# Version 1.2.0 (2026-08-11)
-# Purpose: Finds a parameter name in a list based on the `param_name_key` convention.
-# Rationale:   correctly handle parameter naming conventions
-#            for both univariate and multivariate models. It introduces the
-#            `is_multivariate_model` argument. When `true`, it prioritizes searching
-#            for outcome-specific parameter names (e.g., `sigma_s_idx_1`). When `false`,
-#            it correctly searches for the base parameter name (e.g., `sigma_s_idx`),
-#            resolving the "parameter not found" warning for univariate models.
+# Version 1.3.0 (2026-08-20)
+# Purpose: Finds a parameter name in a list based on the canonical target_name_base convention.
+# Canonical signature: _find_parameter(p_names, target_name_base, outcome_idx=nothing, is_multivariate_model=false)
 function _find_parameter(
-    p_names, key, param_name, k=nothing, is_multivariate_model::Bool=false
+    reg::ParamRegistry, target_name_base::Union{String, Symbol}, outcome_idx=nothing, is_multivariate_model::Bool=false
 )
-    base_name_prefix = "$(param_name)_$(key)"
+    return find_chain_param(reg, string(target_name_base); outcome_idx=outcome_idx)
+end
+
+function _find_parameter(
+    p_names, target_name_base::Union{String, Symbol}, outcome_idx=nothing, is_multivariate_model::Bool=false
+)
+    base_str = string(target_name_base)
+    p_names_str = string.(p_names)
 
     # Priority 1: Exact match with outcome index suffix (e.g., "sigma_s_idx_1").
-    # This is the most specific pattern, used for outcome-specific parameters in
-    # multivariate models. This check is now conditional on `is_multivariate_model`.
-    if is_multivariate_model && !isnothing(k)
-        specific_name_with_k_suffix = "$(base_name_prefix)_$(k)"
-        if specific_name_with_k_suffix in p_names
+    if is_multivariate_model && !isnothing(outcome_idx)
+        specific_name_with_k_suffix = "$(base_str)_$(outcome_idx)"
+        if specific_name_with_k_suffix in p_names_str
             return specific_name_with_k_suffix
         end
         
-        # Also check for bracketed version with a specific index (e.g., "sigma_s_idx[1]").
-        indexed_name_with_k_bracket = "$(base_name_prefix)[$(k)]"
-        if indexed_name_with_k_bracket in p_names
+        indexed_name_with_k_bracket = "$(base_str)[$(outcome_idx)]"
+        if indexed_name_with_k_bracket in p_names_str
             return indexed_name_with_k_bracket
         end
     end
 
-    # Priority 2: Exact match for the base name (e.g., "sigma_s_idx").
-    # This is used for univariate models or parameters shared across outcomes.
-    if base_name_prefix in p_names
-        return base_name_prefix
+    # Priority 2: Exact match for the base name
+    if base_str in p_names_str
+        return base_str
     end
 
     # Priority 3: Check for any bracketed indexed versions of the base name.
-    # This is a fallback to find vector parameters like `beta[1], beta[2], ...`.
-    re_indexed_any = Regex("^" * escape_string(base_name_prefix) * "\\[\\d+\\]")
-    if any(n -> occursin(re_indexed_any, n), p_names)
-        return base_name_prefix
+    re_indexed_any = Regex("^" * escape_string(base_str) * "\\[\\d+\\]")
+    if any(n -> occursin(re_indexed_any, n), p_names_str)
+        return base_str
+    end
+
+    # Priority 4: Alias transformations (e.g., ure <-> innovations, sre <-> latent/struct, rho_unconstrained <-> unconstrained_rho)
+    alias_candidates = String[]
+    if startswith(base_str, "ure_")
+        push!(alias_candidates, replace(base_str, r"^ure_" => "innovations_"))
+        push!(alias_candidates, replace(base_str, r"^ure_" => "innov_"))
+        push!(alias_candidates, replace(base_str, r"^ure_" => "raw_"))
+    elseif startswith(base_str, "innovations_")
+        push!(alias_candidates, replace(base_str, r"^innovations_" => "ure_"))
+    elseif startswith(base_str, "sre_")
+        push!(alias_candidates, replace(base_str, r"^sre_" => "latent_"))
+        push!(alias_candidates, replace(base_str, r"^sre_" => "struct_"))
+    elseif startswith(base_str, "latent_")
+        push!(alias_candidates, replace(base_str, r"^latent_" => "sre_"))
+    elseif startswith(base_str, "struct_")
+        push!(alias_candidates, replace(base_str, r"^struct_" => "sre_"))
+    elseif occursin("unconstrained", base_str)
+        push!(alias_candidates, replace(base_str, "rho_unconstrained" => "unconstrained_rho"))
+        push!(alias_candidates, replace(base_str, "unconstrained_rho" => "rho_unconstrained"))
+        push!(alias_candidates, replace(base_str, "sigma_unconstrained" => "unconstrained_sigma"))
+        push!(alias_candidates, replace(base_str, "unconstrained_sigma" => "sigma_unconstrained"))
+    elseif base_str == "beta"
+        push!(alias_candidates, "Xfixed_beta_prop", "beta_prop", "Xfixed_beta")
+    elseif base_str == "beta_flat"
+        push!(alias_candidates, "Xfixed_beta_prop_flat", "beta_prop_flat")
+    elseif base_str == "Xfixed_beta_prop"
+        push!(alias_candidates, "beta")
+    elseif base_str == "Xfixed_beta_prop_flat"
+        push!(alias_candidates, "beta_flat")
+    elseif base_str == "sigma_st_interaction"
+        push!(alias_candidates, "st_interaction_sigma")
+    elseif base_str == "ure_st_interaction"
+        push!(alias_candidates, "st_interaction_raw")
+    elseif base_str == "v_unscaled_reflection"
+        push!(alias_candidates, "v_raw_reflection")
+    end
+
+    for alias in alias_candidates
+        if is_multivariate_model && !isnothing(outcome_idx)
+            s_k = "$(alias)_$(outcome_idx)"
+            if s_k in p_names_str; return s_k; end
+            s_b = "$(alias)[$(outcome_idx)]"
+            if s_b in p_names_str; return s_b; end
+        end
+        if alias in p_names_str; return alias; end
+        re_alias = Regex("^" * escape_string(alias) * "\\[\\d+\\]")
+        if any(n -> occursin(re_alias, n), p_names_str); return alias; end
+    end
+
+    # Priority 5: Substring fallback
+    for n in p_names_str
+        if occursin(base_str, n)
+            return n
+        end
     end
 
     return "" # Return empty string if no match is found.
@@ -212,8 +264,9 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
     if M.add_intercept
         for k in 1:outcomes_N
             param_name = (M.model_arch == "multivariate") ? "intercept_$(k)" : "intercept"
-            if param_name in p_names
-                intercept_samples[:, k] = get_params_vector(chain, param_name, 1)[:, 1]
+            found_name = _find_parameter(p_names, param_name, k, M.model_arch == "multivariate")
+            if !isempty(found_name)
+                intercept_samples[:, k] = get_params_vector(chain, found_name, 1)[:, 1]
             else
                 @warn "Intercept parameter '$param_name' not found in the MCMC chain. Using zero for this effect."
             end
@@ -223,17 +276,18 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
     # --- Fixed Effects ---
     fixed_effects_samples = zeros(Float64, M.Xfixed_N, n_samples, outcomes_N)
     if M.Xfixed_N > 0
-        param_name_base = (M.model_arch == "multivariate") ? "Xfixed_beta_prop_flat" : "Xfixed_beta_prop"
-        if param_name_base in p_names
+        param_name_base = (M.model_arch == "multivariate") ? "beta_flat" : "beta"
+        found_base = _find_parameter(p_names, param_name_base, nothing, M.model_arch == "multivariate")
+        if !isempty(found_base)
             if M.model_arch == "multivariate"
-                all_fixed_beta_flat = get_params_matrix(chain, param_name_base, M.Xfixed_N * outcomes_N)
+                all_fixed_beta_flat = get_params_matrix(chain, found_base, M.Xfixed_N * outcomes_N)
                 reshaped_fixed_beta = reshape(all_fixed_beta_flat, n_samples, M.Xfixed_N, outcomes_N)
                 for k in 1:outcomes_N
-                    fixed_effects_samples[:, :, k] = reshaped_fixed_beta[:, :, k]'
+                    fixed_effects_samples[:, :, k] = permutedims(reshaped_fixed_beta[:, :, k], (2, 1))
                 end
             else # Univariate
-                fixed_beta = get_params_matrix(chain, param_name_base, M.Xfixed_N)
-                fixed_effects_samples[:, :, 1] = fixed_beta'
+                fixed_beta = get_params_matrix(chain, found_base, M.Xfixed_N)
+                fixed_effects_samples[:, :, 1] = permutedims(fixed_beta, (2, 1))
             end
         else
             @warn "Fixed effects parameter '$param_name_base' not found in the MCMC chain. Using zero for this effect."
@@ -250,9 +304,11 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
     # --- Spatiotemporal Interaction Effects ---
     st_interaction_effects_samples = zeros(Float64, M.s_N * M.t_N, n_samples, outcomes_N)
     if get(M, :model_st, "none") != "none"
-        param_name_base = "st_interaction_raw"
-        sigma_name_base = "st_interaction_sigma"
-        if param_name_base in p_names && sigma_name_base in p_names
+        param_name_base = any(p -> occursin("ure_st_interaction", string(p)), p_names) ? "ure_st_interaction" : "st_interaction_raw"
+        sigma_name_base = any(p -> occursin("sigma_st_interaction", string(p)), p_names) ? "sigma_st_interaction" : "st_interaction_sigma"
+        has_param = any(p -> occursin(param_name_base, string(p)), p_names)
+        has_sigma = any(p -> occursin(sigma_name_base, string(p)), p_names)
+        if has_param && has_sigma
             if M.model_arch == "multivariate"
                 sigma_samples = get_params_matrix(chain, sigma_name_base, outcomes_N)
                 raw_samples = get_params_matrix(chain, param_name_base, M.s_N * M.t_N * outcomes_N)
@@ -293,11 +349,11 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
     # --- Householder Reflection Effects ---
     householder_effects_samples = zeros(Float64, outcomes_N, outcomes_N, n_samples)
     if get(M, :spectral_orientation, false) && M.model_arch == "multivariate"
-        param_name = "v_raw_reflection"
-        if param_name in p_names
-            v_raw_reflection_samples = get_params_matrix(chain, param_name, outcomes_N)
+        param_name = any(p -> occursin("v_unscaled_reflection", string(p)), p_names) ? "v_unscaled_reflection" : "v_raw_reflection"
+        if any(p -> occursin(param_name, string(p)), p_names)
+            v_reflection_samples = get_params_matrix(chain, param_name, outcomes_N)
             for i in 1:n_samples
-                v_reflection = v_raw_reflection_samples[i, :] / (norm(v_raw_reflection_samples[i, :]) + 1e-9)
+                v_reflection = v_reflection_samples[i, :] / (norm(v_reflection_samples[i, :]) + 1e-9)
                 householder_effects_samples[:, :, i] = I - 2.0 * v_reflection * v_reflection'
             end
         else
@@ -717,13 +773,13 @@ function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
     log_lik_samples = zeros(Float64, N_train, n_samples)
 
     y_sigma_samples = if family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
-        get_params_vector(chain, "y_sigma", outcomes_N)
+        outcomes_N > 1 ? get_params_matrix(chain, "y_sigma", outcomes_N) : get_params_vector(chain, "y_sigma", 1)
     else
         ones(Float64, n_samples, outcomes_N)
     end
 
     r_nb_samples = if family == "negbin"
-        get_params_vector(chain, "r_nb", outcomes_N)
+        outcomes_N > 1 ? get_params_matrix(chain, "r_nb", outcomes_N) : get_params_vector(chain, "r_nb", 1)
     else
         ones(Float64, n_samples, outcomes_N)
     end
@@ -1157,369 +1213,6 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
 end
 
 
-"""
-    bstm_plots(model_obj::DynamicPPL.Model, chain, res, M; au=nothing, data=nothing, outcome=1)
-
-Generates a standard set of diagnostic and summary plots from a fitted `bstm` model.
-
-# Version
-v1.2.0 (2026-08-20)
-
-# Rationale
-This function is the primary visualization engine for the `bstm` framework. It takes
-the summarized results from the reconstruction engine and produces a standardized
-set of plots for model diagnostics and interpretation. It is designed to be robust
-and flexible, correctly handling different model architectures (univariate,
-multivariate) and component types (spatial, temporal, smooth, mixed effects).
-This version now returns both the plot objects and the underlying data used to
-create them.
-
-# Workflow
-1.  **Posterior Predictive Check (PPC)**: Creates a scatter plot of observed vs.
-    predicted values to assess overall model fit.
-2.  **Fixed Effects**: Bar plots of coefficients with credible intervals.
-3.  **Conditional Effects**: Plots the expected response for varying values of one or two predictors.
-4.  **Component-wise Plotting**: Iterates through all components defined in the model
-    configuration (`M.components`).
-5.  **Structure-based Dispatch**: For each component, it uses the `structure`
-    (e.g., `:spatial`, `:temporal`, `:smooth`) to dispatch to the appropriate
-    plotting logic.
-    - **Spatial**: Generates choropleth maps (if polygons are provided) or scatter
-      plots of the spatial random effects. For `BYM2` models, it creates separate
-      plots for the structured and unstructured components.
-    - **Temporal/Seasonal**: Creates line plots of the temporal or seasonal trends
-      with credible interval ribbons.
-    - **Smooth**: Creates line plots showing the non-linear effect of a covariate,
-      with credible interval ribbons. For 2D smooths, generates surface/contour plots.
-    - **Spatially Varying Coefficients (SVC)**: Generates choropleth/heatmap plots of the estimated coefficient surface.
-6.  **Hierarchical Effects**: Visualizes the distribution of group-level parameters.
-
-# Arguments
-- `model_obj::DynamicPPL.Model`: The fitted Turing model object.
-- `chain`: The MCMC chain object from the fitted model.
-- `res`: The results `NamedTuple` from `_reconstruct`, containing summarized effects.
-- `M`: The main model configuration `NamedTuple`.
-- `au`: An optional object containing areal unit information (`polygons`, `centroids`).
-- `data`: The optional input `DataFrame`, used to get coordinate/variable data for axes.
-- `outcome`: `Int`, the index of the outcome to plot in a multivariate model.
-
-# Returns
-- A `NamedTuple` with two fields:
-  - `plots`: A `NamedTuple` where each key corresponds to a plot type and the value is a `Plots.Plot` object or a dictionary of plots.
-  - `plots_data`: A `NamedTuple` containing the data used to generate each plot.
-"""
-function bstm_plots(model_obj::DynamicPPL.Model, chain, res, M; au=nothing, data=nothing, outcome=1)
-    plots = Dict{Symbol, Any}()
-    plots_data = Dict{Symbol, Any}()
-    effects = res.pstats.effects
-    is_mv = res.pstats.arch isa MultivariateArchitecture
-    
-    y_obs = get(M, :y_obs, nothing)
-
-    polygons = if !isnothing(au) && (au isa NamedTuple || au isa Dict)
-        get(au, :polygons, nothing)
-    else
-        nothing
-    end
-    
-    centroids = if !isnothing(au) && (au isa NamedTuple || au isa Dict)
-        get(au, :centroids, nothing)
-    else
-        nothing
-    end
-
-    # --- 1. Posterior Predictive Check ---
-    if hasproperty(res.pstats, :predictions_denoised)
-        if isnothing(y_obs)
-            @info "Skipping PPC plot: Observation data not found."
-        else
-            pred_summary = is_mv ? res.pstats.predictions_denoised[outcome] : res.pstats.predictions_denoised 
-            if !isnothing(pred_summary) && hasproperty(pred_summary, :mean)
-                y_p, y_o = vec(pred_summary.mean), is_mv ? vec(y_obs[:, outcome]) : vec(y_obs)
-                if length(y_p) == length(y_o)
-                    p_ppc = scatter(y_p, y_o, title="Posterior Predictive Check", xlabel="Predicted", ylabel="Observed", alpha=0.5, markersize=3, markerstrokewidth=0, legend=false)
-                    clean_p, clean_o = filter(!isnan, y_p), filter(!isnan, y_o)
-                    if !isempty(clean_p) && !isempty(clean_o)
-                        min_val, max_val = min(minimum(clean_p), minimum(clean_o)), max(maximum(clean_p), maximum(clean_o))
-                        plot!(p_ppc, [min_val, max_val], [min_val, max_val], color=:red, ls=:dash, lw=1.5)
-                    end
-                    plots[:ppc] = p_ppc
-                    plots_data[:ppc] = (predicted = y_p, observed = y_o)
-                end
-            end
-        end
-    end
-
-    # --- 2. Helper function for choropleth plots ---
-    function _create_choropleth_plot(field_data, title_str, polygons, centroids)
-        if isnothing(field_data) || !hasproperty(field_data, :mean)
-            @info "Skipping spatial plot '$title_str': Data missing."
-            return nothing
-        end 
-        if isnothing(polygons) && isnothing(centroids)
-            @info "Skipping spatial plot '$title_str': No geometry provided."
-            return nothing
-        end
-        s_mean = vec(collect(field_data.mean))
-        if all(iszero, s_mean)
-            @info "Skipping spatial plot '$title_str': Mean effect is zero."
-            return nothing
-        end
-        if !isnothing(polygons) && length(polygons) >= length(s_mean)
-            return plot_choropleth(s_mean, polygons; title=title_str)
-        elseif !isnothing(centroids)
-            return scatter(getindex.(centroids, 1), getindex.(centroids, 2), marker_z=s_mean, markersize=4, c=:viridis, label=nothing, title=title_str, aspect_ratio=:equal)
-        end
-        return nothing
-    end
-
-    # --- 3. Fixed Effects Plots ---
-    if hasproperty(effects, :fixed) && !isnothing(effects.fixed)
-        fe_summary = is_mv ? effects.fixed[outcome] : effects.fixed
-        if hasproperty(fe_summary, :mean) && !all(iszero, fe_summary.mean) 
-            fm, fl, fu = vec(fe_summary.mean), vec(fe_summary.lower), vec(fe_summary.upper)
-            if !isempty(fm)
-                coef_names = haskey(M, :Xfixed_names) ? string.(M.Xfixed_names) : ["Coef_$i" for i in 1:length(fm)]
-                p_forest = scatter(fm, 1:length(fm), xerror=(fm .- fl, fu .- fm), yticks=(1:length(fm), coef_names), title="Fixed Effects Coefficients", xlabel="Estimate", markersize=4, color=:black, legend=false)
-                vline!(p_forest, [0], color=:red, ls=:dash, lw=1)
-                plots[:fixed_effects] = p_forest
-                plots_data[:fixed_effects] = (names=coef_names, mean=fm, lower=fl, upper=fu)
-            end
-        end
-    end
-
-    # --- 4. Conditional Effects Plots ---
-    conditional_plots = Dict{Symbol, Any}()
-    conditional_plots_data = Dict{Symbol, Any}()
-    all_covariates = String[]
-    if haskey(M, :Xfixed_names); append!(all_covariates, string.(M.Xfixed_names)); end
-    for spec in M.components
-        if spec.structure == :smooth
-            vars = get(spec.params, :positional_args, [])
-            append!(all_covariates, string.(vars))
-        end
-    end
-    all_covariates = unique(Symbol.(all_covariates))
-
-    for cov_sym in all_covariates
-        if !hasproperty(M.data, cov_sym); continue; end
-
-        if eltype(M.data[!, cov_sym]) <: Number # Continuous covariate
-            cond_preds_res = _generate_conditional_predictions(model_obj, chain, M, cov_sym)
-            if !isnothing(cond_preds_res)
-                cond_preds, cov_range = cond_preds_res
-                cond_summary = is_mv ? cond_preds[outcome] : cond_preds
-                
-                cm, cl, cu = vec(cond_summary.mean), vec(cond_summary.lower), vec(cond_summary.upper)
-                p_cond = plot(cov_range, cm, ribbon=(cm .- cl, cu .- cm), title="Conditional Effect: $(cov_sym)", xlabel=string(cov_sym), ylabel="Expected Response", lw=2, fillalpha=0.2, color=:blue, legend=false)
-                plot_key = Symbol("conditional_$(cov_sym)")
-                conditional_plots[plot_key] = p_cond
-                conditional_plots_data[plot_key] = (covariate_values=cov_range, mean=cm, lower=cl, upper=cu)
-            end
-        else # Categorical covariate
-            cond_preds_res = _generate_conditional_predictions(model_obj, chain, M, cov_sym)
-            if !isnothing(cond_preds_res)
-                cond_preds, cov_levels = cond_preds_res
-                cond_summary = is_mv ? cond_preds[outcome] : cond_preds
-                
-                cm, cl, cu = vec(cond_summary.mean), vec(cond_summary.lower), vec(cond_summary.upper)
-                p_cond = bar(string.(cov_levels), cm, yerror=(cm .- cl, cu .- cm), title="Conditional Effect: $(cov_sym)", xlabel=string(cov_sym), ylabel="Expected Response", color=:blue, legend=false)
-                plot_key = Symbol("conditional_$(cov_sym)")
-                conditional_plots[plot_key] = p_cond
-                conditional_plots_data[plot_key] = (covariate_levels=string.(cov_levels), mean=cm, lower=cl, upper=cu)
-            end
-        end
-    end
-    if !isempty(conditional_plots)
-        plots[:conditional_effects] = conditional_plots
-        plots_data[:conditional_effects] = conditional_plots_data
-    end
-
-    # --- 5. Component-wise Plotting ---
-    smooth_effects_plots = Dict{Symbol, Any}()
-    smooth_effects_plots_data = Dict{Symbol, Any}()
-    for spec in M.components
-        key = spec.key
-        
-        if spec.component_obj isa Mixed; continue; end
-
-        if !haskey(effects, key)
-            @info "Skipping plot for component '$key': No effect summary found in results."
-            continue
-        end
-        
-        component_effects = effects[key]
-        
-        main_effect_summary = if hasproperty(component_effects, :noisy)
-            is_mv ? component_effects.noisy[outcome] : component_effects.noisy
-        elseif hasproperty(component_effects, :structured)
-            is_mv ? component_effects.structured[outcome] : component_effects.structured
-        else
-            continue
-        end
-
-        if isnothing(main_effect_summary) || !hasproperty(main_effect_summary, :mean) || all(iszero, main_effect_summary.mean)
-            @info "Skipping plot for component '$key': Main effect is zero or data is missing."
-            continue
-        end
-
-        if spec.structure == :spatial
-            plot_key = Symbol("spatial_$(key)")
-            p = _create_choropleth_plot(main_effect_summary, "Spatial Effect: $key", polygons, centroids)
-            if !isnothing(p)
-                plots[plot_key] = p
-                plots_data[plot_key] = (values=vec(main_effect_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
-            end
-
-            if hasproperty(component_effects, :structured)
-                struct_summary = is_mv ? component_effects.structured[outcome] : component_effects.structured
-                p_struct = _create_choropleth_plot(struct_summary, "Structured Effect: $key", polygons, centroids)
-                if !isnothing(p_struct)
-                    plot_key_struct = Symbol("structured_$(key)")
-                    plots[plot_key_struct] = p_struct
-                    plots_data[plot_key_struct] = (values=vec(struct_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
-                end
-            end
-            if hasproperty(component_effects, :unstructured)
-                unstruct_summary = is_mv ? component_effects.unstructured[outcome] : component_effects.unstructured
-                p_unstruct = _create_choropleth_plot(unstruct_summary, "Unstructured Effect: $key", polygons, centroids)
-                if !isnothing(p_unstruct)
-                    plot_key_unstruct = Symbol("unstructured_$(key)")
-                    plots[plot_key_unstruct] = p_unstruct
-                    plots_data[plot_key_unstruct] = (values=vec(unstruct_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
-                end
-            end
-
-        elseif spec.structure == :temporal
-            plot_key = Symbol("temporal_$(key)")
-            if !isnothing(data) && haskey(M, :t_idx_var) && hasproperty(data, M.t_idx_var)
-                time_var = M.t_idx_var
-                time_coords = data[!, time_var]
-                p_order = sortperm(time_coords)
-                tm, tl, tu = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-                plots[plot_key] = plot(time_coords[p_order], tm[p_order], ribbon=(tm[p_order] .- tl[p_order], tu[p_order] .- tm[p_order]), title="Temporal Trend: $key", lw=2, fillalpha=0.2, color=:royalblue, legend=false, xlabel=string(time_var))
-                plots_data[plot_key] = (time=time_coords[p_order], mean=tm[p_order], lower=tl[p_order], upper=tu[p_order])
-            else
-                tm, tl, tu = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-                plots[plot_key] = plot(tm, ribbon=(tm .- tl, tu .- tm), title="Temporal Trend: $key", lw=2, fillalpha=0.2, color=:royalblue, legend=false, xlabel="Time Index")
-                plots_data[plot_key] = (time=1:length(tm), mean=tm, lower=tl, upper=tu)
-            end
-
-        elseif spec.structure == :seasonal
-            plot_key = Symbol("seasonal_$(key)")
-            um, ul, uu = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-            plots[plot_key] = plot(um, ribbon=(um .- ul, uu .- um), title="Seasonal Component: $key", lw=2, fillalpha=0.2, color=:forestgreen, legend=false, xlabel="Period")
-            plots_data[plot_key] = (period=1:length(um), mean=um, lower=ul, upper=uu)
-
-        elseif spec.structure == :smooth
-            if isnothing(data); @info "Skipping smooth effect plot for '$key': `data` not provided."; continue; end
-            
-            vars = get(spec.params, :positional_args, [])
-            if length(vars) == 1 # 1D smooth
-                var_sym = Symbol(vars[1])
-                if hasproperty(data, var_sym)
-                    cov_data = data[!, var_sym]
-                    p_order = sortperm(cov_data)
-                    sm, sl, su = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-                    
-                    smooth_effects_plots[var_sym] = plot(cov_data[p_order], sm[p_order], ribbon=(sm[p_order] .- sl[p_order], su[p_order] .- sm[p_order]), title="Smooth Effect: $var_sym", xlabel=string(var_sym), ylabel="Latent Effect", legend=false, color=:darkorange, fillalpha=0.2)
-                    smooth_effects_plots_data[var_sym] = (covariate_values=cov_data[p_order], mean=sm[p_order], lower=sl[p_order], upper=su[p_order])
-                end
-            elseif length(vars) == 2 # 2D smooth (interaction)
-                var1_sym, var2_sym = Symbol(vars[1]), Symbol(vars[2])
-                if hasproperty(data, var1_sym) && hasproperty(data, var2_sym)
-                    cond_preds_res = _generate_conditional_predictions(model_obj, chain, M, var1_sym, second_cov=var2_sym)
-                    if !isnothing(cond_preds_res)
-                        cond_preds, range1, range2 = cond_preds_res
-                        cond_summary = is_mv ? cond_preds[outcome] : cond_preds
-                        
-                        grid_mean = reshape(vec(cond_summary.mean), length(range1), length(range2))
-                        
-                        plot_key = Symbol("$(var1_sym)_$(var2_sym)")
-                        smooth_effects_plots[plot_key] = heatmap(range1, range2, grid_mean', title="2D Smooth Effect: $(var1_sym) & $(var2_sym)", xlabel=string(var1_sym), ylabel=string(var2_sym), c=:viridis, legend=false)
-                        smooth_effects_plots_data[plot_key] = (x=range1, y=range2, z=grid_mean)
-                    end
-                end
-            end
-        end
-    end
-    if !isempty(smooth_effects_plots)
-        plots[:smooth_effects] = smooth_effects_plots
-        plots_data[:smooth_effects] = smooth_effects_plots_data
-    end
-
-    # --- 6. Spatiotemporal Interaction Effects ---
-    if hasproperty(effects, :st_interaction) && !isnothing(effects.st_interaction)
-        st_summary = is_mv ? effects.st_interaction[outcome] : effects.st_interaction
-        if hasproperty(st_summary, :mean) && !all(iszero, st_summary.mean)
-            if haskey(M, :s_N) && haskey(M, :t_N)
-                st_mean_grid = reshape(vec(st_summary.mean), M.s_N, M.t_N)
-                p_st_heatmap = heatmap(1:M.t_N, 1:M.s_N, st_mean_grid, title="Spatiotemporal Interaction", xlabel="Time Index", ylabel="Spatial Unit Index", c=:viridis, legend=false)
-                plots[:st_interaction_heatmap] = p_st_heatmap
-                plots_data[:st_interaction_heatmap] = (time_idx=1:M.t_N, space_idx=1:M.s_N, mean_effect=st_mean_grid)
-            else
-                @warn "Skipping spatiotemporal interaction plot: M.s_N or M.t_N not found."
-            end
-        end
-    end
-
-    # --- 7. Spatially Varying Coefficients (SVC) Plots ---
-    for spec in M.components
-        if spec.structure == :svc
-            key = spec.key
-            if !haskey(effects, key) || (isnothing(polygons) && isnothing(centroids)); continue; end
-            
-            svc_effect_summary = is_mv ? effects[key].structured[outcome] : effects[key].structured
-            if !isnothing(svc_effect_summary) && hasproperty(svc_effect_summary, :mean)
-                plot_key = Symbol("svc_$(key)")
-                p_svc = _create_choropleth_plot(svc_effect_summary, "SVC Effect: $(key)", polygons, centroids)
-                if !isnothing(p_svc)
-                    plots[plot_key] = p_svc
-                    plots_data[plot_key] = (values=vec(svc_effect_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
-                end
-            end
-        end
-    end
-
-    # --- 8. Hierarchical Effects (Mixed Effects) Plots ---
-    if hasproperty(effects, :mixed_effects) && !isnothing(effects.mixed_effects)
-        mixed_plots = Dict{Symbol, Any}()
-        mixed_plots_data = Dict{Symbol, Any}()
-        for (key, effect_summary) in pairs(effects.mixed_effects)
-            group_var = Symbol(effect_summary.group_var)
-            group_levels = hasproperty(M.data, group_var) ? unique(M.data[!, group_var]) : nothing
-
-            summaries_to_plot = is_mv ? effect_summary.summaries[outcome] : effect_summary.summaries
-
-            for (term_name, summary) in pairs(summaries_to_plot)
-                if hasproperty(summary, :mean) && !all(iszero, summary.mean)
-                    means = vec(summary.mean)
-                    lowers = vec(summary.lower)
-                    uppers = vec(summary.upper)
-                    n_levels = length(means) 
-                    
-                    y_ticks_labels = isnothing(group_levels) || length(group_levels) != n_levels ? ["Level $i" for i in 1:n_levels] : string.(group_levels)
-                    
-                    p_title = "Mixed Effect: $(term_name) | $(group_var)"
-                    
-                    p_forest = scatter(means, 1:n_levels, xerror=(means .- lowers, uppers .- means), yticks=(1:n_levels, y_ticks_labels), title=p_title, xlabel="Effect Size", markersize=4, color=:black, legend=false, yflip=true)
-                    vline!(p_forest, [0], color=:red, ls=:dash, lw=1)
-                    
-                    plot_key = Symbol("$(key)_$(term_name)")
-                    mixed_plots[plot_key] = p_forest
-                    mixed_plots_data[plot_key] = (group_levels=y_ticks_labels, mean=means, lower=lowers, upper=uppers)
-                end
-            end
-        end
-        if !isempty(mixed_plots)
-            plots[:mixed_effects] = mixed_plots
-            plots_data[:mixed_effects] = mixed_plots_data
-        end
-    end
-
-    return (plots=NamedTuple(plots), plots_data=NamedTuple(plots_data))
-end
-
 
 
 
@@ -1738,109 +1431,6 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
 end
 
 
-"""
-    model_results_plots(res)
-
-A convenience function to display all plots generated by the `model_results_comprehensive`
-function.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function provides a simple and standardized way to visualize all the output
-plots from a `bstm` model run. It is designed to handle the nested structure of the
-`plots` object returned by `model_results_comprehensive`, which may contain both
-individual plot objects and dictionaries of plots (for example, for multiple smooth or
-mixed effects).
-
-# Arguments
-- `res`: The main results `NamedTuple` returned by `model_results_comprehensive`.
-
-# Returns
-- `nothing`. The function prints the plots to the current display.
-"""
-function model_results_plots(res)
-    if !hasproperty(res, :plots) || isempty(res.plots)
-        println("No plots found in the results object.") 
-        return
-    end
-
-    println("--- Displaying Generated Plots ---")
-    for (plot_name, plot_obj) in pairs(res.plots)
-        if plot_obj isa Dict # Handle nested plot dictionaries like for smooth_effects
-            for (sub_name, sub_plot) in plot_obj
-                println("--- Plot: $plot_name -> $sub_name ---")
-                display(sub_plot)
-            end
-        else
-            println("--- Plot: $plot_name ---")
-            display(plot_obj)
-        end
-    end
-    println("--- End of Plots ---")
-end
-
-
-"""
-    plot_choropleth(values::AbstractVector, polygons::Vector; title="Spatial Distribution", cmap=:viridis)
-
-A utility function to generate a choropleth map from a set of values and their
-corresponding spatial polygons.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function provides a standardized and simple way to visualize spatial data,
-which is a core requirement for interpreting the outputs of spatiotemporal models.
-It is used by the main `bstm_plots` function to create maps of spatial random
-effects and predictions. The implementation is robust, handling common issues like
-non-closed polygon shapes and invalid coordinate data.
-
-# Arguments
-- `values::AbstractVector`: A vector of numeric values, where each value corresponds
-  to a polygon.
-- `polygons::Vector`: A vector of polygons. Each element of the vector should be a
-  collection of points (e.g., a `Vector` of 2-element `Tuple`s or `Vector`s) that
-  define the vertices of a polygon.
-- `title::String`: The title for the plot.
-- `cmap`: The colormap to use for shading the polygons. Can be a `Symbol` (e.g.,
-  `:viridis`) or a `ColorGradient`.
-
-# Returns
-- A `Plots.Plot` object representing the choropleth map.
-"""
-function plot_choropleth(values::AbstractVector, polygons::Vector; title="Spatial Distribution", cmap=:viridis)
-    plt = plot(aspect_ratio=:equal, title=title, legend=false, grid=false, showaxis=false, xticks=false, yticks=false)
-
-    # Determine the color range for normalization, handled automatically by Plots.jl
-    # but useful to have if manual normalization were needed.
-    min_val, max_val = extrema(values)
-    
-    for i in 1:min(length(polygons), length(values))
-        poly_coords = polygons[i]
-        
-        # A valid polygon requires at least 3 vertices.
-        if length(poly_coords) > 2 
-            # Extract x and y coordinates, filtering out any NaN values.
-            px = [pt[1] for pt in poly_coords if !isnan(pt[1])]
-            py = [pt[2] for pt in poly_coords if !isnan(pt[2])]
-            
-            # Proceed only if there are valid coordinates.
-            if !isempty(px)
-                # Ensure the polygon is closed for plotting.
-                if (px[1], py[1]) != (px[end], py[end])
-                    push!(px, px[1])
-                    push!(py, py[1])
-                end
-                
-                plot!(plt, px, py, seriestype=:shape, fill_z=values[i], c=cmap, linecolor=:black, lw=0.5, fillalpha=0.8, label=nothing) 
-            end
-        end
-    end
-    return plt
-end
 
 """
     bstm_cv_orchestrator(formula::String, data::DataFrame; ...)

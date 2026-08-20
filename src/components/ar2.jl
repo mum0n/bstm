@@ -65,16 +65,22 @@ controlled by the `random()` call:
 - Hamilton, J. D. (1994). *Time Series Analysis*. Princeton University Press.
 """
 struct AR2 <: ComponentModel
-    unconstrained_rho1::Distribution
-    unconstrained_rho2::Distribution
+    rho1_unconstrained::Distribution
+    rho2_unconstrained::Distribution
     sigma::Distribution
     method::Symbol
 end
 
+Base.getproperty(m::AR2, s::Symbol) = (
+    s === :unconstrained_rho1 ? getfield(m, :rho1_unconstrained) :
+    s === :unconstrained_rho2 ? getfield(m, :rho2_unconstrained) :
+    getfield(m, s)
+)
+
 COMPONENT_TYPE_REGISTRY[:ar2] = AR2
 COMPONENT_CONSTRUCTORS[:ar2] = (p, params) -> AR2(
-    get(p, :unconstrained_rho1, Normal(0, 1.5)),
-    get(p, :unconstrained_rho2, Normal(0, 1.5)),
+    get(p, :rho1_unconstrained, get(p, :unconstrained_rho1, Normal(0, 1.5))),
+    get(p, :rho2_unconstrained, get(p, :unconstrained_rho2, Normal(0, 1.5))),
     get(p, :sigma, Exponential(1.0)),
     get(params, :method, :statespace)
 )
@@ -109,17 +115,15 @@ function get_priors(
 
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
         push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-        push!(priors_acc, "$(p_names.unconstrained_rho1) ~ " *
-                          "$(_distribution_to_string(m.unconstrained_rho1))")
-        push!(priors_acc, "$(p_names.unconstrained_rho2) ~ " *
-                          "$(_distribution_to_string(m.unconstrained_rho2))")
+        push!(priors_acc, "$(p_names.rho1_unconstrained) ~ " *
+                          "$(_distribution_to_string(m.rho1_unconstrained))")
+        push!(priors_acc, "$(p_names.rho2_unconstrained) ~ " *
+                          "$(_distribution_to_string(m.rho2_unconstrained))")
     end
 
-    # For the :statespace method, we define priors on the innovations.
-    # For the :centered method, the latent field is sampled directly in get_updates,
-    # so no prior is needed here for the latent variable itself.
+    # For the :statespace method, we define priors on the innovations (ure).
     if m.method == :statespace
-        push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
+        push!(priors_acc, "$(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)")
     end
     
     return join(priors_acc, "\n    ")
@@ -142,21 +146,21 @@ function get_updates(
 
     statespace_code = """
         # --- AR2 Component (State-Space, Stationarity-Enforced): $(spec.key) ---
-        pi1 = tanh($(p_names.unconstrained_rho1))
-        pi2 = tanh($(p_names.unconstrained_rho2))
+        pi1 = tanh($(p_names.rho1_unconstrained))
+        pi2 = tanh($(p_names.rho2_unconstrained))
         rho1 = pi1 * (1 - pi2)
         rho2 = pi2
         
-        latent_field = ar2_statespace(
-            rho1, rho2, $(p_names.sigma), $(p_names.innovations), $(n_latent), M.noise
+        $(p_names.sre) = ar2_statespace(
+            rho1, rho2, $(p_names.sigma), $(p_names.ure), $(n_latent), M.noise
         )
-        $(eta_target) .+= view(latent_field, M.$(index_var))
+        $(eta_target) .+= view($(p_names.sre), M.$(index_var))
     """
 
     centered_code = """
         # --- AR2 Component (Centered, Didactic): $(spec.key) ---
-        pi1 = tanh($(p_names.unconstrained_rho1))
-        pi2 = tanh($(p_names.unconstrained_rho2))
+        pi1 = tanh($(p_names.rho1_unconstrained))
+        pi2 = tanh($(p_names.rho2_unconstrained))
         rho1 = pi1 * (1 - pi2)
         rho2 = pi2
         
@@ -164,8 +168,30 @@ function get_updates(
             K = _ar2_covariance_matrix(
                 rho1, rho2, $(p_names.sigma), $(n_latent), M.noise
             )
-            $(p_names.latent) ~ MvNormal(zeros(T, $(n_latent)), Symmetric(K))
-            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
+            $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), Symmetric(K))
+            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+        end
+    """
+
+    marginalized_code = """
+        # --- AR2 Component (Marginalized): $(spec.key) ---
+        let
+            pi1 = tanh($(p_names.rho1_unconstrained))
+            pi2 = tanh($(p_names.rho2_unconstrained))
+            rho1 = pi1 * (1 - pi2)
+            rho2 = pi2
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(spec.key) = _ar2_log_marginal_likelihood(
+                y_residual,
+                M.$(index_var),
+                $(n_latent),
+                rho1,
+                rho2,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(spec.key)
         end
     """
 
@@ -173,9 +199,10 @@ function get_updates(
         return statespace_code
     elseif m.method == :centered
         return centered_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else
-        error("Unsupported method '$(m.method)' for AR2 component. Use `:statespace` " *
-              "or `:centered`.")
+        error("Unsupported method '$(m.method)' for AR2 component. Use `:statespace`, `:centered`, or `:marginalized`.")
     end
 end
 
@@ -218,15 +245,78 @@ function _ar2_covariance_matrix(rho1, rho2, sigma, n, noise)
 end
 
 """
-    ar2_statespace(rho1, rho2, sigma, innovations, n_latent, noise)
+    _ar2_log_marginal_likelihood(y_residual, t_idx, t_N, rho1, rho2, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for an AR(2) process integrated out analytically.
+"""
+function _ar2_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    t_idx::AbstractVector{Int},
+    t_N::Int,
+    rho1::T,
+    rho2::T,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    T_num = promote_type(T, typeof(noise))
+    
+    if rho1 + rho2 >= one(T_num) || rho2 - rho1 >= one(T_num) || abs(rho2) >= one(T_num)
+        return -T_num(1e12)
+    end
+    
+    K = _ar2_covariance_matrix(rho1, rho2, sigma, t_N, noise)
+    
+    # Pre-accumulate observation counts and sums per time index
+    N_t = zeros(T_num, t_N)
+    S_t = zeros(T_num, t_N)
+    for i in 1:N
+        t = t_idx[i]
+        if 1 <= t <= t_N
+            N_t[t] += one(T_num)
+            S_t[t] += y_residual[i]
+        end
+    end
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    
+    # Q_prior = inv(K)
+    F_K = cholesky(Symmetric(K + T_num(noise) * I))
+    Q_prior = inv(F_K)
+    
+    # Q_post = Q_prior + diag(N_t * inv_sigma_y2)
+    Q_post = Matrix(Q_prior)
+    for t in 1:t_N
+        Q_post[t, t] += N_t[t] * inv_sigma_y2
+    end
+    
+    F_post = cholesky(Symmetric(Q_post))
+    
+    log_det_diff = - 2 * sum(log.(diag(F_K.U))) - 2 * sum(log.(diag(F_post.U)))
+    
+    b = S_t .* inv_sigma_y2
+    v = F_post.L \ b
+    quad_term = dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
+"""
+    ar2_statespace(rho1, rho2, sigma, ure, n_latent, noise)
 
 Computes the state-space evolution of a stationary AR(2) process. This version is CPU-only.
 """
 function ar2_statespace(
-    rho1, rho2, sigma, innovations::AbstractVector, n_latent::Int, noise
+    rho1, rho2, sigma, ure::AbstractVector, n_latent::Int, noise
 )
     T_num = promote_type(
-        typeof(rho1), typeof(rho2), typeof(sigma), eltype(innovations), typeof(noise)
+        typeof(rho1), typeof(rho2), typeof(sigma), eltype(ure), typeof(noise)
     )
     latent = Vector{T_num}(undef, n_latent)
     if n_latent == 0
@@ -253,14 +343,14 @@ function ar2_statespace(
 
     # Initialize the first two states
     if n_latent >= 2
-        latent[1:2] = L_12 * view(innovations, 1:2)
+        latent[1:2] = L_12 * view(ure, 1:2)
     elseif n_latent == 1
-        latent[1] = sqrt(gamma_0) * innovations[1]
+        latent[1] = sqrt(gamma_0) * ure[1]
     end
 
     # Evolve the process for the remaining time steps
     for t in 3:n_latent
-        latent[t] = rho1 * latent[t-1] + rho2 * latent[t-2] + innovations[t] * sigma
+        latent[t] = rho1 * latent[t-1] + rho2 * latent[t-2] + ure[t] * sigma
     end
 
     return latent
@@ -277,10 +367,14 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = string.(names(DataFrame(chain)))
+    p_names = string.(keys(chain))
     
     noise_val = get(M, :noise, 1e-6)
     
@@ -303,8 +397,8 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        rho1_name = _find_parameter(p_names, string(p_names_k.unconstrained_rho1), k, is_multivariate_model)
-        rho2_name = _find_parameter(p_names, string(p_names_k.unconstrained_rho2), k, is_multivariate_model)
+        rho1_name = _find_parameter(p_names, string(p_names_k.rho1_unconstrained), k, is_multivariate_model)
+        rho2_name = _find_parameter(p_names, string(p_names_k.rho2_unconstrained), k, is_multivariate_model)
         
         if isempty(sigma_name) || isempty(rho1_name) || isempty(rho2_name)
             @warn "Base parameters for AR2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -323,46 +417,90 @@ function get_effects(
         latent_field_samples = zeros(Float64, t_N_full, n_samples)
         
         if m.method == :statespace
-            innov_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
-            if isempty(innov_name)
-                @warn "Innovations for AR2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "Innovations (ure) for AR2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total_obs, n_samples))
                 continue
             end
-            innov_samples = get_params_vector(chain, innov_name, t_N_train)
+            ure_samples = get_params_vector(chain, ure_name, t_N_train)
             
             # Reconstruction for training period
             for j in 1:n_samples
                 latent_field_train_j = ar2_statespace(
                     rho1_samples[j], rho2_samples[j], sigma_samples[j],
-                    innov_samples[j, :], t_N_train, noise_val
+                    ure_samples[j, :], t_N_train, noise_val
                 )
                 latent_field_samples[1:t_N_train, j] = latent_field_train_j
             end
 
         elseif m.method == :centered
-            latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
-            if isempty(latent_name)
-                @warn "Latent field for AR2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
+            if isempty(sre_name)
+                @warn "Structured field (sre) for AR2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total_obs, n_samples))
                 continue
             end
-            latent_samples = get_params_vector(chain, latent_name, t_N_train)
-            latent_field_samples[1:t_N_train, :] = latent_samples'
+            sre_samples = get_params_vector(chain, sre_name, t_N_train)
+            latent_field_samples[1:t_N_train, :] = sre_samples'
             if t_N_full > t_N_train
                 @warn "Forecasting for the AR2 component with the ':centered' method is not supported. Returning zeros for prediction time steps."
             end
+
+        elseif m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
+            end
+            
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            
+            N_t = zeros(Float64, t_N_train)
+            S_t = zeros(Float64, t_N_train)
+            for i in 1:length(t_idx_train)
+                t = t_idx_train[i]
+                if 1 <= t <= t_N_train
+                    N_t[t] += 1.0
+                    S_t[t] += y_vec[i]
+                end
+            end
+            
+            for j in 1:n_samples
+                r1 = rho1_samples[j]
+                r2 = rho2_samples[j]
+                sig = sigma_samples[j]
+                y_sig = y_sigma_samples[j]
+                
+                K = _ar2_covariance_matrix(r1, r2, sig, t_N_train, noise_val)
+                F_K = cholesky(Symmetric(K + noise_val * I))
+                Q_prior = inv(F_K)
+                
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise_val)
+                Q_post = Matrix(Q_prior)
+                for t in 1:t_N_train
+                    Q_post[t, t] += N_t[t] * inv_sigma_y2
+                end
+                
+                F_post = cholesky(Symmetric(Q_post))
+                b = S_t .* inv_sigma_y2
+                mu = F_post \ b
+                
+                z = randn(t_N_train)
+                x_train = mu + F_post.U \ z
+                latent_field_samples[1:t_N_train, j] = x_train
+            end
         end
         
-        # Forecasting step for the statespace method
-        if m.method == :statespace && t_N_full > t_N_train
+        # Forecasting step for statespace and marginalized methods
+        if (m.method in [:statespace, :marginalized]) && t_N_full > t_N_train
             for j in 1:n_samples
                 for t in (t_N_train + 1):t_N_full
                     pred_innov = randn()
-                    latent_field_samples[t, j] = 
-                        rho1_samples[j] * latent_field_samples[t-1, j] +
-                        rho2_samples[j] * latent_field_samples[t-2, j] +
-                        pred_innov * sigma_samples[j]
+                    val_t1 = t - 1 >= 1 ? latent_field_samples[t-1, j] : 0.0
+                    val_t2 = t - 2 >= 1 ? latent_field_samples[t-2, j] : 0.0
+                    latent_field_samples[t, j] = rho1_samples[j] * val_t1 + rho2_samples[j] * val_t2 + pred_innov * sigma_samples[j]
                 end
             end
         end

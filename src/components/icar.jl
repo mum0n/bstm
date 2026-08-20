@@ -93,16 +93,76 @@ function get_precomputes(m::ICAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
+"""
+    _icar_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for an ICAR spatial process integrated out analytically.
+"""
+function _icar_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    s_idx::AbstractVector{Int},
+    s_N::Int,
+    Q_template::AbstractMatrix,
+    L_eig::AbstractVector,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    T_num = promote_type(T, typeof(noise))
+    
+    # Pre-accumulate observation counts and sums per spatial index
+    N_s = zeros(T_num, s_N)
+    S_s = zeros(T_num, s_N)
+    for i in 1:N
+        s = s_idx[i]
+        if 1 <= s <= s_N
+            N_s[s] += one(T_num)
+            S_s[s] += y_residual[i]
+        end
+    end
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    Q_base = Matrix{T_num}(Q_template)
+    for s in 1:s_N
+        Q_base[s, s] += T_num(noise) + N_s[s] * inv_sigma_y2 * scale
+    end
+    
+    F = cholesky(Symmetric(Q_base))
+    
+    # Determinant term (ICAR has rank deficiency 1)
+    log_det_prior = sum(log.(L_eig[2:end] .+ T_num(noise)))
+    log_det_diff = - (s_N - 1) * log(scale) + log_det_prior - 2 * sum(log.(diag(F.U)))
+    
+    # Quadratic term
+    b = S_s .* inv_sigma_y2
+    v = F.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
 function get_priors(
     m::ICAR, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     n_latent = spec.hyper.n_latent
-    return """ # Priors for sigma and raw innovations
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
-    """
+    if m.method == :marginalized
+        return "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))"
+    else
+        return """ # Priors for sigma and raw innovations
+        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)
+        """
+    end
 end
 
 function get_updates(
@@ -122,8 +182,8 @@ function get_updates(
             L = hyper.L
             diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
             diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-            $(p_names.latent) = U * (diag_D .* $(p_names.innovations))
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(p_names.sre) = U * (diag_D .* $(p_names.ure))
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -132,14 +192,14 @@ function get_updates(
         let
             hyper = spec_registry[:$(key)].hyper
             F = hyper.cholesky_factor
-            latent_field_raw = F.L' \\ $(p_names.innovations)
+            sre_unscaled = F.L' \\ $(p_names.ure)
             
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw)
+                Normal(0.0, 0.001 * $(n_latent)), sum(sre_unscaled)
             )
             
-            $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -149,14 +209,33 @@ function get_updates(
             hyper = spec_registry[:$(key)].hyper
             Q = hyper.Q_template
             F = cholesky(Symmetric(Q + M.noise * I))
-            latent_field_raw = F.L' \\ $(p_names.innovations)
+            sre_unscaled = F.L' \\ $(p_names.ure)
             
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw)
+                Normal(0.0, 0.001 * $(n_latent)), sum(sre_unscaled)
             )
             
-            $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+        end
+    """
+
+    marginalized_code = """
+        # --- ICAR Component: $(key) (Marginalized Method) ---
+        let
+            hyper = spec_registry[:$(key)].hyper
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _icar_log_marginal_likelihood(
+                y_residual,
+                M.s_idx,
+                hyper.n_latent,
+                hyper.Q_template,
+                hyper.L,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
@@ -166,8 +245,10 @@ function get_updates(
         return cholesky_code
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else
-        error("Unsupported method '$(m.method)' for ICAR component.")
+        error("Unsupported method '$(m.method)' for ICAR component. Use :spectral, :cholesky, :cholesky_sparse, or :marginalized.")
     end
 end
 
@@ -190,7 +271,7 @@ function get_effects(
     end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = string.(names(DataFrame(chain)))
+    p_names = string.(keys(chain))
     
     noise = M.noise
     n_latent = spec.hyper.n_latent
@@ -212,48 +293,98 @@ function get_effects(
         
         # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for ICAR component $(spec.key) (outcome ) not found. Returning zero-matrix."
+        if isempty(sigma_name)
+            @warn "Parameters for ICAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
 
         # Initialize the output matrix for latent effects
         effect_k_latent = zeros(Float64, n_latent, n_samples)
 
         # --- Sample-wise Reconstruction ---
-        if m.method == :spectral
-            U = spec.hyper.U
-            L = spec.hyper.L
-            
-            for j in 1:n_samples
-                sigma_j = sigma_samples[j, 1] # Scalar sigma for current sample
-                innov_j = innovations_samples[j, :] # Vector of innovations for current sample
-                
-                # Apply spectral transformation
-                diag_D = sigma_j ./ sqrt.(L .+ noise)
-                diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-                effect_k_latent[:, j] = U * (diag_D .* innov_j)
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
             end
-        else # :cholesky or :cholesky_sparse
-            # For reconstruction, use the pre-computed Cholesky factor
-            F = spec.hyper.cholesky_factor
+            
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            
+            N_s = zeros(Float64, n_latent)
+            S_s = zeros(Float64, n_latent)
+            for i in 1:length(s_idx_train)
+                s = s_idx_train[i]
+                if 1 <= s <= n_latent
+                    N_s[s] += 1.0
+                    S_s[s] += y_vec[i]
+                end
+            end
+            
+            Q_template = spec.hyper.Q_template
             
             for j in 1:n_samples
                 sigma_j = sigma_samples[j, 1]
-                innov_j = innovations_samples[j, :]
+                y_sig = y_sigma_samples[j]
+                
+                scale = sigma_j^2 + noise
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
+                
+                Q_base = Matrix{Float64}(Q_template)
+                for i in 1:n_latent
+                    Q_base[i, i] += noise + N_s[i] * inv_sigma_y2 * scale
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = S_s .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(n_latent)
+                x_train = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+                x_train .-= mean(x_train)
+                effect_k_latent[:, j] = x_train
+            end
+        else
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "ure for ICAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            ure_samples = get_params_matrix(chain, ure_name, n_latent)
 
-                latent_field_raw = F.L' \ innov_j
-                latent_field_centered = latent_field_raw .- mean(latent_field_raw)
-                effect_k_latent[:, j] = latent_field_centered .* sigma_j
+            if m.method == :spectral
+                U = spec.hyper.U
+                L = spec.hyper.L
+                
+                for j in 1:n_samples
+                    sigma_j = sigma_samples[j, 1]
+                    innov_j = ure_samples[j, :]
+                    
+                    diag_D = sigma_j ./ sqrt.(L .+ noise)
+                    diag_D[1] = 0.0 # Enforce sum-to-zero constraint
+                    effect_k_latent[:, j] = U * (diag_D .* innov_j)
+                end
+            else # :cholesky or :cholesky_sparse
+                F = spec.hyper.cholesky_factor
+                
+                for j in 1:n_samples
+                    sigma_j = sigma_samples[j, 1]
+                    innov_j = ure_samples[j, :]
+
+                    sre_unscaled = F.L' \ innov_j
+                    latent_field_centered = sre_unscaled .- mean(sre_unscaled)
+                    effect_k_latent[:, j] = latent_field_centered .* sigma_j
+                end
             end
         end
+
         # Index the reconstructed latent effects to match the observation indices
         indexed_effects = effect_k_latent[s_idx_full, :]
         push!(structured_effects, indexed_effects)

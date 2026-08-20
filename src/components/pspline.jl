@@ -118,6 +118,58 @@ function get_precomputes(m::PSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
+"""
+    _pspline_log_marginal_likelihood(y_residual, B_basis, Q_penalty, L_eig, diff_order, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for a P-spline component with basis coefficients integrated out analytically.
+"""
+function _pspline_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    B_basis::AbstractMatrix,
+    Q_penalty::AbstractMatrix,
+    L_eig::AbstractVector,
+    diff_order::Int,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    K = size(B_basis, 2)
+    T_num = promote_type(T, typeof(noise))
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    # B^T B and B^T y_residual
+    BTB = Matrix{T_num}(B_basis' * B_basis)
+    BTy = Vector{T_num}(B_basis' * y_residual)
+    
+    # Q_post_scaled = Q_penalty + (sigma^2 / sigma_y^2) * B^T B + noise * I
+    Q_base = Matrix{T_num}(Q_penalty) .+ (scale * inv_sigma_y2) .* BTB
+    for k in 1:K
+        Q_base[k, k] += T_num(noise)
+    end
+    
+    F = cholesky(Symmetric(Q_base))
+    
+    # Determinant term
+    valid_eigs = L_eig[(diff_order + 1):end]
+    log_det_prior = isempty(valid_eigs) ? zero(T_num) : sum(log.(valid_eigs .+ T_num(noise)))
+    log_det_diff = - max(K - diff_order, 1) * log(scale) + log_det_prior - 2 * sum(log.(diag(F.U)))
+    
+    # Quadratic term
+    b = BTy .* inv_sigma_y2
+    v = F.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
 function get_priors(
     m::PSpline, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -126,12 +178,16 @@ function get_priors(
     sigma_prior_str = _distribution_to_string(m.sigma)
     key = spec.key
 
-    return """
-        $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.innovations) ~ MvNormal(
-            zeros(T, spec_registry[:$(key)].hyper.n_latent), I
-        )
-    """
+    if m.method == :marginalized
+        return "$(p_names.sigma) ~ $(sigma_prior_str)"
+    else
+        return """
+            $(p_names.sigma) ~ $(sigma_prior_str)
+            $(p_names.ure) ~ MvNormal(
+                zeros(T, spec_registry[:$(key)].hyper.n_latent), I
+            )
+        """
+    end
 end
 
 function get_updates(
@@ -154,9 +210,9 @@ function get_updates(
             local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             for i in 1:$(m.diff_order); diag_D[i] = 0.0; end
 
-            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
-            $(p_names.latent) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.latent)
+            coeffs = hyper.U * (diag_D .* $(p_names.ure))
+            $(p_names.sre) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -165,15 +221,15 @@ function get_updates(
         let
             $(common_code)
             local F = hyper.cholesky_factor
-            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            local coeffs_unscaled = F.L' \\ $(p_names.ure)
 
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw)
+                Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled)
             )
 
-            local coeffs = $(p_names.sigma) .* coeffs_raw
-            $(p_names.latent) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.latent)
+            local coeffs = $(p_names.sigma) .* coeffs_unscaled
+            $(p_names.sre) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -183,15 +239,34 @@ function get_updates(
             $(common_code)
             local Q_penalty = hyper.Q_template
             local F = cholesky(Symmetric(Q_penalty + M.noise * I))
-            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            local coeffs_unscaled = F.L' \\ $(p_names.ure)
 
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw)
+                Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled)
             )
 
-            local coeffs = $(p_names.sigma) .* coeffs_raw
-            $(p_names.latent) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.latent)
+            local coeffs = $(p_names.sigma) .* coeffs_unscaled
+            $(p_names.sre) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.sre)
+        end
+    """
+
+    marginalized_code = """
+        # --- P-Spline Smoother Component (Marginalized): $(key) ---
+        let
+            $(common_code)
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _pspline_log_marginal_likelihood(
+                y_residual,
+                B_basis,
+                hyper.Q_template,
+                hyper.L,
+                $(m.diff_order),
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
@@ -201,8 +276,10 @@ function get_updates(
         return cholesky_code
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else
-        error("Unsupported method '$(m.method)' for PSpline component.")
+        error("Unsupported method '$(m.method)' for PSpline component. Use :spectral, :cholesky, :cholesky_sparse, or :marginalized.")
     end
 end
 
@@ -249,9 +326,8 @@ function get_effects(
         
         # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(innovations_name)
+        if isempty(sigma_name)
             @warn "Parameters for PSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -259,38 +335,75 @@ function get_effects(
 
         # Extract posterior samples (these are on the CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
         # Initialize the output matrix for coefficients on the CPU
         coeffs_samples_matrix_cpu = zeros(Float64, n_latent, n_samples)
 
         # --- Sample-wise Reconstruction on the CPU ---
-        if m.method == :spectral
-            U = hyper.U # Already a CPU array
-            L = hyper.L # Already a CPU array
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
+            end
             
-            # Vectorized reconstruction on CPU
-            # sigma_samples_cpu is [n_samples], innovations_samples_cpu is [n_samples, n_latent]
-            # We need to broadcast sigma over the innovations.
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            BTB = Matrix{Float64}(B_train' * B_train)
+            BTy = Vector{Float64}(B_train' * y_vec)
             
-            # Create a matrix of diag_D values, one column per sample
+            for i in 1:n_samples
+                sig = sigma_samples_cpu[i]
+                y_sig = y_sigma_samples[i]
+                
+                scale = sig^2 + noise
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
+                
+                Q_base = Matrix{Float64}(hyper.Q_template) .+ (scale * inv_sigma_y2) .* BTB
+                for j in 1:n_latent
+                    Q_base[j, j] += noise
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = BTy .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(n_latent)
+                coeffs_i = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+                coeffs_samples_matrix_cpu[:, i] = coeffs_i
+            end
+        elseif m.method == :spectral
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "ure for PSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
+
+            U = hyper.U
+            L = hyper.L
+            
             diag_D_matrix = (sigma_samples_cpu' ./ sqrt.(L .+ noise))
             for i in 1:m.diff_order
                 diag_D_matrix[i, :] .= 0.0
             end
             
-            # U is [n_latent x n_latent], diag_D_matrix is [n_latent x n_samples], innovations_samples_cpu' is [n_latent x n_samples]
-            coeffs_samples_matrix_cpu = U * (diag_D_matrix .* innovations_samples_cpu')
-
+            coeffs_samples_matrix_cpu = U * (diag_D_matrix .* ure_samples_cpu')
         else # :cholesky or :cholesky_sparse
-            F = hyper.cholesky_factor # Already a CPU factorization object
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "ure for PSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
+
+            F = hyper.cholesky_factor
             for i in 1:n_samples
-                innov_i_cpu = innovations_samples_cpu[i, :]
-                coeffs_raw = F.L' \ innov_i_cpu
-                
-                # Centering based on sum-to-zero constraint for RW penalties
-                # The sum(coeffs_raw) is constrained in get_updates, so mean(coeffs_raw) is appropriate here.
-                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
+                innov_i_cpu = ure_samples_cpu[i, :]
+                coeffs_unscaled = F.L' \ innov_i_cpu
+                coeffs_centered = coeffs_unscaled .- mean(coeffs_unscaled)
                 coeffs_samples_matrix_cpu[:, i] = sigma_samples_cpu[i] .* coeffs_centered
             end
         end

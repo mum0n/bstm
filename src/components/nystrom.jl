@@ -118,7 +118,7 @@ function get_priors(
     end
     
     if m.method == :noncentered
-        push!(priors, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, m.n_inducing), I), :$(p_names.innovations))")
+        push!(priors, "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, m.n_inducing), I), :$(p_names.ure))")
     end
 
     return join(priors, "\n    ")
@@ -151,17 +151,17 @@ function get_updates(
         # --- Nystrom Sparse GP (Non-Centered): $(key) ---
         $(common_code)
             L_UU = cholesky(Symmetric(K_UU)).L
-            u_latent = L_UU * $(p_names.innovations)
-            nystrom_effect = K_XU * (K_UU \\ u_latent)
-            $(eta_target) .+= nystrom_effect
+            u_latent = L_UU * $(p_names.ure)
+            $(p_names.sre) = K_XU * (K_UU \\ u_latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
     centered_code = """
         # --- Nystrom Sparse GP (Centered): $(key) ---
         $(common_code)
-            $(p_names.latent) ~ MvNormal(zeros(T, $(m.n_inducing)), Symmetric(K_UU))
-            nystrom_effect = K_XU * (K_UU \\ $(p_names.latent))
+            $(p_names.sre) ~ MvNormal(zeros(T, $(m.n_inducing)), Symmetric(K_UU))
+            nystrom_effect = K_XU * (K_UU \\ $(p_names.sre))
             $(eta_target) .+= nystrom_effect
         end
     """
@@ -239,13 +239,13 @@ function get_effects(
 
         # --- Sample-wise Reconstruction ---
         if m.method == :noncentered
-            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
-            if isempty(innovations_name)
-                @warn "Innovations for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "ure for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            innovations_samples = get_params_matrix(chain, innovations_name, m.n_inducing) # (n_samples, n_inducing)
+            ure_samples = get_params_matrix(chain, ure_name, m.n_inducing) # (n_samples, n_inducing)
 
             for i in 1:n_samples
                 current_sigma = sigma_samples[i, 1] # Sigma for current sample
@@ -256,17 +256,17 @@ function get_effects(
                 K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
                 
                 L_UU = cholesky(Symmetric(K_UU)).L
-                u_latent = L_UU * innovations_samples[i, :]
+                u_latent = L_UU * ure_samples[i, :]
                 effect_k_matrix[:, i] = K_XU * (K_UU \ u_latent)
             end
         else # :centered
-            latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
-            if isempty(latent_name)
-                @warn "Latent values for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
+            if isempty(sre_name)
+                @warn "sre for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            u_latent_samples = get_params_matrix(chain, latent_name, m.n_inducing) # (n_samples, n_inducing)
+            u_latent_samples = get_params_matrix(chain, sre_name, m.n_inducing) # (n_samples, n_inducing)
 
             for i in 1:n_samples # Iterate over each posterior sample
                 current_sigma = sigma_samples[i, 1] # Sigma for current sample

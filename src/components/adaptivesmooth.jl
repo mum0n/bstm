@@ -63,12 +63,13 @@ expansion in the warped space.
 
 # Key References
 - Bishop, C. M. (1995). *Neural Networks for Pattern Recognition*. Oxford University Press.
+- Rue, H., Martino, S., & Chopin, N. (2009). Approximate Bayesian inference for latent Gaussian models by using integrated nested Laplace approximations. *Journal of the Royal Statistical Society: Series B (Statistical Methodology)*, 71(2), 319-392.
 """
 struct AdaptiveSmooth <: ComponentModel
     hidden_dim::Int
     nbins::Int
     sigma::UnivariateDistribution
-    method::Symbol
+    method::Symbol # :noncentered, :centered, :rw2_penalty, :marginalized
 end
 
 COMPONENT_TYPE_REGISTRY[:adaptivesmooth] = AdaptiveSmooth
@@ -76,8 +77,8 @@ COMPONENT_TYPE_REGISTRY[:adaptivesmooth] = AdaptiveSmooth
 COMPONENT_CONSTRUCTORS[:adaptivesmooth] = (p, params) -> AdaptiveSmooth(
     get(params, :hidden_dim, 10),
     get(params, :nbins, 20),
-    p.sigma,
-    get(params, :method, :noncentered)
+    get(p, :sigma, Exponential(1.0)), # Default sigma prior
+    get(params, :method, :noncentered) # Default method
 )
 
 MODEL_TO_STRUCTURE_MAP[:adaptivesmooth] = :smooth
@@ -128,6 +129,48 @@ function get_precomputes(
     return NamedTuple(precomputes)
 end
 
+"""
+    _adaptivesmooth_log_marginal_likelihood(y_residual, B, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for an AdaptiveSmooth component with latent basis weights integrated out analytically.
+Uses Woodbury / matrix determinant identity in O(N*M + M^3) operations.
+"""
+function _adaptivesmooth_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    B::AbstractMatrix{T},
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    M_dim = size(B, 2)
+    T_num = promote_type(T, typeof(noise))
+    
+    inv_sigma2 = one(T_num) / (sigma^2 + T_num(noise))
+    inv_y_sig2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    
+    # Q_beta = (1/sigma^2)*I + (1/y_sig^2)*(B' * B)
+    Q_beta = (B' * B) .* inv_y_sig2
+    for d in 1:M_dim
+        Q_beta[d, d] += inv_sigma2
+    end
+    
+    F = cholesky(Symmetric(Q_beta))
+    
+    # Determinant of (sigma^2 B B' + y_sigma^2 I) via matrix determinant lemma:
+    # log det = N * log(y_sigma^2) + M * log(sigma^2) + 2 * sum(log, diag(F.U))
+    log_det = N * log(y_sigma^2 + T_num(noise)) + M_dim * log(sigma^2 + T_num(noise)) + 2 * sum(log.(diag(F.U)))
+    
+    # Quadratic term via Woodbury:
+    # (1/y_sigma^2) * ||y_residual||^2 - (1/y_sigma^4) * y_res' * B * Q_beta^{-1} * B' * y_res
+    b = (B' * y_residual) .* inv_y_sig2
+    v = F.L \ b
+    quad_term = inv_y_sig2 * dot(y_residual, y_residual) - dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi)) - (1 / 2) * log_det - (1 / 2) * quad_term
+    return log_lik
+end
+
 
 """
     get_priors(m::AdaptiveSmooth, spec::NamedTuple, arch::String, outcome_idx, M)
@@ -147,13 +190,13 @@ function get_priors(
     priors = String[]
     push!(priors, "$(p_names.W1) ~ MvNormal(zeros(T, $(in_dim * h_dim)), I)")
     push!(priors, "$(p_names.b1) ~ MvNormal(zeros(T, $(h_dim)), I)")
-    push!(priors, "$(p_names.W2) ~ MvNormal(zeros(T, $(h_dim * n_bins)), I)")
+    push!(priors, "$(p_names.W2) ~ MvNormal(zeros(T, $(h_dim * n_bins)), I)") # W2 is always sampled
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
-    if m.method in [:noncentered, :rw2_penalty]
-        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_bins)), I)")
+    if m.method in [:noncentered, :rw2_penalty] # Latent field is sampled
+        push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, $(n_bins)), I)")
     elseif m.method == :centered
-        push!(priors, "$(p_names.latent) ~ MvNormal(zeros(T, $(n_bins)), I)")
+        push!(priors, "$(p_names.sre) ~ MvNormal(zeros(T, $(n_bins)), I)")
     end
     
     return join(priors, "\n    ")
@@ -191,7 +234,7 @@ function get_updates(
     noncentered_code = """
         # --- AdaptiveSmooth Component (Non-Centered): $(key) ---
         $(common_code)
-            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
+            scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
             adaptive_effect = B_adaptive * scaled_coeffs
             $(eta_target) .+= adaptive_effect
         end
@@ -200,7 +243,7 @@ function get_updates(
     centered_code = """
         # --- AdaptiveSmooth Component (Centered): $(key) ---
         $(common_code)
-            coeffs = $(p_names.latent) .* $(p_names.sigma)
+            coeffs = $(p_names.sre) .* $(p_names.sigma)
             adaptive_effect = B_adaptive * coeffs
             $(eta_target) .+= adaptive_effect
         end
@@ -214,17 +257,34 @@ function get_updates(
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
             
-            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
+            coeffs = hyper.U * (diag_D .* $(p_names.ure))
             adaptive_effect = B_adaptive * coeffs
             
             $(eta_target) .+= adaptive_effect
         end
     """
 
-    if m.method == :noncentered; return noncentered_code;
-    elseif m.method == :centered; return centered_code;
-    elseif m.method == :rw2_penalty; return rw2_penalty_code;
-    else; error("Unsupported method '$(m.method)' for AdaptiveSmooth component."); end
+    marginalized_code = """
+        # --- AdaptiveSmooth Component (Marginalized): $(key) ---
+        $(common_code)
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _adaptivesmooth_log_marginal_likelihood(
+                y_residual,
+                B_adaptive,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
+        end
+    """
+
+    if m.method == :noncentered; return noncentered_code; end
+    if m.method == :centered; return centered_code; end
+    if m.method == :rw2_penalty; return rw2_penalty_code; end
+    if m.method == :marginalized; return marginalized_code; end
+    
+    error("Unsupported method '$(m.method)' for AdaptiveSmooth component.");
 end
 
 """
@@ -245,7 +305,7 @@ function get_effects(
     end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = string.(names(DataFrame(chain)))
+    p_names = string.(keys(chain))
     
     # --- Coordinate Handling: Combine training and prediction sets ---
     coords_train = spec.hyper.coords
@@ -261,7 +321,6 @@ function get_effects(
 
     structured_effects = Vector{Matrix{Float64}}()
 
-    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
@@ -300,30 +359,53 @@ function get_effects(
             # Reconstruct coefficients based on the sampling method
             local coeffs
             if m.method == :centered
-                latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
-                if isempty(latent_name)
+                sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
+                if isempty(sre_name)
                     @warn "Latent coefficients for centered AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
                     coeffs = zeros(m.nbins)
                 else
-                    coeffs = get_params_vector(chain, latent_name, m.nbins)[i, :] .* sigma_samples[i]
+                    coeffs = get_params_vector(chain, sre_name, m.nbins)[i, :] .* sigma_samples[i]
                 end
+            elseif m.method == :marginalized
+                # Exact conditional Gaussian simulation for basis weights beta ~ N(0, sigma^2 I)
+                y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+                y_sig = !isempty(y_sigma_name) ? get_params_vector(chain, y_sigma_name, 1)[i, 1] : 1.0
+                
+                y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+                n_train = size(coords_train, 1)
+                B_train = B_adaptive[1:n_train, :]
+                
+                inv_sigma2 = 1.0 / (sigma_samples[i]^2 + M.noise)
+                inv_y_sig2 = 1.0 / (y_sig^2 + M.noise)
+                
+                # Q_post = (1/sigma^2)*I + (1/y_sig^2)*(B_train' * B_train)
+                Q_post = (B_train' * B_train) .* inv_y_sig2
+                for d in 1:m.nbins
+                    Q_post[d, d] += inv_sigma2
+                end
+                
+                F = cholesky(Symmetric(Q_post))
+                b = (B_train' * y_vec[1:n_train]) .* inv_y_sig2
+                mu = F \ b
+                z = randn(m.nbins)
+                coeffs = mu + F.U \ z
             else # :noncentered or :rw2_penalty
-                innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
-                if isempty(innovations_name)
-                    @warn "Innovations for AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
+                ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+                if isempty(ure_name)
+                    @warn "Innovations (ure) for AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
                     coeffs = zeros(m.nbins)
                 else
-                    innovations = get_params_vector(chain, innovations_name, m.nbins)[i, :]
+                    ure_samples = get_params_vector(chain, ure_name, m.nbins)[i, :]
                     
                     if m.method == :noncentered
-                        coeffs = innovations .* sigma_samples[i]
+                        coeffs = ure_samples .* sigma_samples[i]
                     else # :rw2_penalty
                         U = spec.hyper.U
                         L = spec.hyper.L
                         diag_D = sigma_samples[i] ./ sqrt.(L .+ M.noise)
                         diag_D[1] = 0.0; diag_D[2] = 0.0
                         
-                        coeffs = U * (diag_D .* innovations)
+                        coeffs = U * (diag_D .* ure_samples)
                     end
                 end
             end

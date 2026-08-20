@@ -139,7 +139,7 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
@@ -168,9 +168,9 @@ function get_updates(
             $(common_basis_code)
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
-            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
-            $(p_names.latent) = B_wavelet * coeffs
-            $(eta_target) .+= $(p_names.latent)
+            coeffs = hyper.U * (diag_D .* $(p_names.ure))
+            $(p_names.sre) = B_wavelet * coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -179,11 +179,11 @@ function get_updates(
         let
             $(common_basis_code)
             F = hyper.cholesky_factor
-            coeffs_raw = F.L' \\\\ $(p_names.innovations)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
-            coeffs = $(p_names.sigma) .* (coeffs_raw .- mean(coeffs_raw))
-            $(p_names.latent) = B_wavelet * coeffs
-            $(eta_target) .+= $(p_names.latent)
+            coeffs_unscaled = F.L' \\ $(p_names.ure)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
+            coeffs = $(p_names.sigma) .* (coeffs_unscaled .- mean(coeffs_unscaled))
+            $(p_names.sre) = B_wavelet * coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -193,11 +193,11 @@ function get_updates(
             $(common_basis_code)
             Q_penalty = hyper.Q_template
             F = cholesky(Symmetric(Q_penalty + M.noise * I))
-            coeffs_raw = F.L' \\\\ $(p_names.innovations)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
-            coeffs = $(p_names.sigma) .* coeffs_raw
-            $(p_names.latent) = B_wavelet * coeffs
-            $(eta_target) .+= $(p_names.latent)
+            coeffs_unscaled = F.L' \\ $(p_names.ure)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
+            coeffs = $(p_names.sigma) .* coeffs_unscaled
+            $(p_names.sre) = B_wavelet * coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -243,9 +243,9 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(ls_name) || isempty(innovations_name)
+        if isempty(sigma_name) || isempty(ls_name) || isempty(ure_name)
             @warn "Parameters for Wavelet component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -255,7 +255,7 @@ function get_effects(
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
         ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
+        ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
 
         # Initialize the output matrix for the full effect on the CPU
         effect_k_cpu = zeros(Float64, N_total, n_samples)
@@ -268,7 +268,7 @@ function get_effects(
                 coords_full_cpu, nbins_per_dim, m.family, current_ls_cpu
             )
             
-            innov_i_cpu = innovations_samples_cpu[i, :]
+            innov_i_cpu = ure_samples_cpu[i, :]
             sigma_i_cpu = sigma_samples_cpu[i]
             
             # 3. Reconstruct coefficients on CPU
@@ -281,8 +281,8 @@ function get_effects(
                 coeffs_cpu = U * (diag_D .* innov_i_cpu)
             else # :cholesky or :cholesky_sparse
                 F = hyper.cholesky_factor
-                coeffs_raw = F.L' \ innov_i_cpu
-                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
+                coeffs_unscaled = F.L' \ innov_i_cpu
+                coeffs_centered = coeffs_unscaled .- mean(coeffs_unscaled)
                 coeffs_cpu = sigma_i_cpu .* coeffs_centered
             end
             

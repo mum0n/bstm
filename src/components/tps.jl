@@ -132,6 +132,54 @@ function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
+"""
+    _tps_log_marginal_likelihood(y_residual, B_basis, Q_penalty, L_eig, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for a TPS component with basis coefficients integrated out analytically.
+"""
+function _tps_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    B_basis::AbstractMatrix,
+    Q_penalty::AbstractMatrix,
+    L_eig::AbstractVector,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    K = size(B_basis, 2)
+    T_num = promote_type(T, typeof(noise))
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    BTB = Matrix{T_num}(B_basis' * B_basis)
+    BTy = Vector{T_num}(B_basis' * y_residual)
+    
+    Q_base = Matrix{T_num}(Q_penalty) .+ (scale * inv_sigma_y2) .* BTB
+    for k in 1:K
+        Q_base[k, k] += T_num(noise)
+    end
+    
+    F = cholesky(Symmetric(Q_base))
+    
+    # RW2 has rank deficiency of 2
+    valid_eigs = L_eig[3:end]
+    log_det_prior = isempty(valid_eigs) ? zero(T_num) : sum(log.(valid_eigs .+ T_num(noise)))
+    log_det_diff = - max(K - 2, 1) * log(scale) + log_det_prior - 2 * sum(log.(diag(F.U)))
+    
+    b = BTy .* inv_sigma_y2
+    v = F.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
 function get_priors(
     m::TPS, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -140,10 +188,16 @@ function get_priors(
     sigma_prior_str = _distribution_to_string(m.sigma)
     key = spec.key
     
-    return """
-        $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)
-    """
+    if m.method == :marginalized
+        return """
+            $(p_names.sigma) ~ $(sigma_prior_str)
+        """
+    else
+        return """
+            $(p_names.sigma) ~ $(sigma_prior_str)
+            $(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)
+        """
+    end
 end
 
 function get_updates(
@@ -165,9 +219,9 @@ function get_updates(
             $(common_code)
             local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
-            local coeffs = hyper.U * (diag_D .* $(p_names.innovations))
-            $(p_names.latent) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.latent)
+            local coeffs = hyper.U * (diag_D .* $(p_names.ure))
+            $(p_names.sre) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -176,11 +230,11 @@ function get_updates(
         let
             $(common_code)
             local F = hyper.cholesky_factor
-            local coeffs_raw = F.L' \\ $(p_names.innovations)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
-            local coeffs = $(p_names.sigma) .* (coeffs_raw .- mean(coeffs_raw))
-            $(p_names.latent) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.latent)
+            local coeffs_unscaled = F.L' \\ $(p_names.ure)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
+            local coeffs = $(p_names.sigma) .* (coeffs_unscaled .- mean(coeffs_unscaled))
+            $(p_names.sre) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -190,18 +244,37 @@ function get_updates(
             $(common_code)
             local Q_penalty = hyper.Q_template
             local F = cholesky(Symmetric(Q_penalty + M.noise * I))
-            local coeffs_raw = F.L' \\ $(p_names.innovations)
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
-            local coeffs = $(p_names.sigma) .* coeffs_raw
-            $(p_names.latent) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.latent)
+            local coeffs_unscaled = F.L' \\ $(p_names.ure)
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
+            local coeffs = $(p_names.sigma) .* coeffs_unscaled
+            $(p_names.sre) = B_basis * coeffs
+            $(eta_target) .+= $(p_names.sre)
+        end
+    """
+
+    marginalized_code = """
+        # --- Thin Plate Spline (TPS) Smoother (Marginalized): $(key) ---
+        let
+            $(common_code)
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _tps_log_marginal_likelihood(
+                y_residual,
+                B_basis,
+                hyper.Q_template,
+                hyper.L,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
     if m.method == :spectral; return spectral_code;
     elseif m.method == :cholesky; return cholesky_code;
     elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
-    else; error("Unsupported method '$(m.method)' for TPS component."); end
+    elseif m.method == :marginalized; return marginalized_code;
+    else; error("Unsupported method '$(m.method)' for TPS component. Use :spectral, :cholesky, :cholesky_sparse, or :marginalized."); end
 end
 
 
@@ -263,39 +336,77 @@ function get_effects(
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(innovations_name)
+        if isempty(sigma_name)
             @warn "Parameters for TPS component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, size(B_full_cpu, 1), n_samples))
             continue
         end
 
-        # Extract posterior samples (CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
-
-        # Initialize output matrix on CPU
         effect_k_cpu = zeros(Float64, size(B_full_cpu, 1), n_samples)
 
-        # --- Sample-wise Reconstruction on CPU ---
-        for i in 1:n_samples
-            sigma_i = sigma_samples_cpu[i]
-            innovations_i = innovations_samples_cpu[i, :]
-            
-            local coeffs_cpu
-            if m.method == :spectral
-                U_cpu, L_cpu = hyper.U, hyper.L
-                diag_D = sigma_i ./ sqrt.(L_cpu .+ noise)
-                diag_D[1] = 0.0; diag_D[2] = 0.0
-                coeffs_cpu = U_cpu * (diag_D .* innovations_i)
-            else # :cholesky or :cholesky_sparse
-                F_cpu = hyper.cholesky_factor
-                coeffs_raw = F_cpu.L' \ innovations_i
-                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
-                coeffs_cpu = sigma_i .* coeffs_centered
+        # --- Sample-wise Reconstruction ---
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
             end
-            effect_k_cpu[:, i] = B_full_cpu * coeffs_cpu
+            
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            BTB = Matrix{Float64}(B_train_cpu' * B_train_cpu)
+            BTy = Vector{Float64}(B_train_cpu' * y_vec)
+            
+            coeffs_samples_matrix = zeros(Float64, n_latent, n_samples)
+            for i in 1:n_samples
+                sig = sigma_samples_cpu[i]
+                y_sig = y_sigma_samples[i]
+                
+                scale = sig^2 + noise
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
+                
+                Q_base = Matrix{Float64}(hyper.Q_template) .+ (scale * inv_sigma_y2) .* BTB
+                for j in 1:n_latent
+                    Q_base[j, j] += noise
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = BTy .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(n_latent)
+                coeffs_samples_matrix[:, i] = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+            end
+            effect_k_cpu = B_full_cpu * coeffs_samples_matrix
+        else
+            ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "ure for TPS component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, size(B_full_cpu, 1), n_samples))
+                continue
+            end
+            ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
+
+            for i in 1:n_samples
+                sigma_i = sigma_samples_cpu[i]
+                innovations_i = ure_samples_cpu[i, :]
+                
+                local coeffs_cpu
+                if m.method == :spectral
+                    U_cpu, L_cpu = hyper.U, hyper.L
+                    diag_D = sigma_i ./ sqrt.(L_cpu .+ noise)
+                    diag_D[1] = 0.0; diag_D[2] = 0.0
+                    coeffs_cpu = U_cpu * (diag_D .* innovations_i)
+                else # :cholesky or :cholesky_sparse
+                    F_cpu = hyper.cholesky_factor
+                    coeffs_unscaled = F_cpu.L' \ innovations_i
+                    coeffs_centered = coeffs_unscaled .- mean(coeffs_unscaled)
+                    coeffs_cpu = sigma_i .* coeffs_centered
+                end
+                effect_k_cpu[:, i] = B_full_cpu * coeffs_cpu
+            end
         end
         
         push!(structured_effects, effect_k_cpu)

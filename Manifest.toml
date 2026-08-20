@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "c14c73d52e4c1b3dcd5285e63df7427d181132b7"
+project_hash = "2ed223f45c6d543ec94fd75e89e08a3f8c7ae358"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "5970c86505ae9c07bf5bc521ef2bbbb3849e8b7b"
@@ -1308,6 +1308,12 @@ deps = ["Artifacts", "JLLWrappers", "Libdl", "Libglvnd_jll", "Xorg_libXcursor_jl
 git-tree-sha1 = "9e0fb9e54594c47f278d75063980e43066e26e20"
 uuid = "0656b61e-2033-5cc2-a64a-77c0f6c09b89"
 version = "3.4.1+1"
+
+[[deps.GLM]]
+deps = ["Distributions", "LinearAlgebra", "LogExpFunctions", "Printf", "Reexport", "SparseArrays", "SpecialFunctions", "Statistics", "StatsAPI", "StatsBase", "StatsModels"]
+git-tree-sha1 = "c963639ae5b9aab54f543bdc7504f42f59880bec"
+uuid = "38e38edf-8417-5370-95a0-9cbb8c7f171a"
+version = "1.9.5"
 
 [[deps.GPUArraysCore]]
 deps = ["Adapt"]
@@ -3913,7 +3919,7 @@ uuid = "700de1a5-db45-46bc-99cf-38207098b444"
 version = "0.2.8"
 
 [[deps.bstm]]
-deps = ["ADTypes", "AbstractGPs", "AbstractMCMC", "AbstractPPL", "AdvancedVI", "Bijectors", "BlackBoxOptim", "CategoricalArrays", "Clustering", "DataFrames", "DelaunayTriangulation", "DifferentialEquations", "DimensionalData", "Distances", "Distributions", "DrWatson", "DynamicPPL", "Enzyme", "FFTW", "FillArrays", "FiniteDiff", "FlexiChains", "ForwardDiff", "Graphs", "HypothesisTests", "Interpolations", "JLD2", "KernelAbstractions", "KernelFunctions", "LibGEOS", "LinearAlgebra", "LogExpFunctions", "MCMCChains", "NLopt", "NNlib", "NamedArrays", "NearestNeighbors", "Optim", "Optimisers", "OptimizationNLopt", "OrderedCollections", "PDMats", "PRIMA", "PackageCompiler", "Plots", "PosteriorStats", "PrecompileTools", "Random", "Reexport", "Requires", "ReverseDiff", "Revise", "SparseArrays", "SpecialFunctions", "StaticArrays", "Statistics", "StatsBase", "StatsModels", "StatsPlots", "Turing", "Wavelets", "WaveletsExt", "Zygote"]
+deps = ["ADTypes", "AbstractGPs", "AbstractMCMC", "AbstractPPL", "AdvancedVI", "Bijectors", "BlackBoxOptim", "CategoricalArrays", "Clustering", "DataFrames", "DelaunayTriangulation", "DifferentialEquations", "DimensionalData", "Distances", "Distributions", "DrWatson", "DynamicPPL", "Enzyme", "FFTW", "FillArrays", "FiniteDiff", "FlexiChains", "ForwardDiff", "GLM", "Graphs", "HypothesisTests", "Interpolations", "JLD2", "KernelAbstractions", "KernelFunctions", "LibGEOS", "LinearAlgebra", "LogExpFunctions", "MCMCChains", "NLopt", "NNlib", "NamedArrays", "NearestNeighbors", "Optim", "Optimisers", "OptimizationNLopt", "OrderedCollections", "PDMats", "PRIMA", "PackageCompiler", "Plots", "PosteriorStats", "PrecompileTools", "Random", "Reexport", "Requires", "ReverseDiff", "Revise", "SparseArrays", "SpecialFunctions", "StaticArrays", "Statistics", "StatsBase", "StatsModels", "StatsPlots", "Turing", "Wavelets", "WaveletsExt", "Zygote"]
 path = "."
 uuid = "a9d6ec74-ebb6-4ecd-a5cd-9826d4a3476e"
 version = "1.0.0"

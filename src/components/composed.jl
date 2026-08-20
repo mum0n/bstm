@@ -99,7 +99,7 @@ function get_precomputes(m::Composed, M::NamedTuple, mod_data::Dict)::NamedTuple
 
         child_spec = (
             key = child_mod_data[:key],
-            structure = MODEL_TO_STRUCTURE_MAP[child_node.module_type],
+            structure = get_component_structure(child_node.module_type),
             var = join(string.(child_mod_data[:variables]), "_"),
             component_obj = child_component_obj,
             params = child_mod_data[:params],
@@ -132,7 +132,7 @@ function get_priors(
         
         n_spatial = state_spec.hyper.n_latent
         n_basis = dynamic_spec.hyper.n_latent
-        coeffs_prior = "$(p_names.innovations) ~ MvNormal(zeros(T, " *
+        coeffs_prior = "$(p_names.ure) ~ MvNormal(zeros(T, " *
                        "$(n_spatial * n_basis)), I)"
         
         return """
@@ -148,7 +148,7 @@ function get_priors(
         return """
         # Priors for Spatiotemporal Interaction: $(spec.key)
         $(p_names.sigma) ~ $(_distribution_to_string(st_sigma_prior))
-        $(p_names.innovations) ~ MvNormal(zeros(T, $(s_N * t_N)), I)
+        $(p_names.ure) ~ MvNormal(zeros(T, $(s_N * t_N)), I)
         """
     elseif m.operator == :composition # Non-stationary variance
         modifier_priors = get_priors(
@@ -206,10 +206,10 @@ function get_updates(
             let
                 $(cholesky_base_code)
                 F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I))
-                coeffs_raw_matrix = reshape($(p_names.innovations), $(n_spatial), $(n_basis))
-                spatial_coeffs = F_spatial.L' \\ coeffs_raw_matrix
-                final_effect = sum($(basis_matrix) .* spatial_coeffs[M.s_idx, :], dims=2)
-                $(eta_target) .+= final_effect
+                coeffs_unscaled_matrix = reshape($(p_names.ure), $(n_spatial), $(n_basis))
+                spatial_coeffs = F_spatial.L' \\ coeffs_unscaled_matrix
+                $(p_names.sre) = sum($(basis_matrix) .* spatial_coeffs[M.s_idx, :], dims=2)
+                $(eta_target) .+= $(p_names.sre)
             end
         """
 
@@ -218,10 +218,10 @@ function get_updates(
             let
                 $(cholesky_base_code)
                 F_spatial = cholesky(Symmetric(Q_spatial + M.noise * I))
-                coeffs_raw_matrix = reshape($(p_names.innovations), $(n_spatial), $(n_basis))
-                spatial_coeffs = F_spatial.L' \\ coeffs_raw_matrix
-                final_effect = sum($(basis_matrix) .* spatial_coeffs[M.s_idx, :], dims=2)
-                $(eta_target) .+= final_effect
+                coeffs_unscaled_matrix = reshape($(p_names.ure), $(n_spatial), $(n_basis))
+                spatial_coeffs = F_spatial.L' \\ coeffs_unscaled_matrix
+                $(p_names.sre) = sum($(basis_matrix) .* spatial_coeffs[M.s_idx, :], dims=2)
+                $(eta_target) .+= $(p_names.sre)
             end
         """
         
@@ -256,14 +256,14 @@ function get_updates(
                 diag_D_s = $(p_names.sigma) ./ sqrt.(diag_Ls .+ M.noise)
                 diag_D_t = 1.0 ./ sqrt.(diag_Lt .+ M.noise)
                 
-                Z_matrix = reshape($(p_names.innovations), M.s_N, M.t_N)
+                Z_matrix = reshape($(p_names.ure), M.s_N, M.t_N)
                 
                 tmp = s_hyper.U' * Z_matrix * t_hyper.U
                 transformed = (diag_D_s .* tmp) .* diag_D_t'
-                st_field = s_hyper.U * transformed * t_hyper.U'
+                $(p_names.sre) = s_hyper.U * transformed * t_hyper.U'
                 
                 st_idx = (M.t_idx .- 1) .* M.s_N .+ M.s_idx
-                $(eta_target) .+= view(st_field, st_idx)
+                $(eta_target) .+= view($(p_names.sre), st_idx)
             end
         """
 
@@ -280,13 +280,13 @@ function get_updates(
                 $(cholesky_base_code)
                 C_s = cholesky(Symmetric(Matrix(Q_s) + M.noise * I))
                 C_t = cholesky(Symmetric(Matrix(Q_t) + M.noise * I))
-                Z_matrix = reshape($(p_names.innovations), M.s_N, M.t_N)
+                Z_matrix = reshape($(p_names.ure), M.s_N, M.t_N)
                 tmp_spatial = C_s.L' \\ Z_matrix
                 st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
                 Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_unscaled))
-                st_field = st_field_unscaled .* $(p_names.sigma)
+                $(p_names.sre) = st_field_unscaled .* $(p_names.sigma)
                 st_idx = (M.t_idx .- 1) .* M.s_N .+ M.s_idx
-                $(eta_target) .+= view(st_field, st_idx)
+                $(eta_target) .+= view($(p_names.sre), st_idx)
             end
         """
 
@@ -301,28 +301,28 @@ function get_updates(
         modifier_updates = get_updates(
             modifier_spec.component_obj, modifier_spec, arch, outcome_idx, M
         )
-        modifier_latent_var = generate_full_variable_names(
+        modifier_sre_var = generate_full_variable_names(
             modifier_spec, arch, outcome_idx
-        ).latent
+        ).sre
         modifier_code = replace(modifier_updates, Regex("$(eta_target) .\\+= .*") => "")
 
         base_updates = get_updates(
             base_spec.component_obj, base_spec, arch, outcome_idx, M
         )
-        base_latent_var = generate_full_variable_names(
+        base_sre_var = generate_full_variable_names(
             base_spec, arch, outcome_idx
-        ).latent
+        ).sre
         base_code = replace(base_updates, Regex("$(eta_target) .\\+= .*") => "")
 
         base_structure = base_spec.structure
         indexed_base_effect = if base_structure == :spatial
-            "view($(base_latent_var), M.s_idx)"
+            "view($(base_sre_var), M.s_idx)"
         elseif base_structure == :temporal
-            "view($(base_latent_var), M.t_idx)"
+            "view($(base_sre_var), M.t_idx)"
         elseif base_structure == :seasonal
-            "view($(base_latent_var), M.u_idx)"
+            "view($(base_sre_var), M.u_idx)"
         else # :smooth or :any
-            "$(base_latent_var)"
+            "$(base_sre_var)"
         end
 
         return """
@@ -335,8 +335,8 @@ function get_updates(
             $(base_code)
 
             # Modulate the base field and add to eta
-            final_effect = $(indexed_base_effect) .* exp.($(modifier_latent_var))
-            $(eta_target) .+= final_effect
+            $(p_names.sre) = $(indexed_base_effect) .* exp.($(modifier_sre_var))
+            $(eta_target) .+= $(p_names.sre)
         end
         """
     end
@@ -396,13 +396,13 @@ function get_effects(
 
         for k in 1:outcomes_N
             p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-            innov_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
-            if isempty(innov_name)
-                @warn "Innovations for Composed component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "Innovations (ure) for Composed component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            innov_samples = get_params_matrix(chain, innov_name, n_spatial * n_basis) # (n_samples, n_spatial * n_basis)
+            ure_samples = get_params_matrix(chain, ure_name, n_spatial * n_basis) # (n_samples, n_spatial * n_basis)
             
             state_p_names = generate_full_variable_names(state_spec, M.model_arch, k)
             state_model_type = Symbol(lowercase(string(typeof(state_spec.component_obj))))
@@ -417,8 +417,8 @@ function get_effects(
                 Q_spatial = recompose_precision(state_model_type, Q_spatial_template, 1.0; extra_param=rho_val)
                 F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I))
                 
-                coeffs_raw_matrix = reshape(innov_samples[i, :], n_spatial, n_basis)
-                spatial_coeffs = F_spatial.L' \ coeffs_raw_matrix
+                coeffs_unscaled_matrix = reshape(ure_samples[i, :], n_spatial, n_basis)
+                spatial_coeffs = F_spatial.L' \ coeffs_unscaled_matrix
                 
                 effect_k_matrix[:, i] = sum(B_dynamic_full .* spatial_coeffs[s_idx_full, :], dims=2)
             end
@@ -432,6 +432,10 @@ function get_effects(
         t_spec = child_specs[2] # Temporal component spec
         s_N = s_spec.hyper.n_latent # Number of spatial units
         t_N = t_spec.hyper.n_latent # Number of temporal units
+        s_model_type = Symbol(lowercase(string(typeof(s_spec.component_obj))))
+        t_model_type = Symbol(lowercase(string(typeof(t_spec.component_obj))))
+        Q_s_template = s_spec.hyper.Q_template
+        Q_t_template = t_spec.hyper.Q_template
         
         s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # Combine spatial indices
             vcat(M.s_idx, PS.data.s_idx) 
@@ -452,12 +456,12 @@ function get_effects(
             t_v = generate_full_variable_names(t_spec, M.model_arch, k)
 
             sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
-            innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
+            ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
             
             s_rho_name = hasproperty(s_spec.component_obj, :rho) ? _find_parameter(p_names, string(s_v.rho), k, is_multivariate_model) : ""
             t_rho_name = hasproperty(t_spec.component_obj, :rho) ? _find_parameter(p_names, string(t_v.rho), k, is_multivariate_model) : ""
 
-            if isempty(sigma_name) || isempty(innovations_name)
+            if isempty(sigma_name) || isempty(ure_name)
                 @warn "Parameters for Kronecker product component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
@@ -465,7 +469,7 @@ function get_effects(
 
             # Extract posterior samples (CPU)
             sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-            innovations_samples = get_params_matrix(chain, innovations_name, s_N * t_N) # (n_samples, s_N * t_N)
+            ure_samples = get_params_matrix(chain, ure_name, s_N * t_N) # (n_samples, s_N * t_N)
             
             s_rho_samples = !isempty(s_rho_name) ? get_params_vector(chain, s_rho_name, 1) : nothing # (n_samples, 1)
             t_rho_samples = !isempty(t_rho_name) ? get_params_vector(chain, t_rho_name, 1) : nothing # (n_samples, 1)
@@ -476,19 +480,19 @@ function get_effects(
             # --- Sample-wise Reconstruction ---
             for i in 1:n_samples # Iterate over each posterior sample
                 sigma_i = sigma_samples[i, 1] # Scalar sigma for current sample
-                innovations_i = innovations_samples[i, :] # Innovations for current sample
-                s_rho_val = isnothing(s_rho_samples_cpu) ? nothing : s_rho_samples_cpu[i]
-                t_rho_val = isnothing(t_rho_samples_cpu) ? nothing : t_rho_samples_cpu[i]
+                ure_i = ure_samples[i, :] # Innovations for current sample
+                s_rho_val = isnothing(s_rho_samples) ? nothing : s_rho_samples[i, 1]
+                t_rho_val = isnothing(t_rho_samples) ? nothing : t_rho_samples[i, 1]
                 
                 # Recompose precision matrices on the CPU
-                Q_s = recompose_precision(s_model_type, Q_s_template_cpu, 1.0; extra_param=s_rho_val)
-                Q_t = recompose_precision(t_model_type, Q_t_template_cpu, 1.0; extra_param=t_rho_val)
+                Q_s = recompose_precision(s_model_type, Q_s_template, 1.0; extra_param=s_rho_val)
+                Q_t = recompose_precision(t_model_type, Q_t_template, 1.0; extra_param=t_rho_val)
                 
                 # Perform Cholesky and back-solve
                 C_s = cholesky(Symmetric(Matrix(Q_s) + noise * I))
                 C_t = cholesky(Symmetric(Matrix(Q_t) + noise * I))
                 
-                Z_matrix = reshape(innovations_i, s_N, t_N) # Reshape innovations to (s_N, t_N) grid
+                Z_matrix = reshape(ure_i, s_N, t_N) # Reshape innovations to (s_N, t_N) grid
                 tmp_spatial = C_s.L' \ Z_matrix # Back-solve for spatial component
                 st_field_unscaled = transpose(C_t.L' \ transpose(tmp_spatial)) # Back-solve for temporal component
                 

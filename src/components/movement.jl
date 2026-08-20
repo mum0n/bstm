@@ -244,7 +244,7 @@ function get_priors(
         push!(priors, "$(p_names.beta_het) ~ $(_distribution_to_string(m.beta_het))")
     end
     
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
@@ -300,7 +300,7 @@ function get_updates(
         $(diffusion_field_code)
         T_num_dyn = eltype(diffusion_field)
         dyn_field = zeros(T_num_dyn, $(hyper.s_N), $(hyper.t_N))
-        innov_matrix = reshape($(p_names.innovations), $(hyper.s_N), $(hyper.t_N))
+        innov_matrix = reshape($(p_names.ure), $(hyper.s_N), $(hyper.t_N))
         L_op = spec_registry[:$(key)].hyper.L_template
         A_op = spec_registry[:$(key)].hyper.A_template
     """
@@ -377,8 +377,8 @@ function get_updates(
         
         # Vectorized update to the linear predictor using linear indexing
         st_idx = (M.t_idx .- 1) .* spec.hyper.s_N .+ M.s_idx
-        effect = vec(dyn_field)[st_idx]
-        $(eta_target) .+= effect
+        $(p_names.sre) = vec(dyn_field)[st_idx]
+        $(eta_target) .+= $(p_names.sre)
     """
 
     return """
@@ -402,11 +402,15 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     
-    p_names = string.(names(DataFrame(chain)))
+    p_names = string.(keys(chain))
     
     key = spec.key
     hyper = spec.hyper
@@ -446,11 +450,11 @@ function get_effects(
         velocity_name = _find_parameter(p_names, string(p_names_k.velocity), k, is_multivariate_model)
         diffusion_name = _find_parameter(p_names, string(p_names_k.diffusion), k, is_multivariate_model)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
         r_name = hasproperty(p_names_k, :r) ? _find_parameter(p_names, string(p_names_k.r), k, is_multivariate_model) : ""
         K_name = hasproperty(p_names_k, :K) ? _find_parameter(p_names, string(p_names_k.K), k, is_multivariate_model) : ""
 
-        if isempty(velocity_name) || isempty(diffusion_name) || isempty(sigma_name) || isempty(innovations_name)
+        if isempty(velocity_name) || isempty(diffusion_name) || isempty(sigma_name) || isempty(ure_name)
             @warn "Parameters for Movement component $(key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -460,7 +464,7 @@ function get_effects(
         velocity_samples = get_params_vector(chain, velocity_name, 1)[:, 1]
         diffusion_samples = get_params_vector(chain, diffusion_name, 1)[:, 1]
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, s_N * t_N)'
+        ure_samples = get_params_vector(chain, ure_name, s_N * t_N)'
         
         r_samples = !isempty(r_name) ? get_params_vector(chain, r_name, 1)[:, 1] : zeros(n_samples)
         K_samples = !isempty(K_name) ? get_params_vector(chain, K_name, 1)[:, 1] : fill(Inf, n_samples)
@@ -487,7 +491,7 @@ function get_effects(
             end
 
             # Prepare innovations matrix, extending for prediction if needed
-            innov_matrix_train = reshape(innovations_samples[:, i], s_N, t_N)
+            innov_matrix_train = reshape(ure_samples[:, i], s_N, t_N)
             innov_matrix_full = if t_N_full > t_N
                 hcat(innov_matrix_train, randn(Float32, s_N, t_N_full - t_N))
             else

@@ -91,7 +91,7 @@ function get_priors(
     inner_spec_key = Symbol("$(spec.key)_inner")
     inner_spec = (
         key = inner_spec_key,
-        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.model)],
+        structure = get_component_structure(m.model),
         var = spec.var,
         component_obj = m.model,
         params = spec.params,
@@ -120,7 +120,7 @@ function get_updates(
     inner_spec_key = Symbol("$(spec.key)_inner")
     inner_spec = (
         key = inner_spec_key,
-        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.model)],
+        structure = get_component_structure(m.model),
         var = spec.var,
         component_obj = m.model,
         params = spec.params,
@@ -130,7 +130,7 @@ function get_updates(
     # Generate the code for the inner model.
     inner_updates_code = get_updates(m.model, inner_spec, arch, outcome_idx, M)
     inner_p_names = generate_full_variable_names(inner_spec, arch, outcome_idx)
-    inner_latent_var = inner_p_names.latent
+    inner_latent_var = inner_p_names.sre
     
     # Fix the spec_registry path in the generated code.
     incorrect_access = "spec_registry[:$(inner_spec_key)].hyper"
@@ -169,7 +169,7 @@ function get_effects(
     inner_spec_key = Symbol("$(spec.key)_inner")
     inner_spec = (
         key = inner_spec_key,
-        structure = MODEL_TO_STRUCTURE_MAP[typeof(m.model)],
+        structure = get_component_structure(m.model),
         var = spec.var,
         component_obj = m.model,
         params = spec.params,

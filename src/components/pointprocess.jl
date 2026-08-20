@@ -144,13 +144,13 @@ function get_priors(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx
         n_latent = spec.hyper.inner_hyper.n_latent
         return """
         $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-        $(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.innovations))
+        $(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.ure))
         """
     elseif m.method == :lgmcp
         n_latent = spec.hyper.inner_hyper.n_latent
         return """
         $(p_names.shape) ~ $(_distribution_to_string(m.shape))
-        $(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.innovations))
+        $(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.ure))
         """
     elseif m.method == :sncp
         n_parents_str = if m.n_parents isa Int
@@ -187,7 +187,7 @@ function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_id
             hyper = spec_registry[:$(key)].hyper
             Q_lgcp = hyper.inner_hyper.Q_template
             F_lgcp = cholesky(Symmetric(Matrix(Q_lgcp) + M.noise * I))
-            spatial_component = $(p_names.sigma) .* (F_lgcp.L' \\ $(p_names.innovations))
+            spatial_component = $(p_names.sigma) .* (F_lgcp.L' \\ $(p_names.ure))
             
             log_intensity_surface = $(eta_target) .+ spatial_component[M.s_idx]
             
@@ -207,7 +207,7 @@ function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_id
             hyper = spec_registry[:$(key)].hyper
             Q_lgmcp = hyper.inner_hyper.Q_template
             F_lgmcp = cholesky(Symmetric(Matrix(Q_lgmcp) + M.noise * I))
-            spatial_component = exp.(F_lgmcp.L' \\ $(p_names.innovations))
+            spatial_component = exp.(F_lgmcp.L' \\ $(p_names.ure))
             
             mean_intensity_surface = exp.($(eta_target)) .* spatial_component[M.s_idx]
             
@@ -292,9 +292,9 @@ function get_effects(
         
         if m.method == :lgcp
             sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
 
-            if isempty(sigma_name) || isempty(innovations_name)
+            if isempty(sigma_name) || isempty(ure_name)
                 @warn "Parameters for LGCP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
@@ -302,27 +302,27 @@ function get_effects(
 
             # Extract samples (CPU)
             sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-            innovations_samples = get_params_matrix(chain, innovations_name, hyper.inner_hyper.n_latent) # (n_samples, n_latent)
+            ure_samples = get_params_matrix(chain, ure_name, hyper.inner_hyper.n_latent) # (n_samples, n_latent)
             
             F_lgcp = hyper.inner_hyper.cholesky_factor # Cholesky factor for LGCP
             
-            spatial_component_raw = F_lgcp.L' \ innovations_samples' # Raw spatial component
-            effect_k_latent = sigma_samples' .* spatial_component_raw # Scaled spatial component
+            spatial_component_unscaled = F_lgcp.L' \ ure_samples' # Unscaled spatial component
+            effect_k_latent = sigma_samples' .* spatial_component_unscaled # Scaled spatial component
             
             indexed_effects = effect_k_latent[s_idx_full, :]
             push!(structured_effects, indexed_effects)
 
         elseif m.method == :lgmcp
-            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
-            if isempty(innovations_name)
-                @warn "Innovations for LGMCP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "ure for LGMCP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            innovations_samples = get_params_matrix(chain, innovations_name, hyper.inner_hyper.n_latent) # Innovations for LGMCP
+            ure_samples = get_params_matrix(chain, ure_name, hyper.inner_hyper.n_latent) # Innovations for LGMCP
             F_lgmcp = hyper.inner_hyper.cholesky_factor # Cholesky factor for LGMCP
 
-            effect_k_latent = exp.(F_lgmcp.L' \ innovations_samples') # Exponentiate to get intensity
+            effect_k_latent = exp.(F_lgmcp.L' \ ure_samples') # Exponentiate to get intensity
 
             indexed_effects = effect_k_latent[s_idx_full, :]
             push!(structured_effects, indexed_effects)

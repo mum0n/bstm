@@ -262,7 +262,8 @@ Infers the structural type of a `random()` component (e.g., :spatial, :temporal)
 based on the model name and the variables provided.
 """
 function _infer_structure_from_args(variables::Vector, params::Dict)::Symbol
-    model_name = get(params, :model, :iid) 
+    model_name_raw = get(params, :model, :iid)
+    model_name = model_name_raw isa Symbol ? model_name_raw : Symbol(model_name_raw)
 
     # Use the central registry to find the structure for unambiguous models
     if haskey(MODEL_TO_STRUCTURE_MAP, model_name)
@@ -668,10 +669,11 @@ function resolve_hyperpriors(model_name::String, global_priors::Dict, local_para
 
     # Comprehensive list of all possible hyperpriors across all components.
     possible_priors = [
-        :sigma, :rho, :rho1, :rho2, :unconstrained_rho, :kappa, :lengthscale, 
+        :sigma, :rho, :rho1, :rho2, :rho_unconstrained, :rho1_unconstrained, :rho2_unconstrained,
+        :sigma1_unconstrained, :sigma2_unconstrained, :threshold_unconstrained, :unconstrained_rho, :kappa, :lengthscale, 
         :range, :period, :amplitude, :phase, :velocity, :diffusion, :pca_sd, 
         :pdef_sd, :L_corr, :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, 
-        :gamma, :delta, :curvature
+        :gamma, :delta, :curvature, :rho_sigma, :rho_rho, :sigma0, :shape, :nu
     ]
 
     resolved = Dict{Symbol, Any}()
@@ -1436,29 +1438,56 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
     # --- Hyperparameters ---
     # These parameters may be shared across outcomes in a multivariate model.
     hyperparameters = [
-        :sigma, :rho, :rho1, :rho2, :unconstrained_rho, :kappa, :ls, :range, :period,
+        :sigma, :rho, :rho1, :rho2,
+        :rho_unconstrained, :rho1_unconstrained, :rho2_unconstrained,
+        :sigma1_unconstrained, :sigma2_unconstrained, :threshold_unconstrained,
+        :unconstrained_rho, :unconstrained_rho1, :unconstrained_rho2,
+        :unconstrained_sigma1, :unconstrained_sigma2,
+        :kappa, :ls, :range, :period,
         :amplitude, :phase, :velocity, :diffusion, :pca_sd, :pdef_sd, :L_corr,
-        :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, :gamma, :delta, :curvature
+        :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, :gamma, :delta, :curvature,
+        :nu, :sigma0, :shape
     ]
     for p in hyperparameters
         names[p] = Symbol("$(p)_$(full_key)$(hyperparam_suffix)")
     end
 
-    # --- Latent Fields & Innovations ---
+    # --- Latent Fields & Innovations / Random Errors (ure / sre) ---
     # These are always unique per outcome in a multivariate model.
     latent_fields = [
-        :innovations, :latent, :struct, :iid, :beta_cos, :beta_sin, :rho_field,
-        :W, :b, :v_raw, :factors_flat, :thresh_raw, :W1, :b1, :W2, :amplitude_raw,
-        :innov_predator, :cluster_innovations, :inducing_innovations, :diag_innovations
+        :ure, :sre, :ure_diag, :ure_pic, :ure_inducing, :ure_rho, :ure_cluster, :ure_predator,
+        :innovations, :latent, :struct, :iid,
+        :beta_cos, :beta_sin, :rho_field,
+        :W, :b, :v_unscaled, :v_raw, :factors_flat, :thresh_unscaled, :thresh_raw,
+        :W1, :b1, :W2, :amplitude_unscaled, :amplitude_raw,
+        :innov_predator, :cluster_innovations, :inducing_innovations, :diag_innovations,
+        :parent_locs_x, :parent_locs_y
     ]
     for p in latent_fields
         names[p] = Symbol("$(p)_$(full_key)$(latent_field_suffix)")
     end
 
-    # Deprecated names, kept for temporary backward compatibility.
-    # They point to the new 'innovations' name to ensure old code does not break.
-    names[:raw] = names[:innovations]
-    names[:innov] = names[:innovations]
+    # Aliases for consistent role lookup and backward compatibility:
+    names[:innovations] = names[:ure]
+    names[:innov] = names[:ure]
+    names[:raw] = names[:ure]
+    names[:iid] = names[:ure]
+    names[:latent] = names[:sre]
+    names[:struct] = names[:sre]
+    names[:unconstrained_rho] = names[:rho_unconstrained]
+    names[:unconstrained_rho1] = names[:rho1_unconstrained]
+    names[:unconstrained_rho2] = names[:rho2_unconstrained]
+    names[:unconstrained_sigma1] = names[:sigma1_unconstrained]
+    names[:unconstrained_sigma2] = names[:sigma2_unconstrained]
+    names[:v_raw] = names[:v_unscaled]
+    names[:thresh_raw] = names[:thresh_unscaled]
+    names[:amplitude_raw] = names[:amplitude_unscaled]
+    names[:inducing_innovations] = names[:ure_inducing]
+    names[:diag_innovations] = names[:ure_diag]
+    names[:pic_innovations] = names[:ure_pic]
+    names[:rho_innovations] = names[:ure_rho]
+    names[:cluster_innovations] = names[:ure_cluster]
+    names[:innov_predator] = names[:ure_predator]
 
     return NamedTuple(names)
 end
@@ -1496,25 +1525,25 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     s_key = string(s_spec.key)
     t_key = string(t_spec.key)
     
-    s_chol_access = get(s_spec, :is_static, false) ? "spec_registry[:$(s_key)].cholesky_factor" : "cholesky(Symmetric(spec_registry[:$(s_key)].hyper.Q_template + noise * I))"
-    t_chol_access = get(t_spec, :is_static, false) ? "spec_registry[:$(t_key)].cholesky_factor" : "cholesky(Symmetric(spec_registry[:$(t_key)].hyper.Q_template + noise * I))"
+    s_chol_access = get(s_spec, :is_static, false) ? "spec_registry[:$(s_key)].cholesky_factor" : (hasproperty(s_spec.hyper, :cholesky_factor) ? "spec_registry[:$(s_key)].hyper.cholesky_factor" : "cholesky(Symmetric(Matrix(spec_registry[:$(s_key)].hyper.Q_template) + noise * I))")
+    t_chol_access = get(t_spec, :is_static, false) ? "spec_registry[:$(t_key)].cholesky_factor" : (hasproperty(t_spec.hyper, :cholesky_factor) ? "spec_registry[:$(t_key)].hyper.cholesky_factor" : "cholesky(Symmetric(Matrix(spec_registry[:$(t_key)].hyper.Q_template) + noise * I))")
 
     K = get(M, :outcomes_N, 1)
 
     if is_multivariate
         interaction_code = """
     # --- Spatiotemporal Interaction Priors ---
-    local st_sigma_prior_dist_str = haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)"
-    st_interaction_sigma ~ NamedDist(filldist($(st_sigma_prior_dist_str), $K), :st_interaction_sigma)
+    local st_sigma_prior_dist_str = haskey(M, :sigma_st_interaction_prior) ? _distribution_to_string(M.sigma_st_interaction_prior) : (haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)")
+    sigma_st_interaction ~ NamedDist(filldist($(st_sigma_prior_dist_str), $K), :sigma_st_interaction)
     
     # --- Spatiotemporal Interaction Innovations ---
-    st_interaction_raw ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N * $K), 0), I), :st_interaction_raw)
+    ure_st_interaction ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N * $K), 0), I), :ure_st_interaction)
 
     let
         C_s = $s_chol_access
         C_t = $t_chol_access
         
-        Z_tensor = reshape(st_interaction_raw, M.s_N, M.t_N, $K)
+        Z_tensor = reshape(ure_st_interaction, M.s_N, M.t_N, $K)
         
         for k in 1:$K
             Z_k = view(Z_tensor, :, :, k)
@@ -1524,7 +1553,7 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
             
             Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_k_unscaled))
             
-            st_field_k = st_field_k_unscaled .* st_interaction_sigma[k]
+            st_field_k = st_field_k_unscaled .* sigma_st_interaction[k]
 
             # Vectorized update to the linear predictor
             effect_k = vec(st_field_k)[M.st_idx]
@@ -1535,27 +1564,27 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     else
         interaction_code = """
     # --- Spatiotemporal Interaction Priors ---
-    local st_sigma_prior_dist_str = haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)"
-    st_interaction_sigma ~ NamedDist($(st_sigma_prior_dist_str), :st_interaction_sigma)
+    local st_sigma_prior_dist_str = haskey(M, :sigma_st_interaction_prior) ? _distribution_to_string(M.sigma_st_interaction_prior) : (haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)")
+    sigma_st_interaction ~ NamedDist($(st_sigma_prior_dist_str), :sigma_st_interaction)
 
-    st_interaction_raw ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N), 0), I), :st_interaction_raw)
+    ure_st_interaction ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N), 0), I), :ure_st_interaction)
 
     let
         C_s = $s_chol_access
         C_t = $t_chol_access
         
-        Z_matrix = reshape(st_interaction_raw, M.s_N, M.t_N)
+        Z_matrix = reshape(ure_st_interaction, M.s_N, M.t_N)
         
         tmp_spatial = C_s.U \\ Z_matrix
         st_field_unscaled = (transpose(C_t.U \\ transpose(tmp_spatial)))
         
         Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_unscaled))
         
-        st_field = st_field_unscaled .* st_interaction_sigma
+        st_field = st_field_unscaled .* sigma_st_interaction
 
         # Vectorized update to the linear predictor
         effect = vec(st_field)[M.st_idx]
-        $(eta_name) .+= effect
+        $(eta_name) = $(eta_name) .+ effect
     end
     """
     end
@@ -1582,12 +1611,12 @@ function _generate_householder_reflection_block(M::NamedTuple, is_multivariate::
      
     priors_str = """
     # Householder reflection for spectral orientation
-    v_raw_reflection ~ NamedDist(MvNormal(fill!(Array{T}(undef, $(K)), 0), I), :v_raw_reflection)
+    v_unscaled_reflection ~ NamedDist(MvNormal(fill!(Array{T}(undef, $(K)), 0), I), :v_unscaled_reflection)
     """
 
     update_str = """
     let
-        v_reflection = v_raw_reflection / (norm(v_raw_reflection) + 1e-9)
+        v_reflection = v_unscaled_reflection / (norm(v_unscaled_reflection) + 1e-9)
         H_reflection = I - 2.0 * v_reflection * v_reflection'
         $(eta_name) = $(eta_name) * H_reflection
     end
@@ -1654,7 +1683,7 @@ function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main
             
             # Fixed Effects
             if get(sub_M, :Xfixed_N, 0) > 0
-                beta_name = is_sub_multivariate ? "Xfixed_beta_prop_flat_$(prefix)" : "Xfixed_beta_prop_$(prefix)"
+                beta_name = is_sub_multivariate ? "beta_flat_$(prefix)" : "beta_$(prefix)"
                 n_params = is_sub_multivariate ? sub_M.Xfixed_N * sub_M.outcomes_N : sub_M.Xfixed_N
                 prior_str = _distribution_to_string(sub_M.Xfixed_priors_vec[1])
                 push!(sub_priors_acc, "$(beta_name) ~ DynamicPPL.NamedDist(filldist($(prior_str), $(n_params)), :$(beta_name))")
@@ -2862,6 +2891,15 @@ function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwa
             println("Prior sample check successful. Sample values:")
             display(prior_sample)
         end
+
+        # Calibrate and store centralized ParamRegistry in spec_registry
+        current_reg = get(registry, :parameters, build_param_registry(new_config))
+        if !isnothing(prior_sample)
+            registry[:parameters] = calibrate_param_registry(current_reg, prior_sample)
+        else
+            registry[:parameters] = current_reg
+        end
+
     catch e 
         # Provide detailed, user-friendly error diagnostics if the check fails.
         _bstm_error_handler(e, model_instance)
@@ -2952,9 +2990,9 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     eta_name = is_multivariate ? "eta_latent" : "eta"
  
     eta_init = if get(M, :add_intercept, false)
-        is_multivariate ? "intercept' .+ fill!(Array{T}(undef, N, K), 0)" : "intercept .+ fill!(Array{T}(undef, N), 0)"
+        is_multivariate ? "intercept' .+ zeros(T, N, K)" : "intercept .+ zeros(T, N)"
     else
-        is_multivariate ? "fill!(Array{T}(undef, N, K), 0)" : "fill!(Array{T}(undef, N), 0)"
+        is_multivariate ? "zeros(T, N, K)" : "zeros(T, N)"
     end
 
     outcomes_N = get(M, :outcomes_N, 1)
@@ -2967,7 +3005,10 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     main_spatial_spec = nothing
     main_temporal_spec = nothing
     
-    has_custom_likelihood_from_component = any(spec -> spec.component_obj isa PointProcess, M.components)
+    has_custom_likelihood_from_component = any(
+        spec -> (spec.component_obj isa PointProcess || (hasproperty(spec.component_obj, :method) && spec.component_obj.method == :marginalized)),
+        M.components
+    )
     has_custom_likelihood_from_family = any(spec -> string(get(spec, :family, "")) == "ordinal", M.likelihood_specs)
     has_custom_likelihood = has_custom_likelihood_from_component || has_custom_likelihood_from_family
 
@@ -3044,7 +3085,7 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
         noise = M.noise
         N = M.y_N
         K = $(outcomes_N)
-        T = Float64
+        T = _model_float_type(__varinfo__)
 
         # --- Priors & Hyperparameters ---
     $(_indent_block(priors_code))
@@ -3058,6 +3099,7 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     $(_indent_block(likelihood_code))
     end
     """
+    spec_registry[:parameters] = build_param_registry(M)
  
     try
         return model_string, Meta.parse(model_string), spec_registry
@@ -3114,7 +3156,7 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
 
     # Handle standard components.
     model_name = if haskey(m_params, :model)
-        m_params[:model]
+        m_params[:model] isa Symbol ? m_params[:model] : Symbol(m_params[:model])
     else
         # Infer default model based on the structure if no model is specified.
         if m_type == :spatial
@@ -3346,7 +3388,7 @@ function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::Abstract
         dist_sq = _sqeuclidean_broadcast_cross(coords1_T, coords2_T) ./ ls_T^2
     end
     
-    dist_sq[diagind(dist_sq)] .= max.(0, diag(dist_sq))
+    dist_sq .= max.(zero(T), dist_sq)
 
     if kernel_type == :gaussian || kernel_type == :se || kernel_type == :rbf
         return param_val^2 .* exp.(-one(T)/2 .* dist_sq)
@@ -3876,7 +3918,7 @@ function model_pseudocode(m::DynamicPPL.Model)
         push!(lines, "    r_nb ~ $(_distribution_to_string(Exponential(1.0)))")
     end
     if get(config, :use_zi, false)
-        push!(lines, "    phi_zi ~ $(_distribution_to_string(Beta(1, 1)))")
+        push!(lines, "    lik_phi_zi ~ $(_distribution_to_string(Beta(1, 1)))")
     end
     if get(config, :user_provided_hurdle, false)
         push!(lines, "    lik_phi_hurdle ~ $(_distribution_to_string(Beta(1,1)))")
@@ -3905,10 +3947,10 @@ function model_pseudocode(m::DynamicPPL.Model)
         spec = config.likelihood_specs[ordinal_spec_idx]
         K_ordinal = get(spec, :K, 0)
         if K_ordinal > 2
-            push!(lines, "    ordinal_alpha_raw_1 ~ $(_distribution_to_string(Normal(0, 5)))")
+            push!(lines, "    ordinal_alpha_unscaled_1 ~ $(_distribution_to_string(Normal(0, 5)))")
             push!(lines, "    ordinal_alpha_diffs ~ $(_distribution_to_string(Fill(Exponential(1.0), K_ordinal - 2)))")
         elseif K_ordinal == 2
-            push!(lines, "    ordinal_alpha_raw_1 ~ $(_distribution_to_string(Normal(0, 5)))")
+            push!(lines, "    ordinal_alpha_unscaled_1 ~ $(_distribution_to_string(Normal(0, 5)))")
         end
         if get(spec, :latent_dist, :logistic) == :student_t
             push!(lines, "    ordinal_df ~ $(_distribution_to_string(Exponential(1.0)))")
@@ -3941,10 +3983,10 @@ function model_pseudocode(m::DynamicPPL.Model)
             if is_multivariate
                 # Simplified for pseudo-code: assume all outcomes have the same prior structure
                 prior_str = _distribution_to_string(priors_prop[1]) # Take first as representative
-                push!(lines, "    Xfixed_beta_prop_flat ~ filldist($(prior_str), $(length(prop_indices) * outcomes_N))")
+                push!(lines, "    beta_flat ~ filldist($(prior_str), $(length(prop_indices) * outcomes_N))")
             else
                 prior_str_list = [_distribution_to_string(p) for p in priors_prop]
-                push!(lines, "    Xfixed_beta_prop ~ Product([$(join(prior_str_list, ", "))])")
+                push!(lines, "    beta ~ Product([$(join(prior_str_list, ", "))])")
             end
         end
 
@@ -3968,10 +4010,11 @@ function model_pseudocode(m::DynamicPPL.Model)
             # This list should be comprehensive for all possible hyperparameters
             # that might have priors in any component.
             all_possible_hyperpriors = [
-                :sigma, :rho, :rho1, :rho2, :unconstrained_rho, :kappa, :ls, :range, :period,
+                :sigma, :rho, :rho1, :rho2, :rho_unconstrained, :rho1_unconstrained, :rho2_unconstrained,
+                :sigma1_unconstrained, :sigma2_unconstrained, :threshold_unconstrained, :unconstrained_rho, :kappa, :ls, :range, :period,
                 :amplitude, :phase, :velocity, :diffusion, :pca_sd, :pdef_sd,
                 :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, :gamma, :delta, :curvature,
-                :lengthscale # Added for consistency with GP/RFF
+                :lengthscale, :rho_sigma, :rho_rho, :sigma0, :shape, :nu
             ]
 
             for field_sym in all_possible_hyperpriors
@@ -3990,10 +4033,10 @@ function model_pseudocode(m::DynamicPPL.Model)
                     end
                 end
             end
-            # Add innovations prior for components that have them
+            # Add innovations/ure prior for components that have them
             p_names = generate_full_variable_names(spec, config.model_arch, 1)
             if hasproperty(spec.hyper, :n_latent) && spec.hyper.n_latent > 0
-                push!(lines, "    $(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)")
+                push!(lines, "    $(p_names.ure) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)")
             end
         end
     end
@@ -4017,9 +4060,9 @@ function model_pseudocode(m::DynamicPPL.Model)
     # Add fixed effects
     if get(config, :Xfixed_N, 0) > 0
         if is_multivariate
-            push!(lines, "    $(eta_var_name) .+= M.Xfixed * reshape(Xfixed_beta_prop_flat, M.Xfixed_N, M.outcomes_N)")
+            push!(lines, "    $(eta_var_name) .+= M.Xfixed * reshape(beta_flat, M.Xfixed_N, M.outcomes_N)")
         else
-            push!(lines, "    $(eta_var_name) .+= M.Xfixed * Xfixed_beta_prop")
+            push!(lines, "    $(eta_var_name) .+= M.Xfixed * beta")
         end
     end
 
@@ -4027,13 +4070,13 @@ function model_pseudocode(m::DynamicPPL.Model)
     if haskey(config, :components) && !isempty(config.components)
         for spec in config.components
             p_names = generate_full_variable_names(spec, config.model_arch, 1) # Use 1 for pseudo-code
-            if hasproperty(p_names, :latent)
+            if hasproperty(p_names, :sre)
                 # This is a simplification; actual update logic is more complex and depends on structure.
                 # For pseudo-code, we show a generic addition.
                 if is_multivariate
-                    push!(lines, "    $(eta_var_name) .+= $(p_names.latent)[M.s_idx, :]") # Example for spatial/temporal
+                    push!(lines, "    $(eta_var_name) .+= $(p_names.sre)[M.s_idx, :]") # Example for spatial/temporal
                 else
-                    push!(lines, "    $(eta_var_name) .+= $(p_names.latent)[M.s_idx]")
+                    push!(lines, "    $(eta_var_name) .+= $(p_names.sre)[M.s_idx]")
                 end
             end
         end
@@ -4852,7 +4895,7 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
         dist_sq = _sqeuclidean_broadcast(coords_T) ./ ls_T^2
     end
     
-    dist_sq[diagind(dist_sq)] .= max.(0, diag(dist_sq))
+    dist_sq .= max.(zero(T), dist_sq)
 
     if kernel_type == :gaussian || kernel_type == :se || kernel_type == :rbf
         return param_val^2 .* exp.(-one(T)/2 .* dist_sq) .+ (noise * I)
@@ -5032,29 +5075,29 @@ v1.1.0 (2026-08-13)
 function _distribution_to_string(d::Distribution)
     dist_name = string(typeof(d).name.name)
     if d isa Exponential
-        return "$(dist_name){T}($(rate(d)))"
+        return "$(dist_name)($(rate(d)))"
     elseif d isa Normal
-        return "$(dist_name){T}($(mean(d)), $(std(d)))"
+        return "$(dist_name)($(mean(d)), $(std(d)))"
     elseif d isa LogNormal
-        return "$(dist_name){T}($(meanlog(d)), $(stdlog(d)))"
+        return "$(dist_name)($(meanlog(d)), $(stdlog(d)))"
     elseif d isa Beta
         # Access alpha and beta parameters directly for Beta distribution
-        return "$(dist_name){T}($(d.α), $(d.β))"
+        return "$(dist_name)($(d.α), $(d.β))"
     elseif d isa InverseGamma
-        return "$(dist_name){T}($(Distributions.shape(d)), $(Distributions.scale(d)))"
+        return "$(dist_name)($(Distributions.shape(d)), $(Distributions.scale(d)))"
     elseif d isa Gamma
-        return "$(dist_name){T}($(Distributions.shape(d)), $(Distributions.scale(d)))"
+        return "$(dist_name)($(Distributions.shape(d)), $(Distributions.scale(d)))"
     elseif d isa Uniform
-        return "$(dist_name){T}($(minimum(d)), $(maximum(d)))"
+        return "$(dist_name)($(minimum(d)), $(maximum(d)))"
     elseif d isa TDist
-        return "$(dist_name){T}($(d.df))"
+        return "$(dist_name)($(d.df))"
     elseif d isa Dirac
-        return "$(dist_name){T}($(d.value))"
+        return "$(dist_name)($(d.value))"
     elseif d isa Categorical
         return "$(dist_name)($(d.p))" # Probabilities are fixed, no need for {T}
     elseif d isa LKJCholesky
         # Essential for multivariate models (e.g., mixed effects)
-        return "$(dist_name){T}($(d.d), $(d.eta))"
+        return "$(dist_name)($(d.d), $(d.eta))"
     elseif d isa MvNormal
         # Handle common cases for MvNormal, especially with UniformScaling
         mean_str = string(mean(d))
@@ -5063,11 +5106,11 @@ function _distribution_to_string(d::Distribution)
         else
             string(d.Σ) # Fallback for other matrix types
         end
-        return "$(dist_name)(T.($(mean_str)), $(cov_str))"
+        return "$(dist_name)($(mean_str), $(cov_str))"
     elseif d isa Truncated
         inner_dist_str = _distribution_to_string(d.untruncated)
-        lower_str = isinf(d.lower) ? string(d.lower) : "T($(d.lower))"
-        upper_str = isinf(d.upper) ? string(d.upper) : "T($(d.upper))"
+        lower_str = isinf(d.lower) ? string(d.lower) : "$(d.lower)"
+        upper_str = isinf(d.upper) ? string(d.upper) : "$(d.upper)"
         return "truncated($(inner_dist_str), $(lower_str), $(upper_str))"
     elseif d isa Product
         if hasproperty(d, :v) && d.v isa Fill
@@ -5109,18 +5152,13 @@ process that builds a composite `Gibbs` sampler tailored to the model's structur
 This version has been rewritten to use the modern, public API of `DynamicPPL.jl`,
 resolving `MethodError` and deprecation warnings from previous versions. The key
 corrections are:
-1.  **Correct Parameter Name Matching**: Uses `vn.name` to match parameter symbols
+1.  **Correct Parameter Name Matching**: Uses `_get_varname_symbol(vn)` to match parameter symbols
     (e.g., in `sampler_map`) and `string(vn)` for string-based matching (e.g., for
-    component grouping), replacing the incorrect use of `vn.optic`.
-2.  **Public API for `VarInfo`**: Uses `keys(vi)` and `get(vi, vn)` which are part of
-    the public API, ensuring forward compatibility.
-3.  **Robust Type Inference**: Uses `eltype(get(vi, vn))` for determining parameter
-    types, which correctly handles the underlying data structures of `VarInfo`.
+    component grouping).
+2.  **Public API & ParamRegistry for `VarInfo`**: Uses `keys(vi)`, `ParamRegistry` prior descriptors, and safe `vi[vn]` indexing.
+3.  **Robust Type Inference**: Determines parameter support (discrete vs. bounded vs. continuous) via `ParamRegistry` distribution metadata and value type inspection.
 4.  **Generalization**: The logic for categorizing parameters has been made more
-    general and less reliant on internal implementation details of `DynamicPPL`.
-5.  **Dense Mass Matrix Adaptation**: Introduces an option to use `DenseEuclideanMetric`
-    for `NUTS` samplers assigned to model component groups, where parameters are
-    often highly correlated, leading to more efficient exploration of the posterior.
+    general and robust across all versions of `DynamicPPL`.
 6.  **Refined AD Backend Selection**: The heuristic for selecting the AD backend
     (e.g., `AutoForwardDiff` vs. `AutoEnzyme`) is now applied at the block level,
     allowing for more granular optimization based on the size of each parameter block.
@@ -5178,11 +5216,20 @@ function get_optimal_sampler(
         return sampler_choice
     end
 
-    # --- Initialize VarInfo and determine global AD backend ---
+    # --- Initialize VarInfo, ParamRegistry, and determine global AD backend ---
     # Instantiate and populate the VarInfo object to get variable names and types.
     vi = DynamicPPL.VarInfo(model_obj)
     vns = keys(vi)
     num_params = length(vns)
+
+    # Retrieve centralized ParamRegistry if present
+    param_reg = if hasproperty(model_obj.args, :spec_registry) && haskey(model_obj.args.spec_registry, :parameters)
+        model_obj.args.spec_registry[:parameters]
+    elseif hasproperty(model_obj.args, :M)
+        build_param_registry(model_obj.args.M)
+    else
+        nothing
+    end
 
     # Determine the global AD backend to use based on model size.
     # For large models, Enzyme is often more performant.
@@ -5200,8 +5247,8 @@ function get_optimal_sampler(
     # --- Stage 1: Handle user-provided sampler map (highest precedence) ---
     # Iterate through the user's sampler map and assign samplers to specified parameters.
     for (param_sym, sampler) in sampler_map
-        # Match VarNames by their symbolic name (vn.name).
-        sym_vns = filter(vn -> vn.name == param_sym, vns)
+        # Match VarNames by their symbolic name (_get_varname_symbol(vn)).
+        sym_vns = filter(vn -> _get_varname_symbol(vn) == param_sym, vns)
         if !isempty(sym_vns)
             push!(sampler_assignments, Tuple(sym_vns) => sampler)
             union!(all_processed_vns, sym_vns)
@@ -5210,9 +5257,7 @@ function get_optimal_sampler(
         end
     end
 
-    # --- Stage 2: Group parameters by model component if enabled ---
-    # Identify parameters belonging to the same model component and group them for joint sampling.
-    if group_components && hasproperty(model_obj.args.M, :components)
+    if group_components && hasproperty(model_obj.args, :M) && hasproperty(model_obj.args.M, :components)
         # Get component keys from the model configuration.
         component_keys = string.([spec.key for spec in model_obj.args.M.components])
         # Sort by length in reverse to prioritize longer, more specific keys (e.g., "spatial_key" before "key").
@@ -5223,16 +5268,27 @@ function get_optimal_sampler(
         vns_to_check = setdiff(vns, all_processed_vns)
 
         for vn in vns_to_check
-            # Use `string(vn)` for matching, which produces names like `param[1]`.
-            # The symbol is `vn.name`.
             vn_str = string(vn)
+            vn_sym = _get_varname_symbol(vn)
             found_key = nothing
-            for key in component_keys
-                # Match if the variable name ends with `_key` or `_key_d` (for indexed parameters).
-                # Or if it starts with `key_` (for parameters directly named after the component).
-                if occursin(Regex("_$(key)(_\\d+)?\$"), vn_str) || startswith(vn_str, "$(key)_")
-                    found_key = key
-                    break
+
+            # Fast lookup via ParamRegistry if present
+            if !isnothing(param_reg) && haskey(param_reg.descriptors, vn_sym)
+                desc_key = param_reg.descriptors[vn_sym].component_key
+                if desc_key in [spec.key for spec in model_obj.args.M.components]
+                    found_key = string(desc_key)
+                end
+            end
+
+            # Fallback to pattern matching
+            if isnothing(found_key)
+                for key in component_keys
+                    # Match if the variable name ends with `_key` or `_key_d` (for indexed parameters).
+                    # Or if it starts with `key_` (for parameters directly named after the component).
+                    if occursin(Regex("_$(key)(_\\d+)?\$"), vn_str) || startswith(vn_str, "$(key)_")
+                        found_key = key
+                        break
+                    end
                 end
             end
             
@@ -5257,10 +5313,7 @@ function get_optimal_sampler(
                 adtype_to_use
             end
 
-            # Use DenseEuclideanMetric for component groups if enabled, as parameters
-            # within a component are often highly correlated.
-            metric_type = use_dense_metric_for_components ? DenseEuclideanMetric() : DiagEuclideanMetric()
-            sampler = NUTS(adaptation_steps, target_acceptance; adtype=block_adtype, metric=metric_type)
+            sampler = NUTS(adaptation_steps, target_acceptance; adtype=block_adtype)
             push!(sampler_assignments, Tuple(params_to_process) => sampler)
             union!(all_processed_vns, params_to_process)
         end
@@ -5278,24 +5331,54 @@ function get_optimal_sampler(
 
         for vn in remaining_vns
             try
-                # Check for discrete parameters (e.g., integer types).
-                if eltype(get(vi, vn)) <: Integer
+                vn_sym = _get_varname_symbol(vn)
+                is_discrete = false
+                is_bounded = false
+
+                # Prior inspection from ParamRegistry if available
+                if !isnothing(param_reg) && haskey(param_reg.descriptors, vn_sym)
+                    desc = param_reg.descriptors[vn_sym]
+                    if !isnothing(desc.prior)
+                        if desc.prior isa Distributions.DiscreteDistribution
+                            is_discrete = true
+                        elseif desc.prior isa Distributions.Truncated || desc.prior isa Distributions.Beta || desc.prior isa Distributions.Uniform
+                            is_bounded = true
+                        end
+                    end
+                end
+
+                # Check for discrete parameter via VarInfo values
+                if !is_discrete
+                    val = try
+                        vi[vn]
+                    catch
+                        try
+                            hasproperty(vi, vn_sym) ? getproperty(vi, vn_sym) : nothing
+                        catch
+                            nothing
+                        end
+                    end
+                    if !isnothing(val) && (val isa Integer || (val isa AbstractArray && eltype(val) <: Integer))
+                        is_discrete = true
+                    end
+                end
+
+                if is_discrete
                     push!(param_groups[:discrete], vn)
                     continue
                 end
 
-                # Check for bounded parameters by inspecting their transform strategy.
-                # This is the most reliable way to infer support from DynamicPPL.
-                if haskey(vi.transform_strategy, vn)
+                # Check for bounded parameter via transform_strategy in VarInfo if present
+                if !is_bounded && hasproperty(vi, :transform_strategy) && (vi.transform_strategy isa AbstractDict) && haskey(vi.transform_strategy, vn)
                     transform = vi.transform_strategy[vn]
                     if transform isa Bijectors.Exp || transform isa Bijectors.Logistic
-                        push!(param_groups[:bounded], vn)
-                    else 
-                        # If a transform exists but is not Exp or Logistic, assume unbounded continuous.
-                        push!(param_groups[:other_continuous], vn)
+                        is_bounded = true
                     end
+                end
+
+                if is_bounded
+                    push!(param_groups[:bounded], vn)
                 else
-                    # If no specific transform, assume unbounded continuous.
                     push!(param_groups[:other_continuous], vn)
                 end
             catch e
@@ -5325,9 +5408,8 @@ function get_optimal_sampler(
                 adtype_to_use
             end
 
-            # Default to DiagEuclideanMetric for general continuous blocks.
             push!(sampler_assignments, 
-                params => NUTS(adaptation_steps, target_acceptance; adtype=block_adtype, metric=DiagEuclideanMetric())
+                params => NUTS(adaptation_steps, target_acceptance; adtype=block_adtype)
             )
         end
     end
@@ -5347,62 +5429,94 @@ function get_optimal_sampler(
 end
 
 
-
 function _extract_flexichain_param_samples(chain, param_name::String)
-    param_sym = Symbol(param_name)
-    base_param_sym = Symbol(first(Base.split(param_name, '[')))
- 
-    chain_keys = names(DataFrame(chain))
+    # Determine base name (strip any '[idx]' suffix)
+    base_name = first(Base.split(param_name, '['))
+    base_sym = Symbol(base_name)
 
-    if !(base_param_sym in chain_keys)
-        error("Parameter ':$param_sym' or base ':$base_param_sym' not found in the MCMC chain.")
+    # Extract column/variable data robustly across chain formats (FlexiChain, VNChain, DataFrame, Dict, NamedTuple)
+    col_data = try
+        chain[base_sym]
+    catch
+        try
+            chain[DynamicPPL.VarName(base_sym)]
+        catch
+            try
+                chain[param_name]
+            catch
+                try
+                    df = DataFrame(chain)
+                    df_cols = names(df)
+                    idx = findfirst(n -> string(n) == base_name || string(n) == param_name, df_cols)
+                    if !isnothing(idx)
+                        df[!, df_cols[idx]]
+                    else
+                        error("Parameter ':$param_name' or base ':$base_name' not found in chain.")
+                    end
+                catch err
+                    error("Parameter ':$param_name' or base ':$base_name' not found in the MCMC chain: $err")
+                end
+            end
+        end
     end
 
-    param_data_array = Array(chain[base_param_sym])
+    param_data_array = Array(col_data)
 
+    # 1D vector (e.g. from DataFrame column or flattened samples)
+    if ndims(param_data_array) == 1
+        return reshape(param_data_array, :, 1)
+    end
+
+    # 2D array: for FlexiChain scalar with [iterations, chains], reshape to (total_samples, 1)
+    # If already a 2D sample matrix where chains are already combined or it's a mock matrix
+    if ndims(param_data_array) == 2
+        return reshape(param_data_array, :, 1)
+    end
+
+    # 3D+ array from FlexiChain: [iterations, dim1, ..., chains]
     num_iterations = size(param_data_array, 1)
     num_chains = size(param_data_array, ndims(param_data_array))
     total_samples = num_iterations * num_chains
-
-    if num_chains == 1 && ndims(param_data_array) > 1 && size(param_data_array, 2) > 1 && ndims(param_data_array) < 3
-        return param_data_array
-    end
 
     perm_dims = (1, ndims(param_data_array), 2:(ndims(param_data_array)-1)...)
     permuted_data = permutedims(param_data_array, perm_dims)
 
     param_dims = size(permuted_data)[3:end]
-    
+
     if isempty(param_dims) # Scalar parameter
         return reshape(permuted_data, total_samples, 1)
     else
-        if prod(param_dims) == 1 && length(param_dims) > 0 # Handle vector of length 1
-            return reshape(permuted_data, total_samples, 1)
-        else
-            return reshape(permuted_data, total_samples, prod(param_dims))
-        end
+        return reshape(permuted_data, total_samples, prod(param_dims))
     end
 end
 
  
 # get_params_vector is for scalar parameters (expected_len = 1)
-function get_params_vector(chain, param_name::String, expected_len::Int)
-    if expected_len != 1
-        error("get_params_vector is intended for scalar parameters (expected_len=1). Use get_params_matrix for vector parameters.")
-    end
+# get_params_vector is for scalar parameters (expected_len = 1)
+function get_params_vector(chain, param_name::String, expected_len::Int=1)
     samples = _extract_flexichain_param_samples(chain, param_name)
-    return samples # Should be (total_samples, 1)
+    if size(samples, 2) != expected_len
+        if expected_len == 1 && size(samples, 2) > 1
+            error("get_params_vector was called for scalar (expected_len=1), but '$param_name' has dimension $(size(samples, 2)). Use get_params_matrix for vector parameters.")
+        elseif prod(size(samples)) == size(samples, 1) * expected_len
+            return reshape(samples, size(samples, 1), expected_len)
+        else
+            error("Parameter '$param_name' has dimension $(size(samples, 2)), but expected $expected_len.")
+        end
+    end
+    return samples # (total_samples, expected_len)
 end
 
-# get_params_matrix is for vector parameters (expected_len > 1)
+# get_params_matrix is for parameters of dimension expected_len >= 1
 function get_params_matrix(chain, param_name::String, expected_len::Int)
-    if expected_len == 1
-        error("get_params_matrix is intended for vector parameters (expected_len > 1). Use get_params_vector for scalar parameters.")
-    end
     samples = _extract_flexichain_param_samples(chain, param_name)
     # Check if the extracted samples have the correct expected_len
     if size(samples, 2) != expected_len
-        error("Parameter '$param_name' has dimension $(size(samples, 2)), but expected $expected_len.")
+        if prod(size(samples)) == size(samples, 1) * expected_len
+            return reshape(samples, size(samples, 1), expected_len)
+        else
+            error("Parameter '$param_name' has dimension $(size(samples, 2)), but expected $expected_len.")
+        end
     end
     return samples # Should be (total_samples, expected_len)
 end
@@ -5601,11 +5715,11 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
 
         if K > 2
             # Prior for the first cut-point and the positive differences for subsequent cut-points.
-            push!(prior_blocks, "ordinal_alpha_raw_1 ~ DynamicPPL.NamedDist(Normal(0, 5), :ordinal_alpha_raw_1)")
+            push!(prior_blocks, "ordinal_alpha_unscaled_1 ~ DynamicPPL.NamedDist(Normal(0, 5), :ordinal_alpha_unscaled_1)")
             push!(prior_blocks, "ordinal_alpha_diffs ~ DynamicPPL.NamedDist(filldist(Exponential(1.0), $(K - 2)), :ordinal_alpha_diffs)")
         elseif K == 2
             # For a binary ordinal model, only one cut-point is needed.
-            push!(prior_blocks, "ordinal_alpha_raw_1 ~ DynamicPPL.NamedDist(Normal(0, 5), :ordinal_alpha_raw_1)")
+            push!(prior_blocks, "ordinal_alpha_unscaled_1 ~ DynamicPPL.NamedDist(Normal(0, 5), :ordinal_alpha_unscaled_1)")
         end
 
         # Prior for the degrees of freedom if using a Student's T latent distribution.
@@ -5772,11 +5886,11 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
     return """
     # Ordinal Likelihood Block
     let
-        # Reconstruct the ordered cut-points from their raw parameters.
+        # Reconstruct the ordered cut-points from their unscaled parameters.
         alphas_computed = if $(K > 2)
-            cumsum([ordinal_alpha_raw_1; ordinal_alpha_diffs])
+            cumsum([ordinal_alpha_unscaled_1; ordinal_alpha_diffs])
         else
-            [ordinal_alpha_raw_1]
+            [ordinal_alpha_unscaled_1]
         end
 
         latent_dist_symbol = :$(latent_dist_val)
@@ -5853,9 +5967,11 @@ refactoring's goal of improved readability and maintainability.
 """
 
 function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
-    # Check if a component like a PointProcess handles its own likelihood.
-    # This check is now consistent with the one in `bstm_text_assembler`.
-    has_custom_likelihood_from_component = any(spec -> spec.component_obj isa PointProcess, M.components)
+    # Check if a component like a PointProcess or a marginalized GMRF handles its own likelihood.
+    has_custom_likelihood_from_component = any(
+        spec -> (spec.component_obj isa PointProcess || (hasproperty(spec.component_obj, :method) && spec.component_obj.method == :marginalized)),
+        M.components
+    )
     if has_custom_likelihood_from_component
         return "" # The component's `get_updates` method will add the log-probability.
     end
@@ -5953,11 +6069,11 @@ function _generate_offset_block(M::NamedTuple, is_multivariate::Bool, eta_name::
     if is_multivariate
         # For multivariate models, eta_name is `eta_latent` (an N x K matrix),
         # and M.log_offsets is also an N x K matrix.
-        return "$(eta_name) .+= M.log_offsets"
+        return "$(eta_name) = $(eta_name) .+ M.log_offsets"
     else
         # For univariate models, eta_name is `eta` (an N-element vector).
         # M.log_offsets is an N x 1 matrix, so we must select the first column.
-        return "$(eta_name) .+= M.log_offsets[:, 1]"
+        return "$(eta_name) = $(eta_name) .+ M.log_offsets[:, 1]"
     end
 end
 
@@ -5998,9 +6114,9 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
         priors_prop = priors_vec[prop_indices]
         all_same_prop = !isempty(priors_prop) && all(p -> p == priors_prop[1], priors_prop)
         
-        beta_prop_name = is_multivariate ? "Xfixed_beta_prop_flat" : "Xfixed_beta_prop"
+        beta_prop_name = is_multivariate ? "beta_flat" : "beta"
         n_params_prop = is_multivariate ? n_prop * M.outcomes_N : n_prop
-        prior_label = is_multivariate ? :Xfixed_beta_prop_flat : :Xfixed_beta_prop
+        prior_label = is_multivariate ? :beta_flat : :beta
 
         # Generate prior string
         if all_same_prop
@@ -6014,9 +6130,9 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
 
         # Generate update string
         update_code = if is_multivariate
-            "$(eta_name) .+= M.Xfixed[:, $(prop_indices)] * reshape($(beta_prop_name), $(n_prop), M.outcomes_N)"
+            "$(eta_name) = $(eta_name) .+ M.Xfixed[:, $(prop_indices)] * reshape($(beta_prop_name), $(n_prop), M.outcomes_N)"
         else
-            "$(eta_name) .+= M.Xfixed[:, $(prop_indices)] * $(beta_prop_name)"
+            "$(eta_name) = $(eta_name) .+ M.Xfixed[:, $(prop_indices)] * $(beta_prop_name)"
         end
         push!(update_parts, update_code)
     end
@@ -7036,10 +7152,13 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
             prior_val = mod_data[:params][:sigma]
             calling_mod = get(opt_dict, :calling_module, Main)
             if prior_val isa Tuple
-                opt_dict[:st_interaction_sigma_prior] = create_pc_prior(:sigma, prior_val)
+                opt_dict[:sigma_st_interaction_prior] = create_pc_prior(:sigma, prior_val)
+                opt_dict[:st_interaction_sigma_prior] = opt_dict[:sigma_st_interaction_prior]
             elseif prior_val isa Expr
-                opt_dict[:st_interaction_sigma_prior] = Core.eval(calling_mod, prior_val)
+                opt_dict[:sigma_st_interaction_prior] = Core.eval(calling_mod, prior_val)
+                opt_dict[:st_interaction_sigma_prior] = opt_dict[:sigma_st_interaction_prior]
             else
+                opt_dict[:sigma_st_interaction_prior] = prior_val
                 opt_dict[:st_interaction_sigma_prior] = prior_val
             end
         end

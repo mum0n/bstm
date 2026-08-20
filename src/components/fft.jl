@@ -153,7 +153,7 @@ function get_priors(
     
     push!(
         priors,
-        "$(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)"
+        "$(p_names.ure) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)"
     )
 
     return join(priors, "\n    ")
@@ -256,10 +256,10 @@ function get_updates(
             diag_D[1] = 0.0
             diag_D[2] = 0.0
             
-            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
-            $(p_names.latent) = B_fft * coeffs
+            coeffs = hyper.U * (diag_D .* $(p_names.ure))
+            $(p_names.sre) = B_fft * coeffs
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -270,17 +270,17 @@ function get_updates(
             Q_penalty = spec_registry[:$(key)].hyper.Q_template
             F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
             
-            coeffs_raw = F.L' \\ $(p_names.innovations)
+            coeffs_unscaled = F.L' \\ $(p_names.ure)
             
             # Apply soft sum-to-zero constraint for RW2 penalty
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw)
+                Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_unscaled)
             )
             
-            coeffs = $(p_names.sigma) .* coeffs_raw
-            $(p_names.latent) = B_fft * coeffs
+            coeffs = $(p_names.sigma) .* coeffs_unscaled
+            $(p_names.sre) = B_fft * coeffs
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -291,17 +291,17 @@ function get_updates(
             Q_penalty = spec_registry[:$(key)].hyper.Q_template
             F = cholesky(Symmetric(Q_penalty + M.noise * I))
             
-            coeffs_raw = F.L' \\ $(p_names.innovations)
+            coeffs_unscaled = F.L' \\ $(p_names.ure)
             
             # Apply soft sum-to-zero constraint for RW2 penalty
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw)
+                Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_unscaled)
             )
             
-            coeffs = $(p_names.sigma) .* coeffs_raw
-            $(p_names.latent) = B_fft * coeffs
+            coeffs = $(p_names.sigma) .* coeffs_unscaled
+            $(p_names.sre) = B_fft * coeffs
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -322,7 +322,11 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -349,9 +353,9 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(ls_name) || isempty(innovations_name)
+        if isempty(sigma_name) || isempty(ls_name) || isempty(ure_name)
             @warn "Parameters for FFT component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -361,7 +365,7 @@ function get_effects(
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
         ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
+        ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
 
         # Initialize the output matrix for the full effect on the CPU
         effect_k_cpu = zeros(Float64, N_total, n_samples)
@@ -374,7 +378,7 @@ function get_effects(
                 coords_full_cpu, nbins_per_dim, current_ls_cpu
             )
             
-            innov_i_cpu = innovations_samples_cpu[i, :]
+            innov_i_cpu = ure_samples_cpu[i, :]
             sigma_i_cpu = sigma_samples_cpu[i]
             
             # 3. Reconstruct coefficients on CPU
@@ -388,12 +392,12 @@ function get_effects(
             else # :cholesky or :cholesky_sparse
                 Q_penalty = hyper.Q_template
                 F = cholesky(Symmetric(Matrix(Q_penalty) + noise * I))
-                coeffs_raw = F.L' \ innov_i_cpu
-                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
+                coeffs_unscaled = F.L' \ innov_i_cpu
+                coeffs_centered = coeffs_unscaled .- mean(coeffs_unscaled)
                 coeffs_cpu = sigma_i_cpu .* coeffs_centered
             end
             # 4. Compute effect for this sample
-            effect_k_cpu[:, i] = B_fft_i * coeffs_cpu
+            effect_k_cpu[:, i] = B_fft_i_cpu * coeffs_cpu
         end
         
         push!(structured_effects, effect_k_cpu)

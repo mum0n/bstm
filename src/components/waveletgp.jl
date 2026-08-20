@@ -169,7 +169,7 @@ function get_priors(
 
     push!(priors, "$(p_names.sigma0) ~ $(_distribution_to_string(m.sigma0))")
     push!(priors, "$(p_names.alpha) ~ $(_distribution_to_string(m.alpha))")
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
@@ -191,7 +191,7 @@ function get_updates(
         wt = Wavelets.wavelet(Symbol("$(m.wavelet)"))
         
         scale_variances = $(p_names.sigma0)^2 .* (2.0 .^ (-$(p_names.alpha) .* hyper.scale_indices))
-        wavelet_coeffs = $(p_names.innovations) .* sqrt.(scale_variances)
+        wavelet_coeffs = $(p_names.ure) .* sqrt.(scale_variances)
         
         local latent_field_grid
         if $(n_dims) == 1
@@ -203,9 +203,9 @@ function get_updates(
         
         itp = linear_interpolation(hyper.grid_ranges, latent_field_grid, extrapolation_bc=Flat())
         coords_for_itp = ntuple(d -> hyper.coords[:, d], $(n_dims))
-        $(p_names.latent) = itp(coords_for_itp...)
+        $(p_names.sre) = itp(coords_for_itp...)
         
-        $(eta_target) .+= $(p_names.latent)
+        $(eta_target) .+= $(p_names.sre)
     end
     """
 end
@@ -253,9 +253,9 @@ function get_effects(
         v = generate_full_variable_names(spec, M.model_arch, k)
         sigma0_name = _find_parameter(p_names, string(v.sigma0), k, is_multivariate_model)
         alpha_name = _find_parameter(p_names, string(v.alpha), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
 
-        if isempty(sigma0_name) || isempty(alpha_name) || isempty(innovations_name)
+        if isempty(sigma0_name) || isempty(alpha_name) || isempty(ure_name)
             @warn "Parameters for WaveletGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total_eff, n_samples))
             continue
@@ -264,7 +264,7 @@ function get_effects(
         # Extract posterior samples (these are on the CPU)
         sigma0_samples_cpu = get_params_vector(chain, sigma0_name, 1)[:, 1]
         alpha_samples_cpu = get_params_vector(chain, alpha_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
+        ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
 
         effect_k = zeros(Float64, N_total_eff, n_samples)
         wt = Wavelets.wavelet(m.wavelet)
@@ -273,7 +273,7 @@ function get_effects(
         for i in 1:n_samples
             sigma0_s = sigma0_samples_cpu[i]
             alpha_s = alpha_samples_cpu[i]
-            innov_s = innovations_samples_cpu[i, :]
+            innov_s = ure_samples_cpu[i, :]
 
             scale_variances = sigma0_s^2 .* (2.0 .^ (-alpha_s .* scale_indices_cpu))
             wavelet_coeffs = innov_s .* sqrt.(scale_variances)

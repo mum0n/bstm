@@ -108,7 +108,7 @@ function get_precomputes(
     u_var_sym = Symbol(variables[1])
     if !hasproperty(M.data, u_var_sym)
         error(
-            "Seasonal index variable ':' for Harmonic model not found " *
+            "Seasonal index variable ':$u_var_sym' for Harmonic model not found " *
             "in data."
         )
     end
@@ -187,7 +187,7 @@ function get_updates(
             period_val = $(period_access_code)
             
             angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
-            $(p_names.latent) .+= b_cos .* cos.(angle) .+ b_sin .* sin.(angle)
+            $(p_names.sre) .+= b_cos .* cos.(angle) .+ b_sin .* sin.(angle)
         """
     else # :ampphase
         loop_body = """
@@ -196,7 +196,7 @@ function get_updates(
             period_val = $(period_access_code)
             
             angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
-            $(p_names.latent) .+= amp .* cos.(angle .+ (2 * pi * phase))
+            $(p_names.sre) .+= amp .* cos.(angle .+ (2 * pi * phase))
         """
     end
 
@@ -208,11 +208,11 @@ function get_updates(
             T_num = eltype($(init_param))
             u_N_val = spec_registry[:$(spec.key)].hyper.u_N
             u_idx_val = spec_registry[:$(spec.key)].hyper.u_idx
-            $(p_names.latent) = zeros(T_num, u_N_val)
+            $(p_names.sre) = zeros(T_num, u_N_val)
             for k in 1:$(m.nharmonics)
                 $(loop_body)
             end
-            $(eta_target) .+= view($(p_names.latent), u_idx_val)
+            $(eta_target) .+= view($(p_names.sre), u_idx_val)
         end
     """
 end

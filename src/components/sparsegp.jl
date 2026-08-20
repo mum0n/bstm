@@ -145,18 +145,18 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.inducing_innovations) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
+    push!(priors, "$(p_names.ure_inducing) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
     
     if m.method == :fitc
         push!(
             priors,
-            "$(p_names.diag_innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
+            "$(p_names.ure_diag) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
         )
     elseif m.method == :pic
         # For PIC, innovations are for the entire latent field, then partitioned by block.
         push!(
             priors,
-            "$(p_names.pic_innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
+            "$(p_names.ure_pic) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
         )
     end
 
@@ -185,7 +185,7 @@ function get_updates(
         )
         
         local L_UU = cholesky(Symmetric(K_UU)).L
-        local u_latent = L_UU * $(p_names.inducing_innovations)
+        local u_latent = L_UU * $(p_names.ure_inducing)
     """
 
     fitc_code = """
@@ -201,10 +201,10 @@ function get_updates(
             local diag_Q_ff = sum(tmp.^2, dims=2)
             local lambda_diag = diag_K_XX - vec(diag_Q_ff)
             
-            $(p_names.latent) = mean_f .+
-                sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.diag_innovations)
+            $(p_names.sre) = mean_f .+
+                sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.ure_diag)
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -214,9 +214,9 @@ function get_updates(
             $(common_code)
             
             local K_UU_inv_u = K_UU \\ u_latent
-            $(p_names.latent) = K_XU * K_UU_inv_u
+            $(p_names.sre) = K_XU * K_UU_inv_u
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -229,7 +229,7 @@ function get_updates(
             local mean_f = K_XU * K_UU_inv_u
             
             # Initialize latent field with the mean component
-            $(p_names.latent) = deepcopy(mean_f)
+            $(p_names.sre) = deepcopy(mean_f)
             
             # Loop over each cluster to apply the block-diagonal correction
             for g in 1:hyper.n_clusters
@@ -256,10 +256,10 @@ function get_updates(
                 local L_C_block = cholesky(Symmetric(C_block + I * M.noise)).L
                 
                 # Apply the correction to the latent field for this block
-                $(p_names.latent)[block_indices] .+= L_C_block * $(p_names.pic_innovations)[block_indices]
+                $(p_names.sre)[block_indices] .+= L_C_block * $(p_names.ure_pic)[block_indices]
             end
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -279,7 +279,11 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -309,7 +313,7 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
-        inducing_innov_name = _find_parameter(p_names, string(p_names_k.inducing_innovations), k, is_multivariate_model)
+        inducing_innov_name = _find_parameter(p_names, string(p_names_k.ure_inducing), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(inducing_innov_name)
             @warn "Parameters for SparseGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -330,19 +334,19 @@ function get_effects(
         for i in 1:n_samples
             current_sigma = sigma_samples_cpu[i]
             current_ls = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
-            current_u_raw = inducing_innov_samples_cpu[i, :]
+            current_u_unscaled = inducing_innov_samples_cpu[i, :]
             
             # Kernel evaluation and Cholesky happen on the CPU
             K_UU = evaluate_kernel_matrix(Z_inducing_cpu, current_sigma, current_ls, kernel_type, noise)
             K_XU_full = evaluate_cross_kernel_matrix(coords_full_cpu, Z_inducing_cpu, current_sigma, current_ls, kernel_type)
             
             L_UU = cholesky(Symmetric(K_UU)).L
-            u_latent = L_UU * current_u_raw
+            u_latent = L_UU * current_u_unscaled
             K_UU_inv_u = K_UU \ u_latent
             mean_f = K_XU_full * K_UU_inv_u
 
             if m.method == :fitc
-                diag_innov_name = _find_parameter(p_names, string(p_names_k.diag_innovations), k, is_multivariate_model)
+                diag_innov_name = _find_parameter(p_names, string(p_names_k.ure_diag), k, is_multivariate_model)
                 if isempty(diag_innov_name)
                     @warn "Diagonal innovations for FITC component $(spec.key) (outcome $k) not found. Using zero for correction."
                     effect_k_cpu[:, i] = mean_f
@@ -368,7 +372,7 @@ function get_effects(
                 effect_k_cpu[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* diag_innov_i_cpu
             elseif m.method == :pic
                 effect_k_cpu[:, i] = mean_f
-                pic_innov_name = _find_parameter(p_names, string(p_names_k.pic_innovations), k, is_multivariate_model)
+                pic_innov_name = _find_parameter(p_names, string(p_names_k.ure_pic), k, is_multivariate_model)
                 if isempty(pic_innov_name)
                     @warn "PIC innovations for component $(spec.key) (outcome $k) not found. Using mean-only prediction."
                     continue

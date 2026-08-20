@@ -118,13 +118,13 @@ function get_priors(
     
     priors = String[]
     push!(priors, "$(p_names.threshold_unconstrained) ~ Normal(0.0, 1.0)")
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     if m.method == :statespace
-        push!(priors, "$(p_names.unconstrained_rho1) ~ Normal(0, 1.5)")
-        push!(priors, "$(p_names.unconstrained_rho2) ~ Normal(0, 1.5)")
-        push!(priors, "$(p_names.unconstrained_sigma1) ~ Normal(0, 1.0)")
-        push!(priors, "$(p_names.unconstrained_sigma2) ~ Normal(0, 1.0)")
+        push!(priors, "$(p_names.rho1_unconstrained) ~ Normal(0, 1.5)")
+        push!(priors, "$(p_names.rho2_unconstrained) ~ Normal(0, 1.5)")
+        push!(priors, "$(p_names.sigma1_unconstrained) ~ Normal(0, 1.0)")
+        push!(priors, "$(p_names.sigma2_unconstrained) ~ Normal(0, 1.0)")
     else # :statespace_constrained
         push!(priors, "$(p_names.rho1) ~ $(_distribution_to_string(m.rho_regimes[1]))")
         push!(priors, "$(p_names.rho2) ~ $(_distribution_to_string(m.rho_regimes[2]))")
@@ -146,10 +146,10 @@ function get_updates(
     local param_definitions
     if m.method == :statespace
         param_definitions = """
-            local rho1 = tanh($(p_names.unconstrained_rho1))
-            local rho2 = tanh($(p_names.unconstrained_rho2))
-            local sigma1 = exp($(p_names.unconstrained_sigma1))
-            local sigma2 = exp($(p_names.unconstrained_sigma2))
+            local rho1 = tanh($(p_names.rho1_unconstrained))
+            local rho2 = tanh($(p_names.rho2_unconstrained))
+            local sigma1 = exp($(p_names.sigma1_unconstrained))
+            local sigma2 = exp($(p_names.sigma2_unconstrained))
         """
     else # :statespace_constrained
         param_definitions = """
@@ -166,7 +166,7 @@ function get_updates(
             $(param_definitions)
             local hyper = spec_registry[:$(key)].hyper
             local threshold_level = mean(hyper.threshold_data) + $(p_names.threshold_unconstrained)
-            local innovations = $(p_names.innovations)
+            local innovations = $(p_names.ure)
             
             local latent_field = Vector{eltype(innovations)}(undef, M.t_N)
             
@@ -181,8 +181,8 @@ function get_updates(
                     latent_field[t] = curr_rho * latent_field[t-1] + innovations[t] * curr_sigma
                 end
             end
-            $(p_names.latent) = latent_field
-            $(eta_target) .+= view($(p_names.latent), M.t_idx)
+            $(p_names.sre) = latent_field
+            $(eta_target) .+= view($(p_names.sre), M.t_idx)
         end
     """
 end
@@ -193,7 +193,11 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -237,9 +241,9 @@ function get_effects(
         v = generate_full_variable_names(spec, M.model_arch, k_outcome)
         
         thresh_unconstrained_name = _find_parameter(p_names, string(v.threshold_unconstrained), k_outcome, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(v.innovations), k_outcome, is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(v.ure), k_outcome, is_multivariate_model)
 
-        if isempty(thresh_unconstrained_name) || isempty(innovations_name)
+        if isempty(thresh_unconstrained_name) || isempty(ure_name)
             @warn "Base parameters for TAR component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -247,23 +251,23 @@ function get_effects(
 
         # Extract posterior samples (CPU)
         thresh_unconstrained_samples_cpu = get_params_vector(chain, thresh_unconstrained_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, t_N_train)
+        ure_samples_cpu = get_params_matrix(chain, ure_name, t_N_train)
         
         local rho1_samples_cpu, rho2_samples_cpu, sigma1_samples_cpu, sigma2_samples_cpu
         if m.method == :statespace
-            rho1_raw_name = _find_parameter(p_names, string(v.unconstrained_rho1), k_outcome, is_multivariate_model)
-            rho2_raw_name = _find_parameter(p_names, string(v.unconstrained_rho2), k_outcome, is_multivariate_model)
-            sigma1_raw_name = _find_parameter(p_names, string(v.unconstrained_sigma1), k_outcome, is_multivariate_model)
-            sigma2_raw_name = _find_parameter(p_names, string(v.unconstrained_sigma2), k_outcome, is_multivariate_model)
-            if isempty(rho1_raw_name) || isempty(rho2_raw_name) || isempty(sigma1_raw_name) || isempty(sigma2_raw_name)
+            rho1_unconstrained_name = _find_parameter(p_names, string(v.rho1_unconstrained), k_outcome, is_multivariate_model)
+            rho2_unconstrained_name = _find_parameter(p_names, string(v.rho2_unconstrained), k_outcome, is_multivariate_model)
+            sigma1_unconstrained_name = _find_parameter(p_names, string(v.sigma1_unconstrained), k_outcome, is_multivariate_model)
+            sigma2_unconstrained_name = _find_parameter(p_names, string(v.sigma2_unconstrained), k_outcome, is_multivariate_model)
+            if isempty(rho1_unconstrained_name) || isempty(rho2_unconstrained_name) || isempty(sigma1_unconstrained_name) || isempty(sigma2_unconstrained_name)
                 @warn "Regime parameters for TAR component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            rho1_samples_cpu = tanh.(get_params_vector(chain, rho1_raw_name, 1)[:, 1])
-            rho2_samples_cpu = tanh.(get_params_vector(chain, rho2_raw_name, 1)[:, 1])
-            sigma1_samples_cpu = exp.(get_params_vector(chain, sigma1_raw_name, 1)[:, 1])
-            sigma2_samples_cpu = exp.(get_params_vector(chain, sigma2_raw_name, 1)[:, 1])
+            rho1_samples_cpu = tanh.(get_params_vector(chain, rho1_unconstrained_name, 1)[:, 1])
+            rho2_samples_cpu = tanh.(get_params_vector(chain, rho2_unconstrained_name, 1)[:, 1])
+            sigma1_samples_cpu = exp.(get_params_vector(chain, sigma1_unconstrained_name, 1)[:, 1])
+            sigma2_samples_cpu = exp.(get_params_vector(chain, sigma2_unconstrained_name, 1)[:, 1])
         else # :statespace_constrained
             rho1_name = _find_parameter(p_names, string(v.rho1), k_outcome, is_multivariate_model)
             rho2_name = _find_parameter(p_names, string(v.rho2), k_outcome, is_multivariate_model)
@@ -289,7 +293,7 @@ function get_effects(
         for s in 1:n_samples
             threshold_level = mean_thresh_data_cpu + thresh_unconstrained_samples_cpu[s]
             
-            innov_train_cpu = innovations_samples_cpu[s, :]
+            innov_train_cpu = ure_samples_cpu[s, :]
             innov_pred_cpu = randn(Float32, t_N_full - t_N_train)
             innov_full_cpu = vcat(innov_train_cpu, innov_pred_cpu)
             

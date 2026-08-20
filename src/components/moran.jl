@@ -89,6 +89,55 @@ function get_precomputes(m::Moran, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
+    _moran_log_marginal_likelihood(y_residual, s_idx, s_N, eigenvectors, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for a Moran eigenvector component integrated out analytically.
+"""
+function _moran_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    s_idx::AbstractVector{Int},
+    s_N::Int,
+    eigenvectors::AbstractMatrix,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    K = size(eigenvectors, 2)
+    T_num = promote_type(T, typeof(noise))
+    
+    # Construct design X = eigenvectors[s_idx, :]
+    X = Matrix{T_num}(eigenvectors[s_idx, :])
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    XTX = Matrix{T_num}(X' * X)
+    XTy = Vector{T_num}(X' * y_residual)
+    
+    I_mat = Matrix{T_num}(I, K, K)
+    Q_base = I_mat .+ (scale * inv_sigma_y2) .* XTX
+    for k in 1:K
+        Q_base[k, k] += T_num(noise)
+    end
+    
+    F = cholesky(Symmetric(Q_base))
+    
+    log_det_diff = - K * log(scale) - 2 * sum(log.(diag(F.U)))
+    
+    b = XTy .* inv_sigma_y2
+    v = F.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
+"""
     get_priors(m::Moran, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates priors for the Moran component's parameters, including the standard
@@ -105,7 +154,7 @@ function get_priors(
     if m.method == :noncentered
         push!(
             priors,
-            "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.innovations))"
+            "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.ure))"
         )
     end
     
@@ -135,9 +184,9 @@ function get_updates(
         # --- Moran Eigenvector Component (Non-Centered): $(key) ---
         let
             $(common_code)
-            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
-            latent_field = moran_eigenvectors * scaled_coeffs
-            $(eta_target) .+= view(latent_field, M.s_idx)
+            scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
+            $(p_names.sre) = moran_eigenvectors * scaled_coeffs
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -145,9 +194,27 @@ function get_updates(
         # --- Moran Eigenvector Component (Centered): $(key) ---
         let
             $(common_code)
-            $(p_names.latent) ~ MvNormal(zeros(T, $(n_latent)), $(p_names.sigma)^2 * I)
-            latent_field = moran_eigenvectors * $(p_names.latent)
+            $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), $(p_names.sigma)^2 * I)
+            latent_field = moran_eigenvectors * $(p_names.sre)
             $(eta_target) .+= view(latent_field, M.s_idx)
+        end
+    """
+
+    marginalized_code = """
+        # --- Moran Eigenvector Component (Marginalized): $(key) ---
+        let
+            $(common_code)
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _moran_log_marginal_likelihood(
+                y_residual,
+                M.s_idx,
+                size(moran_eigenvectors, 1),
+                moran_eigenvectors,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
@@ -155,8 +222,10 @@ function get_updates(
         return noncentered_code
     elseif m.method == :centered
         return centered_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else
-        error("Unsupported method '$(m.method)' for Moran component.")
+        error("Unsupported method '$(m.method)' for Moran component. Use :noncentered, :centered, or :marginalized.")
     end
 end
 
@@ -179,6 +248,7 @@ function get_effects(
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
+    noise = get(M, :noise, 1e-6)
     
     structured_effects = Vector{Matrix{Float64}}()
     
@@ -196,10 +266,11 @@ function get_effects(
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names, string(spec.key), "sigma", k, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         
         if isempty(sigma_name)
-            @warn "Sigma parameter for Moran component $(spec.key) (outcome ) not found. Returning zero-matrix."
+            @warn "Sigma parameter for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
@@ -207,26 +278,63 @@ function get_effects(
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         
         local latent_field_matrix
-        if m.method == :noncentered
-            innovations_name = _find_parameter(p_names, string(spec.key), "innovations", k, is_multivariate_model)
-            if isempty(innovations_name)
-                @warn "Innovations for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
+            end
+            
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            X_train = Matrix{Float64}(eigenvectors[s_idx_train, :])
+            XTX = Matrix{Float64}(X_train' * X_train)
+            XTy = Vector{Float64}(X_train' * y_vec)
+            
+            K = n_latent
+            I_mat = Matrix{Float64}(I, K, K)
+            coeffs_matrix = zeros(Float64, K, n_samples)
+            
+            for s in 1:n_samples
+                sig = sigma_samples[s, 1]
+                y_sig = y_sigma_samples[s]
+                
+                scale = sig^2 + noise
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
+                
+                Q_base = I_mat .+ (scale * inv_sigma_y2) .* XTX
+                for j in 1:K
+                    Q_base[j, j] += noise
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = XTy .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(K)
+                coeffs_matrix[:, s] = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+            end
+            latent_field_matrix = eigenvectors * coeffs_matrix
+        elseif m.method == :noncentered
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "ure for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
+            ure_samples = get_params_matrix(chain, ure_name, n_latent) # (n_samples, n_latent)
             
-            scaled_coeffs = innovations_samples' .* sigma_samples' # (n_latent, n_samples)
+            scaled_coeffs = ure_samples' .* sigma_samples' # (n_latent, n_samples)
             latent_field_matrix = eigenvectors * scaled_coeffs
 
         else # :centered
-            latent_name = _find_parameter(p_names, string(spec.key), "latent", k, is_multivariate_model)
-            if isempty(latent_name)
-                @warn "Latent coefficients for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
+            if isempty(sre_name)
+                @warn "sre for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            coeffs_samples = get_params_matrix(chain, latent_name, n_latent)
+            coeffs_samples = get_params_matrix(chain, sre_name, n_latent)
             
             latent_field_matrix = eigenvectors * coeffs_samples'
         end

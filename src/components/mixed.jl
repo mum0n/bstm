@@ -117,7 +117,7 @@ function get_priors(
         # Priors for Correlated Mixed Effects: $(spec.key)
         $(p_names.L_corr) ~ LKJCholesky($(n_terms), 1.0)
         $(p_names.sigma_effects) ~ filldist(Exponential(1.0), $(n_terms))
-        $(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_groups * n_terms)), I), :$(p_names.innovations))
+        $(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_groups * n_terms)), I), :$(p_names.ure))
         """
     end
 end
@@ -140,37 +140,37 @@ function get_updates(
         
         local latent_field_code
         if inner_model isa IID
-            latent_field_code = "$(p_names.latent) = $(p_names.innovations) .* $(p_names.sigma)"
+            latent_field_code = "$(p_names.sre) = $(p_names.ure) .* $(p_names.sigma)"
         elseif inner_model isa Union{ICAR, Besag, RW1, RW2, Leroux}
             if m.method == :spectral
                 latent_field_code = """
                 diag_D = $(p_names.sigma) ./ sqrt.($(inner_hyper_access).L .+ M.noise)
                 if $(inner_model isa Union{ICAR, Besag, RW1}); diag_D[1] = 0.0; end
                 if $(inner_model isa RW2); diag_D[1] = 0.0; diag_D[2] = 0.0; end
-                $(p_names.latent) = $(inner_hyper_access).U * (diag_D .* $(p_names.innovations))
+                $(p_names.sre) = $(inner_hyper_access).U * (diag_D .* $(p_names.ure))
                 """
             else # :cholesky or :cholesky_sparse
                 latent_field_code = """
                 F_groups = $(inner_hyper_access).cholesky_factor
-                latent_field_raw = F_groups.L' \\ $(p_names.innovations)
+                sre_unscaled = F_groups.L' \\ $(p_names.ure)
                 if $(inner_model isa Union{ICAR, Besag, RW1, RW2})
-                    Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_groups)), sum(latent_field_raw))
+                    Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_groups)), sum(sre_unscaled))
                 end
-                $(p_names.latent) = latent_field_raw .* $(p_names.sigma)
+                $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
                 """
             end
         else
-            latent_field_code = "$(p_names.latent) = $(p_names.innovations) .* $(p_names.sigma)"
+            latent_field_code = "$(p_names.sre) = $(p_names.ure) .* $(p_names.sigma)"
         end
 
         local application_code
         if lhs_str == "1" || lhs_str == "intercept()"
-            application_code = "$(eta_target) .+= view($(p_names.latent), M.$(index_var))"
+            application_code = "$(eta_target) .+= view($(p_names.sre), M.$(index_var))"
         else
             application_code = """
             let cov_data = M.data[!, :$(Symbol(lhs_str))]
                 for i in 1:length($(eta_target))
-                    $(eta_target)[i] += cov_data[i] * $(p_names.latent)[M.$(index_var)[i]]
+                    $(eta_target)[i] += cov_data[i] * $(p_names.sre)[M.$(index_var)[i]]
                 end
             end
             """
@@ -196,7 +196,7 @@ function get_updates(
 
         common_correlated_code = """
             L_effects_t = ($(p_names.L_corr).L' * Diagonal($(p_names.sigma_effects)))
-            innovations_matrix = reshape($(p_names.innovations), $(n_groups), $(n_terms))
+            innovations_matrix = reshape($(p_names.ure), $(n_groups), $(n_terms))
         """
 
         spectral_code = """
@@ -305,21 +305,21 @@ function get_effects(
         for k in 1:outcomes_N
             p_names_k = generate_full_variable_names(spec, M.model_arch, k)
             sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
 
-            if isempty(sigma_name) || isempty(innovations_name)
-                @warn "Parameters for simple Mixed component $(spec.key) (outcome ) not found. Returning zero-matrix."
+            if isempty(sigma_name) || isempty(ure_name)
+                @warn "Parameters for simple Mixed component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(effects_per_outcome, zeros(Float64, length(full_indices_cpu), n_samples)) # Use length(full_indices_cpu) for N_total
                 continue
             end
 
             # Extract samples (CPU)
             sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-            innovations_samples = get_params_matrix(chain, innovations_name, n_groups_train) # (n_samples, n_groups_train)
+            ure_samples = get_params_matrix(chain, ure_name, n_groups_train) # (n_samples, n_groups_train)
             
             # Perform computation
             # latent_samples_train: [n_groups_train, n_samples]
-            latent_samples_train_cpu = innovations_samples_cpu' .* sigma_samples_cpu'
+            latent_samples_train_cpu = ure_samples' .* sigma_samples'
             
             full_effects_cpu = zeros(Float64, n_all_groups, n_samples)
             train_indices_map_cpu = [level_map[level] for level in train_levels]
@@ -327,7 +327,7 @@ function get_effects(
 
             if has_new_levels
                 new_level_indices = setdiff(1:n_all_groups, train_indices_map_cpu)
-                new_effects_cpu = randn(Float64, length(new_level_indices), n_samples) .* sigma_samples_cpu'
+                new_effects_cpu = randn(Float64, length(new_level_indices), n_samples) .* sigma_samples'
                 full_effects_cpu[new_level_indices, :] = new_effects_cpu
             end
             
@@ -352,17 +352,17 @@ function get_effects(
             p_names_k = generate_full_variable_names(spec, M.model_arch, k)
             l_corr_name = _find_parameter(p_names, string(p_names_k.L_corr), k, is_multivariate_model)
             sigma_effects_name = _find_parameter(p_names, string(p_names_k.sigma_effects), k, is_multivariate_model)
-            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
 
-            if isempty(l_corr_name) || isempty(sigma_effects_name) || isempty(innovations_name)
-                @warn "Parameters for correlated Mixed component $(spec.key) (outcome ) not found. Skipping."
+            if isempty(l_corr_name) || isempty(sigma_effects_name) || isempty(ure_name)
+                @warn "Parameters for correlated Mixed component $(spec.key) (outcome $k) not found. Skipping."
                 continue
             end
 
             # Extract samples (CPU)
             l_corr_samples = get_params_matrix(chain, l_corr_name, n_terms * n_terms) # (n_samples, n_terms * n_terms)
             sigma_effects_samples = get_params_matrix(chain, sigma_effects_name, n_terms) # (n_samples, n_terms)
-            innovations_samples = get_params_matrix(chain, innovations_name, n_groups_train * n_terms) # (n_samples, n_groups_train * n_terms)
+            ure_samples = get_params_matrix(chain, ure_name, n_groups_train * n_terms) # (n_samples, n_groups_train * n_terms)
             
             inner_precomputes = spec.hyper.inner_precomputes
 
@@ -373,7 +373,7 @@ function get_effects(
                 # Current sample's parameters (CPU)
                 l_corr_s = reshape(l_corr_samples[s,:], n_terms, n_terms)
                 sigma_effects_s = sigma_effects_samples[s,:]
-                innov_matrix_s = reshape(innovations_samples[s,:], n_groups_train, n_terms)
+                innov_matrix_s = reshape(ure_samples[s,:], n_groups_train, n_terms)
 
                 # Perform computations on CPU
                 L_effects_t = (l_corr_s' * Diagonal(sigma_effects_s))

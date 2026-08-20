@@ -112,10 +112,10 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
     end
     
-    push!(priors, "$(p_names.inducing_innovations) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
+    push!(priors, "$(p_names.ure_inducing) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
     
     if m.method == :fitc
-        push!(priors, "$(p_names.diag_innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+        push!(priors, "$(p_names.ure_diag) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
     end
 
     return join(priors, "\n    ")
@@ -144,7 +144,7 @@ function get_updates(
             )
             
             L_UU = cholesky(Symmetric(K_UU)).L
-            u_latent = L_UU * $(p_names.inducing_innovations)
+            u_latent = L_UU * $(p_names.ure_inducing)
     """
 
     fitc_code = """
@@ -159,10 +159,10 @@ function get_updates(
             diag_Q_ff = sum(tmp.^2, dims=2)
             lambda_diag = diag_K_XX - vec(diag_Q_ff)
             
-            $(p_names.latent) = mean_f .+
-                sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.diag_innovations)
+            $(p_names.sre) = mean_f .+
+                sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.ure_diag)
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -171,9 +171,9 @@ function get_updates(
         $(common_code)
             
             K_UU_inv_u = K_UU \\ u_latent
-            $(p_names.latent) = K_XU * K_UU_inv_u
+            $(p_names.sre) = K_XU * K_UU_inv_u
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -234,9 +234,9 @@ function get_effects(
         # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
-        inducing_innov_name = _find_parameter(p_names, string(p_names_k.inducing_innovations), k, is_multivariate_model)
+        inducing_ure_name = _find_parameter(p_names, string(p_names_k.ure_inducing), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(ls_name) || isempty(inducing_innov_name)
+        if isempty(sigma_name) || isempty(ls_name) || isempty(inducing_ure_name)
             @warn "Parameters for FITC component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
@@ -246,7 +246,7 @@ function get_effects(
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1 # Dimension of lengthscale parameter
         ls_samples = get_params_matrix(chain, ls_name, ls_dim) # (n_samples, ls_dim)
-        inducing_innov_samples = get_params_matrix(chain, inducing_innov_name, m.n_inducing) # (n_samples, n_inducing)
+        inducing_ure_samples = get_params_matrix(chain, inducing_ure_name, m.n_inducing) # (n_samples, n_inducing)
 
         # Initialize the output matrix for the full effect
         effect_k_matrix = zeros(Float64, n_obs_full, n_samples)
@@ -255,7 +255,7 @@ function get_effects(
         for i in 1:n_samples # Iterate over each posterior sample
             current_sigma = sigma_samples[i, 1] # Sigma for current sample
             current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1] # Lengthscale for current sample
-            current_u_raw = inducing_innov_samples[i, :] # Raw innovations for inducing points for current sample
+            current_u_unscaled = inducing_ure_samples[i, :] # Unscaled innovations for inducing points for current sample
             
             # Kernel evaluations happen on the CPU
             K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
@@ -263,28 +263,28 @@ function get_effects(
             
             # Cholesky and linear solves happen on the CPU
             L_UU = cholesky(Symmetric(K_UU)).L
-            u_latent = L_UU * current_u_raw
+            u_latent = L_UU * current_u_unscaled
             K_UU_inv_u = K_UU \ u_latent
             mean_f = K_XU * K_UU_inv_u
 
             if m.method == :fitc
-                diag_innov_name = _find_parameter(p_names, string(p_names_k.diag_innovations), k, is_multivariate_model)
-                if isempty(diag_innov_name)
+                diag_ure_name = _find_parameter(p_names, string(p_names_k.ure_diag), k, is_multivariate_model)
+                if isempty(diag_ure_name)
                     @warn "Diagonal innovations for FITC component $(spec.key) (outcome $k) not found. Using zero for correction."
                     effect_k_matrix[:, i] = mean_f
                     continue
                 end
                 
-                diag_innov_samples = get_params_matrix(chain, diag_innov_name, n_latent_train) # (n_samples, n_latent_train)
+                diag_ure_samples = get_params_matrix(chain, diag_ure_name, n_latent_train) # (n_samples, n_latent_train)
                 
                 # Handle prediction set by generating new innovations
-                diag_innov_i = if n_obs_full > n_latent_train
+                diag_ure_i = if n_obs_full > n_latent_train
                     vcat(
-                        diag_innov_samples[i, :],
+                        diag_ure_samples[i, :],
                         randn(Float64, n_obs_full - n_latent_train) # Generate new innovations for prediction points
                     )
                 else
-                    diag_innov_samples[i, :]
+                    diag_ure_samples[i, :]
                 end
 
                 # Diagonal correction calculations
@@ -293,7 +293,7 @@ function get_effects(
                 diag_Q_ff = sum(tmp.^2, dims=2)
                 lambda_diag = diag_K_XX - vec(diag_Q_ff)
                 
-                effect_k_matrix[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* diag_innov_i
+                effect_k_matrix[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* diag_ure_i
             else # :vfe
                 effect_k_matrix[:, i] = mean_f
             end

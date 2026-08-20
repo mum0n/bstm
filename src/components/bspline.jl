@@ -131,6 +131,54 @@ function get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
+    _bspline_log_marginal_likelihood(y_residual, B_basis, Q_penalty, L_eig, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for a BSpline component with basis coefficients integrated out analytically.
+"""
+function _bspline_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    B_basis::AbstractMatrix,
+    Q_penalty::AbstractMatrix,
+    L_eig::AbstractVector,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    K = size(B_basis, 2)
+    T_num = promote_type(T, typeof(noise))
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    BTB = Matrix{T_num}(B_basis' * B_basis)
+    BTy = Vector{T_num}(B_basis' * y_residual)
+    
+    Q_base = Matrix{T_num}(Q_penalty) .+ (scale * inv_sigma_y2) .* BTB
+    for k in 1:K
+        Q_base[k, k] += T_num(noise)
+    end
+    
+    F = cholesky(Symmetric(Q_base))
+    
+    # RW2 has rank deficiency of 2
+    valid_eigs = L_eig[3:end]
+    log_det_prior = isempty(valid_eigs) ? zero(T_num) : sum(log.(valid_eigs .+ T_num(noise)))
+    log_det_diff = - max(K - 2, 1) * log(scale) + log_det_prior - 2 * sum(log.(diag(F.U)))
+    
+    b = BTy .* inv_sigma_y2
+    v = F.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
+"""
     get_priors(m::BSpline, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates priors for the standard deviation `sigma` and the raw innovations for
@@ -143,11 +191,18 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     sigma_prior_str = _distribution_to_string(m.sigma)
     
-    return """
-    # Priors for BSpline component: $(spec.key)
-    $(p_names.sigma) ~ $(sigma_prior_str)
-    $(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)
-    """
+    if m.method == :marginalized
+        return """
+        # Priors for BSpline component: $(spec.key)
+        $(p_names.sigma) ~ $(sigma_prior_str)
+        """
+    else
+        return """
+        # Priors for BSpline component: $(spec.key)
+        $(p_names.sigma) ~ $(sigma_prior_str)
+        $(p_names.ure) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)
+        """
+    end
 end
 
 """
@@ -180,11 +235,11 @@ function get_updates(
             diag_D[1] = 0.0
             diag_D[2] = 0.0
             
-            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
+            coeffs = hyper.U * (diag_D .* $(p_names.ure))
             
-            $(p_names.latent) = B_basis * coeffs
+            $(p_names.sre) = B_basis * coeffs
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -195,24 +250,22 @@ function get_updates(
             
             F = hyper.cholesky_factor
             
-            coeffs_raw = F.L' \\ $(p_names.innovations)
+            coeffs_unscaled = F.L' \\ $(p_names.ure)
             
             # Apply soft sum-to-zero constraints for RW2 penalty
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw[1:2])
+                Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_unscaled[1:2])
             )
             
-            coeffs = $(p_names.sigma) .* coeffs_raw
-            $(p_names.latent) = B_basis * coeffs
+            coeffs = $(p_names.sigma) .* coeffs_unscaled
+            $(p_names.sre) = B_basis * coeffs
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
     cholesky_sparse_code = """
         # --- B-Spline Smoother Component (Sparse Cholesky, Not AD-Safe): $(key) ---
-        # WARNING: This method is for didactic purposes and is NOT compatible with
-        # automatic differentiation (e.g., NUTS sampler).
         let
             $(common_code)
             
@@ -220,17 +273,35 @@ function get_updates(
             F = cholesky(Symmetric(Q_penalty + M.noise * I))
             
             L_sparse = sparse(F.L)
-            coeffs_raw = L_sparse' \\ $(p_names.innovations)
+            coeffs_unscaled = L_sparse' \\ $(p_names.ure)
             
             # Apply soft sum-to-zero constraints for RW2 penalty
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw[1:2])
+                Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_unscaled[1:2])
             )
             
-            coeffs = $(p_names.sigma) .* coeffs_raw
-            $(p_names.latent) = B_basis * coeffs
+            coeffs = $(p_names.sigma) .* coeffs_unscaled
+            $(p_names.sre) = B_basis * coeffs
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
+        end
+    """
+
+    marginalized_code = """
+        # --- B-Spline Smoother Component (Marginalized): $(key) ---
+        let
+            $(common_code)
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _bspline_log_marginal_likelihood(
+                y_residual,
+                B_basis,
+                hyper.Q_template,
+                hyper.L,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
@@ -240,8 +311,10 @@ function get_updates(
         return cholesky_code
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else
-        error("Unsupported method '$(m.method)' for BSpline component.")
+        error("Unsupported method '$(m.method)' for BSpline component. Use :spectral, :cholesky, :cholesky_sparse, or :marginalized.")
     end
 end
 
@@ -270,18 +343,17 @@ function get_effects(
     n_latent = hyper.n_latent
 
     # --- Basis Matrix Handling for Training and Prediction Sets ---
-    B_train = hyper.basis_matrix # This is already a Julia Array
+    B_train = hyper.basis_matrix
 
     coord_vars = get(spec.params, :positional_args, [])
     coord_var_sym = isempty(coord_vars) ? :none : Symbol(coord_vars[1])
 
-    B_full = if !isnothing(PS) && hasproperty(PS.data, coord_var_sym) # If prediction set is provided
-        coords_pred = PS.data[!, coord_var_sym] # Extract prediction coordinates
-        
-        B_pred, _ = bstm_bspline_basis(coords_pred, m.nbins, m.degree) # Generate basis for prediction data
+    B_full = if !isnothing(PS) && hasproperty(PS.data, coord_var_sym)
+        coords_pred = PS.data[!, coord_var_sym]
+        B_pred, _ = bstm_bspline_basis(coords_pred, m.nbins, m.degree)
         vcat(B_train, B_pred)
     else
-        B_train # Otherwise, use only training basis
+        B_train
     end
     N_total = size(B_full, 1)
 
@@ -290,47 +362,85 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        
-        # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(innovations_name)
+        if isempty(sigma_name)
             @warn "Parameters for BSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
+        sigma_samples = get_params_vector(chain, sigma_name, 1)
 
         # Initialize the output matrix for coefficients
         coeffs_samples_matrix = zeros(Float64, n_latent, n_samples)
 
         # --- Sample-wise Reconstruction ---
-        if m.method == :spectral
-            U = hyper.U # Already a Julia Array
-            L = hyper.L # Already a Julia Array
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
+            end
             
-            # Create a matrix of diag_D values, one column per sample (n_latent x n_samples)
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            BTB = Matrix{Float64}(B_train' * B_train)
+            BTy = Vector{Float64}(B_train' * y_vec)
+            
+            for i in 1:n_samples
+                sig = sigma_samples[i, 1]
+                y_sig = y_sigma_samples[i]
+                
+                scale = sig^2 + noise
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
+                
+                Q_base = Matrix{Float64}(hyper.Q_template) .+ (scale * inv_sigma_y2) .* BTB
+                for j in 1:n_latent
+                    Q_base[j, j] += noise
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = BTy .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(n_latent)
+                coeffs_i = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+                coeffs_samples_matrix[:, i] = coeffs_i
+            end
+        elseif m.method == :spectral
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "Innovations (ure) for BSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            ure_samples = get_params_matrix(chain, ure_name, n_latent)
+
+            U = hyper.U
+            L = hyper.L
+            
             diag_D_matrix = (sigma_samples' ./ sqrt.(L .+ noise))
-            for i in 1:m.degree+1 # diff_order is not stored, but degree+1 is a common choice for RW2
+            for i in 1:m.degree+1
                 diag_D_matrix[i, :] .= 0.0
             end
             
-            # U is [n_latent x n_latent], diag_D_matrix is [n_latent x n_samples], innovations_samples' is [n_latent x n_samples]
-            coeffs_samples_matrix = U * (diag_D_matrix .* innovations_samples')
-
+            coeffs_samples_matrix = U * (diag_D_matrix .* ure_samples')
         else # :cholesky or :cholesky_sparse
-            F = hyper.cholesky_factor # Already a Julia factorization object
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "Innovations (ure) for BSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            ure_samples = get_params_matrix(chain, ure_name, n_latent)
+
+            F = hyper.cholesky_factor
             for i in 1:n_samples
-                innov_i = innovations_samples[i, :] # Innovations for current sample
-                coeffs_raw = F.L' \ innov_i # Back-solve for raw coefficients
-                
-                # Centering based on sum-to-zero constraint for RW penalties
-                # The sum(coeffs_raw) is constrained in get_updates, so mean(coeffs_raw) is appropriate here.
-                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
+                innov_i = ure_samples[i, :]
+                coeffs_unscaled = F.L' \ innov_i
+                coeffs_centered = coeffs_unscaled .- mean(coeffs_unscaled)
                 coeffs_samples_matrix[:, i] = sigma_samples[i, 1] .* coeffs_centered
             end
         end

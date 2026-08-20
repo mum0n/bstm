@@ -123,7 +123,7 @@ function get_priors(
         push!(priors, "$(p_names.ls) ~ $(_distribution_to_string(m.lengthscale))")
     end
     
-    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
@@ -153,7 +153,7 @@ function get_updates(
         )
         
         # 2. Construct complex Fourier coefficients from standard normal innovations
-        innov_reshaped = reshape($(p_names.innovations), $(fill(res, n_dims)...))
+        innov_reshaped = reshape($(p_names.ure), $(fill(res, n_dims)...))
         f_tilde_complex = complex.(innov_reshaped)
         f_tilde_scaled = f_tilde_complex .* sqrt.(S_w)
 
@@ -163,9 +163,9 @@ function get_updates(
         # 4. Interpolate the grid values to the original observation coordinates
         itp = linear_interpolation(hyper.grid_ranges, latent_field_grid, extrapolation_bc=Flat())
         coords_for_itp = ntuple(d -> hyper.coords[:, d], $(n_dims))
-        $(p_names.latent) = itp(coords_for_itp...)
+        $(p_names.sre) = itp(coords_for_itp...)
         
-        $(eta_target) .+= $(p_names.latent)
+        $(eta_target) .+= $(p_names.sre)
     end
     """
 end
@@ -181,7 +181,11 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -213,9 +217,9 @@ function get_effects(
         sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
         ls_name = _find_parameter(p_names, string(v.ls), k, is_multivariate_model)
         nu_name = _find_parameter(p_names, string(v.nu), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(ls_name) || isempty(nu_name) || isempty(innovations_name)
+        if isempty(sigma_name) || isempty(ls_name) || isempty(nu_name) || isempty(ure_name)
             @warn "Parameters for SpectralGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total_eff, n_samples))
             continue
@@ -226,7 +230,7 @@ function get_effects(
         ls_dim = m.lengthscale isa Vector ? n_dims : 1
         ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
         nu_samples_cpu = get_params_vector(chain, nu_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
+        ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
 
         # Initialize the output matrix for the full effect on the CPU
         effect_k_cpu = zeros(Float64, N_total_eff, n_samples)
@@ -236,7 +240,7 @@ function get_effects(
             current_sigma = sigma_samples_cpu[i]
             current_nu = nu_samples_cpu[i]
             current_ls = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
-            current_innovations = innovations_samples_cpu[i, :]
+            current_innovations = ure_samples_cpu[i, :]
             
             # 1. Compute Power Spectral Density on the CPU
             S_w = anisotropic_matern_spectral_density(

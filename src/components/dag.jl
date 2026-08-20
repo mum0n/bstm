@@ -89,7 +89,7 @@ function get_priors(
     return """
     $(p_names.rho) ~ $(_distribution_to_string(m.rho))
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)
+    $(p_names.ure) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)
     """
 end
 
@@ -110,13 +110,13 @@ function get_updates(
         # --- DAG Component (Forward Substitution): $(key) ---
         let
             W_dag = spec_registry[:$(key)].hyper.Q_template
-            innovations = $(p_names.innovations)
+            ure_val = $(p_names.ure)
             rho_val = $(p_names.rho)
             sigma_val = $(p_names.sigma)
             n_latent = spec_registry[:$(key)].hyper.n_latent
 
-            T_num = promote_type(typeof(rho_val), eltype(innovations))
-            $(p_names.latent) = zeros(T_num, n_latent)
+            T_num = promote_type(typeof(rho_val), eltype(ure_val))
+            $(p_names.sre) = zeros(T_num, n_latent)
 
             # Iterate through nodes in topological order (assumed by W_dag structure)
             for i in 1:n_latent
@@ -124,14 +124,14 @@ function get_updates(
                 # Sum contributions from parents (non-zero elements in the row of W_dag)
                 for j_ptr in nzrange(W_dag, i)
                     parent_idx = W_dag.rowval[j_ptr]
-                    parent_effect += W_dag.nzval[j_ptr] * $(p_names.latent)[parent_idx]
+                    parent_effect += W_dag.nzval[j_ptr] * $(p_names.sre)[parent_idx]
                 end
                 # Recursive relationship: phi_i = rho * sum(W_ij * phi_j) + epsilon_i
-                $(p_names.latent)[i] = rho_val * parent_effect + innovations[i]
+                $(p_names.sre)[i] = rho_val * parent_effect + ure_val[i]
             end
-            $(p_names.latent) .*= sigma_val # Scale the entire field by sigma
+            $(p_names.sre) .*= sigma_val # Scale the entire field by sigma
             
-            $(eta_target) .+= view($(p_names.latent), M.s_idx) # Apply to linear predictor
+            $(eta_target) .+= view($(p_names.sre), M.s_idx) # Apply to linear predictor
         end
     """
 
@@ -145,10 +145,10 @@ function get_updates(
             # Use dense Cholesky for AD-safety
             F = cholesky(Symmetric(Matrix(Q) + M.noise * I))
             
-            # Non-centered parameterization: latent = sigma * L_inv * innovations
-            $(p_names.latent) = $(p_names.sigma) .* (F.U \\ $(p_names.innovations))
+            # Non-centered parameterization: sre = sigma * L_inv * ure
+            $(p_names.sre) = $(p_names.sigma) .* (F.U \\ $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.latent), M.s_idx) # Apply to linear predictor
+            $(eta_target) .+= view($(p_names.sre), M.s_idx) # Apply to linear predictor
         end
     """
 
@@ -206,9 +206,9 @@ function get_effects(
         # Find parameter names in the MCMC chain
         rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
 
-        if isempty(rho_name) || isempty(sigma_name) || isempty(innovations_name)
+        if isempty(rho_name) || isempty(sigma_name) || isempty(ure_name)
             @warn "Parameters for DAG component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -217,7 +217,7 @@ function get_effects(
         # Extract posterior samples (these are on the CPU)
         rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
+        ure_samples = get_params_matrix(chain, ure_name, n_latent) # (n_samples, n_latent)
         
         # Initialize the output matrix for latent effects
         latent_field_matrix = zeros(Float64, n_latent, n_samples)
@@ -225,7 +225,7 @@ function get_effects(
         # --- Sample-wise Reconstruction ---
         if m.method == :forward_substitution
             for i in 1:n_samples
-                innov_i = innovations_samples[i, :]
+                innov_i = ure_samples[i, :]
                 latent_field_i = zeros(Float64, n_latent)
                 
                 for j in 1:n_latent
@@ -240,7 +240,7 @@ function get_effects(
             end
         else # :precision
             for i in 1:n_samples
-                innov_i = innovations_samples[i, :]
+                innov_i = ure_samples[i, :]
                 
                 L_op = I - rho_samples[i, 1] * W_dag
                 Q = L_op' * L_op
@@ -250,6 +250,7 @@ function get_effects(
                 latent_field_matrix[:, i] = latent_field_i
             end
         end
+
         # Index the reconstructed latent effects to match the observation indices
         indexed_effects = latent_field_matrix[s_idx_full, :]
         push!(structured_effects, indexed_effects)

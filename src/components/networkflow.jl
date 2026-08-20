@@ -81,7 +81,7 @@ function get_precomputes(m::NetworkFlow, M::NamedTuple, mod_data::Dict)::NamedTu
 
     if habitat_val isa Symbol
         if !hasproperty(data, habitat_val)
-            error("Habitat variable ':' not found in the data frame.")
+            error("Habitat variable ':$habitat_val' not found in the data frame.")
         end
         # Aggregate habitat data to spatial units if it's per-observation
         habitat_per_obs = data[!, habitat_val]
@@ -122,7 +122,7 @@ function get_priors(
 
     push!(priors, "$(p_names.beta) ~ $(_distribution_to_string(m.beta))")
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.innovations))")
+    push!(priors, "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.ure))")
 
     return join(priors, "\n    ")
 end
@@ -157,9 +157,9 @@ function get_updates(
             $(common_code)
             
             F = cholesky(Symmetric(Matrix(Q_beta) + M.noise * I))
-            $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
+            $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -169,9 +169,9 @@ function get_updates(
             $(common_code)
             
             F = cholesky(Symmetric(Q_beta + M.noise * I))
-            $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
+            $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -225,12 +225,13 @@ function get_effects(
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k_outcome in 1:outcomes_N
-        beta_name = _find_parameter(p_names, string(spec.key), "beta", k_outcome, is_multivariate_model)
-        sigma_name = _find_parameter(p_names, string(spec.key), "sigma", k_outcome, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(spec.key), "innovations", k_outcome, is_multivariate_model)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
+        beta_name = _find_parameter(p_names, string(p_names_k.beta), k_outcome, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome, is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(p_names_k.ure), k_outcome, is_multivariate_model)
 
-        if isempty(beta_name) || isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for NetworkFlow component $(key) (outcome $k_outcome) not found. Returning zero-matrix."
+        if isempty(beta_name) || isempty(sigma_name) || isempty(ure_name)
+            @warn "Parameters for NetworkFlow component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
@@ -238,7 +239,7 @@ function get_effects(
         # Extract posterior samples (these are on the CPU)
         beta_samples = get_params_vector(chain, beta_name, 1)[:, 1]
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_matrix(chain, innovations_name, s_N)
+        ure_samples = get_params_matrix(chain, ure_name, s_N)
         
         # Initialize the output matrix for the full latent field on the CPU
         reconstructed_effects_k = zeros(Float64, s_N, n_samples)
@@ -254,7 +255,7 @@ function get_effects(
             # Perform factorization on CPU
             F_i = cholesky(Symmetric(Matrix(Q_beta_i) + noise * I))
             
-            innov_i = innovations_samples[i, :]
+            innov_i = ure_samples[i, :]
             
             reconstructed_effects_k[:, i] = sigma_samples[i] .* (F_i.L' \ innov_i)
         end

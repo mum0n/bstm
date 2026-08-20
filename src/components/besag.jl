@@ -104,6 +104,24 @@ function get_precomputes(m::Besag, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
+    _besag_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for a Besag (ICAR) spatial component integrated out analytically.
+"""
+function _besag_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    s_idx::AbstractVector{Int},
+    s_N::Int,
+    Q_template::AbstractMatrix,
+    L_eig::AbstractVector,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    return _icar_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, sigma, y_sigma, noise)
+end
+
+"""
     get_priors(m::Besag, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates priors for the scale parameter `sigma` and the raw innovations `innovations`.
@@ -115,22 +133,18 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     n_latent = spec.hyper.n_latent
     
-    return """
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
-    """
+    if m.method == :marginalized
+        return """
+        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        """
+    else
+        return """
+        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)
+        """
+    end
 end
 
-
-"""
-    get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx, M)::String
-
-Generates code to sample the latent spatial field. Supports three methods:
-- `:spectral` (default): An efficient, AD-safe method using spectral decomposition.
-- `:cholesky`: An AD-safe didactic alternative using dense Cholesky factorization.
-- `:cholesky_sparse`: A non-AD-safe didactic method using sparse Cholesky
-  factorization, suitable for gradient-free samplers.
-"""
 function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
@@ -143,9 +157,9 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0
             
-            $(p_names.latent) = hyper.U * (diag_D .* $(p_names.innovations))
+            $(p_names.sre) = hyper.U * (diag_D .* $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -153,11 +167,11 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
         # --- Besag Component (Dense Cholesky): $(key) ---
         let
             F = spec_registry[:$(key)].hyper.cholesky_factor
-            latent_field_raw = F.L' \\ $(p_names.innovations)
-            latent_field_centered = latent_field_raw .- mean(latent_field_raw)
+            sre_unscaled = F.L' \\ $(p_names.ure)
+            sre_centered = sre_unscaled .- mean(sre_unscaled)
             
-            $(p_names.latent) = latent_field_centered .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(p_names.sre) = sre_centered .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -168,12 +182,31 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
             F = cholesky(Symmetric(Q + M.noise * I))
             
             L_sparse = sparse(F.L)
-            latent_field_raw = L_sparse' \\ $(p_names.innovations)
+            sre_unscaled = L_sparse' \\ $(p_names.ure)
             
-            latent_field_centered = latent_field_raw .- mean(latent_field_raw)
+            sre_centered = sre_unscaled .- mean(sre_unscaled)
             
-            $(p_names.latent) = latent_field_centered .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(p_names.sre) = sre_centered .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+        end
+    """
+
+    marginalized_code = """
+        # --- Besag Component (Marginalized): $(key) ---
+        let
+            hyper = spec_registry[:$(key)].hyper
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _besag_log_marginal_likelihood(
+                y_residual,
+                M.s_idx,
+                hyper.n_latent,
+                hyper.Q_template,
+                hyper.L,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
@@ -183,8 +216,10 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
         return cholesky_code
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else
-        error("Unsupported method '$(m.method)' for Besag component.")
+        error("Unsupported method '$(m.method)' for Besag component. Use :spectral, :cholesky, :cholesky_sparse, or :marginalized.")
     end
 end
 
@@ -226,12 +261,9 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        
-        # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(innovations_name)
+        if isempty(sigma_name)
             @warn "Parameters for Besag component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -239,38 +271,89 @@ function get_effects(
 
         # Extract posterior samples (these are on the CPU)
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
 
         # Initialize the output matrix for latent effects
         effect_k_latent = zeros(Float64, n_latent, n_samples)
 
         # --- Sample-wise Reconstruction ---
-        if m.method == :spectral
-            U = spec.hyper.U
-            L = spec.hyper.L
-            
-            for j in 1:n_samples
-                sigma_j = sigma_samples[j, 1] # Scalar sigma for current sample
-                innov_j = innovations_samples[j, :] # Vector of innovations for current sample
-                
-                # Apply spectral transformation
-                diag_D = sigma_j ./ sqrt.(L .+ noise)
-                diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-                effect_k_latent[:, j] = U * (diag_D .* innov_j)
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
             end
-        else # :cholesky or :cholesky_sparse
-            # For reconstruction, use the pre-computed Cholesky factor
-            F = spec.hyper.cholesky_factor
+            
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            
+            N_s = zeros(Float64, n_latent)
+            S_s = zeros(Float64, n_latent)
+            for i in 1:length(s_idx_train)
+                s = s_idx_train[i]
+                if 1 <= s <= n_latent
+                    N_s[s] += 1.0
+                    S_s[s] += y_vec[i]
+                end
+            end
+            
+            Q_template = spec.hyper.Q_template
             
             for j in 1:n_samples
-                sigma_j = sigma_samples[j, 1]
-                innov_j = innovations_samples[j, :]
+                sig = sigma_samples[j, 1]
+                y_sig = y_sigma_samples[j]
+                
+                scale = sig^2 + noise
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
+                
+                Q_base = Matrix{Float64}(Q_template)
+                for s in 1:n_latent
+                    Q_base[s, s] += noise + N_s[s] * inv_sigma_y2 * scale
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = S_s .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(n_latent)
+                x_train = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+                x_train .-= mean(x_train)
+                effect_k_latent[:, j] = x_train
+            end
+        else
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "Innovations (ure) for Besag component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            ure_samples = get_params_matrix(chain, ure_name, n_latent)
 
-                latent_field_raw = F.L' \ innov_j
-                latent_field_centered = latent_field_raw .- mean(latent_field_raw)
-                effect_k_latent[:, j] = latent_field_centered .* sigma_j
+            if m.method == :spectral
+                U = spec.hyper.U
+                L = spec.hyper.L
+                
+                for j in 1:n_samples
+                    sigma_j = sigma_samples[j, 1]
+                    innov_j = ure_samples[j, :]
+                    
+                    diag_D = sigma_j ./ sqrt.(L .+ noise)
+                    diag_D[1] = 0.0
+                    effect_k_latent[:, j] = U * (diag_D .* innov_j)
+                end
+            else # :cholesky or :cholesky_sparse
+                F = spec.hyper.cholesky_factor
+                
+                for j in 1:n_samples
+                    sigma_j = sigma_samples[j, 1]
+                    innov_j = ure_samples[j, :]
+
+                    sre_unscaled = F.L' \ innov_j
+                    sre_centered = sre_unscaled .- mean(sre_unscaled)
+                    effect_k_latent[:, j] = sre_centered .* sigma_j
+                end
             end
         end
+
         # Index the reconstructed latent effects to match the observation indices
         indexed_effects = effect_k_latent[s_idx_full, :]
         push!(structured_effects, indexed_effects)

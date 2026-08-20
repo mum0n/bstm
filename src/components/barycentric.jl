@@ -135,6 +135,63 @@ function get_precomputes(
 end
 
 """
+    _barycentric_log_marginal_likelihood(y_residual, B_basis, Q_prior, L_eig, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for a Barycentric smoother with knot coefficients integrated out analytically.
+"""
+function _barycentric_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    B_basis::AbstractMatrix,
+    Q_prior::Union{AbstractMatrix, Nothing},
+    L_eig::Union{AbstractVector, Nothing},
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    K = size(B_basis, 2)
+    T_num = promote_type(T, typeof(noise))
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    BTB = Matrix{T_num}(B_basis' * B_basis)
+    BTy = Vector{T_num}(B_basis' * y_residual)
+    
+    Q_base = if !isnothing(Q_prior)
+        Matrix{T_num}(Q_prior) .+ (scale * inv_sigma_y2) .* BTB
+    else
+        Matrix{T_num}(I, K, K) .+ (scale * inv_sigma_y2) .* BTB
+    end
+    
+    for k in 1:K
+        Q_base[k, k] += T_num(noise)
+    end
+    
+    F = cholesky(Symmetric(Q_base))
+    
+    log_det_diff = if !isnothing(L_eig)
+        # Rank-deficient GMRF
+        valid_eigs = L_eig[2:end]
+        log_det_prior = isempty(valid_eigs) ? zero(T_num) : sum(log.(valid_eigs .+ T_num(noise)))
+        - max(K - 1, 1) * log(scale) + log_det_prior - 2 * sum(log.(diag(F.U)))
+    else
+        - K * log(scale) - 2 * sum(log.(diag(F.U)))
+    end
+    
+    b = BTy .* inv_sigma_y2
+    v = F.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
+"""
     get_priors(m::Barycentric, spec::NamedTuple, arch::String, outcome_idx, M)
 
 Generates priors for the basis coefficients and scale, dispatching on the method.
@@ -151,10 +208,9 @@ function get_priors(
               ":$(p_names.sigma))"]
 
     if m.method in [:noncentered, :gmrfsmooth]
-        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_knots)), I)")
+        push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, $(n_knots)), I)")
     elseif m.method == :centered
-        # The 'latent' variable serves as the raw innovations for the centered method
-        push!(priors, "$(p_names.latent) ~ MvNormal(zeros(T, $(n_knots)), I)")
+        push!(priors, "$(p_names.sre) ~ MvNormal(zeros(T, $(n_knots)), I)")
     end
 
     return join(priors, "\n    ")
@@ -182,18 +238,18 @@ function get_updates(
     noncentered_code = """
         # --- Barycentric Component (Non-Centered): $(key) ---
         $(common_code)
-            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
-            barycentric_effect = B * scaled_coeffs
-            $(eta_target) .+= barycentric_effect
+            scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
+            $(p_names.sre) = B * scaled_coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
     centered_code = """
         # --- Barycentric Component (Centered): $(key) ---
         $(common_code)
-            scaled_coeffs = $(p_names.latent) .* $(p_names.sigma)
-            barycentric_effect = B * scaled_coeffs
-            $(eta_target) .+= barycentric_effect
+            scaled_coeffs = $(p_names.sre) .* $(p_names.sigma)
+            $(p_names.sre) = B * scaled_coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -204,16 +260,36 @@ function get_updates(
             L = hyper.L
             diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
             diag_D[1] = 0.0
-            coeffs = U * (diag_D .* $(p_names.innovations))
-            barycentric_effect = B * coeffs
-            $(eta_target) .+= barycentric_effect
+            coeffs = U * (diag_D .* $(p_names.ure))
+            $(p_names.sre) = B * coeffs
+            $(eta_target) .+= $(p_names.sre)
+        end
+    """
+
+    marginalized_code = """
+        # --- Barycentric Component (Marginalized): $(key) ---
+        $(common_code)
+            y_residual = M.y_obs .- $(eta_target)
+            Q_mat = haskey(hyper, :Q_template) ? hyper.Q_template : nothing
+            L_vec = haskey(hyper, :L) ? hyper.L : nothing
+            log_lik_marginalized_$(key) = _barycentric_log_marginal_likelihood(
+                y_residual,
+                B,
+                Q_mat,
+                L_vec,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
     if m.method == :noncentered; return noncentered_code;
     elseif m.method == :centered; return centered_code;
     elseif m.method == :gmrfsmooth; return gmrfsmooth_code;
-    else; error("Unsupported method '$(m.method)' for Barycentric component."); end
+    elseif m.method == :marginalized; return marginalized_code;
+    else; error("Unsupported method '$(m.method)' for Barycentric component. Use :noncentered, :centered, :gmrfsmooth, or :marginalized."); end
 end
 
 """
@@ -234,7 +310,7 @@ function get_effects(
     end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = string.(names(DataFrame(chain)))
+    p_names = string.(keys(chain))
     noise_val = get(M, :noise, 1e-6)
     n_knots = spec.hyper.n_knots
 
@@ -274,33 +350,65 @@ function get_effects(
         # Initialize the output matrix for coefficients on the CPU
         coeffs_samples_matrix = zeros(Float64, n_knots, n_samples)
         
-        if m.method == :centered
-            latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
-            if !isempty(latent_name)
-                # get_params_vector returns [n_samples x n_params], so we transpose it
-                latent_samples = get_params_vector(chain, latent_name, n_knots)'
-                coeffs_samples_matrix = latent_samples .* sigma_samples'
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
             else
-                @warn "Latent coefficients for centered Barycentric component $(spec.key) (outcome $k) not found. Using zeros."
+                fill(1.0, n_samples)
+            end
+            
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            BTB = Matrix{Float64}(B_train' * B_train)
+            BTy = Vector{Float64}(B_train' * y_vec)
+            Q_prior = haskey(spec.hyper, :Q_template) ? spec.hyper.Q_template : Matrix{Float64}(I, n_knots, n_knots)
+            
+            for i in 1:n_samples
+                sig = sigma_samples[i]
+                y_sig = y_sigma_samples[i]
+                
+                scale = sig^2 + noise_val
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise_val)
+                
+                Q_base = Matrix{Float64}(Q_prior) .+ (scale * inv_sigma_y2) .* BTB
+                for j in 1:n_knots
+                    Q_base[j, j] += noise_val
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = BTy .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(n_knots)
+                coeffs_samples_matrix[:, i] = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+            end
+        elseif m.method == :centered
+            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
+            if !isempty(sre_name)
+                # get_params_vector returns [n_samples x n_params], so we transpose it
+                sre_samples = get_params_vector(chain, sre_name, n_knots)'
+                coeffs_samples_matrix = sre_samples .* sigma_samples'
+            else
+                @warn "Latent coefficients (sre) for centered Barycentric component $(spec.key) (outcome $k) not found. Using zeros."
             end
         else # :noncentered or :gmrfsmooth
-            innov_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
-            if !isempty(innov_name)
-                innov_samples = get_params_vector(chain, innov_name, n_knots)' # Transpose to [n_knots x n_samples]
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if !isempty(ure_name)
+                ure_samples = get_params_vector(chain, ure_name, n_knots)' # Transpose to [n_knots x n_samples]
                 
                 if m.method == :noncentered
-                    coeffs_samples_matrix = innov_samples .* sigma_samples'
+                    coeffs_samples_matrix = ure_samples .* sigma_samples'
                 else # :gmrfsmooth
                     U = spec.hyper.U
                     L = spec.hyper.L
                     for i in 1:n_samples
                         diag_D = sigma_samples[i] ./ sqrt.(L .+ noise_val)
                         diag_D[1] = 0.0 # Assuming L[1] corresponds to the rank-deficient mode
-                        coeffs_samples_matrix[:, i] = U * (diag_D .* innov_samples[:, i])
+                        coeffs_samples_matrix[:, i] = U * (diag_D .* ure_samples[:, i])
                     end
                 end
             else
-                 @warn "Innovations for Barycentric component $(spec.key) (outcome $k) not found. Using zeros."
+                 @warn "Innovations (ure) for Barycentric component $(spec.key) (outcome $k) not found. Using zeros."
             end
         end
         

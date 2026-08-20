@@ -38,7 +38,8 @@ where:
 - `unconstrained_rho_<key>`: The unconstrained mixing parameter.
 - `sigma_<key>`: The marginal standard deviation.
 - `struct_<key>`: Raw standard normal innovations for the structured (ICAR) component.
-- `iid_<key>`: Raw standard normal innovations for the unstructured (IID) component.
+- `sre_<key>`: Raw standard normal innovations for the structured (ICAR) component.
+- `ure_<key>`: Raw standard normal innovations for the unstructured (IID) component.
 - `latent_<key>`: The reconstructed latent BYM2 effect.
 
 # Key References
@@ -46,15 +47,20 @@ where:
 - Besag, J., York, J., & Mollié, A. (1991). *Bayesian image restoration, with applications in spatial statistics*. Annals of the Institute of Statistical Mathematics, 43(1), 1-20.
 """
 struct BYM2 <: ComponentModel
-    unconstrained_rho::UnivariateDistribution
+    rho_unconstrained::UnivariateDistribution
     sigma::UnivariateDistribution
     method::Symbol
 end
 
+Base.getproperty(m::BYM2, s::Symbol) = (
+    s === :unconstrained_rho ? getfield(m, :rho_unconstrained) :
+    getfield(m, s)
+)
+
 COMPONENT_TYPE_REGISTRY[:bym2] = BYM2
 
 COMPONENT_CONSTRUCTORS[:bym2] = (p, params) -> BYM2(
-    get(p, :unconstrained_rho, Normal(0, 0.5)),
+    get(p, :rho_unconstrained, get(p, :unconstrained_rho, Normal(0, 0.5))),
     p.sigma,
     get(params, :method, :spectral)
 )
@@ -79,20 +85,94 @@ function get_precomputes(m::BYM2, M::NamedTuple, mod_data::Dict)::NamedTuple
               "model configuration.")
     end
 
-    # build_structure_template returns CPU arrays
-    template = build_structure_template(:bym2, s_N; W=M.W)
+    template = build_structure_template(:besag, s_N; W=M.W)
+    Q_template = template.matrix
     
-    # Pre-compute the dense Cholesky factor for the :cholesky method on the CPU
-    F_cpu = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
+    eig_decomp = eigen(Symmetric(Matrix(Q_template)))
+    U = eig_decomp.vectors
+    L = eig_decomp.values
+    scaling_factor = _compute_scaling_factor(L, 1)
+
+    Q_template_scaled = Q_template ./ scaling_factor
+    L_scaled = L ./ scaling_factor
+
+    F = cholesky(Symmetric(Matrix(Q_template_scaled) + M.noise * I))
 
     return (
-        Q_template=template.matrix,
-        U=template.U,
-        L=template.L,
-        scaling_factor=template.scaling_factor,
+        Q_template=Q_template_scaled,
+        scaling_factor=scaling_factor,
+        U=U,
+        L=L_scaled,
         n_latent=s_N,
-        cholesky_factor=F_cpu
+        cholesky_factor=F
     )
+end
+
+"""
+    _bym2_log_marginal_likelihood(y_residual, s_idx, s_N, U, L_eig, rho, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for a BYM2 spatial component integrated out analytically.
+"""
+function _bym2_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    s_idx::AbstractVector{Int},
+    s_N::Int,
+    U::AbstractMatrix,
+    L_eig::AbstractVector,
+    rho::T,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    T_num = promote_type(T, typeof(noise))
+    
+    # Pre-accumulate observation counts and residual sums per region
+    N_s = zeros(T_num, s_N)
+    S_s = zeros(T_num, s_N)
+    for i in 1:N
+        s = s_idx[i]
+        if 1 <= s <= s_N
+            N_s[s] += one(T_num)
+            S_s[s] += y_residual[i]
+        end
+    end
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    # Prior covariance eigenvalues in spectral basis
+    lambda_rho = Vector{T_num}(undef, s_N)
+    lambda_rho[1] = (one(T_num) - rho) + T_num(noise)
+    for j in 2:s_N
+        lambda_rho[j] = rho / (L_eig[j] + T_num(noise)) + (one(T_num) - rho) + T_num(noise)
+    end
+    inv_lambda = one(T_num) ./ lambda_rho
+    
+    # Prior precision matrix Q_prior = U * Diag(inv_lambda) * U'
+    Q_prior = Matrix{T_num}(U * Diagonal(inv_lambda) * U')
+    
+    # Posterior precision matrix Q_post = Q_prior + (scale / y_sigma^2) * Diag(N_s)
+    Q_base = copy(Q_prior)
+    for s in 1:s_N
+        Q_base[s, s] += T_num(noise) + N_s[s] * inv_sigma_y2 * scale
+    end
+    
+    F_post = cholesky(Symmetric(Q_base))
+    
+    log_det_prior = - sum(log.(lambda_rho)) - s_N * log(scale)
+    log_det_diff = log_det_prior - 2 * sum(log.(diag(F_post.U)))
+    
+    b = S_s .* inv_sigma_y2
+    v = F_post.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
 end
 
 """
@@ -108,12 +188,19 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     n_latent = spec.hyper.n_latent
     
-    return """
-    $(p_names.unconstrained_rho) ~ $(_distribution_to_string(m.unconstrained_rho))
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.struct) ~ MvNormal(zeros(T, $(n_latent)), I)
-    $(p_names.iid) ~ MvNormal(zeros(T, $(n_latent)), I)
-    """
+    if m.method == :marginalized
+        return """
+        $(p_names.rho_unconstrained) ~ $(_distribution_to_string(m.rho_unconstrained))
+        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        """
+    else
+        return """
+        $(p_names.rho_unconstrained) ~ $(_distribution_to_string(m.rho_unconstrained))
+        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), I)
+        $(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)
+        """
+    end
 end
 
 """
@@ -134,20 +221,20 @@ function get_updates(
         # --- BYM2 Component (Spectral): $(key) ---
         let
             hyper = spec_registry[:$(key)].hyper
-            rho = logistic($(p_names.unconstrained_rho))
+            rho = logistic($(p_names.rho_unconstrained))
             
             # Construct the diagonal of the spectral transformation matrix D on CPU
             diag_D_cpu = 1.0 ./ sqrt.(hyper.L .+ M.noise)
             diag_D_cpu[1] = 0.0 # Enforce sum-to-zero constraint
             
             # Apply the spectral transformation: latent = U * D * z
-            structured_effect = hyper.U * (diag_D_cpu .* $(p_names.struct))
+            structured_effect = hyper.U * (diag_D_cpu .* $(p_names.sre))
             
             # Combine structured and unstructured components
-            $(p_names.latent) = $(p_names.sigma) .* (sqrt(rho) .* structured_effect .+ 
-                                sqrt(1.0 - rho) .* $(p_names.iid))
+            local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* structured_effect .+ 
+                                sqrt(1.0 - rho) .* $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(eta_target) .+= view(combined_effect, M.s_idx)
         end
     """
 
@@ -155,17 +242,17 @@ function get_updates(
         # --- BYM2 Component (Cholesky, AD-Safe): $(key) ---
         let
             hyper = spec_registry[:$(key)].hyper
-            rho = logistic($(p_names.unconstrained_rho))
+            rho = logistic($(p_names.rho_unconstrained))
             F = hyper.cholesky_factor
             
-            struct_latent_raw = F.L' \\\\ $(p_names.struct)
+            sre_unscaled = F.L' \\ $(p_names.sre)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), 
-                                       sum(struct_latent_raw))
+                                       sum(sre_unscaled))
             
-            $(p_names.latent) = $(p_names.sigma) .* (sqrt(rho) .* struct_latent_raw .+ 
-                                sqrt(1.0 - rho) .* $(p_names.iid))
+            local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* sre_unscaled .+ 
+                                sqrt(1.0 - rho) .* $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(eta_target) .+= view(combined_effect, M.s_idx)
         end
     """
 
@@ -173,25 +260,47 @@ function get_updates(
         # --- BYM2 Component (Sparse Cholesky, Not AD-Safe): $(key) ---
         let
             hyper = spec_registry[:$(key)].hyper
-            rho = logistic($(p_names.unconstrained_rho))
+            rho = logistic($(p_names.rho_unconstrained))
             Q_penalty = hyper.Q_template
             F = cholesky(Symmetric(Q_penalty + M.noise * I))
             
-            struct_latent_raw = F.L' \\\\ $(p_names.struct)
+            sre_unscaled = F.L' \\ $(p_names.sre)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), 
-                                       sum(struct_latent_raw))
+                                       sum(sre_unscaled))
             
-            $(p_names.latent) = $(p_names.sigma) .* (sqrt(rho) .* struct_latent_raw .+ 
-                                sqrt(1.0 - rho) .* $(p_names.iid))
+            local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* sre_unscaled .+ 
+                                sqrt(1.0 - rho) .* $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(eta_target) .+= view(combined_effect, M.s_idx)
+        end
+    """
+
+    marginalized_code = """
+        # --- BYM2 Component (Marginalized): $(key) ---
+        let
+            hyper = spec_registry[:$(key)].hyper
+            rho = logistic($(p_names.rho_unconstrained))
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _bym2_log_marginal_likelihood(
+                y_residual,
+                M.s_idx,
+                hyper.n_latent,
+                hyper.U,
+                hyper.L,
+                rho,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
     if m.method == :spectral; return spectral_code;
     elseif m.method == :cholesky; return cholesky_code;
     elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
-    else; error("Unsupported method '$(m.method)' for BYM2 component."); end
+    elseif m.method == :marginalized; return marginalized_code;
+    else; error("Unsupported method '$(m.method)' for BYM2 component. Use :spectral, :cholesky, :cholesky_sparse, or :marginalized."); end
 end
 
 """
@@ -232,12 +341,11 @@ function get_effects(
     total_effects = Vector{Matrix{Float64}}()
 
     for k in 1:outcomes_N
-        sigma_name = _find_parameter(p_names, string(spec.key), "sigma", k, is_multivariate)
-        rho_name = _find_parameter(p_names, string(spec.key), "unconstrained_rho", k, is_multivariate)
-        struct_innov_name = _find_parameter(p_names, string(spec.key), "struct", k, is_multivariate)
-        iid_innov_name = _find_parameter(p_names, string(spec.key), "iid", k, is_multivariate)
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate)
+        rho_name = _find_parameter(p_names, string(p_names_k.rho_unconstrained), k, is_multivariate)
 
-        if isempty(sigma_name) || isempty(rho_name) || isempty(struct_innov_name) || isempty(iid_innov_name)
+        if isempty(sigma_name) || isempty(rho_name)
             @warn "Parameters for BYM2 component $(spec.key) (outcome $(k)) not found. Returning zero-matrices."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             push!(unstructured_effects, zeros(Float64, N_total, n_samples))
@@ -247,32 +355,110 @@ function get_effects(
 
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         rho_samples = logistic.(get_params_vector(chain, rho_name, 1)) # (n_samples, 1)
-        struct_innov_samples = get_params_matrix(chain, struct_innov_name, n_latent) # (n_samples, n_latent)
-        iid_innov_samples = get_params_matrix(chain, iid_innov_name, n_latent) # (n_samples, n_latent)
 
         structured_latent = zeros(Float64, n_latent, n_samples)
         unstructured_latent = zeros(Float64, n_latent, n_samples)
         
         hyper = spec.hyper
 
-        for i in 1:n_samples # Iterate over each posterior sample
-            struct_innov_i = struct_innov_samples[i, :] # Innovations for structured component for current sample
-            
-            local struct_effect_raw # Raw structured effect before scaling
-            if m.method == :spectral
-                U = hyper.U
-                L = hyper.L
-                diag_D = 1.0 ./ sqrt.(L .+ noise)
-                diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-                struct_effect_raw = U * (diag_D .* struct_innov_i)
-            else # :cholesky or :cholesky_sparse (use pre-computed dense Cholesky factor)
-                F = hyper.cholesky_factor
-                struct_effect_raw = F.L' \ struct_innov_i # Back-solve for raw structured effect
-                struct_effect_raw .-= mean(struct_effect_raw)
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
             end
             
-            structured_latent[:, i] = sigma_samples[i, 1] * sqrt(rho_samples[i, 1]) * struct_effect_raw
-            unstructured_latent[:, i] = sigma_samples[i, 1] * sqrt(1.0 - rho_samples[i, 1]) * iid_innov_samples[i, :]
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            
+            N_s = zeros(Float64, n_latent)
+            S_s = zeros(Float64, n_latent)
+            for i in 1:length(M.s_idx)
+                s = M.s_idx[i]
+                if 1 <= s <= n_latent
+                    N_s[s] += 1.0
+                    S_s[s] += y_vec[i]
+                end
+            end
+            
+            U = hyper.U
+            L_eig = hyper.L
+            
+            for i in 1:n_samples # Iterate over each posterior sample
+                sig = sigma_samples[i, 1]
+                rho_val = rho_samples[i, 1]
+                y_sig = y_sigma_samples[i]
+                
+                scale = sig^2 + noise
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
+                
+                lambda_rho = Vector{Float64}(undef, n_latent)
+                lambda_rho[1] = (1.0 - rho_val) + noise
+                for j in 2:n_latent
+                    lambda_rho[j] = rho_val / (L_eig[j] + noise) + (1.0 - rho_val) + noise
+                end
+                inv_lambda = 1.0 ./ lambda_rho
+                
+                Q_prior = Matrix{Float64}(U * Diagonal(inv_lambda) * U')
+                Q_base = copy(Q_prior)
+                for s in 1:n_latent
+                    Q_base[s, s] += noise + N_s[s] * inv_sigma_y2 * scale
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = S_s .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(n_latent)
+                phi = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+                
+                # Decompose into structured and unstructured components via spectral Wiener filtering
+                weights_struct = Vector{Float64}(undef, n_latent)
+                weights_struct[1] = 0.0
+                for j in 2:n_latent
+                    weights_struct[j] = (rho_val / (L_eig[j] + noise)) / lambda_rho[j]
+                end
+                
+                theta = U * (weights_struct .* (U' * phi))
+                eps_vec = phi .- theta
+                
+                structured_latent[:, i] = theta
+                unstructured_latent[:, i] = eps_vec
+            end
+        else
+            sre_innov_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate)
+            ure_innov_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate)
+
+            if isempty(sre_innov_name) || isempty(ure_innov_name)
+                @warn "Innovations (sre/ure) for BYM2 component $(spec.key) (outcome $(k)) not found. Returning zero-matrices."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                push!(unstructured_effects, zeros(Float64, N_total, n_samples))
+                push!(total_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+
+            sre_innov_samples = get_params_matrix(chain, sre_innov_name, n_latent)
+            ure_innov_samples = get_params_matrix(chain, ure_innov_name, n_latent)
+
+            for i in 1:n_samples # Iterate over each posterior sample
+                sre_innov_i = sre_innov_samples[i, :] # Innovations for structured component for current sample
+                
+                local struct_effect_unscaled # Unscaled structured effect before scaling
+                if m.method == :spectral
+                    U = hyper.U
+                    L = hyper.L
+                    diag_D = 1.0 ./ sqrt.(L .+ noise)
+                    diag_D[1] = 0.0 # Enforce sum-to-zero constraint
+                    struct_effect_unscaled = U * (diag_D .* sre_innov_i)
+                else # :cholesky or :cholesky_sparse (use pre-computed dense Cholesky factor)
+                    F = hyper.cholesky_factor
+                    struct_effect_unscaled = F.L' \ sre_innov_i # Back-solve for unscaled structured effect
+                    struct_effect_unscaled .-= mean(struct_effect_unscaled)
+                end
+                
+                structured_latent[:, i] = sigma_samples[i, 1] * sqrt(rho_samples[i, 1]) * struct_effect_unscaled
+                unstructured_latent[:, i] = sigma_samples[i, 1] * sqrt(1.0 - rho_samples[i, 1]) * ure_innov_samples[i, :]
+            end
         end
         
         total_latent = structured_latent .+ unstructured_latent
@@ -283,4 +469,4 @@ function get_effects(
     end
 
     return (structured=structured_effects, unstructured=unstructured_effects, noisy=total_effects)
-end 
+end

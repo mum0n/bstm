@@ -73,6 +73,54 @@ function get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
     return (n_latent=n,)
 end
 
+"""
+    _iid_log_marginal_likelihood(y_residual, idx, n_latent, sigma, y_sigma, noise=1e-6)
+
+Computes the exact closed-form log marginal likelihood for an IID random intercept component integrated out analytically.
+"""
+function _iid_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    idx::AbstractVector{Int},
+    n_latent::Int,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    T_num = promote_type(T, typeof(noise))
+    
+    # Pre-accumulate observation counts, sums, and sum of squares per group
+    N_g = zeros(T_num, n_latent)
+    S_g = zeros(T_num, n_latent)
+    SS_g = zeros(T_num, n_latent)
+    
+    for i in 1:N
+        g = idx[i]
+        if 1 <= g <= n_latent
+            N_g[g] += one(T_num)
+            S_g[g] += y_residual[i]
+            SS_g[g] += y_residual[i]^2
+        end
+    end
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    var_alpha = sigma^2 + T_num(noise)
+    var_y = y_sigma^2 + T_num(noise)
+    
+    log_lik = zero(T_num)
+    
+    for g in 1:n_latent
+        if N_g[g] > zero(T_num)
+            denom = N_g[g] * var_alpha + var_y
+            log_det_g = log(denom / var_y)
+            quad_g = inv_sigma_y2 * (SS_g[g] - (var_alpha / denom) * S_g[g]^2)
+            log_lik += - (N_g[g] / 2) * log(2 * T_num(pi) * var_y) - (1 / 2) * log_det_g - (1 / 2) * quad_g
+        end
+    end
+    
+    return log_lik
+end
+
 function get_priors(
     m::IID, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -89,7 +137,7 @@ function get_priors(
     end
 
     if m.method == :noncentered
-        push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
+        push!(priors_acc, "$(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)")
     end
     
     return join(priors_acc, "\n    ")
@@ -117,16 +165,32 @@ function get_updates(
     noncentered_code = """
         # --- IID Component (Non-Centered): $(spec.key) ---
         let
-            $(p_names.latent) = $(p_names.innovations) .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
+            $(p_names.sre) = $(p_names.ure) .* $(p_names.sigma)
+            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
         end
     """
 
     centered_code = """
         # --- IID Component (Centered): $(spec.key) ---
         let
-            $(p_names.latent) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), $(p_names.sigma)^2 * I)
-            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
+            $(p_names.sre) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), $(p_names.sigma)^2 * I)
+            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+        end
+    """
+
+    marginalized_code = """
+        # --- IID Component (Marginalized): $(spec.key) ---
+        let
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(spec.key) = _iid_log_marginal_likelihood(
+                y_residual,
+                M.$(index_var),
+                spec_registry[:$(spec.key)].hyper.n_latent,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(spec.key)
         end
     """
 
@@ -134,8 +198,10 @@ function get_updates(
         return noncentered_code
     elseif m.method == :centered
         return centered_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else
-        error("Unsupported method '$(m.method)' for IID component.")
+        error("Unsupported method '$(m.method)' for IID component. Use :noncentered, :centered, or :marginalized.")
     end
 end
 
@@ -158,7 +224,7 @@ function get_effects(
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
-    
+    noise = get(M, :noise, 1e-6)
     n_latent = spec.hyper.n_latent
 
     # --- Index Handling: Combine training and prediction sets on CPU ---
@@ -199,26 +265,64 @@ function get_effects(
 
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         
-        local latent_field_samples
-        if m.method == :noncentered
-            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
-            if isempty(innovations_name)
-                @warn "Innovations for IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
+        latent_field_samples = zeros(Float64, n_latent, n_samples)
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
             end
-            innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
             
-            latent_field_samples = innovations_samples' .* sigma_samples' # (n_latent, n_samples)
-        else # :centered
-            latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
-            if isempty(latent_name)
-                @warn "Latent field for centered IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            
+            N_g = zeros(Float64, n_latent)
+            S_g = zeros(Float64, n_latent)
+            for i in 1:length(idx_train)
+                g = idx_train[i]
+                if 1 <= g <= n_latent
+                    N_g[g] += 1.0
+                    S_g[g] += y_vec[i]
+                end
+            end
+            
+            for s in 1:n_samples
+                sig = sigma_samples[s, 1]
+                y_sig = y_sigma_samples[s]
+                
+                var_alpha = sig^2 + noise
+                var_y = y_sig^2 + noise
+                
+                for g in 1:n_latent
+                    if N_g[g] > 0.0
+                        denom = N_g[g] * var_alpha + var_y
+                        mu_g = (var_alpha * S_g[g]) / denom
+                        var_g = (var_alpha * var_y) / denom
+                        latent_field_samples[g, s] = mu_g + sqrt(max(var_g, 1e-12)) * randn()
+                    else
+                        latent_field_samples[g, s] = sqrt(var_alpha) * randn()
+                    end
+                end
+            end
+        elseif m.method == :noncentered
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "ure for IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            latent_samples = get_params_matrix(chain, latent_name, n_latent)
-            latent_field_samples = latent_samples'
+            ure_samples = get_params_matrix(chain, ure_name, n_latent) # (n_samples, n_latent)
+            
+            latent_field_samples = ure_samples' .* sigma_samples' # (n_latent, n_samples)
+        else # :centered
+            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
+            if isempty(sre_name)
+                @warn "sre for centered IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            sre_samples = get_params_matrix(chain, sre_name, n_latent)
+            latent_field_samples = sre_samples'
         end
         
         effect_k = latent_field_samples[idx_full, :]

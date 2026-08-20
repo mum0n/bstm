@@ -129,6 +129,54 @@ end
 
 
 """
+    _bcgn_log_marginal_likelihood(y_residual, mapping_matrix, Q_template, L_eig, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for a BCGN bipartite spatial component integrated out analytically.
+"""
+function _bcgn_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    mapping_matrix::AbstractMatrix,
+    Q_template::AbstractMatrix,
+    L_eig::AbstractVector,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    K = size(mapping_matrix, 2)
+    T_num = promote_type(T, typeof(noise))
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    ATA = Matrix{T_num}(mapping_matrix' * mapping_matrix)
+    ATy = Vector{T_num}(mapping_matrix' * y_residual)
+    
+    Q_base = Matrix{T_num}(Q_template) .+ (scale * inv_sigma_y2) .* ATA
+    for k in 1:K
+        Q_base[k, k] += T_num(noise)
+    end
+    
+    F = cholesky(Symmetric(Q_base))
+    
+    # Laplacian has rank deficiency 1
+    valid_eigs = filter(x -> x > 1e-6, L_eig)
+    log_det_prior = isempty(valid_eigs) ? zero(T_num) : sum(log.(valid_eigs .+ T_num(noise)))
+    log_det_diff = - max(K - 1, 1) * log(scale) + log_det_prior - 2 * sum(log.(diag(F.U)))
+    
+    b = ATy .* inv_sigma_y2
+    v = F.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
+"""
     get_priors(m::BCGN, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates priors for the innovations and overall scale (`sigma`).
@@ -139,19 +187,25 @@ function get_priors(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     n_latent = spec.hyper.n_latent
-    return """
-    # Priors for BCGN component: $(spec.key)
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
-    """
+    if m.method == :marginalized
+        return """
+        # Priors for BCGN component: $(spec.key)
+        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        """
+    else
+        return """
+        # Priors for BCGN component: $(spec.key)
+        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)
+        """
+    end
 end
 
 """
     get_updates(m::BCGN, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates code to compute the BCGN effect and add it to the linear predictor `eta`.
-Supports three methods: `:spectral`, `:cholesky`, and `:cholesky_sparse`. This is a
-CPU-only implementation.
+Supports methods: `:spectral`, `:cholesky`, `:cholesky_sparse`, and `:marginalized`.
 """
 function get_updates(
     m::BCGN, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -171,8 +225,9 @@ function get_updates(
             diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
             diag_D[L .< 1e-6] .= 0.0
             
-            latent_field = U * (diag_D .* $(p_names.innovations))
-            $(eta_target) .+= hyper.mapping_matrix * latent_field
+            latent_field = U * (diag_D .* $(p_names.ure))
+            $(p_names.sre) = hyper.mapping_matrix * latent_field
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -181,12 +236,13 @@ function get_updates(
         let
             hyper = spec_registry[:$(key)].hyper
             F = hyper.cholesky_factor
-            latent_field_raw = F.L' \\ $(p_names.innovations)
+            sre_unscaled = F.L' \\ $(p_names.ure)
             
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(sre_unscaled))
             
-            latent_field = latent_field_raw .* $(p_names.sigma)
-            $(eta_target) .+= hyper.mapping_matrix * latent_field
+            latent_field = sre_unscaled .* $(p_names.sigma)
+            $(p_names.sre) = hyper.mapping_matrix * latent_field
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -196,12 +252,31 @@ function get_updates(
             hyper = spec_registry[:$(key)].hyper
             Q = hyper.Q_template
             F = cholesky(Symmetric(Q + M.noise * I))
-            latent_field_raw = F.L' \\ $(p_names.innovations)
+            sre_unscaled = F.L' \\ $(p_names.ure)
             
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_raw))
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(sre_unscaled))
             
-            latent_field = latent_field_raw .* $(p_names.sigma)
-            $(eta_target) .+= hyper.mapping_matrix * latent_field
+            latent_field = sre_unscaled .* $(p_names.sigma)
+            $(p_names.sre) = hyper.mapping_matrix * latent_field
+            $(eta_target) .+= $(p_names.sre)
+        end
+    """
+
+    marginalized_code = """
+        # --- BCGN Component (Marginalized): $(key) ---
+        let
+            hyper = spec_registry[:$(key)].hyper
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _bcgn_log_marginal_likelihood(
+                y_residual,
+                hyper.mapping_matrix,
+                hyper.Q_template,
+                hyper.L,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
@@ -211,8 +286,10 @@ function get_updates(
         return cholesky_code
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else
-        error("Unsupported method '$(m.method)' for BCGN component. Use `:spectral`, `:cholesky`, or `:cholesky_sparse`.")
+        error("Unsupported method '$(m.method)' for BCGN component. Use `:spectral`, `:cholesky`, `:cholesky_sparse`, or `:marginalized`.")
     end
 end
 
@@ -227,10 +304,14 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = string.(names(DataFrame(chain)))
+    p_names = string.(keys(chain))
     
     noise = M.noise
     n_latent = spec.hyper.n_latent
@@ -264,9 +345,8 @@ function get_effects(
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(innovations_name)
+        if isempty(sigma_name)
             @warn "Parameters for BCGN component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -274,34 +354,75 @@ function get_effects(
 
         # Extract posterior samples from the chain (these are on the CPU)
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
         # Initialize the output matrix for latent effects on the CPU
         effect_k_matrix = zeros(Float64, n_latent, n_samples)
 
         # --- Sample-wise Reconstruction on the CPU ---
-        if m.method == :spectral
-            U = spec.hyper.U
-            L = spec.hyper.L
-            innov_samples_T = innovations_samples' # Transpose to [n_latent x n_samples]
-
-            for j in 1:n_samples
-                sigma_j = sigma_samples[j]
-                
-                diag_D = sigma_j ./ sqrt.(L .+ noise)
-                diag_D[L .< 1e-6] .= 0.0
-                effect_k_matrix[:, j] = U * (diag_D .* innov_samples_T[:, j])
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
             end
-        else # :cholesky or :cholesky_sparse
-            F = spec.hyper.cholesky_factor
-            innov_samples_T = innovations_samples'
-
+            
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            A_train = spec.hyper.mapping_matrix
+            ATA = Matrix{Float64}(A_train' * A_train)
+            ATy = Vector{Float64}(A_train' * y_vec)
+            
             for j in 1:n_samples
-                sigma_j = sigma_samples[j]
+                sig = sigma_samples[j]
+                y_sig = y_sigma_samples[j]
+                
+                scale = sig^2 + noise
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
+                
+                Q_base = Matrix{Float64}(spec.hyper.Q_template) .+ (scale * inv_sigma_y2) .* ATA
+                for i in 1:n_latent
+                    Q_base[i, i] += noise
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = ATy .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(n_latent)
+                effect_k_matrix[:, j] = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+            end
+        else
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "Innovations (ure) for BCGN component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            ure_samples = get_params_vector(chain, ure_name, n_latent)
 
-                latent_field_raw = F.L' \ innov_samples_T[:, j]
-                latent_field_raw .-= mean(latent_field_raw)
-                effect_k_matrix[:, j] = latent_field_raw .* sigma_j
+            if m.method == :spectral
+                U = spec.hyper.U
+                L = spec.hyper.L
+                ure_samples_T = ure_samples'
+
+                for j in 1:n_samples
+                    sigma_j = sigma_samples[j]
+                    
+                    diag_D = sigma_j ./ sqrt.(L .+ noise)
+                    diag_D[L .< 1e-6] .= 0.0
+                    effect_k_matrix[:, j] = U * (diag_D .* ure_samples_T[:, j])
+                end
+            else # :cholesky or :cholesky_sparse
+                F = spec.hyper.cholesky_factor
+                ure_samples_T = ure_samples'
+
+                for j in 1:n_samples
+                    sigma_j = sigma_samples[j]
+
+                    sre_unscaled = F.L' \ ure_samples_T[:, j]
+                    sre_unscaled .-= mean(sre_unscaled)
+                    effect_k_matrix[:, j] = sre_unscaled .* sigma_j
+                end
             end
         end
         

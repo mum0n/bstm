@@ -92,6 +92,64 @@ function get_precomputes(m::Leroux, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
+"""
+    _leroux_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, rho, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for a Leroux spatial CAR process integrated out analytically.
+"""
+function _leroux_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    s_idx::AbstractVector{Int},
+    s_N::Int,
+    Q_template::AbstractMatrix,
+    L_eig::AbstractVector,
+    rho::T,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    T_num = promote_type(T, typeof(noise))
+    
+    # Pre-accumulate observation counts and sums per spatial index
+    N_s = zeros(T_num, s_N)
+    S_s = zeros(T_num, s_N)
+    for i in 1:N
+        s = s_idx[i]
+        if 1 <= s <= s_N
+            N_s[s] += one(T_num)
+            S_s[s] += y_residual[i]
+        end
+    end
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    I_mat = Matrix{T_num}(I, s_N, s_N)
+    Q_base = (one(T_num) - rho) .* I_mat .+ rho .* Matrix{T_num}(Q_template)
+    for s in 1:s_N
+        Q_base[s, s] += T_num(noise) + N_s[s] * inv_sigma_y2 * scale
+    end
+    
+    F = cholesky(Symmetric(Q_base))
+    
+    # Determinant term
+    log_det_prior = sum(log.((one(T_num) - rho) .+ rho .* L_eig .+ T_num(noise)))
+    log_det_diff = log_det_prior - 2 * sum(log.(diag(F.U)))
+    
+    # Quadratic term
+    b = S_s .* inv_sigma_y2
+    v = F.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
 function get_priors(
     m::Leroux, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -107,7 +165,9 @@ function get_priors(
         push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
         push!(priors_acc, "$(p_names.rho) ~ $(_distribution_to_string(m.rho))")
     end
-    push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
+    if m.method != :marginalized
+        push!(priors_acc, "$(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)")
+    end
     return join(priors_acc, "\n    ")
 end
 
@@ -116,7 +176,7 @@ end
     get_updates(m::Leroux, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates code to compute the Leroux effect and add it to the linear predictor `eta`.
-Supports three methods: `:spectral`, `:cholesky`, and `:cholesky_sparse`.
+Supports methods: `:spectral`, `:cholesky`, `:cholesky_sparse`, and `:marginalized`.
 """
 function get_updates(
     m::Leroux, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -133,8 +193,8 @@ function get_updates(
             hyper = spec_registry[:$(key)].hyper
             diag_D = $(p_names.sigma) ./ sqrt.((1.0 .- $(p_names.rho)) .+ 
                                               $(p_names.rho) .* hyper.L .+ M.noise)
-            $(p_names.latent) = hyper.U * (diag_D .* $(p_names.innovations))
-            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
+            $(p_names.sre) = hyper.U * (diag_D .* $(p_names.ure))
+            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
         end
         """
 
@@ -145,8 +205,8 @@ function get_updates(
             rho_val = $(p_names.rho)
             Q_final = (1.0 - rho_val) .* I(size(Q_template, 1)) .+ rho_val .* Q_template
             F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
-            $(p_names.latent) = $(p_names.sigma) .* (F.U \\ $(p_names.innovations))
-            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
+            $(p_names.sre) = $(p_names.sigma) .* (F.U \\ $(p_names.ure))
+            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
         end
         """
 
@@ -158,8 +218,28 @@ function get_updates(
             Q_final = (1.0 - rho_val) .* sparse(I, size(Q_template)...) .+ 
                       rho_val .* Q_template
             F = cholesky(Symmetric(Q_final + M.noise * I))
-            $(p_names.latent) = $(p_names.sigma) .* (F.U \\ $(p_names.innovations))
-            $(eta_target) .+= view($(p_names.latent), M.$(index_var))
+            $(p_names.sre) = $(p_names.sigma) .* (F.U \\ $(p_names.ure))
+            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+        end
+        """
+
+    marginalized_code = """
+        # --- Leroux Marginalized Assembly: $(key) ---
+        let
+            hyper = spec_registry[:$(key)].hyper
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _leroux_log_marginal_likelihood(
+                y_residual,
+                M.$(index_var),
+                hyper.n_latent,
+                hyper.Q_template,
+                hyper.L,
+                $(p_names.rho),
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
         """
 
@@ -169,8 +249,10 @@ function get_updates(
         return cholesky_code
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else
-        error("Unsupported method '$(m.method)' for Leroux component.")
+        error("Unsupported method '$(m.method)' for Leroux component. Use :spectral, :cholesky, :cholesky_sparse, or :marginalized.")
     end
 end
 
@@ -198,13 +280,13 @@ function get_effects(
     n_latent = spec.hyper.n_latent
 
     # --- Coordinate/Index Handling: Combine training and prediction sets on CPU ---
-    s_idx_train = M.s_idx # Spatial indices for training data
-    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set is provided
-        vcat(s_idx_train, PS.data.s_idx) # Combine training and prediction indices
+    s_idx_train = M.s_idx
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        vcat(s_idx_train, PS.data.s_idx)
     else
-        s_idx_train # Otherwise, use only training indices
+        s_idx_train
     end
-    N_total = length(s_idx_full) # Total number of observations (training + prediction)
+    N_total = length(s_idx_full)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -213,10 +295,9 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(rho_name) || isempty(innovations_name)
-            @warn "Parameters for Leroux component $(spec.key) (outcome ) not found. Returning zero-matrix."
+        if isempty(sigma_name) || isempty(rho_name)
+            @warn "Parameters for Leroux component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
@@ -224,31 +305,85 @@ function get_effects(
         # Extract posterior samples (these are on the CPU)
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
         
         # Initialize the output matrix for the full latent field
         effect_k_latent = zeros(Float64, n_latent, n_samples)
 
         # --- Sample-wise Reconstruction ---
-        for s in 1:n_samples # Iterate over each posterior sample
-            sigma_s = sigma_samples[s, 1] # Sigma for current sample
-            rho_s = rho_samples[s, 1] # Rho for current sample
-            innov_s = innovations_samples[s, :] # Innovations for current sample
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
+            end
+            
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            
+            N_s = zeros(Float64, n_latent)
+            S_s = zeros(Float64, n_latent)
+            for i in 1:length(s_idx_train)
+                s = s_idx_train[i]
+                if 1 <= s <= n_latent
+                    N_s[s] += 1.0
+                    S_s[s] += y_vec[i]
+                end
+            end
+            
+            I_mat = Matrix{Float64}(I, n_latent, n_latent)
+            Q_template = spec.hyper.Q_template
+            
+            for s in 1:n_samples
+                sigma_s = sigma_samples[s, 1]
+                rho_s = rho_samples[s, 1]
+                y_sig = y_sigma_samples[s]
+                
+                scale = sigma_s^2 + noise
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
+                
+                Q_base = (1.0 - rho_s) .* I_mat .+ rho_s .* Matrix{Float64}(Q_template)
+                for i in 1:n_latent
+                    Q_base[i, i] += noise + N_s[i] * inv_sigma_y2 * scale
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = S_s .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(n_latent)
+                x_train = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+                effect_k_latent[:, s] = x_train
+            end
+        else
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "ure for Leroux component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            ure_samples = get_params_matrix(chain, ure_name, n_latent)
 
-            if m.method == :spectral
-                U = spec.hyper.U
-                L_eig = spec.hyper.L
-                diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig .+ noise)
-                effect_k_latent[:, s] = U * (diag_D_s .* innov_s)
-            else # :cholesky or :cholesky_sparse (use pre-computed dense Cholesky factor)
-                Q_template = spec.hyper.Q_template
-                I_mat = Matrix{Float64}(I, n_latent, n_latent)
-                Q_final = (1.0 - rho_s) .* I_mat .+ rho_s .* Q_template
-                F = cholesky(Symmetric(Q_final + noise * I_mat))
-                effect_k_latent[:, s] = sigma_s .* (F.U \ innov_s)
+            for s in 1:n_samples
+                sigma_s = sigma_samples[s, 1]
+                rho_s = rho_samples[s, 1]
+                innov_s = ure_samples[s, :]
+
+                if m.method == :spectral
+                    U = spec.hyper.U
+                    L_eig = spec.hyper.L
+                    diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig .+ noise)
+                    effect_k_latent[:, s] = U * (diag_D_s .* innov_s)
+                else # :cholesky or :cholesky_sparse
+                    Q_template = spec.hyper.Q_template
+                    I_mat = Matrix{Float64}(I, n_latent, n_latent)
+                    Q_final = (1.0 - rho_s) .* I_mat .+ rho_s .* Q_template
+                    F = cholesky(Symmetric(Q_final + noise * I_mat))
+                    effect_k_latent[:, s] = sigma_s .* (F.U \ innov_s)
+                end
             end
         end
-        # Index the reconstructed effects for the full observation set to match observation indices
+
+        # Index the reconstructed effects for the full observation set
         indexed_effects = effect_k_latent[s_idx_full, :]
         push!(structured_effects, indexed_effects)
     end

@@ -106,6 +106,63 @@ function get_precomputes(m::SPDE, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 
+"""
+    _spde_log_marginal_likelihood(y_residual, s_idx, s_N, Q_laplacian, L_eig, kappa, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for an SPDE spatial component integrated out analytically.
+"""
+function _spde_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    s_idx::AbstractVector{Int},
+    s_N::Int,
+    Q_laplacian::AbstractMatrix,
+    L_eig::AbstractVector,
+    kappa::Real,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    T_num = promote_type(T, typeof(noise), typeof(kappa))
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    N_s = zeros(T_num, s_N)
+    S_s = zeros(T_num, s_N)
+    for i in 1:N
+        s = s_idx[i]
+        if 1 <= s <= s_N
+            N_s[s] += one(T_num)
+            S_s[s] += y_residual[i]
+        end
+    end
+    
+    L_op = Matrix{T_num}(Q_laplacian) + (T_num(kappa)^2) * Matrix{T_num}(I, s_N, s_N)
+    Q_spde = L_op' * L_op
+    
+    Q_base = Matrix{T_num}(Q_spde)
+    for s in 1:s_N
+        Q_base[s, s] += T_num(noise) + N_s[s] * inv_sigma_y2 * scale
+    end
+    
+    F = cholesky(Symmetric(Q_base))
+    
+    log_det_prior = 2 * sum(log.(T_num(kappa)^2 .+ L_eig .+ T_num(noise)))
+    log_det_diff = - s_N * log(scale) + log_det_prior - 2 * sum(log.(diag(F.U)))
+    
+    b = S_s .* inv_sigma_y2
+    v = F.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
 function get_priors(
     m::SPDE, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -124,10 +181,12 @@ function get_priors(
         push!(priors, "$(p_names.kappa) ~ $(kappa_prior_str)")
     end
     
-    push!(
-        priors,
-        "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
-    )
+    if m.method != :marginalized
+        push!(
+            priors,
+            "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
+        )
+    end
 
     return join(priors, "\n    ")
 end
@@ -152,8 +211,8 @@ function get_updates(
             diag_vals = ($(p_names.kappa)^2 .+ L).^2
             diag_D = $(p_names.sigma) ./ sqrt.(diag_vals .+ M.noise)
             
-            $(p_names.latent) = U * (diag_D .* $(p_names.innovations))
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(p_names.sre) = U * (diag_D .* $(p_names.ure))
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -175,8 +234,8 @@ function get_updates(
         let
             $(cholesky_base_code)
             local F = cholesky(Matrix(Q_final) + M.noise * I)
-            $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -185,12 +244,34 @@ function get_updates(
         let
             $(cholesky_base_code)
             local F = cholesky(Q_final + M.noise * I)
-            $(p_names.latent) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
-            $(eta_target) .+= view($(p_names.latent), M.s_idx)
+            $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
+            $(eta_target) .+= view($(p_names.sre), M.s_idx)
         end
     """
 
-    if use_spectral
+    marginalized_code = """
+        # --- SPDE Component (Marginalized): $(key) ---
+        let
+            hyper = spec_registry[:$(key)].hyper
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _spde_log_marginal_likelihood(
+                y_residual,
+                M.s_idx,
+                hyper.n_latent,
+                hyper.Q_template,
+                hyper.L,
+                $(p_names.kappa),
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
+        end
+    """
+
+    if m.method == :marginalized
+        return marginalized_code
+    elseif use_spectral
         return spectral_code
     elseif m.method == :cholesky
         return cholesky_code
@@ -213,7 +294,11 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -245,9 +330,8 @@ function get_effects(
         v = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
         kappa_name = _find_parameter(p_names, string(v.kappa), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(kappa_name) || isempty(innovations_name)
+        if isempty(sigma_name) || isempty(kappa_name)
             @warn "Parameters for SPDE component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -257,37 +341,88 @@ function get_effects(
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         kappa_dim = m.kappa isa Vector ? length(m.kappa) : 1
         kappa_samples_cpu = get_params_matrix(chain, kappa_name, kappa_dim)
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
         # Initialize the output matrix for the full latent field on the CPU
         latent_field_matrix = zeros(Float64, n_latent, n_samples)
 
-        # --- Sample-wise Reconstruction on the CPU ---
-        for i in 1:n_samples
-            current_sigma = sigma_samples_cpu[i]
-            current_kappa = kappa_samples_cpu[i, :]
-            current_innovations = innovations_samples_cpu[i, :]
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
+            end
             
-            local latent_field_sample
-            if use_spectral
-                kappa_val = current_kappa[1] # Isotropic case
-                diag_vals = (kappa_val^2 .+ L_cpu).^2
-                diag_D = current_sigma ./ sqrt.(diag_vals .+ noise)
-                latent_field_sample = U_cpu * (diag_D .* current_innovations)
-            else # Cholesky methods
-                Q_kappa_term = if m.kappa isa Vector
-                    Diagonal(current_kappa.^2)
-                else
-                    current_kappa[1]^2 * I
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
+            
+            N_s = zeros(Float64, n_latent)
+            S_s = zeros(Float64, n_latent)
+            for i in 1:length(s_idx_train)
+                s = s_idx_train[i]
+                if 1 <= s <= n_latent
+                    N_s[s] += 1.0
+                    S_s[s] += y_vec[i]
+                end
+            end
+            
+            for i in 1:n_samples
+                sig = sigma_samples_cpu[i]
+                kap = kappa_samples_cpu[i, 1]
+                y_sig = y_sigma_samples[i]
+                
+                scale = sig^2 + noise
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
+                
+                L_op = Matrix{Float64}(Q_laplacian_cpu) + (kap^2) * Matrix{Float64}(I, n_latent, n_latent)
+                Q_spde = L_op' * L_op
+                
+                Q_base = Matrix{Float64}(Q_spde)
+                for s in 1:n_latent
+                    Q_base[s, s] += noise + N_s[s] * inv_sigma_y2 * scale
                 end
                 
-                L_operator = Q_kappa_term + Q_laplacian_cpu
-                Q_final = Symmetric(L_operator' * L_operator)
+                F = cholesky(Symmetric(Q_base))
+                b = S_s .* inv_sigma_y2
+                mu = scale .* (F \ b)
                 
-                F = cholesky(Matrix(Q_final) + noise * I)
-                latent_field_sample = current_sigma .* (F.L' \ current_innovations)
+                z = randn(n_latent)
+                latent_field_matrix[:, i] = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
             end
-            latent_field_matrix[:, i] = latent_field_sample
+        else
+            ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
+            if isempty(ure_name)
+                @warn "ure for SPDE component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
+            ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
+
+            for i in 1:n_samples
+                current_sigma = sigma_samples_cpu[i]
+                current_kappa = kappa_samples_cpu[i, :]
+                current_ure = ure_samples_cpu[i, :]
+                
+                local latent_field_sample
+                if use_spectral
+                    kappa_val = current_kappa[1]
+                    diag_vals = (kappa_val^2 .+ L_cpu).^2
+                    diag_D = current_sigma ./ sqrt.(diag_vals .+ noise)
+                    latent_field_sample = U_cpu * (diag_D .* current_ure)
+                else
+                    Q_kappa_term = if m.kappa isa Vector
+                        Diagonal(current_kappa.^2)
+                    else
+                        current_kappa[1]^2 * I
+                    end
+                    
+                    L_operator = Q_kappa_term + Q_laplacian_cpu
+                    Q_final = Symmetric(L_operator' * L_operator)
+                    
+                    F = cholesky(Matrix(Q_final) + noise * I)
+                    latent_field_sample = current_sigma .* (F.L' \ current_ure)
+                end
+                latent_field_matrix[:, i] = latent_field_sample
+            end
         end
         
         # Index the reconstructed effects for the full observation set

@@ -15,11 +15,145 @@ const COMPONENT_CONSTRUCTORS = Dict{Symbol, Function}(
 )
 
 # these structures will be added to where required in the component file
-const MODEL_TO_STRUCTURE_MAP = Dict{Symbol, Symbol}(
+const MODEL_TO_STRUCTURE_MAP = Dict{Union{Symbol, DataType}, Symbol}(
     :none => :none  # dummy value to initiate the map 
 )
 
+"""
+    get_component_structure(component)::Symbol
 
+Resolves the structural category (:spatial, :temporal, :seasonal, :smooth, :spacetime, :mixed, :any)
+for a component model symbol, type, or instance.
+"""
+function get_component_structure(component)::Symbol
+    if component isa Symbol
+        return get(MODEL_TO_STRUCTURE_MAP, component, :any)
+    elseif component isa DataType
+        if haskey(MODEL_TO_STRUCTURE_MAP, component)
+            return MODEL_TO_STRUCTURE_MAP[component]
+        end
+        sym = Symbol(lowercase(string(nameof(component))))
+        return get(MODEL_TO_STRUCTURE_MAP, sym, :any)
+    else
+        T = typeof(component)
+        if haskey(MODEL_TO_STRUCTURE_MAP, T)
+            return MODEL_TO_STRUCTURE_MAP[T]
+        end
+        sym = Symbol(lowercase(string(nameof(T))))
+        return get(MODEL_TO_STRUCTURE_MAP, sym, :any)
+    end
+end
+
+"""
+    _get_varname_symbol(vn)::Symbol
+
+Robustly extracts the base Symbol from a `DynamicPPL.VarName` or `Symbol` across DynamicPPL and AbstractPPL versions.
+"""
+function _get_varname_symbol(vn)::Symbol
+    if vn isa Symbol
+        return vn
+    elseif hasfield(typeof(vn), :name)
+        return vn.name isa Symbol ? vn.name : Symbol(vn.name)
+    else
+        try
+            return DynamicPPL.getsym(vn)
+        catch
+            try
+                return Symbol(first(split(string(vn), '[')))
+            catch
+                return Symbol(vn)
+            end
+        end
+    end
+end
+
+"""
+    _model_float_type(vi)::Type
+
+Extracts the active scalar floating-point number type from `DynamicPPL.VarInfo` (e.g., `Float64`, `ForwardDiff.Dual`, `ReverseDiff.TrackedReal`).
+Ensures AD type-stability when allocating intermediate arrays in generated Turing models.
+"""
+function _model_float_type(vi)::Type
+    # 1. Check OnlyAccsVarInfo (vi.accs)
+    if hasfield(typeof(vi), :accs)
+        try
+            accs = getfield(vi, :accs)
+            if hasproperty(accs, :LogPrior) && hasproperty(accs.LogPrior, :val)
+                val_type = typeof(accs.LogPrior.val)
+                if val_type !== Union{} && val_type !== Any && val_type <: Number
+                    return val_type
+                end
+            end
+            for acc in accs
+                if hasproperty(acc, :val)
+                    val_type = typeof(acc.val)
+                    if val_type !== Union{} && val_type !== Any && val_type <: Number
+                        return val_type
+                    end
+                end
+            end
+        catch
+        end
+    end
+
+    # 2. Check VarInfo / SimpleVarInfo / UntypedVarInfo (vi.values)
+    if hasfield(typeof(vi), :values)
+        try
+            vals = getfield(vi, :values)
+            if vals isa AbstractArray && length(vals) > 0
+                et = eltype(vals)
+                if et !== Union{} && et !== Any && et <: Number; return et; end
+            elseif vals isa NamedTuple && length(vals) > 0
+                first_val = first(values(vals))
+                if first_val isa AbstractArray && length(first_val) > 0
+                    et = eltype(first_val)
+                    if et !== Union{} && et !== Any && et <: Number; return et; end
+                elseif first_val isa Number
+                    val_type = typeof(first_val)
+                    if val_type !== Union{} && val_type !== Any && val_type <: Number
+                        return val_type
+                    end
+                end
+            end
+        catch
+        end
+    end
+
+    # 3. Check TypedVarInfo (vi.metadata)
+    if hasfield(typeof(vi), :metadata)
+        try
+            meta = getfield(vi, :metadata)
+            if meta isa NamedTuple && length(meta) > 0
+                first_meta = first(values(meta))
+                if hasproperty(first_meta, :vals) && length(first_meta.vals) > 0
+                    et = eltype(first_meta.vals)
+                    if et !== Union{} && et !== Any && et <: Number; return et; end
+                end
+            end
+        catch
+        end
+    end
+
+    # 4. Check DynamicPPL.float_type
+    try
+        ft = DynamicPPL.float_type(vi)
+        if ft !== Union{} && ft !== Any && ft isa Type && ft <: Number
+            return ft
+        end
+    catch
+    end
+
+    # 5. Check eltype
+    try
+        et = eltype(vi)
+        if et !== Union{} && et !== Any && et isa Type && et <: Number
+            return et
+        end
+    catch
+    end
+
+    return Float64
+end
 
 abstract type AbstractModelArchitecture end
 struct UnivariateArchitecture <: AbstractModelArchitecture end

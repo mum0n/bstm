@@ -141,6 +141,48 @@ function get_precomputes(m::RFF, M::NamedTuple, mod_data::Dict)::NamedTuple
     )
 end
 
+"""
+    _rff_log_marginal_likelihood(y_residual, Phi, sigma, y_sigma, noise=1e-6)
+
+Computes the exact log marginal likelihood for a Random Fourier Features smoother with coefficients integrated out analytically.
+"""
+function _rff_log_marginal_likelihood(
+    y_residual::AbstractVector{T},
+    Phi::AbstractMatrix,
+    sigma::T,
+    y_sigma::T,
+    noise::Real=1e-6
+) where {T}
+    N = length(y_residual)
+    M_feat = size(Phi, 2)
+    T_num = promote_type(T, typeof(noise))
+    
+    inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
+    scale = sigma^2 + T_num(noise)
+    
+    PTP = Matrix{T_num}(Phi' * Phi)
+    PTy = Vector{T_num}(Phi' * y_residual)
+    
+    Q_base = Matrix{T_num}(I, M_feat, M_feat) .+ (scale * inv_sigma_y2) .* PTP
+    for k in 1:M_feat
+        Q_base[k, k] += T_num(noise)
+    end
+    
+    F = cholesky(Symmetric(Q_base))
+    log_det_diff = - M_feat * log(scale) - 2 * sum(log.(diag(F.U)))
+    
+    b = PTy .* inv_sigma_y2
+    v = F.L \ b
+    quad_term = scale * dot(v, v)
+    
+    log_lik = - (N / 2) * log(2 * T_num(pi) * (y_sigma^2 + T_num(noise))) -
+              (inv_sigma_y2 / 2) * dot(y_residual, y_residual) +
+              (1 / 2) * log_det_diff +
+              (1 / 2) * quad_term
+              
+    return log_lik
+end
+
 function get_priors(
     m::RFF, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -151,21 +193,23 @@ function get_priors(
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
-    if m.lengthscale isa Vector
-        ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
-    else
-        ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
-    end
-    
-    if m.method == :adaptive
-        push!(priors, "$(p_names.W) ~ DynamicPPL.NamedDist(MvNormal(vec(spec_registry[:$(key)].hyper.W_fixed), 0.1), :$(p_names.W))")
-        push!(priors, "$(p_names.b) ~ NamedDist(MvNormal(spec_registry[:$(key)].hyper.b_fixed, 0.1), :$(p_names.b))")
-    end
+    if m.method != :marginalized
+        if m.lengthscale isa Vector
+            ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
+            push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
+        else
+            ls_prior_str = _distribution_to_string(m.lengthscale)
+            push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
+        end
+        
+        if m.method == :adaptive
+            push!(priors, "$(p_names.W) ~ DynamicPPL.NamedDist(MvNormal(vec(spec_registry[:$(key)].hyper.W_fixed), 0.1), :$(p_names.W))")
+            push!(priors, "$(p_names.b) ~ NamedDist(MvNormal(spec_registry[:$(key)].hyper.b_fixed, 0.1), :$(p_names.b))")
+        end
 
-    if m.method in [:fixed, :adaptive]
-        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+        if m.method in [:fixed, :adaptive]
+            push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+        end
     end
 
     return join(priors, "\n    ")
@@ -193,9 +237,9 @@ function get_updates(
         # --- RFF Smoother (Fixed Features): $(key) ---
         let
             $(phi_code("$(hyper_access).W_fixed", "$(hyper_access).b_fixed"))
-            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
-            rff_effect = Phi * scaled_coeffs
-            $(eta_target) .+= rff_effect
+            scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
+            $(p_names.sre) = Phi * scaled_coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -203,9 +247,9 @@ function get_updates(
         # --- RFF Smoother (Adaptive Features): $(key) ---
         let
             $(phi_code(string(p_names.W), string(p_names.b)))
-            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
-            rff_effect = Phi * scaled_coeffs
-            $(eta_target) .+= rff_effect
+            scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
+            $(p_names.sre) = Phi * scaled_coeffs
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -213,16 +257,33 @@ function get_updates(
         # --- RFF Smoother (Centered): $(key) ---
         let
             $(phi_code("$(hyper_access).W_fixed", "$(hyper_access).b_fixed"))
-            $(p_names.latent) ~ MvNormal(zeros(T, $(n_latent)), $(p_names.sigma)^2 * I)
-            rff_effect = Phi * $(p_names.latent)
+            $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), $(p_names.sigma)^2 * I)
+            rff_effect = Phi * $(p_names.sre)
             $(eta_target) .+= rff_effect
+        end
+    """
+
+    marginalized_code = """
+        # --- RFF Smoother (Marginalized): $(key) ---
+        let
+            $(phi_code("$(hyper_access).W_fixed", "$(hyper_access).b_fixed"))
+            y_residual = M.y_obs .- $(eta_target)
+            log_lik_marginalized_$(key) = _rff_log_marginal_likelihood(
+                y_residual,
+                Phi,
+                $(p_names.sigma),
+                y_sigma,
+                M.noise
+            )
+            Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
     if m.method == :fixed; return fixed_code;
     elseif m.method == :adaptive; return adaptive_code;
     elseif m.method == :centered; return centered_code;
-    else; error("Unsupported method '$(m.method)' for RFF component."); end
+    elseif m.method == :marginalized; return marginalized_code;
+    else; error("Unsupported method '$(m.method)' for RFF component. Use :fixed, :adaptive, :centered, or :marginalized."); end
 end
 
 """
@@ -237,10 +298,15 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
+    noise_val = get(M, :noise, 1e-6)
     
     hyper = spec.hyper
     in_dims = hyper.in_dims
@@ -273,13 +339,52 @@ function get_effects(
         # Initialize the output matrix for the full effect on the CPU
         effect_k = zeros(Float64, N_total, n_samples)
 
-        if m.method == :adaptive
+        if m.method == :marginalized
+            y_sigma_name = _find_parameter(p_names, "y_sigma", k_outcome, is_multivariate_model)
+            y_sigma_samples = if !isempty(y_sigma_name)
+                get_params_vector(chain, y_sigma_name, 1)[:, 1]
+            else
+                fill(1.0, n_samples)
+            end
+            
+            W_matrix = hyper.W_fixed
+            b_vec = hyper.b_fixed
+            Phi_train = sqrt(2.0 / n_features) .* cos.((hyper.coords * W_matrix) .+ b_vec')
+            Phi_full = sqrt(2.0 / n_features) .* cos.((coords_full * W_matrix) .+ b_vec')
+            
+            y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k_outcome] : M.y_obs
+            PTP = Matrix{Float64}(Phi_train' * Phi_train)
+            PTy = Vector{Float64}(Phi_train' * y_vec)
+            
+            coeffs_samples = zeros(Float64, n_features, n_samples)
+            for i in 1:n_samples
+                sig = sigma_samples[i]
+                y_sig = y_sigma_samples[i]
+                
+                scale = sig^2 + noise_val
+                inv_sigma_y2 = 1.0 / (y_sig^2 + noise_val)
+                
+                Q_base = Matrix{Float64}(I, n_features, n_features) .+ (scale * inv_sigma_y2) .* PTP
+                for j in 1:n_features
+                    Q_base[j, j] += noise_val
+                end
+                
+                F = cholesky(Symmetric(Q_base))
+                b = PTy .* inv_sigma_y2
+                mu = scale .* (F \ b)
+                
+                z = randn(n_features)
+                coeffs_samples[:, i] = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
+            end
+            effect_k = Phi_full * coeffs_samples
+
+        elseif m.method == :adaptive
             # --- Adaptive Method: Per-sample loop is necessary as W and b change ---
             W_name = _find_parameter(p_names, string(p_names_k.W), k_outcome, is_multivariate_model)
             b_name = _find_parameter(p_names, string(p_names_k.b), k_outcome, is_multivariate_model)
-            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model)
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k_outcome, is_multivariate_model)
             
-            if isempty(W_name) || isempty(b_name) || isempty(innovations_name)
+            if isempty(W_name) || isempty(b_name) || isempty(ure_name)
                 @warn "Adaptive RFF parameters for component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
@@ -287,12 +392,12 @@ function get_effects(
             
             W_samples = get_params_matrix(chain, W_name, in_dims * n_features)
             b_samples = get_params_matrix(chain, b_name, n_features)
-            innovations_samples = get_params_matrix(chain, innovations_name, n_features)
+            ure_samples = get_params_matrix(chain, ure_name, n_features)
 
             for i in 1:n_samples
                 W_matrix = reshape(W_samples[i, :], in_dims, n_features)
                 b_vec = b_samples[i, :]
-                innov_i = innovations_samples[i, :]
+                innov_i = ure_samples[i, :]
                 sigma_i = sigma_samples[i]
 
                 Phi = sqrt(2.0 / n_features) .* cos.((coords_full * W_matrix) .+ b_vec')
@@ -301,33 +406,30 @@ function get_effects(
             end
 
         else # :fixed or :centered methods
-            # --- Vectorized approach for fixed features ---
-            # RFF projection matrix is the same for all samples, so compute it once.
             W_matrix = hyper.W_fixed
             b_vec = hyper.b_fixed
             Phi = sqrt(2.0 / n_features) .* cos.((coords_full * W_matrix) .+ b_vec')
 
             if m.method == :fixed
-                innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model)
-                if isempty(innovations_name)
-                    @warn "Innovations for RFF component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
+                ure_name = _find_parameter(p_names, string(p_names_k.ure), k_outcome, is_multivariate_model)
+                if isempty(ure_name)
+                    @warn "ure for RFF component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
                     push!(structured_effects, zeros(Float64, N_total, n_samples))
                     continue
                 end
-                innovations_samples = get_params_matrix(chain, innovations_name, n_features)
+                ure_samples = get_params_matrix(chain, ure_name, n_features)
                 
-                # Broadcasting scales each column of innovations by the corresponding sigma
-                scaled_coeffs = innovations_samples' .* sigma_samples'
+                scaled_coeffs = ure_samples' .* sigma_samples'
                 effect_k = Phi * scaled_coeffs
 
             else # :centered
-                latent_name = _find_parameter(p_names, string(p_names_k.latent), k_outcome, is_multivariate_model)
-                if isempty(latent_name)
+                sre_name = _find_parameter(p_names, string(p_names_k.sre), k_outcome, is_multivariate_model)
+                if isempty(sre_name)
                     @warn "Latent coefficients for centered RFF component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
                     push!(structured_effects, zeros(Float64, N_total, n_samples))
                     continue
                 end
-                coeffs_samples = get_params_matrix(chain, latent_name, n_features)
+                coeffs_samples = get_params_matrix(chain, sre_name, n_features)
                 
                 effect_k = Phi * coeffs_samples'
             end

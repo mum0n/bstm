@@ -133,11 +133,11 @@ parameters for both the warping layer and the main GP layer.
 function get_priors(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    W_warp_name = Symbol("$(p_names.latent)_W_warp")
-    b_warp_name = Symbol("$(p_names.latent)_b_warp")
-    beta_warp_name = Symbol("$(p_names.latent)_beta_warp")
-    W_main_name = Symbol("$(p_names.latent)_W_main")
-    b_main_name = Symbol("$(p_names.latent)_b_main")
+    W_warp_name = Symbol("$(p_names.sre)_W_warp")
+    b_warp_name = Symbol("$(p_names.sre)_b_warp")
+    beta_warp_name = Symbol("$(p_names.sre)_beta_warp")
+    W_main_name = Symbol("$(p_names.sre)_W_main")
+    b_main_name = Symbol("$(p_names.sre)_b_main")
     
     key = spec.key
     in_dims = spec_registry[:$(key)].hyper.in_dims
@@ -176,11 +176,11 @@ function get_priors(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::St
     # Prior for main GP coefficients (depends on method)
     if m.method == :noncentered
         push!(priors, """
-            $(p_names.innovations) ~ MvNormal(zeros(T, $(n_features)), I)
+            $(p_names.ure) ~ MvNormal(zeros(T, $(n_features)), I)
         """)
     elseif m.method == :centered
         push!(priors, """
-            $(p_names.latent) ~ MvNormal(
+            $(p_names.sre) ~ MvNormal(
                 zeros(T, $(n_features)), $(p_names.sigma)^2 * I
             )
         """)
@@ -213,11 +213,11 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    W_warp_name = Symbol("$(p_names.latent)_W_warp")
-    b_warp_name = Symbol("$(p_names.latent)_b_warp")
-    beta_warp_name = Symbol("$(p_names.latent)_beta_warp")
-    W_main_name = Symbol("$(p_names.latent)_W_main")
-    b_main_name = Symbol("$(p_names.latent)_b_main")
+    W_warp_name = Symbol("$(p_names.sre)_W_warp")
+    b_warp_name = Symbol("$(p_names.sre)_b_warp")
+    beta_warp_name = Symbol("$(p_names.sre)_beta_warp")
+    W_main_name = Symbol("$(p_names.sre)_W_main")
+    b_main_name = Symbol("$(p_names.sre)_b_main")
 
     key = spec.key
     in_dims = spec_registry[:$(key)].hyper.in_dims
@@ -250,10 +250,10 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
             $(common_code)
             
             # 3. Scale coefficients and compute final effect
-            local scaled_beta_main = $(p_names.innovations) .* $(p_names.sigma)
-            $(p_names.latent) = Phi_main * scaled_beta_main
+            local scaled_beta_main = $(p_names.ure) .* $(p_names.sigma)
+            $(p_names.sre) = Phi_main * scaled_beta_main
             
-            $(eta_target) .+= $(p_names.latent)
+            $(eta_target) .+= $(p_names.sre)
         end
     """
 
@@ -263,7 +263,7 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
             $(common_code)
             
             # 3. Sample coefficients directly and compute final effect
-            $(eta_target) .+= Phi_main * $(p_names.latent)
+            $(eta_target) .+= Phi_main * $(p_names.sre)
         end
     """
 
@@ -281,7 +281,11 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -306,11 +310,11 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
         
         # Define parameter names for this outcome
-        W_warp_name = string(Symbol("$(p_names_k.latent)_W_warp"))
-        b_warp_name = string(Symbol("$(p_names_k.latent)_b_warp"))
-        beta_warp_name = string(Symbol("$(p_names_k.latent)_beta_warp"))
-        W_main_name = string(Symbol("$(p_names_k.latent)_W_main"))
-        b_main_name = string(Symbol("$(p_names_k.latent)_b_main"))
+        W_warp_name = string(Symbol("$(p_names_k.sre)_W_warp"))
+        b_warp_name = string(Symbol("$(p_names_k.sre)_b_warp"))
+        beta_warp_name = string(Symbol("$(p_names_k.sre)_beta_warp"))
+        W_main_name = string(Symbol("$(p_names_k.sre)_W_main"))
+        b_main_name = string(Symbol("$(p_names_k.sre)_b_main"))
         sigma_name = string(p_names_k.sigma)
         ls_name = string(p_names_k.ls)
 
@@ -349,13 +353,13 @@ function get_effects(
             # 3. Scale coefficients and compute final effect on the CPU
             local beta_main_i_cpu
             if m.method == :noncentered
-                innovations_name = string(p_names_k.innovations)
-                beta_main_raw_samples_cpu = get_params_matrix(chain, innovations_name, n_features)
-                beta_main_raw_i_cpu = beta_main_raw_samples_cpu[i, :]
-                beta_main_i_cpu = beta_main_raw_i_cpu .* sigma_samples_cpu[i]
+                ure_name = string(p_names_k.ure)
+                beta_main_unscaled_samples_cpu = get_params_matrix(chain, ure_name, n_features)
+                beta_main_unscaled_i_cpu = beta_main_unscaled_samples_cpu[i, :]
+                beta_main_i_cpu = beta_main_unscaled_i_cpu .* sigma_samples_cpu[i]
             else # :centered
-                latent_name = string(p_names_k.latent)
-                beta_main_samples_cpu = get_params_matrix(chain, latent_name, n_features)
+                sre_name = string(p_names_k.sre)
+                beta_main_samples_cpu = get_params_matrix(chain, sre_name, n_features)
                 beta_main_i_cpu = beta_main_samples_cpu[i, :]
             end
             
