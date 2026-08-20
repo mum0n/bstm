@@ -6,7 +6,7 @@ It decomposes a set of multivariate outcomes into a smaller set of orthogonal la
 factors, and uses the dominant latent factor as a predictor in the main model.
 
 # Version
-v1.3.1 (2026-08-17)
+v1.4.0 (2026-08-19)
 
 # Mathematical Summary
 The `Eigen` component models a set of \$N_{vars}\$ observed variables 
@@ -175,9 +175,6 @@ function get_precomputes(m::Eigen, M::NamedTuple, mod_data::Dict)::NamedTuple
         error("Eigen module variables not found in data: $(missing_vars)")
     end
 
-    # Get the device transfer function from the main model object
-    to_device = M.to_device
-
     # Extract the data and center it (a standard assumption for PCA).
     # This is performed on the CPU.
     eigen_data_matrix_cpu = Matrix(data[!, vars_sym])
@@ -200,7 +197,7 @@ function get_precomputes(m::Eigen, M::NamedTuple, mod_data::Dict)::NamedTuple
     n_obs = size(eigen_data_matrix_cpu, 1)
 
     return (
-        eigen_data=to_device(eigen_data_matrix_cpu),
+        eigen_data=eigen_data_matrix_cpu,
         n_latent=n_obs,
         n_vars=n_vars,
         n_factors=n_factors,
@@ -225,12 +222,12 @@ function get_priors(
     ltri_indices_len = hyper.ltri_indices_len
 
     priors = String[]
-    push!(priors, "$(p_names.v_raw) ~ MvNormal(zeros($(ltri_indices_len)), I)")
+    push!(priors, "$(p_names.v_raw) ~ MvNormal(zeros(T, $(ltri_indices_len)), I)")
     push!(priors, "$(p_names.pca_sd) ~ filldist($(pca_sd_prior_str), $(n_factors))")
     push!(priors, "$(p_names.pdef_sd) ~ filldist($(pdef_sd_prior_str), $(n_vars))")
     
     if m.method == :noncentered
-        push!(priors, "$(p_names.factors_flat) ~ MvNormal(zeros($(n_obs * n_factors)), I)")
+        push!(priors, "$(p_names.factors_flat) ~ MvNormal(zeros(T, $(n_obs * n_factors)), I)")
     end
 
     return join(priors, "\n    ")
@@ -284,7 +281,7 @@ function get_updates(
             Cov_F_row = Symmetric(L * L')
             
             for i in 1:$(n_obs)
-                $(p_names.latent)[i, :] ~ MvNormal(zeros($(n_factors)), Cov_F_row)
+                $(p_names.latent)[i, :] ~ MvNormal(zeros(T, $(n_factors)), Cov_F_row)
             end
             
             Y_hat = $(p_names.latent) * L'
@@ -306,22 +303,33 @@ function get_updates(
     end
 end
 
+"""
+    get_effects(m::Eigen, chain, spec::NamedTuple, M::NamedTuple, PS)
+
+Reconstructs the `Eigen` component's effect from posterior samples. This version
+is CPU-only and uses modern chain accessors. The dominant (first) latent factor is
+returned as the effect.
+"""
 function get_effects(
     m::Eigen, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
-    p_names = names(chain)
+    p_names = string.(names(DataFrame(chain)))
     
     hyper = spec.hyper
     n_obs_train = hyper.n_latent
     n_factors = hyper.n_factors
     
     # Determine total number of observations (training + prediction)
-    n_obs_full = M.y_N + (isnothing(PS) ? 0 : size(PS.data, 1))
-    
+    n_obs_full = M.y_N + (isnothing(PS) ? 0 : size(PS.data, 1)) # Total observations (training + prediction)
+
     if !isnothing(PS)
         @warn "Prediction for the Eigen component '$(spec.key)' is not supported. " *
               "Returning zero effect for the prediction set."
@@ -342,19 +350,22 @@ function get_effects(
         if isempty(factors_flat_name)
             @warn "Parameter 'factors_flat' for Eigen component $(spec.key) not found. " *
                   "Returning zero-matrix."
-            factor_effect = zeros(Float64, n_obs_full, n_samples)
+            factor_effect = zeros(Float64, n_obs_full, n_samples) # Initialize with zeros
         else
-            # Samples are on CPU. Reconstruction is done on CPU.
-            factor_samples_train = get_params_matrix(
-                chain, factors_flat_name, n_obs_train * n_factors
+            # Samples are on CPU.
+            factor_samples_train = get_params_vector(
+                chain, factors_flat_name, n_obs_train * n_factors # (n_samples, n_obs_train * n_factors)
             )
+            # Reshape the flat [n_samples, n_params] matrix into a 3D tensor
+            # [n_obs, n_factors, n_samples]
+            F_tensor = reshape(factor_samples_train', n_obs_train, n_factors, n_samples)
+            
             # Initialize full effect matrix with zeros (handles prediction set)
             factor_effect = zeros(Float64, n_obs_full, n_samples)
-            for j in 1:n_samples
-                F_matrix_j = reshape(factor_samples_train[j, :], n_obs_train, n_factors)
-                # The effect is the first factor, applied only to training observations.
-                factor_effect[1:n_obs_train, j] = F_matrix_j[:, 1]
-            end
+            
+            # The effect is the first factor, applied only to training observations.
+            # Slicing the tensor is efficient.
+            factor_effect[1:n_obs_train, :] = F_tensor[:, 1, :]
         end
     else # :centered
         latent_name = _find_parameter(
@@ -368,12 +379,15 @@ function get_effects(
             latent_samples_train = get_params_matrix(
                 chain, latent_name, n_obs_train * n_factors
             )
+            # Reshape the flat [n_samples, n_params] matrix into a 3D tensor
+            # [n_obs, n_factors, n_samples]
+            F_tensor = reshape(latent_samples_train', n_obs_train, n_factors, n_samples)
+
+            # Initialize full effect matrix with zeros (handles prediction set)
             factor_effect = zeros(Float64, n_obs_full, n_samples)
-            for j in 1:n_samples
-                F_matrix_j = reshape(latent_samples_train[j, :], n_obs_train, n_factors)
-                # The effect is the first factor, applied only to training observations.
-                factor_effect[1:n_obs_train, j] = F_matrix_j[:, 1]
-            end
+
+            # The effect is the first factor, applied only to training observations.
+            factor_effect[1:n_obs_train, :] = F_tensor[:, 1, :]
         end
     end
 
@@ -382,6 +396,3 @@ function get_effects(
     
     return (structured=structured_effects, noisy=structured_effects)
 end
-
-
-

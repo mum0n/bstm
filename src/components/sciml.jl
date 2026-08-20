@@ -6,7 +6,7 @@ ecosystem into a Bayesian framework. It allows for the estimation of differentia
 equation parameters and initial conditions.
 
 # Version
-v1.3.0 (2026-08-17)
+v1.3.1 (2026-08-19)
 
 # Mathematical Summary
 This component models an observed process \$y(t)\$ as noisy observations of a latent
@@ -92,10 +92,7 @@ function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
         error("Time index variable ':$time_var_sym' for sciml() module not found in data.")
     end
 
-    # Get device transfer function
-    to_device = M.to_device
-
-    # Extract coordinates to CPU first, then move to device
+    # All computations are on the CPU.
     coords_cpu = M.data[!, time_var_sym]
 
     params = mod_data[:params]
@@ -135,7 +132,7 @@ function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
         prob_template=prob_template,
         solver=params[:solver],
         saveat=get(params, :saveat, 0.1),
-        coords=to_device(coords_cpu),
+        coords=coords_cpu,
         param_names=keys(m.p_priors)
     )
 end
@@ -232,22 +229,21 @@ function get_effects(
     m::SciML, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
     
     structured_effects = Vector{Matrix{Float64}}()
     key = spec.key
     hyper = spec.hyper
     param_names = hyper.param_names
 
-    # --- Coordinate Handling: Combine training and prediction sets ---
-    coords_train_cpu = Array(hyper.coords)
+    # --- Coordinate Handling: Combine training and prediction sets on CPU ---
+    coords_train_cpu = hyper.coords
     t_coords_full_cpu = if !isnothing(PS) && hasproperty(PS.data, Symbol(spec.var))
-        vcat(coords_train_cpu, Array(PS.data[!, Symbol(spec.var)]))
+        vcat(coords_train_cpu, PS.data[!, Symbol(spec.var)])
     else
         coords_train_cpu
     end
@@ -280,12 +276,12 @@ function get_effects(
         end
 
         # Extract posterior samples (CPU)
-        u0_samples_cpu = get_params_vector(chain, u0_name, length(m.u0_prior))
+        u0_samples_cpu = get_params_matrix(chain, u0_name, length(m.u0_prior))
         p_samples_cpu = Dict(p_name => get_params_vector(chain, p_var_name, 1) for (p_name, p_var_name) in p_var_names)
 
         prob_template = hyper.prob_template
 
-        # --- Ensemble Problem Setup for Parallel GPU Execution ---
+        # --- Ensemble Problem Setup for Parallel CPU Execution ---
         function prob_func(prob, i, repeat)
             u0_s = u0_samples_cpu[i, :]
             p_s_tuple = Tuple(p_samples_cpu[p_name][i, 1] for p_name in param_names)
@@ -294,13 +290,8 @@ function get_effects(
 
         ensemble_prob = EnsembleProblem(prob_template, prob_func=prob_func)
         
-        # Choose ensemble algorithm based on device
-        ensemble_alg = if parent_type(to_device(zeros(1))) <: CuArray
-            @info "Using EnsembleGPUKernel for SciML reconstruction."
-            EnsembleGPUKernel(0.0) # Auto-batching
-        else
-            EnsembleThreads()
-        end
+        # Use EnsembleThreads() for parallel CPU execution
+        ensemble_alg = EnsembleThreads()
 
         # Solve all trajectories in parallel
         sim = solve(ensemble_prob, hyper.solver, ensemble_alg; trajectories=n_samples, saveat=t_coords_full_cpu)
@@ -322,4 +313,4 @@ function get_effects(
     
     return (structured=structured_effects, noisy=structured_effects)
 end
-
+ 

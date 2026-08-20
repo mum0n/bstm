@@ -171,82 +171,95 @@ function get_updates(
         error("Unsupported method '$(m.method)' for SAR component.")
     end
 end
+
+
 """
     get_effects(m::SAR, chain, spec, M, PS)
 
-Reconstructs the SAR effect from posterior samples. This version is updated to
-handle GPU arrays by moving sampled parameters to the device for computation and
-moving the final results back to the CPU.
+Reconstructs the SAR effect from posterior samples. 
 """
 function get_effects(
-    m::SAR, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::SAR, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
+    
+    noise = M.noise
+    
+    n_latent = spec.hyper.n_latent
+    W_dag = spec.hyper.Q_template
+
+    # --- Coordinate/Index Handling: Combine training and prediction sets ---
+    s_idx_train = M.s_idx # Spatial indices for training data
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set is provided
+        vcat(s_idx_train, PS.data.s_idx) # Combine training and prediction indices
+    else
+        s_idx_train # Otherwise, use only training indices
+    end
+    N_total = length(s_idx_full) # Total number of observations (training + prediction)
 
     structured_effects = Vector{Matrix{Float64}}()
-    n_latent = spec.hyper.n_latent
-    noise = M.noise
-
-    # --- Index Handling: Combine training and prediction sets on device ---
-    s_idx_train = M.s_idx # Already on device
-    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
-        s_idx_pred_cpu = get(PS.data, :s_idx, [])
-        vcat(s_idx_train, to_device(s_idx_pred_cpu))
-    else
-        s_idx_train
-    end
-    N_total = length(s_idx_full)
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        
+        # Find parameter names in the MCMC chain
         rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(rho_name) || isempty(innovations_name)
+        if isempty(rho_name) || isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for SAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_samples_cpu = get_params_vector(chain, rho_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_vector(chain, innovations_name, n_latent)
+        rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
+        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
         
-        # Initialize the output matrix for the full latent field on the target device
-        effect_k_latent_device = to_device(zeros(Float64, n_latent, n_samples))
-        
-        W_std_device = spec.hyper.Q_template # Already on device
-        I_device = to_device(Matrix(I, n_latent, n_latent))
+        # Initialize the output matrix for latent effects
+        latent_field_matrix = zeros(Float64, n_latent, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
-        for s in 1:n_samples
-            rho_s_device = to_device(rho_samples_cpu[s])
-            sigma_s_device = to_device(sigma_samples_cpu[s])
-            innov_s_device = to_device(innovations_samples_cpu[s, :])
-
-            L_op = I_device - rho_s_device * W_std_device
-            A_sar = L_op' * L_op
-            Q_sar = (A_sar + A_sar') / 2.0
-            Q_final = Symmetric(Q_sar / (sigma_s_device^2) + noise * I_device)
-            
-            # Use dense Cholesky for AD-safety and GPU compatibility
-            F = cholesky(Matrix(Q_final) + I_device * 1e-9)
-            effect_k_latent_device[:, s] = F.L' \ innov_s_device
+        # --- Sample-wise Reconstruction ---
+        if m.method == :forward_substitution
+            for i in 1:n_samples
+                innov_i = innovations_samples[i, :]
+                latent_field_i = zeros(Float64, n_latent)
+                
+                for j in 1:n_latent
+                    parent_effect = 0.0
+                    for j_ptr in nzrange(W_dag, j)
+                        parent_idx = W_dag.rowval[j_ptr]
+                        parent_effect += W_dag.nzval[j_ptr] * latent_field_i[parent_idx]
+                    end
+                    latent_field_i[j] = rho_samples[i, 1] * parent_effect + innov_i[j]
+                end
+                latent_field_matrix[:, i] = latent_field_i .* sigma_samples[i, 1]
+            end
+        else # :precision
+            for i in 1:n_samples
+                innov_i = innovations_samples[i, :]
+                
+                L_op = I - rho_samples[i, 1] * W_dag
+                Q = L_op' * L_op
+                
+                F = cholesky(Symmetric(Matrix(Q) + noise * I))
+                latent_field_i = sigma_samples[i, 1] .* (F.U \ innov_i)
+                latent_field_matrix[:, i] = latent_field_i
+            end
         end
-        
-        # Index the reconstructed effects for the full observation set and move back to CPU
-        indexed_effects_device = effect_k_latent_device[s_idx_full, :]
-        push!(structured_effects, Array(indexed_effects_device))
+        # Index the reconstructed latent effects to match the observation indices
+        indexed_effects = latent_field_matrix[s_idx_full, :]
+        push!(structured_effects, indexed_effects)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+ 

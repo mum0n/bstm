@@ -6,7 +6,7 @@ triangulation of knot points. This method is particularly well-suited for modeli
 smooth spatial effects on irregular domains.
 
 # Version
-v1.1.4 (2026-08-15)
+v1.2.0 (2026-08-19)
 
 # Mathematical Summary
 The component models a function \$f(s)\$ where \$s\$ is a 2D coordinate.
@@ -71,6 +71,7 @@ MODEL_TO_STRUCTURE_MAP[:barycentric] = :smooth
 
 Pre-computes the barycentric basis matrix. For the `:gmrfsmooth` method, it also
 computes the precision matrix template and spectral decomposition for the knot grid.
+This version is CPU-only.
 """
 function get_precomputes(
     m::Barycentric, M::NamedTuple, mod_data::Dict
@@ -215,32 +216,38 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for Barycentric component."); end
 end
 
-
 """
-    get_effects(m::Barycentric, chain, M, n_samples, outcomes_N, p_names, spec, PS, N_total, is_multivariate_model)
+    get_effects(m::Barycentric, chain, spec::NamedTuple, M::NamedTuple, PS)
 
-Reconstructs the barycentric smooth effect from posterior samples, dispatching
-on the method used during sampling.
+Reconstructs the barycentric smooth effect from posterior samples. This version is
+CPU-only and uses modern chain accessors.
 """
-function get_effects( # Line 283
-    m::Barycentric, chain::Chains, spec::NamedTuple, M::NamedTuple,
+function get_effects(
+    m::Barycentric, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    structured_effects = Vector{Matrix{Float64}}()
-    
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
+    outcomes_N = M.outcomes_N
+    is_multivariate_model = M.model_arch == "multivariate"
+    p_names = string.(names(DataFrame(chain)))
+    noise_val = get(M, :noise, 1e-6)
+    n_knots = spec.hyper.n_knots
+
+    # --- Basis Matrix Handling (CPU only) ---
     B_train = spec.hyper.B
     B_full = if !isnothing(PS)
         coord_vars = get(spec.params, :positional_args, [])
         if all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-            coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-            # bstm_barycentric_basis_2D creates a CPU sparse matrix
-            B_pred_cpu = bstm_barycentric_basis_2D(coords_pred_cpu, spec.hyper.knots)
-            # Move B_pred to the target device if GPU is enabled
-            B_pred_device = M.to_device(B_pred_cpu)
-            vcat(B_train, B_pred_device)
+            coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
+            B_pred = bstm_barycentric_basis_2D(coords_pred, spec.hyper.knots)
+            vcat(B_train, B_pred)
         else
-            @warn "Prediction coordinates not found for Barycentric component " *
-                  "$(spec.key). Returning effects for training data only."
+            @warn "Prediction coordinates not found for Barycentric component $(spec.key). Returning effects for training data only."
             B_train
         end
     else
@@ -248,89 +255,63 @@ function get_effects( # Line 283
     end
     n_obs_full = size(B_full, 1)
 
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
-    outcomes_N = M.outcomes_N
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device # This will be Array or CuArray etc.
-    noise_val = get(M, :noise, 1e-6)
-    n_knots = spec.hyper.n_knots
+    structured_effects = Vector{Matrix{Float64}}()
 
+    # --- Reconstruction Loop ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
-        sigma_name = _find_parameter(
-            p_names, string(p_names_k.sigma), k, is_multivariate_model
-        )
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         
         if isempty(sigma_name)
-            @warn "Sigma parameter for Barycentric component $(spec.key) (outcome $k) " *
-                  "not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, size(B_full, 1), n_samples))
+            @warn "Sigma parameter for Barycentric component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        # Initialize the output matrix for coefficients on the target device
-        coeffs_samples_matrix_device = to_device(zeros(Float64, n_knots, n_samples))
+        
+        # Initialize the output matrix for coefficients on the CPU
+        coeffs_samples_matrix = zeros(Float64, n_knots, n_samples)
         
         if m.method == :centered
-            latent_name = _find_parameter(
-                p_names, string(p_names_k.latent), k, is_multivariate_model
-            )
+            latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
             if !isempty(latent_name)
-                latent_samples_cpu = get_params_matrix(chain, latent_name, n_knots)
-                for i in 1:n_samples
-                    # Move samples to device for computation
-                    latent_device = to_device(latent_samples_cpu[i, :])
-                    sigma_device = to_device(sigma_samples[i])
-                    coeffs_samples_matrix_device[:, i] = latent_device .* sigma_device
-                end
+                # get_params_vector returns [n_samples x n_params], so we transpose it
+                latent_samples = get_params_vector(chain, latent_name, n_knots)'
+                coeffs_samples_matrix = latent_samples .* sigma_samples'
             else
-                @warn "Latent coefficients for centered Barycentric component " *
-                      "$(spec.key) (outcome $k) not found. Using zeros."
+                @warn "Latent coefficients for centered Barycentric component $(spec.key) (outcome $k) not found. Using zeros."
             end
         else # :noncentered or :gmrfsmooth
-            innov_name = _find_parameter(
-                p_names, string(p_names_k.innovations), k, is_multivariate_model
-            )
+            innov_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
             if !isempty(innov_name)
-                innov_samples_cpu = get_params_matrix(chain, innov_name, n_knots)
+                innov_samples = get_params_vector(chain, innov_name, n_knots)' # Transpose to [n_knots x n_samples]
+                
                 if m.method == :noncentered
-                    for i in 1:n_samples
-                        # Move samples to device for computation
-                        innov_device = to_device(innov_samples_cpu[i, :])
-                        sigma_device = to_device(sigma_samples[i])
-                        coeffs_samples_matrix_device[:, i] = innov_device .* sigma_device
-                    end
+                    coeffs_samples_matrix = innov_samples .* sigma_samples'
                 else # :gmrfsmooth
-                    U = spec.hyper.U # Already on device
-                    L = spec.hyper.L # Already on device
+                    U = spec.hyper.U
+                    L = spec.hyper.L
                     for i in 1:n_samples
-                        # Move samples to device for computation
-                        innov_device = to_device(innov_samples_cpu[i, :])
-                        sigma_device = to_device(sigma_samples[i])
-                        
-                        diag_D_device = sigma_device ./ sqrt.(L .+ noise_val)
-                        diag_D_device[1] = 0.0 # Assuming L[1] corresponds to the rank-deficient mode
-                        coeffs_samples_matrix_device[:, i] = U * (diag_D_device .* innov_device)
+                        diag_D = sigma_samples[i] ./ sqrt.(L .+ noise_val)
+                        diag_D[1] = 0.0 # Assuming L[1] corresponds to the rank-deficient mode
+                        coeffs_samples_matrix[:, i] = U * (diag_D .* innov_samples[:, i])
                     end
                 end
             else
-                 @warn "Innovations for Barycentric component $(spec.key) " *
-                       "(outcome $k) not found. Using zeros."
+                 @warn "Innovations for Barycentric component $(spec.key) (outcome $k) not found. Using zeros."
             end
         end
         
-        # Perform matrix multiplication on the device
-        effect_k_device = B_full * coeffs_samples_matrix_device
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        # Perform matrix multiplication on the CPU
+        effect_k = B_full * coeffs_samples_matrix
+        push!(structured_effects, effect_k)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
-end
+end 
+
 
 
 

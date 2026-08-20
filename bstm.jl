@@ -1,25 +1,28 @@
+
 module bstm
 
     # Use Reexport for its macro, but be selective about what is re-exported.
-    using Reexport
 
     # List of packages to be re-exported by bstm.jl.
     # This provides a unified namespace for the user. 
     # Only re-export Turing, as bstm is a framework built on Turing.
     # This makes Turing's @model macro and other core functionalities
     # directly available when 'using bstm'.
-    @reexport using Turing
+    using Reexport
+
     @reexport using Distributions
+    @reexport using Turing
+    # @reexport using DynamicPPL
 
     # Packages that are fundamental to bstm's internal operation
     # but whose entire API is NOT intended to be part of bstm's public API.
     # Users should explicitly 'using' these if they need their full API.
-    using AbstractGPs, AbstractMCMC, AbstractPPL, ADTypes, AdvancedVI, KernelAbstractions, GPUArrays,
+    using AbstractGPs, AbstractMCMC, ADTypes, AdvancedVI, KernelAbstractions,  
           Bijectors, CategoricalArrays, Clustering, DataFrames,
-          DelaunayTriangulation, DimensionalData, LogExpFunctions,
-          Distances, DynamicPPL, FFTW, FillArrays, FlexiChains,
+          DelaunayTriangulation, DimensionalData, DynamicPPL, LogExpFunctions,
+          Distances, FFTW, FillArrays, FlexiChains,
           NNlib, GLM, Graphs, HypothesisTests, Interpolations, JLD2,
-          KernelFunctions, LibGEOS, LinearAlgebra, MCMCChains, NamedArrays,
+          KernelFunctions, LibGEOS, LinearAlgebra, NamedArrays,
           NearestNeighbors, Optim, Optimisers, OrderedCollections, PDMats,
           Plots, PosteriorStats, Random, Requires, SparseArrays,
           SpecialFunctions, StaticArrays, Statistics, StatsBase, StatsModels,
@@ -30,19 +33,19 @@ module bstm
     srcdir = joinpath(rootdir, "src")
 
     # Core framework files
-    includet(joinpath(srcdir, "definitions.jl"))  # must be first
-    includet(joinpath(srcdir, "data.jl"))
-    includet(joinpath(srcdir, "partitioning.jl"))
-    includet(joinpath(srcdir, "model.jl"))
-    includet(joinpath(srcdir, "likelihoods.jl"))
-    includet(joinpath(srcdir, "reconstruction.jl")) 
+    include(joinpath(srcdir, "definitions.jl"))  # must be first
+    include(joinpath(srcdir, "data.jl"))
+    include(joinpath(srcdir, "partitioning.jl"))
+    include(joinpath(srcdir, "model.jl"))
+    include(joinpath(srcdir, "likelihoods.jl"))
+    include(joinpath(srcdir, "reconstruction.jl")) 
       
     # component definitions
     components_dir = joinpath(srcdir, "components")
     
     for f in readdir(components_dir)
         if endswith(f, ".jl")
-            includet(joinpath(components_dir, f))
+            include(joinpath(components_dir, f))
         end
     end
 
@@ -51,38 +54,6 @@ module bstm
     export bstm_cv_orchestrator, bstm_plots, bstm_sample
     export assign_spatial_units_inferred, plot_spatial_graph, plot_kde_simple, plot_choropleth
     export assign_spatial_units, assign_time_units, bstm_data
-
-    function load_project_functions( src_dir )
-      
-      fns_main = [
-        "definitions.jl",
-        "data.jl", 
-        "partitioning.jl", 
-        "model.jl", 
-        "likelihoods.jl", 
-        "reconstruction.jl"
-      ]
-
-      fns = joinpath.( src_dir, fns_main )
-
-      fnc = readdir( joinpath( src_dir, "components" ) )
-      for fn in fnc 
-        push!(fns, joinpath(src_dir, "components", fn) )
-      end
-
-      
-      for fn in fns 
-        if endswith(fn, ".jl")
-          try
-            println(fn)  
-            include(fn)
-          catch e
-              @error "Error including file '$fn':" e
-          end
-        end
-      end
-
-    end
 
 
     # Module initialization function
@@ -120,11 +91,11 @@ module bstm
             # This provides a unified namespace for the user.
         pkgs_bstm = [ 
             "AbstractGPs", "AbstractMCMC", "AbstractPPL", "ADTypes", "AdvancedVI", 
-            "Bijectors", "CategoricalArrays", "Clustering", "DataFrames", "KernelAbstractions", "GPUArrays",
+            "Bijectors", "CategoricalArrays", "Clustering", "DataFrames", "KernelAbstractions", 
             "DelaunayTriangulation", "DimensionalData", "LogExpFunctions", "Turing", 
             "Distances", "Distributions", "DynamicPPL", "FFTW", "FillArrays", "FlexiChains", 
             "NNlib", "GLM", "Graphs", "HypothesisTests", "Interpolations", "JLD2", 
-            "KernelFunctions", "LibGEOS", "LinearAlgebra", "MCMCChains", "NamedArrays", 
+            "KernelFunctions", "LibGEOS", "LinearAlgebra", "NamedArrays", 
             "NearestNeighbors", "Optim", "Optimisers", "OrderedCollections", "PDMats", 
             "Plots", "PosteriorStats", "Random", "Requires", "SparseArrays", 
             "SpecialFunctions", "StaticArrays", "Statistics", "StatsBase", "StatsModels", 
@@ -135,7 +106,7 @@ module bstm
         try
           for pk in pkgs_bstm;  @eval using $(Symbol(pk)); end
         catch e
-          # force install all (if in amn incomplete state or first run):
+          # force install all (if in an incomplete state or first run):
           Pkg.add(pkgs_bstm);
           for pk in pkgs_bstm;  @eval using $(Symbol(pk)); end
           print( "\nInstall not complete or inconsistent, installing required packages. This might require multiple restarts and a bit of time...hours? \n\n" ) 
@@ -144,14 +115,44 @@ module bstm
           Pkg.gc() # tidy loose ends:
         end
     
+
+            
+        function load_project_functions( src_dir )
+          
+          fns_main = [
+            "definitions.jl",
+            "data.jl", 
+            "partitioning.jl", 
+            "model.jl", 
+            "likelihoods.jl", 
+            "reconstruction.jl"
+          ]
+
+          fns = joinpath.( src_dir, fns_main )
+
+          fnc = readdir( joinpath( src_dir, "components" ) )
+          for fn in fnc 
+            push!(fns, joinpath(src_dir, "components", fn) )
+          end
+
+          
+          for fn in fns 
+            if endswith(fn, ".jl")
+              try
+                println(fn)  
+                include(fn)
+              catch e
+                  @error "Error including file '$fn':" e
+              end
+            end
+          end
+
+          include(joinpath(src_dir, "tmp.jl"))
+
+        end
+
         load_project_functions( "C:\\home\\jae\\projects\\bstm\\src" )
     
-        if false
-
-          cd( "/home/jae/projects/bstm" ) # where you saved it
-          include("bstm.jl")
-          using .bstm
-
           data_scot, _ = bstm_data(); # Default is "scottish_lip"
           inp_df = data_scot.data;
           W = data_scot.au.W
@@ -164,22 +165,23 @@ module bstm
                   random(year, model=ar1),
               inp_df,
               W = W,
-              use_gpu = true,
               verbose = false # Suppress verbose output
           ); 
 
-          os = get_optimal_sampler(m, 5)
+          # different sampling mechanisms
+          chn = sample(m, MH(), 10; progress=false)  # fast debug
 
-          chn = sample(m, MH(), 100; progress=false)
           chn = sample(m, NUTS(), 10; progress=false)
-          chn = sample(m, os, 10; progress=false)
           
+          os = get_optimal_sampler(m; adaptation_steps=5, n_chains=3)
+          chn = bstm_sample(m, os, 10; progress=false)
+
+          chn = bstm_sample(m, 10; n_chains=3, progress=false)  # uses get_optimal_sampler 
+
           res = model_results_comprehensive( m, chn; au=data_scot.au);
 
           println(res.summary_stats)
-
-        end
-
+ 
     end
 
 end # module bstm

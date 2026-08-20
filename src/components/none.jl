@@ -7,7 +7,7 @@ interactions) or for situations where a component is syntactically required but 
 effect is desired.
 
 # Version
-v1.0.0 (2026-08-08)
+v1.1.0 (2026-08-19)
 
 # Mathematical Summary
 This component has no mathematical form and adds nothing to the model's linear
@@ -68,16 +68,25 @@ function get_updates(
 end
 
 """
-    get_effects(m::None, chain, M::NamedTuple, ...)::NamedTuple
+    get_effects(m::None, chain, spec::NamedTuple, M::NamedTuple, PS)
 
 Returns a zero-effect `NamedTuple` as the `None` component has no effect to
-reconstruct.
+reconstruct. This version is CPU-only and uses modern chain accessors.
 """
 function get_effects(
-    m::None, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
-    spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int
+    m::None, chain, spec::NamedTuple, M::NamedTuple,
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
+    outcomes_N = M.outcomes_N
+    N_total = M.y_N + (isnothing(PS) ? 0 : size(PS.data, 1))
+
     # The effect is always zero.
     structured_effects = [zeros(Float64, N_total, n_samples) for _ in 1:outcomes_N]
     return (structured=structured_effects, noisy=structured_effects)
-end
+end 

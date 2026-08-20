@@ -6,7 +6,7 @@ This provides an "escape hatch" for advanced users who need to implement logic
 not covered by the standard components.
 
 # Version
-v1.1.3 (2026-08-15)
+v1.2.0 (2026-08-19)
 
 # Mathematical Summary
 This component does not have a fixed mathematical form. It is a "blank canvas"
@@ -115,20 +115,19 @@ function get_updates(
 end
 
 """
-    get_effects(m::Custom, chain, spec, M, PS)
+    get_effects(m::Custom, chain, spec::NamedTuple, M::NamedTuple, PS)
 
 Calls a user-provided `reconstruct_func` for posterior reconstruction. If no
 function is provided, it returns a zero-effect with a warning.
 
 The user's function is expected to have the signature:
-`(m::Custom, chain::Chains, spec::NamedTuple, M::NamedTuple, PS::Union{NamedTuple, Nothing}) -> NamedTuple`
+`(m::Custom, chain, spec::NamedTuple, M::NamedTuple, PS::Union{NamedTuple, Nothing}) -> NamedTuple`
 
-The user's function is responsible for all GPU-to-CPU data transfers. It will receive
-GPU-backed arrays within `M` and `spec` if `use_gpu=true`, and it **must** return a
-`NamedTuple` containing standard CPU `Array`s.
+The user's function will receive standard CPU arrays within `M` and `spec` and
+should return a `NamedTuple` containing standard CPU `Array`s.
 """
 function get_effects(
-    m::Custom, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::Custom, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     reconstruct_func = get(m.params, :reconstruct_func, nothing)
@@ -136,7 +135,6 @@ function get_effects(
     if !isnothing(reconstruct_func) && isa(reconstruct_func, Function)
         try
             # The user's function is called with the modern, standardized arguments.
-            # It is the user's responsibility to handle GPU data within this function.
             return reconstruct_func(m, chain, spec, M, PS)
         catch e
             @error "The custom reconstruction function for component '$(spec.key)' failed."
@@ -147,7 +145,11 @@ function get_effects(
               "Returning a zero-effect. Provide a `reconstruct_func` to the " *
               "`custom()` module to enable posterior reconstruction."
         
-        n_samples = size(chain, 1) * size(chain, 3)
+        n_samples = if occursin("FlexiChain", string(typeof(chain)))
+            size(chain, 1) * FlexiChains.nchains(chain)
+        else
+            size(chain, 1) * size(chain, 3)
+        end
         outcomes_N = M.outcomes_N
         N_total = M.y_N + (isnothing(PS) ? 0 : size(PS.data, 1))
 
@@ -156,4 +158,5 @@ function get_effects(
         ]
         return (structured=structured_effects, noisy=structured_effects)
     end
-end
+end 
+ 

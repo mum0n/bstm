@@ -8,7 +8,7 @@ structured on a bipartite graph, where nodes are divided into two disjoint sets,
 and edges only connect nodes from different sets.
 
 # Version
-v1.0.8 (2026-08-15)
+v1.1.0 (2026-08-19)
 
 # Mathematical Summary
 The BCGN component models a latent spatial field on one partition of a bipartite
@@ -72,7 +72,8 @@ MODEL_TO_STRUCTURE_MAP[:bcgn] = :spatial
 
 Pre-computes the precision matrix `Q_template` from the one-mode projection of the
 bipartite graph, along with its spectral decomposition, Cholesky factorization,
-and a mapping matrix to link latent effects to observations.
+and a mapping matrix to link latent effects to observations. This is a CPU-only
+implementation.
 """
 function get_precomputes(m::BCGN, M::NamedTuple, mod_data::Dict)::NamedTuple
     W = get(M, :W, nothing)
@@ -141,7 +142,7 @@ function get_priors(
     return """
     # Priors for BCGN component: $(spec.key)
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.innovations) ~ MvNormal(zeros($(n_latent)), I)
+    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
     """
 end
 
@@ -149,7 +150,8 @@ end
     get_updates(m::BCGN, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
 Generates code to compute the BCGN effect and add it to the linear predictor `eta`.
-Supports three methods: `:spectral`, `:cholesky`, and `:cholesky_sparse`.
+Supports three methods: `:spectral`, `:cholesky`, and `:cholesky_sparse`. This is a
+CPU-only implementation.
 """
 function get_updates(
     m::BCGN, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -215,49 +217,46 @@ function get_updates(
 end
 
 """
-    get_effects(m::BCGN, chain, spec, M, PS)
+    get_effects(m::BCGN, chain, spec::NamedTuple, M::NamedTuple, PS)
 
 Reconstructs the `BCGN` component's effect from the MCMC chain's posterior samples.
-  handle GPU arrays by moving sampled parameters to the
-device for computation and moving the final results back to the CPU. It also uses
-the modern, simplified function signature.
+This version is CPU-only and uses modern chain accessors.
 """
 function get_effects(
-    m::BCGN, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::BCGN, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
+    # --- Setup: Extract dimensions ---
     n_samples = size(chain, 1) * size(chain, 3)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(names(DataFrame(chain)))
+    
     noise = M.noise
     n_latent = spec.hyper.n_latent
 
     # --- Coordinate/Index Handling: Combine training and prediction sets on CPU ---
-    s_idx_train_cpu = M.s_idx isa AbstractArray ? Array(M.s_idx) : M.s_idx
+    s_idx_train = Array(M.s_idx)
     
-    s_idx_full_cpu = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
-        vcat(s_idx_train_cpu, PS.data.s_idx)
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
+        vcat(s_idx_train, PS.data.s_idx)
     else
-        s_idx_train_cpu
+        s_idx_train
     end
-    N_total = length(s_idx_full_cpu)
+    N_total = length(s_idx_full)
 
-    # --- Mapping Matrix Construction: Build on CPU, then move to device ---
+    # --- Mapping Matrix Construction on CPU ---
     set1_map = Dict(original_idx => new_idx for (new_idx, original_idx) in enumerate(spec.hyper.set1_indices))
     
     mapping_matrix_cpu = spzeros(Float64, N_total, n_latent)
     for i in 1:N_total
-        original_s_idx = s_idx_full_cpu[i]
+        original_s_idx = s_idx_full[i]
         if haskey(set1_map, original_s_idx)
             latent_idx = set1_map[original_s_idx]
             mapping_matrix_cpu[i, latent_idx] = 1.0
         end
     end
-    # Move to device as a dense matrix for efficient multiplication
-    mapping_matrix_full = to_device(Matrix(mapping_matrix_cpu))
+    mapping_matrix_full = Matrix(mapping_matrix_cpu)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -274,41 +273,41 @@ function get_effects(
         end
 
         # Extract posterior samples from the chain (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
-        # Initialize the output matrix for latent effects on the target device
-        effect_k_device = to_device(zeros(Float64, n_latent, n_samples))
+        # Initialize the output matrix for latent effects on the CPU
+        effect_k_matrix = zeros(Float64, n_latent, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction on the CPU ---
         if m.method == :spectral
-            U = spec.hyper.U # Already on device
-            L = spec.hyper.L # Already on device
-            innov_samples_device = to_device(innovations_samples_cpu') # Move all innovations at once
+            U = spec.hyper.U
+            L = spec.hyper.L
+            innov_samples_T = innovations_samples' # Transpose to [n_latent x n_samples]
 
             for j in 1:n_samples
-                sigma_j = sigma_samples_cpu[j] # CPU scalar
+                sigma_j = sigma_samples[j]
                 
                 diag_D = sigma_j ./ sqrt.(L .+ noise)
                 diag_D[L .< 1e-6] .= 0.0
-                effect_k_device[:, j] = U * (diag_D .* innov_samples_device[:, j])
+                effect_k_matrix[:, j] = U * (diag_D .* innov_samples_T[:, j])
             end
         else # :cholesky or :cholesky_sparse
-            F = spec.hyper.cholesky_factor # Already on device
-            innov_samples_device = to_device(innovations_samples_cpu')
+            F = spec.hyper.cholesky_factor
+            innov_samples_T = innovations_samples'
 
             for j in 1:n_samples
-                sigma_j = sigma_samples_cpu[j]
+                sigma_j = sigma_samples[j]
 
-                latent_field_raw = F.L' \ innov_samples_device[:, j]
+                latent_field_raw = F.L' \ innov_samples_T[:, j]
                 latent_field_raw .-= mean(latent_field_raw)
-                effect_k_device[:, j] = latent_field_raw .* sigma_j
+                effect_k_matrix[:, j] = latent_field_raw .* sigma_j
             end
         end
         
-        # Apply mapping to get observation-level effects and move the final result to CPU
-        indexed_effects_device = mapping_matrix_full * effect_k_device
-        push!(structured_effects, Array(indexed_effects_device))
+        # Apply mapping to get observation-level effects
+        indexed_effects = mapping_matrix_full * effect_k_matrix
+        push!(structured_effects, indexed_effects)
     end
     
     return (structured=structured_effects, noisy=structured_effects)

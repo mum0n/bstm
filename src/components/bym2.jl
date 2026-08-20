@@ -6,7 +6,7 @@ parameterization for spatial effects by separating them into a structured (ICAR)
 and an unstructured (IID) component.
 
 # Version
-v2.1.0 (2026-08-17)
+v2.2.1 (2026-08-19)
 
 # Mathematical Summary
 The BYM2 model decomposes a spatial random effect \$\\boldsymbol{\\phi}\$ into two parts:
@@ -59,9 +59,13 @@ COMPONENT_CONSTRUCTORS[:bym2] = (p, params) -> BYM2(
     get(params, :method, :spectral)
 )
  
-
 MODEL_TO_STRUCTURE_MAP[:bym2] = :spatial
 
+"""
+    get_precomputes(m::BYM2, M::NamedTuple, mod_data::Dict)::NamedTuple
+
+Performs data-dependent setup for the BYM2 model. This version is CPU-only.
+"""
 function get_precomputes(m::BYM2, M::NamedTuple, mod_data::Dict)::NamedTuple
     if !hasproperty(M, :W) || !isa(M.W, AbstractMatrix) || isempty(M.W)
         error("BYM2 model requires a valid, non-empty adjacency matrix `W` " *
@@ -75,49 +79,48 @@ function get_precomputes(m::BYM2, M::NamedTuple, mod_data::Dict)::NamedTuple
               "model configuration.")
     end
 
-    # Get the device transfer function
-    to_device = M.to_device
-
     # build_structure_template returns CPU arrays
     template = build_structure_template(:bym2, s_N; W=M.W)
     
-    # Move precomputed structures to the target device
-    Q_template_device = to_device(template.matrix)
-    U_device = to_device(template.U)
-    L_device = to_device(template.L)
-    
-    # Pre-compute the dense Cholesky factor for the :cholesky method on the target device
-    F_device = cholesky(Symmetric(Matrix(Q_template_device) + M.noise * I))
+    # Pre-compute the dense Cholesky factor for the :cholesky method on the CPU
+    F_cpu = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
 
     return (
-        Q_template=Q_template_device,
-        U=U_device,
-        L=L_device,
+        Q_template=template.matrix,
+        U=template.U,
+        L=template.L,
         scaling_factor=template.scaling_factor,
         n_latent=s_N,
-        cholesky_factor=F_device
+        cholesky_factor=F_cpu
     )
 end
 
+"""
+    get_priors(m::BYM2, spec::NamedTuple, arch::String, outcome_idx, M)::String
+
+Generates priors for the BYM2 component's parameters, including the mixing
+parameter, overall scale, and innovations for the structured and unstructured parts.
+"""
 function get_priors(
-    m::BYM2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, 
+    m::BYM2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     n_latent = spec.hyper.n_latent
-
-    priors = String[]
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.unconstrained_rho) ~ " *
-                    "$(_distribution_to_string(m.unconstrained_rho))")
     
-    # Priors for the raw innovations for the structured and unstructured components.
-    push!(priors, "$(p_names.struct) ~ MvNormal(zeros(T, $(n_latent)), I)")
-    push!(priors, "$(p_names.iid) ~ MvNormal(zeros(T, $(n_latent)), I)")
-    
-    return join(priors, "\n    ")
+    return """
+    $(p_names.unconstrained_rho) ~ $(_distribution_to_string(m.unconstrained_rho))
+    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+    $(p_names.struct) ~ MvNormal(zeros(T, $(n_latent)), I)
+    $(p_names.iid) ~ MvNormal(zeros(T, $(n_latent)), I)
+    """
 end
 
+"""
+    get_updates(m::BYM2, spec::NamedTuple, arch::String, outcome_idx, M)::String
+
+Generates the Turing code for constructing the BYM2 effect. This version is CPU-only.
+"""
 function get_updates(
     m::BYM2, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, 
     M::NamedTuple
@@ -133,12 +136,12 @@ function get_updates(
             hyper = spec_registry[:$(key)].hyper
             rho = logistic($(p_names.unconstrained_rho))
             
-            # Construct the diagonal of the spectral transformation matrix D.
-            diag_D_structured = 1.0 ./ sqrt.(hyper.L .+ M.noise)
-            diag_D_structured[1] = 0.0 # Enforce sum-to-zero constraint
-
+            # Construct the diagonal of the spectral transformation matrix D on CPU
+            diag_D_cpu = 1.0 ./ sqrt.(hyper.L .+ M.noise)
+            diag_D_cpu[1] = 0.0 # Enforce sum-to-zero constraint
+            
             # Apply the spectral transformation: latent = U * D * z
-            structured_effect = hyper.U * (diag_D_structured .* $(p_names.struct))
+            structured_effect = hyper.U * (diag_D_cpu .* $(p_names.struct))
             
             # Combine structured and unstructured components
             $(p_names.latent) = $(p_names.sigma) .* (sqrt(rho) .* structured_effect .+ 
@@ -155,7 +158,7 @@ function get_updates(
             rho = logistic($(p_names.unconstrained_rho))
             F = hyper.cholesky_factor
             
-            struct_latent_raw = F.L' \\ $(p_names.struct)
+            struct_latent_raw = F.L' \\\\ $(p_names.struct)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), 
                                        sum(struct_latent_raw))
             
@@ -174,7 +177,7 @@ function get_updates(
             Q_penalty = hyper.Q_template
             F = cholesky(Symmetric(Q_penalty + M.noise * I))
             
-            struct_latent_raw = F.L' \\ $(p_names.struct)
+            struct_latent_raw = F.L' \\\\ $(p_names.struct)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), 
                                        sum(struct_latent_raw))
             
@@ -191,100 +194,93 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for BYM2 component."); end
 end
 
+"""
+    get_effects(m::BYM2, chain, spec::NamedTuple, M::NamedTuple, PS)
 
+Reconstructs the posterior distribution of the BYM2 spatial effect from an MCMC chain.
+This version is CPU-only and uses modern chain accessors.
+"""
 function get_effects(
     m::BYM2, chain, spec::NamedTuple, M::NamedTuple,
-    PS::Union{Nothing, NamedTuple}
+    PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
-    outcomes_N = M.outcomes_N
-    is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
-    noise = M.noise
-    hyper = spec.hyper
-    n_latent = hyper.n_latent
-
-    # --- Coordinate/Index Handling: Combine training and prediction sets ---
-    s_idx_train_device = M.s_idx # Already on device
-    s_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
-        s_idx_pred_cpu = get(PS.data, :s_idx, [])
-        vcat(s_idx_train_device, to_device(s_idx_pred_cpu))
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
     else
-        s_idx_train_device
+        size(chain, 1) * size(chain, 3)
     end
-    N_total = length(s_idx_full_device)
+    outcomes_N = M.outcomes_N
+    p_names = string.(keys(chain))
+    is_multivariate = outcomes_N > 1
+    n_latent = spec.hyper.n_latent
+    noise = M.noise
+
+    # Combine spatial indices from training and prediction sets
+    s_idx_full = if haskey(M, :s_idx) # Check if spatial index exists in training data
+        if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set and it has spatial index
+            vcat(M.s_idx, PS.data.s_idx) # Concatenate training and prediction indices
+        else
+            M.s_idx # Otherwise, use only training indices
+        end
+    else # If no spatial index in training data, this is an error for BYM2
+        error("Spatial index `:s_idx` not found in model configuration for BYM2 component.")
+    end
+    N_total = length(s_idx_full)
 
     structured_effects = Vector{Matrix{Float64}}()
     unstructured_effects = Vector{Matrix{Float64}}()
-    noisy_effects = Vector{Matrix{Float64}}()
+    total_effects = Vector{Matrix{Float64}}()
 
-    # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
-        v = generate_full_variable_names(spec, M.model_arch, k)
-        
-        # Find parameter names in the MCMC chain
-        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
-        rho_name = _find_parameter(p_names, string(v.unconstrained_rho), k, is_multivariate_model)
-        struct_name = _find_parameter(p_names, string(v.struct), k, is_multivariate_model)
-        iid_name = _find_parameter(p_names, string(v.iid), k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(spec.key), "sigma", k, is_multivariate)
+        rho_name = _find_parameter(p_names, string(spec.key), "unconstrained_rho", k, is_multivariate)
+        struct_innov_name = _find_parameter(p_names, string(spec.key), "struct", k, is_multivariate)
+        iid_innov_name = _find_parameter(p_names, string(spec.key), "iid", k, is_multivariate)
 
-        if isempty(sigma_name) || isempty(rho_name) || isempty(struct_name) || isempty(iid_name)
-            @warn "Parameters for BYM2 component $(spec.key) (outcome $k) not found. Returning zero-matrices."
+        if isempty(sigma_name) || isempty(rho_name) || isempty(struct_innov_name) || isempty(iid_innov_name)
+            @warn "Parameters for BYM2 component $(spec.key) (outcome $(k)) not found. Returning zero-matrices."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             push!(unstructured_effects, zeros(Float64, N_total, n_samples))
-            push!(noisy_effects, zeros(Float64, N_total, n_samples))
+            push!(total_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_samples_cpu = logistic.(get_params_vector(chain, rho_name, 1)[:, 1])
-        struct_samples_cpu = get_params_matrix(chain, struct_name, n_latent)
-        iid_samples_cpu = get_params_matrix(chain, iid_name, n_latent)
+        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+        rho_samples = logistic.(get_params_vector(chain, rho_name, 1)) # (n_samples, 1)
+        struct_innov_samples = get_params_matrix(chain, struct_innov_name, n_latent) # (n_samples, n_latent)
+        iid_innov_samples = get_params_matrix(chain, iid_innov_name, n_latent) # (n_samples, n_latent)
 
-        # Initialize output matrices on the target device
-        struct_effect_device = to_device(zeros(Float64, n_latent, n_samples))
-        unstruct_effect_device = to_device(zeros(Float64, n_latent, n_samples))
+        structured_latent = zeros(Float64, n_latent, n_samples)
+        unstructured_latent = zeros(Float64, n_latent, n_samples)
+        
+        hyper = spec.hyper
 
-        # --- Sample-wise Reconstruction on the Target Device ---
-        for s in 1:n_samples
-            # Move current sample's innovations to the device
-            struct_innov_s = to_device(struct_samples_cpu[s, :])
-            iid_innov_s = to_device(iid_samples_cpu[s, :])
+        for i in 1:n_samples # Iterate over each posterior sample
+            struct_innov_i = struct_innov_samples[i, :] # Innovations for structured component for current sample
             
-            # Reconstruct the structured component
-            local struct_latent_s
+            local struct_effect_raw # Raw structured effect before scaling
             if m.method == :spectral
-                U_device, L_device = hyper.U, hyper.L # Already on device
-                diag_D = 1.0 ./ sqrt.(L_device .+ noise)
+                U = hyper.U
+                L = hyper.L
+                diag_D = 1.0 ./ sqrt.(L .+ noise)
                 diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-                struct_latent_s = U_device * (diag_D .* struct_innov_s)
-            else # :cholesky or :cholesky_sparse
-                F_device = hyper.cholesky_factor # Already on device
-                struct_latent_s = F_device.L' \ struct_innov_s
+                struct_effect_raw = U * (diag_D .* struct_innov_i)
+            else # :cholesky or :cholesky_sparse (use pre-computed dense Cholesky factor)
+                F = hyper.cholesky_factor
+                struct_effect_raw = F.L' \ struct_innov_i # Back-solve for raw structured effect
+                struct_effect_raw .-= mean(struct_effect_raw)
             end
             
-            struct_latent_centered = struct_latent_s .- mean(struct_latent_s)
-            
-            # Combine components on the device
-            sigma_s = sigma_samples_cpu[s] # CPU scalar
-            rho_s = rho_samples_cpu[s]     # CPU scalar
-            
-            struct_effect_device[:, s] = (sqrt(rho_s) .* struct_latent_centered) .* sigma_s
-            unstruct_effect_device[:, s] = (sqrt(1.0 - rho_s) .* iid_innov_s) .* sigma_s
+            structured_latent[:, i] = sigma_samples[i, 1] * sqrt(rho_samples[i, 1]) * struct_effect_raw
+            unstructured_latent[:, i] = sigma_samples[i, 1] * sqrt(1.0 - rho_samples[i, 1]) * iid_innov_samples[i, :]
         end
         
-        # Indexing on the device and moving the final results to CPU
-        push!(structured_effects, Array(struct_effect_device[s_idx_full_device, :]))
-        push!(unstructured_effects, Array(unstruct_effect_device[s_idx_full_device, :]))
+        total_latent = structured_latent .+ unstructured_latent
         
-        total_effect_device = struct_effect_device .+ unstruct_effect_device
-        push!(noisy_effects, Array(total_effect_device[s_idx_full_device, :]))
+        push!(structured_effects, structured_latent[s_idx_full, :])
+        push!(unstructured_effects, unstructured_latent[s_idx_full, :])
+        push!(total_effects, total_latent[s_idx_full, :])
     end
-    
-    return (structured=structured_effects, unstructured=unstructured_effects, 
-            noisy=noisy_effects)
-end
 
+    return (structured=structured_effects, unstructured=unstructured_effects, noisy=total_effects)
+end 

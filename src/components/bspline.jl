@@ -8,7 +8,7 @@ effect is a linear combination of these basis functions, with coefficients
 regularized by a random walk prior to ensure smoothness.
 
 # Version
-v1.1.4 (2026-08-15)
+v1.2.0 (2026-08-19)
 
 # Mathematical Summary
 The component models a smooth function \$f(x)\$ as a linear combination of B-spline
@@ -75,7 +75,8 @@ MODEL_TO_STRUCTURE_MAP[:bspline] = :smooth
     get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
 
 Pre-computes the B-spline basis matrix and the RW2 penalty matrix (and its
-spectral/Cholesky decompositions) for the spline coefficients.
+spectral/Cholesky decompositions) for the spline coefficients. This is a CPU-only
+implementation.
 """
 function get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
@@ -98,15 +99,15 @@ function get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
               "smoothing, consider `model=:tps` or `model=:tensorproductsmooth`."
     end
     
-    # Generate the B-spline basis matrix.
+    # Generate the B-spline basis matrix on the CPU.
     B, actual_nbins = bstm_bspline_basis(coords[:, 1], m.nbins, m.degree)
     n_latent = actual_nbins
 
-    # Build the RW2 penalty matrix template.
+    # Build the RW2 penalty matrix template on the CPU.
     template = build_structure_template(:rw2, n_latent)
     Q_template = template.matrix
     
-    # Perform eigendecomposition for spectral method.
+    # Perform eigendecomposition for spectral method on the CPU.
     eig_decomp = eigen(Symmetric(Matrix(Q_template)))
     U = eig_decomp.vectors
     L = eig_decomp.values
@@ -115,7 +116,7 @@ function get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     Q_template_scaled = Q_template ./ scaling_factor
     L_scaled = L ./ scaling_factor
 
-    # Pre-compute dense Cholesky factor for the :cholesky method.
+    # Pre-compute dense Cholesky factor for the :cholesky method on the CPU.
     F = cholesky(Symmetric(Matrix(Q_template_scaled) + M.noise * I))
 
     return (
@@ -145,7 +146,7 @@ function get_priors(
     return """
     # Priors for BSpline component: $(spec.key)
     $(p_names.sigma) ~ $(sigma_prior_str)
-    $(p_names.innovations) ~ MvNormal(zeros($(spec.hyper.n_latent)), I)
+    $(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)
     """
 end
 
@@ -245,42 +246,42 @@ function get_updates(
 end
 
 """
-    get_effects(m::BSpline, chain, spec, M, PS)
+    get_effects(m::BSpline, chain, spec::NamedTuple, M::NamedTuple, PS)
 
 Reconstructs the posterior distribution of the B-spline smooth effect from the
-MCMC chain.   handle GPU arrays by moving sampled
-parameters to the device for computation and moving the final results back to the CPU.
+MCMC chain. This version is CPU-only and uses modern chain accessors.
 """
 function get_effects(
-    m::BSpline, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::BSpline, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
+    
+    hyper = spec.hyper
     noise = M.noise
+    n_latent = hyper.n_latent
 
-    # --- Basis Matrix Construction for Training and Prediction ---
-    B_train = spec.hyper.basis_matrix # Already on device if use_gpu=true
+    # --- Basis Matrix Handling for Training and Prediction Sets ---
+    B_train = hyper.basis_matrix # This is already a Julia Array
 
-    B_full = if !isnothing(PS)
-        coord_vars = get(spec.params, :positional_args, [])
-        if !isempty(coord_vars) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-            # Get prediction coordinates from CPU DataFrame
-            coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-            # Move coordinates to device
-            coords_pred_device = to_device(coords_pred_cpu)
-            # bstm_bspline_basis is GPU-aware, so it will return a GPU matrix
-            B_pred, _ = bstm_bspline_basis(coords_pred_device[:, 1], m.nbins, m.degree)
-            vcat(B_train, B_pred)
-        else
-            B_train
-        end
+    coord_vars = get(spec.params, :positional_args, [])
+    coord_var_sym = isempty(coord_vars) ? :none : Symbol(coord_vars[1])
+
+    B_full = if !isnothing(PS) && hasproperty(PS.data, coord_var_sym) # If prediction set is provided
+        coords_pred = PS.data[!, coord_var_sym] # Extract prediction coordinates
+        
+        B_pred, _ = bstm_bspline_basis(coords_pred, m.nbins, m.degree) # Generate basis for prediction data
+        vcat(B_train, B_pred)
     else
-        B_train
+        B_train # Otherwise, use only training basis
     end
     N_total = size(B_full, 1)
 
@@ -289,6 +290,8 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+        
+        # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
@@ -299,42 +302,44 @@ function get_effects(
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, spec.hyper.n_latent)
+        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
 
-        # Initialize the output matrix for coefficients on the target device
-        coeffs_matrix_device = to_device(zeros(Float64, spec.hyper.n_latent, n_samples))
+        # Initialize the output matrix for coefficients
+        coeffs_samples_matrix = zeros(Float64, n_latent, n_samples)
 
-        hyper = spec.hyper
-
-        # --- Sample-wise Coefficient Reconstruction on the Target Device ---
-        for i in 1:n_samples
-            innov_i_device = to_device(innovations_samples_cpu[i, :])
-            sigma_i = sigma_samples_cpu[i] # CPU scalar
-
-            local coeffs_device
-            if m.method == :spectral
-                U = hyper.U # Already on device
-                L = hyper.L # Already on device
-                diag_D = sigma_i ./ sqrt.(L .+ noise)
-                diag_D[1] = 0.0 # Enforce sum-to-zero constraints for RW2 penalty
-                diag_D[2] = 0.0
-                coeffs_device = U * (diag_D .* innov_i_device)
-            else # :cholesky or :cholesky_sparse
-                F = hyper.cholesky_factor # Already on device
-                coeffs_raw = F.L' \ innov_i_device
-                # Apply sum-to-zero constraints for RW2 penalty
-                coeffs_centered = coeffs_raw .- mean(view(coeffs_raw, 1:2)) # Centering based on first two elements
-                coeffs_device = sigma_i .* coeffs_centered
+        # --- Sample-wise Reconstruction ---
+        if m.method == :spectral
+            U = hyper.U # Already a Julia Array
+            L = hyper.L # Already a Julia Array
+            
+            # Create a matrix of diag_D values, one column per sample (n_latent x n_samples)
+            diag_D_matrix = (sigma_samples' ./ sqrt.(L .+ noise))
+            for i in 1:m.degree+1 # diff_order is not stored, but degree+1 is a common choice for RW2
+                diag_D_matrix[i, :] .= 0.0
             end
-            coeffs_matrix_device[:, i] = coeffs_device
+            
+            # U is [n_latent x n_latent], diag_D_matrix is [n_latent x n_samples], innovations_samples' is [n_latent x n_samples]
+            coeffs_samples_matrix = U * (diag_D_matrix .* innovations_samples')
+
+        else # :cholesky or :cholesky_sparse
+            F = hyper.cholesky_factor # Already a Julia factorization object
+            for i in 1:n_samples
+                innov_i = innovations_samples[i, :] # Innovations for current sample
+                coeffs_raw = F.L' \ innov_i # Back-solve for raw coefficients
+                
+                # Centering based on sum-to-zero constraint for RW penalties
+                # The sum(coeffs_raw) is constrained in get_updates, so mean(coeffs_raw) is appropriate here.
+                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
+                coeffs_samples_matrix[:, i] = sigma_samples[i, 1] .* coeffs_centered
+            end
         end
-
-        # Perform matrix multiplication on the device
-        effect_k_device = B_full * coeffs_matrix_device
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        
+        # Perform final matrix multiplication
+        effect_k = B_full * coeffs_samples_matrix
+        
+        push!(structured_effects, effect_k)
     end
-
+    
     return (structured=structured_effects, noisy=structured_effects)
-end
+end 

@@ -185,34 +185,34 @@ function get_updates(
     end
 end
 
+
 function get_effects(
     m::TensorProductSmooth, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = string.(names(chain))
-    to_device = M.to_device
-
-    # --- Get precomputed data (already on device) ---
+    p_names = string.(keys(chain))
+    
+    # --- Get precomputed data ---
     child_specs = spec.hyper.child_specs
     s_spec, t_spec = child_specs[1], child_specs[2]
     s_N, t_N = s_spec.hyper.n_latent, t_spec.hyper.n_latent
     noise = M.noise
 
-    Q_s_template_device = s_spec.hyper.Q_template
-    Q_t_template_device = t_spec.hyper.Q_template
+    Q_s_template_cpu = s_spec.hyper.Q_template
+    Q_t_template_cpu = t_spec.hyper.Q_template
 
     s_model_type = Symbol(lowercase(string(typeof(s_spec.component_obj))))
     t_model_type = Symbol(lowercase(string(typeof(t_spec.component_obj))))
 
-    # --- Index Handling: Combine training and prediction sets on device ---
-    s_idx_full_cpu = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, []))
-    t_idx_full_cpu = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, []))
+    # --- Index Handling: Combine training and prediction sets on CPU ---
+    s_idx_full_cpu = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS.data, :s_idx, []))
+    t_idx_full_cpu = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS.data, :t_idx, []))
     N_total = length(s_idx_full_cpu)
-    st_idx_full_device = to_device((t_idx_full_cpu .- 1) .* s_N .+ s_idx_full_cpu)
+    st_idx_full_cpu = (t_idx_full_cpu .- 1) .* s_N .+ s_idx_full_cpu
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -234,29 +234,28 @@ function get_effects(
             continue
         end
 
-        # Extract posterior samples (these are on the CPU)
+        # Extract posterior samples (CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_vector(chain, innovations_name, s_N * t_N)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, s_N * t_N)
         
         s_rho_samples_cpu = !isempty(s_rho_name) ? get_params_vector(chain, s_rho_name, 1)[:, 1] : nothing
         t_rho_samples_cpu = !isempty(t_rho_name) ? get_params_vector(chain, t_rho_name, 1)[:, 1] : nothing
 
-        # Initialize the output matrix for the full effect on the target device
-        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
+        # Initialize the output matrix for the full effect on the CPU
+        effect_k_cpu = zeros(Float64, N_total, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction on the CPU ---
         for i in 1:n_samples
-            # Move current sample's parameters to device
             sigma_i = sigma_samples_cpu[i]
-            innovations_i = to_device(innovations_samples_cpu[i, :])
+            innovations_i = innovations_samples_cpu[i, :]
             s_rho_val = isnothing(s_rho_samples_cpu) ? nothing : s_rho_samples_cpu[i]
             t_rho_val = isnothing(t_rho_samples_cpu) ? nothing : t_rho_samples_cpu[i]
             
-            # Recompose precision matrices on the device
-            Q_s = recompose_precision(s_model_type, Q_s_template_device, 1.0; extra_param=s_rho_val)
-            Q_t = recompose_precision(t_model_type, Q_t_template_device, 1.0; extra_param=t_rho_val)
+            # Recompose precision matrices on the CPU
+            Q_s = recompose_precision(s_model_type, Q_s_template_cpu, 1.0; extra_param=s_rho_val)
+            Q_t = recompose_precision(t_model_type, Q_t_template_cpu, 1.0; extra_param=t_rho_val)
             
-            # Perform Cholesky and back-solve on the device
+            # Perform Cholesky and back-solve on the CPU
             C_s = cholesky(Symmetric(Matrix(Q_s) + noise * I))
             C_t = cholesky(Symmetric(Matrix(Q_t) + noise * I))
             
@@ -264,17 +263,15 @@ function get_effects(
             tmp_spatial = C_s.L' \ Z_matrix
             st_field_unscaled = transpose(C_t.L' \ transpose(tmp_spatial))
             
-            # Apply sum-to-zero constraint and scale
             st_field_unscaled .-= mean(st_field_unscaled)
             st_field = st_field_unscaled .* sigma_i
             
-            # Index and store the result for this sample
-            effect_k_device[:, i] = vec(st_field)[st_idx_full_device]
+            effect_k_cpu[:, i] = vec(st_field)[st_idx_full_cpu]
         end
         
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_cpu)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+ 

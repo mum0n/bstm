@@ -177,8 +177,6 @@ function get_effects(
     )
 
     # --- Get effects from the inner temporal model ---
-    # This call will return the latent temporal field on the CPU as per the ComponentModel interface contract.
-    # The heavy computation (and GPU usage) happens inside this call.
     inner_effects_result = get_effects(m.model, chain, inner_spec, M, PS)
     
     # --- Prepare covariate and index data on the CPU ---
@@ -213,4 +211,4 @@ function get_effects(
     end
 
     return (structured=structured_effects, noisy=structured_effects)
-end
+end 

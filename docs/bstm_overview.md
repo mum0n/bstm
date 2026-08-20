@@ -9,7 +9,7 @@ format: html
 
 The `bstm` framework provides a composable, formula-based interface for Bayesian spatiotemporal modeling in Julia. It is designed to address the challenge of building complex models by separating the observation likelihood from the specification of the latent process. This decoupling allows for flexible construction of models that can include spatial, temporal, and mechanistic components in an additive and extensible manner. It is a Julia library built on the Turing.jl probabilistic programming framework and many, many other Julia libraries and many more scientists. This work really stands upon their giant shoulders. It provides a high-level, formula-based interface/front-end inspired by R's `brms` and `lme4` to simplify the specification of complex hierarchical models. The framework is designed for composability, allowing users to combine spatial, temporal, and mechanistic components to analyze complex datasets, particularly in fields like ecology and epidemiology. 
 
-`bstm` was designed to pursue my research interests and make my work-life simpler, especially as it often takes more time and effort to post-process data than actually set up the model. It is built on the strength and insights of many people and the strength and composability of Julia and Turing, in particular. It can easily be extended by others for their own purposes and provided as is, warts and all. Full disclosure: I have made heavy use of AI LLMs to restructure and expand the code, especially the crazy regex's, GPU programming and consistent documentation. Any errors are, of course, my own. Check your results with simulated data where possible.
+`bstm` was designed to pursue my research interests and make my work-life simpler, especially as it often takes more time and effort to post-process data than actually set up the model. It is built on the strength and insights of many people and the strength and composability of Julia and Turing, in particular. It can easily be extended by others for their own purposes and provided as is, warts and all. Full disclosure: I have made heavy use of AI LLMs to restructure and expand the code, especially the difficult regex's and consistent documentation. Any errors are, of course, my own. Check your results with simulated data where possible.
 
 
 ## 2. The Formula Interface
@@ -131,16 +131,15 @@ random(lon, lat, structure=:spatial, model=:gp, kernel="matern32")
 
 The `@bstm` macro accepts several keyword arguments that control the model's configuration, inference, and output. These are passed after the `data_frame` argument.
 
-| Keyword Argument | Example Usage | Description |
-| :--- | :--- | :--- |
-| `W` | `W=my_adjacency_matrix` | Provides the adjacency matrix required for discrete spatial models like `:icar`, `:bym2`, and `:leroux`. |
-| `verbose` | `verbose=false` | A `Bool` that controls the amount of output. If `true` (default), it prints the generated model code and prior predictive check results. |
-| `use_gpu` | `use_gpu=true` | A `Bool` that enables GPU acceleration for computationally intensive components. Requires a compatible NVIDIA GPU and CUDA setup. |
-| `prior_scheme` | `prior_scheme=:informative` | Sets the default prior scheme for all components. Options are `:pcpriors` (default), `:informative`, and `:uninformative`. |
-| `hyperpriors` | `hyperpriors=Dict(:sigma => Exponential(0.5))` | A `Dict` to specify global priors for hyperparameters, which will be used unless a local prior is set within a module. |
-| `sampler_choice` | `sampler_choice=NUTS(0.8)` | Overrides the automatic sampler selection and uses the provided sampler for the entire model. |
-| `sampler_map` | `sampler_map=Dict(:my_param => ESS())` | A `Dict` to assign specific samplers to specific parameter groups, used by `get_optimal_sampler`. |
-| `adtype` | `adtype=ADTypes.AutoZygote()` | Specifies the automatic differentiation backend for gradient-based samplers like `NUTS`. |
+| Keyword Argument | Example Usage                                  | Description                                                                                                                              |
+| :-----------------| :-----------------------------------------------| :-----------------------------------------------------------------------------------------------------------------------------------------|
+| `W`              | `W=my_adjacency_matrix`                        | Provides the adjacency matrix required for discrete spatial models like `:icar`, `:bym2`, and `:leroux`.                                 |
+| `verbose`        | `verbose=false`                                | A `Bool` that controls the amount of output. If `true` (default), it prints the generated model code and prior predictive check results. |
+| `prior_scheme`   | `prior_scheme=:informative`                    | Sets the default prior scheme for all components. Options are `:pcpriors` (default), `:informative`, and `:uninformative`.               |
+| `hyperpriors`    | `hyperpriors=Dict(:sigma => Exponential(0.5))` | A `Dict` to specify global priors for hyperparameters, which will be used unless a local prior is set within a module.                   |
+| `sampler_choice` | `sampler_choice=NUTS(0.8)`                     | Overrides the automatic sampler selection and uses the provided sampler for the entire model.                                            |
+| `sampler_map`    | `sampler_map=Dict(:my_param => ESS())`         | A `Dict` to assign specific samplers to specific parameter groups, used by `get_optimal_sampler`.                                        |
+| `adtype`         | `adtype=ADTypes.AutoZygote()`                  | Specifies the automatic differentiation backend for gradient-based samplers like `NUTS`.                                                 |
 
 
 
@@ -163,6 +162,36 @@ The `@bstm` macro accepts several keyword arguments that control the model's con
     Allows the impact of `poverty` to vary according to local spatial gradients.
     `@bstm(likelihood(y) ~ intercept() + (random(s_idx, model=:icar) |> random(t_idx, model=:pspline)), data, W=W)`
     Models a temporal trend that varies smoothly across space.
+
+### 2.6 Optimization-based approaches
+
+Though MCMC sampling is our gold-standard, we also have optimization-based options that can be worth considering. All of these methods are boosted by Automatic Differentiation, some require smooth differentiable likelihood surfaces, while others are robust and can be range bound.
+
+- **Maximum likelihood (ML)** estimation can be much faster than MCMC as pure optimization of a point mass is considerably simpler as priors are ignored and there is no need to carry posterior samples.
+- **Maximum a-posteriori (MAP)** estimation is the same as ML except that prior information is used as well and so a bit closer to MCMC in spirit, though the focus is still upon the point estimates. 
+- **Variational Inference (VI)** is also an optimization method. However, it approaches the problem by approximating the posterior distribution $p(z|x)$ with a simpler, flexible distribution $q(z)$ and minimizing the difference between them.
+ 
+All three methods are accessible with the same Turing/Julia model. The following code snippet shows how to run them.
+
+```julia
+  # Optimization-based Inference Approaches
+  
+  # Maximum Likelihood (ML) .. you would only use this very carefully 
+  res_ml = maximum_likelihood(m, LBFGS()) 
+  
+  # Maximum a Posteriori (MAP)
+  res_map = maximum_a_posteriori(m, LBFGS())
+  println("  MAP optimization complete. Log-posterior: ", res_map.optim_result.value)
+  display(res_map.params)
+  
+  # Variational Inference (VI)
+  println("  Running Variational Inference (this can be slow)...")
+  
+  q_vi = vi(m, ADVI(10, 1000); optimizer=LBFGS(), show_progress=false)
+  println("  VI complete.")
+  # To get samples: chn_vi = rand(q_vi, 1000)
+```
+
 
 ## 3. The Algebra of Components: Composition and State-Space Models
 

@@ -7,7 +7,7 @@ point smoothly connects back to the first. This is a type of Gaussian Markov
 Random Field (GMRF) with a circulant precision matrix.
 
 # Version
-v1.1.3 (2026-08-15)
+v1.2.0 (2026-08-19)
 
 # Mathematical Summary
 The cyclic random walk models a latent field \$\\phi\$ where the value at time \$t\$ is
@@ -66,11 +66,9 @@ MODEL_TO_STRUCTURE_MAP[:cyclic] = :seasonal
 
 Validates the seasonal index variable and pre-computes the circulant precision
 matrix (`Q_template`) for the cyclic random walk, along with its spectral
-decomposition (`U`, `L`) and Cholesky factorization.
+decomposition (`U`, `L`) and Cholesky factorization. This is a CPU-only implementation.
 """
 function get_precomputes(m::Cyclic, M::NamedTuple, mod_data::Dict)::NamedTuple
-    # The `process_random_module!` is expected to have set up `M.u_N` and `M.u_idx`
-    # based on the seasonal index variable provided in the formula.
     u_N = get(M, :u_N, 0)
     if u_N == 0
         error(
@@ -79,7 +77,6 @@ function get_precomputes(m::Cyclic, M::NamedTuple, mod_data::Dict)::NamedTuple
         )
     end
 
-    # Validate the period against the number of unique levels.
     if m.period != u_N
         @warn "The specified period ($(m.period)) does not match the number of " *
               "unique levels in the seasonal index variable ($(u_N)). " *
@@ -116,7 +113,7 @@ function get_priors(
     return """
     # Priors for Cyclic component: $(spec.key)
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.innovations) ~ MvNormal(zeros($(n_latent)), I)
+    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
     """
 end
 
@@ -199,34 +196,37 @@ end
 
 
 """
-    get_effects(m::Cyclic, chain, spec, M, PS)
+    get_effects(m::Cyclic, chain, spec::NamedTuple, M::NamedTuple, PS)
 
 Reconstructs the `Cyclic` component's effect from posterior samples, applying a
-sum-to-zero constraint for identifiability.   handle
-GPU arrays by moving sampled parameters to the device for computation and moving
-the final results back to the CPU.
+sum-to-zero constraint for identifiability. This version is CPU-only and uses
+modern chain accessors.
 """
 function get_effects(
-    m::Cyclic, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::Cyclic, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
+    
     noise = M.noise
     n_latent = spec.hyper.n_latent
 
-    # --- Coordinate/Index Handling: Combine training and prediction sets ---
-    u_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :u_idx)
-        # M.u_idx is already on the device. PS.data.u_idx is on CPU.
-        vcat(M.u_idx, to_device(PS.data.u_idx))
+    # --- Coordinate/Index Handling: Combine training and prediction sets on CPU ---
+    u_idx_train = M.u_idx # Seasonal indices for training data
+    u_idx_full = if !isnothing(PS) && hasproperty(PS.data, :u_idx) # If prediction set is provided
+        vcat(u_idx_train, PS.data.u_idx) # Combine training and prediction indices
     else
-        M.u_idx
+        u_idx_train # Otherwise, use only training indices
     end
-    N_total = length(u_idx_full_device)
+    N_total = length(u_idx_full) # Total number of observations (training + prediction)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -245,42 +245,41 @@ function get_effects(
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
+        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
 
-        # Initialize the output matrix for latent effects on the target device
-        effect_k_device = to_device(zeros(Float64, n_latent, n_samples))
+        # Initialize the output matrix for latent effects
+        effect_k_matrix = zeros(Float64, n_latent, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction ---
         if m.method == :spectral
-            U = spec.hyper.U # Already on device
-            L = spec.hyper.L # Already on device
+            U = spec.hyper.U
+            L = spec.hyper.L
             
             for j in 1:n_samples
-                sigma_j = sigma_samples_cpu[j] # CPU scalar
-                innov_j_device = to_device(innovations_samples_cpu[j, :])
+                sigma_j = sigma_samples[j, 1] # Scalar sigma for current sample
+                innov_j = innovations_samples[j, :] # Vector of innovations for current sample
                 
+                # Apply spectral transformation
                 diag_D = sigma_j ./ sqrt.(L .+ noise)
                 diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-                effect_k_device[:, j] = U * (diag_D .* innov_j_device)
+                effect_k_matrix[:, j] = U * (diag_D .* innov_j)
             end
         else # :cholesky or :cholesky_sparse
-            F = spec.hyper.cholesky_factor # Already on device
-            
+            F = spec.hyper.cholesky_factor
             for j in 1:n_samples
-                sigma_j = sigma_samples_cpu[j]
-                innov_j_device = to_device(innovations_samples_cpu[j, :])
+                sigma_j = sigma_samples[j, 1]
+                innov_j = innovations_samples[j, :]
 
-                latent_field_raw = F.L' \ innov_j_device
+                latent_field_raw = F.L' \ innov_j
                 latent_field_centered = latent_field_raw .- mean(latent_field_raw)
-                effect_k_device[:, j] = latent_field_centered .* sigma_j
+                effect_k_matrix[:, j] = latent_field_centered .* sigma_j
             end
         end
-        
-        # Indexing on the device and moving the final result to CPU
-        indexed_effects_device = effect_k_device[u_idx_full_device, :]
-        push!(structured_effects, Array(indexed_effects_device))
+        # Index the reconstructed latent effects to match the observation indices
+        indexed_effects = effect_k_matrix[u_idx_full, :]
+        push!(structured_effects, indexed_effects)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
-end
+end 

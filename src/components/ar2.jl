@@ -5,7 +5,7 @@ A component model for a second-order autoregressive (AR2) process, fundamental f
 modeling time series data with serial correlation and pseudo-periodic behavior.
 
 # Version
-v1.3.0 (2026-08-17)
+v1.4.0 (2026-08-19)
 
 # Mathematical Summary
 The AR2 process models the value of a latent field \$\\phi_t\$ at time \$t\$ as a linear
@@ -178,11 +178,12 @@ function get_updates(
               "or `:centered`.")
     end
 end
+
 """
     _ar2_covariance_matrix(rho1, rho2, sigma, n, noise)
 
 Helper function to construct the dense Toeplitz covariance matrix for a stationary
-AR(2) process. Used by the `:centered` method. This version is GPU-aware.
+AR(2) process. Used by the `:centered` method. This version is CPU-only.
 """
 function _ar2_covariance_matrix(rho1, rho2, sigma, n, noise)
     T_num = promote_type(typeof(rho1), typeof(rho2), typeof(sigma), typeof(noise))
@@ -198,7 +199,7 @@ function _ar2_covariance_matrix(rho1, rho2, sigma, n, noise)
     gamma_1 = (rho1 / (one(T_num) - rho2)) * gamma_0
 
     # Calculate the first row of the Toeplitz matrix (the autocovariance function)
-    acf = similar(rho1, T_num, n)
+    acf = Vector{T_num}(undef, n)
     if n > 0; acf[1] = gamma_0; end
     if n > 1; acf[2] = gamma_1; end
     for i in 3:n
@@ -206,8 +207,7 @@ function _ar2_covariance_matrix(rho1, rho2, sigma, n, noise)
     end
 
     # Construct the Toeplitz matrix from the ACF.
-    # This is a simple, if not maximally efficient, way that is device-agnostic.
-    C = similar(rho1, T_num, n, n)
+    C = Matrix{T_num}(undef, n, n)
     for i in 1:n
         for j in 1:n
             C[i, j] = acf[abs(i - j) + 1]
@@ -220,7 +220,7 @@ end
 """
     ar2_statespace(rho1, rho2, sigma, innovations, n_latent, noise)
 
-Computes the state-space evolution of a stationary AR(2) process. This version is GPU-aware.
+Computes the state-space evolution of a stationary AR(2) process. This version is CPU-only.
 """
 function ar2_statespace(
     rho1, rho2, sigma, innovations::AbstractVector, n_latent::Int, noise
@@ -228,8 +228,7 @@ function ar2_statespace(
     T_num = promote_type(
         typeof(rho1), typeof(rho2), typeof(sigma), eltype(innovations), typeof(noise)
     )
-    # Use similar to allocate the output array on the same device as the innovations
-    latent = similar(innovations, T_num, n_latent)
+    latent = Vector{T_num}(undef, n_latent)
     if n_latent == 0
         return latent
     end
@@ -245,8 +244,8 @@ function ar2_statespace(
               ((one(T_num) + rho2) * ((one(T_num) - rho2)^2 - rho1^2) + T_num(noise))
     gamma_1 = (rho1 / (one(T_num) - rho2)) * gamma_0
 
-    # Ensure the small 2x2 covariance matrix is created on the correct device
-    cov_12 = similar(innovations, T_num, 2, 2)
+    # Ensure the small 2x2 covariance matrix is created on the CPU
+    cov_12 = Matrix{T_num}(undef, 2, 2)
     cov_12[1,1] = gamma_0; cov_12[2,2] = gamma_0;
     cov_12[1,2] = gamma_1; cov_12[2,1] = gamma_1;
     
@@ -270,34 +269,32 @@ end
 """
     get_effects(m::AR2, chain, spec, M, PS)
 
-Reconstructs the `AR2` component's effect from posterior samples. This version is updated
-to handle GPU arrays by moving sampled parameters to the device for computation and
-moving the final results back to the CPU.
+Reconstructs the `AR2` component's effect from posterior samples. This version is CPU-only
+and uses modern chain accessors.
 """
 function get_effects(
     m::AR2, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
+    # --- Setup: Extract dimensions ---
     n_samples = size(chain, 1) * size(chain, 3)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(names(DataFrame(chain)))
+    
     noise_val = get(M, :noise, 1e-6)
     
     # --- Index Handling: Combine training and prediction sets ---
-    t_idx_train_cpu = Array(M.t_idx)
-    t_idx_full_cpu = if !isnothing(PS) && haskey(PS.data, :t_idx)
-        vcat(t_idx_train_cpu, get(PS.data, :t_idx, []))
+    t_idx_train = M.t_idx
+    t_idx_full = if !isnothing(PS) && haskey(PS.data, :t_idx)
+        vcat(t_idx_train, get(PS.data, :t_idx, []))
     else
-        t_idx_train_cpu
+        t_idx_train
     end
     
     t_N_train = M.t_N
-    t_N_full = isempty(t_idx_full_cpu) ? 0 : maximum(t_idx_full_cpu)
-    N_total_obs = length(t_idx_full_cpu)
-    t_idx_full_device = to_device(t_idx_full_cpu)
+    t_N_full = isempty(t_idx_full) ? 0 : maximum(t_idx_full)
+    N_total_obs = length(t_idx_full)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -315,15 +312,15 @@ function get_effects(
             continue
         end
 
-        # Extract posterior samples (CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        pi1_samples_cpu = tanh.(get_params_vector(chain, rho1_name, 1)[:, 1])
-        pi2_samples_cpu = tanh.(get_params_vector(chain, rho2_name, 1)[:, 1])
-        rho1_samples_cpu = pi1_samples_cpu .* (1 .- pi2_samples_cpu)
-        rho2_samples_cpu = pi2_samples_cpu
+        # Extract posterior samples
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        pi1_samples = tanh.(get_params_vector(chain, rho1_name, 1)[:, 1])
+        pi2_samples = tanh.(get_params_vector(chain, rho2_name, 1)[:, 1])
+        rho1_samples = pi1_samples .* (1 .- pi2_samples)
+        rho2_samples = pi2_samples
         
-        # Initialize output matrix for the full latent field on the device
-        latent_field_samples_device = to_device(zeros(Float64, t_N_full, n_samples))
+        # Initialize output matrix for the full latent field
+        latent_field_samples = zeros(Float64, t_N_full, n_samples)
         
         if m.method == :statespace
             innov_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
@@ -332,16 +329,15 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, N_total_obs, n_samples))
                 continue
             end
-            innov_samples_cpu = get_params_matrix(chain, innov_name, t_N_train)
-            innov_samples_device = to_device(innov_samples_cpu') # Transpose to [n_latent x n_samples]
+            innov_samples = get_params_vector(chain, innov_name, t_N_train)
             
-            # Vectorized reconstruction for training period
+            # Reconstruction for training period
             for j in 1:n_samples
                 latent_field_train_j = ar2_statespace(
-                    rho1_samples_cpu[j], rho2_samples_cpu[j], sigma_samples_cpu[j],
-                    view(innov_samples_device, :, j), t_N_train, noise_val
+                    rho1_samples[j], rho2_samples[j], sigma_samples[j],
+                    innov_samples[j, :], t_N_train, noise_val
                 )
-                latent_field_samples_device[1:t_N_train, j] = latent_field_train_j
+                latent_field_samples[1:t_N_train, j] = latent_field_train_j
             end
 
         elseif m.method == :centered
@@ -351,35 +347,29 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, N_total_obs, n_samples))
                 continue
             end
-            latent_samples_cpu = get_params_matrix(chain, latent_name, t_N_train)
-            latent_field_samples_device[1:t_N_train, :] = to_device(latent_samples_cpu')
+            latent_samples = get_params_vector(chain, latent_name, t_N_train)
+            latent_field_samples[1:t_N_train, :] = latent_samples'
             if t_N_full > t_N_train
                 @warn "Forecasting for the AR2 component with the ':centered' method is not supported. Returning zeros for prediction time steps."
             end
         end
         
-        # Forecasting step (vectorized over samples) for the statespace method
+        # Forecasting step for the statespace method
         if m.method == :statespace && t_N_full > t_N_train
-            # Move parameter samples to device once
-            rho1_samples_device = to_device(rho1_samples_cpu)
-            rho2_samples_device = to_device(rho2_samples_cpu)
-            sigma_samples_device = to_device(sigma_samples_cpu)
-            
-            for t in (t_N_train + 1):t_N_full
-                # Generate all innovations for this time step on the device
-                pred_innov_device = to_device(randn(Float32, n_samples))
-                
-                # Update all samples for time t at once
-                latent_field_samples_device[t, :] = 
-                    rho1_samples_device' .* latent_field_samples_device[t-1, :] .+
-                    rho2_samples_device' .* latent_field_samples_device[t-2, :] .+
-                    pred_innov_device' .* sigma_samples_device'
+            for j in 1:n_samples
+                for t in (t_N_train + 1):t_N_full
+                    pred_innov = randn()
+                    latent_field_samples[t, j] = 
+                        rho1_samples[j] * latent_field_samples[t-1, j] +
+                        rho2_samples[j] * latent_field_samples[t-2, j] +
+                        pred_innov * sigma_samples[j]
+                end
             end
         end
         
-        # Indexing on the device and moving the final result to CPU
-        effect_k_device = latent_field_samples_device[t_idx_full_device, :]
-        push!(structured_effects, Array(effect_k_device))
+        # Indexing to get final effect
+        effect_k = latent_field_samples[t_idx_full, :]
+        push!(structured_effects, effect_k)
     end
     
     return (structured=structured_effects, noisy=structured_effects)

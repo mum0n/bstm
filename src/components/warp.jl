@@ -276,31 +276,22 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
     end
 end
 
-
-"""
-    get_effects(m::Warp, chain, spec, M, PS)
-
-Reconstructs the `Warp` component's effect from the MCMC chain's posterior samples.
-  handle GPU arrays by moving sampled parameters to the
-device for computation and moving the final results back to the CPU.
-"""
 function get_effects(
-    m::Warp, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::Warp, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
-
-    # --- Coordinate Handling: Combine training and prediction sets on device ---
-    coords_train = spec.hyper.coords # Already on device
+    p_names = string.(keys(chain))
+    
+    # --- Coordinate Handling: Combine training and prediction sets on CPU ---
+    coords_train = spec.hyper.coords
     coord_vars = get(spec.params, :positional_args, [])
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
         coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-        vcat(coords_train, to_device(coords_pred_cpu))
+        vcat(coords_train, coords_pred_cpu)
     else
         coords_train
     end
@@ -311,8 +302,8 @@ function get_effects(
     structured_effects = Vector{Matrix{Float64}}()
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
-    for k in 1:outcomes_N
-        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
+    for k_outcome in 1:outcomes_N
+        p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
         
         # Define parameter names for this outcome
         W_warp_name = string(Symbol("$(p_names_k.latent)_W_warp"))
@@ -333,47 +324,47 @@ function get_effects(
         W_main_samples_cpu = get_params_matrix(chain, W_main_name, in_dims * n_features)
         b_main_samples_cpu = get_params_matrix(chain, b_main_name, n_features)
 
-        # Initialize the output matrix for the full effect on the target device
-        effect_k_device = to_device(zeros(Float64, n_obs_full, n_samples))
+        # Initialize the output matrix for the full effect on the CPU
+        effect_k_cpu = zeros(Float64, n_obs_full, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction on the CPU ---
         for i in 1:n_samples
-            # 1. Construct and apply the warping function on the device
-            W_warp_i_device = to_device(reshape(W_warp_samples_cpu[i, :], in_dims, n_features))
-            b_warp_i_device = to_device(b_warp_samples_cpu[i, :])
-            beta_warp_i_device = to_device(beta_warp_samples_cpu[i, :])
+            # 1. Construct and apply the warping function on the CPU
+            W_warp_i_cpu = reshape(W_warp_samples_cpu[i, :], in_dims, n_features)
+            b_warp_i_cpu = b_warp_samples_cpu[i, :]
+            beta_warp_i_cpu = beta_warp_samples_cpu[i, :]
             
-            Phi_warp_i_device = sqrt(2.0 / n_features) .* cos.((coords_full * W_warp_i_device) .+ b_warp_i_device')
-            warping_effect_i_device = Phi_warp_i_device * beta_warp_i_device
-            coords_warped_i_device = coords_full .+ warping_effect_i_device
+            Phi_warp_i_cpu = sqrt(2.0 / n_features) .* cos.((coords_full * W_warp_i_cpu) .+ b_warp_i_cpu')
+            warping_effect_i_cpu = Phi_warp_i_cpu * beta_warp_i_cpu
+            coords_warped_i_cpu = coords_full .+ warping_effect_i_cpu
 
-            # 2. Construct the main GP on the warped coordinates on the device
+            # 2. Construct the main GP on the warped coordinates on the CPU
             ls_i_cpu = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
-            W_main_i_unscaled_device = to_device(reshape(W_main_samples_cpu[i, :], in_dims, n_features))
-            W_main_i_device = W_main_i_unscaled_device ./ (ls_i_cpu isa AbstractVector ? to_device(ls_i_cpu') : to_device(ls_i_cpu))
+            W_main_i_unscaled_cpu = reshape(W_main_samples_cpu[i, :], in_dims, n_features)
+            W_main_i_cpu = W_main_i_unscaled_cpu ./ (ls_i_cpu isa AbstractVector ? ls_i_cpu' : ls_i_cpu)
 
-            b_main_i_device = to_device(b_main_samples_cpu[i, :])
-            Phi_main_i_device = sqrt(2.0 / n_features) .* cos.((coords_warped_i_device * W_main_i_device) .+ b_main_i_device')
+            b_main_i_cpu = b_main_samples_cpu[i, :]
+            Phi_main_i_cpu = sqrt(2.0 / n_features) .* cos.((coords_warped_i_cpu * W_main_i_cpu) .+ b_main_i_cpu')
             
-            # 3. Scale coefficients and compute final effect on the device
-            local beta_main_i_device
+            # 3. Scale coefficients and compute final effect on the CPU
+            local beta_main_i_cpu
             if m.method == :noncentered
                 innovations_name = string(p_names_k.innovations)
                 beta_main_raw_samples_cpu = get_params_matrix(chain, innovations_name, n_features)
-                beta_main_raw_i_device = to_device(beta_main_raw_samples_cpu[i, :])
-                beta_main_i_device = beta_main_raw_i_device .* to_device(sigma_samples_cpu[i])
+                beta_main_raw_i_cpu = beta_main_raw_samples_cpu[i, :]
+                beta_main_i_cpu = beta_main_raw_i_cpu .* sigma_samples_cpu[i]
             else # :centered
                 latent_name = string(p_names_k.latent)
                 beta_main_samples_cpu = get_params_matrix(chain, latent_name, n_features)
-                beta_main_i_device = to_device(beta_main_samples_cpu[i, :])
+                beta_main_i_cpu = beta_main_samples_cpu[i, :]
             end
             
-            effect_k_device[:, i] = Phi_main_i_device * beta_main_i_device
+            effect_k_cpu[:, i] = Phi_main_i_cpu * beta_main_i_cpu
         end
         
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_cpu)
     end
 
     return (structured=structured_effects, noisy=structured_effects)
 end
+   

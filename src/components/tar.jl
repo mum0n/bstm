@@ -7,7 +7,7 @@ processes based on whether an external `threshold_var` is above or below a
 learned threshold.
 
 # Version
-v1.1.1 (2026-08-14)
+v1.1.2 (2026-08-19)
 
 # Mathematical Summary
 A TAR model defines a time series where the parameters of the autoregressive
@@ -77,7 +77,7 @@ MODEL_TO_STRUCTURE_MAP[:tar] = :temporal
 
 
 function get_precomputes(m::TAR, M::NamedTuple, mod_data::Dict)::NamedTuple
-    # --- Validation from get_datastructures! ---
+    # --- Validation ---
     threshold_var = m.threshold_var
     if !hasproperty(M.data, threshold_var)
         error("Threshold variable ':$threshold_var' for TAR model not found in data.")
@@ -87,10 +87,9 @@ function get_precomputes(m::TAR, M::NamedTuple, mod_data::Dict)::NamedTuple
         error("TAR model requires temporal indices (t_idx, t_N) to be set by the model processor.")
     end
     
-    # --- Original precompute logic ---
-    # Data might be on GPU, so bring it to CPU for this calculation
-    threshold_data_full_cpu = Array(M.data[!, threshold_var])
-    t_idx_cpu = Array(M.t_idx)
+    # --- Precompute logic on CPU ---
+    threshold_data_full_cpu = M.data[!, threshold_var]
+    t_idx_cpu = M.t_idx
 
     threshold_data_per_t = zeros(eltype(threshold_data_full_cpu), M.t_N)
     counts_per_t = zeros(Int, M.t_N)
@@ -103,11 +102,8 @@ function get_precomputes(m::TAR, M::NamedTuple, mod_data::Dict)::NamedTuple
 
     threshold_data_per_t ./= max.(1, counts_per_t)
 
-    # Move the result to the target device
-    to_device = M.to_device
-
     return (
-        threshold_data=to_device(threshold_data_per_t),
+        threshold_data=threshold_data_per_t,
         n_latent=M.t_N
     )
 end
@@ -191,36 +187,33 @@ function get_updates(
     """
 end
 
+
 function get_effects(
     m::TAR, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = string.(names(chain))
-    to_device = M.to_device
-
-    # --- Get precomputed data (already on device) ---
+    p_names = string.(keys(chain))
+    
+    # --- Get precomputed data ---
     hyper = spec.hyper
     t_N_train = hyper.n_latent
-    threshold_data_train_device = hyper.threshold_data
+    threshold_data_train_cpu = hyper.threshold_data
 
     # --- Index and Threshold Data Handling for Training and Prediction ---
-    t_idx_train_cpu = Array(M.t_idx) # Bring to CPU for vcat
-    t_idx_full_cpu = if !isnothing(PS) && haskey(PS, :t_idx)
-        vcat(t_idx_train_cpu, get(PS, :t_idx, []))
+    t_idx_train_cpu = M.t_idx
+    t_idx_full_cpu = if !isnothing(PS) && haskey(PS.data, :t_idx)
+        vcat(t_idx_train_cpu, PS.data.t_idx)
     else
         t_idx_train_cpu
     end
     t_N_full = isempty(t_idx_full_cpu) ? 0 : maximum(t_idx_full_cpu)
     N_total = length(t_idx_full_cpu)
 
-    threshold_data_train_cpu = Array(threshold_data_train_device)
     threshold_data_full_cpu = if !isnothing(PS) && hasproperty(PS.data, m.threshold_var)
-        # NOTE: This assumes prediction data is provided at the temporal resolution (t_N).
-        # A more robust implementation might aggregate prediction data similarly to get_precomputes.
         pred_threshold_data = PS.data[!, m.threshold_var]
         len_pred = t_N_full - t_N_train
         if len_pred > 0
@@ -232,19 +225,14 @@ function get_effects(
     else
         threshold_data_train_cpu
     end
-    # Pad if necessary, in case prediction data is shorter than the prediction time index
     if length(threshold_data_full_cpu) < t_N_full
         padding = fill(mean(threshold_data_train_cpu), t_N_full - length(threshold_data_full_cpu))
         threshold_data_full_cpu = vcat(threshold_data_full_cpu, padding)
     end
 
-    # Move final data structures to the target device
-    t_idx_full_device = to_device(t_idx_full_cpu)
-    threshold_data_full_device = to_device(threshold_data_full_cpu)
-
     structured_effects = Vector{Matrix{Float64}}()
 
-    # --- Reconstruction Loop: Iterate over each outcome variable ---
+    # --- Reconstruction Loop ---
     for k_outcome in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k_outcome)
         
@@ -257,7 +245,7 @@ function get_effects(
             continue
         end
 
-        # Extract posterior samples (these are on the CPU)
+        # Extract posterior samples (CPU)
         thresh_unconstrained_samples_cpu = get_params_vector(chain, thresh_unconstrained_name, 1)[:, 1]
         innovations_samples_cpu = get_params_matrix(chain, innovations_name, t_N_train)
         
@@ -292,49 +280,43 @@ function get_effects(
             sigma2_samples_cpu = get_params_vector(chain, sigma2_name, 1)[:, 1]
         end
 
-        # Initialize the output matrix for the full effect on the target device
-        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
+        # Initialize the output matrix for the full effect on the CPU
+        effect_k_cpu = zeros(Float64, N_total, n_samples)
         mean_thresh_data_cpu = mean(threshold_data_train_cpu)
         noise = M.noise
         
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction on the CPU ---
         for s in 1:n_samples
             threshold_level = mean_thresh_data_cpu + thresh_unconstrained_samples_cpu[s]
             
-            # Generate full innovations vector on the device
-            innov_train_device = to_device(innovations_samples_cpu[s, :])
-            innov_pred_device = to_device(randn(Float32, t_N_full - t_N_train))
-            innov_full_device = vcat(innov_train_device, innov_pred_device)
+            innov_train_cpu = innovations_samples_cpu[s, :]
+            innov_pred_cpu = randn(Float32, t_N_full - t_N_train)
+            innov_full_cpu = vcat(innov_train_cpu, innov_pred_cpu)
             
-            latent_field_s_device = to_device(zeros(Float64, t_N_full))
+            latent_field_s_cpu = zeros(Float64, t_N_full)
 
-            # Move current sample's parameters to device (scalars, cheap)
             rho1_s = rho1_samples_cpu[s]
             rho2_s = rho2_samples_cpu[s]
             sigma1_s = sigma1_samples_cpu[s]
             sigma2_s = sigma2_samples_cpu[s]
 
             for t in 1:t_N_full
-                # This loop runs on the device. The condition uses a device array.
-                regime_indicator = threshold_data_full_device[t] > threshold_level
+                regime_indicator = threshold_data_full_cpu[t] > threshold_level
                 curr_rho = regime_indicator ? rho2_s : rho1_s
                 curr_sigma = regime_indicator ? sigma2_s : sigma1_s
 
                 if t == 1
-                    latent_field_s_device[t] = (innov_full_device[t] * curr_sigma) / sqrt(1.0 - curr_rho^2 + noise)
+                    latent_field_s_cpu[t] = (innov_full_cpu[t] * curr_sigma) / sqrt(1.0 - curr_rho^2 + noise)
                 else
-                    latent_field_s_device[t] = curr_rho * latent_field_s_device[t-1] + innov_full_device[t] * curr_sigma
+                    latent_field_s_cpu[t] = curr_rho * latent_field_s_cpu[t-1] + innov_full_cpu[t] * curr_sigma
                 end
             end
-            effect_k_device[:, s] = view(latent_field_s_device, t_idx_full_device)
+            effect_k_cpu[:, s] = latent_field_s_cpu[t_idx_full_cpu]
         end
         
-        # Move the final reconstructed effect for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_cpu)
     end
 
     return (structured=structured_effects, noisy=structured_effects)
 end
-
-
-
+ 

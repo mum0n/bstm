@@ -8,7 +8,7 @@ with a `modifier_model` (typically a spatial smoother) to create a spatially
 varying standard deviation.
 
 # Version
-v1.1.1 (2026-08-14)
+v1.2.0 (2026-08-19)
 
 # Mathematical Summary
 The component models a non-stationary spatial field \$\\phi(s)\$ where the local
@@ -136,8 +136,11 @@ function get_priors(
     )
 
     base_priors = get_priors(m.base_model, base_spec_for_priors, arch, outcome_idx, M)
+    
     # The base model's sigma is not used; variance is controlled by the modifier.
-    base_priors_cleaned = replace(base_priors, r".*sigma.*" => "")
+    # We precisely remove the sigma prior line to avoid side effects.
+    sigma_var_to_remove = generate_full_variable_names(base_spec_for_priors, arch, outcome_idx).sigma
+    base_priors_cleaned = replace(base_priors, Regex("\\s*$(sigma_var_to_remove) ~ .*\\n?") => "")
     
     modifier_priors = get_priors(
         m.modifier_model, modifier_spec_for_priors, arch, outcome_idx, M
@@ -182,12 +185,19 @@ function get_updates(
     modifier_logic = replace(modifier_updates, Regex("$(eta_target) \\.\\+= .*") => "")
     modifier_logic = replace(modifier_logic, modifier_latent_var => "log_sigma_field")
 
-    # Generate code for the base model, which defines the unit-variance field.
+    # Generate code for the base model, but modify it to produce a unit-variance field.
     base_updates = get_updates(m.base_model, base_spec, arch, outcome_idx, M)
-    base_latent_var = generate_full_variable_names(base_spec, arch, outcome_idx).latent
-    base_logic = replace(base_updates, Regex("$(eta_target) \\.\\+= .*") => "")
-    base_logic = replace(base_logic, Regex("$(base_latent_var) = .*") => "") # Remove scaling
-    base_logic = replace(base_logic, base_latent_var => "base_latent_raw")
+    base_p_names = generate_full_variable_names(base_spec, arch, outcome_idx)
+    
+    # Replace the sigma parameter of the base model with 1.0 to get a unit-variance field.
+    base_logic_unit_variance = replace(base_updates, string(base_p_names.sigma) => "1.0")
+    
+    # Strip the eta update from the inner model's code.
+    base_logic_cleaned = replace(base_logic_unit_variance, Regex("$(eta_target) \\.\\+= .*") => "")
+    
+    # Rename the latent variable to avoid clashes if needed.
+    base_latent_var = base_p_names.latent
+    final_base_logic = replace(base_logic_cleaned, base_latent_var => "base_latent_raw")
 
     return """
         # --- NonStationaryVariance Component: $(spec.key) ---
@@ -196,8 +206,8 @@ function get_updates(
             $(modifier_logic)
             local spatially_varying_sigma = exp.(log_sigma_field)
             
-            # 2. Realize the raw latent field from the base model.
-            $(base_logic)
+            # 2. Realize the raw latent field (unit variance) from the base model.
+            $(final_base_logic)
             
             # 3. Combine raw latent field with spatially varying sigma.
             local final_effect_latent = base_latent_raw .* spatially_varying_sigma
@@ -208,30 +218,31 @@ function get_updates(
     """
 end
 
-
 function get_effects(
-    m::NonStationaryVariance, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::NonStationaryVariance, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
+    
     noise = M.noise
     
     structured_effects = Vector{Matrix{Float64}}()
-    
-    # --- Index Handling: Combine training and prediction sets on device ---
-    s_idx_train = M.s_idx # Already on device
-    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
-        s_idx_pred_cpu = get(PS.data, :s_idx, [])
-        vcat(s_idx_train, to_device(s_idx_pred_cpu))
+    # --- Index Handling: Combine training and prediction sets ---
+    s_idx_train = M.s_idx # Spatial indices for training data
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set is provided
+        vcat(s_idx_train, PS.data.s_idx) # Combine training and prediction indices
     else
-        s_idx_train
+        s_idx_train # Otherwise, use only training indices
     end
-    N_total = length(s_idx_full)
+    N_total = length(s_idx_full) # Total number of observations (training + prediction)
 
     # --- Define specs for inner models ---
     base_spec = (
@@ -255,58 +266,50 @@ function get_effects(
     for k in 1:outcomes_N
         # 1. Get the modifier effect (spatially varying log-sigma)
         # This recursive call returns CPU arrays.
-        modifier_results = get_effects(m.modifier_model, chain, modifier_spec, M, PS)
-        log_sigma_field_cpu = modifier_results.structured[k]
+        modifier_results = get_effects(m.modifier_model, chain, modifier_spec, M, PS) # Recursive call to get modifier effects
+        log_sigma_field = modifier_results.structured[k] # Log-sigma field from modifier
         
-        # Move to device and compute sigma
-        log_sigma_field_device = to_device(log_sigma_field_cpu)
-        spatially_varying_sigma_device = exp.(log_sigma_field_device)
+        spatially_varying_sigma = exp.(log_sigma_field) # Exponentiate to get sigma field
 
         # 2. Get the base model's raw innovations
         base_p_names = generate_full_variable_names(base_spec, M.model_arch, k)
         base_innovations_name = _find_parameter(p_names, string(base_p_names.innovations), k, is_multivariate_model)
         
         if isempty(base_innovations_name)
-            @warn "Base innovations for NonStationaryVariance component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            @warn "Base innovations for NonStationaryVariance component $(spec.key) (outcome $k) not found. Returning zero-matrix." # Warn if innovations are missing
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
         
-        # Extract samples (CPU) and move to device
-        base_innovations_cpu = get_params_matrix(chain, base_innovations_name, base_spec.hyper.n_latent)
-        base_innovations_device = to_device(base_innovations_cpu)
+        # Extract samples (CPU)
+        base_innovations = get_params_matrix(chain, base_innovations_name, base_spec.hyper.n_latent) # Base innovations
         
-        # 3. Reconstruct the base latent field (unit variance) on the device
+        # 3. Reconstruct the base latent field (unit variance)
         n_latent_base = base_spec.hyper.n_latent
-        base_latent_raw_device = to_device(zeros(Float64, n_latent_base, n_samples))
+        base_latent_raw = zeros(Float64, n_latent_base, n_samples) # Initialize raw latent field
 
+        # Reconstruction logic based on method (spectral or cholesky)
         if m.method == :spectral
-            U = base_spec.hyper.U # Already on device
-            L = base_spec.hyper.L # Already on device
+            U = base_spec.hyper.U
+            L = base_spec.hyper.L
             diag_D = 1.0 ./ sqrt.(L .+ noise)
             if typeof(m.base_model) in [ICAR, Besag]; diag_D[1] = 0.0; end
             
-            # Vectorized reconstruction
-            base_latent_raw_device = U * (diag_D .* base_innovations_device')
+            # Vectorized reconstruction on CPU
+            base_latent_raw = U * (diag_D .* base_innovations')
         else # :cholesky or :cholesky_sparse
             # Use the pre-computed Cholesky factor
             F_base = base_spec.hyper.cholesky_factor
             for i in 1:n_samples
-                raw_field = F_base.L' \ base_innovations_device[i, :]
-                base_latent_raw_device[:, i] = raw_field .- mean(raw_field)
+                raw_field = F_base.L' \ base_innovations[i, :]
+                base_latent_raw[:, i] = raw_field .- mean(raw_field)
             end
         end
-
-        # 4. Combine base field and sigma field on the device
-        # Index the base field to match the observation structure
-        base_field_at_obs_device = base_latent_raw_device[s_idx_full, :]
-        
-        # Element-wise product
-        final_effect_k_device = base_field_at_obs_device .* spatially_varying_sigma_device
-        
-        # 5. Move final result back to CPU
-        push!(structured_effects, Array(final_effect_k_device))
+        # 4. Combine base field and sigma field
+        base_field_at_obs = base_latent_raw[s_idx_full, :] # Index base field to match observation structure
+        final_effect_k = base_field_at_obs .* spatially_varying_sigma # Element-wise product
+        push!(structured_effects, final_effect_k) # Store final result
     end
     
     return (structured=structured_effects, noisy=structured_effects)
-end
+end 

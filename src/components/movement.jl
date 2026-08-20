@@ -1,94 +1,88 @@
-
 """
     Movement <: ComponentModel
 
-A component for simulating population dynamics using an advection-diffusion
-process on a discrete spatial graph or a continuous surface. This component models
-the change in a latent field over time due to two primary processes: advection
-(directional movement with a velocity field) and diffusion (random movement from
-high to low concentration areas).
+A component for simulating population dynamics using an Advection-Diffusion-Reaction
+(ADR) process on a discrete spatial graph. This component models the change in a
+latent field over time due to three primary processes: advection (directional
+movement), diffusion (random movement), and reaction (local population growth/decay).
+It can also integrate mark-recapture telemetry data to inform movement parameters.
 
 # Version
-v1.0.4 (2026-08-14)
+v1.3.1 (2026-08-19)
 
 # Mathematical Summary
-The component approximates the solution to the advection-diffusion partial
-differential equation (PDE), which describes the transport of a substance or
-quantity. A general reference can be found on Wikipedia's page for the
-Convection-diffusion equation.
+The component approximates the solution to the Advection-Diffusion-Reaction PDE:
 
-\$\\frac{\\partial C}{\\partial t} = \\nabla \\cdot (D \\nabla C) - \\nabla \\cdot (\\mathbf{v} C)\$
+\$\\frac{\\partial C}{\\partial t} = \\nabla \\cdot (D \\nabla C) - \\nabla \\cdot (\\mathbf{v} C) + f(C)\$
 
 where:
 - `C` is the concentration or density of the population.
 - `D` is the diffusion coefficient, which can be spatially varying.
 - `v` is the velocity field for advection.
+- `f(C)` is the reaction term, modeled here as logistic growth: `r*C*(1 - C/K)`.
 
 This implementation uses a discrete state-space representation on a graph, where
 the spatial operators are derived from the graph's adjacency matrix `W`. The
 temporal evolution is modeled using either an explicit or implicit Euler scheme.
-This approach is common in hierarchical Bayesian models for ecological processes,
-such as those described by **Wikle (2003)** in "Hierarchical Bayesian models for
-predicting the spread of ecological processes."
+This approach is common in hierarchical Bayesian models for ecological processes.
+
+# Telemetry Data Integration
+If `mark_recapture_data` is provided, the model includes a likelihood component for
+these observations. The transition probability over `k` time steps is calculated
+from the one-step transition matrix `Gamma` (the inverse of the propagator) as `Gamma^k`.
+
+The `mark_recapture_data` can be provided in two formats:
+1.  A `DataFrame` in "long" format with columns: `tagid`, `s_idx`, `time`, `tag`, and an optional `individual_covariate`. The component will automatically process this into transitions.
+2.  A pre-processed `Matrix` in "wide" format with columns: `[release_unit, recapture_unit, time_steps, individual_covariate]`.
 
 # Computational Methods
-The `Movement` component supports multiple numerical methods for temporal evolution,
-controlled by the `method` parameter in the `random()` call:
-
 - **`:explicit` (Default, AD-friendly)**: Uses an explicit Euler time-stepping
-  scheme. This method is fully compatible with automatic differentiation (AD) and
-  thus suitable for gradient-based samplers like NUTS. However, it is only
-  conditionally stable and may require small time steps or strong priors on
-  `velocity` and `diffusion` to prevent numerical instability.
-  The update rule is:
-  `u_t = u_{t-1} + dt * (v*A*u_{t-1} + D*L*u_{t-1})`
-
+  scheme that includes the reaction term. This method is fully compatible with
+  automatic differentiation (AD) but is only conditionally stable.
 - **`:implicit` (Didactic, Not AD-friendly)**: Uses an implicit Euler time-stepping
-  scheme, which is unconditionally stable and often more robust for stiff problems
-  (e.g., high diffusion). This method requires solving a linear system at each
-  time step, which is done via an `lu` decomposition. This decomposition is not
-  differentiable, making this method incompatible with AD. It is retained as a
-  didactic alternative for use with gradient-free samplers.
-  The update rule is:
-  `(I - dt*(v*A + D*L)) * u_t = u_{t-1}`
-
-# Continuous Space Formulation
-If no adjacency matrix `W` is provided, the component can be configured to operate
-on a continuous domain by discretizing it into a fine lattice based on a provided
-`habitat_raster`. The values in this raster can then influence the diffusion
-parameter, allowing for spatially-varying movement dynamics.
+  scheme for the advection-diffusion part (no reaction term). This method is
+  unconditionally stable but not AD-compatible.
 
 # Inputs
 - **Required**:
   - A spatial index variable (e.g., `s_idx`).
   - A temporal index variable (e.g., `year`).
-  - Either an adjacency matrix `W` passed as a keyword argument to `@bstm`, or a
-    `habitat_raster` matrix passed as a parameter to the `movement` module.
+  - An adjacency matrix `W`.
 - **Optional**:
-  - `habitat`: A `Symbol` pointing to a column in the data, or a `Vector` of length `s_N`.
-  - `method`: A `Symbol` specifying the numerical method (`:explicit` or `:implicit`).
-  - `velocity`: A `UnivariateDistribution` for the prior on the advection velocity. Default: `Normal(0, 0.5)`.
-  - `diffusion`: A `UnivariateDistribution` for the prior on the diffusion rate. Default: `LogNormal(-1, 1)`.
-  - `sigma`: A `UnivariateDistribution` for the prior on the process noise standard deviation. Default: `Exponential(1.0)`.
+  - `habitat`: A covariate influencing diffusion.
+  - `mark_recapture_data`: A `DataFrame` or `Matrix` with telemetry data.
+  - `method`: `:explicit` or `:implicit`.
+  - `velocity`: Prior for the advection velocity.
+  - `diffusion`: Prior for the diffusion rate.
+  - `sigma`: Prior for the process noise standard deviation.
+  - `r`: Prior for the intrinsic growth rate (for reaction term).
+  - `K`: Prior for the carrying capacity (for reaction term).
+  - `beta_het`: Prior for the individual heterogeneity effect in telemetry data.
 
 # Outputs (Parameter Names)
-- `velocity_<key>`: The global advection velocity parameter.
-- `diffusion_<key>`: The base diffusion parameter.
-- `beta_habitat_diffusion_<key>`: The coefficient for the effect of the habitat
-  covariate on diffusion (only if `habitat` is provided).
-- `sigma_<key>`: The marginal standard deviation of the movement process.
-- `innovations_<key>`: The latent innovations driving the process.
+- `velocity_<key>`, `diffusion_<key>`, `sigma_<key>`
+- `r_<key>`, `K_<key>` (if reaction is modeled)
+- `beta_het_<key>` (if telemetry is modeled)
+- `beta_habitat_diffusion_<key>` (if habitat covariate is used)
+- `innovations_<key>`
 """
 struct Movement <: ComponentModel
     velocity::UnivariateDistribution
     diffusion::UnivariateDistribution
     sigma::UnivariateDistribution
+    r::Union{UnivariateDistribution, Nothing}
+    K::Union{UnivariateDistribution, Nothing}
+    beta_het::Union{UnivariateDistribution, Nothing}
     method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:movement] = Movement
 COMPONENT_CONSTRUCTORS[:movement] = (p, params) -> Movement(
-    p.velocity, p.diffusion, p.sigma, get(params, :method, :explicit)
+    p.velocity, p.diffusion, p.sigma,
+    get(p, :r, nothing),
+    get(p, :K, nothing),
+    get(p, :beta_het, nothing),
+    get(params, :method, :explicit)
 )
 MODEL_TO_STRUCTURE_MAP[:movement] = :spacetime
 
@@ -173,8 +167,54 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
     if !isnothing(habitat_data)
         precomputes[:habitat_data] = habitat_data
     end
+    
+    if haskey(params, :mark_recapture_data)
+        telemetry_input = params[:mark_recapture_data]
+        if telemetry_input isa DataFrame
+            precomputes[:mark_recapture_data] = _process_telemetry_data(telemetry_input)
+        else
+            precomputes[:mark_recapture_data] = telemetry_input
+        end
+    end
 
     return NamedTuple(precomputes)
+end
+
+function _process_telemetry_data(telemetry_df::DataFrame)
+    required_cols = [:tagid, :s_idx, :time, :tag]
+    if !all(hasproperty(telemetry_df, col) for col in required_cols)
+        error("Telemetry DataFrame must contain columns: :tagid, :s_idx, :time, :tag.")
+    end
+
+    transitions = []
+    gdf = groupby(telemetry_df, :tagid)
+
+    for sub_df in gdf
+        if nrow(sub_df) < 2; continue; end
+        
+        # Sort observations for each individual by tag/time
+        sort!(sub_df, :tag)
+
+        for i in 1:(nrow(sub_df) - 1)
+            release_row = sub_df[i, :]
+            recapture_row = sub_df[i+1, :]
+
+            release_unit = release_row.s_idx
+            recapture_unit = recapture_row.s_idx
+            time_steps = round(Int, recapture_row.time - release_row.time)
+            
+            # Use individual covariate if present, otherwise default to 0
+            covariate = hasproperty(sub_df, :individual_covariate) ? release_row.individual_covariate : 0.0
+
+            push!(transitions, [release_unit, recapture_unit, time_steps, covariate])
+        end
+    end
+
+    if isempty(transitions)
+        return Matrix{Float64}(undef, 0, 4)
+    end
+
+    return reduce(hcat, transitions)'
 end
 
 function get_priors(
@@ -193,11 +233,49 @@ function get_priors(
         push!(priors, "$(beta_habitat_diffusion_name) ~ Normal(0, 1.0)")
     end
     
+    if !isnothing(m.r)
+        push!(priors, "$(p_names.r) ~ $(_distribution_to_string(m.r))")
+    end
+    if !isnothing(m.K)
+        push!(priors, "$(p_names.K) ~ $(_distribution_to_string(m.K))")
+    end
+
+    if hasproperty(spec.hyper, :mark_recapture_data) && !isnothing(m.beta_het)
+        push!(priors, "$(p_names.beta_het) ~ $(_distribution_to_string(m.beta_het))")
+    end
+    
     push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
 
+"""
+    get_updates(m::Movement, spec::NamedTuple, arch::String, outcome_idx, M)
+
+Generates the Turing code to construct the latent effect for the `Movement`
+component and add it to the linear predictor. This version is CPU-only and uses
+a numerically stable approach for the telemetry likelihood.
+
+# Version
+v1.3.1 (2026-08-19)
+
+# Rationale
+This version replaces the explicit matrix inversion (`inv()`) in the telemetry
+likelihood calculation with a more numerically stable approach using LU factorization
+and back-substitution (`\\`). This avoids potential `DomainError` or `NaN` propagation
+that can occur when the propagator matrix becomes singular or ill-conditioned during
+sampling, which is a common source of the error type shown in the user's request.
+
+# Arguments
+- `m::Movement`: The `Movement` component instance.
+- `spec::NamedTuple`: The full specification for this component instance.
+- `arch::String`: The model architecture (`"univariate"` or `"multivariate"`).
+- `outcome_idx::Union{Int, Nothing}`: The index of the outcome variable.
+- `M::NamedTuple`: The main model configuration.
+
+# Returns
+- A `String` containing the generated Turing code for the component's updates.
+"""
 function get_updates(
     m::Movement, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -227,79 +305,135 @@ function get_updates(
         A_op = spec_registry[:$(key)].hyper.A_template
     """
 
+    has_reaction = !isnothing(m.r) && !isnothing(m.K)
+
     evolution_code = if m.method == :implicit
         """
-        # Implicit Euler method (numerically stable, not AD-friendly)
+        # Implicit Euler method (numerically stable, not AD-friendly, no reaction term)
         for t in 2:$(hyper.t_N)
             propagator_t = lu(I($(hyper.s_N)) - $(p_names.velocity) * A_op - Diagonal(diffusion_field) * L_op)
             dyn_field[:, t] = (propagator_t \\ dyn_field[:, t-1]) + innov_matrix[:, t]
         end
         """
     elseif m.method == :explicit
+        reaction_term_code = has_reaction ? "+ ($(p_names.r) .* dyn_field[:, t-1] .* (1.0 .- dyn_field[:, t-1] ./ $(p_names.K)))" : ""
         """
         # Explicit Euler method (AD-friendly, conditionally stable)
         propagator_t = $(p_names.velocity) * A_op + Diagonal(diffusion_field) * L_op
         for t in 2:$(hyper.t_N)
-            dyn_field[:, t] = dyn_field[:, t-1] + propagator_t * dyn_field[:, t-1] + innov_matrix[:, t]
+            ad_diff_term = propagator_t * dyn_field[:, t-1]
+            reaction_term = $(has_reaction ? "$(p_names.r) .* dyn_field[:, t-1] .* (1.0 .- dyn_field[:, t-1] ./ $(p_names.K))" : "zeros(T_num_dyn, $(hyper.s_N))")
+            dyn_field[:, t] = dyn_field[:, t-1] + ad_diff_term + reaction_term + innov_matrix[:, t]
         end
         """
     else
         error("Unsupported method '$(m.method)' for Movement component.")
     end
 
+    telemetry_likelihood_code = ""
+    if hasproperty(hyper, :mark_recapture_data)
+        telemetry_likelihood_code = """
+        # --- Mark-Recapture Telemetry Likelihood ---
+        M_prop_tlm = I($(hyper.s_N)) - $(p_names.velocity) * A_op - Diagonal(diffusion_field) * L_op
+        
+        # Pre-factorize the transposed propagator for repeated solves.
+        F_prop_T = lu(transpose(M_prop_tlm))
+
+        for m_idx in 1:size(spec_registry[:$(key)].hyper.mark_recapture_data, 1)
+            u_rel = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 1])
+            u_rec = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 2])
+            time_steps = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 3])
+            cov_m = spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 4]
+            
+            local p_unnorm
+            if time_steps > 0
+                # To get the u_rel-th row of inv(M_prop_tlm)^k, we solve
+                # (M_prop_tlm')^k * x = e_urel, where e_urel is a basis vector.
+                # This is done by k successive linear solves using the pre-computed LU factorization.
+                e_urel = zeros(T_num_dyn, $(hyper.s_N))
+                e_urel[u_rel] = 1.0
+                
+                y = e_urel
+                for _ in 1:time_steps
+                    y = F_prop_T \\ y
+                end
+                p_unnorm = y
+            else
+                # If time_steps is 0, transition is from a unit to itself with prob 1.
+                p_unnorm = zeros(T_num_dyn, $(hyper.s_N))
+                p_unnorm[u_rel] = 1.0
+            end
+
+            indiv_scaling = exp($(p_names.beta_het) * cov_m)
+            p_unnorm_scaled = p_unnorm .^ indiv_scaling
+            p_norm = p_unnorm_scaled / (sum(p_unnorm_scaled) + 1e-15)
+            Turing.@addlogprob! log(max(p_norm[u_rec], 1e-12))
+        end
+        """
+    end
+
     application_code = """
         dyn_field .*= $(p_names.sigma)
-        for i in 1:M.y_N
-            $(eta_target)[i] += dyn_field[M.s_idx[i], M.t_idx[i]]
-        end
+        
+        # Vectorized update to the linear predictor using linear indexing
+        st_idx = (M.t_idx .- 1) .* spec.hyper.s_N .+ M.s_idx
+        effect = vec(dyn_field)[st_idx]
+        $(eta_target) .+= effect
     """
 
     return """
     let
         $(common_setup)
         $(evolution_code)
+        $(telemetry_likelihood_code)
         $(application_code)
     end
     """
 end
 
+"""
+    get_effects(m::Movement, chain, spec::NamedTuple, M::NamedTuple, PS)
+
+Reconstructs the posterior distribution of the `Movement` component's effect.
+This version is CPU-only and uses modern chain accessors.
+"""
 function get_effects(
-    m::Movement, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::Movement, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
+    # --- Setup: Extract dimensions ---
     n_samples = size(chain, 1) * size(chain, 3)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    
+    p_names = string.(names(DataFrame(chain)))
     
     key = spec.key
     hyper = spec.hyper
-    L_op = hyper.L_template # Already on device
-    A_op = hyper.A_template # Already on device
+    L_op = hyper.L_template
+    A_op = hyper.A_template
     s_N = hyper.s_N
     t_N = hyper.t_N # Training time steps
 
-    # --- Index Handling: Combine training and prediction sets on device ---
-    s_idx_train = M.s_idx # Already on device
-    t_idx_train = M.t_idx # Already on device
+    # --- Index Handling: Combine training and prediction sets on CPU ---
+    s_idx_train = M.s_idx
+    t_idx_train = M.t_idx
 
     s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
-        vcat(s_idx_train, to_device(PS.data.s_idx))
+        vcat(s_idx_train, PS.data.s_idx)
     else
         s_idx_train
     end
     t_idx_full = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
-        vcat(t_idx_train, to_device(PS.data.t_idx))
+        vcat(t_idx_train, PS.data.t_idx)
     else
         t_idx_train
     end
     
     N_total = length(s_idx_full)
-    t_N_full = isempty(t_idx_full) ? 0 : Array(maximum(t_idx_full))[] # Get max time on CPU
+    t_N_full = isempty(t_idx_full) ? 0 : maximum(t_idx_full)
 
-    # Pre-calculate flat spatiotemporal index for efficient lookups on the device
+    # Pre-calculate flat spatiotemporal index for efficient lookups
     st_idx_full = (t_idx_full .- 1) .* s_N .+ s_idx_full
 
     structured_effects = Vector{Matrix{Float64}}()
@@ -313,6 +447,8 @@ function get_effects(
         diffusion_name = _find_parameter(p_names, string(p_names_k.diffusion), k, is_multivariate_model)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+        r_name = hasproperty(p_names_k, :r) ? _find_parameter(p_names, string(p_names_k.r), k, is_multivariate_model) : ""
+        K_name = hasproperty(p_names_k, :K) ? _find_parameter(p_names, string(p_names_k.K), k, is_multivariate_model) : ""
 
         if isempty(velocity_name) || isempty(diffusion_name) || isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for Movement component $(key) (outcome $k) not found. Returning zero-matrix."
@@ -320,81 +456,72 @@ function get_effects(
             continue
         end
 
-        # Extract all posterior samples to CPU first
-        velocity_samples_cpu = get_params_vector(chain, velocity_name, 1)[:, 1]
-        diffusion_samples_cpu = get_params_vector(chain, diffusion_name, 1)[:, 1]
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, s_N * t_N)
+        # Extract all posterior samples
+        velocity_samples = get_params_vector(chain, velocity_name, 1)[:, 1]
+        diffusion_samples = get_params_vector(chain, diffusion_name, 1)[:, 1]
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        innovations_samples = get_params_vector(chain, innovations_name, s_N * t_N)'
         
-        beta_habitat_samples_cpu = if hasproperty(hyper, :habitat_data)
+        r_samples = !isempty(r_name) ? get_params_vector(chain, r_name, 1)[:, 1] : zeros(n_samples)
+        K_samples = !isempty(K_name) ? get_params_vector(chain, K_name, 1)[:, 1] : fill(Inf, n_samples)
+
+        beta_habitat_samples = if hasproperty(hyper, :habitat_data)
             beta_name = _find_parameter(p_names, "beta_habitat_diffusion_$(key)", k, is_multivariate_model)
             isempty(beta_name) ? nothing : get_params_vector(chain, beta_name, 1)[:, 1]
         else
             nothing
         end
 
-        # Move all sample data to the device at once
-        velocity_samples_device = to_device(velocity_samples_cpu)
-        diffusion_samples_device = to_device(diffusion_samples_cpu)
-        sigma_samples_device = to_device(sigma_samples_cpu)
-        innovations_samples_device = to_device(innovations_samples_cpu') # [s_N*t_N, n_samples]
+        # Initialize a large matrix to hold the flattened dynamic field for all samples
+        dyn_field_all_samples = zeros(Float64, s_N * t_N_full, n_samples)
+        I_s = Matrix(I, s_N, s_N)
 
-        beta_habitat_samples_device = if !isnothing(beta_habitat_samples_cpu)
-            to_device(beta_habitat_samples_cpu)
-        else
-            nothing
-        end
-
-        # Initialize a large matrix on the device to hold the flattened dynamic field for all samples
-        dyn_field_all_samples_device = to_device(zeros(Float64, s_N * t_N_full, n_samples))
-        I_s_device = to_device(Matrix(I, s_N, s_N))
-
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction on the CPU ---
         for i in 1:n_samples
-            # Construct diffusion field for the current sample on the device
-            diffusion_field_device = if !isnothing(beta_habitat_samples_cpu)
-                habitat_field_device = hyper.habitat_data # Already on device
-                diffusion_samples_device[i] .* exp.(beta_habitat_samples_device[i] .* habitat_field_device)
+            # Construct diffusion field for the current sample
+            diffusion_field = if !isnothing(beta_habitat_samples)
+                habitat_field = hyper.habitat_data
+                diffusion_samples[i] .* exp.(beta_habitat_samples[i] .* habitat_field)
             else
-                fill(diffusion_samples_device[i], s_N)
+                fill(diffusion_samples[i], s_N)
             end
 
-            # Prepare innovations matrix on the device, extending for prediction if needed
-            innov_matrix_train_device = reshape(innovations_samples_device[:, i], s_N, t_N)
-            innov_matrix_full_device = if t_N_full > t_N
-                hcat(innov_matrix_train_device, to_device(randn(Float32, s_N, t_N_full - t_N)))
+            # Prepare innovations matrix, extending for prediction if needed
+            innov_matrix_train = reshape(innovations_samples[:, i], s_N, t_N)
+            innov_matrix_full = if t_N_full > t_N
+                hcat(innov_matrix_train, randn(Float32, s_N, t_N_full - t_N))
             else
-                innov_matrix_train_device[:, 1:t_N_full]
+                innov_matrix_train[:, 1:t_N_full]
             end
 
-            # Initialize the dynamic field for this sample on the device
-            dyn_field_sample_device = to_device(zeros(Float64, s_N, t_N_full))
-            dyn_field_sample_device[:, 1] = innov_matrix_full_device[:, 1]
+            # Initialize the dynamic field for this sample
+            dyn_field_sample = zeros(Float64, s_N, t_N_full)
+            dyn_field_sample[:, 1] = innov_matrix_full[:, 1]
 
-            # Time evolution loop on the device
+            # Time evolution loop
             if m.method == :implicit
-                # This method is not AD-friendly but can be run on GPU if lu is supported
-                propagator_t = lu(I_s_device - velocity_samples_device[i] * A_op - Diagonal(diffusion_field_device) * L_op)
+                propagator_t = lu(I_s - velocity_samples[i] * A_op - Diagonal(diffusion_field) * L_op)
                 for t in 2:t_N_full
-                    dyn_field_sample_device[:, t] = (propagator_t \ dyn_field_sample_device[:, t-1]) .+ innov_matrix_full_device[:, t]
+                    dyn_field_sample[:, t] = (propagator_t \ dyn_field_sample[:, t-1]) .+ innov_matrix_full[:, t]
                 end
             else # :explicit
-                propagator_t = velocity_samples_device[i] * A_op + Diagonal(diffusion_field_device) * L_op
+                propagator_t = velocity_samples[i] * A_op + Diagonal(diffusion_field) * L_op
                 for t in 2:t_N_full
-                    dyn_field_sample_device[:, t] = dyn_field_sample_device[:, t-1] + propagator_t * dyn_field_sample_device[:, t-1] + innov_matrix_full_device[:, t]
+                    ad_diff_term = propagator_t * dyn_field_sample[:, t-1]
+                    reaction_term = r_samples[i] .* dyn_field_sample[:, t-1] .* (1.0 .- dyn_field_sample[:, t-1] ./ K_samples[i])
+                    dyn_field_sample[:, t] = dyn_field_sample[:, t-1] + ad_diff_term + reaction_term + innov_matrix_full[:, t]
                 end
             end
             
             # Scale by sigma and store the flattened result
-            dyn_field_sample_device .*= sigma_samples_device[i]
-            dyn_field_all_samples_device[:, i] = vec(dyn_field_sample_device)
+            dyn_field_sample .*= sigma_samples[i]
+            dyn_field_all_samples[:, i] = vec(dyn_field_sample)
         end
 
         # Index the full results matrix once using the pre-calculated flat indices
-        effect_k_device = dyn_field_all_samples_device[st_idx_full, :]
+        effect_k = dyn_field_all_samples[st_idx_full, :]
         
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k)
     end
 
     return (structured=structured_effects, noisy=structured_effects)

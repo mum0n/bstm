@@ -206,35 +206,35 @@ function get_updates(
     end
 end
 
-
 function get_effects(
-    m::PSpline, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::PSpline, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
     
     hyper = spec.hyper
     noise = M.noise
     n_latent = hyper.n_latent
 
-    # --- Basis Matrix Handling for Training and Prediction Sets ---
-    B_train = hyper.basis_matrix # This is already on the correct device
+    # --- Basis Matrix Handling for Training and Prediction Sets (CPU-only) ---
+    B_train = hyper.basis_matrix # This is already a CPU array
 
     coord_vars = get(spec.params, :positional_args, [])
     coord_var_sym = isempty(coord_vars) ? :none : Symbol(coord_vars[1])
 
     B_full = if !isnothing(PS) && hasproperty(PS.data, coord_var_sym)
         coords_pred_cpu = PS.data[!, coord_var_sym]
-        # Move prediction coordinates to the device before creating the basis
-        coords_pred_device = to_device(coords_pred_cpu)
         
-        # bstm_bspline_basis is device-aware
-        B_pred, _ = bstm_bspline_basis(coords_pred_device, m.nbins, m.degree)
+        # bstm_bspline_basis is CPU-only
+        B_pred, _ = bstm_bspline_basis(coords_pred_cpu, m.nbins, m.degree)
         vcat(B_train, B_pred)
     else
         B_train
@@ -261,40 +261,44 @@ function get_effects(
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
-        # Initialize the output matrix for coefficients on the target device
-        coeffs_samples_matrix_device = to_device(zeros(Float64, n_latent, n_samples))
+        # Initialize the output matrix for coefficients on the CPU
+        coeffs_samples_matrix_cpu = zeros(Float64, n_latent, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction on the CPU ---
         if m.method == :spectral
-            U = hyper.U # Already on device
-            L = hyper.L # Already on device
+            U = hyper.U # Already a CPU array
+            L = hyper.L # Already a CPU array
             
-            # Vectorized reconstruction
-            sigma_samples_device = to_device(sigma_samples_cpu)
-            innovations_device_T = to_device(innovations_samples_cpu') # Transpose to [n_latent x n_samples]
+            # Vectorized reconstruction on CPU
+            # sigma_samples_cpu is [n_samples], innovations_samples_cpu is [n_samples, n_latent]
+            # We need to broadcast sigma over the innovations.
             
-            diag_D_matrix = sigma_samples_device' ./ sqrt.(L .+ noise)
+            # Create a matrix of diag_D values, one column per sample
+            diag_D_matrix = (sigma_samples_cpu' ./ sqrt.(L .+ noise))
             for i in 1:m.diff_order
                 diag_D_matrix[i, :] .= 0.0
             end
             
-            coeffs_samples_matrix_device = U * (diag_D_matrix .* innovations_device_T)
+            # U is [n_latent x n_latent], diag_D_matrix is [n_latent x n_samples], innovations_samples_cpu' is [n_latent x n_samples]
+            coeffs_samples_matrix_cpu = U * (diag_D_matrix .* innovations_samples_cpu')
 
         else # :cholesky or :cholesky_sparse
-            F = hyper.cholesky_factor # Already on device
+            F = hyper.cholesky_factor # Already a CPU factorization object
             for i in 1:n_samples
-                innov_i_device = to_device(innovations_samples_cpu[i, :])
-                coeffs_raw = F.L' \ innov_i_device
+                innov_i_cpu = innovations_samples_cpu[i, :]
+                coeffs_raw = F.L' \ innov_i_cpu
+                
+                # Centering based on sum-to-zero constraint for RW penalties
+                # The sum(coeffs_raw) is constrained in get_updates, so mean(coeffs_raw) is appropriate here.
                 coeffs_centered = coeffs_raw .- mean(coeffs_raw)
-                coeffs_samples_matrix_device[:, i] = sigma_samples_cpu[i] .* coeffs_centered
+                coeffs_samples_matrix_cpu[:, i] = sigma_samples_cpu[i] .* coeffs_centered
             end
         end
         
-        # Perform final matrix multiplication on the device
-        effect_k_device = B_full * coeffs_samples_matrix_device
+        # Perform final matrix multiplication on the CPU
+        effect_k_cpu = B_full * coeffs_samples_matrix_cpu
         
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_cpu)
     end
     
     return (structured=structured_effects, noisy=structured_effects)

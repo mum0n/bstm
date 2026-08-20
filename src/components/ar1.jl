@@ -5,7 +5,7 @@ A component model for a first-order autoregressive (AR1) process, fundamental fo
 modeling time series data with serial correlation.
 
 # Version
-v1.3.0 (2026-08-17)
+v1.4.2 (2026-08-19)
 
 # Mathematical Summary
 The AR1 process models the value of a latent field \$\\phi_t\$ at time \$t\$ as a
@@ -64,18 +64,29 @@ COMPONENT_CONSTRUCTORS[:ar1] = (p, params) -> AR1(
 )
 MODEL_TO_STRUCTURE_MAP[:ar1] = :temporal
 
+"""
+    get_precomputes(m::AR1, M::NamedTuple, mod_data::Dict)::NamedTuple
+
+Performs data-dependent setup for the AR1 model. This version is CPU-only.
+"""
 function get_precomputes(m::AR1, M::NamedTuple, mod_data::Dict)::NamedTuple
     n = M.t_N
-    to_device = M.to_device
+    
     template = build_structure_template(:ar1, n)
     return (
-        Q_template=to_device(template.matrix), 
+        Q_template=template.matrix, 
         n_latent=n, 
-        U=to_device(template.U), 
-        L=to_device(template.L)
+        U=template.U, 
+        L=template.L
     )
 end
 
+"""
+    _ar1_covariance_matrix(rho, sigma, n, noise)
+
+Helper function to construct the dense Toeplitz covariance matrix for a stationary
+AR(1) process. Used by the `:centered` method. This version is CPU-only.
+"""
 function _ar1_covariance_matrix(rho, sigma, n, noise)
     T_num = promote_type(typeof(rho), typeof(sigma), typeof(noise))
     var = sigma^2 / (one(T_num) - rho^2 + T_num(noise))
@@ -87,6 +98,11 @@ function _ar1_covariance_matrix(rho, sigma, n, noise)
     return C
 end
 
+"""
+    get_priors(m::AR1, spec::NamedTuple, arch::String, outcome_idx, M)::String
+
+Generates Turing code for the priors of the `AR1` component.
+"""
 function get_priors(
     m::AR1, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -121,7 +137,11 @@ function get_priors(
     return join(priors_acc, "\n    ")
 end
  
+"""
+    get_updates(m::AR1, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
+Generates the Turing code for constructing the AR1 effect. This version is CPU-only.
+"""
 function get_updates(
     m::AR1, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
@@ -181,56 +201,35 @@ function get_updates(
     end
 end
 
-
-
-function ar1_statespace(rho, sigma, innov, n_latent, noise)
-    T_num = promote_type(typeof(rho), typeof(sigma), eltype(innov), typeof(noise))
-    latent = similar(innov, T_num, n_latent) # Use similar for device awareness
-    
-    if n_latent > 0
-        latent[1] = innov[1] / sqrt(one(T_num) - rho^2 + T_num(noise))
-        for t in 2:n_latent
-            latent[t] = rho * latent[t-1] + innov[t]
-        end
-        latent .*= sigma
-    end
-    
-    return latent
-end
-
 function get_effects(
     m::AR1, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
     noise_val = get(M, :noise, 1e-6)
 
-    # --- Index Handling: Combine training and prediction sets ---
-    t_idx_train_cpu = Array(M.t_idx)
-    t_idx_full_cpu = if !isnothing(PS) && haskey(PS.data, :t_idx)
-        vcat(t_idx_train_cpu, get(PS.data, :t_idx, []))
+    # --- Index Handling: Combine training and prediction sets on CPU ---
+    t_idx_train = M.t_idx
+    t_idx_full = if !isnothing(PS) && haskey(PS.data, :t_idx)
+        vcat(t_idx_train, PS.data.t_idx)
     else
-        t_idx_train_cpu
+        t_idx_train
     end
     
     t_N_train = M.t_N
-    t_N_full = isempty(t_idx_full_cpu) ? 0 : maximum(t_idx_full_cpu)
-    N_total = length(t_idx_full_cpu)
-    t_idx_full_device = to_device(t_idx_full_cpu)
+    t_N_full = isempty(t_idx_full) ? 0 : maximum(t_idx_full)
+    N_total = length(t_idx_full)
 
     structured_effects = Vector{Matrix{Float64}}()
 
     # --- Reconstruction Loop ---
     for k in 1:outcomes_N
-        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        rho_name = _find_parameter(p_names, string(p_names_k.unconstrained_rho), k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(spec.key), "sigma", k, is_multivariate_model)
+        rho_name = _find_parameter(p_names, string(spec.key), "unconstrained_rho", k, is_multivariate_model)
         
         if isempty(sigma_name) || isempty(rho_name)
             @warn "Base parameters for AR1 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -238,69 +237,101 @@ function get_effects(
             continue
         end
 
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_samples_cpu = tanh.(get_params_vector(chain, rho_name, 1)[:, 1])
+        # All samples are extracted to CPU arrays
+        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+        rho_samples = tanh.(get_params_vector(chain, rho_name, 1)[:, 1])
         
-        latent_field_samples_device = to_device(zeros(Float64, t_N_full, n_samples))
+        latent_field_samples = zeros(Float64, t_N_full, n_samples)
         
         if m.method in [:statespace, :spectral]
-            innov_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innov_name = _find_parameter(p_names, string(spec.key), "innovations", k, is_multivariate_model)
             if isempty(innov_name)
                 @warn "Innovations for AR1 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            innov_samples_cpu = get_params_matrix(chain, innov_name, t_N_train)
-            innov_samples_device = to_device(innov_samples_cpu') # Transpose to [n_latent x n_samples]
+            innov_samples = get_params_matrix(chain, innov_name, t_N_train)
             
             if m.method == :statespace
                 for j in 1:n_samples
                     latent_field_train_j = ar1_statespace(
-                        rho_samples_cpu[j], sigma_samples_cpu[j],
-                        view(innov_samples_device, :, j), t_N_train, noise_val
+                        rho_samples[j], sigma_samples[j],
+                        innov_samples[j, :], t_N_train, noise_val
                     )
-                    latent_field_samples_device[1:t_N_train, j] = latent_field_train_j
+                    latent_field_samples[1:t_N_train, j] = latent_field_train_j
                 end
             else # :spectral
-                U_device = spec.hyper.U
-                L_base_device = spec.hyper.L
-                rho_samples_device = to_device(rho_samples_cpu)
-                sigma_samples_device = to_device(sigma_samples_cpu)
+                U = spec.hyper.U
+                L_base = spec.hyper.L
                 
-                lambda_vals = (1.0 .+ rho_samples_device'.^2) .+ rho_samples_device' .* L_base_device
-                diag_D = sigma_samples_device' ./ sqrt.(lambda_vals .+ noise_val)
-                latent_field_train_device = U_device * (diag_D .* innov_samples_device)
-                latent_field_samples_device[1:t_N_train, :] = latent_field_train_device
+                for j in 1:n_samples
+                    lambda_vals = (1.0 + rho_samples[j]^2) .+ rho_samples[j] .* L_base
+                    diag_D = sigma_samples[j] ./ sqrt.(lambda_vals .+ noise_val)
+                    latent_field_samples[1:t_N_train, j] = U * (diag_D .* innov_samples[j, :])
+                end
             end
 
         elseif m.method == :centered
-            latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
+            latent_name = _find_parameter(p_names, string(spec.key), "latent", k, is_multivariate_model)
             if isempty(latent_name)
                 @warn "Latent field for AR1 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            latent_samples_cpu = get_params_matrix(chain, latent_name, t_N_train)
-            latent_field_samples_device[1:t_N_train, :] = to_device(latent_samples_cpu')
+            latent_samples = get_params_matrix(chain, latent_name, t_N_train)
+            latent_field_samples[1:t_N_train, :] = latent_samples'
         end
         
-        # Forecasting step (vectorized over samples)
+        # Forecasting step (on CPU)
         if t_N_full > t_N_train
-            rho_samples_device = to_device(rho_samples_cpu)
-            sigma_samples_device = to_device(sigma_samples_cpu)
-            
-            for t in (t_N_train + 1):t_N_full
-                pred_innov_device = to_device(randn(Float32, n_samples))
-                latent_field_samples_device[t, :] = rho_samples_device' .* latent_field_samples_device[t-1, :] .+ pred_innov_device' .* sigma_samples_device'
+            for j in 1:n_samples
+                for t in (t_N_train + 1):t_N_full
+                    pred_innov = randn()
+                    latent_field_samples[t, j] = rho_samples[j] * latent_field_samples[t-1, j] + pred_innov * sigma_samples[j]
+                end
             end
         end
         
-        # Indexing on the device and moving the final result to CPU
-        effect_k_device = latent_field_samples_device[t_idx_full_device, :]
-        push!(structured_effects, Array(effect_k_device))
+        # Indexing on the CPU
+        effect_k = latent_field_samples[t_idx_full, :]
+        push!(structured_effects, effect_k)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+ 
 
+  
 
+"""
+    ar1_statespace(rho, sigma, innovations, n_latent, noise)
+
+Computes the state-space evolution of a stationary AR(1) process. This is a CPU-only implementation.
+"""
+function ar1_statespace(
+    rho, sigma, innovations::AbstractVector, n_latent::Int, noise
+)
+    T_num = promote_type(
+        typeof(rho), typeof(sigma), eltype(innovations), typeof(noise)
+    )
+    latent = Vector{T_num}(undef, n_latent)
+    if n_latent == 0
+        return latent
+    end
+
+    # The stationarity check `abs(rho) >= one(T_num)` is removed as it can cause
+    # issues with AD when rho is very close to 1 or -1. The `tanh` transformation
+    # in `get_updates` already ensures |rho| < 1 mathematically. Numerical
+    # stability at the boundaries is handled by the `noise` term in the denominator.
+
+    if n_latent > 0
+        # The denominator is protected from being zero or negative by the `noise` term.
+        latent[1] = innovations[1] / sqrt(one(T_num) - rho^2 + T_num(noise))
+        for t in 2:n_latent
+            latent[t] = rho * latent[t-1] + innovations[t]
+        end
+        latent .*= sigma
+    end
+    
+    return latent
+end 

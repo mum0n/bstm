@@ -6,7 +6,7 @@ approximates the full GP kernel matrix with a low-rank version based on a small 
 of `n_inducing` points, making it scalable for larger datasets.
 
 # Version
-v1.1.1 (2026-08-14)
+v1.2.0 (2026-08-19)
 
 # Mathematical Summary
 The Nyström method approximates the \$N \\times N\$ kernel matrix \$K_{XX}\$ of the data
@@ -133,36 +133,35 @@ function get_updates(
     key = spec.key
     
     common_code = """
-        local hyper = spec_registry[:$(key)].hyper
-        local X_coords = hyper.coords
-        local Z_coords = hyper.Z_inducing
-        local kernel_type = Symbol("$(m.kernel)")
-        
-        local K_UU = evaluate_kernel_matrix(
-            Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
-        )
-        local K_XU = evaluate_cross_kernel_matrix(
-            X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
-        )
+        let
+            hyper = spec_registry[:$(key)].hyper
+            X_coords = hyper.coords
+            Z_coords = hyper.Z_inducing
+            kernel_type = Symbol("$(m.kernel)")
+            
+            K_UU = evaluate_kernel_matrix(
+                Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
+            )
+            K_XU = evaluate_cross_kernel_matrix(
+                X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
+            )
     """
 
     noncentered_code = """
         # --- Nystrom Sparse GP (Non-Centered): $(key) ---
-        let
-            $(common_code)
-            local L_UU = cholesky(Symmetric(K_UU)).L
-            local u_latent = L_UU * $(p_names.innovations)
-            local nystrom_effect = K_XU * (K_UU \\ u_latent)
+        $(common_code)
+            L_UU = cholesky(Symmetric(K_UU)).L
+            u_latent = L_UU * $(p_names.innovations)
+            nystrom_effect = K_XU * (K_UU \\ u_latent)
             $(eta_target) .+= nystrom_effect
         end
     """
 
     centered_code = """
         # --- Nystrom Sparse GP (Centered): $(key) ---
-        let
-            $(common_code)
+        $(common_code)
             $(p_names.latent) ~ MvNormal(zeros(T, $(m.n_inducing)), Symmetric(K_UU))
-            local nystrom_effect = K_XU * (K_UU \\ $(p_names.latent))
+            nystrom_effect = K_XU * (K_UU \\ $(p_names.latent))
             $(eta_target) .+= nystrom_effect
         end
     """
@@ -176,34 +175,43 @@ function get_updates(
     end
 end
 
+"""
+    get_effects(m::Nystrom, chain, spec::NamedTuple, M::NamedTuple, PS)
 
+Reconstructs the Nyström sparse GP effect from posterior samples. This version is
+CPU-only and uses modern chain accessors.
+"""
 function get_effects(
-    m::Nystrom, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::Nystrom, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
     
     hyper = spec.hyper
     noise = M.noise
     kernel_type = Symbol(m.kernel)
 
     # --- Coordinate and Inducing Point Handling ---
-    coords_train = hyper.coords # Already on device
-    Z_inducing = hyper.Z_inducing # Already on device
+    coords_train = hyper.coords # Training coordinates
+    Z_inducing = hyper.Z_inducing # Inducing points
     
+    # Combine training and prediction coordinates
     coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-        vcat(coords_train, to_device(coords_pred_cpu))
+    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars) # If prediction set is provided
+        coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]) # Extract prediction coordinates
+        vcat(coords_train, coords_pred) # Combine training and prediction coordinates
     else
-        coords_train
+        coords_train # Otherwise, use only training coordinates
     end
-    n_obs_full = size(coords_full, 1)
+    n_obs_full = size(coords_full, 1) # Total number of observations (training + prediction)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -221,14 +229,15 @@ function get_effects(
             continue
         end
 
-        # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_samples_cpu = get_params_matrix(chain, ls_name, m.lengthscale isa Vector ? length(m.lengthscale) : 1)
+        # Extract posterior samples (CPU)
+        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1 # Dimension of lengthscale parameter
+        ls_samples = get_params_matrix(chain, ls_name, ls_dim) # (n_samples, ls_dim)
 
-        # Initialize the output matrix for the full effect on the target device
-        effect_k_device = to_device(zeros(Float64, n_obs_full, n_samples))
+        # Initialize the output matrix for the full effect
+        effect_k_matrix = zeros(Float64, n_obs_full, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction ---
         if m.method == :noncentered
             innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
             if isempty(innovations_name)
@@ -236,19 +245,19 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            innovations_samples_cpu = get_params_matrix(chain, innovations_name, m.n_inducing)
+            innovations_samples = get_params_matrix(chain, innovations_name, m.n_inducing) # (n_samples, n_inducing)
 
             for i in 1:n_samples
-                current_sigma = sigma_samples_cpu[i]
-                current_ls = m.lengthscale isa Vector ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+                current_sigma = sigma_samples[i, 1] # Sigma for current sample
+                current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1] # Lengthscale for current sample
                 
-                # Kernel evaluations and linear algebra happen on the device
+                # Kernel evaluations and linear algebra
                 K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
                 K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
                 
                 L_UU = cholesky(Symmetric(K_UU)).L
-                u_latent = L_UU * to_device(innovations_samples_cpu[i, :])
-                effect_k_device[:, i] = K_XU * (K_UU \ u_latent)
+                u_latent = L_UU * innovations_samples[i, :]
+                effect_k_matrix[:, i] = K_XU * (K_UU \ u_latent)
             end
         else # :centered
             latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
@@ -257,23 +266,22 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            u_latent_samples_cpu = get_params_matrix(chain, latent_name, m.n_inducing)
+            u_latent_samples = get_params_matrix(chain, latent_name, m.n_inducing) # (n_samples, n_inducing)
 
-            for i in 1:n_samples
-                current_sigma = sigma_samples_cpu[i]
-                current_ls = m.lengthscale isa Vector ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+            for i in 1:n_samples # Iterate over each posterior sample
+                current_sigma = sigma_samples[i, 1] # Sigma for current sample
+                current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1] # Lengthscale for current sample
                 
-                # Kernel evaluations and linear algebra happen on the device
+                # Kernel evaluations and linear algebra
                 K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
                 K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
                 
-                effect_k_device[:, i] = K_XU * (K_UU \ to_device(u_latent_samples_cpu[i, :]))
+                effect_k_matrix[:, i] = K_XU * (K_UU \ u_latent_samples[i, :])
             end
         end
         
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_matrix)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
-end
+end 

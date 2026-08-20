@@ -8,7 +8,7 @@ two sum-to-zero constraints for identifiability. It produces a smoother field th
 an RW1 model.
 
 # Version
-v2.1.0 (2026-08-17)
+v2.1.1 (2026-08-19)
 
 # Mathematical Summary
 The RW2 model defines a latent temporal field \$\\phi\$ where the value at time \$t\$ is
@@ -88,27 +88,24 @@ function get_precomputes(m::RW2, M::NamedTuple, mod_data::Dict)::NamedTuple
               "The component will have no effect."
     end
 
-    # Get the device transfer function
-    to_device = M.to_device
-
     # build_structure_template returns CPU arrays
     template = build_structure_template(:rw2, t_N)
     
-    # Move large, static arrays to the target device
-    Q_template_device = to_device(template.matrix)
-    U_device = to_device(template.U)
-    L_device = to_device(template.L)
+    # All arrays remain on the CPU.
+    Q_template_cpu = template.matrix
+    U_cpu = template.U
+    L_cpu = template.L
     
-    # Pre-compute the dense Cholesky factor for the :cholesky method on the target device
-    F_device = cholesky(Symmetric(Matrix(Q_template_device) + M.noise * I))
+    # Pre-compute the dense Cholesky factor for the :cholesky method on the CPU
+    F_cpu = cholesky(Symmetric(Matrix(Q_template_cpu) + M.noise * I))
     
     return (
-        Q_template=Q_template_device,
-        U=U_device,
-        L=L_device,
+        Q_template=Q_template_cpu,
+        U=U_cpu,
+        L=L_cpu,
         scaling_factor=template.scaling_factor,
         n_latent=t_N,
-        cholesky_factor=F_device
+        cholesky_factor=F_cpu
     )
 end
 
@@ -207,32 +204,37 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for RW2. Use :statespace, :spectral, :cholesky, or :cholesky_sparse."); end
 end
 
+"""
+    get_effects(m::RW2, chain, spec::NamedTuple, M::NamedTuple, PS)
+
+Reconstructs the RW2 effect from posterior samples. This version is CPU-only and
+vectorized for efficiency.
+"""
 function get_effects(
     m::RW2, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
+    
     noise = M.noise
 
-    # --- Get precomputed data (already on device) ---
+    # --- Get precomputed data ---
     hyper = spec.hyper
     n_latent_train = hyper.n_latent
 
     # --- Index Handling: Combine training and prediction sets ---
-    t_idx_train_cpu = Array(M.t_idx) # Bring to CPU for vcat
-    t_idx_full_cpu = if !isnothing(PS) && haskey(PS, :t_idx)
-        vcat(t_idx_train_cpu, get(PS, :t_idx, []))
+    t_idx_train_cpu = M.t_idx
+    t_idx_full_cpu = if !isnothing(PS) && haskey(PS.data, :t_idx)
+        vcat(t_idx_train_cpu, PS.data.t_idx)
     else
         t_idx_train_cpu
     end
     t_N_full = isempty(t_idx_full_cpu) ? 0 : maximum(t_idx_full_cpu)
     N_total = length(t_idx_full_cpu)
-    t_idx_full_device = to_device(t_idx_full_cpu)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -252,58 +254,50 @@ function get_effects(
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent_train)
 
-        # Initialize output matrix for the full latent field on the device
-        effect_k_latent_device = to_device(zeros(Float64, t_N_full, n_samples))
-
-        # --- Sample-wise Reconstruction on Device ---
-        for j in 1:n_samples
-            sigma_j = sigma_samples_cpu[j] # scalar
-            innov_train_j = to_device(innovations_samples_cpu[j, :])
-            
-            local latent_field_train_j
-            if m.method == :statespace
-                latent_field_raw = similar(innov_train_j) # Creates a vector on the same device
-                if n_latent_train > 0; latent_field_raw[1] = innov_train_j[1]; end
-                if n_latent_train > 1; latent_field_raw[2] = 2 * latent_field_raw[1] + innov_train_j[2]; end
-                for i in 3:n_latent_train
-                    latent_field_raw[i] = 2 * latent_field_raw[i-1] - latent_field_raw[i-2] + innov_train_j[i]
-                end
-                latent_field_centered = latent_field_raw .- mean(latent_field_raw)
-                latent_field_train_j = latent_field_centered .* sigma_j
-            elseif m.method == :spectral
-                U_device = hyper.U
-                L_device = hyper.L
-                diag_D = sigma_j ./ sqrt.(L_device .+ noise)
-                diag_D[1] = 0.0; diag_D[2] = 0.0 # Enforce sum-to-zero constraints
-                latent_field_train_j = U_device * (diag_D .* innov_train_j)
-            else # :cholesky or :cholesky_sparse
-                F_device = hyper.cholesky_factor
-                latent_field_raw = F_device.L' \ innov_train_j
-                latent_field_centered = latent_field_raw .- mean(latent_field_raw)
-                latent_field_train_j = latent_field_centered .* sigma_j
+        # Initialize output matrix for the full latent field on the CPU
+        effect_k_latent_cpu = zeros(Float64, t_N_full, n_samples)
+        
+        # --- Vectorized Reconstruction on CPU ---
+        local latent_field_train_cpu
+        if m.method == :statespace
+            innovations_T = innovations_samples_cpu' # [n_latent_train, n_samples]
+            latent_field_raw_cpu = similar(innovations_T)
+            if n_latent_train > 0; latent_field_raw_cpu[1, :] = innovations_T[1, :]; end
+            if n_latent_train > 1; latent_field_raw_cpu[2, :] = 2 .* latent_field_raw_cpu[1, :] .+ innovations_T[2, :]; end
+            for t in 3:n_latent_train
+                latent_field_raw_cpu[t, :] = 2 .* latent_field_raw_cpu[t-1, :] .- latent_field_raw_cpu[t-2, :] .+ innovations_T[t, :]
             end
-            effect_k_latent_device[1:n_latent_train, j] = latent_field_train_j
+            latent_field_centered_cpu = latent_field_raw_cpu .- mean(latent_field_raw_cpu, dims=1)
+            latent_field_train_cpu = latent_field_centered_cpu .* sigma_samples_cpu'
+        elseif m.method == :spectral
+            U_cpu = hyper.U
+            L_cpu = hyper.L
+            diag_D = (sigma_samples_cpu' ./ sqrt.(L_cpu .+ noise))
+            diag_D[1, :] .= 0.0; diag_D[2, :] .= 0.0 # Enforce sum-to-zero constraints
+            latent_field_train_cpu = U_cpu * (diag_D .* innovations_samples_cpu')
+        else # :cholesky or :cholesky_sparse
+            F_cpu = hyper.cholesky_factor
+            latent_field_raw_cpu = F_cpu.L' \ innovations_samples_cpu'
+            latent_field_centered_cpu = latent_field_raw_cpu .- mean(latent_field_raw_cpu, dims=1)
+            latent_field_train_cpu = latent_field_centered_cpu .* sigma_samples_cpu'
         end
+        effect_k_latent_cpu[1:n_latent_train, :] = latent_field_train_cpu
 
-        # Forecasting step
+        # Forecasting step (vectorized over samples)
         if t_N_full > n_latent_train
-            # Generate all prediction innovations at once on the device
-            innov_pred_device = to_device(randn(Float32, t_N_full - n_latent_train, n_samples))
+            innov_pred_cpu = randn(Float32, t_N_full - n_latent_train, n_samples)
             
             for t in (n_latent_train + 1):t_N_full
-                # This loop is sequential but operations happen on the device.
-                innov_t = view(innov_pred_device, t - n_latent_train, :)
-                # The RW2 process is driven by innovations scaled by sigma.
-                # The previous values are already scaled.
-                effect_k_latent_device[t, :] = 2 .* effect_k_latent_device[t-1, :] .- effect_k_latent_device[t-2, :] .+ innov_t .* sigma_samples_cpu'
+                innov_t = view(innov_pred_cpu, t - n_latent_train, :)
+                effect_k_latent_cpu[t, :] = 2 .* effect_k_latent_cpu[t-1, :] .- effect_k_latent_cpu[t-2, :] .+ innov_t' .* sigma_samples_cpu'
             end
         end
 
-        # Indexing on the device and moving the final result to CPU
-        indexed_effects_device = effect_k_latent_device[t_idx_full_device, :]
-        push!(structured_effects, Array(indexed_effects_device))
+        # Indexing on the CPU
+        indexed_effects_cpu = effect_k_latent_cpu[t_idx_full_cpu, :]
+        push!(structured_effects, indexed_effects_cpu)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
-
+ 

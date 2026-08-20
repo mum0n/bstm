@@ -6,7 +6,7 @@ framework. It simulates the evolution of a latent field over space and time
 according to a user-specified differential or difference equation.
 
 # Version
-v1.1.0 (2026-08-17)
+v1.2.0 (2026-08-19)
 
 # Mathematical Summary
 Dynamics models describe the evolution of a latent field \$N(s, t)\$ over space \$s\$
@@ -121,7 +121,8 @@ MODEL_TO_STRUCTURE_MAP[:dynamics] = :spacetime
     get_precomputes(m::Dynamics, M::NamedTuple, mod_data::Dict)::NamedTuple
 
 Performs all data-dependent setup and pre-computation for the `Dynamics` component.
-This function is the main data processing entry point for this component.
+This function is the main data processing entry point for this component and is
+CPU-only.
 
 This function handles two main modes for spatial setup:
 1.  **Graph Mode (Default)**: If an adjacency matrix `W` is provided in the main
@@ -130,8 +131,7 @@ This function handles two main modes for spatial setup:
     regular grid based on coordinate variables and the `resolution` parameter.
 
 It also processes exploitation data (`effort`, `removal`) into a spatiotemporal
-grid format and computes the necessary operator matrices (`L_template`, `A_template`),
-moving all large arrays to the target device.
+grid format and computes the necessary operator matrices (`L_template`, `A_template`).
 """
 function get_precomputes(
     m::Dynamics, M::NamedTuple, mod_data::Dict
@@ -139,7 +139,6 @@ function get_precomputes(
     params = mod_data[:params]
     data = M.data
     variables = mod_data[:variables]
-    to_device = M.to_device
     
     local W, s_N, s_idx, t_idx, t_N, centroids, grid_areas
 
@@ -279,21 +278,20 @@ function get_precomputes(
     removal_keys = [k for k in keys(processed_params) if startswith(string(k), "removal")]
 
     return (
-        W=to_device(W),
+        W=W,
         s_N=s_N,
         t_N=t_N,
-        s_idx=to_device(s_idx),
-        t_idx=to_device(t_idx),
-        centroids=centroids, # Typically small, keep on CPU
-        L_template=to_device(L_template),
-        A_template=to_device(A_template),
-        areas=to_device(grid_areas),
+        s_idx=s_idx,
+        t_idx=t_idx,
+        centroids=centroids,
+        L_template=L_template,
+        A_template=A_template,
+        areas=grid_areas,
         effort_keys=effort_keys,
         removal_keys=removal_keys,
-        processed_params=Dict(k => to_device(v) for (k, v) in processed_params)
+        processed_params=processed_params
     )
 end
-
 
 """
     generate_exploitation_block(spec, time_var)
@@ -353,9 +351,6 @@ function generate_exploitation_block(spec, time_var)
 
     return join(lines, "\n    ")
 end
-
-
-
 
 """
     get_priors(m::Dynamics, spec::NamedTuple, arch::String, outcome_idx, M)::String
@@ -494,7 +489,6 @@ function get_updates(
     params = m.params
     s_N = spec.hyper.s_N
     t_N = spec.hyper.t_N
-    array_type_str = "M.to_device"
 
     # Determine the numeric type for dynamic fields, ensuring AD compatibility.
     T_num_dyn = "eltype($(p_names.innovations))"
@@ -738,47 +732,48 @@ function get_updates(
     return "# Dynamics model '$(m.model)' not implemented for this architecture."
 end
 
-
-
 """
-    get_effects(m::Dynamics, chain, spec, M, PS)
+    get_effects(m::Dynamics, chain, spec::NamedTuple, M::NamedTuple, PS)
 
 Reconstructs the `Dynamics`'s effect from the MCMC chain's posterior samples.
-This version is updated to handle GPU arrays by moving sampled parameters to the
-device for computation and moving the final results back to the CPU. It now includes
-support for all dynamics models: advection-diffusion, logistic, delay-difference,
-Lotka-Volterra, Leslie matrix, and Generalized Lotka-Volterra.
+This version is CPU-only and uses modern chain accessors.
 """
 function get_effects(
     m::Dynamics, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(names(DataFrame(chain)))
     
     key_str = string(spec.key)
     model_type = m.model
     params = m.params
     hyper = spec.hyper
 
-    # --- Coordinate/Index Handling: Combine training and prediction sets on device ---
-    s_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
-        vcat(hyper.s_idx, to_device(PS.data.s_idx))
+    # --- Coordinate/Index Handling: Combine training and prediction sets on CPU ---
+    s_idx_train = hyper.s_idx # Spatial indices for training data
+    t_idx_train = hyper.t_idx # Temporal indices for training data
+    
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set is provided
+        vcat(s_idx_train, PS.data.s_idx) # Combine training and prediction spatial indices
     else
-        hyper.s_idx
+        s_idx_train # Otherwise, use only training spatial indices
     end
-    t_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
-        vcat(hyper.t_idx, to_device(PS.data.t_idx))
+    t_idx_full = if !isnothing(PS) && hasproperty(PS.data, :t_idx) # If prediction set is provided
+        vcat(t_idx_train, PS.data.t_idx) # Combine training and prediction temporal indices
     else
-        hyper.t_idx
+        t_idx_train # Otherwise, use only training temporal indices
     end
     
-    N_total = length(s_idx_full_device)
-    t_N_full_cpu = Array(maximum(t_idx_full_device))[]
+    N_total = length(s_idx_full)
+    t_N_full = isempty(t_idx_full) ? 0 : maximum(t_idx_full)
 
     L_op = hyper.L_template
     A_op = hyper.A_template
@@ -787,8 +782,8 @@ function get_effects(
     s_N = hyper.s_N
     t_N = hyper.t_N
 
-    # Pre-calculate flat spatiotemporal index for efficient lookups on the device
-    st_idx_full = (t_idx_full_device .- 1) .* s_N .+ s_idx_full_device
+    # Pre-calculate flat spatiotemporal index for efficient lookups
+    st_idx_full = (t_idx_full .- 1) .* s_N .+ s_idx_full
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -800,56 +795,58 @@ function get_effects(
             sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome, is_multivariate_model)
             innov_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model)
             
-            rate_samples_cpu = if model_type == "advection"
+            rate_samples = if model_type == "advection"
                 get_params_vector(chain, _find_parameter(p_names, string(p_names_k.velocity), k_outcome, is_multivariate_model), 1)
             elseif model_type == "diffusion"
-                get_params_vector(chain, _find_parameter(p_names, string(p_names_k.diffusion), k_outcome, is_multivariate_model), 1)
+                get_params_vector(chain, _find_parameter(p_names, string(p_names_k.diffusion), k_outcome, is_multivariate_model), 1) # (n_samples, 1)
             else # advection_diffusion
-                v_samples = get_params_vector(chain, _find_parameter(p_names, string(p_names_k.velocity), k_outcome, is_multivariate_model), 1)
-                d_samples = get_params_vector(chain, _find_parameter(p_names, string(p_names_k.diffusion), k_outcome, is_multivariate_model), 1)
+                v_samples = get_params_vector(chain, _find_parameter(p_names, string(p_names_k.velocity), k_outcome, is_multivariate_model), 1) # (n_samples, 1)
+                d_samples = get_params_vector(chain, _find_parameter(p_names, string(p_names_k.diffusion), k_outcome, is_multivariate_model), 1) # (n_samples, 1)
                 hcat(v_samples, d_samples)
             end
 
-            if isnothing(rate_samples_cpu) || isempty(sigma_name) || isempty(innov_name)
-                @warn "Parameters for Dynamics manifold $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
+            if isnothing(rate_samples) || isempty(sigma_name) || isempty(innov_name)
+                @warn "Parameters for Dynamics component $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
 
-            sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innov_samples_cpu = get_params_matrix(chain, innov_name, s_N * t_N)
+            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+            innov_samples = get_params_vector(chain, innov_name, s_N * t_N)
 
-            dyn_field_all_samples = to_device(zeros(Float64, s_N * t_N_full_cpu, n_samples))
-            I_s_device = to_device(Matrix(I, s_N, s_N))
+            dyn_field_all_samples = zeros(Float64, s_N * t_N_full, n_samples)
+            I_s = Matrix(I, s_N, s_N)
 
-            for j in 1:n_samples
-                innov_matrix_device = to_device(reshape(innov_samples_cpu[j, :], s_N, t_N))
-                if t_N_full_cpu > t_N
-                    innov_matrix_device = hcat(innov_matrix_device, to_device(randn(s_N, t_N_full_cpu - t_N)))
+            for j in 1:n_samples # Iterate over each posterior sample
+                innov_matrix_train = reshape(innov_samples[j, :], s_N, t_N) # Innovations for training period
+                innov_matrix_full = if t_N_full > t_N
+                    hcat(innov_matrix_train, randn(s_N, t_N_full - t_N)) # Append random innovations for prediction
+                else
+                    innov_matrix_train[:, 1:t_N_full]
                 end
 
-                dyn_field_device = to_device(zeros(Float64, s_N, t_N_full_cpu))
+                dyn_field_sample = zeros(Float64, s_N, t_N_full)
                 
-                local propagator
+                local propagator # Propagator matrix for current sample
                 if model_type == "advection"
-                    propagator = lu(I_s_device - rate_samples_cpu[j, 1] * A_op + noise * I_s_device)
+                    propagator = lu(I_s - rate_samples[j, 1] * A_op + noise * I_s) # Use lu for advection
                 elseif model_type == "diffusion"
-                    propagator = cholesky(Symmetric(I_s_device - rate_samples_cpu[j, 1] * L_op + noise * I_s_device))
+                    propagator = cholesky(Symmetric(I_s - rate_samples[j, 1] * L_op + noise * I_s))
                 else # advection_diffusion
-                    propagator = lu(I_s_device - rate_samples_cpu[j, 1] * A_op - rate_samples_cpu[j, 2] * L_op + noise * I_s_device)
+                    propagator = lu(I_s - rate_samples[j, 1] * A_op - rate_samples[j, 2] * L_op + noise * I_s)
                 end
 
-                dyn_field_device[:, 1] = innov_matrix_device[:, 1]
-                for t in 2:t_N_full_cpu
-                    dyn_field_device[:, t] = (propagator \ dyn_field_device[:, t-1]) + innov_matrix_device[:, t]
+                dyn_field_sample[:, 1] = innov_matrix_full[:, 1]
+                for t in 2:t_N_full
+                    dyn_field_sample[:, t] = (propagator \ dyn_field_sample[:, t-1]) + innov_matrix_full[:, t]
                 end
                 
-                dyn_field_device .*= sigma_samples_cpu[j]
-                dyn_field_all_samples[:, j] = vec(dyn_field_device)
+                dyn_field_sample .*= sigma_samples[j, 1] # Scale by sigma for current sample
+                dyn_field_all_samples[:, j] = vec(dyn_field_sample)
             end
-            
+            # Take log of the dynamics field and index to observation locations
             log_dyn_field = log.(dyn_field_all_samples .+ 1e-6)
-            effect_k = Array(log_dyn_field[st_idx_full, :])
+            effect_k = log_dyn_field[st_idx_full, :]
             push!(structured_effects, effect_k)
 
         elseif model_type == "logistic"
@@ -859,42 +856,44 @@ function get_effects(
             K_name = _find_parameter(p_names, string(p_names_k.K), k_outcome, is_multivariate_model)
             
             if isempty(sigma_name) || isempty(innov_name) || isempty(r_name) || isempty(K_name)
-                @warn "Parameters for Dynamics manifold $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
+                @warn "Parameters for Dynamics component $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
 
-            sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innov_samples_cpu = get_params_matrix(chain, innov_name, s_N * t_N)
-            r_samples_cpu = get_params_vector(chain, r_name, 1)[:, 1]
-            K_samples_cpu = get_params_vector(chain, K_name, 1)[:, 1]
+            sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+            innov_samples = get_params_matrix(chain, innov_name, s_N * t_N) # (n_samples, s_N * t_N)
+            r_samples = get_params_vector(chain, r_name, 1) # (n_samples, 1)
+            K_samples = get_params_vector(chain, K_name, 1) # (n_samples, 1)
             
-            dyn_field_all_samples = to_device(zeros(Float64, s_N * t_N_full_cpu, n_samples))
+            dyn_field_all_samples = zeros(Float64, s_N * t_N_full, n_samples)
 
-            for j in 1:n_samples
-                innov_matrix_device = to_device(reshape(innov_samples_cpu[j, :], s_N, t_N))
-                if t_N_full_cpu > t_N
-                    innov_matrix_device = hcat(innov_matrix_device, to_device(randn(s_N, t_N_full_cpu - t_N)))
+            for j in 1:n_samples # Iterate over each posterior sample
+                innov_matrix_train = reshape(innov_samples[j, :], s_N, t_N) # Innovations for training period
+                innov_matrix_full = if t_N_full > t_N
+                    hcat(innov_matrix_train, randn(s_N, t_N_full - t_N)) # Append random innovations for prediction
+                else
+                    innov_matrix_train[:, 1:t_N_full]
                 end
 
-                dyn_field_device = to_device(zeros(Float64, s_N, t_N_full_cpu))
-                dyn_field_device[:, 1] = innov_matrix_device[:, 1]
+                dyn_field_sample = zeros(Float64, s_N, t_N_full)
+                dyn_field_sample[:, 1] = innov_matrix_full[:, 1]
 
-                for t in 2:t_N_full_cpu
-                    N_prev = dyn_field_device[:, t-1]
-                    D_prev = N_prev ./ areas
-                    K_density = K_samples_cpu[j] ./ areas
-                    growth = r_samples_cpu[j] .* D_prev .* (1.0 .- D_prev ./ K_density)
-                    N_intermediate = N_prev .+ (growth .* areas)
-                    dyn_field_device[:, t] = max.(0.0, N_intermediate .+ innov_matrix_device[:, t])
+                for t in 2:t_N_full
+                    N_prev = dyn_field_sample[:, t-1]
+                    D_prev = N_prev ./ areas # Population density
+                    K_density = K_samples[j, 1] ./ areas # Carrying capacity density
+                    growth = r_samples[j, 1] .* D_prev .* (1.0 .- D_prev ./ K_density) # Logistic growth
+                    N_intermediate = N_prev .+ (growth .* areas) # Update population
+                    dyn_field_sample[:, t] = max.(0.0, N_intermediate .+ innov_matrix_full[:, t])
                 end
                 
-                dyn_field_device .*= sigma_samples_cpu[j]
-                dyn_field_all_samples[:, j] = vec(dyn_field_device)
+                dyn_field_sample .*= sigma_samples[j, 1] # Scale by sigma for current sample
+                dyn_field_all_samples[:, j] = vec(dyn_field_sample)
             end
             
             log_dyn_field = log.(dyn_field_all_samples .+ 1e-6)
-            effect_k = Array(log_dyn_field[st_idx_full, :])
+            effect_k = log_dyn_field[st_idx_full, :]
             push!(structured_effects, effect_k)
 
         elseif model_type == "delay_difference"
@@ -905,62 +904,63 @@ function get_effects(
             M_nat_name = _find_parameter(p_names, string(p_names_k.M_nat), k_outcome, is_multivariate_model)
             
             if isempty(sigma_name) || isempty(innov_name) || isempty(r_name) || isempty(K_name) || isempty(M_nat_name)
-                @warn "Parameters for Dynamics manifold $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
+                @warn "Parameters for Dynamics component $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
 
-            sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innov_samples_cpu = get_params_matrix(chain, innov_name, s_N * t_N)
-            r_samples_cpu = get_params_vector(chain, r_name, 1)[:, 1]
-            K_samples_cpu = get_params_vector(chain, K_name, 1)[:, 1]
-            M_nat_samples_cpu = get_params_vector(chain, M_nat_name, 1)[:, 1]
+            sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+            innov_samples = get_params_matrix(chain, innov_name, s_N * t_N) # (n_samples, s_N * t_N)
+            r_samples = get_params_vector(chain, r_name, 1) # (n_samples, 1)
+            K_samples = get_params_vector(chain, K_name, 1) # (n_samples, 1)
+            M_nat_samples = get_params_vector(chain, M_nat_name, 1) # (n_samples, 1)
             
             effort_keys = spec.hyper.effort_keys
-            q_samples_dict = Dict(key => get_params_vector(chain, _find_parameter(p_names, "q_$(key)", k_outcome, is_multivariate_model), 1)[:, 1] for key in effort_keys)
+            q_samples_dict = Dict(key => get_params_vector(chain, _find_parameter(p_names, "q_$(key)", k_outcome, is_multivariate_model), 1) for key in effort_keys) # (n_samples, 1)
             
-            dyn_field_all_samples = to_device(zeros(Float64, s_N * t_N_full_cpu, n_samples))
+            dyn_field_all_samples = zeros(Float64, s_N * t_N_full, n_samples)
 
             for j in 1:n_samples
-                innov_matrix_device = to_device(reshape(innov_samples_cpu[j, :], s_N, t_N))
-                if t_N_full_cpu > t_N
-                    innov_matrix_device = hcat(innov_matrix_device, to_device(randn(s_N, t_N_full_cpu - t_N)))
+                innov_matrix_train = reshape(innov_samples[j, :], s_N, t_N)
+                innov_matrix_full = if t_N_full > t_N
+                    hcat(innov_matrix_train, randn(s_N, t_N_full - t_N))
+                else
+                    innov_matrix_train[:, 1:t_N_full]
                 end
 
-                dyn_field_device = to_device(zeros(Float64, s_N, t_N_full_cpu))
-                dyn_field_device[:, 1] = innov_matrix_device[:, 1]
+                dyn_field_sample = zeros(Float64, s_N, t_N_full)
+                dyn_field_sample[:, 1] = innov_matrix_full[:, 1]
 
-                for t in 2:t_N_full_cpu
-                    N_prev = dyn_field_device[:, t-1]
-                    D_prev = N_prev ./ areas
-                    K_density = K_samples_cpu[j] ./ areas
-                    growth = r_samples_cpu[j] .* D_prev .* (1.0 .- D_prev ./ K_density)
+                for t in 2:t_N_full
+                    N_prev = dyn_field_sample[:, t-1]
+                    D_prev = N_prev ./ areas # Population density
+                    K_density = K_samples[j, 1] ./ areas # Carrying capacity density
+                    growth = r_samples[j, 1] .* D_prev .* (1.0 .- D_prev ./ K_density) # Logistic growth
                     
-                    C_prev = to_device(zeros(Float64, s_N))
+                    C_prev = zeros(Float64, s_N)
                     for e_key in effort_keys
-                        effort_data = to_device(spec.hyper.processed_params[e_key][:, t-1])
-                        C_prev .+= q_samples_dict[e_key][j] .* effort_data .* N_prev
+                        effort_data = spec.hyper.processed_params[e_key][:, t-1]
+                        C_prev .+= q_samples_dict[e_key][j, 1] .* effort_data .* N_prev # Exploitation from effort
                     end
                     for r_key in spec.hyper.removal_keys
-                        removal_data = to_device(spec.hyper.processed_params[r_key][:, t-1])
+                        removal_data = spec.hyper.processed_params[r_key][:, t-1]
                         C_prev .+= removal_data
                     end
 
-                    N_survived = (N_prev .- C_prev) .* exp(-M_nat_samples_cpu[j])
-                    N_intermediate = N_survived .+ (growth .* areas)
-                    dyn_field_device[:, t] = max.(0.0, N_intermediate .+ innov_matrix_device[:, t])
+                    N_survived = (N_prev .- C_prev) .* exp(-M_nat_samples[j])
+                    N_intermediate = N_survived .+ (growth .* areas) # Update population
+                    dyn_field_sample[:, t] = max.(0.0, N_intermediate .+ innov_matrix_full[:, t])
                 end
                 
-                dyn_field_device .*= sigma_samples_cpu[j]
-                dyn_field_all_samples[:, j] = vec(dyn_field_device)
+                dyn_field_sample .*= sigma_samples[j, 1] # Scale by sigma for current sample
+                dyn_field_all_samples[:, j] = vec(dyn_field_sample)
             end
             
             log_dyn_field = log.(dyn_field_all_samples .+ 1e-6)
-            effect_k = Array(log_dyn_field[st_idx_full, :])
+            effect_k = log_dyn_field[st_idx_full, :]
             push!(structured_effects, effect_k)
 
         elseif model_type == "lotka_volterra"
-            # This model is typically univariate in this context, but we check for safety
             if is_multivariate_model
                 @warn "Lotka-Volterra reconstruction is currently only supported for univariate models. Skipping."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
@@ -976,64 +976,68 @@ function get_effects(
             innov_predator_name = _find_parameter(p_names, string(p_names_k.innovations_predator), k_outcome, is_multivariate_model)
             
             if any(isempty, [alpha_name, beta_name, gamma_name, delta_name, sigma_name, innov_prey_name, innov_predator_name])
-                @warn "Parameters for Dynamics manifold $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
+                @warn "Parameters for Dynamics component $(key_str) (model: $(model_type), outcome $(k_outcome)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
 
-            alpha_samples_cpu = get_params_vector(chain, alpha_name, 1)[:, 1]
-            beta_samples_cpu = get_params_vector(chain, beta_name, 1)[:, 1]
-            gamma_samples_cpu = get_params_vector(chain, gamma_name, 1)[:, 1]
-            delta_samples_cpu = get_params_vector(chain, delta_name, 1)[:, 1]
-            sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-            innov_prey_samples_cpu = get_params_matrix(chain, innov_prey_name, s_N * t_N)
-            innov_predator_samples_cpu = get_params_matrix(chain, innov_predator_name, s_N * t_N)
+            alpha_samples = get_params_vector(chain, alpha_name, 1) # (n_samples, 1)
+            beta_samples = get_params_vector(chain, beta_name, 1)[:, 1]
+            gamma_samples = get_params_vector(chain, gamma_name, 1)[:, 1]
+            delta_samples = get_params_vector(chain, delta_name, 1)[:, 1]
+            sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
+            innov_prey_samples = get_params_vector(chain, innov_prey_name, s_N * t_N)
+            innov_predator_samples = get_params_vector(chain, innov_predator_name, s_N * t_N)
             
             output_species = get(params, :output_species, :prey)
-            dyn_field_all_samples = to_device(zeros(Float64, s_N * t_N_full_cpu, n_samples))
+            dyn_field_all_samples = zeros(Float64, s_N * t_N_full, n_samples)
 
             for j in 1:n_samples
-                innov_matrix_prey_device = to_device(reshape(innov_prey_samples_cpu[j, :], s_N, t_N))
-                innov_matrix_predator_device = to_device(reshape(innov_predator_samples_cpu[j, :], s_N, t_N))
-                if t_N_full_cpu > t_N
-                    innov_matrix_prey_device = hcat(innov_matrix_prey_device, to_device(randn(s_N, t_N_full_cpu - t_N)))
-                    innov_matrix_predator_device = hcat(innov_matrix_predator_device, to_device(randn(s_N, t_N_full_cpu - t_N)))
+                innov_matrix_prey_train = reshape(innov_prey_samples[j, :], s_N, t_N)
+                innov_matrix_predator_train = reshape(innov_predator_samples[j, :], s_N, t_N)
+                
+                innov_matrix_prey_full = if t_N_full > t_N
+                    hcat(innov_matrix_prey_train, randn(s_N, t_N_full - t_N))
+                else
+                    innov_matrix_prey_train[:, 1:t_N_full]
+                end
+                innov_matrix_predator_full = if t_N_full > t_N
+                    hcat(innov_matrix_predator_train, randn(s_N, t_N_full - t_N))
+                else
+                    innov_matrix_predator_train[:, 1:t_N_full]
                 end
 
-                dyn_field_prey_device = to_device(zeros(Float64, s_N, t_N_full_cpu))
-                dyn_field_predator_device = to_device(zeros(Float64, s_N, t_N_full_cpu))
+                dyn_field_prey = zeros(Float64, s_N, t_N_full)
+                dyn_field_predator = zeros(Float64, s_N, t_N_full)
                 
-                dyn_field_prey_device[:, 1] = innov_matrix_prey_device[:, 1]
-                dyn_field_predator_device[:, 1] = innov_matrix_predator_device[:, 1]
+                dyn_field_prey[:, 1] = innov_matrix_prey_full[:, 1]
+                dyn_field_predator[:, 1] = innov_matrix_predator_full[:, 1]
 
-                for t in 2:t_N_full_cpu
-                    N_prey_prev = dyn_field_prey_device[:, t-1]
-                    N_pred_prev = dyn_field_predator_device[:, t-1]
+                for t in 2:t_N_full
+                    N_prey_prev = dyn_field_prey[:, t-1]
+                    N_pred_prev = dyn_field_predator[:, t-1]
                     
-                    d_prey = (alpha_samples_cpu[j] .* N_prey_prev) .- (beta_samples_cpu[j] .* N_prey_prev .* N_pred_prev)
-                    d_pred = (gamma_samples_cpu[j] .* N_prey_prev .* N_pred_prev) .- (delta_samples_cpu[j] .* N_pred_prev)
+                    d_prey = (alpha_samples[j, 1] .* N_prey_prev) .- (beta_samples[j, 1] .* N_prey_prev .* N_pred_prev)
+                    d_pred = (gamma_samples[j, 1] .* N_prey_prev .* N_pred_prev) .- (delta_samples[j, 1] .* N_pred_prev)
                     
-                    dyn_field_prey_device[:, t] = max.(0.0, N_prey_prev .+ d_prey .+ innov_matrix_prey_device[:, t])
-                    dyn_field_predator_device[:, t] = max.(0.0, N_pred_prev .+ d_pred .+ innov_matrix_predator_device[:, t])
+                    dyn_field_prey[:, t] = max.(0.0, N_prey_prev .+ d_prey .+ innov_matrix_prey_full[:, t])
+                    dyn_field_predator[:, t] = max.(0.0, N_pred_prev .+ d_pred .+ innov_matrix_predator_full[:, t])
                 end
                 
-                final_dyn_field = (output_species == :prey) ? dyn_field_prey_device : dyn_field_predator_device
-                final_dyn_field .*= sigma_samples_cpu[j]
+                final_dyn_field = (output_species == :prey) ? dyn_field_prey : dyn_field_predator # Select output species
+                final_dyn_field .*= sigma_samples[j, 1] # Scale by sigma for current sample
                 dyn_field_all_samples[:, j] = vec(final_dyn_field)
             end
 
             log_dyn_field = log.(dyn_field_all_samples .+ 1e-6)
-            effect_k = Array(log_dyn_field[st_idx_full, :])
+            effect_k = log_dyn_field[st_idx_full, :]
             push!(structured_effects, effect_k)
 
         else
-            @warn "Reconstruction for Dynamics model '$(model_type)' is not implemented for GPU. Returning zero effects."
+            @warn "Reconstruction for Dynamics model '$(model_type)' is not implemented. Returning zero effects."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
         end
     end
     
-    # For multivariate models like Leslie, the loop over k_outcome populates this.
-    # For univariate, it's populated once.
     return (structured=structured_effects, noisy=structured_effects)
 end
-

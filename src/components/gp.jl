@@ -6,7 +6,7 @@ geostatistics. It models a latent field by computing a dense covariance
 matrix based on a specified kernel function and coordinate inputs.
 
 # Version
-v1.3.0 (2026-08-17)
+v1.4.1 (2026-08-19)
 
 # Mathematical Summary
 The component models a latent field \$f(x)\$ as a draw from a Gaussian Process with
@@ -82,15 +82,12 @@ function get_precomputes(m::GP, M::NamedTuple, mod_data::Dict)::NamedTuple
         end
     end
 
-    # Get the device transfer function
-    to_device = M.to_device
-
-    # Extract coordinates to a CPU matrix first to handle potential GPU arrays in M.data
-    coords_cpu = Matrix{Float64}(M.data[!, Symbol.(variables)])
-    n_latent = size(coords_cpu, 1)
+    # Extract coordinates to a CPU matrix.
+    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
+    n_latent = size(coords, 1)
     
-    # Move coordinates to the target device
-    return (coords=to_device(coords_cpu), n_latent=n_latent)
+    # Return CPU arrays.
+    return (coords=coords, n_latent=n_latent)
 end
 
 function get_priors(
@@ -166,35 +163,37 @@ function get_updates(
 end
 
 """
-    get_effects(m::GP, chain, spec, M, PS)
+    get_effects(m::GP, chain, spec::NamedTuple, M::NamedTuple, PS)
 
 Reconstructs the `GP` component's effect from posterior samples. This version is
-updated to handle GPU arrays by moving sampled parameters and prediction data to
-the device for computation, and moving the final results back to the CPU.
+CPU-only and uses modern chain accessors.
 """
 function get_effects(
     m::GP, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
     
-    # --- Coordinate Handling: Combine training and prediction sets on device ---
+    # --- Coordinate Handling: Combine training and prediction sets on CPU ---
     coord_vars = get(spec.params, :positional_args, [])
-    coords_train_device = spec.hyper.coords # Already on device
-    
-    coords_full_device = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-        vcat(coords_train_device, to_device(coords_pred_cpu))
+    coords_train = spec.hyper.coords
+    # Combine training and prediction coordinates
+    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars) # If prediction set is provided
+        coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]) # Extract prediction coordinates
+        vcat(coords_train, coords_pred) # Combine training and prediction coordinates
     else
-        coords_train_device
+        coords_train # Otherwise, use only training coordinates
     end
-    n_obs_train = size(coords_train_device, 1)
-    n_obs_full = size(coords_full_device, 1)
+    n_obs_train = size(coords_train, 1) # Number of observations in training data
+    n_obs_full = size(coords_full, 1) # Total number of observations (training + prediction)
     
     noise = M.noise
     kernel_type = Symbol(m.kernel)
@@ -215,14 +214,14 @@ function get_effects(
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
+        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1 # Dimension of lengthscale parameter
+        ls_samples = get_params_matrix(chain, ls_name, ls_dim) # (n_samples, ls_dim)
 
-        # Initialize the output matrix for the full effect on the target device
-        effect_k_device = to_device(zeros(Float64, n_obs_full, n_samples))
+        # Initialize the output matrix for the full effect
+        effect_k_matrix = zeros(Float64, n_obs_full, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction ---
         if m.method == :noncentered
             innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
             if isempty(innovations_name)
@@ -230,25 +229,25 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_obs_train)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_obs_train) # (n_samples, n_obs_train)
 
             for i in 1:n_samples
-                current_ls = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+                current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1] # Lengthscale for current sample
                 
-                # Kernel evaluation and Cholesky happen on the device
-                K_mat = evaluate_kernel_matrix(coords_full_device, sigma_samples_cpu[i], current_ls, kernel_type, noise)
+                # Kernel evaluation and Cholesky
+                K_mat = evaluate_kernel_matrix(coords_full, sigma_samples[i, 1], current_ls, kernel_type, noise)
                 F = cholesky(Symmetric(K_mat))
                 
-                # Combine training innovations with new innovations for prediction points on the device
-                innov_train_device = to_device(innovations_samples_cpu[i, :])
-                innov_i_device = if n_obs_full > n_obs_train
-                    innov_pred_device = to_device(randn(Float32, n_obs_full - n_obs_train))
-                    vcat(innov_train_device, innov_pred_device)
+                # Combine training innovations with new innovations for prediction points
+                innov_train = innovations_samples[i, :]
+                innov_i = if n_obs_full > n_obs_train
+                    innov_pred = randn(Float64, n_obs_full - n_obs_train)
+                    vcat(innov_train, innov_pred)
                 else
-                    innov_train_device
+                    innov_train
                 end
-                
-                effect_k_device[:, i] = F.L * innov_i_device
+                # Compute the latent field
+                effect_k_matrix[:, i] = F.L * innov_i
             end
         elseif m.method == :centered
             latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
@@ -257,37 +256,34 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            latent_samples_cpu = get_params_matrix(chain, latent_name, n_obs_train)
+            latent_samples = get_params_matrix(chain, latent_name, n_obs_train) # (n_samples, n_obs_train)
 
-            for i in 1:n_samples
-                # Move training samples to device
-                effect_k_device[1:n_obs_train, i] = to_device(latent_samples_cpu[i, :])
+            for i in 1:n_samples # Iterate over each posterior sample
+                effect_k_matrix[1:n_obs_train, i] = latent_samples[i, :] # Assign training samples
                 
                 if n_obs_full > n_obs_train
-                    coords_pred_device = coords_full_device[(n_obs_train+1):end, :]
-                    current_ls = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+                    coords_pred = coords_full[(n_obs_train+1):end, :] # Prediction coordinates
+                    current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1] # Lengthscale for current sample
                     
-                    # All kernel evaluations and linear algebra happen on the device
-                    K_ff = evaluate_kernel_matrix(coords_train_device, sigma_samples_cpu[i], current_ls, kernel_type, noise)
-                    K_star_f = evaluate_cross_kernel_matrix(coords_pred_device, coords_train_device, sigma_samples_cpu[i], current_ls, kernel_type)
-                    K_star_star = evaluate_kernel_matrix(coords_pred_device, sigma_samples_cpu[i], current_ls, kernel_type, noise)
+                    # Kernel evaluations and linear algebra
+                    K_ff = evaluate_kernel_matrix(coords_train, sigma_samples[i, 1], current_ls, kernel_type, noise)
+                    K_star_f = evaluate_cross_kernel_matrix(coords_pred, coords_train, sigma_samples[i, 1], current_ls, kernel_type)
+                    K_star_star = evaluate_kernel_matrix(coords_pred, sigma_samples[i, 1], current_ls, kernel_type, noise)
                     
                     L_ff = cholesky(Symmetric(K_ff)).L
                     A = L_ff' \ (L_ff \ K_star_f')
-                    mu_pred = A' * to_device(latent_samples_cpu[i, :])
+                    mu_pred = A' * latent_samples[i, :]
                     Sigma_pred = K_star_star - K_star_f * A
                     
-                    # Sample from the conditional posterior on the device
-                    pred_innov = to_device(randn(Float32, size(Sigma_pred, 1)))
-                    effect_k_device[(n_obs_train+1):end, i] = mu_pred + cholesky(Symmetric(Sigma_pred)).L * pred_innov
+                    # Sample from the conditional posterior on the CPU
+                    pred_innov = randn(Float64, size(Sigma_pred, 1))
+                    effect_k_matrix[(n_obs_train+1):end, i] = mu_pred + cholesky(Symmetric(Sigma_pred + noise * I)).L * pred_innov
                 end
             end
         end
         
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_matrix)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
-end
-
+end 

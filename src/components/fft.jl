@@ -1,3 +1,4 @@
+# File: c:\home\jae\projects\bstm\src\components\fft.jl
 """
     FFT <: ComponentModel
 
@@ -7,7 +8,7 @@ combination of these basis functions, with coefficients regularized by a random
 walk prior to ensure smoothness.
 
 # Version
-v1.1.0 (2026-08-17)
+v1.2.1 (2026-08-19)
 
 # Mathematical Summary
 The component models a smooth function \$f(x)\$ as a linear combination of Fourier
@@ -76,7 +77,7 @@ MODEL_TO_STRUCTURE_MAP[:fft] = :smooth
 Performs all data-dependent setup and pre-computation for the `FFT` component.
 This function validates that coordinate variables exist, extracts them, and then
 pre-computes the penalty matrix and its spectral decomposition for the Fourier
-coefficients, moving large arrays to the target device.
+coefficients. This is a CPU-only implementation.
 """
 function get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
@@ -89,9 +90,6 @@ function get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
             error("Coordinate variable ':$var_sym' for FFT model not found in data.")
         end
     end
-
-    # Get the device transfer function
-    to_device = M.to_device
 
     # Ensure coords are on CPU for initial processing
     coords_cpu = Matrix{Float64}(M.data[!, Symbol.(variables)])
@@ -119,14 +117,14 @@ function get_precomputes(m::FFT, M::NamedTuple, mod_data::Dict)::NamedTuple
     Q_template_scaled_cpu = Q_template_cpu ./ scaling_factor
     L_scaled_cpu = L_cpu ./ scaling_factor
 
-    # Move large, static arrays to the target device
+    # All pre-computed arrays are kept on the CPU.
     return (
-        coords = to_device(coords_cpu),
+        coords = coords_cpu,
         nbins_per_dim = nbins_per_dim,
-        Q_template = to_device(Q_template_scaled_cpu),
+        Q_template = Q_template_scaled_cpu,
         scaling_factor = scaling_factor,
-        U = to_device(U_cpu),
-        L = to_device(L_scaled_cpu),
+        U = U_cpu,
+        L = L_scaled_cpu,
         n_latent = n_latent
     )
 end
@@ -164,8 +162,8 @@ end
 """
     bstm_fourier_basis(coords, nbins_per_dim, lengthscale)
 
-Helper function to generate a tensor product Fourier basis matrix. This function
-is compatible with GPU arrays.
+Helper function to generate a tensor product Fourier basis matrix. This is a CPU-only
+implementation.
 """
 function bstm_fourier_basis(
     coords::AbstractMatrix, nbins_per_dim::Vector{Int},
@@ -227,8 +225,7 @@ end
 """
     get_updates(m::FFT, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates the Turing code for constructing the `FFT` smooth effect. It supports
-three methods for regularizing the Fourier coefficients.
+Generates the Turing code for the `FFT` component. This is a CPU-only implementation.
 """
 function get_updates(
     m::FFT, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -240,7 +237,7 @@ function get_updates(
     n_latent = spec.hyper.n_latent
     
     common_basis_code = """
-        local B_fft = bstm_fourier_basis(
+        B_fft = bstm_fourier_basis(
             spec_registry[:$(key)].hyper.coords,
             spec_registry[:$(key)].hyper.nbins_per_dim,
             $(p_names.ls)
@@ -251,14 +248,15 @@ function get_updates(
         # --- FFT Smoother Component (Spectral): $(key) ---
         let
             $(common_basis_code)
-            local hyper = spec_registry[:$(key)].hyper
+            hyper = spec_registry[:$(key)].hyper
             
-            local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
+            # Construct diag_D on the CPU
+            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             # Enforce sum-to-zero constraints for RW2 penalty
             diag_D[1] = 0.0
             diag_D[2] = 0.0
             
-            local coeffs = hyper.U * (diag_D .* $(p_names.innovations))
+            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             $(p_names.latent) = B_fft * coeffs
             
             $(eta_target) .+= $(p_names.latent)
@@ -269,17 +267,17 @@ function get_updates(
         # --- FFT Smoother Component (Cholesky, AD-Safe): $(key) ---
         let
             $(common_basis_code)
-            local Q_penalty = spec_registry[:$(key)].hyper.Q_template
-            local F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
+            Q_penalty = spec_registry[:$(key)].hyper.Q_template
+            F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
             
-            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            coeffs_raw = F.L' \\ $(p_names.innovations)
             
             # Apply soft sum-to-zero constraint for RW2 penalty
             Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw)
             )
             
-            local coeffs = $(p_names.sigma) .* coeffs_raw
+            coeffs = $(p_names.sigma) .* coeffs_raw
             $(p_names.latent) = B_fft * coeffs
             
             $(eta_target) .+= $(p_names.latent)
@@ -290,17 +288,17 @@ function get_updates(
         # --- FFT Smoother Component (Sparse Cholesky, Not AD-Safe): $(key) ---
         let
             $(common_basis_code)
-            local Q_penalty = spec_registry[:$(key)].hyper.Q_template
-            local F = cholesky(Symmetric(Q_penalty + M.noise * I))
+            Q_penalty = spec_registry[:$(key)].hyper.Q_template
+            F = cholesky(Symmetric(Q_penalty + M.noise * I))
             
-            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            coeffs_raw = F.L' \\ $(p_names.innovations)
             
             # Apply soft sum-to-zero constraint for RW2 penalty
             Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * $(n_latent)), sum(coeffs_raw)
             )
             
-            local coeffs = $(p_names.sigma) .* coeffs_raw
+            coeffs = $(p_names.sigma) .* coeffs_raw
             $(p_names.latent) = B_fft * coeffs
             
             $(eta_target) .+= $(p_names.latent)
@@ -313,48 +311,42 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for FFT component."); end
 end
 
-
 """
-    get_effects(m::FFT, chain, spec, M, PS)
+    get_effects(m::FFT, chain, spec::NamedTuple, M::NamedTuple, PS)
 
 Reconstructs the `FFT` component's effect from posterior samples, dispatching on
-the method used during sampling. Handles GPU arrays by moving sampled parameters
-to the device for computation and moving the final results back to the CPU.
+the method used during sampling. This is a CPU-only implementation.
 """
 function get_effects(
     m::FFT, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
     
     hyper = spec.hyper
     noise = M.noise
     n_latent = hyper.n_latent
     nbins_per_dim = hyper.nbins_per_dim
-    
-    # --- Coordinate/Index Handling: Combine training and prediction sets on device ---
-    coords_train_device = hyper.coords # Already on device
+
+    # --- Coordinate Handling: Combine training and prediction sets on CPU ---
+    coords_train_cpu = hyper.coords
     coord_vars = get(spec.params, :positional_args, [])
-    coords_full_device = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-        vcat(coords_train_device, to_device(coords_pred_cpu))
+    coords_full_cpu = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
+        vcat(coords_train_cpu, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
     else
-        coords_train_device
+        coords_train_cpu
     end
-    N_total = size(coords_full_device, 1)
+    N_total = size(coords_full_cpu, 1)
 
     structured_effects = Vector{Matrix{Float64}}()
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        
-        # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
@@ -364,52 +356,49 @@ function get_effects(
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
-        
+
         # Extract posterior samples (these are on the CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        ls_samples_cpu = get_params_vector(chain, ls_name, ls_dim)
-        innovations_samples_cpu = get_params_vector(chain, innovations_name, n_latent)
+        ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
-        # Initialize the output matrix for the full effect on the target device
-        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
+        # Initialize the output matrix for the full effect on the CPU
+        effect_k_cpu = zeros(Float64, N_total, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction ---
         for i in 1:n_samples
-            current_ls_cpu = if m.lengthscale isa Vector; ls_samples_cpu[i, :]; else ls_samples_cpu[i, 1]; end
+            # 1. Generate basis matrix on CPU
+            current_ls_cpu = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+            B_fft_i_cpu = bstm_fourier_basis(
+                coords_full_cpu, nbins_per_dim, current_ls_cpu
+            )
             
-            # Generate Fourier basis matrix on the target device
-            B_fft_i_device = bstm_fourier_basis(coords_full_device, nbins_per_dim, current_ls_cpu)
+            innov_i_cpu = innovations_samples_cpu[i, :]
+            sigma_i_cpu = sigma_samples_cpu[i]
             
-            # Move current sample's innovations to the device
-            innov_i_device = to_device(innovations_samples_cpu[i, :])
-            
-            local coeffs_device
+            # 3. Reconstruct coefficients on CPU
+            local coeffs_cpu
             if m.method == :spectral
-                U_device = hyper.U
-                L_device = hyper.L
-                diag_D_device = sigma_samples_cpu[i] ./ sqrt.(L_device .+ noise)
-                # Enforce sum-to-zero constraints for RW2 penalty
-                diag_D_device[1] = 0.0
-                diag_D_device[2] = 0.0
-                coeffs_device = U_device * (diag_D_device .* innov_i_device)
+                U = hyper.U
+                L = hyper.L
+                diag_D = sigma_i_cpu ./ sqrt.(L .+ noise)
+                diag_D[1] = 0.0; diag_D[2] = 0.0
+                coeffs_cpu = U * (diag_D .* innov_i_cpu)
             else # :cholesky or :cholesky_sparse
-                # For reconstruction, we can re-compute the dense Cholesky factor on the device.
-                Q_penalty_device = hyper.Q_template
-                F_device = cholesky(Symmetric(Matrix(Q_penalty_device) + noise * I))
-                coeffs_raw_device = F_device.L' \ innov_i_device
-                # Apply sum-to-zero constraint for RW2 penalty
-                coeffs_centered_device = coeffs_raw_device .- mean(coeffs_raw_device)
-                coeffs_device = sigma_samples_cpu[i] .* coeffs_centered_device
+                Q_penalty = hyper.Q_template
+                F = cholesky(Symmetric(Matrix(Q_penalty) + noise * I))
+                coeffs_raw = F.L' \ innov_i_cpu
+                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
+                coeffs_cpu = sigma_i_cpu .* coeffs_centered
             end
-            
-            # Compute the effect for this sample on the device
-            effect_k_device[:, i] = B_fft_i_device * coeffs_device
+            # 4. Compute effect for this sample
+            effect_k_cpu[:, i] = B_fft_i * coeffs_cpu
         end
         
-        # Move the final result matrix for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_cpu)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+ 

@@ -7,7 +7,7 @@ flexible, data-driven covariance structure. It is particularly effective at
 capturing processes with multi-scale features and non-stationarities.
 
 # Version
-v1.1.1 (2026-08-14)
+v1.1.2 (2026-08-19)
 
 # Mathematical Summary
 This component models a latent field \$f(s)\$ by defining the statistical properties
@@ -111,8 +111,8 @@ function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTupl
         end
     end
 
-    # Ensure data is on CPU for initial processing by explicitly converting with Array()
-    coords_cpu = Matrix{Float64}(Array(M.data[!, Symbol.(variables)]))
+    # All computations are on the CPU.
+    coords_cpu = Matrix{Float64}(M.data[!, Symbol.(variables)])
     res = m.resolution
     n_dims = size(coords_cpu, 2)
     
@@ -122,7 +122,6 @@ function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTupl
 
     n_latent = res^n_dims
     
-    # These calculations are cheap and performed on the CPU
     min_coords = minimum(coords_cpu, dims=1)
     max_coords = maximum(coords_cpu, dims=1)
     grid_ranges = [range(min_coords[d], stop=max_coords[d], length=res) for d in 1:n_dims]
@@ -148,16 +147,14 @@ function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTupl
     else # 2D
         scale_indices_cpu = _get_wavelet_scale_indices_2d(res, wt)
     end
-
-    # Move large, static arrays to the target device
-    to_device = M.to_device
+    
     return (
         resolution = res,
         n_dims = n_dims,
         n_latent = n_latent,
-        coords = to_device(coords_cpu),
-        grid_ranges = grid_ranges, # Keep on CPU for Interpolations.jl
-        scale_indices = to_device(scale_indices_cpu)
+        coords = coords_cpu,
+        grid_ranges = grid_ranges,
+        scale_indices = scale_indices_cpu
     )
 end
 
@@ -219,24 +216,26 @@ function get_effects(
     m::WaveletGP, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
     
-    # --- Get precomputed data ---
+    # --- Get precomputed data (all on CPU) ---
     hyper = spec.hyper
     res = hyper.resolution
     n_dims = hyper.n_dims
     n_latent = hyper.n_latent
-    scale_indices_device = hyper.scale_indices # Already on device
+    scale_indices_cpu = hyper.scale_indices
 
     # --- Coordinate and Grid Handling on CPU for Interpolation ---
-    # The interpolation step requires CPU data.
     coord_vars = get(spec.params, :positional_args, [])
-    coords_train_cpu = Array(hyper.coords) # Move coords from device to CPU
+    coords_train_cpu = hyper.coords
     
     coords_full_cpu = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
         vcat(coords_train_cpu, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
@@ -245,17 +244,16 @@ function get_effects(
     end
     N_total_eff = size(coords_full_cpu, 1)
     
-    # Grid ranges are already on CPU from get_precomputes
     grid_ranges_cpu = hyper.grid_ranges
 
     structured_effects = Vector{Matrix{Float64}}()
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
-        p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma0_name = _find_parameter(p_names, string(p_names_k.sigma0), k, is_multivariate_model)
-        alpha_name = _find_parameter(p_names, string(p_names_k.alpha), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+        v = generate_full_variable_names(spec, M.model_arch, k)
+        sigma0_name = _find_parameter(p_names, string(v.sigma0), k, is_multivariate_model)
+        alpha_name = _find_parameter(p_names, string(v.alpha), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
         if isempty(sigma0_name) || isempty(alpha_name) || isempty(innovations_name)
             @warn "Parameters for WaveletGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -266,42 +264,30 @@ function get_effects(
         # Extract posterior samples (these are on the CPU)
         sigma0_samples_cpu = get_params_vector(chain, sigma0_name, 1)[:, 1]
         alpha_samples_cpu = get_params_vector(chain, alpha_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_vector(chain, innovations_name, n_latent)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, N_total_eff, n_samples)
         wt = Wavelets.wavelet(m.wavelet)
         
         # --- Sample-wise Reconstruction ---
-        # This loop is necessary because Interpolations.jl is CPU-bound, forcing a
-        # GPU -> CPU data transfer for each sample's reconstructed grid.
         for i in 1:n_samples
-            # --- GPU-bound Computation ---
-            # Move current sample's parameters to device
-            sigma0_s_device = to_device(sigma0_samples_cpu[i])
-            alpha_s_device = to_device(alpha_samples_cpu[i])
-            innov_s_device = to_device(innovations_samples_cpu[i, :])
+            sigma0_s = sigma0_samples_cpu[i]
+            alpha_s = alpha_samples_cpu[i]
+            innov_s = innovations_samples_cpu[i, :]
 
-            # Compute wavelet coefficients on the device
-            scale_variances_device = sigma0_s_device^2 .* (2.0 .^ (-alpha_s_device .* scale_indices_device))
-            wavelet_coeffs_device = innov_s_device .* sqrt.(scale_variances_device)
+            scale_variances = sigma0_s^2 .* (2.0 .^ (-alpha_s .* scale_indices_cpu))
+            wavelet_coeffs = innov_s .* sqrt.(scale_variances)
             
-            # Perform inverse wavelet transform on the device
-            local latent_field_grid_device
+            local latent_field_grid_cpu
             if n_dims == 1
-                latent_field_grid_device = idwt(wavelet_coeffs_device, wt)
+                latent_field_grid_cpu = idwt(wavelet_coeffs, wt)
             else
-                coeffs_reshaped_device = reshape(wavelet_coeffs_device, res, res)
-                latent_field_grid_device = idwt(coeffs_reshaped_device, wt)
+                coeffs_reshaped = reshape(wavelet_coeffs, res, res)
+                latent_field_grid_cpu = idwt(coeffs_reshaped, wt)
             end
             
-            # --- CPU-bound Interpolation Step ---
-            # Move the reconstructed grid back to the CPU for this sample
-            latent_field_grid_cpu = Array(latent_field_grid_device)
-            
-            # Create interpolation object on the CPU
             itp_s = linear_interpolation(grid_ranges_cpu, latent_field_grid_cpu, extrapolation_bc=Flat())
             
-            # Perform interpolation on the CPU
             coords_for_itp = ntuple(d -> view(coords_full_cpu, :, d), n_dims)
             effect_k[:, i] = itp_s(coords_for_itp...)
         end
@@ -310,3 +296,4 @@ function get_effects(
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+

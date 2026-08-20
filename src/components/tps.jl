@@ -7,7 +7,7 @@ space. The effect is a linear combination of these basis functions, with coeffic
 regularized by a random walk prior to ensure smoothness.
 
 # Version
-v1.1.1 (2026-08-14)
+v1.1.2 (2026-08-19)
 
 # Mathematical Summary
 A Thin Plate Spline models a function \$f(\\mathbf{x})\$ as a linear combination of
@@ -116,16 +116,19 @@ function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
     Q_template_scaled_cpu = Q_template_cpu ./ scaling_factor
     L_scaled_cpu = L_cpu ./ scaling_factor
 
-    # Move precomputed structures to the target device
-    to_device = M.to_device
+    # Pre-compute dense Cholesky factor for the :cholesky method on the CPU.
+    F_cpu = cholesky(Symmetric(Matrix(Q_template_scaled_cpu) + M.noise * I))
+
+    # All precomputed structures remain on the CPU.
     return (
-        basis_matrix = to_device(B_cpu),
-        Q_template = to_device(Q_template_scaled_cpu),
+        basis_matrix = B_cpu,
+        Q_template = Q_template_scaled_cpu,
         scaling_factor = scaling_factor,
-        U = to_device(U_cpu),
-        L = to_device(L_scaled_cpu),
+        U = U_cpu,
+        L = L_scaled_cpu,
         n_latent = n_latent,
-        knots = to_device(knots_cpu)
+        knots = knots_cpu,
+        cholesky_factor = F_cpu
     )
 end
 
@@ -172,11 +175,10 @@ function get_updates(
         # --- Thin Plate Spline (TPS) Smoother (Cholesky, AD-Safe): $(key) ---
         let
             $(common_code)
-            local Q_penalty = hyper.Q_template
-            local F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
+            local F = hyper.cholesky_factor
             local coeffs_raw = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
-            local coeffs = $(p_names.sigma) .* coeffs_raw
+            local coeffs = $(p_names.sigma) .* (coeffs_raw .- mean(coeffs_raw))
             $(p_names.latent) = B_basis * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
@@ -204,61 +206,55 @@ end
 
 
 function get_effects(
-    m::TPS, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::TPS, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = string.(names(chain))
-    to_device = M.to_device
-
-    # --- Get precomputed data (already on device) ---
+    p_names = string.(keys(chain))
+    
     hyper = spec.hyper
     noise = M.noise
     n_latent = hyper.n_latent
-    knots_device = hyper.knots
-    n_dims = size(knots_device, 2)
-    B_train_device = hyper.basis_matrix
+    knots_cpu = hyper.knots
+    n_dims = size(knots_cpu, 2)
+    B_train_cpu = hyper.basis_matrix
 
     # --- Coordinate and Basis Matrix Handling for Prediction ---
     coord_vars = get(spec.params, :positional_args, [])
     has_ps = !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
     
-    N_train = size(B_train_device, 1)
+    N_train = size(B_train_cpu, 1)
     N_total = has_ps ? N_train + size(PS.data, 1) : N_train
 
-    B_full_device = if has_ps
+    B_full_cpu = if has_ps
         coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-        coords_pred_device = to_device(coords_pred_cpu)
         
-        B_pred_device = to_device(zeros(Float64, size(coords_pred_device, 1), n_latent))
+        B_pred_cpu = zeros(Float64, size(coords_pred_cpu, 1), n_latent)
         
-        # Vectorized basis matrix calculation
         if n_dims == 1
-            r = abs.(coords_pred_device[:, 1] .- knots_device[:, 1]')
-            B_pred_device .= r.^3
+            r = abs.(coords_pred_cpu[:, 1] .- knots_cpu[:, 1]')
+            B_pred_cpu .= r.^3
         elseif n_dims == 2
-            dist_sq = (coords_pred_device[:, 1] .- knots_device[:, 1]').^2 .+ (coords_pred_device[:, 2] .- knots_device[:, 2]').^2
+            dist_sq = (coords_pred_cpu[:, 1] .- knots_cpu[:, 1]').^2 .+ (coords_pred_cpu[:, 2] .- knots_cpu[:, 2]').^2
             r = sqrt.(dist_sq)
-            B_pred_device .= (r.^2) .* log.(r .+ 1e-9)
+            B_pred_cpu .= (r.^2) .* log.(r .+ 1e-9)
         else
-            # This part is harder to vectorize without a loop over knots
-            # We keep the loop for the general case; it will be slow on GPU but correct.
             for i in 1:n_latent
-                dist_sq = sum((coords_pred_device .- knots_device[i, :]').^2, dims=2)
+                dist_sq = sum((coords_pred_cpu .- knots_cpu[i, :]').^2, dims=2)
                 r = sqrt.(dist_sq)
                 if isodd(n_dims)
-                    B_pred_device[:, i] .= r.^(4 - n_dims)
+                    B_pred_cpu[:, i] .= r.^(4 - n_dims)
                 else
-                    B_pred_device[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9)
+                    B_pred_cpu[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9)
                 end
             end
         end
-        vcat(B_train_device, B_pred_device)
+        vcat(B_train_cpu, B_pred_cpu)
     else
-        B_train_device
+        B_train_cpu
     end
 
     structured_effects = Vector{Matrix{Float64}}()
@@ -271,43 +267,40 @@ function get_effects(
 
         if isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for TPS component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, size(B_full_device, 1), n_samples))
+            push!(structured_effects, zeros(Float64, size(B_full_cpu, 1), n_samples))
             continue
         end
 
         # Extract posterior samples (CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_vector(chain, innovations_name, n_latent)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
-        # Initialize output matrix on device
-        effect_k_device = to_device(zeros(Float64, size(B_full_device, 1), n_samples))
+        # Initialize output matrix on CPU
+        effect_k_cpu = zeros(Float64, size(B_full_cpu, 1), n_samples)
 
-        # --- Sample-wise Reconstruction on Device ---
+        # --- Sample-wise Reconstruction on CPU ---
         for i in 1:n_samples
-            # Move current sample's parameters to device
-            sigma_i = to_device(sigma_samples_cpu[i])
-            innovations_i = to_device(innovations_samples_cpu[i, :])
+            sigma_i = sigma_samples_cpu[i]
+            innovations_i = innovations_samples_cpu[i, :]
             
-            local coeffs_device
+            local coeffs_cpu
             if m.method == :spectral
-                U_device, L_device = hyper.U, hyper.L
-                diag_D = sigma_i ./ sqrt.(L_device .+ noise)
-                diag_D[1] = 0.0; diag_D[2] = 0.0 # Enforce sum-to-zero constraints
-                coeffs_device = U_device * (diag_D .* innovations_i)
+                U_cpu, L_cpu = hyper.U, hyper.L
+                diag_D = sigma_i ./ sqrt.(L_cpu .+ noise)
+                diag_D[1] = 0.0; diag_D[2] = 0.0
+                coeffs_cpu = U_cpu * (diag_D .* innovations_i)
             else # :cholesky or :cholesky_sparse
-                # Recompute Cholesky on device
-                Q_penalty_device = hyper.Q_template
-                F_device = cholesky(Symmetric(Matrix(Q_penalty_device) + noise * I))
-                coeffs_raw = F_device.L' \ innovations_i
+                F_cpu = hyper.cholesky_factor
+                coeffs_raw = F_cpu.L' \ innovations_i
                 coeffs_centered = coeffs_raw .- mean(coeffs_raw)
-                coeffs_device = sigma_i .* coeffs_centered
+                coeffs_cpu = sigma_i .* coeffs_centered
             end
-            effect_k_device[:, i] = B_full_device * coeffs_device
+            effect_k_cpu[:, i] = B_full_cpu * coeffs_cpu
         end
         
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_cpu)
     end
 
     return (structured=structured_effects, noisy=structured_effects)
 end
+ 

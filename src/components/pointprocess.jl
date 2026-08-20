@@ -144,13 +144,13 @@ function get_priors(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx
         n_latent = spec.hyper.inner_hyper.n_latent
         return """
         $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-        $(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros($(n_latent)), I), :$(p_names.innovations))
+        $(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.innovations))
         """
     elseif m.method == :lgmcp
         n_latent = spec.hyper.inner_hyper.n_latent
         return """
         $(p_names.shape) ~ $(_distribution_to_string(m.shape))
-        $(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros($(n_latent)), I), :$(p_names.innovations))
+        $(p_names.innovations) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.innovations))
         """
     elseif m.method == :sncp
         n_parents_str = if m.n_parents isa Int
@@ -187,7 +187,7 @@ function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_id
             hyper = spec_registry[:$(key)].hyper
             Q_lgcp = hyper.inner_hyper.Q_template
             F_lgcp = cholesky(Symmetric(Matrix(Q_lgcp) + M.noise * I))
-            spatial_component = $(p_names.sigma) .* (F_lgcp.U \\ $(p_names.innovations))
+            spatial_component = $(p_names.sigma) .* (F_lgcp.L' \\ $(p_names.innovations))
             
             log_intensity_surface = $(eta_target) .+ spatial_component[M.s_idx]
             
@@ -207,7 +207,7 @@ function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_id
             hyper = spec_registry[:$(key)].hyper
             Q_lgmcp = hyper.inner_hyper.Q_template
             F_lgmcp = cholesky(Symmetric(Matrix(Q_lgmcp) + M.noise * I))
-            spatial_component = exp.(F_lgmcp.U \\ $(p_names.innovations))
+            spatial_component = exp.(F_lgmcp.L' \\ $(p_names.innovations))
             
             mean_intensity_surface = exp.($(eta_target)) .* spatial_component[M.s_idx]
             
@@ -262,25 +262,27 @@ function get_effects(
     m::PointProcess, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
     
     hyper = spec.hyper
     noise = M.noise
 
-    # --- Index Handling: Combine training and prediction sets on device ---
-    s_idx_train = M.s_idx # Already on device
-    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
-        s_idx_pred_cpu = get(PS.data, :s_idx, [])
-        vcat(s_idx_train, to_device(s_idx_pred_cpu))
+    # --- Index Handling: Combine training and prediction sets ---
+    s_idx_train = M.s_idx # Spatial indices for training data
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set is provided
+        vcat(s_idx_train, PS.data.s_idx) # Combine training and prediction indices
     else
-        s_idx_train
+        s_idx_train # Otherwise, use only training indices
     end
-    N_total = length(s_idx_full)
+    N_total = length(s_idx_full) # Total number of observations (training + prediction)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -293,39 +295,37 @@ function get_effects(
             innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
             if isempty(sigma_name) || isempty(innovations_name)
-                @warn "Parameters for LGCP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                @warn "Parameters for LGCP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
 
-            # Extract samples (CPU) and move to device at once
-            sigma_samples_device = to_device(get_params_vector(chain, sigma_name, 1)') # [1 x n_samples]
-            innovations_samples_device = to_device(get_params_matrix(chain, innovations_name, hyper.inner_hyper.n_latent)') # [n_latent x n_samples]
+            # Extract samples (CPU)
+            sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+            innovations_samples = get_params_matrix(chain, innovations_name, hyper.inner_hyper.n_latent) # (n_samples, n_latent)
             
-            # Use precomputed Cholesky factor from the inner model's spec
-            F_lgcp = hyper.inner_hyper.cholesky_factor # Already on device
+            F_lgcp = hyper.inner_hyper.cholesky_factor # Cholesky factor for LGCP
             
-            spatial_component_raw = F_lgcp.L' \ innovations_samples_device
-            effect_k_latent_device = sigma_samples_device .* spatial_component_raw # Broadcasting
+            spatial_component_raw = F_lgcp.L' \ innovations_samples' # Raw spatial component
+            effect_k_latent = sigma_samples' .* spatial_component_raw # Scaled spatial component
             
-            indexed_effects_device = effect_k_latent_device[s_idx_full, :]
-            push!(structured_effects, Array(indexed_effects_device))
+            indexed_effects = effect_k_latent[s_idx_full, :]
+            push!(structured_effects, indexed_effects)
 
         elseif m.method == :lgmcp
             innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
             if isempty(innovations_name)
-                @warn "Innovations for LGMCP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                @warn "Innovations for LGMCP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
+            innovations_samples = get_params_matrix(chain, innovations_name, hyper.inner_hyper.n_latent) # Innovations for LGMCP
+            F_lgmcp = hyper.inner_hyper.cholesky_factor # Cholesky factor for LGMCP
 
-            innovations_samples_device = to_device(get_params_matrix(chain, innovations_name, hyper.inner_hyper.n_latent)')
-            F_lgmcp = hyper.inner_hyper.cholesky_factor # Already on device
+            effect_k_latent = exp.(F_lgmcp.L' \ innovations_samples') # Exponentiate to get intensity
 
-            effect_k_latent_device = exp.(F_lgmcp.L' \ innovations_samples_device)
-
-            indexed_effects_device = effect_k_latent_device[s_idx_full, :]
-            push!(structured_effects, Array(indexed_effects_device))
+            indexed_effects = effect_k_latent[s_idx_full, :]
+            push!(structured_effects, indexed_effects)
 
         elseif m.method == :sncp
             ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
@@ -336,52 +336,40 @@ function get_effects(
             n_parents = m.n_parents isa Int ? m.n_parents : error("Dynamic n_parents not supported in reconstruction yet.")
 
             if isempty(ls_name) || isempty(amplitude_name) || isempty(parent_locs_x_name) || isempty(parent_locs_y_name)
-                @warn "Parameters for SNCP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                @warn "Parameters for SNCP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
 
             # Extract samples (CPU)
-            ls_samples_cpu = get_params_vector(chain, ls_name, 1)[:, 1]
-            amplitude_samples_cpu = get_params_matrix(chain, amplitude_name, n_parents)
-            parent_locs_x_samples_cpu = get_params_matrix(chain, parent_locs_x_name, n_parents)
-            parent_locs_y_samples_cpu = get_params_matrix(chain, parent_locs_y_name, n_parents)
+            ls_samples = get_params_vector(chain, ls_name, 1) # (n_samples, 1)
+            amplitude_samples = get_params_matrix(chain, amplitude_name, n_parents) # (n_samples, n_parents)
+            parent_locs_x_samples = get_params_matrix(chain, parent_locs_x_name, n_parents) # (n_samples, n_parents)
+            parent_locs_y_samples = get_params_matrix(chain, parent_locs_y_name, n_parents) # (n_samples, n_parents)
 
-            # Prepare observation locations on device
-            obs_locs_train = hyper.centroids # This should be a Vector of Point2D on CPU
-            obs_locs_full_cpu = if !isnothing(PS) && hasproperty(PS, :centroids)
-                vcat(obs_locs_train, PS.centroids)
+            # Prepare observation locations
+            obs_locs_train = hyper.centroids # Training centroids
+            obs_locs_full = if !isnothing(PS) && hasproperty(PS, :centroids) # If prediction set has centroids
+                vcat(obs_locs_train, PS.centroids) # Combine training and prediction centroids
             else
-                obs_locs_train
+                obs_locs_train # Otherwise, use only training centroids
             end
             
-            # Convert Vector{Point2D} to a matrix for vectorized computation
-            obs_locs_matrix_cpu = hcat([p.x for p in obs_locs_full_cpu], [p.y for p in obs_locs_full_cpu])
-            obs_locs_device = to_device(obs_locs_matrix_cpu)
+            obs_locs_matrix = hcat([p.x for p in obs_locs_full], [p.y for p in obs_locs_full]) # Matrix of observation locations
 
-            intensity_all_samples_device = to_device(zeros(Float64, length(obs_locs_full_cpu), n_samples))
+            intensity_all_samples = zeros(Float64, length(obs_locs_full), n_samples) # Initialize intensity matrix
             
-            for i in 1:n_samples
-                # Construct parent locations matrix for current sample on device
-                parent_locs_i_device = to_device(hcat(parent_locs_x_samples_cpu[i, :], parent_locs_y_samples_cpu[i, :]))
-                
-                # Vectorized pairwise distance calculation
-                dist_sq_device = sum(obs_locs_device.^2, dims=2) .- 2 * (obs_locs_device * parent_locs_i_device') .+ sum(parent_locs_i_device.^2, dims=2)'
-                
-                # Compute kernel values
-                kernel_vals_device = exp.(-0.5 .* dist_sq_device ./ (ls_samples_cpu[i]^2))
-                
-                # Compute intensity using matrix-vector product
-                amplitude_i_device = to_device(amplitude_samples_cpu[i, :])
-                intensity_at_obs_device = kernel_vals_device * amplitude_i_device
-                
-                intensity_all_samples_device[:, i] = intensity_at_obs_device
+            for i in 1:n_samples # Iterate over each posterior sample
+                parent_locs_i = hcat(parent_locs_x_samples[i, :], parent_locs_y_samples[i, :]) # Parent locations for current sample
+                dist_sq = sum(obs_locs_matrix.^2, dims=2) .- 2 * (obs_locs_matrix * parent_locs_i') .+ sum(parent_locs_i.^2, dims=2)' # Squared distances
+                kernel_vals = exp.(-0.5 .* dist_sq ./ (ls_samples[i, 1]^2)) # Kernel values
+                intensity_at_obs = kernel_vals * amplitude_samples[i, :] # Intensity at observation locations
+                intensity_all_samples[:, i] = intensity_at_obs # Store intensity
             end
             
-            # Index the log-intensity and move to CPU
-            log_intensity_device = log.(intensity_all_samples_device .+ 1e-9)
-            indexed_effects_device = log_intensity_device[s_idx_full, :]
-            push!(structured_effects, Array(indexed_effects_device))
+            log_intensity = log.(intensity_all_samples .+ 1e-9) # Log-intensity
+            indexed_effects = log_intensity[s_idx_full, :]
+            push!(structured_effects, indexed_effects)
         else
             @warn "Reconstruction for PointProcess method '$(m.method)' is not implemented. Returning zero effects."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
@@ -389,4 +377,4 @@ function get_effects(
     end
     
     return (structured=structured_effects, noisy=structured_effects)
-end
+end 

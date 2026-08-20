@@ -7,7 +7,7 @@ across spatial units. The spatial variation of `rho` is governed by a specified
 GMRF model (e.g., ICAR, Leroux).
 
 # Version
-v2.0.1 (2026-08-14)
+v2.0.2 (2026-08-19)
 
 # Mathematical Summary
 The SVAR model defines a spatiotemporal process \$\\psi_{it}\$ for spatial unit \$i\$
@@ -96,16 +96,13 @@ function get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
         @warn "Adjacency matrix `W` not provided for SVAR model's rho field."
     end
 
-    # Get the device transfer function
-    to_device = M.to_device
-
     # This returns CPU arrays
     template = build_structure_template(m.rho_model_type, s_N; W=W)
 
     return (
-        Q_rho_template=to_device(template.matrix),
-        U_rho=to_device(template.U),
-        L_rho=to_device(template.L),
+        Q_rho_template=template.matrix,
+        U_rho=template.U,
+        L_rho=template.L,
         scaling_factor_rho=template.scaling_factor,
         n_latent_rho=s_N,
         n_latent_svar=s_N * t_N
@@ -153,7 +150,6 @@ function get_updates(
         rho_recon_code = """
             local hyper_rho = spec_registry[:$(key)].hyper
             local Q_rho = hyper_rho.Q_rho_template
-            # Recompute Cholesky on the fly, which will happen on the target device
             local F_rho = cholesky(Symmetric(Matrix(Q_rho) + M.noise * I))
             local rho_field_raw = F_rho.L' \\ $(p_names.rho_innovations)
             if "$(string(m.rho_model_type))" in ["icar", "besag"]
@@ -188,34 +184,31 @@ function get_updates(
     """
 end
 
+
 function get_effects(
-    m::SVAR, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::SVAR, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
-
-    # --- Get precomputed data (already on device) ---
+    p_names = string.(keys(chain))
+    
+    # --- Get precomputed data ---
     hyper = spec.hyper
     s_N, t_N, noise = M.s_N, M.t_N, M.noise
     n_latent_svar = s_N * t_N
-    Q_rho_template_device = hyper.Q_rho_template
-    U_rho_device = hyper.U_rho
-    L_rho_device = hyper.L_rho
+    Q_rho_template_cpu = hyper.Q_rho_template
+    U_rho_cpu = hyper.U_rho
+    L_rho_cpu = hyper.L_rho
 
-    # --- Index Handling: Combine training and prediction sets on device ---
-    s_idx_cpu = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS, :s_idx, Int[]))
-    t_idx_cpu = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS, :t_idx, Int[]))
+    # --- Index Handling: Combine training and prediction sets on CPU ---
+    s_idx_cpu = isnothing(PS) ? M.s_idx : vcat(M.s_idx, get(PS.data, :s_idx, []))
+    t_idx_cpu = isnothing(PS) ? M.t_idx : vcat(M.t_idx, get(PS.data, :t_idx, []))
     N_total = length(s_idx_cpu)
     t_N_full = isempty(t_idx_cpu) ? 0 : maximum(t_idx_cpu)
     
-    s_idx_device = to_device(s_idx_cpu)
-    t_idx_device = to_device(t_idx_cpu)
-
     structured_effects = Vector{Matrix{Float64}}()
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
@@ -236,40 +229,38 @@ function get_effects(
         # Extract posterior samples (these are on the CPU)
         rho_sigma_samples_cpu = get_params_vector(chain, rho_sigma_name, 1)[:, 1]
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_innovations_samples_cpu = get_params_vector(chain, rho_innovations_name, s_N)
-        innovations_samples_cpu = get_params_vector(chain, innovations_name, n_latent_svar)
+        rho_innovations_samples_cpu = get_params_matrix(chain, rho_innovations_name, s_N)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent_svar)
         
-        # Initialize the output matrix for the full effect on the target device
-        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
+        # Initialize the output matrix for the full effect on the CPU
+        effect_k_cpu = zeros(Float64, N_total, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
+        # --- Sample-wise Reconstruction on the CPU ---
         for s in 1:n_samples
-            # Move current sample's parameters to the device
-            rho_sigma_s = rho_sigma_samples_cpu[s] # scalar
-            sigma_s = sigma_samples_cpu[s] # scalar
-            rho_innovations_s = to_device(rho_innovations_samples_cpu[s, :])
-            innovations_s = to_device(innovations_samples_cpu[s, :])
+            rho_sigma_s = rho_sigma_samples_cpu[s]
+            sigma_s = sigma_samples_cpu[s]
+            rho_innovations_s = rho_innovations_samples_cpu[s, :]
+            innovations_s = innovations_samples_cpu[s, :]
 
             local rho_field_s
             if m.method == :spectral
-                D_rho_s = rho_sigma_s ./ sqrt.(L_rho_device .+ noise)
+                D_rho_s = rho_sigma_s ./ sqrt.(L_rho_cpu .+ noise)
                 if m.rho_model_type in [:icar, :besag]; D_rho_s[1] = 0.0; end
-                rho_field_s = U_rho_device * (D_rho_s .* rho_innovations_s)
+                rho_field_s = U_rho_cpu * (D_rho_s .* rho_innovations_s)
             else # :cholesky or :cholesky_sparse
-                # Recompute Cholesky on device
-                F_rho_device = cholesky(Symmetric(Matrix(Q_rho_template_device) + noise * I))
-                rho_field_raw = F_rho_device.L' \ rho_innovations_s
+                F_rho_cpu = cholesky(Symmetric(Matrix(Q_rho_template_cpu) + noise * I))
+                rho_field_raw = F_rho_cpu.L' \ rho_innovations_s
                 if m.rho_model_type in [:icar, :besag]; rho_field_raw .-= mean(rho_field_raw); end
                 rho_field_s = rho_field_raw .* rho_sigma_s
             end
             rho_s_s = tanh.(rho_field_s)
 
-            latent_st_s = to_device(zeros(Float64, s_N, t_N_full))
+            latent_st_s = zeros(Float64, s_N, t_N_full)
             innovations_grid_train = reshape(innovations_s, s_N, t_N)
             innovations_grid_full = if t_N_full > t_N
-                hcat(innovations_grid_train, to_device(randn(Float32, s_N, t_N_full - t_N)))
+                hcat(innovations_grid_train, randn(Float32, s_N, t_N_full - t_N))
             else
-                innovations_grid_train
+                innovations_grid_train[:, 1:t_N_full]
             end
             
             denom = sqrt.(max.(0, 1 .- rho_s_s.^2))
@@ -278,14 +269,13 @@ function get_effects(
                 latent_st_s[:, t] = rho_s_s .* latent_st_s[:, t-1] .+ sigma_s .* innovations_grid_full[:, t]
             end
             
-            # Vectorized indexing
-            linear_indices = s_idx_device .+ (t_idx_device .- 1) .* s_N
-            effect_k_device[:, s] = vec(latent_st_s)[linear_indices]
+            linear_indices = s_idx_cpu .+ (t_idx_cpu .- 1) .* s_N
+            effect_k_cpu[:, s] = vec(latent_st_s)[linear_indices]
         end
         
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_cpu)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
+ 

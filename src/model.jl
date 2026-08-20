@@ -152,42 +152,41 @@ function _rewrite_transformations!(nodes::Vector, data::DataFrame)
     return new_nodes
 end
 
-
 """
-    generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String; ArrayType::Type{<:AbstractArray}=Array)
+    generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String)
 
 Generates random projection weights (W) and biases (b) for the Random Fourier
-Features (RFF) approximation, with GPU support. This version creates arrays on the
-CPU and moves them to the target device specified by `ArrayType`.
+Features (RFF) approximation. This version is CPU-only.
 """
-function generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String; ArrayType::Type{<:AbstractArray}=Array)
-    b_cpu = rand(Uniform(0, 2 * pi), n_features)
-    W_cpu = Matrix{Float64}(undef, in_dims, n_features)
+function generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String)
+    b = rand(Uniform(0, 2 * pi), n_features)
+    W = Matrix{Float64}(undef, in_dims, n_features)
     k_name = lowercase(kernel_name)
 
     if k_name in ["se", "gaussian", "rbf"]
         if lengthscale isa Real
-            W_cpu .= rand(Normal(0, 1.0 / lengthscale), in_dims, n_features)
+            W .= rand(Normal(0, 1.0 / lengthscale), in_dims, n_features)
         else
             if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
-            for d in 1:in_dims; W_cpu[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features); end
+            for d in 1:in_dims; W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features); end
         end
     elseif occursin("matern", k_name)
         nu = if k_name == "matern12"; 0.5; elseif k_name == "matern32"; 1.5; else 2.5; end
         df = 2 * nu
         if lengthscale isa Real
-            W_cpu .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
+            W .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
         else
             if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
-            for d in 1:in_dims; W_cpu[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features); end
+            for d in 1:in_dims; W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features); end
         end
     else
         @warn "Kernel '$kernel_name' not recognized for RFF. Defaulting to SE."
-        return generate_rff_params(in_dims, n_features, lengthscale, "se"; ArrayType=ArrayType)
+        return generate_rff_params(in_dims, n_features, lengthscale, "se")
     end
     
-    return ArrayType(W_cpu), ArrayType(b_cpu)
+    return W, b
 end
+
 
 
 
@@ -1282,16 +1281,7 @@ end
 """
     bstm_config(formula::String, data::DataFrame; calling_module::Module=Main, kwargs...)
 
-Constructs the complete model configuration from a formula and data.
-
-# Version
-v1.1.0 (2026-08-16)
-
-# Rationale
-This function orchestrates the entire model configuration pipeline. This version
-is updated to support generic GPU acceleration by calling `_move_config_to_gpu!`
-at the appropriate stage, after CPU-based data processing is complete but before
-GPU-specific pre-computations like Cholesky factorization.
+Constructs the complete model configuration from a formula and data. 
 """
 function bstm_config(
     formula::String, data::DataFrame; calling_module::Module=Main, kwargs...
@@ -1380,19 +1370,14 @@ function bstm_config(
     _process_fixed_effects!(M, unique(all_fixed_effects))
     _process_fixed_effects_priors!(M)
 
-    # Move data to GPU before static pre-computations.
-    _move_config_to_gpu!(M)
-
-    # Pre-compute Cholesky factorizations for static components (now on GPU if enabled).
+    # Pre-compute Cholesky factorizations for static components.
     _precompute_static_components!(M)
 
     _finalize_config!(M)
     
     return NamedTuple(M)
 end
-
-
-
+ 
 
 
 
@@ -1480,6 +1465,24 @@ end
 
 
 
+"""
+    _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multivariate::Bool, eta_name::String)
+
+Generates Turing code for a spatiotemporal interaction effect. 
+
+# Version
+v1.1.0 (2026-08-18)
+ 
+
+# Arguments
+- `M`: The main model configuration `NamedTuple`.
+- `s_spec`, `t_spec`: The specifications for the spatial and temporal components.
+- `is_multivariate`: A boolean indicating if the model is multivariate.
+- `eta_name`: The name of the linear predictor variable.
+
+# Returns
+- A `String` containing the generated Turing code for the interaction block.
+"""
 function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multivariate::Bool, eta_name::String)
     if get(M, :model_st, "none") == "none" 
         return ""
@@ -1497,7 +1500,6 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     t_chol_access = get(t_spec, :is_static, false) ? "spec_registry[:$(t_key)].cholesky_factor" : "cholesky(Symmetric(spec_registry[:$(t_key)].hyper.Q_template + noise * I))"
 
     K = get(M, :outcomes_N, 1)
-    array_type_str = "M.to_device"
 
     if is_multivariate
         interaction_code = """
@@ -1506,7 +1508,7 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     st_interaction_sigma ~ NamedDist(filldist($(st_sigma_prior_dist_str), $K), :st_interaction_sigma)
     
     # --- Spatiotemporal Interaction Innovations ---
-    st_interaction_raw ~ NamedDist(MvNormal(fill!($(array_type_str){T}(undef, M.s_N * M.t_N * $K), 0), I), :st_interaction_raw)
+    st_interaction_raw ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N * $K), 0), I), :st_interaction_raw)
 
     let
         C_s = $s_chol_access
@@ -1524,9 +1526,9 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
             
             st_field_k = st_field_k_unscaled .* st_interaction_sigma[k]
 
-            for i in 1:N
-                $(eta_name)[i, k] += st_field_k[M.s_idx[i], M.t_idx[i]]
-            end
+            # Vectorized update to the linear predictor
+            effect_k = vec(st_field_k)[M.st_idx]
+            $(eta_name)[:, k] .+= effect_k
         end
     end
     """
@@ -1536,7 +1538,7 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     local st_sigma_prior_dist_str = haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)"
     st_interaction_sigma ~ NamedDist($(st_sigma_prior_dist_str), :st_interaction_sigma)
 
-    st_interaction_raw ~ NamedDist(MvNormal(fill!($(array_type_str){T}(undef, M.s_N * M.t_N), 0), I), :st_interaction_raw)
+    st_interaction_raw ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N), 0), I), :st_interaction_raw)
 
     let
         C_s = $s_chol_access
@@ -1551,20 +1553,16 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
         
         st_field = st_field_unscaled .* st_interaction_sigma
 
-        for i in 1:N
-            $(eta_name)[i] += st_field[M.s_idx[i], M.t_idx[i]]
-        end
+        # Vectorized update to the linear predictor
+        effect = vec(st_field)[M.st_idx]
+        $(eta_name) .+= effect
     end
     """
     end
     
     return interaction_code
 end
-
-
-
-
-
+ 
 
  
 """
@@ -1581,11 +1579,10 @@ function _generate_householder_reflection_block(M::NamedTuple, is_multivariate::
     end
 
     K = M[:outcomes_N]
-    array_type_str = "M.to_device"
-    
+     
     priors_str = """
     # Householder reflection for spectral orientation
-    v_raw_reflection ~ NamedDist(MvNormal(fill!($(array_type_str){T}(undef, $(K)), 0), I), :v_raw_reflection)
+    v_raw_reflection ~ NamedDist(MvNormal(fill!(Array{T}(undef, $(K)), 0), I), :v_raw_reflection)
     """
 
     update_str = """
@@ -1597,6 +1594,8 @@ function _generate_householder_reflection_block(M::NamedTuple, is_multivariate::
     """
     return priors_str, update_str
 end
+
+
 
 
 """
@@ -1673,9 +1672,9 @@ function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main
             
             # --- Assemble sub-model updates ---
             sub_eta_init = if get(sub_M, :add_intercept, false)
-                is_sub_multivariate ? "intercept_$(prefix)' .+ fill!(M.to_device{T}(undef, sub_M.y_N, sub_M.outcomes_N), 0)" : "intercept_$(prefix) .+ fill!(M.to_device{T}(undef, sub_M.y_N), 0)"
+                is_sub_multivariate ? "intercept_$(prefix)' .+ fill!(Array{T}(undef, sub_M.y_N, sub_M.outcomes_N), 0)" : "intercept_$(prefix) .+ fill!(Array{T}(undef, sub_M.y_N), 0)"
             else
-                is_sub_multivariate ? "fill!(M.to_device{T}(undef, sub_M.y_N, sub_M.outcomes_N), 0)" : "fill!(M.to_device{T}(undef, sub_M.y_N), 0)"
+                is_sub_multivariate ? "fill!(Array{T}(undef, sub_M.y_N, sub_M.outcomes_N), 0)" : "fill!(Array{T}(undef, sub_M.y_N), 0)"
             end
             push!(sub_updates_acc, "local $(sub_eta_name) = $(sub_eta_init)")
 
@@ -1705,6 +1704,8 @@ function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main
     end
     return "", "", ""
 end
+
+
 
 
 
@@ -1798,8 +1799,7 @@ end
     _precompute_static_components!(M::Dict)
 
 Pre-computes matrix factorizations for static model components. This version is
-updated to handle GPU arrays by converting sparse matrices to dense on the GPU
-before factorization.
+CPU-only.
 """
 function _precompute_static_components!(M::Dict)
     noise = M[:noise]
@@ -1816,8 +1816,7 @@ function _precompute_static_components!(M::Dict)
             if is_inner_static && hasproperty(current_spec.hyper, :Q_template) && !isnothing(current_spec.hyper.Q_template) && size(current_spec.hyper.Q_template, 1) > 0
                 try
                     Q_concrete = current_spec.hyper.Q_template
-                    # If GPU is used, convert sparse CPU matrix to dense GPU matrix
-                    Q_dense = Q_concrete isa SparseArrays.AbstractSparseMatrix ? M[:gpu_array_type](Matrix(Q_concrete)) : Q_concrete
+                    Q_dense = Matrix(Q_concrete)
                     F = cholesky(Symmetric(Q_dense + noise * I))
                     final_spec = merge(current_spec, (is_static=true, cholesky_factor=F))
                     push!(new_components, final_spec)
@@ -1833,7 +1832,7 @@ function _precompute_static_components!(M::Dict)
         if is_main_static && hasproperty(current_spec.hyper, :Q_template) && !isnothing(current_spec.hyper.Q_template) && size(current_spec.hyper.Q_template, 1) > 0
             try
                 Q_concrete = current_spec.hyper.Q_template
-                Q_dense = Q_concrete isa SparseArrays.AbstractSparseMatrix ? M[:gpu_array_type](Matrix(Q_concrete)) : Q_concrete
+                Q_dense = Matrix(Q_concrete)
                 F = cholesky(Symmetric(Q_dense + noise * I))
                 final_spec = merge(current_spec, (is_static=true, cholesky_factor=F))
                 push!(new_components, final_spec)
@@ -1851,84 +1850,17 @@ function _precompute_static_components!(M::Dict)
 end
 
 
-
-
-"""
-    _get_gpu_backend()
-
-Detects the available and functional GPU backend at runtime. It prioritizes CUDA,
-then AMDGPU, then oneAPI, then OpenCL, and finally Metal. This function uses
-`isdefined` and `Base.invokelatest` to safely check for and use GPU backends that
-may have been loaded after the `bstm` module was compiled, thus avoiding world-age issues.
-
-# Returns
-- A `NamedTuple` `(backend=..., array_type=...)` containing the backend module
-  and its corresponding array type (e.g., `CuArray`, `ROCArray`, `oneArray`,
-  `CLArray`, `MtlArray`), or `nothing` if no functional backend is found.
-"""
-function _get_gpu_backend()
-    # Prioritize CUDA
-    if isdefined(Main, :CUDA)
-        if Base.invokelatest(getfield(Main.CUDA, :functional))
-            @info "CUDA backend detected and functional."
-            return (backend=Main.CUDA, array_type=getfield(Main.CUDA, :CuArray))
-        end
-    end
-
-    # Then AMDGPU
-    if isdefined(Main, :AMDGPU)
-        if Base.invokelatest(getfield(Main.AMDGPU, :functional))
-            @info "AMDGPU backend detected and functional."
-            return (backend=Main.AMDGPU, array_type=getfield(Main.AMDGPU, :ROCArray))
-        end
-    end
-
-    # Then oneAPI (Intel GPUs)
-    if isdefined(Main, :oneAPI)
-        if Base.invokelatest(getfield(Main.oneAPI, :functional))
-            @info "oneAPI backend detected and functional."
-            return (backend=Main.oneAPI, array_type=getfield(Main.oneAPI, :oneArray))
-        end
-    end
-
-    # Then OpenCL
-    if isdefined(Main, :OpenCL)
-        if !isempty(Base.invokelatest(getfield(Main.OpenCL, :devices)))
-            @info "OpenCL backend detected and functional."
-            return (backend=Main.OpenCL, array_type=getfield(Main.OpenCL, :CLArray))
-        end
-    end
-
-    # Then Metal (Apple GPUs)
-    if isdefined(Main, :Metal)
-        if Base.invokelatest(getfield(Main.Metal, :functional))
-            @info "Metal backend detected and functional."
-            return (backend=Main.Metal, array_type=getfield(Main.Metal, :MtlArray))
-        end
-    end
-
-    # No functional GPU backend found
-    return nothing
-end
-
-
-
+ 
 """
     _initialize_config(data::DataFrame, kwargs)
 
-Creates the initial model configuration dictionary (`M`), setting up defaults and
-detecting the appropriate GPU backend without moving data.
+Creates the initial model configuration dictionary (`M`) 
 
 # Version
 v1.2.0 (2026-08-16)
 
 # Rationale
-This function is refactored to handle only the initial setup and GPU backend
-detection. It no longer moves data to the GPU, as this was causing errors by
-converting the `DataFrame` prematurely. Instead, it identifies the correct GPU
-array type and stores it, preserving the original `DataFrame` for subsequent
-formula parsing and data processing steps. Data movement is now handled by a
-dedicated function later in the configuration pipeline.
+This function is refactored to handle only the initial setup. 
 
 # Arguments
 - `data::DataFrame`: The input data for the model.
@@ -1936,10 +1868,10 @@ dedicated function later in the configuration pipeline.
 
 # Returns
 - `Dict{Symbol, Any}`: The initial model configuration dictionary `M`.
-"""
+""" 
 function _initialize_config(data::DataFrame, kwargs)
     M = Dict{Symbol, Any}()
-    M[:data] = data # Keep the original DataFrame
+    M[:data] = data
     M[:y_N] = size(data, 1)
     
     # Set defaults that can be overridden by user-provided kwargs.
@@ -1948,29 +1880,9 @@ function _initialize_config(data::DataFrame, kwargs)
     M[:prior_scheme] = :pcpriors
     M[:fixed_effects_priors] = Dict{Symbol, Any}()
     M[:spectral_orientation] = true
-    M[:use_gpu] = false
-    M[:gpu_backend] = nothing
-    M[:gpu_array_type] = Array 
-    M[:to_device] = Array # Default to CPU
 
     # Merge user-provided keyword arguments, overriding defaults.
     for (k, v) in kwargs; M[k] = v; end
-
-    # Handle GPU backend detection.
-    if M[:use_gpu]
-        gpu_info = _get_gpu_backend()
-        if !isnothing(gpu_info)
-            M[:gpu_backend] = gpu_info.backend
-            M[:gpu_array_type] = gpu_info.array_type
-            M[:to_device] = gpu_info.array_type # Set to_device function
-            @info "GPU acceleration enabled using $(M[:gpu_array_type])."
-        else
-            @warn "use_gpu=true, but no functional GPU backend was found. Reverting to CPU."
-            M[:use_gpu] = false
-            M[:gpu_array_type] = Array # Explicitly fall back
-            M[:to_device] = Array
-        end
-    end
     
     # Initialize containers for components and basis matrices.
     M[:calling_module] = get(kwargs, :calling_module, Main)
@@ -1979,78 +1891,8 @@ function _initialize_config(data::DataFrame, kwargs)
     
     return M
 end
-
-
-
-
-"""
-    _move_config_to_gpu!(M::Dict)
-
-Moves all relevant numeric arrays in the model configuration dictionary `M` to the
-selected GPU device. This function is called after all data structures have been
-created.
-"""
-function _move_config_to_gpu!(M::Dict)
-    if !get(M, :use_gpu, false)
-        return
-    end
-
-    to_device = M[:gpu_array_type]
-    @info "Moving model data structures to device: $(M[:gpu_backend])"
-
-    # List of keys for arrays/matrices to move to the GPU.
-    keys_to_move = [
-        :y_obs, :Xfixed, :W, :centroids, :s_idx, :t_idx, :u_idx,
-        :log_offsets, :weights, :trials, :censor_lower, :censor_upper, :hurdle
-    ]
-
-    for key in keys_to_move
-        if haskey(M, key) && M[key] isa AbstractArray
-            M[key] = to_device(M[key])
-        end
-    end
-
-    # Move basis matrices.
-    if haskey(M, :basis_matrices)
-        for (k, mat) in M[:basis_matrices]
-            if mat isa AbstractArray
-                M[:basis_matrices][k] = to_device(mat)
-            end
-        end
-    end
-
-    # Move precomputed data within each component's `hyper` specification.
-    if haskey(M, :components)
-        new_components = []
-        for spec in M[:components]
-            new_hyper_dict = Dict(pairs(spec.hyper))
-            for (hk, hv) in new_hyper_dict
-                # Do not move Cholesky factors here, they are handled in _precompute_static_components!
-                if hv isa AbstractArray && !(hv isa Factorization)
-                    new_hyper_dict[hk] = to_device(hv)
-                end
-            end
-            
-            # Handle nested specs like in state-space models.
-            if haskey(new_hyper_dict, :state_spec)
-                new_state_spec_dict = Dict(pairs(new_hyper_dict[:state_spec]))
-                for (ssk, ssv) in new_state_spec_dict
-                    if ssv isa AbstractArray && !(ssv isa Factorization)
-                        new_state_spec_dict[ssk] = to_device(ssv)
-                    end
-                end
-                new_hyper_dict[:state_spec] = NamedTuple(new_state_spec_dict)
-            end
-            
-            push!(new_components, merge(spec, (hyper=NamedTuple(new_hyper_dict),)))
-        end
-        M[:components] = new_components
-    end
-end
-
-
-
-
+ 
+ 
 
 """
     _process_lhs!(M::Dict, outcome_specs::Vector{Dict{Symbol, Any}})
@@ -2758,8 +2600,7 @@ macro bstm(exprs...)
     data_esc = esc(data_expr)
     kwargs_esc = [esc(kw) for kw in collected_kwargs]
 
-    # Construct the core function call.
-    # The `use_gpu` argument, if provided by the user, will be in `kwargs_esc`.
+    # Construct the core function call. 
     core_logic = :(bstm_core($formula_str, $data_esc, $(__module__); $(kwargs_esc...)))
 
     # Return the appropriate expression
@@ -2934,7 +2775,6 @@ function _print_finalized_parameters(config::NamedTuple)
     println("\n-------------------------------------\n")
 end
 
-
 """
     bstm_core(formula::String, data::DataFrame, calling_module::Module; kwargs...)
 
@@ -2942,16 +2782,16 @@ The main entry point for the `@bstm` macro. This function orchestrates the confi
 code generation, and instantiation of a Turing model.
 
 # Version
-v1.1.2 (2026-08-15)
+v1.1.3 (2026-08-17)
 
 # Rationale
 This function is the core of the `bstm` framework. It provides a robust and complete
-workflow for dynamic model creation. This version corrects a world-age issue that
-caused an `UndefVarError: 'SimpleVarInfo' not defined` during the prior predictive
-check. The fix involves explicitly evaluating the dynamically generated model in the
-current module's scope using `Core.eval(@__MODULE__, ...)`. This ensures that all
-necessary types from `bstm`'s dependencies (like `DynamicPPL`) are in scope
-during model compilation and execution, resolving the error.
+workflow for dynamic model creation. This version resolves a "world age" warning by
+changing how the dynamically generated model function is retrieved. Instead of using
+`Core.eval` to define the function and then `getfield` to retrieve it (which can
+trigger the warning), this version uses a `quote` block within `Core.eval` to define
+and then immediately return the function object. This is a more robust pattern for
+runtime code generation in Julia and eliminates the world-age warning.
 
 # Workflow
 1.  **Configuration**: Calls `bstm_config` to translate the user's formula and
@@ -2959,7 +2799,7 @@ during model compilation and execution, resolving the error.
 2.  **Code Generation**: Dynamically generates a unique Turing `@model` definition
     by calling `bstm_text_assembler`.
 3.  **Scoped Evaluation**: Evaluates the generated model in the current module's
-    scope to prevent world-age and scoping issues.
+    scope and directly captures the returned function object.
 4.  **Safe Instantiation**: Uses `Base.invokelatest` to instantiate the model.
 5.  **Validation**: Automatically runs a prior predictive check (`rand(model)`) and
     provides detailed, user-friendly diagnostics if the check fails.
@@ -2996,12 +2836,12 @@ function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwa
     end
 
     # --- 3. Model Evaluation and Instantiation ---
-    # Evaluate the generated @model macro expression in the current module's scope
-    # to avoid world-age issues and ensure access to all necessary types.
-    Core.eval(@__MODULE__, expr)
-
-    # Access the function binding from the current module's global scope.
-    model_func = getfield(@__MODULE__, model_func_name)
+    # Evaluate the generated @model expression and get the function object back directly.
+    # This pattern avoids world-age issues that can arise from using `getfield`.
+    model_func = Core.eval(@__MODULE__, quote
+        $(expr) # The parsed @model expression from bstm_text_assembler
+        $(model_func_name) # Return the function object itself
+    end)
 
     # Instantiate the Turing Model Object using invokelatest for type stability.
     model_instance = Base.invokelatest(model_func, new_config, registry)
@@ -3034,6 +2874,7 @@ function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwa
     # Return the fully configured and validated model object.
     return model_instance
 end
+
 
 
 
@@ -3109,12 +2950,11 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     arch = get(M, :model_arch, "univariate")
     is_multivariate = arch == "multivariate"
     eta_name = is_multivariate ? "eta_latent" : "eta"
-    array_type_str = "M.to_device"
-
+ 
     eta_init = if get(M, :add_intercept, false)
-        is_multivariate ? "intercept' .+ fill!($(array_type_str){T}(undef, N, K), 0)" : "intercept .+ fill!($(array_type_str){T}(undef, N), 0)"
+        is_multivariate ? "intercept' .+ fill!(Array{T}(undef, N, K), 0)" : "intercept .+ fill!(Array{T}(undef, N), 0)"
     else
-        is_multivariate ? "fill!($(array_type_str){T}(undef, N, K), 0)" : "fill!($(array_type_str){T}(undef, N), 0)"
+        is_multivariate ? "fill!(Array{T}(undef, N, K), 0)" : "fill!(Array{T}(undef, N), 0)"
     end
 
     outcomes_N = get(M, :outcomes_N, 1)
@@ -3228,8 +3068,6 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     end
 end
 
-
-
  
  
 """
@@ -3303,29 +3141,21 @@ end
 """
     build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractMatrix, Nothing}=nothing)
 
-Creates a precision matrix template and its spectral decomposition for a GMRF model.
-  handle GPU arrays for the eigendecomposition.
+Creates a precision matrix template and its spectral decomposition for a GMRF model. 
 """
 function build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractMatrix, Nothing}=nothing)
     Q_template = spzeros(Float64, n, n)
     rank_deficiency = 0
 
     if n == 0
-        # Handle empty case gracefully
-        gpu_array_type = W isa GPUArrays.AbstractGPUArray ? typeof(W) : Array
-        return (matrix=gpu_array_type(Q_template), scaling_factor=1.0, U=gpu_array_type(spzeros(Float64, 0, 0)), L=gpu_array_type(Float64[]))
+        return (matrix=Q_template, scaling_factor=1.0, U=spzeros(Float64, 0, 0), L=Float64[])
     end
-
-    # Determine the target array type from the input W or default to Array
-    ArrayType = W isa GPUArrays.AbstractGPUArray ? typeof(W).name.wrapper : Array
 
     if model_type in [:icar, :besag, :bym2, :leroux, :localadaptive]
         if isnothing(W); error("Spatial model '$model_type' requires an adjacency matrix `W`."); end
         if size(W, 1) != n || size(W, 2) != n; error("Adjacency matrix `W` dimensions ($(size(W))) do not match `n` ($n)."); end
         
-        # Ensure W is on the CPU for sparse operations if it's a GPU array
-        W_cpu = W isa GPUArrays.AbstractGPUArray ? Array(W) : W
-        W_sym = sparse((W_cpu + W_cpu') .> 0)
+        W_sym = sparse((W + W') .> 0)
         D = spdiagm(0 => vec(sum(W_sym, dims=2)))
         Q_template = D - W_sym
         rank_deficiency = 1
@@ -3370,28 +3200,21 @@ function build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractM
         rank_deficiency = 0
     end
 
-    # Perform eigendecomposition. If on GPU, use GPU-accelerated version.
-    Q_dense = ArrayType(Matrix(Q_template))
-    eig_decomp = eigen(Symmetric(Q_dense))
+    eig_decomp = eigen(Symmetric(Matrix(Q_template)))
     U = eig_decomp.vectors
     L = eig_decomp.values
 
     if rank_deficiency > 0
-        # Perform scaling factor calculation on the CPU for simplicity, then apply.
-        L_cpu = L isa GPUArrays.AbstractGPUArray ? Array(L) : L
-        scaling_factor = _compute_scaling_factor(L_cpu, rank_deficiency)
+        scaling_factor = _compute_scaling_factor(L, rank_deficiency)
         Q_template = Q_template ./ scaling_factor
-        # Rescale eigenvalues as well for consistency.
         L = L ./ scaling_factor
     else
         scaling_factor = 1.0
     end
 
-    return (matrix=ArrayType(Q_template), scaling_factor=scaling_factor, U=U, L=L)
+    return (matrix=Q_template, scaling_factor=scaling_factor, U=U, L=L)
 end
-
-
-
+ 
 
 
 
@@ -3458,9 +3281,7 @@ end
 
 """
     evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
-
-Computes the cross-covariance kernel matrix between two sets of coordinates, with GPU support.
-This version replaces `Distances.pairwise` with broadcasting for GPU compatibility.
+ 
 
 # Version
 v1.5.7 (2026-08-13)
@@ -3506,13 +3327,11 @@ function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::Abstract
     coords1_T = convert(AbstractMatrix{T}, coords1)
     coords2_T = convert(AbstractMatrix{T}, coords2)
     ls_T = convert(typeof(ls) <: Real ? T : AbstractVector{T}, ls)
-    ArrayType = parent(coords1_T) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords1_T)) : Array
 
     if kernel_type == :linear
         return param_val^2 .* (coords1_T * coords2_T')
     end
 
-    # GPU-compatible pairwise squared Euclidean distance for cross-matrices
     function _sqeuclidean_broadcast_cross(X1::AbstractMatrix, X2::AbstractMatrix)
         sum(X1.^2, dims=2) .- 2 * (X1 * X2') .+ sum(X2.^2, dims=2)'
     end
@@ -3527,7 +3346,6 @@ function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::Abstract
         dist_sq = _sqeuclidean_broadcast_cross(coords1_T, coords2_T) ./ ls_T^2
     end
     
-    # Ensure diagonal is non-negative
     dist_sq[diagind(dist_sq)] .= max.(0, diag(dist_sq))
 
     if kernel_type == :gaussian || kernel_type == :se || kernel_type == :rbf
@@ -3549,7 +3367,7 @@ function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::Abstract
 
     elseif kernel_type == :spherical
         d = sqrt.(dist_sq)
-        K = ArrayType(zeros(T, size(d)))
+        K = zeros(T, size(d))
         mask = d .< one(T)
         K[mask] = param_val^2 .* (one(T) .- 1.5 .* d[mask] .+ 0.5 .* d[mask].^3)
         return K
@@ -3571,7 +3389,7 @@ function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::Abstract
     end
 end
 
-
+ 
 
 
 
@@ -3610,7 +3428,6 @@ has the correct dimensions in all cases.
 """
 function observation_volatility(M::NamedTuple)
     is_multivariate = get(M, :model_arch, "univariate") == "multivariate"
-    array_type_str = "M.to_device"
     
     if get(M, :volatility, false)
         required_keys = [:M_rff_sigma, :W_sigma_fixed, :b_sigma_fixed, :coords_st]
@@ -3620,7 +3437,7 @@ function observation_volatility(M::NamedTuple)
 
         priors_str = """
         sigma_log_var ~ DynamicPPL.NamedDist(Exponential(1.0), :sigma_log_var)
-        beta_vol ~ DynamicPPL.NamedDist(MvNormal(fill!($(array_type_str){T}(undef, M.M_rff_sigma), 0), sigma_log_var^2 * I), :beta_vol)
+        beta_vol ~ DynamicPPL.NamedDist(MvNormal(fill!(Array{T}(undef, M.M_rff_sigma), 0), sigma_log_var^2 * I), :beta_vol)
         """
 
         calc_str = """
@@ -3829,217 +3646,7 @@ function create_pc_prior(param_name::Symbol, constraint::Tuple)
     end
 end
 
-
-
-
-"""
-    get_optimal_sampler(model_obj::DynamicPPL.Model; ...)
-
-Automatically selects and constructs an efficient composite MCMC sampler for a `bstm` model.
-
-# Version
-v1.2.8 (2026-08-15)
-
-# Rationale
-This function is a core utility for the `bstm` inference engine. It replaces a
-simple, one-size-fits-all sampler selection with a sophisticated, multi-stage
-process that builds a composite `Gibbs` sampler tailored to the model's structure.
-This version enhances the component grouping logic to be more robust. It now
-identifies parameters with bounded priors (e.g., `Beta`, `Uniform`) within a
-component group and assigns them a gradient-free `Slice` sampler, while the
-remaining unbounded parameters in the group are sampled jointly with `NUTS`. This
-prevents `DomainError` issues that can arise when `NUTS` attempts to sample
-parameters with strict boundaries.
-
-# Workflow
-The function constructs the sampler in a series of stages, with each stage having
-higher precedence than the next:
-1.  **User-Specified Sampler**: If a complete sampler is passed via `sampler_choice`,
-    it is used directly, overriding all other logic.
-2.  **Automatic AD Engine Selection**: If the user has not specified a non-default
-    `adtype`, the function inspects the model's size. For large models (default > 100
-    parameters), it automatically switches the primary AD engine to a more performant
-    one like `ADTypes.AutoEnzyme()`.
-3.  **Manual Sampler Map**: The user can provide a `sampler_map` to assign specific
-    samplers to specific parameter groups (e.g., `sampler_map=Dict(:my_param => ESS())`).
-    These assignments are always respected.
-4.  **Component Grouping**: If `group_components=true`, the function identifies all
-    parameters belonging to the same model component. It then splits this group into
-    'bounded' and 'unbounded' parameters, assigning `Slice` to the former and `NUTS`
-    to the latter.
-5.  **Default Categorization**: Any remaining parameters are categorized by their prior's
-    support (`:discrete`, `:gaussian`, `:bounded`, `:other_continuous`), and an
-    appropriate sampler (`PG`, `ESS`, `Slice`, `NUTS`) is assigned to each category.
-
-# Arguments
-- `model_obj::DynamicPPL.Model`: The instantiated Turing model.
-- `sampler_choice`: A specific sampler instance to use, or `:auto` for automatic selection.
-- `sampler_map`: A `Dict` mapping parameter `Symbol`s to specific samplers.
-- `adtype`: The automatic differentiation backend to use for gradient-based samplers.
-- `target_acceptance`: The target acceptance rate for HMC-based samplers.
-- `adaptation_steps`: The number of adaptation steps for HMC-based samplers.
-- `group_components`: A `Bool` indicating whether to group component parameters for joint sampling.
-- `n_particles`: The number of particles for the `PG` sampler.
-- `hmc_leapfrog_steps`: The number of leapfrog steps for the `HMC` sampler.
-
-# Returns
-- An `AbstractMCMC.AbstractSampler` object, which will be a `Gibbs` sampler if multiple
-  parameter blocks are defined, or a single sampler otherwise.
-"""
-function get_optimal_sampler(
-    model_obj::DynamicPPL.Model;
-    sampler_choice::Union{Symbol, AbstractMCMC.AbstractSampler}=:auto,
-    sampler_map::Dict{Symbol, <:AbstractMCMC.AbstractSampler}=Dict{Symbol, AbstractMCMC.AbstractSampler}(),
-    adtype::ADTypes.AbstractADType=ADTypes.AutoForwardDiff(),
-    group_components::Bool=true,
-    adaptation_steps::Int=500,
-    target_acceptance::Float64=0.8,
-    n_particles::Int=20
-)
-    if sampler_choice isa AbstractMCMC.AbstractSampler
-        @info "Using user-specified sampler: $(typeof(sampler_choice))"
-        return sampler_choice
-    end
-
-    vi = DynamicPPL.VarInfo(model_obj)
-    vns = DynamicPPL.keys(vi)
-    num_params = length(vns)
-
-    # --- AD Engine Selection ---
-    adtype_to_use = adtype
-    param_threshold = 100
-    if adtype isa ADTypes.AutoForwardDiff && num_params > param_threshold
-        adtype_to_use = ADTypes.AutoEnzyme()
-        @info "Model has a large number of parameters ($num_params). Automatically switching to `ADTypes.AutoEnzyme()` for better performance. You can override this with the `adtype` argument."
-    else
-        @info "Using AD engine: $(typeof(adtype_to_use)). Model has $num_params parameters."
-    end
-
-    sampler_assignments = []
-    all_processed_vns = Set{VarName}()
-
-    # --- Stage 1: Handle user-provided sampler map (highest precedence) ---
-    for (param_sym, sampler) in sampler_map
-        sym_vns = filter(vn -> DynamicPPL.getsym(vn) == param_sym, vns)
-        if !isempty(sym_vns)
-            push!(sampler_assignments, Tuple(sym_vns) => sampler)
-            union!(all_processed_vns, sym_vns)
-            @info "Applying user-defined sampler $(typeof(sampler)) for parameter group: $(param_sym)"
-        else
-            @warn "Parameter :$(param_sym) in sampler_map not found in model."
-        end
-    end
-
-    # --- Stage 2: Group parameters by model component if enabled ---
-    if group_components
-        @info "Component grouping enabled. Grouping hyperparameters and latent fields for joint sampling."
-        
-        component_keys = string.([spec.key for spec in model_obj.args.M.components])
-        sort!(component_keys, by=length, rev=true)
-
-        component_groups = Dict{String, Set{VarName}}()
-        vns_to_check = filter(vn -> !(vn in all_processed_vns), vns)
-
-        for vn in vns_to_check
-            # Component grouping only applies to continuous parameters.
-            # Discrete parameters will be handled by the default categorization in Stage 3.
-            dist = DynamicPPL.getdist(vi, vn)
-            if !(Distributions.value_support(typeof(dist)) isa Distributions.Continuous)
-                continue
-            end
-
-            vn_str = string(DynamicPPL.getsym(vn))
-            found_key = nothing
-            for key in component_keys
-                if occursin(Regex("_$(key)(_\\d+)?\$"), vn_str) || startswith(vn_str, "$(key)_")
-                    found_key = key
-                    break
-                end
-            end
-            
-            if !isnothing(found_key)
-                if !haskey(component_groups, found_key)
-                    component_groups[found_key] = Set{VarName}()
-                end
-                push!(component_groups[found_key], vn)
-            end
-        end
-
-        for (key, params_vns) in component_groups
-            params_to_process = setdiff(params_vns, all_processed_vns)
-            if isempty(params_to_process); continue; end
-
-            # Rationale for Change (v1.2.9):
-            # The previous logic split component parameters into 'bounded' and 'unbounded'
-            # groups, assigning them to different samplers (Slice and NUTS). This can
-            # lead to numerical instability and DomainErrors during gradient computation,
-            # as the AD backend sees some parameters of a component as fixed constants
-            # while differentiating with respect to others.
-            # The corrected approach is to treat all continuous parameters within a component as a
-            # single block. We assign the entire block to NUTS, which can handle bounded
-            # priors (like Exponential or Beta) correctly via bijector transformations.
-            # This ensures that all related parameters are sampled jointly, improving
-            # stability and sampling efficiency.
-            sampler = NUTS(adaptation_steps, target_acceptance; adtype=adtype_to_use)
-            push!(sampler_assignments, Tuple(params_to_process) => sampler)
-            union!(all_processed_vns, params_to_process)
-            @info "Created NUTS block for component '$key' with parameters: $(DynamicPPL.getsym.(params_to_process)) using AD: $(typeof(adtype_to_use))"
-        end
-    end
-
-    # --- Stage 3: Assign samplers to remaining parameters based on their prior's support ---
-    remaining_vns = filter(vn -> !(vn in all_processed_vns), vns)
-    if !isempty(remaining_vns)
-        param_groups = Dict(:discrete => Set{VarName}(), :gaussian => Set{VarName}(), :bounded => Set{VarName}(), :other_continuous => Set{VarName}())
-
-        for vn in remaining_vns
-            try
-                dist = DynamicPPL.getdist(vi, vn)
-                support = Distributions.value_support(typeof(dist))
-                if support isa Distributions.Discrete
-                    push!(param_groups[:discrete], vn)
-                elseif support isa Distributions.Continuous
-                    if dist isa Union{Normal, MvNormal, Truncated{<:Normal}}
-                        push!(param_groups[:gaussian], vn)
-                    elseif isfinite(minimum(dist)) || isfinite(maximum(dist))
-                        push!(param_groups[:bounded], vn)
-                    else
-                        push!(param_groups[:other_continuous], vn)
-                    end
-                end
-            catch e
-                push!(param_groups[:other_continuous], vn)
-            end
-        end
-
-        if !isempty(param_groups[:discrete]); params = Tuple(param_groups[:discrete]); push!(sampler_assignments, params => PG(n_particles)); @info "Using Particle Gibbs (PG) for: $(DynamicPPL.getsym.(params))"; end
-        if !isempty(param_groups[:gaussian]); params = Tuple(param_groups[:gaussian]); push!(sampler_assignments, params => ESS()); @info "Using Elliptical Slice Sampling (ESS) for: $(DynamicPPL.getsym.(params))"; end
-        if !isempty(param_groups[:bounded]); params = Tuple(param_groups[:bounded]); push!(sampler_assignments, params => Slice()); @info "Using Slice sampling for: $(DynamicPPL.getsym.(params))"; end
-        if !isempty(param_groups[:other_continuous])
-            params = Tuple(param_groups[:other_continuous])
-            
-            block_adtype = if length(params) <= 10
-                ADTypes.AutoForwardDiff()
-            else
-                adtype_to_use
-            end
-
-            push!(sampler_assignments, params => NUTS(adaptation_steps, target_acceptance; adtype=block_adtype))
-            @info "Using NUTS for remaining continuous parameters: $(DynamicPPL.getsym.(params)) using AD: $(typeof(block_adtype))"
-        end
-    end
-
-    # --- Stage 4: Construct and return the final composite sampler ---
-    if isempty(sampler_assignments)
-        @warn "Could not identify any parameters to sample. Defaulting to a single NUTS sampler for all parameters."
-        return NUTS(adaptation_steps, target_acceptance; adtype=adtype_to_use)
-    elseif length(sampler_assignments) == 1
-        return sampler_assignments[1][2]
-    else
-        return Gibbs(sampler_assignments...)
-    end
-end
-
+ 
 
 """
     create_fixed_design(formula_rhs::AbstractString, data::DataFrame, calling_module::Module; contrasts=Dict{Symbol, Any}())
@@ -4474,16 +4081,12 @@ function model_pseudocode(m::DynamicPPL.Model)
 end
 
 
-
 """
     bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; ...)
 
-Generates a B-spline basis matrix with GPU support. This version infers the
-array type from the input vector `x` and allocates the basis matrix `B` on the
-corresponding device.
+Generates a B-spline basis matrix. This version is CPU-only.
 """
 function bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; knot_method::Symbol=:quantile, custom_knots::Union{AbstractVector, Nothing}=nothing)
-    ArrayType = parent(x) isa GPUArrays.AbstractGPUArray ? typeof(parent(x)) : Array
     p = degree
     if n_basis <= p
         error("Number of basis functions (nbins) must be greater than the spline degree. Got n_basis=$n_basis, degree=$p.")
@@ -4519,7 +4122,7 @@ function bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; knot_m
     
     N = length(x)
     num_total_basis = length(t) - p - 1
-    B = ArrayType{Float64}(undef, N, num_total_basis); fill!(B, 0.0)
+    B = Matrix{Float64}(undef, N, num_total_basis); fill!(B, 0.0)
 
     for j in 1:num_total_basis
         B[:, j] = (t[j] .<= x .< t[j+1])
@@ -4530,13 +4133,13 @@ function bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; knot_m
 
     for d in 1:p
         for j in 1:(num_total_basis - d)
-            w1 = ArrayType{Float64}(undef, N); fill!(w1, 0.0)
+            w1 = Vector{Float64}(undef, N); fill!(w1, 0.0)
             denom1 = t[j+d] - t[j]
             if denom1 > 1e-9
                 w1 = (x .- t[j]) ./ denom1
             end
             
-            w2 = ArrayType{Float64}(undef, N); fill!(w2, 0.0)
+            w2 = Vector{Float64}(undef, N); fill!(w2, 0.0)
             denom2 = t[j+d+1] - t[j+1]
             if denom2 > 1e-9
                 w2 = (t[j+d+1] .- x) ./ denom2
@@ -4550,12 +4153,11 @@ function bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; knot_m
 end
 
 
+
 """
     bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, degrees_per_dim::Vector{Int}; ...)
 
-Generates a tensor product B-spline basis matrix with GPU support. It infers the
-device from the input `coords` and ensures all intermediate and final matrices
-are allocated correctly.
+Generates a tensor product B-spline basis matrix. This version is CPU-only.
 """
 function bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, degrees_per_dim::Vector{Int}; knot_method::Symbol=:quantile, kwargs...)
     n_dims = size(coords, 2)
@@ -4586,8 +4188,7 @@ function bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector
     end
 
     if isempty(basis_matrices_1D)
-        ArrayType = parent(coords) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords)) : Array
-        return ArrayType{Float64}(undef, size(coords, 1), 0)
+        return Matrix{Float64}(undef, size(coords, 1), 0)
     end
 
     B_final = basis_matrices_1D[1]
@@ -4609,18 +4210,17 @@ function bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector
 end
 
 
+
 """
     bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol, lengthscale::Float64)
 
-Generates a 1D wavelet basis matrix with GPU support. It infers the array type
-from the input `vals` and allocates the basis matrix `B` on the correct device.
+Generates a 1D wavelet basis matrix. This version is CPU-only.
 """
 function bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol, lengthscale::Float64)
-    ArrayType = parent(vals) isa GPUArrays.AbstractGPUArray ? typeof(parent(vals)) : Array
     Interpolations = Base.require(Base.Main, :Interpolations)
 
     n_obs = length(vals)
-    B = ArrayType{Float64}(undef, n_obs, nbins); fill!(B, 0.0)
+    B = Matrix{Float64}(undef, n_obs, nbins); fill!(B, 0.0)
     v_min, v_max = minimum(vals), maximum(vals)
     v_range = v_max - v_min
     if v_range < 1e-9; v_range = 1.0; end
@@ -4663,7 +4263,7 @@ function bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol,
         if n_translations <= 0; continue; end
 
         probs = n_translations == 1 ? [0.5] : range(0, 1, length=n_translations)
-        centers = quantile(Array(vals), probs) # Quantile on CPU
+        centers = quantile(vals, probs)
         
         for k in 1:n_translations
             if current_bin > nbins; break; end
@@ -4675,6 +4275,7 @@ function bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol,
     end
     return B
 end
+
 
 
 
@@ -4836,8 +4437,7 @@ end
 """
     bstm_smooth_basis_1D(type::String, vals::AbstractVector, nbins::Int, degree::Int; ...)
 
-Generates a 1D basis matrix with GPU support. It handles RFF and FFT basis
-generation on the appropriate device by inferring the array type from the input `vals`.
+Generates a 1D basis matrix. This version is CPU-only.
 """
 function bstm_smooth_basis_1D(
     type::String, 
@@ -4849,7 +4449,6 @@ function bstm_smooth_basis_1D(
     custom_knots::Union{AbstractVector, Nothing} = nothing, 
     kwargs...
 )
-    ArrayType = parent(vals) isa GPUArrays.AbstractGPUArray ? typeof(parent(vals)) : Array
     n_obs = length(vals)
     
     v_min = minimum(vals)
@@ -4862,14 +4461,14 @@ function bstm_smooth_basis_1D(
     elseif knot_method == :range || use_regular_grid
         collect(range(v_min, stop=v_max, length=nbins))
     else
-        quantile(Array(vals), range(0, 1, length=nbins)) # Quantile on CPU
+        quantile(vals, range(0, 1, length=nbins))
     end
 
     if type in ["pspline", "bspline"]
         return bstm_bspline_basis(vals, nbins, degree; knot_method=knot_method, custom_knots=custom_knots)
     end
 
-    B_out = ArrayType{Float64}(undef, n_obs, nbins); fill!(B_out, 0.0)
+    B_out = Matrix{Float64}(undef, n_obs, nbins); fill!(B_out, 0.0)
     actual_nbins_generated = nbins
 
     if type in ["smooth", "barycentric", "linear"]
@@ -4887,10 +4486,8 @@ function bstm_smooth_basis_1D(
         end
     elseif type == "rff"
         ls = get(kwargs, :lengthscale, v_std)
-        Omega_cpu = randn(1, nbins) ./ ls
-        Phi_phases_cpu = rand(nbins) .* (2.0 * pi)
-        Omega = ArrayType(Omega_cpu)
-        Phi_phases = ArrayType(Phi_phases_cpu)
+        Omega = randn(1, nbins) ./ ls
+        Phi_phases = rand(nbins) .* (2.0 * pi)
         B_out .= sqrt(2.0 / nbins) .* cos.((vals * Omega) .+ Phi_phases')
     elseif type == "fft"
         ls = get(kwargs, :lengthscale, v_std)
@@ -4919,7 +4516,7 @@ function bstm_smooth_basis_1D(
             B_out[mask, m] .= 1.0 .- 1.5 .* h[mask] .+ 0.5 .* h[mask].^3
         end
     else
-        B_out = ArrayType{Float64}(undef, n_obs, 1); fill!(B_out, 1.0)
+        B_out = ones(Float64, n_obs, 1)
         actual_nbins_generated = 1
     end
 
@@ -4930,8 +4527,7 @@ end
 """
     bstm_smooth_basis_2D(type::String, coords::AbstractMatrix, nbins::Union{Int, Vector{Int}}; ...)
 
-Generates a 2D basis matrix with GPU support. It infers the array type from the
-input `coords` and ensures all internal arrays are allocated on the correct device.
+Generates a 2D basis matrix. This version is CPU-only.
 """
 function bstm_smooth_basis_2D(
     type::String, 
@@ -4942,7 +4538,6 @@ function bstm_smooth_basis_2D(
     custom_knots::Union{Tuple{AbstractVector, AbstractVector}, Nothing} = nothing, 
     kwargs...
 )
-    ArrayType = parent(coords) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords)) : Array
     n_obs = size(coords, 1)
     
     n_marginal_x, n_marginal_y = if nbins isa Int
@@ -4963,18 +4558,17 @@ function bstm_smooth_basis_2D(
 
     use_regular_grid = type in ["invdist", "kriging", "tps", "spherical"]
 
-    coords_cpu = Array(coords)
     kx, ky = if knot_method == :custom && !isnothing(custom_knots)
         custom_knots
     elseif knot_method == :quantile && !use_regular_grid
-        (quantile(coords_cpu[:, 1], range(0, 1, length=n_marginal_x)),
-         quantile(coords_cpu[:, 2], range(0, 1, length=n_marginal_y)))
+        (quantile(coords[:, 1], range(0, 1, length=n_marginal_x)),
+         quantile(coords[:, 2], range(0, 1, length=n_marginal_y)))
     else
         (collect(range(c_min[1], stop=c_max[1], length=n_marginal_x)),
          collect(range(c_min[2], stop=c_max[2], length=n_marginal_y)))
     end
     
-    B = ArrayType{Float64}(undef, n_obs, total_bins); fill!(B, 0.0)
+    B = Matrix{Float64}(undef, n_obs, total_bins); fill!(B, 0.0)
 
     if type == "barycentric"
         knot_points = [Point2D(kx[i], ky[j]) for j in 1:n_marginal_y for i in 1:n_marginal_x]
@@ -5006,16 +4600,14 @@ function bstm_smooth_basis_2D(
             B[:, m] .= (r.^2) .* log.(r .+ 1e-9)
         end
     elseif type == "rff" || type == "anisotropic"
-        Omega_cpu = randn(2, total_bins)
-        Omega_cpu[1, :] ./= ls_x
-        Omega_cpu[2, :] ./= ls_y
-        Phi_phases_cpu = rand(total_bins) .* (2.0 * pi)
-        Omega = ArrayType(Omega_cpu)
-        Phi_phases = ArrayType(Phi_phases_cpu)
+        Omega = randn(2, total_bins)
+        Omega[1, :] ./= ls_x
+        Omega[2, :] ./= ls_y
+        Phi_phases = rand(total_bins) .* (2.0 * pi)
         B .= sqrt(2.0 / total_bins) .* cos.((coords * Omega) .+ Phi_phases')
     else
         @warn "Basis type '$type' not recognized for 2D smooth. Returning an empty basis matrix."
-        return ArrayType{Float64}(undef, n_obs, 0)
+        return Matrix{Float64}(undef, n_obs, 0)
     end
 
     return B[:, 1:min(total_bins, size(B, 2))]
@@ -5025,8 +4617,7 @@ end
 """
     bstm_smooth_basis_3D(type::String, coords::AbstractMatrix, nbins::Union{Int, Vector{Int}}; ...)
 
-Generates a 3D basis matrix with GPU support, inferring the device from the input
-`coords` and allocating arrays accordingly.
+Generates a 3D basis matrix. This version is CPU-only.
 """
 function bstm_smooth_basis_3D(
     type::String, 
@@ -5037,7 +4628,6 @@ function bstm_smooth_basis_3D(
     custom_knots::Union{Tuple{AbstractVector, AbstractVector, AbstractVector}, Nothing} = nothing, 
     kwargs...
 )
-    ArrayType = parent(coords) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords)) : Array
     n_obs = size(coords, 1)
 
     n_marginal_x, n_marginal_y, n_marginal_z = if nbins isa Int
@@ -5057,20 +4647,19 @@ function bstm_smooth_basis_3D(
     ls_y = get(kwargs, :ls_y, c_std[2])
     ls_z = get(kwargs, :ls_z, c_std[3])
 
-    coords_cpu = Array(coords)
     kx, ky, kz = if knot_method == :custom && !isnothing(custom_knots)
         custom_knots
     elseif knot_method == :quantile
-        (quantile(coords_cpu[:, 1], range(0, 1, length=n_marginal_x)),
-         quantile(coords_cpu[:, 2], range(0, 1, length=n_marginal_y)),
-         quantile(coords_cpu[:, 3], range(0, 1, length=n_marginal_z)))
+        (quantile(coords[:, 1], range(0, 1, length=n_marginal_x)),
+         quantile(coords[:, 2], range(0, 1, length=n_marginal_y)),
+         quantile(coords[:, 3], range(0, 1, length=n_marginal_z)))
     else
         (collect(range(c_min[1], stop=c_max[1], length=n_marginal_x)),
          collect(range(c_min[2], stop=c_max[2], length=n_marginal_y)),
          collect(range(c_min[3], stop=c_max[3], length=n_marginal_z)))
     end
 
-    B = ArrayType{Float64}(undef, n_obs, total_bins); fill!(B, 0.0)
+    B = Matrix{Float64}(undef, n_obs, total_bins); fill!(B, 0.0)
 
     if type in ["pspline", "bspline"]
         degree_val = get(kwargs, :degree, 3)
@@ -5094,14 +4683,12 @@ function bstm_smooth_basis_3D(
             idx += 1
         end
     elseif type == "rff"
-        Omega_cpu = randn(3, total_bins)
-        Omega_cpu[1, :] ./= ls_x; Omega_cpu[2, :] ./= ls_y; Omega_cpu[3, :] ./= ls_z
-        Phi_phases_cpu = rand(total_bins) .* (2.0 * pi)
-        Omega = ArrayType(Omega_cpu)
-        Phi_phases = ArrayType(Phi_phases_cpu)
+        Omega = randn(3, total_bins)
+        Omega[1, :] ./= ls_x; Omega[2, :] ./= ls_y; Omega[3, :] ./= ls_z
+        Phi_phases = rand(total_bins) .* (2.0 * pi)
         B .= sqrt(2.0 / total_bins) .* cos.((coords * Omega) .+ Phi_phases')
     else
-        B = ArrayType{Float64}(undef, n_obs, total_bins); fill!(B, 1.0)
+        B = ones(Float64, n_obs, total_bins)
     end
 
     return B[:, 1:min(total_bins, size(B, 2))]
@@ -5111,8 +4698,7 @@ end
 """
     bstm_smooth_basis_4D(type::String, coords::AbstractMatrix, nbins::Union{Int, Vector{Int}}; ...)
 
-Generates a 4D basis matrix with GPU support, inferring the device from the input
-`coords` and allocating arrays accordingly.
+Generates a 4D basis matrix. This version is CPU-only.
 """
 function bstm_smooth_basis_4D(
     type::String, 
@@ -5123,7 +4709,6 @@ function bstm_smooth_basis_4D(
     custom_knots::Union{Tuple{AbstractVector, AbstractVector, AbstractVector, AbstractVector}, Nothing} = nothing, 
     kwargs...
 )
-    ArrayType = parent(coords) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords)) : Array
     n_obs = size(coords, 1)
 
     n_marginal_1, n_marginal_2, n_marginal_3, n_marginal_4 = if nbins isa Int
@@ -5144,14 +4729,13 @@ function bstm_smooth_basis_4D(
     ls_3 = get(kwargs, :ls_3, c_std[3])
     ls_4 = get(kwargs, :ls_4, c_std[4])
 
-    coords_cpu = Array(coords)
     k1, k2, k3, k4 = if knot_method == :custom && !isnothing(custom_knots)
         custom_knots
     elseif knot_method == :quantile
-        (quantile(coords_cpu[:, 1], range(0, 1, length=n_marginal_1)),
-         quantile(coords_cpu[:, 2], range(0, 1, length=n_marginal_2)),
-         quantile(coords_cpu[:, 3], range(0, 1, length=n_marginal_3)),
-         quantile(coords_cpu[:, 4], range(0, 1, length=n_marginal_4)))
+        (quantile(coords[:, 1], range(0, 1, length=n_marginal_1)),
+         quantile(coords[:, 2], range(0, 1, length=n_marginal_2)),
+         quantile(coords[:, 3], range(0, 1, length=n_marginal_3)),
+         quantile(coords[:, 4], range(0, 1, length=n_marginal_4)))
     else
         (collect(range(c_min[1], stop=c_max[1], length=n_marginal_1)),
          collect(range(c_min[2], stop=c_max[2], length=n_marginal_2)),
@@ -5159,7 +4743,7 @@ function bstm_smooth_basis_4D(
          collect(range(c_min[4], stop=c_max[4], length=n_marginal_4)))
     end
 
-    B = ArrayType{Float64}(undef, n_obs, total_bins); fill!(B, 0.0)
+    B = Matrix{Float64}(undef, n_obs, total_bins); fill!(B, 0.0)
 
     if type in ["pspline", "bspline"]
         degree_val = get(kwargs, :degree, 3)
@@ -5185,14 +4769,12 @@ function bstm_smooth_basis_4D(
             idx += 1
         end
     elseif type == "rff"
-        Omega_cpu = randn(4, total_bins)
-        Omega_cpu[1, :] ./= ls_1; Omega_cpu[2, :] ./= ls_2; Omega_cpu[3, :] ./= ls_3; Omega_cpu[4, :] ./= ls_4
-        Phi_phases_cpu = rand(total_bins) .* (2.0 * pi)
-        Omega = ArrayType(Omega_cpu)
-        Phi_phases = ArrayType(Phi_phases_cpu)
+        Omega = randn(4, total_bins)
+        Omega[1, :] ./= ls_1; Omega[2, :] ./= ls_2; Omega[3, :] ./= ls_3; Omega[4, :] ./= ls_4
+        Phi_phases = rand(total_bins) .* (2.0 * pi)
         B .= sqrt(2.0 / total_bins) .* cos.((coords * Omega) .+ Phi_phases')
     else
-        B = ArrayType{Float64}(undef, n_obs, total_bins); fill!(B, 1.0)
+        B = ones(Float64, n_obs, total_bins)
     end
 
     return B[:, 1:min(total_bins, size(B, 2))]
@@ -5244,21 +4826,18 @@ been expanded to include mathematical formulations for clarity.
 # Returns
 - A dense `N x N` covariance matrix.
  
-Computes the covariance kernel matrix for a given set of coordinates, with GPU support.
-This version replaces `Distances.pairwise` with broadcasting for GPU compatibility.
+Computes the covariance kernel matrix for a given set of coordinates 
 """
 function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol, noise::Real; wavelet_levels=3)
     T = promote_type(eltype(coords), typeof(param_val), eltype(ls), typeof(noise))
     coords_T = convert(AbstractMatrix{T}, coords)
     ls_T = convert(typeof(ls) <: Real ? T : AbstractVector{T}, ls)
     N = size(coords_T, 1)
-    ArrayType = parent(coords_T) isa GPUArrays.AbstractGPUArray ? typeof(parent(coords_T)) : Array
 
     if kernel_type == :linear
         return param_val^2 .* (coords_T * coords_T') .+ (noise * I)
     end
 
-    # GPU-compatible pairwise squared Euclidean distance calculation using broadcasting
     function _sqeuclidean_broadcast(X::AbstractMatrix)
         sum(X.^2, dims=2) .- 2 * (X * X') .+ sum(X.^2, dims=2)'
     end
@@ -5273,7 +4852,6 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
         dist_sq = _sqeuclidean_broadcast(coords_T) ./ ls_T^2
     end
     
-    # Ensure diagonal is non-negative
     dist_sq[diagind(dist_sq)] .= max.(0, diag(dist_sq))
 
     if kernel_type == :gaussian || kernel_type == :se || kernel_type == :rbf
@@ -5295,7 +4873,7 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
 
     elseif kernel_type == :spherical
         d = sqrt.(dist_sq)
-        K = ArrayType(zeros(T, size(d)))
+        K = zeros(T, size(d))
         mask = d .< one(T)
         K[mask] = param_val^2 .* (one(T) .- 1.5 .* d[mask] .+ 0.5 .* d[mask].^3)
         return K .+ (noise * I)
@@ -5316,7 +4894,7 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
         if ls isa AbstractVector
             @warn "Wavelet kernel with ARD lengthscale is not standard. Using the first lengthscale for decay."
         end
-        K_accum = ArrayType(zeros(T, size(dist_sq)))
+        K_accum = zeros(T, size(dist_sq))
         for wv_scale in 1:wavelet_levels
             ls_scale_sq = (ls isa Real ? ls_T^2 : one(T)) / (convert(T, 4.0)^(wv_scale-1))
             weight_scale = param_val^2 * exp(convert(T, -wv_scale) / local_ls)
@@ -5332,16 +4910,16 @@ end
 
 
 
+
 """
     recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_val::Real; ...)
 
 Constructs a final precision matrix from a template and sampled hyperparameters.
-This version removes `Matrix()` conversions to ensure GPU compatibility.
+This version is CPU-only.
 """
 function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_val::Real; extra_param=nothing, noise=1e-4, kwargs...)
     n_s = size(template_s, 1)
     T_num = promote_type(typeof(param_val), typeof(noise), eltype(template_s), typeof(extra_param))
-    ArrayType = parent(template_s) isa GPUArrays.AbstractGPUArray ? typeof(parent(template_s)) : Array
 
     if m_type == :SPDE
         kappa = isnothing(extra_param) ? one(T_num) : extra_param
@@ -5349,14 +4927,14 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
             kappa^2 * I
         else
             if length(kappa) != n_s; error("Anisotropic kappa vector length must match number of spatial units."); end
-            Diagonal(ArrayType(kappa.^2))
+            Diagonal(kappa.^2)
         end
         L_spde = Q_kappa + template_s
         return Symmetric(L_spde' * L_spde)
     end
 
     if m_type == :None || m_type == :FIXED
-        return Symmetric(ArrayType(sparse(I, n_s, n_s)))
+        return Symmetric(sparse(I, n_s, n_s))
     end
 
     if m_type == :Besag || m_type == :ICAR || m_type == :Cyclic
@@ -5365,20 +4943,17 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
 
     if m_type == :AR1
         rho = isnothing(extra_param) ? zero(T_num) : extra_param
-        # Use UniformScaling for GPU compatibility
         Q = (one(T_num) + rho^2) * I + rho .* template_s
-        # Adjust boundaries on the CPU then move back if necessary
-        Q_cpu = Array(Q)
         if n_s > 0
-            Q_cpu[1, 1] = one(T_num)
-            Q_cpu[n_s, n_s] = one(T_num)
+            Q[1, 1] = one(T_num)
+            Q[n_s, n_s] = one(T_num)
         end
-        return Symmetric(ArrayType(Q_cpu))
+        return Symmetric(Q)
     end
 
     if m_type == :Leroux || m_type == :LocalAdaptive
         lambda_val = isnothing(extra_param) ? convert(T_num, 0.5) : extra_param
-        I_prom = I # Use UniformScaling for AD and GPU safety
+        I_prom = I
         return Symmetric(lambda_val .* template_s + (one(T_num) - lambda_val) .* I_prom)
     end
 
@@ -5392,7 +4967,7 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
         elseif flow_direction == :downstream
             I - rho_net .* W_net
         else
-            W_symm = (W_net + W_net') ./ 2 # Ensure symmetry
+            W_symm = (W_net + W_net') ./ 2
             I - rho_net .* W_symm
         end
         return Symmetric(L_op' * L_op)
@@ -5416,6 +4991,8 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
 
     return Symmetric(template_s)
 end
+
+
 
 
 
@@ -5516,40 +5093,383 @@ function _distribution_to_string(d::Distribution)
 end
 
 
-  
 """
-    bstm_sample(model, sampler, n_samples; kwargs...)
+    get_optimal_sampler(model_obj::DynamicPPL.Model; ...)
 
-A wrapper around `Turing.sample` that suppresses world-age warnings by temporarily
-redirecting `stderr` to `devnull`.
+Constructs an efficient composite MCMC sampler for a `bstm` model by assigning
+specialized samplers to different parameter blocks.
+
+# Version
+v1.4.8 (2026-08-20)
 
 # Rationale
-Dynamically generated models from `@bstm` can trigger non-fatal world-age warnings
-when interacting with pre-compiled library functions inside Turing.jl. This wrapper
-provides a clean way to run the sampler without printing these warnings to the console.
+This function is a core utility for the `bstm` inference engine. It replaces a
+simple, one-size-fits-all sampler selection with a sophisticated, multi-stage
+process that builds a composite `Gibbs` sampler tailored to the model's structure.
+
+This version corrects a `MethodError` that occurred when indexing the `vi.values`
+`VarNamedTuple` and addresses warnings about the use of non-public `DynamicPPL`
+functions. The `MethodError` was resolved by using the `VarName` object `vn`
+directly for indexing (i.e., `vi.values[vn]`). The warnings are resolved by:
+1.  Replacing the internal `DynamicPPL.keys(vi)` with the public API `keys(vi)`.
+2.  Replacing the internal `DynamicPPL.getsym(vn)` with the public field accessor `vn.name`.
+These changes ensure the function is robust, idiomatic, and aligned with the current
+`DynamicPPL` API.
+
+# Workflow
+The function constructs the sampler in a series of stages, with each stage having
+higher precedence than the next:
+1.  **User-Specified Sampler**: If a complete sampler is passed via `sampler_choice`,
+    it is used directly, overriding all other logic.
+2.  **Automatic AD Engine Selection**: If the user has not specified a non-default
+    `adtype`, the function inspects the model's size. For large models (default > 100
+    parameters), it automatically switches the primary AD engine to a more performant
+    one like `ADTypes.AutoEnzyme()`.
+3.  **Manual Sampler Map**: The user can provide a `sampler_map` to assign specific
+    samplers to specific parameter groups.
+4.  **Component Grouping**: If `group_components=true`, the function identifies all
+    parameters belonging to the same model component and assigns them to a joint `NUTS` sampler.
+5.  **Default Categorization**: Any remaining parameters are categorized by their support,
+    inferred from their value type and transform strategy:
+    - **Discrete**: Inferred if the parameter's value is an `Integer`. Assigned to `PG`.
+    - **Bounded Continuous**: Inferred if the parameter's transform is `Exp` or `Logistic`. Assigned to `Slice`.
+    - **Unbounded Continuous**: All other continuous parameters. Assigned to `NUTS`.
+
+# Arguments
+- `model_obj::DynamicPPL.Model`: The instantiated Turing model.
+- `sampler_choice`: A specific sampler instance to use, or `:auto` for automatic selection.
+- `sampler_map`: A `Dict` mapping parameter `Symbol`s to specific samplers.
+- `adtype`: The automatic differentiation backend to use for gradient-based samplers.
+- `target_acceptance`: The target acceptance rate for HMC-based samplers.
+- `adaptation_steps`: The number of adaptation steps for HMC-based samplers.
+- `group_components`: A `Bool` indicating whether to group component parameters for joint sampling.
+- `n_particles`: The number of particles for the `PG` sampler.
+- `n_chains::Int`: The number of chains to be run. Default: `1`.
+
+# Returns
+- An `AbstractMCMC.AbstractSampler` object.
+"""
+function get_optimal_sampler(
+    model_obj::DynamicPPL.Model;
+    sampler_choice::Union{Symbol, AbstractMCMC.AbstractSampler}=:auto,
+    sampler_map::Dict{Symbol, <:AbstractMCMC.AbstractSampler}=Dict{Symbol, AbstractMCMC.AbstractSampler}(),
+    adtype::ADTypes.AbstractADType=ADTypes.AutoForwardDiff(),
+    group_components::Bool=true,
+    adaptation_steps::Int=500,
+    target_acceptance::Float64=0.8,
+    n_particles::Int=20,
+    n_chains::Int=1
+)
+    if sampler_choice isa AbstractMCMC.AbstractSampler
+        return sampler_choice
+    end
+
+    # Instantiate and populate the VarInfo object to get variable names and types.
+    vi = DynamicPPL.VarInfo(model_obj)
+    vns = keys(vi)
+    num_params = length(vns)
+
+    # --- AD Engine Selection ---
+    adtype_to_use = adtype
+    param_threshold = 100
+    if adtype isa ADTypes.AutoForwardDiff && num_params > param_threshold
+        adtype_to_use = ADTypes.AutoEnzyme()
+    end
+
+    sampler_assignments = []
+    all_processed_vns = Set{VarName}()
+
+    # --- Stage 1: Handle user-provided sampler map (highest precedence) ---
+    for (param_sym, sampler) in sampler_map
+        sym_vns = filter(vn -> vn.optic == param_sym, vns)
+        if !isempty(sym_vns)
+            push!(sampler_assignments, Tuple(sym_vns) => sampler)
+            union!(all_processed_vns, sym_vns)
+        else
+            @warn "Parameter :$(param_sym) in sampler_map not found in model."
+        end
+    end
+
+    # --- Stage 2: Group parameters by model component if enabled ---
+    if group_components
+        component_keys = string.([spec.key for spec in model_obj.args.M.components])
+        sort!(component_keys, by=length, rev=true)
+
+        component_groups = Dict{String, Set{VarName}}()
+        vns_to_check = filter(vn -> !(vn in all_processed_vns), vns)
+
+        for vn in vns_to_check
+            if !(eltype(vi.values[vn]) <: Integer)
+                vn_str = string(vn.optic)
+                found_key = nothing
+                for key in component_keys
+                    if occursin(Regex("_$(key)(_\\d+)?\$"), vn_str) || startswith(vn_str, "$(key)_")
+                        found_key = key
+                        break
+                    end
+                end
+                
+                if !isnothing(found_key)
+                    if !haskey(component_groups, found_key)
+                        component_groups[found_key] = Set{VarName}()
+                    end
+                    push!(component_groups[found_key], vn)
+                end
+            end
+        end
+
+        for (key, params_vns) in component_groups
+            params_to_process = setdiff(params_vns, all_processed_vns)
+            if isempty(params_to_process); continue; end
+
+            sampler = NUTS(adaptation_steps, target_acceptance; adtype=adtype_to_use)
+            push!(sampler_assignments, Tuple(params_to_process) => sampler)
+            union!(all_processed_vns, params_to_process)
+        end
+    end
+
+    # --- Stage 3: Assign samplers to remaining parameters based on their support ---
+    remaining_vns = filter(vn -> !(vn in all_processed_vns), vns)
+    if !isempty(remaining_vns)
+
+        param_groups = Dict(
+            :discrete => Set{VarName}(), 
+            :bounded => Set{VarName}(), 
+            :other_continuous => Set{VarName}()
+        )
+
+        for vn in remaining_vns
+            try
+                if eltype(vi.values[vn]) <: Integer
+                    push!(param_groups[:discrete], vn)
+                    continue
+                end
+
+                if haskey(vi.transform_strategy, vn)
+                    transform = vi.transform_strategy[vn]
+                    if transform isa Bijectors.Exp || transform isa Bijectors.Logistic
+                        push!(param_groups[:bounded], vn)
+                    else 
+                        push!(param_groups[:other_continuous], vn)
+                    end
+                else
+                    push!(param_groups[:other_continuous], vn)
+                end
+            catch e
+                @warn "Could not categorize parameter $(vn). Defaulting to NUTS. Error: $e"
+                push!(param_groups[:other_continuous], vn)
+            end
+        end
+
+        if !isempty(param_groups[:discrete])
+            params = Tuple(param_groups[:discrete])
+            push!(sampler_assignments, params => PG(n_particles))
+        end
+
+        if !isempty(param_groups[:bounded])
+            params = Tuple(param_groups[:bounded])
+            push!(sampler_assignments, params => Slice())
+        end
+
+        if !isempty(param_groups[:other_continuous])
+            params = Tuple(param_groups[:other_continuous])
+            
+            block_adtype = if length(params) <= 10
+                ADTypes.AutoForwardDiff()
+            else
+                adtype_to_use
+            end
+
+            push!(sampler_assignments, 
+                params => NUTS(adaptation_steps, target_acceptance; adtype=block_adtype)
+            )
+        end
+    end
+
+    # --- Stage 4: Construct and return the final composite sampler ---
+    if isempty(sampler_assignments)
+        @warn "Could not identify any parameters to sample. Defaulting to a single NUTS sampler for all parameters."
+        return NUTS(adaptation_steps, target_acceptance; adtype=adtype_to_use)
+    elseif length(sampler_assignments) == 1
+        return sampler_assignments[1][2]
+    else
+        return Gibbs(sampler_assignments...)
+    end
+end
+
+
+
+
+function _extract_flexichain_param_samples(chain, param_name::String)
+    param_sym = Symbol(param_name)
+    base_param_sym = Symbol(first(Base.split(param_name, '[')))
+ 
+    chain_keys = names(DataFrame(chain))
+
+    if !(base_param_sym in chain_keys)
+        error("Parameter ':$param_sym' or base ':$base_param_sym' not found in the MCMC chain.")
+    end
+
+    param_data_array = Array(chain[base_param_sym])
+
+    num_iterations = size(param_data_array, 1)
+    num_chains = size(param_data_array, ndims(param_data_array))
+    total_samples = num_iterations * num_chains
+
+    if num_chains == 1 && ndims(param_data_array) > 1 && size(param_data_array, 2) > 1 && ndims(param_data_array) < 3
+        return param_data_array
+    end
+
+    perm_dims = (1, ndims(param_data_array), 2:(ndims(param_data_array)-1)...)
+    permuted_data = permutedims(param_data_array, perm_dims)
+
+    param_dims = size(permuted_data)[3:end]
+    
+    if isempty(param_dims) # Scalar parameter
+        return reshape(permuted_data, total_samples, 1)
+    else
+        if prod(param_dims) == 1 && length(param_dims) > 0 # Handle vector of length 1
+            return reshape(permuted_data, total_samples, 1)
+        else
+            return reshape(permuted_data, total_samples, prod(param_dims))
+        end
+    end
+end
+
+ 
+# get_params_vector is for scalar parameters (expected_len = 1)
+function get_params_vector(chain, param_name::String, expected_len::Int)
+    if expected_len != 1
+        error("get_params_vector is intended for scalar parameters (expected_len=1). Use get_params_matrix for vector parameters.")
+    end
+    samples = _extract_flexichain_param_samples(chain, param_name)
+    return samples # Should be (total_samples, 1)
+end
+
+# get_params_matrix is for vector parameters (expected_len > 1)
+function get_params_matrix(chain, param_name::String, expected_len::Int)
+    if expected_len == 1
+        error("get_params_matrix is intended for vector parameters (expected_len > 1). Use get_params_vector for scalar parameters.")
+    end
+    samples = _extract_flexichain_param_samples(chain, param_name)
+    # Check if the extracted samples have the correct expected_len
+    if size(samples, 2) != expected_len
+        error("Parameter '$param_name' has dimension $(size(samples, 2)), but expected $expected_len.")
+    end
+    return samples # Should be (total_samples, expected_len)
+end
+
+
+
+"""
+    bstm_sample(model::DynamicPPL.Model, n_samples::Int; kwargs...)
+
+A convenience wrapper for `bstm_sample` that automatically selects an optimal sampler
+if one is not provided.
+
+# Rationale
+This method simplifies the user experience by automatically calling `get_optimal_sampler`
+when a specific sampler is not provided. It calculates a default number of adaptation
+steps for HMC-based samplers as 25% of the total number of samples, which is a
+reasonable heuristic for balancing warmup and sampling time.
+
+# Arguments
+- `model`: The Turing model object.
+- `n_samples`: The number of samples to draw per chain.
+- `kwargs...`: Additional keyword arguments passed to `get_optimal_sampler` and `Turing.sample`.
+
+# Returns
+- The MCMC chain object returned by `Turing.sample`.
+"""
+function bstm_sample(model::DynamicPPL.Model, n_samples::Int; kwargs...)
+    # Separate kwargs for get_optimal_sampler and the main sample call.
+    sampler_kwargs = Dict{Symbol, Any}()
+    sample_kwargs = Dict{Symbol, Any}()
+
+    # List of keywords known to get_optimal_sampler
+    known_sampler_keys = [
+        :sampler_choice, :sampler_map, :adtype, :group_components,
+        :adaptation_steps, :target_acceptance, :n_particles, :n_chains
+    ]
+
+    for (key, value) in kwargs
+        if key in known_sampler_keys
+            sampler_kwargs[key] = value
+        else
+            sample_kwargs[key] = value
+        end
+    end
+
+    # Set default adaptation_steps if not provided by the user.
+    if !haskey(sampler_kwargs, :adaptation_steps)
+        adaptation_steps = floor(Int, n_samples * 0.25)
+        sampler_kwargs[:adaptation_steps] = adaptation_steps
+        @info "Automatically setting `adaptation_steps` to $(adaptation_steps) (25% of `n_samples`)."
+    end
+
+    @info "Sampler not provided. Automatically selecting an optimal sampler..."
+    sampler = get_optimal_sampler(model; sampler_kwargs...)
+    
+    # The `n_chains` kwarg, if present, will be in sample_kwargs or its default will be used.
+    return bstm_sample(model, sampler, n_samples; sample_kwargs...)
+end
+ 
+"""
+    bstm_sample(model, sampler, n_samples; n_chains=1, kwargs...)
+
+A wrapper around `Turing.sample` that defaults to the `MCMCThreads` backend for
+both single and multi-chain sampling, ensuring consistent output dimensionality.
+
+# Rationale
+Dynamically generated models from `@bstm` can trigger non-fatal world-age warnings,
+which this wrapper suppresses. By defaulting to `MCMCThreads()` for all sampling,
+it ensures that the returned chain object is always a 3-dimensional array of
+`[iterations, parameters, chains]`, even for `n_chains=1`. This prevents
+`DimensionMismatch` errors in downstream post-processing functions.
 
 # Arguments
 - `model`: The Turing model object.
 - `sampler`: The MCMC sampler to use.
-- `n_samples`: The number of samples to draw.
+- `n_samples`: The number of samples to draw per chain.
+- `n_chains::Int`: The number of MCMC chains to run. Default: `1`.
 - `kwargs...`: Additional keyword arguments passed directly to `Turing.sample`.
 
 # Returns
-- The MCMC chain object returned by `Turing.sample`.
-
-# Example
-```julia
-m = @bstm(likelihood(y) ~ 1, data)
-chn = bstm_sample(m, NUTS(), 1000)
-```
+- A 3-dimensional MCMC chain object.
 """
-function bstm_sample(model, sampler, n_samples; kwargs...)
+function bstm_sample(model, sampler, n_samples; n_chains::Int=1, kwargs...)
     local chain
     redirect_stderr(devnull) do
-        chain = sample(model, sampler, n_samples; kwargs...)
+        @info "Running $(n_chains) chain(s) using MCMCThreads() backend."
+        chain = sample(model, sampler, MCMCThreads(), n_samples, n_chains; kwargs...)
     end
     return chain
 end
+
+# Forward single-chain syntax: sample(model, sampler, N; kwargs...) 
+# directly to the multi-chain MCMCThreads() signature.
+function AbstractMCMC.sample(
+    model::AbstractMCMC.AbstractModel,
+    sampler::AbstractMCMC.AbstractSampler,
+    N::Integer;
+    kwargs...
+)
+    # Default to 1 chain run via MCMCThreads() if n_chains isn't specified
+    return AbstractMCMC.sample(model, sampler, MCMCThreads(), N, 1; kwargs...)
+end
+
+# Forward multi-chain syntax without ensemble strategy: sample(model, sampler, N, n_chains; kwargs...)
+function AbstractMCMC.sample(
+    model::AbstractMCMC.AbstractModel,
+    sampler::AbstractMCMC.AbstractSampler,
+    N::Integer,
+    n_chains::Integer;
+    kwargs...
+)
+    return AbstractMCMC.sample(model, sampler, MCMCThreads(), N, n_chains; kwargs...)
+end
+
+
 
 """
     _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
@@ -5650,160 +5570,112 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
 end
 
 
-"""
-    _generate_univariate_likelihood_block(M::NamedTuple)
 
-Generates the likelihood block for a univariate model.
-
-# Rationale for Update
-  fully consistent with the refactored architecture.
-The key change is the removal of an unnecessary `local` keyword from the generated
-code for `extra_params` (e.g., for Student's T or Gamma distributions), which
-improves code clarity and aligns with the project's coding standards. The function
-remains a core part of the code generation pipeline, correctly handling dynamic
-keyword argument construction for the `bstm_Likelihood` constructor.
-
-# Arguments
-- `M`: The main model configuration `NamedTuple`.
-
-# Returns
-- A `String` containing the generated Turing code for the univariate likelihood block.
-"""
 function _generate_univariate_likelihood_block(M::NamedTuple)
     family = string(M.likelihood_specs[1][:family])
-    
-    # Determine which optional parameters are needed for this family
+    family_symbol = QuoteNode(Symbol(family))
+
+    # Determine which kwargs are needed based on the family
     needs_sigma = family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
     needs_rnb = family == "negbin"
     needs_nu = family == "student_t"
     needs_extra = family in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"]
 
-    # Dynamically build the keyword arguments string
     kwargs_parts = String[]
+    extra_param_logic = ""
+
     if needs_sigma; push!(kwargs_parts, "sigma_y=y_sigma"); end
     if needs_rnb; push!(kwargs_parts, "r_nb=r_nb"); end
-    if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=Int(M.trials[i, 1])"); end
-    if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=M.weights[i, 1]"); end
-    if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=M.censor_lower[i, 1]"); end
-    if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=M.censor_upper[i, 1]"); end
+    if get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
+    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle"); end
     
-    if get(M, :user_provided_hurdle, false)
-        push!(kwargs_parts, "hurdle=M.hurdle[i, 1]")
-        push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle")
-    elseif get(M, :use_zi, false)
-        push!(kwargs_parts, "phi_zi=lik_phi_zi")
-    end
-
-    extra_param_logic = ""
     if needs_nu || needs_extra
-        # Define the extra parameter within the model's scope.
         extra_param_logic = if needs_nu; "extra_p = lik_nu_student_t"
         else; "extra_p = lik_extra_params"; end
         push!(kwargs_parts, "extra_params=extra_p")
     end
 
+    if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=M.trials[:, 1]"); end
+    if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=M.weights[:, 1]"); end
+    if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=M.censor_lower[:, 1]"); end
+    if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=M.censor_upper[:, 1]"); end
+    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=M.hurdle[:, 1]"); end
+
     kwargs_str = join(kwargs_parts, ", ")
 
+    block_content = """
+        $(extra_param_logic)
+        d_lik_vec = bstm_Likelihood.($(family_symbol), eta; $(kwargs_str))
+        log_lik_sum = sum(Distributions.logpdf.(d_lik_vec, M.y_obs))
+    """
+    
     return """
-    family = M.likelihood_specs[1][:family]
-    $(extra_param_logic)
-    for i in 1:M.y_N
-        # Construct distribution with the linear predictor `eta[i]`
-        d_lik = bstm_Likelihood(family, eta[i]; $(kwargs_str))
-        
-        # Evaluate logpdf at the corresponding observation `M.y_obs[i]`
-        Turing.@addlogprob! Distributions.logpdf(d_lik, M.y_obs[i])
+    let
+        local log_lik_sum
+        $(block_content)
+        Turing.@addlogprob! log_lik_sum
     end
     """
 end
 
-"""
-    _generate_multivariate_likelihood_block(M::NamedTuple)
 
-Generates the likelihood block for a multivariate model.
-
-# Rationale for Update
-This version corrects and completes the likelihood generation for multivariate models.
-The previous implementation was incomplete, missing support for several likelihood
-modifications like weights, censoring, and hurdles. It also contained a bug where
-`extra_params` (e.g., for Student's T or Gamma distributions) were not correctly
-included in the generated code.
-
-This updated function now:
-1.  **Dynamically Builds All Keyword Arguments**: It iterates through all possible
-    likelihood parameters (`sigma_y`, `r_nb`, `trial`, `weight`, `censor_lower`,
-    `censor_upper`, `hurdle`, `phi_zi`, `extra_params`) and includes them in the
-    `bstm_Likelihood` constructor only if required by the specific likelihood family
-    and enabled in the model configuration.
-2.  **Fixes `extra_params` Bug**: The logic for including `extra_params` has been
-    corrected to ensure it is properly added to the list of keyword arguments before
-    the code string is generated.
-3.  **Improves Readability**: The code generation is refactored to build an array of
-    likelihood blocks, which are then joined, improving clarity over repeated string
-    concatenation.
-4.  **Removes `local` Keyword**: Aligns with the project's coding standards by removing
-    unnecessary `local` variable declarations from the generated code.
-
-This ensures that the generated code is robust, correct, and fully supports the
-feature set of the `bstm` framework.
-"""
 function _generate_multivariate_likelihood_block(M::NamedTuple)
-    # This block handles the case where all outcomes are categories of a single multinomial response.
-    if any(s -> s[:family] == "dirichlet_multinomial", M.likelihood_specs)
+    if any(s -> string(get(s, :family, "")) == "dirichlet_multinomial", M.likelihood_specs)
         return """
-        eta_correlated = eta_latent * L_corr.L
-        family = M.likelihood_specs[1][:family]
-        for i in 1:M.y_N
-            # For each observation, y_obs[i, :] is the vector of counts across categories.
-            # The total number of trials is the sum of counts for that observation.
-            d_lik = bstm_Likelihood(family, eta_correlated[i, :]; trial=Int(sum(M.y_obs[i, :])))
-            Turing.@addlogprob! Distributions.logpdf(d_lik, M.y_obs[i, :])
+        let
+            eta_correlated = eta_latent * L_corr.L
+            family = :dirichlet_multinomial
+            
+            trials_vec = sum.(eachrow(M.y_obs))
+            d_lik_vec = bstm_Likelihood.(family, eachrow(eta_correlated); trial=trials_vec)
+            
+            Turing.@addlogprob! sum(logpdf.(d_lik_vec, eachrow(M.y_obs)))
         end
         """
     end
 
-    # This block handles multiple, independent univariate-style outcomes.
     loop_body_parts = String[]
     for k in 1:M.outcomes_N
         family = string(M.likelihood_specs[k][:family])
+        family_symbol = QuoteNode(Symbol(family))
+
         needs_sigma = family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
         needs_rnb = family == "negbin"
         needs_nu = family == "student_t"
         needs_extra = family in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"]
 
         kwargs_parts = String[]
-        if needs_sigma; push!(kwargs_parts, "sigma_y=y_sigma[$k]"); end
-        if needs_rnb; push!(kwargs_parts, "r_nb=r_nb"); end # Assumes r_nb is a vector if multivariate
-        if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=Int(M.trials[i, $k])"); end
-        if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=M.weights[i, $k]"); end
-        if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=M.censor_lower[i, $k]"); end
-        if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=M.censor_upper[i, $k]"); end
-        
-        if get(M, :user_provided_hurdle, false)
-            push!(kwargs_parts, "hurdle=M.hurdle[i, $k]")
-            push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle")
-        elseif get(M, :use_zi, false)
-            push!(kwargs_parts, "phi_zi=lik_phi_zi")
-        end
-        
         extra_param_logic = ""
+
+        if needs_sigma; push!(kwargs_parts, "sigma_y=y_sigma[$k]"); end
+        if needs_rnb; push!(kwargs_parts, "r_nb=r_nb"); end
+        if get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
+        if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle"); end
+        
         if needs_nu || needs_extra
-             # Define the extra parameter within the let block's scope.
-             extra_param_logic = if needs_nu; "extra_p = lik_nu_student_t"
-             else; "extra_p = lik_extra_params"; end
-             push!(kwargs_parts, "extra_params=extra_p")
+            extra_param_logic = if needs_nu; "extra_p = lik_nu_student_t"
+            else; "extra_p = lik_extra_params"; end
+            push!(kwargs_parts, "extra_params=extra_p")
         end
+
+        if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=M.trials[:, $k]"); end
+        if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=M.weights[:, $k]"); end
+        if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=M.censor_lower[:, $k]"); end
+        if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=M.censor_upper[:, $k]"); end
+        if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=M.hurdle[:, $k]"); end
 
         kwargs_str = join(kwargs_parts, ", ")
 
+        block_content = """
+            $(extra_param_logic)
+            d_lik_vec_k = bstm_Likelihood.($(family_symbol), view(eta_correlated, :, $k); $(kwargs_str))
+            Turing.@addlogprob! sum(Distributions.logpdf.(d_lik_vec_k, view(M.y_obs, :, $k)))
+        """
+
         outcome_block = """
         # Likelihood for outcome $(k)
-        let family_k = M.likelihood_specs[$k][:family]
-            $(extra_param_logic)
-            for i in 1:M.y_N
-                d_lik = bstm_Likelihood(family_k, eta_correlated[i, $k]; $(kwargs_str))
-                Turing.@addlogprob! Distributions.logpdf(d_lik, M.y_obs[i, $k])
-            end
+        let
+            $(block_content)
         end
         """
         push!(loop_body_parts, outcome_block)
@@ -5817,24 +5689,15 @@ function _generate_multivariate_likelihood_block(M::NamedTuple)
     """
 end
 
+
+
+
+
 """
     _generate_ordinal_likelihood_block(M::NamedTuple)
 
-Generates the Turing code block for an ordinal regression likelihood.
-
-# Rationale
-This helper function encapsulates the complex logic required for ordinal models,
-including the reconstruction of ordered cut-points and the handling of both
-proportional and non-proportional effects. It is called by the main likelihood
-dispatcher, `_generate_final_likelihood_block`, when an ordinal family is specified.
-This separation of concerns improves the modularity and readability of the code
-generation engine.
-
-# Arguments
-- `M`: The main model configuration `NamedTuple`.
-
-# Returns
-- A `String` containing the generated Turing code for the ordinal likelihood block.
+Generates the Turing code block for an ordinal regression likelihood. This version
+is CPU-only.
 """
 function _generate_ordinal_likelihood_block(M::NamedTuple)
     spec = M.likelihood_specs[1]
@@ -5844,8 +5707,7 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
     latent_dist_val = get(spec, :latent_dist, :logistic)
     non_prop_terms = get(M, :non_proportional_effects, Symbol[])
     is_npo = !isempty(non_prop_terms)
-    array_type_str = "M.to_device"
-    
+     
     npo_indices = findall(x -> x in non_prop_terms, M.Xfixed_names)
     n_npo_vars = length(npo_indices)
 
@@ -5872,43 +5734,52 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
         latent_dist_symbol = :$(latent_dist_val)
         $(npo_update_block)
 
-        for i in 1:M.y_N
-            linear_predictor_prop = eta[i]
-            
-            linear_predictor_vec = if $(is_npo && n_npo_vars > 0)
-                linear_predictor_prop .+ view(eta_npo, i, :)
-            else
-                fill(linear_predictor_prop, $(K-1))
-            end
-            
-            cumulative_probs = if latent_dist_symbol == :normal
-                Distributions.cdf.(Normal(), alphas_computed .- linear_predictor_vec)
-            elseif latent_dist_symbol == :logistic
-                LogExpFunctions.logistic.(alphas_computed .- linear_predictor_vec)
-            elseif latent_dist_symbol == :student_t
-                Distributions.cdf.(TDist(ordinal_df), alphas_computed .- linear_predictor_vec)
-            else
-                error("Unsupported latent distribution ':\$(latent_dist_symbol)' for ordinal model.")
-            end
-            
-            probs = $(array_type_str){T}(undef, $(K))
-            if $(K > 1)
-                probs[1] = cumulative_probs[1]
-                for j in 2:($(K-1))
-                    probs[j] = max(0.0, cumulative_probs[j] - cumulative_probs[j-1])
-                end
-                probs[$(K)] = max(0.0, 1.0 - cumulative_probs[$(K-1)])
-            else
-                probs[1] = 1.0
-            end
+        # Proportional effect for all observations
+        eta_prop = eta
 
-            probs ./= (sum(probs) + 1e-9)
-            
-            Turing.@addlogprob! logpdf(Categorical(probs), M.y_obs[i])
+        # Calculate cumulative probabilities for all observations in a vectorized manner
+        eta_matrix = if $(is_npo && n_npo_vars > 0)
+            eta_prop .+ eta_npo
+        else
+            # Broadcast the proportional effect across all cut-points
+            eta_prop .* ones(T, 1, $(K-1))
         end
+        
+        # linear_predictor_vec is now a matrix of size [N_obs, K-1]
+        linear_predictor_matrix = alphas_computed' .- eta_matrix
+
+        cumulative_probs_matrix = if latent_dist_symbol == :normal
+            Distributions.cdf.(Normal(), linear_predictor_matrix)
+        elseif latent_dist_symbol == :logistic
+            LogExpFunctions.logistic.(linear_predictor_matrix)
+        elseif latent_dist_symbol == :student_t
+            Distributions.cdf.(TDist(ordinal_df), linear_predictor_matrix)
+        else
+            error("Unsupported latent distribution ':\$(latent_dist_symbol)' for ordinal model.")
+        end
+        
+        # Calculate probabilities for each category for all observations
+        probs_matrix = Array{T}(undef, M.y_N, $(K))
+        if $(K > 1)
+            probs_matrix[:, 1] = cumulative_probs_matrix[:, 1]
+            for j in 2:($(K-1))
+                probs_matrix[:, j] = max.(0.0, cumulative_probs_matrix[:, j] .- cumulative_probs_matrix[:, j-1])
+            end
+            probs_matrix[:, $(K)] = max.(0.0, 1.0 .- cumulative_probs_matrix[:, $(K-1)])
+        else
+            probs_matrix[:, 1] .= 1.0
+        end
+
+        # Normalize probabilities row-wise
+        probs_matrix ./= (sum(probs_matrix, dims=2) .+ 1e-9)
+        
+        # Use broadcasting to apply logpdf to each observation
+        log_likelihoods = logpdf.(Categorical.(eachrow(probs_matrix)), M.y_obs)
+        Turing.@addlogprob! sum(log_likelihoods)
     end
     """
 end
+
 
 
 """
@@ -6047,24 +5918,7 @@ end
     _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
 
 Generates the Turing code for the priors and linear predictor updates for all
-fixed effects.
-
-# Rationale for Update
-  fully consistent with the refactored architecture by
-re-introducing the logic to handle non-proportional effects for ordinal models.
-When an ordinal likelihood is used with `non_proportional_effects=true` on a
-`fixed()` term, this function correctly separates the proportional and non-proportional
-coefficients, defines their respective priors, and generates the appropriate update
-code. This resolves a functional regression and ensures ordinal models are correctly specified.
-The code has also been slightly refactored to reduce duplication in prior generation.
-
-# Arguments
-- `M`: The main model configuration `NamedTuple`.
-- `is_multivariate`: A boolean indicating if the model is multivariate.
-- `eta_name`: The name of the linear predictor variable (`eta` or `eta_latent`).
-
-# Returns
-- A tuple `(priors_code::String, updates_code::String)`.
+fixed effects. This version is CPU-only.
 """
 function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
     if get(M, :Xfixed_N, 0) == 0
@@ -6090,7 +5944,7 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
 
     prior_parts = String[]
     update_parts = String[]
-
+ 
     # --- Proportional Effects ---
     if n_prop > 0
         priors_prop = priors_vec[prop_indices]
@@ -6134,7 +5988,6 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
             priors_str_list = [_distribution_to_string(p) for p in full_priors_list]
             push!(prior_parts, "$(beta_npo_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ", "))]), :beta_npo)")
         end
-        # The update logic for non-proportional effects is handled within the ordinal likelihood block.
     end
 
     priors_code = join(prior_parts, "\n    ")
@@ -7300,29 +7153,12 @@ end
 
 
 
+
 """
     process_sciml_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
 
 Processes the `sciml()` module call, validating arguments and setting up temporal context.
-
-# Version
-v1.0.1 (2026-08-13)
-
-# Rationale for Update
-  correctly evaluate all user-provided arguments
-(e.g., `solver`, `p_priors`) within the user's module scope. The previous
-version only checked for the presence of these arguments as symbols, but
-did not resolve them into the actual objects needed by the model builder
-and code generator. This fix ensures that functions, distributions, and
-other complex objects passed as arguments are correctly instantiated.
-
-# Arguments
-- `opt_dict`: The main model configuration dictionary (`M`).
-- `mod_data`: The parsed data for the `sciml()` module.
-- `registries`, `hyperpriors`: Additional configuration dictionaries.
-
-# Returns
-- `true` to indicate that a `SciMLComponent` object should be created.
+This version is CPU-only.
 """
 function process_sciml_module!(
     opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict
@@ -7350,7 +7186,6 @@ function process_sciml_module!(
     opt_dict[:t_coords] = data[!, time_var_sym] # Store original time coordinates for interpolation.
 
     # 2. Validate and evaluate all required SciML parameters.
-    # These arguments can be symbols or expressions that need to be evaluated in the user's scope.
     required_args = [:model_func, :u0_prior, :p_priors, :tspan, :solver]
     for arg in required_args
         if !haskey(params, arg)
@@ -7359,9 +7194,7 @@ function process_sciml_module!(
         
         raw_val = params[arg]
         try
-            # Evaluate the argument in the user's module to resolve the object.
             evaluated_val = Core.eval(calling_mod, raw_val)
-            # Store the evaluated object back into the parameters for the component constructor.
             params[arg] = evaluated_val
         catch e
             error("Could not evaluate the `$(arg)` argument `$(raw_val)` for the sciml() module. Ensure it is defined in the calling scope. Error: $e")
@@ -7389,27 +7222,16 @@ function process_sciml_module!(
     opt_dict[:sciml_tspan] = params[:tspan]
     opt_dict[:sciml_saveat] = get(params, :saveat, 0.1) # Default saveat
 
-    # 5. Create and store a problem template. This is crucial for GPU execution,
-    #    as SciML uses the device of the template's arrays to determine the
-    #    execution device for the solver.
+    # 5. Create and store a problem template.
     u0_prior = params[:u0_prior]
     p_priors = params[:p_priors]
     
-    # Use the mean of the priors as placeholder values for the template.
     u0_mean = mean(u0_prior)
     u0_placeholder = u0_mean isa Number ? [u0_mean] : vec(u0_mean)
     p_placeholder = [mean(p) for p in p_priors]
 
-    # If GPU is enabled, move these placeholder arrays to the selected device.
-    if get(opt_dict, :use_gpu, false)
-        to_device = opt_dict[:gpu_array_type]
-        u0_placeholder = to_device(u0_placeholder)
-        p_placeholder = to_device(p_placeholder)
-    end
-
     prob_func = getfield(calling_mod, params[:model_func])
     de_kwargs = get(params, :de_kwargs, Dict())
-    # This assumes ODEProblem is available from a package like DifferentialEquations.jl
     prob_template = ODEProblem(prob_func, u0_placeholder, params[:tspan], p_placeholder; de_kwargs...)
 
     if !haskey(opt_dict, :sciml_problem_templates)
@@ -7417,8 +7239,9 @@ function process_sciml_module!(
     end
     opt_dict[:sciml_problem_templates][Symbol(mod_data[:key])] = prob_template
 
-    return true # Indicates that a SciMLComponent object should be created.
+    return true
 end
+
 
 
 """

@@ -153,8 +153,8 @@ function get_updates(
     key = spec.key
     
     common_basis_code = """
-        local hyper = spec_registry[:$(key)].hyper
-        local B_wavelet = bstm_tensor_product_wavelet_basis(
+        hyper = spec_registry[:$(key)].hyper
+        B_wavelet = bstm_tensor_product_wavelet_basis(
             hyper.coords,
             hyper.nbins_per_dim,
             Symbol("$(m.family)"),
@@ -166,9 +166,9 @@ function get_updates(
         # --- Wavelet Smoother Component (Spectral): $(key) ---
         let
             $(common_basis_code)
-            local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
+            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
-            local coeffs = hyper.U * (diag_D .* $(p_names.innovations))
+            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             $(p_names.latent) = B_wavelet * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
@@ -178,10 +178,10 @@ function get_updates(
         # --- Wavelet Smoother Component (Cholesky, AD-Safe): $(key) ---
         let
             $(common_basis_code)
-            local F = hyper.cholesky_factor
-            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            F = hyper.cholesky_factor
+            coeffs_raw = F.L' \\\\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
-            local coeffs = $(p_names.sigma) .* (coeffs_raw .- mean(coeffs_raw))
+            coeffs = $(p_names.sigma) .* (coeffs_raw .- mean(coeffs_raw))
             $(p_names.latent) = B_wavelet * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
@@ -191,11 +191,11 @@ function get_updates(
         # --- Wavelet Smoother Component (Sparse Cholesky, Not AD-Safe): $(key) ---
         let
             $(common_basis_code)
-            local Q_penalty = hyper.Q_template
-            local F = cholesky(Symmetric(Q_penalty + M.noise * I))
-            local coeffs_raw = F.L' \\ $(p_names.innovations)
+            Q_penalty = hyper.Q_template
+            F = cholesky(Symmetric(Q_penalty + M.noise * I))
+            coeffs_raw = F.L' \\\\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_raw))
-            local coeffs = $(p_names.sigma) .* coeffs_raw
+            coeffs = $(p_names.sigma) .* coeffs_raw
             $(p_names.latent) = B_wavelet * coeffs
             $(eta_target) .+= $(p_names.latent)
         end
@@ -208,24 +208,26 @@ function get_updates(
 end
 
 function get_effects(
-    m::Wavelet, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::Wavelet, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
-
+    p_names = string.(keys(chain))
+    
     hyper = spec.hyper
     noise = M.noise
     n_latent = hyper.n_latent
     nbins_per_dim = hyper.nbins_per_dim
 
     # --- Coordinate Handling: Combine training and prediction sets on CPU ---
-    # The basis generation step requires CPU data.
-    coords_train_cpu = Array(hyper.coords)
+    coords_train_cpu = hyper.coords
     coord_vars = get(spec.params, :positional_args, [])
     coords_full_cpu = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
         vcat(coords_train_cpu, Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
@@ -255,8 +257,8 @@ function get_effects(
         ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
         innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
-        # Initialize the output matrix for the full effect on the target device
-        effect_k_device = to_device(zeros(Float64, N_total, n_samples))
+        # Initialize the output matrix for the full effect on the CPU
+        effect_k_cpu = zeros(Float64, N_total, n_samples)
 
         # --- Sample-wise Reconstruction ---
         for i in 1:n_samples
@@ -266,33 +268,30 @@ function get_effects(
                 coords_full_cpu, nbins_per_dim, m.family, current_ls_cpu
             )
             
-            # 2. Move basis matrix and samples to device
-            B_wavelet_i_device = to_device(B_wavelet_i_cpu)
-            innov_i_device = to_device(innovations_samples_cpu[i, :])
-            sigma_i_device = to_device(sigma_samples_cpu[i])
+            innov_i_cpu = innovations_samples_cpu[i, :]
+            sigma_i_cpu = sigma_samples_cpu[i]
             
-            # 3. Reconstruct coefficients on device
-            local coeffs_device
+            # 3. Reconstruct coefficients on CPU
+            local coeffs_cpu
             if m.method == :spectral
-                U = hyper.U # Already on device
-                L = hyper.L # Already on device
-                diag_D_device = sigma_i_device ./ sqrt.(L .+ noise)
-                diag_D_device[1] = 0.0; diag_D_device[2] = 0.0
-                coeffs_device = U * (diag_D_device .* innov_i_device)
+                U = hyper.U
+                L = hyper.L
+                diag_D = sigma_i_cpu ./ sqrt.(L .+ noise)
+                diag_D[1] = 0.0; diag_D[2] = 0.0
+                coeffs_cpu = U * (diag_D .* innov_i_cpu)
             else # :cholesky or :cholesky_sparse
-                F = hyper.cholesky_factor # Already on device
-                coeffs_raw_device = F.L' \ innov_i_device
-                coeffs_centered_device = coeffs_raw_device .- mean(coeffs_raw_device)
-                coeffs_device = sigma_i_device .* coeffs_centered_device
+                F = hyper.cholesky_factor
+                coeffs_raw = F.L' \ innov_i_cpu
+                coeffs_centered = coeffs_raw .- mean(coeffs_raw)
+                coeffs_cpu = sigma_i_cpu .* coeffs_centered
             end
             
-            # 4. Compute effect for this sample on device
-            effect_k_device[:, i] = B_wavelet_i_device * coeffs_device
+            # 4. Compute effect for this sample on CPU
+            effect_k_cpu[:, i] = B_wavelet_i_cpu * coeffs_cpu
         end
         
-        # 5. Move final result for this outcome back to CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_cpu)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
-end
+end 

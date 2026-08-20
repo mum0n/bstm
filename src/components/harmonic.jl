@@ -1,3 +1,4 @@
+# File: c:\home\jae\projects\bstm\src\components\harmonic.jl
 """
     Harmonic <: ComponentModel
 
@@ -6,10 +7,10 @@ sine and cosine waves. This component can model one or more harmonics, each with
 own amplitude, phase, and potentially its own period.
 
 # Version
-v1.4.0 (2026-08-17)
+v1.5.0 (2026-08-19)
 
 # Mathematical Summary
-The component models a function \$f(t)\$ as a sum of sinusoids. It supports two
+The component models a function \\(f(t)\\) as a sum of sinusoids. It supports two
 parameterizations controlled by the `method` field:
 
 1.  **:twocoefficient (default, AD-friendly)**:
@@ -107,26 +108,21 @@ function get_precomputes(
     u_var_sym = Symbol(variables[1])
     if !hasproperty(M.data, u_var_sym)
         error(
-            "Seasonal index variable ':$u_var_sym' for Harmonic model not found " *
+            "Seasonal index variable ':' for Harmonic model not found " *
             "in data."
         )
     end
     
-    to_device = M.to_device
-    
-    # The index vector itself is already on the device as part of M.data
-    u_idx_device = M.data[!, u_var_sym]
-    
-    # Bring to CPU for `unique` as it can be slow on GPU, but keep the original device array
-    u_idx_cpu = Array(u_idx_device)
-    u_N = length(unique(u_idx_cpu))
+    # All data is on the CPU.
+    u_idx = M.data[!, u_var_sym]
+    u_N = length(unique(u_idx))
     u_idx_var = u_var_sym
 
-    u_coords_cpu = collect(1.0:u_N)
+    u_coords = collect(1.0:u_N)
     
     return (
-        u_coords=to_device(u_coords_cpu), 
-        u_idx=u_idx_device, # Pass the original device array
+        u_coords=u_coords, 
+        u_idx=u_idx,
         u_N=u_N, 
         u_idx_var=u_idx_var
     )
@@ -221,29 +217,39 @@ function get_updates(
     """
 end
 
+"""
+    get_effects(m::Harmonic, chain, spec::NamedTuple, M::NamedTuple, PS)
+
+Reconstructs the harmonic effect from posterior samples. This version is CPU-only
+and uses modern chain accessors.
+"""
 function get_effects(
     m::Harmonic, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
+    
     hyper = spec.hyper
     is_multivariate_model = M.model_arch == "multivariate"
-    u_coords_device = hyper.u_coords
+    u_coords = hyper.u_coords
     u_N_hyper = hyper.u_N
 
     # --- Index Handling ---
-    u_idx_train_device = hyper.u_idx
-    u_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, hyper.u_idx_var)
-        u_idx_pred_cpu = PS.data[!, hyper.u_idx_var]
-        vcat(u_idx_train_device, to_device(u_idx_pred_cpu))
+    u_idx_train = hyper.u_idx
+    u_idx_full = if !isnothing(PS) && hasproperty(PS.data, hyper.u_idx_var)
+        u_idx_pred = PS.data[!, hyper.u_idx_var]
+        vcat(u_idx_train, u_idx_pred)
     else
-        u_idx_train_device
+        u_idx_train
     end
-    N_total = length(u_idx_full_device)
+    N_total = length(u_idx_full)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -253,7 +259,7 @@ function get_effects(
 
         # --- Get Period Samples ---
         period_name = _find_parameter(p_names, string(p_names_k.period), k_outcome, is_multivariate_model)
-        period_samples_cpu = if m.period isa Real
+        period_samples = if m.period isa Real
             fill(m.period, n_samples, m.nharmonics)
         elseif m.period isa Vector{<:Real}
             repeat(m.period', n_samples, 1)
@@ -268,21 +274,21 @@ function get_effects(
         end
         
         # Reshape for broadcasting: [1, n_samples, n_harmonics]
-        period_samples_device = to_device(reshape(period_samples_cpu, 1, n_samples, m.nharmonics))
+        period_samples_tensor = reshape(period_samples, 1, n_samples, m.nharmonics)
 
         # --- Calculate Angles ---
         # u_coords: [u_N, 1, 1], k_harmonics: [1, 1, n_harmonics]
-        u_coords_tensor = reshape(u_coords_device, u_N_hyper, 1, 1)
-        k_harmonics_tensor = to_device(reshape(1:m.nharmonics, 1, 1, m.nharmonics))
+        u_coords_tensor = reshape(u_coords, u_N_hyper, 1, 1)
+        k_harmonics_tensor = reshape(1:m.nharmonics, 1, 1, m.nharmonics)
         
         # Broadcasting happens here
-        angle_tensor = (2 * pi .* k_harmonics_tensor ./ period_samples_device) .* u_coords_tensor
+        angle_tensor = (2 * pi .* k_harmonics_tensor ./ period_samples_tensor) .* u_coords_tensor
         
         cos_angle = cos.(angle_tensor)
         sin_angle = sin.(angle_tensor)
 
         # --- Get Coefficient Samples and Compute Effect ---
-        local reconstructed_effects_k_device
+        local reconstructed_effects_k
         if m.method == :twocoefficient
             b_cos_name = _find_parameter(p_names, string(p_names_k.beta_cos), k_outcome, is_multivariate_model)
             b_sin_name = _find_parameter(p_names, string(p_names_k.beta_sin), k_outcome, is_multivariate_model)
@@ -293,15 +299,15 @@ function get_effects(
                 continue
             end
 
-            b_cos_samples_cpu = get_params_matrix(chain, b_cos_name, m.nharmonics)
-            b_sin_samples_cpu = get_params_matrix(chain, b_sin_name, m.nharmonics)
+            b_cos_samples = get_params_matrix(chain, b_cos_name, m.nharmonics)
+            b_sin_samples = get_params_matrix(chain, b_sin_name, m.nharmonics)
 
             # Reshape for broadcasting: [1, n_samples, n_harmonics]
-            b_cos_tensor = to_device(reshape(b_cos_samples_cpu, 1, n_samples, m.nharmonics))
-            b_sin_tensor = to_device(reshape(b_sin_samples_cpu, 1, n_samples, m.nharmonics))
+            b_cos_tensor = reshape(b_cos_samples, 1, n_samples, m.nharmonics)
+            b_sin_tensor = reshape(b_sin_samples, 1, n_samples, m.nharmonics)
 
             harmonic_effects = b_cos_tensor .* cos_angle .+ b_sin_tensor .* sin_angle
-            reconstructed_effects_k_device = dropdims(sum(harmonic_effects, dims=3), dims=3) # Result is [u_N, n_samples]
+            reconstructed_effects_k = dropdims(sum(harmonic_effects, dims=3), dims=3) # Result is [u_N, n_samples]
 
         else # :ampphase
             amp_name = _find_parameter(p_names, string(p_names_k.amplitude), k_outcome, is_multivariate_model)
@@ -313,22 +319,21 @@ function get_effects(
                 continue
             end
 
-            amp_samples_cpu = get_params_matrix(chain, amp_name, m.nharmonics)
-            phase_samples_cpu = get_params_matrix(chain, phase_name, m.nharmonics)
+            amp_samples = get_params_matrix(chain, amp_name, m.nharmonics)
+            phase_samples = get_params_matrix(chain, phase_name, m.nharmonics)
 
             # Reshape for broadcasting: [1, n_samples, n_harmonics]
-            amp_tensor = to_device(reshape(amp_samples_cpu, 1, n_samples, m.nharmonics))
-            phase_tensor = to_device(reshape(phase_samples_cpu, 1, n_samples, m.nharmonics))
+            amp_tensor = reshape(amp_samples, 1, n_samples, m.nharmonics)
+            phase_tensor = reshape(phase_samples, 1, n_samples, m.nharmonics)
 
             harmonic_effects = amp_tensor .* cos.(angle_tensor .+ (2 * pi .* phase_tensor))
-            reconstructed_effects_k_device = dropdims(sum(harmonic_effects, dims=3), dims=3) # Result is [u_N, n_samples]
+            reconstructed_effects_k = dropdims(sum(harmonic_effects, dims=3), dims=3) # Result is [u_N, n_samples]
         end
 
         # --- Index and Finalize ---
-        indexed_effects_device = reconstructed_effects_k_device[u_idx_full_device, :]
-        push!(structured_effects, Array(indexed_effects_device))
+        indexed_effects = reconstructed_effects_k[u_idx_full, :]
+        push!(structured_effects, indexed_effects)
     end
 
     return (structured=structured_effects, noisy=structured_effects)
 end
-

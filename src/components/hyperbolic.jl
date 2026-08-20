@@ -6,10 +6,10 @@ specifically the Poincaré disk model. This allows for modeling data with hierar
 or tree-like structures, where the notion of distance is warped.
 
 # Version
-v1.0.2 (2026-08-15)
+v1.1.0 (2026-08-19)
 
 # Mathematical Summary
-This component models a latent field \$f(s)\$ as a draw from a Gaussian Process where
+This component models a latent field \\(f(s)\\) as a draw from a Gaussian Process where
 the covariance is a function of the hyperbolic distance between points, not the
 Euclidean distance.
 
@@ -75,7 +75,7 @@ function get_precomputes(m::Hyperbolic, M::NamedTuple, mod_data::Dict)::NamedTup
 
     for var_sym in variables
         if !hasproperty(M.data, Symbol(var_sym))
-            error("Coordinate variable ':$var_sym' for Hyperbolic model not found " *
+            error("Coordinate variable ':' for Hyperbolic model not found " *
                   "in data.")
         end
     end
@@ -132,7 +132,6 @@ function _evaluate_hyperbolic_kernel_matrix(coords, sigma, curvature, noise)
     c = sqrt(max(zero(T), -T(curvature)))
 
     if c == 0.0 # Fallback to Euclidean distance with SE kernel
-        # GPU-compatible pairwise squared Euclidean distance
         sq_dists = sum(coords.^2, dims=2) .+ sum(coords.^2, dims=2)' .- 2 * (coords * coords')
         K = sigma^2 .* exp.(-0.5 .* sq_dists)
         return K + T(noise) * I
@@ -189,31 +188,34 @@ end
 
 
 function get_effects(
-    m::Hyperbolic, chain::Chains, spec::NamedTuple, M::NamedTuple,
+    m::Hyperbolic, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
-
-    # --- Coordinate Handling: Combine training and prediction sets on device ---
+    p_names = string.(keys(chain))
+    
+    # --- Coordinate Handling: Combine training and prediction sets on CPU ---
     coord_vars = get(spec.params, :positional_args, [])
-    coords_train = spec.hyper.coords # Already on device
-
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        coords_pred_cpu = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
-        vcat(coords_train, to_device(coords_pred_cpu))
+    coords_train = spec.hyper.coords
+    # Combine training and prediction coordinates
+    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars) # If prediction set is provided
+        coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]) # Extract prediction coordinates
+        vcat(coords_train, coords_pred) # Combine training and prediction coordinates
     else
-        coords_train
+        coords_train # Otherwise, use only training coordinates
     end
-    n_obs_train = size(coords_train, 1)
-    n_obs_full = size(coords_full, 1)
+    n_obs_train = size(coords_train, 1) # Number of observations in training data
+    n_obs_full = size(coords_full, 1) # Total number of observations (training + prediction)
 
     noise = M.noise
-    curvature = m.curvature
+    curvature = m.curvature # Curvature parameter
     structured_effects = Vector{Matrix{Float64}}()
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
@@ -223,39 +225,38 @@ function get_effects(
         innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for Hyperbolic component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            @warn "Parameters for Hyperbolic component $(spec.key) (outcome ) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_obs_train)
+        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_obs_train) # (n_samples, n_obs_train)
 
-        # Initialize the output matrix for the full effect on the target device
-        effect_k_device = to_device(zeros(Float64, n_obs_full, n_samples))
+        # Initialize the output matrix for the full effect
+        effect_k_matrix = zeros(Float64, n_obs_full, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
-        for i in 1:n_samples
-            # Kernel evaluation and Cholesky happen on the device
-            K_mat = _evaluate_hyperbolic_kernel_matrix(coords_full, sigma_samples_cpu[i], curvature, noise)
+        # --- Sample-wise Reconstruction ---
+        for i in 1:n_samples # Iterate over each posterior sample
+            # Kernel evaluation and Cholesky
+            K_mat = _evaluate_hyperbolic_kernel_matrix(coords_full, sigma_samples[i, 1], curvature, noise)
             F = cholesky(Symmetric(K_mat))
 
-            # Combine training innovations with new innovations for prediction points on the device
-            innov_train_device = to_device(innovations_samples_cpu[i, :])
-            innov_i_device = if n_obs_full > n_obs_train
-                innov_pred_device = to_device(randn(Float32, n_obs_full - n_obs_train))
-                vcat(innov_train_device, innov_pred_device)
+            # Combine training innovations with new innovations for prediction points (if any)
+            innov_train = innovations_samples[i, :]
+            innov_i = if n_obs_full > n_obs_train
+                innov_pred = randn(Float64, n_obs_full - n_obs_train)
+                vcat(innov_train, innov_pred)
             else
-                innov_train_device
+                innov_train
             end
 
-            effect_k_device[:, i] = F.L * innov_i_device
+            effect_k_matrix[:, i] = F.L * innov_i
         end
         
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k_matrix)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
-end
+end 

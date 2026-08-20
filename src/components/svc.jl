@@ -178,8 +178,6 @@ function get_effects(
     )
 
     # --- Get effects from the inner spatial model ---
-    # This call will return effects on the CPU as per the ComponentModel interface contract.
-    # The heavy computation (and GPU usage) happens inside this call.
     inner_effects_result = get_effects(m.model, chain, inner_spec, M, PS)
     
     # --- Prepare covariate data on the CPU ---
@@ -218,5 +216,4 @@ function get_effects(
     end
 
     return (structured=structured_effects, noisy=structured_effects)
-end
-
+end 

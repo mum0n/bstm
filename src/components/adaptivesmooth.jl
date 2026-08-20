@@ -7,7 +7,7 @@ multi-layer perceptron (MLP) to warp the coordinate space, allowing the model to
 capture complex, non-stationary patterns that would be missed by standard smoothers.
 
 # Version
-v1.0.8 (2026-08-15)
+v1.0.9 (2026-08-19)
 
 # Mathematical Summary
 The component models a function \$f(x)\$ by first transforming the input coordinates
@@ -86,7 +86,7 @@ MODEL_TO_STRUCTURE_MAP[:adaptivesmooth] = :smooth
     get_precomputes(m::AdaptiveSmooth, M::NamedTuple, mod_data::Dict)::NamedTuple
 
 Validates and stores coordinate data and, for the `:rw2_penalty` method,
-pre-computes the penalty matrix and its spectral decomposition.
+pre-computes the penalty matrix and its spectral decomposition. This version is CPU-only.
 """
 function get_precomputes(
     m::AdaptiveSmooth, M::NamedTuple, mod_data::Dict
@@ -227,34 +227,32 @@ function get_updates(
     else; error("Unsupported method '$(m.method)' for AdaptiveSmooth component."); end
 end
 
-
-
 """
     get_effects(m::AdaptiveSmooth, chain, spec, M, PS)
 
 Reconstructs the `AdaptiveSmooth` component's effect from posterior samples,
-dispatching on the method used during sampling.   handle
-GPU arrays by moving sampled parameters to the device for computation and moving
-the final results back to the CPU.
+dispatching on the method used during sampling. This version is CPU-only.
 """
 function get_effects(
     m::AdaptiveSmooth, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
-
+    p_names = string.(names(DataFrame(chain)))
+    
     # --- Coordinate Handling: Combine training and prediction sets ---
     coords_train = spec.hyper.coords
     coord_vars = get(spec.params, :positional_args, [])
     
     coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-        # Ensure prediction coordinates are on the correct device
-        coords_pred = to_device(Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]))
+        coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)])
         vcat(coords_train, coords_pred)
     else
         coords_train
@@ -279,72 +277,62 @@ function get_effects(
             continue
         end
 
-        # Extract posterior samples from the chain (these are on the CPU)
-        W1_samples = get_params_matrix(chain, W1_name, m.hidden_dim * spec.hyper.in_dim)
-        b1_samples = get_params_matrix(chain, b1_name, m.hidden_dim)
-        W2_samples = get_params_matrix(chain, W2_name, m.hidden_dim * m.nbins)
+        # Extract posterior samples from the chain
+        W1_samples = get_params_vector(chain, W1_name, m.hidden_dim * spec.hyper.in_dim)
+        b1_samples = get_params_vector(chain, b1_name, m.hidden_dim)
+        W2_samples = get_params_vector(chain, W2_name, m.hidden_dim * m.nbins)
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
 
-        # Initialize the output matrix on the GPU if enabled
-        effect_k_device = to_device(zeros(Float64, n_obs_full, n_samples))
+        # Initialize the output matrix on the CPU
+        effect_k = zeros(Float64, n_obs_full, n_samples)
 
         # --- Sample-wise Reconstruction ---
         for i in 1:n_samples
-            # Reshape CPU samples
-            W1_cpu = reshape(W1_samples[i, :], spec.hyper.in_dim, m.hidden_dim)
-            b1_cpu = b1_samples[i, :]
-            W2_cpu = reshape(W2_samples[i, :], m.hidden_dim, m.nbins)
+            # Reshape samples
+            W1 = reshape(W1_samples[i, :], spec.hyper.in_dim, m.hidden_dim)
+            b1 = b1_samples[i, :]
+            W2 = reshape(W2_samples[i, :], m.hidden_dim, m.nbins)
             
-            # Move samples to the target device for computation
-            W1 = to_device(W1_cpu)
-            b1 = to_device(b1_cpu)
-            W2 = to_device(W2_cpu)
-            
-            # Compute adaptive basis on the target device
+            # Compute adaptive basis
             H = tanh.((coords_full * W1) .+ b1')
             B_adaptive = H * W2
             
             # Reconstruct coefficients based on the sampling method
-            local coeffs_device
+            local coeffs
             if m.method == :centered
                 latent_name = _find_parameter(p_names, string(p_names_k.latent), k, is_multivariate_model)
                 if isempty(latent_name)
                     @warn "Latent coefficients for centered AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
-                    coeffs_device = to_device(zeros(m.nbins))
+                    coeffs = zeros(m.nbins)
                 else
-                    coeffs_cpu = get_params_matrix(chain, latent_name, m.nbins)[i, :] .* sigma_samples[i]
-                    coeffs_device = to_device(coeffs_cpu)
+                    coeffs = get_params_vector(chain, latent_name, m.nbins)[i, :] .* sigma_samples[i]
                 end
             else # :noncentered or :rw2_penalty
                 innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
                 if isempty(innovations_name)
                     @warn "Innovations for AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
-                    coeffs_device = to_device(zeros(m.nbins))
+                    coeffs = zeros(m.nbins)
                 else
-                    innovations_cpu = get_params_matrix(chain, innovations_name, m.nbins)[i, :]
+                    innovations = get_params_vector(chain, innovations_name, m.nbins)[i, :]
                     
                     if m.method == :noncentered
-                        coeffs_cpu = innovations_cpu .* sigma_samples[i]
-                        coeffs_device = to_device(coeffs_cpu)
+                        coeffs = innovations .* sigma_samples[i]
                     else # :rw2_penalty
-                        # Hyperparameters U and L are already on the correct device
                         U = spec.hyper.U
                         L = spec.hyper.L
                         diag_D = sigma_samples[i] ./ sqrt.(L .+ M.noise)
                         diag_D[1] = 0.0; diag_D[2] = 0.0
                         
-                        innovations_device = to_device(innovations_cpu)
-                        coeffs_device = U * (diag_D .* innovations_device)
+                        coeffs = U * (diag_D .* innovations)
                     end
                 end
             end
             
-            # Compute the effect for this sample on the device
-            effect_k_device[:, i] = B_adaptive * coeffs_device
+            # Compute the effect for this sample
+            effect_k[:, i] = B_adaptive * coeffs
         end
         
-        # Move the final result for this outcome back to the CPU
-        push!(structured_effects, Array(effect_k_device))
+        push!(structured_effects, effect_k)
     end
     
     return (structured=structured_effects, noisy=structured_effects)

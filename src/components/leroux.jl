@@ -7,7 +7,7 @@ structured (ICAR) component and an unstructured (IID) component, controlled by a
 single mixing parameter, `rho`.
 
 # Version
-v2.2.0 (2026-08-17)
+v2.3.0 (2026-08-19)
 
 # Mathematical Summary
 The Leroux model is a proper CAR model, meaning its precision matrix is always
@@ -34,7 +34,7 @@ flexible way to model spatial autocorrelation.
 - **Optional (in `random()` call)**:
   - `rho`: A `UnivariateDistribution` for the prior on the mixing parameter. Default: `Beta(1,1)`.
   - `sigma`: A `UnivariateDistribution` for the prior on the overall standard deviation. Default: `Exponential(1.0)`.
-  - `method`: A `Symbol` specifying the computational method. Default: `:spectral`.
+  - `method`: `Symbol`, specifying the computational method. Default: `:spectral`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The overall marginal standard deviation.
@@ -62,6 +62,12 @@ COMPONENT_CONSTRUCTORS[:leroux] = (p, params) -> Leroux(
 
 MODEL_TO_STRUCTURE_MAP[:leroux] = :spatial
 
+"""
+    get_precomputes(m::Leroux, M::NamedTuple, mod_data::Dict)::NamedTuple
+
+Performs data-dependent setup for the Leroux model. This version is CPU-only.
+It pre-computes the ICAR precision matrix template and its spectral decomposition.
+"""
 function get_precomputes(m::Leroux, M::NamedTuple, mod_data::Dict)::NamedTuple
     s_N = get(M, :s_N, 0)
     W = get(M, :W, nothing)
@@ -72,18 +78,15 @@ function get_precomputes(m::Leroux, M::NamedTuple, mod_data::Dict)::NamedTuple
         )
     end
 
-    # Get the device transfer function
-    to_device = M.to_device
-
     # build_structure_template returns CPU arrays
     template = build_structure_template(:icar, s_N; W=W)
     
-    # Move precomputed structures to the target device.
+    # All precomputed structures remain on the CPU.
     # Do not pre-compute Cholesky factor as it depends on `rho`.
     return (
-        Q_template=to_device(template.matrix),
-        U=to_device(template.U),
-        L=to_device(template.L),
+        Q_template=template.matrix,
+        U=template.U,
+        L=template.L,
         scaling_factor=template.scaling_factor,
         n_latent=s_N
     )
@@ -171,31 +174,39 @@ function get_updates(
     end
 end
 
+"""
+    get_effects(m::Leroux, chain, spec::NamedTuple, M::NamedTuple, PS)
 
+Reconstructs the `Leroux` component's effect from posterior samples. This version
+is CPU-only and uses modern chain accessors.
+"""
 function get_effects(
     m::Leroux, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions and identify device ---
-    n_samples = size(chain, 1) * size(chain, 3)
+    # --- Setup: Extract dimensions ---
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
-    p_names = names(chain)
-    to_device = M.to_device
+    p_names = string.(keys(chain))
+    
+    noise = M.noise
+    n_latent = spec.hyper.n_latent
+
+    # --- Coordinate/Index Handling: Combine training and prediction sets on CPU ---
+    s_idx_train = M.s_idx # Spatial indices for training data
+    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set is provided
+        vcat(s_idx_train, PS.data.s_idx) # Combine training and prediction indices
+    else
+        s_idx_train # Otherwise, use only training indices
+    end
+    N_total = length(s_idx_full) # Total number of observations (training + prediction)
 
     structured_effects = Vector{Matrix{Float64}}()
-    n_latent = spec.hyper.n_latent
-    noise = M.noise
-
-    # --- Coordinate/Index Handling: Combine training and prediction sets on device ---
-    s_idx_train_device = M.s_idx # Already on device
-    s_idx_full_device = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
-        s_idx_pred_cpu = get(PS.data, :s_idx, [])
-        vcat(s_idx_train_device, to_device(s_idx_pred_cpu))
-    else
-        s_idx_train_device
-    end
-    N_total = length(s_idx_full_device)
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
@@ -205,46 +216,42 @@ function get_effects(
         innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
         if isempty(sigma_name) || isempty(rho_name) || isempty(innovations_name)
-            @warn "Parameters for Leroux component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            @warn "Parameters for Leroux component $(spec.key) (outcome ) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_samples_cpu = get_params_vector(chain, rho_name, 1)[:, 1]
-        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
+        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+        rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
         
-        # Initialize the output matrix for the full latent field on the target device
-        effect_k_latent_device = to_device(zeros(Float64, n_latent, n_samples))
+        # Initialize the output matrix for the full latent field
+        effect_k_latent = zeros(Float64, n_latent, n_samples)
 
-        # --- Sample-wise Reconstruction on the Target Device ---
-        for s in 1:n_samples
-            # These are scalars, no need to move to device explicitly
-            sigma_s = sigma_samples_cpu[s]
-            rho_s = rho_samples_cpu[s]
-            # Move vector to device
-            innov_s_device = to_device(innovations_samples_cpu[s, :])
+        # --- Sample-wise Reconstruction ---
+        for s in 1:n_samples # Iterate over each posterior sample
+            sigma_s = sigma_samples[s, 1] # Sigma for current sample
+            rho_s = rho_samples[s, 1] # Rho for current sample
+            innov_s = innovations_samples[s, :] # Innovations for current sample
 
             if m.method == :spectral
-                U_device = spec.hyper.U # Already on device
-                L_eig_device = spec.hyper.L # Already on device
-                diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig_device .+ noise)
-                effect_k_latent_device[:, s] = U_device * (diag_D_s .* innov_s_device)
-            else # :cholesky or :cholesky_sparse
-                Q_template_device = spec.hyper.Q_template # Already on device
-                I_device = to_device(Matrix{Float64}(I, n_latent, n_latent)) # Create identity matrix on device
-                Q_final_device = (1.0 - rho_s) .* I_device .+ rho_s .* Q_template_device
-                F_device = cholesky(Symmetric(Q_final_device + noise * I_device))
-                effect_k_latent_device[:, s] = sigma_s .* (F_device.U \ innov_s_device)
+                U = spec.hyper.U
+                L_eig = spec.hyper.L
+                diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig .+ noise)
+                effect_k_latent[:, s] = U * (diag_D_s .* innov_s)
+            else # :cholesky or :cholesky_sparse (use pre-computed dense Cholesky factor)
+                Q_template = spec.hyper.Q_template
+                I_mat = Matrix{Float64}(I, n_latent, n_latent)
+                Q_final = (1.0 - rho_s) .* I_mat .+ rho_s .* Q_template
+                F = cholesky(Symmetric(Q_final + noise * I_mat))
+                effect_k_latent[:, s] = sigma_s .* (F.U \ innov_s)
             end
         end
-        
-        # Index the reconstructed effects for the full observation set and move back to CPU
-        indexed_effects_device = effect_k_latent_device[s_idx_full_device, :]
-        push!(structured_effects, Array(indexed_effects_device))
+        # Index the reconstructed effects for the full observation set to match observation indices
+        indexed_effects = effect_k_latent[s_idx_full, :]
+        push!(structured_effects, indexed_effects)
     end
     
     return (structured=structured_effects, noisy=structured_effects)
 end
-

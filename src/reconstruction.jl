@@ -1,7 +1,5 @@
 # reconstruction logic
 
-
-
 # ==============================================================================
 # SECTION 1: CORE UTILITIES FOR PARAMETER EXTRACTION
 # ==============================================================================
@@ -74,66 +72,8 @@ function _find_parameter(
 end
 
 
-
-
-function get_params_vector(chain, base_name::String, expected_len::Int)
-    # Purpose: Extracts all posterior samples for a given parameter into a matrix.
-    # Rationale: Handles both scalar and vector parameters, correctly parsing indexed names.
-    # Inputs:
-    #   - chain: The MCMC chain object.
-    #   - base_name: The base name of the parameter (e.g., "latent_spatial").
-    #   - expected_len: The expected number of elements for this parameter.
-    # Outputs: A matrix of size `[n_samples x expected_len]`.
-    local N_samples = size(chain, 1)
-    local all_names = string.(FlexiChains.parameters(chain))
-
-    local regex = Regex("^" * base_name * "\\[(\\d+)\\]")
-    local matched_names = filter(n -> occursin(regex, n), all_names)
-
-    if !isempty(matched_names)
-        sort!(matched_names, by = n -> parse(Int, match(regex, n).captures[1]))
-        local res_mat = zeros(Float64, N_samples, length(matched_names))
-        for (idx, n) in enumerate(matched_names)
-            local val_obj = chain[Symbol(n)]
-            local raw = hasproperty(val_obj, :data) ? val_obj.data : collect(val_obj)
-            for s in 1:N_samples
-                local v = raw[s]
-                res_mat[s, idx] = (v isa AbstractVector) ? Float64(v[1]) : Float64(v)
-            end
-        end
-        if size(res_mat, 2) == 1 && expected_len > 1
-            return repeat(res_mat, 1, expected_len)
-        end
-        return res_mat
-    end
-
-    if base_name in all_names
-        local val_obj = chain[Symbol(base_name)]
-        local raw_data = hasproperty(val_obj, :data) ? val_obj.data : collect(val_obj)
-        local mat_data = if eltype(raw_data) <: AbstractVector
-             reduce(hcat, [vec(collect(v)) for v in raw_data])'
-        else
-             Matrix{Float64}(reshape(collect(raw_data), N_samples, :))
-        end
-        if size(mat_data, 2) == expected_len
-            return mat_data
-        elseif size(mat_data, 2) == 1 && expected_len > 1
-            return repeat(mat_data, 1, expected_len)
-        else
-            @warn "Parameter '$base_name' was found, but its length ($(size(mat_data, 2))) does not match expected length ($expected_len). Returning as is."
-            return mat_data
-        end
-    end
-
-    @warn "get_params_vector: Parameter '$base_name' not discovered in chain. Initializing with zeros (len=$expected_len)."
-    return zeros(Float64, N_samples, expected_len)
-end
-
-
-# ==============================================================================
-# SECTION 2: COMPONENT-SPECIFIC EXTRACTION
-# ==============================================================================
  
+
 
 function _apply_multivariate_correlation(eta_latent, chain, outcomes_N)
     # Purpose: Applies the estimated correlation structure to independent latent fields.
@@ -262,107 +202,133 @@ function summarize_predictions(samples::AbstractArray; alpha=0.05)
     )
 end
 
- 
-"""
-    _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
 
-Extracts all latent effects from the MCMC chain by dispatching to the `get_effects`
-method for each model component.
 
-# Version
-v1.2.0 (2026-08-15)
+function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedTuple, Nothing}, n_samples::Int, outcomes_N::Int, N_tot::Int)
+    p_names = string.(names(DataFrame(chain))) # Use names(DataFrame(chain)) for robustness
 
-# Rationale
-This function is the main entry point for reconstructing all latent effects from the
-posterior chain.   use the modern, simplified `get_effects`
-signature, which is part of the broader refactoring for GPU compatibility and code
-consistency. The new signature `get_effects(spec.component_obj, chain, spec, M, PS)`
-is cleaner and delegates the responsibility of parsing samples and dimensions to the
-component-specific methods.
-
-# Arguments
-- `chain`: The MCMC chain object.
-- `M`: The main model configuration `NamedTuple`.
-- `PS`: The prediction set configuration `NamedTuple`, or `nothing`.
-- `n_samples`: The total number of posterior samples.
-- `outcomes_N`: The number of outcome variables.
-- `N_tot`: The total number of observations (training + prediction).
-
-# Returns
-- A `NamedTuple` registry where each key is a component's unique identifier and the
-  value is the reconstructed posterior effect for that component.
-"""
-function _discover_component_realizations(chain, M, PS, n_samples, outcomes_N, N_tot)
-    registry = Dict{Symbol, Any}()
-    is_multivariate = outcomes_N > 1
-
-    # --- Fixed effects and Intercept ---
-    if M.Xfixed_N > 0
-        Xfixed_train = M.Xfixed
-        Xfixed_pred = if isnothing(PS) || !haskey(PS, :Xfixed) || isempty(PS.Xfixed) || size(PS.Xfixed, 1) == 0
-            # Ensure correct type and device for the empty array
-            M.to_device(zeros(Float64, 0, M.Xfixed_N))
-        else
-            PS.Xfixed
-        end
-        Xfixed_full = vcat(Xfixed_train, Xfixed_pred)
-        
-        if is_multivariate
-            beta_samples_flat = get_params_vector(
-                chain, "Xfixed_beta_prop_flat", M.Xfixed_N * outcomes_N
-            )
-            fixed_effects_all = M.to_device(zeros(Float64, N_tot, n_samples, outcomes_N))
-            for k in 1:outcomes_N
-                beta_k = M.to_device(beta_samples_flat[:, (k-1)*M.Xfixed_N+1 : k*M.Xfixed_N])
-                fixed_effects_all[:, :, k] = Xfixed_full * beta_k'
-            end
-            registry[:fixed] = fixed_effects_all
-        else # Univariate case
-            beta_samples = get_params_vector(
-                chain, "Xfixed_beta_prop", M.Xfixed_N
-            )
-            fixed_effects_2d = Xfixed_full * M.to_device(beta_samples')
-            registry[:fixed] = reshape(fixed_effects_2d, N_tot, n_samples, 1)
-        end
-    else
-        registry[:fixed] = M.to_device(zeros(Float64, N_tot, n_samples, outcomes_N))
-    end
-
+    # --- Intercept ---
+    intercept_samples = zeros(Float64, n_samples, outcomes_N)
     if M.add_intercept
-        intercept_samples = get_params_vector(chain, "intercept", outcomes_N)
-        intercept_effects = M.to_device(zeros(Float64, N_tot, n_samples, outcomes_N))
         for k in 1:outcomes_N
-            intercept_effects[:, :, k] .= M.to_device(intercept_samples[:, k]')
+            param_name = (M.model_arch == "multivariate") ? "intercept_$(k)" : "intercept"
+            if param_name in p_names
+                intercept_samples[:, k] = get_params_vector(chain, param_name, 1)[:, 1]
+            else
+                @warn "Intercept parameter '$param_name' not found in the MCMC chain. Using zero for this effect."
+            end
         end
-        registry[:intercept] = intercept_effects
-    else
-        registry[:intercept] = M.to_device(zeros(Float64, N_tot, n_samples, outcomes_N))
     end
 
-    # --- Main Component Loop using get_effects ---
+    # --- Fixed Effects ---
+    fixed_effects_samples = zeros(Float64, M.Xfixed_N, n_samples, outcomes_N)
+    if M.Xfixed_N > 0
+        param_name_base = (M.model_arch == "multivariate") ? "Xfixed_beta_prop_flat" : "Xfixed_beta_prop"
+        if param_name_base in p_names
+            if M.model_arch == "multivariate"
+                all_fixed_beta_flat = get_params_matrix(chain, param_name_base, M.Xfixed_N * outcomes_N)
+                reshaped_fixed_beta = reshape(all_fixed_beta_flat, n_samples, M.Xfixed_N, outcomes_N)
+                for k in 1:outcomes_N
+                    fixed_effects_samples[:, :, k] = reshaped_fixed_beta[:, :, k]'
+                end
+            else # Univariate
+                fixed_beta = get_params_matrix(chain, param_name_base, M.Xfixed_N)
+                fixed_effects_samples[:, :, 1] = fixed_beta'
+            end
+        else
+            @warn "Fixed effects parameter '$param_name_base' not found in the MCMC chain. Using zero for this effect."
+        end
+    end
+
+    # --- Component Effects ---
+    component_realizations = Dict{Symbol, Any}()
     for spec in M.components
-        # Updated call to the modern, simplified get_effects signature
-        effects = get_effects(spec.component_obj, chain, spec, M, PS)
-        registry[spec.key] = effects
+        effects_result = get_effects(spec.component_obj, chain, spec, M, PS)
+        component_realizations[spec.key] = effects_result
     end
 
-    return NamedTuple(registry)
+    # --- Spatiotemporal Interaction Effects ---
+    st_interaction_effects_samples = zeros(Float64, M.s_N * M.t_N, n_samples, outcomes_N)
+    if get(M, :model_st, "none") != "none"
+        param_name_base = "st_interaction_raw"
+        sigma_name_base = "st_interaction_sigma"
+        if param_name_base in p_names && sigma_name_base in p_names
+            if M.model_arch == "multivariate"
+                sigma_samples = get_params_matrix(chain, sigma_name_base, outcomes_N)
+                raw_samples = get_params_matrix(chain, param_name_base, M.s_N * M.t_N * outcomes_N)
+                raw_samples_reshaped = reshape(raw_samples, n_samples, M.s_N * M.t_N, outcomes_N)
+                for k in 1:outcomes_N
+                    s_spec = M.components[findfirst(s -> s.structure == :spatial, M.components)]
+                    t_spec = M.components[findfirst(s -> s.structure == :temporal, M.components)]
+                    s_chol_factor = s_spec.hyper.cholesky_factor
+                    t_chol_factor = t_spec.hyper.cholesky_factor
+                    for i in 1:n_samples
+                        Z_matrix = reshape(raw_samples_reshaped[i, :, k], M.s_N, M.t_N)
+                        tmp_spatial = s_chol_factor.U \ Z_matrix
+                        st_field_unscaled = transpose(t_chol_factor.U \ transpose(tmp_spatial))
+                        st_field = st_field_unscaled .* sigma_samples[i, k]
+                        st_interaction_effects_samples[:, i, k] = vec(st_field)
+                    end
+                end
+            else # Univariate
+                sigma_samples = get_params_vector(chain, sigma_name_base, 1)[:, 1]
+                raw_samples = get_params_matrix(chain, param_name_base, M.s_N * M.t_N)
+                s_spec = M.components[findfirst(s -> s.structure == :spatial, M.components)]
+                t_spec = M.components[findfirst(s -> s.structure == :temporal, M.components)]
+                s_chol_factor = s_spec.hyper.cholesky_factor
+                t_chol_factor = t_spec.hyper.cholesky_factor
+                for i in 1:n_samples
+                    Z_matrix = reshape(raw_samples[i, :], M.s_N, M.t_N)
+                    tmp_spatial = s_chol_factor.U \ Z_matrix
+                    st_field_unscaled = transpose(t_chol_factor.U \ transpose(tmp_spatial))
+                    st_field = st_field_unscaled .* sigma_samples[i]
+                    st_interaction_effects_samples[:, i, 1] = vec(st_field)
+                end
+            end
+        else
+            @warn "Spatiotemporal interaction parameters not found. Using zero for this effect."
+        end
+    end
+
+    # --- Householder Reflection Effects ---
+    householder_effects_samples = zeros(Float64, outcomes_N, outcomes_N, n_samples)
+    if get(M, :spectral_orientation, false) && M.model_arch == "multivariate"
+        param_name = "v_raw_reflection"
+        if param_name in p_names
+            v_raw_reflection_samples = get_params_matrix(chain, param_name, outcomes_N)
+            for i in 1:n_samples
+                v_reflection = v_raw_reflection_samples[i, :] / (norm(v_raw_reflection_samples[i, :]) + 1e-9)
+                householder_effects_samples[:, :, i] = I - 2.0 * v_reflection * v_reflection'
+            end
+        else
+            @warn "Householder reflection parameter '$param_name' not found. Using identity matrix for reflection."
+            for i in 1:n_samples
+                householder_effects_samples[:, :, i] = Matrix(I, outcomes_N, outcomes_N)
+            end
+        end
+    end
+
+    return (
+        intercept=intercept_samples,
+        fixed_effects=fixed_effects_samples,
+        components=component_realizations,
+        st_interaction=st_interaction_effects_samples,
+        householder_reflection=householder_effects_samples
+    )
 end
 
 
 
-
-# Version 1.0.2 (2026-08-11)
-# Purpose: Reconstructs posterior summaries for univariate models.
-# Rationale: This version is confirmed to be correct, including the critical fix
-#            that extracts the 2D slice from the 3D linear predictor before processing,
-#            and ensures a complete and consistent set of outputs are returned.
 function _reconstruct(
     arch::UnivariateArchitecture, mode::String, chain, M::NamedTuple, PS,
     alpha::Float64
 )
     # --- 1. Metadata and Dimension Discovery ---
-    n_samples_val = size(chain, 1)
+    n_samples_val = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3) # For MCMCChains
+    end
     N_tot_val = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
     outcomes_N_val = 1 # For univariate, this is always 1.
 
@@ -372,9 +338,7 @@ function _reconstruct(
     )
 
     # --- 3. Linear Predictor Assembly ---
-    eta_post_3d = _modular_eta_assembly(
-        registry, M, PS, n_samples_val, outcomes_N_val
-    )
+    eta_post_3d = _modular_eta_assembly(registry, M, PS, n_samples_val, outcomes_N_val)
     
     # Extract the 2D matrix for the single outcome
     eta_post_2d = eta_post_3d[:, :, 1]
@@ -400,16 +364,16 @@ function _reconstruct(
 end
 
 
-# Version 1.0.3 (2026-08-11)
-# Purpose: Reconstructs posterior summaries for multivariate models.
-# Rationale: This version is confirmed to be correct and complete, ensuring it
-#            returns all necessary outputs including raw predictions and waic.
 function _reconstruct(
     arch::MultivariateArchitecture, mode::String, chain, M::NamedTuple, PS,
     alpha::Float64
 )
     # --- 1. Metadata and Dimension Discovery ---
-    n_samples_val = size(chain, 1)
+    n_samples_val = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3) # For MCMCChains
+    end
     N_tot_val = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
     outcomes_N_val = M.outcomes_N
 
@@ -419,12 +383,10 @@ function _reconstruct(
     )
   
     # --- 3. Linear Predictor Assembly ---
-    eta_latent_post = _modular_eta_assembly(
-        registry, M, PS, n_samples_val, outcomes_N_val
-    )
+    eta_latent_post = _modular_eta_assembly(registry, M, PS, n_samples_val, outcomes_N_val)
 
     # --- 4. Apply Correlation Structure ---
-    L_corr_samples = get_params_vector(chain, "L_corr", outcomes_N_val * outcomes_N_val)
+    L_corr_samples = get_params_matrix(chain, "L_corr", outcomes_N_val * outcomes_N_val)
     eta_post = similar(eta_latent_post)
     for s in 1:n_samples_val
         L_s = reshape(L_corr_samples[s, :], outcomes_N_val, outcomes_N_val)
@@ -459,16 +421,15 @@ function _reconstruct(
 end
 
 
-# Version 1.0.2 (2026-08-11)
-# Purpose: Main reconstruction entry point for multi-fidelity models.
-# Rationale: This version is confirmed to be correct and complete, ensuring it
-#            returns all necessary outputs including raw predictions, waic, and the
-#            architecture object.
 function _reconstruct(
     arch::MultifidelityArchitecture, mode::String, chain, M::NamedTuple, PS,
     alpha::Float64
 )
-    n_samples = size(chain, 1)
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3) # For MCMCChains
+    end
     N_tot = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
     outcomes_N = M.outcomes_N
 
@@ -478,9 +439,7 @@ function _reconstruct(
     )
     
     # 2. Assemble the main model's base eta
-    eta_main = _modular_eta_assembly(
-        main_registry, M, PS, n_samples, outcomes_N
-    )
+    eta_main = _modular_eta_assembly(main_registry, M, PS, n_samples, outcomes_N)
 
     # 3. Reconstruct sub-models' etas and add them to the main eta
     nested_results = Dict{Symbol, Any}()
@@ -497,9 +456,7 @@ function _reconstruct(
             sub_registry = _discover_component_realizations(
                 chain, sub_M, sub_PS, n_samples, sub_outcomes_N, sub_N_tot
             )
-            eta_sub = _modular_eta_assembly(
-                sub_registry, sub_M, sub_PS, n_samples, sub_outcomes_N
-            )
+            eta_sub = _modular_eta_assembly(sub_registry, sub_M, sub_PS, n_samples, sub_outcomes_N)
 
             rho_name = "rho_nested_$(key)"
             rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
@@ -575,41 +532,59 @@ end
 
 
 
-function _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
-    # Purpose: Assembles the full linear predictor (`eta`) from all discovered latent effects.
-    # Rationale: This function iterates through all registered effects (intercept, fixed, components)
-    #            and sums their contributions to form the final linear predictor for each observation
-    #            and each posterior sample. It correctly handles the mapping of effects from
-    #            component-specific units (e.g., spatial units) to observation-level.
-    # v1.5.9 (2026-08-06)
-    # Inputs:
-    #   - registry: A NamedTuple containing raw posterior samples for each model component.
-    #   - M: The model configuration NamedTuple (for training data).
-    #   - PS: The prediction set configuration NamedTuple (for out-of-sample data), or `nothing`.
-    #   - n_samples: The total number of posterior samples.
-    #   - outcomes_N: The number of outcome variables.
-    # Outputs: A 3D array `eta_latent` of size `[N_total x n_samples x outcomes_N]`.
 
+"""
+    _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
+
+Assembles the full linear predictor (`eta`) from all discovered latent effects.
+
+# Version
+v1.6.0 (2026-08-19)
+
+# Arguments
+- `registry`: A NamedTuple containing raw posterior samples for each model component.
+- `M`: The model configuration NamedTuple (for training data).
+- `PS`: The prediction set configuration NamedTuple (for out-of-sample data), or `nothing`.
+- `n_samples`: The total number of posterior samples.
+- `outcomes_N`: The number of outcome variables.
+
+# Returns
+- A 3D array `eta_latent` of size `[N_total x n_samples x outcomes_N]`.
+"""
+function _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
     N_tot = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
     eta_latent = zeros(Float64, N_tot, n_samples, outcomes_N)
 
-    # Add intercept and fixed effects first.
-    # These are already expanded to [N_total x n_samples x outcomes_N] by _discover_component_realizations.
-    eta_latent .+= registry.intercept
-    eta_latent .+= registry.fixed
+    # --- 1. Add Intercept ---
+    # registry.intercept is [n_samples x outcomes_N]. Reshape to [1 x n_samples x outcomes_N] for broadcasting.
+    eta_latent .+= reshape(registry.intercept, 1, n_samples, outcomes_N)
+
+    # --- 2. Add Fixed Effects ---
+    if haskey(registry, :fixed_effects) && size(registry.fixed_effects, 1) > 0
+        Xfixed_full = if isnothing(PS)
+            M.Xfixed
+        else
+            vcat(M.Xfixed, get(PS, :Xfixed, zeros(PS.y_N, size(M.Xfixed, 2))))
+        end
+
+        for k in 1:outcomes_N
+            # Effect = X * beta_k
+            eta_latent[:, :, k] .+= Xfixed_full * registry.fixed_effects[:, :, k]
+        end
+    end
 
     # Pre-compute full index vectors for spatial, temporal, and seasonal structures.
     # These map observations to their corresponding component units (e.g., spatial unit ID).
-    s_idx_full = haskey(M, :s_idx) ? (isnothing(PS) || !haskey(PS, :s_idx) ? M.s_idx : vcat(M.s_idx, PS.s_idx)) : ones(Int, N_tot)
-    t_idx_full = haskey(M, :t_idx) ? (isnothing(PS) || !haskey(PS, :t_idx) ? M.t_idx : vcat(M.t_idx, PS.t_idx)) : ones(Int, N_tot)
-    u_idx_full = haskey(M, :u_idx) ? (isnothing(PS) || !haskey(PS, :u_idx) ? M.u_idx : vcat(M.u_idx, PS.u_idx)) : ones(Int, N_tot)
+    s_idx_full = haskey(M, :s_idx) ? Array(isnothing(PS) || !haskey(PS, :s_idx) ? M.s_idx : vcat(M.s_idx, PS.s_idx)) : ones(Int, N_tot)
+    t_idx_full = haskey(M, :t_idx) ? Array(isnothing(PS) || !haskey(PS, :t_idx) ? M.t_idx : vcat(M.t_idx, PS.t_idx)) : ones(Int, N_tot)
+    u_idx_full = haskey(M, :u_idx) ? Array(isnothing(PS) || !haskey(PS, :u_idx) ? M.u_idx : vcat(M.u_idx, PS.u_idx)) : ones(Int, N_tot)
 
     # Iterate through all model components and add their effects to the linear predictor.
     for spec in M.components
-        key = spec.key # Get the component's unique identifier (e.g., :s_idx, :year)
-        if !haskey(registry, key); continue; end # Skip if no effects were reconstructed for this key.
+        key = spec.key
+        if !haskey(registry.components, key); continue; end
         
-        effects = registry[key]
+        effects = registry.components[key]
         # Determine which set of effects to use (structured, noisy, or just the default `structured`).
         effect_set = hasproperty(effects, :noisy) ? effects.noisy : effects.structured
         if isempty(effect_set); continue; end # Skip if the effect set is empty.
@@ -632,8 +607,8 @@ function _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
                     idx_vec = u_idx_full
                     eta_latent[:, :, k] .+= effect_to_add[idx_vec, :]
                 end
-            elseif spec.structure in [:smooth, :interact, :nonstationaryvariance]
-                # For smoothers, interactions, and non-stationary variance, the effect matrix
+            elseif spec.structure in [:smooth, :interact, :nonstationaryvariance, :svc]
+                # For smoothers, interactions, SVC, and non-stationary variance, the effect matrix
                 # is typically already expanded to [N_total x n_samples].
                 eta_latent[:, :, k] .+= effect_set[k]
             elseif spec.structure == :mixed
@@ -687,7 +662,7 @@ function _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
     if haskey(M, :log_offsets)
         for k in 1:outcomes_N
             # `offset_full` is constructed for the current outcome `k`.
-            offset_full = isnothing(PS) ? M.log_offsets[:,k] : vcat(M.log_offsets[:,k], get(PS, :log_offsets, zeros(PS.y_N, outcomes_N))[:,k])
+            offset_full = Array(isnothing(PS) ? M.log_offsets[:,k] : vcat(M.log_offsets[:,k], get(PS, :log_offsets, zeros(PS.y_N, outcomes_N))[:,k]))
             eta_latent[:, :, k] .+= offset_full
         end
     end
@@ -698,21 +673,33 @@ end
 
 
 
+"""
+    _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
 
-# Version 1.1.1 (2026-08-11)
-# Purpose: Generates predictions and log-likelihood values from eta.
-# Rationale:   more robust. It now checks the likelihood
-#            family before attempting to extract family-specific parameters like
-#            `y_sigma` (for Gaussian) or `r_nb` (for Negative Binomial). This prevents
-#            "Parameter not discovered" warnings when running models with other
-#            likelihoods (e.g., Poisson).
+Generates predictions and log-likelihood values from the posterior `eta` samples.
+
+# Version
+v1.2.0 (2026-08-19)
+
+# Arguments
+- `eta_samples`: A matrix of posterior linear predictor samples `[N_obs, n_samples]`.
+- `chain`: The MCMC chain object.
+- `M`: The main model configuration.
+- `PS`: The prediction set configuration, or `nothing`.
+- `outcomes_N`: The number of outcomes.
+- `k`: The index of the current outcome.
+
+# Returns
+- A `NamedTuple` containing `p_denoised`, `p_noisy`, and `log_lik` matrices.
+"""
+
 function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
     n_samples = size(eta_samples, 2)
     N_train = M.y_N
     N_pred = isnothing(PS) ? 0 : PS.y_N
     N_tot = N_train + N_pred
 
-    y_obs_k = outcomes_N > 1 ? M.y_obs[:, k] : M.y_obs
+    y_obs_k = Array(outcomes_N > 1 ? M.y_obs[:, k] : M.y_obs)
     
     lik_spec = M.likelihood_specs[k]
     family = string(get(lik_spec, :family, "gaussian"))
@@ -722,18 +709,14 @@ function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
     p_denoised_samples = similar(eta_samples)
     for s in 1:n_samples
         p_denoised_samples[:, s] = _apply_link_and_lik(
-            family, eta_samples[:, s], use_zi, phi_zi_samples[s]
+            family, view(eta_samples, :, s), use_zi, phi_zi_samples[s]
         )
     end
 
     p_noisy_samples = similar(eta_samples)
     log_lik_samples = zeros(Float64, N_train, n_samples)
 
-    # FIX: Conditionally get parameters based on the likelihood family.
-    y_sigma_samples = if family in [
-        "gaussian", "lognormal", "student_t", "laplace", "half_normal",
-        "half_student_t"
-    ]
+    y_sigma_samples = if family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
         get_params_vector(chain, "y_sigma", outcomes_N)
     else
         ones(Float64, n_samples, outcomes_N)
@@ -745,29 +728,24 @@ function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
         ones(Float64, n_samples, outcomes_N)
     end
 
-    trials_full = haskey(M, :trials) ? (isnothing(PS) ? M.trials[:,k] : vcat(M.trials[:,k], get(PS, :trials, ones(Int, PS.y_N)))) : ones(Int, N_tot)
+    trials_full = Array(haskey(M, :trials) ? (isnothing(PS) ? M.trials[:,k] : vcat(M.trials[:,k], get(PS, :trials, ones(Int, PS.y_N, outcomes_N))[:,k])) : ones(Int, N_tot))
     
-    family_trait = get_model_family(family)
-
     for s in 1:n_samples
-        phi_zi_s = phi_zi_samples[s]
+        phi_zi_s = phi_zi_samples[s, 1]
         y_sigma_s = y_sigma_samples[s, k]
         r_nb_s = r_nb_samples[s, k]
         
-        for i in 1:N_tot
-            eta_is = eta_samples[i, s]
-            
-            lik_obj = bstm_Likelihood(
-                family, [eta_is]; phi_zi=phi_zi_s, r_nb=r_nb_s,
-                sigma_y=y_sigma_s, trial=trials_full[i]
-            )
-            dist = get_dist_ref(lik_obj.family, lik_obj, eta_is, y_sigma_s)
-            
-            p_noisy_samples[i, s] = rand(dist) 
+        # Explicitly loop to avoid broadcasting issues with keyword arguments.
+        lik_obj_vec = [
+            bstm_Likelihood(family, eta_samples[i, s]; phi_zi=phi_zi_s, r_nb=r_nb_s, sigma_y=y_sigma_s, trial=trials_full[i])
+            for i in 1:N_tot
+        ]
+        
+        p_noisy_samples[:, s] = rand.(lik_obj_vec)
 
-            if i <= N_train
-                log_lik_samples[i, s] = logpdf(lik_obj, y_obs_k[i])
-            end
+        if N_train > 0
+            lik_obj_train = view(lik_obj_vec, 1:N_train)
+            log_lik_samples[:, s] = logpdf.(lik_obj_train, view(y_obs_k, 1:N_train))
         end
     end
 
@@ -995,59 +973,23 @@ function post_stratification_weights(res, M, PS, samples_denoised)
 
     return weights
 end
-
-
+ 
 
 """
-    model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing, data=nothing, alpha=0.05)
+    model_results_comprehensive(model::DynamicPPL.Model, chain; ...)
 
 The primary post-processing engine that generates comprehensive summaries,
 diagnostics, and plots from a fitted `bstm` model and MCMC chain.
-
-# Version
-v1.6.4 (2026-08-13)
-
-# Rationale
-This function is the main entry point for model interpretation. It orchestrates the
-entire post-processing pipeline, from reconstructing latent effects to generating
-final plots and performance metrics.   correctly handle
-the `strata_info` for post-stratification weights, ensuring they are calculated
-when an `au` object is provided, and it merges the weights into the `pstats`
-output for better consistency.
-
-# Workflow
-1.  **Architecture Dispatch**: Determines the model architecture (univariate,
-    multivariate, etc.) from the model configuration `M`.
-2.  **Core Reconstruction**: Calls the appropriate `_reconstruct` method, which is
-    the engine for calculating all posterior quantities (latent effects, predictions,
-    log-likelihoods).
-3.  **Post-Stratification**: If applicable, it calculates post-stratification
-    weights using the raw denoised predictions from the reconstruction step.
-4.  **Performance Metrics**: Computes standard performance metrics (RMSE, Pearson's R)
-    from the summarized predictions, correctly handling both univariate and
-    multivariate models.
-5.  **MCMC Diagnostics**: Extracts key MCMC diagnostics (R-hat, ESS, sampling time)
-    from the `chain` object for assessing model convergence.
-6.  **Plot Generation**: Calls `bstm_plots` to generate a standardized set of
-    visualizations, including posterior predictive checks and plots of all latent
-    effects.
-7.  **Final Assembly**: Consolidates all metrics, posterior summaries (`pstats`),
-    and plots into a single, comprehensive `NamedTuple` for user inspection.
-
-# Arguments
-- `model::DynamicPPL.Model`: The fitted Turing model object.
-- `chain`: The `MCMCChains.Chains` object from the fitted model.
-- `au`: An optional object containing areal unit information (`polygons`, `centroids`, `strata_info`).
-- `data`: An optional `DataFrame`, used for plotting if different from the training data.
-- `alpha::Float64`: The significance level for credible intervals.
-
-# Returns
-- A `NamedTuple` containing:
-  - `metrics`: A `NamedTuple` with performance and diagnostic metrics.
-  - `pstats`: A `NamedTuple` with detailed posterior summaries of all model effects and predictions.
-  - `plots`: A `NamedTuple` containing all generated plots.
 """
 function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing, data=nothing, alpha=0.05)
+    # --- No initial chain standardization ---
+    
+    n_samples = if occursin("FlexiChain", string(typeof(chain)))
+        size(chain, 1) * FlexiChains.nchains(chain)
+    else
+        size(chain, 1) * size(chain, 3)
+    end
+    
     # --- 1. Metadata and Architecture Extraction ---
     M = model.args.M
     y_obs = M.y_obs
@@ -1062,7 +1004,8 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     end
 
     # --- 2. Core Reconstruction ---
-    res = _reconstruct(arch_type, "model_results", chain, M, nothing, alpha)
+    # Pass the original chain object directly to the reconstruction engine.
+    res = _reconstruct(arch_type, "model_results", chain, M, nothing, alpha) # n_samples is now calculated inside _reconstruct
 
     # --- 2.5 Post-Stratification Weight Calculation (if applicable) ---
     post_strat_weights = nothing 
@@ -1084,7 +1027,7 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
         rmse_val = Float64[]
         r_pearson = Float64[]
         for k in 1:M.outcomes_N
-            y_obs_k = y_obs[:, k]
+            y_obs_k = Array(y_obs[:, k]) # Ensure y_obs is on CPU
             y_pred_k = pred_summary[k].mean
             valid_idx_k = findall(x -> !isnan(x) && !isnothing(x), y_obs_k)
             if !isempty(valid_idx_k)
@@ -1098,9 +1041,10 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
         end
     else # Univariate
         y_pred = hasproperty(pred_summary, :mean) ? pred_summary.mean : []
-        valid_idx = findall(x -> !isnan(x) && !isnothing(x), y_obs)
+        y_obs_cpu = Array(y_obs) # Ensure y_obs is on CPU
+        valid_idx = findall(x -> !isnan(x) && !isnothing(x), y_obs_cpu)
         if !isempty(valid_idx)
-            obs_v = y_obs[valid_idx]
+            obs_v = y_obs_cpu[valid_idx]
             pred_v = y_pred[valid_idx]
             rmse_val = sqrt(mean((obs_v .- pred_v).^2))
             try; r_pearson = cor(obs_v, pred_v); catch; r_pearson = 0.0; end
@@ -1112,8 +1056,13 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     # --- 4. MCMC Diagnostics ---
     mean_rhat, min_ess, sampling_time = 1.0, 0.0, 0.0 
     try
-        chains_obj = MCMCChains.Chains(chain)
-        df_stats = DataFrame(MCMCChains.summarize(chains_obj))
+        # This block now handles both FlexiChains and MCMCChains
+        if occursin("FlexiChain", string(typeof(chain)))
+            df_stats = DataFrame(StatsBase.summarystats(MCMCChains.Chains(chain)))
+        else
+            df_stats = DataFrame(StatsBase.summarystats(chain))
+        end
+
         if hasproperty(df_stats, :rhat); r_vals = filter(x -> !isnan(x) && x > 0, df_stats.rhat); mean_rhat = isempty(r_vals) ? 1.0 : mean(r_vals); end
         e_col = hasproperty(df_stats, :ess_bulk) ? :ess_bulk : (hasproperty(df_stats, :ess) ? :ess : nothing)
         if !isnothing(e_col); e_vals = filter(x -> !isnan(x) && x >= 0, df_stats[!, e_col]); min_ess = isempty(e_vals) ? 0.0 : minimum(e_vals); end
@@ -1122,7 +1071,8 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     
     # --- 5. Plot Generation ---
     data_for_plots = isnothing(data) ? get(M, :data, nothing) : data
-    plots = bstm_plots(res, M; au=au, data=data_for_plots)
+    # Pass the original model and chain to bstm_plots
+    plot_results = bstm_plots(model, chain, res, M; au=au, data=data_for_plots)
 
     # --- 6. Final Assembly ---
     pstats_final = merge(res, (post_strat_weights=post_strat_weights,))
@@ -1130,18 +1080,90 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     return (
         metrics = (rmse = rmse_val, r_pearson = r_pearson, ess = min_ess, rhat = mean_rhat, waic = get(res, :waic, 0.0), time = sampling_time),
         pstats = pstats_final,
-        plots = plots
+        plots = plot_results.plots,
+        plots_data = plot_results.plots_data
     )
 end
 
 
+
+# New helper function for generating conditional predictions
+function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symbol;
+                                           second_cov::Union{Symbol, Nothing}=nothing,
+                                           n_points::Int=50, alpha::Float64=0.05)
+    
+    # Create a base DataFrame for prediction by taking the first row of the original data
+    # and replicating it. Then, set other covariates to their mean/mode.
+    base_df = DataFrame(M.data[1:1, :])
+    for col in names(M.data)
+        col_sym = Symbol(col)
+        if col_sym != target_cov && (isnothing(second_cov) || col_sym != second_cov)
+            if eltype(M.data[!, col_sym]) <: Number
+                base_df[1, col_sym] = mean(M.data[!, col_sym])
+            else # Categorical
+                # For categorical, pick the mode or first level
+                # Ensure the column type is preserved
+                if isempty(levels(M.data[!, col_sym]))
+                    @warn "Categorical covariate $(col_sym) has no levels. Skipping setting default value."
+                    continue
+                end
+                base_df[1, col_sym] = first(levels(M.data[!, col_sym]))
+            end
+        end
+    end
+
+    if isnothing(second_cov) # 1D conditional plot
+        # Generate a range for the target covariate
+        if eltype(M.data[!, target_cov]) <: Number
+            min_val, max_val = extrema(M.data[!, target_cov])
+            cov_range = collect(range(min_val, stop=max_val, length=n_points))
+            pred_df = vcat([base_df for _ in 1:n_points]...)
+            pred_df[!, target_cov] = cov_range
+        else # Categorical
+            unique_levels = unique(M.data[!, target_cov])
+            n_levels = length(unique_levels)
+            pred_df = vcat([base_df for _ in 1:n_levels]...)
+            pred_df[!, target_cov] = unique_levels
+        end
+        
+        # Generate predictions
+        preds = predict(model_obj, chain, pred_df; n_samples=size(chain, 1), alpha=alpha)
+        return (preds.predictions_denoised, pred_df[!, target_cov])
+
+    else # 2D conditional plot (interaction)
+        if !(eltype(M.data[!, target_cov]) <: Number && eltype(M.data[!, second_cov]) <: Number)
+            @warn "2D conditional plots are currently only supported for two continuous covariates."
+            return nothing
+        end
+
+        min_val1, max_val1 = extrema(M.data[!, target_cov])
+        min_val2, max_val2 = extrema(M.data[!, second_cov])
+        range1 = collect(range(min_val1, stop=max_val1, length=n_points))
+        range2 = collect(range(min_val2, stop=max_val2, length=n_points))
+
+        pred_df_rows = DataFrame()
+        for val1 in range1
+            for val2 in range2
+                row = deepcopy(base_df)
+                row[1, target_cov] = val1
+                row[1, second_cov] = val2
+                append!(pred_df_rows, row)
+            end
+        end
+        
+        preds = predict(model_obj, chain, pred_df_rows; n_samples=size(chain, 1), alpha=alpha)
+        return (preds.predictions_denoised, range1, range2)
+    end
+end
+
+
 """
-    bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
+    bstm_plots(model_obj::DynamicPPL.Model, chain, res, M; au=nothing, data=nothing, outcome=1)
 
 Generates a standard set of diagnostic and summary plots from a fitted `bstm` model.
 
 # Version
-v1.0.4 (2026-08-13)
+v1.2.0 (2026-08-20)
 
 # Rationale
 This function is the primary visualization engine for the `bstm` framework. It takes
@@ -1149,13 +1171,17 @@ the summarized results from the reconstruction engine and produces a standardize
 set of plots for model diagnostics and interpretation. It is designed to be robust
 and flexible, correctly handling different model architectures (univariate,
 multivariate) and component types (spatial, temporal, smooth, mixed effects).
+This version now returns both the plot objects and the underlying data used to
+create them.
 
 # Workflow
 1.  **Posterior Predictive Check (PPC)**: Creates a scatter plot of observed vs.
     predicted values to assess overall model fit.
-2.  **Component-wise Plotting**: Iterates through all components defined in the model
+2.  **Fixed Effects**: Bar plots of coefficients with credible intervals.
+3.  **Conditional Effects**: Plots the expected response for varying values of one or two predictors.
+4.  **Component-wise Plotting**: Iterates through all components defined in the model
     configuration (`M.components`).
-3.  **Structure-based Dispatch**: For each component, it uses the `structure`
+5.  **Structure-based Dispatch**: For each component, it uses the `structure`
     (e.g., `:spatial`, `:temporal`, `:smooth`) to dispatch to the appropriate
     plotting logic.
     - **Spatial**: Generates choropleth maps (if polygons are provided) or scatter
@@ -1164,11 +1190,13 @@ multivariate) and component types (spatial, temporal, smooth, mixed effects).
     - **Temporal/Seasonal**: Creates line plots of the temporal or seasonal trends
       with credible interval ribbons.
     - **Smooth**: Creates line plots showing the non-linear effect of a covariate,
-      with credible interval ribbons.
-4.  **Fixed & Mixed Effects**: Generates forest plots to visualize the posterior
-    distributions of the coefficients for fixed and mixed effects.
+      with credible interval ribbons. For 2D smooths, generates surface/contour plots.
+    - **Spatially Varying Coefficients (SVC)**: Generates choropleth/heatmap plots of the estimated coefficient surface.
+6.  **Hierarchical Effects**: Visualizes the distribution of group-level parameters.
 
 # Arguments
+- `model_obj::DynamicPPL.Model`: The fitted Turing model object.
+- `chain`: The MCMC chain object from the fitted model.
 - `res`: The results `NamedTuple` from `_reconstruct`, containing summarized effects.
 - `M`: The main model configuration `NamedTuple`.
 - `au`: An optional object containing areal unit information (`polygons`, `centroids`).
@@ -1176,18 +1204,18 @@ multivariate) and component types (spatial, temporal, smooth, mixed effects).
 - `outcome`: `Int`, the index of the outcome to plot in a multivariate model.
 
 # Returns
-- A `NamedTuple` where each key corresponds to a plot type (e.g., `:ppc`,
-  `:spatial_effects`) and the value is either a `Plots.Plot` object or a
-  dictionary of plots (for smooth and mixed effects).
+- A `NamedTuple` with two fields:
+  - `plots`: A `NamedTuple` where each key corresponds to a plot type and the value is a `Plots.Plot` object or a dictionary of plots.
+  - `plots_data`: A `NamedTuple` containing the data used to generate each plot.
 """
-function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
+function bstm_plots(model_obj::DynamicPPL.Model, chain, res, M; au=nothing, data=nothing, outcome=1)
     plots = Dict{Symbol, Any}()
-    effects = res.effects
-    is_mv = res.arch isa MultivariateArchitecture
+    plots_data = Dict{Symbol, Any}()
+    effects = res.pstats.effects
+    is_mv = res.pstats.arch isa MultivariateArchitecture
     
     y_obs = get(M, :y_obs, nothing)
 
-    # Safely extract geometry information from the areal unit object.
     polygons = if !isnothing(au) && (au isa NamedTuple || au isa Dict)
         get(au, :polygons, nothing)
     else
@@ -1201,11 +1229,11 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
     end
 
     # --- 1. Posterior Predictive Check ---
-    if hasproperty(res, :predictions_denoised)
+    if hasproperty(res.pstats, :predictions_denoised)
         if isnothing(y_obs)
             @info "Skipping PPC plot: Observation data not found."
         else
-            pred_summary = is_mv ? res.predictions_denoised[outcome] : res.predictions_denoised 
+            pred_summary = is_mv ? res.pstats.predictions_denoised[outcome] : res.pstats.predictions_denoised 
             if !isnothing(pred_summary) && hasproperty(pred_summary, :mean)
                 y_p, y_o = vec(pred_summary.mean), is_mv ? vec(y_obs[:, outcome]) : vec(y_obs)
                 if length(y_p) == length(y_o)
@@ -1216,6 +1244,7 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
                         plot!(p_ppc, [min_val, max_val], [min_val, max_val], color=:red, ls=:dash, lw=1.5)
                     end
                     plots[:ppc] = p_ppc
+                    plots_data[:ppc] = (predicted = y_p, observed = y_o)
                 end
             end
         end
@@ -1244,7 +1273,71 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
         return nothing
     end
 
-    # --- 3. Iterate through model components to generate plots ---
+    # --- 3. Fixed Effects Plots ---
+    if hasproperty(effects, :fixed) && !isnothing(effects.fixed)
+        fe_summary = is_mv ? effects.fixed[outcome] : effects.fixed
+        if hasproperty(fe_summary, :mean) && !all(iszero, fe_summary.mean) 
+            fm, fl, fu = vec(fe_summary.mean), vec(fe_summary.lower), vec(fe_summary.upper)
+            if !isempty(fm)
+                coef_names = haskey(M, :Xfixed_names) ? string.(M.Xfixed_names) : ["Coef_$i" for i in 1:length(fm)]
+                p_forest = scatter(fm, 1:length(fm), xerror=(fm .- fl, fu .- fm), yticks=(1:length(fm), coef_names), title="Fixed Effects Coefficients", xlabel="Estimate", markersize=4, color=:black, legend=false)
+                vline!(p_forest, [0], color=:red, ls=:dash, lw=1)
+                plots[:fixed_effects] = p_forest
+                plots_data[:fixed_effects] = (names=coef_names, mean=fm, lower=fl, upper=fu)
+            end
+        end
+    end
+
+    # --- 4. Conditional Effects Plots ---
+    conditional_plots = Dict{Symbol, Any}()
+    conditional_plots_data = Dict{Symbol, Any}()
+    all_covariates = String[]
+    if haskey(M, :Xfixed_names); append!(all_covariates, string.(M.Xfixed_names)); end
+    for spec in M.components
+        if spec.structure == :smooth
+            vars = get(spec.params, :positional_args, [])
+            append!(all_covariates, string.(vars))
+        end
+    end
+    all_covariates = unique(Symbol.(all_covariates))
+
+    for cov_sym in all_covariates
+        if !hasproperty(M.data, cov_sym); continue; end
+
+        if eltype(M.data[!, cov_sym]) <: Number # Continuous covariate
+            cond_preds_res = _generate_conditional_predictions(model_obj, chain, M, cov_sym)
+            if !isnothing(cond_preds_res)
+                cond_preds, cov_range = cond_preds_res
+                cond_summary = is_mv ? cond_preds[outcome] : cond_preds
+                
+                cm, cl, cu = vec(cond_summary.mean), vec(cond_summary.lower), vec(cond_summary.upper)
+                p_cond = plot(cov_range, cm, ribbon=(cm .- cl, cu .- cm), title="Conditional Effect: $(cov_sym)", xlabel=string(cov_sym), ylabel="Expected Response", lw=2, fillalpha=0.2, color=:blue, legend=false)
+                plot_key = Symbol("conditional_$(cov_sym)")
+                conditional_plots[plot_key] = p_cond
+                conditional_plots_data[plot_key] = (covariate_values=cov_range, mean=cm, lower=cl, upper=cu)
+            end
+        else # Categorical covariate
+            cond_preds_res = _generate_conditional_predictions(model_obj, chain, M, cov_sym)
+            if !isnothing(cond_preds_res)
+                cond_preds, cov_levels = cond_preds_res
+                cond_summary = is_mv ? cond_preds[outcome] : cond_preds
+                
+                cm, cl, cu = vec(cond_summary.mean), vec(cond_summary.lower), vec(cond_summary.upper)
+                p_cond = bar(string.(cov_levels), cm, yerror=(cm .- cl, cu .- cm), title="Conditional Effect: $(cov_sym)", xlabel=string(cov_sym), ylabel="Expected Response", color=:blue, legend=false)
+                plot_key = Symbol("conditional_$(cov_sym)")
+                conditional_plots[plot_key] = p_cond
+                conditional_plots_data[plot_key] = (covariate_levels=string.(cov_levels), mean=cm, lower=cl, upper=cu)
+            end
+        end
+    end
+    if !isempty(conditional_plots)
+        plots[:conditional_effects] = conditional_plots
+        plots_data[:conditional_effects] = conditional_plots_data
+    end
+
+    # --- 5. Component-wise Plotting ---
+    smooth_effects_plots = Dict{Symbol, Any}()
+    smooth_effects_plots_data = Dict{Symbol, Any}()
     for spec in M.components
         key = spec.key
         
@@ -1271,80 +1364,130 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
         end
 
         if spec.structure == :spatial
+            plot_key = Symbol("spatial_$(key)")
             p = _create_choropleth_plot(main_effect_summary, "Spatial Effect: $key", polygons, centroids)
-            if !isnothing(p); plots[Symbol("spatial_$(key)")] = p; end
+            if !isnothing(p)
+                plots[plot_key] = p
+                plots_data[plot_key] = (values=vec(main_effect_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+            end
 
             if hasproperty(component_effects, :structured)
                 struct_summary = is_mv ? component_effects.structured[outcome] : component_effects.structured
                 p_struct = _create_choropleth_plot(struct_summary, "Structured Effect: $key", polygons, centroids)
-                if !isnothing(p_struct); plots[Symbol("structured_$(key)")] = p_struct; end
+                if !isnothing(p_struct)
+                    plot_key_struct = Symbol("structured_$(key)")
+                    plots[plot_key_struct] = p_struct
+                    plots_data[plot_key_struct] = (values=vec(struct_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                end
             end
             if hasproperty(component_effects, :unstructured)
                 unstruct_summary = is_mv ? component_effects.unstructured[outcome] : component_effects.unstructured
                 p_unstruct = _create_choropleth_plot(unstruct_summary, "Unstructured Effect: $key", polygons, centroids)
-                if !isnothing(p_unstruct); plots[Symbol("unstructured_$(key)")] = p_unstruct; end
+                if !isnothing(p_unstruct)
+                    plot_key_unstruct = Symbol("unstructured_$(key)")
+                    plots[plot_key_unstruct] = p_unstruct
+                    plots_data[plot_key_unstruct] = (values=vec(unstruct_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                end
             end
 
         elseif spec.structure == :temporal
+            plot_key = Symbol("temporal_$(key)")
             if !isnothing(data) && haskey(M, :t_idx_var) && hasproperty(data, M.t_idx_var)
                 time_var = M.t_idx_var
                 time_coords = data[!, time_var]
-                
                 p_order = sortperm(time_coords)
-                
                 tm, tl, tu = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-                
-                plots[Symbol("temporal_$(key)")] = plot(
-                    time_coords[p_order], 
-                    tm[p_order], 
-                    ribbon=(tm[p_order] .- tl[p_order], tu[p_order] .- tm[p_order]), 
-                    title="Temporal Trend: $key", 
-                    lw=2, fillalpha=0.2, color=:royalblue, legend=false, 
-                    xlabel=string(time_var)
-                )
+                plots[plot_key] = plot(time_coords[p_order], tm[p_order], ribbon=(tm[p_order] .- tl[p_order], tu[p_order] .- tm[p_order]), title="Temporal Trend: $key", lw=2, fillalpha=0.2, color=:royalblue, legend=false, xlabel=string(time_var))
+                plots_data[plot_key] = (time=time_coords[p_order], mean=tm[p_order], lower=tl[p_order], upper=tu[p_order])
             else
                 tm, tl, tu = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-                plots[Symbol("temporal_$(key)")] = plot(tm, ribbon=(tm .- tl, tu .- tm), title="Temporal Trend: $key", lw=2, fillalpha=0.2, color=:royalblue, legend=false, xlabel="Time Index")
+                plots[plot_key] = plot(tm, ribbon=(tm .- tl, tu .- tm), title="Temporal Trend: $key", lw=2, fillalpha=0.2, color=:royalblue, legend=false, xlabel="Time Index")
+                plots_data[plot_key] = (time=1:length(tm), mean=tm, lower=tl, upper=tu)
             end
 
         elseif spec.structure == :seasonal
+            plot_key = Symbol("seasonal_$(key)")
             um, ul, uu = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-            plots[Symbol("seasonal_$(key)")] = plot(um, ribbon=(um .- ul, uu .- um), title="Seasonal Component: $key", lw=2, fillalpha=0.2, color=:forestgreen, legend=false, xlabel="Period")
+            plots[plot_key] = plot(um, ribbon=(um .- ul, uu .- um), title="Seasonal Component: $key", lw=2, fillalpha=0.2, color=:forestgreen, legend=false, xlabel="Period")
+            plots_data[plot_key] = (period=1:length(um), mean=um, lower=ul, upper=uu)
 
         elseif spec.structure == :smooth
             if isnothing(data); @info "Skipping smooth effect plot for '$key': `data` not provided."; continue; end
             
-            var_sym = Symbol(spec.var)
-            if hasproperty(data, var_sym)
-                cov_data = data[!, var_sym]
-                p_order = sortperm(cov_data)
-                sm, sl, su = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-                
-                if !haskey(plots, :smooth_effects); plots[:smooth_effects] = Dict{Symbol, Any}(); end
-                plots[:smooth_effects][var_sym] = plot(cov_data[p_order], sm[p_order], ribbon=(sm[p_order] .- sl[p_order], su[p_order] .- sm[p_order]), title="Smooth Effect: $var_sym", xlabel=string(var_sym), ylabel="Latent Effect", legend=false, color=:darkorange, fillalpha=0.2)
+            vars = get(spec.params, :positional_args, [])
+            if length(vars) == 1 # 1D smooth
+                var_sym = Symbol(vars[1])
+                if hasproperty(data, var_sym)
+                    cov_data = data[!, var_sym]
+                    p_order = sortperm(cov_data)
+                    sm, sl, su = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
+                    
+                    smooth_effects_plots[var_sym] = plot(cov_data[p_order], sm[p_order], ribbon=(sm[p_order] .- sl[p_order], su[p_order] .- sm[p_order]), title="Smooth Effect: $var_sym", xlabel=string(var_sym), ylabel="Latent Effect", legend=false, color=:darkorange, fillalpha=0.2)
+                    smooth_effects_plots_data[var_sym] = (covariate_values=cov_data[p_order], mean=sm[p_order], lower=sl[p_order], upper=su[p_order])
+                end
+            elseif length(vars) == 2 # 2D smooth (interaction)
+                var1_sym, var2_sym = Symbol(vars[1]), Symbol(vars[2])
+                if hasproperty(data, var1_sym) && hasproperty(data, var2_sym)
+                    cond_preds_res = _generate_conditional_predictions(model_obj, chain, M, var1_sym, second_cov=var2_sym)
+                    if !isnothing(cond_preds_res)
+                        cond_preds, range1, range2 = cond_preds_res
+                        cond_summary = is_mv ? cond_preds[outcome] : cond_preds
+                        
+                        grid_mean = reshape(vec(cond_summary.mean), length(range1), length(range2))
+                        
+                        plot_key = Symbol("$(var1_sym)_$(var2_sym)")
+                        smooth_effects_plots[plot_key] = heatmap(range1, range2, grid_mean', title="2D Smooth Effect: $(var1_sym) & $(var2_sym)", xlabel=string(var1_sym), ylabel=string(var2_sym), c=:viridis, legend=false)
+                        smooth_effects_plots_data[plot_key] = (x=range1, y=range2, z=grid_mean)
+                    end
+                end
+            end
+        end
+    end
+    if !isempty(smooth_effects_plots)
+        plots[:smooth_effects] = smooth_effects_plots
+        plots_data[:smooth_effects] = smooth_effects_plots_data
+    end
+
+    # --- 6. Spatiotemporal Interaction Effects ---
+    if hasproperty(effects, :st_interaction) && !isnothing(effects.st_interaction)
+        st_summary = is_mv ? effects.st_interaction[outcome] : effects.st_interaction
+        if hasproperty(st_summary, :mean) && !all(iszero, st_summary.mean)
+            if haskey(M, :s_N) && haskey(M, :t_N)
+                st_mean_grid = reshape(vec(st_summary.mean), M.s_N, M.t_N)
+                p_st_heatmap = heatmap(1:M.t_N, 1:M.s_N, st_mean_grid, title="Spatiotemporal Interaction", xlabel="Time Index", ylabel="Spatial Unit Index", c=:viridis, legend=false)
+                plots[:st_interaction_heatmap] = p_st_heatmap
+                plots_data[:st_interaction_heatmap] = (time_idx=1:M.t_N, space_idx=1:M.s_N, mean_effect=st_mean_grid)
+            else
+                @warn "Skipping spatiotemporal interaction plot: M.s_N or M.t_N not found."
             end
         end
     end
 
-    # --- 4. Fixed and Mixed Effects Plots ---
-    if hasproperty(effects, :fixed) && !isnothing(effects.fixed)
-        fe_summary = is_mv ? effects.fixed[outcome] : effects.fixed
-        if hasproperty(fe_summary, :mean) && !all(iszero, fe_summary.mean) 
-            fm, fl, fu = vec(fe_summary.mean), vec(fe_summary.lower), vec(fe_summary.upper)
-            if !isempty(fm)
-                coef_names = haskey(M, :Xfixed_names) ? string.(M.Xfixed_names) : ["Coef_$i" for i in 1:length(fm)]
-                p_forest = scatter(fm, 1:length(fm), xerror=(fm .- fl, fu .- fm), yticks=(1:length(fm), coef_names), title="Fixed Effects Coefficients", xlabel="Estimate", markersize=4, color=:black, legend=false)
-                vline!(p_forest, [0], color=:red, ls=:dash, lw=1)
-                plots[:fixed_effects] = p_forest
+    # --- 7. Spatially Varying Coefficients (SVC) Plots ---
+    for spec in M.components
+        if spec.structure == :svc
+            key = spec.key
+            if !haskey(effects, key) || (isnothing(polygons) && isnothing(centroids)); continue; end
+            
+            svc_effect_summary = is_mv ? effects[key].structured[outcome] : effects[key].structured
+            if !isnothing(svc_effect_summary) && hasproperty(svc_effect_summary, :mean)
+                plot_key = Symbol("svc_$(key)")
+                p_svc = _create_choropleth_plot(svc_effect_summary, "SVC Effect: $(key)", polygons, centroids)
+                if !isnothing(p_svc)
+                    plots[plot_key] = p_svc
+                    plots_data[plot_key] = (values=vec(svc_effect_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                end
             end
         end
     end
 
+    # --- 8. Hierarchical Effects (Mixed Effects) Plots ---
     if hasproperty(effects, :mixed_effects) && !isnothing(effects.mixed_effects)
         mixed_plots = Dict{Symbol, Any}()
+        mixed_plots_data = Dict{Symbol, Any}()
         for (key, effect_summary) in pairs(effects.mixed_effects)
             group_var = Symbol(effect_summary.group_var)
-            group_levels = hasproperty(data, group_var) ? string.(levels(data[!, group_var])) : nothing 
+            group_levels = hasproperty(M.data, group_var) ? unique(M.data[!, group_var]) : nothing
 
             summaries_to_plot = is_mv ? effect_summary.summaries[outcome] : effect_summary.summaries
 
@@ -1354,19 +1497,30 @@ function bstm_plots(res, M; au=nothing, data=nothing, outcome=1)
                     lowers = vec(summary.lower)
                     uppers = vec(summary.upper)
                     n_levels = length(means) 
-                    y_ticks_labels = isnothing(group_levels) || length(group_levels) != n_levels ? ["Level $i" for i in 1:n_levels] : group_levels
+                    
+                    y_ticks_labels = isnothing(group_levels) || length(group_levels) != n_levels ? ["Level $i" for i in 1:n_levels] : string.(group_levels)
+                    
                     p_title = "Mixed Effect: $(term_name) | $(group_var)"
+                    
                     p_forest = scatter(means, 1:n_levels, xerror=(means .- lowers, uppers .- means), yticks=(1:n_levels, y_ticks_labels), title=p_title, xlabel="Effect Size", markersize=4, color=:black, legend=false, yflip=true)
                     vline!(p_forest, [0], color=:red, ls=:dash, lw=1)
-                    mixed_plots[Symbol("$(key)_$(term_name)")] = p_forest
+                    
+                    plot_key = Symbol("$(key)_$(term_name)")
+                    mixed_plots[plot_key] = p_forest
+                    mixed_plots_data[plot_key] = (group_levels=y_ticks_labels, mean=means, lower=lowers, upper=uppers)
                 end
             end
         end
-        if !isempty(mixed_plots); plots[:mixed_effects] = mixed_plots; end
+        if !isempty(mixed_plots)
+            plots[:mixed_effects] = mixed_plots
+            plots_data[:mixed_effects] = mixed_plots_data
+        end
     end
 
-    return NamedTuple(plots)
+    return (plots=NamedTuple(plots), plots_data=NamedTuple(plots_data))
 end
+
+
 
 
 """
@@ -1597,7 +1751,7 @@ v1.0.1 (2026-08-13)
 This function provides a simple and standardized way to visualize all the output
 plots from a `bstm` model run. It is designed to handle the nested structure of the
 `plots` object returned by `model_results_comprehensive`, which may contain both
-individual plot objects and dictionaries of plots (e.g., for multiple smooth or
+individual plot objects and dictionaries of plots (for example, for multiple smooth or
 mixed effects).
 
 # Arguments
@@ -2038,3 +2192,4 @@ function compare_models(loo_a_report, loo_b_report; model_names=["Model_A", "Mod
         loo_objects = (loo_a, loo_b)
     )
 end
+
