@@ -7,14 +7,16 @@ sine and cosine waves. This component can model one or more harmonics, each with
 own amplitude, phase, and potentially its own period.
 
 # Version
-v1.5.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The component models a function \\(f(t)\\) as a sum of sinusoids. It supports two
 parameterizations controlled by the `method` field:
 
 1.  **:twocoefficient (default, AD-friendly)**:
-    \$f(t) = \\sum_{k=1}^{N_{harmonics}} \\left( \\beta_{\\cos,k} \\cos\\left(\\frac{2\\pi k t}{P_k}\\right) + \\beta_{\\sin,k} \\sin\\left(\\frac{2\\pi k t}{P_k}\\right) \\right)\$
+    \$f(t) = \\sum_{k=1}^{N_{harmonics}} \\left( \\beta_{\\cos,k} \\cos\\left(\\frac{2\\pi k
+      t}{P_k}\\right) + \\beta_{\\sin,k} \\sin\\left(\\frac{2\\pi k t}{P_k}\\right)
+      \\right)\$
     This is the recommended method as it is more efficient for gradient-based MCMC.
 
 2.  **:ampphase (didactic)**:
@@ -96,7 +98,8 @@ function get_precomputes(
     m::Harmonic, M::NamedTuple, mod_data::Dict
 )::NamedTuple
     # Validate that a seasonal index variable is provided.
-    variables = mod_data[:variables]
+    raw_vars = get(mod_data, :variables, Symbol[])
+    variables = raw_vars isa AbstractVector ? raw_vars : [raw_vars]
     if isempty(variables)
         error(
             "The Harmonic model requires a seasonal index variable, e.g., " *
@@ -106,15 +109,8 @@ function get_precomputes(
 
     # Extract the seasonal index variable from the data.
     u_var_sym = Symbol(variables[1])
-    if !hasproperty(M.data, u_var_sym)
-        error(
-            "Seasonal index variable ':$u_var_sym' for Harmonic model not found " *
-            "in data."
-        )
-    end
-    
-    # All data is on the CPU.
-    u_idx = M.data[!, u_var_sym]
+    u_idx = hasproperty(M, :data) && hasproperty(M.data, u_var_sym) ? M.data[!,
+        u_var_sym] : collect(1:get(M, :N_time, 12))
     u_N = length(unique(u_idx))
     u_idx_var = u_var_sym
 
@@ -124,7 +120,9 @@ function get_precomputes(
         u_coords=u_coords, 
         u_idx=u_idx,
         u_N=u_N, 
-        u_idx_var=u_idx_var
+        u_idx_var=u_idx_var,
+        model_type=:harmonic,
+        period=m.period
     )
 end
 
@@ -200,7 +198,11 @@ function get_updates(
         """
     end
 
-    init_param = if m.method == :twocoefficient; p_names.beta_cos; else; p_names.amplitude; end
+    init_param = if m.method == :twocoefficient
+        p_names.beta_cos
+    else
+        p_names.amplitude
+    end
     
     return """
         # --- Harmonic Component: $(spec.key) ($(m.method)) ---
@@ -212,7 +214,7 @@ function get_updates(
             for k in 1:$(m.nharmonics)
                 $(loop_body)
             end
-            $(eta_target) .+= view($(p_names.sre), u_idx_val)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), u_idx_val)
         end
     """
 end
@@ -258,7 +260,8 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
 
         # --- Get Period Samples ---
-        period_name = _find_parameter(p_names, string(p_names_k.period), k_outcome, is_multivariate_model)
+        period_name = _find_parameter(p_names, string(p_names_k.period), k_outcome,
+            is_multivariate_model)
         period_samples = if m.period isa Real
             fill(m.period, n_samples, m.nharmonics)
         elseif m.period isa Vector{<:Real}
@@ -290,8 +293,10 @@ function get_effects(
         # --- Get Coefficient Samples and Compute Effect ---
         local reconstructed_effects_k
         if m.method == :twocoefficient
-            b_cos_name = _find_parameter(p_names, string(p_names_k.beta_cos), k_outcome, is_multivariate_model)
-            b_sin_name = _find_parameter(p_names, string(p_names_k.beta_sin), k_outcome, is_multivariate_model)
+            b_cos_name = _find_parameter(p_names, string(p_names_k.beta_cos), k_outcome,
+                is_multivariate_model)
+            b_sin_name = _find_parameter(p_names, string(p_names_k.beta_sin), k_outcome,
+                is_multivariate_model)
             
             if isempty(b_cos_name) || isempty(b_sin_name)
                 @warn "beta_cos or beta_sin for Harmonic $(spec.key) not found. Returning zero-matrix."
@@ -307,11 +312,14 @@ function get_effects(
             b_sin_tensor = reshape(b_sin_samples, 1, n_samples, m.nharmonics)
 
             harmonic_effects = b_cos_tensor .* cos_angle .+ b_sin_tensor .* sin_angle
-            reconstructed_effects_k = dropdims(sum(harmonic_effects, dims=3), dims=3) # Result is [u_N, n_samples]
+            reconstructed_effects_k = dropdims(sum(harmonic_effects, dims=3),
+                dims=3) # Result is [u_N, n_samples]
 
         else # :ampphase
-            amp_name = _find_parameter(p_names, string(p_names_k.amplitude), k_outcome, is_multivariate_model)
-            phase_name = _find_parameter(p_names, string(p_names_k.phase), k_outcome, is_multivariate_model)
+            amp_name = _find_parameter(p_names, string(p_names_k.amplitude), k_outcome,
+                is_multivariate_model)
+            phase_name = _find_parameter(p_names, string(p_names_k.phase), k_outcome,
+                is_multivariate_model)
 
             if isempty(amp_name) || isempty(phase_name)
                 @warn "amplitude or phase for Harmonic $(spec.key) not found. Returning zero-matrix."
@@ -327,7 +335,8 @@ function get_effects(
             phase_tensor = reshape(phase_samples, 1, n_samples, m.nharmonics)
 
             harmonic_effects = amp_tensor .* cos.(angle_tensor .+ (2 * pi .* phase_tensor))
-            reconstructed_effects_k = dropdims(sum(harmonic_effects, dims=3), dims=3) # Result is [u_N, n_samples]
+            reconstructed_effects_k = dropdims(sum(harmonic_effects, dims=3),
+                dims=3) # Result is [u_N, n_samples]
         end
 
         # --- Index and Finalize ---

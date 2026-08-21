@@ -5,7 +5,7 @@ A component for modeling spatial or spatiotemporal point patterns. This componen
 acts as a wrapper for several point process models, selected via the `method` parameter.
 
 # Version
-v1.0.2 (2026-08-14)
+v1.0.0
 
 # Mathematical Summary
 Point process models describe the probability of observing events (points) in a given
@@ -17,7 +17,8 @@ The component supports the following methods:
 1.  **Log-Gaussian Cox Process (`:lgcp`)**:
     Models the log-intensity as a Gaussian Process (GP):
     \$\\log(\\lambda(s)) = Z(s)\$, where \$Z(s) \\sim \\mathcal{GP}(\\mu(s), k(s, s'))\$.
-    The number of points in an area \$A\$ is \$N(A) \\sim \\text{Poisson}(\\int_A \\lambda(s) ds)\$.
+    The number of points in an area \$A\$ is \$N(A) \\sim \\text{Poisson}(\\int_A
+      \\lambda(s) ds)\$.
     This is implemented by modeling \$Z(s)\$ with a GMRF on a discrete grid.
 
 2.  **Log-Gamma Cox Process (`:lgmcp`)**:
@@ -39,7 +40,8 @@ The component supports the following methods:
   - Coordinate variables (for `:sncp`).
 - **Optional (in `random()` call)**:
   - `method`: `:lgcp`, `:lgmcp`, or `:sncp`. Default: `:lgcp`.
-  - `inner_model`: A `ComponentModel` for the latent field in `:lgcp` and `:lgmcp`. Default: `ICAR`.
+  - `inner_model`: A `ComponentModel` for the latent field in `:lgcp` and `:lgmcp`. Default:
+    `ICAR`.
   - `sigma`: Prior for the standard deviation of the latent field (for `:lgcp`).
   - `shape`: Prior for the shape/dispersion parameter (for `:lgmcp`).
   - `n_parents`: Number of parent points (for `:sncp`).
@@ -70,7 +72,8 @@ COMPONENT_TYPE_REGISTRY[:pointprocess] = PointProcess
 COMPONENT_CONSTRUCTORS[:pointprocess] = (p, params) -> begin
     method = get(params, :model, :lgcp) # User specifies model=:lgcp, etc.
     
-    inner_model_obj = get(params, :inner_model_obj, nothing) # This is passed by resolve_technical_primitive
+    inner_model_obj = get(params, :inner_model_obj,
+        nothing) # This is passed by resolve_technical_primitive
     
     PointProcess(
         method,
@@ -137,7 +140,8 @@ function get_precomputes(m::PointProcess, M::NamedTuple, mod_data::Dict)::NamedT
     return NamedTuple(hyper_dict)
 end
 
-function get_priors(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_priors(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx::Union{Int,
+    Nothing}, M::NamedTuple)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     if m.method == :lgcp
@@ -175,7 +179,8 @@ function get_priors(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx
     return ""
 end
 
-function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx::Union{Int,
+    Nothing}, M::NamedTuple)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     key = spec.key
     eta_target = (arch == "multivariate") ? "eta_latent" : "eta"
@@ -236,7 +241,8 @@ function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_id
             for i in 1:hyper.s_N
                 intensity_i = zero(eltype(parent_locs))
                 for j in 1:n_parents
-                    dist_sq = (obs_locs[i].x - parent_locs[j, 1])^2 + (obs_locs[i].y - parent_locs[j, 2])^2
+                    dist_sq = (obs_locs[i].x - parent_locs[j, 1])^2 + (obs_locs[i].y -
+                      parent_locs[j, 2])^2
                     kernel_val = exp(-0.5 * dist_sq / ($(p_names.ls)^2))
                     intensity_i += $(p_names.amplitude)[j] * kernel_val
                 end
@@ -291,7 +297,8 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         if m.method == :lgcp
-            sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+            sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k,
+                is_multivariate_model)
             ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
 
             if isempty(sigma_name) || isempty(ure_name)
@@ -302,7 +309,8 @@ function get_effects(
 
             # Extract samples (CPU)
             sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-            ure_samples = get_params_matrix(chain, ure_name, hyper.inner_hyper.n_latent) # (n_samples, n_latent)
+            ure_samples = get_params_matrix(chain, ure_name,
+                hyper.inner_hyper.n_latent) # (n_samples, n_latent)
             
             F_lgcp = hyper.inner_hyper.cholesky_factor # Cholesky factor for LGCP
             
@@ -319,7 +327,8 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            ure_samples = get_params_matrix(chain, ure_name, hyper.inner_hyper.n_latent) # Innovations for LGMCP
+            ure_samples = get_params_matrix(chain, ure_name,
+                hyper.inner_hyper.n_latent) # Innovations for LGMCP
             F_lgmcp = hyper.inner_hyper.cholesky_factor # Cholesky factor for LGMCP
 
             effect_k_latent = exp.(F_lgmcp.L' \ ure_samples') # Exponentiate to get intensity
@@ -329,13 +338,17 @@ function get_effects(
 
         elseif m.method == :sncp
             ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
-            amplitude_name = _find_parameter(p_names, string(p_names_k.amplitude), k, is_multivariate_model)
-            parent_locs_x_name = _find_parameter(p_names, string(p_names_k.parent_locs_x), k, is_multivariate_model)
-            parent_locs_y_name = _find_parameter(p_names, string(p_names_k.parent_locs_y), k, is_multivariate_model)
+            amplitude_name = _find_parameter(p_names, string(p_names_k.amplitude), k,
+                is_multivariate_model)
+            parent_locs_x_name = _find_parameter(p_names, string(p_names_k.parent_locs_x), k,
+                is_multivariate_model)
+            parent_locs_y_name = _find_parameter(p_names, string(p_names_k.parent_locs_y), k,
+                is_multivariate_model)
             
             n_parents = m.n_parents isa Int ? m.n_parents : error("Dynamic n_parents not supported in reconstruction yet.")
 
-            if isempty(ls_name) || isempty(amplitude_name) || isempty(parent_locs_x_name) || isempty(parent_locs_y_name)
+            if isempty(ls_name) || isempty(amplitude_name) || isempty(parent_locs_x_name)||
+                isempty(parent_locs_y_name)
                 @warn "Parameters for SNCP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
@@ -343,24 +356,31 @@ function get_effects(
 
             # Extract samples (CPU)
             ls_samples = get_params_vector(chain, ls_name, 1) # (n_samples, 1)
-            amplitude_samples = get_params_matrix(chain, amplitude_name, n_parents) # (n_samples, n_parents)
-            parent_locs_x_samples = get_params_matrix(chain, parent_locs_x_name, n_parents) # (n_samples, n_parents)
-            parent_locs_y_samples = get_params_matrix(chain, parent_locs_y_name, n_parents) # (n_samples, n_parents)
+            amplitude_samples = get_params_matrix(chain, amplitude_name,
+                n_parents) # (n_samples, n_parents)
+            parent_locs_x_samples = get_params_matrix(chain, parent_locs_x_name,
+                n_parents) # (n_samples, n_parents)
+            parent_locs_y_samples = get_params_matrix(chain, parent_locs_y_name,
+                n_parents) # (n_samples, n_parents)
 
             # Prepare observation locations
             obs_locs_train = hyper.centroids # Training centroids
-            obs_locs_full = if !isnothing(PS) && hasproperty(PS, :centroids) # If prediction set has centroids
+            obs_locs_full = if !isnothing(PS) && hasproperty(PS,
+                :centroids) # If prediction set has centroids
                 vcat(obs_locs_train, PS.centroids) # Combine training and prediction centroids
             else
                 obs_locs_train # Otherwise, use only training centroids
             end
             
-            obs_locs_matrix = hcat([p.x for p in obs_locs_full], [p.y for p in obs_locs_full]) # Matrix of observation locations
+            obs_locs_matrix = hcat([p.x for p in obs_locs_full],
+                [p.y for p in obs_locs_full]) # Matrix of observation locations
 
-            intensity_all_samples = zeros(Float64, length(obs_locs_full), n_samples) # Initialize intensity matrix
+            intensity_all_samples = zeros(Float64, length(obs_locs_full),
+                n_samples) # Initialize intensity matrix
             
             for i in 1:n_samples # Iterate over each posterior sample
-                parent_locs_i = hcat(parent_locs_x_samples[i, :], parent_locs_y_samples[i, :]) # Parent locations for current sample
+                parent_locs_i = hcat(parent_locs_x_samples[i, :], parent_locs_y_samples[i,
+                    :]) # Parent locations for current sample
                 dist_sq = sum(obs_locs_matrix.^2, dims=2) .- 2 * (obs_locs_matrix * parent_locs_i') .+ sum(parent_locs_i.^2, dims=2)' # Squared distances
                 kernel_vals = exp.(-0.5 .* dist_sq ./ (ls_samples[i, 1]^2)) # Kernel values
                 intensity_at_obs = kernel_vals * amplitude_samples[i, :] # Intensity at observation locations

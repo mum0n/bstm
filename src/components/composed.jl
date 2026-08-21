@@ -7,7 +7,7 @@ spatiotemporal models, spatially varying coefficients, and non-stationary varian
 models.
 
 # Version
-v1.2.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary & Operators
 
@@ -209,7 +209,7 @@ function get_updates(
                 coeffs_unscaled_matrix = reshape($(p_names.ure), $(n_spatial), $(n_basis))
                 spatial_coeffs = F_spatial.L' \\ coeffs_unscaled_matrix
                 $(p_names.sre) = sum($(basis_matrix) .* spatial_coeffs[M.s_idx, :], dims=2)
-                $(eta_target) .+= $(p_names.sre)
+                $(eta_target) = $(eta_target) .+ $(p_names.sre)
             end
         """
 
@@ -221,12 +221,14 @@ function get_updates(
                 coeffs_unscaled_matrix = reshape($(p_names.ure), $(n_spatial), $(n_basis))
                 spatial_coeffs = F_spatial.L' \\ coeffs_unscaled_matrix
                 $(p_names.sre) = sum($(basis_matrix) .* spatial_coeffs[M.s_idx, :], dims=2)
-                $(eta_target) .+= $(p_names.sre)
+                $(eta_target) = $(eta_target) .+ $(p_names.sre)
             end
         """
         
-        if m.method == :cholesky; return cholesky_dense_code;
-        elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
+        if m.method == :cholesky
+            return cholesky_dense_code
+        elseif m.method == :cholesky_sparse
+            return cholesky_sparse_code
         else; error("Unsupported method '$(m.method)' for pipe operator."); end
 
     elseif m.operator == :kronecker_product
@@ -257,13 +259,11 @@ function get_updates(
                 diag_D_t = 1.0 ./ sqrt.(diag_Lt .+ M.noise)
                 
                 Z_matrix = reshape($(p_names.ure), M.s_N, M.t_N)
-                
-                tmp = s_hyper.U' * Z_matrix * t_hyper.U
-                transformed = (diag_D_s .* tmp) .* diag_D_t'
+                transformed = (diag_D_s .* Z_matrix) .* diag_D_t'
                 $(p_names.sre) = s_hyper.U * transformed * t_hyper.U'
                 
                 st_idx = (M.t_idx .- 1) .* M.s_N .+ M.s_idx
-                $(eta_target) .+= view($(p_names.sre), st_idx)
+                $(eta_target) = $(eta_target) .+ view($(p_names.sre), st_idx)
             end
         """
 
@@ -283,15 +283,18 @@ function get_updates(
                 Z_matrix = reshape($(p_names.ure), M.s_N, M.t_N)
                 tmp_spatial = C_s.L' \\ Z_matrix
                 st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
-                Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_unscaled))
+                Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)),
+                  sum(st_field_unscaled))
                 $(p_names.sre) = st_field_unscaled .* $(p_names.sigma)
                 st_idx = (M.t_idx .- 1) .* M.s_N .+ M.s_idx
-                $(eta_target) .+= view($(p_names.sre), st_idx)
+                $(eta_target) = $(eta_target) .+ view($(p_names.sre), st_idx)
             end
         """
 
-        if m.method == :spectral; return spectral_code;
-        elseif m.method == :cholesky; return cholesky_dense_code;
+        if m.method == :spectral
+            return spectral_code
+        elseif m.method == :cholesky
+            return cholesky_dense_code
         else; error("Unsupported method '$(m.method)' for Kronecker product operator."); end
 
     elseif m.operator == :composition # Non-stationary variance
@@ -304,7 +307,8 @@ function get_updates(
         modifier_sre_var = generate_full_variable_names(
             modifier_spec, arch, outcome_idx
         ).sre
-        modifier_code = replace(modifier_updates, Regex("$(eta_target) .\\+= .*") => "")
+        modifier_code = replace(modifier_updates,
+            Regex("$(eta_target) (\\.\\+=|=|\\.\\=) .*") => "")
 
         base_updates = get_updates(
             base_spec.component_obj, base_spec, arch, outcome_idx, M
@@ -312,7 +316,7 @@ function get_updates(
         base_sre_var = generate_full_variable_names(
             base_spec, arch, outcome_idx
         ).sre
-        base_code = replace(base_updates, Regex("$(eta_target) .\\+= .*") => "")
+        base_code = replace(base_updates, Regex("$(eta_target) (\\.\\+=|=|\\.\\=) .*") => "")
 
         base_structure = base_spec.structure
         indexed_base_effect = if base_structure == :spatial
@@ -336,7 +340,7 @@ function get_updates(
 
             # Modulate the base field and add to eta
             $(p_names.sre) = $(indexed_base_effect) .* exp.($(modifier_sre_var))
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
         """
     end
@@ -372,7 +376,8 @@ function get_effects(
         B_dynamic_full = if !isnothing(PS) # If prediction set is provided
             coord_vars = get(dynamic_spec.params, :positional_args, [])
             if !isempty(coord_vars) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars)
-                coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]) # Extract prediction coordinates
+                coords_pred = Matrix{Float64}(PS.data[!,
+                    Symbol.(coord_vars)]) # Extract prediction coordinates
                 dynamic_comp_obj = dynamic_spec.component_obj
                 B_pred, _ = bstm_bspline_basis(
                     coords_pred[:, 1], dynamic_comp_obj.nbins, dynamic_comp_obj.degree
@@ -402,7 +407,8 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            ure_samples = get_params_matrix(chain, ure_name, n_spatial * n_basis) # (n_samples, n_spatial * n_basis)
+            ure_samples = get_params_matrix(chain, ure_name, n_spatial * n_basis) # (n_samples,
+                n_spatial * n_basis)
             
             state_p_names = generate_full_variable_names(state_spec, M.model_arch, k)
             state_model_type = Symbol(lowercase(string(typeof(state_spec.component_obj))))
@@ -412,15 +418,18 @@ function get_effects(
 
             for i in 1:n_samples # Iterate over each posterior sample
                 rho_val = hasproperty(state_spec.component_obj, :rho) ?
-                          get_params_vector(chain, string(state_p_names.rho), 1)[i, 1] : # Extract rho for current sample
+                          get_params_vector(chain, string(state_p_names.rho), 1)[i,
+                              1] : # Extract rho for current sample
                           nothing
-                Q_spatial = recompose_precision(state_model_type, Q_spatial_template, 1.0; extra_param=rho_val)
+                Q_spatial = recompose_precision(state_model_type, Q_spatial_template, 1.0;
+                    extra_param=rho_val)
                 F_spatial = cholesky(Symmetric(Matrix(Q_spatial) + M.noise * I))
                 
                 coeffs_unscaled_matrix = reshape(ure_samples[i, :], n_spatial, n_basis)
                 spatial_coeffs = F_spatial.L' \ coeffs_unscaled_matrix
                 
-                effect_k_matrix[:, i] = sum(B_dynamic_full .* spatial_coeffs[s_idx_full, :], dims=2)
+                effect_k_matrix[:, i] = sum(B_dynamic_full .* spatial_coeffs[s_idx_full, :],
+                    dims=2)
             end
             push!(structured_effects, effect_k_matrix)
         end
@@ -458,8 +467,10 @@ function get_effects(
             sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
             ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
             
-            s_rho_name = hasproperty(s_spec.component_obj, :rho) ? _find_parameter(p_names, string(s_v.rho), k, is_multivariate_model) : ""
-            t_rho_name = hasproperty(t_spec.component_obj, :rho) ? _find_parameter(p_names, string(t_v.rho), k, is_multivariate_model) : ""
+            s_rho_name = hasproperty(s_spec.component_obj, :rho) ? _find_parameter(p_names,
+                string(s_v.rho), k, is_multivariate_model) : ""
+            t_rho_name = hasproperty(t_spec.component_obj, :rho) ? _find_parameter(p_names,
+                string(t_v.rho), k, is_multivariate_model) : ""
 
             if isempty(sigma_name) || isempty(ure_name)
                 @warn "Parameters for Kronecker product component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -471,8 +482,10 @@ function get_effects(
             sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
             ure_samples = get_params_matrix(chain, ure_name, s_N * t_N) # (n_samples, s_N * t_N)
             
-            s_rho_samples = !isempty(s_rho_name) ? get_params_vector(chain, s_rho_name, 1) : nothing # (n_samples, 1)
-            t_rho_samples = !isempty(t_rho_name) ? get_params_vector(chain, t_rho_name, 1) : nothing # (n_samples, 1)
+            s_rho_samples = !isempty(s_rho_name) ? get_params_vector(chain, s_rho_name,
+                1) : nothing # (n_samples, 1)
+            t_rho_samples = !isempty(t_rho_name) ? get_params_vector(chain, t_rho_name,
+                1) : nothing # (n_samples, 1)
 
             # Initialize the output matrix for the full effect
             effect_k = zeros(Float64, N_total, n_samples)
@@ -512,7 +525,8 @@ function get_effects(
         base_spec = child_specs[2]
         
         # Recursive calls with the correct, modern signature
-        modifier_effects_all = get_effects(modifier_spec.component_obj, chain, modifier_spec, M, PS)
+        modifier_effects_all = get_effects(modifier_spec.component_obj, chain, modifier_spec,
+            M, PS)
         base_effects_all = get_effects(base_spec.component_obj, chain, base_spec, M, PS)
 
         for k in 1:outcomes_N

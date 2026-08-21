@@ -6,7 +6,7 @@ triangulation of knot points. This method is particularly well-suited for modeli
 smooth spatial effects on irregular domains.
 
 # Version
-v1.2.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The component models a function \$f(s)\$ where \$s\$ is a 2D coordinate.
@@ -15,12 +15,14 @@ The component models a function \$f(s)\$ where \$s\$ is a 2D coordinate.
     mesh of non-overlapping triangles.
 2.  **Barycentric Coordinates**: For any observation point \$s_{\\text{obs}}\$, the model finds
     the triangle in the mesh that encloses it. It then computes the barycentric
-    coordinates \$(\\lambda_1, \\lambda_2, \\lambda_3)\$ of \$s_{\\text{obs}}\$ with respect to the triangle's vertices
+    coordinates \$(\\lambda_1, \\lambda_2, \\lambda_3)\$ of \$s_{\\text{obs}}\$ with respect
+      to the triangle's vertices
     \$ (v_1, v_2, v_3) \$. These coordinates are non-negative weights that sum to 1.
 3.  **Basis Construction**: The barycentric coordinates form the basis functions. For
     an observation \$i\$ falling in a triangle with vertices \$ (j, k, l) \$, the
     corresponding row in the basis matrix \$B\$ will have non-zero values only at
-    columns \$j, k, l\$, where \$B[i,j] = \\lambda_1\$, \$B[i,k] = \\lambda_2\$, and \$B[i,l] = \\lambda_3\$.
+    columns \$j, k, l\$, where \$B[i,j] = \\lambda_1\$, \$B[i,k] = \\lambda_2\$, and
+      \$B[i,l] = \\lambda_3\$.
 4.  **Final Effect**: The final smooth effect is a linear combination of the basis
     functions, with coefficients \$\\beta\$ (representing the latent field values at the
     knots) scaled by a standard deviation \$\\sigma\$:
@@ -39,7 +41,8 @@ The component models a function \$f(s)\$ where \$s\$ is a 2D coordinate.
   - Exactly two coordinate variables (e.g., `x`, `y`) passed to `random()`.
 - **Optional (in `random()` call)**:
   - `nbins`: `Int`, the approximate number of knot points to use. Default: `25`.
-  - `knot_method`: `Symbol`, method for placing knots (`:quantile` or `:range`). Default: `:quantile`.
+  - `knot_method`: `Symbol`, method for placing knots (`:quantile` or `:range`). Default:
+    `:quantile`.
   - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the basis
     function coefficients. Default: `Exponential(1.0)`.
   - `method`: `Symbol`, computational method (`:noncentered`, `:centered`, `:gmrfsmooth`).
@@ -47,7 +50,8 @@ The component models a function \$f(s)\$ where \$s\$ is a 2D coordinate.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the basis coefficients.
-- `innovations_<key>`: The latent standard normal innovations for basis coefficients (for `:noncentered` and `:gmrfsmooth`).
+- `innovations_<key>`: The latent standard normal innovations for basis coefficients (for
+  `:noncentered` and `:gmrfsmooth`).
 - `latent_<key>`: The latent basis coefficients (for `:centered`).
 
 # Key References
@@ -135,9 +139,11 @@ function get_precomputes(
 end
 
 """
-    _barycentric_log_marginal_likelihood(y_residual, B_basis, Q_prior, L_eig, sigma, y_sigma, noise=1e-6)
+    _barycentric_log_marginal_likelihood(y_residual, B_basis, Q_prior, L_eig, sigma,
+      y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for a Barycentric smoother with knot coefficients integrated out analytically.
+Computes the exact log marginal likelihood for a Barycentric smoother with knot coefficients
+  integrated out analytically.
 """
 function _barycentric_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -240,7 +246,7 @@ function get_updates(
         $(common_code)
             scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
             $(p_names.sre) = B * scaled_coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -249,7 +255,7 @@ function get_updates(
         $(common_code)
             scaled_coeffs = $(p_names.sre) .* $(p_names.sigma)
             $(p_names.sre) = B * scaled_coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -262,7 +268,7 @@ function get_updates(
             diag_D[1] = 0.0
             coeffs = U * (diag_D .* $(p_names.ure))
             $(p_names.sre) = B * coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -285,10 +291,14 @@ function get_updates(
         end
     """
 
-    if m.method == :noncentered; return noncentered_code;
-    elseif m.method == :centered; return centered_code;
-    elseif m.method == :gmrfsmooth; return gmrfsmooth_code;
-    elseif m.method == :marginalized; return marginalized_code;
+    if m.method == :noncentered
+        return noncentered_code
+    elseif m.method == :centered
+        return centered_code
+    elseif m.method == :gmrfsmooth
+        return gmrfsmooth_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else; error("Unsupported method '$(m.method)' for Barycentric component. Use :noncentered, :centered, :gmrfsmooth, or :marginalized."); end
 end
 
@@ -303,11 +313,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -361,7 +367,8 @@ function get_effects(
             y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
             BTB = Matrix{Float64}(B_train' * B_train)
             BTy = Vector{Float64}(B_train' * y_vec)
-            Q_prior = haskey(spec.hyper, :Q_template) ? spec.hyper.Q_template : Matrix{Float64}(I, n_knots, n_knots)
+            Q_prior = haskey(spec.hyper,
+                :Q_template) ? spec.hyper.Q_template : Matrix{Float64}(I, n_knots, n_knots)
             
             for i in 1:n_samples
                 sig = sigma_samples[i]
@@ -394,7 +401,8 @@ function get_effects(
         else # :noncentered or :gmrfsmooth
             ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
             if !isempty(ure_name)
-                ure_samples = get_params_vector(chain, ure_name, n_knots)' # Transpose to [n_knots x n_samples]
+                ure_samples = get_params_vector(chain, ure_name,
+                    n_knots)' # Transpose to [n_knots x n_samples]
                 
                 if m.method == :noncentered
                     coeffs_samples_matrix = ure_samples .* sigma_samples'
@@ -465,39 +473,31 @@ end
 """
     _delaunay_triangulation(points::Vector{Point2D})
 
-Computes the Delaunay triangulation of a set of 2D points using the Bowyer-Watson 
-algorithm.
+Computes the Delaunay triangulation of a set of 2D points using the Bowyer-Watson algorithm.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core geometric utility required for constructing a true barycentric
-basis from a set of knot points. This implementation of the Bowyer-Watson algorithm
-is retained as a didactic, self-contained method. It has been updated for improved
-efficiency and type stability. The original implementation used a nested loop to find
-the boundary polygon of "bad triangles," which was inefficient. This version replaces
-that with a more performant dictionary-based approach to count edge occurrences,
-which is a standard and more robust technique for this algorithm.
+v1.0.0
 
 # Arguments
 - `points::Vector{Point2D}`: A vector of points to triangulate.
 
 # Returns
-- `Vector{Triangle}`: A vector of `Triangle` structs representing the Delaunay 
-  triangulation.
+- `Vector{Triangle}`: A vector of `Triangle` structs representing the Delaunay triangulation.
 """
 function _delaunay_triangulation(points::Vector{Point2D})
     n = length(points)
     if n < 3
-        return Triangle[] # Return a correctly typed empty vector
+        return Triangle[]
     end
 
     # Determine a "super-triangle" that encloses all points.
-    min_x = minimum(p.x for p in points); max_x = maximum(p.x for p in points)
-    min_y = minimum(p.y for p in points); max_y = maximum(p.y for p in points)
+    min_x = minimum(p.x for p in points)
+    max_x = maximum(p.x for p in points)
+    min_y = minimum(p.y for p in points)
+    max_y = maximum(p.y for p in points)
     
-    dx = max_x - min_x; dy = max_y - min_y
+    dx = max_x - min_x
+    dy = max_y - min_y
     delta_max = max(dx, dy)
     mid_x = (min_x + max_x) / 2
     mid_y = (min_y + max_y) / 2
@@ -507,7 +507,6 @@ function _delaunay_triangulation(points::Vector{Point2D})
     p_super2 = Point2D(mid_x + 20 * delta_max, mid_y - delta_max)
     p_super3 = Point2D(mid_x, mid_y + 20 * delta_max)
     
-    # The indices of the super-triangle vertices will be n+1, n+2, n+3.
     super_triangle = Triangle(n + 1, n + 2, n + 3)
     all_points = [points; p_super1; p_super2; p_super3]
 
@@ -517,68 +516,54 @@ function _delaunay_triangulation(points::Vector{Point2D})
         point = points[i]
         bad_triangles = Vector{Triangle}()
         
-        # Find all triangles whose circumcircle contains the new point.
         for tri in triangulation
-            p1 = all_points[tri.v1]; p2 = all_points[tri.v2]; p3 = all_points[tri.v3]
+            p1 = all_points[tri.v1]
+            p2 = all_points[tri.v2]
+            p3 = all_points[tri.v3]
             if _is_in_circumcircle(point, p1, p2, p3)
                 push!(bad_triangles, tri)
             end
         end
 
-        # --- More efficient polygon edge finding using a dictionary ---
         edge_counts = Dict{Tuple{Int, Int}, Int}()
         for tri in bad_triangles
             edges = [(tri.v1, tri.v2), (tri.v2, tri.v3), (tri.v3, tri.v1)]
             for edge in edges
-                # Normalize edge to store it canonically (v1 < v2).
                 normalized_edge = minmax(edge[1], edge[2])
                 edge_counts[normalized_edge] = get(edge_counts, normalized_edge, 0) + 1
             end
         end
         
-        # The polygon is formed by edges that appeared only once.
         polygon_edges = Vector{Tuple{Int, Int}}()
         for (edge, count) in edge_counts
             if count == 1
                 push!(polygon_edges, edge)
             end
         end
-        # --- End of efficiency improvement ---
 
-        # Remove bad triangles from the triangulation.
         filter!(t -> !(t in bad_triangles), triangulation)
 
-        # Form new triangles from the polygon edges to the new point.
         for edge in polygon_edges
             push!(triangulation, Triangle(edge[1], edge[2], i))
         end
     end
 
-    # Remove any triangles that include vertices of the super-triangle.
     filter!(t -> !(t.v1 > n || t.v2 > n || t.v3 > n), triangulation)
 
     return triangulation
 end
 
-
 """
     bstm_barycentric_basis_2D(coords::AbstractMatrix, knots::Vector{Point2D})
 
-Generates a 2D barycentric basis matrix based on a Delaunay triangulation of knot 
-points.
+Generates a 2D barycentric basis matrix based on a Delaunay triangulation of knot points.
 
-# Rationale
-This provides a true triangulation-based barycentric interpolation, aligning the
-implementation with the documentation's reference to "Delaunay/Voronoi" methods.
-It is more flexible for irregularly spaced data than the previous grid-based
-bilinear interpolation.
+# Version
+v1.0.0
 
 # Arguments
 - `coords`: An `N x 2` matrix of data points.
 - `knots`: A vector of `Point2D` knot points (vertices for the triangulation).
-
-# Version
-v1.0.1 (2026-08-13)
 
 # Returns
 - A sparse basis matrix of size `(N, length(knots))`.

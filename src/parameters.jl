@@ -1,6 +1,11 @@
-# =============================================================================
-# ParamRegistry: Centralized Parameter and Variable Name Architecture for BSTM
-# =============================================================================
+"""
+    parameters.jl
+
+Centralized parameter registry, semantic descriptor management, and chain sample extraction
+for Bayesian Spatio-Temporal Models (BSTM).
+
+Version: v1.0.0
+"""
 
 """
     ParamDescriptor
@@ -8,13 +13,13 @@
 Detailed semantic metadata for a single model parameter / random variable.
 
 # Fields
-- `symbol::Symbol`: The canonical Julia symbol used in Turing code (e.g., `:sigma_s_idx`, `:innovations_s_idx_1`).
+- `symbol::Symbol`: Canonical Julia symbol used in Turing code.
 - `name::String`: Canonical string representation of the symbol.
-- `component_key::Symbol`: Owner component key (e.g., `:s_idx`, `:t_idx`, `:intercept`, `:fixed`, `:st_interaction`, `:likelihood`).
-- `role::Symbol`: Semantic role (e.g., `:sigma`, `:rho`, `:innovations`, `:latent`, `:W1`, `:b1`, `:intercept`, `:fixed_coef`, `:scale`).
-- `outcome_idx::Union{Int, Nothing}`: 1-indexed outcome number for multivariate models, or `nothing` if univariate / shared.
-- `is_shared::Bool`: `true` if this hyperparameter is shared across outcomes in a multivariate model.
-- `shape::Tuple{Vararg{Int}}`: Expected dimension tuple (e.g., `(1,)` for scalar, `(20,)` for vector, `(10, 20)` for matrix).
+- `component_key::Symbol`: Owner component key (e.g., `:s_idx`, `:t_idx`, `:intercept`).
+- `role::Symbol`: Semantic role (e.g., `:sigma`, `:rho`, `:innovations`, `:latent`).
+- `outcome_idx::Union{Int, Nothing}`: Outcome number for multivariate models, or `nothing`.
+- `is_shared::Bool`: `true` if this hyperparameter is shared across outcomes.
+- `shape::Tuple{Vararg{Int}}`: Expected dimension tuple (e.g., `(1,)`, `(20,)`, `(10, 20)`).
 - `prior::Union{Distribution, Nothing}`: The prior distribution object if known.
 """
 struct ParamDescriptor
@@ -59,9 +64,10 @@ Provides canonical name resolution and sample extraction across all MCMC chain f
 mutable struct ParamRegistry
     names::Vector{String}                                              # Canonical string names
     descriptors::Dict{Symbol, ParamDescriptor}                         # Symbol -> ParamDescriptor
-    by_component::Dict{Symbol, Dict{Symbol, Vector{ParamDescriptor}}}  # component_key -> role -> [descriptors]
-    by_base::Dict{String, Vector{String}}                              # base name -> list of matching full names
-    name_to_key::Dict{String, Any}                                     # String/Symbol in chain -> actual indexing key
+    by_component::Dict{Symbol, Dict{Symbol, Vector{ParamDescriptor}}} # component_key ->
+      role -> [descriptors]
+    by_base::Dict{String, Vector{String}} # base name -> list of matching full names
+    name_to_key::Dict{String, Any} # String/Symbol in chain -> actual indexing key
 end
 
 # Default empty constructor
@@ -73,19 +79,6 @@ function ParamRegistry()
         Dict{String, Vector{String}}(),
         Dict{String, Any}()
     )
-end
-
-# Backward-compatible 3-argument constructor
-function ParamRegistry(names::Vector{String}, by_base::Dict{String, Vector{String}}, name_to_key::Dict{String, Any})
-    reg = ParamRegistry()
-    reg.names = names
-    reg.by_base = by_base
-    reg.name_to_key = name_to_key
-    for n in names
-        sym = Symbol(n)
-        reg.descriptors[sym] = ParamDescriptor(sym)
-    end
-    return reg
 end
 
 # =============================================================================
@@ -256,13 +249,15 @@ function build_param_registry(M::NamedTuple)
             # Detect latent fields & innovations
             n_latent = if hasproperty(spec.hyper, :n_latent)
                 spec.hyper.n_latent
-            elseif hasproperty(spec.hyper, :in_dim) && hasproperty(comp_obj, :hidden_dim) && hasproperty(comp_obj, :nbins)
+            elseif hasproperty(spec.hyper, :in_dim) && hasproperty(comp_obj, :hidden_dim) &&
+              hasproperty(comp_obj, :nbins)
                 comp_obj.nbins
             else
                 0
             end
 
-            latent_roles = [:ure, :sre, :W1, :b1, :W2, :W, :b, :v_unscaled, :thresh_unscaled, :amplitude_unscaled]
+            latent_roles = [:ure, :sre, :W1, :b1, :W2, :W, :b, :v_unscaled,
+              :thresh_unscaled, :amplitude_unscaled]
             for role in latent_roles
                 for k in 1:outcomes_N
                     outcome_k = is_multivariate ? k : nothing
@@ -271,11 +266,13 @@ function build_param_registry(M::NamedTuple)
                         sym = getfield(p_names, role)
                         shape_val = if role in [:ure, :sre]
                             (n_latent > 0 ? n_latent : 1,)
-                        elseif role == :W1 && hasproperty(comp_obj, :hidden_dim) && hasproperty(spec.hyper, :in_dim)
+                        elseif role == :W1 && hasproperty(comp_obj, :hidden_dim) &&
+                          hasproperty(spec.hyper, :in_dim)
                             (spec.hyper.in_dim * comp_obj.hidden_dim,)
                         elseif role == :b1 && hasproperty(comp_obj, :hidden_dim)
                             (comp_obj.hidden_dim,)
-                        elseif role == :W2 && hasproperty(comp_obj, :hidden_dim) && hasproperty(comp_obj, :nbins)
+                        elseif role == :W2 && hasproperty(comp_obj, :hidden_dim) &&
+                          hasproperty(comp_obj, :nbins)
                             (comp_obj.hidden_dim * comp_obj.nbins,)
                         else
                             (1,)
@@ -355,7 +352,8 @@ end
 """
     build_param_registry(sample::Any, M::Union{NamedTuple, Nothing}=nothing)
 
-Builds or augments a `ParamRegistry` from a prior predictive draw (e.g., `rand(model)` returning `NamedTuple` or `VarNamedTuple`).
+Builds or augments a `ParamRegistry` from a prior predictive draw
+(e.g., `rand(model)` returning `NamedTuple` or `VarNamedTuple`).
 """
 function build_param_registry(sample::Any, M::Union{NamedTuple, Nothing}=nothing)
     reg = !isnothing(M) ? build_param_registry(M) : ParamRegistry()
@@ -399,7 +397,8 @@ end
 """
     build_param_registry(chain::Any)
 
-Builds a `ParamRegistry` from an MCMC chain (e.g., FlexiChain, MCMCChains.Chains, DataFrame, or Dict).
+Builds a `ParamRegistry` from an MCMC chain
+(e.g., FlexiChain, MCMCChains.Chains, DataFrame, or Dict).
 """
 function build_param_registry(chain::Any)
     reg = ParamRegistry()
@@ -412,18 +411,24 @@ function build_param_registry(chain::Any)
         sym = Symbol(nstr)
 
         base = first(Base.split(nstr, '['))
-        if !haskey(reg.by_base, base); reg.by_base[base] = String[]; end
+        if !haskey(reg.by_base, base)
+            reg.by_base[base] = String[]
+        end
         push!(reg.by_base[base], nstr)
 
         parts = Base.split(nstr, '_')
         if length(parts) > 1 && all(isdigit.(collect(parts[end])))
             underscore_base = join(parts[1:end-1], "_")
-            if !haskey(reg.by_base, underscore_base); reg.by_base[underscore_base] = String[]; end
+            if !haskey(reg.by_base, underscore_base)
+                reg.by_base[underscore_base] = String[]
+            end
             push!(reg.by_base[underscore_base], nstr)
         end
 
         reg.name_to_key[nstr] = key_for_indexing
-        if !(nstr in reg.names); push!(reg.names, nstr); end
+        if !(nstr in reg.names)
+            push!(reg.names, nstr)
+        end
         
         reg.descriptors[sym] = ParamDescriptor(sym)
     end
@@ -438,8 +443,8 @@ end
 """
     calibrate_param_registry(reg::ParamRegistry, sample::Any)
 
-Updates descriptors and shapes in `reg` based on actual realized values in `sample` (from `rand(model)`).
-Supports `NamedTuple`, `DynamicPPL.VarNamedTuple`, `AbstractDict`, etc.
+Updates descriptors and shapes in `reg` based on actual realized values in `sample`
+(from `rand(model)`). Supports `NamedTuple`, `DynamicPPL.VarNamedTuple`, `AbstractDict`, etc.
 """
 function calibrate_param_registry(reg::ParamRegistry, sample::Any)
     pairs_iter = try
@@ -487,10 +492,13 @@ end
 # =============================================================================
 
 """
-    get_samples(chain, reg::ParamRegistry, component_key::Symbol, role::Symbol; outcome=nothing, expected_len=nothing)
+    get_samples(chain, reg::ParamRegistry, component_key::Symbol, role::Symbol;
+                outcome=nothing, expected_len=nothing)
 
-Extracts an `(n_samples, param_dim)` matrix of posterior samples for a specific component and semantic role.
-Automatically handles scalar, vector, and matrix parameters across FlexiChains, MCMCChains, and DataFrames.
+Extracts an `(n_samples, param_dim)` matrix of posterior samples for a specific component
+and semantic role.
+Automatically handles scalar, vector, and matrix parameters across FlexiChains, MCMCChains,
+and DataFrames.
 """
 function get_samples(
     chain,
@@ -500,52 +508,23 @@ function get_samples(
     outcome::Union{Int, Nothing} = nothing,
     expected_len::Union{Int, Nothing} = nothing
 )
-    # Map role to canonical role if alias was used
-    canonical_role = if role in [:innovations, :innov, :raw, :unscaled, :iid]
-        :ure
-    elseif role in [:latent, :struct]
-        :sre
-    elseif role in [:unconstrained_rho, :rho_unconstrained]
-        :rho_unconstrained
-    elseif role in [:unconstrained_rho1, :rho1_unconstrained]
-        :rho1_unconstrained
-    elseif role in [:unconstrained_rho2, :rho2_unconstrained]
-        :rho2_unconstrained
-    elseif role in [:unconstrained_sigma1, :sigma1_unconstrained]
-        :sigma1_unconstrained
-    elseif role in [:unconstrained_sigma2, :sigma2_unconstrained]
-        :sigma2_unconstrained
-    elseif role in [:v_raw, :v_unscaled]
-        :v_unscaled
-    elseif role in [:thresh_raw, :thresh_unscaled]
-        :thresh_unscaled
-    elseif role in [:amplitude_raw, :amplitude_unscaled]
-        :amplitude_unscaled
-    else
-        role
-    end
-
     # 1. Lookup matching descriptor from by_component
-    has_canonical = haskey(reg.by_component, component_key) && haskey(reg.by_component[component_key], canonical_role)
-    has_orig = haskey(reg.by_component, component_key) && haskey(reg.by_component[component_key], role)
+    has_role = haskey(reg.by_component, component_key) &&
+      haskey(reg.by_component[component_key], role)
 
-    if !has_canonical && !has_orig
+    if !has_role
         # Fallback to base name search
-        fallback_name = isnothing(outcome) ? "$(role)_$(component_key)" : "$(role)_$(component_key)_$(outcome)"
+        fallback_name = isnothing(outcome) ? "$(role)_$(component_key)" :
+          "$(role)_$(component_key)_$(outcome)"
         target_name = find_chain_param(reg, fallback_name; outcome_idx = outcome)
         if isempty(target_name)
-            # Try with canonical role name as well
-            fallback_canonical = isnothing(outcome) ? "$(canonical_role)_$(component_key)" : "$(canonical_role)_$(component_key)_$(outcome)"
-            target_name = find_chain_param(reg, fallback_canonical; outcome_idx = outcome)
-        end
-        if isempty(target_name)
-            error("Parameter with component :$(component_key) and role :$(role) (outcome: $(outcome)) not found in ParamRegistry.")
+            error("Parameter with component :$(component_key) and role :$(role) (outcome: " *
+                  "$(outcome)) not found in ParamRegistry.")
         end
         return get_param_samples(chain, reg, target_name; expected_len = expected_len)
     end
 
-    lookup_role = has_canonical ? canonical_role : role
-    candidates = reg.by_component[component_key][lookup_role]
+    candidates = reg.by_component[component_key][role]
     selected_desc = nothing
 
     if !isnothing(outcome)
@@ -563,7 +542,8 @@ function get_samples(
     end
 
     if isnothing(selected_desc)
-        error("No suitable descriptor found for component :$(component_key), role :$(role), outcome $(outcome).")
+        error("No suitable descriptor found for component :$(component_key), role :$(role), " *
+              "outcome $(outcome).")
     end
 
     exp_len = isnothing(expected_len) ? prod(selected_desc.shape) : expected_len
@@ -571,7 +551,8 @@ function get_samples(
 end
 
 """
-    get_param_samples(chain, reg::ParamRegistry, param_name::Union{String, Symbol}; expected_len::Union{Int, Nothing}=nothing)
+    get_param_samples(chain, reg::ParamRegistry, param_name::Union{String, Symbol};
+                      expected_len::Union{Int, Nothing}=nothing)
 
 Extracts an `(n_samples, param_dim)` matrix of posterior samples for a specific parameter name.
 """
@@ -593,12 +574,17 @@ end
 # =============================================================================
 
 """
-    find_chain_param(reg::ParamRegistry, requested::String; outcome_idx::Union{Int, Nothing}=nothing)
+    find_chain_param(reg::ParamRegistry, requested::String;
+                     outcome_idx::Union{Int, Nothing}=nothing)
 
 Finds the best matching actual chain column name for a requested canonical name.
 Returns `String` matching actual name or `""` if not found.
 """
-function find_chain_param(reg::ParamRegistry, requested::String; outcome_idx::Union{Int, Nothing}=nothing)
+function find_chain_param(
+    reg::ParamRegistry,
+    requested::String;
+    outcome_idx::Union{Int, Nothing} = nothing
+)
     # 1) Exact match in registered names
     if requested in reg.names
         return requested
@@ -608,8 +594,12 @@ function find_chain_param(reg::ParamRegistry, requested::String; outcome_idx::Un
     if !isnothing(outcome_idx)
         s1 = "$(requested)_$(outcome_idx)"
         s2 = "$(requested)[$(outcome_idx)]"
-        if s1 in reg.names; return s1; end
-        if s2 in reg.names; return s2; end
+        if s1 in reg.names
+            return s1
+        end
+        if s2 in reg.names
+            return s2
+        end
     end
 
     # 3) Base match in by_base
@@ -618,16 +608,22 @@ function find_chain_param(reg::ParamRegistry, requested::String; outcome_idx::Un
         candidates = reg.by_base[base]
 
         # Plain candidate equal to base
-        if base in candidates; return base; end
+        if base in candidates
+            return base
+        end
 
         # Bracketed candidates
         for c in candidates
-            if startswith(c, base * "["); return c; end
+            if startswith(c, base * "[")
+                return c
+            end
         end
 
         # Underscore numeric suffix candidates
         for c in candidates
-            if startswith(c, base * "_"); return c; end
+            if startswith(c, base * "_")
+                return c
+            end
         end
 
         return first(candidates)
@@ -644,9 +640,11 @@ function find_chain_param(reg::ParamRegistry, requested::String; outcome_idx::Un
     elseif requested == "Xfixed_beta_prop_flat"
         push!(aliases, "beta_flat")
     elseif startswith(requested, "ure_")
-        push!(aliases, replace(requested, r"^ure_" => "innovations_"), replace(requested, r"^ure_" => "innov_"), replace(requested, r"^ure_" => "raw_"))
+        push!(aliases, replace(requested, r"^ure_" => "innovations_"), replace(requested,
+          r"^ure_" => "innov_"), replace(requested, r"^ure_" => "raw_"))
     elseif startswith(requested, "sre_")
-        push!(aliases, replace(requested, r"^sre_" => "latent_"), replace(requested, r"^sre_" => "struct_"))
+        push!(aliases, replace(requested, r"^sre_" => "latent_"), replace(requested,
+          r"^sre_" => "struct_"))
     elseif requested == "sigma_st_interaction"
         push!(aliases, "st_interaction_sigma")
     elseif requested == "ure_st_interaction"
@@ -684,24 +682,30 @@ end
 # =============================================================================
 
 function _extract_chain_column_names(chain::Any)
-    if chain isa DataFrame
-        return names(chain)
+    raw_names = if chain isa DataFrame
+        names(chain)
     elseif chain isa Dict
-        return collect(keys(chain))
+        collect(keys(chain))
     elseif chain isa NamedTuple
-        return collect(keys(chain))
+        collect(keys(chain))
     else
-        # FlexiChain / MCMCChains.Chains
+        # FlexiChain / VNChain / MCMCChains.Chains
         try
-            return names(DataFrame(chain))
+            collect(string.(_get_varname_symbol.(keys(chain))))
         catch
             try
-                return collect(keys(chain))
+                names(DataFrame(chain))
             catch
-                return String[]
+                try
+                    collect(keys(chain))
+                catch
+                    String[]
+                end
             end
         end
     end
+    return [replace(string(n), r"^Parameter\((.*)\)$" => s"\1", r"^parameters\." => "",
+      r"^:+" => "") for n in raw_names]
 end
 
 function _extract_samples_from_chain(chain::Dict, key::Any, nstr::String; expected_len=nothing)
@@ -727,7 +731,8 @@ function _extract_samples_from_chain(chain::Dict, key::Any, nstr::String; expect
     error("Parameter :$(sym_key) not found in mock chain.")
 end
 
-function _extract_samples_from_chain(chain::NamedTuple, key::Any, nstr::String; expected_len=nothing)
+function _extract_samples_from_chain(chain::NamedTuple, key::Any, nstr::String;
+  expected_len=nothing)
     sym_key = Symbol(key)
     if hasproperty(chain, sym_key)
         data = getproperty(chain, sym_key)
@@ -749,7 +754,6 @@ function _extract_samples_from_chain(chain::NamedTuple, key::Any, nstr::String; 
 end
 
 function _extract_samples_from_chain(chain::Any, key::Any, nstr::String; expected_len=nothing)
-    # Use BSTM's core extraction helper _extract_flexichain_param_samples
     base_name = first(Base.split(nstr, '['))
-    return _extract_flexichain_param_samples(chain, base_name)
+    return extract_param_matrix(chain, base_name; expected_dim=expected_len)
 end

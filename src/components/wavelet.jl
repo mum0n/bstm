@@ -7,7 +7,7 @@ effect is a linear combination of these basis functions, with coefficients regul
 a random walk prior to ensure smoothness.
 
 # Version
-v1.1.1 (2026-08-14)
+v1.0.0
 
 # Mathematical Summary
 The wavelet smoother models a function \$f(x)\$ as a linear combination of scaled and
@@ -36,7 +36,8 @@ second-order random walk (RW2), to regularize the function:
 - **Optional (in `random()` call)**:
   - `nbins`: `Int`, the total number of basis functions (wavelets) to generate. Default: `32`.
   - `family`: `Symbol`, the wavelet family to use (e.g., `:db4`, `:haar`). Default: `:db4`.
-  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the wavelet coefficients. Default: `Exponential(1.0)`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the wavelet
+    coefficients. Default: `Exponential(1.0)`.
   - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the
     lengthscale(s), which control the dilation of the wavelets. Default: `Gamma(2, 0.5)`.
   - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
@@ -170,7 +171,7 @@ function get_updates(
             diag_D[1] = 0.0; diag_D[2] = 0.0
             coeffs = hyper.U * (diag_D .* $(p_names.ure))
             $(p_names.sre) = B_wavelet * coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -183,7 +184,7 @@ function get_updates(
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
             coeffs = $(p_names.sigma) .* (coeffs_unscaled .- mean(coeffs_unscaled))
             $(p_names.sre) = B_wavelet * coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -197,13 +198,16 @@ function get_updates(
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
             coeffs = $(p_names.sigma) .* coeffs_unscaled
             $(p_names.sre) = B_wavelet * coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
-    if m.method == :spectral; return spectral_code;
-    elseif m.method == :cholesky; return cholesky_code;
-    elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
     else; error("Unsupported method '$(m.method)' for Wavelet component."); end
 end
 

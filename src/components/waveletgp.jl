@@ -7,7 +7,7 @@ flexible, data-driven covariance structure. It is particularly effective at
 capturing processes with multi-scale features and non-stationarities.
 
 # Version
-v1.1.2 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 This component models a latent field \$f(s)\$ by defining the statistical properties
@@ -18,7 +18,8 @@ are approximately uncorrelated.
 The model works as follows:
 1.  **Discretization**: The continuous spatial domain is discretized onto a regular grid.
 2.  **Wavelet Decomposition**: The latent field \$f(s)\$ on the grid is decomposed into
-    wavelet coefficients \$d_{j,k}\$ using the DWT, where \$j\$ is the scale and \$k\$ is the location.
+    wavelet coefficients \$d_{j,k}\$ using the DWT, where \$j\$ is the scale and \$k\$ is
+      the location.
 3.  **Priors on Coefficients**: The wavelet coefficients are modeled as independent zero-mean
     Gaussian random variables, with a variance that depends on the scale \$j\$:
     \$d_{j,k} \\sim \\mathcal{N}(0, \\sigma_j^2)\$
@@ -26,7 +27,8 @@ The model works as follows:
     controlled by two hyperparameters: an overall scale \$\\sigma_0\$ and a smoothness/decay
     parameter \$\\alpha\$:
     \$\\sigma_j^2 = \\sigma_0^2 \\cdot 2^{-\\alpha j}\$
-    Estimating \$\\alpha\$ allows the model to learn the smoothness of the underlying process from the data.
+    Estimating \$\\alpha\$ allows the model to learn the smoothness of the underlying
+      process from the data.
 5.  **Synthesis**: The latent field is reconstructed by applying the inverse DWT (IDWT) to the
     sampled wavelet coefficients.
 6.  **Interpolation**: The values of the latent field at the original observation locations are
@@ -36,10 +38,13 @@ The model works as follows:
 - **Required**:
   - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
 - **Optional (in `random()` call)**:
-  - `resolution`: `Int`, the grid resolution for discretization (must be a power of 2). Default: `32`.
+  - `resolution`: `Int`, the grid resolution for discretization (must be a power of 2).
+    Default: `32`.
   - `wavelet`: `Symbol`, the wavelet family to use (e.g., `:db4`, `:sym6`). Default: `:db4`.
-  - `sigma0`: `UnivariateDistribution`, prior for the overall scale of the wavelet variances. Default: `Exponential(1.0)`.
-  - `alpha`: `UnivariateDistribution`, prior for the smoothness/decay parameter. Default: `Normal(1.5, 0.5)`.
+  - `sigma0`: `UnivariateDistribution`, prior for the overall scale of the wavelet
+    variances. Default: `Exponential(1.0)`.
+  - `alpha`: `UnivariateDistribution`, prior for the smoothness/decay parameter. Default:
+    `Normal(1.5, 0.5)`.
 
 # Outputs (Parameter Names)
 - `sigma0_<key>`: The overall scale of the wavelet coefficient variances.
@@ -49,7 +54,8 @@ The model works as follows:
 
 # Key References
 - Nason, G. P. (2008). *Wavelet Methods in Statistics with R*. Springer.
-- Whittle, P. (1956). *On the variation of yield variance with plot size*. Biometrika, 43(3/4), 337-343.
+- Whittle, P. (1956). *On the variation of yield variance with plot size*. Biometrika,
+  43(3/4), 337-343.
 """
 struct WaveletGP <: ComponentModel
     sigma0::UnivariateDistribution
@@ -79,7 +85,9 @@ function _get_wavelet_scale_indices_2d(res::Int, wt)
     current_res = res
     for level in 1:max_level
         half_res = current_res ÷ 2
-        if half_res == 0; break; end
+        if half_res == 0
+            break
+        end
         
         # Assign level to the detail coefficient quadrants
         scale_indices_matrix[1:half_res, (half_res+1):current_res] .= level # Horizontal details
@@ -190,7 +198,8 @@ function get_updates(
         hyper = spec_registry[:$(key)].hyper
         wt = Wavelets.wavelet(Symbol("$(m.wavelet)"))
         
-        scale_variances = $(p_names.sigma0)^2 .* (2.0 .^ (-$(p_names.alpha) .* hyper.scale_indices))
+        scale_variances = $(p_names.sigma0)^2 .* (2.0 .^ (-$(p_names.alpha) .*
+          hyper.scale_indices))
         wavelet_coeffs = $(p_names.ure) .* sqrt.(scale_variances)
         
         local latent_field_grid
@@ -205,7 +214,7 @@ function get_updates(
         coords_for_itp = ntuple(d -> hyper.coords[:, d], $(n_dims))
         $(p_names.sre) = itp(coords_for_itp...)
         
-        $(eta_target) .+= $(p_names.sre)
+        $(eta_target) = $(eta_target) .+ $(p_names.sre)
     end
     """
 end
@@ -286,7 +295,8 @@ function get_effects(
                 latent_field_grid_cpu = idwt(coeffs_reshaped, wt)
             end
             
-            itp_s = linear_interpolation(grid_ranges_cpu, latent_field_grid_cpu, extrapolation_bc=Flat())
+            itp_s = linear_interpolation(grid_ranges_cpu, latent_field_grid_cpu,
+                extrapolation_bc=Flat())
             
             coords_for_itp = ntuple(d -> view(coords_full_cpu, :, d), n_dims)
             effect_k[:, i] = itp_s(coords_for_itp...)

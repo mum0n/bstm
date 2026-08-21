@@ -7,7 +7,7 @@ its neighbors plus an independent innovation term, leading to a precision matrix
 the form `(I - ρW)'(I - ρW)`.
 
 # Version
-v1.1.2 (2026-08-14)
+v1.0.0
 
 # Mathematical Summary
 The Simultaneous Autoregressive (SAR) model defines a spatial random effect
@@ -17,10 +17,12 @@ neighbors plus an independent innovation term. The model is typically expressed 
 where:
 - \$\\rho\$ is the spatial autoregressive parameter.
 - \$\\mathbf{W}\$ is a row-standardized adjacency matrix.
-- \$\\boldsymbol{\\epsilon} \\sim \\mathcal{N}(\\mathbf{0}, \\sigma^2 \\mathbf{I})\$ are independent innovations.
+- \$\\boldsymbol{\\epsilon} \\sim \\mathcal{N}(\\mathbf{0}, \\sigma^2 \\mathbf{I})\$ are
+  independent innovations.
 
 The precision matrix \$\\mathbf{Q}\$ for the SAR model is then given by:
-\$\\mathbf{Q} = \\frac{1}{\\sigma^2} (\\mathbf{I} - \\rho \\mathbf{W})^T (\\mathbf{I} - \\rho \\mathbf{W})\$
+\$\\mathbf{Q} = \\frac{1}{\\sigma^2} (\\mathbf{I} - \\rho \\mathbf{W})^T (\\mathbf{I} -
+  \\rho \\mathbf{W})\$
 
 # Computational Methods
 - `:cholesky` (Default, AD-friendly): An AD-safe method using dense Cholesky factorization.
@@ -101,7 +103,8 @@ function get_precomputes(m::SAR, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    _sar_log_marginal_likelihood(y_residual, s_idx, s_N, W_std, eigenvalues, rho, sigma, y_sigma, noise=1e-6)
+    _sar_log_marginal_likelihood(y_residual, s_idx, s_N, W_std, eigenvalues, rho, sigma,
+      y_sigma, noise=1e-6)
 
 Computes the exact log marginal likelihood for a SAR spatial process integrated out analytically.
 """
@@ -198,28 +201,23 @@ function get_updates(
     common_code = """
         local W_std = spec_registry[:$(key)].hyper.Q_template
         local L_op = I - $(p_names.rho) * W_std
-        local A_sar = L_op' * L_op
-        local Q_sar = (A_sar + A_sar') / 2.0
-        local Q_final = Symmetric(Q_sar / ($(p_names.sigma)^2) + M.noise * I)
     """
 
     cholesky_code = """
-        # --- SAR Component (Cholesky, AD-Safe): $(key) ---
+        # --- SAR Component (Direct Autoregressive Solve, AD-Safe): $(key) ---
         let
             $(common_code)
-            F = cholesky(Matrix(Q_final) + I * 1e-9)
-            $(p_names.sre) = F.L' \\ $(p_names.ure)
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(p_names.sre) = L_op \\ ($(p_names.sigma) .* $(p_names.ure))
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
     cholesky_sparse_code = """
-        # --- SAR Component (Sparse Cholesky, Not AD-Safe): $(key) ---
+        # --- SAR Component (Direct Autoregressive Solve, Sparse): $(key) ---
         let
             $(common_code)
-            F = cholesky(Q_final + I * 1e-9)
-            $(p_names.sre) = F.L' \\ $(p_names.ure)
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(p_names.sre) = L_op \\ ($(p_names.sigma) .* $(p_names.ure))
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -265,7 +263,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))

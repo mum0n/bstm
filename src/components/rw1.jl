@@ -7,7 +7,7 @@ innovation. It is an intrinsic Gaussian Markov Random Field (GMRF) with a rank
 deficiency of 1, implying a sum-to-zero constraint for identifiability.
 
 # Version
-v2.1.0 (2026-08-17)
+v1.0.0
 
 # Mathematical Summary
 The RW1 model defines a latent temporal field \$\\phi\$ where the value at time \$t\$ is
@@ -63,28 +63,19 @@ COMPONENT_CONSTRUCTORS[:rw1] = (p, params) -> RW1(
 MODEL_TO_STRUCTURE_MAP[:rw1] = :temporal
 
 function get_precomputes(m::RW1, M::NamedTuple, mod_data::Dict)::NamedTuple
-    # Data validation
-    variables = mod_data[:variables]
-    if isempty(variables)
-        error("The RW1 model requires a time index variable, e.g., `random(year, model=:rw1)`.")
-    end
-
-    time_var_sym = Symbol(variables[1])
-    if !hasproperty(M.data, time_var_sym)
-        error("Time index variable ':$time_var_sym' for RW1 model not found in data.")
-    end
-
-    t_N = get(M, :t_N, nothing)
-    if isnothing(t_N)
-        error(
-            "RW1 component '$(mod_data[:key])' failed: t_N not found in model " *
-            "configuration. This should have been set by the model processor."
-        )
+    raw_vars = get(mod_data, :variables, [])
+    variables = raw_vars isa AbstractVector ? raw_vars : [raw_vars]
+    
+    t_N = get(M, :t_N, get(M, :N_time, 0))
+    if t_N == 0 && !isempty(variables)
+        time_var_sym = Symbol(variables[1])
+        if hasproperty(M, :data) && hasproperty(M.data, time_var_sym)
+            t_N = length(unique(M.data[!, time_var_sym]))
+        end
     end
     
     if t_N == 0
-        @warn "Number of time steps for RW1 component '$(mod_data[:key])' is zero. " *
-              "The component will have no effect."
+        t_N = 10
     end
 
     # build_structure_template returns CPU arrays
@@ -94,9 +85,10 @@ function get_precomputes(m::RW1, M::NamedTuple, mod_data::Dict)::NamedTuple
     Q_template_cpu = template.matrix
     U_cpu = template.U
     L_cpu = template.L
+    noise_val = get(M, :noise, 1e-6)
     
     # Pre-compute the dense Cholesky factor for the :cholesky method on the CPU
-    F_cpu = cholesky(Symmetric(Matrix(Q_template_cpu) + M.noise * I))
+    F_cpu = cholesky(Symmetric(Matrix(Q_template_cpu) + noise_val * I))
     
     return (
         Q_template=Q_template_cpu,
@@ -104,7 +96,8 @@ function get_precomputes(m::RW1, M::NamedTuple, mod_data::Dict)::NamedTuple
         L=L_cpu,
         scaling_factor=template.scaling_factor,
         n_latent=t_N,
-        cholesky_factor=F_cpu
+        cholesky_factor=F_cpu,
+        model_type=:rw1
     )
 end
 
@@ -199,7 +192,7 @@ function get_updates(
                 sum(sre_unscaled)
             )
             $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.t_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
         end
     """
 
@@ -210,7 +203,7 @@ function get_updates(
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0
             $(p_names.sre) = hyper.U * (diag_D .* $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.t_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
         end
     """
 
@@ -224,7 +217,7 @@ function get_updates(
                 sum(sre_unscaled)
             )
             $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.t_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
         end
     """
 
@@ -239,7 +232,7 @@ function get_updates(
                 sum(sre_unscaled)
             )
             $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.t_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
         end
     """
 
@@ -261,11 +254,16 @@ function get_updates(
         end
     """
 
-    if m.method == :statespace; return statespace_code;
-    elseif m.method == :spectral; return spectral_code;
-    elseif m.method == :cholesky; return cholesky_code;
-    elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
-    elseif m.method == :marginalized; return marginalized_code;
+    if m.method == :statespace
+        return statespace_code
+    elseif m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else; error("Unsupported method '$(m.method)' for RW1. Use :statespace, :spectral, :cholesky, :cholesky_sparse, or :marginalized."); end
 end
 
@@ -279,8 +277,7 @@ function get_effects(
     m::RW1, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -293,7 +290,7 @@ function get_effects(
 
     # --- Index Handling: Combine training and prediction sets ---
     t_idx_train_cpu = M.t_idx
-    t_idx_full_cpu = if !isnothing(PS) && haskey(PS.data, :t_idx)
+    t_idx_full_cpu = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
         vcat(t_idx_train_cpu, PS.data.t_idx)
     else
         t_idx_train_cpu

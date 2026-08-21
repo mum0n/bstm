@@ -1,4 +1,3 @@
-
 module bstm
 
     # Use Reexport for its macro, but be selective about what is re-exported.
@@ -19,7 +18,7 @@ module bstm
     # Users should explicitly 'using' these if they need their full API.
     using AbstractGPs, AbstractMCMC, ADTypes, AdvancedVI, KernelAbstractions,  
           Bijectors, CategoricalArrays, Clustering, ColorSchemes, DataFrames,
-          DelaunayTriangulation, DimensionalData, DynamicPPL, LogExpFunctions,
+          DelaunayTriangulation, DimensionalData, DuckDB, DynamicPPL, LogExpFunctions,
           Distances, FFTW, FillArrays, FlexiChains,
           NNlib, GLM, Graphs, HypothesisTests, Interpolations, JLD2,
           KernelFunctions, LibGEOS, LinearAlgebra, NamedArrays,
@@ -41,6 +40,8 @@ module bstm
     include(joinpath(srcdir, "likelihoods.jl"))
     include(joinpath(srcdir, "reconstruction.jl")) 
     include(joinpath(srcdir, "plotting.jl")) 
+    include(joinpath(srcdir, "input_output.jl"))
+    include(joinpath(srcdir, "movement.jl"))
       
     # component definitions
     components_dir = joinpath(srcdir, "components")
@@ -52,13 +53,36 @@ module bstm
     end
 
     # User-facing API exports
-    export @bstm, model_results_comprehensive, get_optimal_sampler, predict, show_model
-    export bstm_cv_orchestrator, bstm_plots, bstm_sample
-    export assign_spatial_units_inferred, plot_spatial_graph, plot_kde_simple, plot_choropleth
-    export assign_spatial_units, assign_time_units, bstm_data
-    export ParamRegistry, ParamDescriptor, build_param_registry, calibrate_param_registry, get_samples, get_param_samples
+    export @bstm, model_results_comprehensive, get_optimal_sampler
+    export precompute_step_sizes, predict, show_model
+    export bstm_cv_orchestrator, bstm_plots, bstm_sample, save_plots
+    export assign_spatial_units_inferred, plot_kde_simple
+    export assign_spatial_units, assign_time_units, assign_spatiotemporal_units
+    export discretize_data, bstm_data
+    export spatial_block_cv, spatial_weights_matrix, spatial_knn_graph
+    export spatial_radius_graph, scaling_factor_bym2
+    export ParamRegistry, ParamDescriptor, build_param_registry
+    export calibrate_param_registry, get_samples, get_param_samples
  
-    export create_theme, choropleth, timeseries_ci, spatial_graph_plot, render_paths!, map_point_occupancy, save_plot
+    export create_theme, choropleth, timeseries_ci, spatial_graph_plot
+    export render_paths!, map_point_occupancy, save_plot, model_results_plots
+
+    # Movement & ADR Telemetry exports
+    export generate_ADR_simulation_bundle, simulate_correlated_density_vector
+    export compute_velocity_field, calculate_multistep_transition
+    export simulate_posterior_trajectories, simulate_mechanistic_trajectories
+    export compute_suitability_transition_kernel, calculate_regional_connectivity
+    export plot_ad_ratio_distribution, synthesize_adr_results
+
+    # Input / Output & Persistence exports
+    export save_bstm_model, load_bstm_model
+    export save_bstm_results, load_bstm_results, query_duckdb
+    export export_posterior_samples_to_duckdb, import_posterior_samples_from_duckdb
+    export append_posterior_samples, extend_sampling
+    export save_bstm_bundle, load_bstm_bundle
+    export export_spatial_results_to_geojson, extract_posterior_priors
+    export save_model_ensemble, bma_weighted_predictions, save_out_of_sample_predictions
+    export export_results_to_parquet, export_results_to_csv, compact_duckdb
 
 
     # Module initialization function
@@ -67,134 +91,5 @@ module bstm
       # @info "bstm module loaded from $(@__DIR__)."
     end
  
-
-    function quicktest()        
-          
-      # not meant to be called directly, but run manually for debugging: 
-
-      # to help track variables, add something like this inside of a function:  
-      Main.DEBUG[] = y,p,t  # this stores y, p, t into Main.DEBUG 
-      DEBUG = Ref{Any}()  # initiate
-
-      # print( "\nTo Debug a variable, place something like the following into your function: \n
-      #  Main.DEBUG[] = y,p,t  # this stores y, p, t into Main.DEBUG \n
-      #  which means, you can see what these values are by typing: DEBUG.y, etc... \n")
-
-      using Pkg
-      Pkg.add( ["Reexport", "DrWatson", "Revise"  ] )
-      using Reexport, DrWatson, Revise 
-
-      if !@isdefined project_directory 
-          project_directory = joinpath( "C:\\home\\jae", "projects", "bstm" )
-      end
-
-      cd(project_directory)
-      quickactivate(project_directory) 
-
-          # This provides a unified namespace for the user.
-      pkgs_bstm = [ 
-          "AbstractGPs", "AbstractMCMC", "AbstractPPL", "ADTypes", "AdvancedVI", 
-          "Bijectors", "CategoricalArrays", "Clustering", "ColorSchemes", "DataFrames", "KernelAbstractions", 
-          "DelaunayTriangulation", "DimensionalData", "LogExpFunctions", "Turing", 
-          "Distances", "Distributions", "DynamicPPL", "FFTW", "FillArrays", "FlexiChains", 
-          "NNlib", "GLM", "Graphs", "HypothesisTests", "Interpolations", "JLD2", 
-          "KernelFunctions", "LibGEOS", "LinearAlgebra", "NamedArrays", 
-          "NearestNeighbors", "Optim", "Optimisers", "OrderedCollections", "PDMats", 
-          "Plots", "PosteriorStats", "Random", "Requires", "SparseArrays", 
-          "SpecialFunctions", "StaticArrays", "Statistics", "StatsBase", "StatsModels", 
-          "StatsPlots", "Wavelets", "WaveletsExt", "ForwardDiff", "ReverseDiff", "Enzyme"
-      ]
-
-      # load them all:
-      try
-        for pk in pkgs_bstm;  @eval using $(Symbol(pk)); end
-      catch e
-        # force install all (if in an incomplete state or first run):
-        Pkg.add(pkgs_bstm);
-        for pk in pkgs_bstm;  @eval using $(Symbol(pk)); end
-        print( "\nInstall not complete or inconsistent, installing required packages. This might require multiple restarts and a bit of time...hours? \n\n" ) 
-        Pkg.instantiate()
-        Pkg.precompile()
-        Pkg.gc() # tidy loose ends:
-      end
-          
-
-      function load_project_functions( src_dir )
-        
-        fns_main = [
-          "definitions.jl",
-          "data.jl", 
-          "partitioning.jl", 
-          "parameters.jl",
-          "plotting.jl",
-          "model.jl", 
-          "likelihoods.jl", 
-          "reconstruction.jl"
-        ]
-
-        fns = joinpath.( src_dir, fns_main )
-
-        fnc = readdir( joinpath( src_dir, "components" ) )
-        for fn in fnc 
-          push!(fns, joinpath(src_dir, "components", fn) )
-        end
-        
-        for fn in fns 
-          if endswith(fn, ".jl")
-            try
-              println(fn)  
-              include(fn)
-            catch e
-                @error "Error including file '$fn':" e
-            end
-          end
-        end
-
-        # include(joinpath(src_dir, "tmp.jl"))
-
-      end
-
-      load_project_functions( "C:\\home\\jae\\projects\\bstm\\src" )
-      
-      data_scot, _ = bstm_data(); # Default is "scottish_lip"
-      inp_df = data_scot.data;
-      W = data_scot.au.W
-
-      m = @bstm(
-          likelihood(y, family=poisson, log_offsets=log_offsets) ~
-              intercept() +
-              fixed(cov1) +
-              random(s_idx, model=bym2) +
-              random(year, model=ar1),
-          inp_df,
-          W = W,
-          verbose = false # Suppress verbose output
-      ); 
-      
-      # you can just use this and edit as a basis and continue with a standard Turing workflow
-      # the Turing model arguments can be recovered from: 
-      # (M = m.args.M, spec_registry = m.args.spec_registry)
-      # m.args.M contains all other internal flags and data:
-      #   m.args.M.formula contains your formula
-      #   m.args.M.generated_model_code contains the Turing code (syntax is not the usual but fully functional)
-      #   etc.
-      show_model(m)  
-
-
-      # different sampling mechanisms
-      chn = sample(m, MH(), 10; progress=false)  # fast debug
-
-      chn = sample(m, NUTS(), 10; progress=false)
-      
-      os = get_optimal_sampler(m; adaptation_steps=5, n_chains=3)
-      chn = bstm_sample(m, os, 10; progress=false)
-
-      chn = bstm_sample(m, 10; n_chains=3, progress=false)  # uses get_optimal_sampler 
-
-      res = model_results_comprehensive( m, chn; au=data_scot.au);
-
-      println(res.summary_stats)
-  end
-
 
 end # module bstm

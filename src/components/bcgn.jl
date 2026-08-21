@@ -8,7 +8,7 @@ structured on a bipartite graph, where nodes are divided into two disjoint sets,
 and edges only connect nodes from different sets.
 
 # Version
-v1.1.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The BCGN component models a latent spatial field on one partition of a bipartite
@@ -44,15 +44,18 @@ is applied to the latent field.
   - A spatial index variable (e.g., `s_idx`).
   - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
 - **Optional (in `random()` call)**:
-  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default: `Exponential(1.0)`.
-  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`). Default: `:spectral`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default:
+    `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
+    Default: `:spectral`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the latent field.
 - `innovations_<key>`: The raw standard normal innovations for the latent field.
 
 # Key References
-- Kipf, T. N., & Welling, M. (2016). *Semi-supervised classification with graph convolutional networks*. arXiv preprint arXiv:1609.02907.
+- Kipf, T. N., & Welling, M. (2016). *Semi-supervised classification with graph
+  convolutional networks*. arXiv preprint arXiv:1609.02907.
 - Rue, H., & Held, L. (2005). *Gaussian Markov Random Fields: Theory and Applications*. CRC Press.
 """
 struct BCGN <: ComponentModel
@@ -129,9 +132,11 @@ end
 
 
 """
-    _bcgn_log_marginal_likelihood(y_residual, mapping_matrix, Q_template, L_eig, sigma, y_sigma, noise=1e-6)
+    _bcgn_log_marginal_likelihood(y_residual, mapping_matrix, Q_template, L_eig, sigma,
+      y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for a BCGN bipartite spatial component integrated out analytically.
+Computes the exact log marginal likelihood for a BCGN bipartite spatial component integrated
+  out analytically.
 """
 function _bcgn_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -227,7 +232,7 @@ function get_updates(
             
             latent_field = U * (diag_D .* $(p_names.ure))
             $(p_names.sre) = hyper.mapping_matrix * latent_field
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -242,7 +247,7 @@ function get_updates(
             
             latent_field = sre_unscaled .* $(p_names.sigma)
             $(p_names.sre) = hyper.mapping_matrix * latent_field
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -258,7 +263,7 @@ function get_updates(
             
             latent_field = sre_unscaled .* $(p_names.sigma)
             $(p_names.sre) = hyper.mapping_matrix * latent_field
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -304,11 +309,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -327,7 +328,8 @@ function get_effects(
     N_total = length(s_idx_full)
 
     # --- Mapping Matrix Construction on CPU ---
-    set1_map = Dict(original_idx => new_idx for (new_idx, original_idx) in enumerate(spec.hyper.set1_indices))
+    set1_map = Dict(original_idx => new_idx for (new_idx,
+        original_idx) in enumerate(spec.hyper.set1_indices))
     
     mapping_matrix_cpu = spzeros(Float64, N_total, n_latent)
     for i in 1:N_total

@@ -7,7 +7,7 @@ Random Field (GMRF) on a graph with data-driven edge weights, often representing
 habitat conductivity or resistance.
 
 # Version
-v1.2.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The component models a latent spatial field \$\\phi\$ as a GMRF,
@@ -38,9 +38,12 @@ degree to which the habitat influences the spatial correlation structure.
   - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
   - `habitat`: A `Symbol` pointing to a column in the data, or a `Vector` of length `s_N`.
 - **Optional (in `random()` call)**:
-  - `beta`: `UnivariateDistribution`, prior for the habitat effect parameter. Default: `Normal(0, 1)`.
-  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default: `Exponential(1.0)`.
-  - `method`: `Symbol`, computational method (`:cholesky` or `:cholesky_sparse`). Default: `:cholesky`.
+  - `beta`: `UnivariateDistribution`, prior for the habitat effect parameter. Default:
+    `Normal(0, 1)`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default:
+    `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:cholesky` or `:cholesky_sparse`). Default:
+    `:cholesky`.
 
 # Outputs (Parameter Names)
 - `beta_<key>`: The habitat effect parameter.
@@ -159,7 +162,7 @@ function get_updates(
             F = cholesky(Symmetric(Matrix(Q_beta) + M.noise * I))
             $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -171,7 +174,7 @@ function get_updates(
             F = cholesky(Symmetric(Q_beta + M.noise * I))
             $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -226,9 +229,12 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k_outcome in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
-        beta_name = _find_parameter(p_names, string(p_names_k.beta), k_outcome, is_multivariate_model)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome, is_multivariate_model)
-        ure_name = _find_parameter(p_names, string(p_names_k.ure), k_outcome, is_multivariate_model)
+        beta_name = _find_parameter(p_names, string(p_names_k.beta), k_outcome,
+            is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome,
+            is_multivariate_model)
+        ure_name = _find_parameter(p_names, string(p_names_k.ure), k_outcome,
+            is_multivariate_model)
 
         if isempty(beta_name) || isempty(sigma_name) || isempty(ure_name)
             @warn "Parameters for NetworkFlow component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."

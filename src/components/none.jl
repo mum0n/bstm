@@ -7,7 +7,7 @@ interactions) or for situations where a component is syntactically required but 
 effect is desired.
 
 # Version
-v1.1.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 This component has no mathematical form and adds nothing to the model's linear

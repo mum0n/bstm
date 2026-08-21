@@ -7,7 +7,7 @@ Gaussian Process with a Matérn covariance function and a discrete Gaussian Mark
 Random Field (GMRF), enabling scalable and principled spatial modeling.
 
 # Version
-v1.1.2 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The SPDE approach models a Gaussian Field \$u(s)\$ as the solution to the SPDE:
@@ -22,14 +22,17 @@ For a discrete spatial domain represented by a graph, the Laplacian \$\\Delta\$ 
 approximated by the graph Laplacian \$\\mathbf{Q}_{ICAR} = D - W\$. For the common case
 where \$\\alpha = 2\$ (which corresponds to a Matérn field with smoothness \$\\nu=1\$),
 the precision matrix \$\\mathbf{Q}\$ of the latent field \$\\boldsymbol{\\phi}\$ is given by:
-\$\\mathbf{Q} = (\\kappa^2 \\mathbf{I} + \\mathbf{Q}_{ICAR})^T (\\kappa^2 \\mathbf{I} + \\mathbf{Q}_{ICAR})\$
-The model then samples the latent field from \$\\boldsymbol{\\phi} \\sim \\mathcal{N}(0, (\\sigma^2 \\mathbf{Q})^{-1})\$.
+\$\\mathbf{Q} = (\\kappa^2 \\mathbf{I} + \\mathbf{Q}_{ICAR})^T (\\kappa^2 \\mathbf{I} +
+  \\mathbf{Q}_{ICAR})\$
+The model then samples the latent field from \$\\boldsymbol{\\phi} \\sim \\mathcal{N}(0,
+  (\\sigma^2 \\mathbf{Q})^{-1})\$.
 
 # Computational Methods
 - `:spectral` (Default, AD-friendly): An efficient, AD-safe method using spectral decomposition.
   Only applicable for isotropic `kappa` priors.
 - `:cholesky` (AD-friendly): An AD-safe didactic alternative using dense Cholesky factorization.
-- `:cholesky_sparse` (Didactic, Not AD-friendly): A non-AD-safe didactic method using sparse Cholesky
+- `:cholesky_sparse` (Didactic, Not AD-friendly): A non-AD-safe didactic method using sparse
+  Cholesky
   factorization, suitable for gradient-free samplers.
 
 # Inputs
@@ -37,7 +40,8 @@ The model then samples the latent field from \$\\boldsymbol{\\phi} \\sim \\mathc
   - A spatial index variable (e.g., `region`) passed to `random()`.
   - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
 - **Optional (in `random()` call)**:
-  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default: `Exponential(1.0)`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default:
+    `Exponential(1.0)`.
   - `kappa`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the `kappa`
     parameter(s). Default: `LogNormal(0, 1)`.
   - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
@@ -107,9 +111,11 @@ end
 
 
 """
-    _spde_log_marginal_likelihood(y_residual, s_idx, s_N, Q_laplacian, L_eig, kappa, sigma, y_sigma, noise=1e-6)
+    _spde_log_marginal_likelihood(y_residual, s_idx, s_N, Q_laplacian, L_eig, kappa, sigma,
+      y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for an SPDE spatial component integrated out analytically.
+Computes the exact log marginal likelihood for an SPDE spatial component integrated out
+  analytically.
 """
 function _spde_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -212,7 +218,7 @@ function get_updates(
             diag_D = $(p_names.sigma) ./ sqrt.(diag_vals .+ M.noise)
             
             $(p_names.sre) = U * (diag_D .* $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -235,7 +241,7 @@ function get_updates(
             $(cholesky_base_code)
             local F = cholesky(Matrix(Q_final) + M.noise * I)
             $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -245,7 +251,7 @@ function get_updates(
             $(cholesky_base_code)
             local F = cholesky(Q_final + M.noise * I)
             $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -294,11 +300,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -373,7 +375,8 @@ function get_effects(
                 scale = sig^2 + noise
                 inv_sigma_y2 = 1.0 / (y_sig^2 + noise)
                 
-                L_op = Matrix{Float64}(Q_laplacian_cpu) + (kap^2) * Matrix{Float64}(I, n_latent, n_latent)
+                L_op = Matrix{Float64}(Q_laplacian_cpu) + (kap^2) * Matrix{Float64}(I,
+                    n_latent, n_latent)
                 Q_spde = L_op' * L_op
                 
                 Q_base = Matrix{Float64}(Q_spde)

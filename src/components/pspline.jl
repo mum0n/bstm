@@ -6,7 +6,7 @@ creates a basis of B-spline functions and applies a discrete penalty (typically 
 random walk) to the coefficients to ensure smoothness and prevent overfitting.
 
 # Version
-v1.2.0 (2026-08-14)
+v1.0.0
 
 # Mathematical Summary
 The P-spline models a smooth function \$f(x)\$ as a linear combination of \$K\$ B-spline
@@ -16,7 +16,8 @@ To enforce smoothness, a penalty is applied to the coefficients \$\\boldsymbol{\
 This is achieved by assuming the coefficients follow a Gaussian Markov Random Field
 (GMRF) structure. A common choice is a second-order random walk (RW2), which
 penalizes deviations from a local linear trend:
-\$\\Delta^d \\beta_k = \\sum_{j=0}^d (-1)^j \\binom{d}{j} \\beta_{k-j} \\sim \\mathcal{N}(0, \\sigma^{-2})\$
+\$\\Delta^d \\beta_k = \\sum_{j=0}^d (-1)^j \\binom{d}{j} \\beta_{k-j} \\sim \\mathcal{N}(0,
+  \\sigma^{-2})\$
 where \$d\$ is the `diff_order`. The precision matrix \$\\mathbf{Q}\$ for the coefficients
 is derived from this random walk structure. The model then samples the coefficients from
 \$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\sigma^2 \\mathbf{Q})^{-1})\$.
@@ -119,9 +120,11 @@ function get_precomputes(m::PSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    _pspline_log_marginal_likelihood(y_residual, B_basis, Q_penalty, L_eig, diff_order, sigma, y_sigma, noise=1e-6)
+    _pspline_log_marginal_likelihood(y_residual, B_basis, Q_penalty, L_eig, diff_order,
+      sigma, y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for a P-spline component with basis coefficients integrated out analytically.
+Computes the exact log marginal likelihood for a P-spline component with basis coefficients
+  integrated out analytically.
 """
 function _pspline_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -212,7 +215,7 @@ function get_updates(
 
             coeffs = hyper.U * (diag_D .* $(p_names.ure))
             $(p_names.sre) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -229,7 +232,7 @@ function get_updates(
 
             local coeffs = $(p_names.sigma) .* coeffs_unscaled
             $(p_names.sre) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -247,7 +250,7 @@ function get_updates(
 
             local coeffs = $(p_names.sigma) .* coeffs_unscaled
             $(p_names.sre) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -287,12 +290,7 @@ function get_effects(
     m::PSpline, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))

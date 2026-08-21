@@ -7,7 +7,7 @@ space. The effect is a linear combination of these basis functions, with coeffic
 regularized by a random walk prior to ensure smoothness.
 
 # Version
-v1.1.2 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 A Thin Plate Spline models a function \$f(\\mathbf{x})\$ as a linear combination of
@@ -43,7 +43,8 @@ second-order random walk (RW2) prior:
     coefficients. Default: `Exponential(1.0)`.
   - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
     Default: `:spectral`.
-  - `knot_method`: `Symbol`, method for placing knots (`:kmeans`, `:random`, `:quantile`, `:range`). Default: `:kmeans`.
+  - `knot_method`: `Symbol`, method for placing knots (`:kmeans`, `:random`, `:quantile`,
+    `:range`). Default: `:kmeans`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the TPS coefficients.
@@ -96,11 +97,27 @@ function get_precomputes(m::TPS, M::NamedTuple, mod_data::Dict)::NamedTuple
     # Basis matrix calculation on CPU
     B_cpu = zeros(Float64, n_obs, n_latent)
     if n_dims == 1
-        for i in 1:n_latent; r = abs.(coords_cpu[:, 1] .- knots_cpu[i, 1]); B_cpu[:, i] .= r.^3; end
+        for i in 1:n_latent
+            r = abs.(coords_cpu[:, 1] .- knots_cpu[i, 1])
+            B_cpu[:, i] .= r.^3
+        end
     elseif n_dims == 2
-        for i in 1:n_latent; dist_sq = (coords_cpu[:, 1] .- knots_cpu[i, 1]).^2 .+ (coords_cpu[:, 2] .- knots_cpu[i, 2]).^2; r = sqrt.(dist_sq); B_cpu[:, i] .= (r.^2) .* log.(r .+ 1e-9); end
+        for i in 1:n_latent
+            dist_sq = (coords_cpu[:, 1] .- knots_cpu[i, 1]).^2 .+ (coords_cpu[:,
+                2] .- knots_cpu[i, 2]).^2
+            r = sqrt.(dist_sq)
+            B_cpu[:, i] .= (r.^2) .* log.(r .+ 1e-9)
+        end
     else
-        for i in 1:n_latent; dist_sq = sum((coords_cpu .- knots_cpu[i, :]').^2, dims=2); r = sqrt.(dist_sq); if isodd(n_dims); B_cpu[:, i] .= r.^(4 - n_dims); else; B_cpu[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9); end; end
+        for i in 1:n_latent
+            dist_sq = sum((coords_cpu .- knots_cpu[i, :]').^2, dims=2)
+            r = sqrt.(dist_sq)
+            if isodd(n_dims)
+                B_cpu[:, i] .= r.^(4 - n_dims)
+            else
+                B_cpu[:, i] .= (r.^(4 - n_dims)) .* log.(r .+ 1e-9)
+            end
+        end
     end
     
     # Penalty matrix and spectral decomposition on CPU
@@ -135,7 +152,8 @@ end
 """
     _tps_log_marginal_likelihood(y_residual, B_basis, Q_penalty, L_eig, sigma, y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for a TPS component with basis coefficients integrated out analytically.
+Computes the exact log marginal likelihood for a TPS component with basis coefficients
+  integrated out analytically.
 """
 function _tps_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -221,7 +239,7 @@ function get_updates(
             diag_D[1] = 0.0; diag_D[2] = 0.0
             local coeffs = hyper.U * (diag_D .* $(p_names.ure))
             $(p_names.sre) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -234,7 +252,7 @@ function get_updates(
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
             local coeffs = $(p_names.sigma) .* (coeffs_unscaled .- mean(coeffs_unscaled))
             $(p_names.sre) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -248,7 +266,7 @@ function get_updates(
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
             local coeffs = $(p_names.sigma) .* coeffs_unscaled
             $(p_names.sre) = B_basis * coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -270,10 +288,14 @@ function get_updates(
         end
     """
 
-    if m.method == :spectral; return spectral_code;
-    elseif m.method == :cholesky; return cholesky_code;
-    elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
-    elseif m.method == :marginalized; return marginalized_code;
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else; error("Unsupported method '$(m.method)' for TPS component. Use :spectral, :cholesky, :cholesky_sparse, or :marginalized."); end
 end
 
@@ -283,7 +305,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -311,7 +333,8 @@ function get_effects(
             r = abs.(coords_pred_cpu[:, 1] .- knots_cpu[:, 1]')
             B_pred_cpu .= r.^3
         elseif n_dims == 2
-            dist_sq = (coords_pred_cpu[:, 1] .- knots_cpu[:, 1]').^2 .+ (coords_pred_cpu[:, 2] .- knots_cpu[:, 2]').^2
+            dist_sq = (coords_pred_cpu[:, 1] .- knots_cpu[:,
+                1]').^2 .+ (coords_pred_cpu[:, 2] .- knots_cpu[:, 2]').^2
             r = sqrt.(dist_sq)
             B_pred_cpu .= (r.^2) .* log.(r .+ 1e-9)
         else

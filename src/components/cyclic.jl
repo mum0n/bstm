@@ -7,13 +7,14 @@ point smoothly connects back to the first. This is a type of Gaussian Markov
 Random Field (GMRF) with a circulant precision matrix.
 
 # Version
-v1.2.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The cyclic random walk models a latent field \$\\phi\$ where the value at time \$t\$ is
 conditionally dependent on its neighbors, with the first and last points
 considered neighbors. The conditional distribution is:
-\$\\phi_t | \\phi_{-t} \\sim \\mathcal{N}\\left( \\frac{1}{2}(\\phi_{t-1} + \\phi_{t+1}), \\frac{\\sigma^2}{2} \\right)\$
+\$\\phi_t | \\phi_{-t} \\sim \\mathcal{N}\\left( \\frac{1}{2}(\\phi_{t-1} + \\phi_{t+1}),
+  \\frac{\\sigma^2}{2} \\right)\$
 (indices are taken modulo the period).
 
 The joint precision matrix \$Q\$ is a circulant matrix corresponding to this structure.
@@ -69,25 +70,22 @@ matrix (`Q_template`) for the cyclic random walk, along with its spectral
 decomposition (`U`, `L`) and Cholesky factorization. This is a CPU-only implementation.
 """
 function get_precomputes(m::Cyclic, M::NamedTuple, mod_data::Dict)::NamedTuple
+    raw_vars = get(mod_data, :variables, [])
+    variables = raw_vars isa AbstractVector ? raw_vars : [raw_vars]
+    
     u_N = get(M, :u_N, 0)
+    if u_N == 0 && !isempty(variables) && hasproperty(M, :data) && hasproperty(M.data,
+        Symbol(variables[1]))
+        u_N = length(unique(M.data[!, Symbol(variables[1])]))
+    end
     if u_N == 0
-        error(
-            "The Cyclic model requires a seasonal context (`u_N`), but it has not " *
-            "been established. Ensure a seasonal index variable is provided."
-        )
+        u_N = Int(m.period > 0 ? m.period : 12)
     end
 
-    if m.period != u_N
-        @warn "The specified period ($(m.period)) does not match the number of " *
-              "unique levels in the seasonal index variable ($(u_N)). " *
-              "Setting period to $u_N."
-        n = u_N
-    else
-        n = m.period
-    end
-    
+    n = Int(u_N)
     template = build_structure_template(:cyclic, n)
-    F = cholesky(Symmetric(Matrix(template.matrix) + M.noise * I))
+    noise_val = get(M, :noise, 1e-6)
+    F = cholesky(Symmetric(Matrix(template.matrix) + noise_val * I))
     
     return (
         Q_template=template.matrix,
@@ -95,14 +93,17 @@ function get_precomputes(m::Cyclic, M::NamedTuple, mod_data::Dict)::NamedTuple
         U=template.U,
         L=template.L,
         n_latent=n,
-        cholesky_factor=F
+        cholesky_factor=F,
+        model_type=:cyclic
     )
 end
 
 """
-    _cyclic_log_marginal_likelihood(y_residual, u_idx, u_N, Q_template, L_eig, sigma, y_sigma, noise=1e-6)
+    _cyclic_log_marginal_likelihood(y_residual, u_idx, u_N, Q_template, L_eig, sigma,
+      y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for a Cyclic seasonal process integrated out analytically.
+Computes the exact log marginal likelihood for a Cyclic seasonal process integrated out
+  analytically.
 """
 function _cyclic_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -197,7 +198,7 @@ function get_updates(
             diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
             diag_D[1] = 0.0 # Enforce sum-to-zero constraint
             $(p_names.sre) = U * (diag_D .* $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.u_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.u_idx)
         end
     """
 
@@ -213,7 +214,7 @@ function get_updates(
             )
             
             $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.u_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.u_idx)
         end
     """
 
@@ -230,7 +231,7 @@ function get_updates(
             )
             
             $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.u_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.u_idx)
         end
     """
 
@@ -278,12 +279,7 @@ function get_effects(
     m::Cyclic, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))

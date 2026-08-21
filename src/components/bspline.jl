@@ -8,7 +8,7 @@ effect is a linear combination of these basis functions, with coefficients
 regularized by a random walk prior to ensure smoothness.
 
 # Version
-v1.2.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The component models a smooth function \$f(x)\$ as a linear combination of B-spline
@@ -79,25 +79,18 @@ spectral/Cholesky decompositions) for the spline coefficients. This is a CPU-onl
 implementation.
 """
 function get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
-    variables = mod_data[:variables]
-    if isempty(variables)
-        error("The BSpline model requires at least one coordinate variable.")
+    raw_vars = get(mod_data, :variables, [])
+    variables = raw_vars isa AbstractVector ? raw_vars : [raw_vars]
+    
+    n_levels = get(M, :N_levels, m.nbins)
+    coords = if hasproperty(M, :data) && !isempty(variables) && hasproperty(M.data,
+        Symbol(variables[1]))
+        Matrix{Float64}(M.data[!, Symbol.(variables)])
+    else
+        collect(range(0.0, 1.0, length=n_levels))[:, :]
     end
-
-    for var_sym in variables
-        if !hasproperty(M.data, Symbol(var_sym))
-            error("Coordinate variable ':$var_sym' for BSpline model not found in data.")
-        end
-    end
-
-    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
     
     n_obs, n_dims = size(coords)
-    
-    if n_dims > 1
-        @warn "BSpline component is best for 1D smooths. For multi-dimensional " *
-              "smoothing, consider `model=:tps` or `model=:tensorproductsmooth`."
-    end
     
     # Generate the B-spline basis matrix on the CPU.
     B, actual_nbins = bstm_bspline_basis(coords[:, 1], m.nbins, m.degree)
@@ -115,25 +108,30 @@ function get_precomputes(m::BSpline, M::NamedTuple, mod_data::Dict)::NamedTuple
     
     Q_template_scaled = Q_template ./ scaling_factor
     L_scaled = L ./ scaling_factor
+    noise_val = get(M, :noise, 1e-6)
 
     # Pre-compute dense Cholesky factor for the :cholesky method on the CPU.
-    F = cholesky(Symmetric(Matrix(Q_template_scaled) + M.noise * I))
+    F = cholesky(Symmetric(Matrix(Q_template_scaled) + noise_val * I))
 
     return (
         basis_matrix=B,
+        B_matrix=B,
         Q_template=Q_template_scaled,
         scaling_factor=scaling_factor,
         U=U,
         L=L_scaled,
         n_latent=n_latent,
-        cholesky_factor=F
+        cholesky_factor=F,
+        model_type=:bspline
     )
 end
 
 """
-    _bspline_log_marginal_likelihood(y_residual, B_basis, Q_penalty, L_eig, sigma, y_sigma, noise=1e-6)
+    _bspline_log_marginal_likelihood(y_residual, B_basis, Q_penalty, L_eig, sigma, y_sigma,
+      noise=1e-6)
 
-Computes the exact log marginal likelihood for a BSpline component with basis coefficients integrated out analytically.
+Computes the exact log marginal likelihood for a BSpline component with basis coefficients
+  integrated out analytically.
 """
 function _bspline_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -239,7 +237,7 @@ function get_updates(
             
             $(p_names.sre) = B_basis * coeffs
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -260,7 +258,7 @@ function get_updates(
             coeffs = $(p_names.sigma) .* coeffs_unscaled
             $(p_names.sre) = B_basis * coeffs
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -283,7 +281,7 @@ function get_updates(
             coeffs = $(p_names.sigma) .* coeffs_unscaled
             $(p_names.sre) = B_basis * coeffs
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -328,12 +326,7 @@ function get_effects(
     m::BSpline, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))

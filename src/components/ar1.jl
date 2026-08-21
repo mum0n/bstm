@@ -5,13 +5,14 @@ A component model for a first-order autoregressive (AR1) process, fundamental fo
 modeling time series data with serial correlation.
 
 # Version
-v1.4.2 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The AR1 process models the value of a latent field \$\\phi_t\$ at time \$t\$ as a
 fraction of its value at the previous time step, plus an independent innovation
 term \$\\epsilon_t\$:
-\$\\phi_t = \\rho \\phi_{t-1} + \\epsilon_t\$, where \$\\epsilon_t \\sim \\mathcal{N}(0, \\sigma^2)\$
+\$\\phi_t = \\rho \\phi_{t-1} + \\epsilon_t\$, where \$\\epsilon_t \\sim \\mathcal{N}(0,
+  \\sigma^2)\$
 
 To ensure stationarity (\$-1 < \\rho < 1\$), the autocorrelation parameter \$\\rho\$ is
 parameterized via a `tanh` transformation of an unconstrained parameter:
@@ -33,7 +34,7 @@ controlled by the `method` parameter in the `random()` call:
 - **Required**:
   - A temporal index variable (e.g., `year`) passed to `random()`.
 - **Optional (in `random()` call)**:
-  - `unconstrained_rho`: A `Distribution` for the prior on the unconstrained
+  - `rho_unconstrained`: A `Distribution` for the prior on the unconstrained
     autocorrelation parameter. Default: `Normal(0, 1.5)`.
   - `sigma`: A `Distribution` for the prior on the innovations' standard deviation.
     Default: `Exponential(1.0)`.
@@ -41,15 +42,17 @@ controlled by the `method` parameter in the `random()` call:
     `:spectral`, or `:centered`). Default: `:statespace`.
 
 # Outputs (Parameter Names)
-- `unconstrained_rho_<key>`: The unconstrained parameter sampled by Turing.
-- `rho_<key>`: The transformed autocorrelation parameter, `tanh(unconstrained_rho_<key>)`.
+- `rho_unconstrained_<key>`: The unconstrained parameter sampled by Turing.
+- `rho_<key>`: The transformed autocorrelation parameter, `tanh(rho_unconstrained_<key>)`.
 - `sigma_<key>`: The standard deviation of the AR1 innovations.
-- `innovations_<key>`: The latent standard normal innovations driving the process (for `:statespace` and `:spectral`).
-- `latent_<key>`: The latent field (for `:centered`).
+- `ure_<key>`: Standard normal innovations driving the process.
+- `sre_<key>`: Reconstructed temporal latent field.
 
 # Key References
 - Hamilton, J. D. (1994). *Time Series Analysis*. Princeton University Press.
-- Rue, H., Martino, S., & Chopin, N. (2009). Approximate Bayesian inference for latent Gaussian models by using integrated nested Laplace approximations. *Journal of the Royal Statistical Society: Series B (Statistical Methodology)*, 71(2), 319-392.
+- Rue, H., Martino, S., & Chopin, N. (2009). Approximate Bayesian inference for latent
+  Gaussian models by using integrated nested Laplace approximations. *Journal of the Royal
+  Statistical Society: Series B (Statistical Methodology)*, 71(2), 319-392.
 """
 struct AR1 <: ComponentModel
     rho_unconstrained::Distribution
@@ -57,11 +60,9 @@ struct AR1 <: ComponentModel
     method::Symbol # :statespace, :spectral, :centered, :marginalized
 end
 
-Base.getproperty(m::AR1, s::Symbol) = (s === :unconstrained_rho ? getfield(m, :rho_unconstrained) : getfield(m, s))
-
 COMPONENT_TYPE_REGISTRY[:ar1] = AR1
 COMPONENT_CONSTRUCTORS[:ar1] = (p, params) -> AR1(
-    get(p, :rho_unconstrained, get(p, :unconstrained_rho, Normal(0, 1.5))),
+    get(p, :rho_unconstrained, Normal(0, 1.5)),
     get(p, :sigma, Exponential(1.0)),
     get(params, :method, :statespace) # Default method
 )
@@ -137,7 +138,8 @@ end
 """
     _ar1_log_marginal_likelihood(y_residual, t_idx, t_N, rho, sigma, y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for an AR(1) Gaussian Markov Random Field integrated out analytically.
+Computes the exact log marginal likelihood for an AR(1) Gaussian Markov Random Field
+  integrated out analytically.
 Runs in linear time O(N + T) using sparse tridiagonal Cholesky factorization.
 """
 function _ar1_log_marginal_likelihood(
@@ -253,7 +255,7 @@ function get_updates(
         $(p_names.sre) = ar1_statespace(
             rho, $(p_names.sigma), $(p_names.ure), $(n_latent), M.noise
         )
-        $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+        $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
     """
 
     spectral_code = """
@@ -266,7 +268,7 @@ function get_updates(
             lambda_vals = (one(T) + rho^2) .+ rho .* L_base
             diag_D = $(p_names.sigma) ./ sqrt.(lambda_vals .+ M.noise)
             $(p_names.sre) = U * (diag_D .* $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
         end
     """
 
@@ -278,7 +280,7 @@ function get_updates(
                 rho, $(p_names.sigma), $(n_latent), M.noise
             )
             $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), Symmetric(K))
-            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
         end
     """
 
@@ -300,10 +302,15 @@ function get_updates(
         end
     """
 
-    if m.method == :statespace; return statespace_code; end
-    if m.method == :spectral; return spectral_code; end
-    if m.method == :centered; return centered_code; end
-    if m.method == :marginalized; return marginalized_code; end
+    if m.method == :statespace
+        return statespace_code
+    elseif m.method == :spectral
+        return spectral_code
+    elseif m.method == :centered
+        return centered_code
+    elseif m.method == :marginalized
+        return marginalized_code
+    end
     
     error(
         "Unsupported method '$(m.method)' for AR1 component. " *
@@ -316,11 +323,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -328,7 +331,7 @@ function get_effects(
 
     # --- Index Handling: Combine training and prediction sets on CPU ---
     t_idx_train = M.t_idx
-    t_idx_full = if !isnothing(PS) && haskey(PS.data, :t_idx)
+    t_idx_full = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
         vcat(t_idx_train, PS.data.t_idx)
     else
         t_idx_train
@@ -343,7 +346,8 @@ function get_effects(
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        rho_name = _find_parameter(p_names, string(p_names_k.rho_unconstrained), k, is_multivariate_model)
+        rho_name = _find_parameter(p_names, string(p_names_k.rho_unconstrained), k,
+            is_multivariate_model)
         
         if isempty(sigma_name) || isempty(rho_name)
             @warn "Base parameters for AR1 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -463,7 +467,8 @@ end
 """
     ar1_statespace(rho, sigma, ure, n_latent, noise)
 
-Computes the state-space evolution of a stationary AR(1) process. This is a CPU-only implementation.
+Computes the state-space evolution of a stationary AR(1) process. This is a CPU-only
+  implementation.
 """
 function ar1_statespace(
     rho, sigma, ure::AbstractVector, n_latent::Int, noise

@@ -8,7 +8,7 @@ with a `modifier_model` (typically a spatial smoother) to create a spatially
 varying standard deviation.
 
 # Version
-v1.2.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The component models a non-stationary spatial field \$\\phi(s)\$ where the local
@@ -139,7 +139,8 @@ function get_priors(
     
     # The base model's sigma is not used; variance is controlled by the modifier.
     # We precisely remove the sigma prior line to avoid side effects.
-    sigma_var_to_remove = generate_full_variable_names(base_spec_for_priors, arch, outcome_idx).sigma
+    sigma_var_to_remove = generate_full_variable_names(base_spec_for_priors, arch,
+        outcome_idx).sigma
     base_priors_cleaned = replace(base_priors, Regex("\\s*$(sigma_var_to_remove) ~ .*\\n?") => "")
     
     modifier_priors = get_priors(
@@ -213,7 +214,7 @@ function get_updates(
             local final_effect_latent = base_sre_unscaled .* spatially_varying_sigma
             
             # 4. Add the final effect to the linear predictor.
-            $(eta_target) .+= view(final_effect_latent, M.s_idx)
+            $(eta_target) = $(eta_target) .+ view(final_effect_latent, M.s_idx)
         end
     """
 end
@@ -266,14 +267,16 @@ function get_effects(
     for k in 1:outcomes_N
         # 1. Get the modifier effect (spatially varying log-sigma)
         # This recursive call returns CPU arrays.
-        modifier_results = get_effects(m.modifier_model, chain, modifier_spec, M, PS) # Recursive call to get modifier effects
+        modifier_results = get_effects(m.modifier_model, chain, modifier_spec, M,
+            PS) # Recursive call to get modifier effects
         log_sigma_field = modifier_results.structured[k] # Log-sigma field from modifier
         
         spatially_varying_sigma = exp.(log_sigma_field) # Exponentiate to get sigma field
 
         # 2. Get the base model's raw innovations
         base_p_names = generate_full_variable_names(base_spec, M.model_arch, k)
-        base_ure_name = _find_parameter(p_names, string(base_p_names.ure), k, is_multivariate_model)
+        base_ure_name = _find_parameter(p_names, string(base_p_names.ure), k,
+            is_multivariate_model)
         
         if isempty(base_ure_name)
             @warn "Base ure for NonStationaryVariance component $(spec.key) (outcome $k) not found. Returning zero-matrix." # Warn if innovations are missing
@@ -282,18 +285,22 @@ function get_effects(
         end
         
         # Extract samples (CPU)
-        base_ure = get_params_matrix(chain, base_ure_name, base_spec.hyper.n_latent) # Base innovations
+        base_ure = get_params_matrix(chain, base_ure_name,
+            base_spec.hyper.n_latent) # Base innovations
         
         # 3. Reconstruct the base latent field (unit variance)
         n_latent_base = base_spec.hyper.n_latent
-        base_sre_unscaled = zeros(Float64, n_latent_base, n_samples) # Initialize unscaled latent field
+        base_sre_unscaled = zeros(Float64, n_latent_base,
+            n_samples) # Initialize unscaled latent field
 
         # Reconstruction logic based on method (spectral or cholesky)
         if m.method == :spectral
             U = base_spec.hyper.U
             L = base_spec.hyper.L
             diag_D = 1.0 ./ sqrt.(L .+ noise)
-            if typeof(m.base_model) in [ICAR, Besag]; diag_D[1] = 0.0; end
+            if typeof(m.base_model) in [ICAR, Besag]
+                diag_D[1] = 0.0
+            end
             
             # Vectorized reconstruction on CPU
             base_sre_unscaled = U * (diag_D .* base_ure')

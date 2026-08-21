@@ -8,7 +8,7 @@ two sum-to-zero constraints for identifiability. It produces a smoother field th
 an RW1 model.
 
 # Version
-v2.1.1 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The RW2 model defines a latent temporal field \$\\phi\$ where the value at time \$t\$ is
@@ -196,11 +196,15 @@ function get_updates(
         let
             innovations = $(p_names.ure)
             T_num = eltype(innovations)
-            n_latent = spec_registry[:$(key)].hyper.n_latent
+            n_latent = $(inner_hyper_access).n_latent
             sre_unscaled = similar(innovations, T_num, n_latent)
             
-            if n_latent > 0; sre_unscaled[1] = innovations[1]; end
-            if n_latent > 1; sre_unscaled[2] = 2 * sre_unscaled[1] + innovations[2]; end
+            if n_latent > 0
+                sre_unscaled[1] = innovations[1]
+            end
+            if n_latent > 1
+                sre_unscaled[2] = 2 * sre_unscaled[1] + innovations[2]
+            end
             for t in 3:n_latent
                 sre_unscaled[t] = 2 * sre_unscaled[t-1] - sre_unscaled[t-2] + innovations[t]
             end
@@ -211,74 +215,87 @@ function get_updates(
             end
             
             $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.t_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
         end
     """
 
     spectral_code = """
         # --- RW2 Component: $(key) (Spectral Method) ---
         let
-            hyper = spec_registry[:$(key)].hyper
-            diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
-            diag_D[1] = 0.0; diag_D[2] = 0.0
-            $(p_names.sre) = hyper.U * (diag_D .* $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.t_idx)
+            inner_hyper = $(inner_hyper_access)
+            diag_D = $(p_names.sigma) ./ sqrt.(inner_hyper.L .+ M.noise)
+            diag_D[1] = 0.0
+            diag_D[2] = 0.0
+            $(p_names.sre) = inner_hyper.U * (diag_D .* $(p_names.ure))
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
         end
     """
 
     cholesky_code = """
-        # --- RW2 Component: $(key) (Cholesky Method, AD-Safe) ---
+        # --- RW2 Component: $(key) (Cholesky Method) ---
         let
-            F = spec_registry[:$(key)].hyper.cholesky_factor
+            F = $(inner_hyper_access).cholesky_factor
             sre_unscaled = F.L' \\ $(p_names.ure)
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * spec_registry[:$(key)].hyper.n_latent), 
+                Normal(0.0, 0.001 * spec_registry[:$(key)].hyper.n_latent),
                 sum(sre_unscaled)
             )
             $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.t_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
         end
     """
 
     cholesky_sparse_code = """
-        # --- RW2 Component: $(key) (Sparse Cholesky, Not AD-Safe) ---
+        # --- RW2 Component: $(key) (Sparse Cholesky Method, Not AD-Safe) ---
         let
-            Q = spec_registry[:$(key)].hyper.Q_template
-            F = cholesky(Symmetric(Q + M.noise * I))
+            F = $(inner_hyper_access).cholesky_factor
             sre_unscaled = F.L' \\ $(p_names.ure)
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * spec_registry[:$(key)].hyper.n_latent), 
+                Normal(0.0, 0.001 * spec_registry[:$(key)].hyper.n_latent),
                 sum(sre_unscaled)
             )
             $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.t_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
         end
     """
 
     marginalized_code = """
-        # --- RW2 Component: $(key) (Marginalized Method) ---
+        # --- RW2 Component: $(key) (Marginalized Analytic Normal Method) ---
         let
-            hyper = spec_registry[:$(key)].hyper
-            y_residual = M.y_obs .- $(eta_target)
-            log_lik_marginalized_$(key) = _rw2_log_marginal_likelihood(
-                y_residual,
-                M.t_idx,
-                hyper.n_latent,
-                hyper.Q_template,
+            N_t = $(inner_hyper_access).N_t
+            S_t = $(inner_hyper_access).S_t
+            n_t = $(inner_hyper_access).n_latent
+            y_obs_k = $(outcome_idx <= M.outcomes_N ? (M.model_arch == "multivariate" ?
+              "M.y_obs[:, $(outcome_idx)]" : "M.y_obs") : "zeros(M.y_N)")
+            y_sig = $(outcome_idx <= M.outcomes_N ? "y_sigma" : "1.0")
+            
+            log_lik_marginalized_$(key) = _marginalized_latent_gaussian_logpdf(
+                y_obs_k,
+                $(inner_hyper_access).Q_template,
                 $(p_names.sigma),
-                y_sigma,
+                y_sig,
+                N_t,
+                S_t,
+                n_t,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
         end
     """
 
-    if m.method == :statespace; return statespace_code;
-    elseif m.method == :spectral; return spectral_code;
-    elseif m.method == :cholesky; return cholesky_code;
-    elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
-    elseif m.method == :marginalized; return marginalized_code;
-    else; error("Unsupported method '$(m.method)' for RW2. Use :statespace, :spectral, :cholesky, :cholesky_sparse, or :marginalized."); end
+    if m.method == :statespace
+        return statespace_code
+    elseif m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    elseif m.method == :marginalized
+        return marginalized_code
+    else
+        error("Unsupported method '$(m.method)' for RW2. Use :statespace, :spectral, :cholesky, :cholesky_sparse, or :marginalized.")
+    end
 end
 
 """
@@ -291,8 +308,7 @@ function get_effects(
     m::RW2, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions ---
-    n_samples = size(chain, 1) * FlexiChains.nchains(chain)
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -305,7 +321,7 @@ function get_effects(
 
     # --- Index Handling: Combine training and prediction sets ---
     t_idx_train_cpu = M.t_idx
-    t_idx_full_cpu = if !isnothing(PS) && haskey(PS.data, :t_idx)
+    t_idx_full_cpu = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
         vcat(t_idx_train_cpu, PS.data.t_idx)
     else
         t_idx_train_cpu
@@ -387,8 +403,12 @@ function get_effects(
             if m.method == :statespace
                 innovations_T = ure_samples_cpu' # [n_latent_train, n_samples]
                 sre_unscaled_cpu = similar(innovations_T)
-                if n_latent_train > 0; sre_unscaled_cpu[1, :] = innovations_T[1, :]; end
-                if n_latent_train > 1; sre_unscaled_cpu[2, :] = 2 .* sre_unscaled_cpu[1, :] .+ innovations_T[2, :]; end
+                if n_latent_train > 0
+                    sre_unscaled_cpu[1, :] = innovations_T[1, :]
+                end
+                if n_latent_train > 1
+                    sre_unscaled_cpu[2, :] = 2 .* sre_unscaled_cpu[1, :] .+ innovations_T[2, :]
+                end
                 for t in 3:n_latent_train
                     sre_unscaled_cpu[t, :] = 2 .* sre_unscaled_cpu[t-1, :] .- sre_unscaled_cpu[t-2, :] .+ innovations_T[t, :]
                 end
@@ -398,7 +418,8 @@ function get_effects(
                 U_cpu = hyper.U
                 L_cpu = hyper.L
                 diag_D = (sigma_samples_cpu' ./ sqrt.(L_cpu .+ noise))
-                diag_D[1, :] .= 0.0; diag_D[2, :] .= 0.0 # Enforce sum-to-zero constraints
+                diag_D[1, :] .= 0.0
+                diag_D[2, :] .= 0.0
                 latent_field_train_cpu = U_cpu * (diag_D .* ure_samples_cpu')
             else # :cholesky or :cholesky_sparse
                 F_cpu = hyper.cholesky_factor

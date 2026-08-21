@@ -6,7 +6,7 @@ It decomposes a set of multivariate outcomes into a smaller set of orthogonal la
 factors, and uses the dominant latent factor as a predictor in the main model.
 
 # Version
-v1.4.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The `Eigen` component models a set of \$N_{vars}\$ observed variables 
@@ -250,7 +250,8 @@ function get_updates(
         v_mat = zeros(T, $(n_vars), $(n_factors))
         v_mat[spec_registry[:$(key)].hyper.ltri_indices] .= $(p_names.v_unscaled)
         
-        U = householder_to_eigenvector(v_mat, spec_registry[:$(key)].hyper.n_vars, spec_registry[:$(key)].hyper.n_factors)
+        U = householder_to_eigenvector(v_mat, spec_registry[:$(key)].hyper.n_vars,
+          spec_registry[:$(key)].hyper.n_factors)
         L = U * Diagonal($(p_names.pca_sd))
         Psi = Diagonal($(p_names.pdef_sd).^2) + (M.noise * I)
         
@@ -268,7 +269,7 @@ function get_updates(
                 Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), Y_eigen_data[i, :])
             end
             
-            $(eta_target) .+= view(F, :, 1)
+            $(eta_target) = $(eta_target) .+ view(F, :, 1)
         end
     """
 
@@ -290,7 +291,7 @@ function get_updates(
                 Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), Y_eigen_data[i, :])
             end
             
-            $(eta_target) .+= view($(p_names.sre), :, 1)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), :, 1)
         end
     """
 
@@ -328,7 +329,8 @@ function get_effects(
     n_factors = hyper.n_factors
     
     # Determine total number of observations (training + prediction)
-    n_obs_full = M.y_N + (isnothing(PS) ? 0 : size(PS.data, 1)) # Total observations (training + prediction)
+    n_obs_full = M.y_N + (isnothing(PS) ? 0 : size(PS.data,
+        1)) # Total observations (training + prediction)
 
     if !isnothing(PS)
         @warn "Prediction for the Eigen component '$(spec.key)' is not supported. " *
@@ -354,7 +356,8 @@ function get_effects(
         else
             # Samples are on CPU.
             factor_samples_train = get_params_vector(
-                chain, factors_flat_name, n_obs_train * n_factors # (n_samples, n_obs_train * n_factors)
+                chain, factors_flat_name, n_obs_train * n_factors # (n_samples,
+                    n_obs_train * n_factors)
             )
             # Reshape the flat [n_samples, n_params] matrix into a 3D tensor
             # [n_obs, n_factors, n_samples]

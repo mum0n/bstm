@@ -6,7 +6,7 @@ product of marginal (e.g., spatial and temporal) components. This is typically
 specified in the formula via the Kronecker product operator `⊗`.
 
 # Version
-v1.2.0 (2026-08-17)
+v1.0.0
 
 # Mathematical Summary
 This component models an inseparable spatiotemporal random effect \$\\boldsymbol{\\delta}\$
@@ -53,7 +53,7 @@ end
 COMPONENT_TYPE_REGISTRY[:tensorproductsmooth] = TensorProductSmooth
 COMPONENT_CONSTRUCTORS[:tensorproductsmooth] = (p, params) -> begin
     components = get(params, :components, error("TensorProductSmooth requires child components."))
-    TensorProductSmooth(components, p.sigma, get(params, :method, :cholesky))
+    TensorProductSmooth(components, p.sigma, get(params, :method, :spectral))
 end
 COMPONENT_CONSTRUCTORS[:interaction] = COMPONENT_CONSTRUCTORS[:tensorproductsmooth]
 
@@ -131,18 +131,44 @@ function get_updates(
     s_model_type = Symbol(lowercase(string(typeof(s_spec.component_obj))))
     t_model_type = Symbol(lowercase(string(typeof(t_spec.component_obj))))
     
-    s_rho_val = hasproperty(s_spec.component_obj, :rho) ? string(generate_full_variable_names(s_spec, arch, outcome_idx).rho) : "nothing"
-    t_rho_val = hasproperty(t_spec.component_obj, :rho) ? string(generate_full_variable_names(t_spec, arch, outcome_idx).rho) : "nothing"
+    s_rho_val = hasproperty(s_spec.component_obj,
+        :rho) ? string(generate_full_variable_names(s_spec, arch, outcome_idx).rho) : "nothing"
+    t_rho_val = hasproperty(t_spec.component_obj,
+        :rho) ? string(generate_full_variable_names(t_spec, arch, outcome_idx).rho) : "nothing"
 
     s_N = s_spec.hyper.n_latent
     t_N = t_spec.hyper.n_latent
+
+    spectral_code = """
+        # --- Spatiotemporal Interaction (Spectral, Fast AD-Safe): $(spec.key) ---
+        let
+            local parent_hyper = spec_registry[:$(key)].hyper
+            local s_hyper = parent_hyper.child_specs[1].hyper
+            local t_hyper = parent_hyper.child_specs[2].hyper
+            
+            local diag_Ls = $(s_rho_val == "nothing" ? "s_hyper.L" : "(1.0 .- $(s_rho_val))
+              .+ $(s_rho_val) .* s_hyper.L")
+            local diag_Lt = $(t_rho_val == "nothing" ? "t_hyper.L" : "(1.0 .- $(t_rho_val))
+              .+ $(t_rho_val) .* t_hyper.L")
+            
+            local diag_D_s = $(p_names.sigma) ./ sqrt.(diag_Ls .+ M.noise)
+            local diag_D_t = 1.0 ./ sqrt.(diag_Lt .+ M.noise)
+            
+            local Z_matrix = reshape($(p_names.ure), $(s_N), $(t_N))
+            local transformed = (diag_D_s .* Z_matrix) .* diag_D_t'
+            local st_field = s_hyper.U * transformed * t_hyper.U'
+            $(eta_target) = $(eta_target) .+ view(st_field, M.st_idx)
+        end
+    """
 
     cholesky_base_code = """
         local parent_hyper = spec_registry[:$(key)].hyper
         local s_spec_hyper = parent_hyper.child_specs[1].hyper
         local t_spec_hyper = parent_hyper.child_specs[2].hyper
-        local Q_s = recompose_precision(:$(s_model_type), s_spec_hyper.Q_template, 1.0; extra_param=$(s_rho_val))
-        local Q_t = recompose_precision(:$(t_model_type), t_spec_hyper.Q_template, 1.0; extra_param=$(t_rho_val))
+        local Q_s = recompose_precision(:$(s_model_type), s_spec_hyper.Q_template, 1.0;
+          extra_param=$(s_rho_val))
+        local Q_t = recompose_precision(:$(t_model_type), t_spec_hyper.Q_template, 1.0;
+          extra_param=$(t_rho_val))
     """
 
     cholesky_dense_code = """
@@ -154,9 +180,10 @@ function get_updates(
             local Z_matrix = reshape($(p_names.ure), $(s_N), $(t_N))
             local tmp_spatial = C_s.L' \\ Z_matrix
             local st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
-            Turing.@addlogprob! logpdf(Normal(0, 0.001 * ($(s_N) * $(t_N))), sum(st_field_unscaled))
+            Turing.@addlogprob! logpdf(Normal(0, 0.001 * ($(s_N) * $(t_N))),
+              sum(st_field_unscaled))
             local st_field = st_field_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view(st_field, M.st_idx)
+            $(eta_target) = $(eta_target) .+ view(st_field, M.st_idx)
         end
     """
 
@@ -169,19 +196,24 @@ function get_updates(
             local Z_matrix = reshape($(p_names.ure), $(s_N), $(t_N))
             local tmp_spatial = C_s.L' \\ Z_matrix
             local st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
-            Turing.@addlogprob! logpdf(Normal(0, 0.001 * ($(s_N) * $(t_N))), sum(st_field_unscaled))
+            Turing.@addlogprob! logpdf(Normal(0, 0.001 * ($(s_N) * $(t_N))),
+              sum(st_field_unscaled))
             local st_field = st_field_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view(st_field, M.st_idx)
+            $(eta_target) = $(eta_target) .+ view(st_field, M.st_idx)
         end
     """
 
-    if m.method == :cholesky
+    has_spectral = hasproperty(s_spec.hyper, :U) && hasproperty(s_spec.hyper, :L) &&
+                   hasproperty(t_spec.hyper, :U) && hasproperty(t_spec.hyper, :L)
+
+    if m.method == :spectral && has_spectral
+        return spectral_code
+    elseif m.method == :cholesky || (m.method == :spectral && !has_spectral)
         return cholesky_dense_code
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
     else
-        @warn "Method '$(m.method)' for TensorProductSmooth not supported. Defaulting to :cholesky."
-        return cholesky_dense_code
+        return has_spectral ? spectral_code : cholesky_dense_code
     end
 end
 
@@ -225,8 +257,10 @@ function get_effects(
         sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
         ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
         
-        s_rho_name = hasproperty(s_spec.component_obj, :rho) ? _find_parameter(p_names, string(s_v.rho), k, is_multivariate_model) : ""
-        t_rho_name = hasproperty(t_spec.component_obj, :rho) ? _find_parameter(p_names, string(t_v.rho), k, is_multivariate_model) : ""
+        s_rho_name = hasproperty(s_spec.component_obj, :rho) ? _find_parameter(p_names,
+            string(s_v.rho), k, is_multivariate_model) : ""
+        t_rho_name = hasproperty(t_spec.component_obj, :rho) ? _find_parameter(p_names,
+            string(t_v.rho), k, is_multivariate_model) : ""
 
         if isempty(sigma_name) || isempty(ure_name)
             @warn "Parameters for TensorProductSmooth component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -238,8 +272,10 @@ function get_effects(
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         ure_samples_cpu = get_params_matrix(chain, ure_name, s_N * t_N)
         
-        s_rho_samples_cpu = !isempty(s_rho_name) ? get_params_vector(chain, s_rho_name, 1)[:, 1] : nothing
-        t_rho_samples_cpu = !isempty(t_rho_name) ? get_params_vector(chain, t_rho_name, 1)[:, 1] : nothing
+        s_rho_samples_cpu = !isempty(s_rho_name) ? get_params_vector(chain, s_rho_name, 1)[:,
+            1] : nothing
+        t_rho_samples_cpu = !isempty(t_rho_name) ? get_params_vector(chain, t_rho_name, 1)[:,
+            1] : nothing
 
         # Initialize the output matrix for the full effect on the CPU
         effect_k_cpu = zeros(Float64, N_total, n_samples)

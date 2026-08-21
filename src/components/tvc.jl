@@ -6,7 +6,7 @@ covariate to vary smoothly over time. It acts as an orchestrator, applying an in
 temporal `ComponentModel` to a specified covariate.
 
 # Version
-v1.1.1 (2026-08-14)
+v1.0.0
 
 # Mathematical Summary
 A TVC model replaces a fixed regression coefficient \$\\beta\$ with a time-indexed
@@ -19,7 +19,8 @@ The time-varying coefficient \$\\boldsymbol{\\beta} = (\\beta(t_1), \\dots, \\be
 is itself modeled as a latent temporal process, governed by the `inner_model`. For
 example, if the inner model is a second-order random walk (RW2), then:
 
-\$\\beta(t) = 2\\beta(t-1) - \\beta(t-2) + \\omega_t, \\quad \\omega_t \\sim \\mathcal{N}(0, \\sigma^2_{\\beta})\$
+\$\\beta(t) = 2\\beta(t-1) - \\beta(t-2) + \\omega_t, \\quad \\omega_t \\sim \\mathcal{N}(0,
+  \\sigma^2_{\\beta})\$
 
 This allows the model to learn how the influence of a covariate changes over time.
 
@@ -31,7 +32,8 @@ use a spectral decomposition for the time-varying coefficient, you would specify
 
 # Inputs
 - **Required**:
-  - A covariate piped (`|>`) into a temporal `random()` module, e.g., `covariate |> random(year, model=ar1)`.
+  - A covariate piped (`|>`) into a temporal `random()` module, e.g., `covariate |>
+    random(year, model=ar1)`.
   - The inner `random()` call must specify a temporal model.
 - **Optional**:
   - Priors for the inner temporal model are passed within the inner `random()` call.
@@ -55,7 +57,8 @@ COMPONENT_TYPE_REGISTRY[:tvc] = TVC
 
 COMPONENT_CONSTRUCTORS[:tvc] = (p, params) -> begin
     covariate = get(params, :covariate, error("TVC constructor requires a `covariate` parameter."))
-    inner_model_obj = get(params, :inner_model_obj, error("TVC constructor requires an `inner_model_obj` parameter."))
+    inner_model_obj = get(params, :inner_model_obj,
+        error("TVC constructor requires an `inner_model_obj` parameter."))
     
     TVC(covariate, inner_model_obj)
 end
@@ -137,20 +140,22 @@ function get_updates(
     correct_access = "spec_registry[:$(spec.key)].hyper.inner_precomputes"
     inner_updates_code_fixed = replace(inner_updates_code, incorrect_access => correct_access)
 
-    # Strip the eta update from the inner model's code, as the TVC wrapper handles it.
-    effect_app_regex = Regex("$(eta_target) \\.\\+= .*")
+    # Strip the eta update from the inner model's code, returning the inner latent field.
+    effect_app_regex = Regex("$(eta_target) (\\.\\+=|=|\\.\\=) .*")
     update_inner_cleaned = replace(
-        inner_updates_code_fixed, effect_app_regex => "# (eta update handled by TVC wrapper)"
+        inner_updates_code_fixed, effect_app_regex => "$(inner_latent_var)"
     )
 
-    application_code = "$(eta_target) .+= M.data[!, :$(cov_var)] .* view($(inner_latent_var), M.t_idx)"
+    application_code = """
+        $(inner_latent_var) = begin
+            $(update_inner_cleaned)
+        end
+        $(eta_target) = $(eta_target) .+ M.data[!, :$(cov_var)] .* view($(inner_latent_var),
+          M.t_idx)
+    """
     
     return """
         # --- Temporally Varying Coefficient (TVC) for: $(cov_var) ---
-        # 1. Generate the latent temporal field for the coefficient.
-        $(update_inner_cleaned)
-
-        # 2. Apply the time-varying coefficient to the linear predictor.
         $(application_code)
     """
 end
@@ -197,14 +202,16 @@ function get_effects(
 
     structured_effects = Vector{Matrix{Float64}}()
     for k in 1:outcomes_N
-        # inner_effects_result.structured[k] is the latent temporal field, size [t_N_full x n_samples]
+        # inner_effects_result.structured[k] is the latent temporal field, size [t_N_full x
+        #   n_samples]
         # This is already a CPU matrix.
         temporal_field_k = inner_effects_result.structured[k]
         
         # Map the temporal field to the observation level using the time index (on CPU)
         temporal_effect_at_obs = temporal_field_k[t_idx_full_cpu, :]
         
-        # Element-wise multiplication of the covariate and the observation-level temporal effect (on CPU)
+        # Element-wise multiplication of the covariate and the observation-level temporal
+        #   effect (on CPU)
         final_effect_k = temporal_effect_at_obs .* cov_data_full_cpu
         
         push!(structured_effects, final_effect_k)

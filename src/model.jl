@@ -1,6 +1,18 @@
 
 
 
+"""
+    model.jl
+
+Core formula compilation, AST decomposition, technical primitive resolution,
+dynamic Turing code generator, and sampling execution engine for Bayesian Spatio-Temporal
+  Models (BSTM).
+
+Version: v1.0.0
+"""
+# Enable deepcopy of Module references to support MCMCThreads multi-chain sampling
+Base.deepcopy_internal(x::Module, stackdict::IdDict{Any, Any}) = x
+
 function Base.:|>(m1::Component, m2::Component)
     return Composed([m1, m2], :pipe)
 end
@@ -18,15 +30,7 @@ otimes(m1::Component, m2::Component) = Composed([m1, m2], :kronecker_product)
 Applies a specified data transformation to a vector.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for the formula parsing engine, acting as the
-implementation backend for the transformation syntax (e.g., `zscore(x) |> ...`).
-It is called by `_rewrite_transformations!` to apply common pre-processing steps
-to covariate data directly within the model formula. This centralizes the
-transformation logic and provides a consistent, extensible interface for adding
-new transformations.
+v1.0.0
 
 # Mathematical Formulations
 - **`:zscore`**: \$ (x - \\text{mean}(x)) / \\text{std}(x) \$
@@ -69,23 +73,7 @@ transformations defined by pipe operators (`|>`), and rewrites the AST nodes to
 use the newly created data columns.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core part of the formula parsing engine. It enables a clean,
-expressive syntax for pre-processing covariates directly within the model formula
-(e.g., `zscore(temperature) |> random(...)`). It works by traversing the parsed AST
-and identifying `pipe` operators where the left-hand side is a recognized
-transformation function (e.g., `:zscore`, `:log`).
-
-When such a transformation is found, this function:
-1.  Applies the transformation to the specified data column.
-2.  Adds a new column to the input `DataFrame` to store the transformed data.
-3.  Rewrites the right-hand side of the pipe operator to use this new column as its
-    input variable.
-
-This process ensures that all subsequent model components operate on the correctly
-transformed data, without requiring the user to manually pre-process their data frame.
+v1.0.0
 
 # Arguments
 - `nodes::Vector`: A vector of AST nodes to be processed.
@@ -98,7 +86,8 @@ transformed data, without requiring the user to manually pre-process their data 
 function _rewrite_transformations!(nodes::Vector, data::DataFrame)
     new_nodes = []
     for node in nodes
-        if hasproperty(node, :type) && node.type == :operator && node.op == :pipe && length(node.children) == 2
+        if hasproperty(node,
+            :type) && node.type == :operator && node.op == :pipe && length(node.children) == 2
             lhs, rhs = node.children
             if hasproperty(lhs, :module_type) && lhs.module_type in TRANSFORMATION_FUNCTIONS
                 # This is a transformation pipe, e.g., `zscore(temp) |> fixed()`
@@ -153,12 +142,14 @@ function _rewrite_transformations!(nodes::Vector, data::DataFrame)
 end
 
 """
-    generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String)
+    generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real,
+      AbstractVector}, kernel_name::String)
 
 Generates random projection weights (W) and biases (b) for the Random Fourier
 Features (RFF) approximation. This version is CPU-only.
 """
-function generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector}, kernel_name::String)
+function generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{Real,
+    AbstractVector}, kernel_name::String)
     b = rand(Uniform(0, 2 * pi), n_features)
     W = Matrix{Float64}(undef, in_dims, n_features)
     k_name = lowercase(kernel_name)
@@ -167,17 +158,31 @@ function generate_rff_params(in_dims::Int, n_features::Int, lengthscale::Union{R
         if lengthscale isa Real
             W .= rand(Normal(0, 1.0 / lengthscale), in_dims, n_features)
         else
-            if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
-            for d in 1:in_dims; W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features); end
+            if length(lengthscale) != in_dims
+                error("ARD lengthscale vector length mismatch.")
+            end
+            for d in 1:in_dims
+                W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features)
+            end
         end
     elseif occursin("matern", k_name)
-        nu = if k_name == "matern12"; 0.5; elseif k_name == "matern32"; 1.5; else 2.5; end
+        nu = if k_name == "matern12"
+            0.5
+        elseif k_name == "matern32"
+            1.5
+        else
+            2.5
+        end
         df = 2 * nu
         if lengthscale isa Real
             W .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
         else
-            if length(lengthscale) != in_dims; error("ARD lengthscale vector length mismatch."); end
-            for d in 1:in_dims; W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features); end
+            if length(lengthscale) != in_dims
+                error("ARD lengthscale vector length mismatch.")
+            end
+            for d in 1:in_dims
+                W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features)
+            end
         end
     else
         @warn "Kernel '$kernel_name' not recognized for RFF. Defaulting to SE."
@@ -198,17 +203,7 @@ Splits a string by a given separator, but only when the separator is not nested
 inside parentheses `()` or brackets `[]`.
 
 # Version
-v1.1.2 (2026-08-14)
-
-# Rationale
-This function is a core utility for the formula parsing engine. It is responsible
-for correctly decomposing a formula string into its top-level additive terms
-(e.g., splitting `a + b` but not `random(a, b)`). It achieves this by maintaining
-a `depth` counter to track nesting within parentheses and brackets, ensuring that
-the separator `sep` is only acted upon when at the top level (depth 0).
-
-This version corrects a `UndefVarError` by replacing a typo (`current_arg`) with
-the correct variable name (`current_term`).
+v1.0.0
 
 # Arguments
 - `input::AbstractString`: The string to be split.
@@ -221,11 +216,24 @@ function split_terms_at_depth(input::AbstractString, sep::AbstractString)
     terms = String[]
     current_term = IOBuffer()
     depth = 0
+    in_quotes = false
+    quote_char = '"'
     
     i = 1
     while i <= ncodeunits(input)
-        # Check for separator at current position, but only if not inside parentheses.
-        if depth == 0 && startswith(SubString(input, i), sep)
+        char = input[i]
+        
+        if (char == '"' || char == '\'') && (i == 1 || input[prevind(input, i)] != '\\')
+            if in_quotes && char == quote_char
+                in_quotes = false
+            elseif !in_quotes
+                in_quotes = true
+                quote_char = char
+            end
+        end
+
+        # Check for separator at current position, but only if not inside parentheses or quotes.
+        if depth == 0 && !in_quotes && startswith(SubString(input, i), sep)
             # Finalize the current term and add it to the list.
             push!(terms, strip(String(take!(current_term))))
             
@@ -235,11 +243,12 @@ function split_terms_at_depth(input::AbstractString, sep::AbstractString)
         end
         
         # Append character to current term and update depth.
-        char = input[i]
-        if char == '(' || char == '['
-            depth += 1
-        elseif char == ')' || char == ']'
-            depth -= 1
+        if !in_quotes
+            if char == '(' || char == '['
+                depth += 1
+            elseif char == ')' || char == ']'
+                depth = max(0, depth - 1)
+            end
         end
         
         write(current_term, char)
@@ -261,7 +270,10 @@ end
 Infers the structural type of a `random()` component (e.g., :spatial, :temporal)
 based on the model name and the variables provided.
 """
-function _infer_structure_from_args(variables::Vector, params::Dict)::Symbol
+_infer_structure_from_args(params::Dict) = _infer_structure_from_args(get(params,
+    :positional_args, []), params)
+_infer_structure_from_args(variables, params::Dict)::Symbol = begin
+    vars_vec = variables isa AbstractVector ? variables : [variables]
     model_name_raw = get(params, :model, :iid)
     model_name = model_name_raw isa Symbol ? model_name_raw : Symbol(model_name_raw)
 
@@ -270,18 +282,13 @@ function _infer_structure_from_args(variables::Vector, params::Dict)::Symbol
         return MODEL_TO_STRUCTURE_MAP[model_name]
     end
     
-    # Fallback for legacy or unregistered models
-    if haskey(KNOWN_UNAMBIGUOUS_MODELS, model_name)
-        return KNOWN_UNAMBIGUOUS_MODELS[model_name]
-    end
-    
     # For truly ambiguous models, infer from variable names
     if model_name in AMBIGUOUS_MODELS
-        if any(v -> occursin("year", string(v)) || occursin("time", string(v)), variables)
+        if any(v -> occursin("year", string(v)) || occursin("time", string(v)), vars_vec)
             return :temporal
-        elseif any(v -> occursin(r"lon|lat|coord"i, string(v)), variables)
+        elseif any(v -> occursin(r"lon|lat|coord"i, string(v)), vars_vec)
             return :smooth
-        elseif any(v -> occursin(r"region|idx|area"i, string(v)), variables)
+        elseif any(v -> occursin(r"region|idx|area"i, string(v)), vars_vec)
             return :spatial
         end
     end
@@ -300,16 +307,7 @@ Parses the arguments from a Julia expression (specifically, the `args` field of 
 arguments.
 
 # Version
-v1.1.0 (2026-08-13)
-
-# Rationale
-This function is a core part of the formula parsing engine that works directly with
-Julia's Abstract Syntax Tree (AST). It correctly distinguishes between positional
-arguments (like variable names) and keyword arguments (like `model=:bym2`). It
-preserves expressions (e.g., `prior=Normal(0,1)`) for later evaluation, which is
-crucial for allowing complex objects as parameters.   use
-the key `:positional_args` for positional arguments, ensuring consistency with the
-rest of the parsing engine.
+v1.0.0
 
 # Arguments
 - `args`: A vector of arguments from an `Expr` object.
@@ -356,15 +354,7 @@ end
 Parses a string value from a formula argument into an appropriate Julia type.
 
 # Version
-v1.0.2 (2026-08-13)
-
-# Rationale
-This function is a core utility for the formula parsing engine. It is responsible
-for converting the string representation of a value from a module's argument list
-into a concrete Julia type (`Symbol`, `String`, `Bool`, `Number`, or `Expr`). This
-is a critical step that enables the `bstm` formula to accept a wide range of
-user inputs.   more robust in parsing symbol literals,
-ensuring that `model=:bym2` is always parsed as the symbol `:bym2`.
+v1.0.0
 
 # Arguments
 - `val_str::AbstractString`: The string value to parse.
@@ -380,7 +370,8 @@ function _parse_value(val_str::AbstractString)
     if startswith(val_str, ":")
         return Symbol(val_str[2:end])
     # Priority 2: Handle quoted string literals.
-    elseif (startswith(val_str, "'") && endswith(val_str, "'")) || (startswith(val_str, "\"") && endswith(val_str, "\""))
+    elseif (startswith(val_str, "'") && endswith(val_str, "'")) || (startswith(val_str,
+        "\"") && endswith(val_str, "\""))
         return String(val_str[2:end-1])
     # Priority 3: Handle boolean literals.
     elseif val_str == "true"
@@ -391,7 +382,8 @@ function _parse_value(val_str::AbstractString)
     elseif occursin(r"^[a-zA-Z_][a-zA-Z0-9_]*$", val_str)
         return Symbol(val_str)
     else
-        # Fallback: Attempt to parse as a Julia expression (e.g., a number, a vector, or a function call like `Normal(0,1)`).
+        # Fallback: Attempt to parse as a Julia expression (e.g., a number, a vector, or a
+        #   function call like `Normal(0,1)`).
         try
             return Meta.parse(val_str)
         catch
@@ -405,20 +397,14 @@ _parse_value(val_str::SubString{String}) = _parse_value(String(val_str))
 
 
 """
-    _add_parsed_arg!(args_dict::Dict{Symbol, Any}, positional_args::Vector{Any}, arg_val::AbstractString)
+    _add_parsed_arg!(args_dict::Dict{Symbol, Any}, positional_args::Vector{Any},
+      arg_val::AbstractString)
 
 A helper function that parses a single argument string and adds it to either the
 keyword argument dictionary or the positional argument list.
 
 # Version
-v1.0.2 (2026-08-13)
-
-# Rationale
-This function is a core utility for the formula parsing engine. It centralizes the
-logic for distinguishing between `key=value` pairs and positional arguments within
-a module's call string.   accept `AbstractString` to
-handle both `String` and `SubString` types, resolving a potential `MethodError`,
-and its documentation has been expanded for clarity.
+v1.0.0
 
 # Arguments
 - `args_dict::Dict{Symbol, Any}`: The dictionary to which keyword arguments will be added.
@@ -428,7 +414,8 @@ and its documentation has been expanded for clarity.
 # Returns
 - `nothing`. The `args_dict` and `positional_args` collections are mutated.
 """
-function _add_parsed_arg!(args_dict::Dict{Symbol, Any}, positional_args::Vector{Any}, arg_val::AbstractString)
+function _add_parsed_arg!(args_dict::Dict{Symbol, Any}, positional_args::Vector{Any},
+    arg_val::AbstractString)
     if contains(arg_val, "=")
         # It's a keyword argument.
         key_val = Base.split(arg_val, "=", limit=2)
@@ -449,29 +436,7 @@ Parses the inner content of a module call string (e.g., "s_idx, model=bym2") int
 a dictionary of keyword arguments and a list of positional arguments.
 
 # Version
-v1.1.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for the formula parsing engine. It is responsible
-for breaking down the argument string from within a module's parentheses into a
-structured dictionary.   correctly handle commas within
-string literals, preventing incorrect splitting of arguments. The docstring has
-also been expanded to detail the internal workflow.
-
-# Workflow
-The function implements a simple state machine that iterates through the argument
-string character by character:
-1.  It maintains a `depth` counter for parentheses `()` and brackets `[]`. A comma
-    is only considered a top-level argument separator if `depth` is zero.
-2.  It maintains an `in_string` flag to detect whether the parser is currently
-    inside a single or double-quoted string. Commas encountered while `in_string`
-    is true are ignored as separators.
-3.  When a valid top-level comma is found, the accumulated argument string is
-    processed by `_add_parsed_arg!`, which separates it into either a positional
-    or keyword argument.
-4.  After the loop, the final accumulated argument is processed.
-5.  Positional arguments are collected and stored in the final dictionary under the
-    key `:positional_args`.
+v1.0.0
 
 # Arguments
 - `args_str::String`: The string of arguments from inside a module's parentheses.
@@ -506,8 +471,11 @@ function _parse_arguments_string(args_str::String)
         else
             write(current_arg, char)
             if !in_string
-                if char == '(' || char == '['; depth += 1;
-                elseif char == ')' || char == ']'; depth -= 1; end
+                if char == '(' || char == '['
+                    depth += 1
+                elseif char == ')' || char == ']'
+                    depth -= 1
+                end
             end
         end
     end
@@ -532,21 +500,7 @@ Sanitizes a string to be a valid Julia variable name, suitable for use in
 dynamically generated code.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for the formula parsing engine. The parser can
-generate keys for model components from formula syntax that includes characters
-invalid in Julia variable names (e.g., `cov |> spatial` might produce a key
-containing `|`). This function cleans those keys before they are used by the
-code generator to create variable names for latent effects, priors, and other
-parameters within the Turing `@model`.
-
-It specifically handles:
-- Standard invalid characters: `|`, `(`, `)`, `+`, `*`, `&`, `:`, and whitespace.
-- Special `bstm` operators: `⊗` (Kronecker product) and `∘` (composition).
-- Formatting artifacts: Ensures no leading/trailing underscores and collapses
-  multiple consecutive underscores into a single one.
+v1.0.0
 
 # Arguments
 - `name::String`: The raw string to be sanitized.
@@ -577,15 +531,7 @@ Parses a single module call string (e.g., "random(s_idx, model=bym2)") into its
 constituent parts: the module name and its arguments.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a low-level utility within the formula parsing engine. It is
-responsible for the initial decomposition of a single component call. It uses a
-regular expression to reliably separate the component's name from the string
-containing its arguments. The argument string is then passed to
-`_parse_arguments_string` for more detailed parsing. This separation of concerns
-makes the parsing engine more modular and easier to debug.
+v1.0.0
 
 # Arguments
 - `term_str::AbstractString`: The string representing a single module call.
@@ -614,29 +560,14 @@ end
 
 
 """
-    resolve_hyperpriors(model_name::String, global_priors::Dict, local_params::Dict, scheme::Symbol, calling_mod::Module)
+    resolve_hyperpriors(model_name::String, global_priors::Dict, local_params::Dict,
+      scheme::Symbol, calling_mod::Module)
 
 Resolves the prior distribution for each hyperparameter of a model component by
 checking for specifications at the local, global, and scheme levels.
 
 # Version
-v1.1.0 (2026-08-13)
-
-# Rationale
-This function is a core utility in the model configuration pipeline. It implements a
-3-level precedence system to resolve the prior distribution for every hyperparameter
-of a model component:
-1.  **Local**: A prior specified directly in a component's formula call (e.g.,
-    `random(..., sigma=Normal(0,1))`).
-2.  **Global**: A prior specified in the `hyperpriors` dictionary passed to `@bstm`.
-3.  **Scheme**: A default prior from a pre-defined scheme (`:pcpriors`,
-    `:informative`, `:uninformative`).
-
-  comprehensive, resolving priors for a wide range of
-parameters used across all `bstm` components, including those for spatial, temporal,
-smoother, and mechanistic models. It correctly handles anisotropic priors for
-multi-dimensional components, normalizes common aliases (e.g., `ls` for `lengthscale`),
-and evaluates user-provided expressions in the correct module scope.
+v1.0.0
 
 # Arguments
 - `model_name::String`: The name of the component model being processed.
@@ -648,7 +579,8 @@ and evaluates user-provided expressions in the correct module scope.
 # Returns
 - A `NamedTuple` containing the resolved prior distributions for the component.
 """
-function resolve_hyperpriors(model_name::String, global_priors::Dict, local_params::Dict, scheme::Symbol, calling_mod::Module)
+function resolve_hyperpriors(model_name::String, global_priors::Dict, local_params::Dict,
+    scheme::Symbol, calling_mod::Module)
     prior_defaults = if scheme == :pcpriors
         PC_PRIORS
     elseif scheme == :informative
@@ -670,7 +602,7 @@ function resolve_hyperpriors(model_name::String, global_priors::Dict, local_para
     # Comprehensive list of all possible hyperpriors across all components.
     possible_priors = [
         :sigma, :rho, :rho1, :rho2, :rho_unconstrained, :rho1_unconstrained, :rho2_unconstrained,
-        :sigma1_unconstrained, :sigma2_unconstrained, :threshold_unconstrained, :unconstrained_rho, :kappa, :lengthscale, 
+        :sigma1_unconstrained, :sigma2_unconstrained, :threshold_unconstrained, :kappa, :lengthscale, 
         :range, :period, :amplitude, :phase, :velocity, :diffusion, :pca_sd, 
         :pdef_sd, :L_corr, :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, 
         :gamma, :delta, :curvature, :rho_sigma, :rho_rho, :sigma0, :shape, :nu
@@ -682,24 +614,31 @@ function resolve_hyperpriors(model_name::String, global_priors::Dict, local_para
         is_ard_param = p_sym in [:lengthscale, :kappa]
 
         if is_ard_param && is_anisotropic
-            if in_dims == 0; error("Cannot resolve anisotropic prior for '$p_sym' because input dimensionality is unknown."); end
+            if in_dims == 0
+                error("Cannot resolve anisotropic prior for '$p_sym' because input dimensionality is unknown.")
+            end
             
             prior_val = get(local_params_norm, p_sym, nothing)
             
             if prior_val isa Expr && prior_val.head == :vect
                 # Case: lengthscale=[Normal(0,1), Normal(0,1)]
                 resolved_priors = [Core.eval(calling_mod, p) for p in prior_val.args]
-                if length(resolved_priors) != in_dims; error("Anisotropic prior vector for '$p_sym' has length $(length(resolved_priors)), but expected $in_dims."); end
+                if length(resolved_priors) != in_dims
+                    error("Anisotropic prior vector for '$p_sym' has length $(length(resolved_priors)), but expected $in_dims.")
+                end
                 resolved[p_sym] = resolved_priors
             else
                 # Case: lengthscale=Normal(0,1) or default
                 single_prior = if !isnothing(prior_val)
                     prior_val isa Expr ? Core.eval(calling_mod, prior_val) : prior_val
-                elseif haskey(global_priors, Symbol(model_name, "_", p_sym)); global_priors[Symbol(model_name, "_", p_sym)]
+                elseif haskey(global_priors, Symbol(model_name, "_",
+                    p_sym)); global_priors[Symbol(model_name, "_", p_sym)]
                 elseif haskey(global_priors, p_sym); global_priors[p_sym]
                 else; get(prior_defaults, string(p_sym), nothing); end
                 
-                if !(single_prior isa Distribution); error("Resolved prior for '$p_sym' is not a Distribution."); end
+                if !(single_prior isa Distribution)
+                    error("Resolved prior for '$p_sym' is not a Distribution.")
+                end
                 resolved[p_sym] = [single_prior for _ in 1:in_dims]
             end
             continue
@@ -745,20 +684,7 @@ Checks if a string is fully and exclusively enclosed by a single pair of
 grouping parentheses.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for the recursive descent parser (`_parse_rhs_expression`).
-It determines if the parser should strip the outer parentheses from an expression
-and recurse on its content. For example, it should return `true` for `(a + b)`
-and `((a + b))`, but `false` for an expression like `(a) + (b)` (which would not be
-passed to this function directly, as the parser would split on `+` first).
-
-This version corrects a bug in the original implementation where the depth check
-incorrectly failed for valid nested expressions. The logic now correctly starts
-the depth count at 1 (to account for the initial opening parenthesis) and checks if
-the depth returns to zero *before* the end of the inner string, which robustly
-identifies expressions that are not exclusively grouped by the outermost parentheses.
+v1.0.0
 
 # Arguments
 - `s::AbstractString`: The string to check.
@@ -807,30 +733,11 @@ Recursively parses a term from the right-hand side (RHS) of a formula into an
 Abstract Syntax Tree (AST) node, respecting operator precedence and grouping.
 
 # Version
-v1.1.0 (2026-08-13)
-
-# Rationale
-This function is a recursive descent parser that forms the core of the formula
-parsing engine. It is responsible for translating a formula string into a structured
-tree that the model configuration engine can interpret.
-
-This version corrects two critical issues from the previous implementation:
-1.  **Operator Precedence**: The order of parsing has been reversed to correctly
-    implement operator precedence. The parser now splits by the lowest-precedence
-    operator first, in the order: `∘` (composition), then `⊗` (Kronecker product),
-    then `|>` (pipe). This ensures that expressions are grouped correctly according
-    to standard mathematical and programming language conventions.
-2.  **Parentheses Handling**: A robust helper function, `_is_fully_enclosed`, has
-    been added to correctly identify and strip grouping parentheses. This prevents
-    parsing errors for complex, nested expressions like `(a |> b) ⊗ c`.
-
-# Operator Precedence & Associativity
-- **Composition (`∘`)**: Lowest precedence, right-associative. `a ∘ b ∘ c` is parsed as `a ∘ (b ∘ c)`.
-- **Kronecker Product (`⊗`)**: Medium precedence, left-associative. `a ⊗ b ⊗ c` is parsed as `(a ⊗ b) ⊗ c`.
-- **Pipe (`|>`)**: Highest precedence, left-associative. `a ⊗ b |> c` is parsed as `a ⊗ (b |> c)`.
+v1.0.0
 
 # Arguments
-- `term_str::AbstractString`: A string representing a single term or a composition of terms from the formula's RHS.
+- `term_str::AbstractString`: A string representing a single term or a composition of terms
+  from the formula's RHS.
 
 # Returns
 - A `NamedTuple` representing a node in the AST.
@@ -844,22 +751,24 @@ function _parse_rhs_expression(term_str::AbstractString)
             return false
         end
         depth = 0
-        # Check the content *inside* the outer parentheses.
-        inner_s = SubString(s, nextind(s, 1), prevind(s, lastindex(s)))
-        for (idx, char) in enumerate(inner_s)
-            if char == '('; depth += 1;
-            elseif char == ')'; depth -= 1; end
-            
-            if depth < 0; return false; end # Unbalanced
-            # If depth is zero before the end, the outer parentheses are not the sole group.
-            if depth == 0 && idx < length(inner_s); return false; end
+        total_len = length(s)
+        for (i, char) in enumerate(s)
+            if char == '('
+                depth += 1
+            elseif char == ')'
+                depth -= 1
+                if depth == 0 && i < total_len
+                    return false
+                end
+            end
         end
         return depth == 0
     end
 
     # If the expression is wrapped in grouping parentheses, parse the inner content recursively.
     if _is_fully_enclosed(term_str_stripped)
-        inner_content = SubString(term_str_stripped, nextind(term_str_stripped, 1), prevind(term_str_stripped, lastindex(term_str_stripped)))
+        inner_content = strip(term_str_stripped[nextind(term_str_stripped,
+            1):prevind(term_str_stripped, lastindex(term_str_stripped))])
         return _parse_rhs_expression(inner_content)
     end
 
@@ -867,19 +776,22 @@ function _parse_rhs_expression(term_str::AbstractString)
     parts = split_terms_at_depth(term_str_stripped, " ∘ ")
     if length(parts) > 1
         # Composition is right-associative: a ∘ b ∘ c -> a ∘ (b ∘ c)
-        return (type=:operator, op=:composition, children=[_parse_rhs_expression(parts[1]), _parse_rhs_expression(join(parts[2:end], " ∘ "))])
+        return (type=:operator, op=:composition, children=[_parse_rhs_expression(parts[1]),
+            _parse_rhs_expression(join(parts[2:end], " ∘ "))])
     end
 
     parts = split_terms_at_depth(term_str_stripped, " ⊗ ")
     if length(parts) > 1
         # Kronecker product is left-associative.
-        return (type=:operator, op=:kronecker_product, children=[_parse_rhs_expression(p) for p in parts])
+        return (type=:operator, op=:kronecker_product,
+            children=[_parse_rhs_expression(p) for p in parts])
     end
 
     parts = split_terms_at_depth(term_str_stripped, " |> ")
     if length(parts) > 1
         # Pipe is left-associative: a |> b |> c -> (a |> b) |> c
-        return (type=:operator, op=:pipe, children=[_parse_rhs_expression(join(parts[1:end-1], " |> ")), _parse_rhs_expression(parts[end])])
+        return (type=:operator, op=:pipe, children=[_parse_rhs_expression(join(parts[1:end-1],
+            " |> ")), _parse_rhs_expression(parts[end])])
     end
 
     # If no operators are found, parse as a single module or a fixed effect.
@@ -928,15 +840,7 @@ of a formula, categorizing its nodes into `bstm` modules (components) or bare
 fixed effects.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core component of the formula parsing engine. It translates
-the structured representation of the formula into a categorized list of components
-and fixed effects, which is then used by the model configuration engine. This
-version improves the specificity of generated keys for composed modules and
-extracts repetitive unique key generation logic into a helper function for
-better readability and maintainability.
+v1.0.0
 
 # Arguments
 - `nodes`: A vector of AST nodes representing the RHS of the formula.
@@ -949,7 +853,8 @@ better readability and maintainability.
 function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
     for node in nodes
         is_pp_composition = false
-        if hasproperty(node, :type) && node.type == :operator && node.op == :composition && length(node.children) == 2
+        if hasproperty(node, :type) && node.type == :operator && node.op == :composition&&
+            length(node.children) == 2
             outer_node, inner_node = node.children[1], node.children[2]
             if outer_node.module_type == :pointprocess && inner_node.module_type == :random
                 is_pp_composition = true
@@ -957,7 +862,9 @@ function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
                 pp_module_type = get(outer_node.args, :model, :lgcp)
                 final_params = copy(inner_node.args)
                 for (k, v) in outer_node.args
-                    if k != :model; final_params[k] = v; end
+                    if k != :model
+                        final_params[k] = v
+                    end
                 end
                 
                 vars = get(inner_node.args, :positional_args, [])
@@ -992,7 +899,8 @@ function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
             raw_key = _get_simplified_composed_node_key(node)
             module_key = _generate_unique_module_key(raw_key, modules)
             
-            modules[module_key] = (module_type = :interact, args = Dict(:operator => node.op, :components => node.children))
+            modules[module_key] = (module_type = :interact, args = Dict(:operator => node.op,
+                :components => node.children))
 
         elseif hasproperty(node, :module_type)
             m_type = node.module_type
@@ -1002,7 +910,8 @@ function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
                 
                 if m_type == :mixed
                     # For `mixed(effect | group)`, the key is based on the group variable.
-                    if !isempty(pos_args) && pos_args[1] isa Expr && pos_args[1].head == :call && pos_args[1].args[1] == :|
+                    if !isempty(pos_args) && pos_args[1] isa Expr && pos_args[1].head == :call&&
+                        pos_args[1].args[1] == :|
                         group_var_str = string(pos_args[1].args[3])
                         raw_key = group_var_str
                     else
@@ -1031,14 +940,13 @@ end
 
 
 
+"""
+    _extract_symbols_from_expr!(sym_set::Set{Symbol}, ex::Expr)
+
+Recursively traverses a Julia AST expression and extracts all unique `Symbol` instances into
+  `sym_set`.
+"""
 function _extract_symbols_from_expr!(sym_set::Set{Symbol}, ex::Expr)
-    # Purpose: Recursively extracts all symbols from a Julia expression.
-    # Rationale: Used to find all variable names mentioned in the formula to check for their presence in the data.
-    # Assumptions: Input is a valid Julia expression.
-    # Inputs:
-    #   - sym_set: A set to store the found symbols.
-    #   - ex: The expression to traverse.
-    # Outputs: None (mutates `sym_set`).
     for arg in ex.args
         if arg isa Symbol
             push!(sym_set, arg)
@@ -1056,16 +964,7 @@ Parses a single term from the left-hand side (LHS) of the formula string. This
 function is a core part of the formula parsing engine.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is designed to handle the various ways outcome variables can be
-specified in a `bstm` formula. It correctly distinguishes between bare outcome
-variables and outcomes defined within a `likelihood()` block. It also supports
-the `+` operator for specifying multiple outcomes, which is essential for both
-multivariate and compositional models. The function's output is a standardized
-vector of dictionaries, which provides a clean, intermediate representation for the
-downstream model configuration engine.
+v1.0.0
 
 # Arguments
 - `term::String`: A string representing one part of the LHS (e.g., `"y"`,
@@ -1086,7 +985,9 @@ function _parse_lhs_term(term::String)
         # Case 1: The term is a likelihood() block.
         inner_content = m.captures[1]
         args = split_terms_at_depth(inner_content, ",")
-        if isempty(args); return specs; end
+        if isempty(args)
+            return specs
+        end
         
         # The first argument(s) are the outcome variables.
         outcome_var_str = Base.strip(args[1])
@@ -1116,34 +1017,7 @@ Decomposes a `bstm` formula string into its constituent parts, including outcome
 likelihood specifications, model components, and fixed effects.
 
 # Version
-v1.0.2 (2026-08-13)
-
-# Rationale
-This function is the main entry point for the formula parsing engine. It translates
-the user-facing formula into a structured, intermediate representation that the
-model configuration engine can process.   handle formulas
-that do not contain a right-hand side (RHS). If the `~` operator is missing, it now
-defaults the RHS to "1" (an intercept-only model), preventing a `BoundsError` during
-parsing. The docstring has also been expanded to detail the internal workflow.
-
-# Workflow
-1.  **LHS/RHS Splitting**: The formula string is split by the `~` operator. If no `~`
-    is present, the RHS defaults to `"1"`.
-2.  **LHS Parsing**: The LHS is parsed to identify outcome variables and their
-    `likelihood()` specifications.
-3.  **RHS Parsing**: The RHS is parsed to handle intercept control (`0`, `-1`,
-    `intercept()`) and to collect all other terms as model components.
-4.  **AST Construction**: An Abstract Syntax Tree (AST) is built from the RHS terms,
-    respecting operator precedence (`|>`, `⊗`, `∘`) to correctly represent
-    component compositions.
-5.  **Data Transformation**: The AST is traversed to find and apply data
-    transformations (e.g., `zscore(x)`). The `DataFrame` is mutated to include new
-    columns with the transformed data, and the AST is rewritten to use these new
-    columns.
-6.  **Node Categorization**: The final AST is traversed to categorize each node as
-    either a `bstm` module (e.g., `random`, `mixed`) or a bare fixed effect term.
-7.  **Output**: A `NamedTuple` is returned containing the structured lists of
-    outcomes, modules, fixed effects, and intercept information.
+v1.0.0
 
 # Arguments
 - `formula_str::String`: The model formula string.
@@ -1154,7 +1028,7 @@ parsing. The docstring has also been expanded to detail the internal workflow.
   `:has_intercept`, and `:intercept_prior`.
 """
 function decompose_bstm_formula(formula_str::String, data::DataFrame)
-    parts = Base.split(formula_str, "~")
+    parts = split_terms_at_depth(formula_str, "~")
     lhs_str = Base.strip(parts[1])
     
     # If there is no '~', default the RHS to "1" (intercept only).
@@ -1167,7 +1041,7 @@ function decompose_bstm_formula(formula_str::String, data::DataFrame)
     outcome_specs = vcat([_parse_lhs_term(term) for term in split_terms_at_depth(lhs_str, "+")]...)
 
     rhs_normalized = replace(rhs_str, r"\s*-\s*" => " + -")
-    rhs_terms = split_terms_at_depth(rhs_normalized, " + ")
+    rhs_terms = split_terms_at_depth(rhs_normalized, "+")
     
     has_intercept = !("0" in rhs_terms || "-1" in rhs_terms)
     intercept_prior = nothing
@@ -1183,7 +1057,9 @@ function decompose_bstm_formula(formula_str::String, data::DataFrame)
                 intercept_module_found = true
                 intercept_data = _parse_single_component_term(term_stripped)
                 has_intercept = get(intercept_data.args, :positional_args, [true])[1] != false
-                if haskey(intercept_data.args, :prior); intercept_prior = intercept_data.args[:prior]; end
+                if haskey(intercept_data.args, :prior)
+                    intercept_prior = intercept_data.args[:prior]
+                end
             end
         else
             push!(module_terms, term_stripped)
@@ -1198,7 +1074,8 @@ function decompose_bstm_formula(formula_str::String, data::DataFrame)
     fixed_effects = String[]
     _categorize_rhs_nodes!(rewritten_nodes, modules, fixed_effects)
     
-    return (outcomes=outcome_specs, modules=modules, fixed_effects=unique(fixed_effects), has_intercept=has_intercept, intercept_prior=intercept_prior)
+    return (outcomes=outcome_specs, modules=modules, fixed_effects=unique(fixed_effects),
+        has_intercept=has_intercept, intercept_prior=intercept_prior)
 end
 
  
@@ -1209,16 +1086,7 @@ Ensures all observation-level likelihood parameters are consistently formatted a
 matrices of size `(N, K)`.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility in the model configuration pipeline. It standardizes
-all observation-level parameters (e.g., `offsets`, `weights`, `trials`, censoring
-bounds) into a consistent `(N, K)` matrix format, where `N` is the number of
-observations and `K` is the number of outcomes. This simplifies the downstream code
-generator, which can then access these parameters with simple indexing `[i, k]`
-inside the model's observation loop, avoiding inefficient runtime conditional checks
-and ensuring dimensional correctness.
+v1.0.0
 
 # Arguments
 - `M::Dict`: The model configuration dictionary, which is mutated by this function.
@@ -1285,6 +1153,9 @@ end
 
 Constructs the complete model configuration from a formula and data. 
 """
+bstm_config(formula::Union{Expr, Symbol}, data::DataFrame; calling_module::Module=Main,
+    kwargs...) = bstm_config(string(formula), data; calling_module=calling_module, kwargs...)
+
 function bstm_config(
     formula::String, data::DataFrame; calling_module::Module=Main, kwargs...
 )
@@ -1344,7 +1215,9 @@ function bstm_config(
             end
         end
 
-        if !create_component; continue; end
+        if !create_component
+            continue
+        end
 
         component_obj = resolve_technical_primitive(
             mod_data_dict, M, M[:hyperpriors], M[:prior_scheme]
@@ -1356,7 +1229,8 @@ function bstm_config(
 
         spec = (
             key=Symbol(key), 
-            structure=mod_data_dict[:params][:structure], 
+            structure=get(mod_data_dict[:params], :structure, get(MODEL_TO_STRUCTURE_MAP,
+                mod_type, :any)),
             var=join(string.(mod_data_dict[:variables]), "_"), 
             component_obj=component_obj, 
             params=mod_data_dict[:params], 
@@ -1384,31 +1258,10 @@ end
 
 
 """
-    generate_full_variable_names(spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+    generate_full_variable_names(spec::NamedTuple, arch::String, outcome_idx::Union{Int,
+      Nothing}; prefix::String="")
 
 Generates a NamedTuple of full variable names for a given component.
-
-# Rationale for Update
-This function is updated to correctly handle the distinction between hyperparameters
-(which can be shared across outcomes in a multivariate model) and latent fields
-(which are always unique to each outcome in a multivariate model). The previous
-implementation used a single suffixing rule, which failed for shared-hyperparameter
-models.
-
-This version introduces two separate suffixing rules:
-1.  `hyperparam_suffix`: Appended to hyperparameters (`sigma`, `rho`, `ls`, etc.) only
-    when the model is multivariate AND the component is not shared (`!is_shared`).
-2.  `latent_field_suffix`: Appended to latent fields (`innovations`, `latent`, etc.)
-    whenever the model is multivariate, regardless of the `shared` flag.
-
-This change ensures that variable names are generated correctly for all model
-architectures, resolving a key source of `FieldError` during model construction.
-The list of parameters has also been updated to use `innovations` consistently,
-deprecating `raw` and `innov`, and to include other specialized parameter names
-found across the component library.
-
-# Version
-v1.1.0 (2026-08-11)
 
 # Arguments
 - `spec`: The component's specification.
@@ -1419,7 +1272,8 @@ v1.1.0 (2026-08-11)
 # Returns
 - A `NamedTuple` containing all necessary variable names as Symbols.
 """
-function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}; prefix::String="")
+function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_idx::Union{Int,
+    Nothing}; prefix::String="")
     base_key = string(spec.key)
     full_key = isempty(prefix) ? base_key : "$(prefix)_$(base_key)"
 
@@ -1441,8 +1295,6 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
         :sigma, :rho, :rho1, :rho2,
         :rho_unconstrained, :rho1_unconstrained, :rho2_unconstrained,
         :sigma1_unconstrained, :sigma2_unconstrained, :threshold_unconstrained,
-        :unconstrained_rho, :unconstrained_rho1, :unconstrained_rho2,
-        :unconstrained_sigma1, :unconstrained_sigma2,
         :kappa, :ls, :range, :period,
         :amplitude, :phase, :velocity, :diffusion, :pca_sd, :pdef_sd, :L_corr,
         :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, :gamma, :delta, :curvature,
@@ -1456,38 +1308,14 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
     # These are always unique per outcome in a multivariate model.
     latent_fields = [
         :ure, :sre, :ure_diag, :ure_pic, :ure_inducing, :ure_rho, :ure_cluster, :ure_predator,
-        :innovations, :latent, :struct, :iid,
         :beta_cos, :beta_sin, :rho_field,
-        :W, :b, :v_unscaled, :v_raw, :factors_flat, :thresh_unscaled, :thresh_raw,
-        :W1, :b1, :W2, :amplitude_unscaled, :amplitude_raw,
-        :innov_predator, :cluster_innovations, :inducing_innovations, :diag_innovations,
+        :W, :b, :v_unscaled, :factors_flat, :thresh_unscaled,
+        :W1, :b1, :W2, :amplitude_unscaled,
         :parent_locs_x, :parent_locs_y
     ]
     for p in latent_fields
         names[p] = Symbol("$(p)_$(full_key)$(latent_field_suffix)")
     end
-
-    # Aliases for consistent role lookup and backward compatibility:
-    names[:innovations] = names[:ure]
-    names[:innov] = names[:ure]
-    names[:raw] = names[:ure]
-    names[:iid] = names[:ure]
-    names[:latent] = names[:sre]
-    names[:struct] = names[:sre]
-    names[:unconstrained_rho] = names[:rho_unconstrained]
-    names[:unconstrained_rho1] = names[:rho1_unconstrained]
-    names[:unconstrained_rho2] = names[:rho2_unconstrained]
-    names[:unconstrained_sigma1] = names[:sigma1_unconstrained]
-    names[:unconstrained_sigma2] = names[:sigma2_unconstrained]
-    names[:v_raw] = names[:v_unscaled]
-    names[:thresh_raw] = names[:thresh_unscaled]
-    names[:amplitude_raw] = names[:amplitude_unscaled]
-    names[:inducing_innovations] = names[:ure_inducing]
-    names[:diag_innovations] = names[:ure_diag]
-    names[:pic_innovations] = names[:ure_pic]
-    names[:rho_innovations] = names[:ure_rho]
-    names[:cluster_innovations] = names[:ure_cluster]
-    names[:innov_predator] = names[:ure_predator]
 
     return NamedTuple(names)
 end
@@ -1495,12 +1323,13 @@ end
 
 
 """
-    _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multivariate::Bool, eta_name::String)
+    _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multivariate::Bool,
+      eta_name::String)
 
 Generates Turing code for a spatiotemporal interaction effect. 
 
 # Version
-v1.1.0 (2026-08-18)
+v1.0.0
  
 
 # Arguments
@@ -1512,7 +1341,8 @@ v1.1.0 (2026-08-18)
 # Returns
 - A `String` containing the generated Turing code for the interaction block.
 """
-function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multivariate::Bool, eta_name::String)
+function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multivariate::Bool,
+    eta_name::String)
     if get(M, :model_st, "none") == "none" 
         return ""
     end
@@ -1533,11 +1363,16 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     if is_multivariate
         interaction_code = """
     # --- Spatiotemporal Interaction Priors ---
-    local st_sigma_prior_dist_str = haskey(M, :sigma_st_interaction_prior) ? _distribution_to_string(M.sigma_st_interaction_prior) : (haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)")
-    sigma_st_interaction ~ NamedDist(filldist($(st_sigma_prior_dist_str), $K), :sigma_st_interaction)
+    local st_sigma_prior_dist_str = haskey(M, :sigma_st_interaction_prior) ?
+      _distribution_to_string(M.sigma_st_interaction_prior) : (haskey(M,
+      :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) :
+      "Exponential(1.0)")
+    sigma_st_interaction ~ NamedDist(filldist($(st_sigma_prior_dist_str), $K),
+      :sigma_st_interaction)
     
     # --- Spatiotemporal Interaction Innovations ---
-    ure_st_interaction ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N * $K), 0), I), :ure_st_interaction)
+    ure_st_interaction ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N * $K), 0),
+      I), :ure_st_interaction)
 
     let
         C_s = $s_chol_access
@@ -1551,7 +1386,8 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
             tmp_spatial = C_s.U \\ Z_k
             st_field_k_unscaled = (transpose(C_t.U \\ transpose(tmp_spatial)))
             
-            Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)), sum(st_field_k_unscaled))
+            Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)),
+              sum(st_field_k_unscaled))
             
             st_field_k = st_field_k_unscaled .* sigma_st_interaction[k]
 
@@ -1564,10 +1400,14 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     else
         interaction_code = """
     # --- Spatiotemporal Interaction Priors ---
-    local st_sigma_prior_dist_str = haskey(M, :sigma_st_interaction_prior) ? _distribution_to_string(M.sigma_st_interaction_prior) : (haskey(M, :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) : "Exponential(1.0)")
+    local st_sigma_prior_dist_str = haskey(M, :sigma_st_interaction_prior) ?
+      _distribution_to_string(M.sigma_st_interaction_prior) : (haskey(M,
+      :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) :
+      "Exponential(1.0)")
     sigma_st_interaction ~ NamedDist($(st_sigma_prior_dist_str), :sigma_st_interaction)
 
-    ure_st_interaction ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N), 0), I), :ure_st_interaction)
+    ure_st_interaction ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N), 0), I),
+      :ure_st_interaction)
 
     let
         C_s = $s_chol_access
@@ -1602,7 +1442,8 @@ This allows for rotating the latent space in multivariate models to better align
 which can be useful for processes with directional dependencies. This is controlled by
 the `spectral_orientation=true` keyword argument.
 """
-function _generate_householder_reflection_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
+function _generate_householder_reflection_block(M::NamedTuple, is_multivariate::Bool,
+    eta_name::String)
     if !is_multivariate || !get(M, :spectral_orientation, false)
         return "", ""
     end
@@ -1611,9 +1452,9 @@ function _generate_householder_reflection_block(M::NamedTuple, is_multivariate::
      
     priors_str = """
     # Householder reflection for spectral orientation
-    v_unscaled_reflection ~ NamedDist(MvNormal(fill!(Array{T}(undef, $(K)), 0), I), :v_unscaled_reflection)
+    v_unscaled_reflection ~ NamedDist(MvNormal(fill!(Array{T}(undef, $(K)), 0), I),
+      :v_unscaled_reflection)
     """
-
     update_str = """
     let
         v_reflection = v_unscaled_reflection / (norm(v_unscaled_reflection) + 1e-9)
@@ -1633,24 +1474,8 @@ end
 Generates the code block for nested sub-models.
 
 # Version
-v1.0.0 (2026-08-17)
+v1.0.0
 
-# Rationale
-This function restores the functionality for handling nested models, which was lost
-during a previous refactoring. It generates the necessary Turing code for each
-sub-model defined in `M.nested_components`.
-
-The implementation follows a similar pattern to the main `bstm_text_assembler`. For
-each nested component, it:
-1.  Defines a prior for the linking parameter `rho_nested`, which scales the sub-model's effect.
-2.  Creates a `let` block to scope the sub-model's variables.
-3.  Generates the priors for the sub-model's intercept, fixed effects, and all of its components. All variable names are prefixed with the nested component's key to avoid name collisions.
-4.  Assembles the sub-model's linear predictor (`eta_sub`).
-5.  Adds the sub-model's likelihood evaluation to the main model's likelihood block.
-6.  Links the assembled sub-model effect to the main model's linear predictor.
-
-This implementation assumes that the sub-model's coordinates align with the main
-model's coordinates, as interpolation logic is not yet part of the model generation step.
 """
 function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main_eta_name::String)
     if haskey(M, :nested_components) && !isempty(M.nested_components)
@@ -1694,38 +1519,44 @@ function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main
                 prefixed_sub_spec = merge(sub_spec, (key=Symbol(prefix, "_", sub_spec.key),))
                 for k in 1:sub_M.outcomes_N
                     sub_outcome_idx = is_sub_multivariate ? k : nothing
-                    priors_str = get_priors(sub_spec.component_obj, prefixed_sub_spec, sub_arch, sub_outcome_idx, sub_M)
-                    push!(sub_priors_acc, replace(priors_str, "spec_registry[:$(prefixed_sub_spec.key)]" => "sub_M.components[$(i)]"))
+                    priors_str = get_priors(sub_spec.component_obj, prefixed_sub_spec,
+                        sub_arch, sub_outcome_idx, sub_M)
+                    push!(sub_priors_acc, replace(priors_str, "spec_registry[:$(prefixed_sub_spec.key)]" => "sub_M_$(key).components[$(i)]"))
                 end
             end
             
             # --- Assemble sub-model updates ---
             sub_eta_init = if get(sub_M, :add_intercept, false)
-                is_sub_multivariate ? "intercept_$(prefix)' .+ fill!(Array{T}(undef, sub_M.y_N, sub_M.outcomes_N), 0)" : "intercept_$(prefix) .+ fill!(Array{T}(undef, sub_M.y_N), 0)"
+                is_sub_multivariate ? "intercept_$(prefix)' .+ fill!(Array{T}(undef, $(sub_M.y_N), $(sub_M.outcomes_N)), 0)" : "intercept_$(prefix) .+ fill!(Array{T}(undef, $(sub_M.y_N)), 0)"
             else
-                is_sub_multivariate ? "fill!(Array{T}(undef, sub_M.y_N, sub_M.outcomes_N), 0)" : "fill!(Array{T}(undef, sub_M.y_N), 0)"
+                is_sub_multivariate ? "fill!(Array{T}(undef, $(sub_M.y_N), $(sub_M.outcomes_N)), 0)" : "fill!(Array{T}(undef, $(sub_M.y_N)), 0)"
             end
-            push!(sub_updates_acc, "local $(sub_eta_name) = $(sub_eta_init)")
-
             # Add component updates
             for (i, sub_spec) in enumerate(sub_M.components)
                 prefixed_sub_spec = merge(sub_spec, (key=Symbol(prefix, "_", sub_spec.key),))
                 for k in 1:sub_M.outcomes_N
                     sub_outcome_idx = is_sub_multivariate ? k : nothing
-                    updates_str = get_updates(sub_spec.component_obj, prefixed_sub_spec, sub_arch, sub_outcome_idx, sub_M)
-                    updates_str_final = replace(updates_str, r"eta_latent|eta" => sub_eta_name, "spec_registry[:$(prefixed_sub_spec.key)]" => "sub_M.components[$(i)]")
+                    updates_str = get_updates(sub_spec.component_obj, prefixed_sub_spec,
+                        sub_arch, sub_outcome_idx, sub_M)
+                    updates_str_final = replace(updates_str, r"eta_latent|eta" => sub_eta_name, "spec_registry[:$(prefixed_sub_spec.key)]" => "sub_M_$(key).components[$(i)]", "M." => "sub_M_$(key).")
                     push!(sub_updates_acc, updates_str_final)
                 end
             end
 
             # --- Sub-model Likelihood ---
             sub_lik_code = _generate_final_likelihood_block(sub_M, is_sub_multivariate)
-            sub_lik_code_final = replace(sub_lik_code, r"eta_latent|eta" => sub_eta_name, r"\bM\." => "sub_M.")
+            sub_lik_code_final = replace(sub_lik_code, r"eta_latent|eta" => sub_eta_name,
+                r"\bM\." => "sub_M_$(key).")
             
             # --- Assemble final code blocks ---
             push!(priors_acc, join(sub_priors_acc, "\n"))
-            let_block = "let\n    local sub_M = M.nested_components[:$(key)]\n    $(join(sub_updates_acc, "\n    "))\n    $(main_eta_name) .+= $(rho_name) .* $(sub_eta_name)\nend"
-            push!(updates_acc, let_block)
+            updates_block = """
+            sub_M_$(key) = M.nested_components[:$(key)]
+            $(sub_eta_name) = $(sub_eta_init)
+            $(join(sub_updates_acc, "\n"))
+            $(main_eta_name) = $(main_eta_name) .+ $(rho_name) .* $(sub_eta_name)
+            """
+            push!(updates_acc, updates_block)
             push!(likelihood_acc, sub_lik_code_final)
         end
 
@@ -1842,7 +1673,9 @@ function _precompute_static_components!(M::Dict)
         if m_obj isa Mixed
             inner_model = m_obj.model
             is_inner_static = any(T -> inner_model isa T, static_component_types)
-            if is_inner_static && hasproperty(current_spec.hyper, :Q_template) && !isnothing(current_spec.hyper.Q_template) && size(current_spec.hyper.Q_template, 1) > 0
+            if is_inner_static && hasproperty(current_spec.hyper, :Q_template)&&
+                !isnothing(current_spec.hyper.Q_template)&&
+                size(current_spec.hyper.Q_template, 1) > 0
                 try
                     Q_concrete = current_spec.hyper.Q_template
                     Q_dense = Matrix(Q_concrete)
@@ -1856,9 +1689,12 @@ function _precompute_static_components!(M::Dict)
             end
         end
 
-        is_main_static = !(current_spec.component_obj isa Composed) && any(T -> current_spec.component_obj isa T, static_component_types)
+        is_main_static = !(current_spec.component_obj isa Composed)&&
+            any(T -> current_spec.component_obj isa T, static_component_types)
 
-        if is_main_static && hasproperty(current_spec.hyper, :Q_template) && !isnothing(current_spec.hyper.Q_template) && size(current_spec.hyper.Q_template, 1) > 0
+        if is_main_static && hasproperty(current_spec.hyper, :Q_template)&&
+            !isnothing(current_spec.hyper.Q_template)&&
+            size(current_spec.hyper.Q_template, 1) > 0
             try
                 Q_concrete = current_spec.hyper.Q_template
                 Q_dense = Matrix(Q_concrete)
@@ -1886,10 +1722,7 @@ end
 Creates the initial model configuration dictionary (`M`) 
 
 # Version
-v1.2.0 (2026-08-16)
-
-# Rationale
-This function is refactored to handle only the initial setup. 
+v1.0.0
 
 # Arguments
 - `data::DataFrame`: The input data for the model.
@@ -1930,24 +1763,7 @@ Processes the Left-Hand Side (LHS) of the formula, setting up outcomes, likeliho
 and observation-level parameters in the main model configuration.
 
 # Version
-v1.1.0 (2026-08-13)
-
-# Rationale
-This function is a core part of the model configuration pipeline. It is responsible
-for interpreting the `likelihood()` module(s) on the LHS of the formula. It correctly
-handles multiple model architectures:
-1.  **Univariate**: A single outcome variable.
-2.  **Multivariate**: Multiple outcome variables specified with `+`, which are modeled
-    jointly with a shared correlation structure.
-3.  **Compositional**: Multiple variables specified with `+` under a
-    `dirichlet_multinomial` family are treated as categories of a single response.
-4.  **Ordinal**: A single outcome variable with the `ordinal` family is recoded, and
-    the necessary parameters for the cut-points are configured.
-
-The function also resolves all observation-level parameters (e.g., `offsets`,
-`weights`, `trials`, censoring bounds) by calling specialized helper functions.
-This version updates the call to `_resolve_outcome_scalar_param` to be consistent
-with the refactored, non-mutating function name.
+v1.0.0
 
 # Arguments
 - `M::Dict`: The main model configuration dictionary, which is mutated by this function.
@@ -2000,9 +1816,13 @@ function _process_lhs!(M::Dict, outcome_specs::Vector{Dict{Symbol, Any}})
             end
             
             if string(get(spec, :family, "")) == "ordinal"
-                if M[:outcomes_N] > 1; error("The `ordinal` family is currently only supported for univariate models."); end
+                if M[:outcomes_N] > 1
+                    error("The `ordinal` family is currently only supported for univariate models.")
+                end
                 outcome_var = M[:outcomes][i]
-                if !hasproperty(M[:data], outcome_var); error("Ordinal outcome variable ':$outcome_var' not found in data."); end
+                if !hasproperty(M[:data], outcome_var)
+                    error("Ordinal outcome variable ':$outcome_var' not found in data.")
+                end
                 
                 outcome_data = M[:data][!, outcome_var]
                 if !(eltype(outcome_data) <: Integer)
@@ -2012,7 +1832,9 @@ function _process_lhs!(M::Dict, outcome_specs::Vector{Dict{Symbol, Any}})
                 
                 unique_levels = sort(unique(M[:data][!, outcome_var]))
                 K = length(unique_levels)
-                if K < 2; error("Ordinal outcome variable ':$outcome_var' must have at least 2 unique levels."); end
+                if K < 2
+                    error("Ordinal outcome variable ':$outcome_var' must have at least 2 unique levels.")
+                end
                 
                 spec[:latent_dist] = get(spec, :latent_dist, :logistic)
                 spec[:K] = K
@@ -2043,7 +1865,9 @@ function _process_lhs!(M::Dict, outcome_specs::Vector{Dict{Symbol, Any}})
     
     # Merge all likelihood parameters to resolve global settings like offsets, weights, etc.
     merged_params = Dict{Symbol, Any}()
-    for spec_params in M[:likelihood_specs]; merge!(merged_params, spec_params); end
+    for spec_params in M[:likelihood_specs]
+        merge!(merged_params, spec_params)
+    end
 
     _resolve_obs_param!(M, merged_params, M[:data], [:log_offsets, :offsets], :log_offsets)
     _resolve_obs_param!(M, merged_params, M[:data], [:weights], :weights)
@@ -2054,14 +1878,19 @@ function _process_lhs!(M::Dict, outcome_specs::Vector{Dict{Symbol, Any}})
         values_per_outcome = []
         any_provided = false
         for spec_params in M[:likelihood_specs]
-            # Corrected call to non-mutating version
             val = _resolve_outcome_scalar_param(spec_params, key, calling_mod)
-            if !isnothing(val); any_provided = true; end
+            if !isnothing(val)
+                any_provided = true
+            end
             push!(values_per_outcome, val)
         end
 
         if any_provided
-            default_val = if key == :censor_lower || key == :hurdle; -Inf; else Inf; end
+            default_val = if key == :censor_lower || key == :hurdle
+                -Inf
+            else
+                Inf
+            end
             final_values = [isnothing(v) ? default_val : v for v in values_per_outcome]
             M[key] = M[:outcomes_N] == 1 ? final_values[1] : final_values
             M[Symbol("user_provided_", key)] = true
@@ -2084,15 +1913,7 @@ end
 Resolves a likelihood parameter that must be a scalar value for a given outcome.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for the model configuration engine. It handles
-scalar parameters in the `likelihood()` module, such as `censor_lower` or `hurdle`.
-It is designed to be robust, correctly parsing values that are provided as direct
-numeric literals, as symbols pointing to a variable in the user's scope, or as
-expressions that evaluate to a number. The `!` has been removed from the function
-name as it does not mutate its arguments, adhering to Julia's style conventions.
+v1.0.0
 
 # Arguments
 - `params::Dict`: The dictionary of parameters from the parsed `likelihood()` module.
@@ -2138,21 +1959,7 @@ Resolves an observation-level parameter (e.g., offsets, weights) from the
 likelihood parameters and sets it in the main configuration dictionary.
 
 # Version
-v1.0.2 (2026-08-13)
-
-# Rationale
-This function is a core utility for the model configuration engine. It robustly
-parses observation-level parameters from the `likelihood()` module, such as
-`log_offsets`, `weights`, and `trials`. It is designed to handle multiple input
-styles from the user:
-1.  A `Symbol` referring directly to a column in the data frame (e.g., `log_offsets=my_col`).
-2.  A `Symbol` referring to a variable in the user's scope, which itself contains
-    a column name or a data vector (e.g., `my_var = :my_col; ... log_offsets=my_var`).
-3.  A literal `Number` or `AbstractVector`.
-
-This flexibility, particularly the use of `Core.eval` to resolve variables in the
-user's scope, is critical for the macro's usability in both interactive and
-programmatic contexts.
+v1.0.0
 
 # Arguments
 - `opt_dict`: The main model configuration dictionary (`M`), which is mutated.
@@ -2217,15 +2024,7 @@ Resolves a boolean flag from the likelihood parameters and sets it in the main
 configuration dictionary.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for the model configuration engine. It handles
-boolean flags in the `likelihood()` module, such as `zero_inflated=true` or
-`volatility=true`. It is designed to be robust, correctly parsing values that are
-provided as direct booleans (`true`), as symbols pointing to a boolean variable
-in the user's scope (`my_flag`), or as expressions that evaluate to a boolean.
-This ensures a flexible and predictable user experience.
+v1.0.0
 
 # Arguments
 - `opt_dict`: The main model configuration dictionary (`M`), which is mutated.
@@ -2267,25 +2066,7 @@ end
 Resolves and stores the prior distributions for each fixed effect coefficient.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core part of the model configuration pipeline. It is responsible
-for correctly mapping the priors specified in `fixed()` modules within the formula
-to the final coefficients generated by `StatsModels.jl`. This is a non-trivial
-task because `StatsModels.jl` can expand a single term (e.g., a categorical
-variable) into multiple coefficients.
-
-This function correctly handles:
-1.  **Canonical Naming**: It normalizes interaction terms (e.g., `a&b` is treated
-    the same as `b&a`) to ensure priors are applied consistently.
-2.  **Scoped Evaluation**: It uses the `calling_module` context to correctly
-    evaluate `Expr` objects for priors (e.g., `prior=Normal(mu, sd)`), where `mu`
-    and `sd` are variables in the user's scope.
-3.  **PC Priors**: It correctly dispatches to `create_pc_prior` when a tuple
-    constraint is provided.
-4.  **Defaults**: It assigns a default prior to any coefficient that does not have
-    an explicit prior.
+v1.0.0
 
 # Arguments
 - `M::Dict`: The main model configuration dictionary, which is mutated by this function.
@@ -2384,18 +2165,7 @@ Ensures the model configuration dictionary has all necessary keys with default v
 before being passed to the code generator.
 
 # Version
-v1.1.0 (2026-08-13)
-
-# Rationale
-This function is the final step in the configuration pipeline. It prevents `KeyError`
-exceptions in the model assembler by providing safe defaults for any configuration
-keys that were not set during the formula parsing or component processing stages.
-
-  consistent with the refactored architecture. It no
-longer sets defaults for observation-level parameters like `log_offsets`, `weights`,
-or `trials`, as these are now robustly handled by the `_precompute_likelihood_params!`
-function earlier in the pipeline. Its primary role is to provide fallbacks for
-structural indices (`s_idx`, `t_idx`, `u_idx`) and global settings like the prior scheme.
+v1.0.0
 
 # Arguments
 - `M::Dict`: The model configuration dictionary, which is mutated by this function.
@@ -2433,17 +2203,7 @@ Recursively traverses a Julia expression and replaces `bstm`-specific modules
 with their `StatsModels.jl` equivalents for parsing within other modules like `mixed()`.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for the formula parsing engine, specifically for
-handling the `mixed()` module. The `mixed()` module's formula (e.g., `1 + x | g`)
-is parsed internally by `StatsModels.jl`. However, users can write `bstm`-specific
-syntax like `intercept()` or `fixed(x)` within the `mixed()` call. This function
-acts as a pre-processor, traversing the expression tree and replacing these `bstm`
-modules with their `StatsModels.jl` equivalents (`1` and `x`, respectively) before
-the expression is passed to `StatsModels.jl` for parsing. This ensures compatibility
-and a consistent user experience.
+v1.0.0
 
 # Arguments
 - `ex`: A Julia expression, symbol, or literal.
@@ -2479,16 +2239,7 @@ Provides detailed, user-friendly diagnostics when the initial prior predictive c
 (`rand(model)`) fails.
 
 # Version
-v1.1.0 (2026-08-13)
-
-# Rationale
-This function is a critical part of the user experience. Instead of presenting a
-raw Julia error, it intercepts common exception types (`DimensionMismatch`,
-`PosDefException`, `MethodError`, etc.) and provides specific, actionable advice
-tailored to the `bstm` framework. This helps users quickly identify issues related
-to data structure, model specification, or AD compatibility. This version adds
-handlers for `MethodError`, `ArgumentError`, and `UndefVarError` and refines the
-existing diagnostics for clarity.
+v1.0.0
 
 # Arguments
 - `e`: The exception object caught during the prior predictive check.
@@ -2554,7 +2305,8 @@ function _bstm_error_handler(e, model)
         rhs_normalized = replace(Base.strip(rhs_raw), r"\s*-\s*" => " + -")
         all_terms = split_terms_at_depth(rhs_normalized, " + ")
 
-        has_intercept = !any(in.(Base.strip.(all_terms), (["0", "-1"],))) && !any(startswith.(Base.strip.(all_terms), "intercept(false"))
+        has_intercept = !any(in.(Base.strip.(all_terms), (["0", "-1"],
+            ))) && !any(startswith.(Base.strip.(all_terms), "intercept(false"))
 
         base_rhs = has_intercept ? "1" : "0"
         println("1. Start with the simplest possible model to isolate the issue.")
@@ -2562,7 +2314,8 @@ function _bstm_error_handler(e, model)
         println("\n   Suggested base model:")
         println("   @bstm(\n       $lhs ~ $base_rhs,\n       data, ...\n   )")
 
-        structural_terms = filter(t -> !in(Base.strip(t), ["1", "0", "-1"]) && !startswith(Base.strip(t), "intercept("), all_terms)
+        structural_terms = filter(t -> !in(Base.strip(t), ["1", "0", "-1"])&&
+            !startswith(Base.strip(t), "intercept("), all_terms)
 
         if !isempty(structural_terms)
             println("\n2. If the base model works, add components back one by one to find the problematic term.")
@@ -2603,7 +2356,8 @@ macro bstm(exprs...)
         elseif ex isa Expr && ex.head == :(=) # This is a keyword argument without a semicolon
             # Convert Expr(:(=), key, value) to Expr(:kw, key, value) for consistency
             push!(collected_kwargs, Expr(:kw, ex.args[1], ex.args[2]))
-        elseif ex isa Expr && ex.head == :kw # This is a keyword argument within a :parameters block
+        elseif ex isa Expr&&
+            ex.head == :kw # This is a keyword argument within a :parameters block
             push!(collected_kwargs, ex)
         else # Positional argument
             push!(current_positional_args, ex)
@@ -2710,8 +2464,10 @@ function _print_finalized_parameters(config::NamedTuple)
     # 2. Intercept Configuration
     println("\n[ Intercept ]")
     if config.add_intercept
-        is_user_provided = haskey(config, :intercept_prior) && config.intercept_prior != Normal(0, 5)
-        _print_param(:prior, get(config, :intercept_prior, Normal(0,5)), is_user_provided ? :user : :default; indent=2)
+        is_user_provided = haskey(config,
+            :intercept_prior) && config.intercept_prior != Normal(0, 5)
+        _print_param(:prior, get(config, :intercept_prior, Normal(0, 5)),
+            is_user_provided ? :user : :default; indent=2)
     else
         println("  - Intercept removed from model.")
     end
@@ -2757,7 +2513,8 @@ function _print_finalized_parameters(config::NamedTuple)
                 latent_dim_val = component_obj.n_features
             elseif hasproperty(component_obj, :n_inducing)
                 latent_dim_val = component_obj.n_inducing
-            elseif hasproperty(spec.hyper, :n_latent) # Fallback for components that explicitly define n_latent in hyper
+            elseif hasproperty(spec.hyper,
+                :n_latent) # Fallback for components that explicitly define n_latent in hyper
                 latent_dim_val = spec.hyper.n_latent
             end
             
@@ -2775,7 +2532,9 @@ function _print_finalized_parameters(config::NamedTuple)
             end
 
             for param_name in sort(collect(all_param_names))
-                if param_name in [:positional_args, :structure, :in_dims]; continue; end
+                if param_name in [:positional_args, :structure, :in_dims]
+                    continue
+                end
                 
                 local final_val, status
                 if param_name in fieldnames(typeof(component_obj))
@@ -2784,7 +2543,8 @@ function _print_finalized_parameters(config::NamedTuple)
                     status = haskey(user_provided_params_raw, param_name) ? :user : :default
                 else
                     # It's a configuration argument
-                    default_val = get(COMPONENT_CONFIG_ARGS, model_type_sym, Dict()) |> d -> get(d, param_name, "N/A")
+                    default_val = get(COMPONENT_CONFIG_ARGS, model_type_sym,
+                        Dict()) |> d -> get(d, param_name, "N/A")
                     final_val = get(user_provided_params_raw, param_name, default_val)
                     status = haskey(user_provided_params_raw, param_name) ? :user : :default
                 end
@@ -2811,27 +2571,8 @@ The main entry point for the `@bstm` macro. This function orchestrates the confi
 code generation, and instantiation of a Turing model.
 
 # Version
-v1.1.3 (2026-08-17)
+v1.0.0
 
-# Rationale
-This function is the core of the `bstm` framework. It provides a robust and complete
-workflow for dynamic model creation. This version resolves a "world age" warning by
-changing how the dynamically generated model function is retrieved. Instead of using
-`Core.eval` to define the function and then `getfield` to retrieve it (which can
-trigger the warning), this version uses a `quote` block within `Core.eval` to define
-and then immediately return the function object. This is a more robust pattern for
-runtime code generation in Julia and eliminates the world-age warning.
-
-# Workflow
-1.  **Configuration**: Calls `bstm_config` to translate the user's formula and
-    data into a detailed model specification.
-2.  **Code Generation**: Dynamically generates a unique Turing `@model` definition
-    by calling `bstm_text_assembler`.
-3.  **Scoped Evaluation**: Evaluates the generated model in the current module's
-    scope and directly captures the returned function object.
-4.  **Safe Instantiation**: Uses `Base.invokelatest` to instantiate the model.
-5.  **Validation**: Automatically runs a prior predictive check (`rand(model)`) and
-    provides detailed, user-friendly diagnostics if the check fails.
  
 # Arguments
 - `formula::String`: The model formula.
@@ -2845,7 +2586,8 @@ runtime code generation in Julia and eliminates the world-age warning.
 function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwargs...)
     # --- 1. Configuration ---
     # Generate model configuration dictionary based on formula syntax and data schema.
-    options = bstm_config(formula, data; calling_module=calling_module, kwargs...) # Pass kwargs to bstm_config
+    options = bstm_config(formula, data; calling_module=calling_module,
+        kwargs...) # Pass kwargs to bstm_config
 
     # --- 2. Code Generation ---
     # Generate a unique name for the model function to avoid world age issues.
@@ -2858,6 +2600,7 @@ function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwa
     # Update the configuration with the generated model code for inspection.
     config_dict = Dict(pairs(options))
     config_dict[:generated_model_code] = model_string
+    delete!(config_dict, :calling_module)
     new_config = NamedTuple(config_dict)
 
     if get(new_config, :verbose, true)
@@ -2922,15 +2665,6 @@ end
 A convenience overload for the main `bstm` constructor. This method defaults the
 model's evaluation scope to the `Main` module.
 
-# Rationale
-This function is not deprecated and serves as a useful entry point for interactive
-use, where the user is typically working in the `Main` module. It simplifies the
-function call by removing the need to explicitly provide the module context.
-
-For use within packages or other modules, the `@bstm` macro is the recommended
-entry point, as it automatically captures the correct calling module (`__module__`),
-ensuring that the dynamically generated model code is evaluated in the correct scope.
-
 # Arguments
 - `formula::String`: The model formula.
 - `data::DataFrame`: The input data.
@@ -2940,10 +2674,12 @@ ensuring that the dynamically generated model code is evaluated in the correct s
 - An instantiated Turing model object.
 """
 function bstm_core(formula::String, data::DataFrame; kwargs...)
-    # This overload defaults the calling_module to `Main`, which is a sensible
-    # default for interactive use. The `@bstm` macro should be preferred for
-    # use inside other modules to ensure correct scope resolution.
     return bstm_core(formula, data, Main; kwargs...)
+end
+
+function bstm_core(formula::Union{Expr, Symbol}, data::DataFrame, calling_module::Module=Main;
+    kwargs...)
+    return bstm_core(string(formula), data, calling_module; kwargs...)
 end
  
 
@@ -2954,28 +2690,7 @@ Assembles the full Turing model code as a string and a Julia `Expr` from the
 provided configuration.
 
 # Version
-v1.1.4 (2026-08-15)
-
-# Rationale
-This function is the core of the `bstm` code generation pipeline. It translates the
-high-level `config` object into a complete, executable Turing `@model` definition.
-This version corrects a scoping issue that caused an `UndefVarError: Turing not defined`
-during dynamic model evaluation. By adding `using Turing` (which is valid in a local
-scope) to the top of the generated function body, it ensures that the `Turing` module
-is explicitly available in the scope where the `@model` macro is expanded, resolving
-the error without causing a syntax error. This version also ensures device-aware
-memory allocation for the linear predictor `eta`.
-
-# Workflow
-1.  **Initialization**: Determines the model architecture and sets up the AD-safe
-    initialization string for `eta`, ensuring allocation on the correct device.
-2.  **Fragment Generation**: Calls helper functions to generate code strings for
-    different parts of the model (intercept, fixed effects, etc.).
-3.  **Component Loop**: Iterates through all components, calling `get_priors` and
-    `get_updates` for each to generate their specific code fragments.
-4.  **Assembly**: Consolidates all generated code fragments into a single,
-    well-formatted model string.
-5.  **Parsing**: Parses the final model string into a Julia `Expr` object.
+v1.0.0
 
 # Arguments
 - `M::NamedTuple`: The complete model configuration object.
@@ -3006,11 +2721,14 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     main_temporal_spec = nothing
     
     has_custom_likelihood_from_component = any(
-        spec -> (spec.component_obj isa PointProcess || (hasproperty(spec.component_obj, :method) && spec.component_obj.method == :marginalized)),
+        spec -> (spec.component_obj isa PointProcess || (hasproperty(spec.component_obj,
+            :method) && spec.component_obj.method == :marginalized)),
         M.components
     )
-    has_custom_likelihood_from_family = any(spec -> string(get(spec, :family, "")) == "ordinal", M.likelihood_specs)
-    has_custom_likelihood = has_custom_likelihood_from_component || has_custom_likelihood_from_family
+    has_custom_likelihood_from_family = any(spec -> string(get(spec, :family,
+        "")) == "ordinal", M.likelihood_specs)
+    has_custom_likelihood = has_custom_likelihood_from_component||
+        has_custom_likelihood_from_family
 
     # --- Generate all code fragments ---
     intercept_priors, _ = _generate_intercept_block(M, is_multivariate, eta_name)
@@ -3018,7 +2736,8 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     
     push!(updates_acc, _generate_offset_block(M, is_multivariate, eta_name))
     
-    fixed_effects_priors, fixed_effects_update = _generate_fixed_effects_block(M, is_multivariate, eta_name)
+    fixed_effects_priors, fixed_effects_update = _generate_fixed_effects_block(M,
+        is_multivariate, eta_name)
     push!(priors_acc, fixed_effects_priors)
     push!(updates_acc, fixed_effects_update)
 
@@ -3034,7 +2753,8 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     end
 
     for spec in M.components
-        if get(M, :is_multivariate_dynamics, false) && string(spec.key) == M[:multivariate_dynamics_key]
+        if get(M, :is_multivariate_dynamics,
+            false) && string(spec.key) == M[:multivariate_dynamics_key]
             continue
         end
         spec_registry[spec.key] = spec
@@ -3044,26 +2764,34 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
             push!(updates_acc, get_updates(spec.component_obj, spec, arch, outcome_idx, M))
         end
 
-        if spec.structure == :spatial && isnothing(main_spatial_spec); main_spatial_spec = spec; end
-        if spec.structure == :temporal && isnothing(main_temporal_spec); main_temporal_spec = spec; end
+        if spec.structure == :spatial && isnothing(main_spatial_spec)
+            main_spatial_spec = spec
+        end
+        if spec.structure == :temporal && isnothing(main_temporal_spec)
+            main_temporal_spec = spec
+        end
     end
 
     push!(priors_acc, _generate_likelihood_section(M, is_multivariate))
     
-    st_interaction_block = _generate_st_interaction_block(M, main_spatial_spec, main_temporal_spec, is_multivariate, eta_name)
+    st_interaction_block = _generate_st_interaction_block(M, main_spatial_spec,
+        main_temporal_spec, is_multivariate, eta_name)
     push!(updates_acc, st_interaction_block)
 
-    householder_priors, householder_update = _generate_householder_reflection_block(M, is_multivariate, eta_name)
+    householder_priors, householder_update = _generate_householder_reflection_block(M,
+        is_multivariate, eta_name)
     push!(priors_acc, householder_priors)
     push!(updates_acc, householder_update)
     
-    nested_priors, nested_updates, nested_likelihoods = _generate_nested_model_block(M, is_multivariate, eta_name)
+    nested_priors, nested_updates, nested_likelihoods = _generate_nested_model_block(M,
+        is_multivariate, eta_name)
     push!(priors_acc, nested_priors)
     push!(updates_acc, nested_updates)
     push!(likelihood_acc, nested_likelihoods)
 
     final_likelihood = if has_custom_likelihood
-        has_custom_likelihood_from_family ? _generate_final_likelihood_block(M, is_multivariate) : ""
+        has_custom_likelihood_from_family ? _generate_final_likelihood_block(M,
+            is_multivariate) : ""
     else
         _generate_final_likelihood_block(M, is_multivariate)
     end
@@ -3120,16 +2848,7 @@ acts as a factory, resolving hyperpriors and calling the appropriate constructor
 `COMPONENT_CONSTRUCTORS` registry.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is the central factory in the `bstm` component system. It translates
-the parsed representation of a formula module (e.g., `random(s_idx, model=:bym2)`)
-into a concrete `ComponentModel` struct instance (e.g., `BYM2(...)`). It achieves
-this by looking up the specified model name in the `COMPONENT_CONSTRUCTORS` registry
-and calling the appropriate constructor with resolved hyperpriors. It also handles
-the recursive instantiation of `Composed` components for operators like `⊗` and `|>`,
-making it a critical part of the model configuration pipeline.
+v1.0.0
 
 # Arguments
 - `module_metadata::Dict`: The parsed data for the module from the formula.
@@ -3140,7 +2859,8 @@ making it a critical part of the model configuration pipeline.
 # Returns
 - A `ComponentModel` object (e.g., an instance of `BYM2`, `AR1`, or `Composed`).
 """
-function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, priors_dict, scheme::Symbol)
+function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, priors_dict,
+    scheme::Symbol)
     m_type = module_metadata[:type]
     m_params = module_metadata[:params]
     calling_mod = get(M, :calling_module, Main)
@@ -3149,14 +2869,20 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
     if m_type == :interact
         op = m_params[:operator]
         components_data = m_params[:components]
-        components_metadata = map(c_node -> Dict(:key=>"temp", :type => c_node.module_type, :params => c_node.args, :variables => get(c_node.args, :positional_args, [])), components_data)
-        resolved_components = [resolve_technical_primitive(comp_meta, M, priors_dict, scheme) for comp_meta in components_metadata]
-        return Composed(resolved_components, op)
+        components_metadata = map(c_node -> Dict(:key=>"temp", :type => c_node.module_type,
+            :params => c_node.args, :variables => get(c_node.args, :positional_args, [])),
+            components_data)
+        resolved_components = [resolve_technical_primitive(comp_meta, M, priors_dict,
+            scheme) for comp_meta in components_metadata]
+        default_method = op == :kronecker_product ? :spectral : (op == :pipe ? :cholesky : :none)
+        return Composed(resolved_components, op, get(m_params, :method, default_method))
     end
 
     # Handle standard components.
     model_name = if haskey(m_params, :model)
         m_params[:model] isa Symbol ? m_params[:model] : Symbol(m_params[:model])
+    elseif haskey(COMPONENT_CONSTRUCTORS, m_type)
+        m_type
     else
         # Infer default model based on the structure if no model is specified.
         if m_type == :spatial
@@ -3169,7 +2895,8 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
     end
 
     model_name_str = string(model_name)
-    resolved_priors = resolve_hyperpriors(model_name_str, priors_dict, m_params, scheme, calling_mod)
+    resolved_priors = resolve_hyperpriors(model_name_str, priors_dict, m_params, scheme,
+        calling_mod)
     
     if !haskey(COMPONENT_CONSTRUCTORS, model_name)
         error("Component model ':$model_name' is not a recognized model type.")
@@ -3185,7 +2912,8 @@ end
 
 Creates a precision matrix template and its spectral decomposition for a GMRF model. 
 """
-function build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractMatrix, Nothing}=nothing)
+function build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractMatrix,
+    Nothing}=nothing)
     Q_template = spzeros(Float64, n, n)
     rank_deficiency = 0
 
@@ -3194,8 +2922,12 @@ function build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractM
     end
 
     if model_type in [:icar, :besag, :bym2, :leroux, :localadaptive]
-        if isnothing(W); error("Spatial model '$model_type' requires an adjacency matrix `W`."); end
-        if size(W, 1) != n || size(W, 2) != n; error("Adjacency matrix `W` dimensions ($(size(W))) do not match `n` ($n)."); end
+        if isnothing(W)
+            error("Spatial model '$model_type' requires an adjacency matrix `W`.")
+        end
+        if size(W, 1) != n || size(W, 2) != n
+            error("Adjacency matrix `W` dimensions ($(size(W))) do not match `n` ($n).")
+        end
         
         W_sym = sparse((W + W') .> 0)
         D = spdiagm(0 => vec(sum(W_sym, dims=2)))
@@ -3212,7 +2944,8 @@ function build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractM
         rank_deficiency = 1
     elseif model_type == :rw2
         if n > 1
-            Q_template = spdiagm(0 => fill(6.0, n), -1 => fill(-4.0, n-1), 1 => fill(-4.0, n-1), -2 => fill(1.0, n-2), 2 => fill(1.0, n-2))
+            Q_template = spdiagm(0 => fill(6.0, n), -1 => fill(-4.0, n-1), 1 => fill(-4.0,
+                n-1), -2 => fill(1.0, n-2), 2 => fill(1.0, n-2))
             Q_template[1, 1] = 1.0; Q_template[2, 2] = 5.0
             Q_template[1, 2] = -2.0; Q_template[2, 1] = -2.0
             Q_template[n-1, n-1] = 5.0; Q_template[n, n] = 1.0
@@ -3267,23 +3000,14 @@ end
 Computes a robust scaling factor for a precision matrix from its eigenvalues.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for scaling precision matrices in intrinsic Gaussian
-Markov Random Field (GMRF) models (e.g., ICAR, RW1, RW2). These models often have
-singular precision matrices (i.e., they are rank-deficient), meaning some eigenvalues
-are zero. A proper scaling factor is essential for ensuring the identifiability of
-the model and for numerical stability during sampling. This method avoids using a
-fixed tolerance to identify zero eigenvalues, which can be sensitive to floating-point
-noise. Instead, it leverages the known `rank_deficiency` of the GMRF model to
-correctly identify the structural zero eigenvalues.
+v1.0.0
 
 # Mathematical Formulation
 The scaling factor `c` is defined as the geometric mean of the `n - rank_deficiency`
 non-zero eigenvalues. This ensures that the determinant of the scaled precision
 matrix is 1.
-\$c = \\exp\\left( \\frac{1}{n - \\text{rank\\_deficiency}} \\sum_{i=\\text{rank\\_deficiency}+1}^{n} \\log(\\lambda_i) \\right)\$
+\$c = \\exp\\left( \\frac{1}{n - \\text{rank\\_deficiency}}
+  \\sum_{i=\\text{rank\\_deficiency}+1}^{n} \\log(\\lambda_i) \\right)\$
 where \$\\lambda_i\$ are the non-zero eigenvalues.
 
 # Arguments
@@ -3322,20 +3046,12 @@ end
 
 
 """
-    evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
+    evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix,
+      param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
  
 
 # Version
-v1.5.7 (2026-08-13)
-
-# Rationale
-This function is a core utility for Gaussian Process (GP) components, particularly
-for tasks such as out-of-sample prediction or computing cross-covariances in multi-output
-GP models. It calculates the covariance between two distinct sets of input points
-(`coords1` and `coords2`) based on a specified kernel function and hyperparameters.
-This version is consistent with `evaluate_kernel_matrix`, including support for
-various kernel types and handling of both isotropic and Automatic Relevance
-Determination (ARD) lengthscales.
+v1.0.0
 
 # Arguments
 - `coords1::AbstractMatrix`: An `N1 x D` matrix of data points.
@@ -3352,11 +3068,15 @@ Determination (ARD) lengthscales.
 - `:exponential`, `:matern12`: Exponential kernel (Matérn with \$\\nu=1/2\$).
   \$k(x, x') = \\sigma^2 \\exp\\left(-\\frac{\\|x - x'\\|}{\\ell}\\right)\$
 - `:matern32`: Matérn kernel with \$\\nu=3/2\$.
-  \$k(x, x') = \\sigma^2 \\left(1 + \\frac{\\sqrt{3}\\|x - x'\\|}{\\ell}\\right) \\exp\\left(-\\frac{\\sqrt{3}\\|x - x'\\|}{\\ell}\\right)\$
+  \$k(x, x') = \\sigma^2 \\left(1 + \\frac{\\sqrt{3}\\|x - x'\\|}{\\ell}\\right)
+    \\exp\\left(-\\frac{\\sqrt{3}\\|x - x'\\|}{\\ell}\\right)\$
 - `:matern52`: Matérn kernel with \$\\nu=5/2\$.
-  \$k(x, x') = \\sigma^2 \\left(1 + \\frac{\\sqrt{5}\\|x - x'\\|}{\\ell} + \\frac{5\\|x - x'\\|^2}{3\\ell^2}\\right) \\exp\\left(-\\frac{\\sqrt{5}\\|x - x'\\|}{\\ell}\\right)\$
+  \$k(x, x') = \\sigma^2 \\left(1 + \\frac{\\sqrt{5}\\|x - x'\\|}{\\ell} + \\frac{5\\|x -
+    x'\\|^2}{3\\ell^2}\\right) \\exp\\left(-\\frac{\\sqrt{5}\\|x - x'\\|}{\\ell}\\right)\$
 - `:spherical`: Spherical kernel.
-  \$k(x, x') = \\sigma^2 \\left(1 - \\frac{3}{2}\\frac{\\|x - x'\\|}{\\ell} + \\frac{1}{2}\\left(\\frac{\\|x - x'\\|}{\\ell}\\right)^3\\right)\$ for \$\\|x - x'\\| < \\ell\$, else \$0\$.
+  \$k(x, x') = \\sigma^2 \\left(1 - \\frac{3}{2}\\frac{\\|x - x'\\|}{\\ell} +
+    \\frac{1}{2}\\left(\\frac{\\|x - x'\\|}{\\ell}\\right)^3\\right)\$ for \$\\|x - x'\\| <
+    \\ell\$, else \$0\$.
 - `:cosine`: Cosine kernel.
   \$k(x, x') = \\sigma^2 \\cos\\left(\\frac{2\\pi\\|x - x'\\|}{\\ell}\\right)\$
 - `:linear`: Linear kernel.
@@ -3364,7 +3084,8 @@ Determination (ARD) lengthscales.
 - `:constant`: Constant kernel.
   \$k(x, x') = \\sigma^2\$
 """
-function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
+function evaluate_cross_kernel_matrix(coords1::AbstractMatrix, coords2::AbstractMatrix,
+    param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol)
     T = promote_type(eltype(coords1), eltype(coords2), typeof(param_val), eltype(ls))
     coords1_T = convert(AbstractMatrix{T}, coords1)
     coords2_T = convert(AbstractMatrix{T}, coords2)
@@ -3443,17 +3164,7 @@ Generates Turing code fragments for the observation error variance, handling bot
 constant variance and a spatiotemporal stochastic volatility (SV) model.
 
 # Version
-v1.1.0 (2026-08-13)
-
-# Rationale
-This function is a core part of the code generation pipeline. It provides a switch
-to model observation noise either as a simple constant parameter or as a complex,
-spatiotemporally varying field. The stochastic volatility option is crucial for
-heteroscedastic data, where the measurement error changes across space and time.
-This is implemented using Random Fourier Features (RFF) to create a flexible,
-non-parametric model for the log-variance.   correctly
-handle both univariate and multivariate models, ensuring the `y_sigma` parameter
-has the correct dimensions in all cases.
+v1.0.0
 
 # Mathematical Formulation
 - **Constant Variance**: \$\\sigma_y\$ is a single parameter.
@@ -3479,16 +3190,15 @@ function observation_volatility(M::NamedTuple)
 
         priors_str = """
         sigma_log_var ~ DynamicPPL.NamedDist(Exponential(1.0), :sigma_log_var)
-        beta_vol ~ DynamicPPL.NamedDist(MvNormal(fill!(Array{T}(undef, M.M_rff_sigma), 0), sigma_log_var^2 * I), :beta_vol)
+        beta_vol ~ DynamicPPL.NamedDist(MvNormal(fill!(Array{T}(undef, M.M_rff_sigma), 0),
+          sigma_log_var^2 * I), :beta_vol)
         """
-
         calc_str = """
         # Stochastic Volatility Calculation
         vol_proj = (M.coords_st * M.W_sigma_fixed) .+ M.b_sigma_fixed'
         log_var_latent = sqrt(2.0 / M.M_rff_sigma) .* cos.(vol_proj) * beta_vol
         y_sigma_sv = exp.(log_var_latent ./ 2.0)
         """
-        
         final_calc_str = is_multivariate ? "y_sigma = y_sigma_sv .* y_sigma_const'" : "y_sigma = y_sigma_const .* y_sigma_sv"
         
         return (priors=priors_str, calculation="$(calc_str)\n    $(final_calc_str)")
@@ -3508,33 +3218,14 @@ end
 
   
 """
-    generate_inducing_points(coords::AbstractMatrix, n_inducing::Int; method::String="kmeans", seed::Int=42)
+    generate_inducing_points(coords::AbstractMatrix, n_inducing::Int;
+      method::String="kmeans", seed::Int=42)
 
 Selects a representative subset of coordinates to serve as inducing points for sparse
 Gaussian Process (GP) models.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for all sparse GP components (e.g., `FITC`, `SVGP`).
-Sparse GPs reduce the O(N³) complexity of exact GPs by summarizing the data through a
-smaller set of `M` inducing points, where `M << N`. The quality of the GP approximation
-depends heavily on the placement of these points. This function provides several
-standard methods for their selection, offering a trade-off between computational
-speed and representativeness. The implementation is consistent with the refactored
-architecture and provides robust, well-tested methods for this critical task.
-
-# Methods
-- `:kmeans`: (Default) Uses k-means clustering to find the centroids of the data
-  points. This is often the most effective method as it places inducing points in
-  high-density areas.
-- `:random`: Simple and fast random sub-sampling of the data points.
-- `:quantile`: Generates a systematic grid of target points based on the marginal
-  quantiles of the data and finds the nearest actual data points to these targets.
-  This ensures good coverage of the data's distributional space.
-- `:regular`: Generates a regular grid of target points over the data's range and
-  finds the nearest actual data points. This ensures good spatial coverage.
+v1.0.0
 
 # Arguments
 - `coords::AbstractMatrix`: An `N x D` matrix of data point coordinates.
@@ -3613,17 +3304,7 @@ end
 Creates a Penalized Complexity (PC) prior distribution from a user-specified quantile constraint.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for the prior specification engine. It translates an
-intuitive belief about a parameter's scale (e.g., "the probability that sigma is
-greater than 1.0 should be 5%") into a formal, well-defined prior distribution.
-This aligns with the principles of Penalized Complexity priors, which favor simpler
-models by shrinking parameters towards a base case (e.g., zero variance or no
-correlation) unless the data provides strong evidence to the contrary. This version
-is consistent with the refactored architecture and includes detailed mathematical
-documentation.
+v1.0.0
 
 # Mathematical Formulation
 The function maps a quantile constraint `(U, α)` to the hyperparameter `λ` of an
@@ -3634,14 +3315,17 @@ The function maps a quantile constraint `(U, α)` to the hyperparameter `λ` of 
   - Derivation: \$e^{-\\lambda U} = \\alpha \\implies \\lambda = -\\log(\\alpha) / U\$
 
 - **For `rho` (correlation parameter on [0, 1])**:
-  - The prior is placed on a transformed parameter \$\\theta = -\\log(1-\\rho) \\sim \\text{Exponential}(\\lambda)\$.
+  - The prior is placed on a transformed parameter \$\\theta = -\\log(1-\\rho) \\sim
+    \\text{Exponential}(\\lambda)\$.
   - Constraint: \$P(\\rho > U) = \\alpha\$
-  - Derivation: \$P(\\theta > -\\log(1-U)) = e^{-\\lambda(-\\log(1-U))} = (1-U)^{\\lambda} = \\alpha \\implies \\lambda = \\log(\\alpha) / \\log(1-U)\$
+  - Derivation: \$P(\\theta > -\\log(1-U)) = e^{-\\lambda(-\\log(1-U))} = (1-U)^{\\lambda} =
+    \\alpha \\implies \\lambda = \\log(\\alpha) / \\log(1-U)\$
 
 - **For `lengthscale`**:
   - The prior is placed on the inverse \$\\theta = 1/\\ell \\sim \\text{Exponential}(\\lambda)\$.
   - Constraint: \$P(\\ell < U) = \\alpha\$
-  - Derivation: \$P(\\theta > 1/U) = e^{-\\lambda/U} = \\alpha \\implies \\lambda = -U \\log(\\alpha)\$
+  - Derivation: \$P(\\theta > 1/U) = e^{-\\lambda/U} = \\alpha \\implies \\lambda = -U
+    \\log(\\alpha)\$
 
 - **For other parameters**:
   - A symmetric `Normal(0, σ)` prior is assumed, where the standard deviation `σ` is
@@ -3673,7 +3357,8 @@ function create_pc_prior(param_name::Symbol, constraint::Tuple)
         λ = log(α) / log(1.0 - U)
         return Exponential(λ)
     elseif param_name == :lengthscale || endswith(string(param_name), "_lengthscale")
-        direction != :lower && error("PC prior for 'lengthscale' only supports lower tail constraints.")
+        direction != :lower&&
+            error("PC prior for 'lengthscale' only supports lower tail constraints.")
         λ = -U * log(α)
         return Exponential(λ)
     elseif param_name == :kappa || endswith(string(param_name), "_kappa")
@@ -3691,26 +3376,20 @@ end
  
 
 """
-    create_fixed_design(formula_rhs::AbstractString, data::DataFrame, calling_module::Module; contrasts=Dict{Symbol, Any}())
+    create_fixed_design(formula_rhs::AbstractString, data::DataFrame,
+      calling_module::Module; contrasts=Dict{Symbol, Any}())
 
 Creates a fixed-effects design matrix (`X`) from a formula string using `StatsModels.jl`.
 
 # Version
-v1.0.3 (2026-08-15)
-
-# Rationale
-This function is a core utility for the model configuration engine. It acts as a
-robust wrapper around `StatsModels.jl` to parse a formula's right-hand side and
-generate the corresponding design matrix.   prevent a
-`LoadError` by explicitly evaluating the formula expression in the `bstm` module's
-scope (`@__MODULE__`) instead of the `calling_module`'s scope. This ensures the
-`StatsModels.@formula` macro can always be found, as `StatsModels` is a direct
-dependency of `bstm`.
+v1.0.0
 
 # Arguments
-- `formula_rhs::AbstractString`: A string representing the right-hand side of the model formula (e.g., "0 + x + y*z").
+- `formula_rhs::AbstractString`: A string representing the right-hand side of the model
+  formula (e.g., "0 + x + y*z").
 - `data::DataFrame`: The input data frame containing the variables.
-- `calling_module::Module`: The module in which the formula should be evaluated (used by `StatsModels` to resolve variables).
+- `calling_module::Module`: The module in which the formula should be evaluated (used by
+  `StatsModels` to resolve variables).
 - `contrasts`: An optional dictionary specifying contrast coding for categorical variables.
 
 # Returns
@@ -3726,11 +3405,13 @@ function create_fixed_design(
     final_rhs_string = strip(formula_rhs)
 
     if isempty(final_rhs_string)
-        return NamedArray(zeros(size(df_internal, 1), 0), (1:size(df_internal, 1), Symbol[])), nothing
+        return NamedArray(zeros(size(df_internal, 1), 0), (1:size(df_internal, 1),
+            Symbol[])), nothing
     end
 
     if final_rhs_string == "1"
-        return NamedArray(ones(size(df_internal, 1), 1), (1:size(df_internal, 1), [:Intercept])), nothing
+        return NamedArray(ones(size(df_internal, 1), 1), (1:size(df_internal, 1),
+            [:Intercept])), nothing
     end
 
     try
@@ -3747,18 +3428,21 @@ function create_fixed_design(
         dynamic_formula = Core.eval(@__MODULE__, formula_expression)
 
         data_schema = StatsModels.schema(dynamic_formula, df_internal, contrasts)
-        applied_formula = StatsModels.apply_schema(dynamic_formula, data_schema, StatsModels.RegressionModel)
+        applied_formula = StatsModels.apply_schema(dynamic_formula, data_schema,
+            StatsModels.RegressionModel)
 
         _, model_matrix_numeric = StatsModels.modelcols(applied_formula, df_internal)
         coefficient_labels = StatsModels.coefnames(applied_formula.rhs)
 
         label_vector = coefficient_labels isa AbstractString ? [Symbol(coefficient_labels)] : Symbol.(coefficient_labels)
 
-        return NamedArray(model_matrix_numeric, (1:size(model_matrix_numeric, 1), label_vector)), applied_formula
+        return NamedArray(model_matrix_numeric, (1:size(model_matrix_numeric, 1),
+            label_vector)), applied_formula
 
     catch design_error
         @warn "BSTM Registry: create_fixed_design expansion failed for: '$final_rhs_string'. Error of type '$(typeof(design_error))' occurred. Check formula syntax and variable names."
-        return NamedArray(zeros(size(df_internal, 1), 0), (1:size(df_internal, 1), Symbol[])), nothing
+        return NamedArray(zeros(size(df_internal, 1), 0), (1:size(df_internal, 1),
+            Symbol[])), nothing
     end
 end
 
@@ -3773,16 +3457,7 @@ Displays a comprehensive and well-formatted summary of the `bstm` model configur
 including likelihoods, priors, and component-specific parameters.
 
 # Version
-v1.1.0 (2026-08-13)
-
-# Rationale
-This function provides a user-friendly way to inspect the full specification of a
-model before or after fitting. This updated version replaces the previous, more basic
-implementation with a detailed, structured output. It iterates through all parts of
-the model configuration (`likelihood`, `intercept`, `fixed effects`, and all `components`)
-and prints their finalized parameters, clearly indicating whether each value was
-provided by the user or assigned a default. This is crucial for debugging and for
-verifying that the model was specified as intended.
+v1.0.0
 
 # Arguments
 - `m`: The Turing model instance generated by `@bstm`.
@@ -3817,8 +3492,10 @@ function show_model(m::DynamicPPL.Model)
     # Intercept Configuration
     println("\n[ Intercept ]")
     if get(config, :add_intercept, false)
-        is_user_provided = haskey(config, :intercept_prior) && config.intercept_prior != Normal(0, 5)
-        _print_param(:prior, get(config, :intercept_prior, Normal(0,5)), is_user_provided ? :user : :default; indent=2)
+        is_user_provided = haskey(config,
+            :intercept_prior) && config.intercept_prior != Normal(0, 5)
+        _print_param(:prior, get(config, :intercept_prior, Normal(0, 5)),
+            is_user_provided ? :user : :default; indent=2)
     else
         println("  - Intercept removed from model.")
     end
@@ -3860,7 +3537,9 @@ function show_model(m::DynamicPPL.Model)
             union!(all_param_names, keys(user_provided_params_raw))
             
             for param_name in sort(collect(all_param_names))
-                if param_name in [:positional_args, :structure, :in_dims]; continue; end
+                if param_name in [:positional_args, :structure, :in_dims]
+                    continue
+                end
                 
                 local final_val, status
                 if param_name in fieldnames(typeof(component_obj))
@@ -3923,7 +3602,8 @@ function model_pseudocode(m::DynamicPPL.Model)
     if get(config, :user_provided_hurdle, false)
         push!(lines, "    lik_phi_hurdle ~ $(_distribution_to_string(Beta(1,1)))")
     end
-    if family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"] && !get(config, :volatility, false)
+    if family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal",
+        "half_student_t"] && !get(config, :volatility, false)
         push!(lines, "    y_sigma ~ $(_distribution_to_string(Exponential(1.0)))")
     end
     if get(config, :volatility, false)
@@ -3942,7 +3622,8 @@ function model_pseudocode(m::DynamicPPL.Model)
     end
 
     # Ordinal-specific priors
-    ordinal_spec_idx = findfirst(s -> string(get(s, :family, "")) == "ordinal", config.likelihood_specs)
+    ordinal_spec_idx = findfirst(s -> string(get(s, :family, "")) == "ordinal",
+        config.likelihood_specs)
     if !isnothing(ordinal_spec_idx)
         spec = config.likelihood_specs[ordinal_spec_idx]
         K_ordinal = get(spec, :K, 0)
@@ -3973,17 +3654,20 @@ function model_pseudocode(m::DynamicPPL.Model)
         # Proportional fixed effects
         prop_indices = collect(1:n_fixed)
         npo_indices = Int[]
-        if !isnothing(ordinal_spec_idx) && haskey(config, :non_proportional_effects) && !isempty(config.non_proportional_effects)
+        if !isnothing(ordinal_spec_idx) && haskey(config,
+            :non_proportional_effects) && !isempty(config.non_proportional_effects)
             npo_indices = findall(x -> x in config.non_proportional_effects, config.Xfixed_names)
             prop_indices = setdiff(prop_indices, npo_indices)
         end
 
         if !isempty(prop_indices)
-            priors_prop = get(config, :Xfixed_priors_vec, [Normal(0, 5) for _ in 1:n_fixed])[prop_indices]
+            priors_prop = get(config, :Xfixed_priors_vec, [Normal(0,
+                5) for _ in 1:n_fixed])[prop_indices]
             if is_multivariate
                 # Simplified for pseudo-code: assume all outcomes have the same prior structure
                 prior_str = _distribution_to_string(priors_prop[1]) # Take first as representative
-                push!(lines, "    beta_flat ~ filldist($(prior_str), $(length(prop_indices) * outcomes_N))")
+                push!(lines,
+                    "    beta_flat ~ filldist($(prior_str), $(length(prop_indices) * outcomes_N))")
             else
                 prior_str_list = [_distribution_to_string(p) for p in priors_prop]
                 push!(lines, "    beta ~ Product([$(join(prior_str_list, ", "))])")
@@ -3992,7 +3676,8 @@ function model_pseudocode(m::DynamicPPL.Model)
 
         # Non-proportional fixed effects (for ordinal)
         if !isempty(npo_indices) && K_ordinal > 1
-            priors_npo = get(config, :Xfixed_priors_vec, [Normal(0, 5) for _ in 1:n_fixed])[npo_indices]
+            priors_npo = get(config, :Xfixed_priors_vec, [Normal(0,
+                5) for _ in 1:n_fixed])[npo_indices]
             prior_str_list = [_distribution_to_string(p) for p in priors_npo]
             push!(lines, "    beta_npo ~ Product([$(join(prior_str_list, ", "))])")
         end
@@ -4011,7 +3696,7 @@ function model_pseudocode(m::DynamicPPL.Model)
             # that might have priors in any component.
             all_possible_hyperpriors = [
                 :sigma, :rho, :rho1, :rho2, :rho_unconstrained, :rho1_unconstrained, :rho2_unconstrained,
-                :sigma1_unconstrained, :sigma2_unconstrained, :threshold_unconstrained, :unconstrained_rho, :kappa, :ls, :range, :period,
+                :sigma1_unconstrained, :sigma2_unconstrained, :threshold_unconstrained, :kappa, :ls, :range, :period,
                 :amplitude, :phase, :velocity, :diffusion, :pca_sd, :pdef_sd,
                 :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, :gamma, :delta, :curvature,
                 :lengthscale, :rho_sigma, :rho_rho, :sigma0, :shape, :nu
@@ -4020,15 +3705,19 @@ function model_pseudocode(m::DynamicPPL.Model)
             for field_sym in all_possible_hyperpriors
                 if hasproperty(m_obj, field_sym)
                     prior_dist = getfield(m_obj, field_sym)
-                    if prior_dist isa Distribution || (prior_dist isa Vector && !isempty(prior_dist) && all(d -> d isa Distribution, prior_dist))
-                        p_names = generate_full_variable_names(spec, config.model_arch, 1) # Use 1 for outcome_idx for pseudo-code simplicity
-                        param_name_sym = get(p_names, field_sym, Symbol("$(field_sym)_$(key)")) # Fallback if not in p_names
+                    if prior_dist isa Distribution || (prior_dist isa Vector&&
+                        !isempty(prior_dist) && all(d -> d isa Distribution, prior_dist))
+                        p_names = generate_full_variable_names(spec, config.model_arch,
+                            1) # Use 1 for outcome_idx for pseudo-code simplicity
+                        param_name_sym = get(p_names, field_sym,
+                            Symbol("$(field_sym)_$(key)")) # Fallback if not in p_names
 
                         if prior_dist isa Vector
                             dist_str = "Product([$(join([_distribution_to_string(d) for d in prior_dist], ", "))])"
                             push!(lines, "    $(param_name_sym) ~ $(dist_str)")
                         else
-                            push!(lines, "    $(param_name_sym) ~ $(_distribution_to_string(prior_dist))")
+                            push!(lines,
+                                "    $(param_name_sym) ~ $(_distribution_to_string(prior_dist))")
                         end
                     end
                 end
@@ -4054,13 +3743,15 @@ function model_pseudocode(m::DynamicPPL.Model)
         push!(eta_parts, "M.log_offsets")
     end
     
-    eta_init_str = isempty(eta_parts) ? "zeros(T, M.y_N, $(config.outcomes_N))" : join(eta_parts, " .+ ")
+    eta_init_str = isempty(eta_parts) ? "zeros(T, M.y_N, $(config.outcomes_N))" : join(eta_parts,
+        " .+ ")
     push!(lines, "    $(eta_var_name) = $(eta_init_str)")
 
     # Add fixed effects
     if get(config, :Xfixed_N, 0) > 0
         if is_multivariate
-            push!(lines, "    $(eta_var_name) .+= M.Xfixed * reshape(beta_flat, M.Xfixed_N, M.outcomes_N)")
+            push!(lines,
+                "    $(eta_var_name) .+= M.Xfixed * reshape(beta_flat, M.Xfixed_N, M.outcomes_N)")
         else
             push!(lines, "    $(eta_var_name) .+= M.Xfixed * beta")
         end
@@ -4069,9 +3760,11 @@ function model_pseudocode(m::DynamicPPL.Model)
     # Add component effects
     if haskey(config, :components) && !isempty(config.components)
         for spec in config.components
-            p_names = generate_full_variable_names(spec, config.model_arch, 1) # Use 1 for pseudo-code
+            p_names = generate_full_variable_names(spec, config.model_arch,
+                1) # Use 1 for pseudo-code
             if hasproperty(p_names, :sre)
-                # This is a simplification; actual update logic is more complex and depends on structure.
+                # This is a simplification; actual update logic is more complex and depends
+                #   on structure.
                 # For pseudo-code, we show a generic addition.
                 if is_multivariate
                     push!(lines, "    $(eta_var_name) .+= $(p_names.sre)[M.s_idx, :]") # Example for spatial/temporal
@@ -4100,16 +3793,36 @@ function model_pseudocode(m::DynamicPPL.Model)
     push!(lines, "\n    # --- Likelihood ---")
     # Construct a more complete bstm_Likelihood call for pseudo-code
     lik_kwargs_parts = String[]
-    if family == "negbin"; push!(lik_kwargs_parts, "r_nb=r_nb"); end
-    if get(config, :user_provided_hurdle, false); push!(lik_kwargs_parts, "phi_hurdle=lik_phi_hurdle"); end
-    if get(config, :use_zi, false); push!(lik_kwargs_parts, "phi_zi=phi_zi"); end
-    if family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]; push!(lik_kwargs_parts, "sigma_y=y_sigma"); end
-    if family == "student_t"; push!(lik_kwargs_parts, "nu=lik_nu_student_t"); end
-    if family in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"]; push!(lik_kwargs_parts, "extra_params=lik_extra_params"); end
-    if get(config, :user_provided_trials, false); push!(lik_kwargs_parts, "trial=M.trials"); end
-    if get(config, :user_provided_weights, false); push!(lik_kwargs_parts, "weight=M.weights"); end
-    if get(config, :user_provided_censor_lower, false); push!(lik_kwargs_parts, "censor_lower=M.censor_lower"); end
-    if get(config, :user_provided_censor_upper, false); push!(lik_kwargs_parts, "censor_upper=M.censor_upper"); end
+    if family == "negbin"
+        push!(lik_kwargs_parts, "r_nb=r_nb")
+    end
+    if get(config, :user_provided_hurdle, false)
+        push!(lik_kwargs_parts, "phi_hurdle=lik_phi_hurdle")
+    end
+    if get(config, :use_zi, false)
+        push!(lik_kwargs_parts, "phi_zi=phi_zi")
+    end
+    if family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
+        push!(lik_kwargs_parts, "sigma_y=y_sigma")
+    end
+    if family == "student_t"
+        push!(lik_kwargs_parts, "nu=lik_nu_student_t")
+    end
+    if family in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"]
+        push!(lik_kwargs_parts, "extra_params=lik_extra_params")
+    end
+    if get(config, :user_provided_trials, false)
+        push!(lik_kwargs_parts, "trial=M.trials")
+    end
+    if get(config, :user_provided_weights, false)
+        push!(lik_kwargs_parts, "weight=M.weights")
+    end
+    if get(config, :user_provided_censor_lower, false)
+        push!(lik_kwargs_parts, "censor_lower=M.censor_lower")
+    end
+    if get(config, :user_provided_censor_upper, false)
+        push!(lik_kwargs_parts, "censor_upper=M.censor_upper")
+    end
 
     lik_kwargs_str = isempty(lik_kwargs_parts) ? "" : "; $(join(lik_kwargs_parts, ", "))"
 
@@ -4129,7 +3842,8 @@ end
 
 Generates a B-spline basis matrix. This version is CPU-only.
 """
-function bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int; knot_method::Symbol=:quantile, custom_knots::Union{AbstractVector, Nothing}=nothing)
+function bstm_bspline_basis(x::AbstractVector, n_basis::Int, degree::Int;
+    knot_method::Symbol=:quantile, custom_knots::Union{AbstractVector, Nothing}=nothing)
     p = degree
     if n_basis <= p
         error("Number of basis functions (nbins) must be greater than the spline degree. Got n_basis=$n_basis, degree=$p.")
@@ -4198,11 +3912,13 @@ end
 
 
 """
-    bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, degrees_per_dim::Vector{Int}; ...)
+    bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int},
+      degrees_per_dim::Vector{Int}; ...)
 
 Generates a tensor product B-spline basis matrix. This version is CPU-only.
 """
-function bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, degrees_per_dim::Vector{Int}; knot_method::Symbol=:quantile, kwargs...)
+function bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int},
+    degrees_per_dim::Vector{Int}; knot_method::Symbol=:quantile, kwargs...)
     n_dims = size(coords, 2)
     if length(nbins_per_dim) != n_dims || length(degrees_per_dim) != n_dims
         error("Number of dimensions in coords must match length of nbins_per_dim and degrees_per_dim.")
@@ -4216,7 +3932,8 @@ function bstm_tensor_product_basis(coords::AbstractMatrix, nbins_per_dim::Vector
     basis_matrices_1D = Vector{AbstractMatrix{Float64}}(undef, n_dims)
     for i in 1:n_dims
         local_bspline_kwargs = copy(bspline_kwargs)
-        if haskey(local_bspline_kwargs, :custom_knots) && local_bspline_kwargs[:custom_knots] isa Tuple
+        if haskey(local_bspline_kwargs,
+            :custom_knots) && local_bspline_kwargs[:custom_knots] isa Tuple
             local_bspline_kwargs[:custom_knots] = local_bspline_kwargs[:custom_knots][i]
         end
         
@@ -4259,14 +3976,17 @@ end
 
 Generates a 1D wavelet basis matrix. This version is CPU-only.
 """
-function bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol, lengthscale::Float64)
+function bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol,
+    lengthscale::Float64)
     Interpolations = Base.require(Base.Main, :Interpolations)
 
     n_obs = length(vals)
     B = Matrix{Float64}(undef, n_obs, nbins); fill!(B, 0.0)
     v_min, v_max = minimum(vals), maximum(vals)
     v_range = v_max - v_min
-    if v_range < 1e-9; v_range = 1.0; end
+    if v_range < 1e-9
+        v_range = 1.0
+    end
 
     local wt_type
     try
@@ -4291,9 +4011,11 @@ function bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol,
     end
 
     n_reconstruction_iterations = 8
-    x_psi_grid, psi_vals = _reconstruct_wavelet_function_from_filters(h_filter, g_filter, n_reconstruction_iterations)
+    x_psi_grid, psi_vals = _reconstruct_wavelet_function_from_filters(h_filter, g_filter,
+        n_reconstruction_iterations)
 
-    itp = Interpolations.linear_interpolation(x_psi_grid, psi_vals, extrapolation_bc=Interpolations.Flat())
+    itp = Interpolations.linear_interpolation(x_psi_grid, psi_vals,
+        extrapolation_bc=Interpolations.Flat())
 
     n_scales = max(1, floor(Int, log2(nbins/4)))
     bins_per_scale = div(nbins, n_scales)
@@ -4303,13 +4025,17 @@ function bstm_wavelet_basis_1D(vals::AbstractVector, nbins::Int, family::Symbol,
         scale_factor = lengthscale * (2.0^(j-1))
         
         n_translations = (j == n_scales) ? (nbins - current_bin + 1) : bins_per_scale
-        if n_translations <= 0; continue; end
+        if n_translations <= 0
+            continue
+        end
 
         probs = n_translations == 1 ? [0.5] : range(0, 1, length=n_translations)
         centers = quantile(vals, probs)
         
         for k in 1:n_translations
-            if current_bin > nbins; break; end
+            if current_bin > nbins
+                break
+            end
             
             transformed_vals = (vals .- centers[k]) ./ (scale_factor * v_range)
             B[:, current_bin] = itp.(transformed_vals)
@@ -4323,20 +4049,14 @@ end
 
 
 """
-    _reconstruct_wavelet_function_from_filters(h::Vector{Float64}, g::Vector{Float64}, n_iterations::Int)
+    _reconstruct_wavelet_function_from_filters(h::Vector{Float64}, g::Vector{Float64},
+      n_iterations::Int)
 
-Reconstructs the mother wavelet function from its quadrature mirror filters using the cascade algorithm.
+Reconstructs the mother wavelet function from its quadrature mirror filters using the
+  cascade algorithm.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function is a core utility for the `Wavelet` component. While the `Wavelets.jl`
-package provides the filter coefficients for various wavelet families, it does not
-offer a direct method to evaluate the mother wavelet function \$\\psi(t)\$ on an
-arbitrary grid. This function implements the cascade algorithm (also known as the
-refining algorithm or pyramid algorithm) to numerically approximate \$\\psi(t)\$ from
-the low-pass (`h`) and high-pass (`g`) filters.
+v1.0.0
 
 # Mathematical Formulation
 The algorithm starts with the scaling function \$\\phi_0(t)\$ as a box function
@@ -4356,7 +4076,8 @@ After `n_iterations`, the function returns the final approximation of \$\\psi(t)
 - A tuple `(x_grid_final, psi_next_vals)` where `x_grid_final` is the coordinate
   grid and `psi_next_vals` are the corresponding values of the wavelet function.
 """
-function _reconstruct_wavelet_function_from_filters(h::Vector{Float64}, g::Vector{Float64}, n_iterations::Int)
+function _reconstruct_wavelet_function_from_filters(h::Vector{Float64}, g::Vector{Float64},
+    n_iterations::Int)
     # Dynamically load Interpolations to ensure it's available in the execution scope.
     Interpolations = Base.require(Base.Main, :Interpolations)
 
@@ -4371,11 +4092,14 @@ function _reconstruct_wavelet_function_from_filters(h::Vector{Float64}, g::Vecto
     # Initialize the scaling function phi_0 as a box function.
     phi_current_vals = zeros(length(x_grid_final))
     for i in eachindex(x_grid_final)
-        if 0.0 <= x_grid_final[i] < 1.0; phi_current_vals[i] = 1.0; end
+        if 0.0 <= x_grid_final[i] < 1.0
+            phi_current_vals[i] = 1.0
+        end
     end
     
     # Create an interpolant for the current scaling function.
-    phi_itp = Interpolations.linear_interpolation(x_grid_final, phi_current_vals, extrapolation_bc=Interpolations.Flat())
+    phi_itp = Interpolations.linear_interpolation(x_grid_final, phi_current_vals,
+        extrapolation_bc=Interpolations.Flat())
 
     psi_next_vals = zeros(length(x_grid_final))
 
@@ -4397,7 +4121,8 @@ function _reconstruct_wavelet_function_from_filters(h::Vector{Float64}, g::Vecto
             psi_next_vals[idx] = sqrt(2.0) * psi_sum
         end
         # Update the interpolant for the next iteration.
-        phi_itp = Interpolations.linear_interpolation(x_grid_final, phi_next_vals, extrapolation_bc=Interpolations.Flat())
+        phi_itp = Interpolations.linear_interpolation(x_grid_final, phi_next_vals,
+            extrapolation_bc=Interpolations.Flat())
     end
     
     return x_grid_final, psi_next_vals
@@ -4406,19 +4131,13 @@ end
  
 
 """
-    bstm_tensor_product_wavelet_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, family::Symbol, lengthscale::Union{Real, AbstractVector})
+    bstm_tensor_product_wavelet_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int},
+      family::Symbol, lengthscale::Union{Real, AbstractVector})
 
 Generates a multi-dimensional wavelet basis matrix via a tensor product of 1D bases.
 
 # Version
-v1.0.1 (2026-08-13)
-
-# Rationale
-This function provides a method for constructing high-dimensional basis functions
-from their 1D counterparts. The tensor product is a standard mathematical operation
-for achieving this. The implementation is correct and consistent with the refactor,
-efficiently using broadcasting and reshaping to compute the product. This version
-adds comprehensive documentation to clarify its purpose and usage.
+v1.0.0
 
 # Mathematical Formulation
 Given 1D basis matrices \$B_1, B_2, \\dots, B_D\$, the tensor product basis \$B\$ is
@@ -4428,28 +4147,37 @@ the rows of the 1D basis matrices.
 
 # Arguments
 - `coords::AbstractMatrix`: An `N x D` matrix of data points.
-- `nbins_per_dim::Vector{Int}`: A vector specifying the number of basis functions for each dimension.
+- `nbins_per_dim::Vector{Int}`: A vector specifying the number of basis functions for each
+  dimension.
 - `family::Symbol`: The wavelet family to use for the 1D bases.
 - `lengthscale::Union{Real, AbstractVector}`: The lengthscale(s) for the wavelets.
 
 # Returns
 - A basis matrix of size `(N, prod(nbins_per_dim))`.
 """
-function bstm_tensor_product_wavelet_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int}, family::Symbol, lengthscale::Union{Real, AbstractVector})
+function bstm_tensor_product_wavelet_basis(coords::AbstractMatrix, nbins_per_dim::Vector{Int},
+    family::Symbol, lengthscale::Union{Real, AbstractVector})
     n_dims = size(coords, 2)
-    if length(nbins_per_dim) != n_dims; error("Length of `nbins_per_dim` must match coordinate dimensions."); end
+    if length(nbins_per_dim) != n_dims
+        error("Length of `nbins_per_dim` must match coordinate dimensions.")
+    end
     
     ls_vec = if lengthscale isa Real
         fill(Float64(lengthscale), n_dims)
     else
-        if length(lengthscale) != n_dims; error("Length of lengthscale vector must match coordinate dimensions."); end
+        if length(lengthscale) != n_dims
+            error("Length of lengthscale vector must match coordinate dimensions.")
+        end
         lengthscale
     end
 
     # Generate a 1D wavelet basis matrix for each dimension.
-    basis_matrices_1D = [bstm_wavelet_basis_1D(coords[:, i], nbins_per_dim[i], family, ls_vec[i]) for i in 1:n_dims]
+    basis_matrices_1D = [bstm_wavelet_basis_1D(coords[:, i], nbins_per_dim[i], family,
+        ls_vec[i]) for i in 1:n_dims]
     
-    if isempty(basis_matrices_1D); return zeros(size(coords, 1), 0); end
+    if isempty(basis_matrices_1D)
+        return zeros(size(coords, 1), 0)
+    end
 
     # Initialize the final basis with the matrix from the first dimension.
     B_final = basis_matrices_1D[1]
@@ -4508,7 +4236,8 @@ function bstm_smooth_basis_1D(
     end
 
     if type in ["pspline", "bspline"]
-        return bstm_bspline_basis(vals, nbins, degree; knot_method=knot_method, custom_knots=custom_knots)
+        return bstm_bspline_basis(vals, nbins, degree; knot_method=knot_method,
+            custom_knots=custom_knots)
     end
 
     B_out = Matrix{Float64}(undef, n_obs, nbins); fill!(B_out, 0.0)
@@ -4618,17 +4347,21 @@ function bstm_smooth_basis_2D(
         B = bstm_barycentric_basis_2D(coords, knot_points)
     elseif type in ["pspline", "bspline"]
         degree_val = get(kwargs, :degree, 3)
-        B = bstm_tensor_product_basis(coords, [n_marginal_x, n_marginal_y], [degree_val, degree_val]; knot_method=knot_method, kwargs...)
+        B = bstm_tensor_product_basis(coords, [n_marginal_x, n_marginal_y], [degree_val,
+            degree_val]; knot_method=knot_method, kwargs...)
     elseif type == "wavelet"
         family = get(kwargs, :family, :db4)
         lengthscale = get(kwargs, :lengthscale, 0.1)
-        B = bstm_tensor_product_wavelet_basis(coords, [n_marginal_x, n_marginal_y], family, lengthscale)
+        B = bstm_tensor_product_wavelet_basis(coords, [n_marginal_x, n_marginal_y], family,
+            lengthscale)
     elseif type in ["smooth", "linear"]
         hx = (c_max[1] - c_min[1]) / (n_marginal_x > 1 ? (n_marginal_x - 1) : 1.0); hx = hx > 0 ? hx : 1.0
         hy = (c_max[2] - c_min[2]) / (n_marginal_y > 1 ? (n_marginal_y - 1) : 1.0); hy = hy > 0 ? hy : 1.0
         idx = 1
         for j in 1:n_marginal_y, i in 1:n_marginal_x
-            if idx > total_bins; break; end
+            if idx > total_bins
+                break
+            end
             b_x = max.(0.0, 1.0 .- abs.(coords[:, 1] .- kx[i]) ./ hx)
             b_y = max.(0.0, 1.0 .- abs.(coords[:, 2] .- ky[j]) ./ hy)
             B[:, idx] .= b_x .* b_y
@@ -4706,11 +4439,13 @@ function bstm_smooth_basis_3D(
 
     if type in ["pspline", "bspline"]
         degree_val = get(kwargs, :degree, 3)
-        B = bstm_tensor_product_basis(coords, [n_marginal_x, n_marginal_y, n_marginal_z], fill(degree_val, 3); knot_method=knot_method, kwargs...)
+        B = bstm_tensor_product_basis(coords, [n_marginal_x, n_marginal_y, n_marginal_z],
+            fill(degree_val, 3); knot_method=knot_method, kwargs...)
     elseif type == "wavelet"
         family = get(kwargs, :family, :db4)
         lengthscale = get(kwargs, :lengthscale, 0.1)
-        B = bstm_tensor_product_wavelet_basis(coords, [n_marginal_x, n_marginal_y, n_marginal_z], family, lengthscale)
+        B = bstm_tensor_product_wavelet_basis(coords, [n_marginal_x, n_marginal_y,
+            n_marginal_z], family, lengthscale)
     elseif type in ["smooth", "barycentric", "linear"]
         hx = (c_max[1] - c_min[1]) / (n_marginal_x > 1 ? (n_marginal_x - 1) : 1.0); hx = hx > 0 ? hx : 1.0
         hy = (c_max[2] - c_min[2]) / (n_marginal_y > 1 ? (n_marginal_y - 1) : 1.0); hy = hy > 0 ? hy : 1.0
@@ -4718,7 +4453,9 @@ function bstm_smooth_basis_3D(
 
         idx = 1
         for k_idx in 1:n_marginal_z, j_idx in 1:n_marginal_y, i_idx in 1:n_marginal_x
-            if idx > total_bins; break; end
+            if idx > total_bins
+                break
+            end
             b_x = max.(0.0, 1.0 .- abs.(coords[:, 1] .- kx[i_idx]) ./ hx)
             b_y = max.(0.0, 1.0 .- abs.(coords[:, 2] .- ky[j_idx]) ./ hy)
             b_z = max.(0.0, 1.0 .- abs.(coords[:, 3] .- kz[k_idx]) ./ hz)
@@ -4790,11 +4527,13 @@ function bstm_smooth_basis_4D(
 
     if type in ["pspline", "bspline"]
         degree_val = get(kwargs, :degree, 3)
-        B = bstm_tensor_product_basis(coords, [n_marginal_1, n_marginal_2, n_marginal_3, n_marginal_4], fill(degree_val, 4); knot_method=knot_method, kwargs...)
+        B = bstm_tensor_product_basis(coords, [n_marginal_1, n_marginal_2, n_marginal_3,
+            n_marginal_4], fill(degree_val, 4); knot_method=knot_method, kwargs...)
     elseif type == "wavelet"
         family = get(kwargs, :family, :db4)
         lengthscale = get(kwargs, :lengthscale, 0.1)
-        B = bstm_tensor_product_wavelet_basis(coords, [n_marginal_1, n_marginal_2, n_marginal_3, n_marginal_4], family, lengthscale)
+        B = bstm_tensor_product_wavelet_basis(coords, [n_marginal_1, n_marginal_2,
+            n_marginal_3, n_marginal_4], family, lengthscale)
     elseif type in ["smooth", "linear", "barycentric"]
         hx1 = (c_max[1] - c_min[1]) / (n_marginal_1 > 1 ? (n_marginal_1 - 1) : 1.0); hx1 = hx1 > 0 ? hx1 : 1.0
         hx2 = (c_max[2] - c_min[2]) / (n_marginal_2 > 1 ? (n_marginal_2 - 1) : 1.0); hx2 = hx2 > 0 ? hx2 : 1.0
@@ -4803,7 +4542,9 @@ function bstm_smooth_basis_4D(
 
         idx = 1
         for l_idx in 1:n_marginal_4, k_idx in 1:n_marginal_3, j_idx in 1:n_marginal_2, i_idx in 1:n_marginal_1
-            if idx > total_bins; break; end
+            if idx > total_bins
+                break
+            end
             b1 = max.(0.0, 1.0 .- abs.(coords[:, 1] .- k1[i_idx]) ./ hx1)
             b2 = max.(0.0, 1.0 .- abs.(coords[:, 2] .- k2[j_idx]) ./ hx2)
             b3 = max.(0.0, 1.0 .- abs.(coords[:, 3] .- k3[k_idx]) ./ hx3)
@@ -4825,19 +4566,13 @@ end
 
 
 """
-    evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol, noise::Real; wavelet_levels=3)
+    evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Union{Real,
+      AbstractVector}, kernel_type::Symbol, noise::Real; wavelet_levels=3)
 
 Computes the covariance kernel matrix for a given set of coordinates.
 
 # Version
-v1.5.7 (2026-08-13)
-
-# Rationale
-This function is a core utility for all GP-based components. It acts as a factory
-to generate dense covariance matrices for various kernel functions. This version is
-updated to include the `:exponential` (or `:matern12`) kernel and fixes a bug in
-the `:wavelet` kernel's handling of anisotropic lengthscales. The documentation has
-been expanded to include mathematical formulations for clarity.
+v1.0.0
 
 # Arguments
 - `coords::AbstractMatrix`: An `N x D` matrix of data points, where `N` is the
@@ -4871,7 +4606,8 @@ been expanded to include mathematical formulations for clarity.
  
 Computes the covariance kernel matrix for a given set of coordinates 
 """
-function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Union{Real, AbstractVector}, kernel_type::Symbol, noise::Real; wavelet_levels=3)
+function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Union{Real,
+    AbstractVector}, kernel_type::Symbol, noise::Real; wavelet_levels=3)
     T = promote_type(eltype(coords), typeof(param_val), eltype(ls), typeof(noise))
     coords_T = convert(AbstractMatrix{T}, coords)
     ls_T = convert(typeof(ls) <: Real ? T : AbstractVector{T}, ls)
@@ -4898,28 +4634,29 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
     dist_sq .= max.(zero(T), dist_sq)
 
     if kernel_type == :gaussian || kernel_type == :se || kernel_type == :rbf
-        return param_val^2 .* exp.(-one(T)/2 .* dist_sq) .+ (noise * I)
+        return (param_val^2 .* exp.(-one(T)/2 .* dist_sq)) + (noise * I)
     
     elseif kernel_type == :exponential || kernel_type == :matern12
         d = sqrt.(dist_sq)
-        return param_val^2 .* exp.(-d) .+ (noise * I)
+        return (param_val^2 .* exp.(-d)) + (noise * I)
     
     elseif kernel_type == :matern32
         d = sqrt.(dist_sq)
         val = sqrt(convert(T, 3.0)) .* d
-        return param_val^2 .* (one(T) .+ val) .* exp.(-val) .+ (noise * I)
+        return (param_val^2 .* (one(T) .+ val) .* exp.(-val)) + (noise * I)
     
     elseif kernel_type == :matern52
         d = sqrt.(dist_sq)
         val = sqrt(convert(T, 5.0)) .* d
-        return param_val^2 .* (one(T) .+ val .+ (val.^2 ./ convert(T, 3.0))) .* exp.(-val) .+ (noise * I)
+        return (param_val^2 .* (one(T) .+ val .+ (val.^2 ./ convert(T,
+            3.0))) .* exp.(-val)) + (noise * I)
 
     elseif kernel_type == :spherical
         d = sqrt.(dist_sq)
         K = zeros(T, size(d))
         mask = d .< one(T)
         K[mask] = param_val^2 .* (one(T) .- 1.5 .* d[mask] .+ 0.5 .* d[mask].^3)
-        return K .+ (noise * I)
+        return K + (noise * I)
 
     elseif kernel_type == :cosine
         if ls isa AbstractVector
@@ -4927,10 +4664,10 @@ function evaluate_kernel_matrix(coords::AbstractMatrix, param_val::Real, ls::Uni
             ls_T = ls_T[1]
         end
         d_euclidean = sqrt.(_sqeuclidean_broadcast(coords_T))
-        return param_val^2 .* cos.(2.0 * pi .* d_euclidean ./ ls_T) .+ (noise * I)
+        return (param_val^2 .* cos.(2.0 * pi .* d_euclidean ./ ls_T)) + (noise * I)
 
     elseif kernel_type == :constant
-        return fill(convert(T, param_val^2), size(dist_sq)) .+ (noise * I)
+        return fill(convert(T, param_val^2), size(dist_sq)) + (noise * I)
 
     elseif kernel_type == :wavelet
         local_ls = ls isa Real ? ls_T : ls_T[1]
@@ -4960,7 +4697,8 @@ end
 Constructs a final precision matrix from a template and sampled hyperparameters.
 This version is CPU-only.
 """
-function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_val::Real; extra_param=nothing, noise=1e-4, kwargs...)
+function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_val::Real;
+    extra_param=nothing, noise=1e-4, kwargs...)
     n_s = size(template_s, 1)
     T_num = promote_type(typeof(param_val), typeof(noise), eltype(template_s), typeof(extra_param))
 
@@ -4969,7 +4707,9 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
         Q_kappa = if kappa isa Real
             kappa^2 * I
         else
-            if length(kappa) != n_s; error("Anisotropic kappa vector length must match number of spatial units."); end
+            if length(kappa) != n_s
+                error("Anisotropic kappa vector length must match number of spatial units.")
+            end
             Diagonal(kappa.^2)
         end
         L_spde = Q_kappa + template_s
@@ -5046,26 +4786,6 @@ end
 Converts a `Distribution` object into a type-stable string representation of its
 constructor call, suitable for dynamic code generation within a Turing `@model`.
 
-# Rationale
-This function is a core utility for the `bstm` code generation engine. It ensures
-that prior distributions defined as Julia objects can be correctly translated into
-AD-compatible code.
-
-Key features of this implementation:
-1.  **AD Compatibility**: It generates constructor strings like `Normal{T}(...)`, where
-    `T` is the generic numeric type used by the Turing model. This allows the model
-    to work seamlessly with automatic differentiation libraries like `ForwardDiff.jl`.
-2.  **Robustness**: It uses accessor functions (`meanlog`, `stdlog`, `shape`, `scale`)
-    where possible, making the code less dependent on the internal structure of
-    `Distribution` objects.
-3.  **Completeness**: It handles a wide range of univariate and multivariate
-    distributions, as well as wrapper types like `Truncated`, `Product`, and `Fill`.
-4.  **Efficiency**: For `Product` distributions containing identical inner distributions,
-    it generates a more efficient `filldist` call.
-
-# Version
-v1.1.0 (2026-08-13)
-
 # Arguments
 - `d::Distribution`: The distribution object to convert.
 
@@ -5136,52 +4856,300 @@ function _distribution_to_string(d::Distribution)
 end
 
 """
+    _compute_block_init_epsilon(dim::Int, key::Union{Symbol, String, Nothing}, init_ϵ,
+      min_ϵ::Real, max_ϵ::Real)::Float64
+
+Calculates or retrieves a well-conditioned initial proposal step size (ϵ) for an HMC/NUTS
+  parameter block of dimension `dim`.
+Uses optimal Roberts & Rosenthal (2001) dimensional scaling ϵ ~ O(dim^(-1/4)) clamped within
+  [min_ϵ, max_ϵ].
+"""
+function _compute_block_init_epsilon(
+    dim::Int,
+    key::Union{Symbol, String, Nothing},
+    init_ϵ::Union{Real, Dict, Symbol, Nothing},
+    min_ϵ::Real,
+    max_ϵ::Real
+)::Float64
+    if init_ϵ === 0.0 || init_ϵ === :turing
+        return 0.0 # Tells Turing to run default unconstrained search
+    elseif init_ϵ isa Real
+        return Float64(clamp(init_ϵ, min_ϵ, max_ϵ))
+    elseif init_ϵ isa Dict
+        k_sym = !isnothing(key) ? Symbol(key) : :default
+        if haskey(init_ϵ, k_sym)
+            val = init_ϵ[k_sym]
+            return val == 0.0 ? 0.0 : Float64(clamp(val, min_ϵ, max_ϵ))
+        elseif haskey(init_ϵ, :default)
+            val = init_ϵ[:default]
+            return val == 0.0 ? 0.0 : Float64(clamp(val, min_ϵ, max_ϵ))
+        end
+    end
+
+    # Default :auto / precomputed proposal heuristic:
+    # 0.2 * dim^(-1/4), clamped to [min_ϵ, min(max_ϵ, 0.25)]
+    # Prevents large initial leapfrog overshoots on low-dimensional GLM blocks (intercept/slopes)
+    scale_factor = 0.2 * (max(dim, 1)^(-0.25))
+    effective_max = min(max_ϵ, 0.25)
+    return Float64(clamp(scale_factor, min_ϵ, effective_max))
+end
+
+"""
+    _compute_block_max_depth(key::Union{Symbol, String, Nothing}, max_depth::Union{Int,
+      Dict, Symbol, Nothing}, hyper=nothing)::Int
+
+Determines maximum tree depth for NUTS trajectory doubling in block `key`.
+If hyper contains spectral Laplacian eigenvalues (hyper.L), uses theoretical condition
+  number bound L* = ceil(log2(π * sqrt(κ))).
+"""
+function _compute_block_max_depth(
+    key::Union{Symbol, String, Nothing},
+    max_depth::Union{Int, Dict, Symbol, Nothing},
+    hyper::Union{NamedTuple, Dict, Nothing}=nothing
+)::Int
+    if max_depth isa Int
+        return max(1, max_depth)
+    elseif max_depth isa Dict
+        k_sym = !isnothing(key) ? Symbol(key) : :default
+        if haskey(max_depth, k_sym)
+            val = max_depth[k_sym]
+            return val isa Int ? max(1, val) : 10
+        elseif haskey(max_depth, :default)
+            val = max_depth[:default]
+            return val isa Int ? max(1, val) : 10
+        end
+    end
+
+    # Automatic spectral condition number estimation:
+    # L_steps ≈ π * sqrt(κ), where κ = λ_max / λ_min
+    if !isnothing(hyper) && hasproperty(hyper, :L)
+        L_eig = hyper.L
+        pos_L = filter(x -> x > 1e-6, L_eig)
+        if length(pos_L) >= 2
+            kappa = maximum(pos_L) / minimum(pos_L)
+            theoretical_depth = ceil(Int, log2(pi * sqrt(kappa)))
+            return clamp(theoretical_depth, 4, 10)
+        end
+    end
+
+    return 10
+end
+
+"""
+    _compute_block_target_acceptance(key::Union{Symbol, String, Nothing}, target_acceptance,
+      hyper=nothing)::Float64
+
+Determines optimal target acceptance rate (δ) for HMC/NUTS block `key`.
+Uses δ = 0.65 for isotropic/well-conditioned blocks and δ = 0.80 - 0.90 for high condition
+  number GMRF/hierarchical manifolds.
+"""
+function _compute_block_target_acceptance(
+    key::Union{Symbol, String, Nothing},
+    target_acceptance::Union{Real, Dict, Symbol, Nothing},
+    hyper::Union{NamedTuple, Dict, Nothing}=nothing
+)::Float64
+    if target_acceptance isa Real
+        return Float64(clamp(target_acceptance, 0.5, 0.99))
+    elseif target_acceptance isa Dict
+        k_sym = !isnothing(key) ? Symbol(key) : :default
+        if haskey(target_acceptance, k_sym)
+            return Float64(clamp(target_acceptance[k_sym], 0.5, 0.99))
+        elseif haskey(target_acceptance, :default)
+            return Float64(clamp(target_acceptance[:default], 0.5, 0.99))
+        end
+    end
+
+    # Condition number adaptation:
+    if !isnothing(hyper) && hasproperty(hyper, :L)
+        L_eig = hyper.L
+        pos_L = filter(x -> x > 1e-6, L_eig)
+        if length(pos_L) >= 2
+            kappa = maximum(pos_L) / minimum(pos_L)
+            return kappa > 1000.0 ? 0.90 : (kappa > 100.0 ? 0.80 : 0.65)
+        end
+    end
+
+    return 0.80
+end
+
+"""
+    _compute_block_adaptation_steps(key, adaptation_steps, dim, hyper=nothing,
+      n_samples=nothing; use_dense_metric=false)::Int
+
+Calculates the mathematically principled number of warmup/adaptation steps for an MCMC block.
+Accounts for:
+1. Metric estimation dimension: Diagonal metric requires O(sqrt(D)) variance exploration;
+  Dense metric requires O(D) covariance samples.
+2. Dual averaging convergence: Step-size dual averaging requires ~150-300 iterations to
+  stabilize within ±5% error.
+3. Condition number (κ): High condition numbers (> 1000) require extended settling.
+4. Total sample ceiling (if n_samples provided).
+"""
+function _compute_block_adaptation_steps(
+    key::Union{Symbol, String, Nothing},
+    adaptation_steps::Union{Int, Dict, Symbol, Nothing},
+    dim::Int,
+    hyper::Union{NamedTuple, Dict, Nothing}=nothing,
+    n_samples::Union{Int, Nothing}=nothing;
+    use_dense_metric::Bool=false
+)::Int
+    if adaptation_steps isa Int
+        return max(5, adaptation_steps)
+    elseif adaptation_steps isa Dict
+        k_sym = !isnothing(key) ? Symbol(key) : :default
+        if haskey(adaptation_steps, k_sym)
+            val = adaptation_steps[k_sym]
+            return val isa Int ? max(5, val) : 300
+        elseif haskey(adaptation_steps, :default)
+            val = adaptation_steps[:default]
+            return val isa Int ? max(5, val) : 300
+        end
+    end
+
+    # Automatic principled calculation:
+    base_steps = if use_dense_metric && dim > 1
+        150 + 4 * dim
+    else
+        150 + ceil(Int, 25.0 * sqrt(max(1, dim)))
+    end
+
+    if !isnothing(hyper) && hasproperty(hyper, :L)
+        L_eig = hyper.L
+        pos_L = filter(x -> x > 1e-6, L_eig)
+        if length(pos_L) >= 2
+            kappa = maximum(pos_L) / minimum(pos_L)
+            if kappa > 1000.0
+                base_steps = ceil(Int, base_steps * 1.3)
+            end
+        end
+    end
+
+    calculated = clamp(base_steps, 100, 1000)
+
+    if !isnothing(n_samples) && n_samples > 0
+        if n_samples <= 200
+            return max(5, min(calculated, ceil(Int, 0.5 * n_samples)))
+        else
+            return min(calculated, ceil(Int, 0.5 * n_samples))
+        end
+    end
+
+    return calculated
+end
+
+"""
+    precompute_step_sizes(model_obj::DynamicPPL.Model; min_ϵ::Real=1e-4, max_ϵ::Real=1.0,
+      max_depth=10, target_acceptance=0.8, adaptation_steps=:auto, init_ϵ=:auto,
+      n_samples=nothing)
+
+Pre-computes and summarizes the initial proposal step sizes (ϵ), maximum tree depths,
+  recommended target acceptance rates,
+and principled adaptation steps for all parameter blocks in a model based on dimensional
+  curvature scaling and spectral condition numbers.
+Returns a Dictionary of block configurations.
+"""
+function precompute_step_sizes(
+    model_obj::DynamicPPL.Model;
+    min_ϵ::Real=1e-4,
+    max_ϵ::Real=1.0,
+    max_depth::Union{Int, Dict{Symbol, Int}, Symbol, Nothing}=10,
+    target_acceptance::Union{Real, Dict{Symbol, <:Real}, Symbol, Nothing}=0.8,
+    adaptation_steps::Union{Int, Dict{Symbol, Int}, Symbol, Nothing}=:auto,
+    init_ϵ::Union{Real, Dict{Symbol, <:Real}, Symbol, Nothing}=:auto,
+    n_samples::Union{Int, Nothing}=nothing
+)
+    vi = DynamicPPL.VarInfo(model_obj)
+    vns = keys(vi)
+    
+    result = Dict{Symbol, NamedTuple{(:dim, :init_ϵ, :max_depth, :target_acceptance,
+        :adaptation_steps, :condition_number, :variables), Tuple{Int, Float64, Int, Float64,
+        Int, Float64, Vector{Symbol}}}}()
+    
+    # Check components
+    if hasproperty(model_obj.args, :M) && hasproperty(model_obj.args.M, :components)
+        processed = Set{VarName}()
+        for spec in model_obj.args.M.components
+            k_sym = Symbol(spec.key)
+            k_str = string(spec.key)
+            comp_vns = filter(vn -> occursin(Regex("_$(k_str)(_\\d+)?\$"), string(vn))||
+                startswith(string(vn), "$(k_str)_"), vns)
+            if !isempty(comp_vns)
+                dim = length(comp_vns)
+                comp_hyper = hasproperty(spec, :hyper) ? spec.hyper : nothing
+                kappa_val = 1.0
+                if !isnothing(comp_hyper) && hasproperty(comp_hyper, :L)
+                    pos_L = filter(x -> x > 1e-6, comp_hyper.L)
+                    if length(pos_L) >= 2
+                        kappa_val = Float64(maximum(pos_L) / minimum(pos_L))
+                    end
+                end
+
+                eps_val = _compute_block_init_epsilon(dim, k_sym, init_ϵ, min_ϵ, max_ϵ)
+                depth_val = _compute_block_max_depth(k_sym, max_depth, comp_hyper)
+                acc_val = _compute_block_target_acceptance(k_sym, target_acceptance, comp_hyper)
+                adapt_val = _compute_block_adaptation_steps(k_sym, adaptation_steps, dim,
+                    comp_hyper, n_samples)
+
+                result[k_sym] = (
+                    dim = dim,
+                    init_ϵ = eps_val,
+                    max_depth = depth_val,
+                    target_acceptance = acc_val,
+                    adaptation_steps = adapt_val,
+                    condition_number = kappa_val,
+                    variables = [_get_varname_symbol(v) for v in comp_vns]
+                )
+                union!(processed, comp_vns)
+            end
+        end
+        remaining = setdiff(vns, processed)
+        if !isempty(remaining)
+            dim = length(remaining)
+            eps_val = _compute_block_init_epsilon(dim, :remaining, init_ϵ, min_ϵ, max_ϵ)
+            depth_val = _compute_block_max_depth(:remaining, max_depth, nothing)
+            acc_val = _compute_block_target_acceptance(:remaining, target_acceptance, nothing)
+            adapt_val = _compute_block_adaptation_steps(:remaining, adaptation_steps, dim,
+                nothing, n_samples)
+            result[:remaining] = (
+                dim = dim,
+                init_ϵ = eps_val,
+                max_depth = depth_val,
+                target_acceptance = acc_val,
+                adaptation_steps = adapt_val,
+                condition_number = 1.0,
+                variables = [_get_varname_symbol(v) for v in remaining]
+            )
+        end
+    else
+        dim = length(vns)
+        eps_val = _compute_block_init_epsilon(dim, :global, init_ϵ, min_ϵ, max_ϵ)
+        depth_val = _compute_block_max_depth(:global, max_depth, nothing)
+        acc_val = _compute_block_target_acceptance(:global, target_acceptance, nothing)
+        adapt_val = _compute_block_adaptation_steps(:global, adaptation_steps, dim, nothing,
+            n_samples)
+        result[:global] = (
+            dim = dim,
+            init_ϵ = eps_val,
+            max_depth = depth_val,
+            target_acceptance = acc_val,
+            adaptation_steps = adapt_val,
+            condition_number = 1.0,
+            variables = [_get_varname_symbol(v) for v in vns]
+        )
+    end
+    
+    return result
+end
+
+"""
     get_optimal_sampler(model_obj::DynamicPPL.Model; ...)
 
 Constructs an efficient composite MCMC sampler for a `bstm` model by assigning
-specialized samplers to different parameter blocks.
+specialized samplers to different parameter blocks with pre-conditioned step-sizes (ϵ),
+principled adaptation lengths, and tree-depth bounds.
 
 # Version
-v1.5.1 (2026-08-20)
-
-# Rationale
-This function is a core utility for the `bstm` inference engine. It replaces a
-simple, one-size-fits-all sampler selection with a sophisticated, multi-stage
-process that builds a composite `Gibbs` sampler tailored to the model's structure.
-
-This version has been rewritten to use the modern, public API of `DynamicPPL.jl`,
-resolving `MethodError` and deprecation warnings from previous versions. The key
-corrections are:
-1.  **Correct Parameter Name Matching**: Uses `_get_varname_symbol(vn)` to match parameter symbols
-    (e.g., in `sampler_map`) and `string(vn)` for string-based matching (e.g., for
-    component grouping).
-2.  **Public API & ParamRegistry for `VarInfo`**: Uses `keys(vi)`, `ParamRegistry` prior descriptors, and safe `vi[vn]` indexing.
-3.  **Robust Type Inference**: Determines parameter support (discrete vs. bounded vs. continuous) via `ParamRegistry` distribution metadata and value type inspection.
-4.  **Generalization**: The logic for categorizing parameters has been made more
-    general and robust across all versions of `DynamicPPL`.
-6.  **Refined AD Backend Selection**: The heuristic for selecting the AD backend
-    (e.g., `AutoForwardDiff` vs. `AutoEnzyme`) is now applied at the block level,
-    allowing for more granular optimization based on the size of each parameter block.
-
-# Workflow
-The function constructs the sampler in a series of stages, with each stage having
-higher precedence than the next:
-1.  **User-Specified Sampler**: If a complete sampler is passed via `sampler_choice`,
-    it is used directly, overriding all other logic.
-2.  **Automatic AD Engine Selection**: If the user has not specified a non-default
-    `adtype`, the function inspects the model's size. For large models (default > 100
-    parameters), it automatically switches the primary AD engine to a more performant
-    one like `ADTypes.AutoEnzyme()`.
-3.  **Manual Sampler Map**: The user can provide a `sampler_map` to assign specific
-    samplers to specific parameter groups.
-4.  **Component Grouping**: If `group_components=true`, the function identifies all
-    parameters belonging to the same model component and assigns them to a joint `NUTS` sampler.
-    For these blocks, a `DenseEuclideanMetric` can be optionally used.
-5.  **Default Categorization**: Any remaining parameters are categorized by their support,
-    inferred from their value type and transform strategy:
-    - **Discrete**: Inferred if the parameter's value is an `Integer`. Assigned to `PG`.
-    - **Bounded Continuous**: Inferred if the parameter's transform is `Exp` or `Logistic`. Assigned to `Slice`.
-    - **Unbounded Continuous**: All other continuous parameters. Assigned to `NUTS`.
+v1.0.0
 
 # Arguments
 - `model_obj::DynamicPPL.Model`: The instantiated Turing model.
@@ -5189,11 +5157,21 @@ higher precedence than the next:
 - `sampler_map`: A `Dict` mapping parameter `Symbol`s to specific samplers.
 - `adtype`: The automatic differentiation backend to use for gradient-based samplers.
 - `group_components`: A `Bool` indicating whether to group component parameters for joint sampling.
-- `use_dense_metric_for_components::Bool`: If `true`, `DenseEuclideanMetric` is used for `NUTS` samplers assigned to component groups. Otherwise, `DiagEuclideanMetric` is used.
-- `adaptation_steps`: The number of adaptation steps for HMC-based samplers.
-- `target_acceptance`: The target acceptance rate for HMC-based samplers.
+- `use_dense_metric_for_components::Bool`: If `true`, `DenseEuclideanMetric` is used for
+  `NUTS` samplers assigned to component groups.
+- `adaptation_steps`: The number of adaptation steps for HMC-based samplers. Defaults to
+  `:auto` (dimension and condition-number scaled).
+- `target_acceptance`: The target acceptance rate for HMC-based samplers (can be `Real` or
+  `Dict{Symbol, <:Real}`).
+- `init_ϵ`: Initial step size for NUTS. Defaults to `:auto` (dimensional scaling). Can also
+  be a `Real`, `Dict{Symbol, <:Real}`, or `0.0` / `:turing` to use Turing's heuristic.
+- `init_epsilon`, `step_size`: Keyword aliases for `init_ϵ`.
+- `max_depth`: Maximum tree depth for NUTS (default `10`). Can be an `Int` or `Dict{Symbol, Int}`.
+- `min_ϵ`: Minimum allowed initial step size (default `1e-4`).
+- `max_ϵ`: Maximum allowed initial step size (default `1.0`).
+- `n_samples`: Total sampling count (used as an optional ceiling for adaptation in short runs).
 - `n_particles`: The number of particles for the `PG` sampler.
-- `n_chains::Int`: The number of chains to be run. This parameter is primarily used by the `sample` function and does not directly affect the construction of the `Gibbs` or `NUTS` samplers themselves.
+- `n_chains::Int`: The number of chains to be run.
 
 # Returns
 - An `AbstractMCMC.AbstractSampler` object.
@@ -5204,26 +5182,34 @@ function get_optimal_sampler(
     sampler_map::Dict{Symbol, <:AbstractMCMC.AbstractSampler}=Dict{Symbol, AbstractMCMC.AbstractSampler}(),
     adtype::ADTypes.AbstractADType=ADTypes.AutoForwardDiff(),
     group_components::Bool=true,
-    use_dense_metric_for_components::Bool=true, # New argument for dense mass matrix
-    adaptation_steps::Int=500,
-    target_acceptance::Float64=0.8,
+    use_dense_metric_for_components::Bool=true,
+    adaptation_steps::Union{Int, Dict{Symbol, Int}, Symbol, Nothing}=:auto,
+    target_acceptance::Union{Real, Dict{Symbol, <:Real}, Symbol, Nothing}=0.8,
+    init_ϵ::Union{Real, Dict{Symbol, <:Real}, Symbol, Nothing}=:auto,
+    init_epsilon::Union{Real, Dict{Symbol, <:Real}, Symbol, Nothing}=nothing,
+    step_size::Union{Real, Dict{Symbol, <:Real}, Symbol, Nothing}=nothing,
+    max_depth::Union{Int, Dict{Symbol, Int}, Symbol, Nothing}=10,
+    min_ϵ::Real=1e-4,
+    max_ϵ::Real=1.0,
+    n_samples::Union{Int, Nothing}=nothing,
     n_particles::Int=20,
-    n_chains::Int=1 # Kept for consistency, but primarily for `sample` call
+    n_chains::Int=1
 )
+    # Resolve step size aliases
+    effective_init_ϵ = !isnothing(step_size) ? step_size : (!isnothing(init_epsilon) ? init_epsilon : init_ϵ)
+
     # --- Stage 0: Handle direct sampler choice ---
-    # If a specific sampler instance is provided, use it directly.
     if sampler_choice isa AbstractMCMC.AbstractSampler
         return sampler_choice
     end
 
     # --- Initialize VarInfo, ParamRegistry, and determine global AD backend ---
-    # Instantiate and populate the VarInfo object to get variable names and types.
     vi = DynamicPPL.VarInfo(model_obj)
     vns = keys(vi)
     num_params = length(vns)
 
-    # Retrieve centralized ParamRegistry if present
-    param_reg = if hasproperty(model_obj.args, :spec_registry) && haskey(model_obj.args.spec_registry, :parameters)
+    param_reg = if hasproperty(model_obj.args,
+        :spec_registry) && haskey(model_obj.args.spec_registry, :parameters)
         model_obj.args.spec_registry[:parameters]
     elseif hasproperty(model_obj.args, :M)
         build_param_registry(model_obj.args.M)
@@ -5231,23 +5217,24 @@ function get_optimal_sampler(
         nothing
     end
 
-    # Determine the global AD backend to use based on model size.
-    # For large models, Enzyme is often more performant.
     adtype_to_use = adtype
     param_threshold = 100
-    if adtype isa ADTypes.AutoForwardDiff && num_params > param_threshold
-        adtype_to_use = ADTypes.AutoEnzyme()
-        @info "Model has > $(param_threshold) parameters. Switching global AD backend to Enzyme for performance."
+    if (adtype isa ADTypes.AutoForwardDiff && num_params > param_threshold)||
+        adtype isa ADTypes.AutoEnzyme
+        if Sys.iswindows()
+            @warn "Enzyme is not working in Windows at the moment. Switching to ReverseDiff backend."
+            adtype_to_use = ADTypes.AutoReverseDiff(compile=false)
+        else
+            adtype_to_use = ADTypes.AutoEnzyme()
+            @info "Model has > $(param_threshold) parameters. Switching global AD backend to Enzyme for reverse-mode performance."
+        end
     end
 
-    # Initialize lists to store sampler assignments and track processed variables.
     sampler_assignments = []
     all_processed_vns = Set{VarName}()
 
     # --- Stage 1: Handle user-provided sampler map (highest precedence) ---
-    # Iterate through the user's sampler map and assign samplers to specified parameters.
     for (param_sym, sampler) in sampler_map
-        # Match VarNames by their symbolic name (_get_varname_symbol(vn)).
         sym_vns = filter(vn -> _get_varname_symbol(vn) == param_sym, vns)
         if !isempty(sym_vns)
             push!(sampler_assignments, Tuple(sym_vns) => sampler)
@@ -5257,14 +5244,13 @@ function get_optimal_sampler(
         end
     end
 
-    if group_components && hasproperty(model_obj.args, :M) && hasproperty(model_obj.args.M, :components)
-        # Get component keys from the model configuration.
+    # --- Stage 2: Group components ---
+    if group_components && hasproperty(model_obj.args, :M) && hasproperty(model_obj.args.M,
+        :components)
         component_keys = string.([spec.key for spec in model_obj.args.M.components])
-        # Sort by length in reverse to prioritize longer, more specific keys (e.g., "spatial_key" before "key").
         sort!(component_keys, by=length, rev=true)
 
         component_groups = Dict{String, Set{VarName}}()
-        # Only consider variables not yet processed by the user's sampler map.
         vns_to_check = setdiff(vns, all_processed_vns)
 
         for vn in vns_to_check
@@ -5272,7 +5258,6 @@ function get_optimal_sampler(
             vn_sym = _get_varname_symbol(vn)
             found_key = nothing
 
-            # Fast lookup via ParamRegistry if present
             if !isnothing(param_reg) && haskey(param_reg.descriptors, vn_sym)
                 desc_key = param_reg.descriptors[vn_sym].component_key
                 if desc_key in [spec.key for spec in model_obj.args.M.components]
@@ -5280,12 +5265,10 @@ function get_optimal_sampler(
                 end
             end
 
-            # Fallback to pattern matching
             if isnothing(found_key)
                 for key in component_keys
-                    # Match if the variable name ends with `_key` or `_key_d` (for indexed parameters).
-                    # Or if it starts with `key_` (for parameters directly named after the component).
-                    if occursin(Regex("_$(key)(_\\d+)?\$"), vn_str) || startswith(vn_str, "$(key)_")
+                    if occursin(Regex("_$(key)(_\\d+)?\$"), vn_str) || startswith(vn_str,
+                        "$(key)_")
                         found_key = key
                         break
                     end
@@ -5301,26 +5284,47 @@ function get_optimal_sampler(
         end
 
         for (key, params_vns) in component_groups
-            # Ensure we don't re-process variables already handled by the user map.
             params_to_process = setdiff(params_vns, all_processed_vns)
-            if isempty(params_to_process); continue; end
+            if isempty(params_to_process)
+                continue
+            end
 
-            # Refined AD backend selection for this specific block.
-            # Use ForwardDiff for very small blocks, otherwise the global AD backend.
-            block_adtype = if length(params_to_process) <= 10
+            dim = length(params_to_process)
+            block_adtype = if dim <= 10
                 ADTypes.AutoForwardDiff()
             else
                 adtype_to_use
             end
 
-            sampler = NUTS(adaptation_steps, target_acceptance; adtype=block_adtype)
+            comp_hyper = nothing
+            if hasproperty(model_obj.args, :M) && hasproperty(model_obj.args.M, :components)
+                for s in model_obj.args.M.components
+                    if string(s.key) == key
+                        comp_hyper = s.hyper
+                        break
+                    end
+                end
+            end
+
+            block_init_ϵ = _compute_block_init_epsilon(dim, key, effective_init_ϵ, min_ϵ, max_ϵ)
+            block_max_depth = _compute_block_max_depth(key, max_depth, comp_hyper)
+            block_target_acc = _compute_block_target_acceptance(key, target_acceptance, comp_hyper)
+            block_adapt = _compute_block_adaptation_steps(key, adaptation_steps, dim,
+                comp_hyper, n_samples; use_dense_metric=use_dense_metric_for_components)
+
+            sampler = if block_init_ϵ > 0.0
+                NUTS(block_adapt, block_target_acc; max_depth=block_max_depth,
+                    init_ϵ=block_init_ϵ, adtype=block_adtype)
+            else
+                NUTS(block_adapt, block_target_acc; max_depth=block_max_depth, adtype=block_adtype)
+            end
+
             push!(sampler_assignments, Tuple(params_to_process) => sampler)
             union!(all_processed_vns, params_to_process)
         end
     end
 
     # --- Stage 3: Assign samplers to remaining parameters based on their support ---
-    # Categorize any remaining parameters (not yet assigned) by their type and support.
     remaining_vns = setdiff(vns, all_processed_vns)
     if !isempty(remaining_vns)
         param_groups = Dict(
@@ -5335,19 +5339,19 @@ function get_optimal_sampler(
                 is_discrete = false
                 is_bounded = false
 
-                # Prior inspection from ParamRegistry if available
                 if !isnothing(param_reg) && haskey(param_reg.descriptors, vn_sym)
                     desc = param_reg.descriptors[vn_sym]
                     if !isnothing(desc.prior)
                         if desc.prior isa Distributions.DiscreteDistribution
                             is_discrete = true
-                        elseif desc.prior isa Distributions.Truncated || desc.prior isa Distributions.Beta || desc.prior isa Distributions.Uniform
+                        elseif desc.prior isa Distributions.Truncated||
+                            desc.prior isa Distributions.Beta||
+                            desc.prior isa Distributions.Uniform
                             is_bounded = true
                         end
                     end
                 end
 
-                # Check for discrete parameter via VarInfo values
                 if !is_discrete
                     val = try
                         vi[vn]
@@ -5358,7 +5362,8 @@ function get_optimal_sampler(
                             nothing
                         end
                     end
-                    if !isnothing(val) && (val isa Integer || (val isa AbstractArray && eltype(val) <: Integer))
+                    if !isnothing(val) && (val isa Integer || (val isa AbstractArray&&
+                        eltype(val) <: Integer))
                         is_discrete = true
                     end
                 end
@@ -5368,8 +5373,9 @@ function get_optimal_sampler(
                     continue
                 end
 
-                # Check for bounded parameter via transform_strategy in VarInfo if present
-                if !is_bounded && hasproperty(vi, :transform_strategy) && (vi.transform_strategy isa AbstractDict) && haskey(vi.transform_strategy, vn)
+                if !is_bounded && hasproperty(vi, :transform_strategy)&&
+                    (vi.transform_strategy isa AbstractDict)&&
+                    haskey(vi.transform_strategy, vn)
                     transform = vi.transform_strategy[vn]
                     if transform isa Bijectors.Exp || transform isa Bijectors.Logistic
                         is_bounded = true
@@ -5400,61 +5406,146 @@ function get_optimal_sampler(
         # Assign NUTS sampler to other unbounded continuous parameters.
         if !isempty(param_groups[:other_continuous])
             params = Tuple(param_groups[:other_continuous])
+            dim = length(params)
             
-            # Refined AD backend selection for this block.
-            block_adtype = if length(params) <= 10
+            block_adtype = if dim <= 10
                 ADTypes.AutoForwardDiff()
             else
                 adtype_to_use
             end
 
-            push!(sampler_assignments, 
-                params => NUTS(adaptation_steps, target_acceptance; adtype=block_adtype)
-            )
+            block_init_ϵ = _compute_block_init_epsilon(dim, :other_continuous,
+                effective_init_ϵ, min_ϵ, max_ϵ)
+            block_max_depth = _compute_block_max_depth(:other_continuous, max_depth, nothing)
+            block_target_acc = _compute_block_target_acceptance(:other_continuous,
+                target_acceptance, nothing)
+            block_adapt = _compute_block_adaptation_steps(:other_continuous, adaptation_steps,
+                dim, nothing, n_samples; use_dense_metric=false)
+
+            sampler = if block_init_ϵ > 0.0
+                NUTS(block_adapt, block_target_acc; max_depth=block_max_depth,
+                    init_ϵ=block_init_ϵ, adtype=block_adtype)
+            else
+                NUTS(block_adapt, block_target_acc; max_depth=block_max_depth, adtype=block_adtype)
+            end
+
+            push!(sampler_assignments, params => sampler)
         end
     end
 
     # --- Stage 4: Construct and return the final composite sampler ---
-    # If no parameters were identified for sampling, default to a single NUTS sampler.
     if isempty(sampler_assignments)
         @warn "Could not identify any parameters to sample. Defaulting to a single NUTS sampler for all parameters."
-        return NUTS(adaptation_steps, target_acceptance; adtype=adtype_to_use)
-    # If only one sampler assignment exists, return that sampler directly.
+        total_init_ϵ = _compute_block_init_epsilon(num_params, :global, effective_init_ϵ,
+            min_ϵ, max_ϵ)
+        total_max_depth = _compute_block_max_depth(:global, max_depth, nothing)
+        total_target_acc = _compute_block_target_acceptance(:global, target_acceptance, nothing)
+        total_adapt = _compute_block_adaptation_steps(:global, adaptation_steps, num_params,
+            nothing, n_samples; use_dense_metric=false)
+        return if total_init_ϵ > 0.0
+            NUTS(total_adapt, total_target_acc; max_depth=total_max_depth, init_ϵ=total_init_ϵ,
+                adtype=adtype_to_use)
+        else
+            NUTS(total_adapt, total_target_acc; max_depth=total_max_depth, adtype=adtype_to_use)
+        end
     elseif length(sampler_assignments) == 1
         return sampler_assignments[1][2]
-    # Otherwise, construct a Gibbs sampler from all the assignments.
     else
         return Gibbs(sampler_assignments...)
     end
 end
 
 
-function _extract_flexichain_param_samples(chain, param_name::String)
-    # Determine base name (strip any '[idx]' suffix)
-    base_name = first(Base.split(param_name, '['))
-    base_sym = Symbol(base_name)
+"""
+    extract_param_matrix(chain, var_id; expected_dim=nothing)::Matrix{Float64}
 
-    # Extract column/variable data robustly across chain formats (FlexiChain, VNChain, DataFrame, Dict, NamedTuple)
+Canonical, zero-fail parameter extraction engine for BSTM.
+Extracts samples for `var_id` (Symbol, String, or DynamicPPL.VarName) across all chain backends
+(`VNChain`, `FlexiChain`, `MCMCChains.Chains`, `DataFrame`, `Dict`, `NamedTuple`) and returns a
+standardized 2D `Matrix{Float64}` of size `(n_samples, dim)`.
+"""
+function extract_param_matrix(chain, var_id::Union{Symbol, String, DynamicPPL.VarName};
+    expected_dim::Union{Int, Nothing}=nothing)::Matrix{Float64}
+    # 1. Normalize identifier to Symbol and clean base string
+    raw_str = string(var_id)
+    clean_str = replace(raw_str, r"^Parameter\((.*)\)$" => s"\1", r"^parameters\." => "",
+        r"^:+" => "")
+    base_name = first(Base.split(clean_str, '['))
+    base_sym = Symbol(base_name)
+    clean_sym = Symbol(clean_str)
+
+    n_chains_val = 1
+    try
+        if occursin("FlexiChain", string(typeof(chain))) || occursin("VNChain",
+            string(typeof(chain)))
+            n_chains_val = FlexiChains.nchains(chain)
+        elseif hasproperty(chain, :chains)
+            n_chains_val = length(chain.chains)
+        elseif hasproperty(chain, :value) && ndims(chain.value) == 3
+            n_chains_val = size(chain.value, 3)
+        elseif hasproperty(chain, :info) && haskey(chain.info, :n_chains)
+            n_chains_val = Int(chain.info.n_chains)
+        end
+    catch
+    end
+
+    # 2. Extract column/variable data robustly across chain formats
     col_data = try
         chain[base_sym]
     catch
         try
-            chain[DynamicPPL.VarName(base_sym)]
+            chain[clean_sym]
         catch
             try
-                chain[param_name]
+                chain[DynamicPPL.VarName(base_sym)]
             catch
                 try
-                    df = DataFrame(chain)
-                    df_cols = names(df)
-                    idx = findfirst(n -> string(n) == base_name || string(n) == param_name, df_cols)
-                    if !isnothing(idx)
-                        df[!, df_cols[idx]]
-                    else
-                        error("Parameter ':$param_name' or base ':$base_name' not found in chain.")
+                    chain[DynamicPPL.VarName(clean_sym)]
+                catch
+                    try
+                        chain[clean_str]
+                    catch
+                        try
+                            chain[raw_str]
+                        catch
+                            try
+                                chain[Symbol(raw_str)]
+                            catch
+                                try
+                                    df = DataFrame(chain)
+                                    df_cols = names(df)
+                                    # Strategy A: Exact or cleaned column match
+                                    idx = findfirst(df_cols) do n
+                                        n_str = string(n)
+                                        n_clean = replace(n_str,
+                                            r"^Parameter\((.*)\)$" => s"\1",
+                                            r"^parameters\." => "", r"^:+" => "")
+                                        n_clean == base_name || n_clean == clean_str||
+                                            n_str == raw_str || n_str == base_name
+                                    end
+                                    if !isnothing(idx)
+                                        df[!, df_cols[idx]]
+                                    else
+                                        # Strategy B: Bracketed indices (e.g. var[1], var[2], ...)
+                                        re_bracket = Regex("^" * escape_string(base_name) * "\\[\\d+\\]")
+                                        matched_cols = filter(n -> occursin(re_bracket,
+                                            string(n)), df_cols)
+                                        if !isempty(matched_cols)
+                                            sort!(matched_cols, by = n -> begin
+                                                m = match(r"\[(\d+)\]", string(n))
+                                                isnothing(m) ? 0 : parse(Int, m.captures[1])
+                                            end)
+                                            Matrix(df[!, matched_cols])
+                                        else
+                                            error("Parameter '$var_id' not found in chain.")
+                                        end
+                                    end
+                                catch err
+                                    error("Parameter '$var_id' not found in the MCMC chain: $err")
+                                end
+                            end
+                        end
                     end
-                catch err
-                    error("Parameter ':$param_name' or base ':$base_name' not found in the MCMC chain: $err")
                 end
             end
         end
@@ -5462,18 +5553,63 @@ function _extract_flexichain_param_samples(chain, param_name::String)
 
     param_data_array = Array(col_data)
 
-    # 1D vector (e.g. from DataFrame column or flattened samples)
+    # 3. Standardize dimensions to Matrix{Float64} of shape (total_samples, dim)
+    
+    # Case A: Elements are AbstractArrays (e.g. Vector{Vector{Float64}} from
+    #   VNChain/FlexiChain vector params)
+    if eltype(param_data_array) <: AbstractArray
+        all_elements = vec(param_data_array)
+        total_samples = length(all_elements)
+        if isempty(all_elements)
+            return zeros(Float64, 0, 1)
+        end
+        first_elem = first(all_elements)
+        param_dim = length(first_elem)
+        
+        mat = Matrix{Float64}(undef, total_samples, param_dim)
+        for i in 1:total_samples
+            mat[i, :] = vec(Float64.(all_elements[i]))
+        end
+        if !isnothing(expected_dim) && param_dim != expected_dim&&
+            (total_samples * param_dim) % expected_dim == 0
+            return reshape(mat, :, expected_dim)
+        end
+        return mat
+    end
+
+    # Case B: 1D vector of numbers (e.g. from DataFrame column or single chain scalar)
     if ndims(param_data_array) == 1
-        return reshape(param_data_array, :, 1)
+        n_elem = length(param_data_array)
+        if !isnothing(expected_dim) && expected_dim > 1 && n_elem % expected_dim == 0
+            return reshape(Float64.(param_data_array), :, expected_dim)
+        end
+        return reshape(Float64.(param_data_array), :, 1)
     end
 
-    # 2D array: for FlexiChain scalar with [iterations, chains], reshape to (total_samples, 1)
-    # If already a 2D sample matrix where chains are already combined or it's a mock matrix
+    # Case C: 2D array of numbers
     if ndims(param_data_array) == 2
-        return reshape(param_data_array, :, 1)
+        n_rows, n_cols = size(param_data_array)
+        # If columns match the number of chains (and > 1) and expected_dim is 1 or nothing:
+        # col_data is [n_iterations, n_chains] representing scalar samples across chains!
+        # Collapse all chains into total_samples = n_rows * n_cols
+        if n_chains_val > 1 && n_cols == n_chains_val && (isnothing(expected_dim)||
+            expected_dim == 1)
+            return reshape(Float64.(vec(param_data_array)), n_rows * n_cols, 1)
+        elseif !isnothing(expected_dim) && n_cols == expected_dim
+            return Float64.(param_data_array)
+        elseif !isnothing(expected_dim) && n_rows == expected_dim && n_cols != expected_dim
+            # Transposed (dim, total_samples) -> transpose to (total_samples, dim)
+            return permutedims(Float64.(param_data_array), (2, 1))
+        elseif n_cols == 1
+            return Float64.(param_data_array)
+        elseif !isnothing(expected_dim) && (n_rows * n_cols) % expected_dim == 0
+            return reshape(Float64.(vec(param_data_array)), :, expected_dim)
+        else
+            return Float64.(param_data_array)
+        end
     end
 
-    # 3D+ array from FlexiChain: [iterations, dim1, ..., chains]
+    # Case D: 3D+ array from FlexiChain/MCMCChains: [iterations, dim1, ..., chains]
     num_iterations = size(param_data_array, 1)
     num_chains = size(param_data_array, ndims(param_data_array))
     total_samples = num_iterations * num_chains
@@ -5484,22 +5620,38 @@ function _extract_flexichain_param_samples(chain, param_name::String)
     param_dims = size(permuted_data)[3:end]
 
     if isempty(param_dims) # Scalar parameter
-        return reshape(permuted_data, total_samples, 1)
+        return reshape(Float64.(permuted_data), total_samples, 1)
     else
-        return reshape(permuted_data, total_samples, prod(param_dims))
+        dim_prod = prod(param_dims)
+        mat_reshaped = reshape(Float64.(permuted_data), total_samples, dim_prod)
+        if !isnothing(expected_dim) && dim_prod != expected_dim&&
+            (total_samples * dim_prod) % expected_dim == 0
+            return reshape(mat_reshaped, :, expected_dim)
+        end
+        return mat_reshaped
     end
 end
 
- 
-# get_params_vector is for scalar parameters (expected_len = 1)
-# get_params_vector is for scalar parameters (expected_len = 1)
-function get_params_vector(chain, param_name::String, expected_len::Int=1)
-    samples = _extract_flexichain_param_samples(chain, param_name)
+"""
+    extract_param_vector(chain, var_id)::Vector{Float64}
+
+Extracts a scalar parameter as a 1D `Vector{Float64}` of length `n_samples`.
+"""
+function extract_param_vector(chain, var_id::Union{Symbol, String,
+    DynamicPPL.VarName})::Vector{Float64}
+    mat = extract_param_matrix(chain, var_id; expected_dim=1)
+    return vec(mat[:, 1])
+end
+
+# get_params_vector is for scalar or fixed-length parameters (expected_len >= 1)
+function get_params_vector(chain, param_name::Union{Symbol, String, DynamicPPL.VarName},
+    expected_len::Int=1)
+    samples = extract_param_matrix(chain, param_name; expected_dim=expected_len)
     if size(samples, 2) != expected_len
-        if expected_len == 1 && size(samples, 2) > 1
-            error("get_params_vector was called for scalar (expected_len=1), but '$param_name' has dimension $(size(samples, 2)). Use get_params_matrix for vector parameters.")
-        elseif prod(size(samples)) == size(samples, 1) * expected_len
+        if prod(size(samples)) == size(samples, 1) * expected_len
             return reshape(samples, size(samples, 1), expected_len)
+        elseif size(samples, 1) % expected_len == 0 && size(samples, 2) == 1
+            return reshape(samples, :, expected_len)
         else
             error("Parameter '$param_name' has dimension $(size(samples, 2)), but expected $expected_len.")
         end
@@ -5507,18 +5659,10 @@ function get_params_vector(chain, param_name::String, expected_len::Int=1)
     return samples # (total_samples, expected_len)
 end
 
-# get_params_matrix is for parameters of dimension expected_len >= 1
-function get_params_matrix(chain, param_name::String, expected_len::Int)
-    samples = _extract_flexichain_param_samples(chain, param_name)
-    # Check if the extracted samples have the correct expected_len
-    if size(samples, 2) != expected_len
-        if prod(size(samples)) == size(samples, 1) * expected_len
-            return reshape(samples, size(samples, 1), expected_len)
-        else
-            error("Parameter '$param_name' has dimension $(size(samples, 2)), but expected $expected_len.")
-        end
-    end
-    return samples # Should be (total_samples, expected_len)
+# get_params_matrix is for vector/matrix parameters (expected_len >= 1)
+function get_params_matrix(chain, param_name::Union{Symbol, String, DynamicPPL.VarName},
+    expected_len::Int)
+    return get_params_vector(chain, param_name, expected_len)
 end
 
 
@@ -5528,12 +5672,6 @@ end
 
 A convenience wrapper for `bstm_sample` that automatically selects an optimal sampler
 if one is not provided.
-
-# Rationale
-This method simplifies the user experience by automatically calling `get_optimal_sampler`
-when a specific sampler is not provided. It calculates a default number of adaptation
-steps for HMC-based samplers as 25% of the total number of samples, which is a
-reasonable heuristic for balancing warmup and sampling time.
 
 # Arguments
 - `model`: The Turing model object.
@@ -5551,7 +5689,9 @@ function bstm_sample(model::DynamicPPL.Model, n_samples::Int; kwargs...)
     # List of keywords known to get_optimal_sampler
     known_sampler_keys = [
         :sampler_choice, :sampler_map, :adtype, :group_components,
-        :adaptation_steps, :target_acceptance, :n_particles, :n_chains
+        :use_dense_metric_for_components, :adaptation_steps, :target_acceptance,
+        :n_particles, :n_chains, :init_ϵ, :init_epsilon, :step_size,
+        :max_depth, :min_ϵ, :max_ϵ
     ]
 
     for (key, value) in kwargs
@@ -5562,18 +5702,17 @@ function bstm_sample(model::DynamicPPL.Model, n_samples::Int; kwargs...)
         end
     end
 
-    # Set default adaptation_steps if not provided by the user.
-    if !haskey(sampler_kwargs, :adaptation_steps)
-        adaptation_steps = floor(Int, n_samples * 0.25)
-        sampler_kwargs[:adaptation_steps] = adaptation_steps
-        @info "Automatically setting `adaptation_steps` to $(adaptation_steps) (25% of `n_samples`)."
+    n_chains = get(kwargs, :n_chains, 1)
+
+    # Pass n_samples to get_optimal_sampler to enable principled adaptation scaling
+    if !haskey(sampler_kwargs, :n_samples)
+        sampler_kwargs[:n_samples] = n_samples
     end
 
-    @info "Sampler not provided. Automatically selecting an optimal sampler..."
+    @info "Sampler not provided. Automatically selecting an optimal sampler with principled warmup scaling..."
     sampler = get_optimal_sampler(model; sampler_kwargs...)
     
-    # The `n_chains` kwarg, if present, will be in sample_kwargs or its default will be used.
-    return bstm_sample(model, sampler, n_samples; sample_kwargs...)
+    return bstm_sample(model, sampler, n_samples; n_chains=n_chains, sample_kwargs...)
 end
  
 """
@@ -5581,13 +5720,6 @@ end
 
 A wrapper around `Turing.sample` that defaults to the `MCMCThreads` backend for
 both single and multi-chain sampling, ensuring consistent output dimensionality.
-
-# Rationale
-Dynamically generated models from `@bstm` can trigger non-fatal world-age warnings,
-which this wrapper suppresses. By defaulting to `MCMCThreads()` for all sampling,
-it ensures that the returned chain object is always a 3-dimensional array of
-`[iterations, parameters, chains]`, even for `n_chains=1`. This prevents
-`DimensionMismatch` errors in downstream post-processing functions.
 
 # Arguments
 - `model`: The Turing model object.
@@ -5620,7 +5752,8 @@ function AbstractMCMC.sample(
     return AbstractMCMC.sample(model, sampler, MCMCThreads(), N, 1; kwargs...)
 end
 
-# Forward multi-chain syntax without ensemble strategy: sample(model, sampler, N, n_chains; kwargs...)
+# Forward multi-chain syntax without ensemble strategy: sample(model, sampler, N, n_chains;
+#   kwargs...)
 function AbstractMCMC.sample(
     model::AbstractMCMC.AbstractModel,
     sampler::AbstractMCMC.AbstractSampler,
@@ -5637,25 +5770,6 @@ end
     _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
 
 Generates Turing code for all likelihood-specific priors.
-
-# Rationale
-This function is a core part of the code generation pipeline and is not deprecated.
-It is responsible for defining the priors for all parameters that are specific to
-the chosen likelihood family, but are not part of a `ComponentModel`. This includes
-parameters for dispersion, zero-inflation, observation noise, and the complex
-cut-point parameterization required for ordinal models.
-
-This version is fully consistent with the refactored architecture and correctly:
-1.  Generates priors for standard likelihood parameters like `r_nb` (Negative Binomial),
-    `y_sigma` (Gaussian-like families), and `lik_phi_zi` (Zero-Inflation).
-2.  Handles multivariate models by correctly specifying priors for shared correlation
-    matrices (`L_corr`) and outcome-specific variance parameters.
-3.  Includes the necessary prior definitions for ordinal regression models, including
-    the ordered cut-points (`alphas`) and the degrees of freedom (`ordinal_df`) for
-    the latent Student's T distribution.
-
-This function ensures that all necessary likelihood-level priors are declared before
-the main model components are processed.
 
 # Arguments
 - `M`: The main model configuration `NamedTuple`.
@@ -5683,14 +5797,17 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
 
     # Prior for Student's T degrees of freedom
     if any(f -> f == "student_t", families)
-        push!(prior_blocks, "lik_nu_student_t ~ DynamicPPL.NamedDist(Exponential(1.0), :lik_nu_student_t)")
+        push!(prior_blocks,
+            "lik_nu_student_t ~ DynamicPPL.NamedDist(Exponential(1.0), :lik_nu_student_t)")
     end
 
     # Prior for observation standard deviation (for Gaussian-like families)
-    if any(f -> f in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"], families)
+    if any(f -> f in ["gaussian", "lognormal", "student_t", "laplace", "half_normal",
+        "half_student_t"], families)
         y_sigma_prior_str = _distribution_to_string(Exponential(1.0))
         if is_multivariate
-            push!(prior_blocks, "y_sigma ~ DynamicPPL.NamedDist(filldist($(y_sigma_prior_str), K), :y_sigma)")
+            push!(prior_blocks,
+                "y_sigma ~ DynamicPPL.NamedDist(filldist($(y_sigma_prior_str), K), :y_sigma)")
         else
             push!(prior_blocks, "y_sigma ~ DynamicPPL.NamedDist($(y_sigma_prior_str), :y_sigma)")
         end
@@ -5698,7 +5815,8 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
     
     # Prior for extra parameters (e.g., Gamma shape, Beta precision)
     if any(f -> f in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"], families)
-        push!(prior_blocks, "lik_extra_params ~ DynamicPPL.NamedDist(Exponential(1.0), :lik_extra_params)")
+        push!(prior_blocks,
+            "lik_extra_params ~ DynamicPPL.NamedDist(Exponential(1.0), :lik_extra_params)")
     end
 
     # Prior for multivariate correlation matrix
@@ -5746,10 +5864,18 @@ function _generate_univariate_likelihood_block(M::NamedTuple)
     kwargs_parts = String[]
     extra_param_logic = ""
 
-    if needs_sigma; push!(kwargs_parts, "sigma_y=y_sigma"); end
-    if needs_rnb; push!(kwargs_parts, "r_nb=r_nb"); end
-    if get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
-    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle"); end
+    if needs_sigma
+        push!(kwargs_parts, "sigma_y=y_sigma")
+    end
+    if needs_rnb
+        push!(kwargs_parts, "r_nb=r_nb")
+    end
+    if get(M, :use_zi, false)
+        push!(kwargs_parts, "phi_zi=lik_phi_zi")
+    end
+    if get(M, :user_provided_hurdle, false)
+        push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle")
+    end
     
     if needs_nu || needs_extra
         extra_param_logic = if needs_nu; "extra_p = lik_nu_student_t"
@@ -5757,11 +5883,21 @@ function _generate_univariate_likelihood_block(M::NamedTuple)
         push!(kwargs_parts, "extra_params=extra_p")
     end
 
-    if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=M.trials[:, 1]"); end
-    if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=M.weights[:, 1]"); end
-    if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=M.censor_lower[:, 1]"); end
-    if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=M.censor_upper[:, 1]"); end
-    if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=M.hurdle[:, 1]"); end
+    if get(M, :user_provided_trials, false)
+        push!(kwargs_parts, "trial=M.trials[:, 1]")
+    end
+    if get(M, :user_provided_weights, false)
+        push!(kwargs_parts, "weight=M.weights[:, 1]")
+    end
+    if get(M, :user_provided_censor_lower, false)
+        push!(kwargs_parts, "censor_lower=M.censor_lower[:, 1]")
+    end
+    if get(M, :user_provided_censor_upper, false)
+        push!(kwargs_parts, "censor_upper=M.censor_upper[:, 1]")
+    end
+    if get(M, :user_provided_hurdle, false)
+        push!(kwargs_parts, "hurdle=M.hurdle[:, 1]")
+    end
 
     kwargs_str = join(kwargs_parts, ", ")
 
@@ -5770,7 +5906,6 @@ function _generate_univariate_likelihood_block(M::NamedTuple)
         d_lik_vec = bstm_Likelihood.($(family_symbol), eta; $(kwargs_str))
         log_lik_sum = sum(Distributions.logpdf.(d_lik_vec, M.y_obs))
     """
-    
     return """
     let
         local log_lik_sum
@@ -5809,10 +5944,18 @@ function _generate_multivariate_likelihood_block(M::NamedTuple)
         kwargs_parts = String[]
         extra_param_logic = ""
 
-        if needs_sigma; push!(kwargs_parts, "sigma_y=y_sigma[$k]"); end
-        if needs_rnb; push!(kwargs_parts, "r_nb=r_nb"); end
-        if get(M, :use_zi, false); push!(kwargs_parts, "phi_zi=lik_phi_zi"); end
-        if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle"); end
+        if needs_sigma
+            push!(kwargs_parts, "sigma_y=y_sigma[$k]")
+        end
+        if needs_rnb
+            push!(kwargs_parts, "r_nb=r_nb")
+        end
+        if get(M, :use_zi, false)
+            push!(kwargs_parts, "phi_zi=lik_phi_zi")
+        end
+        if get(M, :user_provided_hurdle, false)
+            push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle")
+        end
         
         if needs_nu || needs_extra
             extra_param_logic = if needs_nu; "extra_p = lik_nu_student_t"
@@ -5820,20 +5963,30 @@ function _generate_multivariate_likelihood_block(M::NamedTuple)
             push!(kwargs_parts, "extra_params=extra_p")
         end
 
-        if get(M, :user_provided_trials, false); push!(kwargs_parts, "trial=M.trials[:, $k]"); end
-        if get(M, :user_provided_weights, false); push!(kwargs_parts, "weight=M.weights[:, $k]"); end
-        if get(M, :user_provided_censor_lower, false); push!(kwargs_parts, "censor_lower=M.censor_lower[:, $k]"); end
-        if get(M, :user_provided_censor_upper, false); push!(kwargs_parts, "censor_upper=M.censor_upper[:, $k]"); end
-        if get(M, :user_provided_hurdle, false); push!(kwargs_parts, "hurdle=M.hurdle[:, $k]"); end
+        if get(M, :user_provided_trials, false)
+            push!(kwargs_parts, "trial=M.trials[:, $k]")
+        end
+        if get(M, :user_provided_weights, false)
+            push!(kwargs_parts, "weight=M.weights[:, $k]")
+        end
+        if get(M, :user_provided_censor_lower, false)
+            push!(kwargs_parts, "censor_lower=M.censor_lower[:, $k]")
+        end
+        if get(M, :user_provided_censor_upper, false)
+            push!(kwargs_parts, "censor_upper=M.censor_upper[:, $k]")
+        end
+        if get(M, :user_provided_hurdle, false)
+            push!(kwargs_parts, "hurdle=M.hurdle[:, $k]")
+        end
 
         kwargs_str = join(kwargs_parts, ", ")
 
         block_content = """
             $(extra_param_logic)
-            d_lik_vec_k = bstm_Likelihood.($(family_symbol), view(eta_correlated, :, $k); $(kwargs_str))
+            d_lik_vec_k = bstm_Likelihood.($(family_symbol), view(eta_correlated, :, $k);
+              $(kwargs_str))
             Turing.@addlogprob! sum(Distributions.logpdf.(d_lik_vec_k, view(M.y_obs, :, $k)))
         """
-
         outcome_block = """
         # Likelihood for outcome $(k)
         let
@@ -5864,7 +6017,9 @@ is CPU-only.
 function _generate_ordinal_likelihood_block(M::NamedTuple)
     spec = M.likelihood_specs[1]
     K = get(spec, :K, 0)
-    if K < 2; return ""; end
+    if K < 2
+        return ""
+    end
 
     latent_dist_val = get(spec, :latent_dist, :logistic)
     non_prop_terms = get(M, :non_proportional_effects, Symbol[])
@@ -5925,7 +6080,8 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
         if $(K > 1)
             probs_matrix[:, 1] = cumulative_probs_matrix[:, 1]
             for j in 2:($(K-1))
-                probs_matrix[:, j] = max.(0.0, cumulative_probs_matrix[:, j] .- cumulative_probs_matrix[:, j-1])
+                probs_matrix[:, j] = max.(0.0, cumulative_probs_matrix[:, j] .-
+                  cumulative_probs_matrix[:, j-1])
             end
             probs_matrix[:, $(K)] = max.(0.0, 1.0 .- cumulative_probs_matrix[:, $(K-1)])
         else
@@ -5950,14 +6106,6 @@ end
 Generates the final likelihood block for the Turing model, dispatching to the
 appropriate helper based on the model architecture and handling special cases.
 
-# Rationale
-This function is a core part of the code generation pipeline. This version has been
-refactored to improve modularity. The complex logic for ordinal models has been
-extracted into a dedicated helper function, `_generate_ordinal_likelihood_block`.
-This change makes the function a clean, high-level dispatcher that routes to the
-correct likelihood generator based on the model's configuration, aligning with the
-refactoring's goal of improved readability and maintainability.
-
 # Arguments
 - `M`: The main model configuration `NamedTuple`.
 - `is_multivariate`: A boolean indicating if the model is multivariate.
@@ -5965,11 +6113,11 @@ refactoring's goal of improved readability and maintainability.
 # Returns
 - A `String` containing the generated Turing code for the likelihood block.
 """
-
 function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
     # Check if a component like a PointProcess or a marginalized GMRF handles its own likelihood.
     has_custom_likelihood_from_component = any(
-        spec -> (spec.component_obj isa PointProcess || (hasproperty(spec.component_obj, :method) && spec.component_obj.method == :marginalized)),
+        spec -> (spec.component_obj isa PointProcess || (hasproperty(spec.component_obj,
+            :method) && spec.component_obj.method == :marginalized)),
         M.components
     )
     if has_custom_likelihood_from_component
@@ -5997,19 +6145,11 @@ end
 
 Generates the Turing code for the global intercept's prior.
 
-# Rationale for Update
-This version is updated for consistency with the refactored architecture. The
-explicit update to the linear predictor (`eta`) has been removed from this function.
-Instead, the intercept is now added during the initialization of `eta` in the main
-model assembler (`bstm_text_assembler`). This change is critical for ensuring
-automatic differentiation (AD) type stability, as it guarantees that `eta` is
-initialized with the correct `Dual` number type when using gradient-based samplers.
-The unnecessary `local` keyword has also been removed.
-
 # Arguments
 - `M`: The main model configuration `NamedTuple`.
 - `is_multivariate`: A boolean indicating if the model is multivariate.
-- `eta_name`: The name of the linear predictor variable (unused, but kept for signature consistency).
+- `eta_name`: The name of the linear predictor variable (unused, but kept for signature
+  consistency).
 
 # Returns
 - A tuple `(priors_code::String, updates_code::String)`, where `updates_code` is always empty.
@@ -6043,22 +6183,6 @@ end
 
 Generates the Turing code for adding log-offsets to the linear predictor.
 
-# Rationale for Update
-This version corrects a bug where the function was using an incorrect key (`:log_offset`)
-and did not properly handle the matrix dimensions of the offset data. The `bstm`
-framework standardizes observation-level parameters like offsets into an `[N x K]`
-matrix stored under the key `:log_offsets`. This updated function now correctly:
-1.  Uses the consistent key `:log_offsets` for both univariate and multivariate cases.
-2.  Adds a check to return an empty string if all offsets are zero, avoiding
-    unnecessary operations in the model.
-3.  In the univariate case, it correctly selects the first column of the
-    `M.log_offsets` matrix (`M.log_offsets[:, 1]`) to match the dimensions of the
-    `eta` vector, preventing a `DimensionMismatch`.
-4.  In the multivariate case, it correctly adds the full `[N x K]` offset matrix
-    to the `eta_latent` matrix.
-
-This aligns the function with the refactored data structures and ensures type
-stability and dimensional correctness.
 """
 function _generate_offset_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
     # Check if offsets are provided and are non-trivial.
@@ -6125,7 +6249,9 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
         else
             priors_to_use = is_multivariate ? vcat([priors_prop for _ in 1:M.outcomes_N]...) : priors_prop
             priors_str_list = [_distribution_to_string(p) for p in priors_to_use]
-            push!(prior_parts, "$(beta_prop_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ", "))]), $(QuoteNode(prior_label)))")
+            push!(prior_parts,
+                "$(beta_prop_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ",
+                "))]), $(QuoteNode(prior_label)))")
         end
 
         # Generate update string
@@ -6150,7 +6276,9 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
         else
             full_priors_list = vcat([priors_npo for _ in 1:(K_ordinal-1)]...)
             priors_str_list = [_distribution_to_string(p) for p in full_priors_list]
-            push!(prior_parts, "$(beta_npo_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ", "))]), :beta_npo)")
+            push!(prior_parts,
+                "$(beta_npo_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ",
+                "))]), :beta_npo)")
         end
     end
 
@@ -6165,20 +6293,15 @@ end
 """
     process_smooth_module!(opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict)
 
-Processes a module with `structure=:smooth`, which is typically invoked via
-`random(var, structure=:smooth, model=...)`. This function is responsible for
-generating basis matrices for various static smoothers or setting up coordinate
-data for continuous and dynamic kernel-based models.
-
-# Rationale for Update
-  consistent with the refactored component processing
-pipeline. It removes a recursive call pattern for handling symbolic `nbins` arguments,
-replacing it with a more direct, linear control flow that improves code clarity.
+Processes a module with `structure=:smooth` (invoked via `random(var, structure=:smooth,
+  model=...)`).
+Constructs basis matrices for static smoothers and sets up coordinate data for continuous
+  and dynamic kernel-based models.
 
 # Arguments
 - `opt_dict`: The main model configuration dictionary (`M`).
 - `mod_data`: The parsed data for the `random(structure=:smooth)` module.
-- `registries`, `hyperpriors`: Additional configuration dictionaries (not used here).
+- `registries`, `hyperpriors`: Additional configuration dictionaries.
 
 # Returns
 - `true` to indicate that a component object should be created.
@@ -6258,13 +6381,19 @@ function process_smooth_module!(
                 
                 B_smooth_matrix, actual_nbins_for_component = if n_vars == 1
                     v_vec = data[!, Symbol(mod_data[:variables][1])]
-                    bstm_smooth_basis_1D(model_str, v_vec, nbins_per_dim_vec[1], get(params, :degree, 3); local_kwargs...)
+                    bstm_smooth_basis_1D(model_str, v_vec, nbins_per_dim_vec[1], get(params,
+                        :degree, 3); local_kwargs...)
                 else
                     c_mat = Matrix{Float64}(data[!, Symbol.(mod_data[:variables])])
-                    B_matrix = if n_vars == 2; bstm_smooth_basis_2D(model_str, c_mat, nbins_per_dim_vec; local_kwargs...);
-                    elseif n_vars == 3; bstm_smooth_basis_3D(model_str, c_mat, nbins_per_dim_vec; local_kwargs...);
-                    elseif n_vars == 4; bstm_smooth_basis_4D(model_str, c_mat, nbins_per_dim_vec; local_kwargs...);
-                    else; error("Smoothers with more than 4 dimensions are not supported for this basis type."); end
+                    B_matrix = if n_vars == 2
+                        bstm_smooth_basis_2D(model_str, c_mat, nbins_per_dim_vec; local_kwargs...)
+                    elseif n_vars == 3
+                        bstm_smooth_basis_3D(model_str, c_mat, nbins_per_dim_vec; local_kwargs...)
+                    elseif n_vars == 4
+                        bstm_smooth_basis_4D(model_str, c_mat, nbins_per_dim_vec; local_kwargs...)
+                    else
+                        error("Smoothers with more than 4 dimensions are not supported for this basis type.")
+                    end
                     (B_matrix, size(B_matrix, 2)) # Return matrix and its column count
                 end
                 
@@ -6291,7 +6420,9 @@ function process_smooth_module!(
     # --- Path 4: GMRFs on Binned Covariates (e.g., rw2 on age) ---
     elseif model_str in gmrfs_on_bins_models
         vars = mod_data[:variables]
-        if length(vars) != 1; @warn "GMRF smooth on $(join(vars, ",")) requires exactly 1 variable. Skipping."; return true; end
+        if length(vars) != 1
+            @warn "GMRF smooth on $(join(vars, ",")) requires exactly 1 variable. Skipping."; return true
+        end
         
         var_sym = Symbol(vars[1])
         nbins = get(mod_data[:params], :nbins, 20)
@@ -6317,10 +6448,11 @@ Processes the `eigen()` module, which performs Bayesian Principal Component Anal
 (PCA) for dimensionality reduction.
 
 # Version
-v1.1.0 (2026-08-13)
+v1.0.0
 
 # Mathematical Summary
-The `eigen()` component models a set of \$P\$ observed variables \$\\mathbf{Y}\$ (an \$N \\times P\$
+The `eigen()` component models a set of \$P\$ observed variables \$\\mathbf{Y}\$ (an \$N
+  \\times P\$
 matrix) as a linear combination of \$K\$ latent factors (principal components)
 \$\\mathbf{F}\$ (an \$N \\times K\$ matrix) plus residual noise:
 \$\\mathbf{Y} = \\mathbf{F} \\mathbf{L}^T + \\mathbf{E}\$
@@ -6401,13 +6533,6 @@ end
 
 Processes the `mixed()` module for random effects.
 
-# Rationale for Update
-This version enhances robustness by adding a check for the number of unique levels
-in the grouping variable. If the number of levels is suspiciously high (suggesting
-a continuous variable was passed by mistake), it issues a warning to the user.
-The core logic, which uses `StatsModels.jl` to correctly parse the random effects
-formula (e.g., `1 + cov1 | group`), remains consistent with the refactored architecture.
-
 # Arguments
 - `opt_dict`: The main model configuration dictionary.
 - `mod_data`: The parsed data for the `mixed()` module.
@@ -6422,7 +6547,8 @@ function process_mixed_module!(opt_dict, mod_data, registries, hyperpriors)
     
     response_var = Symbol(opt_dict[:outcomes][1])
 
-    effect_expr, group_var_str = if !isempty(vars) && vars[1] isa Expr && vars[1].head == :call && vars[1].args[1] == :|
+    effect_expr, group_var_str = if !isempty(vars) && vars[1] isa Expr && vars[1].head == :call&&
+        vars[1].args[1] == :|
         # Handles the `effect | group` syntax.
         (vars[1].args[2], string(vars[1].args[3]))
     elseif length(vars) >= 2
@@ -6496,6 +6622,7 @@ function process_mixed_module!(opt_dict, mod_data, registries, hyperpriors)
     mod_data[:params][:indices] = indices
     mod_data[:params][:n_cat] = n_levels
     mod_data[:params][:lhs] = effect_names
+    mod_data[:params][:group_var] = group_var_sym
     mod_data[:variables] = [group_var_str]
     
     return true
@@ -6508,13 +6635,6 @@ end
 
 Processes the `fixed()` module, gathering information about fixed effects, custom
 contrasts, and priors.
-
-# Rationale for Update
-This version improves the robustness of contrast handling. The previous implementation
-only applied a specified `contrast` to the first variable in a `fixed()` call. This
-has been corrected to iterate over all variables provided in the module and apply the
-contrast to each one, making the behavior more intuitive and consistent. The
-initialization block has also been simplified using `get!`.
 
 # Arguments
 - `opt_dict`: The main model configuration dictionary.
@@ -6583,18 +6703,6 @@ end
 
 Processes the `custom()` module.
 
-# Rationale
-This function serves as the processor for the `custom()` module. It is intentionally
-minimal because the `custom()` module's logic is entirely self-contained within the
-user-provided `code_fragment`. Its only role is to return `true`, which signals to
-the configuration engine that a `Custom` component object should be instantiated. This
-object then acts as a wrapper for the user's code, which is handled by a specialized
-code generator later in the pipeline. The function is not deprecated and is a necessary
-part of the component processing system.
-
-This version adds a validation step to ensure that the required `code_fragment`
-argument is provided, failing early with an informative error message if it is missing.
-
 # Arguments
 - `opt_dict`: The main model configuration dictionary.
 - `mod_data`: The parsed data for the `custom()` module.
@@ -6623,17 +6731,6 @@ end
 Processes the `localadaptive` model, ensuring centroids and cluster assignments are
 correctly computed for all spatial units.
 
-# Rationale for Update
-This function is updated to be consistent with the refactored component system. It
-no longer calls the deprecated `process_spatial_module!`. Instead, it assumes that
-the main `process_random_module!` has already established the necessary spatial
-context (`s_N`, `s_idx`, `W`). This function's sole responsibility is now to handle
-the logic specific to the `localadaptive` model, which includes resolving the
-centroids for all spatial units and performing k-means clustering to generate the
-`cluster_assignments`. This change removes redundancy and aligns the function with
-the modular design of the refactor. The logic for resolving and validating
-centroids from the previous version is retained and made more efficient.
-
 # Arguments
 - `opt_dict`: The main model configuration dictionary.
 - `mod_data`: The parsed data for the `random(model=:localadaptive)` module.
@@ -6655,10 +6752,12 @@ function process_localadaptive_module!(opt_dict, mod_data, registries, hyperprio
         @info "Centroids not found for localadaptive model. Attempting to compute from s_x and s_y coordinates."
         if hasproperty(data, :s_x) && hasproperty(data, :s_y) && hasproperty(data, :s_idx)
             
-            # Efficiently create a map from each spatial index to its unique coordinate using DataFrames.
+            # Efficiently create a map from each spatial index to its unique coordinate
+            #   using DataFrames.
             gdf = groupby(data, :s_idx)
             unique_coords_df = combine(gdf, [:s_x, :s_y] .=> first, renamecols=false)
-            coord_map = Dict(row.s_idx => Point2D(row.s_x, row.s_y) for row in eachrow(unique_coords_df))
+            coord_map = Dict(row.s_idx => Point2D(row.s_x,
+                row.s_y) for row in eachrow(unique_coords_df))
 
             # Check if we have coordinates for all s_N units.
             if length(coord_map) < s_N
@@ -6698,7 +6797,8 @@ function process_localadaptive_module!(opt_dict, mod_data, registries, hyperprio
     # Perform k-means clustering on the centroids
     kmeans_result = kmeans(centroids_matrix, n_clusters; maxiter=200, display=:none)
     
-    # The assignments map each of the s_N centroids to a cluster. This vector now has the correct length.
+    # The assignments map each of the s_N centroids to a cluster. This vector now has the
+    #   correct length.
     opt_dict[:cluster_assignments] = assignments(kmeans_result)
     opt_dict[:n_clusters] = nclusters(kmeans_result)
     
@@ -6713,16 +6813,6 @@ end
 Processes the `nested()` module for multi-fidelity or joint models. This function
 recursively calls `bstm_config` to create a complete and independent configuration
 for the sub-model defined within the `nested()` call.
-
-# Rationale
-This processor is the core of the multi-fidelity and joint modeling capabilities. It
-validates the `data_source` and `formula` arguments for the sub-model, correctly
-evaluating them in the user's calling module if necessary. It then orchestrates a
-recursive call to `bstm_config`, creating a self-contained configuration for the
-sub-model which is then stored in the main configuration's `:nested_components`
-registry. This function does not create a component in the main model's processing
-loop (returns `false`), as the nested model's effects are handled by a specialized
-code generator. This version is consistent with the refactored architecture.
 
 # Arguments
 - `opt_dict`: The main model configuration dictionary.
@@ -6804,6 +6894,11 @@ is needed for this component.
 function process_random_module!(
     opt_dict::Dict, mod_data::Dict, registries::Dict, hyperpriors::Dict
 )
+    # Ensure key is present
+    if !haskey(mod_data, :key)
+        mod_data[:key] = Symbol(join(string.(mod_data[:variables]), "_"))
+    end
+
     # 1. Infer the structure (:spatial, :temporal, :smooth, etc.)
     structure = _infer_structure_from_args(mod_data[:variables], mod_data[:params])
     mod_data[:params][:structure] = structure
@@ -6922,9 +7017,13 @@ end
 
 
 
+"""
+    adjacency_to_bipartite(W::AbstractMatrix; force_bipartite::Bool=true)
+
+Converts a unipartite square adjacency matrix `W` into a bipartite graph representation by
+  finding a 2-coloring.
+"""
 function adjacency_to_bipartite(W::AbstractMatrix; force_bipartite::Bool=true)
-    # # Process: Translates a unipartite graph into a bipartite representation.
-    # # Rationale: Required for models like BCGN that operate on inter-set connectivity.
     
     rows, cols = size(W)
     if rows != cols
@@ -7021,15 +7120,6 @@ end
 
 Processes interaction modules created by operators like `|>`, `∘`, and `⊗`.
 
-# Rationale
-This function is a core part of the component processing pipeline and is not
-deprecated. It acts as the central dispatcher for all compositional syntax,
-enabling complex model structures. It correctly identifies various interaction
-patterns and orchestrates their setup by calling other processors or setting global
-configuration flags. This version is consistent with the refactored architecture,
-including the use of `process_random_module!` for establishing the context of
-child components.
-
 # Arguments
 - `opt_dict`: The main model configuration dictionary.
 - `mod_data`: The parsed data for the interaction module.
@@ -7042,7 +7132,9 @@ child components.
 function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
     op = get(mod_data, :operator, get(mod_data[:params], :operator, nothing))
     components = get(mod_data, :components, get(mod_data[:params], :components, []))
-    if isnothing(op) || isempty(components); return false; end
+    if isnothing(op) || isempty(components)
+        return false
+    end
     
     if op == :composition && length(components) == 2
         outer_node, inner_node = components[1], components[2]
@@ -7051,13 +7143,19 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
             return true
         end
 
-        is_nonstationary_variance = outer_node.module_type == :random && get(outer_node.args, :structure, :none) == :spatial && inner_node.module_type == :random && get(inner_node.args, :structure, :none) == :smooth
+        is_nonstationary_variance = outer_node.module_type == :random && get(outer_node.args,
+            :structure,
+            :none) == :spatial && inner_node.module_type == :random && get(inner_node.args,
+            :structure, :none) == :smooth
         if is_nonstationary_variance
             modifier_vars = get(inner_node.args, :positional_args, [])
-            if isempty(modifier_vars); @warn "The modifier component (smooth) of a composition operator is missing variables. Skipping."; return false; end
+            if isempty(modifier_vars)
+                @warn "The modifier component (smooth) of a composition operator is missing variables. Skipping."; return false
+            end
             
             # Corrected call: Use process_random_module! for the smooth component.
-            smooth_mod_data = Dict(:type => :random, :variables => modifier_vars, :params => inner_node.args)
+            smooth_mod_data = Dict(:type => :random, :variables => modifier_vars,
+                :params => inner_node.args)
             process_random_module!(opt_dict, smooth_mod_data, registries, hyperpriors)
             
             mod_data[:type] = :nonstationary_variance
@@ -7081,25 +7179,35 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
             node2.args[:structure] = _infer_structure_from_args(args2)
         end
 
-        is_spatially_varying_curve = node1.module_type == :random && get(node1.args, :structure, :none) == :smooth &&
-                                     node2.module_type == :random && get(node2.args, :structure, :none) == :spatial
+        is_spatially_varying_curve = node1.module_type == :random && get(node1.args,
+            :structure, :none) == :smooth &&
+                                     node2.module_type == :random && get(node2.args,
+                                         :structure, :none) == :spatial
 
-        is_svc = node1.module_type == :fixed && node2.module_type == :random && get(node2.args, :structure, :none) == :spatial
-        is_tvc = node1.module_type == :fixed && node2.module_type == :random && get(node2.args, :structure, :none) == :temporal
-        is_svar = node1.module_type == :random && get(node1.args, :structure, :none) == :temporal && node2.module_type == :random && get(node2.args, :structure, :none) == :spatial
+        is_svc = node1.module_type == :fixed && node2.module_type == :random && get(node2.args,
+            :structure, :none) == :spatial
+        is_tvc = node1.module_type == :fixed && node2.module_type == :random && get(node2.args,
+            :structure, :none) == :temporal
+        is_svar = node1.module_type == :random && get(node1.args, :structure,
+            :none) == :temporal && node2.module_type == :random && get(node2.args, :structure,
+            :none) == :spatial
 
         if is_spatially_varying_curve
             dynamic_node = node1
             dynamic_vars = get(dynamic_node.args, :positional_args, [])
-            if isempty(dynamic_vars); error("The dynamic part of a pipe operator (e.g., a smoother) must have a variable."); end
+            if isempty(dynamic_vars)
+                error("The dynamic part of a pipe operator (e.g., a smoother) must have a variable.")
+            end
             
             # Corrected call: Use process_random_module! for the smooth component.
-            smooth_mod_data = Dict(:type => :random, :variables => dynamic_vars, :params => dynamic_node.args)
+            smooth_mod_data = Dict(:type => :random, :variables => dynamic_vars,
+                :params => dynamic_node.args)
             process_random_module!(opt_dict, smooth_mod_data, registries, hyperpriors)
             
             state_node = node2
             # Corrected call: Use process_random_module! for the spatial component.
-            spatial_mod_data = Dict(:type => :random, :variables => get(state_node.args, :positional_args, []), :params => state_node.args)
+            spatial_mod_data = Dict(:type => :random, :variables => get(state_node.args,
+                :positional_args, []), :params => state_node.args)
             process_random_module!(opt_dict, spatial_mod_data, registries, hyperpriors)
             
             mod_data[:params][:dynamic_component_node] = dynamic_node
@@ -7111,34 +7219,68 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
             covariate_node = node1
             spatial_node = node2
             cov_args = get(covariate_node.args, :positional_args, [])
-            if isempty(cov_args); @warn "SVC model is missing a covariate. Skipping."; return false; end
-            covariate_name = cov_args[1]
+            if isempty(cov_args)
+                @warn "SVC model is missing a covariate. Skipping."; return false
+            end
+            covariate_name = Symbol(cov_args[1])
+            spatial_vars = get(spatial_node.args, :positional_args, [])
+            
+            process_random_module!(opt_dict, Dict(:type => :spatial,
+                :params => spatial_node.args, :variables => spatial_vars), registries,
+                hyperpriors)
             
             mod_data[:type] = :svc
-            mod_data[:variables] = [covariate_name, get(spatial_node.args, :positional_args, [])...]
+            mod_data[:variables] = [covariate_name, spatial_vars...]
             mod_data[:params][:covariate] = covariate_name
             mod_data[:params][:spatial_model_spec] = spatial_node
+            
+            inner_comp_type = Symbol(get(spatial_node.args, :model, :icar))
+            inner_obj = resolve_technical_primitive(
+                Dict(:key => "inner", :type => inner_comp_type, :params => spatial_node.args,
+                    :variables => spatial_vars),
+                opt_dict, hyperpriors, opt_dict[:prior_scheme]
+            )
+            mod_data[:params][:inner_model_obj] = inner_obj
             return true
 
         elseif is_tvc
             covariate_node = node1
             temporal_node = node2
             cov_args = get(covariate_node.args, :positional_args, [])
-            if isempty(cov_args); @warn "TVC model is missing a covariate. Skipping."; return false; end
-            covariate_name = cov_args[1]
+            if isempty(cov_args)
+                @warn "TVC model is missing a covariate. Skipping."; return false
+            end
+            covariate_name = Symbol(cov_args[1])
+            temporal_vars = get(temporal_node.args, :positional_args, [])
+
+            process_random_module!(opt_dict, Dict(:type => :temporal,
+                :params => temporal_node.args, :variables => temporal_vars), registries,
+                hyperpriors)
 
             mod_data[:type] = :tvc
-            mod_data[:variables] = [covariate_name, get(temporal_node.args, :positional_args, [])...]
+            mod_data[:variables] = [covariate_name, temporal_vars...]
             mod_data[:params][:covariate] = covariate_name
             mod_data[:params][:temporal_model_spec] = temporal_node
+            
+            inner_comp_type = Symbol(get(temporal_node.args, :model, :ar1))
+            inner_obj = resolve_technical_primitive(
+                Dict(:key => "inner", :type => inner_comp_type, :params => temporal_node.args,
+                    :variables => temporal_vars),
+                opt_dict, hyperpriors, opt_dict[:prior_scheme]
+            )
+            mod_data[:params][:inner_model_obj] = inner_obj
             return true
             
         elseif is_svar
             temporal_node = node1
             spatial_node = node2
             
-            process_random_module!(opt_dict, Dict(:type => :temporal, :params => temporal_node.args, :variables => get(temporal_node.args, :positional_args, [])), registries, hyperpriors)
-            process_random_module!(opt_dict, Dict(:type => :spatial, :params => spatial_node.args, :variables => get(spatial_node.args, :positional_args, [])), registries, hyperpriors)
+            process_random_module!(opt_dict, Dict(:type => :temporal,
+                :params => temporal_node.args, :variables => get(temporal_node.args,
+                :positional_args, [])), registries, hyperpriors)
+            process_random_module!(opt_dict, Dict(:type => :spatial,
+                :params => spatial_node.args, :variables => get(spatial_node.args,
+                :positional_args, [])), registries, hyperpriors)
 
             mod_data[:type] = :svar
             mod_data[:params][:rho_spatial_node] = spatial_node
@@ -7164,24 +7306,49 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
         end
         
         if length(components) == 2
-            s_idx = get(opt_dict, :s_idx, nothing); t_idx = get(opt_dict, :t_idx, nothing); s_N = get(opt_dict, :s_N, nothing)
-            if !isnothing(s_idx) && !isnothing(t_idx) && !isnothing(s_N); mod_data[:params][:indices] = [(t - 1) * s_N + s for (s, t) in zip(s_idx, t_idx)];
-            else @warn "Could not compute Kronecker product indices for '$(mod_data[:variables])'. Ensure spatial and temporal components are defined."; end
+            for comp in components
+                if comp.module_type == :random && !haskey(comp.args, :structure)
+                    args_c = copy(comp.args); args_c[:vars] = get(comp.args, :positional_args, [])
+                    comp.args[:structure] = _infer_structure_from_args(args_c)
+                end
+            end
             
-            c1_type = get(components[1], :module_type, :unknown); c2_type = get(components[2], :module_type, :unknown)
+            c1_type = get(components[1], :module_type, :unknown); c2_type = get(components[2],
+                :module_type, :unknown)
             
-            spatial_node = c1_type == :random && get(components[1].args, :structure, :none) == :spatial ? components[1] : (c2_type == :random && get(components[2].args, :structure, :none) == :spatial ? components[2] : nothing)
+            spatial_node = c1_type == :random && get(components[1].args, :structure,
+                :none) == :spatial ? components[1] : (c2_type == :random && get(components[2].args,
+                :structure, :none) == :spatial ? components[2] : nothing)
             temporal_node = c1_type == :random && get(components[1].args, :structure, :none) == :temporal ? components[1] : (c2_type == :random && get(components[2].args, :structure, :none) == :temporal ? components[2] : nothing)
             
             if !isnothing(spatial_node) && !isnothing(temporal_node)
-                spatial_model_str = string(get(spatial_node.args, :model, :iid)); temporal_model_str = string(get(temporal_node.args, :model, :iid))
+                spatial_vars = get(spatial_node.args, :positional_args, [])
+                temporal_vars = get(temporal_node.args, :positional_args, [])
+                process_random_module!(opt_dict, Dict(:type => :spatial,
+                    :params => spatial_node.args, :variables => spatial_vars), registries,
+                    hyperpriors)
+                process_random_module!(opt_dict, Dict(:type => :temporal,
+                    :params => temporal_node.args, :variables => temporal_vars), registries,
+                    hyperpriors)
+                
+                spatial_model_str = string(get(spatial_node.args, :model,
+                    :iid)); temporal_model_str = string(get(temporal_node.args, :model, :iid))
                 has_structured_space = spatial_model_str != "iid"; has_structured_time = temporal_model_str != "iid"
-                if has_structured_space && has_structured_time; opt_dict[:model_st] = "IV";
-                elseif !has_structured_space && has_structured_time; opt_dict[:model_st] = "II";
-                elseif has_structured_space && !has_structured_time; opt_dict[:model_st] = "III";
+                if has_structured_space && has_structured_time
+                    opt_dict[:model_st] = "IV"
+                elseif !has_structured_space && has_structured_time
+                    opt_dict[:model_st] = "II"
+                elseif has_structured_space && !has_structured_time
+                    opt_dict[:model_st] = "III"
                 else opt_dict[:model_st] = "I"; end
             end
-            return false
+            
+            s_idx = get(opt_dict, :s_idx, nothing); t_idx = get(opt_dict, :t_idx,
+                nothing); s_N = get(opt_dict, :s_N, nothing)
+            if !isnothing(s_idx) && !isnothing(t_idx) && !isnothing(s_N)
+                mod_data[:params][:indices] = [(t - 1) * s_N + s for (s, t) in zip(s_idx, t_idx)]
+            end
+            return true
         else
             @warn "Kronecker product with more than 2 components is not yet supported in process_interact_module!."
         end
@@ -7191,16 +7358,14 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
 end
 
 
+"""
+    _process_mosaic_grouping!(opt_dict::Dict, mod_data::Dict)
+
+Partitions the spatial domain into mosaic regions using k-means clustering or predefined
+  cluster indices.
+Returns a `NamedTuple` containing the grouping column name and number of regions.
+"""
 function _process_mosaic_grouping!(opt_dict, mod_data)
-    # Purpose: Handles the grouping logic for mosaic models, partitioning the spatial domain.
-    # Rationale: Centralizes the logic for creating mosaic groups, supporting k-means clustering
-    #            or pre-defined grouping columns. This version enhances robustness and clarity,
-    #            especially for pre-defined groups, by validating consistency and completeness.
-    # v1.0.1 (2026-08-13)
-    # Inputs:
-    #   - opt_dict: The main model configuration dictionary.
-    #   - mod_data: The parsed data for the `random()` module call.
-    # Outputs: A NamedTuple containing the new observation-level grouping column name and the number of regions.
 
     s_N = get(opt_dict, :s_N, 0)
     if s_N == 0
@@ -7378,7 +7543,9 @@ function process_sciml_module!(
                     params[arg] = Core.eval(calling_mod, raw_val)
                 catch e
                     @warn "Could not evaluate `$(arg)` argument for sciml() module. Using default. Error: $e"
-                    if arg == :de_kwargs; params[arg] = Dict(); end
+                    if arg == :de_kwargs
+                        params[arg] = Dict()
+                    end
                 end
             end
         end
@@ -7399,7 +7566,8 @@ function process_sciml_module!(
 
     prob_func = getfield(calling_mod, params[:model_func])
     de_kwargs = get(params, :de_kwargs, Dict())
-    prob_template = ODEProblem(prob_func, u0_placeholder, params[:tspan], p_placeholder; de_kwargs...)
+    prob_template = ODEProblem(prob_func, u0_placeholder, params[:tspan], p_placeholder;
+        de_kwargs...)
 
     if !haskey(opt_dict, :sciml_problem_templates)
         opt_dict[:sciml_problem_templates] = Dict{Symbol, Any}()
@@ -7438,13 +7606,22 @@ function process_dynamics_module!(
     variables = mod_data[:variables] # Positional arguments from the formula, e.g., s_idx, year
 
     # 1. Validate and set up spatial and temporal indices from formula arguments.
-    # The dynamics module expects at least two positional arguments: spatial_index, temporal_index
+    # The dynamics module expects spatial_index, temporal_index, or infers them from data
     if length(variables) < 2
-        error("The `dynamics()` module requires at least two positional arguments: a spatial index and a temporal index (e.g., `dynamics(s_idx, year, ...)`).")
+        s_var = hasproperty(data, :s_idx) ? :s_idx : (hasproperty(data,
+            :district) ? :district : nothing)
+        t_var = hasproperty(data, :year) ? :year : (hasproperty(data,
+            :t_idx) ? :t_idx : (hasproperty(data, :time) ? :time : nothing))
+        if !isnothing(s_var) && !isnothing(t_var)
+            spatial_idx_var = s_var
+            temporal_idx_var = t_var
+        else
+            error("The `dynamics()` module requires at least two positional arguments: a spatial index and a temporal index (e.g., `dynamics(s_idx, year, ...)`).")
+        end
+    else
+        spatial_idx_var = Symbol(variables[1])
+        temporal_idx_var = Symbol(variables[2])
     end
-
-    spatial_idx_var = Symbol(variables[1])
-    temporal_idx_var = Symbol(variables[2])
 
     # Resolve spatial index and its number of levels
     if !hasproperty(data, spatial_idx_var)
@@ -7520,22 +7697,6 @@ A constant dictionary that serves as the central dispatch table for processing m
 parsed from the `bstm` formula. This registry maps a module's type (a `Symbol` like
 `:random` or `:mixed`) to its corresponding processor function.
 
-# Rationale
-This dispatch mechanism is a core element of the refactored component-based
-architecture. It replaces a monolithic series of `if/elseif` checks with a clean,
-extensible, and maintainable system. When the `bstm_config` function encounters a
-module in the parsed formula, it looks up the module's type in this dictionary and
-calls the associated function to perform data-dependent setup and validation.
-
-This design is consistent with the refactor's goals:
-- **Modularity**: Each module's setup logic is encapsulated in its own processor function.
-- **Consolidation**: It reflects the consolidation of older modules like `:spatial`,
-  `:temporal`, and `:smooth` into the unified `:random` module, which is handled by
-  `process_random_module!`.
-- **Extensibility**: New modules can be added to the framework by defining a new
-  processor function and adding an entry to this dictionary.
-
-This constant is the definitive registry for the current system.
 """ 
 const MODULE_PROCESSORS = Dict{Symbol, Function}(
     :random => process_random_module!,

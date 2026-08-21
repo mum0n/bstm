@@ -5,13 +5,14 @@ A component model for a second-order autoregressive (AR2) process, fundamental f
 modeling time series data with serial correlation and pseudo-periodic behavior.
 
 # Version
-v1.4.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The AR2 process models the value of a latent field \$\\phi_t\$ at time \$t\$ as a linear
 combination of its values at the two previous time steps, plus an independent
 innovation term \$\\epsilon_t\$:
-\$\\phi_t = \\rho_1 \\phi_{t-1} + \\rho_2 \\phi_{t-2} + \\epsilon_t\$, where \$\\epsilon_t \\sim \\mathcal{N}(0, \\sigma^2)\$
+\$\\phi_t = \\rho_1 \\phi_{t-1} + \\rho_2 \\phi_{t-2} + \\epsilon_t\$, where \$\\epsilon_t
+  \\sim \\mathcal{N}(0, \\sigma^2)\$
 
 To ensure stationarity, the parameters \$(\\rho_1, \\rho_2)\$ must lie within a
 triangular region defined by:
@@ -43,9 +44,9 @@ controlled by the `random()` call:
 - **Required**:
   - A temporal index variable (e.g., `year`) passed to `random()`.
 - **Optional (in `random()` call)**:
-  - `unconstrained_rho1`: A `Distribution` for the first unconstrained partial
+  - `rho1_unconstrained`: A `Distribution` for the first unconstrained partial
     autocorrelation coefficient. Default: `Normal(0, 1.5)`.
-  - `unconstrained_rho2`: A `Distribution` for the second unconstrained partial
+  - `rho2_unconstrained`: A `Distribution` for the second unconstrained partial
     autocorrelation coefficient. Default: `Normal(0, 1.5)`.
   - `sigma`: A `Distribution` for the prior on the innovations' standard deviation.
     Default: `Exponential(1.0)`.
@@ -53,13 +54,13 @@ controlled by the `random()` call:
     `:centered`). Default: `:statespace`.
 
 # Outputs (Parameter Names)
-- `unconstrained_rho1_<key>`: The first unconstrained parameter sampled by Turing.
-- `unconstrained_rho2_<key>`: The second unconstrained parameter sampled by Turing.
+- `rho1_unconstrained_<key>`: The first unconstrained parameter sampled by Turing.
+- `rho2_unconstrained_<key>`: The second unconstrained parameter sampled by Turing.
 - `rho1_<key>`: The first transformed AR coefficient.
 - `rho2_<key>`: The second transformed AR coefficient.
 - `sigma_<key>`: The standard deviation of the AR2 innovations.
-- `innovations_<key>`: The latent standard normal innovations driving the process (for `:statespace`).
-- `latent_<key>`: The latent field (for `:centered`).
+- `ure_<key>`: Standard normal innovations driving the process.
+- `sre_<key>`: Reconstructed temporal latent field.
 
 # Key References
 - Hamilton, J. D. (1994). *Time Series Analysis*. Princeton University Press.
@@ -71,16 +72,10 @@ struct AR2 <: ComponentModel
     method::Symbol
 end
 
-Base.getproperty(m::AR2, s::Symbol) = (
-    s === :unconstrained_rho1 ? getfield(m, :rho1_unconstrained) :
-    s === :unconstrained_rho2 ? getfield(m, :rho2_unconstrained) :
-    getfield(m, s)
-)
-
 COMPONENT_TYPE_REGISTRY[:ar2] = AR2
 COMPONENT_CONSTRUCTORS[:ar2] = (p, params) -> AR2(
-    get(p, :rho1_unconstrained, get(p, :unconstrained_rho1, Normal(0, 1.5))),
-    get(p, :rho2_unconstrained, get(p, :unconstrained_rho2, Normal(0, 1.5))),
+    get(p, :rho1_unconstrained, Normal(0, 1.5)),
+    get(p, :rho2_unconstrained, Normal(0, 1.5)),
     get(p, :sigma, Exponential(1.0)),
     get(params, :method, :statespace)
 )
@@ -154,7 +149,7 @@ function get_updates(
         $(p_names.sre) = ar2_statespace(
             rho1, rho2, $(p_names.sigma), $(p_names.ure), $(n_latent), M.noise
         )
-        $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+        $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
     """
 
     centered_code = """
@@ -169,7 +164,7 @@ function get_updates(
                 rho1, rho2, $(p_names.sigma), $(n_latent), M.noise
             )
             $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), Symmetric(K))
-            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
         end
     """
 
@@ -227,8 +222,12 @@ function _ar2_covariance_matrix(rho1, rho2, sigma, n, noise)
 
     # Calculate the first row of the Toeplitz matrix (the autocovariance function)
     acf = Vector{T_num}(undef, n)
-    if n > 0; acf[1] = gamma_0; end
-    if n > 1; acf[2] = gamma_1; end
+    if n > 0
+        acf[1] = gamma_0
+    end
+    if n > 1
+        acf[2] = gamma_1
+    end
     for i in 3:n
         acf[i] = rho1 * acf[i-1] + rho2 * acf[i-2]
     end
@@ -367,11 +366,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -380,8 +375,8 @@ function get_effects(
     
     # --- Index Handling: Combine training and prediction sets ---
     t_idx_train = M.t_idx
-    t_idx_full = if !isnothing(PS) && haskey(PS.data, :t_idx)
-        vcat(t_idx_train, get(PS.data, :t_idx, []))
+    t_idx_full = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
+        vcat(t_idx_train, PS.data.t_idx)
     else
         t_idx_train
     end
@@ -397,8 +392,10 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        rho1_name = _find_parameter(p_names, string(p_names_k.rho1_unconstrained), k, is_multivariate_model)
-        rho2_name = _find_parameter(p_names, string(p_names_k.rho2_unconstrained), k, is_multivariate_model)
+        rho1_name = _find_parameter(p_names, string(p_names_k.rho1_unconstrained), k,
+            is_multivariate_model)
+        rho2_name = _find_parameter(p_names, string(p_names_k.rho2_unconstrained), k,
+            is_multivariate_model)
         
         if isempty(sigma_name) || isempty(rho1_name) || isempty(rho2_name)
             @warn "Base parameters for AR2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."

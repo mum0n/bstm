@@ -8,12 +8,13 @@ movement), diffusion (random movement), and reaction (local population growth/de
 It can also integrate mark-recapture telemetry data to inform movement parameters.
 
 # Version
-v1.3.1 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The component approximates the solution to the Advection-Diffusion-Reaction PDE:
 
-\$\\frac{\\partial C}{\\partial t} = \\nabla \\cdot (D \\nabla C) - \\nabla \\cdot (\\mathbf{v} C) + f(C)\$
+\$\\frac{\\partial C}{\\partial t} = \\nabla \\cdot (D \\nabla C) - \\nabla \\cdot
+  (\\mathbf{v} C) + f(C)\$
 
 where:
 - `C` is the concentration or density of the population.
@@ -32,8 +33,11 @@ these observations. The transition probability over `k` time steps is calculated
 from the one-step transition matrix `Gamma` (the inverse of the propagator) as `Gamma^k`.
 
 The `mark_recapture_data` can be provided in two formats:
-1.  A `DataFrame` in "long" format with columns: `tagid`, `s_idx`, `time`, `tag`, and an optional `individual_covariate`. The component will automatically process this into transitions.
-2.  A pre-processed `Matrix` in "wide" format with columns: `[release_unit, recapture_unit, time_steps, individual_covariate]`.
+1.  A `DataFrame` in "long" format with columns: `tagid`, `s_idx`, `time`, `tag`, and an
+  optional `individual_covariate`. The component will automatically process this into
+  transitions.
+2.  A pre-processed `Matrix` in "wide" format with columns: `[release_unit, recapture_unit,
+  time_steps, individual_covariate]`.
 
 # Computational Methods
 - **`:explicit` (Default, AD-friendly)**: Uses an explicit Euler time-stepping
@@ -95,7 +99,9 @@ function _raster_to_graph(raster::AbstractMatrix)
         idx = (c - 1) * rows + r
         # 8-neighbor connectivity (Queen's case)
         for dr in -1:1, dc in -1:1
-            if dr == 0 && dc == 0; continue; end
+            if dr == 0 && dc == 0
+                continue
+            end
             nr, nc = r + dr, c + dc
             if 1 <= nr <= rows && 1 <= nc <= cols
                 n_idx = (nc - 1) * rows + nr
@@ -118,7 +124,9 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
     if isnothing(W)
         if haskey(params, :habitat_raster)
             raster = params[:habitat_raster]
-            if !(raster isa AbstractMatrix); error("`habitat_raster` must be a matrix."); end
+            if !(raster isa AbstractMatrix)
+                error("`habitat_raster` must be a matrix.")
+            end
             W = _raster_to_graph(raster)
         else
             error("The `movement` component requires either an adjacency matrix `W` or a `habitat_raster` parameter.")
@@ -132,7 +140,9 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
     if haskey(params, :habitat)
         habitat_val = params[:habitat]
         if habitat_val isa Symbol
-            if !hasproperty(data, habitat_val); error("Habitat variable ':$habitat_val' not found in data."); end
+            if !hasproperty(data, habitat_val)
+                error("Habitat variable ':$habitat_val' not found in data.")
+            end
             habitat_per_obs = data[!, habitat_val]
             habitat_aggregated = zeros(Float64, s_N)
             counts = zeros(Int, s_N)
@@ -143,7 +153,9 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
             end
             habitat_data = habitat_aggregated ./ max.(1, counts)
         elseif habitat_val isa AbstractVector
-            if length(habitat_val) != s_N; error("Provided `habitat` vector length ($(length(habitat_val))) does not match s_N ($(s_N))."); end
+            if length(habitat_val) != s_N
+                error("Provided `habitat` vector length ($(length(habitat_val))) does not match s_N ($(s_N)).")
+            end
             habitat_data = convert(Vector{Float64}, habitat_val)
         else
             error("The `habitat` parameter must be a Symbol (column name) or a Vector of length s_N.")
@@ -190,7 +202,9 @@ function _process_telemetry_data(telemetry_df::DataFrame)
     gdf = groupby(telemetry_df, :tagid)
 
     for sub_df in gdf
-        if nrow(sub_df) < 2; continue; end
+        if nrow(sub_df) < 2
+            continue
+        end
         
         # Sort observations for each individual by tag/time
         sort!(sub_df, :tag)
@@ -204,7 +218,8 @@ function _process_telemetry_data(telemetry_df::DataFrame)
             time_steps = round(Int, recapture_row.time - release_row.time)
             
             # Use individual covariate if present, otherwise default to 0
-            covariate = hasproperty(sub_df, :individual_covariate) ? release_row.individual_covariate : 0.0
+            covariate = hasproperty(sub_df,
+                :individual_covariate) ? release_row.individual_covariate : 0.0
 
             push!(transitions, [release_unit, recapture_unit, time_steps, covariate])
         end
@@ -252,19 +267,11 @@ end
 """
     get_updates(m::Movement, spec::NamedTuple, arch::String, outcome_idx, M)
 
-Generates the Turing code to construct the latent effect for the `Movement`
-component and add it to the linear predictor. This version is CPU-only and uses
-a numerically stable approach for the telemetry likelihood.
+Generates the Turing DSL code to construct the latent effect for the `Movement` component
+and adds it to the linear predictor `eta`.
 
 # Version
-v1.3.1 (2026-08-19)
-
-# Rationale
-This version replaces the explicit matrix inversion (`inv()`) in the telemetry
-likelihood calculation with a more numerically stable approach using LU factorization
-and back-substitution (`\\`). This avoids potential `DomainError` or `NaN` propagation
-that can occur when the propagator matrix becomes singular or ill-conditioned during
-sampling, which is a common source of the error type shown in the user's request.
+v1.0.0
 
 # Arguments
 - `m::Movement`: The `Movement` component instance.
@@ -272,6 +279,7 @@ sampling, which is a common source of the error type shown in the user's request
 - `arch::String`: The model architecture (`"univariate"` or `"multivariate"`).
 - `outcome_idx::Union{Int, Nothing}`: The index of the outcome variable.
 - `M::NamedTuple`: The main model configuration.
+"""
 
 # Returns
 - A `String` containing the generated Turing code for the component's updates.
@@ -316,7 +324,8 @@ function get_updates(
         end
         """
     elseif m.method == :explicit
-        reaction_term_code = has_reaction ? "+ ($(p_names.r) .* dyn_field[:, t-1] .* (1.0 .- dyn_field[:, t-1] ./ $(p_names.K)))" : ""
+        reaction_term_code = has_reaction ? "+ ($(p_names.r) .* dyn_field[:, t-1] .* (1.0 .-
+          dyn_field[:, t-1] ./ $(p_names.K)))" : ""
         """
         # Explicit Euler method (AD-friendly, conditionally stable)
         propagator_t = $(p_names.velocity) * A_op + Diagonal(diffusion_field) * L_op
@@ -349,7 +358,8 @@ function get_updates(
             if time_steps > 0
                 # To get the u_rel-th row of inv(M_prop_tlm)^k, we solve
                 # (M_prop_tlm')^k * x = e_urel, where e_urel is a basis vector.
-                # This is done by k successive linear solves using the pre-computed LU factorization.
+                # This is done by k successive linear solves using the pre-computed LU
+                #   factorization.
                 e_urel = zeros(T_num_dyn, $(hyper.s_N))
                 e_urel[u_rel] = 1.0
                 
@@ -378,7 +388,7 @@ function get_updates(
         # Vectorized update to the linear predictor using linear indexing
         st_idx = (M.t_idx .- 1) .* spec.hyper.s_N .+ M.s_idx
         $(p_names.sre) = vec(dyn_field)[st_idx]
-        $(eta_target) .+= $(p_names.sre)
+        $(eta_target) = $(eta_target) .+ $(p_names.sre)
     """
 
     return """
@@ -447,15 +457,21 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         # Find parameter names
-        velocity_name = _find_parameter(p_names, string(p_names_k.velocity), k, is_multivariate_model)
-        diffusion_name = _find_parameter(p_names, string(p_names_k.diffusion), k, is_multivariate_model)
+        velocity_name = _find_parameter(p_names, string(p_names_k.velocity), k,
+          is_multivariate_model)
+        diffusion_name = _find_parameter(p_names, string(p_names_k.diffusion), k,
+          is_multivariate_model)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-        r_name = hasproperty(p_names_k, :r) ? _find_parameter(p_names, string(p_names_k.r), k, is_multivariate_model) : ""
-        K_name = hasproperty(p_names_k, :K) ? _find_parameter(p_names, string(p_names_k.K), k, is_multivariate_model) : ""
+        r_name = hasproperty(p_names_k, :r) ? _find_parameter(p_names, string(p_names_k.r),
+          k, is_multivariate_model) : ""
+        K_name = hasproperty(p_names_k, :K) ? _find_parameter(p_names, string(p_names_k.K),
+          k, is_multivariate_model) : ""
 
-        if isempty(velocity_name) || isempty(diffusion_name) || isempty(sigma_name) || isempty(ure_name)
-            @warn "Parameters for Movement component $(key) (outcome $k) not found. Returning zero-matrix."
+        if isempty(velocity_name) || isempty(diffusion_name) || isempty(sigma_name) ||
+          isempty(ure_name)
+            @warn "Parameters for Movement component $(key) (outcome $k) not found.
+              Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
@@ -467,10 +483,12 @@ function get_effects(
         ure_samples = get_params_vector(chain, ure_name, s_N * t_N)'
         
         r_samples = !isempty(r_name) ? get_params_vector(chain, r_name, 1)[:, 1] : zeros(n_samples)
-        K_samples = !isempty(K_name) ? get_params_vector(chain, K_name, 1)[:, 1] : fill(Inf, n_samples)
+        K_samples = !isempty(K_name) ? get_params_vector(chain, K_name, 1)[:, 1] : fill(Inf,
+          n_samples)
 
         beta_habitat_samples = if hasproperty(hyper, :habitat_data)
-            beta_name = _find_parameter(p_names, "beta_habitat_diffusion_$(key)", k, is_multivariate_model)
+            beta_name = _find_parameter(p_names, "beta_habitat_diffusion_$(key)", k,
+              is_multivariate_model)
             isempty(beta_name) ? nothing : get_params_vector(chain, beta_name, 1)[:, 1]
         else
             nothing
@@ -504,16 +522,20 @@ function get_effects(
 
             # Time evolution loop
             if m.method == :implicit
-                propagator_t = lu(I_s - velocity_samples[i] * A_op - Diagonal(diffusion_field) * L_op)
+                propagator_t = lu(I_s - velocity_samples[i] * A_op -
+                  Diagonal(diffusion_field) * L_op)
                 for t in 2:t_N_full
-                    dyn_field_sample[:, t] = (propagator_t \ dyn_field_sample[:, t-1]) .+ innov_matrix_full[:, t]
+                    dyn_field_sample[:, t] = (propagator_t \ dyn_field_sample[:, t-1]) .+
+                      innov_matrix_full[:, t]
                 end
             else # :explicit
                 propagator_t = velocity_samples[i] * A_op + Diagonal(diffusion_field) * L_op
                 for t in 2:t_N_full
                     ad_diff_term = propagator_t * dyn_field_sample[:, t-1]
-                    reaction_term = r_samples[i] .* dyn_field_sample[:, t-1] .* (1.0 .- dyn_field_sample[:, t-1] ./ K_samples[i])
-                    dyn_field_sample[:, t] = dyn_field_sample[:, t-1] + ad_diff_term + reaction_term + innov_matrix_full[:, t]
+                    reaction_term = r_samples[i] .* dyn_field_sample[:, t-1] .* (1.0 .-
+                      dyn_field_sample[:, t-1] ./ K_samples[i])
+                    dyn_field_sample[:, t] = dyn_field_sample[:, t-1] + ad_diff_term +
+                      reaction_term + innov_matrix_full[:, t]
                 end
             end
             

@@ -6,7 +6,7 @@ specifically the Poincaré disk model. This allows for modeling data with hierar
 or tree-like structures, where the notion of distance is warped.
 
 # Version
-v1.1.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 This component models a latent field \\(f(s)\\) as a draw from a Gaussian Process where
@@ -17,7 +17,8 @@ Euclidean distance.
     unit disk.
 2.  **Hyperbolic Distance**: The distance \$d_c(u, v)\$ between two points \$u, v\$ in
     the Poincaré disk with curvature \$c < 0\$ is given by:
-    \$d_c(u, v) = \\frac{1}{\\sqrt{-c}} \\text{arccosh}\\left(1 + 2 \\frac{\\|u-v\\|^2}{(1-\\|u\\|^2)(1-\\|v\\|^2)}\\right)\$
+    \$d_c(u, v) = \\frac{1}{\\sqrt{-c}} \\text{arccosh}\\left(1 + 2
+      \\frac{\\|u-v\\|^2}{(1-\\|u\\|^2)(1-\\|v\\|^2)}\\right)\$
 3.  **Kernel**: A standard kernel, such as the Squared Exponential, is applied to this
     hyperbolic distance:
     \$k(u, v) = \\sigma^2 \\exp\\left(-\\frac{d_c(u,v)^2}{2}\\right)\$
@@ -108,7 +109,9 @@ end
 
 function _poincare_dist_sq(u, v, curvature)
     c = sqrt(max(0.0, -curvature))
-    if c == 0.0; return sum((u .- v).^2); end # Fallback to Euclidean
+    if c == 0.0
+        return sum((u .- v).^2)
+    end # Fallback to Euclidean
     
     norm_u_sq = sum(u.^2)
     norm_v_sq = sum(v.^2)
@@ -180,7 +183,7 @@ function get_updates(
             F_gp = cholesky(Symmetric(K_mat))
             $(p_names.sre) = F_gp.L * $(p_names.ure)
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 end
@@ -204,8 +207,10 @@ function get_effects(
     coord_vars = get(spec.params, :positional_args, [])
     coords_train = spec.hyper.coords
     # Combine training and prediction coordinates
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars) # If prediction set is provided
-        coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]) # Extract prediction coordinates
+    coords_full = if !isnothing(PS) && all(hasproperty(PS.data,
+        Symbol(v)) for v in coord_vars) # If prediction set is provided
+        coords_pred = Matrix{Float64}(PS.data[!,
+            Symbol.(coord_vars)]) # Extract prediction coordinates
         vcat(coords_train, coords_pred) # Combine training and prediction coordinates
     else
         coords_train # Otherwise, use only training coordinates
@@ -239,7 +244,8 @@ function get_effects(
         # --- Sample-wise Reconstruction ---
         for i in 1:n_samples # Iterate over each posterior sample
             # Kernel evaluation and Cholesky
-            K_mat = _evaluate_hyperbolic_kernel_matrix(coords_full, sigma_samples[i, 1], curvature, noise)
+            K_mat = _evaluate_hyperbolic_kernel_matrix(coords_full, sigma_samples[i, 1],
+                curvature, noise)
             F = cholesky(Symmetric(K_mat))
 
             # Combine training innovations with new innovations for prediction points (if any)

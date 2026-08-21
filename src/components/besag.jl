@@ -7,14 +7,15 @@ where the value at a location is assumed to be conditionally dependent on the
 average of its neighbors.
 
 # Version
-v1.4.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The Besag model defines a Gaussian Markov Random Field (GMRF) with a singular
 precision matrix (the graph Laplacian), making it an "intrinsic" GMRF. The
 conditional distribution of the spatial effect \$\\phi_i\$ at location \$i\$, given all
 other locations, is:
-\$\\phi_i | \\phi_{j \\ne i} \\sim \\mathcal{N}\\left( \\frac{1}{d_i} \\sum_{j \\sim i} \\phi_j, \\frac{\\sigma^2}{d_i} \\right)\$
+\$\\phi_i | \\phi_{j \\ne i} \\sim \\mathcal{N}\\left( \\frac{1}{d_i} \\sum_{j \\sim i}
+  \\phi_j, \\frac{\\sigma^2}{d_i} \\right)\$
 where \$j \\sim i\$ denotes that \$j\$ is a neighbor of \$i\$, and \$d_i\$ is the number of
 neighbors.
 
@@ -41,8 +42,10 @@ strong prior belief in local spatial smoothing.
   - A spatial index variable (e.g., `s_idx`).
   - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
 - **Optional (in `random()` call)**:
-  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default: `Exponential(1.0)`.
-  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`). Default: `:spectral`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default:
+    `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
+    Default: `:spectral`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the latent field.
@@ -104,9 +107,11 @@ function get_precomputes(m::Besag, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    _besag_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, sigma, y_sigma, noise=1e-6)
+    _besag_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, sigma,
+      y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for a Besag (ICAR) spatial component integrated out analytically.
+Computes the exact log marginal likelihood for a Besag (ICAR) spatial component integrated
+  out analytically.
 """
 function _besag_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -118,7 +123,8 @@ function _besag_log_marginal_likelihood(
     y_sigma::T,
     noise::Real=1e-6
 ) where {T}
-    return _icar_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, sigma, y_sigma, noise)
+    return _icar_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, sigma,
+        y_sigma, noise)
 end
 
 """
@@ -145,7 +151,8 @@ function get_priors(
     end
 end
 
-function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Union{Int,
+    Nothing}, M::NamedTuple)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
@@ -159,7 +166,7 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
             
             $(p_names.sre) = hyper.U * (diag_D .* $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -171,7 +178,7 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
             sre_centered = sre_unscaled .- mean(sre_unscaled)
             
             $(p_names.sre) = sre_centered .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -187,7 +194,7 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
             sre_centered = sre_unscaled .- mean(sre_unscaled)
             
             $(p_names.sre) = sre_centered .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -235,11 +242,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))

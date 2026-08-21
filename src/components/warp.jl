@@ -8,7 +8,7 @@ coordinates are first "warped" by a non-linear function (approximated by RFFs),
 and then a standard RFF-based GP is applied to these warped coordinates.
 
 # Version
-v1.0.3 (2026-08-15)
+v1.0.0
 
 # Mathematical Summary
 A Warped Gaussian Process models a non-stationary function \$f(x)\$ by composing a
@@ -38,11 +38,15 @@ of the main GP dependent on the input location \$x\$.
 - **Required**:
   - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
 - **Optional (in `random()` call)**:
-  - `n_features`: `Int`, number of random features for both the warping and main RFF layers. Default: `20`.
-  - `kernel`: `String`, name of the kernel to approximate (e.g., `"se"`, `"matern32"`). Default: `"se"`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s) of the main GP.
+  - `n_features`: `Int`, number of random features for both the warping and main RFF layers.
+    Default: `20`.
+  - `kernel`: `String`, name of the kernel to approximate (e.g., `"se"`, `"matern32"`).
+    Default: `"se"`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel lengthscale(s) of the main GP.
   - `sigma`: `UnivariateDistribution`, prior for the std. dev. of the main GP's coefficients.
-  - `method`: `Symbol`, the computational method (`:noncentered` or `:centered`). Default: `:noncentered`.
+  - `method`: `Symbol`, the computational method (`:noncentered` or `:centered`). Default:
+    `:noncentered`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the main GP's coefficients.
@@ -235,13 +239,15 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
         
         # 1. Construct and apply the warping function
         local W_warp_matrix = reshape($(W_warp_name), $(in_dims), $(n_features))
-        local Phi_warp = sqrt(2.0 / $(n_features)) .* cos.((coords * W_warp_matrix) .+ $(b_warp_name)')
+        local Phi_warp = sqrt(2.0 / $(n_features)) .* cos.((coords * W_warp_matrix) .+
+          $(b_warp_name)')
         local warping_effect = Phi_warp * $(beta_warp_name)
         local coords_warped = coords .+ warping_effect
 
         # 2. Construct the main GP on the warped coordinates
         $(ls_scaling_code)
-        local Phi_main = sqrt(2.0 / $(n_features)) .* cos.((coords_warped * W_main_matrix) .+ $(b_main_name)')
+        local Phi_main = sqrt(2.0 / $(n_features)) .* cos.((coords_warped * W_main_matrix)
+          .+ $(b_main_name)')
     """
 
     noncentered_code = """
@@ -253,7 +259,7 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
             local scaled_beta_main = $(p_names.ure) .* $(p_names.sigma)
             $(p_names.sre) = Phi_main * scaled_beta_main
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -263,7 +269,7 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
             $(common_code)
             
             # 3. Sample coefficients directly and compute final effect
-            $(eta_target) .+= Phi_main * $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ Phi_main * $(p_names.sre)
         end
     """
 

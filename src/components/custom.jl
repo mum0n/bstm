@@ -6,7 +6,7 @@ This provides an "escape hatch" for advanced users who need to implement logic
 not covered by the standard components.
 
 # Version
-v1.2.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 This component does not have a fixed mathematical form. It is a "blank canvas"

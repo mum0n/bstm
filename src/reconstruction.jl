@@ -1,34 +1,133 @@
-# reconstruction logic
+"""
+    reconstruction.jl
 
+Posterior reconstruction, analytical post-processing, latent field synthesis,
+denoised/noisy point predictions, WAIC computation, and MCMC convergence diagnostics for BSTM.
+
+Version: v1.0.0
+"""
 # ==============================================================================
 # SECTION 1: CORE UTILITIES FOR PARAMETER EXTRACTION
 # ==============================================================================
 
+"""
+    get_kernel_from_string(kernel_name::String)::Kernel
+
+Maps a string identifier to its corresponding `KernelFunctions.jl` kernel instance.
+"""
 function get_kernel_from_string(kernel_name::String)
-    # Purpose: Maps a string identifier to a `KernelFunctions.jl` kernel object.
-    # Rationale: Centralizes kernel selection for GP-based models.
-    # Inputs:
-    #   - kernel_name: The string name of the kernel.
-    # Outputs: A `Kernel` object.
     k_name = lowercase(kernel_name)
-    if k_name == "constant"; return ConstantKernel();
-    elseif k_name == "linear"; return LinearKernel();
-    elseif k_name == "matern12" || k_name == "exponential"; return Matern12Kernel();
-    elseif k_name == "matern32"; return Matern32Kernel();
-    elseif k_name == "matern52"; return Matern52Kernel();
-    elseif k_name == "spherical"; return SphericalKernel();
-    elseif k_name == "squared_exponential" || k_name == "se" || k_name == "gaussian" || k_name == "rbf"; return SqExponentialKernel();
-    elseif k_name == "periodic"; return PeriodicKernel();
+    if k_name == "constant"
+        return ConstantKernel()
+    elseif k_name == "linear"
+        return LinearKernel()
+    elseif k_name in ["matern12", "exponential"]
+        return Matern12Kernel()
+    elseif k_name == "matern32"
+        return Matern32Kernel()
+    elseif k_name == "matern52"
+        return Matern52Kernel()
+    elseif k_name == "spherical"
+        return SphericalKernel()
+    elseif k_name in ["squared_exponential", "se", "gaussian", "rbf"]
+        return SqExponentialKernel()
+    elseif k_name == "periodic"
+        return PeriodicKernel()
     else
         @warn "Kernel '$kernel_name' not recognized. Defaulting to SqExponentialKernel."
         return SqExponentialKernel()
     end
 end
 
- 
-# Version 1.3.0 (2026-08-20)
-# Purpose: Finds a parameter name in a list based on the canonical target_name_base convention.
-# Canonical signature: _find_parameter(p_names, target_name_base, outcome_idx=nothing, is_multivariate_model=false)
+"""
+    _get_clean_chain_param_names(chain::Any)::Vector{String}
+
+Extracts clean parameter names from chains of various formats (`VNChain`, `FlexiChain`,
+  `DataFrame`, `Dict`, `NamedTuple`).
+"""
+function _get_clean_chain_param_names(chain::Any)::Vector{String}
+    raw_names = if chain isa DataFrame
+        string.(names(chain))
+    elseif chain isa Dict
+        string.(keys(chain))
+    elseif chain isa NamedTuple
+        string.(keys(chain))
+    else
+        try
+            collect(string.(_get_varname_symbol.(keys(chain))))
+        catch
+            try
+                string.(names(DataFrame(chain)))
+            catch
+                try
+                    string.(collect(keys(chain)))
+                catch
+                    String[]
+                end
+            end
+        end
+    end
+
+    clean_names = String[]
+    for n in raw_names
+        cleaned = replace(string(n), r"^Parameter\((.*)\)$" => s"\1", r"^parameters\." => "", r"^:+" => "")
+        push!(clean_names, cleaned)
+    end
+    return unique(clean_names)
+end
+
+"""
+    _get_chain_n_samples(chain::Any)::Int
+
+Robustly extracts the total number of posterior samples from any chain type
+(`VNChain`, `FlexiChain`, `MCMCChains.Chains`, `DataFrame`, `Dict`, `NamedTuple`).
+"""
+function _get_chain_n_samples(chain::Any)::Int
+    if occursin("FlexiChain", string(typeof(chain))) || occursin("VNChain", string(typeof(chain)))
+        try
+            return size(chain, 1) * FlexiChains.nchains(chain)
+        catch
+            return size(chain, 1)
+        end
+    elseif chain isa DataFrame
+        return nrow(chain)
+    elseif chain isa AbstractDict || chain isa NamedTuple
+        if isempty(chain)
+            return 0
+        end
+        first_val = first(values(chain))
+        if first_val isa AbstractArray
+            if eltype(first_val) <: AbstractArray
+                return length(first_val)
+            elseif ndims(first_val) >= 2 && size(first_val, 1) == 1
+                return size(first_val, 2)
+            else
+                return size(first_val, 1)
+            end
+        else
+            return 1
+        end
+    else
+        try
+            return size(chain, 1) * size(chain, 3)
+        catch
+            try
+                return size(chain, 1)
+            catch
+                return 1
+            end
+        end
+    end
+end
+
+"""
+    _find_parameter(reg::ParamRegistry, target_name_base, outcome_idx=nothing,
+      is_multivariate_model=false)
+    _find_parameter(p_names, target_name_base, outcome_idx=nothing, is_multivariate_model=false)
+
+Finds the canonical parameter name in a chain or `ParamRegistry` matching `target_name_base`
+  and optional outcome index.
+"""
 function _find_parameter(
     reg::ParamRegistry, target_name_base::Union{String, Symbol}, outcome_idx=nothing, is_multivariate_model::Bool=false
 )
@@ -38,8 +137,10 @@ end
 function _find_parameter(
     p_names, target_name_base::Union{String, Symbol}, outcome_idx=nothing, is_multivariate_model::Bool=false
 )
-    base_str = string(target_name_base)
-    p_names_str = string.(p_names)
+    raw_base_str = string(target_name_base)
+    base_str = replace(raw_base_str, r"^Parameter\((.*)\)$" => s"\1", r"^parameters\." => "",
+        r"^:+" => "")
+    p_names_str = [replace(string(n), r"^Parameter\((.*)\)$" => s"\1", r"^parameters\." => "", r"^:+" => "") for n in p_names]
 
     # Priority 1: Exact match with outcome index suffix (e.g., "sigma_s_idx_1").
     if is_multivariate_model && !isnothing(outcome_idx)
@@ -65,58 +166,10 @@ function _find_parameter(
         return base_str
     end
 
-    # Priority 4: Alias transformations (e.g., ure <-> innovations, sre <-> latent/struct, rho_unconstrained <-> unconstrained_rho)
-    alias_candidates = String[]
-    if startswith(base_str, "ure_")
-        push!(alias_candidates, replace(base_str, r"^ure_" => "innovations_"))
-        push!(alias_candidates, replace(base_str, r"^ure_" => "innov_"))
-        push!(alias_candidates, replace(base_str, r"^ure_" => "raw_"))
-    elseif startswith(base_str, "innovations_")
-        push!(alias_candidates, replace(base_str, r"^innovations_" => "ure_"))
-    elseif startswith(base_str, "sre_")
-        push!(alias_candidates, replace(base_str, r"^sre_" => "latent_"))
-        push!(alias_candidates, replace(base_str, r"^sre_" => "struct_"))
-    elseif startswith(base_str, "latent_")
-        push!(alias_candidates, replace(base_str, r"^latent_" => "sre_"))
-    elseif startswith(base_str, "struct_")
-        push!(alias_candidates, replace(base_str, r"^struct_" => "sre_"))
-    elseif occursin("unconstrained", base_str)
-        push!(alias_candidates, replace(base_str, "rho_unconstrained" => "unconstrained_rho"))
-        push!(alias_candidates, replace(base_str, "unconstrained_rho" => "rho_unconstrained"))
-        push!(alias_candidates, replace(base_str, "sigma_unconstrained" => "unconstrained_sigma"))
-        push!(alias_candidates, replace(base_str, "unconstrained_sigma" => "sigma_unconstrained"))
-    elseif base_str == "beta"
-        push!(alias_candidates, "Xfixed_beta_prop", "beta_prop", "Xfixed_beta")
-    elseif base_str == "beta_flat"
-        push!(alias_candidates, "Xfixed_beta_prop_flat", "beta_prop_flat")
-    elseif base_str == "Xfixed_beta_prop"
-        push!(alias_candidates, "beta")
-    elseif base_str == "Xfixed_beta_prop_flat"
-        push!(alias_candidates, "beta_flat")
-    elseif base_str == "sigma_st_interaction"
-        push!(alias_candidates, "st_interaction_sigma")
-    elseif base_str == "ure_st_interaction"
-        push!(alias_candidates, "st_interaction_raw")
-    elseif base_str == "v_unscaled_reflection"
-        push!(alias_candidates, "v_raw_reflection")
-    end
-
-    for alias in alias_candidates
-        if is_multivariate_model && !isnothing(outcome_idx)
-            s_k = "$(alias)_$(outcome_idx)"
-            if s_k in p_names_str; return s_k; end
-            s_b = "$(alias)[$(outcome_idx)]"
-            if s_b in p_names_str; return s_b; end
-        end
-        if alias in p_names_str; return alias; end
-        re_alias = Regex("^" * escape_string(alias) * "\\[\\d+\\]")
-        if any(n -> occursin(re_alias, n), p_names_str); return alias; end
-    end
-
-    # Priority 5: Substring fallback
+    # Priority 4: Substring match (return cleaned base_str)
     for n in p_names_str
         if occursin(base_str, n)
-            return n
+            return base_str
         end
     end
 
@@ -127,15 +180,13 @@ end
  
 
 
+"""
+    _apply_multivariate_correlation(eta_latent, chain, outcomes_N)
+
+Applies the estimated Cholesky correlation factor `L_corr` to independent multivariate
+  latent fields.
+"""
 function _apply_multivariate_correlation(eta_latent, chain, outcomes_N)
-    # Purpose: Applies the estimated correlation structure to independent latent fields.
-    # Rationale: Centralizes the core logic of multivariate models, where independent
-    #            latent effects are combined via a learned correlation matrix.
-    # Inputs:
-    #   - eta_latent: A 3D array of un-correlated effects [n_obs, n_samples, n_outcomes].
-    #   - chain: The MCMC chain, to extract the correlation matrix.
-    #   - outcomes_N: The number of outcomes.
-    # Outputs: A 3D array of correlated effects.
     if outcomes_N == 1
         return eta_latent
     end
@@ -149,21 +200,19 @@ function _apply_multivariate_correlation(eta_latent, chain, outcomes_N)
     return eta_final
 end
 
-# Version 1.0.1 (2026-08-06)
-# Purpose: Summarizes the posterior samples for all discovered component effects.
-# Rationale:   create a more informative summary object. Instead of
-#            only summarizing one effect per component, it now iterates through all effect
-#            (e.g., `structured`, `unstructured`, `noisy`)
-#            and summarizes each one. This allows downstream functions like `bstm_plots` to
-#            visualize different aspects of a component (e.g., the structured vs. unstructured
-#            parts of a BYM2 model) separately.
+"""
+    _summarize_effects_registry(registry, M, outcomes_N, alpha)
+
+Computes posterior summary statistics (mean, median, std, lower/upper credible bounds) for
+  all structured and unstructured component effects.
+"""
 function _summarize_effects_registry(registry, M, outcomes_N, alpha)
     summarized_registry = Dict{Symbol, Any}()
     mixed_effects_summaries = Dict{Symbol, Any}()
 
-    for (key, effects) in pairs(registry)
-        if key in [:intercept, :fixed]; continue; end
-
+    # 1. Summarize Component Effects
+    comp_dict = haskey(registry, :components) ? registry.components : Dict{Symbol, Any}()
+    for (key, effects) in pairs(comp_dict)
         spec_idx = findfirst(s -> s.key == key, M.components)
         if !isnothing(spec_idx) && M.components[spec_idx].component_obj isa Mixed
             # --- Handle Mixed Effects Separately ---
@@ -175,25 +224,30 @@ function _summarize_effects_registry(registry, M, outcomes_N, alpha)
             elseif effects.type == :correlated
                 for (term_name, term_effects) in pairs(effects.effects)
                     for k in 1:outcomes_N
-                        summaries_per_outcome[k][term_name] = summarize_array(term_effects[k], alpha=alpha)
+                        summaries_per_outcome[k][term_name] = summarize_array(term_effects[k],
+                            alpha=alpha)
                     end
                 end
             end
             
             summaries_final = outcomes_N > 1 ? [NamedTuple(s) for s in summaries_per_outcome] : NamedTuple(summaries_per_outcome[1])
-            mixed_effects_summaries[key] = (group_var=M.components[spec_idx].var, summaries=summaries_final)
+            mixed_effects_summaries[key] = (group_var=M.components[spec_idx].var,
+                summaries=summaries_final)
         else
             # --- Handle Standard Components ---
             component_summary = Dict{Symbol, Any}()
-            # Iterate over all fields in the effects tuple (e.g., :structured, :unstructured, :noisy)
             for effect_type in keys(effects)
-                if !(effects[effect_type] isa AbstractVector); continue; end # Skip non-effect fields like :indices
-                
-                effect_set = effects[effect_type]
-                if isempty(effect_set); continue; end
+                effect_set = getproperty(effects, effect_type)
+                if !(effect_set isa AbstractVector)
+                    continue
+                end # Skip non-effect fields like :indices
+                if isempty(effect_set)
+                    continue
+                end
 
                 if outcomes_N > 1
-                    component_summary[effect_type] = [summarize_array(effect_set[k], alpha=alpha) for k in 1:outcomes_N]
+                    component_summary[effect_type] = [summarize_array(effect_set[k],
+                        alpha=alpha) for k in 1:outcomes_N]
                 else
                     component_summary[effect_type] = summarize_array(effect_set[1], alpha=alpha)
                 end
@@ -203,26 +257,50 @@ function _summarize_effects_registry(registry, M, outcomes_N, alpha)
             end
         end
     end
-    if !isempty(mixed_effects_summaries); summarized_registry[:mixed_effects] = NamedTuple(mixed_effects_summaries); end
+    if !isempty(mixed_effects_summaries)
+        summarized_registry[:mixed_effects] = NamedTuple(mixed_effects_summaries)
+    end
+
+    # 2. Summarize Spatiotemporal Interaction Effects
+    if haskey(registry, :st_interaction) && !isempty(registry.st_interaction) && !all(iszero,
+        registry.st_interaction)
+        st_mat = registry.st_interaction
+        summarized_registry[:st_interaction] = outcomes_N > 1 ? [summarize_array(st_mat[:, :,
+            k], alpha=alpha) for k in 1:outcomes_N] : summarize_array(st_mat[:, :, 1],
+            alpha=alpha)
+    end
+
+    # 3. Summarize Fixed Effects
+    if haskey(registry, :fixed_effects) && !isempty(registry.fixed_effects) && !all(iszero,
+        registry.fixed_effects)
+        fe_mat = registry.fixed_effects
+        summarized_registry[:fixed] = outcomes_N > 1 ? [summarize_array(fe_mat[:, :, k],
+            alpha=alpha) for k in 1:outcomes_N] : summarize_array(fe_mat[:, :, 1], alpha=alpha)
+    end
+
+    # 4. Summarize Intercept
+    if haskey(registry, :intercept) && !isempty(registry.intercept) && !all(iszero,
+        registry.intercept)
+        int_mat = registry.intercept
+        summarized_registry[:intercept] = outcomes_N > 1 ? [summarize_array(int_mat[:, k],
+            alpha=alpha) for k in 1:outcomes_N] : summarize_array(int_mat[:, 1], alpha=alpha)
+    end
     
     return NamedTuple(summarized_registry)
 end
 
 
-# Version 1.0.0 (2026-08-06)
-# Purpose: Computes summary statistics (mean, median, std, credible intervals) from a matrix of posterior samples.
-# Rationale: This function was recreated to restore lost functionality. It provides a standardized way to summarize
-#            posterior predictions from a `[n_observations x n_samples]` matrix into a NamedTuple of vectors,
-#            which is the format expected by downstream plotting and analysis functions. It is functionally
-#            equivalent to `summarize_array` but is named specifically for summarizing prediction matrices.
-# Inputs:
-#   - samples: An AbstractArray of posterior samples, where the last dimension is the sample dimension.
-#   - alpha: The significance level for the credible intervals (e.g., 0.05 for a 95% CI).
-# Outputs: A NamedTuple containing vectors for the mean, median, standard deviation, and lower/upper credible bounds.
+"""
+    summarize_predictions(samples::AbstractArray; alpha=0.05)
+
+Computes summary statistics (mean, median, std, lower/upper credible intervals) from a
+  matrix of posterior samples.
+"""
 function summarize_predictions(samples::AbstractArray; alpha=0.05)
     # Ensure the input array is not empty or full of NaNs to prevent errors.
     if isempty(samples) || all(isnan, samples)
-        return (mean = Float64[], median = Float64[], std = Float64[], lower = Float64[], upper = Float64[])
+        return (mean = Float64[], median = Float64[], std = Float64[], lower = Float64[],
+            upper = Float64[])
     end
 
     # The last dimension is assumed to be the dimension over which samples are drawn.
@@ -256,8 +334,9 @@ end
 
 
 
-function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedTuple, Nothing}, n_samples::Int, outcomes_N::Int, N_tot::Int)
-    p_names = string.(names(DataFrame(chain))) # Use names(DataFrame(chain)) for robustness
+function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedTuple, Nothing},
+    n_samples::Int, outcomes_N::Int, N_tot::Int)
+    p_names = _get_clean_chain_param_names(chain)
 
     # --- Intercept ---
     intercept_samples = zeros(Float64, n_samples, outcomes_N)
@@ -277,13 +356,16 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
     fixed_effects_samples = zeros(Float64, M.Xfixed_N, n_samples, outcomes_N)
     if M.Xfixed_N > 0
         param_name_base = (M.model_arch == "multivariate") ? "beta_flat" : "beta"
-        found_base = _find_parameter(p_names, param_name_base, nothing, M.model_arch == "multivariate")
+        found_base = _find_parameter(p_names, param_name_base, nothing,
+            M.model_arch == "multivariate")
         if !isempty(found_base)
             if M.model_arch == "multivariate"
                 all_fixed_beta_flat = get_params_matrix(chain, found_base, M.Xfixed_N * outcomes_N)
-                reshaped_fixed_beta = reshape(all_fixed_beta_flat, n_samples, M.Xfixed_N, outcomes_N)
+                reshaped_fixed_beta = reshape(all_fixed_beta_flat, n_samples, M.Xfixed_N,
+                    outcomes_N)
                 for k in 1:outcomes_N
-                    fixed_effects_samples[:, :, k] = permutedims(reshaped_fixed_beta[:, :, k], (2, 1))
+                    fixed_effects_samples[:, :, k] = permutedims(reshaped_fixed_beta[:, :, k],
+                        (2, 1))
                 end
             else # Univariate
                 fixed_beta = get_params_matrix(chain, found_base, M.Xfixed_N)
@@ -304,8 +386,10 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
     # --- Spatiotemporal Interaction Effects ---
     st_interaction_effects_samples = zeros(Float64, M.s_N * M.t_N, n_samples, outcomes_N)
     if get(M, :model_st, "none") != "none"
-        param_name_base = any(p -> occursin("ure_st_interaction", string(p)), p_names) ? "ure_st_interaction" : "st_interaction_raw"
-        sigma_name_base = any(p -> occursin("sigma_st_interaction", string(p)), p_names) ? "sigma_st_interaction" : "st_interaction_sigma"
+        param_name_base = any(p -> occursin("ure_st_interaction", string(p)),
+            p_names) ? "ure_st_interaction" : "st_interaction_raw"
+        sigma_name_base = any(p -> occursin("sigma_st_interaction", string(p)),
+            p_names) ? "sigma_st_interaction" : "st_interaction_sigma"
         has_param = any(p -> occursin(param_name_base, string(p)), p_names)
         has_sigma = any(p -> occursin(sigma_name_base, string(p)), p_names)
         if has_param && has_sigma
@@ -349,11 +433,13 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
     # --- Householder Reflection Effects ---
     householder_effects_samples = zeros(Float64, outcomes_N, outcomes_N, n_samples)
     if get(M, :spectral_orientation, false) && M.model_arch == "multivariate"
-        param_name = any(p -> occursin("v_unscaled_reflection", string(p)), p_names) ? "v_unscaled_reflection" : "v_raw_reflection"
+        param_name = any(p -> occursin("v_unscaled_reflection", string(p)),
+            p_names) ? "v_unscaled_reflection" : "v_raw_reflection"
         if any(p -> occursin(param_name, string(p)), p_names)
             v_reflection_samples = get_params_matrix(chain, param_name, outcomes_N)
             for i in 1:n_samples
-                v_reflection = v_reflection_samples[i, :] / (norm(v_reflection_samples[i, :]) + 1e-9)
+                v_reflection = v_reflection_samples[i, :] / (norm(v_reflection_samples[i,
+                    :]) + 1e-9)
                 householder_effects_samples[:, :, i] = I - 2.0 * v_reflection * v_reflection'
             end
         else
@@ -380,11 +466,7 @@ function _reconstruct(
     alpha::Float64
 )
     # --- 1. Metadata and Dimension Discovery ---
-    n_samples_val = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3) # For MCMCChains
-    end
+    n_samples_val = _get_chain_n_samples(chain)
     N_tot_val = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
     outcomes_N_val = 1 # For univariate, this is always 1.
 
@@ -425,11 +507,7 @@ function _reconstruct(
     alpha::Float64
 )
     # --- 1. Metadata and Dimension Discovery ---
-    n_samples_val = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3) # For MCMCChains
-    end
+    n_samples_val = _get_chain_n_samples(chain)
     N_tot_val = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
     outcomes_N_val = M.outcomes_N
 
@@ -455,7 +533,8 @@ function _reconstruct(
         for k in 1:outcomes_N_val
     ]
     
-    p_denoised_summaries = [summarize_array(res.p_denoised, alpha=alpha) for res in all_pred_results]
+    p_denoised_summaries = [summarize_array(res.p_denoised,
+        alpha=alpha) for res in all_pred_results]
     p_noisy_summaries = [summarize_array(res.p_noisy, alpha=alpha) for res in all_pred_results]
     raw_denoised = [res.p_denoised for res in all_pred_results]
     raw_noisy = [res.p_noisy for res in all_pred_results]
@@ -481,11 +560,7 @@ function _reconstruct(
     arch::MultifidelityArchitecture, mode::String, chain, M::NamedTuple, PS,
     alpha::Float64
 )
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3) # For MCMCChains
-    end
+    n_samples = _get_chain_n_samples(chain)
     N_tot = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
     outcomes_N = M.outcomes_N
 
@@ -551,7 +626,8 @@ function _reconstruct(
             _process_ll_and_predictions(eta_final[:,:,k], chain, M, PS, outcomes_N, k)
             for k in 1:outcomes_N
         ]
-        p_denoised_summaries = [summarize_array(res.p_denoised, alpha=alpha) for res in all_pred_results]
+        p_denoised_summaries = [summarize_array(res.p_denoised,
+            alpha=alpha) for res in all_pred_results]
         p_noisy_summaries = [summarize_array(res.p_noisy, alpha=alpha) for res in all_pred_results]
         raw_denoised = [res.p_denoised for res in all_pred_results]
         raw_noisy = [res.p_noisy for res in all_pred_results]
@@ -595,7 +671,7 @@ end
 Assembles the full linear predictor (`eta`) from all discovered latent effects.
 
 # Version
-v1.6.0 (2026-08-19)
+v1.0.0
 
 # Arguments
 - `registry`: A NamedTuple containing raw posterior samples for each model component.
@@ -612,7 +688,8 @@ function _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
     eta_latent = zeros(Float64, N_tot, n_samples, outcomes_N)
 
     # --- 1. Add Intercept ---
-    # registry.intercept is [n_samples x outcomes_N]. Reshape to [1 x n_samples x outcomes_N] for broadcasting.
+    # registry.intercept is [n_samples x outcomes_N]. Reshape to [1 x n_samples x
+    #   outcomes_N] for broadcasting.
     eta_latent .+= reshape(registry.intercept, 1, n_samples, outcomes_N)
 
     # --- 2. Add Fixed Effects ---
@@ -631,95 +708,110 @@ function _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
 
     # Pre-compute full index vectors for spatial, temporal, and seasonal structures.
     # These map observations to their corresponding component units (e.g., spatial unit ID).
-    s_idx_full = haskey(M, :s_idx) ? Array(isnothing(PS) || !haskey(PS, :s_idx) ? M.s_idx : vcat(M.s_idx, PS.s_idx)) : ones(Int, N_tot)
-    t_idx_full = haskey(M, :t_idx) ? Array(isnothing(PS) || !haskey(PS, :t_idx) ? M.t_idx : vcat(M.t_idx, PS.t_idx)) : ones(Int, N_tot)
-    u_idx_full = haskey(M, :u_idx) ? Array(isnothing(PS) || !haskey(PS, :u_idx) ? M.u_idx : vcat(M.u_idx, PS.u_idx)) : ones(Int, N_tot)
+    s_idx_full = haskey(M, :s_idx) ? Array(isnothing(PS) || !haskey(PS,
+        :s_idx) ? M.s_idx : vcat(M.s_idx, PS.s_idx)) : ones(Int, N_tot)
+    t_idx_full = haskey(M, :t_idx) ? Array(isnothing(PS) || !haskey(PS,
+        :t_idx) ? M.t_idx : vcat(M.t_idx, PS.t_idx)) : ones(Int, N_tot)
+    u_idx_full = haskey(M, :u_idx) ? Array(isnothing(PS) || !haskey(PS,
+        :u_idx) ? M.u_idx : vcat(M.u_idx, PS.u_idx)) : ones(Int, N_tot)
 
     # Iterate through all model components and add their effects to the linear predictor.
     for spec in M.components
         key = spec.key
-        if !haskey(registry.components, key); continue; end
+        if !haskey(registry.components, key)
+            continue
+        end
         
         effects = registry.components[key]
-        # Determine which set of effects to use (structured, noisy, or just the default `structured`).
+        # Determine which set of effects to use (structured, noisy, or just the default
+        #   `structured`).
         effect_set = hasproperty(effects, :noisy) ? effects.noisy : effects.structured
-        if isempty(effect_set); continue; end # Skip if the effect set is empty.
+        if isempty(effect_set)
+            continue
+        end # Skip if the effect set is empty.
         
         for k in 1:outcomes_N
-            if spec.structure in [:spatial, :temporal]
-                # For standard GMRF-like effects (e.g., ICAR, AR1), the effect matrix is [n_units x n_samples].
-                # We use the appropriate index vector (s_idx_full or t_idx_full) to map the effect
-                # from component units to each observation.
-                effect_to_add = effect_set[k]
+            effect_to_add = effect_set[k]
+            if isempty(effect_to_add)
+                continue
+            end
+
+            if size(effect_to_add, 1) == N_tot
+                # Effect matrix is already expanded to full observation dimension [N_tot x
+                #   n_samples]
+                eta_latent[:, :, k] .+= effect_to_add
+            elseif spec.structure in [:spatial, :temporal]
+                # Unit-level effect matrix [n_units x n_samples] mapped via index vector
                 idx_vec = spec.structure == :spatial ? s_idx_full : t_idx_full
                 eta_latent[:, :, k] .+= effect_to_add[idx_vec, :]
             elseif spec.structure == :seasonal
-                # Seasonal effects. Harmonic components are typically expanded to observation-level,
-                # while Cyclic (GMRF-like) components are mapped via u_idx_full.
-                effect_to_add = effect_set[k]
-                if spec.component_obj isa Harmonic # Harmonic basis is already expanded to N_total observations
+                if spec.component_obj isa Harmonic
                     eta_latent[:, :, k] .+= effect_to_add
-                else # Assumes Cyclic or other GMRF-like seasonal model mapped via index
+                else
                     idx_vec = u_idx_full
                     eta_latent[:, :, k] .+= effect_to_add[idx_vec, :]
                 end
             elseif spec.structure in [:smooth, :interact, :nonstationaryvariance, :svc]
-                # For smoothers, interactions, SVC, and non-stationary variance, the effect matrix
-                # is typically already expanded to [N_total x n_samples].
-                eta_latent[:, :, k] .+= effect_set[k]
+                eta_latent[:, :, k] .+= effect_to_add
             elseif spec.structure == :mixed
-                # Mixed effects (random intercepts/slopes).
-                # The `extract_component` for Mixed returns `effects.indices` which is
-                # the full observation-level index vector for grouping levels.
                 idx_full = effects.indices
-                
                 if effects.type == :simple
-                    # Uncorrelated random intercept or slope.
-                    effect_to_add = effects.effects[k]
-                    if effects.lhs == "1" # Random intercept
-                        eta_latent[:, :, k] .+= effect_to_add[idx_full, :]
-                    else # Random slope
-                        # Covariate vector needs to be combined from training and prediction data.
+                    if effects.lhs == "1"
+                        eta_latent[:, :, k] .+= (size(effect_to_add,
+                            1) == N_tot ? effect_to_add : effect_to_add[idx_full, :])
+                    else
                         cov_name = Symbol(effects.lhs)
-                        cov_vec = if isnothing(PS)
-                            M.data[!, cov_name]
-                        else
-                            vcat(M.data[!, cov_name], PS.data[!, cov_name])
-                        end
-                        eta_latent[:, :, k] .+= effect_to_add[idx_full, :] .* cov_vec
+                        cov_vec = isnothing(PS) ? M.data[!, cov_name] : vcat(M.data[!,
+                            cov_name], PS.data[!, cov_name])
+                        eff = (size(effect_to_add,
+                            1) == N_tot ? effect_to_add : effect_to_add[idx_full, :])
+                        eta_latent[:, :, k] .+= eff .* cov_vec
                     end
                 elseif effects.type == :correlated
-                    # Correlated random effects (multiple terms in LHS, e.g., `(1 + cov | group)`).
                     for (term_name, term_effects) in pairs(effects.effects)
-                        effect_to_add = term_effects[k]
+                        t_eff = term_effects[k]
                         if term_name == :intercept
-                            eta_latent[:, :, k] .+= effect_to_add[idx_full, :]
+                            eta_latent[:, :, k] .+= (size(t_eff,
+                                1) == N_tot ? t_eff : t_eff[idx_full, :])
                         else
-                            # For random slopes, get the corresponding covariate data.
                             cov_name = Symbol(replace(string(term_name), "slope_" => ""))
-                            cov_vec = isnothing(PS) ? M.data[!, cov_name] : vcat(M.data[!, cov_name], PS.data[!, cov_name])
-                            eta_latent[:, :, k] .+= effect_to_add[idx_full, :] .* cov_vec
+                            cov_vec = isnothing(PS) ? M.data[!, cov_name] : vcat(M.data[!,
+                                cov_name], PS.data[!, cov_name])
+                            eff = (size(t_eff, 1) == N_tot ? t_eff : t_eff[idx_full, :])
+                            eta_latent[:, :, k] .+= eff .* cov_vec
                         end
                     end
                 end
-            else # Fallback for other component types.
-                # Assume the effect is already expanded to N_total x n_samples.
-                if size(effect_set[k], 1) == N_tot
-                    eta_latent[:, :, k] .+= effect_set[k]
+            else # Fallback
+                if size(effect_to_add, 1) == N_tot
+                    eta_latent[:, :, k] .+= effect_to_add
                 else
-                    @warn "Component '$(key)' (structure $(spec.structure)) has an unexpected effect dimension ($(size(effect_set[k], 1))) for outcome $k. Expected $N_tot. Skipping."
+                    @warn "Component '$(key)' (structure $(spec.structure)) has unexpected dimension ($(size(effect_to_add, 1))) for outcome $k. Expected $N_tot."
                 end
             end
         end
     end
 
     # Add log_offsets at the very end.
-    # M.log_offsets is a matrix of [N_obs x outcomes_N].
-    if haskey(M, :log_offsets)
+    if haskey(M, :log_offsets) && !isnothing(M.log_offsets)
+        M_offsets = M.log_offsets isa AbstractVector ? reshape(M.log_offsets, :,
+            1) : Matrix(M.log_offsets)
+        PS_offsets = if isnothing(PS)
+            zeros(Float64, 0, outcomes_N)
+        else
+            if haskey(PS, :log_offsets) && !isnothing(PS.log_offsets) && size(PS.log_offsets,
+                1) == PS.y_N
+                PS.log_offsets isa AbstractVector ? reshape(PS.log_offsets, :,
+                    1) : Matrix(PS.log_offsets)
+            else
+                zeros(Float64, PS.y_N, outcomes_N)
+            end
+        end
+        offset_full = vcat(M_offsets, PS_offsets)
         for k in 1:outcomes_N
-            # `offset_full` is constructed for the current outcome `k`.
-            offset_full = Array(isnothing(PS) ? M.log_offsets[:,k] : vcat(M.log_offsets[:,k], get(PS, :log_offsets, zeros(PS.y_N, outcomes_N))[:,k]))
-            eta_latent[:, :, k] .+= offset_full
+            if k <= size(offset_full, 2)
+                eta_latent[:, :, k] .+= offset_full[:, k]
+            end
         end
     end
 
@@ -735,7 +827,7 @@ end
 Generates predictions and log-likelihood values from the posterior `eta` samples.
 
 # Version
-v1.2.0 (2026-08-19)
+v1.0.0
 
 # Arguments
 - `eta_samples`: A matrix of posterior linear predictor samples `[N_obs, n_samples]`.
@@ -748,13 +840,10 @@ v1.2.0 (2026-08-19)
 # Returns
 - A `NamedTuple` containing `p_denoised`, `p_noisy`, and `log_lik` matrices.
 """
-
 function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
-    n_samples = size(eta_samples, 2)
+    N_tot, n_samples = size(eta_samples)
     N_train = M.y_N
-    N_pred = isnothing(PS) ? 0 : PS.y_N
-    N_tot = N_train + N_pred
-
+    
     y_obs_k = Array(outcomes_N > 1 ? M.y_obs[:, k] : M.y_obs)
     
     lik_spec = M.likelihood_specs[k]
@@ -762,44 +851,69 @@ function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
     use_zi = get(M, :use_zi, false)
     phi_zi_samples = use_zi ? get_params_vector(chain, "lik_phi_zi", 1)[:,1] : zeros(n_samples)
     
+    trials_full = if haskey(M, :trials)
+        if isnothing(PS)
+            M.trials[:, k]
+        elseif N_tot == PS.y_N
+            get(PS, :trials, ones(Int, PS.y_N, outcomes_N))[:, k]
+        else
+            vcat(M.trials[:, k], get(PS, :trials, ones(Int, PS.y_N, outcomes_N))[:, k])
+        end
+    else
+        ones(Int, N_tot)
+    end
+
     p_denoised_samples = similar(eta_samples)
     for s in 1:n_samples
         p_denoised_samples[:, s] = _apply_link_and_lik(
-            family, view(eta_samples, :, s), use_zi, phi_zi_samples[s]
+            family, view(eta_samples, :, s), use_zi, phi_zi_samples[s], 1.0, trials_full
         )
     end
 
     p_noisy_samples = similar(eta_samples)
-    log_lik_samples = zeros(Float64, N_train, n_samples)
+    log_lik_samples = zeros(Float64, min(N_train, N_tot), n_samples)
 
     y_sigma_samples = if family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
-        outcomes_N > 1 ? get_params_matrix(chain, "y_sigma", outcomes_N) : get_params_vector(chain, "y_sigma", 1)
+        outcomes_N > 1 ? get_params_matrix(chain, "y_sigma",
+            outcomes_N) : get_params_vector(chain, "y_sigma", 1)
     else
         ones(Float64, n_samples, outcomes_N)
     end
 
     r_nb_samples = if family == "negbin"
-        outcomes_N > 1 ? get_params_matrix(chain, "r_nb", outcomes_N) : get_params_vector(chain, "r_nb", 1)
+        outcomes_N > 1 ? get_params_matrix(chain, "r_nb",
+            outcomes_N) : get_params_vector(chain, "r_nb", 1)
     else
         ones(Float64, n_samples, outcomes_N)
     end
 
-    trials_full = Array(haskey(M, :trials) ? (isnothing(PS) ? M.trials[:,k] : vcat(M.trials[:,k], get(PS, :trials, ones(Int, PS.y_N, outcomes_N))[:,k])) : ones(Int, N_tot))
+    trials_full = if haskey(M, :trials)
+        if isnothing(PS)
+            M.trials[:, k]
+        elseif N_tot == PS.y_N
+            get(PS, :trials, ones(Int, PS.y_N, outcomes_N))[:, k]
+        else
+            vcat(M.trials[:, k], get(PS, :trials, ones(Int, PS.y_N, outcomes_N))[:, k])
+        end
+    else
+        ones(Int, N_tot)
+    end
     
     for s in 1:n_samples
-        phi_zi_s = phi_zi_samples[s, 1]
+        phi_zi_s = phi_zi_samples isa AbstractMatrix ? phi_zi_samples[s, 1] : phi_zi_samples[s]
         y_sigma_s = y_sigma_samples[s, k]
         r_nb_s = r_nb_samples[s, k]
         
         # Explicitly loop to avoid broadcasting issues with keyword arguments.
         lik_obj_vec = [
-            bstm_Likelihood(family, eta_samples[i, s]; phi_zi=phi_zi_s, r_nb=r_nb_s, sigma_y=y_sigma_s, trial=trials_full[i])
+            bstm_Likelihood(family, eta_samples[i, s]; phi_zi=phi_zi_s, r_nb=r_nb_s,
+                sigma_y=y_sigma_s, trial=trials_full[min(i, length(trials_full))])
             for i in 1:N_tot
         ]
         
         p_noisy_samples[:, s] = rand.(lik_obj_vec)
 
-        if N_train > 0
+        if isnothing(PS) && N_train > 0
             lik_obj_train = view(lik_obj_vec, 1:N_train)
             log_lik_samples[:, s] = logpdf.(lik_obj_train, view(y_obs_k, 1:N_train))
         end
@@ -810,9 +924,13 @@ end
 
 
 
+"""
+    _process_multinomial_predictions(eta_samples, chain, M, PS)
+
+Generates posterior predictions (proportions and simulated counts) and pointwise
+  log-likelihood for multinomial models.
+"""
 function _process_multinomial_predictions(eta_samples, chain, M, PS)
-    # Purpose: Generates predictions and log-likelihood for multinomial models.
-    # Rationale: This specialized function handles the vector nature of multinomial outcomes.
     n_samples = size(eta_samples, 2)
     N_train = M.y_N
     N_pred = isnothing(PS) ? 0 : PS.y_N
@@ -835,8 +953,6 @@ function _process_multinomial_predictions(eta_samples, chain, M, PS)
 
     # Get total trials for each observation
     trials_train = sum(y_obs_train, dims=2)
-    # For prediction, we might need to assume a total count, or it could be in PS.
-    # Assuming 1 for simplicity if not provided.
     trials_pred = haskey(PS, :trials) ? sum(PS.trials, dims=2) : ones(Int, N_pred)
     trials_full = vcat(vec(trials_train), vec(trials_pred))
 
@@ -845,15 +961,13 @@ function _process_multinomial_predictions(eta_samples, chain, M, PS)
             probs = p_denoised_samples[i, :, s]
             dist = Multinomial(Int(trials_full[i]), probs)
             p_noisy_samples[i, :, s] = rand(dist)
-            if i <= N_train; log_lik_samples[i, s] = logpdf(dist, y_obs_train[i, :]); end
+            if i <= N_train
+                log_lik_samples[i, s] = logpdf(dist, y_obs_train[i, :])
+            end
         end
     end
     return (p_denoised=p_denoised_samples, p_noisy=p_noisy_samples, log_lik=log_lik_samples)
 end
- 
-
-  
- 
 
 function _quantile_along_last_dim(A::AbstractArray, q::Real; sample_dim=ndims(A))
     other_dims = size(A)[1:end-1]
@@ -866,9 +980,15 @@ function _quantile_along_last_dim(A::AbstractArray, q::Real; sample_dim=ndims(A)
     return out
 end
 
+"""
+    summarize_array(samples::AbstractArray; alpha=0.05)
+
+Computes mean, median, std, and credible interval bounds along the last dimension of `samples`.
+"""
 function summarize_array(samples::AbstractArray; alpha=0.05)
     if isempty(samples) || all(isnan, samples)
-        return (mean = Float64[], median = Float64[], std = Float64[], lower = Float64[], upper = Float64[])
+        return (mean = Float64[], median = Float64[], std = Float64[], lower = Float64[],
+            upper = Float64[])
     end 
 
     sample_dim = ndims(samples)
@@ -893,20 +1013,13 @@ function summarize_array(samples::AbstractArray; alpha=0.05)
     )
 end
 
+"""
+    _compute_waic(log_lik::AbstractMatrix)
 
-# Version 1.0.2 (2026-08-06)
-# Purpose: Computes the Widely Applicable Information Criterion (WAIC).
-# Rationale: This version corrects a `BoundsError` that occurred because the function
-#            was incorrectly slicing the log-likelihood matrix. The original code
-#            iterated over observations but sliced columns, leading to an out-of-bounds
-#            access when the number of observations exceeded the number of samples.
-#            The fix changes the slicing from `log_lik[:, i]` to `log_lik[i, :]` to
-#            correctly compute statistics over the samples for each observation.
+Computes the Watanabe-Akaike (Widely Applicable) Information Criterion (WAIC) from pointwise
+  log-likelihood evaluations.
+"""
 function _compute_waic(log_lik)
-    # This function calculates the WAIC from a matrix of pointwise log-likelihoods.
-    # The matrix is expected to have dimensions [n_observations, n_samples].
-
-    # Ensure log_lik is a matrix.
     if !(log_lik isa AbstractMatrix)
         @warn "log_lik passed to _compute_waic is not a matrix. Returning NaN."
         return NaN
@@ -916,49 +1029,37 @@ function _compute_waic(log_lik)
     end
 
     nobs, nsamples = size(log_lik)
-    
-    # lppd: log pointwise predictive density.
-    # This is the sum over observations of the log of the mean likelihood for each observation.
-    # The mean is taken over the posterior samples.
-    # The original code `log_lik[:, i]` was incorrect as it sliced columns.
-    # The correct approach is to slice rows `log_lik[i, :]`.
     lppd = sum(LogExpFunctions.logsumexp(view(log_lik, i, :)) - log(nsamples) for i in 1:nobs)
-    
-    # p_waic: effective number of parameters.
-    # This is the sum over observations of the variance of the log-likelihood for each observation.
-    # The variance is taken over the posterior samples.
     p_waic = sum(var(view(log_lik, i, :)) for i in 1:nobs)
     
     return -2 * (lppd - p_waic)
 end
 
-
-
-function _apply_link_and_lik(family::String, eta::AbstractArray, use_zi::Bool, phi=0.0, r=1.0)
+function _apply_link_and_lik(family::String, eta::AbstractArray, use_zi::Bool, phi=0.0, r=1.0,
+    trials=nothing)
     local mu
-    if family in ["poisson", "negbin", "gamma", "exponential", "inverse_gaussian", "pareto"]
-        mu = exp.(eta)
-    elseif family in ["bernoulli", "binomial", "beta"]
+    if family in ["poisson", "negbin", "gamma", "exponential", "inverse_gaussian", "pareto", "lognormal"]
+        clamped_eta = clamp.(eta, -20.0, 20.0)
+        mu = exp.(clamped_eta)
+    elseif family in ["bernoulli", "beta"]
         mu = LogExpFunctions.logistic.(eta)
+    elseif family == "binomial"
+        prob = LogExpFunctions.logistic.(eta)
+        mu = !isnothing(trials) ? Float64.(trials) .* prob : prob
     else
-        mu = eta 
+        mu = copy(eta)
     end
     if use_zi
         mu = (1.0 .- phi) .* mu
     end
     return mu
 end
- 
-# Version 1.1.0 (2026-08-11)
-# Purpose: Computes model-based post-stratification weights.
-# Rationale: This version implements a model-based weighting scheme where the weight for
-#            an observation is the ratio of the mean prediction within its stratum to the
-#            prediction for the observation itself. This method is intended to adjust
-#            individual predictions based on their stratum's average behavior.
-#            NOTE: This is a departure from traditional post-stratification weights, which
-#            are typically calculated as `Area(j) / n_obs_in_stratum(j)` to scale sample
-#            densities to population totals. This new implementation directly follows the user's
-#            request to base weights on prediction ratios.
+
+"""
+    post_stratification_weights(res, M, PS, samples_denoised)
+
+Computes model-based post-stratification weights across spatial strata.
+"""
 function post_stratification_weights(res, M, PS, samples_denoised)
     # Assumptions:
     #   1. The model configuration `M` contains the spatial index vector `:s_idx`.
@@ -1003,7 +1104,8 @@ function post_stratification_weights(res, M, PS, samples_denoised)
     unique_strata = unique(strata_ids_full)
 
     # #
-    # Calculate weights based on the ratio of stratum-mean prediction to observation-level prediction
+    # Calculate weights based on the ratio of stratum-mean prediction to observation-level
+    #   prediction
     for stratum in unique_strata
         # Find indices of observations in the current stratum
         obs_indices_in_stratum = findall(x -> x == stratum, strata_ids_full)
@@ -1032,19 +1134,16 @@ end
  
 
 """
-    model_results_comprehensive(model::DynamicPPL.Model, chain; ...)
+    model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothing, alpha=0.05,
+      strata_info=nothing)
 
-The primary post-processing engine that generates comprehensive summaries,
-diagnostics, and plots from a fitted `bstm` model and MCMC chain.
+The primary analytical post-processing engine that reconstructs latent fields, computes
+point predictions, prediction intervals, goodness-of-fit metrics, and MCMC convergence diagnostics.
+Generates pure analytical data without executing graphical rendering.
 """
-function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing, data=nothing, alpha=0.05)
-    # --- No initial chain standardization ---
-    
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothing, alpha=0.05,
+    strata_info=nothing)
+    n_samples = _get_chain_n_samples(chain)
     
     # --- 1. Metadata and Architecture Extraction ---
     M = model.args.M
@@ -1060,20 +1159,20 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     end
 
     # --- 2. Core Reconstruction ---
-    # Pass the original chain object directly to the reconstruction engine.
-    res = _reconstruct(arch_type, "model_results", chain, M, nothing, alpha) # n_samples is now calculated inside _reconstruct
+    res = _reconstruct(arch_type, "model_results", chain, M, nothing, alpha)
 
     # --- 2.5 Post-Stratification Weight Calculation (if applicable) ---
     post_strat_weights = nothing 
 
     local M_for_post_strat = M
-    if !haskey(M, :strata_info) && !isnothing(au) && hasproperty(au, :strata_info)
-        M_for_post_strat = merge(M, (strata_info=au.strata_info,))
+    if !haskey(M, :strata_info) && !isnothing(strata_info)
+        M_for_post_strat = merge(M, (strata_info=strata_info,))
     end
 
     if hasproperty(res, :raw_predictions_denoised)
         samples_denoised = res.arch isa MultivariateArchitecture ? res.raw_predictions_denoised[1] : res.raw_predictions_denoised
-        post_strat_weights = post_stratification_weights(res, M_for_post_strat, nothing, samples_denoised)
+        post_strat_weights = post_stratification_weights(res, M_for_post_strat, nothing,
+            samples_denoised)
     end
 
     # --- 3. Performance Metric Calculation ---
@@ -1110,35 +1209,208 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; au=nothing,
     end
 
     # --- 4. MCMC Diagnostics ---
+    # --- 4. MCMC Diagnostics (Pooled across all chains) ---
+    df_stats = _compute_direct_parameter_summary(chain, model; alpha=alpha)
+
     mean_rhat, min_ess, sampling_time = 1.0, 0.0, 0.0 
-    try
-        # This block now handles both FlexiChains and MCMCChains
-        if occursin("FlexiChain", string(typeof(chain)))
-            df_stats = DataFrame(StatsBase.summarystats(MCMCChains.Chains(chain)))
-        else
-            df_stats = DataFrame(StatsBase.summarystats(chain))
-        end
-
-        if hasproperty(df_stats, :rhat); r_vals = filter(x -> !isnan(x) && x > 0, df_stats.rhat); mean_rhat = isempty(r_vals) ? 1.0 : mean(r_vals); end
-        e_col = hasproperty(df_stats, :ess_bulk) ? :ess_bulk : (hasproperty(df_stats, :ess) ? :ess : nothing)
-        if !isnothing(e_col); e_vals = filter(x -> !isnan(x) && x >= 0, df_stats[!, e_col]); min_ess = isempty(e_vals) ? 0.0 : minimum(e_vals); end
-        if hasproperty(chain, :info) && haskey(chain.info, :stop_time); sampling_time = (chain.info.stop_time - chain.info.start_time); end
-    catch e; @warn "MCMC diagnostic extraction failed: $e. Using default values."; end
+    if hasproperty(df_stats, :rhat)
+        r_vals = filter(x -> !isnan(x) && x > 0, df_stats.rhat)
+        mean_rhat = isempty(r_vals) ? 1.0 : mean(r_vals)
+    end
+    e_col = hasproperty(df_stats, :ess_bulk) ? :ess_bulk : (hasproperty(df_stats,
+        :ess) ? :ess : nothing)
+    if !isnothing(e_col)
+        e_vals = filter(x -> !isnan(x) && x >= 0, df_stats[!, e_col])
+        min_ess = isempty(e_vals) ? 0.0 : minimum(e_vals)
+    end
+    if hasproperty(chain, :info) && haskey(chain.info, :stop_time)
+        sampling_time = (chain.info.stop_time - chain.info.start_time)
+    end
     
-    # --- 5. Plot Generation ---
-    data_for_plots = isnothing(data) ? get(M, :data, nothing) : data
-    # Pass the original model and chain to bstm_plots
-    plot_results = bstm_plots(model, chain, res, M; au=au, data=data_for_plots)
+    # --- 5. Final Assembly (Structured Analytical Results) ---
+    y_obs_clean = if arch_type isa MultivariateArchitecture
+        [Array(y_obs[:, k]) for k in 1:M.outcomes_N]
+    else
+        Array(y_obs)
+    end
 
-    # --- 6. Final Assembly ---
-    pstats_final = merge(res, (post_strat_weights=post_strat_weights,))
+    pred_obj = (
+        observed = y_obs_clean,
+        denoised = res.predictions_denoised,
+        noisy = res.predictions_noisy
+    )
+
+    draws_obj = (
+        predictions_denoised = res.raw_predictions_denoised,
+        predictions_noisy = res.raw_predictions_noisy,
+        weights = post_strat_weights,
+        log_likelihood = res.log_likelihood
+    )
 
     return (
-        metrics = (rmse = rmse_val, r_pearson = r_pearson, ess = min_ess, rhat = mean_rhat, waic = get(res, :waic, 0.0), time = sampling_time),
-        pstats = pstats_final,
-        plots = plot_results.plots,
-        plots_data = plot_results.plots_data
+        metrics = (
+            rmse = rmse_val, 
+            r_pearson = r_pearson, 
+            waic = get(res, :waic, 0.0), 
+            rhat = mean_rhat, 
+            ess = min_ess, 
+            time = sampling_time
+        ),
+        parameters = df_stats,
+        effects = res.effects,
+        predictions = pred_obj,
+        draws = draws_obj,
+        arch = res.arch
     )
+end
+
+function _get_chain_n_chains(chain::Any)::Int
+    if chain isa DataFrame || chain isa AbstractDict
+        return 1
+    end
+    try
+        if occursin("FlexiChain", string(typeof(chain))) || occursin("VNChain",
+            string(typeof(chain)))
+            return FlexiChains.nchains(chain)
+        end
+    catch
+    end
+    try
+        if hasproperty(chain, :chains)
+            return length(chain.chains)
+        end
+    catch
+    end
+    try
+        if hasproperty(chain, :value) && ndims(chain.value) == 3
+            return size(chain.value, 3)
+        end
+    catch
+    end
+    try
+        if hasproperty(chain, :info) && haskey(chain.info, :n_chains)
+            return Int(chain.info.n_chains)
+        end
+    catch
+    end
+    return 1
+end
+
+"""
+    _compute_direct_parameter_summary(chain::Any, model=nothing; alpha=0.05)::DataFrame
+
+Computes standard MCMC parameter summary statistics directly from extracted parameter arrays.
+Guarantees a pooled, well-formed DataFrame with exactly one row per parameter containing:
+`parameters`, `mean`, `std`, `median`, `lower_95`, `upper_95`, `ess`, `rhat`.
+"""
+function _compute_direct_parameter_summary(chain::Any, model=nothing; alpha=0.05)::DataFrame
+    p_names = _get_clean_chain_param_names(chain)
+    if isempty(p_names) && !isnothing(model) && hasproperty(model.args, :M)
+        reg = build_param_registry(model.args.M)
+        p_names = reg.names
+    end
+
+    n_chains_val = _get_chain_n_chains(chain)
+
+    low_q = alpha / 2.0
+    high_q = 1.0 - low_q
+
+    rows = []
+    for pname in p_names
+        try
+            samples_mat = extract_param_matrix(chain, pname)
+            dim = size(samples_mat, 2)
+            for d in 1:dim
+                v = samples_mat[:, d]
+                valid_v = filter(x -> !isnan(x) && !isinf(x), v)
+                if isempty(valid_v)
+                    continue
+                end
+                
+                param_label = dim == 1 ? pname : "$(pname)[$d]"
+                m_val = Statistics.mean(valid_v)
+                s_val = length(valid_v) > 1 ? Statistics.std(valid_v) : 0.0
+                med_val = Statistics.median(valid_v)
+                q_low = Statistics.quantile(valid_v, low_q)
+                q_high = Statistics.quantile(valid_v, high_q)
+                
+                # --- Gelman-Rubin Rhat and ESS ---
+                n_total = length(valid_v)
+                rhat_val = 1.0
+                ess_val = Float64(n_total)
+
+                if n_chains_val >= 2 && n_total % n_chains_val == 0&&
+                    (n_total ÷ n_chains_val) >= 4
+                    n_iter_per_chain = n_total ÷ n_chains_val
+                    chain_means = Float64[]
+                    chain_vars = Float64[]
+                    for c in 1:n_chains_val
+                        sub_v = valid_v[(c-1)*n_iter_per_chain + 1 : c*n_iter_per_chain]
+                        push!(chain_means, Statistics.mean(sub_v))
+                        push!(chain_vars, length(sub_v) > 1 ? Statistics.var(sub_v) : 0.0)
+                    end
+                    overall_mean = Statistics.mean(chain_means)
+                    B = (Float64(n_iter_per_chain) / (n_chains_val - 1)) * sum((chain_means .- overall_mean).^2)
+                    W = Statistics.mean(chain_vars)
+                    if W > 1e-12
+                        var_plus = ((n_iter_per_chain - 1.0) / n_iter_per_chain) * W + (1.0 / n_iter_per_chain) * B
+                        rhat_val = clamp(sqrt(var_plus / W), 1.0, 10.0)
+                    end
+                elseif n_total >= 20 # Split-Rhat for single chain
+                    half_n = n_total ÷ 2
+                    sub1 = valid_v[1:half_n]
+                    sub2 = valid_v[half_n+1 : 2*half_n]
+                    m1, m2 = Statistics.mean(sub1), Statistics.mean(sub2)
+                    v1, v2 = Statistics.var(sub1), Statistics.var(sub2)
+                    B = (Float64(half_n) / 1.0) * ((m1 - (m1+m2)/2.0)^2 + (m2 - (m1+m2)/2.0)^2)
+                    W = (v1 + v2) / 2.0
+                    if W > 1e-12
+                        var_plus = ((half_n - 1.0) / half_n) * W + (1.0 / half_n) * B
+                        rhat_val = clamp(sqrt(var_plus / W), 1.0, 10.0)
+                    end
+                end
+
+                # Effective sample size via autocorrelation
+                if n_total >= 10 && s_val > 1e-12
+                    try
+                        rho1 = StatsBase.autocor(valid_v, [1])[1]
+                        if !isnan(rho1) && rho1 < 0.99 && rho1 > -0.99
+                            act = (1.0 + rho1) / (1.0 - rho1)
+                            ess_val = clamp(n_total / act, 1.0, Float64(n_total))
+                        end
+                    catch
+                    end
+                end
+
+                push!(rows, (
+                    parameters = Symbol(param_label),
+                    mean = round(m_val, digits=4),
+                    std = round(s_val, digits=4),
+                    median = round(med_val, digits=4),
+                    lower_95 = round(q_low, digits=4),
+                    upper_95 = round(q_high, digits=4),
+                    rhat = round(rhat_val, digits=4),
+                    ess = round(ess_val, digits=1)
+                ))
+            end
+        catch
+        end
+    end
+
+    if isempty(rows)
+        return DataFrame(
+            parameters = Symbol[],
+            mean = Float64[],
+            std = Float64[],
+            median = Float64[],
+            lower_95 = Float64[],
+            upper_95 = Float64[],
+            rhat = Float64[],
+            ess = Float64[]
+        )
+    end
+
+    return DataFrame(rows)
 end
 
 
@@ -1154,16 +1426,20 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
     for col in names(M.data)
         col_sym = Symbol(col)
         if col_sym != target_cov && (isnothing(second_cov) || col_sym != second_cov)
-            if eltype(M.data[!, col_sym]) <: Number
-                base_df[1, col_sym] = mean(M.data[!, col_sym])
-            else # Categorical
-                # For categorical, pick the mode or first level
-                # Ensure the column type is preserved
-                if isempty(levels(M.data[!, col_sym]))
-                    @warn "Categorical covariate $(col_sym) has no levels. Skipping setting default value."
-                    continue
+            col_type = eltype(M.data[!, col_sym])
+            if col_type <: Integer
+                base_df[1, col_sym] = round(col_type, Statistics.median(M.data[!, col_sym]))
+            elseif col_type <: AbstractFloat
+                base_df[1, col_sym] = Statistics.mean(M.data[!, col_sym])
+            elseif col_type <: Number
+                base_df[1, col_sym] = round(col_type, Statistics.mean(M.data[!, col_sym]))
+            else # Categorical / String
+                if hasmethod(levels, Tuple{typeof(M.data[!,
+                    col_sym])}) && !isempty(levels(M.data[!, col_sym]))
+                    base_df[1, col_sym] = first(levels(M.data[!, col_sym]))
+                else
+                    base_df[1, col_sym] = first(M.data[!, col_sym])
                 end
-                base_df[1, col_sym] = first(levels(M.data[!, col_sym]))
             end
         end
     end
@@ -1172,13 +1448,19 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
         # Generate a range for the target covariate
         if eltype(M.data[!, target_cov]) <: Number
             min_val, max_val = extrema(M.data[!, target_cov])
-            cov_range = collect(range(min_val, stop=max_val, length=n_points))
-            pred_df = vcat([base_df for _ in 1:n_points]...)
+            cov_range = if eltype(M.data[!, target_cov]) <: Integer
+                step_val = max(1, round(Int, (max_val - min_val) / max(1, n_points - 1)))
+                collect(min_val:step_val:max_val)
+            else
+                collect(range(min_val, stop=max_val, length=n_points))
+            end
+            n_actual = length(cov_range)
+            pred_df = vcat([deepcopy(base_df) for _ in 1:n_actual]...)
             pred_df[!, target_cov] = cov_range
         else # Categorical
             unique_levels = unique(M.data[!, target_cov])
             n_levels = length(unique_levels)
-            pred_df = vcat([base_df for _ in 1:n_levels]...)
+            pred_df = vcat([deepcopy(base_df) for _ in 1:n_levels]...)
             pred_df[!, target_cov] = unique_levels
         end
         
@@ -1194,8 +1476,12 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
 
         min_val1, max_val1 = extrema(M.data[!, target_cov])
         min_val2, max_val2 = extrema(M.data[!, second_cov])
-        range1 = collect(range(min_val1, stop=max_val1, length=n_points))
-        range2 = collect(range(min_val2, stop=max_val2, length=n_points))
+        range1 = eltype(M.data[!, target_cov]) <: Integer ? collect(min_val1:max(1, round(Int,
+            (max_val1-min_val1)/max(1, n_points-1))):max_val1) : collect(range(min_val1,
+            stop=max_val1, length=n_points))
+        range2 = eltype(M.data[!, second_cov]) <: Integer ? collect(min_val2:max(1, round(Int,
+            (max_val2-min_val2)/max(1, n_points-1))):max_val2) : collect(range(min_val2,
+            stop=max_val2, length=n_points))
 
         pred_df_rows = DataFrame()
         for val1 in range1
@@ -1217,40 +1503,14 @@ end
 
 
 """
-    predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100, alpha=0.05)
+    predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100,
+      alpha=0.05)
 
 The primary engine for projecting a fitted `bstm` model onto a new dataset to
 generate out-of-sample predictions.
 
 # Version
-v1.1.0 (2026-08-13)
-
-# Rationale
-This function constructs a "prediction set" configuration (`PS`) that mirrors the
-training configuration (`M`) but is adapted for the `new_data`. It correctly
-handles the projection of fixed effects, the re-generation of basis matrices for
-smoothers on the new coordinates, and the recursive prediction for nested models.
-  consistent with the refactored architecture,
-correcting `MethodError` exceptions that arose from changes in the signatures of
-`decompose_bstm_formula` and `create_fixed_design`.
-
-# Workflow
-1.  **Initialize Prediction Set (PS)**: Creates a copy of the training model's
-    configuration (`M`) and updates it with the `new_data`.
-2.  **Re-create Fixed Effects**: Parses the original formula and calls
-    `create_fixed_design` to generate a new design matrix for the fixed effects
-    based on the `new_data`.
-3.  **Update Indices**: Populates the spatial, temporal, and seasonal index vectors
-    in the `PS` from the corresponding columns in `new_data`.
-4.  **Re-create Basis Matrices**: For any smoother components in the original model,
-    it regenerates the basis matrices (e.g., for P-splines, thin-plate splines)
-    using the coordinate data from `new_data`.
-5.  **Handle Nested Models**: If the original model contained `nested()` components,
-    it recursively creates a prediction set for each sub-model.
-6.  **Call Reconstruction Engine**: Invokes the main `_reconstruct` function, passing
-    it both the training configuration `M` and the new prediction set `PS`.
-7.  **Slice Predictions**: Extracts and returns only the out-of-sample portion of
-    the predictions from the full reconstructed output.
+v1.0.0
 
 # Arguments
 - `model_obj::DynamicPPL.Model`: The fitted Turing model object.
@@ -1264,7 +1524,8 @@ correcting `MethodError` exceptions that arose from changes in the signatures of
   `predictions_noisy`, the full posterior statistics object `pstats`, and the
   prediction set configuration `PS`.
 """
-function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100, alpha=0.05)
+function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100,
+    alpha=0.05)
     M_train = model_obj.args.M
     n_samps = min(size(chain, 1), n_samples)
 
@@ -1294,7 +1555,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
             Xfixed_pred, _ = create_fixed_design(
                 rhs, 
                 new_data, 
-                M_train.calling_module; 
+                get(M_train, :calling_module, @__MODULE__); 
                 contrasts=get(M_train, :contrasts, Dict())
             )
             PS_dict[:Xfixed] = Matrix(Xfixed_pred)
@@ -1303,10 +1564,29 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
         end
     end
 
-    # 3. Update indices from new_data
-    if haskey(M_train, :s_idx_var) && hasproperty(new_data, M_train.s_idx_var); PS_dict[:s_idx] = new_data[!, M_train.s_idx_var]; end 
-    if haskey(M_train, :t_idx_var) && hasproperty(new_data, M_train.t_idx_var); PS_dict[:t_idx] = new_data[!, M_train.t_idx_var]; end 
-    if haskey(M_train, :u_idx_var) && hasproperty(new_data, M_train.u_idx_var); PS_dict[:u_idx] = new_data[!, M_train.u_idx_var]; end 
+    # 3. Update indices and offsets from new_data
+    if haskey(M_train, :s_idx_var) && hasproperty(new_data, M_train.s_idx_var)
+        PS_dict[:s_idx] = new_data[!, M_train.s_idx_var]
+    end 
+    if haskey(M_train, :t_idx_var) && hasproperty(new_data, M_train.t_idx_var)
+        PS_dict[:t_idx] = new_data[!, M_train.t_idx_var]
+    end 
+    if haskey(M_train, :u_idx_var) && hasproperty(new_data, M_train.u_idx_var)
+        PS_dict[:u_idx] = new_data[!, M_train.u_idx_var]
+    end 
+
+    if haskey(M_train, :log_offsets) && !isnothing(M_train.log_offsets)
+        offset_var = get(M_train, :log_offsets_var, nothing)
+        if !isnothing(offset_var) && hasproperty(new_data, Symbol(offset_var))
+            PS_dict[:log_offsets] = Matrix(reshape(Float64.(new_data[!, Symbol(offset_var)]),
+                :, M_train.outcomes_N))
+        elseif hasproperty(new_data, :log_offsets)
+            PS_dict[:log_offsets] = Matrix(reshape(Float64.(new_data[!, :log_offsets]), :,
+                M_train.outcomes_N))
+        else
+            PS_dict[:log_offsets] = zeros(Float64, nrow(new_data), M_train.outcomes_N)
+        end
+    end
 
     # 4. Re-create basis matrices for smoothers on the new data
     if haskey(M_train, :components)
@@ -1317,7 +1597,8 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
             key_sym = Symbol(spec.var)
             vars = get(spec.params, :positional_args, [])
             n_vars = length(vars)
-            if haskey(M_train.basis_matrices, key_sym) && all(hasproperty(new_data, Symbol(v)) for v in vars)
+            if haskey(M_train.basis_matrices, key_sym) && all(hasproperty(new_data,
+                Symbol(v)) for v in vars)
                 m_obj = spec.component_obj
                 model_type_str = lowercase(string(typeof(m_obj)))
                 nb = size(M_train.basis_matrices[key_sym], 2)
@@ -1326,13 +1607,19 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
                 local_kwargs = Dict(spec.params)
 
                 B_matrix, _ = if n_vars == 1 
-                    bstm_smooth_basis_1D(model_type_str, new_data[!, Symbol(vars[1])], nb; local_kwargs...)
+                    bstm_smooth_basis_1D(model_type_str, new_data[!, Symbol(vars[1])], nb;
+                        local_kwargs...)
                 elseif n_vars > 1
                     coords_new = Matrix{Float64}(new_data[!, Symbol.(vars)])
-                    B_matrix_raw = if n_vars == 2; bstm_smooth_basis_2D(model_type_str, coords_new, nb; local_kwargs...);
-                    elseif n_vars == 3; bstm_smooth_basis_3D(model_type_str, coords_new, nb; local_kwargs...);
-                    elseif n_vars == 4; bstm_smooth_basis_4D(model_type_str, coords_new, nb; local_kwargs...);
-                    else; error("Smoothers with more than 4 dimensions are not supported for prediction."); end
+                    B_matrix_raw = if n_vars == 2
+                        bstm_smooth_basis_2D(model_type_str, coords_new, nb; local_kwargs...)
+                    elseif n_vars == 3
+                        bstm_smooth_basis_3D(model_type_str, coords_new, nb; local_kwargs...)
+                    elseif n_vars == 4
+                        bstm_smooth_basis_4D(model_type_str, coords_new, nb; local_kwargs...)
+                    else
+                        error("Smoothers with more than 4 dimensions are not supported for prediction.")
+                    end
                     (B_matrix_raw, size(B_matrix_raw, 2))
                 end
                 ps_basis_registry[key_sym] = B_matrix
@@ -1357,8 +1644,10 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
                 sub_fixed_effects_vars = String[]
                 append!(sub_fixed_effects_vars, sub_decomposed.fixed_effects)
                 for (_, mod_data_nt) in sub_decomposed.modules
-                    if mod_data_nt.module_type == :fixed && haskey(mod_data_nt.args, :positional_args)
-                        append!(sub_fixed_effects_vars, string.(mod_data_nt.args[:positional_args]))
+                    if mod_data_nt.module_type == :fixed && haskey(mod_data_nt.args,
+                        :positional_args)
+                        append!(sub_fixed_effects_vars,
+                            string.(mod_data_nt.args[:positional_args]))
                     end
                 end
                 sub_fixed_effects_vars = unique(sub_fixed_effects_vars)
@@ -1369,7 +1658,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
                     Xfixed_sub, _ = create_fixed_design(
                         rhs, 
                         new_data, 
-                        sub_M.calling_module; 
+                        get(sub_M, :calling_module, @__MODULE__); 
                         contrasts=get(sub_M, :contrasts, Dict())
                     )
                     sub_PS_dict[:Xfixed] = Matrix(Xfixed_sub)
@@ -1389,7 +1678,8 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
 
             if haskey(sub_M, :likelihood_specs) && !isempty(sub_M.likelihood_specs) 
                 sub_lik_params = sub_M.likelihood_specs[1]
-                _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:log_offsets], :log_offsets)
+                _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:log_offsets],
+                    :log_offsets)
                 _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:weights], :weights)
                 _resolve_obs_param!(sub_PS_dict, sub_lik_params, new_data, [:trials], :trials)
             end
@@ -1407,9 +1697,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
     elseif raw_arch == "multifidelity"; MultifidelityArchitecture()
     else; UnivariateArchitecture(); end 
 
-    chain_sub = chain[1:min(n_samps, end), :, :]
-
-    res = _reconstruct(arch_type, "prediction", chain_sub, M_train, PS, alpha)
+    res = _reconstruct(arch_type, "prediction", chain, M_train, PS, alpha)
 
     # 7. Slice the prediction part from the full summary.
     N_train = M_train.y_N
@@ -1440,28 +1728,7 @@ supports several strategies designed to handle the dependent nature of
 spatiotemporal data.
 
 # Version
-v1.1.0 (2026-08-13)
-
-# Rationale
-This function provides a standardized and flexible way to evaluate a model's
-out-of-sample predictive performance.   consistent
-with the refactored `bstm` architecture, replacing the deprecated model
-instantiation logic with a call to the new `bstm_core` function. It also
-corrects a bug in the formula parsing step.
-
-# Cross-Validation Methods (`method`)
-- **`:kfold`**: Standard random k-fold cross-validation. Suitable only when
-  observations can be considered independent.
-- **`:lolo` (Leave-One-Location-Out)**: Each fold consists of all observations
-  from a unique level of the `cv_var` (e.g., a spatial unit `s_idx`). This
-  tests the model's ability to predict at entirely new locations.
-- **`:spatial_block`**: Creates `n_folds` spatial blocks using k-means
-  clustering on the `cv_space_vars`. This tests spatial extrapolation performance.
-- **`:temporal_block`**: Divides the data into `n_folds` contiguous blocks based
-  on the `cv_var` (e.g., `year`). This tests interpolation performance for
-  missing time periods.
-- **`:temporal_forward_chain`**: A forecasting simulation. It iteratively trains
-  on data up to a certain time point and tests on the next `n_folds` time points.
+v1.0.0
 
 # Arguments
 - `formula::String`: The `bstm` model formula.
@@ -1472,7 +1739,8 @@ corrects a bug in the formula parsing step.
 - `sampler`: The Turing sampler used to fit the model in each fold. Default: `NUTS(500, 0.65)`.
 - `n_samples::Int`: The number of posterior samples to draw in each fold. Default: `500`.
 - `alpha::Float64`: The significance level for credible intervals in prediction. Default: `0.05`.
-- `cv_space_vars::Vector{Symbol}`: Coordinate columns for `:spatial_block`. Default: `[:s_x, :s_y]`.
+- `cv_space_vars::Vector{Symbol}`: Coordinate columns for `:spatial_block`. Default: `[:s_x,
+  :s_y]`.
 - `kwargs...`: Additional keyword arguments passed to the underlying `bstm_core` call.
 
 # Returns
@@ -1504,36 +1772,50 @@ function bstm_cv_orchestrator(
     is_forward_chain = false
 
     if method == :lolo
-        if !hasproperty(data, cv_var); error("LOLO cross-validation requires the specified `cv_var` column ':$cv_var' in the data."); end
+        if !hasproperty(data, cv_var)
+            error("LOLO cross-validation requires the specified `cv_var` column ':$cv_var' in the data.")
+        end
         unique_locs = unique(data[!, cv_var])
         for loc in unique_locs
             push!(folds_indices, findall(x -> x == loc, data[!, cv_var]))
         end
     elseif method == :spatial_block
-        if !all(hasproperty(data, v) for v in cv_space_vars); error("Spatial block cross-validation requires coordinate columns specified in `cv_space_vars`: $cv_space_vars."); end
+        if !all(hasproperty(data, v) for v in cv_space_vars)
+            error("Spatial block cross-validation requires coordinate columns specified in `cv_space_vars`: $cv_space_vars.")
+        end
         coords = Matrix(data[!, cv_space_vars])' # kmeans expects features in rows
         R = Clustering.kmeans(coords, n_folds; maxiter=200, display=:none)
         assignments = R.assignments
         for k in 1:n_folds
             fold_k_indices = findall(x -> x == k, assignments)
-            if !isempty(fold_k_indices); push!(folds_indices, fold_k_indices); end 
+            if !isempty(fold_k_indices)
+                push!(folds_indices, fold_k_indices)
+            end 
         end
     elseif method == :temporal_block
-        if !hasproperty(data, cv_var); error("Temporal block cross-validation requires the specified `cv_var` column ':$cv_var' in the data."); end
+        if !hasproperty(data, cv_var)
+            error("Temporal block cross-validation requires the specified `cv_var` column ':$cv_var' in the data.")
+        end
         unique_times = sort(unique(data[!, cv_var]))
         fold_size = cld(length(unique_times), n_folds) # ceiling division
         for i in 1:n_folds
             start_idx = (i - 1) * fold_size + 1
             end_idx = min(i * fold_size, length(unique_times))
-            if start_idx > length(unique_times); continue; end 
+            if start_idx > length(unique_times)
+                continue
+            end 
             time_block = unique_times[start_idx:end_idx]
             push!(folds_indices, findall(t -> t in time_block, data[!, cv_var]))
         end
     elseif method == :temporal_forward_chain
-        if !hasproperty(data, cv_var); error("Forward-chaining cross-validation requires the specified `cv_var` column ':$cv_var' in the data."); end
+        if !hasproperty(data, cv_var)
+            error("Forward-chaining cross-validation requires the specified `cv_var` column ':$cv_var' in the data.")
+        end
         is_forward_chain = true
         unique_times = sort(unique(data[!, cv_var]))
-        if length(unique_times) <= n_folds; @warn "Number of unique time points ($(length(unique_times))) is less than or equal to `n_folds` ($n_folds). Consider reducing `n_folds` for forward-chaining."; end
+        if length(unique_times) <= n_folds
+            @warn "Number of unique time points ($(length(unique_times))) is less than or equal to `n_folds` ($n_folds). Consider reducing `n_folds` for forward-chaining."
+        end
         test_times = unique_times[end-n_folds+1:end]
         for t in test_times
             push!(folds_indices, findall(x -> x == t, data[!, cv_var]))
@@ -1545,7 +1827,9 @@ function bstm_cv_orchestrator(
         for i in 1:n_folds
             idx_start = (i - 1) * fold_size + 1
             idx_end = min(i * fold_size, n_obs)
-            if idx_start > n_obs; continue; end 
+            if idx_start > n_obs
+                continue
+            end 
             push!(folds_indices, row_indices[idx_start:idx_end])
         end
     end
@@ -1566,17 +1850,21 @@ function bstm_cv_orchestrator(
             data[train_mask, :]
         end
 
-        if nrow(train_data) == 0; @warn "Fold $f_idx created an empty training set. Skipping."; continue; end 
+        if nrow(train_data) == 0
+            @warn "Fold $f_idx created an empty training set. Skipping."
+            continue
+        end 
 
         # Updated model instantiation to use bstm_core, consistent with refactor.
         # Pass kwargs through, but force verbose=false to avoid excessive output.
-        cv_kwargs = Dict(kwargs)
+        cv_kwargs = Dict{Symbol, Any}(pairs(kwargs))
         cv_kwargs[:verbose] = false
         
         model_train = bstm_core(formula, train_data; cv_kwargs...)
         
-        chain_train = sample(model_train, sampler, n_samples; progress=false)
-        res_pred = predict(model_train, chain_train, test_data; n_samples=div(n_samples, 2), alpha=alpha)
+        chain_train = Base.invokelatest(sample, model_train, sampler, n_samples; progress=false)
+        res_pred = Base.invokelatest(predict, model_train, chain_train, test_data;
+            n_samples=div(n_samples, 2), alpha=alpha)
 
         y_test_obs = test_data[!, response_name]
         y_test_pred = res_pred.predictions_denoised.mean
@@ -1612,28 +1900,7 @@ A utility for performing Leave-One-Out Cross-Validation using Pareto Smoothed
 Importance Sampling (PSIS-LOO) to assess a model's out-of-sample predictive accuracy.
 
 # Version
-v1.0.3 (2026-08-13)
-
-# Rationale
-This function serves as a high-level wrapper around the `PosteriorStats.loo`
-function. It is a critical tool for model selection, providing a more robust
-estimate of out-of-sample predictive performance than simpler metrics like WAIC.
-
-This version is confirmed to be correct and consistent with the refactored `bstm`
-architecture. It correctly handles the dimensional requirements of the underlying
-`PosteriorStats.loo` function by transposing the log-likelihood matrix.
-
-# Workflow
-1.  **Architecture Dispatch**: Determines the model architecture (univariate,
-    multivariate, etc.) from the model configuration.
-2.  **Log-Likelihood Reconstruction**: Calls the internal `_reconstruct` function
-    to generate the pointwise log-likelihood matrix, which has dimensions
-    `[n_observations, n_samples]`.
-3.  **Matrix Transposition**: Transposes the log-likelihood matrix to the
-    `[n_samples, n_observations]` format required by `PosteriorStats.loo`.
-4.  **PSIS-LOO Calculation**: Calls `PosteriorStats.loo` to compute the LOO-CV metrics.
-5.  **Reporting**: Prints a summary of the key metrics (ELPD, p_loo, LOOIC) and
-    warns the user if any influential observations (high Pareto-k values) are detected.
+v1.0.0
 
 # Arguments
 - `model_obj::DynamicPPL.Model`: The fitted Turing model object.
@@ -1687,9 +1954,12 @@ function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
     end
 
     println("\n--- BSTM Model Selection Report ---")
-    println("Expected Log Pointwise Predictive Density (ELPD): ", round(loo_result.estimates[:elpd_loo, :estimate], digits=2))
-    println("Effective Number of Parameters (p_loo):          ", round(loo_result.estimates[:p_loo, :estimate], digits=2))
-    println("LOO Information Criterion:                       ", round(loo_result.estimates[:looic, :estimate], digits=2))
+    println("Expected Log Pointwise Predictive Density (ELPD): ",
+        round(loo_result.estimates[:elpd_loo, :estimate], digits=2))
+    println("Effective Number of Parameters (p_loo):          ",
+        round(loo_result.estimates[:p_loo, :estimate], digits=2))
+    println("LOO Information Criterion:                       ",
+        round(loo_result.estimates[:looic, :estimate], digits=2))
 
     # Check for influential observations (k > 0.7)
     pareto_k = loo_result.pointwise[:pareto_k]
@@ -1717,12 +1987,6 @@ end
 A utility for formal model comparison between two fitted `bstm` models. It uses
 their PSIS-LOO results to compute the difference in Expected Log Pointwise
 Predictive Density (ELPD) and provides a statistical basis for model selection.
-
-# Rationale
-This function is updated to be consistent with the refactored `bstm` framework,
-which uses the term "component" instead of the deprecated "manifold". The function
-name and internal print statements have been updated accordingly. The core logic,
-which relies on `PosteriorStats.compare`, remains unchanged as it is correct.
 
 # Arguments
 - `loo_a_report`, `loo_b_report`: The output `NamedTuple` from `bstm_loo` for each model.
@@ -1755,14 +2019,17 @@ function compare_models(loo_a_report, loo_b_report; model_names=["Model_A", "Mod
 
     # 4. Report Generation
     println("\n--- BSTM Model Selection Registry ---")
-    println("Model A (", model_names[1], "): ELPD = ", round(elpd_a, digits=2), " | p_loo = ", round(p_loo_a, digits=2))
-    println("Model B (", model_names[2], "): ELPD = ", round(elpd_b, digits=2), " | p_loo = ", round(p_loo_b, digits=2))
+    println("Model A (", model_names[1], "): ELPD = ", round(elpd_a, digits=2), " | p_loo = ",
+        round(p_loo_a, digits=2))
+    println("Model B (", model_names[2], "): ELPD = ", round(elpd_b, digits=2), " | p_loo = ",
+        round(p_loo_b, digits=2))
     diff_elpd = elpd_a - elpd_b
     println("\nELPD Delta (A - B): ", round(diff_elpd, digits=2))
 
     if abs(diff_elpd) > 4.0
         winning_model = diff_elpd > 0 ? model_names[1] : model_names[2]
-        println("CONCLUSION: ", winning_model, " is statistically preferred based on predictive density.")
+        println("CONCLUSION: ", winning_model,
+            " is statistically preferred based on predictive density.")
     else
         println("CONCLUSION: Competing models provide indistinguishable predictive density.")
     end

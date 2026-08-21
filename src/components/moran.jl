@@ -8,7 +8,7 @@ combination of these eigenvectors, providing a spectral basis for modeling spati
 processes.
 
 # Version
-v1.1.2 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The Moran component models a spatial field \$\\phi\$ as a linear combination of the
@@ -25,7 +25,8 @@ where:
 # Computational Methods
 - `:noncentered` (Default, AD-friendly): A non-centered parameterization where coefficients are
   constructed from standard normal innovations. Recommended for gradient-based samplers.
-- `:centered` (Didactic, Not AD-friendly): A centered parameterization where coefficients are sampled directly
+- `:centered` (Didactic, Not AD-friendly): A centered parameterization where coefficients
+  are sampled directly
   from `N(0, sigma^2)`. This can be less efficient for MCMC.
 
 # Inputs
@@ -33,12 +34,15 @@ where:
   - A spatial index variable (e.g., `region`) passed to `random()`.
   - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
 - **Optional (in `random()` call)**:
-  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the coefficients. Default: `Exponential(1.0)`.
-  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default: `:noncentered`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the coefficients.
+    Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default:
+    `:noncentered`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the eigenvector coefficients.
-- `innovations_<key>`: The raw standard normal innovations for the coefficients (for `:noncentered`).
+- `innovations_<key>`: The raw standard normal innovations for the coefficients (for
+  `:noncentered`).
 - `latent_<key>`: The latent coefficients (for `:centered`).
 
 # Key References
@@ -89,9 +93,11 @@ function get_precomputes(m::Moran, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    _moran_log_marginal_likelihood(y_residual, s_idx, s_N, eigenvectors, sigma, y_sigma, noise=1e-6)
+    _moran_log_marginal_likelihood(y_residual, s_idx, s_N, eigenvectors, sigma, y_sigma,
+      noise=1e-6)
 
-Computes the exact log marginal likelihood for a Moran eigenvector component integrated out analytically.
+Computes the exact log marginal likelihood for a Moran eigenvector component integrated out
+  analytically.
 """
 function _moran_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -186,7 +192,7 @@ function get_updates(
             $(common_code)
             scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
             $(p_names.sre) = moran_eigenvectors * scaled_coeffs
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -196,7 +202,7 @@ function get_updates(
             $(common_code)
             $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), $(p_names.sigma)^2 * I)
             latent_field = moran_eigenvectors * $(p_names.sre)
-            $(eta_target) .+= view(latent_field, M.s_idx)
+            $(eta_target) = $(eta_target) .+ view(latent_field, M.s_idx)
         end
     """
 
@@ -239,12 +245,7 @@ function get_effects(
     m::Moran, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))

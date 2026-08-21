@@ -6,7 +6,7 @@ approximates the full GP kernel matrix with a low-rank version based on a small 
 of `n_inducing` points, making it scalable for larger datasets.
 
 # Version
-v1.2.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The Nyström method approximates the \$N \\times N\$ kernel matrix \$K_{XX}\$ of the data
@@ -30,7 +30,8 @@ where \$K_{ZZ} = L_{ZZ}L_{ZZ}^T\$. The final effect is computed as:
 - `:noncentered` (Default, AD-friendly): A non-centered parameterization where the latent values
   at inducing points are constructed from standard normal innovations. Recommended
   for efficient MCMC sampling.
-- `:centered` (Didactic, Not AD-friendly): A centered parameterization where the latent values at inducing points
+- `:centered` (Didactic, Not AD-friendly): A centered parameterization where the latent
+  values at inducing points
   are sampled directly from their `MvNormal` distribution. This can be less efficient for MCMC.
 
 # Inputs
@@ -38,17 +39,24 @@ where \$K_{ZZ} = L_{ZZ}L_{ZZ}^T\$. The final effect is computed as:
   - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
 - **Optional (in `random()` call)**:
   - `n_inducing`: `Int`, the number of inducing points. Default: `20`.
-  - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`). Default: `"se"`.
-  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP. Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
-  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default: `:noncentered`.
-  - `knot_method`: `Symbol`, method for placing inducing points (`:kmeans`, `:random`, `:quantile`, `:range`). Default: `:kmeans`.
+  - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`).
+    Default: `"se"`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP.
+    Default: `Exponential(1.0)`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default:
+    `:noncentered`.
+  - `knot_method`: `Symbol`, method for placing inducing points (`:kmeans`, `:random`,
+    `:quantile`, `:range`). Default: `:kmeans`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the GP.
 - `ls_<key>`: The kernel lengthscale(s).
-- `innovations_<key>`: Raw standard normal innovations for the inducing points (for `:noncentered`).
-- `latent_<key>`: The latent values at the inducing points (for `:centered`). The final effect is derived from these.
+- `innovations_<key>`: Raw standard normal innovations for the inducing points (for
+  `:noncentered`).
+- `latent_<key>`: The latent values at the inducing points (for `:centered`). The final
+  effect is derived from these.
 """
 struct Nystrom <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
@@ -151,9 +159,8 @@ function get_updates(
         # --- Nystrom Sparse GP (Non-Centered): $(key) ---
         $(common_code)
             L_UU = cholesky(Symmetric(K_UU)).L
-            u_latent = L_UU * $(p_names.ure)
-            $(p_names.sre) = K_XU * (K_UU \\ u_latent)
-            $(eta_target) .+= $(p_names.sre)
+            $(p_names.sre) = K_XU * (L_UU' \\ $(p_names.ure))
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -162,7 +169,7 @@ function get_updates(
         $(common_code)
             $(p_names.sre) ~ MvNormal(zeros(T, $(m.n_inducing)), Symmetric(K_UU))
             nystrom_effect = K_XU * (K_UU \\ $(p_names.sre))
-            $(eta_target) .+= nystrom_effect
+            $(eta_target) = $(eta_target) .+ nystrom_effect
         end
     """
 
@@ -205,8 +212,10 @@ function get_effects(
     
     # Combine training and prediction coordinates
     coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars) # If prediction set is provided
-        coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]) # Extract prediction coordinates
+    coords_full = if !isnothing(PS) && all(hasproperty(PS.data,
+        Symbol(v)) for v in coord_vars) # If prediction set is provided
+        coords_pred = Matrix{Float64}(PS.data[!,
+            Symbol.(coord_vars)]) # Extract prediction coordinates
         vcat(coords_train, coords_pred) # Combine training and prediction coordinates
     else
         coords_train # Otherwise, use only training coordinates
@@ -245,15 +254,18 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            ure_samples = get_params_matrix(chain, ure_name, m.n_inducing) # (n_samples, n_inducing)
+            ure_samples = get_params_matrix(chain, ure_name, m.n_inducing) # (n_samples,
+                n_inducing)
 
             for i in 1:n_samples
                 current_sigma = sigma_samples[i, 1] # Sigma for current sample
                 current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1] # Lengthscale for current sample
                 
                 # Kernel evaluations and linear algebra
-                K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
-                K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
+                K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls,
+                    kernel_type, noise)
+                K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma,
+                    current_ls, kernel_type)
                 
                 L_UU = cholesky(Symmetric(K_UU)).L
                 u_latent = L_UU * ure_samples[i, :]
@@ -266,15 +278,18 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            u_latent_samples = get_params_matrix(chain, sre_name, m.n_inducing) # (n_samples, n_inducing)
+            u_latent_samples = get_params_matrix(chain, sre_name, m.n_inducing) # (n_samples,
+                n_inducing)
 
             for i in 1:n_samples # Iterate over each posterior sample
                 current_sigma = sigma_samples[i, 1] # Sigma for current sample
                 current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1] # Lengthscale for current sample
                 
                 # Kernel evaluations and linear algebra
-                K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
-                K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
+                K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls,
+                    kernel_type, noise)
+                K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma,
+                    current_ls, kernel_type)
                 
                 effect_k_matrix[:, i] = K_XU * (K_UU \ u_latent_samples[i, :])
             end

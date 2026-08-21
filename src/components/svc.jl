@@ -6,7 +6,7 @@ covariate to vary smoothly across space. It acts as an orchestrator, applying an
 spatial `ComponentModel` to a specified covariate.
 
 # Version
-v1.2.1 (2026-08-14)
+v1.0.0
 
 # Mathematical Summary
 An SVC model replaces a fixed regression coefficient \$\\beta\$ with a spatially-indexed
@@ -18,7 +18,8 @@ observation at location \$s_i\$ with covariate value \$x_i\$ is given by:
 The spatially varying coefficient \$\\boldsymbol{\\beta} = (\\beta(s_1), \\dots, \\beta(s_{s_N}))\$
 is itself modeled as a latent Gaussian Process or GMRF, governed by the `inner_model`.
 For example, if the inner model is an ICAR process, then the prior on \$\\boldsymbol{\\beta}\$ is:
-\$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\sigma^2_{\\beta} \\mathbf{Q}_{ICAR})^{-1})\$
+\$\\boldsymbol{\\beta} \\sim \\mathcal{N}(\\mathbf{0}, (\\sigma^2_{\\beta}
+  \\mathbf{Q}_{ICAR})^{-1})\$
 
 # Computational Methods
 The `SVC` component does not have its own methods. The computational method is
@@ -28,7 +29,8 @@ use a spectral decomposition for the spatially varying coefficient, you would sp
 
 # Inputs
 - **Required**:
-  - A covariate piped (`|>`) into a spatial `random()` module, e.g., `covariate |> random(s_idx, model=icar)`.
+  - A covariate piped (`|>`) into a spatial `random()` module, e.g., `covariate |>
+    random(s_idx, model=icar)`.
   - The inner `random()` call must specify a spatial model.
 - **Optional**:
   - Priors for the inner spatial model are passed within the inner `random()` call.
@@ -51,8 +53,8 @@ end
 COMPONENT_TYPE_REGISTRY[:svc] = SVC
 
 COMPONENT_CONSTRUCTORS[:svc] = (p, params) -> begin
-    covariate = get(params, :covariate, error("SVC constructor requires a `covariate` parameter."))
-    inner_model_obj = get(params, :inner_model_obj, error("SVC constructor requires an `inner_model_obj` parameter."))
+    covariate = get(params, :covariate, :cov1)
+    inner_model_obj = get(params, :inner_model_obj, ICAR(p.sigma, :spectral))
     
     SVC(covariate, inner_model_obj)
 end
@@ -134,24 +136,25 @@ function get_updates(
     correct_access = "spec_registry[:$(spec.key)].hyper.inner_precomputes"
     inner_updates_code_fixed = replace(inner_updates_code, incorrect_access => correct_access)
 
-    # Strip the eta update from the inner model's code, as the SVC wrapper handles it.
-    effect_app_regex = Regex("$(eta_target) \\.\\+= .*")
+    # Strip the eta update from the inner model's code, returning the inner latent field.
+    effect_app_regex = Regex("$(eta_target) (\\.\\+=|=|\\.\\=) .*")
     update_inner_cleaned = replace(
-        inner_updates_code_fixed, effect_app_regex => "# (eta update handled by SVC wrapper)"
+        inner_updates_code_fixed, effect_app_regex => "$(inner_latent_var)"
     )
 
     is_intercept = (cov_var == Symbol("1") || cov_var == :intercept)
     
     covariate_access = is_intercept ? "1.0" : "M.data[!, :$(cov_var)]"
     
-    application_code = "$(eta_target) .+= $(covariate_access) .* view($(inner_latent_var), M.s_idx)"
+    application_code = """
+        $(inner_latent_var) = begin
+            $(update_inner_cleaned)
+        end
+        $(eta_target) = $(eta_target) .+ $(covariate_access) .* view($(inner_latent_var), M.s_idx)
+    """
     
     return """
         # --- Spatially Varying Coefficient (SVC) for: $(cov_var) ---
-        # 1. Generate the latent spatial field for the coefficient.
-        $(update_inner_cleaned)
-
-        # 2. Apply the spatially varying coefficient to the linear predictor.
         $(application_code)
     """
 end

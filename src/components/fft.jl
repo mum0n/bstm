@@ -8,12 +8,13 @@ combination of these basis functions, with coefficients regularized by a random
 walk prior to ensure smoothness.
 
 # Version
-v1.2.1 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The component models a smooth function \$f(x)\$ as a linear combination of Fourier
 basis functions:
-\$f(x) = \\sum_{j=1}^{M} \\left( \\beta_{s,j} \\sin\\left(\\frac{2\\pi j x}{\\ell}\\right) + \\beta_{c,j} \\cos\\left(\\frac{2\\pi j x}{\\ell}\\right) \\right)\$
+\$f(x) = \\sum_{j=1}^{M} \\left( \\beta_{s,j} \\sin\\left(\\frac{2\\pi j x}{\\ell}\\right) +
+  \\beta_{c,j} \\cos\\left(\\frac{2\\pi j x}{\\ell}\\right) \\right)\$
 where:
 - \$M\$ is half the number of bins (`nbins`), representing the number of sine/cosine pairs.
 - \$\\ell\$ is the `lengthscale` that controls the periodicity of the basis functions.
@@ -203,7 +204,9 @@ function bstm_fourier_basis(
         push!(basis_matrices_1D, B_1d)
     end
     
-    if isempty(basis_matrices_1D); return similar(coords, n_obs, 0); end
+    if isempty(basis_matrices_1D)
+        return similar(coords, n_obs, 0)
+    end
 
     # Combine 1D basis matrices using broadcasting for a row-wise Kronecker product
     B_final = basis_matrices_1D[1]
@@ -259,7 +262,7 @@ function get_updates(
             coeffs = hyper.U * (diag_D .* $(p_names.ure))
             $(p_names.sre) = B_fft * coeffs
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -280,7 +283,7 @@ function get_updates(
             coeffs = $(p_names.sigma) .* coeffs_unscaled
             $(p_names.sre) = B_fft * coeffs
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -301,13 +304,16 @@ function get_updates(
             coeffs = $(p_names.sigma) .* coeffs_unscaled
             $(p_names.sre) = B_fft * coeffs
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
-    if m.method == :spectral; return spectral_code;
-    elseif m.method == :cholesky; return cholesky_code;
-    elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
     else; error("Unsupported method '$(m.method)' for FFT component."); end
 end
 

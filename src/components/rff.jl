@@ -7,7 +7,7 @@ the input coordinates into a randomized feature space. This transforms the GP in
 more scalable Bayesian linear regression problem.
 
 # Version
-v1.2.1 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The RFF method approximates a stationary kernel \$k(\\tau) = k(x - x')\$ by using
@@ -32,17 +32,22 @@ The final effect is a linear combination of these features: \$f(x) = \\phi(x)^T 
   - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
 - **Optional (in `random()` call)**:
   - `n_features`: `Int`, the number of random features to use. Default: `20`.
-  - `kernel`: `String`, the name of the kernel to approximate (e.g., `"se"`, `"matern32"`). Default: `"se"`.
-  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the RFF coefficients. Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
-  - `method`: `Symbol`, computational method (`:fixed`, `:adaptive`, or `:centered`). Default: `:fixed`.
+  - `kernel`: `String`, the name of the kernel to approximate (e.g., `"se"`, `"matern32"`).
+    Default: `"se"`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the RFF
+    coefficients. Default: `Exponential(1.0)`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `method`: `Symbol`, computational method (`:fixed`, `:adaptive`, or `:centered`).
+    Default: `:fixed`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the RFF coefficients.
 - `ls_<key>`: The kernel lengthscale(s).
 - `W_<key>`: The learned RFF projection weights (for `:adaptive` method).
 - `b_<key>`: The learned RFF biases (for `:adaptive` method).
-- `innovations_<key>`: Raw standard normal innovations for the RFF coefficients (for `:fixed` and `:adaptive`).
+- `innovations_<key>`: Raw standard normal innovations for the RFF coefficients (for
+  `:fixed` and `:adaptive`).
 - `latent_<key>`: The RFF coefficients (for `:centered`).
 """
 struct RFF <: ComponentModel
@@ -85,7 +90,13 @@ function _generate_rff_fixed_params(
             end
         end
     elseif occursin("matern", k_name)
-        nu = if k_name == "matern12"; 0.5; elseif k_name == "matern32"; 1.5; else 2.5; end
+        nu = if k_name == "matern12"
+            0.5
+        elseif k_name == "matern32"
+            1.5
+        else
+            2.5
+        end
         df = 2 * nu
         if lengthscale isa Real
             W .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
@@ -144,7 +155,8 @@ end
 """
     _rff_log_marginal_likelihood(y_residual, Phi, sigma, y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for a Random Fourier Features smoother with coefficients integrated out analytically.
+Computes the exact log marginal likelihood for a Random Fourier Features smoother with
+  coefficients integrated out analytically.
 """
 function _rff_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -208,7 +220,8 @@ function get_priors(
         end
 
         if m.method in [:fixed, :adaptive]
-            push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+            push!(priors,
+                "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
         end
     end
 
@@ -239,7 +252,7 @@ function get_updates(
             $(phi_code("$(hyper_access).W_fixed", "$(hyper_access).b_fixed"))
             scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
             $(p_names.sre) = Phi * scaled_coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -249,7 +262,7 @@ function get_updates(
             $(phi_code(string(p_names.W), string(p_names.b)))
             scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
             $(p_names.sre) = Phi * scaled_coeffs
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -259,7 +272,7 @@ function get_updates(
             $(phi_code("$(hyper_access).W_fixed", "$(hyper_access).b_fixed"))
             $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), $(p_names.sigma)^2 * I)
             rff_effect = Phi * $(p_names.sre)
-            $(eta_target) .+= rff_effect
+            $(eta_target) = $(eta_target) .+ rff_effect
         end
     """
 
@@ -279,10 +292,14 @@ function get_updates(
         end
     """
 
-    if m.method == :fixed; return fixed_code;
-    elseif m.method == :adaptive; return adaptive_code;
-    elseif m.method == :centered; return centered_code;
-    elseif m.method == :marginalized; return marginalized_code;
+    if m.method == :fixed
+        return fixed_code
+    elseif m.method == :adaptive
+        return adaptive_code
+    elseif m.method == :centered
+        return centered_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else; error("Unsupported method '$(m.method)' for RFF component. Use :fixed, :adaptive, :centered, or :marginalized."); end
 end
 
@@ -298,11 +315,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -328,7 +341,8 @@ function get_effects(
     for k_outcome in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
 
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome,
+            is_multivariate_model)
         if isempty(sigma_name)
             @warn "Sigma parameter for RFF component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
@@ -364,7 +378,8 @@ function get_effects(
                 scale = sig^2 + noise_val
                 inv_sigma_y2 = 1.0 / (y_sig^2 + noise_val)
                 
-                Q_base = Matrix{Float64}(I, n_features, n_features) .+ (scale * inv_sigma_y2) .* PTP
+                Q_base = Matrix{Float64}(I, n_features,
+                    n_features) .+ (scale * inv_sigma_y2) .* PTP
                 for j in 1:n_features
                     Q_base[j, j] += noise_val
                 end
@@ -380,9 +395,12 @@ function get_effects(
 
         elseif m.method == :adaptive
             # --- Adaptive Method: Per-sample loop is necessary as W and b change ---
-            W_name = _find_parameter(p_names, string(p_names_k.W), k_outcome, is_multivariate_model)
-            b_name = _find_parameter(p_names, string(p_names_k.b), k_outcome, is_multivariate_model)
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k_outcome, is_multivariate_model)
+            W_name = _find_parameter(p_names, string(p_names_k.W), k_outcome,
+                is_multivariate_model)
+            b_name = _find_parameter(p_names, string(p_names_k.b), k_outcome,
+                is_multivariate_model)
+            ure_name = _find_parameter(p_names, string(p_names_k.ure), k_outcome,
+                is_multivariate_model)
             
             if isempty(W_name) || isempty(b_name) || isempty(ure_name)
                 @warn "Adaptive RFF parameters for component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
@@ -411,7 +429,8 @@ function get_effects(
             Phi = sqrt(2.0 / n_features) .* cos.((coords_full * W_matrix) .+ b_vec')
 
             if m.method == :fixed
-                ure_name = _find_parameter(p_names, string(p_names_k.ure), k_outcome, is_multivariate_model)
+                ure_name = _find_parameter(p_names, string(p_names_k.ure), k_outcome,
+                    is_multivariate_model)
                 if isempty(ure_name)
                     @warn "ure for RFF component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
                     push!(structured_effects, zeros(Float64, N_total, n_samples))
@@ -423,7 +442,8 @@ function get_effects(
                 effect_k = Phi * scaled_coeffs
 
             else # :centered
-                sre_name = _find_parameter(p_names, string(p_names_k.sre), k_outcome, is_multivariate_model)
+                sre_name = _find_parameter(p_names, string(p_names_k.sre), k_outcome,
+                    is_multivariate_model)
                 if isempty(sre_name)
                     @warn "Latent coefficients for centered RFF component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
                     push!(structured_effects, zeros(Float64, N_total, n_samples))

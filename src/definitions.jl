@@ -1,28 +1,31 @@
- 
+"""
+    definitions.jl
+
+Core type definitions, abstract hierarchies, registries, and interface function declarations
+for Bayesian Spatio-Temporal Models (BSTM).
+
+Version: v1.0.0
+"""
+
 abstract type Component end
-
 abstract type ComponentOperator <: Component end
-
-# All component models must inherit from ComponentModel
 abstract type ComponentModel <: Component end
 
-struct None <: ComponentModel end # Placeholder for empty components
+struct None <: ComponentModel end
 
-
-# these constructors will be added upon by each component file
 const COMPONENT_CONSTRUCTORS = Dict{Symbol, Function}(
     :none => (p, params) -> None()
 )
 
-# these structures will be added to where required in the component file
 const MODEL_TO_STRUCTURE_MAP = Dict{Union{Symbol, DataType}, Symbol}(
-    :none => :none  # dummy value to initiate the map 
+    :none => :none
 )
 
 """
     get_component_structure(component)::Symbol
 
-Resolves the structural category (:spatial, :temporal, :seasonal, :smooth, :spacetime, :mixed, :any)
+Resolves the structural category (`:spatial`, `:temporal`, `:seasonal`, `:smooth`,
+  `:spacetime`, `:mixed`, `:any`)
 for a component model symbol, type, or instance.
 """
 function get_component_structure(component)::Symbol
@@ -47,7 +50,8 @@ end
 """
     _get_varname_symbol(vn)::Symbol
 
-Robustly extracts the base Symbol from a `DynamicPPL.VarName` or `Symbol` across DynamicPPL and AbstractPPL versions.
+Extracts the base Symbol from a `DynamicPPL.VarName` or `Symbol` across DynamicPPL and
+  AbstractPPL versions.
 """
 function _get_varname_symbol(vn)::Symbol
     if vn isa Symbol
@@ -70,8 +74,10 @@ end
 """
     _model_float_type(vi)::Type
 
-Extracts the active scalar floating-point number type from `DynamicPPL.VarInfo` (e.g., `Float64`, `ForwardDiff.Dual`, `ReverseDiff.TrackedReal`).
-Ensures AD type-stability when allocating intermediate arrays in generated Turing models.
+Extracts the active scalar floating-point number type from `DynamicPPL.VarInfo` (e.g.
+  `Float64`, `ForwardDiff.Dual`, `ReverseDiff.TrackedReal`).
+Ensures automatic differentiation type-stability when allocating intermediate arrays in
+  generated Turing models.
 """
 function _model_float_type(vi)::Type
     # 1. Check OnlyAccsVarInfo (vi.accs)
@@ -102,12 +108,16 @@ function _model_float_type(vi)::Type
             vals = getfield(vi, :values)
             if vals isa AbstractArray && length(vals) > 0
                 et = eltype(vals)
-                if et !== Union{} && et !== Any && et <: Number; return et; end
+                if et !== Union{} && et !== Any && et <: Number
+                    return et
+                end
             elseif vals isa NamedTuple && length(vals) > 0
                 first_val = first(values(vals))
                 if first_val isa AbstractArray && length(first_val) > 0
                     et = eltype(first_val)
-                    if et !== Union{} && et !== Any && et <: Number; return et; end
+                    if et !== Union{} && et !== Any && et <: Number
+                        return et
+                    end
                 elseif first_val isa Number
                     val_type = typeof(first_val)
                     if val_type !== Union{} && val_type !== Any && val_type <: Number
@@ -127,7 +137,9 @@ function _model_float_type(vi)::Type
                 first_meta = first(values(meta))
                 if hasproperty(first_meta, :vals) && length(first_meta.vals) > 0
                     et = eltype(first_meta.vals)
-                    if et !== Union{} && et !== Any && et <: Number; return et; end
+                    if et !== Union{} && et !== Any && et <: Number
+                        return et
+                    end
                 end
             end
         catch
@@ -302,61 +314,12 @@ const STATSMODELS_CONTRASTS = Dict(
     :treatment => StatsModels.DummyCoding()
 )
 
-# Purpose: Defines a mapping for models whose structure is unambiguous. 
-const KNOWN_UNAMBIGUOUS_MODELS = Dict{Symbol, Symbol}(
-    :icar => :spatial,
-    :besag => :spatial,
-    :bym2 => :spatial,
-    :leroux => :spatial,
-    :sar => :spatial, 
-    :dag => :spatial,
-    :spde => :spatial,
-    :localadaptive => :spatial, :mosaic => :spatial, :networkflow => :spatial,
-    :pointprocess => :spatial, # The consolidated point process component is spatial
-    :bcgn => :spatial, # Bipartite Graph Convolutional Network
-
-    :ar1 => :temporal,
-    :ar2 => :temporal,
-    :rw1 => :temporal,
-    :rw2 => :temporal,
-    :cyclic => :temporal,
-    :harmonic => :temporal,
-    :tar => :temporal,
-
-    :pspline => :smooth,
-    :bspline => :smooth,
-    :tps => :smooth, 
-    :wavelet => :smooth,
-    :waveletgp => :smooth,
-    :spectralgp => :smooth,
-    
-    :eigen => :smooth,
-    :moran => :smooth,
-    :barycentric => :smooth, 
-
-    :svar => :spacetime,
-    :dynamics => :spacetime,
-    :composed => :spacetime, # Default, can be overridden
-    :nonstationaryvariance => :spacetime,
-    :adaptivesmooth => :smooth
-)
- 
-
 const AMBIGUOUS_MODELS = Set([
     :iid, # Can be spatial (with W), temporal (with time var), or smooth (generic var)
     :gp,  # Can be spatial (coords), temporal (time var), or smooth (generic var)
     :rff, # Same as gp
     :fft, # Can be spatial (coords) or temporal (time var)
 ])
-
- 
-const LEGACY_MODULES = Dict(
-    :spatial => :spatial,
-    :temporal => :temporal,
-    :smooth => :smooth,
-    :seasonal => :seasonal,
-    :spacetime => :spacetime
-);
 
  
 
@@ -427,7 +390,8 @@ component has been instantiated. It is responsible for:
 function get_precomputes end
 
 """
-    get_priors(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_priors(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int,
+      Nothing}, M::NamedTuple)::String
 
 Generates the Turing code string for the component's priors.
 
@@ -449,9 +413,11 @@ producing Julia/Turing code snippets that define:
 function get_priors end
 
 """
-    get_updates(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String
+    get_updates(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int,
+      Nothing}, M::NamedTuple)::String
 
-Generates the Turing code string for constructing the component's effect and adding it to the linear predictor.
+Generates the Turing code string for constructing the component's effect and adding it to
+  the linear predictor.
 
 This method is dispatched on the `ComponentModel` instance and is responsible for
 producing Julia/Turing code snippets that define:
@@ -471,9 +437,12 @@ producing Julia/Turing code snippets that define:
 function get_updates end
 
 """
-    get_effects(m::ComponentModel, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
+    get_effects(m::ComponentModel, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int,
+      p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing},
+      N_total::Int)::NamedTuple
 
-Reconstructs the component's effect from the MCMC chain's posterior samples for diagnostics and visualization.
+Reconstructs the component's effect from the MCMC chain's posterior samples for diagnostics
+  and visualization.
 
 This method is dispatched on the `ComponentModel` instance and is responsible for:
 1.  Extracting relevant parameter samples from the MCMC `chain`.

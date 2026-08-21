@@ -6,7 +6,7 @@ leverages the Fast Fourier Transform (FFT) to efficiently model stationary
 covariance structures, making it highly scalable for data on regular grids.
 
 # Version
-v1.2.2 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 This component models a latent field \$f(s)\$ by defining its properties in the
@@ -34,10 +34,14 @@ This approach is computationally efficient, scaling as \$O(N \\log N)\$ for a gr
   - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
 - **Optional (in `random()` call)**:
   - `resolution`: `Int`, the grid resolution for discretization. Default: `32`.
-  - `kernel`: `String`, the parametric family for the power spectrum (e.g., `"matern"`). Default: `"matern"`.
-  - `sigma`: `UnivariateDistribution`, prior for the overall marginal standard deviation. Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
-  - `nu` (smoothness): `UnivariateDistribution`, prior for the Matern smoothness parameter. Default: `LogNormal(log(1.5), 0.5)`.
+  - `kernel`: `String`, the parametric family for the power spectrum (e.g., `"matern"`).
+    Default: `"matern"`.
+  - `sigma`: `UnivariateDistribution`, prior for the overall marginal standard deviation.
+    Default: `Exponential(1.0)`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `nu` (smoothness): `UnivariateDistribution`, prior for the Matern smoothness parameter.
+    Default: `LogNormal(log(1.5), 0.5)`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the GP.
@@ -91,7 +95,8 @@ function get_precomputes(m::SpectralGP, M::NamedTuple, mod_data::Dict)::NamedTup
     freqs = [fftfreq(res, res / (max_coords[d] - min_coords[d])) for d in 1:n_dims]
     
     # Create a meshgrid of frequencies on the CPU
-    freq_grids = [reshape(f, (d == i ? res : 1 for i in 1:n_dims)...) for (d, f) in enumerate(freqs)]
+    freq_grids = [reshape(f, (d == i ? res : 1 for i in 1:n_dims)...) for (d,
+        f) in enumerate(freqs)]
     
     n_latent = res^n_dims
 
@@ -165,7 +170,7 @@ function get_updates(
         coords_for_itp = ntuple(d -> hyper.coords[:, d], $(n_dims))
         $(p_names.sre) = itp(coords_for_itp...)
         
-        $(eta_target) .+= $(p_names.sre)
+        $(eta_target) = $(eta_target) .+ $(p_names.sre)
     end
     """
 end
@@ -260,7 +265,8 @@ function get_effects(
             latent_field_grid = real.(ifft(f_tilde_scaled)) .* (res^(n_dims/2))
             
             # 4. Interpolate grid values to original coordinates on the CPU
-            itp_s = linear_interpolation(grid_ranges_cpu, latent_field_grid, extrapolation_bc=Flat())
+            itp_s = linear_interpolation(grid_ranges_cpu, latent_field_grid,
+                extrapolation_bc=Flat())
             coords_for_itp = ntuple(d -> view(coords_full_cpu, :, d), n_dims)
             effect_k_cpu[:, i] = itp_s(coords_for_itp...)
         end
@@ -281,7 +287,9 @@ Computes the power spectral density of an anisotropic Matérn kernel on a freque
 
 # Mathematical Summary
 The spectral density \$S(f)\$ for an anisotropic Matérn kernel is given by:
-\$S(\\mathbf{f}) = \\sigma^2 (\\prod_i \\ell_i) \\frac{2^d \\pi^{d/2} \\Gamma(\\nu+d/2)(2\\nu)^\\nu}{\\Gamma(\\nu)} \\left(2\\nu + 4\\pi^2 \\sum_i (\\ell_i f_i)^2 \\right)^{-(\\nu+d/2)}\$
+\$S(\\mathbf{f}) = \\sigma^2 (\\prod_i \\ell_i) \\frac{2^d \\pi^{d/2}
+  \\Gamma(\\nu+d/2)(2\\nu)^\\nu}{\\Gamma(\\nu)} \\left(2\\nu + 4\\pi^2 \\sum_i (\\ell_i
+  f_i)^2 \\right)^{-(\\nu+d/2)}\$
 where \$d\$ is the number of dimensions, \$\\sigma\$ is the marginal standard deviation,
 \$\\nu\$ is the smoothness, \$\\ell_i\$ are the lengthscales, and \$f_i\$ are the frequencies.
 

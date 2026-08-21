@@ -7,7 +7,7 @@ multi-layer perceptron (MLP) to warp the coordinate space, allowing the model to
 capture complex, non-stationary patterns that would be missed by standard smoothers.
 
 # Version
-v1.0.9 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The component models a function \$f(x)\$ by first transforming the input coordinates
@@ -58,12 +58,15 @@ expansion in the warped space.
 - `b1_<key>`: `Vector{Float64}`, MLP hidden biases.
 - `W2_<key>`: `Matrix{Float64}`, MLP output weights.
 - `sigma_<key>`: `Float64`, standard deviation of basis coefficients.
-- `innovations_<key>`: `Vector{Float64}`, raw innovations for basis coefficients (for `:noncentered` and `:rw2_penalty`).
+- `innovations_<key>`: `Vector{Float64}`, raw innovations for basis coefficients (for
+  `:noncentered` and `:rw2_penalty`).
 - `latent_<key>`: `Vector{Float64}`, basis coefficients (for `:centered`).
 
 # Key References
 - Bishop, C. M. (1995). *Neural Networks for Pattern Recognition*. Oxford University Press.
-- Rue, H., Martino, S., & Chopin, N. (2009). Approximate Bayesian inference for latent Gaussian models by using integrated nested Laplace approximations. *Journal of the Royal Statistical Society: Series B (Statistical Methodology)*, 71(2), 319-392.
+- Rue, H., Martino, S., & Chopin, N. (2009). Approximate Bayesian inference for latent
+  Gaussian models by using integrated nested Laplace approximations. *Journal of the Royal
+  Statistical Society: Series B (Statistical Methodology)*, 71(2), 319-392.
 """
 struct AdaptiveSmooth <: ComponentModel
     hidden_dim::Int
@@ -132,7 +135,8 @@ end
 """
     _adaptivesmooth_log_marginal_likelihood(y_residual, B, sigma, y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for an AdaptiveSmooth component with latent basis weights integrated out analytically.
+Computes the exact log marginal likelihood for an AdaptiveSmooth component with latent basis
+  weights integrated out analytically.
 Uses Woodbury / matrix determinant identity in O(N*M + M^3) operations.
 """
 function _adaptivesmooth_log_marginal_likelihood(
@@ -190,7 +194,8 @@ function get_priors(
     priors = String[]
     push!(priors, "$(p_names.W1) ~ MvNormal(zeros(T, $(in_dim * h_dim)), I)")
     push!(priors, "$(p_names.b1) ~ MvNormal(zeros(T, $(h_dim)), I)")
-    push!(priors, "$(p_names.W2) ~ MvNormal(zeros(T, $(h_dim * n_bins)), I)") # W2 is always sampled
+    push!(priors,
+        "$(p_names.W2) ~ MvNormal(zeros(T, $(h_dim * n_bins)), I)") # W2 is always sampled
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     if m.method in [:noncentered, :rw2_penalty] # Latent field is sampled
@@ -236,7 +241,7 @@ function get_updates(
         $(common_code)
             scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
             adaptive_effect = B_adaptive * scaled_coeffs
-            $(eta_target) .+= adaptive_effect
+            $(eta_target) = $(eta_target) .+ adaptive_effect
         end
     """
 
@@ -245,7 +250,7 @@ function get_updates(
         $(common_code)
             coeffs = $(p_names.sre) .* $(p_names.sigma)
             adaptive_effect = B_adaptive * coeffs
-            $(eta_target) .+= adaptive_effect
+            $(eta_target) = $(eta_target) .+ adaptive_effect
         end
     """
 
@@ -260,7 +265,7 @@ function get_updates(
             coeffs = hyper.U * (diag_D .* $(p_names.ure))
             adaptive_effect = B_adaptive * coeffs
             
-            $(eta_target) .+= adaptive_effect
+            $(eta_target) = $(eta_target) .+ adaptive_effect
         end
     """
 
@@ -279,10 +284,15 @@ function get_updates(
         end
     """
 
-    if m.method == :noncentered; return noncentered_code; end
-    if m.method == :centered; return centered_code; end
-    if m.method == :rw2_penalty; return rw2_penalty_code; end
-    if m.method == :marginalized; return marginalized_code; end
+    if m.method == :noncentered
+        return noncentered_code
+    elseif m.method == :centered
+        return centered_code
+    elseif m.method == :rw2_penalty
+        return rw2_penalty_code
+    elseif m.method == :marginalized
+        return marginalized_code
+    end
     
     error("Unsupported method '$(m.method)' for AdaptiveSmooth component.");
 end
@@ -359,7 +369,8 @@ function get_effects(
             # Reconstruct coefficients based on the sampling method
             local coeffs
             if m.method == :centered
-                sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
+                sre_name = _find_parameter(p_names, string(p_names_k.sre), k,
+                    is_multivariate_model)
                 if isempty(sre_name)
                     @warn "Latent coefficients for centered AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
                     coeffs = zeros(m.nbins)
@@ -369,7 +380,8 @@ function get_effects(
             elseif m.method == :marginalized
                 # Exact conditional Gaussian simulation for basis weights beta ~ N(0, sigma^2 I)
                 y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
-                y_sig = !isempty(y_sigma_name) ? get_params_vector(chain, y_sigma_name, 1)[i, 1] : 1.0
+                y_sig = !isempty(y_sigma_name) ? get_params_vector(chain, y_sigma_name, 1)[i,
+                    1] : 1.0
                 
                 y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
                 n_train = size(coords_train, 1)
@@ -390,7 +402,8 @@ function get_effects(
                 z = randn(m.nbins)
                 coeffs = mu + F.U \ z
             else # :noncentered or :rw2_penalty
-                ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+                ure_name = _find_parameter(p_names, string(p_names_k.ure), k,
+                    is_multivariate_model)
                 if isempty(ure_name)
                     @warn "Innovations (ure) for AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
                     coeffs = zeros(m.nbins)

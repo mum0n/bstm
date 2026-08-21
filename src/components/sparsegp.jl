@@ -7,18 +7,20 @@ Independent Training Conditional), VFE (Variational Free Energy), and PIC
 small set of `n_inducing` points to make it scalable for larger datasets.
 
 # Version
-v1.3.2 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 All methods approximate a full GP posterior by introducing a set of \$M\$ inducing
 points, \$\\mathbf{Z}\$. The latent GP values \$f\$ are modeled as:
 \$f \\sim \\mathcal{N}(\\mu_f, \\Sigma_f)\$
-where the conditional mean is \$\\mu_f = K_{XZ} K_{ZZ}^{-1} u\$, with \$u \\sim \\mathcal{N}(0, K_{ZZ})\$.
+where the conditional mean is \$\\mu_f = K_{XZ} K_{ZZ}^{-1} u\$, with \$u \\sim
+  \\mathcal{N}(0, K_{ZZ})\$.
 
 The methods differ in their covariance approximation:
 - **`:fitc` (default)**: Includes a diagonal correction to account for the variance
   of data points not captured by the inducing points.
-  \$\\Sigma_f = \\text{diag}(K_{XX} - Q_{XX}) + \\sigma_n^2 I\$, where \$Q_{XX} = K_{XZ} K_{ZZ}^{-1} K_{ZX}\$.
+  \$\\Sigma_f = \\text{diag}(K_{XX} - Q_{XX}) + \\sigma_n^2 I\$, where \$Q_{XX} = K_{XZ}
+    K_{ZZ}^{-1} K_{ZX}\$.
 - **`:vfe` (didactic)**: A pure low-rank approximation, equivalent to DTC.
   \$\\Sigma_f = Q_{XX}\$. This is simpler but can underestimate variance.
 - **`:pic`**: The Partially Independent Conditional approximation, which uses a
@@ -41,18 +43,24 @@ The methods differ in their covariance approximation:
 - **Optional (in `random()` call)**:
   - `n_inducing`: `Int`, the number of inducing points. Default: `20`.
   - `n_clusters`: `Int`, the number of clusters for the PIC method. Default: `10`.
-  - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`). Default: `"se"`.
-  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP. Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`).
+    Default: `"se"`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP.
+    Default: `Exponential(1.0)`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
   - `method`: `Symbol`, approximation method (`:fitc`, `:vfe`, or `:pic`). Default: `:fitc`.
-  - `knot_method`: `Symbol`, method for placing inducing points (`:kmeans`, `:random`, `:quantile`, `:range`). Default: `:kmeans`.
+  - `knot_method`: `Symbol`, method for placing inducing points (`:kmeans`, `:random`,
+    `:quantile`, `:range`). Default: `:kmeans`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the GP.
 - `ls_<key>`: The kernel lengthscale(s).
 - `inducing_innovations_<key>`: Raw standard normal innovations for the inducing points.
-- `diag_innovations_<key>`: Raw standard normal innovations for the diagonal correction (for `:fitc` method).
-- `pic_innovations_<key>`: Raw standard normal innovations for the block correction (for `:pic` method).
+- `diag_innovations_<key>`: Raw standard normal innovations for the diagonal correction (for
+  `:fitc` method).
+- `pic_innovations_<key>`: Raw standard normal innovations for the block correction (for
+  `:pic` method).
 - `latent_<key>`: The reconstructed latent GP effect.
 
 # Key References
@@ -204,7 +212,7 @@ function get_updates(
             $(p_names.sre) = mean_f .+
                 sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.ure_diag)
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -216,7 +224,7 @@ function get_updates(
             local K_UU_inv_u = K_UU \\ u_latent
             $(p_names.sre) = K_XU * K_UU_inv_u
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -256,10 +264,11 @@ function get_updates(
                 local L_C_block = cholesky(Symmetric(C_block + I * M.noise)).L
                 
                 # Apply the correction to the latent field for this block
-                $(p_names.sre)[block_indices] .+= L_C_block * $(p_names.ure_pic)[block_indices]
+                $(p_names.sre)[block_indices] = $(p_names.sre)[block_indices] .+ L_C_block *
+                  $(p_names.ure_pic)[block_indices]
             end
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -313,7 +322,8 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
-        inducing_innov_name = _find_parameter(p_names, string(p_names_k.ure_inducing), k, is_multivariate_model)
+        inducing_innov_name = _find_parameter(p_names, string(p_names_k.ure_inducing), k,
+            is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(inducing_innov_name)
             @warn "Parameters for SparseGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -337,8 +347,10 @@ function get_effects(
             current_u_unscaled = inducing_innov_samples_cpu[i, :]
             
             # Kernel evaluation and Cholesky happen on the CPU
-            K_UU = evaluate_kernel_matrix(Z_inducing_cpu, current_sigma, current_ls, kernel_type, noise)
-            K_XU_full = evaluate_cross_kernel_matrix(coords_full_cpu, Z_inducing_cpu, current_sigma, current_ls, kernel_type)
+            K_UU = evaluate_kernel_matrix(Z_inducing_cpu, current_sigma, current_ls,
+                kernel_type, noise)
+            K_XU_full = evaluate_cross_kernel_matrix(coords_full_cpu, Z_inducing_cpu,
+                current_sigma, current_ls, kernel_type)
             
             L_UU = cholesky(Symmetric(K_UU)).L
             u_latent = L_UU * current_u_unscaled
@@ -346,7 +358,8 @@ function get_effects(
             mean_f = K_XU_full * K_UU_inv_u
 
             if m.method == :fitc
-                diag_innov_name = _find_parameter(p_names, string(p_names_k.ure_diag), k, is_multivariate_model)
+                diag_innov_name = _find_parameter(p_names, string(p_names_k.ure_diag), k,
+                    is_multivariate_model)
                 if isempty(diag_innov_name)
                     @warn "Diagonal innovations for FITC component $(spec.key) (outcome $k) not found. Using zero for correction."
                     effect_k_cpu[:, i] = mean_f
@@ -369,10 +382,12 @@ function get_effects(
                 diag_Q_ff = sum(tmp.^2, dims=2)
                 lambda_diag = diag_K_XX - vec(diag_Q_ff)
                 
-                effect_k_cpu[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* diag_innov_i_cpu
+                effect_k_cpu[:, i] = mean_f .+ sqrt.(max.(lambda_diag,
+                    0.0) .+ noise) .* diag_innov_i_cpu
             elseif m.method == :pic
                 effect_k_cpu[:, i] = mean_f
-                pic_innov_name = _find_parameter(p_names, string(p_names_k.ure_pic), k, is_multivariate_model)
+                pic_innov_name = _find_parameter(p_names, string(p_names_k.ure_pic), k,
+                    is_multivariate_model)
                 if isempty(pic_innov_name)
                     @warn "PIC innovations for component $(spec.key) (outcome $k) not found. Using mean-only prediction."
                     continue
@@ -393,7 +408,8 @@ function get_effects(
                     coords_block = coords_train_cpu[block_indices, :]
                     K_XU_block = K_XU_train[block_indices, :]
                     
-                    K_block = evaluate_kernel_matrix(coords_block, current_sigma, current_ls, kernel_type, noise)
+                    K_block = evaluate_kernel_matrix(coords_block, current_sigma, current_ls,
+                        kernel_type, noise)
                     Q_block = K_XU_block * (K_UU \ K_XU_block')
                     C_block = K_block - Q_block
                     L_C_block = cholesky(Symmetric(C_block + I * noise)).L

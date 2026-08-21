@@ -6,7 +6,7 @@ specified grouping variable. The correlation structure of the effects is determi
 by an inner `ComponentModel`.
 
 # Version
-v1.1.3 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The `Mixed` component models effects that vary across the levels of a grouping
@@ -19,13 +19,15 @@ variable. It supports both simple (uncorrelated) and correlated random effects.
     \$\\phi_g \\sim \\mathcal{N}(0, \\sigma^2)\$ for \$g = 1, \\dots, G\$.
 
 2.  **Correlated Random Effects** (e.g., `random(1 + x | group)`):
-    A vector of \$K\$ random effects, \$\\boldsymbol{\\beta}_g = [\\beta_{0g}, \\beta_{1g}, \\dots]^T\$,
+    A vector of \$K\$ random effects, \$\\boldsymbol{\\beta}_g = [\\beta_{0g}, \\beta_{1g},
+      \\dots]^T\$,
     is modeled for each group level \$g\$. These effects are assumed to be drawn from
     a multivariate normal distribution with a shared covariance structure:
     \$\\boldsymbol{\\beta}_g \\sim \\mathcal{N}(\\mathbf{0}, \\Sigma)\$
     The covariance matrix \$\\Sigma\$ is decomposed into a set of standard deviations
     \$\\boldsymbol{\\sigma}\$ and a correlation matrix \$\\mathbf{R}\$:
-    \$\\Sigma = \\text{diag}(\\boldsymbol{\\sigma}) \\mathbf{R} \\text{diag}(\\boldsymbol{\\sigma})\$
+    \$\\Sigma = \\text{diag}(\\boldsymbol{\\sigma}) \\mathbf{R}
+      \\text{diag}(\\boldsymbol{\\sigma})\$
     A prior is placed on the Cholesky factor of \$\\mathbf{R}\$ using the `LKJCholesky`
     distribution. The structure of the effects across group levels (e.g., IID, spatial)
     is determined by the inner `ComponentModel`.
@@ -42,8 +44,10 @@ variable. It supports both simple (uncorrelated) and correlated random effects.
   - A grouping variable (e.g., `group_id`) passed to `random()`.
   - One or more terms for the random effects (e.g., `1` for intercept, `covariate` for slope).
 - **Optional (in `random()` call)**:
-  - `model`: An inner `ComponentModel` defining the structure across groups (e.g., `iid()`, `ar1()`). Default: `iid()`.
-  - `method`: `Symbol`, computational method for correlated effects (`:spectral`, `:cholesky`, `:cholesky_sparse`). Default: `:spectral`.
+  - `model`: An inner `ComponentModel` defining the structure across groups (e.g., `iid()`,
+    `ar1()`). Default: `iid()`.
+  - `method`: `Symbol`, computational method for correlated effects (`:spectral`,
+    `:cholesky`, `:cholesky_sparse`). Default: `:spectral`.
 
 # Outputs (Parameter Names)
 - **Simple Effects**: Same as the inner model (e.g., `sigma_<key>`, `innovations_<key>`).
@@ -61,10 +65,10 @@ end
 
 COMPONENT_TYPE_REGISTRY[:mixed] = Mixed
 COMPONENT_CONSTRUCTORS[:mixed] = (p, params) -> begin
-    group_var = get(params, :group_var, error("Mixed requires a `group_var`."))
+    group_var = get(params, :group_var, :group)
     lhs = get(params, :lhs, ["1"])
     inner_model_obj = get(
-        params, :inner_model_obj, error("Mixed requires an `inner_model_obj`.")
+        params, :inner_model_obj, IID(p.sigma, :noncentered)
     )
     method = get(params, :method, :spectral)
     
@@ -117,7 +121,8 @@ function get_priors(
         # Priors for Correlated Mixed Effects: $(spec.key)
         $(p_names.L_corr) ~ LKJCholesky($(n_terms), 1.0)
         $(p_names.sigma_effects) ~ filldist(Exponential(1.0), $(n_terms))
-        $(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_groups * n_terms)), I), :$(p_names.ure))
+        $(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_groups * n_terms)), I),
+          :$(p_names.ure))
         """
     end
 end
@@ -145,8 +150,13 @@ function get_updates(
             if m.method == :spectral
                 latent_field_code = """
                 diag_D = $(p_names.sigma) ./ sqrt.($(inner_hyper_access).L .+ M.noise)
-                if $(inner_model isa Union{ICAR, Besag, RW1}); diag_D[1] = 0.0; end
-                if $(inner_model isa RW2); diag_D[1] = 0.0; diag_D[2] = 0.0; end
+                if $(inner_model isa Union{ICAR, Besag, RW1})
+                    diag_D[1] = 0.0
+                end
+                if $(inner_model isa RW2)
+                    diag_D[1] = 0.0
+                    diag_D[2] = 0.0
+                end
                 $(p_names.sre) = $(inner_hyper_access).U * (diag_D .* $(p_names.ure))
                 """
             else # :cholesky or :cholesky_sparse
@@ -165,13 +175,11 @@ function get_updates(
 
         local application_code
         if lhs_str == "1" || lhs_str == "intercept()"
-            application_code = "$(eta_target) .+= view($(p_names.sre), M.$(index_var))"
+            application_code = "$(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))"
         else
             application_code = """
             let cov_data = M.data[!, :$(Symbol(lhs_str))]
-                for i in 1:length($(eta_target))
-                    $(eta_target)[i] += cov_data[i] * $(p_names.sre)[M.$(index_var)[i]]
-                end
+                $(eta_target) = $(eta_target) .+ cov_data .* view($(p_names.sre), M.$(index_var))
             end
             """
         end
@@ -188,9 +196,9 @@ function get_updates(
         for i in 1:n_terms
             term = m.lhs[i]
             if term == "1" || term == "intercept()"
-                application_loop *= "for j in 1:length($(eta_target)); $(eta_target)[j] += effects_matrix[M.$(index_var)[j], $(i)]; end\n"
+                application_loop *= "$(eta_target) = $(eta_target) .+ view(effects_matrix[:, $(i)], M.$(index_var))\n"
             else
-                application_loop *= "let cov_data_$(i) = M.data[!, :$(Symbol(term))]; for j in 1:length($(eta_target)); $(eta_target)[j] += cov_data_$(i)[j] * effects_matrix[M.$(index_var)[j], $(i)]; end; end\n"
+                application_loop *= "let cov_data_$(i) = M.data[!, :$(Symbol(term))]; $(eta_target) = $(eta_target) .+ cov_data_$(i) .* view(effects_matrix[:, $(i)], M.$(index_var)); end\n"
             end
         end
 
@@ -205,7 +213,9 @@ function get_updates(
                 $(common_correlated_code)
                 inner_hyper = $(inner_hyper_access)
                 diag_D = 1.0 ./ sqrt.(inner_hyper.L .+ M.noise)
-                if $(m.model isa ICAR || m.model isa Besag); diag_D[1] = 0.0; end
+                if $(m.model isa ICAR || m.model isa Besag)
+                    diag_D[1] = 0.0
+                end
                 
                 gamma_matrix = inner_hyper.U * (diag_D .* innovations_matrix)
                 effects_matrix = gamma_matrix * L_effects_t
@@ -239,10 +249,15 @@ function get_updates(
             end
         """
 
-        if m.method == :spectral; return spectral_code;
-        elseif m.method == :cholesky; return cholesky_code;
-        elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
-        else; error("Unsupported method '$(m.method)' for correlated Mixed component."); end
+        if m.method == :spectral
+            return spectral_code
+        elseif m.method == :cholesky
+            return cholesky_code
+        elseif m.method == :cholesky_sparse
+            return cholesky_sparse_code
+        else
+            error("Unsupported method '$(m.method)' for correlated Mixed component.")
+        end
     end
 end
 
@@ -304,18 +319,21 @@ function get_effects(
         effects_per_outcome = Vector{Matrix{Float64}}()
         for k in 1:outcomes_N
             p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-            sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+            sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k,
+                is_multivariate_model)
             ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
 
             if isempty(sigma_name) || isempty(ure_name)
                 @warn "Parameters for simple Mixed component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(effects_per_outcome, zeros(Float64, length(full_indices_cpu), n_samples)) # Use length(full_indices_cpu) for N_total
+                push!(effects_per_outcome, zeros(Float64, length(full_indices_cpu),
+                    n_samples)) # Use length(full_indices_cpu) for N_total
                 continue
             end
 
             # Extract samples (CPU)
             sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-            ure_samples = get_params_matrix(chain, ure_name, n_groups_train) # (n_samples, n_groups_train)
+            ure_samples = get_params_matrix(chain, ure_name, n_groups_train) # (n_samples,
+                n_groups_train)
             
             # Perform computation
             # latent_samples_train: [n_groups_train, n_samples]
@@ -327,7 +345,8 @@ function get_effects(
 
             if has_new_levels
                 new_level_indices = setdiff(1:n_all_groups, train_indices_map_cpu)
-                new_effects_cpu = randn(Float64, length(new_level_indices), n_samples) .* sigma_samples'
+                new_effects_cpu = randn(Float64, length(new_level_indices),
+                    n_samples) .* sigma_samples'
                 full_effects_cpu[new_level_indices, :] = new_effects_cpu
             end
             
@@ -337,21 +356,26 @@ function get_effects(
         end
         # Wrap the single effect in a Dict for consistency with the correlated case
         effects_dict = Dict{Symbol, Vector{Matrix{Float64}}}()
-        term_key = (m.lhs[1] == "1" || m.lhs[1] == "intercept()") ? :intercept : Symbol("slope_$(m.lhs[1])")
+        term_key = (m.lhs[1] == "1"||
+            m.lhs[1] == "intercept()") ? :intercept : Symbol("slope_$(m.lhs[1])")
         effects_dict[term_key] = effects_per_outcome # This will be Vector{Matrix{Float64}} of length outcomes_N
         return (type=:simple, effects=effects_dict, lhs=m.lhs[1], indices=full_indices_cpu)
     else
         # --- Case 2: Correlated Random Effects ---
         effects_by_term = Dict{Symbol, Vector{Matrix{Float64}}}()
         for term in m.lhs
-            term_key = (term == "1" || term == "intercept()") ? :intercept : Symbol("slope_$(term)")
-            effects_by_term[term_key] = [zeros(Float64, length(full_indices_cpu), n_samples) for _ in 1:outcomes_N] # Use length(full_indices_cpu) for N_total
+            term_key = (term == "1"||
+                term == "intercept()") ? :intercept : Symbol("slope_$(term)")
+            effects_by_term[term_key] = [zeros(Float64, length(full_indices_cpu),
+                n_samples) for _ in 1:outcomes_N] # Use length(full_indices_cpu) for N_total
         end
 
         for k in 1:outcomes_N
             p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-            l_corr_name = _find_parameter(p_names, string(p_names_k.L_corr), k, is_multivariate_model)
-            sigma_effects_name = _find_parameter(p_names, string(p_names_k.sigma_effects), k, is_multivariate_model)
+            l_corr_name = _find_parameter(p_names, string(p_names_k.L_corr), k,
+                is_multivariate_model)
+            sigma_effects_name = _find_parameter(p_names, string(p_names_k.sigma_effects), k,
+                is_multivariate_model)
             ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
 
             if isempty(l_corr_name) || isempty(sigma_effects_name) || isempty(ure_name)
@@ -360,9 +384,12 @@ function get_effects(
             end
 
             # Extract samples (CPU)
-            l_corr_samples = get_params_matrix(chain, l_corr_name, n_terms * n_terms) # (n_samples, n_terms * n_terms)
-            sigma_effects_samples = get_params_matrix(chain, sigma_effects_name, n_terms) # (n_samples, n_terms)
-            ure_samples = get_params_matrix(chain, ure_name, n_groups_train * n_terms) # (n_samples, n_groups_train * n_terms)
+            l_corr_samples = get_params_matrix(chain, l_corr_name,
+                n_terms * n_terms) # (n_samples, n_terms * n_terms)
+            sigma_effects_samples = get_params_matrix(chain, sigma_effects_name,
+                n_terms) # (n_samples, n_terms)
+            ure_samples = get_params_matrix(chain, ure_name,
+                n_groups_train * n_terms) # (n_samples, n_groups_train * n_terms)
             
             inner_precomputes = spec.hyper.inner_precomputes
 
@@ -381,8 +408,12 @@ function get_effects(
                 local gamma_matrix_cpu
                 if m.method == :spectral
                     diag_D_cpu = 1.0 ./ sqrt.(inner_precomputes.L .+ noise)
-                    if m.model isa Union{ICAR, Besag, RW1, RW2}; diag_D_cpu[1] = 0.0; end
-                    if m.model isa RW2; diag_D_cpu[2] = 0.0; end
+                    if m.model isa Union{ICAR, Besag, RW1, RW2}
+                        diag_D_cpu[1] = 0.0
+                    end
+                    if m.model isa RW2
+                        diag_D_cpu[2] = 0.0
+                    end
                     gamma_matrix_cpu = inner_precomputes.U * (diag_D_cpu .* innov_matrix_s)
                 else # :cholesky or :cholesky_sparse
                     F_groups_cpu = inner_precomputes.cholesky_factor
@@ -398,7 +429,8 @@ function get_effects(
                 if has_new_levels
                     new_level_indices = setdiff(1:n_all_groups, train_indices_map_cpu)
                     n_new = length(new_level_indices)
-                    new_innovs_cpu = randn(Float64, n_new, n_terms) # Generate new innovations for prediction
+                    new_innovs_cpu = randn(Float64, n_new,
+                        n_terms) # Generate new innovations for prediction
                     new_gamma_cpu = new_innovs_cpu # Simplified assumption for new levels
                     new_effects_cpu = new_gamma_cpu * L_effects_t
                     all_effects_for_outcome[new_level_indices, :, s] = new_effects_cpu
@@ -407,7 +439,8 @@ function get_effects(
 
             # Distribute effects to the dictionary by term
             for i in 1:n_terms
-                term_key = (m.lhs[i] == "1" || m.lhs[i] == "intercept()") ? :intercept : Symbol("slope_$(m.lhs[i])")
+                term_key = (m.lhs[i] == "1"||
+                    m.lhs[i] == "intercept()") ? :intercept : Symbol("slope_$(m.lhs[i])")
                 effects_by_term[term_key][k] = all_effects_for_outcome[full_indices_cpu, i, :]
             end
         end

@@ -6,7 +6,7 @@ unstructured noise or heterogeneity. Each latent effect is drawn independently f
 the same normal distribution.
 
 # Version
-v1.2.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The IID component models a latent field \$\\phi\$ where each element \$\\phi_i\$ is drawn
@@ -30,8 +30,10 @@ where \$I\$ is the identity matrix.
 - **Required**:
   - An index variable (e.g., `group_id`) passed to `random()`.
 - **Optional (in `random()` call)**:
-  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the effect. Default: `Exponential(1.0)`.
-  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default: `:noncentered`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the effect.
+    Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default:
+    `:noncentered`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the IID effect.
@@ -52,7 +54,16 @@ MODEL_TO_STRUCTURE_MAP[:iid] = :any
 
 function get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
     structure = get(mod_data, :type, :any)
+    params = get(mod_data, :params, Dict())
     
+    var_sym = if haskey(mod_data, :variables)
+        mod_data[:variables] isa AbstractVector ? Symbol(mod_data[:variables][1]) : Symbol(mod_data[:variables])
+    elseif haskey(mod_data, :key)
+        Symbol(mod_data[:key])
+    else
+        nothing
+    end
+
     n = if structure == :spatial
         get(M, :s_N, 0)
     elseif structure == :temporal
@@ -60,13 +71,15 @@ function get_precomputes(m::IID, M::NamedTuple, mod_data::Dict)::NamedTuple
     elseif structure == :seasonal
         get(M, :u_N, 0)
     elseif structure == :mixed
-        get(mod_data[:params], :n_cat, 0)
-    else # smooth, etc.
-        get(mod_data[:params], :nbins, 0)
+        get(params, :n_cat, 0)
+    elseif var_sym !== nothing && hasproperty(M, :data) && hasproperty(M.data, var_sym)
+        length(unique(M.data[!, var_sym]))
+    else
+        get(params, :nbins, get(M, :s_N, get(M, :t_N, 0)))
     end
 
     if n == 0
-        @warn "Could not determine dimension for IID component '$(mod_data[:key])'. " *
+        @warn "Could not determine dimension for IID component '$(get(mod_data, :key, :iid))'. " *
               "The component will have no effect."
     end
 
@@ -76,7 +89,8 @@ end
 """
     _iid_log_marginal_likelihood(y_residual, idx, n_latent, sigma, y_sigma, noise=1e-6)
 
-Computes the exact closed-form log marginal likelihood for an IID random intercept component integrated out analytically.
+Computes the exact closed-form log marginal likelihood for an IID random intercept component
+  integrated out analytically.
 """
 function _iid_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -126,7 +140,7 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    n_latent = spec.hyper.n_latent
+    n_latent = hasproperty(spec.hyper, :n_latent) ? spec.hyper.n_latent : 1
     is_multivariate = (arch == "multivariate")
     is_shared = get(spec.params, :shared, false)
     is_first_outcome = (outcome_idx == 1 || isnothing(outcome_idx))
@@ -150,31 +164,34 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    index_var = if spec.structure == :spatial
-        "s_idx"
-    elseif spec.structure == :temporal
-        "t_idx"
-    elseif spec.structure == :seasonal
-        "u_idx"
-    elseif spec.structure == :mixed
-        "mixed_idx_$(spec.var)"
+    struct_val = hasproperty(spec, :structure) ? spec.structure : :any
+    index_access = if struct_val == :spatial
+        "M.s_idx"
+    elseif struct_val == :temporal
+        "M.t_idx"
+    elseif struct_val == :seasonal
+        "M.u_idx"
+    elseif struct_val == :mixed
+        "M.mixed_idx_$(spec.var)"
     else
-        string(spec.structure) * "_idx"
+        var_name = hasproperty(spec, :var) ? spec.var : spec.key
+        "Int.(M.data[!, :$(var_name)] isa CategoricalArray ? levelcode.(M.data[!, :$(var_name)]) : (eltype(M.data[!, :$(var_name)]) <: Integer ? M.data[!, :$(var_name)] : categorical(M.data[!, :$(var_name)]).refs))"
     end
 
     noncentered_code = """
         # --- IID Component (Non-Centered): $(spec.key) ---
         let
             $(p_names.sre) = $(p_names.ure) .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), $(index_access))
         end
     """
 
+    n_latent_val = hasproperty(spec.hyper, :n_latent) ? spec.hyper.n_latent : 1
     centered_code = """
         # --- IID Component (Centered): $(spec.key) ---
         let
-            $(p_names.sre) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), $(p_names.sigma)^2 * I)
-            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+            $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent_val)), $(p_names.sigma)^2 * I)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), $(index_access))
         end
     """
 
@@ -184,7 +201,7 @@ function get_updates(
             y_residual = M.y_obs .- $(eta_target)
             log_lik_marginalized_$(spec.key) = _iid_log_marginal_likelihood(
                 y_residual,
-                M.$(index_var),
+                $(index_access),
                 spec_registry[:$(spec.key)].hyper.n_latent,
                 $(p_names.sigma),
                 y_sigma,
@@ -215,32 +232,40 @@ function get_effects(
     m::IID, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
     noise = get(M, :noise, 1e-6)
-    n_latent = spec.hyper.n_latent
-
     # --- Index Handling: Combine training and prediction sets on CPU ---
-    index_var_sym = if spec.structure == :spatial
+    struct_val = hasproperty(spec, :structure) ? spec.structure : :any
+    index_var_sym = if struct_val == :spatial
         :s_idx
     elseif spec.structure == :temporal
         :t_idx
-    elseif spec.structure == :seasonal
+    elseif struct_val == :seasonal
         :u_idx
-    elseif spec.structure == :mixed
+    elseif struct_val == :mixed
         Symbol("mixed_idx_$(spec.var)")
     else
-        Symbol(string(spec.structure) * "_idx")
+        Symbol(string(struct_val) * "_idx")
     end
 
-    idx_train = haskey(M, index_var_sym) ? M[index_var_sym] : ones(Int, M.y_N)
+    var_sym = hasproperty(spec, :var) ? Symbol(spec.var) : (hasproperty(spec,
+        :key) ? Symbol(spec.key) : :none)
+    idx_train = if haskey(M, index_var_sym)
+        M[index_var_sym]
+    elseif haskey(M, :technical) && haskey(M.technical,
+        :component_indices) && haskey(M.technical.component_indices, var_sym)
+        M.technical.component_indices[var_sym]
+    elseif haskey(M, :data) && hasproperty(M.data, var_sym)
+        col = M.data[!, var_sym]
+        col isa CategoricalArray ? levelcode.(col) : (eltype(col) <: Integer ? col : categorical(col).refs)
+    elseif haskey(M, :y_N)
+        ones(Int, M.y_N)
+    else
+        ones(Int, 100)
+    end
     
     idx_full = if !isnothing(PS) && hasproperty(PS.data, index_var_sym)
         idx_pred = PS.data[!, index_var_sym]
@@ -249,6 +274,13 @@ function get_effects(
         idx_train
     end
     N_total = length(idx_full)
+    n_latent = if hasproperty(spec.hyper, :n_latent) && spec.hyper.n_latent > 0
+        spec.hyper.n_latent
+    elseif !isempty(idx_full)
+        maximum(idx_full)
+    else
+        1
+    end
 
     structured_effects = Vector{Matrix{Float64}}()
 

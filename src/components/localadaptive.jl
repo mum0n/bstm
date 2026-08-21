@@ -7,7 +7,7 @@ cluster-specific mean effects. This allows the model to capture both smooth spat
 trends and abrupt shifts between distinct spatial regions.
 
 # Version
-v1.3.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The `LocalAdaptive` component models a latent spatial field \$\\phi\$ as a non-zero
@@ -46,7 +46,8 @@ is not constant but varies by spatial cluster, while the precision matrix,
 - **Optional (in `random()` call)**:
   - `n_clusters`: `Int`, the number of spatial clusters to identify. Default: `5`.
   - `rho`: A `UnivariateDistribution` for the prior on the mixing parameter. Default: `Beta(1,1)`.
-  - `sigma`: A `UnivariateDistribution` for the prior on the overall standard deviation. Default: `Exponential(1.0)`.
+  - `sigma`: A `UnivariateDistribution` for the prior on the overall standard deviation.
+    Default: `Exponential(1.0)`.
   - `method`: `Symbol`, specifying the computational method. Default: `:spectral`.
 
 # Outputs (Parameter Names)
@@ -173,11 +174,12 @@ function get_updates(
 
     spectral_code = """
         $(common_code)
-            diag_D_leroux = $(p_names.sigma) ./ sqrt.((1.0 - $(p_names.rho)) .+ $(p_names.rho) .* hyper.L .+ M.noise)
+            diag_D_leroux = $(p_names.sigma) ./ sqrt.((1.0 - $(p_names.rho)) .+
+              $(p_names.rho) .* hyper.L .+ M.noise)
             latent_centered = hyper.U * (diag_D_leroux .* $(p_names.ure))
             
             $(p_names.sre) = mu_field .+ latent_centered
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -189,25 +191,29 @@ function get_updates(
             latent_centered = F.L' \\ $(p_names.ure)
             
             $(p_names.sre) = mu_field .+ latent_centered .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
     cholesky_sparse_code = """
         $(common_code)
-            Q_leroux = (1.0 - $(p_names.rho)) .* sparse(I, $(n_latent), $(n_latent)) .+ $(p_names.rho) .* hyper.Q_icar
+            Q_leroux = (1.0 - $(p_names.rho)) .* sparse(I, $(n_latent), $(n_latent)) .+
+              $(p_names.rho) .* hyper.Q_icar
             F = cholesky(Symmetric(Q_leroux + M.noise * I))
             
             latent_centered = F.L' \\ $(p_names.ure)
             
             $(p_names.sre) = mu_field .+ latent_centered .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
     
-    if m.method == :spectral; return spectral_code;
-    elseif m.method == :cholesky; return cholesky_code;
-    elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
     else; error("Unsupported method '$(m.method)' for LocalAdaptive component."); end
 end
 
@@ -253,9 +259,11 @@ function get_effects(
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
         ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-        ure_cluster_name = _find_parameter(p_names, string(p_names_k.ure_cluster), k, is_multivariate_model)
+        ure_cluster_name = _find_parameter(p_names, string(p_names_k.ure_cluster), k,
+            is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(rho_name) || isempty(ure_name) || isempty(ure_cluster_name)
+        if isempty(sigma_name) || isempty(rho_name) || isempty(ure_name)||
+            isempty(ure_cluster_name)
             @warn "Parameters for LocalAdaptive component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -265,7 +273,8 @@ function get_effects(
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
         ure_samples = get_params_matrix(chain, ure_name, n_latent) # (n_samples, n_latent)
-        ure_cluster_samples = get_params_matrix(chain, ure_cluster_name, n_clusters) # (n_samples, n_clusters)
+        ure_cluster_samples = get_params_matrix(chain, ure_cluster_name,
+            n_clusters) # (n_samples, n_clusters)
         
         # Initialize the output matrix for the full latent field
         latent_field_matrix = zeros(Float64, n_latent, n_samples)

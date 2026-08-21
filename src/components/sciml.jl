@@ -6,7 +6,7 @@ ecosystem into a Bayesian framework. It allows for the estimation of differentia
 equation parameters and initial conditions.
 
 # Version
-v1.3.1 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 This component models an observed process \$y(t)\$ as noisy observations of a latent
@@ -31,13 +31,17 @@ the model to observed data.
   - A temporal index variable (e.g., `year`) passed to `sciml()`.
   - `model_func`: `Symbol`, the name of the user-defined function specifying the DE system.
   - `u0_prior`: A `Distribution` for the prior on the initial conditions `u0`.
-  - `p_priors`: A `NamedTuple` of priors for the DE parameters (e.g., `(alpha=Normal(0,1), beta=LogNormal(0,1))`).
+  - `p_priors`: A `NamedTuple` of priors for the DE parameters (e.g., `(alpha=Normal(0,1),
+    beta=LogNormal(0,1))`).
   - `tspan`: A `Tuple` specifying the integration time span (e.g., `(0.0, 10.0)`).
   - `solver`: A `SciML` solver object (e.g., `Tsit5()`).
 - **Optional (in `sciml()` call)**:
-  - `de_type`: `Symbol`, the type of differential equation (`:ODE`, `:SDE`, `:DDE`, `:Jump`). Default: `:ODE`.
-  - `likelihood_type`: `Symbol`, the likelihood evaluation method (`:additive` or `:direct`). Default: `:additive`.
-  - `de_kwargs`: A `Dict` of additional keyword arguments for the `DEProblem` constructor (e.g., `constant_lags` for DDEs).
+  - `de_type`: `Symbol`, the type of differential equation (`:ODE`, `:SDE`, `:DDE`,
+    `:Jump`). Default: `:ODE`.
+  - `likelihood_type`: `Symbol`, the likelihood evaluation method (`:additive` or
+    `:direct`). Default: `:additive`.
+  - `de_kwargs`: A `Dict` of additional keyword arguments for the `DEProblem` constructor
+    (e.g., `constant_lags` for DDEs).
   - `saveat`: `Float64`, the time step for saving the DE solution. Default: `0.1`.
 
 # Outputs (Parameter Names)
@@ -72,7 +76,9 @@ COMPONENT_CONSTRUCTORS[:sciml] = (p, params) -> begin
     
     de_kwargs = Dict{Symbol, Any}()
     for key in [:constant_lags, :saveat, :h, :noise_func]
-        if haskey(params, key); de_kwargs[key] = params[key]; end
+        if haskey(params, key)
+            de_kwargs[key] = params[key]
+        end
     end
 
     SciML(model_func, u0_prior, p_priors, de_type, de_kwargs, likelihood_type)
@@ -121,7 +127,8 @@ function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
     elseif m.de_type == :DDE
         h_func_sym = get(params, :h, error("DDE requires a history function `h`."))
         h_func = Core.eval(calling_mod, h_func_sym)
-        prob_template = DDEProblem(model_func, u0_template, h_func, tspan, p_template; m.de_kwargs...)
+        prob_template = DDEProblem(model_func, u0_template, h_func, tspan, p_template;
+            m.de_kwargs...)
     elseif m.de_type == :Jump
         prob_template = model_func(u0_template, p_template, tspan)
     else
@@ -196,7 +203,7 @@ function get_updates(
         # --- SciML Component (Additive): $(key) ---
         let
             $(common_solve_code)
-            $(eta_target) .+= sciml_effect_$(key)[1,:]
+            $(eta_target) = $(eta_target) .+ sciml_effect_$(key)[1,:]
         end
     """
 
@@ -281,7 +288,8 @@ function get_effects(
 
         # Extract posterior samples (CPU)
         u0_samples_cpu = get_params_matrix(chain, u0_name, length(m.u0_prior))
-        p_samples_cpu = Dict(p_name => get_params_vector(chain, p_var_name, 1) for (p_name, p_var_name) in p_var_names)
+        p_samples_cpu = Dict(p_name => get_params_vector(chain, p_var_name, 1) for (p_name,
+            p_var_name) in p_var_names)
 
         prob_template = hyper.prob_template
 
@@ -298,7 +306,8 @@ function get_effects(
         ensemble_alg = EnsembleThreads()
 
         # Solve all trajectories in parallel
-        sim = solve(ensemble_prob, hyper.solver, ensemble_alg; trajectories=n_samples, saveat=t_coords_full_cpu)
+        sim = solve(ensemble_prob, hyper.solver, ensemble_alg; trajectories=n_samples,
+            saveat=t_coords_full_cpu)
 
         # --- Process Results ---
         trajectories_cpu = zeros(Float64, N_total, n_samples)

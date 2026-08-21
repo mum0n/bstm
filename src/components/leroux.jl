@@ -7,7 +7,7 @@ structured (ICAR) component and an unstructured (IID) component, controlled by a
 single mixing parameter, `rho`.
 
 # Version
-v2.3.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The Leroux model is a proper CAR model, meaning its precision matrix is always
@@ -33,7 +33,8 @@ flexible way to model spatial autocorrelation.
   - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
 - **Optional (in `random()` call)**:
   - `rho`: A `UnivariateDistribution` for the prior on the mixing parameter. Default: `Beta(1,1)`.
-  - `sigma`: A `UnivariateDistribution` for the prior on the overall standard deviation. Default: `Exponential(1.0)`.
+  - `sigma`: A `UnivariateDistribution` for the prior on the overall standard deviation.
+    Default: `Exponential(1.0)`.
   - `method`: `Symbol`, specifying the computational method. Default: `:spectral`.
 
 # Outputs (Parameter Names)
@@ -93,9 +94,11 @@ function get_precomputes(m::Leroux, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    _leroux_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, rho, sigma, y_sigma, noise=1e-6)
+    _leroux_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, rho, sigma,
+      y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for a Leroux spatial CAR process integrated out analytically.
+Computes the exact log marginal likelihood for a Leroux spatial CAR process integrated out
+  analytically.
 """
 function _leroux_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -194,7 +197,7 @@ function get_updates(
             diag_D = $(p_names.sigma) ./ sqrt.((1.0 .- $(p_names.rho)) .+ 
                                               $(p_names.rho) .* hyper.L .+ M.noise)
             $(p_names.sre) = hyper.U * (diag_D .* $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
         end
         """
 
@@ -206,7 +209,7 @@ function get_updates(
             Q_final = (1.0 - rho_val) .* I(size(Q_template, 1)) .+ rho_val .* Q_template
             F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
             $(p_names.sre) = $(p_names.sigma) .* (F.U \\ $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
         end
         """
 
@@ -219,7 +222,7 @@ function get_updates(
                       rho_val .* Q_template
             F = cholesky(Symmetric(Q_final + M.noise * I))
             $(p_names.sre) = $(p_names.sigma) .* (F.U \\ $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.$(index_var))
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
         end
         """
 
@@ -267,11 +270,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))

@@ -7,18 +7,20 @@ approximations: FITC (Fully Independent Training Conditional) and VFE
 (Variational Free Energy), also known as DTC (Deterministic Training Conditional).
 
 # Version
-v1.4.1 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 Both methods approximate a full GP using a small set of \$M\$ inducing points \$Z\$.
 The latent GP values \$f\$ are modeled as:
 \$f \\sim \\mathcal{N}(\\mu_f, \\Sigma_f)\$
-where the conditional mean is \$\\mu_f = K_{XZ} K_{ZZ}^{-1} u\$, with \$u \\sim \\mathcal{N}(0, K_{ZZ})\$.
+where the conditional mean is \$\\mu_f = K_{XZ} K_{ZZ}^{-1} u\$, with \$u \\sim
+  \\mathcal{N}(0, K_{ZZ})\$.
 
 The methods differ in their covariance approximation:
 - **`:fitc` (default)**: Includes a diagonal correction to account for the variance
   of data points not captured by the inducing points.
-  \$\\Sigma_f = \\text{diag}(K_{XX} - Q_{XX}) + \\sigma_n^2 I\$, where \$Q_{XX} = K_{XZ} K_{ZZ}^{-1} K_{ZX}\$.
+  \$\\Sigma_f = \\text{diag}(K_{XX} - Q_{XX}) + \\sigma_n^2 I\$, where \$Q_{XX} = K_{XZ}
+    K_{ZZ}^{-1} K_{ZX}\$.
 - **`:vfe` (didactic)**: A pure low-rank approximation, equivalent to DTC.
   \$\\Sigma_f = Q_{XX}\$. This is simpler but can underestimate variance.
 
@@ -34,17 +36,22 @@ The methods differ in their covariance approximation:
   - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
 - **Optional (in `random()` call)**:
   - `n_inducing`: `Int`, the number of inducing points. Default: `20`.
-  - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`). Default: `"se"`.
-  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP. Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`).
+    Default: `"se"`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP.
+    Default: `Exponential(1.0)`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
   - `method`: `Symbol`, approximation method (`:fitc` or `:vfe`). Default: `:fitc`.
-  - `knot_method`: `Symbol`, method for placing inducing points (`:kmeans`, `:random`, `:quantile`, `:range`). Default: `:kmeans`.
+  - `knot_method`: `Symbol`, method for placing inducing points (`:kmeans`, `:random`,
+    `:quantile`, `:range`). Default: `:kmeans`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the GP.
 - `ls_<key>`: The kernel lengthscale(s).
 - `inducing_innovations_<key>`: Raw standard normal innovations for the inducing points.
-- `diag_innovations_<key>`: Raw standard normal innovations for the diagonal correction (for `:fitc` method).
+- `diag_innovations_<key>`: Raw standard normal innovations for the diagonal correction (for
+  `:fitc` method).
 - `latent_<key>`: The reconstructed latent GP effect.
 """
 struct FITC <: ComponentModel
@@ -144,14 +151,12 @@ function get_updates(
             )
             
             L_UU = cholesky(Symmetric(K_UU)).L
-            u_latent = L_UU * $(p_names.ure_inducing)
+            K_UU_inv_u = L_UU' \\ $(p_names.ure_inducing)
     """
 
     fitc_code = """
         # --- FITC Sparse GP Component: $(key) ---
         $(common_code)
-            
-            K_UU_inv_u = K_UU \\ u_latent
             mean_f = K_XU * K_UU_inv_u
             
             diag_K_XX = fill($(p_names.sigma)^2, hyper.n_latent)
@@ -162,18 +167,15 @@ function get_updates(
             $(p_names.sre) = mean_f .+
                 sqrt.(max.(lambda_diag, 0.0) .+ M.noise) .* $(p_names.ure_diag)
             
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
     vfe_code = """
         # --- VFE/DTC Sparse GP Component: $(key) ---
         $(common_code)
-            
-            K_UU_inv_u = K_UU \\ u_latent
             $(p_names.sre) = K_XU * K_UU_inv_u
-            
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -217,8 +219,10 @@ function get_effects(
     
     # Combine training and prediction coordinates
     coord_vars = get(spec.params, :positional_args, [])
-    coords_full = if !isnothing(PS) && all(hasproperty(PS.data, Symbol(v)) for v in coord_vars) # If prediction set is provided
-        coords_pred = Matrix{Float64}(PS.data[!, Symbol.(coord_vars)]) # Extract prediction coordinates
+    coords_full = if !isnothing(PS) && all(hasproperty(PS.data,
+        Symbol(v)) for v in coord_vars) # If prediction set is provided
+        coords_pred = Matrix{Float64}(PS.data[!,
+            Symbol.(coord_vars)]) # Extract prediction coordinates
         vcat(coords_train, coords_pred) # Combine training and prediction coordinates
     else
         coords_train # Otherwise, use only training coordinates
@@ -234,7 +238,8 @@ function get_effects(
         # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
-        inducing_ure_name = _find_parameter(p_names, string(p_names_k.ure_inducing), k, is_multivariate_model)
+        inducing_ure_name = _find_parameter(p_names, string(p_names_k.ure_inducing), k,
+            is_multivariate_model)
 
         if isempty(sigma_name) || isempty(ls_name) || isempty(inducing_ure_name)
             @warn "Parameters for FITC component $(spec.key) (outcome $k) not found. Returning zero-matrix."
@@ -246,7 +251,8 @@ function get_effects(
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1 # Dimension of lengthscale parameter
         ls_samples = get_params_matrix(chain, ls_name, ls_dim) # (n_samples, ls_dim)
-        inducing_ure_samples = get_params_matrix(chain, inducing_ure_name, m.n_inducing) # (n_samples, n_inducing)
+        inducing_ure_samples = get_params_matrix(chain, inducing_ure_name,
+            m.n_inducing) # (n_samples, n_inducing)
 
         # Initialize the output matrix for the full effect
         effect_k_matrix = zeros(Float64, n_obs_full, n_samples)
@@ -258,8 +264,10 @@ function get_effects(
             current_u_unscaled = inducing_ure_samples[i, :] # Unscaled innovations for inducing points for current sample
             
             # Kernel evaluations happen on the CPU
-            K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type, noise)
-            K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma, current_ls, kernel_type)
+            K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls, kernel_type,
+                noise)
+            K_XU = evaluate_cross_kernel_matrix(coords_full, Z_inducing, current_sigma,
+                current_ls, kernel_type)
             
             # Cholesky and linear solves happen on the CPU
             L_UU = cholesky(Symmetric(K_UU)).L
@@ -268,14 +276,16 @@ function get_effects(
             mean_f = K_XU * K_UU_inv_u
 
             if m.method == :fitc
-                diag_ure_name = _find_parameter(p_names, string(p_names_k.ure_diag), k, is_multivariate_model)
+                diag_ure_name = _find_parameter(p_names, string(p_names_k.ure_diag), k,
+                    is_multivariate_model)
                 if isempty(diag_ure_name)
                     @warn "Diagonal innovations for FITC component $(spec.key) (outcome $k) not found. Using zero for correction."
                     effect_k_matrix[:, i] = mean_f
                     continue
                 end
                 
-                diag_ure_samples = get_params_matrix(chain, diag_ure_name, n_latent_train) # (n_samples, n_latent_train)
+                diag_ure_samples = get_params_matrix(chain, diag_ure_name,
+                    n_latent_train) # (n_samples, n_latent_train)
                 
                 # Handle prediction set by generating new innovations
                 diag_ure_i = if n_obs_full > n_latent_train
@@ -293,7 +303,8 @@ function get_effects(
                 diag_Q_ff = sum(tmp.^2, dims=2)
                 lambda_diag = diag_K_XX - vec(diag_Q_ff)
                 
-                effect_k_matrix[:, i] = mean_f .+ sqrt.(max.(lambda_diag, 0.0) .+ noise) .* diag_ure_i
+                effect_k_matrix[:, i] = mean_f .+ sqrt.(max.(lambda_diag,
+                    0.0) .+ noise) .* diag_ure_i
             else # :vfe
                 effect_k_matrix[:, i] = mean_f
             end

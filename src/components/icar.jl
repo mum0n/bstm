@@ -7,14 +7,15 @@ where the value at a location is assumed to be conditionally dependent on the
 average of its neighbors.
 
 # Version
-v1.4.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The ICAR model defines a Gaussian Markov Random Field (GMRF) with a singular
 precision matrix (the graph Laplacian), making it an "intrinsic" GMRF. The
 conditional distribution of the spatial effect \$\\phi_i\$ at location \$i\$, given all
 other locations, is:
-\$\\phi_i | \\phi_{j \\ne i} \\sim \\mathcal{N}\\left( \\frac{1}{d_i} \\sum_{j \\sim i} \\phi_j, \\frac{\\sigma^2}{d_i} \\right)\$
+\$\\phi_i | \\phi_{j \\ne i} \\sim \\mathcal{N}\\left( \\frac{1}{d_i} \\sum_{j \\sim i}
+  \\phi_j, \\frac{\\sigma^2}{d_i} \\right)\$
 where \$j \\sim i\$ denotes that \$j\$ is a neighbor of \$i\$, and \$d_i\$ is the number of
 neighbors.
 
@@ -94,7 +95,8 @@ function get_precomputes(m::ICAR, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    _icar_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, sigma, y_sigma, noise=1e-6)
+    _icar_log_marginal_likelihood(y_residual, s_idx, s_N, Q_template, L_eig, sigma, y_sigma,
+      noise=1e-6)
 
 Computes the exact log marginal likelihood for an ICAR spatial process integrated out analytically.
 """
@@ -183,7 +185,7 @@ function get_updates(
             diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
             diag_D[1] = 0.0 # Enforce sum-to-zero constraint
             $(p_names.sre) = U * (diag_D .* $(p_names.ure))
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -199,7 +201,7 @@ function get_updates(
             )
             
             $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -216,7 +218,7 @@ function get_updates(
             )
             
             $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) .+= view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
         end
     """
 
@@ -263,12 +265,7 @@ function get_effects(
     m::ICAR, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))

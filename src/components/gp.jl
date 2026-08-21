@@ -6,7 +6,7 @@ geostatistics. It models a latent field by computing a dense covariance
 matrix based on a specified kernel function and coordinate inputs.
 
 # Version
-v1.4.1 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The component models a latent field \$f(x)\$ as a draw from a Gaussian Process with
@@ -22,7 +22,8 @@ where:
 
 For **anisotropic** models (Automatic Relevance Determination), the squared distance
 is weighted by a vector of lengthscales \$\\boldsymbol{\\ell} = [\\ell_1, \\dots, \\ell_D]\$:
-\$k(x, x') = \\sigma^2 \\exp\\left(-\\frac{1}{2} \\sum_{d=1}^D \\frac{(x_d - x'_d)^2}{\\ell_d^2}\\right)\$
+\$k(x, x') = \\sigma^2 \\exp\\left(-\\frac{1}{2} \\sum_{d=1}^D \\frac{(x_d -
+  x'_d)^2}{\\ell_d^2}\\right)\$
 
 The model samples the latent field \$f\$ from the resulting multivariate normal
 distribution \$f \\sim \\mathcal{N}(0, K)\$, where \$K\$ is the dense covariance matrix
@@ -40,20 +41,27 @@ evaluated at all data points.
 - **Required**:
   - One or more coordinate variables (e.g., `x`, `y`) passed to `random()`.
 - **Optional (in `random()` call)**:
-  - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`). Default: `"se"`.
-  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP. Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
-  - `anisotropic`: `Bool`, if `true`, a separate lengthscale is estimated for each input dimension (ARD). Default: `false`.
-  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default: `:noncentered`.
+  - `kernel`: `String`, the name of the kernel function (e.g., `"se"`, `"matern32"`).
+    Default: `"se"`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP.
+    Default: `Exponential(1.0)`.
+  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `anisotropic`: `Bool`, if `true`, a separate lengthscale is estimated for each input
+    dimension (ARD). Default: `false`.
+  - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default:
+    `:noncentered`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the GP.
 - `ls_<key>`: The kernel lengthscale(s). A vector if anisotropic.
-- `innovations_<key>`: The raw standard normal innovations for the latent field (for `:noncentered`).
+- `innovations_<key>`: The raw standard normal innovations for the latent field (for
+  `:noncentered`).
 - `latent_<key>`: The latent field (for `:centered`).
 
 # Key References
-- Rasmussen, C. E., & Williams, C. K. I. (2006). *Gaussian Processes for Machine Learning*. MIT Press.
+- Rasmussen, C. E., & Williams, C. K. I. (2006). *Gaussian Processes for Machine Learning*.
+  MIT Press.
 """
 struct GP <: ComponentModel
     lengthscale::Union{Distribution, Vector{<:Distribution}}
@@ -93,7 +101,8 @@ end
 """
     _gp_log_marginal_likelihood(y_residual, coords, sigma, ls, kernel_type, y_sigma, noise=1e-6)
 
-Computes the exact log marginal likelihood for a full Gaussian Process with latent field integrated out analytically.
+Computes the exact log marginal likelihood for a full Gaussian Process with latent field
+  integrated out analytically.
 """
 function _gp_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -148,7 +157,7 @@ function get_priors(
     end
     
     if m.method == :noncentered
-        push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+        push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)")
     end
 
     return join(priors, "\n    ")
@@ -179,7 +188,7 @@ function get_updates(
         $(common_code)
             F_gp = cholesky(Symmetric(K_mat))
             $(p_names.sre) = F_gp.L * $(p_names.ure)
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -187,7 +196,7 @@ function get_updates(
         # --- GP (Centered): $(key) ---
         $(common_code)
             $(p_names.sre) ~ MvNormal(zeros(T, size(K_mat, 1)), Symmetric(K_mat))
-            $(eta_target) .+= $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.sre)
         end
     """
 
@@ -232,11 +241,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -302,7 +307,8 @@ function get_effects(
                 alpha = F_y \ y_vec
                 
                 if n_obs_full == n_obs_train
-                    # Training conditional posterior: f | y ~ N(K_ff Ky^{-1} y, K_ff - K_ff Ky^{-1} K_ff)
+                    # Training conditional posterior: f | y ~ N(K_ff Ky^{-1} y, K_ff - K_ff
+                    #   Ky^{-1} K_ff)
                     mu_train = K_ff * alpha
                     Sigma_train = K_ff - K_ff * (F_y \ K_ff)
                     for j in 1:n_obs_train
@@ -314,12 +320,16 @@ function get_effects(
                     coords_pred = coords_full[(n_obs_train+1):end, :]
                     n_pred = size(coords_pred, 1)
                     
-                    K_star_f = evaluate_cross_kernel_matrix(coords_pred, coords_train, sig, current_ls, kernel_type)
-                    K_star_star = evaluate_kernel_matrix(coords_pred, sig, current_ls, kernel_type, noise)
+                    K_star_f = evaluate_cross_kernel_matrix(coords_pred, coords_train, sig,
+                        current_ls, kernel_type)
+                    K_star_star = evaluate_kernel_matrix(coords_pred, sig, current_ls,
+                        kernel_type, noise)
                     
                     # Full joint covariance
-                    K_full = evaluate_kernel_matrix(coords_full, sig, current_ls, kernel_type, noise)
-                    K_full_train = evaluate_cross_kernel_matrix(coords_full, coords_train, sig, current_ls, kernel_type)
+                    K_full = evaluate_kernel_matrix(coords_full, sig, current_ls, kernel_type,
+                        noise)
+                    K_full_train = evaluate_cross_kernel_matrix(coords_full, coords_train, sig,
+                        current_ls, kernel_type)
                     
                     mu_full = K_full_train * alpha
                     Sigma_full = K_full - K_full_train * (F_y \ K_full_train')
@@ -342,7 +352,8 @@ function get_effects(
             for i in 1:n_samples
                 current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
                 
-                K_mat = evaluate_kernel_matrix(coords_full, sigma_samples[i, 1], current_ls, kernel_type, noise)
+                K_mat = evaluate_kernel_matrix(coords_full, sigma_samples[i, 1], current_ls,
+                    kernel_type, noise)
                 F = cholesky(Symmetric(K_mat))
                 
                 innov_train = ure_samples[i, :]
@@ -370,9 +381,12 @@ function get_effects(
                     coords_pred = coords_full[(n_obs_train+1):end, :]
                     current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
                     
-                    K_ff = evaluate_kernel_matrix(coords_train, sigma_samples[i, 1], current_ls, kernel_type, noise)
-                    K_star_f = evaluate_cross_kernel_matrix(coords_pred, coords_train, sigma_samples[i, 1], current_ls, kernel_type)
-                    K_star_star = evaluate_kernel_matrix(coords_pred, sigma_samples[i, 1], current_ls, kernel_type, noise)
+                    K_ff = evaluate_kernel_matrix(coords_train, sigma_samples[i, 1],
+                        current_ls, kernel_type, noise)
+                    K_star_f = evaluate_cross_kernel_matrix(coords_pred, coords_train,
+                        sigma_samples[i, 1], current_ls, kernel_type)
+                    K_star_star = evaluate_kernel_matrix(coords_pred, sigma_samples[i, 1],
+                        current_ls, kernel_type, noise)
                     
                     L_ff = cholesky(Symmetric(K_ff)).L
                     A = L_ff' \ (L_ff \ K_star_f')

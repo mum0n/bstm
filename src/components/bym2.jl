@@ -6,45 +6,53 @@ parameterization for spatial effects by separating them into a structured (ICAR)
 and an unstructured (IID) component.
 
 # Version
-v2.2.1 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The BYM2 model decomposes a spatial random effect \$\\boldsymbol{\\phi}\$ into two parts:
-a spatially structured component \$\\boldsymbol{\\theta}\$ and an unstructured (IID) component \$\\boldsymbol{\\epsilon}\$:
+a spatially structured component \$\\boldsymbol{\\theta}\$ and an unstructured (IID)
+  component \$\\boldsymbol{\\epsilon}\$:
 
-\$\\boldsymbol{\\phi} = \\sigma \\left( \\sqrt{\\rho} \\boldsymbol{\\theta}_{scaled} + \\sqrt{1 - \\rho} \\boldsymbol{\\epsilon} \\right)\$
+\$\\boldsymbol{\\phi} = \\sigma \\left( \\sqrt{\\rho} \\boldsymbol{\\theta}_{scaled} +
+  \\sqrt{1 - \\rho} \\boldsymbol{\\epsilon} \\right)\$
 
 where:
 - \$\\boldsymbol{\\theta}_{scaled}\$ is a scaled intrinsic CAR (ICAR) process with unit variance.
-- \$\\boldsymbol{\\epsilon} \\sim \\mathcal{N}(0, \\mathbf{I})\$ is IID Gaussian noise.
-- \$\\rho \\in [0, 1]\$ is a mixing parameter controlling the proportion of variance attributed to the structured spatial effect. It is parameterized on an unconstrained scale via `unconstrained_rho`.
+- \$\\rho \\in [0, 1]\$ is a mixing parameter controlling the proportion of variance
+  attributed to the structured spatial effect. It is parameterized on an unconstrained scale
+  via `rho_unconstrained`.
 - \$\\sigma > 0\$ is the overall marginal standard deviation of the total spatial effect.
 
 # Computational Methods
-- `:spectral` (Default, AD-friendly): An efficient, AD-safe method using spectral decomposition of the ICAR precision matrix.
+- `:spectral` (Default, AD-friendly): An efficient, AD-safe method using spectral
+  decomposition of the ICAR precision matrix.
 - `:cholesky` (AD-friendly): A didactic alternative using dense Cholesky factorization.
-- `:cholesky_sparse` (Didactic, Not AD-friendly): A non-AD-safe didactic method using sparse Cholesky factorization.
+- `:cholesky_sparse` (Didactic, Not AD-friendly): A non-AD-safe didactic method using sparse
+  Cholesky factorization.
 
 # Inputs
 - **Required**:
   - A spatial index variable (e.g., `region`) passed to `random()`.
   - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
 - **Optional (in `random()` call)**:
-  - `unconstrained_rho`: `UnivariateDistribution`, prior for the unconstrained mixing parameter. Default: `Normal(0, 0.5)`.
-  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default: `Exponential(1.0)`.
-  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`). Default: `:spectral`.
+  - `rho_unconstrained`: `UnivariateDistribution`, prior for the unconstrained mixing
+    parameter. Default: `Normal(0, 0.5)`.
+  - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default:
+    `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
+    Default: `:spectral`.
 
 # Outputs (Parameter Names)
-- `unconstrained_rho_<key>`: The unconstrained mixing parameter.
+- `rho_unconstrained_<key>`: The unconstrained mixing parameter.
 - `sigma_<key>`: The marginal standard deviation.
-- `struct_<key>`: Raw standard normal innovations for the structured (ICAR) component.
-- `sre_<key>`: Raw standard normal innovations for the structured (ICAR) component.
-- `ure_<key>`: Raw standard normal innovations for the unstructured (IID) component.
-- `latent_<key>`: The reconstructed latent BYM2 effect.
+- `ure_<key>`: Standard normal innovations for the spatial field.
+- `sre_<key>`: Reconstructed structured spatial effect.
 
 # Key References
-- Riebler, A., Sørbye, S. H., Simpson, D., & Rue, H. (2016). *An intuitive joint prior for variance parameters in hierarchical models*. Statistical Science, 31(1), 114-135.
-- Besag, J., York, J., & Mollié, A. (1991). *Bayesian image restoration, with applications in spatial statistics*. Annals of the Institute of Statistical Mathematics, 43(1), 1-20.
+- Riebler, A., Sørbye, S. H., Simpson, D., & Rue, H. (2016). *An intuitive joint prior for
+  variance parameters in hierarchical models*. Statistical Science, 31(1), 114-135.
+- Besag, J., York, J., & Mollié, A. (1991). *Bayesian image restoration, with applications
+  in spatial statistics*. Annals of the Institute of Statistical Mathematics, 43(1), 1-20.
 """
 struct BYM2 <: ComponentModel
     rho_unconstrained::UnivariateDistribution
@@ -52,15 +60,10 @@ struct BYM2 <: ComponentModel
     method::Symbol
 end
 
-Base.getproperty(m::BYM2, s::Symbol) = (
-    s === :unconstrained_rho ? getfield(m, :rho_unconstrained) :
-    getfield(m, s)
-)
-
 COMPONENT_TYPE_REGISTRY[:bym2] = BYM2
 
 COMPONENT_CONSTRUCTORS[:bym2] = (p, params) -> BYM2(
-    get(p, :rho_unconstrained, get(p, :unconstrained_rho, Normal(0, 0.5))),
+    get(p, :rho_unconstrained, Normal(0, 0.5)),
     p.sigma,
     get(params, :method, :spectral)
 )
@@ -109,9 +112,11 @@ function get_precomputes(m::BYM2, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    _bym2_log_marginal_likelihood(y_residual, s_idx, s_N, U, L_eig, rho, sigma, y_sigma, noise=1e-6)
+    _bym2_log_marginal_likelihood(y_residual, s_idx, s_N, U, L_eig, rho, sigma, y_sigma,
+      noise=1e-6)
 
-Computes the exact log marginal likelihood for a BYM2 spatial component integrated out analytically.
+Computes the exact log marginal likelihood for a BYM2 spatial component integrated out
+  analytically.
 """
 function _bym2_log_marginal_likelihood(
     y_residual::AbstractVector{T},
@@ -234,7 +239,7 @@ function get_updates(
             local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* structured_effect .+ 
                                 sqrt(1.0 - rho) .* $(p_names.ure))
             
-            $(eta_target) .+= view(combined_effect, M.s_idx)
+            $(eta_target) = $(eta_target) .+ view(combined_effect, M.s_idx)
         end
     """
 
@@ -252,7 +257,7 @@ function get_updates(
             local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* sre_unscaled .+ 
                                 sqrt(1.0 - rho) .* $(p_names.ure))
             
-            $(eta_target) .+= view(combined_effect, M.s_idx)
+            $(eta_target) = $(eta_target) .+ view(combined_effect, M.s_idx)
         end
     """
 
@@ -271,7 +276,7 @@ function get_updates(
             local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* sre_unscaled .+ 
                                 sqrt(1.0 - rho) .* $(p_names.ure))
             
-            $(eta_target) .+= view(combined_effect, M.s_idx)
+            $(eta_target) = $(eta_target) .+ view(combined_effect, M.s_idx)
         end
     """
 
@@ -296,10 +301,14 @@ function get_updates(
         end
     """
 
-    if m.method == :spectral; return spectral_code;
-    elseif m.method == :cholesky; return cholesky_code;
-    elseif m.method == :cholesky_sparse; return cholesky_sparse_code;
-    elseif m.method == :marginalized; return marginalized_code;
+    if m.method == :spectral
+        return spectral_code
+    elseif m.method == :cholesky
+        return cholesky_code
+    elseif m.method == :cholesky_sparse
+        return cholesky_sparse_code
+    elseif m.method == :marginalized
+        return marginalized_code
     else; error("Unsupported method '$(m.method)' for BYM2 component. Use :spectral, :cholesky, :cholesky_sparse, or :marginalized."); end
 end
 
@@ -313,11 +322,7 @@ function get_effects(
     m::BYM2, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     p_names = string.(keys(chain))
     is_multivariate = outcomes_N > 1
@@ -326,7 +331,8 @@ function get_effects(
 
     # Combine spatial indices from training and prediction sets
     s_idx_full = if haskey(M, :s_idx) # Check if spatial index exists in training data
-        if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set and it has spatial index
+        if !isnothing(PS) && hasproperty(PS.data,
+            :s_idx) # If prediction set and it has spatial index
             vcat(M.s_idx, PS.data.s_idx) # Concatenate training and prediction indices
         else
             M.s_idx # Otherwise, use only training indices
@@ -343,7 +349,8 @@ function get_effects(
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate)
-        rho_name = _find_parameter(p_names, string(p_names_k.rho_unconstrained), k, is_multivariate)
+        rho_name = _find_parameter(p_names, string(p_names_k.rho_unconstrained), k,
+            is_multivariate)
 
         if isempty(sigma_name) || isempty(rho_name)
             @warn "Parameters for BYM2 component $(spec.key) (outcome $(k)) not found. Returning zero-matrices."
@@ -412,7 +419,8 @@ function get_effects(
                 z = randn(n_latent)
                 phi = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
                 
-                # Decompose into structured and unstructured components via spectral Wiener filtering
+                # Decompose into structured and unstructured components via spectral Wiener
+                #   filtering
                 weights_struct = Vector{Float64}(undef, n_latent)
                 weights_struct[1] = 0.0
                 for j in 2:n_latent
@@ -456,8 +464,10 @@ function get_effects(
                     struct_effect_unscaled .-= mean(struct_effect_unscaled)
                 end
                 
-                structured_latent[:, i] = sigma_samples[i, 1] * sqrt(rho_samples[i, 1]) * struct_effect_unscaled
-                unstructured_latent[:, i] = sigma_samples[i, 1] * sqrt(1.0 - rho_samples[i, 1]) * ure_innov_samples[i, :]
+                structured_latent[:, i] = sigma_samples[i, 1] * sqrt(rho_samples[i,
+                    1]) * struct_effect_unscaled
+                unstructured_latent[:, i] = sigma_samples[i, 1] * sqrt(1.0 - rho_samples[i,
+                    1]) * ure_innov_samples[i, :]
             end
         end
         

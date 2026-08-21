@@ -7,7 +7,7 @@ directional dependencies between spatial or other units, such as in river networ
 or epidemiological models.
 
 # Version
-v1.1.0 (2026-08-19)
+v1.0.0
 
 # Mathematical Summary
 The DAG model defines a recursive relationship for the latent field \$\\phi\$:
@@ -32,9 +32,12 @@ precision matrix is \$Q = (I - \\rho W)^T (I - \\rho W) / \\sigma^2\$.
   - A spatial index variable (e.g., `s_idx`).
   - An adjacency matrix `W` passed as a keyword argument to `@bstm`.
 - **Optional (in `random()` call)**:
-  - `rho`: `UnivariateDistribution`, prior for the autoregressive parameter. Default: `Normal(0, 0.5)`.
-  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the innovations. Default: `Exponential(1.0)`.
-  - `method`: `Symbol`, computational method (`:forward_substitution` or `:precision`). Default: `:forward_substitution`.
+  - `rho`: `UnivariateDistribution`, prior for the autoregressive parameter. Default:
+    `Normal(0, 0.5)`.
+  - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the innovations.
+    Default: `Exponential(1.0)`.
+  - `method`: `Symbol`, computational method (`:forward_substitution` or `:precision`).
+    Default: `:forward_substitution`.
 
 # Outputs (Parameter Names)
 - `rho_<key>`: The autoregressive parameter.
@@ -44,7 +47,9 @@ precision matrix is \$Q = (I - \\rho W)^T (I - \\rho W) / \\sigma^2\$.
 
 # Key References
 - Cressie, N. (1993). *Statistics for Spatial Data*. Wiley.
-- Ver Hoef, J. M., Peterson, E. E., & Theobald, D. M. (2006). *Spatial statistical models that use flow and stream distance*. Environmental and Ecological Statistics, 13(4), 449-464.
+- Ver Hoef, J. M., Peterson, E. E., & Theobald, D. M. (2006). *Spatial statistical models
+  that use flow and stream distance*. Environmental and Ecological Statistics, 13(4),
+  449-464.
 """
 struct DAG <: ComponentModel
     rho::Distribution
@@ -129,9 +134,10 @@ function get_updates(
                 # Recursive relationship: phi_i = rho * sum(W_ij * phi_j) + epsilon_i
                 $(p_names.sre)[i] = rho_val * parent_effect + ure_val[i]
             end
-            $(p_names.sre) .*= sigma_val # Scale the entire field by sigma
+            $(p_names.sre) = $(p_names.sre) .* sigma_val # Scale the entire field by sigma
             
-            $(eta_target) .+= view($(p_names.sre), M.s_idx) # Apply to linear predictor
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx) # Apply to linear
+              predictor
         end
     """
 
@@ -148,7 +154,8 @@ function get_updates(
             # Non-centered parameterization: sre = sigma * L_inv * ure
             $(p_names.sre) = $(p_names.sigma) .* (F.U \\ $(p_names.ure))
             
-            $(eta_target) .+= view($(p_names.sre), M.s_idx) # Apply to linear predictor
+            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx) # Apply to linear
+              predictor
         end
     """
 
