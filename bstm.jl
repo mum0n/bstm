@@ -42,6 +42,8 @@ module bstm
     include(joinpath(srcdir, "plotting.jl")) 
     include(joinpath(srcdir, "input_output.jl"))
     include(joinpath(srcdir, "movement.jl"))
+    include(joinpath(srcdir, "derivatives.jl"))
+    include(joinpath(srcdir, "pipeline.jl"))
       
     # component definitions
     components_dir = joinpath(srcdir, "components")
@@ -55,10 +57,13 @@ module bstm
     # User-facing API exports
     export @bstm, model_results_comprehensive, get_optimal_sampler
     export precompute_step_sizes, predict, show_model
+    export bstm_surface_derivatives, compute_topographic_metrics
+    export bstm_pipeline, compute_network_transfer_matrix, reshard_spatial_field
+    export summarize_sample_matrix, PipelineResult, PipelineTierSpec
     export bstm_cv_orchestrator, bstm_plots, bstm_sample, save_plots
     export assign_spatial_units_inferred, plot_kde_simple
     export assign_spatial_units, assign_time_units, assign_spatiotemporal_units
-    export discretize_data, bstm_data
+    export discretize_data, bstm_data, expand_hull, generate_mock_hierarchical_datasets
     export spatial_block_cv, spatial_weights_matrix, spatial_knn_graph
     export spatial_radius_graph, scaling_factor_bym2
     export ParamRegistry, ParamDescriptor, build_param_registry

@@ -254,8 +254,7 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            ure_samples = get_params_matrix(chain, ure_name, m.n_inducing) # (n_samples,
-                n_inducing)
+            ure_samples = get_params_matrix(chain, ure_name, m.n_inducing) # (n_samples, n_inducing)
 
             for i in 1:n_samples
                 current_sigma = sigma_samples[i, 1] # Sigma for current sample
@@ -278,8 +277,7 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
                 continue
             end
-            u_latent_samples = get_params_matrix(chain, sre_name, m.n_inducing) # (n_samples,
-                n_inducing)
+            u_latent_samples = get_params_matrix(chain, sre_name, m.n_inducing) # (n_samples, n_inducing)
 
             for i in 1:n_samples # Iterate over each posterior sample
                 current_sigma = sigma_samples[i, 1] # Sigma for current sample

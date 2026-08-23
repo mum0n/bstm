@@ -66,8 +66,8 @@ end
 
 COMPONENT_TYPE_REGISTRY[:waveletgp] = WaveletGP
 COMPONENT_CONSTRUCTORS[:waveletgp] = (p, params) -> WaveletGP(
-    p.sigma0,
-    p.alpha,
+    get(p, :sigma0, get(p, :sigma, Exponential(1.0))),
+    get(p, :alpha, Exponential(1.0)),
     get(params, :wavelet, :db4),
     get(params, :resolution, 32)
 )
@@ -80,7 +80,7 @@ Computes the scale level for each coefficient in a 2D DWT.
 """
 function _get_wavelet_scale_indices_2d(res::Int, wt)
     scale_indices_matrix = zeros(Int, res, res)
-    max_level = dwt_levels(zeros(res, res), wt)
+    max_level = floor(Int, log2(res))
     
     current_res = res
     for level in 1:max_level
@@ -102,26 +102,50 @@ function _get_wavelet_scale_indices_2d(res::Int, wt)
     return vec(scale_indices_matrix)
 end
 
+function _resolve_wavelet(w)
+    if w isa Wavelets.WT.OrthoWaveletClass || w isa Wavelets.WT.BiOrthoWaveletClass
+        return Wavelets.wavelet(w)
+    elseif w isa Symbol || w isa AbstractString
+        str = lowercase(string(w))
+        if str in ["db4", "daubechies4"]
+            return Wavelets.wavelet(Wavelets.WT.db4)
+        elseif str in ["db2", "daubechies2"]
+            return Wavelets.wavelet(Wavelets.WT.db2)
+        elseif str in ["db6", "daubechies6"]
+            return Wavelets.wavelet(Wavelets.WT.db6)
+        elseif str in ["db8", "daubechies8"]
+            return Wavelets.wavelet(Wavelets.WT.db8)
+        elseif str in ["haar", "db1"]
+            return Wavelets.wavelet(Wavelets.WT.haar)
+        elseif str in ["coif2"]
+            return Wavelets.wavelet(Wavelets.WT.coif2)
+        elseif str in ["coif4"]
+            return Wavelets.wavelet(Wavelets.WT.coif4)
+        elseif str in ["sym4"]
+            return Wavelets.wavelet(Wavelets.WT.sym4)
+        elseif str in ["sym8"]
+            return Wavelets.wavelet(Wavelets.WT.sym8)
+        else
+            return Wavelets.wavelet(Wavelets.WT.db4)
+        end
+    else
+        return Wavelets.wavelet(Wavelets.WT.db4)
+    end
+end
+
 function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTuple
-    # Data validation
     variables = mod_data[:variables]
     if isempty(variables)
         error("WaveletGP model requires coordinate variables.")
     end
-    
-    if !ispow2(m.resolution)
-        error("Resolution for WaveletGP must be a power of 2. Got: $(m.resolution)")
-    end
-
     for var_sym in variables
-        if !hasproperty(M.data, Symbol(var_sym))
+        if !hasproperty(M.data, var_sym)
             error("Coordinate variable ':$var_sym' for WaveletGP model not found in data.")
         end
     end
-
-    # All computations are on the CPU.
-    coords_cpu = Matrix{Float64}(M.data[!, Symbol.(variables)])
+    
     res = m.resolution
+    coords_cpu = Matrix{Float64}(M.data[:, variables])
     n_dims = size(coords_cpu, 2)
     
     if n_dims > 2
@@ -134,7 +158,7 @@ function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTupl
     max_coords = maximum(coords_cpu, dims=1)
     grid_ranges = [range(min_coords[d], stop=max_coords[d], length=res) for d in 1:n_dims]
 
-    wt = Wavelets.wavelet(m.wavelet)
+    wt = _resolve_wavelet(m.wavelet)
     local scale_indices_cpu
     if n_dims == 1
         x_dummy = zeros(res)
@@ -142,18 +166,40 @@ function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTupl
         scale_indices_cpu = zeros(Int, length(c))
         start_idx = 1
         
-        # Approximation coefficients scale
-        scale_indices_cpu[start_idx : start_idx + l[1] - 1] .= dwt_levels(x_dummy)
+        max_lvl = floor(Int, log2(res))
+        scale_indices_cpu[start_idx : start_idx + l[1] - 1] .= max_lvl
         start_idx += l[1]
         
         # Detail coefficients scales
         for i in 2:length(l)-1
-            current_level = dwt_levels(x_dummy) - (i - 1)
+            current_level = max_lvl - (i - 1)
             scale_indices_cpu[start_idx : start_idx + l[i] - 1] .= current_level
             start_idx += l[i]
         end
     else # 2D
         scale_indices_cpu = _get_wavelet_scale_indices_2d(res, wt)
+    end
+
+    # Precompute wavelet synthesis basis matrix: [n_latent, n_latent]
+    Phi_wavelet = zeros(Float64, n_latent, n_latent)
+    for j in 1:n_latent
+        e_j = zeros(Float64, n_latent)
+        e_j[j] = 1.0
+        if n_dims == 1
+            Phi_wavelet[:, j] = idwt(e_j, wt)
+        else
+            e_j_2d = reshape(e_j, res, res)
+            Phi_wavelet[:, j] = vec(idwt(e_j_2d, wt))
+        end
+    end
+
+    # Precompute interpolation projection to observation coordinates: [N_obs, n_latent]
+    N_obs = size(coords_cpu, 1)
+    B_obs = zeros(Float64, N_obs, n_latent)
+    for j in 1:n_latent
+        grid_j = reshape(Phi_wavelet[:, j], fill(res, n_dims)...)
+        itp_j = linear_interpolation(Tuple(grid_ranges), grid_j, extrapolation_bc=Interpolations.Flat())
+        B_obs[:, j] = [itp_j(coords_cpu[i, :]...) for i in 1:N_obs]
     end
     
     return (
@@ -162,7 +208,10 @@ function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTupl
         n_latent = n_latent,
         coords = coords_cpu,
         grid_ranges = grid_ranges,
-        scale_indices = scale_indices_cpu
+        scale_indices = scale_indices_cpu,
+        wt = wt,
+        Phi_wavelet = Phi_wavelet,
+        B_obs = B_obs
     )
 end
 
@@ -189,30 +238,15 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
-    res = m.resolution
-    n_dims = spec.hyper.n_dims
 
     return """
     # --- WaveletGP Component: $(key) ---
     let
         hyper = spec_registry[:$(key)].hyper
-        wt = Wavelets.wavelet(Symbol("$(m.wavelet)"))
         
-        scale_variances = $(p_names.sigma0)^2 .* (2.0 .^ (-$(p_names.alpha) .*
-          hyper.scale_indices))
+        scale_variances = $(p_names.sigma0)^2 .* (2.0 .^ (-$(p_names.alpha) .* hyper.scale_indices))
         wavelet_coeffs = $(p_names.ure) .* sqrt.(scale_variances)
-        
-        local latent_field_grid
-        if $(n_dims) == 1
-            latent_field_grid = idwt(wavelet_coeffs, wt)
-        else
-            coeffs_reshaped = reshape(wavelet_coeffs, $(res), $(res))
-            latent_field_grid = idwt(coeffs_reshaped, wt)
-        end
-        
-        itp = linear_interpolation(hyper.grid_ranges, latent_field_grid, extrapolation_bc=Flat())
-        coords_for_itp = ntuple(d -> hyper.coords[:, d], $(n_dims))
-        $(p_names.sre) = itp(coords_for_itp...)
+        $(p_names.sre) = hyper.B_obs * wavelet_coeffs
         
         $(eta_target) = $(eta_target) .+ $(p_names.sre)
     end
@@ -276,7 +310,7 @@ function get_effects(
         ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
 
         effect_k = zeros(Float64, N_total_eff, n_samples)
-        wt = Wavelets.wavelet(m.wavelet)
+        wt = _resolve_wavelet(m.wavelet)
         
         # --- Sample-wise Reconstruction ---
         for i in 1:n_samples
@@ -295,11 +329,13 @@ function get_effects(
                 latent_field_grid_cpu = idwt(coeffs_reshaped, wt)
             end
             
-            itp_s = linear_interpolation(grid_ranges_cpu, latent_field_grid_cpu,
-                extrapolation_bc=Flat())
+            itp_s = linear_interpolation(Tuple(grid_ranges_cpu), latent_field_grid_cpu,
+                extrapolation_bc=Interpolations.Flat())
             
-            coords_for_itp = ntuple(d -> view(coords_full_cpu, :, d), n_dims)
-            effect_k[:, i] = itp_s(coords_for_itp...)
+            for j in 1:N_total_eff
+                pt = ntuple(d -> coords_full_cpu[j, d], n_dims)
+                effect_k[j, i] = itp_s(pt...)
+            end
         end
         push!(structured_effects, effect_k)
     end

@@ -1142,7 +1142,7 @@ point predictions, prediction intervals, goodness-of-fit metrics, and MCMC conve
 Generates pure analytical data without executing graphical rendering.
 """
 function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothing, alpha=0.05,
-    strata_info=nothing)
+    strata_info=nothing, au=nothing, kwargs...)
     n_samples = _get_chain_n_samples(chain)
     
     # --- 1. Metadata and Architecture Extraction ---
@@ -1699,20 +1699,42 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
 
     res = _reconstruct(arch_type, "prediction", chain, M_train, PS, alpha)
 
-    # 7. Slice the prediction part from the full summary.
+    # 7. Slice the prediction part from the full summary and sample matrices
     N_train = M_train.y_N
     
-    function slice_summary(summary)
+    function slice_summary(summary, raw_samples)
         if summary isa AbstractVector # Multivariate case 
-            return [(mean=s.mean[(N_train+1):end], median=s.median[(N_train+1):end], std=s.std[(N_train+1):end], lower=s.lower[(N_train+1):end], upper=s.upper[(N_train+1):end]) for s in summary]
+            return [(
+                mean = s.mean[(N_train+1):end],
+                median = s.median[(N_train+1):end],
+                std = s.std[(N_train+1):end],
+                lower = s.lower[(N_train+1):end],
+                upper = s.upper[(N_train+1):end],
+                samples = (raw_samples isa AbstractArray && ndims(raw_samples) == 3 &&
+                    size(raw_samples, 1) >= N_train + 1) ?
+                    raw_samples[(N_train+1):end, :, k] : nothing
+            ) for (k, s) in enumerate(summary)]
         else # Univariate case
-            return (mean=summary.mean[(N_train+1):end], median=summary.median[(N_train+1):end], std=summary.std[(N_train+1):end], lower=summary.lower[(N_train+1):end], upper=summary.upper[(N_train+1):end])
+            samps = (raw_samples isa AbstractArray && ndims(raw_samples) >= 2 &&
+                size(raw_samples, 1) >= N_train + 1) ?
+                raw_samples[(N_train+1):end, :] : nothing
+            return (
+                mean = summary.mean[(N_train+1):end],
+                median = summary.median[(N_train+1):end],
+                std = summary.std[(N_train+1):end],
+                lower = summary.lower[(N_train+1):end],
+                upper = summary.upper[(N_train+1):end],
+                samples = samps
+            )
         end
     end
 
+    raw_denoised = hasproperty(res, :raw_predictions_denoised) ? res.raw_predictions_denoised : nothing
+    raw_noisy = hasproperty(res, :raw_predictions_noisy) ? res.raw_predictions_noisy : nothing
+
     return (
-        predictions_denoised = slice_summary(res.predictions_denoised),
-        predictions_noisy = slice_summary(res.predictions_noisy),
+        predictions_denoised = slice_summary(res.predictions_denoised, raw_denoised),
+        predictions_noisy = slice_summary(res.predictions_noisy, raw_noisy),
         pstats = res,
         PS = PS
     )

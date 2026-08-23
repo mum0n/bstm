@@ -1,0 +1,382 @@
+# ==============================================================================
+# BSTM Test Suite: Data Generator, Persistence (JLD2/DuckDB), Plots & Magnitude Validation
+# ==============================================================================
+
+if !@isdefined(bstm_Likelihood)
+    include(joinpath(@__DIR__, "test_helpers.jl"))
+end
+
+@testset "bstm_data Monolithic Synthetic Data Generator" begin
+    @testset "Default scottish_lip Dataset & Covariate Completeness" begin
+        p_out, n_out = bstm.bstm_data() # Default "scottish_lip"
+        df = p_out.data
+        au = p_out.au
+
+        @test df isa DataFrame
+        @test au.W isa AbstractMatrix
+        @test size(df, 1) > 0
+
+        required_cols = [
+            :y, :y_rate, :y_bin, :y_gauss, :y_pois, :ordinal_y,
+            :y_cat1, :y_cat2, :y_cat3, :counts, :t_idx, :year, :month, :day,
+            :region, :district, :group, :group_id, :group_var, :cell_area,
+            :effort, :removal, :removal_total, :proxy_val, :predator_pop,
+            :recruitment, :habitat, :species_1, :species_2, :species_3,
+            :age_1, :age_2, :age_3, :class_1, :class_2, :class_3, :class_4,
+            :s_idx, :s_x, :s_y
+        ]
+        for col in required_cols
+            @test col in propertynames(df)
+        end
+    end
+
+    @testset "All Supported Synthetic Dataset Types" begin
+        df_ord = bstm.bstm_data("ordinal"; n_obs=100)
+        @test df_ord isa DataFrame
+        @test :ordinal_y in propertynames(df_ord)
+    end
+end
+
+@testset "Plotting Subsystem" begin
+    # 1. Theme generator
+    thm = bstm.create_theme(fontsize=11)
+    @test haskey(thm, :titlefontsize)
+    @test thm.size == (900, 600)
+
+    # 2. Choropleth plotting
+    polys = [
+        [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+        [(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0)]
+    ]
+    vals = [1.5, 2.5]
+    p_choro = bstm.choropleth(polys, vals; title="Test Choro")
+    @test p_choro isa Plots.Plot
+
+    # Test flipped argument order
+    p_choro2 = bstm.choropleth(vals, polys)
+    @test p_choro2 isa Plots.Plot
+
+    # 3. Timeseries with Credible Interval
+    ts_p = bstm.timeseries_ci(1:5, [1.0, 2.0, 3.0, 2.5, 2.0], [0.8, 1.7, 2.5, 2.0, 1.5],
+        [1.2, 2.3, 3.5, 3.0, 2.5]; title="Trend")
+    @test ts_p isa Plots.Plot
+
+    # 4. Spatial Graph Plot
+    cents = [(0.5, 0.5), (1.5, 0.5)]
+    g = Graphs.SimpleGraph(2)
+    Graphs.add_edge!(g, 1, 2)
+    sg_p = bstm.spatial_graph_plot(cents, g; polygons=polys)
+    @test sg_p isa Plots.Plot
+
+    # Test keyword-based au dispatch
+    au_mock = (polygons=polys, centroids=cents, graph=g, hull_coords=polys[1])
+    sg_p2 = bstm.spatial_graph_plot(au=au_mock)
+    @test sg_p2 isa Plots.Plot
+
+    # 5. Render Paths & Occupancy
+    path_mock = [[(0.5, 0.5), (1.5, 0.5)]]
+    p_paths = bstm.render_paths!(deepcopy(sg_p), path_mock)
+    @test p_paths isa Plots.Plot
+
+    occ_p = bstm.map_point_occupancy(polys, cents, 1, 1)
+    @test occ_p isa Plots.Plot
+
+    # 6. Save Plot
+    tmp_file = joinpath(tempdir(), "test_bstm_plot.png")
+    saved_path = bstm.save_plot(p_choro, tmp_file)
+    @test isfile(saved_path)
+    try; rm(saved_path; force=true); catch; end
+
+    # 7. Test Spatiotemporal Time Coordinates in bstm_plots
+    df_st_mock = DataFrame(
+        s_idx = repeat(1:56, inner=10),
+        year = repeat(1:10, outer=56),
+        y_gauss = randn(560)
+    )
+    res_mock = (
+        effects = Dict(
+            :year => (
+                structured = (
+                    mean = repeat(sin.(1:10), outer=56),
+                    lower = repeat(sin.(1:10) .- 0.2, outer=56),
+                    upper = repeat(sin.(1:10) .+ 0.2, outer=56)
+                ),
+            )
+        ),
+        predictions = (
+            denoised = (
+                mean = randn(560),
+                lower = randn(560) .- 0.5,
+                upper = randn(560) .+ 0.5,
+                observed = randn(560)
+            ),
+        )
+    )
+    M_mock_st = (
+        s_N = 56,
+        t_N = 10,
+        t_idx_var = :year,
+        t_idx = df_st_mock.year,
+        s_idx = df_st_mock.s_idx,
+        data = df_st_mock
+    )
+    plots_out = bstm._bstm_plots_impl(nothing, nothing, res_mock, M_mock_st; data=df_st_mock)
+    @test haskey(plots_out.plots, :temporal)
+    @test length(plots_out.plots_data[:temporal].time) == 10
+    @test collect(plots_out.plots_data[:temporal].time) == 1:10
+end
+
+@testset "Model State & Results Persistence (JLD2 & DuckDB)" begin
+    # 1. Setup simple model & sampling
+    rng = MersenneTwister(123)
+    df_test = DataFrame(
+        y = rand(rng, 1:10, 25),
+        x = randn(rng, 25),
+        group = rand(rng, 1:5, 25)
+    )
+    m_test = @bstm(likelihood(y, family=poisson) ~ intercept() + fixed(x) + random(group,
+        model=iid), df_test, verbose=false)
+    chn_test = sample(m_test, MH(), 30; progress=false)
+    res_test = model_results_comprehensive(m_test, chn_test)
+
+    temp_dir = mktempdir()
+    jld2_path = joinpath(temp_dir, "test_model.jld2")
+    duckdb_path = joinpath(temp_dir, "test_results.duckdb")
+    bundle_base = joinpath(temp_dir, "test_bundle")
+
+    # 2. Test JLD2 Model State Save & Load
+    saved_file = save_bstm_model(jld2_path, m_test; chain=chn_test,
+        metadata=Dict("test_run"=>"v1"))
+    @test isfile(saved_file)
+
+    loaded_bundle = load_bstm_model(saved_file)
+    @test hasproperty(loaded_bundle, :model)
+    @test loaded_bundle.model isa DynamicPPL.Model
+    @test hasproperty(loaded_bundle, :chain)
+    @test !isnothing(loaded_bundle.chain)
+    @test loaded_bundle.metadata["test_run"] == "v1"
+
+    # Test sampling on reloaded model
+    chn_reloaded = sample(loaded_bundle.model, MH(), 10; progress=false)
+    @test size(chn_reloaded, 1) == 10
+
+    # 3. Test Chain Appending & Extension
+    chn_extended = append_posterior_samples(chn_test, chn_reloaded)
+    @test size(chn_extended, 1) == size(chn_test, 1) + size(chn_reloaded, 1)
+
+    chn_ext_sampled = extend_sampling(m_test, chn_test, 10; sampler=MH(), progress=false)
+    @test size(chn_ext_sampled, 1) == size(chn_test, 1) + 10
+
+    # 4. Test DuckDB Results Save & Query
+    saved_db = save_bstm_results(duckdb_path, res_test; model=m_test, chain=chn_test)
+    @test isfile(saved_db)
+
+    # SQL Queries via DuckDB
+    df_metrics = query_duckdb(duckdb_path, "SELECT * FROM metrics")
+    @test df_metrics isa DataFrame
+    @test "metric" in names(df_metrics)
+
+    df_params = query_duckdb(duckdb_path, "SELECT * FROM parameter_stats")
+    @test df_params isa DataFrame
+
+    df_preds = query_duckdb(duckdb_path, "SELECT * FROM predictions")
+    @test df_preds isa DataFrame
+    @test nrow(df_preds) == 25
+
+    # Reload DuckDB results
+    res_reloaded = load_bstm_results(duckdb_path)
+    @test hasproperty(res_reloaded, :metrics)
+    @test hasproperty(res_reloaded, :parameters)
+    @test hasproperty(res_reloaded, :predictions)
+    @test hasproperty(res_reloaded, :plots_data)
+
+    # 5. Test Unified Bundle Save & Load
+    bundle_paths = save_bstm_bundle(bundle_base, m_test, chn_test, res_test;
+        metadata=Dict("experiment"=>"bundle_test"))
+    @test isfile(bundle_paths.model_file)
+    @test isfile(bundle_paths.results_file)
+
+    loaded_all = load_bstm_bundle(bundle_base)
+    @test loaded_all.model isa DynamicPPL.Model
+    @test !isnothing(loaded_all.chain)
+    @test hasproperty(loaded_all.results, :metrics)
+    @test loaded_all.metadata["experiment"] == "bundle_test"
+
+    # 6. Test Sequential Prior Extraction
+    extracted_priors = extract_posterior_priors(res_test)
+    @test haskey(extracted_priors, :intercept)
+    @test extracted_priors[:intercept] isa Normal
+
+    # 7. Test Multi-Model Ensembling & BMA
+    ens_db = joinpath(temp_dir, "ensemble.duckdb")
+    m2_test = @bstm(likelihood(y, family=poisson) ~ intercept() + fixed(x), df_test,
+        verbose=false)
+    c2_test = sample(m2_test, MH(), 30; progress=false)
+    r2_test = model_results_comprehensive(m2_test, c2_test)
+
+    ensemble_dict = Dict(
+        :full => (model=m_test, chain=chn_test, results=res_test),
+        :reduced => (model=m2_test, chain=c2_test, results=r2_test)
+    )
+    df_registry = save_model_ensemble(ens_db, ensemble_dict)
+    @test nrow(df_registry) == 2
+    @test "bma_weight" in names(df_registry)
+
+    df_bma = bma_weighted_predictions(ens_db)
+    @test nrow(df_bma) == 25
+    @test "bma_pred_mean" in names(df_bma)
+
+    # 8. Test Parquet & CSV Export
+    pq_path = joinpath(temp_dir, "predictions.parquet")
+    csv_path = joinpath(temp_dir, "predictions.csv")
+    export_results_to_parquet(duckdb_path, "predictions", pq_path)
+    export_results_to_csv(duckdb_path, "predictions", csv_path)
+    @test isfile(pq_path)
+    @test isfile(csv_path)
+
+    # 9. Test DuckDB Compaction
+    compact_duckdb(duckdb_path)
+
+    # 10. Test GeoJSON Export
+    au_dummy = (
+        polygons = Vector{Tuple{Float64, Float64}}[
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)],
+            [(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 0.0)]
+        ],
+        centroids = [(0.5, 0.5), (1.5, 0.5)]
+    )
+    geojson_path = joinpath(temp_dir, "spatial_units.geojson")
+    export_spatial_results_to_geojson(geojson_path, res_test, au_dummy)
+    @test isfile(geojson_path)
+    @test filesize(geojson_path) > 0
+
+    # Cleanup
+    rm(temp_dir; recursive=true, force=true)
+end
+
+@testset "Prediction & Observation Magnitude and PPC Validation" begin
+    # 1. Intercept-Only Model Magnitude Check
+    @testset "Intercept-Only Model Magnitude" begin
+        n_obs = 60
+        true_mu = 4.5
+        y_sim = true_mu .+ randn(n_obs) .* 0.3
+        df_intercept = DataFrame(y = y_sim)
+        
+        m_intercept = @bstm(likelihood(y) ~ 1, df_intercept, verbose=false)
+        chn_intercept = sample(m_intercept, MH(), 150, progress=false)
+        res_intercept = bstm.model_results_comprehensive(m_intercept, chn_intercept)
+        
+        y_obs_vec = res_intercept.predictions.observed
+        pred_denoised = res_intercept.predictions.denoised.mean
+        pred_noisy = res_intercept.predictions.noisy.mean
+        
+        @test length(pred_denoised) == n_obs
+        @test length(pred_noisy) == n_obs
+        @test abs(mean(pred_denoised) - mean(y_obs_vec)) < 0.5
+        @test abs(mean(pred_noisy) - mean(y_obs_vec)) < 0.5
+        @test minimum(pred_denoised) >= minimum(y_obs_vec) - 1.5
+        @test maximum(pred_denoised) <= maximum(y_obs_vec) + 1.5
+        @test res_intercept.metrics.rmse < 1.0
+    end
+
+    # 2. Complex Model (Fixed + Spatiotemporal) Magnitude and PPC Pearson Correlation Check
+    @testset "Complex Model Magnitude and PPC Pearson Correlation" begin
+        p_data, _ = bstm.bstm_data("scottish_lip")
+        df_cplx = p_data.data
+        W_cplx = p_data.au.W
+        
+        m_cplx = @bstm(likelihood(y_gauss) ~ 1 + cov1 + random(s_idx,
+            model=bym2) + random(year, model=ar1), df_cplx, W=W_cplx, verbose=false)
+        chn_cplx = sample(m_cplx, MH(), 150, progress=false)
+        res_cplx = bstm.model_results_comprehensive(m_cplx, chn_cplx)
+        
+        y_obs_vec = res_cplx.predictions.observed
+        pred_denoised = res_cplx.predictions.denoised.mean
+        pred_noisy = res_cplx.predictions.noisy.mean
+        
+        @test abs(mean(pred_denoised) - mean(y_obs_vec)) < 1.0
+        @test abs(mean(pred_noisy) - mean(y_obs_vec)) < 1.0
+        @test abs(std(pred_noisy) - std(y_obs_vec)) < 1.5
+        
+        @test haskey(res_cplx.metrics, :r_pearson)
+        r_val = res_cplx.metrics.r_pearson
+        @test r_val isa Real
+        @test !isnan(r_val)
+        @test !isinf(r_val)
+        @test -1.0 <= r_val <= 1.0
+        calc_r = cor(y_obs_vec, pred_denoised)
+        @test isapprox(r_val, calc_r, atol=1e-6)
+        @test r_val > 0.0
+        
+        plots_res = bstm.bstm_plots(res_cplx, df_cplx; au=p_data.au)
+        @test haskey(plots_res.plots, :posterior_predictive_check)
+        @test haskey(plots_res.plots_data, :posterior_predictive_check)
+        @test res_cplx.metrics.r_pearson == r_val
+    end
+
+    # 3. Poisson with Log Offsets Count-Scale Magnitude Check
+    @testset "Poisson with Log Offsets Magnitude" begin
+        p_data, _ = bstm.bstm_data("scottish_lip")
+        df_lip = p_data.data
+        W_lip = p_data.au.W
+        
+        m_pois = @bstm(likelihood(y_pois, family=poisson,
+            log_offsets=log_offsets) ~ 1 + cov1 + random(s_idx, model=bym2), df_lip,
+            W=W_lip, verbose=false)
+        chn_pois = sample(m_pois, MH(), 100, progress=false)
+        res_pois = bstm.model_results_comprehensive(m_pois, chn_pois)
+        
+        preds_p = res_pois.predictions.denoised.mean
+        @test median(preds_p) > 0.0
+        @test median(preds_p) < 2.0 * maximum(df_lip.y_pois)
+        @test abs(median(preds_p) - median(df_lip.y_pois)) < 25.0
+    end
+
+    # 4. Binomial with Trials Scale Check
+    @testset "Binomial with Trials Magnitude" begin
+        n_obs = 50
+        n_trials = 40
+        true_prob = 0.35
+        y_sim = rand(Distributions.Binomial(n_trials, true_prob), n_obs)
+        df_bin = DataFrame(y = y_sim, trials = fill(n_trials, n_obs))
+        
+        m_bin = @bstm(likelihood(y, family=binomial, trials=trials) ~ 1, df_bin, verbose=false)
+        chn_bin = sample(m_bin, MH(), 100, progress=false)
+        res_bin = bstm.model_results_comprehensive(m_bin, chn_bin)
+        
+        preds_bin = res_bin.predictions.denoised.mean
+        @test abs(mean(preds_bin) - mean(y_sim)) < 6.0
+        @test all(v -> 0.0 <= v <= n_trials, preds_bin)
+    end
+
+    # 5. LogNormal Natural Scale Check
+    @testset "LogNormal Natural Scale Magnitude" begin
+        n_obs = 50
+        true_mu = 1.5
+        y_sim = exp.(true_mu .+ randn(n_obs) .* 0.2)
+        df_ln = DataFrame(y = y_sim)
+        
+        m_ln = @bstm(likelihood(y, family=lognormal) ~ 1, df_ln, verbose=false)
+        chn_ln = sample(m_ln, MH(), 100, progress=false)
+        res_ln = bstm.model_results_comprehensive(m_ln, chn_ln)
+        
+        preds_ln = res_ln.predictions.denoised.mean
+        @test abs(mean(preds_ln) - mean(y_sim)) < 4.0
+        @test minimum(preds_ln) > 0.0
+    end
+
+    # 6. Smooth Model (P-Spline) Magnitude Check
+    @testset "Smooth Model (P-Spline) Magnitude" begin
+        p_data, _ = bstm.bstm_data("scottish_lip")
+        df_lip = p_data.data
+        
+        m_smooth = @bstm(likelihood(y_gauss) ~ 1 + random(cov1, model=pspline), df_lip,
+            verbose=false)
+        chn_smooth = sample(m_smooth, MH(), 100, progress=false)
+        res_smooth = bstm.model_results_comprehensive(m_smooth, chn_smooth)
+        
+        preds_smooth = res_smooth.predictions.denoised.mean
+        @test abs(mean(preds_smooth) - mean(df_lip.y_gauss)) < 2.5
+        @test haskey(res_smooth.effects, :cov1)
+    end
+end

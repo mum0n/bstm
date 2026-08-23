@@ -59,14 +59,17 @@ struct SpectralGP <: ComponentModel
 end
 
 COMPONENT_TYPE_REGISTRY[:spectral_gp] = SpectralGP
+COMPONENT_TYPE_REGISTRY[:spectralgp] = SpectralGP
 COMPONENT_CONSTRUCTORS[:spectral_gp] = (p, params) -> SpectralGP(
-    p.sigma,
-    p.lengthscale,
+    get(p, :sigma, Exponential(1.0)),
+    get(p, :lengthscale, InverseGamma(2.0, 10.0)),
     get(p, :nu, LogNormal(log(1.5), 0.5)),
     string(get(params, :kernel, "matern")),
     get(params, :resolution, 32)
 )
+COMPONENT_CONSTRUCTORS[:spectralgp] = COMPONENT_CONSTRUCTORS[:spectral_gp]
 MODEL_TO_STRUCTURE_MAP[:spectral_gp] = :smooth
+MODEL_TO_STRUCTURE_MAP[:spectralgp] = :smooth
 
 
 function get_precomputes(m::SpectralGP, M::NamedTuple, mod_data::Dict)::NamedTuple
@@ -143,6 +146,7 @@ function get_updates(
     res = m.resolution
     n_dims = spec.hyper.n_dims
 
+    dims_str = join(fill(string(res), n_dims), ", ")
     return """
     # --- SpectralGP Component: $(key) ---
     let
@@ -158,7 +162,7 @@ function get_updates(
         )
         
         # 2. Construct complex Fourier coefficients from standard normal innovations
-        innov_reshaped = reshape($(p_names.ure), $(fill(res, n_dims)...))
+        innov_reshaped = reshape($(p_names.ure), $(dims_str))
         f_tilde_complex = complex.(innov_reshaped)
         f_tilde_scaled = f_tilde_complex .* sqrt.(S_w)
 
@@ -166,7 +170,7 @@ function get_updates(
         latent_field_grid = real.(ifft(f_tilde_scaled)) .* ($(res^(n_dims/2)))
         
         # 4. Interpolate the grid values to the original observation coordinates
-        itp = linear_interpolation(hyper.grid_ranges, latent_field_grid, extrapolation_bc=Flat())
+        itp = linear_interpolation(Tuple(hyper.grid_ranges), latent_field_grid, extrapolation_bc=Interpolations.Flat())
         coords_for_itp = ntuple(d -> hyper.coords[:, d], $(n_dims))
         $(p_names.sre) = itp(coords_for_itp...)
         
@@ -265,10 +269,12 @@ function get_effects(
             latent_field_grid = real.(ifft(f_tilde_scaled)) .* (res^(n_dims/2))
             
             # 4. Interpolate grid values to original coordinates on the CPU
-            itp_s = linear_interpolation(grid_ranges_cpu, latent_field_grid,
-                extrapolation_bc=Flat())
-            coords_for_itp = ntuple(d -> view(coords_full_cpu, :, d), n_dims)
-            effect_k_cpu[:, i] = itp_s(coords_for_itp...)
+            itp_s = linear_interpolation(Tuple(grid_ranges_cpu), latent_field_grid,
+                extrapolation_bc=Interpolations.Flat())
+            for j in 1:N_total_eff
+                pt = ntuple(d -> coords_full_cpu[j, d], n_dims)
+                effect_k_cpu[j, i] = itp_s(pt...)
+            end
         end
         
         push!(structured_effects, effect_k_cpu)
@@ -307,9 +313,10 @@ function anisotropic_matern_spectral_density(freq_grids, sigma, ls, nu, n_dims)
     T = promote_type(typeof(sigma), eltype(ls), typeof(nu))
     ls_vec = ls isa Real ? fill(convert(T, ls), n_dims) : convert(Vector{T}, ls)
     
-    freq_norm_sq = zeros(T, size(freq_grids[1]))
-    for d in 1:n_dims
-        freq_norm_sq .+= (2 * T(pi) .* ls_vec[d] .* freq_grids[d]).^2
+    terms = [(2 * T(pi) .* ls_vec[d] .* freq_grids[d]).^2 for d in 1:n_dims]
+    freq_norm_sq = terms[1]
+    for d in 2:n_dims
+        freq_norm_sq = freq_norm_sq .+ terms[d]
     end
     
     const_factor = (2^n_dims * T(pi)^(n_dims/2) * gamma(nu + n_dims/2) * (2*nu)^nu) / gamma(nu)
@@ -320,7 +327,7 @@ function anisotropic_matern_spectral_density(freq_grids, sigma, ls, nu, n_dims)
     
     base_term = (2*nu) .+ freq_norm_sq
 
-    S_w = total_scaling .* base_term.^(-power_val)
+    S_w = total_scaling .* (base_term .^ (-power_val))
     
     return S_w
 end

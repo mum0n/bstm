@@ -260,7 +260,7 @@ function bstm_Likelihood(
     phi_hurdle = -Inf,
     r_nb = 1.0,
     sigma_y = 1.0,
-    trial::Int = 1,
+    trial = 1,
     censor_lower = -Inf,
     censor_upper = Inf,
     hurdle = -Inf,
@@ -269,6 +269,8 @@ function bstm_Likelihood(
     f_trait = get_model_family(string(family_input))
     
     extract_scalar(x) = x isa AbstractArray ? (isempty(x) ? -Inf : x[1]) : x
+    extract_int(x) = x isa AbstractArray ? (isempty(x) ? 1 : Int(x[1])) : Int(x)
+    tr_s = extract_int(trial)
     w_s = extract_scalar(weight)
     pzi_s = extract_scalar(phi_zi)
     phu_s = extract_scalar(phi_hurdle)
@@ -303,7 +305,7 @@ function bstm_Likelihood(
     return bstm_Likelihood(
         f_trait, param_vec, zi_trait, censor_trait,
         promoted_type(w_s), promoted_type(pzi_s), promoted_type(phu_s),
-        promoted_type(rnb_s), promoted_type(sig_s), trial,
+        promoted_type(rnb_s), promoted_type(sig_s), tr_s,
         yL_val, yU_val, h_val, extra_params
     )
 end

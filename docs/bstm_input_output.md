@@ -49,8 +49,8 @@ The `bstm` framework solves this with a **Two-Tier Decoupled Persistence Archite
         │     save_bstm_model()      │                │    save_bstm_results()     │
         │     save_bstm_bundle()     │                │    save_bstm_bundle()      │
         └─────────────┬──────────────┘                └─────────────┬──────────────┘
-                      │                                              │
-                      ▼                                              ▼
+                      │                                             │
+                      ▼                                             ▼
         ┌────────────────────────────┐                ┌────────────────────────────┐
         │      model_file.jld2       │                │     results.duckdb         │
         │  - Formula & Data          │                │  - model_metadata          │
@@ -61,7 +61,7 @@ The `bstm` framework solves this with a **Two-Tier Decoupled Persistence Archite
         └─────────────┬──────────────┘                │  - plot_data_*             │
                       │                               │  - posterior_samples       │
                       │                               └─────────────┬──────────────┘
-                      │                                              │
+                      │                                             │
         ┌─────────────┴──────────────┐                ┌─────────────┴──────────────┐
         │  load_bstm_model()         │                │  query_duckdb()            │
         │  extend_sampling()         │                │  bma_weighted_predictions()│
@@ -134,7 +134,10 @@ Central comparison table across competing models in `save_model_ensemble`:
 - `waic` (`DOUBLE`): Widely Applicable Information Criterion.
 - `delta_waic` (`DOUBLE`): $\Delta \text{WAIC}_k = \text{WAIC}_k - \min_j \text{WAIC}_j$.
 - `bma_weight` (`DOUBLE`): Normalized Bayesian Model Averaging weight:
-  $$w_k = \frac{\exp(-\frac{1}{2}\Delta \text{WAIC}_k)}{\sum_j \exp(-\frac{1}{2}\Delta \text{WAIC}_j)}$$
+
+  $$
+  w_k = \frac{\exp(-\frac{1}{2}\Delta \text{WAIC}_k)}{\sum_j \exp(-\frac{1}{2}\Delta \text{WAIC}_j)}
+  $$
 
 ---
 
@@ -169,6 +172,21 @@ Loads a saved model from `.jld2` and re-instantiates a live, callable `DynamicPP
 - `chain`: Saved MCMC chain object (or `nothing`).
 - `au`: Spatial areal units object (or `nothing`).
 - `metadata`: Saved metadata dictionary.
+
+#### `extend_sampling`
+```julia
+extend_sampling(model::DynamicPPL.Model, prev_chain, n_additional_samples::Int; 
+                sampler=NUTS(), kwargs...) -> FlexiChain
+```
+Draws `n_additional_samples` from `model` and automatically concatenates them with `prev_chain`.
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `model` | `DynamicPPL.Model` | *Required* | Instantiated, callable Turing model. |
+| `prev_chain` | `Any` | *Required* | Existing MCMC chain (e.g. from `load_bstm_model(filepath).chain`). |
+| `n_additional_samples` | `Int` | *Required* | Number of additional MCMC iterations to draw. |
+| `sampler` | `InferenceAlgorithm` | `NUTS()` | Sampler algorithm (e.g. `NUTS(100, 0.80)`). |
+| `kwargs...` | `Any` | - | Additional keyword options passed to `sample()`. |
 
 ---
 
@@ -361,7 +379,8 @@ display(first(df_bma, 5))
 
 ### Workflow 4: Zero-Copy Parquet Export for Python / R Data Pipelines
 
-Export high-volume posterior predictions and spatial effects to compressed Parquet files for downstream processing in Python (Polars / PyArrow) or R (arrow / sf):
+Export high-volume posterior predictions and spatial effects to compressed Parquet files for
+downstream processing in Python (Polars / PyArrow) or R (arrow / sf):
 
 ```julia
 # Export specific tables directly from DuckDB to Parquet
@@ -371,6 +390,90 @@ export_results_to_parquet("output/scot_model.duckdb", "plot_data_sre_spatial", "
 # Compact and optimize database
 compact_duckdb("output/scot_model.duckdb")
 ```
+
+---
+
+### Workflow 5: Resuming and Extending MCMC Sampling (`extend_sampling`)
+
+In Bayesian computation, initial or pilot sampling runs (e.g., 200 iterations) may reveal insufficient Effective Sample Size ($\text{ESS}$) or higher Monte Carlo Standard Error ($\text{MCSE}$) for high-dimensional spatial variance parameters. `extend_sampling` allows resuming and appending additional MCMC draws from a serialized model without re-initializing or re-specifying the model formula:
+
+```julia
+using bstm, DataFrames
+
+# 1. Load the persisted model bundle from disk (containing model, chain, and au)
+bundle = load_bstm_model("output/scot_model.jld2")
+m = bundle.model
+chn_init = bundle.chain
+au = bundle.au
+
+println("Initial sample count: ", size(chn_init, 1))
+
+# 2. Extend sampling by drawing 500 additional MCMC iterations
+chn_extended = extend_sampling(
+    m, chn_init, 500;
+    sampler = NUTS(100, 0.80),
+    progress = false
+)
+
+println("Extended sample count: ", size(chn_extended, 1))
+
+# 3. Reconstruct comprehensive post-processed results from the extended chain
+res_extended = model_results_comprehensive(m, chn_extended; au=au)
+
+# 4. Overwrite and update the saved bundle and DuckDB tables
+save_bstm_bundle("output/scot_model", m, chn_extended, res_extended; au=au)
+```
+
+---
+
+### Workflow 6: Multi-Tier DAG Pipeline Persistence (`bstm_pipeline`)
+
+Declarative multi-tier pipelines persist every model tier, observation data, and canonical
+harmonized predictions directly into DuckDB:
+
+```julia
+pipe_res = bstm_pipeline(
+    :depth     => (formula = "likelihood(depth) ~ intercept() + random(s_x, s_y, model=rff)", data = df_bathy, derivatives = [:slope, :curvature, :bpi]),
+    :substrate => (formula = "likelihood(grain) ~ intercept() + fixed(depth_mu, error_sd=:depth_sd) + random(s_idx, model=bym2)", data = df_sub, au = au_sub),
+    :biology   => (formula = "likelihood(catch, family=gamma) ~ intercept() + fixed(grain_mu, error_sd=:grain_sd) + random(s_idx, model=bym2)", data = df_bio, au = au_master);
+    master_au = au_master,
+    duckdb_path = "project_db/pipeline.duckdb",
+    geojson_path = "project_gis/master_habitat.geojson"
+)
+
+# SQL Query on Harmonized Summary Table
+df_master = query_duckdb("project_db/pipeline.duckdb", """
+    SELECT unit_id, centroid_x, centroid_y, area, depth_mu, grain_mu, biology_mu
+    FROM master_harmonized_summary
+    WHERE biology_mu > 100.0
+    ORDER BY biology_mu DESC
+""")
+display(df_master)
+```
+
+For full details, see [**Integrated Hierarchical Workflows & ADR Telemetry** (`docs/hierarchical_workflow/hierarchical_workflow.md`)](hierarchical_workflow/hierarchical_workflow.md).
+
+---
+
+### Workflow 7: Mark-Recapture Telemetry & ADR Persistence
+
+Persist animal tracking encounters, spatiotemporal survey abundance, and transition probability
+matrices into DuckDB:
+
+```julia
+# Ingest telemetry encounters and survey data
+save_bstm_bundle("output/adr_model", m_adr, chn_adr, res_adr; au=au_spatial)
+
+# SQL analysis on movement parameters and tag recovery rates
+df_recovery = query_duckdb("output/adr_model.duckdb", """
+    SELECT s_idx, COUNT(DISTINCT tagid) AS releases, SUM(tag) AS recaptures
+    FROM telemetry_encounters
+    GROUP BY s_idx
+""")
+display(df_recovery)
+```
+
+For full details, see [**Integrated Hierarchical Workflows & ADR Telemetry** (`docs/hierarchical_workflow/hierarchical_workflow.md`)](hierarchical_workflow/hierarchical_workflow.md).
 
 ---
 

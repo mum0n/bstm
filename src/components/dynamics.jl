@@ -155,20 +155,34 @@ function get_precomputes(
 
     if W_provided
         # --- Graph-based method (W is provided) ---
-        if length(variables) < 2
+        if length(variables) == 1 && haskey(M, :s_idx) && haskey(M, :t_idx) && !isempty(M.s_idx) && !isempty(M.t_idx)
+            W = M.W
+            s_N = size(W, 1)
+            s_idx = M.s_idx
+            t_idx = M.t_idx
+            t_N = length(unique(t_idx))
+            centroids = get(M, :centroids, nothing)
+        elseif length(variables) >= 2
+            spatial_idx_var_sym = Symbol(variables[1])
+            temporal_idx_var_sym = Symbol(variables[2])
+
+            W = M.W
+            s_N = size(W, 1)
+            
+            if !hasproperty(data, spatial_idx_var_sym)
+                error("Spatial index variable ':$spatial_idx_var_sym' not found for graph-based dynamics.")
+            end
+            s_idx = data[!, spatial_idx_var_sym]
+            
+            if !hasproperty(data, temporal_idx_var_sym)
+                error("Temporal index variable ':$temporal_idx_var_sym' not found.")
+            end
+            t_idx = data[!, temporal_idx_var_sym]
+            t_N = length(unique(t_idx))
+            centroids = get(M, :centroids, nothing)
+        else
             error("Graph-based dynamics requires at least two positional arguments: a spatial index and a temporal index.")
         end
-        spatial_idx_var_sym = Symbol(variables[1])
-        temporal_idx_var_sym = Symbol(variables[2])
-
-        W = M.W
-        s_N = size(W, 1)
-        
-        if !hasproperty(data, spatial_idx_var_sym)
-            error("Spatial index variable ':$spatial_idx_var_sym' not found for graph-based dynamics.")
-        end
-        s_idx = data[!, spatial_idx_var_sym]
-        centroids = get(M, :centroids, nothing) # Pass through if available
     else
         # --- Continuous/Grid-based method (W is not provided) ---
         @info "Adjacency matrix 'W' not provided for Dynamics component. Creating a regular grid from coordinates."
@@ -193,10 +207,10 @@ function get_precomputes(
         grid_y = range(minimum(y_coords), maximum(y_coords), length=res)
         
         W_grid = spzeros(Int, s_N, s_N)
-        centroids_grid = Vector{Point2D}(undef, s_N)
+        centroids_grid = Tuple{Float64, Float64}[]
         for c in 1:res, r in 1:res
             idx = (c-1)*res + r
-            centroids_grid[idx] = Point2D(grid_x[r], grid_y[c])
+            push!(centroids_grid, (grid_x[r], grid_y[c]))
             for dr in -1:1, dc in -1:1
                 if dr == 0 && dc == 0
                     continue
@@ -225,15 +239,13 @@ function get_precomputes(
             s_idx_new[i] = (best_c-1)*res + best_r
         end
         s_idx = s_idx_new
-    end
 
-    # Common temporal setup
-    temporal_idx_var_sym = W_provided ? Symbol(variables[2]) : Symbol(variables[3])
-    if !hasproperty(data, temporal_idx_var_sym)
-        error("Temporal index variable ':$temporal_idx_var_sym' not found.")
+        if !hasproperty(data, temporal_idx_var_sym)
+            error("Temporal index variable ':$temporal_idx_var_sym' not found.")
+        end
+        t_idx = data[!, temporal_idx_var_sym]
+        t_N = length(unique(t_idx))
     end
-    t_idx = data[!, temporal_idx_var_sym]
-    t_N = length(unique(t_idx))
 
     # Process grid areas
     if haskey(params, :grid_areas)

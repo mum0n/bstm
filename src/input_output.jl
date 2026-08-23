@@ -18,7 +18,6 @@ using Dates, Printf
                     chain=nothing, au=nothing, metadata::Dict=Dict(), compress::Bool=true)
 
 Saves the complete state of a `bstm` model `m` and optional posterior `chain` to a JLD2 file.
-"""
 
 # Arguments
 - `filepath::AbstractString`: Path to output file (should end with `.jld2` or `.bstm`).
@@ -299,10 +298,8 @@ function save_bstm_results(
             wkt_vec = String[_polygon_to_wkt(polys[i]) for i in 1:min(S, length(polys))]
             cx_vec = Float64[cents[i][1] for i in 1:S]
             cy_vec = Float64[cents[i][2] for i in 1:S]
-            area_vec = hasproperty(au, :areas) && length(au.areas) == S ? Float64.(au.areas)
-              : fill(NaN, S)
-            pt_cnt = hasproperty(au, :point_counts) && length(au.point_counts) == S ?
-              Int.(au.point_counts) : fill(0, S)
+            area_vec = (hasproperty(au, :areas) && length(au.areas) == S) ? Float64.(au.areas) : fill(NaN, S)
+            pt_cnt = (hasproperty(au, :point_counts) && length(au.point_counts) == S) ? Int.(au.point_counts) : fill(0, S)
 
             df_geom = DataFrame(
                 unit_id = 1:S,

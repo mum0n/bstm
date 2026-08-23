@@ -164,10 +164,39 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
 
     L_template = build_structure_template(:besag, s_N; W=W).matrix
     
-    W_dir = tril(W, -1)
-    out_degree = sum(W_dir, dims=2)[:]
-    D_inv = spdiagm(0 => 1.0 ./ (out_degree .+ 1e-9))
-    A_template = D_inv * W_dir
+    rel_type = get(params, :relationship, get(params, :habitat_relationship, :exponential))
+    local A_template
+    if !isnothing(habitat_data)
+        # Directed advection operator derived from Habitat Suitability Index (HSI) gradient
+        W_dir = spzeros(Float64, s_N, s_N)
+        rows = rowvals(W)
+        vals = nonzeros(W)
+        for i in 1:s_N
+            for j_idx in nzrange(W, i)
+                j = rows[j_idx]
+                if i != j
+                    diff_h = habitat_data[j] - habitat_data[i]
+                    if diff_h > 0.0
+                        if rel_type == :exponential
+                            W_dir[i, j] = vals[j_idx] * exp(diff_h)
+                        elseif rel_type == :logistic
+                            W_dir[i, j] = vals[j_idx] / (1.0 + exp(-diff_h * 4.0))
+                        else # :linear
+                            W_dir[i, j] = vals[j_idx] * diff_h
+                        end
+                    end
+                end
+            end
+        end
+        out_degree = sum(W_dir, dims=2)[:]
+        D_inv = spdiagm(0 => [od > 1e-12 ? 1.0 / od : 0.0 for od in out_degree])
+        A_template = D_inv * W_dir
+    else
+        W_dir = tril(W, -1)
+        out_degree = sum(W_dir, dims=2)[:]
+        D_inv = spdiagm(0 => 1.0 ./ (out_degree .+ 1e-9))
+        A_template = D_inv * W_dir
+    end
 
     precomputes = Dict{Symbol, Any}(
         :L_template => L_template,
@@ -259,7 +288,7 @@ function get_priors(
         push!(priors, "$(p_names.beta_het) ~ $(_distribution_to_string(m.beta_het))")
     end
     
-    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+    push!(priors, "$(p_names.ure) ~ MvNormal(zeros($(spec.hyper.n_latent)), I)")
 
     return join(priors, "\n    ")
 end
@@ -279,7 +308,6 @@ v1.0.0
 - `arch::String`: The model architecture (`"univariate"` or `"multivariate"`).
 - `outcome_idx::Union{Int, Nothing}`: The index of the outcome variable.
 - `M::NamedTuple`: The main model configuration.
-"""
 
 # Returns
 - A `String` containing the generated Turing code for the component's updates.
@@ -309,8 +337,8 @@ function get_updates(
         T_num_dyn = eltype(diffusion_field)
         dyn_field = zeros(T_num_dyn, $(hyper.s_N), $(hyper.t_N))
         innov_matrix = reshape($(p_names.ure), $(hyper.s_N), $(hyper.t_N))
-        L_op = spec_registry[:$(key)].hyper.L_template
-        A_op = spec_registry[:$(key)].hyper.A_template
+        L_op = Matrix(spec_registry[:$(key)].hyper.L_template)
+        A_op = Matrix(spec_registry[:$(key)].hyper.A_template)
     """
 
     has_reaction = !isnothing(m.r) && !isnothing(m.K)
@@ -319,16 +347,14 @@ function get_updates(
         """
         # Implicit Euler method (numerically stable, not AD-friendly, no reaction term)
         for t in 2:$(hyper.t_N)
-            propagator_t = lu(I($(hyper.s_N)) - $(p_names.velocity) * A_op - Diagonal(diffusion_field) * L_op)
+            propagator_t = lu(Matrix(I($(hyper.s_N))) - $(p_names.velocity) * A_op - Diagonal(diffusion_field) * L_op)
             dyn_field[:, t] = (propagator_t \\ dyn_field[:, t-1]) + innov_matrix[:, t]
         end
         """
     elseif m.method == :explicit
-        reaction_term_code = has_reaction ? "+ ($(p_names.r) .* dyn_field[:, t-1] .* (1.0 .-
-          dyn_field[:, t-1] ./ $(p_names.K)))" : ""
         """
         # Explicit Euler method (AD-friendly, conditionally stable)
-        propagator_t = $(p_names.velocity) * A_op + Diagonal(diffusion_field) * L_op
+        propagator_t = $(p_names.velocity) .* A_op .+ Diagonal(diffusion_field) * L_op
         for t in 2:$(hyper.t_N)
             ad_diff_term = propagator_t * dyn_field[:, t-1]
             reaction_term = $(has_reaction ? "$(p_names.r) .* dyn_field[:, t-1] .* (1.0 .- dyn_field[:, t-1] ./ $(p_names.K))" : "zeros(T_num_dyn, $(hyper.s_N))")
@@ -343,9 +369,9 @@ function get_updates(
     if hasproperty(hyper, :mark_recapture_data)
         telemetry_likelihood_code = """
         # --- Mark-Recapture Telemetry Likelihood ---
-        M_prop_tlm = I($(hyper.s_N)) - $(p_names.velocity) * A_op - Diagonal(diffusion_field) * L_op
+        M_prop_tlm = Matrix(I($(hyper.s_N))) .- ($(p_names.velocity) .* A_op) .- (Diagonal(diffusion_field) * L_op)
         
-        # Pre-factorize the transposed propagator for repeated solves.
+        # Pre-factorize the transposed propagator for repeated solves using generic dense LU.
         F_prop_T = lu(transpose(M_prop_tlm))
 
         for m_idx in 1:size(spec_registry[:$(key)].hyper.mark_recapture_data, 1)
@@ -356,10 +382,6 @@ function get_updates(
             
             local p_unnorm
             if time_steps > 0
-                # To get the u_rel-th row of inv(M_prop_tlm)^k, we solve
-                # (M_prop_tlm')^k * x = e_urel, where e_urel is a basis vector.
-                # This is done by k successive linear solves using the pre-computed LU
-                #   factorization.
                 e_urel = zeros(T_num_dyn, $(hyper.s_N))
                 e_urel[u_rel] = 1.0
                 
@@ -369,13 +391,12 @@ function get_updates(
                 end
                 p_unnorm = y
             else
-                # If time_steps is 0, transition is from a unit to itself with prob 1.
                 p_unnorm = zeros(T_num_dyn, $(hyper.s_N))
                 p_unnorm[u_rel] = 1.0
             end
 
             indiv_scaling = exp($(p_names.beta_het) * cov_m)
-            p_unnorm_scaled = p_unnorm .^ indiv_scaling
+            p_unnorm_scaled = abs.(p_unnorm) .^ indiv_scaling
             p_norm = p_unnorm_scaled / (sum(p_unnorm_scaled) + 1e-15)
             Turing.@addlogprob! log(max(p_norm[u_rec], 1e-12))
         end

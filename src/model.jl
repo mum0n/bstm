@@ -1343,7 +1343,10 @@ v1.0.0
 """
 function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multivariate::Bool,
     eta_name::String)
-    if get(M, :model_st, "none") == "none" 
+    has_composed_kronecker = any(spec -> hasproperty(spec, :component_obj) && 
+        spec.component_obj isa Composed && spec.component_obj.operator == :kronecker_product,
+        get(M, :components, []))
+    if has_composed_kronecker || get(M, :model_st, "none") == "none" 
         return ""
     end
 
@@ -1360,13 +1363,14 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
 
     K = get(M, :outcomes_N, 1)
 
-    if is_multivariate
-        interaction_code = """
-    # --- Spatiotemporal Interaction Priors ---
-    local st_sigma_prior_dist_str = haskey(M, :sigma_st_interaction_prior) ?
+    st_sigma_prior_dist_str = haskey(M, :sigma_st_interaction_prior) ?
       _distribution_to_string(M.sigma_st_interaction_prior) : (haskey(M,
       :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) :
       "Exponential(1.0)")
+
+    if is_multivariate
+        interaction_code = """
+    # --- Spatiotemporal Interaction Priors ---
     sigma_st_interaction ~ NamedDist(filldist($(st_sigma_prior_dist_str), $K),
       :sigma_st_interaction)
     
@@ -1400,10 +1404,6 @@ function _generate_st_interaction_block(M::NamedTuple, s_spec, t_spec, is_multiv
     else
         interaction_code = """
     # --- Spatiotemporal Interaction Priors ---
-    local st_sigma_prior_dist_str = haskey(M, :sigma_st_interaction_prior) ?
-      _distribution_to_string(M.sigma_st_interaction_prior) : (haskey(M,
-      :st_interaction_sigma_prior) ? _distribution_to_string(M.st_interaction_sigma_prior) :
-      "Exponential(1.0)")
     sigma_st_interaction ~ NamedDist($(st_sigma_prior_dist_str), :sigma_st_interaction)
 
     ure_st_interaction ~ NamedDist(MvNormal(fill!(Array{T}(undef, M.s_N * M.t_N), 0), I),
@@ -1622,6 +1622,53 @@ function _process_fixed_effects!(M::Dict, fixed_effects_vars::Vector{String})
     M[:Xfixed_N] = size(M[:Xfixed], 2)
     M[:Xfixed_names] = size(Xfixed_named, 2) > 0 ? names(Xfixed_named, 2) : Symbol[]
     M[:Xfixed_applied_formula] = applied_formula
+
+    # Process Errors-in-Variables (EIV) standard deviations
+    eiv_dict = get(M, :fixed_effects_eiv, Dict{Symbol, Any}())
+    eiv_map = Dict{Symbol, Vector{Float64}}()
+
+    if !isempty(eiv_dict) && !isempty(M[:Xfixed_names])
+        for col_sym in M[:Xfixed_names]
+            col_str = string(col_sym)
+            base_sym = Symbol(replace(col_str, r"^.*:" => ""))
+            matched_key = if haskey(eiv_dict, col_sym)
+                col_sym
+            elseif haskey(eiv_dict, base_sym)
+                base_sym
+            else
+                nothing
+            end
+
+            if !isnothing(matched_key)
+                err_spec = eiv_dict[matched_key]
+                sd_vec = if err_spec isa Symbol
+                    if hasproperty(M[:data], err_spec)
+                        Vector{Float64}(M[:data][!, err_spec])
+                    else
+                        error("Errors-in-Variables error_sd column :$err_spec not found in model DataFrame.")
+                    end
+                elseif err_spec isa AbstractString
+                    sd_sym = Symbol(err_spec)
+                    if hasproperty(M[:data], sd_sym)
+                        Vector{Float64}(M[:data][!, sd_sym])
+                    else
+                        error("Errors-in-Variables error_sd column '$err_spec' not found in model DataFrame.")
+                    end
+                elseif err_spec isa Real
+                    fill(Float64(err_spec), M[:y_N])
+                elseif err_spec isa AbstractVector
+                    if length(err_spec) != M[:y_N]
+                        error("Errors-in-Variables error_sd vector length ($(length(err_spec))) does not match data row count ($(M[:y_N])).")
+                    end
+                    Vector{Float64}(err_spec)
+                else
+                    error("Unsupported error_sd specification for Errors-in-Variables: $(typeof(err_spec))")
+                end
+                eiv_map[col_sym] = sd_vec
+            end
+        end
+    end
+    M[:Xfixed_eiv_map] = eiv_map
 end
 
 
@@ -2299,7 +2346,7 @@ function _bstm_error_handler(e, model)
     println("\n--- Suggested Debugging Steps ---")
     try
         formula_str = model.args.M.formula
-        lhs, rhs_raw = split(formula_str, '~')
+        lhs, rhs_raw = Base.split(formula_str, '~')
         lhs = Base.strip(lhs)
 
         rhs_normalized = replace(Base.strip(rhs_raw), r"\s*-\s*" => " + -")
@@ -2753,11 +2800,20 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     end
 
     for spec in M.components
-        if get(M, :is_multivariate_dynamics,
-            false) && string(spec.key) == M[:multivariate_dynamics_key]
+        if get(M, :is_multivariate_dynamics, false) && string(spec.key) == M[:multivariate_dynamics_key]
             continue
         end
         spec_registry[spec.key] = spec
+        if hasproperty(spec, :hyper) && hasproperty(spec.hyper, :child_specs)
+            for cs in spec.hyper.child_specs
+                spec_registry[cs.key] = cs
+                if hasproperty(cs, :hyper) && hasproperty(cs.hyper, :child_specs)
+                    for gcs in cs.hyper.child_specs
+                        spec_registry[gcs.key] = gcs
+                    end
+                end
+            end
+        end
         for k in 1:outcomes_N
             outcome_idx = is_multivariate ? k : nothing
             push!(priors_acc, get_priors(spec.component_obj, spec, arch, outcome_idx, M))
@@ -2879,10 +2935,10 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
     end
 
     # Handle standard components.
-    model_name = if haskey(m_params, :model)
-        m_params[:model] isa Symbol ? m_params[:model] : Symbol(m_params[:model])
-    elseif haskey(COMPONENT_CONSTRUCTORS, m_type)
+    model_name = if haskey(COMPONENT_CONSTRUCTORS, m_type)
         m_type
+    elseif haskey(m_params, :model)
+        m_params[:model] isa Symbol ? m_params[:model] : Symbol(m_params[:model])
     else
         # Infer default model based on the structure if no model is specified.
         if m_type == :spatial
@@ -4799,7 +4855,7 @@ function _distribution_to_string(d::Distribution)
     elseif d isa Normal
         return "$(dist_name)($(mean(d)), $(std(d)))"
     elseif d isa LogNormal
-        return "$(dist_name)($(meanlog(d)), $(stdlog(d)))"
+        return "$(dist_name)($(d.μ), $(d.σ))"
     elseif d isa Beta
         # Access alpha and beta parameters directly for Beta distribution
         return "$(dist_name)($(d.α), $(d.β))"
@@ -5899,13 +5955,42 @@ function _generate_univariate_likelihood_block(M::NamedTuple)
         push!(kwargs_parts, "hurdle=M.hurdle[:, 1]")
     end
 
-    kwargs_str = join(kwargs_parts, ", ")
+    has_obs_vec_kw = get(M, :user_provided_trials, false) ||
+                     get(M, :user_provided_weights, false) ||
+                     get(M, :user_provided_censor_lower, false) ||
+                     get(M, :user_provided_censor_upper, false) ||
+                     get(M, :user_provided_hurdle, false)
 
-    block_content = """
+    block_content = if has_obs_vec_kw
+        kwargs_parts_i = String[]
+        for p in kwargs_parts
+            if startswith(p, "trial=")
+                push!(kwargs_parts_i, "trial=M.trials[i, 1]")
+            elseif startswith(p, "weight=")
+                push!(kwargs_parts_i, "weight=M.weights[i, 1]")
+            elseif startswith(p, "censor_lower=")
+                push!(kwargs_parts_i, "censor_lower=M.censor_lower[i, 1]")
+            elseif startswith(p, "censor_upper=")
+                push!(kwargs_parts_i, "censor_upper=M.censor_upper[i, 1]")
+            elseif startswith(p, "hurdle=")
+                push!(kwargs_parts_i, "hurdle=M.hurdle[i, 1]")
+            else
+                push!(kwargs_parts_i, p)
+            end
+        end
+        kwargs_i_str = join(kwargs_parts_i, ", ")
+        """
+        $(extra_param_logic)
+        log_lik_sum = sum(i -> Distributions.logpdf(bstm_Likelihood($(family_symbol), eta[i]; $(kwargs_i_str)), M.y_obs[i]), 1:length(eta))
+        """
+    else
+        kwargs_str = join(kwargs_parts, ", ")
+        """
         $(extra_param_logic)
         d_lik_vec = bstm_Likelihood.($(family_symbol), eta; $(kwargs_str))
         log_lik_sum = sum(Distributions.logpdf.(d_lik_vec, M.y_obs))
-    """
+        """
+    end
     return """
     let
         local log_lik_sum
@@ -6230,6 +6315,8 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
     n_npo = length(npo_indices)
     K_ordinal = is_ordinal ? get(M.likelihood_specs[1], :K, 0) : 0
 
+    eiv_map = hasproperty(M, :Xfixed_eiv_map) ? M.Xfixed_eiv_map : Dict{Symbol, Vector{Float64}}()
+
     prior_parts = String[]
     update_parts = String[]
  
@@ -6242,7 +6329,7 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
         n_params_prop = is_multivariate ? n_prop * M.outcomes_N : n_prop
         prior_label = is_multivariate ? :beta_flat : :beta
 
-        # Generate prior string
+        # Generate prior string for coefficients
         if all_same_prop
             prior_str = _distribution_to_string(priors_prop[1])
             push!(prior_parts, "$(beta_prop_name) ~ DynamicPPL.NamedDist(filldist($(prior_str), $(n_params_prop)), $(QuoteNode(prior_label)))")
@@ -6250,17 +6337,49 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
             priors_to_use = is_multivariate ? vcat([priors_prop for _ in 1:M.outcomes_N]...) : priors_prop
             priors_str_list = [_distribution_to_string(p) for p in priors_to_use]
             push!(prior_parts,
-                "$(beta_prop_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ",
-                "))]), $(QuoteNode(prior_label)))")
+                "$(beta_prop_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ", "))]), $(QuoteNode(prior_label)))")
         end
 
-        # Generate update string
-        update_code = if is_multivariate
-            "$(eta_name) = $(eta_name) .+ M.Xfixed[:, $(prop_indices)] * reshape($(beta_prop_name), $(n_prop), M.outcomes_N)"
-        else
-            "$(eta_name) = $(eta_name) .+ M.Xfixed[:, $(prop_indices)] * $(beta_prop_name)"
+        # Identify EIV and non-EIV columns
+        eiv_prop_indices = [j for j in prop_indices if haskey(eiv_map, M.Xfixed_names[j])]
+        std_prop_indices = [j for j in prop_indices if !haskey(eiv_map, M.Xfixed_names[j])]
+
+        # Generate latent innovation priors for EIV covariates
+        for j in eiv_prop_indices
+            col_name = M.Xfixed_names[j]
+            push!(prior_parts, "ure_eiv_$(col_name) ~ DynamicPPL.NamedDist(filldist(Normal(0, 1), N), $(QuoteNode(Symbol("ure_eiv_$(col_name)"))))")
         end
-        push!(update_parts, update_code)
+
+        # Standard (non-EIV) linear update
+        if !isempty(std_prop_indices)
+            update_code = if is_multivariate
+                "$(eta_name) = $(eta_name) .+ M.Xfixed[:, $(std_prop_indices)] * reshape($(beta_prop_name), $(n_prop), M.outcomes_N)[$(std_prop_indices), :]"
+            else
+                "$(eta_name) = $(eta_name) .+ M.Xfixed[:, $(std_prop_indices)] * $(beta_prop_name)[$(std_prop_indices)]"
+            end
+            push!(update_parts, update_code)
+        end
+
+        # EIV latent linear update
+        for j in eiv_prop_indices
+            col_name = M.Xfixed_names[j]
+            if is_multivariate
+                eiv_code = """
+                let
+                    X_lat_$(col_name) = M.Xfixed[:, $(j)] .+ M.Xfixed_eiv_map[$(QuoteNode(col_name))] .* ure_eiv_$(col_name)
+                    beta_j = reshape($(beta_prop_name), $(n_prop), M.outcomes_N)[$(j), :]
+                    $(eta_name) = $(eta_name) .+ X_lat_$(col_name) * beta_j'
+                end"""
+                push!(update_parts, eiv_code)
+            else
+                eiv_code = """
+                let
+                    X_lat_$(col_name) = M.Xfixed[:, $(j)] .+ M.Xfixed_eiv_map[$(QuoteNode(col_name))] .* ure_eiv_$(col_name)
+                    $(eta_name) = $(eta_name) .+ X_lat_$(col_name) .* $(beta_prop_name)[$(j)]
+                end"""
+                push!(update_parts, eiv_code)
+            end
+        end
     end
 
     # --- Non-Proportional Effects (for Ordinal Models) ---
@@ -6650,6 +6769,7 @@ function process_fixed_module!(opt_dict, mod_data, registries, hyperpriors)
     get!(opt_dict, :contrasts, Dict{Symbol, Any}())
     get!(opt_dict, :fixed_effects_priors, Dict{Symbol, Any}())
     get!(opt_dict, :vars_to_categorize, Set{Symbol}())
+    get!(opt_dict, :fixed_effects_eiv, Dict{Symbol, Any}())
     
     params = mod_data[:params]
     vars = mod_data[:variables]
@@ -6657,6 +6777,14 @@ function process_fixed_module!(opt_dict, mod_data, registries, hyperpriors)
     # Collect all variables specified in this fixed() call.
     for var in vars
         push!(opt_dict[:fixed_effects_from_modules], string(var))
+    end
+
+    # Handle Errors-in-Variables (EIV) error standard deviations.
+    if haskey(params, :error_sd) || haskey(params, :sd_error) || haskey(params, :se)
+        eiv_spec = get(params, :error_sd, get(params, :sd_error, get(params, :se, nothing)))
+        for var in vars
+            opt_dict[:fixed_effects_eiv][Symbol(var)] = eiv_spec
+        end
     end
 
     # Handle custom contrast coding.

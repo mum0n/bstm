@@ -57,7 +57,9 @@ For each region $s \in \{1, \dots, S\}$ with population $N_s$:
 
 The **spatial force of infection** $\lambda_{s, t-1}$ acting upon susceptible individuals in region $s$ combines within-region contact transmission and geographic spillover from adjacent regions via the row-standardized spatial weights matrix $W_{\text{std}}$:
 
-$$\lambda_{s, t-1} = \beta_{\text{local}} \cdot \frac{I_{s, t-1}}{N_s} + \beta_{\text{spatial}} \sum_{j=1}^S W_{\text{std}, sj} \cdot \frac{I_{j, t-1}}{N_j}$$
+$$
+\lambda_{s, t-1} = \beta_{\text{local}} \cdot \frac{I_{s, t-1}}{N_s} + \beta_{\text{spatial}} \sum_{j=1}^S W_{\text{std}, sj} \cdot \frac{I_{j, t-1}}{N_j}
+$$
 
 where:
 - $\beta_{\text{local}} > 0$: Transmission rate within the host region.
@@ -69,26 +71,54 @@ where:
 Over discrete time interval $\Delta t = 1$:
 
 1. **New Infections ($S \to E$)**:
-   $$\Delta N_{S \to E, s, t} \approx \lambda_{s, t-1} \cdot S_{s, t-1}$$
+
+   $$
+   \Delta N_{S \to E, s, t} \approx \lambda_{s, t-1} \cdot S_{s, t-1}
+   $$
+
 2. **Latent Progression ($E \to I$)** with incubation rate $\sigma_{\text{lat}} = 1 / \tau_{\text{inc}}$:
-   $$\Delta N_{E \to I, s, t} \approx \sigma_{\text{lat}} \cdot E_{s, t-1}$$
+
+   $$
+   \Delta N_{E \to I, s, t} \approx \sigma_{\text{lat}} \cdot E_{s, t-1}
+   $$
+
 3. **Recovery ($I \to R$)** with recovery rate $\gamma_{\text{rec}} = 1 / \tau_{\text{inf}}$:
-   $$\Delta N_{I \to R, s, t} \approx \gamma_{\text{rec}} \cdot I_{s, t-1}$$
+
+   $$
+   \Delta N_{I \to R, s, t} \approx \gamma_{\text{rec}} \cdot I_{s, t-1}
+   $$
 
 #### Recursive State Equations:
-$$S_{s, t} = S_{s, t-1} - \Delta N_{S \to E, s, t}$$
-$$E_{s, t} = E_{s, t-1} + \Delta N_{S \to E, s, t} - \Delta N_{E \to I, s, t}$$
-$$I_{s, t} = I_{s, t-1} + \Delta N_{E \to I, s, t} - \Delta N_{I \to R, s, t}$$
-$$R_{s, t} = R_{s, t-1} + \Delta N_{I \to R, s, t}$$
+
+$$
+S_{s, t} = S_{s, t-1} - \Delta N_{S \to E, s, t}
+$$
+
+$$
+E_{s, t} = E_{s, t-1} + \Delta N_{S \to E, s, t} - \Delta N_{E \to I, s, t}
+$$
+
+$$
+I_{s, t} = I_{s, t-1} + \Delta N_{E \to I, s, t} - \Delta N_{I \to R, s, t}
+$$
+
+$$
+R_{s, t} = R_{s, t-1} + \Delta N_{I \to R, s, t}
+$$
 
 ### 2.3. Observation Likelihood
 
 Public health surveillance systems observe confirmed cases $y_{s, t}$, which represent newly symptomatic infectious individuals subject to reporting coverage $\rho_{\text{rep}} \in (0, 1)$ and overdispersion:
 
-$$\mathbb{E}[y_{s, t}] = \rho_{\text{rep}} \cdot \Delta N_{E \to I, s, t}$$
+$$
+\mathbb{E}[y_{s, t}] = \rho_{\text{rep}} \cdot \Delta N_{E \to I, s, t}
+$$
 
 In the linear predictor link scale:
-$$\eta_{s, t} = \log\left( \max\left(\rho_{\text{rep}} \cdot \Delta N_{E \to I, s, t}, 10^{-6}\right) \right) + \phi_s$$
+
+$$
+\eta_{s, t} = \log\left( \max\left(\rho_{\text{rep}} \cdot \Delta N_{E \to I, s, t}, 10^{-6}\right) \right) + \phi_s
+$$
 
 where $\phi_s \sim \operatorname{BYM2}(W)$ accounts for unmodeled residual spatial clustering.
 

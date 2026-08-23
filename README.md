@@ -42,6 +42,16 @@ Inspired by high-level formula interfaces like R's `brms` and `INLA`, `bstm` pro
 - **Spatial Block Cross-Validation (`bstm_cv_orchestrator`)**:
   Assesses out-of-sample generalization using `:spatial_block`, `:temporal_block`, `:lolo` (leave-one-location-out), and `:temporal_forward_chain` to prevent spatial autocorrelation leakage.
 
+- **Modular Bayesian DAG Pipeline & Cross-Mesh Resharding (`src/pipeline.jl`)**:
+  - Declarative workflow orchestrator (`bstm_pipeline`) running sequential multi-tier cut-posterior models.
+  - Linear geometric transfer operators ($P \in \mathbb{R}^{N_{\text{dest}} \times N_{\text{src}}}$) mapping spatial latent fields across mismatched irregular polygonal tessellations via `:area_weighted`, `:gaussian_kernel`, and `:inverse_distance` weighting (`compute_network_transfer_matrix`).
+  - Full Monte Carlo sample matrix transformation ($U_{\text{dest}} = P U_{\text{src}}$) preserving non-Gaussian posterior geometry (`reshard_spatial_field`, `summarize_sample_matrix`).
+  - Canonical master mesh harmonization across all tiers with automated DuckDB persistence.
+- **Continuous Surface Derivatives & Differential Geometry (`src/derivatives.jl`)**:
+  - Exact analytical gradients ($\nabla z$), geomorphometric slopes ($\|\nabla z\|$, $\arctan\|\nabla z\|$), compass aspects, Hessians ($z_{xx}, z_{yy}, z_{xy}$), Laplacians ($\nabla^2 z$), profile/planform curvatures ($k_{\text{prof}}, k_{\text{plan}}$), and circular Bessel Bathymetric Position Indices ($\text{BPI}_r$) across `RFF`, `SpectralGP`, `WaveletGP`, `SPDE`, `PSpline`, and `TPS` (`bstm_surface_derivatives`).
+- **Errors-in-Variables (EIV) Covariate Priors (`src/model.jl`)**:
+  - Propagate upstream posterior uncertainty directly into downstream linear predictors as latent Gaussian measurement errors: $x_i \sim \mathcal{N}(\mu_{x, i}, \sigma^2_{x, i})$ via `fixed(cov, error_sd=:cov_sd)` or `eiv(cov, cov_sd)`.
+
 ---
 
 ## Installation & Setup
@@ -193,22 +203,61 @@ chn_extended = extend_sampling(bundle.model, bundle.chain, 500; progress=false)
 
 ---
 
+### Example 4: Modular Hierarchical DAG Pipeline & Surface Derivatives
+
+Execute a multi-tier ecological workflow with analytical surface derivatives, cross-mesh resharding, Errors-in-Variables priors, and DuckDB table persistence:
+
+```julia
+using bstm, DataFrames, Turing
+
+# 1. Declarative Multi-Tier Pipeline Execution
+pipe_result = bstm_pipeline(
+    :depth => (
+        formula = "likelihood(depth) ~ intercept() + random(s_x, s_y, model=rff, n_features=25)",
+        data = df_bathy,
+        derivatives = [:slope, :curvature, :bpi],
+        radii = [10.0, 25.0]
+    ),
+    :substrate => (
+        formula = "likelihood(grain) ~ intercept() + fixed(depth_mu, error_sd=:depth_sd) + random(s_idx, model=bym2)",
+        data = df_sub,
+        au = au_sub
+    ),
+    :biology => (
+        formula = "likelihood(biomass, family=gamma) ~ intercept() + fixed(grain_mu, error_sd=:grain_sd) + random(s_idx, model=bym2)",
+        data = df_bio,
+        au = au_master
+    );
+    master_au = au_master,
+    duckdb_path = "project_db/ecosystem_pipeline.duckdb",
+    geojson_path = "project_gis/master_habitat.geojson"
+)
+
+# 2. Query Master Harmonized Summary Table from DuckDB
+df_master = query_duckdb("project_db/ecosystem_pipeline.duckdb", "SELECT * FROM master_harmonized_summary LIMIT 10")
+display(df_master)
+```
+
+---
+
 ## Documentation
 
 Comprehensive guides and technical documentation are available in the `docs/` directory:
 
+- [**Integrated Hierarchical Workflows & ADR Telemetry** (`docs/hierarchical_workflow/hierarchical_workflow.md`)](docs/hierarchical_workflow/hierarchical_workflow.md):
+  Directed Acyclic Graphs (DAGs), multi-scale cross-mesh resharding, Full Monte Carlo matrix transformations, Errors-in-Variables (EIV) priors, second-last tier Habitat Suitability (HSI) determination, analytical surface derivatives, Advection-Diffusion-Reaction (ADR) population dynamics, Lagrangian telemetry, and DuckDB SQL analytics.
+- [**Advanced Hierarchical Workflows & Hydrodynamic Telemetry** (`docs/hierarchical_advanced/hierarchical_advanced.md`)](docs/hierarchical_advanced/hierarchical_advanced.md):
+  Methodological innovations addressing modular inference: Tempered Power Posteriors (fractional feedback $\lambda$), full empirical spatial covariance in EIV, hybrid continuous basis-polygon quadrature resharding, continuous soft-sigmoid physiological HSI, and coupled oceanographic-active advection.
 - [**Architectural & Methodological Overview** (`docs/bstm_overview.md`)](docs/bstm_overview.md):
   Design principles, formula syntax, component algebra, prior systems, and inference engines.
 - [**Technical API Reference** (`docs/bstm_api.md`)](docs/bstm_api.md):
   Developer reference for the `ComponentModel` lifecycle, `ParamRegistry`, likelihood distributions, plotting functions, and AST parser.
 - [**Spatial & Spatiotemporal Partitioning Guide** (`docs/bstm_spatial_partitioning.md`)](docs/bstm_spatial_partitioning.md):
-  Mathematical formulations, Lloyd's relaxation, hexagonal geometry, MAUP mitigation, island bridging, and BYM2 spectral scaling.
+  Mathematical formulations, Lloyd's relaxation, hexagonal geometry, MAUP mitigation, island bridging, cross-mesh transfer operators, and BYM2 spectral scaling.
 - [**Input / Output & Persistence Guide** (`docs/bstm_input_output.md`)](docs/bstm_input_output.md):
   Two-tier persistence architecture, JLD2 model serialization, DuckDB analytical results storage, sample extension, SQL analytics, and GIS export.
 - [**Custom Components & Spatial SEIR Modeling Guide** (`docs/bstm_custom.md`)](docs/bstm_custom.md):
   Mechanistic process modeling, raw Turing code injection with `custom()`, first-class `ComponentModel` implementation, and spatial SEIR disease dynamics.
-- [**Movement & ADR Telemetry Guide** (`docs/bstm_movement.md`)](docs/bstm_movement.md):
-  Advection-Diffusion-Reaction (ADR) population dynamics, Eulerian survey counts, Lagrangian mark-recapture telemetry, and trajectory path simulation.
 
 ---
 

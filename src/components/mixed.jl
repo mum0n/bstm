@@ -66,13 +66,25 @@ end
 COMPONENT_TYPE_REGISTRY[:mixed] = Mixed
 COMPONENT_CONSTRUCTORS[:mixed] = (p, params) -> begin
     group_var = get(params, :group_var, :group)
-    lhs = get(params, :lhs, ["1"])
+    raw_lhs = get(params, :lhs, ["1"])
+    lhs_terms = String[]
+    for item in (raw_lhs isa AbstractVector ? raw_lhs : [raw_lhs])
+        for sub_term in Base.split(string(item), "+")
+            trimmed = Base.strip(sub_term)
+            if !isempty(trimmed)
+                push!(lhs_terms, trimmed)
+            end
+        end
+    end
+    if isempty(lhs_terms)
+        lhs_terms = ["1"]
+    end
     inner_model_obj = get(
         params, :inner_model_obj, IID(p.sigma, :noncentered)
     )
     method = get(params, :method, :spectral)
     
-    Mixed(group_var, lhs, inner_model_obj, method)
+    Mixed(group_var, lhs_terms, inner_model_obj, method)
 end
 
 MODEL_TO_STRUCTURE_MAP[:mixed] = :mixed
@@ -207,12 +219,24 @@ function get_updates(
             innovations_matrix = reshape($(p_names.ure), $(n_groups), $(n_terms))
         """
 
-        spectral_code = """
+        spectral_code = if m.model isa IID
+            """
+            # --- Correlated Mixed Effects (IID): $(spec.key) ---
+            let
+                $(common_correlated_code)
+                gamma_matrix = innovations_matrix
+                effects_matrix = gamma_matrix * L_effects_t
+                
+                $(application_loop)
+            end
+            """
+        else
+            """
             # --- Correlated Mixed Effects (Spectral): $(spec.key) ---
             let
                 $(common_correlated_code)
                 inner_hyper = $(inner_hyper_access)
-                diag_D = 1.0 ./ sqrt.(inner_hyper.L .+ M.noise)
+                diag_D = 1.0 ./ sqrt.(abs.(inner_hyper.L) .+ M.noise)
                 if $(m.model isa ICAR || m.model isa Besag)
                     diag_D[1] = 0.0
                 end
@@ -222,7 +246,8 @@ function get_updates(
                 
                 $(application_loop)
             end
-        """
+            """
+        end
 
         cholesky_code = """
             # --- Correlated Mixed Effects (Cholesky): $(spec.key) ---
@@ -332,8 +357,7 @@ function get_effects(
 
             # Extract samples (CPU)
             sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-            ure_samples = get_params_matrix(chain, ure_name, n_groups_train) # (n_samples,
-                n_groups_train)
+            ure_samples = get_params_matrix(chain, ure_name, n_groups_train) # (n_samples, n_groups_train)
             
             # Perform computation
             # latent_samples_train: [n_groups_train, n_samples]

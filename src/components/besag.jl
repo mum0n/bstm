@@ -87,7 +87,7 @@ spectral decomposition (`U`, `L`) for use by different sampling methods. This is
 CPU-only implementation.
 """
 function get_precomputes(m::Besag, M::NamedTuple, mod_data::Dict)::NamedTuple
-    n = M.s_N
+    n = (hasproperty(M, :W) && !isempty(M.W) && isa(M.W, AbstractMatrix)) ? size(M.W, 1) : M.s_N
     W = M.W
     
     # build_structure_template returns CPU arrays

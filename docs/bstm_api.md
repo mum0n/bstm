@@ -305,7 +305,9 @@ end
 
 All parameter symbols generated across components follow the strict sequence:
 
-$$\mathbf{\{quantity\}\_\{descriptor\}\_\{key\}[\_\{outcome\}]}$$
+```
+quantity_descriptor_key[_outcome]
+```
 
 - **Quantity**: `beta`, `sigma`, `rho`, `ls`, `ure`, `sre`, `threshold`, `v`, `alpha`, `K`, `r`.
 - **Descriptor**: `unconstrained`, `unscaled`, `inducing`, `diag`, `pic`, `predator`, `cluster`, `st_interaction`, `flat`.
@@ -354,46 +356,70 @@ end
 
 ---
 
-## 5. Mathematical Formulations, Assumptions & Utility of Components
+## 5. Statistical Component Models Taxonomy
 
-### 5.1. Spatial Areal GMRF Models
+### 5.1. Spatial Areal & Graph GMRF Models
 
 #### 1. Intrinsic Conditional Autoregressive (`ICAR`)
 - **Mathematical Formulation**:
-  $$u_i \mid u_{-i} \sim \mathcal{N}\left( \frac{1}{d_i} \sum_{j \in N(i)} u_j, \frac{\sigma^2}{d_i} \right)$$
+
+  $$
+  u_i \mid u_{-i} \sim \mathcal{N}\left( \frac{1}{d_i} \sum_{j \in N(i)} u_j, \frac{\sigma^2}{d_i} \right)
+  $$
+
   In matrix notation, $u \sim \mathcal{N}(0, (\tau Q)^{-1})$ where $Q = \operatorname{diag}(W \mathbf{1}) - W$ is the singular graph Laplacian and $\tau = 1/\sigma^2$.
 - **Core Assumptions**: First-order intrinsic stationarity; singular precision matrix with sum-to-zero constraint $\sum_{i=1}^S u_i = 0$; spatial Markov property (conditional independence given neighbors).
 - **Utility**: Standard spatial smoothing across discrete administrative or geographic regions (Besag, 1974).
 
 #### 2. Besag-York-Mollié (`BYM2`)
 - **Mathematical Formulation**:
-  $$\phi_s = \sigma \left( \sqrt{1 - \rho} \cdot v_s + \sqrt{\rho / s_{\text{scale}}} \cdot u_s \right)$$
+
+  $$
+  \phi_s = \sigma \left( \sqrt{1 - \rho} \cdot v_s + \sqrt{\rho / s_{\text{scale}}} \cdot u_s \right)
+  $$
+
   where $u \sim \operatorname{ICAR}(W)$, $v \sim \mathcal{N}(0, I_S)$, $\rho \in [0, 1]$ is the spatial mixing parameter, and $s_{\text{scale}} = \exp(-\frac{1}{S-1}\sum_{i=1}^{S-1} \log \lambda_i)$ is the Riebler et al. (2016) spectral scaling factor.
 - **Core Assumptions**: Additive orthogonal decomposition into spatially structured clustering ($u$) and unstructured white noise ($v$); graph is fully connected.
 - **Utility**: The gold standard in spatial epidemiology and disease mapping. Allows direct interpretation of $\rho$ as the proportion of total variance explained by spatial autocorrelation.
 
 #### 3. Leroux CAR (`Leroux`)
 - **Mathematical Formulation**:
-  $$Q = (1 - \rho) I_S + \rho Q_{\text{ICAR}}, \quad \phi \sim \mathcal{N}\left(0, (\sigma^2 Q)^{-1}\right)$$
+
+  $$
+  Q = (1 - \rho) I_S + \rho Q_{\text{ICAR}}, \quad \phi \sim \mathcal{N}\left(0, (\sigma^2 Q)^{-1}\right)
+  $$
+
 - **Core Assumptions**: Full-rank proper precision matrix for all $\rho \in [0, 1)$; smooth convex interpolation between pure independence ($\rho=0$) and ICAR ($\rho=1$).
 - **Utility**: Prevents boundary edge singularities and avoids rigid sum-to-zero constraints; highly stable for small sample sizes.
 
 #### 4. Simultaneous Autoregressive (`SAR`)
 - **Mathematical Formulation**:
-  $$\phi = \rho W_{\text{std}} \phi + \epsilon, \quad \phi = (I - \rho W_{\text{std}})^{-1} \epsilon, \quad \epsilon \sim \mathcal{N}(0, \sigma^2 I)$$
+
+  $$
+  \phi = \rho W_{\text{std}} \phi + \epsilon, \quad \phi = (I - \rho W_{\text{std}})^{-1} \epsilon, \quad \epsilon \sim \mathcal{N}(0, \sigma^2 I)
+  $$
+
 - **Core Assumptions**: Spatial lag autoregressive process; stationarity requires $\rho \in (1/\lambda_{\min}, 1/\lambda_{\max})$.
 - **Utility**: Spatial econometrics, hedonic pricing, and geographic spillover modeling.
 
 #### 5. Local Adaptive GMRF (`LocalAdaptive`)
 - **Mathematical Formulation**:
-  $$\phi \sim \mathcal{N}\left( \mu_{\text{cluster}(s)}, (\sigma^2 Q_{\text{Leroux}})^{-1} \right)$$
+
+  $$
+  \phi \sim \mathcal{N}\left( \mu_{\text{cluster}(s)}, (\sigma^2 Q_{\text{Leroux}})^{-1} \right)
+  $$
+
   where $\mu_g$ is a cluster-specific mean effect estimated across spatial clusters $g \in \{1, \dots, K\}$.
 - **Core Assumptions**: Continuous background spatial covariance with piecewise discontinuous mean shifts across geographic regimes.
 - **Utility**: Environmental epidemiology across distinct jurisdictions, socioeconomic divides, or natural geographic boundaries.
 
 #### 6. Multivariate Conditional Autoregressive (`MCAR`)
 - **Mathematical Formulation**:
-  $$\operatorname{vec}(\boldsymbol{\Phi}) \sim \mathcal{N}\left(\mathbf{0}, (\mathbf{\Omega}_{\text{cross}} \otimes \mathbf{Q}_{\text{spatial}})^{-1}\right)$$
+
+  $$
+  \operatorname{vec}(\boldsymbol{\Phi}) \sim \mathcal{N}\left(\mathbf{0}, (\mathbf{\Omega}_{\text{cross}} \otimes \mathbf{Q}_{\text{spatial}})^{-1}\right)
+  $$
+
   where $\mathbf{Q}_{\text{spatial}} = (1 - \rho)\mathbf{I}_S + \rho \mathbf{Q}_{\text{ICAR}}$ is the proper spatial precision matrix, and $\mathbf{\Sigma}_{\text{cross}} = \mathbf{\Omega}_{\text{cross}}^{-1} = \operatorname{diag}(\boldsymbol{\sigma})\mathbf{L}_{\text{corr}}\mathbf{L}_{\text{corr}}^T \operatorname{diag}(\boldsymbol{\sigma})$ captures cross-outcome correlations via an LKJ prior.
 - **Core Assumptions**: Cross-outcome and spatial dependencies factorize into a Kronecker separable precision structure.
 - **Utility**: Joint multi-disease spatial mapping and multi-species ecological co-occurrence across geographic regions (Gelfand & Vounatsou, 2003).
@@ -404,14 +430,22 @@ end
 
 #### 1. Gaussian Process (`GP`)
 - **Mathematical Formulation**:
-  $$f(x) \sim \mathcal{GP}(0, k(x, x')), \quad k_{\text{SE}}(d) = \sigma^2 \exp\left( -\frac{d^2}{2\ell^2} \right), \quad k_{\text{Matérn}}(d) = \sigma^2 \frac{2^{1-\nu}}{\Gamma(\nu)} \left(\sqrt{2\nu}\frac{d}{\ell}\right)^\nu K_\nu\left(\sqrt{2\nu}\frac{d}{\ell}\right)$$
+
+  $$
+  f(x) \sim \mathcal{GP}(0, k(x, x')), \quad k_{\text{SE}}(d) = \sigma^2 \exp\left( -\frac{d^2}{2\ell^2} \right), \quad k_{\text{Matérn}}(d) = \sigma^2 \frac{2^{1-\nu}}{\Gamma(\nu)} \left(\sqrt{2\nu}\frac{d}{\ell}\right)^\nu K_\nu\left(\sqrt{2\nu}\frac{d}{\ell}\right)
+  $$
+
 - **Core Assumptions**: Second-order stationarity and isotropy (or anisotropic ARD lengthscales $\ell_d$).
 - **Utility**: Exact spatial interpolation (Kriging), continuous environmental field mapping, sensor fusion.
 
 #### 2. Nearest Neighbor Gaussian Process (`NNGP`)
 - **Mathematical Formulation**:
   Approximates continuous GP joint densities via $m$-nearest neighbor conditioning sets among preceding points in a spatial ordering (Datta et al., 2016):
-  $$p(w_1, \dots, w_N) \approx p(w_1) \prod_{i=2}^N \mathcal{N}\left(\mathbf{B}_i \mathbf{w}_{N(s_i)}, F_i\right)$$
+
+  $$
+  p(w_1, \dots, w_N) \approx p(w_1) \prod_{i=2}^N \mathcal{N}\left(\mathbf{B}_i \mathbf{w}_{N(s_i)}, F_i\right)
+  $$
+
   where $\mathbf{B}_i = C(s_i, N(s_i)) [C(N(s_i), N(s_i))]^{-1}$ and $F_i = C(s_i, s_i) - \mathbf{B}_i C(N(s_i), s_i)$.
 - **Core Assumptions**: High-order conditional independence given the $m$ nearest preceding spatial neighbors.
 - **Utility**: Highly scalable geostatistics achieving $\mathcal{O}(N m^3)$ runtime and $\mathcal{O}(N m)$ memory for point datasets $N > 10^5$ without pseudo-inputs.
@@ -419,21 +453,33 @@ end
 #### 3. Sparse Gaussian Process (`SparseGP` / `FITC` / `PIC`)
 - **Mathematical Formulation**:
   Approximates dense covariance $K_{ff}$ via $M \ll N$ pseudo-inputs $u = f(X_u)$ using the Fully Independent Training Conditional (FITC) factorization:
-  $$K_{ff} \approx Q_{ff} + \operatorname{diag}(K_{ff} - Q_{ff}), \quad Q_{ff} = K_{fu} K_{uu}^{-1} K_{uf}$$
+
+  $$
+  K_{ff} \approx Q_{ff} + \operatorname{diag}(K_{ff} - Q_{ff}), \quad Q_{ff} = K_{fu} K_{uu}^{-1} K_{uf}
+  $$
+
 - **Core Assumptions**: Latent spatial field covariance is low-rank conditionally independent given inducing points.
 - **Utility**: Scales Gaussian Process inference from $\mathcal{O}(N^3)$ to $\mathcal{O}(NM^2)$, making continuous GPs tractable for $N > 10^5$ observations.
 
 #### 4. Random Fourier Features (`RFF`)
 - **Mathematical Formulation**:
   By Bochner's theorem, stationary kernel $k(x - x') = \int p(\omega) e^{i \omega^T (x - x')} d\omega \approx z(x)^T z(x')$:
-  $$z(x) = \sqrt{\frac{2}{D}} \left[ \cos(W x + b) \right], \quad W \sim \mathcal{N}(0, \ell^{-2} I), \quad b \sim \operatorname{Uniform}(0, 2\pi)$$
+
+  $$
+  z(x) = \sqrt{\frac{2}{D}} \left[ \cos(W x + b) \right], \quad W \sim \mathcal{N}(0, \ell^{-2} I), \quad b \sim \operatorname{Uniform}(0, 2\pi)
+  $$
+
 - **Core Assumptions**: Shift-invariant stationary kernel; projection dimension $D$ is sufficiently large.
 - **Utility**: Linear $\mathcal{O}(ND)$ time complexity for continuous spatial fields in high-dimensional settings.
 
 #### 5. Stochastic Partial Differential Equations (`SPDE`)
 - **Mathematical Formulation**:
   Represents continuous Matérn fields as solutions to the linear fractional SPDE (Lindgren et al., 2011):
-  $$(\kappa^2 - \Delta)^{\alpha/2} u(s) = \mathcal{W}(s)$$
+
+  $$
+  (\kappa^2 - \Delta)^{\alpha/2} u(s) = \mathcal{W}(s)
+  $$
+
   Discretized on a Constrained Delaunay Triangulation mesh via piecewise linear basis functions $u(s) = \sum_{i=1}^V \psi_i(s) u_i$.
 - **Core Assumptions**: Matérn field smoothness $\nu = \alpha - d/2$; finite element discretization accurately captures spatial boundary conditions.
 - **Utility**: Bridges continuous Gaussian fields with sparse precision GMRFs ($\mathcal{O}(N^{1.5})$ complexity).
@@ -458,13 +504,21 @@ end
 
 #### 3. Harmonic & Periodic Models (`Harmonic`, `Cyclic`)
 - **Mathematical Formulation**:
-  $$f(t) = \sum_{k=1}^K \left( \beta_{\cos, k} \cos\left(\frac{2\pi k t}{P}\right) + \beta_{\sin, k} \sin\left(\frac{2\pi k t}{P}\right) \right)$$
+
+  $$
+  f(t) = \sum_{k=1}^K \left( \beta_{\cos, k} \cos\left(\frac{2\pi k t}{P}\right) + \beta_{\sin, k} \sin\left(\frac{2\pi k t}{P}\right) \right)
+  $$
+
 - **Core Assumptions**: Strict periodicity with fundamental cycle period $P$ (e.g. 12 months, 24 hours).
 - **Utility**: Seasonal epidemiological peaks, environmental annual rhythms, tidal cycles.
 
 #### 4. Threshold Autoregressive (`TAR`)
 - **Mathematical Formulation**:
-  $$x_t = \begin{cases} \rho_1 x_{t-1} + \sigma_1 \epsilon_t & \text{if } x_{t-d} \le c \\ \rho_2 x_{t-1} + \sigma_2 \epsilon_t & \text{if } x_{t-d} > c \end{cases}$$
+
+  $$
+  x_t = \begin{cases} \rho_1 x_{t-1} + \sigma_1 \epsilon_t & \text{if } x_{t-d} \le c \\ \rho_2 x_{t-1} + \sigma_2 \epsilon_t & \text{if } x_{t-d} > c \end{cases}
+  $$
+
 - **Core Assumptions**: Piecewise linear regime switching governed by threshold variable and delay lag $d$.
 - **Utility**: Ecological tipping points, predator-prey collapses, financial market regime shifts.
 
@@ -474,7 +528,9 @@ end
 
 Knorr-Held (2000) spatiotemporal interactions are constructed via the Kronecker product operator:
 
-$$\eta_{st} = \alpha + u_s + v_t + \delta_{st}, \quad \delta \sim \mathcal{N}\left(0, \sigma_{\delta}^2 (Q_s \otimes Q_t)^{-1}\right)$$
+$$
+\eta_{st} = \alpha + u_s + v_t + \delta_{st}, \quad \delta \sim \mathcal{N}\left(0, \sigma_{\delta}^2 (Q_s \otimes Q_t)^{-1}\right)
+$$
 
 | Interaction Type | Spatial Structure ($Q_s$) | Temporal Structure ($Q_t$) | Interpretation |
 | :--- | :--- | :--- | :--- |
@@ -490,11 +546,22 @@ $$\eta_{st} = \alpha + u_s + v_t + \delta_{st}, \quad \delta \sim \mathcal{N}\le
 The `dynamics()` module fuses physical and ecological differential equations into the Bayesian state-space framework:
 
 1. **Logistic Population Growth**:
-   $$N_t = N_{t-1} + r N_{t-1} \left(1 - \frac{N_{t-1}}{K}\right) + \epsilon_t, \quad \epsilon_t \sim \mathcal{N}(0, \sigma^2)$$
+
+   $$
+   N_t = N_{t-1} + r N_{t-1} \left(1 - \frac{N_{t-1}}{K}\right) + \epsilon_t, \quad \epsilon_t \sim \mathcal{N}(0, \sigma^2)
+   $$
+
 2. **Advection-Diffusion PDE**:
-   $$\frac{\partial u}{\partial t} = D \nabla^2 u - v \cdot \nabla u + \epsilon(s, t)$$
+
+   $$
+   \frac{\partial u}{\partial t} = D \nabla^2 u - v \cdot \nabla u + \epsilon(s, t)
+   $$
+
    Discretized across graph Laplacian $L = D - W$:
-   $$u_{t} = u_{t-1} - \Delta t \left( D L u_{t-1} + v \cdot \nabla u_{t-1} \right) + \epsilon_t$$
+
+   $$
+   u_{t} = u_{t-1} - \Delta t \left( D L u_{t-1} + v \cdot \nabla u_{t-1} \right) + \epsilon_t
+   $$
 
 - **Core Assumptions**: Known physical/biological differential equations with stochastic environmental noise.
 - **Utility**: Physics-Informed Machine Learning (SciML), population viability analysis, pollution plume tracking.
@@ -505,11 +572,15 @@ The `dynamics()` module fuses physical and ecological differential equations int
 
 Bayesian PCA decomposes $P$ multivariate outcomes into $K \ll P$ orthogonal latent factors:
 
-$$Y = Z \Lambda^{1/2} U^T + E, \quad E \sim \mathcal{N}(0, \operatorname{diag}(\sigma_{\epsilon, 1}^2, \dots, \sigma_{\epsilon, P}^2))$$
+$$
+Y = Z \Lambda^{1/2} U^T + E, \quad E \sim \mathcal{N}(0, \operatorname{diag}(\sigma_{\epsilon, 1}^2, \dots, \sigma_{\epsilon, P}^2))
+$$
 
 To enforce strict orthonormality ($U^T U = I_K$) without identification sign-flipping or unconstrained matrix drift, `bstm` parameterizes $U$ using a product of Householder reflections:
 
-$$H_k = I - 2 \frac{v_k v_k^T}{\|v_k\|^2}, \quad U = \prod_{k=1}^K H_k$$
+$$
+H_k = I - 2 \frac{v_k v_k^T}{\|v_k\|^2}, \quad U = \prod_{k=1}^K H_k
+$$
 
 - **Core Assumptions**: High-dimensional outcomes are generated by a low-dimensional orthogonal latent subspace.
 - **Utility**: Multi-pollutant exposure indices, ecological multi-species co-occurrence, multi-phenotype genetics.
@@ -520,7 +591,9 @@ $$H_k = I - 2 \frac{v_k v_k^T}{\|v_k\|^2}, \quad U = \prod_{k=1}^K H_k$$
 
 The `nested()` supervisor module enables multi-fidelity transfer learning and errors-in-variables covariate modeling:
 
-$$\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}(\text{Data}_{\text{aux}})$$
+$$
+\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}(\text{Data}_{\text{aux}})
+$$
 
 - **Core Assumptions**: Coarse or noisy proxy data shares the latent spatial/temporal functional form up to scaling $\rho$.
 - **Utility**: Integrating satellite proxy observations with sparse ground-station monitors; jointly modeling censored or missing covariates.
@@ -762,7 +835,29 @@ The movement subsystem implements biophysical Advection-Diffusion-Reaction (ADR)
 
 ---
 
-## 13. References
+## 13. Surface Derivatives, Pipeline Orchestrator & Multi-Mesh API
+
+### 13.1. Surface Derivatives & Differential Geometry (`src/derivatives.jl`)
+
+| Function | Signature | Description |
+| :--- | :--- | :--- |
+| `bstm_surface_derivatives` | `bstm_surface_derivatives(model_obj, chain, coords; metrics=[:slope, :curvature, :bpi], radii=[5.0, 15.0, 30.0], alpha=0.05, return_samples=false, n_samples=nothing)` | Computes exact continuous surface derivatives ($\nabla z, \nabla^2 z$, slopes, aspects, profile/planform curvatures, Bessel BPI) across `RFF`, `SpectralGP`, `WaveletGP`, `SPDE`, `PSpline`, and `TPS`. |
+| `compute_topographic_metrics` | `compute_topographic_metrics(z_samples, zx_samples, zy_samples, zxx_samples, zyy_samples, zxy_samples, bpi_samples, radii; alpha=0.05)` | Transforms raw spatial partial derivative sample matrices into geomorphometric summary metrics and empirical credible intervals. |
+
+### 13.2. Modular DAG Pipeline & Topological Resharding (`src/pipeline.jl`)
+
+| Type / Function | Signature | Description |
+| :--- | :--- | :--- |
+| `PipelineTierSpec` | `PipelineTierSpec(name, formula, data; au=nothing, W=nothing, sampler=NUTS(50, 0.65), n_samples=100, derivatives=Symbol[], radii=[10.0, 25.0])` | Declarative specification for an individual model tier within a multi-scale DAG pipeline. |
+| `bstm_pipeline` | `bstm_pipeline(tiers...; master_au=nothing, duckdb_path=":memory:", jld2_path=nothing, geojson_path=nothing, verbose=true)` | Orchestrates sequential multi-tier MCMC execution, dynamic spatial network resharding, DuckDB persistence, and canonical master harmonization. |
+| `compute_network_transfer_matrix` | `compute_network_transfer_matrix(au_src, au_dest; method=:area_weighted, bandwidth=nothing)` | Constructs sparse geometric linear transfer matrix $\mathbf{P} \in \mathbb{R}^{N_{\text{dest}} \times N_{\text{src}}}$ via area-weighted intersection, Gaussian kernel, or inverse-distance weighting. |
+| `reshard_spatial_field` | `reshard_spatial_field(source, au_src, au_dest; mode=:samples, method=:area_weighted, bandwidth=nothing, alpha=0.05)` | Reshards spatial latent fields across mismatched graphs in Full Monte Carlo sample matrix mode (`mode=:samples`) or moment mode (`mode=:moments`). |
+| `summarize_sample_matrix` | `summarize_sample_matrix(samples; alpha=0.05)` | Computes column-wise and row-wise empirical mean, standard deviation, median, and $(1-\alpha)$ credible intervals from an $N \times S$ Monte Carlo sample matrix. |
+| `expand_hull` | `expand_hull(s_x, s_y, buffer_dist)` | Computes the 2D convex hull of coordinates and expands it by `buffer_dist` using LibGEOS polygon buffering. |
+
+---
+
+## 14. References
 
 1. **Besag, J.** (1974). Spatial interaction and the statistical analysis of lattice systems. *Journal of the Royal Statistical Society: Series B*, 36(2), 192–225.
 2. **Besag, J., York, J., & Mollié, A.** (1991). Bayesian image restoration, with applications in spatial statistics. *Annals of the Institute of Statistical Mathematics*, 43(1), 1–59.

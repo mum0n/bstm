@@ -51,7 +51,9 @@ The **`bstm` Partitioning Subsystem** provides an extensible suite of algorithms
 
 Given a bounded 2D domain $\Omega \subset \mathbb{R}^2$ and a set of $S$ distinct generator seeds $C = \{c_1, c_2, \dots, c_S\} \subset \Omega$, the Voronoi cell $V_i$ corresponding to generator $c_i$ is defined as:
 
-$$V_i = \left\{ x \in \Omega \;\middle|\; \|x - c_i\|_2 \le \|x - c_j\|_2, \quad \forall j \ne i \right\}$$
+$$
+V_i = \left\{ x \in \Omega \;\middle|\; \|x - c_i\|_2 \le \|x - c_j\|_2, \quad \forall j \ne i \right\}
+$$
 
 The collection $\mathcal{V}(C) = \{V_1, V_2, \dots, V_S\}$ forms a convex polygonal partition of $\Omega$. The Delaunay triangulation $\mathcal{D}(C)$ is the planar geometric dual of $\mathcal{V}(C)$: two seeds $c_i$ and $c_j$ share an edge in $\mathcal{D}(C)$ if and only if their Voronoi cells share a boundary segment $\partial V_i \cap \partial V_j \ne \emptyset$.
 
@@ -63,11 +65,15 @@ In `bstm`, all Voronoi polygons are computed via Delaunay triangulation (`Delaun
 
 A Centroidal Voronoi Tessellation (CVT) is a Voronoi diagram where each generator seed $c_i$ coincides exactly with the geometric center of mass (centroid) $c_i^*$ of its associated Voronoi region $V_i$:
 
-$$c_i^* = \frac{\int_{V_i} x \, \rho(x) \, dx}{\int_{V_i} \rho(x) \, dx}$$
+$$
+c_i^* = \frac{\int_{V_i} x \, \rho(x) \, dx}{\int_{V_i} \rho(x) \, dx}
+$$
 
 When the density function $\rho(x) \equiv 1$ (uniform density), $c_i^*$ is the geometric centroid. CVTs minimize the spatial quantization energy:
 
-$$\mathcal{E}(C, \mathcal{V}) = \sum_{i=1}^S \int_{V_i} \|x - c_i\|^2 \, dx$$
+$$
+\mathcal{E}(C, \mathcal{V}) = \sum_{i=1}^S \int_{V_i} \|x - c_i\|^2 \, dx
+$$
 
 #### Algorithm (Lloyd's Relaxation)
 1. **Initialize**: Sample $S$ initial seeds $C^{(0)} = \{c_1^{(0)}, \dots, c_S^{(0)}\}$ from the data extent using density-weighted KD-Tree sampling.
@@ -83,7 +89,9 @@ $$\mathcal{E}(C, \mathcal{V}) = \sum_{i=1}^S \int_{V_i} \|x - c_i\|^2 \, dx$$
 
 Unlike CVT which moves centroids toward the geometric center of the polygon, K-Means Voronoi Tessellation (KVT) moves seeds toward the empirical mean of the observational data points residing within each Voronoi cell:
 
-$$c_i^{(t+1)} = (1 - \gamma) c_i^{(t)} + \gamma \left( \frac{1}{|N_i|} \sum_{x_j \in N_i} x_j \right)$$
+$$
+c_i^{(t+1)} = (1 - \gamma) c_i^{(t)} + \gamma \left( \frac{1}{|N_i|} \sum_{x_j \in N_i} x_j \right)
+$$
 
 where:
 - $N_i = \{x_j \in \text{Data} \mid \arg\min_k \|x_j - c_k\| = i\}$ is the set of points assigned to cell $i$.
@@ -97,11 +105,19 @@ where:
 
 QVT is a top-down hierarchical space-partitioning method. Starting with the entire dataset in a single region $\Omega$, it recursively subdivides regions into four quadrants based on bivariate medians:
 
-$$\tilde{x} = \text{median}(\{x_j \mid x_j \in R\}), \quad \tilde{y} = \text{median}(\{y_j \mid y_j \in R\})$$
+$$
+\tilde{x} = \text{median}(\{x_j \mid x_j \in R\}), \quad \tilde{y} = \text{median}(\{y_j \mid y_j \in R\})
+$$
 
 Regions are split into:
-$$R_{1} = \{p \in R \mid p_x \le \tilde{x}, p_y \le \tilde{y}\}, \quad R_{2} = \{p \in R \mid p_x > \tilde{x}, p_y \le \tilde{y}\}$$
-$$R_{3} = \{p \in R \mid p_x \le \tilde{x}, p_y > \tilde{y}\}, \quad R_{4} = \{p \in R \mid p_x > \tilde{x}, p_y > \tilde{y}\}$$
+
+$$
+R_{1} = \{p \in R \mid p_x \le \tilde{x}, p_y \le \tilde{y}\}, \quad R_{2} = \{p \in R \mid p_x > \tilde{x}, p_y \le \tilde{y}\}
+$$
+
+$$
+R_{3} = \{p \in R \mid p_x \le \tilde{x}, p_y > \tilde{y}\}, \quad R_{4} = \{p \in R \mid p_x > \tilde{x}, p_y > \tilde{y}\}
+$$
 
 *Splitting Criteria*: Subdivisions continue on regions exceeding `min_points` until the target unit count `target_units` or coefficient of variation (CV) threshold is achieved.
 
@@ -111,10 +127,15 @@ $$R_{3} = \{p \in R \mid p_x \le \tilde{x}, p_y > \tilde{y}\}, \quad R_{4} = \{p
 
 Binary Voronoi Tessellation recursively bisects regions along their principal axis of maximum variance:
 
-$$d^* = \arg\max_{d \in \{x, y\}} \operatorname{Var}(p_d \mid p \in R)$$
+$$
+d^* = \arg\max_{d \in \{x, y\}} \operatorname{Var}(p_d \mid p \in R)
+$$
 
 The region is bisected along the median of dimension $d^*$:
-$$R_{\text{left}} = \{p \in R \mid p_{d^*} \le \text{median}(p_{d^*})\}, \quad R_{\text{right}} = \{p \in R \mid p_{d^*} > \text{median}(p_{d^*})\}$$
+
+$$
+R_{\text{left}} = \{p \in R \mid p_{d^*} \le \text{median}(p_{d^*})\}, \quad R_{\text{right}} = \{p \in R \mid p_{d^*} > \text{median}(p_{d^*})\}
+$$
 
 *Statistical Properties*: Fast, robust to anisotropic coordinate scaling, and naturally adapts to elongated spatial tracks or linear features (e.g., river networks, coastlines).
 
@@ -124,7 +145,9 @@ $$R_{\text{left}} = \{p \in R \mid p_{d^*} \le \text{median}(p_{d^*})\}, \quad R
 
 HVT combines $k$-means spatial initialization with iterative Lloyd refinement and adaptive cell splitting. If a Voronoi cell contains more than `max_points` observations after centroid stabilization, the cell is split into two child seeds placed along its local dispersion axis:
 
-$$c_{\text{new}, 1} = \bar{x}_{\text{cluster}} \times 0.99, \quad c_{\text{new}, 2} = \bar{x}_{\text{cluster}} \times 1.01$$
+$$
+c_{\text{new}, 1} = \bar{x}_{\text{cluster}} \times 0.99, \quad c_{\text{new}, 2} = \bar{x}_{\text{cluster}} \times 1.01
+$$
 
 ---
 
@@ -132,7 +155,9 @@ $$c_{\text{new}, 1} = \bar{x}_{\text{cluster}} \times 0.99, \quad c_{\text{new},
 
 AVT is a bottom-up hierarchical clustering method. It begins in an over-partitioned state ($S_{\text{init}} = 2 \cdot \text{target\_units}$) and iteratively merges the smallest, underpopulated, or constraint-violating polygon into its nearest neighbor:
 
-$$c_{\text{merged}} = \frac{n_i c_i + n_j c_j}{n_i + n_j}$$
+$$
+c_{\text{merged}} = \frac{n_i c_i + n_j c_j}{n_i + n_j}
+$$
 
 where $j = \arg\min_{k \ne i} \|c_i - c_k\|^2$. Merging continues until all remaining units satisfy `min_points`, `min_time_slices`, and `min_area` constraints.
 
@@ -165,7 +190,10 @@ For a regular hexagon with radius $R$ (center to vertex):
 - Row Offset: Odd rows are shifted horizontally by $\frac{\sqrt{3}}{2} R$.
 
 Vertices for cell centered at $(x_c, y_c)$:
-$$v_k = \left( x_c + R \cos\left(\frac{\pi}{6} + \frac{k\pi}{3}\right), \; y_c + R \sin\left(\frac{\pi}{6} + \frac{k\pi}{3}\right) \right), \quad k = 0, \dots, 5$$
+
+$$
+v_k = \left( x_c + R \cos\left(\frac{\pi}{6} + \frac{k\pi}{3}\right), \; y_c + R \sin\left(\frac{\pi}{6} + \frac{k\pi}{3}\right) \right), \quad k = 0, \dots, 5
+$$
 
 ---
 
@@ -183,7 +211,9 @@ Square or rectangular raster grid partitioning. Given bounding box $[x_{\min}, x
 
 When observational data contains an adjacency matrix $W$ but lacks geographic coordinates $(s_x, s_y)$ (such as standard regional benchmark datasets like the Scottish Lip Cancer data), `assign_spatial_units_inferred` reconstructs continuous coordinates via a force-directed spring layout:
 
-$$c_i^{(t+1)} = c_i^{(t)} + \eta \left( \frac{1}{|N(i)|} \sum_{j \in N(i)} c_j^{(t)} - c_i^{(t)} \right)$$
+$$
+c_i^{(t+1)} = c_i^{(t)} + \eta \left( \frac{1}{|N(i)|} \sum_{j \in N(i)} c_j^{(t)} - c_i^{(t)} \right)
+$$
 
 where $\eta$ is the learning rate. Once coordinates stabilize, Voronoi boundaries and a hull geometry are constructed.
 
@@ -207,7 +237,9 @@ Spatial models (such as ICAR or BYM2) require a connected spatial graph $\mathca
 2. A 2D KD-Tree searches for the closest pair of components.
 3. The closest node pair $(u, v)$ across the two components is connected with an edge:
 
-$$(u^*, v^*) = \arg\min_{u \in C_a, v \in C_b} \|c_u - c_v\|_2^2$$
+$$
+(u^*, v^*) = \arg\min_{u \in C_a, v \in C_b} \|c_u - c_v\|_2^2
+$$
 
 This guarantees a single connected component with minimal perturbation to the graph topology.
 
@@ -217,11 +249,15 @@ This guarantees a single connected component with minimal perturbation to the gr
 
 The BYM2 model (Riebler et al., 2016) decomposes spatial random effects into a structured intrinsic GMRF ($u$) and an unstructured white-noise effect ($v$):
 
-$$\theta_s = \sigma_s \left( \sqrt{1 - \rho} \cdot v_s + \sqrt{\rho / s_{\text{scale}}} \cdot u_s \right)$$
+$$
+\theta_s = \sigma_s \left( \sqrt{1 - \rho} \cdot v_s + \sqrt{\rho / s_{\text{scale}}} \cdot u_s \right)
+$$
 
 where $u \sim \operatorname{ICAR}(W)$ with singular precision matrix $Q = \operatorname{diag}(W \mathbf{1}) - W$. To ensure that the structured component has an empirical marginal variance of approximately 1 (making $\rho \in [0, 1]$ interpretable as the proportion of variance explained by spatial structure), the scaling factor $s_{\text{scale}}$ is computed from the non-zero eigenvalues $\lambda_1, \dots, \lambda_{S-1}$ of $Q$:
 
-$$s_{\text{scale}} = \exp\left( -\frac{1}{S-1} \sum_{i=1}^{S-1} \log \lambda_i \right)$$
+$$
+s_{\text{scale}} = \exp\left( -\frac{1}{S-1} \sum_{i=1}^{S-1} \log \lambda_i \right)
+$$
 
 In `bstm`, this is evaluated via `scaling_factor_bym2(W)`:
 
@@ -339,7 +375,9 @@ The `discretize_data` function partitions continuous 1D variables (such as time 
 
 For spatiotemporal models with spatiotemporal interaction terms (e.g. Type I–IV interaction models, Knorr-Held 2000), `assign_spatiotemporal_units` synchronizes spatial areal unit indices $s \in \{1, \dots, S\}$ and temporal intervals $t \in \{1, \dots, T\}$ into a single joint index $st \in \{1, \dots, S \cdot T\}$:
 
-$$st = (t - 1) \cdot S + s$$
+$$
+st = (t - 1) \cdot S + s
+$$
 
 ```julia
 st_res = assign_spatiotemporal_units(df; 
@@ -485,7 +523,89 @@ choropleth(st_data.au_spatial.polygons, res.effects.s_idx.structured.mean; title
 
 ---
 
-## 8. Assumptions, Limitations & Best Practices
+## 8. Cross-Mesh Topological Resharding & Spatial Transfer Operators
+
+In multi-tiered ecological and oceanographic workflows, data sources at different physical layers often possess disparate spatial densities and resolutions. For example, substrate grab stations may form an areal graph $G_{\text{src}} = (V_{\text{src}}, W_{\text{src}})$ with $N_{\text{src}} = 25$ units, whereas final population assessments require predictions on a fine-scale management mesh $G_{\text{dest}} = (V_{\text{dest}}, W_{\text{dest}})$ with $N_{\text{dest}} = 80$ units.
+
+The `bstm` partitioning module provides native linear transfer operators $P \in \mathbb{R}^{N_{\text{dest}} \times N_{\text{src}}}$ to map spatial fields seamlessly between arbitrary irregular polygonal tessellations.
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        CROSS-MESH GEOMETRIC TRANSFER OPERATOR                          │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│  Source Mesh A (A_1, ..., A_m) ──► Latent Field u_src or Samples U_src [N_src × S]     │
+│                                           │                                            │
+│                 Transfer Matrix P: P_ji = Area(B_j ∩ A_i) / Area(B_j)                  │
+│                                           │                                            │
+│  Destination Mesh B (B_1, ..., B_n) ◄─────┴── u_dest = P × u_src                       │
+│                                               U_dest = P × U_src                       │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.1. Mathematical Formulations
+
+1. **Area-Weighted Polygon Intersection (`method = :area_weighted`)**:
+   For destination polygon $B_j$ and source polygon $A_i$, the transfer weight represents the fraction of $B_j$'s area overlapping $A_i$:
+
+   $$
+   P_{j, i} = \frac{\text{Area}(B_j \cap A_i)}{\text{Area}(B_j)}, \quad \sum_{i=1}^{N_{\text{src}}} P_{j, i} = 1
+   $$
+
+   Computed geometrically via `LibGEOS.intersection` across all intersecting polygon pairs.
+
+2. **Gaussian Kernel Spatial Decay (`method = :gaussian_kernel`)**:
+   Transfer weights decay smoothly as a Gaussian function of Euclidean distance between unit centroids:
+
+   $$
+   \tilde{P}_{j, i} = \exp\left(-\frac{\|\mathbf{c}_{\text{dest}, j} - \mathbf{c}_{\text{src}, i}\|^2}{2 h^2}\right), \quad P_{j, i} = \frac{\tilde{P}_{j, i}}{\sum_{k=1}^{N_{\text{src}}} \tilde{P}_{j, k}}
+   $$
+
+   where $h$ is the spatial bandwidth parameter (defaults to mean nearest-neighbor distance).
+
+3. **Inverse Distance Weighting (`method = :inverse_distance`)**:
+
+   $$
+   \tilde{P}_{j, i} = \frac{1}{(\|\mathbf{c}_{\text{dest}, j} - \mathbf{c}_{\text{src}, i}\| + \epsilon)^p}, \quad P_{j, i} = \frac{\tilde{P}_{j, i}}{\sum_{k=1}^{N_{\text{src}}} \tilde{P}_{j, k}}
+   $$
+
+### 8.2. Full Monte Carlo Sample Matrix vs. Moment Resharding
+
+- **Full Monte Carlo Mode (`mode = :samples`)**:
+  When downstream likelihoods are non-Gaussian (e.g., Gamma, Negative Binomial, Hurdle), resharding the raw $N_{\text{src}} \times S$ posterior sample matrix preserves higher-order moments, skewness, and multi-modal distributions:
+
+  $$
+  \mathbf{U}_{\text{dest}} = \mathbf{P} \mathbf{U}_{\text{src}} \in \mathbb{R}^{N_{\text{dest}} \times S}
+  $$
+
+- **Moments Mode (`mode = :moments`)**:
+  Reshards the posterior mean vector and variance vector directly:
+
+  $$
+  \mathbf{u}_{\text{dest}} = \mathbf{P} \mathbf{u}_{\text{src}}, \quad \boldsymbol{\sigma}^2_{\text{dest}} = \mathbf{P} \boldsymbol{\sigma}^2_{\text{src}}
+  $$
+
+### 8.3. Practical Usage
+
+```julia
+# 1. Generate two distinct spatial partitionings
+au_coarse = assign_spatial_units(df_sed.s_x, df_sed.s_y; area_method=:cvt, target_units=20)
+au_fine   = assign_spatial_units(df_all.s_x, df_all.s_y; area_method=:cvt, target_units=60)
+
+# 2. Compute the geometric transfer operator matrix
+P = compute_network_transfer_matrix(au_coarse, au_fine; method=:area_weighted)
+
+# 3. Reshard full posterior sample matrix (60 units × 500 draws)
+coarse_draws = randn(20, 500) # [N_src × S]
+fine_results = reshard_spatial_field(coarse_draws, au_coarse, au_fine; mode=:samples)
+
+# 4. Extract empirical summary statistics
+println("Fine-scale resharded summary:")
+display(fine_results.summary)
+```
+
+---
+
+## 9. Assumptions, Limitations & Best Practices
 
 1. **Projected Coordinate Reference Systems (CRS)**:
    All geometric calculations (Euclidean distance, Shoelace polygon area) assume planar Cartesian coordinates (e.g., UTM or local projected meters/kilometers). Longitude/latitude degrees should be projected to a suitable planar CRS prior to partitioning to avoid high-latitude distortion.

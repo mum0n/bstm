@@ -1354,13 +1354,13 @@ end
         half_x, half_y = ls_x / 2.0, ls_y / 2.0
 
         for c in final_centroids_raw
-            coords = [[[
-    [Float64(c[1]-half_x), Float64(c[2]-half_y)],
-    [Float64(c[1]+half_x), Float64(c[2]-half_y)],
-    [Float64(c[1]+half_x), Float64(c[2]+half_y)],
-    [Float64(c[1]-half_x), Float64(c[2]+half_y)],
-    [Float64(c[1]-half_x), Float64(c[2]-half_y)]
-]]]
+            coords = [[
+                [Float64(c[1]-half_x), Float64(c[2]-half_y)],
+                [Float64(c[1]+half_x), Float64(c[2]-half_y)],
+                [Float64(c[1]+half_x), Float64(c[2]+half_y)],
+                [Float64(c[1]-half_x), Float64(c[2]+half_y)],
+                [Float64(c[1]-half_x), Float64(c[2]-half_y)]
+            ]]
             p_geom = LibGEOS.Polygon(coords)
             if !isnothing(geom_hull)
                 p_geom = LibGEOS.intersection(p_geom, geom_hull)
@@ -1515,6 +1515,7 @@ end
         W = W,
         hull_coords = hull_coords,
         s_idx = new_assigns,
+        assignments = new_assigns,
         s_x = s_x,
         s_y = s_y,
         s_vals = collect(1:size(W, 1)),

@@ -354,11 +354,9 @@ function get_effects(
                   "Returning zero-matrix."
             factor_effect = zeros(Float64, n_obs_full, n_samples) # Initialize with zeros
         else
-            # Samples are on CPU.
             factor_samples_train = get_params_vector(
-                chain, factors_flat_name, n_obs_train * n_factors # (n_samples,
-                    n_obs_train * n_factors)
-            )
+                chain, factors_flat_name, n_obs_train * n_factors
+            ) # (n_samples, n_obs_train * n_factors)
             # Reshape the flat [n_samples, n_params] matrix into a 3D tensor
             # [n_obs, n_factors, n_samples]
             F_tensor = reshape(factor_samples_train', n_obs_train, n_factors, n_samples)

@@ -246,23 +246,29 @@ function get_updates(
         t_rho_val = hasproperty(t_spec.component_obj, :rho) ? 
                     string(t_p_names.rho) : "nothing"
 
+        diag_Ls_expr = "s_hyper.L"
+        diag_Lt_expr = "t_hyper.L"
+
         spectral_code = """
             # --- Spatiotemporal Interaction (Spectral): $(spec.key) ---
             let
                 s_hyper = spec_registry[:$(s_spec.key)].hyper
                 t_hyper = spec_registry[:$(t_spec.key)].hyper
                 
-                diag_Ls = (1.0 .- $(s_rho_val)) .+ $(s_rho_val) .* s_hyper.L
-                diag_Lt = (1.0 .- $(t_rho_val)) .+ $(t_rho_val) .* t_hyper.L
+                n_s = s_hyper.n_latent
+                n_t = t_hyper.n_latent
                 
-                diag_D_s = $(p_names.sigma) ./ sqrt.(diag_Ls .+ M.noise)
-                diag_D_t = 1.0 ./ sqrt.(diag_Lt .+ M.noise)
+                diag_Ls = $(diag_Ls_expr)
+                diag_Lt = $(diag_Lt_expr)
                 
-                Z_matrix = reshape($(p_names.ure), M.s_N, M.t_N)
+                diag_D_s = $(p_names.sigma) ./ sqrt.(abs.(diag_Ls) .+ M.noise)
+                diag_D_t = 1.0 ./ sqrt.(abs.(diag_Lt) .+ M.noise)
+                
+                Z_matrix = reshape($(p_names.ure), n_s, n_t)
                 transformed = (diag_D_s .* Z_matrix) .* diag_D_t'
                 $(p_names.sre) = s_hyper.U * transformed * t_hyper.U'
                 
-                st_idx = (M.t_idx .- 1) .* M.s_N .+ M.s_idx
+                st_idx = (M.t_idx .- 1) .* n_s .+ M.s_idx
                 $(eta_target) = $(eta_target) .+ view($(p_names.sre), st_idx)
             end
         """
@@ -278,15 +284,19 @@ function get_updates(
             # --- Spatiotemporal Interaction (Cholesky): $(spec.key) ---
             let
                 $(cholesky_base_code)
+                s_hyper = spec_registry[:$(s_spec.key)].hyper
+                t_hyper = spec_registry[:$(t_spec.key)].hyper
+                n_s = s_hyper.n_latent
+                n_t = t_hyper.n_latent
                 C_s = cholesky(Symmetric(Matrix(Q_s) + M.noise * I))
                 C_t = cholesky(Symmetric(Matrix(Q_t) + M.noise * I))
-                Z_matrix = reshape($(p_names.ure), M.s_N, M.t_N)
+                Z_matrix = reshape($(p_names.ure), n_s, n_t)
                 tmp_spatial = C_s.L' \\ Z_matrix
                 st_field_unscaled = transpose(C_t.L' \\ transpose(tmp_spatial))
-                Turing.@addlogprob! logpdf(Normal(0, 0.001 * (M.s_N * M.t_N)),
+                Turing.@addlogprob! logpdf(Normal(0, 0.001 * (n_s * n_t)),
                   sum(st_field_unscaled))
                 $(p_names.sre) = st_field_unscaled .* $(p_names.sigma)
-                st_idx = (M.t_idx .- 1) .* M.s_N .+ M.s_idx
+                st_idx = (M.t_idx .- 1) .* n_s .+ M.s_idx
                 $(eta_target) = $(eta_target) .+ view($(p_names.sre), st_idx)
             end
         """
@@ -407,9 +417,7 @@ function get_effects(
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            ure_samples = get_params_matrix(chain, ure_name, n_spatial * n_basis) # (n_samples,
-                n_spatial * n_basis)
-            
+            ure_samples = get_params_matrix(chain, ure_name, n_spatial * n_basis) # (n_samples, n_spatial * n_basis)
             state_p_names = generate_full_variable_names(state_spec, M.model_arch, k)
             state_model_type = Symbol(lowercase(string(typeof(state_spec.component_obj))))
             Q_spatial_template = state_spec.hyper.Q_template
@@ -446,17 +454,41 @@ function get_effects(
         Q_s_template = s_spec.hyper.Q_template
         Q_t_template = t_spec.hyper.Q_template
         
-        s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # Combine spatial indices
-            vcat(M.s_idx, PS.data.s_idx) 
+        s_var = Symbol(s_spec.var)
+        t_var = Symbol(t_spec.var)
+
+        s_train = hasproperty(M, :data) && hasproperty(M.data, s_var) ? M.data[!, s_var] : M.s_idx
+        t_train = hasproperty(M, :data) && hasproperty(M.data, t_var) ? M.data[!, t_var] : M.t_idx
+
+        s_idx_full = if !isnothing(PS)
+            s_pred = if hasproperty(PS.data, s_var)
+                PS.data[!, s_var]
+            elseif hasproperty(PS.data, :s_idx)
+                PS.data.s_idx
+            else
+                fill(1, nrow(PS.data))
+            end
+            vcat(s_train, s_pred)
         else
-            M.s_idx
+            s_train
         end
-        t_idx_full = if !isnothing(PS) && hasproperty(PS.data, :t_idx) # Combine temporal indices
-            vcat(M.t_idx, PS.data.t_idx) 
+
+        t_idx_full = if !isnothing(PS)
+            t_pred = if hasproperty(PS.data, t_var)
+                PS.data[!, t_var]
+            elseif hasproperty(PS.data, :t_idx)
+                PS.data.t_idx
+            else
+                fill(1, nrow(PS.data))
+            end
+            vcat(t_train, t_pred)
         else
-            M.t_idx
+            t_train
         end
-        st_idx_full = (t_idx_full .- 1) .* s_N .+ s_idx_full
+
+        s_idx_int = clamp.(Int.(round.(s_idx_full)), 1, s_N)
+        t_idx_int = clamp.(Int.(round.(t_idx_full)), 1, t_N)
+        st_idx_full = (t_idx_int .- 1) .* s_N .+ s_idx_int
         N_total = length(st_idx_full)
 
         for k in 1:outcomes_N
@@ -490,29 +522,52 @@ function get_effects(
             # Initialize the output matrix for the full effect
             effect_k = zeros(Float64, N_total, n_samples)
 
-            # --- Sample-wise Reconstruction ---
-            for i in 1:n_samples # Iterate over each posterior sample
-                sigma_i = sigma_samples[i, 1] # Scalar sigma for current sample
-                ure_i = ure_samples[i, :] # Innovations for current sample
-                s_rho_val = isnothing(s_rho_samples) ? nothing : s_rho_samples[i, 1]
-                t_rho_val = isnothing(t_rho_samples) ? nothing : t_rho_samples[i, 1]
+            has_spectral = hasproperty(s_spec.hyper, :U) && hasproperty(s_spec.hyper, :L) &&
+                           hasproperty(t_spec.hyper, :U) && hasproperty(t_spec.hyper, :L)
+
+            if has_spectral
+                s_U = s_spec.hyper.U
+                s_L = s_spec.hyper.L
+                t_U = t_spec.hyper.U
+                t_L = t_spec.hyper.L
                 
-                # Recompose precision matrices on the CPU
-                Q_s = recompose_precision(s_model_type, Q_s_template, 1.0; extra_param=s_rho_val)
-                Q_t = recompose_precision(t_model_type, Q_t_template, 1.0; extra_param=t_rho_val)
-                
-                # Perform Cholesky and back-solve
-                C_s = cholesky(Symmetric(Matrix(Q_s) + noise * I))
-                C_t = cholesky(Symmetric(Matrix(Q_t) + noise * I))
-                
-                Z_matrix = reshape(ure_i, s_N, t_N) # Reshape innovations to (s_N, t_N) grid
-                tmp_spatial = C_s.L' \ Z_matrix # Back-solve for spatial component
-                st_field_unscaled = transpose(C_t.L' \ transpose(tmp_spatial)) # Back-solve for temporal component
-                
-                st_field_unscaled .-= mean(st_field_unscaled)
-                st_field = st_field_unscaled .* sigma_i
-                
-                effect_k[:, i] = vec(st_field)[st_idx_full] # Flatten and index
+                diag_D_s_base = 1.0 ./ sqrt.(abs.(s_L) .+ noise)
+                diag_D_t = 1.0 ./ sqrt.(abs.(t_L) .+ noise)
+
+                for i in 1:n_samples
+                    sigma_i = sigma_samples[i, 1]
+                    ure_i = ure_samples[i, :]
+                    
+                    diag_D_s = sigma_i .* diag_D_s_base
+                    Z_matrix = reshape(ure_i, s_N, t_N)
+                    transformed = (diag_D_s .* Z_matrix) .* diag_D_t'
+                    st_field = s_U * transformed * t_U'
+                    
+                    effect_k[:, i] = vec(st_field)[st_idx_full]
+                end
+            else
+                # Fallback to Cholesky reconstruction
+                for i in 1:n_samples
+                    sigma_i = sigma_samples[i, 1]
+                    ure_i = ure_samples[i, :]
+                    s_rho_val = isnothing(s_rho_samples) ? nothing : s_rho_samples[i, 1]
+                    t_rho_val = isnothing(t_rho_samples) ? nothing : t_rho_samples[i, 1]
+                    
+                    Q_s = recompose_precision(s_model_type, Q_s_template, 1.0; extra_param=s_rho_val)
+                    Q_t = recompose_precision(t_model_type, Q_t_template, 1.0; extra_param=t_rho_val)
+                    
+                    C_s = cholesky(Symmetric(Matrix(Q_s) + max(noise, 1e-4) * I))
+                    C_t = cholesky(Symmetric(Matrix(Q_t) + max(noise, 1e-4) * I))
+                    
+                    Z_matrix = reshape(ure_i, s_N, t_N)
+                    tmp_spatial = C_s.L' \ Z_matrix
+                    st_field_unscaled = transpose(C_t.L' \ transpose(tmp_spatial))
+                    
+                    st_field_unscaled .-= mean(st_field_unscaled)
+                    st_field = st_field_unscaled .* sigma_i
+                    
+                    effect_k[:, i] = vec(st_field)[st_idx_full]
+                end
             end
             
             push!(structured_effects, effect_k)

@@ -64,10 +64,9 @@ Provides canonical name resolution and sample extraction across all MCMC chain f
 mutable struct ParamRegistry
     names::Vector{String}                                              # Canonical string names
     descriptors::Dict{Symbol, ParamDescriptor}                         # Symbol -> ParamDescriptor
-    by_component::Dict{Symbol, Dict{Symbol, Vector{ParamDescriptor}}} # component_key ->
-      role -> [descriptors]
-    by_base::Dict{String, Vector{String}} # base name -> list of matching full names
-    name_to_key::Dict{String, Any} # String/Symbol in chain -> actual indexing key
+    by_component::Dict{Symbol, Dict{Symbol, Vector{ParamDescriptor}}} # component_key -> role -> [descriptors]
+    by_base::Dict{String, Vector{String}}                              # base name -> list of matching full names
+    name_to_key::Dict{String, Any}                                     # String/Symbol in chain -> actual indexing key
 end
 
 # Default empty constructor
@@ -204,6 +203,21 @@ function build_param_registry(M::NamedTuple)
                 is_shared = true,
                 shape = (n_fixed,)
             ))
+        end
+
+        # Register Errors-in-Variables (EIV) latent innovations
+        if haskey(M, :Xfixed_eiv_map) && !isempty(M.Xfixed_eiv_map)
+            for (col_sym, sd_vec) in M.Xfixed_eiv_map
+                add_descriptor!(reg, ParamDescriptor(
+                    Symbol("ure_eiv_$(col_sym)");
+                    component_key = :fixed,
+                    role = :eiv_innovations,
+                    outcome_idx = nothing,
+                    is_shared = true,
+                    shape = (M.y_N,),
+                    prior = Normal(0, 1)
+                ))
+            end
         end
     end
 

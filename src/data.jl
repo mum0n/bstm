@@ -32,8 +32,14 @@ Consolidated synthetic and benchmark dataset generator for BSTM models.
 - `"logistic_spatial_k"`: Logistic growth with spatially varying carrying capacity K.
 - `"logistic_spatial_r"`: Logistic growth with spatially varying growth rate r.
 - `"leslie_matrix"`: Multivariate Leslie matrix dynamics dataset.
-- `"dirichlet_multinomial"`: Dirichlet-Multinomial spatial composition dataset.
-- `"generalized_leslie_matrix"`: Generalized Leslie stage-structured dataset.
+- `"hierarchical"` / `"marine_ecosystem"` / `"multi_tier"`: 5-tier marine ecological
+  pipeline bundle returning a NamedTuple: `(bathymetry, substrate, temperature, species_composition, snow_crab)`.
+- `"bathymetry"`: Tier 1 continuous bathymetric soundings dataset.
+- `"substrate"`: Tier 2 benthic sediment grab stations dataset.
+- `"temperature"` / `"ctd"`: Tier 3 hydrographic CTD casts across 10 years.
+- `"species_composition"` / `"community"` / `"trawl"`: Tier 4 multi-species survey haul records across 30 species.
+- `"snow_crab"` / `"crab"`: Tier 5 target species survey tows and demographic biomass records.
+- `"telemetry"` / `"adr"` / `"adr_telemetry"`: Joint population density survey and mark-recapture telemetry bundle.
 
 # Common Keyword Arguments:
 - `s_N::Int = 10`: Number of spatial units.
@@ -52,13 +58,17 @@ Consolidated synthetic and benchmark dataset generator for BSTM models.
 - `n_groups::Int = 10`: Group count for random intercepts.
 - `n_obs_per_st_unit::Int = 1`: Observations per space-time unit.
 - `n_obs_per_unit::Int = 10`: Observations per unit for Dirichlet-Multinomial.
-- `n_units::Int = 25`: Spatial units for Dirichlet-Multinomial.
+- `n_units::Int = 25`: Spatial units for Dirichlet-Multinomial / telemetry simulation.
 - `n_categories::Int = 3`: Category count for multinomial models.
+- `domain_size::Float64 = 600.0`: Domain extent for telemetry ADR simulation.
+- `n_marks::Int = 100`: Number of marked individuals for telemetry simulation.
+- `area_method::Symbol = :cvt`: Tessellation method for telemetry spatial network.
 - `use_effort::Bool = false`: Include effort covariate.
 - `use_removal::Bool = false`: Include removal covariate.
 """
 function bstm_data(
-    type::Union{String, Symbol} = "scottish_lip";
+    type_pos::Union{String, Symbol, Nothing} = nothing;
+    type::Union{String, Symbol, Nothing} = nothing,
     s_N::Int = 10,
     t_N::Int = 5,
     n_years::Int = 10,
@@ -77,13 +87,47 @@ function bstm_data(
     n_obs_per_unit::Int = 10,
     n_units::Int = 25,
     n_categories::Int = 3,
+    domain_size::Float64 = 600.0,
+    n_marks::Int = 100,
+    area_method::Symbol = :cvt,
     use_effort::Bool = false,
     use_removal::Bool = false
 )
     actual_seed = seed !== nothing ? seed : rndseed
-    type_str = lowercase(string(type))
+    resolved_type = if type !== nothing
+        type
+    elseif type_pos !== nothing
+        type_pos
+    else
+        "scottish_lip"
+    end
+    type_str = lowercase(string(resolved_type))
 
-    if type_str in ["scottish_lip", "scottish"]
+    if type_str in ["hierarchical", "hierarchical_workflow", "marine_ecosystem", "multi_tier"]
+        return generate_mock_hierarchical_datasets(seed=actual_seed)
+
+    elseif type_str in ["bathymetry", "tier1_bathymetry"]
+        return generate_mock_hierarchical_datasets(seed=actual_seed).bathymetry
+
+    elseif type_str in ["substrate", "tier2_substrate"]
+        return generate_mock_hierarchical_datasets(seed=actual_seed).substrate
+
+    elseif type_str in ["temperature", "tier3_temperature", "ctd"]
+        return generate_mock_hierarchical_datasets(seed=actual_seed).temperature
+
+    elseif type_str in ["species_composition", "tier4_species", "community", "trawl"]
+        return generate_mock_hierarchical_datasets(seed=actual_seed).species_composition
+
+    elseif type_str in ["snow_crab", "tier5_snow_crab", "crab"]
+        return generate_mock_hierarchical_datasets(seed=actual_seed).snow_crab
+
+    elseif type_str in ["telemetry", "adr", "adr_telemetry"]
+        rng = MersenneTwister(actual_seed)
+        return generate_ADR_simulation_bundle(
+            domain_size, n_units, n_years, n_marks; area_method=area_method, rng=rng
+        )
+
+    elseif type_str in ["scottish_lip", "scottish"]
         cache_path = "data/scottish_lip_cancer_cache.jld2"
 
         if isfile(cache_path) && !recreate
@@ -951,15 +995,16 @@ function bstm_data(
 
     else
         throw(ArgumentError("Unknown dataset type '$type'. Supported types are: " *
-            "scottish_lip, ordinal, sim, lgcp_regular, lgcp_irregular, advanced, " *
-            "logistic, delay_difference, glv, lotka_volterra, leslie_logistic, " *
-            "logistic_spatial_k, logistic_spatial_r, leslie_matrix, " *
+            "scottish_lip, hierarchical, bathymetry, substrate, temperature, " *
+            "species_composition, snow_crab, telemetry, ordinal, sim, lgcp_regular, " *
+            "lgcp_irregular, advanced, logistic, delay_difference, glv, lotka_volterra, " *
+            "leslie_logistic, logistic_spatial_k, logistic_spatial_r, leslie_matrix, " *
             "dirichlet_multinomial, generalized_leslie_matrix."))
     end
 end
 
 # ==============================================================================
-# Internal Helper Functions
+# Internal Helper Functions & Multi-Tier Ecosystem Generator
 # ==============================================================================
 
 function create_base_st_data(;
@@ -992,4 +1037,247 @@ function create_base_st_data(;
         grid_area_col=repeat(grid_areas, inner=t_N * n_obs_per_st_unit)
     )
     return df, W, grid_areas
+end
+
+"""
+    generate_mock_hierarchical_datasets(; seed=42, N_bathy=1000, N_sub=500, N_temp_per_year=100, N_hauls_per_year=50, N_crab_per_year=40) -> NamedTuple
+
+Generates a complete multi-tier synthetic marine ecological dataset bundle with independent
+sampling geometries across all 5 tiers:
+1. `bathymetry`: N = 1,000 continuous bathymetric soundings with depth variations.
+2. `substrate`: N = 500 benthic grab stations with log grain size measurements.
+3. `temperature`: N = 1,000 hydrographic CTD casts across 10 years and multiple seasons.
+4. `species_composition`: N = 15,000 trawl haul records across 30 marine fish & invertebrate species.
+5. `snow_crab`: N = 400 survey tows capturing target species biomass and demographics.
+
+# Outputs:
+- NamedTuple: `(bathymetry=df_bathy, substrate=df_sub, temperature=df_temp, species_composition=df_species, snow_crab=df_crab)`
+"""
+function generate_mock_hierarchical_datasets(;
+    seed::Int=42,
+    N_bathy::Int=1000,
+    N_sub::Int=500,
+    N_temp_per_year::Int=100,
+    N_hauls_per_year::Int=50,
+    N_crab_per_year::Int=40
+)
+    rng = MersenneTwister(seed)
+
+    # --------------------------------------------------------------------------
+    # TRUE LATENT PHYSICAL FIELDS (Generative Ground Truth)
+    # --------------------------------------------------------------------------
+    # True Bathymetry Surface: Shelf basin with banks and submarine canyons
+    true_depth(x, y) = 180.0 - 1.2 * x + 0.8 * y + 
+                       35.0 * sin(x / 12.0) * cos(y / 12.0) + 
+                       15.0 * sin(x / 25.0)
+
+    # True Bathymetric Gradient & Slope Magnitude
+    true_slope(x, y) = begin
+        dz_dx = -1.2 + (35.0/12.0) * cos(x / 12.0) * cos(y / 12.0) + (15.0/25.0) * cos(x / 25.0)
+        dz_dy = 0.8 - (35.0/12.0) * sin(x / 12.0) * sin(y / 12.0)
+        sqrt(dz_dx^2 + dz_dy^2)
+    end
+
+    # True Substrate Log Grain Size (mm) (Coarse on banks/slopes, fine in deep basins)
+    true_grain(x, y) = 1.8 - 0.008 * true_depth(x, y) + 
+                       0.15 * true_slope(x, y) + 
+                       0.4 * sin(x / 15.0)
+
+    # True Bottom Temperature (°C)
+    true_temperature(x, y, month, year) = begin
+        z = true_depth(x, y)
+        year_idx = year - 2014
+        # Thermal stratification + seasonal harmonic lag + interannual warming trend
+        5.5 - 0.012 * z + 
+        3.2 * sin(2π * (month - 3.0) / 12.0) + 
+        0.18 * year_idx + 
+        0.5 * sin(x / 20.0) * cos(y / 20.0)
+    end
+
+    # --------------------------------------------------------------------------
+    # 1. TIER 1: BATHYMETRIC SOUNDINGS
+    # --------------------------------------------------------------------------
+    bx = rand(rng, Uniform(5.0, 95.0), N_bathy)
+    by = rand(rng, Uniform(5.0, 95.0), N_bathy)
+    b_depth = [true_depth(x, y) + randn(rng) * 2.5 for (x, y) in zip(bx, by)]
+
+    df_bathy = DataFrame(
+        sounding_id = 1:N_bathy,
+        s_x = bx,
+        s_y = by,
+        depth = b_depth
+    )
+
+    # --------------------------------------------------------------------------
+    # 2. TIER 2: BENTHIC SUBSTRATE SAMPLES
+    # --------------------------------------------------------------------------
+    sub_x = rand(rng, Uniform(5.0, 95.0), N_sub)
+    sub_y = rand(rng, Uniform(5.0, 95.0), N_sub)
+    sub_grain = [true_grain(x, y) + randn(rng) * 0.35 for (x, y) in zip(sub_x, sub_y)]
+    sub_class = [g < -0.5 ? "Mud/Silt" : (g > 1.0 ? "Gravel/Cobble" : "Sand") for g in sub_grain]
+
+    df_substrate = DataFrame(
+        station_id = 1:N_sub,
+        s_x = sub_x,
+        s_y = sub_y,
+        grain_size_phi = sub_grain,
+        log_grain_size = sub_grain,
+        grain = sub_grain,
+        substrate_type = sub_class
+    )
+
+    # --------------------------------------------------------------------------
+    # 3. TIER 3: SPATIOTEMPORAL BOTTOM TEMPERATURE (10 Years)
+    # --------------------------------------------------------------------------
+    years = 2015:2024
+    temp_records = DataFrame()
+
+    for yr in years
+        tx = rand(rng, Uniform(5.0, 95.0), N_temp_per_year)
+        ty = rand(rng, Uniform(5.0, 95.0), N_temp_per_year)
+        months = rand(rng, [3, 4, 5, 6, 7, 8, 9, 10, 11], N_temp_per_year)
+        t_vals = [true_temperature(x, y, m, yr) + randn(rng) * 0.45 for (x, y, m) in zip(tx, ty, months)]
+
+        df_yr = DataFrame(
+            cast_id = string("CTD_", yr, "_", lpad.(1:N_temp_per_year, 3, "0")),
+            year = fill(yr, N_temp_per_year),
+            month = months,
+            s_x = tx,
+            s_y = ty,
+            bottom_temperature = t_vals
+        )
+        append!(temp_records, df_yr)
+    end
+    df_temperature = temp_records
+
+    # --------------------------------------------------------------------------
+    # 4. TIER 4: MULTI-SPECIES COMPOSITION (30 Species)
+    # --------------------------------------------------------------------------
+    species_list = [
+        "Gadus_morhua", "Melanogrammus_aeglefinus", "Pollachius_virens", "Sebastes_fasciatus",
+        "Hippoglossus_hippoglossus", "Reinhardtius_hippoglossoides", "Glyptocephalus_cynoglossus",
+        "Hippoglossoides_platessoides", "Limanda_ferruginea", "Pseudopleuronectes_americanus",
+        "Merluccius_bilinearis", "Urophycis_tenuis", "Anarhichas_lupus", "Amblyraja_radiata",
+        "Malacoraja_senta", "Squalus_acanthias", "Clupea_harengus", "Scomber_scombrus",
+        "Mallotus_villosus", "Ammodytes_dubius", "Illex_illecebrosus", "Pandalus_borealis",
+        "Homarus_americanus", "Placopecten_magellanicus", "Strongylocentrotus_droebachiensis",
+        "Ophiura_sarsii", "Pagurus_acadienus", "Cancer_irroratus", "Hyas_coarctatus", "Lithodes_maja"
+    ]
+    K_species = length(species_list)
+
+    species_opt_temp = rand(rng, Uniform(1.5, 9.0), K_species)
+    species_opt_depth = rand(rng, Uniform(60.0, 260.0), K_species)
+    species_opt_grain = rand(rng, Uniform(-1.5, 2.0), K_species)
+    species_base_density = rand(rng, Uniform(5.0, 80.0), K_species)
+
+    species_records = DataFrame()
+
+    for yr in years
+        hx = rand(rng, Uniform(5.0, 95.0), N_hauls_per_year)
+        hy = rand(rng, Uniform(5.0, 95.0), N_hauls_per_year)
+        months = rand(rng, [6, 7, 8, 9, 10], N_hauls_per_year)
+        efforts = rand(rng, Uniform(0.75, 1.35), N_hauls_per_year)
+
+        for h in 1:N_hauls_per_year
+            x, y, m, eff = hx[h], hy[h], months[h], efforts[h]
+            z_loc = true_depth(x, y)
+            g_loc = true_grain(x, y)
+            t_loc = true_temperature(x, y, m, yr)
+            haul_tag = string("HAUL_", yr, "_", lpad(h, 3, "0"))
+
+            for k in 1:K_species
+                t_suit = exp(-0.5 * ((t_loc - species_opt_temp[k]) / 2.2)^2)
+                z_suit = exp(-0.5 * ((z_loc - species_opt_depth[k]) / 45.0)^2)
+                g_suit = exp(-0.5 * ((g_loc - species_opt_grain[k]) / 1.2)^2)
+
+                lambda_bio = species_base_density[k] * t_suit * z_suit * g_suit * eff
+
+                p_presence = 1.0 - exp(-0.15 * lambda_bio)
+                if rand(rng) < p_presence
+                    catch_kg = rand(rng, Gamma(2.5, max(0.1, lambda_bio) / 2.5))
+                    catch_cnt = rand(rng, Poisson(max(1.0, lambda_bio * 3.0)))
+                else
+                    catch_kg = 0.0
+                    catch_cnt = 0
+                end
+
+                push!(species_records, (
+                    haul_id = haul_tag,
+                    year = yr,
+                    month = m,
+                    s_x = x,
+                    s_y = y,
+                    swept_area_km2 = eff,
+                    species = species_list[k],
+                    biomass_kg = round(catch_kg, digits=2),
+                    count = catch_cnt
+                ))
+            end
+        end
+    end
+    df_species_comp = species_records
+
+    # --------------------------------------------------------------------------
+    # 5. TIER 5: SNOW CRAB ABUNDANCE & DEMOGRAPHICS (10 Years)
+    # --------------------------------------------------------------------------
+    crab_records = DataFrame()
+
+    for yr in years
+        cx = rand(rng, Uniform(5.0, 95.0), N_crab_per_year)
+        cy = rand(rng, Uniform(5.0, 95.0), N_crab_per_year)
+        months = rand(rng, [6, 7, 8, 9], N_crab_per_year)
+        efforts = rand(rng, Uniform(0.8, 1.2), N_crab_per_year)
+
+        for c in 1:N_crab_per_year
+            x, y, m, eff = cx[c], cy[c], months[c], efforts[c]
+            z_loc = true_depth(x, y)
+            g_loc = true_grain(x, y)
+            t_loc = true_temperature(x, y, m, yr)
+            tow_tag = string("CRAB_", yr, "_", lpad(c, 3, "0"))
+
+            t_niche = exp(-0.5 * ((t_loc - 2.5) / 1.8)^2)
+            z_niche = exp(-0.5 * ((z_loc - 140.0) / 40.0)^2)
+            g_niche = exp(-0.5 * ((g_loc - (-0.8)) / 0.9)^2)
+
+            base_abundance = 120.0 * t_niche * z_niche * g_niche * eff
+
+            p_pres = 1.0 - exp(-0.08 * base_abundance)
+            if rand(rng) < p_pres
+                total_kg = rand(rng, Gamma(3.0, max(0.5, base_abundance) / 3.0))
+                mature_male_kg   = round(total_kg * rand(rng, Uniform(0.40, 0.65)), digits=2)
+                immature_male_kg = round(total_kg * rand(rng, Uniform(0.15, 0.35)), digits=2)
+                female_kg        = round(max(0.0, total_kg - mature_male_kg - immature_male_kg), digits=2)
+                total_count      = round(Int, total_kg * rand(rng, Uniform(1.8, 3.2)))
+            else
+                total_kg = 0.0
+                mature_male_kg = 0.0
+                immature_male_kg = 0.0
+                female_kg = 0.0
+                total_count = 0
+            end
+
+            push!(crab_records, (
+                tow_id = tow_tag,
+                year = yr,
+                month = m,
+                s_x = x,
+                s_y = y,
+                swept_area_km2 = eff,
+                total_biomass_kg = round(total_kg, digits=2),
+                mature_male_kg = mature_male_kg,
+                immature_male_kg = immature_male_kg,
+                female_kg = female_kg,
+                total_count = total_count
+            ))
+        end
+    end
+    df_snow_crab = crab_records
+
+    return (
+        bathymetry = df_bathy,
+        substrate = df_substrate,
+        temperature = df_temperature,
+        species_composition = df_species_comp,
+        snow_crab = df_snow_crab
+    )
 end

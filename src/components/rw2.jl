@@ -190,6 +190,7 @@ function get_updates(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
+    inner_hyper_access = "spec_registry[:$(key)].hyper"
 
     statespace_code = """
         # --- RW2 Component: $(key) (State-Space Method) ---
@@ -265,9 +266,9 @@ function get_updates(
             N_t = $(inner_hyper_access).N_t
             S_t = $(inner_hyper_access).S_t
             n_t = $(inner_hyper_access).n_latent
-            y_obs_k = $(outcome_idx <= M.outcomes_N ? (M.model_arch == "multivariate" ?
+            y_obs_k = $((isnothing(outcome_idx) || outcome_idx <= M.outcomes_N) ? (M.model_arch == "multivariate" ?
               "M.y_obs[:, $(outcome_idx)]" : "M.y_obs") : "zeros(M.y_N)")
-            y_sig = $(outcome_idx <= M.outcomes_N ? "y_sigma" : "1.0")
+            y_sig = $((isnothing(outcome_idx) || outcome_idx <= M.outcomes_N) ? "y_sigma" : "1.0")
             
             log_lik_marginalized_$(key) = _marginalized_latent_gaussian_logpdf(
                 y_obs_k,

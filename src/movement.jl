@@ -393,17 +393,33 @@ function simulate_mechanistic_trajectories(
 end
 
 """
-    compute_suitability_transition_kernel(suitability_vec, W;
-                                          sensitivity=1.0, diffusion_weight=0.1)
+    compute_suitability_transition_kernel(
+        suitability_vec, W;
+        sensitivity=1.0, diffusion_weight=0.1, relationship=:exponential
+    )
 
-Generates a spatial Markov transition kernel based on local habitat suitability differences:
-\$\\Gamma_{ij} \\propto \\exp(\\beta \\cdot \\text{suitability}_j) + D_{\\text{weight}}\$.
+Generates a spatial Markov transition probability kernel based on local habitat
+suitability index (HSI) differences and network topology:
+- `:exponential` (default): \$\\Gamma_{ij} \\propto \\exp(\\beta \\cdot \\text{HSI}_j) + D_{\\text{weight}}\$
+- `:linear`: \$\\Gamma_{ij} \\propto (1 + \\beta \\cdot \\text{HSI}_j) + D_{\\text{weight}}\$
+- `:logistic`: \$\\Gamma_{ij} \\propto \\frac{1}{1 + \\exp(-\\beta \\cdot \\text{HSI}_j)} + D_{\\text{weight}}\$
+
+# Arguments
+- `suitability_vec::AbstractVector{<:Real}`: Habitat Suitability Index (HSI) values (\$S\$).
+- `W::AbstractMatrix`: Spatial adjacency weights matrix (\$S \\times S\$).
+- `sensitivity::Real`: Advective response sensitivity (\$\\beta \\ge 0\$).
+- `diffusion_weight::Real`: Baseline isotropic dispersal weight (\$D_{\\text{weight}} \\ge 0\$).
+- `relationship::Symbol`: Functional relationship (`:exponential`, `:linear`, `:logistic`).
+
+# Returns
+- `SparseMatrixCSC{Float64, Int}`: Row-stochastic Markov transition probability matrix.
 """
 function compute_suitability_transition_kernel(
     suitability_vec::AbstractVector{T},
     W::AbstractMatrix;
     sensitivity::Real = 1.0,
-    diffusion_weight::Real = 0.1
+    diffusion_weight::Real = 0.1,
+    relationship::Symbol = :exponential
 ) where T <: Real
 
     n_spatial = length(suitability_vec)
@@ -412,13 +428,29 @@ function compute_suitability_transition_kernel(
     vals = nonzeros(W)
     
     for i in 1:n_spatial
-        Gamma[i, i] = exp(sensitivity * suitability_vec[i])
+        h_i = suitability_vec[i]
+        bias_i = if relationship == :exponential
+            exp(sensitivity * h_i)
+        elseif relationship == :logistic
+            1.0 / (1.0 + exp(-sensitivity * h_i))
+        else # :linear
+            max(0.01, 1.0 + sensitivity * h_i)
+        end
+        Gamma[i, i] = bias_i
+
         for j_idx in nzrange(W, i)
             j = rows[j_idx]
             if i == j
                 continue
             end
-            suitability_bias = exp(sensitivity * suitability_vec[j])
+            h_j = suitability_vec[j]
+            suitability_bias = if relationship == :exponential
+                exp(sensitivity * h_j)
+            elseif relationship == :logistic
+                1.0 / (1.0 + exp(-sensitivity * h_j))
+            else # :linear
+                max(0.01, 1.0 + sensitivity * h_j)
+            end
             edge_weight = vals[j_idx]
             Gamma[i, j] = (suitability_bias + diffusion_weight) * edge_weight
         end

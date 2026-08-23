@@ -16,9 +16,9 @@ The **Bayesian Spatio-Temporal Modeling (`bstm`)** framework provides a composab
 2. **Algebra of Model Components**:
    Model formulas support algebraic operators (`+`, `⊗`, `|>`, `∘`) to compose high-dimensional Kronecker space-time interactions, spatially-varying coefficients, and multi-fidelity hierarchies.
 3. **Automatic Differentiability (AD-First)**:
-   All component constructors and latent transformations are designed for ForwardDiff, ReverseDiff, and Zygote compatibility, eliminating numerical bottlenecks in gradient-based samplers like NUTS.
+   All component constructors and latent transformations are designed for Automatic Differentiation compatibility, eliminating numerical bottlenecks in gradient-based samplers like NUTS.
 4. **End-to-End Workflow Integration**:
-   `bstm` centralizes the entire modeling lifecycle: continuous spatial discretization $\to$ topological graph extraction $\to$ prior predictive checking $\to$ adaptive block-sampling $\to$ posterior parameter reconstruction $\to$ publication-ready visualization.
+   `bstm` centralizes the entire modeling lifecycle: continuous spatial discretization $\to$ topological graph extraction $\to$ prior predictive checking $\to$ adaptive block-sampling $\to$ posterior parameter reconstruction $\to$ analytical SQL querying $\to$ spatial block cross-validation $\to$ Bayesian DAG pipeline $\to$ cross-mesh resharding $\to$ hierarchical cut-posterior simulation $\to$ continuous field inference with flexible projection kernels $\to$ visualization.
 
 ```
                                ┌────────────────────────────────────────────────────────┐
@@ -157,7 +157,7 @@ The formula parser evaluates algebraic operators to create sophisticated spatiot
                             ┌───────────────────────────────────────────────┐
                             │              Formula Operators                │
                             ├───────────────────────┬───────────────────────┤
-                            │  Kronecker Product ⊗  │  Pipe Operator |>     │
+                            │  Kronecker Product ⊗ │  Pipe Operator |>     │
                             │  Space-Time GMRF      │  Varying Coefficients │
                             └───────────────────────┴───────────────────────┘
 ```
@@ -166,7 +166,9 @@ The formula parser evaluates algebraic operators to create sophisticated spatiot
 
 Constructs inseparable Knorr-Held (2000) Type I–IV spatiotemporal interactions via Kronecker precision algebra:
 
-$$Q_{st} = Q_t \otimes Q_s$$
+$$
+Q_{st} = Q_t \otimes Q_s
+$$
 
 ```julia
 # Knorr-Held Type IV interaction: Structured space (ICAR) evolving over smooth time (AR1)
@@ -326,11 +328,23 @@ Penalized Complexity (PC) priors (Simpson et al., 2017) provide an axiomatic fra
 #### Core Principles of PC Priors
 1. **Parsimony / Base Model**: Every complex component (e.g. spatial field, autocorrelation, non-linear spline) is viewed as an extension of a simpler "base model" (e.g., $\sigma = 0$ corresponds to no spatial field; $\rho = 0$ corresponds to independence; $\ell = \infty$ corresponds to a flat constant).
 2. **Information-Theoretic Distance**: Model divergence from the base model $f_0$ to the flexible model $f$ is measured using Kullback-Leibler Divergence (KLD):
-   $$d(f \parallel f_0) = \sqrt{2 \operatorname{KLD}(f \parallel f_0)}$$
+
+   $$
+   d(f \parallel f_0) = \sqrt{2 \operatorname{KLD}(f \parallel f_0)}
+   $$
+
 3. **Constant Rate Penalization**: Placing an Exponential prior on the distance $d$ yields an invariant prior that penalizes deviation from simplicity at a constant rate $\lambda$:
-   $$\pi(d) = \lambda \exp(-\lambda d)$$
+
+   $$
+   \pi(d) = \lambda \exp(-\lambda d)
+   $$
+
 4. **Intuitive Quantile Constraints**: Users parameterize the prior via an interpretable tail probability constraint $(U, \alpha)$:
-   $$P(\text{parameter} > U) = \alpha$$
+
+   $$
+   P(\text{parameter} > U) = \alpha
+   $$
+
    meaning: *"The prior probability that the effect scale exceeds $U$ is only $\alpha$ (e.g., 1% or 5%)."*
 
 #### Mathematical Quantile Formulations in `bstm`
@@ -415,7 +429,11 @@ In high-dimensional spatial and spatiotemporal Bayesian models, default unconstr
 #### A. Initial Step Size ($\epsilon$) Pre-Conditioning & Bounds
 * **The Failure Mode of Standard Search**: Turing's default `find_good_stepsize` initializes $\epsilon$ by doubling/halving until a single leapfrog acceptance probability is $\approx 0.5$. In high-dimensional spatial fields (e.g., $S = 500$ areas), steep local gradients at initial values frequently cause $\epsilon$ to collapse to $10^{-6} - 10^{-8}$, triggering maximum tree-depth stalls (1024 leapfrog steps per sample), or explode to $10^2$, causing immediate divergence.
 * **Dimensional Curvature Scaling**: Following Roberts & Rosenthal (2001), the optimal step size for a block of dimension $D$ scales as $\mathcal{O}(D^{-1/4})$. Standardized latent innovations (`ure ~ MvNormal(0, I)`) have Hessian curvature $\approx I$, yielding a robust initial proposal:
-  $$\epsilon_{\text{init}} = \text{clamp}\left(0.5 \cdot D^{-1/4},\, \text{min\_}\epsilon,\, \text{max\_}\epsilon\right)$$
+
+  $$
+  \epsilon_{\text{init}} = \operatorname{clamp}\left(0.5 \cdot D^{-1/4},\, \epsilon_{\min},\, \epsilon_{\max}\right)
+  $$
+
   - Global scalars ($D = 1-5$): $\epsilon \approx 0.35 - 0.50$.
   - Spatial fields ($D = 50-5000$): $\epsilon \approx 0.05 - 0.18$.
 * **Safe Envelopes (`min_ϵ` & `max_ϵ`)**: Clamping $\epsilon \in [10^{-4}, 1.0]$ guarantees the dual averaging controller begins inside a numerically stable region.
@@ -427,9 +445,12 @@ In high-dimensional spatial and spatiotemporal Bayesian models, default unconstr
 #### C. Maximum Tree Depth (`max_depth`) & Spectral Condition Numbers
 * **Harmonic Oscillator Stopping Time**: In Hamiltonian dynamics, a Gaussian target mode with variance $\sigma^2$ oscillates with period $T = 2\pi \sigma$. The optimal trajectory length before a U-turn is a half-period: $\tau^* = \pi \sigma_{\max}$.
 * **Spectral Condition Number Bound**: For GMRFs with precision eigenvalues $\lambda_1 \le \dots \le \lambda_n$, the condition number is $\kappa = \lambda_{\max} / \lambda_{\min}$. The steps required to traverse the slowest mode is $L^* \approx \pi \sqrt{\kappa}$, yielding the theoretical minimum tree depth:
-  $$\text{max\_depth}^* = \left\lceil \log_2\left(\pi \sqrt{\kappa}\right) \right\rceil = \left\lceil \log_2(\pi) + \frac{1}{2}\log_2(\kappa) \right\rceil$$
 
-| Model Structure | Condition Number $\kappa$ | Recommended $\text{max\_depth}$ | Recommended Target $\delta$ |
+  $$
+  \text{depth}_{\max}^* = \left\lceil \log_2\left(\pi \sqrt{\kappa}\right) \right\rceil = \left\lceil \log_2(\pi) + \frac{1}{2}\log_2(\kappa) \right\rceil
+  $$
+
+| Model Structure | Condition Number $\kappa$ | Recommended `max_depth` | Recommended Target $\delta$ |
 | :--- | :--- | :--- | :--- |
 | **Spectral / Non-Centered / Marginalized** | $\kappa \le 100$ | **$4 - 6$** (16–64 steps) | **$0.65$** (Fastest exploration) |
 | **Standard ICAR / BYM2 / Leroux / AR(1)** | $100 < \kappa \le 10^4$ | **$6 - 8$** (64–256 steps) | **$0.80$** (Balanced stability) |
@@ -447,14 +468,25 @@ In high-dimensional spatial and spatiotemporal Bayesian models, default unconstr
      - *Diagonal Metric*: Estimating coordinate marginal variances $\sigma_i^2$ scales as $\mathcal{O}(\sqrt{D})$.
      - *Dense Metric*: Estimating the $D(D+1)/2$ full covariance entries requires at least $3D - 5D$ draws for well-conditioned empirical covariance inversion.
 * **The `bstm` Principled Formula (`adaptation_steps = :auto`)**:
-  $$N_{\text{adapt}}^{\text{diag}}(D) = \text{clamp}\left(150 + 25 \sqrt{D}, \; 100, \; 1000\right)$$
-  $$N_{\text{adapt}}^{\text{dense}}(D) = \text{clamp}\left(150 + 4 D, \; 150, \; 1500\right)$$
+
+  $$
+  N_{\text{adapt}}^{\text{diag}}(D) = \operatorname{clamp}\left(150 + 25 \sqrt{D}, \; 100, \; 1000\right)
+  $$
+
+  $$
+  N_{\text{adapt}}^{\text{dense}}(D) = \operatorname{clamp}\left(150 + 4 D, \; 150, \; 1500\right)
+  $$
+
   If the spectral condition number $\kappa > 1000$, a $1.3\times$ multiplier is applied to account for slow modes. If total $N_{\text{samples}}$ is provided, adaptation is capped at $\min(N_{\text{adapt}}, \lceil 0.5 \cdot N_{\text{samples}} \rceil)$.
 
 #### E. Diagnostics: Tree-Depth Saturation & E-BFMI
 * **Tree-Depth Saturation ($f_{\text{sat}}$)**: The fraction of transitions hitting `max_depth`. If $f_{\text{sat}} > 0.05$ with zero divergences, increase `max_depth` by 1–2. If divergences exist, increase $\delta$ or use spectral reparameterization.
 * **Energy-Bayesian Fraction of Missing Information (E-BFMI)**:
-  $$\text{E-BFMI} = \frac{\sum_{i=1}^N (E_i - E_{i-1})^2}{\sum_{i=1}^N (E_i - \bar{E})^2}$$
+
+  $$
+  \text{E-BFMI} = \frac{\sum_{i=1}^N (E_i - E_{i-1})^2}{\sum_{i=1}^N (E_i - \bar{E})^2}
+  $$
+
   $\text{E-BFMI} \ge 0.3$ confirms the momentum distribution efficiently explores the energy spectrum.
 
 ---
@@ -485,7 +517,7 @@ println("Model RMSE: ", res.metrics.rmse)
 println("WAIC: ", res.metrics.waic)
 ```
 
-### 8.2. Publication-Ready Plotting Subsystem (`src/plotting.jl`)
+### 8.2. Plotting (`src/plotting.jl`)
 
 ```julia
 # 1. Generate full diagnostic and spatial effect plots
@@ -502,7 +534,7 @@ timeseries_ci(1:T, res.pstats.time_mean, res.pstats.time_lower, res.pstats.time_
 model_results_plots(res)
 ```
 
-### 8.3. Model State & Analytical Database Persistence (`src/input_output.jl`)
+### 8.3. Model State & Analytical Database Persistence and Sampling Updating (`src/input_output.jl`)
 
 `bstm` uses a two-tier decoupled architecture:
 - **JLD2 (`.jld2`)**: Full serialization of live Turing model states (`m`), data, and MCMC chains (`chn`).
@@ -521,9 +553,62 @@ bundle = load_bstm_bundle("runs/model_bym2")
 chn_extended = extend_sampling(bundle.model, bundle.chain, 500; progress=false)
 ```
 
-For full details, see:
+### 8.4. Modular DAG Pipeline & Cross-Mesh Resharding (`src/pipeline.jl`)
+
+The `bstm_pipeline` orchestrator coordinates multi-tier cut-posterior models, transferring
+spatial fields across mismatched irregular polygonal tessellations via geometric linear
+transfer operators ($P \in \mathbb{R}^{N_{\text{dest}} \times N_{\text{src}}}$):
+
+```julia
+pipe_res = bstm_pipeline(
+    :depth     => (formula = "likelihood(depth) ~ intercept() + random(s_x, s_y, model=rff)", data = df_bathy, derivatives = [:slope, :curvature, :bpi]),
+    :substrate => (formula = "likelihood(grain) ~ intercept() + fixed(depth_mu, error_sd=:depth_sd) + random(s_idx, model=bym2)", data = df_sub, au = au_sub),
+    :biology   => (formula = "likelihood(catch, family=gamma) ~ intercept() + fixed(grain_mu, error_sd=:grain_sd) + random(s_idx, model=bym2)", data = df_bio, au = au_master);
+    master_au = au_master,
+    duckdb_path = "project_db/pipeline.duckdb"
+)
+```
+
+### 8.5. Continuous Surface Derivatives & Differential Geometry (`src/derivatives.jl`)
+
+Calculates exact continuous surface derivatives ($\nabla z, \nabla^2 z$), slopes, compass
+aspects, profile/planform curvatures, and circular Bessel Bathymetric Position Indices
+($\text{BPI}_r$) directly across `RFF`, `SpectralGP`, `WaveletGP`, `SPDE`, `PSpline`, and `TPS`:
+
+```julia
+derivs = bstm_surface_derivatives(m_depth, chn_depth, query_coords; metrics=[:slope, :curvature, :bpi], radii=[10.0, 25.0])
+```
+
+### 8.6. Mechanistic Movement & Mark-Recapture Telemetry (`src/movement.jl`)
+
+Models Advection-Diffusion-Reaction population dynamics, integrating Lagrangian mark-recapture
+tracking encounters ($u_{\text{rel}} \to u_{\text{rec}}$) with optional Eulerian population abundance surveys.
+The advective drift velocity $\mathbf{v} \propto \nabla \text{HSI}$ is driven by Habitat Suitability Index
+surfaces with functional relationships (`:exponential`, `:linear`, or `:logistic`):
+
+```julia
+m_mov = @bstm(
+    likelihood(density, family=poisson) ~ 
+        intercept() + 
+        movement(
+            unit_id, year,
+            habitat = :habitat_p,
+            relationship = :exponential,
+            mark_recapture_data = df_telemetry,
+            velocity = Truncated(Normal(1.0, 0.5), 0.0, Inf),
+            diffusion = LogNormal(-0.5, 0.5)
+        ),
+    df_survey, W = au.W
+)
+```
+
+For comprehensive guides, see:
+- [**Integrated Hierarchical Workflows & ADR Telemetry** (`docs/hierarchical_workflow/hierarchical_workflow.md`)](hierarchical_workflow/hierarchical_workflow.md)
+- [**Advanced Hierarchical Workflows & Hydrodynamic Telemetry** (`docs/hierarchical_advanced/hierarchical_advanced.md`)](hierarchical_advanced/hierarchical_advanced.md)
+- [**Spatial & Spatiotemporal Partitioning Guide** (`docs/bstm_spatial_partitioning.md`)](bstm_spatial_partitioning.md)
 - [**Input / Output & Persistence Guide** (`docs/bstm_input_output.md`)](bstm_input_output.md)
 - [**Custom Components & Spatial SEIR Modeling Guide** (`docs/bstm_custom.md`)](bstm_custom.md)
+- [**Technical API Reference** (`docs/bstm_api.md`)](bstm_api.md)
 
 ---
 

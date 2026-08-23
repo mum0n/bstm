@@ -111,7 +111,7 @@ function get_precomputes(
     u_var_sym = Symbol(variables[1])
     u_idx = hasproperty(M, :data) && hasproperty(M.data, u_var_sym) ? M.data[!,
         u_var_sym] : collect(1:get(M, :N_time, 12))
-    u_N = length(unique(u_idx))
+    u_N = hasproperty(M, :N_time) ? M.N_time : Int(maximum(u_idx))
     u_idx_var = u_var_sym
 
     u_coords = collect(1.0:u_N)
@@ -251,7 +251,8 @@ function get_effects(
     else
         u_idx_train
     end
-    N_total = length(u_idx_full)
+    u_idx_int = Int.(round.(u_idx_full))
+    N_total = length(u_idx_int)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -340,7 +341,7 @@ function get_effects(
         end
 
         # --- Index and Finalize ---
-        indexed_effects = reconstructed_effects_k[u_idx_full, :]
+        indexed_effects = reconstructed_effects_k[u_idx_int, :]
         push!(structured_effects, indexed_effects)
     end
 

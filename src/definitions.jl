@@ -63,7 +63,7 @@ function _get_varname_symbol(vn)::Symbol
             return DynamicPPL.getsym(vn)
         catch
             try
-                return Symbol(first(split(string(vn), '[')))
+                return Symbol(first(Base.split(string(vn), '[')))
             catch
                 return Symbol(vn)
             end
