@@ -364,15 +364,20 @@ function build_param_registry(M::NamedTuple)
 end
 
 """
-    build_param_registry(sample::Any, M::Union{NamedTuple, Nothing}=nothing)
+    build_param_registry(sample::Union{NamedTuple, AbstractDict}, M::Union{NamedTuple, Nothing}=nothing)
 
 Builds or augments a `ParamRegistry` from a prior predictive draw
 (e.g., `rand(model)` returning `NamedTuple` or `VarNamedTuple`).
+Passes the draw to `calibrate_param_registry` to populate descriptor shapes.
 """
-function build_param_registry(sample::Any, M::Union{NamedTuple, Nothing}=nothing)
+function build_param_registry(
+    sample :: Union{NamedTuple, AbstractDict},
+    M      :: Union{NamedTuple, Nothing} = nothing
+)
     reg = !isnothing(M) ? build_param_registry(M) : ParamRegistry()
     return calibrate_param_registry(reg, sample)
 end
+
 
 """
     build_param_registry(model::DynamicPPL.Model)
@@ -409,12 +414,13 @@ function build_param_registry(model::DynamicPPL.Model)
 end
 
 """
-    build_param_registry(chain::Any)
+    build_param_registry(chain::Union{AbstractDataFrame, AbstractDict})
 
-Builds a `ParamRegistry` from an MCMC chain
-(e.g., FlexiChain, MCMCChains.Chains, DataFrame, or Dict).
+Builds a `ParamRegistry` from an MCMC chain expressed as a `DataFrame` or
+`AbstractDict` (e.g., a `FlexiChain`-derived dict or `MCMCChains.Chains`
+converted to DataFrame).
 """
-function build_param_registry(chain::Any)
+function build_param_registry(chain::Union{AbstractDataFrame, AbstractDict})
     reg = ParamRegistry()
     raw_names = _extract_chain_column_names(chain)
     names_str = string.(raw_names)
@@ -443,7 +449,63 @@ function build_param_registry(chain::Any)
         if !(nstr in reg.names)
             push!(reg.names, nstr)
         end
-        
+
+        reg.descriptors[sym] = ParamDescriptor(sym)
+    end
+
+    return reg
+end
+
+"""
+    build_param_registry(chain)
+
+Single generic fallback: handles FlexiChain, MCMCChains.Chains, or any
+chain-like object whose column names can be extracted via
+`_extract_chain_column_names`. Concrete types (`NamedTuple`, `AbstractDict`,
+`AbstractDataFrame`, `DynamicPPL.Model`) are handled by more specific dispatches
+above and will not reach this method.
+"""
+function build_param_registry(chain::T) where T
+    # Disambiguate: if it looks like a prior sample (has `pairs`), delegate to calibrate.
+    # Otherwise treat as a chain-like object.
+    if chain isa DynamicPPL.Model
+        # Handled by the DynamicPPL.Model dispatch above — should never reach here.
+        error("build_param_registry: unexpected dispatch to generic chain fallback for DynamicPPL.Model")
+    end
+    reg = ParamRegistry()
+    raw_names = try
+        _extract_chain_column_names(chain)
+    catch
+        @warn "build_param_registry: could not extract chain column names from $(T); returning empty registry."
+        return reg
+    end
+    names_str = string.(raw_names)
+
+    for (i, nstr) in enumerate(names_str)
+        orig_key = raw_names[i]
+        key_for_indexing = orig_key isa String ? Symbol(nstr) : orig_key
+        sym = Symbol(nstr)
+
+        base = first(Base.split(nstr, '['))
+        if !haskey(reg.by_base, base)
+            reg.by_base[base] = String[]
+        end
+        push!(reg.by_base[base], nstr)
+
+        parts = Base.split(nstr, '_')
+        if length(parts) > 1 && all(isdigit.(collect(parts[end])))
+            underscore_base = join(parts[1:end-1], "_")
+            if !haskey(reg.by_base, underscore_base)
+                reg.by_base[underscore_base] = String[]
+            end
+            push!(reg.by_base[underscore_base], nstr)
+        end
+
+        reg.name_to_key[nstr] = key_for_indexing
+        if !(nstr in reg.names)
+            push!(reg.names, nstr)
+        end
+
         reg.descriptors[sym] = ParamDescriptor(sym)
     end
 

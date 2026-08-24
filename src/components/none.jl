@@ -24,11 +24,11 @@ predictor or its likelihood. It is equivalent to adding zero.
 - This component implements the Null Object pattern.
  
 """
-struct None <: ComponentModel end
-
-COMPONENT_TYPE_REGISTRY[:none] = None
+# None <: ComponentModel is defined in definitions.jl (loads before components).
+# Register it in the component registries here.
 COMPONENT_CONSTRUCTORS[:none] = (p, params) -> None()
-MODEL_TO_STRUCTURE_MAP[:none] = :none 
+COMPONENT_TYPE_REGISTRY[:none] = None
+MODEL_TO_STRUCTURE_MAP[:none] = :none
 
 """
     get_precomputes(m::None, M::NamedTuple, mod_data::Dict)::NamedTuple

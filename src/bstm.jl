@@ -18,12 +18,12 @@ module bstm
     # Users should explicitly 'using' these if they need their full API.
     using AbstractGPs, AbstractMCMC, ADTypes, AdvancedVI, KernelAbstractions,  
           Bijectors, CategoricalArrays, Clustering, ColorSchemes, DataFrames,
-          DelaunayTriangulation, DimensionalData, DuckDB, DynamicPPL, LogExpFunctions,
+          Dates, DelaunayTriangulation, DimensionalData, DuckDB, DynamicPPL, LogExpFunctions,
           Distances, FFTW, FillArrays, FlexiChains,
           NNlib, GLM, Graphs, HypothesisTests, Interpolations, JLD2,
           KernelFunctions, LibGEOS, LinearAlgebra, NamedArrays,
           NearestNeighbors, Optim, Optimisers, OrderedCollections, PDMats,
-          Plots, PosteriorStats, Random, Requires, SparseArrays,
+          Printf, Plots, PosteriorStats, Random, Requires, SHA, SparseArrays,
           SpecialFunctions, StaticArrays, Statistics, StatsBase, StatsModels,
           StatsPlots, Wavelets, WaveletsExt, ForwardDiff, ReverseDiff, Enzyme
     
@@ -47,8 +47,8 @@ module bstm
     include( "hierarchical.jl")
       
     # component definitions
-    components_dir = "components"
-    
+    components_dir = joinpath(@__DIR__, "components")
+
     for f in readdir(components_dir)
         if endswith(f, ".jl")
             include(joinpath(components_dir, f))
