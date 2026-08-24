@@ -44,6 +44,7 @@ module bstm
     include(joinpath(srcdir, "movement.jl"))
     include(joinpath(srcdir, "derivatives.jl"))
     include(joinpath(srcdir, "pipeline.jl"))
+    include(joinpath(srcdir, "hierarchical.jl"))
       
     # component definitions
     components_dir = joinpath(srcdir, "components")
@@ -64,6 +65,7 @@ module bstm
     export assign_spatial_units_inferred, plot_kde_simple
     export assign_spatial_units, assign_time_units, assign_spatiotemporal_units
     export discretize_data, bstm_data, expand_hull, generate_mock_hierarchical_datasets
+    export map_to_units
     export spatial_block_cv, spatial_weights_matrix, spatial_knn_graph
     export spatial_radius_graph, scaling_factor_bym2
     export ParamRegistry, ParamDescriptor, build_param_registry
@@ -88,6 +90,12 @@ module bstm
     export export_spatial_results_to_geojson, extract_posterior_priors
     export save_model_ensemble, bma_weighted_predictions, save_out_of_sample_predictions
     export export_results_to_parquet, export_results_to_csv, compact_duckdb
+
+    # Hierarchical Pipeline & Provenance exports
+    export compute_data_traits, init_pipeline_manifest!
+    export write_tier_table!, read_tier_table, has_tier_table
+    export get_manifest_entry, update_manifest_entry!, is_tier_up_to_date
+    export check_pipeline_status
 
 
     # Module initialization function

@@ -604,7 +604,6 @@ m_mov = @bstm(
 
 For comprehensive guides, see:
 - [**Integrated Hierarchical Workflows & ADR Telemetry** (`docs/hierarchical_workflow/hierarchical_workflow.md`)](hierarchical_workflow/hierarchical_workflow.md)
-- [**Advanced Hierarchical Workflows & Hydrodynamic Telemetry** (`docs/hierarchical_advanced/hierarchical_advanced.md`)](hierarchical_advanced/hierarchical_advanced.md)
 - [**Spatial & Spatiotemporal Partitioning Guide** (`docs/bstm_spatial_partitioning.md`)](bstm_spatial_partitioning.md)
 - [**Input / Output & Persistence Guide** (`docs/bstm_input_output.md`)](bstm_input_output.md)
 - [**Custom Components & Spatial SEIR Modeling Guide** (`docs/bstm_custom.md`)](bstm_custom.md)

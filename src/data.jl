@@ -32,13 +32,19 @@ Consolidated synthetic and benchmark dataset generator for BSTM models.
 - `"logistic_spatial_k"`: Logistic growth with spatially varying carrying capacity K.
 - `"logistic_spatial_r"`: Logistic growth with spatially varying growth rate r.
 - `"leslie_matrix"`: Multivariate Leslie matrix dynamics dataset.
-- `"hierarchical"` / `"marine_ecosystem"` / `"multi_tier"`: 5-tier marine ecological
-  pipeline bundle returning a NamedTuple: `(bathymetry, substrate, temperature, species_composition, snow_crab)`.
+- `"hierarchical"` / `"marine_ecosystem"` / `"multi_tier"`: 6-tier marine ecological
+  pipeline bundle returning a NamedTuple:
+  `(bathymetry, substrate, temperature, species_composition, snow_crab, individuals)`.
+  The `individuals` table contains one row per measured animal from the Tier 6 biological
+  sub-sampling program (carapace width, sex, maturity).
 - `"bathymetry"`: Tier 1 continuous bathymetric soundings dataset.
 - `"substrate"`: Tier 2 benthic sediment grab stations dataset.
 - `"temperature"` / `"ctd"`: Tier 3 hydrographic CTD casts across 10 years.
 - `"species_composition"` / `"community"` / `"trawl"`: Tier 4 multi-species survey haul records across 30 species.
 - `"snow_crab"` / `"crab"`: Tier 5 target species survey tows and demographic biomass records.
+- `"biosampling"` / `"individuals"` / `"tier6_biosampling"`: Tier 6 individual biological
+  sampling records: `tow_id`, `year`, `month`, `s_x`, `s_y`, `carapace_width_mm`,
+  `size_bin` (Int, 1–L), `sex` (0=female, 1=male), `maturity` (0=immature, 1=mature).
 - `"telemetry"` / `"adr"` / `"adr_telemetry"`: Joint population density survey and mark-recapture telemetry bundle.
 
 # Common Keyword Arguments:
@@ -120,6 +126,9 @@ function bstm_data(
 
     elseif type_str in ["snow_crab", "tier5_snow_crab", "crab"]
         return generate_mock_hierarchical_datasets(seed=actual_seed).snow_crab
+
+    elseif type_str in ["biosampling", "individuals", "tier6_biosampling"]
+        return generate_mock_hierarchical_datasets(seed=actual_seed).individuals
 
     elseif type_str in ["telemetry", "adr", "adr_telemetry"]
         rng = MersenneTwister(actual_seed)
@@ -1040,18 +1049,25 @@ function create_base_st_data(;
 end
 
 """
-    generate_mock_hierarchical_datasets(; seed=42, N_bathy=1000, N_sub=500, N_temp_per_year=100, N_hauls_per_year=50, N_crab_per_year=40) -> NamedTuple
+    generate_mock_hierarchical_datasets(; seed=42, N_bathy=1000, N_sub=500,
+        N_temp_per_year=100, N_hauls_per_year=50, N_crab_per_year=40) -> NamedTuple
 
 Generates a complete multi-tier synthetic marine ecological dataset bundle with independent
-sampling geometries across all 5 tiers:
+sampling geometries across all 6 tiers:
 1. `bathymetry`: N = 1,000 continuous bathymetric soundings with depth variations.
 2. `substrate`: N = 500 benthic grab stations with log grain size measurements.
 3. `temperature`: N = 1,000 hydrographic CTD casts across 10 years and multiple seasons.
 4. `species_composition`: N = 15,000 trawl haul records across 30 marine fish & invertebrate species.
 5. `snow_crab`: N = 400 survey tows capturing target species biomass and demographics.
+6. `individuals`: Biological sub-sample records (30–50 per positive tow) with columns
+   `tow_id`, `year`, `month`, `s_x`, `s_y`, `carapace_width_mm`, `size_bin` (1–5),
+   `sex` (0=female, 1=male), `maturity` (0=immature, 1=mature). CW is log-normal with
+   a depth/temperature-driven spatial mean mimicking known snow crab growth patterns.
+   Sex is a logistic function of CW (male L50 > female L50). Maturity follows sex-specific
+   logistic ogives (male L50=65 mm, female L50=45 mm).
 
 # Outputs:
-- NamedTuple: `(bathymetry=df_bathy, substrate=df_sub, temperature=df_temp, species_composition=df_species, snow_crab=df_crab)`
+- NamedTuple: `(bathymetry, substrate, temperature, species_composition, snow_crab, individuals)`
 """
 function generate_mock_hierarchical_datasets(;
     seed::Int=42,
@@ -1273,11 +1289,71 @@ function generate_mock_hierarchical_datasets(;
     end
     df_snow_crab = crab_records
 
+    # --------------------------------------------------------------------------
+    # 6. TIER 6: INDIVIDUAL BIOLOGICAL SAMPLING (Carapace Width, Sex, Maturity)
+    # --------------------------------------------------------------------------
+    # Size bins: [0, 40), [40, 60), [60, 80), [80, 100), [100, Inf) mm CW  (bins 1–5)
+    cw_breaks = [0.0, 40.0, 60.0, 80.0, 100.0, Inf]
+
+    # Logistic ogive helper: P(mature | CW, sex) with sex-specific L50
+    #   male  L50 = 65 mm, slope = 0.12 /mm
+    #   female L50 = 45 mm, slope = 0.15 /mm
+    function p_mature(cw::Float64, sex::Int)::Float64
+        L50    = sex == 1 ? 65.0 : 45.0
+        slope  = sex == 1 ? 0.12 : 0.15
+        return 1.0 / (1.0 + exp(-slope * (cw - L50)))
+    end
+
+    # Sex probability: P(male) = logistic(-0.3 + 0.006 * CW)
+    # Larger individuals are slightly more likely to be male (growth dimorphism).
+    p_male(cw::Float64) = 1.0 / (1.0 + exp(-(-0.3 + 0.006 * cw)))
+
+    bio_records = DataFrame()
+
+    for row in eachrow(df_snow_crab)
+        row.total_count == 0 && continue
+
+        x, y, m, yr = row.s_x, row.s_y, row.month, row.year
+        z_loc = true_depth(x, y)
+        t_loc = true_temperature(x, y, m, yr)
+
+        # Mean CW (mm): larger animals in colder, deeper water.
+        # Typical snow crab CW range: 35–130 mm; mean ≈ 60 + depth/4 - 2*temp
+        mu_cw_log  = log(max(10.0, 60.0 + 0.1 * z_loc - 2.0 * t_loc))
+        sigma_cw_log = 0.25  # log-scale SD ≈ 28% CV on CW
+
+        n_bio = rand(rng, 30:50)
+        n_bio = min(n_bio, row.total_count)
+
+        for _ in 1:n_bio
+            cw  = exp(rand(rng, Normal(mu_cw_log, sigma_cw_log)))
+            cw  = clamp(cw, 5.0, 160.0)
+            sex = Int(rand(rng) < p_male(cw))
+            mat = Int(rand(rng) < p_mature(cw, sex))
+            # Bin assignment (searchsortedfirst locates the first break > cw)
+            bin = min(searchsortedfirst(cw_breaks, cw) - 1, length(cw_breaks) - 1)
+
+            push!(bio_records, (
+                tow_id             = row.tow_id,
+                year               = yr,
+                month              = m,
+                s_x                = x,
+                s_y                = y,
+                carapace_width_mm  = round(cw, digits=1),
+                size_bin           = bin,
+                sex                = sex,
+                maturity           = mat
+            ))
+        end
+    end
+    df_individuals = bio_records
+
     return (
-        bathymetry = df_bathy,
-        substrate = df_substrate,
-        temperature = df_temperature,
+        bathymetry         = df_bathy,
+        substrate          = df_substrate,
+        temperature        = df_temperature,
         species_composition = df_species_comp,
-        snow_crab = df_snow_crab
+        snow_crab          = df_snow_crab,
+        individuals        = df_individuals
     )
 end

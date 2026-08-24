@@ -245,9 +245,7 @@ display(df_master)
 Comprehensive guides and technical documentation are available in the `docs/` directory:
 
 - [**Integrated Hierarchical Workflows & ADR Telemetry** (`docs/hierarchical_workflow/hierarchical_workflow.md`)](docs/hierarchical_workflow/hierarchical_workflow.md):
-  Directed Acyclic Graphs (DAGs), multi-scale cross-mesh resharding, Full Monte Carlo matrix transformations, Errors-in-Variables (EIV) priors, second-last tier Habitat Suitability (HSI) determination, analytical surface derivatives, Advection-Diffusion-Reaction (ADR) population dynamics, Lagrangian telemetry, and DuckDB SQL analytics.
-- [**Advanced Hierarchical Workflows & Hydrodynamic Telemetry** (`docs/hierarchical_advanced/hierarchical_advanced.md`)](docs/hierarchical_advanced/hierarchical_advanced.md):
-  Methodological innovations addressing modular inference: Tempered Power Posteriors (fractional feedback $\lambda$), full empirical spatial covariance in EIV, hybrid continuous basis-polygon quadrature resharding, continuous soft-sigmoid physiological HSI, and coupled oceanographic-active advection.
+  Directed Acyclic Graphs (DAGs), multi-scale cross-mesh resharding, Full Monte Carlo matrix transformations, Errors-in-Variables (EIV) priors, second-last tier Habitat Suitability (HSI) determination, analytical surface derivatives, Advection-Diffusion-Reaction (ADR) population dynamics, Lagrangian telemetry, and DuckDB SQL analytics, Tempered Power Posteriors (fractional feedback $\lambda$), full empirical spatial covariance in EIV, hybrid continuous basis-polygon quadrature resharding, continuous soft-sigmoid physiological HSI, and coupled oceanographic-active advection.
 - [**Architectural & Methodological Overview** (`docs/bstm_overview.md`)](docs/bstm_overview.md):
   Design principles, formula syntax, component algebra, prior systems, and inference engines.
 - [**Technical API Reference** (`docs/bstm_api.md`)](docs/bstm_api.md):
