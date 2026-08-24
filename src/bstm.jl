@@ -32,22 +32,22 @@ module bstm
     srcdir = joinpath(rootdir, "src")
 
     # Core framework files
-    include(joinpath(srcdir, "definitions.jl"))  # must be first
-    include(joinpath(srcdir, "data.jl"))
-    include(joinpath(srcdir, "partitioning.jl"))
-    include(joinpath(srcdir, "parameters.jl"))
-    include(joinpath(srcdir, "model.jl"))
-    include(joinpath(srcdir, "likelihoods.jl"))
-    include(joinpath(srcdir, "reconstruction.jl")) 
-    include(joinpath(srcdir, "plotting.jl")) 
-    include(joinpath(srcdir, "input_output.jl"))
-    include(joinpath(srcdir, "movement.jl"))
-    include(joinpath(srcdir, "derivatives.jl"))
-    include(joinpath(srcdir, "pipeline.jl"))
-    include(joinpath(srcdir, "hierarchical.jl"))
+    include( "definitions.jl")  # must be first
+    include( "data.jl")
+    include( "partitioning.jl")
+    include( "parameters.jl")
+    include( "model.jl")
+    include( "likelihoods.jl")
+    include( "reconstruction.jl") 
+    include( "plotting.jl") 
+    include( "input_output.jl")
+    include( "movement.jl")
+    include( "derivatives.jl")
+    include( "pipeline.jl")
+    include( "hierarchical.jl")
       
     # component definitions
-    components_dir = joinpath(srcdir, "components")
+    components_dir = "components"
     
     for f in readdir(components_dir)
         if endswith(f, ".jl")
