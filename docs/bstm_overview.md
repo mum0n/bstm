@@ -5,7 +5,7 @@ format: html
 
 # The BSTM Framework: A Comprehensive Architectural & Methodological Overview
 
-## 1. Introduction & Design Philosophy
+## 1. Introduction
 
 The **Bayesian Spatio-Temporal Modeling (`bstm`)** framework provides a composable, formula-driven probabilistic programming interface for complex hierarchical, spatial, temporal, and spatiotemporal models in Julia. Built on top of [Turing.jl](https://github.com/TuringLang/Turing.jl) and the Julia scientific computing ecosystem, `bstm` bridges the gap between the intuitive, high-level modeling syntax of tools like R's `brms` / `INLA` and the computational speed and flexibility of modern probabilistic programming languages.
 

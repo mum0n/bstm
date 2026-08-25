@@ -22,7 +22,7 @@ csl: ../chicago-author-date.csl
 
 # Unified Hierarchical Bayesian Workflows: Multi-Tier DAGs, Surface Derivatives, EIV Priors, Habitat Suitability & ADR Telemetry
 
-## 1. Executive Summary & Design Philosophy
+## 1. Summary
 
 Complex ecological and environmental systems are inherently **multi-scale, multi-fidelity,
 and multi-tiered**. Rather than fitting all physical, oceanographic, community, and population

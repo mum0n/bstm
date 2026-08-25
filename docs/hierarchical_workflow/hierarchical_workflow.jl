@@ -17,19 +17,19 @@
 # ==============================================================================
 
 # Include local bstm framework
-include(joinpath(@__DIR__, "..", "..", "bstm.jl"))
-using .bstm
+# include(joinpath(@__DIR__, "..", "..", "bstm.jl"))
+# using .bstm
 
-using DataFrames
-using LinearAlgebra
-using SparseArrays
-using Distributions
-using Turing
-using Random
-using Dates
-using Printf
-using DuckDB
-using Plots
+# using DataFrames
+# using LinearAlgebra
+# using SparseArrays
+# using Distributions
+# using Turing
+# using Random
+# using Dates
+# using Printf
+# using DuckDB
+# using Plots
 
 # ==============================================================================
 # SECTION 1: CONFIGURATION & PIPELINE SPECIFICATION
@@ -44,7 +44,7 @@ Configuration parameters for the unified multi-tier hierarchical workflow.
 - `mode::Symbol`: Global preset (`:standard` / `:baseline` vs. `:advanced`). Default is `:advanced`.
 - `tier1_mesh_eval::Symbol`: Bathymetry evaluation mode (`:mesh` vs `:continuous`).
 - `tier2_cov_mode::Symbol`: Substrate EIV covariance (`:diagonal` vs `:full`).
-- `tier3_feedback_lambda::Float64`: Modular feedback weight ($0.0$ = strict cut, $0.25$ = tempered power posterior).
+- `tier3_feedback_lambda::Float64`: Modular feedback weight (0.0 = strict cut, 0.25 = tempered power posterior).
 - `tier4_hsi_mode::Symbol`: Suitability formulation (`:binary_quantile` vs `:soft_sigmoid`).
 - `tier4_hsi_kappa::Float64`: Soft-sigmoid steepness scaling factor.
 - `movement_mode::Symbol`: Telemetry advection kernel (`:gradient_taxis` vs `:coupled_hydrodynamic`).
@@ -802,8 +802,8 @@ poststratified abundance by demographic class.
 
 **6a. Size Composition — Additive Log-Ratio GMRF (Dirichlet-Multinomial proxy)**
 
-For $L$ carapace width (CW) size bins and each tow $i$, bin counts
-$\\mathbf{n}_i = (n_{i1}, \\ldots, n_{iL})$ are modelled via $L-1$ independent
+For \$L\$ carapace width (CW) size bins and each tow \$i\$, bin counts
+\$\\mathbf{n}_i = (n_{i1}, \\ldots, n_{iL})\$ are modelled via \$L-1\$ independent
 Gaussian spatial models on the additive log-ratio (ALR) scale:
 
     alr_{i\\ell} = log(n_{i\\ell} / n_{iL})
@@ -830,7 +830,7 @@ temperature-driven growth differences).
 
 **6d. Poststratification**
 
-At each posterior draw $s$, unit $u$, year $t$:
+At each posterior draw \$s\$, unit \$u\$, year \$t\$:
 
     N̂^{(s)}(u,t,ℓ,g,m) = N̂^{(s)}_T5(u,t)
                            × π̂^{(s)}_ℓ(u,t)

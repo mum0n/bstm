@@ -9,51 +9,101 @@ module bstm
     # directly available when 'using bstm'.
     using Reexport
 
+    @reexport using Random 
     @reexport using Distributions
     @reexport using Turing
-    # @reexport using DynamicPPL
+    @reexport using AbstractGPs
+    @reexport using AbstractMCMC
+    @reexport using DynamicPPL
+    @reexport using AdvancedVI
+    
+    @reexport using GLM
+    @reexport using StatsBase
+    @reexport using Statistics 
+    @reexport using DataFrames
+    @reexport using ArgParse
+    @reexport using ADTypes
+    @reexport using KernelAbstractions
+    @reexport using Bijectors
+    @reexport using CategoricalArrays
+    @reexport using ColorSchemes
+    @reexport using Dates
+    @reexport using DelaunayTriangulation
+    @reexport using DimensionalData
+    @reexport using DuckDB
+    @reexport using LogExpFunctions
+    @reexport using Distances
+    @reexport using FFTW
+    @reexport using FillArrays
+    @reexport using FlexiChains
+    @reexport using Graphs
+    @reexport using HypothesisTests
+    @reexport using Interpolations
+    @reexport using JLD2
+    @reexport using KernelFunctions
+    @reexport using LibGEOS
+    @reexport using LinearAlgebra
+    @reexport using NamedArrays
+    @reexport using NearestNeighbors
+    @reexport using Optim
+    @reexport using Optimisers
+    @reexport using OrderedCollections
+    @reexport using PDMats
+    @reexport using Printf
+    @reexport using Plots
+    @reexport using PosteriorStats
+    @reexport using Requires
+    @reexport using SHA
+    @reexport using SparseArrays
+    @reexport using SpecialFunctions
+    @reexport using StaticArrays
+    @reexport using StatsModels
+    @reexport using StatsPlots
+    @reexport using ForwardDiff
+    @reexport using ReverseDiff
+    @reexport using Enzyme
+
+ 
+
 
     # Packages that are fundamental to bstm's internal operation
     # but whose entire API is NOT intended to be part of bstm's public API.
     # Users should explicitly 'using' these if they need their full API.
-    using AbstractGPs, AbstractMCMC, ADTypes, AdvancedVI, KernelAbstractions,  
-          Bijectors, CategoricalArrays, Clustering, ColorSchemes, DataFrames,
-          Dates, DelaunayTriangulation, DimensionalData, DuckDB, DynamicPPL, LogExpFunctions,
-          Distances, FFTW, FillArrays, FlexiChains,
-          NNlib, GLM, Graphs, HypothesisTests, Interpolations, JLD2,
-          KernelFunctions, LibGEOS, LinearAlgebra, NamedArrays,
-          NearestNeighbors, Optim, Optimisers, OrderedCollections, PDMats,
-          Printf, Plots, PosteriorStats, Random, Requires, SHA, SparseArrays,
-          SpecialFunctions, StaticArrays, Statistics, StatsBase, StatsModels,
-          StatsPlots, Wavelets, WaveletsExt, ForwardDiff, ReverseDiff, Enzyme
-    
-    rootdir = @__DIR__
+    using Wavelets, WaveletsExt, NNlib 
+        
+    srcdir = @__DIR__  # bstm/src
+    rootdir = dirname(srcdir) # bstm
+    docsdir = joinpath(rootdir, "docs") # bstm/docs
 
-    srcdir = joinpath(rootdir, "src")
-
-    # Core framework files
+    # Core framework files 
     include( "definitions.jl")  # must be first
+    
     include( "data.jl")
-    include( "partitioning.jl")
-    include( "parameters.jl")
-    include( "model.jl")
-    include( "likelihoods.jl")
-    include( "reconstruction.jl") 
-    include( "plotting.jl") 
-    include( "input_output.jl")
-    include( "movement.jl")
     include( "derivatives.jl")
+    include( "hierarchical.jl") 
+    include( "input_output.jl")
+    include( "likelihoods.jl")
+    include( "model.jl")
+    include( "movement.jl")
+    include( "parameters.jl")
+    include( "partitioning.jl")
     include( "pipeline.jl")
-    include( "hierarchical.jl")
-      
+    include( "plotting.jl") 
+    include( "reconstruction.jl")  
+ 
     # component definitions
-    components_dir = joinpath(@__DIR__, "components")
+    components_dir = joinpath(srcdir, "components")
 
     for f in readdir(components_dir)
         if endswith(f, ".jl")
             include(joinpath(components_dir, f))
         end
     end
+
+    # work in progress: 
+    # include( joinpath(docsdir, "hierarchical_workflow", "hierarchical_workflow.jl") )
+    include( joinpath(docsdir, "movement", "movement_simple.jl") )
+
 
     # User-facing API exports
     export @bstm, model_results_comprehensive, get_optimal_sampler

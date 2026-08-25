@@ -5,7 +5,7 @@ format: html
 
 # BSTM Input / Output & Persistence Subsystem: Technical Guide
 
-## 1. Executive Summary & Design Philosophy
+## 1. Summary 
 
 In Bayesian spatiotemporal modeling, fitted models encompass heterogeneous artifacts:
 1. **Dynamic Model Computations**: Instantiated Turing `@model` instances, compiled code, sparse graph precision matrices ($Q$), and basis function expansions ($B$).
