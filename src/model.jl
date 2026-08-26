@@ -10,8 +10,6 @@ dynamic Turing code generator, and sampling execution engine for Bayesian Spatio
 
 Version: v1.0.0
 """
-# Enable deepcopy of Module references to support MCMCThreads multi-chain sampling
-Base.deepcopy_internal(x::Module, stackdict::IdDict{Any, Any}) = x
 
 function Base.:|>(m1::Component, m2::Component)
     return Composed([m1, m2], :pipe)
@@ -2657,14 +2655,24 @@ function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwa
     # --- 3. Model Evaluation and Instantiation ---
     # Evaluate the generated @model expression and get the function object back directly.
     # This pattern avoids world-age issues that can arise from using `getfield`.
-    model_func = Core.eval(@__MODULE__, quote
-        $(expr) # The parsed @model expression from bstm_text_assembler
-        $(model_func_name) # Return the function object itself
-    end)
-
+    # model_func = Core.eval(@__MODULE__, quote
+    #     $(expr) # The parsed @model expression from bstm_text_assembler
+    #     $(model_func_name) # Return the function object itself
+    # end)
     # Instantiate the Turing Model Object using invokelatest for type stability.
-    model_instance = Base.invokelatest(model_func, new_config, registry)
+    # model_instance = Base.invokelatest(model_func, new_config, registry)
 
+    model_func = 
+        let func_closure = Core.eval(@__MODULE__, quote
+            $(expr)
+            $(model_func_name)
+        end)
+        func_closure  # Capture in closure at eval time
+    end
+
+    # Then use immediately (no world-age gap)
+    model_instance = model_func(new_config, registry)  # ← No invokelatest needed here
+ 
     # --- 4. Prior Predictive Check and Validation ---
     if get(new_config, :verbose, true)
         println("\n--- Running prior predictive check ---")
@@ -2673,9 +2681,7 @@ function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwa
     prior_sample = nothing
     try
         # Run a single draw from the prior to validate the model structure.
-        redirect_stderr(devnull) do
-            prior_sample = Base.invokelatest(rand, model_instance)
-        end
+        prior_sample = rand(model_instance)
     
         if get(new_config, :verbose, true) && !isnothing(prior_sample)
             println("Prior sample check successful. Sample values:")
@@ -5789,10 +5795,10 @@ both single and multi-chain sampling, ensuring consistent output dimensionality.
 """
 function bstm_sample(model, sampler, n_samples; n_chains::Int=1, kwargs...)
     local chain
-    redirect_stderr(devnull) do
-        @info "Running $(n_chains) chain(s) using MCMCThreads() backend."
-        chain = sample(model, sampler, MCMCThreads(), n_samples, n_chains; kwargs...)
-    end
+
+    @info "Running $(n_chains) chain(s) using MCMCThreads() backend."
+    chain = sample(model, sampler, MCMCThreads(), n_samples, n_chains; kwargs...)
+
     return chain
 end
 

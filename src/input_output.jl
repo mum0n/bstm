@@ -329,8 +329,8 @@ function save_bstm_results(
         end
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
 
     @info "BSTM analytical results successfully saved to DuckDB database '$duckdb_path'."
@@ -406,8 +406,8 @@ function load_bstm_results(duckdb_path::AbstractString; table_prefix::String="")
 
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
 
     predictions_nt = if haskey(preds_dict, :denoised)
@@ -447,8 +447,8 @@ function query_duckdb(duckdb_path::AbstractString, sql_query::AbstractString)::D
         df = DataFrame(DuckDB.query(con, sql_query))
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
     return df
 end
@@ -734,8 +734,8 @@ function save_model_ensemble(
         _write_df_to_duckdb(con, df_registry, "models_registry", overwrite)
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
 
     @info "Model ensemble saved with $(length(m_names)) models in '$duckdb_path'."
@@ -814,8 +814,8 @@ function save_out_of_sample_predictions(
         _write_df_to_duckdb(con, pred_df, table_name, overwrite)
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
     @info "Out-of-sample predictions saved to table '$table_name' in '$duckdb_path'."
 end
@@ -845,8 +845,8 @@ function export_results_to_parquet(
           "PARQUET, COMPRESSION ZSTD)")
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
     @info "Table '$table_name' exported to Parquet: '$output_parquet_path'."
     return output_parquet_path
@@ -876,8 +876,8 @@ function export_results_to_csv(
           DELIMITER ',')")
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
     @info "Table '$table_name' exported to CSV: '$output_csv_path'."
     return output_csv_path
@@ -900,8 +900,8 @@ function compact_duckdb(duckdb_path::AbstractString)
         DuckDB.query(con, "ANALYZE")
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
     @info "DuckDB database '$duckdb_path' compacted and optimized."
 end
@@ -942,8 +942,8 @@ function export_posterior_samples_to_duckdb(
         _write_df_to_duckdb(con, df_samples, table_name, overwrite)
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
 
     @info "Posterior samples exported to DuckDB table '$table_name' in '$duckdb_path'."

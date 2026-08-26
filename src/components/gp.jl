@@ -125,7 +125,7 @@ function _gp_log_marginal_likelihood(
     end
     
     F = cholesky(Symmetric(Ky))
-    log_det_Ky = 2 * sum(log.(diag(F.U)))
+    log_det_Ky = 2 * sum(log.(diag(F.L)))  # NOT F.U
     
     v = F.L \ y_residual
     quad_term = dot(v, v)

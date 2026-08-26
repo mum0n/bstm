@@ -375,11 +375,11 @@ function Base.rand(rng::Random.AbstractRNG, d::bstm_Likelihood)
 
     # Censoring bounds
     if d.censoring_state isa LeftCensored
-        u_b = d.censor_upper isa AbstractVector ? d.censor_upper[1] : d.censor_upper
-        return min(raw_draw, Float64(u_b))
-    elseif d.censoring_state isa RightCensored
         l_b = d.censor_lower isa AbstractVector ? d.censor_lower[1] : d.censor_lower
         return max(raw_draw, Float64(l_b))
+    elseif d.censoring_state isa RightCensored
+        u_b = d.censor_upper isa AbstractVector ? d.censor_upper[1] : d.censor_upper
+        return min(raw_draw, Float64(u_b))
     elseif d.censoring_state isa IntervalCensored
         l_b = d.censor_lower isa AbstractVector ? d.censor_lower[1] : d.censor_lower
         u_b = d.censor_upper isa AbstractVector ? d.censor_upper[1] : d.censor_upper

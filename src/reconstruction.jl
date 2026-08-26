@@ -1884,8 +1884,8 @@ function bstm_cv_orchestrator(
         
         model_train = bstm_core(formula, train_data; cv_kwargs...)
         
-        chain_train = Base.invokelatest(sample, model_train, sampler, n_samples; progress=false)
-        res_pred = Base.invokelatest(predict, model_train, chain_train, test_data;
+        chain_train = sample(model_train, sampler, n_samples; progress=false)
+        res_pred = predict(model_train, chain_train, test_data;
             n_samples=div(n_samples, 2), alpha=alpha)
 
         y_test_obs = test_data[!, response_name]

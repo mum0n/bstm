@@ -188,15 +188,18 @@ function compute_velocity_field(
     eps_val = 1e-6
 
     for r in 1:rows, c in 1:cols
-        gx = (c == 1) ? (grid[r, 2] - grid[r, 1]) : (c == cols ? (grid[r, cols] - grid[r,
-          cols-1]) : (grid[r, c+1] - grid[r, c-1]) / 2.0)
-        gy = (r == 1) ? (grid[2, c] - grid[1, c]) : (r == rows ? (grid[rows, c] -
-          grid[rows-1, c]) : (grid[r+1, c] - grid[r-1, c]) / 2.0)
+        gx = (c == 1) ? (grid[r, 2] - grid[r, 1]) : (c == cols ? (grid[r, cols] - grid[r, cols-1]) : ((grid[r, c+1] - grid[r, c-1]) / 2.0))
+        gy = (r == 1) ? (grid[2, c] - grid[1, c]) : (r == rows ? (grid[rows, c] - grid[rows-1, c]) : ((grid[r+1, c] - grid[r-1, c]) / 2.0))
 
         if mode == :exponential
-            denom = max(grid[r, c], eps_val)
-            vx[r, c] = (gx / denom) * strength
-            vy[r, c] = (gy / denom) * strength
+            # Better: normalize by geometric mean of neighbors
+            numerator_x = abs(grid[r, c+1] - grid[r, c-1])
+            denom_x = sqrt(grid[r, c] * (grid[r, c] + eps_val))
+            vx[r, c] = (sign(gx) * numerator_x / denom_x) * strength
+
+            numerator_y = abs(grid[r+1, c] - grid[r-1, c])
+            denom_y = sqrt(grid[r, c] * (grid[r, c] + eps_val))
+            vy[r, c] = (sign(gy) * numerator_y / denom_y) * strength
         else
             vx[r, c] = gx * strength
             vy[r, c] = gy * strength
@@ -288,7 +291,7 @@ function simulate_posterior_trajectories(
             if rho_persistence > 0.0 && prev_node != 0
                 v_prev = [centroids[curr_node][d] - centroids[prev_node][d] for d in 1:2]
                 if norm(v_prev) > 1e-9
-                    persistence_weights = ones(T, n_spatial)
+                    persistence_weights = ones(promote_type(T, typeof(rho_persistence)), n_spatial)
                     for j in 1:n_spatial
                         if j == curr_node
                             continue
@@ -490,11 +493,13 @@ function calculate_regional_connectivity(Gamma::AbstractMatrix, strata_definitio
     end
 
     for r in 1:n_strata
+        n_units_in_r = count(==(r), strata_map_inverse)  # How many units in stratum r
         row_sum = sum(C[r, :])
         if row_sum > 0
             C[r, :] ./= row_sum
         end
     end
+
     return C
 end
 
@@ -571,6 +576,13 @@ function synthesize_adr_results(
     A = D_inv * W_dir
     
     # Propagator M_prop = I - v*A - D*L
+    # NOTE: Inverting M_prop to get a transition matrix assumes that the propagator 
+    # defines a solvable linear system. However, for advection-diffusion on bounded domains, 
+    # this may not be the intended transition kernel. The transition matrix should emerge 
+    # directly from discretization, not from inverting a propagator.
+    # Fix: Verify this is the intended mathematical model, or construct 
+    # Gamma_mean directly from the advection/diffusion operators without inversion.
+
     M_prop_mean = Matrix(I(n_spatial) - (S_strength_mean .* A) - (D_coeff_mean .* L))
     Gamma_mean = inv(M_prop_mean)
     

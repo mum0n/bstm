@@ -126,8 +126,8 @@ function init_pipeline_manifest!(db_path::AbstractString)
         """)
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
 end
 
@@ -144,8 +144,8 @@ function write_tier_table!(db_path::AbstractString, df::DataFrame, tbl_name::Abs
         _write_df_to_duckdb(con, df, tbl_name, true)
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
 end
 
@@ -162,8 +162,8 @@ function read_tier_table(db_path::AbstractString, tbl_name::AbstractString)
         return DataFrame(res)
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
 end
 
@@ -179,15 +179,13 @@ function has_tier_table(db_path::AbstractString, tbl_name::AbstractString)
     db = DuckDB.DB(db_path)
     con = DuckDB.connect(db)
     try
-        df = DataFrame(DuckDB.query(con, """
-            SELECT table_name FROM information_schema.tables 
-            WHERE table_name = '$tbl_name'
-        """))
+        df = DataFrame(DuckDB.query(con, 
+            "SELECT table_name FROM information_schema.tables WHERE table_name = ?", [tbl_name]))   
         return nrow(df) > 0
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
 end
 
@@ -204,14 +202,13 @@ function get_manifest_entry(db_path::AbstractString, tier_id::AbstractString)
     db = DuckDB.DB(db_path)
     con = DuckDB.connect(db)
     try
-        df = DataFrame(DuckDB.query(con, """
-            SELECT * FROM pipeline_manifest WHERE tier_id = '$tier_id'
-        """))
+        df = DataFrame(DuckDB.query(con, 
+            "SELECT * FROM pipeline_manifest WHERE tier_id = ?", [tier_id]))    
         return nrow(df) > 0 ? df[1, :] : nothing
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
 end
 
@@ -232,7 +229,7 @@ function update_manifest_entry!(
     table_name::AbstractString
 )
     init_pipeline_manifest!(db_path)
-    now_str = Dates.format(Dates.now(Dates.UTC), "yyyy-mm-dd HH:MM:SS") * " UTC"
+    now_str = Dates.format(Dates.now(Dates.UTC), "yyyy-mm-dd HH:mm:ss") * " UTC"
     traits_str = repr(traits)
     deps_str = join(upstream_deps, ",")
     data_hash = get(traits, :hash, "")
@@ -243,16 +240,16 @@ function update_manifest_entry!(
     try
         DuckDB.query(con, "DELETE FROM pipeline_manifest WHERE tier_id = '$tier_id'")
         DuckDB.query(con, """
-            INSERT INTO pipeline_manifest VALUES (
-                '$tier_id', '$tier_name', '$status', '$update_frequency',
-                '$now_str', '$data_hash', $data_rows, '$traits_str',
-                '$deps_str', '$bundle_path', '$table_name'
-            )
-        """)
+        DuckDB.query(con, """
+            INSERT INTO pipeline_manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            tier_id, tier_name, status, update_frequency, now_str, 
+            data_hash, data_rows, traits_str, deps_str, bundle_path, table_name
+        ])
     finally
         DuckDB.disconnect(con)
-        try close(db) catch end
-        GC.gc()
+        
+        
     end
 end
 

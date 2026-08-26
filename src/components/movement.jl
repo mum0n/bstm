@@ -73,7 +73,7 @@ The `mark_recapture_data` can be provided in two formats:
 struct Movement <: ComponentModel
     velocity::UnivariateDistribution
     diffusion::UnivariateDistribution
-    sigma::UnivariateDistribution
+    sigma::UnivariateDistribution   
     r::Union{UnivariateDistribution, Nothing}
     K::Union{UnivariateDistribution, Nothing}
     beta_het::Union{UnivariateDistribution, Nothing}

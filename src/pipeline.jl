@@ -398,16 +398,27 @@ function bstm_pipeline(
             end
         end
 
+
+
         # 2. Fit Model & Sample Posterior
+        
+        # wrap in trampoline
+        
+        function _sample_tier_model(m, sampler, n_samples)
+            return sample(m, sampler, n_samples; progress=false)
+        end
+ 
         m_tier = if !isnothing(cur_W)
             bstm_core(spec.formula, cur_df, @__MODULE__; W=cur_W, verbose=false)
         else
             bstm_core(spec.formula, cur_df, @__MODULE__; verbose=false)
         end
 
-        chn_tier = Base.invokelatest(sample, m_tier, spec.sampler, spec.n_samples; progress=false)
-        res_tier = Base.invokelatest(model_results_comprehensive, m_tier, chn_tier; alpha=0.05)
-
+         
+        chn_tier = _sample_tier_model(m_tier, spec.sampler, spec.n_samples; progress=false)
+        
+        res_tier = model_results_comprehensive(m_tier, chn_tier; alpha=0.05)
+ 
         models[t_name] = m_tier
         chains[t_name] = chn_tier
         results[t_name] = res_tier
@@ -424,8 +435,7 @@ function bstm_pipeline(
             end
 
             if !isnothing(coords_query)
-                deriv_res = Base.invokelatest(
-                    bstm_surface_derivatives,
+                deriv_res = bstm_surface_derivatives(
                     m_tier, chn_tier, coords_query;
                     metrics=spec.derivatives,
                     radii=spec.radii,
@@ -437,7 +447,7 @@ function bstm_pipeline(
 
         # 4. Generate Predictions DataFrame for Downstream Sharing
         pred_df = copy(cur_df)
-        pred_res = Base.invokelatest(predict, m_tier, chn_tier, cur_df)
+        pred_res = predict(m_tier, chn_tier, cur_df)
         pred_df[!, Symbol("$(t_name)_mean")] = pred_res.predictions_denoised.mean
         pred_df[!, Symbol("$(t_name)_sd")] = pred_res.predictions_denoised.std
         tier_predictions[t_name] = pred_df
@@ -459,7 +469,7 @@ function bstm_pipeline(
                 end
             end
             try
-                pred_res_u = Base.invokelatest(predict, m_tier, chn_tier, df_units)
+                pred_res_u = predict(m_tier, chn_tier, df_units)
                 tier_unit_predictions[t_name] = pred_res_u.predictions_denoised
             catch
                 u_m = [mean(pred_df[!, Symbol("$(t_name)_mean")][pred_df.s_idx .== i]) for i in 1:cur_au.n_units]
@@ -553,8 +563,8 @@ function bstm_pipeline(
             _write_df_to_duckdb(con, master_df, "master_harmonized_summary", true)
         finally
             DuckDB.disconnect(con)
-            try close(db) catch end
-            GC.gc()
+            
+            
         end
     end
 
