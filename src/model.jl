@@ -603,7 +603,8 @@ function resolve_hyperpriors(model_name::String, global_priors::Dict, local_para
         :sigma1_unconstrained, :sigma2_unconstrained, :threshold_unconstrained, :kappa, :lengthscale, 
         :range, :period, :amplitude, :phase, :velocity, :diffusion, :pca_sd, 
         :pdef_sd, :L_corr, :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, 
-        :gamma, :delta, :curvature, :rho_sigma, :rho_rho, :sigma0, :shape, :nu
+        :gamma, :delta, :curvature, :rho_sigma, :rho_rho, :sigma0, :shape, :nu,
+        :beta_het, :beta_habitat_diffusion
     ]
 
     resolved = Dict{Symbol, Any}()
@@ -902,7 +903,7 @@ function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
 
         elseif hasproperty(node, :module_type)
             m_type = node.module_type
-            if m_type in BSTM_MODULE_KEYWORDS
+            if m_type in BSTM_MODULE_KEYWORDS || haskey(COMPONENT_TYPE_REGISTRY, m_type)
                 local raw_key
                 pos_args = get(node.args, :positional_args, [])
                 
@@ -1296,7 +1297,7 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
         :kappa, :ls, :range, :period,
         :amplitude, :phase, :velocity, :diffusion, :pca_sd, :pdef_sd, :L_corr,
         :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, :gamma, :delta, :curvature,
-        :nu, :sigma0, :shape
+        :nu, :sigma0, :shape, :beta_het, :beta_habitat_diffusion
     ]
     for p in hyperparameters
         names[p] = Symbol("$(p)_$(full_key)$(hyperparam_suffix)")
@@ -2653,25 +2654,13 @@ function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwa
     end
 
     # --- 3. Model Evaluation and Instantiation ---
-    # Evaluate the generated @model expression and get the function object back directly.
-    # This pattern avoids world-age issues that can arise from using `getfield`.
-    # model_func = Core.eval(@__MODULE__, quote
-    #     $(expr) # The parsed @model expression from bstm_text_assembler
-    #     $(model_func_name) # Return the function object itself
-    # end)
-    # Instantiate the Turing Model Object using invokelatest for type stability.
-    # model_instance = Base.invokelatest(model_func, new_config, registry)
+    model_func = Core.eval(@__MODULE__, quote
+        $(expr)
+        $(model_func_name)
+    end)
 
-    model_func = 
-        let func_closure = Core.eval(@__MODULE__, quote
-            $(expr)
-            $(model_func_name)
-        end)
-        func_closure  # Capture in closure at eval time
-    end
-
-    # Then use immediately (no world-age gap)
-    model_instance = model_func(new_config, registry)  # ← No invokelatest needed here
+    # Instantiate the Turing Model Object using invokelatest to prevent world age issues
+    model_instance = Base.invokelatest(model_func, new_config, registry)
  
     # --- 4. Prior Predictive Check and Validation ---
     if get(new_config, :verbose, true)
@@ -2681,7 +2670,7 @@ function bstm_core(formula::String, data::DataFrame, calling_module::Module; kwa
     prior_sample = nothing
     try
         # Run a single draw from the prior to validate the model structure.
-        prior_sample = rand(model_instance)
+        prior_sample = Base.invokelatest(rand, model_instance)
     
         if get(new_config, :verbose, true) && !isnothing(prior_sample)
             println("Prior sample check successful. Sample values:")
@@ -4891,8 +4880,10 @@ function _distribution_to_string(d::Distribution)
         return "$(dist_name)($(mean_str), $(cov_str))"
     elseif d isa Truncated
         inner_dist_str = _distribution_to_string(d.untruncated)
-        lower_str = isinf(d.lower) ? string(d.lower) : "$(d.lower)"
-        upper_str = isinf(d.upper) ? string(d.upper) : "$(d.upper)"
+        lower_val = isnothing(d.lower) ? -Inf : d.lower
+        upper_val = isnothing(d.upper) ? Inf : d.upper
+        lower_str = isinf(lower_val) ? (lower_val < 0 ? "-Inf" : "Inf") : "$(lower_val)"
+        upper_str = isinf(upper_val) ? (upper_val < 0 ? "-Inf" : "Inf") : "$(upper_val)"
         return "truncated($(inner_dist_str), $(lower_str), $(upper_str))"
     elseif d isa Product
         if hasproperty(d, :v) && d.v isa Fill

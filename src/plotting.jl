@@ -262,25 +262,40 @@ function _choropleth_impl(
 end
 
 # Unified, unambiguous choropleth dispatchers
-choropleth(polygons::AbstractVector{<:AbstractVector}, values::AbstractVector{<:Real};
-    kwargs...) = _choropleth_impl(polygons, values; kwargs...)
-choropleth(values::AbstractVector{<:Real}, polygons::AbstractVector{<:AbstractVector};
-    kwargs...) = _choropleth_impl(polygons, values; kwargs...)
+function choropleth(polygons::AbstractVector{<:AbstractVector}, values::AbstractVector{<:Real};
+    mode::Symbol=:plots, kwargs...)
+    if mode == :leaflet || mode == :html
+        return leaflet_choropleth(polygons, values; kwargs...)
+    end
+    return _choropleth_impl(polygons, values; kwargs...)
+end
+
+function choropleth(values::AbstractVector{<:Real}, polygons::AbstractVector{<:AbstractVector};
+    mode::Symbol=:plots, kwargs...)
+    if mode == :leaflet || mode == :html
+        return leaflet_choropleth(polygons, values; kwargs...)
+    end
+    return _choropleth_impl(polygons, values; kwargs...)
+end
 
 
 """
     spatial_graph_plot(centroids, g; polygons=nothing, hull_coords=nothing, pts=nothing,
                        node_size=3, node_color=:black, edge_color=:red, edge_alpha=0.6,
-                       title="Spatial Partitioning", theme_kwargs=NamedTuple())
+                       title="Spatial Partitioning", theme_kwargs=NamedTuple(), mode=:plots)
 
 Plots spatial partitioning structures: polygons, adjacency graph edges, centroids, boundary
-  hulls, and raw data points.
+  hulls, and raw data points. Supports `mode=:plots` (Plots.jl) or `mode=:leaflet` (interactive HTML).
 """
 function spatial_graph_plot(
     centroids, g; polygons=nothing, hull_coords=nothing, pts=nothing,
     node_size=3, node_color=:black, edge_color=:red, edge_alpha=0.6,
-    title::String="Spatial Partitioning", theme_kwargs=NamedTuple(), kwargs...
+    title::String="Spatial Partitioning", theme_kwargs=NamedTuple(), mode::Symbol=:plots, kwargs...
 )
+    if mode == :leaflet || mode == :html
+        return leaflet_spatial_graph(centroids, g; polygons=polygons, hull_coords=hull_coords,
+                                     pts=pts, title=title, kwargs...)
+    end
     p = Plots.plot(aspect_ratio=:equal, title=title, legend=false; theme_kwargs..., kwargs...)
 
     # 1. Polygons (if provided)
@@ -337,8 +352,11 @@ end
 
 # Keyword-based dispatch accepting `au` NamedTuple/Dict or raw coordinates
 function spatial_graph_plot(; au=nothing, pts=nothing, plot_title="Spatial Partitioning",
-    title=plot_title, kwargs...)
+    title=plot_title, mode::Symbol=:plots, kwargs...)
     if !isnothing(au)
+        if mode == :leaflet || mode == :html
+            return leaflet_spatial_graph(au; pts=pts, title=title, kwargs...)
+        end
         polygons = hasproperty(au, :polygons) ? au.polygons : (haskey(au,
             :polygons) ? au[:polygons] : nothing)
         centroids = hasproperty(au, :centroids) ? au.centroids : (haskey(au,
@@ -347,7 +365,7 @@ function spatial_graph_plot(; au=nothing, pts=nothing, plot_title="Spatial Parti
         hull = hasproperty(au, :hull_coords) ? au.hull_coords : (haskey(au,
             :hull_coords) ? au[:hull_coords] : nothing)
         return spatial_graph_plot(centroids, g; polygons=polygons, hull_coords=hull, pts=pts,
-            title=title, kwargs...)
+            title=title, mode=mode, kwargs...)
     else
         error("spatial_graph_plot requires either (centroids, graph) or `au=(...)`.")
     end
@@ -518,6 +536,800 @@ end
 
 
 # -----------------------------------------------------------------------------
+# Section 2b: Movement & Trajectory Visualization Primitives
+# -----------------------------------------------------------------------------
+
+"""
+    plot_hsi_choropleth(hsi, au; title="Habitat Suitability Index (HSI)",
+                        cmap=:viridis, show_centroids=false,
+                        show_hull=true, show_colorbar=true,
+                        border_color=:gray, lw=0.4, kwargs...)
+
+Renders a spatial polygon choropleth map of the Habitat Suitability Index (HSI)
+over the tessellated spatial domain.
+
+# Mathematical Formulation
+Each spatial unit ``i \\in \\{1,\\dots,S\\}`` is colored according to its local
+suitability metric ``\\text{HSI}_i \\in [0, 1]``.
+
+# Arguments
+- `hsi::AbstractVector{<:Real}`: Habitat suitability values across ``S`` units.
+- `au::NamedTuple`: Spatial tessellation containing `:polygons` and `:centroids`.
+- `title::String`: Plot title. Default: `"Habitat Suitability Index (HSI)"`.
+- `cmap::Symbol`: Colormap scheme (e.g. `:viridis`, `:cividis`, `:plasma`).
+- `show_centroids::Bool`: Whether to plot unit centroid points. Default: `false`.
+- `show_hull::Bool`: Whether to outline the domain boundary hull. Default: `true`.
+- `show_colorbar::Bool`: Whether to display the value colorbar. Default: `true`.
+- `border_color`: Color of polygon unit borders. Default: `:gray`.
+- `lw::Real`: Line width for polygon borders. Default: `0.4`.
+
+# Returns
+- `Plots.Plot`: Rendered choropleth figure.
+"""
+function plot_hsi_choropleth(
+    hsi::AbstractVector{<:Real},
+    au::NamedTuple;
+    mode::Symbol = :plots,
+    title::String = "Habitat Suitability Index (HSI)",
+    cmap::Symbol = :viridis,
+    show_centroids::Bool = false,
+    show_hull::Bool = true,
+    show_colorbar::Bool = true,
+    border_color = :gray,
+    lw::Real = 0.4,
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        return leaflet_hsi_map(hsi, au; title=title, cmap=cmap, show_centroids=show_centroids,
+                               show_hull=show_hull, kwargs...)
+    end
+    polys = hasproperty(au, :polygons) ? au.polygons : au[:polygons]
+    p = _choropleth_impl(
+        polys, hsi;
+        title = title,
+        cmap = cmap,
+        show_colorbar = show_colorbar,
+        colorbar_label = "HSI",
+        border_color = border_color,
+        lw = lw,
+        kwargs...
+    )
+
+    if show_centroids && hasproperty(au, :centroids)
+        xs = [c[1] for c in au.centroids]
+        ys = [c[2] for c in au.centroids]
+        Plots.scatter!(p, xs, ys, markersize=2.5, color=:black,
+                       markerstrokecolor=:white, markerstrokewidth=0.5,
+                       label=nothing)
+    end
+
+    if show_hull && hasproperty(au, :hull_coords) && !isnothing(au.hull_coords)
+        bx, by = _poly_xy(au.hull_coords)
+        if !isempty(bx)
+            Plots.plot!(p, bx, by, color=:black, lw=1.5, ls=:dash, label=nothing)
+        end
+    end
+
+    return p
+end
+
+"""
+    plot_diffusion_map(diffusion, au; title="Spatial Diffusion / Dispersal Field",
+                       cmap=:plasma, show_colorbar=true, border_color=:gray,
+                       lw=0.4, kwargs...)
+
+Renders a polygon choropleth map representing the spatial distribution of
+dispersal or diffusion rates ``D`` across spatial units.
+
+# Arguments
+- `diffusion::Union{Real, AbstractVector{<:Real}}`: Scalar or ``S``-vector of diffusion rates.
+- `au::NamedTuple`: Spatial tessellation object with `:polygons`.
+- `title::String`: Plot title. Default: `"Spatial Diffusion / Dispersal Field"`.
+- `cmap::Symbol`: Colormap scheme. Default: `:plasma`.
+- `show_colorbar::Bool`: Whether to display the value colorbar. Default: `true`.
+
+# Returns
+- `Plots.Plot`: Rendered diffusion map figure.
+"""
+function plot_diffusion_map(
+    diffusion::Union{Real, AbstractVector{<:Real}},
+    au::NamedTuple;
+    mode::Symbol = :plots,
+    title::String = "Spatial Diffusion / Dispersal Field",
+    cmap::Symbol = :plasma,
+    show_colorbar::Bool = true,
+    border_color = :gray,
+    lw::Real = 0.4,
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        return leaflet_diffusion_map(diffusion, au; title=title, cmap=cmap, kwargs...)
+    end
+    polys = hasproperty(au, :polygons) ? au.polygons : au[:polygons]
+    S = length(polys)
+    diff_vec = if diffusion isa Real
+        fill(Float64(diffusion), S)
+    else
+        Float64.(diffusion)
+    end
+
+    return _choropleth_impl(
+        polys, diff_vec;
+        title = title,
+        cmap = cmap,
+        show_colorbar = show_colorbar,
+        colorbar_label = "Diffusion (D)",
+        border_color = border_color,
+        lw = lw,
+        kwargs...
+    )
+end
+
+"""
+    plot_residence_time_map(Gamma, au; title="Stationary Residence Distribution (π)",
+                            cmap=:inferno, show_colorbar=true, kwargs...)
+
+Computes and maps the stationary distribution ``\\pi`` satisfying ``\\pi \\Gamma = \\pi``,
+reflecting long-term spatial occupancy and residence probabilities under the fitted
+movement kernel.
+
+# Arguments
+- `Gamma::AbstractMatrix{<:Real}`: Markov transition probability matrix (``S \\times S``).
+- `au::NamedTuple`: Spatial tessellation with `:polygons`.
+- `title::String`: Plot title. Default: `"Stationary Residence Distribution (π)"`.
+- `cmap::Symbol`: Colormap scheme. Default: `:inferno`.
+
+# Returns
+- `Plots.Plot`: Rendered stationary distribution choropleth.
+"""
+function plot_residence_time_map(
+    Gamma::AbstractMatrix{<:Real},
+    au::NamedTuple;
+    mode::Symbol = :plots,
+    title::String = "Stationary Residence Distribution (π)",
+    cmap::Symbol = :inferno,
+    show_colorbar::Bool = true,
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        return leaflet_residence_time_map(Gamma, au; title=title, cmap=cmap, kwargs...)
+    end
+    S = size(Gamma, 1)
+    # Power iteration for robust computation of left principal eigenvector
+    pi_vec = fill(1.0 / S, S)
+    for _ in 1:250
+        pi_next = vec(pi_vec' * Gamma)
+        s_sum = sum(pi_next)
+        s_sum > 1e-12 && (pi_next ./= s_sum)
+        pi_vec = pi_next
+    end
+
+    polys = hasproperty(au, :polygons) ? au.polygons : au[:polygons]
+    return _choropleth_impl(
+        polys, pi_vec;
+        title = title,
+        cmap = cmap,
+        show_colorbar = show_colorbar,
+        colorbar_label = "Stationary π",
+        kwargs...
+    )
+end
+
+"""
+    plot_advection_arrows(au; hsi=nothing, velocity=1.0, Gamma=nothing,
+                          relationship=:exponential, arrow_scale=1.0,
+                          arrow_color=:white, background=:hsi, cmap=:viridis,
+                          title="Advection Drift & Velocity Field",
+                          min_speed_quantile=0.05, kwargs...)
+
+Generates a spatial vector field (arrow / quiver plot) depicting the magnitude and
+direction of directed movement / advective drift across spatial units.
+
+# Mathematical Formulation
+Advection vectors ``\\mathbf{v}_i = (v_x, v_y)_i`` at unit centroids ``\\mathbf{x}_i``
+are computed from the local habitat gradient:
+```math
+\\mathbf{v}_i = v \\cdot \\sum_{j \\in \\mathcal{N}(i)} w_{ij} \\, f(\\text{HSI}_j - \\text{HSI}_i) \\,
+\\frac{\\mathbf{x}_j - \\mathbf{x}_i}{\\|\\mathbf{x}_j - \\mathbf{x}_i\\|}
+```
+where ``f(\\Delta h)`` is the response function (`:exponential`, `:logistic`, or `:linear`),
+or directly from the net transition flux ``\\mathbf{J}_i = \\sum_j \\Gamma_{ij}(\\mathbf{x}_j - \\mathbf{x}_i)``.
+
+# Arguments
+- `au::NamedTuple`: Spatial tessellation with `:centroids`, `:polygons`, and `:W`.
+- `hsi::Union{Nothing, AbstractVector{<:Real}}`: Habitat suitability vector (length ``S``).
+- `velocity::Real`: Movement velocity / advection sensitivity multiplier ``v``.
+- `Gamma::Union{Nothing, AbstractMatrix{<:Real}}`: Optional transition probability matrix.
+- `relationship::Symbol`: Response form (`:exponential`, `:logistic`, `:linear`).
+- `arrow_scale::Real`: Scaling factor for visual arrow lengths. Default: `1.0`.
+- `arrow_color`: Color of arrow lines/heads. Default: `:white`.
+- `background::Symbol`: Background style (`:hsi`, `:polygons`, `:none`). Default: `:hsi`.
+- `cmap::Symbol`: Colormap for background or speed. Default: `:viridis`.
+- `title::String`: Plot title.
+- `min_speed_quantile::Real`: Minimum speed quantile threshold below which arrows are omitted.
+
+# Returns
+- `Plots.Plot`: Rendered vector field map.
+"""
+function plot_advection_arrows(
+    au::NamedTuple;
+    mode::Symbol = :plots,
+    hsi::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    velocity::Real = 1.0,
+    Gamma::Union{Nothing, AbstractMatrix{<:Real}} = nothing,
+    relationship::Symbol = :exponential,
+    arrow_scale::Real = 1.0,
+    arrow_color = :white,
+    background::Symbol = :hsi,
+    cmap::Symbol = :viridis,
+    title::String = "Advection Drift & Velocity Field",
+    min_speed_quantile::Real = 0.05,
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        col_str = arrow_color isa Symbol ? string(arrow_color) : string(arrow_color)
+        return leaflet_advection_arrows(au; hsi=hsi, velocity=velocity, Gamma=Gamma,
+                                        relationship=relationship, arrow_scale=arrow_scale,
+                                        arrow_color=col_str, background=background,
+                                        cmap=cmap, title=title, min_speed_quantile=min_speed_quantile,
+                                        kwargs...)
+    end
+    S = length(au.centroids)
+    vx = zeros(Float64, S)
+    vy = zeros(Float64, S)
+
+    if !isnothing(hsi) && hasproperty(au, :W) && !isnothing(au.W)
+        W = au.W
+        rows = rowvals(W)
+        vals = nonzeros(W)
+        hsi_vec = Float64.(hsi)
+
+        for i in 1:S
+            ci = au.centroids[i]
+            for j_idx in nzrange(W, i)
+                j = rows[j_idx]
+                i == j && continue
+                cj = au.centroids[j]
+                dh = hsi_vec[j] - hsi_vec[i]
+                if dh > 0.0
+                    dx = cj[1] - ci[1]
+                    dy = cj[2] - ci[2]
+                    dist = sqrt(dx^2 + dy^2) + 1e-9
+                    weight = if relationship == :exponential
+                        vals[j_idx] * exp(dh)
+                    elseif relationship == :logistic
+                        vals[j_idx] / (1.0 + exp(-4.0 * dh))
+                    else
+                        vals[j_idx] * dh
+                    end
+                    vx[i] += weight * (dx / dist)
+                    vy[i] += weight * (dy / dist)
+                end
+            end
+        end
+        vx .*= Float64(velocity)
+        vy .*= Float64(velocity)
+    elseif !isnothing(Gamma)
+        for i in 1:S
+            ci = au.centroids[i]
+            for j in 1:S
+                i == j && continue
+                cj = au.centroids[j]
+                p_ij = Gamma[i, j]
+                vx[i] += p_ij * (cj[1] - ci[1])
+                vy[i] += p_ij * (cj[2] - ci[2])
+            end
+        end
+    end
+
+    # Background plot
+    p = if background == :hsi && !isnothing(hsi) && hasproperty(au, :polygons)
+        plot_hsi_choropleth(hsi, au; title=title, cmap=cmap, border_color=:gray40,
+                            lw=0.3, show_centroids=false, kwargs...)
+    elseif background == :polygons && hasproperty(au, :polygons)
+        p_base = Plots.plot(aspect_ratio=:equal, title=title, legend=false; kwargs...)
+        for poly in au.polygons
+            if length(poly) > 2
+                xs, ys = _poly_xy(poly)
+                Plots.plot!(p_base, xs, ys, seriestype=:shape, fillcolor=:white,
+                            linecolor=:gray60, lw=0.4, label=nothing)
+            end
+        end
+        p_base
+    else
+        Plots.plot(aspect_ratio=:equal, title=title, legend=false; kwargs...)
+    end
+
+    # Calculate arrow lengths and scaling
+    speeds = sqrt.(vx.^2 .+ vy.^2)
+    max_sp = maximum(speeds)
+
+    if max_sp > 1e-12
+        # Determine average nearest centroid distance to scale arrows proportionally
+        dists = Float64[]
+        for i in 1:min(S, 20)
+            ci = au.centroids[i]
+            nn_d = minimum([sqrt((cj[1]-ci[1])^2 + (cj[2]-ci[2])^2)
+                            for (j, cj) in enumerate(au.centroids) if j != i])
+            push!(dists, nn_d)
+        end
+        avg_spacing = !isempty(dists) ? mean(dists) : 10.0
+        target_max_arrow = avg_spacing * 0.75 * arrow_scale
+        scale_fac = target_max_arrow / max_sp
+
+        speed_cutoff = quantile(speeds, clamp(min_speed_quantile, 0.0, 0.5))
+
+        xs_arr = Float64[]
+        ys_arr = Float64[]
+        qx = Float64[]
+        qy = Float64[]
+
+        for i in 1:S
+            if speeds[i] >= speed_cutoff
+                push!(xs_arr, au.centroids[i][1])
+                push!(ys_arr, au.centroids[i][2])
+                push!(qx, vx[i] * scale_fac)
+                push!(qy, vy[i] * scale_fac)
+            end
+        end
+
+        if !isempty(xs_arr)
+            Plots.quiver!(p, xs_arr, ys_arr, quiver=(qx, qy),
+                          color=arrow_color, lw=1.5, label=nothing)
+            Plots.scatter!(p, xs_arr, ys_arr, markersize=1.8,
+                           color=arrow_color, label=nothing)
+        end
+    end
+
+    return p
+end
+
+const plot_velocity_field = plot_advection_arrows
+
+"""
+    plot_tracks_on_map(paths, au; hsi=nothing, background=:polygons,
+                       title="Movement Trajectories",
+                       palette=:tab10, show_start_end=true,
+                       alpha=0.85, lw=1.8, max_paths=25, kwargs...)
+
+Maps individual movement tracks / dispersal trajectories across the spatial domain,
+with distinct track colorings, release (start) and recapture (end) markers.
+
+# Arguments
+- `paths`: Trajectory matrix (size ``n_{\\text{indiv}} \\times (n_{\\text{steps}}+1)``)
+  of spatial unit indices, or a `Vector` of coordinate sequence tuples.
+- `au::NamedTuple`: Spatial tessellation object with `:centroids` and `:polygons`.
+- `hsi::Union{Nothing, AbstractVector{<:Real}}`: Optional HSI vector for background choropleth.
+- `background::Symbol`: Background style (`:polygons`, `:hsi`, `:none`). Default: `:polygons`.
+- `title::String`: Plot title. Default: `"Movement Trajectories"`.
+- `palette::Symbol`: Color palette for differentiating individuals. Default: `:tab10`.
+- `show_start_end::Bool`: Whether to mark starts (green circles) and ends (red stars).
+- `alpha::Real`: Line transparency. Default: `0.85`.
+- `lw::Real`: Trajectory line width. Default: `1.8`.
+- `max_paths::Int`: Maximum number of paths to render to avoid clutter. Default: `25`.
+
+# Returns
+- `Plots.Plot`: Rendered trajectory map.
+"""
+function plot_tracks_on_map(
+    paths,
+    au::NamedTuple;
+    mode::Symbol = :plots,
+    hsi::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    background::Symbol = :polygons,
+    title::String = "Movement Trajectories",
+    palette::Symbol = :tab10,
+    show_start_end::Bool = true,
+    alpha::Real = 0.85,
+    lw::Real = 1.8,
+    max_paths::Int = 25,
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        return leaflet_tracks_map(paths, au; hsi=hsi, background=background, title=title,
+                                  palette=palette, show_start_end=show_start_end,
+                                  max_paths=max_paths, kwargs...)
+    end
+    # Background setup
+    p = if background == :hsi && !isnothing(hsi) && hasproperty(au, :polygons)
+        plot_hsi_choropleth(hsi, au; title=title, border_color=:gray40, lw=0.3,
+                            show_centroids=false, kwargs...)
+    elseif background == :polygons && hasproperty(au, :polygons)
+        p_base = Plots.plot(aspect_ratio=:equal, title=title, legend=:outerright; kwargs...)
+        for poly in au.polygons
+            if length(poly) > 2
+                xs, ys = _poly_xy(poly)
+                Plots.plot!(p_base, xs, ys, seriestype=:shape, fillcolor=:white,
+                            linecolor=:gray75, lw=0.4, alpha=0.8, label=nothing)
+            end
+        end
+        p_base
+    else
+        Plots.plot(aspect_ratio=:equal, title=title, legend=:outerright; kwargs...)
+    end
+
+    cents = au.centroids
+    n_paths_total = size(paths, 1)
+    n_to_render = min(n_paths_total, max_paths)
+    cs = _get_cscheme(palette)
+
+    for i in 1:n_to_render
+        t_col = get(cs, n_to_render > 1 ? (i - 1) / (n_to_render - 1) : 0.5)
+
+        xs = Float64[]
+        ys = Float64[]
+
+        if isa(paths, AbstractMatrix)
+            n_steps = size(paths, 2)
+            xs = [cents[paths[i, t]][1] for t in 1:n_steps]
+            ys = [cents[paths[i, t]][2] for t in 1:n_steps]
+        elseif isa(paths, AbstractVector) && isa(paths[1], AbstractVector)
+            xs = [pt[1] for pt in paths[i]]
+            ys = [pt[2] for pt in paths[i]]
+        end
+
+        if !isempty(xs)
+            Plots.plot!(p, xs, ys, color=t_col, lw=lw, alpha=alpha,
+                        label="Tag $i", marker=:none)
+
+            if show_start_end
+                # Start marker: filled green circle
+                Plots.scatter!(p, [xs[1]], [ys[1]], markershape=:circle,
+                               markersize=4.5, color=:lime, markerstrokecolor=:black,
+                               markerstrokewidth=0.8, label=nothing)
+                # End marker: filled red triangle / star
+                Plots.scatter!(p, [xs[end]], [ys[end]], markershape=:star5,
+                               markersize=6.0, color=:crimson, markerstrokecolor=:black,
+                               markerstrokewidth=0.8, label=nothing)
+            end
+        end
+    end
+
+    # Add legend proxy for start/end indicators
+    if show_start_end
+        Plots.scatter!(p, [NaN], [NaN], markershape=:circle, markersize=4.0,
+                       color=:lime, markerstrokecolor=:black, label="Release (Start)")
+        Plots.scatter!(p, [NaN], [NaN], markershape=:star5, markersize=5.0,
+                       color=:crimson, markerstrokecolor=:black, label="Recapture (End)")
+    end
+
+    return p
+end
+
+"""
+    plot_dispersal_kernel(Gamma, au; title="Dispersal Kernel Distance Decay",
+                          n_bins=15, fit_exponential=true,
+                          color=:steelblue, kwargs...)
+
+Plots one-step Markov transition probabilities ``\\Gamma_{ij}`` against pairwise spatial
+distances ``d_{ij} = \\|\\mathbf{x}_i - \\mathbf{x}_j\\|``, highlighting isotropic
+dispersal attenuation and empirical kernel decay.
+
+# Arguments
+- `Gamma::AbstractMatrix{<:Real}`: Markov transition probability matrix (``S \\times S``).
+- `au::NamedTuple`: Spatial tessellation with `:centroids`.
+- `title::String`: Plot title.
+- `n_bins::Int`: Number of distance bins for empirical average curve. Default: `15`.
+- `fit_exponential::Bool`: Whether to overlay fitted exponential decay line. Default: `true`.
+- `color`: Primary color for data points. Default: `:steelblue`.
+
+# Returns
+- `Plots.Plot`: Rendered dispersal distance decay curve.
+"""
+function plot_dispersal_kernel(
+    Gamma::AbstractMatrix{<:Real},
+    au::NamedTuple;
+    mode::Symbol = :plots,
+    title::String = "Dispersal Kernel Distance Decay",
+    n_bins::Int = 15,
+    fit_exponential::Bool = true,
+    color = :steelblue,
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        return leaflet_dispersal_kernel(Gamma, au; title=title, kwargs...)
+    end
+    S = size(Gamma, 1)
+    cents = au.centroids
+
+    distances = Float64[]
+    probs = Float64[]
+
+    for i in 1:S
+        ci = cents[i]
+        for j in 1:S
+            i == j && continue
+            cj = cents[j]
+            d = sqrt((cj[1] - ci[1])^2 + (cj[2] - ci[2])^2)
+            p = Gamma[i, j]
+            push!(distances, d)
+            push!(probs, p)
+        end
+    end
+
+    p = Plots.plot(
+        title = title,
+        xlabel = "Pairwise Distance (km)",
+        ylabel = "Transition Probability (Γ_ij)",
+        legend = :topright;
+        kwargs...
+    )
+
+    # Scatter points
+    Plots.scatter!(p, distances, probs, color=color, alpha=0.35, markersize=2.5,
+                   markerstrokewidth=0, label="Pairs (i, j)")
+
+    # Binned mean curve
+    if !isempty(distances)
+        d_min, d_max = minimum(distances), maximum(distances)
+        bin_edges = range(d_min, d_max, length=n_bins+1)
+        bin_mids = Float64[]
+        bin_means = Float64[]
+        bin_se = Float64[]
+
+        for b in 1:n_bins
+            idx = findall(d -> bin_edges[b] <= d < bin_edges[b+1], distances)
+            if !isempty(idx)
+                push!(bin_mids, (bin_edges[b] + bin_edges[b+1]) / 2.0)
+                m = mean(probs[idx])
+                se = length(idx) > 1 ? std(probs[idx]) / sqrt(length(idx)) : 0.0
+                push!(bin_means, m)
+                push!(bin_se, se)
+            end
+        end
+
+        if !isempty(bin_mids)
+            Plots.plot!(p, bin_mids, bin_means, yerror=bin_se, color=:darkorange,
+                        lw=2.5, marker=:circle, markersize=4.0, label="Binned Mean ± SE")
+        end
+
+        # Exponential fit: P(d) = a * exp(-b * d)
+        if fit_exponential && length(probs) > 5
+            valid_idx = findall(p -> p > 1e-9, probs)
+            if length(valid_idx) > 5
+                d_v = distances[valid_idx]
+                log_p = log.(probs[valid_idx])
+                # Linear regression on log scale
+                x_mean = mean(d_v)
+                y_mean = mean(log_p)
+                denom = sum((d_v .- x_mean).^2)
+                if denom > 1e-12
+                    slope = sum((d_v .- x_mean) .* (log_p .- y_mean)) / denom
+                    intercept = y_mean - slope * x_mean
+
+                    if slope < 0
+                        d_eval = range(d_min, d_max, length=100)
+                        p_fit = exp.(intercept .+ slope .* d_eval)
+                        decay_dist = round(-1.0 / slope, digits=1)
+                        Plots.plot!(p, d_eval, p_fit, color=:crimson, lw=2.0, ls=:dash,
+                                    label="Exp Decay (λ ≈ $(decay_dist) km)")
+                    end
+                end
+            end
+        end
+    end
+
+    return p
+end
+
+"""
+    plot_step_length_distribution(paths, au; title="Step Length & Turning Angle Diagnostics",
+                                  kwargs...)
+
+Computes and plots empirical step lengths (km) and turning angle distributions
+from individual trajectory paths.
+
+# Arguments
+- `paths`: Matrix of unit indices or vector of coordinate sequences.
+- `au::NamedTuple`: Spatial tessellation with `:centroids`.
+- `title::String`: Plot super-title.
+
+# Returns
+- `Plots.Plot`: 2-panel composite figure showing step lengths and turning angles.
+"""
+function plot_step_length_distribution(
+    paths,
+    au::NamedTuple;
+    mode::Symbol = :plots,
+    title::String = "Step Length & Turning Angle Diagnostics",
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        return leaflet_step_diagnostics(paths, au; title=title, kwargs...)
+    end
+    cents = au.centroids
+    n_indiv = size(paths, 1)
+    n_steps = size(paths, 2)
+
+    step_lengths = Float64[]
+    turning_angles = Float64[]
+
+    for i in 1:n_indiv
+        xs = [cents[paths[i, t]][1] for t in 1:n_steps]
+        ys = [cents[paths[i, t]][2] for t in 1:n_steps]
+
+        for t in 2:n_steps
+            d = sqrt((xs[t] - xs[t-1])^2 + (ys[t] - ys[t-1])^2)
+            push!(step_lengths, d)
+
+            if t >= 3
+                # Turning angle between step (t-1 -> t) and (t-2 -> t-1)
+                dx1, dy1 = xs[t-1] - xs[t-2], ys[t-1] - ys[t-2]
+                dx2, dy2 = xs[t] - xs[t-1], ys[t] - ys[t-1]
+                a1 = atan(dy1, dx1)
+                a2 = atan(dy2, dx2)
+                d_ang = a2 - a1
+                # Wrap to [-pi, pi]
+                d_ang = atan(sin(d_ang), cos(d_ang))
+                push!(turning_angles, d_ang)
+            end
+        end
+    end
+
+    p1 = Plots.histogram(
+        step_lengths, bins=15, color=:royalblue, linecolor=:white,
+        title="Step Length Distribution", xlabel="Step Length (km)",
+        ylabel="Frequency", legend=false
+    )
+
+    p2 = Plots.histogram(
+        turning_angles, bins=15, color=:darkorange, linecolor=:white,
+        title="Turning Angle Distribution", xlabel="Turning Angle (rad)",
+        ylabel="Frequency", legend=false
+    )
+    Plots.vline!(p2, [0.0], color=:red, ls=:dash, lw=1.5)
+
+    return Plots.plot(p1, p2, layout=(1, 2), size=(800, 350), plot_title=title; kwargs...)
+end
+
+"""
+    plot_regional_connectivity_matrix(C_regional; strata_names=nothing,
+                                      title="Macro-Regional Transfer Matrix",
+                                      cmap=:Blues, show_values=true, kwargs...)
+
+Renders a heatmap of the macro-regional transition probability matrix ``C_{rs}``
+with annotated cell percentages.
+
+# Arguments
+- `C_regional::AbstractMatrix{<:Real}`: Regional transition matrix (``R \\times R``).
+- `strata_names::Union{Nothing, Vector{String}}`: Names of the regional strata.
+- `title::String`: Plot title. Default: `"Macro-Regional Transfer Matrix"`.
+- `cmap::Symbol`: Heatmap colormap. Default: `:Blues`.
+- `show_values::Bool`: Whether to annotate text percentages in cells. Default: `true`.
+
+# Returns
+- `Plots.Plot`: Rendered connectivity matrix heatmap.
+"""
+function plot_regional_connectivity_matrix(
+    C_regional::AbstractMatrix{<:Real};
+    mode::Symbol = :plots,
+    strata_names::Union{Nothing, Vector{String}} = nothing,
+    title::String = "Macro-Regional Transfer Matrix",
+    cmap::Symbol = :Blues,
+    show_values::Bool = true,
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        return leaflet_regional_connectivity(C_regional; strata_names=strata_names, title=title, kwargs...)
+    end
+    R = size(C_regional, 1)
+    names = if !isnothing(strata_names) && length(strata_names) == R
+        strata_names
+    elseif R == 2
+        ["West", "East"]
+    else
+        ["Stratum $i" for i in 1:R]
+    end
+
+    # Plots.heatmap expects y-axis as rows, x-axis as cols
+    # Transpose so that from-stratum is vertical axis and to-stratum is horizontal axis
+    p = Plots.heatmap(
+        names, names, C_regional',
+        color = cmap,
+        clims = (0.0, 1.0),
+        aspect_ratio = :equal,
+        title = title,
+        xlabel = "To Region",
+        ylabel = "From Region",
+        colorbar_title = "Transfer Prob.",
+        yflip = true;
+        kwargs...
+    )
+
+    if show_values
+        for i in 1:R
+            for j in 1:R
+                val = C_regional[i, j]
+                txt = @sprintf("%.1f%%", val * 100.0)
+                txt_color = val > 0.5 ? :white : :black
+                Plots.annotate!(p, [(j, i, Plots.text(txt, 10, txt_color, :center, :bold))])
+            end
+        end
+    end
+
+    return p
+end
+
+"""
+    plot_movement_dashboard(result, paths; hsi=nothing, strata=nothing,
+                            title="BSTM Movement Diagnostics Dashboard", kwargs...)
+
+Creates a comprehensive 4-panel composite dashboard summarizing:
+1. (A) Habitat Suitability & Advective Velocity Vectors
+2. (B) Movement Tracks / Trajectories on Tessellation
+3. (C) Dispersal Kernel Distance Decay Curve
+4. (D) Macro-Regional Transfer Connectivity Matrix
+
+# Arguments
+- `result::NamedTuple`: Result object from `run_movement_simple` or `synthesize_adr_results`.
+- `paths::AbstractMatrix{<:Integer}`: Simulated individual trajectory paths.
+- `hsi::Union{Nothing, AbstractVector{<:Real}}`: Optional HSI vector.
+- `strata::Union{Nothing, AbstractVector}`: Regional strata definitions.
+- `title::String`: Dashboard super-title.
+
+# Returns
+- `Plots.Plot`: 4-panel composite diagnostic dashboard.
+"""
+function plot_movement_dashboard(
+    result::NamedTuple,
+    paths::AbstractMatrix{<:Integer};
+    mode::Symbol = :plots,
+    hsi::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    strata::Union{Nothing, AbstractVector} = nothing,
+    title::String = "BSTM Movement Diagnostics Dashboard",
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        return leaflet_movement_dashboard(result, paths; hsi=hsi, strata=strata, title=title, kwargs...)
+    end
+    au = result.au
+    Gamma = result.transition_matrix
+    hsi_vec = !isnothing(hsi) ? hsi : (hasproperty(result.opts, :hsi) ? result.opts.hsi : nothing)
+
+    # Subplot A: Habitat & Advection Arrows
+    p_a = plot_advection_arrows(
+        au;
+        hsi = hsi_vec,
+        Gamma = Gamma,
+        background = !isnothing(hsi_vec) ? :hsi : :polygons,
+        title = "(A) Habitat & Advective Drift",
+        arrow_scale = 1.0
+    )
+
+    # Subplot B: Movement Tracks
+    p_b = plot_tracks_on_map(
+        paths, au;
+        hsi = hsi_vec,
+        background = :polygons,
+        title = "(B) Simulated Trajectories",
+        max_paths = 15
+    )
+
+    # Subplot C: Dispersal Distance Decay
+    p_c = plot_dispersal_kernel(
+        Gamma, au;
+        title = "(C) Dispersal Kernel Decay",
+        fit_exponential = true
+    )
+
+    # Subplot D: Regional Connectivity
+    cents_x = [c[1] for c in au.centroids]
+    mid_x = (minimum(cents_x) + maximum(cents_x)) / 2.0
+    strata_vec = !isnothing(strata) ? strata : [x > mid_x ? "East" : "West" for x in cents_x]
+    C_reg = calculate_regional_connectivity(Gamma, strata_vec)
+    strata_unique = unique(strata_vec)
+    p_d = plot_regional_connectivity_matrix(
+        C_reg;
+        strata_names = strata_unique,
+        title = "(D) Macro-Regional Connectivity"
+    )
+
+    return Plots.plot(p_a, p_b, p_c, p_d, layout=(2, 2), size=(1050, 850),
+                      plot_title=title; kwargs...)
+end
+
+
+# -----------------------------------------------------------------------------
 # Section 3: Timeseries & Regression Primitives
 # -----------------------------------------------------------------------------
 
@@ -553,11 +1365,15 @@ end
 # -----------------------------------------------------------------------------
 
 """
-    save_plot(p::Plots.Plot, path::AbstractString; fmt=nothing, dpi::Integer=150)
+    save_plot(p::Union{Plots.Plot, LeafletMap}, path::AbstractString; fmt=nothing, dpi::Integer=150)
 
-Saves plot `p` to file path `path`. Creates parent directories automatically if needed.
+Saves plot `p` (either a `Plots.Plot` figure or an interactive `LeafletMap` HTML document)
+to file path `path`. Creates parent directories automatically if needed.
 """
-function save_plot(p::Plots.Plot, path::AbstractString; fmt=nothing, dpi::Integer=150)
+function save_plot(p::Union{Plots.Plot, LeafletMap}, path::AbstractString; fmt=nothing, dpi::Integer=150)
+    if p isa LeafletMap
+        return save_html(p, path)
+    end
     dir = dirname(path)
     if !isempty(dir)
         try; isdir(dir) || mkpath(dir); catch; end
@@ -1308,6 +2124,7 @@ end
       dpi::Integer=150)
 
 Saves all plots in a `plots` NamedTuple/Dict or `bstm_plots` result to `save_dir`.
+Automatically saves `Plots.Plot` objects as `fmt` (default: `"png"`) and `LeafletMap` objects as `.html`.
 """
 function save_plots(plots_obj, save_dir::AbstractString; prefix::String="", fmt::String="png",
     dpi::Integer=150)
@@ -1320,14 +2137,24 @@ function save_plots(plots_obj, save_dir::AbstractString; prefix::String="", fmt:
     clean_fmt = lowercase(string(lstrip(fmt, '.')))
 
     for (k, p) in pairs(plots_to_save)
-        if p isa Plots.Plot
+        if p isa LeafletMap
+            fn = isempty(prefix) ? "$(k).html" : "$(prefix)_$(k).html"
+            out_path = joinpath(save_dir, fn)
+            save_html(p, out_path)
+            push!(saved_paths, out_path)
+        elseif p isa Plots.Plot
             fn = isempty(prefix) ? "$(k).$(clean_fmt)" : "$(prefix)_$(k).$(clean_fmt)"
             out_path = joinpath(save_dir, fn)
             save_plot(p, out_path; fmt=nothing, dpi=dpi)
             push!(saved_paths, out_path)
         elseif p isa NamedTuple || p isa Dict
             for (sub_k, sub_p) in pairs(p)
-                if sub_p isa Plots.Plot
+                if sub_p isa LeafletMap
+                    fn = isempty(prefix) ? "$(k)_$(sub_k).html" : "$(prefix)_$(k)_$(sub_k).html"
+                    out_path = joinpath(save_dir, fn)
+                    save_html(sub_p, out_path)
+                    push!(saved_paths, out_path)
+                elseif sub_p isa Plots.Plot
                     fn = isempty(prefix) ? "$(k)_$(sub_k).$(clean_fmt)" : "$(prefix)_$(k)_$(sub_k).$(clean_fmt)"
                     out_path = joinpath(save_dir, fn)
                     save_plot(sub_p, out_path; fmt=nothing, dpi=dpi)

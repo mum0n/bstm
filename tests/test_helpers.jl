@@ -6,7 +6,7 @@ using Test
 try
     using bstm
 catch
-    include(joinpath(@__DIR__, "..", "bstm.jl"))
+    include(joinpath(@__DIR__, "..", "src", "bstm.jl"))
     using .bstm
 end
 

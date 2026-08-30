@@ -54,7 +54,7 @@ framework connecting:
 7. **Configurable Standard & Advanced Modes**: A single unified engine (`hierarchical_workflow.jl`)
    supports both baseline cut-posterior formulations and advanced methodological innovations via
    `PipelineOptions` flags.
-7. **Individual Size-Sex-Maturity Composition & Poststratification**: A linked trio of sub-models
+8. **Individual Size-Sex-Maturity Composition & Poststratification**: A linked trio of sub-models
    (ALR-GMRF size composition, Bernoulli sex-ratio, parametric maturity ogive) fit on individual
    biological sub-sample records, combined with Tier 5 abundance via poststratification to
    reconstruct $\hat{N}(s, t, \ell, g, m)$ at arbitrary locations and times as input to a

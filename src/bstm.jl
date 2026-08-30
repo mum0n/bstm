@@ -21,7 +21,6 @@ module bstm
     @reexport using StatsBase
     @reexport using Statistics 
     @reexport using DataFrames
-    @reexport using ArgParse
     @reexport using ADTypes
     @reexport using KernelAbstractions
     @reexport using Bijectors
@@ -69,7 +68,7 @@ module bstm
     # Packages that are fundamental to bstm's internal operation
     # but whose entire API is NOT intended to be part of bstm's public API.
     # Users should explicitly 'using' these if they need their full API.
-    using Wavelets, WaveletsExt, NNlib 
+    using Wavelets, WaveletsExt, NNlib, CoordRefSystems, Unitful
         
     srcdir = @__DIR__  # bstm/src
     rootdir = dirname(srcdir) # bstm
@@ -82,6 +81,7 @@ module bstm
     include( "derivatives.jl")
     include( "hierarchical.jl") 
     include( "input_output.jl")
+    include( "leaflet.jl")
     include( "likelihoods.jl")
     include( "model.jl")
     include( "movement.jl")
@@ -102,7 +102,7 @@ module bstm
 
     # work in progress: 
     # include( joinpath(docsdir, "hierarchical_workflow", "hierarchical_workflow.jl") )
-    include( joinpath(docsdir, "movement", "movement_simple.jl") )
+    # include( joinpath(docsdir, "movement", "movement_simple.jl") )
 
 
     # User-facing API exports
@@ -123,6 +123,21 @@ module bstm
  
     export create_theme, choropleth, timeseries_ci, spatial_graph_plot
     export render_paths!, map_point_occupancy, save_plot, model_results_plots
+    export plot_hsi_choropleth, plot_diffusion_map, plot_residence_time_map
+    export plot_advection_arrows, plot_velocity_field, plot_tracks_on_map
+    export plot_dispersal_kernel, plot_step_length_distribution
+    export plot_regional_connectivity_matrix, plot_movement_dashboard
+    export householder_to_eigenvector, eigenvector_to_householder
+
+    # Leaflet Interactive HTML System exports
+    export LeafletMap, save_html, utm_to_lonlat, lonlat_to_utm
+    export leaflet_choropleth, leaflet_spatial_map, leaflet_spatial_graph
+    export leaflet_hsi_map, leaflet_diffusion_map, leaflet_residence_time_map
+    export leaflet_advection_arrows, leaflet_velocity_field
+    export leaflet_tracks_map, leaflet_render_paths
+    export leaflet_spacetime_map, leaflet_movement_dashboard
+    export leaflet_dispersal_kernel, leaflet_step_diagnostics
+    export leaflet_regional_connectivity, leaflet_ad_ratio_distribution
 
     # Movement & ADR Telemetry exports
     export generate_ADR_simulation_bundle, simulate_correlated_density_vector
@@ -130,6 +145,10 @@ module bstm
     export simulate_posterior_trajectories, simulate_mechanistic_trajectories
     export compute_suitability_transition_kernel, calculate_regional_connectivity
     export plot_ad_ratio_distribution, synthesize_adr_results
+    export haversine_distance, tag_to_study_id, filter_dead_tags
+    export summarize_tag_activity, sample_markov_bridge, reconstruct_mark_recapture_paths
+    export validate_telemetry, map_telemetry_to_units, time_steps_between
+    export extract_scalar_param, reconstruct_posterior_kernel, reshard_hsi_field
 
     # Input / Output & Persistence exports
     export save_bstm_model, load_bstm_model

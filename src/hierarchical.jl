@@ -39,21 +39,22 @@ function compute_data_traits(df::DataFrame; temporal_col=nothing, spatial_cols=(
         :rows => nrow(df),
         :cols => ncol(df)
     )
-    if haskey(df, spatial_cols[1]) && haskey(df, spatial_cols[2])
+    if hasproperty(df, spatial_cols[1]) && hasproperty(df, spatial_cols[2])
         traits[:min_x] = round(minimum(df[!, spatial_cols[1]]), digits=4)
         traits[:max_x] = round(maximum(df[!, spatial_cols[1]]), digits=4)
         traits[:min_y] = round(minimum(df[!, spatial_cols[2]]), digits=4)
         traits[:max_y] = round(maximum(df[!, spatial_cols[2]]), digits=4)
     end
-    if temporal_col !== nothing && haskey(df, temporal_col)
+    if temporal_col !== nothing && hasproperty(df, temporal_col)
         traits[:min_time] = minimum(df[!, temporal_col])
         traits[:max_time] = maximum(df[!, temporal_col])
         traits[:n_times] = length(unique(df[!, temporal_col]))
-    elseif haskey(df, :year)
+    elseif hasproperty(df, :year)
         traits[:min_time] = minimum(df.year)
         traits[:max_time] = maximum(df.year)
         traits[:n_times] = length(unique(df.year))
     end
+
     
     # Deterministic hash based on dimensions and column summaries
     h_val = hash(nrow(df))
@@ -105,10 +106,25 @@ if it does not already exist.
 - `bundle_path` (`VARCHAR`): File path to JLD2 model bundle.
 - `table_name` (`VARCHAR`): Table name of predictions in DuckDB.
 """
-function init_pipeline_manifest!(db_path::AbstractString)
+function _with_duckdb(f::Function, db_path::AbstractString)
     db = DuckDB.DB(db_path)
     con = DuckDB.connect(db)
     try
+        return f(con)
+    finally
+        try DuckDB.disconnect(con) catch end
+        try DuckDB.close(db) catch end
+        GC.gc()
+    end
+end
+
+"""
+    init_pipeline_manifest!(db_path::AbstractString)
+
+Initializes the metadata and provenance manifest table in DuckDB if not present.
+"""
+function init_pipeline_manifest!(db_path::AbstractString)
+    _with_duckdb(db_path) do con
         DuckDB.query(con, """
             CREATE TABLE IF NOT EXISTS pipeline_manifest (
                 tier_id VARCHAR PRIMARY KEY,
@@ -124,10 +140,6 @@ function init_pipeline_manifest!(db_path::AbstractString)
                 table_name VARCHAR
             )
         """)
-    finally
-        DuckDB.disconnect(con)
-        
-        
     end
 end
 
@@ -138,14 +150,8 @@ Writes or replaces a DataFrame into the relational DuckDB project database with
 automatic connection cleanup and garbage collection.
 """
 function write_tier_table!(db_path::AbstractString, df::DataFrame, tbl_name::AbstractString)
-    db = DuckDB.DB(db_path)
-    con = DuckDB.connect(db)
-    try
+    _with_duckdb(db_path) do con
         _write_df_to_duckdb(con, df, tbl_name, true)
-    finally
-        DuckDB.disconnect(con)
-        
-        
     end
 end
 
@@ -155,15 +161,9 @@ end
 Reads a table from the relational DuckDB project database into a Julia `DataFrame`.
 """
 function read_tier_table(db_path::AbstractString, tbl_name::AbstractString)
-    db = DuckDB.DB(db_path)
-    con = DuckDB.connect(db)
-    try
+    return _with_duckdb(db_path) do con
         res = DuckDB.query(con, "SELECT * FROM $tbl_name")
-        return DataFrame(res)
-    finally
-        DuckDB.disconnect(con)
-        
-        
+        DataFrame(res)
     end
 end
 
@@ -176,16 +176,10 @@ function has_tier_table(db_path::AbstractString, tbl_name::AbstractString)
     if !isfile(db_path)
         return false
     end
-    db = DuckDB.DB(db_path)
-    con = DuckDB.connect(db)
-    try
+    return _with_duckdb(db_path) do con
         df = DataFrame(DuckDB.query(con, 
-            "SELECT table_name FROM information_schema.tables WHERE table_name = ?", [tbl_name]))   
-        return nrow(df) > 0
-    finally
-        DuckDB.disconnect(con)
-        
-        
+            "SELECT table_name FROM information_schema.tables WHERE table_name = '$tbl_name'"))   
+        nrow(df) > 0
     end
 end
 
@@ -199,16 +193,10 @@ function get_manifest_entry(db_path::AbstractString, tier_id::AbstractString)
         return nothing
     end
     init_pipeline_manifest!(db_path)
-    db = DuckDB.DB(db_path)
-    con = DuckDB.connect(db)
-    try
+    return _with_duckdb(db_path) do con
         df = DataFrame(DuckDB.query(con, 
-            "SELECT * FROM pipeline_manifest WHERE tier_id = ?", [tier_id]))    
-        return nrow(df) > 0 ? df[1, :] : nothing
-    finally
-        DuckDB.disconnect(con)
-        
-        
+            "SELECT * FROM pipeline_manifest WHERE tier_id = '$tier_id'"))    
+        nrow(df) > 0 ? df[1, :] : nothing
     end
 end
 
@@ -231,27 +219,23 @@ function update_manifest_entry!(
     init_pipeline_manifest!(db_path)
     now_str = Dates.format(Dates.now(Dates.UTC), "yyyy-mm-dd HH:mm:ss") * " UTC"
     traits_str = repr(traits)
+    traits_escaped = replace(traits_str, "'" => "''")
     deps_str = join(upstream_deps, ",")
     data_hash = get(traits, :hash, "")
     data_rows = Int64(get(traits, :rows, 0))
 
-    db = DuckDB.DB(db_path)
-    con = DuckDB.connect(db)
-    try
+    _with_duckdb(db_path) do con
         DuckDB.query(con, "DELETE FROM pipeline_manifest WHERE tier_id = '$tier_id'")
         DuckDB.query(con, """
-        DuckDB.query(con, """
-            INSERT INTO pipeline_manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            tier_id, tier_name, status, update_frequency, now_str, 
-            data_hash, data_rows, traits_str, deps_str, bundle_path, table_name
-        ])
-    finally
-        DuckDB.disconnect(con)
-        
-        
+            INSERT INTO pipeline_manifest VALUES (
+                '$tier_id', '$tier_name', '$status', '$update_frequency', '$now_str', 
+                '$data_hash', $data_rows, '$traits_escaped', '$deps_str', '$bundle_path', '$table_name'
+            )
+        """)
     end
 end
+
+
 
 """
     is_tier_up_to_date(db_path::AbstractString, tier_id::AbstractString, current_traits::Dict{Symbol, Any}, upstream_deps::Vector{String}) -> Bool

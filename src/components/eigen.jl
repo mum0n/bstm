@@ -247,13 +247,14 @@ function get_updates(
     n_vars = hyper.n_vars
     
     common_code = """
-        v_mat = zeros(T, $(n_vars), $(n_factors))
+        T_v = eltype($(p_names.v_unscaled))
+        v_mat = zeros(T_v, $(n_vars), $(n_factors))
         v_mat[spec_registry[:$(key)].hyper.ltri_indices] .= $(p_names.v_unscaled)
         
         U = householder_to_eigenvector(v_mat, spec_registry[:$(key)].hyper.n_vars,
           spec_registry[:$(key)].hyper.n_factors)
         L = U * Diagonal($(p_names.pca_sd))
-        Psi = Diagonal($(p_names.pdef_sd).^2) + (M.noise * I)
+        pdef_sd_vec = $(p_names.pdef_sd)
         
         Y_eigen_data = spec_registry[:$(key)].hyper.eigen_data
     """
@@ -265,13 +266,14 @@ function get_updates(
             F = reshape($(p_names.factors_flat), $(n_obs), $(n_factors))
             Y_hat = F * L'
             
-            for i in 1:$(n_obs)
-                Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), Y_eigen_data[i, :])
+            for j in 1:$(n_vars)
+                Turing.@addlogprob! sum(Distributions.logpdf.(Distributions.Normal.(view(Y_hat, :, j), pdef_sd_vec[j]), view(Y_eigen_data, :, j)))
             end
             
             $(eta_target) = $(eta_target) .+ view(F, :, 1)
         end
     """
+
 
     centered_code = """
         # --- Factor Model for Eigen Component (Centered): $(key) ---

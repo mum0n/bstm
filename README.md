@@ -5,9 +5,32 @@
 [![Turing.jl](https://img.shields.io/badge/Powered%20By-Turing.jl-purple.svg)](https://turinglang.org)
 [![DuckDB](https://img.shields.io/badge/Analytics-DuckDB-yellow.svg)](https://duckdb.org)
 
-The **`bstm`** framework provides a composable, formula-driven probabilistic programming interface for hierarchical Bayesian spatiotemporal modeling in Julia. Built on top of **Turing.jl** and Julia's scientific computing ecosystem, `bstm` separates observation likelihood specifications from latent process dynamics. This decoupling allows researchers to flexibly assemble spatial, temporal, non-linear, and mechanistic differential components into an integrated, differentiable probabilistic model.
+The **`bstm`** framework provides a composable, formula-driven probabilistic programming interface for hierarchical Bayesian spatiotemporal modeling in Julia. Built on top of **Turing.jl** and Julia's stellar scientific computing ecosystem, `bstm` separates observation likelihood specifications from latent process dynamics. This separation allows researchers to flexibly assemble spatial, temporal, non-linear, and mechanistic differential components into an integrated, differentiable probabilistic model.
 
-Inspired by high-level formula interfaces like R's `brms` and `INLA`, `bstm` provides automated code generation, automatic differentiation (ForwardDiff, ReverseDiff, Zygote), adaptive composite block-sampling, full posterior reconstruction, spatial tessellation, analytical SQL querying, and publication-ready diagnostic visualization.
+Inspired by high-level formula interfaces like R's `brms` and `INLA`, `bstm` and learning from `bugs`, `jags` and `stan`, it provides automated code generation, automatic differentiation (ForwardDiff, ReverseDiff, Zygote), adaptive composite block-sampling, full posterior reconstruction, spatial tessellation, analytical SQL querying, and publication-ready diagnostic visualization. It represents the evolution of the  `aegis`-based approach and workflow implemented in R (https://github.com/jae0/aegis, https://github.com/jae0/carstm, and https://github.com/jae0/bio.snowcrab) to embrace Julia's performance, ecosystem and extensibility. It is designed to make complex ecological modeling faster, more flexible, transparent and accessible to scientists, in the spirit and ideals of open and reproducible science. It is limited by my own human limits knowledge and experience, and so I look forward to other scientists running with it to make something truly great! 
+
+Full disclosure: I have made heavy use of Gemini AI to help develop this package. It has been an invaluable catalyst to make coherent the code, tests, vizualizations and documentation. 
+
+Best regards,
+Jae
+
+
+## What it looks like
+
+By design, this should look familiar and comprehensible to most people. All that is required for a user is to define a likelihood and any latent processes. The rest is handled by `bstm` and you have a full hierarchical Bayesian model! You can take the generated Turing.jl model and alter it by adding any custom components you desire! Then use the best inference method available, such as cutting edge Variational inference methods, or MCMC methods (NUTS, HMC, etc.) to estimate the features you are interested in. 
+
+```julia
+
+m = @bstm(
+    likelihood(y, family=poisson) ~
+        intercept() +
+        fixed(elevation) +
+        random(s_idx, model=bym2, W=W) +
+        random(year_idx, model=ar1),
+    data = st_data
+);
+
+```
 
 ---
 
@@ -60,8 +83,7 @@ Inspired by high-level formula interfaces like R's `brms` and `INLA`, `bstm` pro
 
 ```bash
 git clone https://github.com/mum0n/bstm.git
-cd bstm
-# cd("c:/home/jae/projects/bstm") # where you saved bstm
+cd("where/you/saved/bstm")  
 ```
 
 Start Julia within the repository:
@@ -70,9 +92,13 @@ Start Julia within the repository:
 using Pkg
 Pkg.activate(".")
 Pkg.instantiate()
- 
-include("bstm.jl")
+include("src/bstm.jl")
 using .bstm
+
+# or installed as a package
+using Pkg
+Pkg.add(url="https://github.com/mum0n/bstm.git")
+using bstm
 ```
 
 ## Quick Start Examples
@@ -87,20 +113,18 @@ Random.seed!(42)
 
 # 1. Load benchmark dataset (56 Scottish districts across time)
 data_scot, _ = bstm_data() # Scottish Lip Cancer
-df = data_scot.data
-W = data_scot.au.W
+df = data_scot.data # dataframe with response and covariates
+W = data_scot.au.W  # graph (adjacency matrix)
 
 # 2. Specify Hierarchical Spatiotemporal Model
 m = @bstm(
     likelihood(y, family=poisson, log_offsets=log_offsets) ~
         intercept() +
         fixed(cov1) +
-        random(s_idx, model=bym2) +
+        random(s_idx, model=bym2, W=W) +
         random(year, model=ar1),
-    df,
-    W = W,
-    verbose = false
-)
+    df     
+);
 
 # 3. Sample from Posterior with NUTS
 chn = sample(m, NUTS(), 30; progress=false)
@@ -116,6 +140,14 @@ display(plots_res.plots[:spatial])
 
 # 6. Persist Unified Bundle to DuckDB and JLD2
 save_bstm_bundle("output/scot_lip_model", m, chn, res; au=data_scot.au)
+
+# 7. Query prior
+# Extract prior from the saved bundle
+prior_posterior = extract_prior_posterior(bn_bundle)
+
+# Show posterior summaries of the prior (first 1000 draws)
+display(prior_posterior[:prior, :parameters, 1:1000])
+ 
 ```
 
 ---
@@ -205,7 +237,7 @@ chn_extended = extend_sampling(bundle.model, bundle.chain, 500; progress=false)
 
 ### Example 4: Modular Hierarchical DAG Pipeline & Surface Derivatives
 
-Execute a multi-tier ecological workflow with analytical surface derivatives, cross-mesh resharding, Errors-in-Variables priors, and DuckDB table persistence:
+Execute a multi-tier ecological workflow with analytical surface derivatives, cross-mesh resharding, Errors-in-Variables priors, and DuckDB table persistence. This was the `aegis` workflow, but with `bstm` and some major enhancements enabled by the Julia ecosystem.
 
 ```julia
 using bstm, DataFrames, Turing
@@ -242,7 +274,7 @@ display(df_master)
 
 ## Documentation
 
-Comprehensive guides and technical documentation are available in the `docs/` directory:
+There is a lot more functionality available. Comprehensive guides and technical documentation are available in the `docs/` directory:
 
 - [**Integrated Hierarchical Workflows & ADR Telemetry** (`docs/hierarchical_workflow/hierarchical_workflow.md`)](docs/hierarchical_workflow/hierarchical_workflow.md):
   Directed Acyclic Graphs (DAGs), multi-scale cross-mesh resharding, Full Monte Carlo matrix transformations, Errors-in-Variables (EIV) priors, second-last tier Habitat Suitability (HSI) determination, analytical surface derivatives, Advection-Diffusion-Reaction (ADR) population dynamics, Lagrangian telemetry, and DuckDB SQL analytics, Tempered Power Posteriors (fractional feedback $\lambda$), full empirical spatial covariance in EIV, hybrid continuous basis-polygon quadrature resharding, continuous soft-sigmoid physiological HSI, and coupled oceanographic-active advection.
@@ -255,7 +287,7 @@ Comprehensive guides and technical documentation are available in the `docs/` di
 - [**Input / Output & Persistence Guide** (`docs/bstm_input_output.md`)](docs/bstm_input_output.md):
   Two-tier persistence architecture, JLD2 model serialization, DuckDB analytical results storage, sample extension, SQL analytics, and GIS export.
 - [**Custom Components & Spatial SEIR Modeling Guide** (`docs/bstm_custom.md`)](docs/bstm_custom.md):
-  Mechanistic process modeling, raw Turing code injection with `custom()`, first-class `ComponentModel` implementation, and spatial SEIR disease dynamics.
+  Mechanistic process modeling, raw Turing code injection with `custom()`, first-class `ComponentModel` implementation, and spatial SEIR disease dynamics. OR, create a new ComposedModel specific to your needs by extending existing components. Use the many examples provided in 'src/composed/' as a guide. 
 
 ---
 

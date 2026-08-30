@@ -134,7 +134,7 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
     end
 
     s_N = size(W, 1)
-    t_N = M.t_N
+    t_N = hasproperty(M, :t_N) ? M.t_N : (hasproperty(M, :t_idx) ? length(unique(M.t_idx)) : 1)
 
     habitat_data = nothing
     if haskey(params, :habitat)
@@ -146,10 +146,14 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
             habitat_per_obs = data[!, habitat_val]
             habitat_aggregated = zeros(Float64, s_N)
             counts = zeros(Int, s_N)
-            for i in 1:M.y_N
-                s_i = M.s_idx[i]
-                habitat_aggregated[s_i] += habitat_per_obs[i]
-                counts[s_i] += 1
+            y_N_val = hasproperty(M, :y_N) ? M.y_N : nrow(data)
+            s_idx_vec = hasproperty(M, :s_idx) ? M.s_idx : (hasproperty(data, :s_idx) ? data.s_idx : Int[])
+            for i in 1:min(y_N_val, length(s_idx_vec))
+                s_i = s_idx_vec[i]
+                if 1 <= s_i <= s_N
+                    habitat_aggregated[s_i] += habitat_per_obs[i]
+                    counts[s_i] += 1
+                end
             end
             habitat_data = habitat_aggregated ./ max.(1, counts)
         elseif habitat_val isa AbstractVector
@@ -222,9 +226,17 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 function _process_telemetry_data(telemetry_df::DataFrame)
-    required_cols = [:tagid, :s_idx, :time, :tag]
-    if !all(hasproperty(telemetry_df, col) for col in required_cols)
-        error("Telemetry DataFrame must contain columns: :tagid, :s_idx, :time, :tag.")
+    time_col = if hasproperty(telemetry_df, :time)
+        :time
+    elseif hasproperty(telemetry_df, :timestamp)
+        :timestamp
+    else
+        nothing
+    end
+
+    if isnothing(time_col) || !hasproperty(telemetry_df, :tagid) ||
+       !hasproperty(telemetry_df, :s_idx) || !hasproperty(telemetry_df, :tag)
+        error("Telemetry DataFrame must contain columns: :tagid, :s_idx, (:time or :timestamp), :tag.")
     end
 
     transitions = []
@@ -235,8 +247,8 @@ function _process_telemetry_data(telemetry_df::DataFrame)
             continue
         end
         
-        # Sort observations for each individual by tag/time
-        sort!(sub_df, :tag)
+        # Sort observations for each individual by tag and time
+        sort!(sub_df, [order(:tag), order(time_col)])
 
         for i in 1:(nrow(sub_df) - 1)
             release_row = sub_df[i, :]
@@ -244,11 +256,13 @@ function _process_telemetry_data(telemetry_df::DataFrame)
 
             release_unit = release_row.s_idx
             recapture_unit = recapture_row.s_idx
-            time_steps = round(Int, recapture_row.time - release_row.time)
+            t_rel = Float64(getproperty(release_row, time_col))
+            t_rec = Float64(getproperty(recapture_row, time_col))
+            time_steps = max(1, round(Int, t_rec - t_rel))
             
             # Use individual covariate if present, otherwise default to 0
             covariate = hasproperty(sub_df,
-                :individual_covariate) ? release_row.individual_covariate : 0.0
+                :individual_covariate) ? Float64(release_row.individual_covariate) : 0.0
 
             push!(transitions, [release_unit, recapture_unit, time_steps, covariate])
         end
@@ -273,8 +287,7 @@ function get_priors(
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
     
     if hasproperty(spec.hyper, :habitat_data)
-        beta_habitat_diffusion_name = "beta_habitat_diffusion_$(spec.key)"
-        push!(priors, "$(beta_habitat_diffusion_name) ~ Normal(0, 1.0)")
+        push!(priors, "$(p_names.beta_habitat_diffusion) ~ Normal(0, 1.0)")
     end
     
     if !isnothing(m.r)
@@ -322,10 +335,9 @@ function get_updates(
     hyper = spec.hyper
 
     diffusion_field_code = if hasproperty(hyper, :habitat_data)
-        beta_habitat_diffusion_name = "beta_habitat_diffusion_$(key)"
         """
         habitat_field = spec_registry[:$(key)].hyper.habitat_data
-        diffusion_field = $(p_names.diffusion) .* exp.($(beta_habitat_diffusion_name) .* habitat_field)
+        diffusion_field = $(p_names.diffusion) .* exp.($(p_names.beta_habitat_diffusion) .* habitat_field)
         """
     else
         "diffusion_field = fill($(p_names.diffusion), $(hyper.s_N))"
@@ -407,7 +419,7 @@ function get_updates(
         dyn_field .*= $(p_names.sigma)
         
         # Vectorized update to the linear predictor using linear indexing
-        st_idx = (M.t_idx .- 1) .* spec.hyper.s_N .+ M.s_idx
+        st_idx = (M.t_idx .- 1) .* $(hyper.s_N) .+ M.s_idx
         $(p_names.sre) = vec(dyn_field)[st_idx]
         $(eta_target) = $(eta_target) .+ $(p_names.sre)
     """
@@ -508,8 +520,12 @@ function get_effects(
           n_samples)
 
         beta_habitat_samples = if hasproperty(hyper, :habitat_data)
-            beta_name = _find_parameter(p_names, "beta_habitat_diffusion_$(key)", k,
-              is_multivariate_model)
+            beta_name = _find_parameter(p_names,
+              string(p_names_k.beta_habitat_diffusion), k, is_multivariate_model)
+            if isempty(beta_name)
+                beta_name = _find_parameter(p_names, "beta_habitat_diffusion_$(key)",
+                  k, is_multivariate_model)
+            end
             isempty(beta_name) ? nothing : get_params_vector(chain, beta_name, 1)[:, 1]
         else
             nothing

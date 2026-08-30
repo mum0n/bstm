@@ -202,4 +202,133 @@ end
 
     p_ad = plot_ad_ratio_distribution([1.0, 2.0], [0.5, 0.5])
     @test p_ad isa Plots.Plot
+
+    # 5. Test _process_telemetry_data with :time and :timestamp columns
+    df_telem_time = DataFrame(
+        tagid = [1, 1, 2, 2],
+        s_idx = [1, 2, 2, 1],
+        time = [2020.0, 2021.0, 2020.0, 2022.0],
+        tag = [0, 1, 0, 1],
+        individual_covariate = [0.5, 0.5, -0.2, -0.2]
+    )
+    mat_time = bstm._process_telemetry_data(df_telem_time)
+    @test size(mat_time) == (2, 4)
+    @test mat_time[1, 1] == 1.0 && mat_time[1, 2] == 2.0 && mat_time[1, 3] == 1.0
+
+    df_telem_timestamp = DataFrame(
+        tagid = [1, 1],
+        s_idx = [1, 3],
+        timestamp = [10.0, 12.0],
+        tag = [0, 1]
+    )
+    mat_timestamp = bstm._process_telemetry_data(df_telem_timestamp)
+    @test size(mat_timestamp) == (1, 4)
+    @test mat_timestamp[1, 3] == 2.0
+
+    # 6. Test movement component formula compilation and hyperprior resolution
+    df_mov = DataFrame(
+        y = [1.0, 2.0],
+        s_idx = [1, 2],
+        t_idx = [1, 1],
+        s_x = [0.0, 1.0],
+        s_y = [0.0, 1.0]
+    )
+    W_mov = [0 1; 1 0]
+    m_mov_test = @bstm(
+        likelihood(y, family=gaussian) ~ intercept() +
+            movement(s_idx, t_idx,
+                velocity  = truncated(Normal(0.0, 1.0), lower=0.0),
+                diffusion = truncated(Normal(0.0, 1.0), lower=0.0),
+                sigma     = truncated(Normal(0.0, 0.5), lower=0.0),
+                beta_het  = Normal(0.0, 1.0)),
+        df_mov,
+        W = W_mov,
+        mark_recapture_data = df_telem_time,
+        verbose = false
+    )
+    @test m_mov_test isa DynamicPPL.Model
+    spec_mov = m_mov_test.args.M.components[1]
+    @test spec_mov.component_obj isa bstm.Movement
+    @test !isnothing(spec_mov.component_obj.beta_het)
+
+    # 7. Test haversine_distance calculation
+    d_m = bstm.haversine_distance(-63.57, 44.65, -60.18, 46.14)
+    @test isapprox(d_m / 1000.0, 311.0; atol=5.0)
+    @test bstm.haversine_distance(0.0, 0.0, 0.0, 0.0) == 0.0
+    @test isnan(bstm.haversine_distance(NaN, 0.0, 1.0, 1.0))
+
+    # 8. Test tag_to_study_id lookup mappings
+    @test bstm.tag_to_study_id(100) == 1
+    @test bstm.tag_to_study_id("G1234") == 6
+    @test bstm.tag_to_study_id("t1605") == 49
+    @test bstm.tag_to_study_id("s99105") == 57
+    @test bstm.tag_to_study_id(999999) === nothing
+
+    # 9. Test filter_dead_tags terminal stationary period detection
+    df_dead_test = DataFrame(
+        tagid = fill("tag_A", 4),
+        lon = [-63.0, -62.5, -62.0, -62.0001],
+        lat = [44.0, 44.5, 45.0, 45.0001],
+        timestamp = [Date(2021, 1, 1), Date(2021, 2, 1), Date(2021, 3, 1), Date(2021, 5, 1)]
+    )
+    df_filtered = bstm.filter_dead_tags(df_dead_test; time_threshold_days=30.0, dist_threshold_meters=50.0)
+    @test hasproperty(df_filtered, :is_dead)
+    @test df_filtered.is_dead[1] == false
+    @test df_filtered.is_dead[2] == false
+    @test df_filtered.is_dead[3] == true
+    @test df_filtered.is_dead[4] == true
+
+    # 10. Test summarize_tag_activity calculation
+    df_act = DataFrame(
+        tagid = ["tag_1", "tag_1", "tag_2"],
+        lon = [-63.0, -63.1, -60.0],
+        lat = [44.0, 44.1, 45.0],
+        timestamp = [Date(2021, 1, 1), Date(2021, 1, 11), Date(2021, 1, 1)],
+        cw = [100.0, 105.0, 90.0],
+        cc = ["2", "3", "1"]
+    )
+    act_summary = bstm.summarize_tag_activity(df_act)
+    @test nrow(act_summary) == 2
+    row1 = filter(r -> r.tagid == "tag_1", act_summary)[1, :]
+    @test row1.duration_days == 10.0
+    @test row1.cw_change == 5.0
+    @test row1.n_points == 2
+    @test row1.total_dist_m > 0.0
+
+    # 11. Test validate_telemetry
+    df_valid = DataFrame(
+        tagid = [1, 1],
+        lon = [-63.0, -62.5],
+        lat = [44.0, 44.5],
+        time = [2021.0, 2022.0],
+        tag = [0, 1]
+    )
+    @test bstm.validate_telemetry(df_valid) === nothing
+    @test_throws ArgumentError bstm.validate_telemetry(DataFrame(tagid=[1], lon=[0.0]))
+
+    # 12. Test map_telemetry_to_units & time_steps_between
+    df_mapped = bstm.map_telemetry_to_units(df_valid, au_simple)
+    @test hasproperty(df_mapped, :s_idx)
+    @test all(1 .<= df_mapped.s_idx .<= 2)
+    @test bstm.time_steps_between(2020.0, 2022.2) == 2
+    @test bstm.time_steps_between(2020.0, 2020.1) == 1
+
+    # 13. Test reconstruct_posterior_kernel with mock chain
+    mock_chain = (
+        velocity = [0.8, 1.0],
+        diffusion = [0.2, 0.3]
+    )
+    W_k = [0 1; 1 0]
+    Gamma_rec = bstm.reconstruct_posterior_kernel(mock_chain, W_k)
+    @test size(Gamma_rec) == (2, 2)
+    @test isapprox(sum(Gamma_rec[1, :]), 1.0; atol=1e-5)
+    @test isapprox(sum(Gamma_rec[2, :]), 1.0; atol=1e-5)
+
+    # 14. Test reshard_hsi_field
+    hsi_source = [0.2, 0.8, 0.5, 0.9]
+    hsi_resharded = bstm.reshard_hsi_field(hsi_source, au_simple)
+    @test length(hsi_resharded) == length(au_simple.centroids)
+    @test all(0.0 .<= hsi_resharded .<= 1.0)
 end
+
+

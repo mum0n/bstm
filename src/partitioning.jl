@@ -1507,6 +1507,16 @@ end
         total_area = sum(areas)
     )
 
+    wkt_val = if haskey(kwargs, :wkt) && !isnothing(kwargs[:wkt])
+        string(kwargs[:wkt])
+    elseif haskey(kwargs, :crs) && !isnothing(kwargs[:crs])
+        string(kwargs[:crs])
+    elseif haskey(kwargs, :proj) && !isnothing(kwargs[:proj])
+        string(kwargs[:proj])
+    else
+        nothing
+    end
+
     return (
         centroids = final_centroids,
         polygons = polys_coords,
@@ -1523,7 +1533,8 @@ end
         point_counts = point_counts,
         n_units = n_units,
         metrics = metrics,
-        termination_reason = reason
+        termination_reason = reason,
+        wkt = wkt_val
     )
 end
 
@@ -1541,16 +1552,27 @@ end
 
 """
     assign_spatial_units_inferred(adjacency_matrix; iterations=50, learning_rate=0.1,
-      buffer_dist=0.5, input_polygons=nothing)
+      buffer_dist=0.5, input_polygons=nothing, wkt=nothing)
 
 Infers spatial node positions and creates Voronoi boundaries when only a neighborhood
 adjacency matrix `W` is available (e.g. Scottish Lip Cancer dataset). Uses a force-directed
 spring layout to determine relative spatial coordinates.
 """
 function assign_spatial_units_inferred(
-    adjacency_matrix; iterations=50, learning_rate=0.1, buffer_dist=0.5, input_polygons=nothing
+    adjacency_matrix; iterations=50, learning_rate=0.1, buffer_dist=0.5, input_polygons=nothing,
+    wkt=nothing, crs=nothing, proj=nothing
 )
     nAU = size(adjacency_matrix, 1)
+
+    wkt_val = if !isnothing(wkt)
+        string(wkt)
+    elseif !isnothing(crs)
+        string(crs)
+    elseif !isnothing(proj)
+        string(proj)
+    else
+        nothing
+    end
 
     if input_polygons !== nothing && !isempty(input_polygons)
         final_centroids_geoms = [LibGEOS.centroid(p) for p in input_polygons]
@@ -1653,7 +1675,8 @@ function assign_spatial_units_inferred(
         s_x = [c[1] for c in final_centroids[1:nAU]],
         s_y = [c[2] for c in final_centroids[1:nAU]],
         s_vals = collect(1:nAU),
-        termination_reason = "positions inferred from adjacency matrix"
+        termination_reason = "positions inferred from adjacency matrix",
+        wkt = wkt_val
     )
 end
 
@@ -1749,45 +1772,56 @@ function ensure_connected!(g::SimpleGraph, centroids::Vector{<:Tuple{Real, Real}
         return g
     end
 
-    n_comps = length(comps)
-    comp_centroids = Vector{Vector{Float64}}(undef, n_comps)
-    for i in 1:n_comps
-        pts = [[Float64(centroids[node][1]), Float64(centroids[node][2])] for node in comps[i]]
-        comp_centroids[i] = mean(pts)
-    end
+    n_nodes = length(centroids)
+    c_mat = hcat([[Float64(c[1]), Float64(c[2])] for c in centroids]...)
+    tree = KDTree(c_mat)
 
-    tree = KDTree(hcat(comp_centroids...))
-
-    for i in 1:n_comps
-        if is_connected(g)
-            break
-        end
-        idxs, _ = knn(tree, comp_centroids[i], min(2, n_comps))
-        target_comp_idx = idxs[min(2, length(idxs))]
-
-        min_dist = Inf
-        best_pair = (0, 0)
-        for u in comps[i]
-            for v in comps[target_comp_idx]
-                d = (centroids[u][1]-centroids[v][1])^2 + (centroids[u][2]-centroids[v][2])^2
-                if d < min_dist
-                    min_dist = d
-                    best_pair = (u, v)
+    # 1. Add minimal bridging edge from each component to nearest external node
+    for comp in comps
+        comp_set = Set(comp)
+        best_d = Inf
+        best_u = 0
+        best_v = 0
+        k_search = min(n_nodes, max(4, ceil(Int, sqrt(n_nodes))))
+        for u in comp
+            idxs, dists = knn(tree, [centroids[u][1], centroids[u][2]], k_search)
+            for (k_idx, v) in enumerate(idxs)
+                if !(v in comp_set)
+                    if dists[k_idx] < best_d
+                        best_d = dists[k_idx]
+                        best_u = u
+                        best_v = v
+                        break
+                    end
                 end
             end
         end
-
-        if best_pair[1] != 0 && best_pair[2] != 0 && !has_edge(g, best_pair[1], best_pair[2])
-            add_edge!(g, best_pair[1], best_pair[2])
+        if best_u != 0 && best_v != 0 && !has_edge(g, best_u, best_v)
+            add_edge!(g, best_u, best_v)
         end
     end
 
-    if !is_connected(g)
-        return ensure_connected!(g, centroids)
+    # 2. Iteratively bridge any remaining disjoint component centroids
+    comps = connected_components(g)
+    while length(comps) > 1
+        n_c = length(comps)
+        comp_centroids = [
+            mean([[Float64(centroids[n][1]), Float64(centroids[n][2])] for n in c])
+            for c in comps
+        ]
+        tree_c = KDTree(hcat(comp_centroids...))
+        idxs, _ = knn(tree_c, comp_centroids[1], min(2, n_c))
+        target_idx = idxs[min(2, length(idxs))]
+        u = comps[1][1]
+        v = comps[target_idx][1]
+        add_edge!(g, u, v)
+        comps = connected_components(g)
     end
 
     return g
 end
+
+
 
 
 """

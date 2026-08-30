@@ -2,7 +2,7 @@
 
 julia_version = "1.12.7"
 manifest_format = "2.0"
-project_hash = "85119e18d4d4bb1db01eb12f8f68c26d05e84abf"
+project_hash = "06f98a7af566d2fe0e3697ea4855fe6e1e472dd5"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "5970c86505ae9c07bf5bc521ef2bbbb3849e8b7b"
@@ -656,6 +656,12 @@ weakdeps = ["IntervalSets", "LinearAlgebra", "StaticArrays"]
 git-tree-sha1 = "439e35b0b36e2e5881738abc8857bd92ad6ff9a8"
 uuid = "d38c429a-6771-53c6-b99e-75d170b6e991"
 version = "0.6.3"
+
+[[deps.CoordRefSystems]]
+deps = ["ForwardDiff", "Random", "Rotations", "StaticArrays", "Unitful"]
+git-tree-sha1 = "bbfccac7cab8ded940cce9b086b164bdd87be8f4"
+uuid = "b46f11dc-f210-4604-bfba-323c1ec968cb"
+version = "0.20.0"
 
 [[deps.CoordinateTransformations]]
 deps = ["LinearAlgebra", "StaticArrays"]
@@ -1590,14 +1596,11 @@ deps = ["Adapt", "AxisAlgorithms", "ChainRulesCore", "LinearAlgebra", "OffsetArr
 git-tree-sha1 = "48922d06068130f87e43edef52382e6a94305ae6"
 uuid = "a98d9a8b-a2ab-59e6-89dd-64a1c18fca59"
 version = "0.16.3"
+weakdeps = ["ForwardDiff", "Unitful"]
 
     [deps.Interpolations.extensions]
     InterpolationsForwardDiffExt = "ForwardDiff"
     InterpolationsUnitfulExt = "Unitful"
-
-    [deps.Interpolations.weakdeps]
-    ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
-    Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [[deps.IntervalArithmetic]]
 deps = ["CRlibm", "CoreMath", "MacroTools", "OpenBLASConsistentFPCSR_jll", "Printf", "Random", "RoundingEmulator"]
@@ -2652,6 +2655,12 @@ git-tree-sha1 = "f7bbf8d5dda12f3f417b350baf82ebf0d190a623"
 uuid = "eead6e0c-2d5b-5641-a95c-b722de96d551"
 version = "0.7.1+0"
 
+[[deps.PROJ_jll]]
+deps = ["Artifacts", "JLLWrappers", "LibCURL_jll", "Libdl", "Libtiff_jll", "SQLite_jll"]
+git-tree-sha1 = "fbfbc14815c5f5375abc971321aa5f468e715a38"
+uuid = "58948b4f-47e0-5654-a9ad-f609743f8632"
+version = "902.800.100+0"
+
 [[deps.PSIS]]
 deps = ["LinearAlgebra", "LogExpFunctions", "Printf", "RecipesBase", "Statistics"]
 git-tree-sha1 = "554bfcb2e56a9928b793a3c99f1d16e324c79ee0"
@@ -2845,6 +2854,12 @@ deps = ["Distributed", "Printf"]
 git-tree-sha1 = "fbb92c6c56b34e1a2c4c36058f68f332bec840e7"
 uuid = "92933f4c-e287-5a05-a399-4b506db050ca"
 version = "1.11.0"
+
+[[deps.Proj]]
+deps = ["CEnum", "CoordinateTransformations", "GeoFormatTypes", "GeoInterface", "NetworkOptions", "PROJ_jll"]
+git-tree-sha1 = "61188669db4f5b400173e4ec60da8bcb72d6e749"
+uuid = "c94c279d-25a6-4763-9509-64d165bea63e"
+version = "1.9.0"
 
 [[deps.PtrArrays]]
 git-tree-sha1 = "4fbbafbc6251b883f4d2705356f3641f3652a7fe"
@@ -3105,6 +3120,12 @@ deps = ["IfElse", "Static", "VectorizationBase"]
 git-tree-sha1 = "72312aa278823c0e99ce31186e22d917d2d11f99"
 uuid = "476501e8-09a2-5ece-8869-fb82de89a1fa"
 version = "0.6.46"
+
+[[deps.SQLite_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Zlib_jll", "dlfcn_win32_jll"]
+git-tree-sha1 = "324744e40b84e6dc2cfaa4122ce969a083c40a6f"
+uuid = "76ed43ae-9a5d-5a62-8c75-30186b810ce8"
+version = "3.53.2+0"
 
 [[deps.SSMProblems]]
 deps = ["AbstractMCMC", "Distributions", "Random"]
@@ -3625,14 +3646,11 @@ deps = ["InverseFunctions", "LinearAlgebra", "Requires"]
 git-tree-sha1 = "cb44e15367c11e252b265bc6b088995826ae29f9"
 uuid = "c3b1956e-8857-4d84-9b79-890df85b1e67"
 version = "1.14.0"
+weakdeps = ["OffsetArrays", "Unitful"]
 
     [deps.TypeUtils.extensions]
     TypeUtilsOffsetArraysExt = "OffsetArrays"
     TypeUtilsUnitfulExt = "Unitful"
-
-    [deps.TypeUtils.weakdeps]
-    OffsetArrays = "6fe1bfb0-de20-5000-8ca7-80f57d26f881"
-    Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [[deps.URIs]]
 git-tree-sha1 = "908fec9df6c5de98548ead82a468c95ccf6cd263"
@@ -3679,6 +3697,21 @@ version = "3.8.4"
     IntervalSets = "8197267c-284f-5f27-9208-e0e47529a953"
     Term = "22787eb5-b846-44ae-b979-8e399b8463ab"
     Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[[deps.Unitful]]
+deps = ["Dates", "LinearAlgebra", "Random"]
+git-tree-sha1 = "57e1b2c9de4bd6f40ecb9de4ac1797b81970d008"
+uuid = "1986cc42-f94f-5a68-af5c-568840ba703d"
+version = "1.28.0"
+weakdeps = ["ConstructionBase", "ForwardDiff", "InverseFunctions", "LaTeXStrings", "Latexify", "NaNMath", "Printf"]
+
+    [deps.Unitful.extensions]
+    ConstructionBaseUnitfulExt = "ConstructionBase"
+    ForwardDiffExt = "ForwardDiff"
+    InverseFunctionsUnitfulExt = "InverseFunctions"
+    LatexifyExt = ["Latexify", "LaTeXStrings"]
+    NaNMathExt = "NaNMath"
+    PrintfExt = "Printf"
 
 [[deps.UnsafeAtomics]]
 git-tree-sha1 = "21b39bfb1fab6156b61fbcba4c86c57b6216d2c3"
@@ -3937,10 +3970,16 @@ uuid = "700de1a5-db45-46bc-99cf-38207098b444"
 version = "0.2.8"
 
 [[deps.bstm]]
-deps = ["ADTypes", "AbstractGPs", "AbstractMCMC", "AbstractPPL", "AdvancedVI", "Bijectors", "BlackBoxOptim", "CategoricalArrays", "Clustering", "ColorSchemes", "DataFrames", "DelaunayTriangulation", "DifferentialEquations", "DimensionalData", "Distances", "Distributions", "DrWatson", "DuckDB", "DynamicPPL", "Enzyme", "FFTW", "FillArrays", "FiniteDiff", "FlexiChains", "ForwardDiff", "GLM", "Graphs", "HypothesisTests", "Interpolations", "JLD2", "KernelAbstractions", "KernelFunctions", "LibGEOS", "LinearAlgebra", "LogExpFunctions", "NLopt", "NNlib", "NamedArrays", "NearestNeighbors", "Optim", "Optimisers", "OptimizationNLopt", "OrderedCollections", "PDMats", "PRIMA", "PackageCompiler", "Plots", "PosteriorStats", "PrecompileTools", "Random", "Reexport", "Requires", "ReverseDiff", "Revise", "SparseArrays", "SpecialFunctions", "StaticArrays", "Statistics", "StatsBase", "StatsModels", "StatsPlots", "Turing", "Wavelets", "WaveletsExt", "Zygote"]
+deps = ["ADTypes", "AbstractGPs", "AbstractMCMC", "AbstractPPL", "AdvancedVI", "Bijectors", "BlackBoxOptim", "CategoricalArrays", "Clustering", "ColorSchemes", "DataFrames", "Dates", "DelaunayTriangulation", "DifferentialEquations", "DimensionalData", "Distances", "Distributions", "DrWatson", "DuckDB", "DynamicPPL", "Enzyme", "FFTW", "FillArrays", "FiniteDiff", "FlexiChains", "ForwardDiff", "GLM", "Graphs", "HypothesisTests", "Interpolations", "JLD2", "KernelAbstractions", "KernelFunctions", "LibGEOS", "LinearAlgebra", "LogExpFunctions", "NLopt", "NNlib", "NamedArrays", "NearestNeighbors", "Optim", "Optimisers", "OptimizationNLopt", "OrderedCollections", "PDMats", "PRIMA", "PackageCompiler", "Plots", "PosteriorStats", "PrecompileTools", "Printf", "Proj", "Random", "Reexport", "Requires", "ReverseDiff", "Revise", "SHA", "SparseArrays", "SpecialFunctions", "StaticArrays", "Statistics", "StatsBase", "StatsModels", "StatsPlots", "Turing", "Wavelets", "WaveletsExt", "Zygote"]
 path = "."
 uuid = "a9d6ec74-ebb6-4ecd-a5cd-9826d4a3476e"
 version = "1.0.0"
+
+[[deps.dlfcn_win32_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "e141d67ffe550eadfb5af1bdbdaf138031e4805f"
+uuid = "c4b69c83-5512-53e3-94e6-de98773c479f"
+version = "1.4.2+0"
 
 [[deps.eudev_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]

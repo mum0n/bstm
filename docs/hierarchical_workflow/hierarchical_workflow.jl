@@ -16,20 +16,17 @@
 # Single-Call Segment Execution, Provenance Fingerprinting & Smart Restarts.
 # ==============================================================================
 
-# Include local bstm framework
-# include(joinpath(@__DIR__, "..", "..", "bstm.jl"))
-# using .bstm
-
-# using DataFrames
-# using LinearAlgebra
-# using SparseArrays
-# using Distributions
-# using Turing
-# using Random
-# using Dates
-# using Printf
-# using DuckDB
-# using Plots
+using bstm
+using DataFrames
+using LinearAlgebra
+using SparseArrays
+using Distributions
+using Turing
+using Random
+using Dates
+using Printf
+using DuckDB
+using Plots
 
 # ==============================================================================
 # SECTION 1: CONFIGURATION & PIPELINE SPECIFICATION
@@ -677,11 +674,12 @@ function run_step7_telemetry_movement(
     for poly in au_master.polygons
         plot!(p_traj, [p[1] for p in poly], [p[2] for p in poly], seriestype=:shape, fillalpha=0.08, linecolor=:grey, label="")
     end
-    render_paths!(p_traj, sim_paths, au_master.centroids; linecolor=:darkgreen, alpha=0.6, linewidth=1.5)
+    render_paths!(p_traj, sim_paths; au=au_master, color=:darkgreen, lw=1.5)
 
     p_conn = heatmap(
         ["East_Bank", "West_Basin"], ["East_Bank", "West_Basin"], C_regional,
-        title = "Regional Connectivity Matrix", xlabel = "Destination", ylabel = "Source", colormap = :blues
+        title = "Regional Connectivity Matrix", xlabel = "Destination",
+        ylabel = "Source", color = :blues
     )
 
     output_dir = joinpath(@__DIR__, "output")
@@ -887,13 +885,9 @@ function run_tier6_composition(
     tow_meta = combine(
         groupby(df_bio, [:tow_id, :s_idx, :year_idx, :hsi_mu, :hsi_sd,
                          :temp_mu, :temp_sd, :depth_mu, :depth_sd]),
-        :size_bin => (b -> [sum(b .== l) for l in 1:L]) => :bin_counts,
+        [Symbol("size_bin") => (b -> sum(b .== l)) => Symbol("n_bin_", l) for l in 1:L]...,
         nrow => :n_bio
     )
-    # Expand bin_counts vector column into L separate columns
-    for l in 1:L
-        tow_meta[!, Symbol("n_bin_", l)] = [r.bin_counts[l] for r in eachrow(tow_meta)]
-    end
 
     # ALR reference bin = L; fit L-1 Gaussian models on log(n_l / n_L + 0.5)
     chains_alr = Vector{Any}(undef, L - 1)
@@ -971,9 +965,9 @@ function run_tier6_composition(
 
     # Maturity ogive at bin midpoints for male and female
     bin_mids  = [(breaks[l] + min(breaks[l+1], breaks[l] + 30.0)) / 2.0 for l in 1:L]
-    alpha_mat = mean(Array(chn_mat[:intercept]))
-    beta_cw   = mean(Array(chn_mat[:beta_fixed_cw_scaled]))
-    beta_sex  = mean(Array(chn_mat[:beta_fixed_sex]))
+    alpha_mat = mean(extract_scalar_param(chn_mat, "intercept"))
+    beta_cw   = mean(extract_scalar_param(chn_mat, "cw_scaled"))
+    beta_sex  = mean(extract_scalar_param(chn_mat, "sex"))
 
     mat_prob(cw, sex_val) = 1.0 / (1.0 + exp(-(alpha_mat
                                                 + beta_cw * (cw - 65.0) / 20.0
@@ -983,13 +977,22 @@ function run_tier6_composition(
     # tier5_table.pred_mean is per spatial unit (single year summary); repeat over T_N
     N_ut = repeat(tier5_table.pred_mean, outer=T_N)  # length = n_units * T_N
 
-    # Assemble long-format poststratified table
-    years_unique  = minimum(df_bio.year) .+ (0:(T_N-1))
-    sex_labels    = [0, 1]      # female, male
-    maturity_labels = [0, 1]    # immature, mature
+    # Assemble long-format poststratified table with preallocated vectors
+    years_unique    = minimum(df_bio.year) .+ (0:(T_N-1))
+    sex_labels      = [0, 1]      # female, male
+    maturity_labels = [0, 1]      # immature, mature
 
-    ps_records = DataFrame()
+    total_rows = nrow(grid_ut) * L * length(sex_labels) * length(maturity_labels)
+    unit_ids_col   = Vector{Int}(undef, total_rows)
+    years_col      = Vector{Int}(undef, total_rows)
+    size_bins_col  = Vector{Int}(undef, total_rows)
+    sexes_col      = Vector{Int}(undef, total_rows)
+    mat_col        = Vector{Int}(undef, total_rows)
+    n_means_col    = Vector{Float64}(undef, total_rows)
+    n_lowers_col   = Vector{Float64}(undef, total_rows)
+    n_uppers_col   = Vector{Float64}(undef, total_rows)
 
+    idx_out = 1
     for (row_idx, row) in enumerate(eachrow(grid_ut))
         N_base = max(0.0, N_ut[row_idx])
         for l in 1:L
@@ -1000,20 +1003,31 @@ function run_tier6_composition(
                     mu = mat_prob(bin_mids[l], Float64(g))
                     p_m = m_val == 1 ? mu : (1.0 - mu)
                     n_mean = N_base * pi_l * rho * p_m
-                    push!(ps_records, (
-                        unit_id   = row.s_idx,
-                        year      = years_unique[row.year_idx],
-                        size_bin  = l,
-                        sex       = g,
-                        maturity  = m_val,
-                        n_mean    = n_mean,
-                        n_lower   = n_mean * 0.8,   # placeholder CI until full sample propagation
-                        n_upper   = n_mean * 1.2
-                    ))
+
+                    unit_ids_col[idx_out]  = row.s_idx
+                    years_col[idx_out]     = years_unique[row.year_idx]
+                    size_bins_col[idx_out] = l
+                    sexes_col[idx_out]     = g
+                    mat_col[idx_out]       = m_val
+                    n_means_col[idx_out]   = n_mean
+                    n_lowers_col[idx_out]  = n_mean * 0.8
+                    n_uppers_col[idx_out]  = n_mean * 1.2
+                    idx_out += 1
                 end
             end
         end
     end
+
+    ps_records = DataFrame(
+        unit_id   = unit_ids_col,
+        year      = years_col,
+        size_bin  = size_bins_col,
+        sex       = sexes_col,
+        maturity  = mat_col,
+        n_mean    = n_means_col,
+        n_lower   = n_lowers_col,
+        n_upper   = n_uppers_col
+    )
 
     write_tier_table!(db_path, ps_records, "tier6_composition")
     @info "  Saved tier6_composition: $(nrow(ps_records)) rows " *

@@ -176,9 +176,9 @@ struct UnknownArchitecture <: AbstractModelArchitecture end
 
 
 const BSTM_MODULE_KEYWORDS = Set([ 
-    :intercept, :fixed, :mixed, :random, :nested, :eigen, :dynamics, :pointprocess, :custom,
-    :zscore, :log, :center, :scale, :sciml
-]);
+    :intercept, :fixed, :mixed, :random, :nested, :eigen, :dynamics, :movement,
+    :pointprocess, :custom, :zscore, :log, :center, :scale, :sciml
+])
   
 const TRANSFORMATION_FUNCTIONS = Set([:zscore, :log, :center, :scale])
 
