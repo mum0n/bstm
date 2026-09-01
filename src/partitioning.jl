@@ -696,7 +696,7 @@ function get_hvt_centroids(
     pts_matrix = hcat([[p[1], p[2]] for p in coords]...)
     k_target = max(1, cfg.min_total_arealunits)
 
-    R = kmeans(pts_matrix, k_target)
+    R = Clustering.kmeans(pts_matrix, k_target)
     curr_centroids = [(R.centers[1, i], R.centers[2, i]) for i in 1:size(R.centers, 2)]
 
     last_mean_density, last_cv = 0.0, 0.0
@@ -2281,3 +2281,704 @@ function estimate_local_kde_with_extrapolation(
     intensity ./= max(sum(intensity), 1e-9)
     return x_grid, y_grid, intensity
 end
+
+
+
+
+"""
+    lonlat_to_xy_km(lon, lat; center_lon=nothing, center_lat=nothing, crs=nothing, datum=WGS84Latest)
+    -> (x_km, y_km)
+"""
+function lonlat_to_xy_km(
+    lon::Real, lat::Real;
+    center_lon = nothing,
+    center_lat = nothing,
+    crs = nothing,
+    datum = WGS84Latest
+)::Tuple{Float64, Float64}
+    if !isnothing(crs) && _HAS_COORDSYS
+        try
+            source_pt = LatLon{datum}(lat, lon)
+            proj_pt = convert(crs, source_pt)
+
+            x_km = Float64(ustrip(u"km", proj_pt.x))
+            y_km = Float64(ustrip(u"km", proj_pt.y))
+
+            # If a local custom center is provided, subtract it to get relative offsets
+            if !isnothing(center_lon) && !isnothing(center_lat)
+                center_pt = LatLon{datum}(center_lat, center_lon)
+                proj_center = convert(crs, center_pt)
+                x_km -= Float64(ustrip(u"km", proj_center.x))
+                y_km -= Float64(ustrip(u"km", proj_center.y))
+            end
+
+            return (x_km, y_km)
+        catch
+        end
+    end
+    
+    # Fallback to local tangent plane (requires a center to function, defaults to 0.0)
+    c_lon = isnothing(center_lon) ? 0.0 : Float64(center_lon)
+    c_lat = isnothing(center_lat) ? 0.0 : Float64(center_lat)
+    
+    R  = 6371.0
+    ϕ0 = c_lat * (π / 180.0)
+    x  = (Float64(lon) - c_lon) * cos(ϕ0) * (π / 180.0) * R
+    y  = (Float64(lat) - c_lat) * (π / 180.0) * R
+    return (x, y)
+end
+
+"""
+    xy_km_to_lonlat(x_km, y_km; center_lon=nothing, center_lat=nothing, crs=nothing, datum=WGS84Latest)
+    -> (lon, lat)
+"""
+function xy_km_to_lonlat(
+    x::Real, y::Real;
+    center_lon = nothing,
+    center_lat = nothing,
+    crs = nothing,
+    datum = WGS84Latest
+)::Tuple{Float64, Float64}
+    if !isnothing(crs) && _HAS_COORDSYS
+        try
+            abs_x = x * 1.0u"km"
+            abs_y = y * 1.0u"km"
+
+            # If a local custom center was used, add it back to get absolute CRS coordinates
+            if !isnothing(center_lon) && !isnothing(center_lat)
+                center_pt = LatLon{datum}(center_lat, center_lon)
+                proj_center = convert(crs, center_pt)
+                abs_x += proj_center.x
+                abs_y += proj_center.y
+            end
+
+            proj_pt = crs(abs_x, abs_y)
+            lonlat_pt = convert(LatLon{datum}, proj_pt)
+
+            out_lon = Float64(ustrip(u"°", lonlat_pt.lon))
+            out_lat = Float64(ustrip(u"°", lonlat_pt.lat))
+
+            return (out_lon, out_lat)
+        catch
+        end
+    end
+    
+    # Fallback local tangent plane
+    c_lon = isnothing(center_lon) ? 0.0 : Float64(center_lon)
+    c_lat = isnothing(center_lat) ? 0.0 : Float64(center_lat)
+    
+    R  = 6371.0
+    ϕ0 = c_lat * (π / 180.0)
+    lon = c_lon + (Float64(x) / (R * cos(ϕ0))) * (180.0 / π)
+    lat = c_lat + (Float64(y) / R) * (180.0 / π)
+    return (lon, lat)
+end
+
+# ── Internal helpers ───────────────────────────────────────────────────────────
+
+"""
+    _to_decimal_year(d) -> Float64
+
+Convert a `Date` or `DateTime` to decimal year, accounting for leap years:
+
+    decimal_year = year + (dayofyear − 1) / days_in_year
+"""
+function _to_decimal_year(d::Union{Date, DateTime})::Float64
+    yr         = Dates.year(d)
+    doy        = Float64(Dates.dayofyear(d))
+    days_in_yr = Dates.isleapyear(yr) ? 366.0 : 365.0
+    return Float64(yr) + (doy - 1.0) / days_in_yr
+end
+
+"""
+    _safe_mean(v) -> Float64
+
+Mean of `v` after stripping `Missing` and non-finite values.
+Returns `NaN` when no valid values remain.
+"""
+function _safe_mean(v)::Float64
+    vals = collect(skipmissing(v))
+    vals = filter(x -> (x isa Real) && isfinite(x), vals)
+    return isempty(vals) ? NaN : mean(vals)
+end
+
+# ── Telemetry aggregation ──────────────────────────────────────────────────────
+
+"""
+    aggregate_telemetry_time(tagging; time_interval=:monthly) -> DataFrame
+
+Aggregate high-frequency telemetry pings per individual into regular temporal
+bins, with `Missing`-safe numeric aggregation throughout.
+
+# Binning modes
+- `:monthly`  — first day of each (year, month).
+- `:weekly`   — Monday of each ISO calendar week.
+- `:biweekly` — 14-day epochs anchored at 1990-01-01.
+- `:daily`    — calendar date.
+- `:raw`      — no aggregation; returns a copy.
+
+# Data requirements
+`tagging` must contain at minimum: `:tagid`, `:lon`, `:lat`, `:timestamp`, `:tag`.
+Optional numeric columns (`:z`, `:cw`, `:chela`, `:wgt`) are aggregated with
+`_safe_mean`.  Group columns (`:sex`, `:mat`, `:datasource`) use `first`.
+`:is_dead` is propagated via `any(skipmissing)`.
+
+Individuals with < 2 distinct temporal observations after aggregation are
+dropped.  `:tag` is re-indexed (0, 1, 2, …) per individual.
+
+# Arguments
+- `tagging::DataFrame`: Input telemetry table.
+- `time_interval::Symbol`: Binning resolution (default `:monthly`).
+
+# Returns
+- `DataFrame`: Aggregated table with `:time` (decimal year) column.
+"""
+function aggregate_telemetry_time(
+    tagging::DataFrame;
+    time_interval::Symbol = :monthly
+)::DataFrame
+
+    time_interval == :raw && return copy(tagging)
+
+    df = copy(tagging)
+    hasproperty(df, :timestamp) || error("DataFrame must contain :timestamp column.")
+
+    if time_interval == :daily
+        df[!, :time_bucket] = Date.(df.timestamp)
+    elseif time_interval == :weekly
+        df[!, :time_bucket] = [Date(t) - Day(dayofweek(Date(t)) - 1)
+                                for t in df.timestamp]
+    elseif time_interval == :biweekly
+        epoch = Date(1990, 1, 1)
+        df[!, :time_bucket] = [epoch + Day(fld(Int(Date(t) - epoch), 14) * 14)
+                                for t in df.timestamp]
+    elseif time_interval == :monthly
+        df[!, :time_bucket] = [Date(year(t), month(t), 1) for t in df.timestamp]
+    else
+        error("Unsupported time_interval: $(time_interval). " *
+              "Use :monthly, :weekly, :biweekly, :daily, or :raw.")
+    end
+
+    spec = Pair[
+        :lon       => _safe_mean => :lon,
+        :lat       => _safe_mean => :lat,
+        :tag       => minimum    => :tag,
+        :timestamp => minimum    => :timestamp,
+    ]
+    for col in (:z, :cw, :chela, :wgt)
+        hasproperty(df, col) && push!(spec, col => _safe_mean => col)
+    end
+    for col in (:sex, :mat, :datasource)
+        hasproperty(df, col) && push!(spec, col => first => col)
+    end
+    hasproperty(df, :is_dead) &&
+        push!(spec, :is_dead => (x -> any(skipmissing(x))) => :is_dead)
+
+    agg = DataFrames.combine(groupby(df, [:tagid, :time_bucket]), spec...)
+    agg[!, :time] = [_to_decimal_year(d) for d in agg.timestamp]
+    sort!(agg, [:tagid, :time])
+
+    valid = Set{String}()
+    for sub in groupby(agg, :tagid)
+        nrow(sub) >= 2 && push!(valid, string(first(sub.tagid)))
+    end
+    filter!(r -> string(r.tagid) in valid, agg)
+
+    parts = DataFrame[]
+    for sub in groupby(agg, :tagid)
+        sdf     = DataFrame(sub)
+        sdf.tag = collect(0:(nrow(sdf) - 1))
+        push!(parts, sdf)
+    end
+    return isempty(parts) ? DataFrame() : vcat(parts...)
+end
+
+# ── Planar hexagonal mesh ──────────────────────────────────────────────────────
+
+"""
+    build_hex_mesh_planar(lon_vec, lat_vec; radius_km=5.0, crs=nothing, datum=WGS84Latest)
+    -> NamedTuple
+
+Construct a regular hexagonal tessellation in planar km coordinates from
+observation lon/lat points, then back-project polygon vertices and centroids
+to geographic coordinates for reporting and visualisation.
+
+# Hex geometry (flat-top orientation)
+For circumradius r (km = side length for a regular hexagon):
+- Column spacing: dx = √3 r
+- Row spacing:    dy = 1.5 r
+- Offset row grid: odd rows shift by dx/2.
+- Exact area:     A = (3√3/2) r²  km²
+
+# Adjacency
+W_ij = 1 when planar centroid distance < √3 r × 1.05 (5 % snap tolerance).
+Symmetrised: W = max(W, Wᵀ).
+
+# Arguments
+- `lon_vec, lat_vec`: Geographic coordinates in decimal degrees.
+- `radius_km`: Hexagon circumradius = side length in km (default 5.0).
+- `crs`: Target Coordinate Reference System (default nothing, uses local tangent plane).
+- `datum`: The geographic datum (default: `WGS84Latest`).
+
+# Returns
+`NamedTuple`:
+- `centroids_km, centroids_lonlat`: Centroid coordinates in km and degrees.
+- `polygons_km, polygons_lonlat`: Closed vertex rings per hex cell.
+- `n_units::Int`, `W::SparseMatrixCSC`, `radius_km::Float64`.
+- `areas_km2::Vector{Float64}`: Identical exact hex area per cell.
+- `center_lon, center_lat`: Projection origin in degrees.
+"""
+function build_hex_mesh_planar(
+    lon_vec::AbstractVector{<:Real},
+    lat_vec::AbstractVector{<:Real};
+    radius_km::Real = 5.0,
+    crs = nothing,
+    datum = WGS84Latest
+)::NamedTuple
+
+    center_lon = mean(lon_vec)
+    center_lat = mean(lat_vec)
+
+    # Calculate planar coordinates directly
+    pts_km = [lonlat_to_xy_km(Float64(lon), Float64(lat);
+                  center_lon=center_lon, center_lat=center_lat, 
+                  crs=crs, datum=datum)
+              for (lon, lat) in zip(lon_vec, lat_vec)]
+
+    r  = Float64(radius_km)
+    dx = sqrt(3.0) * r
+    dy = 1.5 * r
+
+    centre_set = Set{Tuple{Float64, Float64}}()
+    for (xk, yk) in pts_km
+        row  = round(Int, yk / dy)
+        xoff = isodd(row) ? (dx / 2.0) : 0.0
+        col  = round(Int, (xk - xoff) / dx)
+        push!(centre_set, (col * dx + xoff, row * dy))
+    end
+
+    centroids_km = sort!(collect(centre_set), by = c -> (c[2], c[1]))
+    S            = length(centroids_km)
+
+    polygons_km      = Vector{Vector{Tuple{Float64, Float64}}}(undef, S)
+    polygons_lonlat  = Vector{Vector{Tuple{Float64, Float64}}}(undef, S)
+    centroids_lonlat = Vector{Tuple{Float64, Float64}}(undef, S)
+
+    # Flat-top hexagon: vertices at 30°, 90°, 150°, 210°, 270°, 330°
+    hex_angles = (30.0 .+ 60.0 .* (0:5)) .* (π / 180.0)
+
+    for (i, (cx, cy)) in enumerate(centroids_km)
+        verts_km = [(cx + r * cos(a), cy + r * sin(a)) for a in hex_angles]
+        push!(verts_km, verts_km[1]) # Close the polygon
+        
+        polygons_km[i]      = verts_km
+        polygons_lonlat[i]  = [xy_km_to_lonlat(v[1], v[2];
+                                    center_lon=center_lon, center_lat=center_lat,
+                                    crs=crs, datum=datum)
+                                for v in verts_km]
+        
+        centroids_lonlat[i] = xy_km_to_lonlat(cx, cy;
+                                    center_lon=center_lon, center_lat=center_lat,
+                                    crs=crs, datum=datum)
+    end
+
+    # Efficient matrix allocation for KDTree
+    c_mat = Matrix{Float64}(undef, 2, S)
+    for i in 1:S
+        c_mat[1, i] = centroids_km[i][1]
+        c_mat[2, i] = centroids_km[i][2]
+    end
+    
+    tree       = KDTree(c_mat)
+    adj_thresh = sqrt(3.0) * r * 1.05
+
+    rows_idx = Int[]
+    cols_idx = Int[]
+    for i in 1:S
+        nbrs = inrange(tree, [centroids_km[i][1], centroids_km[i][2]], adj_thresh)
+        for j in nbrs
+            if j != i
+                push!(rows_idx, i)
+                push!(cols_idx, j)
+            end
+        end
+    end
+    
+    W = sparse(rows_idx, cols_idx, ones(Float64, length(rows_idx)), S, S)
+    W = max.(W, W')
+
+    area_km2 = (3.0 * sqrt(3.0) / 2.0) * r^2
+
+    return (
+        centroids_km     = centroids_km,
+        centroids_lonlat = centroids_lonlat,
+        polygons_km      = polygons_km,
+        polygons_lonlat  = polygons_lonlat,
+        n_units          = S,
+        W                = W,
+        radius_km        = r,
+        areas_km2        = fill(area_km2, S),
+        center_lon       = center_lon,
+        center_lat       = center_lat
+    )
+end
+
+# ── Telemetry → unit mapping ───────────────────────────────────────────────────
+
+
+"""
+    map_telemetry_to_units(
+        tagging, centroids_km, center_lon, center_lat; crs=nothing, datum=WGS84Latest
+    ) -> DataFrame
+
+Assign each telemetry observation to the nearest hexagonal unit via a KDTree on
+planar km centroids. Adds `:s_idx` (1-based integer, 1 ≤ s ≤ S).
+
+# Arguments
+- `tagging`: Must contain `:lon`, `:lat` (geographic degrees).
+- `centroids_km`: Vector of (x, y) km tuples from `build_hex_mesh_planar`.
+- `center_lon, center_lat`: Projection origin matching the mesh.
+- `crs`: Target Coordinate Reference System (default nothing).
+- `datum`: The geographic datum (default: `WGS84Latest`).
+
+# Returns
+- Copy of `tagging` with `:s_idx::Int` appended.
+"""
+function map_telemetry_to_units(
+    tagging::DataFrame,
+    centroids_km::Vector{Tuple{Float64, Float64}},
+    center_lon::Real,
+    center_lat::Real;
+    crs = nothing,
+    datum = WGS84Latest
+)::DataFrame
+    
+    # 1. Pre-allocate and populate the centroids matrix efficiently
+    S = length(centroids_km)
+    c_mat = Matrix{Float64}(undef, 2, S)
+    for i in 1:S
+        c_mat[1, i] = centroids_km[i][1]
+        c_mat[2, i] = centroids_km[i][2]
+    end
+    
+    # 2. Build the KDTree for fast spatial lookups
+    tree = KDTree(c_mat)
+    
+    # 3. Pre-allocate and populate the telemetry points matrix
+    N = nrow(tagging)
+    pts_mat = Matrix{Float64}(undef, 2, N)
+    for (i, (lon, lat)) in enumerate(zip(tagging.lon, tagging.lat))
+        x, y = lonlat_to_xy_km(Float64(lon), Float64(lat);
+                               center_lon=center_lon, center_lat=center_lat, 
+                               crs=crs, datum=datum)
+        pts_mat[1, i] = x
+        pts_mat[2, i] = y
+    end
+    
+    # 4. Perform nearest neighbor search for all points simultaneously
+    idxs, _ = knn(tree, pts_mat, 1)
+    
+    # 5. Append results to a copy of the DataFrame
+    out = copy(tagging)
+    out[!, :s_idx] = first.(idxs)
+    
+    return out
+end
+
+
+# ── HSI loading and monthly discretization ─────────────────────────────────────
+
+"""
+    _interpolate_hsi(hsi_2d, years, s_idx, decimal_year; ref_doy=244.0)
+    -> Float64
+
+Linear interpolation of the annual posterior-mean HSI for spatial unit `s_idx`
+at continuous time `decimal_year`.
+
+The annual predictions are anchored at `ref_doy` (day of year; 244 ≈ Sept 1):
+
+    t_ref = (ref_doy − 1) / 365.25
+    u     = decimal_year − t_ref
+    y1    = clamp(⌊u⌋, y_min, y_max − 1)
+    α     = u − y1                          ∈ [0, 1)
+    HSI   = (1 − α) HSI(s, y1) + α HSI(s, y1+1)
+
+# Arguments
+- `hsi_2d`: Posterior-mean HSI matrix (S × T).
+- `years`: Annual year labels (e.g. 1999:2025).
+- `s_idx`: Spatial unit index (1-based).
+- `decimal_year`: Continuous time in decimal years.
+- `ref_doy`: Reference survey day of year (default 244.0).
+
+# Returns
+- `Float64`: Interpolated HSI clamped to [0, 1].
+"""
+function _interpolate_hsi(
+    hsi_2d::AbstractMatrix{Float64},
+    years::AbstractVector{<:Integer},
+    s_idx::Integer,
+    decimal_year::Real;
+    ref_doy::Real = 244.0
+)::Float64
+    y_min = first(years)
+    y_max = last(years)
+    t_off = (ref_doy - 1.0) / 365.25
+    u     = Float64(decimal_year) - t_off
+    u_cl  = clamp(u, Float64(y_min), Float64(y_max))
+    y1    = clamp(floor(Int, u_cl), y_min, y_max - 1)
+    α     = u_cl - Float64(y1)
+    t1    = clamp(y1 - y_min + 1, 1, length(years))
+    t2    = clamp(t1 + 1, 1, length(years))
+    return clamp((1.0 - α) * hsi_2d[s_idx, t1] + α * hsi_2d[s_idx, t2], 0.0, 1.0)
+end
+
+
+"""
+    build_monthly_hsi_matrix(hsi_mean, years; ref_doy=244.0)
+    -> (Matrix{Float64}, Dict{Tuple{Int,Int}, Int})
+
+Discretize the annual posterior-mean HSI onto a monthly grid (12 months per
+year) by evaluating `_interpolate_hsi` at the 15th of each month, leap-year
+aware, anchored to `ref_doy`.
+"""
+function build_monthly_hsi_matrix(
+    hsi_mean::AbstractMatrix{Float64},
+    years::AbstractVector{<:Integer};
+    ref_doy::Real = 244.0
+)::Tuple{Matrix{Float64}, Dict{Tuple{Int, Int}, Int}}
+
+    S      = size(hsi_mean, 1)
+    n_cols = length(years) * 12
+    
+    # Use undef since we overwrite every element (avoids zeroing overhead)
+    mat    = Matrix{Float64}(undef, S, n_cols)
+    
+    # Pre-size the dictionary to avoid reallocations
+    lookup = Dict{Tuple{Int, Int}, Int}()
+    sizehint!(lookup, n_cols)
+    
+    col = 1
+    for yr in years
+        days_in_yr = Dates.isleapyear(yr) ? 366.0 : 365.0
+        for m in 1:12
+            doy_mid = Float64(Dates.dayofyear(Date(yr, m, 15)))
+            dec_yr  = Float64(yr) + (doy_mid - 1.0) / days_in_yr
+            
+            # @inbounds safely removes bounds checking for peak speed
+            @inbounds for s in 1:S
+                mat[s, col] = _interpolate_hsi(
+                    hsi_mean, years, s, dec_yr; ref_doy=ref_doy)
+            end
+            
+            lookup[(yr, m)] = col
+            col += 1
+        end
+    end
+    
+    return mat, lookup
+end
+
+
+"""
+    load_hsi_jld2(path; hsi_key="hsi", years_key="years",
+                  auids_key="auids", ref_doy=244.0) -> NamedTuple
+
+Load a JLD2 bundle containing a 3D posterior HSI array and compute derived
+summaries needed for movement modelling.
+
+# Expected JLD2 keys
+- `hsi`:   Array{Float64, 3} (S × T × N_draws).
+- `years`: Vector{Int} of length T.
+- `auids`: (optional) spatial unit identifiers.
+
+# Arguments
+- `path`: Path to the JLD2 file.
+- `hsi_key`, `years_key`, `auids_key`: JLD2 key names.
+- `ref_doy`: Reference day of year (default 244.0 = Sept 1).
+
+# Returns
+`NamedTuple`:
+- `hsi`, `years`, `auids`.
+- `hsi_mean` (S × T): posterior mean.
+- `hsi_sd` (S × T): posterior standard deviation.
+- `hsi_spatial_mean` (length S): multi-year mean per spatial unit.
+- `monthly_hsi` (S × 12T): monthly discretization.
+- `month_lookup`: Dict{(year, month) => column_index}.
+"""
+function load_hsi_jld2(
+    path::AbstractString;
+    hsi_key::AbstractString   = "hsi",
+    years_key::AbstractString = "years",
+    auids_key::AbstractString = "auids",
+    ref_doy::Real             = 244.0
+)::NamedTuple
+    isfile(path) || error("HSI JLD2 not found: $(path)")
+    bundle = JLD2.load(path)
+    hsi    = bundle[hsi_key]
+    years  = bundle[years_key]
+    auids  = haskey(bundle, auids_key) ? bundle[auids_key] : collect(1:size(hsi, 1))
+
+    hsi_mean          = dropdims(mean(hsi, dims=3), dims=3)
+    hsi_sd            = dropdims(std(hsi, dims=3),  dims=3)
+    hsi_spatial_mean  = vec(mean(hsi_mean, dims=2))
+
+    monthly_hsi, month_lookup = build_monthly_hsi_matrix(
+        Float64.(hsi_mean), years; ref_doy=ref_doy)
+
+    return (
+        hsi              = hsi,
+        years            = years,
+        auids            = auids,
+        hsi_mean         = hsi_mean,
+        hsi_sd           = hsi_sd,
+        hsi_spatial_mean = hsi_spatial_mean,
+        monthly_hsi      = monthly_hsi,
+        month_lookup     = month_lookup
+    )
+end
+"""
+    match_telemetry_closest_month_hsi(
+        telemetry_df, monthly_hsi, month_lookup, years
+    ) -> Vector{Float64}
+
+Assign each telemetry observation its HSI value from the nearest (year, month).
+
+# Fallback strategy (applied in order)
+1. Clamp year to [y_min, y_max]; look up `(yr_clamped, month)`.
+2. Same month in `y_min` (lower boundary).
+3. Same month in `y_max` (upper boundary).
+4. Assign `NaN` and emit a single summary `@warn` when entries are missing.
+
+# Arguments
+- `telemetry_df`: DataFrame with `:timestamp` and `:s_idx`.
+- `monthly_hsi`: Matrix (S × 12T).
+- `month_lookup`: Dict{(year, month) => column_index}.
+- `years`: Valid year range.
+
+# Returns
+- `Vector{Float64}` of length `nrow(telemetry_df)`.
+"""
+function match_telemetry_closest_month_hsi(
+    telemetry_df::DataFrame,
+    monthly_hsi::AbstractMatrix{<:Real},
+    month_lookup::Dict{Tuple{Int, Int}, Int},
+    years::AbstractVector{<:Integer}
+)::Vector{Float64}
+
+    y_min, y_max = extrema(years)
+    n_rows = nrow(telemetry_df)
+    
+    # Use undef instead of zeros to prevent unnecessary memory writing
+    out = Vector{Float64}(undef, n_rows)
+
+    # 1. Extract columns to local variables for type-stable, zero-overhead indexing
+    timestamps = telemetry_df.timestamp
+    s_idxs     = telemetry_df.s_idx
+
+    missing_count = 0
+
+    @inbounds for i in 1:n_rows
+        dt = timestamps[i]
+        s  = s_idxs[i]
+        
+        yr = clamp(Dates.year(dt), y_min, y_max)
+        mo = Dates.month(dt)
+
+        # 2. Use 0 as a default instead of `nothing` to keep types strict and fast
+        col = get(month_lookup, (yr, mo), 0)
+        
+        if col == 0
+            col = get(month_lookup, (y_min, mo), get(month_lookup, (y_max, mo), 0))
+            if col == 0
+                out[i] = NaN
+                missing_count += 1
+                continue
+            end
+        end
+        
+        out[i] = monthly_hsi[s, col]
+    end
+    
+    # 3. Emit a single summary warning rather than spamming the console
+    if missing_count > 0
+        @warn "No month_lookup entry found for $missing_count telemetry observations. Assigned NaN."
+    end
+
+    return out
+end
+"""
+    reshard_hsi_field(
+        src_vals, src_coords_km, dest_centroids_km; k=6
+    ) -> Vector{Float64}
+
+Reshard a scalar field from source centroids to destination centroids using
+planar inverse-distance-squared weighting (IDW) among the `k` nearest source
+points.
+
+All coordinates must be in the same planar km system.
+
+Weight: w_j = 1/d_j² (d_j < 1e-9 → w = 1e18, i.e. coincident → snap).
+
+# Arguments
+- `src_vals`: Values at source centroids (length S_src).
+- `src_coords_km`: Planar km coordinates of source centroids.
+- `dest_centroids_km`: Planar km coordinates of destination centroids.
+- `k`: Nearest neighbours to use (default 6; capped at S_src).
+
+# Returns
+- `Vector{Float64}` of length S_dest.
+"""
+function reshard_hsi_field(
+    src_vals::AbstractVector{<:Real},
+    src_coords_km::Vector{Tuple{Float64, Float64}},
+    dest_centroids_km::Vector{Tuple{Float64, Float64}};
+    k::Integer = 6
+)::Vector{Float64}
+
+    N_src = length(src_coords_km)
+    N_dest = length(dest_centroids_km)
+    k_eff = min(Int(k), length(src_vals))
+
+    # 1. Preallocate and fill matrices efficiently (no splatting)
+    src_mat = Matrix{Float64}(undef, 2, N_src)
+    for i in 1:N_src
+        src_mat[1, i] = src_coords_km[i][1]
+        src_mat[2, i] = src_coords_km[i][2]
+    end
+
+    dest_mat = Matrix{Float64}(undef, 2, N_dest)
+    for i in 1:N_dest
+        dest_mat[1, i] = dest_centroids_km[i][1]
+        dest_mat[2, i] = dest_centroids_km[i][2]
+    end
+
+    # 2. Build tree and find neighbors
+    tree = KDTree(src_mat)
+    idxs, dists = knn(tree, dest_mat, k_eff)
+
+    # 3. Allocation-free inner loop for IDW
+    out = Vector{Float64}(undef, N_dest)
+    
+    @inbounds for j in 1:N_dest
+        w_sum = 0.0
+        val_sum = 0.0
+        
+        # Loop over the k neighbors for the j-th destination point
+        for i in 1:k_eff
+            idx = idxs[j][i]
+            d   = dists[j][i]
+            
+            # d * d is slightly faster than d^2
+            w = d < 1e-9 ? 1e18 : 1.0 / (d * d)
+            
+            val_sum += w * src_vals[idx]
+            w_sum   += w
+        end
+        
+        # Protect against division by zero (though mathematically impossible with strictly positive w)
+        out[j] = w_sum > 0.0 ? (val_sum / w_sum) : 0.0 
+    end
+    
+    return out
+end
+

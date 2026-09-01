@@ -2116,6 +2116,42 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
         end
     end
 
+    # --- 9. Stratified Categorical Movement Parameter Plots ---
+    if !isnothing(effects) && hasproperty(effects, :categorical_movement) && !isnothing(effects.categorical_movement)
+        cat_mov_summary = effects.categorical_movement
+        cat_plots = Dict{Symbol, Any}()
+        cat_plots_data = Dict{Symbol, Any}()
+        
+        group_lookup = haskey(M, :group_lookup) ? M.group_lookup : (haskey(res, :group_lookup) ? res.group_lookup : nothing)
+        group_names = !isnothing(group_lookup) ? sort(collect(keys(group_lookup)), by=x->group_lookup[x]) : nothing
+
+        for param_sym in [:beta, :D_g, :gamma]
+            if hasproperty(cat_mov_summary, param_sym)
+                group_summaries = getproperty(cat_mov_summary, param_sym)
+                if group_summaries isa AbstractVector && !isempty(group_summaries)
+                    n_groups = length(group_summaries)
+                    g_labels = !isnothing(group_names) && length(group_names) == n_groups ? group_names : ["Group $i" for i in 1:n_groups]
+                    
+                    means = [Float64(s.mean) for s in group_summaries]
+                    lowers = [Float64(s.lower) for s in group_summaries]
+                    uppers = [Float64(s.upper) for s in group_summaries]
+                    
+                    p_forest = Plots.scatter(means, 1:n_groups, xerror=(means .- lowers, uppers .- means),
+                        yticks=(1:n_groups, g_labels), title="Categorical Movement Param: $(param_sym)",
+                        xlabel="Estimate (95% CI)", markersize=5, color=:darkcyan, legend=false, yflip=true)
+                    Plots.vline!(p_forest, [0.0], color=:crimson, ls=:dash, lw=1.5)
+                    
+                    cat_plots[param_sym] = p_forest
+                    cat_plots_data[param_sym] = (groups=g_labels, mean=means, lower=lowers, upper=uppers)
+                end
+            end
+        end
+        if !isempty(cat_plots)
+            plots[:categorical_movement] = cat_plots
+            plots_data[:categorical_movement] = cat_plots_data
+        end
+    end
+
     return (plots=NamedTuple(plots), plots_data=NamedTuple(plots_data))
 end
 

@@ -200,11 +200,12 @@ function _apply_multivariate_correlation(eta_latent, chain, outcomes_N)
     return eta_final
 end
 
+
 """
     _summarize_effects_registry(registry, M, outcomes_N, alpha)
 
 Computes posterior summary statistics (mean, median, std, lower/upper credible bounds) for
-  all structured and unstructured component effects.
+all structured and unstructured component effects, including categorical movement parameters.
 """
 function _summarize_effects_registry(registry, M, outcomes_N, alpha)
     summarized_registry = Dict{Symbol, Any}()
@@ -285,6 +286,24 @@ function _summarize_effects_registry(registry, M, outcomes_N, alpha)
         summarized_registry[:intercept] = outcomes_N > 1 ? [summarize_array(int_mat[:, k],
             alpha=alpha) for k in 1:outcomes_N] : summarize_array(int_mat[:, 1], alpha=alpha)
     end
+
+    # 5. Summarize Stratified Categorical Movement Parameters (beta, D_g, gamma)
+    if haskey(registry, :categorical_movement) && !isempty(registry.categorical_movement)
+        cat_mov = registry.categorical_movement
+        cat_summary = Dict{Symbol, Any}()
+        
+        for param_key in keys(cat_mov)
+            param_vals = getproperty(cat_mov, param_key) # Expected matrix [samples × groups]
+            if param_vals isa AbstractMatrix
+                n_groups = size(param_vals, 2)
+                group_summaries = [summarize_array(param_vals[:, g], alpha=alpha) for g in 1:n_groups]
+                cat_summary[param_key] = group_summaries
+            else
+                cat_summary[param_key] = summarize_array(param_vals, alpha=alpha)
+            end
+        end
+        summarized_registry[:categorical_movement] = NamedTuple(cat_summary)
+    end
     
     return NamedTuple(summarized_registry)
 end
@@ -332,6 +351,36 @@ function summarize_predictions(samples::AbstractArray; alpha=0.05)
     )
 end
 
+
+function _discover_categorical_movement_realizations(chain, M, PS, n_samples, G)
+    p_names = _get_clean_chain_param_names(chain)
+    
+    beta_samples = zeros(Float64, n_samples, G)
+    D_samples    = zeros(Float64, n_samples, G)
+    gamma_samples = zeros(Float64, n_samples, G)
+    
+    for g in 1:G
+        # Extract beta[g]
+        b_name = _find_parameter(p_names, "beta[$g]", g, false)
+        if !isempty(b_name)
+            beta_samples[:, g] = get_params_vector(chain, b_name, 1)[:, 1]
+        end
+        
+        # Extract D_g[g]
+        d_name = _find_parameter(p_names, "D_g[$g]", g, false)
+        if !isempty(d_name)
+            D_samples[:, g] = get_params_vector(chain, d_name, 1)[:, 1]
+        end
+        
+        # Extract gamma[g]
+        g_name = _find_parameter(p_names, "gamma[$g]", g, false)
+        if !isempty(g_name)
+            gamma_samples[:, g] = get_params_vector(chain, g_name, 1)[:, 1]
+        end
+    end
+    
+    return (beta = beta_samples, D_g = D_samples, gamma = gamma_samples)
+end
 
 
 function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedTuple, Nothing},
@@ -381,6 +430,13 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
     for spec in M.components
         effects_result = get_effects(spec.component_obj, chain, spec, M, PS)
         component_realizations[spec.key] = effects_result
+    end
+
+    # --- Stratified Categorical Movement Effects ---
+    categorical_movement_realizations = nothing
+    if haskey(M, :group_lookup) || haskey(M, :G) || any(s -> get(s.params, :method, nothing) == :categorical, M.components)
+        G_val = haskey(M, :group_lookup) ? length(M.group_lookup) : get(M, :G, 3)
+        categorical_movement_realizations = _discover_categorical_movement_realizations(chain, M, PS, n_samples, G_val)
     end
 
     # --- Spatiotemporal Interaction Effects ---
@@ -450,15 +506,20 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
         end
     end
 
-    return (
+    res_tuple = (
         intercept=intercept_samples,
         fixed_effects=fixed_effects_samples,
         components=component_realizations,
         st_interaction=st_interaction_effects_samples,
         householder_reflection=householder_effects_samples
     )
-end
 
+    if !isnothing(categorical_movement_realizations)
+        res_tuple = merge(res_tuple, (categorical_movement=categorical_movement_realizations,))
+    end
+
+    return res_tuple
+end
 
 
 function _reconstruct(
@@ -1415,13 +1476,39 @@ end
 
 
 
-# New helper function for generating conditional predictions
-function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symbol;
-                                           second_cov::Union{Symbol, Nothing}=nothing,
-                                           n_points::Int=50, alpha::Float64=0.05)
-    
-    # Create a base DataFrame for prediction by taking the first row of the original data
-    # and replicating it. Then, set other covariates to their mean/mode.
+"""
+    _generate_conditional_predictions(model_obj, chain, M, target_cov::Symbol; second_cov::Union{Symbol, Nothing}=nothing, n_points::Int=50, alpha::Float64=0.05)
+
+Generates conditional predictions for covariates, with specialized support for 
+step-length (`k`) conditioning in stratified categorical movement models.
+"""
+function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symbol; second_cov::Union{Symbol, Nothing}=nothing, n_points::Int=50, alpha::Float64=0.05)
+    is_categorical_movement = haskey(M, :method) && M.method == :categorical
+
+    if is_categorical_movement
+        # For categorical movement models, allow conditional prediction over step-length `k`
+        if target_cov == :k && hasproperty(M, :data) && hasproperty(M.data, :k)
+            base_df = DataFrame(M.data[1:1, :])
+            min_k, max_k = extrema(M.data.k)
+            k_range = collect(min_k:max(1, (max_k - min_k) ÷ n_points):max(1, max_k))
+            pred_df = vcat([deepcopy(base_df) for _ in k_range]...)
+            pred_df[!, :k] = k_range
+            
+            preds = predict(model_obj, chain, pred_df; n_samples=size(chain, 1), alpha=alpha)
+            
+            # Extract mean spatial probability vector summary across the k range
+            mean_probs = preds.predictions_denoised.mean
+            return (mean = mean_probs, lower = zeros(size(mean_probs)), upper = zeros(size(mean_probs))), k_range
+        else
+            return nothing
+        end
+    end
+
+    # --- Standard BSTM Conditional Predictions ---
+    if isnothing(M.data) || !hasproperty(M.data, target_cov)
+        return nothing
+    end
+
     base_df = DataFrame(M.data[1:1, :])
     for col in names(M.data)
         col_sym = Symbol(col)
@@ -1433,9 +1520,8 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
                 base_df[1, col_sym] = Statistics.mean(M.data[!, col_sym])
             elseif col_type <: Number
                 base_df[1, col_sym] = round(col_type, Statistics.mean(M.data[!, col_sym]))
-            else # Categorical / String
-                if hasmethod(levels, Tuple{typeof(M.data[!,
-                    col_sym])}) && !isempty(levels(M.data[!, col_sym]))
+            else
+                if hasmethod(levels, Tuple{typeof(M.data[!, col_sym])}) && !isempty(levels(M.data[!, col_sym]))
                     base_df[1, col_sym] = first(levels(M.data[!, col_sym]))
                 else
                     base_df[1, col_sym] = first(M.data[!, col_sym])
@@ -1444,8 +1530,7 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
         end
     end
 
-    if isnothing(second_cov) # 1D conditional plot
-        # Generate a range for the target covariate
+    if isnothing(second_cov)
         if eltype(M.data[!, target_cov]) <: Number
             min_val, max_val = extrema(M.data[!, target_cov])
             cov_range = if eltype(M.data[!, target_cov]) <: Integer
@@ -1457,32 +1542,26 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
             n_actual = length(cov_range)
             pred_df = vcat([deepcopy(base_df) for _ in 1:n_actual]...)
             pred_df[!, target_cov] = cov_range
-        else # Categorical
+        else
             unique_levels = unique(M.data[!, target_cov])
             n_levels = length(unique_levels)
             pred_df = vcat([deepcopy(base_df) for _ in 1:n_levels]...)
             pred_df[!, target_cov] = unique_levels
+            cov_range = unique_levels
         end
-        
-        # Generate predictions
-        preds = predict(model_obj, chain, pred_df; n_samples=size(chain, 1), alpha=alpha)
-        return (preds.predictions_denoised, pred_df[!, target_cov])
 
-    else # 2D conditional plot (interaction)
+        preds = predict(model_obj, chain, pred_df; n_samples=size(chain, 1), alpha=alpha)
+        return (preds.predictions_denoised, cov_range)
+    else
         if !(eltype(M.data[!, target_cov]) <: Number && eltype(M.data[!, second_cov]) <: Number)
             @warn "2D conditional plots are currently only supported for two continuous covariates."
             return nothing
         end
-
         min_val1, max_val1 = extrema(M.data[!, target_cov])
         min_val2, max_val2 = extrema(M.data[!, second_cov])
-        range1 = eltype(M.data[!, target_cov]) <: Integer ? collect(min_val1:max(1, round(Int,
-            (max_val1-min_val1)/max(1, n_points-1))):max_val1) : collect(range(min_val1,
-            stop=max_val1, length=n_points))
-        range2 = eltype(M.data[!, second_cov]) <: Integer ? collect(min_val2:max(1, round(Int,
-            (max_val2-min_val2)/max(1, n_points-1))):max_val2) : collect(range(min_val2,
-            stop=max_val2, length=n_points))
-
+        range1 = eltype(M.data[!, target_cov]) <: Integer ? collect(min_val1:max(1, round(Int, (max_val1-min_val1)/max(1, n_points-1))):max_val1) : collect(range(min_val1, stop=max_val1, length=n_points))
+        range2 = eltype(M.data[!, second_cov]) <: Integer ? collect(min_val2:max(1, round(Int, (max_val2-min_val2)/max(1, n_points-1))):max_val2) : collect(range(min_val2, stop=max_val2, length=n_points))
+        
         pred_df_rows = DataFrame()
         for val1 in range1
             for val2 in range2
@@ -1492,14 +1571,106 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
                 append!(pred_df_rows, row)
             end
         end
-        
         preds = predict(model_obj, chain, pred_df_rows; n_samples=size(chain, 1), alpha=alpha)
         return (preds.predictions_denoised, range1, range2)
     end
 end
 
 
+"""
+    _predict_categorical_movement(model_obj, chain, new_data, n_samps, alpha)
 
+Simulates out-of-sample recapture location distributions and sampled locations 
+from fitted group transition matrices using posterior draws of (β, D_g, γ).
+"""
+function _predict_categorical_movement(model_obj, chain, new_data::DataFrame, n_samps::Int, alpha::Float64)
+    M = model_obj.args.M
+    S = M.s_N
+    W = M.W
+    hsi = M.hsi
+    adj_rows = M.adj_rows
+    L_dense = M.L_dense
+    I_S = Matrix{Float64}(I, S, S)
+    
+    # Extract prediction inputs from new_data
+    releases = hasproperty(new_data, :release) ? Vector{Int}(new_data.release) : ones(Int, nrow(new_data))
+    ks = hasproperty(new_data, :k) ? Vector{Int}(new_data.k) : ones(Int, nrow(new_data))
+    
+    # Resolve group indices for new_data using training group_lookup
+    group_lookup = M.group_lookup
+    groups = if hasproperty(new_data, :group)
+        Vector{Int}(new_data.group)
+    elseif hasproperty(new_data, :sex) && hasproperty(new_data, :mat)
+        # Map using build_group_indices logic
+        [get(group_lookup, "$(r.sex)_$(r.mat)", 1) for r in eachrow(new_data)]
+    else
+        ones(Int, nrow(new_data))
+    end
+
+    G = length(group_lookup)
+    N_new = nrow(new_data)
+    
+    # Matrices to store posterior simulations [N_new x n_samps]
+    simulated_recaps = Matrix{Int}(undef, N_new, n_samps)
+    expected_probs = zeros(Float64, N_new, S, n_samps)
+
+    # Thinning or selecting indices for n_samps
+    total_chain_samples = _get_chain_n_samples(chain)
+    sample_indices = unique(round.(Int, range(1, total_chain_samples, length=n_samps)))
+    actual_samps = length(sample_indices)
+
+    for (s_idx, chain_i) in enumerate(sample_indices)
+        # Extract parameter draws for this sample across groups
+        beta_draws  = [mean(extract_param_matrix(chain, "beta[$g]")[chain_i, :]) for g in 1:G] # Fallback extraction
+        D_draws     = [mean(extract_param_matrix(chain, "D_g[$g]")[chain_i, :]) for g in 1:G]
+        gamma_draws = [mean(extract_param_matrix(chain, "gamma[$g]")[chain_i, :]) for g in 1:G]
+
+        # Precompute group transition matrices and max power cache for this draw
+        max_k = maximum(ks)
+        Gk_cache_draw = map(1:G) do g
+            A_g = _build_A_ad(adj_rows, hsi, gamma_draws[g], S)
+            M_mat = I_S .- beta_draws[g] .* A_g .- D_draws[g] .* L_dense
+            Graw = inv(M_mat)
+            Gamma_1 = _row_normalise(Graw, S)
+            
+            if max_k > 1
+                higher_powers = accumulate(2:max_k; init=Gamma_1) do prev_Gamma, _
+                    _row_normalise(prev_Gamma * Gamma_1, S)
+                end
+                vcat([Gamma_1], higher_powers)
+            else
+                [Gamma_1]
+            end
+        end
+
+        # Predict for each observation in new_data
+        for n in 1:N_new
+            rel = releases[n]
+            g = groups[n]
+            k_n = ks[n]
+            
+            p = Gk_cache_draw[g][k_n][rel, :]
+            ps = sum(p)
+            p_norm = ps > 1e-12 ? (p ./ ps) : fill(1.0 / S, S)
+            
+            expected_probs[n, :, s_idx] = p_norm
+            
+            # Simulate categorical recapture location
+            simulated_recaps[n, s_idx] = rand(Categorical(p_norm))
+        end
+    end
+
+    # Summarize expected probability distributions across posterior draws
+    mean_probs = dropdims(mean(expected_probs, dims=3), dims=3) # [N_new x S]
+    
+    return (
+        predictions_denoised = (mean = mean_probs,),
+        predictions_noisy = (mean = simulated_recaps,),
+        raw_predictions_denoised = expected_probs,
+        raw_predictions_noisy = simulated_recaps,
+        PS = new_data
+    )
+end
 
 
 """
@@ -1529,6 +1700,13 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
     M_train = model_obj.args.M
     n_samps = min(size(chain, 1), n_samples)
 
+    # Check if this is a categorical movement model
+    is_categorical_movement = haskey(M_train, :method) && M_train.method == :categorical
+
+    if is_categorical_movement
+        return _predict_categorical_movement(model_obj, chain, new_data, n_samps, alpha)
+    end
+ 
     # 1. Initialize the Prediction Set (PS) configuration
     PS_dict = Dict(pairs(M_train))
     PS_dict[:data] = new_data
@@ -1773,23 +1951,15 @@ v1.0.0
   - `response_var`: The name of the response variable.
   - `method`: The CV method used.
   - `n_folds`: The number of folds executed.
-"""
-function bstm_cv_orchestrator(
-    formula::String, 
-    data::DataFrame; 
-    method::Symbol = :kfold, 
-    cv_var::Symbol = :s_idx, 
-    n_folds::Int = 5, 
-    n_samples::Int = 500, 
-    sampler = NUTS(500, 0.65), 
-    alpha = 0.05, 
-    cv_space_vars::Vector{Symbol} = [:s_x, :s_y],
-    kwargs...
-)    
-    # Corrected call to include the data argument for formula parsing.
+""" 
+function bstm_cv_orchestrator(formula::String, data::DataFrame; method::Symbol = :kfold, cv_var::Symbol = :s_idx, n_folds::Int = 5, n_samples::Int = 500, sampler = NUTS(500, 0.65), alpha = 0.05, cv_space_vars::Vector{Symbol} = [:s_x, :s_y], kwargs... )
+    
+    # Check if this is a categorical movement model configuration
+    is_categorical_movement = haskey(kwargs, :method) && kwargs[:method] == :categorical
+    
     meta_discovery = decompose_bstm_formula(formula, data)
-    response_name = Symbol(meta_discovery.outcomes[1][:var])
-
+    response_name = !isnothing(meta_discovery) && !isempty(meta_discovery.outcomes) ? Symbol(meta_discovery.outcomes[1][:var]) : (hasproperty(data, :recapture) ? :recapture : :y)
+    
     folds_indices = Vector{Vector{Int}}()
     is_forward_chain = false
 
@@ -1805,27 +1975,27 @@ function bstm_cv_orchestrator(
         if !all(hasproperty(data, v) for v in cv_space_vars)
             error("Spatial block cross-validation requires coordinate columns specified in `cv_space_vars`: $cv_space_vars.")
         end
-        coords = Matrix(data[!, cv_space_vars])' # kmeans expects features in rows
+        coords = Matrix(data[!, cv_space_vars])' 
         R = Clustering.kmeans(coords, n_folds; maxiter=200, display=:none)
         assignments = R.assignments
         for k in 1:n_folds
             fold_k_indices = findall(x -> x == k, assignments)
             if !isempty(fold_k_indices)
                 push!(folds_indices, fold_k_indices)
-            end 
+            end
         end
     elseif method == :temporal_block
         if !hasproperty(data, cv_var)
             error("Temporal block cross-validation requires the specified `cv_var` column ':$cv_var' in the data.")
         end
         unique_times = sort(unique(data[!, cv_var]))
-        fold_size = cld(length(unique_times), n_folds) # ceiling division
+        fold_size = cld(length(unique_times), n_folds)
         for i in 1:n_folds
             start_idx = (i - 1) * fold_size + 1
             end_idx = min(i * fold_size, length(unique_times))
             if start_idx > length(unique_times)
                 continue
-            end 
+            end
             time_block = unique_times[start_idx:end_idx]
             push!(folds_indices, findall(t -> t in time_block, data[!, cv_var]))
         end
@@ -1835,9 +2005,6 @@ function bstm_cv_orchestrator(
         end
         is_forward_chain = true
         unique_times = sort(unique(data[!, cv_var]))
-        if length(unique_times) <= n_folds
-            @warn "Number of unique time points ($(length(unique_times))) is less than or equal to `n_folds` ($n_folds). Consider reducing `n_folds` for forward-chaining."
-        end
         test_times = unique_times[end-n_folds+1:end]
         for t in test_times
             push!(folds_indices, findall(x -> x == t, data[!, cv_var]))
@@ -1851,7 +2018,7 @@ function bstm_cv_orchestrator(
             idx_end = min(i * fold_size, n_obs)
             if idx_start > n_obs
                 continue
-            end 
+            end
             push!(folds_indices, row_indices[idx_start:idx_end])
         end
     end
@@ -1861,7 +2028,6 @@ function bstm_cv_orchestrator(
 
     for (f_idx, test_idx) in enumerate(folds_indices)
         test_data = data[test_idx, :]
-        
         train_data = if is_forward_chain
             min_test_time = minimum(test_data[!, cv_var])
             train_idx = findall(t -> t < min_test_time, data[!, cv_var])
@@ -1875,46 +2041,70 @@ function bstm_cv_orchestrator(
         if nrow(train_data) == 0
             @warn "Fold $f_idx created an empty training set. Skipping."
             continue
-        end 
+        end
 
-        # Updated model instantiation to use bstm_core, consistent with refactor.
-        # Pass kwargs through, but force verbose=false to avoid excessive output.
         cv_kwargs = Dict{Symbol, Any}(pairs(kwargs))
         cv_kwargs[:verbose] = false
         
-        model_train = bstm_core(formula, train_data; cv_kwargs...)
-        
-        chain_train = sample(model_train, sampler, n_samples; progress=false)
-        res_pred = predict(model_train, chain_train, test_data;
-            n_samples=div(n_samples, 2), alpha=alpha)
-
-        y_test_obs = test_data[!, response_name]
-        y_test_pred = res_pred.predictions_denoised.mean
-
-        if length(y_test_obs) == length(y_test_pred)
-            residuals = y_test_obs .- y_test_pred
-            rmse = sqrt(Statistics.mean(residuals.^2))
-            ss_res = sum(residuals.^2)
-            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
-            r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
-            push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
+        # Fit model
+        model_train = if is_categorical_movement
+            # Call fit_categorical_movement directly or via bstm core wrapper
+            # Assuming training arguments match package conventions
+            S = get(kwargs, :S, maximum(train_data.recapture))
+            W = kwargs[:W]
+            hsi = kwargs[:hsi]
+            group_lookup = kwargs[:group_lookup]
+            fit_categorical_movement(train_data, S, W, hsi, group_lookup; n_samples=n_samples, n_warmup=div(n_samples, 2), show_progress=false)
         else
-            @warn "Fold $f_idx: Prediction length mismatch. Observed: $(length(y_test_obs)), Predicted: $(length(y_test_pred))"
+            bstm_core(formula, train_data; cv_kwargs...)
+        end
+
+        chain_train = is_categorical_movement ? model_train.chain : sample(model_train, sampler, n_samples; progress=false)
+        fit_obj = is_categorical_movement ? model_train : model_train
+
+        res_pred = predict(fit_obj, chain_train, test_data; n_samples=div(n_samples, 2), alpha=alpha)
+
+        if is_categorical_movement
+            # Evaluate categorical log-likelihood / accuracy on test set recapture locations
+            y_test_obs = Vector{Int}(test_data.recapture)
+            mean_probs = res_pred.predictions_denoised.mean # [N_test x S]
+            
+            log_liks = [log(max(mean_probs[n, y_test_obs[n]], 1e-12)) for n in 1:length(y_test_obs)]
+            elpd_fold = sum(log_liks)
+            
+            pred_locs = [argmax(mean_probs[n, :]) for n in 1:size(mean_probs, 1)]
+            accuracy = mean(pred_locs .== y_test_obs)
+            
+            push!(fold_results, (fold=f_idx, elpd=elpd_fold, accuracy=accuracy))
+        else
+            y_test_obs = test_data[!, response_name]
+            y_test_pred = res_pred.predictions_denoised.mean
+            
+            if length(y_test_obs) == length(y_test_pred)
+                residuals = y_test_obs .- y_test_pred
+                rmse = sqrt(Statistics.mean(residuals.^2))
+                ss_res = sum(residuals.^2)
+                ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
+                r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
+                push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
+            else
+                @warn "Fold $f_idx: Prediction length mismatch. Observed: $(length(y_test_obs)), Predicted: $(length(y_test_pred))"
+            end
         end
     end
 
-    mean_rmse = Statistics.mean([r.rmse for r in fold_results])
-    mean_r2 = Statistics.mean([r.r2 for r in fold_results])
-
-    return (
-        folds = fold_results,
-        mean_rmse = mean_rmse,
-        mean_r2 = mean_r2,
-        response_var = response_name,
-        method = method,
-        n_folds = n_actual_folds
-    )
+    if is_categorical_movement
+        mean_elpd = Statistics.mean([r.elpd for r in fold_results])
+        mean_acc = Statistics.mean([r.accuracy for r in fold_results])
+        return (folds = fold_results, mean_elpd = mean_elpd, mean_accuracy = mean_acc, method = method, n_folds = n_actual_folds)
+    else
+        mean_rmse = Statistics.mean([r.rmse for r in fold_results])
+        mean_r2 = Statistics.mean([r.r2 for r in fold_results])
+        return (folds = fold_results, mean_rmse = mean_rmse, mean_r2 = mean_r2, response_var = response_name, method = method, n_folds = n_actual_folds)
+    end
 end
+
+
 """
     bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
 
@@ -1936,37 +2126,86 @@ v1.0.0
   - `metrics`: A `NamedTuple` with the key estimates (`elpd`, `p_loo`, `looic`).
   - `log_likelihood`: The original `[n_obs, n_samples]` log-likelihood matrix.
   - `pareto_k`: A vector of the Pareto-k diagnostic values for each observation.
-"""
-function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)    
-    # --- 1. Metadata and Architecture Extraction ---
+""" 
+function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
     M = model_obj.args.M
-    raw_arch = get(M, :model_arch, "univariate")
+    is_categorical_movement = haskey(M, :method) && M.method == :categorical
 
-    # --- 2. Technical Dispatch Resolution ---
-    arch_type = if raw_arch == "univariate"
-        UnivariateArchitecture()
-    elseif raw_arch == "multivariate"
-        MultivariateArchitecture()
-    elseif raw_arch == "multifidelity"
-        MultifidelityArchitecture()
+    if is_categorical_movement
+        # Compute pointwise log-likelihood matrix [N_train x n_samples] for categorical movement
+        releases = Vector{Int}(M.data.release)
+        recaps   = Vector{Int}(M.data.recapture)
+        ks       = Vector{Int}(M.data.k)
+        groups   = Vector{Int}(M.data.group)
+        S        = M.s_N
+        W        = M.W
+        hsi      = M.hsi
+        adj_rows = M.adj_rows
+        L_dense  = M.L_dense
+        I_S      = Matrix{Float64}(I, S, S)
+        G        = length(M.group_lookup)
+        
+        n_samples = _get_chain_n_samples(chain)
+        N_train   = length(releases)
+        log_lik   = zeros(Float64, N_train, n_samples)
+        
+        max_k = maximum(ks)
+        for s in 1:n_samples
+            # Extract parameter draws for sample s across groups
+            beta_draws  = [mean(extract_param_matrix(chain, "beta[$g]")[s, :]) for g in 1:G]
+            D_draws     = [mean(extract_param_matrix(chain, "D_g[$g]")[s, :]) for g in 1:G]
+            gamma_draws = [mean(extract_param_matrix(chain, "gamma[$g]")[s, :]) for g in 1:G]
+            
+            Gk_cache_draw = map(1:G) do g
+                A_g = _build_A_ad(adj_rows, hsi, gamma_draws[g], S)
+                M_mat = I_S .- beta_draws[g] .* A_g .- D_draws[g] .* L_dense
+                Graw = inv(M_mat)
+                Gamma_1 = _row_normalise(Graw, S)
+                if max_k > 1
+                    higher_powers = accumulate(2:max_k; init=Gamma_1) do prev_Gamma, _
+                        _row_normalise(prev_Gamma * Gamma_1, S)
+                    end
+                    vcat([Gamma_1], higher_powers)
+                else
+                    [Gamma_1]
+                end
+            end
+            
+            for n in 1:N_train
+                rel = releases[n]
+                rec = recaps[n]
+                g   = groups[n]
+                k_n = ks[n]
+                
+                p = Gk_cache_draw[g][k_n][rel, :]
+                ps = sum(p)
+                p_norm = ps > 1e-12 ? (p ./ ps) : fill(1.0 / S, S)
+                
+                log_lik[n, s] = log(max(p_norm[rec], 1e-12))
+            end
+        end
     else
-        UnivariateArchitecture() 
+        raw_arch = get(M, :model_arch, "univariate")
+        arch_type = if raw_arch == "univariate"
+            UnivariateArchitecture()
+        elseif raw_arch == "multivariate"
+            MultivariateArchitecture()
+        elseif raw_arch == "multifidelity"
+            MultifidelityArchitecture()
+        else
+            UnivariateArchitecture()
+        end
+
+        res = _reconstruct(arch_type, "loo_recovery", chain, M, nothing, alpha)
+        log_lik = res.log_likelihood
     end
 
-    # --- 3. Latent Component Reconstruction for Likelihood Registry ---
-    res = _reconstruct(arch_type, "loo_recovery", chain, M, nothing, alpha)
-
-    # --- 4. Matrix Extraction and Validation ---
-    log_lik = res.log_likelihood 
     if isempty(log_lik)
         @warn "Log-likelihood matrix is empty. Cannot compute LOO."
         return nothing
     end
-    
-    n_obs, n_samples = size(log_lik)
 
-    # --- 5. PSIS-LOO Calculation via PosteriorStats ---
-    # PosteriorStats.loo expects a matrix of size [n_samples, n_obs].
+    n_obs, n_samples = size(log_lik)
     loo_result = nothing
     try
         loo_result = loo(Matrix(log_lik'))
@@ -1976,17 +2215,13 @@ function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
     end
 
     println("\n--- BSTM Model Selection Report ---")
-    println("Expected Log Pointwise Predictive Density (ELPD): ",
-        round(loo_result.estimates[:elpd_loo, :estimate], digits=2))
-    println("Effective Number of Parameters (p_loo):          ",
-        round(loo_result.estimates[:p_loo, :estimate], digits=2))
-    println("LOO Information Criterion:                       ",
-        round(loo_result.estimates[:looic, :estimate], digits=2))
+    println("Expected Log Pointwise Predictive Density (ELPD): ", round(loo_result.estimates[:elpd_loo, :estimate], digits=2))
+    println("Effective Number of Parameters (p_loo):          ", round(loo_result.estimates[:p_loo, :estimate], digits=2))
+    println("LOO Information Criterion:                       ", round(loo_result.estimates[:looic, :estimate], digits=2))
 
-    # Check for influential observations (k > 0.7)
     pareto_k = loo_result.pointwise[:pareto_k]
     influential_count = count(x -> x > 0.7, pareto_k)
-    if influential_count > 0 
+    if influential_count > 0
         @warn "BSTM: " * string(influential_count) * " influential observations detected (Pareto k > 0.7)."
     end
 

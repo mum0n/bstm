@@ -25,6 +25,9 @@ module bstm
     @reexport using KernelAbstractions
     @reexport using Bijectors
     @reexport using CategoricalArrays
+
+    @reexport using Clustering
+    
     @reexport using ColorSchemes
     @reexport using Dates
     @reexport using DelaunayTriangulation
@@ -69,7 +72,12 @@ module bstm
     # but whose entire API is NOT intended to be part of bstm's public API.
     # Users should explicitly 'using' these if they need their full API.
     using Wavelets, WaveletsExt, NNlib, CoordRefSystems, Unitful
-        
+    # using Unitful: ustrip, @u_str
+    # using NearestNeighbors: KDTree, inrange, knn
+    # using SparseArrays: sparse, max.
+    # using Statistics: mean
+    # using LinearAlgebra: mul!, I
+
     srcdir = @__DIR__  # bstm/src
     rootdir = dirname(srcdir) # bstm
     docsdir = joinpath(rootdir, "docs") # bstm/docs
@@ -90,7 +98,8 @@ module bstm
     include( "pipeline.jl")
     include( "plotting.jl") 
     include( "reconstruction.jl")  
- 
+    include("par.jl")
+
     # component definitions
     components_dir = joinpath(srcdir, "components")
 
@@ -149,6 +158,7 @@ module bstm
     export summarize_tag_activity, sample_markov_bridge, reconstruct_mark_recapture_paths
     export validate_telemetry, map_telemetry_to_units, time_steps_between
     export extract_scalar_param, reconstruct_posterior_kernel, reshard_hsi_field
+    export fit_categorical_movement, prepare_movement_data
 
     # Input / Output & Persistence exports
     export save_bstm_model, load_bstm_model
@@ -165,6 +175,9 @@ module bstm
     export write_tier_table!, read_tier_table, has_tier_table
     export get_manifest_entry, update_manifest_entry!, is_tier_up_to_date
     export check_pipeline_status
+
+    export par_from_posterior, summarize_par_effects, export_par_to_table
+    export par_credible_interval_plot, par_forest_plot  
 
 
     # Module initialization function

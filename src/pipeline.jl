@@ -415,7 +415,7 @@ function bstm_pipeline(
         end
 
          
-        chn_tier = _sample_tier_model(m_tier, spec.sampler, spec.n_samples; progress=false)
+        chn_tier = _sample_tier_model(m_tier, spec.sampler, spec.n_samples)
         
         res_tier = model_results_comprehensive(m_tier, chn_tier; alpha=0.05)
  

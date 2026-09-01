@@ -18,7 +18,8 @@ const COMPONENT_CONSTRUCTORS = Dict{Symbol, Function}(
 )
 
 const MODEL_TO_STRUCTURE_MAP = Dict{Union{Symbol, DataType}, Symbol}(
-    :none => :none
+    :none => :none,
+    :cat_movement => :spatial
 )
 
 """
@@ -252,68 +253,6 @@ const UNINFORMATIVE_PRIORS = Dict(
 )
 
 
-abstract type AbstractBSTM_Family end
-
-struct PoissonFamily <: AbstractBSTM_Family end
-struct GaussianFamily <: AbstractBSTM_Family end
-struct LogNormalFamily <: AbstractBSTM_Family end
-struct NegativeBinomialFamily <: AbstractBSTM_Family end
-struct BinomialFamily <: AbstractBSTM_Family end
-struct GammaFamily <: AbstractBSTM_Family end
-struct ExponentialFamily <: AbstractBSTM_Family end
-struct BetaFamily <: AbstractBSTM_Family end
-struct InverseGaussianFamily <: AbstractBSTM_Family end
-struct StudentTFamily <: AbstractBSTM_Family end
-struct HalfNormalFamily <: AbstractBSTM_Family end
-struct HalfStudentTFamily <: AbstractBSTM_Family end
-struct LaplaceFamily <: AbstractBSTM_Family end
-struct ParetoFamily <: AbstractBSTM_Family end
-struct DirichletFamily <: AbstractBSTM_Family end
-struct InverseWishartFamily <: AbstractBSTM_Family end
-struct DirichletMultinomialFamily <: AbstractBSTM_Family end
-struct OrdinalFamily <: AbstractBSTM_Family end
-
-abstract type AbstractZIState end
-struct NonZeroInflated <: AbstractZIState end
-struct ZeroInflated <: AbstractZIState end
-
-
-abstract type AbstractCensoringState end
-struct Uncensored <: AbstractCensoringState end
-struct LeftCensored <: AbstractCensoringState end
-struct RightCensored <: AbstractCensoringState end
-struct IntervalCensored <: AbstractCensoringState end
-
-
-const BSTM_FAMILY_REGISTRY = Dict{String, AbstractBSTM_Family}(
-    "poisson" => PoissonFamily(),
-    "gaussian" => GaussianFamily(),
-    "lognormal" => LogNormalFamily(),
-    "bernoulli" => BinomialFamily(),
-    "binomial" => BinomialFamily(),
-    "negbin" => NegativeBinomialFamily(),
-    "gamma" => GammaFamily(),
-    "exponential" => ExponentialFamily(),
-    "beta" => BetaFamily(),
-    "inverse_gaussian" => InverseGaussianFamily(),
-    "student_t" => StudentTFamily(),
-    "half_normal" => HalfNormalFamily(),
-    "half_student_t" => HalfStudentTFamily(),
-    "laplace" => LaplaceFamily(),
-    "pareto" => ParetoFamily(),
-    "dirichlet" => DirichletFamily(),
-    "inverse_wishart" => InverseWishartFamily(),
-    "dirichlet_multinomial" => DirichletMultinomialFamily(),
-    "ordinal" => OrdinalFamily()
-)
-
-const STATSMODELS_CONTRASTS = Dict(
-    :dummy => StatsModels.DummyCoding(),
-    :effects => StatsModels.EffectsCoding(),
-    :helmert => StatsModels.HelmertCoding(),
-    :treatment => StatsModels.DummyCoding()
-)
-
 const AMBIGUOUS_MODELS = Set([
     :iid, # Can be spatial (with W), temporal (with time var), or smooth (generic var)
     :gp,  # Can be spatial (coords), temporal (time var), or smooth (generic var)
@@ -356,7 +295,12 @@ const COMPONENT_CONFIG_ARGS = Dict(
     :tar => Dict(), 
     :pointprocess => Dict(:model => :lgcp, :inner_model => :icar, :grid_areas => "unit"),
     :localadaptive => Dict(:n_clusters => 5),
-    :eigen => Dict(:n_factors => 1)
+    :eigen => Dict(:n_factors => 1),
+    :movement => Dict(
+        :method => :categorical, 
+        :groups => 1, 
+        :time_interval => :monthly
+    )
 )
 
 

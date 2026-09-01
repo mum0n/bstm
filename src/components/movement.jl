@@ -74,6 +74,7 @@ struct Movement <: ComponentModel
     velocity::UnivariateDistribution
     diffusion::UnivariateDistribution
     sigma::UnivariateDistribution   
+    gamma::UnivariateDistribution
     r::Union{UnivariateDistribution, Nothing}
     K::Union{UnivariateDistribution, Nothing}
     beta_het::Union{UnivariateDistribution, Nothing}
@@ -83,10 +84,11 @@ end
 COMPONENT_TYPE_REGISTRY[:movement] = Movement
 COMPONENT_CONSTRUCTORS[:movement] = (p, params) -> Movement(
     p.velocity, p.diffusion, p.sigma,
+    get(p, :gamma, Normal(1.0, 1.0)),
     get(p, :r, nothing),
     get(p, :K, nothing),
     get(p, :beta_het, nothing),
-    get(params, :method, :explicit)
+    get(p, :method, :explicit)
 )
 MODEL_TO_STRUCTURE_MAP[:movement] = :spacetime
 
@@ -164,8 +166,23 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
         else
             error("The `habitat` parameter must be a Symbol (column name) or a Vector of length s_N.")
         end
+    if haskey(params, :mark_recapture_data)
+        telemetry_input = params[:mark_recapture_data]
+        
+        # Process dataframe into groups, releases, recaps, ks
+        processed_tel = _process_telemetry_data(telemetry_input) # You will need to update this helper to return your required vectors
+        
+        precomputes[:mark_recapture_data] = processed_tel
+        
+        # Precompute structural matrices for the categorical method
+        W_sym = Array(max.(W, W'))
+        deg = vec(sum(W_sym, dims=2))
+        precomputes[:L_dense] = Matrix{Float64}(Diagonal(deg) - W_sym)
+        precomputes[:adj_rows] = [W.rowval[W.colptr[i]:W.colptr[i+1]-1] for i in 1:s_N]
+        precomputes[:max_k] = maximum(processed_tel.ks) # Assuming processed_tel holds ks
     end
 
+    
     L_template = build_structure_template(:besag, s_N; W=W).matrix
     
     rel_type = get(params, :relationship, get(params, :habitat_relationship, :exponential))
@@ -279,29 +296,38 @@ function get_priors(
     m::Movement, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
+    
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     priors = String[]
 
-    push!(priors, "$(p_names.velocity) ~ $(_distribution_to_string(m.velocity))")
-    push!(priors, "$(p_names.diffusion) ~ $(_distribution_to_string(m.diffusion))")
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    
-    if hasproperty(spec.hyper, :habitat_data)
-        push!(priors, "$(p_names.beta_habitat_diffusion) ~ Normal(0, 1.0)")
-    end
-    
-    if !isnothing(m.r)
-        push!(priors, "$(p_names.r) ~ $(_distribution_to_string(m.r))")
-    end
-    if !isnothing(m.K)
-        push!(priors, "$(p_names.K) ~ $(_distribution_to_string(m.K))")
-    end
+    if m.method == :categorical 
+        # Assuming G is passed via hyper or spec
+        G = spec.hyper.mark_recapture_data.G 
+        push!(priors, "$(p_names.velocity) ~ filldist(truncated(Normal(0.2, 0.2), 0.0, 0.95), $G)")
+        push!(priors, "$(p_names.diffusion) ~ filldist(truncated(Normal(0.1, 0.2), 0.0, Inf), $G)")
+        push!(priors, "$(p_names.gamma) ~ filldist(Normal(1.0, 1.0), $G)")
+    else
+        push!(priors, "$(p_names.velocity) ~ $(_distribution_to_string(m.velocity))")
+        push!(priors, "$(p_names.diffusion) ~ $(_distribution_to_string(m.diffusion))")
+        push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+        
+        if hasproperty(spec.hyper, :habitat_data)
+            push!(priors, "$(p_names.beta_habitat_diffusion) ~ Normal(0, 1.0)")
+        end
+        
+        if !isnothing(m.r)
+            push!(priors, "$(p_names.r) ~ $(_distribution_to_string(m.r))")
+        end
+        if !isnothing(m.K)
+            push!(priors, "$(p_names.K) ~ $(_distribution_to_string(m.K))")
+        end
 
-    if hasproperty(spec.hyper, :mark_recapture_data) && !isnothing(m.beta_het)
-        push!(priors, "$(p_names.beta_het) ~ $(_distribution_to_string(m.beta_het))")
+        if hasproperty(spec.hyper, :mark_recapture_data) && !isnothing(m.beta_het)
+            push!(priors, "$(p_names.beta_het) ~ $(_distribution_to_string(m.beta_het))")
+        end
+        
+        push!(priors, "$(p_names.ure) ~ MvNormal(zeros($(spec.hyper.n_latent)), I)")
     end
-    
-    push!(priors, "$(p_names.ure) ~ MvNormal(zeros($(spec.hyper.n_latent)), I)")
 
     return join(priors, "\n    ")
 end
@@ -329,6 +355,7 @@ function get_updates(
     m::Movement, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
     M::NamedTuple
 )::String
+
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
@@ -379,40 +406,82 @@ function get_updates(
 
     telemetry_likelihood_code = ""
     if hasproperty(hyper, :mark_recapture_data)
-        telemetry_likelihood_code = """
-        # --- Mark-Recapture Telemetry Likelihood ---
-        M_prop_tlm = Matrix(I($(hyper.s_N))) .- ($(p_names.velocity) .* A_op) .- (Diagonal(diffusion_field) * L_op)
-        
-        # Pre-factorize the transposed propagator for repeated solves using generic dense LU.
-        F_prop_T = lu(transpose(M_prop_tlm))
-
-        for m_idx in 1:size(spec_registry[:$(key)].hyper.mark_recapture_data, 1)
-            u_rel = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 1])
-            u_rec = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 2])
-            time_steps = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 3])
-            cov_m = spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 4]
+        if m.method == :categorical
+            telemetry_likelihood_code = """
+            # --- Categorical Mark-Recapture Likelihood ---
+            I_S_dense = Matrix{eltype($(p_names.velocity))}(I, $(hyper.s_N), $(hyper.s_N))
             
-            local p_unnorm
-            if time_steps > 0
-                e_urel = zeros(T_num_dyn, $(hyper.s_N))
-                e_urel[u_rel] = 1.0
+            Gk_cache = map(1:$(hyper.mark_recapture_data.G)) do g
+                A_g  = _build_A_ad(spec_registry[:$(key)].hyper.adj_rows, spec_registry[:$(key)].hyper.habitat_data, $(p_names.gamma)[g], $(hyper.s_N))
+                M    = I_S_dense .- $(p_names.velocity)[g] .* A_g .- $(p_names.diffusion)[g] .* spec_registry[:$(key)].hyper.L_dense
+                Graw = inv(M)
+                Gamma_1 = _row_normalise(Graw, $(hyper.s_N))
                 
-                y = e_urel
-                for _ in 1:time_steps
-                    y = F_prop_T \\ y
+                if $(hyper.max_k) > 1
+                    higher_powers = accumulate(2:$(hyper.max_k); init=Gamma_1) do prev_Gamma, _
+                        _row_normalise(prev_Gamma * Gamma_1, $(hyper.s_N))
+                    end
+                    vcat([Gamma_1], higher_powers)
+                else
+                    [Gamma_1]
                 end
-                p_unnorm = y
-            else
-                p_unnorm = zeros(T_num_dyn, $(hyper.s_N))
-                p_unnorm[u_rel] = 1.0
             end
 
-            indiv_scaling = exp($(p_names.beta_het) * cov_m)
-            p_unnorm_scaled = abs.(p_unnorm) .^ indiv_scaling
-            p_norm = p_unnorm_scaled / (sum(p_unnorm_scaled) + 1e-15)
-            Turing.@addlogprob! log(max(p_norm[u_rec], 1e-12))
+            for n in 1:length(spec_registry[:$(key)].hyper.mark_recapture_data.releases)
+                rel = spec_registry[:$(key)].hyper.mark_recapture_data.releases[n]
+                rec = spec_registry[:$(key)].hyper.mark_recapture_data.recaps[n]
+                g   = spec_registry[:$(key)].hyper.mark_recapture_data.groups[n]
+                k_n = spec_registry[:$(key)].hyper.mark_recapture_data.ks[n]
+                
+                p = Gk_cache[g][k_n][rel, :]
+                ps = sum(p)
+                T_el = eltype(p)
+                p_norm = ps > eps(T_el) ? (p ./ ps) : fill(one(T_el) / $(hyper.s_N), $(hyper.s_N))
+                
+                Turing.@addlogprob! log(max(p_norm[rec], 1e-12))
+            end
+            """
+
+        elseif m.method == :explicit
+
+          
+            telemetry_likelihood_code = """
+            # --- Mark-Recapture Telemetry Likelihood ---
+            M_prop_tlm = Matrix(I($(hyper.s_N))) .- ($(p_names.velocity) .* A_op) .- (Diagonal(diffusion_field) * L_op)
+            
+            # Pre-factorize the transposed propagator for repeated solves using generic dense LU.
+            F_prop_T = lu(transpose(M_prop_tlm))
+
+            for m_idx in 1:size(spec_registry[:$(key)].hyper.mark_recapture_data, 1)
+                u_rel = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 1])
+                u_rec = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 2])
+                time_steps = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 3])
+                cov_m = spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 4]
+                
+                local p_unnorm
+                if time_steps > 0
+                    e_urel = zeros(T_num_dyn, $(hyper.s_N))
+                    e_urel[u_rel] = 1.0
+                    
+                    y = e_urel
+                    for _ in 1:time_steps
+                        y = F_prop_T \\ y
+                    end
+                    p_unnorm = y
+                else
+                    p_unnorm = zeros(T_num_dyn, $(hyper.s_N))
+                    p_unnorm[u_rel] = 1.0
+                end
+
+                indiv_scaling = exp($(p_names.beta_het) * cov_m)
+                p_unnorm_scaled = abs.(p_unnorm) .^ indiv_scaling
+                p_norm = p_unnorm_scaled / (sum(p_unnorm_scaled) + 1e-15)
+                Turing.@addlogprob! log(max(p_norm[u_rec], 1e-12))
+            end
+            """
+        elseif m.method == :implicit
+            # missing?
         end
-        """
     end
 
     application_code = """
@@ -434,6 +503,8 @@ function get_updates(
     """
 end
 
+
+
 """
     get_effects(m::Movement, chain, spec::NamedTuple, M::NamedTuple, PS)
 
@@ -443,7 +514,7 @@ This version is CPU-only and uses modern chain accessors.
 function get_effects(
     m::Movement, chain, spec::NamedTuple, M::NamedTuple,
     PS::Union{NamedTuple, Nothing}
-)::NamedTuple
+)
     # --- Setup: Extract dimensions ---
     n_samples = if occursin("FlexiChain", string(typeof(chain)))
         size(chain, 1) * FlexiChains.nchains(chain)

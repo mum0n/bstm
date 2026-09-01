@@ -7,6 +7,75 @@ for Bayesian Spatio-Temporal Models (BSTM).
 Version: v1.0.0
 """
 
+
+abstract type AbstractBSTM_Family end
+
+struct PoissonFamily <: AbstractBSTM_Family end
+struct GaussianFamily <: AbstractBSTM_Family end
+struct LogNormalFamily <: AbstractBSTM_Family end
+struct NegativeBinomialFamily <: AbstractBSTM_Family end
+struct BinomialFamily <: AbstractBSTM_Family end
+struct GammaFamily <: AbstractBSTM_Family end
+struct ExponentialFamily <: AbstractBSTM_Family end
+struct BetaFamily <: AbstractBSTM_Family end
+struct InverseGaussianFamily <: AbstractBSTM_Family end
+struct StudentTFamily <: AbstractBSTM_Family end
+struct HalfNormalFamily <: AbstractBSTM_Family end
+struct HalfStudentTFamily <: AbstractBSTM_Family end
+struct LaplaceFamily <: AbstractBSTM_Family end
+struct ParetoFamily <: AbstractBSTM_Family end
+struct DirichletFamily <: AbstractBSTM_Family end
+struct InverseWishartFamily <: AbstractBSTM_Family end
+struct DirichletMultinomialFamily <: AbstractBSTM_Family end
+struct OrdinalFamily <: AbstractBSTM_Family end
+struct CategoricalMovementFamily <: AbstractBSTM_Family end
+
+abstract type AbstractZIState end
+struct NonZeroInflated <: AbstractZIState end
+struct ZeroInflated <: AbstractZIState end
+
+
+abstract type AbstractCensoringState end
+struct Uncensored <: AbstractCensoringState end
+struct LeftCensored <: AbstractCensoringState end
+struct RightCensored <: AbstractCensoringState end
+struct IntervalCensored <: AbstractCensoringState end
+
+
+const BSTM_FAMILY_REGISTRY = Dict{String, AbstractBSTM_Family}(
+    "poisson" => PoissonFamily(),
+    "gaussian" => GaussianFamily(),
+    "lognormal" => LogNormalFamily(),
+    "bernoulli" => BinomialFamily(),
+    "binomial" => BinomialFamily(),
+    "negbin" => NegativeBinomialFamily(),
+    "gamma" => GammaFamily(),
+    "exponential" => ExponentialFamily(),
+    "beta" => BetaFamily(),
+    "inverse_gaussian" => InverseGaussianFamily(),
+    "student_t" => StudentTFamily(),
+    "half_normal" => HalfNormalFamily(),
+    "half_student_t" => HalfStudentTFamily(),
+    "laplace" => LaplaceFamily(),
+    "pareto" => ParetoFamily(),
+    "dirichlet" => DirichletFamily(),
+    "inverse_wishart" => InverseWishartFamily(),
+    "dirichlet_multinomial" => DirichletMultinomialFamily(),
+    "ordinal" => OrdinalFamily(),
+    "categorical_movement" => CategoricalMovementFamily(),
+    "categorical"          => CategoricalMovementFamily()
+)
+
+const STATSMODELS_CONTRASTS = Dict(
+    :dummy => StatsModels.DummyCoding(),
+    :effects => StatsModels.EffectsCoding(),
+    :helmert => StatsModels.HelmertCoding(),
+    :treatment => StatsModels.DummyCoding()
+)
+
+
+
+
 """
     bstm_Likelihood
 
@@ -562,3 +631,18 @@ function _stable_logsubexp(a::Real, b::Real)
     end
     return a + LogExpFunctions.log1mexp(b - a)
 end
+
+
+function get_dist_ref(::CategoricalMovementFamily, d, eta_vec, sig)
+    # eta_vec acts as the pre-normalized probability vector p over S spatial units
+    p_safe = max.(eta_vec, 1e-12)
+    p_norm = p_safe ./ sum(p_safe)
+    return Categorical(p_norm)
+end
+
+function bstm_kernel(fam::CategoricalMovementFamily, ::Uncensored, ::NonZeroInflated, d, eta_vec, sig, y_scalar)
+    dist = get_dist_ref(fam, d, eta_vec, sig)
+    # y_scalar represents the integer index of the recapture location (1 to S)
+    return logpdf(dist, Int(y_scalar))
+end
+

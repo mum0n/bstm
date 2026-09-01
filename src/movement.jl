@@ -1822,3 +1822,890 @@ function _nearest_unit_index(lon::Float64, lat::Float64, cents_deg::Vector{Tuple
 end
 
 
+
+"""
+    _build_A_ad(adj_rows, hsi, gamma_g, S)
+
+AD-compatible directed adjacency build. Optimized for ForwardDiff.
+"""
+function _build_A_ad(adj_rows, hsi, gamma_g, S)
+    # 1. Mathematical simplification & Vectorization:
+    # exp(γ(HSI_j - HSI_i)) / Σ exp(γ(HSI_k - HSI_i)) mathematically simplifies to
+    # exp(γ HSI_j) / Σ exp(γ HSI_k). The HSI_i term cancels out completely!
+    # We compute this once for all units, which AD engines handle highly efficiently.
+    exp_hsi = exp.(gamma_g .* hsi)
+    
+    # Extract the promoted AD type (e.g., ForwardDiff.Dual) directly from the math
+    T = eltype(exp_hsi)
+    A = zeros(T, S, S)
+    
+    @inbounds for i in 1:S
+        nbrs = adj_rows[i]
+        isempty(nbrs) && continue
+        
+        # 2. Allocation-free denominator accumulation
+        sw = zero(T)
+        for j in nbrs
+            sw += exp_hsi[j]
+        end
+        
+        sw <= 0 && continue
+        
+        # 3. Allocation-free assignment
+        for j in nbrs
+            A[i, j] = exp_hsi[j] / sw
+        end
+    end
+    
+    return A
+end
+
+
+function _row_normalise(M, S)
+    T = eltype(M)
+    M_rect = max.(zero(T), M)
+    s = sum(M_rect, dims=2)
+    
+    # Non-mutating division-by-zero protection
+    s_safe = s .+ (s .== zero(T))
+    
+    # Broadcast normalization and uniform distribution injection for zero-rows
+    return (M_rect ./ s_safe) .+ ((s .== zero(T)) ./ T(S))
+end
+
+# ── Directed adjacency and resolvent operator ──────────────────────────────────
+ 
+
+"""
+    compute_directed_adjacency(hsi, W; gamma=1.0) -> Matrix{Float64}
+
+Construct the directed adjacency matrix A from the symmetric adjacency W and
+habitat suitability values HSI. Row i has non-zero entries only at W-neighbours
+of i, weighted by exp(γ HSI_j) and row-normalised:
+
+    A[i,j] = exp(γ HSI_j) / Σ_k W_ik exp(γ HSI_k)
+
+γ > 0 biases movement towards higher HSI; γ = 0 gives the uniform random walk.
+
+# Arguments
+- `hsi::Vector{Float64}`: Habitat suitability per spatial unit (length S).
+- `W::SparseMatrixCSC`: Symmetric binary adjacency matrix (S × S).
+- `gamma::Real`: Advection sensitivity to HSI gradient (default 1.0).
+
+# Returns
+- Dense S × S matrix A with row-stochastic structure over W-neighbours.
+"""
+function compute_directed_adjacency(
+    hsi::AbstractVector{<:Real},
+    W::SparseMatrixCSC;
+    gamma::Real = 1.0
+)::Matrix{Float64}
+    
+    S = size(W, 1)
+    A = zeros(Float64, S, S)
+    
+    # 1. Mathematically simplify and precompute exponents.
+    # exp(γ(HSI_j - HSI_i)) / Σ exp(γ(HSI_k - HSI_i)) simplifies exactly to
+    # exp(γ HSI_j) / Σ exp(γ HSI_k). This saves thousands of exp() calls.
+    exp_hsi = exp.(gamma .* hsi)
+    
+    for i in 1:S
+        # 2. Because W is symmetric, neighbors of row `i` are neighbors of col `i`.
+        # Accessing CSC columns via internal pointers is allocation-free and O(1).
+        col_start = W.colptr[i]
+        col_end   = W.colptr[i+1] - 1
+        
+        # Skip if no neighbors
+        col_start > col_end && continue 
+        
+        # 3. Calculate denominator
+        sw = 0.0
+        @inbounds for ptr in col_start:col_end
+            j = W.rowval[ptr]
+            sw += exp_hsi[j]
+        end
+        
+        sw <= 0.0 && continue
+        
+        # 4. Populate dense transition matrix A
+        @inbounds for ptr in col_start:col_end
+            j = W.rowval[ptr]
+            A[i, j] = exp_hsi[j] / sw
+        end
+    end
+    
+    return A
+end
+
+ 
+"""
+    resolvent_transition(beta, D_diff, A, L, S) -> Matrix{Float64}
+
+Compute the resolvent transition operator:
+
+    Γ̄ = (I − β A − D L)^{-1}
+
+where L is the symmetric graph Laplacian. Rows of Γ̄ are rectified (negative
+entries set to zero) and row-normalised to form valid probability distributions.
+
+Note: the inverse exists when ‖β A + D L‖ < 1 in an appropriate operator norm.
+The NUTS priors (β < 0.95, D ≥ 0) are chosen to help ensure this, but
+near-boundary samples may produce poorly conditioned M; the try/catch below
+falls back to `M \\ I` in those cases.
+
+# Arguments
+- `beta`: Advective weight (scalar, 0 ≤ β < 1).
+- `D_diff`: Diffusion coefficient (scalar, ≥ 0).
+- `A::Matrix{Float64}`: Directed adjacency matrix (S × S, row-stochastic over nbrs).
+- `L::Matrix{Float64}`: Graph Laplacian (S × S, positive semidefinite).
+- `S::Int`: Number of spatial units.
+
+# Returns
+- Dense S × S matrix Γ̄ with row-stochastic rows.
+"""
+function resolvent_transition(
+    beta::Real,
+    D_diff::Real,
+    A::AbstractMatrix{<:Real},
+    L::AbstractMatrix{<:Real},
+    S::Int
+)::Matrix{Float64}
+
+    # Lock types upfront for type-stability
+    b = Float64(beta)
+    d = Float64(D_diff)
+
+    # 1. Construct M in a single allocation-free, column-major pass
+    M = Matrix{Float64}(undef, S, S)
+    @inbounds for j in 1:S
+        for i in 1:S
+            diag = (i == j) ? 1.0 : 0.0
+            M[i, j] = diag - b * A[i, j] - d * L[i, j]
+        end
+    end
+
+    # 2. Invert M
+    Gamma = try
+        inv(M)
+    catch e
+        @warn "resolvent_transition: inv failed, falling back to M\\I: $(e)"
+        M \ Matrix{Float64}(I, S, S)
+    end
+
+    # 3. Rectify and accumulate row sums (Column-Major for peak cache efficiency)
+    row_sums = zeros(Float64, S)
+    @inbounds for j in 1:S
+        for i in 1:S
+            v = max(0.0, Gamma[i, j])
+            Gamma[i, j] = v
+            row_sums[i] += v
+        end
+    end
+
+    # 4. Row-normalise using the accumulated sums (Column-Major)
+    @inbounds for j in 1:S
+        for i in 1:S
+            if row_sums[i] > 0.0
+                Gamma[i, j] /= row_sums[i]
+            end
+        end
+    end
+
+    return Gamma
+end
+
+
+
+"""
+    _powerm(M, k) -> Matrix
+
+Compute M^k using iterative binary (repeated squaring) exponentiation.
+Optimized to perform all multiplications in-place, reducing memory allocations 
+to \$O(1)\$ regardless of \$k\$.
+"""
+function _powerm(M::AbstractMatrix{T}, k::Integer) where {T <: Real}
+    n = size(M, 1)
+    
+    # Ensure type stability by matching the precision of M (e.g., Float64)
+    OutType = float(T) 
+    
+    k <= 0 && return Matrix{OutType}(I, n, n)
+    k == 1 && return Matrix{OutType}(M)
+
+    # Preallocate active matrices
+    R = Matrix{OutType}(I, n, n)
+    B = Matrix{OutType}(M)
+    
+    # Preallocate temporary buffers for in-place multiplication
+    R_tmp = similar(R)
+    B_tmp = similar(B)
+
+    # Iterative repeated squaring
+    while k > 0
+        if isodd(k)
+            # R = R * B (in-place)
+            mul!(R_tmp, R, B)
+            R, R_tmp = R_tmp, R  # Swap references (zero cost)
+        end
+        
+        k >>= 1 # Fast bitwise division by 2  ..  isodd(k) and k >>= 1 is faster than k % 2 != 0 and k ÷ 2.
+        
+        if k > 0
+            # B = B * B (in-place)
+            mul!(B_tmp, B, B)
+            B, B_tmp = B_tmp, B  # Swap references (zero cost)
+        end
+    end
+    
+    return R
+end
+
+"""
+    power_transition(Gamma, k) -> Matrix{Float64}
+
+Compute Γ̄^k and apply a final row rectification and normalisation to correct 
+any numerical drift.
+
+# Arguments
+- `Gamma::Matrix{Float64}`: Row-stochastic transition matrix.
+- `k::Integer`: Number of discrete steps (≥ 1).
+
+# Returns
+- S × S matrix Γ̄^k with row-stochastic rows.
+"""
+function power_transition(Gamma::AbstractMatrix{Float64}, k::Integer)::Matrix{Float64}
+    # Uses the optimized O(1) allocation _powerm we built previously
+    Gk = _powerm(Gamma, max(1, k))
+    S = size(Gk, 1)
+    
+    # 1. Rectify negative entries and accumulate row sums (Column-Major)
+    row_sums = zeros(Float64, S)
+    @inbounds for j in 1:S
+        for i in 1:S
+            v = max(0.0, Gk[i, j])
+            Gk[i, j] = v
+            row_sums[i] += v
+        end
+    end
+    
+    # 2. Row-normalise using the accumulated sums (Column-Major)
+    @inbounds for j in 1:S
+        for i in 1:S
+            if row_sums[i] > 0.0
+                Gk[i, j] /= row_sums[i]
+            end
+        end
+    end
+    
+    return Gk
+end
+
+
+
+
+"""
+    generate_simulated_data(;
+        domain_km  = 200.0,
+        n_tags     = 100,
+        n_steps    = 5,
+        seed       = 42,
+        radius_km  = 5.0,
+        center_lon = -60.0,
+        center_lat = 46.0,
+        crs        = nothing,
+        datum      = WGS84Latest
+    ) -> NamedTuple
+
+Generate synthetic mark-recapture telemetry in a square planar domain of
+side `domain_km` km, centred at `(center_lon, center_lat)`.
+
+# Data generation
+- `n_tags` individuals released at random hex units.
+- Movement simulated with a uniform random walk on the hex adjacency graph
+  (all neighbours equally likely).
+- `n_steps` monthly recaptures per individual.
+- Sex (`"M"` / `"F"`) and maturity (`"mature"` / `"immature"`) assigned
+  randomly in equal proportions.
+- Timestamps start 2020-01-01 and increment monthly.
+
+# Arguments
+- `domain_km`: Side length of the square domain in km (default 200.0).
+- `n_tags`: Number of tagged individuals (default 100).
+- `n_steps`: Recapture events per individual (default 5).
+- `seed`: Random seed (default 42).
+- `radius_km`: Hex circumradius in km (default 5.0).
+- `center_lon, center_lat`: Geographic centre for projection.
+- `crs`: Target Coordinate Reference System (default nothing, local tangent plane).
+- `datum`: Source geographic datum (default: WGS84Latest).
+
+# Returns
+`NamedTuple`:
+- `tagging::DataFrame`: Mark-recapture table.
+- `mesh`: Hex mesh from `build_hex_mesh_planar`.
+- `true_kernel::Matrix{Float64}`: Uniform random-walk kernel used.
+"""
+function generate_simulated_data(;
+    domain_km  :: Real = 200.0,
+    n_tags     :: Int  = 100,
+    n_steps    :: Int  = 5,
+    seed       :: Int  = 42,
+    radius_km  :: Real = 5.0,
+    center_lon :: Real = -60.0,
+    center_lat :: Real = 46.0,
+    crs        = nothing,
+    datum      = WGS84Latest
+)::NamedTuple
+
+    # Internal categorical draw — avoids importing Distributions in this file
+    function _sample_categorical(p::AbstractVector{Float64}, rng::AbstractRNG)::Int
+        u    = rand(rng)
+        csum = 0.0
+        for (i, pi) in enumerate(p)
+            csum += pi
+            csum >= u && return i
+        end
+        return length(p)
+    end
+
+    rng  = MersenneTwister(seed)
+    half = Float64(domain_km) / 2.0
+
+    n_grid = max(10, round(Int, domain_km / radius_km * 2))
+    xs_g   = range(-half, half, length=n_grid)
+    ys_g   = range(-half, half, length=n_grid)
+    
+    # Pre-allocate grid coordinate vectors
+    n_pts = length(xs_g) * length(ys_g)
+    grid_lon = Vector{Float64}(undef, n_pts)
+    grid_lat = Vector{Float64}(undef, n_pts)
+    
+    idx = 1
+    for y in ys_g, x in xs_g
+        lon, lat = xy_km_to_lonlat(x, y; 
+                        center_lon=center_lon, center_lat=center_lat, 
+                        crs=crs, datum=datum)
+        grid_lon[idx] = lon
+        grid_lat[idx] = lat
+        idx += 1
+    end
+
+    # Pass the CRS formatting down to the mesh generator
+    mesh = build_hex_mesh_planar(grid_lon, grid_lat; 
+               radius_km=radius_km, crs=crs, datum=datum)
+    S = mesh.n_units
+
+    # Construct the true kernel directly using row sums of the sparse matrix
+    row_sums = sum(mesh.W, dims=2)
+    kernel   = zeros(Float64, S, S)
+    for i in 1:S
+        rs = row_sums[i]
+        if rs > 0
+            # Broadcast the sparse row directly into the dense matrix
+            @views kernel[i, :] .= mesh.W[i, :] ./ rs
+        else
+            kernel[i, i] = 1.0
+        end
+    end
+
+    sexes = [rand(rng, ["M", "F"])            for _ in 1:n_tags]
+    mats  = [rand(rng, ["mature", "immature"]) for _ in 1:n_tags]
+    t0_dt = Date(2020, 1, 1)
+    
+    # Use an array of NamedTuples to store rows (drastically faster than DataFrame push!)
+    total_records = n_tags * (n_steps + 1)
+    records = Vector{NamedTuple{
+        (:tagid, :lon, :lat, :tag, :timestamp, :time, :sex, :mat, :is_dead, :s_idx),
+        Tuple{String, Float64, Float64, Int, DateTime, Float64, String, String, Bool, Int}
+    }}(undef, total_records)
+    
+    row_idx = 1
+    for i in 1:n_tags
+        s_cur   = rand(rng, 1:S)
+        tid_str = string(i)
+        
+        (lon_r, lat_r) = mesh.centroids_lonlat[s_cur]
+        records[row_idx] = (
+            tagid     = tid_str,
+            lon       = lon_r,
+            lat       = lat_r,
+            tag       = 0,
+            timestamp = DateTime(t0_dt),
+            time      = _to_decimal_year(t0_dt),
+            sex       = sexes[i],
+            mat       = mats[i],
+            is_dead   = false,
+            s_idx     = s_cur
+        )
+        row_idx += 1
+
+        for step in 1:n_steps
+            p_row = kernel[s_cur, :]
+            s_cur = _sample_categorical(p_row, rng)
+            t_dt  = t0_dt + Month(step)
+            
+            (lon_r, lat_r) = mesh.centroids_lonlat[s_cur]
+            records[row_idx] = (
+                tagid     = tid_str,
+                lon       = lon_r,
+                lat       = lat_r,
+                tag       = step,
+                timestamp = DateTime(t_dt),
+                time      = _to_decimal_year(t_dt),
+                sex       = sexes[i],
+                mat       = mats[i],
+                is_dead   = false,
+                s_idx     = s_cur
+            )
+            row_idx += 1
+        end
+    end
+
+    # Construct the DataFrame once at the very end
+    return (
+        tagging     = DataFrame(records),
+        mesh        = mesh,
+        true_kernel = kernel
+    )
+end
+
+
+
+# ── Mark-recapture event extraction ───────────────────────────────────────────
+ 
+"""
+    _extract_mark_recapture_events(tagging; time_interval=:monthly) -> DataFrame
+
+Extract consecutive (release, recapture) pairs from a telemetry DataFrame.
+
+For each individual, consecutive observation pairs are converted to events.
+The number of discrete time steps `k` is computed per pair from the elapsed
+decimal-year difference:
+
+    dt_unit = 1/12 (:monthly), 1/52 (:weekly), 1/26 (:biweekly), 1/365.25 (:daily)
+    k       = max(1, round(Int, Δt / dt_unit))
+
+Sex and maturity are taken from the first record of each individual.  Absent
+group columns default to `"unknown"`.
+
+# Required columns
+`:tagid`, `:s_idx`, `:time`.
+
+# Optional columns
+`:sex`, `:mat`.
+
+# Arguments
+- `tagging::DataFrame`: Aggregated telemetry with unit assignments.
+- `time_interval::Symbol`: Sets `dt_unit` (default `:monthly`).
+
+# Returns
+`DataFrame` with columns: `tagid`, `release`, `recapture`, `k`, `sex`, `mat`.
+"""
+function _extract_mark_recapture_events(
+    tagging::DataFrame;
+    time_interval::Symbol = :monthly
+)::DataFrame
+
+    # NamedTuple avoids the heap allocation of a Dict
+    dt_map = (monthly=1.0/12.0, weekly=1.0/52.0, biweekly=1.0/26.0, daily=1.0/365.25, raw=1.0)
+    dt = hasproperty(dt_map, time_interval) ? getproperty(dt_map, time_interval) : 1.0 / 12.0
+
+    has_sex = hasproperty(tagging, :sex)
+    has_mat = hasproperty(tagging, :mat)
+
+    # 1. Sort globally upfront
+    sorted_df = sort(tagging, [:tagid, :time])
+    n_rows = nrow(sorted_df)
+
+    # 2. Extract columns to local vectors. 
+    # This guarantees type stability and peak access speed inside the loop.
+    tagids = sorted_df.tagid
+    times  = sorted_df.time
+    s_idxs = sorted_df.s_idx
+    sexes  = has_sex ? sorted_df.sex : nothing
+    mats   = has_mat ? sorted_df.mat : nothing
+
+    RecordType = NamedTuple{
+        (:tagid, :release, :recapture, :k, :sex, :mat), 
+        Tuple{String, Int, Int, Int, String, String}
+    }
+    
+    records = Vector{RecordType}(undef, 0)
+    
+    # Return empty DataFrame immediately if not enough rows to form a pair
+    if n_rows < 2
+        return DataFrame(tagid=String[], release=Int[], recapture=Int[], 
+                         k=Int[], sex=String[], mat=String[])
+    end
+    
+    sizehint!(records, n_rows) # Max possible pairs is n_rows - 1
+
+    # 3. Single-pass flat loop
+    for i in 2:n_rows
+        # If the tag is the same as the previous row, it's a consecutive pair
+        if tagids[i] == tagids[i-1]
+            Δt = times[i] - times[i-1]
+            k  = max(1, round(Int, Δt / dt))
+            
+            push!(records, (
+                tagid     = string(tagids[i-1]),
+                release   = s_idxs[i-1],
+                recapture = s_idxs[i],
+                k         = k,
+                sex       = has_sex ? string(sexes[i-1]) : "unknown",
+                mat       = has_mat ? string(mats[i-1]) : "unknown"
+            ))
+        end
+    end
+
+    return isempty(records) ? 
+           DataFrame(tagid=String[], release=Int[], recapture=Int[], 
+                     k=Int[], sex=String[], mat=String[]) : 
+           DataFrame(records)
+end
+
+
+# ── Main data preparation entry point ─────────────────────────────────────────
+ 
+"""
+    prepare_movement_data(;
+        data_source   = :snowcrab,
+        data_dir      = joinpath(@__DIR__, "data"),
+        tagging_file  = nothing,
+        hsi_path      = nothing,
+        telemetry_csv = nothing,
+        radius_km     = 5.0,
+        time_interval = :monthly,
+        filter_dead   = true,
+        crs           = nothing,
+        datum         = WGS84Latest,
+        domain_km     = 200.0,
+        n_tags        = 100,
+        n_steps       = 5,
+        seed          = 42,
+        center_lon    = -60.0,
+        center_lat    = 46.0,
+        ref_doy       = 244.0,
+        verbose       = false
+    ) -> NamedTuple
+
+Unified data preparation pipeline. Loads or generates mark-recapture telemetry,
+builds a planar hexagonal mesh, reshards the HSI field, maps observations to
+spatial units, and returns a NamedTuple ready for `fit_categorical_movement`.
+
+# Data sources
+- `:snowcrab` — snow crab telemetry + HSI from JLD2 files.
+- `:simulate` — synthetic square-domain data with forward-simulated tracks.
+- `:csv`      — generic telemetry from CSV (requires `telemetry_csv` path).
+
+# Returns
+`NamedTuple`:
+- `tagging::DataFrame`: Filtered/aggregated telemetry with `:s_idx` and `:hsi`.
+- `mesh`: Hex mesh NamedTuple.
+- `hsi_vec::Vector{Float64}`: Climatological mean HSI per unit (length S).
+- `monthly_hsi::Matrix{Float64}`: (S × 12T), or empty when unavailable.
+- `month_lookup::Dict{Tuple{Int,Int}, Int}`: (year, month) → column index.
+- `years::Vector{Int}`: Annual year labels.
+- `obs::DataFrame`: Mark-recapture pairs (release, recapture, k, sex, mat).
+"""
+function prepare_movement_data(;
+    data_source   :: Symbol  = :snowcrab,
+    data_dir      :: AbstractString = joinpath(@__DIR__, "data"),
+    tagging_file  :: Union{Nothing, AbstractString} = nothing,
+    hsi_path      :: Union{Nothing, AbstractString} = nothing,
+    telemetry_csv :: Union{Nothing, AbstractString} = nothing,
+    radius_km     :: Real    = 5.0,
+    time_interval :: Symbol  = :monthly,
+    filter_dead   :: Bool    = true,
+    crs                      = nothing,
+    datum                    = WGS84Latest,
+    domain_km     :: Real    = 200.0,
+    n_tags        :: Int     = 100,
+    n_steps       :: Int     = 5,
+    seed          :: Int     = 42,
+    center_lon    :: Real    = -60.0,
+    center_lat    :: Real    = 46.0,
+    ref_doy       :: Real    = 244.0,
+    verbose       :: Bool    = false
+)::NamedTuple
+
+    local tagging, mesh, pre_mapped
+
+    # ── Load / generate raw telemetry ─────────────────────────────────────────
+ 
+    if data_source == :user
+        if !isfile(tagging_file) 
+            error("User specified tagging file not found: $tagging_file")
+        else
+            verbose && println("  [data] Loading user specified telemetry file …")
+            tagging = JLD2.load(tagging_file)
+        end
+
+        # 1. Filter dead (using column-based syntax avoids DataFrameRow overhead)
+        if filter_dead && hasproperty(tagging, :is_dead)
+            filter!(:is_dead => d -> !coalesce(d, false), tagging)
+        end
+
+        # 2. Fast vectorized type coercion via broadcasting
+        tagging[!, :lon]   = Float64.(tagging.lon)
+        tagging[!, :lat]   = Float64.(tagging.lat)
+        tagging[!, :tag]   = Int.(tagging.tag)
+        tagging[!, :tagid] = string.(tagging.tagid)
+        if hasproperty(tagging, :time)
+            tagging[!, :time] = Float64.(tagging.time)
+        end
+
+        # 3. Zero-allocation mean longitude check
+        sum_lon = 0.0
+        n_lon   = 0
+        for x in tagging.lon
+            if isfinite(x)
+                sum_lon += x
+                n_lon += 1
+            end
+        end
+        
+        if n_lon > 0 && (sum_lon / n_lon) > 0
+            @warn "Mean longitude is positive ($(round(sum_lon / n_lon, digits=2))). " *
+                "Verify sign convention — western Atlantic data should be negative."
+        end
+
+        # 4. Require both events using ultra-fast SubDataFrame column views
+        if require_both_events
+            valid_set = Set{String}()
+            
+            for sub in groupby(tagging, :tagid)
+                tags = sub.tag # direct view into the column
+                
+                # Use fast short-circuiting checks
+                if any(==(0), tags) && any(>(0), tags)
+                    push!(valid_set, sub.tagid[1])
+                end
+            end
+            
+            # ∈(valid_set) is highly optimized in Julia for Set lookups
+            filter!(:tagid => ∈(valid_set), tagging)
+        end
+
+        sort!(tagging, [:tagid, :time])
+
+        pre_mapped = nothing
+        verbose && println(
+            "    $(length(unique(tagging.tagid))) individuals, $(nrow(tagging)) obs.")
+    
+    elseif data_source == :simulate
+        verbose && println("  [data] Generating simulated data …")
+        sim        = generate_simulated_data(;
+            domain_km=domain_km, n_tags=n_tags, n_steps=n_steps, seed=seed,
+            radius_km=radius_km, center_lon=center_lon, center_lat=center_lat,
+            crs=crs, datum=datum)
+        tagging    = sim.tagging
+        pre_mapped = sim.mesh
+        verbose && println("    $(n_tags) individuals, $(sim.mesh.n_units) units.")
+ 
+    elseif data_source == :csv
+        (!isnothing(telemetry_csv) && isfile(telemetry_csv)) ||
+            error("--telemetry-path must be a readable CSV for :csv data source.")
+        _HAS_CSV || error("CSV.jl not available; add it to the project.")
+        verbose && println("  [data] Loading CSV: $(telemetry_csv) …")
+        
+        tagging = CSV.read(telemetry_csv, DataFrame)
+        if hasproperty(tagging, :timestamp) && eltype(tagging.timestamp) <: AbstractString
+            tagging[!, :timestamp] = DateTime.(tagging.timestamp)
+        end
+        if !hasproperty(tagging, :time)
+            tagging[!, :time] = _to_decimal_year.(tagging.timestamp)
+        end
+        pre_mapped = nothing
+        verbose && println("    $(nrow(tagging)) rows loaded.")
+
+    else
+        error("Unknown data_source: $(data_source). Use :snowcrab, :simulate, or :csv.")
+    end
+
+    # ── Temporal aggregation (skip for simulate — already at target resolution) ─
+    if data_source != :simulate
+        verbose && println("  [data] Aggregating to :$(time_interval) …")
+        tagging = aggregate_telemetry_time(tagging; time_interval=time_interval)
+        verbose && println(
+            "    $(nrow(tagging)) rows, $(length(unique(tagging.tagid))) individuals.")
+    end
+
+    # ── Build planar hex mesh ──────────────────────────────────────────────────
+    if isnothing(pre_mapped)
+        verbose && println("  [data] Building hex mesh (r=$(radius_km) km) …")
+        lon_v = Float64.(tagging.lon)
+        lat_v = Float64.(tagging.lat)
+        mesh  = build_hex_mesh_planar(lon_v, lat_v;
+                    radius_km=radius_km, crs=crs, datum=datum)
+    else
+        mesh = pre_mapped
+    end
+    verbose && println("    Mesh: $(mesh.n_units) units.")
+
+    # ── Map telemetry to hex units ─────────────────────────────────────────────
+    verbose && println("  [data] Mapping observations to hex units …")
+    tagging = map_telemetry_to_units(tagging, mesh.centroids_km,
+                  mesh.center_lon, mesh.center_lat; crs=crs, datum=datum)
+
+    # ── Load HSI and reshard to destination mesh ───────────────────────────────
+    hsi_vec      = fill(0.5, mesh.n_units)
+    monthly_hsi  = Matrix{Float64}(undef, 0, 0)
+    month_lookup = Dict{Tuple{Int, Int}, Int}()
+    years_vec    = Int[]
+
+    hsi_jld2 = !isnothing(hsi_path) ? hsi_path : joinpath(data_dir, "hsi.jld2")
+
+    if isfile(hsi_jld2)
+        verbose && println("  [data] Loading HSI: $(hsi_jld2) …")
+        h            = load_hsi_jld2(hsi_jld2; ref_doy=ref_doy)
+        years_vec    = h.years
+        month_lookup = h.month_lookup
+        S_src        = size(h.monthly_hsi, 1)
+
+        if S_src == mesh.n_units
+            monthly_hsi = h.monthly_hsi
+            hsi_vec     = h.hsi_spatial_mean
+        else
+            verbose && println("    Resharding HSI $(S_src) → $(mesh.n_units) units …")
+            sppoly_jld2 = joinpath(data_dir, "sppoly.jld2")
+
+            if isfile(sppoly_jld2)
+                sp     = JLD2.load(sppoly_jld2)
+                au_src = sp["au"]
+                n_au   = length(au_src.lon)
+                
+                # Preallocate array for massive speedup over push!()
+                src_coords_km = Vector{Tuple{Float64, Float64}}(undef, n_au)
+                for i in 1:n_au
+                    src_coords_km[i] = lonlat_to_xy_km(
+                        au_src.lon[i], au_src.lat[i];
+                        center_lon=mesh.center_lon, center_lat=mesh.center_lat,
+                        crs=crs, datum=datum)
+                end
+            else
+                src_coords_km = Tuple{Float64, Float64}[]
+                @warn "sppoly.jld2 not found; cannot reshard HSI. Using domain mean."
+            end
+
+            if !isempty(src_coords_km)
+                n_mo        = size(h.monthly_hsi, 2)
+                monthly_hsi = zeros(Float64, mesh.n_units, n_mo)
+                for m in 1:n_mo
+                    monthly_hsi[:, m] = reshard_hsi_field(
+                        h.monthly_hsi[:, m], src_coords_km, mesh.centroids_km)
+                end
+                hsi_vec = vec(mean(monthly_hsi, dims=2))
+            else
+                hsi_vec = fill(mean(h.hsi_spatial_mean), mesh.n_units)
+            end
+        end
+
+        if !isempty(month_lookup) && size(monthly_hsi, 1) == mesh.n_units
+            tagging[!, :hsi] = match_telemetry_closest_month_hsi(
+                tagging, monthly_hsi, month_lookup, years_vec)
+        else
+            tagging[!, :hsi] = fill(0.5, nrow(tagging))
+        end
+        verbose && begin
+            hsi_vals = filter(isfinite, tagging.hsi)
+            isempty(hsi_vals) ||
+                println("    HSI matched (mean=$(round(mean(hsi_vals), digits=4))).")
+        end
+    else
+        tagging[!, :hsi] = fill(0.5, nrow(tagging))
+        !isnothing(hsi_path) &&
+            @warn "HSI file not found: $(hsi_jld2); using uniform HSI = 0.5."
+    end
+
+    # ── Extract mark-recapture event pairs ─────────────────────────────────────
+    verbose && println("  [data] Extracting mark-recapture event pairs …")
+    obs = _extract_mark_recapture_events(tagging; time_interval=time_interval)
+    verbose && println("    $(nrow(obs)) event pairs.")
+
+    return (
+        tagging      = tagging,
+        mesh         = mesh,
+        hsi_vec      = hsi_vec,
+        monthly_hsi  = monthly_hsi,
+        month_lookup = month_lookup,
+        years        = years_vec,
+        obs          = obs
+    )
+end
+
+# ── Group stratification ───────────────────────────────────────────────────────
+
+
+"""
+    build_group_indices(obs; sex_col=:sex, mat_col=:mat) 
+    -> (DataFrame, Dict{String,Int})
+
+Map each observation to an integer group index based on a 3-tier categorization:
+1. `"immature"`: Any individual where maturity is "immature".
+2. `"male"`: Any mature male (maturity "mature", sex "M").
+3. `"female"`: Any mature female (maturity "mature", sex "F").
+(Unmatched combinations default to `"unknown"`).
+
+# Arguments
+- `obs::DataFrame`: Mark-recapture events; must contain `sex_col` and `mat_col`.
+- `sex_col`: Column name for sex (default `:sex`).
+- `mat_col`: Column name for maturity (default `:mat`).
+
+# Returns
+- `obs` copy with `:group::Int` column added (1-based group index).
+- `group_lookup::Dict{String,Int}`: group label → index.
+"""
+function build_group_indices(
+    obs::DataFrame;
+    sex_col::Symbol = :sex,
+    mat_col::Symbol = :mat
+)::Tuple{DataFrame, Dict{String, Int}}
+
+    n_rows = nrow(obs)
+    has_sex = hasproperty(obs, sex_col)
+    has_mat = hasproperty(obs, mat_col)
+
+    # 1. Preallocate the labels array
+    labels = Vector{String}(undef, n_rows)
+
+    if has_sex && has_mat
+        # 2. Extract columns for type-stable, zero-overhead loop access
+        sexes = obs[!, sex_col]
+        mats  = obs[!, mat_col]
+
+        @inbounds for i in 1:n_rows
+            sx = string(sexes[i])
+            mt = string(mats[i])
+
+            # Apply the specific 3-tier biological categorization
+            if mt == "immature"
+                labels[i] = "immature"
+            elseif mt == "mature" && sx == "M"
+                labels[i] = "male"
+            elseif mt == "mature" && sx == "F"
+                labels[i] = "female"
+            else
+                labels[i] = "unknown"
+            end
+        end
+    else
+        # Fallback if required columns are missing
+        fill!(labels, "unknown")
+    end
+
+    # 3. Determine unique groups present in the data
+    unique_labels = sort!(unique(labels))
+    group_lookup  = Dict{String, Int}(lbl => i for (i, lbl) in enumerate(unique_labels))
+    
+    # 4. Map labels to integer IDs efficiently
+    group_ids = Vector{Int}(undef, n_rows)
+    @inbounds for i in 1:n_rows
+        group_ids[i] = group_lookup[labels[i]]
+    end
+
+    out = copy(obs)
+    out[!, :group] = group_ids
+    
+    return out, group_lookup
+end
+
