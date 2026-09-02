@@ -1602,7 +1602,7 @@ function _predict_categorical_movement(model_obj, chain, new_data::DataFrame, n_
         Vector{Int}(new_data.group)
     elseif hasproperty(new_data, :sex) && hasproperty(new_data, :mat)
         # Map using build_group_indices logic
-        [get(group_lookup, "$(r.sex)_$(r.mat)", 1) for r in eachrow(new_data)]
+        [get(group_lookup, "$(r.sex)_$(r.mat)", 1) for r in eachrow(new_data)]  # need to update todo!  
     else
         ones(Int, nrow(new_data))
     end

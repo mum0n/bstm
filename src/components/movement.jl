@@ -166,6 +166,8 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
         else
             error("The `habitat` parameter must be a Symbol (column name) or a Vector of length s_N.")
         end
+    end
+    
     if haskey(params, :mark_recapture_data)
         telemetry_input = params[:mark_recapture_data]
         
@@ -443,7 +445,6 @@ function get_updates(
             """
 
         elseif m.method == :explicit
-
           
             telemetry_likelihood_code = """
             # --- Mark-Recapture Telemetry Likelihood ---
@@ -480,7 +481,40 @@ function get_updates(
             end
             """
         elseif m.method == :implicit
-            # missing?
+            telemetry_likelihood_code = """
+            # --- Implicit Mark-Recapture Telemetry Likelihood ---
+            
+            # Build propagator once, factorize once
+            M_prop_tlm = Matrix(I($(hyper.s_N))) .- ($(p_names.velocity) .* A_op) .- (Diagonal(diffusion_field) * L_op)
+            F_prop_T = lu(transpose(M_prop_tlm))
+
+            for m_idx in 1:size(spec_registry[:$(key)].hyper.mark_recapture_data, 1)
+                u_rel = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 1])
+                u_rec = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 2])
+                time_steps = Int(spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 3])
+                cov_m = spec_registry[:$(key)].hyper.mark_recapture_data[m_idx, 4]
+                
+                local p_unnorm
+                if time_steps > 0
+                    e_urel = zeros(T_num_dyn, $(hyper.s_N))
+                    e_urel[u_rel] = 1.0
+                    
+                    y = e_urel
+                    for _ in 1:time_steps
+                        y = F_prop_T \\ y
+                    end
+                    p_unnorm = y
+                else
+                    p_unnorm = zeros(T_num_dyn, $(hyper.s_N))
+                    p_unnorm[u_rel] = 1.0
+                end
+
+                indiv_scaling = exp($(p_names.beta_het) * cov_m)
+                p_unnorm_scaled = abs.(p_unnorm) .^ indiv_scaling
+                p_norm = p_unnorm_scaled / (sum(p_unnorm_scaled) + 1e-15)
+                Turing.@addlogprob! log(max(p_norm[u_rec], 1e-12))
+            end
+            """
         end
     end
 
@@ -521,6 +555,7 @@ function get_effects(
     else
         size(chain, 1) * size(chain, 3)
     end
+
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     
@@ -542,6 +577,7 @@ function get_effects(
     else
         s_idx_train
     end
+
     t_idx_full = if !isnothing(PS) && hasproperty(PS.data, :t_idx)
         vcat(t_idx_train, PS.data.t_idx)
     else
@@ -572,8 +608,7 @@ function get_effects(
         K_name = hasproperty(p_names_k, :K) ? _find_parameter(p_names, string(p_names_k.K),
           k, is_multivariate_model) : ""
 
-        if isempty(velocity_name) || isempty(diffusion_name) || isempty(sigma_name) ||
-          isempty(ure_name)
+        if isempty(velocity_name) || isempty(diffusion_name) || isempty(sigma_name) || isempty(ure_name)
             @warn "Parameters for Movement component $(key) (outcome $k) not found.
               Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
@@ -650,13 +685,13 @@ function get_effects(
             # Scale by sigma and store the flattened result
             dyn_field_sample .*= sigma_samples[i]
             dyn_field_all_samples[:, i] = vec(dyn_field_sample)
-        end
+        end # end for
 
         # Index the full results matrix once using the pre-calculated flat indices
         effect_k = dyn_field_all_samples[st_idx_full, :]
         
         push!(structured_effects, effect_k)
-    end
+    end # end for
 
     return (structured=structured_effects, noisy=structured_effects)
 end

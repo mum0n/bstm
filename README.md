@@ -83,22 +83,31 @@ m = @bstm(
 
 ```bash
 git clone https://github.com/mum0n/bstm.git
-cd("where/you/saved/bstm")  
+bstm_location = "where/you/saved/bstm"  # e.g. bstm_location = "C:/home/jae/projects/bstm"
+
 ```
 
 Start Julia within the repository:
 
 ```julia
-using Pkg
-Pkg.activate(".")
-Pkg.instantiate()
-include("src/bstm.jl")
-using .bstm
+#  your working directory (where data, etc are found)
+myworkdir = "c:/home/jae/work"
 
-# or installed as a package
+mkpath(myworkdir)
+cd(myworkdir) 
+
 using Pkg
-Pkg.add(url="https://github.com/mum0n/bstm.git")
-using bstm
+Pkg.activate(myworkdir)
+Pkg.instantiate()
+
+# this will install required packages, you will have to rerun this several times to get all the dependencies worked out. 
+# manually install and dependencies that get interrupted, if needed restart julia as well
+include( joinpath(bstm_location, "src", "bstm.jl") ) 
+using .bstm  # the "." means load the module in the current session, not importing it as a package.  
+
+# or, you can of course install and import as a package too:  
+# Pkg.add(url="https://github.com/mum0n/bstm.git"); using bstm
+
 ```
 
 ## Quick Start Examples

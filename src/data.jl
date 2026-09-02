@@ -135,6 +135,8 @@ function bstm_data(
         return generate_ADR_simulation_bundle(
             domain_size, n_units, n_years, n_marks; area_method=area_method, rng=rng
         )
+    elseif type_str in ["movement"]
+        return generate_movement_data()
 
     elseif type_str in ["scottish_lip", "scottish"]
         cache_path = "data/scottish_lip_cancer_cache.jld2"
@@ -1047,6 +1049,210 @@ function create_base_st_data(;
     )
     return df, W, grid_areas
 end
+
+# Internal categorical draw — avoids importing Distributions in this file
+function _sample_categorical(p::AbstractVector{Float64}, rng::AbstractRNG)::Int
+    u    = rand(rng)
+    csum = 0.0
+    for (i, pi) in enumerate(p)
+        csum += pi
+        csum >= u && return i
+    end
+    return length(p)
+end
+
+"""
+    generate_movement_data(; kwargs...)
+
+Generates synthetic animal movement and telemetry datasets mapped over spatial meshes, 
+returning a structured `NamedTuple` containing telemetry records, spatial meshes, 
+transition kernels, habitat suitability indices, and derived release-recapture observations.
+"""
+function generate_movement_data(;
+    radius_km     :: Real    = 5.0,
+    time_interval :: Symbol  = :monthly,
+    crs                      = nothing,
+    datum                    = WGS84Latest,
+    domain_km     :: Real    = 200.0,
+    n_tags        :: Int     = 100,
+    n_steps       :: Int     = 5,
+    center_lon    :: Real    = -60.0,
+    center_lat    :: Real    = 46.0,
+    seed          :: Int     = 42
+)::NamedTuple
+    
+    rng  = MersenneTwister(seed)
+    half = Float64(domain_km) / 2.0
+
+    n_grid = max(10, round(Int, domain_km / radius_km * 2))
+    xs_g   = range(-half, half, length=n_grid)
+    ys_g   = range(-half, half, length=n_grid)
+    
+    # Pre-allocate grid coordinate vectors
+    n_pts = length(xs_g) * length(ys_g)
+    grid_lon = Vector{Float64}(undef, n_pts)
+    grid_lat = Vector{Float64}(undef, n_pts)
+    
+    idx = 1
+    for y in ys_g, x in xs_g
+        lon, lat = xy_km_to_lonlat(x, y; 
+                        center_lon=center_lon, center_lat=center_lat, 
+                        crs=crs, datum=datum)
+        grid_lon[idx] = lon
+        grid_lat[idx] = lat
+        idx += 1
+    end
+
+    # Pass the CRS formatting down to the mesh generator
+    mesh = build_hex_mesh_planar(grid_lon, grid_lat; 
+               radius_km=radius_km, crs=crs, datum=datum)
+    S = mesh.n_units
+
+    # Construct the true kernel directly using row sums of the sparse matrix
+    row_sums = sum(mesh.W, dims=2)
+    kernel   = zeros(Float64, S, S)
+    for i in 1:S
+        rs = row_sums[i]
+        if rs > 0
+            @views kernel[i, :] .= mesh.W[i, :] ./ rs
+        else
+            kernel[i, i] = 1.0
+        end
+    end
+
+    sexes = [rand(rng, ["M", "F"])            for _ in 1:n_tags]
+    mats  = [rand(rng, ["mature", "immature"]) for _ in 1:n_tags]
+    t0_dt = Date(2020, 1, 1)
+    
+    total_records = n_tags * (n_steps + 1)
+    records = Vector{NamedTuple{
+        (:tagid, :lon, :lat, :tag, :timestamp, :time, :sex, :mat, :is_dead, :s_idx),
+        Tuple{String, Float64, Float64, Int, DateTime, Float64, String, String, Bool, Int}
+    }}(undef, total_records)
+    
+    row_idx = 1
+    for i in 1:n_tags
+        s_cur   = rand(rng, 1:S)
+        tid_str = string(i)
+        
+        (lon_r, lat_r) = mesh.centroids_lonlat[s_cur]
+        records[row_idx] = (
+            tagid     = tid_str,
+            lon       = lon_r,
+            lat       = lat_r,
+            tag       = 0,
+            timestamp = DateTime(t0_dt),
+            time      = _to_decimal_year(t0_dt),
+            sex       = sexes[i],
+            mat       = mats[i],
+            is_dead   = false,
+            s_idx     = s_cur
+        )
+        row_idx += 1
+
+        for step in 1:n_steps
+            p_row = kernel[s_cur, :]
+            s_cur = _sample_categorical(p_row, rng)
+            t_dt  = t0_dt + Month(step)
+            
+            (lon_r, lat_r) = mesh.centroids_lonlat[s_cur]
+            records[row_idx] = (
+                tagid     = tid_str,
+                lon       = lon_r,
+                lat       = lat_r,
+                tag       = step,
+                timestamp = DateTime(t_dt),
+                time      = _to_decimal_year(t_dt),
+                sex       = sexes[i],
+                mat       = mats[i],
+                is_dead   = false,
+                s_idx     = s_cur
+            )
+            row_idx += 1
+        end
+    end
+  
+    tagging = DataFrame(records)
+    true_kernel = kernel
+    tagging = map_telemetry_to_units(tagging, mesh.centroids_km,
+                  mesh.center_lon, mesh.center_lat; crs=crs, datum=datum)
+    
+    hsi_vec      = fill(0.5, mesh.n_units)
+    monthly_hsi  = Matrix{Float64}(undef, 0, 0)
+    month_lookup = Dict{Tuple{Int, Int}, Int}()
+    years_vec    = Int[]
+
+    # Time-interval step conversion mapping
+    dt_map = (monthly=1.0/12.0, weekly=1.0/52.0, biweekly=1.0/26.0, daily=1.0/365.25, raw=1.0)
+    dt = hasproperty(dt_map, time_interval) ? getproperty(dt_map, time_interval) : 1.0 / 12.0
+
+    has_sex = hasproperty(tagging, :sex)
+    has_mat = hasproperty(tagging, :mat)
+
+    # 1. Sort globally upfront
+    sorted_df = sort(tagging, [:tagid, :time])
+    n_rows = nrow(sorted_df)
+
+    # Return empty DataFrame immediately if not enough rows to form a pair
+    if n_rows < 2
+        obs = DataFrame(tagid=String[], release=Int[], recapture=Int[], 
+                        k=Int[], sex=String[], mat=String[])
+        return (
+            tagging      = tagging,
+            mesh         = mesh,
+            hsi_vec      = hsi_vec,
+            monthly_hsi  = monthly_hsi,
+            month_lookup = month_lookup,
+            years        = years_vec,
+            obs          = obs
+        )
+    end
+
+    # 2. Extract columns to local vectors for type stability
+    tagids = sorted_df.tagid
+    times  = sorted_df.time
+    s_idxs = sorted_df.s_idx
+    sexes_col = has_sex ? sorted_df.sex : nothing
+    mats_col  = has_mat ? sorted_df.mat : nothing
+
+    RecordType = NamedTuple{
+        (:tagid, :release, :recapture, :k, :sex, :mat), 
+        Tuple{String, Int, Int, Int, String, String}
+    }
+    
+    pair_records = Vector{RecordType}(undef, 0)
+    sizehint!(pair_records, n_rows)
+
+    # 3. Single-pass flat loop for consecutive pairs
+    for i in 2:n_rows
+        if tagids[i] == tagids[i-1]
+            Δt = times[i] - times[i-1]
+            k  = max(1, round(Int, Δt / dt))
+            
+            push!(pair_records, (
+                tagid     = string(tagids[i-1]),
+                release   = s_idxs[i-1],
+                recapture = s_idxs[i],
+                k         = k,
+                sex       = has_sex ? string(sexes_col[i-1]) : "unknown",
+                mat       = has_mat ? string(mats_col[i-1])  : "unknown"
+            ))
+        end
+    end
+
+    obs = DataFrame(pair_records)
+  
+    return (
+        tagging      = tagging,
+        mesh         = mesh,
+        hsi_vec      = hsi_vec,
+        monthly_hsi  = monthly_hsi,
+        month_lookup = month_lookup,
+        years        = years_vec,
+        obs          = obs
+    )
+end
+
 
 """
     generate_mock_hierarchical_datasets(; seed=42, N_bathy=1000, N_sub=500,
