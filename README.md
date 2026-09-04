@@ -9,7 +9,7 @@ The **`bstm`** framework provides a composable, formula-driven probabilistic pro
 
 Inspired by high-level formula interfaces like R's `brms` and `INLA`, `bstm` and learning from `bugs`, `jags` and `stan`, it provides automated code generation, automatic differentiation (ForwardDiff, ReverseDiff, Zygote), adaptive composite block-sampling, full posterior reconstruction, spatial tessellation, analytical SQL querying, and publication-ready diagnostic visualization. It represents the evolution of the  `aegis`-based approach and workflow implemented in R (https://github.com/jae0/aegis, https://github.com/jae0/carstm, and https://github.com/jae0/bio.snowcrab) to embrace Julia's performance, ecosystem and extensibility. It is designed to make complex ecological modeling faster, more flexible, transparent and accessible to scientists, in the spirit and ideals of open and reproducible science. It is limited by my own human limits knowledge and experience, and so I look forward to other scientists running with it to make something truly great! 
 
-Full disclosure: I have made heavy use of Gemini AI to help develop this package. It has been an invaluable catalyst to make coherent the code, tests, vizualizations and documentation. 
+Full disclosure: I have made heavy use of Gemini AI to help develop this package. It has been an invaluable catalyst to make coherent the code, unit tests, visualizations and consistent documentation. 
 
 Best regards,
 Jae
@@ -121,7 +121,7 @@ Fit a hierarchical BYM2 spatial model with an AR1 temporal trend, extract diagno
 Random.seed!(42)
 
 # 1. Load benchmark dataset (56 Scottish districts across time)
-data_scot, _ = bstm_data() # Scottish Lip Cancer
+data_scot = bstm_data() # Scottish Lip Cancer
 df = data_scot.data # dataframe with response and covariates
 W = data_scot.au.W  # graph (adjacency matrix)
 
@@ -149,6 +149,7 @@ display(plots_res.plots[:spatial])
 
 # 6. Persist Unified Bundle to DuckDB and JLD2
 save_bstm_bundle("output/scot_lip_model", m, chn, res; au=data_scot.au)
+bn_bundle = load_bstm_bundle("output/scot_lip_model")
 
 # 7. Query prior
 # Extract prior from the saved bundle
@@ -166,7 +167,6 @@ display(prior_posterior[:prior, :parameters, 1:1000])
 Discretize continuous GPS coordinates into exact regular hexagons, construct neighborhood topology, and fit a spatiotemporal model:
 
 ```julia
-using bstm, DataFrames, Random, Plots
 
 rng = MersenneTwister(42)
 N = 400
@@ -187,9 +187,11 @@ st_data = assign_spatiotemporal_units(df;
     time_var = :year,
     area_method = :hexagonal,
     target_units = 16,
-    exact_units = true,
-    merge_small_polygons = true
+    radius = 10.0,
+    exact_units = true
 )
+
+spatial_graph_plot(au=st_data.au_spatial, title="16 Hexagonal Spatial Units")
 
 df.s_idx = st_data.s_idx
 df.year_idx = st_data.t_idx
@@ -216,9 +218,39 @@ p_ppc = plots_res.plots[:posterior_predictive_check]
 plot(p_map, p_ppc, layout=(1, 2), size=(1000, 450))
 ```
 
+
 ---
 
-### Example 3: Analytical SQL Querying, Prior Extraction & Chain Extension
+### Example 3: Multivariate Hierarchical Spatiotemporal Model
+
+```julia
+ 
+# Example df must contain: :s_idx, :t_idx (or :year), :y1, :y2, :cov1
+# y1: counts (Poisson), y2: continuous (Gaussian)
+
+m = @bstm(
+    # Multivariate joint likelihood: specify two outputs and their families
+    likelihood((y1, y2),
+               family = (poisson, gaussian),
+               # pass offsets/trials if needed per outcome: log_offsets=(offset1, offset2)
+    ) ~
+        # Common fixed effects (applied to both outcomes), plus outcome-specific terms
+        intercept() +
+        fixed(cov1) +
+        # name the spatial component "shared_spatial" so it's the same latent effect for both outcomes
+        random(s_idx, model=bym2, W = W, key = :shared_spatial) +
+        # outcome-specific temporal effect: this will be added per outcome automatically
+        random(t_idx, model=ar1, key = :temporal_by_outcome),
+    df;
+    model_arch = "multivariate",    # enable multivariate architecture
+    verbose = true
+)
+ 
+```
+
+
+
+### Example 4: Analytical SQL Querying, Prior Extraction & Chain Extension
 
 Leverage DuckDB for relational SQL analytics and resume sampling on previously saved models:
 
@@ -244,7 +276,7 @@ chn_extended = extend_sampling(bundle.model, bundle.chain, 500; progress=false)
 
 ---
 
-### Example 4: Modular Hierarchical DAG Pipeline & Surface Derivatives
+### Example 5: Modular Hierarchical DAG Pipeline & Surface Derivatives
 
 Execute a multi-tier ecological workflow with analytical surface derivatives, cross-mesh resharding, Errors-in-Variables priors, and DuckDB table persistence. This was the `aegis` workflow, but with `bstm` and some major enhancements enabled by the Julia ecosystem.
 

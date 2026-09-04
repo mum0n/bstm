@@ -49,6 +49,45 @@ function get_component_structure(component)::Symbol
 end
 
 """
+    is_param_shared(shared_spec, param_sym::Symbol)::Bool
+
+Determines whether a model hyperparameter or latent component is shared across
+outcomes in a multivariate model.
+
+# Mathematical & Design Logic
+In multivariate BSTM formulations with \$K\$ outcomes, parameters may either vary
+independently per outcome (\$k \\in \\{1, \\dots, K\\}\$) or be shared across all
+outcomes to enforce parsimony or joint structure.
+
+The `shared_spec` argument supports fine-grained control:
+- `true`: All parameters of the component are shared across outcomes.
+- `false`: All parameters of the component vary per outcome.
+- `:all`: Alias for `true`.
+- `Symbol` (e.g. `:sigma`): Only the matching parameter symbol is shared.
+- `AbstractVector` or `Tuple` of Symbols/Strings (e.g. `[:sigma, :range]`): Only the
+  specified parameter names in the collection are shared.
+
+# Arguments
+- `shared_spec`: Sharing configuration (`Bool`, `Symbol`, or collection of `Symbol`s).
+- `param_sym::Symbol`: The parameter name being checked (e.g., `:sigma`, `:rho`).
+
+# Returns
+- `Bool`: `true` if `param_sym` is shared across outcomes, `false` otherwise.
+"""
+function is_param_shared(shared_spec, param_sym::Symbol)::Bool
+    if shared_spec isa Bool
+        return shared_spec
+    elseif shared_spec isa Symbol
+        return shared_spec == :all || shared_spec == param_sym
+    elseif shared_spec isa AbstractVector || shared_spec isa Tuple
+        spec_syms = Symbol.(shared_spec)
+        return :all in spec_syms || param_sym in spec_syms
+    else
+        return false
+    end
+end
+
+"""
     _get_varname_symbol(vn)::Symbol
 
 Extracts the base Symbol from a `DynamicPPL.VarName` or `Symbol` across DynamicPPL and
@@ -177,8 +216,8 @@ struct UnknownArchitecture <: AbstractModelArchitecture end
 
 
 const BSTM_MODULE_KEYWORDS = Set([ 
-    :intercept, :fixed, :mixed, :random, :nested, :eigen, :dynamics, :movement,
-    :pointprocess, :custom, :zscore, :log, :center, :scale, :sciml
+    :intercept, :fixed, :mixed, :random, :nested, :transfer, :fidelity, :eigen,
+    :dynamics, :movement, :pointprocess, :custom, :zscore, :log, :center, :scale, :sciml
 ])
   
 const TRANSFORMATION_FUNCTIONS = Set([:zscore, :log, :center, :scale])
@@ -221,7 +260,10 @@ const PC_PRIORS = Dict(
     "phase" => Beta(1, 1),
     "pca_sd" => Exponential(1.0), 
     "pdef_sd" => Exponential(1.0),
-    "range" => InverseGamma(3,3)
+    "range" => InverseGamma(3,3),
+    "velocity" => truncated(Normal(0.2, 0.2), 0.0, 0.95),
+    "diffusion" => truncated(Normal(0.1, 0.2), 0.0, Inf),
+    "gamma" => Normal(1.0, 1.0)
 )
 
 const INFORMATIVE_PRIORS = Dict(
@@ -235,7 +277,10 @@ const INFORMATIVE_PRIORS = Dict(
     "phase" => Beta(2, 2),
     "pca_sd" => Exponential(0.5), 
     "pdef_sd" => Exponential(0.5),
-    "range" => InverseGamma(5,5)
+    "range" => InverseGamma(5,5),
+    "velocity" => truncated(Normal(0.2, 0.1), 0.0, 0.95),
+    "diffusion" => truncated(Normal(0.1, 0.1), 0.0, Inf),
+    "gamma" => Normal(1.0, 0.5)
 )
 
 const UNINFORMATIVE_PRIORS = Dict(
@@ -249,7 +294,10 @@ const UNINFORMATIVE_PRIORS = Dict(
     "phase" => Uniform(0, 1),
     "pca_sd" => Normal(0, 1e6), 
     "pdef_sd" => Normal(0, 1e6),
-    "range" => InverseGamma(0.01, 0.01)
+    "range" => InverseGamma(0.01, 0.01),
+    "velocity" => Uniform(0.0, 0.95),
+    "diffusion" => truncated(Normal(0.0, 10.0), 0.0, Inf),
+    "gamma" => Normal(0.0, 10.0)
 )
 
 

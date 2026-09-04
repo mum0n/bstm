@@ -7,7 +7,7 @@ if !@isdefined(bstm_Likelihood)
 end
 
 @testset "Formulaic Interface & Model Instantiation" begin
-    p_dummy, _ = bstm.bstm_data("scottish_lip")
+    p_dummy = bstm.bstm_data("scottish_lip")
     dummy_df = p_dummy.data
     W_test = p_dummy.au.W
 
@@ -38,7 +38,7 @@ end
 end
 
 @testset "Integration Tests: Smoke Tests" begin
-    p_smoke, _ = bstm.bstm_data("scottish_lip")
+    p_smoke = bstm.bstm_data("scottish_lip")
     sim_df = p_smoke.data
     W_smoke = p_smoke.au.W
 
@@ -73,7 +73,7 @@ end
 end
 
 @testset "Complex Integration Tests" begin
-    p_cplx, _ = bstm.bstm_data("scottish_lip")
+    p_cplx = bstm.bstm_data("scottish_lip")
     data = p_cplx.data
     W = p_cplx.au.W
 
@@ -100,7 +100,9 @@ end
 
     @testset "Multifidelity Signal Transfer" begin
         df_hi = copy(data)
-        if !hasproperty(df_hi, :t_idx); df_hi[!, :t_idx] = df_hi[!, :year]; end
+        if !hasproperty(df_hi, :t_idx)
+            df_hi[!, :t_idx] = df_hi[!, :year]
+        end
         W_mf = W
         df_lo = select(df_hi, :proxy_val => :y_low, :s_idx, :t_idx)
 
@@ -119,7 +121,9 @@ end
 
     @testset "Prediction Engine" begin
         train_df = copy(data)
-        if !hasproperty(train_df, :t_idx); train_df[!, :t_idx] = train_df[!, :year]; end
+        if !hasproperty(train_df, :t_idx)
+            train_df[!, :t_idx] = train_df[!, :year]
+        end
         W_train = W
         
         centroids_matrix = reduce(hcat, [[c[1], c[2]] for c in p_cplx.au.centroids])

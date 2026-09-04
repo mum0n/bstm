@@ -43,37 +43,140 @@ Version: v1.0.0
 Computes the spatial interpolation / resharding matrix \$P \\in \\mathbb{R}^{n_{\\text{dest}} \\times n_{\\text{src}}}\$
 between two areal unit spatial partitions.
 
-Uses polygon geometric area-overlap weighting when available, falling back to
-k-nearest inverse-distance-weighted (IDW) centroid mapping.
+Uses polygon geometric area-overlap weighting via `LibGEOS.intersection` when polygons
+are available, with automated coordinate alignment, AABB envelope pre-filtering, and
+row-stochastic normalization. Falls back to k-nearest inverse-distance-weighted (IDW)
+centroid mapping if geometries are absent.
 """
-function compute_network_transfer_matrix(au_src::NamedTuple, au_dest::NamedTuple)
-    n_src = length(au_src.centroids)
-    n_dest = length(au_dest.centroids)
+function compute_network_transfer_matrix(
+    au_src::NamedTuple,
+    au_dest::NamedTuple;
+    method::Symbol = :area_weighted,
+    kwargs...
+)
+    _extract_cents(au) = if hasproperty(au, :centroids) && !isnothing(au.centroids)
+        au.centroids
+    elseif hasproperty(au, :centroids_lonlat) && !isnothing(au.centroids_lonlat)
+        au.centroids_lonlat
+    elseif hasproperty(au, :centroids_km) && !isnothing(au.centroids_km)
+        au.centroids_km
+    else
+        error("Areal unit partition has no centroids field.")
+    end
 
-    if n_src == n_dest && au_src.centroids == au_dest.centroids
+    src_cents = _extract_cents(au_src)
+    dest_cents = _extract_cents(au_dest)
+    n_src = length(src_cents)
+    n_dest = length(dest_cents)
+
+    if n_src == n_dest && src_cents == dest_cents
         return spdiagm(0 => ones(Float64, n_dest))
     end
 
-    # 1. Try Geometric Polygon Overlap if LibGEOS polygons are available
-    has_polys = hasproperty(au_src, :polygons) && hasproperty(au_dest, :polygons) &&
-                !isempty(au_src.polygons) && !isempty(au_dest.polygons)
+    # Determine coordinate scale (geographic degrees vs projected planar meters/km)
+    is_geo_coords(pts) = !isempty(pts) && all(abs(c[1]) <= 180.5 && abs(c[2]) <= 90.5 for c in pts)
+    src_is_geo = is_geo_coords(src_cents)
 
-    if has_polys
+    resolve_au_geom(au, ref_geo) = begin
+        if ref_geo && hasproperty(au, :polygons_lonlat) && !isempty(au.polygons_lonlat)
+            cents = hasproperty(au, :centroids_lonlat) ? au.centroids_lonlat : _extract_cents(au)
+            return (polygons = au.polygons_lonlat, centroids = cents)
+        elseif !ref_geo && hasproperty(au, :polygons_km) && !isempty(au.polygons_km)
+            cents = hasproperty(au, :centroids_km) ? au.centroids_km : _extract_cents(au)
+            return (polygons = au.polygons_km, centroids = cents)
+        elseif hasproperty(au, :polygons) && !isempty(au.polygons)
+            cents = _extract_cents(au)
+            return (polygons = au.polygons, centroids = cents)
+        else
+            return (polygons = Vector{Vector{Tuple{Float64, Float64}}}(), centroids = _extract_cents(au))
+        end
+    end
+
+    geom_src = resolve_au_geom(au_src, src_is_geo)
+    geom_dest = resolve_au_geom(au_dest, src_is_geo)
+
+    has_polys = !isempty(geom_src.polygons) && !isempty(geom_dest.polygons) &&
+                length(geom_src.polygons) == n_src && length(geom_dest.polygons) == n_dest
+
+    if has_polys && method != :centroid_idw && method != :idw
         try
+            # Helper to create valid closed LibGEOS Polygon
+            function _to_libgeos_valid_polygon(poly_coords)
+                if isempty(poly_coords) || length(poly_coords) < 3
+                    return nothing
+                end
+                pts = [[Float64(pt[1]), Float64(pt[2])] for pt in poly_coords if !isnan(pt[1]) && !isnan(pt[2])]
+                if length(pts) < 3
+                    return nothing
+                end
+                if pts[1] != pts[end]
+                    push!(pts, pts[1])
+                end
+                if length(pts) < 4
+                    return nothing
+                end
+                try
+                    lg_p = LibGEOS.Polygon([pts])
+                    if !LibGEOS.isValid(lg_p)
+                        lg_p = LibGEOS.buffer(lg_p, 0.0)
+                    end
+                    return lg_p
+                catch
+                    return nothing
+                end
+            end
+
+            src_lg_polys = [_to_libgeos_valid_polygon(p) for p in geom_src.polygons]
+            dest_lg_polys = [_to_libgeos_valid_polygon(p) for p in geom_dest.polygons]
+
+            # Pre-compute Axis-Aligned Bounding Boxes (AABB) for fast candidate filtering
+            src_bboxes = Vector{Tuple{Float64, Float64, Float64, Float64}}(undef, n_src)
+            for i in 1:n_src
+                p = geom_src.polygons[i]
+                xs = [pt[1] for pt in p if !isnan(pt[1])]
+                ys = [pt[2] for pt in p if !isnan(pt[2])]
+                if isempty(xs) || isempty(ys)
+                    src_bboxes[i] = (0.0, 0.0, 0.0, 0.0)
+                else
+                    src_bboxes[i] = (minimum(xs), maximum(xs), minimum(ys), maximum(ys))
+                end
+            end
+
             P = spzeros(Float64, n_dest, n_src)
-            src_lg_polys = [LibGEOS.Polygon([[[pt[1], pt[2]] for pt in p]]) for p in au_src.polygons]
-            dest_lg_polys = [LibGEOS.Polygon([[[pt[1], pt[2]] for pt in p]]) for p in au_dest.polygons]
+            all_valid = true
 
             for j in 1:n_dest
                 dest_p = dest_lg_polys[j]
-                dest_area = get_polygon_area(au_dest.polygons[j])
+                if dest_p === nothing
+                    all_valid = false
+                    break
+                end
+                dest_area = get_polygon_area(geom_dest.polygons[j])
                 if dest_area <= 1e-9
                     continue
                 end
 
+                dp = geom_dest.polygons[j]
+                d_xs = [pt[1] for pt in dp if !isnan(pt[1])]
+                d_ys = [pt[2] for pt in dp if !isnan(pt[2])]
+                if isempty(d_xs) || isempty(d_ys)
+                    continue
+                end
+                d_min_x, d_max_x = minimum(d_xs), maximum(d_xs)
+                d_min_y, d_max_y = minimum(d_ys), maximum(d_ys)
+
                 total_overlap = 0.0
                 for i in 1:n_src
                     src_p = src_lg_polys[i]
+                    src_p === nothing && continue
+
+                    # AABB Disjoint Rejection Test
+                    s_min_x, s_max_x, s_min_y, s_max_y = src_bboxes[i]
+                    if d_min_x > s_max_x || d_max_x < s_min_x ||
+                       d_min_y > s_max_y || d_max_y < s_min_y
+                        continue
+                    end
+
                     if LibGEOS.intersects(dest_p, src_p)
                         inter_geom = LibGEOS.intersection(dest_p, src_p)
                         if !LibGEOS.isEmpty(inter_geom)
@@ -87,24 +190,30 @@ function compute_network_transfer_matrix(au_src::NamedTuple, au_dest::NamedTuple
                     end
                 end
 
-                # Normalize row if partial overlap
+                # Normalize row if overlapping area is detected
                 if total_overlap > 1e-6
                     P[j, :] ./= total_overlap
+                else
+                    # Fallback for peripheral destination cells outside source envelope:
+                    # Assign full mass to nearest source centroid
+                    c_j = geom_dest.centroids[j]
+                    dists = [hypot(c_j[1] - geom_src.centroids[i][1], c_j[2] - geom_src.centroids[i][2]) for i in 1:n_src]
+                    nearest_i = argmin(dists)
+                    P[j, nearest_i] = 1.0
                 end
             end
 
-            # If all rows have valid weights, return geometric transfer matrix
-            if all(sum(P, dims=2) .> 0.5)
+            if all_valid && all(sum(P, dims=2) .> 0.99)
                 return P
             end
-        catch
-            # Fall back to centroid IDW if geometry intersection fails
+        catch err
+            # Fall back to centroid IDW if geometric intersection encounters unexpected errors
         end
     end
 
     # 2. Centroid Inverse Distance Weighting (k-d Tree Fallback)
-    src_coords = hcat([[c[1], c[2]] for c in au_src.centroids]...)
-    dest_coords = hcat([[c[1], c[2]] for c in au_dest.centroids]...)
+    src_coords = hcat([[c[1], c[2]] for c in src_cents]...)
+    dest_coords = hcat([[c[1], c[2]] for c in dest_cents]...)
 
     kdtree = KDTree(src_coords)
     k_nn = min(4, n_src)
@@ -139,80 +248,140 @@ function summarize_sample_matrix(samples::AbstractMatrix{<:Real}; alpha::Real=0.
     n_units, n_samples = size(samples)
     means = vec(Statistics.mean(samples, dims=2))
     stds = vec(Statistics.std(samples, dims=2))
-    lowers = zeros(Float64, n_units)
-    uppers = zeros(Float64, n_units)
-    medians = zeros(Float64, n_units)
-    for i in 1:n_units
-        row_vals = view(samples, i, :)
-        lowers[i] = quantile(row_vals, alpha / 2.0)
-        uppers[i] = quantile(row_vals, 1.0 - alpha / 2.0)
-        medians[i] = median(row_vals)
-    end
+    medians = [quantile(samples[i, :], 0.5) for i in 1:n_units]
+    lowers = [quantile(samples[i, :], alpha / 2.0) for i in 1:n_units]
+    uppers = [quantile(samples[i, :], 1.0 - alpha / 2.0) for i in 1:n_units]
+
     return (
         mean = means,
         median = medians,
         std = stds,
         lower = lowers,
         upper = uppers,
-        samples = Matrix{Float64}(samples)
+        samples = samples
     )
 end
 
 """
     reshard_spatial_field(values::AbstractArray, au_src::NamedTuple, au_dest::NamedTuple)
+    reshard_spatial_field(vectors::Tuple, au_src::NamedTuple, au_dest::NamedTuple)
+    reshard_spatial_field(nt::NamedTuple, au_src::NamedTuple, au_dest::NamedTuple)
     reshard_spatial_field(summary::NamedTuple, au_src::NamedTuple, au_dest::NamedTuple; mode::Symbol=:samples, alpha::Real=0.05)
 
 Reshards a spatial field from source network `au_src` to destination network `au_dest`.
 
-# Modes
-- **Full Monte Carlo Matrix Resharding** (`mode=:samples` or when passing a 2D matrix `[N_src × S]`):
-  Transfers all posterior draws directly via linear transfer operator:
-  \$U_{\\text{dest}} = P U_{\\text{src}} \\in \\mathbb{R}^{N_{\\text{dest}} \\times S}\$
-  and computes empirical non-Gaussian credible intervals without variance distortion.
-- **Simplistic Moment-Matching Resharding** (`mode=:moments`):
-  Transfers only the first two moments:
-  \$\\mathbf{u}_{\\text{dest}} = P \\mathbf{u}_{\\text{src}}, \\quad \\boldsymbol{\\sigma}_{\\text{dest}} = \\sqrt{P \\boldsymbol{\\sigma}^2_{\\text{src}}}\$
+# Mathematical Formulation
+For intensive physical and environmental variables, the resharding operator evaluates:
+```math
+\\mathbf{u}_{\\text{dest}} = P \\mathbf{u}_{\\text{src}}
+```
+where \$P \\in \\mathbb{R}^{n_{\\text{dest}} \\times n_{\\text{src}}}\$ is the area-overlap
+transfer matrix computed by `compute_network_transfer_matrix`.
+
+# Multi-Dimensional Support:
+- 1D vector: \$S_{\\text{src}} \\to S_{\\text{dest}}\$
+- 2D matrix: \$S_{\\text{src}} \\times N_z \\to S_{\\text{dest}} \\times N_z\$
+- 3D array: \$S_{\\text{src}} \\times N_z \\times N_t \\to S_{\\text{dest}} \\times N_z \\times N_t\$
+- Vector tuples: e.g. `(u, v)` or `(u, v, w)` resharded simultaneously
+- Field bundles: `NamedTuple` of fields resharded in a unified call
 """
 function reshard_spatial_field(
-    values::AbstractArray{<:Real}, au_src::NamedTuple, au_dest::NamedTuple
+    P::AbstractMatrix{<:Real},
+    values::AbstractArray{<:Real}
 )
-    P = compute_network_transfer_matrix(au_src, au_dest)
-    if ndims(values) == 1
+    nd = ndims(values)
+    if nd == 1
         return Vector{Float64}(P * values)
-    else
+    elseif nd == 2
         return Matrix{Float64}(P * values)
+    elseif nd == 3
+        s1, s2, s3 = size(values)
+        flat = reshape(values, s1, s2 * s3)
+        res_flat = Matrix{Float64}(P * flat)
+        return reshape(res_flat, size(P, 1), s2, s3)
+    else
+        error("Unsupported array dimensionality ($nd) for reshard_spatial_field.")
     end
 end
 
 function reshard_spatial_field(
-    summary::NamedTuple, au_src::NamedTuple, au_dest::NamedTuple;
-    mode::Symbol=:samples, alpha::Real=0.05
+    P::AbstractMatrix{<:Real},
+    vectors::Tuple{Vararg{AbstractArray{<:Real}}}
+)
+    return map(arr -> reshard_spatial_field(P, arr), vectors)
+end
+
+function reshard_spatial_field(
+    P::AbstractMatrix{<:Real},
+    nt_or_summary::NamedTuple;
+    mode::Symbol = :samples,
+    alpha::Real = 0.05
+)
+    is_summary = hasproperty(nt_or_summary, :mean) && hasproperty(nt_or_summary, :std)
+
+    if is_summary
+        if mode in [:samples, :full_mc, :matrix] && hasproperty(nt_or_summary, :samples) &&
+           !isnothing(nt_or_summary.samples) && nt_or_summary.samples isa AbstractMatrix
+            U_dest = Matrix{Float64}(P * nt_or_summary.samples)
+            return summarize_sample_matrix(U_dest; alpha=alpha)
+        end
+
+        mean_resharded = Vector{Float64}(P * nt_or_summary.mean)
+        sd_resharded = Vector{Float64}(sqrt.(P * (nt_or_summary.std .^ 2)))
+        lower_resharded = Vector{Float64}(P * nt_or_summary.lower)
+        upper_resharded = Vector{Float64}(P * nt_or_summary.upper)
+        median_resharded = hasproperty(nt_or_summary, :median) ?
+            Vector{Float64}(P * nt_or_summary.median) : mean_resharded
+
+        return (
+            mean = mean_resharded,
+            median = median_resharded,
+            std = sd_resharded,
+            lower = lower_resharded,
+            upper = upper_resharded,
+            samples = nothing
+        )
+    else
+        res_pairs = Pair{Symbol, Any}[]
+        n_src_expected = size(P, 2)
+        for (k, v) in pairs(nt_or_summary)
+            if v isa AbstractArray{<:Real} && size(v, 1) == n_src_expected
+                push!(res_pairs, k => reshard_spatial_field(P, v))
+            elseif v isa Tuple && all(x -> x isa AbstractArray{<:Real} && size(x, 1) == n_src_expected, v)
+                push!(res_pairs, k => map(x -> reshard_spatial_field(P, x), v))
+            else
+                push!(res_pairs, k => v)
+            end
+        end
+        return NamedTuple(res_pairs)
+    end
+end
+
+function reshard_spatial_field(
+    values::AbstractArray{<:Real}, au_src::NamedTuple, au_dest::NamedTuple
 )
     P = compute_network_transfer_matrix(au_src, au_dest)
+    return reshard_spatial_field(P, values)
+end
 
-    # 1. Full Monte Carlo Matrix Resharding (if sample matrix is available and requested)
-    if mode in [:samples, :full_mc, :matrix] && hasproperty(summary, :samples) &&
-       !isnothing(summary.samples) && summary.samples isa AbstractMatrix
-        U_dest = Matrix{Float64}(P * summary.samples)
-        return summarize_sample_matrix(U_dest; alpha=alpha)
-    end
+function reshard_spatial_field(
+    vectors::Tuple{Vararg{AbstractArray{<:Real}}},
+    au_src::NamedTuple,
+    au_dest::NamedTuple
+)
+    P = compute_network_transfer_matrix(au_src, au_dest)
+    return reshard_spatial_field(P, vectors)
+end
 
-    # 2. Simplistic Moment-Matching Resharding (Fallback or Explicit Mode)
-    mean_resharded = Vector{Float64}(P * summary.mean)
-    sd_resharded = Vector{Float64}(sqrt.(P * (summary.std .^ 2)))
-    lower_resharded = Vector{Float64}(P * summary.lower)
-    upper_resharded = Vector{Float64}(P * summary.upper)
-    median_resharded = hasproperty(summary, :median) ?
-        Vector{Float64}(P * summary.median) : mean_resharded
-
-    return (
-        mean = mean_resharded,
-        median = median_resharded,
-        std = sd_resharded,
-        lower = lower_resharded,
-        upper = upper_resharded,
-        samples = nothing
-    )
+function reshard_spatial_field(
+    nt_or_summary::NamedTuple,
+    au_src::NamedTuple,
+    au_dest::NamedTuple;
+    mode::Symbol = :samples,
+    alpha::Real = 0.05
+)
+    P = compute_network_transfer_matrix(au_src, au_dest)
+    return reshard_spatial_field(P, nt_or_summary; mode=mode, alpha=alpha)
 end
 
 # ==============================================================================
@@ -405,7 +574,7 @@ function bstm_pipeline(
         # wrap in trampoline
         
         function _sample_tier_model(m, sampler, n_samples)
-            return sample(m, sampler, n_samples; progress=false)
+            return Base.invokelatest(sample, m, sampler, n_samples; progress=false)
         end
  
         m_tier = if !isnothing(cur_W)

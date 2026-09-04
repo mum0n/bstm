@@ -464,6 +464,7 @@ println("BYM2 Scaling Factor: $(scaling_factor_bym2(au.W))")
 
 # 3. Visualize spatial graph
 p = spatial_graph_plot(au=au, title="16 Hexagonal Spatial Units")
+
 ```
 
 ---

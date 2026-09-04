@@ -101,4 +101,27 @@ end
     au_min_area = bstm.assign_spatial_units(sx, sy; area_method=:hexagonal,
         target_units=10, min_area=2.0, merge_small_polygons=true)
     @test all(a -> a >= 2.0 || isapprox(a, 2.0; atol=1e-3), au_min_area.areas)
+
+    # 8. Hexagonal Gridding Unaggregated Regular Polygons & Observation Preservation
+    rng_hex = MersenneTwister(42)
+    n_hex = 300
+    df_hex = DataFrame(
+        lon = rand(rng_hex, n_hex) .* 100.0,
+        lat = rand(rng_hex, n_hex) .* 50.0
+    )
+    au_hex = bstm.assign_spatial_units(df_hex;
+        x = :lon,
+        y = :lat,
+        area_method = :hexagonal,
+        target_units = 16,
+        exact_units = true,
+        radius = 10.0,
+        merge_small_polygons = true
+    )
+    @test au_hex.n_units == 16
+    for p in au_hex.polygons
+        @test length(p) == 7  # 6 vertices + 1 closed coordinate for regular hexagon
+    end
+    @test length(au_hex.s_idx) == n_hex
+    @test extrema(au_hex.s_idx) == (1, 16)
 end

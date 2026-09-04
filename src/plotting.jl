@@ -101,35 +101,63 @@ Prevents observation index fallback (e.g. 1:560) when time units range across 1:
   calendar years.
 """
 function _resolve_temporal_coordinates(M, input_data, tm_len::Int, comp_key=nothing)
-    # 1. Search in input_data if available
-    if !isnothing(input_data) && input_data isa DataFrame
+    # 0. Check domain_values or t_values directly inside M
+    if !isnothing(M) && hasproperty(M, :domain_values) && !isnothing(comp_key)
+        d_dict = M.domain_values
+        if d_dict isa AbstractDict && haskey(d_dict, Symbol(comp_key))
+            d_vals = d_dict[Symbol(comp_key)]
+            if length(d_vals) == tm_len
+                t_lbl = (Symbol(comp_key) == :t_idx) ? "Time Index" : (Symbol(comp_key) == :year ? "Year" : string(comp_key))
+                return (raw_t = d_vals, unique_t = sort(unique(d_vals)), label = t_lbl)
+            end
+        end
+    end
+
+    if !isnothing(M) && hasproperty(M, :t_values) && !isnothing(M.t_values)
+        if length(M.t_values) == tm_len
+            t_lbl = haskey(M, :t_idx_var) ? (M.t_idx_var == :year ? "Year" : string(M.t_idx_var)) : "Year"
+            return (raw_t = M.t_values, unique_t = sort(unique(M.t_values)), label = t_lbl)
+        end
+    end
+
+    # 1. Search in input_data or M.data if available
+    df_to_check = if !isnothing(input_data) && input_data isa DataFrame
+        input_data
+    elseif !isnothing(M) && hasproperty(M, :data) && !isnothing(M.data) && M.data isa DataFrame
+        M.data
+    else
+        nothing
+    end
+
+    if !isnothing(df_to_check)
         candidates = Symbol[]
         if !isnothing(comp_key)
             push!(candidates, Symbol(comp_key))
         end
-        if haskey(M, :t_idx_var) && !isnothing(M.t_idx_var)
+        if !isnothing(M) && haskey(M, :t_idx_var) && !isnothing(M.t_idx_var)
             push!(candidates, Symbol(M.t_idx_var))
         end
         append!(candidates, [:year, :time, :date, :month, :t_idx, :t, :day, :period])
 
         for cand in unique(candidates)
-            if hasproperty(input_data, cand)
-                col_data = input_data[!, cand]
-                if length(col_data) == tm_len
-                    unique_t = sort(unique(col_data))
-                    t_lbl = (cand == :t_idx) ? "Time Index" : (cand == :year ? "Year" : string(cand))
-                    return (raw_t = col_data, unique_t = unique_t, label = t_lbl)
-                elseif length(unique(col_data)) == tm_len
-                    unique_t = sort(unique(col_data))
-                    t_lbl = (cand == :t_idx) ? "Time Index" : (cand == :year ? "Year" : string(cand))
-                    return (raw_t = unique_t, unique_t = unique_t, label = t_lbl)
+            if hasproperty(df_to_check, cand)
+                col_data = df_to_check[!, cand]
+                u_vals = sort(unique(col_data))
+                t_lbl = (cand == :t_idx) ? "Time Index" : (cand == :year ? "Year" : string(cand))
+                if length(u_vals) == tm_len
+                    return (raw_t = u_vals, unique_t = u_vals, label = t_lbl)
+                elseif length(col_data) == tm_len
+                    return (raw_t = col_data, unique_t = u_vals, label = t_lbl)
+                elseif tm_len > 1 && eltype(col_data) <: Number
+                    grid_vals = collect(range(minimum(col_data), maximum(col_data), length=tm_len))
+                    return (raw_t = grid_vals, unique_t = grid_vals, label = t_lbl)
                 end
             end
         end
     end
 
     # 2. Check M.t_idx
-    if haskey(M, :t_idx) && !isnothing(M.t_idx) && !isempty(M.t_idx)
+    if !isnothing(M) && haskey(M, :t_idx) && !isnothing(M.t_idx) && !isempty(M.t_idx)
         t_vec = M.t_idx
         if length(t_vec) == tm_len
             unique_t = sort(unique(t_vec))
@@ -142,15 +170,22 @@ function _resolve_temporal_coordinates(M, input_data, tm_len::Int, comp_key=noth
         end
     end
 
-    # 3. Check M.t_N (number of time steps)
-    if haskey(M, :t_N) && M.t_N > 0
+    # 3. Check M.t_values with interpolation if length matches tm_len
+    if !isnothing(M) && hasproperty(M, :t_values) && !isnothing(M.t_values) && tm_len > 1
+        tv = M.t_values
+        grid_vals = collect(range(minimum(tv), maximum(tv), length=tm_len))
+        t_lbl = haskey(M, :t_idx_var) ? string(M.t_idx_var) : "Year"
+        return (raw_t = grid_vals, unique_t = grid_vals, label = t_lbl)
+    end
+
+    # 4. Check M.t_N (number of time steps)
+    if !isnothing(M) && haskey(M, :t_N) && M.t_N > 0
         t_N = M.t_N
         unique_t = collect(1:t_N)
         t_lbl = haskey(M, :t_idx_var) ? string(M.t_idx_var) : "Time Index"
         if tm_len == t_N
             return (raw_t = unique_t, unique_t = unique_t, label = t_lbl)
         elseif haskey(M, :s_N) && M.s_N > 0 && tm_len == M.s_N * t_N
-            # Scottish lip cancer / regular space-time layout: time index cycles across units
             raw_t = [(i - 1) % t_N + 1 for i in 1:tm_len]
             return (raw_t = raw_t, unique_t = unique_t, label = t_lbl)
         elseif tm_len % t_N == 0
@@ -159,9 +194,9 @@ function _resolve_temporal_coordinates(M, input_data, tm_len::Int, comp_key=noth
         end
     end
 
-    # 4. Fallback: integer sequence
+    # 5. Fallback: integer sequence
     unique_t = collect(1:tm_len)
-    return (raw_t = unique_t, unique_t = unique_t, label = "Time Index")
+    return (raw_t = unique_t, unique_t = unique_t, label = !isnothing(comp_key) ? string(comp_key) : "Time Index")
 end
 
 
@@ -1843,15 +1878,22 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
 
                 if length(vars) == 1 # 1D smooth
                     var_sym = Symbol(vars[1])
+                    cov_data = nothing
                     if !isnothing(cov_df) && hasproperty(cov_df, var_sym)
                         cov_data = cov_df[!, var_sym]
-                        sm, sl, su = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-                        
+                    elseif !isnothing(M) && hasproperty(M, :domain_values) && haskey(M.domain_values, var_sym)
+                        cov_data = M.domain_values[var_sym]
+                    elseif !isnothing(M) && hasproperty(M, Symbol("$(var_sym)_values"))
+                        cov_data = getproperty(M, Symbol("$(var_sym)_values"))
+                    end
+
+                    sm, sl, su = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
+
+                    if !isnothing(cov_data) && !isempty(cov_data)
                         if length(cov_data) == length(sm)
                             unique_cov = sort(unique(cov_data))
                             
-                            # If there are duplicate covariate values (e.g. repeated
-                            #   space-time observations)
+                            # If there are duplicate covariate values (e.g. repeated space-time observations)
                             if length(unique_cov) < length(sm) && length(unique_cov) > 1
                                 sm_mean = [mean(sm[cov_data .== x]) for x in unique_cov]
                                 sm_low  = [mean(sl[cov_data .== x]) for x in unique_cov]
@@ -1868,24 +1910,36 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
                                     sl[p_order], su[p_order]; color=:darkorange,
                                     title="Smooth Effect: $var_sym", xlabel=string(var_sym))
                                 smooth_effects_plots[var_sym] = p_sm
-                                smooth_effects_plots_data[var_sym] = (covariate_values=cov_data[p_order], mean=sm[p_order], lower=sl[p_order], upper=su[p_order])
+                                smooth_effects_plots_data[var_sym] = (covariate_values=cov_data[p_order],
+                                    mean=sm[p_order], lower=sl[p_order], upper=su[p_order])
                             end
-                            
-                            plots[Symbol("smooth_$(var_sym)")] = p_sm
-                            if !haskey(plots, :smooth)
-                                plots[:smooth] = p_sm
+                        else
+                            # sm represents smooth curve across knots or discretized bins
+                            u_cov = sort(unique(cov_data))
+                            cov_grid = if length(u_cov) == length(sm)
+                                u_cov
+                            elseif length(cov_data) > 1
+                                collect(range(minimum(cov_data), maximum(cov_data), length=length(sm)))
+                            else
+                                collect(1:length(sm))
                             end
+                            p_sm = timeseries_ci(cov_grid, sm, sl, su;
+                                color=:darkorange, title="Smooth Effect: $var_sym",
+                                xlabel=string(var_sym))
+                            smooth_effects_plots[var_sym] = p_sm
+                            smooth_effects_plots_data[var_sym] = (covariate_values=cov_grid,
+                                mean=sm, lower=sl, upper=su)
                         end
                     else
-                        sm, sl, su = vec(main_effect_summary.mean), vec(main_effect_summary.lower), vec(main_effect_summary.upper)
-                        p_order = sortperm(sm)
-                        p_sm = timeseries_ci(1:length(sm), sm[p_order], sl[p_order], su[p_order]; color=:darkorange, title="Smooth Effect: $var_sym", xlabel="Covariate Index")
+                        p_sm = timeseries_ci(1:length(sm), sm, sl, su;
+                            color=:darkorange, title="Smooth Effect: $var_sym", xlabel=string(var_sym))
                         smooth_effects_plots[var_sym] = p_sm
-                        smooth_effects_plots_data[var_sym] = (covariate_values=1:length(sm), mean=sm[p_order], lower=sl[p_order], upper=su[p_order])
-                        plots[Symbol("smooth_$(var_sym)")] = p_sm
-                        if !haskey(plots, :smooth)
-                            plots[:smooth] = p_sm
-                        end
+                        smooth_effects_plots_data[var_sym] = (covariate_values=1:length(sm),
+                            mean=sm, lower=sl, upper=su)
+                    end
+                    plots[Symbol("smooth_$(var_sym)")] = p_sm
+                    if !haskey(plots, :smooth)
+                        plots[:smooth] = p_sm
                     end
                 elseif length(vars) == 2 # 2D smooth (interaction)
                     var1_sym, var2_sym = Symbol(vars[1]), Symbol(vars[2])
@@ -2220,11 +2274,12 @@ function bstm_plots(res::NamedTuple; au=nothing, data=nothing, outcome=1, save_d
     save_prefix="", fmt="png", dpi=150)
     model = get(res, :model, nothing)
     chain = get(res, :chain, nothing)
-    M = !isnothing(model) && hasproperty(model, :args) && hasproperty(model.args,
-        :M) ? model.args.M : NamedTuple()
+    M = hasproperty(res, :M) && !isnothing(res.M) ? res.M :
+        (!isnothing(model) && hasproperty(model, :args) && hasproperty(model.args, :M) ? model.args.M : NamedTuple())
     au_to_use = !isnothing(au) ? au : get(res, :au, nothing)
-    data_to_use = !isnothing(data) ? data : (!isnothing(model) && hasproperty(model,
-        :args) && hasproperty(model.args, :M) ? get(model.args.M, :data, nothing) : nothing)
+    data_to_use = !isnothing(data) ? data :
+        (hasproperty(res, :data) && !isnothing(res.data) ? res.data :
+        (!isnothing(model) && hasproperty(model, :args) && hasproperty(model.args, :M) ? get(model.args.M, :data, nothing) : nothing))
     
     plot_res = _bstm_plots_impl(model, chain, res, M; au=au_to_use, data=data_to_use,
         outcome=outcome)
@@ -2291,3 +2346,526 @@ function model_results_plots(res)
     end
     println("--- End of Plots ---")
 end
+
+
+# -----------------------------------------------------------------------------
+# Section 8: Hydrodynamic Diagnostics & Hexagonal Spatial Visualizations
+# -----------------------------------------------------------------------------
+
+"""
+    _extract_polygons(au)
+
+Internal helper to robustly extract polygon vertex arrays from a collection,
+NamedTuple (`:polygons_lonlat`, `:polygons`, or `:polygons_km`), or Vector.
+"""
+function _extract_polygons(au)
+    if au isa AbstractVector
+        return au
+    elseif au isa NamedTuple
+        if hasproperty(au, :polygons_lonlat) && !isnothing(au.polygons_lonlat)
+            return au.polygons_lonlat
+        elseif hasproperty(au, :polygons) && !isnothing(au.polygons)
+            return au.polygons
+        elseif hasproperty(au, :polygons_km) && !isnothing(au.polygons_km)
+            return au.polygons_km
+        end
+    end
+    throw(ArgumentError(
+        "Could not extract polygons. Expected vector or NamedTuple with :polygons."
+    ))
+end
+
+"""
+    _extract_centroids(au)
+
+Internal helper to robustly extract centroid coordinates from a collection,
+NamedTuple (`:centroids_lonlat`, `:centroids`, or `:centroids_km`), or Vector.
+"""
+function _extract_centroids(au)
+    if au isa AbstractVector
+        return au
+    elseif au isa NamedTuple
+        if hasproperty(au, :centroids_lonlat) && !isnothing(au.centroids_lonlat)
+            return au.centroids_lonlat
+        elseif hasproperty(au, :centroids) && !isnothing(au.centroids)
+            return au.centroids
+        elseif hasproperty(au, :centroids_km) && !isnothing(au.centroids_km)
+            return au.centroids_km
+        end
+    end
+    throw(ArgumentError(
+        "Could not extract centroids. Expected vector or NamedTuple with :centroids."
+    ))
+end
+
+"""
+    plot_hexagonal_field(values, au; mode=:plots, cmap=:viridis, title="Hexagonal Field",
+                         colorbar_label=nothing, clims=nothing, center_zero=false, kwargs...)
+
+Renders a spatial scalar field across polygonal areal units, specifically designed
+for fine regular hexagonal lattices (such as those constructed via `build_hex_mesh_planar`).
+
+# Mathematical Background
+Let the spatial study domain \$\\Omega \\subset \\mathbb{R}^2\$ be partitioned into \$S\$
+discrete hexagonal cells \$\\{\\Omega_s\\}_{s=1}^S\$. Each cell boundary
+\$\\partial \\Omega_s = \\{(x_{s,k}, y_{s,k})\\}_{k=1}^{K_s}\$ is a regular polygon.
+For a given state vector \$\\mathbf{v} = (v_1, \\dots, v_S)^T\$, this function maps
+each cell's value \$v_s\$ through a continuous colormap transfer function:
+```math
+\\mathcal{C}(v_s) = \\mathrm{cmap}\\left(\\mathrm{clamp}\\left(
+    \\frac{v_s - v_{\\min}}{v_{\\max} - v_{\\min}}, 0, 1
+\\right)\\right)
+```
+where \$[v_{\\min}, v_{\\max}]\$ denotes the color saturation envelope or empirical quantiles.
+
+# Arguments
+- `values::AbstractVector{<:Real}`: Scalar field vector of length \$S\$, aligned with `au`.
+- `au`: Spatial areal units object (NamedTuple containing `:polygons`, `:polygons_lonlat`,
+  or `:polygons_km`, or directly a vector of polygon vertex lists).
+
+# Keyword Arguments
+- `mode::Symbol=:plots`: Visualization backend (`:plots` for static vector graphic,
+  `:leaflet` or `:html` for interactive web dashboard).
+- `cmap::Symbol=:viridis`: Colormap symbol (e.g., `:viridis`, `:haline`, `:thermal`, `:RdBu`).
+- `title::String="Hexagonal Spatial Field"`: Figure title.
+- `colorbar_label::Union{Nothing, String}=nothing`: Label for the colorbar axis.
+- `clims::Union{Nothing, Tuple{Real, Real}}=nothing`: Explicit value limits `(vmin, vmax)`.
+- `center_zero::Bool=false`: When `true`, symmetrically centers the colormap around zero.
+- `kwargs...`: Additional options forwarded to `_choropleth_impl` or `leaflet_choropleth`.
+
+# Returns
+- A `Plots.Plot` object (when `mode == :plots`) or `LeafletMap` (when `mode == :leaflet`).
+"""
+function plot_hexagonal_field(
+    values::AbstractVector{<:Real},
+    au;
+    mode::Symbol = :plots,
+    cmap::Symbol = :viridis,
+    title::String = "Hexagonal Spatial Field",
+    colorbar_label::Union{Nothing, String} = nothing,
+    clims = nothing,
+    center_zero::Bool = false,
+    kwargs...
+)
+    polys = _extract_polygons(au)
+    n_p = length(polys)
+    n_v = length(values)
+    if n_p != n_v
+        throw(DimensionMismatch(
+            "Dimension mismatch: length(values) ($n_v) != length(polygons) ($n_p)."
+        ))
+    end
+
+    if mode == :leaflet || mode == :html
+        return leaflet_choropleth(
+            polys, values; cmap=cmap, title=title, clims=clims, kwargs...
+        )
+    else
+        return _choropleth_impl(
+            polys, values; cmap=cmap, title=title,
+            colorbar_label=colorbar_label, clims=clims,
+            center_zero=center_zero, kwargs...
+        )
+    end
+end
+
+"""
+    plot_hydrodynamic_stratification(hydro_data, au; depth_level=1, mode=:plots,
+                                     title="Ocean Stratification Diagnostics", kwargs...)
+
+Generates multi-panel hydrographic stratification diagnostics, visualizing the
+squared Brunt-Väisälä buoyancy frequency (\$N^2\$), practical salinity (\$S\$), and
+representative vertical water-column profiles across depth levels.
+
+# Mathematical Background
+Hydrodynamic stability in the water column is governed by density stratification:
+```math
+N^2(z) = -\\frac{g}{\\rho_0} \\frac{\\partial \\rho}{\\partial z}
+```
+where \$g = 9.80665 \\,\\text{m/s}^2\$ is gravitational acceleration, \$\\rho_0 = 1025 \\,\\text{kg/m}^3\$
+is reference seawater density, and \$\\rho(S, T, z)\$ is computed via the UNESCO equation
+of state. Positive values \$N^2 > 0\$ indicate static pycnocline stability; near-zero values
+\$N^2 \\approx 0\$ indicate well-mixed surface or bottom boundary layers.
+
+# Arguments
+- `hydro_data::NamedTuple`: Hydrodynamic dataset (e.g. from `extract_hydrodynamic_dataset`
+  or resharded onto fine hexagons), containing `:N2`, `:salinity`, `:temperature`,
+  and `:depth_levels`.
+- `au`: Spatial areal units representation (hexagonal mesh or polygons).
+
+# Keyword Arguments
+- `depth_level::Integer=1`: Vertical depth slice index to visualize in horizontal maps.
+- `mode::Symbol=:plots`: Visualization backend (`:plots` or `:leaflet`).
+- `title::String="Ocean Stratification Diagnostics"`: Overall figure title.
+- `kwargs...`: Additional keyword arguments forwarded to Plots layout.
+
+# Returns
+- Multi-panel `Plots.Plot` or interactive `LeafletMap`.
+"""
+function plot_hydrodynamic_stratification(
+    hydro_data::NamedTuple,
+    au;
+    depth_level::Integer = 1,
+    mode::Symbol = :plots,
+    title::String = "Ocean Stratification Diagnostics",
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        return leaflet_hydrodynamic_dashboard(hydro_data, au; title=title, kwargs...)
+    end
+
+    # Extract horizontal slices at requested depth level
+    z_coords = hasproperty(hydro_data, :depth_levels) ?
+        collect(Float64, hydro_data.depth_levels) : [0.0]
+    n_z = length(z_coords)
+    d_idx = clamp(depth_level, 1, n_z)
+    z_val = z_coords[d_idx]
+
+    n2_mat = hydro_data.N2
+    sal_mat = hydro_data.salinity
+
+    n2_slice = ndims(n2_mat) >= 2 ? vec(n2_mat[:, d_idx]) : vec(n2_mat)
+    sal_slice = ndims(sal_mat) >= 2 ? vec(sal_mat[:, d_idx]) : vec(sal_mat)
+
+    # Subplot A: Buoyancy frequency squared on hexagonal grid
+    p_a = plot_hexagonal_field(
+        n2_slice, au;
+        title = "(A) Buoyancy Freq N² (z=\$(round(z_val, digits=1))m)",
+        cmap = :viridis,
+        colorbar_label = "N² (s⁻²)"
+    )
+
+    # Subplot B: Salinity field on hexagonal grid
+    p_b = plot_hexagonal_field(
+        sal_slice, au;
+        title = "(B) Salinity S (z=\$(round(z_val, digits=1))m)",
+        cmap = :haline,
+        colorbar_label = "Salinity (PSU)"
+    )
+
+    # Subplot C: Vertical water-column profile
+    p_c = Plots.plot(
+        title = "(C) Mean Water-Column Profile",
+        xlabel = "Value",
+        ylabel = "Depth (m)",
+        yflip = true,
+        legend = :bottomright
+    )
+
+    if ndims(n2_mat) >= 2 && n_z > 1
+        mean_n2 = [Statistics.mean(filter(!isnan, n2_mat[:, k])) for k in 1:n_z]
+        mean_sal = [Statistics.mean(filter(!isnan, sal_mat[:, k])) for k in 1:n_z]
+
+        # Scale N2 for visual comparison on profile plot (e.g. N2 * 1e4)
+        Plots.plot!(
+            p_c, mean_n2 .* 1e4, z_coords,
+            lw = 2.4, color = :darkblue, label = "N² × 10⁴ (s⁻²)"
+        )
+        Plots.plot!(
+            p_c, mean_sal, z_coords,
+            lw = 2.2, color = :darkgreen, linestyle = :dash, label = "Salinity (PSU)"
+        )
+    else
+        Plots.scatter!(
+            p_c, [Statistics.mean(filter(!isnan, n2_slice)) * 1e4], [z_val],
+            color = :darkblue, markersize = 6, label = "N² × 10⁴"
+        )
+    end
+
+    layout_spec = Plots.@layout [a{0.38w} b{0.38w} c{0.24w}]
+    return Plots.plot(
+        p_a, p_b, p_c,
+        layout = layout_spec,
+        size = (1250, 440),
+        plot_title = title;
+        kwargs...
+    )
+end
+
+"""
+    plot_hydrodynamic_diffusion(hydro_data, au; depth_level=1, mode=:plots,
+                                title="Turbulent Eddy Diffusivity & Viscosity", kwargs...)
+
+Visualizes turbulent vertical eddy diffusivity \$\\kappa_v\$ (\$m^2/s\$) and eddy viscosity
+\$\\nu_v\$ (\$m^2/s\$) across fine hexagonal units and vertical water-column profiles.
+
+# Mathematical Background
+Vertical turbulent transport parameterization follows Richardson-number (\$Ri\$) closures:
+```math
+\\nu_v(z) = \\frac{\\nu_0}{(1 + \\alpha Ri)^n} + \\nu_b, \\quad
+\\kappa_v(z) = \\frac{\\nu_v(z)}{1 + \\alpha Ri} + \\kappa_b
+```
+where \$Ri = N^2 / [(\\partial u/\\partial z)^2 + (\\partial v/\\partial z)^2]\$, with background
+mixing rate \$\\kappa_b \\sim 10^{-5} \\,\\text{m}^2/\\text{s}\$ and peak mixed-layer values
+exceeding \$10^{-2} \\,\\text{m}^2/\\text{s}\$.
+
+# Arguments
+- `hydro_data::NamedTuple`: Hydrodynamic dataset containing `:kappa_v`, `:nu_v`, and `:depth_levels`.
+- `au`: Spatial areal units representation (hexagonal mesh or polygons).
+
+# Keyword Arguments
+- `depth_level::Integer=1`: Depth slice index for map subplots.
+- `mode::Symbol=:plots`: Visualization backend (`:plots` or `:leaflet`).
+- `title::String="Turbulent Eddy Diffusivity & Viscosity"`: Overall figure title.
+- `kwargs...`: Additional keyword arguments forwarded to Plots.
+
+# Returns
+- Multi-panel `Plots.Plot` or interactive `LeafletMap`.
+"""
+function plot_hydrodynamic_diffusion(
+    hydro_data::NamedTuple,
+    au;
+    depth_level::Integer = 1,
+    mode::Symbol = :plots,
+    title::String = "Turbulent Eddy Diffusivity & Viscosity",
+    kwargs...
+)
+    if mode == :leaflet || mode == :html
+        return leaflet_hydrodynamic_dashboard(hydro_data, au; title=title, kwargs...)
+    end
+
+    z_coords = hasproperty(hydro_data, :depth_levels) ?
+        collect(Float64, hydro_data.depth_levels) : [0.0]
+    n_z = length(z_coords)
+    d_idx = clamp(depth_level, 1, n_z)
+    z_val = z_coords[d_idx]
+
+    kv_mat = hydro_data.kappa_v
+    nv_mat = hydro_data.nu_v
+
+    kv_slice = ndims(kv_mat) >= 2 ? vec(kv_mat[:, d_idx]) : vec(kv_mat)
+    nv_slice = ndims(nv_mat) >= 2 ? vec(nv_mat[:, d_idx]) : vec(nv_mat)
+
+    # Subplot A: Eddy diffusivity
+    p_a = plot_hexagonal_field(
+        kv_slice, au;
+        title = "(A) Eddy Diffusivity κ_v (z=\$(round(z_val, digits=1))m)",
+        cmap = :plasma,
+        colorbar_label = "κ_v (m²/s)"
+    )
+
+    # Subplot B: Eddy viscosity
+    p_b = plot_hexagonal_field(
+        nv_slice, au;
+        title = "(B) Eddy Viscosity ν_v (z=\$(round(z_val, digits=1))m)",
+        cmap = :cividis,
+        colorbar_label = "ν_v (m²/s)"
+    )
+
+    # Subplot C: Vertical profile of turbulent coefficients
+    p_c = Plots.plot(
+        title = "(C) Vertical Diffusion Profile",
+        xlabel = "log₁₀(Coefficient) [m²/s]",
+        ylabel = "Depth (m)",
+        yflip = true,
+        legend = :bottomright
+    )
+
+    if ndims(kv_mat) >= 2 && n_z > 1
+        mean_kv = [Statistics.mean(filter(x -> !isnan(x) && x > 0, kv_mat[:, k])) for k in 1:n_z]
+        mean_nv = [Statistics.mean(filter(x -> !isnan(x) && x > 0, nv_mat[:, k])) for k in 1:n_z]
+
+        Plots.plot!(
+            p_c, log10.(max.(mean_kv, 1e-8)), z_coords,
+            lw = 2.4, color = :purple, label = "log₁₀(κ_v)"
+        )
+        Plots.plot!(
+            p_c, log10.(max.(mean_nv, 1e-8)), z_coords,
+            lw = 2.2, color = :teal, linestyle = :dash, label = "log₁₀(ν_v)"
+        )
+    else
+        val_kv = Statistics.mean(filter(x -> !isnan(x) && x > 0, kv_slice))
+        Plots.scatter!(
+            p_c, [log10(max(val_kv, 1e-8))], [z_val],
+            color = :purple, markersize = 6, label = "log₁₀(κ_v)"
+        )
+    end
+
+    layout_spec = Plots.@layout [a{0.38w} b{0.38w} c{0.24w}]
+    return Plots.plot(
+        p_a, p_b, p_c,
+        layout = layout_spec,
+        size = (1250, 440),
+        plot_title = title;
+        kwargs...
+    )
+end
+
+"""
+    plot_hydrodynamic_section(hydro_data, au; var=:temperature, coordinate=:lon,
+                              slice_val=nothing, tolerance=nothing, cmap=nothing,
+                              title=nothing, kwargs...)
+
+Renders a 2D vertical hydrographic cross-section (depth \$z\$ versus horizontal position)
+along a transect corridor, overlaid with seafloor bathymetry bedrock masking.
+
+# Mathematical Background
+Along a chosen transect parameterized by horizontal coordinate \$s\$, the hydrographic
+variable \$\\psi(s, z)\$ is displayed for all depth levels \$0 \\le z \\le H(s)\$, where \$H(s)\$
+denotes the local seafloor bathymetric depth. Grid points below the seafloor \$z > H(s)\$
+are masked to represent the solid continental shelf or slope bedrock.
+
+# Arguments
+- `hydro_data::NamedTuple`: Hydrodynamic dataset containing 2D or 3D fields (`:temperature`,
+  `:salinity`, `:N2`, `:kappa_v`), `:depth_levels`, and seafloor depths (`:depths`).
+- `au`: Spatial areal units representation (hexagonal mesh or polygons).
+
+# Keyword Arguments
+- `var::Symbol=:temperature`: Field variable key to cross-section.
+- `coordinate::Symbol=:lon`: Transect orientation (`:lon` for longitudinal slice varying
+  across latitude, `:lat` for latitudinal slice varying across longitude).
+- `slice_val::Union{Nothing, Real}=nothing`: Fixed coordinate value for the transect
+  (defaults to median coordinate).
+- `tolerance::Union{Nothing, Real}=nothing`: Half-width corridor to gather stations.
+- `cmap=nothing`: Colormap symbol (defaults to `:thermal` for temperature, `:haline`
+  for salinity, `:viridis` for \$N^2\$).
+- `title=nothing`: Figure title.
+- `kwargs...`: Additional keyword arguments forwarded to Plots.
+
+# Returns
+- A `Plots.Plot` object of the vertical hydrographic transect.
+"""
+function plot_hydrodynamic_section(
+    hydro_data::NamedTuple,
+    au;
+    var::Symbol = :temperature,
+    coordinate::Symbol = :lon,
+    slice_val::Union{Nothing, Real} = nothing,
+    tolerance::Union{Nothing, Real} = nothing,
+    cmap = nothing,
+    title = nothing,
+    kwargs...
+)
+    cents = _extract_centroids(au)
+    lons = [Float64(c[1]) for c in cents]
+    lats = [Float64(c[2]) for c in cents]
+
+    fixed = coordinate == :lon ? lons : lats
+    varying = coordinate == :lon ? lats : lons
+    along_label = coordinate == :lon ? "Latitude (°N)" : "Longitude (°E)"
+
+    target_val = !isnothing(slice_val) ? Float64(slice_val) : Statistics.median(fixed)
+
+    tol = if !isnothing(tolerance)
+        Float64(tolerance)
+    else
+        u_fixed = sort(unique(fixed))
+        spacing = length(u_fixed) > 1 ? Statistics.median(diff(u_fixed)) : 0.2
+        max(0.04, 1.25 * spacing)
+    end
+
+    matched_idx = findall(abs.(fixed .- target_val) .<= tol)
+    if isempty(matched_idx)
+        matched_idx = [argmin(abs.(fixed .- target_val))]
+    end
+
+    # Sort stations monotonically along the transect
+    perm = sortperm(varying[matched_idx])
+    matched_idx = matched_idx[perm]
+    x_coords = varying[matched_idx]
+
+    z_coords = hasproperty(hydro_data, :depth_levels) ?
+        collect(Float64, hydro_data.depth_levels) : [0.0, 50.0, 100.0, 200.0]
+    n_z = length(z_coords)
+    n_stn = length(matched_idx)
+
+    # Retrieve data matrix (S x Nz)
+    data_mat = getproperty(hydro_data, var)
+    if ndims(data_mat) < 2
+        throw(ArgumentError(
+            "Variable :\$var in hydro_data must have at least 2 dimensions (S x Nz) for cross-sections."
+        ))
+    end
+
+    # Retrieve seafloor depth
+    n_total = size(data_mat, 1)
+    seafloor = if hasproperty(hydro_data, :seafloor) && length(hydro_data.seafloor) == n_total
+        Float64.(hydro_data.seafloor[matched_idx])
+    elseif hasproperty(hydro_data, :depth_vec) && length(hydro_data.depth_vec) == n_total
+        Float64.(hydro_data.depth_vec[matched_idx])
+    elseif hasproperty(hydro_data, :depths_vec) && length(hydro_data.depths_vec) == n_total
+        Float64.(hydro_data.depths_vec[matched_idx])
+    elseif hasproperty(hydro_data, :bathymetry) && length(hydro_data.bathymetry) == n_total
+        Float64.(hydro_data.bathymetry[matched_idx])
+    elseif hasproperty(au, :depths) && length(au.depths) == n_total
+        Float64.(au.depths[matched_idx])
+    elseif hasproperty(au, :depth_vec) && length(au.depth_vec) == n_total
+        Float64.(au.depth_vec[matched_idx])
+    else
+        fill(maximum(z_coords), n_stn)
+    end
+
+    # Assemble section matrix: (n_z x n_stn)
+    section = Matrix{Float64}(undef, n_z, n_stn)
+    for j in 1:n_stn
+        stn_orig = matched_idx[j]
+        h_bottom = seafloor[j]
+        for k in 1:n_z
+            z_curr = z_coords[k]
+            if z_curr > h_bottom + 1e-3
+                section[k, j] = NaN  # Mask bedrock below seafloor
+            else
+                section[k, j] = Float64(data_mat[stn_orig, k])
+            end
+        end
+    end
+
+    # Default color scheme
+    chosen_cmap = if !isnothing(cmap)
+        cmap
+    elseif var == :temperature
+        :thermal
+    elseif var == :salinity
+        :haline
+    elseif var == :N2
+        :viridis
+    elseif var == :kappa_v || var == :nu_v
+        :plasma
+    else
+        :viridis
+    end
+
+    plot_title = !isnothing(title) ? title :
+        "Hydrodynamic Vertical Section (\$var) along \$(coordinate)=\$(round(target_val, digits=2))°"
+
+    p = Plots.plot(
+        title = plot_title,
+        xlabel = along_label,
+        ylabel = "Depth (m)",
+        yflip = true,
+        size = (900, 500)
+    )
+
+    # Render filled contour / heatmap
+    if n_stn > 1 && n_z > 1
+        Plots.heatmap!(
+            p, x_coords, z_coords, section,
+            color = chosen_cmap,
+            colorbar = true
+        )
+    end
+
+    # Bedrock polygon under seafloor
+    max_z = maximum(z_coords) * 1.15
+    poly_x = vcat(x_coords, reverse(x_coords))
+    poly_z = vcat(seafloor, fill(max_z, n_stn))
+    Plots.plot!(
+        p, poly_x, poly_z,
+        seriestype = :shape,
+        fillcolor = RGB(0.28, 0.26, 0.24),
+        linecolor = :transparent,
+        alpha = 0.95,
+        label = "Seafloor Bedrock"
+    )
+
+    # Seafloor bathymetry line
+    Plots.plot!(
+        p, x_coords, seafloor,
+        lw = 2.5,
+        color = :black,
+        label = "Seafloor Bathymetry"
+    )
+
+    return p
+end
+

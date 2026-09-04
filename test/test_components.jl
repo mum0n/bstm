@@ -329,6 +329,75 @@ end
     hsi_resharded = bstm.reshard_hsi_field(hsi_source, au_simple)
     @test length(hsi_resharded) == length(au_simple.centroids)
     @test all(0.0 .<= hsi_resharded .<= 1.0)
+
+    # 15. Test construct_stochastic_transition_kernel & vector overloads
+    S_t = 5
+    W_dense = zeros(Float64, S_t, S_t)
+    for i in 1:(S_t - 1)
+        W_dense[i, i + 1] = 1.0
+        W_dense[i + 1, i] = 1.0
+    end
+    W_sp_t = sparse(W_dense)
+    hsi_t = [0.1, 0.3, 0.7, 0.9, 0.5]
+
+    # Scalar parameters -> Matrix{Float64}
+    P_sc = bstm.construct_stochastic_transition_kernel(
+        W_sp_t, hsi_t; gamma=1.0, residence=0.2, advection=0.5
+    )
+    @test P_sc isa Matrix{Float64}
+    @test size(P_sc) == (S_t, S_t)
+    for i in 1:S_t
+        @test isapprox(sum(P_sc[i, :]), 1.0; atol=1e-12)
+    end
+
+    # Group vector mode (G=3) -> Vector{Matrix{Float64}}
+    g_vec_t = [0.5, 1.0, 2.0]
+    rho_vec_t = [0.1, 0.2, 0.3]
+    adv_vec_t = [0.3, 0.5, 0.8]
+    P_grp = bstm.construct_stochastic_transition_kernel(
+        W_sp_t, hsi_t; gamma=g_vec_t, residence=rho_vec_t, advection=adv_vec_t
+    )
+    @test P_grp isa Vector{Matrix{Float64}}
+    @test length(P_grp) == 3
+    for g in 1:3
+        @test size(P_grp[g]) == (S_t, S_t)
+        for i in 1:S_t
+            @test isapprox(sum(P_grp[g][i, :]), 1.0; atol=1e-12)
+        end
+    end
+
+    # Mixed scalar and vector (scalar broadcasts)
+    P_mix = bstm.construct_stochastic_transition_kernel(
+        W_sp_t, hsi_t; gamma=1.0, residence=rho_vec_t, advection=0.5
+    )
+    @test P_mix isa Vector{Matrix{Float64}}
+    @test length(P_mix) == 3
+
+    # Spatial vector mode (spatial=true) -> Matrix{Float64}
+    rho_sp = [0.1, 0.2, 0.3, 0.2, 0.1]
+    adv_sp = [0.4, 0.5, 0.6, 0.5, 0.4]
+    P_sp = bstm.construct_stochastic_transition_kernel(
+        W_sp_t, hsi_t; gamma=1.0, residence=rho_sp, advection=adv_sp, spatial=true
+    )
+    @test P_sp isa Matrix{Float64}
+    @test size(P_sp) == (S_t, S_t)
+    for i in 1:S_t
+        @test isapprox(sum(P_sp[i, :]), 1.0; atol=1e-12)
+    end
+
+    # predict_path & predict_corridor with Vector of kernels
+    path_g1 = bstm.predict_path(P_grp, 1, 5, 4; group=1)
+    path_g3 = bstm.predict_path(P_grp, 1, 5, 4; group=3)
+    @test path_g1 isa Vector{Int}
+    @test path_g3 isa Vector{Int}
+    @test length(path_g1) == 5
+    @test first(path_g1) == 1 && last(path_g1) == 5
+
+    corr_g1 = bstm.predict_corridor(P_grp, 1, 5, 4; group=1)
+    @test size(corr_g1) == (S_t, 5)
+    for t in 1:5
+        @test isapprox(sum(corr_g1[:, t]), 1.0; atol=1e-12)
+    end
 end
 
 

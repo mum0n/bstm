@@ -383,20 +383,40 @@ function _discover_categorical_movement_realizations(chain, M, PS, n_samples, G)
 end
 
 
-function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedTuple, Nothing},
-    n_samples::Int, outcomes_N::Int, N_tot::Int)
+function _discover_component_realizations(
+    chain, M::NamedTuple, PS::Union{NamedTuple, Nothing},
+    n_samples::Int, outcomes_N::Int, N_tot::Int; prefix::String = ""
+)
     p_names = _get_clean_chain_param_names(chain)
 
     # --- Intercept ---
     intercept_samples = zeros(Float64, n_samples, outcomes_N)
     if M.add_intercept
-        for k in 1:outcomes_N
-            param_name = (M.model_arch == "multivariate") ? "intercept_$(k)" : "intercept"
-            found_name = _find_parameter(p_names, param_name, k, M.model_arch == "multivariate")
-            if !isempty(found_name)
-                intercept_samples[:, k] = get_params_vector(chain, found_name, 1)[:, 1]
-            else
-                @warn "Intercept parameter '$param_name' not found in the MCMC chain. Using zero for this effect."
+        inter_base = !isempty(prefix) ? "intercept_$(prefix)" : "intercept"
+        found_joint = _find_parameter(p_names, inter_base, nothing, false)
+        if !isempty(found_joint) && outcomes_N > 1
+            try
+                all_inter = get_params_matrix(chain, found_joint, outcomes_N)
+                if size(all_inter, 2) == outcomes_N
+                    intercept_samples = all_inter
+                end
+            catch
+            end
+        end
+        if all(intercept_samples .== 0.0)
+            for k in 1:outcomes_N
+                found_name = _find_parameter(p_names, inter_base, k, M.model_arch == "multivariate")
+                if isempty(found_name)
+                    found_name = _find_parameter(p_names, "$(inter_base)_$(k)", nothing, false)
+                end
+                if isempty(found_name) && !isempty(prefix)
+                    found_name = _find_parameter(p_names, "intercept_$(k)", nothing, false)
+                end
+                if !isempty(found_name)
+                    intercept_samples[:, k] = get_params_vector(chain, found_name, 1)[:, 1]
+                else
+                    @warn "Intercept parameter '$(inter_base)_$(k)' not found in the MCMC chain. Using zero for this effect."
+                end
             end
         end
     end
@@ -404,7 +424,11 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
     # --- Fixed Effects ---
     fixed_effects_samples = zeros(Float64, M.Xfixed_N, n_samples, outcomes_N)
     if M.Xfixed_N > 0
-        param_name_base = (M.model_arch == "multivariate") ? "beta_flat" : "beta"
+        param_name_base = if !isempty(prefix)
+            (M.model_arch == "multivariate") ? "beta_flat_$(prefix)" : "beta_$(prefix)"
+        else
+            (M.model_arch == "multivariate") ? "beta_flat" : "beta"
+        end
         found_base = _find_parameter(p_names, param_name_base, nothing,
             M.model_arch == "multivariate")
         if !isempty(found_base)
@@ -428,7 +452,8 @@ function _discover_component_realizations(chain, M::NamedTuple, PS::Union{NamedT
     # --- Component Effects ---
     component_realizations = Dict{Symbol, Any}()
     for spec in M.components
-        effects_result = get_effects(spec.component_obj, chain, spec, M, PS)
+        spec_for_effects = !isempty(prefix) ? merge(spec, (key=Symbol(prefix, "_", spec.key),)) : spec
+        effects_result = get_effects(spec.component_obj, chain, spec_for_effects, M, PS)
         component_realizations[spec.key] = effects_result
     end
 
@@ -524,7 +549,7 @@ end
 
 function _reconstruct(
     arch::UnivariateArchitecture, mode::String, chain, M::NamedTuple, PS,
-    alpha::Float64
+    alpha::Float64; prefix::String = ""
 )
     # --- 1. Metadata and Dimension Discovery ---
     n_samples_val = _get_chain_n_samples(chain)
@@ -533,7 +558,7 @@ function _reconstruct(
 
     # --- 2. Latent Field Reconstruction ---
     registry = _discover_component_realizations(
-        chain, M, PS, n_samples_val, outcomes_N_val, N_tot_val
+        chain, M, PS, n_samples_val, outcomes_N_val, N_tot_val; prefix = prefix
     )
 
     # --- 3. Linear Predictor Assembly ---
@@ -544,7 +569,7 @@ function _reconstruct(
 
     # --- 4. Prediction and Log-Likelihood Calculation ---
     pred_results = _process_ll_and_predictions(
-        eta_post_2d, chain, M, PS, outcomes_N_val, 1
+        eta_post_2d, chain, M, PS, outcomes_N_val, 1; prefix = prefix
     )
 
     # --- 5. Final Result Consolidation ---
@@ -565,7 +590,7 @@ end
 
 function _reconstruct(
     arch::MultivariateArchitecture, mode::String, chain, M::NamedTuple, PS,
-    alpha::Float64
+    alpha::Float64; prefix::String = ""
 )
     # --- 1. Metadata and Dimension Discovery ---
     n_samples_val = _get_chain_n_samples(chain)
@@ -574,14 +599,65 @@ function _reconstruct(
 
     # --- 2. Latent Field Reconstruction ---
     registry = _discover_component_realizations(
-        chain, M, PS, n_samples_val, outcomes_N_val, N_tot_val
+        chain, M, PS, n_samples_val, outcomes_N_val, N_tot_val; prefix = prefix
     )
   
     # --- 3. Linear Predictor Assembly ---
     eta_latent_post = _modular_eta_assembly(registry, M, PS, n_samples_val, outcomes_N_val)
 
+    is_multinomial_model = get(M, :is_multinomial, false) || any(
+        s -> string(get(s, :family, "")) in [
+            "multinomial", "categorical", "dirichlet_multinomial", "dirichlet"
+        ],
+        M.likelihood_specs
+    )
+
+    if is_multinomial_model
+        pred_res = _process_multinomial_predictions(
+            eta_latent_post, chain, M, PS; prefix = prefix
+        )
+        K_cats = get(M, :K_categories, outcomes_N_val + 1)
+        cat_labels = get(M, :category_labels, [Symbol("cat_$k") for k in 1:K_cats])
+
+        p_denoised_summaries = [
+            summarize_array(pred_res.p_denoised[:, k, :], alpha=alpha)
+            for k in 1:K_cats
+        ]
+        
+        n_noisy_cols = size(pred_res.p_noisy, 2)
+        p_noisy_summaries = [
+            summarize_array(pred_res.p_noisy[:, k, :], alpha=alpha)
+            for k in 1:n_noisy_cols
+        ]
+
+        # MAP classification: dominant category label per observation
+        dominant_indices = [
+            argmax([p_denoised_summaries[k].mean[i] for k in 1:K_cats])
+            for i in 1:N_tot_val
+        ]
+        dominant_labels = [cat_labels[idx] for idx in dominant_indices]
+
+        pstats = (
+            effects=_summarize_effects_registry(registry, M, outcomes_N_val, alpha),
+            predictions_denoised=p_denoised_summaries,
+            predictions_noisy=p_noisy_summaries,
+            raw_predictions_denoised=pred_res.p_denoised,
+            raw_predictions_noisy=pred_res.p_noisy,
+            dominant_category=dominant_labels,
+            category_labels=cat_labels,
+            log_likelihood=pred_res.log_lik,
+            waic=_compute_waic(pred_res.log_lik),
+            arch=arch
+        )
+        return pstats
+    end
+
     # --- 4. Apply Correlation Structure ---
-    L_corr_samples = get_params_matrix(chain, "L_corr", outcomes_N_val * outcomes_N_val)
+    l_corr_name = !isempty(prefix) ? "L_corr_$(prefix)" : "L_corr"
+    L_corr_samples = get_params_matrix(chain, l_corr_name, outcomes_N_val * outcomes_N_val)
+    if isempty(L_corr_samples) && !isempty(prefix)
+        L_corr_samples = get_params_matrix(chain, "L_corr", outcomes_N_val * outcomes_N_val)
+    end
     eta_post = similar(eta_latent_post)
     for s in 1:n_samples_val
         L_s = reshape(L_corr_samples[s, :], outcomes_N_val, outcomes_N_val)
@@ -590,7 +666,9 @@ function _reconstruct(
 
     # --- 5. Prediction and Log-Likelihood Calculation ---
     all_pred_results = [
-        _process_ll_and_predictions(eta_post[:,:,k], chain, M, PS, outcomes_N_val, k)
+        _process_ll_and_predictions(
+            eta_post[:, :, k], chain, M, PS, outcomes_N_val, k; prefix = prefix
+        )
         for k in 1:outcomes_N_val
     ]
     
@@ -646,14 +724,25 @@ function _reconstruct(
             sub_outcomes_N = get(sub_M, :outcomes_N, 1)
             sub_N_tot = isnothing(sub_PS) ? sub_M.y_N : sub_M.y_N + sub_PS.y_N
             sub_registry = _discover_component_realizations(
-                chain, sub_M, sub_PS, n_samples, sub_outcomes_N, sub_N_tot
+                chain, sub_M, sub_PS, n_samples, sub_outcomes_N, sub_N_tot;
+                prefix = string(key)
             )
             eta_sub = _modular_eta_assembly(sub_registry, sub_M, sub_PS, n_samples, sub_outcomes_N)
 
             rho_name = "rho_nested_$(key)"
-            rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
+            rho_samples = if get(sub_M, :fixed_coupling, false)
+                ones(Float64, n_samples)
+            else
+                v = get_params_vector(chain, rho_name, 1)
+                isempty(v) ? ones(Float64, n_samples) : v[:, 1]
+            end
 
-            if size(eta_sub, 1) != N_tot
+            if haskey(sub_M, :mapping) && !isnothing(sub_M.mapping)
+                eta_sub_mapped = eta_sub[sub_M.mapping, :, :]
+                eta_main .+= reshape(rho_samples, 1, n_samples, 1) .* eta_sub_mapped
+            elseif size(eta_sub, 1) == N_tot
+                eta_main .+= reshape(rho_samples, 1, n_samples, 1) .* eta_sub
+            else
                 @warn "Size mismatch between main model observations ($N_tot) and " *
                       "nested model '$(key)' observations ($(size(eta_sub, 1)))." *
                       " Cannot apply nested effect."
@@ -664,8 +753,6 @@ function _reconstruct(
                 @warn "Multi-fidelity connection between multivariate models is not " *
                       "fully supported. Assuming a 1-to-1 outcome mapping." 
             end
-            
-            eta_main .+= reshape(rho_samples, 1, n_samples, 1) .* eta_sub
 
             sub_arch_raw = get(sub_M, :model_arch, "univariate")
             sub_arch_type = if sub_arch_raw == "multivariate"
@@ -674,7 +761,8 @@ function _reconstruct(
                 UnivariateArchitecture()
             end
             nested_results[key] = _reconstruct(
-                sub_arch_type, mode, chain, sub_M, sub_PS, alpha
+                sub_arch_type, mode, chain, sub_M, sub_PS, alpha;
+                prefix = string(key)
             )
         end
     end
@@ -718,6 +806,7 @@ function _reconstruct(
         waic = waic, 
         effects = summarized_effects, 
         nested_results = nested_results, 
+        transfer_results = nested_results,
         arch = arch
     )
 end
@@ -901,7 +990,9 @@ v1.0.0
 # Returns
 - A `NamedTuple` containing `p_denoised`, `p_noisy`, and `log_lik` matrices.
 """
-function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
+function _process_ll_and_predictions(
+    eta_samples, chain, M, PS, outcomes_N, k; prefix::String = ""
+)
     N_tot, n_samples = size(eta_samples)
     N_train = M.y_N
     
@@ -910,7 +1001,17 @@ function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
     lik_spec = M.likelihood_specs[k]
     family = string(get(lik_spec, :family, "gaussian"))
     use_zi = get(M, :use_zi, false)
-    phi_zi_samples = use_zi ? get_params_vector(chain, "lik_phi_zi", 1)[:,1] : zeros(n_samples)
+    
+    phi_zi_name = !isempty(prefix) ? "lik_phi_zi_$(prefix)" : "lik_phi_zi"
+    phi_zi_samples = if use_zi
+        v = get_params_vector(chain, phi_zi_name, 1)
+        if isempty(v) && !isempty(prefix)
+            v = get_params_vector(chain, "lik_phi_zi", 1)
+        end
+        isempty(v) ? zeros(n_samples) : v[:, 1]
+    else
+        zeros(n_samples)
+    end
     
     trials_full = if haskey(M, :trials)
         if isnothing(PS)
@@ -934,16 +1035,41 @@ function _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
     p_noisy_samples = similar(eta_samples)
     log_lik_samples = zeros(Float64, min(N_train, N_tot), n_samples)
 
+    y_sigma_name = !isempty(prefix) ? "y_sigma_$(prefix)" : "y_sigma"
+    r_nb_name = !isempty(prefix) ? "r_nb_$(prefix)" : "r_nb"
+
     y_sigma_samples = if family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
-        outcomes_N > 1 ? get_params_matrix(chain, "y_sigma",
-            outcomes_N) : get_params_vector(chain, "y_sigma", 1)
+        if outcomes_N > 1
+            m = get_params_matrix(chain, y_sigma_name, outcomes_N)
+            if isempty(m) && !isempty(prefix)
+                m = get_params_matrix(chain, "y_sigma", outcomes_N)
+            end
+            m
+        else
+            v = get_params_vector(chain, y_sigma_name, 1)
+            if isempty(v) && !isempty(prefix)
+                v = get_params_vector(chain, "y_sigma", 1)
+            end
+            v
+        end
     else
         ones(Float64, n_samples, outcomes_N)
     end
 
     r_nb_samples = if family == "negbin"
-        outcomes_N > 1 ? get_params_matrix(chain, "r_nb",
-            outcomes_N) : get_params_vector(chain, "r_nb", 1)
+        if outcomes_N > 1
+            m = get_params_matrix(chain, r_nb_name, outcomes_N)
+            if isempty(m) && !isempty(prefix)
+                m = get_params_matrix(chain, "r_nb", outcomes_N)
+            end
+            m
+        else
+            v = get_params_vector(chain, r_nb_name, 1)
+            if isempty(v) && !isempty(prefix)
+                v = get_params_vector(chain, "r_nb", 1)
+            end
+            v
+        end
     else
         ones(Float64, n_samples, outcomes_N)
     end
@@ -988,46 +1114,147 @@ end
 """
     _process_multinomial_predictions(eta_samples, chain, M, PS)
 
-Generates posterior predictions (proportions and simulated counts) and pointwise
-  log-likelihood for multinomial models.
+Generates posterior predictions (proportions, simulated counts/classes) and pointwise
+log-likelihood for multinomial, categorical, and Dirichlet-multinomial models.
+
+# Mathematical Formulation
+For \$K\$ categories with reference category 1 (\$k_{\\text{ref}} = 1\$):
+\$\\boldsymbol{\\eta}_i = [0, \\eta_{i, 1}, \\dots, \\eta_{i, K-1}]^\\top\$
+\$\\boldsymbol{\\pi}_i = \\operatorname{softmax}(\\boldsymbol{\\eta}_i) \\in \\Delta^{K-1}\$
+
+# Returns
+A `NamedTuple` `(p_denoised, p_noisy, log_lik)`.
 """
-function _process_multinomial_predictions(eta_samples, chain, M, PS)
+function _process_multinomial_predictions(
+    eta_samples, chain, M, PS; prefix::String = ""
+)
     n_samples = size(eta_samples, 2)
     N_train = M.y_N
     N_pred = isnothing(PS) ? 0 : PS.y_N
     N_tot = N_train + N_pred
-    K = M.outcomes_N
 
-    y_obs_train = M.y_obs # [N_train, K]
+    K_free = size(eta_samples, 3)
+    K_tot = get(M, :K_categories, K_free + 1)
+    fam = Symbol(get(M, :multinomial_family, :multinomial))
 
-    # Denoised predictions (proportions)
-    p_denoised_samples = zeros(Float64, N_tot, K, n_samples)
+    y_obs_train = M.y_obs
+
+    # 1. Denoised simplex probabilities [N_tot, K_tot, n_samples]
+    p_denoised_samples = zeros(Float64, N_tot, K_tot, n_samples)
     for s in 1:n_samples 
         for i in 1:N_tot
-            p_denoised_samples[i, :, s] = NNlib.softmax(eta_samples[i, s, :])
+            eta_row = if K_free < K_tot
+                vcat(0.0, eta_samples[i, s, :])
+            else
+                collect(eta_samples[i, s, :])
+            end
+            p_denoised_samples[i, :, s] = NNlib.softmax(eta_row)
         end
     end
 
-    # Noisy predictions (counts)
-    p_noisy_samples = zeros(Int, N_tot, K, n_samples)
+    # 2. Noisy predictions and pointwise log-likelihood
     log_lik_samples = zeros(Float64, N_train, n_samples)
 
-    # Get total trials for each observation
-    trials_train = sum(y_obs_train, dims=2)
-    trials_pred = haskey(PS, :trials) ? sum(PS.trials, dims=2) : ones(Int, N_pred)
-    trials_full = vcat(vec(trials_train), vec(trials_pred))
+    if fam == :categorical
+        p_noisy_samples = zeros(Int, N_tot, 1, n_samples)
+        for s in 1:n_samples
+            for i in 1:N_tot
+                probs = p_denoised_samples[i, :, s]
+                dist = Categorical(probs)
+                p_noisy_samples[i, 1, s] = rand(dist)
+                if i <= N_train
+                    y_val = y_obs_train isa AbstractVector ?
+                        y_obs_train[i] : argmax(y_obs_train[i, :])
+                    log_lik_samples[i, s] = logpdf(dist, Int(y_val))
+                end
+            end
+        end
 
-    for s in 1:n_samples 
-        for i in 1:N_tot
-            probs = p_denoised_samples[i, :, s]
-            dist = Multinomial(Int(trials_full[i]), probs)
-            p_noisy_samples[i, :, s] = rand(dist)
-            if i <= N_train
-                log_lik_samples[i, s] = logpdf(dist, y_obs_train[i, :])
+    elseif fam == :dirichlet
+        p_noisy_samples = zeros(Float64, N_tot, K_tot, n_samples)
+        phi_name = !isempty(prefix) ? "dirichlet_phi_$(prefix)" : "dirichlet_phi"
+        phi_samples = try
+            v = get_params_vector(chain, phi_name, 1)
+            if isempty(v) && !isempty(prefix)
+                v = get_params_vector(chain, "dirichlet_phi", 1)
+            end
+            isempty(v) ? fill(1.0, n_samples) : v[:, 1]
+        catch
+            fill(1.0, n_samples)
+        end
+
+        for s in 1:n_samples
+            phi_s = isempty(phi_samples) ? 1.0 : max(phi_samples[s], 1e-4)
+            for i in 1:N_tot
+                alpha_vec = max.(phi_s .* p_denoised_samples[i, :, s], 1e-6)
+                dist = Dirichlet(alpha_vec)
+                p_noisy_samples[i, :, s] = rand(dist)
+                if i <= N_train
+                    log_lik_samples[i, s] = logpdf(dist, y_obs_train[i, :])
+                end
+            end
+        end
+
+    else # :multinomial or :dirichlet_multinomial
+        p_noisy_samples = zeros(Int, N_tot, K_tot, n_samples)
+        
+        # Total trials per observation
+        trials_train = if haskey(M, :trials)
+            vec(M.trials isa AbstractMatrix ? M.trials[:, 1] : M.trials)
+        else
+            vec(sum(y_obs_train, dims=2))
+        end
+        trials_pred = if N_pred > 0
+            if !isnothing(PS) && haskey(PS, :trials)
+                vec(PS.trials)
+            else
+                fill(Int(trials_train[1]), N_pred)
+            end
+        else
+            Int[]
+        end
+        trials_full = vcat(trials_train, trials_pred)
+
+        phi_name = !isempty(prefix) ? "dirichlet_phi_$(prefix)" : "dirichlet_phi"
+        phi_samples = if fam == :dirichlet_multinomial
+            try
+                v = get_params_vector(chain, phi_name, 1)
+                if isempty(v) && !isempty(prefix)
+                    v = get_params_vector(chain, "dirichlet_phi", 1)
+                end
+                isempty(v) ? fill(1.0, n_samples) : v[:, 1]
+            catch
+                fill(1.0, n_samples)
+            end
+        else
+            Float64[]
+        end
+
+        for s in 1:n_samples
+            phi_s = (fam == :dirichlet_multinomial && !isempty(phi_samples)) ?
+                max(phi_samples[s], 1e-4) : 1.0
+
+            for i in 1:N_tot
+                n_tr = Int(trials_full[i])
+                probs = p_denoised_samples[i, :, s]
+
+                dist = if fam == :dirichlet_multinomial
+                    alpha_vec = max.(phi_s .* probs, 1e-6)
+                    DirichletMultinomial(n_tr, alpha_vec)
+                else
+                    Multinomial(n_tr, probs)
+                end
+
+                p_noisy_samples[i, :, s] = rand(dist)
+                if i <= N_train
+                    log_lik_samples[i, s] = logpdf(dist, y_obs_train[i, :])
+                end
             end
         end
     end
-    return (p_denoised=p_denoised_samples, p_noisy=p_noisy_samples, log_lik=log_lik_samples)
+
+    return (p_denoised = p_denoised_samples, p_noisy = p_noisy_samples,
+            log_lik = log_lik_samples)
 end
 
 function _quantile_along_last_dim(A::AbstractArray, q::Real; sample_dim=ndims(A))
@@ -1195,6 +1422,65 @@ end
  
 
 """
+    reconstruct(chain, M::NamedTuple; alpha::Float64=0.05, PS=nothing)
+    reconstruct(chain, model::DynamicPPL.Model; alpha::Float64=0.05, PS=nothing)
+    reconstruct(model::DynamicPPL.Model, chain; alpha::Float64=0.05, PS=nothing)
+
+Reconstruct latent fields, compute denoised and noisy predictions, prediction intervals,
+goodness-of-fit metrics, and nested transfer components from an MCMC chain and model
+specification.
+
+### Mathematical Formulation
+For each posterior draw \$\\theta^{(s)}\$, the linear predictor \$\\eta^{(s)}\$ is assembled
+from fixed effects and latent components \$\\eta_k^{(s)}\$. In nested or multi-fidelity
+specifications, sub-model predictors \$\\eta_{m, \\text{sub}}^{(s)}\$ are coupled via transfer
+weights \$\\rho_m^{(s)}\$ (with optional index mapping \$\\mathcal{M}\$):
+\$\$ \\eta^{(s)} = \\eta_{\\text{main}}^{(s)} + \\sum_m \\rho_m^{(s)} \\eta_{m, \\text{sub}}^{(s)}[\\mathcal{M}] \$\$
+Point predictions and intervals are derived by evaluating the inverse link function
+\$\\mathbb{E}[y^{(s)}] = g^{-1}(\\eta^{(s)})\$ across samples \$s = 1, \\dots, S\$.
+
+### Arguments
+- `chain`: MCMC sample collection (e.g., Turing `Chains` or `VNChain`).
+- `M`: Model configuration `NamedTuple` (from `bstm_config` or `bstm_core`) or `DynamicPPL.Model`.
+- `alpha::Float64`: Significance level for \$(1 - \\alpha)\$ credible intervals (default `0.05`).
+- `PS`: Optional prediction set `NamedTuple` for out-of-sample synthesis (default `nothing`).
+
+### Returns
+A `NamedTuple` containing:
+- `predictions_denoised`: Summary statistics (`mean`, `median`, `std`, `ci_lower`, `ci_upper`)
+  for expected values \$g^{-1}(\\eta)\$.
+- `predictions_noisy`: Summary statistics incorporating observation dispersion/noise.
+- `raw_predictions_denoised`: Array of raw Monte Carlo draws for denoised predictions.
+- `raw_predictions_noisy`: Array of raw Monte Carlo draws for noisy predictions.
+- `log_likelihood`: Observation-level log-likelihood evaluation matrix.
+- `waic`: Widely Applicable Information Criterion diagnostic.
+- `effects`: Summarized posterior effects for all registered components.
+- `nested_results` / `transfer_results`: Reconstructed outputs for each nested sub-model.
+"""
+function reconstruct(chain, M::NamedTuple; alpha::Float64=0.05, PS=nothing)
+    raw_arch = get(M, :model_arch, "univariate")
+    arch_type = if raw_arch == "multivariate"
+        MultivariateArchitecture()
+    elseif raw_arch == "multifidelity" ||
+           (haskey(M, :nested_components) && !isempty(M.nested_components))
+        MultifidelityArchitecture()
+    else
+        UnivariateArchitecture()
+    end
+    mode = isnothing(PS) ? "model_results" : "prediction"
+    return _reconstruct(arch_type, mode, chain, M, PS, alpha)
+end
+
+function reconstruct(chain, model::DynamicPPL.Model; alpha::Float64=0.05, PS=nothing)
+    return reconstruct(chain, model.args.M; alpha=alpha, PS=PS)
+end
+
+function reconstruct(model::DynamicPPL.Model, chain; alpha::Float64=0.05, PS=nothing)
+    return reconstruct(chain, model.args.M; alpha=alpha, PS=PS)
+end
+
+
+"""
     model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothing, alpha=0.05,
       strata_info=nothing)
 
@@ -1213,7 +1499,8 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothin
 
     arch_type = if raw_arch == "multivariate"
         MultivariateArchitecture()
-    elseif raw_arch == "multifidelity"
+    elseif raw_arch == "multifidelity" ||
+           (haskey(M, :nested_components) && !isempty(M.nested_components))
         MultifidelityArchitecture()
     else
         UnivariateArchitecture()
@@ -1230,8 +1517,21 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothin
         M_for_post_strat = merge(M, (strata_info=strata_info,))
     end
 
+    is_multinomial_model = get(M, :is_multinomial, false) || any(
+        s -> string(get(s, :family, "")) in [
+            "multinomial", "categorical", "dirichlet_multinomial", "dirichlet"
+        ],
+        M.likelihood_specs
+    )
+
     if hasproperty(res, :raw_predictions_denoised)
-        samples_denoised = res.arch isa MultivariateArchitecture ? res.raw_predictions_denoised[1] : res.raw_predictions_denoised
+        samples_denoised = if res.raw_predictions_denoised isa AbstractArray{<:Real, 3}
+            res.raw_predictions_denoised[:, 1, :]
+        elseif res.raw_predictions_denoised isa AbstractVector
+            res.raw_predictions_denoised[1]
+        else
+            res.raw_predictions_denoised
+        end
         post_strat_weights = post_stratification_weights(res, M_for_post_strat, nothing,
             samples_denoised)
     end
@@ -1239,7 +1539,24 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothin
     # --- 3. Performance Metric Calculation ---
     pred_summary = res.predictions_denoised
     local rmse_val, r_pearson
-    if arch_type isa MultivariateArchitecture
+    if is_multinomial_model
+        accuracy = if hasproperty(res, :dominant_category)
+            if y_obs isa AbstractVector
+                cat_labels = get(M, :category_labels, string.(1:get(M, :K_categories, 2)))
+                obs_labels = [string(cat_labels[y_obs[i]]) for i in 1:length(y_obs)]
+                mean(res.dominant_category .== obs_labels)
+            else
+                dominant_obs = [argmax(y_obs[i, :]) for i in 1:size(y_obs, 1)]
+                cat_labels = get(M, :category_labels, string.(1:size(y_obs, 2)))
+                obs_labels = [cat_labels[idx] for idx in dominant_obs]
+                mean(res.dominant_category .== obs_labels)
+            end
+        else
+            NaN
+        end
+        rmse_val = [1.0 - accuracy]
+        r_pearson = [accuracy]
+    elseif arch_type isa MultivariateArchitecture
         rmse_val = Float64[]
         r_pearson = Float64[]
         for k in 1:M.outcomes_N
@@ -1289,17 +1606,39 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothin
     end
     
     # --- 5. Final Assembly (Structured Analytical Results) ---
-    y_obs_clean = if arch_type isa MultivariateArchitecture
+    y_obs_clean = if is_multinomial_model
+        y_obs
+    elseif arch_type isa MultivariateArchitecture
         [Array(y_obs[:, k]) for k in 1:M.outcomes_N]
     else
         Array(y_obs)
     end
 
-    pred_obj = (
-        observed = y_obs_clean,
-        denoised = res.predictions_denoised,
-        noisy = res.predictions_noisy
-    )
+    pred_obj = if is_multinomial_model
+        K_cats = get(M, :K_categories, length(res.predictions_denoised))
+        cat_labels = get(M, :category_labels, [Symbol("cat_$k") for k in 1:K_cats])
+        probs_dict = Dict{Symbol, Any}()
+        for (k, lbl) in enumerate(cat_labels)
+            probs_dict[Symbol("p_$(lbl)")] = res.predictions_denoised[k]
+        end
+        (
+            observed = y_obs_clean,
+            probabilities = NamedTuple(probs_dict),
+            predicted_category = (
+                mean = res.dominant_category,
+                mode = res.dominant_category,
+                median = res.dominant_category
+            ),
+            denoised = res.predictions_denoised,
+            noisy = res.predictions_noisy
+        )
+    else
+        (
+            observed = y_obs_clean,
+            denoised = res.predictions_denoised,
+            noisy = res.predictions_noisy
+        )
+    end
 
     draws_obj = (
         predictions_denoised = res.raw_predictions_denoised,
@@ -1308,11 +1647,14 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothin
         log_likelihood = res.log_likelihood
     )
 
+    waic_raw = get(res, :waic, 0.0)
+    waic_val = waic_raw isa Real ? waic_raw : (hasproperty(waic_raw, :waic) ? waic_raw.waic : 0.0)
+
     return (
         metrics = (
             rmse = rmse_val, 
             r_pearson = r_pearson, 
-            waic = get(res, :waic, 0.0), 
+            waic = waic_val, 
             rhat = mean_rhat, 
             ess = min_ess, 
             time = sampling_time
@@ -1321,7 +1663,12 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothin
         effects = res.effects,
         predictions = pred_obj,
         draws = draws_obj,
-        arch = res.arch
+        nested_results = get(res, :nested_results, nothing),
+        transfer_results = get(res, :transfer_results, nothing),
+        arch = res.arch,
+        M = M,
+        data = get(M, :data, data),
+        au = au
     )
 end
 
@@ -1482,7 +1829,26 @@ end
 Generates conditional predictions for covariates, with specialized support for 
 step-length (`k`) conditioning in stratified categorical movement models.
 """
-function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symbol; second_cov::Union{Symbol, Nothing}=nothing, n_points::Int=50, alpha::Float64=0.05)
+function _generate_conditional_predictions(
+    model_obj,
+    chain,
+    M,
+    target_cov::Symbol;
+    second_cov::Union{Symbol, Nothing} = nothing,
+    n_points::Int = 50,
+    alpha::Float64 = 0.05
+)
+    # Conditional predictions require both the compiled model and posterior chain
+    if isnothing(model_obj) || isnothing(chain) || isnothing(M)
+        return nothing
+    end
+
+    n_samps = try
+        size(chain, 1)
+    catch
+        50
+    end
+
     is_categorical_movement = haskey(M, :method) && M.method == :categorical
 
     if is_categorical_movement
@@ -1493,9 +1859,9 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
             k_range = collect(min_k:max(1, (max_k - min_k) ÷ n_points):max(1, max_k))
             pred_df = vcat([deepcopy(base_df) for _ in k_range]...)
             pred_df[!, :k] = k_range
-            
-            preds = predict(model_obj, chain, pred_df; n_samples=size(chain, 1), alpha=alpha)
-            
+
+            preds = predict(model_obj, chain, pred_df; n_samples = n_samps, alpha = alpha)
+
             # Extract mean spatial probability vector summary across the k range
             mean_probs = preds.predictions_denoised.mean
             return (mean = mean_probs, lower = zeros(size(mean_probs)), upper = zeros(size(mean_probs))), k_range
@@ -1505,7 +1871,7 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
     end
 
     # --- Standard BSTM Conditional Predictions ---
-    if isnothing(M.data) || !hasproperty(M.data, target_cov)
+    if !hasproperty(M, :data) || isnothing(M.data) || !hasproperty(M.data, target_cov)
         return nothing
     end
 
@@ -1550,7 +1916,7 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
             cov_range = unique_levels
         end
 
-        preds = predict(model_obj, chain, pred_df; n_samples=size(chain, 1), alpha=alpha)
+        preds = predict(model_obj, chain, pred_df; n_samples = n_samps, alpha = alpha)
         return (preds.predictions_denoised, cov_range)
     else
         if !(eltype(M.data[!, target_cov]) <: Number && eltype(M.data[!, second_cov]) <: Number)
@@ -1571,7 +1937,7 @@ function _generate_conditional_predictions(model_obj, chain, M, target_cov::Symb
                 append!(pred_df_rows, row)
             end
         end
-        preds = predict(model_obj, chain, pred_df_rows; n_samples=size(chain, 1), alpha=alpha)
+        preds = predict(model_obj, chain, pred_df_rows; n_samples = n_samps, alpha = alpha)
         return (preds.predictions_denoised, range1, range2)
     end
 end
@@ -1620,27 +1986,52 @@ function _predict_categorical_movement(model_obj, chain, new_data::DataFrame, n_
     actual_samps = length(sample_indices)
 
     for (s_idx, chain_i) in enumerate(sample_indices)
-        # Extract parameter draws for this sample across groups
-        beta_draws  = [mean(extract_param_matrix(chain, "beta[$g]")[chain_i, :]) for g in 1:G] # Fallback extraction
-        D_draws     = [mean(extract_param_matrix(chain, "D_g[$g]")[chain_i, :]) for g in 1:G]
-        gamma_draws = [mean(extract_param_matrix(chain, "gamma[$g]")[chain_i, :]) for g in 1:G]
-
-        # Precompute group transition matrices and max power cache for this draw
-        max_k = maximum(ks)
-        Gk_cache_draw = map(1:G) do g
-            A_g = _build_A_ad(adj_rows, hsi, gamma_draws[g], S)
-            M_mat = I_S .- beta_draws[g] .* A_g .- D_draws[g] .* L_dense
-            Graw = inv(M_mat)
-            Gamma_1 = _row_normalise(Graw, S)
-            
-            if max_k > 1
-                higher_powers = accumulate(2:max_k; init=Gamma_1) do prev_Gamma, _
-                    _row_normalise(prev_Gamma * Gamma_1, S)
+        # Extract parameter draws for this sample across groups (supporting all parameter prefix conventions)
+        function _extract_draw_val(prefix, g, chain_idx)
+            candidates = [
+                "$(prefix)[$g]",
+                "$(prefix)_movement[$g]",
+                "$(prefix)_s_idx_t_idx[$g]",
+                "$(prefix)[$g, 1]",
+                "$(prefix)"
+            ]
+            for c in candidates
+                try
+                    mat = extract_param_matrix(chain, c)
+                    if size(mat, 1) >= chain_idx
+                        return Float64(mat[chain_idx, 1])
+                    end
+                catch
                 end
-                vcat([Gamma_1], higher_powers)
-            else
-                [Gamma_1]
             end
+            # Fallback legacy names
+            if prefix == "velocity"
+                try; return Float64(extract_param_matrix(chain, "beta[$g]")[chain_idx, 1]); catch; end
+            elseif prefix == "diffusion"
+                try; return Float64(extract_param_matrix(chain, "D_g[$g]")[chain_idx, 1]); catch; end
+            end
+            return prefix == "gamma" ? 1.0 : (prefix == "velocity" ? 0.3 : 0.1)
+        end
+
+        max_k = maximum(ks)
+        W_sp = sparse(W)
+        Gk_cache_draw = map(1:G) do g
+            v_val = _extract_draw_val("velocity", g, chain_i)
+            d_val = _extract_draw_val("diffusion", g, chain_i)
+            g_val = _extract_draw_val("gamma", g, chain_i)
+            tot   = v_val + d_val + 1e-6
+            alpha_g = clamp(v_val / tot, 0.0, 1.0)
+            rho_g   = clamp(1.0 / (1.0 + tot), 0.01, 0.95)
+
+            P_g = construct_stochastic_transition_kernel(
+                W_sp, hsi; gamma=g_val, residence=rho_g, advection=alpha_g
+            )
+            powers = Vector{Matrix{Float64}}(undef, max_k)
+            powers[1] = P_g
+            for k_step in 2:max_k
+                powers[k_step] = powers[k_step - 1] * P_g
+            end
+            powers
         end
 
         # Predict for each observation in new_data
@@ -1871,9 +2262,14 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
     PS = NamedTuple(PS_dict)
 
     raw_arch = get(M_train, :model_arch, "univariate")
-    arch_type = if raw_arch == "multivariate"; MultivariateArchitecture()
-    elseif raw_arch == "multifidelity"; MultifidelityArchitecture()
-    else; UnivariateArchitecture(); end 
+    arch_type = if raw_arch == "multivariate"
+        MultivariateArchitecture()
+    elseif raw_arch == "multifidelity" ||
+           (haskey(M_train, :nested_components) && !isempty(M_train.nested_components))
+        MultifidelityArchitecture()
+    else
+        UnivariateArchitecture()
+    end 
 
     res = _reconstruct(arch_type, "prediction", chain, M_train, PS, alpha)
 
@@ -2059,7 +2455,8 @@ function bstm_cv_orchestrator(formula::String, data::DataFrame; method::Symbol =
             bstm_core(formula, train_data; cv_kwargs...)
         end
 
-        chain_train = is_categorical_movement ? model_train.chain : sample(model_train, sampler, n_samples; progress=false)
+        chain_train = is_categorical_movement ? model_train.chain :
+            Base.invokelatest(sample, model_train, sampler, n_samples; progress=false)
         fit_obj = is_categorical_movement ? model_train : model_train
 
         res_pred = predict(fit_obj, chain_train, test_data; n_samples=div(n_samples, 2), alpha=alpha)
@@ -2150,25 +2547,50 @@ function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
         log_lik   = zeros(Float64, N_train, n_samples)
         
         max_k = maximum(ks)
-        for s in 1:n_samples
-            # Extract parameter draws for sample s across groups
-            beta_draws  = [mean(extract_param_matrix(chain, "beta[$g]")[s, :]) for g in 1:G]
-            D_draws     = [mean(extract_param_matrix(chain, "D_g[$g]")[s, :]) for g in 1:G]
-            gamma_draws = [mean(extract_param_matrix(chain, "gamma[$g]")[s, :]) for g in 1:G]
-            
-            Gk_cache_draw = map(1:G) do g
-                A_g = _build_A_ad(adj_rows, hsi, gamma_draws[g], S)
-                M_mat = I_S .- beta_draws[g] .* A_g .- D_draws[g] .* L_dense
-                Graw = inv(M_mat)
-                Gamma_1 = _row_normalise(Graw, S)
-                if max_k > 1
-                    higher_powers = accumulate(2:max_k; init=Gamma_1) do prev_Gamma, _
-                        _row_normalise(prev_Gamma * Gamma_1, S)
+        W_sp = sparse(W)
+        function _extract_loo_draw_val(prefix, g, chain_idx)
+            candidates = [
+                "$(prefix)[$g]",
+                "$(prefix)_movement[$g]",
+                "$(prefix)_s_idx_t_idx[$g]",
+                "$(prefix)[$g, 1]",
+                "$(prefix)"
+            ]
+            for c in candidates
+                try
+                    mat = extract_param_matrix(chain, c)
+                    if size(mat, 1) >= chain_idx
+                        return Float64(mat[chain_idx, 1])
                     end
-                    vcat([Gamma_1], higher_powers)
-                else
-                    [Gamma_1]
+                catch
                 end
+            end
+            if prefix == "velocity"
+                try; return Float64(extract_param_matrix(chain, "beta[$g]")[chain_idx, 1]); catch; end
+            elseif prefix == "diffusion"
+                try; return Float64(extract_param_matrix(chain, "D_g[$g]")[chain_idx, 1]); catch; end
+            end
+            return prefix == "gamma" ? 1.0 : (prefix == "velocity" ? 0.3 : 0.1)
+        end
+
+        for s in 1:n_samples
+            Gk_cache_draw = map(1:G) do g
+                v_val = _extract_loo_draw_val("velocity", g, s)
+                d_val = _extract_loo_draw_val("diffusion", g, s)
+                g_val = _extract_loo_draw_val("gamma", g, s)
+                tot   = v_val + d_val + 1e-6
+                alpha_g = clamp(v_val / tot, 0.0, 1.0)
+                rho_g   = clamp(1.0 / (1.0 + tot), 0.01, 0.95)
+
+                P_g = construct_stochastic_transition_kernel(
+                    W_sp, hsi; gamma=g_val, residence=rho_g, advection=alpha_g
+                )
+                powers = Vector{Matrix{Float64}}(undef, max_k)
+                powers[1] = P_g
+                for k_step in 2:max_k
+                    powers[k_step] = powers[k_step - 1] * P_g
+                end
+                powers
             end
             
             for n in 1:N_train

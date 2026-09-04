@@ -1883,54 +1883,84 @@ Construct the directed adjacency matrix A from the symmetric adjacency W and
 habitat suitability values HSI. Row i has non-zero entries only at W-neighbours
 of i, weighted by exp(γ HSI_j) and row-normalised:
 
-    A[i,j] = exp(γ HSI_j) / Σ_k W_ik exp(γ HSI_k)
+```math
+A[i,j] = \\frac{\\exp(\\gamma_i \\cdot \\text{HSI}_j)}{\\sum_{k \\in \\mathcal{N}(i)} \\exp(\\gamma_i \\cdot \\text{HSI}_k)}
+```
 
 γ > 0 biases movement towards higher HSI; γ = 0 gives the uniform random walk.
 
 # Arguments
-- `hsi::Vector{Float64}`: Habitat suitability per spatial unit (length S).
+- `hsi::AbstractVector{<:Real}`: Habitat suitability per spatial unit (length S).
 - `W::SparseMatrixCSC`: Symmetric binary adjacency matrix (S × S).
-- `gamma::Real`: Advection sensitivity to HSI gradient (default 1.0).
+- `gamma::Union{Real, AbstractVector{<:Real}}`: Advection sensitivity to HSI gradient
+  (default 1.0). May be a scalar or a spatially varying vector of length S.
 
 # Returns
-- Dense S × S matrix A with row-stochastic structure over W-neighbours.
+- `Matrix{Float64}`: Dense S × S matrix A with row-stochastic structure over W-neighbours.
 """
 function compute_directed_adjacency(
     hsi::AbstractVector{<:Real},
     W::SparseMatrixCSC;
-    gamma::Real = 1.0
+    gamma::Union{Real, AbstractVector{<:Real}} = 1.0
 )::Matrix{Float64}
-    
     S = size(W, 1)
     A = zeros(Float64, S, S)
     
-    # 1. Mathematically simplify and precompute exponents.
-    # exp(γ(HSI_j - HSI_i)) / Σ exp(γ(HSI_k - HSI_i)) simplifies exactly to
-    # exp(γ HSI_j) / Σ exp(γ HSI_k). This saves thousands of exp() calls.
-    exp_hsi = exp.(gamma .* hsi)
-    
-    for i in 1:S
-        # 2. Because W is symmetric, neighbors of row `i` are neighbors of col `i`.
-        # Accessing CSC columns via internal pointers is allocation-free and O(1).
-        col_start = W.colptr[i]
-        col_end   = W.colptr[i+1] - 1
-        
-        # Skip if no neighbors
-        col_start > col_end && continue 
-        
-        # 3. Calculate denominator
-        sw = 0.0
-        @inbounds for ptr in col_start:col_end
-            j = W.rowval[ptr]
-            sw += exp_hsi[j]
+    is_spatial = gamma isa AbstractVector
+    if is_spatial
+        n_g = length(gamma)
+        if n_g != S && n_g != 1
+            throw(DimensionMismatch(
+                "gamma vector has length $n_g, but must be scalar or match spatial units S=$S."
+            ))
         end
-        
-        sw <= 0.0 && continue
-        
-        # 4. Populate dense transition matrix A
-        @inbounds for ptr in col_start:col_end
-            j = W.rowval[ptr]
-            A[i, j] = exp_hsi[j] / sw
+        if n_g == 1
+            gamma_scalar = Float64(gamma[1])
+            is_spatial = false
+        end
+    else
+        gamma_scalar = Float64(gamma)
+    end
+
+    if !is_spatial
+        # Fast path: precompute exponents once for uniform scalar gamma
+        exp_hsi = exp.(gamma_scalar .* hsi)
+        for i in 1:S
+            col_start = W.colptr[i]
+            col_end   = W.colptr[i+1] - 1
+            col_start > col_end && continue 
+            
+            sw = 0.0
+            @inbounds for ptr in col_start:col_end
+                j = W.rowval[ptr]
+                sw += exp_hsi[j]
+            end
+            sw <= 0.0 && continue
+            
+            @inbounds for ptr in col_start:col_end
+                j = W.rowval[ptr]
+                A[i, j] = exp_hsi[j] / sw
+            end
+        end
+    else
+        # Spatially-varying gamma[i] per unit i
+        for i in 1:S
+            col_start = W.colptr[i]
+            col_end   = W.colptr[i+1] - 1
+            col_start > col_end && continue 
+            
+            g_i = Float64(gamma[i])
+            sw = 0.0
+            @inbounds for ptr in col_start:col_end
+                j = W.rowval[ptr]
+                sw += exp(g_i * Float64(hsi[j]))
+            end
+            sw <= 0.0 && continue
+            
+            @inbounds for ptr in col_start:col_end
+                j = W.rowval[ptr]
+                A[i, j] = exp(g_i * Float64(hsi[j])) / sw
+            end
         end
     end
     
@@ -2014,7 +2044,7 @@ function resolvent_transition(
     return Gamma
 end
 
-
+ 
 
 """
     _powerm(M, k) -> Matrix
@@ -2100,6 +2130,1398 @@ function power_transition(Gamma::AbstractMatrix{Float64}, k::Integer)::Matrix{Fl
     return Gk
 end
 
- 
+
+"""
+    construct_stochastic_transition_kernel(W, hsi; gamma=1.0, residence=0.2, advection=0.5, spatial=false)
+
+Constructs strictly row-stochastic, unconditionally non-negative discrete movement
+transition matrices ``P`` over spatial graph ``W``:
+
+```math
+P = (1 - \\rho) \\left[ (1 - \\alpha) T_{\\text{diff}} + \\alpha A \\right] + \\rho I
+```
+
+# Arguments
+- `W::SparseMatrixCSC`: Spatial adjacency matrix (size ``S \\times S``).
+- `hsi::AbstractVector{<:Real}`: Habitat suitability values per unit (length ``S``).
+- `gamma::Union{Real, AbstractVector{<:Real}}`: Sensitivity of directional advection to
+  the habitat gradient (default 1.0). May be scalar or vector across groups or units.
+- `residence::Union{Real, AbstractVector{<:Real}}`: Probability ``\\rho \\in [0, 1)`` of
+  remaining in current unit (default 0.2). May be scalar or vector across groups or units.
+- `advection::Union{Real, AbstractVector{<:Real}}`: Fraction ``\\alpha \\in [0, 1]`` of
+  directed movement vs random diffusion (default 0.5). May be scalar or vector.
+- `spatial::Bool`: When `true`, vector parameters of length ``S`` are interpreted as
+  spatially varying per unit ``s \\in 1:S``, returning a single ``S \\times S`` matrix.
+  When `false` (default), vector parameters of length ``G`` represent group-level
+  parameters across ``G`` biological groups, returning a `Vector{Matrix{Float64}}`.
+
+# Returns
+- `Matrix{Float64}`: If all parameters are scalars (or `spatial=true`), dense ``S \\times S``
+  row-stochastic transition probability matrix.
+- `Vector{Matrix{Float64}}`: If any parameter is an `AbstractVector` (and `spatial=false`),
+  vector of ``G`` dense ``S \\times S`` row-stochastic transition matrices.
+"""
+function construct_stochastic_transition_kernel(
+    W::SparseMatrixCSC,
+    hsi::AbstractVector{<:Real};
+    gamma::Union{Real, AbstractVector{<:Real}} = 1.0,
+    residence::Union{Real, AbstractVector{<:Real}} = 0.2,
+    advection::Union{Real, AbstractVector{<:Real}} = 0.5,
+    spatial::Bool = false,
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing
+)::Union{Matrix{Float64}, Vector{Matrix{Float64}}}
+    S = size(W, 1)
+
+    # 1. Unbiased topological random walk matrix T_diff (row-stochastic, independent of params)
+    T_diff = zeros(Float64, S, S)
+    for i in 1:S
+        col_start = W.colptr[i]
+        col_end   = W.colptr[i+1] - 1
+        deg_i = col_end - col_start + 1
+        if deg_i > 0 && col_start <= col_end
+            inv_deg = 1.0 / deg_i
+            @inbounds for ptr in col_start:col_end
+                j = W.rowval[ptr]
+                T_diff[i, j] = inv_deg
+            end
+        else
+            T_diff[i, i] = 1.0
+        end
+    end
+
+    # Helper to enforce land zero-transition barrier and row stochasticity
+    function _postprocess_kernel!(P_mat::Matrix{Float64})
+        if land_mask !== nothing
+            for i in 1:S
+                if land_mask[i]
+                    P_mat[i, :] .= 0.0
+                    P_mat[i, i] = 1.0
+                else
+                    for j in 1:S
+                        if land_mask[j]
+                            P_mat[i, j] = 0.0
+                        end
+                    end
+                    rs = sum(view(P_mat, i, :))
+                    if rs > 0.0
+                        P_mat[i, :] ./= rs
+                    else
+                        P_mat[i, i] = 1.0
+                    end
+                end
+            end
+        else
+            for i in 1:S
+                rs = sum(view(P_mat, i, :))
+                if rs > 0.0
+                    P_mat[i, :] ./= rs
+                else
+                    P_mat[i, i] = 1.0
+                end
+            end
+        end
+        return P_mat
+    end
+
+    # 2. Check for vector parameters
+    any_vector = (gamma isa AbstractVector) ||
+                 (residence isa AbstractVector) ||
+                 (advection isa AbstractVector)
+
+    if !any_vector
+        # Standard scalar parameter execution (backward-compatible)
+        rho = clamp(Float64(residence), 0.0, 0.9999)
+        alpha = clamp(Float64(advection), 0.0, 1.0)
+        A = compute_directed_adjacency(hsi, W; gamma=Float64(gamma))
+
+        P = Matrix{Float64}(undef, S, S)
+        w_move = 1.0 - rho
+        w_adv  = w_move * alpha
+        w_diff = w_move * (1.0 - alpha)
+
+        @inbounds for j in 1:S
+            for i in 1:S
+                val = w_adv * A[i, j] + w_diff * T_diff[i, j]
+                if i == j
+                    val += rho
+                end
+                P[i, j] = val
+            end
+        end
+
+        return _postprocess_kernel!(P)
+
+    elseif spatial
+        # Spatially-varying parameters across S spatial units
+        for (name, p) in (("gamma", gamma), ("residence", residence), ("advection", advection))
+            if p isa AbstractVector && length(p) != S && length(p) != 1
+                throw(DimensionMismatch(
+                    "In spatial mode, parameter `$name` has length $(length(p)), " *
+                    "but must match spatial units S=$S or be a scalar."
+                ))
+            end
+        end
+
+        rho_vec = residence isa AbstractVector ?
+            (length(residence) == 1 ? fill(Float64(residence[1]), S) : Float64.(residence)) :
+            fill(Float64(residence), S)
+        adv_vec = advection isa AbstractVector ?
+            (length(advection) == 1 ? fill(Float64(advection[1]), S) : Float64.(advection)) :
+            fill(Float64(advection), S)
+        g_vec = gamma isa AbstractVector ?
+            (length(gamma) == 1 ? fill(Float64(gamma[1]), S) : Float64.(gamma)) :
+            fill(Float64(gamma), S)
+
+        clamp!(rho_vec, 0.0, 0.9999)
+        clamp!(adv_vec, 0.0, 1.0)
+
+        A = compute_directed_adjacency(hsi, W; gamma=g_vec)
+
+        P = Matrix{Float64}(undef, S, S)
+        @inbounds for i in 1:S
+            rho_i    = rho_vec[i]
+            alpha_i  = adv_vec[i]
+            w_move_i = 1.0 - rho_i
+            w_adv_i  = w_move_i * alpha_i
+            w_diff_i = w_move_i * (1.0 - alpha_i)
+
+            for j in 1:S
+                val = w_adv_i * A[i, j] + w_diff_i * T_diff[i, j]
+                if i == j
+                    val += rho_i
+                end
+                P[i, j] = val
+            end
+        end
+
+        return _postprocess_kernel!(P)
+
+    else
+        # Group vector mode: construct distinct transition matrix per group g in 1:G
+        v_lengths = [length(p) for p in (gamma, residence, advection) if p isa AbstractVector]
+        G = maximum(v_lengths)
+
+        for (name, p) in (("gamma", gamma), ("residence", residence), ("advection", advection))
+            if p isa AbstractVector && length(p) != G && length(p) != 1
+                throw(DimensionMismatch(
+                    "Parameter `$name` has length $(length(p)), but expected length G=$G or 1."
+                ))
+            end
+        end
+
+        g_vec = gamma isa AbstractVector ?
+            (length(gamma) == 1 ? fill(Float64(gamma[1]), G) : Float64.(gamma)) :
+            fill(Float64(gamma), G)
+        rho_vec = residence isa AbstractVector ?
+            (length(residence) == 1 ? fill(Float64(residence[1]), G) : Float64.(residence)) :
+            fill(Float64(residence), G)
+        adv_vec = advection isa AbstractVector ?
+            (length(advection) == 1 ? fill(Float64(advection[1]), G) : Float64.(advection)) :
+            fill(Float64(advection), G)
+
+        kernels = Vector{Matrix{Float64}}(undef, G)
+        for g in 1:G
+            rho_g   = clamp(rho_vec[g], 0.0, 0.9999)
+            alpha_g = clamp(adv_vec[g], 0.0, 1.0)
+            A_g     = compute_directed_adjacency(hsi, W; gamma=g_vec[g])
+
+            P_g = Matrix{Float64}(undef, S, S)
+            w_move = 1.0 - rho_g
+            w_adv  = w_move * alpha_g
+            w_diff = w_move * (1.0 - alpha_g)
+
+            @inbounds for j in 1:S
+                for i in 1:S
+                    val = w_adv * A_g[i, j] + w_diff * T_diff[i, j]
+                    if i == j
+                        val += rho_g
+                    end
+                    P_g[i, j] = val
+                end
+            end
+
+            kernels[g] = _postprocess_kernel!(P_g)
+        end
+        return kernels
+    end
+end
 
 
+"""
+    predict_path(P::AbstractMatrix{<:Real}, release::Int, recapture::Int, k::Int;
+                 land_mask=nothing) -> Vector{Int}
+
+Computes the single most likely sequence of spatial units visited by an individual
+between `release` (time 0) and `recapture` (time `k`) using the Viterbi dynamic programming
+algorithm over the Markov transition kernel `P`:
+
+```math
+\\max_{s_1, \\dots, s_{k-1}} \\prod_{\\tau=1}^k P(s_{\\tau-1}, s_\\tau), \\quad s_0 = \\text{release}, \\; s_k = \\text{recapture}
+```
+
+# Arguments
+- `P`: Row-stochastic transition matrix (size ``S \\times S``).
+- `release`: Starting spatial unit index (1-indexed).
+- `recapture`: Destination spatial unit index at step `k` (1-indexed).
+- `k`: Total discrete time steps elapsed between release and recapture (``k \\ge 1``).
+- `land_mask`: Optional boolean vector of length ``S`` (`true` for land units). When provided,
+  all transitions to/from land units receive log-probability ``-10^{12}``, preventing Viterbi
+  trajectories from traversing terrestrial barriers.
+
+# Returns
+- `Vector{Int}`: Sequence of length ``k + 1`` containing unit indices from `release` to `recapture`.
+"""
+function predict_path(
+    P::AbstractMatrix{<:Real},
+    release::Int,
+    recapture::Int,
+    k::Int;
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing
+)::Vector{Int}
+    S = size(P, 1)
+    if !(1 <= release <= S) || !(1 <= recapture <= S)
+        error("Release unit ($release) and recapture unit ($recapture) must be within 1:$S.")
+    end
+    if k < 1
+        return [release]
+    elseif k == 1
+        return [release, recapture]
+    end
+
+    # Log-probability transition matrix
+    T_val = Float64
+    logP = Matrix{T_val}(undef, S, S)
+    @inbounds for j in 1:S
+        for i in 1:S
+            p_ij = Float64(P[i, j])
+            logP[i, j] = p_ij > 1e-15 ? log(p_ij) : -1e12
+        end
+    end
+
+    # Enforce land barrier in Viterbi trellis: zero transition into or out of land
+    if land_mask !== nothing
+        for l in 1:S
+            if land_mask[l]
+                logP[:, l] .= -1e12
+                logP[l, :] .= -1e12
+            end
+        end
+    end
+
+    # Forward Viterbi trellis: delta[s, tau] is max log-prob to be at unit s at step tau
+    delta = fill(-1e12, S, k + 1)
+    psi   = zeros(Int, S, k + 1)
+
+    delta[release, 1] = 0.0
+
+    for tau in 2:(k + 1)
+        prev_tau = tau - 1
+        for j in 1:S
+            best_val = -Inf
+            best_prev = 1
+            for i in 1:S
+                score = delta[i, prev_tau] + logP[i, j]
+                if score > best_val
+                    best_val = score
+                    best_prev = i
+                end
+            end
+            delta[j, tau] = best_val
+            psi[j, tau]   = best_prev
+        end
+    end
+
+    # Backtrack from target recapture unit at step k+1
+    path = zeros(Int, k + 1)
+    path[k + 1] = recapture
+    for tau in (k + 1):-1:2
+        path[tau - 1] = psi[path[tau], tau]
+    end
+
+    return path
+end
+
+
+"""
+    predict_corridor(P::AbstractMatrix{<:Real}, release::Int, recapture::Int, k::Int;
+                     land_mask=nothing) -> Matrix{Float64}
+
+Computes the Markov bridge probability distribution across all spatial units at each
+intermediate time step ``\\tau \\in \\{0, 1, \\dots, k\\}``:
+
+```math
+\\mathbb{P}(X_\\tau = j \\mid X_0 = u_{\\text{rel}}, X_k = u_{\\text{rec}}) = 
+\\frac{[P^\\tau]_{u_{\\text{rel}}, j} \\cdot [P^{k - \\tau}]_{j, u_{\\text{rec}}}}{[P^k]_{u_{\\text{rel}}, u_{\\text{rec}}}}
+```
+
+# Arguments
+- `P`: Row-stochastic transition matrix (size ``S \\times S``).
+- `release`: Starting spatial unit index (1-indexed).
+- `recapture`: Destination spatial unit index at step `k` (1-indexed).
+- `k`: Total discrete time steps elapsed between release and recapture (``k \\ge 1``).
+- `land_mask`: Optional boolean vector of length ``S`` (`true` for land units). When provided,
+  all probability mass on land units is strictly zeroed out and columns are renormalized
+  over navigable marine units.
+
+# Returns
+- `Matrix{Float64}`: Array of size ``(S, k + 1)`` where column ``\\tau + 1`` gives the spatial
+  probability distribution over all ``S`` units at time step ``\\tau``. Each column sums to 1.0.
+"""
+function predict_corridor(
+    P::AbstractMatrix{<:Real},
+    release::Int,
+    recapture::Int,
+    k::Int;
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing
+)::Matrix{Float64}
+    S = size(P, 1)
+    if !(1 <= release <= S) || !(1 <= recapture <= S)
+        error("Release unit ($release) and recapture unit ($recapture) must be within 1:$S.")
+    end
+
+    P_mat = Matrix{Float64}(P)
+    corridor = zeros(Float64, S, k + 1)
+
+    if k <= 0
+        corridor[release, 1] = 1.0
+        return corridor
+    end
+
+    # Precompute powers P^tau for tau = 0 to k
+    P_powers = Vector{Matrix{Float64}}(undef, k + 1)
+    P_powers[1] = Matrix{Float64}(I, S, S)
+    for tau in 1:k
+        P_powers[tau + 1] = P_powers[tau] * P_mat
+    end
+
+    # Total likelihood of transitioning from release to recapture in k steps
+    P_total = P_powers[k + 1][release, recapture]
+
+    if P_total <= 1e-15
+        @warn "Recapture unit $recapture has near-zero reachability from release $release in $k steps."
+        if land_mask !== nothing
+            n_water = count(!, land_mask)
+            w_val = n_water > 0 ? 1.0 / n_water : 1.0 / S
+            for j in 1:S
+                corridor[j, :] .= land_mask[j] ? 0.0 : w_val
+            end
+        else
+            corridor[:, :] .= 1.0 / S
+        end
+        corridor[release, 1] = 1.0
+        corridor[recapture, k + 1] = 1.0
+        return corridor
+    end
+
+    # Markov bridge formula for each intermediate step tau = 0 .. k
+    for tau in 0:k
+        tau_idx = tau + 1
+        rem_idx = (k - tau) + 1
+        for j in 1:S
+            prob_fwd = P_powers[tau_idx][release, j]
+            prob_bwd = P_powers[rem_idx][j, recapture]
+            corridor[j, tau_idx] = (prob_fwd * prob_bwd) / P_total
+        end
+        # Enforce land barrier: strictly zero probability on land
+        if land_mask !== nothing
+            for l in 1:S
+                if land_mask[l]
+                    corridor[l, tau_idx] = 0.0
+                end
+            end
+        end
+        # Normalize column
+        col_sum = sum(view(corridor, :, tau_idx))
+        if col_sum > 0.0
+            corridor[:, tau_idx] ./= col_sum
+        end
+    end
+
+    return corridor
+end
+
+
+# Convenience overloads for result dictionaries / named tuples
+function predict_path(
+    res::NamedTuple, release::Int, recapture::Int, k::Int;
+    group::Union{String, Symbol, Int} = 1,
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing
+)
+    mask = land_mask !== nothing ? land_mask :
+        (hasproperty(res, :land_mask) ? res.land_mask : nothing)
+    if hasproperty(res, :transition_matrices)
+        tm = res.transition_matrices
+        key = group isa Int ?
+            (hasproperty(res, :group_lookup) ? res.group_lookup[group] : first(keys(tm))) :
+            string(group)
+        P = tm[key]
+        return predict_path(P, release, recapture, k; land_mask=mask)
+    else
+        error("Expected a result NamedTuple with field `:transition_matrices`.")
+    end
+end
+
+function predict_corridor(
+    res::NamedTuple, release::Int, recapture::Int, k::Int;
+    group::Union{String, Symbol, Int} = 1,
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing
+)
+    mask = land_mask !== nothing ? land_mask :
+        (hasproperty(res, :land_mask) ? res.land_mask : nothing)
+    if hasproperty(res, :transition_matrices)
+        tm = res.transition_matrices
+        key = group isa Int ?
+            (hasproperty(res, :group_lookup) ? res.group_lookup[group] : first(keys(tm))) :
+            string(group)
+        P = tm[key]
+        return predict_corridor(P, release, recapture, k; land_mask=mask)
+    else
+        error("Expected a result NamedTuple with field `:transition_matrices`.")
+    end
+end
+
+"""
+    predict_path(P_vec::AbstractVector{<:AbstractMatrix{<:Real}}, release::Int, recapture::Int, k::Int;
+                 group::Union{Integer, Symbol, AbstractString} = 1,
+                 land_mask::Union{Nothing, AbstractVector{Bool}} = nothing) -> Vector{Int}
+
+Group-aware overload for `predict_path` when given a vector of group-specific transition matrices.
+Reconstructs the most likely sequence of spatial units (Viterbi path) for the specified group.
+
+# Mathematical Formulation
+Given group index ``g``, the dynamic programming Viterbi trellis identifies:
+```math
+\\mathbf{s}^* = \\arg\\max_{\\mathbf{s}} \\prod_{\\tau=1}^k [P_g]_{s_{\\tau-1}, s_\\tau}
+```
+subject to ``s_0 = u_{\\text{rel}}`` and ``s_k = u_{\\text{rec}}``.
+
+# Arguments
+- `P_vec`: Collection of row-stochastic transition matrices for each biological group.
+- `release`: Starting spatial unit index (1-indexed).
+- `recapture`: Destination spatial unit index at step `k` (1-indexed).
+- `k`: Number of discrete time intervals elapsed.
+- `group`: 1-based integer index or group label.
+- `land_mask`: Optional boolean mask of impermeable barrier units.
+
+# Returns
+- `Vector{Int}`: Sequence of ``k + 1`` spatial unit indices from `release` to `recapture`.
+"""
+function predict_path(
+    P_vec::AbstractVector{<:AbstractMatrix{<:Real}},
+    release::Int,
+    recapture::Int,
+    k::Int;
+    group::Union{Integer, Symbol, AbstractString} = 1,
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing
+)::Vector{Int}
+    if isempty(P_vec)
+        throw(ArgumentError("P_vec transition kernel vector cannot be empty."))
+    end
+    g_idx = if group isa Integer
+        Int(group)
+    else
+        parsed = tryparse(Int, string(group))
+        parsed !== nothing ? parsed : 1
+    end
+    if !(1 <= g_idx <= length(P_vec))
+        throw(ArgumentError("Group index $g_idx is out of bounds (1:$(length(P_vec)))."))
+    end
+    return predict_path(P_vec[g_idx], release, recapture, k; land_mask=land_mask)
+end
+
+"""
+    predict_corridor(P_vec::AbstractVector{<:AbstractMatrix{<:Real}}, release::Int, recapture::Int, k::Int;
+                     group::Union{Integer, Symbol, AbstractString} = 1,
+                     land_mask::Union{Nothing, AbstractVector{Bool}} = nothing) -> Matrix{Float64}
+
+Group-aware overload for `predict_corridor` when given a vector of group-specific transition matrices.
+Computes the Markov bridge probability distribution across spatial units for the specified group.
+
+# Mathematical Formulation
+Given group index ``g``, the Markov bridge probability at intermediate step ``\\tau`` is:
+```math
+\\mathbb{P}(X_\\tau = j \\mid X_0 = u_{\\text{rel}}, X_k = u_{\\text{rec}}) = 
+\\frac{[P_g^\\tau]_{u_{\\text{rel}}, j} \\cdot [P_g^{k - \\tau}]_{j, u_{\\text{rec}}}}{[P_g^k]_{u_{\\text{rel}}, u_{\\text{rec}}}}
+```
+
+# Arguments
+- `P_vec`: Collection of row-stochastic transition matrices for each biological group.
+- `release`: Starting spatial unit index (1-indexed).
+- `recapture`: Destination spatial unit index at step `k` (1-indexed).
+- `k`: Number of discrete time intervals elapsed.
+- `group`: 1-based integer index or group label.
+- `land_mask`: Optional boolean mask of impermeable barrier units.
+
+# Returns
+- `Matrix{Float64}`: Array of size ``(S, k + 1)`` where column ``\\tau + 1`` gives the spatial
+  probability distribution over all units at time step ``\\tau``.
+"""
+function predict_corridor(
+    P_vec::AbstractVector{<:AbstractMatrix{<:Real}},
+    release::Int,
+    recapture::Int,
+    k::Int;
+    group::Union{Integer, Symbol, AbstractString} = 1,
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing
+)::Matrix{Float64}
+    if isempty(P_vec)
+        throw(ArgumentError("P_vec transition kernel vector cannot be empty."))
+    end
+    g_idx = if group isa Integer
+        Int(group)
+    else
+        parsed = tryparse(Int, string(group))
+        parsed !== nothing ? parsed : 1
+    end
+    if !(1 <= g_idx <= length(P_vec))
+        throw(ArgumentError("Group index $g_idx is out of bounds (1:$(length(P_vec)))."))
+    end
+    return predict_corridor(P_vec[g_idx], release, recapture, k; land_mask=land_mask)
+end
+
+
+# ==============================================================================
+# Domain Tessellation, Autocorrelation Infilling & Land Barrier Engine
+# ==============================================================================
+
+"""
+    point_in_polygon(x::Real, y::Real, poly) -> Bool
+
+Tests whether planar or geographic coordinate `(x, y)` lies inside a closed 2D polygon
+or MultiPolygon using the classical ray-casting (even-odd crossing) algorithm.
+
+# Mathematical Formulation
+A horizontal ray is cast from point ``(x, y)`` along the positive ``x``-axis to ``+\\infty``.
+For each polygon edge connecting vertices ``(x_i, y_i)`` and ``(x_j, y_j)``:
+```math
+\\text{crosses}(e) = ((y_i > y) \\ne (y_j > y)) \\land 
+\\left( x < \\frac{(x_j - x_i)(y - y_i)}{y_j - y_i} + x_i \\right)
+```
+The query point is inside if and only if the total edge crossing count is odd:
+```math
+\\text{inside} = \\left( \\sum_{e \\in E} \\mathbb{I}[\\text{crosses}(e)] \\right) \\pmod 2 = 1
+```
+
+# Arguments
+- `x::Real`: Longitude or planar x-coordinate of query point.
+- `y::Real`: Latitude or planar y-coordinate of query point.
+- `poly`: Polygon geometry representation. Supports:
+  - `Vector{Tuple{<:Real, <:Real}}` or `Vector{<:AbstractVector{<:Real}}`: Single polygon ring.
+  - `Vector{Vector{...}}`: Collection of polygon rings (MultiPolygon / archipelago).
+  - `LibGEOS.AbstractGeometry`: Geometric polygon object via LibGEOS.
+
+# Returns
+- `Bool`: `true` if `(x, y)` is inside the polygon interior, `false` otherwise.
+"""
+function point_in_polygon(x::Real, y::Real, poly)::Bool
+    if poly isa AbstractVector && !isempty(poly) && first(poly) isa AbstractVector
+        for sub_poly in poly
+            if point_in_polygon(x, y, sub_poly)
+                return true
+            end
+        end
+        return false
+    end
+
+    n = length(poly)
+    n < 3 && return false
+    inside = false
+    j = n
+    px = Float64(x)
+    py = Float64(y)
+    @inbounds for i in 1:n
+        pt_i = poly[i]
+        pt_j = poly[j]
+        xi = Float64(pt_i[1])
+        yi = Float64(pt_i[2])
+        xj = Float64(pt_j[1])
+        yj = Float64(pt_j[2])
+
+        if ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)
+            inside = !inside
+        end
+        j = i
+    end
+    return inside
+end
+
+function point_in_polygon(x::Real, y::Real, geom::LibGEOS.AbstractGeometry)::Bool
+    pt = LibGEOS.Point(Float64(x), Float64(y))
+    return LibGEOS.contains(geom, pt)
+end
+
+
+"""
+Curated geographic boundary coordinates for the Canadian Maritime region, enclosing
+major terrestrial landmasses while preserving marine straits (Cabot Strait, Northumberland
+Strait, Bay of Fundy, Chedabucto Bay, and Scotian Shelf coastal waters).
+"""
+const _DEFAULT_MARITIMES_LAND_POLYGONS = [
+    # 1. Cape Breton Island
+    [
+        (-60.45, 47.05), (-60.38, 46.90), (-60.38, 46.65), (-60.45, 46.30),
+        (-60.15, 46.25), (-59.75, 46.15), (-59.85, 45.85), (-60.50, 45.60),
+        (-61.00, 45.48), (-61.40, 45.65), (-61.50, 45.90), (-61.25, 46.25),
+        (-61.05, 46.65), (-60.75, 46.90), (-60.55, 47.05), (-60.45, 47.05)
+    ],
+    # 2. Nova Scotia Mainland
+    [
+        (-61.40, 45.60), (-61.50, 45.45), (-61.20, 45.35), (-60.99, 45.33),
+        (-61.50, 45.10), (-62.50, 44.80), (-63.50, 44.55), (-64.20, 44.40),
+        (-64.70, 44.00), (-65.30, 43.50), (-65.65, 43.40), (-66.15, 43.80),
+        (-66.25, 44.20), (-65.75, 44.65), (-65.00, 45.15), (-64.35, 45.35),
+        (-64.40, 45.85), (-63.70, 45.85), (-62.60, 45.75), (-61.90, 45.75),
+        (-61.40, 45.60)
+    ],
+    # 3. Prince Edward Island
+    [
+        (-64.40, 46.95), (-64.00, 46.60), (-63.50, 46.50), (-62.50, 46.45),
+        (-61.95, 46.40), (-62.40, 46.00), (-63.00, 45.95), (-63.80, 46.20),
+        (-64.40, 46.60), (-64.40, 46.95)
+    ],
+    # 4. New Brunswick & Quebec / Gaspe coast
+    [
+        (-64.40, 45.85), (-64.50, 45.80), (-64.70, 45.50), (-65.50, 45.30),
+        (-67.00, 45.00), (-68.50, 45.50), (-69.50, 48.00), (-68.00, 49.00),
+        (-65.00, 49.20), (-64.20, 48.80), (-64.80, 48.00), (-64.80, 47.00),
+        (-64.50, 46.20), (-64.40, 45.85)
+    ]
+]
+
+
+"""
+    identify_land_units(
+        centroids::AbstractVector;
+        land_polygons::Union{Nothing, Symbol, AbstractVector} = nothing,
+        depth::Union{Nothing, AbstractVector{<:Real}} = nothing,
+        depth_threshold::Real = 0.0
+    ) -> Vector{Bool}
+
+Classifies spatial partitioning units as terrestrial land (`true`) or navigable marine water
+(`false`) using boundary polygons, bathymetric depth thresholds, or regional defaults.
+
+# Mathematical Formulation
+A spatial unit ``s \\in \\{1, \\dots, S\\}`` with centroid ``\\mathbf{c}_s = (x_s, y_s)`` is classified
+as land if it satisfies either geometric boundary polygon inclusion or the bathymetric threshold:
+```math
+\\text{is\\_land}(s) = (\\exists p \\in \\mathcal{P} : \\mathbf{c}_s \\in p) \\lor (d_s \\le d_{\\text{thresh}})
+```
+where ``\\mathcal{P}`` is the set of land boundary polygons and ``d_s`` is the bathymetric depth.
+
+# Arguments
+- `centroids`: Vector of coordinate tuples `(x, y)` or `(lon, lat)` for all ``S`` units.
+- `land_polygons`: Optional polygon or collection of polygons.
+  - `nothing`: If `depth` is also `nothing`, defaults to `:maritimes` (curated NW Atlantic coastline).
+  - `:maritimes` or `:default`: Uses built-in Nova Scotia, Cape Breton, PEI, and NB/QC polygons.
+  - `Vector{...}`: User-provided polygon rings or MultiPolygon coordinate vectors.
+- `depth`: Optional bathymetric depth vector of length ``S`` (positive values indicate water depth).
+- `depth_threshold`: Scalar threshold below which a unit is classified as land (default `0.0`).
+
+# Returns
+- `Vector{Bool}`: Boolean mask of length ``S`` where `true` indicates a terrestrial land unit.
+"""
+function identify_land_units(
+    centroids::AbstractVector;
+    land_polygons::Union{Nothing, Symbol, AbstractVector} = nothing,
+    depth::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    depth_threshold::Real = 0.0
+)::Vector{Bool}
+    S = length(centroids)
+    land_mask = falses(S)
+
+    # 1. Depth thresholding
+    if depth !== nothing
+        if length(depth) != S
+            throw(DimensionMismatch(
+                "Depth vector length ($(length(depth))) must match centroids length ($S)."
+            ))
+        end
+        for i in 1:S
+            if isfinite(depth[i]) && depth[i] <= depth_threshold
+                land_mask[i] = true
+            end
+        end
+    end
+
+    # 2. Polygon boundaries
+    polys = if land_polygons === nothing
+        _DEFAULT_MARITIMES_LAND_POLYGONS
+    elseif land_polygons in (:none, :false, false)
+        nothing
+    elseif land_polygons in (:maritimes, :default)
+        _DEFAULT_MARITIMES_LAND_POLYGONS
+    else
+        land_polygons
+    end
+
+    if polys !== nothing
+        for i in 1:S
+            land_mask[i] && continue
+            c = centroids[i]
+            x, y = Float64(c[1]), Float64(c[2])
+            if point_in_polygon(x, y, polys)
+                land_mask[i] = true
+            end
+        end
+    end
+
+    return land_mask
+end
+
+
+"""
+    apply_land_barrier(
+        W::AbstractMatrix{<:Real},
+        hsi::AbstractVector{<:Real},
+        land_mask::AbstractVector{Bool}
+    ) -> Tuple{SparseMatrixCSC{Float64, Int}, Vector{Float64}}
+
+Enforces impassable terrestrial movement barriers on the spatial adjacency graph ``W`` and
+habitat suitability vector ``\\mathbf{h}``, severing all topological connections across land.
+
+# Mathematical Formulation
+Let ``\\mathcal{L} = \\{l \\mid \\text{land\\_mask}[l] = \\text{true}\\}`` be the set of land units,
+and ``\\mathcal{W} = \\{w \\mid \\text{land\\_mask}[w] = \\text{false}\\}`` be marine water units.
+All directed and undirected edges incident to any land unit are strictly eliminated:
+```math
+W^{\\text{water}}_{ij} = \\begin{cases} 
+W_{ij} & \\text{if } i \\in \\mathcal{W} \\land j \\in \\mathcal{W} \\\\
+0 & \\text{otherwise}
+\\end{cases}
+```
+Habitat suitability values on land are set to zero:
+```math
+h^{\\text{water}}_i = \\begin{cases}
+h_i & \\text{if } i \\in \\mathcal{W} \\\\
+0.0 & \\text{if } i \\in \\mathcal{L}
+\\end{cases}
+```
+This guarantees that topological random walks (``T_{\\text{diff}}``) and directed advection (``A``)
+have zero probability of transitioning onto or through land masses:
+```math
+P(X_{t+1} \\in \\mathcal{L} \\mid X_t \\in \\mathcal{W}) = 0
+```
+
+# Arguments
+- `W`: Spatial graph adjacency matrix (size ``S \\times S``).
+- `hsi`: Habitat suitability vector (length ``S``).
+- `land_mask`: Boolean vector of length ``S`` (`true` for land units).
+
+# Returns
+- `Tuple{SparseMatrixCSC{Float64, Int}, Vector{Float64}}`:
+  - `W_water`: Severed adjacency matrix with all land connections removed and zeros dropped.
+  - `hsi_water`: Habitat suitability vector with land units zeroed out.
+"""
+function apply_land_barrier(
+    W::AbstractMatrix{<:Real},
+    hsi::AbstractVector{<:Real},
+    land_mask::AbstractVector{Bool}
+)::Tuple{SparseMatrixCSC{Float64, Int}, Vector{Float64}}
+    S = size(W, 1)
+    if length(hsi) != S || length(land_mask) != S
+        throw(DimensionMismatch(
+            "Dimension mismatch: W is $(S)x$(S), hsi has length $(length(hsi)), " *
+            "and land_mask has length $(length(land_mask))."
+        ))
+    end
+
+    W_water = copy(sparse(Float64.(W)))
+    for l in findall(land_mask)
+        W_water[l, :] .= 0.0
+        W_water[:, l] .= 0.0
+    end
+    dropzeros!(W_water)
+
+    hsi_water = copy(Float64.(hsi))
+    hsi_water[land_mask] .= 0.0
+
+    return (W_water, hsi_water)
+end
+
+
+"""
+    infill_spatial_hsi(
+        hsi_raw::AbstractVector{<:Real},
+        W::AbstractMatrix{<:Real},
+        known_mask::AbstractVector{Bool};
+        land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+        centroids::Union{Nothing, AbstractVector} = nothing,
+        rho::Real = 0.95,
+        baseline_quantile::Real = 0.1,
+        fallback_decay_km::Real = 50.0
+    ) -> Vector{Float64}
+
+Infills missing Habitat Suitability Index (HSI) values outside the primary survey domain
+using a data-driven graph-Laplacian screened Dirichlet system constrained to marine water channels.
+
+# Mathematical Formulation
+The spatial domain is partitioned into known survey units ``\\mathcal{K}``, unknown marine units
+``\\mathcal{U}``, and terrestrial land units ``\\mathcal{L}``. On the severed water graph
+``W^{\\text{water}}``, the conditional expectation of unknown HSI values satisfies:
+```math
+(D_{\\mathcal{UU}} - \\rho W_{\\mathcal{UU}}) \\mathbf{h}_{\\mathcal{U}} = 
+\\rho W_{\\mathcal{UK}} \\mathbf{h}_{\\mathcal{K}} + (1 - \\rho) D_{\\mathcal{UU}} \\mu_0 \\mathbf{1}
+```
+where:
+- ``D_{\\mathcal{UU}} = \\operatorname{diag}\\left( \\sum_{j \\in \\mathcal{W}} W_{ij} \\right)_{i \\in \\mathcal{U}}``
+  is the total degree of each unknown node in the water graph.
+- ``W_{\\mathcal{UU}}`` is the internal adjacency submatrix among unknown water nodes.
+- ``W_{\\mathcal{UK}}`` connects unknown water nodes to adjacent known survey nodes.
+- ``\\rho \\in (0, 1)`` controls spatial autocorrelation strength (default 0.95).
+- ``\\mu_0 = \\operatorname{quantile}(\\mathbf{h}_{\\mathcal{K}}, \\text{baseline\\_quantile})``
+  is the empirical conservative baseline HSI for distant unsampled marine waters.
+
+Because ``W^{\\text{water}}`` has all land edges severed, the Dirichlet diffusion flows strictly
+around peninsulas and through marine straits (e.g. Cabot Strait), never jumping across land.
+Isolated water components without graph connections to known units decay smoothly to ``\\mu_0``
+or utilize an exponential spatial covariance fallback ``K(d) = \\exp(-d / \\ell)``.
+
+# Arguments
+- `hsi_raw`: Vector of observed HSI values (length ``S``).
+- `W`: Spatial graph adjacency matrix (size ``S \\times S``).
+- `known_mask`: Boolean vector of length ``S`` (`true` where HSI is observed).
+- `land_mask`: Optional boolean vector of length ``S`` (`true` for land units).
+- `centroids`: Optional coordinates vector for spatial distance fallback on disconnected units.
+- `rho`: Spatial autocorrelation strength parameter in ``(0, 1)`` (default 0.95).
+- `baseline`: Optional scalar baseline prior mean for unobserved regions. If `nothing`,
+  defaults to empirical quantile `baseline_quantile` of known values.
+- `baseline_quantile`: Empirical quantile of known HSI used as prior baseline (default 0.1).
+- `fallback_decay_km`: Spatial correlation length scale in km for disconnected units (default 50.0).
+
+# Returns
+- `Vector{Float64}`: Infilled HSI vector of length ``S`` bounded in ``[0, 1]`` with land units set to 0.0.
+"""
+function infill_spatial_hsi(
+    hsi_raw::AbstractVector{<:Real},
+    W::AbstractMatrix{<:Real},
+    known_mask::AbstractVector{Bool};
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+    centroids::Union{Nothing, AbstractVector} = nothing,
+    rho::Real = 0.95,
+    baseline::Union{Nothing, Real} = nothing,
+    baseline_quantile::Real = 0.1,
+    fallback_decay_km::Real = 50.0
+)::Vector{Float64}
+    S = size(W, 1)
+    if length(hsi_raw) != S || length(known_mask) != S
+        throw(DimensionMismatch("hsi_raw, W, and known_mask dimensions must match."))
+    end
+
+    mask_l = land_mask === nothing ? falses(S) : land_mask
+    hsi_out = copy(Float64.(hsi_raw))
+
+    # Land units are set to 0.0
+    hsi_out[mask_l] .= 0.0
+
+    # Unknown water units
+    unknown_idx = findall(.!known_mask .& .!mask_l)
+    known_idx   = findall(known_mask .& .!mask_l)
+
+    if isempty(unknown_idx)
+        return hsi_out
+    end
+
+    # Baseline prior mean from known survey values or explicit baseline
+    known_vals = filter(isfinite, hsi_out[known_idx])
+    mu0 = if baseline !== nothing
+        Float64(baseline)
+    elseif isempty(known_vals)
+        0.2
+    else
+        Float64(quantile(known_vals, baseline_quantile))
+    end
+
+    # Graph degree vector (summing only water connections)
+    W_sp = sparse(W)
+    D = vec(sum(W_sp, dims=2))
+
+    W_uu = W_sp[unknown_idx, unknown_idx]
+    W_uk = W_sp[unknown_idx, known_idx]
+    D_uu = Diagonal(D[unknown_idx])
+
+    rho_val = clamp(Float64(rho), 0.5, 0.999)
+    A_mat = D_uu - rho_val * W_uu
+    b_vec = rho_val * (W_uk * hsi_out[known_idx]) + (1.0 - rho_val) * (D[unknown_idx] .* mu0)
+
+    # For any isolated nodes (degree == 0), regularize diagonal to yield mu0
+    for (k_sub, u) in enumerate(unknown_idx)
+        if D[u] < 1e-12
+            A_mat[k_sub, k_sub] = 1.0
+            b_vec[k_sub] = mu0
+        end
+    end
+
+    # Solve the screened Dirichlet system
+    h_u = try
+        A_mat \ b_vec
+    catch e
+        @warn "infill_spatial_hsi: direct solve failed ($e); using regularized solve."
+        (A_mat + 1e-4 * I) \ b_vec
+    end
+
+    # Fallback distance decay for units with no direct path to survey area
+    if centroids !== nothing && !isempty(known_idx)
+        tree_known = KDTree(hcat([[Float64(c[1]), Float64(c[2])] for c in centroids[known_idx]]...))
+        for (k_sub, u) in enumerate(unknown_idx)
+            has_survey_conn = sum(W_uk[k_sub, :]) > 0.0
+            if !has_survey_conn
+                c_u = centroids[u]
+                idx_nn, dists = knn(tree_known, [Float64(c_u[1]), Float64(c_u[2])], 1)
+                nn_unit = known_idx[first(idx_nn)]
+                d_val = first(dists)
+                w_dist = exp(-d_val / fallback_decay_km)
+                h_u[k_sub] = w_dist * hsi_out[nn_unit] + (1.0 - w_dist) * mu0
+            end
+        end
+    end
+
+    # Bound filled values in [0.0, 1.0]
+    for (k_sub, u) in enumerate(unknown_idx)
+        hsi_out[u] = clamp(h_u[k_sub], 0.0, 1.0)
+    end
+
+    return hsi_out
+end
+
+
+"""
+    construct_full_movement_domain(
+        lon_vec::AbstractVector{<:Real},
+        lat_vec::AbstractVector{<:Real};
+        radius_km::Real = 15.0,
+        land_polygons = nothing,
+        depth = nothing,
+        depth_threshold::Real = 0.0,
+        crs = nothing,
+        datum = WGS84Latest
+    ) -> NamedTuple
+
+Generates a unified data-driven spatial tessellation covering the complete movement domain
+(including areas outside the core survey domain), identifies terrestrial land units, and
+severs land edges to form contiguous marine movement channels.
+
+# Mathematical Formulation
+A regular planar hexagonal lattice of circumradius ``r`` is generated across the bounding
+envelope of all spatial observations:
+```math
+\\Delta x = \\sqrt{3} r, \\quad \\Delta y = \\frac{3}{2} r
+```
+Centroids ``\\mathbf{c}_s`` are classified as land via `identify_land_units`. Land-water edges
+in graph ``W`` are severed via `apply_land_barrier`, creating a topological state space where
+marine passages remain fully connected while landmasses act as impenetrable barriers.
+
+# Arguments
+- `lon_vec, lat_vec`: Geographic coordinates encompassing the full observation domain.
+- `radius_km`: Hexagon circumradius in km (default 15.0 km).
+- `land_polygons`: Optional land boundary polygons (defaults to `:maritimes`).
+- `depth`: Optional depth vector matching units.
+- `depth_threshold`: Bathymetric cutoff below which units are classified as land (default 0.0).
+- `crs`: Coordinate reference system (default local tangent projection).
+- `datum`: Reference ellipsoid datum (default `WGS84Latest`).
+
+# Returns
+- `NamedTuple`:
+  - `centroids_km`, `centroids_lonlat`: Centroid coordinates in km and degrees.
+  - `polygons_km`, `polygons_lonlat`: Hexagonal cell boundary vertex rings.
+  - `n_units::Int`: Total count of spatial units ``S``.
+  - `W`: Cleaned adjacency matrix with land edges severed.
+  - `W_raw`: Original geometric adjacency matrix prior to land barrier severing.
+  - `land_mask`: Boolean vector of length ``S`` indicating land units.
+  - `radius_km`: Hexagon radius in km.
+  - `areas_km2`: Cell area per unit.
+  - `center_lon`, `center_lat`: Projection origin.
+"""
+function construct_full_movement_domain(
+    lon_vec::AbstractVector{<:Real},
+    lat_vec::AbstractVector{<:Real};
+    radius_km::Real = 15.0,
+    land_polygons = nothing,
+    depth = nothing,
+    depth_threshold::Real = 0.0,
+    crs = nothing,
+    datum = WGS84Latest
+)::NamedTuple
+    lon_min, lon_max = extrema(lon_vec)
+    lat_min, lat_max = extrema(lat_vec)
+
+    center_lon = (lon_min + lon_max) / 2.0
+    center_lat = (lat_min + lat_max) / 2.0
+
+    # Planar bounding coordinates
+    xy_sw = lonlat_to_xy_km(
+        lon_min, lat_min;
+        center_lon=center_lon, center_lat=center_lat, crs=crs, datum=datum
+    )
+    xy_ne = lonlat_to_xy_km(
+        lon_max, lat_max;
+        center_lon=center_lon, center_lat=center_lat, crs=crs, datum=datum
+    )
+
+    r = Float64(radius_km)
+    dx = sqrt(3.0) * r
+    dy = 1.5 * r
+
+    x_min = min(xy_sw[1], xy_ne[1]) - r
+    x_max = max(xy_sw[1], xy_ne[1]) + r
+    y_min = min(xy_sw[2], xy_ne[2]) - r
+    y_max = max(xy_sw[2], xy_ne[2]) + r
+
+    row_min = floor(Int, y_min / dy)
+    row_max = ceil(Int, y_max / dy)
+
+    centroids_km = Tuple{Float64, Float64}[]
+    for row in row_min:row_max
+        yk = row * dy
+        xoff = isodd(row) ? (dx / 2.0) : 0.0
+        col_min = floor(Int, (x_min - xoff) / dx)
+        col_max = ceil(Int, (x_max - xoff) / dx)
+        for col in col_min:col_max
+            xk = col * dx + xoff
+            push!(centroids_km, (xk, yk))
+        end
+    end
+
+    S = length(centroids_km)
+    centroids_lonlat = [
+        xy_km_to_lonlat(
+            c[1], c[2];
+            center_lon=center_lon, center_lat=center_lat, crs=crs, datum=datum
+        )
+        for c in centroids_km
+    ]
+
+    # Flat-top hexagon vertices
+    hex_angles = (30.0 .+ 60.0 .* (0:5)) .* (π / 180.0)
+    polygons_km     = Vector{Vector{Tuple{Float64, Float64}}}(undef, S)
+    polygons_lonlat = Vector{Vector{Tuple{Float64, Float64}}}(undef, S)
+
+    for i in 1:S
+        cx, cy = centroids_km[i]
+        verts_km = [(cx + r * cos(a), cy + r * sin(a)) for a in hex_angles]
+        push!(verts_km, verts_km[1])
+        polygons_km[i] = verts_km
+        polygons_lonlat[i] = [
+            xy_km_to_lonlat(
+                v[1], v[2];
+                center_lon=center_lon, center_lat=center_lat, crs=crs, datum=datum
+            )
+            for v in verts_km
+        ]
+    end
+
+    # Adjacency graph W via KDTree
+    c_mat = Matrix{Float64}(undef, 2, S)
+    for i in 1:S
+        c_mat[1, i] = centroids_km[i][1]
+        c_mat[2, i] = centroids_km[i][2]
+    end
+    tree = KDTree(c_mat)
+    adj_thresh = sqrt(3.0) * r * 1.05
+
+    rows_idx = Int[]
+    cols_idx = Int[]
+    for i in 1:S
+        nbrs = inrange(tree, [centroids_km[i][1], centroids_km[i][2]], adj_thresh)
+        for j in nbrs
+            if j != i
+                push!(rows_idx, i)
+                push!(cols_idx, j)
+            end
+        end
+    end
+    W_init = sparse(rows_idx, cols_idx, ones(Float64, length(rows_idx)), S, S)
+    W_init = max.(W_init, W_init')
+
+    # Identify land units
+    land_mask = identify_land_units(
+        centroids_lonlat;
+        land_polygons=land_polygons,
+        depth=depth,
+        depth_threshold=depth_threshold
+    )
+
+    # Sever land edges in W
+    W_water, _ = apply_land_barrier(W_init, zeros(Float64, S), land_mask)
+
+    area_km2 = (3.0 * sqrt(3.0) / 2.0) * r^2
+
+    return (
+        centroids_km     = centroids_km,
+        centroids_lonlat = centroids_lonlat,
+        polygons_km      = polygons_km,
+        polygons_lonlat  = polygons_lonlat,
+        n_units          = S,
+        W                = W_water,
+        W_raw            = W_init,
+        land_mask        = land_mask,
+        radius_km        = r,
+        areas_km2        = fill(area_km2, S),
+        center_lon       = center_lon,
+        center_lat       = center_lat
+    )
+end
+
+
+"""
+    prepare_movement_data(
+        tagging::DataFrame;
+        hsi_file::Union{Nothing, AbstractString} = nothing,
+        sppoly_file::Union{Nothing, AbstractString} = nothing,
+        radius_km::Real = 15.0,
+        time_interval::Symbol = :monthly,
+        land_polygons = nothing,
+        depth = nothing,
+        depth_threshold::Real = 0.0,
+        crs = nothing,
+        datum = WGS84Latest,
+        ref_doy::Int = 182,
+        verbose::Bool = true
+    ) -> NamedTuple
+
+High-level end-to-end data preparation pipeline for individual animal movement and telemetry.
+Builds the full-domain tessellation, classifies and blocks terrestrial land barriers, reshards
+and autocorrelates HSI into external marine areas, maps telemetry observations, and extracts
+mark-recapture transition events with biological group stratifications.
+
+# Arguments
+- `tagging::DataFrame`: Raw telemetry records with `:tagid`, `:lon`, `:lat`, `:time`, `:tag`.
+- `hsi_file`: Path to environmental Habitat Suitability Index JLD2 file.
+- `sppoly_file`: Path to survey spatial polygons JLD2 file defining known HSI units.
+- `radius_km`: Spatial hexagon circumradius in km (default 15.0 km).
+- `time_interval`: Discrete transition interval (`:monthly`, `:weekly`, `:biweekly`, `:daily`).
+- `land_polygons`: Terrestrial boundary polygons (defaults to `:maritimes`).
+- `depth`: Optional depth vector matching units.
+- `depth_threshold`: Bathymetric cutoff below which units are classified as land (default 0.0).
+- `crs`: Target coordinate reference system (default local tangent projection).
+- `datum`: Reference ellipsoid datum (default `WGS84Latest`).
+- `ref_doy`: Annual reference survey day of year (default 182).
+- `verbose`: Toggle progress logging to console.
+
+# Returns
+- `NamedTuple`:
+  - `tagging`: Processed telemetry DataFrame with `:s_idx` and `:hsi`.
+  - `mesh`: Full-domain tessellation NamedTuple.
+  - `W`: Adjacency matrix with severed land boundaries.
+  - `hsi_vec`: Infilled spatial HSI vector (length ``S``).
+  - `monthly_hsi`: Monthly HSI matrix (size ``S \\times T``).
+  - `month_lookup`: Mapping of `(year, month)` to column index.
+  - `years`: Vector of survey years.
+  - `obs`: Extracted mark-recapture event pairs DataFrame.
+  - `group_lookup`: Biological stratum dictionary mapping.
+  - `land_mask`: Boolean vector of length ``S`` denoting terrestrial barrier units.
+"""
+function prepare_movement_data(
+    tagging::DataFrame;
+    hsi_file::Union{Nothing, AbstractString} = nothing,
+    sppoly_file::Union{Nothing, AbstractString} = nothing,
+    radius_km::Real = 15.0,
+    time_interval::Symbol = :monthly,
+    land_polygons = nothing,
+    depth = nothing,
+    depth_threshold::Real = 0.0,
+    crs = nothing,
+    datum = WGS84Latest,
+    ref_doy::Int = 182,
+    verbose::Bool = true
+)::NamedTuple
+    tag_df = copy(tagging)
+
+    # Filter dead records
+    if hasproperty(tag_df, :is_dead)
+        filter!(:is_dead => d -> !coalesce(d, false), tag_df)
+    end
+
+    tag_df[!, :lon]   = Float64.(tag_df.lon)
+    tag_df[!, :lat]   = Float64.(tag_df.lat)
+    tag_df[!, :tag]   = Int.(tag_df.tag)
+    tag_df[!, :tagid] = string.(tag_df.tagid)
+    tag_df[!, :time]  = Float64.(tag_df.time)
+
+    # Require both release and recapture events
+    valid_set = Set{String}()
+    for sub in groupby(tag_df, :tagid)
+        tags = sub.tag
+        if any(==(0), tags) && any(>(0), tags)
+            push!(valid_set, sub.tagid[1])
+        end
+    end
+    filter!(:tagid => ∈(valid_set), tag_df)
+    sort!(tag_df, [:tagid, :time])
+
+    # 1. Full-domain tessellation with land barriers
+    verbose && println("  [prepare] Constructing full movement domain (r=$(radius_km) km) …")
+    mesh = construct_full_movement_domain(
+        tag_df.lon, tag_df.lat;
+        radius_km=radius_km, land_polygons=land_polygons,
+        depth=depth, depth_threshold=depth_threshold,
+        crs=crs, datum=datum
+    )
+    verbose && println("    Total mesh units: $(mesh.n_units) (water: $(count(!, mesh.land_mask)), land: $(sum(mesh.land_mask)))")
+
+    # 2. Map telemetry observations to hex units
+    verbose && println("  [prepare] Mapping observations to domain units …")
+    tag_df = map_telemetry_to_units(
+        tag_df, mesh.centroids_km,
+        mesh.center_lon, mesh.center_lat; crs=crs, datum=datum
+    )
+
+    # 3. Load HSI and perform autocorrelation infilling outside core domain
+    hsi_vec      = zeros(Float64, mesh.n_units)
+    monthly_hsi  = Matrix{Float64}(undef, 0, 0)
+    month_lookup = Dict{Tuple{Int, Int}, Int}()
+    years_vec    = Int[]
+
+    if hsi_file !== nothing && isfile(hsi_file)
+        verbose && println("  [prepare] Loading and infilling HSI field …")
+        h = load_hsi_jld2(hsi_file; ref_doy=ref_doy)
+        years_vec    = h.years
+        month_lookup = h.month_lookup
+        S_src        = size(h.monthly_hsi, 1)
+
+        src_coords_km = Tuple{Float64, Float64}[]
+        known_mask = falses(mesh.n_units)
+
+        if sppoly_file !== nothing && isfile(sppoly_file)
+            sp = JLD2.load(sppoly_file)
+            au_src = sp["au"]
+            n_au = length(au_src.lon)
+            src_coords_km = Vector{Tuple{Float64, Float64}}(undef, n_au)
+            for i in 1:n_au
+                src_coords_km[i] = lonlat_to_xy_km(
+                    au_src.lon[i], au_src.lat[i];
+                    center_lon=mesh.center_lon, center_lat=mesh.center_lat,
+                    crs=crs, datum=datum
+                )
+            end
+
+            # Identify mesh units lying within the known HSI survey domain
+            tree_src = KDTree(hcat([[Float64(c[1]), Float64(c[2])] for c in src_coords_km]...))
+            survey_radius_thresh = 1.5 * radius_km
+            for i in 1:mesh.n_units
+                if !mesh.land_mask[i]
+                    _, dists = knn(tree_src, [mesh.centroids_km[i][1], mesh.centroids_km[i][2]], 1)
+                    if first(dists) <= survey_radius_thresh
+                        known_mask[i] = true
+                    end
+                end
+            end
+        end
+
+        n_mo = size(h.monthly_hsi, 2)
+        if !isempty(src_coords_km) && n_mo > 0
+            monthly_hsi = zeros(Float64, mesh.n_units, n_mo)
+            for m in 1:n_mo
+                raw_m = reshard_hsi_field(
+                    h.monthly_hsi[:, m], src_coords_km, mesh.centroids_km
+                )
+                monthly_hsi[:, m] = infill_spatial_hsi(
+                    raw_m, mesh.W, known_mask;
+                    land_mask=mesh.land_mask, centroids=mesh.centroids_km
+                )
+            end
+            hsi_vec = vec(mean(monthly_hsi, dims=2))
+        else
+            base_vec = fill(0.2, mesh.n_units)
+            hsi_vec = infill_spatial_hsi(
+                base_vec, mesh.W, known_mask;
+                land_mask=mesh.land_mask, centroids=mesh.centroids_km
+            )
+        end
+
+        if !isempty(month_lookup) && size(monthly_hsi, 1) == mesh.n_units
+            tag_df[!, :hsi] = match_telemetry_closest_month_hsi(
+                tag_df, monthly_hsi, month_lookup, years_vec
+            )
+        else
+            tag_df[!, :hsi] = fill(0.5, nrow(tag_df))
+        end
+    else
+        verbose && println("  [prepare] No HSI file provided; using uniform marine HSI = 0.5 …")
+        hsi_vec = [mesh.land_mask[i] ? 0.0 : 0.5 for i in 1:mesh.n_units]
+        tag_df[!, :hsi] = fill(0.5, nrow(tag_df))
+    end
+
+    # 4. Extract mark-recapture event pairs
+    dt_map = (monthly=1.0/12.0, weekly=1.0/52.0, biweekly=1.0/26.0, daily=1.0/365.25, raw=1.0)
+    dt = hasproperty(dt_map, time_interval) ? getproperty(dt_map, time_interval) : 1.0 / 12.0
+
+    has_sex = hasproperty(tag_df, :sex)
+    has_mat = hasproperty(tag_df, :mat)
+
+    sorted_df = sort(tag_df, [:tagid, :time])
+    n_rows = nrow(sorted_df)
+
+    tagids    = sorted_df.tagid
+    times     = sorted_df.time
+    s_idxs    = sorted_df.s_idx
+    sexes_col = has_sex ? sorted_df.sex : nothing
+    mats_col  = has_mat ? sorted_df.mat : nothing
+
+    RecordType = NamedTuple{
+        (:tagid, :release, :recapture, :k, :sex, :mat), 
+        Tuple{String, Int, Int, Int, String, String}
+    }
+    pair_records = Vector{RecordType}(undef, 0)
+
+    if n_rows >= 2
+        sizehint!(pair_records, n_rows)
+        for i in 2:n_rows
+            if tagids[i] == tagids[i-1]
+                Δt = times[i] - times[i-1]
+                k  = max(1, round(Int, Δt / dt))
+                push!(pair_records, (
+                    tagid     = string(tagids[i-1]),
+                    release   = s_idxs[i-1],
+                    recapture = s_idxs[i],
+                    k         = k,
+                    sex       = has_sex ? string(sexes_col[i-1]) : "unknown",
+                    mat       = has_mat ? string(mats_col[i-1])  : "unknown"
+                ))
+            end
+        end
+    end
+
+    obs = DataFrame(pair_records)
+
+    # 5. Assign biological groupings
+    n_obs = nrow(obs)
+    labels = Vector{String}(undef, n_obs)
+    if n_obs > 0
+        obs_sexes = obs[!, :sex]
+        obs_mats  = obs[!, :mat]
+        @inbounds for i in 1:n_obs
+            sx = string(obs_sexes[i])
+            mt = string(obs_mats[i])
+            if mt == "immature"
+                labels[i] = "immature"
+            elseif mt == "mature" && sx == "M"
+                labels[i] = "male"
+            elseif mt == "mature" && sx == "F"
+                labels[i] = "female"
+            else
+                labels[i] = "unknown"
+            end
+        end
+    end
+
+    unique_labels = sort!(unique(labels))
+    group_lookup  = Dict{String, Int}(lbl => i for (i, lbl) in enumerate(unique_labels))
+    group_ids = Vector{Int}(undef, n_obs)
+    @inbounds for i in 1:n_obs
+        group_ids[i] = group_lookup[labels[i]]
+    end
+    obs[!, :group] = group_ids
+
+    return (
+        tagging      = tag_df,
+        mesh         = mesh,
+        W            = mesh.W,
+        hsi_vec      = hsi_vec,
+        monthly_hsi  = monthly_hsi,
+        month_lookup = month_lookup,
+        years        = years_vec,
+        obs          = obs,
+        group_lookup = group_lookup,
+        land_mask    = mesh.land_mask
+    )
+end

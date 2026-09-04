@@ -143,7 +143,7 @@ The RHS formula combines linear fixed effects, structured random fields, and pro
 | `mixed()` | Correlated random slopes and intercepts. | `model`, `method` | `mixed(1 + poverty \| region)` |
 | `dynamics()` | Mechanistic state-space differential equations. | `model`, `r`, `K`, `velocity` | `dynamics(time, model=:logistic, r=Normal(0.5, 0.1))` |
 | `eigen()` | Bayesian PCA factor analysis. | `n_factors`, `pca_sd` | `eigen(pollutant1, pollutant2, n_factors=1)` |
-| `nested()` | Multi-fidelity supervised proxy models. | `formula`, `data_source` | `nested(proxy, formula="...", data_source=df_proxy)` |
+| `nested()`, `transfer()`, `fidelity()` | Multi-fidelity supervised proxy models & transfer learning. | `formula`, `data_source`, `mapping`, `prior`, `fixed` | `transfer(:proxy)` or `nested(proxy, formula="...", data_source=df)` |
 | `sciml()` | Scientific Machine Learning ODE/PDE integration. | `model_func`, `solver` | `sciml(t, model_func=my_ode)` |
 | `custom()` | User-injected raw Turing code fragments. | `code_fragment` | `custom(code_fragment="...")` |
 
@@ -195,6 +195,30 @@ The pipe operator routes covariates through latent fields to create spatially or
 @bstm(
     likelihood(y) ~ intercept() + (random(s_idx, model=icar) |> random(month, model=pspline)),
     df, W=W
+)
+```
+
+### 3.3. Declarative Multi-Equation Coupling (`:primary => ..., :proxy => ...`)
+
+High-fidelity models often integrate auxiliary, low-fidelity proxies (such as satellite retrievals or coarse numerical simulations). Rather than nesting formula strings, `bstm` supports declarative multi-equation pair syntax:
+
+$$
+\boldsymbol{\eta}_{\text{primary}} = \mathbf{X}_{\text{hi}} \boldsymbol{\beta}_{\text{hi}} + \sum_k f_k(\mathbf{s}, t) + \rho \cdot \boldsymbol{\eta}_{\text{proxy}}[\mathcal{M}]
+$$
+
+```julia
+# Declarative multi-equation system with unquoted Julia formulas and observation mapping
+model = @bstm(
+    :primary => (
+        formula = likelihood(pm25_ground) ~ 1 + fixed(elev) + transfer(:satellite),
+        data    = df_ground
+    ),
+    :satellite => (
+        formula = likelihood(aod) ~ 1 + fixed(humidity) + random(s_idx, model=bym2),
+        data    = df_satellite,
+        mapping = :satellite_cell_id,   # Aligns ground points to satellite pixels
+        prior   = Normal(1.0, 0.25)     # Custom coupling weight prior rho ~ Normal
+    )
 )
 ```
 

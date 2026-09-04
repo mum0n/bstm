@@ -171,7 +171,7 @@ end
         end
 
         N_obs = 60
-        s_indices = rand(1:N_units, N_obs)
+        s_indices = vcat(collect(1:N_units), rand(1:N_units, N_obs - N_units))
         z_obs = [100.0 + 0.5 * cx[s] - 0.2 * cy[s] + randn() * 0.5 for s in s_indices]
         df_spde = DataFrame(s_idx = s_indices, depth = z_obs)
 

@@ -8,7 +8,7 @@ end
 
 @testset "bstm_data Monolithic Synthetic Data Generator" begin
     @testset "Default scottish_lip Dataset & Covariate Completeness" begin
-        p_out, n_out = bstm.bstm_data() # Default "scottish_lip"
+        p_out = bstm.bstm_data() # Default "scottish_lip"
         df = p_out.data
         au = p_out.au
 
@@ -401,13 +401,13 @@ end
 
     # 2. Complex Model (Fixed + Spatiotemporal) Magnitude and PPC Pearson Correlation Check
     @testset "Complex Model Magnitude and PPC Pearson Correlation" begin
-        p_data, _ = bstm.bstm_data("scottish_lip")
+        p_data = bstm.bstm_data("scottish_lip")
         df_cplx = p_data.data
         W_cplx = p_data.au.W
         
         m_cplx = @bstm(likelihood(y_gauss) ~ 1 + cov1 + random(s_idx,
             model=bym2) + random(year, model=ar1), df_cplx, W=W_cplx, verbose=false)
-        chn_cplx = sample(m_cplx, MH(), 150, progress=false)
+        chn_cplx = sample(m_cplx, NUTS(30, 0.65), 50, progress=false)
         res_cplx = bstm.model_results_comprehensive(m_cplx, chn_cplx)
         
         y_obs_vec = res_cplx.predictions.observed
@@ -436,7 +436,7 @@ end
 
     # 3. Poisson with Log Offsets Count-Scale Magnitude Check
     @testset "Poisson with Log Offsets Magnitude" begin
-        p_data, _ = bstm.bstm_data("scottish_lip")
+        p_data = bstm.bstm_data("scottish_lip")
         df_lip = p_data.data
         W_lip = p_data.au.W
         
@@ -487,7 +487,7 @@ end
 
     # 6. Smooth Model (P-Spline) Magnitude Check
     @testset "Smooth Model (P-Spline) Magnitude" begin
-        p_data, _ = bstm.bstm_data("scottish_lip")
+        p_data = bstm.bstm_data("scottish_lip")
         df_lip = p_data.data
         
         m_smooth = @bstm(likelihood(y_gauss) ~ 1 + random(cov1, model=pspline), df_lip,

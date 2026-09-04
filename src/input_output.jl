@@ -1093,3 +1093,268 @@ function load_bstm_bundle(base_path::AbstractString; calling_module::Module=Main
         metadata = m_data.metadata
     )
 end
+
+"""
+    PriorPosteriorBundle
+
+Structured container encapsulating both prior and posterior parameter distributions,
+MCMC chains, and model provenance.
+
+# Fields
+- `model`: Underlying `DynamicPPL.Model`.
+- `prior_chain`: MCMC draws sampled from the prior distribution.
+- `posterior_chain`: MCMC draws sampled from the posterior distribution.
+- `prior_parameters`: DataFrame of summary statistics for prior parameters.
+- `posterior_parameters`: DataFrame of summary statistics for posterior parameters.
+- `au`: Spatial analytical units or mesh metadata, if available.
+- `metadata`: Provenance metadata dictionary.
+
+# Indexing
+- `bundle[:prior, :parameters]` -> returns prior summary DataFrame.
+- `bundle[:prior, :parameters, 1:1000]` -> returns specified rows of prior summary DataFrame.
+- `bundle[:posterior, :parameters]` -> returns posterior summary DataFrame.
+- `bundle[:posterior, :parameters, 1:1000]` -> returns specified rows of posterior summary DataFrame.
+- `bundle[:prior, :chain]` -> returns prior MCMC draws.
+- `bundle[:posterior, :chain]` -> returns posterior MCMC draws.
+- `bundle[:prior]` -> `(parameters = bundle.prior_parameters, chain = bundle.prior_chain)`
+- `bundle[:posterior]` -> `(parameters = bundle.posterior_parameters, chain = bundle.posterior_chain)`
+"""
+struct PriorPosteriorBundle
+    model::Any
+    prior_chain::Any
+    posterior_chain::Any
+    prior_parameters::DataFrame
+    posterior_parameters::DataFrame
+    au::Any
+    metadata::Dict
+end
+
+function Base.getindex(b::PriorPosteriorBundle, dist_type::Symbol)
+    d = Symbol(lowercase(string(dist_type)))
+    if d in (:prior, :priors)
+        return (parameters = b.prior_parameters, chain = b.prior_chain)
+    elseif d in (:posterior, :posteriors)
+        return (parameters = b.posterior_parameters, chain = b.posterior_chain)
+    else
+        error("Invalid distribution key ':$dist_type'. Expected :prior or :posterior.")
+    end
+end
+
+function Base.getindex(b::PriorPosteriorBundle, dist_type::Symbol, target::Symbol)
+    d = Symbol(lowercase(string(dist_type)))
+    t = Symbol(lowercase(string(target)))
+
+    if d in (:prior, :priors)
+        if t in (:param, :params, :parameters)
+            return b.prior_parameters
+        elseif t in (:chain, :chains, :draws)
+            return b.prior_chain
+        end
+    elseif d in (:posterior, :posteriors)
+        if t in (:param, :params, :parameters)
+            return b.posterior_parameters
+        elseif t in (:chain, :chains, :draws)
+            return b.posterior_chain
+        end
+    end
+    error("Invalid query: [:$dist_type, :$target]. Expected (:prior|:posterior, :parameters|:chain).")
+end
+
+function Base.getindex(b::PriorPosteriorBundle, dist_type::Symbol, target::Symbol, rows)
+    obj = b[dist_type, target]
+    if obj isa DataFrame
+        max_r = nrow(obj)
+        valid_rows = if rows isa AbstractRange
+            intersect(rows, 1:max_r)
+        elseif rows isa Integer
+            clamp(rows, 1, max_r)
+        else
+            filter(r -> 1 <= r <= max_r, rows)
+        end
+        return obj[valid_rows, :]
+    elseif obj isa AbstractMatrix
+        return obj[rows, :]
+    elseif obj isa MCMCChains.Chains
+        return obj[rows, :, :]
+    else
+        return obj[rows]
+    end
+end
+
+function Base.show(io::IO, b::PriorPosteriorBundle)
+    n_p = nrow(b.posterior_parameters)
+    n_prior_p = nrow(b.prior_parameters)
+    print(io, "PriorPosteriorBundle(\n")
+    print(io, "  Prior Parameters:     $n_prior_p parameters\n")
+    print(io, "  Posterior Parameters: $n_p parameters\n")
+    print(io, "  Prior Chain:          $(!isnothing(b.prior_chain) ? string(typeof(b.prior_chain)) : "none")\n")
+    print(io, "  Posterior Chain:      $(!isnothing(b.posterior_chain) ? string(typeof(b.posterior_chain)) : "none")\n")
+    print(io, ")")
+end
+
+"""
+    extract_prior_posterior(bundle; n_prior=1000, seed=42, calling_module=Main)
+    extract_prior_posterior(model::DynamicPPL.Model, chain; n_prior=1000, seed=42, au=nothing, metadata=Dict())
+
+Extracts prior and posterior chains and parameter summaries from a saved bundle,
+model results, or model and chain.
+
+# Mathematical Background
+Given an observation likelihood \$\\mathcal{L}(\\mathbf{y} \\mid \\boldsymbol{\\theta})\$
+and joint prior \$\\pi(\\boldsymbol{\\theta})\$, Bayesian inference computes the posterior:
+\$\\pi(\\boldsymbol{\\theta} \\mid \\mathbf{y}) = \\frac{\\mathcal{L}(\\mathbf{y} \\mid \\boldsymbol{\\theta}) \\pi(\\boldsymbol{\\theta})}{\\int \\mathcal{L}(\\mathbf{y} \\mid \\boldsymbol{\\theta}) \\pi(\\boldsymbol{\\theta}) d\\boldsymbol{\\theta}}\$
+This function extracts both the unconditioned prior realizations \$\\boldsymbol{\\theta}^{(s)} \\sim \\pi(\\boldsymbol{\\theta})\$
+and the conditioned posterior realizations \$\\boldsymbol{\\theta}^{(s)} \\sim \\pi(\\boldsymbol{\\theta} \\mid \\mathbf{y})\$,
+enabling direct prior-vs-posterior shrinkage and update diagnostics.
+
+# Arguments
+- `bundle`: A bundle NamedTuple returned by `save_bstm_bundle` or `load_bstm_bundle`,
+  a filepath string pointing to a saved `.jld2` or `.duckdb` bundle, or a model results NamedTuple.
+- `n_prior`: Number of prior samples to generate if prior draws were not pre-saved (default: 1000).
+- `seed`: Random seed for prior sampling reproducibility (default: 42).
+
+# Returns
+A `PriorPosteriorBundle` supporting:
+```julia
+prior_posterior = extract_prior_posterior(bn_bundle)
+display(prior_posterior[:prior, :parameters, 1:1000])
+display(prior_posterior[:posterior, :parameters])
+```
+"""
+function extract_prior_posterior(
+    bundle;
+    n_prior::Int=1000,
+    seed::Int=42,
+    calling_module::Module=Main
+)
+    model = nothing
+    post_chain = nothing
+    post_params = DataFrame()
+    au = nothing
+    metadata = Dict{String, Any}()
+
+    if bundle isa AbstractString
+        loaded = load_bstm_bundle(bundle; calling_module=calling_module)
+        model = loaded.model
+        post_chain = loaded.chain
+        au = loaded.au
+        metadata = loaded.metadata
+        if hasproperty(loaded, :results) && hasproperty(loaded.results, :parameters) &&
+           loaded.results.parameters isa DataFrame && !isempty(loaded.results.parameters)
+            post_params = loaded.results.parameters
+        end
+    elseif bundle isa NamedTuple && haskey(bundle, :model_file)
+        loaded = load_bstm_bundle(bundle.model_file; calling_module=calling_module)
+        model = loaded.model
+        post_chain = loaded.chain
+        au = loaded.au
+        metadata = loaded.metadata
+        if hasproperty(loaded, :results) && hasproperty(loaded.results, :parameters) &&
+           loaded.results.parameters isa DataFrame && !isempty(loaded.results.parameters)
+            post_params = loaded.results.parameters
+        end
+    elseif bundle isa NamedTuple && haskey(bundle, :model) && haskey(bundle, :chain)
+        model = bundle.model
+        post_chain = bundle.chain
+        au = get(bundle, :au, nothing)
+        metadata = get(bundle, :metadata, Dict{String, Any}())
+        if haskey(bundle, :results) && hasproperty(bundle.results, :parameters) &&
+           bundle.results.parameters isa DataFrame && !isempty(bundle.results.parameters)
+            post_params = bundle.results.parameters
+        elseif haskey(bundle, :parameters) && bundle.parameters isa DataFrame && !isempty(bundle.parameters)
+            post_params = bundle.parameters
+        end
+    elseif bundle isa NamedTuple && haskey(bundle, :parameters) && haskey(bundle, :effects)
+        # return from model_results_comprehensive
+        model = get(bundle, :model, nothing)
+        post_chain = get(bundle, :chain, nothing)
+        post_params = bundle.parameters
+        au = get(bundle, :au, nothing)
+    else
+        error("Unrecognized bundle format passed to extract_prior_posterior. Expected filepath, NamedTuple from save_bstm_bundle, or model results.")
+    end
+
+    if isnothing(model)
+        error("Model object could not be resolved from bundle. Ensure the bundle contains the DynamicPPL model.")
+    end
+
+    # Sample prior draws
+    rng = Random.MersenneTwister(seed)
+    prior_chain = try
+        Base.invokelatest(sample, rng, model, Prior(), n_prior; progress=false)
+    catch e
+        @warn "Prior sampling failed: $e. Returning empty prior chain."
+        nothing
+    end
+
+    prior_params = if !isnothing(prior_chain)
+        try
+            _compute_direct_parameter_summary(prior_chain, model)
+        catch e
+            DataFrame()
+        end
+    else
+        DataFrame()
+    end
+
+    if isempty(post_params) && !isnothing(post_chain)
+        post_params = try
+            _compute_direct_parameter_summary(post_chain, model)
+        catch e
+            DataFrame()
+        end
+    end
+
+    return PriorPosteriorBundle(
+        model,
+        prior_chain,
+        post_chain,
+        prior_params,
+        post_params,
+        au,
+        metadata
+    )
+end
+
+function extract_prior_posterior(
+    model::DynamicPPL.Model,
+    chain;
+    n_prior::Int=1000,
+    seed::Int=42,
+    au=nothing,
+    metadata=Dict{String, Any}()
+)
+    rng = Random.MersenneTwister(seed)
+    prior_chain = try
+        Base.invokelatest(sample, rng, model, Prior(), n_prior; progress=false)
+    catch e
+        @warn "Prior sampling failed: $e. Returning empty prior chain."
+        nothing
+    end
+
+    prior_params = if !isnothing(prior_chain)
+        try
+            _compute_direct_parameter_summary(prior_chain, model)
+        catch e
+            DataFrame()
+        end
+    else
+        DataFrame()
+    end
+
+    post_params = try
+        _compute_direct_parameter_summary(chain, model)
+    catch e
+        DataFrame()
+    end
+
+    return PriorPosteriorBundle(
+        model,
+        prior_chain,
+        chain,
+        prior_params,
+        post_params,
+        au,
+        metadata
+    )
+end

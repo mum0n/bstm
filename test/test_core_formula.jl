@@ -72,7 +72,7 @@ end
         @test haskey(reg.by_component[:s_idx], :sigma)
 
         # 3. Test build_param_registry from M config
-        p_data, _ = bstm.bstm_data("scottish_lip")
+        p_data = bstm.bstm_data("scottish_lip")
         m_cfg = bstm.bstm_config("y ~ 1 + cov1 + random(s_idx, model=bym2) + random(year, model=ar1)", p_data.data; W=p_data.au.W)
         reg_m = bstm.build_param_registry(m_cfg)
         @test haskey(reg_m.by_component, :intercept)
@@ -526,3 +526,260 @@ end
         @test size(res_bs.B_matrix) == (15, 15)
     end
 end
+
+@testset "Formula Escapes, Operator Precedence & Tensor Registries" begin
+    @testset "Escape Handling & Nested Parentheses" begin
+        is_esc = bstm._is_escaped
+        s1 = "a\\\"b"
+        @test is_esc(s1, 3) == true
+        s2 = "a\\\\\"b"
+        @test is_esc(s2, 4) == false
+        s3 = "a\\\\\\\"b"
+        @test is_esc(s3, 5) == true
+
+        # split_terms_at_depth with escaped quotes and braces
+        s_split1 = "fixed(x, label=\"a + b\") + fixed(y)"
+        parts1 = bstm.split_terms_at_depth(s_split1, "+")
+        @test length(parts1) == 2
+        @test parts1[1] == "fixed(x, label=\"a + b\")"
+        @test parts1[2] == "fixed(y)"
+
+        s_split2 = "fixed(x, label=\"foo \\\" + bar\") + fixed(z)"
+        parts2 = bstm.split_terms_at_depth(s_split2, "+")
+        @test length(parts2) == 2
+        @test parts2[2] == "fixed(z)"
+
+        s_split3 = "fixed(x, options={a=1 + 2, b=3}) + fixed(y)"
+        parts3 = bstm.split_terms_at_depth(s_split3, "+")
+        @test length(parts3) == 2
+
+        # _is_outermost_grouping_parentheses
+        is_outer = bstm._is_outermost_grouping_parentheses
+        @test is_outer("(a + b)") == true
+        @test is_outer("(a) + (b)") == false
+        @test is_outer("((a + b))") == true
+        @test is_outer("(a + (b * (c + d)))") == true
+        @test is_outer("fixed(x)") == false
+        @test is_outer("(a))") == false
+        @test is_outer("((a)") == false
+        @test is_outer("(fixed(x, label=\"test ) string\"))") == true
+        @test is_outer("(fixed(x, label=\"test ( string\"))") == true
+        @test is_outer("(fixed(x, label=\"test \\\" ) string\"))") == true
+    end
+
+    @testset "Operator Precedence" begin
+        parse_expr = bstm._parse_rhs_expression
+
+        # Pipe vs Kronecker product
+        res1 = parse_expr("fixed(a) |> random(b) ⊗ random(c)")
+        @test res1.type == :operator && res1.op == :pipe
+        @test res1.children[2].op == :kronecker_product
+
+        res2 = parse_expr("random(a) ⊗ random(b) |> fixed(c)")
+        @test res2.type == :operator && res2.op == :pipe
+        @test res2.children[1].op == :kronecker_product
+
+        # Composition vs Kronecker product
+        res3 = parse_expr("fixed(a) ∘ random(b) ⊗ random(c)")
+        @test res3.type == :operator && res3.op == :composition
+        @test res3.children[2].op == :kronecker_product
+
+        res4 = parse_expr("random(a) ⊗ random(b) ∘ fixed(c)")
+        @test res4.type == :operator && res4.op == :composition
+        @test res4.children[1].op == :kronecker_product
+
+        # Addition vs Pipe
+        res5 = parse_expr("fixed(a) + fixed(b) |> fixed(c)")
+        @test res5.type == :operator && res5.op == :add
+        @test res5.children[2].op == :pipe
+
+        res6 = parse_expr("(fixed(a) + fixed(b)) |> fixed(c)")
+        @test res6.type == :operator && res6.op == :pipe
+        @test res6.children[1].op == :add
+
+        # Full formula parsing
+        df_mock = DataFrame(y = [1, 2], cov = [0.1, 0.2], s_idx = [1, 2])
+        decomp = bstm.decompose_bstm_formula(
+            "y ~ intercept() + fixed(cov) |> random(s_idx, model=bym2)",
+            df_mock
+        )
+        @test decomp.has_intercept == true
+        @test length(decomp.modules) >= 1
+    end
+
+    @testset "Multi-dimensional Matrix/Tensor Parameters" begin
+        in_dim = 3
+        hidden_dim = 4
+        nbins = 2
+
+        comp_spec = (
+            key = :nn_covar,
+            component_obj = (hidden_dim = hidden_dim, nbins = nbins),
+            hyper = (in_dim = in_dim, n_latent = 0),
+            params = Dict{Symbol, Any}()
+        )
+        M_tensor = (
+            model_arch = "univariate",
+            outcomes_N = 1,
+            add_intercept = true,
+            Xfixed_N = 2,
+            components = [comp_spec]
+        )
+        reg = bstm.build_param_registry(M_tensor)
+
+        @test haskey(reg.descriptors, :W1_nn_covar)
+        @test reg.descriptors[:W1_nn_covar].shape == (in_dim, hidden_dim)
+        @test haskey(reg.descriptors, :W2_nn_covar)
+        @test reg.descriptors[:W2_nn_covar].shape == (hidden_dim, nbins)
+        @test haskey(reg.descriptors, :b1_nn_covar)
+        @test reg.descriptors[:b1_nn_covar].shape == (hidden_dim,)
+
+        # Sample extraction with tensor reshaping
+        n_samples = 50
+        chain_df = DataFrame()
+        for j in 1:hidden_dim
+            for i in 1:in_dim
+                col_name = Symbol("W1_nn_covar[$i, $j]")
+                chain_df[!, col_name] = [Float64(i * 10 + j + s * 100) for s in 1:n_samples]
+            end
+        end
+
+        reg_chain = bstm.build_param_registry(chain_df)
+        @test reg_chain.descriptors[:W1_nn_covar].shape == (in_dim, hidden_dim)
+
+        samples_tensor = bstm.get_param_samples(chain_df, reg, :nn_covar, :W1)
+        @test size(samples_tensor) == (n_samples, in_dim, hidden_dim)
+        @test samples_tensor[1, 1, 1] == 111.0
+        @test samples_tensor[50, 3, 4] == 5034.0
+
+        samples_flat = bstm.get_param_samples(
+            chain_df, reg, :nn_covar, :W1; reshape_to_shape = false
+        )
+        @test size(samples_flat) == (n_samples, in_dim * hidden_dim)
+    end
+
+    @testset "Log Transformations with Offsets" begin
+        # Positive data
+        x_pos = [1.0, 2.0, 10.0]
+        @test bstm.apply_transformation(:log, x_pos) ≈ log.(x_pos)
+
+        # Zero-containing data defaults to log1p
+        x_zero = [0.0, 1.0, 9.0]
+        @test bstm.apply_transformation(:log, x_zero) ≈ log1p.(x_zero)
+
+        # Custom offset
+        x_custom = [0.0, 2.0, 5.0]
+        @test bstm.apply_transformation(:log, x_custom; offset=0.05) ≈ log.(x_custom .+ 0.05)
+
+        # Negative data without offset throws ArgumentError
+        x_neg = [-5.0, 0.0, 5.0]
+        @test_throws ArgumentError bstm.apply_transformation(:log, x_neg)
+        @test bstm.apply_transformation(:log, x_neg; offset=10.0) ≈ log.(x_neg .+ 10.0)
+
+        # Formula pipeline transformation (non-mutating caller data by default)
+        df_trans = DataFrame(val = [0.0, 1.0, 2.0])
+        decomp = bstm.decompose_bstm_formula(
+            "y ~ intercept() + log(val, offset=0.1) |> fixed()", df_trans
+        )
+        @test !hasproperty(df_trans, :val_log)
+        @test hasproperty(decomp.data, :val_log)
+        @test decomp.data.val_log ≈ log.(decomp.data.val .+ 0.1)
+
+        decomp_mut = bstm.decompose_bstm_formula(
+            "y ~ intercept() + log(val, offset=0.1) |> fixed()", df_trans; copy_data=false
+        )
+        @test hasproperty(df_trans, :val_log)
+    end
+
+    @testset "Transformation DataFrame Safety & Collision Avoidance" begin
+        # Column collision handling
+        df_collision = DataFrame(
+            temp = [1.0, 2.0, 3.0, 4.0, 5.0],
+            temp_zscore = [99.0, 99.0, 99.0, 99.0, 99.0],
+            y = [1.0, 2.0, 3.0, 4.0, 5.0]
+        )
+        decomp_col = bstm.decompose_bstm_formula("likelihood(y) ~ zscore(temp) |> fixed()", df_collision)
+        @test hasproperty(decomp_col.data, :temp_zscore_2)
+        @test decomp_col.data.temp_zscore == [99.0, 99.0, 99.0, 99.0, 99.0]
+    end
+
+    @testset "Multivariate Hyperprior Sharing (Item 8)" begin
+        @test bstm.is_param_shared(true, :sigma) == true
+        @test bstm.is_param_shared(false, :sigma) == false
+        @test bstm.is_param_shared(:all, :sigma) == true
+        @test bstm.is_param_shared(:sigma, :sigma) == true
+        @test bstm.is_param_shared(:sigma, :rho) == false
+        @test bstm.is_param_shared([:sigma, :range], :sigma) == true
+        @test bstm.is_param_shared([:sigma, :range], :rho) == false
+
+        # Shared intercept
+        m_cfg_shared_int = (
+            model_arch = "multivariate",
+            outcomes_N = 3,
+            add_intercept = true,
+            shared_intercept = true,
+            intercept_prior = Normal(0, 1),
+            Xfixed_N = 0,
+            components = []
+        )
+        reg_shared_int = bstm.build_param_registry(m_cfg_shared_int)
+        @test haskey(reg_shared_int.descriptors, :intercept)
+        @test reg_shared_int.descriptors[:intercept].is_shared == true
+        @test !haskey(reg_shared_int.descriptors, :intercept_1)
+
+        # Fine-grained component sharing
+        m_cfg_shared_comp = (
+            model_arch = "multivariate",
+            outcomes_N = 2,
+            add_intercept = false,
+            Xfixed_N = 0,
+            components = [
+                (
+                    key = :time,
+                    params = Dict{Symbol, Any}(:shared => [:sigma]),
+                    component_obj = bstm.AR1(Normal(0, 1), Exponential(1.0), :statespace),
+                    hyper = (n_latent = 10,)
+                )
+            ]
+        )
+        reg_comp = bstm.build_param_registry(m_cfg_shared_comp)
+        @test haskey(reg_comp.descriptors, :sigma_time)
+        @test reg_comp.descriptors[:sigma_time].is_shared == true
+        @test haskey(reg_comp.descriptors, :rho_unconstrained_time_1)
+        @test haskey(reg_comp.descriptors, :rho_unconstrained_time_2)
+        @test reg_comp.descriptors[:rho_unconstrained_time_1].is_shared == false
+    end
+
+    @testset "Parameter Extraction Disambiguation (Item 13)" begin
+        reg_disambig = bstm.ParamRegistry()
+        bstm.add_descriptor!(reg_disambig, bstm.ParamDescriptor(:Xfixed_beta; role=:fixed_coef))
+        bstm.add_descriptor!(reg_disambig, bstm.ParamDescriptor(:beta_prop; role=:fixed_coef))
+
+        @test bstm.find_chain_param(reg_disambig, "beta"; exact=true) == ""
+        param_found = bstm.find_chain_param(reg_disambig, "beta"; exact=false)
+        @test !isempty(param_found)
+    end
+
+    @testset "Kronecker Product Composition Validation (Item 14)" begin
+        df_kronecker = DataFrame(y = rand(10), s = 1:10, t = 1:10, x = rand(10))
+        @test_throws ArgumentError bstm.decompose_bstm_formula(
+            "likelihood(y) ~ intercept() ⊗ fixed(x)", df_kronecker
+        )
+    end
+
+    @testset "Bare Fixed Effect Term Parsing" begin
+        p_scot = bstm.bstm_data("scottish_lip")
+        df_bare = p_scot.data
+        W_bare = p_scot.au.W
+
+        m_bare = @bstm(
+            likelihood(y_gauss) ~ 1 + cov1 + random(s_idx, model=bym2) + random(year, model=ar1),
+            df_bare,
+            W = W_bare,
+            verbose = false
+        )
+        @test m_bare !== nothing
+        @test hasproperty(m_bare, :args)
+    end
+end
+

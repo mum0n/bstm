@@ -86,7 +86,8 @@ The LHS `likelihood(outcome, ...)` defines the observation likelihood distributi
 
 | Parameter | Type | Default | Description & Mathematical Role |
 | :--- | :--- | :--- | :--- |
-| `family` | `Symbol` | `:gaussian` | Likelihood distribution family (19 families supported). |
+| `family` | `Symbol` | `:gaussian` | Likelihood distribution family (20 families supported). |
+| `reference` | `Symbol` / `String` | `nothing` | Reference category for unordered multi-class models (`:categorical`, `:multinomial`, etc.). Defaults to first category or column. |
 | `log_offsets` | `Symbol` / `Vector` | `nothing` | Additive offset on the linear predictor link scale: $\eta' = \eta + \text{offset}$. Essential for modeling rates (e.g., $\log(\text{Expected})$ in Poisson models). |
 | `weights` | `Symbol` / `Vector` | `nothing` | Observation-level log-likelihood weighting: $\ell_i(\theta) = w_i \cdot \log p(y_i \mid \eta_i)$. |
 | `trials` | `Symbol` / `Vector` | `nothing` | Number of binomial trials $N_i$ for `:binomial` and `:betabinomial` families. |
@@ -116,9 +117,75 @@ The LHS `likelihood(outcome, ...)` defines the observation likelihood distributi
 | `:zinegbin` | $\mu = \exp(\eta)$ | $y \in \{0, 1, \dots\}$ | Zero-inflation $\pi \sim \operatorname{Beta}(1, 1)$, dispersion $r \sim \operatorname{Gamma}(2.0, 0.5)$. | Overdispersed counts with structural zero inflation. |
 | `:ordered_logistic` | Cutpoints $c_k$ | $y \in \{1, \dots, K\}$ | Ordered categorical threshold vector $c_1 < c_2 < \dots < c_{K-1}$. | Likert scale survey responses and graded disease severity stages. |
 | `:ordered_probit` | Cutpoints $c_k$ | $y \in \{1, \dots, K\}$ | Standard normal CDF link $\Phi(\cdot)$ with ordered cutpoints. | Latent Gaussian threshold crossing models for ordinal ratings. |
-| `:categorical` | Softmax $\eta_k$ | $y \in \{1, \dots, K\}$ | Categorical probability vector $p = \operatorname{softmax}(\eta)$. | Unordered multi-class choice and state classifications. |
-| `:multinomial` | Softmax $\eta_k$ | Vector counts | Multinomial count vector across $K$ categories. | Compositional count data across competing categorical outcomes. |
-| `:dirichlet` | Softmax $\eta_k$ | Simplex $\Delta^{K-1}$ | Concentration parameter vector $\alpha = \exp(\eta)$. | Continuous compositional proportions summing to 1. |
+| `:categorical` | Softmax $\eta_k$ | $y \in \{1, \dots, K\}$ | Categorical probability vector $p = \operatorname{softmax}(\eta)$ with reference category $\eta_1 \equiv 0$. | Unordered multi-class choice and state classifications. |
+| `:multinomial` | Softmax $\eta_k$ | Vector counts | Multinomial count vector across $K$ categories with reference category $\eta_1 \equiv 0$. | Compositional count data across competing categorical outcomes. |
+| `:dirichlet_multinomial` | Softmax $\eta_k$ + Dirichlet $\phi$ | Vector counts | Multinomial counts with Dirichlet dispersion $\phi \sim \operatorname{Exponential}(1.0)$. | Overdispersed compositional count data with latent linear predictors. |
+| `:dirichlet` | Softmax $\eta_k$ + Dirichlet $\phi$ | Simplex $\Delta^{K-1}$ | Dirichlet concentration vector $\boldsymbol{\alpha} = \phi \cdot \operatorname{softmax}(\boldsymbol{\eta})$. | Continuous compositional proportions summing to 1. |
+
+---
+
+### 2.2.1. Multinomial, Categorical, and Compositional Likelihoods
+
+The `bstm` framework provides native, mathematically identified formulations for unordered
+multi-class, multinomial count, and compositional proportion data across $K \ge 2$ categories.
+
+#### Model Specifications & Formula Syntax
+
+1. **Wide Count Format (Multinomial / Dirichlet-Multinomial)**:
+   Observations are represented as multiple count columns summing to total trials per row:
+   ```julia
+   formula = @formula(likelihood(c1 + c2 + c3, family=:multinomial) ~
+                      intercept() + fixed(x1) + random(s_idx, model=bym2))
+   ```
+   Each row vector $\mathbf{y}_i = [y_{i, 1}, \dots, y_{i, K}]^\top$ represents counts
+   across $K$ categories with total trials $N_i = \sum_{k=1}^K y_{i, k}$.
+
+2. **Long Categorical Format (Categorical / Multi-Class Logit)**:
+   Observations are represented as an integer, string, or symbol categorical column:
+   ```julia
+   formula = @formula(likelihood(species, family=:categorical, reference="cod") ~
+                      intercept() + fixed(temperature) + random(time, model=ar1))
+   ```
+   The `reference` keyword specifies the baseline category (defaulting to the first level).
+
+3. **Dirichlet and Dirichlet-Multinomial Formulations**:
+   - `:dirichlet_multinomial`: Accommodates overdispersed count compositions via a learned
+     Dirichlet dispersion parameter $\phi \sim \operatorname{Exponential}(1.0)$.
+   - `:dirichlet`: Accommodates continuous simplex observations $\mathbf{y}_i \in \Delta^{K-1}$
+     where $\sum_{k=1}^K y_{i, k} = 1$ and $y_{i, k} > 0$.
+
+#### Mathematical Parameterization & Identifiability
+
+In standard multinomial logit models, the softmax transformation is invariant under uniform
+translation:
+$$\operatorname{softmax}(\boldsymbol{\eta} + c) = \operatorname{softmax}(\boldsymbol{\eta}), \quad \forall c \in \mathbb{R}$$
+Estimating $K$ unconstrained linear predictors introduces complete non-identifiability,
+inducing MCMC random-walk drift and poor sampling efficiency.
+
+To guarantee mathematical identifiability, `bstm` constrains the linear predictor of the
+reference category ($k = 1$) to zero:
+$$\eta_{i, 1} \equiv 0$$
+For non-reference categories $k \in \{2, \dots, K\}$, latent linear predictors $\eta_{i, k}$
+are estimated from the additive latent components:
+$$\eta_{i, k} = \alpha_k + \mathbf{x}_i^\top \boldsymbol{\beta}_k + u_{i, k} + \dots$$
+The category probability vector $\mathbf{p}_i = [p_{i, 1}, \dots, p_{i, K}]^\top$ on the
+simplex $\Delta^{K-1}$ is evaluated via numerically stable softmax:
+$$p_{i, k} = \frac{\exp(\eta_{i, k})}{\sum_{j=1}^K \exp(\eta_{i, j})} = \operatorname{softmax}(\boldsymbol{\eta}_i)_k$$
+
+For Dirichlet and Dirichlet-Multinomial families, the Dirichlet concentration vector
+$\boldsymbol{\alpha}_i$ is parameterized by precision $\phi$:
+$$\boldsymbol{\alpha}_i = \phi \cdot \mathbf{p}_i, \quad \phi \sim \operatorname{Exponential}(1.0)$$
+$$\mathbf{y}_i \sim \operatorname{DirichletMultinomial}(N_i, \boldsymbol{\alpha}_i)$$
+
+#### Posterior Reconstruction Outputs
+
+Posterior reconstruction via `model_results_comprehensive` automatically produces:
+- **`probabilities`**: Posterior mean and 95% credible intervals for each category probability
+  $p_{i, k}$ across all observations $i=1,\dots,N$, strictly satisfying $\sum_{k=1}^K p_{i,k} = 1$.
+- **`predicted_category`**: Maximum a posteriori (MAP) predicted dominant category
+  $\hat{y}_i = \operatorname{argmax}_k p_{i, k}$ mapped back to categorical factor labels.
+- **Joint WAIC / Pointwise Log-Likelihood**: Evaluated across multivariate outcome vectors
+  for Bayesian model comparison and leave-one-out cross-validation.
 
 ---
 
@@ -126,17 +193,17 @@ The LHS `likelihood(outcome, ...)` defines the observation likelihood distributi
 
 The RHS formula combines linear fixed effects, structured random fields, and process dynamics:
 
-| Module | Purpose | Key Parameters | Example Usage |
-| :--- | :--- | :--- | :--- |
-| `intercept()` | Controls global intercept prior. | `prior` | `intercept(prior=Normal(0, 5))` |
-| `fixed()` | Fixed-effect regression coefficients. | `prior`, `contrast` | `fixed(elevation, prior=Normal(0, 1))` |
-| `random()` | Structured & unstructured random fields. | `model`, `sigma`, `rho`, `lengthscale`, etc. | `random(s_idx, model=bym2)` |
-| `mixed()` | Correlated random slopes and intercepts. | `model`, `method` | `mixed(1 + poverty \| region)` |
-| `dynamics()` | Mechanistic state-space differential equations. | `model`, `r`, `K`, `velocity`, `diffusion` | `dynamics(time, model=:logistic, r=Normal(0.5, 0.1))` |
-| `eigen()` | Bayesian PCA factor analysis. | `n_factors`, `pca_sd` | `eigen(pollutant1, pollutant2, n_factors=1)` |
-| `nested()` | Multi-fidelity supervised proxy models. | `formula`, `data_source` | `nested(proxy, formula="...", data_source=df_proxy)` |
-| `sciml()` | Scientific Machine Learning ODE/PDE integration. | `model_func`, `solver` | `sciml(t, model_func=my_ode)` |
-| `custom()` | User-injected raw Turing code fragments. | `code_fragment` | `custom(code_fragment="...")` |
+| Module        | Purpose                                          | Key Parameters                               | Example Usage                                         |          |
+| :--------------| :-------------------------------------------------| :---------------------------------------------| :------------------------------------------------------| ----------|
+| `intercept()` | Controls global intercept prior.                 | `prior`                                      | `intercept(prior=Normal(0, 5))`                       |          |
+| `fixed()`     | Fixed-effect regression coefficients.            | `prior`, `contrast`                          | `fixed(elevation, prior=Normal(0, 1))`                |          |
+| `random()`    | Structured & unstructured random fields.         | `model`, `sigma`, `rho`, `lengthscale`, etc. | `random(s_idx, model=bym2)`                           |          |
+| `mixed()`     | Correlated random slopes and intercepts.         | `model`, `method`                            | `mixed(1 + poverty \                                  | region)` |
+| `dynamics()`  | Mechanistic state-space differential equations.  | `model`, `r`, `K`, `velocity`, `diffusion`   | `dynamics(time, model=:logistic, r=Normal(0.5, 0.1))` |          |
+| `eigen()`     | Bayesian PCA factor analysis.                    | `n_factors`, `pca_sd`                        | `eigen(pollutant1, pollutant2, n_factors=1)`          |          |
+| `nested()`, `transfer()`, `fidelity()` | Multi-fidelity supervised proxy models & transfer learning. | `formula`, `data_source`, `mapping`, `prior`, `fixed` | `transfer(:proxy)` or `nested(proxy, formula="...", data_source=df)` |
+| `sciml()`     | Scientific Machine Learning ODE/PDE integration. | `model_func`, `solver`                       | `sciml(t, model_func=my_ode)`                         |          |
+| `custom()`    | User-injected raw Turing code fragments.         | `code_fragment`                              | `custom(code_fragment="...")`                         |          |
 
 ---
 
@@ -587,16 +654,105 @@ $$
 
 ---
 
-### 5.7. Supervised Multi-Fidelity Modeling (`nested()`)
+### 5.7. Supervised Multi-Fidelity & Transfer Linkage Models (`nested()`, `transfer()`, `fidelity()`)
 
-The `nested()` supervisor module enables multi-fidelity transfer learning and errors-in-variables covariate modeling:
+Multi-fidelity transfer modeling enables joint inference where a primary process (e.g., sparse, high-precision ground monitor observations) is augmented by one or more proxy processes (e.g., dense but biased satellite retrievals, low-fidelity numerical simulations, or auxiliary biological telemetry).
 
+#### 5.7.1. Mathematical Formulation
+
+Let $\mathbf{y}_{\text{hi}} \in \mathbb{R}^{N_{\text{hi}}}$ denote the primary observation vector and $\mathbf{y}_{\text{lo}, m} \in \mathbb{R}^{N_{\text{sub}, m}}$ denote auxiliary/proxy observation vectors for sub-models $m = 1, \dots, M$.
+
+**Primary / High-Fidelity Process**:
 $$
-\eta_{\text{main}} = \dots + \rho_{\text{nested}} \cdot \eta_{\text{sub}}(\text{Data}_{\text{aux}})
+\mathbf{y}_{\text{hi}} \sim \operatorname{Likelihood}(\boldsymbol{\eta}_{\text{hi}}, \boldsymbol{\theta}_{\text{hi}})
+$$
+$$
+\boldsymbol{\eta}_{\text{hi}} = \alpha_{\text{hi}} + \mathbf{X}_{\text{hi}} \boldsymbol{\beta}_{\text{hi}} + \sum_{k} f_k(\mathbf{s}, t) + \sum_{m=1}^M \rho_m \cdot \boldsymbol{\eta}_{\text{sub}, m}[\mathcal{M}_m]
 $$
 
-- **Core Assumptions**: Coarse or noisy proxy data shares the latent spatial/temporal functional form up to scaling $\rho$.
-- **Utility**: Integrating satellite proxy observations with sparse ground-station monitors; jointly modeling censored or missing covariates.
+**Auxiliary / Sub-Model Process**:
+Each sub-model $m$ is estimated jointly as an independent Bayesian structural process:
+$$
+\mathbf{y}_{\text{lo}, m} \sim \operatorname{Likelihood}(\boldsymbol{\eta}_{\text{sub}, m}, \boldsymbol{\theta}_{\text{sub}, m})
+$$
+$$
+\boldsymbol{\eta}_{\text{sub}, m} = \alpha_{\text{sub}, m} + \mathbf{X}_{\text{lo}, m} \boldsymbol{\beta}_{\text{sub}, m} + \sum_{j} g_{m, j}(\mathbf{s}, t)
+$$
+
+**Coupling Weight ($\rho_m$)**:
+$$
+\rho_m \sim \mathcal{P}_{\text{coupling}} \quad (\text{default: } \operatorname{Normal}(1.0, 0.5))
+$$
+Optionally, coupling can be fixed ($\rho_m \equiv 1.0$) via `fixed = true`.
+
+**Observation Alignment & Mapping ($\mathcal{M}_m$)**:
+When the primary and proxy datasets differ in observation count ($N_{\text{hi}} \ne N_{\text{sub}, m}$), an explicit index mapping vector $\mathcal{M}_m \in \{1, \dots, N_{\text{sub}, m}\}^{N_{\text{hi}}}$ maps each primary observation $i \in \{1, \dots, N_{\text{hi}}\}$ to its corresponding proxy location/cell $\mathcal{M}_m[i]$. Bounds ($1 \le \mathcal{M}_m[i] \le N_{\text{sub}, m}$) and dimensions ($\operatorname{length}(\mathcal{M}_m) = N_{\text{hi}}$) are strictly validated.
+
+#### 5.7.2. Declarative Paired Multi-Equation Syntax
+
+The preferred, modern syntax for defining multi-fidelity systems uses declarative pairs. This avoids escaped nested strings and permits native Julia formula expressions.
+
+##### Using the `@bstm` Macro
+```julia
+model = @bstm(
+    :primary => (
+        formula = likelihood(pm25_ground) ~ 1 + fixed(elevation) + transfer(:satellite),
+        data    = df_ground
+    ),
+    :satellite => (
+        formula = likelihood(aod_satellite) ~ 1 + fixed(humidity) + random(s_idx, model=bym2),
+        data    = df_satellite,
+        mapping = :satellite_cell_id,   # Column in df_ground or index vector
+        prior   = Normal(1.0, 0.25)     # Custom coupling weight prior
+    )
+)
+
+# Sample jointly using NUTS or optimal composite Gibbs sampler
+chain = sample(model, NUTS(), 1000)
+```
+
+##### Using `bstm_config` or `bstm_core`
+```julia
+cfg = bstm_config(
+    :primary => (
+        formula = "likelihood(y_hi) ~ 1 + fixed(x) + transfer(:proxy)",
+        data    = data_hi
+    ),
+    :proxy => (
+        formula = "likelihood(y_lo) ~ 1 + fixed(x)",
+        data    = data_lo,
+        mapping = map_indices,          # Vector{Int} of length N_hi
+        prior   = Normal(0.0, 1.0),
+        fixed   = false
+    )
+)
+```
+
+#### 5.7.3. Classic Formula Supervisor Syntax (`nested()`)
+
+For single-formula workflows, the `nested()` module remains fully supported:
+```julia
+model = @bstm(
+    likelihood(y_hi) ~ 1 + fixed(x) +
+        nested(proxy, formula="likelihood(y_lo) ~ 1 + fixed(x)",
+               data_source=:proxy_data, mapping=:map_idx, prior=Normal(1.0, 0.5)),
+    data_hi,
+    proxy_data = data_lo
+)
+```
+
+#### 5.7.4. Parameter Registry & Namespace Isolation
+
+Sub-model parameters are automatically isolated and prefixed in the `ParamRegistry`:
+- Main model: `intercept`, `beta`, `y_sigma`.
+- Coupling weight: `rho_nested_<key>` (assigned `role = :nested_weight`, shape `(1,)`).
+- Sub-model: `intercept_<key>`, `beta_<key>`, `y_sigma_<key>`, etc.
+
+Parameter queries by role:
+```julia
+reg = build_param_registry(cfg)
+weights = get_descriptors_by_role(reg, :nested_weight)  # Returns ParamDescriptor for rho_nested_*
+```
 
 ---
 
@@ -649,6 +805,21 @@ mle_res = optimize(m, MLE())
 vi_res = vi(m, ADVI(10, 1000))
 ```
 
+### 6.3. Parameter Registry & Sample Extraction
+
+The `ParamRegistry` tracks parameter roles, dimensions, and priors across the model hierarchy:
+
+```julia
+# Inspect or query descriptors by semantic role
+reg = build_param_registry(model)
+spatial_params = get_descriptors_by_role(reg, :spatial)
+nested_weights = get_descriptors_by_role(reg, :nested_weight)
+
+# Direct posterior sample extraction
+rho_samples = get_samples(chain, :rho_nested_proxy)  # 1D Vector for scalar
+beta_samples = get_samples(chain, :beta)              # 2D Matrix (n_samples, p)
+```
+
 ---
 
 ## 7. Posterior Reconstruction, Prediction & Diagnostics Engine
@@ -668,9 +839,31 @@ Processes fitted models and MCMC chains into a clean, structured analytical data
 | `effects` | `NamedTuple` | Latent component effect summaries (spatial, temporal, fixed, random, interaction). |
 | `predictions` | `NamedTuple` | Observation-level fitted values: `denoised` (`mean`, `median`, `std`, `lower`, `upper`) and `noisy`. |
 | `draws` | `NamedTuple` | Raw posterior sample matrices: `predictions_denoised`, `predictions_noisy`, `weights`, `log_likelihood`. |
+| `transfer_results` | `Dict{Symbol, Any}` | Reconstructed post-processing results for nested transfer sub-models (or `nothing`). |
 | `arch` | `ModelArchitecture` | Model architecture type (`UnivariateArchitecture`, `MultivariateArchitecture`, `MultifidelityArchitecture`). |
 
-### 7.2. Diagnostic & Component Effect Plotting (`bstm_plots`)
+### 7.2. Direct Reconstruction (`reconstruct`)
+
+The `reconstruct` function provides lightweight, low-overhead posterior latent field synthesis, point predictions, and credible intervals from an MCMC chain and model configuration (or DynamicPPL model):
+
+```julia
+# From model or config NamedTuple
+res = reconstruct(chain, cfg; alpha=0.05)
+res = reconstruct(model, chain; alpha=0.05)
+```
+
+| Return Field | Type | Description |
+| :--- | :--- | :--- |
+| `predictions_denoised` | `NamedTuple` | Expected value summaries ($g^{-1}(\eta)$): `mean`, `median`, `std`, `lower`, `upper`. |
+| `predictions_noisy` | `NamedTuple` | Observation-level predictions incorporating residual dispersion. |
+| `raw_predictions_denoised` | `Array` | Raw Monte Carlo draws for expected values. |
+| `raw_predictions_noisy` | `Array` | Raw Monte Carlo draws for noisy predictions. |
+| `log_likelihood` | `Matrix` | Pointwise observation-level log-likelihood evaluation matrix. |
+| `waic` | `Real` / `NamedTuple` | Widely Applicable Information Criterion. |
+| `effects` | `NamedTuple` | Summarized posterior effects across all registered model components. |
+| `transfer_results` | `Dict{Symbol, Any}` | Reconstructed outputs for each nested/transfer sub-model. |
+
+### 7.3. Diagnostic & Component Effect Plotting (`bstm_plots`)
 
 ```julia
 plots_res = bstm_plots(res; data=inp_df, au=data_scot.au, save_dir=nothing, save_prefix="", fmt="png", dpi=150)
@@ -685,7 +878,7 @@ Generates the complete suite of diagnostic plots and underlying tidy datasets fr
 
 If `save_dir !== nothing`, all generated plots are automatically saved to disk.
 
-### 7.3. Out-of-Sample Prediction (`predict`)
+### 7.4. Out-of-Sample Prediction (`predict`)
 
 ```julia
 preds = predict(model, chain, new_dataframe; alpha=0.05)
@@ -693,7 +886,7 @@ preds = predict(model, chain, new_dataframe; alpha=0.05)
 
 Projects fitted posterior fields onto a new spatial, temporal, or covariate data grid, automatically re-computing basis matrices for smooth spline terms and Gaussian Process cross-covariances.
 
-### 7.3. Model Inspection (`show_model`)
+### 7.5. Model Inspection (`show_model`)
 
 ```julia
 show_model(model)
@@ -701,10 +894,10 @@ show_model(model)
 
 Prints formatted diagnostic information about the model, including the parsed formula, data schema, active components, generated Turing model code, and parameter registry mappings.
 
-### 7.4. Benchmark Datasets (`bstm_data`)
+### 7.6. Benchmark Datasets (`bstm_data`)
 
 ```julia
-dataset, metadata = bstm_data("scottish_lip")
+dataset = bstm_data("scottish_lip")
 ```
 
 Loads built-in benchmark spatiotemporal datasets (e.g. Scottish Lip Cancer disease mapping dataset with spatial polygons and adjacency matrix $W$).
@@ -790,27 +983,27 @@ The `bstm` framework provides a high-performance, non-redundant serialization an
 
 ### 11.1. Function Reference
 
-| Function | Signature | Description |
-| :--- | :--- | :--- |
-| `save_bstm_model` | `save_bstm_model(path, model; chain=nothing, au=nothing, metadata=Dict(), compress=true)` | Serializes the complete Turing `@model` state, configuration `M`, data, and optional MCMC chain to JLD2. |
-| `load_bstm_model` | `load_bstm_model(path; calling_module=Main)` | Reads JLD2 file and re-instantiates a live, callable `DynamicPPL.Model` ready for sampling or prediction. |
-| `save_bstm_results` | `save_bstm_results(duckdb_path, res; model=nothing, chain=nothing, au=nothing, table_prefix="", overwrite=true)` | Normalizes `model_results_comprehensive` output into relational DuckDB tables (`metrics`, `parameter_stats`, `predictions`, `spatial_geometries`, `plots_data_*`). |
-| `load_bstm_results` | `load_bstm_results(duckdb_path; table_prefix="")` | Reconstructs the `model_results_comprehensive` NamedTuple from DuckDB tables. |
-| `query_duckdb` | `query_duckdb(duckdb_path, sql_query)` | Executes analytical SQL queries directly against a BSTM DuckDB database, returning a DataFrame. |
-| `export_posterior_samples_to_duckdb` | `export_posterior_samples_to_duckdb(duckdb_path, chain, model=nothing; table_name="bstm_posterior_samples", format=:tidy)` | Exports MCMC posterior draws in `:tidy` long format `(iteration, chain, parameter, value)` or `:wide` format to DuckDB. |
-| `import_posterior_samples_from_duckdb` | `import_posterior_samples_from_duckdb(duckdb_path; table_name="bstm_posterior_samples")` | Reads stored posterior draws from DuckDB into a Julia DataFrame. |
-| `append_posterior_samples` | `append_posterior_samples(chain1, chain2)` | Concatenates two MCMC chains across sampling iterations for chain extension. |
-| `extend_sampling` | `extend_sampling(model, prev_chain, n_additional_samples; sampler=NUTS(), kwargs...)` | Warms up from previous chain state, samples additional iterations, and returns merged chains. |
-| `save_bstm_bundle` | `save_bstm_bundle(base_path, model, chain, res; au=nothing, metadata=Dict())` | Unified one-line persistence creating `<base_path>.jld2` (model & chain) and `<base_path>.duckdb` (results). |
-| `load_bstm_bundle` | `load_bstm_bundle(base_path; calling_module=Main)` | Unified one-line loader recovering `(model=m, chain=chn, results=res, au=au, metadata=meta)`. |
-| `export_spatial_results_to_geojson` | `export_spatial_results_to_geojson(geojson_path, res, au; property_keys=nothing)` | Serializes spatial model results and polygon boundaries to standard RFC 7946 GeoJSON. |
-| `extract_posterior_priors` | `extract_posterior_priors(source; parameter_names=nothing, prior_family=:normal)` | Extracts posterior parameters and builds fitted prior distributions for sequential Bayesian updating. |
-| `save_model_ensemble` | `save_model_ensemble(duckdb_path, ensemble_dict; overwrite=true)` | Registers a multi-model ensemble in DuckDB and computes $\Delta \text{WAIC}$ and BMA weights. |
-| `bma_weighted_predictions` | `bma_weighted_predictions(duckdb_path)` | Computes Bayesian Model Averaged predictions and total variance across all candidate models. |
-| `save_out_of_sample_predictions` | `save_out_of_sample_predictions(duckdb_path, pred_df; table_name="out_of_sample_predictions")` | Stores out-of-sample prediction DataFrames into DuckDB. |
-| `export_results_to_parquet` | `export_results_to_parquet(duckdb_path, table_name, output_parquet_path)` | Zero-copy compressed Parquet export using DuckDB `COPY`. |
-| `export_results_to_csv` | `export_results_to_csv(duckdb_path, table_name, output_csv_path)` | Exports DuckDB table to CSV. |
-| `compact_duckdb` | `compact_duckdb(duckdb_path)` | Executes `VACUUM; ANALYZE;` on DuckDB database to reclaim space and optimize query statistics. |
+| Function                               | Signature                                                                                                                  | Description                                                                                                                                                        |
+| :---------------------------------------| :---------------------------------------------------------------------------------------------------------------------------| :-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `save_bstm_model`                      | `save_bstm_model(path, model; chain=nothing, au=nothing, metadata=Dict(), compress=true)`                                  | Serializes the complete Turing `@model` state, configuration `M`, data, and optional MCMC chain to JLD2.                                                           |
+| `load_bstm_model`                      | `load_bstm_model(path; calling_module=Main)`                                                                               | Reads JLD2 file and re-instantiates a live, callable `DynamicPPL.Model` ready for sampling or prediction.                                                          |
+| `save_bstm_results`                    | `save_bstm_results(duckdb_path, res; model=nothing, chain=nothing, au=nothing, table_prefix="", overwrite=true)`           | Normalizes `model_results_comprehensive` output into relational DuckDB tables (`metrics`, `parameter_stats`, `predictions`, `spatial_geometries`, `plots_data_*`). |
+| `load_bstm_results`                    | `load_bstm_results(duckdb_path; table_prefix="")`                                                                          | Reconstructs the `model_results_comprehensive` NamedTuple from DuckDB tables.                                                                                      |
+| `query_duckdb`                         | `query_duckdb(duckdb_path, sql_query)`                                                                                     | Executes analytical SQL queries directly against a BSTM DuckDB database, returning a DataFrame.                                                                    |
+| `export_posterior_samples_to_duckdb`   | `export_posterior_samples_to_duckdb(duckdb_path, chain, model=nothing; table_name="bstm_posterior_samples", format=:tidy)` | Exports MCMC posterior draws in `:tidy` long format `(iteration, chain, parameter, value)` or `:wide` format to DuckDB.                                            |
+| `import_posterior_samples_from_duckdb` | `import_posterior_samples_from_duckdb(duckdb_path; table_name="bstm_posterior_samples")`                                   | Reads stored posterior draws from DuckDB into a Julia DataFrame.                                                                                                   |
+| `append_posterior_samples`             | `append_posterior_samples(chain1, chain2)`                                                                                 | Concatenates two MCMC chains across sampling iterations for chain extension.                                                                                       |
+| `extend_sampling`                      | `extend_sampling(model, prev_chain, n_additional_samples; sampler=NUTS(), kwargs...)`                                      | Warms up from previous chain state, samples additional iterations, and returns merged chains.                                                                      |
+| `save_bstm_bundle`                     | `save_bstm_bundle(base_path, model, chain, res; au=nothing, metadata=Dict())`                                              | Unified one-line persistence creating `<base_path>.jld2` (model & chain) and `<base_path>.duckdb` (results).                                                       |
+| `load_bstm_bundle`                     | `load_bstm_bundle(base_path; calling_module=Main)`                                                                         | Unified one-line loader recovering `(model=m, chain=chn, results=res, au=au, metadata=meta)`.                                                                      |
+| `export_spatial_results_to_geojson`    | `export_spatial_results_to_geojson(geojson_path, res, au; property_keys=nothing)`                                          | Serializes spatial model results and polygon boundaries to standard RFC 7946 GeoJSON.                                                                              |
+| `extract_posterior_priors`             | `extract_posterior_priors(source; parameter_names=nothing, prior_family=:normal)`                                          | Extracts posterior parameters and builds fitted prior distributions for sequential Bayesian updating.                                                              |
+| `save_model_ensemble`                  | `save_model_ensemble(duckdb_path, ensemble_dict; overwrite=true)`                                                          | Registers a multi-model ensemble in DuckDB and computes $\Delta \text{WAIC}$ and BMA weights.                                                                      |
+| `bma_weighted_predictions`             | `bma_weighted_predictions(duckdb_path)`                                                                                    | Computes Bayesian Model Averaged predictions and total variance across all candidate models.                                                                       |
+| `save_out_of_sample_predictions`       | `save_out_of_sample_predictions(duckdb_path, pred_df; table_name="out_of_sample_predictions")`                             | Stores out-of-sample prediction DataFrames into DuckDB.                                                                                                            |
+| `export_results_to_parquet`            | `export_results_to_parquet(duckdb_path, table_name, output_parquet_path)`                                                  | Zero-copy compressed Parquet export using DuckDB `COPY`.                                                                                                           |
+| `export_results_to_csv`                | `export_results_to_csv(duckdb_path, table_name, output_csv_path)`                                                          | Exports DuckDB table to CSV.                                                                                                                                       |
+| `compact_duckdb`                       | `compact_duckdb(duckdb_path)`                                                                                              | Executes `VACUUM; ANALYZE;` on DuckDB database to reclaim space and optimize query statistics.                                                                     |
 
 ---
 
@@ -828,6 +1021,10 @@ The movement subsystem implements biophysical Advection-Diffusion-Reaction (ADR)
 | `calculate_multistep_transition` | `calculate_multistep_transition(Gamma_base, steps)` | Calculates multi-step dispersal transition probabilities via matrix exponentiation $\mathbf{\Gamma}^k$. |
 | `simulate_posterior_trajectories` | `simulate_posterior_trajectories(Gamma_base, start_units, n_steps, au_context; rho_persistence=0.0, rng=Random.GLOBAL_RNG)` | Simulates individual animal trajectories with directional persistence (Correlated Random Walk). |
 | `simulate_mechanistic_trajectories` | `simulate_mechanistic_trajectories(Gamma_sequence, start_units, t_start, au_context; rho_persistence=0.0, n_years_sim=1, rng=Random.GLOBAL_RNG)` | Simulates individual movement through dynamic, time-varying transition kernels $\mathbf{\Gamma}_t$. |
+| `construct_stochastic_transition_kernel` | `construct_stochastic_transition_kernel(W, hsi_vec; gamma=1.0, residence=0.0, advection=0.0, spatial=false)` | Constructs row-stochastic transition kernel $\mathbf{P} \in [0, 1]^{S \times S}$ (or $\operatorname{Vector}\{\operatorname{Matrix}\}$ for groups). `spatial=false` supports length-$G$ vectors for demographic groups; `spatial=true` supports length-$S$ vectors for spatially varying parameters across units. |
+| `compute_directed_adjacency` | `compute_directed_adjacency(W, hsi_vec; gamma=1.0)` | Constructs directed adjacency matrix modulated by habitat gradients: $A_{ij} = W_{ij} \exp(\gamma (h_j - h_i))$. Supports scalar $\gamma$ or spatially varying vector $\gamma \in \mathbb{R}^S$. |
+| `predict_path` | `predict_path(P, obs_units, obs_times; group=1)` | Reconstructs the most likely latent path between telemetry fixes using the Viterbi algorithm. Accepts single transition matrix $\mathbf{P}$ or vector of group transition kernels. |
+| `predict_corridor` | `predict_corridor(P, start_unit, end_unit, n_steps; group=1)` | Computes the spatial movement corridor and expected occupancy probability field between endpoints over $K$ steps. Accepts single matrix $\mathbf{P}$ or vector of group kernels. |
 | `compute_suitability_transition_kernel` | `compute_suitability_transition_kernel(suitability_vec, W; sensitivity=1.0, diffusion_weight=0.1)` | Generates spatial Markov transition kernels biased towards high habitat suitability. |
 | `calculate_regional_connectivity` | `calculate_regional_connectivity(Gamma, strata_definition)` | Aggregates fine-scale unit transitions into macro-regional migration probability matrices. |
 | `plot_ad_ratio_distribution` | `plot_ad_ratio_distribution(advection_field, diffusion_field)` | Generates diagnostic histogram of local Advection-to-Diffusion (Péclet) ratios. |
@@ -857,20 +1054,54 @@ The movement subsystem implements biophysical Advection-Diffusion-Reaction (ADR)
 
 ---
 
-## 14. References
+## 14. Population Attributable Risk (PAR / PAF) Engine (`src/par.jl`)
+
+The epidemiological risk attribution engine calculates relative risks, odds ratios, population attributable fractions, and counterfactual intervention scenarios from MCMC posterior chains:
+
+### 14.1. Mathematical Formulations
+- **Log-Linear Relative Risk**: With canonical log link ($\eta = \log \mu$), $\text{RR} = \exp(\beta)$.
+- **Logistic Models & Baseline Risk**: With logit link ($\eta = \operatorname{logit}(p)$), $\text{OR} = \exp(\beta)$. Conditional on baseline probability $p_0$:
+  $$\text{RR} = \frac{\operatorname{logistic}(\operatorname{logit}(p_0) + \beta)}{p_0}$$
+- **Levin's Formulation (1953)**: For population exposure prevalence $p_{\text{pop}}$:
+  $$\text{PAF} = \frac{p_{\text{pop}} (\text{RR} - 1)}{1 + p_{\text{pop}} (\text{RR} - 1)}$$
+- **Miettinen's Formulation (1974)**: For case exposure prevalence $p_{\text{cases}}$:
+  $$\text{PAF} = p_{\text{cases}} \frac{\text{RR} - 1}{\text{RR}}$$
+- **Prevented Fraction (PF)**: For protective exposures ($\text{RR} < 1$):
+  $$\text{PF} = \frac{p_{\text{pop}} (1 - \text{RR})}{p_{\text{pop}} (1 - \text{RR}) + \text{RR}}$$
+- **Counterfactual Model-Based PAF**: Full posterior simulation comparing observed vs counterfactual ($E_i = 0$):
+  $$\text{PAF}^{(s)} = \frac{\sum_{i=1}^N \mu_i^{(s)}(\mathbf{X}_i) - \sum_{i=1}^N \mu_i^{(s)}(\mathbf{X}_i^*)}{\sum_{i=1}^N \mu_i^{(s)}(\mathbf{X}_i)}$$
+
+### 14.2. Function Reference
+
+| Function | Signature | Description |
+| :--- | :--- | :--- |
+| `par_from_posterior` | `par_from_posterior(chain, covariate; family="poisson", baseline_eta=nothing, baseline_risk=nothing, exposure_var=nothing, exposure_prevalence=nothing, threshold=nothing, data=nothing, outcome_var=nothing, reference_population="sample", method=:levin, alpha=0.05)` | Computes PAF, PAR, RR, Prevented Fraction, and Attributable Cases across posterior draws. |
+| `summarize_par_effects` | `summarize_par_effects(chain; covariates=nothing, families="poisson", baseline_etas=nothing, baseline_risks=nothing, exposure_vars=nothing, exposure_prevalences=nothing, thresholds=nothing, data=nothing, outcome_var=nothing, reference_population="sample", method=:levin, alpha=0.05)` | Batch computes PAR/PAF summaries across multiple fixed effect covariates. |
+| `par_counterfactual` | `par_counterfactual(model, chain; exposure_var, counterfactual_value=0.0, data=nothing, alpha=0.05)` | Computes model-based PAF and attributable cases via individual-level counterfactual simulation. |
+| `export_par_to_table` | `export_par_to_table(par_results; include_raw_samples=false)` | Exports single or multiple PAR results into a tidy analytical `DataFrame`. |
+| `par_credible_interval_plot` | `par_credible_interval_plot(par_result; title="PAF Estimate")` | Generates Plots.jl visual of PAF posterior mean and credible interval. |
+| `par_forest_plot` | `par_forest_plot(par_results; title="Forest Plot: PAF by Risk Factor")` | Generates Plots.jl forest plot comparing PAF estimates across risk factors. |
+
+---
+
+## 15. References
 
 1. **Besag, J.** (1974). Spatial interaction and the statistical analysis of lattice systems. *Journal of the Royal Statistical Society: Series B*, 36(2), 192–225.
 2. **Besag, J., York, J., & Mollié, A.** (1991). Bayesian image restoration, with applications in spatial statistics. *Annals of the Institute of Statistical Mathematics*, 43(1), 1–59.
 3. **Du, Q., Faber, V., & Gunzburger, M.** (1999). Centroidal Voronoi tessellations: Applications and algorithms. *SIAM Review*, 41(4), 637–676.
 4. **Gelfand, A. E., et al.** (2003). Spatial modeling with spatially varying coefficient processes. *Journal of the American Statistical Association*, 98(462), 387–396.
-5. **Hooten, M. B., & Hefley, T. J.** (2019). *Bringing Bayesian Models to Life*. CRC Press.
-6. **Jenks, G. F.** (1967). The data model concept in statistical mapping. *International Yearbook of Cartography*, 7, 186–190.
-7. **Knorr-Held, L.** (2000). Bayesian modelling of inseparable space-time variation in disease risk. *Statistical Methods in Medical Research*, 9(3), 205–220.
-8. **Leroux, B. G., Lei, X., & Breslow, N.** (2000). Estimation of disease rates in small areas: A new mixed model for spatial dependence. In *Statistical Models in Epidemiology, the Environment, and Clinical Trials* (pp. 179–191). Springer.
-9. **Lindgren, F., Rue, H., & Lindström, J.** (2011). An explicit link between Gaussian fields and Gaussian Markov random fields: The SPDE approach. *Journal of the Royal Statistical Society: Series B*, 73(4), 423–498.
-10. **Lloyd, S.** (1982). Least squares quantization in PCM. *IEEE Transactions on Information Theory*, 28(2), 129–137.
-11. **Okubo, A.** (1980). *Diffusion and Ecological Problems: Mathematical Models*. Springer-Verlag.
-12. **Rasmussen, C. E., & Williams, C. K. I.** (2006). *Gaussian Processes for Machine Learning*. MIT Press.
-13. **Riebler, A., Sørbye, S. H., Simpson, D., & Rue, H.** (2016). An intuitive Bayesian spatial model for disease mapping that accounts for scaling. *Statistical Methods in Medical Research*, 25(4), 1145–1165.
-14. **Roberts, D. R., et al.** (2017). Cross-validation strategies for data with temporal, spatial, hierarchical or phylogenetic structure. *Ecography*, 40(8), 913–929.
-15. **Turchin, P.** (1998). *Quantitative Analysis of Movement: Measuring and Modeling Population Redistribution in Animals and Plants*. Sinauer Associates.
+5. **Greenland, S., & Drescher, K.** (1993). Maximum likelihood estimation of the attributable fraction from logistic models. *Biometrics*, 49(3), 865–872.
+6. **Hooten, M. B., & Hefley, T. J.** (2019). *Bringing Bayesian Models to Life*. CRC Press.
+7. **Jenks, G. F.** (1967). The data model concept in statistical mapping. *International Yearbook of Cartography*, 7, 186–190.
+8. **Knorr-Held, L.** (2000). Bayesian modelling of inseparable space-time variation in disease risk. *Statistical Methods in Medical Research*, 9(3), 205–220.
+9. **Leroux, B. G., Lei, X., & Breslow, N.** (2000). Estimation of disease rates in small areas: A new mixed model for spatial dependence. In *Statistical Models in Epidemiology, the Environment, and Clinical Trials* (pp. 179–191). Springer.
+10. **Levin, M. L.** (1953). The occurrence of lung cancer in man. *Acta Unio Int. Cancrum*, 9(3), 531–541.
+11. **Lindgren, F., Rue, H., & Lindström, J.** (2011). An explicit link between Gaussian fields and Gaussian Markov random fields: The SPDE approach. *Journal of the Royal Statistical Society: Series B*, 73(4), 423–498.
+12. **Lloyd, S.** (1982). Least squares quantization in PCM. *IEEE Transactions on Information Theory*, 28(2), 129–137.
+13. **Miettinen, O. S.** (1974). Proportion of disease caused or prevented by a given exposure, trait or intervention. *American Journal of Epidemiology*, 99(5), 325–332.
+14. **Okubo, A.** (1980). *Diffusion and Ecological Problems: Mathematical Models*. Springer-Verlag.
+15. **Rasmussen, C. E., & Williams, C. K. I.** (2006). *Gaussian Processes for Machine Learning*. MIT Press.
+16. **Riebler, A., Sørbye, S. H., Simpson, D., & Rue, H.** (2016). An intuitive Bayesian spatial model for disease mapping that accounts for scaling. *Statistical Methods in Medical Research*, 25(4), 1145–1165.
+17. **Roberts, D. R., et al.** (2017). Cross-validation strategies for data with temporal, spatial, hierarchical or phylogenetic structure. *Ecography*, 40(8), 913–929.
+18. **Rockhill, B., Newman, B., & Weinberg, C.** (1998). Use and misuse of population attributable fractions. *American Journal of Public Health*, 88(1), 15–19.
+19. **Turchin, P.** (1998). *Quantitative Analysis of Movement: Measuring and Modeling Population Redistribution in Animals and Plants*. Sinauer Associates.

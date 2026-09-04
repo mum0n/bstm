@@ -1437,17 +1437,50 @@ end
     # Granular Post-Processing: Merging, Pruning, and Exact Units Enforcement
     # -------------------------------------------------------------------------
 
-    # A. Merge small polygons below min_area
-    if merge_small_polygons || (min_area > 0.0)
+    is_regular_grid = area_method in [:hexagonal, :hexbin, :lattice, :grid]
+
+    # A. Merge small polygons below min_area (irregular Voronoi tessellations only)
+    # Regular grids (hexagons/lattices) are uniform geometry; merging cells creates
+    # irregular multi-polygon aggregations and destroys regular grid properties.
+    if !is_regular_grid && (merge_small_polygons || (min_area > 0.0))
         _merge_undersized_polygons!(lg_polys, polys_coords, final_centroids, min_area)
     end
 
     # B. Strict exact units enforcement
     if exact_units && eff_target_units > 0
-        hull_for_adjust = !isnothing(geom_hull) ? geom_hull : expand_hull(s_x, s_y, 0.1)
-        _adjust_to_exact_units!(
-        lg_polys, polys_coords, final_centroids, eff_target_units, hull_for_adjust
-    )
+        if is_regular_grid
+            # For regular grids, rank cells by observation density and proximity
+            # to data center without merging or deforming hexagonal geometries.
+            if length(final_centroids) > eff_target_units
+                cand_mat = hcat([[c[1], c[2]] for c in final_centroids]...)
+                cand_tree = KDTree(cand_mat)
+                cand_assigns, _ = knn(cand_tree, pts_mat, 1)
+                pt_counts = zeros(Int, length(final_centroids))
+                for a in cand_assigns
+                    pt_counts[a[1]] += 1
+                end
+
+                mean_x = mean(s_x)
+                mean_y = mean(s_y)
+                dists_to_center = [
+                    (c[1] - mean_x)^2 + (c[2] - mean_y)^2 for c in final_centroids
+                ]
+                ranked_indices = sort(
+                    1:length(final_centroids),
+                    by = i -> (-pt_counts[i], dists_to_center[i])
+                )
+                keep_indices = sort(ranked_indices[1:eff_target_units])
+
+                lg_polys = lg_polys[keep_indices]
+                polys_coords = polys_coords[keep_indices]
+                final_centroids = final_centroids[keep_indices]
+            end
+        else
+            hull_for_adjust = !isnothing(geom_hull) ? geom_hull : expand_hull(s_x, s_y, 0.1)
+            _adjust_to_exact_units!(
+                lg_polys, polys_coords, final_centroids, eff_target_units, hull_for_adjust
+            )
+        end
     end
 
     # C. Point Assignments
@@ -2287,7 +2320,35 @@ end
 
 """
     lonlat_to_xy_km(lon, lat; center_lon=nothing, center_lat=nothing, crs=nothing, datum=WGS84Latest)
-    -> (x_km, y_km)
+    -> Tuple{Float64, Float64}
+
+Projects geographic coordinates (longitude, latitude in decimal degrees) into a planar
+Cartesian coordinate space in kilometers, optionally relative to a local tangent origin.
+
+# Mathematical Formulation
+When `crs` is supplied and `CoordRefSystems` is available, coordinates are converted
+via geodesic projection. Otherwise, a local equirectangular tangent plane approximation
+is computed:
+```math
+x = R \\cdot (\\lambda - \\lambda_0) \\cdot \\cos(\\phi_0) \\cdot \\frac{\\pi}{180^\\circ}
+```
+```math
+y = R \\cdot (\\phi - \\phi_0) \\cdot \\frac{\\pi}{180^\\circ}
+```
+where \$R = 6371.0\\text{ km}\$ is Earth's mean radius, \$(\\lambda_0, \\phi_0)\$ is the
+tangent projection origin (`center_lon`, `center_lat`), and \$(\\lambda, \\phi)\$ are
+the input longitude and latitude.
+
+# Arguments
+- `lon::Real`: Longitude in decimal degrees.
+- `lat::Real`: Latitude in decimal degrees.
+- `center_lon`: Tangent plane projection center longitude (default `nothing`).
+- `center_lat`: Tangent plane projection center latitude (default `nothing`).
+- `crs`: Optional target Coordinate Reference System from `CoordRefSystems`.
+- `datum`: Geographic datum (default `WGS84Latest`).
+
+# Returns
+- `Tuple{Float64, Float64}`: Planar coordinates `(x_km, y_km)` in kilometers.
 """
 function lonlat_to_xy_km(
     lon::Real, lat::Real;
@@ -2330,7 +2391,32 @@ end
 
 """
     xy_km_to_lonlat(x_km, y_km; center_lon=nothing, center_lat=nothing, crs=nothing, datum=WGS84Latest)
-    -> (lon, lat)
+    -> Tuple{Float64, Float64}
+
+Inverts planar Cartesian coordinates in kilometers back to geographic coordinates
+(longitude, latitude in decimal degrees).
+
+# Mathematical Formulation
+For the local equirectangular tangent plane fallback:
+```math
+\\lambda = \\lambda_0 + \\frac{x}{R \\cdot \\cos(\\phi_0) \\cdot (\\pi / 180^\\circ)}
+```
+```math
+\\phi = \\phi_0 + \\frac{y}{R \\cdot (\\pi / 180^\\circ)}
+```
+where \$R = 6371.0\\text{ km}\$ is Earth's mean radius and \$(\\lambda_0, \\phi_0)\$ is
+the tangent plane projection origin (`center_lon`, `center_lat`).
+
+# Arguments
+- `x::Real`: Planar x-coordinate in kilometers.
+- `y::Real`: Planar y-coordinate in kilometers.
+- `center_lon`: Tangent plane projection center longitude (default `nothing`).
+- `center_lat`: Tangent plane projection center latitude (default `nothing`).
+- `crs`: Optional target Coordinate Reference System from `CoordRefSystems`.
+- `datum`: Geographic datum (default `WGS84Latest`).
+
+# Returns
+- `Tuple{Float64, Float64}`: Geographic coordinates `(lon, lat)` in decimal degrees.
 """
 function xy_km_to_lonlat(
     x::Real, y::Real;
@@ -2610,8 +2696,10 @@ function build_hex_mesh_planar(
     area_km2 = (3.0 * sqrt(3.0) / 2.0) * r^2
 
     return (
+        centroids        = centroids_lonlat,
         centroids_km     = centroids_km,
         centroids_lonlat = centroids_lonlat,
+        polygons         = polygons_lonlat,
         polygons_km      = polygons_km,
         polygons_lonlat  = polygons_lonlat,
         n_units          = S,
@@ -2814,7 +2902,16 @@ function load_hsi_jld2(
 )::NamedTuple
     isfile(path) || error("HSI JLD2 not found: $(path)")
     bundle = JLD2.load(path)
-    hsi    = bundle[hsi_key]
+    actual_hsi_key = if haskey(bundle, hsi_key)
+        hsi_key
+    elseif haskey(bundle, "sims")
+        "sims"
+    elseif haskey(bundle, "predictions")
+        "predictions"
+    else
+        hsi_key
+    end
+    hsi    = bundle[actual_hsi_key]
     years  = bundle[years_key]
     auids  = haskey(bundle, auids_key) ? bundle[auids_key] : collect(1:size(hsi, 1))
 

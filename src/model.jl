@@ -23,37 +23,79 @@ otimes(m1::Component, m2::Component) = Composed([m1, m2], :kronecker_product)
 
  
 """
-    apply_transformation(func_name::Symbol, data_vector::AbstractVector)
+    apply_transformation(func_name::Symbol, data_vector::AbstractVector;
+                         offset::Union{Real, Nothing} = nothing, kwargs...)
 
-Applies a specified data transformation to a vector.
-
-# Version
-v1.0.0
+Applies a specified mathematical transformation to a data vector.
 
 # Mathematical Formulations
-- **`:zscore`**: \$ (x - \\text{mean}(x)) / \\text{std}(x) \$
-- **`:log`**: \$ \\log(x - \\min(x) + 1) \$
+- **`:zscore`**: \$ z = \\frac{x - \\text{mean}(x)}{\\text{std}(x)} \$
+- **`:log`**:
+  - For strictly positive data (\$\\min(x) > 0\$) without an explicit offset: computes \$ \\log(x) \$.
+  - For non-negative data containing zeros (\$\\min(x) = 0\$) without an explicit offset:
+    uses standard pseudocount \$ \\log(x + 1) = \\text{log1p}(x) \$.
+  - For user-specified `offset`: computes \$ \\log(x + \\text{offset}) \$.
+  - For data with negative values without an offset: raises an informative `ArgumentError`.
 - **`:center`**: \$ x - \\text{mean}(x) \$
-- **`:scale`**: \$ (x - \\min(x)) / (\\max(x) - \\min(x)) \$
+- **`:scale`**: \$ \\frac{x - \\min(x)}{\\max(x) - \\min(x)} \$
 
 # Arguments
-- `func_name::Symbol`: The name of the transformation (e.g., `:zscore`, `:log`).
+- `func_name::Symbol`: The transformation to apply (`:zscore`, `:log`, `:center`, `:scale`).
 - `data_vector::AbstractVector`: The input data column.
+- `offset::Union{Real, Nothing}`: Optional user-specified scalar offset for `:log`.
+- `kwargs...`: Additional keyword arguments forwarded to the transformation.
 
 # Returns
-- A new vector with the transformation applied.
+- `AbstractVector`: The transformed vector.
 """
-function apply_transformation(func_name::Symbol, data_vector::AbstractVector)
+function apply_transformation(
+    func_name::Symbol,
+    data_vector::AbstractVector;
+    offset::Union{Real, Nothing} = nothing,
+    kwargs...
+)
     if func_name == :zscore
         return standardize(ZScoreTransform, data_vector)
     elseif func_name == :log
-        # Add offset to handle non-positive values before log transform.
-        offset = 1.0 - minimum(data_vector)
-        return log.(data_vector .+ offset)
+        valid_vals = collect(skipmissing(data_vector))
+        if isempty(valid_vals)
+            return log.(data_vector)
+        end
+        min_val = minimum(valid_vals)
+        
+        effective_offset = if !isnothing(offset)
+            Float64(offset)
+        elseif min_val > 0.0
+            0.0
+        elseif min_val == 0.0
+            1.0
+        else
+            throw(ArgumentError(
+                "Cannot apply :log transformation to data containing negative values " *
+                "(minimum = $(min_val)). Please provide an explicit positive offset shift, " *
+                "e.g. `log(x, offset=$(ceil(abs(min_val) + 1.0)))`."
+            ))
+        end
+        
+        if min_val + effective_offset <= 0.0
+            throw(ArgumentError(
+                "Log transformation offset ($(effective_offset)) is insufficient for " *
+                "data minimum ($(min_val)). The shifted minimum must be strictly positive (> 0), " *
+                "but got $(min_val + effective_offset)."
+            ))
+        end
+        
+        if effective_offset == 0.0
+            return log.(data_vector)
+        elseif effective_offset == 1.0
+            return log1p.(data_vector)
+        else
+            return log.(data_vector .+ effective_offset)
+        end
     elseif func_name == :center
-        return data_vector .- mean(data_vector)
+        valid_vals = collect(skipmissing(data_vector))
+        return isempty(valid_vals) ? data_vector : data_vector .- mean(valid_vals)
     elseif func_name == :scale
-        # Scales data to the [0, 1] range.
         return standardize(UnitRangeTransform, data_vector)
     else
         @warn "Unknown transformation function ':$func_name'. Returning original data."
@@ -102,15 +144,61 @@ function _rewrite_transformations!(nodes::Vector, data::DataFrame)
                     error("Variable ':$var_sym' for transformation not found in data.")
                 end
                 
+                # Extract any optional keyword arguments passed to the transformation (e.g. offset)
+                transform_kwargs = Dict{Symbol, Any}()
+                for (k, v) in lhs.args
+                    if k != :positional_args
+                        transform_kwargs[k] = v
+                    end
+                end
+                
                 # Apply transformation and add new column to the DataFrame
                 original_data = data[!, var_sym]
-                transformed_data = apply_transformation(transform_func_name, original_data)
+                transformed_data = apply_transformation(transform_func_name, original_data;
+                                                        transform_kwargs...)
                 
+                # Validation of transformed_data (Items 4 & 7)
+                if !(transformed_data isa AbstractVector)
+                    throw(ArgumentError(
+                        "Transformation '$(transform_func_name)' on column ':$var_sym' " *
+                        "must return an AbstractVector, but returned $(typeof(transformed_data))."
+                    ))
+                end
+
+                if length(transformed_data) != nrow(data)
+                    throw(DimensionMismatch(
+                        "Transformation '$(transform_func_name)' on column ':$var_sym' returned " *
+                        "$(length(transformed_data)) elements, but expected $(nrow(data)) elements " *
+                        "to match DataFrame row count."
+                    ))
+                end
+
+                # Check for unexpected NaN / Inf introduced by transformation
+                orig_finite = all(x -> ismissing(x) || (x isa Real && isfinite(x)), original_data)
+                if orig_finite
+                    bad_nan = any(x -> !ismissing(x) && x isa Real && isnan(x), transformed_data)
+                    bad_inf = any(x -> !ismissing(x) && x isa Real && isinf(x), transformed_data)
+                    if bad_nan || bad_inf
+                        bad_type = bad_nan ? "NaN" : "Inf"
+                        throw(ArgumentError(
+                            "Transformation '$(transform_func_name)' on column ':$var_sym' produced " *
+                            "invalid $(bad_type) values from valid finite data. Please inspect the input " *
+                            "values or provide appropriate offset/parameters."
+                        ))
+                    end
+                end
+
                 new_col_name = Symbol("$(var_sym)_$(transform_func_name)")
-                counter = 1
-                while hasproperty(data, new_col_name)
-                    counter += 1
-                    new_col_name = Symbol("$(var_sym)_$(transform_func_name)_$(counter)")
+                if hasproperty(data, new_col_name)
+                    counter = 2
+                    unique_col_name = Symbol("$(var_sym)_$(transform_func_name)_$(counter)")
+                    while hasproperty(data, unique_col_name)
+                        counter += 1
+                        unique_col_name = Symbol("$(var_sym)_$(transform_func_name)_$(counter)")
+                    end
+                    @warn "Column ':$new_col_name' already exists in DataFrame. " *
+                          "Allocating unique column ':$unique_col_name' for transformed data."
+                    new_col_name = unique_col_name
                 end
                 data[!, new_col_name] = transformed_data
 
@@ -195,13 +283,35 @@ end
 
 
 """
+    _is_escaped(s::AbstractString, idx::Int)::Bool
+
+Returns `true` if the character at byte index `idx` in string `s` is escaped by an odd
+number of preceding backslashes. If preceded by an even number of backslashes (including 0),
+the backslashes are themselves escaped and this function returns `false`.
+
+# Arguments
+- `s::AbstractString`: The source string.
+- `idx::Int`: The byte index of the character to check.
+
+# Returns
+- `Bool`: `true` if escaped, `false` otherwise.
+"""
+function _is_escaped(s::AbstractString, idx::Int)::Bool
+    count = 0
+    p = prevind(s, idx)
+    while p >= 1 && s[p] == '\\'
+        count += 1
+        p = prevind(s, p)
+    end
+    return isodd(count)
+end
+
+"""
     split_terms_at_depth(input::AbstractString, sep::AbstractString)
 
 Splits a string by a given separator, but only when the separator is not nested
-inside parentheses `()` or brackets `[]`.
-
-# Version
-v1.0.0
+inside parentheses `()`, brackets `[]`, braces `{}`, or string literal quotes.
+Correctly handles consecutive escape sequences (e.g. `\\\\\\"`).
 
 # Arguments
 - `input::AbstractString`: The string to be split.
@@ -218,10 +328,12 @@ function split_terms_at_depth(input::AbstractString, sep::AbstractString)
     quote_char = '"'
     
     i = 1
-    while i <= ncodeunits(input)
+    n_units = ncodeunits(input)
+    while i <= n_units
         char = input[i]
         
-        if (char == '"' || char == '\'') && (i == 1 || input[prevind(input, i)] != '\\')
+        # Check for quote boundary, correctly respecting consecutive backslash escapes
+        if (char == '"' || char == '\'') && !_is_escaped(input, i)
             if in_quotes && char == quote_char
                 in_quotes = false
             elseif !in_quotes
@@ -230,35 +342,27 @@ function split_terms_at_depth(input::AbstractString, sep::AbstractString)
             end
         end
 
-        # Check for separator at current position, but only if not inside parentheses or quotes.
+        # Check for separator at current position, but only if not inside delimiters or quotes
         if depth == 0 && !in_quotes && startswith(SubString(input, i), sep)
-            # Finalize the current term and add it to the list.
             push!(terms, strip(String(take!(current_term))))
-            
-            # Advance index past the separator.
             i = nextind(input, i, length(sep))
             continue
         end
         
-        # Append character to current term and update depth.
+        # Append character to current term and update depth
         if !in_quotes
-            if char == '(' || char == '['
+            if char == '(' || char == '[' || char == '{'
                 depth += 1
-            elseif char == ')' || char == ']'
+            elseif char == ')' || char == ']' || char == '}'
                 depth = max(0, depth - 1)
             end
         end
         
         write(current_term, char)
-        
-        # Move to the next character's starting byte index.
         i = nextind(input, i)
     end
     
-    # Add the final term after the last separator.
     push!(terms, strip(String(take!(current_term))))
-    
-    # Filter out any empty strings that might result from leading/trailing separators.
     return filter!(!isempty, terms)
 end
 
@@ -491,6 +595,75 @@ function _parse_arguments_string(args_str::String)
 end
 
 
+const CONFIG_RESERVED_SYMBOLS = Set([
+    :model, :method, :structure, :family, :relationship, :habitat_relationship,
+    :type, :operator, :penalty, :time_method, :link, :positional_args
+])
+
+"""
+    _resolve_param_references!(params::Dict{Symbol,Any}, data::Union{DataFrame,Nothing}, calling_mod::Module=Main)
+
+Resolve parameter references for a component's `args` dictionary:
+- Skips configuration keywords (:model, :method, :structure, etc.) to preserve them as Symbols.
+- If a value is a Symbol and matches a column name in `data`, resolves to that column (except for
+  `:habitat` where a Symbol is preserved so component aggregation can be performed).
+- Else if a value is a Symbol, resolves by evaluating in `calling_mod`.
+- If a value is an Expr, evaluates it in `calling_mod` (e.g., prior distributions).
+- Recurses into vectors/tuples/dicts to resolve nested references.
+
+This mutates `params` in place.
+"""
+function _resolve_param_references!(
+    params::AbstractDict{Symbol, <:Any},
+    data::Union{DataFrame, Nothing} = nothing,
+    calling_mod::Module = Main
+)
+    for k in collect(keys(params))
+        if k in CONFIG_RESERVED_SYMBOLS
+            continue
+        end
+        v = params[k]
+        # Helper to resolve a single value
+        resolve_one = function(x)
+            if x isa Symbol
+                if k == :habitat && data !== nothing && hasproperty(data, x)
+                    return x
+                elseif data !== nothing && hasproperty(data, x)
+                    return data[!, x]
+                else
+                    try
+                        return Core.eval(calling_mod, x)
+                    catch
+                        return x   # leave as symbol if not found
+                    end
+                end
+            elseif x isa Expr
+                try
+                    return Core.eval(calling_mod, x)
+                catch
+                    return x
+                end
+            elseif x isa AbstractVector
+                return [resolve_one(el) for el in x]
+            elseif x isa Tuple
+                return tuple((resolve_one(e) for e in x)...)
+            elseif x isa AbstractDict
+                newd = Dict{Any, Any}()
+                for (kk, vv) in x
+                    newd[kk] = resolve_one(vv)
+                end
+                return newd
+            else
+                return x
+            end
+        end
+
+        params[k] = resolve_one(v)
+    end
+    return nothing
+end
+
+
 """
     _sanitize_variablename(name::String)
 
@@ -677,51 +850,57 @@ end
 
 
 """
-    _is_outermost_grouping_parentheses(s::AbstractString)
+    _is_outermost_grouping_parentheses(s::AbstractString)::Bool
 
-Checks if a string is fully and exclusively enclosed by a single pair of
-grouping parentheses.
-
-# Version
-v1.0.0
+Checks if a string is fully and exclusively enclosed by a single matching pair of outer
+grouping parentheses `(...)`, correctly accounting for nested parentheses, quotes, and
+escaped characters.
 
 # Arguments
 - `s::AbstractString`: The string to check.
 
 # Returns
-- `Bool`: `true` if the string is fully enclosed by grouping parentheses, `false` otherwise.
+- `Bool`: `true` if the string is fully enclosed by outer grouping parentheses, `false` otherwise.
 """
-function _is_outermost_grouping_parentheses(s::AbstractString)
-    if !startswith(s, "(") || !endswith(s, ")")
+function _is_outermost_grouping_parentheses(s::AbstractString)::Bool
+    s_str = Base.strip(s)
+    if !startswith(s_str, "(") || !endswith(s_str, ")")
         return false
     end
     
-    # Start depth at 1 to account for the initial opening parenthesis.
-    depth = 1
+    depth = 0
+    in_quotes = false
+    quote_char = '"'
+    n_units = ncodeunits(s_str)
     
-    # Iterate over the content *inside* the first and last parentheses.
-    inner_s = SubString(s, nextind(s, 1), prevind(s, lastindex(s)))
-    
-    for (idx, char) in enumerate(inner_s)
-        if char == '('
-            depth += 1
-        elseif char == ')'
-            depth -= 1
-        end
+    i = 1
+    while i <= n_units
+        c = s_str[i]
         
-        # If depth becomes zero before the end of the inner string,
-        # it means a closing parenthesis matches the initial opening one
-        # prematurely. e.g., for "(a) + (b)", depth becomes 0 after ')'.
-        # This indicates the outer parentheses are not the sole grouping operator.
-        if depth == 0 && idx < length(inner_s)
-            return false
+        # Check string literal quote boundaries respecting backslash escaping
+        if (c == '"' || c == '\'') && !_is_escaped(s_str, i)
+            if in_quotes && c == quote_char
+                in_quotes = false
+            elseif !in_quotes
+                in_quotes = true
+                quote_char = c
+            end
+        elseif !in_quotes
+            if c == '('
+                depth += 1
+            elseif c == ')'
+                depth -= 1
+                # If depth becomes 0 before the end of the string, parentheses closed prematurely
+                # e.g., "(a) + (b)" closes at index 3 while total length is 9.
+                if depth == 0 && i < n_units
+                    return false
+                end
+            end
         end
+        i = nextind(s_str, i)
     end
     
-    # After iterating through the whole inner string, the depth must be exactly 1
-    # to match the final closing parenthesis that was not part of the iteration.
-    # A final depth of 0 would mean an imbalance like `(a))`.
-    return depth == 1
+    return depth == 0
 end
 
 
@@ -729,61 +908,49 @@ end
     _parse_rhs_expression(term_str::AbstractString)
 
 Recursively parses a term from the right-hand side (RHS) of a formula into an
-Abstract Syntax Tree (AST) node, respecting operator precedence and grouping.
+Abstract Syntax Tree (AST) node, strictly respecting operator precedence and associativity.
 
-# Version
-v1.0.0
+# Operator Precedence Hierarchy (from lowest binding to highest binding)
+1. Addition `+` (lowest precedence, additive model components):
+   `a + b` combines additive terms of the linear predictor \$\\eta\$.
+2. Pipe `|>` (low precedence, left-associative):
+   `a |> b |> c` parses as `((a |> b) |> c)`. Passes upstream output to downstream component.
+3. Composition `∘` (middle precedence, right-associative):
+   `a ∘ b ∘ c` parses as `(a ∘ (b ∘ c))`. Functional composition of stochastic processes.
+4. Kronecker Product `⊗` (highest binary precedence, associative):
+   `a ⊗ b` evaluates tensor product / spatiotemporal interaction before composition or pipe.
+5. Grouping `(...)` / invocations (highest precedence):
+   Parentheses explicitly override precedence, e.g. `(a + b) |> c`.
 
-# Arguments
-- `term_str::AbstractString`: A string representing a single term or a composition of terms
-  from the formula's RHS.
-
-# Returns
-- A `NamedTuple` representing a node in the AST.
+# Precedence Examples
+- `a ⊗ b |> c` parses as `(a ⊗ b) |> c`
+- `a |> b ⊗ c` parses as `a |> (b ⊗ c)`
+- `a ∘ b ⊗ c` parses as `a ∘ (b ⊗ c)`
+- `a ⊗ b ∘ c` parses as `(a ⊗ b) ∘ c`
+- `(a + b) |> c` parses as `pipe(add(a, b), c)`
+- `intercept + fixed(x) |> random(s)` parses as `intercept + (fixed(x) |> random(s))`
 """
 function _parse_rhs_expression(term_str::AbstractString)
     term_str_stripped = Base.strip(term_str)
 
-    # Helper to check if the string is fully enclosed by a single pair of parentheses.
-    function _is_fully_enclosed(s::AbstractString)
-        if !startswith(s, "(") || !endswith(s, ")")
-            return false
-        end
-        depth = 0
-        total_len = length(s)
-        for (i, char) in enumerate(s)
-            if char == '('
-                depth += 1
-            elseif char == ')'
-                depth -= 1
-                if depth == 0 && i < total_len
-                    return false
-                end
-            end
-        end
-        return depth == 0
-    end
-
     # If the expression is wrapped in grouping parentheses, parse the inner content recursively.
-    if _is_fully_enclosed(term_str_stripped)
+    if _is_outermost_grouping_parentheses(term_str_stripped)
         inner_content = strip(term_str_stripped[nextind(term_str_stripped,
             1):prevind(term_str_stripped, lastindex(term_str_stripped))])
         return _parse_rhs_expression(inner_content)
     end
 
     # Proceed with parsing based on operator precedence (lowest precedence first).
-    parts = split_terms_at_depth(term_str_stripped, " ∘ ")
-    if length(parts) > 1
-        # Composition is right-associative: a ∘ b ∘ c -> a ∘ (b ∘ c)
-        return (type=:operator, op=:composition, children=[_parse_rhs_expression(parts[1]),
-            _parse_rhs_expression(join(parts[2:end], " ∘ "))])
-    end
-
-    parts = split_terms_at_depth(term_str_stripped, " ⊗ ")
-    if length(parts) > 1
-        # Kronecker product is left-associative.
-        return (type=:operator, op=:kronecker_product,
-            children=[_parse_rhs_expression(p) for p in parts])
+    # Precedence order (from lowest to highest binding):
+    # 0. Addition `+` (lowest precedence, additive model components): a + b -> add(a, b)
+    # 1. Pipe `|>` (low precedence, left-associative): a ⊗ b |> c -> (a ⊗ b) |> c
+    # 2. Composition `∘` (middle precedence, right-associative): a ∘ b ⊗ c -> a ∘ (b ⊗ c)
+    # 3. Kronecker product `⊗` (highest binary precedence, associative): a ⊗ b
+    parts_plus = [Base.strip(p) for p in split_terms_at_depth(term_str_stripped, "+")
+                  if !isempty(Base.strip(p))]
+    if length(parts_plus) > 1
+        return (type=:operator, op=:add,
+            children=[_parse_rhs_expression(p) for p in parts_plus])
     end
 
     parts = split_terms_at_depth(term_str_stripped, " |> ")
@@ -793,12 +960,36 @@ function _parse_rhs_expression(term_str::AbstractString)
             " |> ")), _parse_rhs_expression(parts[end])])
     end
 
+    parts = split_terms_at_depth(term_str_stripped, " ∘ ")
+    if length(parts) > 1
+        # Composition is right-associative: a ∘ b ∘ c -> a ∘ (b ∘ c)
+        return (type=:operator, op=:composition, children=[_parse_rhs_expression(parts[1]),
+            _parse_rhs_expression(join(parts[2:end], " ∘ "))])
+    end
+
+    parts = split_terms_at_depth(term_str_stripped, " ⊗ ")
+    if length(parts) > 1
+        child_nodes = [_parse_rhs_expression(p) for p in parts]
+        for (idx, ch) in enumerate(child_nodes)
+            m_type = hasproperty(ch, :module_type) ? ch.module_type : :unknown
+            if m_type in (:fixed, :intercept)
+                throw(ArgumentError(
+                    "Invalid Kronecker product (⊗) composition: component #$(idx) " *
+                    "('$(parts[idx])') is a $(m_type) term. Kronecker interactions require " *
+                    "multidimensional structured random process components (e.g. spatial ⊗ temporal), " *
+                    "not scalar fixed effects or intercepts."
+                ))
+            end
+        end
+        return (type=:operator, op=:kronecker_product, children=child_nodes)
+    end
+
     # If no operators are found, parse as a single module or a fixed effect.
     if occursin(r"\(.*\)", term_str_stripped)
         return _parse_single_component_term(term_str_stripped)
     else
         # Treat bare terms as fixed effects.
-        return (module_type = :fixed, args = Dict(:positional_args => [term_str_stripped]))
+        return (module_type = :fixed, args = Dict{Symbol, Any}(:positional_args => Any[term_str_stripped]))
     end
 end
 
@@ -832,7 +1023,7 @@ end
 
 
 """
-    _categorize_rhs_nodes!(nodes, modules, fixed_effects)
+    _categorize_rhs_nodes!(nodes, modules, fixed_effects; data=nothing, calling_mod::Module=Main)
 
 Recursively traverses the Abstract Syntax Tree (AST) of the right-hand side (RHS)
 of a formula, categorizing its nodes into `bstm` modules (components) or bare
@@ -849,7 +1040,7 @@ v1.0.0
 # Returns
 - `nothing`. The `modules` and `fixed_effects` collections are mutated.
 """
-function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
+function _categorize_rhs_nodes!(nodes, modules, fixed_effects; data=nothing, calling_mod::Module=Main)
     for node in nodes
         is_pp_composition = false
         if hasproperty(node, :type) && node.type == :operator && node.op == :composition&&
@@ -867,16 +1058,25 @@ function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
                 end
                 
                 vars = get(inner_node.args, :positional_args, [])
+                
+                _resolve_param_references!(final_params, data, calling_mod) 
+
                 new_module_data = (module_type = pp_module_type, args = final_params)
                 
                 key_parts = [string(pp_module_type), join(string.(vars), "_")]
                 raw_key = join(filter(!isempty, key_parts), "_")
                 module_key = _generate_unique_module_key(raw_key, modules)
+                
                 modules[module_key] = new_module_data
             end
         end
 
         if is_pp_composition
+            continue
+        end
+
+        if hasproperty(node, :type) && node.type == :operator && node.op == :add
+            _categorize_rhs_nodes!(node.children, modules, fixed_effects; data=data, calling_mod=calling_mod)
             continue
         end
 
@@ -897,9 +1097,16 @@ function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
             end
             raw_key = _get_simplified_composed_node_key(node)
             module_key = _generate_unique_module_key(raw_key, modules)
+            for child in node.children 
+                if hasproperty(child, :args) && child.args isa AbstractDict 
+                    _resolve_param_references!(child.args, data, calling_mod) 
+                end 
+            end 
             
-            modules[module_key] = (module_type = :interact, args = Dict(:operator => node.op,
-                :components => node.children))
+            interact_args = Dict{Symbol, Any}(:operator => node.op, :components => node.children) 
+            _resolve_param_references!(interact_args, data, calling_mod) 
+
+            modules[module_key] = (module_type = :interact, args = interact_args)
 
         elseif hasproperty(node, :module_type)
             m_type = node.module_type
@@ -925,6 +1132,7 @@ function _categorize_rhs_nodes!(nodes, modules, fixed_effects)
                 end
 
                 module_key = _generate_unique_module_key(raw_key, modules)
+                _resolve_param_references!(node.args, data, calling_mod)
                 modules[module_key] = node
             else
                 push!(fixed_effects, string(m_type))
@@ -994,6 +1202,14 @@ function _parse_lhs_term(term::String)
         params_str = join(args[2:end], ",")
         params = _parse_arguments_string(params_str)
         
+        # Validate mutual exclusivity of zero-inflation and hurdle specifications
+        is_zi = get(params, :zero_inflated, false) in (true, :true, "true") ||
+                haskey(params, :phi_zi)
+        is_hurdle = haskey(params, :hurdle) || haskey(params, :phi_hurdle)
+        if is_zi && is_hurdle
+            throw(ArgumentError("zero_inflated and hurdle specifications are mutually exclusive."))
+        end
+
         # Handle multiple outcomes specified with `+` inside the likelihood block.
         for ov in [Base.strip(s) for s in Base.split(outcome_var_str, '+')]
             push!(specs, Dict(:var => ov, :params => params))
@@ -1010,23 +1226,34 @@ end
 
 
 """
-    decompose_bstm_formula(formula_str::String, data::DataFrame)
+    decompose_bstm_formula(formula_str::String, data::DataFrame;
+                           calling_mod::Module = Main, copy_data::Bool = true)
 
 Decomposes a `bstm` formula string into its constituent parts, including outcomes,
-likelihood specifications, model components, and fixed effects.
+likelihood specifications, model components, and fixed effects. Applies transformations
+safely without mutating caller input data when `copy_data = true`.
 
 # Version
-v1.0.0
+v1.1.0
 
 # Arguments
-- `formula_str::String`: The model formula string.
-- `data::DataFrame`: The input DataFrame, which may be mutated by transformation functions.
+- `formula_str::String`: The model formula string (e.g., `"y ~ intercept() + fixed(x)"`).
+- `data::DataFrame`: The input DataFrame. If `copy_data = true` (default), transformations
+  are applied to an isolated working copy to preserve caller data integrity.
+- `calling_mod::Module`: Calling module scope for evaluating symbols/expressions.
+- `copy_data::Bool`: If `true` (default), copies `data` before transformation.
 
 # Returns
-- A `NamedTuple` with the fields `:outcomes`, `:modules`, `:fixed_effects`,
-  `:has_intercept`, and `:intercept_prior`.
+- A `NamedTuple` with fields `:outcomes`, `:modules`, `:fixed_effects`,
+  `:has_intercept`, `:intercept_prior`, and `:data` (containing the working DataFrame
+  with any generated transformation columns).
 """
-function decompose_bstm_formula(formula_str::String, data::DataFrame)
+function decompose_bstm_formula(
+    formula_str::String,
+    data::DataFrame;
+    calling_mod::Module = Main,
+    copy_data::Bool = true
+)
     parts = split_terms_at_depth(formula_str, "~")
     lhs_str = Base.strip(parts[1])
     
@@ -1051,7 +1278,7 @@ function decompose_bstm_formula(formula_str::String, data::DataFrame)
         term_stripped = Base.strip(term)
         if term_stripped == "0" || term_stripped == "-1" || term_stripped == "1"
             continue
-        elseif startswith(term_stripped, "intercept(")
+        elseif startswith(term_stripped, "intercept(") && !occursin(r"[⊗∘|>]", term_stripped)
             if !intercept_module_found
                 intercept_module_found = true
                 intercept_data = _parse_single_component_term(term_stripped)
@@ -1067,14 +1294,24 @@ function decompose_bstm_formula(formula_str::String, data::DataFrame)
 
     top_level_nodes = [_parse_rhs_expression(term) for term in module_terms]
     
-    rewritten_nodes = _rewrite_transformations!(top_level_nodes, data)
+    working_data = copy_data ? copy(data) : data
+    rewritten_nodes = _rewrite_transformations!(top_level_nodes, working_data)
 
     modules = Dict{String, Any}()
     fixed_effects = String[]
-    _categorize_rhs_nodes!(rewritten_nodes, modules, fixed_effects)
-    
-    return (outcomes=outcome_specs, modules=modules, fixed_effects=unique(fixed_effects),
-        has_intercept=has_intercept, intercept_prior=intercept_prior)
+    _categorize_rhs_nodes!(
+        rewritten_nodes, modules, fixed_effects;
+        data = working_data, calling_mod = calling_mod
+    )
+
+    return (
+        outcomes = outcome_specs,
+        modules = modules,
+        fixed_effects = unique(fixed_effects),
+        has_intercept = has_intercept,
+        intercept_prior = intercept_prior,
+        data = working_data
+    )
 end
 
  
@@ -1098,19 +1335,17 @@ function _precompute_likelihood_params!(M::Dict)
     K = M[:outcomes_N]
 
     param_specs = [
-        (key=:censor_lower, default=-Inf, is_scalar_per_outcome=true),
-        (key=:censor_upper, default=Inf, is_scalar_per_outcome=true),
-        (key=:hurdle, default=-Inf, is_scalar_per_outcome=true),
-        (key=:trials, default=1, is_scalar_per_outcome=false),
-        (key=:weights, default=1.0, is_scalar_per_outcome=false),
-        (key=:log_offsets, default=0.0, is_scalar_per_outcome=false)
+        (key=:censor_lower, default=-Inf),
+        (key=:censor_upper, default=Inf),
+        (key=:hurdle, default=-Inf),
+        (key=:trials, default=1),
+        (key=:weights, default=1.0),
+        (key=:log_offsets, default=0.0)
     ]
 
     for spec in param_specs
         key = spec.key
         default_val = spec.default
-        is_scalar_per_outcome = spec.is_scalar_per_outcome
-
         final_matrix = Matrix{typeof(default_val)}(undef, N, K)
 
         if !haskey(M, key)
@@ -1118,25 +1353,25 @@ function _precompute_likelihood_params!(M::Dict)
         else
             val = M[key]
             if val isa Real
-                # Handle scalar input for both parameter types.
+                # Uniform scalar across all observations and outcomes
                 fill!(final_matrix, val)
-            elseif is_scalar_per_outcome
-                # Parameter is defined per outcome, broadcast across observations.
-                if val isa AbstractVector && length(val) == K
-                    final_matrix = repeat(val', N, 1)
-                else
-                    @warn "Scalar-per-outcome parameter `:$key` has unexpected type or dimensions. Expected a scalar or a vector of length $K. Using default."
-                    fill!(final_matrix, default_val)
-                end
-            else # Parameter is defined per observation.
-                if val isa AbstractVector && length(val) == N
-                    final_matrix = repeat(val, 1, K)
-                elseif val isa AbstractMatrix && size(val) == (N, K)
-                    final_matrix = val
-                else
-                    @warn "Per-observation parameter `:$key` has incorrect dimensions. Expected a scalar, vector of length $N, or matrix of size ($N, $K). Using default."
-                    fill!(final_matrix, default_val)
-                end
+            elseif val isa AbstractMatrix && size(val) == (N, K)
+                # Exact observation-by-outcome matrix
+                final_matrix = Matrix{typeof(default_val)}(val)
+            elseif (val isa AbstractVector && length(val) == N) ||
+                   (val isa AbstractMatrix && size(val) == (N, 1))
+                # Per-observation vector or (N, 1) column broadcast across outcomes
+                vec_val = Vector{typeof(default_val)}(vec(val))
+                final_matrix = repeat(reshape(vec_val, N, 1), 1, K)
+            elseif (val isa Tuple || val isa AbstractVector) && length(val) == K
+                # Per-outcome vector broadcast across observations
+                final_matrix = repeat(Matrix{typeof(default_val)}(collect(val)'), N, 1)
+            else
+                throw(DimensionMismatch(
+                    "Likelihood parameter `:$key` has invalid dimensions $(size(val)). " *
+                    "Expected scalar, vector of length $N (observations), " *
+                    "vector of length $K (outcomes), or matrix of size ($N, $K)."
+                ))
             end
         end
         M[key] = final_matrix
@@ -1155,19 +1390,199 @@ Constructs the complete model configuration from a formula and data.
 bstm_config(formula::Union{Expr, Symbol}, data::DataFrame; calling_module::Module=Main,
     kwargs...) = bstm_config(string(formula), data; calling_module=calling_module, kwargs...)
 
+"""
+    bstm_config(pairs::Pair{Symbol, <:Union{NamedTuple, AbstractDict}}...; kwargs...)
+
+Constructs a multi-fidelity model configuration from a system of paired equations.
+
+# Mathematical Formulation
+Couples sub-model linear predictors into the primary linear predictor:
+``\\eta_{\\text{primary}} = \\eta_{\\text{base}} + \\sum_k \\rho_k \\cdot \\eta_{\\text{sub}, k}[\\text{mapping}_k]``
+where ``\\rho_k \\sim \\text{coupling\\_prior}`` (or ``\\rho_k \\equiv 1.0`` when `fixed = true`).
+
+# Arguments
+- `pairs`: One or more pairs `key => (formula = ..., data = ..., ...)`.
+  The primary tier is identified by `:primary`, `:main`, `:target`, or default `pairs[1]`.
+  Secondary pairs configure sub-models (e.g. `:proxy => (formula=..., data=..., mapping=..., prior=...)`).
+- `kwargs`: Global model options passed to all component models.
+
+# Returns
+- A comprehensive `NamedTuple` model configuration.
+"""
+function bstm_config(
+    equation_pairs::Pair{Symbol, <:Union{NamedTuple, AbstractDict}}...;
+    calling_module::Module = Main,
+    kwargs...
+)
+    if isempty(equation_pairs)
+        throw(ArgumentError("bstm_config requires at least one model specification pair."))
+    end
+
+    pair_dict = Dict{Symbol, Any}(p.first => p.second for p in equation_pairs)
+    primary_key = if haskey(pair_dict, :primary)
+        :primary
+    elseif haskey(pair_dict, :main)
+        :main
+    elseif haskey(pair_dict, :target)
+        :target
+    else
+        equation_pairs[1].first
+    end
+
+    primary_spec = pair_dict[primary_key]
+    sub_keys = [p.first for p in equation_pairs if p.first != primary_key]
+
+    primary_data = get(primary_spec, :data, nothing)
+    if isnothing(primary_data)
+        throw(ArgumentError(
+            "Primary specification ':$primary_key' must include a `data` DataFrame."
+        ))
+    end
+    primary_N = size(primary_data, 1)
+
+    nested_comps = Dict{Symbol, Any}()
+    for sk in sub_keys
+        s_spec = pair_dict[sk]
+        s_formula_raw = get(s_spec, :formula, nothing)
+        s_data = get(s_spec, :data, nothing)
+        if isnothing(s_formula_raw) || isnothing(s_data)
+            throw(ArgumentError(
+                "Sub-model specification ':$sk' must include both `formula` and `data`."
+            ))
+        end
+
+        s_formula_str = s_formula_raw isa String ? s_formula_raw : string(s_formula_raw)
+        
+        sub_kwargs = Dict{Symbol, Any}(kwargs)
+        for (k, v) in pairs(s_spec)
+            if k ∉ (:formula, :data, :mapping, :prior, :fixed)
+                sub_kwargs[k] = v
+            end
+        end
+        sub_kwargs[:calling_module] = calling_module
+
+        sub_cfg = bstm_config(s_formula_str, s_data; sub_kwargs...)
+
+        mapping_arg = get(s_spec, :mapping, nothing)
+        mapping_indices = nothing
+        sub_N = size(s_data, 1)
+        if !isnothing(mapping_arg)
+            if mapping_arg isa Symbol || mapping_arg isa AbstractString
+                col_sym = Symbol(mapping_arg)
+                if !hasproperty(primary_data, col_sym)
+                    throw(ArgumentError(
+                        "Nested mapping column ':$col_sym' not found in primary model data."
+                    ))
+                end
+                mapping_indices = Vector{Int}(primary_data[!, col_sym])
+            elseif mapping_arg isa AbstractVector{<:Integer}
+                mapping_indices = Vector{Int}(mapping_arg)
+            else
+                throw(ArgumentError(
+                    "Unsupported type for 'mapping' in sub-model ':$sk': $(typeof(mapping_arg))."
+                ))
+            end
+            if length(mapping_indices) != primary_N
+                throw(DimensionMismatch(
+                    "Nested mapping length ($(length(mapping_indices))) does not match primary " *
+                    "observation count ($primary_N)."
+                ))
+            end
+            if any(idx -> idx < 1 || idx > sub_N, mapping_indices)
+                throw(BoundsError(
+                    "Nested mapping indices out of bounds (valid range: 1..$sub_N)."
+                ))
+            end
+        elseif primary_N != sub_N
+            throw(ArgumentError(
+                "Observation count mismatch in sub-model ':$sk': primary model has $primary_N " *
+                "observations, but sub-model data has $sub_N observations. Specify explicit mapping."
+            ))
+        end
+
+        if !isnothing(mapping_indices)
+            sub_cfg = merge(sub_cfg, (mapping = mapping_indices,))
+        end
+
+        coupling_prior = get(s_spec, :prior, Normal(1.0, 0.5))
+        fixed_coupling = get(s_spec, :fixed, false)
+        sub_cfg = merge(sub_cfg, (
+            coupling_prior = coupling_prior,
+            fixed_coupling = fixed_coupling
+        ))
+
+        nested_comps[sk] = sub_cfg
+    end
+
+    primary_formula_raw = get(primary_spec, :formula, nothing)
+    if isnothing(primary_formula_raw)
+        throw(ArgumentError(
+            "Primary specification ':$primary_key' must include a `formula`."
+        ))
+    end
+    primary_formula_str = primary_formula_raw isa String ?
+        primary_formula_raw : string(primary_formula_raw)
+
+    primary_kwargs = Dict{Symbol, Any}(kwargs)
+    for (k, v) in pairs(primary_spec)
+        if k ∉ (:formula, :data)
+            primary_kwargs[k] = v
+        end
+    end
+    primary_kwargs[:calling_module] = calling_module
+    primary_kwargs[:nested_components] = nested_comps
+
+    return bstm_config(primary_formula_str, primary_data; primary_kwargs...)
+end
+
 function bstm_config(
     formula::String, data::DataFrame; calling_module::Module=Main, kwargs...
 )
-    df_processed = deepcopy(data)
-    decomposed_formula = decompose_bstm_formula(formula, df_processed)
+    decomposed_formula = decompose_bstm_formula(
+        formula, data; calling_mod = calling_module, copy_data = true
+    )
+    df_processed = decomposed_formula.data
 
     M = _initialize_config(
         df_processed,
         merge(Dict(kwargs), Dict(:calling_module => calling_module))
     )
     M[:formula] = formula
+
+    # Support submodels keyword argument dictionary if provided
+    if haskey(M, :submodels)
+        if !haskey(M, :nested_components)
+            M[:nested_components] = Dict{Symbol, Any}()
+        end
+        for (sk, s_spec) in pairs(M[:submodels])
+            s_sym = Symbol(sk)
+            if !haskey(M[:nested_components], s_sym)
+                s_formula_raw = get(s_spec, :formula, "")
+                s_data = get(s_spec, :data, nothing)
+                if !isnothing(s_data) && !isempty(string(s_formula_raw))
+                    s_kwargs = Dict{Symbol, Any}(kwargs)
+                    for (k, v) in pairs(s_spec)
+                        if k ∉ (:formula, :data, :mapping, :prior, :fixed)
+                            s_kwargs[k] = v
+                        end
+                    end
+                    s_kwargs[:calling_module] = calling_module
+                    s_cfg = bstm_config(string(s_formula_raw), s_data; s_kwargs...)
+                    c_prior = get(s_spec, :prior, Normal(1.0, 0.5))
+                    f_coupling = get(s_spec, :fixed, false)
+                    s_cfg = merge(s_cfg, (
+                        coupling_prior = c_prior, fixed_coupling = f_coupling
+                    ))
+                    if haskey(s_spec, :mapping) && !isnothing(s_spec.mapping)
+                        s_cfg = merge(s_cfg, (mapping = s_spec.mapping,))
+                    end
+                    M[:nested_components][s_sym] = s_cfg
+                end
+            end
+        end
+    end
     
-    _process_lhs!(M, decomposed_formula.outcomes)
+    _process_lhs!(M, decomposed_formula.outcomes, decomposed_formula.modules)
     
     is_multivariate = get(M, :model_arch, "univariate") == "multivariate"
     if is_multivariate
@@ -1277,12 +1692,8 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
     full_key = isempty(prefix) ? base_key : "$(prefix)_$(base_key)"
 
     is_multivariate = arch == "multivariate"
-    is_shared = get(spec.params, :shared, false)
+    shared_spec = get(spec.params, :shared, false)
 
-    # Suffix for hyperparameters, which can be shared across outcomes.
-    # It is only added if the model is multivariate AND the component is not shared.
-    hyperparam_suffix = (is_multivariate && !is_shared) ? "_$(outcome_idx)" : ""
-    
     # Suffix for latent fields, which are always per-outcome in a multivariate model.
     latent_field_suffix = is_multivariate ? "_$(outcome_idx)" : ""
 
@@ -1300,7 +1711,9 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
         :nu, :sigma0, :shape, :beta_het, :beta_habitat_diffusion
     ]
     for p in hyperparameters
-        names[p] = Symbol("$(p)_$(full_key)$(hyperparam_suffix)")
+        p_is_shared = is_param_shared(shared_spec, p)
+        p_suffix = (is_multivariate && !p_is_shared) ? "_$(outcome_idx)" : ""
+        names[p] = Symbol("$(p)_$(full_key)$(p_suffix)")
     end
 
     # --- Latent Fields & Innovations / Random Errors (ure / sre) ---
@@ -1487,7 +1900,13 @@ function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main
             
             # 1. Define the linking parameter rho
             rho_name = "rho_nested_$(key)"
-            push!(priors_acc, "$(rho_name) ~ Normal(1.0, 0.5)")
+            if get(sub_M, :fixed_coupling, false)
+                push!(sub_updates_acc, "$(rho_name) = 1.0")
+            else
+                c_prior = get(sub_M, :coupling_prior, Normal(1.0, 0.5))
+                dist_str = _distribution_to_string(c_prior)
+                push!(priors_acc, "$(rho_name) ~ DynamicPPL.NamedDist($(dist_str), :$(rho_name))")
+            end
 
             # --- Start generating code for the sub-model ---
             sub_priors_acc = String[]
@@ -1505,12 +1924,17 @@ function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main
                 push!(sub_priors_acc, "$(intercept_var_name) ~ DynamicPPL.NamedDist($(dist_str), :$(intercept_var_name))")
             end
             
-            # Fixed Effects
+            # Fixed Effects (priors & updates)
             if get(sub_M, :Xfixed_N, 0) > 0
-                beta_name = is_sub_multivariate ? "beta_flat_$(prefix)" : "beta_$(prefix)"
-                n_params = is_sub_multivariate ? sub_M.Xfixed_N * sub_M.outcomes_N : sub_M.Xfixed_N
-                prior_str = _distribution_to_string(sub_M.Xfixed_priors_vec[1])
-                push!(sub_priors_acc, "$(beta_name) ~ DynamicPPL.NamedDist(filldist($(prior_str), $(n_params)), :$(beta_name))")
+                fe_priors, fe_updates = _generate_fixed_effects_block(
+                    sub_M, is_sub_multivariate, sub_eta_name; prefix = prefix
+                )
+                if !isempty(strip(fe_priors))
+                    push!(sub_priors_acc, fe_priors)
+                end
+                if !isempty(strip(fe_updates))
+                    push!(sub_updates_acc, fe_updates)
+                end
             end
 
             # Components
@@ -1524,6 +1948,14 @@ function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main
                 end
             end
             
+            # Sub-model Likelihood Priors
+            sub_lik_priors = _generate_likelihood_section(
+                sub_M, is_sub_multivariate; prefix = prefix
+            )
+            if !isempty(strip(sub_lik_priors))
+                push!(sub_priors_acc, sub_lik_priors)
+            end
+
             # --- Assemble sub-model updates ---
             sub_eta_init = if get(sub_M, :add_intercept, false)
                 is_sub_multivariate ? "intercept_$(prefix)' .+ fill!(Array{T}(undef, $(sub_M.y_N), $(sub_M.outcomes_N)), 0)" : "intercept_$(prefix) .+ fill!(Array{T}(undef, $(sub_M.y_N)), 0)"
@@ -1537,23 +1969,44 @@ function _generate_nested_model_block(M::NamedTuple, is_multivariate::Bool, main
                     sub_outcome_idx = is_sub_multivariate ? k : nothing
                     updates_str = get_updates(sub_spec.component_obj, prefixed_sub_spec,
                         sub_arch, sub_outcome_idx, sub_M)
-                    updates_str_final = replace(updates_str, r"eta_latent|eta" => sub_eta_name, "spec_registry[:$(prefixed_sub_spec.key)]" => "sub_M_$(key).components[$(i)]", "M." => "sub_M_$(key).")
+                    updates_str_final = replace(
+                        updates_str,
+                        r"\b(eta_latent|eta)\b" => sub_eta_name,
+                        "spec_registry[:$(prefixed_sub_spec.key)]" => "sub_M_$(key).components[$(i)]",
+                        r"\bM\." => "sub_M_$(key)."
+                    )
                     push!(sub_updates_acc, updates_str_final)
                 end
             end
 
             # --- Sub-model Likelihood ---
-            sub_lik_code = _generate_final_likelihood_block(sub_M, is_sub_multivariate)
-            sub_lik_code_final = replace(sub_lik_code, r"eta_latent|eta" => sub_eta_name,
-                r"\bM\." => "sub_M_$(key).")
+            sub_lik_code = _generate_final_likelihood_block(
+                sub_M, is_sub_multivariate; prefix = prefix
+            )
+            sub_lik_code_final = replace(
+                sub_lik_code,
+                r"\b(eta_latent|eta)\b" => sub_eta_name,
+                r"\bM\." => "sub_M_$(key)."
+            )
             
+            # --- Linear Predictor Coupling ---
+            eta_coupling = if haskey(sub_M, :mapping) && !isnothing(sub_M.mapping)
+                if is_sub_multivariate && is_multivariate
+                    "$(main_eta_name) = $(main_eta_name) .+ $(rho_name) .* $(sub_eta_name)[sub_M_$(key).mapping, :]"
+                else
+                    "$(main_eta_name) = $(main_eta_name) .+ $(rho_name) .* $(sub_eta_name)[sub_M_$(key).mapping]"
+                end
+            else
+                "$(main_eta_name) = $(main_eta_name) .+ $(rho_name) .* $(sub_eta_name)"
+            end
+
             # --- Assemble final code blocks ---
-            push!(priors_acc, join(sub_priors_acc, "\n"))
+            push!(priors_acc, join(filter(!isempty, sub_priors_acc), "\n"))
             updates_block = """
             sub_M_$(key) = M.nested_components[:$(key)]
             $(sub_eta_name) = $(sub_eta_init)
-            $(join(sub_updates_acc, "\n"))
-            $(main_eta_name) = $(main_eta_name) .+ $(rho_name) .* $(sub_eta_name)
+            $(join(filter(!isempty, sub_updates_acc), "\n"))
+            $(eta_coupling)
             """
             push!(updates_acc, updates_block)
             push!(likelihood_acc, sub_lik_code_final)
@@ -1819,35 +2272,149 @@ v1.0.0
 # Returns
 - `nothing`.
 """
-function _process_lhs!(M::Dict, outcome_specs::Vector{Dict{Symbol, Any}})
+function _process_lhs!(
+    M::Dict, outcome_specs::Vector{Dict{Symbol, Any}}, modules::Dict=Dict()
+)
     outcomes = [Symbol(spec[:var]) for spec in outcome_specs]
     likelihood_specs = [spec[:params] for spec in outcome_specs]
     
     # Check the family from the first spec, assuming it's consistent for a `+` separated group.
     family_type = string(get(likelihood_specs[1], :family, "gaussian"))
 
-    if family_type == "dirichlet_multinomial"
-        # --- Special Handling for Dirichlet-Multinomial ---
-        # In this case, `y1 + y2 + y3` represents categories of one response.
-        if length(outcomes) <= 1
-            error("The `dirichlet_multinomial` family requires multiple outcome variables specified with `+`, e.g., `likelihood(y1 + y2, ...)`.")
-        end
-        
-        for out_sym in outcomes
-            if !hasproperty(M[:data], out_sym)
-                error("Outcome category variable ':$out_sym' for dirichlet_multinomial not found in the data frame.")
-            end
-        end
+    # Disambiguate movement telemetry models: pure telemetry mark-recapture uses categorical
+    # observations over spatial graph nodes, which are evaluated directly via the movement kernel
+    # rather than multi-class logit linear predictors.
+    has_movement = any(
+        m -> (hasproperty(m, :module_type) && m.module_type == :movement) ||
+             (hasproperty(m, :args) && get(m.args, :model, :none) == :movement),
+        values(modules)
+    )
+    is_telemetry_family = family_type in ["categorical_movement", "telemetry"]
 
-        M[:outcomes] = outcomes
-        M[:outcomes_N] = length(outcomes)
-        M[:model_arch] = "multivariate"
-        M[:y_obs] = Matrix(M[:data][!, M[:outcomes]])
-        
-        # Merge parameters from all likelihood specs, giving precedence to the first ones.
-        merged_params = Dict{Symbol, Any}()
-        for spec in reverse(likelihood_specs); merge!(merged_params, spec); end
-        M[:likelihood_specs] = [merged_params]
+    if !has_movement && !is_telemetry_family && family_type in [
+        "multinomial", "categorical", "dirichlet_multinomial", "dirichlet"
+    ]
+        # --- Special Handling for Multinomial, Categorical & Dirichlet Models ---
+        spec1 = likelihood_specs[1]
+        ref_kw = get(spec1, :reference, nothing)
+
+        if length(outcomes) >= 2
+            # Wide format: multiple columns represent categories
+            for out_sym in outcomes
+                if !hasproperty(M[:data], out_sym)
+                    error("Outcome category column ':$out_sym' for $family_type not found in data frame.")
+                end
+            end
+
+            # Determine reference category index (default: 1)
+            ref_idx = 1
+            if ref_kw isa Integer
+                if 1 <= ref_kw <= length(outcomes)
+                    ref_idx = Int(ref_kw)
+                else
+                    @warn "Reference category index $ref_kw out of range 1:$(length(outcomes)). Defaulting to 1."
+                end
+            elseif ref_kw isa Symbol || ref_kw isa String
+                found = findfirst(==(Symbol(ref_kw)), outcomes)
+                if !isnothing(found)
+                    ref_idx = found
+                else
+                    @warn "Reference category '$ref_kw' not found in outcomes $(outcomes). Defaulting to 1."
+                end
+            end
+
+            # Order outcomes so reference category is placed at index 1
+            ordered_outcomes = if ref_idx == 1
+                outcomes
+            else
+                vcat([outcomes[ref_idx]], [outcomes[i] for i in 1:length(outcomes) if i != ref_idx])
+            end
+
+            K = length(ordered_outcomes)
+            M[:category_levels] = ordered_outcomes
+            M[:category_labels] = string.(ordered_outcomes)
+            M[:ref_category] = ordered_outcomes[1]
+            M[:K_categories] = K
+            M[:outcomes] = ordered_outcomes
+            M[:outcomes_N] = K - 1 # K - 1 free linear predictors for non-reference categories!
+            M[:model_arch] = "multivariate"
+            M[:is_multinomial] = true
+            M[:multinomial_family] = Symbol(family_type)
+
+            raw_y = Matrix(M[:data][!, ordered_outcomes])
+            if family_type in ["multinomial", "dirichlet_multinomial"]
+                M[:y_obs] = round.(Int, raw_y)
+                M[:trials] = vec(sum(M[:y_obs], dims=2))
+            elseif family_type == "categorical"
+                M[:y_obs] = [argmax(raw_y[i, :]) for i in 1:size(raw_y, 1)]
+                M[:trials] = ones(Int, size(raw_y, 1))
+            else # dirichlet
+                M[:y_obs] = Float64.(raw_y)
+                M[:trials] = ones(Int, size(raw_y, 1))
+            end
+
+            merged_params = Dict{Symbol, Any}()
+            for spec in reverse(likelihood_specs); merge!(merged_params, spec); end
+            M[:likelihood_specs] = [merged_params]
+
+        else
+            # Single outcome column: long categorical factor or integer classes
+            out_var = outcomes[1]
+            if !hasproperty(M[:data], out_var)
+                error("Multinomial/Categorical outcome column ':$out_var' not found in data frame.")
+            end
+
+            col_data = M[:data][!, out_var]
+            uniq_levels = sort(unique(skipmissing(col_data)))
+            if length(uniq_levels) < 2
+                error("Multinomial/Categorical outcome variable ':$out_var' must have at least 2 unique levels, found $(length(uniq_levels)).")
+            end
+
+            # Place reference level at index 1
+            ordered_levels = if !isnothing(ref_kw)
+                ref_str = string(ref_kw)
+                found = findfirst(x -> string(x) == ref_str, uniq_levels)
+                if !isnothing(found)
+                    vcat([uniq_levels[found]], [uniq_levels[i] for i in 1:length(uniq_levels) if i != found])
+                else
+                    @warn "Reference category '$ref_kw' not found in unique levels of '$out_var'. Using $(first(uniq_levels))."
+                    uniq_levels
+                end
+            else
+                uniq_levels
+            end
+
+            K = length(ordered_levels)
+            level_map = Dict(lvl => i for (i, lvl) in enumerate(ordered_levels))
+            y_indices = [level_map[v] for v in col_data]
+
+            M[:category_levels] = ordered_levels
+            M[:category_labels] = string.(ordered_levels)
+            M[:ref_category] = ordered_levels[1]
+            M[:K_categories] = K
+            M[:outcomes] = [Symbol("cat_$(l)") for l in ordered_levels]
+            M[:outcomes_N] = K - 1 # K - 1 free linear predictors for non-reference categories!
+            M[:model_arch] = "multivariate"
+            M[:is_multinomial] = true
+            M[:multinomial_family] = Symbol(family_type)
+
+            if family_type == "categorical"
+                M[:y_obs] = y_indices
+                M[:trials] = ones(Int, length(y_indices))
+            else
+                # Single column multinomial / dirichlet_multinomial: encode as one-hot count matrix
+                y_onehot = zeros(Int, length(y_indices), K)
+                for i in 1:length(y_indices)
+                    y_onehot[i, y_indices[i]] = 1
+                end
+                M[:y_obs] = y_onehot
+                M[:trials] = ones(Int, length(y_indices))
+            end
+
+            merged_params = Dict{Symbol, Any}()
+            for spec in reverse(likelihood_specs); merge!(merged_params, spec); end
+            M[:likelihood_specs] = [merged_params]
+        end
 
     else
         # --- Standard Handling for Other Families ---
@@ -1921,32 +2488,39 @@ function _process_lhs!(M::Dict, outcome_specs::Vector{Dict{Symbol, Any}})
 
     scalar_param_keys = [:censor_lower, :censor_upper, :hurdle]
     for key in scalar_param_keys
-        values_per_outcome = []
-        any_provided = false
-        for spec_params in M[:likelihood_specs]
-            val = _resolve_outcome_scalar_param(spec_params, key, calling_mod)
-            if !isnothing(val)
-                any_provided = true
+        if haskey(merged_params, key)
+            _resolve_obs_param!(M, merged_params, M[:data], [key], key)
+        else
+            values_per_outcome = []
+            any_provided = false
+            for spec_params in M[:likelihood_specs]
+                val = _resolve_outcome_scalar_param(spec_params, key, calling_mod)
+                if !isnothing(val)
+                    any_provided = true
+                end
+                push!(values_per_outcome, val)
             end
-            push!(values_per_outcome, val)
-        end
 
-        if any_provided
-            default_val = if key == :censor_lower || key == :hurdle
-                -Inf
-            else
-                Inf
+            if any_provided
+                default_val = if key == :censor_lower || key == :hurdle
+                    -Inf
+                else
+                    Inf
+                end
+                final_values = [isnothing(v) ? default_val : v for v in values_per_outcome]
+                M[key] = M[:outcomes_N] == 1 ? final_values[1] : final_values
+                M[Symbol("user_provided_", key)] = true
             end
-            final_values = [isnothing(v) ? default_val : v for v in values_per_outcome]
-            M[key] = M[:outcomes_N] == 1 ? final_values[1] : final_values
-            M[Symbol("user_provided_", key)] = true
         end
     end
 
     _resolve_boolean_obs_param!(M, merged_params, :zero_inflated, :use_zi)
     if get(M, :user_provided_hurdle, false) && get(M, :use_zi, false)
-        @warn "Both `hurdle` and `zero_inflated` were specified. The hurdle model will be used and zero-inflation will be ignored."
-        M[:use_zi] = false
+        throw(ArgumentError(
+            "Model specification error: `zero_inflated=true` and `hurdle` cannot both be specified. " *
+            "Zero-inflation (mixture at zero) and hurdle (two-part conditional threshold) formulations " *
+            "are mutually exclusive. Please choose either zero-inflation or hurdle."
+        ))
     end
     _resolve_boolean_obs_param!(M, merged_params, :volatility, :volatility)
 end
@@ -2025,6 +2599,10 @@ function _resolve_obs_param!(opt_dict, params, data, param_keys, target_key)
                 if hasproperty(data, val)
                     # Case 1: The value is a symbol that directly matches a column name.
                     opt_dict[target_key] = data[!, val]
+                    opt_dict[Symbol("user_provided_", target_key)] = true
+                elseif haskey(opt_dict, val)
+                    # Case 1b: The value was passed as a keyword argument in opt_dict
+                    opt_dict[target_key] = opt_dict[val]
                     opt_dict[Symbol("user_provided_", target_key)] = true
                 else
                     # Case 2: The symbol might refer to a variable in the calling scope.
@@ -2381,58 +2959,175 @@ function _bstm_error_handler(e, model)
 end
 
 
-macro bstm(exprs...)
-    local var_name = nothing
-    local formula_expr = nothing
-    local data_expr = nothing
-    local collected_kwargs = []
-    local current_positional_args = []
 
-    # Handle assignment syntax: `@bstm m = formula, data, ...` 
+"""
+    _transform_pair_macro_expr(pair_ex)
+
+Transforms a pair AST expression `key => (formula = ..., data = ...)` so formula
+expressions are cleanly converted to strings at macro expansion time, while runtime
+variables (like DataFrames, priors, and mapping vectors) are properly escaped.
+"""
+function _transform_pair_macro_expr(pair_ex)
+    if !(pair_ex isa Expr && pair_ex.head == :call && length(pair_ex.args) == 3 &&
+         pair_ex.args[1] == :(=>))
+        return esc(pair_ex)
+    end
+    key_part = esc(pair_ex.args[2])
+    spec_part = pair_ex.args[3]
+
+    if spec_part isa Expr && spec_part.head == :tuple
+        transformed_args = Any[]
+        for item in spec_part.args
+            if item isa Expr && (item.head == :(=) || item.head == :kw)
+                k = item.args[1]
+                v = item.args[2]
+                if k == :formula
+                    v_str = v isa String ? v : string(v)
+                    push!(transformed_args, Expr(:(=), k, v_str))
+                else
+                    push!(transformed_args, Expr(:(=), k, esc(v)))
+                end
+            else
+                push!(transformed_args, esc(item))
+            end
+        end
+        return Expr(:call, :(=>), key_part, Expr(:tuple, transformed_args...))
+    else
+        return Expr(:call, :(=>), key_part, esc(spec_part))
+    end
+end
+
+macro bstm(exprs...)
+    # --- detect assignment form: @bstm name = rest... ---
+    local var_name = nothing
     local expressions_to_parse = exprs
     if !isempty(exprs) && exprs[1] isa Expr && exprs[1].head == :(=)
         var_name = exprs[1].args[1]
         expressions_to_parse = (exprs[1].args[2], exprs[2:end]...)
     end
 
-    # Iterate through all expressions to separate positional and keyword arguments
+    # --- collect positional args and raw keyword expressions (preserve order) ---
+    positional = Any[]
+    raw_kwargs = Expr[]    # will hold Expr(:kw, key, val) or elements from a :parameters node
+
     for ex in expressions_to_parse
-        if ex isa Expr && ex.head == :parameters # This is the block after a semicolon
-            append!(collected_kwargs, ex.args)
-        elseif ex isa Expr && ex.head == :(=) # This is a keyword argument without a semicolon
-            # Convert Expr(:(=), key, value) to Expr(:kw, key, value) for consistency
-            push!(collected_kwargs, Expr(:kw, ex.args[1], ex.args[2]))
-        elseif ex isa Expr&&
-            ex.head == :kw # This is a keyword argument within a :parameters block
-            push!(collected_kwargs, ex)
-        else # Positional argument
-            push!(current_positional_args, ex)
+        if ex isa Expr && ex.head == :parameters
+            # things after semicolon — ex.args is a list of Expr(:kw, key, val)
+            append!(raw_kwargs, ex.args)
+        elseif ex isa Expr && ex.head == :kw
+            push!(raw_kwargs, ex)
+        elseif ex isa Expr && ex.head == :(=)
+            # Keyword argument before semicolon (e.g., verbose = true)
+            push!(raw_kwargs, Expr(:kw, ex.args[1], ex.args[2]))
+        else
+            push!(positional, ex)
         end
     end
 
-    # Extract formula and data from positional arguments
-    if length(current_positional_args) < 2
-        error("The @bstm macro requires at least a formula and a data frame, e.g., `@bstm(y ~ 1, my_data)`.")
+    # --- check if positional arguments are pairs: @bstm :primary => (...), :proxy => (...) ---
+    _is_pair_expr(ex) = (ex isa Expr && ex.head == :call && length(ex.args) == 3 &&
+                         ex.args[1] == :(=>))
+    if !isempty(positional) && all(_is_pair_expr, positional)
+        transformed_pairs = Expr[]
+        for p in positional
+            push!(transformed_pairs, _transform_pair_macro_expr(p))
+        end
+
+        final_kwargs = Expr[]
+        for kw in raw_kwargs
+            if kw isa Expr && kw.head == :kw
+                push!(final_kwargs, kw)
+            end
+        end
+        kwargs_esc = [esc(kw) for kw in final_kwargs]
+
+        core_logic = :(bstm_core($(transformed_pairs...); calling_module = $(__module__), $(kwargs_esc...)))
+        if !isnothing(var_name)
+            return :($(esc(var_name)) = $core_logic)
+        else
+            return core_logic
+        end
     end
-    formula_expr = current_positional_args[1]
-    data_expr = current_positional_args[2]
+
+    # --- convert raw_kwargs into a Dict for lookup (but keep raw_kwargs for order) ---
+    kwdict = Dict{Symbol, Any}()
+    for kw in raw_kwargs
+        if kw isa Expr && kw.head == :kw
+            key = kw.args[1]
+            val = kw.args[2]
+            kwdict[key] = val
+        end
+    end
+
+    # --- resolve formula and data: keywords take precedence over positional ---
+    formula_pos_idx = 0
+    if haskey(kwdict, :formula)
+        formula_expr = kwdict[:formula]
+        delete!(kwdict, :formula)
+    elseif length(positional) >= 1
+        formula_expr = positional[1]
+        formula_pos_idx = 1
+    else
+        error("The @bstm macro requires a formula; supply it positionally or with `formula=`.")
+    end
+
+    data_pos_idx = 0
+    if haskey(kwdict, :data)
+        data_expr = kwdict[:data]
+        delete!(kwdict, :data)
+    elseif length(positional) >= (formula_pos_idx + 1)
+        data_pos_idx = formula_pos_idx + 1
+        data_expr = positional[data_pos_idx]
+    else
+        error("The @bstm macro requires a data frame; supply it positionally or with `data=`.")
+    end
 
     # Warn if there are unexpected extra positional arguments
-    if length(current_positional_args) > 2
-        @warn "Ignoring extra positional arguments: $(current_positional_args[3:end])"
+    consumed_pos = max(formula_pos_idx, data_pos_idx)
+    if length(positional) > consumed_pos
+        extra_args = positional[(consumed_pos + 1):end]
+        @warn "Ignoring extra positional arguments: $(extra_args)"
     end
 
-    # Convert the formula expression to a string
+    # Promote spatial graph / data parameters inside formula_expr to macro keyword arguments
+    # so they are cleanly resolved in the caller's lexical scope (including local function variables)
+    function _promote_context_args!(ex)
+        if ex isa Expr
+            if (ex.head == :kw || ex.head == :(=)) && length(ex.args) == 2
+                k = ex.args[1]
+                v = ex.args[2]
+                if k in (:W, :Q, :habitat, :telemetry_data, :mark_recapture_data) && !haskey(kwdict, k)
+                    kwdict[k] = v
+                    push!(raw_kwargs, Expr(:kw, k, v))
+                end
+            end
+            for a in ex.args
+                _promote_context_args!(a)
+            end
+        end
+    end
+    _promote_context_args!(formula_expr)
+
+    # --- reconstruct ordered keyword list excluding formula/data ---
+    final_kwargs = Expr[]
+    for kw in raw_kwargs
+        # each kw is Expr(:kw, key, val); skip formula/data
+        if kw isa Expr && kw.head == :kw
+            ksym = kw.args[1]
+            if ksym == :formula || ksym == :data
+                continue
+            end
+            push!(final_kwargs, kw)
+        end
+    end
+
+    # --- prepare for insertion into generated call ---
     formula_str = string(formula_expr)
-
-    # Escape all expressions for interpolation
     data_esc = esc(data_expr)
-    kwargs_esc = [esc(kw) for kw in collected_kwargs]
+    kwargs_esc = [esc(kw) for kw in final_kwargs]
 
-    # Construct the core function call. 
     core_logic = :(bstm_core($formula_str, $data_esc, $(__module__); $(kwargs_esc...)))
 
-    # Return the appropriate expression
     if !isnothing(var_name)
         return :($(esc(var_name)) = $core_logic)
     else
@@ -2440,8 +3135,7 @@ macro bstm(exprs...)
     end
 end
 
-
-
+ 
 
 """
     _print_param(name, value, status; indent=4)
@@ -2723,6 +3417,67 @@ function bstm_core(formula::Union{Expr, Symbol}, data::DataFrame, calling_module
     kwargs...)
     return bstm_core(string(formula), data, calling_module; kwargs...)
 end
+
+"""
+    bstm_core(equation_pairs::Pair{Symbol, <:Union{NamedTuple, AbstractDict}}...; calling_module::Module=Main, kwargs...)
+
+Constructs and instantiates a Turing model from a system of paired multi-fidelity equations.
+"""
+function bstm_core(
+    equation_pairs::Pair{Symbol, <:Union{NamedTuple, AbstractDict}}...;
+    calling_module::Module = Main,
+    kwargs...
+)
+    options = bstm_config(equation_pairs...; calling_module = calling_module, kwargs...)
+
+    random_suffix = rand(10000:99999)
+    model_func_name = Symbol("bstm_dynamic_model_$(random_suffix)")
+
+    model_string, expr, registry = bstm_text_assembler(options, model_func_name)
+
+    config_dict = Dict(pairs(options))
+    config_dict[:generated_model_code] = model_string
+    delete!(config_dict, :calling_module)
+    new_config = NamedTuple(config_dict)
+
+    if get(new_config, :verbose, true)
+        _print_finalized_parameters(new_config)
+    end
+
+    model_func = Core.eval(@__MODULE__, quote
+        $(expr)
+        $(model_func_name)
+    end)
+
+    model_instance = Base.invokelatest(model_func, new_config, registry)
+
+    if get(new_config, :verbose, true)
+        println("\n--- Running prior predictive check ---")
+    end
+
+    prior_sample = nothing
+    try
+        prior_sample = Base.invokelatest(rand, model_instance)
+        if get(new_config, :verbose, true) && !isnothing(prior_sample)
+            println("Prior sample check successful. Sample values:")
+            display(prior_sample)
+        end
+        current_reg = get(registry, :parameters, build_param_registry(new_config))
+        if !isnothing(prior_sample)
+            registry[:parameters] = calibrate_param_registry(current_reg, prior_sample)
+        else
+            registry[:parameters] = current_reg
+        end
+    catch e
+        _bstm_error_handler(e, model_instance)
+    end
+
+    if get(new_config, :verbose, true)
+        println("--------------------------------------\n")
+    end
+
+    return model_instance
+end
  
 
 """
@@ -2764,12 +3519,13 @@ function bstm_text_assembler(M::NamedTuple, model_func_name::Symbol)
     
     has_custom_likelihood_from_component = any(
         spec -> (spec.component_obj isa PointProcess || (hasproperty(spec.component_obj,
-            :method) && spec.component_obj.method == :marginalized)),
+            :method) && spec.component_obj.method == :marginalized) ||
+            (spec.component_obj isa Movement && get(M, :is_pure_telemetry, false))),
         M.components
     )
     has_custom_likelihood_from_family = any(spec -> string(get(spec, :family,
         "")) == "ordinal", M.likelihood_specs)
-    has_custom_likelihood = has_custom_likelihood_from_component||
+    has_custom_likelihood = has_custom_likelihood_from_component ||
         has_custom_likelihood_from_family
 
     # --- Generate all code fragments ---
@@ -3080,12 +3836,23 @@ function _compute_scaling_factor(evals::Vector{Float64}, rank_deficiency::Int)
         return 1.0
     end
     
-    # Select the eigenvalues that are not part of the null space.
-    # These are the `n - rank_deficiency` largest eigenvalues.
-    positive_evals = sorted_evals[(rank_deficiency + 1):end]
+    # Select candidate eigenvalues after discarding expected null space rank deficiency
+    candidate_evals = sorted_evals[(rank_deficiency + 1):end]
     
+    # Check for additional zero eigenvalues (e.g. disconnected graph components)
+    max_λ = isempty(sorted_evals) ? 1.0 : maximum(abs, sorted_evals)
+    tol = max(1e-10, 1e-8 * max_λ)
+    
+    num_near_zero = count(λ -> λ <= tol, candidate_evals)
+    if num_near_zero > 0
+        @warn "Precision matrix has $(num_near_zero) additional near-zero eigenvalue(s) " *
+              "(<= $tol), indicating disconnected spatial graph components. " *
+              "Filtering from scaling factor calculation."
+    end
+    
+    positive_evals = filter(λ -> λ > tol, candidate_evals)
     if isempty(positive_evals)
-        # If no positive eigenvalues are found, return 1.0 to avoid errors.
+        @warn "No positive eigenvalues found above tolerance $tol. Defaulting to 1.0."
         return 1.0
     end
     
@@ -5517,7 +6284,7 @@ Extracts samples for `var_id` (Symbol, String, or DynamicPPL.VarName) across all
 (`VNChain`, `FlexiChain`, `MCMCChains.Chains`, `DataFrame`, `Dict`, `NamedTuple`) and returns a
 standardized 2D `Matrix{Float64}` of size `(n_samples, dim)`.
 """
-function extract_param_matrix(chain, var_id::Union{Symbol, String, DynamicPPL.VarName};
+function extract_param_matrix(chain, var_id::Union{Symbol, AbstractString, DynamicPPL.VarName};
     expected_dim::Union{Int, Nothing}=nothing)::Matrix{Float64}
     # 1. Normalize identifier to Symbol and clean base string
     raw_str = string(var_id)
@@ -5579,14 +6346,17 @@ function extract_param_matrix(chain, var_id::Union{Symbol, String, DynamicPPL.Va
                                     if !isnothing(idx)
                                         df[!, df_cols[idx]]
                                     else
-                                        # Strategy B: Bracketed indices (e.g. var[1], var[2], ...)
-                                        re_bracket = Regex("^" * escape_string(base_name) * "\\[\\d+\\]")
-                                        matched_cols = filter(n -> occursin(re_bracket,
-                                            string(n)), df_cols)
+                                        # Strategy B: Bracketed indices (e.g. 1D var[1], or 2D/tensor var[1, 1], ...)
+                                        re_bracket = Regex("^" * escape_string(base_name) * "\\[([\\d,\\s]+)\\]")
+                                        matched_cols = filter(n -> occursin(re_bracket, string(n)), df_cols)
                                         if !isempty(matched_cols)
                                             sort!(matched_cols, by = n -> begin
-                                                m = match(r"\[(\d+)\]", string(n))
-                                                isnothing(m) ? 0 : parse(Int, m.captures[1])
+                                                m = match(re_bracket, string(n))
+                                                if isnothing(m)
+                                                    return (0,)
+                                                end
+                                                idx_strs = Base.split(m.captures[1], ',')
+                                                Tuple(parse(Int, strip(s)) for s in idx_strs)
                                             end)
                                             Matrix(df[!, matched_cols])
                                         else
@@ -5690,14 +6460,14 @@ end
 
 Extracts a scalar parameter as a 1D `Vector{Float64}` of length `n_samples`.
 """
-function extract_param_vector(chain, var_id::Union{Symbol, String,
+function extract_param_vector(chain, var_id::Union{Symbol, AbstractString,
     DynamicPPL.VarName})::Vector{Float64}
     mat = extract_param_matrix(chain, var_id; expected_dim=1)
     return vec(mat[:, 1])
 end
 
 # get_params_vector is for scalar or fixed-length parameters (expected_len >= 1)
-function get_params_vector(chain, param_name::Union{Symbol, String, DynamicPPL.VarName},
+function get_params_vector(chain, param_name::Union{Symbol, AbstractString, DynamicPPL.VarName},
     expected_len::Int=1)
     samples = extract_param_matrix(chain, param_name; expected_dim=expected_len)
     if size(samples, 2) != expected_len
@@ -5713,7 +6483,7 @@ function get_params_vector(chain, param_name::Union{Symbol, String, DynamicPPL.V
 end
 
 # get_params_matrix is for vector/matrix parameters (expected_len >= 1)
-function get_params_matrix(chain, param_name::Union{Symbol, String, DynamicPPL.VarName},
+function get_params_matrix(chain, param_name::Union{Symbol, AbstractString, DynamicPPL.VarName},
     expected_len::Int)
     return get_params_vector(chain, param_name, expected_len)
 end
@@ -5831,27 +6601,38 @@ Generates Turing code for all likelihood-specific priors.
 # Returns
 - A `String` containing the generated Turing code for the likelihood priors.
 """
-function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
+function _generate_likelihood_section(
+    M::NamedTuple, is_multivariate::Bool; prefix::String = ""
+)
     families = [string(get(spec, :family, "gaussian")) for spec in M.likelihood_specs]
     
     prior_blocks = String[]
 
+    r_nb_sym = !isempty(prefix) ? "r_nb_$(prefix)" : "r_nb"
+    phi_hurdle_sym = !isempty(prefix) ? "lik_phi_hurdle_$(prefix)" : "lik_phi_hurdle"
+    phi_zi_sym = !isempty(prefix) ? "lik_phi_zi_$(prefix)" : "lik_phi_zi"
+    nu_sym = !isempty(prefix) ? "lik_nu_student_t_$(prefix)" : "lik_nu_student_t"
+    y_sigma_sym = !isempty(prefix) ? "y_sigma_$(prefix)" : "y_sigma"
+    extra_sym = !isempty(prefix) ? "lik_extra_params_$(prefix)" : "lik_extra_params"
+    L_corr_sym = !isempty(prefix) ? "L_corr_$(prefix)" : "L_corr"
+    dirichlet_phi_sym = !isempty(prefix) ? "dirichlet_phi_$(prefix)" : "dirichlet_phi"
+
     # Prior for Negative Binomial dispersion
     if any(f -> f == "negbin", families)
-        push!(prior_blocks, "r_nb ~ DynamicPPL.NamedDist(Exponential(1.0), :r_nb)")
+        push!(prior_blocks, "$(r_nb_sym) ~ DynamicPPL.NamedDist(Exponential(1.0), :$(r_nb_sym))")
     end
 
     # Prior for Zero-Inflation or Hurdle probability
     if get(M, :user_provided_hurdle, false)
-        push!(prior_blocks, "lik_phi_hurdle ~ DynamicPPL.NamedDist(Beta(1,1), :lik_phi_hurdle)")
+        push!(prior_blocks, "$(phi_hurdle_sym) ~ DynamicPPL.NamedDist(Beta(1,1), :$(phi_hurdle_sym))")
     elseif get(M, :use_zi, false)
-        push!(prior_blocks, "lik_phi_zi ~ DynamicPPL.NamedDist(Beta(1,1), :lik_phi_zi)")
+        push!(prior_blocks, "$(phi_zi_sym) ~ DynamicPPL.NamedDist(Beta(1,1), :$(phi_zi_sym))")
     end
 
     # Prior for Student's T degrees of freedom
     if any(f -> f == "student_t", families)
         push!(prior_blocks,
-            "lik_nu_student_t ~ DynamicPPL.NamedDist(Exponential(1.0), :lik_nu_student_t)")
+            "$(nu_sym) ~ DynamicPPL.NamedDist(Exponential(1.0), :$(nu_sym))")
     end
 
     # Prior for observation standard deviation (for Gaussian-like families)
@@ -5860,21 +6641,26 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
         y_sigma_prior_str = _distribution_to_string(Exponential(1.0))
         if is_multivariate
             push!(prior_blocks,
-                "y_sigma ~ DynamicPPL.NamedDist(filldist($(y_sigma_prior_str), K), :y_sigma)")
+                "$(y_sigma_sym) ~ DynamicPPL.NamedDist(filldist($(y_sigma_prior_str), K), :$(y_sigma_sym))")
         else
-            push!(prior_blocks, "y_sigma ~ DynamicPPL.NamedDist($(y_sigma_prior_str), :y_sigma)")
+            push!(prior_blocks, "$(y_sigma_sym) ~ DynamicPPL.NamedDist($(y_sigma_prior_str), :$(y_sigma_sym))")
         end
     end
     
     # Prior for extra parameters (e.g., Gamma shape, Beta precision)
     if any(f -> f in ["gamma", "beta", "inverse_gaussian", "pareto", "half_student_t"], families)
         push!(prior_blocks,
-            "lik_extra_params ~ DynamicPPL.NamedDist(Exponential(1.0), :lik_extra_params)")
+            "$(extra_sym) ~ DynamicPPL.NamedDist(Exponential(1.0), :$(extra_sym))")
     end
 
-    # Prior for multivariate correlation matrix
-    if is_multivariate
-        push!(prior_blocks, "L_corr ~ DynamicPPL.NamedDist(LKJCholesky(K, 1.0), :L_corr)")
+    # Prior for multivariate correlation matrix (skipped for multinomial models)
+    if is_multivariate && !get(M, :is_multinomial, false)
+        push!(prior_blocks, "$(L_corr_sym) ~ DynamicPPL.NamedDist(LKJCholesky(K, 1.0), :$(L_corr_sym))")
+    end
+
+    # Prior for Dirichlet dispersion / precision parameter
+    if get(M, :is_multinomial, false) && string(get(M, :multinomial_family, "")) in ["dirichlet_multinomial", "dirichlet"]
+        push!(prior_blocks, "$(dirichlet_phi_sym) ~ DynamicPPL.NamedDist(Exponential(1.0), :$(dirichlet_phi_sym))")
     end
 
     # --- Priors for Ordinal Model ---
@@ -5883,19 +6669,22 @@ function _generate_likelihood_section(M::NamedTuple, is_multivariate::Bool)
         spec = M.likelihood_specs[ordinal_spec_idx]
         K = get(spec, :K, 0)
         latent_dist = get(spec, :latent_dist, :logistic)
+        alpha_1_sym = !isempty(prefix) ? "ordinal_alpha_unscaled_1_$(prefix)" : "ordinal_alpha_unscaled_1"
+        diffs_sym = !isempty(prefix) ? "ordinal_alpha_diffs_$(prefix)" : "ordinal_alpha_diffs"
+        df_sym = !isempty(prefix) ? "ordinal_df_$(prefix)" : "ordinal_df"
 
         if K > 2
             # Prior for the first cut-point and the positive differences for subsequent cut-points.
-            push!(prior_blocks, "ordinal_alpha_unscaled_1 ~ DynamicPPL.NamedDist(Normal(0, 5), :ordinal_alpha_unscaled_1)")
-            push!(prior_blocks, "ordinal_alpha_diffs ~ DynamicPPL.NamedDist(filldist(Exponential(1.0), $(K - 2)), :ordinal_alpha_diffs)")
+            push!(prior_blocks, "$(alpha_1_sym) ~ DynamicPPL.NamedDist(Normal(0, 5), :$(alpha_1_sym))")
+            push!(prior_blocks, "$(diffs_sym) ~ DynamicPPL.NamedDist(filldist(Exponential(1.0), $(K - 2)), :$(diffs_sym))")
         elseif K == 2
             # For a binary ordinal model, only one cut-point is needed.
-            push!(prior_blocks, "ordinal_alpha_unscaled_1 ~ DynamicPPL.NamedDist(Normal(0, 5), :ordinal_alpha_unscaled_1)")
+            push!(prior_blocks, "$(alpha_1_sym) ~ DynamicPPL.NamedDist(Normal(0, 5), :$(alpha_1_sym))")
         end
 
         # Prior for the degrees of freedom if using a Student's T latent distribution.
         if latent_dist == :student_t
-            push!(prior_blocks, "ordinal_df ~ DynamicPPL.NamedDist(Exponential(1.0), :ordinal_df)")
+            push!(prior_blocks, "$(df_sym) ~ DynamicPPL.NamedDist(Exponential(1.0), :$(df_sym))")
         end
     end
 
@@ -5904,9 +6693,16 @@ end
 
 
 
-function _generate_univariate_likelihood_block(M::NamedTuple)
+function _generate_univariate_likelihood_block(M::NamedTuple; prefix::String = "")
     family = string(M.likelihood_specs[1][:family])
     family_symbol = QuoteNode(Symbol(family))
+
+    y_sigma_name = !isempty(prefix) ? "y_sigma_$(prefix)" : "y_sigma"
+    r_nb_name = !isempty(prefix) ? "r_nb_$(prefix)" : "r_nb"
+    phi_zi_name = !isempty(prefix) ? "lik_phi_zi_$(prefix)" : "lik_phi_zi"
+    phi_hurdle_name = !isempty(prefix) ? "lik_phi_hurdle_$(prefix)" : "lik_phi_hurdle"
+    nu_name = !isempty(prefix) ? "lik_nu_student_t_$(prefix)" : "lik_nu_student_t"
+    extra_name = !isempty(prefix) ? "lik_extra_params_$(prefix)" : "lik_extra_params"
 
     # Determine which kwargs are needed based on the family
     needs_sigma = family in ["gaussian", "lognormal", "student_t", "laplace", "half_normal", "half_student_t"]
@@ -5918,21 +6714,21 @@ function _generate_univariate_likelihood_block(M::NamedTuple)
     extra_param_logic = ""
 
     if needs_sigma
-        push!(kwargs_parts, "sigma_y=y_sigma")
+        push!(kwargs_parts, "sigma_y=$(y_sigma_name)")
     end
     if needs_rnb
-        push!(kwargs_parts, "r_nb=r_nb")
+        push!(kwargs_parts, "r_nb=$(r_nb_name)")
     end
     if get(M, :use_zi, false)
-        push!(kwargs_parts, "phi_zi=lik_phi_zi")
+        push!(kwargs_parts, "phi_zi=$(phi_zi_name)")
     end
     if get(M, :user_provided_hurdle, false)
-        push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle")
+        push!(kwargs_parts, "phi_hurdle=$(phi_hurdle_name)")
     end
     
     if needs_nu || needs_extra
-        extra_param_logic = if needs_nu; "extra_p = lik_nu_student_t"
-        else; "extra_p = lik_extra_params"; end
+        extra_param_logic = if needs_nu; "extra_p = $(nu_name)"
+        else; "extra_p = $(extra_name)"; end
         push!(kwargs_parts, "extra_params=extra_p")
     end
 
@@ -5998,19 +6794,62 @@ function _generate_univariate_likelihood_block(M::NamedTuple)
 end
 
 
-function _generate_multivariate_likelihood_block(M::NamedTuple)
-    if any(s -> string(get(s, :family, "")) == "dirichlet_multinomial", M.likelihood_specs)
-        return """
-        let
-            eta_correlated = eta_latent * L_corr.L
-            family = :dirichlet_multinomial
-            
-            trials_vec = sum.(eachrow(M.y_obs))
-            d_lik_vec = bstm_Likelihood.(family, eachrow(eta_correlated); trial=trials_vec)
-            
-            Turing.@addlogprob! sum(logpdf.(d_lik_vec, eachrow(M.y_obs)))
+function _generate_multivariate_likelihood_block(M::NamedTuple; prefix::String = "")
+    y_sigma_name = !isempty(prefix) ? "y_sigma_$(prefix)" : "y_sigma"
+    r_nb_name = !isempty(prefix) ? "r_nb_$(prefix)" : "r_nb"
+    phi_zi_name = !isempty(prefix) ? "lik_phi_zi_$(prefix)" : "lik_phi_zi"
+    phi_hurdle_name = !isempty(prefix) ? "lik_phi_hurdle_$(prefix)" : "lik_phi_hurdle"
+    nu_name = !isempty(prefix) ? "lik_nu_student_t_$(prefix)" : "lik_nu_student_t"
+    extra_name = !isempty(prefix) ? "lik_extra_params_$(prefix)" : "lik_extra_params"
+    L_corr_name = !isempty(prefix) ? "L_corr_$(prefix)" : "L_corr"
+    dirichlet_phi_name = !isempty(prefix) ? "dirichlet_phi_$(prefix)" : "dirichlet_phi"
+
+    if get(M, :is_multinomial, false)
+        fam = Symbol(get(M, :multinomial_family, :multinomial))
+        trials_code = get(M, :user_provided_trials, false) ? "M.trials[:, 1]" : "vec(sum(M.y_obs, dims=2))"
+        if fam == :multinomial
+            return """
+            let
+                local log_lik_sum
+                eta_full = hcat(fill(zero(T), N, 1), eta_latent)
+                probs_mat = LogExpFunctions.softmax(eta_full; dims=2)
+                trials_vec = $(trials_code)
+                log_lik_sum = sum(i -> Distributions.logpdf(Distributions.Multinomial(Int(trials_vec[i]), collect(probs_mat[i, :])), M.y_obs[i, :]), 1:N)
+                Turing.@addlogprob! log_lik_sum
+            end
+            """
+        elseif fam == :categorical
+            return """
+            let
+                local log_lik_sum
+                eta_full = hcat(fill(zero(T), N, 1), eta_latent)
+                probs_mat = LogExpFunctions.softmax(eta_full; dims=2)
+                log_lik_sum = sum(i -> Distributions.logpdf(Distributions.Categorical(collect(probs_mat[i, :])), Int(M.y_obs[i])), 1:N)
+                Turing.@addlogprob! log_lik_sum
+            end
+            """
+        elseif fam == :dirichlet_multinomial
+            return """
+            let
+                local log_lik_sum
+                eta_full = hcat(fill(zero(T), N, 1), eta_latent)
+                probs_mat = LogExpFunctions.softmax(eta_full; dims=2)
+                trials_vec = $(trials_code)
+                log_lik_sum = sum(i -> Distributions.logpdf(Distributions.DirichletMultinomial(Int(trials_vec[i]), max.($(dirichlet_phi_name) .* collect(probs_mat[i, :]), 1e-6)), M.y_obs[i, :]), 1:N)
+                Turing.@addlogprob! log_lik_sum
+            end
+            """
+        elseif fam == :dirichlet
+            return """
+            let
+                local log_lik_sum
+                eta_full = hcat(fill(zero(T), N, 1), eta_latent)
+                probs_mat = LogExpFunctions.softmax(eta_full; dims=2)
+                log_lik_sum = sum(i -> Distributions.logpdf(Distributions.Dirichlet(max.($(dirichlet_phi_name) .* collect(probs_mat[i, :]), 1e-6)), M.y_obs[i, :]), 1:N)
+                Turing.@addlogprob! log_lik_sum
+            end
+            """
         end
-        """
     end
 
     loop_body_parts = String[]
@@ -6027,21 +6866,21 @@ function _generate_multivariate_likelihood_block(M::NamedTuple)
         extra_param_logic = ""
 
         if needs_sigma
-            push!(kwargs_parts, "sigma_y=y_sigma[$k]")
+            push!(kwargs_parts, "sigma_y=$(y_sigma_name)[$k]")
         end
         if needs_rnb
-            push!(kwargs_parts, "r_nb=r_nb")
+            push!(kwargs_parts, "r_nb=$(r_nb_name)")
         end
         if get(M, :use_zi, false)
-            push!(kwargs_parts, "phi_zi=lik_phi_zi")
+            push!(kwargs_parts, "phi_zi=$(phi_zi_name)")
         end
         if get(M, :user_provided_hurdle, false)
-            push!(kwargs_parts, "phi_hurdle=lik_phi_hurdle")
+            push!(kwargs_parts, "phi_hurdle=$(phi_hurdle_name)")
         end
         
         if needs_nu || needs_extra
-            extra_param_logic = if needs_nu; "extra_p = lik_nu_student_t"
-            else; "extra_p = lik_extra_params"; end
+            extra_param_logic = if needs_nu; "extra_p = $(nu_name)"
+            else; "extra_p = $(extra_name)"; end
             push!(kwargs_parts, "extra_params=extra_p")
         end
 
@@ -6081,7 +6920,7 @@ function _generate_multivariate_likelihood_block(M::NamedTuple)
     loop_body = join(loop_body_parts, "\n\n")
 
     return """
-    eta_correlated = eta_latent * L_corr.L
+    eta_correlated = eta_latent * $(L_corr_name).L
     $(loop_body)
     """
 end
@@ -6091,12 +6930,12 @@ end
 
 
 """
-    _generate_ordinal_likelihood_block(M::NamedTuple)
+    _generate_ordinal_likelihood_block(M::NamedTuple; prefix::String = "")
 
 Generates the Turing code block for an ordinal regression likelihood. This version
 is CPU-only.
 """
-function _generate_ordinal_likelihood_block(M::NamedTuple)
+function _generate_ordinal_likelihood_block(M::NamedTuple; prefix::String = "")
     spec = M.likelihood_specs[1]
     K = get(spec, :K, 0)
     if K < 2
@@ -6110,12 +6949,17 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
     npo_indices = findall(x -> x in non_prop_terms, M.Xfixed_names)
     n_npo_vars = length(npo_indices)
 
+    alpha_1_sym = !isempty(prefix) ? "ordinal_alpha_unscaled_1_$(prefix)" : "ordinal_alpha_unscaled_1"
+    diffs_sym = !isempty(prefix) ? "ordinal_alpha_diffs_$(prefix)" : "ordinal_alpha_diffs"
+    df_sym = !isempty(prefix) ? "ordinal_df_$(prefix)" : "ordinal_df"
+    beta_npo_name = !isempty(prefix) ? "beta_npo_$(prefix)" : "beta_npo"
+
     npo_update_block = ""
     if is_npo && n_npo_vars > 0
         npo_update_block = """
         # Non-proportional effects calculation
         X_npo = M.Xfixed[:, $(npo_indices)]
-        beta_npo_matrix = reshape(beta_npo, $(n_npo_vars), $(K-1))
+        beta_npo_matrix = reshape($(beta_npo_name), $(n_npo_vars), $(K-1))
         eta_npo = X_npo * beta_npo_matrix
         """
     end
@@ -6125,9 +6969,9 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
     let
         # Reconstruct the ordered cut-points from their unscaled parameters.
         alphas_computed = if $(K > 2)
-            cumsum([ordinal_alpha_unscaled_1; ordinal_alpha_diffs])
+            cumsum([$(alpha_1_sym); $(diffs_sym)])
         else
-            [ordinal_alpha_unscaled_1]
+            [$(alpha_1_sym)]
         end
 
         latent_dist_symbol = :$(latent_dist_val)
@@ -6152,7 +6996,7 @@ function _generate_ordinal_likelihood_block(M::NamedTuple)
         elseif latent_dist_symbol == :logistic
             LogExpFunctions.logistic.(linear_predictor_matrix)
         elseif latent_dist_symbol == :student_t
-            Distributions.cdf.(TDist(ordinal_df), linear_predictor_matrix)
+            Distributions.cdf.(TDist($(df_sym)), linear_predictor_matrix)
         else
             error("Unsupported latent distribution ':\$(latent_dist_symbol)' for ordinal model.")
         end
@@ -6183,7 +7027,7 @@ end
 
 
 """
-    _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
+    _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool; prefix::String = "")
 
 Generates the final likelihood block for the Turing model, dispatching to the
 appropriate helper based on the model architecture and handling special cases.
@@ -6191,11 +7035,14 @@ appropriate helper based on the model architecture and handling special cases.
 # Arguments
 - `M`: The main model configuration `NamedTuple`.
 - `is_multivariate`: A boolean indicating if the model is multivariate.
+- `prefix`: An optional prefix string for sub-model likelihood parameters.
 
 # Returns
 - A `String` containing the generated Turing code for the likelihood block.
 """
-function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
+function _generate_final_likelihood_block(
+    M::NamedTuple, is_multivariate::Bool; prefix::String = ""
+)
     # Check if a component like a PointProcess or a marginalized GMRF handles its own likelihood.
     has_custom_likelihood_from_component = any(
         spec -> (spec.component_obj isa PointProcess || (hasproperty(spec.component_obj,
@@ -6207,14 +7054,14 @@ function _generate_final_likelihood_block(M::NamedTuple, is_multivariate::Bool)
     end
 
     if is_multivariate
-        return _generate_multivariate_likelihood_block(M)
+        return _generate_multivariate_likelihood_block(M; prefix = prefix)
     else
         # For univariate models, check for special families like ordinal.
         family = string(M.likelihood_specs[1][:family])
         if family == "ordinal"
-            return _generate_ordinal_likelihood_block(M)
+            return _generate_ordinal_likelihood_block(M; prefix = prefix)
         else
-            return _generate_univariate_likelihood_block(M)
+            return _generate_univariate_likelihood_block(M; prefix = prefix)
         end
     end
 end
@@ -6290,7 +7137,9 @@ end
 Generates the Turing code for the priors and linear predictor updates for all
 fixed effects. This version is CPU-only.
 """
-function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta_name::String)
+function _generate_fixed_effects_block(
+    M::NamedTuple, is_multivariate::Bool, eta_name::String; prefix::String = ""
+)
     if get(M, :Xfixed_N, 0) == 0
         return "", ""
     end
@@ -6316,15 +7165,16 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
 
     prior_parts = String[]
     update_parts = String[]
+    M_ref = !isempty(prefix) ? "sub_M_$(prefix)" : "M"
  
     # --- Proportional Effects ---
     if n_prop > 0
         priors_prop = priors_vec[prop_indices]
         all_same_prop = !isempty(priors_prop) && all(p -> p == priors_prop[1], priors_prop)
         
-        beta_prop_name = is_multivariate ? "beta_flat" : "beta"
+        beta_prop_name = !isempty(prefix) ? (is_multivariate ? "beta_flat_$(prefix)" : "beta_$(prefix)") : (is_multivariate ? "beta_flat" : "beta")
         n_params_prop = is_multivariate ? n_prop * M.outcomes_N : n_prop
-        prior_label = is_multivariate ? :beta_flat : :beta
+        prior_label = Symbol(beta_prop_name)
 
         # Generate prior string for coefficients
         if all_same_prop
@@ -6344,15 +7194,16 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
         # Generate latent innovation priors for EIV covariates
         for j in eiv_prop_indices
             col_name = M.Xfixed_names[j]
-            push!(prior_parts, "ure_eiv_$(col_name) ~ DynamicPPL.NamedDist(filldist(Normal(0, 1), N), $(QuoteNode(Symbol("ure_eiv_$(col_name)"))))")
+            eiv_sym = !isempty(prefix) ? "ure_eiv_$(prefix)_$(col_name)" : "ure_eiv_$(col_name)"
+            push!(prior_parts, "$(eiv_sym) ~ DynamicPPL.NamedDist(filldist(Normal(0, 1), N), $(QuoteNode(Symbol(eiv_sym))))")
         end
 
         # Standard (non-EIV) linear update
         if !isempty(std_prop_indices)
             update_code = if is_multivariate
-                "$(eta_name) = $(eta_name) .+ M.Xfixed[:, $(std_prop_indices)] * reshape($(beta_prop_name), $(n_prop), M.outcomes_N)[$(std_prop_indices), :]"
+                "$(eta_name) = $(eta_name) .+ $(M_ref).Xfixed[:, $(std_prop_indices)] * reshape($(beta_prop_name), $(n_prop), $(M_ref).outcomes_N)[$(std_prop_indices), :]"
             else
-                "$(eta_name) = $(eta_name) .+ M.Xfixed[:, $(std_prop_indices)] * $(beta_prop_name)[$(std_prop_indices)]"
+                "$(eta_name) = $(eta_name) .+ $(M_ref).Xfixed[:, $(std_prop_indices)] * $(beta_prop_name)[$(std_prop_indices)]"
             end
             push!(update_parts, update_code)
         end
@@ -6360,18 +7211,19 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
         # EIV latent linear update
         for j in eiv_prop_indices
             col_name = M.Xfixed_names[j]
+            eiv_sym = !isempty(prefix) ? "ure_eiv_$(prefix)_$(col_name)" : "ure_eiv_$(col_name)"
             if is_multivariate
                 eiv_code = """
                 let
-                    X_lat_$(col_name) = M.Xfixed[:, $(j)] .+ M.Xfixed_eiv_map[$(QuoteNode(col_name))] .* ure_eiv_$(col_name)
-                    beta_j = reshape($(beta_prop_name), $(n_prop), M.outcomes_N)[$(j), :]
+                    X_lat_$(col_name) = $(M_ref).Xfixed[:, $(j)] .+ $(M_ref).Xfixed_eiv_map[$(QuoteNode(col_name))] .* $(eiv_sym)
+                    beta_j = reshape($(beta_prop_name), $(n_prop), $(M_ref).outcomes_N)[$(j), :]
                     $(eta_name) = $(eta_name) .+ X_lat_$(col_name) * beta_j'
                 end"""
                 push!(update_parts, eiv_code)
             else
                 eiv_code = """
                 let
-                    X_lat_$(col_name) = M.Xfixed[:, $(j)] .+ M.Xfixed_eiv_map[$(QuoteNode(col_name))] .* ure_eiv_$(col_name)
+                    X_lat_$(col_name) = $(M_ref).Xfixed[:, $(j)] .+ $(M_ref).Xfixed_eiv_map[$(QuoteNode(col_name))] .* $(eiv_sym)
                     $(eta_name) = $(eta_name) .+ X_lat_$(col_name) .* $(beta_prop_name)[$(j)]
                 end"""
                 push!(update_parts, eiv_code)
@@ -6383,18 +7235,19 @@ function _generate_fixed_effects_block(M::NamedTuple, is_multivariate::Bool, eta
     if n_npo > 0 && K_ordinal > 1
         priors_npo = priors_vec[npo_indices]
         all_same_npo = !isempty(priors_npo) && all(p -> p == priors_npo[1], priors_npo)
-        beta_npo_name = "beta_npo"
+        beta_npo_name = !isempty(prefix) ? "beta_npo_$(prefix)" : "beta_npo"
         n_npo_params = n_npo * (K_ordinal - 1)
+        prior_npo_label = Symbol(beta_npo_name)
 
         if all_same_npo
             prior_str = _distribution_to_string(priors_npo[1])
-            push!(prior_parts, "$(beta_npo_name) ~ DynamicPPL.NamedDist(filldist($(prior_str), $(n_npo_params)), :beta_npo)")
+            push!(prior_parts, "$(beta_npo_name) ~ DynamicPPL.NamedDist(filldist($(prior_str), $(n_npo_params)), $(QuoteNode(prior_npo_label)))")
         else
             full_priors_list = vcat([priors_npo for _ in 1:(K_ordinal-1)]...)
             priors_str_list = [_distribution_to_string(p) for p in full_priors_list]
             push!(prior_parts,
                 "$(beta_npo_name) ~ DynamicPPL.NamedDist(Product([$(join(priors_str_list, ",
-                "))]), :beta_npo)")
+                "))]), $(QuoteNode(prior_npo_label)))")
         end
     end
 
@@ -6515,6 +7368,15 @@ function process_smooth_module!(
                 
                 basis_registry[reg_key] = B_smooth_matrix
                 mod_data[:params][:nbins] = actual_nbins_for_component # Update nbins with the actual count
+                if n_vars == 1
+                    v_sym = Symbol(mod_data[:variables][1])
+                    if !haskey(opt_dict, :domain_values)
+                        opt_dict[:domain_values] = Dict{Symbol, Any}()
+                    end
+                    v_unique = sort(unique(data[!, v_sym]))
+                    opt_dict[:domain_values][v_sym] = v_unique
+                    opt_dict[Symbol("$(v_sym)_values")] = v_unique
+                end
             end
         end
     
@@ -6954,6 +7816,22 @@ function process_nested_module!(opt_dict, mod_data, registries, hyperpriors)
     
     var = Symbol(mod_data[:variables][1])
     params = mod_data[:params]
+
+    # Check if sub-model was pre-configured (e.g. via paired multi-equation syntax or submodels dict)
+    if haskey(opt_dict[:nested_components], var)
+        sub_cfg = opt_dict[:nested_components][var]
+        if haskey(params, :prior) || haskey(params, :coupling_prior)
+            c_prior = get(params, :prior, get(params, :coupling_prior, Normal(1.0, 0.5)))
+            sub_cfg = merge(sub_cfg, (coupling_prior = c_prior,))
+        end
+        if haskey(params, :fixed) || haskey(params, :fixed_coupling)
+            f_coupling = get(params, :fixed, get(params, :fixed_coupling, false))
+            sub_cfg = merge(sub_cfg, (fixed_coupling = f_coupling,))
+        end
+        opt_dict[:nested_components][var] = sub_cfg
+        return false
+    end
+
     sub_formula_raw = get(params, :formula, "")
     data_source_sym = get(params, :data_source, :data)
 
@@ -6965,11 +7843,25 @@ function process_nested_module!(opt_dict, mod_data, registries, hyperpriors)
     sub_data = opt_dict[data_source_sym]
     
     # Prepare keyword arguments for the recursive bstm_config call.
-    # Exclude keys that are specific to the parent model.
+    # Exclude internal state keys specific to the parent model.
     sub_config_kwargs = copy(opt_dict)
-    delete!(sub_config_kwargs, :data)
-    delete!(sub_config_kwargs, data_source_sym)
-    delete!(sub_config_kwargs, :formula)
+    keys_to_exclude = [
+        :data, :formula, data_source_sym,
+        :y_obs, :y_N, :y_cols, :outcomes, :likelihood_specs,
+        :components, :nested_components, :basis_matrices,
+        :Xfixed, :Xfixed_N, :Xfixed_names, :Xfixed_priors_vec,
+        :add_intercept, :intercept_prior, :model_arch, :outcomes_N,
+        :is_multivariate_dynamics, :multivariate_dynamics_key, :model_st,
+        :st_interaction_sigma_prior, :sigma_st_interaction_prior,
+        :Xfixed_eiv_map, :trials, :weights, :censor_lower, :censor_upper,
+        :hurdle, :log_offsets, :user_provided_trials, :user_provided_weights,
+        :user_provided_censor_lower, :user_provided_censor_upper,
+        :user_provided_hurdle, :user_provided_log_offsets,
+        :fixed_effects_from_modules, :generated_model_code
+    ]
+    for k in keys_to_exclude
+        delete!(sub_config_kwargs, k)
+    end
     
     # Robustly handle the formula argument, which can be a String, Symbol, or Expr.
     sub_formula_str::String = if sub_formula_raw isa String
@@ -6990,9 +7882,79 @@ function process_nested_module!(opt_dict, mod_data, registries, hyperpriors)
     if !(sub_formula_str isa String)
         error("The `formula` argument for the nested module must resolve to a String. Got type: $(typeof(sub_formula_str))")
     end
+
+    # Validate observation count alignment or mapping
+    parent_N = size(opt_dict[:data], 1)
+    sub_N = size(sub_data, 1)
+
+    mapping_arg = get(params, :mapping, nothing)
+    mapping_indices = nothing
+    if !isnothing(mapping_arg)
+        if mapping_arg isa Symbol || mapping_arg isa AbstractString
+            col_sym = Symbol(mapping_arg)
+            if hasproperty(opt_dict[:data], col_sym)
+                mapping_indices = Vector{Int}(opt_dict[:data][!, col_sym])
+            elseif haskey(opt_dict, col_sym) && opt_dict[col_sym] isa AbstractVector{<:Integer}
+                mapping_indices = Vector{Int}(opt_dict[col_sym])
+            else
+                calling_mod = get(opt_dict, :calling_module, Main)
+                evaled_vec = try
+                    Core.eval(calling_mod, col_sym)
+                catch
+                    nothing
+                end
+                if evaled_vec isa AbstractVector{<:Integer}
+                    mapping_indices = Vector{Int}(evaled_vec)
+                else
+                    throw(ArgumentError(
+                        "Nested mapping identifier ':$col_sym' not found in parent model data, arguments, or calling scope."
+                    ))
+                end
+            end
+        elseif mapping_arg isa AbstractVector{<:Integer}
+            mapping_indices = Vector{Int}(mapping_arg)
+        else
+            throw(ArgumentError(
+                "Unsupported type for 'mapping' in nested module: $(typeof(mapping_arg)). " *
+                "Expected a Column Symbol or Vector{Int}."
+            ))
+        end
+        if length(mapping_indices) != parent_N
+            throw(DimensionMismatch(
+                "Nested mapping length ($(length(mapping_indices))) does not match parent " *
+                "observation count ($parent_N)."
+            ))
+        end
+        if any(idx -> idx < 1 || idx > sub_N, mapping_indices)
+            bad_idx = first(filter(idx -> idx < 1 || idx > sub_N, mapping_indices))
+            throw(BoundsError(1:sub_N, bad_idx))
+        end
+    elseif parent_N != sub_N
+        throw(ArgumentError(
+            "Observation count mismatch in nested module '$var': parent model has $parent_N " *
+            "observations, but nested data has $sub_N observations. " *
+            "When observation counts differ, specify an explicit mapping vector or column via " *
+            "nested(..., mapping=:map_col) or nested(..., mapping=index_vec)."
+        ))
+    end
     
     # Recursively call bstm_config to create a full configuration for the sub-model.
-    sub_config = bstm_config(sub_formula_str, sub_data; sub_config_kwargs...)
+    calling_mod = get(opt_dict, :calling_module, Main)
+    sub_config = bstm_config(
+        sub_formula_str, sub_data;
+        calling_module = calling_mod,
+        sub_config_kwargs...
+    )
+
+    coupling_prior = get(params, :prior, get(params, :coupling_prior, Normal(1.0, 0.5)))
+    fixed_coupling = get(params, :fixed, get(params, :fixed_coupling, false))
+    sub_config = merge(sub_config, (
+        coupling_prior = coupling_prior,
+        fixed_coupling = fixed_coupling
+    ))
+    if !isnothing(mapping_indices)
+        sub_config = merge(sub_config, (mapping = mapping_indices,))
+    end
     
     # Store the complete sub-model configuration.
     opt_dict[:nested_components][var] = sub_config
@@ -7048,20 +8010,6 @@ function process_random_module!(
             opt_dict[:s_idx] = s_idx
             opt_dict[:s_N] = length(unique(s_idx))
         end
-        
-        if !haskey(opt_dict, :W) && haskey(mod_data[:params], :W)
-            W_arg = mod_data[:params][:W]
-            if W_arg isa Symbol || W_arg isa Expr
-                calling_mod = get(opt_dict, :calling_module, Main)
-                try
-                    opt_dict[:W] = Core.eval(calling_mod, W_arg)
-                catch e
-                    error("Could not evaluate `W` argument `$(W_arg)` for component '$(mod_data[:key])'. Error: $e")
-                end
-            else
-                opt_dict[:W] = W_arg
-            end
-        end
 
     elseif structure == :temporal
         variables = mod_data[:variables]
@@ -7080,6 +8028,12 @@ function process_random_module!(
             opt_dict[:t_idx] = tu_meta.idx
             opt_dict[:t_N] = tu_meta.N_cat
             opt_dict[:t_idx_var] = t_var_sym
+            opt_dict[:t_values] = tu_meta.mids
+            opt_dict[Symbol("$(t_var_sym)_values")] = tu_meta.mids
+            if !haskey(opt_dict, :domain_values)
+                opt_dict[:domain_values] = Dict{Symbol, Any}()
+            end
+            opt_dict[:domain_values][t_var_sym] = tu_meta.mids
         end
 
     elseif structure == :spacetime
@@ -7094,6 +8048,10 @@ function process_random_module!(
             end
             opt_dict[:s_idx] = data[!, s_var_sym]
             opt_dict[:s_N] = length(unique(opt_dict[:s_idx]))
+            if !haskey(opt_dict, :domain_values)
+                opt_dict[:domain_values] = Dict{Symbol, Any}()
+            end
+            opt_dict[:domain_values][s_var_sym] = sort(unique(opt_dict[:s_idx]))
         end
 
         t_var_sym = Symbol(mod_data[:variables][2])
@@ -7106,10 +8064,53 @@ function process_random_module!(
             opt_dict[:t_idx] = tu_meta.idx
             opt_dict[:t_N] = tu_meta.N_cat
             opt_dict[:t_idx_var] = t_var_sym
+            opt_dict[:t_values] = tu_meta.mids
+            opt_dict[Symbol("$(t_var_sym)_values")] = tu_meta.mids
+            if !haskey(opt_dict, :domain_values)
+                opt_dict[:domain_values] = Dict{Symbol, Any}()
+            end
+            opt_dict[:domain_values][t_var_sym] = tu_meta.mids
         end
 
         if !haskey(opt_dict, :st_idx)
             opt_dict[:st_idx] = (opt_dict[:t_idx] .- 1) .* opt_dict[:s_N] .+ opt_dict[:s_idx]
+        end
+    end
+
+    calling_mod = get(opt_dict, :calling_module, Main)
+
+    # Register W from component params if present
+    if !haskey(opt_dict, :W) && haskey(mod_data[:params], :W)
+        W_arg = mod_data[:params][:W]
+        if W_arg isa Symbol || W_arg isa Expr
+            try
+                opt_dict[:W] = Core.eval(calling_mod, W_arg)
+            catch e
+                error("Could not evaluate `W` argument `$(W_arg)` for component '$(mod_data[:key])'. Error: $e")
+            end
+        else
+            opt_dict[:W] = W_arg
+        end
+    end
+
+    # Register Q from component params if present
+    if !haskey(opt_dict, :Q) && haskey(mod_data[:params], :Q)
+        Q_arg = mod_data[:params][:Q]
+        if Q_arg isa Symbol || Q_arg isa Expr
+            try
+                opt_dict[:Q] = Core.eval(calling_mod, Q_arg)
+            catch e
+                error("Could not evaluate `Q` argument `$(Q_arg)` for component '$(mod_data[:key])'. Error: $e")
+            end
+        else
+            opt_dict[:Q] = Q_arg
+        end
+    end
+
+    # Validate spatial dimension compatibility between data indices and W
+    if haskey(opt_dict, :s_N) && haskey(opt_dict, :W) && opt_dict[:W] isa AbstractMatrix
+        if opt_dict[:s_N] != size(opt_dict[:W], 1)
+            error("Number of unique spatial indices ($(opt_dict[:s_N])) in data does not match the dimension of adjacency matrix W ($(size(opt_dict[:W], 1))).")
         end
     end
 
@@ -7466,6 +8467,12 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
                 elseif has_structured_space && !has_structured_time
                     opt_dict[:model_st] = "III"
                 else opt_dict[:model_st] = "I"; end
+            else
+                throw(ArgumentError(
+                    "Invalid Kronecker product (⊗) interaction: components must specify one " *
+                    "spatial process and one temporal process (e.g., random(s, model=:bym2) ⊗ " *
+                    "random(t, model=:ar1)). Received components of types ($(c1_type), $(c2_type))."
+                ))
             end
             
             s_idx = get(opt_dict, :s_idx, nothing); t_idx = get(opt_dict, :t_idx,
@@ -7816,18 +8823,152 @@ end
 
 
 """
+    process_movement_module!(opt_dict, mod_data, registries, hyperpriors)
+
+Processes a `movement(...)` module call from the formula. Sets up the structural context
+for mark-recapture telemetry or advection-diffusion movement models, supporting both
+Option 2 (pure telemetry categorical model without dummy outcomes) and Option 3 (joint
+numerical density and movement model where density gradients construct dynamic HSI).
+"""
+function process_movement_module!(
+    opt_dict::Dict{Symbol, Any},
+    mod_data::Dict{Symbol, Any},
+    registries::Dict{Symbol, Any},
+    hyperpriors::Dict{Symbol, Any}
+)
+    data = opt_dict[:data]
+    calling_mod = get(opt_dict, :calling_module, Main)
+    params = mod_data[:params]
+
+    # Ensure model and structure are set
+    params[:model] = :movement
+    if !haskey(params, :structure)
+        params[:structure] = :spacetime
+    end
+
+    # Register W from component params if present
+    if !haskey(opt_dict, :W) && haskey(params, :W)
+        W_arg = params[:W]
+        if W_arg isa Symbol || W_arg isa Expr
+            try
+                opt_dict[:W] = Core.eval(calling_mod, W_arg)
+            catch e
+                error("Could not evaluate `W` argument `$(W_arg)` for component '$(mod_data[:key])'. Error: $e")
+            end
+        else
+            opt_dict[:W] = W_arg
+        end
+    end
+    if haskey(opt_dict, :W) && opt_dict[:W] isa AbstractMatrix
+        opt_dict[:s_N] = size(opt_dict[:W], 1)
+    end
+
+    # Detect Option 2 (pure telemetry):
+    # Identified by data having :recapture / :recaps or outcome family being categorical
+    lik_specs = get(opt_dict, :likelihood_specs, Dict{Symbol, Any}[])
+    is_telemetry = hasproperty(data, :recapture) ||
+                   hasproperty(data, :recaps) ||
+                   any(s -> string(get(s, :family, "")) in ["categorical", "categorical_movement"], lik_specs)
+
+    if is_telemetry
+        opt_dict[:is_pure_telemetry] = true
+        opt_dict[:add_intercept] = false
+
+        # If telemetry data is not explicitly passed as parameter, use data directly
+        if !haskey(params, :mark_recapture_data) && !haskey(params, :telemetry_data)
+            params[:mark_recapture_data] = data
+        end
+
+        # Establish s_idx and t_idx for pure telemetry data
+        if !haskey(opt_dict, :s_idx)
+            rel_val = get(params, :release, nothing)
+            if rel_val isa AbstractVector
+                opt_dict[:s_idx] = Int.(rel_val)
+            elseif rel_val isa Symbol || rel_val isa AbstractString
+                if hasproperty(data, Symbol(rel_val))
+                    opt_dict[:s_idx] = Int.(data[!, Symbol(rel_val)])
+                else
+                    opt_dict[:s_idx] = ones(Int, nrow(data))
+                end
+            elseif hasproperty(data, :release)
+                opt_dict[:s_idx] = Int.(data.release)
+            elseif hasproperty(data, :s_idx)
+                opt_dict[:s_idx] = Int.(data.s_idx)
+            else
+                opt_dict[:s_idx] = ones(Int, nrow(data))
+            end
+        end
+
+        if !haskey(opt_dict, :t_idx)
+            k_val = get(params, :k, nothing)
+            if k_val isa AbstractVector
+                opt_dict[:t_idx] = Int.(round.(k_val))
+                opt_dict[:t_N] = isempty(opt_dict[:t_idx]) ? 1 : maximum(opt_dict[:t_idx])
+            elseif k_val isa Symbol || k_val isa AbstractString
+                if hasproperty(data, Symbol(k_val))
+                    opt_dict[:t_idx] = Int.(round.(data[!, Symbol(k_val)]))
+                    opt_dict[:t_N] = isempty(opt_dict[:t_idx]) ? 1 : maximum(opt_dict[:t_idx])
+                else
+                    opt_dict[:t_idx] = ones(Int, nrow(data))
+                    opt_dict[:t_N] = 1
+                end
+            elseif hasproperty(data, :k)
+                opt_dict[:t_idx] = Int.(round.(data.k))
+                opt_dict[:t_N] = isempty(opt_dict[:t_idx]) ? 1 : maximum(opt_dict[:t_idx])
+            elseif hasproperty(data, :time)
+                opt_dict[:t_idx] = Int.(round.(data.time))
+                opt_dict[:t_N] = isempty(opt_dict[:t_idx]) ? 1 : maximum(opt_dict[:t_idx])
+            else
+                opt_dict[:t_idx] = ones(Int, nrow(data))
+                opt_dict[:t_N] = 1
+            end
+        end
+
+        if !haskey(opt_dict, :st_idx)
+            s_N_val = get(opt_dict, :s_N, 1)
+            opt_dict[:st_idx] = (opt_dict[:t_idx] .- 1) .* s_N_val .+ opt_dict[:s_idx]
+        end
+    end
+
+    # 3. Create the component object
+    component_obj = resolve_technical_primitive(
+        mod_data, NamedTuple(opt_dict), hyperpriors, opt_dict[:prior_scheme]
+    )
+    mod_data[:component_obj] = component_obj
+
+    # 4. Get precomputes
+    M_nt = NamedTuple(opt_dict)
+    precomputes = get_precomputes(component_obj, M_nt, mod_data)
+
+    # 5. Create the final specification object
+    spec = (
+        key=Symbol(mod_data[:key]),
+        structure=:spacetime,
+        var=join(string.(get(mod_data, :variables, ["movement"])), "_"),
+        component_obj=component_obj,
+        params=params,
+        hyper=precomputes
+    )
+
+    push!(registries[:components], spec)
+    return false
+end
+
+"""
     MODULE_PROCESSORS
 
 A constant dictionary that serves as the central dispatch table for processing modules
 parsed from the `bstm` formula. This registry maps a module's type (a `Symbol` like
 `:random` or `:mixed`) to its corresponding processor function.
-
 """ 
 const MODULE_PROCESSORS = Dict{Symbol, Function}(
     :random => process_random_module!,
+    :movement => process_movement_module!,
     :fixed => process_fixed_module!,
     :mixed => process_mixed_module!,
     :nested => process_nested_module!,
+    :transfer => process_nested_module!,
+    :fidelity => process_nested_module!,
     :eigen => process_eigen_module!,
     :dynamics => process_dynamics_module!,
     :interact => process_interact_module!,

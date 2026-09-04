@@ -97,7 +97,8 @@ function bstm_data(
     n_marks::Int = 100,
     area_method::Symbol = :cvt,
     use_effort::Bool = false,
-    use_removal::Bool = false
+    use_removal::Bool = false,
+    kwargs...
 )
     actual_seed = seed !== nothing ? seed : rndseed
     resolved_type = if type !== nothing
@@ -107,6 +108,7 @@ function bstm_data(
     else
         "scottish_lip"
     end
+
     type_str = lowercase(string(resolved_type))
 
     if type_str in ["hierarchical", "hierarchical_workflow", "marine_ecosystem", "multi_tier"]
@@ -136,35 +138,10 @@ function bstm_data(
             domain_size, n_units, n_years, n_marks; area_method=area_method, rng=rng
         )
     elseif type_str in ["movement"]
-        return generate_movement_data()
-
-    elseif type_str in ["scottish_lip", "scottish"]
-        cache_path = "data/scottish_lip_cancer_cache.jld2"
-
-        if isfile(cache_path) && !recreate
-            try
-                println("Loading cached dataset from: ", cache_path)
-                data_bundle = JLD2.load(cache_path)
-                p_out = data_bundle["primary"]
-                n_out = data_bundle["nested"]
-                if hasproperty(p_out.data, :y_gauss) &&
-                   hasproperty(p_out.data, :t_idx) &&
-                   maximum(p_out.data.cov1) <= 5.0
-                    return (p_out, n_out)
-                else
-                    println("Cached dataset missing consolidated covariates or unscaled " *
-                            "cov1; regenerating...")
-                end
-            catch e
-                println("Failed to load cache ($e); regenerating dataset...")
-            end
-        end
-
-        println("Generating new spatiotemporal dataset...")
-        Random.seed!(actual_seed)
-
-        n_districts = 56
-
+        return generate_movement_data(; seed=actual_seed, kwargs...)
+        
+    elseif type_str in ["scottish_lip_neighbours" ]
+ 
         neighbor_list = [
             [5, 9, 11, 19], [7, 10], [6, 12], [18, 20, 28], [1, 11, 12, 13, 19],
             [3, 8], [2, 10, 13, 16, 17], [6], [1, 11, 17, 19, 23, 29], [2, 7, 16, 22],
@@ -185,16 +162,54 @@ function bstm_data(
             [18, 20, 24, 27, 56], [18, 24, 30, 33, 45, 55]
         ]
 
+        n_districts = length(neighbor_list)
+
         W_raw = spzeros(Int, n_districts, n_districts)
         for i in 1:n_districts
             for nb in neighbor_list[i]
                 W_raw[i, nb] = 1
             end
         end
-        W = sparse(Symmetric(Matrix(W_raw + W_raw')) .> 0)
+        W = sparse(Symmetric(Matrix(W_raw + W_raw')) .> 0) 
 
-        au_primary = assign_spatial_units_inferred(W)
-        p_centroids = au_primary.centroids
+        return W
+
+    elseif type_str in ["scottish_lip_au" ]
+
+        cache_path = "data/scottish_lip_au_cache.jld2"
+
+        if isfile(cache_path) && !recreate
+            try
+                println("Loading cached dataset from: ", cache_path)
+                data_bundle = JLD2.load(cache_path)
+                au = data_bundle["au"]
+                return au
+            catch e
+                println("Failed to load cache ($e); regenerating dataset...")
+            end
+        end
+
+        W = bstm_data("scottish_lip_neighbours")
+
+        au = assign_spatial_units_inferred(W)
+
+        if !isdir("data")
+            mkdir("data")
+        end
+
+        JLD2.save(cache_path, "au", au )
+        println("Dataset successfully cached at: ", cache_path)
+
+        return au
+
+    elseif type_str in ["scottish_lip" ]
+ 
+        println("Generating new spatiotemporal dataset...")
+        Random.seed!(actual_seed)
+
+        W  = bstm_data("scottish_lip_neighbours")
+        au = bstm_data("scottish_lip_au")
+        p_centroids = au.centroids
 
         y_orig = [
             9, 39, 11, 9, 15, 8, 26, 7, 6, 20, 13, 5, 3, 8, 17, 9, 2, 7, 9, 7,
@@ -214,7 +229,8 @@ function bstm_data(
             0, 1, 16, 16, 0, 1, 7, 1, 1, 0, 1, 1, 0, 1, 1, 16, 10
         ]
 
-        data_primary = DataFrame()
+        n_districts = length(y_orig)
+        data_sl = DataFrame()
         for i in 1:n_districts
             log_off = log.(fill(E_orig[i], n_years))
             innov = cumsum(randn(n_years) .* 0.1)
@@ -229,76 +245,76 @@ function bstm_data(
                 cov1 = fill(Float64(x_orig[i]) / 10.0, n_years)
             )
             d_df.y_rate = d_df.y ./ exp.(d_df.log_offsets)
-            append!(data_primary, d_df)
+            append!(data_sl, d_df)
         end
 
-        n_total = nrow(data_primary)
+        n_total = nrow(data_sl)
 
-        data_primary.y_bin = [v > mean(data_primary.y_rate) ? 1 : 0 for v in data_primary.y_rate]
+        data_sl.y_bin = [v > mean(data_sl.y_rate) ? 1 : 0 for v in data_sl.y_rate]
 
-        data_primary.cov2 = 0.5 .* data_primary.cov1 .+ randn(n_total)
-        data_primary.cov3 = randn(n_total) .* (data_primary.y_rate .^ 2)
-        data_primary.cov4 = randn(n_total) .* log.(data_primary.y_rate .+ 1.0)
-        data_primary.cov5 = randn(n_total) .* exp.(data_primary.y_rate) .* 2.0
-        data_primary.cov6 = randn(n_total)
+        data_sl.cov2 = 0.5 .* data_sl.cov1 .+ randn(n_total)
+        data_sl.cov3 = randn(n_total) .* (data_sl.y_rate .^ 2)
+        data_sl.cov4 = randn(n_total) .* log.(data_sl.y_rate .+ 1.0)
+        data_sl.cov5 = randn(n_total) .* exp.(data_sl.y_rate) .* 2.0
+        data_sl.cov6 = randn(n_total)
 
-        data_primary.day = rand(1:365, n_total)
-        data_primary.month = Int.(round.(data_primary.day ./ 365 .* 12)) .+ 1
+        data_sl.day = rand(1:365, n_total)
+        data_sl.month = Int.(round.(data_sl.day ./ 365 .* 12)) .+ 1
 
-        data_primary.f1 = rand(["A", "B"], n_total)
-        data_primary.s_idx = data_primary.district
-        data_primary.s_x = [c[1] for c in p_centroids[data_primary.s_idx]]
-        data_primary.s_y = [c[2] for c in p_centroids[data_primary.s_idx]]
+        data_sl.f1 = rand(["A", "B"], n_total)
+        data_sl.s_idx = data_sl.district
+        data_sl.s_x = [c[1] for c in p_centroids[data_sl.s_idx]]
+        data_sl.s_y = [c[2] for c in p_centroids[data_sl.s_idx]]
 
         reg_indices = mod1.(1:n_total, 4)
         reg_levels = ["North", "South", "East", "West"]
         reg = reg_levels[reg_indices]
-        data_primary.region = categorical(reg)
+        data_sl.region = categorical(reg)
 
-        data_primary.group = categorical(data_primary.district)
-        data_primary.group_id = categorical(data_primary.district)
-        data_primary.group_var = categorical(data_primary.region)
+        data_sl.group = categorical(data_sl.district)
+        data_sl.group_id = categorical(data_sl.district)
+        data_sl.group_var = categorical(data_sl.region)
 
         # Comprehensive additional response types and covariates for component testing
-        data_primary.y_gauss = Float64.(data_primary.y_rate) .+ randn(n_total) .* 0.1
-        data_primary.y_pois = data_primary.y
-        data_primary.counts = data_primary.y
-        data_primary.cell_area = fill(1.0, n_total)
+        data_sl.y_gauss = Float64.(data_sl.y_rate) .+ randn(n_total) .* 0.1
+        data_sl.y_pois = data_sl.y
+        data_sl.counts = data_sl.y
+        data_sl.cell_area = fill(1.0, n_total)
 
-        data_primary.ordinal_y = [v == 0 ? 1 : (v < 5 ? 2 : 3) for v in data_primary.y]
+        data_sl.ordinal_y = [v == 0 ? 1 : (v < 5 ? 2 : 3) for v in data_sl.y]
 
-        eta_m = hcat(data_primary.cov1, data_primary.cov2, zeros(n_total))
+        eta_m = hcat(data_sl.cov1, data_sl.cov2, zeros(n_total))
         y_mult = zeros(Int, n_total, 3)
         for i in 1:n_total
             p = NNlib.softmax(eta_m[i, :])
             y_mult[i, :] = rand(Multinomial(20, p))
         end
-        data_primary.y_cat1 = y_mult[:, 1]
-        data_primary.y_cat2 = y_mult[:, 2]
-        data_primary.y_cat3 = y_mult[:, 3]
+        data_sl.y_cat1 = y_mult[:, 1]
+        data_sl.y_cat2 = y_mult[:, 2]
+        data_sl.y_cat3 = y_mult[:, 3]
 
-        data_primary.effort = rand(n_total) .* 0.5 .+ 0.1
-        data_primary.removal = rand(n_total) .* 2.0
-        data_primary.removal_total = data_primary.removal
-        data_primary.proxy_val = data_primary.y_gauss .+ randn(n_total) .* 0.3
-        data_primary.predator_pop = rand(n_total) .* 5.0 .+ 1.0
-        data_primary.recruitment = rand(n_total) .* 10.0 .+ 2.0
-        data_primary.habitat = rand(n_total)
-        data_primary.species_1 = rand(n_total) .* 10.0
-        data_primary.species_2 = rand(n_total) .* 10.0
-        data_primary.species_3 = rand(n_total) .* 10.0
-        data_primary.age_1 = rand(n_total) .* 10.0
-        data_primary.age_2 = rand(n_total) .* 10.0
-        data_primary.age_3 = rand(n_total) .* 10.0
-        data_primary.class_1 = rand(n_total) .* 10.0
-        data_primary.class_2 = rand(n_total) .* 10.0
-        data_primary.class_3 = rand(n_total) .* 10.0
-        data_primary.class_4 = rand(n_total) .* 10.0
+        data_sl.effort = rand(n_total) .* 0.5 .+ 0.1
+        data_sl.removal = rand(n_total) .* 2.0
+        data_sl.removal_total = data_sl.removal
+        data_sl.proxy_val = data_sl.y_gauss .+ randn(n_total) .* 0.3
+        data_sl.predator_pop = rand(n_total) .* 5.0 .+ 1.0
+        data_sl.recruitment = rand(n_total) .* 10.0 .+ 2.0
+        data_sl.habitat = rand(n_total)
+        data_sl.species_1 = rand(n_total) .* 10.0
+        data_sl.species_2 = rand(n_total) .* 10.0
+        data_sl.species_3 = rand(n_total) .* 10.0
+        data_sl.age_1 = rand(n_total) .* 10.0
+        data_sl.age_2 = rand(n_total) .* 10.0
+        data_sl.age_3 = rand(n_total) .* 10.0
+        data_sl.class_1 = rand(n_total) .* 10.0
+        data_sl.class_2 = rand(n_total) .* 10.0
+        data_sl.class_3 = rand(n_total) .* 10.0
+        data_sl.class_4 = rand(n_total) .* 10.0
 
-        au_primary = merge(au_primary, (
-            s_idx = data_primary.s_idx,
-            s_x = [c[1] for c in p_centroids[data_primary.s_idx]],
-            s_y = [c[2] for c in p_centroids[data_primary.s_idx]],
+        au = merge(au, (
+            s_idx = data_sl.s_idx,
+            s_x = [c[1] for c in p_centroids[data_sl.s_idx]],
+            s_y = [c[2] for c in p_centroids[data_sl.s_idx]],
             s_vals = collect(1:n_districts)
         ))
 
@@ -314,56 +330,78 @@ function bstm_data(
         ny_min, ny_max = y_min - s_buff * y_rng, y_max + s_buff * y_rng
 
         nt_max = Int(round(n_years * temporal_expansion))
+        
+        scottish_lip = (data=data_sl, au=au)
+ 
+        return scottish_lip
+
+    elseif type_str in ["nested" ]
+        # Generate a new "nested" dataset within the domain of the primary dataset
+        # using scottish lip cancer as a starting basis .. this is to allow nested() examples
+
+        println("Generating new spatiotemporal dataset...")
+        Random.seed!(actual_seed)
+
+        W  = bstm_data("scottish_lip_neighbours")
+        au = bstm_data("scottish_lip_au")
+        p_centroids = au.centroids
+
+        n_districts = size(W, 2)
+   
+        # "Nested" dataset construction ( within scottish lip data domain)
+        px = [c[1] for c in p_centroids]
+        py = [c[2] for c in p_centroids]
+        x_min, x_max = minimum(px), maximum(px)
+        y_min, y_max = minimum(py), maximum(py)
+        x_rng, y_rng = x_max - x_min, y_max - y_min
+
+        s_buff = (spatial_expansion - 1.0) / 2.0
+        nx_min, nx_max = x_min - s_buff * x_rng, x_max + s_buff * x_rng
+        ny_min, ny_max = y_min - s_buff * y_rng, y_max + s_buff * y_rng
+
+        nt_max = Int(round(n_years * temporal_expansion))
+
         n_obs_nested = Int(round(n_total * spatial_expansion * temporal_expansion))
 
         sx_nested = rand(Uniform(nx_min, nx_max), n_obs_nested)
         sy_nested = rand(Uniform(ny_min, ny_max), n_obs_nested)
         time_nested = rand(1:nt_max, n_obs_nested)
 
-        au_nested = assign_spatial_units(sx_nested, sy_nested; target_units=100)
+        au = assign_spatial_units(sx_nested, sy_nested; target_units=100)
 
-        data_nested = DataFrame(
+        slnested = DataFrame(
             s_x = sx_nested,
             s_y = sy_nested,
             year = time_nested,
             t_idx = time_nested,
-            district = au_nested.s_idx,
-            s_idx = au_nested.s_idx
+            district = au.s_idx,
+            s_idx = au.s_idx
         )
 
-        s_lat_n = cumsum(randn(length(au_nested.centroids))) .* 0.3
+        s_lat_n = cumsum(randn(length(au.centroids))) .* 0.3
         t_lat_n = sin.(collect(1:nt_max) .* (2π/nt_max))
 
         eta_n = [
-            1.5 + s_lat_n[data_nested.district[i]] + t_lat_n[data_nested.year[i]]
+            1.5 + s_lat_n[slnested.district[i]] + t_lat_n[slnested.year[i]]
             for i in 1:n_obs_nested
         ]
 
-        data_nested.y = [rand(Poisson(exp(v))) for v in eta_n]
-        data_nested.y_rate = exp.(eta_n) .+ randn(n_obs_nested) .* 0.2
-        data_nested.y_bin = [v > mean(data_nested.y_rate) ? 1 : 0 for v in data_nested.y_rate]
+        slnested.y = [rand(Poisson(exp(v))) for v in eta_n]
+        slnested.y_rate = exp.(eta_n) .+ randn(n_obs_nested) .* 0.2
+        slnested.y_bin = [v > mean(slnested.y_rate) ? 1 : 0 for v in slnested.y_rate]
 
-        data_nested.cov1 = 0.6 .* eta_n .+ randn(n_obs_nested)
-        data_nested.cov2 = randn(n_obs_nested) .* exp.(data_nested.y_rate)
-        data_nested.cov3 = randn(n_obs_nested)
-        data_nested.ncov1 = data_nested.cov1
-        data_nested.ncov2 = data_nested.cov2
-        data_nested.ncov3 = data_nested.cov3
-        data_nested.group = categorical(data_nested.district)
-        data_nested.group_id = categorical(data_nested.district)
-        data_nested.month = mod1.(data_nested.year, 12)
-        data_nested.day = rand(1:365, n_obs_nested)
-
-        primary_out = (data=data_primary, au=au_primary)
-        nested_out = (data=data_nested, au=au_nested)
-
-        if !isdir("data")
-            mkdir("data")
-        end
-        JLD2.save(cache_path, "primary", primary_out, "nested", nested_out)
-        println("Dataset successfully cached at: ", cache_path)
-
-        return (primary_out, nested_out)
+        slnested.cov1 = 0.6 .* eta_n .+ randn(n_obs_nested)
+        slnested.cov2 = randn(n_obs_nested) .* exp.(slnested.y_rate)
+        slnested.cov3 = randn(n_obs_nested)
+        slnested.ncov1 = slnested.cov1
+        slnested.ncov2 = slnested.cov2
+        slnested.ncov3 = slnested.cov3
+        slnested.group = categorical(slnested.district)
+        slnested.group_id = categorical(slnested.district)
+        slnested.month = mod1.(slnested.year, 12)
+        slnested.day = rand(1:365, n_obs_nested)
+ 
+        return ( data=slnested, au=au )
 
     elseif type_str == "ordinal"
         Random.seed!(actual_seed)
@@ -1062,20 +1100,54 @@ function _sample_categorical(p::AbstractVector{Float64}, rng::AbstractRNG)::Int
 end
 
 """
-    generate_movement_data(; kwargs...)
+    generate_movement_data(; radius_km=8.0, time_interval=:monthly, crs=nothing,
+                           datum=WGS84Latest, domain_km=60.0, n_tags=50, n_steps=3,
+                           center_lon=-60.0, center_lat=46.0, seed=42) -> NamedTuple
 
-Generates synthetic animal movement and telemetry datasets mapped over spatial meshes, 
-returning a structured `NamedTuple` containing telemetry records, spatial meshes, 
-transition kernels, habitat suitability indices, and derived release-recapture observations.
+Generates synthetic animal movement and mark-recapture telemetry datasets mapped over a
+planar hexagonal spatial mesh. Simulates individual movement trajectories via discrete
+Markov transitions across mesh units, assigns demographic attributes, and classifies
+individuals into canonical biological groups matching `snowcrab_movement_data`:
+- `"female"`: Mature females (`mat == "mature"`, `sex == "F"`)
+- `"male"`: Mature males (`mat == "mature"`, `sex == "M"`)
+- `"immature"`: Immature individuals (`mat == "immature"`)
+- `"unknown"`: Unclassified or missing demographic observations
+
+# Arguments
+- `radius_km::Real = 8.0`: Hexagonal cell circumradius in kilometers.
+- `time_interval::Symbol = :monthly`: Temporal step discretization interval
+  (`:monthly`, `:weekly`, `:biweekly`, `:daily`, or `:raw`).
+- `crs = nothing`: Coordinate reference system for spatial projections.
+- `datum = WGS84Latest`: Geographic geodetic datum.
+- `domain_km::Real = 60.0`: Spatial domain width and height in kilometers.
+- `n_tags::Int = 50`: Total number of tagged individuals simulated.
+- `n_steps::Int = 3`: Number of consecutive movement observation steps per individual.
+- `center_lon::Real = -60.0`: Geographic center longitude of the simulated domain.
+- `center_lat::Real = 46.0`: Geographic center latitude of the simulated domain.
+- `seed::Int = 42`: Random seed for reproducible spatial and demographic simulation.
+
+# Returns
+A `NamedTuple` with fields:
+- `tagging::DataFrame`: Raw synthetic telemetry event records with coordinates and units.
+- `mesh::NamedTuple`: Planar hexagonal mesh containing centroids, polygons, and `W`.
+- `W::SparseMatrixCSC`: Adjacency matrix of the spatial mesh.
+- `hsi_vec::Vector{Float64}`: Domain Habitat Suitability Index (HSI) vector.
+- `monthly_hsi::Matrix{Float64}`: Monthly dynamic HSI fields (empty if static).
+- `month_lookup::Dict`: Mapping from `(year, month)` to monthly HSI column index.
+- `years::Vector{Int}`: Observed survey years.
+- `obs::DataFrame`: Extracted consecutive mark-recapture event pairs with biological
+  group classifications (`:group` column with 1-based indices).
+- `survey_df::DataFrame`: Synthetic spatial survey density observations.
+- `group_lookup::Dict{String, Int}`: Dictionary mapping group names to integer IDs.
 """
 function generate_movement_data(;
-    radius_km     :: Real    = 5.0,
+    radius_km     :: Real    = 8.0,
     time_interval :: Symbol  = :monthly,
     crs                      = nothing,
     datum                    = WGS84Latest,
-    domain_km     :: Real    = 200.0,
-    n_tags        :: Int     = 100,
-    n_steps       :: Int     = 5,
+    domain_km     :: Real    = 60.0,
+    n_tags        :: Int     = 50,
+    n_steps       :: Int     = 3,
     center_lon    :: Real    = -60.0,
     center_lat    :: Real    = 46.0,
     seed          :: Int     = 42
@@ -1120,8 +1192,37 @@ function generate_movement_data(;
         end
     end
 
-    sexes = [rand(rng, ["M", "F"])            for _ in 1:n_tags]
-    mats  = [rand(rng, ["mature", "immature"]) for _ in 1:n_tags]
+    # Biological demographic simulation covering female, male, immature, and unknown
+    # Guarantee the 4 canonical groups appear in simulated tagging dataset
+    canonical_demographics = [
+        ("F", "mature"),        # -> female
+        ("M", "mature"),        # -> male
+        ("M", "immature"),      # -> immature
+        ("unknown", "unknown")  # -> unknown
+    ]
+    pool_demographics = [
+        ("F", "mature"),
+        ("M", "mature"),
+        ("M", "immature"),
+        ("F", "immature"),
+        ("unknown", "mature"),
+        ("unknown", "unknown")
+    ]
+    pool_weights = [0.35, 0.35, 0.12, 0.08, 0.05, 0.05]
+
+    sexes = Vector{String}(undef, n_tags)
+    mats  = Vector{String}(undef, n_tags)
+    for i in 1:n_tags
+        if i <= length(canonical_demographics)
+            sx, mt = canonical_demographics[i]
+        else
+            w_idx = _sample_categorical(pool_weights, rng)
+            sx, mt = pool_demographics[w_idx]
+        end
+        sexes[i] = sx
+        mats[i]  = mt
+    end
+
     t0_dt = Date(2020, 1, 1)
     
     total_records = n_tags * (n_steps + 1)
@@ -1177,7 +1278,17 @@ function generate_movement_data(;
     tagging = map_telemetry_to_units(tagging, mesh.centroids_km,
                   mesh.center_lon, mesh.center_lat; crs=crs, datum=datum)
     
-    hsi_vec      = fill(0.5, mesh.n_units)
+    # Generate realistic spatial bathymetry and habitat suitability gradient
+    depth_vec = [150.0 + 60.0 * sin(mesh.centroids_km[s][1] / 40.0) + 
+                 40.0 * cos(mesh.centroids_km[s][2] / 40.0) for s in 1:mesh.n_units]
+    temp_vec  = [3.0 + 1.5 * cos(mesh.centroids_km[s][1] / 50.0) for s in 1:mesh.n_units]
+    
+    # HSI peaks in optimal thermal/depth window
+    hsi_raw = [exp(-((depth_vec[s] - 170.0) / 45.0)^2 - ((temp_vec[s] - 2.5) / 1.5)^2) 
+               for s in 1:mesh.n_units]
+    hsi_min, hsi_max = extrema(hsi_raw)
+    hsi_vec = (hsi_raw .- hsi_min) ./ max(1e-6, hsi_max - hsi_min) .* 0.8 .+ 0.1
+
     monthly_hsi  = Matrix{Float64}(undef, 0, 0)
     month_lookup = Dict{Tuple{Int, Int}, Int}()
     years_vec    = Int[]
@@ -1196,22 +1307,32 @@ function generate_movement_data(;
     # Return empty DataFrame immediately if not enough rows to form a pair
     if n_rows < 2
         obs = DataFrame(tagid=String[], release=Int[], recapture=Int[], 
-                        k=Int[], sex=String[], mat=String[])
+                        k=Int[], sex=String[], mat=String[], group=Int[])
+        survey_df = DataFrame(s_idx=Int[], t_idx=Int[], density=Int[], depth=Float64[], temp=Float64[])
+        default_group_lookup = Dict{String, Int}(
+            "female"   => 1,
+            "immature" => 2,
+            "male"     => 3,
+            "unknown"  => 4
+        )
         return (
             tagging      = tagging,
             mesh         = mesh,
+            W            = mesh.W,
             hsi_vec      = hsi_vec,
             monthly_hsi  = monthly_hsi,
             month_lookup = month_lookup,
             years        = years_vec,
-            obs          = obs
+            obs          = obs,
+            survey_df    = survey_df,
+            group_lookup = default_group_lookup
         )
     end
 
     # 2. Extract columns to local vectors for type stability
-    tagids = sorted_df.tagid
-    times  = sorted_df.time
-    s_idxs = sorted_df.s_idx
+    tagids    = sorted_df.tagid
+    times     = sorted_df.time
+    s_idxs    = sorted_df.s_idx
     sexes_col = has_sex ? sorted_df.sex : nothing
     mats_col  = has_mat ? sorted_df.mat : nothing
 
@@ -1229,27 +1350,80 @@ function generate_movement_data(;
             Δt = times[i] - times[i-1]
             k  = max(1, round(Int, Δt / dt))
             
+            s_str = has_sex ? string(sexes_col[i-1]) : "unknown"
+            m_str = has_mat ? string(mats_col[i-1])  : "unknown"
+
             push!(pair_records, (
                 tagid     = string(tagids[i-1]),
                 release   = s_idxs[i-1],
                 recapture = s_idxs[i],
                 k         = k,
-                sex       = has_sex ? string(sexes_col[i-1]) : "unknown",
-                mat       = has_mat ? string(mats_col[i-1])  : "unknown"
+                sex       = s_str,
+                mat       = m_str
             ))
         end
     end
 
     obs = DataFrame(pair_records)
+
+    # 4. Assign 3-tier biological groupings matching snowcrab_movement_data()
+    n_obs = nrow(obs)
+    labels = Vector{String}(undef, n_obs)
+    
+    if n_obs > 0
+        obs_sexes = obs[!, :sex]
+        obs_mats  = obs[!, :mat]
+
+        @inbounds for i in 1:n_obs
+            sx = string(obs_sexes[i])
+            mt = string(obs_mats[i])
+
+            if mt == "immature" || mt == "imm"
+                labels[i] = "immature"
+            elseif (mt == "mature" || mt == "mat") && (sx == "M" || sx == "male")
+                labels[i] = "male"
+            elseif (mt == "mature" || mt == "mat") && (sx == "F" || sx == "female")
+                labels[i] = "female"
+            else
+                labels[i] = "unknown"
+            end
+        end
+    end
+    
+    unique_labels = sort!(unique(labels))
+    group_lookup  = Dict{String, Int}(lbl => i for (i, lbl) in enumerate(unique_labels))
+        
+    group_ids = Vector{Int}(undef, n_obs)
+    @inbounds for i in 1:n_obs
+        group_ids[i] = group_lookup[labels[i]]
+    end
+
+    obs[!, :group] = group_ids
+
+    # 5. Generate synthetic survey density observations for Option 3 joint modeling
+    mu_density = exp.(1.5 .+ 2.0 .* hsi_vec .- 0.005 .* (depth_vec .- 170.0))
+    density_counts = [rand(rng, NegativeBinomial(4.0, 4.0 / (4.0 + mu_density[s]))) 
+                      for s in 1:mesh.n_units]
+    survey_df = DataFrame(
+        s_idx   = collect(1:mesh.n_units),
+        t_idx   = ones(Int, mesh.n_units),
+        density = density_counts,
+        depth   = depth_vec,
+        temp    = temp_vec
+    )
   
     return (
         tagging      = tagging,
         mesh         = mesh,
+        W            = mesh.W,
         hsi_vec      = hsi_vec,
         monthly_hsi  = monthly_hsi,
         month_lookup = month_lookup,
         years        = years_vec,
-        obs          = obs
+        obs          = obs,
+        survey_df    = survey_df,
+        depth_vec    = depth_vec,
+        group_lookup = group_lookup
     )
 end
 
@@ -1563,3 +1737,631 @@ function generate_mock_hierarchical_datasets(;
         individuals        = df_individuals
     )
 end
+
+
+# =============================================================================
+# SECTION: OPEN BATHYMETRY & HYDRODYNAMIC DATA INGESTION
+# =============================================================================
+
+"""
+    load_open_bathymetry(;
+        source = :synthetic,
+        bbox = (-68.0, -57.0, 42.0, 48.0),
+        grid_resolution = (60, 50),
+        seed = 42,
+        crs = nothing
+    ) -> NamedTuple
+
+Ingest or synthesize high-resolution open-sourced bathymetry data for coastal
+shelf environments (e.g., Scotian Shelf, Cabot Strait, and Gulf of St. Lawrence).
+
+# Mathematical & Physical Foundation
+Seafloor elevation ``z_{\\text{bottom}}(\\mathbf{s})`` satisfies:
+```math
+z_{\\text{bottom}}(\\mathbf{s}) \\le 0, \\quad H(\\mathbf{s}) = -z_{\\text{bottom}}(\\mathbf{s})
+```
+where ``H(\\mathbf{s})`` is the water-column depth in meters.
+Topographic slope is evaluated as:
+```math
+\\text{Slope}(\\mathbf{s}) = \\arctan\\left( \\sqrt{ \\left(\\frac{\\partial z}{\\partial x}\\right)^2 + \\left(\\frac{\\partial z}{\\partial y}\\right)^2 } \\right)
+```
+
+# Arguments
+- `source`: Bathymetric data source. Supported options:
+  - `:synthetic` (default): Realistic regional shelf synthesis featuring coastal
+    shallows (0–40 m), offshore banks (30–70 m), basins (150–250 m), submarine
+    canyons (e.g. The Gully), shelf break (200 m), and continental slope (up to 2500 m).
+  - `filepath::AbstractString`: Path to a local `.nc`, `.tif`, `.csv`, `.duckdb`, or `.jld2` file.
+- `bbox::Tuple{Real, Real, Real, Real}`: Geographic bounding box `(min_lon, max_lon, min_lat, max_lat)`.
+- `grid_resolution::Tuple{Int, Int}`: Regular grid dimensions `(nx, ny)`. Default: `(60, 50)`.
+- `seed::Int`: Random seed for synthetic bathymetric perturbations.
+- `crs`: Optional coordinate reference system identifier.
+
+# Returns
+A `NamedTuple` containing:
+- `lons::Vector{Float64}`: 1D vector of grid longitudes (length `nx`).
+- `lats::Vector{Float64}`: 1D vector of grid latitudes (length `ny`).
+- `depth::Matrix{Float64}`: 2D matrix of water column depths in meters (positive down, size `nx × ny`).
+- `elevation::Matrix{Float64}`: 2D matrix of seafloor elevation in meters (negative below sea level, size `nx × ny`).
+- `slope::Matrix{Float64}`: 2D matrix of topographic seabed slope in degrees.
+- `is_land::BitMatrix`: Boolean mask indicating terrestrial units (`elevation >= 0.0`).
+- `centroids::Vector{Tuple{Float64, Float64}}`: Centroids for each marine cell.
+- `polygons::Vector{Vector{Tuple{Float64, Float64}}}`: Closed bounding polygon vertex rings for each cell.
+- `depth_vec::Vector{Float64}`: 1D vector of marine unit depths matching `centroids`.
+- `bbox::Tuple{Float64, Float64, Float64, Float64}`: Bounding box.
+"""
+function load_open_bathymetry(;
+    source::Union{Symbol, AbstractString} = :synthetic,
+    bbox::Union{Nothing, Tuple{<:Real, <:Real, <:Real, <:Real}} = nothing,
+    lon_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    lat_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    grid_resolution::Union{Nothing, Tuple{Int, Int}} = nothing,
+    resolution_deg::Union{Nothing, Real} = nothing,
+    seed::Int = 42,
+    crs = nothing
+)::NamedTuple
+    actual_bbox = if bbox !== nothing
+        Float64.(bbox)
+    elseif lon_range !== nothing && lat_range !== nothing
+        (Float64(lon_range[1]), Float64(lon_range[2]), Float64(lat_range[1]), Float64(lat_range[2]))
+    else
+        (-68.0, -57.0, 42.0, 48.0)
+    end
+    min_lon, max_lon, min_lat, max_lat = actual_bbox
+
+    actual_res = if grid_resolution !== nothing
+        grid_resolution
+    elseif resolution_deg !== nothing
+        nx_calc = max(4, round(Int, (max_lon - min_lon) / Float64(resolution_deg)))
+        ny_calc = max(4, round(Int, (max_lat - min_lat) / Float64(resolution_deg)))
+        (nx_calc, ny_calc)
+    else
+        (60, 50)
+    end
+    nx, ny = actual_res
+
+    @assert nx >= 4 && ny >= 4 "Grid resolution must be at least (4, 4)"
+    @assert min_lon < max_lon "Bounding box min_lon must be less than max_lon"
+    @assert min_lat < max_lat "Bounding box min_lat must be less than max_lat"
+
+    lons = collect(range(min_lon, max_lon, length=nx))
+    lats = collect(range(min_lat, max_lat, length=ny))
+    dx = (max_lon - min_lon) / max(1, nx - 1)
+    dy = (max_lat - min_lat) / max(1, ny - 1)
+
+    elev = zeros(Float64, nx, ny)
+    loaded_from_file = false
+
+    # Check for file-based ingestion
+    if source isa AbstractString && isfile(source)
+        ext = lowercase(splitext(source)[2])
+        try
+            if ext == ".csv"
+                df = CSV.read(source, DataFrame)
+                lon_col = filter(c -> occursin("lon", lowercase(string(c))), names(df))
+                lat_col = filter(c -> occursin("lat", lowercase(string(c))), names(df))
+                z_col   = filter(c -> occursin("elev", lowercase(string(c))) ||
+                                      occursin("depth", lowercase(string(c))) ||
+                                      occursin("z", lowercase(string(c))), names(df))
+                if !isempty(lon_col) && !isempty(lat_col) && !isempty(z_col)
+                    pts = [Float64.([df[i, first(lon_col)], df[i, first(lat_col)]]) for i in 1:nrow(df)]
+                    tree = KDTree(hcat(pts...))
+                    is_depth = occursin("depth", lowercase(string(first(z_col))))
+                    for j in 1:ny, i in 1:nx
+                        idx, _ = knn(tree, [lons[i], lats[j]], 1)
+                        val = Float64(df[first(idx), first(z_col)])
+                        elev[i, j] = is_depth ? -abs(val) : val
+                    end
+                    loaded_from_file = true
+                end
+            elseif ext == ".jld2"
+                d = JLD2.load(source)
+                key = haskey(d, "elevation") ? "elevation" : (haskey(d, "bathymetry") ? "bathymetry" : nothing)
+                if key !== nothing
+                    raw_elev = d[key]
+                    if size(raw_elev) == (nx, ny)
+                        elev .= Float64.(raw_elev)
+                        loaded_from_file = true
+                    end
+                end
+            end
+        catch err
+            @warn "Failed to parse open bathymetry file '$(source)': $(err). Falling back to synthetic shelf model."
+        end
+    end
+
+    if !loaded_from_file
+        # Realistic continental shelf synthetic bathymetry
+        rng = MersenneTwister(seed)
+        for j in 1:ny
+            y_norm = (lats[j] - min_lat) / (max_lat - min_lat)
+            for i in 1:nx
+                x_norm = (lons[i] - min_lon) / (max_lon - min_lon)
+
+                # Distance from shelf-edge line (roughly southwest to northeast)
+                # Shelf edge runs from (0.0, 0.35) to (1.0, 0.70)
+                shelf_edge_y = 0.35 + 0.35 * x_norm
+                dist_to_slope = y_norm - shelf_edge_y
+
+                base_elev = if dist_to_slope < -0.05
+                    # Continental Slope and Abyss (deep ocean)
+                    slope_t = clamp((-dist_to_slope - 0.05) / 0.35, 0.0, 1.0)
+                    -200.0 - 2200.0 * (slope_t ^ 1.8)
+                else
+                    # Continental Shelf Platform: depth typically 50m to 220m
+                    shelf_t = clamp(dist_to_slope / 0.6, 0.0, 1.0)
+                    # Outer shelf banks (shallow offshore features)
+                    bank_signal = 55.0 * sin(3.0 * π * x_norm) * cos(2.5 * π * y_norm)
+                    # Central shelf basins / troughs
+                    basin_signal = -80.0 * exp(-((x_norm - 0.5)^2 + (y_norm - 0.55)^2) / 0.04)
+                    # Coastal shallowing
+                    coastal_rise = 110.0 * (shelf_t ^ 1.2)
+                    -170.0 + bank_signal + basin_signal + coastal_rise
+                end
+
+                # Submarine Canyon cut (e.g., The Gully at x ≈ 0.65)
+                canyon_dist = abs(x_norm - 0.65)
+                if canyon_dist < 0.08 && dist_to_slope < 0.15
+                    canyon_depth = 450.0 * (1.0 - canyon_dist / 0.08) * max(0.0, 0.15 - dist_to_slope) / 0.15
+                    base_elev -= canyon_depth
+                end
+
+                # Micro-topographic soundings roughness
+                roughness = 4.0 * (rand(rng) - 0.5)
+                elev[i, j] = min(5.0, base_elev + roughness)
+            end
+        end
+    end
+
+    # Water column depth: H = max(0.0, -elevation)
+    depth = zeros(Float64, nx, ny)
+    is_land = falses(nx, ny)
+    for j in 1:ny, i in 1:nx
+        if elev[i, j] >= 0.0
+            is_land[i, j] = true
+            depth[i, j] = 0.0
+        else
+            depth[i, j] = -elev[i, j]
+        end
+    end
+
+    # Calculate topographic slope: arctan(sqrt(dz_dx^2 + dz_dy^2))
+    slope = zeros(Float64, nx, ny)
+    for j in 1:ny
+        lat_rad = deg2rad(lats[j])
+        dx_m = dx * 111320.0 * cos(lat_rad)
+        dy_m = dy * 110540.0
+        for i in 1:nx
+            dz_dx = if i == 1
+                (elev[2, j] - elev[1, j]) / dx_m
+            elseif i == nx
+                (elev[nx, j] - elev[nx - 1, j]) / dx_m
+            else
+                (elev[i + 1, j] - elev[i - 1, j]) / (2.0 * dx_m)
+            end
+
+            dz_dy = if j == 1
+                (elev[i, 2] - elev[i, 1]) / dy_m
+            elseif j == ny
+                (elev[i, ny] - elev[i, ny - 1]) / dy_m
+            else
+                (elev[i, j + 1] - elev[i, j - 1]) / (2.0 * dy_m)
+            end
+
+            grad_mag = sqrt(dz_dx^2 + dz_dy^2)
+            slope[i, j] = rad2deg(atan(grad_mag))
+        end
+    end
+
+    # Build regular grid polygon cells for seamless LibGEOS geometric resharding
+    centroids = Tuple{Float64, Float64}[]
+    polygons = Vector{Vector{Tuple{Float64, Float64}}}()
+    depth_vec = Float64[]
+
+    half_dx = dx / 2.0
+    half_dy = dy / 2.0
+
+    for j in 1:ny, i in 1:nx
+        cx = lons[i]
+        cy = lats[j]
+        # Closed counter-clockwise rectangular bounding box
+        poly = [
+            (cx - half_dx, cy - half_dy),
+            (cx + half_dx, cy - half_dy),
+            (cx + half_dx, cy + half_dy),
+            (cx - half_dx, cy + half_dy),
+            (cx - half_dx, cy - half_dy)
+        ]
+        push!(centroids, (cx, cy))
+        push!(polygons, poly)
+        push!(depth_vec, depth[i, j])
+    end
+
+    au = (
+        centroids = centroids,
+        centroids_lonlat = centroids,
+        polygons = polygons,
+        polygons_lonlat = polygons
+    )
+
+    return (
+        lons = lons,
+        lats = lats,
+        grid_lon = [c[1] for c in centroids],
+        grid_lat = [c[2] for c in centroids],
+        depth = depth,
+        depths = depth_vec,
+        depth_vec = depth_vec,
+        elevation = elev,
+        slope = slope,
+        slopes = vec(slope),
+        is_land = is_land,
+        centroids = centroids,
+        polygons = polygons,
+        au = au,
+        bbox = actual_bbox,
+        crs = crs
+    )
+end
+
+"""
+    extract_hydrodynamic_dataset(
+        hydro_input::Any = nothing;
+        bathymetry_data::Union{Nothing, NamedTuple} = nothing,
+        bbox::Tuple{<:Real, <:Real, <:Real, <:Real} = (-68.0, -57.0, 42.0, 48.0),
+        grid_resolution::Tuple{Int, Int} = (60, 50),
+        depths::AbstractVector{<:Real} = [-2.5, -25.0, -50.0, -100.0, -150.0, -250.0],
+        depth::Union{Nothing, Real} = nothing,
+        depth_level::Union{Nothing, Int} = nothing,
+        time_seconds::Union{Nothing, Real} = nothing,
+        time_index::Union{Nothing, Int} = nothing
+    ) -> NamedTuple
+
+Extract, compute, and format 3D/4D ocean hydrodynamic fields at specific depths and times.
+
+# Physical Formulations
+- **Potential Density** (UNESCO Linear Equation of State):
+  ```math
+  \\rho(T, S) = \\rho_0 \\left[ 1 - \\alpha (T - T_0) + \\beta (S - S_0) \\right]
+  ```
+  with ``\\rho_0 = 1025.0\\text{ kg/m}^3``, ``\\alpha = 2.0 \\times 10^{-4}\\text{ K}^{-1}``,
+  ``\\beta = 7.6 \\times 10^{-4}\\text{ PSU}^{-1}``.
+- **Salinity Stratification & Brunt-Väisälä Frequency**:
+  ```math
+  N^2 = -\\frac{g}{\\rho_0} \\frac{\\partial \\rho}{\\partial z} \\approx g \\left( \\alpha \\frac{\\partial T}{\\partial z} - \\beta \\frac{\\partial S}{\\partial z} \\right)
+  ```
+- **Turbulent Eddy Diffusivity & Viscosity**:
+  ```math
+  \\kappa_v(z) = \\kappa_{\\text{surf}} e^{z / h_{\\text{mix}}} + \\frac{\\kappa_{\\text{bkg}}}{1 + 10 Ri} + \\kappa_{\\text{bbl}} e^{-(H + z) / h_{\\text{bbl}}}
+  ```
+  where ``Ri = N^2 / [(\\partial u / \\partial z)^2 + (\\partial v / \\partial z)^2]``.
+
+# Arguments
+- `hydro_input`: Ocean circulation model instance, NamedTuple, Dict, or `nothing`.
+- `bathymetry_data`: Optional bathymetric dataset from `load_open_bathymetry`.
+- `bbox`: Geographic spatial domain `(min_lon, max_lon, min_lat, max_lat)`.
+- `grid_resolution`: Grid dimensions `(nx, ny)`.
+- `depths`: Vertical depth coordinate levels (m, negative below surface).
+- `depth`: Target continuous depth for 2D slice extraction.
+- `depth_level`: Target vertical level index (1 = surface).
+- `time_seconds`: Simulation time in seconds.
+- `time_index`: Snapshot time index.
+
+# Returns
+A `NamedTuple` containing:
+- `lons`, `lats`, `depths`: Coordinate axes.
+- `temperature`, `salinity`, `density`: 3D scalar fields (`nx × ny × nz`).
+- `stratification_N2`, `salinity_gradient`: 3D stratification diagnostics (`nx × ny × nz`).
+- `u`, `v`, `w`, `speed`: 3D velocity fields (`nx × ny × nz`).
+- `diffusivity_v`, `viscosity_v`: 3D turbulent mixing fields (`nx × ny × nz`).
+- `elevation`: 2D sea surface height (m).
+- `bathymetry`: 2D seafloor elevation (m).
+- `slice_2d`: NamedTuple containing 2D horizontal slices of all fields at the requested `depth`.
+- `centroids`, `polygons`: Areal unit representation for LibGEOS resharding.
+"""
+function extract_hydrodynamic_dataset(
+    hydro_input::Any = nothing;
+    bathymetry_data::Union{Nothing, NamedTuple} = nothing,
+    bbox::Tuple{<:Real, <:Real, <:Real, <:Real} = (-68.0, -57.0, 42.0, 48.0),
+    grid_resolution::Tuple{Int, Int} = (60, 50),
+    depths::AbstractVector{<:Real} = [-2.5, -25.0, -50.0, -100.0, -150.0, -250.0],
+    depth_levels::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    depth::Union{Nothing, Real} = nothing,
+    depth_level::Union{Nothing, Int} = nothing,
+    time_seconds::Union{Nothing, Real} = nothing,
+    times::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    time_index::Union{Nothing, Int} = nothing
+)::NamedTuple
+    # Auto-detect if bathymetry NamedTuple was supplied as first positional argument
+    if hydro_input isa NamedTuple && (hasproperty(hydro_input, :elevation) || hasproperty(hydro_input, :depth)) && !hasproperty(hydro_input, :temperature)
+        bathymetry_data = hydro_input
+        hydro_input = nothing
+    end
+
+    bathy = if bathymetry_data !== nothing
+        bathymetry_data
+    else
+        load_open_bathymetry(source=:synthetic, bbox=bbox, grid_resolution=grid_resolution)
+    end
+
+    lons = bathy.lons
+    lats = bathy.lats
+    nx = length(lons)
+    ny = length(lats)
+
+    actual_depths = if depth_levels !== nothing
+        collect(Float64, depth_levels)
+    else
+        collect(Float64, depths)
+    end
+    nz = length(actual_depths)
+    z_levels = [z > 0.0 ? -z : z for z in actual_depths]
+
+    # Resolve target depth index
+    active_k = 1
+    if depth !== nothing
+        target_z = depth > 0.0 ? -Float64(depth) : Float64(depth)
+        _, active_k = findmin(abs.(z_levels .- target_z))
+    elseif depth_level !== nothing
+        active_k = clamp(depth_level, 1, nz)
+    end
+    resolved_depth_m = z_levels[active_k]
+
+    # Initialize 3D field arrays (nx × ny × nz)
+    T_mat = zeros(Float64, nx, ny, nz)
+    S_mat = zeros(Float64, nx, ny, nz)
+    u_mat = zeros(Float64, nx, ny, nz)
+    v_mat = zeros(Float64, nx, ny, nz)
+    w_mat = zeros(Float64, nx, ny, nz)
+    diff_v = zeros(Float64, nx, ny, nz)
+    visc_v = zeros(Float64, nx, ny, nz)
+
+    t_sec = time_seconds !== nothing ? Float64(time_seconds) :
+            (time_index !== nothing ? Float64(time_index * 3600.0) : 0.0)
+
+    # 1. Ingest from external model or NamedTuple if provided
+    if hydro_input isa NamedTuple || hydro_input isa AbstractDict
+        get_f(k_list, def) = begin
+            for k in k_list
+                if hydro_input isa NamedTuple && hasproperty(hydro_input, k)
+                    return getproperty(hydro_input, k)
+                elseif hydro_input isa AbstractDict && (haskey(hydro_input, k) || haskey(hydro_input, string(k)))
+                    return haskey(hydro_input, k) ? hydro_input[k] : hydro_input[string(k)]
+                end
+            end
+            return def
+        end
+        raw_u = get_f((:u, :u_velocity), nothing)
+        raw_v = get_f((:v, :v_velocity), nothing)
+        raw_t = get_f((:temperature, :T, :temp), nothing)
+        raw_s = get_f((:salinity, :S, :sal), nothing)
+
+        if raw_u !== nothing && size(raw_u, 1) == nx && size(raw_u, 2) == ny
+            u_mat .= ndims(raw_u) == 2 ? repeat(raw_u, 1, 1, nz) : raw_u[:, :, 1:min(nz, size(raw_u, 3))]
+        end
+        if raw_v !== nothing && size(raw_v, 1) == nx && size(raw_v, 2) == ny
+            v_mat .= ndims(raw_v) == 2 ? repeat(raw_v, 1, 1, nz) : raw_v[:, :, 1:min(nz, size(raw_v, 3))]
+        end
+        if raw_t !== nothing && size(raw_t, 1) == nx && size(raw_t, 2) == ny
+            T_mat .= ndims(raw_t) == 2 ? repeat(raw_t, 1, 1, nz) : raw_t[:, :, 1:min(nz, size(raw_t, 3))]
+        end
+        if raw_s !== nothing && size(raw_s, 1) == nx && size(raw_s, 2) == ny
+            S_mat .= ndims(raw_s) == 2 ? repeat(raw_s, 1, 1, nz) : raw_s[:, :, 1:min(nz, size(raw_s, 3))]
+        end
+    else
+        # 2. Physics-based synthetic regional shelf circulation
+        min_lon, max_lon, min_lat, max_lat = bathy.bbox
+        for j in 1:ny
+            y_norm = (lats[j] - min_lat) / (max_lat - min_lat)
+            for i in 1:nx
+                x_norm = (lons[i] - min_lon) / (max_lon - min_lon)
+                h_bed = bathy.depth[i, j]
+
+                # Tidal and seasonal modulation
+                t_phase = 2.0 * π * (t_sec / 44714.0)
+                u_tide = 0.08 * sin(t_phase + 2.0 * x_norm)
+                v_tide = 0.06 * cos(t_phase + 1.5 * y_norm)
+
+                for k in 1:nz
+                    z = z_levels[k]
+
+                    # If level is below seabed, mask as NaN
+                    if abs(z) > h_bed
+                        T_mat[i, j, k] = NaN
+                        S_mat[i, j, k] = NaN
+                        u_mat[i, j, k] = NaN
+                        v_mat[i, j, k] = NaN
+                        w_mat[i, j, k] = NaN
+                        diff_v[i, j, k] = NaN
+                        visc_v[i, j, k] = NaN
+                        continue
+                    end
+
+                    # Temperature (°C): Surface warm, CIL minimum at -50m, slope warm
+                    t_surface = 15.5 - 3.2 * y_norm + 1.5 * x_norm
+                    t_cil = 2.0 + 0.9 * sin(π * x_norm)
+                    t_slope = 7.8 + 1.2 * (1.0 - y_norm)
+
+                    t_val = if z > -20.0
+                        t_surface + (z / 20.0) * (t_surface - 6.0)
+                    elseif z > -75.0
+                        t_cil + ((z + 50.0) / 35.0)^2 * 2.8
+                    else
+                        t_cil + ((abs(z) - 75.0) / 100.0) * (t_slope - t_cil)
+                    end
+                    T_mat[i, j, k] = clamp(t_val, 0.2, 19.0)
+
+                    # Salinity (PSU): Fresher coastal runoff to saline deep slope
+                    s_val = 31.2 + 1.9 * (1.0 - y_norm) + 1.3 * x_norm + (abs(z) / 150.0) * 1.4
+                    S_mat[i, j, k] = clamp(s_val, 29.8, 35.8)
+
+                    # Advection: Southwestward Nova Scotia Current along coastal shelf
+                    z_atten = exp(z / 80.0)
+                    u_mean = (-0.18 - 0.12 * y_norm) * z_atten
+                    v_mean = (-0.10 - 0.08 * (1.0 - x_norm)) * z_atten
+
+                    u_mat[i, j, k] = u_mean + u_tide * (1.0 + z / 200.0)
+                    v_mat[i, j, k] = v_mean + v_tide * (1.0 + z / 200.0)
+
+                    # Vertical velocity w (m/s): Upwelling along shelf break
+                    w_up = 0.0004 * sin(2.0 * π * x_norm) * cos(π * y_norm) * (z / max(1.0, h_bed))
+                    w_mat[i, j, k] = w_up
+                end
+            end
+        end
+    end
+
+    # Physical Density and Stratification Computation
+    # UNESCO Linear Equation of State
+    rho0 = 1025.0
+    alpha_t = 2.0e-4
+    beta_s = 7.6e-4
+    T0 = 10.0
+    S0 = 35.0
+    g = 9.80665
+
+    rho_mat = zeros(Float64, nx, ny, nz)
+    strat_N2 = zeros(Float64, nx, ny, nz)
+    sal_grad = zeros(Float64, nx, ny, nz)
+
+    for k in 1:nz, j in 1:ny, i in 1:nx
+        t = T_mat[i, j, k]
+        s = S_mat[i, j, k]
+        if !isnan(t) && !isnan(s)
+            rho_mat[i, j, k] = rho0 * (1.0 - alpha_t * (t - T0) + beta_s * (s - S0))
+        else
+            rho_mat[i, j, k] = NaN
+        end
+    end
+
+    # Vertical gradients
+    for j in 1:ny, i in 1:nx
+        for k in 1:nz
+            if isnan(rho_mat[i, j, k])
+                strat_N2[i, j, k] = NaN
+                sal_grad[i, j, k] = NaN
+                diff_v[i, j, k] = NaN
+                visc_v[i, j, k] = NaN
+                continue
+            end
+
+            d_rho_dz = if k == 1 && nz > 1
+                (rho_mat[i, j, 1] - rho_mat[i, j, 2]) / (z_levels[1] - z_levels[2])
+            elseif k == nz && nz > 1
+                (rho_mat[i, j, nz - 1] - rho_mat[i, j, nz]) / (z_levels[nz - 1] - z_levels[nz])
+            elseif nz >= 3
+                (rho_mat[i, j, k - 1] - rho_mat[i, j, k + 1]) / (z_levels[k - 1] - z_levels[k + 1])
+            else
+                0.0
+            end
+
+            ds_dz = if k == 1 && nz > 1
+                (S_mat[i, j, 1] - S_mat[i, j, 2]) / (z_levels[1] - z_levels[2])
+            elseif k == nz && nz > 1
+                (S_mat[i, j, nz - 1] - S_mat[i, j, nz]) / (z_levels[nz - 1] - z_levels[nz])
+            elseif nz >= 3
+                (S_mat[i, j, k - 1] - S_mat[i, j, k + 1]) / (z_levels[k - 1] - z_levels[k + 1])
+            else
+                0.0
+            end
+
+            sal_grad[i, j, k] = ds_dz
+            n2_val = -(g / rho0) * d_rho_dz
+            strat_N2[i, j, k] = max(1e-7, n2_val)
+
+            # Turbulent Eddy Diffusivity & Viscosity
+            du_dz = (nz > 1 && k < nz) ? (u_mat[i, j, k] - u_mat[i, j, k+1]) / (z_levels[k] - z_levels[k+1]) : 0.005
+            dv_dz = (nz > 1 && k < nz) ? (v_mat[i, j, k] - v_mat[i, j, k+1]) / (z_levels[k] - z_levels[k+1]) : 0.005
+            shear2 = max(1e-6, du_dz^2 + dv_dz^2)
+            ri = clamp(strat_N2[i, j, k] / shear2, 0.05, 50.0)
+
+            z = z_levels[k]
+            h_bed = bathy.depth[i, j]
+            k_surf = 1.2e-2 * exp(z / 15.0)
+            k_pyc  = 1.5e-4 / (1.0 + 8.0 * ri)
+            dist_to_bed = max(0.5, h_bed + z)
+            k_bbl  = 2.5e-3 * exp(-dist_to_bed / 12.0)
+
+            diff_v[i, j, k] = clamp(k_surf + k_pyc + k_bbl, 1e-5, 0.05)
+            visc_v[i, j, k] = diff_v[i, j, k] * (1.0 + 0.5 * ri)
+        end
+    end
+
+    spd_mat = hypot.(u_mat, v_mat)
+
+    n_cells = nx * ny
+    T_2d = reshape(T_mat, n_cells, nz)
+    S_2d = reshape(S_mat, n_cells, nz)
+    rho_2d = reshape(rho_mat, n_cells, nz)
+    strat_N2_2d = reshape(strat_N2, n_cells, nz)
+    sal_grad_2d = reshape(sal_grad, n_cells, nz)
+    u_2d = reshape(u_mat, n_cells, nz)
+    v_2d = reshape(v_mat, n_cells, nz)
+    w_2d = reshape(w_mat, n_cells, nz)
+    diff_v_2d = reshape(diff_v, n_cells, nz)
+    visc_v_2d = reshape(visc_v, n_cells, nz)
+    spd_2d = reshape(spd_mat, n_cells, nz)
+
+    # Habitat suitability gradient tied to depth and water column temperature
+    d_vec = bathy.depth_vec
+    t_surf = T_2d[:, 1]
+    hsi_raw = exp.(-((d_vec .- 175.0) ./ 60.0).^2 - ((t_surf .- 3.0) ./ 2.5).^2)
+    valid_hsi = filter(!isnan, hsi_raw)
+    hsi_min, hsi_max = isempty(valid_hsi) ? (0.0, 1.0) : extrema(valid_hsi)
+    hsi_vec = (hsi_raw .- hsi_min) ./ max(1e-6, hsi_max - hsi_min) .* 0.85 .+ 0.1
+
+    # Extract active 2D horizontal slice at resolved_depth_m
+    slice_2d = (
+        depth_m = resolved_depth_m,
+        depth_level = active_k,
+        temperature = T_mat[:, :, active_k],
+        salinity = S_mat[:, :, active_k],
+        density = rho_mat[:, :, active_k],
+        stratification = strat_N2[:, :, active_k],
+        salinity_gradient = sal_grad[:, :, active_k],
+        u = u_mat[:, :, active_k],
+        v = v_mat[:, :, active_k],
+        w = w_mat[:, :, active_k],
+        speed = spd_mat[:, :, active_k],
+        diffusivity = diff_v[:, :, active_k],
+        viscosity = visc_v[:, :, active_k]
+    )
+
+    return (
+        lons = lons,
+        lats = lats,
+        depths = abs.(actual_depths),
+        depth_levels = abs.(actual_depths),
+        temperature = T_2d,
+        temperature_3d = T_mat,
+        salinity = S_2d,
+        salinity_3d = S_mat,
+        density = rho_2d,
+        rho = rho_2d,
+        density_3d = rho_mat,
+        stratification_N2 = strat_N2_2d,
+        N2 = strat_N2_2d,
+        stratification_3d = strat_N2,
+        salinity_gradient = sal_grad_2d,
+        u = u_2d,
+        advection_u = u_2d,
+        v = v_2d,
+        advection_v = v_2d,
+        w = w_2d,
+        speed = spd_2d,
+        diffusivity_v = diff_v_2d,
+        kappa_v = diff_v_2d,
+        viscosity_v = visc_v_2d,
+        nu_v = visc_v_2d,
+        hsi = hsi_vec,
+        elevation = zeros(Float64, n_cells),
+        bathymetry = bathy.elevation,
+        depth_vec = bathy.depth_vec,
+        depths_vec = bathy.depth_vec,
+        slice_2d = slice_2d,
+        centroids = bathy.centroids,
+        polygons = bathy.polygons,
+        bbox = bathy.bbox
+    )
+end
+

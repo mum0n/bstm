@@ -300,7 +300,7 @@ Fit a spatial disease model, persist geometries to DuckDB, and export an RFC 794
 using bstm, DataFrames, Random
 
 # 1. Fit BYM2 model on Scottish Lip Cancer data
-data_scot, _ = bstm_data()
+data_scot = bstm_data()
 df = data_scot.data
 au = data_scot.au
 

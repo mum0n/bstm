@@ -11,8 +11,11 @@
 #   julia --project=. tests/runtests.jl derivatives      # Run surface derivatives & BPI
 #   julia --project=. tests/runtests.jl eiv              # Run Errors-in-Variables tests
 #   julia --project=. tests/runtests.jl pipeline         # Run DAG pipeline orchestrator
+#   julia --project=. tests/runtests.jl par              # Run PAR / PAF engine tests
 #   julia --project=. tests/runtests.jl models           # Run model MCMC inference tests
+#   julia --project=. tests/runtests.jl multinomial      # Run multinomial & categorical models
 #   julia --project=. tests/runtests.jl persistence      # Run DuckDB & JLD2 persistence
+#   julia --project=. tests/runtests.jl nested           # Run nested multi-fidelity tests
 #
 # Standalone execution:
 #   julia --project=. tests/test_core_formula.jl
@@ -22,8 +25,11 @@
 #   julia --project=. tests/test_derivatives.jl
 #   julia --project=. tests/test_eiv.jl
 #   julia --project=. tests/test_pipeline.jl
+#   julia --project=. tests/test_par.jl
 #   julia --project=. tests/test_models.jl
+#   julia --project=. tests/test_multinomial.jl
 #   julia --project=. tests/test_data_persistence_plots.jl
+#   julia --project=. tests/test_nested.jl
 # ==============================================================================
 
 include(joinpath(@__DIR__, "test_helpers.jl"))
@@ -57,21 +63,35 @@ const AVAILABLE_SEGMENTS = Dict{Symbol, @NamedTuple{file::String, desc::String}}
         file = "test_pipeline.jl",
         desc = "Modular DAG Pipeline Orchestrator & Cross-Mesh Resharding"
     ),
+    :par => (
+        file = "test_par.jl",
+        desc = "Population Attributable Risk (PAR / PAF) Engine"
+    ),
     :models => (
         file = "test_models.jl",
         desc = "Model Instantiation, Smoke Tests & Complex Inference"
     ),
+    :multinomial => (
+        file = "test_multinomial.jl",
+        desc = "Multinomial, Categorical & Dirichlet Formulations"
+    ),
     :persistence => (
         file = "test_data_persistence_plots.jl",
         desc = "DuckDB Analytics, JLD2 Bundles, GeoJSON & Plot Validation"
+    ),
+    :nested => (
+        file = "test_nested.jl",
+        desc = "Nested Multi-Fidelity Models & Sub-Model Linkage Architecture"
     )
 )
 
 const ALIAS_MAP = Dict{String, Vector{Symbol}}(
-    "all"          => [:core, :likelihoods, :partitioning, :components, :derivatives, :eiv, :pipeline, :models, :persistence],
-    "full"         => [:core, :likelihoods, :partitioning, :components, :derivatives, :eiv, :pipeline, :models, :persistence],
-    "fast"         => [:core, :likelihoods, :partitioning, :eiv, :pipeline],
-    "quick"        => [:core, :likelihoods, :partitioning, :eiv, :pipeline],
+    "all"          => [:core, :likelihoods, :partitioning, :components, :derivatives,
+                       :eiv, :pipeline, :par, :models, :multinomial, :persistence, :nested],
+    "full"         => [:core, :likelihoods, :partitioning, :components, :derivatives,
+                       :eiv, :pipeline, :par, :models, :multinomial, :persistence, :nested],
+    "fast"         => [:core, :likelihoods, :partitioning, :eiv, :pipeline, :par],
+    "quick"        => [:core, :likelihoods, :partitioning, :eiv, :pipeline, :par],
     "core"         => [:core],
     "formula"      => [:core],
     "registry"     => [:core],
@@ -98,16 +118,26 @@ const ALIAS_MAP = Dict{String, Vector{Symbol}}(
     "orchestrator" => [:pipeline],
     "dag"          => [:pipeline],
     "resharding"   => [:pipeline],
+    "par"          => [:par],
+    "paf"          => [:par],
+    "attributable" => [:par],
     "models"       => [:models],
     "model"        => [:models],
     "instantiation"=> [:models],
     "gibbs"        => [:models],
     "smoke"        => [:models],
+    "multinomial"  => [:multinomial],
+    "categorical"  => [:multinomial],
+    "dirichlet"    => [:multinomial],
     "persistence"  => [:persistence],
     "data"         => [:persistence],
     "plots"        => [:persistence],
     "duckdb"       => [:persistence],
-    "geojson"      => [:persistence]
+    "geojson"      => [:persistence],
+    "nested"       => [:nested],
+    "transfer"     => [:nested],
+    "submodel"     => [:nested],
+    "multifidelity"=> [:nested]
 )
 
 """
@@ -117,7 +147,8 @@ Parses CLI test segment arguments, resolving aliases and fast-test shortcuts.
 """
 function parse_requested_segments(args::Vector{String})::Vector{Symbol}
     if isempty(args)
-        return [:core, :likelihoods, :partitioning, :components, :derivatives, :eiv, :pipeline, :models, :persistence]
+        return [:core, :likelihoods, :partitioning, :components, :derivatives,
+                :eiv, :pipeline, :par, :models, :multinomial, :persistence, :nested]
     end
 
     selected = Symbol[]
@@ -131,7 +162,7 @@ function parse_requested_segments(args::Vector{String})::Vector{Symbol}
         end
     end
 
-    return isempty(selected) ? [:core, :likelihoods, :partitioning, :eiv, :pipeline] : unique(selected)
+    return isempty(selected) ? [:core, :likelihoods, :partitioning, :eiv, :pipeline, :par] : unique(selected)
 end
 
 requested_segments = parse_requested_segments(ARGS)

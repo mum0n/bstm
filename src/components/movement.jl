@@ -55,7 +55,7 @@ The `mark_recapture_data` can be provided in two formats:
 - **Optional**:
   - `habitat`: A covariate influencing diffusion.
   - `mark_recapture_data`: A `DataFrame` or `Matrix` with telemetry data.
-  - `method`: `:explicit` or `:implicit`.
+  - `method`: `categorical`, `:explicit`,  `:implicit`.
   - `velocity`: Prior for the advection velocity.
   - `diffusion`: Prior for the diffusion rate.
   - `sigma`: Prior for the process noise standard deviation.
@@ -83,12 +83,14 @@ end
 
 COMPONENT_TYPE_REGISTRY[:movement] = Movement
 COMPONENT_CONSTRUCTORS[:movement] = (p, params) -> Movement(
-    p.velocity, p.diffusion, p.sigma,
-    get(p, :gamma, Normal(1.0, 1.0)),
-    get(p, :r, nothing),
-    get(p, :K, nothing),
-    get(p, :beta_het, nothing),
-    get(p, :method, :explicit)
+    get(p, :velocity, get(params, :velocity, truncated(Normal(0.2, 0.2), 0.0, 0.95))),
+    get(p, :diffusion, get(params, :diffusion, truncated(Normal(0.1, 0.2), 0.0, Inf))),
+    get(p, :sigma, get(params, :sigma, Exponential(1.0))),
+    get(p, :gamma, get(params, :gamma, Normal(1.0, 1.0))),
+    get(p, :r, get(params, :r, nothing)),
+    get(p, :K, get(params, :K, nothing)),
+    get(p, :beta_het, get(params, :beta_het, nothing)),
+    Symbol(get(params, :method, :explicit))
 )
 MODEL_TO_STRUCTURE_MAP[:movement] = :spacetime
 
@@ -114,14 +116,184 @@ function _raster_to_graph(raster::AbstractMatrix)
     return W
 end
 
+"""
+    TelemetryData <: AbstractMatrix{Float64}
+
+Structured container for mark-recapture telemetry observation events. Supports categorical
+group-stratified transition modeling while maintaining matrix indexing compatibility.
+
+# Fields
+- `releases`: Vector of unit indices at initial detection / release (1-indexed).
+- `recaps`: Vector of unit indices at subsequent detection / recapture (1-indexed).
+- `ks`: Elapsed discrete time intervals between consecutive detections.
+- `groups`: Biological stratum / group identifiers (1-indexed integers).
+- `covariates`: Individual-level continuous covariates.
+- `G`: Total count of distinct biological strata / groups.
+- `max_k`: Maximum observed elapsed transition step count.
+- `matrix`: `Matrix{Float64}` representation of size `(N, 4)`.
+"""
+struct TelemetryData <: AbstractMatrix{Float64}
+    releases::Vector{Int}
+    recaps::Vector{Int}
+    ks::Vector{Int}
+    groups::Vector{Int}
+    covariates::Vector{Float64}
+    G::Int
+    max_k::Int
+    matrix::Matrix{Float64}
+end
+
+Base.size(td::TelemetryData) = size(td.matrix)
+Base.size(td::TelemetryData, d::Int) = size(td.matrix, d)
+Base.getindex(td::TelemetryData, i::Int, j::Int) = td.matrix[i, j]
+Base.getindex(td::TelemetryData, i::Int) = td.matrix[i]
+Base.IndexStyle(::Type{TelemetryData}) = IndexLinear()
+
+"""
+    _process_telemetry_data(telemetry_input; mark_recapture_G=nothing)
+
+Transforms input telemetry data (DataFrame or Matrix) into a validated `TelemetryData`
+structure for movement modeling. Supports both longitudinal event sequences and
+pre-aggregated transition event pairs.
+"""
+function _process_telemetry_data(telemetry_input; mark_recapture_G=nothing)
+    if telemetry_input isa TelemetryData
+        return telemetry_input
+    elseif telemetry_input isa AbstractMatrix
+        mat = Matrix{Float64}(telemetry_input)
+        n_rows = size(mat, 1)
+        rel = n_rows > 0 ? Int.(mat[:, 1]) : Int[]
+        rec = n_rows > 0 && size(mat, 2) >= 2 ? Int.(mat[:, 2]) : Int[]
+        ks  = n_rows > 0 && size(mat, 2) >= 3 ? Int.(mat[:, 3]) : Int[]
+        cov = n_rows > 0 && size(mat, 2) >= 4 ? mat[:, 4] : zeros(Float64, n_rows)
+        grp = if size(mat, 2) >= 5
+            Int.(mat[:, 5])
+        elseif !isnothing(mark_recapture_G) && mark_recapture_G > 1 &&
+               all(c -> isinteger(c) && c >= 1, cov)
+            Int.(cov)
+        else
+            ones(Int, n_rows)
+        end
+        G_val = isnothing(mark_recapture_G) ? (isempty(grp) ? 1 : maximum(grp)) :
+            Int(mark_recapture_G)
+        max_k_val = isempty(ks) ? 1 : maximum(ks)
+        return TelemetryData(rel, rec, ks, grp, cov, G_val, max_k_val, mat)
+
+    elseif telemetry_input isa DataFrame
+        df = telemetry_input
+        # Case A: Already aggregated event pairs with release and recapture
+        has_rel = hasproperty(df, :release) || hasproperty(df, :releases)
+        has_rec = hasproperty(df, :recapture) || hasproperty(df, :recaps)
+
+        if has_rel && has_rec
+            rel_col = hasproperty(df, :release) ? :release : :releases
+            rec_col = hasproperty(df, :recapture) ? :recapture : :recaps
+            k_col = hasproperty(df, :k) ? :k : (hasproperty(df, :ks) ? :ks : nothing)
+            grp_col = hasproperty(df, :group) ? :group :
+                (hasproperty(df, :groups) ? :groups : nothing)
+            cov_col = hasproperty(df, :covariate) ? :covariate :
+                (hasproperty(df, :individual_covariate) ? :individual_covariate : nothing)
+
+            rel = Int.(df[!, rel_col])
+            rec = Int.(df[!, rec_col])
+            ks  = !isnothing(k_col) ? Int.(df[!, k_col]) : ones(Int, nrow(df))
+            grp = !isnothing(grp_col) ? Int.(df[!, grp_col]) : ones(Int, nrow(df))
+            cov = !isnothing(cov_col) ? Float64.(df[!, cov_col]) : zeros(Float64, nrow(df))
+            G_val = isnothing(mark_recapture_G) ? (isempty(grp) ? 1 : maximum(grp)) :
+                Int(mark_recapture_G)
+            max_k_val = isempty(ks) ? 1 : maximum(ks)
+            mat = hcat(Float64.(rel), Float64.(rec), Float64.(ks), cov)
+            return TelemetryData(rel, rec, ks, grp, cov, G_val, max_k_val, mat)
+        end
+
+        # Case B: Longitudinal telemetry observations
+        time_col = if hasproperty(df, :time)
+            :time
+        elseif hasproperty(df, :timestamp)
+            :timestamp
+        else
+            nothing
+        end
+
+        if isnothing(time_col) || !hasproperty(df, :tagid) || !hasproperty(df, :s_idx)
+            error("Telemetry DataFrame must contain either event pairs (:release, :recapture) " *
+                  "or longitudinal observations (:tagid, :s_idx, :time).")
+        end
+
+        releases = Int[]
+        recaps = Int[]
+        ks = Int[]
+        groups = Int[]
+        covariates = Float64[]
+
+        tag_col = hasproperty(df, :tag) ? :tag : nothing
+        grp_col = hasproperty(df, :group) ? :group :
+            (hasproperty(df, :groups) ? :groups : nothing)
+        cov_col = hasproperty(df, :individual_covariate) ? :individual_covariate :
+            (hasproperty(df, :covariate) ? :covariate : nothing)
+
+        gdf = groupby(df, :tagid)
+        for sub_df in gdf
+            if nrow(sub_df) < 2
+                continue
+            end
+            sub_sorted = if !isnothing(tag_col)
+                sort(sub_df, [order(tag_col), order(time_col)])
+            else
+                sort(sub_df, [order(time_col)])
+            end
+
+            for i in 1:(nrow(sub_sorted) - 1)
+                row_rel = sub_sorted[i, :]
+                row_rec = sub_sorted[i+1, :]
+                push!(releases, Int(row_rel.s_idx))
+                push!(recaps, Int(row_rec.s_idx))
+                t_rel = Float64(getproperty(row_rel, time_col))
+                t_rec = Float64(getproperty(row_rec, time_col))
+                push!(ks, max(1, round(Int, t_rec - t_rel)))
+                grp_val = !isnothing(grp_col) ? Int(getproperty(row_rel, grp_col)) : 1
+                push!(groups, grp_val)
+                cov_val = !isnothing(cov_col) ? Float64(getproperty(row_rel, cov_col)) : 0.0
+                push!(covariates, cov_val)
+            end
+        end
+
+        n_events = length(releases)
+        mat = if n_events > 0
+            hcat(Float64.(releases), Float64.(recaps), Float64.(ks), covariates)
+        else
+            Matrix{Float64}(undef, 0, 4)
+        end
+        G_val = isnothing(mark_recapture_G) ? (isempty(groups) ? 1 : maximum(groups)) :
+            Int(mark_recapture_G)
+        max_k_val = isempty(ks) ? 1 : maximum(ks)
+        return TelemetryData(releases, recaps, ks, groups, covariates, G_val, max_k_val, mat)
+    else
+        error("Unsupported format for mark_recapture_data: $(typeof(telemetry_input)). " *
+              "Expected DataFrame or Matrix.")
+    end
+end
+
 function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
     params = mod_data[:params]
     data = M.data
     variables = mod_data[:variables]
+    calling_mod = get(M, :calling_module, Main)
 
-    W_from_params = get(params, :W, nothing)
-    W_from_main = get(M, :W, nothing)
-    W = isnothing(W_from_params) ? W_from_main : W_from_params
+    W = if hasproperty(M, :W) && M.W isa AbstractMatrix
+        M.W
+    elseif haskey(params, :W) && params[:W] isa AbstractMatrix
+        params[:W]
+    elseif haskey(params, :W)
+        W_expr = params[:W]
+        try
+            Core.eval(calling_mod, W_expr)
+        catch e
+            error("Could not evaluate adjacency matrix `W` from `$(W_expr)`. Error: $e")
+        end
+    else
+        nothing
+    end
 
     if isnothing(W)
         if haskey(params, :habitat_raster)
@@ -136,11 +308,32 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
     end
 
     s_N = size(W, 1)
+    if hasproperty(M, :s_N) && M.s_N != s_N
+        error("Number of spatial units in data ($(M.s_N)) does not match adjacency matrix W dimension ($(s_N)).")
+    end
     t_N = hasproperty(M, :t_N) ? M.t_N : (hasproperty(M, :t_idx) ? length(unique(M.t_idx)) : 1)
 
     habitat_data = nothing
-    if haskey(params, :habitat)
+    if hasproperty(M, :habitat) && M.habitat isa AbstractVector
+        habitat_val = M.habitat
+    elseif haskey(params, :habitat)
         habitat_val = params[:habitat]
+        if habitat_val isa Symbol || habitat_val isa Expr
+            if habitat_val isa Symbol && hasproperty(data, habitat_val)
+                # Column in data, will be aggregated below
+            else
+                try
+                    habitat_val = Core.eval(calling_mod, habitat_val)
+                catch e
+                    # Fallback to column lookup error below if not found
+                end
+            end
+        end
+    else
+        habitat_val = nothing
+    end
+
+    if !isnothing(habitat_val)
         if habitat_val isa Symbol
             if !hasproperty(data, habitat_val)
                 error("Habitat variable ':$habitat_val' not found in data.")
@@ -149,7 +342,8 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
             habitat_aggregated = zeros(Float64, s_N)
             counts = zeros(Int, s_N)
             y_N_val = hasproperty(M, :y_N) ? M.y_N : nrow(data)
-            s_idx_vec = hasproperty(M, :s_idx) ? M.s_idx : (hasproperty(data, :s_idx) ? data.s_idx : Int[])
+            s_idx_vec = hasproperty(M, :s_idx) ? M.s_idx :
+                (hasproperty(data, :s_idx) ? data.s_idx : Int[])
             for i in 1:min(y_N_val, length(s_idx_vec))
                 s_i = s_idx_vec[i]
                 if 1 <= s_i <= s_N
@@ -167,35 +361,110 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
             error("The `habitat` parameter must be a Symbol (column name) or a Vector of length s_N.")
         end
     end
-    
-    if haskey(params, :mark_recapture_data)
-        telemetry_input = params[:mark_recapture_data]
-        
-        # Process dataframe into groups, releases, recaps, ks
-        processed_tel = _process_telemetry_data(telemetry_input) # You will need to update this helper to return your required vectors
-        
-        precomputes[:mark_recapture_data] = processed_tel
-        
-        # Precompute structural matrices for the categorical method
-        W_sym = Array(max.(W, W'))
-        deg = vec(sum(W_sym, dims=2))
-        precomputes[:L_dense] = Matrix{Float64}(Diagonal(deg) - W_sym)
-        precomputes[:adj_rows] = [W.rowval[W.colptr[i]:W.colptr[i+1]-1] for i in 1:s_N]
-        precomputes[:max_k] = maximum(processed_tel.ks) # Assuming processed_tel holds ks
+
+    precomputes = Dict{Symbol, Any}(
+        :n_latent => s_N * t_N,
+        :s_N => s_N,
+        :t_N => t_N
+    )
+    if isnothing(habitat_data)
+        habitat_data = zeros(Float64, s_N)
+    end
+    land_mask = if hasproperty(M, :land_mask) && M.land_mask isa AbstractVector{Bool}
+        M.land_mask
+    elseif haskey(params, :land_mask) && params[:land_mask] isa AbstractVector{Bool}
+        params[:land_mask]
+    else
+        nothing
     end
 
-    
-    L_template = build_structure_template(:besag, s_N; W=W).matrix
-    
+    if !isnothing(land_mask)
+        if length(land_mask) != s_N
+            throw(DimensionMismatch("land_mask length ($(length(land_mask))) must match s_N ($s_N)."))
+        end
+        habitat_data[land_mask] .= 0.0
+        precomputes[:land_mask] = land_mask
+    end
+
+    W_sp = sparse(W)
+    if !isnothing(land_mask)
+        W_sp = copy(W_sp)
+        for l in findall(land_mask)
+            W_sp[l, :] .= 0
+            W_sp[:, l] .= 0
+        end
+        dropzeros!(W_sp)
+    end
+
+    W_sym = Array(max.(W_sp, W_sp'))
+    deg = vec(sum(W_sym, dims=2))
+    precomputes[:L_dense] = Matrix{Float64}(Diagonal(deg) - W_sym)
+    precomputes[:adj_rows] = [W_sp.rowval[W_sp.colptr[i]:W_sp.colptr[i+1]-1] for i in 1:s_N]
+
+    # Precompute topological random walk matrix T_diff (row-stochastic)
+    T_diff = zeros(Float64, s_N, s_N)
+    for i in 1:s_N
+        if !isnothing(land_mask) && land_mask[i]
+            T_diff[i, i] = 1.0
+            continue
+        end
+        col_start = W_sp.colptr[i]
+        col_end   = W_sp.colptr[i+1] - 1
+        deg_i = col_end - col_start + 1
+        if deg_i > 0 && col_start <= col_end
+            inv_deg = 1.0 / deg_i
+            for ptr in col_start:col_end
+                j = W_sp.rowval[ptr]
+                if isnothing(land_mask) || !land_mask[j]
+                    T_diff[i, j] = inv_deg
+                end
+            end
+        else
+            T_diff[i, i] = 1.0
+        end
+    end
+    precomputes[:T_diff] = T_diff
+
+    tel_key = haskey(params, :telemetry_data) ? :telemetry_data : 
+              (haskey(params, :mark_recapture_data) ? :mark_recapture_data : nothing)
+    if !isnothing(tel_key)
+        telemetry_input = params[tel_key]
+        if telemetry_input isa Symbol || telemetry_input isa Expr
+            try
+                telemetry_input = Core.eval(calling_mod, telemetry_input)
+            catch e
+                error("Could not evaluate `$(tel_key)` argument `$(telemetry_input)`. Error: $e")
+            end
+        end
+
+        G_hint = get(params, :mark_recapture_G, get(params, :G, nothing))
+        if G_hint isa Symbol || G_hint isa Expr
+            try
+                G_hint = Core.eval(calling_mod, G_hint)
+            catch e
+                # Fallback to auto-detection from data
+            end
+        end
+
+        processed_tel = _process_telemetry_data(telemetry_input; mark_recapture_G=G_hint)
+        precomputes[:mark_recapture_data] = processed_tel
+        precomputes[:max_k] = processed_tel.max_k
+    else
+        precomputes[:max_k] = 1
+    end
+
+    L_template = build_structure_template(:besag, s_N; W=W_sp).matrix
+    precomputes[:L_template] = L_template
+
     rel_type = get(params, :relationship, get(params, :habitat_relationship, :exponential))
     local A_template
-    if !isnothing(habitat_data)
+    if any(!iszero, habitat_data)
         # Directed advection operator derived from Habitat Suitability Index (HSI) gradient
         W_dir = spzeros(Float64, s_N, s_N)
-        rows = rowvals(W)
-        vals = nonzeros(W)
+        rows = rowvals(W_sp)
+        vals = nonzeros(W_sp)
         for i in 1:s_N
-            for j_idx in nzrange(W, i)
+            for j_idx in nzrange(W_sp, i)
                 j = rows[j_idx]
                 if i != j
                     diff_h = habitat_data[j] - habitat_data[i]
@@ -215,83 +484,15 @@ function get_precomputes(m::Movement, M::NamedTuple, mod_data::Dict)::NamedTuple
         D_inv = spdiagm(0 => [od > 1e-12 ? 1.0 / od : 0.0 for od in out_degree])
         A_template = D_inv * W_dir
     else
-        W_dir = tril(W, -1)
+        W_dir = tril(W_sp, -1)
         out_degree = sum(W_dir, dims=2)[:]
         D_inv = spdiagm(0 => 1.0 ./ (out_degree .+ 1e-9))
         A_template = D_inv * W_dir
     end
-
-    precomputes = Dict{Symbol, Any}(
-        :L_template => L_template,
-        :A_template => A_template,
-        :n_latent => s_N * t_N,
-        :s_N => s_N,
-        :t_N => t_N
-    )
-    if !isnothing(habitat_data)
-        precomputes[:habitat_data] = habitat_data
-    end
-    
-    if haskey(params, :mark_recapture_data)
-        telemetry_input = params[:mark_recapture_data]
-        if telemetry_input isa DataFrame
-            precomputes[:mark_recapture_data] = _process_telemetry_data(telemetry_input)
-        else
-            precomputes[:mark_recapture_data] = telemetry_input
-        end
-    end
+    precomputes[:A_template] = A_template
+    precomputes[:habitat_data] = habitat_data
 
     return NamedTuple(precomputes)
-end
-
-function _process_telemetry_data(telemetry_df::DataFrame)
-    time_col = if hasproperty(telemetry_df, :time)
-        :time
-    elseif hasproperty(telemetry_df, :timestamp)
-        :timestamp
-    else
-        nothing
-    end
-
-    if isnothing(time_col) || !hasproperty(telemetry_df, :tagid) ||
-       !hasproperty(telemetry_df, :s_idx) || !hasproperty(telemetry_df, :tag)
-        error("Telemetry DataFrame must contain columns: :tagid, :s_idx, (:time or :timestamp), :tag.")
-    end
-
-    transitions = []
-    gdf = groupby(telemetry_df, :tagid)
-
-    for sub_df in gdf
-        if nrow(sub_df) < 2
-            continue
-        end
-        
-        # Sort observations for each individual by tag and time
-        sort!(sub_df, [order(:tag), order(time_col)])
-
-        for i in 1:(nrow(sub_df) - 1)
-            release_row = sub_df[i, :]
-            recapture_row = sub_df[i+1, :]
-
-            release_unit = release_row.s_idx
-            recapture_unit = recapture_row.s_idx
-            t_rel = Float64(getproperty(release_row, time_col))
-            t_rec = Float64(getproperty(recapture_row, time_col))
-            time_steps = max(1, round(Int, t_rec - t_rel))
-            
-            # Use individual covariate if present, otherwise default to 0
-            covariate = hasproperty(sub_df,
-                :individual_covariate) ? Float64(release_row.individual_covariate) : 0.0
-
-            push!(transitions, [release_unit, recapture_unit, time_steps, covariate])
-        end
-    end
-
-    if isempty(transitions)
-        return Matrix{Float64}(undef, 0, 4)
-    end
-
-    return reduce(hcat, transitions)'
 end
 
 function get_priors(
@@ -302,12 +503,14 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     priors = String[]
 
-    if m.method == :categorical 
-        # Assuming G is passed via hyper or spec
-        G = spec.hyper.mark_recapture_data.G 
-        push!(priors, "$(p_names.velocity) ~ filldist(truncated(Normal(0.2, 0.2), 0.0, 0.95), $G)")
-        push!(priors, "$(p_names.diffusion) ~ filldist(truncated(Normal(0.1, 0.2), 0.0, Inf), $G)")
-        push!(priors, "$(p_names.gamma) ~ filldist(Normal(1.0, 1.0), $G)")
+    if m.method in (:categorical, :stochastic_kernel, :density_gradient, :joint)
+        G = hasproperty(spec.hyper, :mark_recapture_data) ? spec.hyper.mark_recapture_data.G : 1
+        v_prior_str = _distribution_to_string(m.velocity)
+        d_prior_str = _distribution_to_string(m.diffusion)
+        g_prior_str = _distribution_to_string(m.gamma)
+        push!(priors, "$(p_names.velocity) ~ filldist($v_prior_str, $G)")
+        push!(priors, "$(p_names.diffusion) ~ filldist($d_prior_str, $G)")
+        push!(priors, "$(p_names.gamma) ~ filldist($g_prior_str, $G)")
     else
         push!(priors, "$(p_names.velocity) ~ $(_distribution_to_string(m.velocity))")
         push!(priors, "$(p_names.diffusion) ~ $(_distribution_to_string(m.diffusion))")
@@ -363,6 +566,88 @@ function get_updates(
     key = spec.key
     hyper = spec.hyper
 
+    if m.method in (:categorical, :stochastic_kernel, :density_gradient, :joint)
+        if !hasproperty(hyper, :mark_recapture_data)
+            error("The `$(m.method)` movement method requires `mark_recapture_data` or `telemetry_data`.")
+        end
+
+        hsi_calc = if m.method in (:density_gradient, :joint)
+            """
+            # --- Dynamic Habitat Suitability Index from Survey Density Linear Predictor ---
+            eta_spatial = zeros(T, $(hyper.s_N))
+            counts_spatial = zeros(Int, $(hyper.s_N))
+            if hasproperty(M, :s_idx)
+                @inbounds for i in 1:length(M.s_idx)
+                    s_i = M.s_idx[i]
+                    if 1 <= s_i <= $(hyper.s_N)
+                        eta_spatial[s_i] += $(eta_target)[i]
+                        counts_spatial[s_i] += 1
+                    end
+                end
+                @inbounds for s in 1:$(hyper.s_N)
+                    if counts_spatial[s] > 0
+                        eta_spatial[s] /= counts_spatial[s]
+                    end
+                end
+            end
+            hsi_eff = eta_spatial
+            """
+        else
+            """
+            hsi_eff = spec_registry[:$(key)].hyper.habitat_data
+            """
+        end
+
+        return """
+        let
+            $(hsi_calc)
+            I_S_dense = Matrix{eltype($(p_names.velocity))}(I, $(hyper.s_N), $(hyper.s_N))
+            T_diff = spec_registry[:$(key)].hyper.T_diff
+            
+            Gk_cache = map(1:$(hyper.mark_recapture_data.G)) do g
+                # 1. Habitat-directed advection choice matrix A_g
+                A_g = _build_A_ad(spec_registry[:$(key)].hyper.adj_rows, hsi_eff, $(p_names.gamma)[g], $(hyper.s_N))
+                
+                # 2. Stochastic transition kernel (strictly row-stochastic, no inversions, no clamping)
+                v_g = $(p_names.velocity)[g]
+                d_g = $(p_names.diffusion)[g]
+                tot_g = v_g + d_g + 1e-6
+                alpha_g = clamp(v_g / tot_g, 0.0, 1.0)
+                rho_g   = clamp(1.0 / (1.0 + tot_g), 0.01, 0.99)
+                
+                w_move = 1.0 - rho_g
+                w_adv  = w_move * alpha_g
+                w_diff = w_move * (1.0 - alpha_g)
+                
+                P_g = (w_adv .* A_g) .+ (w_diff .* T_diff) .+ (rho_g .* I_S_dense)
+                
+                # 3. Multi-step power cache (P^1, P^2, ..., P^max_k)
+                powers = Vector{Matrix{eltype(P_g)}}(undef, $(hyper.max_k))
+                powers[1] = P_g
+                for k_step in 2:$(hyper.max_k)
+                    powers[k_step] = powers[k_step - 1] * P_g
+                end
+                powers
+            end
+
+            # 4. Telemetry transition log-likelihood
+            for n in 1:length(spec_registry[:$(key)].hyper.mark_recapture_data.releases)
+                rel = spec_registry[:$(key)].hyper.mark_recapture_data.releases[n]
+                rec = spec_registry[:$(key)].hyper.mark_recapture_data.recaps[n]
+                g   = spec_registry[:$(key)].hyper.mark_recapture_data.groups[n]
+                k_n = spec_registry[:$(key)].hyper.mark_recapture_data.ks[n]
+                
+                p = Gk_cache[g][k_n][rel, :]
+                ps = sum(p)
+                T_el = eltype(p)
+                p_norm = ps > eps(T_el) ? (p ./ ps) : fill(one(T_el) / $(hyper.s_N), $(hyper.s_N))
+                
+                Turing.@addlogprob! log(max(p_norm[rec], 1e-12))
+            end
+        end
+        """
+    end
+
     diffusion_field_code = if hasproperty(hyper, :habitat_data)
         """
         habitat_field = spec_registry[:$(key)].hyper.habitat_data
@@ -408,43 +693,7 @@ function get_updates(
 
     telemetry_likelihood_code = ""
     if hasproperty(hyper, :mark_recapture_data)
-        if m.method == :categorical
-            telemetry_likelihood_code = """
-            # --- Categorical Mark-Recapture Likelihood ---
-            I_S_dense = Matrix{eltype($(p_names.velocity))}(I, $(hyper.s_N), $(hyper.s_N))
-            
-            Gk_cache = map(1:$(hyper.mark_recapture_data.G)) do g
-                A_g  = _build_A_ad(spec_registry[:$(key)].hyper.adj_rows, spec_registry[:$(key)].hyper.habitat_data, $(p_names.gamma)[g], $(hyper.s_N))
-                M    = I_S_dense .- $(p_names.velocity)[g] .* A_g .- $(p_names.diffusion)[g] .* spec_registry[:$(key)].hyper.L_dense
-                Graw = inv(M)
-                Gamma_1 = _row_normalise(Graw, $(hyper.s_N))
-                
-                if $(hyper.max_k) > 1
-                    higher_powers = accumulate(2:$(hyper.max_k); init=Gamma_1) do prev_Gamma, _
-                        _row_normalise(prev_Gamma * Gamma_1, $(hyper.s_N))
-                    end
-                    vcat([Gamma_1], higher_powers)
-                else
-                    [Gamma_1]
-                end
-            end
-
-            for n in 1:length(spec_registry[:$(key)].hyper.mark_recapture_data.releases)
-                rel = spec_registry[:$(key)].hyper.mark_recapture_data.releases[n]
-                rec = spec_registry[:$(key)].hyper.mark_recapture_data.recaps[n]
-                g   = spec_registry[:$(key)].hyper.mark_recapture_data.groups[n]
-                k_n = spec_registry[:$(key)].hyper.mark_recapture_data.ks[n]
-                
-                p = Gk_cache[g][k_n][rel, :]
-                ps = sum(p)
-                T_el = eltype(p)
-                p_norm = ps > eps(T_el) ? (p ./ ps) : fill(one(T_el) / $(hyper.s_N), $(hyper.s_N))
-                
-                Turing.@addlogprob! log(max(p_norm[rec], 1e-12))
-            end
-            """
-
-        elseif m.method == :explicit
+        if m.method == :explicit
           
             telemetry_likelihood_code = """
             # --- Mark-Recapture Telemetry Likelihood ---

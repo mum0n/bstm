@@ -1976,7 +1976,7 @@ function leaflet_tracks_map(
         for path in paths
             if isa(path, AbstractVector)
                 for pt in path
-                    if length(pt) >= 2 && !isnan(pt[1]) && !isnan(pt[2])
+                    if !isa(pt, Number) && length(pt) >= 2 && !isnan(pt[1]) && !isnan(pt[2])
                         push!(all_raw_pts, (float(pt[1]), float(pt[2])))
                     end
                 end
@@ -2037,8 +2037,18 @@ function leaflet_tracks_map(
                 start_date_str = hasproperty(tr, :start_date) ? string(tr.start_date) : ""
                 end_date_str = hasproperty(tr, :end_date) ? string(tr.end_date) : ""
             elseif isa(paths, AbstractVector) && isa(paths[1], AbstractVector)
-                for pt in paths[i]
-                    push!(coords_raw, (float(pt[1]), float(pt[2])))
+                if !isempty(paths[1]) && paths[1][1] isa Integer && !isempty(cents)
+                    for u_idx in paths[i]
+                        if 1 <= u_idx <= length(cents)
+                            push!(coords_raw, (float(cents[u_idx][1]), float(cents[u_idx][2])))
+                        end
+                    end
+                else
+                    for pt in paths[i]
+                        if !isa(pt, Number) && length(pt) >= 2
+                            push!(coords_raw, (float(pt[1]), float(pt[2])))
+                        end
+                    end
                 end
                 n_steps_val = length(coords_raw) - 1
             end
@@ -3484,3 +3494,570 @@ function leaflet_ad_ratio_distribution(
 </html>"""
     return LeafletMap(html, title=title, width=width, height=height, metadata=Dict(:n_units=>length(ratios)))
 end
+
+
+# =============================================================================
+# Section: Multi-Depth Hexagonal Hydrodynamic Leaflet Dashboard
+# =============================================================================
+
+"""
+    leaflet_hydrodynamic_dashboard(
+        au::NamedTuple,
+        hydro_data::NamedTuple;
+        trajectories::Union{Nothing, NamedTuple, AbstractVector} = nothing,
+        title::AbstractString = "Hydrodynamic Ocean Circulation & Stratification Dashboard",
+        dark_mode::Bool = true,
+        width::String = "100%",
+        height::String = "750px",
+        wkt = nothing,
+        is_geo::Union{Nothing, Bool} = nothing,
+        quiver_scale::Real = 1.0
+    ) -> LeafletMap
+
+Constructs an interactive, publication-grade standalone Leaflet HTML dashboard rendering
+multi-depth ocean hydrodynamic model outputs (temperature, salinity stratification,
+turbulent diffusion, and advection current velocity vectors) over a spatial mesh
+(e.g., fine-resolution hexagonal lattice).
+
+# Features
+- **Depth Selector**: Live switching between discrete vertical water-column levels
+  (Surface, Subsurface, Cold Intermediate Layer, and Benthic Shelf).
+- **Interactive Layer Toggles**:
+  - Seawater Potential Temperature (``T``, °C)
+  - Practical Salinity (``S``, PSU)
+  - Brunt-Väisälä Stratification Frequency Squared (``N^2``, ``\\text{s}^{-2}``)
+  - Turbulent Vertical Eddy Diffusivity (``\\kappa_v``, ``\\text{m}^2/\\text{s}``)
+  - Current Speed Magnitude (``|\\boldsymbol{u}_h|``, cm/s)
+  - Seafloor Bathymetric Depth (``H``, m)
+- **Advection Velocity Quivers**: Directional arrowheads originating from cell centroids
+  scaled by horizontal flow speed.
+- **Dynamic HUD Tooltip**: Real-time display of localized physical diagnostics on mouse hover.
+- **Trajectory Integration**: Optional rendering of Lagrangian particle tracks or telemetry paths.
+
+# Arguments
+- `au`: Spatial tessellation NamedTuple containing `:centroids` and `:polygons`
+  (or `:polygons_lonlat` / `:centroids_lonlat`).
+- `hydro_data`: NamedTuple containing multi-depth hydrodynamic variables (`:depths`,
+  `:temperature`, `:salinity`, `:stratification_N2`, `:diffusivity_v`, `:u`, `:v`).
+- `trajectories`: Optional trajectory records or path sequences.
+- `title`: Header title of the interactive map.
+- `dark_mode`: Whether to style with dark theme basemaps (default: `true`).
+"""
+function leaflet_hydrodynamic_dashboard(
+    arg1::NamedTuple,
+    arg2::NamedTuple;
+    trajectories::Union{Nothing, NamedTuple, AbstractVector} = nothing,
+    title::AbstractString = "Hydrodynamic Ocean Circulation & Stratification Dashboard",
+    dark_mode::Bool = true,
+    width::String = "100%",
+    height::String = "750px",
+    wkt = nothing,
+    is_geo::Union{Nothing, Bool} = nothing,
+    quiver_scale::Real = 1.0
+)::LeafletMap
+    # Auto-detect argument order: either (au, hydro_data) or (hydro_data, au)
+    au, hydro_data = if (hasproperty(arg1, :temperature) || hasproperty(arg1, :stratification_N2) || hasproperty(arg1, :N2)) && !(hasproperty(arg1, :W) || hasproperty(arg1, :polygons_lonlat))
+        arg2, arg1
+    else
+        arg1, arg2
+    end
+    # 1. Resolve geometry coordinates (prefer geographic lon/lat)
+    polys = if hasproperty(au, :polygons_lonlat) && !isempty(au.polygons_lonlat)
+        au.polygons_lonlat
+    elseif hasproperty(au, :polygons)
+        au.polygons
+    else
+        error("Spatial partition `au` must contain `:polygons` or `:polygons_lonlat`.")
+    end
+
+    cents = if hasproperty(au, :centroids_lonlat) && !isempty(au.centroids_lonlat)
+        au.centroids_lonlat
+    elseif hasproperty(au, :centroids)
+        au.centroids
+    else
+        error("Spatial partition `au` must contain `:centroids` or `:centroids_lonlat`.")
+    end
+
+    S = length(cents)
+    wkt_str = !isnothing(wkt) ? string(wkt) : _extract_wkt(au)
+    tf = _build_coordinate_transformer(cents; wkt=wkt_str, is_geo=is_geo, lon_center=-160.0, lat_center=0.0)
+
+    # 2. Extract multi-depth hydrodynamic variables
+    depth_levels = hasproperty(hydro_data, :depths) ? Float64.(hydro_data.depths) : [-2.5, -25.0, -50.0, -100.0]
+    nz = length(depth_levels)
+
+    to_2d(field, def_val) = begin
+        if field === nothing
+            return fill(def_val, S, nz)
+        elseif ndims(field) == 1
+            if length(field) == S
+                return repeat(Float64.(field), 1, nz)
+            else
+                return fill(def_val, S, nz)
+            end
+        elseif ndims(field) == 2
+            if size(field, 1) == S
+                f_cols = size(field, 2)
+                if f_cols == nz
+                    return Float64.(field)
+                else
+                    res = fill(def_val, S, nz)
+                    for k in 1:min(nz, f_cols)
+                        res[:, k] .= Float64.(field[:, k])
+                    end
+                    return res
+                end
+            else
+                return fill(def_val, S, nz)
+            end
+        else
+            return fill(def_val, S, nz)
+        end
+    end
+
+    T_2d = to_2d(hasproperty(hydro_data, :temperature) ? hydro_data.temperature : nothing, 5.0)
+    S_2d = to_2d(hasproperty(hydro_data, :salinity) ? hydro_data.salinity : nothing, 32.5)
+
+    N2_field = hasproperty(hydro_data, :stratification_N2) ? hydro_data.stratification_N2 :
+               (hasproperty(hydro_data, :N2) ? hydro_data.N2 :
+               (hasproperty(hydro_data, :stratification) ? hydro_data.stratification : nothing))
+    N2_2d = to_2d(N2_field, 1e-4)
+
+    diff_field = hasproperty(hydro_data, :diffusivity_v) ? hydro_data.diffusivity_v :
+                 (hasproperty(hydro_data, :kappa_v) ? hydro_data.kappa_v :
+                 (hasproperty(hydro_data, :diffusivity) ? hydro_data.diffusivity : nothing))
+    diff_2d = to_2d(diff_field, 1e-3)
+
+    u_field = hasproperty(hydro_data, :u) ? hydro_data.u :
+              (hasproperty(hydro_data, :advection_u) ? hydro_data.advection_u : nothing)
+    v_field = hasproperty(hydro_data, :v) ? hydro_data.v :
+              (hasproperty(hydro_data, :advection_v) ? hydro_data.advection_v : nothing)
+    u_2d = to_2d(u_field, 0.0)
+    v_2d = to_2d(v_field, 0.0)
+    spd_2d = hypot.(u_2d, v_2d) .* 100.0 # convert m/s to cm/s
+
+    bathy_vec = if hasproperty(hydro_data, :depths_vec) && length(hydro_data.depths_vec) == S
+        Float64.(hydro_data.depths_vec)
+    elseif hasproperty(hydro_data, :depth_vec) && length(hydro_data.depth_vec) == S
+        Float64.(hydro_data.depth_vec)
+    elseif hasproperty(hydro_data, :depths) && length(hydro_data.depths) == S
+        Float64.(hydro_data.depths)
+    elseif hasproperty(hydro_data, :bathymetry) && length(hydro_data.bathymetry) == S
+        Float64.(hydro_data.bathymetry)
+    elseif hasproperty(au, :depth_vec) && length(au.depth_vec) == S
+        Float64.(au.depth_vec)
+    elseif hasproperty(au, :depths) && length(au.depths) == S
+        Float64.(au.depths)
+    else
+        fill(120.0, S)
+    end
+
+    # 3. Build GeoJSON Polygons with multi-depth attributes
+    features_json = String[]
+    all_lats = Float64[]
+    all_lngs = Float64[]
+
+    for i in 1:S
+        p = polys[i]
+        length(p) < 3 && continue
+
+        p_trans = _transform_polygon(tf, p)
+        length(p_trans) < 3 && continue
+
+        coords_str = String[]
+        for pt in p_trans
+            push!(coords_str, "[$(pt[1]), $(pt[2])]")
+            push!(all_lngs, pt[1])
+            push!(all_lats, pt[2])
+        end
+        if coords_str[1] != coords_str[end]
+            push!(coords_str, coords_str[1])
+        end
+
+        # Multi-depth attributes for cell i
+        t_vals = [isnan(T_2d[i, k]) ? "null" : @sprintf("%.2f", T_2d[i, k]) for k in 1:nz]
+        s_vals = [isnan(S_2d[i, k]) ? "null" : @sprintf("%.2f", S_2d[i, k]) for k in 1:nz]
+        n2_vals = [isnan(N2_2d[i, k]) ? "null" : @sprintf("%.2e", N2_2d[i, k]) for k in 1:nz]
+        diff_vals = [isnan(diff_2d[i, k]) ? "null" : @sprintf("%.2e", diff_2d[i, k]) for k in 1:nz]
+        spd_vals = [isnan(spd_2d[i, k]) ? "null" : @sprintf("%.1f", spd_2d[i, k]) for k in 1:nz]
+        u_vals = [isnan(u_2d[i, k]) ? "null" : @sprintf("%.3f", u_2d[i, k]) for k in 1:nz]
+        v_vals = [isnan(v_2d[i, k]) ? "null" : @sprintf("%.3f", v_2d[i, k]) for k in 1:nz]
+        b_val = isnan(bathy_vec[i]) ? "null" : @sprintf("%.1f", abs(bathy_vec[i]))
+
+        feat = """{
+          "type": "Feature",
+          "id": $i,
+          "properties": {
+            "unit_id": $i,
+            "bathy": $b_val,
+            "t": [$(join(t_vals, ", "))],
+            "s": [$(join(s_vals, ", "))],
+            "n2": [$(join(n2_vals, ", "))],
+            "diff": [$(join(diff_vals, ", "))],
+            "spd": [$(join(spd_vals, ", "))],
+            "u": [$(join(u_vals, ", "))],
+            "v": [$(join(v_vals, ", "))]
+          },
+          "geometry": {
+            "type": "Polygon",
+            "coordinates": [[$(join(coords_str, ", "))]]
+          }
+        }"""
+        push!(features_json, feat)
+    end
+
+    geojson_cells = "{\"type\": \"FeatureCollection\", \"features\": [$(join(features_json, ",\n"))]}"
+
+    # 4. Build Multi-Depth Velocity Quiver Features
+    quivers_per_depth = String[]
+    for k in 1:nz
+        arrows_k = String[]
+        for i in 1:S
+            u_val = u_2d[i, k]
+            v_val = v_2d[i, k]
+            spd = spd_2d[i, k]
+            if !isnan(u_val) && !isnan(v_val) && spd > 0.5
+                c_trans = _transform_point(tf, cents[i])
+                # Scale arrow tip (quiver_scale)
+                arrow_len = min(0.08, 0.003 * spd * quiver_scale)
+                angle = atan(v_val, u_val)
+                tip_x = c_trans[1] + arrow_len * cos(angle)
+                tip_y = c_trans[2] + arrow_len * sin(angle)
+
+                arrow_feat = """{
+                  "type": "Feature",
+                  "properties": { "speed": $(round(spd, digits=1)), "dir": $(round(rad2deg(angle), digits=1)) },
+                  "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[$(c_trans[1]), $(c_trans[2])], [$(tip_x), $(tip_y)]]
+                  }
+                }"""
+                push!(arrows_k, arrow_feat)
+            end
+        end
+        push!(quivers_per_depth, "{\"type\": \"FeatureCollection\", \"features\": [$(join(arrows_k, ",\n"))]}")
+    end
+    quivers_json_array = "[" * join(quivers_per_depth, ", ") * "]"
+
+    # 5. Trajectory Paths Overlay if provided
+    tracks_json_str = "null"
+    if trajectories !== nothing
+        t_feats = String[]
+        p_list = if trajectories isa NamedTuple && hasproperty(trajectories, :lon) && hasproperty(trajectories, :lat)
+            # Flattened coordinate arrays
+            [[(trajectories.lon[i], trajectories.lat[i]) for i in 1:length(trajectories.lon)]]
+        elseif trajectories isa AbstractVector
+            trajectories
+        else
+            []
+        end
+        for (tr_idx, track) in enumerate(p_list)
+            if track isa AbstractVector && length(track) >= 2
+                coords_t = [_transform_point(tf, pt) for pt in track if !isnan(pt[1]) && !isnan(pt[2])]
+                if length(coords_t) >= 2
+                    c_str = join(["[$(pt[1]), $(pt[2])]" for pt in coords_t], ", ")
+                    push!(t_feats, """{
+                      "type": "Feature",
+                      "properties": { "track_id": $tr_idx },
+                      "geometry": { "type": "LineString", "coordinates": [$c_str] }
+                    }""")
+                end
+            end
+        end
+        if !isempty(t_feats)
+            tracks_json_str = "{\"type\": \"FeatureCollection\", \"features\": [$(join(t_feats, ",\n"))]}"
+        end
+    end
+
+    # 6. HTML Template with Controls and Palette Interpolator
+    map_id = "bstm_hydro_" * string(abs(hash(title * string(rand()))), base=16)
+    depth_labels_js = "[" * join(["\"$(abs(round(d, digits=1)))m\"" for d in depth_levels], ", ") * "]"
+
+    html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>$(title)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Outfit', sans-serif; background: #090d16; color: #f1f5f9; overflow: hidden; }
+    #$(map_id) { width: $(width); height: $(height); position: relative; }
+    .hydro-panel {
+      position: absolute; top: 16px; left: 16px; z-index: 1000;
+      background: rgba(15, 23, 42, 0.88); backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 12px;
+      padding: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); width: 330px;
+    }
+    .hydro-title { font-size: 0.95rem; font-weight: 700; color: #38bdf8; margin-bottom: 12px; }
+    .hydro-group { margin-bottom: 12px; }
+    .hydro-group-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: #94a3b8; margin-bottom: 6px; }
+    .btn-group { display: flex; flex-wrap: wrap; gap: 4px; }
+    .btn-tab {
+      background: rgba(30, 41, 59, 0.7); border: 1px solid rgba(255,255,255,0.08);
+      color: #cbd5e1; padding: 5px 10px; border-radius: 6px; font-size: 0.75rem;
+      cursor: pointer; transition: all 0.15s ease; font-family: 'Outfit', sans-serif;
+    }
+    .btn-tab:hover { background: rgba(56, 189, 248, 0.2); color: #fff; border-color: rgba(56, 189, 248, 0.4); }
+    .btn-tab.active { background: #0284c7; color: #fff; border-color: #38bdf8; font-weight: 600; }
+    .legend-card {
+      position: absolute; bottom: 24px; right: 24px; z-index: 1000;
+      background: rgba(15, 23, 42, 0.88); backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 10px;
+      padding: 12px 16px; width: 260px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .legend-title { font-size: 0.78rem; font-weight: 600; color: #cbd5e1; margin-bottom: 6px; }
+    .legend-bar { height: 12px; border-radius: 4px; margin-bottom: 6px; }
+    .legend-labels { display: flex; justify-content: space-between; font-size: 0.70rem; color: #94a3b8; font-family: 'JetBrains Mono', monospace; }
+    .hud-tooltip {
+      position: absolute; top: 16px; right: 16px; z-index: 1000;
+      background: rgba(15, 23, 42, 0.88); backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 10px;
+      padding: 12px 16px; min-width: 240px; pointer-events: none; font-size: 0.75rem;
+    }
+    .hud-title { font-weight: 700; color: #38bdf8; margin-bottom: 6px; font-size: 0.82rem; }
+    .hud-row { display: flex; justify-content: space-between; margin-bottom: 3px; font-family: 'JetBrains Mono', monospace; }
+    .hud-label { color: #94a3b8; }
+    .hud-val { color: #f8fafc; font-weight: 500; }
+  </style>
+</head>
+<body>
+  <div id="$(map_id)">
+    <div class="hydro-panel">
+      <div class="hydro-title">$(title)</div>
+      <div class="hydro-group">
+        <div class="hydro-group-label">Depth Slices</div>
+        <div class="btn-group" id="depth-tabs"></div>
+      </div>
+      <div class="hydro-group">
+        <div class="hydro-group-label">Diagnostic Layers</div>
+        <div class="btn-group" id="layer-tabs">
+          <button class="btn-tab active" data-layer="t">Temperature</button>
+          <button class="btn-tab" data-layer="s">Salinity</button>
+          <button class="btn-tab" data-layer="n2">Stratification (N²)</button>
+          <button class="btn-tab" data-layer="diff">Diffusivity (κ)</button>
+          <button class="btn-tab" data-layer="spd">Current Speed</button>
+          <button class="btn-tab" data-layer="bathy">Bathymetry</button>
+        </div>
+      </div>
+      <div class="hydro-group" style="margin-bottom: 0;">
+        <label style="font-size: 0.75rem; color: #cbd5e1; cursor: pointer; display: flex; align-items: center; gap: 6px;">
+          <input type="checkbox" id="toggle-quivers" checked> Advection Quiver Arrows
+        </label>
+      </div>
+    </div>
+
+    <div class="hud-tooltip" id="hud-box">
+      <div class="hud-title">Hydrodynamic Diagnostics</div>
+      <div style="color: #64748b;">Hover over a cell to view localized water-column metrics.</div>
+    </div>
+
+    <div class="legend-card">
+      <div class="legend-title" id="legend-label">Temperature (°C)</div>
+      <div class="legend-bar" id="legend-gradient"></div>
+      <div class="legend-labels">
+        <span id="leg-min">-</span>
+        <span id="leg-mid">-</span>
+        <span id="leg-max">-</span>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    var cellData = $(geojson_cells);
+    var quiversData = $(quivers_json_array);
+    var tracksData = $(tracks_json_str);
+    var depthLabels = $(depth_labels_js);
+    var nz = $(nz);
+
+    var curDepthIdx = 0;
+    var curLayer = 't';
+    var showQuivers = true;
+
+    // Palettes
+    var palettes = {
+      t: ['#313695', '#4575b4', '#74add1', '#abd9e9', '#e0f3f8', '#fee090', '#fdae61', '#f46d43', '#d73027'],
+      s: ['#440154', '#414487', '#2a788e', '#22a884', '#7ad151', '#fde725'],
+      n2: ['#0d0887', '#5402a3', '#8b0aa5', '#b93289', '#db5c68', '#f48849', '#febd2a', '#f0f921'],
+      diff: ['#000004', '#2c105c', '#711f81', '#b63679', '#ee605e', '#fca068', '#fcdea2'],
+      spd: ['#30123b', '#4662d8', '#28bbec', '#35eb93', '#a2fc3c', '#e2d312', '#fa8603', '#d61b03'],
+      bathy: ['#081d58', '#253494', '#225ea8', '#1d91c0', '#41b6c4', '#7fcdbb', '#c7e9b4', '#edf8b1']
+    };
+
+    var units = {
+      t: '°C', s: 'PSU', n2: 's⁻²', diff: 'm²/s', spd: 'cm/s', bathy: 'm'
+    };
+    var layerNames = {
+      t: 'Temperature', s: 'Salinity', n2: 'Stratification Frequency (N²)',
+      diff: 'Turbulent Diffusivity (κ)', spd: 'Current Speed (|u|)', bathy: 'Seafloor Depth'
+    };
+
+    // Calculate dynamic layer bounds across cells
+    var layerRanges = {};
+    ['t', 's', 'n2', 'diff', 'spd'].forEach(function(lKey) {
+      layerRanges[lKey] = [];
+      for (var k = 0; k < nz; k++) {
+        var vals = [];
+        cellData.features.forEach(function(f) {
+          var v = f.properties[lKey][k];
+          if (v !== null && !isNaN(v)) vals.push(v);
+        });
+        vals.sort(function(a, b) { return a - b; });
+        var minVal = vals.length > 0 ? vals[Math.floor(vals.length * 0.02)] : 0;
+        var maxVal = vals.length > 0 ? vals[Math.floor(vals.length * 0.98)] : 1;
+        if (minVal === maxVal) maxVal += 0.1;
+        layerRanges[lKey].push({ min: minVal, max: maxVal });
+      }
+    });
+
+    // Bathymetry range
+    var bVals = [];
+    cellData.features.forEach(function(f) {
+      if (f.properties.bathy !== null) bVals.push(f.properties.bathy);
+    });
+    bVals.sort(function(a,b){return a-b;});
+    layerRanges['bathy'] = [{ min: bVals[0] || 0, max: bVals[bVals.length - 1] || 2000 }];
+
+    function getColor(val, min, max, pal) {
+      if (val === null || isNaN(val)) return 'rgba(30, 41, 59, 0.4)';
+      var t = (val - min) / (max - min);
+      t = Math.max(0, Math.min(1, t));
+      var idx = t * (pal.length - 1);
+      var i = Math.floor(idx);
+      var f = idx - i;
+      if (i >= pal.length - 1) return pal[pal.length - 1];
+      return pal[i];
+    }
+
+    var map = L.map('$(map_id)', { attributionControl: false, zoomControl: false });
+    L.control.zoom({ position: 'topright' }).addTo(map);
+
+    var baseTiles = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 13
+    }).addTo(map);
+
+    var cellLayer = L.geoJSON(cellData, {
+      style: function(f) {
+        var rng = (curLayer === 'bathy') ? layerRanges['bathy'][0] : layerRanges[curLayer][curDepthIdx];
+        var val = (curLayer === 'bathy') ? f.properties.bathy : f.properties[curLayer][curDepthIdx];
+        var col = getColor(val, rng.min, rng.max, palettes[curLayer]);
+        return { fillColor: col, fillOpacity: 0.82, weight: 0.6, color: '#0f172a' };
+      },
+      onEachFeature: function(f, layer) {
+        layer.on({
+          mouseover: function(e) {
+            e.target.setStyle({ weight: 2, color: '#38bdf8' });
+            e.target.bringToFront();
+            updateHUD(f.properties);
+          },
+          mouseout: function(e) {
+            cellLayer.resetStyle(e.target);
+          }
+        });
+      }
+    }).addTo(map);
+
+    map.fitBounds(cellLayer.getBounds(), { padding: [20, 20] });
+
+    var quiverLayers = [];
+    for (var k = 0; k < nz; k++) {
+      var ql = L.geoJSON(quiversData[k], {
+        style: function(f) {
+          return { color: '#ffffff', weight: 1.5, opacity: 0.75 };
+        }
+      });
+      quiverLayers.push(ql);
+    }
+    if (showQuivers) quiverLayers[curDepthIdx].addTo(map);
+
+    if (tracksData) {
+      L.geoJSON(tracksData, {
+        style: { color: '#f43f5e', weight: 2.5, dashArray: '4, 4', opacity: 0.9 }
+      }).addTo(map);
+    }
+
+    function updateHUD(p) {
+      var hud = document.getElementById('hud-box');
+      var d = depthLabels[curDepthIdx];
+      var html = '<div class="hud-title">Hex Unit #' + p.unit_id + ' [' + d + ']</div>';
+      html += '<div class="hud-row"><span class="hud-label">Seafloor Depth:</span><span class="hud-val">' + p.bathy + ' m</span></div>';
+      html += '<div class="hud-row"><span class="hud-label">Temperature:</span><span class="hud-val">' + p.t[curDepthIdx] + ' °C</span></div>';
+      html += '<div class="hud-row"><span class="hud-label">Salinity:</span><span class="hud-val">' + p.s[curDepthIdx] + ' PSU</span></div>';
+      html += '<div class="hud-row"><span class="hud-label">Stratification (N²):</span><span class="hud-val">' + p.n2[curDepthIdx] + ' s⁻²</span></div>';
+      html += '<div class="hud-row"><span class="hud-label">Diffusivity (κ):</span><span class="hud-val">' + p.diff[curDepthIdx] + ' m²/s</span></div>';
+      html += '<div class="hud-row"><span class="hud-label">Velocity (u, v):</span><span class="hud-val">(' + p.u[curDepthIdx] + ', ' + p.v[curDepthIdx] + ') m/s</span></div>';
+      html += '<div class="hud-row"><span class="hud-label">Current Speed:</span><span class="hud-val">' + p.spd[curDepthIdx] + ' cm/s</span></div>';
+      hud.innerHTML = html;
+    }
+
+    function refreshLayers() {
+      var rng = (curLayer === 'bathy') ? layerRanges['bathy'][0] : layerRanges[curLayer][curDepthIdx];
+      var pal = palettes[curLayer];
+
+      cellLayer.eachLayer(function(l) {
+        var f = l.feature;
+        var val = (curLayer === 'bathy') ? f.properties.bathy : f.properties[curLayer][curDepthIdx];
+        l.setStyle({ fillColor: getColor(val, rng.min, rng.max, pal) });
+      });
+
+      for (var k = 0; k < nz; k++) {
+        map.removeLayer(quiverLayers[k]);
+      }
+      if (showQuivers && curLayer !== 'bathy') {
+        quiverLayers[curDepthIdx].addTo(map);
+      }
+
+      // Update Legend
+      document.getElementById('legend-label').innerText = layerNames[curLayer] + ' (' + units[curLayer] + ') [' + depthLabels[curDepthIdx] + ']';
+      document.getElementById('legend-gradient').style.background = 'linear-gradient(to right, ' + pal.join(', ') + ')';
+      document.getElementById('leg-min').innerText = rng.min.toExponential ? (rng.min < 0.01 ? rng.min.toExponential(2) : rng.min.toFixed(2)) : rng.min;
+      document.getElementById('leg-mid').innerText = ((rng.min + rng.max) / 2).toFixed(2);
+      document.getElementById('leg-max').innerText = rng.max.toExponential ? (rng.max < 0.01 ? rng.max.toExponential(2) : rng.max.toFixed(2)) : rng.max;
+    }
+
+    // Initialize UI Buttons
+    var depthContainer = document.getElementById('depth-tabs');
+    depthLabels.forEach(function(dLabel, idx) {
+      var btn = document.createElement('button');
+      btn.className = 'btn-tab' + (idx === 0 ? ' active' : '');
+      btn.innerText = dLabel;
+      btn.onclick = function() {
+        document.querySelectorAll('#depth-tabs .btn-tab').forEach(function(b){b.classList.remove('active');});
+        btn.classList.add('active');
+        curDepthIdx = idx;
+        refreshLayers();
+      };
+      depthContainer.appendChild(btn);
+    });
+
+    document.querySelectorAll('#layer-tabs .btn-tab').forEach(function(btn) {
+      btn.onclick = function() {
+        document.querySelectorAll('#layer-tabs .btn-tab').forEach(function(b){b.classList.remove('active');});
+        btn.classList.add('active');
+        curLayer = btn.getAttribute('data-layer');
+        refreshLayers();
+      };
+    });
+
+    document.getElementById('toggle-quivers').onchange = function(e) {
+      showQuivers = e.target.checked;
+      refreshLayers();
+    };
+
+    refreshLayers();
+  </script>
+</body>
+</html>"""
+
+    return LeafletMap(
+        html_content,
+        title=title,
+        width=width,
+        height=height,
+        metadata=Dict(:n_units=>S, :n_depths=>nz, :depths=>depth_levels)
+    )
+end
+

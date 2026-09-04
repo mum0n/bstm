@@ -13,7 +13,7 @@ module bstm
     @reexport using Distributions
     @reexport using Turing
     
-    using 
+    @reexport using 
         AbstractGPs, 
         AbstractMCMC,
         DynamicPPL,
@@ -114,6 +114,7 @@ module bstm
     export 
         @bstm,
         model_results_comprehensive,
+        reconstruct,
         get_optimal_sampler,
         precompute_step_sizes,
         predict,
@@ -146,6 +147,8 @@ module bstm
         spatial_knn_graph,
         spatial_radius_graph, 
         scaling_factor_bym2,
+        load_open_bathymetry,
+        extract_hydrodynamic_dataset,
 
         ParamRegistry, 
         ParamDescriptor, 
@@ -153,6 +156,7 @@ module bstm
         calibrate_param_registry, 
         get_samples, 
         get_param_samples,
+        get_descriptors_by_role,
  
         create_theme, 
         choropleth, 
@@ -172,6 +176,10 @@ module bstm
         plot_step_length_distribution,
         plot_regional_connectivity_matrix, 
         plot_movement_dashboard,
+        plot_hexagonal_field,
+        plot_hydrodynamic_stratification,
+        plot_hydrodynamic_diffusion,
+        plot_hydrodynamic_section,
         householder_to_eigenvector, 
         eigenvector_to_householder,
 
@@ -196,6 +204,7 @@ module bstm
         leaflet_step_diagnostics,
         leaflet_regional_connectivity, 
         leaflet_ad_ratio_distribution,
+        leaflet_hydrodynamic_dashboard,
 
         # Movement & ADR Telemetry exports
         generate_ADR_simulation_bundle, 
@@ -204,6 +213,9 @@ module bstm
         calculate_multistep_transition,
         simulate_posterior_trajectories, 
         simulate_mechanistic_trajectories,
+        construct_stochastic_transition_kernel,
+        predict_path,
+        predict_corridor,
         compute_suitability_transition_kernel, 
         calculate_regional_connectivity,
         plot_ad_ratio_distribution, 
@@ -216,13 +228,26 @@ module bstm
         reconstruct_mark_recapture_paths,
         validate_telemetry, 
         map_telemetry_to_units, 
+        build_hex_mesh_planar,
+        lonlat_to_xy_km,
+        xy_km_to_lonlat,
+        load_hsi_jld2,
+        match_telemetry_closest_month_hsi,
         time_steps_between,
         extract_scalar_param, 
         reconstruct_posterior_kernel, 
         reshard_hsi_field,
         fit_categorical_movement, 
         prepare_movement_data,
-
+        point_in_polygon,
+        identify_land_units,
+        apply_land_barrier,
+        infill_spatial_hsi,
+        construct_full_movement_domain,
+        compute_directed_adjacency, 
+        resolvent_transition,
+        decompose_bstm_formula,  
+ 
         # Input / Output & Persistence exports
         save_bstm_model, 
         load_bstm_model,
@@ -237,6 +262,8 @@ module bstm
         load_bstm_bundle,
         export_spatial_results_to_geojson, 
         extract_posterior_priors,
+        extract_prior_posterior,
+        PriorPosteriorBundle,
         save_model_ensemble, 
         bma_weighted_predictions, 
         save_out_of_sample_predictions,
@@ -257,6 +284,7 @@ module bstm
         
         par_from_posterior, 
         summarize_par_effects, 
+        par_counterfactual,
         export_par_to_table,
         par_credible_interval_plot, 
         par_forest_plot  
