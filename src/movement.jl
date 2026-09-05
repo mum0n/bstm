@@ -267,7 +267,17 @@ function simulate_posterior_trajectories(
     
     n_indiv = length(start_units)
     n_spatial = size(Gamma_base, 1)
-    centroids = au_context.centroids
+    centroids = if hasproperty(au_context, :centroids)
+        au_context.centroids
+    elseif hasproperty(au_context, :centroids_km)
+        au_context.centroids_km
+    elseif hasproperty(au_context, :centroids_lonlat)
+        au_context.centroids_lonlat
+    else
+        throw(ArgumentError(
+            "au_context must contain :centroids, :centroids_km, or :centroids_lonlat."
+        ))
+    end
     paths = zeros(Int, n_indiv, n_steps + 1)
     paths[:, 1] = start_units
     
@@ -290,20 +300,18 @@ function simulate_posterior_trajectories(
             p_row = max.(0.0, vec(G_sampling[curr_node, :]))
             if rho_persistence > 0.0 && prev_node != 0
                 v_prev = [centroids[curr_node][d] - centroids[prev_node][d] for d in 1:2]
-                if norm(v_prev) > 1e-9
-                    persistence_weights = ones(promote_type(T, typeof(rho_persistence)), n_spatial)
+                norm_prev = norm(v_prev)
+                if norm_prev > 1e-9
                     for j in 1:n_spatial
-                        if j == curr_node
-                            continue
-                        end
-                        v_cand = [centroids[j][d] - centroids[curr_node][d] for d in 1:2]
-                        n_cand = norm(v_cand)
-                        if n_cand > 1e-9
-                            cos_theta = dot(v_prev, v_cand) / (norm(v_prev) * n_cand)
-                            persistence_weights[j] = exp(rho_persistence * cos_theta)
+                        if j != curr_node && p_row[j] > 0.0
+                            v_cand = [centroids[j][d] - centroids[curr_node][d] for d in 1:2]
+                            norm_cand = norm(v_cand)
+                            if norm_cand > 1e-9
+                                cos_theta = dot(v_prev, v_cand) / (norm_prev * norm_cand)
+                                p_row[j] *= exp(rho_persistence * cos_theta)
+                            end
                         end
                     end
-                    p_row = max.(0.0, p_row .* persistence_weights)
                 end
             end
             row_sum = sum(p_row)
@@ -342,7 +350,17 @@ function simulate_mechanistic_trajectories(
 
     n_indiv = length(start_units)
     n_spatial = size(Gamma_sequence[1], 1)
-    centroids = au_context.centroids
+    centroids = if hasproperty(au_context, :centroids)
+        au_context.centroids
+    elseif hasproperty(au_context, :centroids_km)
+        au_context.centroids_km
+    elseif hasproperty(au_context, :centroids_lonlat)
+        au_context.centroids_lonlat
+    else
+        throw(ArgumentError(
+            "au_context must contain :centroids, :centroids_km, or :centroids_lonlat."
+        ))
+    end
     max_available_time = length(Gamma_sequence)
     
     actual_steps = n_years_sim
@@ -365,20 +383,18 @@ function simulate_mechanistic_trajectories(
             p_row = max.(0.0, vec(Gamma_t[curr_node, :]))
             if rho_persistence > 0.0 && prev_node != 0
                 v_prev = [centroids[curr_node][d] - centroids[prev_node][d] for d in 1:2]
-                if norm(v_prev) > 1e-9
-                    persistence_weights = ones(T, n_spatial)
+                norm_prev = norm(v_prev)
+                if norm_prev > 1e-9
                     for j in 1:n_spatial
-                        if j == curr_node
-                            continue
-                        end
-                        v_cand = [centroids[j][d] - centroids[curr_node][d] for d in 1:2]
-                        n_cand = norm(v_cand)
-                        if n_cand > 1e-9
-                            cos_theta = dot(v_prev, v_cand) / (norm(v_prev) * n_cand)
-                            persistence_weights[j] = exp(rho_persistence * cos_theta)
+                        if j != curr_node && p_row[j] > 0.0
+                            v_cand = [centroids[j][d] - centroids[curr_node][d] for d in 1:2]
+                            norm_cand = norm(v_cand)
+                            if norm_cand > 1e-9
+                                cos_theta = dot(v_prev, v_cand) / (norm_prev * norm_cand)
+                                p_row[j] *= exp(rho_persistence * cos_theta)
+                            end
                         end
                     end
-                    p_row = max.(0.0, p_row .* persistence_weights)
                 end
             end
             row_sum = sum(p_row)
@@ -2347,98 +2363,937 @@ function construct_stochastic_transition_kernel(
 end
 
 
+function _spatial_node_distance(c1, c2)::Float64
+    x1, y1 = Float64(c1[1]), Float64(c1[2])
+    x2, y2 = Float64(c2[1]), Float64(c2[2])
+    if abs(x1) <= 180.0 && abs(x2) <= 180.0 && abs(y1) <= 90.0 && abs(y2) <= 90.0
+        return haversine_distance(x1, y1, x2, y2)
+    else
+        return sqrt((x1 - x2)^2 + (y1 - y2)^2)
+    end
+end
+
 """
-    predict_path(P::AbstractMatrix{<:Real}, release::Int, recapture::Int, k::Int;
-                 land_mask=nothing) -> Vector{Int}
+    astar_predict_path(
+        P::AbstractMatrix{<:Real},
+        release::Int,
+        recapture::Int;
+        centroids = nothing,
+        k::Union{Nothing, Int} = nothing,
+        land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+        p_min::Real = 1e-12
+    ) -> Vector{Int}
+
+Reconstructs the most likely individual movement trajectory between `release` and
+`recapture` locations using the goal-directed \$A^*\$ heuristic search algorithm on the
+negative log-likelihood transition graph.
+
+# Mathematical Formulation
+Given row-stochastic transition matrix \$\\mathbf{P} \\in [0, 1]^{S \\times S}\$, the
+probability of a discrete trajectory \$\\pi = (u_0=u_{\\text{rel}}, \\dots, u_m=u_{\\text{rec}})\$ is:
+```math
+\\mathbb{P}(\\pi \\mid u_{\\text{rel}}, u_{\\text{rec}}) = \\prod_{\\tau=0}^{m-1} P_{u_\\tau, u_{\\tau+1}}
+```
+Maximizing path probability is equivalent to finding the shortest path with additive non-negative costs:
+```math
+c(u, v) = -\\ln P_{u, v} \\ge 0
+```
+When node spatial centroids \$\\mathbf{c}_u\$ are provided, the distance \$D(u, u_{\\text{rec}})\$
+gives an admissible and consistent heuristic:
+```math
+h(u) = \\left\\lceil \\frac{D(u, u_{\\text{rec}})}{\\Delta x_{\\max}} \\right\\rceil \\cdot \\min_{i \\neq j} (-\\ln P_{i, j})
+```
+guaranteeing that \$A^*\$ identifies the exact global maximum-likelihood trajectory while
+expanding an order of magnitude fewer nodes than a full trellis search.
+
+# Arguments
+- `P`: Row-stochastic transition probability matrix (dense or sparse \$S \\times S\$).
+- `release`: Source spatial unit index (1-indexed).
+- `recapture`: Destination spatial unit index (1-indexed).
+- `centroids`: Optional collection of centroid coordinate tuples `(lon, lat)` or `(x, y)`.
+- `k`: Optional target step duration (integer).
+- `land_mask`: Optional boolean vector of length \$S\$ (`true` for impermeable land).
+- `p_min`: Numerical cutoff below which transitions are treated as zero probability (default `1e-12`).
+
+# Returns
+- `Vector{Int}`: Ordered sequence of spatial unit indices connecting `release` to `recapture`.
+"""
+function astar_predict_path(
+    P::AbstractMatrix{<:Real},
+    release::Int,
+    recapture::Int;
+    centroids = nothing,
+    k::Union{Nothing, Int} = nothing,
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+    p_min::Real = 1e-12
+)::Vector{Int}
+    S = size(P, 1)
+    if !(1 <= release <= S) || !(1 <= recapture <= S)
+        throw(ArgumentError("Release unit ($release) and recapture unit ($recapture) must be within 1:$S."))
+    end
+    if release == recapture
+        return k !== nothing ? fill(release, max(1, k + 1)) : [release]
+    end
+
+    # Build directed graph and sparse cost matrix
+    g = SimpleDiGraph(S)
+    rows_c = Int[]
+    cols_c = Int[]
+    vals_c = Float64[]
+
+    max_p_trans = 0.0
+
+    if P isa SparseMatrixCSC
+        rows = rowvals(P)
+        vals = nonzeros(P)
+        for j in 1:S
+            if land_mask !== nothing && land_mask[j]
+                continue
+            end
+            for ptr in nzrange(P, j)
+                i = rows[ptr]
+                if i == j || (land_mask !== nothing && land_mask[i])
+                    continue
+                end
+                p_val = Float64(vals[ptr])
+                if p_val > p_min
+                    add_edge!(g, i, j)
+                    push!(rows_c, i)
+                    push!(cols_c, j)
+                    cost = -log(p_val)
+                    push!(vals_c, cost)
+                    if p_val > max_p_trans
+                        max_p_trans = p_val
+                    end
+                end
+            end
+        end
+    else
+        for i in 1:S
+            if land_mask !== nothing && land_mask[i]
+                continue
+            end
+            for j in 1:S
+                if i == j || (land_mask !== nothing && land_mask[j])
+                    continue
+                end
+                p_val = Float64(P[i, j])
+                if p_val > p_min
+                    add_edge!(g, i, j)
+                    push!(rows_c, i)
+                    push!(cols_c, j)
+                    cost = -log(p_val)
+                    push!(vals_c, cost)
+                    if p_val > max_p_trans
+                        max_p_trans = p_val
+                    end
+                end
+            end
+        end
+    end
+
+    cents_vec = if centroids !== nothing
+        hasproperty(centroids, :centroids_lonlat) ? centroids.centroids_lonlat :
+        (hasproperty(centroids, :centroids) ? centroids.centroids : centroids)
+    else
+        nothing
+    end
+
+    heuristic = if cents_vec !== nothing && length(cents_vec) == S && !isempty(rows_c)
+        max_d = 1e-6
+        for k_idx in 1:length(rows_c)
+            u = rows_c[k_idx]
+            v = cols_c[k_idx]
+            d = _spatial_node_distance(cents_vec[u], cents_vec[v])
+            if d > max_d
+                max_d = d
+            end
+        end
+        min_cost_hop = max_p_trans > 0.0 ? -log(max_p_trans) : 0.01
+
+        v -> begin
+            if v == recapture
+                return 0.0
+            end
+            d_v = _spatial_node_distance(cents_vec[v], cents_vec[recapture])
+            hops = ceil(d_v / max_d)
+            return hops * min_cost_hop
+        end
+    else
+        v -> 0.0
+    end
+
+    distmx = sparse(rows_c, cols_c, vals_c, S, S)
+    sp = a_star(g, release, recapture, distmx, heuristic)
+
+    if isempty(sp)
+        return [release, recapture]
+    end
+
+    raw_path = vcat([src(e) for e in sp], [dst(last(sp))])
+
+    if k !== nothing && k >= 1
+        m = length(raw_path) - 1
+        if m < k
+            p_self = [Float64(P[u, u]) for u in raw_path]
+            expanded_path = copy(raw_path)
+            while length(expanded_path) < k + 1
+                best_idx = argmax(p_self)
+                insert!(expanded_path, best_idx, expanded_path[best_idx])
+                p_self[best_idx] *= 0.90
+            end
+            return expanded_path
+        end
+    end
+
+    return raw_path
+end
+
+"""
+    astar_least_cost_path(
+        centroids::AbstractVector,
+        W::AbstractMatrix{<:Real},
+        release::Int,
+        recapture::Int;
+        resistance::Union{Nothing, AbstractVector{<:Real}} = nothing,
+        hsi::Union{Nothing, AbstractVector{<:Real}} = nothing,
+        land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+        land_polygons = nothing
+    ) -> Vector{Int}
+
+Computes the ecological least-cost migration corridor between `release` and `recapture`
+spatial units across an environmental resistance/friction surface using \$A^*\$ graph search.
+
+# Mathematical Formulation
+Given node centroids \$\\mathbf{c}_u\$ and network adjacency \$W\$, the physical distance
+between adjacent nodes is \$d(u, v) = \\text{dist}(\\mathbf{c}_u, \\mathbf{c}_v)\$.
+Traversing node \$v\$ incurs an environmental friction/resistance \$\\Phi(v) \\ge 1.0\$.
+The directed edge traversal cost is:
+```math
+c(u, v) = d(u, v) \\times \\frac{\\Phi(u) + \\Phi(v)}{2}
+```
+where \$\\Phi(v)\$ can be parameterized from habitat suitability:
+```math
+\\Phi(v) = 1.0 + 3.0 \\times (1.0 - \\text{HSI}_v)^2
+```
+With admissible Euclidean / Haversine heuristic \$h(u) = d(u, u_{\\text{rec}}) \\times \\min_w \\Phi(w)\$,
+\$A^*\$ identifies the optimal least-resistance corridor avoiding environmental barriers.
+
+# Arguments
+- `centroids`: Spatial centroids coordinate vector (length \$S\$).
+- `W`: Spatial adjacency matrix (\$S \\times S\$).
+- `release`: Starting spatial unit index (1-indexed).
+- `recapture`: Destination spatial unit index (1-indexed).
+- `resistance`: Optional explicit resistance vector of length \$S\$ (\$\\Phi \\ge 1.0\$).
+- `hsi`: Optional habitat suitability index vector (used if `resistance` is not provided).
+- `land_mask`: Optional boolean vector denoting impermeable land units.
+- `land_polygons`: Optional land barrier polygons for topological edge severing.
+
+# Returns
+- `Vector{Int}`: Sequence of spatial unit indices tracing the least-cost path.
+"""
+function astar_least_cost_path(
+    centroids::AbstractVector,
+    W::AbstractMatrix{<:Real},
+    release::Int,
+    recapture::Int;
+    resistance::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    hsi::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+    land_polygons = nothing
+)::Vector{Int}
+    S = size(W, 1)
+    if !(1 <= release <= S) || !(1 <= recapture <= S)
+        throw(ArgumentError("Release unit ($release) and recapture unit ($recapture) must be within 1:$S."))
+    end
+    if release == recapture
+        return [release]
+    end
+
+    phi = if resistance !== nothing
+        Float64.(resistance)
+    elseif hsi !== nothing
+        [1.0 + 3.0 * (1.0 - clamp(Float64(h), 0.0, 1.0))^2 for h in hsi]
+    else
+        ones(Float64, S)
+    end
+    min_phi = minimum(phi)
+
+    W_active = copy(sparse(Float64.(W)))
+    if land_mask !== nothing
+        for l in findall(land_mask)
+            W_active[l, :] .= 0.0
+            W_active[:, l] .= 0.0
+        end
+        dropzeros!(W_active)
+    end
+    if land_polygons !== nothing
+        sever_land_crossing_edges!(W_active, centroids; land_polygons=land_polygons)
+    end
+
+    g = SimpleGraph(S)
+    rows_c = Int[]
+    cols_c = Int[]
+    vals_c = Float64[]
+
+    rows = rowvals(W_active)
+    for col in 1:S
+        for ptr in nzrange(W_active, col)
+            row = rows[ptr]
+            if row > col
+                add_edge!(g, col, row)
+                d_ij = _spatial_node_distance(centroids[col], centroids[row])
+                cost = d_ij * (phi[col] + phi[row]) / 2.0
+                push!(rows_c, col)
+                push!(cols_c, row)
+                push!(vals_c, cost)
+                push!(rows_c, row)
+                push!(cols_c, col)
+                push!(vals_c, cost)
+            end
+        end
+    end
+
+    distmx = sparse(rows_c, cols_c, vals_c, S, S)
+    heuristic = v -> begin
+        if v == recapture
+            return 0.0
+        end
+        return _spatial_node_distance(centroids[v], centroids[recapture]) * min_phi
+    end
+
+    sp = a_star(g, release, recapture, distmx, heuristic)
+    if isempty(sp)
+        return [release, recapture]
+    end
+    return vcat([src(e) for e in sp], [dst(last(sp))])
+end
+
+"""
+    smooth_marine_path(
+        path::Vector{Int},
+        centroids::AbstractVector;
+        land_polygons = nothing
+    ) -> Vector{Int}
+
+Applies line-of-sight shortcutting ("string-pulling") to an animal trajectory on a discrete
+mesh, removing artificial cell-to-cell hexagonal zig-zagging while strictly preserving
+clearance around terrestrial land barriers (islands, peninsulas, headlands).
+
+# Mathematical Formulation
+For path waypoints \$\\mathbf{w} = [u_1, u_2, \\dots, u_m]\$, the algorithm casts a line
+of sight between non-adjacent waypoints \$u_i\$ and \$u_j\$ (\$j > i + 1\$).
+If the line segment:
+```math
+L(u_i, u_j) = \\{ (1 - t) \\mathbf{c}_{u_i} + t \\mathbf{c}_{u_j} \\mid t \\in [0, 1] \\}
+```
+does not intersect any terrestrial barrier polygon (evaluated via `_line_crosses_polygon_or_in`),
+all intermediate waypoints \$u_{i+1}, \\dots, u_{j-1}\$ are removed. If an intersection
+occurs, waypoints around the headland are retained.
+
+# Arguments
+- `path`: Ordered sequence of spatial unit indices.
+- `centroids`: Spatial centroids coordinate vector matching unit indices.
+- `land_polygons`: Terrestrial boundary polygons (defaults to `:maritimes`).
+
+# Returns
+- `Vector{Int}`: Smoothed subset of waypoints with direct lines of sight across open water.
+"""
+function smooth_marine_path(
+    path::Vector{Int},
+    centroids::AbstractVector;
+    land_polygons = nothing
+)::Vector{Int}
+    if length(path) <= 2
+        return path
+    end
+
+    polys = if land_polygons === nothing
+        _DEFAULT_MARITIMES_LAND_POLYGONS
+    elseif land_polygons in (:none, :false, false)
+        nothing
+    elseif land_polygons in (:maritimes, :default)
+        _DEFAULT_MARITIMES_LAND_POLYGONS
+    else
+        land_polygons
+    end
+
+    smoothed = Int[path[1]]
+    curr_idx = 1
+    n_pts = length(path)
+
+    while curr_idx < n_pts
+        furthest_idx = curr_idx + 1
+        for look_idx in n_pts:-1:(curr_idx + 2)
+            p_curr = (Float64(centroids[path[curr_idx]][1]), Float64(centroids[path[curr_idx]][2]))
+            p_look = (Float64(centroids[path[look_idx]][1]), Float64(centroids[path[look_idx]][2]))
+            crosses = polys !== nothing ? _line_crosses_polygon_or_in(p_curr, p_look, polys) : false
+            if !crosses
+                furthest_idx = look_idx
+                break
+            end
+        end
+        push!(smoothed, path[furthest_idx])
+        curr_idx = furthest_idx
+    end
+
+    return smoothed
+end
+
+"""
+    StochasticAStarResult
+
+Container holding posterior inference results for stochastic A* pathfinding
+propagating uncertainty in habitat suitability, friction parameters, or observation
+error terms.
+
+# Fields
+- `corridor_prob::Vector{Float64}`: Posterior probability of node inclusion in corridor.
+- `edge_prob::SparseMatrixCSC{Float64, Int}`: Posterior traversal probability of edge.
+- `medoid_path::Vector{Int}`: Most representative trajectory across posterior draws.
+- `all_paths::Vector{Vector{Int}}`: Vector of individual trajectory realizations.
+- `path_costs::Vector{Float64}`: Realized path costs across all draws.
+- `path_distances::Vector{Float64}`: Realized physical path distances (km).
+- `mean_distance::Float64`: Posterior expected physical distance.
+- `ci_distance::Tuple{Float64, Float64}`: 95% credible interval for travel distance.
+- `release::Int`: Origin node.
+- `recapture::Int`: Destination node.
+- `n_draws::Int`: Number of stochastic draws evaluated.
+"""
+struct StochasticAStarResult
+    corridor_prob::Vector{Float64}
+    edge_prob::SparseMatrixCSC{Float64, Int}
+    medoid_path::Vector{Int}
+    all_paths::Vector{Vector{Int}}
+    path_costs::Vector{Float64}
+    path_distances::Vector{Float64}
+    mean_distance::Float64
+    ci_distance::Tuple{Float64, Float64}
+    release::Int
+    recapture::Int
+    n_draws::Int
+end
+
+function Base.show(io::IO, res::StochasticAStarResult)
+    S = length(res.corridor_prob)
+    n_corridor = count(p -> p > 0.0, res.corridor_prob)
+    n_bottleneck = count(p -> p >= 0.80, res.corridor_prob)
+    println(io, "StochasticAStarResult:")
+    println(io, "  Release -> Recapture:        $(res.release) -> $(res.recapture)")
+    println(io, "  Stochastic Draws (M):        $(res.n_draws)")
+    println(io, "  Corridor Envelope Units:     $n_corridor / $S units")
+    println(io, "  Consensus Bottlenecks (P>=0.8): $n_bottleneck units")
+    println(io, "  Medoid Path Waypoints:       $(length(res.medoid_path))")
+    print(io,   "  Expected Path Distance:      $(round(res.mean_distance, digits=2)) km " *
+                "(95% CI: $(round(res.ci_distance[1], digits=2)) - " *
+                "$(round(res.ci_distance[2], digits=2)) km)")
+end
+
+"""
+    astar_stochastic_least_cost_path(
+        centroids::AbstractVector,
+        W::AbstractMatrix{<:Real},
+        release::Int,
+        recapture::Int;
+        hsi_samples::Union{Nothing, AbstractMatrix{<:Real}} = nothing,
+        hsi_mean::Union{Nothing, AbstractVector{<:Real}} = nothing,
+        hsi_se::Union{Nothing, AbstractVector{<:Real}} = nothing,
+        resistance_samples::Union{Nothing, AbstractMatrix{<:Real}} = nothing,
+        resistance_mean::Union{Nothing, AbstractVector{<:Real}} = nothing,
+        resistance_se::Union{Nothing, AbstractVector{<:Real}} = nothing,
+        n_draws::Int = 50,
+        friction_power::Real = 2.0,
+        land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+        land_polygons = nothing,
+        smooth::Bool = false,
+        ci_alpha::Real = 0.05,
+        seed::Union{Nothing, Int} = nothing
+    ) -> StochasticAStarResult
+
+Performs Bayesian stochastic A* least-cost pathfinding by propagating posterior
+uncertainty in habitat suitability (HSI), environmental friction, or observation error
+terms across the marine graph.
+
+# Mathematical Formulation
+Deterministic A* yields a single trajectory ``\\pi^* = \\arg\\min_{\\pi} \\sum c(u, v)``
+conditioned on a fixed point-estimate resistance surface ``\\hat{\\boldsymbol{\\Phi}}``.
+In stochastic A*, environmental friction varies across posterior draws:
+```math
+H_i^{(m)} = \\text{clamp}(H_i^{\\text{obs}} + \\sigma_{H, i} Z_i^{(m)}, 0, 1)
+```
+or ``\\mathbf{H}^{(m)} \\sim \\pi(\\mathbf{H} \\mid \\mathbf{y})``.
+Nodal friction is parameterized as:
+```math
+\\Phi_i^{(m)} = 1.0 + 3.0 \\left(1.0 - H_i^{(m)}\\right)^\\gamma
+```
+For each draw ``m = 1, \\dots, M``, A* identifies the optimal trajectory ``\\pi^{(m)}``.
+The posterior corridor utilization probability across the graph is computed:
+```math
+P(i \\in \\text{Corridor} \\mid \\text{data}) =
+  \\frac{1}{M} \\sum_{m=1}^M \\mathbb{I}(i \\in \\pi^{(m)})
+```
+Nodes with ``P(i) \\to 1.0`` indicate mandatory migratory bottleneck pinch-points that
+must be traversed regardless of habitat uncertainty, while nodes with intermediate
+``0 < P(i) < 1.0`` reveal viable alternative corridors.
+
+# Arguments
+- `centroids`: Vector of spatial unit coordinates (lon/lat tuples or planar points).
+- `W`: Adjacency matrix of the spatial graph (size ``S \\times S``).
+- `release`: Starting spatial unit index.
+- `recapture`: Destination spatial unit index.
+- `hsi_samples`: Optional ``S \\times M`` matrix of posterior HSI MCMC draws.
+- `hsi_mean`: Optional posterior mean / estimated HSI vector (length ``S``).
+- `hsi_se`: Optional HSI standard error / observation error vector (length ``S``).
+- `resistance_samples`: Optional ``S \\times M`` matrix of friction/resistance draws.
+- `resistance_mean`: Optional mean resistance vector.
+- `resistance_se`: Optional resistance standard error vector.
+- `n_draws`: Number of stochastic realizations (default: 50).
+- `friction_power`: Exponent ``\\gamma`` for converting HSI into friction (default: 2.0).
+- `land_mask`: Optional boolean vector (`true` for land units).
+- `land_polygons`: Optional land boundary geometries for raycasting line-of-sight checks.
+- `smooth`: If `true`, applies line-of-sight raycasting (`smooth_marine_path`) to each draw.
+- `ci_alpha`: Credible interval significance level (default: 0.05 for 95% CI).
+- `seed`: Optional random seed for reproducible sampling.
+
+# Returns
+- `StochasticAStarResult`: Posterior corridor probabilities, edge traversal frequencies,
+  medoid path, path distance and cost credible intervals.
+
+# References
+- Hart, P. E., Nilsson, N. J., & Raphael, B. (1968). A formal basis for the heuristic
+  determination of minimum cost paths. IEEE Transactions on Systems Science and Cybernetics.
+- Adriaensen, F., et al. (2003). The application of least-cost modelling as a functional
+  landscape model. Landscape and Urban Planning, 64(4), 233-247.
+"""
+function astar_stochastic_least_cost_path(
+    centroids::AbstractVector,
+    W::AbstractMatrix{<:Real},
+    release::Int,
+    recapture::Int;
+    hsi_samples::Union{Nothing, AbstractMatrix{<:Real}} = nothing,
+    hsi_mean::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    hsi_se::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    resistance_samples::Union{Nothing, AbstractMatrix{<:Real}} = nothing,
+    resistance_mean::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    resistance_se::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    n_draws::Int = 50,
+    friction_power = 2.0,
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+    land_polygons = nothing,
+    smooth::Bool = false,
+    ci_alpha::Real = 0.05,
+    seed::Union{Nothing, Int} = nothing
+)::StochasticAStarResult
+    S = size(W, 1)
+    if !(1 <= release <= S) || !(1 <= recapture <= S)
+        throw(ArgumentError(
+            "Release ($release) and recapture ($recapture) must be within 1:$S."
+        ))
+    end
+
+    rng = isnothing(seed) ? Random.default_rng() : MersenneTwister(seed)
+
+    _get_power_vec(f_arg, n_sim) = if f_arg isa AbstractVector{<:Real}
+        [max(0.05, Float64(f_arg[min(i, length(f_arg))])) for i in 1:n_sim]
+    elseif f_arg isa Distribution
+        [max(0.05, Float64(rand(rng, f_arg))) for _ in 1:n_sim]
+    elseif f_arg isa Real
+        fill(max(0.05, Float64(f_arg)), n_sim)
+    else
+        fill(2.0, n_sim)
+    end
+
+    # 1. Assemble resistance realizations
+    r_draws::Matrix{Float64} = if !isnothing(resistance_samples)
+        if size(resistance_samples, 1) != S
+            throw(DimensionMismatch(
+                "resistance_samples rows ($(size(resistance_samples, 1))) != units S ($S)"
+            ))
+        end
+        Float64.(resistance_samples)
+    elseif !isnothing(resistance_mean)
+        if length(resistance_mean) != S
+            throw(DimensionMismatch(
+                "resistance_mean length ($(length(resistance_mean))) != units S ($S)"
+            ))
+        end
+        M_sim = max(1, n_draws)
+        draws = zeros(Float64, S, M_sim)
+        mean_vec = Float64.(resistance_mean)
+        if !isnothing(resistance_se)
+            se_vec = Float64.(resistance_se)
+            for m in 1:M_sim
+                z = randn(rng, S)
+                draws[:, m] = max.(1.0, mean_vec .+ se_vec .* z)
+            end
+        else
+            for m in 1:M_sim
+                draws[:, m] = max.(1.0, mean_vec)
+            end
+        end
+        draws
+    elseif !isnothing(hsi_samples)
+        if size(hsi_samples, 1) != S
+            throw(DimensionMismatch(
+                "hsi_samples rows ($(size(hsi_samples, 1))) != units S ($S)"
+            ))
+        end
+        M_sim = size(hsi_samples, 2)
+        draws = zeros(Float64, S, M_sim)
+        p_vec = _get_power_vec(friction_power, M_sim)
+        for m in 1:M_sim
+            p_m = p_vec[m]
+            h_col = clamp.(Float64.(hsi_samples[:, m]), 0.0, 1.0)
+            draws[:, m] = [1.0 + 3.0 * (1.0 - h)^p_m for h in h_col]
+        end
+        draws
+    elseif !isnothing(hsi_mean)
+        if length(hsi_mean) != S
+            throw(DimensionMismatch(
+                "hsi_mean length ($(length(hsi_mean))) != units S ($S)"
+            ))
+        end
+        M_sim = max(1, n_draws)
+        draws = zeros(Float64, S, M_sim)
+        mean_h = Float64.(hsi_mean)
+        p_vec = _get_power_vec(friction_power, M_sim)
+        if !isnothing(hsi_se)
+            se_h = Float64.(hsi_se)
+            for m in 1:M_sim
+                p_m = p_vec[m]
+                z = randn(rng, S)
+                h_m = clamp.(mean_h .+ se_h .* z, 0.0, 1.0)
+                draws[:, m] = [1.0 + 3.0 * (1.0 - h)^p_m for h in h_m]
+            end
+        else
+            for m in 1:M_sim
+                p_m = p_vec[m]
+                h_m = clamp.(mean_h, 0.0, 1.0)
+                draws[:, m] = [1.0 + 3.0 * (1.0 - h)^p_m for h in h_m]
+            end
+        end
+        draws
+    else
+        throw(ArgumentError(
+            "Either hsi_mean/se, hsi_samples, or resistance_mean/se must be provided."
+        ))
+    end
+
+    M_total = size(r_draws, 2)
+    all_paths = Vector{Vector{Int}}(undef, M_total)
+    path_costs = zeros(Float64, M_total)
+    path_distances = zeros(Float64, M_total)
+    node_counts = zeros(Int, S)
+    edge_counts = spzeros(Float64, S, S)
+
+    # 2. Iterate across stochastic draws
+    for m in 1:M_total
+        r_m = r_draws[:, m]
+
+        # Solve A* least-cost trajectory
+        p_m = astar_least_cost_path(
+            centroids,
+            W,
+            release,
+            recapture;
+            resistance = r_m,
+            land_mask = land_mask,
+            land_polygons = land_polygons
+        )
+
+        if smooth && length(p_m) > 2
+            p_m = smooth_marine_path(
+                p_m,
+                centroids;
+                land_polygons = land_polygons
+            )
+        end
+
+        all_paths[m] = p_m
+
+        # Accumulate node visits
+        for u in p_m
+            node_counts[u] += 1
+        end
+
+        # Accumulate edge visits and metrics
+        dist_m = 0.0
+        cost_m = 0.0
+        for idx in 1:(length(p_m) - 1)
+            u = p_m[idx]
+            v = p_m[idx + 1]
+            edge_counts[u, v] += 1.0
+            d_uv = _spatial_node_distance(centroids[u], centroids[v])
+            dist_m += d_uv
+            cost_m += d_uv * (r_m[u] + r_m[v]) / 2.0
+        end
+
+        path_distances[m] = dist_m
+        path_costs[m] = cost_m
+    end
+
+    # 3. Compute posterior corridor probabilities
+    corridor_prob = node_counts ./ Float64(M_total)
+    edge_prob = edge_counts ./ Float64(M_total)
+
+    # 4. Identify medoid trajectory (highest mean corridor confidence)
+    best_score = -Inf
+    best_idx = 1
+    for m in 1:M_total
+        p_len = length(all_paths[m])
+        score_m = p_len > 0 ? sum(corridor_prob[u] for u in all_paths[m]) / p_len : 0.0
+        if score_m > best_score
+            best_score = score_m
+            best_idx = m
+        end
+    end
+    medoid = all_paths[best_idx]
+
+    # 5. Compute distance summary statistics
+    mean_dist = mean(path_distances)
+    alpha_lo = clamp(Float64(ci_alpha) / 2.0, 0.0, 0.5)
+    alpha_hi = 1.0 - alpha_lo
+    ci_dist = (quantile(path_distances, alpha_lo), quantile(path_distances, alpha_hi))
+
+    return StochasticAStarResult(
+        corridor_prob,
+        edge_prob,
+        medoid,
+        all_paths,
+        path_costs,
+        path_distances,
+        mean_dist,
+        ci_dist,
+        release,
+        recapture,
+        M_total
+    )
+end
+
+"""
+    astar_stochastic_predict_path(
+        P::AbstractMatrix{<:Real},
+        release::Int,
+        recapture::Int;
+        P_samples::Union{Nothing, Vector{<:AbstractMatrix{<:Real}}} = nothing,
+        temperature::Real = 0.05,
+        n_draws::Int = 50,
+        centroids = nothing,
+        k::Union{Nothing, Int} = nothing,
+        land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+        ci_alpha::Real = 0.05,
+        seed::Union{Nothing, Int} = nothing
+    ) -> StochasticAStarResult
+
+Performs stochastic A* path prediction across uncertain transition probability matrices.
+"""
+function astar_stochastic_predict_path(
+    P::AbstractMatrix{<:Real},
+    release::Int,
+    recapture::Int;
+    P_samples::Union{Nothing, Vector{<:AbstractMatrix{<:Real}}} = nothing,
+    temperature::Real = 0.05,
+    n_draws::Int = 50,
+    centroids = nothing,
+    k::Union{Nothing, Int} = nothing,
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+    ci_alpha::Real = 0.05,
+    seed::Union{Nothing, Int} = nothing
+)::StochasticAStarResult
+    S = size(P, 1)
+    rng = isnothing(seed) ? Random.default_rng() : MersenneTwister(seed)
+    M_total = !isnothing(P_samples) ? length(P_samples) : max(1, n_draws)
+
+    all_paths = Vector{Vector{Int}}(undef, M_total)
+    path_costs = zeros(Float64, M_total)
+    path_distances = zeros(Float64, M_total)
+    node_counts = zeros(Int, S)
+    edge_counts = spzeros(Float64, S, S)
+    temp = max(1e-6, Float64(temperature))
+
+    for m in 1:M_total
+        P_m = if !isnothing(P_samples)
+            P_samples[m]
+        else
+            P_pert = copy(P)
+            I_nz, J_nz, V_nz = findnz(sparse(P))
+            V_new = zeros(Float64, length(V_nz))
+            for idx in eachindex(V_nz)
+                v = max(1e-12, Float64(V_nz[idx]))
+                log_v = log(v) + temp * randn(rng)
+                V_new[idx] = exp(log_v)
+            end
+            P_sparse = sparse(I_nz, J_nz, V_new, S, S)
+            row_sums = vec(sum(P_sparse, dims=2))
+            D_inv = Diagonal([rs > 0.0 ? 1.0 / rs : 1.0 for rs in row_sums])
+            D_inv * P_sparse
+        end
+
+        p_m = astar_predict_path(
+            P_m,
+            release,
+            recapture;
+            centroids = centroids,
+            k = k,
+            land_mask = land_mask
+        )
+
+        all_paths[m] = p_m
+        for u in p_m
+            node_counts[u] += 1
+        end
+
+        dist_m = 0.0
+        cost_m = 0.0
+        for idx in 1:(length(p_m) - 1)
+            u = p_m[idx]
+            v = p_m[idx + 1]
+            edge_counts[u, v] += 1.0
+            if !isnothing(centroids)
+                dist_m += _spatial_node_distance(centroids[u], centroids[v])
+            else
+                dist_m += 1.0
+            end
+            p_uv = P_m[u, v]
+            cost_m += p_uv > 0.0 ? -log(p_uv) : 25.0
+        end
+        path_distances[m] = dist_m
+        path_costs[m] = cost_m
+    end
+
+    corridor_prob = node_counts ./ Float64(M_total)
+    edge_prob = edge_counts ./ Float64(M_total)
+
+    best_score = -Inf
+    best_idx = 1
+    for m in 1:M_total
+        p_len = length(all_paths[m])
+        score_m = p_len > 0 ? sum(corridor_prob[u] for u in all_paths[m]) / p_len : 0.0
+        if score_m > best_score
+            best_score = score_m
+            best_idx = m
+        end
+    end
+    medoid = all_paths[best_idx]
+
+    mean_dist = mean(path_distances)
+    alpha_lo = clamp(Float64(ci_alpha) / 2.0, 0.0, 0.5)
+    alpha_hi = 1.0 - alpha_lo
+    ci_dist = (quantile(path_distances, alpha_lo), quantile(path_distances, alpha_hi))
+
+    return StochasticAStarResult(
+        corridor_prob,
+        edge_prob,
+        medoid,
+        all_paths,
+        path_costs,
+        path_distances,
+        mean_dist,
+        ci_dist,
+        release,
+        recapture,
+        M_total
+    )
+end
+
+"""
+    predict_path(P::AbstractMatrix{<:Real}, release::Int, recapture::Int,
+                 k::Union{Nothing, Int}=nothing;
+                 centroids=nothing, method=:astar, land_mask=nothing) -> Vector{Int}
 
 Computes the single most likely sequence of spatial units visited by an individual
-between `release` (time 0) and `recapture` (time `k`) using the Viterbi dynamic programming
-algorithm over the Markov transition kernel `P`:
-
-```math
-\\max_{s_1, \\dots, s_{k-1}} \\prod_{\\tau=1}^k P(s_{\\tau-1}, s_\\tau), \\quad s_0 = \\text{release}, \\; s_k = \\text{recapture}
-```
+between `release` and `recapture` using either goal-directed \$A^*\$ heuristic search
+(`method=:astar`, default) or the classic fixed-horizon Viterbi trellis (`method=:viterbi`).
 
 # Arguments
 - `P`: Row-stochastic transition matrix (size ``S \\times S``).
 - `release`: Starting spatial unit index (1-indexed).
-- `recapture`: Destination spatial unit index at step `k` (1-indexed).
-- `k`: Total discrete time steps elapsed between release and recapture (``k \\ge 1``).
-- `land_mask`: Optional boolean vector of length ``S`` (`true` for land units). When provided,
-  all transitions to/from land units receive log-probability ``-10^{12}``, preventing Viterbi
-  trajectories from traversing terrestrial barriers.
+- `recapture`: Destination spatial unit index (1-indexed).
+- `k`: Optional discrete time steps elapsed between release and recapture (``k \\ge 1``).
+- `centroids`: Optional spatial centroids coordinate vector for \$A^*\$ distance heuristic.
+- `method`: Algorithm selector (`:astar` for high-performance \$A^*\$,
+  `:viterbi` for classic trellis).
+- `land_mask`: Optional boolean vector of length ``S`` (`true` for land units).
 
 # Returns
-- `Vector{Int}`: Sequence of length ``k + 1`` containing unit indices from `release` to `recapture`.
+- `Vector{Int}`: Sequence of spatial unit indices from `release` to `recapture`.
 """
 function predict_path(
     P::AbstractMatrix{<:Real},
     release::Int,
     recapture::Int,
-    k::Int;
+    k::Union{Nothing, Int} = nothing;
+    centroids = nothing,
+    method::Symbol = :astar,
     land_mask::Union{Nothing, AbstractVector{Bool}} = nothing
 )::Vector{Int}
-    S = size(P, 1)
-    if !(1 <= release <= S) || !(1 <= recapture <= S)
-        error("Release unit ($release) and recapture unit ($recapture) must be within 1:$S.")
-    end
-    if k < 1
-        return [release]
-    elseif k == 1
-        return [release, recapture]
-    end
-
-    # Log-probability transition matrix
-    T_val = Float64
-    logP = Matrix{T_val}(undef, S, S)
-    @inbounds for j in 1:S
-        for i in 1:S
-            p_ij = Float64(P[i, j])
-            logP[i, j] = p_ij > 1e-15 ? log(p_ij) : -1e12
+    if k === nothing || method == :astar
+        return astar_predict_path(
+            P, release, recapture;
+            centroids = centroids,
+            k = k,
+            land_mask = land_mask
+        )
+    elseif method == :viterbi
+        S = size(P, 1)
+        if !(1 <= release <= S) || !(1 <= recapture <= S)
+            throw(ArgumentError(
+                "Release unit ($release) and recapture unit ($recapture) must be within 1:$S."
+            ))
         end
-    end
+        if k < 1
+            return [release]
+        elseif k == 1
+            return [release, recapture]
+        end
 
-    # Enforce land barrier in Viterbi trellis: zero transition into or out of land
-    if land_mask !== nothing
-        for l in 1:S
-            if land_mask[l]
-                logP[:, l] .= -1e12
-                logP[l, :] .= -1e12
+        logP = Matrix{Float64}(undef, S, S)
+        @inbounds for j in 1:S
+            for i in 1:S
+                p_ij = Float64(P[i, j])
+                logP[i, j] = p_ij > 1e-15 ? log(p_ij) : -1e12
             end
         end
-    end
 
-    # Forward Viterbi trellis: delta[s, tau] is max log-prob to be at unit s at step tau
-    delta = fill(-1e12, S, k + 1)
-    psi   = zeros(Int, S, k + 1)
-
-    delta[release, 1] = 0.0
-
-    for tau in 2:(k + 1)
-        prev_tau = tau - 1
-        for j in 1:S
-            best_val = -Inf
-            best_prev = 1
-            for i in 1:S
-                score = delta[i, prev_tau] + logP[i, j]
-                if score > best_val
-                    best_val = score
-                    best_prev = i
+        if land_mask !== nothing
+            for l in 1:S
+                if land_mask[l]
+                    logP[:, l] .= -1e12
+                    logP[l, :] .= -1e12
                 end
             end
-            delta[j, tau] = best_val
-            psi[j, tau]   = best_prev
         end
-    end
 
-    # Backtrack from target recapture unit at step k+1
-    path = zeros(Int, k + 1)
-    path[k + 1] = recapture
-    for tau in (k + 1):-1:2
-        path[tau - 1] = psi[path[tau], tau]
-    end
+        delta = fill(-1e12, S, k + 1)
+        psi   = zeros(Int, S, k + 1)
+        delta[release, 1] = 0.0
 
-    return path
+        for tau in 2:(k + 1)
+            prev_tau = tau - 1
+            for j in 1:S
+                best_val = -Inf
+                best_prev = 1
+                for i in 1:S
+                    score = delta[i, prev_tau] + logP[i, j]
+                    if score > best_val
+                        best_val = score
+                        best_prev = i
+                    end
+                end
+                delta[j, tau] = best_val
+                psi[j, tau]   = best_prev
+            end
+        end
+
+        path = zeros(Int, k + 1)
+        path[k + 1] = recapture
+        for tau in (k + 1):-1:2
+            path[tau - 1] = psi[path[tau], tau]
+        end
+        return path
+    else
+        throw(ArgumentError("Unknown path method '$method'. Expected :astar or :viterbi."))
+    end
 end
 
 
@@ -2543,21 +3398,33 @@ end
 
 # Convenience overloads for result dictionaries / named tuples
 function predict_path(
-    res::NamedTuple, release::Int, recapture::Int, k::Int;
+    res::NamedTuple,
+    release::Int,
+    recapture::Int,
+    k::Union{Nothing, Int} = nothing;
     group::Union{String, Symbol, Int} = 1,
+    centroids = nothing,
+    method::Symbol = :astar,
     land_mask::Union{Nothing, AbstractVector{Bool}} = nothing
-)
+)::Vector{Int}
     mask = land_mask !== nothing ? land_mask :
         (hasproperty(res, :land_mask) ? res.land_mask : nothing)
+    cents = centroids !== nothing ? centroids :
+        (hasproperty(res, :mesh) ? res.mesh : nothing)
     if hasproperty(res, :transition_matrices)
         tm = res.transition_matrices
         key = group isa Int ?
             (hasproperty(res, :group_lookup) ? res.group_lookup[group] : first(keys(tm))) :
             string(group)
         P = tm[key]
-        return predict_path(P, release, recapture, k; land_mask=mask)
+        return predict_path(
+            P, release, recapture, k;
+            centroids = cents,
+            method = method,
+            land_mask = mask
+        )
     else
-        error("Expected a result NamedTuple with field `:transition_matrices`.")
+        throw(ArgumentError("Expected a result NamedTuple with field `:transition_matrices`."))
     end
 end
 
@@ -2610,8 +3477,10 @@ function predict_path(
     P_vec::AbstractVector{<:AbstractMatrix{<:Real}},
     release::Int,
     recapture::Int,
-    k::Int;
+    k::Union{Nothing, Int} = nothing;
     group::Union{Integer, Symbol, AbstractString} = 1,
+    centroids = nothing,
+    method::Symbol = :astar,
     land_mask::Union{Nothing, AbstractVector{Bool}} = nothing
 )::Vector{Int}
     if isempty(P_vec)
@@ -2626,7 +3495,12 @@ function predict_path(
     if !(1 <= g_idx <= length(P_vec))
         throw(ArgumentError("Group index $g_idx is out of bounds (1:$(length(P_vec)))."))
     end
-    return predict_path(P_vec[g_idx], release, recapture, k; land_mask=land_mask)
+    return predict_path(
+        P_vec[g_idx], release, recapture, k;
+        centroids = centroids,
+        method = method,
+        land_mask = land_mask
+    )
 end
 
 """
@@ -2822,9 +3696,11 @@ where ``\\mathcal{P}`` is the set of land boundary polygons and ``d_s`` is the b
 """
 function identify_land_units(
     centroids::AbstractVector;
+    polygons::Union{Nothing, AbstractVector} = nothing,
     land_polygons::Union{Nothing, Symbol, AbstractVector} = nothing,
     depth::Union{Nothing, AbstractVector{<:Real}} = nothing,
-    depth_threshold::Real = 0.0
+    depth_threshold::Real = 0.0,
+    land_fraction_threshold::Real = 0.5
 )::Vector{Bool}
     S = length(centroids)
     land_mask = falses(S)
@@ -2859,8 +3735,21 @@ function identify_land_units(
             land_mask[i] && continue
             c = centroids[i]
             x, y = Float64(c[1]), Float64(c[2])
+            # Check centroid inclusion
             if point_in_polygon(x, y, polys)
                 land_mask[i] = true
+                continue
+            end
+            # Check unit polygon vertices if provided
+            if polygons !== nothing && i <= length(polygons)
+                u_poly = polygons[i]
+                if length(u_poly) >= 3
+                    n_verts = length(u_poly) - (u_poly[1] == u_poly[end] ? 1 : 0)
+                    n_in = count(k -> point_in_polygon(u_poly[k][1], u_poly[k][2], polys), 1:n_verts)
+                    if n_in >= ceil(Int, n_verts * land_fraction_threshold)
+                        land_mask[i] = true
+                    end
+                end
             end
         end
     end
@@ -2936,6 +3825,214 @@ function apply_land_barrier(
     hsi_water[land_mask] .= 0.0
 
     return (W_water, hsi_water)
+end
+
+
+function _extract_polygon_rings(polys)
+    if polys isa AbstractVector && !isempty(polys)
+        first_elem = first(polys)
+        if first_elem isa Tuple || (first_elem isa AbstractVector && length(first_elem) == 2 && first_elem[1] isa Real)
+            return [polys]
+        elseif first_elem isa AbstractVector
+            return polys
+        end
+    end
+    return [polys]
+end
+
+function _line_crosses_polygon_or_in(p1, p2, polys)::Bool
+    # Check midpoint inclusion in land polygon
+    mid_x = (p1[1] + p2[1]) / 2.0
+    mid_y = (p1[2] + p2[2]) / 2.0
+    if point_in_polygon(mid_x, mid_y, polys)
+        return true
+    end
+
+    # Orientation test for 2D line segment intersection
+    function _ccw(A, B, C)
+        return (C[2] - A[2]) * (B[1] - A[1]) > (B[2] - A[2]) * (C[1] - A[1])
+    end
+
+    function _seg_intersect(a1, a2, b1, b2)
+        return (_ccw(a1, b1, b2) != _ccw(a2, b1, b2)) && (_ccw(a1, a2, b1) != _ccw(a1, a2, b2))
+    end
+
+    rings = _extract_polygon_rings(polys)
+    for ring in rings
+        if ring isa AbstractVector && length(ring) >= 3
+            n_pts = length(ring)
+            for k in 1:(n_pts - 1)
+                e1 = (Float64(ring[k][1]), Float64(ring[k][2]))
+                e2 = (Float64(ring[k + 1][1]), Float64(ring[k + 1][2]))
+                if _seg_intersect(p1, p2, e1, e2)
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+"""
+    sever_land_crossing_edges!(
+        W::AbstractMatrix{<:Real},
+        centroids::AbstractVector;
+        land_polygons = nothing
+    ) -> Int
+
+Inspects all non-zero edges ``(i, j)`` in the spatial adjacency matrix ``W`` and
+severs any edge whose straight-line trajectory intersects a terrestrial land barrier polygon.
+
+# Mathematical Formulation
+For nodes ``i, j \\in \\mathcal{S}``, the trajectory line segment is:
+```math
+L_{ij} = \\{ (1 - t) \\mathbf{c}_i + t \\mathbf{c}_j \\mid t \\in [0, 1] \\}
+```
+If ``L_{ij} \\cap \\mathcal{P}_{\\text{land}} \\neq \\emptyset``, the edge is severed:
+```math
+W_{ij} \\leftarrow 0, \\quad W_{ji} \\leftarrow 0
+```
+preventing movement models from allowing transitions that cross overland barriers.
+
+# Arguments
+- `W`: Spatial graph adjacency matrix (size ``S \\times S``). Modified in-place if mutable.
+- `centroids`: Centroids coordinate vector (length ``S``).
+- `land_polygons`: Boundary polygons (defaults to `:maritimes`).
+
+# Returns
+- `Int`: Total number of directed edges severed.
+"""
+function sever_land_crossing_edges!(
+    W::AbstractMatrix{<:Real},
+    centroids::AbstractVector;
+    land_polygons = nothing
+)::Int
+    polys = if land_polygons === nothing
+        _DEFAULT_MARITIMES_LAND_POLYGONS
+    elseif land_polygons in (:none, :false, false)
+        return 0
+    elseif land_polygons in (:maritimes, :default)
+        _DEFAULT_MARITIMES_LAND_POLYGONS
+    else
+        land_polygons
+    end
+
+    polys === nothing && return 0
+
+    S = size(W, 1)
+    if length(centroids) != S
+        throw(DimensionMismatch(
+            "centroids length ($(length(centroids))) must match W dimensions ($S)."
+        ))
+    end
+
+    severed_count = 0
+    if W isa SparseMatrixCSC
+        rows = rowvals(W)
+        for col in 1:S
+            c_col = centroids[col]
+            p_col = (Float64(c_col[1]), Float64(c_col[2]))
+            for k in nzrange(W, col)
+                row = rows[k]
+                if row > col
+                    c_row = centroids[row]
+                    p_row = (Float64(c_row[1]), Float64(c_row[2]))
+                    if _line_crosses_polygon_or_in(p_col, p_row, polys)
+                        W[row, col] = 0.0
+                        W[col, row] = 0.0
+                        severed_count += 2
+                    end
+                end
+            end
+        end
+        dropzeros!(W)
+    else
+        for i in 1:S
+            c_i = centroids[i]
+            p_i = (Float64(c_i[1]), Float64(c_i[2]))
+            for j in (i + 1):S
+                if W[i, j] != 0.0 || W[j, i] != 0.0
+                    c_j = centroids[j]
+                    p_j = (Float64(c_j[1]), Float64(c_j[2]))
+                    if _line_crosses_polygon_or_in(p_i, p_j, polys)
+                        W[i, j] = 0.0
+                        W[j, i] = 0.0
+                        severed_count += 2
+                    end
+                end
+            end
+        end
+    end
+
+    return severed_count
+end
+
+"""
+    compact_marine_mesh(mesh, land_mask::AbstractVector{Bool}) -> NamedTuple
+
+Extracts and compacts a spatial mesh into an active marine water sub-domain by
+filtering out all terrestrial land units and reindexing spatial units from ``1`` to
+``S_{\\text{water}}``.
+
+# Mathematical Formulation
+Given spatial unit set ``\\mathcal{S} = \\{1, \\dots, S\\}`` and boolean indicator
+``\\text{land\\_mask}``, the navigable marine sub-domain is defined by:
+```math
+\\mathcal{M} = \\{ i \\in \\mathcal{S} \\mid \\neg \\text{land\\_mask}[i] \\}
+```
+The adjacency graph is subsetted to the induced sub-graph:
+```math
+W_{\\text{marine}} = W[\\mathcal{M}, \\mathcal{M}]
+```
+preserving all marine graph topology while reducing state dimensionality.
+
+# Arguments
+- `mesh`: Spatial mesh NamedTuple containing `:centroids`, `:polygons`, `:n_units`, and `:W`.
+- `land_mask`: Boolean vector of length ``S`` (`true` for land units).
+
+# Returns
+- `NamedTuple`: Compacted marine mesh with updated `:n_units`, `:W`, `:centroids_lonlat`,
+  `:polygons_lonlat`, and the mapping vector `:water_indices`.
+"""
+function compact_marine_mesh(mesh, land_mask::AbstractVector{Bool})::NamedTuple
+    water_idx = findall(!, land_mask)
+    S_water = length(water_idx)
+
+    cents_ll = hasproperty(mesh, :centroids_lonlat) ? mesh.centroids_lonlat[water_idx] :
+               (hasproperty(mesh, :centroids) ? mesh.centroids[water_idx] : Tuple{Float64, Float64}[])
+    polys_ll = hasproperty(mesh, :polygons_lonlat) ? mesh.polygons_lonlat[water_idx] :
+               (hasproperty(mesh, :polygons) ? mesh.polygons[water_idx] : Vector{Vector{Tuple{Float64, Float64}}}())
+    cents_km = hasproperty(mesh, :centroids_km) ? mesh.centroids_km[water_idx] : nothing
+    polys_km = hasproperty(mesh, :polygons_km) ? mesh.polygons_km[water_idx] : nothing
+
+    W_sub = copy(mesh.W[water_idx, water_idx])
+    if W_sub isa SparseMatrixCSC
+        dropzeros!(W_sub)
+    end
+
+    res = Dict{Symbol, Any}(
+        :n_units          => S_water,
+        :centroids        => cents_ll,
+        :centroids_lonlat => cents_ll,
+        :polygons         => polys_ll,
+        :polygons_lonlat  => polys_ll,
+        :W                => W_sub,
+        :water_indices    => water_idx
+    )
+    if cents_km !== nothing
+        res[:centroids_km] = cents_km
+    end
+    if polys_km !== nothing
+        res[:polygons_km] = polys_km
+    end
+    if hasproperty(mesh, :radius_km)
+        res[:radius_km] = mesh.radius_km
+    end
+    if hasproperty(mesh, :areas_km2)
+        res[:areas_km2] = mesh.areas_km2[water_idx]
+    end
+
+    return NamedTuple(res)
 end
 
 
@@ -3232,16 +4329,18 @@ function construct_full_movement_domain(
     W_init = sparse(rows_idx, cols_idx, ones(Float64, length(rows_idx)), S, S)
     W_init = max.(W_init, W_init')
 
-    # Identify land units
+    # Identify land units with area fraction check
     land_mask = identify_land_units(
         centroids_lonlat;
+        polygons=polygons_lonlat,
         land_polygons=land_polygons,
         depth=depth,
         depth_threshold=depth_threshold
     )
 
-    # Sever land edges in W
+    # Sever land edges in W and topological land-crossing links
     W_water, _ = apply_land_barrier(W_init, zeros(Float64, S), land_mask)
+    sever_land_crossing_edges!(W_water, centroids_lonlat; land_polygons=land_polygons)
 
     area_km2 = (3.0 * sqrt(3.0) / 2.0) * r^2
 
@@ -3315,7 +4414,7 @@ function prepare_movement_data(
     hsi_file::Union{Nothing, AbstractString} = nothing,
     sppoly_file::Union{Nothing, AbstractString} = nothing,
     radius_km::Real = 15.0,
-    time_interval::Symbol = :monthly,
+    time_interval::Symbol = :daily,
     land_polygons = nothing,
     depth = nothing,
     depth_threshold::Real = 0.0,

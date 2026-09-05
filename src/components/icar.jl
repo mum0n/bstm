@@ -274,13 +274,8 @@ function get_effects(
     n_latent = spec.hyper.n_latent
 
     # --- Coordinate/Index Handling: Combine training and prediction sets on CPU ---
-    s_idx_train = M.s_idx # Spatial indices for training data
-    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set is provided
-        vcat(s_idx_train, PS.data.s_idx) # Combine training and prediction indices
-    else
-        s_idx_train # Otherwise, use only training indices
-    end
-    N_total = length(s_idx_full) # Total number of observations (training + prediction)
+    s_idx_train = M.s_idx
+    s_idx_full, N_total = _resolve_effect_indices(M, PS, :s_idx)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -289,10 +284,13 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         # Find parameter names in the MCMC chain
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        sigma_name = _find_parameter(
+            p_names, string(p_names_k.sigma), k, is_multivariate_model
+        )
 
         if isempty(sigma_name)
-            @warn "Parameters for ICAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            @warn "Parameters for ICAR component $(spec.key) (outcome $k) " *
+                  "not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
@@ -348,9 +346,12 @@ function get_effects(
                 effect_k_latent[:, j] = x_train
             end
         else
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            ure_name = _find_parameter(
+                p_names, string(p_names_k.ure), k, is_multivariate_model
+            )
             if isempty(ure_name)
-                @warn "ure for ICAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                @warn "ure for ICAR component $(spec.key) (outcome $k) not found. " *
+                      "Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
@@ -359,26 +360,17 @@ function get_effects(
             if m.method == :spectral
                 U = spec.hyper.U
                 L = spec.hyper.L
-                
-                for j in 1:n_samples
-                    sigma_j = sigma_samples[j, 1]
-                    innov_j = ure_samples[j, :]
-                    
-                    diag_D = sigma_j ./ sqrt.(L .+ noise)
-                    diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-                    effect_k_latent[:, j] = U * (diag_D .* innov_j)
-                end
+                inv_sqrt_L = 1.0 ./ sqrt.(L .+ noise)
+                inv_sqrt_L[1] = 0.0 # Enforce sum-to-zero constraint
+                # Vectorized Level-3 BLAS across all MCMC draws
+                scaled_innov = (inv_sqrt_L .* ure_samples') .* sigma_samples[:, 1]'
+                effect_k_latent = U * scaled_innov
             else # :cholesky or :cholesky_sparse
                 F = spec.hyper.cholesky_factor
-                
-                for j in 1:n_samples
-                    sigma_j = sigma_samples[j, 1]
-                    innov_j = ure_samples[j, :]
-
-                    sre_unscaled = F.L' \ innov_j
-                    latent_field_centered = sre_unscaled .- mean(sre_unscaled)
-                    effect_k_latent[:, j] = latent_field_centered .* sigma_j
-                end
+                # Vectorized Level-3 BLAS triangular solve across all draws
+                sre_unscaled = F.L' \ ure_samples'
+                sre_centered = sre_unscaled .- mean(sre_unscaled, dims=1)
+                effect_k_latent = sre_centered .* sigma_samples[:, 1]'
             end
         end
 

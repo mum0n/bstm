@@ -269,11 +269,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -282,13 +278,7 @@ function get_effects(
     noise = M.noise
 
     # --- Index Handling: Combine training and prediction sets ---
-    s_idx_train = M.s_idx # Spatial indices for training data
-    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set is provided
-        vcat(s_idx_train, PS.data.s_idx) # Combine training and prediction indices
-    else
-        s_idx_train # Otherwise, use only training indices
-    end
-    N_total = length(s_idx_full) # Total number of observations (training + prediction)
+    s_idx_full, N_total = _resolve_effect_indices(M, PS, :s_idx)
 
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -297,59 +287,119 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         if m.method == :lgcp
-            sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k,
-                is_multivariate_model)
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            sigma_name = _find_parameter(
+                p_names, string(p_names_k.sigma), k, is_multivariate_model
+            )
+            ure_name = _find_parameter(
+                p_names, string(p_names_k.ure), k, is_multivariate_model
+            )
 
             if isempty(sigma_name) || isempty(ure_name)
-                @warn "Parameters for LGCP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
+                @warn "Parameters for LGCP component $(spec.key) (outcome $(k)) " *
+                      "not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
 
             # Extract samples (CPU)
             sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-            ure_samples = get_params_matrix(chain, ure_name,
-                hyper.inner_hyper.n_latent) # (n_samples, n_latent)
+            ure_samples = get_params_matrix(
+                chain, ure_name, hyper.inner_hyper.n_latent
+            ) # (n_samples, n_latent)
             
-            F_lgcp = hyper.inner_hyper.cholesky_factor # Cholesky factor for LGCP
-            
-            spatial_component_unscaled = F_lgcp.L' \ ure_samples' # Unscaled spatial component
-            effect_k_latent = sigma_samples' .* spatial_component_unscaled # Scaled spatial component
+            spatial_component_unscaled = if hasproperty(hyper.inner_hyper, :cholesky_factor)
+                hyper.inner_hyper.cholesky_factor.L' \ ure_samples'
+            elseif hasproperty(hyper.inner_hyper, :U) && hasproperty(hyper.inner_hyper, :L)
+                L_vals = hyper.inner_hyper.L
+                inv_sqrt_L = [
+                    L_vals[i] > 1e-6 ? 1.0 / sqrt(L_vals[i]) : 0.0 for i in 1:length(L_vals)
+                ]
+                hyper.inner_hyper.U * (inv_sqrt_L .* ure_samples')
+            elseif hasproperty(hyper.inner_hyper, :Q_template)
+                F_q = cholesky(Symmetric(Matrix(hyper.inner_hyper.Q_template) + noise * I))
+                F_q.L' \ ure_samples'
+            else
+                throw(ArgumentError(
+                    "PointProcess inner model must provide either cholesky_factor, " *
+                    "eigenbasis (U, L), or Q_template."
+                ))
+            end
+            effect_k_latent = sigma_samples' .* spatial_component_unscaled
             
             indexed_effects = effect_k_latent[s_idx_full, :]
             push!(structured_effects, indexed_effects)
 
         elseif m.method == :lgmcp
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            ure_name = _find_parameter(
+                p_names, string(p_names_k.ure), k, is_multivariate_model
+            )
             if isempty(ure_name)
-                @warn "ure for LGMCP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
+                @warn "ure for LGMCP component $(spec.key) (outcome $(k)) not found. " *
+                      "Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            ure_samples = get_params_matrix(chain, ure_name,
-                hyper.inner_hyper.n_latent) # Innovations for LGMCP
-            F_lgmcp = hyper.inner_hyper.cholesky_factor # Cholesky factor for LGMCP
+            ure_samples = get_params_matrix(
+                chain, ure_name, hyper.inner_hyper.n_latent
+            ) # Innovations for LGMCP
 
-            effect_k_latent = exp.(F_lgmcp.L' \ ure_samples') # Exponentiate to get intensity
+            spatial_component_unscaled = if hasproperty(hyper.inner_hyper, :cholesky_factor)
+                hyper.inner_hyper.cholesky_factor.L' \ ure_samples'
+            elseif hasproperty(hyper.inner_hyper, :U) && hasproperty(hyper.inner_hyper, :L)
+                L_vals = hyper.inner_hyper.L
+                inv_sqrt_L = [
+                    L_vals[i] > 1e-6 ? 1.0 / sqrt(L_vals[i]) : 0.0 for i in 1:length(L_vals)
+                ]
+                hyper.inner_hyper.U * (inv_sqrt_L .* ure_samples')
+            elseif hasproperty(hyper.inner_hyper, :Q_template)
+                F_q = cholesky(Symmetric(Matrix(hyper.inner_hyper.Q_template) + noise * I))
+                F_q.L' \ ure_samples'
+            else
+                throw(ArgumentError(
+                    "PointProcess inner model must provide either cholesky_factor, " *
+                    "eigenbasis (U, L), or Q_template."
+                ))
+            end
+            effect_k_latent = exp.(spatial_component_unscaled)
 
             indexed_effects = effect_k_latent[s_idx_full, :]
             push!(structured_effects, indexed_effects)
 
         elseif m.method == :sncp
-            ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
-            amplitude_name = _find_parameter(p_names, string(p_names_k.amplitude), k,
-                is_multivariate_model)
-            parent_locs_x_name = _find_parameter(p_names, string(p_names_k.parent_locs_x), k,
-                is_multivariate_model)
-            parent_locs_y_name = _find_parameter(p_names, string(p_names_k.parent_locs_y), k,
-                is_multivariate_model)
+            ls_name = _find_parameter(
+                p_names, string(p_names_k.ls), k, is_multivariate_model
+            )
+            amplitude_name = _find_parameter(
+                p_names, string(p_names_k.amplitude), k, is_multivariate_model
+            )
+            parent_locs_x_name = _find_parameter(
+                p_names, string(p_names_k.parent_locs_x), k, is_multivariate_model
+            )
+            parent_locs_y_name = _find_parameter(
+                p_names, string(p_names_k.parent_locs_y), k, is_multivariate_model
+            )
             
-            n_parents = m.n_parents isa Int ? m.n_parents : error("Dynamic n_parents not supported in reconstruction yet.")
+            n_parents = if m.n_parents isa Int
+                m.n_parents
+            else
+                n_parents_name = _find_parameter(
+                    p_names, string(p_names_k.n_parents), k, is_multivariate_model
+                )
+                if !isempty(n_parents_name)
+                    n_p_vec = extract_chain_scalar(chain, n_parents_name)
+                    isempty(n_p_vec) ? 50 : round(Int, mean(n_p_vec))
+                else
+                    matching_x = filter(
+                        p -> startswith(p, string(p_names_k.parent_locs_x)), p_names
+                    )
+                    isempty(matching_x) ? 50 : length(matching_x)
+                end
+            end
 
-            if isempty(ls_name) || isempty(amplitude_name) || isempty(parent_locs_x_name)||
-                isempty(parent_locs_y_name)
-                @warn "Parameters for SNCP component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
+            if isempty(ls_name) || isempty(amplitude_name) ||
+               isempty(parent_locs_x_name) || isempty(parent_locs_y_name)
+                @warn "Parameters for SNCP component $(spec.key) (outcome $(k)) " *
+                      "not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end

@@ -179,6 +179,12 @@ with:
   with habitat suitability set to zero (\$hsi_l = 0\$), guaranteeing zero traversal
   probability (\$P_{il} = 0, P_{li} = 0\$) across the out-of-range bathymetric domain.
   CLI: `--depth-range <min,max>`, `--depth-min <min>`, `--depth-max <max>`.
+- `max_paths::Int`: Maximum number of individual Viterbi trajectories to
+  reconstruct and display in the path summary and map (default 25). CLI: `-p, --max-paths <N>`.
+- `path_method::Symbol`: Path reconstruction algorithm: `:astar` (default) or `:viterbi`.
+  CLI: `--path-method <astar|viterbi>`, `--astar`, `--viterbi`.
+- `smooth_paths::Bool`: Apply line-of-sight raycasting to eliminate hexagonal zig-zagging
+  while strictly preserving marine clearance around land (default false). CLI: `--smooth-paths`.
 - `n_samples::Int`: Number of MCMC posterior draws (default 200).
   CLI: `-n, -s, --samples <N>`.
 - `n_warmup::Int`: Number of MCMC warmup iterations (default 100).
@@ -211,6 +217,10 @@ function run_movement_individual(;
     hex_radius_km     :: Real   = 10.0,
     use_hydrodynamics :: Bool   = false,
     depth_range       :: Union{Nothing, Tuple{<:Real, <:Real}, AbstractVector{<:Real}, AbstractString} = nothing,
+    max_paths         :: Int    = 25,
+    path_method       :: Symbol = :astar,
+    smooth_paths      :: Bool   = false,
+    compute_circuit   :: Bool   = false,
     n_samples         :: Int    = 200,
     n_warmup          :: Int    = 100,
     seed              :: Int    = 42,
@@ -244,7 +254,8 @@ function run_movement_individual(;
 
     data = if data_source == :snowcrab
         if isdefined(Main, :snowcrab_movement_data)
-            Base.invokelatest(snowcrab_movement_data; verbose=verbose)
+            sc_rad = get(kwargs, :radius_km, (hex_radius_km != 10.0 ? hex_radius_km : 15.0))
+            Base.invokelatest(snowcrab_movement_data; radius_km=sc_rad, verbose=verbose)
         else
             @warn "snowcrab_movement_data.jl not found; falling back to :simulate."
             bstm_data("movement")
@@ -342,6 +353,7 @@ function run_movement_individual(;
         W = fine_mesh.W
         land_mask = identify_land_units(fine_mesh.centroids_lonlat; depth=resharded_depths)
         W, hsi_vec = apply_land_barrier(fine_mesh.W, resharded_hydro.hsi, land_mask)
+        sever_land_crossing_edges!(W, fine_mesh.centroids_lonlat)
         n_spatial = fine_mesh.n_units
 
         verbose && println("  - Resharding complete. Movement model will execute on fine hexagons!")
@@ -413,7 +425,7 @@ function run_movement_individual(;
     models = Dict{Symbol, Any}()
     chains = Dict{Symbol, Any}()
 
-    # ── 2. Pure Telemetry Model (No Dummy Outcomes) ──────────────────────────
+    # ── 2. Pure Telemetry Model ──────────────────────────
     if fit_telemetry
         verbose && println("\n[Step 2] Fitting Pure Telemetry Model (mode: \"telemetry\")...")
         verbose && println("  Likelihood: recapture ~ Categorical(P_g^k[release, :])")
@@ -594,8 +606,11 @@ function run_movement_individual(;
     # ── 5. Most Likely Path & Migration Corridor Reconstruction ───────────────
     verbose && println("\n[Step 5] Reconstructing individual movement paths and corridors...")
     
-    # Select example tracked individuals from observation data
-    sample_tags = unique(obs_df.tagid)[1:min(5, length(unique(obs_df.tagid)))]
+    # Select tracked individuals from observation data up to max_paths
+    all_unique_tags = unique(obs_df.tagid)
+    n_sample = min(max_paths, length(all_unique_tags))
+    sample_tags = all_unique_tags[1:n_sample]
+    verbose && println("  - Reconstructing Viterbi trajectories for $(n_sample) / $(length(all_unique_tags)) individuals (max_paths = $(max_paths))...")
     reconstructed_paths = Dict{String, Vector{Int}}()
     reconstructed_corridors = Dict{String, Matrix{Float64}}()
 
@@ -610,14 +625,21 @@ function run_movement_individual(;
             (1 <= grp <= length(P_kernel) ? P_kernel[grp] : first(P_kernel)) :
             P_kernel
 
+        cents_mesh = hasproperty(mesh, :centroids_lonlat) ? mesh.centroids_lonlat :
+                     (hasproperty(mesh, :centroids) ? mesh.centroids : nothing)
+
         # Combine consecutive segments
         full_tag_path = Int[sub_obs.release[1]]
         for row in eachrow(sub_obs)
             seg_path = predict_path(
-                P_k, row.release, row.recapture, row.k; land_mask=land_mask
+                P_k, row.release, row.recapture, row.k;
+                centroids=cents_mesh, method=path_method, land_mask=land_mask
             )
             # Append intermediate and destination units
             append!(full_tag_path, seg_path[2:end])
+        end
+        if smooth_paths && cents_mesh !== nothing
+            full_tag_path = smooth_marine_path(full_tag_path, cents_mesh)
         end
         reconstructed_paths[tid] = full_tag_path
 
@@ -651,12 +673,25 @@ function run_movement_individual(;
             )
             all_paths_vec = collect(values(reconstructed_paths))
 
+            # Extract all empirical mark-recapture vectors (displacement lines)
+            emp_tracks = [
+                [
+                    (Float64(cents_ll[r.release][1]), Float64(cents_ll[r.release][2])),
+                    (Float64(cents_ll[r.recapture][1]), Float64(cents_ll[r.recapture][2]))
+                ]
+                for r in eachrow(obs_df)
+                if 1 <= r.release <= length(cents_ll) && 1 <= r.recapture <= length(cents_ll)
+            ]
+            verbose && println("  - Extracted $(length(emp_tracks)) empirical mark-recapture vectors.")
+
             html_file = joinpath(output_dir, "movement_paths_dashboard.html")
             try
-                # Render tracks on the finer hexagonal mesh
+                # Render tracks on the hexagonal mesh with empirical tag observations layer
                 map_obj = leaflet_tracks_map(
                     all_paths_vec,
                     au_mesh;
+                    empirical_paths = emp_tracks,
+                    max_empirical_paths = max(500, length(emp_tracks)),
                     hsi   = hsi_vec,
                     title = "Individual Movement Trajectories & Migration Corridors" *
                             (reshard_hex || use_hydrodynamics ? " (Fine Hexagonal Mesh)" : "") *
@@ -669,6 +704,27 @@ function run_movement_individual(;
                 verbose && println("  (Leaflet rendering note: $e - saving ASCII summary instead)")
             end
 
+            # Generate the interactive two-click corridor & path ensemble dashboard
+            corridor_html = joinpath(output_dir, "movement_interactive_corridor.html")
+            try
+                grp_labels = [get(grp_name_lookup, g, "Group $g") for g in 1:G]
+                corridor_map = leaflet_interactive_corridor_dashboard(
+                    P_kernel,
+                    au_mesh;
+                    hsi = hsi_vec,
+                    empirical_paths = emp_tracks,
+                    group_labels = grp_labels,
+                    title = "Snow Crab Dynamic Movement Corridor & Path Ensemble Explorer" *
+                            (reshard_hex || use_hydrodynamics ? " (Fine Hexagons)" : "") *
+                            (parsed_depth_range !== nothing ?
+                             " [Depth: $(round(Int, min_d))-$(round(Int, max_d)) m]" : "")
+                )
+                save_html(corridor_map, corridor_html)
+                verbose && println("  Interactive two-click corridor dashboard saved to: $corridor_html")
+            catch e
+                verbose && println("  (Interactive corridor rendering note: $e)")
+            end
+
             # When hydrodynamic resharding was used, render the hydrodynamic dashboard on fine hexagons
             if !isnothing(resharded_hydro)
                 try
@@ -679,9 +735,61 @@ function run_movement_individual(;
                         title = "Scotian Shelf Hydrodynamics & Stratification (Fine Hexagons)"
                     )
                     save_html(dash, hydro_html)
-                    verbose && println("  Interactive Hydrodynamic Hexagonal dashboard saved to: $hydro_html")
+                    verbose && println(
+                        "  Interactive Hydrodynamic Hexagonal dashboard saved to: $hydro_html"
+                    )
                 catch e
                     verbose && println("  (Hydrodynamic dashboard rendering note: $e)")
+                end
+            end
+
+            # Generate the Circuit Theory Migratory Current Density dashboard if requested
+            if compute_circuit
+                density_html = joinpath(output_dir, "movement_current_density.html")
+                try
+                    verbose && println(
+                        "\n[Step 6c] Computing Circuit Migratory Current Density & Pinch-Points..."
+                    )
+                    sources = Int.(obs_df.release)
+                    sinks   = Int.(obs_df.recapture)
+                    cur_dens, _, _, _ = current_density_map(
+                        W, sources, sinks;
+                        hsi = hsi_vec,
+                        land_mask = land_mask
+                    )
+                    p_mask, p_score, p_thresh = identify_ecological_pinchpoints(
+                        cur_dens;
+                        top_quantile = 0.90
+                    )
+                    circuit_res = (
+                        current_density = cur_dens,
+                        pinch_mask = p_mask,
+                        pinch_score = p_score,
+                        threshold = p_thresh
+                    )
+                    verbose && println(
+                        "  - Analyzed $(length(sources)) transition vectors across network"
+                    )
+                    verbose && println(
+                        "  - Identified $(sum(p_mask)) critical ecological pinch-points " *
+                        "(threshold = $(round(p_thresh, digits=4)))"
+                    )
+
+                    if render_html
+                        leaflet_current_density_map(
+                            au_mesh, cur_dens;
+                            pinch_mask = p_mask,
+                            pinch_score = p_score,
+                            centroids = cents_ll,
+                            output_html = density_html,
+                            title = "Snow Crab Migratory Current Density & Ecological Pinch-Points"
+                        )
+                        verbose && println(
+                            "  Interactive Current Density dashboard saved to: $density_html"
+                        )
+                    end
+                catch e
+                    verbose && println("  (Circuit current density computation note: $e)")
                 end
             end
         end
@@ -699,7 +807,8 @@ function run_movement_individual(;
         paths       = reconstructed_paths,
         corridors   = reconstructed_corridors,
         parameters  = (alpha=alpha_hat, residence=rho_hat, gamma=g_mean),
-        depth_range = parsed_depth_range
+        depth_range = parsed_depth_range,
+        circuit     = circuit_res
     )
 end
 
@@ -734,9 +843,14 @@ Options:
       --hydro                  Extract 3D hydrodynamic fields and bathymetry.
       --depth-range <min,max>  Force all movement within depth range in meters (e.g. '50,300').
                                Sever all network graph links outside range (P = 0 traversal).
-      --depth-min <min>        Minimum traversal depth in meters.
-      --depth-max <max>        Maximum traversal depth in meters.
-  -n, -s, --samples <N>        Number of MCMC posterior draws (default: 200).
+       --depth-min <min>        Minimum traversal depth in meters.
+       --depth-max <max>        Maximum traversal depth in meters.
+   -p, --max-paths <N>          Maximum number of Viterbi trajectories to reconstruct (default: 25).
+       --path-method <method>   Path reconstruction method: 'astar' (default) or 'viterbi'.
+       --astar                  Shorthand for --path-method=astar.
+       --viterbi                Shorthand for --path-method=viterbi.
+       --smooth-paths           Apply line-of-sight raycasting to smooth hexagonal trajectories.
+   -n, -s, --samples <N>        Number of MCMC posterior draws (default: 200).
   -w, --warmup <N>             Number of MCMC warmup iterations (default: 100).
       --seed <N>               Random number generator seed (default: 42).
       --render-html, --html    Export interactive Leaflet HTML dashboard (default: true).
@@ -878,6 +992,22 @@ function parse_movement_cli_args(
             opts[:depth_min] = parse(Float64, fetch_val())
         elseif key in ("--depth-max", "--max-depth")
             opts[:depth_max] = parse(Float64, fetch_val())
+        elseif key in ("--max-paths", "--paths", "-p")
+            opts[:max_paths] = parse(Int, fetch_val())
+        elseif key in ("--path-method", "--algorithm")
+            opts[:path_method] = Symbol(lowercase(fetch_val()))
+        elseif key == "--astar"
+            opts[:path_method] = :astar
+        elseif key == "--viterbi"
+            opts[:path_method] = :viterbi
+        elseif key in ("--smooth-paths", "--smooth")
+            opts[:smooth_paths] = true
+        elseif key in ("--circuit", "--current-density", "--conductance")
+            if has_inline
+                opts[:compute_circuit] = !(lowercase(inline_val) in ("false", "0", "no", "off"))
+            else
+                opts[:compute_circuit] = true
+            end
         elseif key in ("--n-samples", "--samples", "-n", "-s")
             opts[:n_samples] = parse(Int, fetch_val())
         elseif key in ("--n-warmup", "--warmup", "-w")

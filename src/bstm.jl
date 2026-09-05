@@ -81,10 +81,13 @@ module bstm
     # Core framework files 
     include( "definitions.jl")  # must be first
     
+    # order is important:
     include( "data.jl")
     include( "derivatives.jl")
     include( "hierarchical.jl") 
     include( "input_output.jl")
+    include( "circuit.jl")
+    include( "graph_wavelets.jl")
     include( "leaflet.jl")
     include( "likelihoods.jl")
     include( "model.jl")
@@ -200,6 +203,7 @@ module bstm
         leaflet_render_paths,
         leaflet_spacetime_map, 
         leaflet_movement_dashboard,
+        leaflet_interactive_corridor_dashboard,
         leaflet_dispersal_kernel, 
         leaflet_step_diagnostics,
         leaflet_regional_connectivity, 
@@ -215,6 +219,14 @@ module bstm
         simulate_mechanistic_trajectories,
         construct_stochastic_transition_kernel,
         predict_path,
+        astar_predict_path,
+        astar_least_cost_path,
+        astar_stochastic_least_cost_path,
+        astar_stochastic_predict_path,
+        StochasticAStarResult,
+        AStar,
+        get_astar_paths,
+        smooth_marine_path,
         predict_corridor,
         compute_suitability_transition_kernel, 
         calculate_regional_connectivity,
@@ -242,12 +254,42 @@ module bstm
         point_in_polygon,
         identify_land_units,
         apply_land_barrier,
+        sever_land_crossing_edges!,
+        compact_marine_mesh,
         infill_spatial_hsi,
         construct_full_movement_domain,
         compute_directed_adjacency, 
         resolvent_transition,
         decompose_bstm_formula,  
  
+        # Circuit Theory & Ecological Connectivity exports
+        Circuit,
+        PosteriorCircuitResult,
+        build_circuit_laplacian,
+        effective_resistance_matrix,
+        solve_circuit_voltage,
+        pairwise_effective_resistance,
+        current_density_map,
+        identify_ecological_pinchpoints,
+        identify_stochastic_pinchpoints,
+        posterior_circuit_inference,
+        get_circuit_paths,
+        resistance_covariance_matrix,
+        leaflet_current_density_map,
+
+        # Spectral Graph Wavelets (SGWT) exports
+        GraphWavelet,
+        SpectralGraphWaveletResult,
+        build_normalized_laplacian,
+        compute_laplacian_spectral_bounds,
+        chebyshev_polynomial_coefficients,
+        apply_graph_spectral_filter,
+        spectral_graph_wavelet_transform,
+        inverse_spectral_graph_wavelet_transform,
+        denoise_spatial_signal_wavelet,
+        graph_wavelet_basis_matrix,
+        leaflet_graph_wavelet_dashboard,
+
         # Input / Output & Persistence exports
         save_bstm_model, 
         load_bstm_model,

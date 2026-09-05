@@ -777,7 +777,7 @@ function resolve_hyperpriors(model_name::String, global_priors::Dict, local_para
         :range, :period, :amplitude, :phase, :velocity, :diffusion, :pca_sd, 
         :pdef_sd, :L_corr, :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, 
         :gamma, :delta, :curvature, :rho_sigma, :rho_rho, :sigma0, :shape, :nu,
-        :beta_het, :beta_habitat_diffusion
+        :beta_het, :beta_habitat_diffusion, :friction_power
     ]
 
     resolved = Dict{Symbol, Any}()
@@ -1605,9 +1605,17 @@ function bstm_config(
     if !isnothing(decomposed_formula.intercept_prior)
         prior_val = decomposed_formula.intercept_prior
         if prior_val isa Expr
-            try; M[:intercept_prior] = Core.eval(calling_module, prior_val);
-            catch e; error("Could not evaluate `prior` argument `$(prior_val)` in intercept() module. Error: $e"); end
-        else; M[:intercept_prior] = prior_val; end
+            try
+                M[:intercept_prior] = Core.eval(calling_module, prior_val)
+            catch e
+                error(
+                    "Could not evaluate `prior` argument `$(prior_val)` " *
+                    "in intercept() module. Error: $e"
+                )
+            end
+        else
+            M[:intercept_prior] = prior_val
+        end
     end
 
     for (key, mod_data_nt) in decomposed_formula.modules
@@ -1708,7 +1716,8 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
         :kappa, :ls, :range, :period,
         :amplitude, :phase, :velocity, :diffusion, :pca_sd, :pdef_sd, :L_corr,
         :sigma_effects, :r, :K, :q, :M_nat, :alpha, :beta, :gamma, :delta, :curvature,
-        :nu, :sigma0, :shape, :beta_het, :beta_habitat_diffusion
+        :nu, :sigma0, :shape, :beta_het, :beta_habitat_diffusion, :tau_error,
+        :friction_power, :sigma_process
     ]
     for p in hyperparameters
         p_is_shared = is_param_shared(shared_spec, p)
@@ -1720,6 +1729,7 @@ function generate_full_variable_names(spec::NamedTuple, arch::String, outcome_id
     # These are always unique per outcome in a multivariate model.
     latent_fields = [
         :ure, :sre, :ure_diag, :ure_pic, :ure_inducing, :ure_rho, :ure_cluster, :ure_predator,
+        :ure_hab,
         :beta_cos, :beta_sin, :rho_field,
         :W, :b, :v_unscaled, :factors_flat, :thresh_unscaled,
         :W1, :b1, :W2, :amplitude_unscaled,
@@ -3096,7 +3106,11 @@ macro bstm(exprs...)
             if (ex.head == :kw || ex.head == :(=)) && length(ex.args) == 2
                 k = ex.args[1]
                 v = ex.args[2]
-                if k in (:W, :Q, :habitat, :telemetry_data, :mark_recapture_data) && !haskey(kwdict, k)
+                promote_keys = (
+                    :W, :Q, :habitat, :centroids, :sources, :sinks,
+                    :telemetry_data, :mark_recapture_data
+                )
+                if k in promote_keys && !haskey(kwdict, k)
                     kwdict[k] = v
                     push!(raw_kwargs, Expr(:kw, k, v))
                 end
@@ -3753,12 +3767,16 @@ function build_structure_template(model_type::Symbol, n::Int; W::Union{AbstractM
         if n > 1
             Q_template = spdiagm(0 => fill(6.0, n), -1 => fill(-4.0, n-1), 1 => fill(-4.0,
                 n-1), -2 => fill(1.0, n-2), 2 => fill(1.0, n-2))
-            Q_template[1, 1] = 1.0; Q_template[2, 2] = 5.0
-            Q_template[1, 2] = -2.0; Q_template[2, 1] = -2.0
-            Q_template[n-1, n-1] = 5.0; Q_template[n, n] = 1.0
-            Q_template[n-1, n] = -2.0; Q_template[n, n-1] = -2.0
+            Q_template[1, 1] = 1.0
+            Q_template[2, 2] = 5.0
+            Q_template[1, 2] = -2.0
+            Q_template[2, 1] = -2.0
+            Q_template[n-1, n-1] = 5.0
+            Q_template[n, n] = 1.0
+            Q_template[n-1, n] = -2.0
+            Q_template[n, n-1] = -2.0
         elseif n == 1
-            Q_template[1,1] = 1.0
+            Q_template[1, 1] = 1.0
         end
         rank_deficiency = 2
     elseif model_type == :cyclic

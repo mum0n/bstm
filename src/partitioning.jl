@@ -2635,16 +2635,34 @@ function build_hex_mesh_planar(
     dx = sqrt(3.0) * r
     dy = 1.5 * r
 
-    centre_set = Set{Tuple{Float64, Float64}}()
-    for (xk, yk) in pts_km
-        row  = round(Int, yk / dy)
+    # Determine planar domain bounds (expanded by r to ensure complete boundary coverage)
+    x_coords = [p[1] for p in pts_km]
+    y_coords = [p[2] for p in pts_km]
+    x_min, x_max = extrema(x_coords)
+    y_min, y_max = extrema(y_coords)
+
+    x_min -= r
+    x_max += r
+    y_min -= r
+    y_max += r
+
+    row_min = floor(Int, y_min / dy)
+    row_max = ceil(Int, y_max / dy)
+
+    centroids_km = Tuple{Float64, Float64}[]
+    for row in row_min:row_max
+        yk   = row * dy
         xoff = isodd(row) ? (dx / 2.0) : 0.0
-        col  = round(Int, (xk - xoff) / dx)
-        push!(centre_set, (col * dx + xoff, row * dy))
+        col_min = floor(Int, (x_min - xoff) / dx)
+        col_max = ceil(Int, (x_max - xoff) / dx)
+        for col in col_min:col_max
+            xk = col * dx + xoff
+            push!(centroids_km, (xk, yk))
+        end
     end
 
-    centroids_km = sort!(collect(centre_set), by = c -> (c[2], c[1]))
-    S            = length(centroids_km)
+    sort!(centroids_km, by = c -> (c[2], c[1]))
+    S = length(centroids_km)
 
     polygons_km      = Vector{Vector{Tuple{Float64, Float64}}}(undef, S)
     polygons_lonlat  = Vector{Vector{Tuple{Float64, Float64}}}(undef, S)

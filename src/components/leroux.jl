@@ -280,23 +280,23 @@ function get_effects(
 
     # --- Coordinate/Index Handling: Combine training and prediction sets on CPU ---
     s_idx_train = M.s_idx
-    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx)
-        vcat(s_idx_train, PS.data.s_idx)
-    else
-        s_idx_train
-    end
-    N_total = length(s_idx_full)
+    s_idx_full, N_total = _resolve_effect_indices(M, PS, :s_idx)
 
     structured_effects = Vector{Matrix{Float64}}()
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
+        sigma_name = _find_parameter(
+            p_names, string(p_names_k.sigma), k, is_multivariate_model
+        )
+        rho_name = _find_parameter(
+            p_names, string(p_names_k.rho), k, is_multivariate_model
+        )
 
         if isempty(sigma_name) || isempty(rho_name)
-            @warn "Parameters for Leroux component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+            @warn "Parameters for Leroux component $(spec.key) (outcome $k) " *
+                  "not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
@@ -354,27 +354,36 @@ function get_effects(
                 effect_k_latent[:, s] = x_train
             end
         else
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+            ure_name = _find_parameter(
+                p_names, string(p_names_k.ure), k, is_multivariate_model
+            )
             if isempty(ure_name)
-                @warn "ure for Leroux component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+                @warn "ure for Leroux component $(spec.key) (outcome $k) not found. " *
+                      "Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
             ure_samples = get_params_matrix(chain, ure_name, n_latent)
 
-            for s in 1:n_samples
-                sigma_s = sigma_samples[s, 1]
-                rho_s = rho_samples[s, 1]
-                innov_s = ure_samples[s, :]
-
-                if m.method == :spectral
-                    U = spec.hyper.U
-                    L_eig = spec.hyper.L
+            if m.method == :spectral
+                U = spec.hyper.U
+                L_eig = spec.hyper.L
+                # Vectorized Level-3 BLAS across all MCMC draws
+                Z = Matrix{Float64}(undef, n_latent, n_samples)
+                for s in 1:n_samples
+                    sigma_s = sigma_samples[s, 1]
+                    rho_s = rho_samples[s, 1]
                     diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig .+ noise)
-                    effect_k_latent[:, s] = U * (diag_D_s .* innov_s)
-                else # :cholesky or :cholesky_sparse
-                    Q_template = spec.hyper.Q_template
-                    I_mat = Matrix{Float64}(I, n_latent, n_latent)
+                    Z[:, s] = diag_D_s .* ure_samples[s, :]
+                end
+                effect_k_latent = U * Z
+            else # :cholesky or :cholesky_sparse
+                Q_template = spec.hyper.Q_template
+                I_mat = Matrix{Float64}(I, n_latent, n_latent)
+                for s in 1:n_samples
+                    sigma_s = sigma_samples[s, 1]
+                    rho_s = rho_samples[s, 1]
+                    innov_s = ure_samples[s, :]
                     Q_final = (1.0 - rho_s) .* I_mat .+ rho_s .* Q_template
                     F = cholesky(Symmetric(Q_final + noise * I_mat))
                     effect_k_latent[:, s] = sigma_s .* (F.U \ innov_s)

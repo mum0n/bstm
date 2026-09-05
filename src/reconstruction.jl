@@ -176,8 +176,109 @@ function _find_parameter(
     return "" # Return empty string if no match is found.
 end
 
+"""
+    _resolve_effect_indices(M::NamedTuple, PS::Union{NamedTuple, Nothing}, var_sym::Symbol)
 
- 
+Extracts and harmonizes spatial, temporal, or general unit observation indices
+across training data and optional out-of-sample prediction sets (`PS`).
+
+# Arguments
+- `M::NamedTuple`: Main model configuration dictionary or NamedTuple.
+- `PS::Union{NamedTuple, Nothing}`: Optional prediction set configuration.
+- `var_sym::Symbol`: Target index variable (`:s_idx`, `:t_idx`, `:st_idx`, etc.).
+
+# Returns
+- `Tuple{Vector{Int}, Int}`: `(full_indices, N_total)` where `N_total = length(full_indices)`.
+"""
+function _resolve_effect_indices(
+    M::NamedTuple,
+    PS::Union{NamedTuple, Nothing},
+    var_sym::Symbol = :s_idx
+)::Tuple{Vector{Int}, Int}
+    train_idx = if hasproperty(M, var_sym)
+        collect(Int, getproperty(M, var_sym))
+    elseif haskey(M, var_sym)
+        collect(Int, M[var_sym])
+    else
+        Int[]
+    end
+
+    full_idx = if !isnothing(PS)
+        pred_idx = if hasproperty(PS, :data) && hasproperty(PS.data, var_sym)
+            collect(Int, getproperty(PS.data, var_sym))
+        elseif hasproperty(PS, :data) && haskey(PS.data, var_sym)
+            collect(Int, PS.data[var_sym])
+        elseif hasproperty(PS, var_sym)
+            collect(Int, getproperty(PS, var_sym))
+        elseif haskey(PS, var_sym)
+            collect(Int, PS[var_sym])
+        else
+            Int[]
+        end
+        vcat(train_idx, pred_idx)
+    else
+        train_idx
+    end
+
+    return (full_idx, length(full_idx))
+end
+
+"""
+    extract_chain_scalar(chain, param_prefix::Union{String, Symbol}; default=nothing)
+
+Robustly extracts a scalar parameter vector across all posterior draws in an MCMC chain,
+supporting `VNChain`, `FlexiChain`, `Chains`, `DataFrame`, `Dict`, and `NamedTuple`.
+
+# Arguments
+- `chain`: MCMC posterior chain or container.
+- `param_prefix`: Base symbol or string name of the target parameter.
+- `default`: Optional fallback value if parameter is not located. If `nothing`, throws error.
+
+# Returns
+- `Vector{Float64}`: Vector of posterior parameter values of length `n_samples`.
+"""
+function extract_chain_scalar(
+    chain,
+    param_prefix::Union{String, Symbol};
+    default::Union{Nothing, Real, AbstractVector{<:Real}} = nothing
+)::Vector{Float64}
+    pref_str = string(param_prefix)
+
+    # 1. Direct key lookup for Dict / NamedTuple
+    if chain isa NamedTuple || chain isa AbstractDict
+        for (k, v) in pairs(chain)
+            sk = string(k)
+            if sk == pref_str || sk == "$(pref_str)_1" ||
+               sk == "$(pref_str)_s_idx" || sk == "$(pref_str)_movement"
+                return v isa AbstractVector ? Float64.(v) : [Float64(v)]
+            end
+        end
+    end
+
+    # 2. Extract clean parameter names
+    p_names = _get_clean_chain_param_names(chain)
+    matched = _find_parameter(p_names, pref_str, 1, false)
+
+    if !isempty(matched)
+        return get_params_vector(chain, matched, 1)[:, 1]
+    end
+
+    # 3. Check for common prefix variants
+    for candidate in ["$(pref_str)_s_idx", "$(pref_str)_movement", "$(pref_str)_t_idx"]
+        m_cand = _find_parameter(p_names, candidate, 1, false)
+        if !isempty(m_cand)
+            return get_params_vector(chain, m_cand, 1)[:, 1]
+        end
+    end
+
+    # 4. Handle default or informative error
+    if !isnothing(default)
+        n_s = _get_chain_n_samples(chain)
+        return default isa AbstractVector ? Float64.(default) : fill(Float64(default), n_s)
+    end
+
+    error("Parameter matching '$(pref_str)' was not found in the MCMC chain.")
+end
 
 
 """
@@ -1966,11 +2067,26 @@ function _predict_categorical_movement(model_obj, chain, new_data::DataFrame, n_
     group_lookup = M.group_lookup
     groups = if hasproperty(new_data, :group)
         Vector{Int}(new_data.group)
+    elseif hasproperty(new_data, :group_id)
+        Vector{Int}(new_data.group_id)
     elseif hasproperty(new_data, :sex) && hasproperty(new_data, :mat)
-        # Map using build_group_indices logic
-        [get(group_lookup, "$(r.sex)_$(r.mat)", 1) for r in eachrow(new_data)]  # need to update todo!  
+        [get(group_lookup, "$(r.sex)_$(r.mat)", 1) for r in eachrow(new_data)]
     else
-        ones(Int, nrow(new_data))
+        matched = ones(Int, nrow(new_data))
+        cols = propertynames(new_data)
+        for (idx, r) in enumerate(eachrow(new_data))
+            for (lbl, g_id) in pairs(group_lookup)
+                cand_matches = [
+                    string(r[c]) for c in cols
+                    if r[c] isa Union{String, Symbol, Number}
+                ]
+                if any(m -> occursin(m, string(lbl)), cand_matches)
+                    matched[idx] = g_id
+                    break
+                end
+            end
+        end
+        matched
     end
 
     G = length(group_lookup)
@@ -1986,7 +2102,7 @@ function _predict_categorical_movement(model_obj, chain, new_data::DataFrame, n_
     actual_samps = length(sample_indices)
 
     for (s_idx, chain_i) in enumerate(sample_indices)
-        # Extract parameter draws for this sample across groups (supporting all parameter prefix conventions)
+        # Extract parameter draws for this sample across groups
         function _extract_draw_val(prefix, g, chain_idx)
             candidates = [
                 "$(prefix)[$g]",
@@ -2020,8 +2136,11 @@ function _predict_categorical_movement(model_obj, chain, new_data::DataFrame, n_
             d_val = _extract_draw_val("diffusion", g, chain_i)
             g_val = _extract_draw_val("gamma", g, chain_i)
             tot   = v_val + d_val + 1e-6
-            alpha_g = clamp(v_val / tot, 0.0, 1.0)
-            rho_g   = clamp(1.0 / (1.0 + tot), 0.01, 0.95)
+            if tot <= 1e-6
+                @warn "Total movement velocity + diffusion <= 0 for group $g. Using default dispersal."
+            end
+            alpha_g = max(0.0, min(1.0, v_val / tot))
+            rho_g   = max(0.001, min(0.999, 1.0 / (1.0 + tot)))
 
             P_g = construct_stochastic_transition_kernel(
                 W_sp, hsi; gamma=g_val, residence=rho_g, advection=alpha_g

@@ -116,6 +116,14 @@ struct Dynamics <: ComponentModel
     model::String
     params::Dict{Symbol, Any}
     resolution::Int
+
+    function Dynamics(
+        model::String,
+        params::Dict{Symbol, Any} = Dict{Symbol, Any}(),
+        resolution::Int = 30
+    )
+        return new(model, params, resolution)
+    end
 end
 
 COMPONENT_TYPE_REGISTRY[:dynamics] = Dynamics
@@ -692,13 +700,15 @@ function get_updates(
                 for s in 1:$(s_N)
                     L_s = zeros(T, $(n_classes), $(n_classes));
                     if $(spatially_varying_rates)
-                        for i in 1:($(n_classes)-1); L_s[i+1, i] = survival_rates_spatial[s,
-                          i]; end;
-                        L_s[1, :] = fecundity_rates_spatial[s, :];
+                        for i in 1:($(n_classes)-1)
+                            L_s[i+1, i] = survival_rates_spatial[s, i]
+                        end
+                        L_s[1, :] = fecundity_rates_spatial[s, :]
                     else
-                        for i in 1:($(n_classes)-1); L_s[i+1, i] =
-                          survival_rates_$(key_str)[i]; end;
-                        L_s[1, :] = fecundity_rates_$(key_str);
+                        for i in 1:($(n_classes)-1)
+                            L_s[i+1, i] = survival_rates_$(key_str)[i]
+                        end
+                        L_s[1, :] = fecundity_rates_$(key_str)
                     end
                     for t in 2:$(t_N)
                         N_prev = view(population_field_$(key_str), s, t-1, :);
@@ -776,7 +786,9 @@ function get_updates(
             """
         end
     end
-    return "# Dynamics model '$(m.model)' not implemented for this architecture."
+    throw(ArgumentError(
+        "Dynamics model '$(m.model)' is not supported for architecture '$(arch)'."
+    ))
 end
 
 """
@@ -790,11 +802,7 @@ function get_effects(
     PS::Union{NamedTuple, Nothing}
 )::NamedTuple
     # --- Setup: Extract dimensions ---
-    n_samples = if occursin("FlexiChain", string(typeof(chain)))
-        size(chain, 1) * FlexiChains.nchains(chain)
-    else
-        size(chain, 1) * size(chain, 3)
-    end
+    n_samples = _get_chain_n_samples(chain)
     outcomes_N = M.outcomes_N
     is_multivariate_model = M.model_arch == "multivariate"
     p_names = string.(keys(chain))
@@ -805,21 +813,8 @@ function get_effects(
     hyper = spec.hyper
 
     # --- Coordinate/Index Handling: Combine training and prediction sets on CPU ---
-    s_idx_train = hyper.s_idx # Spatial indices for training data
-    t_idx_train = hyper.t_idx # Temporal indices for training data
-    
-    s_idx_full = if !isnothing(PS) && hasproperty(PS.data, :s_idx) # If prediction set is provided
-        vcat(s_idx_train, PS.data.s_idx) # Combine training and prediction spatial indices
-    else
-        s_idx_train # Otherwise, use only training spatial indices
-    end
-    t_idx_full = if !isnothing(PS) && hasproperty(PS.data, :t_idx) # If prediction set is provided
-        vcat(t_idx_train, PS.data.t_idx) # Combine training and prediction temporal indices
-    else
-        t_idx_train # Otherwise, use only training temporal indices
-    end
-    
-    N_total = length(s_idx_full)
+    s_idx_full, N_total = _resolve_effect_indices(M, PS, :s_idx)
+    t_idx_full, _ = _resolve_effect_indices(M, PS, :t_idx)
     t_N_full = isempty(t_idx_full) ? 0 : maximum(t_idx_full)
 
     L_op = hyper.L_template
@@ -833,6 +828,7 @@ function get_effects(
     st_idx_full = (t_idx_full .- 1) .* s_N .+ s_idx_full
 
     structured_effects = Vector{Matrix{Float64}}()
+    simulated_pop_tensor = nothing
 
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k_outcome in 1:outcomes_N
@@ -1120,8 +1116,376 @@ function get_effects(
             effect_k = log_dyn_field[st_idx_full, :]
             push!(structured_effects, effect_k)
 
+        elseif model_type == "leslie_matrix"
+            if isnothing(simulated_pop_tensor)
+                n_classes = get(params, :n_age_classes, outcomes_N)
+                spatially_varying_K = get(params, :spatially_varying_K, false)
+                spatially_varying_rates = get(params, :spatially_varying_rates, false)
+
+                sigma_p_name = _find_parameter(
+                    p_names, string(p_names_k.sigma_process), k_outcome,
+                    is_multivariate_model
+                )
+                if isempty(sigma_p_name)
+                    sigma_p_name = _find_parameter(
+                        p_names, "sigma_process_$(key_str)", 1, is_multivariate_model
+                    )
+                end
+                ure_name = _find_parameter(
+                    p_names, string(p_names_k.ure), k_outcome, is_multivariate_model
+                )
+                if isempty(ure_name)
+                    ure_name = _find_parameter(
+                        p_names, "ure_$(key_str)", 1, is_multivariate_model
+                    )
+                end
+
+                if isempty(sigma_p_name) || isempty(ure_name)
+                    @warn "Parameters for Leslie Dynamics $(key_str) not found."
+                    simulated_pop_tensor = zeros(
+                        Float64, s_N, t_N_full, n_classes, n_samples
+                    )
+                else
+                    sigma_p_samples = get_params_matrix(
+                        chain, sigma_p_name, n_classes
+                    )
+                    ure_samples = get_params_matrix(
+                        chain, ure_name, s_N * t_N * n_classes
+                    )
+
+                    local surv_rates_fixed, fec_rates_fixed
+                    local fec_unscaled_samples, fec_mean_samples, fec_sig_samples
+                    local surv_unscaled_samples, surv_mean_samples, surv_sig_samples
+                    if spatially_varying_rates
+                        fec_unscaled_samples = get_params_matrix(
+                            chain, "fecundity_unscaled_$(key_str)", s_N * n_classes
+                        )
+                        fec_mean_samples = get_params_matrix(
+                            chain, "log_fecundity_mean_$(key_str)", n_classes
+                        )
+                        fec_sig_samples = get_params_matrix(
+                            chain, "sigma_fecundity_$(key_str)", n_classes
+                        )
+                        surv_unscaled_samples = get_params_matrix(
+                            chain, "survival_unscaled_$(key_str)",
+                            s_N * (n_classes - 1)
+                        )
+                        surv_mean_samples = get_params_matrix(
+                            chain, "logit_survival_mean_$(key_str)", n_classes - 1
+                        )
+                        surv_sig_samples = get_params_matrix(
+                            chain, "sigma_survival_$(key_str)", n_classes - 1
+                        )
+                    else
+                        surv_name = _find_parameter(
+                            p_names, "survival_rates_$(key_str)", 1,
+                            is_multivariate_model
+                        )
+                        fec_name = _find_parameter(
+                            p_names, "fecundity_rates_$(key_str)", 1,
+                            is_multivariate_model
+                        )
+                        surv_rates_fixed = !isempty(surv_name) ?
+                            get_params_matrix(chain, surv_name, n_classes - 1) :
+                            fill(0.8, n_samples, n_classes - 1)
+                        fec_rates_fixed = !isempty(fec_name) ?
+                            get_params_matrix(chain, fec_name, n_classes) :
+                            fill(1.0, n_samples, n_classes)
+                    end
+
+                    local K_samples_mat, K_unscaled, log_K_mean, sig_K
+                    if spatially_varying_K
+                        K_unscaled = get_params_matrix(
+                            chain, "K_unscaled_$(key_str)", s_N
+                        )
+                        log_K_mean = get_params_vector(
+                            chain, "log_K_mean_$(key_str)", 1
+                        )[:, 1]
+                        sig_K = get_params_vector(
+                            chain, "sigma_K_$(key_str)", 1
+                        )[:, 1]
+                    elseif haskey(params, :K)
+                        K_name = _find_parameter(
+                            p_names, "K_$(key_str)", 1, is_multivariate_model
+                        )
+                        K_samples_mat = !isempty(K_name) ?
+                            get_params_vector(chain, K_name, 1)[:, 1] :
+                            fill(100.0, n_samples)
+                    end
+
+                    effort_keys = spec.hyper.effort_keys
+                    q_samples_dict = Dict(
+                        key => get_params_matrix(
+                            chain,
+                            _find_parameter(
+                                p_names, "q_$(key)", 1, is_multivariate_model
+                            ),
+                            n_classes
+                        ) for key in effort_keys
+                    )
+
+                    pop_tensor = zeros(
+                        Float64, s_N, t_N_full, n_classes, n_samples
+                    )
+                    F_sp_obj = cholesky(
+                        Symmetric(Matrix(hyper.L_template) + noise * I)
+                    )
+
+                    for j in 1:n_samples
+                        ure_train = reshape(
+                            ure_samples[j, :], s_N, t_N, n_classes
+                        )
+                        ure_full = if t_N_full > t_N
+                            cat(
+                                ure_train,
+                                randn(s_N, t_N_full - t_N, n_classes),
+                                dims = 2
+                            )
+                        else
+                            ure_train[:, 1:t_N_full, :]
+                        end
+
+                        sig_proc = sigma_p_samples[j, :]
+
+                        for a in 1:n_classes
+                            pop_tensor[:, 1, a, j] = max.(
+                                0.0, ure_full[:, 1, a] .* sig_proc[a]
+                            )
+                        end
+
+                        local S_rates, F_rates
+                        if spatially_varying_rates
+                            fec_field = F_sp_obj.L' \ reshape(
+                                fec_unscaled_samples[j, :], s_N, n_classes
+                            )
+                            F_rates = exp.(
+                                fec_mean_samples[j, :]' .+
+                                fec_field .* fec_sig_samples[j, :]'
+                            )
+                            surv_field = F_sp_obj.L' \ reshape(
+                                surv_unscaled_samples[j, :], s_N, n_classes - 1
+                            )
+                            S_rates = 1.0 ./ (
+                                1.0 .+ exp.-(
+                                    surv_mean_samples[j, :]' .+
+                                    surv_field .* surv_sig_samples[j, :]'
+                                )
+                            )
+                        end
+
+                        local K_spatial
+                        if spatially_varying_K
+                            K_field = F_sp_obj.L' \ K_unscaled[j, :]
+                            K_spatial = exp.(
+                                log_K_mean[j] .+ K_field .* sig_K[j]
+                            )
+                        elseif haskey(params, :K)
+                            K_spatial = fill(K_samples_mat[j], s_N)
+                        end
+
+                        for s in 1:s_N
+                            L_s = zeros(Float64, n_classes, n_classes)
+                            if spatially_varying_rates
+                                for i in 1:(n_classes - 1)
+                                    L_s[i+1, i] = S_rates[s, i]
+                                end
+                                L_s[1, :] = F_rates[s, :]
+                            else
+                                for i in 1:(n_classes - 1)
+                                    L_s[i+1, i] = surv_rates_fixed[j, i]
+                                end
+                                L_s[1, :] = fec_rates_fixed[j, :]
+                            end
+
+                            for t in 2:t_N_full
+                                N_prev = pop_tensor[s, t-1, :, j]
+                                exploit = zeros(Float64, n_classes)
+                                for e_key in effort_keys
+                                    eff = spec.hyper.processed_params[
+                                        Symbol(e_key)
+                                    ][s, min(t-1, t_N)]
+                                    exploit .+= q_samples_dict[e_key][j, :] .*
+                                        eff .* N_prev
+                                end
+                                for r_key in spec.hyper.removal_keys
+                                    remov = spec.hyper.processed_params[
+                                        Symbol(r_key)
+                                    ][s, min(t-1, t_N), :]
+                                    exploit .+= remov
+                                end
+                                N_rem = max.(0.0, N_prev .- exploit)
+                                L_eff = copy(L_s)
+                                if spatially_varying_K || haskey(params, :K)
+                                    tot_pop = sum(N_rem)
+                                    K_dens = K_spatial[s] / areas[s]
+                                    dd = max(
+                                        0.0,
+                                        1.0 - (tot_pop / areas[s]) / K_dens
+                                    )
+                                    L_eff[1, :] .*= dd
+                                end
+                                N_proj = L_eff * N_rem
+                                innov = ure_full[s, t, :] .* sig_proc
+                                pop_tensor[s, t, :, j] = max.(
+                                    0.0, N_proj .+ innov
+                                )
+                            end
+                        end
+                    end
+                    simulated_pop_tensor = pop_tensor
+                end
+            end
+            pop_k = simulated_pop_tensor[:, :, k_outcome, :]
+            log_dyn_field = log.(
+                reshape(pop_k, s_N * t_N_full, n_samples) .+ 1e-6
+            )
+            effect_k = log_dyn_field[st_idx_full, :]
+            push!(structured_effects, effect_k)
+
+        elseif model_type == "generalized_lotka_volterra"
+            if isnothing(simulated_pop_tensor)
+                n_species = outcomes_N
+                spatially_varying_K = get(params, :spatially_varying_K, false)
+
+                sigma_p_name = _find_parameter(
+                    p_names, string(p_names_k.sigma_process), k_outcome,
+                    is_multivariate_model
+                )
+                if isempty(sigma_p_name)
+                    sigma_p_name = _find_parameter(
+                        p_names, "sigma_process_$(key_str)", 1, is_multivariate_model
+                    )
+                end
+                ure_name = _find_parameter(
+                    p_names, string(p_names_k.ure), k_outcome, is_multivariate_model
+                )
+                if isempty(ure_name)
+                    ure_name = _find_parameter(
+                        p_names, "ure_$(key_str)", 1, is_multivariate_model
+                    )
+                end
+
+                if isempty(sigma_p_name) || isempty(ure_name)
+                    @warn "Parameters for GLV Dynamics $(key_str) not found."
+                    simulated_pop_tensor = zeros(
+                        Float64, s_N, t_N_full, n_species, n_samples
+                    )
+                else
+                    sigma_p_samples = get_params_matrix(
+                        chain, sigma_p_name, n_species
+                    )
+                    ure_samples = get_params_matrix(
+                        chain, ure_name, s_N * t_N * n_species
+                    )
+
+                    r_samples = get_params_matrix(
+                        chain, "r_$(key_str)", n_species
+                    )
+                    n_off = n_species * (n_species - 1)
+                    alpha_unscaled_samples = get_params_matrix(
+                        chain, "alpha_unscaled_$(key_str)", n_off
+                    )
+                    off_diag_indices = [
+                        i for i in 1:(n_species^2) if mod(i-1, n_species+1) != 0
+                    ]
+
+                    local K_samples_mat, log_K_mean_mat, sig_K_mat, K_unscaled_mat
+                    if spatially_varying_K
+                        log_K_mean_mat = get_params_matrix(
+                            chain, "log_K_mean_$(key_str)", n_species
+                        )
+                        sig_K_mat = get_params_matrix(
+                            chain, "sigma_K_$(key_str)", n_species
+                        )
+                        K_unscaled_mat = get_params_matrix(
+                            chain, "K_unscaled_$(key_str)", s_N * n_species
+                        )
+                    else
+                        K_samples_mat = get_params_matrix(
+                            chain, "K_$(key_str)", n_species
+                        )
+                    end
+
+                    pop_tensor = zeros(
+                        Float64, s_N, t_N_full, n_species, n_samples
+                    )
+                    F_sp_obj = cholesky(
+                        Symmetric(Matrix(hyper.L_template) + noise * I)
+                    )
+
+                    for j in 1:n_samples
+                        ure_train = reshape(
+                            ure_samples[j, :], s_N, t_N, n_species
+                        )
+                        ure_full = if t_N_full > t_N
+                            cat(
+                                ure_train,
+                                randn(s_N, t_N_full - t_N, n_species),
+                                dims = 2
+                            )
+                        else
+                            ure_train[:, 1:t_N_full, :]
+                        end
+
+                        sig_proc = sigma_p_samples[j, :]
+
+                        alpha_mat = Matrix{Float64}(I, n_species, n_species)
+                        alpha_mat[off_diag_indices] = alpha_unscaled_samples[j, :]
+
+                        local K_values
+                        if spatially_varying_K
+                            K_un_mat = reshape(
+                                K_unscaled_mat[j, :], s_N, n_species
+                            )
+                            K_field = F_sp_obj.L' \ K_un_mat
+                            K_values = exp.(
+                                log_K_mean_mat[j, :]' .+
+                                K_field .* sig_K_mat[j, :]'
+                            )
+                        else
+                            K_values = repeat(K_samples_mat[j, :]', s_N, 1)
+                        end
+
+                        pop_tensor[:, 1, :, j] = max.(
+                            0.0, ure_full[:, 1, :] .* sig_proc'
+                        )
+
+                        r_j = r_samples[j, :]
+
+                        for s in 1:s_N
+                            area_s = areas[s]
+                            K_dens = K_values[s, :] ./ area_s
+                            for t in 2:t_N_full
+                                N_prev = pop_tensor[s, t-1, :, j]
+                                D_prev = N_prev ./ area_s
+                                N_inter = copy(N_prev)
+                                for i in 1:n_species
+                                    inter_sum = dot(alpha_mat[i, :], D_prev)
+                                    growth = r_j[i] * D_prev[i] * (
+                                        1.0 - inter_sum / K_dens[i]
+                                    )
+                                    N_inter[i] += growth * area_s
+                                end
+                                innov = ure_full[s, t, :] .* sig_proc
+                                pop_tensor[s, t, :, j] = max.(
+                                    0.0, N_inter .+ innov
+                                )
+                            end
+                        end
+                    end
+                    simulated_pop_tensor = pop_tensor
+                end
+            end
+            pop_k = simulated_pop_tensor[:, :, k_outcome, :]
+            log_dyn_field = log.(
+                reshape(pop_k, s_N * t_N_full, n_samples) .+ 1e-6
+            )
+            effect_k = log_dyn_field[st_idx_full, :]
+            push!(structured_effects, effect_k)
+
         else
-            @warn "Reconstruction for Dynamics model '$(model_type)' is not implemented. Returning zero effects."
+            @warn "Reconstruction for Dynamics model '$(model_type)' is " *
+                  "not implemented. Returning zero effects."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
         end
     end

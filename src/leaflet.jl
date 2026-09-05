@@ -4061,3 +4061,1761 @@ function leaflet_hydrodynamic_dashboard(
     )
 end
 
+
+# ==============================================================================
+# SECTION: TWO-CLICK DYNAMIC INTERACTIVE CORRIDOR & PATH VISUALIZATION
+# ==============================================================================
+
+"""
+    leaflet_interactive_corridor_dashboard(
+        P::Union{AbstractMatrix{<:Real}, AbstractVector{<:AbstractMatrix{<:Real}}},
+        au::NamedTuple;
+        hsi::Union{Nothing, AbstractVector{<:Real}} = nothing,
+        empirical_paths = nothing,
+        group_labels::Vector{String} = String[],
+        title::String = "Interactive Movement Corridor & Path Ensemble Explorer",
+        dark_mode::Bool = true,
+        width::String = "100%",
+        height::String = "750px",
+        k_default::Int = 4,
+        max_paths_render::Int = 30
+    ) -> LeafletMap
+
+Constructs a standalone interactive Leaflet visualization of dynamic movement corridors
+and probabilistic path ensembles between user-selected spatial endpoints.
+
+# Interaction Design
+- **First Click on Hexagon \$A\$**: Designates Start / Release unit (green pulsing pin).
+- **Second Click on Hexagon \$B\$**: Designates Destination / Recapture unit (red pulsing pin).
+- **Dynamic Path Ensemble**: Instantly computes and renders all probable paths from \$A\$
+  to \$B\$ in \$k\$ steps. More probable paths are rendered with darker, thicker lines
+  (high opacity, bold stroke), while less probable paths are drawn with lighter, faint
+  lines (low opacity, thin stroke).
+- **Interactive Controls**: Features client-side sliders for discrete elapsed steps \$k\$,
+  top-path density filters, and biological stratum selectors.
+
+# Mathematical Formulation
+For discrete transition kernel \$\\mathbf{P}\$ and endpoints \$A, B\$ over \$k\$ steps,
+the posterior probability of a candidate trajectory \$\\pi = (u_0=A, u_1, \\dots, u_k=B)\$ is:
+```math
+\\mathbb{P}(\\pi \\mid X_0 = A, X_k = B) = \\frac{\\prod_{\\tau=0}^{k-1} P_{u_\\tau, u_{\\tau+1}}}{[\\mathbf{P}^k]_{A, B}}
+```
+Paths are rendered with stroke opacity and width proportional to relative posterior probability:
+```math
+w_\\pi = \\frac{\\mathbb{P}(\\pi \\mid A \\to B)}{\\max_{\\pi'} \\mathbb{P}(\\pi' \\mid A \\to B)} \\in (0, 1]
+```
+
+# Arguments
+- `P`: Row-stochastic transition matrix (or vector of matrices for multiple biological groups).
+- `au`: Spatial areal unit NamedTuple containing `:centroids` and `:polygons`.
+- `hsi`: Optional spatial habitat suitability index vector of length ``S``.
+- `empirical_paths`: Optional collection of observed mark-recapture trajectories.
+- `group_labels`: Optional labels matching the group transition kernels.
+- `title`: Visualization header title.
+- `dark_mode`: Toggle modern dark theme (default `true`).
+- `width, height`: CSS dimension specifications.
+- `k_default`: Initial transition step duration (default `4`).
+- `max_paths_render`: Maximum number of paths to draw simultaneously (default `30`).
+
+# Returns
+- `LeafletMap`: Self-contained HTML dashboard with embedded client-side Markov path engine.
+"""
+function leaflet_interactive_corridor_dashboard(
+    P::Union{AbstractMatrix{<:Real}, AbstractVector{<:AbstractMatrix{<:Real}}},
+    au::NamedTuple;
+    hsi::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    empirical_paths = nothing,
+    group_labels::Vector{String} = String[],
+    title::String = "Interactive Movement Corridor & Path Ensemble Explorer",
+    dark_mode::Bool = true,
+    width::String = "100%",
+    height::String = "750px",
+    k_default::Int = 4,
+    max_paths_render::Int = 30
+)::LeafletMap
+
+    # Extract centroids and polygons
+    cents_raw = hasproperty(au, :centroids_lonlat) ? au.centroids_lonlat :
+                (hasproperty(au, :centroids) ? au.centroids : Tuple{Float64, Float64}[])
+    polys_raw = hasproperty(au, :polygons_lonlat) ? au.polygons_lonlat :
+                (hasproperty(au, :polygons) ? au.polygons : Vector{Vector{Tuple{Float64, Float64}}}())
+    S = length(cents_raw)
+
+    # Normalize kernel input into group dictionary
+    kernels_dict = Dict{String, Matrix{Float64}}()
+    if P isa AbstractVector
+        for (idx, mat) in enumerate(P)
+            g_lbl = idx <= length(group_labels) ? group_labels[idx] : "Group \$idx"
+            kernels_dict[g_lbl] = Matrix{Float64}(mat)
+        end
+    else
+        g_lbl = !isempty(group_labels) ? first(group_labels) : "All"
+        kernels_dict[g_lbl] = Matrix{Float64}(P)
+    end
+    group_names = collect(keys(kernels_dict))
+
+    # Helper to serialize sparse P matrix into compact JSON lookup
+    function _matrix_to_sparse_json(mat::Matrix{Float64})
+        S_dim = size(mat, 1)
+        entries = String[]
+        for i in 1:S_dim
+            nbrs = String[]
+            for j in 1:S_dim
+                p_val = mat[i, j]
+                if p_val > 1e-5
+                    push!(nbrs, "[\$j,\$(round(p_val, digits=5))]")
+                end
+            end
+            push!(entries, "\"\"\"\$i\"\"\":[\$(join(nbrs, \",\"))]")
+        end
+        return "{" * join(entries, ",") * "}"
+    end
+
+    groups_json_parts = String[]
+    for g_name in group_names
+        p_json = _matrix_to_sparse_json(kernels_dict[g_name])
+        push!(groups_json_parts, "\"\"\"\$g_name\"\"\": \$p_json")
+    end
+    all_kernels_json = "{" * join(groups_json_parts, ",\n") * "}"
+
+    # Centroids JSON: lookup of [lon, lat] per unit ID
+    cents_json_parts = String[]
+    for (i, c) in enumerate(cents_raw)
+        push!(cents_json_parts, "\"\"\"\$i\"\"\": [\$(round(Float64(c[1]), digits=6)), \$(round(Float64(c[2]), digits=6))]")
+    end
+    cents_json = "{" * join(cents_json_parts, ",") * "}"
+
+    # Background Polygons GeoJSON
+    has_hsi = !isnothing(hsi) && length(hsi) == S
+    hsi_vals = has_hsi ? Float64.(hsi) : fill(0.5, S)
+    pal_hsi = _resolve_palette(:viridis)
+
+    polys_json = String[]
+    for (i, poly) in enumerate(polys_raw)
+        if length(poly) >= 3
+            c_str = ["[$(round(Float64(pt[1]), digits=6)), $(round(Float64(pt[2]), digits=6))]" for pt in poly]
+            if c_str[1] != c_str[end]
+                push!(c_str, c_str[1])
+            end
+            h_val = has_hsi ? hsi_vals[i] : NaN
+            h_col = has_hsi ? _map_val_to_hex(h_val, 0.0, 1.0, pal_hsi) : "#1e293b"
+            h_str = has_hsi ? @sprintf("%.3f", h_val) : "N/A"
+            push!(polys_json, """{
+              "type": "Feature",
+              "id": $i,
+              "properties": { "unit_id": $i, "hsi": "$h_str", "fill_color": "$h_col" },
+              "geometry": { "type": "Polygon", "coordinates": [[$(join(c_str, ", "))]] }
+            }""")
+        end
+    end
+    polys_collection = "{\"type\": \"FeatureCollection\", \"features\": [$(join(polys_json, ",\n"))]}"
+
+    # Optional Empirical Vectors GeoJSON
+    emp_json = String[]
+    if !isnothing(empirical_paths)
+        for (idx, tr) in enumerate(empirical_paths)
+            if length(tr) >= 2
+                c_str = join(["[$(round(Float64(pt[1]), digits=6)), $(round(Float64(pt[2]), digits=6))]" for pt in tr], ", ")
+                push!(emp_json, """{
+                  "type": "Feature",
+                  "id": $idx,
+                  "properties": { "track_id": $idx },
+                  "geometry": { "type": "LineString", "coordinates": [$c_str] }
+                }""")
+            end
+        end
+    end
+    emp_collection = "{\"type\": \"FeatureCollection\", \"features\": [$(join(emp_json, ",\n"))]}"
+
+    # Compute bounding box center
+    all_lons = [Float64(c[1]) for c in cents_raw if !isnan(c[1])]
+    all_lats = [Float64(c[2]) for c in cents_raw if !isnan(c[2])]
+    mid_lon = !isempty(all_lons) ? (minimum(all_lons) + maximum(all_lons)) / 2.0 : -60.0
+    mid_lat = !isempty(all_lats) ? (minimum(all_lats) + maximum(all_lats)) / 2.0 : 45.0
+
+    html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>$title - BSTM Interactive Dynamic Corridor Explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+  <style>
+    :root {
+      --bg-main: #0b1329;
+      --panel-bg: rgba(15, 23, 42, 0.88);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --border-main: rgba(255, 255, 255, 0.12);
+      --accent: #38bdf8;
+      --start-color: #10b981;
+      --end-color: #f43f5e;
+      --font-main: 'Outfit', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-main);
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .bstm-header {
+      background: var(--panel-bg);
+      border-bottom: 1px solid var(--border-main);
+      padding: 10px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 1000;
+    }
+    .bstm-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .bstm-badge {
+      font-size: 0.70rem;
+      text-transform: uppercase;
+      background: rgba(56, 189, 248, 0.2);
+      color: var(--accent);
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+    .bstm-map-container {
+      position: relative;
+      flex: 1;
+      width: 100%;
+    }
+    #corridor_map {
+      width: 100%;
+      height: 100%;
+      background: #090e1f;
+    }
+    .bstm-floating-panel {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      width: 340px;
+      background: var(--panel-bg);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-main);
+      border-radius: 12px;
+      padding: 16px;
+      z-index: 1000;
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.4);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .bstm-panel-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text-main);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .bstm-status-box {
+      font-size: 0.82rem;
+      background: rgba(11, 19, 41, 0.7);
+      border: 1px solid var(--border-main);
+      border-radius: 8px;
+      padding: 10px;
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+    .bstm-endpoints-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .bstm-endpoint-card {
+      background: rgba(11, 19, 41, 0.7);
+      border: 1px solid var(--border-main);
+      border-radius: 8px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+    }
+    .bstm-ep-label {
+      font-size: 0.70rem;
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+    .bstm-ep-val {
+      font-size: 1.05rem;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      margin-top: 2px;
+    }
+    .bstm-control-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .bstm-control-label {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+    }
+    .bstm-slider {
+      width: 100%;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    .bstm-select {
+      background: rgba(11, 19, 41, 0.8);
+      border: 1px solid var(--border-main);
+      color: var(--text-main);
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-family: var(--font-main);
+      font-size: 0.85rem;
+    }
+    .bstm-btn-group {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .bstm-btn {
+      flex: 1;
+      background: rgba(56, 189, 248, 0.15);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      color: var(--accent);
+      padding: 7px 12px;
+      border-radius: 8px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.18s ease;
+    }
+    .bstm-btn:hover {
+      background: rgba(56, 189, 248, 0.30);
+      color: #fff;
+    }
+    .bstm-btn-secondary {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-main);
+      color: var(--text-muted);
+    }
+    .bstm-btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.12);
+      color: var(--text-main);
+    }
+    .bstm-pulse-icon {
+      border-radius: 50%;
+      box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+      animation: pulse 1.6s infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.7); }
+      70% { box-shadow: 0 0 0 14px rgba(56, 189, 248, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0); }
+    }
+  </style>
+</head>
+<body>
+  <header class="bstm-header">
+    <div class="bstm-title">
+      <span>$title</span>
+      <span class="bstm-badge">Two-Click Dynamic Markov Path Explorer</span>
+    </div>
+    <div style="font-size: 0.82rem; color: var(--text-muted);">
+      Click any polygon for <b>Release</b>, then a second polygon for <b>Recapture</b>
+    </div>
+  </header>
+
+  <div class="bstm-map-container">
+    <div id="corridor_map"></div>
+
+    <div class="bstm-floating-panel">
+      <div class="bstm-panel-title">
+        <span>Path Ensemble Controls</span>
+        <span id="paths_count_badge" class="bstm-badge" style="display:none;">0 paths</span>
+      </div>
+
+      <div class="bstm-endpoints-grid">
+        <div class="bstm-endpoint-card" style="border-left: 3px solid var(--start-color);">
+          <span class="bstm-ep-label" style="color: var(--start-color);">Release (Start)</span>
+          <span class="bstm-ep-val" id="ep_start">None</span>
+        </div>
+        <div class="bstm-endpoint-card" style="border-left: 3px solid var(--end-color);">
+          <span class="bstm-ep-label" style="color: var(--end-color);">Recapture (End)</span>
+          <span class="bstm-ep-val" id="ep_end">None</span>
+        </div>
+      </div>
+
+      <div class="bstm-status-box" id="status_text">
+        Click a polygon on the map to select the <b>Release (Start)</b> unit.
+      </div>
+
+      <div class="bstm-control-group">
+        <div class="bstm-control-label">
+          <span>Migration Elapsed Steps (k)</span>
+          <b id="k_val_label" style="color: var(--accent); font-family: var(--font-mono);">$k_default</b>
+        </div>
+        <input type="range" class="bstm-slider" id="k_slider" min="1" max="20" value="$k_default">
+      </div>
+
+      <div class="bstm-control-group">
+        <div class="bstm-control-label">
+          <span>Max Paths to Draw</span>
+          <b id="paths_limit_label" style="color: var(--accent); font-family: var(--font-mono);">$max_paths_render</b>
+        </div>
+        <input type="range" class="bstm-slider" id="paths_slider" min="5" max="50" value="$max_paths_render">
+      </div>
+
+      $(length(group_names) > 1 ? """
+      <div class="bstm-control-group">
+        <div class="bstm-control-label">Biological Group</div>
+        <select class="bstm-select" id="group_select">
+          $(join(["<option value=\"$g\">$g</option>" for g in group_names], "\n"))
+        </select>
+      </div>
+      """ : "")
+
+      <div class="bstm-btn-group">
+        <button class="bstm-btn bstm-btn-secondary" onclick="clearSelection()">⟲ Clear</button>
+        <button class="bstm-btn" onclick="resetMapView()">🗺 Reset Map</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script>
+    // 1. Data Ingestion
+    var allKernels = $all_kernels_json;
+    var centroids = $cents_json;
+    var polysData = $polys_collection;
+    var empData = $emp_collection;
+    var defaultGroup = "$(first(group_names))";
+
+    // 2. Map Initialization
+    var map = L.map('corridor_map', { attributionControl: false }).setView([$mid_lat, $mid_lon], 7);
+
+    var cartoDark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(map);
+    var esriOcean = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}', { maxZoom: 13 });
+
+    var baseLayers = { "CartoDB Dark": cartoDark, "Esri Ocean": esriOcean };
+    var overlayLayers = {};
+
+    // Base Polygons Layer
+    var polyLayer = L.geoJSON(polysData, {
+      style: function(feature) {
+        return {
+          fillColor: feature.properties.fill_color || '#1e293b',
+          fillOpacity: 0.55,
+          color: '#334155',
+          weight: 0.8
+        };
+      },
+      onEachFeature: function(feature, layer) {
+        var uid = feature.properties.unit_id;
+        layer.on('click', function(e) {
+          handleUnitClick(uid, e.latlng);
+        });
+        layer.on('mouseover', function() {
+          if (uid !== state.startUnit && uid !== state.endUnit) {
+            layer.setStyle({ weight: 2.0, color: '#38bdf8' });
+          }
+        });
+        layer.on('mouseout', function() {
+          if (uid !== state.startUnit && uid !== state.endUnit) {
+            polyLayer.resetStyle(layer);
+          }
+        });
+        layer.bindTooltip("Unit #" + uid + (feature.properties.hsi ? " (HSI: " + feature.properties.hsi + ")" : ""));
+      }
+    }).addTo(map);
+    overlayLayers["Spatial Mesh (HSI)"] = polyLayer;
+
+    // Optional Empirical Tracks Layer
+    if (empData.features && empData.features.length > 0) {
+      var empTrackLayer = L.geoJSON(empData, {
+        style: { color: '#0ea5e9', weight: 1.2, opacity: 0.35 }
+      });
+      overlayLayers["Direct Tag Vectors"] = empTrackLayer;
+    }
+
+    var pathsGroup = L.layerGroup().addTo(map);
+    overlayLayers["Probabilistic Paths"] = pathsGroup;
+
+    L.control.layers(baseLayers, overlayLayers, { collapsed: false }).addTo(map);
+
+    // 3. State Management
+    var state = {
+      startUnit: null,
+      endUnit: null,
+      startMarker: null,
+      endMarker: null,
+      k: $k_default,
+      maxPaths: $max_paths_render,
+      group: defaultGroup
+    };
+
+    function updateStatus(msg) {
+      document.getElementById('status_text').innerHTML = msg;
+    }
+
+    function handleUnitClick(uid, latlng) {
+      if (state.startUnit === null) {
+        setStartUnit(uid, latlng);
+      } else if (state.endUnit === null && uid !== state.startUnit) {
+        setEndUnit(uid, latlng);
+        computeAndRenderPaths();
+      } else {
+        clearSelection();
+        setStartUnit(uid, latlng);
+      }
+    }
+
+    function setStartUnit(uid, latlng) {
+      state.startUnit = uid;
+      document.getElementById('ep_start').innerText = "#" + uid;
+      var icon = L.divIcon({
+        className: 'bstm-pulse-icon',
+        html: '<div style="width:14px;height:14px;background:#10b981;border:2px solid #fff;border-radius:50%;"></div>',
+        iconSize: [14, 14]
+      });
+      state.startMarker = L.marker(latlng, { icon: icon }).addTo(map).bindPopup("<b>Release (Start): #" + uid + "</b>").openPopup();
+      updateStatus("Selected Release <b>#" + uid + "</b>. Now click a second polygon to set the <b>Recapture (Destination)</b>.");
+    }
+
+    function setEndUnit(uid, latlng) {
+      state.endUnit = uid;
+      document.getElementById('ep_end').innerText = "#" + uid;
+      var icon = L.divIcon({
+        className: 'bstm-pulse-icon',
+        html: '<div style="width:14px;height:14px;background:#f43f5e;border:2px solid #fff;border-radius:50%;"></div>',
+        iconSize: [14, 14]
+      });
+      state.endMarker = L.marker(latlng, { icon: icon }).addTo(map).bindPopup("<b>Recapture (End): #" + uid + "</b>").openPopup();
+      updateStatus("Calculating probabilistic path ensemble between <b>#" + state.startUnit + "</b> and <b>#" + uid + "</b>...");
+    }
+
+    function clearSelection() {
+      state.startUnit = null;
+      state.endUnit = null;
+      if (state.startMarker) map.removeLayer(state.startMarker);
+      if (state.endMarker) map.removeLayer(state.endMarker);
+      pathsGroup.clearLayers();
+      document.getElementById('ep_start').innerText = "None";
+      document.getElementById('ep_end').innerText = "None";
+      document.getElementById('paths_count_badge').style.display = 'none';
+      updateStatus("Click a polygon on the map to select the <b>Release (Start)</b> unit.");
+    }
+
+    function resetMapView() {
+      map.setView([$mid_lat, $mid_lon], 7);
+    }
+
+    // 4. Client-Side Dynamic Path Ensemble Search
+    function computeAndRenderPaths() {
+      if (state.startUnit === null || state.endUnit === null) return;
+
+      pathsGroup.clearLayers();
+      var P = allKernels[state.group] || allKernels[defaultGroup];
+      if (!P) return;
+
+      var start = String(state.startUnit);
+      var end = Number(state.endUnit);
+      var k = state.k;
+      var maxRender = state.maxPaths;
+
+      // Beam search for top candidate paths from start to end in k steps
+      // Path representation: { seq: [start, ...], prob: 1.0 }
+      var beam = [{ seq: [Number(start)], prob: 1.0 }];
+      var BEAM_WIDTH = 150;
+
+      for (var step = 1; step <= k; step++) {
+        var nextBeam = [];
+        for (var b = 0; b < beam.length; b++) {
+          var pItem = beam[b];
+          var lastNode = String(pItem.seq[pItem.seq.length - 1]);
+          var nbrs = P[lastNode];
+          if (!nbrs || nbrs.length === 0) continue;
+
+          for (var n = 0; n < nbrs.length; n++) {
+            var target = nbrs[n][0];
+            var pVal = nbrs[n][1];
+            nextBeam.push({
+              seq: pItem.seq.concat([target]),
+              prob: pItem.prob * pVal
+            });
+          }
+        }
+        nextBeam.sort(function(a, b) { return b.prob - a.prob; });
+        beam = nextBeam.slice(0, BEAM_WIDTH);
+      }
+
+      // Filter paths that ended at destination
+      var validPaths = beam.filter(function(item) {
+        return item.seq[item.seq.length - 1] === end;
+      });
+
+      // If exact step reach is empty, fallback to paths that reached destination at intermediate steps
+      if (validPaths.length === 0) {
+        validPaths = beam.filter(function(item) {
+          return item.seq.indexOf(end) !== -1;
+        });
+      }
+
+      if (validPaths.length === 0) {
+        updateStatus("<span style='color:#f87171;'>No viable path found</span> from #" + start + " to #" + end + " in " + k + " steps. Try increasing the <b>k</b> slider.");
+        document.getElementById('paths_count_badge').style.display = 'none';
+        return;
+      }
+
+      validPaths.sort(function(a, b) { return b.prob - a.prob; });
+      var renderPaths = validPaths.slice(0, maxRender);
+      var maxProb = renderPaths[0].prob;
+
+      document.getElementById('paths_count_badge').style.display = 'inline';
+      document.getElementById('paths_count_badge').innerText = renderPaths.length + " paths";
+      updateStatus("Rendered <b>" + renderPaths.length + " paths</b> between #" + start + " and #" + end + " (" + k + " steps). <i>Darker = higher posterior probability</i>.");
+
+      // Render Polylines with probability-weighted opacity, thickness, and color
+      for (var pIdx = 0; pIdx < renderPaths.length; pIdx++) {
+        var pathObj = renderPaths[pIdx];
+        var relWeight = (maxProb > 0) ? (pathObj.prob / maxProb) : 1.0;
+
+        var coords = [];
+        for (var s = 0; s < pathObj.seq.length; s++) {
+          var c = centroids[String(pathObj.seq[s])];
+          if (c) coords.push([c[1], c[0]]); // Leaflet [lat, lon]
+        }
+
+        // More probable = darker, thicker, higher opacity
+        var opacity = 0.20 + 0.75 * relWeight;
+        var weight = 1.4 + 3.6 * relWeight;
+        
+        // Color mapping: dark navy / blue for high, soft slate/cyan for low
+        var col = (relWeight > 0.6) ? '#0284c7' : (relWeight > 0.25 ? '#38bdf8' : '#94a3b8');
+
+        var line = L.polyline(coords, {
+          color: col,
+          weight: weight,
+          opacity: opacity
+        }).addTo(pathsGroup);
+
+        var probPct = (relWeight * 100).toFixed(1);
+        line.bindPopup(
+          "<div style='font-family:var(--font-main);font-size:0.85rem;'>" +
+          "<b>Probabilistic Path #" + (pIdx + 1) + "</b><br>" +
+          "Relative Probability: <b>" + probPct + "%</b><br>" +
+          "Steps: " + (pathObj.seq.length - 1) + " hops<br>" +
+          "<span style='font-size:0.75rem;color:#94a3b8;font-family:var(--font-mono);'>Route: " + pathObj.seq.join(" → ") + "</span>" +
+          "</div>"
+        );
+      }
+    }
+
+    // 5. Control Listeners
+    document.getElementById('k_slider').oninput = function(e) {
+      state.k = Number(e.target.value);
+      document.getElementById('k_val_label').innerText = state.k;
+      computeAndRenderPaths();
+    };
+
+    document.getElementById('paths_slider').oninput = function(e) {
+      state.maxPaths = Number(e.target.value);
+      document.getElementById('paths_limit_label').innerText = state.maxPaths;
+      computeAndRenderPaths();
+    };
+
+    var grpSelect = document.getElementById('group_select');
+    if (grpSelect) {
+      grpSelect.onchange = function(e) {
+        state.group = e.target.value;
+        computeAndRenderPaths();
+      };
+    }
+  </script>
+</body>
+</html>"""
+
+    return LeafletMap(
+        html_content,
+        title=title,
+        width=width,
+        height=height,
+        metadata=Dict(:n_units=>S, :groups=>group_names, :k_default=>k_default)
+    )
+end
+
+
+# ==============================================================================
+# SECTION: MIGRATORY CURRENT DENSITY & ECOLOGICAL PINCH-POINTS
+# ==============================================================================
+
+"""
+    leaflet_current_density_map(
+        mesh::NamedTuple,
+        current_density::AbstractVector{<:Real};
+        pinch_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+        pinch_score::Union{Nothing, AbstractVector{<:Real}} = nothing,
+        centroids::Union{Nothing, AbstractVector} = nothing,
+        output_html::Union{Nothing, AbstractString} = nothing,
+        title::String = "BSTM Migratory Current Density & Ecological Pinch-Points",
+        colormap::Symbol = :inferno,
+        dark_mode::Bool = true,
+        width::String = "100%",
+        height::String = "750px",
+        legend_title::String = "Current Density (J)"
+    ) -> LeafletMap
+
+Constructs a standalone interactive Leaflet visualization displaying the population-level
+migratory current density field and critical ecological pinch-points across the mesh.
+
+# Visual Design
+- Polygons are filled with a continuous color ramp (`:inferno`, `:plasma`, `:turbo`)
+  reflecting migratory current density flux ``J_i``.
+- Critical bottleneck cells (`pinch_mask .== true`) are emphasized with glowing borders.
+- Interactive popups display polygon ID, current density, bottleneck status, and coordinates.
+- Includes a floating stats HUD and toggleable pinch-point filter.
+"""
+
+"""
+    leaflet_current_density_map(
+        mesh::NamedTuple,
+        res::PosteriorCircuitResult;
+        prob_threshold::Real = 0.80,
+        title::String = "BSTM Posterior Migratory Current Density & Pinch-Points",
+        legend_title::String = "Posterior Mean Flux (J)",
+        kwargs...
+    ) -> LeafletMap
+
+Overload of `leaflet_current_density_map` for `PosteriorCircuitResult`, plotting the
+posterior mean current density field and highlighting robust pinch-points that exceed
+`prob_threshold` certainty.
+"""
+function leaflet_current_density_map(
+    mesh::NamedTuple,
+    res::PosteriorCircuitResult;
+    prob_threshold::Real = 0.80,
+    title::String = "BSTM Posterior Migratory Current Density & Pinch-Points",
+    legend_title::String = "Posterior Mean Flux (J)",
+    kwargs...
+)
+    robust_mask, _, _ = identify_stochastic_pinchpoints(
+        res; prob_threshold = prob_threshold
+    )
+    return leaflet_current_density_map(
+        mesh,
+        res.mean_density;
+        pinch_mask = robust_mask,
+        pinch_score = res.pinchpoint_prob,
+        title = title,
+        legend_title = legend_title,
+        kwargs...
+    )
+end
+
+function leaflet_current_density_map(
+    mesh::NamedTuple,
+    current_density::AbstractVector{<:Real};
+    pinch_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+    pinch_score::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    centroids::Union{Nothing, AbstractVector} = nothing,
+    output_html::Union{Nothing, AbstractString} = nothing,
+    title::String = "BSTM Migratory Current Density & Ecological Pinch-Points",
+    colormap::Symbol = :inferno,
+    dark_mode::Bool = true,
+    width::String = "100%",
+    height::String = "750px",
+    legend_title::String = "Current Density (J)"
+)
+    polys_raw = if hasproperty(mesh, :polygons)
+        mesh.polygons
+    elseif hasproperty(mesh, :poly)
+        mesh.poly
+    elseif hasproperty(mesh, :polygons_lonlat)
+        mesh.polygons_lonlat
+    elseif hasproperty(mesh, :polygons_km)
+        mesh.polygons_km
+    else
+        error("mesh must provide :polygons, :poly, or :polygons_lonlat")
+    end
+
+    S = length(polys_raw)
+    if length(current_density) != S
+        throw(DimensionMismatch(
+            "current_density length $(length(current_density)) must match mesh units $S"
+        ))
+    end
+
+    cents_raw = if !isnothing(centroids) && length(centroids) == S
+        centroids
+    elseif hasproperty(mesh, :centroids) && length(mesh.centroids) == S
+        mesh.centroids
+    elseif hasproperty(mesh, :centroids_lonlat) && length(mesh.centroids_lonlat) == S
+        mesh.centroids_lonlat
+    elseif hasproperty(mesh, :centroids_km) && length(mesh.centroids_km) == S
+        mesh.centroids_km
+    else
+        fill([NaN, NaN], S)
+    end
+
+    pal = _resolve_palette(colormap)
+    dens_vals = Float64.(current_density)
+    max_d = maximum(dens_vals)
+    min_d = minimum(dens_vals)
+
+    has_pinch = !isnothing(pinch_mask) && length(pinch_mask) == S
+    pinch_bools = has_pinch ? pinch_mask : fill(false, S)
+    n_pinch = sum(pinch_bools)
+
+    # Convert polygons to GeoJSON FeatureCollection
+    features_json = String[]
+    for i in 1:S
+        poly = polys_raw[i]
+        length(poly) < 3 && continue
+        c_str = [
+            "[$(round(Float64(pt[1]), digits=6)), $(round(Float64(pt[2]), digits=6))]"
+            for pt in poly
+        ]
+        if c_str[1] != c_str[end]
+            push!(c_str, c_str[1])
+        end
+
+        d_val = dens_vals[i]
+        col = _map_val_to_hex(d_val, min_d, max_d, pal)
+        is_p = pinch_bools[i]
+        p_str = is_p ? "CRITICAL PINCH-POINT" : "Normal Corridor"
+        ps_str = if !isnothing(pinch_score) && length(pinch_score) == S
+            @sprintf("%.4f", Float64(pinch_score[i]))
+        else
+            "N/A"
+        end
+
+        push!(features_json, """{
+          "type": "Feature",
+          "id": $i,
+          "properties": {
+            "unit_id": $i,
+            "density": $(round(d_val, digits=5)),
+            "is_pinch": $(is_p ? "true" : "false"),
+            "pinch_status": "$p_str",
+            "pinch_score": "$ps_str",
+            "fill_color": "$col"
+          },
+          "geometry": { "type": "Polygon", "coordinates": [[$(join(c_str, ", "))]] }
+        }""")
+    end
+    geojson_str = "{\"type\": \"FeatureCollection\", \"features\": [\n" *
+                  join(features_json, ",\n") * "]}"
+
+    all_lons = [Float64(c[1]) for c in cents_raw if !isnan(c[1])]
+    all_lats = [Float64(c[2]) for c in cents_raw if !isnan(c[2])]
+    mid_lon = !isempty(all_lons) ? (minimum(all_lons) + maximum(all_lons)) / 2.0 : -60.0
+    mid_lat = !isempty(all_lats) ? (minimum(all_lats) + maximum(all_lats)) / 2.0 : 45.0
+
+    grad_css = "linear-gradient(to right, " * join(pal, ", ") * ")"
+    min_str = @sprintf("%.3e", min_d)
+    max_str = @sprintf("%.3e", max_d)
+
+    html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>$title</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap">
+  <style>
+    :root {
+      --bg-main: #090d16;
+      --panel-bg: rgba(15, 23, 42, 0.90);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --border-main: rgba(255, 255, 255, 0.12);
+      --accent: #38bdf8;
+      --pinch-glow: #06b6d4;
+      --font-main: 'Outfit', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-main);
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .bstm-header {
+      background: var(--panel-bg);
+      border-bottom: 1px solid var(--border-main);
+      padding: 10px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 1000;
+    }
+    .bstm-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .bstm-badge {
+      font-size: 0.70rem;
+      text-transform: uppercase;
+      background: rgba(56, 189, 248, 0.2);
+      color: var(--accent);
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+    .bstm-map-container {
+      position: relative;
+      flex: 1;
+      width: 100%;
+    }
+    #density_map {
+      width: 100%;
+      height: 100%;
+      background: #0b1120;
+    }
+    .bstm-floating-panel {
+      position: absolute;
+      top: 15px;
+      right: 15px;
+      width: 320px;
+      background: var(--panel-bg);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-main);
+      border-radius: 12px;
+      padding: 16px;
+      z-index: 1000;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+    .bstm-stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0;
+      font-size: 0.85rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .bstm-stat-val {
+      font-family: var(--font-mono);
+      font-weight: 600;
+      color: var(--accent);
+    }
+    .bstm-legend {
+      position: absolute;
+      bottom: 25px;
+      left: 20px;
+      background: var(--panel-bg);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-main);
+      border-radius: 10px;
+      padding: 12px 16px;
+      z-index: 1000;
+      width: 280px;
+    }
+    .bstm-legend-bar {
+      height: 12px;
+      border-radius: 6px;
+      margin: 8px 0 4px 0;
+      background: $grad_css;
+    }
+    .bstm-legend-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.75rem;
+      font-family: var(--font-mono);
+      color: var(--text-muted);
+    }
+    .bstm-toggle-btn {
+      width: 100%;
+      margin-top: 12px;
+      padding: 8px;
+      background: rgba(56, 189, 248, 0.15);
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 0.82rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .bstm-toggle-btn:hover {
+      background: rgba(56, 189, 248, 0.30);
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <header class="bstm-header">
+    <div class="bstm-title">
+      <span>$title</span>
+      <span class="bstm-badge">Circuit Theory / Ohm's Law</span>
+    </div>
+    <div style="font-size: 0.82rem; color: var(--text-muted);">
+      Population Migratory Flux & Bottleneck Corridors
+    </div>
+  </header>
+
+  <div class="bstm-map-container">
+    <div id="density_map"></div>
+
+    <div class="bstm-floating-panel">
+      <div style="font-weight: 700; font-size: 0.95rem; margin-bottom: 10px;">
+        Connectivity Statistics
+      </div>
+      <div class="bstm-stat-row">
+        <span style="color: var(--text-muted);">Active Spatial Units:</span>
+        <span class="bstm-stat-val">$S</span>
+      </div>
+      <div class="bstm-stat-row">
+        <span style="color: var(--text-muted);">Max Current Density:</span>
+        <span class="bstm-stat-val">$max_str</span>
+      </div>
+      <div class="bstm-stat-row">
+        <span style="color: var(--text-muted);">Critical Pinch-Points:</span>
+        <span class="bstm-stat-val" style="color: #38bdf8;">$n_pinch</span>
+      </div>
+      <button id="toggle_pinch_btn" class="bstm-toggle-btn">
+        Toggle Pinch-Point Highlight
+      </button>
+    </div>
+
+    <div class="bstm-legend">
+      <div style="font-size: 0.82rem; font-weight: 600;">$legend_title</div>
+      <div class="bstm-legend-bar"></div>
+      <div class="bstm-legend-labels">
+        <span>$min_str</span>
+        <span>$max_str</span>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    var map = L.map('density_map', {
+      center: [$mid_lat, $mid_lon],
+      zoom: 7,
+      preferCanvas: true
+    });
+
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; OpenStreetMap, &copy; CARTO',
+      maxZoom: 19
+    }).addTo(map);
+
+    var rawGeojson = $geojson_str;
+    var showPinchHighlight = true;
+
+    function getFeatureStyle(feature) {
+      var isP = feature.properties.is_pinch;
+      var strokeColor = (isP && showPinchHighlight) ? '#06b6d4' : '#1e293b';
+      var strokeWeight = (isP && showPinchHighlight) ? 2.5 : 0.6;
+      var strokeOpacity = (isP && showPinchHighlight) ? 0.95 : 0.4;
+
+      return {
+        fillColor: feature.properties.fill_color,
+        fillOpacity: 0.82,
+        color: strokeColor,
+        weight: strokeWeight,
+        opacity: strokeOpacity
+      };
+    }
+
+    var geojsonLayer = L.geoJSON(rawGeojson, {
+      style: getFeatureStyle,
+      onEachFeature: function(feature, layer) {
+        var p = feature.properties;
+        var badgeHtml = p.is_pinch
+          ? "<span style='background:rgba(6,182,212,0.2);color:#06b6d4;" +
+            "padding:2px 6px;border-radius:4px;font-size:0.75rem;font-weight:700;'>" +
+            "CRITICAL BOTTLENECK</span>"
+          : "<span style='color:#94a3b8;font-size:0.75rem;'>Standard Marine Corridor</span>";
+
+        var scoreRow = (p.pinch_score !== 'N/A')
+          ? "<div>Pinch Score: <b style='font-family:var(--font-mono);'>" +
+            p.pinch_score + "</b></div>"
+          : "";
+
+        layer.bindPopup(
+          "<div style='font-family:var(--font-main);font-size:0.85rem;line-height:1.4;'>" +
+          "<div style='font-weight:700;font-size:0.95rem;margin-bottom:4px;'>" +
+          "Polygon #" + p.unit_id + "</div>" +
+          "<div>Status: " + badgeHtml + "</div>" +
+          "<div>Current Density: <b style='font-family:var(--font-mono);'>" +
+          p.density.toExponential(4) + "</b></div>" +
+          scoreRow +
+          "</div>"
+        );
+
+        layer.on('mouseover', function() {
+          this.setStyle({ weight: 3.5, color: '#f8fafc', fillOpacity: 0.95 });
+        });
+        layer.on('mouseout', function() {
+          geojsonLayer.resetStyle(this);
+        });
+      }
+    }).addTo(map);
+
+    try {
+      map.fitBounds(geojsonLayer.getBounds(), { padding: [20, 20] });
+    } catch(e) {}
+
+    document.getElementById('toggle_pinch_btn').onclick = function() {
+      showPinchHighlight = !showPinchHighlight;
+      geojsonLayer.setStyle(getFeatureStyle);
+      this.innerText = showPinchHighlight ? "Hide Pinch Highlights" : "Highlight Pinch-Points";
+    };
+  </script>
+</body>
+</html>"""
+
+    if !isnothing(output_html)
+        write(output_html, html_content)
+    end
+
+    return LeafletMap(
+        html_content,
+        title=title,
+        width=width,
+        height=height,
+        metadata=Dict(:n_units=>S, :n_pinch=>n_pinch, :max_density=>max_d)
+    )
+end
+
+"""
+    leaflet_graph_wavelet_dashboard(
+        mesh,
+        sgwt_result::SpectralGraphWaveletResult;
+        reconstruction::Union{Nothing, AbstractVector{<:Real}} = nothing,
+        centroids::Union{Nothing, AbstractVector} = nothing,
+        output_html::Union{Nothing, AbstractString} = nothing,
+        title::String = "BSTM Spectral Graph Wavelet Multi-Scale Dashboard",
+        signal_name::String = "Spatial Field",
+        width::String = "100%",
+        height::String = "750px"
+    ) -> LeafletMap
+
+Generates a standalone, interactive Leaflet HTML dashboard for visual inspection of
+multiresolution Spectral Graph Wavelet decompositions across irregular spatial meshes.
+
+# Features
+- **Dynamic Layer Toggling**: Seamlessly switch between Original Signal ``\\mathbf{f}``,
+  Macro Baseline (Low-pass Approximation ``\\mathbf{a}``), Detail Scales
+  ``\\mathbf{d}_1, \\dots, \\mathbf{d}_J`` (fine to coarse), and Denoised Reconstruction
+  ``\\hat{\\mathbf{f}}`` without re-rendering the DOM.
+- **Adaptive Colormaps**: Uses sequential palettes for baseline and reconstructed fields,
+  and zero-centered diverging palettes for oscillating wavelet detail coefficients.
+- **Energy Spectrum Analytics**: Real-time progress bars showing the percentage of
+  spatial variance and energy captured across each resolution scale.
+- **Cell Inspection Popups**: Displays exact numerical values across all resolution
+  scales simultaneously upon clicking or hovering any spatial unit.
+
+# Arguments
+- `mesh`: Spatial partitioning mesh (named tuple or object with `:polygons` and `:centroids`).
+- `sgwt_result::SpectralGraphWaveletResult`: Decomposed wavelet result from
+  `spectral_graph_wavelet_transform`.
+- `reconstruction`: Optional reconstructed or denoised signal vector (length ``S``).
+- `centroids`: Optional explicit centroid coordinates (length ``S``).
+- `output_html`: Optional file path to write standalone HTML.
+- `title::String`: Dashboard title.
+- `signal_name::String`: Name of the analyzed ecological field (default: `"Spatial Field"`).
+- `width::String`: CSS width (default: `"100%"`).
+- `height::String`: CSS height (default: `"750px"`).
+
+# Returns
+- `map::LeafletMap`: Standalone LeafletMap object containing complete HTML and metadata.
+"""
+function leaflet_graph_wavelet_dashboard(
+    mesh,
+    sgwt_result::SpectralGraphWaveletResult;
+    reconstruction::Union{Nothing, AbstractVector{<:Real}} = nothing,
+    centroids::Union{Nothing, AbstractVector} = nothing,
+    output_html::Union{Nothing, AbstractString} = nothing,
+    title::String = "BSTM Spectral Graph Wavelet Multi-Scale Dashboard",
+    signal_name::String = "Spatial Field",
+    width::String = "100%",
+    height::String = "750px"
+)
+    polys_raw = if hasproperty(mesh, :polygons)
+        mesh.polygons
+    elseif hasproperty(mesh, :poly)
+        mesh.poly
+    elseif hasproperty(mesh, :polygons_lonlat)
+        mesh.polygons_lonlat
+    elseif hasproperty(mesh, :polygons_km)
+        mesh.polygons_km
+    else
+        error("mesh must provide :polygons, :poly, or :polygons_lonlat")
+    end
+
+    S = length(polys_raw)
+    if length(sgwt_result.original) != S
+        throw(DimensionMismatch(
+            "Wavelet signal length $(length(sgwt_result.original)) != mesh units $S"
+        ))
+    end
+
+    cents_raw = if !isnothing(centroids) && length(centroids) == S
+        centroids
+    elseif hasproperty(mesh, :centroids) && length(mesh.centroids) == S
+        mesh.centroids
+    elseif hasproperty(mesh, :centroids_lonlat) && length(mesh.centroids_lonlat) == S
+        mesh.centroids_lonlat
+    elseif hasproperty(mesh, :centroids_km) && length(mesh.centroids_km) == S
+        mesh.centroids_km
+    else
+        fill([NaN, NaN], S)
+    end
+
+    J = length(sgwt_result.scales)
+    has_recon = !isnothing(reconstruction) && length(reconstruction) == S
+    recon_vec = has_recon ? Float64.(reconstruction) : zeros(Float64, S)
+
+    # Compute min/max bounds for each layer to allow client-side color normalization
+    orig_min, orig_max = extrema(sgwt_result.original)
+    app_min, app_max = extrema(sgwt_result.approximation)
+    detail_max_abs = [maximum(abs, sgwt_result.details[:, j]) for j in 1:J]
+    rec_min, rec_max = has_recon ? extrema(recon_vec) : (0.0, 1.0)
+
+    # Build GeoJSON feature collection
+    features_json = String[]
+    for i in 1:S
+        poly = polys_raw[i]
+        length(poly) < 3 && continue
+        c_str = [
+            "[$(round(Float64(pt[1]), digits=6)), $(round(Float64(pt[2]), digits=6))]"
+            for pt in poly
+        ]
+        if c_str[1] != c_str[end]
+            push!(c_str, c_str[1])
+        end
+
+        det_vals = [round(sgwt_result.details[i, j], digits=5) for j in 1:J]
+        rec_val = has_recon ? round(recon_vec[i], digits=5) : 0.0
+
+        push!(features_json, """{
+          "type": "Feature",
+          "id": $i,
+          "properties": {
+            "unit_id": $i,
+            "orig": $(round(sgwt_result.original[i], digits=5)),
+            "approx": $(round(sgwt_result.approximation[i], digits=5)),
+            "details": [$(join(det_vals, ", "))],
+            "recon": $rec_val
+          },
+          "geometry": { "type": "Polygon", "coordinates": [[$(join(c_str, ", "))]] }
+        }""")
+    end
+    geojson_str = "{\"type\": \"FeatureCollection\", \"features\": [\n" *
+                  join(features_json, ",\n") * "]}"
+
+    all_lons = [Float64(c[1]) for c in cents_raw if !isnan(c[1])]
+    all_lats = [Float64(c[2]) for c in cents_raw if !isnan(c[2])]
+    mid_lon = !isempty(all_lons) ? (minimum(all_lons) + maximum(all_lons)) / 2.0 : -60.0
+    mid_lat = !isempty(all_lats) ? (minimum(all_lats) + maximum(all_lats)) / 2.0 : 45.0
+
+    # Build energy bars HTML
+    energy_bars_html = String[]
+    # Macro Approx bar
+    p0 = sgwt_result.relative_energies[1] * 100.0
+    push!(energy_bars_html, """
+      <div class="bstm-energy-row">
+        <div class="bstm-energy-label">
+          <span>Macro Baseline</span>
+          <span>$(round(p0, digits=1))%</span>
+        </div>
+        <div class="bstm-bar-track">
+          <div class="bstm-bar-fill fill-approx" style="width: $(clamp(p0, 1.0, 100.0))%;"></div>
+        </div>
+      </div>
+    """)
+    for j in 1:J
+        pj = sgwt_result.relative_energies[j + 1] * 100.0
+        sj = sgwt_result.scales[j]
+        push!(energy_bars_html, """
+          <div class="bstm-energy-row">
+            <div class="bstm-energy-label">
+              <span>Scale $j (s=$(round(sj, digits=2)))</span>
+              <span>$(round(pj, digits=1))%</span>
+            </div>
+            <div class="bstm-bar-track">
+              <div class="bstm-bar-fill fill-scale-$j"
+                   style="width: $(clamp(pj, 1.0, 100.0))%;"></div>
+            </div>
+          </div>
+        """)
+    end
+    energy_section_html = join(energy_bars_html, "\n")
+
+    # Layer buttons HTML
+    layer_btns_html = [
+        """<button class="bstm-layer-btn active" data-layer="orig">Original Field</button>""",
+        """<button class="bstm-layer-btn" data-layer="approx">Macro Baseline</button>"""
+    ]
+    for j in 1:J
+        sj = round(sgwt_result.scales[j], digits=2)
+        push!(layer_btns_html,
+            """<button class="bstm-layer-btn" data-layer="detail_$j">Scale $j (s=$sj)</button>""")
+    end
+    if has_recon
+        push!(layer_btns_html,
+            """<button class="bstm-layer-btn" data-layer="recon">Denoised / Recon</button>""")
+    end
+    buttons_html = join(layer_btns_html, "\n")
+
+    html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>$title</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap">
+  <style>
+    :root {
+      --bg-main: #0b1120;
+      --panel-bg: rgba(15, 23, 42, 0.90);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --border-main: rgba(255, 255, 255, 0.12);
+      --accent: #38bdf8;
+      --font-main: 'Outfit', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-main);
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .bstm-header {
+      background: var(--panel-bg);
+      border-bottom: 1px solid var(--border-main);
+      padding: 10px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 1000;
+    }
+    .bstm-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .bstm-badge {
+      font-size: 0.70rem;
+      text-transform: uppercase;
+      background: rgba(56, 189, 248, 0.2);
+      color: var(--accent);
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+    .bstm-map-container {
+      position: relative;
+      flex: 1;
+      width: 100%;
+    }
+    #wavelet_map {
+      width: 100%;
+      height: 100%;
+      background: #0b1120;
+    }
+    .bstm-floating-panel {
+      position: absolute;
+      top: 15px;
+      right: 15px;
+      width: 320px;
+      background: var(--panel-bg);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-main);
+      border-radius: 12px;
+      padding: 16px;
+      z-index: 1000;
+      max-height: calc(100vh - 120px);
+      overflow-y: auto;
+    }
+    .bstm-panel-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      margin-bottom: 12px;
+      border-bottom: 1px solid var(--border-main);
+      padding-bottom: 6px;
+      color: var(--text-main);
+    }
+    .bstm-layer-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-bottom: 16px;
+    }
+    .bstm-layer-btn {
+      padding: 6px 10px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-main);
+      color: var(--text-muted);
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 0.78rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      text-align: center;
+    }
+    .bstm-layer-btn:hover {
+      background: rgba(56, 189, 248, 0.15);
+      color: #fff;
+    }
+    .bstm-layer-btn.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #0b1120;
+      font-weight: 700;
+    }
+    .bstm-stat-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 5px 0;
+      font-size: 0.82rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .bstm-stat-val {
+      font-family: var(--font-mono);
+      font-weight: 600;
+      color: var(--accent);
+    }
+    .bstm-energy-row {
+      margin-bottom: 8px;
+    }
+    .bstm-energy-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.76rem;
+      font-family: var(--font-mono);
+      color: var(--text-muted);
+      margin-bottom: 2px;
+    }
+    .bstm-bar-track {
+      height: 6px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .bstm-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+    }
+    .fill-approx { background: #38bdf8; }
+    .fill-scale-1 { background: #ec4899; }
+    .fill-scale-2 { background: #f59e0b; }
+    .fill-scale-3 { background: #10b981; }
+    .fill-scale-4 { background: #8b5cf6; }
+    .bstm-legend {
+      position: absolute;
+      bottom: 25px;
+      left: 20px;
+      background: var(--panel-bg);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-main);
+      border-radius: 10px;
+      padding: 12px 16px;
+      z-index: 1000;
+      width: 280px;
+    }
+    .bstm-legend-bar {
+      height: 12px;
+      border-radius: 6px;
+      margin: 8px 0 4px 0;
+    }
+    .bstm-legend-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.75rem;
+      font-family: var(--font-mono);
+      color: var(--text-muted);
+    }
+  </style>
+</head>
+<body>
+  <header class="bstm-header">
+    <div class="bstm-title">
+      <span>$title</span>
+      <span class="bstm-badge">Spectral Graph Wavelets</span>
+    </div>
+    <div style="font-size: 0.82rem; color: var(--text-muted);">
+      Irregular Mesh Multiresolution Decomposition
+    </div>
+  </header>
+
+  <div class="bstm-map-container">
+    <div id="wavelet_map"></div>
+
+    <div class="bstm-floating-panel">
+      <div class="bstm-panel-title">Spatial Resolution Layer</div>
+      <div class="bstm-layer-grid" id="layer_button_container">
+        $buttons_html
+      </div>
+
+      <div class="bstm-panel-title" style="margin-top: 10px;">Spatial Energy Distribution</div>
+      <div style="margin-bottom: 12px;">
+        $energy_section_html
+      </div>
+
+      <div class="bstm-panel-title">Spectral Metrics</div>
+      <div class="bstm-stat-row">
+        <span>Mesh Units (S):</span>
+        <span class="bstm-stat-val">$S</span>
+      </div>
+      <div class="bstm-stat-row">
+        <span>Chebyshev Degree (M):</span>
+        <span class="bstm-stat-val">$(sgwt_result.order)</span>
+      </div>
+      <div class="bstm-stat-row">
+        <span>Laplacian Bound (λ_max):</span>
+        <span class="bstm-stat-val">$(round(sgwt_result.lambda_max, digits=4))</span>
+      </div>
+      <div class="bstm-stat-row">
+        <span>Total Energy:</span>
+        <span class="bstm-stat-val">$(@sprintf("%.4e", sgwt_result.total_energy))</span>
+      </div>
+    </div>
+
+    <div class="bstm-legend">
+      <div id="legend_title"
+           style="font-size: 0.82rem; font-weight: 700; color: var(--text-main);">
+        $signal_name (Original)
+      </div>
+      <div class="bstm-legend-bar" id="legend_gradient"></div>
+      <div class="bstm-legend-labels">
+        <span id="legend_min"></span>
+        <span id="legend_max"></span>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    var map = L.map('wavelet_map', {
+      center: [$mid_lat, $mid_lon],
+      zoom: 7,
+      preferCanvas: true
+    });
+
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; OpenStreetMap, &copy; CARTO',
+      maxZoom: 19
+    }).addTo(map);
+
+    var rawGeojson = $geojson_str;
+    var currentLayer = 'orig';
+    var numDetailScales = $J;
+    var hasRecon = $(has_recon ? "true" : "false");
+
+    var bounds = {
+      orig: { min: $orig_min, max: $orig_max, name: '$signal_name (Original)', type: 'seq' },
+      approx: { min: $app_min, max: $app_max, name: 'Macro Baseline Approx', type: 'seq' },
+      recon: { min: $rec_min, max: $rec_max, name: 'Reconstructed / Denoised', type: 'seq' }
+    };
+    var detailMaxAbs = [$(join(detail_max_abs, ", "))];
+    for (var j = 1; j <= numDetailScales; j++) {
+      var dMax = detailMaxAbs[j - 1] > 1e-12 ? detailMaxAbs[j - 1] : 1.0;
+      bounds['detail_' + j] = {
+        min: -dMax,
+        max: dMax,
+        name: 'Scale ' + j + ' Detail (Band-pass)',
+        type: 'div'
+      };
+    }
+
+    var seqPalette = [
+      [48, 18, 59], [70, 98, 216], [53, 171, 248], [26, 228, 182],
+      [114, 254, 94], [199, 241, 53], [250, 186, 57], [245, 91, 17],
+      [217, 40, 11], [122, 4, 3]
+    ];
+
+    var divPalette = [
+      [2, 132, 199], [56, 189, 248], [147, 197, 253], [226, 232, 240],
+      [252, 165, 165], [248, 113, 113], [239, 68, 68]
+    ];
+
+    function interpolatePalette(t, palette) {
+      t = Math.max(0.0, Math.min(1.0, t));
+      var n = palette.length - 1;
+      var idx = Math.floor(t * n);
+      if (idx >= n) return 'rgb(' + palette[n].join(',') + ')';
+      var frac = (t * n) - idx;
+      var c1 = palette[idx];
+      var c2 = palette[idx + 1];
+      var r = Math.round(c1[0] + frac * (c2[0] - c1[0]));
+      var g = Math.round(c1[1] + frac * (c2[1] - c1[1]));
+      var b = Math.round(c1[2] + frac * (c2[2] - c1[2]));
+      return 'rgb(' + r + ',' + g + ',' + b + ')';
+    }
+
+    function getFeatureVal(props, layer) {
+      if (layer === 'orig') return props.orig;
+      if (layer === 'approx') return props.approx;
+      if (layer === 'recon') return props.recon;
+      if (layer.startsWith('detail_')) {
+        var idx = parseInt(layer.split('_')[1], 10) - 1;
+        return props.details[idx];
+      }
+      return props.orig;
+    }
+
+    function getFeatureFillColor(props, layer) {
+      var b = bounds[layer] || bounds.orig;
+      var val = getFeatureVal(props, layer);
+      if (b.type === 'div') {
+        var maxAbs = Math.max(Math.abs(b.min), Math.abs(b.max));
+        var t = maxAbs > 1e-12 ? 0.5 + 0.5 * (val / maxAbs) : 0.5;
+        return interpolatePalette(t, divPalette);
+      } else {
+        var range = b.max - b.min;
+        var t = range > 1e-12 ? (val - b.min) / range : 0.5;
+        return interpolatePalette(t, seqPalette);
+      }
+    }
+
+    function getFeatureStyle(feature) {
+      return {
+        fillColor: getFeatureFillColor(feature.properties, currentLayer),
+        fillOpacity: 0.85,
+        color: '#1e293b',
+        weight: 0.8,
+        opacity: 0.6
+      };
+    }
+
+    var geojsonLayer = L.geoJSON(rawGeojson, {
+      style: getFeatureStyle,
+      onEachFeature: function(feature, layer) {
+        layer.on('click', function() {
+          var p = feature.properties;
+          var detailsRows = '';
+          for (var j = 0; j < p.details.length; j++) {
+            var signSym = p.details[j] >= 0 ? '+' : '';
+            detailsRows += '<div style="display:flex;justify-content:space-between;' +
+              'padding:2px 0;">' +
+              '<span style="color:#94a3b8;">Scale ' + (j + 1) + ':</span>' +
+              '<span style="font-family:var(--font-mono);font-weight:600;">' +
+              signSym + p.details[j].toExponential(3) + '</span></div>';
+          }
+          var reconRow = hasRecon ?
+            '<div style="display:flex;justify-content:space-between;padding:2px 0;' +
+            'border-top:1px solid rgba(255,255,255,0.1);margin-top:4px;">' +
+            '<span style="color:#38bdf8;">Denoised:</span>' +
+            '<span style="font-family:var(--font-mono);font-weight:700;color:#38bdf8;">' +
+            p.recon.toFixed(4) + '</span></div>' : '';
+
+          var popupContent =
+            '<div style="font-family:var(--font-main);font-size:0.85rem;min-width:180px;">' +
+            '<div style="font-weight:700;font-size:0.95rem;margin-bottom:6px;' +
+            'border-bottom:1px solid rgba(255,255,255,0.15);padding-bottom:3px;">' +
+            'Polygon Unit #' + p.unit_id + '</div>' +
+            '<div style="display:flex;justify-content:space-between;padding:2px 0;">' +
+            '<span style="color:#94a3b8;">Original:</span>' +
+            '<span style="font-family:var(--font-mono);font-weight:600;">' +
+            p.orig.toFixed(4) + '</span></div>' +
+            '<div style="display:flex;justify-content:space-between;padding:2px 0;">' +
+            '<span style="color:#94a3b8;">Macro Baseline:</span>' +
+            '<span style="font-family:var(--font-mono);font-weight:600;">' +
+            p.approx.toFixed(4) + '</span></div>' +
+            '<div style="font-size:0.75rem;text-transform:uppercase;color:#38bdf8;' +
+            'font-weight:700;margin-top:6px;margin-bottom:2px;">Detail Scales</div>' +
+            detailsRows +
+            reconRow +
+            '</div>';
+
+          layer.bindPopup(popupContent).openPopup();
+        });
+
+        layer.on('mouseover', function() {
+          this.setStyle({ weight: 2.5, color: '#f8fafc', fillOpacity: 0.95 });
+        });
+        layer.on('mouseout', function() {
+          geojsonLayer.resetStyle(this);
+        });
+      }
+    }).addTo(map);
+
+    try {
+      map.fitBounds(geojsonLayer.getBounds(), { padding: [20, 20] });
+    } catch(e) {}
+
+    function updateLegend() {
+      var b = bounds[currentLayer] || bounds.orig;
+      document.getElementById('legend_title').innerText = b.name;
+      document.getElementById('legend_min').innerText = b.min.toExponential(2);
+      document.getElementById('legend_max').innerText = b.max.toExponential(2);
+
+      var gradEl = document.getElementById('legend_gradient');
+      if (b.type === 'div') {
+        var cols = divPalette.map(function(c) { return 'rgb(' + c.join(',') + ')'; });
+        gradEl.style.background = 'linear-gradient(to right, ' + cols.join(', ') + ')';
+      } else {
+        var cols = seqPalette.map(function(c) { return 'rgb(' + c.join(',') + ')'; });
+        gradEl.style.background = 'linear-gradient(to right, ' + cols.join(', ') + ')';
+      }
+    }
+    updateLegend();
+
+    var buttons = document.querySelectorAll('.bstm-layer-btn');
+    buttons.forEach(function(btn) {
+      btn.onclick = function() {
+        buttons.forEach(function(b) { b.classList.remove('active'); });
+        this.classList.add('active');
+        currentLayer = this.getAttribute('data-layer');
+        geojsonLayer.setStyle(getFeatureStyle);
+        updateLegend();
+      };
+    });
+  </script>
+</body>
+</html>"""
+
+    if !isnothing(output_html)
+        write(output_html, html_content)
+    end
+
+    return LeafletMap(
+        html_content,
+        title = title,
+        width = width,
+        height = height,
+        metadata = Dict(
+            :n_units => S,
+            :num_scales => J,
+            :lambda_max => sgwt_result.lambda_max,
+            :total_energy => sgwt_result.total_energy
+        )
+    )
+end
