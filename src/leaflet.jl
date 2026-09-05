@@ -2014,6 +2014,8 @@ function leaflet_tracks_map(
             dur_days_val = 0.0
             dist_val_str = ""
             disp_val_str = ""
+            tort_val_str = ""
+            hsi_val_str = ""
             start_date_str = ""
             end_date_str = ""
 
@@ -2030,12 +2032,25 @@ function leaflet_tracks_map(
                 tr = paths[i]
                 coords_raw = tr.coords
                 tag_id_str = string(tr.tagid)
-                n_steps_val = hasproperty(tr, :n_steps) ? tr.n_steps : length(coords_raw) - 1
-                dur_days_val = hasproperty(tr, :duration_days) ? tr.duration_days : 0.0
-                dist_val_str = hasproperty(tr, :total_dist_km) ? @sprintf("%.1f", tr.total_dist_km) : ""
-                disp_val_str = hasproperty(tr, :displacement_km) ? @sprintf("%.1f", tr.displacement_km) : ""
-                start_date_str = hasproperty(tr, :start_date) ? string(tr.start_date) : ""
-                end_date_str = hasproperty(tr, :end_date) ? string(tr.end_date) : ""
+                n_steps_val = hasproperty(tr, :n_steps) ?
+                    tr.n_steps : length(coords_raw) - 1
+                dur_days_val = hasproperty(tr, :duration_days) ?
+                    tr.duration_days : 0.0
+                dist_val_str = hasproperty(tr, :total_dist_km) ?
+                    @sprintf("%.1f", tr.total_dist_km) : ""
+                disp_val_str = hasproperty(tr, :displacement_km) ?
+                    @sprintf("%.1f", tr.displacement_km) : ""
+                start_date_str = hasproperty(tr, :start_date) ?
+                    string(tr.start_date) : ""
+                end_date_str = hasproperty(tr, :end_date) ?
+                    string(tr.end_date) : ""
+                if hasproperty(tr, :color)
+                    t_col = string(tr.color)
+                end
+                tort_val_str = hasproperty(tr, :tortuosity) ?
+                    @sprintf("%.2f", tr.tortuosity) : ""
+                hsi_val_str = hasproperty(tr, :mean_hsi) ?
+                    @sprintf("%.3f", tr.mean_hsi) : ""
             elseif isa(paths, AbstractVector) && isa(paths[1], AbstractVector)
                 if !isempty(paths[1]) && paths[1][1] isa Integer && !isempty(cents)
                     for u_idx in paths[i]
@@ -2081,6 +2096,8 @@ function leaflet_tracks_map(
                     "duration_days": $(round(dur_days_val, digits=1)),
                     "total_dist": "$dist_val_str",
                     "displacement": "$disp_val_str",
+                    "tortuosity": "$tort_val_str",
+                    "mean_hsi": "$hsi_val_str",
                     "start_date": "$start_date_str",
                     "end_date": "$end_date_str",
                     "color": "$t_col"
@@ -2295,23 +2312,50 @@ function leaflet_tracks_map(
           layer.on('mouseout', function() {
             trackLayer.resetStyle(layer);
           });
+          var tTitle = (p.tag_id.startsWith('Tag') ||
+                        p.tag_id.startsWith('Method') ||
+                        p.tag_id.startsWith('Path')) ?
+                        p.tag_id : 'Snow Crab Tag #' + p.tag_id;
           var popupHtml = '<div class="bstm-popup">' +
-            '<div class="bstm-popup-title" style="color: ' + p.color + '">Snow Crab Tag #' + p.tag_id + '</div>' +
-            '<div class="bstm-popup-row"><span class="bstm-popup-label">State-Space Steps:</span><span class="bstm-popup-val">' + p.n_steps + '</span></div>';
+            '<div class="bstm-popup-title" style="color: ' + p.color + '">' +
+            tTitle + '</div>' +
+            '<div class="bstm-popup-row">' +
+            '<span class="bstm-popup-label">State-Space Steps:</span>' +
+            '<span class="bstm-popup-val">' + p.n_steps + '</span></div>';
           if (p.duration_days > 0) {
-            popupHtml += '<div class="bstm-popup-row"><span class="bstm-popup-label">Duration:</span><span class="bstm-popup-val">' + p.duration_days + ' days</span></div>';
+            popupHtml += '<div class="bstm-popup-row">' +
+              '<span class="bstm-popup-label">Duration:</span>' +
+              '<span class="bstm-popup-val">' + p.duration_days + ' days</span></div>';
           }
           if (p.total_dist && p.total_dist != '') {
-            popupHtml += '<div class="bstm-popup-row"><span class="bstm-popup-label">Estimated Path Length:</span><span class="bstm-popup-val">' + p.total_dist + ' km</span></div>';
+            popupHtml += '<div class="bstm-popup-row">' +
+              '<span class="bstm-popup-label">Estimated Path Length:</span>' +
+              '<span class="bstm-popup-val">' + p.total_dist + ' km</span></div>';
           }
           if (p.displacement && p.displacement != '') {
-            popupHtml += '<div class="bstm-popup-row"><span class="bstm-popup-label">Net Displacement:</span><span class="bstm-popup-val">' + p.displacement + ' km</span></div>';
+            popupHtml += '<div class="bstm-popup-row">' +
+              '<span class="bstm-popup-label">Net Displacement:</span>' +
+              '<span class="bstm-popup-val">' + p.displacement + ' km</span></div>';
+          }
+          if (p.tortuosity && p.tortuosity != '') {
+            popupHtml += '<div class="bstm-popup-row">' +
+              '<span class="bstm-popup-label">Tortuosity Index:</span>' +
+              '<span class="bstm-popup-val">' + p.tortuosity + '</span></div>';
+          }
+          if (p.mean_hsi && p.mean_hsi != '') {
+            popupHtml += '<div class="bstm-popup-row">' +
+              '<span class="bstm-popup-label">Mean Habitat HSI:</span>' +
+              '<span class="bstm-popup-val">' + p.mean_hsi + '</span></div>';
           }
           if (p.start_date && p.start_date != '') {
-            popupHtml += '<div class="bstm-popup-row"><span class="bstm-popup-label">Release:</span><span class="bstm-popup-val">' + p.start_date + '</span></div>';
+            popupHtml += '<div class="bstm-popup-row">' +
+              '<span class="bstm-popup-label">Release:</span>' +
+              '<span class="bstm-popup-val">' + p.start_date + '</span></div>';
           }
           if (p.end_date && p.end_date != '') {
-            popupHtml += '<div class="bstm-popup-row"><span class="bstm-popup-label">Recapture:</span><span class="bstm-popup-val">' + p.end_date + '</span></div>';
+            popupHtml += '<div class="bstm-popup-row">' +
+              '<span class="bstm-popup-label">Recapture:</span>' +
+              '<span class="bstm-popup-val">' + p.end_date + '</span></div>';
           }
           popupHtml += '</div>';
           layer.bindPopup(popupHtml);

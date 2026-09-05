@@ -753,17 +753,52 @@ end
 """
     map_telemetry_to_units(df::DataFrame, au::NamedTuple)::DataFrame
 
-Projects observation coordinates `(:lon, :lat)` in a telemetry DataFrame to their nearest
-spatial unit centroids, returning a copy of `df` with an appended `:s_idx` column.
+Projects observation coordinates `(:lon, :lat)` in a telemetry DataFrame to
+their nearest active, navigable spatial unit centroids, returning a copy of `df`
+with an appended `:s_idx` column.
+
+When `au` contains `:land_mask` or `:W`, mapping is restricted strictly to active
+water units (`!land_mask && degree(W) > 0`), ensuring observations near coastlines
+or outside the survey domain snap to valid water units rather than land barriers.
 
 # Mathematical Formulation
 For each observation \$\\mathbf{x}_i = (\\text{lon}_i, \\text{lat}_i)\$:
-\$s_i = \\arg\\min_{j \\in \\{1, \\dots, S\\}} \\|\\mathbf{x}_i - \\mathbf{c}_j\\|_2\$
-where \$\\mathbf{c}_j\$ is the geographic centroid of spatial unit \$j\$.
+\$s_i = \\arg\\min_{j \\in \\mathcal{M}} \\|\\mathbf{x}_i - \\mathbf{c}_j\\|_2\$
+where \$\\mathcal{M} = \\{ j \\mid \\neg \\text{land\\_mask}[j] \\land \\text{deg}(j) > 0 \\}\$.
 """
 function map_telemetry_to_units(df::DataFrame, au::NamedTuple)::DataFrame
+    land_mask = hasproperty(au, :land_mask) ? au.land_mask : nothing
+    W = hasproperty(au, :W) ? au.W : nothing
+    if hasproperty(au, :centroids_km) &&
+       hasproperty(au, :center_lon) &&
+       hasproperty(au, :center_lat)
+        return map_telemetry_to_units(
+            df, au.centroids_km, au.center_lon, au.center_lat;
+            land_mask = land_mask, W = W
+        )
+    end
+    cents = hasproperty(au, :centroids) ? au.centroids :
+            (hasproperty(au, :centroids_lonlat) ? au.centroids_lonlat : nothing)
+    if cents === nothing
+        throw(ArgumentError("au must contain :centroids or :centroids_km."))
+    end
+    S = length(cents)
+    active_mask = trues(S)
+    if land_mask !== nothing
+        active_mask .&= .!land_mask
+    end
+    if W !== nothing
+        deg = vec(sum(W, dims=2))
+        active_mask .&= (deg .> 0.0)
+    end
+    active_indices = findall(active_mask)
+    if isempty(active_indices)
+        active_indices = collect(1:S)
+    end
+    active_cents = cents[active_indices]
+    mapped_local = map_to_units(df.lon, df.lat, active_cents)
     out = copy(df)
-    out.s_idx = map_to_units(df.lon, df.lat, au.centroids)
+    out.s_idx = [active_indices[k] for k in mapped_local]
     return out
 end
 
@@ -1750,9 +1785,16 @@ function reconstruct_mark_recapture_paths(
             t1 = Float64(r1[time_col])
             t2 = Float64(r2[time_col])
 
-            # Find nearest spatial units in au
-            u_start = _nearest_unit_index(lon1, lat1, cents_deg)
-            u_end = _nearest_unit_index(lon2, lat2, cents_deg)
+            # Find nearest spatial units in au strictly on navigable water
+            au_lmask = hasproperty(au, :land_mask) ? au.land_mask : nothing
+            u_start = _nearest_unit_index(
+                lon1, lat1, cents_deg;
+                land_mask = au_lmask, W = W
+            )
+            u_end = _nearest_unit_index(
+                lon2, lat2, cents_deg;
+                land_mask = au_lmask, W = W
+            )
 
             elapsed_t = max(0.0, t2 - t1)
             n_steps = clamp(round(Int, elapsed_t / dt_step), 1, 60)
@@ -1824,10 +1866,31 @@ function reconstruct_mark_recapture_paths(
     return trajectories
 end
 
-function _nearest_unit_index(lon::Float64, lat::Float64, cents_deg::Vector{Tuple{Float64, Float64}})::Int
-    best_idx = 1
+function _nearest_unit_index(
+    lon::Float64,
+    lat::Float64,
+    cents_deg::Vector{Tuple{Float64, Float64}};
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+    W::Union{Nothing, AbstractMatrix} = nothing
+)::Int
+    S = length(cents_deg)
+    active_mask = trues(S)
+    if land_mask !== nothing
+        active_mask .&= .!land_mask
+    end
+    if W !== nothing
+        deg = vec(sum(W, dims=2))
+        active_mask .&= (deg .> 0.0)
+    end
+    active_indices = findall(active_mask)
+    if isempty(active_indices)
+        active_indices = collect(1:S)
+    end
+
+    best_idx = first(active_indices)
     best_dist = Inf
-    for (i, c) in enumerate(cents_deg)
+    for i in active_indices
+        c = cents_deg[i]
         d = (c[1] - lon)^2 + (c[2] - lat)^2
         if d < best_dist
             best_dist = d
@@ -2374,6 +2437,47 @@ function _spatial_node_distance(c1, c2)::Float64
 end
 
 """
+    _find_navigable_node(u::Int, centroids, land_mask, g::AbstractGraph) -> Int
+
+Resolves an endpoint unit to the nearest topologically active and navigable
+marine node in graph `g`. If `u` is already active (not in `land_mask` and has
+degree > 0 in `g`), returns `u` directly. Otherwise finds the closest marine
+unit in Euclidean space.
+"""
+function _find_navigable_node(
+    u::Int,
+    centroids,
+    land_mask::Union{Nothing, AbstractVector{Bool}},
+    g::AbstractGraph
+)::Int
+    S = nv(g)
+    is_valid_u = (1 <= u <= S) &&
+                 (land_mask === nothing || !land_mask[u]) &&
+                 (degree(g, u) > 0)
+    if is_valid_u
+        return u
+    end
+
+    best_v = u
+    min_dist = Inf
+    for v in 1:S
+        if (land_mask === nothing || !land_mask[v]) && degree(g, v) > 0
+            d = centroids !== nothing ?
+                _spatial_node_distance(centroids[u], centroids[v]) : abs(u - v)
+            if d < min_dist
+                min_dist = d
+                best_v = v
+            end
+        end
+    end
+    if best_v != u
+        @warn "Unit $u is not navigable (land or severed); mapped to " *
+              "nearest marine unit $best_v."
+    end
+    return best_v
+end
+
+"""
     astar_predict_path(
         P::AbstractMatrix{<:Real},
         release::Int,
@@ -2499,7 +2603,15 @@ function astar_predict_path(
         nothing
     end
 
-    heuristic = if cents_vec !== nothing && length(cents_vec) == S && !isempty(rows_c)
+    # Ensure endpoints are valid, navigable marine nodes in g
+    u_start = _find_navigable_node(release, cents_vec, land_mask, g)
+    u_end   = _find_navigable_node(recapture, cents_vec, land_mask, g)
+    if u_start == u_end
+        return k !== nothing ? fill(u_start, max(1, k + 1)) : [u_start]
+    end
+
+    has_cents = cents_vec !== nothing && length(cents_vec) == S
+    heuristic = if has_cents && !isempty(rows_c)
         max_d = 1e-6
         for k_idx in 1:length(rows_c)
             u = rows_c[k_idx]
@@ -2512,10 +2624,10 @@ function astar_predict_path(
         min_cost_hop = max_p_trans > 0.0 ? -log(max_p_trans) : 0.01
 
         v -> begin
-            if v == recapture
+            if v == u_end
                 return 0.0
             end
-            d_v = _spatial_node_distance(cents_vec[v], cents_vec[recapture])
+            d_v = _spatial_node_distance(cents_vec[v], cents_vec[u_end])
             hops = ceil(d_v / max_d)
             return hops * min_cost_hop
         end
@@ -2524,10 +2636,13 @@ function astar_predict_path(
     end
 
     distmx = sparse(rows_c, cols_c, vals_c, S, S)
-    sp = a_star(g, release, recapture, distmx, heuristic)
+    sp = a_star(g, u_start, u_end, distmx, heuristic)
 
     if isempty(sp)
-        return [release, recapture]
+        @warn "astar_predict_path: no marine path found between $release and " *
+              "$recapture in graph topology; endpoints may reside in " *
+              "disconnected marine basins."
+        return [u_start]
     end
 
     raw_path = vcat([src(e) for e in sp], [dst(last(sp))])
@@ -2600,11 +2715,14 @@ function astar_least_cost_path(
     resistance::Union{Nothing, AbstractVector{<:Real}} = nothing,
     hsi::Union{Nothing, AbstractVector{<:Real}} = nothing,
     land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
-    land_polygons = nothing
+    land_polygons = nothing,
+    centroids_lonlat = nothing
 )::Vector{Int}
     S = size(W, 1)
     if !(1 <= release <= S) || !(1 <= recapture <= S)
-        throw(ArgumentError("Release unit ($release) and recapture unit ($recapture) must be within 1:$S."))
+        throw(ArgumentError(
+            "Release ($release) and recapture ($recapture) must be within 1:$S."
+        ))
     end
     if release == recapture
         return [release]
@@ -2628,7 +2746,10 @@ function astar_least_cost_path(
         dropzeros!(W_active)
     end
     if land_polygons !== nothing
-        sever_land_crossing_edges!(W_active, centroids; land_polygons=land_polygons)
+        sever_coords = centroids_lonlat !== nothing ? centroids_lonlat : centroids
+        sever_land_crossing_edges!(
+            W_active, sever_coords; land_polygons=land_polygons
+        )
     end
 
     g = SimpleGraph(S)
@@ -2654,17 +2775,27 @@ function astar_least_cost_path(
         end
     end
 
-    distmx = sparse(rows_c, cols_c, vals_c, S, S)
-    heuristic = v -> begin
-        if v == recapture
-            return 0.0
-        end
-        return _spatial_node_distance(centroids[v], centroids[recapture]) * min_phi
+    # Ensure endpoints are valid, navigable marine nodes in g
+    u_start = _find_navigable_node(release, centroids, land_mask, g)
+    u_end   = _find_navigable_node(recapture, centroids, land_mask, g)
+    if u_start == u_end
+        return [u_start]
     end
 
-    sp = a_star(g, release, recapture, distmx, heuristic)
+    distmx = sparse(rows_c, cols_c, vals_c, S, S)
+    heuristic = v -> begin
+        if v == u_end
+            return 0.0
+        end
+        return _spatial_node_distance(centroids[v], centroids[u_end]) * min_phi
+    end
+
+    sp = a_star(g, u_start, u_end, distmx, heuristic)
     if isempty(sp)
-        return [release, recapture]
+        @warn "astar_least_cost_path: no marine path found between $release and " *
+              "$recapture in active water graph; endpoints may reside in " *
+              "disconnected marine basins."
+        return [u_start]
     end
     return vcat([src(e) for e in sp], [dst(last(sp))])
 end
@@ -2673,36 +2804,40 @@ end
     smooth_marine_path(
         path::Vector{Int},
         centroids::AbstractVector;
-        land_polygons = nothing
+        land_polygons = nothing,
+        centroids_lonlat = nothing
     ) -> Vector{Int}
 
-Applies line-of-sight shortcutting ("string-pulling") to an animal trajectory on a discrete
-mesh, removing artificial cell-to-cell hexagonal zig-zagging while strictly preserving
-clearance around terrestrial land barriers (islands, peninsulas, headlands).
+Applies line-of-sight shortcutting ("string-pulling") to an animal trajectory
+on a discrete mesh, removing artificial cell-to-cell hexagonal zig-zagging
+while strictly preserving clearance around terrestrial land barriers (islands,
+peninsulas, headlands).
 
 # Mathematical Formulation
-For path waypoints \$\\mathbf{w} = [u_1, u_2, \\dots, u_m]\$, the algorithm casts a line
-of sight between non-adjacent waypoints \$u_i\$ and \$u_j\$ (\$j > i + 1\$).
-If the line segment:
+For path waypoints \$\\mathbf{w} = [u_1, u_2, \\dots, u_m]\$, the algorithm
+casts a line of sight between non-adjacent waypoints \$u_i\$ and \$u_j\$
+(\$j > i + 1\$). If the line segment:
 ```math
 L(u_i, u_j) = \\{ (1 - t) \\mathbf{c}_{u_i} + t \\mathbf{c}_{u_j} \\mid t \\in [0, 1] \\}
 ```
-does not intersect any terrestrial barrier polygon (evaluated via `_line_crosses_polygon_or_in`),
-all intermediate waypoints \$u_{i+1}, \\dots, u_{j-1}\$ are removed. If an intersection
-occurs, waypoints around the headland are retained.
+does not intersect any terrestrial barrier polygon (evaluated via
+`_line_crosses_polygon_or_in`), intermediate waypoints \$u_{i+1}, \\dots, u_{j-1}\$
+are removed. If an intersection occurs, waypoints around the headland are kept.
 
 # Arguments
 - `path`: Ordered sequence of spatial unit indices.
 - `centroids`: Spatial centroids coordinate vector matching unit indices.
 - `land_polygons`: Terrestrial boundary polygons (defaults to `:maritimes`).
+- `centroids_lonlat`: Optional coordinates in degrees for polygon intersection.
 
 # Returns
-- `Vector{Int}`: Smoothed subset of waypoints with direct lines of sight across open water.
+- `Vector{Int}`: Smoothed subset of waypoints with direct lines of sight.
 """
 function smooth_marine_path(
     path::Vector{Int},
     centroids::AbstractVector;
-    land_polygons = nothing
+    land_polygons = nothing,
+    centroids_lonlat = nothing
 )::Vector{Int}
     if length(path) <= 2
         return path
@@ -2718,6 +2853,16 @@ function smooth_marine_path(
         land_polygons
     end
 
+    coords_check = centroids_lonlat !== nothing ? centroids_lonlat : centroids
+    is_planar = abs(coords_check[1][1]) > 180.0 || abs(coords_check[1][2]) > 90.0
+
+    if is_planar && polys !== nothing
+        @warn "smooth_marine_path: centroids appear to be planar coordinates " *
+              "while land_polygons are in geographic degrees; provide " *
+              "centroids_lonlat to enable barrier-respecting smoothing." maxlog = 1
+        return path
+    end
+
     smoothed = Int[path[1]]
     curr_idx = 1
     n_pts = length(path)
@@ -2725,9 +2870,16 @@ function smooth_marine_path(
     while curr_idx < n_pts
         furthest_idx = curr_idx + 1
         for look_idx in n_pts:-1:(curr_idx + 2)
-            p_curr = (Float64(centroids[path[curr_idx]][1]), Float64(centroids[path[curr_idx]][2]))
-            p_look = (Float64(centroids[path[look_idx]][1]), Float64(centroids[path[look_idx]][2]))
-            crosses = polys !== nothing ? _line_crosses_polygon_or_in(p_curr, p_look, polys) : false
+            p_curr = (
+                Float64(coords_check[path[curr_idx]][1]),
+                Float64(coords_check[path[curr_idx]][2])
+            )
+            p_look = (
+                Float64(coords_check[path[look_idx]][1]),
+                Float64(coords_check[path[look_idx]][2])
+            )
+            crosses = polys !== nothing ?
+                _line_crosses_polygon_or_in(p_curr, p_look, polys) : false
             if !crosses
                 furthest_idx = look_idx
                 break
@@ -2880,6 +3032,7 @@ function astar_stochastic_least_cost_path(
     friction_power = 2.0,
     land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
     land_polygons = nothing,
+    centroids_lonlat = nothing,
     smooth::Bool = false,
     ci_alpha::Real = 0.05,
     seed::Union{Nothing, Int} = nothing
@@ -2998,14 +3151,16 @@ function astar_stochastic_least_cost_path(
             recapture;
             resistance = r_m,
             land_mask = land_mask,
-            land_polygons = land_polygons
+            land_polygons = land_polygons,
+            centroids_lonlat = centroids_lonlat
         )
 
         if smooth && length(p_m) > 2
             p_m = smooth_marine_path(
                 p_m,
                 centroids;
-                land_polygons = land_polygons
+                land_polygons = land_polygons,
+                centroids_lonlat = centroids_lonlat
             )
         end
 
@@ -3243,8 +3398,22 @@ function predict_path(
         end
         if k < 1
             return [release]
-        elseif k == 1
-            return [release, recapture]
+        end
+        if release == recapture
+            return fill(release, k + 1)
+        end
+        if k == 1
+            has_p = Float64(P[release, recapture]) > 1e-12
+            no_land = land_mask === nothing ||
+                      (!land_mask[release] && !land_mask[recapture])
+            if has_p && no_land
+                return [release, recapture]
+            else
+                return astar_predict_path(
+                    P, release, recapture;
+                    centroids = centroids, k = k, land_mask = land_mask
+                )
+            end
         end
 
         logP = Matrix{Float64}(undef, S, S)
@@ -3283,6 +3452,15 @@ function predict_path(
                 delta[j, tau] = best_val
                 psi[j, tau]   = best_prev
             end
+        end
+
+        if delta[recapture, k + 1] <= -1e11
+            @warn "Viterbi: no valid marine path of length $k found between " *
+                  "$release and $recapture; falling back to marine A* path."
+            return astar_predict_path(
+                P, release, recapture;
+                centroids = centroids, k = k, land_mask = land_mask
+            )
         end
 
         path = zeros(Int, k + 1)
@@ -4395,6 +4573,7 @@ mark-recapture transition events with biological group stratifications.
 - `datum`: Reference ellipsoid datum (default `WGS84Latest`).
 - `ref_doy`: Annual reference survey day of year (default 182).
 - `verbose`: Toggle progress logging to console.
+- `pre_mapped`: Optional pre-computed mesh NamedTuple to turn off dynamic resharding.
 
 # Returns
 - `NamedTuple`:
@@ -4421,7 +4600,8 @@ function prepare_movement_data(
     crs = nothing,
     datum = WGS84Latest,
     ref_doy::Int = 182,
-    verbose::Bool = true
+    verbose::Bool = true,
+    pre_mapped = nothing
 )::NamedTuple
     tag_df = copy(tagging)
 
@@ -4448,20 +4628,76 @@ function prepare_movement_data(
     sort!(tag_df, [:tagid, :time])
 
     # 1. Full-domain tessellation with land barriers
-    verbose && println("  [prepare] Constructing full movement domain (r=$(radius_km) km) …")
-    mesh = construct_full_movement_domain(
-        tag_df.lon, tag_df.lat;
-        radius_km=radius_km, land_polygons=land_polygons,
-        depth=depth, depth_threshold=depth_threshold,
-        crs=crs, datum=datum
-    )
-    verbose && println("    Total mesh units: $(mesh.n_units) (water: $(count(!, mesh.land_mask)), land: $(sum(mesh.land_mask)))")
+    mesh = if pre_mapped !== nothing
+        verbose && println("  [prepare] Using user pre-mapped domain mesh …")
+        c_lon = hasproperty(pre_mapped, :center_lon) ?
+            pre_mapped.center_lon : ((minimum(tag_df.lon) + maximum(tag_df.lon)) / 2.0)
+        c_lat = hasproperty(pre_mapped, :center_lat) ?
+            pre_mapped.center_lat : ((minimum(tag_df.lat) + maximum(tag_df.lat)) / 2.0)
+        c_km = if hasproperty(pre_mapped, :centroids_km)
+            pre_mapped.centroids_km
+        elseif hasproperty(pre_mapped, :centroids_lonlat)
+            [lonlat_to_xy_km(
+                c[1], c[2];
+                center_lon = c_lon, center_lat = c_lat,
+                crs = crs, datum = datum
+            ) for c in pre_mapped.centroids_lonlat]
+        elseif hasproperty(pre_mapped, :centroids)
+            [lonlat_to_xy_km(
+                c[1], c[2];
+                center_lon = c_lon, center_lat = c_lat,
+                crs = crs, datum = datum
+            ) for c in pre_mapped.centroids]
+        else
+            throw(ArgumentError(
+                "pre_mapped must contain :centroids or :centroids_km."
+            ))
+        end
+        n_u = hasproperty(pre_mapped, :n_units) ?
+            pre_mapped.n_units : length(c_km)
+        l_mask = hasproperty(pre_mapped, :land_mask) ?
+            pre_mapped.land_mask : falses(n_u)
+        c_ll = if hasproperty(pre_mapped, :centroids_lonlat)
+            pre_mapped.centroids_lonlat
+        elseif hasproperty(pre_mapped, :centroids)
+            pre_mapped.centroids
+        else
+            [xy_km_to_lonlat(
+                c[1], c[2];
+                center_lon = c_lon, center_lat = c_lat,
+                crs = crs, datum = datum
+            ) for c in c_km]
+        end
+        (
+            centroids_km     = c_km,
+            centroids_lonlat = c_ll,
+            n_units          = n_u,
+            W                = pre_mapped.W,
+            land_mask        = l_mask,
+            center_lon       = c_lon,
+            center_lat       = c_lat,
+            radius_km        = hasproperty(pre_mapped, :radius_km) ?
+                pre_mapped.radius_km : radius_km
+        )
+    else
+        verbose && println("  [prepare] Constructing full movement domain (r=$(radius_km) km) …")
+        construct_full_movement_domain(
+            tag_df.lon, tag_df.lat;
+            radius_km=radius_km, land_polygons=land_polygons,
+            depth=depth, depth_threshold=depth_threshold,
+            crs=crs, datum=datum
+        )
+    end
+    verbose && println("    Total mesh units: $(mesh.n_units) " *
+                       "(water: $(count(!, mesh.land_mask)), land: $(sum(mesh.land_mask)))")
 
-    # 2. Map telemetry observations to hex units
+    # 2. Map telemetry observations to hex units strictly on active water
     verbose && println("  [prepare] Mapping observations to domain units …")
     tag_df = map_telemetry_to_units(
         tag_df, mesh.centroids_km,
-        mesh.center_lon, mesh.center_lat; crs=crs, datum=datum
+        mesh.center_lon, mesh.center_lat;
+        crs=crs, datum=datum,
+        land_mask=mesh.land_mask, W=mesh.W
     )
 
     # 3. Load HSI and perform autocorrelation infilling outside core domain

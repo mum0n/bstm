@@ -2746,6 +2746,8 @@ planar km centroids. Adds `:s_idx` (1-based integer, 1 ≤ s ≤ S).
 - `center_lon, center_lat`: Projection origin matching the mesh.
 - `crs`: Target Coordinate Reference System (default nothing).
 - `datum`: The geographic datum (default: `WGS84Latest`).
+- `land_mask`: Optional boolean vector of length `S` (`true` for land units).
+- `W`: Optional adjacency matrix (size `S × S`) to identify disconnected units.
 
 # Returns
 - Copy of `tagging` with `:s_idx::Int` appended.
@@ -2756,38 +2758,56 @@ function map_telemetry_to_units(
     center_lon::Real,
     center_lat::Real;
     crs = nothing,
-    datum = WGS84Latest
+    datum = WGS84Latest,
+    land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
+    W::Union{Nothing, AbstractMatrix} = nothing
 )::DataFrame
-    
-    # 1. Pre-allocate and populate the centroids matrix efficiently
     S = length(centroids_km)
-    c_mat = Matrix{Float64}(undef, 2, S)
-    for i in 1:S
-        c_mat[1, i] = centroids_km[i][1]
-        c_mat[2, i] = centroids_km[i][2]
+
+    # Filter to active navigable units if masks or topology are provided
+    active_mask = trues(S)
+    if land_mask !== nothing
+        active_mask .&= .!land_mask
     end
-    
-    # 2. Build the KDTree for fast spatial lookups
+    if W !== nothing
+        deg = vec(sum(W, dims=2))
+        active_mask .&= (deg .> 0.0)
+    end
+    active_indices = findall(active_mask)
+    if isempty(active_indices)
+        active_indices = collect(1:S)
+    end
+
+    n_act = length(active_indices)
+    c_mat = Matrix{Float64}(undef, 2, n_act)
+    for (col, idx) in enumerate(active_indices)
+        c_mat[1, col] = centroids_km[idx][1]
+        c_mat[2, col] = centroids_km[idx][2]
+    end
+
+    # Build the KDTree for fast spatial lookups on navigable marine units
     tree = KDTree(c_mat)
-    
-    # 3. Pre-allocate and populate the telemetry points matrix
+
+    # Pre-allocate and populate the telemetry points matrix
     N = nrow(tagging)
     pts_mat = Matrix{Float64}(undef, 2, N)
     for (i, (lon, lat)) in enumerate(zip(tagging.lon, tagging.lat))
-        x, y = lonlat_to_xy_km(Float64(lon), Float64(lat);
-                               center_lon=center_lon, center_lat=center_lat, 
-                               crs=crs, datum=datum)
+        x, y = lonlat_to_xy_km(
+            Float64(lon), Float64(lat);
+            center_lon=center_lon, center_lat=center_lat,
+            crs=crs, datum=datum
+        )
         pts_mat[1, i] = x
         pts_mat[2, i] = y
     end
-    
-    # 4. Perform nearest neighbor search for all points simultaneously
+
+    # Perform nearest neighbor search for all points simultaneously
     idxs, _ = knn(tree, pts_mat, 1)
-    
-    # 5. Append results to a copy of the DataFrame
+
+    # Append mapped units to a copy of the DataFrame
     out = copy(tagging)
-    out[!, :s_idx] = first.(idxs)
-    
+    out[!, :s_idx] = [active_indices[first(idx)] for idx in idxs]
+
     return out
 end
 

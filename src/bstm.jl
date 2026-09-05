@@ -160,6 +160,7 @@ module bstm
         get_samples, 
         get_param_samples,
         get_descriptors_by_role,
+        get_effects,
  
         create_theme, 
         choropleth, 
