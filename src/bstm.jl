@@ -54,6 +54,7 @@ module bstm
         Plots,
         PosteriorStats,
         Requires,
+        RCall,
         SHA,
         SparseArrays,
         SpecialFunctions,
@@ -250,8 +251,10 @@ module bstm
         extract_scalar_param, 
         reconstruct_posterior_kernel, 
         reshard_hsi_field,
+        build_monthly_hsi_matrix,
         fit_categorical_movement, 
         prepare_movement_data,
+        snowcrab_movement_data,
         point_in_polygon,
         identify_land_units,
         apply_land_barrier,
@@ -261,6 +264,7 @@ module bstm
         construct_full_movement_domain,
         compute_directed_adjacency, 
         resolvent_transition,
+        power_transition,
         decompose_bstm_formula,  
  
         # Circuit Theory & Ecological Connectivity exports

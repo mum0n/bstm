@@ -91,7 +91,7 @@ Start Julia within the repository:
 
 ```julia
 #  your working directory (where data, etc are found)
-myworkdir = "c:/home/jae/work"
+myworkdir = "c:/home/jae/projects/bstm"
 
 mkpath(myworkdir)
 cd(myworkdir) 
@@ -102,6 +102,7 @@ Pkg.instantiate()
 
 # this will install required packages, you will have to rerun this several times to get all the dependencies worked out. 
 # manually install and dependencies that get interrupted, if needed restart julia as well
+bstm_location = "c:/home/jae/projects/bstm"
 include( joinpath(bstm_location, "src", "bstm.jl") ) 
 using .bstm  # the "." means load the module in the current session, not importing it as a package.  
 
@@ -121,7 +122,7 @@ Fit a hierarchical BYM2 spatial model with an AR1 temporal trend, extract diagno
 Random.seed!(42)
 
 # 1. Load benchmark dataset (56 Scottish districts across time)
-data_scot = bstm_data() # Scottish Lip Cancer
+data_scot = bstm_data(); # Scottish Lip Cancer
 df = data_scot.data # dataframe with response and covariates
 W = data_scot.au.W  # graph (adjacency matrix)
 
@@ -139,21 +140,21 @@ m = @bstm(
 chn = sample(m, NUTS(), 30; progress=false)
 
 # 4. Extract Comprehensive Diagnostics & Summaries (Pure Data)
-res = model_results_comprehensive(m, chn)
+res = model_results_comprehensive(m, chn);
 println("Model WAIC: ", res.metrics.waic)
 display(res.parameters)
 
 # 5. Generate, Display, and Export Diagnostic Plots
-plots_res = bstm_plots(res; au=data_scot.au, save_dir="output/plots")
+plots_res = bstm_plots(res; au=data_scot.au, save_dir="output/plots");
 display(plots_res.plots[:spatial])
 
 # 6. Persist Unified Bundle to DuckDB and JLD2
-save_bstm_bundle("output/scot_lip_model", m, chn, res; au=data_scot.au)
+save_bstm_bundle("output/scot_lip_model", m, chn, res; au=data_scot.au);
 bn_bundle = load_bstm_bundle("output/scot_lip_model")
 
 # 7. Query prior
 # Extract prior from the saved bundle
-prior_posterior = extract_prior_posterior(bn_bundle)
+prior_posterior = extract_prior_posterior(bn_bundle);
 
 # Show posterior summaries of the prior (first 1000 draws)
 display(prior_posterior[:prior, :parameters, 1:1000])
@@ -180,7 +181,7 @@ df = DataFrame(
     y = rand(rng, 0:20, N)
 )
 
-# 2. Partition space into exactly 16 regular hexagons across 5 years
+# 2. Partition space into hexagons across 5 years
 st_data = assign_spatiotemporal_units(df;
     space_x = :lon,
     space_y = :lat,
@@ -191,7 +192,7 @@ st_data = assign_spatiotemporal_units(df;
     exact_units = true
 )
 
-spatial_graph_plot(au=st_data.au_spatial, title="16 Hexagonal Spatial Units")
+spatial_graph_plot(au=st_data.au_spatial, title="Spatial Units")
 
 df.s_idx = st_data.s_idx
 df.year_idx = st_data.t_idx
@@ -224,13 +225,14 @@ plot(p_map, p_ppc, layout=(1, 2), size=(1000, 450))
 ### Example 3: Multivariate Hierarchical Spatiotemporal Model
 
 ```julia
- 
-# Example df must contain: :s_idx, :t_idx (or :year), :y1, :y2, :cov1
-# y1: counts (Poisson), y2: continuous (Gaussian)
+
+data_scot = bstm_data(); # Scottish Lip Cancer
+df = data_scot.data # dataframe with response and covariates
+W = data_scot.au.W  # graph (adjacency matrix)
 
 m = @bstm(
     # Multivariate joint likelihood: specify two outputs and their families
-    likelihood((y1, y2),
+    likelihood((y, y_rate),
                family = (poisson, gaussian),
                # pass offsets/trials if needed per outcome: log_offsets=(offset1, offset2)
     ) ~

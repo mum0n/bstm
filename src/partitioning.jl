@@ -2860,12 +2860,39 @@ end
 
 
 """
-    build_monthly_hsi_matrix(hsi_mean, years; ref_doy=244.0)
-    -> (Matrix{Float64}, Dict{Tuple{Int,Int}, Int})
+    build_monthly_hsi_matrix(
+        hsi_mean::AbstractMatrix{Float64},
+        years::AbstractVector{<:Integer};
+        ref_doy::Real = 244.0
+    ) -> Tuple{Matrix{Float64}, Dict{Tuple{Int, Int}, Int}}
 
-Discretize the annual posterior-mean HSI onto a monthly grid (12 months per
-year) by evaluating `_interpolate_hsi` at the 15th of each month, leap-year
-aware, anchored to `ref_doy`.
+Discretizes multi-year spatial Habitat Suitability Index (HSI) surfaces onto a
+regular monthly grid (12 calendar months per survey year) via continuous
+piecewise-linear temporal interpolation, evaluating each cell at mid-month (day 15)
+with leap-year awareness.
+
+# Mathematical Formulation
+Given annual HSI values ``h_s(y)`` for spatial unit ``s`` in year ``y``, the fractional
+calendar year at day-of-year ``d`` of year ``y`` is:
+```math
+t = y + \\frac{d - 1}{D(y)}
+```
+where ``D(y) \\in \\{365, 366\\}``. Anchored to annual survey reference day
+``d_{\\text{ref}}``, the mid-month HSI is linearly interpolated between adjacent survey epochs:
+```math
+h_s(t) = (1 - \\alpha) h_s(y_1) + \\alpha h_s(y_2)
+```
+clamped to ``[0, 1]``.
+
+# Arguments
+- `hsi_mean`: Spatial HSI posterior mean matrix (size ``S \\times T_{\\text{years}}``).
+- `years`: Integer vector of survey years of length ``T_{\\text{years}}``.
+- `ref_doy`: Reference survey day of year (default `244.0` = September 1).
+
+# Returns
+- `Tuple{Matrix{Float64}, Dict{Tuple{Int, Int}, Int}}`:
+  - `mat`: Monthly discretized HSI matrix (size ``S \\times 12 T_{\\text{years}}``).
+  - `lookup`: Dictionary mapping `(year, month)` tuples to matrix column indices.
 """
 function build_monthly_hsi_matrix(
     hsi_mean::AbstractMatrix{Float64},

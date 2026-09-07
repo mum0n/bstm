@@ -2,7 +2,7 @@
 
 julia_version = "1.12.7"
 manifest_format = "2.0"
-project_hash = "06f98a7af566d2fe0e3697ea4855fe6e1e472dd5"
+project_hash = "df3edd1fdd23d87946af9071d40c4f4b60d8e659"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "5970c86505ae9c07bf5bc521ef2bbbb3849e8b7b"
@@ -634,6 +634,12 @@ deps = ["Serialization", "Sockets"]
 git-tree-sha1 = "3c9be947934c38475bafe822c6d61aaed17f0738"
 uuid = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
 version = "2.6.0"
+
+[[deps.Conda]]
+deps = ["Downloads", "JSON", "VersionParsing"]
+git-tree-sha1 = "8f06b0cfa4c514c7b9546756dbae91fcfbc92dc9"
+uuid = "8f4d0f93-b110-5947-807f-2305c1781a2d"
+version = "1.10.3"
 
 [[deps.ConsoleProgressMonitor]]
 deps = ["Logging", "ProgressMeter"]
@@ -2655,12 +2661,6 @@ git-tree-sha1 = "f7bbf8d5dda12f3f417b350baf82ebf0d190a623"
 uuid = "eead6e0c-2d5b-5641-a95c-b722de96d551"
 version = "0.7.1+0"
 
-[[deps.PROJ_jll]]
-deps = ["Artifacts", "JLLWrappers", "LibCURL_jll", "Libdl", "Libtiff_jll", "SQLite_jll"]
-git-tree-sha1 = "fbfbc14815c5f5375abc971321aa5f468e715a38"
-uuid = "58948b4f-47e0-5654-a9ad-f609743f8632"
-version = "902.800.100+0"
-
 [[deps.PSIS]]
 deps = ["LinearAlgebra", "LogExpFunctions", "Printf", "RecipesBase", "Statistics"]
 git-tree-sha1 = "554bfcb2e56a9928b793a3c99f1d16e324c79ee0"
@@ -2855,12 +2855,6 @@ git-tree-sha1 = "fbb92c6c56b34e1a2c4c36058f68f332bec840e7"
 uuid = "92933f4c-e287-5a05-a399-4b506db050ca"
 version = "1.11.0"
 
-[[deps.Proj]]
-deps = ["CEnum", "CoordinateTransformations", "GeoFormatTypes", "GeoInterface", "NetworkOptions", "PROJ_jll"]
-git-tree-sha1 = "61188669db4f5b400173e4ec60da8bcb72d6e749"
-uuid = "c94c279d-25a6-4763-9509-64d165bea63e"
-version = "1.9.0"
-
 [[deps.PtrArrays]]
 git-tree-sha1 = "4fbbafbc6251b883f4d2705356f3641f3652a7fe"
 uuid = "43287f4e-b6f4-7ad1-bb20-aadabca52c3d"
@@ -2921,6 +2915,18 @@ deps = ["LinearAlgebra", "Random", "RealDot"]
 git-tree-sha1 = "4d8c1b7c3329c1885b857abb50d08fa3f4d9e3c8"
 uuid = "94ee1d12-ae83-5a48-8b1c-48b8ff168ae0"
 version = "0.7.7"
+
+[[deps.RCall]]
+deps = ["CategoricalArrays", "Conda", "DataFrames", "DataStructures", "Dates", "Libdl", "Preferences", "REPL", "Random", "StatsModels", "WinReg"]
+git-tree-sha1 = "a2be505c76807bf9ce4220cde4e1b464c726eb2f"
+uuid = "6f49c342-dc21-5d91-9882-a32aef131414"
+version = "0.14.13"
+
+    [deps.RCall.extensions]
+    RCallAxisArraysExt = ["AxisArrays"]
+
+    [deps.RCall.weakdeps]
+    AxisArrays = "39de3d68-74b9-583c-8d2d-e117c070f3a9"
 
 [[deps.REPL]]
 deps = ["InteractiveUtils", "JuliaSyntaxHighlighting", "Markdown", "Sockets", "StyledStrings", "Unicode"]
@@ -3120,12 +3126,6 @@ deps = ["IfElse", "Static", "VectorizationBase"]
 git-tree-sha1 = "72312aa278823c0e99ce31186e22d917d2d11f99"
 uuid = "476501e8-09a2-5ece-8869-fb82de89a1fa"
 version = "0.6.46"
-
-[[deps.SQLite_jll]]
-deps = ["Artifacts", "JLLWrappers", "Libdl", "Zlib_jll", "dlfcn_win32_jll"]
-git-tree-sha1 = "324744e40b84e6dc2cfaa4122ce969a083c40a6f"
-uuid = "76ed43ae-9a5d-5a62-8c75-30186b810ce8"
-version = "3.53.2+0"
 
 [[deps.SSMProblems]]
 deps = ["AbstractMCMC", "Distributions", "Random"]
@@ -3733,6 +3733,11 @@ git-tree-sha1 = "807a234dc5e6132dd6cf4c9317ca0917c4001ab3"
 uuid = "3d5dd08c-fd9d-11e8-17fa-ed2836048c2f"
 version = "0.21.74"
 
+[[deps.VersionParsing]]
+git-tree-sha1 = "58d6e80b4ee071f5efd07fda82cb9fbe17200868"
+uuid = "81def892-9a0e-5fdd-b105-ffc91e053289"
+version = "1.3.0"
+
 [[deps.Vulkan_Loader_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Wayland_jll", "Xorg_libX11_jll", "Xorg_libXrandr_jll", "xkbcommon_jll"]
 git-tree-sha1 = "2f0486047a07670caad3a81a075d2e518acc5c59"
@@ -3775,6 +3780,11 @@ deps = ["Colors", "Dates", "Observables", "OrderedCollections"]
 git-tree-sha1 = "cab29ed70d9355a28b95b1798007ff3a00eefc91"
 uuid = "cc8bc4a8-27d6-5769-a93b-9d913e69aa62"
 version = "0.6.8"
+
+[[deps.WinReg]]
+git-tree-sha1 = "cd910906b099402bcc50b3eafa9634244e5ec83b"
+uuid = "1b915085-20d7-51cf-bf83-8f477d6f5128"
+version = "1.0.0"
 
 [[deps.WoodburyMatrices]]
 deps = ["LinearAlgebra", "SparseArrays"]
@@ -3970,16 +3980,10 @@ uuid = "700de1a5-db45-46bc-99cf-38207098b444"
 version = "0.2.8"
 
 [[deps.bstm]]
-deps = ["ADTypes", "AbstractGPs", "AbstractMCMC", "AbstractPPL", "AdvancedVI", "Bijectors", "BlackBoxOptim", "CategoricalArrays", "Clustering", "ColorSchemes", "DataFrames", "Dates", "DelaunayTriangulation", "DifferentialEquations", "DimensionalData", "Distances", "Distributions", "DrWatson", "DuckDB", "DynamicPPL", "Enzyme", "FFTW", "FillArrays", "FiniteDiff", "FlexiChains", "ForwardDiff", "GLM", "Graphs", "HypothesisTests", "Interpolations", "JLD2", "KernelAbstractions", "KernelFunctions", "LibGEOS", "LinearAlgebra", "LogExpFunctions", "NLopt", "NNlib", "NamedArrays", "NearestNeighbors", "Optim", "Optimisers", "OptimizationNLopt", "OrderedCollections", "PDMats", "PRIMA", "PackageCompiler", "Plots", "PosteriorStats", "PrecompileTools", "Printf", "Proj", "Random", "Reexport", "Requires", "ReverseDiff", "Revise", "SHA", "SparseArrays", "SpecialFunctions", "StaticArrays", "Statistics", "StatsBase", "StatsModels", "StatsPlots", "Turing", "Wavelets", "WaveletsExt", "Zygote"]
+deps = ["ADTypes", "AbstractGPs", "AbstractMCMC", "AbstractPPL", "AdvancedVI", "Bijectors", "BlackBoxOptim", "CategoricalArrays", "Clustering", "ColorSchemes", "CoordRefSystems", "DataFrames", "Dates", "DelaunayTriangulation", "DifferentialEquations", "DimensionalData", "Distances", "Distributions", "DrWatson", "DuckDB", "DynamicPPL", "Enzyme", "FFTW", "FillArrays", "FiniteDiff", "FlexiChains", "ForwardDiff", "GLM", "Graphs", "HypothesisTests", "Interpolations", "JLD2", "KernelAbstractions", "KernelFunctions", "LibGEOS", "LinearAlgebra", "LogExpFunctions", "NLopt", "NNlib", "NamedArrays", "NearestNeighbors", "Optim", "Optimisers", "OptimizationNLopt", "OrderedCollections", "PDMats", "PRIMA", "PackageCompiler", "Plots", "PosteriorStats", "PrecompileTools", "Printf", "Random", "Reexport", "Requires", "ReverseDiff", "Revise", "SHA", "SparseArrays", "SpecialFunctions", "StaticArrays", "Statistics", "StatsBase", "StatsModels", "StatsPlots", "Turing", "Unitful", "Wavelets", "WaveletsExt", "Zygote"]
 path = "."
 uuid = "a9d6ec74-ebb6-4ecd-a5cd-9826d4a3476e"
 version = "1.0.0"
-
-[[deps.dlfcn_win32_jll]]
-deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "e141d67ffe550eadfb5af1bdbdaf138031e4805f"
-uuid = "c4b69c83-5512-53e3-94e6-de98773c479f"
-version = "1.4.2+0"
 
 [[deps.eudev_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]

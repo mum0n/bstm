@@ -2170,17 +2170,32 @@ function _powerm(M::AbstractMatrix{T}, k::Integer) where {T <: Real}
 end
 
 """
-    power_transition(Gamma, k) -> Matrix{Float64}
+    power_transition(Gamma::AbstractMatrix{Float64}, k::Integer) -> Matrix{Float64}
 
-Compute Γ̄^k and apply a final row rectification and normalisation to correct 
-any numerical drift.
+Computes the ``k``-step Markov transition probability matrix ``\\boldsymbol{\\Gamma}^k``
+via repeated matrix squaring (binary exponentiation) and applies non-negativity
+rectification and row-stochastic normalization to eliminate floating-point drift.
+
+# Mathematical Formulation
+For a discrete spatial Markov transition matrix
+``\\boldsymbol{\\Gamma} \\in \\mathbb{R}^{S \\times S}``:
+```math
+\\boldsymbol{\\Gamma}^k = \\underbrace{\\boldsymbol{\\Gamma} \\times \\cdots \\times \\boldsymbol{\\Gamma}}_{k \\text{ times}}
+```
+Each entry ``[\\boldsymbol{\\Gamma}^k]_{ij} = \\mathbb{P}(X_{t+k} = j \\mid X_t = i)``
+denotes the conditional probability that an individual transitions from node ``i`` to
+node ``j`` after ``k`` time steps. Small negative entries arising from numerical
+rounding are clamped to zero and rows are re-normalized:
+```math
+[\\boldsymbol{\\Gamma}^k]_{ij} \\leftarrow \\frac{\\max(0, [\\boldsymbol{\\Gamma}^k]_{ij})}{\\sum_{l=1}^S \\max(0, [\\boldsymbol{\\Gamma}^k]_{il})}
+```
 
 # Arguments
-- `Gamma::Matrix{Float64}`: Row-stochastic transition matrix.
-- `k::Integer`: Number of discrete steps (≥ 1).
+- `Gamma`: Row-stochastic one-step transition matrix (size ``S \\times S``).
+- `k`: Discrete time step exponent (``k \\ge 1``).
 
 # Returns
-- S × S matrix Γ̄^k with row-stochastic rows.
+- `Matrix{Float64}`: Numerically stable row-stochastic ``k``-step transition matrix.
 """
 function power_transition(Gamma::AbstractMatrix{Float64}, k::Integer)::Matrix{Float64}
     # Uses the optimized O(1) allocation _powerm we built previously
@@ -3574,7 +3589,26 @@ function predict_corridor(
 end
 
 
-# Convenience overloads for result dictionaries / named tuples
+"""
+    predict_path(res::NamedTuple, release::Int, recapture::Int, k=nothing; kwargs...) -> Vector{Int}
+
+Extracts the group transition matrix and domain mesh from a fitted BSTM result
+NamedTuple and predicts the most probable movement trajectory between release and
+recapture nodes using goal-directed search (`:astar`) or dynamic programming (`:viterbi`).
+
+# Arguments
+- `res`: Result NamedTuple containing `:transition_matrices` and `:mesh`.
+- `release`: Starting spatial unit index.
+- `recapture`: Destination spatial unit index.
+- `k`: Total discrete time steps (optional for `:astar`).
+- `group`: Demographic group identifier (string, symbol, or integer ID).
+- `centroids`: Optional centroid coordinates (defaults to `res.mesh`).
+- `method`: Algorithm (`:astar` or `:viterbi`).
+- `land_mask`: Optional boolean land mask vector.
+
+# Returns
+- `Vector{Int}`: Sequence of traversed spatial unit indices.
+"""
 function predict_path(
     res::NamedTuple,
     release::Int,
@@ -3606,6 +3640,23 @@ function predict_path(
     end
 end
 
+"""
+    predict_corridor(res::NamedTuple, release::Int, recapture::Int, k::Int; kwargs...) -> Matrix{Float64}
+
+Extracts the group transition matrix from a fitted BSTM result NamedTuple and
+computes the space-time Markov bridge corridor matrix over ``k`` steps.
+
+# Arguments
+- `res`: Result NamedTuple containing `:transition_matrices`.
+- `release`: Starting spatial unit index.
+- `recapture`: Destination spatial unit index.
+- `k`: Total discrete time steps (``k \\ge 1``).
+- `group`: Demographic group identifier (string, symbol, or integer ID).
+- `land_mask`: Optional boolean land mask vector.
+
+# Returns
+- `Matrix{Float64}`: State probability matrix of size ``S \\times (k + 1)``.
+"""
 function predict_corridor(
     res::NamedTuple, release::Int, recapture::Int, k::Int;
     group::Union{String, Symbol, Int} = 1,
@@ -3797,6 +3848,19 @@ function point_in_polygon(x::Real, y::Real, poly)::Bool
     return inside
 end
 
+"""
+    point_in_polygon(x::Real, y::Real, geom::LibGEOS.AbstractGeometry) -> Bool
+
+Evaluates geometric inclusion of 2D coordinates ``(x, y)`` within a LibGEOS
+spatial polygon or multi-polygon geometry object.
+
+# Arguments
+- `x, y`: Coordinate values in the geometry's coordinate system.
+- `geom`: `LibGEOS.AbstractGeometry` polygon representation.
+
+# Returns
+- `Bool`: `true` if point lies strictly inside or on the boundary of the geometry.
+"""
 function point_in_polygon(x::Real, y::Real, geom::LibGEOS.AbstractGeometry)::Bool
     pt = LibGEOS.Point(Float64(x), Float64(y))
     return LibGEOS.contains(geom, pt)
@@ -4767,6 +4831,23 @@ function prepare_movement_data(
             tag_df[!, :hsi] = match_telemetry_closest_month_hsi(
                 tag_df, monthly_hsi, month_lookup, years_vec
             )
+            # Climatology fallback: replace NaN observations
+            # (missing year/month) with the spatial mean HSI
+            n_nan = 0
+            hsi_col = tag_df.hsi
+            s_col   = tag_df.s_idx
+            for i in eachindex(hsi_col)
+                if isnan(hsi_col[i])
+                    s = s_col[i]
+                    hsi_col[i] = (1 <= s <= length(hsi_vec)) ?
+                                 hsi_vec[s] : 0.5
+                    n_nan += 1
+                end
+            end
+            n_nan > 0 && verbose && println(
+                "  [prepare] HSI climatology fallback applied " *
+                "to $n_nan / $(nrow(tag_df)) observations."
+            )
         else
             tag_df[!, :hsi] = fill(0.5, nrow(tag_df))
         end
@@ -4858,5 +4939,89 @@ function prepare_movement_data(
         obs          = obs,
         group_lookup = group_lookup,
         land_mask    = mesh.land_mask
+    )
+end
+
+
+"""
+    snowcrab_movement_data(;
+        radius_km = 15.0,
+        time_interval = :daily,
+        crs = nothing,
+        datum = WGS84Latest,
+        ref_doy = 182,
+        verbose = true,
+        pre_mapped = nothing,
+        data_dir = nothing
+    ) -> NamedTuple
+
+High-level convenience pipeline for empirical snow crab (*Chionoecetes opilio*)
+movement, telemetry, and environmental suitability data across Atlantic Canada.
+Loads empirical mark-recapture encounters from JLD2 storage, constructs a unified
+planar hexagonal domain tessellation covering both the Scotian Shelf and Gulf of
+St. Lawrence, classifies and severs terrestrial land barriers, infills unobserved
+marine Habitat Suitability Index (HSI) values via screened graph-Laplacian
+Dirichlet diffusion, snaps telemetry observations to navigable marine units,
+and stratifies event pairs into 4 biological demographic categories.
+
+# Arguments
+- `radius_km::Real`: Hexagon circumradius in kilometers (default `15.0`).
+- `time_interval::Symbol`: Time discretization step (`:daily`, `:monthly`, `:weekly`).
+- `crs`: Target coordinate reference system (defaults to local tangent projection).
+- `datum`: Reference ellipsoid datum (defaults to `WGS84Latest`).
+- `ref_doy::Int`: Annual survey reference day-of-year (default `182`).
+- `verbose::Bool`: Enable progress and summary console output (default `true`).
+- `pre_mapped`: Optional pre-computed mesh NamedTuple to bypass regeneration.
+- `data_dir`: Directory containing `tagging.jld2`, `hsi.jld2`, and `sppoly.jld2`.
+  Defaults to the repository directory `docs/movement/data`.
+
+# Returns
+- `NamedTuple` containing:
+  - `tagging::DataFrame`: Filtered telemetry records snapped to marine units.
+  - `mesh::NamedTuple`: Full-domain tessellation with centroids and polygons.
+  - `W::SparseMatrixCSC{Float64, Int}`: Adjacency matrix with land severed.
+  - `hsi_vec::Vector{Float64}`: Infilled full-domain spatial HSI vector.
+  - `monthly_hsi::Matrix{Float64}`: Monthly discretized HSI matrix.
+  - `month_lookup::Dict`: Mapping of `(year, month)` to column indices.
+  - `years::Vector{Int}`: Survey year span.
+  - `obs::DataFrame`: Extracted release-recapture event pairs.
+  - `group_lookup::Dict`: Stratum string to integer ID mapping.
+  - `land_mask::Vector{Bool}`: Terrestrial barrier indicator vector.
+"""
+function snowcrab_movement_data(;
+    radius_km     :: Real    = 15.0,
+    time_interval :: Symbol  = :daily,
+    crs                      = nothing,
+    datum                    = WGS84Latest,
+    ref_doy       :: Int     = 182,
+    verbose       :: Bool    = true,
+    pre_mapped               = nothing,
+    data_dir      :: Union{Nothing, AbstractString} = nothing
+)::NamedTuple
+    dir = if data_dir !== nothing
+        data_dir
+    else
+        normpath(joinpath(@__DIR__, "..", "docs", "movement", "data"))
+    end
+    tagging_file = joinpath(dir, "tagging.jld2")
+    isfile(tagging_file) || error(
+        "Snow crab tagging file not found at: $tagging_file"
+    )
+    tagging = JLD2.load(tagging_file, "tagging")
+    hsi_jld2 = joinpath(dir, "hsi.jld2")
+    sppoly_jld2 = joinpath(dir, "sppoly.jld2")
+
+    return prepare_movement_data(
+        tagging;
+        hsi_file      = isfile(hsi_jld2) ? hsi_jld2 : nothing,
+        sppoly_file   = isfile(sppoly_jld2) ? sppoly_jld2 : nothing,
+        radius_km     = radius_km,
+        time_interval = time_interval,
+        land_polygons = :maritimes,
+        crs           = crs,
+        datum         = datum,
+        ref_doy       = ref_doy,
+        verbose       = verbose,
+        pre_mapped    = pre_mapped
     )
 end

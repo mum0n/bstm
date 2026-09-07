@@ -4207,10 +4207,14 @@ function leaflet_interactive_corridor_dashboard(
             for j in 1:S_dim
                 p_val = mat[i, j]
                 if p_val > 1e-5
-                    push!(nbrs, "[\$j,\$(round(p_val, digits=5))]")
+                    push!(nbrs,
+                        string("[", j, ",",
+                               round(p_val, digits=5), "]"))
                 end
             end
-            push!(entries, "\"\"\"\$i\"\"\":[\$(join(nbrs, \",\"))]")
+            push!(entries,
+                string("\"" , i, "\":[",
+                       join(nbrs, ","), "]"))
         end
         return "{" * join(entries, ",") * "}"
     end
@@ -4218,14 +4222,18 @@ function leaflet_interactive_corridor_dashboard(
     groups_json_parts = String[]
     for g_name in group_names
         p_json = _matrix_to_sparse_json(kernels_dict[g_name])
-        push!(groups_json_parts, "\"\"\"\$g_name\"\"\": \$p_json")
+        push!(groups_json_parts,
+            string("\"" , g_name, "\": ", p_json))
     end
     all_kernels_json = "{" * join(groups_json_parts, ",\n") * "}"
 
     # Centroids JSON: lookup of [lon, lat] per unit ID
     cents_json_parts = String[]
     for (i, c) in enumerate(cents_raw)
-        push!(cents_json_parts, "\"\"\"\$i\"\"\": [\$(round(Float64(c[1]), digits=6)), \$(round(Float64(c[2]), digits=6))]")
+        push!(cents_json_parts,
+            string("\"" , i, "\": [",
+                   round(Float64(c[1]), digits=6), ", ",
+                   round(Float64(c[2]), digits=6), "]"))
     end
     cents_json = "{" * join(cents_json_parts, ",") * "}"
 

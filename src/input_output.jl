@@ -1358,3 +1358,93 @@ function extract_prior_posterior(
         metadata
     )
 end
+
+
+
+# General function to write data to R formats
+function write_rdata(data, filepath::String; preset::String="high")
+    ext = lowercase(splitext(filepath)[2])
+    
+    # Transfer variables to R
+    @rput data
+    @rput filepath
+    
+    if ext == ".rdz"
+		# Ensure the qs package is available in the background R session
+		R"""
+		if (!requireNamespace('qs', quietly = TRUE)) {
+			install.packages('qs', repos='http://cran.us.r-project.org')
+		}
+		"""
+
+		# Transfer variables to R and save
+		@rput data
+		@rput filepath
+		@rput preset
+
+		R"qs::qsave(data, file=filepath, preset=preset)"
+        
+    elseif ext == ".rds"
+        R"saveRDS(data, file=filepath)"
+        println("Successfully wrote rds to ", filepath)
+        
+    elseif ext == ".rda" || ext == ".rdata"
+        # Note: 'data' is the name of the variable in the R environment we want to save
+        R"save(data, file=filepath)"
+        println("Successfully wrote rdata to ", filepath)
+        
+    else
+        error("Unsupported file extension: $ext")
+    end
+end
+
+
+# General function to read data from R formats
+function read_rdata(filepath::String)
+    ext = lowercase(splitext(filepath)[2])
+    
+    @rput filepath
+    
+    if ext == ".rdz"
+	   R"""
+		if (!requireNamespace('qs', quietly = TRUE)) {
+			install.packages('qs', repos='http://cran.us.r-project.org')
+		}
+		"""
+
+		temp_rda = tempname() * ".rda"
+		@rput filepath
+		@rput temp_rda
+		
+		# Read via qs in R and save to a temporary .rda file
+		R"""
+		data_in <- qs::qread(filepath)
+		save(data_in, file=temp_rda)
+		"""
+
+		# Retrieve data back to Julia using RData.jl to preserve structure
+		loaded_data = RData.load(temp_rda)
+		
+		# Clean up the temporary .rda file
+		rm(temp_rda, force=true)
+		
+		return loaded_data["data_in"]
+        
+    elseif ext == ".rds"
+        R"data_in <- readRDS(filepath)"
+        @rget data_in
+        return data_in
+        
+    elseif ext == ".rda" || ext == ".rdata"
+        # load() returns the name of the objects loaded, we need to extract the first one
+        R"""
+        loaded_obj_names <- load(filepath)
+        data_in <- get(loaded_obj_names[1])
+        """
+        @rget data_in
+        return data_in
+        
+    else
+        error("Unsupported file extension: $ext")
+    end
+end
