@@ -134,9 +134,13 @@ function _icar_log_marginal_likelihood(
     
     F = cholesky(Symmetric(Q_base))
     
-    # Determinant term (ICAR has rank deficiency 1)
-    log_det_prior = sum(log.(L_eig[2:end] .+ T_num(noise)))
-    log_det_diff = - (s_N - 1) * log(scale) + log_det_prior - 2 * sum(log.(diag(F.U)))
+    # Generalized log-determinant over non-zero eigenvalues of spatial precision
+    max_λ = isempty(L_eig) ? one(T_num) : maximum(abs, L_eig)
+    tol = max(T_num(1e-10), T_num(1e-8) * max_λ)
+    pos_evals = filter(λ -> λ > tol, L_eig)
+    rank_eff = length(pos_evals)
+    log_det_prior = isempty(pos_evals) ? zero(T_num) : sum(log.(pos_evals))
+    log_det_diff = - rank_eff * log(scale) + log_det_prior - 2 * sum(log.(diag(F.U)))
     
     # Quadratic term
     b = S_s .* inv_sigma_y2

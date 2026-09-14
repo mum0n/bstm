@@ -18,8 +18,7 @@ const COMPONENT_CONSTRUCTORS = Dict{Symbol, Function}(
 )
 
 const MODEL_TO_STRUCTURE_MAP = Dict{Union{Symbol, DataType}, Symbol}(
-    :none => :none,
-    :cat_movement => :spatial
+    :none => :none
 )
 
 """
@@ -217,7 +216,7 @@ struct UnknownArchitecture <: AbstractModelArchitecture end
 
 const BSTM_MODULE_KEYWORDS = Set([ 
     :intercept, :fixed, :mixed, :random, :nested, :transfer, :fidelity, :eigen,
-    :dynamics, :movement, :pointprocess, :custom, :zscore, :log, :center, :scale, :sciml
+    :dynamics, :pointprocess, :custom, :zscore, :log, :center, :scale, :sciml
 ])
   
 const TRANSFORMATION_FUNCTIONS = Set([:zscore, :log, :center, :scale])
@@ -280,7 +279,9 @@ const INFORMATIVE_PRIORS = Dict(
     "range" => InverseGamma(5,5),
     "velocity" => truncated(Normal(0.2, 0.1), 0.0, 0.95),
     "diffusion" => truncated(Normal(0.1, 0.1), 0.0, Inf),
-    "gamma" => Normal(1.0, 0.5)
+    "gamma" => Normal(1.0, 0.5),
+    "rho_sigma" => Exponential(0.5),
+    "rho_rho" => Beta(2, 2)
 )
 
 const UNINFORMATIVE_PRIORS = Dict(
@@ -297,7 +298,9 @@ const UNINFORMATIVE_PRIORS = Dict(
     "range" => InverseGamma(0.01, 0.01),
     "velocity" => Uniform(0.0, 0.95),
     "diffusion" => truncated(Normal(0.0, 10.0), 0.0, Inf),
-    "gamma" => Normal(0.0, 10.0)
+    "gamma" => Normal(0.0, 10.0),
+    "rho_sigma" => Exponential(10.0),
+    "rho_rho" => Uniform(0, 1)
 )
 
 
@@ -343,12 +346,7 @@ const COMPONENT_CONFIG_ARGS = Dict(
     :tar => Dict(), 
     :pointprocess => Dict(:model => :lgcp, :inner_model => :icar, :grid_areas => "unit"),
     :localadaptive => Dict(:n_clusters => 5),
-    :eigen => Dict(:n_factors => 1),
-    :movement => Dict(
-        :method => :categorical, 
-        :groups => 1, 
-        :time_interval => :monthly
-    )
+    :eigen => Dict(:n_factors => 1)
 )
 
 
@@ -456,3 +454,625 @@ This method is dispatched on the `ComponentModel` instance and is responsible fo
 - A `NamedTuple` (e.g., `(structured=..., noisy=...)`) containing the reconstructed effects.
 """
 function get_effects end
+
+# -----------------------------------------------------------------------------
+# Coordinate & Variable Resolvers
+# -----------------------------------------------------------------------------
+
+"""
+Standard pairs of spatial 2D coordinate variable names, ordered by preference.
+Used for automatic spatial coordinate detection when users provide custom column names.
+"""
+const STANDARD_SPATIAL_COORDINATE_PAIRS = [
+    (:s_x, :s_y),
+    (:plon, :plat),
+    (:lon, :lat),
+    (:longitude, :latitude),
+    (:easting, :northing),
+    (:x, :y),
+    (:coord_x, :coord_y),
+    (:coords_x, :coords_y),
+    (:spatial_x, :spatial_y),
+    (:s1, :s2)
+]
+
+"""
+Standard candidate column names for temporal indexing, ordered by preference.
+"""
+const STANDARD_TEMPORAL_CANDIDATES = [
+    :t_idx,
+    :year,
+    :time,
+    :timestamp,
+    :date,
+    :datetime,
+    :t,
+    :day,
+    :week,
+    :month,
+    :hour,
+    :step
+]
+
+"""
+    _detect_xy_columns(df; x=nothing, y=nothing)::Tuple{Symbol, Symbol}
+
+Automatically identifies or validates 2D spatial coordinate columns in a tabular dataset
+or NamedTuple `df`.
+
+# Process & Mathematical Context
+Spatial models and continuous smooths operate on spatial point coordinates
+\$\\mathbf{s}_i = (x_i, y_i) \\in \\mathbb{R}^2\$. Users commonly label their coordinate
+axes with domain-specific conventions (e.g. `plon`/`plat` for oceanographic bathymetry,
+`easting`/`northing` for projected UTM cartesian grids, or `lon`/`lat` for geodetic
+data). This function systematically resolves the coordinate column names:
+1. If both `x` and `y` are explicitly provided, it validates that they exist in `df`.
+2. If either `x` or `y` is unspecified, it matches against known coordinate pairs
+   defined in `STANDARD_SPATIAL_COORDINATE_PAIRS`.
+3. If no recognized coordinate columns are present, it raises a descriptive `ArgumentError`.
+
+# Inputs
+- `df`: Tabular dataset (`DataFrame`, `NamedTuple`, or table-like object).
+- `x`: Optional explicit name for the horizontal/x coordinate column.
+- `y`: Optional explicit name for the vertical/y coordinate column.
+
+# Outputs
+- `Tuple{Symbol, Symbol}`: Resolved `(col_x, col_y)` symbols.
+"""
+function _detect_xy_columns(
+    df; x=nothing, y=nothing, allow_nothing::Bool=false
+)::Union{Tuple{Symbol, Symbol}, Nothing}
+    # 1. Explicitly provided both x and y
+    if !isnothing(x) && !isnothing(y)
+        sx, sy = Symbol(x), Symbol(y)
+        if !hasproperty(df, sx)
+            allow_nothing && return nothing
+            error(
+                "Specified coordinate column x=:$sx not found in data: " *
+                "$(propertynames(df))."
+            )
+        end
+        if !hasproperty(df, sy)
+            allow_nothing && return nothing
+            error(
+                "Specified coordinate column y=:$sy not found in data: " *
+                "$(propertynames(df))."
+            )
+        end
+        return (sx, sy)
+    end
+
+    # 2. If only one is specified, find matching partner in standard pairs
+    if !isnothing(x) && isnothing(y)
+        sx = Symbol(x)
+        if !hasproperty(df, sx)
+            allow_nothing && return nothing
+            error(
+                "Specified coordinate column x=:$sx not found in data: " *
+                "$(propertynames(df))."
+            )
+        end
+        for (cx, cy) in STANDARD_SPATIAL_COORDINATE_PAIRS
+            if cx == sx && hasproperty(df, cy)
+                return (sx, cy)
+            elseif cy == sx && hasproperty(df, cx)
+                return (cx, sx)
+            end
+        end
+        for cy in [:s_y, :northing, :lat, :latitude, :y, :plat, :coords_y]
+            if hasproperty(df, cy) && cy != sx
+                return (sx, cy)
+            end
+        end
+        allow_nothing && return nothing
+        error(
+            "Coordinate column x=:$sx found, but could not detect matching " *
+            "y coordinate column."
+        )
+    end
+
+    if isnothing(x) && !isnothing(y)
+        sy = Symbol(y)
+        if !hasproperty(df, sy)
+            allow_nothing && return nothing
+            error(
+                "Specified coordinate column y=:$sy not found in data: " *
+                "$(propertynames(df))."
+            )
+        end
+        for (cx, cy) in STANDARD_SPATIAL_COORDINATE_PAIRS
+            if cy == sy && hasproperty(df, cx)
+                return (cx, sy)
+            elseif cx == sy && hasproperty(df, cy)
+                return (sy, cy)
+            end
+        end
+        for cx in [:s_x, :plon, :lon, :longitude, :easting, :x, :coords_x]
+            if hasproperty(df, cx) && cx != sy
+                return (cx, sy)
+            end
+        end
+        allow_nothing && return nothing
+        error(
+            "Coordinate column y=:$sy found, but could not detect matching " *
+            "x coordinate column."
+        )
+    end
+
+    # 3. Neither specified: iterate standard candidate pairs
+    for (cx, cy) in STANDARD_SPATIAL_COORDINATE_PAIRS
+        if hasproperty(df, cx) && hasproperty(df, cy)
+            return (cx, cy)
+        end
+    end
+
+    if allow_nothing
+        return nothing
+    end
+
+    error(
+        "Could not automatically detect spatial coordinate columns in dataset. " *
+        "Available columns: $(propertynames(df)). " *
+        "Please specify coordinate columns explicitly " *
+        "(e.g., x=:lon, y=:lat or x=:plon, y=:plat)."
+    )
+end
+
+"""
+    _detect_time_column(df; time_var=nothing, allow_nothing=false)::Union{Symbol, Nothing}
+
+Automatically identifies or validates the temporal index or date column in a dataset.
+
+# Inputs
+- `df`: Tabular dataset.
+- `time_var`: Optional explicit name for the temporal column.
+- `allow_nothing`: If true, returns `nothing` when not detected instead of error.
+
+# Outputs
+- `Union{Symbol, Nothing}`: Resolved temporal column name or nothing.
+"""
+function _detect_time_column(
+    df; time_var=nothing, allow_nothing::Bool=false
+)::Union{Symbol, Nothing}
+    if !isnothing(time_var)
+        st = Symbol(time_var)
+        if !hasproperty(df, st)
+            allow_nothing && return nothing
+            error(
+                "Specified temporal column time_var=:$st not found in data: " *
+                "$(propertynames(df))."
+            )
+        end
+        return st
+    end
+
+    for t_cand in STANDARD_TEMPORAL_CANDIDATES
+        if hasproperty(df, t_cand)
+            return t_cand
+        end
+    end
+
+    if allow_nothing
+        return nothing
+    end
+
+    error(
+        "Could not automatically detect temporal column in dataset. " *
+        "Available columns: $(propertynames(df)). " *
+        "Please specify temporal column explicitly " *
+        "(e.g., time_var=:year or time_var=:time)."
+    )
+end
+
+"""
+    _detect_response_column(df; target_var=nothing, exclude=Symbol[])::Symbol
+
+Automatically identifies the primary numeric response variable column for modeling
+or kriging interpolation.
+
+# Process
+1. If `target_var` is explicitly provided, validates and returns it.
+2. If `:z`, `:y`, `:val`, or `:value` exists and is not excluded, selects it.
+3. Otherwise, picks the first numeric column in `df` not contained in `exclude`.
+
+# Inputs
+- `df`: Tabular dataset.
+- `target_var`: Optional explicit response column name.
+- `exclude`: List of column symbols to exclude (e.g. spatial coordinates, IDs).
+
+# Outputs
+- `Symbol`: Resolved response column name.
+"""
+function _detect_response_column(df; target_var=nothing, exclude=Symbol[])::Symbol
+    if !isnothing(target_var)
+        sv = Symbol(target_var)
+        if !hasproperty(df, sv)
+            error(
+                "Specified target variable :$sv not found in data: " *
+                "$(propertynames(df))."
+            )
+        end
+        return sv
+    end
+
+    # Standard candidate response names
+    for cand in [:z, :y, :val, :value, :response, :obs]
+        if hasproperty(df, cand) && !(cand in exclude)
+            return cand
+        end
+    end
+
+    # First numeric non-excluded column
+    for col in propertynames(df)
+        sym = Symbol(col)
+        if !(sym in exclude)
+            col_data = df[!, sym]
+            if eltype(col_data) <: Number
+                return sym
+            end
+        end
+    end
+
+    error(
+        "Could not automatically detect response column in dataset. " *
+        "Available columns: $(propertynames(df)). " *
+        "Please specify target variable explicitly (e.g., var=:z)."
+    )
+end
+
+"""
+Standard candidate column names for discrete spatial units (regions, areas, districts, etc.).
+"""
+const STANDARD_SPATIAL_UNIT_CANDIDATES = [
+    :s_idx,
+    :region,
+    :district,
+    :county,
+    :area,
+    :area_id,
+    :zone,
+    :unit,
+    :unit_id,
+    :spatial_unit,
+    :au,
+    :au_idx,
+    :polygon_id,
+    :id,
+    :site,
+    :location,
+    :station
+]
+
+"""
+    _detect_spatial_unit_column(df; s_idx_var=nothing, allow_nothing=false)::Union{Symbol, Nothing}
+
+Automatically identifies or validates the spatial unit or areal index column in a dataset.
+
+# Process
+1. If `s_idx_var` is explicitly specified, validates that it exists in `df` and returns it.
+2. Otherwise, matches against `STANDARD_SPATIAL_UNIT_CANDIDATES`.
+3. If not found and `allow_nothing=false`, raises a descriptive `error`.
+
+# Inputs
+- `df`: Tabular dataset.
+- `s_idx_var`: Optional explicit column name.
+- `allow_nothing`: If true, returns `nothing` when not detected instead of error.
+
+# Outputs
+- `Union{Symbol, Nothing}`: Resolved column symbol or nothing.
+"""
+function _detect_spatial_unit_column(
+    df; s_idx_var=nothing, allow_nothing::Bool=false
+)::Union{Symbol, Nothing}
+    if !isnothing(s_idx_var)
+        sym = Symbol(s_idx_var)
+        if !hasproperty(df, sym)
+            allow_nothing && return nothing
+            error(
+                "Specified spatial unit column s_idx_var=:$sym not found in data: " *
+                "$(propertynames(df))."
+            )
+        end
+        return sym
+    end
+
+    for cand in STANDARD_SPATIAL_UNIT_CANDIDATES
+        if hasproperty(df, cand)
+            return cand
+        end
+    end
+
+    if allow_nothing
+        return nothing
+    end
+
+    error(
+        "Could not automatically detect spatial unit column in dataset. " *
+        "Available columns: $(propertynames(df)). " *
+        "Please specify spatial unit variable explicitly " *
+        "(e.g., `random(region, model=:icar)` or s_idx_var=:region)."
+    )
+end
+
+"""
+Standard candidate column names for seasonal and cyclic indexing, ordered by preference.
+"""
+const STANDARD_SEASONAL_CANDIDATES = [
+    :u_idx,
+    :month,
+    :season,
+    :quarter,
+    :week,
+    :doy,
+    :day_of_year,
+    :hour,
+    :tod,
+    :time_of_day,
+    :period,
+    :cycle,
+    :step
+]
+
+"""
+    _detect_seasonal_column(df; u_idx_var=nothing, allow_nothing=false)::Union{Symbol, Nothing}
+
+Automatically identifies or validates the seasonal/cyclic index column in a dataset.
+
+# Process
+1. If `u_idx_var` is explicitly specified, validates that it exists in `df` and returns it.
+2. Otherwise, matches against `STANDARD_SEASONAL_CANDIDATES`.
+3. If not found and `allow_nothing=false`, raises a descriptive `error`.
+
+# Inputs
+- `df`: Tabular dataset (`DataFrame`, `NamedTuple`, or table-like object).
+- `u_idx_var`: Optional explicit column name.
+- `allow_nothing`: If true, returns `nothing` when not detected instead of error.
+
+# Outputs
+- `Union{Symbol, Nothing}`: Resolved column symbol or `nothing`.
+"""
+function _detect_seasonal_column(
+    df; u_idx_var=nothing, allow_nothing::Bool=false
+)::Union{Symbol, Nothing}
+    if !isnothing(u_idx_var)
+        sym = Symbol(u_idx_var)
+        if !hasproperty(df, sym)
+            allow_nothing && return nothing
+            error(
+                "Specified seasonal index column u_idx_var=:$sym not found in data: " *
+                "$(propertynames(df))."
+            )
+        end
+        return sym
+    end
+
+    for cand in STANDARD_SEASONAL_CANDIDATES
+        if hasproperty(df, cand)
+            return cand
+        end
+    end
+
+    if allow_nothing
+        return nothing
+    end
+
+    error(
+        "Could not automatically detect seasonal/cyclic column in dataset. " *
+        "Available columns: $(propertynames(df)). " *
+        "Please specify seasonal variable explicitly " *
+        "(e.g., `random(month, model=:cyclic)` or u_idx_var=:month)."
+    )
+end
+
+"""
+Standard candidate column names for grouping / clustering, ordered by preference.
+"""
+const STANDARD_GROUP_CANDIDATES = [
+    :group,
+    :group_id,
+    :grp,
+    :g_idx,
+    :subject,
+    :subject_id,
+    :id,
+    :cluster,
+    :cluster_id,
+    :batch,
+    :category,
+    :stratum,
+    :strata
+]
+
+"""
+    _detect_group_column(df; group_var=nothing, allow_nothing=false)::Union{Symbol, Nothing}
+
+Automatically identifies or validates the grouping or cluster column in a dataset.
+
+# Process
+1. If `group_var` is explicitly specified, validates that it exists in `df` and returns it.
+2. Otherwise, matches against `STANDARD_GROUP_CANDIDATES`.
+3. If not found and `allow_nothing=false`, raises a descriptive `error`.
+
+# Inputs
+- `df`: Tabular dataset (`DataFrame`, `NamedTuple`, or table-like object).
+- `group_var`: Optional explicit column name.
+- `allow_nothing`: If true, returns `nothing` when not detected instead of error.
+
+# Outputs
+- `Union{Symbol, Nothing}`: Resolved column symbol or `nothing`.
+"""
+function _detect_group_column(
+    df; group_var=nothing, allow_nothing::Bool=false
+)::Union{Symbol, Nothing}
+    if !isnothing(group_var)
+        sym = Symbol(group_var)
+        if !hasproperty(df, sym)
+            allow_nothing && return nothing
+            error(
+                "Specified group column group_var=:$sym not found in data: " *
+                "$(propertynames(df))."
+            )
+        end
+        return sym
+    end
+
+    for cand in STANDARD_GROUP_CANDIDATES
+        if hasproperty(df, cand)
+            return cand
+        end
+    end
+
+    if allow_nothing
+        return nothing
+    end
+
+    error(
+        "Could not automatically detect grouping column in dataset. " *
+        "Available columns: $(propertynames(df)). " *
+        "Please specify grouping variable explicitly (e.g., `random(group, model=:iid)`)."
+    )
+end
+
+"""
+Standard supported coupling and interaction modes for nested multi-fidelity models:
+- `:additive`       : Standard additive link η_parent = η_base + ρ * η_sub[mapping].
+- `:multiplicative` : Proportional modulator η_parent = η_base * (1 + ρ * η_sub[mapping]).
+- `:interaction`    : Cross-product interaction η_parent = η_base + ρ * (η_base .* η_sub[mapping]).
+- `:tensor`         : Kronecker tensor product coupling across multiple strata factors.
+- `:moderated`      : Continuous moderator interaction ρ = ρ_0[strata] + ρ_1[strata] * mod.
+"""
+const NESTED_COUPLING_MODES = [
+    :additive,
+    :multiplicative,
+    :interaction,
+    :tensor,
+    :moderated
+]
+
+"""
+    _resolve_nested_strata(data, strata_arg; calling_mod::Module = Main)
+
+Resolves single or compound strata definitions for nested multi-fidelity coupling.
+
+# Mathematical Formulation
+When multiple strata columns ``\\{C_1, \\dots, C_K\\}`` are provided (e.g. `[:region, :season]`),
+each observation ``i`` is mapped to a compound joint stratum tuple:
+``s[i] = (C_1[i], \\dots, C_K[i])``
+Unique observed combinations define discrete compound levels ``\\{1, \\dots, S_{\\text{tot}}\\}``,
+allowing coupling parameters ``\\boldsymbol{\\rho}`` to vary across joint parent strata or
+to form factorial / Kronecker tensor interactions.
+
+# Inputs
+- `data`: Tabular dataset (`DataFrame`, `NamedTuple`, or table-like object).
+- `strata_arg`: Strata specification. Supports:
+  - `Symbol` or `AbstractString`: Single column name in `data`.
+  - `Vector{Symbol}`, `Vector{String}`, `Tuple`: Multiple column names in `data`.
+  - `AbstractVector{<:Integer}`: Pre-computed integer stratum indices.
+  - `nothing`: Unstratified coupling.
+- `calling_mod`: Calling module scope for variable evaluation.
+
+# Outputs
+- `NamedTuple` containing:
+  - `strata_indices`: `Vector{Int}` of length ``N`` mapping each row to joint stratum ``1 \\dots S``.
+  - `n_strata`: `Int` total count of unique joint strata.
+  - `strata_levels`: `Vector{Any}` of unique level values or compound tuples.
+  - `strata_factors`: `Vector{Symbol}` names of strata factors.
+  - `factor_indices`: `Dict{Symbol, Vector{Int}}` marginal indices per factor.
+  - `factor_levels`: `Dict{Symbol, Vector{Any}}` unique marginal levels per factor.
+  - `factor_dims`: `Dict{Symbol, Int}` counts of marginal levels per factor.
+  - `is_multistrata`: `Bool` indicating if multiple factors define the strata.
+"""
+function _resolve_nested_strata(data, strata_arg; calling_mod::Module = Main)
+    isnothing(strata_arg) && return nothing
+
+    N_obs = size(data, 1)
+
+    # 1. Direct integer index vector
+    if strata_arg isa AbstractVector{<:Integer}
+        s_idx = Vector{Int}(strata_arg)
+        length(s_idx) == N_obs || throw(DimensionMismatch(
+            "Length of pre-computed strata_indices ($(length(s_idx))) " *
+            "does not match data row count ($(N_obs))."
+        ))
+        n_s = isempty(s_idx) ? 0 : maximum(s_idx)
+        return (
+            strata_indices = s_idx,
+            n_strata = n_s,
+            strata_levels = collect(1:n_s),
+            strata_factors = Symbol[],
+            factor_indices = Dict{Symbol, Vector{Int}}(),
+            factor_levels = Dict{Symbol, Vector{Any}}(),
+            factor_dims = Dict{Symbol, Int}(),
+            is_multistrata = false
+        )
+    end
+
+    # 2. Extract column symbol list
+    col_syms = if strata_arg isa Symbol || strata_arg isa AbstractString
+        [Symbol(strata_arg)]
+    elseif strata_arg isa AbstractVector
+        [Symbol(c) for c in strata_arg]
+    elseif strata_arg isa Tuple
+        [Symbol(c) for c in strata_arg]
+    else
+        throw(ArgumentError(
+            "Unsupported type for nested strata specification: $(typeof(strata_arg)). " *
+            "Expected Symbol, Vector{Symbol}, Tuple, or Vector{<:Integer}."
+        ))
+    end
+
+    isempty(col_syms) && return nothing
+
+    # Validate all strata columns exist in data
+    for col in col_syms
+        if !hasproperty(data, col)
+            throw(ArgumentError(
+                "Nested strata column ':$col' not found in data. " *
+                "Available columns: $(propertynames(data))."
+            ))
+        end
+    end
+
+    # 3. Compute marginal factor levels and indices
+    factor_indices = Dict{Symbol, Vector{Int}}()
+    factor_levels = Dict{Symbol, Vector{Any}}()
+    factor_dims = Dict{Symbol, Int}()
+
+    for col in col_syms
+        raw_vals = data[!, col]
+        u_vals = unique(raw_vals)
+        val_map = Dict(v => i for (i, v) in enumerate(u_vals))
+        factor_indices[col] = [val_map[v] for v in raw_vals]
+        factor_levels[col] = Vector{Any}(u_vals)
+        factor_dims[col] = length(u_vals)
+    end
+
+    # 4. Compute joint compound strata levels and indices
+    if length(col_syms) == 1
+        col = col_syms[1]
+        s_idx = factor_indices[col]
+        n_s = factor_dims[col]
+        u_levels = factor_levels[col]
+        is_multi = false
+    else
+        compound_tuples = [
+            Tuple(data[i, col] for col in col_syms) for i in 1:N_obs
+        ]
+        u_levels = unique(compound_tuples)
+        n_s = length(u_levels)
+        compound_map = Dict(tup => i for (i, tup) in enumerate(u_levels))
+        s_idx = [compound_map[tup] for tup in compound_tuples]
+        is_multi = true
+    end
+
+    return (
+        strata_indices = s_idx,
+        n_strata = n_s,
+        strata_levels = u_levels,
+        strata_factors = col_syms,
+        factor_indices = factor_indices,
+        factor_levels = factor_levels,
+        factor_dims = factor_dims,
+        is_multistrata = is_multi
+    )
+end

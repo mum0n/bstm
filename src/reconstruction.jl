@@ -248,8 +248,7 @@ function extract_chain_scalar(
     if chain isa NamedTuple || chain isa AbstractDict
         for (k, v) in pairs(chain)
             sk = string(k)
-            if sk == pref_str || sk == "$(pref_str)_1" ||
-               sk == "$(pref_str)_s_idx" || sk == "$(pref_str)_movement"
+            if sk == pref_str || sk == "$(pref_str)_1" || sk == "$(pref_str)_s_idx"
                 return v isa AbstractVector ? Float64.(v) : [Float64(v)]
             end
         end
@@ -264,7 +263,7 @@ function extract_chain_scalar(
     end
 
     # 3. Check for common prefix variants
-    for candidate in ["$(pref_str)_s_idx", "$(pref_str)_movement", "$(pref_str)_t_idx"]
+    for candidate in ["$(pref_str)_s_idx", "$(pref_str)_t_idx"]
         m_cand = _find_parameter(p_names, candidate, 1, false)
         if !isempty(m_cand)
             return get_params_vector(chain, m_cand, 1)[:, 1]
@@ -306,7 +305,7 @@ end
     _summarize_effects_registry(registry, M, outcomes_N, alpha)
 
 Computes posterior summary statistics (mean, median, std, lower/upper credible bounds) for
-all structured and unstructured component effects, including categorical movement parameters.
+all structured and unstructured component effects.
 """
 function _summarize_effects_registry(registry, M, outcomes_N, alpha)
     summarized_registry = Dict{Symbol, Any}()
@@ -388,24 +387,6 @@ function _summarize_effects_registry(registry, M, outcomes_N, alpha)
             alpha=alpha) for k in 1:outcomes_N] : summarize_array(int_mat[:, 1], alpha=alpha)
     end
 
-    # 5. Summarize Stratified Categorical Movement Parameters (beta, D_g, gamma)
-    if haskey(registry, :categorical_movement) && !isempty(registry.categorical_movement)
-        cat_mov = registry.categorical_movement
-        cat_summary = Dict{Symbol, Any}()
-        
-        for param_key in keys(cat_mov)
-            param_vals = getproperty(cat_mov, param_key) # Expected matrix [samples × groups]
-            if param_vals isa AbstractMatrix
-                n_groups = size(param_vals, 2)
-                group_summaries = [summarize_array(param_vals[:, g], alpha=alpha) for g in 1:n_groups]
-                cat_summary[param_key] = group_summaries
-            else
-                cat_summary[param_key] = summarize_array(param_vals, alpha=alpha)
-            end
-        end
-        summarized_registry[:categorical_movement] = NamedTuple(cat_summary)
-    end
-    
     return NamedTuple(summarized_registry)
 end
 
@@ -452,36 +433,6 @@ function summarize_predictions(samples::AbstractArray; alpha=0.05)
     )
 end
 
-
-function _discover_categorical_movement_realizations(chain, M, PS, n_samples, G)
-    p_names = _get_clean_chain_param_names(chain)
-    
-    beta_samples = zeros(Float64, n_samples, G)
-    D_samples    = zeros(Float64, n_samples, G)
-    gamma_samples = zeros(Float64, n_samples, G)
-    
-    for g in 1:G
-        # Extract beta[g]
-        b_name = _find_parameter(p_names, "beta[$g]", g, false)
-        if !isempty(b_name)
-            beta_samples[:, g] = get_params_vector(chain, b_name, 1)[:, 1]
-        end
-        
-        # Extract D_g[g]
-        d_name = _find_parameter(p_names, "D_g[$g]", g, false)
-        if !isempty(d_name)
-            D_samples[:, g] = get_params_vector(chain, d_name, 1)[:, 1]
-        end
-        
-        # Extract gamma[g]
-        g_name = _find_parameter(p_names, "gamma[$g]", g, false)
-        if !isempty(g_name)
-            gamma_samples[:, g] = get_params_vector(chain, g_name, 1)[:, 1]
-        end
-    end
-    
-    return (beta = beta_samples, D_g = D_samples, gamma = gamma_samples)
-end
 
 
 function _discover_component_realizations(
@@ -558,12 +509,7 @@ function _discover_component_realizations(
         component_realizations[spec.key] = effects_result
     end
 
-    # --- Stratified Categorical Movement Effects ---
-    categorical_movement_realizations = nothing
-    if haskey(M, :group_lookup) || haskey(M, :G) || any(s -> get(s.params, :method, nothing) == :categorical, M.components)
-        G_val = haskey(M, :group_lookup) ? length(M.group_lookup) : get(M, :G, 3)
-        categorical_movement_realizations = _discover_categorical_movement_realizations(chain, M, PS, n_samples, G_val)
-    end
+
 
     # --- Spatiotemporal Interaction Effects ---
     st_interaction_effects_samples = zeros(Float64, M.s_N * M.t_N, n_samples, outcomes_N)
@@ -639,10 +585,6 @@ function _discover_component_realizations(
         st_interaction=st_interaction_effects_samples,
         householder_reflection=householder_effects_samples
     )
-
-    if !isnothing(categorical_movement_realizations)
-        res_tuple = merge(res_tuple, (categorical_movement=categorical_movement_realizations,))
-    end
 
     return res_tuple
 end
@@ -796,25 +738,22 @@ function _reconstruct(
 end
 
 
-function _reconstruct(
-    arch::MultifidelityArchitecture, mode::String, chain, M::NamedTuple, PS,
-    alpha::Float64
+"""
+    _assemble_hierarchical_eta(chain, M, PS, n_samples, outcomes_N, N_tot; prefix="")
+
+Recursively computes linear predictor `eta` for a model and all nested sub-models,
+propagating lower-tier linear predictors through intermediate cascading parents.
+"""
+function _assemble_hierarchical_eta(
+    chain, M::NamedTuple, PS, n_samples::Int, outcomes_N::Int, N_tot::Int;
+    prefix::String = ""
 )
-    n_samples = _get_chain_n_samples(chain)
-    N_tot = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
-    outcomes_N = M.outcomes_N
-
-    # 1. Reconstruct the main model's components (excluding nested effects)
-    main_registry = _discover_component_realizations(
-        chain, M, PS, n_samples, outcomes_N, N_tot
+    registry = _discover_component_realizations(
+        chain, M, PS, n_samples, outcomes_N, N_tot; prefix = prefix
     )
-    
-    # 2. Assemble the main model's base eta
-    eta_main = _modular_eta_assembly(main_registry, M, PS, n_samples, outcomes_N)
+    eta = _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
 
-    # 3. Reconstruct sub-models' etas and add them to the main eta
-    nested_results = Dict{Symbol, Any}()
-    if haskey(M, :nested_components)
+    if haskey(M, :nested_components) && !isempty(M.nested_components)
         for (key, sub_M) in M.nested_components
             sub_PS = if !isnothing(PS) && haskey(PS, :nested_prediction_sets)
                 get(PS.nested_prediction_sets, key, nothing)
@@ -824,46 +763,160 @@ function _reconstruct(
 
             sub_outcomes_N = get(sub_M, :outcomes_N, 1)
             sub_N_tot = isnothing(sub_PS) ? sub_M.y_N : sub_M.y_N + sub_PS.y_N
-            sub_registry = _discover_component_realizations(
-                chain, sub_M, sub_PS, n_samples, sub_outcomes_N, sub_N_tot;
-                prefix = string(key)
-            )
-            eta_sub = _modular_eta_assembly(sub_registry, sub_M, sub_PS, n_samples, sub_outcomes_N)
+            sub_prefix = isempty(prefix) ? string(key) : "$(prefix)_$(key)"
 
-            rho_name = "rho_nested_$(key)"
-            rho_samples = if get(sub_M, :fixed_coupling, false)
-                ones(Float64, n_samples)
+            # Recursively assemble child's eta (with any cascading children)
+            eta_sub = _assemble_hierarchical_eta(
+                chain, sub_M, sub_PS, n_samples, sub_outcomes_N, sub_N_tot;
+                prefix = sub_prefix
+            )
+
+            coupling = get(sub_M, :coupling, get(sub_M, :interaction, :additive))
+            is_tensor = coupling == :tensor && get(sub_M, :is_multistrata, false)
+            is_moderated = coupling == :moderated
+            n_strata = get(sub_M, :n_strata, 1)
+            is_stratified = n_strata > 1
+            has_moderator = hasproperty(sub_M, :moderator) &&
+                !isnothing(sub_M.moderator)
+            moderator_vec = has_moderator ? sub_M.moderator : nothing
+            strata_idx = get(sub_M, :strata_indices, nothing)
+
+            # Sample extraction for tensor, moderated, or standard coupling
+            fac_samples = Dict{Symbol, Matrix{Float64}}()
+            rho_0_mat = nothing
+            rho_1_mat = nothing
+            rho_samples = nothing
+
+            if is_tensor
+                for fac in sub_M.strata_factors
+                    dim = sub_M.factor_dims[fac]
+                    rho_fac_name = "rho_nested_$(sub_prefix)_$(fac)"
+                    v = extract_param_matrix(chain, rho_fac_name; expected_dim = dim)
+                    fac_samples[fac] = isempty(v) ? ones(Float64, n_samples, dim) : v
+                end
+            elseif is_moderated
+                rho_0_name = "rho_nested_$(sub_prefix)_0"
+                rho_1_name = "rho_nested_$(sub_prefix)_1"
+                exp_d = is_stratified ? n_strata : 1
+                v0 = extract_param_matrix(chain, rho_0_name; expected_dim = exp_d)
+                v1 = extract_param_matrix(chain, rho_1_name; expected_dim = exp_d)
+                rho_0_mat = isempty(v0) ? ones(Float64, n_samples, exp_d) : v0
+                rho_1_mat = isempty(v1) ? zeros(Float64, n_samples, exp_d) : v1
             else
-                v = get_params_vector(chain, rho_name, 1)
-                isempty(v) ? ones(Float64, n_samples) : v[:, 1]
+                rho_name = "rho_nested_$(sub_prefix)"
+                rho_samples = if get(sub_M, :fixed_coupling, false)
+                    if is_stratified
+                        ones(Float64, n_samples, n_strata)
+                    else
+                        ones(Float64, n_samples)
+                    end
+                else
+                    if is_stratified
+                        v = extract_param_matrix(chain, rho_name; expected_dim = n_strata)
+                        isempty(v) ? ones(Float64, n_samples, n_strata) : v
+                    else
+                        v = extract_param_matrix(chain, rho_name; expected_dim = 1)
+                        isempty(v) ? ones(Float64, n_samples) : vec(v[:, 1])
+                    end
+                end
             end
 
-            if haskey(sub_M, :mapping) && !isnothing(sub_M.mapping)
-                eta_sub_mapped = eta_sub[sub_M.mapping, :, :]
-                eta_main .+= reshape(rho_samples, 1, n_samples, 1) .* eta_sub_mapped
+            eta_sub_mapped = if haskey(sub_M, :mapping) && !isnothing(sub_M.mapping)
+                eta_sub[sub_M.mapping, :, :]
             elseif size(eta_sub, 1) == N_tot
-                eta_main .+= reshape(rho_samples, 1, n_samples, 1) .* eta_sub
+                eta_sub
             else
-                @warn "Size mismatch between main model observations ($N_tot) and " *
+                @warn "Size mismatch between parent observations ($N_tot) and " *
                       "nested model '$(key)' observations ($(size(eta_sub, 1)))." *
                       " Cannot apply nested effect."
                 continue
             end
-            
-            if outcomes_N > 1 || sub_outcomes_N > 1
-                @warn "Multi-fidelity connection between multivariate models is not " *
-                      "fully supported. Assuming a 1-to-1 outcome mapping." 
+
+            # Apply coupling with interaction modes
+            for i in 1:size(eta_sub_mapped, 1)
+                w = if is_tensor
+                    w_t = ones(Float64, n_samples)
+                    for fac in sub_M.strata_factors
+                        idx_f = sub_M.factor_indices[fac][i]
+                        w_t .*= fac_samples[fac][:, idx_f]
+                    end
+                    if has_moderator
+                        w_t .*= moderator_vec[i]
+                    end
+                    w_t
+                elseif is_moderated
+                    s_idx = !isnothing(strata_idx) ? strata_idx[i] : 1
+                    mod_v = !isnothing(moderator_vec) ? moderator_vec[i] : 1.0
+                    rho_0_mat[:, s_idx] .+ rho_1_mat[:, s_idx] .* mod_v
+                elseif is_stratified
+                    s_idx = !isnothing(strata_idx) ? strata_idx[i] : 1
+                    mod_w = !isnothing(moderator_vec) ? moderator_vec[i] : 1.0
+                    rho_samples[:, s_idx] .* mod_w
+                else
+                    mod_w = !isnothing(moderator_vec) ? moderator_vec[i] : 1.0
+                    rho_samples .* mod_w
+                end
+
+                w_reshaped = reshape(w, 1, n_samples, 1)
+                sub_row = eta_sub_mapped[i:i, :, :]
+
+                if coupling == :multiplicative
+                    eta[i:i, :, :] .*= (1.0 .+ w_reshaped .* sub_row)
+                elseif coupling == :interaction
+                    eta[i:i, :, :] .+= w_reshaped .* (eta[i:i, :, :] .* sub_row)
+                else # :additive, :tensor, :moderated
+                    eta[i:i, :, :] .+= w_reshaped .* sub_row
+                end
+            end
+        end
+    end
+
+    return eta
+end
+
+function _reconstruct(
+    arch::MultifidelityArchitecture, mode::String, chain, M::NamedTuple, PS,
+    alpha::Float64; prefix::String = ""
+)
+    n_samples = _get_chain_n_samples(chain)
+    N_tot = isnothing(PS) ? M.y_N : M.y_N + PS.y_N
+    outcomes_N = M.outcomes_N
+
+    # 1. Reconstruct full hierarchical eta (including all nested cascading levels)
+    eta_main = _assemble_hierarchical_eta(
+        chain, M, PS, n_samples, outcomes_N, N_tot; prefix = prefix
+    )
+
+    # 2. Main model registry for effects summary
+    main_registry = _discover_component_realizations(
+        chain, M, PS, n_samples, outcomes_N, N_tot; prefix = prefix
+    )
+
+    # 3. Individual reconstruction summaries for sub-models
+    nested_results = Dict{Symbol, Any}()
+    if haskey(M, :nested_components)
+        for (key, sub_M) in M.nested_components
+            sub_PS = if !isnothing(PS) && haskey(PS, :nested_prediction_sets)
+                get(PS.nested_prediction_sets, key, nothing)
+            else
+                nothing
             end
 
+            sub_prefix = isempty(prefix) ? string(key) : "$(prefix)_$(key)"
             sub_arch_raw = get(sub_M, :model_arch, "univariate")
-            sub_arch_type = if sub_arch_raw == "multivariate"
+            sub_arch_type = if (haskey(sub_M, :nested_components) &&
+                               !isempty(sub_M.nested_components)) ||
+                               sub_arch_raw == "multifidelity"
+                MultifidelityArchitecture()
+            elseif sub_arch_raw == "multivariate"
                 MultivariateArchitecture()
             else
                 UnivariateArchitecture()
             end
+
             nested_results[key] = _reconstruct(
                 sub_arch_type, mode, chain, sub_M, sub_PS, alpha;
-                prefix = string(key)
+                prefix = sub_prefix
             )
         end
     end
@@ -1419,7 +1472,7 @@ function _compute_waic(log_lik)
 
     nobs, nsamples = size(log_lik)
     lppd = sum(LogExpFunctions.logsumexp(view(log_lik, i, :)) - log(nsamples) for i in 1:nobs)
-    p_waic = sum(var(view(log_lik, i, :)) for i in 1:nobs)
+    p_waic = nsamples > 1 ? sum(var(view(log_lik, i, :)) for i in 1:nobs) : 0.0
     
     return -2 * (lppd - p_waic)
 end
@@ -1589,8 +1642,38 @@ The primary analytical post-processing engine that reconstructs latent fields, c
 point predictions, prediction intervals, goodness-of-fit metrics, and MCMC convergence diagnostics.
 Generates pure analytical data without executing graphical rendering.
 """
+function _is_optimization_or_vi_result(chain)::Bool
+    if chain isa DataFrame || chain isa AbstractDict
+        return false
+    end
+    t_str = string(typeof(chain))
+    if occursin("ModeResult", t_str) ||
+       occursin("VIResult", t_str) ||
+       occursin("VariationalPosterior", t_str)
+        return true
+    end
+    if (hasproperty(chain, :params) && hasproperty(chain, :optim_result)) ||
+       hasproperty(chain, :q)
+        return true
+    end
+    return false
+end
+
+function _is_area_unit_object(obj)::Bool
+    isnothing(obj) && return false
+    if obj isa DataFrame || (isdefined(Main, :AbstractDataFrame) && obj isa AbstractDataFrame)
+        return false
+    end
+    return hasproperty(obj, :centroids) || hasproperty(obj, :W) ||
+           hasproperty(obj, :polygons) || hasproperty(obj, :n_units)
+end
+
 function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothing, alpha=0.05,
     strata_info=nothing, au=nothing, kwargs...)
+    if _is_optimization_or_vi_result(chain)
+        n_samples_req = get(kwargs, :n_samples, 100)
+        chain = convert_to_chains(chain, model, n_samples_req)
+    end
     n_samples = _get_chain_n_samples(chain)
     
     # --- 1. Metadata and Architecture Extraction ---
@@ -1769,7 +1852,32 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothin
         arch = res.arch,
         M = M,
         data = get(M, :data, data),
-        au = au
+        au = au,
+        model = model,
+        chain = chain
+    )
+end
+
+"""
+    model_results_comprehensive(model::DynamicPPL.Model, chain, arg3, arg4=nothing; kwargs...)
+
+Positional argument convenience overload supporting `(model, chain, data, au)` and
+`(model, chain, au)` call signatures.
+"""
+function model_results_comprehensive(
+    model::DynamicPPL.Model,
+    chain,
+    arg3,
+    arg4 = nothing;
+    data = nothing,
+    au = nothing,
+    kwargs...
+)
+    resolved_au = !isnothing(au) ? au : (_is_area_unit_object(arg3) ? arg3 : arg4)
+    resolved_data = !isnothing(data) ? data : (_is_area_unit_object(arg3) ? arg4 : arg3)
+
+    return model_results_comprehensive(
+        model, chain; data = resolved_data, au = resolved_au, kwargs...
     )
 end
 
@@ -1927,8 +2035,7 @@ end
 """
     _generate_conditional_predictions(model_obj, chain, M, target_cov::Symbol; second_cov::Union{Symbol, Nothing}=nothing, n_points::Int=50, alpha::Float64=0.05)
 
-Generates conditional predictions for covariates, with specialized support for 
-step-length (`k`) conditioning in stratified categorical movement models.
+Generates conditional predictions for covariates across the spatial and temporal domain.
 """
 function _generate_conditional_predictions(
     model_obj,
@@ -1945,31 +2052,11 @@ function _generate_conditional_predictions(
     end
 
     n_samps = try
-        size(chain, 1)
+        _get_chain_n_samples(chain)
     catch
         50
     end
 
-    is_categorical_movement = haskey(M, :method) && M.method == :categorical
-
-    if is_categorical_movement
-        # For categorical movement models, allow conditional prediction over step-length `k`
-        if target_cov == :k && hasproperty(M, :data) && hasproperty(M.data, :k)
-            base_df = DataFrame(M.data[1:1, :])
-            min_k, max_k = extrema(M.data.k)
-            k_range = collect(min_k:max(1, (max_k - min_k) ÷ n_points):max(1, max_k))
-            pred_df = vcat([deepcopy(base_df) for _ in k_range]...)
-            pred_df[!, :k] = k_range
-
-            preds = predict(model_obj, chain, pred_df; n_samples = n_samps, alpha = alpha)
-
-            # Extract mean spatial probability vector summary across the k range
-            mean_probs = preds.predictions_denoised.mean
-            return (mean = mean_probs, lower = zeros(size(mean_probs)), upper = zeros(size(mean_probs))), k_range
-        else
-            return nothing
-        end
-    end
 
     # --- Standard BSTM Conditional Predictions ---
     if !hasproperty(M, :data) || isnothing(M.data) || !hasproperty(M.data, target_cov)
@@ -2045,178 +2132,13 @@ end
 
 
 """
-    _predict_categorical_movement(model_obj, chain, new_data, n_samps, alpha)
+    _prepare_prediction_inputs(M_train, new_data::DataFrame)::NamedTuple
 
-Simulates out-of-sample recapture location distributions and sampled locations 
-from fitted group transition matrices using posterior draws of (β, D_g, γ).
+Prepares the prediction set configuration `PS` from the training model specification `M_train`
+and new input observations `new_data`. Automatically resolves and maps user-supplied spatial
+and temporal variable names to 1-based internal indices.
 """
-function _predict_categorical_movement(model_obj, chain, new_data::DataFrame, n_samps::Int, alpha::Float64)
-    M = model_obj.args.M
-    S = M.s_N
-    W = M.W
-    hsi = M.hsi
-    adj_rows = M.adj_rows
-    L_dense = M.L_dense
-    I_S = Matrix{Float64}(I, S, S)
-    
-    # Extract prediction inputs from new_data
-    releases = hasproperty(new_data, :release) ? Vector{Int}(new_data.release) : ones(Int, nrow(new_data))
-    ks = hasproperty(new_data, :k) ? Vector{Int}(new_data.k) : ones(Int, nrow(new_data))
-    
-    # Resolve group indices for new_data using training group_lookup
-    group_lookup = M.group_lookup
-    groups = if hasproperty(new_data, :group)
-        Vector{Int}(new_data.group)
-    elseif hasproperty(new_data, :group_id)
-        Vector{Int}(new_data.group_id)
-    elseif hasproperty(new_data, :sex) && hasproperty(new_data, :mat)
-        [get(group_lookup, "$(r.sex)_$(r.mat)", 1) for r in eachrow(new_data)]
-    else
-        matched = ones(Int, nrow(new_data))
-        cols = propertynames(new_data)
-        for (idx, r) in enumerate(eachrow(new_data))
-            for (lbl, g_id) in pairs(group_lookup)
-                cand_matches = [
-                    string(r[c]) for c in cols
-                    if r[c] isa Union{String, Symbol, Number}
-                ]
-                if any(m -> occursin(m, string(lbl)), cand_matches)
-                    matched[idx] = g_id
-                    break
-                end
-            end
-        end
-        matched
-    end
-
-    G = length(group_lookup)
-    N_new = nrow(new_data)
-    
-    # Matrices to store posterior simulations [N_new x n_samps]
-    simulated_recaps = Matrix{Int}(undef, N_new, n_samps)
-    expected_probs = zeros(Float64, N_new, S, n_samps)
-
-    # Thinning or selecting indices for n_samps
-    total_chain_samples = _get_chain_n_samples(chain)
-    sample_indices = unique(round.(Int, range(1, total_chain_samples, length=n_samps)))
-    actual_samps = length(sample_indices)
-
-    for (s_idx, chain_i) in enumerate(sample_indices)
-        # Extract parameter draws for this sample across groups
-        function _extract_draw_val(prefix, g, chain_idx)
-            candidates = [
-                "$(prefix)[$g]",
-                "$(prefix)_movement[$g]",
-                "$(prefix)_s_idx_t_idx[$g]",
-                "$(prefix)[$g, 1]",
-                "$(prefix)"
-            ]
-            for c in candidates
-                try
-                    mat = extract_param_matrix(chain, c)
-                    if size(mat, 1) >= chain_idx
-                        return Float64(mat[chain_idx, 1])
-                    end
-                catch
-                end
-            end
-            # Fallback legacy names
-            if prefix == "velocity"
-                try; return Float64(extract_param_matrix(chain, "beta[$g]")[chain_idx, 1]); catch; end
-            elseif prefix == "diffusion"
-                try; return Float64(extract_param_matrix(chain, "D_g[$g]")[chain_idx, 1]); catch; end
-            end
-            return prefix == "gamma" ? 1.0 : (prefix == "velocity" ? 0.3 : 0.1)
-        end
-
-        max_k = maximum(ks)
-        W_sp = sparse(W)
-        Gk_cache_draw = map(1:G) do g
-            v_val = _extract_draw_val("velocity", g, chain_i)
-            d_val = _extract_draw_val("diffusion", g, chain_i)
-            g_val = _extract_draw_val("gamma", g, chain_i)
-            tot   = v_val + d_val + 1e-6
-            if tot <= 1e-6
-                @warn "Total movement velocity + diffusion <= 0 for group $g. Using default dispersal."
-            end
-            alpha_g = max(0.0, min(1.0, v_val / tot))
-            rho_g   = max(0.001, min(0.999, 1.0 / (1.0 + tot)))
-
-            P_g = construct_stochastic_transition_kernel(
-                W_sp, hsi; gamma=g_val, residence=rho_g, advection=alpha_g
-            )
-            powers = Vector{Matrix{Float64}}(undef, max_k)
-            powers[1] = P_g
-            for k_step in 2:max_k
-                powers[k_step] = powers[k_step - 1] * P_g
-            end
-            powers
-        end
-
-        # Predict for each observation in new_data
-        for n in 1:N_new
-            rel = releases[n]
-            g = groups[n]
-            k_n = ks[n]
-            
-            p = Gk_cache_draw[g][k_n][rel, :]
-            ps = sum(p)
-            p_norm = ps > 1e-12 ? (p ./ ps) : fill(1.0 / S, S)
-            
-            expected_probs[n, :, s_idx] = p_norm
-            
-            # Simulate categorical recapture location
-            simulated_recaps[n, s_idx] = rand(Categorical(p_norm))
-        end
-    end
-
-    # Summarize expected probability distributions across posterior draws
-    mean_probs = dropdims(mean(expected_probs, dims=3), dims=3) # [N_new x S]
-    
-    return (
-        predictions_denoised = (mean = mean_probs,),
-        predictions_noisy = (mean = simulated_recaps,),
-        raw_predictions_denoised = expected_probs,
-        raw_predictions_noisy = simulated_recaps,
-        PS = new_data
-    )
-end
-
-
-"""
-    predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100,
-      alpha=0.05)
-
-The primary engine for projecting a fitted `bstm` model onto a new dataset to
-generate out-of-sample predictions.
-
-# Version
-v1.0.0
-
-# Arguments
-- `model_obj::DynamicPPL.Model`: The fitted Turing model object.
-- `chain`: The `MCMCChains.Chains` object from the fitted model.
-- `new_data::DataFrame`: A `DataFrame` with the same column names as the training data.
-- `n_samples::Int`: The number of posterior samples to use for prediction.
-- `alpha::Float64`: The significance level for credible intervals.
-
-# Returns
-- A `NamedTuple` containing the summarized `predictions_denoised` and
-  `predictions_noisy`, the full posterior statistics object `pstats`, and the
-  prediction set configuration `PS`.
-"""
-function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100,
-    alpha=0.05)
-    M_train = model_obj.args.M
-    n_samps = min(size(chain, 1), n_samples)
-
-    # Check if this is a categorical movement model
-    is_categorical_movement = haskey(M_train, :method) && M_train.method == :categorical
-
-    if is_categorical_movement
-        return _predict_categorical_movement(model_obj, chain, new_data, n_samps, alpha)
-    end
- 
+function _prepare_prediction_inputs(M_train, new_data::DataFrame)::NamedTuple
     # 1. Initialize the Prediction Set (PS) configuration
     PS_dict = Dict(pairs(M_train))
     PS_dict[:data] = new_data
@@ -2225,7 +2147,6 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
 
     # 2. Re-create fixed effects design matrix for the new data
     if haskey(M_train, :formula)
-        # Corrected call: Pass training data for context.
         decomposed_formula = decompose_bstm_formula(M_train.formula, M_train.data)
         
         fixed_effects_vars = String[]
@@ -2239,7 +2160,6 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
         
         if !isempty(fixed_effects_vars)
             rhs = "0 + " * join(fixed_effects_vars, " + ")
-            # Corrected call: Pass calling_module for scoped evaluation.
             Xfixed_pred, _ = create_fixed_design(
                 rhs, 
                 new_data, 
@@ -2254,13 +2174,60 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
 
     # 3. Update indices and offsets from new_data
     if haskey(M_train, :s_idx_var) && hasproperty(new_data, M_train.s_idx_var)
-        PS_dict[:s_idx] = new_data[!, M_train.s_idx_var]
+        raw_new_s = new_data[!, M_train.s_idx_var]
+        if haskey(M_train, :s_values) && !isnothing(M_train.s_values)
+            s_val_map = Dict(v => i for (i, v) in enumerate(M_train.s_values))
+            PS_dict[:s_idx] = [get(s_val_map, v, 1) for v in raw_new_s]
+        elseif eltype(raw_new_s) <: Integer
+            PS_dict[:s_idx] = Int.(raw_new_s)
+        else
+            PS_dict[:s_idx] = raw_new_s
+        end
+    elseif hasproperty(new_data, :s_idx)
+        PS_dict[:s_idx] = Int.(new_data[!, :s_idx])
     end 
+
     if haskey(M_train, :t_idx_var) && hasproperty(new_data, M_train.t_idx_var)
-        PS_dict[:t_idx] = new_data[!, M_train.t_idx_var]
+        raw_new_t = new_data[!, M_train.t_idx_var]
+        if haskey(M_train, :t_values) && !isnothing(M_train.t_values)
+            t_vals = M_train.t_values
+            PS_dict[:t_idx] = [
+                begin
+                    fidx = findfirst(==(v), t_vals)
+                    if !isnothing(fidx)
+                        fidx
+                    elseif v isa Real && eltype(t_vals) <: Real
+                        argmin(abs.(t_vals .- v))
+                    else
+                        1
+                    end
+                end for v in raw_new_t
+            ]
+        elseif eltype(raw_new_t) <: Integer
+            PS_dict[:t_idx] = Int.(raw_new_t)
+        else
+            PS_dict[:t_idx] = raw_new_t
+        end
+    elseif hasproperty(new_data, :t_idx)
+        PS_dict[:t_idx] = Int.(new_data[!, :t_idx])
     end 
+
     if haskey(M_train, :u_idx_var) && hasproperty(new_data, M_train.u_idx_var)
-        PS_dict[:u_idx] = new_data[!, M_train.u_idx_var]
+        raw_new_u = new_data[!, M_train.u_idx_var]
+        if haskey(M_train, :u_values) && !isnothing(M_train.u_values)
+            u_val_map = Dict(v => i for (i, v) in enumerate(M_train.u_values))
+            PS_dict[:u_idx] = [get(u_val_map, v, 1) for v in raw_new_u]
+        elseif eltype(raw_new_u) <: Integer
+            PS_dict[:u_idx] = Int.(raw_new_u)
+        else
+            PS_dict[:u_idx] = raw_new_u
+        end
+    elseif hasproperty(new_data, :u_idx)
+        PS_dict[:u_idx] = Int.(new_data[!, :u_idx])
+    end 
+
+    if haskey(PS_dict, :s_idx) && haskey(PS_dict, :t_idx) && haskey(M_train, :s_N)
+        PS_dict[:st_idx] = (PS_dict[:t_idx] .- 1) .* M_train.s_N .+ PS_dict[:s_idx]
     end 
 
     if haskey(M_train, :log_offsets) && !isnothing(M_train.log_offsets)
@@ -2290,8 +2257,6 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
                 m_obj = spec.component_obj
                 model_type_str = lowercase(string(typeof(m_obj)))
                 nb = size(M_train.basis_matrices[key_sym], 2)
-                
-                # Correctly pass keyword arguments from the spec's params dictionary.
                 local_kwargs = Dict(spec.params)
 
                 B_matrix, _ = if n_vars == 1 
@@ -2326,9 +2291,7 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
             sub_PS_dict[:y_N] = nrow(new_data)
 
             if haskey(sub_M, :formula)
-                # Corrected call for sub-model
                 sub_decomposed = decompose_bstm_formula(sub_M.formula, sub_M.data) 
-                
                 sub_fixed_effects_vars = String[]
                 append!(sub_fixed_effects_vars, sub_decomposed.fixed_effects)
                 for (_, mod_data_nt) in sub_decomposed.modules
@@ -2342,7 +2305,6 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
                 
                 if !isempty(sub_fixed_effects_vars)
                     rhs = "0 + " * join(sub_fixed_effects_vars, " + ")
-                    # Corrected call for sub-model
                     Xfixed_sub, _ = create_fixed_design(
                         rhs, 
                         new_data, 
@@ -2377,8 +2339,40 @@ function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samp
         end
     end
 
-    # 6. Finalize PS and call reconstruction
-    PS = NamedTuple(PS_dict)
+    # 6. Finalize PS
+    return NamedTuple(PS_dict)
+end
+
+"""
+    predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100,
+      alpha=0.05)
+
+The primary engine for projecting a fitted `bstm` model onto a new dataset to
+generate out-of-sample predictions.
+
+# Version
+v1.0.0
+
+# Arguments
+- `model_obj::DynamicPPL.Model`: The fitted Turing model object.
+- `chain`: The `MCMCChains.Chains` object from the fitted model.
+- `new_data::DataFrame`: A `DataFrame` with the same column names as the training data.
+- `n_samples::Int`: The number of posterior samples to use for prediction.
+- `alpha::Float64`: The significance level for credible intervals.
+
+# Returns
+- A `NamedTuple` containing the summarized `predictions_denoised` and
+  `predictions_noisy`, the full posterior statistics object `pstats`, and the
+  prediction set configuration `PS`.
+"""
+function predict(model_obj::DynamicPPL.Model, chain, new_data::DataFrame; n_samples::Int=100,
+    alpha=0.05)
+    M_train = model_obj.args.M
+    n_samps = min(_get_chain_n_samples(chain), n_samples)
+
+ 
+    # Prepare Prediction Set (PS) configuration
+    PS = _prepare_prediction_inputs(M_train, new_data)
 
     raw_arch = get(M_train, :model_arch, "univariate")
     arch_type = if raw_arch == "multivariate"
@@ -2467,10 +2461,19 @@ v1.0.0
   - `method`: The CV method used.
   - `n_folds`: The number of folds executed.
 """ 
-function bstm_cv_orchestrator(formula::String, data::DataFrame; method::Symbol = :kfold, cv_var::Symbol = :s_idx, n_folds::Int = 5, n_samples::Int = 500, sampler = NUTS(500, 0.65), alpha = 0.05, cv_space_vars::Vector{Symbol} = [:s_x, :s_y], kwargs... )
+function bstm_cv_orchestrator(
+    formula::String,
+    data::DataFrame;
+    method::Symbol = :kfold,
+    cv_var::Symbol = :s_idx,
+    n_folds::Int = 5,
+    n_samples::Int = 500,
+    sampler = NUTS(500, 0.65),
+    alpha = 0.05,
+    cv_space_vars::Union{Vector{Symbol}, Nothing} = nothing,
+    kwargs...
+)
     
-    # Check if this is a categorical movement model configuration
-    is_categorical_movement = haskey(kwargs, :method) && kwargs[:method] == :categorical
     
     meta_discovery = decompose_bstm_formula(formula, data)
     response_name = !isnothing(meta_discovery) && !isempty(meta_discovery.outcomes) ? Symbol(meta_discovery.outcomes[1][:var]) : (hasproperty(data, :recapture) ? :recapture : :y)
@@ -2479,18 +2482,32 @@ function bstm_cv_orchestrator(formula::String, data::DataFrame; method::Symbol =
     is_forward_chain = false
 
     if method == :lolo
-        if !hasproperty(data, cv_var)
-            error("LOLO cross-validation requires the specified `cv_var` column ':$cv_var' in the data.")
+        eff_cv_var = if hasproperty(data, cv_var)
+            cv_var
+        else
+            _detect_spatial_unit_column(data; allow_nothing=true)
         end
-        unique_locs = unique(data[!, cv_var])
+        if isnothing(eff_cv_var) || !hasproperty(data, eff_cv_var)
+            error(
+                "LOLO cross-validation requires a spatial unit column in data " *
+                "(e.g. $(join(STANDARD_SPATIAL_UNIT_CANDIDATES, ", ")))."
+            )
+        end
+        unique_locs = unique(data[!, eff_cv_var])
         for loc in unique_locs
-            push!(folds_indices, findall(x -> x == loc, data[!, cv_var]))
+            push!(folds_indices, findall(x -> x == loc, data[!, eff_cv_var]))
         end
     elseif method == :spatial_block
-        if !all(hasproperty(data, v) for v in cv_space_vars)
-            error("Spatial block cross-validation requires coordinate columns specified in `cv_space_vars`: $cv_space_vars.")
+        space_cols = if !isnothing(cv_space_vars)
+            cv_space_vars
+        else
+            cx, cy = _detect_xy_columns(data)
+            [cx, cy]
         end
-        coords = Matrix(data[!, cv_space_vars])' 
+        if !all(hasproperty(data, v) for v in space_cols)
+            error("Spatial block cross-validation requires coordinate columns: $space_cols.")
+        end
+        coords = Matrix(data[!, space_cols])' 
         R = Clustering.kmeans(coords, n_folds; maxiter=200, display=:none)
         assignments = R.assignments
         for k in 1:n_folds
@@ -2500,10 +2517,18 @@ function bstm_cv_orchestrator(formula::String, data::DataFrame; method::Symbol =
             end
         end
     elseif method == :temporal_block
-        if !hasproperty(data, cv_var)
-            error("Temporal block cross-validation requires the specified `cv_var` column ':$cv_var' in the data.")
+        eff_cv_var = if cv_var != :s_idx && hasproperty(data, cv_var)
+            cv_var
+        else
+            _detect_time_column(data; allow_nothing=true)
         end
-        unique_times = sort(unique(data[!, cv_var]))
+        if isnothing(eff_cv_var) || !hasproperty(data, eff_cv_var)
+            error(
+                "Temporal block cross-validation requires a temporal column in data " *
+                "(e.g. $(join(STANDARD_TEMPORAL_CANDIDATES, ", ")))."
+            )
+        end
+        unique_times = sort(unique(data[!, eff_cv_var]))
         fold_size = cld(length(unique_times), n_folds)
         for i in 1:n_folds
             start_idx = (i - 1) * fold_size + 1
@@ -2512,17 +2537,25 @@ function bstm_cv_orchestrator(formula::String, data::DataFrame; method::Symbol =
                 continue
             end
             time_block = unique_times[start_idx:end_idx]
-            push!(folds_indices, findall(t -> t in time_block, data[!, cv_var]))
+            push!(folds_indices, findall(t -> t in time_block, data[!, eff_cv_var]))
         end
     elseif method == :temporal_forward_chain
-        if !hasproperty(data, cv_var)
-            error("Forward-chaining cross-validation requires the specified `cv_var` column ':$cv_var' in the data.")
+        eff_cv_var = if cv_var != :s_idx && hasproperty(data, cv_var)
+            cv_var
+        else
+            _detect_time_column(data; allow_nothing=true)
+        end
+        if isnothing(eff_cv_var) || !hasproperty(data, eff_cv_var)
+            error(
+                "Forward-chaining cross-validation requires a temporal column in data " *
+                "(e.g. $(join(STANDARD_TEMPORAL_CANDIDATES, ", ")))."
+            )
         end
         is_forward_chain = true
-        unique_times = sort(unique(data[!, cv_var]))
+        unique_times = sort(unique(data[!, eff_cv_var]))
         test_times = unique_times[end-n_folds+1:end]
         for t in test_times
-            push!(folds_indices, findall(x -> x == t, data[!, cv_var]))
+            push!(folds_indices, findall(x -> x == t, data[!, eff_cv_var]))
         end
     else # Default to k-fold
         n_obs = size(data, 1)
@@ -2561,63 +2594,29 @@ function bstm_cv_orchestrator(formula::String, data::DataFrame; method::Symbol =
         cv_kwargs = Dict{Symbol, Any}(pairs(kwargs))
         cv_kwargs[:verbose] = false
         
-        # Fit model
-        model_train = if is_categorical_movement
-            # Call fit_categorical_movement directly or via bstm core wrapper
-            # Assuming training arguments match package conventions
-            S = get(kwargs, :S, maximum(train_data.recapture))
-            W = kwargs[:W]
-            hsi = kwargs[:hsi]
-            group_lookup = kwargs[:group_lookup]
-            fit_categorical_movement(train_data, S, W, hsi, group_lookup; n_samples=n_samples, n_warmup=div(n_samples, 2), show_progress=false)
-        else
-            bstm_core(formula, train_data; cv_kwargs...)
-        end
-
-        chain_train = is_categorical_movement ? model_train.chain :
-            Base.invokelatest(sample, model_train, sampler, n_samples; progress=false)
-        fit_obj = is_categorical_movement ? model_train : model_train
+        model_train = bstm_core(formula, train_data; cv_kwargs...)
+        chain_train = Base.invokelatest(sample, model_train, sampler, n_samples; progress=false)
+        fit_obj = model_train
 
         res_pred = predict(fit_obj, chain_train, test_data; n_samples=div(n_samples, 2), alpha=alpha)
+        y_test_obs  = test_data[!, response_name]
+        y_test_pred = res_pred.predictions_denoised.mean
 
-        if is_categorical_movement
-            # Evaluate categorical log-likelihood / accuracy on test set recapture locations
-            y_test_obs = Vector{Int}(test_data.recapture)
-            mean_probs = res_pred.predictions_denoised.mean # [N_test x S]
-            
-            log_liks = [log(max(mean_probs[n, y_test_obs[n]], 1e-12)) for n in 1:length(y_test_obs)]
-            elpd_fold = sum(log_liks)
-            
-            pred_locs = [argmax(mean_probs[n, :]) for n in 1:size(mean_probs, 1)]
-            accuracy = mean(pred_locs .== y_test_obs)
-            
-            push!(fold_results, (fold=f_idx, elpd=elpd_fold, accuracy=accuracy))
+        if length(y_test_obs) == length(y_test_pred)
+            residuals = y_test_obs .- y_test_pred
+            rmse = sqrt(Statistics.mean(residuals.^2))
+            ss_res = sum(residuals.^2)
+            ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
+            r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
+            push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
         else
-            y_test_obs = test_data[!, response_name]
-            y_test_pred = res_pred.predictions_denoised.mean
-            
-            if length(y_test_obs) == length(y_test_pred)
-                residuals = y_test_obs .- y_test_pred
-                rmse = sqrt(Statistics.mean(residuals.^2))
-                ss_res = sum(residuals.^2)
-                ss_tot = sum((y_test_obs .- Statistics.mean(y_test_obs)).^2)
-                r2 = 1.0 - (ss_res / (ss_tot + 1e-15))
-                push!(fold_results, (fold=f_idx, rmse=rmse, r2=r2))
-            else
-                @warn "Fold $f_idx: Prediction length mismatch. Observed: $(length(y_test_obs)), Predicted: $(length(y_test_pred))"
-            end
+            @warn "Fold $f_idx: Prediction length mismatch. Observed: $(length(y_test_obs)), Predicted: $(length(y_test_pred))"
         end
     end
 
-    if is_categorical_movement
-        mean_elpd = Statistics.mean([r.elpd for r in fold_results])
-        mean_acc = Statistics.mean([r.accuracy for r in fold_results])
-        return (folds = fold_results, mean_elpd = mean_elpd, mean_accuracy = mean_acc, method = method, n_folds = n_actual_folds)
-    else
-        mean_rmse = Statistics.mean([r.rmse for r in fold_results])
-        mean_r2 = Statistics.mean([r.r2 for r in fold_results])
-        return (folds = fold_results, mean_rmse = mean_rmse, mean_r2 = mean_r2, response_var = response_name, method = method, n_folds = n_actual_folds)
-    end
+    mean_rmse = Statistics.mean([r.rmse for r in fold_results])
+    mean_r2 = Statistics.mean([r.r2 for r in fold_results])
+    return (folds = fold_results, mean_rmse = mean_rmse, mean_r2 = mean_r2, response_var = response_name, method = method, n_folds = n_actual_folds)
 end
 
 
@@ -2645,101 +2644,19 @@ v1.0.0
 """ 
 function bstm_loo(model_obj::DynamicPPL.Model, chain; alpha=0.05)
     M = model_obj.args.M
-    is_categorical_movement = haskey(M, :method) && M.method == :categorical
-
-    if is_categorical_movement
-        # Compute pointwise log-likelihood matrix [N_train x n_samples] for categorical movement
-        releases = Vector{Int}(M.data.release)
-        recaps   = Vector{Int}(M.data.recapture)
-        ks       = Vector{Int}(M.data.k)
-        groups   = Vector{Int}(M.data.group)
-        S        = M.s_N
-        W        = M.W
-        hsi      = M.hsi
-        adj_rows = M.adj_rows
-        L_dense  = M.L_dense
-        I_S      = Matrix{Float64}(I, S, S)
-        G        = length(M.group_lookup)
-        
-        n_samples = _get_chain_n_samples(chain)
-        N_train   = length(releases)
-        log_lik   = zeros(Float64, N_train, n_samples)
-        
-        max_k = maximum(ks)
-        W_sp = sparse(W)
-        function _extract_loo_draw_val(prefix, g, chain_idx)
-            candidates = [
-                "$(prefix)[$g]",
-                "$(prefix)_movement[$g]",
-                "$(prefix)_s_idx_t_idx[$g]",
-                "$(prefix)[$g, 1]",
-                "$(prefix)"
-            ]
-            for c in candidates
-                try
-                    mat = extract_param_matrix(chain, c)
-                    if size(mat, 1) >= chain_idx
-                        return Float64(mat[chain_idx, 1])
-                    end
-                catch
-                end
-            end
-            if prefix == "velocity"
-                try; return Float64(extract_param_matrix(chain, "beta[$g]")[chain_idx, 1]); catch; end
-            elseif prefix == "diffusion"
-                try; return Float64(extract_param_matrix(chain, "D_g[$g]")[chain_idx, 1]); catch; end
-            end
-            return prefix == "gamma" ? 1.0 : (prefix == "velocity" ? 0.3 : 0.1)
-        end
-
-        for s in 1:n_samples
-            Gk_cache_draw = map(1:G) do g
-                v_val = _extract_loo_draw_val("velocity", g, s)
-                d_val = _extract_loo_draw_val("diffusion", g, s)
-                g_val = _extract_loo_draw_val("gamma", g, s)
-                tot   = v_val + d_val + 1e-6
-                alpha_g = clamp(v_val / tot, 0.0, 1.0)
-                rho_g   = clamp(1.0 / (1.0 + tot), 0.01, 0.95)
-
-                P_g = construct_stochastic_transition_kernel(
-                    W_sp, hsi; gamma=g_val, residence=rho_g, advection=alpha_g
-                )
-                powers = Vector{Matrix{Float64}}(undef, max_k)
-                powers[1] = P_g
-                for k_step in 2:max_k
-                    powers[k_step] = powers[k_step - 1] * P_g
-                end
-                powers
-            end
-            
-            for n in 1:N_train
-                rel = releases[n]
-                rec = recaps[n]
-                g   = groups[n]
-                k_n = ks[n]
-                
-                p = Gk_cache_draw[g][k_n][rel, :]
-                ps = sum(p)
-                p_norm = ps > 1e-12 ? (p ./ ps) : fill(1.0 / S, S)
-                
-                log_lik[n, s] = log(max(p_norm[rec], 1e-12))
-            end
-        end
+    raw_arch = get(M, :model_arch, "univariate")
+    arch_type = if raw_arch == "univariate"
+        UnivariateArchitecture()
+    elseif raw_arch == "multivariate"
+        MultivariateArchitecture()
+    elseif raw_arch == "multifidelity"
+        MultifidelityArchitecture()
     else
-        raw_arch = get(M, :model_arch, "univariate")
-        arch_type = if raw_arch == "univariate"
-            UnivariateArchitecture()
-        elseif raw_arch == "multivariate"
-            MultivariateArchitecture()
-        elseif raw_arch == "multifidelity"
-            MultifidelityArchitecture()
-        else
-            UnivariateArchitecture()
-        end
-
-        res = _reconstruct(arch_type, "loo_recovery", chain, M, nothing, alpha)
-        log_lik = res.log_likelihood
+        UnivariateArchitecture()
     end
+
+    res = _reconstruct(arch_type, "loo_recovery", chain, M, nothing, alpha)
+    log_lik = res.log_likelihood
 
     if isempty(log_lik)
         @warn "Log-likelihood matrix is empty. Cannot compute LOO."

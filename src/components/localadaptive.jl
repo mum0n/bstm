@@ -93,11 +93,30 @@ function get_precomputes(m::LocalAdaptive, M::NamedTuple, mod_data::Dict)::Named
     if haskey(M, :centroids)
         centroids = M.centroids
     else
-        @info "Centroids not found for localadaptive model. Attempting to compute from s_x and s_y coordinates."
-        if hasproperty(data, :s_x) && hasproperty(data, :s_y) && hasproperty(data, :s_idx)
-            gdf = groupby(data, :s_idx)
-            unique_coords_df = combine(gdf, [:s_x, :s_y] .=> first, renamecols=false)
-            coord_map = Dict(row.s_idx => (row.s_x, row.s_y) for row in eachrow(unique_coords_df))
+        coord_cols = if haskey(mod_data, :variables) && length(mod_data[:variables]) >= 2
+            (Symbol(mod_data[:variables][1]), Symbol(mod_data[:variables][2]))
+        else
+            try
+                _detect_xy_columns(data)
+            catch
+                nothing
+            end
+        end
+
+        s_idx_col = if hasproperty(data, :s_idx)
+            :s_idx
+        elseif haskey(M, :s_idx_var) && hasproperty(data, Symbol(M.s_idx_var))
+            Symbol(M.s_idx_var)
+        else
+            nothing
+        end
+
+        if coord_cols !== nothing && s_idx_col !== nothing &&
+           hasproperty(data, coord_cols[1]) && hasproperty(data, coord_cols[2])
+            cx, cy = coord_cols
+            gdf = groupby(data, s_idx_col)
+            unique_coords_df = combine(gdf, [cx, cy] .=> first, renamecols=false)
+            coord_map = Dict(row[s_idx_col] => (row[cx], row[cy]) for row in eachrow(unique_coords_df))
 
             if length(coord_map) < s_N
                 error("The `localadaptive` model requires coordinates for all $(s_N) spatial units, but only found coordinates for $(length(coord_map)) unique units in the data. Please provide a complete `centroids` vector as a keyword argument.")
@@ -105,7 +124,7 @@ function get_precomputes(m::LocalAdaptive, M::NamedTuple, mod_data::Dict)::Named
 
             centroids = [(coord_map[i][1], coord_map[i][2]) for i in 1:s_N]
         else
-            error("The `localadaptive()` model requires centroids for clustering. Provide them via the `centroids` keyword argument, or ensure spatial coordinates (s_x, s_y) and indices (s_idx) are in the data frame.")
+            error("The `localadaptive()` model requires centroids for clustering. Provide them via the `centroids` keyword argument, or ensure spatial coordinates and indices (s_idx) are in the data frame.")
         end
     end
     

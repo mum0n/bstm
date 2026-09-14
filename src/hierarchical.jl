@@ -34,25 +34,47 @@ of all column vectors to detect mutations in raw survey observations.
 # Returns
 - `Dict{Symbol, Any}`: Dictionary containing dimensions, bounding box, temporal range, and hash.
 """
-function compute_data_traits(df::DataFrame; temporal_col=nothing, spatial_cols=(:s_x, :s_y))
+function compute_data_traits(
+    df::DataFrame;
+    temporal_col::Union{Symbol, AbstractString, Nothing} = nothing,
+    spatial_cols::Union{Tuple{Symbol, Symbol}, Vector{Symbol}, Nothing} = nothing
+)
     traits = Dict{Symbol, Any}(
         :rows => nrow(df),
         :cols => ncol(df)
     )
-    if hasproperty(df, spatial_cols[1]) && hasproperty(df, spatial_cols[2])
-        traits[:min_x] = round(minimum(df[!, spatial_cols[1]]), digits=4)
-        traits[:max_x] = round(maximum(df[!, spatial_cols[1]]), digits=4)
-        traits[:min_y] = round(minimum(df[!, spatial_cols[2]]), digits=4)
-        traits[:max_y] = round(maximum(df[!, spatial_cols[2]]), digits=4)
+    resolved_spatial = if !isnothing(spatial_cols)
+        (Symbol(spatial_cols[1]), Symbol(spatial_cols[2]))
+    else
+        try
+            _detect_xy_columns(df)
+        catch
+            nothing
+        end
     end
-    if temporal_col !== nothing && hasproperty(df, temporal_col)
-        traits[:min_time] = minimum(df[!, temporal_col])
-        traits[:max_time] = maximum(df[!, temporal_col])
-        traits[:n_times] = length(unique(df[!, temporal_col]))
-    elseif hasproperty(df, :year)
-        traits[:min_time] = minimum(df.year)
-        traits[:max_time] = maximum(df.year)
-        traits[:n_times] = length(unique(df.year))
+
+    if resolved_spatial !== nothing && hasproperty(df, resolved_spatial[1]) &&
+       hasproperty(df, resolved_spatial[2])
+        traits[:min_x] = round(minimum(df[!, resolved_spatial[1]]), digits=4)
+        traits[:max_x] = round(maximum(df[!, resolved_spatial[1]]), digits=4)
+        traits[:min_y] = round(minimum(df[!, resolved_spatial[2]]), digits=4)
+        traits[:max_y] = round(maximum(df[!, resolved_spatial[2]]), digits=4)
+    end
+
+    resolved_time = if !isnothing(temporal_col)
+        Symbol(temporal_col)
+    else
+        try
+            _detect_time_column(df)
+        catch
+            nothing
+        end
+    end
+
+    if resolved_time !== nothing && hasproperty(df, resolved_time)
+        traits[:min_time] = minimum(df[!, resolved_time])
+        traits[:max_time] = maximum(df[!, resolved_time])
+        traits[:n_times] = length(unique(df[!, resolved_time]))
     end
 
     

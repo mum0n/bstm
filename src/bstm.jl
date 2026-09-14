@@ -54,7 +54,6 @@ module bstm
         Plots,
         PosteriorStats,
         Requires,
-        RCall,
         SHA,
         SparseArrays,
         SpecialFunctions,
@@ -92,7 +91,6 @@ module bstm
     include( "leaflet.jl")
     include( "likelihoods.jl")
     include( "model.jl")
-    include( "movement.jl")
     include( "parameters.jl")
     include( "partitioning.jl")
     include( "pipeline.jl")
@@ -111,13 +109,14 @@ module bstm
 
     # work in progress: 
     # include( joinpath(docsdir, "hierarchical_workflow", "hierarchical_workflow.jl") )
-    # include( joinpath(docsdir, "movement", "movement_simple.jl") )
 
 
     # User-facing API exports
     export 
         @bstm,
+        bstm_config,
         model_results_comprehensive,
+        convert_to_chains,
         reconstruct,
         get_optimal_sampler,
         precompute_step_sizes,
@@ -125,6 +124,8 @@ module bstm
         show_model,
         bstm_surface_derivatives,
         compute_topographic_metrics,
+        generate_rff_params,
+        build_structure_template,
         bstm_pipeline,
         compute_network_transfer_matrix,
         reshard_spatial_field,
@@ -133,8 +134,22 @@ module bstm
         PipelineTierSpec,
         bstm_cv_orchestrator,
         bstm_plots,
+        plot_spatial_surface,
         bstm_sample,
         save_plots,
+        _detect_xy_columns,
+        _detect_time_column,
+        _detect_response_column,
+        _detect_spatial_unit_column,
+        _detect_seasonal_column,
+        _detect_group_column,
+        _resolve_nested_strata,
+        NESTED_COUPLING_MODES,
+        STANDARD_SPATIAL_COORDINATE_PAIRS,
+        STANDARD_TEMPORAL_CANDIDATES,
+        STANDARD_SPATIAL_UNIT_CANDIDATES,
+        STANDARD_SEASONAL_CANDIDATES,
+        STANDARD_GROUP_CANDIDATES,
 
         assign_spatial_units_inferred, 
         plot_kde_simple,
@@ -153,6 +168,10 @@ module bstm
         scaling_factor_bym2,
         load_open_bathymetry,
         extract_hydrodynamic_dataset,
+        build_hex_mesh_planar,
+        map_point_to_units,
+        lonlat_to_xy_km,
+        xy_km_to_lonlat,
 
         ParamRegistry, 
         ParamDescriptor, 
@@ -176,11 +195,6 @@ module bstm
         plot_residence_time_map,
         plot_advection_arrows, 
         plot_velocity_field, 
-        plot_tracks_on_map,
-        plot_dispersal_kernel, 
-        plot_step_length_distribution,
-        plot_regional_connectivity_matrix, 
-        plot_movement_dashboard,
         plot_hexagonal_field,
         plot_hydrodynamic_stratification,
         plot_hydrodynamic_diffusion,
@@ -201,72 +215,8 @@ module bstm
         leaflet_residence_time_map,
         leaflet_advection_arrows, 
         leaflet_velocity_field,
-        leaflet_tracks_map, 
-        leaflet_render_paths,
-        leaflet_spacetime_map, 
-        leaflet_movement_dashboard,
-        leaflet_interactive_corridor_dashboard,
-        leaflet_dispersal_kernel, 
-        leaflet_step_diagnostics,
-        leaflet_regional_connectivity, 
-        leaflet_ad_ratio_distribution,
-        leaflet_hydrodynamic_dashboard,
+        leaflet_spacetime_map,
 
-        # Movement & ADR Telemetry exports
-        generate_ADR_simulation_bundle, 
-        simulate_correlated_density_vector,
-        compute_velocity_field, 
-        calculate_multistep_transition,
-        simulate_posterior_trajectories, 
-        simulate_mechanistic_trajectories,
-        construct_stochastic_transition_kernel,
-        predict_path,
-        astar_predict_path,
-        astar_least_cost_path,
-        astar_stochastic_least_cost_path,
-        astar_stochastic_predict_path,
-        StochasticAStarResult,
-        AStar,
-        get_astar_paths,
-        smooth_marine_path,
-        predict_corridor,
-        compute_suitability_transition_kernel, 
-        calculate_regional_connectivity,
-        plot_ad_ratio_distribution, 
-        synthesize_adr_results,
-        haversine_distance, 
-        tag_to_study_id, 
-        filter_dead_tags,
-        summarize_tag_activity, 
-        sample_markov_bridge, 
-        reconstruct_mark_recapture_paths,
-        validate_telemetry, 
-        map_telemetry_to_units, 
-        build_hex_mesh_planar,
-        lonlat_to_xy_km,
-        xy_km_to_lonlat,
-        load_hsi_jld2,
-        match_telemetry_closest_month_hsi,
-        time_steps_between,
-        extract_scalar_param, 
-        reconstruct_posterior_kernel, 
-        reshard_hsi_field,
-        build_monthly_hsi_matrix,
-        fit_categorical_movement, 
-        prepare_movement_data,
-        snowcrab_movement_data,
-        point_in_polygon,
-        identify_land_units,
-        apply_land_barrier,
-        sever_land_crossing_edges!,
-        compact_marine_mesh,
-        infill_spatial_hsi,
-        construct_full_movement_domain,
-        compute_directed_adjacency, 
-        resolvent_transition,
-        power_transition,
-        decompose_bstm_formula,  
- 
         # Circuit Theory & Ecological Connectivity exports
         Circuit,
         PosteriorCircuitResult,
@@ -339,8 +289,7 @@ module bstm
 
     # Module initialization function
     function __init__()
-      Random.seed!(42) # Set a seed for reproducibility.
-      # @info "bstm module loaded from $(@__DIR__)."
+        Random.seed!(42) # Set a seed for reproducibility.
     end
  
 

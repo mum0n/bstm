@@ -30,7 +30,6 @@ struct MultinomialFamily <: AbstractBSTM_Family end
 struct CategoricalFamily <: AbstractBSTM_Family end
 struct DirichletMultinomialFamily <: AbstractBSTM_Family end
 struct OrdinalFamily <: AbstractBSTM_Family end
-struct CategoricalMovementFamily <: AbstractBSTM_Family end
 struct MvNormalFamily <: AbstractBSTM_Family end
 
 abstract type AbstractZIState end
@@ -67,7 +66,6 @@ const BSTM_FAMILY_REGISTRY = Dict{String, AbstractBSTM_Family}(
     "categorical"           => CategoricalFamily(),
     "dirichlet_multinomial" => DirichletMultinomialFamily(),
     "ordinal"               => OrdinalFamily(),
-    "categorical_movement"  => CategoricalMovementFamily(),
     "mvnormal"              => MvNormalFamily(),
     "multivariate_normal"   => MvNormalFamily()
 )
@@ -422,7 +420,7 @@ end
 
 function is_discrete_family(::Union{PoissonFamily, NegativeBinomialFamily, BinomialFamily,
                                    MultinomialFamily, CategoricalFamily,
-                                   DirichletMultinomialFamily, CategoricalMovementFamily})
+                                   DirichletMultinomialFamily})
     return true
 end
 
@@ -924,17 +922,4 @@ function _stable_logsubexp(a::Real, b::Real)
     return a + LogExpFunctions.log1mexp(b - a)
 end
 
-
-function get_dist_ref(::CategoricalMovementFamily, d, eta_vec, sig)
-    # eta_vec acts as the pre-normalized probability vector p over S spatial units
-    p_safe = max.(eta_vec, 1e-12)
-    p_norm = p_safe ./ sum(p_safe)
-    return Categorical(p_norm)
-end
-
-function bstm_kernel(fam::CategoricalMovementFamily, ::Uncensored, ::NonZeroInflated, d, eta_vec, sig, y_scalar)
-    dist = get_dist_ref(fam, d, eta_vec, sig)
-    # y_scalar represents the integer index of the recapture location (1 to S)
-    return logpdf(dist, Int(y_scalar))
-end
 

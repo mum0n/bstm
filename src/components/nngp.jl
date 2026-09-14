@@ -92,15 +92,12 @@ function get_precomputes(m::NNGP, M::NamedTuple, mod_data::Dict)::NamedTuple
     params = mod_data[:params]
     
     # 1. Extract 2D Spatial Coordinates
-    x_col = haskey(params, :x) ? params[:x] : (hasproperty(data,
-        :s_x) ? :s_x : (hasproperty(data, :lon) ? :lon : (hasproperty(data,
-        :x) ? :x : nothing)))
-    y_col = haskey(params, :y) ? params[:y] : (hasproperty(data,
-        :s_y) ? :s_y : (hasproperty(data, :lat) ? :lat : (hasproperty(data,
-        :y) ? :y : nothing)))
-    
-    if isnothing(x_col) || isnothing(y_col)
-        error("NNGP component '$(mod_data[:key])' requires 2D coordinates (:s_x, :s_y) or (:lon, :lat) in dataset.")
+    x_col, y_col = if haskey(mod_data, :variables) && length(mod_data[:variables]) >= 2
+        (Symbol(mod_data[:variables][1]), Symbol(mod_data[:variables][2]))
+    elseif haskey(params, :positional_args) && length(params[:positional_args]) >= 2
+        (Symbol(params[:positional_args][1]), Symbol(params[:positional_args][2]))
+    else
+        _detect_xy_columns(data; x=get(params, :x, nothing), y=get(params, :y, nothing))
     end
 
     raw_x = Float64.(data[!, x_col])

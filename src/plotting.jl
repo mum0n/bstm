@@ -314,6 +314,503 @@ function choropleth(values::AbstractVector{<:Real}, polygons::AbstractVector{<:A
 end
 
 
+# -----------------------------------------------------------------------------
+# Continuous Spatial Surface Interpolation & Surface Plotting Primitives
+# -----------------------------------------------------------------------------
+
+"""
+    _detect_spatial_coords(data, M=NamedTuple(), au=nothing)
+
+Safely discovers and extracts a two-column `Matrix{Float64}` of 2D spatial
+coordinates from the input dataset, model metadata `M`, or spatial partitioning `au`.
+Returns `nothing` if 2D coordinates cannot be identified.
+"""
+function _detect_spatial_coords(data, M=NamedTuple(), au=nothing)
+    # 1. Direct DataFrame columns check
+    df_candidate = if !isnothing(data) && data isa DataFrame
+        data
+    elseif haskey(M, :data) && !isnothing(M.data) && M.data isa DataFrame
+        M.data
+    else
+        nothing
+    end
+
+    if !isnothing(df_candidate)
+        # 1. Check component positional args first if present (matching formula variables)
+        if haskey(M, :components)
+            for spec in M.components
+                vars = get(spec.params, :positional_args, Symbol[])
+                if length(vars) == 2 && all(hasproperty(df_candidate, Symbol(v)) for v in vars)
+                    v1, v2 = Symbol(vars[1]), Symbol(vars[2])
+                    # If given as (northing/lat, easting/lon), re-orient to (x, y)
+                    if (v1 in [:plat, :lat, :latitude, :northing]) &&
+                       (v2 in [:plon, :lon, :longitude, :easting])
+                        return Matrix{Float64}(df_candidate[!, [v2, v1]])
+                    else
+                        return Matrix{Float64}(df_candidate[!, [v1, v2]])
+                    end
+                end
+            end
+        end
+
+        # 2. Check detected coordinate column pairs
+        detected = try
+            _detect_xy_columns(df_candidate)
+        catch
+            nothing
+        end
+        if !isnothing(detected)
+            return Matrix{Float64}(df_candidate[!, [detected[1], detected[2]]])
+        end
+    end
+
+    # 2. Check centroids or points from au
+    if !isnothing(au) && (au isa NamedTuple || au isa AbstractDict)
+        if haskey(au, :centroids) && !isnothing(au[:centroids])
+            xs, ys = _centroids_xy(au[:centroids])
+            if !isempty(xs)
+                return [xs ys]
+            end
+        elseif haskey(au, :pts) && !isnothing(au[:pts])
+            xs, ys = _centroids_xy(au[:pts])
+            if !isempty(xs)
+                return [xs ys]
+            end
+        end
+    end
+
+    # 3. Check M coordinates field
+    if haskey(M, :coords) && !isnothing(M.coords)
+        if M.coords isa AbstractMatrix && size(M.coords, 2) >= 2
+            return Matrix{Float64}(M.coords[:, 1:2])
+        end
+    end
+
+    if haskey(M, :s_coord_tuple) && !isnothing(M.s_coord_tuple)
+        xs, ys = _centroids_xy(M.s_coord_tuple)
+        if !isempty(xs)
+            return [xs ys]
+        end
+    end
+
+    return nothing
+end
+
+"""
+    _build_spatial_domain_grid(coords; grid_res::Int=150, ext_factor::Real=0.05,
+                               domain_bbox=nothing)
+
+Constructs regular 1D coordinate vectors `(grid_x, grid_y)` spanning the continuous
+spatial domain bounding box with proportional boundary extension padding.
+"""
+function _build_spatial_domain_grid(
+    coords::AbstractMatrix{<:Real};
+    grid_res::Int=150,
+    ext_factor::Real=0.05,
+    domain_bbox=nothing
+)
+    if size(coords, 2) < 2
+        error("Coordinates must have at least 2 columns for 2D spatial domain grid.")
+    end
+
+    x_min, x_max = !isnothing(domain_bbox) ? (domain_bbox[1], domain_bbox[2]) :
+                   extrema(coords[:, 1])
+    y_min, y_max = !isnothing(domain_bbox) ? (domain_bbox[3], domain_bbox[4]) :
+                   extrema(coords[:, 2])
+
+    dx = max(x_max - x_min, 1e-6)
+    dy = max(y_max - y_min, 1e-6)
+
+    x_start = x_min - ext_factor * dx
+    x_end   = x_max + ext_factor * dx
+    y_start = y_min - ext_factor * dy
+    y_end   = y_max + ext_factor * dy
+
+    grid_x = collect(range(x_start, stop=x_end, length=grid_res))
+    grid_y = collect(range(y_start, stop=y_end, length=grid_res))
+
+    return grid_x, grid_y
+end
+
+"""
+    _reconstruct_spatial_surface(coords, values; grid_res=150, ext_factor=0.05,
+                                 lengthscale=nothing, nugget=1e-4, domain_bbox=nothing)
+
+Reconstructs a smooth continuous random surface \$Z(x_g, y_g)\$ over a regular 2D
+grid spanning the spatial domain using regularized Matérn-3/2 kernel interpolation.
+
+# Mathematical Formulation
+Given observation locations \$\\mathbf{x}_i \\in \\mathbb{R}^2\$ and scalar effect
+realizations \$z_i\$, the continuous spatial field is represented as a Gaussian process:
+```math
+z(\\mathbf{x}_0) = \\bar{z} + \\sum_{i=1}^N \\alpha_i \\cdot k(\\|\\mathbf{x}_0 - \\mathbf{x}_i\\|)
+```
+where the kernel is the Matérn-3/2 covariance function:
+```math
+k(r) = \\left(1 + \\frac{\\sqrt{3}r}{\\ell}\\right) \\exp\\left(-\\frac{\\sqrt{3}r}{\\ell}\\right)
+```
+with correlation lengthscale \$\\ell\$ automatically estimated from domain scale:
+```math
+\\ell = \\max\\left(1.5 \\cdot \\sqrt{\\frac{\\Delta x \\cdot \\Delta y}{\\pi N}}, 0.05 \\cdot \\max(\\Delta x, \\Delta y)\\right)
+```
+and regularized dual coefficients \$\\boldsymbol{\\alpha} = (\\mathbf{K} + \\lambda \\mathbf{I})^{-1}(\\mathbf{z} - \\bar{z})\$.
+"""
+function _reconstruct_spatial_surface(
+    coords::AbstractMatrix{<:Real},
+    values::AbstractVector{<:Real};
+    grid_res::Int=150,
+    ext_factor::Real=0.05,
+    lengthscale::Union{Real, Nothing}=nothing,
+    nugget::Real=1e-4,
+    domain_bbox=nothing
+)
+    c_mat = Matrix{Float64}(coords)
+    v_vec = vec(collect(Float64, values))
+
+    # Mask NaNs and non-finite entries
+    valid_mask = .!isnan.(v_vec) .& .!isnan.(c_mat[:, 1]) .& .!isnan.(c_mat[:, 2])
+    c_clean = c_mat[valid_mask, :]
+    v_clean = v_vec[valid_mask]
+
+    n_pts = length(v_clean)
+    if n_pts == 0
+        error("No valid non-NaN coordinate and value pairs available for surface reconstruction.")
+    end
+
+    grid_x, grid_y = _build_spatial_domain_grid(
+        c_clean; grid_res=grid_res, ext_factor=ext_factor, domain_bbox=domain_bbox
+    )
+
+    # Edge case: single observation or all identical values
+    if n_pts == 1 || all(isapprox(v_clean[1]), v_clean)
+        surface_const = fill(v_clean[1], length(grid_x), length(grid_y))
+        return (grid_x=grid_x, grid_y=grid_y, surface=surface_const)
+    end
+
+    x_min, x_max = extrema(c_clean[:, 1])
+    y_min, y_max = extrema(c_clean[:, 2])
+    dx = max(x_max - x_min, 1e-6)
+    dy = max(y_max - y_min, 1e-6)
+
+    # Characteristic spatial lengthscale
+    ell = if !isnothing(lengthscale) && lengthscale > 0
+        Float64(lengthscale)
+    else
+        max(1.5 * sqrt(dx * dy / (pi * max(n_pts, 1))), 0.05 * max(dx, dy))
+    end
+
+    v_mean = mean(v_clean)
+    v_cent = v_clean .- v_mean
+    v_var = var(v_clean)
+    reg_val = max(nugget * v_var, 1e-8)
+
+    sq3 = sqrt(3.0)
+
+    # Fast kernel evaluation closure
+    @inline function _matern32(d_val::Float64, scale::Float64)
+        r = d_val / scale
+        return (1.0 + sq3 * r) * exp(-sq3 * r)
+    end
+
+    surface_z = zeros(Float64, length(grid_x), length(grid_y))
+
+    if n_pts <= 2000
+        # Exact regularized dual-basis solve
+        K = Matrix{Float64}(undef, n_pts, n_pts)
+        for j in 1:n_pts
+            xj, yj = c_clean[j, 1], c_clean[j, 2]
+            for i in 1:j
+                d_ij = hypot(c_clean[i, 1] - xj, c_clean[i, 2] - yj)
+                k_val = _matern32(d_ij, ell)
+                K[i, j] = k_val
+                K[j, i] = k_val
+            end
+            K[j, j] += reg_val
+        end
+
+        alpha_weights = cholesky(Symmetric(K)) \ v_cent
+
+        # Evaluate continuous surface across regular 2D grid
+        for (j, gy) in enumerate(grid_y)
+            for (i, gx) in enumerate(grid_x)
+                s_val = 0.0
+                for k in 1:n_pts
+                    d_k = hypot(gx - c_clean[k, 1], gy - c_clean[k, 2])
+                    s_val += alpha_weights[k] * _matern32(d_k, ell)
+                end
+                surface_z[i, j] = v_mean + s_val
+            end
+        end
+    else
+        # High-volume local Nadaraya-Watson kernel regression for massive N
+        for (j, gy) in enumerate(grid_y)
+            for (i, gx) in enumerate(grid_x)
+                weight_sum = 0.0
+                val_sum = 0.0
+                for k in 1:n_pts
+                    d_k = hypot(gx - c_clean[k, 1], gy - c_clean[k, 2])
+                    w_k = _matern32(d_k, ell)
+                    weight_sum += w_k
+                    val_sum += w_k * v_clean[k]
+                end
+                surface_z[i, j] = weight_sum > 1e-12 ? (val_sum / weight_sum) : v_mean
+            end
+        end
+    end
+
+    return (grid_x=grid_x, grid_y=grid_y, surface=surface_z)
+end
+
+"""
+    plot_spatial_surface(coords, values; grid_res=150, ext_factor=0.05,
+                         cmap=:viridis, show_points=true, show_contours=false,
+                         title="Continuous Spatial Random Field",
+                         colorbar_title=nothing, polygons=nothing,
+                         point_color=:white, point_size=2.5, point_alpha=0.6,
+                         clims=nothing, theme_kwargs=NamedTuple(), kwargs...)
+
+Renders a smooth continuous random surface over the entire spatial domain as a
+high-resolution heatmap, with optional contour lines, boundary polygon overlays,
+and observation point markers.
+
+# Mathematical Formulation
+Given observation coordinates \$\\mathbf{x}_i \\in \\mathbb{R}^2\$ and spatial effect
+values \$z_i\$, the continuous spatial field is reconstructed across a dense regular
+domain grid using regularized Matérn-3/2 kernel interpolation:
+```math
+z(\\mathbf{x}_0) = \\bar{z} + \\sum_{i=1}^N \\alpha_i \\cdot \\left(1 + \\frac{\\sqrt{3}\\|\\mathbf{x}_0 - \\mathbf{x}_i\\|}{\\ell}\\right) \\exp\\left(-\\frac{\\sqrt{3}\\|\\mathbf{x}_0 - \\mathbf{x}_i\\|}{\\ell}\\right)
+```
+where \$\\boldsymbol{\\alpha} = (\\mathbf{K} + \\lambda \\mathbf{I})^{-1}(\\mathbf{z} - \\bar{z})\$
+and \$\\ell\$ is the characteristic spatial correlation lengthscale.
+
+# Arguments
+- `coords`: Spatial coordinates as an \$N \\times 2\$ matrix, `DataFrame`, or vector of
+  tuples/vectors.
+- `values`: Vector of numeric spatial effect values aligned with `coords`.
+- `grid_res`: Resolution of the spatial grid along each dimension (default `150`).
+- `ext_factor`: Fractional domain extension beyond coordinate extrema (default `0.05`).
+- `cmap`: Colormap for the heatmap (default `:viridis`).
+- `show_points`: Whether to overlay observation locations as scatter markers (default `true`).
+- `show_contours`: Whether to overlay iso-contour lines on the heatmap (default `false`).
+- `title`: Plot title string.
+- `colorbar_title`: Optional label for the colorbar.
+- `polygons`: Optional vector of polygon vertex lists to overlay as boundary outlines.
+- `point_color`: Marker color for observation points (default `:white`).
+- `point_size`: Marker size for observation points (default `2.5`).
+- `point_alpha`: Alpha transparency for observation points (default `0.6`).
+- `clims`: Optional explicit color limit tuple `(vmin, vmax)`.
+
+# Returns
+- A `Plots.Plot` object displaying the continuous surface heatmap.
+"""
+function plot_spatial_surface(
+    coords::AbstractMatrix{<:Real},
+    values::AbstractVector{<:Real};
+    grid_res::Int=150,
+    ext_factor::Real=0.05,
+    cmap=:viridis,
+    show_points::Bool=true,
+    show_contours::Bool=false,
+    title::String="Continuous Spatial Random Field",
+    colorbar_title::Union{String, Nothing}=nothing,
+    polygons=nothing,
+    point_color=:white,
+    point_size::Real=2.5,
+    point_alpha::Real=0.6,
+    clims=nothing,
+    theme_kwargs=NamedTuple(),
+    kwargs...
+)
+    c_mat = Matrix{Float64}(coords)
+    v_vec = vec(collect(Float64, values))
+
+    recon = _reconstruct_spatial_surface(
+        c_mat, v_vec; grid_res=grid_res, ext_factor=ext_factor
+    )
+    grid_x, grid_y, Z = recon.grid_x, recon.grid_y, recon.surface
+
+    # Determine color limits
+    c_limits = if !isnothing(clims)
+        clims
+    else
+        valid_z = filter(!isnan, Z)
+        !isempty(valid_z) ? (minimum(valid_z), maximum(valid_z)) : (0.0, 1.0)
+    end
+
+    cs_sym = cmap isa Symbol ? cmap : :viridis
+
+    p = Plots.heatmap(
+        grid_x, grid_y, Z';
+        c=cs_sym,
+        clims=c_limits,
+        title=title,
+        xlabel="Coordinate X",
+        ylabel="Coordinate Y",
+        aspect_ratio=:equal,
+        colorbar=true,
+        colorbar_title=colorbar_title,
+        theme_kwargs...,
+        kwargs...
+    )
+
+    if show_contours
+        Plots.contour!(p, grid_x, grid_y, Z', color=:black, alpha=0.35, lw=0.6)
+    end
+
+    if !isnothing(polygons)
+        for poly in polygons
+            if length(poly) >= 3
+                xs, ys = _poly_xy(poly)
+                if !isempty(xs)
+                    Plots.plot!(p, xs, ys, linecolor=:black, lw=0.8, alpha=0.7, label=nothing)
+                end
+            end
+        end
+    end
+
+    if show_points && size(c_mat, 1) > 0
+        Plots.scatter!(
+            p, c_mat[:, 1], c_mat[:, 2],
+            markersize=point_size,
+            markercolor=point_color,
+            markeralpha=point_alpha,
+            markerstrokewidth=0.4,
+            markerstrokecolor=:black,
+            label=nothing
+        )
+    end
+
+    return p
+end
+
+function plot_spatial_surface(
+    coords::AbstractVector,
+    values::AbstractVector{<:Real};
+    kwargs...
+)
+    xs, ys = _centroids_xy(coords)
+    return plot_spatial_surface([xs ys], values; kwargs...)
+end
+
+function plot_spatial_surface(
+    df::DataFrame,
+    values::AbstractVector{<:Real};
+    x::Union{Symbol, AbstractString, Nothing} = nothing,
+    y::Union{Symbol, AbstractString, Nothing} = nothing,
+    kwargs...
+)
+    col_x, col_y = _detect_xy_columns(df; x=x, y=y)
+    coords_mat = Matrix{Float64}(df[!, [col_x, col_y]])
+    return plot_spatial_surface(coords_mat, values; kwargs...)
+end
+
+function plot_spatial_surface(
+    res::NamedTuple;
+    component::Symbol=:spatial,
+    outcome::Int=1,
+    kwargs...
+)
+    effects = get(res, :effects, nothing)
+    if isnothing(effects)
+        error("No reconstructed effects found in model results object.")
+    end
+
+    # Search for matching component
+    target_comp = nothing
+    if haskey(effects, component)
+        target_comp = effects[component]
+    else
+        # Search among component keys
+        for (k, eff) in pairs(effects)
+            if k == component || string(k) == string(component) ||
+               occursin(string(component), string(k))
+                target_comp = eff
+                break
+            end
+        end
+        if isnothing(target_comp)
+            for (k, eff) in pairs(effects)
+                k_str = string(k)
+                if k in [:spatial, :s_idx, :space, :district, :region] ||
+                   occursin("spatial", k_str) || occursin("s_x", k_str) ||
+                   occursin("plat", k_str) || occursin("plon", k_str) ||
+                   occursin("lon", k_str) || occursin("lat", k_str) ||
+                   occursin("easting", k_str) || occursin("northing", k_str)
+                    target_comp = eff
+                    break
+                end
+            end
+        end
+        # Fallback: check M.components for spatial or smooth structure
+        if isnothing(target_comp) && haskey(res, :M) && haskey(res.M, :components)
+            for spec in res.M.components
+                if spec.structure in [:spatial, :smooth]
+                    spec_key = Symbol(spec.var)
+                    if haskey(effects, spec_key)
+                        target_comp = effects[spec_key]
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    if isnothing(target_comp)
+        error("Could not locate spatial component '$(component)' in model effects.")
+    end
+
+    summary_obj = if hasproperty(target_comp, :structured)
+        target_comp.structured
+    elseif hasproperty(target_comp, :noisy)
+        target_comp.noisy
+    else
+        target_comp
+    end
+
+    if summary_obj isa AbstractVector
+        summary_obj = summary_obj[min(outcome, length(summary_obj))]
+    end
+
+    if !hasproperty(summary_obj, :mean)
+        error("Spatial component summary does not contain posterior ':mean'.")
+    end
+
+    mean_vals = vec(collect(Float64, summary_obj.mean))
+
+    # Detect coordinates
+    M = hasproperty(res, :M) ? res.M : NamedTuple()
+    data = hasproperty(res, :data) ? res.data : nothing
+    au = hasproperty(res, :au) ? res.au : nothing
+    coords = _detect_spatial_coords(data, M, au)
+
+    if isnothing(coords)
+        error("Could not automatically detect 2D spatial coordinates from results object.")
+    end
+
+    title_str = get(kwargs, :title, "Continuous Spatial Random Field: $(component)")
+    clean_kwargs = filter(p -> p.first != :title, pairs(kwargs))
+
+    return plot_spatial_surface(
+        coords, mean_vals;
+        title=title_str,
+        polygons=isnothing(au) ? nothing : _extract_polygons(au),
+        clean_kwargs...
+    )
+end
+
+function plot_spatial_surface(
+    model::DynamicPPL.Model,
+    chain;
+    component::Symbol=:spatial,
+    outcome::Int=1,
+    alpha::Real=0.05,
+    kwargs...
+)
+    res = model_results_comprehensive(model, chain; alpha=alpha)
+    return plot_spatial_surface(res; component=component, outcome=outcome, kwargs...)
+end
+
+
 """
     spatial_graph_plot(centroids, g; polygons=nothing, hull_coords=nothing, pts=nothing,
                        node_size=3, node_color=:black, edge_color=:red, edge_alpha=0.6,
@@ -432,12 +929,16 @@ function plot_kde_simple(s_coord_tuple; grid_res=600, sd_extension_factor=0.25,
     return plt
 end
 
-function plot_kde_simple(df::DataFrame; x=:s_x, y=:s_y, grid_res=600, sd_extension_factor=0.25,
-    title="Spatial Intensity (KDE)")
-    if !hasproperty(df, x) || !hasproperty(df, y)
-        error("Input DataFrame for plot_kde_simple expects columns `:$x` and `:$y`. Override with x=... and y=... if using different names.")
-    end
-    s_coord_tuple = tuple.(df[!, x], df[!, y])
+function plot_kde_simple(
+    df::DataFrame;
+    x::Union{Symbol, AbstractString, Nothing} = nothing,
+    y::Union{Symbol, AbstractString, Nothing} = nothing,
+    grid_res = 600,
+    sd_extension_factor = 0.25,
+    title = "Spatial Intensity (KDE)"
+)
+    col_x, col_y = _detect_xy_columns(df; x=x, y=y)
+    s_coord_tuple = tuple.(df[!, col_x], df[!, col_y])
     return plot_kde_simple(s_coord_tuple; grid_res=grid_res,
         sd_extension_factor=sd_extension_factor, title=title)
 end
@@ -571,7 +1072,7 @@ end
 
 
 # -----------------------------------------------------------------------------
-# Section 2b: Movement & Trajectory Visualization Primitives
+# Section 2b: Spatial Suitability, Diffusion & Advection Visualization
 # -----------------------------------------------------------------------------
 
 """
@@ -921,449 +1422,6 @@ end
 
 const plot_velocity_field = plot_advection_arrows
 
-"""
-    plot_tracks_on_map(paths, au; hsi=nothing, background=:polygons,
-                       title="Movement Trajectories",
-                       palette=:tab10, show_start_end=true,
-                       alpha=0.85, lw=1.8, max_paths=25, kwargs...)
-
-Maps individual movement tracks / dispersal trajectories across the spatial domain,
-with distinct track colorings, release (start) and recapture (end) markers.
-
-# Arguments
-- `paths`: Trajectory matrix (size ``n_{\\text{indiv}} \\times (n_{\\text{steps}}+1)``)
-  of spatial unit indices, or a `Vector` of coordinate sequence tuples.
-- `au::NamedTuple`: Spatial tessellation object with `:centroids` and `:polygons`.
-- `hsi::Union{Nothing, AbstractVector{<:Real}}`: Optional HSI vector for background choropleth.
-- `background::Symbol`: Background style (`:polygons`, `:hsi`, `:none`). Default: `:polygons`.
-- `title::String`: Plot title. Default: `"Movement Trajectories"`.
-- `palette::Symbol`: Color palette for differentiating individuals. Default: `:tab10`.
-- `show_start_end::Bool`: Whether to mark starts (green circles) and ends (red stars).
-- `alpha::Real`: Line transparency. Default: `0.85`.
-- `lw::Real`: Trajectory line width. Default: `1.8`.
-- `max_paths::Int`: Maximum number of paths to render to avoid clutter. Default: `25`.
-
-# Returns
-- `Plots.Plot`: Rendered trajectory map.
-"""
-function plot_tracks_on_map(
-    paths,
-    au::NamedTuple;
-    mode::Symbol = :plots,
-    hsi::Union{Nothing, AbstractVector{<:Real}} = nothing,
-    background::Symbol = :polygons,
-    title::String = "Movement Trajectories",
-    palette::Symbol = :tab10,
-    show_start_end::Bool = true,
-    alpha::Real = 0.85,
-    lw::Real = 1.8,
-    max_paths::Int = 25,
-    kwargs...
-)
-    if mode == :leaflet || mode == :html
-        return leaflet_tracks_map(paths, au; hsi=hsi, background=background, title=title,
-                                  palette=palette, show_start_end=show_start_end,
-                                  max_paths=max_paths, kwargs...)
-    end
-    # Background setup
-    p = if background == :hsi && !isnothing(hsi) && hasproperty(au, :polygons)
-        plot_hsi_choropleth(hsi, au; title=title, border_color=:gray40, lw=0.3,
-                            show_centroids=false, kwargs...)
-    elseif background == :polygons && hasproperty(au, :polygons)
-        p_base = Plots.plot(aspect_ratio=:equal, title=title, legend=:outerright; kwargs...)
-        for poly in au.polygons
-            if length(poly) > 2
-                xs, ys = _poly_xy(poly)
-                Plots.plot!(p_base, xs, ys, seriestype=:shape, fillcolor=:white,
-                            linecolor=:gray75, lw=0.4, alpha=0.8, label=nothing)
-            end
-        end
-        p_base
-    else
-        Plots.plot(aspect_ratio=:equal, title=title, legend=:outerright; kwargs...)
-    end
-
-    cents = au.centroids
-    n_paths_total = size(paths, 1)
-    n_to_render = min(n_paths_total, max_paths)
-    cs = _get_cscheme(palette)
-
-    for i in 1:n_to_render
-        t_col = get(cs, n_to_render > 1 ? (i - 1) / (n_to_render - 1) : 0.5)
-
-        xs = Float64[]
-        ys = Float64[]
-
-        if isa(paths, AbstractMatrix)
-            n_steps = size(paths, 2)
-            xs = [cents[paths[i, t]][1] for t in 1:n_steps]
-            ys = [cents[paths[i, t]][2] for t in 1:n_steps]
-        elseif isa(paths, AbstractVector) && isa(paths[1], AbstractVector)
-            xs = [pt[1] for pt in paths[i]]
-            ys = [pt[2] for pt in paths[i]]
-        end
-
-        if !isempty(xs)
-            Plots.plot!(p, xs, ys, color=t_col, lw=lw, alpha=alpha,
-                        label="Tag $i", marker=:none)
-
-            if show_start_end
-                # Start marker: filled green circle
-                Plots.scatter!(p, [xs[1]], [ys[1]], markershape=:circle,
-                               markersize=4.5, color=:lime, markerstrokecolor=:black,
-                               markerstrokewidth=0.8, label=nothing)
-                # End marker: filled red triangle / star
-                Plots.scatter!(p, [xs[end]], [ys[end]], markershape=:star5,
-                               markersize=6.0, color=:crimson, markerstrokecolor=:black,
-                               markerstrokewidth=0.8, label=nothing)
-            end
-        end
-    end
-
-    # Add legend proxy for start/end indicators
-    if show_start_end
-        Plots.scatter!(p, [NaN], [NaN], markershape=:circle, markersize=4.0,
-                       color=:lime, markerstrokecolor=:black, label="Release (Start)")
-        Plots.scatter!(p, [NaN], [NaN], markershape=:star5, markersize=5.0,
-                       color=:crimson, markerstrokecolor=:black, label="Recapture (End)")
-    end
-
-    return p
-end
-
-"""
-    plot_dispersal_kernel(Gamma, au; title="Dispersal Kernel Distance Decay",
-                          n_bins=15, fit_exponential=true,
-                          color=:steelblue, kwargs...)
-
-Plots one-step Markov transition probabilities ``\\Gamma_{ij}`` against pairwise spatial
-distances ``d_{ij} = \\|\\mathbf{x}_i - \\mathbf{x}_j\\|``, highlighting isotropic
-dispersal attenuation and empirical kernel decay.
-
-# Arguments
-- `Gamma::AbstractMatrix{<:Real}`: Markov transition probability matrix (``S \\times S``).
-- `au::NamedTuple`: Spatial tessellation with `:centroids`.
-- `title::String`: Plot title.
-- `n_bins::Int`: Number of distance bins for empirical average curve. Default: `15`.
-- `fit_exponential::Bool`: Whether to overlay fitted exponential decay line. Default: `true`.
-- `color`: Primary color for data points. Default: `:steelblue`.
-
-# Returns
-- `Plots.Plot`: Rendered dispersal distance decay curve.
-"""
-function plot_dispersal_kernel(
-    Gamma::AbstractMatrix{<:Real},
-    au::NamedTuple;
-    mode::Symbol = :plots,
-    title::String = "Dispersal Kernel Distance Decay",
-    n_bins::Int = 15,
-    fit_exponential::Bool = true,
-    color = :steelblue,
-    kwargs...
-)
-    if mode == :leaflet || mode == :html
-        return leaflet_dispersal_kernel(Gamma, au; title=title, kwargs...)
-    end
-    S = size(Gamma, 1)
-    cents = au.centroids
-
-    distances = Float64[]
-    probs = Float64[]
-
-    for i in 1:S
-        ci = cents[i]
-        for j in 1:S
-            i == j && continue
-            cj = cents[j]
-            d = sqrt((cj[1] - ci[1])^2 + (cj[2] - ci[2])^2)
-            p = Gamma[i, j]
-            push!(distances, d)
-            push!(probs, p)
-        end
-    end
-
-    p = Plots.plot(
-        title = title,
-        xlabel = "Pairwise Distance (km)",
-        ylabel = "Transition Probability (Γ_ij)",
-        legend = :topright;
-        kwargs...
-    )
-
-    # Scatter points
-    Plots.scatter!(p, distances, probs, color=color, alpha=0.35, markersize=2.5,
-                   markerstrokewidth=0, label="Pairs (i, j)")
-
-    # Binned mean curve
-    if !isempty(distances)
-        d_min, d_max = minimum(distances), maximum(distances)
-        bin_edges = range(d_min, d_max, length=n_bins+1)
-        bin_mids = Float64[]
-        bin_means = Float64[]
-        bin_se = Float64[]
-
-        for b in 1:n_bins
-            idx = findall(d -> bin_edges[b] <= d < bin_edges[b+1], distances)
-            if !isempty(idx)
-                push!(bin_mids, (bin_edges[b] + bin_edges[b+1]) / 2.0)
-                m = mean(probs[idx])
-                se = length(idx) > 1 ? std(probs[idx]) / sqrt(length(idx)) : 0.0
-                push!(bin_means, m)
-                push!(bin_se, se)
-            end
-        end
-
-        if !isempty(bin_mids)
-            Plots.plot!(p, bin_mids, bin_means, yerror=bin_se, color=:darkorange,
-                        lw=2.5, marker=:circle, markersize=4.0, label="Binned Mean ± SE")
-        end
-
-        # Exponential fit: P(d) = a * exp(-b * d)
-        if fit_exponential && length(probs) > 5
-            valid_idx = findall(p -> p > 1e-9, probs)
-            if length(valid_idx) > 5
-                d_v = distances[valid_idx]
-                log_p = log.(probs[valid_idx])
-                # Linear regression on log scale
-                x_mean = mean(d_v)
-                y_mean = mean(log_p)
-                denom = sum((d_v .- x_mean).^2)
-                if denom > 1e-12
-                    slope = sum((d_v .- x_mean) .* (log_p .- y_mean)) / denom
-                    intercept = y_mean - slope * x_mean
-
-                    if slope < 0
-                        d_eval = range(d_min, d_max, length=100)
-                        p_fit = exp.(intercept .+ slope .* d_eval)
-                        decay_dist = round(-1.0 / slope, digits=1)
-                        Plots.plot!(p, d_eval, p_fit, color=:crimson, lw=2.0, ls=:dash,
-                                    label="Exp Decay (λ ≈ $(decay_dist) km)")
-                    end
-                end
-            end
-        end
-    end
-
-    return p
-end
-
-"""
-    plot_step_length_distribution(paths, au; title="Step Length & Turning Angle Diagnostics",
-                                  kwargs...)
-
-Computes and plots empirical step lengths (km) and turning angle distributions
-from individual trajectory paths.
-
-# Arguments
-- `paths`: Matrix of unit indices or vector of coordinate sequences.
-- `au::NamedTuple`: Spatial tessellation with `:centroids`.
-- `title::String`: Plot super-title.
-
-# Returns
-- `Plots.Plot`: 2-panel composite figure showing step lengths and turning angles.
-"""
-function plot_step_length_distribution(
-    paths,
-    au::NamedTuple;
-    mode::Symbol = :plots,
-    title::String = "Step Length & Turning Angle Diagnostics",
-    kwargs...
-)
-    if mode == :leaflet || mode == :html
-        return leaflet_step_diagnostics(paths, au; title=title, kwargs...)
-    end
-    cents = au.centroids
-    n_indiv = size(paths, 1)
-    n_steps = size(paths, 2)
-
-    step_lengths = Float64[]
-    turning_angles = Float64[]
-
-    for i in 1:n_indiv
-        xs = [cents[paths[i, t]][1] for t in 1:n_steps]
-        ys = [cents[paths[i, t]][2] for t in 1:n_steps]
-
-        for t in 2:n_steps
-            d = sqrt((xs[t] - xs[t-1])^2 + (ys[t] - ys[t-1])^2)
-            push!(step_lengths, d)
-
-            if t >= 3
-                # Turning angle between step (t-1 -> t) and (t-2 -> t-1)
-                dx1, dy1 = xs[t-1] - xs[t-2], ys[t-1] - ys[t-2]
-                dx2, dy2 = xs[t] - xs[t-1], ys[t] - ys[t-1]
-                a1 = atan(dy1, dx1)
-                a2 = atan(dy2, dx2)
-                d_ang = a2 - a1
-                # Wrap to [-pi, pi]
-                d_ang = atan(sin(d_ang), cos(d_ang))
-                push!(turning_angles, d_ang)
-            end
-        end
-    end
-
-    p1 = Plots.histogram(
-        step_lengths, bins=15, color=:royalblue, linecolor=:white,
-        title="Step Length Distribution", xlabel="Step Length (km)",
-        ylabel="Frequency", legend=false
-    )
-
-    p2 = Plots.histogram(
-        turning_angles, bins=15, color=:darkorange, linecolor=:white,
-        title="Turning Angle Distribution", xlabel="Turning Angle (rad)",
-        ylabel="Frequency", legend=false
-    )
-    Plots.vline!(p2, [0.0], color=:red, ls=:dash, lw=1.5)
-
-    return Plots.plot(p1, p2, layout=(1, 2), size=(800, 350), plot_title=title; kwargs...)
-end
-
-"""
-    plot_regional_connectivity_matrix(C_regional; strata_names=nothing,
-                                      title="Macro-Regional Transfer Matrix",
-                                      cmap=:Blues, show_values=true, kwargs...)
-
-Renders a heatmap of the macro-regional transition probability matrix ``C_{rs}``
-with annotated cell percentages.
-
-# Arguments
-- `C_regional::AbstractMatrix{<:Real}`: Regional transition matrix (``R \\times R``).
-- `strata_names::Union{Nothing, Vector{String}}`: Names of the regional strata.
-- `title::String`: Plot title. Default: `"Macro-Regional Transfer Matrix"`.
-- `cmap::Symbol`: Heatmap colormap. Default: `:Blues`.
-- `show_values::Bool`: Whether to annotate text percentages in cells. Default: `true`.
-
-# Returns
-- `Plots.Plot`: Rendered connectivity matrix heatmap.
-"""
-function plot_regional_connectivity_matrix(
-    C_regional::AbstractMatrix{<:Real};
-    mode::Symbol = :plots,
-    strata_names::Union{Nothing, Vector{String}} = nothing,
-    title::String = "Macro-Regional Transfer Matrix",
-    cmap::Symbol = :Blues,
-    show_values::Bool = true,
-    kwargs...
-)
-    if mode == :leaflet || mode == :html
-        return leaflet_regional_connectivity(C_regional; strata_names=strata_names, title=title, kwargs...)
-    end
-    R = size(C_regional, 1)
-    names = if !isnothing(strata_names) && length(strata_names) == R
-        strata_names
-    elseif R == 2
-        ["West", "East"]
-    else
-        ["Stratum $i" for i in 1:R]
-    end
-
-    # Plots.heatmap expects y-axis as rows, x-axis as cols
-    # Transpose so that from-stratum is vertical axis and to-stratum is horizontal axis
-    p = Plots.heatmap(
-        names, names, C_regional',
-        color = cmap,
-        clims = (0.0, 1.0),
-        aspect_ratio = :equal,
-        title = title,
-        xlabel = "To Region",
-        ylabel = "From Region",
-        colorbar_title = "Transfer Prob.",
-        yflip = true;
-        kwargs...
-    )
-
-    if show_values
-        for i in 1:R
-            for j in 1:R
-                val = C_regional[i, j]
-                txt = @sprintf("%.1f%%", val * 100.0)
-                txt_color = val > 0.5 ? :white : :black
-                Plots.annotate!(p, [(j, i, Plots.text(txt, 10, txt_color, :center, :bold))])
-            end
-        end
-    end
-
-    return p
-end
-
-"""
-    plot_movement_dashboard(result, paths; hsi=nothing, strata=nothing,
-                            title="BSTM Movement Diagnostics Dashboard", kwargs...)
-
-Creates a comprehensive 4-panel composite dashboard summarizing:
-1. (A) Habitat Suitability & Advective Velocity Vectors
-2. (B) Movement Tracks / Trajectories on Tessellation
-3. (C) Dispersal Kernel Distance Decay Curve
-4. (D) Macro-Regional Transfer Connectivity Matrix
-
-# Arguments
-- `result::NamedTuple`: Result object from `run_movement_simple` or `synthesize_adr_results`.
-- `paths::AbstractMatrix{<:Integer}`: Simulated individual trajectory paths.
-- `hsi::Union{Nothing, AbstractVector{<:Real}}`: Optional HSI vector.
-- `strata::Union{Nothing, AbstractVector}`: Regional strata definitions.
-- `title::String`: Dashboard super-title.
-
-# Returns
-- `Plots.Plot`: 4-panel composite diagnostic dashboard.
-"""
-function plot_movement_dashboard(
-    result::NamedTuple,
-    paths::AbstractMatrix{<:Integer};
-    mode::Symbol = :plots,
-    hsi::Union{Nothing, AbstractVector{<:Real}} = nothing,
-    strata::Union{Nothing, AbstractVector} = nothing,
-    title::String = "BSTM Movement Diagnostics Dashboard",
-    kwargs...
-)
-    if mode == :leaflet || mode == :html
-        return leaflet_movement_dashboard(result, paths; hsi=hsi, strata=strata, title=title, kwargs...)
-    end
-    au = result.au
-    Gamma = result.transition_matrix
-    hsi_vec = !isnothing(hsi) ? hsi : (hasproperty(result.opts, :hsi) ? result.opts.hsi : nothing)
-
-    # Subplot A: Habitat & Advection Arrows
-    p_a = plot_advection_arrows(
-        au;
-        hsi = hsi_vec,
-        Gamma = Gamma,
-        background = !isnothing(hsi_vec) ? :hsi : :polygons,
-        title = "(A) Habitat & Advective Drift",
-        arrow_scale = 1.0
-    )
-
-    # Subplot B: Movement Tracks
-    p_b = plot_tracks_on_map(
-        paths, au;
-        hsi = hsi_vec,
-        background = :polygons,
-        title = "(B) Simulated Trajectories",
-        max_paths = 15
-    )
-
-    # Subplot C: Dispersal Distance Decay
-    p_c = plot_dispersal_kernel(
-        Gamma, au;
-        title = "(C) Dispersal Kernel Decay",
-        fit_exponential = true
-    )
-
-    # Subplot D: Regional Connectivity
-    cents_x = [c[1] for c in au.centroids]
-    mid_x = (minimum(cents_x) + maximum(cents_x)) / 2.0
-    strata_vec = !isnothing(strata) ? strata : [x > mid_x ? "East" : "West" for x in cents_x]
-    C_reg = calculate_regional_connectivity(Gamma, strata_vec)
-    strata_unique = unique(strata_vec)
-    p_d = plot_regional_connectivity_matrix(
-        C_reg;
-        strata_names = strata_unique,
-        title = "(D) Macro-Regional Connectivity"
-    )
-
-    return Plots.plot(p_a, p_b, p_c, p_d, layout=(2, 2), size=(1050, 850),
-                      plot_title=title; kwargs...)
-end
-
-
 # -----------------------------------------------------------------------------
 # Section 3: Timeseries & Regression Primitives
 # -----------------------------------------------------------------------------
@@ -1497,6 +1555,8 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
         nothing
     end
 
+    coords_detected = _detect_spatial_coords(input_data, M, au)
+
     # --- 1. Posterior Predictive Check ---
     if !isnothing(pred_denoised) && !isnothing(y_obs)
         pred_summary = is_mv ? (outcome <= length(pred_denoised) ? pred_denoised[outcome] : nothing) : pred_denoised
@@ -1556,52 +1616,109 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
         end
     end
 
-    # --- 2. Helper function for spatial maps (handles both unit-level and observation-level effects) ---
-    function _render_spatial_effect(field_data, title_str, polys, cents; kwargs...)
+    # --- 2. Helper function for spatial maps (handles continuous surface & discrete units) ---
+    function _render_spatial_effect(field_data, title_str, polys, cents; coords=nothing, kwargs...)
         if isnothing(field_data) || !hasproperty(field_data, :mean)
             return nothing
         end 
-        if isnothing(polys) && isnothing(cents)
-            return nothing
-        end
         s_mean = vec(collect(Float64, field_data.mean))
         if isempty(s_mean) || all(iszero, s_mean)
             return nothing
         end
 
-        n_units = !isnothing(polys) ? length(polys) : length(cents)
+        coords_to_use = !isnothing(coords) ? coords : coords_detected
+        if !isnothing(coords_to_use) && coords_to_use isa Tuple && length(coords_to_use) == 2
+            coords_to_use = [coords_to_use[1] coords_to_use[2]]
+        end
+
+        # Continuous spatial process: render smooth random surface over entire domain
+        if !isnothing(coords_to_use) && coords_to_use isa AbstractMatrix &&
+           size(coords_to_use, 1) == length(s_mean)
+            return plot_spatial_surface(
+                coords_to_use, s_mean;
+                title=title_str,
+                polygons=polys,
+                kwargs...
+            )
+        end
+
+        n_units = !isnothing(polys) ? length(polys) : (!isnothing(cents) ? length(cents) : (!isnothing(coords_to_use) ? size(coords_to_use, 1) : 0))
+        if n_units == 0 && isnothing(coords_to_use)
+            return nothing
+        end
+
         unit_vals = if length(s_mean) == n_units
             s_mean
         elseif length(s_mean) > n_units && haskey(M, :s_idx)
             s_idx_vec = M.s_idx
-            [mean(s_mean[s_idx_vec .== i]) for i in 1:n_units]
-        elseif length(s_mean) > n_units && !isnothing(input_data) && (hasproperty(input_data,
-            :s_idx) || hasproperty(input_data, :district))
-            s_idx_vec = hasproperty(input_data, :s_idx) ? input_data.s_idx : input_data.district
-            [mean(s_mean[s_idx_vec .== i]) for i in 1:n_units]
+            [begin
+                vals = s_mean[s_idx_vec .== i]
+                isempty(vals) ? 0.0 : mean(vals)
+            end for i in 1:n_units]
+        elseif length(s_mean) > n_units && !isnothing(input_data)
+            det_s = _detect_spatial_unit_column(input_data; allow_nothing=true)
+            if !isnothing(det_s) && hasproperty(input_data, det_s)
+                raw_s = input_data[!, det_s]
+                u_units = unique(raw_s)
+                s_map = Dict(u => i for (i, u) in enumerate(u_units))
+                s_idx_vec = [get(s_map, u, 1) for u in raw_s]
+                [begin
+                    vals = s_mean[s_idx_vec .== i]
+                    isempty(vals) ? 0.0 : mean(vals)
+                end for i in 1:n_units]
+            else
+                s_mean[1:min(length(s_mean), max(1, n_units))]
+            end
         else
-            s_mean[1:min(length(s_mean), n_units)]
+            s_mean[1:min(length(s_mean), max(1, n_units))]
         end
 
         if !isnothing(polys) && length(polys) == length(unit_vals)
             return choropleth(polys, unit_vals; title=title_str, kwargs...)
+        elseif !isnothing(coords_to_use) && coords_to_use isa AbstractMatrix &&
+               size(coords_to_use, 1) == length(unit_vals)
+            return plot_spatial_surface(
+                coords_to_use, unit_vals;
+                title=title_str,
+                polygons=polys,
+                kwargs...
+            )
         elseif !isnothing(cents)
             xs, ys = _centroids_xy(cents)
-            return Plots.scatter(xs, ys, marker_z=unit_vals, markersize=5, c=:viridis,
-                label=nothing, title=title_str, aspect_ratio=:equal, kwargs...)
+            return plot_spatial_surface(
+                [xs ys], unit_vals;
+                title=title_str,
+                polygons=polys,
+                kwargs...
+            )
         end
         return nothing
     end
 
-    if (!isnothing(polygons) || !isnothing(centroids)) && !isnothing(y_obs)
+    if (!isnothing(polygons) || !isnothing(centroids) || !isnothing(coords_detected)) && !isnothing(y_obs)
         y_o = _extract_outcome_vec(y_obs, outcome)
-        n_units = !isnothing(polygons) ? length(polygons) : length(centroids)
-        s_idx_vec = haskey(M,
-            :s_idx) ? M.s_idx : (!isnothing(input_data) && hasproperty(input_data,
-            :s_idx) ? input_data.s_idx : (!isnothing(input_data) && hasproperty(input_data,
-            :district) ? input_data.district : (!isnothing(y_o) ? (1:length(y_o)) : 1:n_units)))
+        n_units = !isnothing(polygons) ? length(polygons) : (!isnothing(centroids) ? length(centroids) : (!isnothing(coords_detected) ? size(coords_detected, 1) : 0))
+        s_idx_vec = if haskey(M, :s_idx)
+            M.s_idx
+        elseif !isnothing(input_data)
+            det_s = _detect_spatial_unit_column(input_data; allow_nothing=true)
+            if !isnothing(det_s) && hasproperty(input_data, det_s)
+                raw_s = input_data[!, det_s]
+                u_units = unique(raw_s)
+                s_map = Dict(u => i for (i, u) in enumerate(u_units))
+                [get(s_map, u, 1) for u in raw_s]
+            elseif !isnothing(y_o)
+                1:length(y_o)
+            else
+                1:n_units
+            end
+        elseif !isnothing(y_o)
+            1:length(y_o)
+        else
+            1:n_units
+        end
 
-        if !isnothing(y_o) && length(y_o) >= n_units
+        if !isnothing(y_o) && length(y_o) >= n_units && n_units > 0
             family_str = haskey(M, :likelihood_specs) && length(M.likelihood_specs) >= outcome ? string(get(M.likelihood_specs[outcome], :family, "gaussian")) : "gaussian"
             has_count_offset = family_str in ["poisson", "negbin"] && haskey(M,
                 :log_offsets) && !isnothing(M.log_offsets) && !all(iszero, M.log_offsets)
@@ -1613,15 +1730,18 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
 
             y_unit_obs = if !isnothing(log_off_vec)
                 [sum(y_o[s_idx_vec .== i]) / max(sum(exp.(log_off_vec[s_idx_vec .== i])), 1e-12) for i in 1:n_units]
+            elseif length(y_o) == n_units
+                y_o
             else
                 [mean(y_o[s_idx_vec .== i]) for i in 1:n_units]
             end
             obs_title = !isnothing(log_off_vec) ? "Observed Standardized Rate (SIR)" : "Observed Mean by Spatial Unit"
-            p_obs_map = _render_spatial_effect((mean=y_unit_obs,), obs_title, polygons, centroids)
+            p_obs_map = _render_spatial_effect((mean=y_unit_obs,), obs_title, polygons, centroids; coords=coords_detected)
             if !isnothing(p_obs_map)
                 plots[:spatial_observed] = p_obs_map
                 plots_data[:spatial_observed] = (values=y_unit_obs,
-                    geometry=isnothing(polygons) ? centroids : polygons)
+                    geometry=isnothing(polygons) ? centroids : polygons,
+                    coordinates=coords_detected)
             end
 
             if !isnothing(pred_denoised)
@@ -1630,25 +1750,29 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
                     y_p = vec(pred_summary.mean)
                     y_unit_fit = if !isnothing(log_off_vec)
                         [sum(y_p[s_idx_vec .== i]) / max(sum(exp.(log_off_vec[s_idx_vec .== i])), 1e-12) for i in 1:n_units]
+                    elseif length(y_p) == n_units
+                        y_p
                     else
                         [mean(y_p[s_idx_vec .== i]) for i in 1:n_units]
                     end
                     fit_title = !isnothing(log_off_vec) ? "Fitted Relative Risk (RR)" : "Fitted Mean by Spatial Unit"
                     p_fit_map = _render_spatial_effect((mean=y_unit_fit, ), fit_title,
-                        polygons, centroids)
+                        polygons, centroids; coords=coords_detected)
                     if !isnothing(p_fit_map)
                         plots[:spatial_fitted] = p_fit_map
                         plots_data[:spatial_fitted] = (values=y_unit_fit,
-                            geometry=isnothing(polygons) ? centroids : polygons)
+                            geometry=isnothing(polygons) ? centroids : polygons,
+                            coordinates=coords_detected)
                     end
 
                     y_unit_res = y_unit_obs .- y_unit_fit
                     p_res_map = _render_spatial_effect((mean=y_unit_res, ),
-                        "Spatial Residuals (Observed - Fitted)", polygons, centroids)
+                        "Spatial Residuals (Observed - Fitted)", polygons, centroids; coords=coords_detected)
                     if !isnothing(p_res_map)
                         plots[:spatial_residuals] = p_res_map
                         plots_data[:spatial_residuals] = (values=y_unit_res,
-                            geometry=isnothing(polygons) ? centroids : polygons)
+                            geometry=isnothing(polygons) ? centroids : polygons,
+                            coordinates=coords_detected)
                     end
                 end
             end
@@ -1763,12 +1887,28 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
                 continue
             end
 
+            is_continuous_comp = !isnothing(spec) && (
+                spec.component_obj isa RFF ||
+                spec.component_obj isa SpectralGP ||
+                spec.component_obj isa WaveletGP ||
+                spec.component_obj isa SPDE ||
+                spec.component_obj isa TPS ||
+                spec.component_obj isa GP ||
+                spec.component_obj isa Nystrom ||
+                (spec.structure in [:smooth, :spatial] && haskey(spec.params, :positional_args) &&
+                 length(spec.params[:positional_args]) == 2 &&
+                 any(c -> occursin(string(c), lowercase(string(spec.params[:positional_args]))),
+                     ["x", "y", "lon", "lat", "coord", "east", "north"]))
+            )
+
             struct_type = if !isnothing(spec)
-                spec.structure
-            elseif key in [:s_idx, :spatial, :district, :region,
-                :space] || hasproperty(component_effects, :unstructured)
+                is_continuous_comp ? :spatial : spec.structure
+            elseif key in [:s_idx, :spatial, :space] ||
+                   key in STANDARD_SPATIAL_UNIT_CANDIDATES ||
+                   hasproperty(component_effects, :unstructured)
                 :spatial
-            elseif key in [:year, :time, :t_idx, :temporal, :t, :day, :month, :date]
+            elseif key in [:t_idx, :temporal, :t] ||
+                   key in STANDARD_TEMPORAL_CANDIDATES
                 :temporal
             elseif key in [:season, :u_idx, :seasonal]
                 :seasonal
@@ -1779,32 +1919,48 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
             if struct_type == :spatial
                 plot_key = Symbol("spatial_$(key)")
                 p = _render_spatial_effect(main_effect_summary, "Spatial Effect: $key",
-                    polygons, centroids)
+                    polygons, centroids; coords=coords_detected)
                 if !isnothing(p)
                     plots[plot_key] = p
                     plots[:spatial] = p
-                    plots_data[plot_key] = (values=vec(main_effect_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                    plots[Symbol("smooth_$(key)")] = p
+                    if !isnothing(coords_detected)
+                        recon_p = _reconstruct_spatial_surface(coords_detected, vec(main_effect_summary.mean))
+                        plots_data[plot_key] = (grid_x=recon_p.grid_x, grid_y=recon_p.grid_y, surface=recon_p.surface, values=vec(main_effect_summary.mean), coordinates=coords_detected)
+                    else
+                        plots_data[plot_key] = (values=vec(main_effect_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                    end
                     plots_data[:spatial] = plots_data[plot_key]
                 end
 
                 if hasproperty(component_effects, :structured)
                     struct_summary = is_mv ? component_effects.structured[outcome] : component_effects.structured
                     p_struct = _render_spatial_effect(struct_summary,
-                        "Structured Spatial Effect: $key", polygons, centroids)
+                        "Structured Spatial Effect: $key", polygons, centroids; coords=coords_detected)
                     if !isnothing(p_struct)
                         plot_key_struct = Symbol("structured_$(key)")
                         plots[plot_key_struct] = p_struct
-                        plots_data[plot_key_struct] = (values=vec(struct_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                        if !isnothing(coords_detected)
+                            recon_p = _reconstruct_spatial_surface(coords_detected, vec(struct_summary.mean))
+                            plots_data[plot_key_struct] = (grid_x=recon_p.grid_x, grid_y=recon_p.grid_y, surface=recon_p.surface, values=vec(struct_summary.mean), coordinates=coords_detected)
+                        else
+                            plots_data[plot_key_struct] = (values=vec(struct_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                        end
                     end
                 end
                 if hasproperty(component_effects, :unstructured)
                     unstruct_summary = is_mv ? component_effects.unstructured[outcome] : component_effects.unstructured
                     p_unstruct = _render_spatial_effect(unstruct_summary,
-                        "Unstructured Spatial Effect: $key", polygons, centroids)
+                        "Unstructured Spatial Effect: $key", polygons, centroids; coords=coords_detected)
                     if !isnothing(p_unstruct)
                         plot_key_unstruct = Symbol("unstructured_$(key)")
                         plots[plot_key_unstruct] = p_unstruct
-                        plots_data[plot_key_unstruct] = (values=vec(unstruct_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                        if !isnothing(coords_detected)
+                            recon_p = _reconstruct_spatial_surface(coords_detected, vec(unstruct_summary.mean))
+                            plots_data[plot_key_unstruct] = (grid_x=recon_p.grid_x, grid_y=recon_p.grid_y, surface=recon_p.surface, values=vec(unstruct_summary.mean), coordinates=coords_detected)
+                        else
+                            plots_data[plot_key_unstruct] = (values=vec(unstruct_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                        end
                     end
                 end
 
@@ -1941,21 +2097,33 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
                     if !haskey(plots, :smooth)
                         plots[:smooth] = p_sm
                     end
-                elseif length(vars) == 2 # 2D smooth (interaction)
+                elseif length(vars) == 2 # 2D smooth (interaction or continuous spatial)
                     var1_sym, var2_sym = Symbol(vars[1]), Symbol(vars[2])
+                    plot_key = Symbol("$(var1_sym)_$(var2_sym)")
                     if !isnothing(cov_df) && hasproperty(cov_df,
                         var1_sym) && hasproperty(cov_df, var2_sym)
-                        cond_preds_res = _generate_conditional_predictions(model_obj, chain, M,
-                            var1_sym, second_cov=var2_sym)
+                        cond_preds_res = !isnothing(model_obj) && !isnothing(chain) ?
+                            _generate_conditional_predictions(model_obj, chain, M,
+                                var1_sym, second_cov=var2_sym) : nothing
                         if !isnothing(cond_preds_res)
                             cond_preds, range1, range2 = cond_preds_res
                             cond_summary = is_mv ? cond_preds[outcome] : cond_preds
                             grid_mean = reshape(vec(cond_summary.mean), length(range1), length(range2))
                             
-                            plot_key = Symbol("$(var1_sym)_$(var2_sym)")
-                            p_2d = Plots.heatmap(range1, range2, grid_mean', title="2D Smooth Effect: $(var1_sym) & $(var2_sym)", xlabel=string(var1_sym), ylabel=string(var2_sym), c=:viridis, legend=false)
+                            p_2d = Plots.heatmap(range1, range2, grid_mean', title="2D Smooth Effect: $(var1_sym) & $(var2_sym)", xlabel=string(var1_sym), ylabel=string(var2_sym), c=:viridis, aspect_ratio=:equal)
                             smooth_effects_plots[plot_key] = p_2d
                             smooth_effects_plots_data[plot_key] = (x=range1, y=range2, z=grid_mean)
+                            plots[Symbol("smooth_$(plot_key)")] = p_2d
+                        elseif length(main_effect_summary.mean) == nrow(cov_df)
+                            c_2d = Matrix{Float64}(cov_df[!, [var1_sym, var2_sym]])
+                            p_2d = plot_spatial_surface(
+                                c_2d, vec(main_effect_summary.mean);
+                                title="2D Smooth Effect: $(var1_sym) & $(var2_sym)",
+                                colorbar_title=string(key)
+                            )
+                            smooth_effects_plots[plot_key] = p_2d
+                            recon_2d = _reconstruct_spatial_surface(c_2d, vec(main_effect_summary.mean))
+                            smooth_effects_plots_data[plot_key] = (x=recon_2d.grid_x, y=recon_2d.grid_y, z=recon_2d.surface)
                             plots[Symbol("smooth_$(plot_key)")] = p_2d
                         end
                     end
@@ -1997,9 +2165,15 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
             elseif !isnothing(input_data) && hasproperty(input_data,
                 :s_idx) && length(input_data.s_idx) == N_all
                 input_data.s_idx
-            elseif !isnothing(input_data) && hasproperty(input_data,
-                :district) && length(input_data.district) == N_all
-                input_data.district
+            elseif !isnothing(input_data)
+                det_s = _detect_spatial_unit_column(input_data; allow_nothing=true)
+                if !isnothing(det_s) && length(input_data[!, det_s]) == N_all
+                    input_data[!, det_s]
+                elseif haskey(M, :s_N) && haskey(M, :t_N) && N_all == M.s_N * M.t_N
+                    repeat(1:M.s_N, inner=M.t_N)
+                else
+                    nothing
+                end
             elseif haskey(M, :s_N) && haskey(M, :t_N) && N_all == M.s_N * M.t_N
                 repeat(1:M.s_N, inner=M.t_N)
             else
@@ -2170,41 +2344,6 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
         end
     end
 
-    # --- 9. Stratified Categorical Movement Parameter Plots ---
-    if !isnothing(effects) && hasproperty(effects, :categorical_movement) && !isnothing(effects.categorical_movement)
-        cat_mov_summary = effects.categorical_movement
-        cat_plots = Dict{Symbol, Any}()
-        cat_plots_data = Dict{Symbol, Any}()
-        
-        group_lookup = haskey(M, :group_lookup) ? M.group_lookup : (haskey(res, :group_lookup) ? res.group_lookup : nothing)
-        group_names = !isnothing(group_lookup) ? sort(collect(keys(group_lookup)), by=x->group_lookup[x]) : nothing
-
-        for param_sym in [:beta, :D_g, :gamma]
-            if hasproperty(cat_mov_summary, param_sym)
-                group_summaries = getproperty(cat_mov_summary, param_sym)
-                if group_summaries isa AbstractVector && !isempty(group_summaries)
-                    n_groups = length(group_summaries)
-                    g_labels = !isnothing(group_names) && length(group_names) == n_groups ? group_names : ["Group $i" for i in 1:n_groups]
-                    
-                    means = [Float64(s.mean) for s in group_summaries]
-                    lowers = [Float64(s.lower) for s in group_summaries]
-                    uppers = [Float64(s.upper) for s in group_summaries]
-                    
-                    p_forest = Plots.scatter(means, 1:n_groups, xerror=(means .- lowers, uppers .- means),
-                        yticks=(1:n_groups, g_labels), title="Categorical Movement Param: $(param_sym)",
-                        xlabel="Estimate (95% CI)", markersize=5, color=:darkcyan, legend=false, yflip=true)
-                    Plots.vline!(p_forest, [0.0], color=:crimson, ls=:dash, lw=1.5)
-                    
-                    cat_plots[param_sym] = p_forest
-                    cat_plots_data[param_sym] = (groups=g_labels, mean=means, lower=lowers, upper=uppers)
-                end
-            end
-        end
-        if !isempty(cat_plots)
-            plots[:categorical_movement] = cat_plots
-            plots_data[:categorical_movement] = cat_plots_data
-        end
-    end
 
     return (plots=NamedTuple(plots), plots_data=NamedTuple(plots_data))
 end

@@ -49,7 +49,7 @@ const AVAILABLE_SEGMENTS = Dict{Symbol, @NamedTuple{file::String, desc::String}}
     ),
     :components => (
         file = "test_components.jl",
-        desc = "ComponentModel Interface, NNGP, MCAR & Movement"
+        desc = "ComponentModel Interface, NNGP, MCAR"
     ),
     :derivatives => (
         file = "test_derivatives.jl",
@@ -105,7 +105,6 @@ const ALIAS_MAP = Dict{String, Vector{Symbol}}(
     "components"   => [:components],
     "component"    => [:components],
     "nngp"         => [:components],
-    "movement"     => [:components],
     "derivatives"  => [:derivatives],
     "derivative"   => [:derivatives],
     "slope"        => [:derivatives],

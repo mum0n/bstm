@@ -414,6 +414,98 @@ Penalized Complexity (PC) priors (Simpson et al., 2017) provide an axiomatic fra
 ## 7. Sampling, Inference & Sampler Optimization
 
 `bstm` provides a multi-paradigm inference engine combining composite Gibbs partitioning, gradient-based HMC/NUTS, gradient-free slice sampling, and variational approximations.
+ 
+Though MCMC sampling is our gold-standard, we also have other
+optimization-based options that can be worth considering. All of these
+methods are boosted by Automatic Differentiation, some require smooth
+differentiable likelihood surfaces, while others are robust and can be
+range bound. See the [whole list
+here](https://docs.sciml.ai/Optimization/stable/optimization_packages/optim/).
+
+- Maximum likelihood (ML) estimation can be much faster than MCMC as
+pure optimization of a point mass is considerably simpler as priors
+are ignored and there is no need to carry posterior samples. Many
+specialized optimization algorithms exist that have been tried and
+tested over many years.
+
+- Maximum a-posteriori (MAP) estimation is the same as ML except that
+prior information is used as well and so a bit closer to MCMC in
+spirit, though the focus is still upon the point estimates.
+
+- Variational Inference is also an optimization method. However, it
+approaches the problem using the ELBO estimator (log-likelihood aka
+"evidence" of the observed data, \(\log p(x)\)). In complex models,
+calculating the true posterior distribution \(p(z|x)\) is impossible
+(intractable). Instead, we choose a simpler, flexible distribution
+\(q(z)\) to approximate it. Maximizing the ELBO is equivalent to
+minimizing the difference (Kullback-Leibler divergence) between
+\(q(z)\) and the true posterior. The ELBO allows us to use
+gradient-based optimization methods (like Stochastic Gradient Descent)
+to solve Bayesian inference problems. In principle it is closest to
+MCMC and able to describe the posterior distribution reasonably well.
+
+It is, similar to INLA in that optimization is also used but INLA uses
+a Laplace Approximation which comes with the assumption/constraint
+that the posterior marginals can be accurately approximated by a
+Taylor-series expansion. VI has no limits to distributional
+constraints (INLA internally assumes Gaussian), and requires that the
+likelihood is smooth enough for optimization. Note that optimizers for
+non-differentiable surfaces exist too...
+
+All three methods are accessible with the same Turing/Julia model (but
+not Laplace Approximation, to my knowledge, though some Julia projects
+seem to have used LA). As a bonus you also get Automatic
+Differentiation for free and can use the same Turing model.
+
+The following code snippet shows how to run them. One can even use the
+solution from one method as the starting point of another (though that
+runs the risk of starting from a pathologiucal suboptimimum).
+
+
+
+```{julia}
+#| Optimization approaches
+
+using Optim, AdvancedVI, Turing
+
+# ML 
+res_opt = maximum_likelihood(m, LBFGS() )  # many optimizers available
+res_opt.optim_result.retcode
+res_opt.params
+
+res = model_results_comprehensive(m, res_opt, inp_scot, au_scot, n_samples=100);
+ 
+# MAP  
+res_map = maximum_a_posteriori( m, LBFGS() )
+res_map.optim_result.retcode   #
+res_map.params
+res = model_results_comprehensive(m, res_map, inp_scot, au_scot);
+
+
+# Variational Inference 
+samples_per_step = 10
+max_iters = 1000
+n_samples = 1000
+
+# q_init = q_locationscale
+# q_init = q_meanfield_gaussian
+# q_init = q_fullrank_gaussian
+q_init = q_fullrank_gaussian
+
+chn_vi = vi(m, q_init, max_iters, adtype=AutoForwardDiff(),
+show_progress=true; optimizer=LBFGS() ) #;,
+optimizer=Flux.ADAM(1e-1));
+
+# Convert to reconstruct-compatible format
+# chn = convert_advi_to_reconstruct_format(chn_vi, m, n_samples)
+
+# Reconstruct and Visualize: not great
+res = model_results_comprehensive(m, chn_vi, inp_scot, au_scot);
+
+pairs(res.metrics)
+
+ 
+```
 
 ### 7.1. Automatic Composite Gibbs Partitioning (`get_optimal_sampler`)
 

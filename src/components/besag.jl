@@ -27,10 +27,10 @@ from the global intercept.
 
 # Assumptions
 - The spatial process is locally smooth, with values at neighboring locations being
-  similar.
-- The provided adjacency matrix `W` represents a connected graph. Disconnected
-  "islands" will lead to a rank deficiency greater than 1 and cause the model to
-  fail.
+- The provided adjacency matrix `W` can represent either a single connected graph or
+  a disconnected graph with spatial islands. When multiple disconnected components or
+  isolated units are detected, `build_structure_template` automatically performs sub-graph
+  island normalization and component deflation (Freni-Sterrantino et al., 2018).
 
 # Best Use Case
 Modeling structured spatial random effects for areal or lattice data, such as

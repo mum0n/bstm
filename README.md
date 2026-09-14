@@ -109,6 +109,12 @@ using .bstm  # the "." means load the module in the current session, not importi
 # or, you can of course install and import as a package too:  
 # Pkg.add(url="https://github.com/mum0n/bstm.git"); using bstm
 
+# or to develop:
+cd(bstm_location)
+] dev .
+using bstm
+
+
 ```
 
 ## Quick Start Examples
@@ -150,7 +156,8 @@ display(plots_res.plots[:spatial])
 
 # 6. Persist Unified Bundle to DuckDB and JLD2
 save_bstm_bundle("output/scot_lip_model", m, chn, res; au=data_scot.au);
-bn_bundle = load_bstm_bundle("output/scot_lip_model")
+bn_bundle = load_bstm_bundle("output/scot_lip_model") ;
+keys(bn_bundle)
 
 # 7. Query prior
 # Extract prior from the saved bundle
@@ -179,7 +186,7 @@ df = DataFrame(
     year = rand(rng, 2020:2024, N),
     elevation = randn(rng, N),
     y = rand(rng, 0:20, N)
-)
+);
 
 # 2. Partition space into hexagons across 5 years
 st_data = assign_spatiotemporal_units(df;
@@ -190,12 +197,12 @@ st_data = assign_spatiotemporal_units(df;
     target_units = 16,
     radius = 10.0,
     exact_units = true
-)
+);
 
 spatial_graph_plot(au=st_data.au_spatial, title="Spatial Units")
 
-df.s_idx = st_data.s_idx
-df.year_idx = st_data.t_idx
+df.s_idx = st_data.s_idx ;
+df.year_idx = st_data.t_idx ;
 
 # 3. Fit Spatiotemporal Model with BYM2 + AR1
 m = @bstm(
@@ -207,12 +214,12 @@ m = @bstm(
     df,
     W = st_data.W_spatial,
     verbose = false
-)
+);
 
 # 4. Process Results and Generate Plots
-chn = sample(m, NUTS(), 300; progress=false)
-res = model_results_comprehensive(m, chn)
-plots_res = bstm_plots(res; data=df, au=st_data.au_spatial)
+chn = sample(m, NUTS(), 300; progress=false);
+res = model_results_comprehensive(m, chn);
+plots_res = bstm_plots(res; data=df, au=st_data.au_spatial);
 
 p_map = plots_res.plots[:spatial]
 p_ppc = plots_res.plots[:posterior_predictive_check]

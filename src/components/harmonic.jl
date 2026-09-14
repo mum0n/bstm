@@ -92,26 +92,34 @@ COMPONENT_CONSTRUCTORS[:harmonic] = (p, params) -> begin
     Harmonic(nharmonics, p.amplitude, p.phase, period_param, method)
 end
 
-MODEL_TO_STRUCTURE_MAP[:harmonic] = :temporal
+MODEL_TO_STRUCTURE_MAP[:harmonic] = :seasonal
 
 function get_precomputes(
     m::Harmonic, M::NamedTuple, mod_data::Dict
 )::NamedTuple
-    # Validate that a seasonal index variable is provided.
+    # Validate that a seasonal index variable is provided or auto-detect it.
     raw_vars = get(mod_data, :variables, Symbol[])
     variables = raw_vars isa AbstractVector ? raw_vars : [raw_vars]
-    if isempty(variables)
-        error(
-            "The Harmonic model requires a seasonal index variable, e.g., " *
-            "`random(month, model=:harmonic)`."
-        )
+    u_var_sym = if !isempty(variables)
+        Symbol(variables[1])
+    elseif hasproperty(M, :data)
+        _detect_seasonal_column(M.data; allow_nothing=false)
+    else
+        :u_idx
     end
 
     # Extract the seasonal index variable from the data.
-    u_var_sym = Symbol(variables[1])
-    u_idx = hasproperty(M, :data) && hasproperty(M.data, u_var_sym) ? M.data[!,
-        u_var_sym] : collect(1:get(M, :N_time, 12))
-    u_N = hasproperty(M, :N_time) ? M.N_time : Int(maximum(u_idx))
+    raw_u = hasproperty(M, :data) && hasproperty(M.data, u_var_sym) ?
+        M.data[!, u_var_sym] : collect(1:get(M, :N_time, 12))
+    u_idx = if eltype(raw_u) <: Integer
+        Int.(raw_u)
+    elseif haskey(M, :u_idx)
+        M.u_idx
+    else
+        collect(1:length(raw_u))
+    end
+    u_N = haskey(M, :u_N) && M.u_N > 0 ? M.u_N :
+        (hasproperty(M, :N_time) ? M.N_time : Int(maximum(u_idx)))
     u_idx_var = u_var_sym
 
     u_coords = collect(1.0:u_N)
@@ -245,9 +253,20 @@ function get_effects(
 
     # --- Index Handling ---
     u_idx_train = hyper.u_idx
-    u_idx_full = if !isnothing(PS) && hasproperty(PS.data, hyper.u_idx_var)
-        u_idx_pred = PS.data[!, hyper.u_idx_var]
-        vcat(u_idx_train, u_idx_pred)
+    u_idx_full = if !isnothing(PS)
+        if hasproperty(PS, :u_idx)
+            vcat(u_idx_train, PS.u_idx)
+        elseif hasproperty(PS, :data) && hasproperty(PS.data, hyper.u_idx_var)
+            raw_new = PS.data[!, hyper.u_idx_var]
+            if haskey(M, :u_values) && !isnothing(M.u_values)
+                u_map = Dict(v => i for (i, v) in enumerate(M.u_values))
+                vcat(u_idx_train, [get(u_map, v, 1) for v in raw_new])
+            else
+                vcat(u_idx_train, Int.(round.(raw_new)))
+            end
+        else
+            u_idx_train
+        end
     else
         u_idx_train
     end

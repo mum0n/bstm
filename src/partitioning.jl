@@ -1575,11 +1575,19 @@ end
 assign_spatial_units(coords::Vector{<:Tuple{Real, Real}}; kwargs...) =
     assign_spatial_units([p[1] for p in coords], [p[2] for p in coords]; kwargs...)
 
-function assign_spatial_units(df::DataFrame; x::Symbol=:s_x, y::Symbol=:s_y, kwargs...)
-    if !hasproperty(df, x) || !hasproperty(df, y)
-        error("DataFrame missing required spatial coordinate columns `:$x` and `:$y`.")
+function assign_spatial_units(
+    df::DataFrame;
+    x::Union{Symbol, AbstractString, Nothing}=nothing,
+    y::Union{Symbol, AbstractString, Nothing}=nothing,
+    target_col::Union{Symbol, AbstractString, Nothing}=nothing,
+    kwargs...
+)
+    col_x, col_y = _detect_xy_columns(df; x=x, y=y)
+    au = assign_spatial_units(df[!, col_x], df[!, col_y]; kwargs...)
+    if !isnothing(target_col)
+        df[!, Symbol(target_col)] = au.assignments
     end
-    return assign_spatial_units(df[!, x], df[!, y]; kwargs...)
+    return au
 end
 
 
@@ -2186,25 +2194,57 @@ function assign_time_units(
     return (idx=idx, brks=brks, mids=mids, N_cat=N_cat)
 end
 
+"""
+    assign_time_units(t_v::AbstractVector; time_method="unique", t_N=nothing, u_N=nothing, kwargs...)
+
+Discretizes arbitrary temporal identifiers (dates, strings, symbols, or general objects) into
+consecutive 1-based indices `1:N_cat` based on their sorted unique values.
+"""
+function assign_time_units(
+    t_v::AbstractVector; time_method="unique", t_N=nothing, u_N=nothing, kwargs...
+)
+    unique_times = sort(unique(t_v))
+    N_cat = length(unique_times)
+    brks = collect(1:(N_cat + 1))
+    val_to_idx = Dict(val => i for (i, val) in enumerate(unique_times))
+    idx = [val_to_idx[v] for v in t_v]
+    mids = unique_times
+
+    return (idx=idx, brks=brks, mids=mids, N_cat=N_cat)
+end
+
 
 """
-    assign_spatiotemporal_units(df::DataFrame; space_x=:s_x, space_y=:s_y, time_var=:t_idx,
-                                area_method=:avt, target_units=10, time_method="unique",
-                                  t_N=nothing, kwargs...)
+    assign_spatiotemporal_units(df::DataFrame; space_x=nothing, space_y=nothing,
+                                time_var=nothing, target_space_col=nothing,
+                                target_time_col=nothing, area_method=:avt,
+                                target_units=10, time_method="unique", t_N=nothing, kwargs...)
 
 Simultaneously discretizes space and time, producing synchronized `(s_idx, t_idx, st_idx)`
-and dimensional metadata for spatiotemporal modeling.
+and dimensional metadata for spatiotemporal modeling. Automatically detects coordinate
+and temporal variables if not explicitly specified.
 """
 function assign_spatiotemporal_units(
-    df::DataFrame; space_x::Symbol=:s_x, space_y::Symbol=:s_y, time_var::Symbol=:t_idx,
-    area_method::Symbol=:avt, target_units::Integer=10,
-    time_method="unique", t_N=nothing, kwargs...
+    df::DataFrame;
+    space_x::Union{Symbol, AbstractString, Nothing}=nothing,
+    space_y::Union{Symbol, AbstractString, Nothing}=nothing,
+    time_var::Union{Symbol, AbstractString, Nothing}=nothing,
+    target_space_col::Union{Symbol, AbstractString, Nothing}=nothing,
+    target_time_col::Union{Symbol, AbstractString, Nothing}=nothing,
+    area_method::Symbol=:avt,
+    target_units::Integer=10,
+    time_method="unique",
+    t_N=nothing,
+    kwargs...
 )
+    col_x, col_y = _detect_xy_columns(df; x=space_x, y=space_y)
+    col_t = _detect_time_column(df; time_var=time_var)
+
     au_space = assign_spatial_units(
-        df; x=space_x, y=space_y, area_method=area_method,
+        df; x=col_x, y=col_y, area_method=area_method,
         target_units=target_units, kwargs...
     )
-    au_time = assign_time_units(df[!, time_var]; time_method=time_method, t_N=t_N, kwargs...)
+    au_time = assign_time_units(df[!, col_t]; time_method=time_method, t_N=t_N, kwargs...)
 
     S = length(au_space.centroids)
     T = au_time.N_cat
@@ -2213,6 +2253,13 @@ function assign_spatiotemporal_units(
     st_idx = (t_idx .- 1) .* S .+ s_idx
 
     scalefactor_s = scaling_factor_bym2(au_space.W)
+
+    if !isnothing(target_space_col)
+        df[!, Symbol(target_space_col)] = s_idx
+    end
+    if !isnothing(target_time_col)
+        df[!, Symbol(target_time_col)] = t_idx
+    end
 
     return (
         au_spatial = au_space,
@@ -2488,96 +2535,6 @@ function _safe_mean(v)::Float64
     return isempty(vals) ? NaN : mean(vals)
 end
 
-# ── Telemetry aggregation ──────────────────────────────────────────────────────
-
-"""
-    aggregate_telemetry_time(tagging; time_interval=:monthly) -> DataFrame
-
-Aggregate high-frequency telemetry pings per individual into regular temporal
-bins, with `Missing`-safe numeric aggregation throughout.
-
-# Binning modes
-- `:monthly`  — first day of each (year, month).
-- `:weekly`   — Monday of each ISO calendar week.
-- `:biweekly` — 14-day epochs anchored at 1990-01-01.
-- `:daily`    — calendar date.
-- `:raw`      — no aggregation; returns a copy.
-
-# Data requirements
-`tagging` must contain at minimum: `:tagid`, `:lon`, `:lat`, `:timestamp`, `:tag`.
-Optional numeric columns (`:z`, `:cw`, `:chela`, `:wgt`) are aggregated with
-`_safe_mean`.  Group columns (`:sex`, `:mat`, `:datasource`) use `first`.
-`:is_dead` is propagated via `any(skipmissing)`.
-
-Individuals with < 2 distinct temporal observations after aggregation are
-dropped.  `:tag` is re-indexed (0, 1, 2, …) per individual.
-
-# Arguments
-- `tagging::DataFrame`: Input telemetry table.
-- `time_interval::Symbol`: Binning resolution (default `:monthly`).
-
-# Returns
-- `DataFrame`: Aggregated table with `:time` (decimal year) column.
-"""
-function aggregate_telemetry_time(
-    tagging::DataFrame;
-    time_interval::Symbol = :monthly
-)::DataFrame
-
-    time_interval == :raw && return copy(tagging)
-
-    df = copy(tagging)
-    hasproperty(df, :timestamp) || error("DataFrame must contain :timestamp column.")
-
-    if time_interval == :daily
-        df[!, :time_bucket] = Date.(df.timestamp)
-    elseif time_interval == :weekly
-        df[!, :time_bucket] = [Date(t) - Day(dayofweek(Date(t)) - 1)
-                                for t in df.timestamp]
-    elseif time_interval == :biweekly
-        epoch = Date(1990, 1, 1)
-        df[!, :time_bucket] = [epoch + Day(fld(Int(Date(t) - epoch), 14) * 14)
-                                for t in df.timestamp]
-    elseif time_interval == :monthly
-        df[!, :time_bucket] = [Date(year(t), month(t), 1) for t in df.timestamp]
-    else
-        error("Unsupported time_interval: $(time_interval). " *
-              "Use :monthly, :weekly, :biweekly, :daily, or :raw.")
-    end
-
-    spec = Pair[
-        :lon       => _safe_mean => :lon,
-        :lat       => _safe_mean => :lat,
-        :tag       => minimum    => :tag,
-        :timestamp => minimum    => :timestamp,
-    ]
-    for col in (:z, :cw, :chela, :wgt)
-        hasproperty(df, col) && push!(spec, col => _safe_mean => col)
-    end
-    for col in (:sex, :mat, :datasource)
-        hasproperty(df, col) && push!(spec, col => first => col)
-    end
-    hasproperty(df, :is_dead) &&
-        push!(spec, :is_dead => (x -> any(skipmissing(x))) => :is_dead)
-
-    agg = DataFrames.combine(groupby(df, [:tagid, :time_bucket]), spec...)
-    agg[!, :time] = [_to_decimal_year(d) for d in agg.timestamp]
-    sort!(agg, [:tagid, :time])
-
-    valid = Set{String}()
-    for sub in groupby(agg, :tagid)
-        nrow(sub) >= 2 && push!(valid, string(first(sub.tagid)))
-    end
-    filter!(r -> string(r.tagid) in valid, agg)
-
-    parts = DataFrame[]
-    for sub in groupby(agg, :tagid)
-        sdf     = DataFrame(sub)
-        sdf.tag = collect(0:(nrow(sdf) - 1))
-        push!(parts, sdf)
-    end
-    return isempty(parts) ? DataFrame() : vcat(parts...)
-end
 
 # ── Planar hexagonal mesh ──────────────────────────────────────────────────────
 
@@ -2729,15 +2686,15 @@ function build_hex_mesh_planar(
     )
 end
 
-# ── Telemetry → unit mapping ───────────────────────────────────────────────────
+# ── point → unit mapping ───────────────────────────────────────────────────
 
 
 """
-    map_telemetry_to_units(
+    map_point_to_units(
         tagging, centroids_km, center_lon, center_lat; crs=nothing, datum=WGS84Latest
     ) -> DataFrame
 
-Assign each telemetry observation to the nearest hexagonal unit via a KDTree on
+Assign each point observation to the nearest hexagonal unit via a KDTree on
 planar km centroids. Adds `:s_idx` (1-based integer, 1 ≤ s ≤ S).
 
 # Arguments
@@ -2752,11 +2709,12 @@ planar km centroids. Adds `:s_idx` (1-based integer, 1 ≤ s ≤ S).
 # Returns
 - Copy of `tagging` with `:s_idx::Int` appended.
 """
-function map_telemetry_to_units(
+function map_point_to_units(
     tagging::DataFrame,
     centroids_km::Vector{Tuple{Float64, Float64}},
     center_lon::Real,
     center_lat::Real;
+    target_col::Union{Symbol, AbstractString, Nothing} = nothing,
     crs = nothing,
     datum = WGS84Latest,
     land_mask::Union{Nothing, AbstractVector{Bool}} = nothing,
@@ -2788,10 +2746,11 @@ function map_telemetry_to_units(
     # Build the KDTree for fast spatial lookups on navigable marine units
     tree = KDTree(c_mat)
 
-    # Pre-allocate and populate the telemetry points matrix
+    # Pre-allocate and populate the point coordinates matrix
     N = nrow(tagging)
     pts_mat = Matrix{Float64}(undef, 2, N)
-    for (i, (lon, lat)) in enumerate(zip(tagging.lon, tagging.lat))
+    col_x, col_y = _detect_xy_columns(tagging)
+    for (i, (lon, lat)) in enumerate(zip(tagging[!, col_x], tagging[!, col_y]))
         x, y = lonlat_to_xy_km(
             Float64(lon), Float64(lat);
             center_lon=center_lon, center_lat=center_lat,
@@ -2806,7 +2765,11 @@ function map_telemetry_to_units(
 
     # Append mapped units to a copy of the DataFrame
     out = copy(tagging)
-    out[!, :s_idx] = [active_indices[first(idx)] for idx in idxs]
+    mapped_s = [active_indices[first(idx)] for idx in idxs]
+    out[!, :s_idx] = mapped_s
+    if !isnothing(target_col)
+        out[!, Symbol(target_col)] = mapped_s
+    end
 
     return out
 end
@@ -2997,76 +2960,6 @@ function load_hsi_jld2(
         monthly_hsi      = monthly_hsi,
         month_lookup     = month_lookup
     )
-end
-"""
-    match_telemetry_closest_month_hsi(
-        telemetry_df, monthly_hsi, month_lookup, years
-    ) -> Vector{Float64}
-
-Assign each telemetry observation its HSI value from the nearest (year, month).
-
-# Fallback strategy (applied in order)
-1. Clamp year to [y_min, y_max]; look up `(yr_clamped, month)`.
-2. Same month in `y_min` (lower boundary).
-3. Same month in `y_max` (upper boundary).
-4. Assign `NaN` and emit a single summary `@warn` when entries are missing.
-
-# Arguments
-- `telemetry_df`: DataFrame with `:timestamp` and `:s_idx`.
-- `monthly_hsi`: Matrix (S × 12T).
-- `month_lookup`: Dict{(year, month) => column_index}.
-- `years`: Valid year range.
-
-# Returns
-- `Vector{Float64}` of length `nrow(telemetry_df)`.
-"""
-function match_telemetry_closest_month_hsi(
-    telemetry_df::DataFrame,
-    monthly_hsi::AbstractMatrix{<:Real},
-    month_lookup::Dict{Tuple{Int, Int}, Int},
-    years::AbstractVector{<:Integer}
-)::Vector{Float64}
-
-    y_min, y_max = extrema(years)
-    n_rows = nrow(telemetry_df)
-    
-    # Use undef instead of zeros to prevent unnecessary memory writing
-    out = Vector{Float64}(undef, n_rows)
-
-    # 1. Extract columns to local variables for type-stable, zero-overhead indexing
-    timestamps = telemetry_df.timestamp
-    s_idxs     = telemetry_df.s_idx
-
-    missing_count = 0
-
-    @inbounds for i in 1:n_rows
-        dt = timestamps[i]
-        s  = s_idxs[i]
-        
-        yr = clamp(Dates.year(dt), y_min, y_max)
-        mo = Dates.month(dt)
-
-        # 2. Use 0 as a default instead of `nothing` to keep types strict and fast
-        col = get(month_lookup, (yr, mo), 0)
-        
-        if col == 0
-            col = get(month_lookup, (y_min, mo), get(month_lookup, (y_max, mo), 0))
-            if col == 0
-                out[i] = NaN
-                missing_count += 1
-                continue
-            end
-        end
-        
-        out[i] = monthly_hsi[s, col]
-    end
-    
-    # 3. Emit a single summary warning rather than spamming the console
-    if missing_count > 0
-        @warn "No month_lookup entry found for $missing_count telemetry observations. Assigned NaN."
-    end
-
-    return out
 end
 """
     reshard_hsi_field(

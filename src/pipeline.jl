@@ -537,11 +537,13 @@ function bstm_pipeline(
                 prev_au = tier_networks[prev_name]
 
                 # Match coordinates or spatial units
-                if hasproperty(cur_df, :s_x) && hasproperty(cur_df, :s_y) && 
-                   hasproperty(prev_pred_df, :s_x) && hasproperty(prev_pred_df, :s_y)
+                cur_xy = try _detect_xy_columns(cur_df) catch; nothing end
+                prev_xy = try _detect_xy_columns(prev_pred_df) catch; nothing end
+
+                if !isnothing(cur_xy) && !isnothing(prev_xy)
                     # Coordinate-based nearest neighbor / interpolation mapping
-                    kdt = KDTree(hcat(prev_pred_df.s_x, prev_pred_df.s_y)')
-                    query_pts = hcat(cur_df.s_x, cur_df.s_y)'
+                    kdt = KDTree(hcat(prev_pred_df[!, prev_xy[1]], prev_pred_df[!, prev_xy[2]])')
+                    query_pts = hcat(cur_df[!, cur_xy[1]], cur_df[!, cur_xy[2]])'
                     nns, _ = knn(kdt, query_pts, 1)
                     nn_idxs = [n[1] for n in nns]
                     cur_df[!, prev_name] = prev_pred_df[!, val_col][nn_idxs]
@@ -595,8 +597,9 @@ function bstm_pipeline(
 
         # 3. Compute Surface Derivatives if requested
         if !isempty(spec.derivatives)
-            coords_query = if hasproperty(cur_df, :s_x) && hasproperty(cur_df, :s_y)
-                cur_df[:, [:s_x, :s_y]]
+            cur_xy = try _detect_xy_columns(cur_df) catch; nothing end
+            coords_query = if !isnothing(cur_xy)
+                cur_df[:, [cur_xy[1], cur_xy[2]]]
             elseif !isnothing(cur_au)
                 DataFrame(s_x = [c[1] for c in cur_au.centroids], s_y = [c[2] for c in cur_au.centroids])
             else
@@ -667,9 +670,10 @@ function bstm_pipeline(
         all_x = Float64[]
         all_y = Float64[]
         for s in tier_specs
-            if hasproperty(s.data, :s_x) && hasproperty(s.data, :s_y)
-                append!(all_x, s.data.s_x)
-                append!(all_y, s.data.s_y)
+            s_xy = try _detect_xy_columns(s.data) catch; nothing end
+            if !isnothing(s_xy)
+                append!(all_x, s.data[!, s_xy[1]])
+                append!(all_y, s.data[!, s_xy[2]])
             end
         end
         final_master_au = assign_spatial_units(all_x, all_y; target_units=30)
@@ -714,13 +718,16 @@ function bstm_pipeline(
             u_sds   = [mean(pred_df[!, sd_col][pred_df.s_idx .== i]) for i in 1:src_au.n_units]
             master_df[!, val_col] = Vector{Float64}(P_master * u_means)
             master_df[!, sd_col] = Vector{Float64}(sqrt.(P_master * (u_sds .^ 2)))
-        elseif hasproperty(pred_df, :s_x) && hasproperty(pred_df, :s_y)
-            kdt = KDTree(hcat(pred_df.s_x, pred_df.s_y)')
-            q_pts = hcat(master_df.s_x, master_df.s_y)'
-            nns, _ = knn(kdt, q_pts, 1)
-            idxs = [n[1] for n in nns]
-            master_df[!, val_col] = pred_df[!, val_col][idxs]
-            master_df[!, sd_col] = pred_df[!, sd_col][idxs]
+        else
+            pred_xy = try _detect_xy_columns(pred_df) catch; nothing end
+            if !isnothing(pred_xy)
+                kdt = KDTree(hcat(pred_df[!, pred_xy[1]], pred_df[!, pred_xy[2]])')
+                q_pts = hcat(master_df.s_x, master_df.s_y)'
+                nns, _ = knn(kdt, q_pts, 1)
+                idxs = [n[1] for n in nns]
+                master_df[!, val_col] = pred_df[!, val_col][idxs]
+                master_df[!, sd_col] = pred_df[!, sd_col][idxs]
+            end
         end
     end
 

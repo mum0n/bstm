@@ -431,21 +431,64 @@ function build_param_registry(M::NamedTuple; prefix::String = "")
     end
 
     # 7. Nested / Transfer Sub-models (recursive registration with prefix)
-    if isempty(prefix) && haskey(M, :nested_components) && !isempty(M.nested_components)
+    if haskey(M, :nested_components) && !isempty(M.nested_components)
         for (k, sub_M) in M.nested_components
+            sub_prefix = isempty(prefix) ? string(k) : "$(prefix)_$(k)"
+            coupling = get(sub_M, :coupling, get(sub_M, :interaction, :additive))
+            is_tensor = coupling == :tensor && get(sub_M, :is_multistrata, false)
+            is_moderated = coupling == :moderated
+            n_strata = get(sub_M, :n_strata, 1)
+
             if !get(sub_M, :fixed_coupling, false)
-                c_prior = get(sub_M, :coupling_prior, Normal(1.0, 0.5))
-                add_descriptor!(reg, ParamDescriptor(
-                    Symbol("rho_nested_$(k)");
-                    component_key = :nested,
-                    role = :nested_weight,
-                    outcome_idx = nothing,
-                    is_shared = true,
-                    shape = (1,),
-                    prior = c_prior
-                ))
+                if is_tensor
+                    for fac in sub_M.strata_factors
+                        dim = sub_M.factor_dims[fac]
+                        add_descriptor!(reg, ParamDescriptor(
+                            Symbol("rho_nested_$(sub_prefix)_$(fac)");
+                            component_key = :nested,
+                            role = :nested_weight,
+                            outcome_idx = nothing,
+                            is_shared = true,
+                            shape = (dim,),
+                            prior = get(sub_M, :coupling_prior, Normal(1.0, 0.5))
+                        ))
+                    end
+                elseif is_moderated
+                    c_prior = get(sub_M, :coupling_prior, Normal(1.0, 0.5))
+                    s_shape = n_strata > 1 ? (n_strata,) : (1,)
+                    add_descriptor!(reg, ParamDescriptor(
+                        Symbol("rho_nested_$(sub_prefix)_0");
+                        component_key = :nested,
+                        role = :nested_weight,
+                        outcome_idx = nothing,
+                        is_shared = true,
+                        shape = s_shape,
+                        prior = c_prior
+                    ))
+                    add_descriptor!(reg, ParamDescriptor(
+                        Symbol("rho_nested_$(sub_prefix)_1");
+                        component_key = :nested,
+                        role = :nested_weight,
+                        outcome_idx = nothing,
+                        is_shared = true,
+                        shape = s_shape,
+                        prior = c_prior
+                    ))
+                else
+                    c_prior = get(sub_M, :coupling_prior, Normal(1.0, 0.5))
+                    s_shape = n_strata > 1 ? (n_strata,) : (1,)
+                    add_descriptor!(reg, ParamDescriptor(
+                        Symbol("rho_nested_$(sub_prefix)");
+                        component_key = :nested,
+                        role = :nested_weight,
+                        outcome_idx = nothing,
+                        is_shared = true,
+                        shape = s_shape,
+                        prior = c_prior
+                    ))
+                end
             end
-            sub_reg = build_param_registry(sub_M; prefix = string(k))
+            sub_reg = build_param_registry(sub_M; prefix = sub_prefix)
             for (_, d) in sub_reg.descriptors
                 add_descriptor!(reg, d)
             end

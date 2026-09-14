@@ -289,8 +289,23 @@ function get_effects(
 
     # --- Coordinate/Index Handling: Combine training and prediction sets on CPU ---
     u_idx_train = M.u_idx
-    u_idx_full = if !isnothing(PS) && hasproperty(PS.data, :u_idx)
-        vcat(u_idx_train, PS.data.u_idx)
+    u_idx_full = if !isnothing(PS)
+        if hasproperty(PS, :u_idx)
+            vcat(u_idx_train, PS.u_idx)
+        elseif hasproperty(PS, :data) && haskey(M, :u_idx_var) &&
+               hasproperty(PS.data, M.u_idx_var)
+            raw_new = PS.data[!, M.u_idx_var]
+            if haskey(M, :u_values) && !isnothing(M.u_values)
+                u_map = Dict(v => i for (i, v) in enumerate(M.u_values))
+                vcat(u_idx_train, [get(u_map, v, 1) for v in raw_new])
+            else
+                vcat(u_idx_train, Int.(raw_new))
+            end
+        elseif hasproperty(PS, :data) && hasproperty(PS.data, :u_idx)
+            vcat(u_idx_train, Int.(PS.data.u_idx))
+        else
+            u_idx_train
+        end
     else
         u_idx_train
     end

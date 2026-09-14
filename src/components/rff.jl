@@ -40,6 +40,8 @@ The final effect is a linear combination of these features: \$f(x) = \\phi(x)^T 
     the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
   - `method`: `Symbol`, computational method (`:fixed`, `:adaptive`, or `:centered`).
     Default: `:fixed`.
+  - `sampling`: `Symbol`, spectral frequency sampling method (`:orthogonal`,
+    `:adaptive`, `:quasi`, or `:iid`). Default: `:orthogonal`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the RFF coefficients.
@@ -56,6 +58,18 @@ struct RFF <: ComponentModel
     n_features::Int
     kernel::String
     method::Symbol
+    sampling::Symbol
+
+    function RFF(
+        lengthscale::Union{Distribution, Vector{<:Distribution}},
+        sigma::Distribution,
+        n_features::Int,
+        kernel::String,
+        method::Symbol = :fixed,
+        sampling::Symbol = :orthogonal
+    )
+        return new(lengthscale, sigma, n_features, kernel, method, sampling)
+    end
 end
 
 COMPONENT_TYPE_REGISTRY[:rff] = RFF
@@ -65,54 +79,31 @@ COMPONENT_CONSTRUCTORS[:rff] = (p, params) -> RFF(
     p.sigma,
     get(params, :n_features, 20),
     string(get(params, :kernel, "se")),
-    get(params, :method, :fixed)
+    get(params, :method, :fixed),
+    Symbol(get(params, :sampling, :orthogonal))
 )
 
 MODEL_TO_STRUCTURE_MAP[:rff] = :smooth
 
-function _generate_rff_fixed_params(
-    in_dims::Int, n_features::Int, lengthscale::Union{Real, AbstractVector},
-    kernel_name::String
-)
-    b = rand(Uniform(0, 2 * pi), n_features)
-    W = Matrix{Float64}(undef, in_dims, n_features)
-    k_name = lowercase(kernel_name)
+"""
+    _generate_rff_fixed_params(in_dims, n_features, lengthscale, kernel_name;
+                               sampling = :orthogonal, coords = nothing, rng = default_rng())
 
-    if k_name in ["se", "gaussian", "rbf"]
-        if lengthscale isa Real
-            W .= rand(Normal(0, 1.0 / lengthscale), in_dims, n_features)
-        else
-            if length(lengthscale) != in_dims
-                error("ARD lengthscale vector length mismatch.")
-            end
-            for d in 1:in_dims
-                W[d, :] = rand(Normal(0, 1.0 / lengthscale[d]), n_features)
-            end
-        end
-    elseif occursin("matern", k_name)
-        nu = if k_name == "matern12"
-            0.5
-        elseif k_name == "matern32"
-            1.5
-        else
-            2.5
-        end
-        df = 2 * nu
-        if lengthscale isa Real
-            W .= (sqrt(df) / lengthscale) .* rand(TDist(df), in_dims, n_features)
-        else
-            if length(lengthscale) != in_dims
-                error("ARD lengthscale vector length mismatch.")
-            end
-            for d in 1:in_dims
-                W[d, :] = (sqrt(df) / lengthscale[d]) .* rand(TDist(df), n_features)
-            end
-        end
-    else
-        @warn "Kernel '$kernel_name' not recognized for RFF. Defaulting to SE."
-        return _generate_rff_fixed_params(in_dims, n_features, lengthscale, "se")
-    end
-    return W, b
+Generates RFF frequencies and phase offsets, delegating to `generate_rff_params`.
+"""
+function _generate_rff_fixed_params(
+    in_dims::Int,
+    n_features::Int,
+    lengthscale::Union{Real, AbstractVector},
+    kernel_name::String;
+    sampling::Symbol = :orthogonal,
+    coords::Union{Nothing, AbstractMatrix{<:Real}} = nothing,
+    rng::AbstractRNG = Random.default_rng()
+)::Tuple{Matrix{Float64}, Vector{Float64}}
+    return generate_rff_params(
+        in_dims, n_features, lengthscale, kernel_name;
+        sampling = sampling, coords = coords, rng = rng
+    )
 end
 
 function get_precomputes(m::RFF, M::NamedTuple, mod_data::Dict)::NamedTuple
@@ -140,7 +131,9 @@ function get_precomputes(m::RFF, M::NamedTuple, mod_data::Dict)::NamedTuple
     end
 
     W_fixed, b_fixed = _generate_rff_fixed_params(
-        in_dims, m.n_features, ls_initial, m.kernel
+        in_dims, m.n_features, ls_initial, m.kernel;
+        sampling = m.sampling,
+        coords = coords
     )
 
     return (

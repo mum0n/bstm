@@ -69,21 +69,32 @@ struct SVAR <: ComponentModel
 end
 
 COMPONENT_TYPE_REGISTRY[:svar] = SVAR
+COMPONENT_TYPE_REGISTRY[:spacetime] = SVAR
 
-COMPONENT_CONSTRUCTORS[:svar] = (p, params) -> SVAR(
-    get(params, :model, :icar),
-    p.rho_sigma,
-    get(p, :rho_rho, nothing),
-    p.sigma,
-    get(params, :method, :spectral)
-)
+COMPONENT_CONSTRUCTORS[:svar] = (p, params) -> begin
+    raw_rho = get(params, :rho_model, get(params, :model, :icar))
+    rho_m = raw_rho in [:svar, :spacetime] ? :icar : raw_rho
+    p_rho_sigma = hasproperty(p, :rho_sigma) ? p.rho_sigma :
+        (hasproperty(p, :sigma) ? p.sigma : Exponential(0.5))
+    p_rho_rho = hasproperty(p, :rho_rho) ? p.rho_rho : nothing
+    p_sigma = hasproperty(p, :sigma) ? p.sigma : Exponential(0.5)
+    SVAR(
+        rho_m,
+        p_rho_sigma,
+        p_rho_rho,
+        p_sigma,
+        get(params, :method, :spectral)
+    )
+end
+COMPONENT_CONSTRUCTORS[:spacetime] = COMPONENT_CONSTRUCTORS[:svar]
 
 MODEL_TO_STRUCTURE_MAP[:svar] = :spacetime
+MODEL_TO_STRUCTURE_MAP[:spacetime] = :spacetime
 
 function get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     # Validation moved from get_datastructures!
     variables = mod_data[:variables]
-    if length(variables) < 2
+    if length(variables) < 2 && (isnothing(get(M, :s_N, nothing)) || isnothing(get(M, :t_N, nothing)))
         error("SVAR requires a spatial and a temporal variable, e.g., `random(s, t, model=svar)`.")
     end
 

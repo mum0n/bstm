@@ -176,42 +176,15 @@ end
     m_arr = bstm.leaflet_advection_arrows(au; hsi=hsi, velocity=1.2, Gamma=Gamma, title="Advection Leaflet")
     @test m_arr isa bstm.LeafletMap
 
-    # 5. Leaflet Movement Tracks
-    paths = [1 2 4 4;
-             3 1 2 4]
-    m_tracks = bstm.leaflet_tracks_map(paths, au; hsi=hsi, title="Tracks Leaflet")
-    @test m_tracks isa bstm.LeafletMap
-
-    # 6. Leaflet Spatiotemporal Time Slider Map
+    # 5. Leaflet Spatiotemporal Time Slider Map
     st_dict = Dict(2020 => [0.1, 0.3, 0.5, 0.7], 2021 => [0.2, 0.4, 0.6, 0.8], 2022 => [0.3, 0.5, 0.7, 0.9])
     m_st = bstm.leaflet_spacetime_map([2020, 2021, 2022], st_dict, au; title="Spatiotemporal Evolution")
     @test m_st isa bstm.LeafletMap
     @test occursin("timeSlider", m_st.html_content)
 
-    # 7. Leaflet Dispersal, Step Diagnostics, Connectivity, ADR Ratio
-    m_kern = bstm.leaflet_dispersal_kernel(Gamma, au; title="Dispersal Decay")
-    @test m_kern isa bstm.LeafletMap
-    @test occursin("Chart", m_kern.html_content)
-
-    m_step = bstm.leaflet_step_diagnostics(paths, au; title="Step Length Diagnostics")
-    @test m_step isa bstm.LeafletMap
-
-    C_reg = [0.8 0.2; 0.3 0.7]
-    m_conn = bstm.leaflet_regional_connectivity(C_reg; strata_names=["West", "East"], title="Connectivity")
-    @test m_conn isa bstm.LeafletMap
-
-    m_adr = bstm.leaflet_ad_ratio_distribution([0.1, 0.5, 0.8, 1.2], [0.4, 0.4, 0.4, 0.4])
-    @test m_adr isa bstm.LeafletMap
-
-    # 8. Leaflet Movement Dashboard (Combined Leaflet + Chart.js App)
-    result_mock = (au=au, transition_matrix=Gamma, opts=(hsi=hsi,), d_val=0.45, v_val=1.2)
-    m_dash = bstm.leaflet_movement_dashboard(result_mock, paths; hsi=hsi, strata=["West", "East", "West", "East"], title="Test Dashboard")
-    @test m_dash isa bstm.LeafletMap
-    @test occursin("dashboard-grid", m_dash.html_content)
-
-    # 9. HTML Persistence & save_plot / save_plots
-    tmp_html = joinpath(tempdir(), "test_leaflet_dash.html")
-    saved_html = bstm.save_plot(m_dash, tmp_html)
+    # 6. HTML Persistence & save_plot / save_plots
+    tmp_html = joinpath(tempdir(), "test_leaflet_st.html")
+    saved_html = bstm.save_plot(m_st, tmp_html)
     @test isfile(saved_html)
     @test filesize(saved_html) > 1000
     try; rm(saved_html; force=true); catch; end
@@ -219,31 +192,25 @@ end
     # Test save_plots with LeafletMap
     p_static = Plots.plot([1, 2], [3, 4])
     plots_bundle = (
-        dash = m_dash,
+        st_map = m_st,
         hsi_map = m_hsi,
         static_p = p_static
     )
     tmp_saved_dir = joinpath(tempdir(), "bstm_test_plots_export")
     saved_files = bstm.save_plots(plots_bundle, tmp_saved_dir)
     @test length(saved_files) == 3
-    @test any(f -> endswith(f, "dash.html"), saved_files)
+    @test any(f -> endswith(f, "st_map.html"), saved_files)
     @test any(f -> endswith(f, "hsi_map.html"), saved_files)
     @test any(f -> endswith(f, "static_p.png"), saved_files)
     try; rm(tmp_saved_dir; recursive=true, force=true); catch; end
 
-    # 10. Test mode=:leaflet flag across standard API functions
+    # 7. Test mode=:leaflet flag across standard API functions
     @test bstm.plot_hsi_choropleth(hsi, au; mode=:leaflet) isa bstm.LeafletMap
     @test bstm.plot_diffusion_map(0.5, au; mode=:leaflet) isa bstm.LeafletMap
     @test bstm.plot_residence_time_map(Gamma, au; mode=:leaflet) isa bstm.LeafletMap
     @test bstm.plot_advection_arrows(au; hsi=hsi, mode=:leaflet) isa bstm.LeafletMap
-    @test bstm.plot_tracks_on_map(paths, au; mode=:leaflet) isa bstm.LeafletMap
-    @test bstm.plot_movement_dashboard(result_mock, paths; mode=:leaflet) isa bstm.LeafletMap
     @test bstm.choropleth(polys, hsi; mode=:leaflet) isa bstm.LeafletMap
     @test bstm.spatial_graph_plot(au=au, mode=:leaflet) isa bstm.LeafletMap
-    @test bstm.plot_dispersal_kernel(Gamma, au; mode=:leaflet) isa bstm.LeafletMap
-    @test bstm.plot_step_length_distribution(paths, au; mode=:leaflet) isa bstm.LeafletMap
-    @test bstm.plot_regional_connectivity_matrix(C_reg; mode=:leaflet) isa bstm.LeafletMap
-    @test bstm.plot_ad_ratio_distribution([0.5, 1.0], [0.5, 0.5]; mode=:leaflet) isa bstm.LeafletMap
 end
 
 @testset "Model State & Results Persistence (JLD2 & DuckDB)" begin

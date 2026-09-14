@@ -124,12 +124,14 @@ function get_precomputes(m::PointProcess, M::NamedTuple, mod_data::Dict)::NamedT
         hyper_dict[:t_N] = get(M, :t_N, 1)
         
     elseif m.method == :sncp
-        if !hasproperty(M.data, :s_x) || !hasproperty(M.data, :s_y)
-            error("ShotNoiseCoxProcess (`:sncp`) requires continuous spatial coordinates `s_x` and `s_y` to define the domain.")
+        coord_cols = if haskey(mod_data, :variables) && length(mod_data[:variables]) >= 2
+            (Symbol(mod_data[:variables][1]), Symbol(mod_data[:variables][2]))
+        else
+            _detect_xy_columns(M.data)
         end
-        coords = M.data[!, [:s_x, :s_y]]
-        x_min, x_max = extrema(coords.s_x)
-        y_min, y_max = extrema(coords.s_y)
+        coords = M.data[!, [coord_cols[1], coord_cols[2]]]
+        x_min, x_max = extrema(coords[!, coord_cols[1]])
+        y_min, y_max = extrema(coords[!, coord_cols[2]])
         
         hyper_dict[:domain_bounds] = (x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max)
         hyper_dict[:areas] = get(M, :grid_areas, ones(M.s_N))

@@ -283,4 +283,145 @@ end
         )
         @test cfg_map_paired.nested_components[:proxy].mapping == data_hi_map.lo_idx
     end
+
+    @testset "Enhanced Multi-Fidelity Nesting & Coupling Architecture" begin
+        n_tier = 25
+        data_hi_enh = DataFrame(
+            y_hi = randn(n_tier),
+            x = randn(n_tier),
+            region = rand([:north, :south, :east], n_tier),
+            depth_stratum = rand([:shallow, :deep], n_tier),
+            temp = randn(n_tier)
+        )
+        data_mid_enh = DataFrame(
+            y_mid = randn(n_tier),
+            x = randn(n_tier),
+            region = rand([:north, :south, :east], n_tier),
+            depth_stratum = rand([:shallow, :deep], n_tier),
+            temp = randn(n_tier)
+        )
+        data_lo_enh = DataFrame(
+            y_lo = randn(n_tier),
+            x = randn(n_tier),
+            region = rand([:north, :south, :east], n_tier),
+            depth_stratum = rand([:shallow, :deep], n_tier),
+            temp = randn(n_tier)
+        )
+
+        # 1. Multi-Strata Factorial Resolution
+        res_single = bstm._resolve_nested_strata(data_hi_enh, :region)
+        @test res_single.n_strata == 3
+        @test length(res_single.strata_levels) == 3
+        @test length(res_single.strata_indices) == n_tier
+
+        res_multi = bstm._resolve_nested_strata(
+            data_hi_enh, [:region, :depth_stratum]
+        )
+        @test res_multi.n_strata == 6
+        @test length(res_multi.strata_levels) == 6
+        @test haskey(res_multi, :factor_dims)
+        @test res_multi.factor_dims[:region] == 3
+        @test res_multi.factor_dims[:depth_stratum] == 2
+        @test length(res_multi.factor_indices[:region]) == n_tier
+
+        # 2. Coupling Modes & ParamRegistry
+        cfg_mult = bstm.bstm_config(
+            :primary => (
+                formula = "likelihood(y_hi) ~ 1 + fixed(x) + transfer(:proxy)",
+                data = data_hi_enh
+            ),
+            :proxy => (
+                formula = "likelihood(y_lo) ~ 1 + fixed(x)",
+                data = data_lo_enh,
+                coupling = :multiplicative
+            )
+        )
+        @test cfg_mult.nested_components[:proxy].coupling == :multiplicative
+
+        cfg_mod = bstm.bstm_config(
+            :primary => (
+                formula = "likelihood(y_hi) ~ 1 + fixed(x) + transfer(:proxy)",
+                data = data_hi_enh
+            ),
+            :proxy => (
+                formula = "likelihood(y_lo) ~ 1 + fixed(x)",
+                data = data_lo_enh,
+                coupling = :moderated,
+                moderator = :temp
+            )
+        )
+        reg_mod = bstm.build_param_registry(cfg_mod)
+        @test haskey(reg_mod.descriptors, :rho_nested_proxy_0)
+        @test haskey(reg_mod.descriptors, :rho_nested_proxy_1)
+
+        cfg_tensor = bstm.bstm_config(
+            :primary => (
+                formula = "likelihood(y_hi) ~ 1 + fixed(x) + transfer(:proxy)",
+                data = data_hi_enh
+            ),
+            :proxy => (
+                formula = "likelihood(y_lo) ~ 1 + fixed(x)",
+                data = data_lo_enh,
+                coupling = :tensor,
+                strata = [:region, :depth_stratum]
+            )
+        )
+        reg_tensor = bstm.build_param_registry(cfg_tensor)
+        @test haskey(reg_tensor.descriptors, :rho_nested_proxy_region)
+        @test haskey(reg_tensor.descriptors, :rho_nested_proxy_depth_stratum)
+        @test reg_tensor.descriptors[:rho_nested_proxy_region].shape == (3,)
+        @test reg_tensor.descriptors[:rho_nested_proxy_depth_stratum].shape == (2,)
+
+        # 3. Hierarchical 3-Tier Cascading Assembly
+        cfg_3tier = bstm.bstm_config(
+            :primary => (
+                formula = "likelihood(y_hi) ~ 1 + fixed(x) + transfer(:mid)",
+                data = data_hi_enh
+            ),
+            :mid => (
+                formula = "likelihood(y_mid) ~ 1 + fixed(x) + transfer(:coarse)",
+                data = data_mid_enh
+            ),
+            :coarse => (
+                formula = "likelihood(y_lo) ~ 1 + fixed(x)",
+                data = data_lo_enh
+            )
+        )
+        @test haskey(cfg_3tier.nested_components, :mid)
+        @test haskey(cfg_3tier.nested_components[:mid].nested_components, :coarse)
+
+        reg_3tier = bstm.build_param_registry(cfg_3tier)
+        @test haskey(reg_3tier.descriptors, :rho_nested_mid)
+        @test haskey(reg_3tier.descriptors, :rho_nested_mid_coarse)
+        @test haskey(reg_3tier.descriptors, :intercept_mid_coarse)
+
+        code_3tier, _, _ = bstm.bstm_text_assembler(cfg_3tier, :model_3tier)
+        @test occursin("rho_nested_mid ~", code_3tier)
+        @test occursin("rho_nested_mid_coarse ~", code_3tier)
+        @test occursin("eta_sub_mid_coarse", code_3tier)
+        @test occursin("eta_sub_mid = eta_sub_mid .+ rho_nested_mid_coarse .* eta_sub_mid_coarse", code_3tier)
+        @test occursin("eta = eta .+ rho_nested_mid .* eta_sub_mid", code_3tier)
+
+        # 4. End-to-End Prior Sampling & Reconstruction
+        model_3tier = @bstm(
+            :primary => (
+                formula = likelihood(y_hi) ~ 1 + fixed(x) + transfer(:mid),
+                data = data_hi_enh
+            ),
+            :mid => (
+                formula = likelihood(y_mid) ~ 1 + fixed(x) + transfer(:coarse),
+                data = data_mid_enh
+            ),
+            :coarse => (
+                formula = likelihood(y_lo) ~ 1 + fixed(x),
+                data = data_lo_enh
+            )
+        )
+        chain_3tier = sample(model_3tier, Prior(), 5, progress=false)
+        res_3tier = bstm.reconstruct(chain_3tier, cfg_3tier)
+        @test all(isfinite, res_3tier.predictions_denoised.mean)
+        @test haskey(res_3tier.transfer_results, :mid)
+        @test haskey(res_3tier.transfer_results[:mid].transfer_results, :coarse)
+    end
 end
+

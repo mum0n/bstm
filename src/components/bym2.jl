@@ -89,15 +89,10 @@ function get_precomputes(m::BYM2, M::NamedTuple, mod_data::Dict)::NamedTuple
     end
 
     template = build_structure_template(:besag, s_N; W=M.W)
-    Q_template = template.matrix
-    
-    eig_decomp = eigen(Symmetric(Matrix(Q_template)))
-    U = eig_decomp.vectors
-    L = eig_decomp.values
-    scaling_factor = _compute_scaling_factor(L, 1)
-
-    Q_template_scaled = Q_template ./ scaling_factor
-    L_scaled = L ./ scaling_factor
+    Q_template_scaled = template.matrix
+    scaling_factor = template.scaling_factor
+    U = template.U
+    L_scaled = template.L
 
     F = cholesky(Symmetric(Matrix(Q_template_scaled) + M.noise * I))
 
@@ -147,10 +142,17 @@ function _bym2_log_marginal_likelihood(
     scale = sigma^2 + T_num(noise)
     
     # Prior covariance eigenvalues in spectral basis
+    max_λ = isempty(L_eig) ? one(T_num) : maximum(abs, L_eig)
+    tol = max(T_num(1e-10), T_num(1e-8) * max_λ)
     lambda_rho = Vector{T_num}(undef, s_N)
-    lambda_rho[1] = (one(T_num) - rho) + T_num(noise)
-    for j in 2:s_N
-        lambda_rho[j] = rho / (L_eig[j] + T_num(noise)) + (one(T_num) - rho) + T_num(noise)
+    for j in 1:s_N
+        if L_eig[j] <= tol
+            # Null space modes receive unstructured variance
+            lambda_rho[j] = (one(T_num) - rho) + T_num(noise)
+        else
+            lambda_rho[j] = rho / (L_eig[j] + T_num(noise)) +
+                            (one(T_num) - rho) + T_num(noise)
+        end
     end
     inv_lambda = one(T_num) ./ lambda_rho
     
