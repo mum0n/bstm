@@ -12,8 +12,9 @@ module bstm
     @reexport using Random 
     @reexport using Distributions
     @reexport using Turing
+    @reexport using DataFrames
     
-    @reexport using 
+    using 
         AbstractGPs, 
         AbstractMCMC,
         DynamicPPL,
@@ -21,13 +22,11 @@ module bstm
         GLM,
         StatsBase,
         Statistics, 
-        DataFrames,
         ADTypes,
         KernelAbstractions,
         Bijectors,
         CategoricalArrays,
         Clustering,
-        ColorSchemes,
         Dates,
         DelaunayTriangulation,
         DimensionalData,
@@ -51,7 +50,6 @@ module bstm
         OrderedCollections,
         PDMats,
         Printf,
-        Plots,
         PosteriorStats,
         Requires,
         SHA,
@@ -59,7 +57,6 @@ module bstm
         SpecialFunctions,
         StaticArrays,
         StatsModels,
-        StatsPlots,
         ForwardDiff,
         ReverseDiff,
         Enzyme,     
@@ -68,15 +65,41 @@ module bstm
         NNlib, 
         CoordRefSystems, 
         Unitful
-    # using Unitful: ustrip, @u_str
-    # using NearestNeighbors: KDTree, inrange, knn
-    # using SparseArrays: sparse, max.
-    # using Statistics: mean
-    # using LinearAlgebra: mul!, I
+
+    # Export thin wrappers for essential symbols from demoted packages
+    export plot, plot!, scatter, scatter!, heatmap, theme
+    export LatLon, Mercator, Cartesian
+    export mean, median, var, std, quantile, summarystats
+    export @u_str, ustrip
 
     srcdir = @__DIR__  # bstm/src
     rootdir = dirname(srcdir) # bstm
     docsdir = joinpath(rootdir, "docs") # bstm/docs
+
+    # Empty function stubs for BSTMPlotsExt extension
+    function bstm_plots end
+    function plot_spatial_surface end
+    function save_plots end
+    function plot_kde_simple end
+    function create_theme end
+    function choropleth end
+    function timeseries_ci end
+    function spatial_graph_plot end
+    function render_paths! end
+    function map_point_occupancy end
+    function save_plot end
+    function model_results_plots end
+    function plot_hsi_choropleth end
+    function plot_diffusion_map end
+    function plot_residence_time_map end
+    function plot_advection_arrows end
+    function plot_velocity_field end
+    function plot_hexagonal_field end
+    function plot_hydrodynamic_stratification end
+    function plot_hydrodynamic_diffusion end
+    function plot_hydrodynamic_section end
+    function par_credible_interval_plot end
+    function par_forest_plot end
 
     # Core framework files 
     include( "definitions.jl")  # must be first
@@ -86,17 +109,14 @@ module bstm
     include( "derivatives.jl")
     include( "hierarchical.jl") 
     include( "input_output.jl")
-    include( "circuit.jl")
-    include( "graph_wavelets.jl")
     include( "leaflet.jl")
     include( "likelihoods.jl")
     include( "model.jl")
     include( "parameters.jl")
     include( "partitioning.jl")
     include( "pipeline.jl")
-    include( "plotting.jl") 
     include( "reconstruction.jl")  
-    include("par.jl")
+    include( "par.jl")
 
     # component definitions
     components_dir = joinpath(srcdir, "components")
@@ -216,34 +236,6 @@ module bstm
         leaflet_advection_arrows, 
         leaflet_velocity_field,
         leaflet_spacetime_map,
-
-        # Circuit Theory & Ecological Connectivity exports
-        Circuit,
-        PosteriorCircuitResult,
-        build_circuit_laplacian,
-        effective_resistance_matrix,
-        solve_circuit_voltage,
-        pairwise_effective_resistance,
-        current_density_map,
-        identify_ecological_pinchpoints,
-        identify_stochastic_pinchpoints,
-        posterior_circuit_inference,
-        get_circuit_paths,
-        resistance_covariance_matrix,
-        leaflet_current_density_map,
-
-        # Spectral Graph Wavelets (SGWT) exports
-        GraphWavelet,
-        SpectralGraphWaveletResult,
-        build_normalized_laplacian,
-        compute_laplacian_spectral_bounds,
-        chebyshev_polynomial_coefficients,
-        apply_graph_spectral_filter,
-        spectral_graph_wavelet_transform,
-        inverse_spectral_graph_wavelet_transform,
-        denoise_spatial_signal_wavelet,
-        graph_wavelet_basis_matrix,
-        leaflet_graph_wavelet_dashboard,
 
         # Input / Output & Persistence exports
         save_bstm_model, 

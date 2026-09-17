@@ -1,6 +1,11 @@
 # ==============================================================================
 # BSTM Test Suite: Data Generator, Persistence (JLD2/DuckDB), Plots & Magnitude Validation
 # ==============================================================================
+using Dates
+using DataFrames
+using JLD2
+using DuckDB
+using Plots
 
 if !@isdefined(bstm_Likelihood)
     include(joinpath(@__DIR__, "test_helpers.jl"))

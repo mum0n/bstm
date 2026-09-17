@@ -1,6 +1,11 @@
 # ==============================================================================
 # BSTM Comprehensive Test Suite Orchestrator
 # ==============================================================================
+
+import Pkg
+Pkg.activate(joinpath(@__DIR__, ".."))
+Pkg.instantiate()
+
 # Usage:
 #   julia --project=. tests/runtests.jl                  # Run all test segments
 #   julia --project=. tests/runtests.jl fast             # Run ultra-fast unit tests

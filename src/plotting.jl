@@ -1420,7 +1420,7 @@ function plot_advection_arrows(
     return p
 end
 
-const plot_velocity_field = plot_advection_arrows
+plot_velocity_field(args...; kwargs...) = plot_advection_arrows(args...; kwargs...)
 
 # -----------------------------------------------------------------------------
 # Section 3: Timeseries & Regression Primitives

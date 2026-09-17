@@ -10372,11 +10372,7 @@ function process_dynamics_module!(
 
     # 1. Validate and set up spatial and temporal indices from formula arguments.
     if length(variables) < 2
-        s_var = if length(variables) == 1
-            Symbol(variables[1])
-        else
-            _detect_spatial_unit_column(data; allow_nothing=true)
-        end
+        s_var = _detect_spatial_unit_column(data; allow_nothing=true)
         t_var = _detect_time_column(data; allow_nothing=true)
 
         if !isnothing(s_var) && !isnothing(t_var)

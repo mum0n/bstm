@@ -1076,16 +1076,6 @@ function create_base_st_data(;
     return df, W, grid_areas
 end
 
-# Internal categorical draw — avoids importing Distributions in this file
-function _sample_categorical(p::AbstractVector{Float64}, rng::AbstractRNG)::Int
-    u    = rand(rng)
-    csum = 0.0
-    for (i, pi) in enumerate(p)
-        csum += pi
-        csum >= u && return i
-    end
-    return length(p)
-end
 
 
 
