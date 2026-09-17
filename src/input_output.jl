@@ -327,6 +327,9 @@ function save_bstm_results(
             df_samples = _chain_to_tidy_df(chain, model)
             _write_df_to_duckdb(con, df_samples, "$(pfx)posterior_samples", overwrite)
         end
+
+        # Explicitly flush and checkpoint storage blocks to disk with compression
+        DuckDB.query(con, "CHECKPOINT;")
     finally
         DuckDB.disconnect(con)
         DuckDB.close(db)
@@ -815,36 +818,6 @@ function save_out_of_sample_predictions(
     @info "Out-of-sample predictions saved to table '$table_name' in '$duckdb_path'."
 end
 
-"""
-    export_results_to_parquet(duckdb_path::AbstractString, table_name::AbstractString,
-                              output_parquet_path::AbstractString)
-
-Exports a DuckDB table to a high-speed compressed Parquet file using DuckDB's export engine.
-"""
-function export_results_to_parquet(
-    duckdb_path::AbstractString, 
-    table_name::AbstractString, 
-    output_parquet_path::AbstractString
-)
-    dir = dirname(output_parquet_path)
-    if !isempty(dir) && !isdir(dir)
-        mkpath(dir)
-    end
-
-    db = DuckDB.DB(duckdb_path)
-    con = DuckDB.connect(db)
-    try
-        # Escape path for SQL
-        clean_path = replace(output_parquet_path, "\\" => "/")
-        DuckDB.query(con, "COPY (SELECT * FROM $(table_name)) TO '$(clean_path)' (FORMAT " *
-          "PARQUET, COMPRESSION ZSTD)")
-    finally
-        DuckDB.disconnect(con)
-        DuckDB.close(db)
-    end
-    @info "Table '$table_name' exported to Parquet: '$output_parquet_path'."
-    return output_parquet_path
-end
 
 """
     export_results_to_csv(duckdb_path::AbstractString, table_name::AbstractString,

@@ -29,7 +29,7 @@ The `bstm` framework solves this with a **Two-Tier Decoupled Persistence Archite
 │  - Graph topology (W) & spatial metadata  │  - Parameter summaries & diagnostic metrics │
 │  - Raw MCMC posterior chains (FlexiChain) │  - Native WKT spatial geometries & GIS maps │
 │  - Warm-restart & chain extension engine  │  - Multi-model Bayesian Averaging (BMA)     │
-│  - Sequential Bayesian prior derivation   │  - Zero-copy Parquet / CSV export           │
+│  - Sequential Bayesian prior derivation   │  - Zero-copy CSV export                     │
 └───────────────────────────────────────────┴─────────────────────────────────────────────┘
 ```
 
@@ -65,7 +65,7 @@ The `bstm` framework solves this with a **Two-Tier Decoupled Persistence Archite
         ┌─────────────┴──────────────┐                ┌─────────────┴──────────────┐
         │  load_bstm_model()         │                │  query_duckdb()            │
         │  extend_sampling()         │                │  bma_weighted_predictions()│
-        │  extract_posterior_priors()│                │  export_to_parquet()       │
+        │  extract_posterior_priors()│                │  export_results_to_csv()   │
         │  (Resume / Prior Transfer) │                │  export_to_geojson()       │
         └────────────────────────────┘                └────────────────────────────┘
 ```
@@ -268,13 +268,7 @@ Computes Bayesian Model Averaged (BMA) predictions across all candidate models r
 
 ---
 
-### 4.6. Zero-Copy Parquet & CSV Export & Maintenance
-
-#### `export_results_to_parquet`
-```julia
-export_results_to_parquet(duckdb_path::AbstractString, table_name::AbstractString, output_parquet_path::AbstractString) -> String
-```
-Exports a DuckDB table to a high-speed compressed Parquet file using DuckDB's zero-copy export engine.
+### 4.6. CSV Export & Maintenance
 
 #### `export_results_to_csv`
 ```julia
@@ -377,15 +371,15 @@ display(first(df_bma, 5))
 
 ---
 
-### Workflow 4: Zero-Copy Parquet Export for Python / R Data Pipelines
+### Workflow 4: CSV Export for Python / R Data Pipelines
 
-Export high-volume posterior predictions and spatial effects to compressed Parquet files for
-downstream processing in Python (Polars / PyArrow) or R (arrow / sf):
+Export posterior predictions and spatial effects to CSV files for
+downstream processing in Python (Pandas / Polars) or R (readr / data.table):
 
 ```julia
-# Export specific tables directly from DuckDB to Parquet
-export_results_to_parquet("output/scot_model.duckdb", "predictions", "exports/predictions.parquet")
-export_results_to_parquet("output/scot_model.duckdb", "plot_data_sre_spatial", "exports/spatial_effects.parquet")
+# Export specific tables directly from DuckDB to CSV
+export_results_to_csv("output/scot_model.duckdb", "predictions", "exports/predictions.csv")
+export_results_to_csv("output/scot_model.duckdb", "plot_data_sre_spatial", "exports/spatial_effects.csv")
 
 # Compact and optimize database
 compact_duckdb("output/scot_model.duckdb")

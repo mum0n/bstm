@@ -3008,3 +3008,119 @@ function plot_hydrodynamic_section(
     return p
 end
 
+
+# -----------------------------------------------------------------------------
+# Section 10: Population Attributable Risk Plots
+# -----------------------------------------------------------------------------
+
+"""
+    par_credible_interval_plot(par_result::NamedTuple; title="PAF Estimate")
+"""
+function par_credible_interval_plot(par_result::NamedTuple; title="PAF Estimate")
+    y_pos = 1
+    label_text = "$(par_result.covariate) ($(par_result.family), ref=$(par_result.reference_population))"
+    p = Plots.plot(title=title, xlabel="Population Attributable Fraction (PAF)", ylabel="", legend=:topright, size=(700, 300))
+    Plots.plot!(p, [par_result.paf_lower, par_result.paf_upper], [y_pos, y_pos], linewidth=3, color=:steelblue, label="95% CI")
+    Plots.scatter!(p, [par_result.paf_mean], [y_pos], markersize=8, color=:darkblue, label="Posterior Mean", markerstrokewidth=0)
+    Plots.yticks!(p, [y_pos], [label_text])
+    return p
+end
+
+"""
+    par_forest_plot(par_results::Union{Dict, NamedTuple}; title="Forest Plot: PAF by Risk Factor")
+"""
+function par_forest_plot(par_results::Union{Dict, NamedTuple}; title="Forest Plot: PAF by Risk Factor")
+    results_dict = par_results isa NamedTuple ? Dict(String(k) => v for (k, v) in pairs(par_results)) : par_results
+    valid_results = Dict(k => v for (k, v) in results_dict if v isa NamedTuple && !isnan(v.paf_mean))
+    isempty(valid_results) && return nothing
+    cov_names = sort(collect(keys(valid_results)))
+    n_cov = length(cov_names)
+    means = [valid_results[c].paf_mean for c in cov_names]
+    lowers = [valid_results[c].paf_lower for c in cov_names]
+    uppers = [valid_results[c].paf_upper for c in cov_names]
+    p = Plots.plot(title=title, xlabel="Population Attributable Fraction (PAF)", ylabel="", legend=false, size=(700, 300 + 50 * n_cov))
+    for (i, cov) in enumerate(reverse(cov_names))
+        y = n_cov + 1 - i
+        Plots.plot!(p, [lowers[n_cov + 1 - i], uppers[n_cov + 1 - i]], [y, y], linewidth=2, color=:steelblue, label="")
+        Plots.scatter!(p, [means[n_cov + 1 - i]], [y], markersize=7, color=:darkblue, label="", markerstrokewidth=0)
+    end
+    Plots.yticks!(p, 1:n_cov, reverse(cov_names))
+    return p
+end
+
+
+# -----------------------------------------------------------------------------
+# Section 11: Bayesian Diagnostics & Advanced Spatiotemporal Plots
+# -----------------------------------------------------------------------------
+
+"""
+    plot_ppc(y_observed::AbstractVector, y_rep_matrix::AbstractMatrix; num_draws::Int=50, title="Posterior Predictive Check", kwargs...)
+Overlays the density of the observed data against draws from the posterior predictive distribution.
+"""
+function plot_ppc(y_observed::AbstractVector, y_rep_matrix::AbstractMatrix; num_draws::Int=50, title="Posterior Predictive Check", kwargs...)
+    p = Plots.plot(title=title, xlabel="Value", ylabel="Density", legend=true; kwargs...)
+    n_samples = size(y_rep_matrix, 2)
+    draws = min(n_samples, num_draws)
+    indices = sample(1:n_samples, draws, replace=false)
+    for i in indices
+        StatsPlots.density!(p, y_rep_matrix[:, i], color=:lightblue, alpha=0.3, linewidth=1, label= i == indices[1] ? "y_rep" : "")
+    end
+    StatsPlots.density!(p, y_observed, color=:black, linewidth=2, label="Observed y")
+    return p
+end
+
+"""
+    plot_prior_vs_posterior(prior_dist::Distribution, posterior_samples::AbstractVector; title="Prior vs Posterior", param_name="Parameter", kwargs...)
+Visualizes how much the posterior distribution shifted from the prior.
+"""
+function plot_prior_vs_posterior(prior_dist::Distribution, posterior_samples::AbstractVector; title="Prior vs Posterior", param_name="Parameter", kwargs...)
+    p = Plots.plot(title=title, xlabel=param_name, ylabel="Density"; kwargs...)
+    StatsPlots.density!(p, posterior_samples, color=:steelblue, linewidth=2, label="Posterior", fill=(0, 0.3, :steelblue))
+    Plots.plot!(p, prior_dist, color=:darkred, linewidth=2, label="Prior", linestyle=:dash)
+    return p
+end
+
+"""
+    plot_marginal_effects(x_range::AbstractVector, mean_pred::AbstractVector, lower_pred::AbstractVector, upper_pred::AbstractVector; covariate_name="Covariate", outcome_name="Response", title="Marginal Effect", kwargs...)
+Plots the predicted outcome given a covariate, with 95% credible intervals.
+"""
+function plot_marginal_effects(x_range::AbstractVector, mean_pred::AbstractVector, lower_pred::AbstractVector, upper_pred::AbstractVector; covariate_name="Covariate", outcome_name="Response", title="Marginal Effect", kwargs...)
+    p = Plots.plot(title=title, xlabel=covariate_name, ylabel=outcome_name, legend=false; kwargs...)
+    Plots.plot!(p, x_range, mean_pred, ribbon=(mean_pred .- lower_pred, upper_pred .- mean_pred), fillalpha=0.3, color=:royalblue, linewidth=2)
+    return p
+end
+
+"""
+    plot_spatial_residuals(polygons::AbstractVector, observed::AbstractVector, predicted::AbstractVector; title="Spatial Residuals", mode=:static, kwargs...)
+Choropleth mapping of the residuals (observed - predicted) using a diverging colormap.
+"""
+function plot_spatial_residuals(polygons::AbstractVector, observed::AbstractVector, predicted::AbstractVector; title="Spatial Residuals", mode=:static, kwargs...)
+    residuals = observed .- predicted
+    if mode == :leaflet
+        return leaflet_choropleth(polygons, residuals; title=title, colorscheme=:RdBu_11, kwargs...)
+    else
+        return choropleth(polygons, residuals; title=title, colorscheme=:RdBu_11, kwargs...)
+    end
+end
+
+"""
+    plot_spatiotemporal_facets(polygons::AbstractVector, values_matrix::AbstractMatrix, time_labels::AbstractVector; title="Spatiotemporal Evolution", colorscheme=:viridis, kwargs...)
+Generates a grid of small multiples for spatial evolution over time.
+"""
+function plot_spatiotemporal_facets(polygons::AbstractVector, values_matrix::AbstractMatrix, time_labels::AbstractVector; title="Spatiotemporal Evolution", colorscheme=:viridis, kwargs...)
+    n_times = length(time_labels)
+    plots = Plots.Plot[]
+    v_min = minimum(skipmissing(values_matrix))
+    v_max = maximum(skipmissing(values_matrix))
+    for t in 1:n_times
+        vals = values_matrix[:, t]
+        # Note: colorbar is only rendered on the last subplot to reduce clutter
+        p_t = choropleth(polygons, vals; title=string(time_labels[t]), colorscheme=colorscheme, clims=(v_min, v_max), colorbar=(t==n_times), kwargs...)
+        push!(plots, p_t)
+    end
+    r = ceil(Int, sqrt(n_times))
+    c = ceil(Int, n_times / r)
+    layout = Plots.grid(r, c)
+    return Plots.plot(plots..., layout=layout, plot_title=title, size=(r*300, c*300))
+end
+

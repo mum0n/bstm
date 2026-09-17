@@ -51,7 +51,7 @@ The `bstm` framework translates high-level domain formulas into optimized, diffe
                                                            ▼
                                ┌────────────────────────────────────────────────────────┐
                                │  Persistence & SQL Analytics: save_bstm_bundle / DuckDB│
-                               │  (JLD2 live models, DuckDB tables, GeoJSON, Parquet)   │
+                               │  (JLD2 live models, DuckDB tables, GeoJSON, CSV)       │
                                └────────────────────────────────────────────────────────┘
 ```
 
@@ -1001,7 +1001,6 @@ The `bstm` framework provides a high-performance, non-redundant serialization an
 | `save_model_ensemble`                  | `save_model_ensemble(duckdb_path, ensemble_dict; overwrite=true)`                                                          | Registers a multi-model ensemble in DuckDB and computes $\Delta \text{WAIC}$ and BMA weights.                                                                      |
 | `bma_weighted_predictions`             | `bma_weighted_predictions(duckdb_path)`                                                                                    | Computes Bayesian Model Averaged predictions and total variance across all candidate models.                                                                       |
 | `save_out_of_sample_predictions`       | `save_out_of_sample_predictions(duckdb_path, pred_df; table_name="out_of_sample_predictions")`                             | Stores out-of-sample prediction DataFrames into DuckDB.                                                                                                            |
-| `export_results_to_parquet`            | `export_results_to_parquet(duckdb_path, table_name, output_parquet_path)`                                                  | Zero-copy compressed Parquet export using DuckDB `COPY`.                                                                                                           |
 | `export_results_to_csv`                | `export_results_to_csv(duckdb_path, table_name, output_csv_path)`                                                          | Exports DuckDB table to CSV.                                                                                                                                       |
 | `compact_duckdb`                       | `compact_duckdb(duckdb_path)`                                                                                              | Executes `VACUUM; ANALYZE;` on DuckDB database to reclaim space and optimize query statistics.                                                                     |
 

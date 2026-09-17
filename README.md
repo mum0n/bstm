@@ -59,7 +59,7 @@ m = @bstm(
   Introspects parameter supports and constructs composite Gibbs samplers assigning `PG` to discrete variables, `ESS` to Gaussian latent vectors, `Slice` to bounded parameters, and `NUTS` to continuous blocks.
 - **Two-Tier Model Persistence & Analytical SQL Engine (`src/input_output.jl`)**:
   - **Tier 1 (JLD2)**: Full binary serialization of live callable Turing models (`m`), configurations, data, and MCMC chains (`chn`).
-  - **Tier 2 (DuckDB)**: Embedded relational SQL database storing normalized metrics, parameter statistics, predictions, WKT spatial geometries, and diagnostic plot data for zero-copy querying, multi-model Bayesian Model Averaging (BMA), sequential prior extraction, and Parquet/GeoJSON export.
+  - **Tier 2 (DuckDB)**: Embedded relational SQL database storing normalized metrics, parameter statistics, predictions, WKT spatial geometries, and diagnostic plot data for zero-copy querying, multi-model Bayesian Model Averaging (BMA), sequential prior extraction, and CSV/GeoJSON export.
 - **Diagnostics, Post-Processing & Visualization (`src/plotting.jl`)**:
   One-line extraction of posterior credible intervals, predictive error metrics (RMSE, $R^2$, DIC, WAIC), spatial choropleth maps (`choropleth`), spatial adjacency graphs (`spatial_graph_plot`), animal movement paths (`render_paths!`), and timeseries ribbons (`timeseries_ci`).
 - **Spatial Block Cross-Validation (`bstm_cv_orchestrator`)**:

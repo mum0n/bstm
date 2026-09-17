@@ -100,6 +100,11 @@ module bstm
     function plot_hydrodynamic_section end
     function par_credible_interval_plot end
     function par_forest_plot end
+    function plot_ppc end
+    function plot_prior_vs_posterior end
+    function plot_marginal_effects end
+    function plot_spatial_residuals end
+    function plot_spatiotemporal_facets end
 
     # Core framework files 
     include( "definitions.jl")  # must be first
@@ -256,7 +261,6 @@ module bstm
         save_model_ensemble, 
         bma_weighted_predictions, 
         save_out_of_sample_predictions,
-        export_results_to_parquet, 
         export_results_to_csv, 
         compact_duckdb,
 

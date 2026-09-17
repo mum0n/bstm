@@ -318,12 +318,9 @@ end
     @test nrow(df_bma) == 25
     @test "bma_pred_mean" in names(df_bma)
 
-    # 8. Test Parquet & CSV Export
-    pq_path = joinpath(temp_dir, "predictions.parquet")
+    # 8. Test CSV Export
     csv_path = joinpath(temp_dir, "predictions.csv")
-    export_results_to_parquet(duckdb_path, "predictions", pq_path)
     export_results_to_csv(duckdb_path, "predictions", csv_path)
-    @test isfile(pq_path)
     @test isfile(csv_path)
 
     # 9. Test DuckDB Compaction
