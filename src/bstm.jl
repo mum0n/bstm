@@ -9,6 +9,8 @@ module bstm
     # directly available when 'using bstm'.
     using Reexport
 
+    import Base: union, union!, intersect, setdiff
+
     @reexport using Random 
     @reexport using Distributions
     @reexport using Turing
@@ -78,6 +80,7 @@ module bstm
 
     # Empty function stubs for BSTMPlotsExt extension
     function bstm_plots end
+    function _bstm_plots_impl end
     function plot_spatial_surface end
     function save_plots end
     function plot_kde_simple end

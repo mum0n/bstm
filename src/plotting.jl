@@ -467,6 +467,10 @@ function _reconstruct_spatial_surface(
     c_mat = Matrix{Float64}(coords)
     v_vec = vec(collect(Float64, values))
 
+    if size(c_mat, 1) != length(v_vec)
+        throw(DimensionMismatch("Coordinates rows ($(size(c_mat, 1))) and values length ($(length(v_vec))) must match in _reconstruct_spatial_surface."))
+    end
+
     # Mask NaNs and non-finite entries
     valid_mask = .!isnan.(v_vec) .& .!isnan.(c_mat[:, 1]) .& .!isnan.(c_mat[:, 2])
     c_clean = c_mat[valid_mask, :]
@@ -1924,11 +1928,23 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
                     plots[plot_key] = p
                     plots[:spatial] = p
                     plots[Symbol("smooth_$(key)")] = p
-                    if !isnothing(coords_detected)
-                        recon_p = _reconstruct_spatial_surface(coords_detected, vec(main_effect_summary.mean))
-                        plots_data[plot_key] = (grid_x=recon_p.grid_x, grid_y=recon_p.grid_y, surface=recon_p.surface, values=vec(main_effect_summary.mean), coordinates=coords_detected)
+                    if !isnothing(coords_detected) &&
+                       size(coords_detected, 1) == length(main_effect_summary.mean)
+                        recon_p = _reconstruct_spatial_surface(
+                            coords_detected, vec(main_effect_summary.mean)
+                        )
+                        plots_data[plot_key] = (
+                            grid_x = recon_p.grid_x,
+                            grid_y = recon_p.grid_y,
+                            surface = recon_p.surface,
+                            values = vec(main_effect_summary.mean),
+                            coordinates = coords_detected
+                        )
                     else
-                        plots_data[plot_key] = (values=vec(main_effect_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                        plots_data[plot_key] = (
+                            values = vec(main_effect_summary.mean),
+                            geometry = isnothing(polygons) ? centroids : polygons
+                        )
                     end
                     plots_data[:spatial] = plots_data[plot_key]
                 end
@@ -1940,11 +1956,23 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
                     if !isnothing(p_struct)
                         plot_key_struct = Symbol("structured_$(key)")
                         plots[plot_key_struct] = p_struct
-                        if !isnothing(coords_detected)
-                            recon_p = _reconstruct_spatial_surface(coords_detected, vec(struct_summary.mean))
-                            plots_data[plot_key_struct] = (grid_x=recon_p.grid_x, grid_y=recon_p.grid_y, surface=recon_p.surface, values=vec(struct_summary.mean), coordinates=coords_detected)
+                        if !isnothing(coords_detected) &&
+                           size(coords_detected, 1) == length(struct_summary.mean)
+                            recon_p = _reconstruct_spatial_surface(
+                                coords_detected, vec(struct_summary.mean)
+                            )
+                            plots_data[plot_key_struct] = (
+                                grid_x = recon_p.grid_x,
+                                grid_y = recon_p.grid_y,
+                                surface = recon_p.surface,
+                                values = vec(struct_summary.mean),
+                                coordinates = coords_detected
+                            )
                         else
-                            plots_data[plot_key_struct] = (values=vec(struct_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                            plots_data[plot_key_struct] = (
+                                values = vec(struct_summary.mean),
+                                geometry = isnothing(polygons) ? centroids : polygons
+                            )
                         end
                     end
                 end
@@ -1955,11 +1983,23 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
                     if !isnothing(p_unstruct)
                         plot_key_unstruct = Symbol("unstructured_$(key)")
                         plots[plot_key_unstruct] = p_unstruct
-                        if !isnothing(coords_detected)
-                            recon_p = _reconstruct_spatial_surface(coords_detected, vec(unstruct_summary.mean))
-                            plots_data[plot_key_unstruct] = (grid_x=recon_p.grid_x, grid_y=recon_p.grid_y, surface=recon_p.surface, values=vec(unstruct_summary.mean), coordinates=coords_detected)
+                        if !isnothing(coords_detected) &&
+                           size(coords_detected, 1) == length(unstruct_summary.mean)
+                            recon_p = _reconstruct_spatial_surface(
+                                coords_detected, vec(unstruct_summary.mean)
+                            )
+                            plots_data[plot_key_unstruct] = (
+                                grid_x = recon_p.grid_x,
+                                grid_y = recon_p.grid_y,
+                                surface = recon_p.surface,
+                                values = vec(unstruct_summary.mean),
+                                coordinates = coords_detected
+                            )
                         else
-                            plots_data[plot_key_unstruct] = (values=vec(unstruct_summary.mean), geometry=isnothing(polygons) ? centroids : polygons)
+                            plots_data[plot_key_unstruct] = (
+                                values = vec(unstruct_summary.mean),
+                                geometry = isnothing(polygons) ? centroids : polygons
+                            )
                         end
                     end
                 end

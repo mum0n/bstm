@@ -7289,8 +7289,8 @@ function get_optimal_sampler(
     # Normalize sampler map
     norm_sampler_map = _normalize_sampler_map(sampler_map)
 
-    # Inspect VarInfo and extract variables
-    vi = DynamicPPL.VarInfo(model_obj)
+    # Inspect VarInfo and extract variables using invokelatest to guard world age
+    vi = Base.invokelatest(DynamicPPL.VarInfo, model_obj)
     vns = keys(vi)
     num_params = length(vns)
 
@@ -7995,7 +7995,7 @@ function bstm_sample(model, sampler, n_samples; n_chains::Int=1, kwargs...)
     local chain
 
     @info "Running $(n_chains) chain(s) using MCMCThreads() backend."
-    chain = sample(model, sampler, MCMCThreads(), n_samples, n_chains; kwargs...)
+    chain = Base.invokelatest(sample, model, sampler, MCMCThreads(), n_samples, n_chains; kwargs...)
 
     return chain
 end

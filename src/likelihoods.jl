@@ -153,20 +153,22 @@ function get_dist_ref(::InverseWishartFamily, d, eta, sig, obs_idx::Int=1)
 end
 
 function get_dist_ref(::GaussianFamily, d, eta::V, sig::S, obs_idx::Int=1) where {V<:Real, S<:Real}
+    T = promote_type(V, S)
     if isnan(eta) || isinf(eta)
-        return Normal(0.0, 1.0)
+        return Normal(zero(T), one(T))
     end
     sig_val = _get_obs(sig, obs_idx)
-    return Normal(eta, V(sig_val) + V(1e-9))
+    return Normal(T(eta), T(sig_val) + T(1e-9))
 end
 
 function get_dist_ref(::LogNormalFamily, d, eta::V, sig::S, obs_idx::Int=1) where {V<:Real, S<:Real}
+    T = promote_type(V, S)
     if isnan(eta) || isinf(eta)
-        return LogNormal(0.0, 1.0)
+        return LogNormal(zero(T), one(T))
     end
     sig_val = _get_obs(sig, obs_idx)
-    mu = clamp(eta - (V(sig_val)^2) / V(2.0), V(-30.0), V(30.0))
-    return LogNormal(mu, V(sig_val) + V(1e-9))
+    mu = clamp(T(eta) - (T(sig_val)^2) / T(2.0), T(-30.0), T(30.0))
+    return LogNormal(mu, T(sig_val) + T(1e-9))
 end
 
 function get_dist_ref(::NegativeBinomialFamily, d, eta::V, sig, obs_idx::Int=1) where {V<:Real}
