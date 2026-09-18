@@ -206,6 +206,12 @@ module bstm
         get_param_samples,
         get_descriptors_by_role,
         get_effects,
+
+        # Model Architecture taxonomy
+        AbstractModelArchitecture,
+        UnivariateArchitecture,
+        MultivariateArchitecture,
+        MultifidelityArchitecture,
  
         create_theme, 
         choropleth, 

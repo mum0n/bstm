@@ -9928,8 +9928,11 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
                                      node2.module_type == :random && get(node2.args,
                                          :structure, :none) == :spatial
 
-        is_svc = node1.module_type == :fixed && node2.module_type == :random && get(node2.args,
-            :structure, :none) == :spatial
+        is_svc = node1.module_type == :fixed && node2.module_type == :random && (
+            get(node2.args, :structure, :none) == :spatial ||
+            (get(node2.args, :structure, :none) == :smooth &&
+             length(get(node2.args, :positional_args, [])) >= 2)
+        )
         is_tvc = node1.module_type == :fixed && node2.module_type == :random && get(node2.args,
             :structure, :none) == :temporal
         is_svar = node1.module_type == :random && get(node1.args, :structure,
@@ -9976,6 +9979,7 @@ function process_interact_module!(opt_dict, mod_data, registries, hyperpriors)
             mod_data[:type] = :svc
             mod_data[:variables] = [covariate_name, spatial_vars...]
             mod_data[:params][:covariate] = covariate_name
+            mod_data[:params][:positional_args] = spatial_vars
             mod_data[:params][:spatial_model_spec] = spatial_node
             
             inner_comp_type = Symbol(get(spatial_node.args, :model, :icar))

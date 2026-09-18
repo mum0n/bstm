@@ -72,11 +72,19 @@ function get_precomputes(m::TVC, M::NamedTuple, mod_data::Dict)::NamedTuple
         error("Covariate ':$cov_var' for TVC model '$(mod_data[:key])' not found in data.")
     end
 
-    # The inner model's variables are the main variables of the TVC component
+    # The inner model's variables are the temporal coordinates (excluding the covariate)
+    inner_vars = filter(v -> Symbol(v) != cov_var, mod_data[:variables])
+    inner_params = if haskey(mod_data[:params], :temporal_model_spec) &&
+                      hasproperty(mod_data[:params][:temporal_model_spec], :args)
+        merge(Dict{Symbol, Any}(mod_data[:params][:temporal_model_spec].args), Dict{Symbol, Any}(mod_data[:params]))
+    else
+        Dict{Symbol, Any}(mod_data[:params])
+    end
+
     inner_mod_data = Dict(
         :key => Symbol("$(mod_data[:key])_inner"),
-        :variables => mod_data[:variables],
-        :params => mod_data[:params]
+        :variables => inner_vars,
+        :params => inner_params
     )
     
     inner_precomputes = get_precomputes(m.model, M, inner_mod_data)

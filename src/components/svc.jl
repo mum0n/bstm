@@ -68,11 +68,19 @@ function get_precomputes(m::SVC, M::NamedTuple, mod_data::Dict)::NamedTuple
         error("Covariate ':$cov_var' for SVC model '$(mod_data[:key])' not found in data.")
     end
 
-    # The inner model's variables are the main variables of the SVC component
+    # The inner model's variables are the spatial coordinates (excluding the covariate)
+    inner_vars = filter(v -> Symbol(v) != cov_var, mod_data[:variables])
+    inner_params = if haskey(mod_data[:params], :spatial_model_spec) &&
+                      hasproperty(mod_data[:params][:spatial_model_spec], :args)
+        merge(Dict{Symbol, Any}(mod_data[:params][:spatial_model_spec].args), Dict{Symbol, Any}(mod_data[:params]))
+    else
+        Dict{Symbol, Any}(mod_data[:params])
+    end
+
     inner_mod_data = Dict(
         :key => Symbol("$(mod_data[:key])_inner"),
-        :variables => mod_data[:variables],
-        :params => mod_data[:params]
+        :variables => inner_vars,
+        :params => inner_params
     )
     
     inner_precomputes = get_precomputes(m.model, M, inner_mod_data)
@@ -171,12 +179,19 @@ function get_effects(
     # --- Construct inner specification ---
     # This creates the specification required to call the inner model's methods.
     inner_spec_key = Symbol("$(spec.key)_inner")
+    inner_params = if haskey(spec.params, :spatial_model_spec) &&
+                      hasproperty(spec.params[:spatial_model_spec], :args)
+        merge(Dict{Symbol, Any}(spec.params[:spatial_model_spec].args), Dict{Symbol, Any}(spec.params))
+    else
+        Dict{Symbol, Any}(spec.params)
+    end
+
     inner_spec = (
         key = inner_spec_key,
         structure = get_component_structure(m.model),
         var = spec.var,
         component_obj = m.model,
-        params = spec.params,
+        params = inner_params,
         hyper = spec.hyper.inner_precomputes
     )
 

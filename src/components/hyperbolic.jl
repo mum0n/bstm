@@ -101,7 +101,7 @@ function get_priors(
     
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)")
     
     return join(priors, "\n    ")
 end

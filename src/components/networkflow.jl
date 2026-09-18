@@ -125,7 +125,7 @@ function get_priors(
 
     push!(priors, "$(p_names.beta) ~ $(_distribution_to_string(m.beta))")
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.ure))")
+    push!(priors, "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(spec.hyper.n_latent)), I), :$(p_names.ure))")
 
     return join(priors, "\n    ")
 end

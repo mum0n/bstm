@@ -12,6 +12,8 @@ end
 
 using DynamicPPL
 using Plots
+using StatsPlots
+using ColorSchemes
 using Distributions
 using LinearAlgebra
 using DataFrames

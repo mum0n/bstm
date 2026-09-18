@@ -672,46 +672,158 @@ end
 # ==============================================================================
 
 """
-    _generic_ad_surface_derivatives(model_obj, chain, coords_mat, radii; n_samples=nothing)
+    _generic_ad_surface_derivatives(
+        model_obj, chain, coords_mat, radii;
+        spatial_spec=nothing, n_samples=nothing
+    )
 
-Evaluates surface derivatives via ForwardDiff dual numbers for general spatial
-models (`PSpline`, `BSpline`, `TPS`, `GP`).
+Evaluates surface derivatives via finite-difference dual evaluations across the
+full model predictor for continuous spatial models, including:
+`PSpline`, `BSpline`, `TPS`, `GP`, `Nystrom`, `FITC`, `SparseGP`, `Barycentric`,
+`AdaptiveSmooth`, `SVC`, `TensorProductSmooth`, `Warp`, and `NNGP`.
+
+# Mathematical Formulation
+Given spatial evaluation points \$s = (x, y)\$, gradient vectors and Hessian matrices
+are approximated via central difference stencils:
+\$\\frac{\\partial z}{\\partial x} \\approx \\frac{z(x+h, y) - z(x-h, y)}{2h}\$
+\$\\frac{\\partial^2 z}{\\partial x^2} \\approx \\frac{z(x+h, y) - 2z(x, y) + z(x-h, y)}{h^2}\$
+\$\\frac{\\partial^2 z}{\\partial x \\partial y} \\approx \\frac{z(x+h, y+h) - z(x+h, y-h) - z(x-h, y+h) + z(x-h, y-h)}{4h^2}\$
+where step size \$h\$ scales with domain diameter.
+
+For Spatially Varying Coefficients (`SVC`), the associated covariate is set to 1.0,
+yielding the spatial coefficient surface \$\\beta(s)\$ and its directional derivatives.
+
+# Arguments
+- `model_obj::DynamicPPL.Model`: Fitted model object.
+- `chain`: Posterior MCMC realizations.
+- `coords_mat::Matrix{Float64}`: Query coordinates `[N, 2]`.
+- `radii::Vector{Float64}`: Neighborhood radius/radii for circular BPI.
+- `spatial_spec::Union{NamedTuple, Nothing}`: Identified spatial component specification.
+- `n_samples::Union{Int, Nothing}`: Maximum posterior samples to draw.
+
+# Returns
+A NamedTuple containing realization matrices `(z, zx, zy, zxx, zyy, zxy, bpi)`.
 """
 function _generic_ad_surface_derivatives(
-    model_obj::DynamicPPL.Model, chain::Any, coords_mat::Matrix{Float64},
-    radii::Vector{Float64}; n_samples::Union{Int, Nothing}=nothing
+    model_obj::DynamicPPL.Model,
+    chain::Any,
+    coords_mat::Matrix{Float64},
+    radii::Vector{Float64};
+    spatial_spec::Union{NamedTuple, Nothing}=nothing,
+    n_samples::Union{Int, Nothing}=nothing
 )
     N_pts = size(coords_mat, 1)
+    M = model_obj.args.M
 
-    # Sample predictions across target coordinates
-    target_df = DataFrame(s_x = coords_mat[:, 1], s_y = coords_mat[:, 2])
-    pred_res = bstm.predict(model_obj, chain, target_df)
+    # 1. Resolve coordinate variable names from spatial component or model metadata
+    x_var = :s_x
+    y_var = :s_y
+    if !isnothing(spatial_spec) && haskey(spatial_spec.params, :positional_args)
+        pargs = spatial_spec.params[:positional_args]
+        if length(pargs) >= 2
+            x_var = Symbol(pargs[1])
+            y_var = Symbol(pargs[2])
+        end
+    elseif haskey(M, :s_coords_vars) && length(M.s_coords_vars) >= 2
+        x_var = Symbol(M.s_coords_vars[1])
+        y_var = Symbol(M.s_coords_vars[2])
+    elseif haskey(M, :data) && M.data isa DataFrame
+        if hasproperty(M.data, :s_x) && hasproperty(M.data, :s_y)
+            x_var = :s_x
+            y_var = :s_y
+        elseif hasproperty(M.data, :x) && hasproperty(M.data, :y)
+            x_var = :x
+            y_var = :y
+        end
+    end
 
-    z_mean = pred_res.predictions_denoised.mean
+    # 2. Identify required covariates or auxiliary columns
+    extra_cols = Dict{Symbol, Any}()
+    if !isnothing(spatial_spec) && spatial_spec.component_obj isa SVC
+        cov_var = spatial_spec.component_obj.covariate
+        if cov_var != Symbol("1") && cov_var != :intercept
+            extra_cols[cov_var] = fill(1.0, N_pts)
+        end
+    end
+
+    # Populate baseline values for other columns from training data if present
+    if haskey(M, :data) && M.data isa DataFrame
+        y_var_name = haskey(M, :y_var) ? Symbol(M.y_var) : :nothing
+        for col_name in propertynames(M.data)
+            sym_col = Symbol(col_name)
+            if sym_col != x_var && sym_col != y_var && sym_col != :s_x &&
+               sym_col != :s_y && sym_col != y_var_name && !haskey(extra_cols, sym_col)
+                col_vals = M.data[!, sym_col]
+                rep_val = if eltype(col_vals) <: Real
+                    median(skipmissing(col_vals))
+                else
+                    first(col_vals)
+                end
+                extra_cols[sym_col] = fill(rep_val, N_pts)
+            end
+        end
+    end
+
+    function _build_eval_df(dx::Float64, dy::Float64)
+        df = DataFrame(
+            x_var => coords_mat[:, 1] .+ dx,
+            y_var => coords_mat[:, 2] .+ dy
+        )
+        if x_var != :s_x && !hasproperty(df, :s_x)
+            df[!, :s_x] = df[!, x_var]
+        end
+        if y_var != :s_y && !hasproperty(df, :s_y)
+            df[!, :s_y] = df[!, y_var]
+        end
+        for (col, val) in extra_cols
+            if !hasproperty(df, col)
+                df[!, col] = val
+            end
+        end
+        return df
+    end
+
+    # Baseline prediction at query points
+    target_df = _build_eval_df(0.0, 0.0)
     total_chain_samples = size(chain, 1) * (chain isa VNChain ? 1 : size(chain, 3))
     S = isnothing(n_samples) ? min(50, total_chain_samples) : min(n_samples, total_chain_samples)
 
-    # 2D Finite-difference epsilon for curvature stability on arbitrary basis matrices
-    h = 0.01 * sqrt(sum((maximum(coords_mat, dims=1) .- minimum(coords_mat, dims=1)).^2) / N_pts)
+    pred_res = bstm.predict(model_obj, chain, target_df; n_samples=S)
+    z_mean = pred_res.predictions_denoised.mean
+    has_samples = !isnothing(pred_res.predictions_denoised.samples)
+
+    # 2D Finite-difference step size for curvature stability
+    coord_spans = maximum(coords_mat, dims=1) .- minimum(coords_mat, dims=1)
+    span_norm = sqrt(sum(coord_spans .^ 2))
+    h = span_norm > 0.0 ? 0.01 * (span_norm / sqrt(N_pts)) : 0.01
     h = max(h, 1e-4)
 
-    df_x_plus = DataFrame(s_x = coords_mat[:, 1] .+ h, s_y = coords_mat[:, 2])
-    df_x_minus = DataFrame(s_x = coords_mat[:, 1] .- h, s_y = coords_mat[:, 2])
-    df_y_plus = DataFrame(s_x = coords_mat[:, 1], s_y = coords_mat[:, 2] .+ h)
-    df_y_minus = DataFrame(s_x = coords_mat[:, 1], s_y = coords_mat[:, 2] .- h)
-    df_diag_pp = DataFrame(s_x = coords_mat[:, 1] .+ h, s_y = coords_mat[:, 2] .+ h)
-    df_diag_pm = DataFrame(s_x = coords_mat[:, 1] .+ h, s_y = coords_mat[:, 2] .- h)
-    df_diag_mp = DataFrame(s_x = coords_mat[:, 1] .- h, s_y = coords_mat[:, 2] .+ h)
-    df_diag_mm = DataFrame(s_x = coords_mat[:, 1] .- h, s_y = coords_mat[:, 2] .- h)
+    df_xp = _build_eval_df(+h, 0.0)
+    df_xm = _build_eval_df(-h, 0.0)
+    df_yp = _build_eval_df(0.0, +h)
+    df_ym = _build_eval_df(0.0, -h)
+    df_pp = _build_eval_df(+h, +h)
+    df_pm = _build_eval_df(+h, -h)
+    df_mp = _build_eval_df(-h, +h)
+    df_mm = _build_eval_df(-h, -h)
 
-    p_xp = bstm.predict(model_obj, chain, df_x_plus).predictions_denoised.mean
-    p_xm = bstm.predict(model_obj, chain, df_x_minus).predictions_denoised.mean
-    p_yp = bstm.predict(model_obj, chain, df_y_plus).predictions_denoised.mean
-    p_ym = bstm.predict(model_obj, chain, df_y_minus).predictions_denoised.mean
-    p_pp = bstm.predict(model_obj, chain, df_diag_pp).predictions_denoised.mean
-    p_pm = bstm.predict(model_obj, chain, df_diag_pm).predictions_denoised.mean
-    p_mp = bstm.predict(model_obj, chain, df_diag_mp).predictions_denoised.mean
-    p_mm = bstm.predict(model_obj, chain, df_diag_mm).predictions_denoised.mean
+    res_xp = bstm.predict(model_obj, chain, df_xp; n_samples=S)
+    res_xm = bstm.predict(model_obj, chain, df_xm; n_samples=S)
+    res_yp = bstm.predict(model_obj, chain, df_yp; n_samples=S)
+    res_ym = bstm.predict(model_obj, chain, df_ym; n_samples=S)
+    res_pp = bstm.predict(model_obj, chain, df_pp; n_samples=S)
+    res_pm = bstm.predict(model_obj, chain, df_pm; n_samples=S)
+    res_mp = bstm.predict(model_obj, chain, df_mp; n_samples=S)
+    res_mm = bstm.predict(model_obj, chain, df_mm; n_samples=S)
+
+    p_xp = res_xp.predictions_denoised.mean
+    p_xm = res_xm.predictions_denoised.mean
+    p_yp = res_yp.predictions_denoised.mean
+    p_ym = res_ym.predictions_denoised.mean
+    p_pp = res_pp.predictions_denoised.mean
+    p_pm = res_pm.predictions_denoised.mean
+    p_mp = res_mp.predictions_denoised.mean
+    p_mm = res_mm.predictions_denoised.mean
 
     zx_mean = (p_xp .- p_xm) ./ (2.0 * h)
     zy_mean = (p_yp .- p_ym) ./ (2.0 * h)
@@ -721,28 +833,66 @@ function _generic_ad_surface_derivatives(
 
     # Approximate BPI via multi-point circular sampling
     bpi_means = Dict{Float64, Vector{Float64}}()
+    bpi_samples_dict = Dict{Float64, Matrix{Float64}}()
     n_ring_pts = 8
     angles = range(0, 2 * pi, length=n_ring_pts + 1)[1:n_ring_pts]
 
     for r in radii
         ring_preds = zeros(Float64, N_pts)
+        local ring_samples = has_samples ?
+            zeros(Float64, size(pred_res.predictions_denoised.samples)) : nothing
         for theta in angles
             dx = r * cos(theta)
             dy = r * sin(theta)
-            df_ring = DataFrame(s_x = coords_mat[:, 1] .+ dx, s_y = coords_mat[:, 2] .+ dy)
-            ring_preds .+= bstm.predict(model_obj, chain, df_ring).predictions_denoised.mean
+            df_ring = _build_eval_df(dx, dy)
+            pred_ring = bstm.predict(model_obj, chain, df_ring; n_samples=S)
+            ring_preds .+= pred_ring.predictions_denoised.mean
+            if has_samples && !isnothing(pred_ring.predictions_denoised.samples)
+                ring_samples .+= pred_ring.predictions_denoised.samples
+            end
         end
         bpi_means[r] = z_mean .- (ring_preds ./ n_ring_pts)
+        if has_samples && !isnothing(ring_samples)
+            bpi_samples_dict[r] = pred_res.predictions_denoised.samples .- (ring_samples ./ n_ring_pts)
+        end
     end
 
-    # Return pseudo-samples with mean replicated for downstream consistency
-    z_samples = repeat(z_mean, 1, S)
-    zx_samples = repeat(zx_mean, 1, S)
-    zy_samples = repeat(zy_mean, 1, S)
-    zxx_samples = repeat(zxx_mean, 1, S)
-    zyy_samples = repeat(zyy_mean, 1, S)
-    zxy_samples = repeat(zxy_mean, 1, S)
-    bpi_samples = Dict(r => repeat(bpi_means[r], 1, S) for r in radii)
+    if has_samples &&
+       !isnothing(res_xp.predictions_denoised.samples) &&
+       !isnothing(res_xm.predictions_denoised.samples) &&
+       !isnothing(res_yp.predictions_denoised.samples) &&
+       !isnothing(res_ym.predictions_denoised.samples) &&
+       !isnothing(res_pp.predictions_denoised.samples) &&
+       !isnothing(res_pm.predictions_denoised.samples) &&
+       !isnothing(res_mp.predictions_denoised.samples) &&
+       !isnothing(res_mm.predictions_denoised.samples)
+
+        s_z = pred_res.predictions_denoised.samples
+        s_xp = res_xp.predictions_denoised.samples
+        s_xm = res_xm.predictions_denoised.samples
+        s_yp = res_yp.predictions_denoised.samples
+        s_ym = res_ym.predictions_denoised.samples
+        s_pp = res_pp.predictions_denoised.samples
+        s_pm = res_pm.predictions_denoised.samples
+        s_mp = res_mp.predictions_denoised.samples
+        s_mm = res_mm.predictions_denoised.samples
+
+        z_samples = s_z
+        zx_samples = (s_xp .- s_xm) ./ (2.0 * h)
+        zy_samples = (s_yp .- s_ym) ./ (2.0 * h)
+        zxx_samples = (s_xp .- 2.0 .* s_z .+ s_xm) ./ (h^2)
+        zyy_samples = (s_yp .- 2.0 .* s_z .+ s_ym) ./ (h^2)
+        zxy_samples = (s_pp .- s_pm .- s_mp .+ s_mm) ./ (4.0 * h^2)
+        bpi_samples = bpi_samples_dict
+    else
+        z_samples = repeat(z_mean, 1, S)
+        zx_samples = repeat(zx_mean, 1, S)
+        zy_samples = repeat(zy_mean, 1, S)
+        zxx_samples = repeat(zxx_mean, 1, S)
+        zyy_samples = repeat(zyy_mean, 1, S)
+        zxy_samples = repeat(zxy_mean, 1, S)
+        bpi_samples = Dict(r => repeat(bpi_means[r], 1, S) for r in radii)
+    end
 
     return (
         z = z_samples,
@@ -770,7 +920,15 @@ and Bathymetric Position Indices (BPI) from continuous spatial models.
 - `SpectralGP` / `FFT`: Exact Fourier-space frequency derivatives and inverse FFT.
 - `WaveletGP`: Multi-scale inverse DWT combined with spectral differentiation.
 - `SPDE`: Finite Element Method (FEM) triangulation gradients and discrete Laplacians.
-- `PSpline` / `BSpline` / `TPS` / `GP`: Exact basis derivatives and ForwardDiff AD.
+- `Nystrom`: Low-rank kernel approximation surface derivatives and curvatures.
+- `FITC` / `SparseGP`: Inducing point sparse Gaussian process derivatives.
+- `GP`: Full Gaussian process / Kriging surface derivatives.
+- `SVC`: Spatially Varying Coefficients \$\\beta(s)\$ differential geometry.
+- `PSpline` / `BSpline` / `TPS`: Basis spline surface derivatives and curvatures.
+- `Barycentric`: Delaunay triangulation continuous surface derivatives.
+- `AdaptiveSmooth`: Multi-layer coordinate warping smooth surface derivatives.
+- `TensorProductSmooth`: Inseparable multidimensional tensor product derivatives.
+- `Warp` / `NNGP`: Manifold warped and nearest-neighbor Gaussian processes.
 
 # Arguments
 - `model_obj::DynamicPPL.Model`: The fitted BSTM model object.
@@ -803,10 +961,62 @@ function bstm_surface_derivatives(
     return_samples::Bool=false,
     n_samples::Union{Int, Nothing}=nothing
 )
-    # 1. Parse coordinate matrix
+    M = model_obj.args.M
+    spec_reg = model_obj.args.spec_registry
+
+    # 1. Identify smooth or continuous spatial component
+    spatial_spec = nothing
+    for (k, spec) in spec_reg
+        if (
+            spec.component_obj isa RFF || 
+            spec.component_obj isa SpectralGP || 
+            spec.component_obj isa WaveletGP ||
+            spec.component_obj isa SPDE ||
+            spec.component_obj isa PSpline || 
+            spec.component_obj isa TPS || 
+            spec.component_obj isa BSpline ||
+            spec.component_obj isa GP ||
+            spec.component_obj isa Nystrom ||
+            spec.component_obj isa FITC ||
+            spec.component_obj isa SparseGP ||
+            spec.component_obj isa SVC ||
+            spec.component_obj isa Barycentric ||
+            spec.component_obj isa AdaptiveSmooth ||
+            spec.component_obj isa TensorProductSmooth ||
+            spec.component_obj isa Warp ||
+            spec.component_obj isa NNGP
+        )
+            spatial_spec = spec
+            break
+        end
+    end
+
+    # 2. Parse coordinate matrix
     coords_mat = if coords isa DataFrame
-        x_col = hasproperty(coords, :s_x) ? :s_x : (hasproperty(coords, :x) ? :x : names(coords)[1])
-        y_col = hasproperty(coords, :s_y) ? :s_y : (hasproperty(coords, :y) ? :y : names(coords)[2])
+        coord_vars = if !isnothing(spatial_spec) && haskey(spatial_spec.params, :positional_args)
+            Symbol.(spatial_spec.params[:positional_args])
+        else
+            Symbol[]
+        end
+        x_col = if length(coord_vars) >= 1 && hasproperty(coords, coord_vars[1])
+            coord_vars[1]
+        elseif hasproperty(coords, :s_x)
+            :s_x
+        elseif hasproperty(coords, :x)
+            :x
+        else
+            names(coords)[1]
+        end
+
+        y_col = if length(coord_vars) >= 2 && hasproperty(coords, coord_vars[2])
+            coord_vars[2]
+        elseif hasproperty(coords, :s_y)
+            :s_y
+        elseif hasproperty(coords, :y)
+            :y
+        else
+            names(coords)[2]
+        end
         Matrix{Float64}(coords[!, [x_col, y_col]])
     else
         Matrix{Float64}(coords)
@@ -814,26 +1024,6 @@ function bstm_surface_derivatives(
 
     if size(coords_mat, 2) < 2
         error("bstm_surface_derivatives requires 2D spatial coordinates (x, y).")
-    end
-
-    M = model_obj.args.M
-    spec_reg = model_obj.args.spec_registry
-
-    # 2. Identify smooth spatial component
-    spatial_spec = nothing
-    for (k, spec) in spec_reg
-        if spec.structure in [:smooth, :spatial] && (
-            spec.component_obj isa RFF || 
-            spec.component_obj isa SpectralGP || 
-            spec.component_obj isa WaveletGP ||
-            spec.component_obj isa SPDE ||
-            spec.component_obj isa PSpline || 
-            spec.component_obj isa TPS || 
-            spec.component_obj isa BSpline
-        )
-            spatial_spec = spec
-            break
-        end
     end
 
     # 3. Dispatch to specialized analytical or automatic derivative engine
@@ -846,7 +1036,10 @@ function bstm_surface_derivatives(
     elseif !isnothing(spatial_spec) && spatial_spec.component_obj isa SPDE
         _spde_surface_derivatives(spatial_spec, chain, coords_mat, radii; n_samples=n_samples)
     else
-        _generic_ad_surface_derivatives(model_obj, chain, coords_mat, radii; n_samples=n_samples)
+        _generic_ad_surface_derivatives(
+            model_obj, chain, coords_mat, radii;
+            spatial_spec=spatial_spec, n_samples=n_samples
+        )
     end
 
     # If model has an intercept, add intercept samples to elevation realizations

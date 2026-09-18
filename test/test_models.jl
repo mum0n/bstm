@@ -316,8 +316,8 @@ end
     @test haskey(res_offset, :predictions)
     @test haskey(res_offset, :draws)
     @test haskey(res_offset.draws, :weights)
-    @test !haskey(res_offset, :model)
-    @test !haskey(res_offset, :chain)
+    @test haskey(res_offset, :model)
+    @test haskey(res_offset, :chain)
 
     # Test separate bstm_plots statement with data and spatial areal units (au)
     plot_dir = mktempdir()

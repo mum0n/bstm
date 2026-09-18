@@ -160,7 +160,7 @@ function get_priors(
     if m.method == :noncentered
         push!(
             priors,
-            "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, spec.hyper.n_latent), I), :$(p_names.ure))"
+            "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(spec.hyper.n_latent)), I), :$(p_names.ure))"
         )
     end
     

@@ -6,6 +6,8 @@ using DataFrames
 using JLD2
 using DuckDB
 using Plots
+using StatsPlots
+using ColorSchemes
 
 if !@isdefined(bstm_Likelihood)
     include(joinpath(@__DIR__, "test_helpers.jl"))

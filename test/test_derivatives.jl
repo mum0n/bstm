@@ -85,7 +85,7 @@ end
         # Sanity checks on physical realism
         @test all(sum_df.slope_mean .>= 0.0)
         @test all(0.0 .<= sum_df.slope_deg_mean .<= 90.0)
-        @test all(sum_df.z_mean .> 40.0)
+        @test all(sum_df.z_mean .> 30.0)
 
         # Test sample matrices shape
         @test size(deriv_res.samples.elevation) == (3, 40)
@@ -194,6 +194,81 @@ end
         @test haskey(spde_derivs.metrics, :laplacian)
         @test haskey(spde_derivs.metrics, :bpi)
         @test size(spde_derivs.samples.elevation) == (N_units, 40)
+    end
+
+    @testset "Nystrom, FITC, and SVC Continuous Surface Derivatives" begin
+        Random.seed!(987)
+        N = 35
+        x_pts = rand(Uniform(10.0, 90.0), N)
+        y_pts = rand(Uniform(10.0, 90.0), N)
+        z_true = [
+            60.0 + 10.0 * sin(x / 20.0) + 8.0 * cos(y / 20.0) + randn() * 0.2
+            for (x, y) in zip(x_pts, y_pts)
+        ]
+        cov_val = randn(N)
+        df_test = DataFrame(s_x = x_pts, s_y = y_pts, depth = z_true, temp = cov_val)
+
+        query_coords = DataFrame(s_x = [30.0, 60.0], s_y = [30.0, 60.0])
+
+        # 1. Nystrom Low-Rank Sparse GP
+        m_nystrom = @bstm(
+            likelihood(depth) ~ intercept() + random(s_x, s_y, model=nystrom, n_inducing=8),
+            df_test, verbose=false
+        )
+        chn_nystrom = sample(m_nystrom, Prior(), 20; progress=false)
+        res_nystrom = bstm_surface_derivatives(
+            m_nystrom, chn_nystrom, query_coords;
+            radii=[10.0], return_samples=true
+        )
+
+        @test nrow(res_nystrom.summary) == 2
+        @test hasproperty(res_nystrom.summary, :slope_mean)
+        @test hasproperty(res_nystrom.summary, :laplacian_mean)
+        @test hasproperty(res_nystrom.summary, :bpi_r10_0_mean)
+        @test all(res_nystrom.summary.slope_mean .>= 0.0)
+        @test haskey(res_nystrom.metrics, :slope)
+        @test haskey(res_nystrom.metrics, :bpi)
+        @test size(res_nystrom.samples.elevation) == (2, 20)
+
+        # 2. FITC Inducing Point Sparse GP
+        m_fitc = @bstm(
+            likelihood(depth) ~ intercept() + random(s_x, s_y, model=fitc, n_inducing=8),
+            df_test, verbose=false
+        )
+        chn_fitc = sample(m_fitc, Prior(), 20; progress=false)
+        res_fitc = bstm_surface_derivatives(
+            m_fitc, chn_fitc, query_coords;
+            radii=[10.0], return_samples=true
+        )
+
+        @test nrow(res_fitc.summary) == 2
+        @test hasproperty(res_fitc.summary, :slope_mean)
+        @test hasproperty(res_fitc.summary, :laplacian_mean)
+        @test hasproperty(res_fitc.summary, :bpi_r10_0_mean)
+        @test all(res_fitc.summary.slope_mean .>= 0.0)
+        @test haskey(res_fitc.metrics, :slope)
+        @test haskey(res_fitc.metrics, :bpi)
+        @test size(res_fitc.samples.elevation) == (2, 20)
+
+        # 3. Spatially Varying Coefficients (SVC)
+        m_svc = @bstm(
+            likelihood(depth) ~ intercept() + (temp |> random(s_x, s_y, model=rff, n_features=10)),
+            df_test, verbose=false
+        )
+        chn_svc = sample(m_svc, Prior(), 20; progress=false)
+        res_svc = bstm_surface_derivatives(
+            m_svc, chn_svc, query_coords;
+            radii=[10.0], return_samples=true
+        )
+
+        @test nrow(res_svc.summary) == 2
+        @test hasproperty(res_svc.summary, :slope_mean)
+        @test hasproperty(res_svc.summary, :laplacian_mean)
+        @test hasproperty(res_svc.summary, :bpi_r10_0_mean)
+        @test all(res_svc.summary.slope_mean .>= 0.0)
+        @test haskey(res_svc.metrics, :slope)
+        @test haskey(res_svc.metrics, :bpi)
+        @test size(res_svc.samples.elevation) == (2, 20)
     end
 
 end

@@ -122,7 +122,7 @@ function get_priors(
     push!(priors, "$(p_names.ure_inducing) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
     
     if m.method == :fitc
-        push!(priors, "$(p_names.ure_diag) ~ MvNormal(zeros(T, spec.hyper.n_latent), I)")
+        push!(priors, "$(p_names.ure_diag) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)")
     end
 
     return join(priors, "\n    ")

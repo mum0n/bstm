@@ -328,8 +328,11 @@ function reshard_spatial_field(
 
         mean_resharded = Vector{Float64}(P * nt_or_summary.mean)
         sd_resharded = Vector{Float64}(sqrt.(P * (nt_or_summary.std .^ 2)))
-        lower_resharded = Vector{Float64}(P * nt_or_summary.lower)
-        upper_resharded = Vector{Float64}(P * nt_or_summary.upper)
+        z_crit = quantile(Normal(0.0, 1.0), 1.0 - alpha / 2.0)
+        lower_resharded = hasproperty(nt_or_summary, :lower) ?
+            Vector{Float64}(P * nt_or_summary.lower) : (mean_resharded .- z_crit .* sd_resharded)
+        upper_resharded = hasproperty(nt_or_summary, :upper) ?
+            Vector{Float64}(P * nt_or_summary.upper) : (mean_resharded .+ z_crit .* sd_resharded)
         median_resharded = hasproperty(nt_or_summary, :median) ?
             Vector{Float64}(P * nt_or_summary.median) : mean_resharded
 

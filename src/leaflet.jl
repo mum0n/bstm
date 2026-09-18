@@ -87,6 +87,10 @@ function save_html(m::LeafletMap, filepath::AbstractString)::String
     return abspath(final_path)
 end
 
+function save_plot(m::LeafletMap, filepath::AbstractString; kwargs...)::String
+    return save_html(m, filepath)
+end
+
 function save_html(html_str::AbstractString, filepath::AbstractString)::String
     dir = dirname(filepath)
     if !isempty(dir) && !isdir(dir)

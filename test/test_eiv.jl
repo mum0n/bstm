@@ -42,7 +42,8 @@ end
         # Verify generated Turing model string contains latent innovation prior
         code_str = m_col_sd.args.M.generated_model_code
         @test contains(code_str, "ure_eiv_x_obs")
-        @test contains(code_str, "X_lat_x_obs = M.Xfixed[:, 1] .+ M.Xfixed_eiv_map[:x_obs] .* ure_eiv_x_obs")
+        @test contains(code_str, "lat_noise = M.Xfixed_eiv_map[:x_obs] .* ure_eiv_x_obs")
+        @test contains(code_str, "X_lat_x_obs = M.Xfixed[:, 1] .+ lat_noise")
     end
 
     @testset "EIV Mixed Fixed Effects & NUTS Sampling" begin

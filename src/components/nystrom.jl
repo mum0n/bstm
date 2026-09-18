@@ -126,7 +126,7 @@ function get_priors(
     end
     
     if m.method == :noncentered
-        push!(priors, "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, m.n_inducing), I), :$(p_names.ure))")
+        push!(priors, "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(m.n_inducing)), I), :$(p_names.ure))")
     end
 
     return join(priors, "\n    ")
