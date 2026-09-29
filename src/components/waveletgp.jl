@@ -41,13 +41,13 @@ The model works as follows:
   - `resolution`: `Int`, the grid resolution for discretization (must be a power of 2).
     Default: `32`.
   - `wavelet`: `Symbol`, the wavelet family to use (e.g., `:db4`, `:sym6`). Default: `:db4`.
-  - `sigma0`: `UnivariateDistribution`, prior for the overall scale of the wavelet
+  - `sigma`: `UnivariateDistribution`, prior for the overall scale of the wavelet
     variances. Default: `Exponential(1.0)`.
   - `alpha`: `UnivariateDistribution`, prior for the smoothness/decay parameter. Default:
     `Normal(1.5, 0.5)`.
 
 # Outputs (Parameter Names)
-- `sigma0_<key>`: The overall scale of the wavelet coefficient variances.
+- `sigma_<key>`: The overall scale of the wavelet coefficient variances.
 - `alpha_<key>`: The smoothness/decay parameter.
 - `innovations_<key>`: The raw standard normal innovations for the wavelet coefficients.
 - `latent_<key>`: The reconstructed latent effect at the observation coordinates.
@@ -58,7 +58,7 @@ The model works as follows:
   43(3/4), 337-343.
 """
 struct WaveletGP <: ComponentModel
-    sigma0::UnivariateDistribution
+    sigma::UnivariateDistribution
     alpha::UnivariateDistribution
     wavelet::Symbol
     resolution::Int
@@ -66,7 +66,7 @@ end
 
 COMPONENT_TYPE_REGISTRY[:waveletgp] = WaveletGP
 COMPONENT_CONSTRUCTORS[:waveletgp] = (p, params) -> WaveletGP(
-    get(p, :sigma0, get(p, :sigma, Exponential(1.0))),
+    get(p, :sigma, get(p, :sigma, Exponential(1.0))),
     get(p, :alpha, Exponential(1.0)),
     get(params, :wavelet, :db4),
     get(params, :resolution, 32)
@@ -224,9 +224,9 @@ function get_priors(
     key = spec.key
     priors = String[]
 
-    push!(priors, "$(p_names.sigma0) ~ $(_distribution_to_string(m.sigma0))")
+    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
     push!(priors, "$(p_names.alpha) ~ $(_distribution_to_string(m.alpha))")
-    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
@@ -244,11 +244,11 @@ function get_updates(
     let
         hyper = spec_registry[:$(key)].hyper
         
-        scale_variances = $(p_names.sigma0)^2 .* (2.0 .^ (-$(p_names.alpha) .* hyper.scale_indices))
-        wavelet_coeffs = $(p_names.ure) .* sqrt.(scale_variances)
-        $(p_names.sre) = hyper.B_obs * wavelet_coeffs
+        scale_variances = $(p_names.sigma)^2 .* (2.0 .^ (-$(p_names.alpha) .* hyper.scale_indices))
+        wavelet_coeffs = $(p_names.innovations) .* sqrt.(scale_variances)
+        $(p_names.latent_field) = hyper.B_obs * wavelet_coeffs
         
-        $(eta_target) = $(eta_target) .+ $(p_names.sre)
+        $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
     end
     """
 end
@@ -294,31 +294,31 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma0_name = _find_parameter(p_names, string(v.sigma0), k, is_multivariate_model)
+        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
         alpha_name = _find_parameter(p_names, string(v.alpha), k, is_multivariate_model)
-        ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
-        if isempty(sigma0_name) || isempty(alpha_name) || isempty(ure_name)
+        if isempty(sigma_name) || isempty(alpha_name) || isempty(innovations_name)
             @warn "Parameters for WaveletGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total_eff, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma0_samples_cpu = get_params_vector(chain, sigma0_name, 1)[:, 1]
+        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         alpha_samples_cpu = get_params_vector(chain, alpha_name, 1)[:, 1]
-        ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, N_total_eff, n_samples)
         wt = _resolve_wavelet(m.wavelet)
         
         # --- Sample-wise Reconstruction ---
         for i in 1:n_samples
-            sigma0_s = sigma0_samples_cpu[i]
+            sigma_s = sigma_samples_cpu[i]
             alpha_s = alpha_samples_cpu[i]
-            innov_s = ure_samples_cpu[i, :]
+            innov_s = innovations_samples_cpu[i, :]
 
-            scale_variances = sigma0_s^2 .* (2.0 .^ (-alpha_s .* scale_indices_cpu))
+            scale_variances = sigma_s^2 .* (2.0 .^ (-alpha_s .* scale_indices_cpu))
             wavelet_coeffs = innov_s .* sqrt.(scale_variances)
             
             local latent_field_grid_cpu

@@ -11,10 +11,10 @@ v1.0.0
 
 # Mathematical Summary
 The SPDE approach models a Gaussian Field \$u(s)\$ as the solution to the SPDE:
-\$(\\kappa^2 - \\Delta)^{\\alpha/2} u(s) = \\mathcal{W}(s)\$
+\$(\\range_value^2 - \\Delta)^{\\alpha/2} u(s) = \\mathcal{W}(s)\$
 where:
 - \$\\Delta\$ is the Laplacian operator.
-- \$\\kappa > 0\$ controls the spatial range of the process.
+- \$\\range_value > 0\$ controls the spatial range of the process.
 - \$\\alpha\$ controls the smoothness of the process.
 - \$\\mathcal{W}(s)\$ is Gaussian white noise.
 
@@ -22,14 +22,14 @@ For a discrete spatial domain represented by a graph, the Laplacian \$\\Delta\$ 
 approximated by the graph Laplacian \$\\mathbf{Q}_{ICAR} = D - W\$. For the common case
 where \$\\alpha = 2\$ (which corresponds to a Matérn field with smoothness \$\\nu=1\$),
 the precision matrix \$\\mathbf{Q}\$ of the latent field \$\\boldsymbol{\\phi}\$ is given by:
-\$\\mathbf{Q} = (\\kappa^2 \\mathbf{I} + \\mathbf{Q}_{ICAR})^T (\\kappa^2 \\mathbf{I} +
+\$\\mathbf{Q} = (\\range_value^2 \\mathbf{I} + \\mathbf{Q}_{ICAR})^T (\\range_value^2 \\mathbf{I} +
   \\mathbf{Q}_{ICAR})\$
 The model then samples the latent field from \$\\boldsymbol{\\phi} \\sim \\mathcal{N}(0,
   (\\sigma^2 \\mathbf{Q})^{-1})\$.
 
 # Computational Methods
 - `:spectral` (Default, AD-friendly): An efficient, AD-safe method using spectral decomposition.
-  Only applicable for isotropic `kappa` priors.
+  Only applicable for isotropic `range` priors.
 - `:cholesky` (AD-friendly): An AD-safe didactic alternative using dense Cholesky factorization.
 - `:cholesky_sparse` (Didactic, Not AD-friendly): A non-AD-safe didactic method using sparse
   Cholesky
@@ -42,14 +42,14 @@ The model then samples the latent field from \$\\boldsymbol{\\phi} \\sim \\mathc
 - **Optional (in `random()` call)**:
   - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation. Default:
     `Exponential(1.0)`.
-  - `kappa`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the `kappa`
+  - `range`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the `range`
     parameter(s). Default: `LogNormal(0, 1)`.
   - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
     Default: `:spectral`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the SPDE effect.
-- `kappa_<key>`: The spatial range parameter(s).
+- `range_<key>`: The spatial range parameter(s).
 - `innovations_<key>`: The raw standard normal innovations for the latent field.
 - `latent_<key>`: The reconstructed latent SPDE effect.
 
@@ -60,13 +60,13 @@ The model then samples the latent field from \$\\boldsymbol{\\phi} \\sim \\mathc
 """
 struct SPDE <: ComponentModel
     sigma::Distribution
-    kappa::Union{Distribution, Vector{<:Distribution}}
+    range::Union{Distribution, Vector{<:Distribution}}
     method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:spde] = SPDE
 COMPONENT_CONSTRUCTORS[:spde] = (p, params) -> SPDE(
-    p.sigma, p.kappa, get(params, :method, :spectral)
+    p.sigma, p.range, get(params, :method, :spectral)
 )
 
 MODEL_TO_STRUCTURE_MAP[:spde] = :spatial
@@ -111,7 +111,7 @@ end
 
 
 """
-    _spde_log_marginal_likelihood(y_residual, s_idx, s_N, Q_laplacian, L_eig, kappa, sigma,
+    _spde_log_marginal_likelihood(y_residual, s_idx, s_N, Q_laplacian, L_eig, range, sigma,
       y_sigma, noise=1e-6)
 
 Computes the exact log marginal likelihood for an SPDE spatial component integrated out
@@ -123,13 +123,13 @@ function _spde_log_marginal_likelihood(
     s_N::Int,
     Q_laplacian::AbstractMatrix,
     L_eig::AbstractVector,
-    kappa::Real,
+    range::Real,
     sigma::T,
     y_sigma::T,
     noise::Real=1e-6
 ) where {T}
     N = length(y_residual)
-    T_num = promote_type(T, typeof(noise), typeof(kappa))
+    T_num = promote_type(T, typeof(noise), typeof(range))
     
     inv_sigma_y2 = one(T_num) / (y_sigma^2 + T_num(noise))
     scale = sigma^2 + T_num(noise)
@@ -144,7 +144,7 @@ function _spde_log_marginal_likelihood(
         end
     end
     
-    L_op = Matrix{T_num}(Q_laplacian) + (T_num(kappa)^2) * Matrix{T_num}(I, s_N, s_N)
+    L_op = Matrix{T_num}(Q_laplacian) + (T_num(range)^2) * Matrix{T_num}(I, s_N, s_N)
     Q_spde = L_op' * L_op
     
     Q_base = Matrix{T_num}(Q_spde)
@@ -154,7 +154,7 @@ function _spde_log_marginal_likelihood(
     
     F = cholesky(Symmetric(Q_base))
     
-    log_det_prior = 2 * sum(log.(T_num(kappa)^2 .+ L_eig .+ T_num(noise)))
+    log_det_prior = 2 * sum(log.(T_num(range)^2 .+ L_eig .+ T_num(noise)))
     log_det_diff = - s_N * log(scale) + log_det_prior - 2 * sum(log.(diag(F.U)))
     
     b = S_s .* inv_sigma_y2
@@ -179,18 +179,18 @@ function get_priors(
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
-    if m.kappa isa Vector
-        kappa_priors_str = join([_distribution_to_string(p) for p in m.kappa], ", ")
-        push!(priors, "$(p_names.kappa) ~ Product([$(kappa_priors_str)])")
+    if m.range isa Vector
+        range_priors_str = join([_distribution_to_string(p) for p in m.range], ", ")
+        push!(priors, "$(p_names.range) ~ Product([$(range_priors_str)])")
     else
-        kappa_prior_str = _distribution_to_string(m.kappa)
-        push!(priors, "$(p_names.kappa) ~ $(kappa_prior_str)")
+        range_prior_str = _distribution_to_string(m.range)
+        push!(priors, "$(p_names.range) ~ $(range_prior_str)")
     end
     
     if m.method != :marginalized
         push!(
             priors,
-            "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
+            "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)"
         )
     end
 
@@ -205,7 +205,7 @@ function get_updates(
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     key = spec.key
 
-    use_spectral = m.method == :spectral && !(m.kappa isa Vector)
+    use_spectral = m.method == :spectral && !(m.range isa Vector)
 
     spectral_code = """
         # --- SPDE Component (Spectral): $(key) ---
@@ -214,24 +214,24 @@ function get_updates(
             U = hyper.U
             L = hyper.L
             
-            diag_vals = ($(p_names.kappa)^2 .+ L).^2
+            diag_vals = ($(p_names.range)^2 .+ L).^2
             diag_D = $(p_names.sigma) ./ sqrt.(diag_vals .+ M.noise)
             
-            $(p_names.sre) = U * (diag_D .* $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = U * (diag_D .* $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
     cholesky_base_code = """
         local hyper = spec_registry[:$(key)].hyper
         local Q_laplacian = hyper.Q_template
-        local kappa_val = $(p_names.kappa)
-        local Q_kappa_term = if kappa_val isa AbstractVector
-            Diagonal(kappa_val.^2)
+        local range_val = $(p_names.range)
+        local Q_range_term = if range_val isa AbstractVector
+            Diagonal(range_val.^2)
         else
-            kappa_val^2 * I
+            range_val^2 * I
         end
-        local L_operator = Q_kappa_term + Q_laplacian
+        local L_operator = Q_range_term + Q_laplacian
         local Q_final = Symmetric(L_operator' * L_operator)
     """
 
@@ -240,8 +240,8 @@ function get_updates(
         let
             $(cholesky_base_code)
             local F = cholesky(Matrix(Q_final) + M.noise * I)
-            $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -250,8 +250,8 @@ function get_updates(
         let
             $(cholesky_base_code)
             local F = cholesky(Q_final + M.noise * I)
-            $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -266,7 +266,7 @@ function get_updates(
                 hyper.n_latent,
                 hyper.Q_template,
                 hyper.L,
-                $(p_names.kappa),
+                $(p_names.range),
                 $(p_names.sigma),
                 y_sigma,
                 M.noise
@@ -284,7 +284,7 @@ function get_updates(
     elseif m.method == :cholesky_sparse
         return cholesky_sparse_code
     else
-        @warn "SPDE method '$(m.method)' with anisotropic kappa is not supported by spectral method. Falling back to dense Cholesky."
+        @warn "SPDE method '$(m.method)' with anisotropic range is not supported by spectral method. Falling back to dense Cholesky."
         return cholesky_code
     end
 end
@@ -322,8 +322,8 @@ function get_effects(
     end
     N_total = length(s_idx_full)
 
-    # Determine if spectral method can be used (requires isotropic kappa)
-    use_spectral = m.method == :spectral && !(m.kappa isa Vector)
+    # Determine if spectral method can be used (requires isotropic range)
+    use_spectral = m.method == :spectral && !(m.range isa Vector)
     
     structured_effects = Vector{Matrix{Float64}}()
 
@@ -331,9 +331,9 @@ function get_effects(
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
-        kappa_name = _find_parameter(p_names, string(v.kappa), k, is_multivariate_model)
+        range_name = _find_parameter(p_names, string(v.range), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(kappa_name)
+        if isempty(sigma_name) || isempty(range_name)
             @warn "Parameters for SPDE component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -341,8 +341,8 @@ function get_effects(
 
         # Extract posterior samples (CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        kappa_dim = m.kappa isa Vector ? length(m.kappa) : 1
-        kappa_samples_cpu = get_params_matrix(chain, kappa_name, kappa_dim)
+        range_dim = m.range isa Vector ? length(m.range) : 1
+        range_samples_cpu = get_params_matrix(chain, range_name, range_dim)
 
         # Initialize the output matrix for the full latent field on the CPU
         latent_field_matrix = zeros(Float64, n_latent, n_samples)
@@ -369,7 +369,7 @@ function get_effects(
             
             for i in 1:n_samples
                 sig = sigma_samples_cpu[i]
-                kap = kappa_samples_cpu[i, 1]
+                kap = range_samples_cpu[i, 1]
                 y_sig = y_sigma_samples[i]
                 
                 scale = sig^2 + noise
@@ -392,37 +392,32 @@ function get_effects(
                 latent_field_matrix[:, i] = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
             end
         else
-            ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "ure for SPDE component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
+            innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
+            innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
             for i in 1:n_samples
                 current_sigma = sigma_samples_cpu[i]
-                current_kappa = kappa_samples_cpu[i, :]
-                current_ure = ure_samples_cpu[i, :]
+                current_range = range_samples_cpu[i, :]
+                current_innovations = innovations_samples_cpu[i, :]
                 
                 local latent_field_sample
                 if use_spectral
-                    kappa_val = current_kappa[1]
-                    diag_vals = (kappa_val^2 .+ L_cpu).^2
+                    range_val = current_range[1]
+                    diag_vals = (range_val^2 .+ L_cpu).^2
                     diag_D = current_sigma ./ sqrt.(diag_vals .+ noise)
-                    latent_field_sample = U_cpu * (diag_D .* current_ure)
+                    latent_field_sample = U_cpu * (diag_D .* current_innovations)
                 else
-                    Q_kappa_term = if m.kappa isa Vector
-                        Diagonal(current_kappa.^2)
+                    Q_range_term = if m.range isa Vector
+                        Diagonal(current_range.^2)
                     else
-                        current_kappa[1]^2 * I
+                        current_range[1]^2 * I
                     end
                     
-                    L_operator = Q_kappa_term + Q_laplacian_cpu
+                    L_operator = Q_range_term + Q_laplacian_cpu
                     Q_final = Symmetric(L_operator' * L_operator)
                     
                     F = cholesky(Matrix(Q_final) + noise * I)
-                    latent_field_sample = current_sigma .* (F.L' \ current_ure)
+                    latent_field_sample = current_sigma .* (F.L' \ current_innovations)
                 end
                 latent_field_matrix[:, i] = latent_field_sample
             end

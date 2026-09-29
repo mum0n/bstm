@@ -5,9 +5,9 @@ using Dates
 using DataFrames
 using JLD2
 using DuckDB
-using Plots
-using StatsPlots
-using ColorSchemes
+using Random
+using Distributions
+using DynamicPPL
 
 if !@isdefined(bstm_Likelihood)
     include(joinpath(@__DIR__, "test_helpers.jl"))
@@ -26,7 +26,7 @@ end
         required_cols = [
             :y, :y_rate, :y_bin, :y_gauss, :y_pois, :ordinal_y,
             :y_cat1, :y_cat2, :y_cat3, :counts, :t_idx, :year, :month, :day,
-            :region, :district, :group, :group_id, :group_var, :cell_area,
+            :region, :district, :group, :group_id, :grouping_covariate, :cell_area,
             :effort, :removal, :removal_total, :proxy_val, :predator_pop,
             :recruitment, :habitat, :species_1, :species_2, :species_3,
             :age_1, :age_2, :age_3, :class_1, :class_2, :class_3, :class_4,
@@ -44,7 +44,13 @@ end
     end
 end
 
-@testset "Plotting Subsystem" begin
+if !HAS_PLOTTING
+    @testset "Plotting Subsystem" begin
+        @test_skip false
+        @info "Skipping 'Plotting Subsystem' testset: optional plotting stack not installed."
+    end
+else
+    @testset "Plotting Subsystem" begin
     # 1. Theme generator
     thm = bstm.create_theme(fontsize=11)
     @test haskey(thm, :titlefontsize)
@@ -89,7 +95,7 @@ end
     @test occ_p isa Plots.Plot
 
     # 6. Save Plot
-    tmp_file = joinpath(tempdir(), "test_bstm_plot.png")
+    tmp_file = scratch_path("test_bstm_plot.png")
     saved_path = bstm.save_plot(p_choro, tmp_file)
     @test isfile(saved_path)
     try; rm(saved_path; force=true); catch; end
@@ -190,7 +196,7 @@ end
     @test occursin("timeSlider", m_st.html_content)
 
     # 6. HTML Persistence & save_plot / save_plots
-    tmp_html = joinpath(tempdir(), "test_leaflet_st.html")
+    tmp_html = scratch_path("test_leaflet_st.html")
     saved_html = bstm.save_plot(m_st, tmp_html)
     @test isfile(saved_html)
     @test filesize(saved_html) > 1000
@@ -203,7 +209,7 @@ end
         hsi_map = m_hsi,
         static_p = p_static
     )
-    tmp_saved_dir = joinpath(tempdir(), "bstm_test_plots_export")
+    tmp_saved_dir = scratch_path("bstm_test_plots_export")
     saved_files = bstm.save_plots(plots_bundle, tmp_saved_dir)
     @test length(saved_files) == 3
     @test any(f -> endswith(f, "st_map.html"), saved_files)
@@ -218,6 +224,7 @@ end
     @test bstm.plot_advection_arrows(au; hsi=hsi, mode=:leaflet) isa bstm.LeafletMap
     @test bstm.choropleth(polys, hsi; mode=:leaflet) isa bstm.LeafletMap
     @test bstm.spatial_graph_plot(au=au, mode=:leaflet) isa bstm.LeafletMap
+    end # if HAS_PLOTTING
 end
 
 @testset "Model State & Results Persistence (JLD2 & DuckDB)" begin
@@ -233,7 +240,7 @@ end
     chn_test = sample(m_test, MH(), 30; progress=false)
     res_test = model_results_comprehensive(m_test, chn_test)
 
-    temp_dir = mktempdir()
+    temp_dir = scratch_dir()
     jld2_path = joinpath(temp_dir, "test_model.jld2")
     duckdb_path = joinpath(temp_dir, "test_results.duckdb")
     bundle_base = joinpath(temp_dir, "test_bundle")
@@ -399,9 +406,14 @@ end
         @test isapprox(r_val, calc_r, atol=1e-6)
         @test r_val > 0.0
         
-        plots_res = bstm.bstm_plots(res_cplx, df_cplx; au=p_data.au)
-        @test haskey(plots_res.plots, :posterior_predictive_check)
-        @test haskey(plots_res.plots_data, :posterior_predictive_check)
+        if HAS_PLOTTING
+            plots_res = bstm.bstm_plots(res_cplx, df_cplx; au=p_data.au)
+            @test haskey(plots_res.plots, :posterior_predictive_check)
+            @test haskey(plots_res.plots_data, :posterior_predictive_check)
+        else
+            @test_skip false
+            @info "Skipping bstm_plots checks: optional plotting stack not installed."
+        end
         @test res_cplx.metrics.r_pearson == r_val
     end
 
@@ -440,13 +452,17 @@ end
         @test all(v -> 0.0 <= v <= n_trials, preds_bin)
     end
 
-    # 5. LogNormal Natural Scale Check
-    @testset "LogNormal Natural Scale Magnitude" begin
-        n_obs = 50
-        true_mu = 1.5
-        y_sim = exp.(true_mu .+ randn(n_obs) .* 0.2)
-        df_ln = DataFrame(y = y_sim)
-        
+      # 5. LogNormal Natural Scale Check
+      @testset "LogNormal Natural Scale Magnitude" begin
+          # Seeded: this drew from the global RNG, so its result depended on how many
+          # draws earlier testsets happened to make.
+          Random.seed!(4242)
+          n_obs = 50
+          true_mu = 1.5
+          y_sim = exp.(true_mu .+ randn(n_obs) .* 0.2)
+          df_ln = DataFrame(y = y_sim)
+
+
         m_ln = @bstm(likelihood(y, family=lognormal) ~ 1, df_ln, verbose=false)
         chn_ln = sample(m_ln, MH(), 100, progress=false)
         res_ln = bstm.model_results_comprehensive(m_ln, chn_ln)
@@ -469,5 +485,57 @@ end
         preds_smooth = res_smooth.predictions.denoised.mean
         @test abs(mean(preds_smooth) - mean(df_lip.y_gauss)) < 2.5
         @test haskey(res_smooth.effects, :cov1)
+    end
+
+    @testset "Bundle Schema Versioning" begin
+        Random.seed!(909)
+        n_s = 8
+        df_s = DataFrame(
+            y = rand(Poisson(2.0), n_s),
+            x = collect(1.0:n_s),
+            s_idx = collect(1:n_s),
+        )
+        W_s = bstm.spatial_knn_graph([(Float64(i), 0.0) for i in 1:n_s], 2)[2]
+        m_s = @bstm(
+            likelihood(y, family=poisson) ~ intercept() + fixed(x) +
+            random(s_idx, model=bym2), df_s, W=W_s, verbose=false
+        )
+
+        path = joinpath(scratch_dir(), "schema.bstm")
+        bstm.save_bstm_model(path, m_s)
+
+        # A bundle records the layout version that wrote it, in both places a reader
+        # might look, and does not carry the old hardcoded package-version string.
+        JLD2.jldopen(path, "r") do f
+            @test haskey(f, "schema_version")
+            @test f["schema_version"] == bstm.BSTM_SCHEMA_VERSION
+            @test f["metadata"]["schema_version"] == bstm.BSTM_SCHEMA_VERSION
+            @test !haskey(f["metadata"], "bstm_version")
+            @test haskey(f["metadata"], "dropped_spec_registry_keys")
+        end
+
+        # The recorded version survives a round trip, and the model is still usable.
+        loaded = bstm.load_bstm_model(path)
+        @test loaded.model isa DynamicPPL.Model
+
+        # A bundle from a future bstm must be refused outright, not silently misread.
+        future = joinpath(scratch_dir(), "future.bstm")
+        bstm.save_bstm_model(future, m_s)
+        JLD2.jldopen(future, "r+") do f
+            delete!(f, "schema_version")
+            f["schema_version"] = bstm.BSTM_SCHEMA_VERSION + 5
+        end
+        @test_throws ErrorException bstm.load_bstm_model(future)
+
+        # A bundle with no marker at all predates versioning: treat it as v1, not as
+        # a corrupt file, and say so.
+        legacy = joinpath(scratch_dir(), "legacy.bstm")
+        bstm.save_bstm_model(legacy, m_s)
+        JLD2.jldopen(legacy, "r+") do f
+            delete!(f, "schema_version")
+            delete!(f, "metadata")
+        end
+        @test (@test_logs (:warn,) match_mode=:any bstm.load_bstm_model(legacy)).model isa
+            DynamicPPL.Model
     end
 end

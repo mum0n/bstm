@@ -43,8 +43,8 @@ where \$K_{ZZ} = L_{ZZ}L_{ZZ}^T\$. The final effect is computed as:
     Default: `"se"`.
   - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP.
     Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
-    the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `length_scale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel length_scale(s). Default: `Gamma(2, 0.5)`.
   - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default:
     `:noncentered`.
   - `knot_method`: `Symbol`, method for placing inducing points (`:kmeans`, `:random`,
@@ -52,14 +52,14 @@ where \$K_{ZZ} = L_{ZZ}L_{ZZ}^T\$. The final effect is computed as:
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the GP.
-- `ls_<key>`: The kernel lengthscale(s).
+- `ls_<key>`: The kernel length_scale(s).
 - `innovations_<key>`: Raw standard normal innovations for the inducing points (for
   `:noncentered`).
 - `latent_<key>`: The latent values at the inducing points (for `:centered`). The final
   effect is derived from these.
 """
 struct Nystrom <: ComponentModel
-    lengthscale::Union{Distribution, Vector{<:Distribution}}
+    length_scale::Union{Distribution, Vector{<:Distribution}}
     sigma::Distribution
     n_inducing::Int
     kernel::String
@@ -69,7 +69,7 @@ end
 COMPONENT_TYPE_REGISTRY[:nystrom] = Nystrom
 
 COMPONENT_CONSTRUCTORS[:nystrom] = (p, params) -> Nystrom(
-    p.lengthscale,
+    p.length_scale,
     p.sigma,
     get(params, :n_inducing, 20),
     string(get(params, :kernel, "se")),
@@ -117,16 +117,16 @@ function get_priors(
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
-    if m.lengthscale isa Vector
-        ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
+    if m.length_scale isa Vector
+        length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
+        push!(priors, "$(p_names.length_scale) ~ Product([$(length_scale_priors_str)])")
     else
-        ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
+        length_scale_prior_str = _distribution_to_string(m.length_scale)
+        push!(priors, "$(p_names.length_scale) ~ $(length_scale_prior_str)")
     end
     
     if m.method == :noncentered
-        push!(priors, "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(m.n_inducing)), I), :$(p_names.ure))")
+        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(m.n_inducing)), I)")
     end
 
     return join(priors, "\n    ")
@@ -148,10 +148,10 @@ function get_updates(
             kernel_type = Symbol("$(m.kernel)")
             
             K_UU = evaluate_kernel_matrix(
-                Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
+                Z_coords, $(p_names.sigma), $(p_names.length_scale), kernel_type, M.noise
             )
             K_XU = evaluate_cross_kernel_matrix(
-                X_coords, Z_coords, $(p_names.sigma), $(p_names.ls), kernel_type
+                X_coords, Z_coords, $(p_names.sigma), $(p_names.length_scale), kernel_type
             )
     """
 
@@ -159,16 +159,16 @@ function get_updates(
         # --- Nystrom Sparse GP (Non-Centered): $(key) ---
         $(common_code)
             L_UU = cholesky(Symmetric(K_UU)).L
-            $(p_names.sre) = K_XU * (L_UU' \\ $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(p_names.latent_field) = K_XU * (L_UU' \\ $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
     centered_code = """
         # --- Nystrom Sparse GP (Centered): $(key) ---
         $(common_code)
-            $(p_names.sre) ~ MvNormal(zeros(T, $(m.n_inducing)), Symmetric(K_UU))
-            nystrom_effect = K_XU * (K_UU \\ $(p_names.sre))
+            $(p_names.latent_field) ~ MvNormal(zeros(T, $(m.n_inducing)), Symmetric(K_UU))
+            nystrom_effect = K_XU * (K_UU \\ $(p_names.latent_field))
             $(eta_target) = $(eta_target) .+ nystrom_effect
         end
     """
@@ -230,9 +230,9 @@ function get_effects(
         
         # Find parameter names in the MCMC chain
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
+        length_scale_name = _find_parameter(p_names, string(p_names_k.length_scale), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(ls_name)
+        if isempty(sigma_name) || isempty(length_scale_name)
             @warn "Parameters for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
@@ -240,25 +240,20 @@ function get_effects(
 
         # Extract posterior samples (CPU)
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1 # Dimension of lengthscale parameter
-        ls_samples = get_params_matrix(chain, ls_name, ls_dim) # (n_samples, ls_dim)
+        length_scale_dim = m.length_scale isa Vector ? length(m.length_scale) : 1 # Dimension of length_scale parameter
+        length_scale_samples = get_params_matrix(chain, length_scale_name, length_scale_dim) # (n_samples, length_scale_dim)
 
         # Initialize the output matrix for the full effect
         effect_k_matrix = zeros(Float64, n_obs_full, n_samples)
 
         # --- Sample-wise Reconstruction ---
         if m.method == :noncentered
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "ure for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
-                continue
-            end
-            ure_samples = get_params_matrix(chain, ure_name, m.n_inducing) # (n_samples, n_inducing)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_samples = get_params_matrix(chain, innovations_name, m.n_inducing) # (n_samples, n_inducing)
 
             for i in 1:n_samples
                 current_sigma = sigma_samples[i, 1] # Sigma for current sample
-                current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1] # Lengthscale for current sample
+                current_ls = length_scale_dim > 1 ? length_scale_samples[i, :] : length_scale_samples[i, 1] # Lengthscale for current sample
                 
                 # Kernel evaluations and linear algebra
                 K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls,
@@ -267,21 +262,16 @@ function get_effects(
                     current_ls, kernel_type)
                 
                 L_UU = cholesky(Symmetric(K_UU)).L
-                u_latent = L_UU * ure_samples[i, :]
+                u_latent = L_UU * innovations_samples[i, :]
                 effect_k_matrix[:, i] = K_XU * (K_UU \ u_latent)
             end
         else # :centered
-            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
-            if isempty(sre_name)
-                @warn "sre for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
-                continue
-            end
-            u_latent_samples = get_params_matrix(chain, sre_name, m.n_inducing) # (n_samples, n_inducing)
+            latent_field_name = _find_parameter(p_names, string(p_names_k.latent_field), k, is_multivariate_model)
+            u_latent_samples = get_params_matrix(chain, latent_field_name, m.n_inducing) # (n_samples, n_inducing)
 
             for i in 1:n_samples # Iterate over each posterior sample
                 current_sigma = sigma_samples[i, 1] # Sigma for current sample
-                current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1] # Lengthscale for current sample
+                current_ls = length_scale_dim > 1 ? length_scale_samples[i, :] : length_scale_samples[i, 1] # Lengthscale for current sample
                 
                 # Kernel evaluations and linear algebra
                 K_UU = evaluate_kernel_matrix(Z_inducing, current_sigma, current_ls,

@@ -55,15 +55,15 @@ where \$\\mathbf{L}_{\\text{cross}} = \\operatorname{diag}(\\boldsymbol{\\sigma}
     `Normal(0, 0.5)`.
   - `sigma`: `UnivariateDistribution`, base prior for outcome marginal standard deviations.
     Default: `Exponential(1.0)`.
-  - `eta_lkj`: `Real`, LKJ prior shape parameter for cross-outcome correlation matrix.
+  - `correlation_lkj`: `Real`, LKJ prior shape parameter for cross-outcome correlation matrix.
     Default: `1.0`.
 
 # Outputs (Parameter Names)
 - `rho_unconstrained_<key>`: Spatial autocorrelation parameter.
 - `sigma_<key>`: Outcome-specific marginal standard deviations (vector of length \$K\$).
 - `L_corr_<key>`: LKJ Cholesky factor for cross-outcome correlations (\$K \\times K\$).
-- `ure_<key>`: Standard normal innovations (\$S \\cdot K\$).
-- `sre_<key>`: Multivariate spatial realization (\$S \\times K\$).
+- `innovations_<key>`: Standard normal innovations (\$S \\cdot K\$).
+- `latent_field_<key>`: Multivariate spatial realization (\$S \\times K\$).
 
 # Key References
 - Gelfand, A. E., & Vounatsou, P. (2003). *Proper multivariate conditional autoregressive
@@ -74,7 +74,7 @@ where \$\\mathbf{L}_{\\text{cross}} = \\operatorname{diag}(\\boldsymbol{\\sigma}
 struct MCAR <: ComponentModel
     rho_unconstrained::UnivariateDistribution
     sigma::UnivariateDistribution
-    eta_lkj::Real
+    correlation_lkj::Real
     n_outcomes::Int
     method::Symbol
 end
@@ -84,7 +84,7 @@ COMPONENT_TYPE_REGISTRY[:mcar] = MCAR
 COMPONENT_CONSTRUCTORS[:mcar] = (p, params) -> MCAR(
     get(p, :rho_unconstrained, Normal(0.0, 0.5)),
     get(p, :sigma, Exponential(1.0)),
-    get(params, :eta_lkj, 1.0),
+    get(params, :correlation_lkj, 1.0),
     get(params, :n_outcomes, get(params, :K, 2)),
     get(params, :method, :spectral)
 )
@@ -132,8 +132,8 @@ function get_priors(
     return """
     $(p_names.rho_unconstrained) ~ $(_distribution_to_string(m.rho_unconstrained))
     $(p_names.sigma) ~ filldist($(_distribution_to_string(m.sigma)), $(K))
-    L_corr_$(spec.key) ~ LKJCholesky($(K), $(m.eta_lkj))
-    $(p_names.ure) ~ MvNormal(zeros(T, $(s_N * K)), I)
+    L_corr_$(spec.key) ~ LKJCholesky($(K), $(m.correlation_lkj))
+    $(p_names.innovations) ~ MvNormal(zeros(T, $(s_N * K)), I)
     """
 end
 
@@ -150,16 +150,16 @@ function get_updates(
     multivariate_assign = if arch == "multivariate"
         """
         for k in 1:$(K)
-            eta_latent[:, k] = eta_latent[:, k] .+ $(p_names.sre)[:, k][M.s_idx]
+            eta_latent[:, k] = eta_latent[:, k] .+ $(p_names.latent_field)[:, k][M.s_idx]
         end
         """
     else
-        "eta = eta .+ $(p_names.sre)[:, 1][M.s_idx]"
+        "eta = eta .+ $(p_names.latent_field)[:, 1][M.s_idx]"
     end
 
     return """
     # --- Multivariate Conditional Autoregressive (MCAR): $(key) ---
-    $(p_names.sre) = let
+    $(p_names.latent_field) = let
         rho_val = logistic($(p_names.rho_unconstrained))
         U_sp = spec_registry[:$(key)].hyper.U_spatial
         lam_sp = spec_registry[:$(key)].hyper.lambda_scaled
@@ -173,12 +173,12 @@ function get_updates(
         end
 
         # Unpack standard normal innovations matrix (S x K)
-        Z_mat = reshape($(p_names.ure), $(s_N), $(K))
+        Z_mat = reshape($(p_names.innovations), $(s_N), $(K))
         
         # Spatial filtering: U * diag(inv_sqrt_lam) * Z
         U_spatial_field = U_sp * (inv_sqrt_lam .* Z_mat)
 
-        # Cross-outcome covariance Cholesky factor: diag(sigma) * L_corr.L
+        # Cross-outcome covariance Cholesky factor: diag(sigma) * correlation_cholesky.L
         L_cholesky = L_corr_$(key).L
         sig_vec = $(p_names.sigma)
         L_cross = Diagonal(sig_vec) * L_cholesky
@@ -204,7 +204,7 @@ function get_effects(
 
     rho_samples = get_param_samples(chain, M.param_registry, Symbol(v.rho_unconstrained))
     sig_samples = get_param_samples(chain, M.param_registry, Symbol(v.sigma))
-    ure_samples = get_param_samples(chain, M.param_registry, Symbol(v.ure))
+    innovations_samples = get_param_samples(chain, M.param_registry, Symbol(v.innovations))
 
     effect_matrix = zeros(Float64, M.y_N, n_samples)
 
@@ -212,7 +212,7 @@ function get_effects(
         rho_val = 1.0 / (1.0 + exp(-rho_samples[s]))
         inv_sqrt_lam = [1.0 / sqrt(max((1.0 - rho_val) + rho_val * lam_sp[i], 1e-6)) for i in 1:s_N]
         
-        u_raw = ure_samples[:, s]
+        u_raw = innovations_samples[:, s]
         Z_mat = reshape(u_raw, s_N, K)
         U_sp_field = U_sp * (inv_sqrt_lam .* Z_mat)
         

@@ -87,7 +87,9 @@ component.
 # Arguments
 - `v_mat`: A `p x k` matrix where each column is a Householder reflector vector.
 - `p`: The number of original variables (`n_vars`).
-- `k`: The number of latent factors (`n_factors`).
+- `k`: The number of latent factors. This is a local dimension symbol in the maths
+  (`p` is likewise `n_vars`), not a bstm parameter name; the sampled quantity derived
+  from it is `factors_flat_<key>`.
 
 # Returns
 - A `p x k` matrix `U` with orthonormal columns.
@@ -222,7 +224,7 @@ function get_priors(
     ltri_indices_len = hyper.ltri_indices_len
 
     priors = String[]
-    push!(priors, "$(p_names.v_unscaled) ~ MvNormal(zeros(T, $(ltri_indices_len)), I)")
+    push!(priors, "$(p_names.reflection_vector_unconstrained) ~ MvNormal(zeros(T, $(ltri_indices_len)), I)")
     push!(priors, "$(p_names.pca_sd) ~ filldist($(pca_sd_prior_str), $(n_factors))")
     push!(priors, "$(p_names.pdef_sd) ~ filldist($(pdef_sd_prior_str), $(n_vars))")
     
@@ -247,9 +249,9 @@ function get_updates(
     n_vars = hyper.n_vars
     
     common_code = """
-        T_v = eltype($(p_names.v_unscaled))
+        T_v = eltype($(p_names.reflection_vector_unconstrained))
         v_mat = zeros(T_v, $(n_vars), $(n_factors))
-        v_mat[spec_registry[:$(key)].hyper.ltri_indices] .= $(p_names.v_unscaled)
+        v_mat[spec_registry[:$(key)].hyper.ltri_indices] .= $(p_names.reflection_vector_unconstrained)
         
         U = householder_to_eigenvector(v_mat, spec_registry[:$(key)].hyper.n_vars,
           spec_registry[:$(key)].hyper.n_factors)
@@ -280,20 +282,20 @@ function get_updates(
         let
             $(common_code)
             # Define the latent factors matrix that will be sampled row-by-row
-            $(p_names.sre) = Matrix{T}(undef, $(n_obs), $(n_factors))
+            $(p_names.latent_field) = Matrix{T}(undef, $(n_obs), $(n_factors))
             Cov_F_row = Symmetric(L * L')
             
             for i in 1:$(n_obs)
-                $(p_names.sre)[i, :] ~ MvNormal(zeros(T, $(n_factors)), Cov_F_row)
+                $(p_names.latent_field)[i, :] ~ MvNormal(zeros(T, $(n_factors)), Cov_F_row)
             end
             
-            Y_hat = $(p_names.sre) * L'
+            Y_hat = $(p_names.latent_field) * L'
             
             for i in 1:$(n_obs)
                 Turing.@addlogprob! logpdf(MvNormal(Y_hat[i, :], Psi), Y_eigen_data[i, :])
             end
             
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), :, 1)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), :, 1)
         end
     """
 
@@ -371,16 +373,16 @@ function get_effects(
             factor_effect[1:n_obs_train, :] = F_tensor[:, 1, :]
         end
     else # :centered
-        sre_name = _find_parameter(
-            p_names, string(p_names_k.sre), nothing, params_are_per_outcome
+        latent_field_name = _find_parameter(
+            p_names, string(p_names_k.latent_field), nothing, params_are_per_outcome
         )
-        if isempty(sre_name)
-            @warn "Parameter 'sre' for Eigen component $(spec.key) not found. " *
+        if isempty(latent_field_name)
+            @warn "Parameter 'latent_field' for Eigen component $(spec.key) not found. " *
                   "Returning zero-matrix."
             factor_effect = zeros(Float64, n_obs_full, n_samples)
         else
             latent_samples_train = get_params_matrix(
-                chain, sre_name, n_obs_train * n_factors
+                chain, latent_field_name, n_obs_train * n_factors
             )
             # Reshape the flat [n_samples, n_params] matrix into a 3D tensor
             # [n_obs, n_factors, n_samples]

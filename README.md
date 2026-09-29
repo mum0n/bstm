@@ -268,10 +268,10 @@ using bstm
 
 # 1. Query previously saved model results directly via SQL
 df_high_risk = query_duckdb("output/scot_lip_model.duckdb", """
-    SELECT unit_id, sre_mean, sre_lower, sre_upper 
-    FROM plot_data_sre_spatial 
-    WHERE sre_mean > 1.0 
-    ORDER BY sre_mean DESC
+    SELECT unit_id, latent_field_mean, latent_field_lower, latent_field_upper 
+    FROM plot_data_latent_field_spatial 
+    WHERE latent_field_mean > 1.0 
+    ORDER BY latent_field_mean DESC
 """)
 display(df_high_risk)
 

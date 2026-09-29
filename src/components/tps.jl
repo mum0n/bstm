@@ -213,7 +213,7 @@ function get_priors(
     else
         return """
             $(p_names.sigma) ~ $(sigma_prior_str)
-            $(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)
+            $(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)
         """
     end
 end
@@ -237,9 +237,9 @@ function get_updates(
             $(common_code)
             local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
-            local coeffs = hyper.U * (diag_D .* $(p_names.ure))
-            $(p_names.sre) = B_basis * coeffs
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            local coeffs = hyper.U * (diag_D .* $(p_names.innovations))
+            $(p_names.latent_field) = B_basis * coeffs
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -248,11 +248,11 @@ function get_updates(
         let
             $(common_code)
             local F = hyper.cholesky_factor
-            local coeffs_unscaled = F.L' \\ $(p_names.ure)
+            local coeffs_unscaled = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
             local coeffs = $(p_names.sigma) .* (coeffs_unscaled .- mean(coeffs_unscaled))
-            $(p_names.sre) = B_basis * coeffs
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(p_names.latent_field) = B_basis * coeffs
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -262,11 +262,11 @@ function get_updates(
             $(common_code)
             local Q_penalty = hyper.Q_template
             local F = cholesky(Symmetric(Q_penalty + M.noise * I))
-            local coeffs_unscaled = F.L' \\ $(p_names.ure)
+            local coeffs_unscaled = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
             local coeffs = $(p_names.sigma) .* coeffs_unscaled
-            $(p_names.sre) = B_basis * coeffs
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(p_names.latent_field) = B_basis * coeffs
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -404,17 +404,12 @@ function get_effects(
             end
             effect_k_cpu = B_full_cpu * coeffs_samples_matrix
         else
-            ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "ure for TPS component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, size(B_full_cpu, 1), n_samples))
-                continue
-            end
-            ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
+            innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
+            innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
             for i in 1:n_samples
                 sigma_i = sigma_samples_cpu[i]
-                innovations_i = ure_samples_cpu[i, :]
+                innovations_i = innovations_samples_cpu[i, :]
                 
                 local coeffs_cpu
                 if m.method == :spectral

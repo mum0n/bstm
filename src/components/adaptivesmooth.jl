@@ -54,9 +54,9 @@ expansion in the warped space.
     Default: `:noncentered`.
 
 # Outputs (Parameter Names)
-- `W1_<key>`: `Matrix{Float64}`, MLP input weights.
-- `b1_<key>`: `Vector{Float64}`, MLP hidden biases.
-- `W2_<key>`: `Matrix{Float64}`, MLP output weights.
+- `rff_weights_1_<key>`: `Matrix{Float64}`, MLP input weights.
+- `rff_offsets_1_<key>`: `Vector{Float64}`, MLP hidden biases.
+- `rff_weights_2_<key>`: `Matrix{Float64}`, MLP output weights.
 - `sigma_<key>`: `Float64`, standard deviation of basis coefficients.
 - `innovations_<key>`: `Vector{Float64}`, raw innovations for basis coefficients (for
   `:noncentered` and `:rw2_penalty`).
@@ -130,11 +130,12 @@ function get_precomputes(
     end
 
     return NamedTuple(precomputes)
+
 end
+
 
 """
     _adaptivesmooth_log_marginal_likelihood(y_residual, B, sigma, y_sigma, noise=1e-6)
-
 Computes the exact log marginal likelihood for an AdaptiveSmooth component with latent basis
   weights integrated out analytically.
 Uses Woodbury / matrix determinant identity in O(N*M + M^3) operations.
@@ -149,33 +150,25 @@ function _adaptivesmooth_log_marginal_likelihood(
     N = length(y_residual)
     M_dim = size(B, 2)
     T_num = promote_type(T, typeof(noise))
-    
     inv_sigma2 = one(T_num) / (sigma^2 + T_num(noise))
     inv_y_sig2 = one(T_num) / (y_sigma^2 + T_num(noise))
-    
     # Q_beta = (1/sigma^2)*I + (1/y_sig^2)*(B' * B)
     Q_beta = (B' * B) .* inv_y_sig2
     for d in 1:M_dim
         Q_beta[d, d] += inv_sigma2
     end
-    
     F = cholesky(Symmetric(Q_beta))
-    
     # Determinant of (sigma^2 B B' + y_sigma^2 I) via matrix determinant lemma:
     # log det = N * log(y_sigma^2) + M * log(sigma^2) + 2 * sum(log, diag(F.U))
     log_det = N * log(y_sigma^2 + T_num(noise)) + M_dim * log(sigma^2 + T_num(noise)) + 2 * sum(log.(diag(F.U)))
-    
     # Quadratic term via Woodbury:
     # (1/y_sigma^2) * ||y_residual||^2 - (1/y_sigma^4) * y_res' * B * Q_beta^{-1} * B' * y_res
     b = (B' * y_residual) .* inv_y_sig2
     v = F.L \ b
     quad_term = inv_y_sig2 * dot(y_residual, y_residual) - dot(v, v)
-    
     log_lik = - (N / 2) * log(2 * T_num(pi)) - (1 / 2) * log_det - (1 / 2) * quad_term
     return log_lik
 end
-
-
 """
     get_priors(m::AdaptiveSmooth, spec::NamedTuple, arch::String, outcome_idx, M)
 
@@ -192,16 +185,16 @@ function get_priors(
     n_bins = m.nbins
 
     priors = String[]
-    push!(priors, "$(p_names.W1) ~ MvNormal(zeros(T, $(in_dim * h_dim)), I)")
-    push!(priors, "$(p_names.b1) ~ MvNormal(zeros(T, $(h_dim)), I)")
+    push!(priors, "$(p_names.rff_weights_1) ~ MvNormal(zeros(T, $(in_dim * h_dim)), I)")
+    push!(priors, "$(p_names.rff_offsets_1) ~ MvNormal(zeros(T, $(h_dim)), I)")
     push!(priors,
-        "$(p_names.W2) ~ MvNormal(zeros(T, $(h_dim * n_bins)), I)") # W2 is always sampled
+        "$(p_names.rff_weights_2) ~ MvNormal(zeros(T, $(h_dim * n_bins)), I)") # the output layer is always sampled
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     if m.method in [:noncentered, :rw2_penalty] # Latent field is sampled
-        push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, $(n_bins)), I)")
+        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_bins)), I)")
     elseif m.method == :centered
-        push!(priors, "$(p_names.sre) ~ MvNormal(zeros(T, $(n_bins)), I)")
+        push!(priors, "$(p_names.latent_field) ~ MvNormal(zeros(T, $(n_bins)), I)")
     end
     
     return join(priors, "\n    ")
@@ -228,18 +221,18 @@ function get_updates(
         let
             hyper = spec_registry[:$(key)].hyper
             X_orig = hyper.coords
-            W1 = reshape($(p_names.W1), $(in_dim), $(h_dim))
-            b1 = $(p_names.b1)
-            W2 = reshape($(p_names.W2), $(h_dim), $(n_bins))
+            rff_weights_1 = reshape($(p_names.rff_weights_1), $(in_dim), $(h_dim))
+            rff_offsets_1 = $(p_names.rff_offsets_1)
+            rff_weights_2 = reshape($(p_names.rff_weights_2), $(h_dim), $(n_bins))
             
-            H = tanh.((X_orig * W1) .+ b1')
-            B_adaptive = H * W2
+            H = tanh.((X_orig * rff_weights_1) .+ rff_offsets_1')
+            B_adaptive = H * rff_weights_2
     """
 
     noncentered_code = """
         # --- AdaptiveSmooth Component (Non-Centered): $(key) ---
         $(common_code)
-            scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
+            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
             adaptive_effect = B_adaptive * scaled_coeffs
             $(eta_target) = $(eta_target) .+ adaptive_effect
         end
@@ -248,7 +241,7 @@ function get_updates(
     centered_code = """
         # --- AdaptiveSmooth Component (Centered): $(key) ---
         $(common_code)
-            coeffs = $(p_names.sre) .* $(p_names.sigma)
+            coeffs = $(p_names.latent_field) .* $(p_names.sigma)
             adaptive_effect = B_adaptive * coeffs
             $(eta_target) = $(eta_target) .+ adaptive_effect
         end
@@ -262,7 +255,7 @@ function get_updates(
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
             
-            coeffs = hyper.U * (diag_D .* $(p_names.ure))
+            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             adaptive_effect = B_adaptive * coeffs
             
             $(eta_target) = $(eta_target) .+ adaptive_effect
@@ -335,21 +328,21 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         # Find parameter names in the MCMC chain
-        W1_name = _find_parameter(p_names, string(p_names_k.W1), k, is_multivariate_model)
-        b1_name = _find_parameter(p_names, string(p_names_k.b1), k, is_multivariate_model)
-        W2_name = _find_parameter(p_names, string(p_names_k.W2), k, is_multivariate_model)
+        rff_weights_1_name = _find_parameter(p_names, string(p_names_k.rff_weights_1), k, is_multivariate_model)
+        rff_offsets_1_name = _find_parameter(p_names, string(p_names_k.rff_offsets_1), k, is_multivariate_model)
+        rff_weights_2_name = _find_parameter(p_names, string(p_names_k.rff_weights_2), k, is_multivariate_model)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         
-        if isempty(W1_name) || isempty(b1_name) || isempty(W2_name) || isempty(sigma_name)
+        if isempty(rff_weights_1_name) || isempty(rff_offsets_1_name) || isempty(rff_weights_2_name) || isempty(sigma_name)
             @warn "MLP parameters for AdaptiveSmooth component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
 
         # Extract posterior samples from the chain
-        W1_samples = get_params_vector(chain, W1_name, m.hidden_dim * spec.hyper.in_dim)
-        b1_samples = get_params_vector(chain, b1_name, m.hidden_dim)
-        W2_samples = get_params_vector(chain, W2_name, m.hidden_dim * m.nbins)
+        rff_weights_1_samples = get_params_vector(chain, rff_weights_1_name, m.hidden_dim * spec.hyper.in_dim)
+        rff_offsets_1_samples = get_params_vector(chain, rff_offsets_1_name, m.hidden_dim)
+        rff_weights_2_samples = get_params_vector(chain, rff_weights_2_name, m.hidden_dim * m.nbins)
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
 
         # Initialize the output matrix on the CPU
@@ -358,69 +351,45 @@ function get_effects(
         # --- Sample-wise Reconstruction ---
         for i in 1:n_samples
             # Reshape samples
-            W1 = reshape(W1_samples[i, :], spec.hyper.in_dim, m.hidden_dim)
-            b1 = b1_samples[i, :]
-            W2 = reshape(W2_samples[i, :], m.hidden_dim, m.nbins)
+            rff_weights_1 = reshape(rff_weights_1_samples[i, :], spec.hyper.in_dim, m.hidden_dim)
+            rff_offsets_1 = rff_offsets_1_samples[i, :]
+            rff_weights_2 = reshape(rff_weights_2_samples[i, :], m.hidden_dim, m.nbins)
             
             # Compute adaptive basis
-            H = tanh.((coords_full * W1) .+ b1')
-            B_adaptive = H * W2
+            H = tanh.((coords_full * rff_weights_1) .+ rff_offsets_1')
+            B_adaptive = H * rff_weights_2
             
             # Reconstruct coefficients based on the sampling method
             local coeffs
             if m.method == :centered
-                sre_name = _find_parameter(p_names, string(p_names_k.sre), k,
+                latent_field_name = _find_parameter(p_names, string(p_names_k.latent_field), k,
                     is_multivariate_model)
-                if isempty(sre_name)
-                    @warn "Latent coefficients for centered AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
-                    coeffs = zeros(m.nbins)
-                else
-                    coeffs = get_params_vector(chain, sre_name, m.nbins)[i, :] .* sigma_samples[i]
-                end
             elseif m.method == :marginalized
                 # Exact conditional Gaussian simulation for basis weights beta ~ N(0, sigma^2 I)
                 y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
                 y_sig = !isempty(y_sigma_name) ? get_params_vector(chain, y_sigma_name, 1)[i,
                     1] : 1.0
-                
                 y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
                 n_train = size(coords_train, 1)
                 B_train = B_adaptive[1:n_train, :]
-                
                 inv_sigma2 = 1.0 / (sigma_samples[i]^2 + M.noise)
                 inv_y_sig2 = 1.0 / (y_sig^2 + M.noise)
-                
                 # Q_post = (1/sigma^2)*I + (1/y_sig^2)*(B_train' * B_train)
                 Q_post = (B_train' * B_train) .* inv_y_sig2
                 for d in 1:m.nbins
                     Q_post[d, d] += inv_sigma2
                 end
                 
+
                 F = cholesky(Symmetric(Q_post))
                 b = (B_train' * y_vec[1:n_train]) .* inv_y_sig2
                 mu = F \ b
                 z = randn(m.nbins)
                 coeffs = mu + F.U \ z
             else # :noncentered or :rw2_penalty
-                ure_name = _find_parameter(p_names, string(p_names_k.ure), k,
+                innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k,
                     is_multivariate_model)
-                if isempty(ure_name)
-                    @warn "Innovations (ure) for AdaptiveSmooth component $(spec.key) (outcome $k) not found. Using zeros."
-                    coeffs = zeros(m.nbins)
-                else
-                    ure_samples = get_params_vector(chain, ure_name, m.nbins)[i, :]
-                    
-                    if m.method == :noncentered
-                        coeffs = ure_samples .* sigma_samples[i]
-                    else # :rw2_penalty
-                        U = spec.hyper.U
-                        L = spec.hyper.L
-                        diag_D = sigma_samples[i] ./ sqrt.(L .+ M.noise)
-                        diag_D[1] = 0.0; diag_D[2] = 0.0
-                        
-                        coeffs = U * (diag_D .* ure_samples)
-                    end
-                end
+
             end
             
             # Compute the effect for this sample

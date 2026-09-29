@@ -201,7 +201,7 @@ function get_priors(
         return """
         # Priors for BCGN component: $(spec.key)
         $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-        $(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)
+        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     end
 end
@@ -230,9 +230,9 @@ function get_updates(
             diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
             diag_D[L .< 1e-6] .= 0.0
             
-            latent_field = U * (diag_D .* $(p_names.ure))
-            $(p_names.sre) = hyper.mapping_matrix * latent_field
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            latent_field = U * (diag_D .* $(p_names.innovations))
+            $(p_names.latent_field) = hyper.mapping_matrix * latent_field
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -241,13 +241,13 @@ function get_updates(
         let
             hyper = spec_registry[:$(key)].hyper
             F = hyper.cholesky_factor
-            sre_unscaled = F.L' \\ $(p_names.ure)
+            latent_field_unscaled = F.L' \\ $(p_names.innovations)
             
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(sre_unscaled))
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_unscaled))
             
-            latent_field = sre_unscaled .* $(p_names.sigma)
-            $(p_names.sre) = hyper.mapping_matrix * latent_field
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            latent_field = latent_field_unscaled .* $(p_names.sigma)
+            $(p_names.latent_field) = hyper.mapping_matrix * latent_field
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -257,13 +257,13 @@ function get_updates(
             hyper = spec_registry[:$(key)].hyper
             Q = hyper.Q_template
             F = cholesky(Symmetric(Q + M.noise * I))
-            sre_unscaled = F.L' \\ $(p_names.ure)
+            latent_field_unscaled = F.L' \\ $(p_names.innovations)
             
-            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(sre_unscaled))
+            Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_unscaled))
             
-            latent_field = sre_unscaled .* $(p_names.sigma)
-            $(p_names.sre) = hyper.mapping_matrix * latent_field
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            latent_field = latent_field_unscaled .* $(p_names.sigma)
+            $(p_names.latent_field) = hyper.mapping_matrix * latent_field
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -394,36 +394,31 @@ function get_effects(
                 effect_k_matrix[:, j] = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
             end
         else
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "Innovations (ure) for BCGN component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            ure_samples = get_params_vector(chain, ure_name, n_latent)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_samples = get_params_vector(chain, innovations_name, n_latent)
 
             if m.method == :spectral
                 U = spec.hyper.U
                 L = spec.hyper.L
-                ure_samples_T = ure_samples'
+                innovations_samples_T = innovations_samples'
 
                 for j in 1:n_samples
                     sigma_j = sigma_samples[j]
                     
                     diag_D = sigma_j ./ sqrt.(L .+ noise)
                     diag_D[L .< 1e-6] .= 0.0
-                    effect_k_matrix[:, j] = U * (diag_D .* ure_samples_T[:, j])
+                    effect_k_matrix[:, j] = U * (diag_D .* innovations_samples_T[:, j])
                 end
             else # :cholesky or :cholesky_sparse
                 F = spec.hyper.cholesky_factor
-                ure_samples_T = ure_samples'
+                innovations_samples_T = innovations_samples'
 
                 for j in 1:n_samples
                     sigma_j = sigma_samples[j]
 
-                    sre_unscaled = F.L' \ ure_samples_T[:, j]
-                    sre_unscaled .-= mean(sre_unscaled)
-                    effect_k_matrix[:, j] = sre_unscaled .* sigma_j
+                    latent_field_unscaled = F.L' \ innovations_samples_T[:, j]
+                    latent_field_unscaled .-= mean(latent_field_unscaled)
+                    effect_k_matrix[:, j] = latent_field_unscaled .* sigma_j
                 end
             end
         end

@@ -45,8 +45,8 @@ where:
 # Outputs (Parameter Names)
 - `rho_unconstrained_<key>`: The unconstrained mixing parameter.
 - `sigma_<key>`: The marginal standard deviation.
-- `ure_<key>`: Standard normal innovations for the spatial field.
-- `sre_<key>`: Reconstructed structured spatial effect.
+- `innovations_<key>`: Standard normal innovations for the spatial field.
+- `latent_field_<key>`: Reconstructed structured spatial effect.
 
 # Key References
 - Riebler, A., Sørbye, S. H., Simpson, D., & Rue, H. (2016). *An intuitive joint prior for
@@ -204,8 +204,8 @@ function get_priors(
         return """
         $(p_names.rho_unconstrained) ~ $(_distribution_to_string(m.rho_unconstrained))
         $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-        $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), I)
-        $(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)
+        $(p_names.latent_field) ~ MvNormal(zeros(T, $(n_latent)), I)
+        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     end
 end
@@ -235,11 +235,11 @@ function get_updates(
             diag_D_cpu[1] = 0.0 # Enforce sum-to-zero constraint
             
             # Apply the spectral transformation: latent = U * D * z
-            structured_effect = hyper.U * (diag_D_cpu .* $(p_names.sre))
+            structured_effect = hyper.U * (diag_D_cpu .* $(p_names.latent_field))
             
             # Combine structured and unstructured components
             local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* structured_effect .+ 
-                                sqrt(1.0 - rho) .* $(p_names.ure))
+                                sqrt(1.0 - rho) .* $(p_names.innovations))
             
             $(eta_target) = $(eta_target) .+ view(combined_effect, M.s_idx)
         end
@@ -252,12 +252,12 @@ function get_updates(
             rho = logistic($(p_names.rho_unconstrained))
             F = hyper.cholesky_factor
             
-            sre_unscaled = F.L' \\ $(p_names.sre)
+            latent_field_unscaled = F.L' \\ $(p_names.latent_field)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), 
-                                       sum(sre_unscaled))
+                                       sum(latent_field_unscaled))
             
-            local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* sre_unscaled .+ 
-                                sqrt(1.0 - rho) .* $(p_names.ure))
+            local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* latent_field_unscaled .+ 
+                                sqrt(1.0 - rho) .* $(p_names.innovations))
             
             $(eta_target) = $(eta_target) .+ view(combined_effect, M.s_idx)
         end
@@ -271,12 +271,12 @@ function get_updates(
             Q_penalty = hyper.Q_template
             F = cholesky(Symmetric(Q_penalty + M.noise * I))
             
-            sre_unscaled = F.L' \\ $(p_names.sre)
+            latent_field_unscaled = F.L' \\ $(p_names.latent_field)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * $(n_latent)), 
-                                       sum(sre_unscaled))
+                                       sum(latent_field_unscaled))
             
-            local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* sre_unscaled .+ 
-                                sqrt(1.0 - rho) .* $(p_names.ure))
+            local combined_effect = $(p_names.sigma) .* (sqrt(rho) .* latent_field_unscaled .+ 
+                                sqrt(1.0 - rho) .* $(p_names.innovations))
             
             $(eta_target) = $(eta_target) .+ view(combined_effect, M.s_idx)
         end
@@ -436,22 +436,22 @@ function get_effects(
                 unstructured_latent[:, i] = eps_vec
             end
         else
-            sre_innov_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate)
-            ure_innov_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate)
+            latent_field_name = _find_parameter(p_names, string(p_names_k.latent_field), k, is_multivariate)
+            innovations_field_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate)
 
-            if isempty(sre_innov_name) || isempty(ure_innov_name)
-                @warn "Innovations (sre/ure) for BYM2 component $(spec.key) (outcome $(k)) not found. Returning zero-matrices."
+            if isempty(latent_field_name) || isempty(innovations_field_name)
+                @warn "Innovations (latent_field/innovations) for BYM2 component $(spec.key) (outcome $(k)) not found. Returning zero-matrices."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 push!(unstructured_effects, zeros(Float64, N_total, n_samples))
                 push!(total_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
 
-            sre_innov_samples = get_params_matrix(chain, sre_innov_name, n_latent)
-            ure_innov_samples = get_params_matrix(chain, ure_innov_name, n_latent)
+            latent_field_innovations_samples = get_params_matrix(chain, latent_field_name, n_latent)
+            innovations_samples = get_params_matrix(chain, innovations_field_name, n_latent)
 
             for i in 1:n_samples # Iterate over each posterior sample
-                sre_innov_i = sre_innov_samples[i, :] # Innovations for structured component for current sample
+                latent_field_innovations_i = latent_field_innovations_samples[i, :] # Innovations for structured component for current sample
                 
                 local struct_effect_unscaled # Unscaled structured effect before scaling
                 if m.method == :spectral
@@ -459,17 +459,17 @@ function get_effects(
                     L = hyper.L
                     diag_D = 1.0 ./ sqrt.(L .+ noise)
                     diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-                    struct_effect_unscaled = U * (diag_D .* sre_innov_i)
+                    struct_effect_unscaled = U * (diag_D .* latent_field_innovations_i)
                 else # :cholesky or :cholesky_sparse (use pre-computed dense Cholesky factor)
                     F = hyper.cholesky_factor
-                    struct_effect_unscaled = F.L' \ sre_innov_i # Back-solve for unscaled structured effect
+                    struct_effect_unscaled = F.L' \ latent_field_innovations_i # Back-solve for unscaled structured effect
                     struct_effect_unscaled .-= mean(struct_effect_unscaled)
                 end
                 
                 structured_latent[:, i] = sigma_samples[i, 1] * sqrt(rho_samples[i,
                     1]) * struct_effect_unscaled
                 unstructured_latent[:, i] = sigma_samples[i, 1] * sqrt(1.0 - rho_samples[i,
-                    1]) * ure_innov_samples[i, :]
+                    1]) * innovations_samples[i, :]
             end
         end
         

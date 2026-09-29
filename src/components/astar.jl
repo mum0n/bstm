@@ -88,9 +88,9 @@ on cumulative migration distance.
 - `beta_<key>`: Friction sensitivity parameter.
 - `sigma_<key>`: Marginal standard deviation of the spatial random effect.
 - `friction_power_<key>`: Inferred friction power exponent (when modeled as random).
-- `ure_<key>`: Standard normal innovations for the spatial field.
-- `ure_hab_<key>`: Latent habitat innovation terms (when `habitat_se` is supplied).
-- `sre_<key>`: Structured spatial effect vector.
+- `innovations_<key>`: Standard normal innovations for the spatial field.
+- `innovations_habitat_<key>`: Latent habitat innovation terms (when `habitat_se` is supplied).
+- `latent_field_<key>`: Structured spatial effect vector.
 - `astar_paths`: `StochasticAStarResult` containing posterior corridor probabilities,
   consensus medoid path, and migration distance credible intervals.
 
@@ -376,10 +376,10 @@ function get_priors(
     n_latent = spec.hyper.n_latent
 
     if spec.hyper.has_error
-        push!(priors, "$(p_names.ure_hab) ~ MvNormal(zeros(T, $(s_N)), I)")
+        push!(priors, "$(p_names.innovations_habitat) ~ MvNormal(zeros(T, $(s_N)), I)")
     end
 
-    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)")
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
 
     return join(priors, "\n    ")
 end
@@ -414,7 +414,7 @@ function get_updates(
             hab_mean = hyper.habitat_data
             hab_se = hyper.habitat_se_data
 
-            hab_latent = hab_mean .+ hab_se .* $(p_names.ure_hab)
+            hab_latent = hab_mean .+ hab_se .* $(p_names.innovations_habitat)
             hab_clamped = clamp.(hab_latent, 0.001, 0.999)
 
             # Resistance: r = (1 - h)^p
@@ -430,9 +430,9 @@ function get_updates(
             Q_A = D_A - W_A
 
             F = cholesky(Symmetric(Matrix(Q_A) + M.noise * I))
-            $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
+            $(p_names.latent_field) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
 
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
         """
     else
@@ -457,9 +457,9 @@ function get_updates(
             Q_A = D_A - W_A
 
             F = cholesky(Symmetric(Matrix(Q_A) + M.noise * I))
-            $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
+            $(p_names.latent_field) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
 
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
         """
     end
@@ -516,11 +516,11 @@ function get_effects(
         sigma_name = _find_parameter(
             p_names, string(p_names_k.sigma), k_outcome, is_multivariate_model
         )
-        ure_name = _find_parameter(
-            p_names, string(p_names_k.ure), k_outcome, is_multivariate_model
+        innovations_name = _find_parameter(
+            p_names, string(p_names_k.innovations), k_outcome, is_multivariate_model
         )
 
-        if isempty(beta_name) || isempty(sigma_name) || isempty(ure_name)
+        if isempty(beta_name) || isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for AStar component $(spec.key) not found."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -528,11 +528,11 @@ function get_effects(
 
         beta_samples = get_params_vector(chain, beta_name, 1)[:, 1]
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ure_samples = get_params_matrix(chain, ure_name, s_N)
+        innovations_samples = get_params_matrix(chain, innovations_name, s_N)
 
-        ure_hab_samples = if has_error
+        innovations_habitat_samples = if has_error
             hab_name = _find_parameter(
-                p_names, string(p_names_k.ure_hab), k_outcome, is_multivariate_model
+                p_names, string(p_names_k.innovations_habitat), k_outcome, is_multivariate_model
             )
             !isempty(hab_name) ? get_params_matrix(chain, hab_name, s_N) : nothing
         else
@@ -555,8 +555,8 @@ function get_effects(
         reconstructed_effects_k = zeros(Float64, s_N, n_samples)
 
         for i in 1:n_samples
-            hab_i = if has_error && !isnothing(ure_hab_samples)
-                habitat_data .+ habitat_se_data .* ure_hab_samples[i, :]
+            hab_i = if has_error && !isnothing(innovations_habitat_samples)
+                habitat_data .+ habitat_se_data .* innovations_habitat_samples[i, :]
             else
                 habitat_data
             end
@@ -576,7 +576,7 @@ function get_effects(
             Q_A_i = D_A_i - W_A_i
 
             F_i = cholesky(Symmetric(Matrix(Q_A_i) + noise * I))
-            innov_i = ure_samples[i, :]
+            innov_i = innovations_samples[i, :]
             reconstructed_effects_k[:, i] = sigma_samples[i] .* (F_i.L' \ innov_i)
         end
 

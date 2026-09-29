@@ -18,7 +18,7 @@ the Squared Exponential (SE) kernel is:
 \$k(x, x') = \\sigma^2 \\exp\\left(-\\frac{\\|x - x'\\|^2}{2\\ell^2}\\right)\$
 where:
 - \$\\sigma^2\$ is the marginal variance.
-- \$\\ell\$ is the characteristic lengthscale.
+- \$\\ell\$ is the characteristic length_scale.
 
 For **anisotropic** models (Automatic Relevance Determination), the squared distance
 is weighted by a vector of lengthscales \$\\boldsymbol{\\ell} = [\\ell_1, \\dots, \\ell_D]\$:
@@ -45,16 +45,16 @@ evaluated at all data points.
     Default: `"se"`.
   - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP.
     Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
-    the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
-  - `anisotropic`: `Bool`, if `true`, a separate lengthscale is estimated for each input
+  - `length_scale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel length_scale(s). Default: `Gamma(2, 0.5)`.
+  - `anisotropic`: `Bool`, if `true`, a separate length_scale is estimated for each input
     dimension (ARD). Default: `false`.
   - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default:
     `:noncentered`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the GP.
-- `ls_<key>`: The kernel lengthscale(s). A vector if anisotropic.
+- `ls_<key>`: The kernel length_scale(s). A vector if anisotropic.
 - `innovations_<key>`: The raw standard normal innovations for the latent field (for
   `:noncentered`).
 - `latent_<key>`: The latent field (for `:centered`).
@@ -64,7 +64,7 @@ evaluated at all data points.
   MIT Press.
 """
 struct GP <: ComponentModel
-    lengthscale::Union{Distribution, Vector{<:Distribution}}
+    length_scale::Union{Distribution, Vector{<:Distribution}}
     sigma::Distribution
     kernel::String
     method::Symbol
@@ -72,7 +72,7 @@ end
 
 COMPONENT_TYPE_REGISTRY[:gp] = GP
 COMPONENT_CONSTRUCTORS[:gp] = (p, params) -> GP(
-    p.lengthscale, p.sigma, string(get(params, :kernel, "se")),
+    p.length_scale, p.sigma, string(get(params, :kernel, "se")),
     get(params, :method, :noncentered)
 )
 
@@ -99,7 +99,7 @@ function get_precomputes(m::GP, M::NamedTuple, mod_data::Dict)::NamedTuple
 end
 
 """
-    _gp_log_marginal_likelihood(y_residual, coords, sigma, ls, kernel_type, y_sigma, noise=1e-6)
+    _gp_log_marginal_likelihood(y_residual, coords, sigma, length_scale, kernel_type, y_sigma, noise=1e-6)
 
 Computes the exact log marginal likelihood for a full Gaussian Process with latent field
   integrated out analytically.
@@ -108,7 +108,7 @@ function _gp_log_marginal_likelihood(
     y_residual::AbstractVector{T},
     coords::AbstractMatrix,
     sigma::T,
-    ls::Union{T, AbstractVector{T}},
+    length_scale::Union{T, AbstractVector{T}},
     kernel_type::Symbol,
     y_sigma::T,
     noise::Real=1e-6
@@ -116,7 +116,7 @@ function _gp_log_marginal_likelihood(
     N = length(y_residual)
     T_num = promote_type(T, typeof(noise))
     
-    K_mat = evaluate_kernel_matrix(coords, sigma, ls, kernel_type, noise)
+    K_mat = evaluate_kernel_matrix(coords, sigma, length_scale, kernel_type, noise)
     total_noise = y_sigma^2 + T_num(noise)
     
     Ky = Matrix{T_num}(K_mat)
@@ -147,17 +147,17 @@ function get_priors(
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     # This logic correctly handles both isotropic (single Distribution) and
-    # anisotropic (Vector of Distributions) cases for the lengthscale.
-    if m.lengthscale isa Vector
-        ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
+    # anisotropic (Vector of Distributions) cases for the length_scale.
+    if m.length_scale isa Vector
+        length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
+        push!(priors, "$(p_names.length_scale) ~ Product([$(length_scale_priors_str)])")
     else
-        ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
+        length_scale_prior_str = _distribution_to_string(m.length_scale)
+        push!(priors, "$(p_names.length_scale) ~ $(length_scale_prior_str)")
     end
     
     if m.method == :noncentered
-        push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)")
+        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)")
     end
 
     return join(priors, "\n    ")
@@ -172,14 +172,14 @@ function get_updates(
     key = spec.key
     
     # The `evaluate_kernel_matrix` function is designed to handle both scalar and vector
-    # lengthscale parameters (`ls`), correctly implementing isotropic and ARD kernels.
+    # length_scale parameters, correctly implementing isotropic and ARD kernels.
     common_code = """
         let
             coords = spec_registry[:$(key)].hyper.coords
             kernel_type = Symbol("$(m.kernel)")
 
             K_mat = evaluate_kernel_matrix(
-                coords, $(p_names.sigma), $(p_names.ls), kernel_type, M.noise
+                coords, $(p_names.sigma), $(p_names.length_scale), kernel_type, M.noise
             )
     """
 
@@ -187,16 +187,16 @@ function get_updates(
         # --- GP (Non-Centered): $(key) ---
         $(common_code)
             F_gp = cholesky(Symmetric(K_mat))
-            $(p_names.sre) = F_gp.L * $(p_names.ure)
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(p_names.latent_field) = F_gp.L * $(p_names.innovations)
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
     centered_code = """
         # --- GP (Centered): $(key) ---
         $(common_code)
-            $(p_names.sre) ~ MvNormal(zeros(T, size(K_mat, 1)), Symmetric(K_mat))
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(p_names.latent_field) ~ MvNormal(zeros(T, size(K_mat, 1)), Symmetric(K_mat))
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -210,7 +210,7 @@ function get_updates(
                 y_residual,
                 coords,
                 $(p_names.sigma),
-                $(p_names.ls),
+                $(p_names.length_scale),
                 kernel_type,
                 y_sigma,
                 M.noise
@@ -267,17 +267,17 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
+        length_scale_name = _find_parameter(p_names, string(p_names_k.length_scale), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(ls_name)
+        if isempty(sigma_name) || isempty(length_scale_name)
             @warn "Parameters for GP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
 
         sigma_samples = get_params_vector(chain, sigma_name, 1)
-        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        ls_samples = get_params_matrix(chain, ls_name, ls_dim)
+        length_scale_dim = m.length_scale isa Vector ? length(m.length_scale) : 1
+        length_scale_samples = get_params_matrix(chain, length_scale_name, length_scale_dim)
 
         effect_k_matrix = zeros(Float64, n_obs_full, n_samples)
 
@@ -293,7 +293,7 @@ function get_effects(
             y_vec = M.y_obs isa AbstractMatrix ? M.y_obs[:, k] : M.y_obs
             
             for i in 1:n_samples
-                current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
+                current_ls = length_scale_dim > 1 ? length_scale_samples[i, :] : length_scale_samples[i, 1]
                 sig = sigma_samples[i, 1]
                 y_sig = y_sigma_samples[i]
                 
@@ -341,22 +341,17 @@ function get_effects(
                 end
             end
         elseif m.method == :noncentered
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "Innovations for GP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
-                continue
-            end
-            ure_samples = get_params_matrix(chain, ure_name, n_obs_train)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_obs_train)
 
             for i in 1:n_samples
-                current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
+                current_ls = length_scale_dim > 1 ? length_scale_samples[i, :] : length_scale_samples[i, 1]
                 
                 K_mat = evaluate_kernel_matrix(coords_full, sigma_samples[i, 1], current_ls,
                     kernel_type, noise)
                 F = cholesky(Symmetric(K_mat))
                 
-                innov_train = ure_samples[i, :]
+                innov_train = innovations_samples[i, :]
                 innov_i = if n_obs_full > n_obs_train
                     innov_pred = randn(Float64, n_obs_full - n_obs_train)
                     vcat(innov_train, innov_pred)
@@ -366,20 +361,15 @@ function get_effects(
                 effect_k_matrix[:, i] = F.L * innov_i
             end
         elseif m.method == :centered
-            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
-            if isempty(sre_name)
-                @warn "Latent field for GP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
-                continue
-            end
-            sre_samples = get_params_matrix(chain, sre_name, n_obs_train)
+            latent_field_name = _find_parameter(p_names, string(p_names_k.latent_field), k, is_multivariate_model)
+            latent_field_samples = get_params_matrix(chain, latent_field_name, n_obs_train)
 
             for i in 1:n_samples
-                effect_k_matrix[1:n_obs_train, i] = sre_samples[i, :]
+                effect_k_matrix[1:n_obs_train, i] = latent_field_samples[i, :]
                 
                 if n_obs_full > n_obs_train
                     coords_pred = coords_full[(n_obs_train+1):end, :]
-                    current_ls = ls_dim > 1 ? ls_samples[i, :] : ls_samples[i, 1]
+                    current_ls = length_scale_dim > 1 ? length_scale_samples[i, :] : length_scale_samples[i, 1]
                     
                     K_ff = evaluate_kernel_matrix(coords_train, sigma_samples[i, 1],
                         current_ls, kernel_type, noise)
@@ -390,7 +380,7 @@ function get_effects(
                     
                     L_ff = cholesky(Symmetric(K_ff)).L
                     A = L_ff' \ (L_ff \ K_star_f')
-                    mu_pred = A' * sre_samples[i, :]
+                    mu_pred = A' * latent_field_samples[i, :]
                     Sigma_pred = K_star_star - K_star_f * A
                     
                     pred_innov = randn(Float64, size(Sigma_pred, 1))

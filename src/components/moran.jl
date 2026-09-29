@@ -160,7 +160,7 @@ function get_priors(
     if m.method == :noncentered
         push!(
             priors,
-            "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(spec.hyper.n_latent)), I), :$(p_names.ure))"
+            "$(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)"
         )
     end
     
@@ -190,9 +190,9 @@ function get_updates(
         # --- Moran Eigenvector Component (Non-Centered): $(key) ---
         let
             $(common_code)
-            scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
-            $(p_names.sre) = moran_eigenvectors * scaled_coeffs
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
+            $(p_names.latent_field) = moran_eigenvectors * scaled_coeffs
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -200,8 +200,8 @@ function get_updates(
         # --- Moran Eigenvector Component (Centered): $(key) ---
         let
             $(common_code)
-            $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), $(p_names.sigma)^2 * I)
-            latent_field = moran_eigenvectors * $(p_names.sre)
+            $(p_names.latent_field) ~ MvNormal(zeros(T, $(n_latent)), $(p_names.sigma)^2 * I)
+            latent_field = moran_eigenvectors * $(p_names.latent_field)
             $(eta_target) = $(eta_target) .+ view(latent_field, M.s_idx)
         end
     """
@@ -317,25 +317,15 @@ function get_effects(
             end
             latent_field_matrix = eigenvectors * coeffs_matrix
         elseif m.method == :noncentered
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "ure for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            ure_samples = get_params_matrix(chain, ure_name, n_latent) # (n_samples, n_latent)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
             
-            scaled_coeffs = ure_samples' .* sigma_samples' # (n_latent, n_samples)
+            scaled_coeffs = innovations_samples' .* sigma_samples' # (n_latent, n_samples)
             latent_field_matrix = eigenvectors * scaled_coeffs
 
         else # :centered
-            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
-            if isempty(sre_name)
-                @warn "sre for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            coeffs_samples = get_params_matrix(chain, sre_name, n_latent)
+            latent_field_name = _find_parameter(p_names, string(p_names_k.latent_field), k, is_multivariate_model)
+            coeffs_samples = get_params_matrix(chain, latent_field_name, n_latent)
             
             latent_field_matrix = eigenvectors * coeffs_samples'
         end

@@ -290,7 +290,7 @@ scalefactor = scaling_factor_bym2(W)
 │ 1. Count Enforcement     │ 2. Area Controls           │ 3. Pruning & Merging    │
 │  - target_units=15       │  - target_area=50.0        │  - min_area=5.0         │
 │  - exact_units=true      │  - min_area / max_area     │  - merge_small_polygons │
-│  - grid_resolution=(6,8) │  - radius / lengthscale    │  - prune_empty=true     │
+│  - grid_resolution=(6,8) │  - radius / length_scale    │  - prune_empty=true     │
 └──────────────────────────┴────────────────────────────┴─────────────────────────┘
 ```
 
@@ -316,7 +316,7 @@ scalefactor = scaling_factor_bym2(W)
 | `merge_small_polygons` | `Bool` | `false` | All | Automatically merges polygons with $\text{area} < \text{min\_area}$ into their neighbor sharing the longest boundary edge using `LibGEOS.union`. |
 | `prune_empty` | `Bool` | `false` | All | Drops spatial units containing 0 data points and updates the graph and $W$ matrix. Reduces model dimension to active units only. |
 | `radius` | `Real` | `nothing` | `:hexagonal` | Explicit hexagon radius $R$. Direct control over honeycomb cell resolution. |
-| `lengthscale` | `Real` | `nothing` | `:lattice` | Explicit square cell side length $L$. Direct control over raster cell resolution. |
+| `length_scale` | `Real` | `nothing` | `:lattice` | Explicit square cell side length $L$. Direct control over raster cell resolution. |
 | `grid_resolution` | `Int` or `(Int, Int)` | `nothing` | `:lattice` | Explicit $(rows, cols)$ or $N \times N$ tiling for regular grids. |
 | `aspect_ratio` | `Real` | `1.0` | `:lattice` | Cell aspect ratio $L_y / L_x$. Used to accommodate non-square geographic bounding boxes without cell distortion. |
 | `input_polygons` | `Vector` | `nothing` | Custom | User-supplied custom geometries (e.g. Shapefile, GeoJSON). Bypasses automatic tessellation while constructing centroids, boundaries, and graph topology. |

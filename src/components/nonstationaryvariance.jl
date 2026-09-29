@@ -182,9 +182,9 @@ function get_updates(
 
     # Generate code for the modifier, which defines the log-sigma field.
     modifier_updates = get_updates(m.modifier_model, modifier_spec, arch, outcome_idx, M)
-    modifier_sre_var = generate_full_variable_names(modifier_spec, arch, outcome_idx).sre
+    modifier_latent_field_var = generate_full_variable_names(modifier_spec, arch, outcome_idx).latent_field
     modifier_logic = replace(modifier_updates, Regex("$(eta_target) \\.\\+= .*") => "")
-    modifier_logic = replace(modifier_logic, modifier_sre_var => "log_sigma_field")
+    modifier_logic = replace(modifier_logic, modifier_latent_field_var => "log_sigma_field")
 
     # Generate code for the base model, but modify it to produce a unit-variance field.
     base_updates = get_updates(m.base_model, base_spec, arch, outcome_idx, M)
@@ -197,8 +197,8 @@ function get_updates(
     base_logic_cleaned = replace(base_logic_unit_variance, Regex("$(eta_target) \\.\\+= .*") => "")
     
     # Rename the latent variable to avoid clashes if needed.
-    base_sre_var = base_p_names.sre
-    final_base_logic = replace(base_logic_cleaned, base_sre_var => "base_sre_unscaled")
+    base_latent_field_var = base_p_names.latent_field
+    final_base_logic = replace(base_logic_cleaned, base_latent_field_var => "base_latent_field_unscaled")
 
     return """
         # --- NonStationaryVariance Component: $(spec.key) ---
@@ -211,7 +211,7 @@ function get_updates(
             $(final_base_logic)
             
             # 3. Combine unscaled latent field with spatially varying sigma.
-            local final_effect_latent = base_sre_unscaled .* spatially_varying_sigma
+            local final_effect_latent = base_latent_field_unscaled .* spatially_varying_sigma
             
             # 4. Add the final effect to the linear predictor.
             $(eta_target) = $(eta_target) .+ view(final_effect_latent, M.s_idx)
@@ -275,22 +275,22 @@ function get_effects(
 
         # 2. Get the base model's raw innovations
         base_p_names = generate_full_variable_names(base_spec, M.model_arch, k)
-        base_ure_name = _find_parameter(p_names, string(base_p_names.ure), k,
+        base_innovations_name = _find_parameter(p_names, string(base_p_names.innovations), k,
             is_multivariate_model)
         
-        if isempty(base_ure_name)
-            @warn "Base ure for NonStationaryVariance component $(spec.key) (outcome $k) not found. Returning zero-matrix." # Warn if innovations are missing
+        if isempty(base_innovations_name)
+            @warn "Base innovations for NonStationaryVariance component $(spec.key) (outcome $k) not found. Returning zero-matrix." # Warn if innovations are missing
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
         
         # Extract samples (CPU)
-        base_ure = get_params_matrix(chain, base_ure_name,
+        base_innovations = get_params_matrix(chain, base_innovations_name,
             base_spec.hyper.n_latent) # Base innovations
         
         # 3. Reconstruct the base latent field (unit variance)
         n_latent_base = base_spec.hyper.n_latent
-        base_sre_unscaled = zeros(Float64, n_latent_base,
+        base_latent_field_unscaled = zeros(Float64, n_latent_base,
             n_samples) # Initialize unscaled latent field
 
         # Reconstruction logic based on method (spectral or cholesky)
@@ -303,17 +303,17 @@ function get_effects(
             end
             
             # Vectorized reconstruction on CPU
-            base_sre_unscaled = U * (diag_D .* base_ure')
+            base_latent_field_unscaled = U * (diag_D .* base_innovations')
         else # :cholesky or :cholesky_sparse
             # Use the pre-computed Cholesky factor
             F_base = base_spec.hyper.cholesky_factor
             for i in 1:n_samples
-                unscaled_field = F_base.L' \ base_ure[i, :]
-                base_sre_unscaled[:, i] = unscaled_field .- mean(unscaled_field)
+                unscaled_field = F_base.L' \ base_innovations[i, :]
+                base_latent_field_unscaled[:, i] = unscaled_field .- mean(unscaled_field)
             end
         end
         # 4. Combine base field and sigma field
-        base_field_at_obs = base_sre_unscaled[s_idx_full, :] # Index base field to match observation structure
+        base_field_at_obs = base_latent_field_unscaled[s_idx_full, :] # Index base field to match observation structure
         final_effect_k = base_field_at_obs .* spatially_varying_sigma # Element-wise product
         push!(structured_effects, final_effect_k) # Store final result
     end

@@ -86,10 +86,10 @@ end
             intercept = 0.5,
             beta = [0.1, 0.2],
             sigma_s_idx = 1.2,
-            ure_s_idx = randn(s_N_lip)
+            innovations_s_idx = randn(s_N_lip)
         )
         calibrated = bstm.calibrate_param_registry(reg_m, sample_nt)
-        @test calibrated.descriptors[:ure_s_idx].shape == (s_N_lip,)
+        @test calibrated.descriptors[:innovations_s_idx].shape == (s_N_lip,)
 
         # Mock VarNamedTuple mapping
         struct MockVarNamedTuple
@@ -97,29 +97,29 @@ end
         end
         Base.pairs(m::MockVarNamedTuple) = Base.pairs(m.data)
         t_N_lip = length(unique(p_data.data.year))
-        mock_vnt = MockVarNamedTuple(Dict(:sigma_year => 0.8, :ure_year => randn(t_N_lip)))
+        mock_vnt = MockVarNamedTuple(Dict(:sigma_year => 0.8, :innovations_year => randn(t_N_lip)))
         calibrated_vnt = bstm.calibrate_param_registry(calibrated, mock_vnt)
-        @test calibrated_vnt.descriptors[:ure_year].shape == (t_N_lip,)
+        @test calibrated_vnt.descriptors[:innovations_year].shape == (t_N_lip,)
 
         # 5. Test get_samples with mock chain dictionary
         mock_ch = Dict(
             :sigma_s_idx => reshape([1.0, 1.1, 1.2, 1.3, 1.4], 1, 5),
-            :ure_s_idx => randn(s_N_lip, 5)
+            :innovations_s_idx => randn(s_N_lip, 5)
         )
         sigma_s = bstm.get_samples(mock_ch, calibrated, :s_idx, :sigma)
         @test size(sigma_s, 1) == 5
         @test size(sigma_s, 2) == 1
 
-        ure_s = bstm.get_samples(mock_ch, calibrated, :s_idx, :ure)
-        @test size(ure_s, 1) == 5
-        @test size(ure_s, 2) == s_N_lip
+        innovations_s = bstm.get_samples(mock_ch, calibrated, :s_idx, :innovations)
+        @test size(innovations_s, 1) == 5
+        @test size(innovations_s, 2) == s_N_lip
 
         # 6. Test canonical _find_parameter
-        names_list = ["intercept", "sigma_s_idx_1", "ure_s_idx[1]"]
+        names_list = ["intercept", "sigma_s_idx_1", "innovations_s_idx[1]"]
         @test bstm._find_parameter(names_list, "sigma_s_idx", 1, true) == "sigma_s_idx_1"
         @test bstm._find_parameter(names_list, :sigma_s_idx, 1, true) == "sigma_s_idx_1"
         @test bstm._find_parameter(names_list, "intercept", nothing, false) == "intercept"
-        @test bstm._find_parameter(names_list, "ure_s_idx", 1, true) == "ure_s_idx[1]"
+        @test bstm._find_parameter(names_list, "innovations_s_idx", 1, true) == "innovations_s_idx[1]"
 
         # 7. Test Marginalized AR1 Likelihood & Latent Reconstruction
         ar1_m = bstm.AR1(Normal(0, 1), Exponential(1.0), :marginalized)
@@ -155,8 +155,8 @@ end
         @test ll_ar2 < 0.0
 
         chain_ar2 = Dict(
-            :rho1_unconstrained_year => reshape([0.3, 0.4, 0.5], 1, 3),
-            :rho2_unconstrained_year => reshape([0.1, 0.2, 0.1], 1, 3),
+            :rho_regime_1_unconstrained_year => reshape([0.3, 0.4, 0.5], 1, 3),
+            :rho_regime_2_unconstrained_year => reshape([0.1, 0.2, 0.1], 1, 3),
             :sigma_year => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
@@ -477,7 +477,7 @@ end
             params = Dict())
         chain_spde = Dict(
             :sigma_region => reshape([0.4, 0.5, 0.6], 1, 3),
-            :kappa_region => reshape([1.0, 1.2, 1.4], 1, 3),
+            :range_region => reshape([1.0, 1.2, 1.4], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
         eff_spde = bstm.get_effects(spde_m, chain_spde, spec_spde, M_spatial, nothing)
@@ -493,7 +493,7 @@ end
         spec_gp = (key = :space, hyper = (n_latent = 5, coords = coords_mock), params = Dict())
         chain_gp = Dict(
             :sigma_space => reshape([0.4, 0.5, 0.6], 1, 3),
-            :ls_space => reshape([1.0, 1.2, 1.4], 1, 3),
+            :length_scale_space => reshape([1.0, 1.2, 1.4], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
         eff_gp = bstm.get_effects(gp_m, chain_gp, spec_gp, M_mock, nothing)
@@ -627,33 +627,36 @@ end
         )
         reg = bstm.build_param_registry(M_tensor)
 
-        @test haskey(reg.descriptors, :W1_nn_covar)
-        @test reg.descriptors[:W1_nn_covar].shape == (in_dim, hidden_dim)
-        @test haskey(reg.descriptors, :W2_nn_covar)
-        @test reg.descriptors[:W2_nn_covar].shape == (hidden_dim, nbins)
-        @test haskey(reg.descriptors, :b1_nn_covar)
-        @test reg.descriptors[:b1_nn_covar].shape == (hidden_dim,)
+        @test haskey(reg.descriptors, :rff_weights_1_nn_covar)
+        @test reg.descriptors[:rff_weights_1_nn_covar].shape == (in_dim, hidden_dim)
+        @test haskey(reg.descriptors, :rff_weights_2_nn_covar)
+        @test reg.descriptors[:rff_weights_2_nn_covar].shape == (hidden_dim, nbins)
+        @test haskey(reg.descriptors, :rff_offsets_1_nn_covar)
+        @test reg.descriptors[:rff_offsets_1_nn_covar].shape == (hidden_dim,)
 
         # Sample extraction with tensor reshaping
         n_samples = 50
         chain_df = DataFrame()
         for j in 1:hidden_dim
             for i in 1:in_dim
-                col_name = Symbol("W1_nn_covar[$i, $j]")
+                col_name = Symbol("rff_weights_1_nn_covar[$i, $j]")
                 chain_df[!, col_name] = [Float64(i * 10 + j + s * 100) for s in 1:n_samples]
             end
         end
 
+        # A registry built from a chain is element-wise: MCMCChains stores one column per
+        # matrix entry, so there is one descriptor per `[i, j]` rather than a rolled-up one.
         reg_chain = bstm.build_param_registry(chain_df)
-        @test reg_chain.descriptors[:W1_nn_covar].shape == (in_dim, hidden_dim)
+        @test haskey(reg_chain.descriptors, Symbol("rff_weights_1_nn_covar[1, 1]"))
+        @test haskey(reg_chain.descriptors, Symbol("rff_weights_1_nn_covar[3, 4]"))
 
-        samples_tensor = bstm.get_param_samples(chain_df, reg, :nn_covar, :W1)
+        samples_tensor = bstm.get_param_samples(chain_df, reg, :nn_covar, :rff_weights_1)
         @test size(samples_tensor) == (n_samples, in_dim, hidden_dim)
         @test samples_tensor[1, 1, 1] == 111.0
         @test samples_tensor[50, 3, 4] == 5034.0
 
         samples_flat = bstm.get_param_samples(
-            chain_df, reg, :nn_covar, :W1; reshape_to_shape = false
+            chain_df, reg, :nn_covar, :rff_weights_1; reshape_to_shape = false
         )
         @test size(samples_flat) == (n_samples, in_dim * hidden_dim)
     end
@@ -755,9 +758,13 @@ end
         bstm.add_descriptor!(reg_disambig, bstm.ParamDescriptor(:Xfixed_beta; role=:fixed_coef))
         bstm.add_descriptor!(reg_disambig, bstm.ParamDescriptor(:beta_prop; role=:fixed_coef))
 
-        @test bstm.find_chain_param(reg_disambig, "beta"; exact=true) == ""
-        param_found = bstm.find_chain_param(reg_disambig, "beta"; exact=false)
-        @test !isempty(param_found)
+        # A registered name resolves to itself and nothing else.
+        @test bstm.find_chain_param(reg_disambig, "Xfixed_beta") == "Xfixed_beta"
+        @test bstm.find_chain_param(reg_disambig, "beta_prop") == "beta_prop"
+
+        # A name that is not registered returns nothing rather than quietly resolving to
+        # a different coefficient, and says which names were on offer.
+        @test_logs (:warn,) bstm.find_chain_param(reg_disambig, "beta") == ""
     end
 
     @testset "Kronecker Product Composition Validation (Item 14)" begin
@@ -783,3 +790,81 @@ end
     end
 end
 
+@testset "World Age Safety (model built inside a function)" begin
+    # Regression test: `bstm` generates the Turing model body with a runtime
+    # `Core.eval`, which defines a method that already-compiled code (DynamicPPL's
+    # `_evaluate!!`) cannot see. Constructing and sampling a model inside a plain
+    # function therefore used to fail with
+    #   "MethodError: ... (method too new to be called from this world context.)"
+    # `make_world_age_safe` routes evaluation through a precompiled trampoline to
+    # prevent that. Keep this test: the failure mode is silent at top level.
+    p_world = bstm.bstm_data("scottish_lip")
+    df_world = p_world.data
+    W_world = p_world.au.W
+
+    # The model must be built AND sampled inside the function, not at top level.
+    function _build_and_sample_in_function()
+        m = @bstm(
+            likelihood(y_gauss) ~ intercept() + fixed(cov1),
+            df_world,
+            W = W_world,
+            verbose = false
+        )
+        return sample(m, NUTS(), 10; progress = false, check_model = false)
+    end
+
+    @testset "macro in function scope" begin
+        chn = _build_and_sample_in_function()
+        @test chn !== nothing
+        @test size(chn, 1) == 10
+    end
+
+    @testset "bstm_core with a runtime String in function scope" begin
+        # The string-formula entry point goes through the same construction path.
+        function _build_and_sample_string()
+            m = bstm.bstm_core(
+                "likelihood(y_gauss) ~ intercept() + fixed(cov1)",
+                df_world, Main;
+                W = W_world, verbose = false)
+            return sample(m, NUTS(), 10; progress = false, check_model = false)
+        end
+        chn2 = _build_and_sample_string()
+        @test chn2 !== nothing
+        @test size(chn2, 1) == 10
+    end
+
+    @testset "prior draw in function scope" begin
+        m_rand = @bstm(likelihood(y_gauss) ~ intercept(), df_world; verbose = false)
+        _rand_in_function(m) = rand(m)
+        @test _rand_in_function(m_rand) !== nothing
+    end
+
+    @testset "trampoline is installed and idempotent" begin
+        m_t = @bstm(likelihood(y_gauss) ~ intercept(), df_world; verbose = false)
+        @test m_t.f isa bstm.WorldAgeTrampoline
+        # Wrapping twice must not nest another trampoline.
+        @test bstm.make_world_age_safe(m_t).f === m_t.f
+    end
+
+    @testset "Component Interface Contract" begin
+        # Every registered component implements the whole interface. Checked as a
+        # property of the registry, so a component that drops a method fails here rather
+        # than as a MethodError deep inside model construction.
+        @test isempty(bstm.validate_all_component_interfaces())
+
+        @test length(bstm.COMPONENT_INTERFACE_FUNCTIONS) == 4
+        @test Set(bstm.COMPONENT_INTERFACE_FUNCTIONS) ==
+            Set([:get_precomputes, :get_priors, :get_updates, :get_effects])
+
+        for (key, T) in bstm.COMPONENT_TYPE_REGISTRY
+            missing = bstm.missing_interface_methods(T)
+            @test isempty(missing) || "$(key) is missing $(join(string.(missing), ", "))"
+        end
+
+        # The check actually detects a gap, rather than passing vacuously.
+        @eval struct IncompleteComponent <: bstm.ComponentModel end
+        @test bstm.missing_interface_methods(IncompleteComponent) ==
+            collect(bstm.COMPONENT_INTERFACE_FUNCTIONS)
+        @test_throws ErrorException bstm.validate_component_interface(IncompleteComponent)
+    end
+end

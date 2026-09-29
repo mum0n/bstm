@@ -125,7 +125,7 @@ function get_priors(
 
     push!(priors, "$(p_names.beta) ~ $(_distribution_to_string(m.beta))")
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(spec.hyper.n_latent)), I), :$(p_names.ure))")
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)")
 
     return join(priors, "\n    ")
 end
@@ -160,9 +160,9 @@ function get_updates(
             $(common_code)
             
             F = cholesky(Symmetric(Matrix(Q_beta) + M.noise * I))
-            $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
+            $(p_names.latent_field) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
             
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -172,9 +172,9 @@ function get_updates(
             $(common_code)
             
             F = cholesky(Symmetric(Q_beta + M.noise * I))
-            $(p_names.sre) = $(p_names.sigma) .* (F.L' \\ $(p_names.ure))
+            $(p_names.latent_field) = $(p_names.sigma) .* (F.L' \\ $(p_names.innovations))
             
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -233,10 +233,10 @@ function get_effects(
             is_multivariate_model)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome,
             is_multivariate_model)
-        ure_name = _find_parameter(p_names, string(p_names_k.ure), k_outcome,
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome,
             is_multivariate_model)
 
-        if isempty(beta_name) || isempty(sigma_name) || isempty(ure_name)
+        if isempty(beta_name) || isempty(sigma_name) || isempty(innovations_name)
             @warn "Parameters for NetworkFlow component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -245,7 +245,7 @@ function get_effects(
         # Extract posterior samples (these are on the CPU)
         beta_samples = get_params_vector(chain, beta_name, 1)[:, 1]
         sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ure_samples = get_params_matrix(chain, ure_name, s_N)
+        innovations_samples = get_params_matrix(chain, innovations_name, s_N)
         
         # Initialize the output matrix for the full latent field on the CPU
         reconstructed_effects_k = zeros(Float64, s_N, n_samples)
@@ -261,7 +261,7 @@ function get_effects(
             # Perform factorization on CPU
             F_i = cholesky(Symmetric(Matrix(Q_beta_i) + noise * I))
             
-            innov_i = ure_samples[i, :]
+            innov_i = innovations_samples[i, :]
             
             reconstructed_effects_k[:, i] = sigma_samples[i] .* (F_i.L' \ innov_i)
         end

@@ -197,7 +197,7 @@ The RHS formula combines linear fixed effects, structured random fields, and pro
 | :--------------| :-------------------------------------------------| :---------------------------------------------| :------------------------------------------------------| ----------|
 | `intercept()` | Controls global intercept prior.                 | `prior`                                      | `intercept(prior=Normal(0, 5))`                       |          |
 | `fixed()`     | Fixed-effect regression coefficients.            | `prior`, `contrast`                          | `fixed(elevation, prior=Normal(0, 1))`                |          |
-| `random()`    | Structured & unstructured random fields.         | `model`, `sigma`, `rho`, `lengthscale`, etc. | `random(s_idx, model=bym2)`                           |          |
+| `random()`    | Structured & unstructured random fields.         | `model`, `sigma`, `rho`, `length_scale`, etc. | `random(s_idx, model=bym2)`                           |          |
 | `mixed()`     | Correlated random slopes and intercepts.         | `model`, `method`                            | `mixed(1 + poverty \                                  | region)` |
 | `dynamics()`  | Mechanistic state-space differential equations.  | `model`, `r`, `K`, `velocity`, `diffusion`   | `dynamics(time, model=:logistic, r=Normal(0.5, 0.1))` |          |
 | `eigen()`     | Bayesian PCA factor analysis.                    | `n_factors`, `pca_sd`                        | `eigen(pollutant1, pollutant2, n_factors=1)`          |          |
@@ -237,7 +237,7 @@ The RHS parser (`decompose_bstm_formula`) supports algebraic composition operato
             rho = (0.5, 0.05)                        # P(ρ > 0.5) = 0.05   => Exponential on -log(1-ρ)
         ) +
         random(time, model=gp, 
-            lengthscale = (0.1, 0.01)                # P(ℓ < 0.1) = 0.01   => Exponential on 1/ℓ
+            length_scale = (0.1, 0.01)                # P(ℓ < 0.1) = 0.01   => Exponential on 1/ℓ
         ),
     df, W=W
 )
@@ -245,9 +245,9 @@ The RHS parser (`decompose_bstm_formula`) supports algebraic composition operato
 
 | Parameter Type | Quantile Constraint Syntax | Base Model State | Induced Prior Distribution |
 | :--- | :--- | :--- | :--- |
-| **Standard Deviation (`sigma`, `kappa`)** | `(U, α)` $\implies P(\sigma > U) = \alpha$ | $\sigma = 0$ (No variation) | $\operatorname{Exponential}(\lambda), \; \lambda = -\log(\alpha)/U$ |
+| **Standard Deviation (`sigma`, `range`)** | `(U, α)` $\implies P(\sigma > U) = \alpha$ | $\sigma = 0$ (No variation) | $\operatorname{Exponential}(\lambda), \; \lambda = -\log(\alpha)/U$ |
 | **Correlation (`rho`)** | `(U, α)` $\implies P(\rho > U) = \alpha$ | $\rho = 0$ (Independent noise) | $\operatorname{Exponential}(\lambda)$ on $\theta = -\log(1-\rho)$ |
-| **Lengthscale (`lengthscale`, `ls`)** | `(U, α)` $\implies P(\ell < U) = \alpha$ | $\ell = \infty$ (Flat constant) | $\operatorname{Exponential}(\lambda)$ on $\theta = 1/\ell$ |
+| **Length scale (`length_scale`)** | `(U, α)` $\implies P(\ell < U) = \alpha$ | $\ell = \infty$ (Flat constant) | $\operatorname{Exponential}(\lambda)$ on $\theta = 1/\ell$ |
 | **Fixed Effects / Slopes (`prior`)** | `(U, α)` $\implies P(\|\beta\| > U) = \alpha$ | $\beta = 0$ (Null effect) | $\operatorname{Normal}(0, \sigma_{\beta}), \; \sigma_{\beta} = \frac{-U}{\Phi^{-1}(\alpha/2)}$ |
 
 ---
@@ -289,10 +289,10 @@ To add a new latent component, create a struct subtyping `ComponentModel` and im
    - Validates required columns in `M.data` and generates data structures (e.g., basis matrices $B$, precision matrix templates $Q$, eigenvalue decompositions $U, \Lambda$). Stored in `spec.hyper`.
 
 2. **`get_priors(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String`**
-   - Emits Turing `@model` code declaring prior distributions for hyperparameters (e.g., `sigma`, `rho_unconstrained`) and standard normal innovations `ure`.
+   - Emits Turing `@model` code declaring prior distributions for hyperparameters (e.g., `sigma`, `rho_unconstrained`) and standard normal innovations `innovations`.
 
 3. **`get_updates(m::ComponentModel, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing}, M::NamedTuple)::String`**
-   - Emits Turing code computing the realized structured latent field `sre` from `ure` and hyperparameters, and adds the contribution into the linear predictor `eta`.
+   - Emits Turing code computing the realized structured latent field `latent_field` from `innovations` and hyperparameters, and adds the contribution into the linear predictor `eta`.
 
 4. **`get_effects(m::ComponentModel, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple`**
    - Extracts posterior samples from `chain` via `ParamRegistry` and reconstructs posterior trajectories and credible intervals for post-processing and plotting.
@@ -356,9 +356,9 @@ end
 function get_effects(m::IID, chain, M::NamedTuple, n_samples::Int, outcomes_N::Int, p_names::NamedTuple, spec::NamedTuple, PS::Union{NamedTuple, Nothing}, N_total::Int)::NamedTuple
     v = generate_full_variable_names(spec, M.model_arch, 1)
     sigma_samples = get_param_samples(chain, M.param_registry, Symbol(v.sigma))
-    ure_samples = get_param_samples(chain, M.param_registry, Symbol(v.ure))
+    innovations_samples = get_param_samples(chain, M.param_registry, Symbol(v.innovations))
     
-    latent_field = ure_samples .* reshape(sigma_samples, 1, :)
+    latent_field = innovations_samples .* reshape(sigma_samples, 1, :)
     index_var = spec.structure == :spatial ? M.s_idx : (spec.structure == :temporal ? M.t_idx : M.data[!, spec.var])
     effect = latent_field[index_var, :]
     
@@ -376,22 +376,22 @@ All parameter symbols generated across components follow the strict sequence:
 quantity_descriptor_key[_outcome]
 ```
 
-- **Quantity**: `beta`, `sigma`, `rho`, `ls`, `ure`, `sre`, `threshold`, `v`, `alpha`, `K`, `r`.
+- **Quantity**: `beta`, `sigma`, `rho`, `length_scale`, `innovations`, `latent_field`, `threshold_unconstrained`, `reflection_vector_unconstrained`, `alpha`, `carrying_capacity`, `intrinsic_growth_rate`.
 - **Descriptor**: `unconstrained`, `unscaled`, `inducing`, `diag`, `pic`, `predator`, `cluster`, `st_interaction`, `flat`.
 - **Key**: Unique component identifier derived from formula term (`s_idx`, `year`, `space`, etc.).
 - **Outcome**: `1`, `2` (for multivariate models).
 
 #### Core Token Definitions:
 - **`beta` / `beta_flat`**: Fixed effects regression coefficients.
-- **`ure_<key>`**: Unstructured Random Error / standard normal innovations driving the stochastic process.
-- **`sre_<key>`**: Structured Random Error / realized structured latent field.
+- **`innovations_<key>`**: i.i.d. standard-normal innovations. These carry no structure of their own; the component scales and correlates them.
+- **`latent_field_<key>`**: the reconstructed field, after the component has scaled and correlated the innovations.
 - **`rho_unconstrained_<key>`**: Unconstrained transform of correlation parameter $\rho \in (-1, 1)$ or $(0, 1)$.
 
 ---
 
 ## 4. Parameter Registry Engine (`src/parameters.jl`)
 
-The `ParamRegistry` system provides central parameter discovery, support categorization, alias resolution, and MCMC extraction.
+The `ParamRegistry` system provides central parameter discovery, support categorization, and MCMC extraction. Every parameter has exactly one registered name: there is no alias table and no abbreviation fallback, so a name is either registered or it is not.
 
 ### 4.1. Core Types
 
@@ -406,11 +406,12 @@ struct ParamDescriptor
     prior_str::String        # String representation of prior distribution
 end
 
-struct ParamRegistry
-    params::Dict{Symbol, ParamDescriptor}
-    aliases::Dict{Symbol, Symbol}
-    by_component::Dict{Symbol, Vector{Symbol}}
-    by_role::Dict{Symbol, Vector{Symbol}}
+mutable struct ParamRegistry
+    names::Vector{String}                                              # Canonical string names
+    descriptors::Dict{Symbol, ParamDescriptor}                         # Symbol -> ParamDescriptor
+    by_component::Dict{Symbol, Dict{Symbol, Vector{ParamDescriptor}}} # component_key -> role -> [descriptors]
+    by_base::Dict{String, Vector{String}}                              # base name -> list of matching full names
+    name_to_key::Dict{String, Any}                                     # String/Symbol in chain -> actual indexing key
 end
 ```
 
@@ -418,8 +419,8 @@ end
 
 - **`build_param_registry(M::NamedTuple)::ParamRegistry`**: Scans model specification `M` and compiles an initial parameter registry.
 - **`calibrate_param_registry(reg::ParamRegistry, vi::VarInfo)::ParamRegistry`**: Introspects DynamicPPL `VarInfo` to calibrate active variable names, dimensions, and empirical supports.
-- **`get_param_samples(chain, reg::ParamRegistry, param_sym::Symbol)`**: Fetches posterior samples across `FlexiChain`, `Chains`, `DataFrame`, or `Dict` containers with automatic alias fallback (`ure` $\leftrightarrow$ `innovations`, `sre` $\leftrightarrow$ `latent`, `beta` $\leftrightarrow$ `Xfixed_beta_prop`).
-- **`_find_parameter(reg::ParamRegistry, target_name::Symbol)`**: Resolves parameter names accounting for multivariate suffixes and historical aliases.
+- **`get_param_samples(chain, reg::ParamRegistry, param_sym::Symbol)`**: Fetches posterior samples across `FlexiChain`, `Chains`, `DataFrame`, or `Dict` containers by exact name. There is no alias or abbreviation fallback: every parameter has exactly one registered name, and an unregistered name returns nothing and names the near-misses.
+- **`_find_parameter(reg::ParamRegistry, target_name::Symbol)`**: Resolves a parameter name across a chain, accounting for multivariate outcome suffixes (`_1`, `[1]`). It does not guess between candidate names.
 
 ---
 
@@ -933,7 +934,7 @@ Comprehensive spatial discretization, graph extraction, and spatiotemporal index
 
 | Function | Signature | Description |
 | :--- | :--- | :--- |
-| `assign_spatial_units` | `assign_spatial_units(s_x, s_y; area_method=:avt, target_units=10, exact_units=false, target_area=nothing, min_area=0.0, max_area=Inf, min_points=1, max_points=nothing, lengthscale=nothing, radius=nothing, grid_resolution=nothing, aspect_ratio=1.0, prune_empty=false, merge_small_polygons=false, input_polygons=nothing, geom_hull=nothing, kwargs...)` | Primary spatial partitioner. Discretizes 2D coordinates into polygons and builds neighborhood graph $W$. |
+| `assign_spatial_units` | `assign_spatial_units(s_x, s_y; area_method=:avt, target_units=10, exact_units=false, target_area=nothing, min_area=0.0, max_area=Inf, min_points=1, max_points=nothing, length_scale=nothing, radius=nothing, grid_resolution=nothing, aspect_ratio=1.0, prune_empty=false, merge_small_polygons=false, input_polygons=nothing, geom_hull=nothing, kwargs...)` | Primary spatial partitioner. Discretizes 2D coordinates into polygons and builds neighborhood graph $W$. |
 | `assign_spatial_units_inferred` | `assign_spatial_units_inferred(W; iterations=50, learning_rate=0.1, buffer_dist=0.5)` | Reconstructs coordinates and Voronoi polygons from an adjacency matrix via force-directed spring layout. |
 | `assign_time_units` | `assign_time_units(t_v; time_method="quantile_regular", t_N=10)` | Discretizes continuous or discrete time vectors into categorical temporal indices. |
 | `assign_spatiotemporal_units` | `assign_spatiotemporal_units(df; space_x=:s_x, space_y=:s_y, time_var=:t_idx, area_method=:avt, target_units=10, ...)` | Synchronizes space and time partitions into aligned `(s_idx, t_idx, st_idx)` indices and metadata $(S, T, ST)$. |

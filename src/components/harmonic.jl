@@ -193,7 +193,7 @@ function get_updates(
             period_val = $(period_access_code)
             
             angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
-            $(p_names.sre) .+= b_cos .* cos.(angle) .+ b_sin .* sin.(angle)
+            $(p_names.latent_field) .+= b_cos .* cos.(angle) .+ b_sin .* sin.(angle)
         """
     else # :ampphase
         loop_body = """
@@ -202,7 +202,7 @@ function get_updates(
             period_val = $(period_access_code)
             
             angle = (2 * pi * k ./ period_val) .* $(u_coords_access)
-            $(p_names.sre) .+= amp .* cos.(angle .+ (2 * pi * phase))
+            $(p_names.latent_field) .+= amp .* cos.(angle .+ (2 * pi * phase))
         """
     end
 
@@ -218,11 +218,11 @@ function get_updates(
             T_num = eltype($(init_param))
             u_N_val = spec_registry[:$(spec.key)].hyper.u_N
             u_idx_val = spec_registry[:$(spec.key)].hyper.u_idx
-            $(p_names.sre) = zeros(T_num, u_N_val)
+            $(p_names.latent_field) = zeros(T_num, u_N_val)
             for k in 1:$(m.nharmonics)
                 $(loop_body)
             end
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), u_idx_val)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), u_idx_val)
         end
     """
 end

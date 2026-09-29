@@ -198,7 +198,7 @@ function get_priors(
         return """
         # Priors for BSpline component: $(spec.key)
         $(p_names.sigma) ~ $(sigma_prior_str)
-        $(p_names.ure) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)
+        $(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)
         """
     end
 end
@@ -233,11 +233,11 @@ function get_updates(
             diag_D[1] = 0.0
             diag_D[2] = 0.0
             
-            coeffs = hyper.U * (diag_D .* $(p_names.ure))
+            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             
-            $(p_names.sre) = B_basis * coeffs
+            $(p_names.latent_field) = B_basis * coeffs
             
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -248,7 +248,7 @@ function get_updates(
             
             F = hyper.cholesky_factor
             
-            coeffs_unscaled = F.L' \\ $(p_names.ure)
+            coeffs_unscaled = F.L' \\ $(p_names.innovations)
             
             # Apply soft sum-to-zero constraints for RW2 penalty
             Turing.@addlogprob! logpdf(
@@ -256,9 +256,9 @@ function get_updates(
             )
             
             coeffs = $(p_names.sigma) .* coeffs_unscaled
-            $(p_names.sre) = B_basis * coeffs
+            $(p_names.latent_field) = B_basis * coeffs
             
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -271,7 +271,7 @@ function get_updates(
             F = cholesky(Symmetric(Q_penalty + M.noise * I))
             
             L_sparse = sparse(F.L)
-            coeffs_unscaled = L_sparse' \\ $(p_names.ure)
+            coeffs_unscaled = L_sparse' \\ $(p_names.innovations)
             
             # Apply soft sum-to-zero constraints for RW2 penalty
             Turing.@addlogprob! logpdf(
@@ -279,9 +279,9 @@ function get_updates(
             )
             
             coeffs = $(p_names.sigma) .* coeffs_unscaled
-            $(p_names.sre) = B_basis * coeffs
+            $(p_names.latent_field) = B_basis * coeffs
             
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -403,13 +403,8 @@ function get_effects(
                 coeffs_samples_matrix[:, i] = coeffs_i
             end
         elseif m.method == :spectral
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "Innovations (ure) for BSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            ure_samples = get_params_matrix(chain, ure_name, n_latent)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
             U = hyper.U
             L = hyper.L
@@ -419,19 +414,14 @@ function get_effects(
                 diag_D_matrix[i, :] .= 0.0
             end
             
-            coeffs_samples_matrix = U * (diag_D_matrix .* ure_samples')
+            coeffs_samples_matrix = U * (diag_D_matrix .* innovations_samples')
         else # :cholesky or :cholesky_sparse
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "Innovations (ure) for BSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            ure_samples = get_params_matrix(chain, ure_name, n_latent)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
             F = hyper.cholesky_factor
             for i in 1:n_samples
-                innov_i = ure_samples[i, :]
+                innov_i = innovations_samples[i, :]
                 coeffs_unscaled = F.L' \ innov_i
                 coeffs_centered = coeffs_unscaled .- mean(coeffs_unscaled)
                 coeffs_samples_matrix[:, i] = sigma_samples[i, 1] .* coeffs_centered

@@ -3,38 +3,32 @@
 # ==============================================================================
 
 import Pkg
-Pkg.activate(joinpath(@__DIR__, ".."))
-Pkg.instantiate()
+
+# Only activate the package project when this file is executed directly
+# (`julia --project=. test/runtests.jl ...`). Under `Pkg.test()` the active
+# environment is already the dedicated `test/Project.toml`, and re-activating the
+# parent project there would drop the test-only dependencies (notably the optional
+# plotting stack) and make them unresolvable.
+const RUNNING_UNDER_PKG_TEST =
+    basename(dirname(Base.active_project())) == "test"
+if !RUNNING_UNDER_PKG_TEST
+    Pkg.activate(joinpath(@__DIR__, ".."); io = devnull)
+    Pkg.instantiate(; io = devnull)
+end
 
 # Usage:
-#   julia --project=. tests/runtests.jl                  # Run all test segments
-#   julia --project=. tests/runtests.jl fast             # Run ultra-fast unit tests
-#   julia --project=. tests/runtests.jl core             # Run formula & registry tests
-#   julia --project=. tests/runtests.jl likelihoods      # Run likelihood taxonomy tests
-#   julia --project=. tests/runtests.jl partitioning     # Run spatial graph tests
-#   julia --project=. tests/runtests.jl components       # Run component model tests
-#   julia --project=. tests/runtests.jl derivatives      # Run surface derivatives & BPI
-#   julia --project=. tests/runtests.jl eiv              # Run Errors-in-Variables tests
-#   julia --project=. tests/runtests.jl pipeline         # Run DAG pipeline orchestrator
-#   julia --project=. tests/runtests.jl par              # Run PAR / PAF engine tests
-#   julia --project=. tests/runtests.jl models           # Run model MCMC inference tests
-#   julia --project=. tests/runtests.jl multinomial      # Run multinomial & categorical models
-#   julia --project=. tests/runtests.jl persistence      # Run DuckDB & JLD2 persistence
-#   julia --project=. tests/runtests.jl nested           # Run nested multi-fidelity tests
+#   julia --project=. test/runtests.jl                # Run every segment
+#   julia --project=. test/runtests.jl core           # Run only that segment
+#   julia --project=. test/runtests.jl core par eiv   # Run several
 #
-# Standalone execution:
-#   julia --project=. tests/test_core_formula.jl
-#   julia --project=. tests/test_likelihoods.jl
-#   julia --project=. tests/test_partitioning.jl
-#   julia --project=. tests/test_components.jl
-#   julia --project=. tests/test_derivatives.jl
-#   julia --project=. tests/test_eiv.jl
-#   julia --project=. tests/test_pipeline.jl
-#   julia --project=. tests/test_par.jl
-#   julia --project=. tests/test_models.jl
-#   julia --project=. tests/test_multinomial.jl
-#   julia --project=. tests/test_data_persistence_plots.jl
-#   julia --project=. tests/test_nested.jl
+# Segments: core, likelihoods, partitioning, components, derivatives, eiv,
+#           pipeline, par, models, multinomial, persistence, nested
+#
+# Under `Pkg.test()` the whole suite runs; pass segments as test_args:
+#   Pkg.test(test_args = ["core", "par"])
+#
+# A single file can also be run directly:
+#   julia --project=. test/test_core_formula.jl
 # ==============================================================================
 
 include(joinpath(@__DIR__, "test_helpers.jl"))
@@ -90,83 +84,30 @@ const AVAILABLE_SEGMENTS = Dict{Symbol, @NamedTuple{file::String, desc::String}}
     )
 )
 
-const ALIAS_MAP = Dict{String, Vector{Symbol}}(
-    "all"          => [:core, :likelihoods, :partitioning, :components, :derivatives,
-                       :eiv, :pipeline, :par, :models, :multinomial, :persistence, :nested],
-    "full"         => [:core, :likelihoods, :partitioning, :components, :derivatives,
-                       :eiv, :pipeline, :par, :models, :multinomial, :persistence, :nested],
-    "fast"         => [:core, :likelihoods, :partitioning, :eiv, :pipeline, :par],
-    "quick"        => [:core, :likelihoods, :partitioning, :eiv, :pipeline, :par],
-    "core"         => [:core],
-    "formula"      => [:core],
-    "registry"     => [:core],
-    "manifolds"    => [:core],
-    "likelihoods"  => [:likelihoods],
-    "likelihood"   => [:likelihoods],
-    "taxonomy"     => [:likelihoods],
-    "partitioning" => [:partitioning],
-    "partition"    => [:partitioning],
-    "spatial"      => [:partitioning],
-    "components"   => [:components],
-    "component"    => [:components],
-    "nngp"         => [:components],
-    "derivatives"  => [:derivatives],
-    "derivative"   => [:derivatives],
-    "slope"        => [:derivatives],
-    "bpi"          => [:derivatives],
-    "eiv"          => [:eiv],
-    "errors"       => [:eiv],
-    "measurement"  => [:eiv],
-    "pipeline"     => [:pipeline],
-    "workflow"     => [:pipeline],
-    "orchestrator" => [:pipeline],
-    "dag"          => [:pipeline],
-    "resharding"   => [:pipeline],
-    "par"          => [:par],
-    "paf"          => [:par],
-    "attributable" => [:par],
-    "models"       => [:models],
-    "model"        => [:models],
-    "instantiation"=> [:models],
-    "gibbs"        => [:models],
-    "smoke"        => [:models],
-    "multinomial"  => [:multinomial],
-    "categorical"  => [:multinomial],
-    "dirichlet"    => [:multinomial],
-    "persistence"  => [:persistence],
-    "data"         => [:persistence],
-    "plots"        => [:persistence],
-    "duckdb"       => [:persistence],
-    "geojson"      => [:persistence],
-    "nested"       => [:nested],
-    "transfer"     => [:nested],
-    "submodel"     => [:nested],
-    "multifidelity"=> [:nested]
-)
-
 """
     parse_requested_segments(args::Vector{String}) -> Vector{Symbol}
 
-Parses CLI test segment arguments, resolving aliases and fast-test shortcuts.
+Resolves CLI segment arguments to segment keys. Each segment is addressed by its own
+name only; there is no alias table, so `julia test/runtests.jl bpi` is an error naming
+the available segments rather than a silent guess at what the author meant.
 """
 function parse_requested_segments(args::Vector{String})::Vector{Symbol}
     if isempty(args)
-        return [:core, :likelihoods, :partitioning, :components, :derivatives,
-                :eiv, :pipeline, :par, :models, :multinomial, :persistence, :nested]
+        return collect(keys(AVAILABLE_SEGMENTS))
     end
 
     selected = Symbol[]
     for a in args
-        key_str = lowercase(strip(a))
-        if haskey(ALIAS_MAP, key_str)
-            append!(selected, ALIAS_MAP[key_str])
+        key = Symbol(lowercase(strip(a)))
+        if haskey(AVAILABLE_SEGMENTS, key)
+            push!(selected, key)
         else
-            avail = sort(collect(keys(AVAILABLE_SEGMENTS)))
+            avail = sort(string.(collect(keys(AVAILABLE_SEGMENTS))))
             @warn "Unrecognized test segment: '$a'. Available segments: $(join(avail, ", "))"
         end
     end
 
-    return isempty(selected) ? [:core, :likelihoods, :partitioning, :eiv, :pipeline, :par] : unique(selected)
+    return isempty(selected) ? sort!(collect(keys(AVAILABLE_SEGMENTS))) : unique(selected)
 end
 
 requested_segments = parse_requested_segments(ARGS)

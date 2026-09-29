@@ -165,8 +165,12 @@ end
 
         code_str, _, _ = bstm.bstm_text_assembler(cfg, :test_nested_model)
 
-        # Sub-model weight and priors
-        @test occursin("rho_nested_proxy ~ DynamicPPL.NamedDist(Normal(1.0, 0.5)", code_str)
+        # Sub-model weight and priors.
+        # NOTE: these are emitted as plain `name ~ dist` statements; the legacy
+        # `DynamicPPL.NamedDist(dist, :name)` wrapper was removed from DynamicPPL
+        # and the left-hand side already supplies the variable name.
+        @test occursin("rho_nested_proxy ~ Normal(1.0, 0.5)", code_str)
+        @test !occursin("NamedDist", code_str)
         @test occursin("intercept_proxy ~", code_str)
         @test occursin("beta_proxy ~", code_str)
         @test occursin("y_sigma_proxy ~", code_str)

@@ -3,7 +3,7 @@
 
 A component for a Threshold Autoregressive (TAR) model, which captures
 regime-switching temporal dynamics. The model switches between two different AR(1)
-processes based on whether an external `threshold_var` is above or below a
+processes based on whether an external `threshold_covariate` is above or below a
 learned threshold.
 
 # Version
@@ -33,7 +33,7 @@ where:
 # Inputs
 - **Required**:
   - A temporal index variable (e.g., `year`) passed to `random()`.
-  - `threshold_var`: `Symbol`, the name of the column in the data to use for thresholding.
+  - `threshold_covariate`: `Symbol`, the name of the column in the data to use for thresholding.
 - **Optional (in `random()` call)**:
   - `rho_regimes`: `Vector{<:UnivariateDistribution}`, priors for the `rho` parameter in
     each of the two regimes. Priors should be constrained to `(-1, 1)`. Default:
@@ -46,8 +46,8 @@ where:
 
 # Outputs (Parameter Names)
 - `threshold_unconstrained_<key>`: The unconstrained parameter for the threshold level.
-- `ure_<key>`: Standard normal innovations for the AR(1) processes.
-- `sre_<key>`: Realized regime-dependent temporal field.
+- `innovations_<key>`: Standard normal innovations for the AR(1) processes.
+- `latent_field_<key>`: Realized regime-dependent temporal field.
 - **For `:statespace` method**:
   - `rho1_unconstrained_<key>`, `rho2_unconstrained_<key>`: Unconstrained `rho` parameters.
   - `sigma1_unconstrained_<key>`, `sigma2_unconstrained_<key>`: Unconstrained `sigma` parameters.
@@ -56,7 +56,7 @@ where:
   - `sigma1_<key>`, `sigma2_<key>`: The `sigma` parameters for each regime.
 """
 struct TAR <: ComponentModel
-    threshold_var::Symbol
+    threshold_covariate::Symbol
     rho_regimes::Vector{<:UnivariateDistribution}
     sigma_regimes::Vector{<:UnivariateDistribution}
     method::Symbol
@@ -65,8 +65,8 @@ end
 COMPONENT_TYPE_REGISTRY[:tar] = TAR
 
 COMPONENT_CONSTRUCTORS[:tar] = (p, params) -> begin
-    threshold_var = get(params, :threshold_var,
-        error("TAR model requires a `threshold_var` parameter."))
+    threshold_covariate = get(params, :threshold_covariate,
+        error("TAR model requires a `threshold_covariate` parameter."))
     
     rho_regimes = get(params, :rho_regimes, [truncated(Normal(0, 0.5), -1, 1),
         truncated(Normal(0, 0.5), -1, 1)])
@@ -80,7 +80,7 @@ COMPONENT_CONSTRUCTORS[:tar] = (p, params) -> begin
         error("`sigma_regimes` for TAR model must be a Vector of two Distributions.")
     end
 
-    TAR(threshold_var, rho_regimes, sigma_regimes, method)
+    TAR(threshold_covariate, rho_regimes, sigma_regimes, method)
 end
 
 MODEL_TO_STRUCTURE_MAP[:tar] = :temporal
@@ -88,9 +88,9 @@ MODEL_TO_STRUCTURE_MAP[:tar] = :temporal
 
 function get_precomputes(m::TAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     # --- Validation ---
-    threshold_var = m.threshold_var
-    if !hasproperty(M.data, threshold_var)
-        error("Threshold variable ':$threshold_var' for TAR model not found in data.")
+    threshold_covariate = m.threshold_covariate
+    if !hasproperty(M.data, threshold_covariate)
+        error("Threshold variable ':$threshold_covariate' for TAR model not found in data.")
     end
 
     if !haskey(M, :t_idx) || !haskey(M, :t_N) || M.t_N == 0
@@ -98,7 +98,7 @@ function get_precomputes(m::TAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     end
     
     # --- Precompute logic on CPU ---
-    threshold_data_full_cpu = M.data[!, threshold_var]
+    threshold_data_full_cpu = M.data[!, threshold_covariate]
     t_idx_cpu = M.t_idx
 
     threshold_data_per_t = zeros(eltype(threshold_data_full_cpu), M.t_N)
@@ -128,18 +128,18 @@ function get_priors(
     
     priors = String[]
     push!(priors, "$(p_names.threshold_unconstrained) ~ Normal(0.0, 1.0)")
-    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     if m.method == :statespace
-        push!(priors, "$(p_names.rho1_unconstrained) ~ Normal(0, 1.5)")
-        push!(priors, "$(p_names.rho2_unconstrained) ~ Normal(0, 1.5)")
-        push!(priors, "$(p_names.sigma1_unconstrained) ~ Normal(0, 1.0)")
-        push!(priors, "$(p_names.sigma2_unconstrained) ~ Normal(0, 1.0)")
+        push!(priors, "$(p_names.rho_regime_1_unconstrained) ~ Normal(0, 1.5)")
+        push!(priors, "$(p_names.rho_regime_2_unconstrained) ~ Normal(0, 1.5)")
+        push!(priors, "$(p_names.sigma_regime_1_unconstrained) ~ Normal(0, 1.0)")
+        push!(priors, "$(p_names.sigma_regime_2_unconstrained) ~ Normal(0, 1.0)")
     else # :statespace_constrained
-        push!(priors, "$(p_names.rho1) ~ $(_distribution_to_string(m.rho_regimes[1]))")
-        push!(priors, "$(p_names.rho2) ~ $(_distribution_to_string(m.rho_regimes[2]))")
-        push!(priors, "$(p_names.sigma1) ~ $(_distribution_to_string(m.sigma_regimes[1]))")
-        push!(priors, "$(p_names.sigma2) ~ $(_distribution_to_string(m.sigma_regimes[2]))")
+        push!(priors, "$(p_names.rho_regime_1) ~ $(_distribution_to_string(m.rho_regimes[1]))")
+        push!(priors, "$(p_names.rho_regime_2) ~ $(_distribution_to_string(m.rho_regimes[2]))")
+        push!(priors, "$(p_names.sigma_regime_1) ~ $(_distribution_to_string(m.sigma_regimes[1]))")
+        push!(priors, "$(p_names.sigma_regime_2) ~ $(_distribution_to_string(m.sigma_regimes[2]))")
     end
 
     return join(priors, "\n    ")
@@ -156,17 +156,17 @@ function get_updates(
     local param_definitions
     if m.method == :statespace
         param_definitions = """
-            local rho1 = tanh($(p_names.rho1_unconstrained))
-            local rho2 = tanh($(p_names.rho2_unconstrained))
-            local sigma1 = exp($(p_names.sigma1_unconstrained))
-            local sigma2 = exp($(p_names.sigma2_unconstrained))
+            local rho_regime_1 = tanh($(p_names.rho_regime_1_unconstrained))
+            local rho_regime_2 = tanh($(p_names.rho_regime_2_unconstrained))
+            local sigma_regime_1 = exp($(p_names.sigma_regime_1_unconstrained))
+            local sigma_regime_2 = exp($(p_names.sigma_regime_2_unconstrained))
         """
     else # :statespace_constrained
         param_definitions = """
-            local rho1 = $(p_names.rho1)
-            local rho2 = $(p_names.rho2)
-            local sigma1 = $(p_names.sigma1)
-            local sigma2 = $(p_names.sigma2)
+            local rho_regime_1 = $(p_names.rho_regime_1)
+            local rho_regime_2 = $(p_names.rho_regime_2)
+            local sigma_regime_1 = $(p_names.sigma_regime_1)
+            local sigma_regime_2 = $(p_names.sigma_regime_2)
         """
     end
 
@@ -176,14 +176,14 @@ function get_updates(
             $(param_definitions)
             local hyper = spec_registry[:$(key)].hyper
             local threshold_level = mean(hyper.threshold_data) + $(p_names.threshold_unconstrained)
-            local innovations = $(p_names.ure)
+            local innovations = $(p_names.innovations)
             
             local latent_field = Vector{eltype(innovations)}(undef, M.t_N)
             
             for t in 1:M.t_N
                 local regime_indicator = hyper.threshold_data[t] > threshold_level
-                local curr_rho = regime_indicator ? rho2 : rho1
-                local curr_sigma = regime_indicator ? sigma2 : sigma1
+                local curr_rho = regime_indicator ? rho_regime_2 : rho_regime_1
+                local curr_sigma = regime_indicator ? sigma_regime_2 : sigma_regime_1
 
                 if t == 1
                     latent_field[t] = (innovations[t] * curr_sigma) / sqrt(1.0 - curr_rho^2
@@ -192,8 +192,8 @@ function get_updates(
                     latent_field[t] = curr_rho * latent_field[t-1] + innovations[t] * curr_sigma
                 end
             end
-            $(p_names.sre) = latent_field
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
+            $(p_names.latent_field) = latent_field
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.t_idx)
         end
     """
 end
@@ -228,8 +228,8 @@ function get_effects(
     t_N_full = isempty(t_idx_full_cpu) ? 0 : maximum(t_idx_full_cpu)
     N_total = length(t_idx_full_cpu)
 
-    threshold_data_full_cpu = if !isnothing(PS) && hasproperty(PS.data, m.threshold_var)
-        pred_threshold_data = PS.data[!, m.threshold_var]
+    threshold_data_full_cpu = if !isnothing(PS) && hasproperty(PS.data, m.threshold_covariate)
+        pred_threshold_data = PS.data[!, m.threshold_covariate]
         len_pred = t_N_full - t_N_train
         if len_pred > 0
             pred_data_agg = pred_threshold_data[1:min(length(pred_threshold_data), len_pred)]
@@ -253,9 +253,9 @@ function get_effects(
         
         thresh_unconstrained_name = _find_parameter(p_names, string(v.threshold_unconstrained),
             k_outcome, is_multivariate_model)
-        ure_name = _find_parameter(p_names, string(v.ure), k_outcome, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k_outcome, is_multivariate_model)
 
-        if isempty(thresh_unconstrained_name) || isempty(ure_name)
+        if isempty(thresh_unconstrained_name) || isempty(innovations_name)
             @warn "Base parameters for TAR component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -264,18 +264,18 @@ function get_effects(
         # Extract posterior samples (CPU)
         thresh_unconstrained_samples_cpu = get_params_vector(chain, thresh_unconstrained_name,
             1)[:, 1]
-        ure_samples_cpu = get_params_matrix(chain, ure_name, t_N_train)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, t_N_train)
         
         local rho1_samples_cpu, rho2_samples_cpu, sigma1_samples_cpu, sigma2_samples_cpu
         if m.method == :statespace
-            rho1_unconstrained_name = _find_parameter(p_names, string(v.rho1_unconstrained),
+            rho1_unconstrained_name = _find_parameter(p_names, string(v.rho_regime_1_unconstrained),
                 k_outcome, is_multivariate_model)
-            rho2_unconstrained_name = _find_parameter(p_names, string(v.rho2_unconstrained),
+            rho2_unconstrained_name = _find_parameter(p_names, string(v.rho_regime_2_unconstrained),
                 k_outcome, is_multivariate_model)
             sigma1_unconstrained_name = _find_parameter(p_names,
-                string(v.sigma1_unconstrained), k_outcome, is_multivariate_model)
+                string(v.sigma_regime_1_unconstrained), k_outcome, is_multivariate_model)
             sigma2_unconstrained_name = _find_parameter(p_names,
-                string(v.sigma2_unconstrained), k_outcome, is_multivariate_model)
+                string(v.sigma_regime_2_unconstrained), k_outcome, is_multivariate_model)
             if isempty(rho1_unconstrained_name) || isempty(rho2_unconstrained_name)||
                 isempty(sigma1_unconstrained_name) || isempty(sigma2_unconstrained_name)
                 @warn "Regime parameters for TAR component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
@@ -287,22 +287,22 @@ function get_effects(
             sigma1_samples_cpu = exp.(get_params_vector(chain, sigma1_unconstrained_name, 1)[:, 1])
             sigma2_samples_cpu = exp.(get_params_vector(chain, sigma2_unconstrained_name, 1)[:, 1])
         else # :statespace_constrained
-            rho1_name = _find_parameter(p_names, string(v.rho1), k_outcome, is_multivariate_model)
-            rho2_name = _find_parameter(p_names, string(v.rho2), k_outcome, is_multivariate_model)
-            sigma1_name = _find_parameter(p_names, string(v.sigma1), k_outcome,
+            rho_regime_1_name = _find_parameter(p_names, string(v.rho_regime_1), k_outcome, is_multivariate_model)
+            rho_regime_2_name = _find_parameter(p_names, string(v.rho_regime_2), k_outcome, is_multivariate_model)
+            sigma_regime_1_name = _find_parameter(p_names, string(v.sigma_regime_1), k_outcome,
                 is_multivariate_model)
-            sigma2_name = _find_parameter(p_names, string(v.sigma2), k_outcome,
+            sigma_regime_2_name = _find_parameter(p_names, string(v.sigma_regime_2), k_outcome,
                 is_multivariate_model)
-            if isempty(rho1_name) || isempty(rho2_name) || isempty(sigma1_name)||
-                isempty(sigma2_name)
+            if isempty(rho_regime_1_name) || isempty(rho_regime_2_name) || isempty(sigma_regime_1_name)||
+                isempty(sigma_regime_2_name)
                 @warn "Regime parameters for TAR component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            rho1_samples_cpu = get_params_vector(chain, rho1_name, 1)[:, 1]
-            rho2_samples_cpu = get_params_vector(chain, rho2_name, 1)[:, 1]
-            sigma1_samples_cpu = get_params_vector(chain, sigma1_name, 1)[:, 1]
-            sigma2_samples_cpu = get_params_vector(chain, sigma2_name, 1)[:, 1]
+            rho1_samples_cpu = get_params_vector(chain, rho_regime_1_name, 1)[:, 1]
+            rho2_samples_cpu = get_params_vector(chain, rho_regime_2_name, 1)[:, 1]
+            sigma1_samples_cpu = get_params_vector(chain, sigma_regime_1_name, 1)[:, 1]
+            sigma2_samples_cpu = get_params_vector(chain, sigma_regime_2_name, 1)[:, 1]
         end
 
         # Initialize the output matrix for the full effect on the CPU
@@ -314,7 +314,7 @@ function get_effects(
         for s in 1:n_samples
             threshold_level = mean_thresh_data_cpu + thresh_unconstrained_samples_cpu[s]
             
-            innov_train_cpu = ure_samples_cpu[s, :]
+            innov_train_cpu = innovations_samples_cpu[s, :]
             innov_pred_cpu = randn(Float32, t_N_full - t_N_train)
             innov_full_cpu = vcat(innov_train_cpu, innov_pred_cpu)
             

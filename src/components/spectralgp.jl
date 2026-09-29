@@ -38,21 +38,21 @@ This approach is computationally efficient, scaling as \$O(N \\log N)\$ for a gr
     Default: `"matern"`.
   - `sigma`: `UnivariateDistribution`, prior for the overall marginal standard deviation.
     Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
-    the kernel lengthscale(s). Default: `Gamma(2, 0.5)`.
+  - `length_scale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel length_scale(s). Default: `Gamma(2, 0.5)`.
   - `nu` (smoothness): `UnivariateDistribution`, prior for the Matern smoothness parameter.
     Default: `LogNormal(log(1.5), 0.5)`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The marginal standard deviation of the GP.
-- `ls_<key>`: The kernel lengthscale(s).
+- `ls_<key>`: The kernel length_scale(s).
 - `nu_<key>`: The Matern smoothness parameter.
 - `innovations_<key>`: The raw standard normal innovations for the Fourier coefficients.
 - `latent_<key>`: The interpolated latent effect at the observation coordinates.
 """
 struct SpectralGP <: ComponentModel
     sigma::UnivariateDistribution
-    lengthscale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}
+    length_scale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}
     nu::UnivariateDistribution
     kernel::String
     resolution::Int
@@ -62,7 +62,7 @@ COMPONENT_TYPE_REGISTRY[:spectral_gp] = SpectralGP
 COMPONENT_TYPE_REGISTRY[:spectralgp] = SpectralGP
 COMPONENT_CONSTRUCTORS[:spectral_gp] = (p, params) -> SpectralGP(
     get(p, :sigma, Exponential(1.0)),
-    get(p, :lengthscale, InverseGamma(2.0, 10.0)),
+    get(p, :length_scale, InverseGamma(2.0, 10.0)),
     get(p, :nu, LogNormal(log(1.5), 0.5)),
     string(get(params, :kernel, "matern")),
     get(params, :resolution, 32)
@@ -124,14 +124,14 @@ function get_priors(
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
     push!(priors, "$(p_names.nu) ~ $(_distribution_to_string(m.nu))")
 
-    if m.lengthscale isa Vector
-        ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
+    if m.length_scale isa Vector
+        length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
+        push!(priors, "$(p_names.length_scale) ~ Product([$(length_scale_priors_str)])")
     else
-        push!(priors, "$(p_names.ls) ~ $(_distribution_to_string(m.lengthscale))")
+        push!(priors, "$(p_names.length_scale) ~ $(_distribution_to_string(m.length_scale))")
     end
     
-    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
@@ -156,13 +156,13 @@ function get_updates(
         S_w = anisotropic_matern_spectral_density(
             hyper.freq_grids,
             $(p_names.sigma),
-            $(p_names.ls),
+            $(p_names.length_scale),
             $(p_names.nu),
             $(n_dims)
         )
         
         # 2. Construct complex Fourier coefficients from standard normal innovations
-        innov_reshaped = reshape($(p_names.ure), $(dims_str))
+        innov_reshaped = reshape($(p_names.innovations), $(dims_str))
         f_tilde_complex = complex.(innov_reshaped)
         f_tilde_scaled = f_tilde_complex .* sqrt.(S_w)
 
@@ -172,9 +172,9 @@ function get_updates(
         # 4. Interpolate the grid values to the original observation coordinates
         itp = linear_interpolation(Tuple(hyper.grid_ranges), latent_field_grid, extrapolation_bc=Interpolations.Flat())
         coords_for_itp = ntuple(d -> hyper.coords[:, d], $(n_dims))
-        $(p_names.sre) = itp(coords_for_itp...)
+        $(p_names.latent_field) = itp(coords_for_itp...)
         
-        $(eta_target) = $(eta_target) .+ $(p_names.sre)
+        $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
     end
     """
 end
@@ -224,11 +224,11 @@ function get_effects(
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
-        ls_name = _find_parameter(p_names, string(v.ls), k, is_multivariate_model)
+        length_scale_name = _find_parameter(p_names, string(v.length_scale), k, is_multivariate_model)
         nu_name = _find_parameter(p_names, string(v.nu), k, is_multivariate_model)
-        ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(ls_name) || isempty(nu_name) || isempty(ure_name)
+        if isempty(sigma_name) || isempty(length_scale_name) || isempty(nu_name) || isempty(innovations_name)
             @warn "Parameters for SpectralGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total_eff, n_samples))
             continue
@@ -236,10 +236,10 @@ function get_effects(
 
         # Extract posterior samples (CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_dim = m.lengthscale isa Vector ? n_dims : 1
-        ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
+        length_scale_dim = m.length_scale isa Vector ? n_dims : 1
+        ls_samples_cpu = get_params_matrix(chain, length_scale_name, length_scale_dim)
         nu_samples_cpu = get_params_vector(chain, nu_name, 1)[:, 1]
-        ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
         # Initialize the output matrix for the full effect on the CPU
         effect_k_cpu = zeros(Float64, N_total_eff, n_samples)
@@ -248,8 +248,8 @@ function get_effects(
         for i in 1:n_samples
             current_sigma = sigma_samples_cpu[i]
             current_nu = nu_samples_cpu[i]
-            current_ls = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
-            current_innovations = ure_samples_cpu[i, :]
+            current_ls = length_scale_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+            current_innovations = innovations_samples_cpu[i, :]
             
             # 1. Compute Power Spectral Density on the CPU
             S_w = anisotropic_matern_spectral_density(
@@ -287,7 +287,7 @@ end
 
 
 """
-    anisotropic_matern_spectral_density(freq_grids, sigma, ls, nu, n_dims)
+    anisotropic_matern_spectral_density(freq_grids, sigma, length_scale, nu, n_dims)
 
 Computes the power spectral density of an anisotropic Matérn kernel on a frequency grid.
 
@@ -302,18 +302,18 @@ where \$d\$ is the number of dimensions, \$\\sigma\$ is the marginal standard de
 # Arguments
 - `freq_grids`: A vector of frequency grids for each dimension.
 - `sigma`: The marginal standard deviation of the process.
-- `ls`: A vector of lengthscales for each dimension.
+- `length_scale`: A vector of lengthscales for each dimension.
 - `nu`: The smoothness parameter of the Matérn kernel.
 - `n_dims`: The number of dimensions.
 
 # Returns
 - A matrix representing the power spectral density on the grid.
 """
-function anisotropic_matern_spectral_density(freq_grids, sigma, ls, nu, n_dims)
-    T = promote_type(typeof(sigma), eltype(ls), typeof(nu))
-    ls_vec = ls isa Real ? fill(convert(T, ls), n_dims) : convert(Vector{T}, ls)
+function anisotropic_matern_spectral_density(freq_grids, sigma, length_scale, nu, n_dims)
+    T = promote_type(typeof(sigma), eltype(length_scale), typeof(nu))
+    length_scale_vec = length_scale isa Real ? fill(convert(T, length_scale), n_dims) : convert(Vector{T}, length_scale)
     
-    terms = [(2 * T(pi) .* ls_vec[d] .* freq_grids[d]).^2 for d in 1:n_dims]
+    terms = [(2 * T(pi) .* length_scale_vec[d] .* freq_grids[d]).^2 for d in 1:n_dims]
     freq_norm_sq = terms[1]
     for d in 2:n_dims
         freq_norm_sq = freq_norm_sq .+ terms[d]
@@ -321,7 +321,7 @@ function anisotropic_matern_spectral_density(freq_grids, sigma, ls, nu, n_dims)
     
     const_factor = (2^n_dims * T(pi)^(n_dims/2) * gamma(nu + n_dims/2) * (2*nu)^nu) / gamma(nu)
     
-    total_scaling = sigma^2 * prod(ls_vec) * const_factor
+    total_scaling = sigma^2 * prod(length_scale_vec) * const_factor
 
     power_val = nu + n_dims/2
     

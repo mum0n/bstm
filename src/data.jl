@@ -16,7 +16,7 @@ Consolidated synthetic and benchmark dataset generator for BSTM models.
 - `"scottish_lip"` (Default): Scottish Lip Cancer spatiotemporal dataset (primary & nested)
   enriched
   with comprehensive covariates (`y`, `y_rate`, `y_bin`, `y_gauss`, `y_pois`, `ordinal_y`,
-  `y_cat1..3`, `counts`, `t_idx`, `group`, `group_id`, `group_var`, `cell_area`, `effort`,
+  `y_cat1..3`, `counts`, `t_idx`, `group`, `group_id`, `grouping_covariate`, `cell_area`, `effort`,
   `removal`, `removal_total`, `proxy_val`, `predator_pop`, `recruitment`, `habitat`,
   `species_1..3`, `age_1..3`, `class_1..4`).
 - `"ordinal"`: Non-proportional odds ordinal dataset.
@@ -261,7 +261,7 @@ function bstm_data(
 
         data_sl.group = categorical(data_sl.district)
         data_sl.group_id = categorical(data_sl.district)
-        data_sl.group_var = categorical(data_sl.region)
+        data_sl.grouping_covariate = categorical(data_sl.region)
 
         # Comprehensive additional response types and covariates for component testing
         data_sl.y_gauss = Float64.(data_sl.y_rate) .+ randn(n_total) .* 0.1
@@ -921,9 +921,9 @@ function bstm_data(
         dist_matrix = pairwise(Euclidean(), centroids, dims=1)
         alpha_fields = zeros(n_units, n_categories)
         for k in 1:n_categories
-            ls = rand(1.5:0.1:3.0)
+            length_scale = rand(1.5:0.1:3.0)
             sigma_f = rand(0.8:0.1:1.2)
-            K = sigma_f^2 .* exp.(-0.5 .* (dist_matrix ./ ls).^2) + I * 1e-6
+            K = sigma_f^2 .* exp.(-0.5 .* (dist_matrix ./ length_scale).^2) + I * 1e-6
             alpha_fields[:, k] = rand(MvNormal(zeros(n_units), K))
         end
 

@@ -151,7 +151,7 @@ function get_priors(
     end
 
     if m.method == :noncentered
-        push!(priors_acc, "$(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)")
+        push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
     end
     
     return join(priors_acc, "\n    ")
@@ -181,8 +181,8 @@ function get_updates(
     noncentered_code = """
         # --- IID Component (Non-Centered): $(spec.key) ---
         let
-            $(p_names.sre) = $(p_names.ure) .* $(p_names.sigma)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), $(index_access))
+            $(p_names.latent_field) = $(p_names.innovations) .* $(p_names.sigma)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), $(index_access))
         end
     """
 
@@ -190,8 +190,8 @@ function get_updates(
     centered_code = """
         # --- IID Component (Centered): $(spec.key) ---
         let
-            $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent_val)), $(p_names.sigma)^2 * I)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), $(index_access))
+            $(p_names.latent_field) ~ MvNormal(zeros(T, $(n_latent_val)), $(p_names.sigma)^2 * I)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), $(index_access))
         end
     """
 
@@ -337,24 +337,14 @@ function get_effects(
                 end
             end
         elseif m.method == :noncentered
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "ure for IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            ure_samples = get_params_matrix(chain, ure_name, n_latent) # (n_samples, n_latent)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
             
-            latent_field_samples = ure_samples' .* sigma_samples' # (n_latent, n_samples)
+            latent_field_samples = innovations_samples' .* sigma_samples' # (n_latent, n_samples)
         else # :centered
-            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
-            if isempty(sre_name)
-                @warn "sre for centered IID component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            sre_samples = get_params_matrix(chain, sre_name, n_latent)
-            latent_field_samples = sre_samples'
+            latent_field_name = _find_parameter(p_names, string(p_names_k.latent_field), k, is_multivariate_model)
+            latent_field_samples = get_params_matrix(chain, latent_field_name, n_latent)
+            latent_field_samples = latent_field_samples'
         end
         
         effect_k = latent_field_samples[idx_full, :]

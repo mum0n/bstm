@@ -73,7 +73,7 @@ m = @bstm(
     likelihood(outcome, family=..., modifiers...) ~
         intercept() +
         fixed(covariate, ...) +
-        random(group_var, model=..., ...) +
+        random(grouping_covariate, model=..., ...) +
         other_modules(...),
     data_frame,
     W = spatial_adjacency_matrix,
@@ -299,7 +299,7 @@ Continuous point coordinates $(s_x, s_y)$ can be discretized into discrete areal
 ### 5.1. Sizing, Count & Geometry Controls
 
 - **`exact_units=true`**: Dynamically guarantees *exactly* $S$ output polygons via post-clipping bisection and union merging.
-- **`target_area=A`**: Scales hexagon radius $R = \sqrt{\frac{2 A}{3\sqrt{3}}}$ or lattice lengthscale $L = \sqrt{A}$.
+- **`target_area=A`**: Scales hexagon radius $R = \sqrt{\frac{2 A}{3\sqrt{3}}}$ or lattice length scale $L = \sqrt{A}$.
 - **`min_area` & `merge_small_polygons=true`**: Eliminates boundary slivers by merging small fragments into their longest-sharing neighbor using `LibGEOS.union`.
 - **`prune_empty=true`**: Removes unobserved polygons containing 0 data points.
 - **`ensure_connected!`**: Automatically detects disconnected spatial islands and adds minimal bridging edges to guarantee a fully connected graph for GMRF identifiability.
@@ -339,7 +339,7 @@ Synchronizes spatial areal units ($s \in 1\dots S$) and temporal intervals ($t \
 │ 1. Local Formula Call    │ 2. Global Hyperpriors Dict │ 3. Prior Scheme Presets │
 │  - sigma = (1.0, 0.01)   │  - :icar_sigma => ...      │  - :pcpriors (Default)  │
 │  - rho = Beta(2, 2)      │  - :sigma => ...           │  - :informative         │
-│  - prior = Normal(0, 1)  │  - :lengthscale => ...     │  - :uninformative       │
+│  - prior = Normal(0, 1)  │  - :length_scale => ...     │  - :uninformative       │
 └──────────────────────────┴────────────────────────────┴─────────────────────────┘
 ```
 
@@ -388,7 +388,7 @@ Penalized Complexity (PC) priors (Simpson et al., 2017) provide an axiomatic fra
   - *Base Model*: $\ell = \infty$ (infinitely smooth / constant flat function).
   - *Transform*: $\theta = 1/\ell \sim \operatorname{Exponential}(\lambda)$.
   - *Constraint*: $P(\ell < U) = \alpha \implies \lambda = -U \log(\alpha)$.
-  - *Example*: `random(x, model=gp, lengthscale=(0.1, 0.01))` sets $P(\ell < 0.1) = 0.01$ (penalizing high-frequency micro-scale fluctuations).
+  - *Example*: `random(x, model=gp, length_scale=(0.1, 0.01))` sets $P(\ell < 0.1) = 0.01$ (penalizing high-frequency micro-scale fluctuations).
 
 * **Fixed Effect & Regression Coefficients ($\beta$)**:
   - *Base Model*: $\beta = 0$ (no covariate effect).
@@ -662,7 +662,7 @@ save_bstm_bundle("runs/model_bym2", m, chn, res; au=st_res.au_spatial)
 
 # 2. Query results with SQL via DuckDB
 df_high_risk = query_duckdb("runs/model_bym2.duckdb", 
-    "SELECT * FROM plot_data_sre_spatial WHERE sre_mean > 1.2 ORDER BY sre_mean DESC")
+    "SELECT * FROM plot_data_latent_field_spatial WHERE latent_field_mean > 1.2 ORDER BY latent_field_mean DESC")
 
 # 3. Reload model and extend sampling with more iterations
 bundle = load_bstm_bundle("runs/model_bym2")

@@ -210,13 +210,12 @@ function get_priors(
     n_knots = spec.hyper.n_knots
     
     priors = ["$(p_names.sigma) ~ " * 
-              "DynamicPPL.NamedDist($(_distribution_to_string(m.sigma)), " *
-              ":$(p_names.sigma))"]
+              "$(_distribution_to_string(m.sigma))"]
 
     if m.method in [:noncentered, :gmrfsmooth]
-        push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, $(n_knots)), I)")
+        push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_knots)), I)")
     elseif m.method == :centered
-        push!(priors, "$(p_names.sre) ~ MvNormal(zeros(T, $(n_knots)), I)")
+        push!(priors, "$(p_names.latent_field) ~ MvNormal(zeros(T, $(n_knots)), I)")
     end
 
     return join(priors, "\n    ")
@@ -244,18 +243,18 @@ function get_updates(
     noncentered_code = """
         # --- Barycentric Component (Non-Centered): $(key) ---
         $(common_code)
-            scaled_coeffs = $(p_names.ure) .* $(p_names.sigma)
-            $(p_names.sre) = B * scaled_coeffs
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            scaled_coeffs = $(p_names.innovations) .* $(p_names.sigma)
+            $(p_names.latent_field) = B * scaled_coeffs
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
     centered_code = """
         # --- Barycentric Component (Centered): $(key) ---
         $(common_code)
-            scaled_coeffs = $(p_names.sre) .* $(p_names.sigma)
-            $(p_names.sre) = B * scaled_coeffs
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            scaled_coeffs = $(p_names.latent_field) .* $(p_names.sigma)
+            $(p_names.latent_field) = B * scaled_coeffs
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -266,9 +265,9 @@ function get_updates(
             L = hyper.L
             diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
             diag_D[1] = 0.0
-            coeffs = U * (diag_D .* $(p_names.ure))
-            $(p_names.sre) = B * coeffs
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            coeffs = U * (diag_D .* $(p_names.innovations))
+            $(p_names.latent_field) = B * coeffs
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -390,33 +389,33 @@ function get_effects(
                 coeffs_samples_matrix[:, i] = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
             end
         elseif m.method == :centered
-            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
-            if !isempty(sre_name)
+            latent_field_name = _find_parameter(p_names, string(p_names_k.latent_field), k, is_multivariate_model)
+            if !isempty(latent_field_name)
                 # get_params_vector returns [n_samples x n_params], so we transpose it
-                sre_samples = get_params_vector(chain, sre_name, n_knots)'
-                coeffs_samples_matrix = sre_samples .* sigma_samples'
+                latent_field_samples = get_params_vector(chain, latent_field_name, n_knots)'
+                coeffs_samples_matrix = latent_field_samples .* sigma_samples'
             else
-                @warn "Latent coefficients (sre) for centered Barycentric component $(spec.key) (outcome $k) not found. Using zeros."
+                @warn "Latent coefficients (latent_field) for centered Barycentric component $(spec.key) (outcome $k) not found. Using zeros."
             end
         else # :noncentered or :gmrfsmooth
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if !isempty(ure_name)
-                ure_samples = get_params_vector(chain, ure_name,
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            if !isempty(innovations_name)
+                innovations_samples = get_params_vector(chain, innovations_name,
                     n_knots)' # Transpose to [n_knots x n_samples]
                 
                 if m.method == :noncentered
-                    coeffs_samples_matrix = ure_samples .* sigma_samples'
+                    coeffs_samples_matrix = innovations_samples .* sigma_samples'
                 else # :gmrfsmooth
                     U = spec.hyper.U
                     L = spec.hyper.L
                     for i in 1:n_samples
                         diag_D = sigma_samples[i] ./ sqrt.(L .+ noise_val)
                         diag_D[1] = 0.0 # Assuming L[1] corresponds to the rank-deficient mode
-                        coeffs_samples_matrix[:, i] = U * (diag_D .* ure_samples[:, i])
+                        coeffs_samples_matrix[:, i] = U * (diag_D .* innovations_samples[:, i])
                     end
                 end
             else
-                 @warn "Innovations (ure) for Barycentric component $(spec.key) (outcome $k) not found. Using zeros."
+                 @warn "Innovations (innovations) for Barycentric component $(spec.key) (outcome $k) not found. Using zeros."
             end
         end
         

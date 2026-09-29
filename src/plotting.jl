@@ -434,7 +434,7 @@ end
 
 """
     _reconstruct_spatial_surface(coords, values; grid_res=150, ext_factor=0.05,
-                                 lengthscale=nothing, nugget=1e-4, domain_bbox=nothing)
+                                 length_scale=nothing, nugget=1e-4, domain_bbox=nothing)
 
 Reconstructs a smooth continuous random surface \$Z(x_g, y_g)\$ over a regular 2D
 grid spanning the spatial domain using regularized Matérn-3/2 kernel interpolation.
@@ -449,7 +449,7 @@ where the kernel is the Matérn-3/2 covariance function:
 ```math
 k(r) = \\left(1 + \\frac{\\sqrt{3}r}{\\ell}\\right) \\exp\\left(-\\frac{\\sqrt{3}r}{\\ell}\\right)
 ```
-with correlation lengthscale \$\\ell\$ automatically estimated from domain scale:
+with correlation length_scale \$\\ell\$ automatically estimated from domain scale:
 ```math
 \\ell = \\max\\left(1.5 \\cdot \\sqrt{\\frac{\\Delta x \\cdot \\Delta y}{\\pi N}}, 0.05 \\cdot \\max(\\Delta x, \\Delta y)\\right)
 ```
@@ -460,7 +460,7 @@ function _reconstruct_spatial_surface(
     values::AbstractVector{<:Real};
     grid_res::Int=150,
     ext_factor::Real=0.05,
-    lengthscale::Union{Real, Nothing}=nothing,
+    length_scale::Union{Real, Nothing}=nothing,
     nugget::Real=1e-4,
     domain_bbox=nothing
 )
@@ -496,9 +496,9 @@ function _reconstruct_spatial_surface(
     dx = max(x_max - x_min, 1e-6)
     dy = max(y_max - y_min, 1e-6)
 
-    # Characteristic spatial lengthscale
-    ell = if !isnothing(lengthscale) && lengthscale > 0
-        Float64(lengthscale)
+    # Characteristic spatial length_scale
+    ell = if !isnothing(length_scale) && length_scale > 0
+        Float64(length_scale)
     else
         max(1.5 * sqrt(dx * dy / (pi * max(n_pts, 1))), 0.05 * max(dx, dy))
     end
@@ -585,7 +585,7 @@ domain grid using regularized Matérn-3/2 kernel interpolation:
 z(\\mathbf{x}_0) = \\bar{z} + \\sum_{i=1}^N \\alpha_i \\cdot \\left(1 + \\frac{\\sqrt{3}\\|\\mathbf{x}_0 - \\mathbf{x}_i\\|}{\\ell}\\right) \\exp\\left(-\\frac{\\sqrt{3}\\|\\mathbf{x}_0 - \\mathbf{x}_i\\|}{\\ell}\\right)
 ```
 where \$\\boldsymbol{\\alpha} = (\\mathbf{K} + \\lambda \\mathbf{I})^{-1}(\\mathbf{z} - \\bar{z})\$
-and \$\\ell\$ is the characteristic spatial correlation lengthscale.
+and \$\\ell\$ is the characteristic spatial correlation length_scale.
 
 # Arguments
 - `coords`: Spatial coordinates as an \$N \\times 2\$ matrix, `DataFrame`, or vector of
@@ -2349,9 +2349,9 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
         mixed_plots = Dict{Symbol, Any}()
         mixed_plots_data = Dict{Symbol, Any}()
         for (key, effect_summary) in pairs(effects.mixed_effects)
-            group_var = Symbol(effect_summary.group_var)
+            grouping_covariate = Symbol(effect_summary.grouping_covariate)
             group_levels = (haskey(M, :data) && !isnothing(M.data) && hasproperty(M.data,
-                group_var)) ? unique(M.data[!, group_var]) : nothing
+                grouping_covariate)) ? unique(M.data[!, grouping_covariate]) : nothing
 
             summaries_to_plot = is_mv ? effect_summary.summaries[outcome] : effect_summary.summaries
 
@@ -2363,7 +2363,7 @@ function _bstm_plots_impl(model_obj, chain, res, M; au=nothing, data=nothing, ou
                     n_levels = length(means) 
                     
                     y_ticks_labels = isnothing(group_levels) || length(group_levels) != n_levels ? ["Level $i" for i in 1:n_levels] : string.(group_levels)
-                    p_title = "Mixed Effect: $(term_name) | $(group_var)"
+                    p_title = "Mixed Effect: $(term_name) | $(grouping_covariate)"
                     
                     p_forest = Plots.scatter(means, 1:n_levels, xerror=(means .- lowers,
                         uppers .- means), yticks=(1:n_levels, y_ticks_labels), title=p_title,

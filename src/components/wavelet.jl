@@ -38,14 +38,14 @@ second-order random walk (RW2), to regularize the function:
   - `family`: `Symbol`, the wavelet family to use (e.g., `:db4`, `:haar`). Default: `:db4`.
   - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the wavelet
     coefficients. Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the
-    lengthscale(s), which control the dilation of the wavelets. Default: `Gamma(2, 0.5)`.
+  - `length_scale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for the
+    length_scale(s), which control the dilation of the wavelets. Default: `Gamma(2, 0.5)`.
   - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
     Default: `:spectral`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the wavelet coefficients.
-- `ls_<key>`: The lengthscale(s) controlling the wavelet dilation.
+- `ls_<key>`: The length_scale(s) controlling the wavelet dilation.
 - `innovations_<key>`: The raw standard normal innovations for the coefficients.
 - `latent_<key>`: The final smooth effect vector.
 
@@ -57,7 +57,7 @@ struct Wavelet <: ComponentModel
     family::Symbol
     nbins::Int
     sigma::Distribution
-    lengthscale::Union{Distribution, Vector{<:Distribution}}
+    length_scale::Union{Distribution, Vector{<:Distribution}}
     method::Symbol
 end
 
@@ -67,7 +67,7 @@ COMPONENT_CONSTRUCTORS[:wavelet] = (p, params) -> Wavelet(
     get(params, :family, :db4),
     get(params, :nbins, 32),
     p.sigma,
-    p.lengthscale,
+    p.length_scale,
     get(params, :method, :spectral)
 )
 
@@ -132,15 +132,15 @@ function get_priors(
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
-    if m.lengthscale isa Vector
-        ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
+    if m.length_scale isa Vector
+        length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
+        push!(priors, "$(p_names.length_scale) ~ Product([$(length_scale_priors_str)])")
     else
-        ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
+        length_scale_prior_str = _distribution_to_string(m.length_scale)
+        push!(priors, "$(p_names.length_scale) ~ $(length_scale_prior_str)")
     end
     
-    push!(priors, "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
+    push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     return join(priors, "\n    ")
 end
@@ -159,7 +159,7 @@ function get_updates(
             hyper.coords,
             hyper.nbins_per_dim,
             Symbol("$(m.family)"),
-            $(p_names.ls)
+            $(p_names.length_scale)
         )
     """
 
@@ -169,9 +169,9 @@ function get_updates(
             $(common_basis_code)
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0; diag_D[2] = 0.0
-            coeffs = hyper.U * (diag_D .* $(p_names.ure))
-            $(p_names.sre) = B_wavelet * coeffs
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
+            $(p_names.latent_field) = B_wavelet * coeffs
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -180,11 +180,11 @@ function get_updates(
         let
             $(common_basis_code)
             F = hyper.cholesky_factor
-            coeffs_unscaled = F.L' \\ $(p_names.ure)
+            coeffs_unscaled = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
             coeffs = $(p_names.sigma) .* (coeffs_unscaled .- mean(coeffs_unscaled))
-            $(p_names.sre) = B_wavelet * coeffs
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(p_names.latent_field) = B_wavelet * coeffs
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -194,11 +194,11 @@ function get_updates(
             $(common_basis_code)
             Q_penalty = hyper.Q_template
             F = cholesky(Symmetric(Q_penalty + M.noise * I))
-            coeffs_unscaled = F.L' \\ $(p_names.ure)
+            coeffs_unscaled = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper.n_latent), sum(coeffs_unscaled))
             coeffs = $(p_names.sigma) .* coeffs_unscaled
-            $(p_names.sre) = B_wavelet * coeffs
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(p_names.latent_field) = B_wavelet * coeffs
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -246,10 +246,10 @@ function get_effects(
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
-        ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+        length_scale_name = _find_parameter(p_names, string(p_names_k.length_scale), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(ls_name) || isempty(ure_name)
+        if isempty(sigma_name) || isempty(length_scale_name) || isempty(innovations_name)
             @warn "Parameters for Wavelet component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -257,9 +257,9 @@ function get_effects(
 
         # Extract posterior samples (these are on the CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
-        ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
+        length_scale_dim = m.length_scale isa Vector ? length(m.length_scale) : 1
+        ls_samples_cpu = get_params_matrix(chain, length_scale_name, length_scale_dim)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
         # Initialize the output matrix for the full effect on the CPU
         effect_k_cpu = zeros(Float64, N_total, n_samples)
@@ -267,12 +267,12 @@ function get_effects(
         # --- Sample-wise Reconstruction ---
         for i in 1:n_samples
             # 1. Generate basis matrix on CPU
-            current_ls_cpu = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+            current_ls_cpu = length_scale_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
             B_wavelet_i_cpu = bstm_tensor_product_wavelet_basis(
                 coords_full_cpu, nbins_per_dim, m.family, current_ls_cpu
             )
             
-            innov_i_cpu = ure_samples_cpu[i, :]
+            innov_i_cpu = innovations_samples_cpu[i, :]
             sigma_i_cpu = sigma_samples_cpu[i]
             
             # 3. Reconstruct coefficients on CPU

@@ -850,12 +850,12 @@ end
 
 
 """
-    get_lattice_centroids(s_x, s_y, lengthscale)
+    get_lattice_centroids(s_x, s_y, length_scale)
 
 Generates regular square lattice centroids covering the bounding box of `(s_x, s_y)`.
 """
 function get_lattice_centroids(
-    s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, lengthscale::Real
+    s_x::AbstractVector{<:Real}, s_y::AbstractVector{<:Real}, length_scale::Real
 )
     if isempty(s_x) || isempty(s_y)
         return Tuple{Float64, Float64}[], 0, 0, (0.0, 0.0, 0.0, 0.0)
@@ -864,8 +864,8 @@ function get_lattice_centroids(
     xmin, xmax = extrema(s_x)
     ymin, ymax = extrema(s_y)
 
-    x_range = collect(xmin:lengthscale:xmax)
-    y_range = collect(ymin:lengthscale:ymax)
+    x_range = collect(xmin:length_scale:xmax)
+    y_range = collect(ymin:length_scale:ymax)
 
     if isempty(x_range)
         x_range = [xmin]
@@ -1201,7 +1201,7 @@ end
 """
     assign_spatial_units(s_x, s_y; area_method=:avt, target_units=10, exact_units=false,
                          target_area=nothing, min_area=0.0, max_area=Inf, min_points=1,
-                         max_points=nothing, lengthscale=nothing, radius=nothing,
+                         max_points=nothing, length_scale=nothing, radius=nothing,
                          grid_resolution=nothing, aspect_ratio=1.0, prune_empty=false,
                          merge_small_polygons=false, input_polygons=nothing,
                            geom_hull=nothing, kwargs...)
@@ -1219,7 +1219,7 @@ into discrete areal units with granular control over polygon size and unit count
 - `merge_small_polygons::Bool`: Merges sliver/boundary-clipped polygons below `min_area`
   into neighbors.
 - `prune_empty::Bool`: Removes areal units that contain 0 data observations (default: false).
-- `lengthscale::Real`, `radius::Real`: Explicit cell side length (`:lattice`) or hexagon
+- `length_scale::Real`, `radius::Real`: Explicit cell side length (`:lattice`) or hexagon
   radius (`:hexagonal`).
 - `grid_resolution`: Explicit grid resolution for `:lattice` (e.g., `20` or `(rows, cols)`).
 - `aspect_ratio::Real`: Rectangular cell aspect ratio for `:lattice` (`dy / dx`).
@@ -1244,7 +1244,7 @@ function assign_spatial_units(
     area_method::Symbol=:avt, target_units::Union{Nothing, Integer}=nothing,
     exact_units::Bool=false, target_area::Union{Nothing, Real}=nothing,
     min_area::Real=0.0, max_area::Real=Inf, min_points::Integer=1,
-    max_points::Union{Nothing, Integer}=nothing, lengthscale=nothing,
+    max_points::Union{Nothing, Integer}=nothing, length_scale=nothing,
     radius=nothing, grid_resolution=nothing, aspect_ratio::Real=1.0,
     prune_empty::Bool=false, merge_small_polygons::Bool=false,
     input_polygons=nothing, geom_hull=nothing, kwargs...
@@ -1284,8 +1284,8 @@ end
             Float64(radius)
         elseif !isnothing(target_area) && target_area > 0.0
             sqrt((2.0 * target_area) / (3.0 * sqrt(3.0)))
-        elseif !isnothing(lengthscale)
-            Float64(lengthscale)
+        elseif !isnothing(length_scale)
+            Float64(length_scale)
         else
             sqrt(domain_total_area / (1.5 * sqrt(3.0) * max(1, eff_target_units)))
         end
@@ -1325,8 +1325,8 @@ end
             end
             xmin, xmax = extrema(s_x); ymin, ymax = extrema(s_y)
             ((xmax - xmin) / max(1, cols), (ymax - ymin) / max(1, rows))
-        elseif !isnothing(lengthscale)
-            (Float64(lengthscale), Float64(lengthscale) * aspect_ratio)
+        elseif !isnothing(length_scale)
+            (Float64(length_scale), Float64(length_scale) * aspect_ratio)
         elseif !isnothing(target_area) && target_area > 0.0
             side = sqrt(target_area)
             (side, side * aspect_ratio)

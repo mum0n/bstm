@@ -169,7 +169,7 @@ function get_priors(
         push!(priors_acc, "$(p_names.rho) ~ $(_distribution_to_string(m.rho))")
     end
     if m.method != :marginalized
-        push!(priors_acc, "$(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)")
+        push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
     end
     return join(priors_acc, "\n    ")
 end
@@ -196,8 +196,8 @@ function get_updates(
             hyper = spec_registry[:$(key)].hyper
             diag_D = $(p_names.sigma) ./ sqrt.((1.0 .- $(p_names.rho)) .+ 
                                               $(p_names.rho) .* hyper.L .+ M.noise)
-            $(p_names.sre) = hyper.U * (diag_D .* $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
+            $(p_names.latent_field) = hyper.U * (diag_D .* $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.$(index_var))
         end
         """
 
@@ -208,8 +208,8 @@ function get_updates(
             rho_val = $(p_names.rho)
             Q_final = (1.0 - rho_val) .* I(size(Q_template, 1)) .+ rho_val .* Q_template
             F = cholesky(Symmetric(Matrix(Q_final) + M.noise * I))
-            $(p_names.sre) = $(p_names.sigma) .* (F.U \\ $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
+            $(p_names.latent_field) = $(p_names.sigma) .* (F.U \\ $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.$(index_var))
         end
         """
 
@@ -221,8 +221,8 @@ function get_updates(
             Q_final = (1.0 - rho_val) .* sparse(I, size(Q_template)...) .+ 
                       rho_val .* Q_template
             F = cholesky(Symmetric(Q_final + M.noise * I))
-            $(p_names.sre) = $(p_names.sigma) .* (F.U \\ $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
+            $(p_names.latent_field) = $(p_names.sigma) .* (F.U \\ $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.$(index_var))
         end
         """
 
@@ -354,16 +354,16 @@ function get_effects(
                 effect_k_latent[:, s] = x_train
             end
         else
-            ure_name = _find_parameter(
-                p_names, string(p_names_k.ure), k, is_multivariate_model
+            innovations_name = _find_parameter(
+                p_names, string(p_names_k.innovations), k, is_multivariate_model
             )
-            if isempty(ure_name)
-                @warn "ure for Leroux component $(spec.key) (outcome $k) not found. " *
+            if isempty(innovations_name)
+                @warn "innovations for Leroux component $(spec.key) (outcome $k) not found. " *
                       "Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            ure_samples = get_params_matrix(chain, ure_name, n_latent)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
             if m.method == :spectral
                 U = spec.hyper.U
@@ -374,7 +374,7 @@ function get_effects(
                     sigma_s = sigma_samples[s, 1]
                     rho_s = rho_samples[s, 1]
                     diag_D_s = sigma_s ./ sqrt.((1.0 - rho_s) .+ rho_s .* L_eig .+ noise)
-                    Z[:, s] = diag_D_s .* ure_samples[s, :]
+                    Z[:, s] = diag_D_s .* innovations_samples[s, :]
                 end
                 effect_k_latent = U * Z
             else # :cholesky or :cholesky_sparse
@@ -383,7 +383,7 @@ function get_effects(
                 for s in 1:n_samples
                     sigma_s = sigma_samples[s, 1]
                     rho_s = rho_samples[s, 1]
-                    innov_s = ure_samples[s, :]
+                    innov_s = innovations_samples[s, :]
                     Q_final = (1.0 - rho_s) .* I_mat .+ rho_s .* Q_template
                     F = cholesky(Symmetric(Q_final + noise * I_mat))
                     effect_k_latent[:, s] = sigma_s .* (F.U \ innov_s)

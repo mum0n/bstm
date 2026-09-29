@@ -166,7 +166,7 @@ function get_priors(
     else
         return """ # Priors for sigma and raw innovations
         $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-        $(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)
+        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     end
 end
@@ -188,8 +188,8 @@ function get_updates(
             L = hyper.L
             diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
             diag_D[1] = 0.0 # Enforce sum-to-zero constraint
-            $(p_names.sre) = U * (diag_D .* $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = U * (diag_D .* $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -198,14 +198,14 @@ function get_updates(
         let
             hyper = spec_registry[:$(key)].hyper
             F = hyper.cholesky_factor
-            sre_unscaled = F.L' \\ $(p_names.ure)
+            latent_field_unscaled = F.L' \\ $(p_names.innovations)
             
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * $(n_latent)), sum(sre_unscaled)
+                Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_unscaled)
             )
             
-            $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = latent_field_unscaled .* $(p_names.sigma)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -215,14 +215,14 @@ function get_updates(
             hyper = spec_registry[:$(key)].hyper
             Q = hyper.Q_template
             F = cholesky(Symmetric(Q + M.noise * I))
-            sre_unscaled = F.L' \\ $(p_names.ure)
+            latent_field_unscaled = F.L' \\ $(p_names.innovations)
             
             Turing.@addlogprob! logpdf(
-                Normal(0.0, 0.001 * $(n_latent)), sum(sre_unscaled)
+                Normal(0.0, 0.001 * $(n_latent)), sum(latent_field_unscaled)
             )
             
-            $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = latent_field_unscaled .* $(p_names.sigma)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -350,16 +350,16 @@ function get_effects(
                 effect_k_latent[:, j] = x_train
             end
         else
-            ure_name = _find_parameter(
-                p_names, string(p_names_k.ure), k, is_multivariate_model
+            innovations_name = _find_parameter(
+                p_names, string(p_names_k.innovations), k, is_multivariate_model
             )
-            if isempty(ure_name)
-                @warn "ure for ICAR component $(spec.key) (outcome $k) not found. " *
+            if isempty(innovations_name)
+                @warn "innovations for ICAR component $(spec.key) (outcome $k) not found. " *
                       "Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            ure_samples = get_params_matrix(chain, ure_name, n_latent)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
             if m.method == :spectral
                 U = spec.hyper.U
@@ -367,14 +367,14 @@ function get_effects(
                 inv_sqrt_L = 1.0 ./ sqrt.(L .+ noise)
                 inv_sqrt_L[1] = 0.0 # Enforce sum-to-zero constraint
                 # Vectorized Level-3 BLAS across all MCMC draws
-                scaled_innov = (inv_sqrt_L .* ure_samples') .* sigma_samples[:, 1]'
+                scaled_innov = (inv_sqrt_L .* innovations_samples') .* sigma_samples[:, 1]'
                 effect_k_latent = U * scaled_innov
             else # :cholesky or :cholesky_sparse
                 F = spec.hyper.cholesky_factor
                 # Vectorized Level-3 BLAS triangular solve across all draws
-                sre_unscaled = F.L' \ ure_samples'
-                sre_centered = sre_unscaled .- mean(sre_unscaled, dims=1)
-                effect_k_latent = sre_centered .* sigma_samples[:, 1]'
+                latent_field_unscaled = F.L' \ innovations_samples'
+                latent_field_centered = latent_field_unscaled .- mean(latent_field_unscaled, dims=1)
+                effect_k_latent = latent_field_centered .* sigma_samples[:, 1]'
             end
         end
 

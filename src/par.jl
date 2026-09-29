@@ -670,16 +670,42 @@ end
         exposure_var::Union{String, Symbol},
         counterfactual_value::Real=0.0,
         data::Union{DataFrame, Nothing}=nothing,
+        weights::Union{AbstractVector, Nothing}=nothing,
         alpha::Float64=0.05)::NamedTuple
 
-Computes model-based Population Attributable Fraction (PAF) through posterior counterfactual simulation.
+Computes a counterfactual Population Attributable Fraction (PAF) from posterior draws
+of a single exposure coefficient.
 
 # Mathematical Background
-Following Greenland & Drescher (1993) and Rockhill et al. (1998), the model-based PAF
-compares total expected outcomes under observed exposures \$\\mathbf{X}\$ against expected
-outcomes under counterfactual elimination of exposure \$\\mathbf{X}^*\$ (setting `exposure_var = counterfactual_value`),
-adjusting for all other covariates, spatial effects, and temporal dynamics:
-\$\\text{PAF}^{(s)} = \\frac{\\sum_{i=1}^N \\mu_i^{(s)}(\\mathbf{X}_i) - \\sum_{i=1}^N \\mu_i^{(s)}(\\mathbf{X}_i^*)}{\\sum_{i=1}^N \\mu_i^{(s)}(\\mathbf{X}_i)}\$
+For a log-linear link the counterfactual risk ratio for observation \$i\$ under elimination
+of the exposure is
+\$\\text{RR}_i^{(s)} = \\mu_i^{(s)}(\\mathbf{X}^*_i)/\\mu_i^{(s)}(\\mathbf{X}_i) = \\exp(-\\beta_x^{(s)}\\Delta x_i)\$,
+and the PAF is the weighted average of those ratios:
+\$\\text{PAF}^{(s)} = 1 - \\frac{\\sum_i w_i \\text{RR}_i^{(s)}}{\\sum_i w_i}\$.
+
+The weights \$w_i\$ are what turn an average of individual risk ratios into a ratio of
+*sums* over expected outcomes. Choosing \$w_i = \\mu_i^{(s)}\$ (the fitted expected
+outcome for observation \$i\$) gives the classic model-based
+\$\\text{PAF} = 1 - \\frac{\\sum_i \\mu_i \\text{RR}_i}{\\sum_i \\mu_i}\$; choosing population
+or case-count weights \$w_i = N_i\$ gives a population-attributable fraction. Unit
+weights are the default and are *not* that quantity — see the limitations below.
+
+# Scope and limitations (read before interpreting results)
+This routine is **marginal**: it propagates uncertainty in the exposure coefficient
+\$\\beta_x\$ only. It does **not** re-evaluate the model's linear predictor, so it does
+**not** adjust for other fixed covariates, spatial random effects, temporal effects,
+or measurement-error (EIV) latent variables. In particular:
+
+- With the default `weights = nothing` (unit weights) the result is
+  `1 - mean_i(RR_i)`, an *unweighted* average of individual risk ratios. This equals
+  the ratio-of-sums PAF only when every observation has the same baseline risk
+  \$\\mu_i\$; with heterogeneous baseline risk it understates the PAF.
+- Pass `weights = mu_i` (the fitted expected outcome per observation, e.g. from
+  `bstm.reconstruct(...).predictions.denoised.mean`) to recover the documented
+  ratio-of-sums form. Pass population/count weights instead to obtain a
+  population-attributable fraction.
+- For a fully confounder-adjusted (g-computation) PAF, re-predict each draw from the
+  fitted model with the exposure column replaced by `counterfactual_value`.
 
 # Arguments
 - `model`: The fitted `DynamicPPL.Model`.
@@ -687,6 +713,8 @@ adjusting for all other covariates, spatial effects, and temporal dynamics:
 - `exposure_var`: Exposure variable name.
 - `counterfactual_value`: Baseline reference level (default: 0.0).
 - `data`: Input DataFrame. If `nothing`, retrieved from model arguments.
+- `weights`: Optional per-observation weights \$\\mu_i\$ (or population at risk) used in
+  the ratio of sums. Defaults to unit weights; see the limitations above.
 - `alpha`: Significance level for credible interval (default: 0.05).
 
 # Returns
@@ -701,6 +729,7 @@ function par_counterfactual(
     exposure_var::Union{String, Symbol},
     counterfactual_value::Real=0.0,
     data::Union{DataFrame, Nothing}=nothing,
+    weights::Union{AbstractVector, Nothing}=nothing,
     alpha::Float64=0.05
 )::NamedTuple
     M = hasproperty(model, :args) && hasproperty(model.args, :M) ? model.args.M : nothing
@@ -729,6 +758,27 @@ function par_counterfactual(
     n_draws = length(coef_samples)
     paf_draws = zeros(Float64, n_draws)
     excess_cases_draws = zeros(Float64, n_draws)
+
+    # Weights enter the PAF as the per-observation expected outcome μ_i (or, for a
+    # population-attributable fraction, the population at risk). They are what turn
+    # Σ_i μ_i r_i / Σ_i μ_i into a ratio of *sums* rather than an unweighted mean of
+    # individual risk ratios; the two coincide only under equal baseline risk.
+    if isnothing(weights)
+        w = nothing
+        w_sum = 1.0
+    else
+        w = Float64.(collect(weights))
+        if length(w) != length(exp_obs)
+            error("`weights` has length $(length(w)) but the exposure variable has " *
+                  "length $(length(exp_obs)).")
+        end
+        any(x -> x < 0, w) && error("`weights` must be non-negative.")
+        sum(w) <= 0 && error("`weights` must contain at least one positive entry.")
+        w_sum = sum(w)
+    end
+    # With unit weights the weighted mean of `ratio_cf` is just its plain mean, so skip
+    # the extra length-N broadcast entirely on the default path.
+    use_unit_weights = isnothing(w)
     
     # Approximate baseline expected counts if outcome is available
     outcome_sym = if !isnothing(M) && hasproperty(M, :outcomes) && !isempty(M.outcomes)
@@ -744,8 +794,11 @@ function par_counterfactual(
         beta_s = coef_samples[s]
         # Individual counterfactual ratio: mu_cf,i / mu_obs,i = exp(-beta_s * delta_x_i)
         ratio_cf = exp.(-beta_s .* delta_x)
-        # Population attributable fraction: 1 - (sum mu_cf / sum mu_obs)
-        paf_s = 1.0 - mean(ratio_cf)
+        # Population attributable fraction: 1 - (sum_i w_i mu_cf,i / sum_i w_i mu_obs,i),
+        # which reduces to the weighted mean of `ratio_cf`. `dot` avoids materialising a
+        # temporary vector on every draw.
+        paf_s = use_unit_weights ? 1.0 - mean(ratio_cf) :
+                1.0 - dot(w, ratio_cf) / w_sum
         paf_draws[s] = paf_s
         excess_cases_draws[s] = paf_s * y_total
     end

@@ -44,9 +44,9 @@ is transformed using the `tanh` function: \$\\rho_i = \\tanh(\\rho_{field, i})\$
 - **Optional (in `random()` call)**:
   - `model`: `Symbol`, the GMRF model for the `rho` field (e.g., `:icar`, `:leroux`).
     Default: `:icar`.
-  - `rho_sigma`: `UnivariateDistribution`, prior for the std. dev. of the `rho` field.
+  - `precision_field_scale`: `UnivariateDistribution`, prior for the std. dev. of the `rho` field.
     Default: `Exponential(1.0)`.
-  - `rho_rho`: `UnivariateDistribution`, prior for the mixing parameter of the `rho` field's
+  - `precision_field_mixing`: `UnivariateDistribution`, prior for the mixing parameter of the `rho` field's
     model (if applicable). Default: `Beta(1,1)`.
   - `sigma`: `UnivariateDistribution`, prior for the std. dev. of the AR(1) innovations.
     Default: `Exponential(1.0)`.
@@ -61,9 +61,9 @@ is transformed using the `tanh` function: \$\\rho_i = \\tanh(\\rho_{field, i})\$
 - `latent_<key>`: The reconstructed spatiotemporal SVAR effect.
 """
 struct SVAR <: ComponentModel
-    rho_model_type::Symbol
-    rho_sigma::UnivariateDistribution
-    rho_rho::Union{UnivariateDistribution, Nothing}
+    precision_field_model::Symbol
+    precision_field_scale::UnivariateDistribution
+    precision_field_mixing::Union{UnivariateDistribution, Nothing}
     sigma::UnivariateDistribution
     method::Symbol
 end
@@ -74,9 +74,9 @@ COMPONENT_TYPE_REGISTRY[:spacetime] = SVAR
 COMPONENT_CONSTRUCTORS[:svar] = (p, params) -> begin
     raw_rho = get(params, :rho_model, get(params, :model, :icar))
     rho_m = raw_rho in [:svar, :spacetime] ? :icar : raw_rho
-    p_rho_sigma = hasproperty(p, :rho_sigma) ? p.rho_sigma :
+    p_rho_sigma = hasproperty(p, :precision_field_scale) ? p.precision_field_scale :
         (hasproperty(p, :sigma) ? p.sigma : Exponential(0.5))
-    p_rho_rho = hasproperty(p, :rho_rho) ? p.rho_rho : nothing
+    p_rho_rho = hasproperty(p, :precision_field_mixing) ? p.precision_field_mixing : nothing
     p_sigma = hasproperty(p, :sigma) ? p.sigma : Exponential(0.5)
     SVAR(
         rho_m,
@@ -109,12 +109,12 @@ function get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
         )
     end
     W = get(M, :W, nothing)
-    if isnothing(W) && m.rho_model_type != :iid
+    if isnothing(W) && m.precision_field_model != :iid
         @warn "Adjacency matrix `W` not provided for SVAR model's rho field."
     end
 
     # This returns CPU arrays
-    template = build_structure_template(m.rho_model_type, s_N; W=W)
+    template = build_structure_template(m.precision_field_model, s_N; W=W)
 
     return (
         Q_rho_template=template.matrix,
@@ -135,16 +135,16 @@ function get_priors(
     key = spec.key
 
     priors_acc = String[]
-    push!(priors_acc, "$(p_names.rho_sigma) ~ $(_distribution_to_string(m.rho_sigma))")
-    if m.rho_model_type in [:leroux, :bym2] && !isnothing(m.rho_rho)
-        push!(priors_acc, "$(p_names.rho_rho) ~ $(_distribution_to_string(m.rho_rho))")
+    push!(priors_acc, "$(p_names.precision_field_scale) ~ $(_distribution_to_string(m.precision_field_scale))")
+    if m.precision_field_model in [:leroux, :bym2] && !isnothing(m.precision_field_mixing)
+        push!(priors_acc, "$(p_names.precision_field_mixing) ~ $(_distribution_to_string(m.precision_field_mixing))")
     end
     push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
     push!(priors_acc,
-        "$(p_names.ure_rho) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent_rho), I)")
+        "$(p_names.innovations_precision) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent_rho), I)")
     push!(priors_acc,
-        "$(p_names.ure) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent_svar), I)")
+        "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent_svar), I)")
 
     return join(priors_acc, "\n    ")
 end
@@ -161,23 +161,23 @@ function get_updates(
     if m.method == :spectral
         rho_recon_code = """
             local hyper_rho = spec_registry[:$(key)].hyper
-            local D_rho = $(p_names.rho_sigma) ./ sqrt.(hyper_rho.L_rho .+ M.noise)
-            if "$(string(m.rho_model_type))" in ["icar", "besag"]
+            local D_rho = $(p_names.precision_field_scale) ./ sqrt.(hyper_rho.L_rho .+ M.noise)
+            if "$(string(m.precision_field_model))" in ["icar", "besag"]
                 D_rho[1] = 0.0
             end
-            local rho_field = hyper_rho.U_rho * (D_rho .* $(p_names.ure_rho))
+            local rho_field = hyper_rho.U_rho * (D_rho .* $(p_names.innovations_precision))
         """
     else # :cholesky or :cholesky_sparse
         rho_recon_code = """
             local hyper_rho = spec_registry[:$(key)].hyper
             local Q_rho = hyper_rho.Q_rho_template
             local F_rho = cholesky(Symmetric(Matrix(Q_rho) + M.noise * I))
-            local rho_field_unscaled = F_rho.L' \\ $(p_names.ure_rho)
-            if "$(string(m.rho_model_type))" in ["icar", "besag"]
+            local rho_field_unscaled = F_rho.L' \\ $(p_names.innovations_precision)
+            if "$(string(m.precision_field_model))" in ["icar", "besag"]
                 Turing.@addlogprob! logpdf(Normal(0.0, 0.001 * hyper_rho.n_latent_rho),
                   sum(rho_field_unscaled))
             end
-            local rho_field = rho_field_unscaled .* $(p_names.rho_sigma)
+            local rho_field = rho_field_unscaled .* $(p_names.precision_field_scale)
         """
     end
 
@@ -190,7 +190,7 @@ function get_updates(
 
             # 2. Evolve the SVAR state-space.
             local latent_st = zeros(eltype(rho_s), M.s_N, M.t_N)
-            local innovations_grid = reshape($(p_names.ure), M.s_N, M.t_N)
+            local innovations_grid = reshape($(p_names.innovations), M.s_N, M.t_N)
             
             latent_st[:, 1] = ($(p_names.sigma) ./ sqrt.(1 .- rho_s.^2 .+ M.noise)) .*
               innovations_grid[:, 1]
@@ -200,10 +200,10 @@ function get_updates(
             end
             
             # 3. Map the 2D latent field back to the 1D observation vector.
-            $(p_names.sre) = [latent_st[M.s_idx[i], M.t_idx[i]] for i in 1:M.y_N]
+            $(p_names.latent_field) = [latent_st[M.s_idx[i], M.t_idx[i]] for i in 1:M.y_N]
 
             # 4. Add the effect to the linear predictor.
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 end
@@ -243,13 +243,13 @@ function get_effects(
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
         
-        rho_sigma_name = _find_parameter(p_names, string(v.rho_sigma), k, is_multivariate_model)
+        rho_sigma_name = _find_parameter(p_names, string(v.precision_field_scale), k, is_multivariate_model)
         sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
-        ure_rho_name = _find_parameter(p_names, string(v.ure_rho), k, is_multivariate_model)
-        ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
+        innovations_precision_name = _find_parameter(p_names, string(v.innovations_precision), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
         
-        if isempty(rho_sigma_name) || isempty(sigma_name) || isempty(ure_rho_name)||
-            isempty(ure_name)
+        if isempty(rho_sigma_name) || isempty(sigma_name) || isempty(innovations_precision_name)||
+            isempty(innovations_name)
             @warn "Parameters for SVAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -258,8 +258,8 @@ function get_effects(
         # Extract posterior samples (these are on the CPU)
         rho_sigma_samples_cpu = get_params_vector(chain, rho_sigma_name, 1)[:, 1]
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        rho_innovations_samples_cpu = get_params_matrix(chain, ure_rho_name, s_N)
-        innovations_samples_cpu = get_params_matrix(chain, ure_name, n_latent_svar)
+        rho_innovations_samples_cpu = get_params_matrix(chain, innovations_precision_name, s_N)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent_svar)
         
         # Initialize the output matrix for the full effect on the CPU
         effect_k_cpu = zeros(Float64, N_total, n_samples)
@@ -274,14 +274,14 @@ function get_effects(
             local rho_field_s
             if m.method == :spectral
                 D_rho_s = rho_sigma_s ./ sqrt.(L_rho_cpu .+ noise)
-                if m.rho_model_type in [:icar, :besag]
+                if m.precision_field_model in [:icar, :besag]
                     D_rho_s[1] = 0.0
                 end
                 rho_field_s = U_rho_cpu * (D_rho_s .* rho_innovations_s)
             else # :cholesky or :cholesky_sparse
                 F_rho_cpu = cholesky(Symmetric(Matrix(Q_rho_template_cpu) + noise * I))
                 rho_field_unscaled = F_rho_cpu.L' \ rho_innovations_s
-                if m.rho_model_type in [:icar, :besag]
+                if m.precision_field_model in [:icar, :besag]
                     rho_field_unscaled .-= mean(rho_field_unscaled)
                 end
                 rho_field_s = rho_field_unscaled .* rho_sigma_s

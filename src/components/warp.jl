@@ -25,7 +25,7 @@ coordinates:
 Both the main process \$h(\\cdot)\$ and the offset function \$\\text{offset}(x)\$ are
 modeled as GPs, which are approximated using Random Fourier Features (RFFs) for
 computational scalability. This allows the model to learn how to stretch and
-compress the input space to best fit the data, effectively making the lengthscale
+compress the input space to best fit the data, effectively making the length_scale
 of the main GP dependent on the input location \$x\$.
 
 # Computational Methods
@@ -42,15 +42,15 @@ of the main GP dependent on the input location \$x\$.
     Default: `20`.
   - `kernel`: `String`, name of the kernel to approximate (e.g., `"se"`, `"matern32"`).
     Default: `"se"`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
-    the kernel lengthscale(s) of the main GP.
+  - `length_scale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+    the kernel length_scale(s) of the main GP.
   - `sigma`: `UnivariateDistribution`, prior for the std. dev. of the main GP's coefficients.
   - `method`: `Symbol`, the computational method (`:noncentered` or `:centered`). Default:
     `:noncentered`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the main GP's coefficients.
-- `ls_<key>`: The kernel lengthscale(s).
+- `ls_<key>`: The kernel length_scale(s).
 - `W_warp_<key>`: RFF weights for the warping layer.
 - `b_warp_<key>`: RFF biases for the warping layer.
 - `beta_warp_<key>`: RFF coefficients for the warping layer.
@@ -60,7 +60,7 @@ of the main GP dependent on the input location \$x\$.
 - `latent_<key>`: Main GP coefficients (centered).
 """
 struct Warp <: ComponentModel
-    lengthscale::Union{Distribution, Vector{<:Distribution}}
+    length_scale::Union{Distribution, Vector{<:Distribution}}
     sigma::Distribution
     n_features::Int
     kernel::String
@@ -70,7 +70,7 @@ end
 COMPONENT_TYPE_REGISTRY[:warp] = Warp
  
 COMPONENT_CONSTRUCTORS[:warp] = (p, params) -> Warp(
-    p.lengthscale,
+    p.length_scale,
     p.sigma,
     get(params, :n_features, 20),
     string(get(params, :kernel, "se")),
@@ -121,7 +121,7 @@ end
 
 Generates the Turing code string for the Warp component's priors.
 This includes priors for the overall standard deviation (`sigma`),
-the kernel lengthscale(s) (`ls`), and all Random Fourier Features (RFF)
+the kernel length_scale(s), and all Random Fourier Features (RFF)
 parameters for both the warping layer and the main GP layer.
 
 # Arguments
@@ -137,11 +137,11 @@ parameters for both the warping layer and the main GP layer.
 function get_priors(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    W_warp_name = Symbol("$(p_names.sre)_W_warp")
-    b_warp_name = Symbol("$(p_names.sre)_b_warp")
-    beta_warp_name = Symbol("$(p_names.sre)_beta_warp")
-    W_main_name = Symbol("$(p_names.sre)_W_main")
-    b_main_name = Symbol("$(p_names.sre)_b_main")
+    rff_weights_warp_name = Symbol("$(p_names.rff_weights)_warp")
+    rff_offsets_warp_name = Symbol("$(p_names.rff_offsets)_warp")
+    beta_warp_name = Symbol("$(p_names.beta)_warp")
+    rff_weights_main_name = Symbol("$(p_names.rff_weights)_main")
+    rff_offsets_main_name = Symbol("$(p_names.rff_offsets)_main")
     
     key = spec.key
     in_dims = spec_registry[:$(key)].hyper.in_dims
@@ -150,41 +150,41 @@ function get_priors(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::St
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
-    if m.lengthscale isa Vector
-        ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
+    if m.length_scale isa Vector
+        length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
+        push!(priors, "$(p_names.length_scale) ~ Product([$(length_scale_priors_str)])")
     else
-        ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
+        length_scale_prior_str = _distribution_to_string(m.length_scale)
+        push!(priors, "$(p_names.length_scale) ~ $(length_scale_prior_str)")
     end
 
     # Priors for warping layer RFF parameters (always sampled)
     push!(priors, """
-        $(W_warp_name) ~ MvNormal(zeros(T, $(in_dims * n_features)), I)
+
+        $(rff_weights_warp_name) ~ MvNormal(zeros(T, $(in_dims * n_features)), I)
     """)
+
     push!(priors, """
-        $(b_warp_name) ~ MvNormal(zeros(T, $(n_features)), I)
+        $(rff_offsets_warp_name) ~ MvNormal(zeros(T, $(n_features)), I)
     """)
     push!(priors, """
         $(beta_warp_name) ~ MvNormal(zeros(T, $(n_features)), I)
     """)
-    
     # Priors for main GP layer RFF parameters (always sampled)
     push!(priors, """
-        $(W_main_name) ~ MvNormal(zeros(T, $(in_dims * n_features)), I)
+        $(rff_weights_main_name) ~ MvNormal(zeros(T, $(in_dims * n_features)), I)
     """)
     push!(priors, """
-        $(b_main_name) ~ MvNormal(zeros(T, $(n_features)), I)
+        $(rff_offsets_main_name) ~ MvNormal(zeros(T, $(n_features)), I)
     """)
-
     # Prior for main GP coefficients (depends on method)
     if m.method == :noncentered
         push!(priors, """
-            $(p_names.ure) ~ MvNormal(zeros(T, $(n_features)), I)
+            $(p_names.innovations) ~ MvNormal(zeros(T, $(n_features)), I)
         """)
     elseif m.method == :centered
         push!(priors, """
-            $(p_names.sre) ~ MvNormal(
+            $(p_names.latent_field) ~ MvNormal(
                 zeros(T, $(n_features)), $(p_names.sigma)^2 * I
             )
         """)
@@ -217,20 +217,20 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     eta_target = (arch == "multivariate") ? "eta_latent[:, $(outcome_idx)]" : "eta"
     
-    W_warp_name = Symbol("$(p_names.sre)_W_warp")
-    b_warp_name = Symbol("$(p_names.sre)_b_warp")
-    beta_warp_name = Symbol("$(p_names.sre)_beta_warp")
-    W_main_name = Symbol("$(p_names.sre)_W_main")
-    b_main_name = Symbol("$(p_names.sre)_b_main")
+    rff_weights_warp_name = Symbol("$(p_names.rff_weights)_warp")
+    rff_offsets_warp_name = Symbol("$(p_names.rff_offsets)_warp")
+    beta_warp_name = Symbol("$(p_names.beta)_warp")
+    rff_weights_main_name = Symbol("$(p_names.rff_weights)_main")
+    rff_offsets_main_name = Symbol("$(p_names.rff_offsets)_main")
 
     key = spec.key
     in_dims = spec_registry[:$(key)].hyper.in_dims
     n_features = m.n_features
 
-    ls_scaling_code = if m.lengthscale isa Vector
-        "local W_main_matrix = reshape($(W_main_name), $(in_dims), $(n_features)) ./ $(p_names.ls)'"
+    length_scale_scaling_code = if m.length_scale isa Vector
+        "local W_main_matrix = reshape($(rff_weights_main_name), $(in_dims), $(n_features)) ./ $(p_names.length_scale)'"
     else
-        "local W_main_matrix = reshape($(W_main_name), $(in_dims), $(n_features)) ./ $(p_names.ls)"
+        "local W_main_matrix = reshape($(rff_weights_main_name), $(in_dims), $(n_features)) ./ $(p_names.length_scale)"
     end
 
     common_code = """ # Common code for both noncentered and centered methods
@@ -238,16 +238,16 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
         local coords = hyper.coords
         
         # 1. Construct and apply the warping function
-        local W_warp_matrix = reshape($(W_warp_name), $(in_dims), $(n_features))
+        local W_warp_matrix = reshape($(rff_weights_warp_name), $(in_dims), $(n_features))
         local Phi_warp = sqrt(2.0 / $(n_features)) .* cos.((coords * W_warp_matrix) .+
-          $(b_warp_name)')
+          $(rff_offsets_warp_name)')
         local warping_effect = Phi_warp * $(beta_warp_name)
         local coords_warped = coords .+ warping_effect
 
         # 2. Construct the main GP on the warped coordinates
-        $(ls_scaling_code)
+        $(length_scale_scaling_code)
         local Phi_main = sqrt(2.0 / $(n_features)) .* cos.((coords_warped * W_main_matrix)
-          .+ $(b_main_name)')
+          .+ $(rff_offsets_main_name)')
     """
 
     noncentered_code = """
@@ -256,10 +256,10 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
             $(common_code)
             
             # 3. Scale coefficients and compute final effect
-            local scaled_beta_main = $(p_names.ure) .* $(p_names.sigma)
-            $(p_names.sre) = Phi_main * scaled_beta_main
+            local scaled_beta_main = $(p_names.innovations) .* $(p_names.sigma)
+            $(p_names.latent_field) = Phi_main * scaled_beta_main
             
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -269,7 +269,7 @@ function get_updates(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::S
             $(common_code)
             
             # 3. Sample coefficients directly and compute final effect
-            $(eta_target) = $(eta_target) .+ Phi_main * $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ Phi_main * $(p_names.latent_field)
         end
     """
 
@@ -316,23 +316,23 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
         
         # Define parameter names for this outcome
-        W_warp_name = string(Symbol("$(p_names_k.sre)_W_warp"))
-        b_warp_name = string(Symbol("$(p_names_k.sre)_b_warp"))
-        beta_warp_name = string(Symbol("$(p_names_k.sre)_beta_warp"))
-        W_main_name = string(Symbol("$(p_names_k.sre)_W_main"))
-        b_main_name = string(Symbol("$(p_names_k.sre)_b_main"))
+        rff_weights_warp_name = string(Symbol("$(p_names_k.rff_weights)_warp"))
+        rff_offsets_warp_name = string(Symbol("$(p_names_k.rff_offsets)_warp"))
+        beta_warp_name = string(Symbol("$(p_names_k.beta)_warp"))
+        rff_weights_main_name = string(Symbol("$(p_names_k.rff_weights)_main"))
+        rff_offsets_main_name = string(Symbol("$(p_names_k.rff_offsets)_main"))
         sigma_name = string(p_names_k.sigma)
-        ls_name = string(p_names_k.ls)
+        length_scale_name = string(p_names_k.length_scale)
 
         # Extract posterior samples (these are on the CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
-        W_warp_samples_cpu = get_params_matrix(chain, W_warp_name, in_dims * n_features)
-        b_warp_samples_cpu = get_params_matrix(chain, b_warp_name, n_features)
+        length_scale_dim = m.length_scale isa Vector ? length(m.length_scale) : 1
+        ls_samples_cpu = get_params_matrix(chain, length_scale_name, length_scale_dim)
+        W_warp_samples_cpu = get_params_matrix(chain, rff_weights_warp_name, in_dims * n_features)
+        b_warp_samples_cpu = get_params_matrix(chain, rff_offsets_warp_name, n_features)
         beta_warp_samples_cpu = get_params_matrix(chain, beta_warp_name, n_features)
-        W_main_samples_cpu = get_params_matrix(chain, W_main_name, in_dims * n_features)
-        b_main_samples_cpu = get_params_matrix(chain, b_main_name, n_features)
+        W_main_samples_cpu = get_params_matrix(chain, rff_weights_main_name, in_dims * n_features)
+        b_main_samples_cpu = get_params_matrix(chain, rff_offsets_main_name, n_features)
 
         # Initialize the output matrix for the full effect on the CPU
         effect_k_cpu = zeros(Float64, n_obs_full, n_samples)
@@ -349,7 +349,7 @@ function get_effects(
             coords_warped_i_cpu = coords_full .+ warping_effect_i_cpu
 
             # 2. Construct the main GP on the warped coordinates on the CPU
-            ls_i_cpu = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+            ls_i_cpu = length_scale_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
             W_main_i_unscaled_cpu = reshape(W_main_samples_cpu[i, :], in_dims, n_features)
             W_main_i_cpu = W_main_i_unscaled_cpu ./ (ls_i_cpu isa AbstractVector ? ls_i_cpu' : ls_i_cpu)
 
@@ -359,13 +359,13 @@ function get_effects(
             # 3. Scale coefficients and compute final effect on the CPU
             local beta_main_i_cpu
             if m.method == :noncentered
-                ure_name = string(p_names_k.ure)
-                beta_main_unscaled_samples_cpu = get_params_matrix(chain, ure_name, n_features)
+                innovations_name = string(p_names_k.innovations)
+                beta_main_unscaled_samples_cpu = get_params_matrix(chain, innovations_name, n_features)
                 beta_main_unscaled_i_cpu = beta_main_unscaled_samples_cpu[i, :]
                 beta_main_i_cpu = beta_main_unscaled_i_cpu .* sigma_samples_cpu[i]
             else # :centered
-                sre_name = string(p_names_k.sre)
-                beta_main_samples_cpu = get_params_matrix(chain, sre_name, n_features)
+                latent_field_name = string(p_names_k.latent_field)
+                beta_main_samples_cpu = get_params_matrix(chain, latent_field_name, n_features)
                 beta_main_i_cpu = beta_main_samples_cpu[i, :]
             end
             

@@ -141,7 +141,7 @@ function get_updates(
     # Generate the code for the inner model.
     inner_updates_code = get_updates(m.model, inner_spec, arch, outcome_idx, M)
     inner_p_names = generate_full_variable_names(inner_spec, arch, outcome_idx)
-    inner_latent_var = inner_p_names.sre
+    inner_latent_var = inner_p_names.latent_field
     
     # Fix the spec_registry path in the generated code.
     incorrect_access = "spec_registry[:$(inner_spec_key)].hyper"

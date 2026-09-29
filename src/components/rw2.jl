@@ -176,7 +176,7 @@ function get_priors(
     else
         return """
             $(p_names.sigma) ~ $(sigma_prior_str)
-            $(p_names.ure) ~ MvNormal(
+            $(p_names.innovations) ~ MvNormal(
                 zeros(T, spec_registry[:$(key)].hyper.n_latent), I
             )
         """
@@ -195,28 +195,28 @@ function get_updates(
     statespace_code = """
         # --- RW2 Component: $(key) (State-Space Method) ---
         let
-            innovations = $(p_names.ure)
+            innovations = $(p_names.innovations)
             T_num = eltype(innovations)
             n_latent = $(inner_hyper_access).n_latent
-            sre_unscaled = similar(innovations, T_num, n_latent)
+            latent_field_unscaled = similar(innovations, T_num, n_latent)
             
             if n_latent > 0
-                sre_unscaled[1] = innovations[1]
+                latent_field_unscaled[1] = innovations[1]
             end
             if n_latent > 1
-                sre_unscaled[2] = 2 * sre_unscaled[1] + innovations[2]
+                latent_field_unscaled[2] = 2 * latent_field_unscaled[1] + innovations[2]
             end
             for t in 3:n_latent
-                sre_unscaled[t] = 2 * sre_unscaled[t-1] - sre_unscaled[t-2] + innovations[t]
+                latent_field_unscaled[t] = 2 * latent_field_unscaled[t-1] - latent_field_unscaled[t-2] + innovations[t]
             end
             if n_latent > 0
                 Turing.@addlogprob! logpdf(
-                    Normal(0.0, 0.001 * n_latent), sum(sre_unscaled)
+                    Normal(0.0, 0.001 * n_latent), sum(latent_field_unscaled)
                 )
             end
             
-            $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
+            $(p_names.latent_field) = latent_field_unscaled .* $(p_names.sigma)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.t_idx)
         end
     """
 
@@ -227,8 +227,8 @@ function get_updates(
             diag_D = $(p_names.sigma) ./ sqrt.(inner_hyper.L .+ M.noise)
             diag_D[1] = 0.0
             diag_D[2] = 0.0
-            $(p_names.sre) = inner_hyper.U * (diag_D .* $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
+            $(p_names.latent_field) = inner_hyper.U * (diag_D .* $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.t_idx)
         end
     """
 
@@ -236,13 +236,13 @@ function get_updates(
         # --- RW2 Component: $(key) (Cholesky Method) ---
         let
             F = $(inner_hyper_access).cholesky_factor
-            sre_unscaled = F.L' \\ $(p_names.ure)
+            latent_field_unscaled = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * spec_registry[:$(key)].hyper.n_latent),
-                sum(sre_unscaled)
+                sum(latent_field_unscaled)
             )
-            $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
+            $(p_names.latent_field) = latent_field_unscaled .* $(p_names.sigma)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.t_idx)
         end
     """
 
@@ -250,13 +250,13 @@ function get_updates(
         # --- RW2 Component: $(key) (Sparse Cholesky Method, Not AD-Safe) ---
         let
             F = $(inner_hyper_access).cholesky_factor
-            sre_unscaled = F.L' \\ $(p_names.ure)
+            latent_field_unscaled = F.L' \\ $(p_names.innovations)
             Turing.@addlogprob! logpdf(
                 Normal(0.0, 0.001 * spec_registry[:$(key)].hyper.n_latent),
-                sum(sre_unscaled)
+                sum(latent_field_unscaled)
             )
-            $(p_names.sre) = sre_unscaled .* $(p_names.sigma)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.t_idx)
+            $(p_names.latent_field) = latent_field_unscaled .* $(p_names.sigma)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.t_idx)
         end
     """
 
@@ -393,27 +393,22 @@ function get_effects(
                 effect_k_latent_cpu[1:n_latent_train, j] = x_train
             end
         else
-            ure_name = _find_parameter(p_names, string(v.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "ure for RW2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent_train)
+            innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
+            innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent_train)
 
             if m.method == :statespace
-                innovations_T = ure_samples_cpu' # [n_latent_train, n_samples]
-                sre_unscaled_cpu = similar(innovations_T)
+                innovations_T = innovations_samples_cpu' # [n_latent_train, n_samples]
+                latent_field_unscaled_cpu = similar(innovations_T)
                 if n_latent_train > 0
-                    sre_unscaled_cpu[1, :] = innovations_T[1, :]
+                    latent_field_unscaled_cpu[1, :] = innovations_T[1, :]
                 end
                 if n_latent_train > 1
-                    sre_unscaled_cpu[2, :] = 2 .* sre_unscaled_cpu[1, :] .+ innovations_T[2, :]
+                    latent_field_unscaled_cpu[2, :] = 2 .* latent_field_unscaled_cpu[1, :] .+ innovations_T[2, :]
                 end
                 for t in 3:n_latent_train
-                    sre_unscaled_cpu[t, :] = 2 .* sre_unscaled_cpu[t-1, :] .- sre_unscaled_cpu[t-2, :] .+ innovations_T[t, :]
+                    latent_field_unscaled_cpu[t, :] = 2 .* latent_field_unscaled_cpu[t-1, :] .- latent_field_unscaled_cpu[t-2, :] .+ innovations_T[t, :]
                 end
-                latent_field_centered_cpu = sre_unscaled_cpu .- mean(sre_unscaled_cpu, dims=1)
+                latent_field_centered_cpu = latent_field_unscaled_cpu .- mean(latent_field_unscaled_cpu, dims=1)
                 latent_field_train_cpu = latent_field_centered_cpu .* sigma_samples_cpu'
             elseif m.method == :spectral
                 U_cpu = hyper.U
@@ -421,11 +416,11 @@ function get_effects(
                 diag_D = (sigma_samples_cpu' ./ sqrt.(L_cpu .+ noise))
                 diag_D[1, :] .= 0.0
                 diag_D[2, :] .= 0.0
-                latent_field_train_cpu = U_cpu * (diag_D .* ure_samples_cpu')
+                latent_field_train_cpu = U_cpu * (diag_D .* innovations_samples_cpu')
             else # :cholesky or :cholesky_sparse
                 F_cpu = hyper.cholesky_factor
-                sre_unscaled = F_cpu.L' \ ure_samples_cpu'
-                latent_field_centered_cpu = sre_unscaled .- mean(sre_unscaled, dims=1)
+                latent_field_unscaled = F_cpu.L' \ innovations_samples_cpu'
+                latent_field_centered_cpu = latent_field_unscaled .- mean(latent_field_unscaled, dims=1)
                 latent_field_train_cpu = latent_field_centered_cpu .* sigma_samples_cpu'
             end
             effect_k_latent_cpu[1:n_latent_train, :] = latent_field_train_cpu

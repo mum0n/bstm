@@ -81,9 +81,9 @@ function ParamRegistry()
 end
 
 # =============================================================================
+
 # Registration & Mutation Helpers
 # =============================================================================
-
 """
     add_descriptor!(reg::ParamRegistry, desc::ParamDescriptor)
 
@@ -100,10 +100,12 @@ function add_descriptor!(reg::ParamRegistry, desc::ParamDescriptor)
     if !haskey(reg.by_component, desc.component_key)
         reg.by_component[desc.component_key] = Dict{Symbol, Vector{ParamDescriptor}}()
     end
+
     role_dict = reg.by_component[desc.component_key]
     if !haskey(role_dict, desc.role)
         role_dict[desc.role] = ParamDescriptor[]
     end
+
     # Replace existing with same symbol or append
     existing_idx = findfirst(d -> d.symbol == desc.symbol, role_dict[desc.role])
     if isnothing(existing_idx)
@@ -120,7 +122,6 @@ function add_descriptor!(reg::ParamRegistry, desc::ParamDescriptor)
     if !(desc.name in reg.by_base[base])
         push!(reg.by_base[base], desc.name)
     end
-
     # Also index by underscore-numeric suffix base if present (e.g., intercept_1 -> intercept)
     parts = Base.split(desc.name, '_')
     if length(parts) > 1 && all(isdigit.(collect(parts[end])))
@@ -132,16 +133,15 @@ function add_descriptor!(reg::ParamRegistry, desc::ParamDescriptor)
             push!(reg.by_base[underscore_base], desc.name)
         end
     end
-
     # Map name to indexing key
     reg.name_to_key[desc.name] = desc.symbol
     return reg
 end
 
 # =============================================================================
+
 # Multi-Source ParamRegistry Builders
 # =============================================================================
-
 """
     build_param_registry(M::NamedTuple; prefix::String = "")
 
@@ -238,7 +238,7 @@ function build_param_registry(M::NamedTuple; prefix::String = "")
         # Register Errors-in-Variables (EIV) latent innovations
         if haskey(M, :Xfixed_eiv_map) && !isempty(M.Xfixed_eiv_map)
             for (col_sym, sd_vec) in M.Xfixed_eiv_map
-                eiv_sym = !isempty(prefix) ? Symbol("ure_eiv_$(prefix)_$(col_sym)") : Symbol("ure_eiv_$(col_sym)")
+                eiv_sym = !isempty(prefix) ? Symbol("innovations_eiv_$(prefix)_$(col_sym)") : Symbol("innovations_eiv_$(col_sym)")
                 add_descriptor!(reg, ParamDescriptor(
                     eiv_sym;
                     component_key = :fixed,
@@ -303,28 +303,28 @@ function build_param_registry(M::NamedTuple; prefix::String = "")
                 0
             end
 
-            latent_roles = [:ure, :sre, :W1, :b1, :W2, :W, :b, :v_unscaled,
-              :thresh_unscaled, :amplitude_unscaled]
+            latent_roles = [:innovations, :latent_field, :rff_weights_1, :rff_offsets_1, :rff_weights_2, :rff_weights, :rff_offsets, :reflection_vector_unconstrained,
+              :threshold_unconstrained, :amplitude_unconstrained]
             for role in latent_roles
                 for k in 1:outcomes_N
                     outcome_k = is_multivariate ? k : nothing
                     p_names = generate_full_variable_names(prefixed_spec, arch, outcome_k)
                     if hasproperty(p_names, role)
                         sym = getfield(p_names, role)
-                        shape_val = if role in [:ure, :sre]
+                        shape_val = if role in [:innovations, :latent_field]
                             (n_latent > 0 ? n_latent : 1,)
-                        elseif role == :W1 && hasproperty(comp_obj, :hidden_dim) &&
+                        elseif role == :rff_weights_1 && hasproperty(comp_obj, :hidden_dim) &&
                           hasproperty(spec.hyper, :in_dim)
                             (spec.hyper.in_dim, comp_obj.hidden_dim)
-                        elseif role == :b1 && hasproperty(comp_obj, :hidden_dim)
+                        elseif role == :rff_offsets_1 && hasproperty(comp_obj, :hidden_dim)
                             (comp_obj.hidden_dim,)
-                        elseif role == :W2 && hasproperty(comp_obj, :hidden_dim) &&
+                        elseif role == :rff_weights_2 && hasproperty(comp_obj, :hidden_dim) &&
                           hasproperty(comp_obj, :nbins)
                             (comp_obj.hidden_dim, comp_obj.nbins)
-                        elseif role == :W && hasproperty(spec.hyper, :in_dim) &&
+                        elseif role == :rff_weights && hasproperty(spec.hyper, :in_dim) &&
                           hasproperty(spec.hyper, :out_dim)
                             (spec.hyper.in_dim, spec.hyper.out_dim)
-                        elseif role == :b && hasproperty(spec.hyper, :out_dim)
+                        elseif role == :rff_offsets && hasproperty(spec.hyper, :out_dim)
                             (spec.hyper.out_dim,)
                         else
                             (1,)
@@ -356,7 +356,7 @@ function build_param_registry(M::NamedTuple; prefix::String = "")
         s_N = get(M, :s_N, 1)
         t_N = get(M, :t_N, 1)
         sig_st_sym = !isempty(prefix) ? Symbol("sigma_st_interaction_$(prefix)") : :sigma_st_interaction
-        ure_st_sym = !isempty(prefix) ? Symbol("ure_st_interaction_$(prefix)") : :ure_st_interaction
+        innovations_st_sym = !isempty(prefix) ? Symbol("innovations_st_interaction_$(prefix)") : :innovations_st_interaction
         add_descriptor!(reg, ParamDescriptor(
             sig_st_sym;
             component_key = :st_interaction,
@@ -367,9 +367,9 @@ function build_param_registry(M::NamedTuple; prefix::String = "")
             prior = st_prior
         ))
         add_descriptor!(reg, ParamDescriptor(
-            ure_st_sym;
+            innovations_st_sym;
             component_key = :st_interaction,
-            role = :ure,
+            role = :innovations,
             outcome_idx = nothing,
             is_shared = false,
             shape = is_multivariate ? (s_N * t_N * outcomes_N,) : (s_N * t_N,)
@@ -378,11 +378,11 @@ function build_param_registry(M::NamedTuple; prefix::String = "")
 
     # 5. Spectral Orientation (Householder Reflection)
     if is_multivariate && get(M, :spectral_orientation, false)
-        v_refl_sym = !isempty(prefix) ? Symbol("v_unscaled_reflection_$(prefix)") : :v_unscaled_reflection
+        v_refl_sym = !isempty(prefix) ? Symbol("v_unscaled_reflection_$(prefix)") : :reflection_vector_unconstrained_reflection
         add_descriptor!(reg, ParamDescriptor(
             v_refl_sym;
             component_key = :spectral_orientation,
-            role = :v_unscaled,
+            role = :reflection_vector_unconstrained,
             outcome_idx = nothing,
             is_shared = true,
             shape = (outcomes_N,)
@@ -391,7 +391,7 @@ function build_param_registry(M::NamedTuple; prefix::String = "")
 
     # 6. Likelihood parameters
     if is_multivariate && outcomes_N > 1 && !get(M, :is_multinomial, false)
-        l_corr_sym = !isempty(prefix) ? Symbol("L_corr_$(prefix)") : :L_corr
+        l_corr_sym = !isempty(prefix) ? Symbol("L_corr_$(prefix)") : :correlation_cholesky
         add_descriptor!(reg, ParamDescriptor(
             l_corr_sym;
             component_key = :likelihood,
@@ -494,13 +494,10 @@ function build_param_registry(M::NamedTuple; prefix::String = "")
             end
         end
     end
-
     return reg
 end
-
 """
     build_param_registry(sample::Union{NamedTuple, AbstractDict}, M::Union{NamedTuple, Nothing}=nothing)
-
 Builds or augments a `ParamRegistry` from a prior predictive draw
 (e.g., `rand(model)` returning `NamedTuple` or `VarNamedTuple`).
 Passes the draw to `calibrate_param_registry` to populate descriptor shapes.
@@ -512,11 +509,8 @@ function build_param_registry(
     reg = !isnothing(M) ? build_param_registry(M) : ParamRegistry()
     return calibrate_param_registry(reg, sample)
 end
-
-
 """
     build_param_registry(model::DynamicPPL.Model)
-
 Builds a `ParamRegistry` directly from an instantiated Turing `DynamicPPL.Model`.
 """
 function build_param_registry(model::DynamicPPL.Model)
@@ -547,10 +541,8 @@ function build_param_registry(model::DynamicPPL.Model)
         return reg
     end
 end
-
 """
     build_param_registry(chain::Union{AbstractDataFrame, AbstractDict})
-
 Builds a `ParamRegistry` from an MCMC chain expressed as a `DataFrame` or
 `AbstractDict` (e.g., a `FlexiChain`-derived dict or `MCMCChains.Chains`
 converted to DataFrame).
@@ -559,18 +551,15 @@ function build_param_registry(chain::Union{AbstractDataFrame, AbstractDict})
     reg = ParamRegistry()
     raw_names = _extract_chain_column_names(chain)
     names_str = string.(raw_names)
-
     for (i, nstr) in enumerate(names_str)
         orig_key = raw_names[i]
         key_for_indexing = orig_key isa String ? Symbol(nstr) : orig_key
         sym = Symbol(nstr)
-
         base = first(Base.split(nstr, '['))
         if !haskey(reg.by_base, base)
             reg.by_base[base] = String[]
         end
         push!(reg.by_base[base], nstr)
-
         parts = Base.split(nstr, '_')
         if length(parts) > 1 && all(isdigit.(collect(parts[end])))
             underscore_base = join(parts[1:end-1], "_")
@@ -579,22 +568,17 @@ function build_param_registry(chain::Union{AbstractDataFrame, AbstractDict})
             end
             push!(reg.by_base[underscore_base], nstr)
         end
-
         reg.name_to_key[nstr] = key_for_indexing
         if !(nstr in reg.names)
             push!(reg.names, nstr)
         end
-
         reg.descriptors[sym] = ParamDescriptor(sym)
     end
-
     _infer_tensor_shapes!(reg)
     return reg
 end
-
 """
     build_param_registry(chain)
-
 Single generic fallback: handles FlexiChain, MCMCChains.Chains, or any
 chain-like object whose column names can be extracted via
 `_extract_chain_column_names`. Concrete types (`NamedTuple`, `AbstractDict`,
@@ -616,18 +600,15 @@ function build_param_registry(chain::T) where T
         return reg
     end
     names_str = string.(raw_names)
-
     for (i, nstr) in enumerate(names_str)
         orig_key = raw_names[i]
         key_for_indexing = orig_key isa String ? Symbol(nstr) : orig_key
         sym = Symbol(nstr)
-
         base = first(Base.split(nstr, '['))
         if !haskey(reg.by_base, base)
             reg.by_base[base] = String[]
         end
         push!(reg.by_base[base], nstr)
-
         parts = Base.split(nstr, '_')
         if length(parts) > 1 && all(isdigit.(collect(parts[end])))
             underscore_base = join(parts[1:end-1], "_")
@@ -636,22 +617,17 @@ function build_param_registry(chain::T) where T
             end
             push!(reg.by_base[underscore_base], nstr)
         end
-
         reg.name_to_key[nstr] = key_for_indexing
         if !(nstr in reg.names)
             push!(reg.names, nstr)
         end
-
         reg.descriptors[sym] = ParamDescriptor(sym)
     end
-
     _infer_tensor_shapes!(reg)
     return reg
 end
-
 """
     _infer_tensor_shapes!(reg::ParamRegistry)
-
 Scans `reg.by_base` for multi-dimensional bracketed indices (e.g. `var[i, j]`)
 and creates root parameter descriptors with their exact matrix/tensor shapes.
 """
@@ -683,14 +659,11 @@ function _infer_tensor_shapes!(reg::ParamRegistry)
         end
     end
 end
-
 # =============================================================================
 # Calibration Helper
 # =============================================================================
-
 """
     calibrate_param_registry(reg::ParamRegistry, sample::Any)
-
 Updates descriptors and shapes in `reg` based on actual realized values in `sample`
 (from `rand(model)`). Supports `NamedTuple`, `DynamicPPL.VarNamedTuple`, `AbstractDict`, etc.
 """
@@ -704,12 +677,10 @@ function calibrate_param_registry(reg::ParamRegistry, sample::Any)
             Dict(k => getproperty(sample, k) for k in propertynames(sample))
         end
     end
-
     for (sym, val) in pairs_iter
         val_shape = val isa AbstractArray ? size(val) : (1,)
         nstr = string(sym)
         sym_key = Symbol(sym)
-
         if haskey(reg.descriptors, sym_key)
             existing = reg.descriptors[sym_key]
             reg.descriptors[sym_key] = ParamDescriptor(
@@ -729,20 +700,21 @@ function calibrate_param_registry(reg::ParamRegistry, sample::Any)
                 shape = val_shape
             ))
         end
-
         reg.name_to_key[nstr] = sym_key
     end
+
     return reg
+
 end
+
 
 # =============================================================================
 # Universal Sample Extraction API
 # =============================================================================
-
 """
+
     get_samples(chain, reg::ParamRegistry, component_key::Symbol, role::Symbol;
                 outcome=nothing, expected_len=nothing)
-
 Extracts an `(n_samples, param_dim)` matrix of posterior samples for a specific component
 and semantic role.
 Automatically handles scalar, vector, and matrix parameters across FlexiChains, MCMCChains,
@@ -755,31 +727,27 @@ function get_samples(
     role::Symbol;
     outcome::Union{Int, Nothing} = nothing,
     expected_len::Union{Int, Nothing} = nothing,
-    reshape_to_shape::Bool = true,
-    exact::Bool = false
+    reshape_to_shape::Bool = true
 )
     # 1. Lookup matching descriptor from by_component
     has_role = haskey(reg.by_component, component_key) &&
       haskey(reg.by_component[component_key], role)
-
     if !has_role
         # Fallback to base name search
         fallback_name = isnothing(outcome) ? "$(role)_$(component_key)" :
           "$(role)_$(component_key)_$(outcome)"
-        target_name = find_chain_param(reg, fallback_name; outcome_idx = outcome, exact = exact)
+        target_name = find_chain_param(reg, fallback_name; outcome_idx = outcome)
         if isempty(target_name)
             error("Parameter with component :$(component_key) and role :$(role) (outcome: " *
                   "$(outcome)) not found in ParamRegistry.")
         end
         return get_param_samples(
             chain, reg, target_name;
-            expected_len = expected_len, reshape_to_shape = reshape_to_shape, exact = exact
+            expected_len = expected_len, reshape_to_shape = reshape_to_shape
         )
     end
-
     candidates = reg.by_component[component_key][role]
     selected_desc = nothing
-
     if !isnothing(outcome)
         # Find candidate with matching outcome_idx
         for d in candidates
@@ -789,25 +757,27 @@ function get_samples(
             end
         end
     end
-
     if isnothing(selected_desc) && !isempty(candidates)
         selected_desc = first(candidates)
     end
-
     if isnothing(selected_desc)
         error("No suitable descriptor found for component :$(component_key), role :$(role), " *
               "outcome $(outcome).")
     end
-
     exp_len = isnothing(expected_len) ? prod(selected_desc.shape) : expected_len
     return get_param_samples(
         chain, reg, selected_desc.name;
-        expected_len = exp_len, reshape_to_shape = reshape_to_shape, exact = exact
+        expected_len = exp_len, reshape_to_shape = reshape_to_shape
     )
 end
 
+
+
 """
+
     get_descriptors_by_role(reg::ParamRegistry, role::Symbol)
+
+
 
 Returns all `ParamDescriptor` entries in `reg` registered with semantic role `role`.
 
@@ -895,11 +865,10 @@ function get_param_samples(
     reg::ParamRegistry,
     param_name::Union{AbstractString, Symbol};
     expected_len::Union{Int, Nothing} = nothing,
-    reshape_to_shape::Bool = true,
-    exact::Bool = false
+    reshape_to_shape::Bool = true
 )
     nstr = string(param_name)
-    actual_col = find_chain_param(reg, nstr; exact = exact)
+    actual_col = find_chain_param(reg, nstr)
     lookup_key = !isempty(actual_col) ? chain_index_key(reg, actual_col) : Symbol(nstr)
 
     base_sym = Symbol(first(Base.split(nstr, '[')))
@@ -926,41 +895,44 @@ function get_param_samples(
 end
 
 # =============================================================================
+
 # Name Resolution & Lookup Helpers
 # =============================================================================
-
 """
     find_chain_param(reg::ParamRegistry, requested::AbstractString;
-                     outcome_idx::Union{Int, Nothing}=nothing,
-                     exact::Bool=false,
-                     allow_partial::Bool=false)
 
-Finds the best matching actual chain column name for a requested canonical name.
+                     outcome_idx::Union{Int, Nothing}=nothing)
 
-# Resolution Precedence & Disambiguation
-1. **Exact match**: Direct match in `reg.names`.
-2. **Outcome-specific match**: Searches `\$(requested)_\$(outcome_idx)` or `\$(requested)[\$(outcome_idx)]`.
-3. **Exact base match**: Matches prefix in `reg.by_base`.
-4. **Alias transformations**: Checked in canonical order if `exact=false`. If multiple candidate
-   aliases match columns in the chain, a warning is emitted and the canonical choice is used.
-5. **Substring fallback**: Only performed if `allow_partial=true` and `exact=false`.
+Resolve a parameter name to the concrete chain column it was registered under.
+# Resolution rules (in order)
+1. **Exact match** — `requested` is a registered name.
+2. **Outcome-specific match** — `"\$(requested)_\$(outcome_idx)"` or
+   `"\$(requested)[\$(outcome_idx)]"`, for multivariate models.
+3. **Base match** — `requested` is a *base* name with several concrete
+   registrations (e.g. one per outcome, or indexed variants such as
+   `phi[1,1]`). The unambiguous structural form is returned: the bare base, then a
+   bracketed variant, then a numeric-suffix variant.
+There are **no aliases, abbreviations, or substring fallbacks**. A parameter has
+exactly one supported name — the one `build_param_registry` registered. This is
+deliberate: the previous implementation rewrote names (`ure_*` → `innovations_*`,
+`beta` → `Xfixed_beta_prop`, `sre_*` → `latent_*`) and, when several candidates
+matched, silently selected one. For an attribution or effect-size workflow that
+resolves to the wrong coefficient without any error, which is worse than failing.
+Use the canonical name from `get_descriptors_by_role` / `reg.names`.
 
 # Arguments
 - `reg::ParamRegistry`: Parameter registry for the model.
-- `requested::AbstractString`: The requested parameter name or alias.
+- `requested::AbstractString`: The canonical parameter name.
 - `outcome_idx::Union{Int, Nothing}`: Optional outcome index.
-- `exact::Bool`: If `true`, requires an exact match in `reg.names` without alias/substring fallback.
-- `allow_partial::Bool`: If `true`, enables partial substring fallback as a last resort.
 
 # Returns
-- `String`: The resolved chain column name, or `""` if no match is found.
+- `String`: The resolved chain column name, or `""` if `requested` is not a
+  registered name.
 """
 function find_chain_param(
     reg::ParamRegistry,
     requested::AbstractString;
-    outcome_idx::Union{Int, Nothing} = nothing,
-    exact::Bool = false,
-    allow_partial::Bool = false
+    outcome_idx::Union{Int, Nothing} = nothing
 )
     # 1) Exact match in registered names
     if requested in reg.names
@@ -979,102 +951,68 @@ function find_chain_param(
         end
     end
 
-    # If exact match only, terminate lookup here
-    if exact
-        return ""
-    end
-
-    # 3) Base match in by_base
+    # 3) Base match: `requested` is a base name with concrete registrations.
     base = String(first(Base.split(requested, '[')))
     if haskey(reg.by_base, base)
         candidates = reg.by_base[base]
-
         # Plain candidate equal to base
         if base in candidates
             return base
         end
-
         # Bracketed candidates
         for c in candidates
             if startswith(c, base * "[")
                 return c
             end
         end
-
         # Underscore numeric suffix candidates
         for c in candidates
             if startswith(c, base * "_")
                 return c
             end
         end
-
         return first(candidates)
     end
 
-    # 4) Alias transformations with disambiguation
-    aliases = String[]
-    if requested == "beta"
-        push!(aliases, "Xfixed_beta_prop", "beta_prop", "Xfixed_beta")
-    elseif requested == "beta_flat"
-        push!(aliases, "Xfixed_beta_prop_flat", "beta_prop_flat")
-    elseif requested == "Xfixed_beta_prop"
-        push!(aliases, "beta")
-    elseif requested == "Xfixed_beta_prop_flat"
-        push!(aliases, "beta_flat")
-    elseif startswith(requested, "ure_")
-        push!(aliases, replace(requested, r"^ure_" => "innovations_"), replace(requested,
-          r"^ure_" => "innov_"), replace(requested, r"^ure_" => "raw_"))
-    elseif startswith(requested, "sre_")
-        push!(aliases, replace(requested, r"^sre_" => "latent_"), replace(requested,
-          r"^sre_" => "struct_"))
-    elseif requested == "sigma_st_interaction"
-        push!(aliases, "st_interaction_sigma")
-    elseif requested == "ure_st_interaction"
-        push!(aliases, "st_interaction_raw")
-    end
 
-    matching_aliases = String[]
-    for a in aliases
-        res = find_chain_param(reg, a; outcome_idx = outcome_idx, exact = true)
-        if !isempty(res)
-            push!(matching_aliases, res)
-        end
-    end
-
-    if !isempty(matching_aliases)
-        if length(matching_aliases) > 1
-            @warn "Ambiguous chain parameter for '$(requested)': multiple candidate aliases " *
-                  "found in chain ($(matching_aliases)). Selecting '$(first(matching_aliases))' " *
-                  "according to canonical precedence."
-        end
-        return first(matching_aliases)
-    end
-
-    # 5) Substring fallback only if explicitly permitted
-    if allow_partial
-        for n in reg.names
-            if occursin(requested, n)
-                return n
-            end
-        end
-    end
-
+    # Not a registered name. Suggest near-misses so the caller fails with something
+    # actionable instead of quietly resolving to a different parameter.
+    _warn_unknown_param(reg, requested)
     return ""
 end
-
+"""
+    _warn_unknown_param(reg::ParamRegistry, requested::AbstractString)
+Emit a single, actionable warning when a parameter name is not registered, listing
+the registered names that share a prefix with what was requested.
+"""
+function _warn_unknown_param(reg::ParamRegistry, requested::AbstractString)
+    prefix = String(first(Base.split(requested, '_')))
+    registered = reg.names
+    suggestions = sort!(filter(n -> startswith(n, prefix) || occursin(requested, n),
+        registered))
+    msg = "Parameter '$(requested)' is not a registered parameter name."
+    if !isempty(suggestions)
+        msg *= " Did you mean one of: " *
+            join(first(suggestions, 8) .|> s -> "\"$(s)\"", ", ") * " ?"
+    else
+        with_prefix = sort!(filter(n -> startswith(n, prefix), registered))
+        msg *= " Registered names beginning with '$(prefix)': " *
+            (isempty(with_prefix) ? "(none)" :
+                join(first(with_prefix, 8) .|> s -> "\"$(s)\"", ", ")) * "."
+    end
+    @warn msg
+    return nothing
+end
 """
     chain_index_key(reg::ParamRegistry, actual_name::AbstractString)
-
 Returns the exact indexing key (Symbol or String) for indexing into the MCMC chain.
 """
 function chain_index_key(reg::ParamRegistry, actual_name::AbstractString)
     return get(reg.name_to_key, String(actual_name), Symbol(actual_name))
 end
-
 # =============================================================================
 # Low-Level Chain Extraction Dispatch Helpers
 # =============================================================================
-
 function _extract_chain_column_names(chain::Any)
     raw_names = if chain isa DataFrame
         names(chain)
@@ -1097,11 +1035,11 @@ function _extract_chain_column_names(chain::Any)
                 end
             end
         end
+
     end
     return [replace(string(n), r"^Parameter\((.*)\)$" => s"\1", r"^parameters\." => "",
       r"^:+" => "") for n in raw_names]
 end
-
 function _extract_samples_from_chain(chain::Dict, key::Any, nstr::AbstractString; expected_len=nothing)
     # Mock chain dictionary support for testing
     sym_key = Symbol(key)
@@ -1121,10 +1059,10 @@ function _extract_samples_from_chain(chain::Dict, key::Any, nstr::AbstractString
         else
             return fill(Float64(data), 1, 1)
         end
+
     end
     error("Parameter :$(sym_key) not found in mock chain.")
 end
-
 function _extract_samples_from_chain(chain::NamedTuple, key::Any, nstr::AbstractString;
   expected_len=nothing)
     sym_key = Symbol(key)
@@ -1143,11 +1081,16 @@ function _extract_samples_from_chain(chain::NamedTuple, key::Any, nstr::Abstract
         else
             return fill(Float64(data), 1, 1)
         end
+
     end
+
     error("Parameter :$(sym_key) not found in chain NamedTuple.")
+
 end
+
 
 function _extract_samples_from_chain(chain::Any, key::Any, nstr::AbstractString; expected_len=nothing)
     base_name = String(first(Base.split(nstr, '[')))
     return extract_param_matrix(chain, base_name; expected_dim=expected_len)
 end
+

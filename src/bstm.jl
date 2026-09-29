@@ -1,15 +1,12 @@
 module bstm
 
-    # Use Reexport for its macro, but be selective about what is re-exported.
-
-    # List of packages to be re-exported by bstm.jl.
-    # This provides a unified namespace for the user. 
-    # Only re-export Turing, as bstm is a framework built on Turing.
-    # This makes Turing's @model macro and other core functionalities
-    # directly available when 'using bstm'.
+    # `Reexport` pulls another package's names into this module's namespace and
+    # re-exports them, so `using bstm` also brings in that package's API. Turing is
+    # re-exported because bstm is a framework built on it and users need `@model`,
+    # `NUTS` and friends; `Random`, `Distributions` and `DataFrames` are re-exported for
+    # the same convenience. Everything else is imported privately and, where the public
+    # API needs it, re-exported explicitly further down.
     using Reexport
-
-    import Base: union, union!, intersect, setdiff
 
     @reexport using Random 
     @reexport using Distributions
@@ -53,7 +50,7 @@ module bstm
         PDMats,
         Printf,
         PosteriorStats,
-        Requires,
+        PrecompileTools,
         SHA,
         SparseArrays,
         SpecialFunctions,
@@ -68,10 +65,14 @@ module bstm
         CoordRefSystems, 
         Unitful
 
-    # Export thin wrappers for essential symbols from demoted packages
-    export plot, plot!, scatter, scatter!, heatmap, theme
+    # Export thin wrappers for essential symbols from demoted packages.
+    #
+    # NOTE: `plot`, `scatter`, `heatmap` and `theme` used to be exported here, but they
+    # are owned by `Plots` — a *weak* dependency that `bstm` does not import. Neither
+    # this module nor the `BSTMPlotsExt` extension ever defined them, so they were
+    # exported-but-undefined and raised `UndefVarError` on use. The plotting entry points
+    # bstm actually owns are stubbed below and filled in by the extension.
     export LatLon, Mercator, Cartesian
-    export mean, median, var, std, quantile, summarystats
     export @u_str, ustrip
 
     srcdir = @__DIR__  # bstm/src
@@ -127,9 +128,15 @@ module bstm
     include( "par.jl")
 
     # component definitions
+    #
+    # `sort` matters: every component file performs top-level registration into the
+    # `COMPONENT_TYPE_REGISTRY` / `COMPONENT_CONSTRUCTORS` / `MODEL_TO_STRUCTURE_MAP`
+    # globals, so include order determines the order those registries are populated.
+    # `readdir` returns entries in filesystem order, which is not specified to be
+    # alphabetical; sorting keeps precompilation output reproducible across machines.
     components_dir = joinpath(srcdir, "components")
 
-    for f in readdir(components_dir)
+    for f in sort(readdir(components_dir))
         if endswith(f, ".jl")
             include(joinpath(components_dir, f))
         end
@@ -165,13 +172,6 @@ module bstm
         plot_spatial_surface,
         bstm_sample,
         save_plots,
-        _detect_xy_columns,
-        _detect_time_column,
-        _detect_response_column,
-        _detect_spatial_unit_column,
-        _detect_seasonal_column,
-        _detect_group_column,
-        _resolve_nested_strata,
         NESTED_COUPLING_MODES,
         STANDARD_SPATIAL_COORDINATE_PAIRS,
         STANDARD_TEMPORAL_CANDIDATES,
@@ -252,8 +252,10 @@ module bstm
         leaflet_spacetime_map,
 
         # Input / Output & Persistence exports
-        save_bstm_model, 
+        save_bstm_model,
         load_bstm_model,
+        BSTM_SCHEMA_VERSION,
+
         save_bstm_results, 
         load_bstm_results, 
         query_duckdb,   
@@ -292,10 +294,112 @@ module bstm
         par_forest_plot  
 
 
-    # Module initialization function
-    function __init__()
-        Random.seed!(42) # Set a seed for reproducibility.
+    # ---------------------------------------------------------------------------
+    # Runtime namespace for generated model code
+    #
+    # The model body produced by `bstm_text_assembler` used to be `Core.eval`'d in
+    # `bstm` itself, so it resolved names -- `Normal`, `filldist`, `MvNormal`, `I`,
+    # `logistic`, ... -- only because `bstm` happened to re-export Turing, Distributions
+    # and LinearAlgebra. That made the generated code's dependencies implicit and
+    # load-bearing: dropping a `using` from this module, or a future change to what we
+    # re-export, would silently change the code the generator emits.
+    #
+    # Generated code is now evaluated in `_GeneratedModelRuntime`, which declares exactly
+    # the imports it needs. Anything else it references has to be bound in explicitly
+    # below, so a missing dependency surfaces here rather than as a confusing
+    # UndefVarError at model-definition time.
+    # ---------------------------------------------------------------------------
+    module _GeneratedModelRuntime
+        using Turing
+        using DynamicPPL
+        using Distributions
+        using LinearAlgebra
+        using Statistics
+        using Random
+        # `logistic` / `logit`: re-exported by LogExpFunctions, which is where the
+        # generated body's bare `logistic(...)` calls come from.
+        using LogExpFunctions
+        # `ifft`/`fft` for the Fourier-basis components, `CategoricalArray` for
+        # group-indexed effects.
+        using FFTW
+        using CategoricalArrays
+        # Cubic interpolation for the basis / spline components.
+        using Interpolations
     end
- 
+
+    # bstm's own helpers, reachable from the generated body. Bound as values once every
+    # include has run, so the module needs no relative-path import.
+    #
+    # This list is the complete set of package functions the generated model body calls.
+    # Adding a name here is a deliberate act: if a component starts calling a new
+    # helper, the model fails to build with that name in the error until it is added.
+    const _GENERATED_CODE_HELPERS = Symbol[
+        :_model_float_type,
+        :bstm_Likelihood,
+        :evaluate_kernel_matrix,
+        :evaluate_cross_kernel_matrix,
+        :anisotropic_matern_spectral_density,
+        :householder_to_eigenvector,
+        :ar1_statespace,
+        :ar2_statespace,
+        :_adaptivesmooth_log_marginal_likelihood,
+        :_ar1_log_marginal_likelihood,
+        :_ar2_log_marginal_likelihood,
+        :_barycentric_log_marginal_likelihood,
+        :_bcgn_log_marginal_likelihood,
+        :_besag_log_marginal_likelihood,
+        :_bspline_log_marginal_likelihood,
+        :_bym2_log_marginal_likelihood,
+        :_cyclic_log_marginal_likelihood,
+        :_gp_log_marginal_likelihood,
+        :_icar_log_marginal_likelihood,
+        :_iid_log_marginal_likelihood,
+        :_leroux_log_marginal_likelihood,
+        :_moran_log_marginal_likelihood,
+        :_pspline_log_marginal_likelihood,
+        :_rff_log_marginal_likelihood,
+        :_rw1_log_marginal_likelihood,
+        :_rw2_log_marginal_likelihood,
+        :_sar_log_marginal_likelihood,
+        :_spde_log_marginal_likelihood,
+        :_tps_log_marginal_likelihood,
+    ]
+    for _helper in _GENERATED_CODE_HELPERS
+        isdefined(@__MODULE__, _helper) || error(
+            "generated-code helper `$_helper` is not defined; it is declared in " *
+            "_GENERATED_CODE_HELPERS but missing from bstm")
+        Core.eval(_GeneratedModelRuntime, Expr(:const, _helper, getfield(@__MODULE__, _helper)))
+    end
+
+    # ---------------------------------------------------------------------------
+    # Precompilation workload
+    #
+    # bstm's hot path is runtime string codegen (`bstm_text_assembler` -> `Core.eval`),
+    # so almost nothing in the model pipeline is compiled until a user first fits a
+    # model. This workload walks the representative path once at precompile time:
+    # formula parse -> config -> codegen -> model instantiation -> density evaluation ->
+    # chain conversion. It is deliberately tiny and uses prior sampling rather than
+    # NUTS, because the goal is to compile the machinery, not to spend time tuning.
+    #
+    # If anything here throws, precompilation of the whole package fails, so the
+    # workload must stay minimal and dependency-free.
+    # ---------------------------------------------------------------------------
+    PrecompileTools.@setup_workload begin
+        _wl_df = DataFrames.DataFrame(
+            y = [3.0, 5.0, 4.0, 6.0, 2.0, 7.0],
+            x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            s_idx = [1, 2, 3, 4, 5, 6],
+        )
+        _wl_W = spatial_knn_graph([(Float64(i), 0.0) for i in 1:6], 2)[2]
+
+        _wl_m = bstm_core(
+            "likelihood(y, family=poisson) ~ intercept() + fixed(x) + random(s_idx, model=bym2)",
+            _wl_df, bstm; W = _wl_W, verbose = false)
+
+        # Exercises model evaluation, the world-age trampoline and chain construction.
+        _wl_chn = sample(_wl_m, Turing.Prior(), 3; progress = false, check_model = false)
+        convert_to_chains(_wl_chn)
+    end
 
 end # module bstm
+

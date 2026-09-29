@@ -251,10 +251,9 @@ const COMPONENT_TYPE_REGISTRY = Dict{Symbol, Type{<:ComponentModel}}(
 const PC_PRIORS = Dict(
     "sigma" => Exponential(1.0),
     "rho" => Beta(1, 1),
-    "rho1" => Normal(0, 0.5),
-    "rho2" => Normal(0, 0.5),
-    "lengthscale" => InverseGamma(3, 3),
-    "kappa" => Exponential(1.0),
+    "rho_regime_1" => Normal(0, 0.5),
+    "rho_regime_2" => Normal(0, 0.5),
+    "length_scale" => InverseGamma(3, 3),
     "amplitude" => Normal(0, 1),
     "phase" => Beta(1, 1),
     "pca_sd" => Exponential(1.0), 
@@ -268,10 +267,9 @@ const PC_PRIORS = Dict(
 const INFORMATIVE_PRIORS = Dict(
     "sigma" => Exponential(0.5),
     "rho" => Beta(2, 2),
-    "rho1" => Normal(0, 1.0),
-    "rho2" => Normal(0, 1.0),
-    "lengthscale" => InverseGamma(5, 5),
-    "kappa" => Exponential(0.1),
+    "rho_regime_1" => Normal(0, 1.0),
+    "rho_regime_2" => Normal(0, 1.0),
+    "length_scale" => InverseGamma(5, 5),
     "amplitude" => Normal(0, 0.5),
     "phase" => Beta(2, 2),
     "pca_sd" => Exponential(0.5), 
@@ -280,17 +278,16 @@ const INFORMATIVE_PRIORS = Dict(
     "velocity" => truncated(Normal(0.2, 0.1), 0.0, 0.95),
     "diffusion" => truncated(Normal(0.1, 0.1), 0.0, Inf),
     "gamma" => Normal(1.0, 0.5),
-    "rho_sigma" => Exponential(0.5),
-    "rho_rho" => Beta(2, 2)
+    "precision_field_scale" => Exponential(0.5),
+    "precision_field_mixing" => Beta(2, 2)
 )
 
 const UNINFORMATIVE_PRIORS = Dict(
     "sigma" => Normal(0, 1e6),
     "rho" => Uniform(-1, 1),
-    "rho1" => Normal(0, 10),
-    "rho2" => Normal(0, 10),
-    "lengthscale" => InverseGamma(0.01, 0.01),
-    "kappa" => Exponential(10.0),
+    "rho_regime_1" => Normal(0, 10),
+    "rho_regime_2" => Normal(0, 10),
+    "length_scale" => InverseGamma(0.01, 0.01),
     "amplitude" => Normal(0, 100),
     "phase" => Uniform(0, 1),
     "pca_sd" => Normal(0, 1e6), 
@@ -299,8 +296,8 @@ const UNINFORMATIVE_PRIORS = Dict(
     "velocity" => Uniform(0.0, 0.95),
     "diffusion" => truncated(Normal(0.0, 10.0), 0.0, Inf),
     "gamma" => Normal(0.0, 10.0),
-    "rho_sigma" => Exponential(10.0),
-    "rho_rho" => Uniform(0, 1)
+    "precision_field_scale" => Exponential(10.0),
+    "precision_field_mixing" => Uniform(0, 1)
 )
 
 
@@ -322,7 +319,7 @@ all applicable settings, even those not explicitly set by the user.
 """
 const COMPONENT_CONFIG_ARGS = Dict(
     # Spline models
-    :pspline => Dict(:nbins => 20, :degree => 3, :diff_order => 2, :knot_method => :quantile),
+    :pspline => Dict(:nbins => 20, :degree => 3, :penalty_order => 2, :knot_method => :quantile),
     :bspline => Dict(:nbins => 10, :degree => 3, :knot_method => :quantile),
     :tps => Dict(:nbins => 20, :knot_method => :quantile),
     
@@ -454,6 +451,85 @@ This method is dispatched on the `ComponentModel` instance and is responsible fo
 - A `NamedTuple` (e.g., `(structured=..., noisy=...)`) containing the reconstructed effects.
 """
 function get_effects end
+
+# -----------------------------------------------------------------------------
+# Interface contract
+#
+# Every registered component must implement all four of these. They were bare global
+# `function ... end` declarations, so a component missing one only failed later, as a
+# MethodError deep inside model construction, naming the internal call site rather than
+# the component at fault. These helpers turn that into an immediate, component-attributed
+# error.
+# -----------------------------------------------------------------------------
+
+"""
+    COMPONENT_INTERFACE_FUNCTIONS
+
+The four functions every component type must implement, in call order.
+"""
+const COMPONENT_INTERFACE_FUNCTIONS = (:get_precomputes, :get_priors, :get_updates, :get_effects)
+
+"""
+    missing_interface_methods(T::Type) -> Vector{Symbol}
+
+The interface functions `T` does not implement.
+
+This inspects each method's *first argument* type rather than calling `hasmethod`, which
+cannot be used here: the interface takes five arguments, so a one-element
+`Tuple{T}` never matches a five-argument method signature.
+"""
+function missing_interface_methods(@nospecialize(T::Type))
+    return [f for f in COMPONENT_INTERFACE_FUNCTIONS if !_implements_for(T, getfield(bstm, f))]
+end
+
+function _implements_for(@nospecialize(T::Type), f::Function)
+    for m in methods(f)
+        params = Base.unwrap_unionall(m.sig).parameters
+        length(params) >= 2 || continue
+        first_arg = params[2]
+        first_arg isa Type && T <: first_arg && return true
+    end
+    return false
+end
+
+"""
+    validate_component_interface(T::Type) -> Type
+
+Assert that `T` implements the whole component interface. Throws an error naming the
+component and exactly which functions are missing.
+"""
+function validate_component_interface(@nospecialize(T::Type))
+    missing = missing_interface_methods(T)
+    if !isempty(missing)
+        error(
+            "Component `$(T)` does not implement the bstm component interface. " *
+            "Missing: $(join(string.(missing), ", ")). " *
+            "Every component must define $(join(string.(COMPONENT_INTERFACE_FUNCTIONS), ", ")).")
+    end
+    return T
+end
+
+"""
+    validate_all_component_interfaces() -> Dict{Symbol, Vector{Symbol}}
+
+Check every type in `COMPONENT_TYPE_REGISTRY`. Returns a map of component key to the
+interface functions it is missing, and errors if any is incomplete. Called when a model is
+assembled, so an incomplete component fails at model-build time with the component named,
+rather than at sample time with a `MethodError`.
+"""
+function validate_all_component_interfaces()
+    report = Dict{Symbol, Vector{Symbol}}()
+    for (key, T) in COMPONENT_TYPE_REGISTRY
+        missing = missing_interface_methods(T)
+        isempty(missing) || (report[key] = missing)
+    end
+    if !isempty(report)
+        details = join(("  `$(k)` -> $(join(string.(v), ", "))" for (k, v) in sort(collect(report), by = first)),
+            "\n")
+        error("Incomplete component interface(s):\n$(details)")
+    end
+    return report
+end
 
 # -----------------------------------------------------------------------------
 # Coordinate & Variable Resolvers
@@ -884,32 +960,32 @@ const STANDARD_GROUP_CANDIDATES = [
 ]
 
 """
-    _detect_group_column(df; group_var=nothing, allow_nothing=false)::Union{Symbol, Nothing}
+    _detect_group_column(df; grouping_covariate=nothing, allow_nothing=false)::Union{Symbol, Nothing}
 
 Automatically identifies or validates the grouping or cluster column in a dataset.
 
 # Process
-1. If `group_var` is explicitly specified, validates that it exists in `df` and returns it.
+1. If `grouping_covariate` is explicitly specified, validates that it exists in `df` and returns it.
 2. Otherwise, matches against `STANDARD_GROUP_CANDIDATES`.
 3. If not found and `allow_nothing=false`, raises a descriptive `error`.
 
 # Inputs
 - `df`: Tabular dataset (`DataFrame`, `NamedTuple`, or table-like object).
-- `group_var`: Optional explicit column name.
+- `grouping_covariate`: Optional explicit column name.
 - `allow_nothing`: If true, returns `nothing` when not detected instead of error.
 
 # Outputs
 - `Union{Symbol, Nothing}`: Resolved column symbol or `nothing`.
 """
 function _detect_group_column(
-    df; group_var=nothing, allow_nothing::Bool=false
+    df; grouping_covariate=nothing, allow_nothing::Bool=false
 )::Union{Symbol, Nothing}
-    if !isnothing(group_var)
-        sym = Symbol(group_var)
+    if !isnothing(grouping_covariate)
+        sym = Symbol(grouping_covariate)
         if !hasproperty(df, sym)
             allow_nothing && return nothing
             error(
-                "Specified group column group_var=:$sym not found in data: " *
+                "Specified group column grouping_covariate=:$sym not found in data: " *
                 "$(propertynames(df))."
             )
         end

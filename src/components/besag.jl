@@ -146,7 +146,7 @@ function get_priors(
     else
         return """
         $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-        $(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)
+        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     end
 end
@@ -164,9 +164,9 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             diag_D[1] = 0.0
             
-            $(p_names.sre) = hyper.U * (diag_D .* $(p_names.ure))
+            $(p_names.latent_field) = hyper.U * (diag_D .* $(p_names.innovations))
             
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -174,11 +174,11 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
         # --- Besag Component (Dense Cholesky): $(key) ---
         let
             F = spec_registry[:$(key)].hyper.cholesky_factor
-            sre_unscaled = F.L' \\ $(p_names.ure)
-            sre_centered = sre_unscaled .- mean(sre_unscaled)
+            latent_field_unscaled = F.L' \\ $(p_names.innovations)
+            latent_field_centered = latent_field_unscaled .- mean(latent_field_unscaled)
             
-            $(p_names.sre) = sre_centered .* $(p_names.sigma)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = latent_field_centered .* $(p_names.sigma)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -189,12 +189,12 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
             F = cholesky(Symmetric(Q + M.noise * I))
             
             L_sparse = sparse(F.L)
-            sre_unscaled = L_sparse' \\ $(p_names.ure)
+            latent_field_unscaled = L_sparse' \\ $(p_names.innovations)
             
-            sre_centered = sre_unscaled .- mean(sre_unscaled)
+            latent_field_centered = latent_field_unscaled .- mean(latent_field_unscaled)
             
-            $(p_names.sre) = sre_centered .* $(p_names.sigma)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = latent_field_centered .* $(p_names.sigma)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -323,13 +323,8 @@ function get_effects(
                 effect_k_latent[:, j] = x_train
             end
         else
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "Innovations (ure) for Besag component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            ure_samples = get_params_matrix(chain, ure_name, n_latent)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
             if m.method == :spectral
                 U = spec.hyper.U
@@ -337,7 +332,7 @@ function get_effects(
                 
                 for j in 1:n_samples
                     sigma_j = sigma_samples[j, 1]
-                    innov_j = ure_samples[j, :]
+                    innov_j = innovations_samples[j, :]
                     
                     diag_D = sigma_j ./ sqrt.(L .+ noise)
                     diag_D[1] = 0.0
@@ -348,11 +343,11 @@ function get_effects(
                 
                 for j in 1:n_samples
                     sigma_j = sigma_samples[j, 1]
-                    innov_j = ure_samples[j, :]
+                    innov_j = innovations_samples[j, :]
 
-                    sre_unscaled = F.L' \ innov_j
-                    sre_centered = sre_unscaled .- mean(sre_unscaled)
-                    effect_k_latent[:, j] = sre_centered .* sigma_j
+                    latent_field_unscaled = F.L' \ innov_j
+                    latent_field_centered = latent_field_unscaled .- mean(latent_field_unscaled)
+                    effect_k_latent[:, j] = latent_field_centered .* sigma_j
                 end
             end
         end

@@ -387,7 +387,7 @@ end
 
 Constructs a multivariate normal (`MvNormal`) distribution instance.
 Mean vector is given by `eta_vec`. The covariance structure is resolved from
-`d.extra_params[:cov]`, correlation Cholesky factor `d.extra_params[:L_corr]`,
+`d.extra_params[:cov]`, correlation Cholesky factor `d.extra_params[:correlation_cholesky]`,
 matrix `sig`, or diagonal elements from vector/scalar `sig`.
 
 # Mathematical Formulation
@@ -398,8 +398,8 @@ function get_dist_ref(::MvNormalFamily, d, eta_vec, sig, obs_idx::Int=1)
     K = length(eta_vec)
     cov_mat = if !isnothing(d.extra_params) && haskey(d.extra_params, :cov)
         d.extra_params[:cov]
-    elseif !isnothing(d.extra_params) && haskey(d.extra_params, :L_corr)
-        L = d.extra_params[:L_corr]
+    elseif !isnothing(d.extra_params) && haskey(d.extra_params, :correlation_cholesky)
+        L = d.extra_params[:correlation_cholesky]
         s = sig isa AbstractVector ? sig : fill(sig, K)
         Diagonal(s) * (L * L') * Diagonal(s)
     elseif sig isa AbstractMatrix

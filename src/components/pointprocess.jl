@@ -31,7 +31,7 @@ The component supports the following methods:
     "parent" points:
     \$\\lambda(s) = \\sum_{i=1}^{N_p} A_i k(s, c_i; \\ell)\$
     where \$c_i\$ are the parent locations, \$A_i\$ are their amplitudes, and \$k\$ is a kernel
-    with lengthscale \$\\ell\$.
+    with length_scale \$\\ell\$.
 
 # Inputs
 - **Required**:
@@ -46,7 +46,7 @@ The component supports the following methods:
   - `shape`: Prior for the shape/dispersion parameter (for `:lgmcp`).
   - `n_parents`: Number of parent points (for `:sncp`).
   - `amplitude`: Prior for parent point amplitudes (for `:sncp`).
-  - `lengthscale`: Prior for the kernel lengthscale (for `:sncp`).
+  - `length_scale`: Prior for the kernel length_scale (for `:sncp`).
   - `grid_areas`: A vector of areas for each spatial unit, for integrating the intensity.
 
 # Outputs (Parameter Names)
@@ -63,7 +63,7 @@ struct PointProcess <: ComponentModel
     # SNCP
     n_parents::Union{Int, UnivariateDistribution, Nothing}
     amplitude::Union{UnivariateDistribution, Nothing}
-    lengthscale::Union{UnivariateDistribution, Nothing}
+    length_scale::Union{UnivariateDistribution, Nothing}
     kernel::Union{String, Nothing}
 end
 
@@ -82,7 +82,7 @@ COMPONENT_CONSTRUCTORS[:pointprocess] = (p, params) -> begin
         get(p, :shape, Exponential(1.0)),
         get(params, :n_parents, 50),
         get(p, :amplitude, Exponential(1.0)),
-        get(p, :lengthscale, Gamma(2.0, 0.5)),
+        get(p, :length_scale, Gamma(2.0, 0.5)),
         string(get(params, :kernel, "se"))
     )
 end
@@ -150,13 +150,13 @@ function get_priors(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx
         n_latent = spec.hyper.inner_hyper.n_latent
         return """
         $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-        $(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.ure))
+        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     elseif m.method == :lgmcp
         n_latent = spec.hyper.inner_hyper.n_latent
         return """
         $(p_names.shape) ~ $(_distribution_to_string(m.shape))
-        $(p_names.ure) ~ DynamicPPL.NamedDist(MvNormal(zeros(T, $(n_latent)), I), :$(p_names.ure))
+        $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     elseif m.method == :sncp
         n_parents_str = if m.n_parents isa Int
@@ -173,7 +173,7 @@ function get_priors(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx
         bounds = spec.hyper.domain_bounds
         push!(priors_list, "$(p_names.parent_locs_x) ~ filldist(Uniform($(bounds.x_min), $(bounds.x_max)), $(n_parents_str))")
         push!(priors_list, "$(p_names.parent_locs_y) ~ filldist(Uniform($(bounds.y_min), $(bounds.y_max)), $(n_parents_str))")
-        push!(priors_list, "$(p_names.ls) ~ $(_distribution_to_string(m.lengthscale))")
+        push!(priors_list, "$(p_names.length_scale) ~ $(_distribution_to_string(m.length_scale))")
         push!(priors_list, "$(p_names.amplitude) ~ filldist($(_distribution_to_string(m.amplitude)), $(n_parents_str))")
         
         return join(priors_list, "\n    ")
@@ -194,7 +194,7 @@ function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_id
             hyper = spec_registry[:$(key)].hyper
             Q_lgcp = hyper.inner_hyper.Q_template
             F_lgcp = cholesky(Symmetric(Matrix(Q_lgcp) + M.noise * I))
-            spatial_component = $(p_names.sigma) .* (F_lgcp.L' \\ $(p_names.ure))
+            spatial_component = $(p_names.sigma) .* (F_lgcp.L' \\ $(p_names.innovations))
             
             log_intensity_surface = $(eta_target) .+ spatial_component[M.s_idx]
             
@@ -214,7 +214,7 @@ function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_id
             hyper = spec_registry[:$(key)].hyper
             Q_lgmcp = hyper.inner_hyper.Q_template
             F_lgmcp = cholesky(Symmetric(Matrix(Q_lgmcp) + M.noise * I))
-            spatial_component = exp.(F_lgmcp.L' \\ $(p_names.ure))
+            spatial_component = exp.(F_lgmcp.L' \\ $(p_names.innovations))
             
             mean_intensity_surface = exp.($(eta_target)) .* spatial_component[M.s_idx]
             
@@ -245,7 +245,7 @@ function get_updates(m::PointProcess, spec::NamedTuple, arch::String, outcome_id
                 for j in 1:n_parents
                     dist_sq = (obs_locs[i].x - parent_locs[j, 1])^2 + (obs_locs[i].y -
                       parent_locs[j, 2])^2
-                    kernel_val = exp(-0.5 * dist_sq / ($(p_names.ls)^2))
+                    kernel_val = exp(-0.5 * dist_sq / ($(p_names.length_scale)^2))
                     intensity_i += $(p_names.amplitude)[j] * kernel_val
                 end
                 intensity_at_obs[i] = intensity_i
@@ -292,11 +292,11 @@ function get_effects(
             sigma_name = _find_parameter(
                 p_names, string(p_names_k.sigma), k, is_multivariate_model
             )
-            ure_name = _find_parameter(
-                p_names, string(p_names_k.ure), k, is_multivariate_model
+            innovations_name = _find_parameter(
+                p_names, string(p_names_k.innovations), k, is_multivariate_model
             )
 
-            if isempty(sigma_name) || isempty(ure_name)
+            if isempty(sigma_name) || isempty(innovations_name)
                 @warn "Parameters for LGCP component $(spec.key) (outcome $(k)) " *
                       "not found. Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
@@ -305,21 +305,21 @@ function get_effects(
 
             # Extract samples (CPU)
             sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-            ure_samples = get_params_matrix(
-                chain, ure_name, hyper.inner_hyper.n_latent
+            innovations_samples = get_params_matrix(
+                chain, innovations_name, hyper.inner_hyper.n_latent
             ) # (n_samples, n_latent)
             
             spatial_component_unscaled = if hasproperty(hyper.inner_hyper, :cholesky_factor)
-                hyper.inner_hyper.cholesky_factor.L' \ ure_samples'
+                hyper.inner_hyper.cholesky_factor.L' \ innovations_samples'
             elseif hasproperty(hyper.inner_hyper, :U) && hasproperty(hyper.inner_hyper, :L)
                 L_vals = hyper.inner_hyper.L
                 inv_sqrt_L = [
                     L_vals[i] > 1e-6 ? 1.0 / sqrt(L_vals[i]) : 0.0 for i in 1:length(L_vals)
                 ]
-                hyper.inner_hyper.U * (inv_sqrt_L .* ure_samples')
+                hyper.inner_hyper.U * (inv_sqrt_L .* innovations_samples')
             elseif hasproperty(hyper.inner_hyper, :Q_template)
                 F_q = cholesky(Symmetric(Matrix(hyper.inner_hyper.Q_template) + noise * I))
-                F_q.L' \ ure_samples'
+                F_q.L' \ innovations_samples'
             else
                 throw(ArgumentError(
                     "PointProcess inner model must provide either cholesky_factor, " *
@@ -332,30 +332,30 @@ function get_effects(
             push!(structured_effects, indexed_effects)
 
         elseif m.method == :lgmcp
-            ure_name = _find_parameter(
-                p_names, string(p_names_k.ure), k, is_multivariate_model
+            innovations_name = _find_parameter(
+                p_names, string(p_names_k.innovations), k, is_multivariate_model
             )
-            if isempty(ure_name)
-                @warn "ure for LGMCP component $(spec.key) (outcome $(k)) not found. " *
+            if isempty(innovations_name)
+                @warn "innovations for LGMCP component $(spec.key) (outcome $(k)) not found. " *
                       "Returning zero-matrix."
                 push!(structured_effects, zeros(Float64, N_total, n_samples))
                 continue
             end
-            ure_samples = get_params_matrix(
-                chain, ure_name, hyper.inner_hyper.n_latent
+            innovations_samples = get_params_matrix(
+                chain, innovations_name, hyper.inner_hyper.n_latent
             ) # Innovations for LGMCP
 
             spatial_component_unscaled = if hasproperty(hyper.inner_hyper, :cholesky_factor)
-                hyper.inner_hyper.cholesky_factor.L' \ ure_samples'
+                hyper.inner_hyper.cholesky_factor.L' \ innovations_samples'
             elseif hasproperty(hyper.inner_hyper, :U) && hasproperty(hyper.inner_hyper, :L)
                 L_vals = hyper.inner_hyper.L
                 inv_sqrt_L = [
                     L_vals[i] > 1e-6 ? 1.0 / sqrt(L_vals[i]) : 0.0 for i in 1:length(L_vals)
                 ]
-                hyper.inner_hyper.U * (inv_sqrt_L .* ure_samples')
+                hyper.inner_hyper.U * (inv_sqrt_L .* innovations_samples')
             elseif hasproperty(hyper.inner_hyper, :Q_template)
                 F_q = cholesky(Symmetric(Matrix(hyper.inner_hyper.Q_template) + noise * I))
-                F_q.L' \ ure_samples'
+                F_q.L' \ innovations_samples'
             else
                 throw(ArgumentError(
                     "PointProcess inner model must provide either cholesky_factor, " *
@@ -368,8 +368,8 @@ function get_effects(
             push!(structured_effects, indexed_effects)
 
         elseif m.method == :sncp
-            ls_name = _find_parameter(
-                p_names, string(p_names_k.ls), k, is_multivariate_model
+            length_scale_name = _find_parameter(
+                p_names, string(p_names_k.length_scale), k, is_multivariate_model
             )
             amplitude_name = _find_parameter(
                 p_names, string(p_names_k.amplitude), k, is_multivariate_model
@@ -398,7 +398,7 @@ function get_effects(
                 end
             end
 
-            if isempty(ls_name) || isempty(amplitude_name) ||
+            if isempty(length_scale_name) || isempty(amplitude_name) ||
                isempty(parent_locs_x_name) || isempty(parent_locs_y_name)
                 @warn "Parameters for SNCP component $(spec.key) (outcome $(k)) " *
                       "not found. Returning zero-matrix."
@@ -407,7 +407,7 @@ function get_effects(
             end
 
             # Extract samples (CPU)
-            ls_samples = get_params_vector(chain, ls_name, 1) # (n_samples, 1)
+            length_scale_samples = get_params_vector(chain, length_scale_name, 1) # (n_samples, 1)
             amplitude_samples = get_params_matrix(chain, amplitude_name,
                 n_parents) # (n_samples, n_parents)
             parent_locs_x_samples = get_params_matrix(chain, parent_locs_x_name,
@@ -434,7 +434,7 @@ function get_effects(
                 parent_locs_i = hcat(parent_locs_x_samples[i, :], parent_locs_y_samples[i,
                     :]) # Parent locations for current sample
                 dist_sq = sum(obs_locs_matrix.^2, dims=2) .- 2 * (obs_locs_matrix * parent_locs_i') .+ sum(parent_locs_i.^2, dims=2)' # Squared distances
-                kernel_vals = exp.(-0.5 .* dist_sq ./ (ls_samples[i, 1]^2)) # Kernel values
+                kernel_vals = exp.(-0.5 .* dist_sq ./ (length_scale_samples[i, 1]^2)) # Kernel values
                 intensity_at_obs = kernel_vals * amplitude_samples[i, :] # Intensity at observation locations
                 intensity_all_samples[:, i] = intensity_at_obs # Store intensity
             end

@@ -168,8 +168,8 @@ function get_priors(
     return """
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
     $(p_names.rho) ~ $(_distribution_to_string(m.rho))
-    $(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)
-    $(p_names.ure_cluster) ~ MvNormal(zeros(T, $(n_clusters)), I)
+    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
+    $(p_names.innovations_cluster) ~ MvNormal(zeros(T, $(n_clusters)), I)
     """
 end
 
@@ -186,7 +186,7 @@ function get_updates(
         # --- LocalAdaptive Component: $(key) ($(m.method)) ---
         let
             hyper = spec_registry[:$(key)].hyper
-            cluster_means_unscaled = $(p_names.ure_cluster)
+            cluster_means_unscaled = $(p_names.innovations_cluster)
             cluster_means = cluster_means_unscaled .- mean(cluster_means_unscaled)
             mu_field = cluster_means[hyper.cluster_assignments]
     """
@@ -195,10 +195,10 @@ function get_updates(
         $(common_code)
             diag_D_leroux = $(p_names.sigma) ./ sqrt.((1.0 - $(p_names.rho)) .+
               $(p_names.rho) .* hyper.L .+ M.noise)
-            latent_centered = hyper.U * (diag_D_leroux .* $(p_names.ure))
+            latent_centered = hyper.U * (diag_D_leroux .* $(p_names.innovations))
             
-            $(p_names.sre) = mu_field .+ latent_centered
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = mu_field .+ latent_centered
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -207,10 +207,10 @@ function get_updates(
             Q_leroux = (1.0 - $(p_names.rho)) .* I($(n_latent)) .+ $(p_names.rho) .* hyper.Q_icar
             F = cholesky(Symmetric(Matrix(Q_leroux) + M.noise * I))
             
-            latent_centered = F.L' \\ $(p_names.ure)
+            latent_centered = F.L' \\ $(p_names.innovations)
             
-            $(p_names.sre) = mu_field .+ latent_centered .* $(p_names.sigma)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = mu_field .+ latent_centered .* $(p_names.sigma)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -220,10 +220,10 @@ function get_updates(
               $(p_names.rho) .* hyper.Q_icar
             F = cholesky(Symmetric(Q_leroux + M.noise * I))
             
-            latent_centered = F.L' \\ $(p_names.ure)
+            latent_centered = F.L' \\ $(p_names.innovations)
             
-            $(p_names.sre) = mu_field .+ latent_centered .* $(p_names.sigma)
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = mu_field .+ latent_centered .* $(p_names.sigma)
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
     
@@ -277,12 +277,12 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
-        ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-        ure_cluster_name = _find_parameter(p_names, string(p_names_k.ure_cluster), k,
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+        innovations_cluster_name = _find_parameter(p_names, string(p_names_k.innovations_cluster), k,
             is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(rho_name) || isempty(ure_name)||
-            isempty(ure_cluster_name)
+        if isempty(sigma_name) || isempty(rho_name) || isempty(innovations_name)||
+            isempty(innovations_cluster_name)
             @warn "Parameters for LocalAdaptive component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -291,8 +291,8 @@ function get_effects(
         # Extract posterior samples (these are on the CPU)
         sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
-        ure_samples = get_params_matrix(chain, ure_name, n_latent) # (n_samples, n_latent)
-        ure_cluster_samples = get_params_matrix(chain, ure_cluster_name,
+        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
+        innovations_cluster_samples = get_params_matrix(chain, innovations_cluster_name,
             n_clusters) # (n_samples, n_clusters)
         
         # Initialize the output matrix for the full latent field
@@ -302,8 +302,8 @@ function get_effects(
         for i in 1:n_samples # Iterate over each posterior sample
             sigma_s = sigma_samples[i, 1] # Sigma for current sample
             rho_s = rho_samples[i, 1] # Rho for current sample
-            innov_s = ure_samples[i, :] # Innovations for current sample
-            cluster_innov_s = ure_cluster_samples[i, :] # Cluster innovations for current sample
+            innov_s = innovations_samples[i, :] # Innovations for current sample
+            cluster_innov_s = innovations_cluster_samples[i, :] # Cluster innovations for current sample
 
             # Reconstruct the mean field
             cluster_means = cluster_innov_s .- mean(cluster_innov_s)

@@ -17,7 +17,7 @@ basis functions:
   \\beta_{c,j} \\cos\\left(\\frac{2\\pi j x}{\\ell}\\right) \\right)\$
 where:
 - \$M\$ is half the number of bins (`nbins`), representing the number of sine/cosine pairs.
-- \$\\ell\$ is the `lengthscale` that controls the periodicity of the basis functions.
+- \$\\ell\$ is the `length_scale` that controls the periodicity of the basis functions.
 - \$\\beta_{s,j}\$ and \$\\beta_{c,j}\$ are the Fourier coefficients.
 
 To ensure smoothness, a penalty is applied to the coefficients, typically a
@@ -43,21 +43,21 @@ scaled by \$\\sigma^2\$.
   - `nbins`: `Int`, the total number of basis functions (sine/cosine pairs). Default: `20`.
   - `sigma`: `UnivariateDistribution`, prior for the standard deviation of the Fourier
     coefficients. Default: `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`,
-    prior for the lengthscale(s) controlling the periodicity. Default: `LogNormal(0, 1)`.
+  - `length_scale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`,
+    prior for the length_scale(s) controlling the periodicity. Default: `LogNormal(0, 1)`.
   - `method`: `Symbol`, computational method (`:spectral`, `:cholesky`, `:cholesky_sparse`).
     Default: `:spectral`.
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: The standard deviation of the Fourier coefficients.
-- `ls_<key>`: The lengthscale(s) controlling the periodicity of the basis functions.
+- `ls_<key>`: The length_scale(s) controlling the periodicity of the basis functions.
 - `innovations_<key>`: The raw standard normal innovations for the Fourier coefficients.
 - `latent_<key>`: The reconstructed latent smooth effect.
 """
 struct FFT <: ComponentModel
     sigma::Distribution
     nbins::Int
-    lengthscale::Union{Distribution, Vector{<:Distribution}}
+    length_scale::Union{Distribution, Vector{<:Distribution}}
     method::Symbol
 end
 
@@ -66,7 +66,7 @@ COMPONENT_TYPE_REGISTRY[:fft] = FFT
 COMPONENT_CONSTRUCTORS[:fft] = (p, params) -> FFT(
     p.sigma,
     get(params, :nbins, 20),
-    get(p, :lengthscale, LogNormal(0.0, 1.0)), # Default prior for lengthscale
+    get(p, :length_scale, LogNormal(0.0, 1.0)), # Default prior for length_scale
     get(params, :method, :spectral)
 )
 
@@ -133,7 +133,7 @@ end
 """
     get_priors(m::FFT, spec::NamedTuple, arch::String, outcome_idx, M)::String
 
-Generates priors for `sigma`, `lengthscale` (`ls`), and the `innovations` coefficients.
+Generates priors for `sigma`, `length_scale`, and the `innovations` coefficients.
 """
 function get_priors(
     m::FFT, spec::NamedTuple, arch::String, outcome_idx::Union{Int, Nothing},
@@ -144,47 +144,47 @@ function get_priors(
     priors = String[]
     push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
 
-    if m.lengthscale isa Vector
-        ls_priors_str = join([_distribution_to_string(p) for p in m.lengthscale], ", ")
-        push!(priors, "$(p_names.ls) ~ Product([$(ls_priors_str)])")
+    if m.length_scale isa Vector
+        length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
+        push!(priors, "$(p_names.length_scale) ~ Product([$(length_scale_priors_str)])")
     else
-        ls_prior_str = _distribution_to_string(m.lengthscale)
-        push!(priors, "$(p_names.ls) ~ $(ls_prior_str)")
+        length_scale_prior_str = _distribution_to_string(m.length_scale)
+        push!(priors, "$(p_names.length_scale) ~ $(length_scale_prior_str)")
     end
     
     push!(
         priors,
-        "$(p_names.ure) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)"
+        "$(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)"
     )
 
     return join(priors, "\n    ")
 end
 
 """
-    bstm_fourier_basis(coords, nbins_per_dim, lengthscale)
+    bstm_fourier_basis(coords, nbins_per_dim, length_scale)
 
 Helper function to generate a tensor product Fourier basis matrix. This is a CPU-only
 implementation.
 """
 function bstm_fourier_basis(
     coords::AbstractMatrix, nbins_per_dim::Vector{Int},
-    lengthscale::Union{Real, AbstractVector}
+    length_scale::Union{Real, AbstractVector}
 )
     n_obs, n_dims = size(coords)
     
-    ls_vec = if lengthscale isa Real
-        fill(Float64(lengthscale), n_dims)
+    length_scale_vec = if length_scale isa Real
+        fill(Float64(length_scale), n_dims)
     else
-        if length(lengthscale) != n_dims
-            error("Length of lengthscale vector must match coordinate dimensions.")
+        if length(length_scale) != n_dims
+            error("Length of length_scale vector must match coordinate dimensions.")
         end
-        lengthscale
+        length_scale
     end
 
     basis_matrices_1D = []
     for i in 1:n_dims
         vals = coords[:, i]
-        ls_val = ls_vec[i]
+        ls_val = length_scale_vec[i]
         t_coords = vals ./ ls_val
         n_basis_1d = nbins_per_dim[i]
         B_1d = similar(t_coords, n_obs, n_basis_1d)
@@ -243,7 +243,7 @@ function get_updates(
         B_fft = bstm_fourier_basis(
             spec_registry[:$(key)].hyper.coords,
             spec_registry[:$(key)].hyper.nbins_per_dim,
-            $(p_names.ls)
+            $(p_names.length_scale)
         )
     """
 
@@ -259,10 +259,10 @@ function get_updates(
             diag_D[1] = 0.0
             diag_D[2] = 0.0
             
-            coeffs = hyper.U * (diag_D .* $(p_names.ure))
-            $(p_names.sre) = B_fft * coeffs
+            coeffs = hyper.U * (diag_D .* $(p_names.innovations))
+            $(p_names.latent_field) = B_fft * coeffs
             
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -273,7 +273,7 @@ function get_updates(
             Q_penalty = spec_registry[:$(key)].hyper.Q_template
             F = cholesky(Symmetric(Matrix(Q_penalty) + M.noise * I))
             
-            coeffs_unscaled = F.L' \\ $(p_names.ure)
+            coeffs_unscaled = F.L' \\ $(p_names.innovations)
             
             # Apply soft sum-to-zero constraint for RW2 penalty
             Turing.@addlogprob! logpdf(
@@ -281,9 +281,9 @@ function get_updates(
             )
             
             coeffs = $(p_names.sigma) .* coeffs_unscaled
-            $(p_names.sre) = B_fft * coeffs
+            $(p_names.latent_field) = B_fft * coeffs
             
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -294,7 +294,7 @@ function get_updates(
             Q_penalty = spec_registry[:$(key)].hyper.Q_template
             F = cholesky(Symmetric(Q_penalty + M.noise * I))
             
-            coeffs_unscaled = F.L' \\ $(p_names.ure)
+            coeffs_unscaled = F.L' \\ $(p_names.innovations)
             
             # Apply soft sum-to-zero constraint for RW2 penalty
             Turing.@addlogprob! logpdf(
@@ -302,9 +302,9 @@ function get_updates(
             )
             
             coeffs = $(p_names.sigma) .* coeffs_unscaled
-            $(p_names.sre) = B_fft * coeffs
+            $(p_names.latent_field) = B_fft * coeffs
             
-            $(eta_target) = $(eta_target) .+ $(p_names.sre)
+            $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
         end
     """
 
@@ -358,10 +358,10 @@ function get_effects(
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        ls_name = _find_parameter(p_names, string(p_names_k.ls), k, is_multivariate_model)
-        ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
+        length_scale_name = _find_parameter(p_names, string(p_names_k.length_scale), k, is_multivariate_model)
+        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(ls_name) || isempty(ure_name)
+        if isempty(sigma_name) || isempty(length_scale_name) || isempty(innovations_name)
             @warn "Parameters for FFT component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
@@ -369,9 +369,9 @@ function get_effects(
 
         # Extract posterior samples (these are on the CPU)
         sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        ls_dim = m.lengthscale isa Vector ? length(m.lengthscale) : 1
-        ls_samples_cpu = get_params_matrix(chain, ls_name, ls_dim)
-        ure_samples_cpu = get_params_matrix(chain, ure_name, n_latent)
+        length_scale_dim = m.length_scale isa Vector ? length(m.length_scale) : 1
+        ls_samples_cpu = get_params_matrix(chain, length_scale_name, length_scale_dim)
+        innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
         # Initialize the output matrix for the full effect on the CPU
         effect_k_cpu = zeros(Float64, N_total, n_samples)
@@ -379,12 +379,12 @@ function get_effects(
         # --- Sample-wise Reconstruction ---
         for i in 1:n_samples
             # 1. Generate basis matrix on CPU
-            current_ls_cpu = ls_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
+            current_ls_cpu = length_scale_dim > 1 ? ls_samples_cpu[i, :] : ls_samples_cpu[i, 1]
             B_fft_i_cpu = bstm_fourier_basis(
                 coords_full_cpu, nbins_per_dim, current_ls_cpu
             )
             
-            innov_i_cpu = ure_samples_cpu[i, :]
+            innov_i_cpu = innovations_samples_cpu[i, :]
             sigma_i_cpu = sigma_samples_cpu[i]
             
             # 3. Reconstruct coefficients on CPU

@@ -129,24 +129,18 @@ function _rff_surface_derivatives(
     v = generate_full_variable_names(spec, "univariate", 1)
     p_names = _get_clean_chain_param_names(chain)
 
-    ure_name = _find_parameter(p_names, string(v.ure), 1, false)
-    if isempty(ure_name)
-        ure_name = _find_parameter(p_names, "ure", 1, false)
-    end
+    innovations_name = _find_parameter(p_names, string(v.innovations), 1, false)
     sigma_name = _find_parameter(p_names, string(v.sigma), 1, false)
-    if isempty(sigma_name)
-        sigma_name = _find_parameter(p_names, "sigma", 1, false)
-    end
 
     total_chain_samples = _get_chain_n_samples(chain)
     S = isnothing(n_samples) ? total_chain_samples : min(n_samples, total_chain_samples)
 
-    if isempty(ure_name)
+    if isempty(innovations_name)
         throw(ArgumentError(
-            "Innovations parameter '$(v.ure)' not found in MCMC chain for RFF."
+            "Innovations parameter '$(v.innovations)' not found in MCMC chain for RFF."
         ))
     end
-    ure_samples = get_params_matrix(chain, ure_name, K)
+    innovations_samples = get_params_matrix(chain, innovations_name, K)
     sigma_samples = !isempty(sigma_name) ?
         get_params_vector(chain, sigma_name, 1) : fill(1.0, S, 1)
 
@@ -189,7 +183,7 @@ function _rff_surface_derivatives(
     bpi_samples = Dict(r => zeros(Float64, N_pts, S) for r in radii)
 
     for s in 1:S
-        coeffs_s = ure_samples[s, :] .* sigma_samples[s, 1]
+        coeffs_s = innovations_samples[s, :] .* sigma_samples[s, 1]
         z_samples[:, s] = Phi * coeffs_s
         zx_samples[:, s] = dPhi_dx * coeffs_s
         zy_samples[:, s] = dPhi_dy * coeffs_s
@@ -247,23 +241,11 @@ function _spectralgp_surface_derivatives(
     p_names = _get_clean_chain_param_names(chain)
 
     sigma_name = _find_parameter(p_names, string(v.sigma), 1, false)
-    if isempty(sigma_name)
-        sigma_name = _find_parameter(p_names, "sigma", 1, false)
-    end
     nu_name = _find_parameter(p_names, string(v.nu), 1, false)
-    if isempty(nu_name)
-        nu_name = _find_parameter(p_names, "nu", 1, false)
-    end
-    ls_name = _find_parameter(p_names, string(v.ls), 1, false)
-    if isempty(ls_name)
-        ls_name = _find_parameter(p_names, "ls", 1, false)
-    end
-    ure_name = _find_parameter(p_names, string(v.ure), 1, false)
-    if isempty(ure_name)
-        ure_name = _find_parameter(p_names, "ure", 1, false)
-    end
-    if isempty(ure_name)
-        ure_name = _find_parameter(p_names, "innovations", 1, false)
+    length_scale_name = _find_parameter(p_names, string(v.length_scale), 1, false)
+    innovations_name = _find_parameter(p_names, string(v.innovations), 1, false)
+    if isempty(innovations_name)
+        innovations_name = _find_parameter(p_names, "innovations", 1, false)
     end
 
     total_chain_samples = _get_chain_n_samples(chain)
@@ -273,16 +255,16 @@ function _spectralgp_surface_derivatives(
         get_params_vector(chain, sigma_name, 1) : fill(1.0, S, 1)
     nu_samples = !isempty(nu_name) ?
         get_params_vector(chain, nu_name, 1) : fill(1.5, S, 1)
-    ls_samples = !isempty(ls_name) ?
-        get_params_vector(chain, ls_name, 1) : fill(10.0, S, 1)
-    if isempty(ure_name)
+    length_scale_samples = !isempty(length_scale_name) ?
+        get_params_vector(chain, length_scale_name, 1) : fill(10.0, S, 1)
+    if isempty(innovations_name)
         throw(ArgumentError(
-            "Innovations parameter '$(v.ure)' not found in MCMC chain for SpectralGP."
+            "Innovations parameter '$(v.innovations)' not found in MCMC chain for SpectralGP."
         ))
     end
-    ure_samples = get_params_matrix(chain, ure_name, res^n_dims)
+    innovations_samples = get_params_matrix(chain, innovations_name, res^n_dims)
 
-    S = min(S, size(sigma_samples, 1), size(nu_samples, 1), size(ls_samples, 1), size(ure_samples, 1))
+    S = min(S, size(sigma_samples, 1), size(nu_samples, 1), size(length_scale_samples, 1), size(innovations_samples, 1))
 
     z_samples = zeros(Float64, N_pts, S)
     zx_samples = zeros(Float64, N_pts, S)
@@ -308,8 +290,8 @@ function _spectralgp_surface_derivatives(
     for s in 1:S
         cur_sigma = sigma_samples[s, 1]
         cur_nu = nu_samples[s, 1]
-        cur_ls = ls_samples[s, 1]
-        cur_innov = ure_samples[s, :]
+        cur_ls = length_scale_samples[s, 1]
+        cur_innov = innovations_samples[s, :]
 
         S_w = anisotropic_matern_spectral_density(freq_grids, cur_sigma, cur_ls, cur_nu, n_dims)
         innov_grid = reshape(cur_innov, fill(res, n_dims)...)
@@ -401,35 +383,26 @@ function _waveletgp_surface_derivatives(
     v = generate_full_variable_names(spec, "univariate", 1)
     p_names = _get_clean_chain_param_names(chain)
 
-    sigma0_name = _find_parameter(p_names, string(v.sigma0), 1, false)
-    if isempty(sigma0_name)
-        sigma0_name = _find_parameter(p_names, "sigma0", 1, false)
-    end
+    sigma_name = _find_parameter(p_names, string(v.sigma), 1, false)
     alpha_name = _find_parameter(p_names, string(v.alpha), 1, false)
-    if isempty(alpha_name)
-        alpha_name = _find_parameter(p_names, "alpha", 1, false)
-    end
-    ure_name = _find_parameter(p_names, string(v.ure), 1, false)
-    if isempty(ure_name)
-        ure_name = _find_parameter(p_names, "ure", 1, false)
-    end
-    if isempty(ure_name)
-        ure_name = _find_parameter(p_names, "innovations", 1, false)
+    innovations_name = _find_parameter(p_names, string(v.innovations), 1, false)
+    if isempty(innovations_name)
+        innovations_name = _find_parameter(p_names, "innovations", 1, false)
     end
 
     total_chain_samples = _get_chain_n_samples(chain)
     S = isnothing(n_samples) ? total_chain_samples : min(n_samples, total_chain_samples)
 
-    sigma0_samples = !isempty(sigma0_name) ?
-        get_params_vector(chain, sigma0_name, 1) : fill(1.0, S, 1)
+    sigma_samples = !isempty(sigma_name) ?
+        get_params_vector(chain, sigma_name, 1) : fill(1.0, S, 1)
     alpha_samples = !isempty(alpha_name) ?
         get_params_vector(chain, alpha_name, 1) : fill(1.5, S, 1)
-    if isempty(ure_name)
+    if isempty(innovations_name)
         throw(ArgumentError(
-            "Innovations parameter '$(v.ure)' not found in MCMC chain for WaveletGP."
+            "Innovations parameter '$(v.innovations)' not found in MCMC chain for WaveletGP."
         ))
     end
-    ure_samples = get_params_matrix(chain, ure_name, hyper.n_latent)
+    innovations_samples = get_params_matrix(chain, innovations_name, hyper.n_latent)
 
     # Frequency grids for spectral differentiation of the reconstructed wavelet field
     freqs = [fftfreq(res, res / (max_coords[d] - min_coords[d])) for d in 1:n_dims]
@@ -459,11 +432,11 @@ function _waveletgp_surface_derivatives(
     coords_cols = ntuple(d -> view(coords_mat, :, d), n_dims)
 
     for s in 1:S
-        sig0 = sigma0_samples[s, 1]
+        sigma_value = sigma_samples[s, 1]
         alp = alpha_samples[s, 1]
-        innov = ure_samples[s, :]
+        innov = innovations_samples[s, :]
 
-        scale_variances = sig0^2 .* (2.0 .^ (-alp .* scale_indices))
+        scale_variances = sigma_value^2 .* (2.0 .^ (-alp .* scale_indices))
         w_coeffs = innov .* sqrt.(scale_variances)
         coeffs_2d = reshape(w_coeffs, res, res)
         grid_z = idwt(coeffs_2d, wt)
@@ -545,19 +518,10 @@ function _spde_surface_derivatives(
     p_names = _get_clean_chain_param_names(chain)
 
     sigma_name = _find_parameter(p_names, string(v.sigma), 1, false)
-    if isempty(sigma_name)
-        sigma_name = _find_parameter(p_names, "sigma", 1, false)
-    end
-    kappa_name = _find_parameter(p_names, string(v.kappa), 1, false)
-    if isempty(kappa_name)
-        kappa_name = _find_parameter(p_names, "kappa", 1, false)
-    end
-    ure_name = _find_parameter(p_names, string(v.ure), 1, false)
-    if isempty(ure_name)
-        ure_name = _find_parameter(p_names, "ure", 1, false)
-    end
-    if isempty(ure_name)
-        ure_name = _find_parameter(p_names, "innovations", 1, false)
+    range_name = _find_parameter(p_names, string(v.range), 1, false)
+    innovations_name = _find_parameter(p_names, string(v.innovations), 1, false)
+    if isempty(innovations_name)
+        innovations_name = _find_parameter(p_names, "innovations", 1, false)
     end
 
     total_chain_samples = _get_chain_n_samples(chain)
@@ -565,21 +529,21 @@ function _spde_surface_derivatives(
 
     sigma_samples = !isempty(sigma_name) ?
         get_params_vector(chain, sigma_name, 1) : fill(1.0, S, 1)
-    kappa_samples = !isempty(kappa_name) ?
-        get_params_vector(chain, kappa_name, 1) : fill(1.0, S, 1)
-    if isempty(ure_name)
+    kappa_samples = !isempty(range_name) ?
+        get_params_vector(chain, range_name, 1) : fill(1.0, S, 1)
+    if isempty(innovations_name)
         throw(ArgumentError(
-            "Innovations parameter '$(v.ure)' not found in MCMC chain for SPDE."
+            "Innovations parameter '$(v.innovations)' not found in MCMC chain for SPDE."
         ))
     end
-    ure_samples = get_params_matrix(chain, ure_name, s_N)
+    innovations_samples = get_params_matrix(chain, innovations_name, s_N)
 
     # Reconstruct vertex field: [s_N, S]
     vertex_samples = zeros(Float64, s_N, S)
     for s in 1:S
         sig = sigma_samples[s, 1]
         kap = kappa_samples[s, 1]
-        innov = ure_samples[s, :]
+        innov = innovations_samples[s, :]
         diag_D = sig ./ sqrt.(kap.^2 .+ L)
         vertex_samples[:, s] = U * (diag_D .* innov)
     end

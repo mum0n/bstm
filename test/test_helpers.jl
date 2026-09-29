@@ -11,9 +11,10 @@ catch
 end
 
 using DynamicPPL
-using Plots
-using StatsPlots
-using ColorSchemes
+# `AbstractMCMC` is referenced explicitly in test_models.jl. A project's direct
+# dependencies are not automatically in scope in Julia, so it must be imported here
+# rather than relied upon transitively.
+using AbstractMCMC
 using Distributions
 using LinearAlgebra
 using DataFrames
@@ -25,6 +26,58 @@ using Clustering
 using LogExpFunctions
 using Graphs
 using StatsModels
+
+# ==============================================================================
+# Project-local scratch space
+#
+# Test artifacts (saved bundles, rendered plots, exported HTML) are written inside the
+# repository rather than to the OS temp directory, so a test run leaves nothing behind
+# outside the project. Use `scratch_dir()` / `scratch_path()` in place of `mktempdir()`
+# and `tempdir()`.
+# ==============================================================================
+const PROJECT_SCRATCH_ROOT = let root = normpath(joinpath(@__DIR__, "..", "work", "test_scratch"))
+    mkpath(root)
+    root
+end
+
+"""
+    scratch_dir(prefix="bstm") -> String
+
+A unique directory inside `work/test_scratch`, for test artifacts.
+"""
+scratch_dir(prefix::AbstractString="bstm") = mktempdir(PROJECT_SCRATCH_ROOT; prefix=prefix)
+
+"""
+    scratch_path(name; prefix="bstm") -> String
+
+A unique path inside `work/test_scratch` for a single test artifact.
+"""
+function scratch_path(name::AbstractString; prefix::AbstractString="bstm")
+    d = mktempdir(PROJECT_SCRATCH_ROOT; prefix=prefix)
+    return joinpath(d, name)
+end
+
+# `Plots`, `StatsPlots` and `ColorSchemes` are *weak* dependencies of bstm (they back the
+# `BSTMPlotsExt` package extension) and are therefore not present in the main project
+# environment. Only the `:persistence` test segment exercises the plotting subsystem, so
+# these are imported softly: every other segment stays runnable without the optional
+# plotting stack installed. See `test/Project.toml` for the full plotting test env.
+const HAS_PLOTTING = let
+    ok = true
+    for mod in (:Plots, :StatsPlots, :ColorSchemes)
+        try
+            @eval using $(mod)
+        catch
+            ok = false
+        end
+    end
+    ok
+end
+
+if !HAS_PLOTTING
+    @info "Optional plotting stack (Plots/StatsPlots/ColorSchemes) not available; " *
+          "the `:persistence` segment will skip its plotting testset."
+end
 
 const bstm_Likelihood = bstm.bstm_Likelihood
 
@@ -60,7 +113,7 @@ function mock_M_config(N_obs, N_areas, N_time, model_arch="univariate")
             y = rand(N_obs),
             s_idx = repeat(1:N_areas, inner=N_time)[1:N_obs],
             t_idx = repeat(1:N_time, outer=N_areas)[1:N_obs],
-            group_var = repeat(1:N_areas, inner=N_obs ÷ N_areas)[1:N_obs]
+            grouping_covariate = repeat(1:N_areas, inner=N_obs ÷ N_areas)[1:N_obs]
         ),
         model_arch = model_arch,
         technical = Dict(

@@ -12,32 +12,32 @@ end
         N_obs, N_levels = 100, 10
         m_iid = bstm.IID(Distributions.Exponential(1.0), :noncentered)
         
-        mock_M_ds = Dict(:data => DataFrame(group_var=repeat(1:N_levels,
+        mock_M_ds = Dict(:data => DataFrame(grouping_covariate=repeat(1:N_levels,
             inner=N_obs ÷ N_levels)[1:N_obs]))
-        mock_mod_data = Dict(:variables => :group_var)
+        mock_mod_data = Dict(:variables => :grouping_covariate)
         
         mock_M_pc = (data=mock_M_ds[:data],)
         res_pc = bstm.get_precomputes(m_iid, mock_M_pc, mock_mod_data)
         @test hasproperty(res_pc, :n_latent) || res_pc == NamedTuple()
 
-        mock_M_priors = (technical=(component_levels=Dict(:group_var => N_levels),),)
-        mock_spec_priors = mock_spec(:group_var)
+        mock_M_priors = (technical=(component_levels=Dict(:grouping_covariate => N_levels),),)
+        mock_spec_priors = mock_spec(:grouping_covariate)
         priors_str = bstm.get_priors(m_iid, mock_spec_priors, "univariate", nothing,
             mock_M_priors)
-        @test contains(priors_str, "sigma_group_var ~ Exponential(1.0)")
-        @test contains(priors_str, "ure_group_var ~ MvNormal(zeros(T,")
+        @test contains(priors_str, "sigma_grouping_covariate ~ Exponential(1.0)")
+        @test contains(priors_str, "innovations_grouping_covariate ~ MvNormal(zeros(T,")
 
-        mock_M_updates = (technical=(component_indices=Dict(:group_var => mock_M_ds[:data].group_var),), model_arch="univariate")
-        mock_spec_updates = mock_spec(:group_var)
+        mock_M_updates = (technical=(component_indices=Dict(:grouping_covariate => mock_M_ds[:data].grouping_covariate),), model_arch="univariate")
+        mock_spec_updates = mock_spec(:grouping_covariate)
         updates_str = bstm.get_updates(m_iid, mock_spec_updates, "univariate", nothing,
             mock_M_updates)
-        @test contains(updates_str, "sre_group_var = ure_group_var .* sigma_group_var")
-        @test contains(updates_str, "view(sre_group_var,")
+        @test contains(updates_str, "latent_field_grouping_covariate = innovations_grouping_covariate .* sigma_grouping_covariate")
+        @test contains(updates_str, "view(latent_field_grouping_covariate,")
 
-        mock_chain_effects = mock_chain(Dict(:sigma_group_var => 0.5,
-            :ure_group_var => randn(N_levels, 10)), 10)
-        mock_M_effects = (technical=(component_indices=Dict(:group_var => mock_M_ds[:data].group_var),), model_arch="univariate")
-        mock_spec_effects = mock_spec(:group_var)
+        mock_chain_effects = mock_chain(Dict(:sigma_grouping_covariate => 0.5,
+            :innovations_grouping_covariate => randn(N_levels, 10)), 10)
+        mock_M_effects = (technical=(component_indices=Dict(:grouping_covariate => mock_M_ds[:data].grouping_covariate),), model_arch="univariate")
+        mock_spec_effects = mock_spec(:grouping_covariate)
         
         effects_result = bstm.get_effects(m_iid, mock_chain_effects, mock_spec_effects,
             (outcomes_N=1, model_arch="univariate", technical=mock_M_effects.technical),
@@ -67,14 +67,14 @@ end
             mock_M_priors)
         @test contains(priors_str, "sigma_s_idx ~ Exponential(1.0)")
         @test contains(priors_str, "rho_s_idx ~ Beta(1.0, 1.0)")
-        @test contains(priors_str, "ure_s_idx ~ MvNormal(zeros(T, 10), I)")
+        @test contains(priors_str, "innovations_s_idx ~ MvNormal(zeros(T, 10), I)")
 
         mock_M_updates = (technical=(component_indices=Dict(:s_idx => repeat(1:N_areas,
             inner=N_obs ÷ N_areas)[1:N_obs]), ), model_arch="univariate")
         updates_str = bstm.get_updates(m_leroux, mock_spec_priors, "univariate", nothing,
             mock_M_updates)
-        @test contains(updates_str, "sre_s_idx = hyper.U * (diag_D .* ure_s_idx)")
-        @test contains(updates_str, "eta = eta .+ view(sre_s_idx, M.s_idx)")
+        @test contains(updates_str, "latent_field_s_idx = hyper.U * (diag_D .* innovations_s_idx)")
+        @test contains(updates_str, "eta = eta .+ view(latent_field_s_idx, M.s_idx)")
     end
 
     # Test GP Component
@@ -97,14 +97,14 @@ end
         priors_str = bstm.get_priors(m_gp, mock_spec_priors, "univariate", nothing,
             mock_M_priors)
         @test contains(priors_str, "sigma_x_y ~ Exponential(1.0)")
-        @test contains(priors_str, "ls_x_y ~ Gamma(2.0, 0.5)")
-        @test contains(priors_str, "ure_x_y ~ MvNormal(zeros(T, 100), I)")
+        @test contains(priors_str, "length_scale_x_y ~ Gamma(2.0, 0.5)")
+        @test contains(priors_str, "innovations_x_y ~ MvNormal(zeros(T, 100), I)")
 
         mock_M_updates = (technical=(component_indices=Dict(),), model_arch="univariate")
         updates_str = bstm.get_updates(m_gp, mock_spec_priors, "univariate", nothing,
             mock_M_updates)
-        @test contains(updates_str, "sre_x_y = F_gp.L * ure_x_y")
-        @test contains(updates_str, "eta = eta .+ sre_x_y")
+        @test contains(updates_str, "latent_field_x_y = F_gp.L * innovations_x_y")
+        @test contains(updates_str, "eta = eta .+ latent_field_x_y")
     end
 
     # Test Harmonic Component
@@ -131,8 +131,8 @@ end
         mock_M_updates = (technical=(component_indices=Dict(:month => mock_M_ds[:data].month),), model_arch="univariate")
         updates_str = bstm.get_updates(m_harm, mock_spec_priors, "univariate", nothing,
             mock_M_updates)
-        @test contains(updates_str, "sre_month = zeros(T_num, u_N_val)")
-        @test contains(updates_str, "eta = eta .+ view(sre_month, u_idx_val)")
+        @test contains(updates_str, "latent_field_month = zeros(T_num, u_N_val)")
+        @test contains(updates_str, "eta = eta .+ view(latent_field_month, u_idx_val)")
     end
 end
 

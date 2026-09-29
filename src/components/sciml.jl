@@ -29,18 +29,18 @@ the model to observed data.
 # Inputs
 - **Required**:
   - A temporal index variable (e.g., `year`) passed to `sciml()`.
-  - `model_func`: `Symbol`, the name of the user-defined function specifying the DE system.
-  - `u0_prior`: A `Distribution` for the prior on the initial conditions `u0`.
-  - `p_priors`: A `NamedTuple` of priors for the DE parameters (e.g., `(alpha=Normal(0,1),
+  - `model_function`: `Symbol`, the name of the user-defined function specifying the DE system.
+  - `initial_state_prior`: A `Distribution` for the prior on the initial conditions `u0`.
+  - `parameter_priors`: A `NamedTuple` of priors for the DE parameters (e.g., `(alpha=Normal(0,1),
     beta=LogNormal(0,1))`).
   - `tspan`: A `Tuple` specifying the integration time span (e.g., `(0.0, 10.0)`).
   - `solver`: A `SciML` solver object (e.g., `Tsit5()`).
 - **Optional (in `sciml()` call)**:
-  - `de_type`: `Symbol`, the type of differential equation (`:ODE`, `:SDE`, `:DDE`,
+  - `ode_solver`: `Symbol`, the type of differential equation (`:ODE`, `:SDE`, `:DDE`,
     `:Jump`). Default: `:ODE`.
   - `likelihood_type`: `Symbol`, the likelihood evaluation method (`:additive` or
     `:direct`). Default: `:additive`.
-  - `de_kwargs`: A `Dict` of additional keyword arguments for the `DEProblem` constructor
+  - `solver_kwargs`: A `Dict` of additional keyword arguments for the `DEProblem` constructor
     (e.g., `constant_lags` for DDEs).
   - `saveat`: `Float64`, the time step for saving the DE solution. Default: `0.1`.
 
@@ -57,31 +57,31 @@ the model to observed data.
 - SciML Documentation: https://sciml.ai/
 """
 struct SciML <: ComponentModel
-    model_func::Symbol
-    u0_prior::Any
-    p_priors::NamedTuple
-    de_type::Symbol
-    de_kwargs::Dict{Symbol, Any}
+    model_function::Symbol
+    initial_state_prior::Any
+    parameter_priors::NamedTuple
+    ode_solver::Symbol
+    solver_kwargs::Dict{Symbol, Any}
     likelihood_type::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:sciml] = SciML
 
 COMPONENT_CONSTRUCTORS[:sciml] = (p, params) -> begin
-    model_func = get(params, :model_func, error("SciML requires a `model_func` parameter."))
-    u0_prior = get(params, :u0_prior, error("SciML requires a `u0_prior` parameter."))
-    p_priors = get(params, :p_priors, error("SciML requires a `p_priors` parameter."))
-    de_type = get(params, :de_type, :ODE)
+    model_function = get(params, :model_function, error("SciML requires a `model_function` parameter."))
+    initial_state_prior = get(params, :initial_state_prior, error("SciML requires a `initial_state_prior` parameter."))
+    parameter_priors = get(params, :parameter_priors, error("SciML requires a `parameter_priors` parameter."))
+    ode_solver = get(params, :ode_solver, :ODE)
     likelihood_type = get(params, :likelihood_type, :additive)
     
-    de_kwargs = Dict{Symbol, Any}()
+    solver_kwargs = Dict{Symbol, Any}()
     for key in [:constant_lags, :saveat, :h, :noise_func]
         if haskey(params, key)
-            de_kwargs[key] = params[key]
+            solver_kwargs[key] = params[key]
         end
     end
 
-    SciML(model_func, u0_prior, p_priors, de_type, de_kwargs, likelihood_type)
+    SciML(model_function, initial_state_prior, parameter_priors, ode_solver, solver_kwargs, likelihood_type)
 end
 
 MODEL_TO_STRUCTURE_MAP[:sciml] = :temporal
@@ -102,7 +102,7 @@ function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
     coords_cpu = M.data[!, time_var_sym]
 
     params = mod_data[:params]
-    required_args = [:model_func, :u0_prior, :p_priors, :tspan, :solver]
+    required_args = [:model_function, :initial_state_prior, :parameter_priors, :tspan, :solver]
     for arg in required_args
         if !haskey(params, arg)
             error("The `sciml()` module is missing the required keyword argument `:$arg`.")
@@ -111,28 +111,28 @@ function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
 
     # --- Problem Template Creation (on CPU) ---
     calling_mod = get(M, :calling_module, Main)
-    model_func = Core.eval(calling_mod, params[:model_func])
+    model_function = Core.eval(calling_mod, params[:model_function])
     
-    u0_template = mean(params[:u0_prior])
-    p_template = Tuple(mean(p) for p in values(m.p_priors))
+    u0_template = mean(params[:initial_state_prior])
+    p_template = Tuple(mean(p) for p in values(m.parameter_priors))
     tspan = params[:tspan]
 
     local prob_template
-    if m.de_type == :ODE
-        prob_template = ODEProblem(model_func, u0_template, tspan, p_template)
-    elseif m.de_type == :SDE
+    if m.ode_solver == :ODE
+        prob_template = ODEProblem(model_function, u0_template, tspan, p_template)
+    elseif m.ode_solver == :SDE
         noise_func_sym = get(params, :noise_func, error("SDE requires a `noise_func`."))
         noise_func = Core.eval(calling_mod, noise_func_sym)
-        prob_template = SDEProblem(model_func, noise_func, u0_template, tspan, p_template)
-    elseif m.de_type == :DDE
+        prob_template = SDEProblem(model_function, noise_func, u0_template, tspan, p_template)
+    elseif m.ode_solver == :DDE
         h_func_sym = get(params, :h, error("DDE requires a history function `h`."))
         h_func = Core.eval(calling_mod, h_func_sym)
-        prob_template = DDEProblem(model_func, u0_template, h_func, tspan, p_template;
-            m.de_kwargs...)
-    elseif m.de_type == :Jump
-        prob_template = model_func(u0_template, p_template, tspan)
+        prob_template = DDEProblem(model_function, u0_template, h_func, tspan, p_template;
+            m.solver_kwargs...)
+    elseif m.ode_solver == :Jump
+        prob_template = model_function(u0_template, p_template, tspan)
     else
-        error("Unsupported `de_type`: $(m.de_type)")
+        error("Unsupported `ode_solver`: $(m.ode_solver)")
     end
 
     return (
@@ -140,7 +140,7 @@ function get_precomputes(m::SciML, M::NamedTuple, mod_data::Dict)::NamedTuple
         solver=params[:solver],
         saveat=get(params, :saveat, 0.1),
         coords=coords_cpu,
-        param_names=keys(m.p_priors)
+        param_names=keys(m.parameter_priors)
     )
 end
 
@@ -151,10 +151,10 @@ function get_priors(
     v = generate_full_variable_names(spec, arch, outcome_idx)
     
     prior_lines = ["# --- Priors for SciML component: $(spec.key) ---"]
-    push!(prior_lines, "$(v.u0) ~ $(_distribution_to_string(m.u0_prior))")
+    push!(prior_lines, "$(v.u0) ~ $(_distribution_to_string(m.initial_state_prior))")
     
     for p_name in spec.hyper.param_names
-        p_prior = m.p_priors[p_name]
+        p_prior = m.parameter_priors[p_name]
         p_var_name = getproperty(v, Symbol("p_$(p_name)"))
         push!(prior_lines, "$(p_var_name) ~ $(_distribution_to_string(p_prior))")
     end
@@ -273,10 +273,6 @@ function get_effects(
             p_sym = Symbol("p_$(p_name)")
             p_full_name = getproperty(v, p_sym)
             found_name = _find_parameter(p_names, string(p_full_name), k, is_multivariate_model)
-            if isempty(found_name)
-                all_params_found = false
-                break
-            end
             p_var_names[p_name] = found_name
         end
 
@@ -287,7 +283,7 @@ function get_effects(
         end
 
         # Extract posterior samples (CPU)
-        u0_samples_cpu = get_params_matrix(chain, u0_name, length(m.u0_prior))
+        u0_samples_cpu = get_params_matrix(chain, u0_name, length(m.initial_state_prior))
         p_samples_cpu = Dict(p_name => get_params_vector(chain, p_var_name, 1) for (p_name,
             p_var_name) in p_var_names)
 

@@ -56,7 +56,6 @@ PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
-Requires = "ae029012-a4dd-5104-9daa-d747884805df"
 ReverseDiff = "37e2e3b7-166d-5795-8a7a-e32c996b4267"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
@@ -80,4 +79,93 @@ ColorSchemes = "35d6a980-a343-548e-a6ea-1d62b119f2f4"
 
 [extensions]
 BSTMPlotsExt = ["Plots", "StatsPlots", "ColorSchemes"]
+
+# Version bounds.
+#
+# bstm is not a loose consumer of the PPL stack: it generates Turing model bodies and
+# then drives DynamicPPL internals directly (`init!!`, `evaluate_nowarn!!`, the
+# `Model` field layout, `requires_threadsafe`, the world-age trampoline). Those
+# internals are not covered by any stability guarantee, so the bounds below are
+# deliberately tight on Turing/DynamicPPL/AbstractMCMC rather than permissive.
+# A minor-version bump in that trio should be treated as a breaking change until
+# bstm's own suite has been re-run.
+[compat]
+julia = "1.10"
+
+# PPL stack -- tightly coupled, see note above.
+Turing = "0.49.0"
+DynamicPPL = "0.42.14"
+AbstractMCMC = "5"
+AbstractPPL = "0.15"
+AdvancedVI = "0.7"
+ADTypes = "1"
+Bijectors = "0.16"
+
+# Distributions / data structures.
+Distributions = "0.25"
+DataFrames = "1"
+CategoricalArrays = "1"
+StatsBase = "0.34"
+StatsModels = "0.7"
+DimensionalData = "0.30"
+NamedArrays = "0.10"
+FillArrays = "1"
+StaticArrays = "1"
+LinearAlgebra = "1"
+SparseArrays = "1"
+Statistics = "1"
+Dates = "1"
+Printf = "1"
+Random = "1"
+SHA = "1"
+OrderedCollections = "1"
+
+# Spatial / geometry.
+Graphs = "1"
+Clustering = "0.15"
+NearestNeighbors = "0.4"
+Distances = "0.10"
+DelaunayTriangulation = "1"
+LibGEOS = "0.9"
+CoordRefSystems = "0.21"
+Unitful = "1"
+
+# Modelling / numerics.
+KernelFunctions = "0.10"
+AbstractGPs = "0.5"
+PDMats = "0.11"
+Interpolations = "0.16"
+Wavelets = "0.10"
+WaveletsExt = "0.2"
+FFTW = "1"
+SpecialFunctions = "2"
+  LogExpFunctions = "0.3"
+
+Optim = "2"
+Optimisers = "0.4"
+ForwardDiff = "1"
+ReverseDiff = "1"
+Enzyme = "0.13"
+DifferentialEquations = "8"
+KernelAbstractions = "0.9"
+NNlib = "0.9"
+PosteriorStats = "0.4"
+HypothesisTests = "0.12"
+GLM = "1"
+
+# Persistence.
+JLD2 = "0.6"
+DuckDB = "1.5"
+FlexiChains = "0.6"
+
+# Build / package plumbing.
+Reexport = "1.2"
+PrecompileTools = "1.3"
+
+  # Weak dependencies (BSTMPlotsExt).
+  Plots = "1"
+  StatsPlots = "0.15"
+  ColorSchemes = "3"
+
+
 

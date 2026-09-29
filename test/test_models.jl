@@ -232,9 +232,9 @@ end
     @test haskey(res_gibbs, :parameters)
 
     # Test parameter name resolution with Parameter(...) and parameters. wrappers
-    raw_wrapped_names = ["Parameter(sigma_s_idx)", "Parameter(ure_s_idx[1])", "parameters.beta", "intercept"]
+    raw_wrapped_names = ["Parameter(sigma_s_idx)", "Parameter(innovations_s_idx[1])", "parameters.beta", "intercept"]
     @test bstm._find_parameter(raw_wrapped_names, "sigma_s_idx") == "sigma_s_idx"
-    @test bstm._find_parameter(raw_wrapped_names, "ure_s_idx") == "ure_s_idx"
+    @test bstm._find_parameter(raw_wrapped_names, "innovations_s_idx") == "innovations_s_idx"
     @test bstm._find_parameter(raw_wrapped_names, "beta") == "beta"
     @test bstm._find_parameter(raw_wrapped_names, "intercept") == "intercept"
 
@@ -248,10 +248,10 @@ end
     @test length(sampled_vec) == 10
 
     # Test extract_param_matrix and extract_param_vector
-    mock_chain_dict = Dict(:sigma_s_idx => [0.5, 0.6, 0.7], :ure_s_idx => [[0.1, 0.2], [0.3,
+    mock_chain_dict = Dict(:sigma_s_idx => [0.5, 0.6, 0.7], :innovations_s_idx => [[0.1, 0.2], [0.3,
         0.4], [0.5, 0.6]])
     @test size(bstm.extract_param_matrix(mock_chain_dict, :sigma_s_idx), 1) == 3
-    @test size(bstm.extract_param_matrix(mock_chain_dict, :ure_s_idx), 2) == 2
+    @test size(bstm.extract_param_matrix(mock_chain_dict, :innovations_s_idx), 2) == 2
     @test length(bstm.extract_param_vector(mock_chain_dict, :sigma_s_idx)) == 3
 
     # Test multi-chain scalar parameter collapsing
@@ -319,22 +319,29 @@ end
     @test haskey(res_offset, :model)
     @test haskey(res_offset, :chain)
 
-    # Test separate bstm_plots statement with data and spatial areal units (au)
-    plot_dir = mktempdir()
-    plots_res = bstm.bstm_plots(res_offset; data=df_offset, au=au_test, save_dir=plot_dir)
-    @test haskey(plots_res.plots, :posterior_predictive_check)
-    @test haskey(plots_res.plots, :fixed_effects)
-    @test haskey(plots_res.plots, :spatial)
-    @test haskey(plots_res.plots, :spatial_observed)
-    @test haskey(plots_res.plots, :spatial_fitted)
-    @test haskey(plots_res.plots, :temporal)
-    @test haskey(plots_res.plots, :spacetime_predictions)
-    @test haskey(plots_res.plots_data, :spacetime_predictions)
-    @test isfile(joinpath(plot_dir, "posterior_predictive_check.png"))
-    @test !isfile(joinpath(plot_dir, "posterior_predictive_check.png.png"))
-    @test isfile(joinpath(plot_dir, "spacetime_predictions.png"))
+    # Test separate bstm_plots statement with data and spatial areal units (au).
+    # `bstm_plots` lives in the `BSTMPlotsExt` package extension and only exists once the
+    # optional plotting stack (Plots/StatsPlots/ColorSchemes) is installed.
+    if HAS_PLOTTING
+        plot_dir = scratch_dir()
+        plots_res = bstm.bstm_plots(res_offset; data=df_offset, au=au_test, save_dir=plot_dir)
+        @test haskey(plots_res.plots, :posterior_predictive_check)
+        @test haskey(plots_res.plots, :fixed_effects)
+        @test haskey(plots_res.plots, :spatial)
+        @test haskey(plots_res.plots, :spatial_observed)
+        @test haskey(plots_res.plots, :spatial_fitted)
+        @test haskey(plots_res.plots, :temporal)
+        @test haskey(plots_res.plots, :spacetime_predictions)
+        @test haskey(plots_res.plots_data, :spacetime_predictions)
+        @test isfile(joinpath(plot_dir, "posterior_predictive_check.png"))
+        @test !isfile(joinpath(plot_dir, "posterior_predictive_check.png.png"))
+        @test isfile(joinpath(plot_dir, "spacetime_predictions.png"))
 
-    # Test positional data argument
-    plots_res_pos = bstm.bstm_plots(res_offset, df_offset; au=au_test)
-    @test haskey(plots_res_pos.plots, :posterior_predictive_check)
+        # Test positional data argument
+        plots_res_pos = bstm.bstm_plots(res_offset, df_offset; au=au_test)
+        @test haskey(plots_res_pos.plots, :posterior_predictive_check)
+    else
+        @test_skip false
+        @info "Skipping bstm_plots checks: optional plotting stack not installed."
+    end
 end

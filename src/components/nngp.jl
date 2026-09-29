@@ -44,7 +44,7 @@ and \$\\mathcal{O}(N m)\$ memory, scaling to \$N > 10^5\$ without inducing point
 - **Optional**:
   - `sigma`: `UnivariateDistribution`, prior for marginal standard deviation. Default:
     `Exponential(1.0)`.
-  - `lengthscale`: `UnivariateDistribution`, prior for spatial correlation lengthscale.
+  - `length_scale`: `UnivariateDistribution`, prior for spatial correlation length_scale.
     Default: `LogNormal(0.0, 1.0)`.
   - `m`: `Int`, number of nearest neighbors (default: 10).
   - `kernel`: `Symbol`, covariance kernel (`:exponential`, `:matern32`, `:matern52`, `:se`).
@@ -53,9 +53,9 @@ and \$\\mathcal{O}(N m)\$ memory, scaling to \$N > 10^5\$ without inducing point
 
 # Outputs (Parameter Names)
 - `sigma_<key>`: Marginal spatial standard deviation.
-- `ls_<key>`: Spatial correlation lengthscale.
-- `ure_<key>`: Standard normal innovations vector (\$N\$ elements).
-- `sre_<key>`: Realized NNGP spatial field.
+- `ls_<key>`: Spatial correlation length_scale.
+- `innovations_<key>`: Standard normal innovations vector (\$N\$ elements).
+- `latent_field_<key>`: Realized NNGP spatial field.
 
 # Key References
 - Datta, A., Banerjee, S., Finley, A. O., & Gelfand, A. E. (2016). *Hierarchical
@@ -67,7 +67,7 @@ and \$\\mathcal{O}(N m)\$ memory, scaling to \$N > 10^5\$ without inducing point
 """
 struct NNGP <: ComponentModel
     sigma::UnivariateDistribution
-    lengthscale::UnivariateDistribution
+    length_scale::UnivariateDistribution
     m::Int
     kernel::Symbol
     order::Symbol
@@ -78,7 +78,7 @@ COMPONENT_TYPE_REGISTRY[:nngp] = NNGP
 
 COMPONENT_CONSTRUCTORS[:nngp] = (p, params) -> NNGP(
     get(p, :sigma, Exponential(1.0)),
-    get(p, :lengthscale, get(p, :ls, LogNormal(0.0, 1.0))),
+    get(p, :length_scale, LogNormal(0.0, 1.0)),
     get(params, :m, 10),
     get(params, :kernel, :exponential),
     get(params, :order, :x),
@@ -175,8 +175,8 @@ function get_priors(
 
     return """
     $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.ls) ~ $(_distribution_to_string(m.lengthscale))
-    $(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)
+    $(p_names.length_scale) ~ $(_distribution_to_string(m.length_scale))
+    $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
     """
 end
 
@@ -206,11 +206,11 @@ function get_updates(
 
     return """
     # --- Nearest Neighbor Gaussian Process (NNGP): $(key) ---
-    $(p_names.sre) = let
+    $(p_names.latent_field) = let
         N_nngp = $(N)
         sig = $(p_names.sigma)
-        ls_val = $(p_names.ls)
-        u_raw = $(p_names.ure)
+        ls_val = $(p_names.length_scale)
+        u_raw = $(p_names.innovations)
         
         nn_idx = spec_registry[:$(key)].hyper.nn_indices
         nn_d_tgt = spec_registry[:$(key)].hyper.nn_dists_target
@@ -255,7 +255,7 @@ function get_updates(
         w_sorted[inv_ord]
     end
 
-    $(eta_target) = $(eta_target) .+ $(p_names.sre)
+    $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
     """
 end
 
@@ -265,8 +265,8 @@ function get_effects(
 )::NamedTuple
     v = generate_full_variable_names(spec, M.model_arch, 1)
     sig_samples = get_param_samples(chain, M.param_registry, Symbol(v.sigma))
-    ls_samples = get_param_samples(chain, M.param_registry, Symbol(v.ls))
-    ure_samples = get_param_samples(chain, M.param_registry, Symbol(v.ure))
+    length_scale_samples = get_param_samples(chain, M.param_registry, Symbol(v.length_scale))
+    innovations_samples = get_param_samples(chain, M.param_registry, Symbol(v.innovations))
 
     N = spec.hyper.N
     effect_matrix = zeros(Float64, N, n_samples)
@@ -278,8 +278,8 @@ function get_effects(
 
     for s in 1:n_samples
         sig = sig_samples[s]
-        ls_val = ls_samples[s]
-        u_raw = ure_samples[:, s]
+        ls_val = length_scale_samples[s]
+        u_raw = innovations_samples[:, s]
 
         w_s = zeros(Float64, N)
         w_s[1] = sig * u_raw[1]

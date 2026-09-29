@@ -283,7 +283,7 @@ end
 """
     _apply_multivariate_correlation(eta_latent, chain, outcomes_N)
 
-Applies the estimated Cholesky correlation factor `L_corr` to independent multivariate
+Applies the estimated Cholesky correlation factor `correlation_cholesky` to independent multivariate
   latent fields.
 """
 function _apply_multivariate_correlation(eta_latent, chain, outcomes_N)
@@ -291,7 +291,7 @@ function _apply_multivariate_correlation(eta_latent, chain, outcomes_N)
         return eta_latent
     end
     N_tot, n_samples, _ = size(eta_latent)
-    L_corr_samples = get_params_vector(chain, "L_corr", outcomes_N * outcomes_N)
+    L_corr_samples = get_params_vector(chain, "correlation_cholesky", outcomes_N * outcomes_N)
     eta_final = zeros(N_tot, n_samples, outcomes_N)
     for s in 1:n_samples
         L_s = reshape(L_corr_samples[s, :], outcomes_N, outcomes_N)
@@ -332,7 +332,7 @@ function _summarize_effects_registry(registry, M, outcomes_N, alpha)
             end
             
             summaries_final = outcomes_N > 1 ? [NamedTuple(s) for s in summaries_per_outcome] : NamedTuple(summaries_per_outcome[1])
-            mixed_effects_summaries[key] = (group_var=M.components[spec_idx].var,
+            mixed_effects_summaries[key] = (grouping_covariate=M.components[spec_idx].var,
                 summaries=summaries_final)
         else
             # --- Handle Standard Components ---
@@ -514,10 +514,10 @@ function _discover_component_realizations(
     # --- Spatiotemporal Interaction Effects ---
     st_interaction_effects_samples = zeros(Float64, M.s_N * M.t_N, n_samples, outcomes_N)
     if get(M, :model_st, "none") != "none"
-        param_name_base = any(p -> occursin("ure_st_interaction", string(p)),
-            p_names) ? "ure_st_interaction" : "st_interaction_raw"
+        param_name_base = any(p -> occursin("innovations_st_interaction", string(p)),
+            p_names) ? "innovations_st_interaction" : "st_interaction_raw"
         sigma_name_base = any(p -> occursin("sigma_st_interaction", string(p)),
-            p_names) ? "sigma_st_interaction" : "st_interaction_sigma"
+            p_names) ? "sigma_st_interaction" : "sigma_st_interaction"
         has_param = any(p -> occursin(param_name_base, string(p)), p_names)
         has_sigma = any(p -> occursin(sigma_name_base, string(p)), p_names)
         if has_param && has_sigma
@@ -696,10 +696,10 @@ function _reconstruct(
     end
 
     # --- 4. Apply Correlation Structure ---
-    l_corr_name = !isempty(prefix) ? "L_corr_$(prefix)" : "L_corr"
-    L_corr_samples = get_params_matrix(chain, l_corr_name, outcomes_N_val * outcomes_N_val)
+    correlation_cholesky_name = !isempty(prefix) ? "L_corr_$(prefix)" : "correlation_cholesky"
+    L_corr_samples = get_params_matrix(chain, correlation_cholesky_name, outcomes_N_val * outcomes_N_val)
     if isempty(L_corr_samples) && !isempty(prefix)
-        L_corr_samples = get_params_matrix(chain, "L_corr", outcomes_N_val * outcomes_N_val)
+        L_corr_samples = get_params_matrix(chain, "correlation_cholesky", outcomes_N_val * outcomes_N_val)
     end
     eta_post = similar(eta_latent_post)
     for s in 1:n_samples_val
@@ -1990,9 +1990,9 @@ function _compute_direct_parameter_summary(chain::Any, model=nothing; alpha=0.05
                 # Effective sample size via autocorrelation
                 if n_total >= 10 && s_val > 1e-12
                     try
-                        rho1 = StatsBase.autocor(valid_v, [1])[1]
-                        if !isnan(rho1) && rho1 < 0.99 && rho1 > -0.99
-                            act = (1.0 + rho1) / (1.0 - rho1)
+                        rho_regime_1 = StatsBase.autocor(valid_v, [1])[1]
+                        if !isnan(rho_regime_1) && rho_regime_1 < 0.99 && rho_regime_1 > -0.99
+                            act = (1.0 + rho_regime_1) / (1.0 - rho_regime_1)
                             ess_val = clamp(n_total / act, 1.0, Float64(n_total))
                         end
                     catch

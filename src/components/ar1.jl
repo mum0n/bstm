@@ -45,8 +45,8 @@ controlled by the `method` parameter in the `random()` call:
 - `rho_unconstrained_<key>`: The unconstrained parameter sampled by Turing.
 - `rho_<key>`: The transformed autocorrelation parameter, `tanh(rho_unconstrained_<key>)`.
 - `sigma_<key>`: The standard deviation of the AR1 innovations.
-- `ure_<key>`: Standard normal innovations driving the process.
-- `sre_<key>`: Reconstructed temporal latent field.
+- `innovations_<key>`: Standard normal innovations driving the process.
+- `latent_field_<key>`: Reconstructed temporal latent field.
 
 # Key References
 - Hamilton, J. D. (1994). *Time Series Analysis*. Princeton University Press.
@@ -223,11 +223,11 @@ function get_priors(
         )
     end
 
-    # The innovations (ure) are only sampled if the method is not marginalized.
+    # The innovations (innovations) are only sampled if the method is not marginalized.
     if m.method in [:statespace, :spectral]
         push!(
             priors_acc,
-            "$(p_names.ure) ~ MvNormal(zeros(T, $(n_latent)), I)"
+            "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)"
         )
     end
     
@@ -252,10 +252,10 @@ function get_updates(
     statespace_code = """
         # --- AR1 Component (State-Space): $(key) ---
         rho = tanh($(p_names.rho_unconstrained))
-        $(p_names.sre) = ar1_statespace(
-            rho, $(p_names.sigma), $(p_names.ure), $(n_latent), M.noise
+        $(p_names.latent_field) = ar1_statespace(
+            rho, $(p_names.sigma), $(p_names.innovations), $(n_latent), M.noise
         )
-        $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
+        $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.$(index_var))
     """
 
     spectral_code = """
@@ -267,8 +267,8 @@ function get_updates(
             L_base = hyper.L
             lambda_vals = (one(T) + rho^2) .+ rho .* L_base
             diag_D = $(p_names.sigma) ./ sqrt.(lambda_vals .+ M.noise)
-            $(p_names.sre) = U * (diag_D .* $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
+            $(p_names.latent_field) = U * (diag_D .* $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.$(index_var))
         end
     """
 
@@ -279,8 +279,8 @@ function get_updates(
             K = _ar1_covariance_matrix(
                 rho, $(p_names.sigma), $(n_latent), M.noise
             )
-            $(p_names.sre) ~ MvNormal(zeros(T, $(n_latent)), Symmetric(K))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.$(index_var))
+            $(p_names.latent_field) ~ MvNormal(zeros(T, $(n_latent)), Symmetric(K))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.$(index_var))
         end
     """
 
@@ -362,19 +362,14 @@ function get_effects(
         latent_field_samples = zeros(Float64, t_N_full, n_samples)
         
         if m.method in [:statespace, :spectral]
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "Innovations (ure) for AR1 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            ure_samples = get_params_matrix(chain, ure_name, t_N_train)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_samples = get_params_matrix(chain, innovations_name, t_N_train)
             
             if m.method == :statespace
                 for j in 1:n_samples
                     latent_field_train_j = ar1_statespace(
                         rho_samples[j], sigma_samples[j],
-                        ure_samples[j, :], t_N_train, noise_val
+                        innovations_samples[j, :], t_N_train, noise_val
                     )
                     latent_field_samples[1:t_N_train, j] = latent_field_train_j
                 end
@@ -385,19 +380,14 @@ function get_effects(
                 for j in 1:n_samples
                     lambda_vals = (1.0 + rho_samples[j]^2) .+ rho_samples[j] .* L_base
                     diag_D = sigma_samples[j] ./ sqrt.(lambda_vals .+ noise_val)
-                    latent_field_samples[1:t_N_train, j] = U * (diag_D .* ure_samples[j, :])
+                    latent_field_samples[1:t_N_train, j] = U * (diag_D .* innovations_samples[j, :])
                 end
             end
 
         elseif m.method == :centered
-            sre_name = _find_parameter(p_names, string(p_names_k.sre), k, is_multivariate_model)
-            if isempty(sre_name)
-                @warn "Structured field (sre) for AR1 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            sre_samples = get_params_matrix(chain, sre_name, t_N_train)
-            latent_field_samples[1:t_N_train, :] = sre_samples'
+            latent_field_name = _find_parameter(p_names, string(p_names_k.latent_field), k, is_multivariate_model)
+            latent_field_samples = get_params_matrix(chain, latent_field_name, t_N_train)
+            latent_field_samples[1:t_N_train, :] = latent_field_samples'
 
         elseif m.method == :marginalized
             # Exact conditional Gaussian simulation for marginalized GMRF
@@ -465,16 +455,16 @@ function get_effects(
 end
 
 """
-    ar1_statespace(rho, sigma, ure, n_latent, noise)
+    ar1_statespace(rho, sigma, innovations, n_latent, noise)
 
 Computes the state-space evolution of a stationary AR(1) process. This is a CPU-only
   implementation.
 """
 function ar1_statespace(
-    rho, sigma, ure::AbstractVector, n_latent::Int, noise
+    rho, sigma, innovations::AbstractVector, n_latent::Int, noise
 )
     T_num = promote_type(
-        typeof(rho), typeof(sigma), eltype(ure), typeof(noise)
+        typeof(rho), typeof(sigma), eltype(innovations), typeof(noise)
     )
     latent = Vector{T_num}(undef, n_latent)
     if n_latent == 0
@@ -483,9 +473,9 @@ function ar1_statespace(
 
     if n_latent > 0
         # The denominator is protected from being zero or negative by the `noise` term.
-        latent[1] = ure[1] / sqrt(one(T_num) - rho^2 + T_num(noise))
+        latent[1] = innovations[1] / sqrt(one(T_num) - rho^2 + T_num(noise))
         for t in 2:n_latent
-            latent[t] = rho * latent[t-1] + ure[t]
+            latent[t] = rho * latent[t-1] + innovations[t]
         end
         latent .*= sigma
     end

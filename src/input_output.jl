@@ -10,8 +10,128 @@ Version: v1.0.0
 using Dates, Printf
 
 # ==============================================================================
+# PREDICTIVE-SD RECOVERY HELPERS
+#
+# The DuckDB predictions table persists a per-observation posterior predictive SD.
+# Databases written before that column existed (and any result object whose
+# `predictions.denoised` carries no `std`) only have credible-interval bounds, from
+# which a SD can be recovered by inverting the symmetric 95% width. The helpers below
+# are the single implementation of that recovery, shared by the writer and the reader
+# so the two can never disagree about which SD was actually stored.
+# ==============================================================================
+
+# 97.5th standard-normal quantile, i.e. the ±z half-width of a two-sided 95%
+# interval. Defined once so the writer and reader cannot drift to different levels.
+const Z975 = 1.959963984540054
+
+# Relative midpoint drift above which a credible interval is considered too
+# asymmetric for the width inversion to be trustworthy.
+const INTERVAL_ASYMMETRY_TOL = 0.05
+
+_as_float(v) = v isa Real ? Float64(v) : NaN
+
+"""
+    _recover_pred_sd(sd, lower, upper, mean) -> (sd::Vector{Float64}, source::Symbol)
+
+Resolve the per-observation predictive SD from whatever is actually available,
+preferring the model's own `std` and falling back to the 95% interval width
+`sd = (upper - lower) / (2 * Z975)`.
+
+The choice is made per observation, so a single unusable entry cannot discard a
+whole model's real predictive SD. Returns the resolved vector together with a
+provenance tag:
+
+- `:model`          every observation came from a genuine `std`.
+- `:interval_width` at least one observation came from the width inversion.
+- `:missing`        neither was usable; the returned vector is all `NaN`.
+
+Non-numeric entries (`missing`, `nothing`) are treated as unusable rather than
+raising, so a partially-populated column degrades instead of failing.
+"""
+function _recover_pred_sd(sd, lower, upper, mean::AbstractVector)
+    n = length(mean)
+    out = fill(NaN, n)
+    n_from_sd = 0
+    n_from_iv = 0
+
+    if sd !== nothing && length(sd) == n
+        @inbounds for i in 1:n
+            v = _as_float(sd[i])
+            if isfinite(v)
+                out[i] = v
+                n_from_sd += 1
+            end
+        end
+    end
+
+    if lower !== nothing && upper !== nothing &&
+            length(lower) == n && length(upper) == n
+        @inbounds for i in 1:n
+            lo = _as_float(lower[i])
+            hi = _as_float(upper[i])
+            if !isfinite(out[i]) && isfinite(lo) && isfinite(hi) && hi > lo
+                out[i] = (hi - lo) / (2 * Z975)
+                n_from_iv += 1
+            end
+        end
+    end
+
+    source = if n_from_sd == n
+        :model
+    elseif n_from_iv > 0
+        :interval_width
+    else
+        :missing
+    end
+    return out, source
+end
+
+"""
+    _interval_asymmetry(lower, upper, mean) -> Float64
+
+Largest relative distance between each interval's midpoint and the corresponding
+prediction mean. The `±Z975*σ` width inversion is only valid for symmetric,
+roughly normal intervals, so a large value means the recovered SD is biased and
+the caller should say so instead of returning a number that looks authoritative.
+"""
+function _interval_asymmetry(lower, upper, mean::AbstractVector)
+    n = length(mean)
+    if lower === nothing || upper === nothing ||
+            length(lower) != n || length(upper) != n
+        return 0.0
+    end
+    worst = 0.0
+    @inbounds for i in 1:n
+        lo = _as_float(lower[i])
+        hi = _as_float(upper[i])
+        mu = _as_float(mean[i])
+        if isfinite(lo) && isfinite(hi) && isfinite(mu)
+            mid = (lo + hi) / 2
+            rel = abs(mid - mu) / max(abs(mu), eps(Float64))
+            rel > worst && (worst = rel)
+        end
+    end
+    return worst
+end
+
+# ==============================================================================
 # SECTION 1: JLD2 MODEL STATE PERSISTENCE
 # ==============================================================================
+
+"""
+    BSTM_SCHEMA_VERSION
+
+Version of the on-disk bundle layout written by [`save_bstm_model`](@ref).
+
+This is deliberately separate from the package version. It changes only when the shape
+of a saved bundle changes, so a reader can tell "written by an older bstm" (same layout,
+possibly missing fields) from "written by a newer bstm whose layout I do not understand".
+
+A bundle records the version that wrote it; [`load_bstm_model`](@ref) refuses a bundle
+newer than this, and accepts an older one with a warning, rather than failing later with
+an unrelated error about a missing field.
+"""
+const BSTM_SCHEMA_VERSION = 2
 
 """
     save_bstm_model(filepath::AbstractString, model::DynamicPPL.Model; 
@@ -56,7 +176,7 @@ function save_bstm_model(
     # Package clean serializable configuration without redundant handles
     meta_info = merge(Dict(
         "created_at" => string(now()),
-        "bstm_version" => "1.0.0",
+        "schema_version" => BSTM_SCHEMA_VERSION,
         "formula" => string(get(M, :formula, "")),
         "model_arch" => string(get(M, :model_arch, "univariate")),
         "family" => string(get(M, :family, :gaussian)),
@@ -65,15 +185,22 @@ function save_bstm_model(
         "has_au" => !isnothing(au)
     ), Dict(string(k) => v for (k, v) in metadata))
 
-    # Strip runtime function handles from spec_registry for clean JLD2 serialization
+    # Strip runtime function handles from spec_registry for clean JLD2 serialization.
+    # What was dropped is recorded rather than discarded silently: a function that turns
+    # out to have mattered is then visible in the bundle instead of showing up later as
+    # an unexplained missing field.
     clean_spec_reg = Dict{Symbol, Any}()
+    dropped = String[]
     for (k, v) in pairs(spec_registry)
         if v isa Function
+            push!(dropped, string(k))
             continue
         elseif v isa Dict
             sub_dict = Dict{Symbol, Any}()
             for (sk, sv) in pairs(v)
-                if !(sv isa Function)
+                if sv isa Function
+                    push!(dropped, "$(k).$(sk)")
+                else
                     sub_dict[sk] = sv
                 end
             end
@@ -82,6 +209,7 @@ function save_bstm_model(
             clean_spec_reg[k] = v
         end
     end
+    meta_info["dropped_spec_registry_keys"] = join(sort(dropped), ", ")
 
     # Extract W matrix if present
     W_mat = haskey(M, :W) ? M.W : (haskey(M, :technical) && haskey(M.technical, :W) ?
@@ -95,10 +223,11 @@ function save_bstm_model(
         spec_registry = clean_spec_reg,
         chain = chain,
         au = au,
+        schema_version = BSTM_SCHEMA_VERSION,
         metadata = meta_info
     )
 
-    @info "BSTM model successfully saved to '$filepath'."
+    @info "BSTM model successfully saved to '$filepath' (schema v$BSTM_SCHEMA_VERSION)."
     return filepath
 end
 
@@ -138,7 +267,23 @@ function load_bstm_model(filepath::AbstractString; calling_module::Module=Main)
     chain = haskey(f, "chain") ? f["chain"] : nothing
     au = haskey(f, "au") ? f["au"] : nothing
     meta = haskey(f, "metadata") ? f["metadata"] : Dict()
+    # Bundles written before schema versioning (v1) carry no top-level marker; they are
+    # layout-compatible, so treat a missing marker as v1 rather than as an error.
+    schema = haskey(f, "schema_version") ? Int(f["schema_version"]) :
+        Int(get(meta, "schema_version", 1))
     close(f)
+
+    if schema > BSTM_SCHEMA_VERSION
+        error(
+            "'$filepath' was written with bstm bundle schema v$schema, but this version " *
+            "of bstm only understands up to v$BSTM_SCHEMA_VERSION. Upgrade bstm to read it.")
+    elseif schema < BSTM_SCHEMA_VERSION
+        @warn "Bundle '$filepath' uses schema v$schema, older than the current v$BSTM_SCHEMA_VERSION. Loading may lose fields added since."
+    end
+    dropped = get(meta, "dropped_spec_registry_keys", "")
+    if !isempty(dropped)
+        @warn "Bundle '$filepath' omits non-serializable spec_registry entries: $dropped"
+    end
 
     # Re-instantiate the live Turing Model using bstm_core
     kwargs = Dict{Symbol, Any}()
@@ -153,7 +298,7 @@ function load_bstm_model(filepath::AbstractString; calling_module::Module=Main)
     # Reconstruct live model
     live_model = bstm_core(formula_str, data_df, calling_module; kwargs...)
 
-    @info "BSTM model successfully loaded and instantiated from '$filepath'."
+    @info "BSTM model successfully loaded and instantiated from '$filepath' (schema v$schema)."
     return (
         model = live_model,
         chain = chain,
@@ -268,11 +413,23 @@ function save_bstm_results(
           res.predictions.denoised : nothing
         if !isnothing(preds) && preds isa NamedTuple && hasproperty(preds, :mean)
             N = length(preds.mean)
+            pred_lower = hasproperty(preds, :lower) ? preds.lower : fill(NaN, N)
+            pred_upper = hasproperty(preds, :upper) ? preds.upper : fill(NaN, N)
+            # `pred_sd` is the within-model posterior predictive SD required by
+            # `bma_weighted_predictions` to apply the law of total variance.
+            pred_sd_col, sd_source = _recover_pred_sd(
+                hasproperty(preds, :std) ? preds.std : nothing,
+                pred_lower, pred_upper, preds.mean)
             df_preds = DataFrame(
                 obs_id = 1:N,
                 pred_mean = preds.mean,
-                pred_lower = hasproperty(preds, :lower) ? preds.lower : fill(NaN, N),
-                pred_upper = hasproperty(preds, :upper) ? preds.upper : fill(NaN, N)
+                pred_sd = pred_sd_col,
+                # Record where the SD came from. Without this, a width-derived
+                # approximation is indistinguishable from the model's real predictive
+                # SD once it has been round-tripped through this table.
+                pred_sd_source = fill(string(sd_source), N),
+                pred_lower = pred_lower,
+                pred_upper = pred_upper
             )
             y_obs_vec = if hasproperty(res.predictions, :observed) &&
               !isnothing(res.predictions.observed)
@@ -386,10 +543,19 @@ function load_bstm_results(duckdb_path::AbstractString; table_prefix::String="")
         # 3. Load Predictions
         try
             df_p = DataFrame(DuckDB.query(con, "SELECT * FROM $(pfx)predictions"))
+            lower = hasproperty(df_p, :pred_lower) ? df_p.pred_lower : fill(NaN, nrow(df_p))
+            upper = hasproperty(df_p, :pred_upper) ? df_p.pred_upper : fill(NaN, nrow(df_p))
+            # Re-derive rather than trusting a stored value blindly: a `pred_sd` column
+            # may be absent (older database) or only partially populated.
+            sd, sd_source = _recover_pred_sd(
+                hasproperty(df_p, :pred_sd) ? df_p.pred_sd : nothing,
+                lower, upper, df_p.pred_mean)
             preds_dict[:denoised] = (
                 mean = df_p.pred_mean,
-                lower = df_p.pred_lower,
-                upper = df_p.pred_upper
+                std = sd,
+                std_source = string(sd_source),
+                lower = lower,
+                upper = upper
             )
         catch
         end
@@ -434,7 +600,7 @@ and returns the result as a DataFrame.
 # Example
 ```julia
 df_high_risk = query_duckdb("output/results.duckdb", 
-    "SELECT * FROM bstm_plot_data_sre_spatial WHERE sre_mean > 1.5 ORDER BY sre_mean DESC")
+    "SELECT * FROM bstm_plot_data_latent_field_spatial WHERE latent_field_mean > 1.5 ORDER BY latent_field_mean DESC")
 ```
 """
 function query_duckdb(duckdb_path::AbstractString, sql_query::AbstractString)::DataFrame
@@ -529,8 +695,8 @@ function export_spatial_results_to_geojson(
     S = length(cents)
 
     # Extract spatial DataFrame from plots_data or pstats
-    df_spatial = if hasproperty(res, :plots_data) && hasproperty(res.plots_data, :sre_spatial)
-        res.plots_data.sre_spatial
+    df_spatial = if hasproperty(res, :plots_data) && hasproperty(res.plots_data, :latent_field_spatial)
+        res.plots_data.latent_field_spatial
     else
         DataFrame(unit_id = 1:S)
     end
@@ -747,6 +913,11 @@ end
 Computes Bayesian Model Averaged (BMA) predictions across all candidate models
 registered in the DuckDB database using their normalized WAIC weights.
 
+The BMA predictive variance follows the law of total variance,
+`Var = Σ_k w_k [ σ²_k + (μ_k - μ̄)² ]`, combining each model's own predictive
+variance (`pred_sd`, or the 95% interval width for databases written before that
+column existed) with the between-model spread of the means.
+
 Returns a DataFrame with `(obs_id, bma_pred_mean, bma_pred_sd)`.
 """
 function bma_weighted_predictions(duckdb_path::AbstractString)::DataFrame
@@ -760,14 +931,16 @@ function bma_weighted_predictions(duckdb_path::AbstractString)::DataFrame
     # Fetch predictions for each model
     preds_list = DataFrame[]
     weights = Float64[]
+    model_names = String[]
 
     for row in eachrow(df_reg)
         m_name = string(row.model_name)
         w = Float64(row.bma_weight)
-        df_p = query_duckdb(duckdb_path, "SELECT obs_id, pred_mean FROM " *
-          "$(m_name)_predictions ORDER BY obs_id")
+        # `SELECT *` so that databases written before the `pred_sd` column existed still load.
+        df_p = query_duckdb(duckdb_path, "SELECT * FROM $(m_name)_predictions ORDER BY obs_id")
         push!(preds_list, df_p)
         push!(weights, w)
+        push!(model_names, m_name)
     end
 
     N = nrow(preds_list[1])
@@ -778,9 +951,43 @@ function bma_weighted_predictions(duckdb_path::AbstractString)::DataFrame
         bma_mean .+= w .* df_p.pred_mean
     end
 
-    # Law of Total Variance
-    for (df_p, w) in zip(preds_list, weights)
-        bma_var .+= w .* (df_p.pred_mean .- bma_mean).^2
+    # Law of total variance:
+    #   Var(y) = Σ_k w_k [ σ²_k + (μ_k - μ̄)² ]
+    # The first term is the *within-model* predictive variance and the second is the
+    # *between-model* spread. Omitting the first term (as this function previously did)
+    # collapses the BMA SD to zero whenever the candidate models agree on the mean,
+    # even if every one of them is wildly uncertain.
+    for (df_p, w, m_name) in zip(preds_list, weights, model_names)
+        lower = hasproperty(df_p, :pred_lower) ? df_p.pred_lower : nothing
+        upper = hasproperty(df_p, :pred_upper) ? df_p.pred_upper : nothing
+        sd_k, sd_source = _recover_pred_sd(
+            hasproperty(df_p, :pred_sd) ? df_p.pred_sd : nothing,
+            lower, upper, df_p.pred_mean)
+
+        if sd_source == :interval_width
+            # This database predates the `pred_sd` column, or the model produced no
+            # `std`. Say so: the value is an approximation, and it is only trustworthy
+            # when the interval is close to symmetric.
+            asym = _interval_asymmetry(lower, upper, df_p.pred_mean)
+            if asym > INTERVAL_ASYMMETRY_TOL
+                @warn "Model '$(m_name)' has no stored `pred_sd`; its predictive SD was " *
+                      "derived from a credible interval whose midpoint is up to " *
+                      "$(round(asym * 100; digits=1))% from the mean, so the symmetric " *
+                      "±$(Z975)σ width inversion is biased. Re-fit the model to populate " *
+                      "`pred_sd` before relying on `bma_pred_sd`."
+            else
+                @info "Model '$(m_name)' has no stored `pred_sd`; deriving its predictive " *
+                      "SD from the 95% credible interval width (±$(Z975)σ). Treat the " *
+                      "resulting `bma_pred_sd` as approximate."
+            end
+        elseif sd_source == :missing
+            @warn "Model '$(m_name)' has no usable predictive SD (no `pred_sd` and no " *
+                  "valid interval bounds); it contributes only its between-model spread " *
+                  "to `bma_pred_sd`."
+            sd_k = zeros(Float64, N)
+        end
+
+        bma_var .+= w .* (sd_k .^ 2 .+ (df_p.pred_mean .- bma_mean) .^ 2)
     end
 
     return DataFrame(
@@ -1147,7 +1354,11 @@ function Base.getindex(b::PriorPosteriorBundle, dist_type::Symbol, target::Symbo
         return obj[valid_rows, :]
     elseif obj isa AbstractMatrix
         return obj[rows, :]
-    elseif obj isa MCMCChains.Chains
+    elseif obj isa AbstractArray && ndims(obj) >= 3
+        # 3D chain containers (e.g. `MCMCChains.Chains` is `[iterations, params, chains]`,
+        # `FlexiChains.VNChain` is `[iterations, chains]`) index on the leading dimension.
+        # MCMCChains is an optional (undeclared) dependency, so dispatch structurally
+        # rather than on its concrete type to avoid an `UndefVarError` at runtime.
         return obj[rows, :, :]
     else
         return obj[rows]

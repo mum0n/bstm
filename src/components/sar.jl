@@ -183,7 +183,7 @@ function get_priors(
         return """
             $(p_names.rho) ~ $(rho_prior_str)
             $(p_names.sigma) ~ $(sigma_prior_str)
-            $(p_names.ure) ~ MvNormal(
+            $(p_names.innovations) ~ MvNormal(
                 zeros(T, spec_registry[:$(key)].hyper.n_latent), I
             )
         """
@@ -207,8 +207,8 @@ function get_updates(
         # --- SAR Component (Direct Autoregressive Solve, AD-Safe): $(key) ---
         let
             $(common_code)
-            $(p_names.sre) = L_op \\ ($(p_names.sigma) .* $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = L_op \\ ($(p_names.sigma) .* $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -216,8 +216,8 @@ function get_updates(
         # --- SAR Component (Direct Autoregressive Solve, Sparse): $(key) ---
         let
             $(common_code)
-            $(p_names.sre) = L_op \\ ($(p_names.sigma) .* $(p_names.ure))
-            $(eta_target) = $(eta_target) .+ view($(p_names.sre), M.s_idx)
+            $(p_names.latent_field) = L_op \\ ($(p_names.sigma) .* $(p_names.innovations))
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
     """
 
@@ -346,18 +346,13 @@ function get_effects(
                 latent_field_matrix[:, s] = mu .+ sqrt(max(scale, 1e-12)) .* (F.U \ z)
             end
         else
-            ure_name = _find_parameter(p_names, string(p_names_k.ure), k, is_multivariate_model)
-            if isempty(ure_name)
-                @warn "ure for SAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-                push!(structured_effects, zeros(Float64, N_total, n_samples))
-                continue
-            end
-            ure_samples = get_params_matrix(chain, ure_name, n_latent)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_latent)
 
             for s in 1:n_samples
                 rho = rho_samples[s]
                 sigma = sigma_samples[s]
-                innovations = ure_samples[s, :]
+                innovations = innovations_samples[s, :]
 
                 L_op = I - rho * W_dag
                 Q_sar = Symmetric(Matrix(L_op' * L_op) / (sigma^2) + noise * I)

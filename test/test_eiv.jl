@@ -41,8 +41,8 @@ end
 
         # Verify generated Turing model string contains latent innovation prior
         code_str = m_col_sd.args.M.generated_model_code
-        @test contains(code_str, "ure_eiv_x_obs")
-        @test contains(code_str, "lat_noise = M.Xfixed_eiv_map[:x_obs] .* ure_eiv_x_obs")
+        @test contains(code_str, "innovations_eiv_x_obs")
+        @test contains(code_str, "lat_noise = M.Xfixed_eiv_map[:x_obs] .* innovations_eiv_x_obs")
         @test contains(code_str, "X_lat_x_obs = M.Xfixed[:, 1] .+ lat_noise")
     end
 
@@ -73,13 +73,13 @@ end
         # Sample with NUTS
         chn = sample(m_mixed, NUTS(20, 0.65), 30; progress=false)
 
-        # Verify chains contain beta, intercept, and ure_eiv_substrate
+        # Verify chains contain beta, intercept, and innovations_eiv_substrate
         p_names = string.(keys(chn))
         @test any(p -> occursin("beta", string(p)), p_names)
-        @test any(p -> occursin("ure_eiv_substrate", string(p)), p_names)
+        @test any(p -> occursin("innovations_eiv_substrate", string(p)), p_names)
 
         # Verify sample extraction
-        eiv_samples = bstm.get_params_matrix(chn, "ure_eiv_substrate", N)
+        eiv_samples = bstm.get_params_matrix(chn, "innovations_eiv_substrate", N)
         @test size(eiv_samples) == (30, N)
     end
 
