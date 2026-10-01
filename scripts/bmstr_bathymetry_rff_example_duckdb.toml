@@ -1,0 +1,47 @@
+# ==============================================================================
+# BSTM Model Configuration: Scotian Shelf Bathymetry (DuckDB Output)
+# Model 1: Random Fourier Features (RFF) Continuous Spatial Field
+# Reference: docs/bathymetry/bathymetry.md# Usage:
+#   julia --project=. scripts/bstmr.jl <config.toml> [options]
+#   julia --project=. scripts/bstmr.jl --config=<config.toml> [options]
+#   julia --project=. scripts/bstmr.jl --help
+# ==============================================================================
+
+[metadata]
+name = "scotian_shelf_rff_duckdb"
+description = "Random Fourier Features (RFF) bathymetry model with DuckDB relational output"
+project = "Scotian Shelf Ecosystem Mapping"
+author = "Jae S. Choi"
+
+[environment]
+packages = ["RData"]
+
+[data]
+path = "data/scotian_shelf_bathymetry_subset.rda"
+key = "bathy"
+format = "rda"
+
+[preprocessing]
+# Example: inline Julia preprocessing filtering invalid coordinates or values
+code = "filter(:z => z -> !isnan(z) && z > -1500.0, df)"
+
+[model]
+formula = "likelihood(z, family = gaussian) ~ intercept() + random(plat, plon, model = rff, n_features = 30)"
+verbose = false
+use_gpu = false
+prior_scheme = "pcpriors"
+
+[sampling]
+sample = true
+sampler = "optimal"
+n_samples = 100
+n_warmup = 50
+n_chains = 1
+target_accept = 0.8
+progress = true
+
+[output]
+path = "work/scotian_shelf_rff.duckdb"
+format = "duckdb"
+compress = true
+table_prefix = "rff_"

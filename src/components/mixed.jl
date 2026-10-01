@@ -161,13 +161,12 @@ function get_updates(
             if m.method == :spectral
                 latent_field_code = """
                 diag_D = $(p_names.sigma) ./ sqrt.($(inner_hyper_access).L .+ M.noise)
-                if $(inner_model isa Union{ICAR, Besag, RW1})
-                    diag_D[1] = 0.0
-                end
-                if $(inner_model isa RW2)
-                    diag_D[1] = 0.0
-                    diag_D[2] = 0.0
-                end
+                # The old code branched on the inner model to decide HOW MANY leading
+                # entries to zero: one for ICAR/Besag/RW1, two for RW2. That count is a
+                # property of the eigen-spectrum, not of the model type, so a disconnected
+                # graph (one null direction per component) was under-deflated and RW2's
+                # two-dimensional null space was hard-coded. Derive it from `L` instead.
+                _zero_null_modes!(diag_D, $(inner_hyper_access).L)
                 $(p_names.latent_field) = $(inner_hyper_access).U * (diag_D .* $(p_names.innovations))
                 """
             else # :cholesky or :cholesky_sparse
@@ -236,9 +235,9 @@ function get_updates(
                 $(common_correlated_code)
                 inner_hyper = $(inner_hyper_access)
                 diag_D = 1.0 ./ sqrt.(abs.(inner_hyper.L) .+ M.noise)
-                if $(m.model isa ICAR || m.model isa Besag)
-                    diag_D[1] = 0.0
-                end
+                # Fixed-count deflation replaced by a tolerance test on the spectrum. The
+                # argument must be the same vector the division used, i.e. `abs.(L)`.
+                _zero_null_modes!(diag_D, abs.(inner_hyper.L))
                 
                 gamma_matrix = inner_hyper.U * (diag_D .* innovations_matrix)
                 effects_matrix = gamma_matrix * L_effects_t

@@ -327,7 +327,25 @@ function reshard_spatial_field(
         end
 
         mean_resharded = Vector{Float64}(P * nt_or_summary.mean)
-        sd_resharded = Vector{Float64}(sqrt.(P * (nt_or_summary.std .^ 2)))
+        # Propagate the SD through the SAME aggregation that produced the mean.
+        #
+        # The mean is a weighted average of fine cells, so its variance is
+        #     Var(P * x) = diag(P * Cov(x) * P')
+        # and using only the marginal variances gives the diagonal approximation
+        #     Var ~ diag(P * Diagonal(std.^2) * P')
+        #
+        # The previous code computed `sqrt.(P * (std.^2))`, which is wrong twice over: it
+        # omits the trailing P' (so cross-covariances are ignored entirely) and it treats
+        # the aggregation as a SUM rather than an average. For a coarse cell averaging k
+        # independent fine cells the truth is sd/sqrt(k), and the old formula returned sd --
+        # overstating by exactly sqrt(k). Measured: k=4 gave 1.0 where the truth is 0.5, a
+        # 100% overstatement; k=100 would be 10x. See `scripts/_verify_ar1_reshard.jl`.
+        #
+        # The cross-covariance term is genuinely absent, so this remains an approximation
+        # for a spatially correlated field -- exact under independence. The `:samples` path
+        # above reshards actual draws and is exact either way.
+        sd_resharded = Vector{Float64}(sqrt.(diag(
+            Matrix{Float64}(P) * Diagonal(Float64.(nt_or_summary.std) .^ 2) * Matrix{Float64}(P)')))
         z_crit = quantile(Normal(0.0, 1.0), 1.0 - alpha / 2.0)
         lower_resharded = hasproperty(nt_or_summary, :lower) ?
             Vector{Float64}(P * nt_or_summary.lower) : (mean_resharded .- z_crit .* sd_resharded)

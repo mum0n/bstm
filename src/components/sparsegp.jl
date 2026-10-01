@@ -74,7 +74,7 @@ The methods differ in their covariance approximation:
 """
 struct SparseGP <: ComponentModel
     length_scale::Union{Distribution, Vector{<:Distribution}}
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     n_inducing::Int
     kernel::String
     method::Symbol
@@ -143,7 +143,7 @@ function get_priors(
     key = spec.key
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
 
     if m.length_scale isa Vector
         length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
@@ -320,19 +320,26 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         length_scale_name = _find_parameter(p_names, string(p_names_k.length_scale), k, is_multivariate_model)
         inducing_innovations_name = _find_parameter(p_names, string(p_names_k.innovations_inducing), k,
             is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(length_scale_name) || isempty(inducing_innovations_name)
-            @warn "Parameters for SparseGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        # Only `sigma` is pinnable here: `length_scale` is
+        # `Union{Distribution, Vector{<:Distribution}}`, so a fixed value is not
+        # representable, and the inducing innovations are always sampled. A pinned `sigma` is
+        # not a chain parameter, so resolve it with the constant fallback.
+        sigma_samples_cpu = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples;
+            as_matrix = true)
+
+        if isnothing(sigma_samples_cpu) || isempty(length_scale_name) || isempty(inducing_innovations_name)
+            @warn "Parameters for SparseGP component $(spec.key) (outcome $k) not " *
+                  "resolved, and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
 
-        # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         length_scale_dim = m.length_scale isa Vector ? length(m.length_scale) : 1
         ls_samples_cpu = get_params_matrix(chain, length_scale_name, length_scale_dim)
         inducing_innov_samples_cpu = get_params_matrix(chain, inducing_innovations_name, m.n_inducing)

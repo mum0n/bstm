@@ -56,7 +56,7 @@ where:
 """
 struct BYM2 <: ComponentModel
     rho_unconstrained::UnivariateDistribution
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     method::Symbol
 end
 
@@ -197,13 +197,13 @@ function get_priors(
     
     if m.method == :marginalized
         return """
-        $(p_names.rho_unconstrained) ~ $(_distribution_to_string(m.rho_unconstrained))
-        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(_prior_or_constant(p_names.rho_unconstrained, m.rho_unconstrained))
+        $(_prior_or_constant(p_names.sigma, m.sigma))
         """
     else
         return """
-        $(p_names.rho_unconstrained) ~ $(_distribution_to_string(m.rho_unconstrained))
-        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(_prior_or_constant(p_names.rho_unconstrained, m.rho_unconstrained))
+        $(_prior_or_constant(p_names.sigma, m.sigma))
         $(p_names.latent_field) ~ MvNormal(zeros(T, $(n_latent)), I)
         $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
@@ -296,7 +296,7 @@ function get_updates(
                 hyper.L,
                 rho,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -350,19 +350,25 @@ function get_effects(
 
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate)
+        # Only `sigma` is pinnable: `rho_unconstrained` is `Distribution`-only, so it must
+        # come from the chain. A pinned `sigma` is not a chain parameter, so resolve it with
+        # the constant fallback rather than reading it by name.
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate, n_samples;
+            as_matrix = true)
         rho_name = _find_parameter(p_names, string(p_names_k.rho_unconstrained), k,
             is_multivariate)
 
-        if isempty(sigma_name) || isempty(rho_name)
-            @warn "Parameters for BYM2 component $(spec.key) (outcome $(k)) not found. Returning zero-matrices."
+        if isnothing(sigma_samples) || isempty(rho_name)
+            @warn "Parameters for BYM2 component $(spec.key) (outcome $(k)) not resolved, " *
+                  "and sigma is not a pinned constant. Returning zero-matrices."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             push!(unstructured_effects, zeros(Float64, N_total, n_samples))
             push!(total_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         rho_samples = logistic.(get_params_vector(chain, rho_name, 1)) # (n_samples, 1)
 
         structured_latent = zeros(Float64, n_latent, n_samples)
@@ -458,7 +464,7 @@ function get_effects(
                     U = hyper.U
                     L = hyper.L
                     diag_D = 1.0 ./ sqrt.(L .+ noise)
-                    diag_D[1] = 0.0 # Enforce sum-to-zero constraint
+                    _zero_null_modes!(diag_D, L)   # zero EVERY null direction; a disconnected graph has more than one
                     struct_effect_unscaled = U * (diag_D .* latent_field_innovations_i)
                 else # :cholesky or :cholesky_sparse (use pre-computed dense Cholesky factor)
                     F = hyper.cholesky_factor

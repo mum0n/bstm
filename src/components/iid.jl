@@ -41,7 +41,7 @@ where \$I\$ is the identity matrix.
 - `latent_<key>`: The latent IID effect (for `:centered`).
 """
 struct IID <: ComponentModel
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     method::Symbol
 end
 
@@ -147,7 +147,7 @@ function get_priors(
 
     priors_acc = String[]
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
-        push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+        push!(priors_acc, "$(_prior_or_constant(p_names.sigma, m.sigma))")
     end
 
     if m.method == :noncentered
@@ -204,7 +204,7 @@ function get_updates(
                 $(index_access),
                 spec_registry[:$(spec.key)].hyper.n_latent,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(spec.key)
@@ -287,15 +287,17 @@ function get_effects(
     # --- Reconstruction Loop ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        
-        if isempty(sigma_name)
-            @warn "Sigma parameter for IID component $(spec.key) (outcome $(k)) not found. Returning zero-matrix."
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples;
+            as_matrix = true)
+
+        if isnothing(sigma_samples)
+            @warn "Parameters for $(spec.key) (outcome $k) not resolved, and " *
+                  "sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
-
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         
         latent_field_samples = zeros(Float64, n_latent, n_samples)
         if m.method == :marginalized

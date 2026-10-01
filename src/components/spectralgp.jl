@@ -51,7 +51,7 @@ This approach is computationally efficient, scaling as \$O(N \\log N)\$ for a gr
 - `latent_<key>`: The interpolated latent effect at the observation coordinates.
 """
 struct SpectralGP <: ComponentModel
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     length_scale::Union{UnivariateDistribution, Vector{<:UnivariateDistribution}}
     nu::UnivariateDistribution
     kernel::String
@@ -121,14 +121,14 @@ function get_priors(
     key = spec.key
     priors = String[]
 
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.nu) ~ $(_distribution_to_string(m.nu))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.nu, m.nu))")
 
     if m.length_scale isa Vector
         length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
         push!(priors, "$(p_names.length_scale) ~ Product([$(length_scale_priors_str)])")
     else
-        push!(priors, "$(p_names.length_scale) ~ $(_distribution_to_string(m.length_scale))")
+        push!(priors, "$(_prior_or_constant(p_names.length_scale, m.length_scale))")
     end
     
     push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
@@ -223,19 +223,24 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
         length_scale_name = _find_parameter(p_names, string(v.length_scale), k, is_multivariate_model)
         nu_name = _find_parameter(p_names, string(v.nu), k, is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(length_scale_name) || isempty(nu_name) || isempty(innovations_name)
-            @warn "Parameters for SpectralGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        # Only `sigma` is pinnable here: `length_scale`, `nu` and `innovations` are
+        # `Distribution`-only, so they must come from the chain.
+        sigma_samples_cpu = _resolve_hyper_samples(
+            chain, p_names, v.sigma, m.sigma, k, is_multivariate_model, n_samples)
+
+        if isnothing(sigma_samples_cpu) || isempty(length_scale_name) || isempty(nu_name) ||
+                isempty(innovations_name)
+            @warn "Parameters for SpectralGP component $(spec.key) (outcome $k) not " *
+                  "resolved, and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total_eff, n_samples))
             continue
         end
 
         # Extract posterior samples (CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         length_scale_dim = m.length_scale isa Vector ? n_dims : 1
         ls_samples_cpu = get_params_matrix(chain, length_scale_name, length_scale_dim)
         nu_samples_cpu = get_params_vector(chain, nu_name, 1)[:, 1]

@@ -61,7 +61,7 @@ of the main GP dependent on the input location \$x\$.
 """
 struct Warp <: ComponentModel
     length_scale::Union{Distribution, Vector{<:Distribution}}
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     n_features::Int
     kernel::String
     method::Symbol
@@ -148,7 +148,7 @@ function get_priors(m::Warp, spec::NamedTuple, arch::String, outcome_idx, M)::St
     n_features = m.n_features
 
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
 
     if m.length_scale isa Vector
         length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")

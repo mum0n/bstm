@@ -58,7 +58,7 @@ The model works as follows:
   43(3/4), 337-343.
 """
 struct WaveletGP <: ComponentModel
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     alpha::UnivariateDistribution
     wavelet::Symbol
     resolution::Int
@@ -224,8 +224,8 @@ function get_priors(
     key = spec.key
     priors = String[]
 
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.alpha) ~ $(_distribution_to_string(m.alpha))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.alpha, m.alpha))")
     push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)")
 
     return join(priors, "\n    ")

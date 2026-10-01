@@ -71,7 +71,7 @@ expansion in the warped space.
 struct AdaptiveSmooth <: ComponentModel
     hidden_dim::Int
     nbins::Int
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     method::Symbol # :noncentered, :centered, :rw2_penalty, :marginalized
 end
 
@@ -189,7 +189,7 @@ function get_priors(
     push!(priors, "$(p_names.rff_offsets_1) ~ MvNormal(zeros(T, $(h_dim)), I)")
     push!(priors,
         "$(p_names.rff_weights_2) ~ MvNormal(zeros(T, $(h_dim * n_bins)), I)") # the output layer is always sampled
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
 
     if m.method in [:noncentered, :rw2_penalty] # Latent field is sampled
         push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_bins)), I)")
@@ -253,7 +253,7 @@ function get_updates(
             hyper = spec_registry[:$(key)].hyper
             
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
-            diag_D[1] = 0.0; diag_D[2] = 0.0
+            diag_D[hyper.L .<= (1e-10 * maximum(hyper.L))] .= 0.0   # zero EVERY null direction (a disconnected graph has more than one)
             
             coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             adaptive_effect = B_adaptive * coeffs
@@ -270,7 +270,7 @@ function get_updates(
                 y_residual,
                 B_adaptive,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -331,10 +331,14 @@ function get_effects(
         rff_weights_1_name = _find_parameter(p_names, string(p_names_k.rff_weights_1), k, is_multivariate_model)
         rff_offsets_1_name = _find_parameter(p_names, string(p_names_k.rff_offsets_1), k, is_multivariate_model)
         rff_weights_2_name = _find_parameter(p_names, string(p_names_k.rff_weights_2), k, is_multivariate_model)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        
-        if isempty(rff_weights_1_name) || isempty(rff_offsets_1_name) || isempty(rff_weights_2_name) || isempty(sigma_name)
-            @warn "MLP parameters for AdaptiveSmooth component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        # Only `sigma` is pinnable here: the RFF weight/offset parameters are always sampled.
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k, is_multivariate_model, n_samples)
+
+        if isempty(rff_weights_1_name) || isempty(rff_offsets_1_name) ||
+                isempty(rff_weights_2_name) || isnothing(sigma_samples)
+            @warn "MLP parameters for AdaptiveSmooth component $(spec.key) (outcome $k) not " *
+                  "resolved, and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
@@ -343,7 +347,6 @@ function get_effects(
         rff_weights_1_samples = get_params_vector(chain, rff_weights_1_name, m.hidden_dim * spec.hyper.in_dim)
         rff_offsets_1_samples = get_params_vector(chain, rff_offsets_1_name, m.hidden_dim)
         rff_weights_2_samples = get_params_vector(chain, rff_weights_2_name, m.hidden_dim * m.nbins)
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
 
         # Initialize the output matrix on the CPU
         effect_k = zeros(Float64, n_obs_full, n_samples)
@@ -359,11 +362,26 @@ function get_effects(
             H = tanh.((coords_full * rff_weights_1) .+ rff_offsets_1')
             B_adaptive = H * rff_weights_2
             
-            # Reconstruct coefficients based on the sampling method
+            # Reconstruct coefficients based on the sampling method. These three
+            # branches were previously stubs: they resolved a chain parameter name and then
+            # fell through without ever assigning `coeffs`, so `B_adaptive * coeffs` raised
+            # `UndefVarError: coeffs`. That was masked while the pinned-`sigma` guard above
+            # bailed out to a zero matrix for every model reaching this point. Each formula
+            # below mirrors the corresponding generated-model branch, so reconstruction
+            # reproduces what the model actually sampled.
             local coeffs
             if m.method == :centered
+                # generated: coeffs = latent_field .* sigma
                 latent_field_name = _find_parameter(p_names, string(p_names_k.latent_field), k,
                     is_multivariate_model)
+                if isempty(latent_field_name)
+                    @warn "latent_field for AdaptiveSmooth component $(spec.key) " *
+                          "(outcome $k) not found. Returning zero-matrix." maxlog = 1
+                    push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
+                    break
+                end
+                latent = get_params_vector(chain, latent_field_name, m.nbins)
+                coeffs = latent[i, :] .* sigma_samples[i]
             elseif m.method == :marginalized
                 # Exact conditional Gaussian simulation for basis weights beta ~ N(0, sigma^2 I)
                 y_sigma_name = _find_parameter(p_names, "y_sigma", k, is_multivariate_model)
@@ -389,7 +407,23 @@ function get_effects(
             else # :noncentered or :rw2_penalty
                 innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k,
                     is_multivariate_model)
-
+                if isempty(innovations_name)
+                    @warn "innovations for AdaptiveSmooth component $(spec.key) " *
+                          "(outcome $k) not found. Returning zero-matrix." maxlog = 1
+                    push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
+                    break
+                end
+                innovations = get_params_vector(chain, innovations_name, m.nbins)
+                if m.method == :noncentered
+                    # generated: scaled_coeffs = innovations .* sigma
+                    coeffs = innovations[i, :] .* sigma_samples[i]
+                else # :rw2_penalty
+                    # generated: coeffs = U * (diag_D .* innovations)
+                    hyper_local = spec.hyper
+                    diag_D = sigma_samples[i] ./ sqrt.(hyper_local.L .+ M.noise)
+                    diag_D[hyper_local.L .<= (1e-10 * maximum(hyper_local.L))] .= 0.0
+                    coeffs = hyper_local.U * (diag_D .* innovations[i, :])
+                end
             end
             
             # Compute the effect for this sample

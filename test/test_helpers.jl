@@ -156,3 +156,38 @@ function mock_chain(param_names_and_values::Dict, n_samples=10)
     end
     return mock_params
 end
+
+# ==============================================================================
+# Shared marginalized-component reconstruction check
+#
+# All 20 marginalized components were tested with a copy-pasted four-line tail:
+#
+#     eff = bstm.get_effects(comp, chain, spec, M, nothing)
+#     @test length(eff.structured) == 1
+#     @test size(eff.structured[1]) == (5, 3)
+#     @test !all(iszero, eff.structured[1])
+#
+# Identical every time, and the third line is the important one. `get_effects` used to bail
+# to a ZERO matrix for 51 site/parameter combinations behind a single `@warn`, and a zero
+# matrix is *finite* -- so the only assertion that catches that class of defect is a
+# NONZERO check. Copy-pasted, one block out of twenty eventually loses it.
+# ==============================================================================
+
+"""
+    check_marginalized_reconstruction(component, chain, spec, M;
+                                     n_latent=5, n_draws=3) -> eff
+
+Assert that a marginalized component's `get_effects` returns one outcome block of the
+expected shape carrying a **nonzero** field, and return the effect so the caller can make
+component-specific assertions on top.
+"""
+function check_marginalized_reconstruction(
+    component, chain, spec, M; n_latent::Integer=5, n_draws::Integer=3
+)
+    eff = bstm.get_effects(component, chain, spec, M, nothing)
+    @test length(eff.structured) == 1
+    @test size(eff.structured[1]) == (n_latent, n_draws)
+    # Nonzero is the load-bearing assertion here -- see the note above.
+    @test !all(iszero, eff.structured[1])
+    return eff
+end

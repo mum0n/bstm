@@ -390,47 +390,47 @@ function get_priors(
     if arch == "univariate"
         if m.model in ["advection", "advection_diffusion"]
             vel_prior = get(params, :velocity, Normal(0.0, 0.5))
-            push!(priors_acc, "$(p_names.velocity) ~ $(_distribution_to_string(vel_prior))")
+            push!(priors_acc, "$(_prior_or_constant(p_names.velocity, vel_prior))")
         end
         if m.model in ["diffusion", "advection_diffusion"]
             diff_prior = get(params, :diffusion, LogNormal(-1.0, 1.0))
-            push!(priors_acc, "$(p_names.diffusion) ~ $(_distribution_to_string(diff_prior))")
+            push!(priors_acc, "$(_prior_or_constant(p_names.diffusion, diff_prior))")
         end
         
         sigma_prior = get(params, :sigma, Exponential(1.0))
-        push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(sigma_prior))")
+        push!(priors_acc, "$(_prior_or_constant(p_names.sigma, sigma_prior))")
         
         if m.model in ["logistic", "delay_difference"]
             if get(params, :spatially_varying_intrinsic_growth_rate, false)
                 intrinsic_growth_rate_mean_log_prior = get(params, :intrinsic_growth_rate_mean_log, Normal(0.0, 0.5))
                 intrinsic_growth_rate_sd_prior = get(params, :intrinsic_growth_rate_sd, Exponential(1.0))
-                push!(priors_acc, "sigma_r_$(key_str) ~ $(_distribution_to_string(intrinsic_growth_rate_sd_prior))")
+                push!(priors_acc, "sigma_r_$(_prior_or_constant(key_str, intrinsic_growth_rate_sd_prior))")
                 push!(priors_acc,
-                    "log_r_mean_$(key_str) ~ $(_distribution_to_string(intrinsic_growth_rate_mean_log_prior))")
+                    "log_r_mean_$(_prior_or_constant(key_str, intrinsic_growth_rate_mean_log_prior))")
                 push!(priors_acc, "r_unscaled_$(key_str) ~ MvNormal(zeros(T, $(s_N)), I)")
             else
                 intrinsic_growth_rate_prior = get(params, :intrinsic_growth_rate, LogNormal(0.0, 1.0))
-                push!(priors_acc, "$(p_names.intrinsic_growth_rate) ~ $(_distribution_to_string(intrinsic_growth_rate_prior))")
+                push!(priors_acc, "$(_prior_or_constant(p_names.intrinsic_growth_rate, intrinsic_growth_rate_prior))")
             end
             if get(params, :spatially_varying_carrying_capacity, false)
                 carrying_capacity_mean_log_prior = get(params, :carrying_capacity_mean_log, Normal(log(100.0), 0.5))
                 carrying_capacity_sd_prior = get(params, :carrying_capacity_sd, Exponential(1.0))
-                push!(priors_acc, "sigma_K_$(key_str) ~ $(_distribution_to_string(carrying_capacity_sd_prior))")
+                push!(priors_acc, "sigma_K_$(_prior_or_constant(key_str, carrying_capacity_sd_prior))")
                 push!(priors_acc,
-                    "log_K_mean_$(key_str) ~ $(_distribution_to_string(carrying_capacity_mean_log_prior))")
+                    "log_K_mean_$(_prior_or_constant(key_str, carrying_capacity_mean_log_prior))")
                 push!(priors_acc, "K_unscaled_$(key_str) ~ MvNormal(zeros(T, $(s_N)), I)")
             else
                 carrying_capacity_prior = get(params, :carrying_capacity, LogNormal(log(100.0), 1.0))
-                push!(priors_acc, "$(p_names.carrying_capacity) ~ $(_distribution_to_string(carrying_capacity_prior))")
+                push!(priors_acc, "$(_prior_or_constant(p_names.carrying_capacity, carrying_capacity_prior))")
             end
             for key in spec.hyper.effort_keys
                 exploitation_rate_prior = get(params, Symbol("exploitation_rate_$(key)"), LogNormal(-2.0, 1.0))
-                push!(priors_acc, "exploitation_rate_$(key) ~ $(_distribution_to_string(exploitation_rate_prior))")
+                push!(priors_acc, "exploitation_rate_$(_prior_or_constant(key, exploitation_rate_prior))")
             end
         end
         if m.model == "delay_difference"
             natural_mortality_rate_prior = get(params, :natural_mortality_rate, LogNormal(-1.0, 0.5))
-            push!(priors_acc, "$(p_names.natural_mortality_rate) ~ $(_distribution_to_string(natural_mortality_rate_prior))")
+            push!(priors_acc, "$(_prior_or_constant(p_names.natural_mortality_rate, natural_mortality_rate_prior))")
         end
         
         if m.model == "lotka_volterra"
@@ -438,10 +438,10 @@ function get_priors(
             beta_prior = get(params, :beta, LogNormal(-1.0, 0.5))
             gamma_prior = get(params, :gamma, LogNormal(-1.0, 0.5))
             delta_prior = get(params, :delta, LogNormal(0.0, 0.5))
-            push!(priors_acc, "$(p_names.alpha) ~ $(_distribution_to_string(alpha_prior))")
-            push!(priors_acc, "$(p_names.beta) ~ $(_distribution_to_string(beta_prior))")
-            push!(priors_acc, "$(p_names.gamma) ~ $(_distribution_to_string(gamma_prior))")
-            push!(priors_acc, "$(p_names.delta) ~ $(_distribution_to_string(delta_prior))")
+            push!(priors_acc, "$(_prior_or_constant(p_names.alpha, alpha_prior))")
+            push!(priors_acc, "$(_prior_or_constant(p_names.beta, beta_prior))")
+            push!(priors_acc, "$(_prior_or_constant(p_names.gamma, gamma_prior))")
+            push!(priors_acc, "$(_prior_or_constant(p_names.delta, delta_prior))")
             push!(priors_acc, "$(p_names.innovations_predator) ~ MvNormal(zeros(T, $(s_N) * $(t_N)), I)")
         end
 
@@ -479,7 +479,7 @@ function get_priors(
             for key in spec.hyper.effort_keys
                 exploitation_rate_prior = get(params, Symbol("exploitation_rate_$(key)"), filldist(LogNormal(-4.0, 1.0),
                     n_classes))
-                push!(priors_acc, "exploitation_rate_$(key) ~ $(_distribution_to_string(exploitation_rate_prior))")
+                push!(priors_acc, "exploitation_rate_$(_prior_or_constant(key, exploitation_rate_prior))")
             end
             push!(priors_acc,
                 "$(p_names.sigma_process) ~ filldist(Exponential(1.0), $(n_classes))")

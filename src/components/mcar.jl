@@ -73,7 +73,7 @@ where \$\\mathbf{L}_{\\text{cross}} = \\operatorname{diag}(\\boldsymbol{\\sigma}
 """
 struct MCAR <: ComponentModel
     rho_unconstrained::UnivariateDistribution
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     correlation_lkj::Real
     n_outcomes::Int
     method::Symbol
@@ -130,7 +130,7 @@ function get_priors(
     K = spec.hyper.K
 
     return """
-    $(p_names.rho_unconstrained) ~ $(_distribution_to_string(m.rho_unconstrained))
+    $(_prior_or_constant(p_names.rho_unconstrained, m.rho_unconstrained))
     $(p_names.sigma) ~ filldist($(_distribution_to_string(m.sigma)), $(K))
     L_corr_$(spec.key) ~ LKJCholesky($(K), $(m.correlation_lkj))
     $(p_names.innovations) ~ MvNormal(zeros(T, $(s_N * K)), I)

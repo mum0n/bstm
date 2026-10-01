@@ -51,7 +51,7 @@ struct PSpline <: ComponentModel
     nbins::Int
     degree::Int
     penalty_order::Int
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     method::Symbol
 end
 
@@ -178,14 +178,14 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    sigma_prior_str = _distribution_to_string(m.sigma)
+    sigma_prior_str = _prior_or_constant(p_names.sigma, m.sigma)
     key = spec.key
 
     if m.method == :marginalized
-        return "$(p_names.sigma) ~ $(sigma_prior_str)"
+        return "$(sigma_prior_str)"
     else
         return """
-            $(p_names.sigma) ~ $(sigma_prior_str)
+            $(sigma_prior_str)
             $(p_names.innovations) ~ MvNormal(
                 zeros(T, spec_registry[:$(key)].hyper.n_latent), I
             )
@@ -266,7 +266,7 @@ function get_updates(
                 hyper.L,
                 $(m.penalty_order),
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -323,16 +323,17 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         # Find parameter names in the MCMC chain
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        sigma_samples_cpu = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples)
 
-        if isempty(sigma_name)
-            @warn "Parameters for PSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        if isnothing(sigma_samples_cpu)
+            @warn "Parameters for $(spec.key) (outcome $k) not resolved, and " *
+                  "sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
 
         # Initialize the output matrix for coefficients on the CPU
         coeffs_samples_matrix_cpu = zeros(Float64, n_latent, n_samples)

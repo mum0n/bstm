@@ -53,7 +53,7 @@ precision matrix is \$Q = (I - \\rho W)^T (I - \\rho W) / \\sigma^2\$.
 """
 struct DAG <: ComponentModel
     rho::Distribution
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     method::Symbol
 end
 
@@ -92,8 +92,8 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     return """
-    $(p_names.rho) ~ $(_distribution_to_string(m.rho))
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+    $(_prior_or_constant(p_names.rho, m.rho))
+    $(_prior_or_constant(p_names.sigma, m.sigma))
     $(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)
     """
 end
@@ -136,8 +136,7 @@ function get_updates(
             end
             $(p_names.latent_field) = $(p_names.latent_field) .* sigma_val # Scale the entire field by sigma
             
-            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx) # Apply to linear
-              predictor
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)  # Apply to linear predictor
         end
     """
 
@@ -154,8 +153,7 @@ function get_updates(
             # Non-centered parameterization: latent_field = sigma * L_inv * innovations
             $(p_names.latent_field) = $(p_names.sigma) .* (F.U \\ $(p_names.innovations))
             
-            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx) # Apply to linear
-              predictor
+            $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)  # Apply to linear predictor
         end
     """
 
@@ -210,21 +208,25 @@ function get_effects(
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
-        # Find parameter names in the MCMC chain
-        rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            # Only `sigma` is pinnable here: `rho` and `innovations` are always sampled, so
+            # they must come from the chain. A pinned `sigma` is not a chain parameter, so
+            # resolve it with the constant fallback rather than reading it by name.
+            rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            sigma_samples = _resolve_hyper_samples(
+                chain, p_names, p_names_k.sigma, m.sigma, k, is_multivariate_model,
+                n_samples; as_matrix = true)
 
-        if isempty(rho_name) || isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for DAG component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_total, n_samples))
-            continue
-        end
+            if isempty(rho_name) || isnothing(sigma_samples) || isempty(innovations_name)
+                @warn "Parameters for DAG component $(spec.key) (outcome $k) not " *
+                      "resolved, and sigma is not a pinned constant. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
 
-        # Extract posterior samples (these are on the CPU)
-        rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
+            # Extract posterior samples (these are on the CPU)
+            rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
         
         # Initialize the output matrix for latent effects
         latent_field_matrix = zeros(Float64, n_latent, n_samples)

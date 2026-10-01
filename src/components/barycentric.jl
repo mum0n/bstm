@@ -60,7 +60,7 @@ The component models a function \$f(s)\$ where \$s\$ is a 2D coordinate.
 - Wikipedia: Barycentric coordinate system
 """
 struct Barycentric <: ComponentModel
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     method::Symbol
 end
 
@@ -264,7 +264,9 @@ function get_updates(
             U = hyper.U
             L = hyper.L
             diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
-            diag_D[1] = 0.0
+            # Zero every null direction: the count depends on the spectrum, and a
+            # disconnected graph has more than one. See _zero_null_modes!.
+            _zero_null_modes!(diag_D, L)
             coeffs = U * (diag_D .* $(p_names.innovations))
             $(p_names.latent_field) = B * coeffs
             $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
@@ -283,7 +285,7 @@ function get_updates(
                 Q_mat,
                 L_vec,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -342,15 +344,17 @@ function get_effects(
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        
-        if isempty(sigma_name)
-            @warn "Sigma parameter for Barycentric component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples)
+
+        if isnothing(sigma_samples)
+            @warn "Parameters for $(spec.key) (outcome $k) not resolved, and " *
+                  "sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
 
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
         
         # Initialize the output matrix for coefficients on the CPU
         coeffs_samples_matrix = zeros(Float64, n_knots, n_samples)
@@ -410,7 +414,9 @@ function get_effects(
                     L = spec.hyper.L
                     for i in 1:n_samples
                         diag_D = sigma_samples[i] ./ sqrt.(L .+ noise_val)
-                        diag_D[1] = 0.0 # Assuming L[1] corresponds to the rank-deficient mode
+                        # Zero every null direction: the count depends on the spectrum, and a
+                        # disconnected graph has more than one. See _zero_null_modes!.
+                        _zero_null_modes!(diag_D, L) # Assuming L[1] corresponds to the rank-deficient mode
                         coeffs_samples_matrix[:, i] = U * (diag_D .* innovations_samples[:, i])
                     end
                 end

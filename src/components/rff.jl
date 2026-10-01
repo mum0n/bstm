@@ -53,16 +53,16 @@ The final effect is a linear combination of these features: \$f(x) = \\phi(x)^T 
 - `latent_<key>`: The RFF coefficients (for `:centered`).
 """
 struct RFF <: ComponentModel
-    length_scale::Union{Distribution, Vector{<:Distribution}}
-    sigma::Distribution
+    length_scale::Union{Distribution, Vector{<:Distribution}, Real}
+    sigma::Union{Distribution, Real}
     n_features::Int
     kernel::String
     method::Symbol
     sampling::Symbol
 
     function RFF(
-        length_scale::Union{Distribution, Vector{<:Distribution}},
-        sigma::Distribution,
+        length_scale::Union{Distribution, Vector{<:Distribution}, Real},
+        sigma::Union{Distribution, Real},
         n_features::Int,
         kernel::String,
         method::Symbol = :fixed,
@@ -196,16 +196,14 @@ function get_priors(
     key = spec.key
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
 
     if m.method != :marginalized
         if m.length_scale isa Vector
             length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
             push!(priors, "$(p_names.length_scale) ~ Product([$(length_scale_priors_str)])")
         else
-
-            length_scale_prior_str = _distribution_to_string(m.length_scale)
-            push!(priors, "$(p_names.length_scale) ~ $(length_scale_prior_str)")
+            push!(priors, "$(_prior_or_constant(p_names.length_scale, m.length_scale))")
         end
 
         if m.method == :adaptive
@@ -278,7 +276,7 @@ function get_updates(
                 y_residual,
                 Phi,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)

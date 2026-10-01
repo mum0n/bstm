@@ -60,7 +60,7 @@ where \$K_{ZZ} = L_{ZZ}L_{ZZ}^T\$. The final effect is computed as:
 """
 struct Nystrom <: ComponentModel
     length_scale::Union{Distribution, Vector{<:Distribution}}
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     n_inducing::Int
     kernel::String
     method::Symbol
@@ -115,7 +115,7 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
 
     if m.length_scale isa Vector
         length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
@@ -229,17 +229,24 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         # Find parameter names in the MCMC chain
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         length_scale_name = _find_parameter(p_names, string(p_names_k.length_scale), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(length_scale_name)
-            @warn "Parameters for Nystrom component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        # Only `sigma` is pinnable here: `length_scale` is
+        # `Union{Distribution, Vector{<:Distribution}}`, so a fixed value is not
+        # representable for it. A pinned `sigma` is not a chain parameter, so resolve it with
+        # the constant fallback rather than reading it by name.
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples;
+            as_matrix = true)
+
+        if isnothing(sigma_samples) || isempty(length_scale_name)
+            @warn "Parameters for Nystrom component $(spec.key) (outcome $k) not " *
+                  "resolved, and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
 
-        # Extract posterior samples (CPU)
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         length_scale_dim = m.length_scale isa Vector ? length(m.length_scale) : 1 # Dimension of length_scale parameter
         length_scale_samples = get_params_matrix(chain, length_scale_name, length_scale_dim) # (n_samples, length_scale_dim)
 

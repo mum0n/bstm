@@ -55,7 +55,7 @@ Euclidean distance.
 """
 struct Hyperbolic <: ComponentModel
     curvature::Real
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
 end
 
 COMPONENT_TYPE_REGISTRY[:hyperbolic] = Hyperbolic
@@ -100,7 +100,7 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
     push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)")
     
     return join(priors, "\n    ")
@@ -225,17 +225,23 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for Hyperbolic component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        # Only `sigma` is pinnable here (`curvature` is a `Real` constructor argument, not a
+        # sampled hyperparameter). A pinned `sigma` is not a chain parameter, so resolve it
+        # with the constant fallback rather than reading it by name.
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k, is_multivariate_model,
+            n_samples; as_matrix = true)
+
+        if isnothing(sigma_samples) || isempty(innovations_name)
+            @warn "Parameters for Hyperbolic component $(spec.key) (outcome $k) not " *
+                  "resolved, and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         innovations_samples = get_params_matrix(chain, innovations_name, n_obs_train) # (n_samples, n_obs_train)
 
         # Initialize the output matrix for the full effect

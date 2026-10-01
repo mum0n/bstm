@@ -184,4 +184,79 @@ end
         )
         @test lik_valid_censor.censoring_state isa bstm.IntervalCensored
     end
+
+    @testset "N1: truncated counts are ForwardDiff-capable" begin
+        using ForwardDiff
+
+        # The hurdle and censoring kernels normalise by a count tail. For Poisson that
+        # normaliser is `logccdf`, which routes through Distributions' `_gammalogcdf` --
+        # Float64-only -- so NUTS/HMC/ADVI all failed with a MethodError while MH worked.
+        # `logpdf` was always AD-capable, which is why only the tail was the problem.
+        _pois(lam) = bstm.get_dist_ref(
+            bstm.get_model_family("poisson"), bstm.bstm_Likelihood("poisson", lam), lam, 1.0, 1)
+
+        @testset "AD path reproduces the Float64 path" begin
+            for (fam, lam) in [("poisson", 0.4), ("poisson", 1.3), ("poisson", 5.0),
+                               ("negbin", 1.3)]
+                dist = bstm.get_dist_ref(
+                    bstm.get_model_family(fam), bstm.bstm_Likelihood(fam, lam), lam, 1.0, 1)
+                for thr in (0.0, 0.5, 1.0, 2.0, 3.0)
+                    @test isapprox(bstm._logcdf_count_ad(dist, thr), logcdf(dist, thr); rtol=1e-11)
+                    @test isapprox(bstm._logccdf_count_ad(dist, thr), logccdf(dist, thr); rtol=1e-11)
+                end
+            end
+        end
+
+        @testset "gradients are correct, not merely finite" begin
+            # An AD path that returned a plausible value with a wrong derivative would
+            # break NUTS silently, so compare against finite differences.
+            for lam in (0.5, 1.5, 4.0)
+                f(l) = bstm._logccdf_count_ad(_pois(l), 1.0)
+                g = ForwardDiff.derivative(f, lam)
+                h = 1e-6
+                fd = (f(lam + h) - f(lam - h)) / (2h)
+                @test isfinite(g)
+                @test isapprox(g, fd; rtol=1e-5)
+            end
+        end
+
+        @testset "the plain-float path is untouched" begin
+            # `is_ad == false` must delegate to Distributions verbatim, so no reported
+            # number moves. `===` rather than `isapprox`: it must be the identical value.
+            for thr in (0.5, 1.0, 2.0)
+                @test bstm._logcdf_count(_pois(1.3), thr, false) === logcdf(_pois(1.3), thr)
+                @test bstm._logccdf_count(_pois(1.3), thr, false) === logccdf(_pois(1.3), thr)
+            end
+            # And the dual/Float64 discrimination used to pick the branch. Note it takes a
+            # TYPE, which is how the kernels call it (`_is_dual_type(V)`).
+            @test !bstm._is_dual_type(Float64)
+            @test bstm._is_dual_type(typeof(ForwardDiff.Dual(1.0, 1.0)))
+        end
+
+        @testset "edge cases" begin
+            # A bound below the support: P(X <= k) = 0 and P(X > k) = 1.
+            @test bstm._logcdf_count_ad(_pois(1.3), -1.0) == -Inf
+            @test bstm._logccdf_count_ad(_pois(1.3), -1.0) == 0.0
+            # A non-integral hurdle bound must floor rather than throw an InexactError.
+            @test isfinite(bstm._logcdf_count_ad(_pois(1.3), 0.5))
+            # An absurdly large bound reports an actionable error instead of grinding.
+            @test_throws ErrorException bstm._logcdf_count_ad(_pois(1.3), 1e7)
+        end
+
+        @testset "hurdle and censored models sample with NUTS" begin
+            s_N = 6
+            df = DataFrame(y = [1, 3, 2, 0, 4, 1, 2, 5, 1, 0, 3, 2], s_idx = repeat(1:s_N, 2))
+            W = bstm.spatial_knn_graph([(Float64(s), 0.0) for s in 1:s_N], 2)[2]
+            for spec in ["hurdle=0.5", "hurdle=1.0", "hurdle=2.0",
+                         "hurdle=0.5, censor_lower=2",
+                         "hurdle=0.5, censor_upper=2",
+                         "hurdle=0.5, censor_lower=1, censor_upper=3"]
+                f = "likelihood(y, family=poisson, $spec) ~ 1 + random(s_idx, model=icar)"
+                m = bstm.bstm_core(f, df; s_N=s_N, W=W, verbose=false)
+                ch = sample(MersenneTwister(5), m, NUTS(), 40;
+                            progress=false, check_model=false)
+                @test size(ch, 1) == 40
+            end
+        end
+    end
 end

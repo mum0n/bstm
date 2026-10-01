@@ -52,14 +52,26 @@ degree to which the habitat influences the spatial correlation structure.
 - `latent_<key>`: The reconstructed latent spatial field.
 """
 struct NetworkFlow <: ComponentModel
-    beta::UnivariateDistribution
-    sigma::UnivariateDistribution
+    # `beta` accepts a `Real` as well as a Distribution, so the habitat effect can be pinned
+    # to a constant. `_prior_or_constant` turns a Real into `name = value` rather than a
+    # prior, and the struct field must accept it. Matches `sigma` below and the other
+    # components; see the `FITC` note on the same class of fix.
+    beta::Union{UnivariateDistribution, Real}
+    sigma::Union{UnivariateDistribution, Real}
     method::Symbol
 end
 
 COMPONENT_TYPE_REGISTRY[:networkflow] = NetworkFlow
+
+# `p.beta` with no fallback raised `FieldError: type NamedTuple has no field beta` for any
+# model that did not spell `beta=` out explicitly -- but `beta` is documented as OPTIONAL
+# with default `Normal(0, 1)` (see the docstring's "Optional (in `random()` call)" section),
+# so omitting it is the documented usage, not a user error. Every other component reads its
+# optional hyperparameter with `get(p, :name, default)`; this one did not.
 COMPONENT_CONSTRUCTORS[:networkflow] = (p, params) -> NetworkFlow(
-    p.beta, p.sigma, get(params, :method, :cholesky)
+    get(p, :beta, Normal(0, 1)),
+    get(p, :sigma, Exponential(1.0)),
+    get(params, :method, :cholesky)
 )
 
 MODEL_TO_STRUCTURE_MAP[:networkflow] = :spatial
@@ -123,8 +135,8 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     priors = String[]
 
-    push!(priors, "$(p_names.beta) ~ $(_distribution_to_string(m.beta))")
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.beta, m.beta))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
     push!(priors, "$(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)")
 
     return join(priors, "\n    ")
@@ -229,22 +241,26 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k_outcome in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k_outcome)
-        beta_name = _find_parameter(p_names, string(p_names_k.beta), k_outcome,
-            is_multivariate_model)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k_outcome,
-            is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k_outcome,
             is_multivariate_model)
 
-        if isempty(beta_name) || isempty(sigma_name) || isempty(innovations_name)
-            @warn "Parameters for NetworkFlow component $(spec.key) (outcome $k_outcome) not found. Returning zero-matrix."
+        # Both `beta` and `sigma` are pinnable here, and a pinned value is not a chain
+        # parameter, so resolve them with the constant fallback rather than by name. Without
+        # this, pinning either one reconstructs a ZERO field with only a warning.
+        beta_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.beta, m.beta, k_outcome, is_multivariate_model, n_samples)
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k_outcome, is_multivariate_model, n_samples)
+
+        if isnothing(beta_samples) || isnothing(sigma_samples) || isempty(innovations_name)
+            @warn "Parameters for NetworkFlow component $(spec.key) (outcome $k_outcome) " *
+                  "not resolved, and beta / sigma are not both pinned constants. " *
+                  "Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
-        beta_samples = get_params_vector(chain, beta_name, 1)[:, 1]
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
         innovations_samples = get_params_matrix(chain, innovations_name, s_N)
         
         # Initialize the output matrix for the full latent field on the CPU

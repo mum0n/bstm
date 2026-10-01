@@ -56,7 +56,7 @@ This penalizes deviations from a linear trend, encouraging a smooth function.
 struct BSpline <: ComponentModel
     nbins::Int
     degree::Int
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     method::Symbol
 end
 
@@ -187,17 +187,16 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    sigma_prior_str = _distribution_to_string(m.sigma)
-    
+    sigma_prior_str = _prior_or_constant(p_names.sigma, m.sigma)
     if m.method == :marginalized
         return """
         # Priors for BSpline component: $(spec.key)
-        $(p_names.sigma) ~ $(sigma_prior_str)
+        $(sigma_prior_str)
         """
     else
         return """
         # Priors for BSpline component: $(spec.key)
-        $(p_names.sigma) ~ $(sigma_prior_str)
+        $(sigma_prior_str)
         $(p_names.innovations) ~ MvNormal(zeros(T, $(spec.hyper.n_latent)), I)
         """
     end
@@ -230,8 +229,9 @@ function get_updates(
             
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             # Enforce sum-to-zero constraints for RW2 penalty
-            diag_D[1] = 0.0
-            diag_D[2] = 0.0
+            # Zero every null direction: the count depends on the spectrum, and a
+            # disconnected graph has more than one. See _zero_null_modes!.
+            _zero_null_modes!(diag_D, hyper.L)
             
             coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             
@@ -296,7 +296,7 @@ function get_updates(
                 hyper.Q_template,
                 hyper.L,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -355,16 +355,18 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples;
+            as_matrix = true)
 
-        if isempty(sigma_name)
-            @warn "Parameters for BSpline component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        if isnothing(sigma_samples)
+            @warn "Parameters for $(spec.key) (outcome $k) not resolved, and " *
+                  "sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        # Extract posterior samples (these are on the CPU)
-        sigma_samples = get_params_vector(chain, sigma_name, 1)
 
         # Initialize the output matrix for coefficients
         coeffs_samples_matrix = zeros(Float64, n_latent, n_samples)

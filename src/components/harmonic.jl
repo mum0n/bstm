@@ -156,7 +156,7 @@ function get_priors(
     end
 
     if m.period isa UnivariateDistribution
-        push!(priors, "$(p_names.period) ~ $(_distribution_to_string(m.period))")
+        push!(priors, "$(_prior_or_constant(p_names.period, m.period))")
     elseif m.period isa Vector{<:UnivariateDistribution}
         period_prior_str = _distribution_to_string(m.period[1])
         push!(priors, "$(p_names.period) ~ filldist($(period_prior_str), $(m.nharmonics))")

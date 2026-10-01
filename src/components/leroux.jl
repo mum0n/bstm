@@ -51,7 +51,7 @@ flexible way to model spatial autocorrelation.
 """
 struct Leroux <: ComponentModel
     rho::UnivariateDistribution
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     method::Symbol
 end
 
@@ -165,8 +165,8 @@ function get_priors(
 
     priors_acc = String[]
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
-        push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-        push!(priors_acc, "$(p_names.rho) ~ $(_distribution_to_string(m.rho))")
+        push!(priors_acc, "$(_prior_or_constant(p_names.sigma, m.sigma))")
+        push!(priors_acc, "$(_prior_or_constant(p_names.rho, m.rho))")
     end
     if m.method != :marginalized
         push!(priors_acc, "$(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)")
@@ -239,7 +239,7 @@ function get_updates(
                 hyper.L,
                 $(p_names.rho),
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -287,22 +287,19 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(
-            p_names, string(p_names_k.sigma), k, is_multivariate_model
-        )
-        rho_name = _find_parameter(
-            p_names, string(p_names_k.rho), k, is_multivariate_model
-        )
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples;
+            as_matrix = true)
+        rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(rho_name)
-            @warn "Parameters for Leroux component $(spec.key) (outcome $k) " *
-                  "not found. Returning zero-matrix."
+        if isnothing(sigma_samples) || isempty(rho_name)
+            @warn "Parameters for Leroux component $(spec.key) (outcome $k) not resolved, " *
+                  "and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        # Extract posterior samples (these are on the CPU)
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
         
         # Initialize the output matrix for the full latent field

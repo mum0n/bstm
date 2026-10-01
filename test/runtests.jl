@@ -70,6 +70,10 @@ const AVAILABLE_SEGMENTS = Dict{Symbol, @NamedTuple{file::String, desc::String}}
         file = "test_models.jl",
         desc = "Model Instantiation, Smoke Tests & Complex Inference"
     ),
+    :reconstruction => (
+        file = "test_reconstruction.jl",
+        desc = "Reconstruction, Multivariate & Likelihood-Plumbing Regressions"
+    ),
     :multinomial => (
         file = "test_multinomial.jl",
         desc = "Multinomial, Categorical & Dirichlet Formulations"

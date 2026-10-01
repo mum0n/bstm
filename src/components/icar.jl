@@ -56,7 +56,7 @@ from the global intercept.
 - Wikipedia: Conditional autoregressive model
 """
 struct ICAR <: ComponentModel
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     method::Symbol
 end
 
@@ -162,10 +162,10 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     n_latent = spec.hyper.n_latent
     if m.method == :marginalized
-        return "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))"
+        return "$(_prior_or_constant(p_names.sigma, m.sigma))"
     else
         return """ # Priors for sigma and raw innovations
-        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(_prior_or_constant(p_names.sigma, m.sigma))
         $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     end
@@ -187,7 +187,7 @@ function get_updates(
             U = hyper.U
             L = hyper.L
             diag_D = $(p_names.sigma) ./ sqrt.(L .+ M.noise)
-            diag_D[1] = 0.0 # Enforce sum-to-zero constraint
+            diag_D[L .<= (1e-10 * maximum(L))] .= 0.0   # zero EVERY null direction (a disconnected graph has more than one)
             $(p_names.latent_field) = U * (diag_D .* $(p_names.innovations))
             $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.s_idx)
         end
@@ -238,7 +238,7 @@ function get_updates(
                 hyper.Q_template,
                 hyper.L,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -287,20 +287,19 @@ function get_effects(
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
-        # Find parameter names in the MCMC chain
-        sigma_name = _find_parameter(
-            p_names, string(p_names_k.sigma), k, is_multivariate_model
-        )
+        # A pinned `sigma` is not a chain parameter, so `_find_parameter` cannot find it.
+        # Fall back to the declared constant rather than returning a zero field.
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k, is_multivariate_model, n_samples)
 
-        if isempty(sigma_name)
+        if isnothing(sigma_samples)
             @warn "Parameters for ICAR component $(spec.key) (outcome $k) " *
-                  "not found. Returning zero-matrix."
+                  "not found, and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        # Extract posterior samples (these are on the CPU)
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
+        sigma_samples = reshape(sigma_samples, n_samples, 1)
 
         # Initialize the output matrix for latent effects
         effect_k_latent = zeros(Float64, n_latent, n_samples)

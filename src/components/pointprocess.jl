@@ -57,13 +57,19 @@ struct PointProcess <: ComponentModel
     # Common for LGCP/LGMCP
     inner_model::Union{ComponentModel, Nothing}
     # LGCP
-    sigma::Union{UnivariateDistribution, Nothing}
+    # The prior fields accept a `Real` as well as a Distribution (and `Nothing`), so a
+    # hyperparameter can be pinned to a constant. `_prior_or_constant` turns a Real into
+    # `name = value` rather than a prior, and the struct field must accept it or the model
+    # fails to build with a `convert` MethodError naming the struct. `Union{..., Nothing}`
+    # alone cannot represent a fixed value, which is why `sigma=1.0` was rejected. Same
+    # class as the `FITC` and `NetworkFlow` fixes.
+    sigma::Union{UnivariateDistribution, Real, Nothing}
     # LGMCP
-    shape::Union{UnivariateDistribution, Nothing}
+    shape::Union{UnivariateDistribution, Real, Nothing}
     # SNCP
     n_parents::Union{Int, UnivariateDistribution, Nothing}
-    amplitude::Union{UnivariateDistribution, Nothing}
-    length_scale::Union{UnivariateDistribution, Nothing}
+    amplitude::Union{UnivariateDistribution, Real, Nothing}
+    length_scale::Union{UnivariateDistribution, Real, Nothing}
     kernel::Union{String, Nothing}
 end
 
@@ -149,13 +155,13 @@ function get_priors(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx
     if m.method == :lgcp
         n_latent = spec.hyper.inner_hyper.n_latent
         return """
-        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(_prior_or_constant(p_names.sigma, m.sigma))
         $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     elseif m.method == :lgmcp
         n_latent = spec.hyper.inner_hyper.n_latent
         return """
-        $(p_names.shape) ~ $(_distribution_to_string(m.shape))
+        $(_prior_or_constant(p_names.shape, m.shape))
         $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     elseif m.method == :sncp
@@ -167,14 +173,24 @@ function get_priors(m::PointProcess, spec::NamedTuple, arch::String, outcome_idx
         
         priors_list = String[]
         if m.n_parents isa UnivariateDistribution
-            push!(priors_list, "$(n_parents_str) ~ $(_distribution_to_string(m.n_parents))")
+            push!(priors_list, "$(_prior_or_constant(n_parents_str, m.n_parents))")
         end
         
         bounds = spec.hyper.domain_bounds
         push!(priors_list, "$(p_names.parent_locs_x) ~ filldist(Uniform($(bounds.x_min), $(bounds.x_max)), $(n_parents_str))")
         push!(priors_list, "$(p_names.parent_locs_y) ~ filldist(Uniform($(bounds.y_min), $(bounds.y_max)), $(n_parents_str))")
-        push!(priors_list, "$(p_names.length_scale) ~ $(_distribution_to_string(m.length_scale))")
-        push!(priors_list, "$(p_names.amplitude) ~ filldist($(_distribution_to_string(m.amplitude)), $(n_parents_str))")
+        push!(priors_list, "$(_prior_or_constant(p_names.length_scale, m.length_scale))")
+        # `amplitude` is a per-parent vector of length `n_parents`, so it cannot use
+        # `_prior_or_constant` (which emits a scalar binding). A pinned amplitude is therefore
+        # emitted as a filled constant of the right length. Calling
+        # `_distribution_to_string` on a Real would raise `MethodError: no method matching
+        # _distribution_to_string(::Float64)`, the same trap as the `FITC` length scale.
+        amplitude_prior = if m.amplitude isa Real
+            "$(p_names.amplitude) = fill($(m.amplitude), $(n_parents_str))"
+        else
+            "$(p_names.amplitude) ~ filldist($(_distribution_to_string(m.amplitude)), $(n_parents_str))"
+        end
+        push!(priors_list, amplitude_prior)
         
         return join(priors_list, "\n    ")
     end

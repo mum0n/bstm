@@ -103,7 +103,7 @@ on cumulative migration distance.
 """
 struct AStar <: ComponentModel
     beta::UnivariateDistribution
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     friction_power::Union{Float64, UnivariateDistribution}
     smooth::Bool
     method::Symbol
@@ -361,8 +361,8 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     priors = String[]
 
-    push!(priors, "$(p_names.beta) ~ $(_distribution_to_string(m.beta))")
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.beta, m.beta))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
 
     if spec.hyper.is_random_power
         push!(

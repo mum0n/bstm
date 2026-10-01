@@ -64,7 +64,7 @@ is not constant but varies by spatial cluster, while the precision matrix,
 """
 struct LocalAdaptive <: ComponentModel
     rho::UnivariateDistribution
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     n_clusters::Int
     method::Symbol
 end
@@ -115,7 +115,7 @@ function get_precomputes(m::LocalAdaptive, M::NamedTuple, mod_data::Dict)::Named
            hasproperty(data, coord_cols[1]) && hasproperty(data, coord_cols[2])
             cx, cy = coord_cols
             gdf = groupby(data, s_idx_col)
-            unique_coords_df = combine(gdf, [cx, cy] .=> first, renamecols=false)
+            unique_coords_df = DataFrames.combine(gdf, [cx, cy] .=> first, renamecols=false)
             coord_map = Dict(row[s_idx_col] => (row[cx], row[cy]) for row in eachrow(unique_coords_df))
 
             if length(coord_map) < s_N
@@ -166,8 +166,8 @@ function get_priors(
     n_clusters = spec.hyper.n_clusters
     
     return """
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.rho) ~ $(_distribution_to_string(m.rho))
+    $(_prior_or_constant(p_names.sigma, m.sigma))
+    $(_prior_or_constant(p_names.rho, m.rho))
     $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
     $(p_names.innovations_cluster) ~ MvNormal(zeros(T, $(n_clusters)), I)
     """
@@ -275,23 +275,28 @@ function get_effects(
     # --- Reconstruction Loop ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
-        innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
-        innovations_cluster_name = _find_parameter(p_names, string(p_names_k.innovations_cluster), k,
-            is_multivariate_model)
+            # Only `sigma` is pinnable here: `rho` and both innovation blocks are always
+            # sampled. A pinned `sigma` is not a chain parameter, so resolve it with the
+            # constant fallback rather than reading it by name.
+            rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
+            innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
+            innovations_cluster_name = _find_parameter(p_names, string(p_names_k.innovations_cluster), k,
+                is_multivariate_model)
+            sigma_samples = _resolve_hyper_samples(
+                chain, p_names, p_names_k.sigma, m.sigma, k, is_multivariate_model,
+                n_samples; as_matrix = true)
 
-        if isempty(sigma_name) || isempty(rho_name) || isempty(innovations_name)||
-            isempty(innovations_cluster_name)
-            @warn "Parameters for LocalAdaptive component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, N_total, n_samples))
-            continue
-        end
+            if isnothing(sigma_samples) || isempty(rho_name) || isempty(innovations_name) ||
+                isempty(innovations_cluster_name)
+                @warn "Parameters for LocalAdaptive component $(spec.key) (outcome $k) not " *
+                      "resolved, and sigma is not a pinned constant. Returning zero-matrix."
+                push!(structured_effects, zeros(Float64, N_total, n_samples))
+                continue
+            end
 
-        # Extract posterior samples (these are on the CPU)
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
-        rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
-        innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
+            # Extract posterior samples (these are on the CPU)
+            rho_samples = get_params_vector(chain, rho_name, 1) # (n_samples, 1)
+            innovations_samples = get_params_matrix(chain, innovations_name, n_latent) # (n_samples, n_latent)
         innovations_cluster_samples = get_params_matrix(chain, innovations_cluster_name,
             n_clusters) # (n_samples, n_clusters)
         

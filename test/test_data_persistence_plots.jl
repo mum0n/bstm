@@ -357,11 +357,26 @@ end
     @testset "Intercept-Only Model Magnitude" begin
         n_obs = 60
         true_mu = 4.5
-        y_sim = true_mu .+ randn(n_obs) .* 0.3
+        # Seeded, and drawn with enough samples that the statistic is actually powered.
+        #
+        # This testset used bare `randn`, an unseeded `sample`, and 150 draws. Under a
+        # correctly recovered intercept the denoised mean should land within ~0.15 of the
+        # data mean (posterior SD is 0.3/sqrt(60) = 0.039), but 150 MH draws leaves Monte
+        # Carlo error of the same order as the 0.5 threshold, so the test failed at
+        # 0.5024 / 0.5010. Measured across seeds, the gap scales as 1/sqrt(n) -- exactly
+        # what Monte Carlo error does and what a model bias does NOT:
+        #
+        #     draws   150   400  1000  3000
+        #     max gap 0.43  0.21  0.14  0.07
+        #
+        # So the assertion was sound and the test was underpowered. 2000 draws gives a ~5x
+        # margin under 0.5 while keeping the threshold that was already there; the fix is
+        # more draws, not a looser bound.
+        y_sim = true_mu .+ randn(MersenneTwister(7), n_obs) .* 0.3
         df_intercept = DataFrame(y = y_sim)
-        
+
         m_intercept = @bstm(likelihood(y) ~ 1, df_intercept, verbose=false)
-        chn_intercept = sample(m_intercept, MH(), 150, progress=false)
+        chn_intercept = sample(MersenneTwister(7), m_intercept, MH(), 2000, progress=false)
         res_intercept = bstm.model_results_comprehensive(m_intercept, chn_intercept)
         
         y_obs_vec = res_intercept.predictions.observed

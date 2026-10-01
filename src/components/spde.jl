@@ -59,7 +59,7 @@ The model then samples the latent field from \$\\boldsymbol{\\phi} \\sim \\mathc
   of the Royal Statistical Society: Series B (Statistical Methodology), 73(4), 423-498.
 """
 struct SPDE <: ComponentModel
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     range::Union{Distribution, Vector{<:Distribution}}
     method::Symbol
 end
@@ -177,7 +177,7 @@ function get_priors(
     key = spec.key
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
 
     if m.range isa Vector
         range_priors_str = join([_distribution_to_string(p) for p in m.range], ", ")
@@ -268,7 +268,7 @@ function get_updates(
                 hyper.L,
                 $(p_names.range),
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -330,17 +330,21 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
         range_name = _find_parameter(p_names, string(v.range), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(range_name)
-            @warn "Parameters for SPDE component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        # Only `sigma` is pinnable here: `range` is `Union{Distribution, Vector{<:Distribution}}`,
+        # so a fixed range is not representable and it must come from the chain.
+        sigma_samples_cpu = _resolve_hyper_samples(
+            chain, p_names, v.sigma, m.sigma, k, is_multivariate_model, n_samples)
+
+        if isnothing(sigma_samples_cpu) || isempty(range_name)
+            @warn "Parameters for SPDE component $(spec.key) (outcome $k) not resolved, " *
+                  "and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         # Extract posterior samples (CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         range_dim = m.range isa Vector ? length(m.range) : 1
         range_samples_cpu = get_params_matrix(chain, range_name, range_dim)
 

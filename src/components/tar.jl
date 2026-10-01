@@ -136,10 +136,10 @@ function get_priors(
         push!(priors, "$(p_names.sigma_regime_1_unconstrained) ~ Normal(0, 1.0)")
         push!(priors, "$(p_names.sigma_regime_2_unconstrained) ~ Normal(0, 1.0)")
     else # :statespace_constrained
-        push!(priors, "$(p_names.rho_regime_1) ~ $(_distribution_to_string(m.rho_regimes[1]))")
-        push!(priors, "$(p_names.rho_regime_2) ~ $(_distribution_to_string(m.rho_regimes[2]))")
-        push!(priors, "$(p_names.sigma_regime_1) ~ $(_distribution_to_string(m.sigma_regimes[1]))")
-        push!(priors, "$(p_names.sigma_regime_2) ~ $(_distribution_to_string(m.sigma_regimes[2]))")
+        push!(priors, "$(_prior_or_constant(p_names.rho_regime_1, m.rho_regimes[1]))")
+        push!(priors, "$(_prior_or_constant(p_names.rho_regime_2, m.rho_regimes[2]))")
+        push!(priors, "$(_prior_or_constant(p_names.sigma_regime_1, m.sigma_regimes[1]))")
+        push!(priors, "$(_prior_or_constant(p_names.sigma_regime_2, m.sigma_regimes[2]))")
     end
 
     return join(priors, "\n    ")

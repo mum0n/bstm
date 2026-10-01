@@ -58,7 +58,7 @@ its spectral decomposition.
 """
 struct SAR <: ComponentModel
     rho::Distribution
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     method::Symbol
 end
 
@@ -172,17 +172,16 @@ function get_priors(
     key = spec.key
 
     rho_prior_str = _distribution_to_string(m.rho)
-    sigma_prior_str = _distribution_to_string(m.sigma)
-    
+    sigma_prior_str = _prior_or_constant(p_names.sigma, m.sigma)
     if m.method == :marginalized
         return """
             $(p_names.rho) ~ $(rho_prior_str)
-            $(p_names.sigma) ~ $(sigma_prior_str)
+            $(sigma_prior_str)
         """
     else
         return """
             $(p_names.rho) ~ $(rho_prior_str)
-            $(p_names.sigma) ~ $(sigma_prior_str)
+            $(sigma_prior_str)
             $(p_names.innovations) ~ MvNormal(
                 zeros(T, spec_registry[:$(key)].hyper.n_latent), I
             )
@@ -234,7 +233,7 @@ function get_updates(
                 hyper.eigenvalues,
                 $(p_names.rho),
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -289,16 +288,20 @@ function get_effects(
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
         rho_name = _find_parameter(p_names, string(p_names_k.rho), k, is_multivariate_model)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        # Only `sigma` is pinnable here: `rho` is `Distribution`-only, so it must come from
+        # the chain. A pinned `sigma` is not a chain parameter, so resolve it with the
+        # constant fallback rather than reading it by name.
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k, is_multivariate_model, n_samples)
 
-        if isempty(rho_name) || isempty(sigma_name)
-            @warn "Parameters for SAR component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        if isempty(rho_name) || isnothing(sigma_samples)
+            @warn "Parameters for SAR component $(spec.key) (outcome $k) not resolved, " *
+                  "and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         rho_samples = get_params_vector(chain, rho_name, 1)[:, 1]
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
 
         latent_field_matrix = zeros(Float64, n_latent, n_samples)
         

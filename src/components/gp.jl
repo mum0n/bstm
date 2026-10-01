@@ -45,8 +45,10 @@ evaluated at all data points.
     Default: `"se"`.
   - `sigma`: `UnivariateDistribution`, prior for the marginal standard deviation of the GP.
     Default: `Exponential(1.0)`.
-  - `length_scale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
-    the kernel length_scale(s). Default: `Gamma(2, 0.5)`.
+- `length_scale`: `UnivariateDistribution` or `Vector{<:UnivariateDistribution}`, prior for
+  the kernel length_scale(s). A plain `Real` pins the length scale to a constant. Default:
+  `Gamma(2, 0.5)`.
+
   - `anisotropic`: `Bool`, if `true`, a separate length_scale is estimated for each input
     dimension (ARD). Default: `false`.
   - `method`: `Symbol`, computational method (`:noncentered` or `:centered`). Default:
@@ -64,8 +66,8 @@ evaluated at all data points.
   MIT Press.
 """
 struct GP <: ComponentModel
-    length_scale::Union{Distribution, Vector{<:Distribution}}
-    sigma::Distribution
+    length_scale::Union{Distribution, Vector{<:Distribution}, Real}
+    sigma::Union{Distribution, Real}
     kernel::String
     method::Symbol
 end
@@ -144,13 +146,17 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
 
-    # This logic correctly handles both isotropic (single Distribution) and
-    # anisotropic (Vector of Distributions) cases for the length_scale.
+    # A `Real` is a *fixed* length scale, not a prior: emit a plain binding so the
+    # generated model refers to a constant instead of a sampled parameter. That keeps
+    # `length_scale=2.5` meaning what it looks like, instead of forcing callers to spell a
+    # degenerate distribution to pin a hyperparameter.
     if m.length_scale isa Vector
         length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
         push!(priors, "$(p_names.length_scale) ~ Product([$(length_scale_priors_str)])")
+    elseif m.length_scale isa Real
+        push!(priors, "$(p_names.length_scale) = $(m.length_scale)")
     else
         length_scale_prior_str = _distribution_to_string(m.length_scale)
         push!(priors, "$(p_names.length_scale) ~ $(length_scale_prior_str)")
@@ -212,7 +218,7 @@ function get_updates(
                 $(p_names.sigma),
                 $(p_names.length_scale),
                 kernel_type,
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -265,19 +271,36 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        length_scale_name = _find_parameter(p_names, string(p_names_k.length_scale), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(length_scale_name)
-            @warn "Parameters for GP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        # Both `sigma` and `length_scale` are pinnable here (`Union{..., Real}`), so both need
+        # the constant fallback: a pinned hyperparameter is not a chain parameter, and reading
+        # it by name alone would bail to a zero field.
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples;
+            as_matrix = true)
+
+        # `length_scale` needs its own path rather than `_resolve_hyper_samples`, because an
+        # anisotropic `Vector{<:Distribution}` occupies SEVERAL chain columns and the helper
+        # returns only the first. A pinned `Real` is necessarily scalar, so the two cases do not
+        # overlap: a Real means fixed-and-uniform, a Vector means sampled-per-axis.
+        length_scale_dim = m.length_scale isa Vector ? length(m.length_scale) : 1
+        length_scale_samples = if m.length_scale isa Real
+            fill(Float64(m.length_scale), n_samples, 1)
+        else
+            ls_name = _find_parameter(p_names, string(p_names_k.length_scale), k,
+                                      is_multivariate_model)
+            isempty(ls_name) ? nothing :
+                get_params_matrix(chain, ls_name, length_scale_dim)
+        end
+
+        if isnothing(sigma_samples) || isnothing(length_scale_samples)
+            @warn "Parameters for GP component $(spec.key) (outcome $k) not resolved, " *
+                  "and sigma / length_scale are not both pinned constants. " *
+                  "Returning zero-matrix."
             push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
             continue
         end
-
-        sigma_samples = get_params_vector(chain, sigma_name, 1)
-        length_scale_dim = m.length_scale isa Vector ? length(m.length_scale) : 1
-        length_scale_samples = get_params_matrix(chain, length_scale_name, length_scale_dim)
 
         effect_k_matrix = zeros(Float64, n_obs_full, n_samples)
 

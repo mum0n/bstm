@@ -151,12 +151,12 @@ function get_priors(
     v = generate_full_variable_names(spec, arch, outcome_idx)
     
     prior_lines = ["# --- Priors for SciML component: $(spec.key) ---"]
-    push!(prior_lines, "$(v.u0) ~ $(_distribution_to_string(m.initial_state_prior))")
+    push!(prior_lines, "$(_prior_or_constant(v.u0, m.initial_state_prior))")
     
     for p_name in spec.hyper.param_names
         p_prior = m.parameter_priors[p_name]
         p_var_name = getproperty(v, Symbol("p_$(p_name)"))
-        push!(prior_lines, "$(p_var_name) ~ $(_distribution_to_string(p_prior))")
+        push!(prior_lines, "$(_prior_or_constant(p_var_name, p_prior))")
     end
 
     if m.likelihood_type == :direct

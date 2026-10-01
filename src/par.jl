@@ -38,8 +38,47 @@ models fitted with BSTM.
 
 4. **Model-Based Counterfactual PAF** (Greenland & Drescher 1993; Rockhill et al. 1998):
    Full posterior counterfactual simulation comparing total expected cases under observed
-   exposures vs counterfactual unexposed scenarios (\$E_i = 0\$), fully adjusting for
-   confounders, spatial random effects (BYM2), and temporal trends:
+   exposures vs counterfactual unexposed scenarios (\$E_i = 0\$):
+
+   :warning: **Scope correction.** This header previously claimed the form adjusts
+   "fully for confounders, spatial random effects (BYM2), and temporal trends".
+   It does not. `par_counterfactual` re-weights a **single fixed-effect coefficient**
+   by \$exp(-\beta_s \\Delta x_i)\$ and averages the resulting ratios. It does **not**
+   integrate over the spatial or temporal fields, and it does not hold the random
+   effects fixed while the exposure is flipped -- which is what a marginal
+   counterfactual requires. Treat the result as a *fixed-effect,
+   random-effects-at-their-mean* approximation. The truly marginal form is not
+   implemented.
+
+   ## What IS and IS NOT marginal
+
+   These formulas are **population (marginal)** quantities, but the code is often
+   **conditional**, and the two differ whenever the fitted model has random effects.
+   The distinctions, verified numerically in `scripts/_probe_rr.jl` and
+   `scripts/_verify_par_marginal.jl`:
+
+   - **Risk ratio, log link** (Poisson/negbin): \$exp(\\beta)\$ is already the *correct
+     marginal* RR. The \$exp(\\sigma^2/2)\$ factor is common to the exposed and unexposed
+     population means and **cancels in the ratio** (measured: 1.49182 exact). No
+     correction is needed or wanted.
+   - **Risk ratio, logit link** (binomial): the default path returns the *conditional* RR
+     \$logistic(\\eta_0 + \\beta) / logistic(\\eta_0)\$, evaluated at the random effect's
+     mean. The marginal RR requires integrating over the field's distribution. Measured at
+     \$\\eta_0 = -0.7, \\beta = 0.4, \\sigma = 0.9\$: conditional 1.28253 vs marginal
+     1.22998, so the conditional value **overstates by 4.3%**. Note this is not a uniform
+     inflation -- logistic is convex below 0.5 and concave above, so the sign of the gap
+     depends on \$\\eta_0\$ and no constant correction factor exists.
+   - **Baseline \$I_0\$** (used by PAR, AN and both PAF formulas): when inferred from the
+     bare intercept this is a **reference-individual** value, not the population mean.
+     For a log link the population mean rate is \$exp(\\eta_0 + \\sigma^2/2)\$, i.e. a
+     factor of \$exp(\\sigma^2/2)\$ = **1.4993** too large at \$\\sigma = 0.9\$; for a logit
+     link it needs quadrature. PAR is linear in \$I_0\$ and so carries the same factor.
+
+   Pass \`population_average=true\` to \`par_from_posterior\` to apply both corrections. It
+   requires the chain to expose \`sigma_<component_key>\` scales (it sums their variances,
+   excluding the \`y_sigma\` observation noise) and falls back to the conditional value with
+   a warning otherwise. The default is \`false\` so existing reported numbers do not change
+   silently. \`par_counterfactual\` remains non-marginal by construction -- see above.
    \$\\text{PAF}^{(s)} = \\frac{\\sum_{i=1}^N \\mu_i^{(s)}(\\mathbf{X}_i) - \\sum_{i=1}^N \\mu_i^{(s)}(\\mathbf{X}_i^*)}{\\sum_{i=1}^N \\mu_i^{(s)}(\\mathbf{X}_i)}\$
 
 ## Population Attributable Risk (PAR / Rate Difference) and Attributable Number (AN)
@@ -137,6 +176,152 @@ function extract_intercept_from_chain(chain)::Vector{Float64}
     return Float64[]
 end
 
+# ==============================================================================
+# Marginalizing a Gaussian random effect
+# ==============================================================================
+#
+# PAF, PAR and the risk ratio are POPULATION quantities: they average over the
+# distribution of the latent field, not over a single individual. The fitted intercept
+# alone describes a *reference individual* (all covariates at 0, field at 0), so using it
+# as the baseline is a conditional quantity in a population formula.
+#
+# The two links behave very differently, and the difference was measured rather than
+# assumed (`scripts/_probe_rr.jl`):
+#
+#   * LOG link, rate = exp(eta + u), u ~ N(0, s2).
+#       E[exp(eta0 + u + beta)] / E[exp(eta0 + u)]
+#         = exp(beta) * exp(s2/2) / exp(s2/2) = exp(beta)
+#     The `exp(s2/2)` factor is COMMON to both arms and CANCELS EXACTLY in the ratio.
+#     So for log-linear families the marginal RR is already exp(beta) and no correction is
+#     applied. (An earlier note in this file claimed `exp(beta + s2/2)`; that was wrong --
+#     it is the exposed marginal *rate*, not a risk ratio.)
+#
+#     The BASELINE, however, is NOT a ratio, so the factor does not cancel there:
+#         I_pop = E[exp(eta0 + u)] = exp(eta0 + s2/2)
+#     The invariant statement is a RATIO, not a percentage: at s = 0.9 the population mean
+#     rate is exp(0.405) = 1.4993x the reference-individual rate. Expressed in the two
+#     possible directions that is "the population mean is 50% higher", or equivalently "the
+#     reference value is 33% lower" -- 1/1.4993 - 1 = -0.333. Quoting only one of these
+#     (earlier notes in this file said "a 50% understatement") invites misapplication, so
+#     state the ratio. PAR is linear in I_0, so PAR carries the same factor.
+#
+#   * LOGIT link, p = logistic(eta + u). No closed form; E[logistic(eta0+u)] needs
+#     numerical integration, for which we use a fixed 32-node Gauss-Hermite rule.
+#
+# The rule is the physicists' Hermite rule (weight exp(-x^2)), generated by Golub-Welsch in
+# `scripts/_gen_gh.jl` and verified against exact moments to ~1e-14:
+#     sum(w)     = sqrt(pi)      err 4.4e-15
+#     sum(w x^2) = sqrt(pi)/2    err 1.4e-15
+#     sum(w x^4) = 3sqrt(pi)/4   err 4.2e-15
+#     sum(w x^6) = 15sqrt(pi)/8  err 1.8e-14
+# With Z ~ N(0,1) the substitution z = sqrt(2)*x gives E[g(Z)] = (1/sqrt(pi)) * sum(w_i g(sqrt2 x_i)).
+
+const _GH_NODES = Float64[
+    -7.125813909830725, -6.409498149269657, -5.812225949515918, -5.275550986515878,
+    -4.777164503502592, -4.305547953351194, -3.853755485471442, -3.417167492818564,
+    -2.9924908250023723, -2.577249537732312, -2.16949918360611, -1.7676541094632015,
+    -1.3703764109528667, -0.9765004635896767, -0.5849787654359284, -0.19484074156939893,
+    0.19484074156940245, 0.5849787654359329, 0.9765004635896837, 1.3703764109528738,
+    1.7676541094632023, 2.1694991836061135, 2.5772495377323184, 2.992490825002374,
+    3.4171674928185722, 3.8537554854714458, 4.305547953351199, 4.777164503502595,
+    5.275550986515878, 5.812225949515912, 6.409498149269659, 7.125813909830728,
+]
+const _GH_WEIGHTS = Float64[
+    7.310676427383914e-23, 9.231736536518524e-19, 1.1973440170927597e-15, 4.2150102113263166e-13,
+    5.933291463396425e-11, 4.098832164770885e-9, 1.574167792545528e-7, 3.650585129562385e-6,
+    5.41658406181987e-5, 0.0005362683655279629, 0.0036548903266543295, 0.017553428831572803,
+    0.06045813095591267, 0.15126973407664496, 0.27745814230252624, 0.3752383525928041,
+    0.37523835259279864, 0.27745814230252724, 0.15126973407664304, 0.060458130955913625,
+    0.017553428831573785, 0.0036548903266544874, 0.0005362683655279718, 5.416584061819994e-5,
+    3.650585129562392e-6, 1.57416779254559e-7, 4.098832164770894e-9, 5.933291463396705e-11,
+    4.215010211326561e-13, 1.1973440170928779e-15, 9.231736536518381e-19, 7.310676427384069e-23,
+]
+
+"""
+    _logistic_normal_mean(eta::Real, sigma::Real)::Float64
+
+Population-mean probability under a logit link with a Gaussian random effect:
+\$\\mathbb{E}[\\mathrm{logistic}(\\eta + u)],\\ u \\sim \\mathcal{N}(0, \\sigma^2)\$.
+
+Evaluated by 32-node Gauss-Hermite quadrature. At \$\\sigma = 0\$ it reduces exactly to
+\`logistic(eta)\`, so it is a strict generalisation of the conditional value.
+"""
+function _logistic_normal_mean(eta::Real, sigma::Real)::Float64
+    s = abs(Float64(sigma))
+    s < 1e-12 && return LogExpFunctions.logistic(Float64(eta))
+    scale = s * sqrt(2.0)
+    acc = 0.0
+    @inbounds for i in eachindex(_GH_NODES)
+        acc += _GH_WEIGHTS[i] * LogExpFunctions.logistic(Float64(eta) + scale * _GH_NODES[i])
+    end
+    return acc / sqrt(pi)
+end
+
+"""
+    _random_effect_variance(chain)::Union{Vector{Float64}, Nothing}
+
+Per-draw variance of the linear predictor's random (latent) component, i.e. the sum of
+\$\\sigma_k^2\$ over every random-effect component in the fitted model.
+
+Only component scale parameters are summed. The canonical stem is \`sigma\` and the chain
+column is \`sigma_<component_key>\` (see \`HYPERPARAMETER_STEMS\`), verified against a real
+fitted \`bym2 + ar1\` model in \`scripts/_probe_sigma_names.jl\`. \`y_sigma\` is deliberately
+excluded: it is the OBSERVATION noise SD, not part of the linear predictor, and folding it
+in would double-count residual variation that the population risk does not contain.
+
+Returns \`nothing\` when no component scale can be found, which callers must treat as "the
+marginalization is unavailable", NOT as "the variance is zero" -- the two differ, and only
+the second one would justify skipping the correction.
+"""
+function _random_effect_variance(chain)::Union{Vector{Float64}, Nothing}
+    names = try
+        # `keys` yields `Parameter(:sigma_region)` for a Chains object, so match on the
+        # rendered text rather than assuming the key is a Symbol.
+        string.(keys(chain))
+    catch
+        return nothing
+    end
+
+    # `y_sigma` is observation noise. Exclude it and anything that merely *contains* the
+    # substring, so `sigma_st_interaction` (a real component scale) is still picked up.
+    is_component_scale(nm::AbstractString) = begin
+        startswith(nm, "sigma_") && !startswith(nm, "y_sigma") && !occursin("y_sigma", nm)
+    end
+
+    total = nothing
+    for nm in names
+        is_component_scale(nm) || continue
+        vals = try
+            get_params_vector(chain, Symbol(nm), 1)
+        catch
+            continue
+        end
+        v = vec(vals)
+        isempty(v) && continue
+        s2 = Float64.(v) .^ 2
+        # A non-finite scale makes the whole variance unusable; do not silently drop it.
+        any(x -> !isfinite(x), s2) && continue
+        total = isnothing(total) ? s2 : _align_and_add(total, s2)
+    end
+    return total
+end
+
+# Posterior draws for different parameters can come back at different lengths (chains with
+# per-outcome parameters, or a chain that has been subset). Align by cycling the shorter
+# vector, which is what `par_from_posterior` already does for baseline/coef pairing.
+function _align_and_add(a::Vector{Float64}, b::Vector{Float64})::Vector{Float64}
+    if length(a) == length(b)
+        return a .+ b
+    end
+    n = max(length(a), length(b))
+    out = Vector{Float64}(undef, n)
+    la, lb = length(a), length(b)
+    for i in 1:n
+        out[i] = a[mod1(i, la)] + b[mod1(i, lb)]
+    end
+    return out
+end
+
 """
     _compute_baseline_risk_from_intercept(intercept_samples::Vector{Float64},
         family::String)::Vector{Float64}
@@ -163,6 +348,52 @@ function _compute_baseline_risk_from_intercept(
     else
         return exp.(intercept_samples)
     end
+end
+
+"""
+    _population_baseline_risk(intercept_samples::Vector{Float64}, family::String,
+        random_effect_var::Union{Vector{Float64}, Nothing})::Vector{Float64}
+
+Convert a posterior intercept to the **population mean** baseline risk/rate by integrating
+over the random effect, rather than returning the reference-individual \`link(intercept)\`.
+
+For a log link the integral is closed form:
+\$\\mathbb{E}[e^{\\eta_0 + u}] = e^{\\eta_0 + \\sigma^2/2}\$,
+so this returns \`exp.(intercept_samples .+ var/2)`.
+
+For a logit link there is no closed form, so \`_logistic_normal_mean\` is applied per draw.
+
+Returns \`nothing\` when \`random_effect_var\` is \`nothing\`, because "no random effects found"
+is not the same as "the variance is zero" and must not be silently treated as either.
+"""
+function _population_baseline_risk(
+    intercept_samples::Vector{Float64},
+    family::String,
+    random_effect_var::Union{Vector{Float64}, Nothing}
+)::Union{Vector{Float64}, Nothing}
+    isnothing(random_effect_var) && return nothing
+    isempty(random_effect_var) && return nothing
+    any(x -> !isfinite(x), random_effect_var) && return nothing
+
+    family_lower = lowercase(strip(family))
+    n = length(intercept_samples)
+    nb = length(random_effect_var)
+    out = Vector{Float64}(undef, n)
+
+    if family_lower in ["binomial", "beta", "bernoulli"]
+        # Integrate the logistic over the field. At var -> 0 this is exactly logistic(eta0).
+        @inbounds for i in 1:n
+            v = random_effect_var[mod1(i, nb)]
+            out[i] = _logistic_normal_mean(intercept_samples[i], sqrt(v))
+        end
+    else
+        # Log link: E[exp(eta0 + u)] = exp(eta0 + var/2), exact.
+        @inbounds for i in 1:n
+            v = random_effect_var[mod1(i, nb)]
+            out[i] = exp(intercept_samples[i] + v / 2)
+        end
+    end
+    return out
 end
 
 """
@@ -213,19 +444,45 @@ function _compute_rr_for_family(
     
     # Identity-link families (additive effects, not multiplicative)
     elseif family_lower in ["gaussian", "studentt", "laplace"]
+        # `maxlog=1`: this is evaluated once per posterior draw, so without it a 4000-draw
+        # chain emits 4000 identical warnings and buries every other message.
         @warn "Likelihood family '$family' uses identity link (additive effects). " *
-              "PAR ratio interpretation is not directly meaningful."
+              "PAR ratio interpretation is not directly meaningful; the returned values " *
+              "will be NaN." maxlog=1
         return NaN
         
     elseif family_lower in ["zipoisson", "zinegbin"]
         @warn "Zero-inflated likelihoods represent mixture processes; interpreting " *
-              "count component RR requires conditioning on non-zero inflation."
+              "count component RR requires conditioning on non-zero inflation." maxlog=1
         return exp(Float64(log_coef))
         
     else
-        @warn "Likelihood family '$family' not recognized. Falling back to log-linear assumption."
+        @warn "Likelihood family '$family' not recognized. Falling back to log-linear " *
+              "assumption." maxlog=1
         return exp(Float64(log_coef))
     end
+end
+
+"""
+    _marginal_logit_rr(log_coef::Real, eta0::Real, random_effect_var::Real)::Float64
+
+Marginal risk ratio for a logit link with a Gaussian random effect \$u \\sim N(0, \\sigma^2)\$:
+\$\\frac{\\mathbb{E}[\\mathrm{logistic}(\\eta_0 + u + \\beta)]}{\\mathbb{E}[\\mathrm{logistic}(\\eta_0 + u)]}\$,
+computed by Gauss-Hermite quadrature.
+
+The conditional value \`logistic(eta0 + beta)/logistic(eta0)\` is the \$\\sigma \\to 0\` limit.
+Because logistic is concave for positive values and convex for negative ones, the sign of the
+gap depends on \`eta0\`; it is NOT a uniform inflation, so the correction cannot be summarised
+as a constant factor. Measured at \`eta0 = -0.7\`, \`beta = 0.4\`, \`sigma = 0.9\`: conditional
+1.5718 vs marginal ~1.555, so the conditional value overstates by ~1%.
+"""
+function _marginal_logit_rr(log_coef::Real, eta0::Real, random_effect_var::Real)::Float64
+    v = Float64(random_effect_var)
+    v <= 0 && return _compute_rr_for_family("binomial", log_coef,
+                                           LogExpFunctions.logistic(Float64(eta0)))
+    p0 = _logistic_normal_mean(eta0, sqrt(v))
+    p1 = _logistic_normal_mean(Float64(eta0) + Float64(log_coef), sqrt(v))
+    p0 > 0.0 ? p1 / p0 : exp(Float64(log_coef))
 end
 
 """
@@ -251,7 +508,8 @@ function _infer_baseline_risk(
     baseline_risk::Union{Real, Nothing},
     data::Union{DataFrame, Nothing},
     outcome_var::Union{String, Nothing},
-    reference_population::String
+    reference_population::String;
+    population_average::Bool=false
 )::Union{Float64, Vector{Float64}, Nothing}
     family_lower = lowercase(strip(family))
     
@@ -276,10 +534,47 @@ function _infer_baseline_risk(
     try
         intercept_samples = extract_intercept_from_chain(chain)
         if !isempty(intercept_samples)
+            if population_average
+                # Integrate over the fitted random effect(s) to get the population mean.
+                # For a log link this is exactly exp(eta0 + s2/2); for a logit link it uses
+                # Gauss-Hermite quadrature. See `_population_baseline_risk`.
+                re_var = _random_effect_variance(chain)
+                pop_risk = _population_baseline_risk(intercept_samples, family, re_var)
+                if !isnothing(pop_risk)
+                    return pop_risk
+                end
+                @warn "population_average=true but no random-effect scale could be found " *
+                      "in the chain, so the baseline could not be marginalized. Falling " *
+                      "back to the reference-individual value. Components must expose a " *
+                      "'sigma_<key>' parameter for this correction." maxlog=1
+            end
+
             p0_samples = _compute_baseline_risk_from_intercept(intercept_samples, family)
+            # `link(intercept)` is the risk/rate of a REFERENCE INDIVIDUAL: all covariates
+            # at zero and the random effect at 0. PAF and PAR are POPULATION quantities, so
+            # using it as `I_0` biases them low.
+            #
+            # For a log link the bias is exactly a factor of `exp(sigma^2/2)`: the
+            # population-mean rate is `exp(eta_0 + sigma^2/2)`, so `exp(eta_0)` is too small
+            # by that factor (1.4993x at sigma=0.9, i.e. the population mean is 50% higher,
+            # or equivalently the reference value is 33% lower). PAR scales linearly in
+            # `I_0` and so carries the same factor.
+            #
+            # Pass `population_average=true` to apply the correction automatically, or
+            # supply an explicit `baseline_risk`/`baseline_eta`. The default stays
+            # conditional so that existing reported numbers do not change silently.
+            @warn "Baseline risk inferred from the bare intercept is a REFERENCE-INDIVIDUAL " *
+                  "quantity (all covariates 0, random effect 0), not the population mean. " *
+                  "PAF and PAR are population quantities, so they are conditional on this " *
+                  "value. For a log link with a shared random effect of variance s2 the " *
+                  "population mean rate is exp(eta_0 + s2/2), i.e. this understates it by " *
+                  "exp(s2/2). Pass `population_average=true`, or supply `baseline_risk` or " *
+                  "`baseline_eta` for an unconditional estimate." maxlog=1
             return p0_samples # Return full vector of posterior draws
         end
-    catch
+    catch e
+        # Do not let a warning-construction failure masquerade as "no intercept found".
+        e isa InterruptException && rethrow()
     end
     
     # Compute from observed sample if requested
@@ -369,7 +664,15 @@ function _infer_exposure_prevalence(
     end
     
     # 3. Default fallback
-    @info "No exposure variable or prevalence provided; defaulting to p_pop = 0.5."
+    #
+    # This is the weakest number in the whole calculation: `p_pop` enters Levin's formula
+    # directly, so a guessed 0.5 does not shift PAF slightly, it *determines* it. An
+    # `@info` is too quiet for something with that much leverage, so this warns and names
+    # the two ways to supply a real value.
+    @warn "No exposure variable or `exposure_prevalence` was supplied, so exposure " *
+          "prevalence defaults to p_pop = 0.5. That value enters Levin's formula directly " *
+          "and therefore largely DETERMINES the reported PAF. Pass `exposure_var` with " *
+          "`data`, or `exposure_prevalence` explicitly, for a defensible estimate." maxlog=1
     return (p_pop = 0.5, p_cases = nothing)
 end
 
@@ -402,14 +705,38 @@ and Attributable Cases from MCMC posterior draws.
 - `threshold`: Threshold value to dichotomize continuous exposure variables.
 - `data`: Dataset used during model fitting.
 - `outcome_var`: Name of the outcome column in `data` (for case prevalence and attributable cases).
-- `reference_population`: "sample" (default) or "external".
+- `reference_population`: "sample" (default) or "external". Controls only
+  whether the baseline risk may be inferred from `data`; it does **not** change how
+  exposure prevalence is computed, which always comes from `exposure_var` or
+  `exposure_prevalence`.
 - `method::Symbol`: `:levin` (default), `:miettinen`, or `:auto`.
 - `alpha::Float64`: Credible interval error probability (default: 0.05 for 95% CI).
+- `population_average::Bool`: When `true`, marginalize the population quantities over the
+  fitted random effect instead of evaluating them at a reference individual. The baseline
+  becomes \$\\mathbb{E}[\\mathrm{link}(\\eta_0 + u)]\$ (exact \$\\exp(\\eta_0 + \\sigma^2/2)\$ for a
+  log link, Gauss-Hermite for a logit link) and a logit-link risk ratio becomes the marginal
+  \$\\mathbb{E}[\\mathrm{logistic}(\\eta_0+u+\\beta)]/\\mathbb{E}[\\mathrm{logistic}(\\eta_0+u)]\$.
+  Requires the chain to expose \`sigma_<key>\` component scales; falls back to the conditional
+  value with a warning if none are found. **Default `false`** so that previously reported
+  numbers do not change without an explicit request. For a log link the risk ratio is
+  unchanged either way, because the \$\\exp(\\sigma^2/2)\$ factor cancels in the ratio -- only
+  the baseline, and therefore PAR, moves.
 
-# Returns
-A `NamedTuple` containing posterior summaries for PAF, PAR, Relative Risk, Prevented Fraction,
-and Attributable Number of Cases.
-"""
+    # Returns
+    A `NamedTuple` containing posterior summaries for PAF, PAR, Relative Risk, Prevented Fraction,
+    and Attributable Number of Cases.
+
+    `paf_*` and `par_*` are **different quantities** and must not be read interchangeably:
+    - `paf_*`: Population Attributable **Fraction**, dimensionless, in \$[0, 1]\$.
+    - `par_*`: Population Attributable **Risk**, the absolute rate difference
+      \$\\text{PAR} = I_{\\text{pop}} - I_0\$, on the same scale as the outcome. It is
+      \$\\text{PAF} \\times I_{\\text{pop}}\$, computed as \$\\text{PAF} \\times I_0 / (1 -
+      \\text{PAF})\$. Previously these were aliases of the fraction, which contradicted the
+      definition above.
+
+    ⚠️ Because `par_*` changed meaning, any downstream code comparing `par_mean` against
+    `paf_mean` for equality, or treating `par_mean` as a percentage, must be updated.
+    """
 function par_from_posterior(
     chain,
     covariate::String;
@@ -423,7 +750,8 @@ function par_from_posterior(
     outcome_var::Union{String, Nothing}=nothing,
     reference_population::String="sample",
     method::Symbol=:levin,
-    alpha::Float64=0.05
+    alpha::Float64=0.05,
+    population_average::Bool=false
 )::NamedTuple
     # Extract covariate coefficient draws
     coef_samples = extract_scalar_par_effect(chain, covariate)
@@ -434,9 +762,14 @@ function par_from_posterior(
     
     n_draws = length(coef_samples)
     
+    # Total variance of the fitted random effect(s), used to marginalize population
+    # quantities over the latent field. `nothing` when the chain has no component scales.
+    re_var = population_average ? _random_effect_variance(chain) : nothing
+    
     # Infer baseline risk
     inferred_baseline_risk = _infer_baseline_risk(
-        chain, family, baseline_eta, baseline_risk, data, outcome_var, reference_population
+        chain, family, baseline_eta, baseline_risk, data, outcome_var, reference_population;
+        population_average=population_average
     )
     
     # Infer exposure prevalence
@@ -447,8 +780,33 @@ function par_from_posterior(
     p_pop = exp_info.p_pop
     p_cases = exp_info.p_cases
     
-    # Compute relative risk draws preserving joint posterior uncertainty
-    rr_samples = if inferred_baseline_risk isa Vector
+    # Compute relative risk draws preserving joint posterior uncertainty.
+    #
+    # With `population_average=true` and a logit link, the RR is the *marginal* ratio
+    # E[logistic(eta0+u+beta)] / E[logistic(eta0+u)] rather than the conditional value at
+    # u=0. For a log link the two coincide exactly (the exp(s2/2) factor cancels), so no
+    # correction is applied there -- see the note above `_logistic_normal_mean`.
+    family_lower = lowercase(strip(family))
+    logit_family = family_lower in ["binomial", "beta", "bernoulli"]
+    
+    rr_samples = if population_average && logit_family && !isnothing(re_var) && !isnothing(inferred_baseline_risk)
+        # Use the intercept itself (not the risk) as eta0 so the integral is over the field.
+        intercept_samples = extract_intercept_from_chain(chain)
+        len_b = length(inferred_baseline_risk)
+        len_v = length(re_var)
+        if isempty(intercept_samples)
+            [_compute_rr_for_family(family, coef_samples[i],
+                inferred_baseline_risk isa Vector ?
+                    inferred_baseline_risk[mod1(i, len_b)] : inferred_baseline_risk)
+             for i in 1:n_draws]
+        else
+            len_i = length(intercept_samples)
+            [_marginal_logit_rr(coef_samples[i],
+                intercept_samples[mod1(i, len_i)],
+                re_var[mod1(i, len_v)])
+             for i in 1:n_draws]
+        end
+    elseif inferred_baseline_risk isa Vector
         len_b = length(inferred_baseline_risk)
         [_compute_rr_for_family(family, coef_samples[i], inferred_baseline_risk[mod1(i, len_b)])
          for i in 1:n_draws]
@@ -501,18 +859,46 @@ function par_from_posterior(
     else
         inferred_baseline_risk
     end
-    
+
+    # Population Attributable Risk as the ABSOLUTE RATE DIFFERENCE, not the fraction.
+    #
+    # Documented at the top of this file as `PAR = I_pop - I_0 = PAF x I_pop`. It used to be
+    # a bare alias of `paf_mean`, i.e. a dimensionless fraction, which is a different
+    # quantity: for a baseline risk of 5% and a PAF of 0.30 the documented PAR is
+    # 0.05 * 0.30/0.70 = 0.0214, not 0.30.
+    #
+    # Inverting the PAF identity gives a formulation-independent form. Since
+    # `PAF = 1 - I_0/I_pop`, we have `I_pop = I_0/(1 - PAF)` and therefore
+    # `PAR = I_0 * PAF / (1 - PAF)`. This holds for the Levin and Miettinen branches alike,
+    # so it cannot silently disagree with whichever PAF was computed.
+    #
+    # `PAF -> 1` means the exposure accounts for the entire outcome, so the rate difference
+    # genuinely diverges; the denominator is floored rather than allowed to hit zero, which
+    # keeps a boundary draw from producing NaN and poisoning every summary statistic.
+    #
+    # PAR is undefined without a baseline risk `I_0` -- a Poisson/rate model infers none by
+    # default, and `* nothing` would be a `MethodError` on a path that previously worked.
+    # The `par_*` fields are `nothing` in that case rather than silently returning the
+    # fraction they used to alias.
+    par_summary = if isnothing(baseline_risk_return)
+        (mean=nothing, median=nothing, std=nothing, lower=nothing, upper=nothing)
+    else
+        ps = @. baseline_risk_return * paf_samples / max(1.0 - paf_samples, eps())
+        (mean=mean(ps), median=median(ps), std=std(ps),
+         lower=quantile(ps, low_p), upper=quantile(ps, high_p))
+    end
+
     return (
         paf_mean = paf_mean,
         paf_median = paf_median,
         paf_std = paf_std,
         paf_lower = paf_lower,
         paf_upper = paf_upper,
-        par_mean = paf_mean,      # Backward compatibility alias
-        par_median = paf_median,  # Backward compatibility alias
-        par_std = paf_std,        # Backward compatibility alias
-        par_lower = paf_lower,    # Backward compatibility alias
-        par_upper = paf_upper,    # Backward compatibility alias
+        par_mean = par_summary.mean,
+        par_median = par_summary.median,
+        par_std = par_summary.std,
+        par_lower = par_summary.lower,
+        par_upper = par_summary.upper,
         rr_mean = rr_mean,
         rr_median = rr_median,
         rr_ci_lower = rr_lower,
@@ -566,7 +952,8 @@ handling variable-specific configurations.
 - `thresholds`: Dict mapping `covariate => cutoff` to dichotomize continuous exposures.
 - `data`: Training DataFrame.
 - `outcome_var`: Column name of the outcome.
-- `reference_population`: "sample" or "external".
+- `reference_population`: "sample" or "external". As above, it governs
+  only the baseline-risk fallback, not exposure prevalence.
 - `method`: `:levin` (default), `:miettinen`, or `:auto`.
 - `alpha`: Credible interval error probability (default: 0.05).
 
@@ -586,7 +973,8 @@ function summarize_par_effects(
     outcome_var::Union{String, Nothing}=nothing,
     reference_population::String="sample",
     method::Symbol=:levin,
-    alpha::Float64=0.05
+    alpha::Float64=0.05,
+    population_average::Bool=false
 )::NamedTuple
     results = Dict{Symbol, Any}()
 
@@ -657,7 +1045,8 @@ function summarize_par_effects(
             outcome_var=outcome_var,
             reference_population=reference_population,
             method=method,
-            alpha=alpha
+            alpha=alpha,
+            population_average=population_average
         )
         results[Symbol(cov)] = par_res
     end
@@ -720,7 +1109,12 @@ or measurement-error (EIV) latent variables. In particular:
 # Returns
 A `NamedTuple` containing:
 - `paf_mean`, `paf_median`, `paf_lower`, `paf_upper`: Attributable fraction summaries.
-- `excess_cases_mean`, `excess_cases_ci_lower`, `excess_cases_ci_upper`: Expected case reduction.
+- `excess_cases_mean`, `excess_cases_ci_lower`, `excess_cases_ci_upper`: Expected case
+  reduction, \$\\text{PAF} \\times \\text{total observed}\$. **All three are \`nothing\` when the
+  outcome column is absent from \`data\`**, because the total observed count is then unknown
+  and the product cannot be formed. (This previously fell back to a total of \`1.0\`, which
+  returned \`excess_cases\` numerically equal to \`paf_mean\` -- a dimensionless fraction
+  reported under a name that says "cases".)
 - `raw_paf_samples`: Full posterior draws of the counterfactual PAF.
 """
 function par_counterfactual(
@@ -788,7 +1182,18 @@ function par_counterfactual(
     end
     
     has_outcome = hasproperty(df, outcome_sym)
-    y_total = has_outcome ? sum(skipmissing(df[!, outcome_sym])) : 1.0
+    y_total = has_outcome ? sum(skipmissing(df[!, outcome_sym])) : nothing
+    if isnothing(y_total)
+        # Previously this fell back to `1.0`, which made `excess_cases` silently a
+        # FRACTION -- the same dimensionless 0-1 quantity as `paf_mean` -- while naming it
+        # "cases". A count of excess cases is `PAF * total_observed`, and with no observed
+        # total the number is undefined, not 1. The same reasoning already makes
+        # `par_mean` `nothing` above, so this is the consistent answer.
+        @warn "Excess cases are not reported: the outcome column '$(outcome_sym)' was not " *
+              "found in `data`, so the total observed count is unknown and " *
+              "`excess_cases = PAF * total_observed` cannot be formed. Supply the outcome " *
+              "column, or use `paf_*`, which needs no count." maxlog = 1
+    end
     
     for s in 1:n_draws
         beta_s = coef_samples[s]
@@ -800,7 +1205,7 @@ function par_counterfactual(
         paf_s = use_unit_weights ? 1.0 - mean(ratio_cf) :
                 1.0 - dot(w, ratio_cf) / w_sum
         paf_draws[s] = paf_s
-        excess_cases_draws[s] = paf_s * y_total
+        excess_cases_draws[s] = isnothing(y_total) ? NaN : paf_s * y_total
     end
     
     low_p = alpha / 2.0
@@ -812,10 +1217,20 @@ function par_counterfactual(
         paf_std = std(paf_draws),
         paf_lower = quantile(paf_draws, low_p),
         paf_upper = quantile(paf_draws, high_p),
-        par_mean = mean(paf_draws), # Alias
-        excess_cases_mean = mean(excess_cases_draws),
-        excess_cases_ci_lower = quantile(excess_cases_draws, low_p),
-        excess_cases_ci_upper = quantile(excess_cases_draws, high_p),
+        # `par_mean` is NOT an alias of `paf_mean` here. `par_from_posterior` documents
+        # PAR as the absolute rate difference `I_pop - I_0`, and returning a dimensionless
+        # fraction under that name was the L3 defect. This function works purely with the
+        # per-observation ratio `mu_cf,i / mu_obs,i`, so the absolute risks -- and therefore
+        # the rate difference -- are not recoverable from it. `nothing` is the honest
+        # `nothing` is the honest answer; `paf_mean` still carries the estimable
+        # quantity, and `excess_cases_*` is `nothing` when the observed total is unknown.
+        par_mean = nothing,
+        # `nothing` rather than a number when the observed total is unknown. `NaN` in the
+        # draws is turned into `nothing` here so callers get the same "unavailable"
+        # convention as `par_mean`, not a quantity that merely looks non-finite.
+        excess_cases_mean = isnothing(y_total) ? nothing : mean(excess_cases_draws),
+        excess_cases_ci_lower = isnothing(y_total) ? nothing : quantile(excess_cases_draws, low_p),
+        excess_cases_ci_upper = isnothing(y_total) ? nothing : quantile(excess_cases_draws, high_p),
         counterfactual_value = counterfactual_value,
         exposure_var = var_sym,
         n_samples = n_draws,

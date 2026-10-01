@@ -179,7 +179,14 @@ function get_precomputes(m::Eigen, M::NamedTuple, mod_data::Dict)::NamedTuple
 
     # Extract the data and center it (a standard assumption for PCA).
     # This is performed on the CPU.
-    eigen_data_matrix_cpu = Matrix(data[!, vars_sym])
+    #
+    # Promote to Float64 explicitly. `Matrix(data[!, vars_sym])` preserves the column
+    # eltype, so for integer-valued columns (an ordinal code, a count, or just an index
+    # variable) the result is a `Matrix{Int}`, and the centering below then raises
+    # `InexactError: Int64(-5.5)` on the first non-integral difference. Centering is float
+    # arithmetic by definition, so the conversion belongs here rather than being left to
+    # fail at the subtraction.
+    eigen_data_matrix_cpu = Matrix{Float64}(data[!, vars_sym])
     eigen_data_matrix_cpu .-= mean(eigen_data_matrix_cpu, dims=1)
 
     n_vars = length(vars_sym)

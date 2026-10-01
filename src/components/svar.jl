@@ -64,7 +64,7 @@ struct SVAR <: ComponentModel
     precision_field_model::Symbol
     precision_field_scale::UnivariateDistribution
     precision_field_mixing::Union{UnivariateDistribution, Nothing}
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     method::Symbol
 end
 
@@ -135,11 +135,11 @@ function get_priors(
     key = spec.key
 
     priors_acc = String[]
-    push!(priors_acc, "$(p_names.precision_field_scale) ~ $(_distribution_to_string(m.precision_field_scale))")
+    push!(priors_acc, "$(_prior_or_constant(p_names.precision_field_scale, m.precision_field_scale))")
     if m.precision_field_model in [:leroux, :bym2] && !isnothing(m.precision_field_mixing)
-        push!(priors_acc, "$(p_names.precision_field_mixing) ~ $(_distribution_to_string(m.precision_field_mixing))")
+        push!(priors_acc, "$(_prior_or_constant(p_names.precision_field_mixing, m.precision_field_mixing))")
     end
-    push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors_acc, "$(_prior_or_constant(p_names.sigma, m.sigma))")
 
     push!(priors_acc,
         "$(p_names.innovations_precision) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent_rho), I)")

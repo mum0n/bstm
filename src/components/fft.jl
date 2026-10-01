@@ -55,7 +55,7 @@ scaled by \$\\sigma^2\$.
 - `latent_<key>`: The reconstructed latent smooth effect.
 """
 struct FFT <: ComponentModel
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     nbins::Int
     length_scale::Union{Distribution, Vector{<:Distribution}}
     method::Symbol
@@ -142,7 +142,7 @@ function get_priors(
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
     priors = String[]
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
 
     if m.length_scale isa Vector
         length_scale_priors_str = join([_distribution_to_string(p) for p in m.length_scale], ", ")
@@ -256,8 +256,9 @@ function get_updates(
             # Construct diag_D on the CPU
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
             # Enforce sum-to-zero constraints for RW2 penalty
-            diag_D[1] = 0.0
-            diag_D[2] = 0.0
+            # Zero every null direction: the count depends on the spectrum, and a
+            # disconnected graph has more than one. See _zero_null_modes!.
+            _zero_null_modes!(diag_D, L)
             
             coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             $(p_names.latent_field) = B_fft * coeffs
@@ -357,18 +358,24 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
         length_scale_name = _find_parameter(p_names, string(p_names_k.length_scale), k, is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(p_names_k.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(length_scale_name) || isempty(innovations_name)
-            @warn "Parameters for FFT component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        # Only `sigma` is pinnable here: `length_scale` is
+        # `Union{Distribution, Vector{<:Distribution}}` and `innovations` is always sampled,
+        # so neither can carry a fixed value. A pinned `sigma` is not a chain parameter, so
+        # resolve it with the constant fallback rather than reading it by name.
+        sigma_samples_cpu = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k, is_multivariate_model, n_samples)
+
+        if isnothing(sigma_samples_cpu) || isempty(length_scale_name) || isempty(innovations_name)
+            @warn "Parameters for FFT component $(spec.key) (outcome $k) not " *
+                  "resolved, and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         length_scale_dim = m.length_scale isa Vector ? length(m.length_scale) : 1
         ls_samples_cpu = get_params_matrix(chain, length_scale_name, length_scale_dim)
         innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
@@ -393,7 +400,9 @@ function get_effects(
                 U = hyper.U
                 L = hyper.L
                 diag_D = sigma_i_cpu ./ sqrt.(L .+ noise)
-                diag_D[1] = 0.0; diag_D[2] = 0.0
+                # Zero every null direction: the count depends on the spectrum, and a
+                # disconnected graph has more than one. See _zero_null_modes!.
+                _zero_null_modes!(diag_D, hyper.L)
                 coeffs_cpu = U * (diag_D .* innov_i_cpu)
             else # :cholesky or :cholesky_sparse
                 Q_penalty = hyper.Q_template

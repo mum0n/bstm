@@ -56,7 +56,7 @@ controlled by the `method` parameter in the `random()` call:
 """
 struct AR1 <: ComponentModel
     rho_unconstrained::Distribution
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     method::Symbol # :statespace, :spectral, :centered, :marginalized
 end
 
@@ -83,6 +83,37 @@ function get_precomputes(m::AR1, M::NamedTuple, mod_data::Dict)::NamedTuple
         U=template.U, 
         L=template.L
     )
+end
+
+"""
+    sigma_stable_scale(sigma, rho, ::Type{T})
+
+Standard-deviation factor for the AR(1) spectral field: \$\$\\sigma/\\sqrt{1-\\rho^2}\$\$ -- see
+below; the fraction is the whole point.
+
+The conditional AR(1) prior is \$\$\\phi_1 \\sim N(0, \\sigma^2/(1-\\rho^2))\$ and
+\$\$\\phi_t \\mid \\phi_{t-1} \\sim N(\\rho\\phi_{t-1}, \\sigma^2/(1-\\rho^2))\$ , so the joint
+precision is \$Q = ((1-\\rho^2)/\\sigma^2)\\, Q_{\\text{base}}\$ with
+\$Q_{\\text{base}} = (1+\\rho^2)I + \\rho\\,T\$. Inverting gives eigenvalues
+\$\$\\lambda/((1-\\rho^2)/\\sigma^2)\$\$ of \$Q\$, hence a field covariance of
+\$\$\\sigma^2/((1-\\rho^2)\\lambda)\$\$. The \$\$\\sqrt{1-\\rho^2}\$\$ therefore goes in the
+**denominator**: it is the stationary scale that turns the innovation SD into the marginal
+SD, multiplying the stationary variance \$\$\\sigma^2/(1-\\rho^2)\$\$.
+
+This was the source of a real defect: the factor was absent, giving the field a marginal
+variance of \$\$\\sigma^2\$\$ instead of \$\$\\sigma^2/(1-\\rho^2)\$\$. An earlier attempt to fix
+it put the factor in the **numerator** -- the reciprocal -- and was caught because the
+implied \$\$\\operatorname{Var}(\\phi_1)\$\$ then no longer matched
+\$\$\\sigma^2/(1-\\rho^2)\$\$. \`scripts/_derive_ar1_scale.jl\` derives the direction from the
+generative model rather than from the code, which is what settled it.
+
+\`rho\` is \`tanh(...)\$ so \$|\\rho| < 1\$ mathematically, but it can round to \$\$\\pm 1\$ in
+floating point for a large unconstrained parameter, which would divide by zero. The floor
+keeps the result finite and positive.
+"""
+function sigma_stable_scale(sigma, rho, ::Type{T}) where {T<:Real}
+    one_minus = one(T) - T(rho) * T(rho)
+    return T(sigma) / sqrt(max(one_minus, eps(one(T))))
 end
 
 """
@@ -118,8 +149,19 @@ function _ar1_precision_matrix(rho, sigma, n, noise)
     # Q_t,t-1 = Q_t-1,t = -rho / (sigma^2 * (1 - rho^2))
     
     # To avoid division by (1 - rho^2) in each element, we can factor it out.
-    # Let Q_base be the precision matrix without the (1 - rho^2) factor.
-    # Then Q = Q_base / (sigma^2 * (1 - rho^2)).
+    # Let Q_base be the precision matrix with the boundary rows set to 1.
+    # The conditional AR(1) prior is phi_1 ~ N(0, sigma^2/(1-rho^2)) and
+    # phi_t | phi_{t-1} ~ N(rho phi_{t-1}, sigma^2/(1-rho^2)), so the joint precision is
+    #     Q = Q_base * (1 - rho^2) / sigma^2
+    # (multiplication, not division -- see `sigma_stable_scale` for the derivation).
+    #
+    # NOTE: this function currently has NO CALLERS. The `:marginalized` method uses
+    # `_ar1_log_marginal_likelihood`, which derives its own precision. It was left in the
+    # reciprocal form `Q_base / (sigma^2 (1 - rho^2))`, which implies a field variance of
+    # `sigma^2 (1 - rho^2)` rather than `sigma^2 / (1 - rho^2)`. Fixed here so that wiring
+    # it up later cannot silently reintroduce the error, but be aware that the residual
+    # `sigma^2 (1 - rho^2)` vs `sigma^2 / (1 - rho^2)` discrepancy measured in
+    # `scripts/_verify_ar1_reshard.jl` refers to THIS dead helper, not to any live path.
     
     # Construct the tridiagonal matrix
     diag_val = fill(one(T_num) + rho^2, n)
@@ -130,9 +172,8 @@ function _ar1_precision_matrix(rho, sigma, n, noise)
     
     Q_base = Tridiagonal(off_diag_val, diag_val, off_diag_val)
     
-    # Add jitter for numerical stability and scale by sigma^2 * (1 - rho^2)
-    # The (1 - rho^2) factor ensures stationarity and is part of the variance.
-    return Symmetric(Q_base ./ (sigma^2 * (one(T_num) - rho^2 + T_num(noise))))
+    # Scale by (1 - rho^2) / sigma^2, the conditional-prior factor derived above.
+    return Symmetric(Q_base .* (one(T_num) - rho^2 + T_num(noise)) ./ sigma^2)
 end
 
 """
@@ -215,7 +256,7 @@ function get_priors(
 
     # These hyperparameters can be shared in multivariate models.
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
-        push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+        push!(priors_acc, "$(_prior_or_constant(p_names.sigma, m.sigma))")
         push!(
             priors_acc,
             "$(p_names.rho_unconstrained) ~ " *
@@ -265,8 +306,24 @@ function get_updates(
             hyper = spec_registry[:$(key)].hyper
             U = hyper.U
             L_base = hyper.L
+            # `L_base` are the eigenvalues of the :ar1 template (tridiagonal, 0 diagonal,
+            # -1 off-diagonal) and `U` its eigenvectors. The AR(1) base precision is
+            # Q_base = (1 + rho^2) I + rho * T, a linear function of that same T, so it
+            # shares T's eigenvectors and its eigenvalues are exactly
+            #     lambda = (1 + rho^2) + rho * L_base.
             lambda_vals = (one(T) + rho^2) .+ rho .* L_base
-            diag_D = $(p_names.sigma) ./ sqrt.(lambda_vals .+ M.noise)
+            # The prior covariance is Q^{-1} where
+            #     Q = (1 - rho^2)/sigma^2 * Q_base,
+            # i.e.  sigma^2/((1 - rho^2) * lambda) in the eigenbasis.
+            #
+            # The `sqrt(1 - rho^2)` factor was MISSING, so this path gave the field a
+            # marginal variance of `sigma^2` instead of `sigma^2/(1 - rho^2)` -- at
+            # rho = 0.9 the temporal field variance was understated by a factor of 5.3,
+            # and the :spectral method (the DEFAULT) silently fitted a different model
+            # from :centered. See `scripts/_verify_ar1_reshard.jl` and
+            # `scripts/_derive_ar1_scale.jl`.
+            var_scale = sigma_stable_scale($(p_names.sigma), rho, T)
+            diag_D = var_scale ./ sqrt.(lambda_vals .+ M.noise)
             $(p_names.latent_field) = U * (diag_D .* $(p_names.innovations))
             $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.$(index_var))
         end
@@ -295,7 +352,7 @@ function get_updates(
                 $(n_latent),
                 rho,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -345,18 +402,19 @@ function get_effects(
 
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples)
         rho_name = _find_parameter(p_names, string(p_names_k.rho_unconstrained), k,
             is_multivariate_model)
-        
-        if isempty(sigma_name) || isempty(rho_name)
-            @warn "Base parameters for AR1 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+
+        if isnothing(sigma_samples) || isempty(rho_name)
+            @warn "Base parameters for AR1 component $(spec.key) (outcome $k) not " *
+                  "resolved, and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        # All samples are extracted to CPU arrays
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
         rho_samples = tanh.(get_params_vector(chain, rho_name, 1)[:, 1])
         
         latent_field_samples = zeros(Float64, t_N_full, n_samples)
@@ -379,7 +437,12 @@ function get_effects(
                 
                 for j in 1:n_samples
                     lambda_vals = (1.0 + rho_samples[j]^2) .+ rho_samples[j] .* L_base
-                    diag_D = sigma_samples[j] ./ sqrt.(lambda_vals .+ noise_val)
+                    # Must match the model's spectral path exactly, including the
+                    # sqrt(1 - rho^2) factor -- see `sigma_stable_scale`. Reconstruction
+                    # silently disagreeing with the model it was fitted from is the same
+                    # class of bug as a wrong prior.
+                    var_scale = sigma_stable_scale(sigma_samples[j], rho_samples[j], Float64)
+                    diag_D = var_scale ./ sqrt.(lambda_vals .+ noise_val)
                     latent_field_samples[1:t_N_train, j] = U * (diag_D .* innovations_samples[j, :])
                 end
             end

@@ -24,14 +24,85 @@ using Dates, Printf
 # interval. Defined once so the writer and reader cannot drift to different levels.
 const Z975 = 1.959963984540054
 
-# Relative midpoint drift above which a credible interval is considered too
-# asymmetric for the width inversion to be trustworthy.
+# Midpoint drift, as a fraction of the interval HALF-WIDTH, above which a credible
+# interval is considered too asymmetric for the width inversion to be trustworthy.
+#
+# Normalised by the half-width rather than by `|mean|`. The old denominator was the mean,
+# which is the wrong yardstick whenever the mean is small next to the interval -- the
+# ordinary situation for a near-zero rate with a wide credible interval, or one that
+# straddles zero. Measured: for a prediction of 0.001 in an interval of half-width 1.0
+# whose midpoint is 0.03 away (a 3% drift, a perfectly good interval), the old measure
+# reported 30.0 -- 600x this tolerance -- purely because the mean was small.
+#
+# It is worth being precise that the old measure is NOT scale-dependent in the ordinary
+# sense: rescaling the problem leaves `|mid-mu|/|mu|` unchanged. The defect is a wrong
+# denominator, which only bites in the near-zero-mean case.
+#
+# The half-width form is directly interpretable: 0 is a perfectly centred interval, 1
+# means the mean sits one half-width from the midpoint.
 const INTERVAL_ASYMMETRY_TOL = 0.05
 
 _as_float(v) = v isa Real ? Float64(v) : NaN
 
 """
-    _recover_pred_sd(sd, lower, upper, mean) -> (sd::Vector{Float64}, source::Symbol)
+    _interval_asymmetry(lower, upper, mean) -> Float64
+
+Largest displacement of an interval's midpoint from the corresponding prediction mean,
+**as a fraction of that interval's half-width**. A large value means the recovered SD is
+biased, because `sd = (upper - lower) / (2 Z975)` assumes a symmetric interval.
+
+Returns `0.0` when the bounds are absent, mismatched, or not all finite, so an unusable
+interval is not reported as a maximally asymmetric one.
+"""
+function _interval_asymmetry(lower, upper, mean::AbstractVector)
+    n = length(mean)
+    if lower === nothing || upper === nothing ||
+            length(lower) != n || length(upper) != n
+        return 0.0
+    end
+    worst = 0.0
+    @inbounds for i in 1:n
+        lo = _as_float(lower[i])
+        hi = _as_float(upper[i])
+        mu = _as_float(mean[i])
+        if isfinite(lo) && isfinite(hi) && isfinite(mu) && hi > lo
+            mid = (lo + hi) / 2
+            half = (hi - lo) / 2
+            rel = abs(mid - mu) / max(half, eps(Float64))
+            rel > worst && (worst = rel)
+        end
+    end
+    return worst
+end
+
+"""
+    _warn_if_interval_asymmetric(asym, context) -> Bool
+
+Emit the interval-asymmetry diagnostic, or an informational note when the drift is within
+tolerance. Returns `true` when it warned.
+
+All three `_recover_pred_sd` call sites route through this, so a width-derived SD is
+reported wherever it is produced rather than only in the BMA path -- previously only one of
+the three sites checked, so a biased SD could enter the stored predictions table and the
+bundle loader without a word. `context` names the source for the reader.
+"""
+function _warn_if_interval_asymmetric(asym::Real, context::AbstractString)
+    if asym > INTERVAL_ASYMMETRY_TOL
+        @warn "Predictive SD for $(context) was derived from a credible interval whose " *
+              "midpoint is up to $(round(asym * 100; digits=1))% of a half-width from the " *
+              "mean, so the symmetric ±$(Z975)σ width inversion is biased. Re-fit the " *
+              "model to populate `pred_sd` before relying on `bma_pred_sd`."
+        return true
+    end
+    @info "Predictive SD for $(context) was derived from the 95% credible interval " *
+          "width (±$(Z975)σ). Interval midpoint drift is $(round(asym * 100; digits=1))% " *
+          "of a half-width, within tolerance. Treat the resulting `bma_pred_sd` as " *
+          "approximate."
+    return false
+end
+
+"""
+    _recover_pred_sd(sd, lower, upper, mean) -> (sd, source, asymmetry)
 
 Resolve the per-observation predictive SD from whatever is actually available,
 preferring the model's own `std` and falling back to the 95% interval width
@@ -44,6 +115,11 @@ provenance tag:
 - `:model`          every observation came from a genuine `std`.
 - `:interval_width` at least one observation came from the width inversion.
 - `:missing`        neither was usable; the returned vector is all `NaN`.
+
+The third element is the worst interval asymmetry (see `_interval_asymmetry`), which is
+only meaningful when `source === :interval_width`. It is returned rather than warned about
+here so that each caller can name its own source, and so that a caller cannot forget to
+check: destructuring into two variables still works, but the number is always available.
 
 Non-numeric entries (`missing`, `nothing`) are treated as unusable rather than
 raising, so a partially-populated column degrades instead of failing.
@@ -83,35 +159,7 @@ function _recover_pred_sd(sd, lower, upper, mean::AbstractVector)
     else
         :missing
     end
-    return out, source
-end
-
-"""
-    _interval_asymmetry(lower, upper, mean) -> Float64
-
-Largest relative distance between each interval's midpoint and the corresponding
-prediction mean. The `±Z975*σ` width inversion is only valid for symmetric,
-roughly normal intervals, so a large value means the recovered SD is biased and
-the caller should say so instead of returning a number that looks authoritative.
-"""
-function _interval_asymmetry(lower, upper, mean::AbstractVector)
-    n = length(mean)
-    if lower === nothing || upper === nothing ||
-            length(lower) != n || length(upper) != n
-        return 0.0
-    end
-    worst = 0.0
-    @inbounds for i in 1:n
-        lo = _as_float(lower[i])
-        hi = _as_float(upper[i])
-        mu = _as_float(mean[i])
-        if isfinite(lo) && isfinite(hi) && isfinite(mu)
-            mid = (lo + hi) / 2
-            rel = abs(mid - mu) / max(abs(mu), eps(Float64))
-            rel > worst && (worst = rel)
-        end
-    end
-    return worst
+    return out, source, _interval_asymmetry(lower, upper, mean)
 end
 
 # ==============================================================================
@@ -417,9 +465,14 @@ function save_bstm_results(
             pred_upper = hasproperty(preds, :upper) ? preds.upper : fill(NaN, N)
             # `pred_sd` is the within-model posterior predictive SD required by
             # `bma_weighted_predictions` to apply the law of total variance.
-            pred_sd_col, sd_source = _recover_pred_sd(
+            pred_sd_col, sd_source, pred_asym = _recover_pred_sd(
                 hasproperty(preds, :std) ? preds.std : nothing,
                 pred_lower, pred_upper, preds.mean)
+            # Report it here too, not only in the BMA path: a width-derived SD is an
+            # approximation, and this is where it first enters the stored predictions.
+            if sd_source == :interval_width
+                _warn_if_interval_asymmetric(pred_asym, "the predictions table $(pfx)predictions")
+            end
             df_preds = DataFrame(
                 obs_id = 1:N,
                 pred_mean = preds.mean,
@@ -547,9 +600,15 @@ function load_bstm_results(duckdb_path::AbstractString; table_prefix::String="")
             upper = hasproperty(df_p, :pred_upper) ? df_p.pred_upper : fill(NaN, nrow(df_p))
             # Re-derive rather than trusting a stored value blindly: a `pred_sd` column
             # may be absent (older database) or only partially populated.
-            sd, sd_source = _recover_pred_sd(
+            sd, sd_source, sd_asym = _recover_pred_sd(
                 hasproperty(df_p, :pred_sd) ? df_p.pred_sd : nothing,
                 lower, upper, df_p.pred_mean)
+            # This is a bare `catch` block, so an exception here would vanish. A biased
+            # width-derived SD is worth surfacing at load time too -- this is the third
+            # of the three recovery sites, and until now it checked nothing.
+            if sd_source == :interval_width
+                _warn_if_interval_asymmetric(sd_asym, "the stored table $(pfx)predictions")
+            end
             preds_dict[:denoised] = (
                 mean = df_p.pred_mean,
                 std = sd,
@@ -960,26 +1019,17 @@ function bma_weighted_predictions(duckdb_path::AbstractString)::DataFrame
     for (df_p, w, m_name) in zip(preds_list, weights, model_names)
         lower = hasproperty(df_p, :pred_lower) ? df_p.pred_lower : nothing
         upper = hasproperty(df_p, :pred_upper) ? df_p.pred_upper : nothing
-        sd_k, sd_source = _recover_pred_sd(
+        sd_k, sd_source, asym = _recover_pred_sd(
             hasproperty(df_p, :pred_sd) ? df_p.pred_sd : nothing,
             lower, upper, df_p.pred_mean)
 
         if sd_source == :interval_width
             # This database predates the `pred_sd` column, or the model produced no
             # `std`. Say so: the value is an approximation, and it is only trustworthy
-            # when the interval is close to symmetric.
-            asym = _interval_asymmetry(lower, upper, df_p.pred_mean)
-            if asym > INTERVAL_ASYMMETRY_TOL
-                @warn "Model '$(m_name)' has no stored `pred_sd`; its predictive SD was " *
-                      "derived from a credible interval whose midpoint is up to " *
-                      "$(round(asym * 100; digits=1))% from the mean, so the symmetric " *
-                      "±$(Z975)σ width inversion is biased. Re-fit the model to populate " *
-                      "`pred_sd` before relying on `bma_pred_sd`."
-            else
-                @info "Model '$(m_name)' has no stored `pred_sd`; deriving its predictive " *
-                      "SD from the 95% credible interval width (±$(Z975)σ). Treat the " *
-                      "resulting `bma_pred_sd` as approximate."
-            end
+            # when the interval is close to symmetric. The measure itself comes from
+            # `_recover_pred_sd`, so all three recovery sites agree on what "asymmetric"
+            # means.
+            _warn_if_interval_asymmetric(asym, "model '$(m_name)'")
         elseif sd_source == :missing
             @warn "Model '$(m_name)' has no usable predictive SD (no `pred_sd` and no " *
                   "valid interval bounds); it contributes only its between-model spread " *

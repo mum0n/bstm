@@ -127,6 +127,23 @@ end
 
 @inline _get_obs(v, i::Int) = v isa AbstractVector ? v[i] : v
 
+"""
+    const ETA_CLAMP_BOUND
+
+Symmetric bound applied to the linear predictor before exponentiating, shared by the
+likelihood families here and by the denoised-prediction path in `reconstruction.jl`.
+
+These two MUST agree. They were independently hardcoded as 30 and 20, so for
+\$\$\\eta \\in (20, 30]\\\$\$ the denoised prediction reported \$\$\\exp(20)\\\$ while a noisy
+draw from the fitted likelihood returned \$\$\\exp(\\eta)\\\$ -- a discrepancy of up to
+\$\$e^{10}\\\$ between a reported mean and the mean of its own simulated noise. One shared
+constant removes the class of bug rather than the single instance.
+
+30 is far below \$\$\\exp(709)\\\$, the actual overflow point, so this guards against
+pathological inputs rather than serving a numerical necessity.
+"""
+const ETA_CLAMP_BOUND = 30.0
+
 # Generic fallback: distribution reference ignores obs_idx unless specialized
 get_dist_ref(fam::AbstractBSTM_Family, d, eta, sig, obs_idx::Int) =
     get_dist_ref(fam, d, eta, sig)
@@ -277,12 +294,17 @@ function get_dist_ref(::StudentTFamily, d, eta, sig)
 end
 
 function get_dist_ref(::HalfNormalFamily, d, eta, sig)
-    return truncated(Normal(0.0, max(sig, 1e-9)), 0.0, Inf)
+    # `eta` is the location, exactly as for `StudentTFamily`/`LaplaceFamily`; the
+    # truncation at 0 is what makes the support half-line, not the location. Pinning the
+    # location to 0.0 would make the linear predictor have no effect on the mean.
+    loc = isnan(eta) || isinf(eta) ? 0.0 : eta
+    return truncated(Normal(loc, max(sig, 1e-9)), 0.0, Inf)
 end
 
 function get_dist_ref(::HalfStudentTFamily, d, eta, sig)
     nu = d.extra_params isa Number && d.extra_params > 0 ? d.extra_params : 5.0
-    return truncated(LocationScale(0.0, max(sig, 1e-9), TDist(nu)), 0.0, Inf)
+    loc = isnan(eta) || isinf(eta) ? 0.0 : eta
+    return truncated(LocationScale(loc, max(sig, 1e-9), TDist(nu)), 0.0, Inf)
 end
 
 function get_dist_ref(::LaplaceFamily, d, eta, sig)
@@ -399,9 +421,68 @@ function get_dist_ref(::MvNormalFamily, d, eta_vec, sig, obs_idx::Int=1)
     cov_mat = if !isnothing(d.extra_params) && haskey(d.extra_params, :cov)
         d.extra_params[:cov]
     elseif !isnothing(d.extra_params) && haskey(d.extra_params, :correlation_cholesky)
-        L = d.extra_params[:correlation_cholesky]
-        s = sig isa AbstractVector ? sig : fill(sig, K)
-        Diagonal(s) * (L * L') * Diagonal(s)
+        Lraw = d.extra_params[:correlation_cholesky]
+        # The correlation factor arrives in several shapes: a `Cholesky`, an `LKJCholesky`
+        # (whose Cholesky lives in its `.d` field, NOT `.L`), or a plain matrix.
+        # `Cholesky * Adjoint` has no method and `Matrix(::LKJCholesky)` is not the
+        # factor, so unwrap before forming the covariance.
+        Lc = if Lraw isa LinearAlgebra.Cholesky
+            Lraw
+        elseif hasproperty(Lraw, :d) && getfield(Lraw, :d) isa LinearAlgebra.Cholesky
+            getfield(Lraw, :d)            # LKJCholesky
+        elseif hasproperty(Lraw, :L) && getfield(Lraw, :L) isa LinearAlgebra.Cholesky
+            getfield(Lraw, :L)            # other wrappers
+        else
+            Lraw
+        end
+        Lmat = Lc isa AbstractMatrix ? Lc : Matrix(Lc)
+        s_raw = sig isa AbstractVector ? sig : fill(sig, K)
+        # `D R D` is positive definite only if every `s` is strictly positive AND `R = L L'`
+        # is itself positive definite. `LKJCholesky` permits correlations approaching +-1,
+        # where `lambda_min(R) -> 0`, and `y_sigma` is an unconstrained positive parameter
+        # that can be driven arbitrarily small -- or negative, or non-finite when HMC
+        # diverges. All are handled relative to the data's own scale rather than with an
+        # absolute epsilon, so the safeguard does not depend on units.
+        #
+        # Non-finite `s` is replaced by the floor rather than thrown on. `cholesky` reports a
+        # NaN covariance as `PosDefException`, which is indistinguishable from genuine
+        # ill-conditioning -- the reason this was misdiagnosed as conditioning for so long.
+        # Throwing here instead kills the whole test suite before it can report. Collapsing
+        # to the floor makes the log-density hugely negative, so HMC rejects the proposal
+        # exactly as it should for an invalid state, and the run continues.
+        finite_s = filter(isfinite, s_raw)
+        smax = isempty(finite_s) ? one(real(float(eltype(s_raw)))) :
+               max(maximum(abs, finite_s), floatmin(float(eltype(s_raw))))
+        floorv = 1e-8 * smax
+        s = map(v -> (isfinite(v) && v > floorv) ? v : floorv, s_raw)
+        # Form the covariance as a GRAM matrix, `Sigma = B B'` with `B = Diagonal(s) * L`,
+        # rather than as `Diagonal(s) * (L L') * Diagonal(s)`.
+        #
+        # The two are algebraically identical -- `(D L)(D L)' = D L L' D` -- but the Gram
+        # form is positive *semidefinite by construction*. Every operation is a multiply or
+        # an add, so it stays valid under ForwardDiff's dual numbers, and there is no
+        # intermediate `R` that rounding can push below zero.
+        B = Diagonal(s) * Lmat
+        Σ = B * B'
+        Σ = (Σ + Σ') / 2
+        # A diverging HMC trajectory can drive the correlation factor itself to NaN/Inf.
+        # `cholesky` reports such a covariance as `PosDefException`, indistinguishable from
+        # genuine ill-conditioning -- which is why this was misdiagnosed as conditioning
+        # for so long. Throwing kills the test suite before it can report, and the factor
+        # is not repairable: a NaN Cholesky has no meaning.
+        #
+        # Instead, return a valid distribution with a vanishingly small isotropic
+        # covariance. Its log-density is -Inf for any observation differing from the mean,
+        # so the proposal is rejected -- the same treatment Stan gives an invalid state --
+        # and the run continues instead of dying.
+        if !all(isfinite, Σ)
+            return MvNormal(collect(eta_vec),
+                            Symmetric(Matrix{eltype(eta_vec)}(I, K, K) * eps(one(real(float(eltype(Σ)))))))
+        end
+        # Relative diagonal jitter, needed only for the rank-deficient case where some
+        # diagonal of `L` has reached 0. Bounded by the matrix scale, so it repairs
+        # ill-conditioning without distorting a well-conditioned fit.
+        Σ = Σ + (1e-8 * (tr(Σ) / K + one(eltype(Σ)))) * Matrix{eltype(Σ)}(I, K, K)
     elseif sig isa AbstractMatrix
         sig
     elseif sig isa AbstractVector
@@ -734,6 +815,8 @@ function bstm_kernel(
         return V(-Inf)
     end
     dist = get_dist_ref(fam, d, eta, sig, obs_idx)
+    # Is the linear predictor a ForwardDiff dual? Decided once, from `V`.
+    is_ad = _is_dual_type(V)
     phi_zi_val = V(_get_obs(d.phi_zi, obs_idx))
     phi_hu_val = V(_get_obs(d.phi_hurdle, obs_idx))
     hu_val = V(_get_obs(d.hurdle, obs_idx))
@@ -759,7 +842,7 @@ function bstm_kernel(
         if y <= hu_val
             return log_one_minus_phi
         else
-            logp_truncated = logpdf(dist, V(y)) - logccdf(dist, hu_val)
+            logp_truncated = logpdf(dist, V(y)) - _logccdf_count(dist, hu_val, is_ad)
             return log_phi + logp_truncated
         end
     else
@@ -780,6 +863,8 @@ function bstm_kernel(
     end
 
     dist = get_dist_ref(fam, d, eta, sig, obs_idx)
+    # Is the linear predictor a ForwardDiff dual? Decided once, from `V`.
+    is_ad = _is_dual_type(V)
     phi_zi_val = V(_get_obs(d.phi_zi, obs_idx))
     phi_hu_val = V(_get_obs(d.phi_hurdle, obs_idx))
     hu_val = V(_get_obs(d.hurdle, obs_idx))
@@ -787,7 +872,7 @@ function bstm_kernel(
     if zero_inflated isa ZeroInflated
         log_phi = V(log(phi_zi_val))
         log_one_minus_phi = V(log1p(-phi_zi_val))
-        lp_base = logcdf(dist, upper_bound)
+        lp_base = _logcdf_count(dist, upper_bound, is_ad)
         if upper_bound >= V(0.0)
             return LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + lp_base)
         else
@@ -800,11 +885,11 @@ function bstm_kernel(
             return log_one_minus_phi
         end
         log_prob_interval = _stable_logsubexp(
-            logcdf(dist, upper_bound), logcdf(dist, hu_val)
-        ) - logccdf(dist, hu_val)
+            _logcdf_count(dist, upper_bound, is_ad), _logcdf_count(dist, hu_val, is_ad)
+        ) - _logccdf_count(dist, hu_val, is_ad)
         return LogExpFunctions.logsumexp(log_one_minus_phi, log_phi + log_prob_interval)
     else
-        return logcdf(dist, upper_bound)
+        return _logcdf_count(dist, upper_bound, is_ad)
     end
 end
 
@@ -821,6 +906,8 @@ function bstm_kernel(
     end
 
     dist = get_dist_ref(fam, d, eta, sig, obs_idx)
+    # Is the linear predictor a ForwardDiff dual? Decided once, from `V`.
+    is_ad = _is_dual_type(V)
     adj_L = is_discrete_family(fam) ? lower_bound - V(1.0) : lower_bound
     phi_zi_val = V(_get_obs(d.phi_zi, obs_idx))
     phi_hu_val = V(_get_obs(d.phi_hurdle, obs_idx))
@@ -831,9 +918,9 @@ function bstm_kernel(
         log_one_minus_phi = V(log1p(-phi_zi_val))
         
         log_p_le_L = if lower_bound < V(0.0)
-            log_one_minus_phi + logcdf(dist, lower_bound)
+            log_one_minus_phi + _logcdf_count(dist, lower_bound, is_ad)
         else
-            LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + logcdf(dist, lower_bound))
+            LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + _logcdf_count(dist, lower_bound, is_ad))
         end
         return LogExpFunctions.log1mexp(log_p_le_L)
 
@@ -842,12 +929,12 @@ function bstm_kernel(
         adj_hurdle = is_discrete_family(fam) ? hu_val - V(1.0) : hu_val
 
         if lower_bound > hu_val
-            return log_phi + logccdf(dist, adj_L) - logccdf(dist, adj_hurdle)
+            return log_phi + _logccdf_count(dist, adj_L, is_ad) - _logccdf_count(dist, adj_hurdle, is_ad)
         else
             return log_phi
         end
     else
-        return logccdf(dist, adj_L)
+        return _logccdf_count(dist, adj_L, is_ad)
     end
 end
 
@@ -870,6 +957,8 @@ function bstm_kernel(
     end
 
     dist = get_dist_ref(fam, d, eta, sig, obs_idx)
+    # Is the linear predictor a ForwardDiff dual? Decided once, from `V`.
+    is_ad = _is_dual_type(V)
     adj_L = is_discrete_family(fam) ? lower_bound - V(1.0) : lower_bound
     phi_zi_val = V(_get_obs(d.phi_zi, obs_idx))
     phi_hu_val = V(_get_obs(d.phi_hurdle, obs_idx))
@@ -880,15 +969,15 @@ function bstm_kernel(
         log_one_minus_phi = V(log1p(-phi_zi_val))
 
         log_p_le_U = if upper_bound < V(0.0)
-            log_one_minus_phi + logcdf(dist, upper_bound)
+            log_one_minus_phi + _logcdf_count(dist, upper_bound, is_ad)
         else
-            LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + logcdf(dist, upper_bound))
+            LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + _logcdf_count(dist, upper_bound, is_ad))
         end
 
         log_p_le_L = if lower_bound < V(0.0)
-            log_one_minus_phi + logcdf(dist, lower_bound)
+            log_one_minus_phi + _logcdf_count(dist, lower_bound, is_ad)
         else
-            LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + logcdf(dist, lower_bound))
+            LogExpFunctions.logsumexp(log_phi, log_one_minus_phi + _logcdf_count(dist, lower_bound, is_ad))
         end
         return _stable_logsubexp(log_p_le_U, log_p_le_L)
 
@@ -902,12 +991,12 @@ function bstm_kernel(
 
         effective_lower = max(adj_L, adj_hurdle)
         log_prob_in_interval = _stable_logsubexp(
-            logcdf(dist, upper_bound), logcdf(dist, effective_lower)
+            _logcdf_count(dist, upper_bound, is_ad), _logcdf_count(dist, effective_lower, is_ad)
         )
-        log_normalizer = logccdf(dist, adj_hurdle)
+        log_normalizer = _logccdf_count(dist, adj_hurdle, is_ad)
         return log_phi + log_prob_in_interval - log_normalizer
     else
-        return _stable_logsubexp(logcdf(dist, upper_bound), logcdf(dist, adj_L))
+        return _stable_logsubexp(_logcdf_count(dist, upper_bound, is_ad), _logcdf_count(dist, adj_L, is_ad))
     end
 end
 
@@ -923,5 +1012,90 @@ function _stable_logsubexp(a::Real, b::Real)
     end
     return a + LogExpFunctions.log1mexp(b - a)
 end
+
+# ==============================================================================
+# ForwardDiff-capable truncated counts (N1)
+# ==============================================================================
+#
+# The hurdle and censoring kernels normalise by a count tail, e.g. the uncensored hurdle
+# computes `logpdf(y) - logccdf(hu)` because the continuous part is the distribution
+# conditioned on X > hu. Those normalisers are what broke gradient sampling:
+# `logcdf`/`logccdf` for Poisson route through Distributions' `_gammalogcdf`, which has
+# methods only for `Float64` and `Float16`/`Float32`. So with a `ForwardDiff.Dual` linear
+# predictor they raise
+#
+#     MethodError: no method matching _gammalogcdf(::ForwardDiff.Dual, ::ForwardDiff.Dual,
+#                                                     ::ForwardDiff.Dual)
+#
+# and NUTS/HMC/ADVI all fail while MH (which needs no gradient) works. `logpdf`, by
+# contrast, IS AD-capable -- only the tails are not, which is why the plain Poisson model
+# samples fine and the hurdle one does not.
+#
+# The fix is NOT to add a method for `_gammalogcdf`. That is a Distributions internal, so
+# defining one would be type piracy: it would be silently overwritten on upgrade and it
+# would apply to every user of the package in the session. Instead, when the linear
+# predictor is a dual, evaluate the truncated sum directly from `logpdf`, which is
+# AD-capable.
+#
+# The plain-float path is deliberately left calling `logcdf`/`logccdf`, so reported
+# results are bit-identical to before. Only the AD path -- which previously threw -- changes.
+#
+# `logccdf` is obtained as `log1mexp(logcdf)`, i.e. via the complement. This is exact in
+# exact arithmetic and fine for the small thresholds a hurdle uses, but it loses precision
+# when `cdf -> 1` (a threshold far into the upper tail), where it tends to `-Inf`. The
+# float path does not have that weakness, which is one more reason not to route it there.
+
+# A hurdle threshold is a small count. Beyond this the explicit sum stops being sensible,
+# so the AD path reports an actionable error instead of silently grinding.
+const _HURDLE_SUM_MAX_TERMS = 4096
+
+# `ForwardDiff.Dual <: Real` but NOT `<: AbstractFloat`, so this separates the AD path from
+# the plain-float path without referencing ForwardDiff (which is not a direct dependency).
+_is_dual_type(::Type{T}) where {T} = !(T <: AbstractFloat)
+
+"""
+    _count_threshold_index(x)::Int
+
+Floor a censoring/hurdle bound to the integer count index it selects. Uses `floor` rather
+than a bare `Int()` so a non-integral bound (a hurdle of 0.5) degrades to a well-defined
+index instead of throwing an `InexactError` on the AD path.
+"""
+_count_threshold_index(x::Real) = isfinite(x) ? floor(Int, x) : (x < 0 ? typemin(Int) - 1 : _HURDLE_SUM_MAX_TERMS + 1)
+
+"""
+    _logcdf_count_ad(dist, x)
+
+`log P(X <= x)` for a discrete `dist`, computed as `logsumexp` of the point masses, so it
+works when the parameter is a `ForwardDiff.Dual`.
+"""
+function _logcdf_count_ad(dist, x::Real)
+    k = _count_threshold_index(x)
+    k < 0 && return oftype(float(x), -Inf)
+    if k > _HURDLE_SUM_MAX_TERMS
+        error("Hurdle/censoring bound $(k) exceeds the AD-capable sum limit of " *
+              "$(_HURDLE_SUM_MAX_TERMS) terms. Gradient samplers cannot evaluate a " *
+              "truncated count normaliser that far into the tail; supply a smaller " *
+              "threshold, or sample with MH.")
+    end
+    return LogExpFunctions.logsumexp([logpdf(dist, i) for i in 0:k])
+end
+
+"""
+    _logccdf_count_ad(dist, x)
+
+`log P(X > x)`, via the complement of `_logcdf_count_ad`. See the note above on precision
+when the CDF approaches 1.
+"""
+function _logccdf_count_ad(dist, x::Real)
+    k = _count_threshold_index(x)
+    k < 0 && return zero(float(x))
+    return LogExpFunctions.log1mexp(_logcdf_count_ad(dist, x))
+end
+
+# Dispatch on `is_ad`, decided once per kernel call from the linear predictor's type
+# rather than by probing the distribution's parameters (which have no common accessor
+# across Poisson / NegativeBinomial / Binomial).
+_logcdf_count(dist, x, is_ad::Bool) = is_ad ? _logcdf_count_ad(dist, x) : logcdf(dist, x)
+_logccdf_count(dist, x, is_ad::Bool) = is_ad ? _logccdf_count_ad(dist, x) : logccdf(dist, x)
 
 

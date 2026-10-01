@@ -50,7 +50,7 @@ latent field.
 - Wikipedia: Random walk
 """
 struct RW1 <: ComponentModel
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     method::Symbol
 end
 
@@ -161,13 +161,12 @@ function get_priors(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     key = spec.key
-    sigma_prior_str = _distribution_to_string(m.sigma)
-    
+    sigma_prior_str = _prior_or_constant(p_names.sigma, m.sigma)
     if m.method == :marginalized
-        return "$(p_names.sigma) ~ $(sigma_prior_str)"
+        return "$(sigma_prior_str)"
     else
         return """
-            $(p_names.sigma) ~ $(sigma_prior_str)
+            $(sigma_prior_str)
             $(p_names.innovations) ~ MvNormal(
                 zeros(T, spec_registry[:$(key)].hyper.n_latent), I
             )
@@ -201,7 +200,9 @@ function get_updates(
         let
             hyper = spec_registry[:$(key)].hyper
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
-            diag_D[1] = 0.0
+            # Zero every null direction: the count depends on the spectrum, and a
+            # disconnected graph has more than one. See _zero_null_modes!.
+            _zero_null_modes!(diag_D, hyper.L)
             $(p_names.latent_field) = hyper.U * (diag_D .* $(p_names.innovations))
             $(eta_target) = $(eta_target) .+ view($(p_names.latent_field), M.t_idx)
         end
@@ -247,7 +248,7 @@ function get_updates(
                 hyper.n_latent,
                 hyper.Q_template,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -304,16 +305,17 @@ function get_effects(
     # --- Reconstruction Loop ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
-        
-        if isempty(sigma_name)
-            @warn "Parameters for RW1 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        sigma_samples_cpu = _resolve_hyper_samples(
+            chain, p_names, v.sigma, m.sigma, k,
+            is_multivariate_model, n_samples)
+
+        if isnothing(sigma_samples_cpu)
+            @warn "Parameters for $(spec.key) (outcome $k) not resolved, and " *
+                  "sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        # Extract posterior samples (CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
 
         # Initialize output matrix for the full latent field on the CPU
         effect_k_latent_cpu = zeros(Float64, t_N_full, n_samples)

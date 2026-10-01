@@ -69,7 +69,7 @@ where:
   The emerging field of signal processing on graphs. IEEE Signal Processing Magazine.
 """
 struct GraphWavelet <: ComponentModel
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     alpha::Distribution
     n_scales::Int
     order::Int
@@ -177,8 +177,8 @@ function get_priors(
     key = spec.key
     priors = String[]
 
-    push!(priors, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
-    push!(priors, "$(p_names.alpha) ~ $(_distribution_to_string(m.alpha))")
+    push!(priors, "$(_prior_or_constant(p_names.sigma, m.sigma))")
+    push!(priors, "$(_prior_or_constant(p_names.alpha, m.alpha))")
 
     n_latent = spec.hyper.n_latent
     if m.method == :noncentered

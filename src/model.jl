@@ -847,16 +847,26 @@ v1.0.0
 """
 function _sanitize_variablename(name::String)
     s = name
-    # Replace pipe, parentheses, spaces, and other invalid characters with an underscore
-    s = replace(s, r"[\s\|()\+\*&:]" => "_")
+    # ORDER MATTERS: the two named symbols must be expanded BEFORE the blanket
+    # complement replace, because neither is a letter and would otherwise be turned into
+    # a bare "_" first, silently losing the distinction the expansion exists to preserve.
     # Replace kronecker product symbol
     s = replace(s, "⊗" => "_kron_")
     # Replace composition symbol
     s = replace(s, "∘" => "_comp_")
+    # A Julia identifier may contain only letters, digits, `_`, and `!`. The original
+    # character class here covered `\s | ( ) + * & :` but not `- / ^ = > <`, so a column
+    # named e.g. `a-b` or `rate/100` produced a name that is not a valid identifier and
+    # then failed deep inside generated code (L1b). The class is now the complement of
+    # the permitted set, so it cannot fall behind the grammar again.
+    s = replace(s, r"[^\p{L}\p{N}_!]" => "_")
     # Remove any leading or trailing underscores that may result
     s = Base.strip(s, '_')
     # Consolidate sequences of multiple underscores into a single one
-    return replace(s, r"__+" => "_")
+    s = replace(s, r"__+" => "_")
+    # A name made entirely of punctuation (e.g. "***") collapses to the empty string,
+    # which is not a valid identifier either; fall back to a stable placeholder.
+    return isempty(s) ? "var" : s
 end
 """
     _parse_single_component_term(term_str::AbstractString)
@@ -1356,6 +1366,40 @@ function _parse_lhs_term(term::String)
     return specs
 end
 """
+    _normalize_rhs_subtraction(rhs_str::AbstractString)::String
+
+Rewrite binary subtraction `a - b` into `a + -b` so that the depth-aware term splitter
+treats the two operands as separate RHS terms.
+
+A blanket `replace(r"\\s*-\\s*" => " + -")` corrupts **scientific notation**: the exponent
+sign is a `-` too, so `1e-8` became `1e + -8`, which no longer parses as a float and was
+rebuilt by `Meta.parse` as `1 * e + -8` -- an undefined variable `e` (L10). Every
+scientific-notation literal in a prior (`sigma=Normal(0, 1e-8)`) was therefore unusable.
+
+Scientific-notation numbers are substituted out to inert placeholders before the rewrite and
+restored afterwards, so their sign is never touched. The guard is deliberately tight:
+a digit must precede the `e`, the sign must be adjacent, and a digit must follow it, while
+the negative lookbehind rejects `A-Za-z_.`. That keeps genuine subtraction working --
+`scale - 8` has a space, and `rate-8` as a variable reference has a non-digit before the `e`
+-- while protecting real float literals.
+"""
+function _normalize_rhs_subtraction(rhs_str::AbstractString)::String
+    saved = String[]
+    guarded = replace(
+        String(rhs_str),
+        r"(?<![A-Za-z_.])[0-9]+(?:\.[0-9]+)?[eE][+-]?[0-9]+" => function (m)
+            push!(saved, m isa RegexMatch ? m.match : String(m))
+            return "\x1b$(length(saved))\x1b"
+        end
+    )
+    normalized = replace(guarded, r"\s*-\s*" => " + -")
+    for (i, original) in enumerate(saved)
+        normalized = replace(normalized, "\x1b$(i)\x1b" => original)
+    end
+    return normalized
+end
+
+"""
     decompose_bstm_formula(formula_str::String, data::DataFrame;
                            calling_mod::Module = Main, copy_data::Bool = true)
 
@@ -1378,6 +1422,7 @@ v1.1.0
   `:has_intercept`, `:intercept_prior`, and `:data` (containing the working DataFrame
   with any generated transformation columns).
 """
+
 function decompose_bstm_formula(
     formula_str::String,
     data::DataFrame;
@@ -1396,7 +1441,7 @@ function decompose_bstm_formula(
 
     outcome_specs = vcat([_parse_lhs_term(term) for term in split_terms_at_depth(lhs_str, "+")]...)
 
-    rhs_normalized = replace(rhs_str, r"\s*-\s*" => " + -")
+    rhs_normalized = _normalize_rhs_subtraction(rhs_str)
     rhs_terms = split_terms_at_depth(rhs_normalized, "+")
     
     has_intercept = !("0" in rhs_terms || "-1" in rhs_terms)
@@ -3794,7 +3839,39 @@ macro bstm(exprs...)
         end
     end
     # --- prepare for insertion into generated call ---
-    formula_str = string(formula_expr)
+    #
+    # `formula_expr` can be three different things, and conflating them is what made
+    # `@bstm(f, df)` unusable (L9):
+    #
+    #   1. DSL syntax written inline -- `likelihood(y) ~ intercept()`. This arrives as an
+    #      `Expr` (head `:~` / `:call`) and must be RENDERED to DSL text, because
+    #      `bstm_core` takes a formula *string*. `string(::Expr)` is what performs that
+    #      rendering, and it is the whole reason the inline form has ever worked.
+    #   2. A `String` literal -- `formula = "y ~ x"`. Used directly.
+    #   3. Anything else is a VALUE, not DSL text: a variable holding the formula
+    #      (`@bstm(f, df)` -> `Symbol(:f)`) or an interpolated string
+    #      (`@bstm("y ~ $term", df)` -> `Expr(:string, ...)`). These must be evaluated
+    #      in the caller's scope at run time. Stringifying them produced the variable's
+    #      NAME, so the DSL read `"f"` as the formula and complained that outcome
+    #      variable `:f` was not a column -- an error that pointed at the data rather
+    #      than at the real mistake.
+    #
+    # A bare `Symbol` is unambiguous: DSL syntax always contains a call, so a lone symbol
+    # can only be a variable reference.
+    formula_runtime = if formula_expr isa String
+        nothing
+    elseif formula_expr isa Symbol
+        :($(esc(formula_expr))::String)
+    elseif formula_expr isa Expr && formula_expr.head == :string
+        :($(esc(formula_expr))::String)
+    else
+        nothing
+    end
+    formula_str = if isnothing(formula_runtime)
+        string(formula_expr)
+    else
+        formula_runtime
+    end
     data_esc = esc(data_expr)
     kwargs_esc = [esc(kw) for kw in final_kwargs]
     core_logic = :(bstm_core($formula_str, $data_esc, $(__module__); $(kwargs_esc...)))
@@ -4367,7 +4444,15 @@ function parse_generated_model(model_string::AbstractString)
     parsed = Meta.parseall(model_string)
     for node in parsed.args
         if node isa Expr && node.head in (:error, :incomplete)
-            line = haskey(node, :line) ? Int(node.line) : 0
+            # `haskey(::Expr, ::line)` is a MethodError on Julia 1.13 -- `Expr` supports
+            # `:line`/`:file` as properties, not as keys. Using it here meant the
+            # parse-error reporter itself threw a MethodError, replacing a located
+            # diagnostic with an unrelated one, and only when something was already wrong.
+            line = try
+                Int(node.line)
+            catch
+                0
+            end
             detail = node.args[1]
             src = ""
             if 0 < line
@@ -4451,6 +4536,54 @@ function resolve_technical_primitive(module_metadata::Dict{Symbol, Any}, M, prio
     constructor_func = COMPONENT_CONSTRUCTORS[model_name]
     return constructor_func(resolved_priors, m_params)
 end
+"""
+    _zero_null_modes!(diag_D::AbstractVector, L::AbstractVector; rel_tol=1e-10)
+
+Zero every eigen-direction whose precision eigenvalue is numerically zero, in place, and
+return the indices zeroed.
+
+**Why not just `diag_D[1] = 0`.** That idiom imposed the intrinsic sum-to-zero constraint by
+zeroing a *SINGLE* eigen-direction. It is correct only when the precision has exactly ONE null
+direction. That holds for a **connected** spatial graph, but not in general: a disconnected
+graph has as many null directions as it has connected components, and zeroing only the first
+leaves the rest carrying variance \`sigma^2 / noise\` because a null eigenvalue \`L ~ 0\` makes
+\`diag_D = sigma / sqrt(L + noise)\` *large*, not small. The opposite error is just as real: the
+\`diag_D[1] = 0.0; diag_D[2] = 0.0\` form, hard-coded in the 2-D second-order penalty
+components, deletes a genuine degree of freedom for a 1-D path penalty such as RW2, whose null
+space is one-dimensional however the index set is arranged.
+
+**All such sites have been converted.** Every \`diag_D\` deflation in \`src/components/\` now calls
+this helper, in both the generated model body and the \`get_effects\` CPU reconstruction (they
+must agree, or reconstruction stops reproducing what the model sampled). To add a component
+back to the old idiom would reintroduce the defect; the count is not a property of the source
+file, it is a property of the spectrum.
+
+Measured with \`scripts/_oracle_icar.jl\` on a 5-unit, 2-component chain: the connected graph
+matches \`pinv(Q)\` to 4e-9, but the disconnected one puts **1e9** of variance on the null
+space and yields a field whose mean is **2.0e8** instead of 0, at the default \`noise\`. The
+\`island_handling\` option does not help: all four modes produced byte-identical templates,
+despite the Info message claiming "component deflation" was applied.
+
+The tolerance is **relative** to the largest eigenvalue, so it means the same thing for a
+precision scaled to 1e6 as for one scaled to 1e-6. An absolute threshold would silently
+classify every direction of a small-scale precision as null. A degenerate template with no
+positive eigenvalue at all (fully isolated units) has no scale to compare against, so every
+direction is treated as null rather than dividing by ~0.
+
+On a connected graph this is a no-op, since the single null direction is index 1 anyway, so
+it is safe wherever the constraint is intended.
+"""
+function _zero_null_modes!(diag_D::AbstractVector, L::AbstractVector; rel_tol::Real = 1e-10)
+    isempty(L) && return Int[]
+    lmax = maximum(L)
+    tol = lmax > 0 ? rel_tol * lmax : rel_tol
+    null_idx = findall(<=(tol), L)
+    for i in null_idx
+        diag_D[i] = 0.0
+    end
+    return null_idx
+end
+
 """
     build_structure_template(
         model_type::Symbol,
@@ -6285,6 +6418,23 @@ function recompose_precision(m_type::Symbol, template_s::AbstractMatrix, param_v
     return Symmetric(template_s)
 end
 """
+    _prior_or_constant(param_name, value)
+
+Emit a Turing prior line for a hyperparameter that may be either a prior or a fixed value.
+
+A `Real` is a *pinned constant*, not a prior: the generated model gets a plain binding so
+the parameter name refers to a constant instead of a sampled variable. That makes
+`sigma=2.0` mean what it looks like, instead of forcing callers to spell a degenerate
+distribution to pin a hyperparameter. Anything else is a prior and is emitted as `~`.
+
+Used by every component's `get_priors`, so a constant hyperparameter is also visible in the
+generated model rather than being silently sampled.
+"""
+function _prior_or_constant(param_name, value)
+    value isa Real && return "$(param_name) = $(value)"
+    return "$(param_name) ~ $(_distribution_to_string(value))"
+end
+"""
     _distribution_to_string(d::Distribution)
 Converts a `Distribution` object into a type-stable string representation of its
 constructor call, suitable for dynamic code generation within a Turing `@model`.
@@ -7287,6 +7437,20 @@ function extract_param_matrix(chain, var_id::Union{Symbol, AbstractString, Dynam
         end
     end
     param_data_array = Array(col_data)
+    # A `Cholesky` parameter (e.g. `correlation_cholesky`, which every multivariate model
+    # carries) is stored as an object per draw and cannot be broadcast to `Float64`, so the
+    # generic numeric paths below all fail on it. Flatten each factor to its entries, giving
+    # (n_samples, p^2), which is what callers requesting `get_params_matrix(chain, name, K^2)`
+    # expect -- they `reshape` the row straight back to a K x K factor.
+    if !isempty(param_data_array) && param_data_array[1] isa LinearAlgebra.Cholesky
+        n_chol = length(param_data_array)
+        p = size(param_data_array[1].L, 1)
+        chol_mat = Matrix{Float64}(undef, n_chol, p * p)
+        for i in 1:n_chol
+            chol_mat[i, :] = vec(Matrix(param_data_array[i].L))
+        end
+        param_data_array = chol_mat
+    end
     # 3. Standardize dimensions to Matrix{Float64} of shape (total_samples, dim)
     
     # Case A: Elements are AbstractArrays (e.g. Vector{Vector{Float64}} from
@@ -7597,8 +7761,11 @@ function _generate_likelihood_section(
             "$(nu_sym) ~ Exponential(1.0)")
     end
     # Prior for observation standard deviation (for Gaussian-like families)
+    # "mvnormal"/"multivariate_normal" are included: the joint multivariate Gaussian path
+    # uses `y_sigma` as the diagonal of D, so omitting it left `y_sigma` undeclared for a
+    # model that explicitly asked for `family=mvnormal`.
     if any(f -> f in ["gaussian", "lognormal", "student_t", "laplace", "half_normal",
-        "half_student_t"], families)
+        "half_student_t", "mvnormal", "multivariate_normal"], families)
         y_sigma_prior_str = _distribution_to_string(Exponential(1.0))
         if is_multivariate
             push!(prior_blocks,
@@ -7614,6 +7781,12 @@ function _generate_likelihood_section(
     end
     # Prior for multivariate correlation matrix (skipped for multinomial models)
     if is_multivariate && !get(M, :is_multinomial, false)
+        # NOTE: `eta = 1` makes the LKJ density uniform on the correlation (for K=2 it is
+        # exactly 1 on (-1, 1)), so it places no penalty as rho -> +-1 and the posterior
+        # is poorly conditioned -- HMC still reports 36-39 divergent transitions. `eta = 2`
+        # (Stan's default) removes the boundary mass and is worth considering, but it is a
+        # prior change for every multivariate model and was NOT what fixed the crash: see
+        # the non-finite-covariance fallback in `get_dist_ref` (`MvNormalFamily`).
         push!(prior_blocks, "$(L_corr_sym) ~ LKJCholesky(K, 1.0)")
     end
     # Prior for Dirichlet dispersion / precision parameter
@@ -7744,6 +7917,42 @@ function _generate_multivariate_likelihood_block(M::NamedTuple; prefix::String =
     extra_name = !isempty(prefix) ? "lik_extra_params_$(prefix)" : "lik_extra_params"
     L_corr_name = !isempty(prefix) ? "L_corr_$(prefix)" : "correlation_cholesky"
     dirichlet_phi_name = !isempty(prefix) ? "dirichlet_phi_$(prefix)" : "dirichlet_phi"
+    K = M.outcomes_N
+
+    # --- Joint Gaussian --------------------------------------------------------
+    # A multivariate Gaussian is y_i ~ MVN(eta_i, D R D): the correlation belongs in the
+    # RESIDUAL COVARIANCE, not applied to the linear predictor. The marginal path below
+    # emitted `eta_latent * L` and then a sum of per-outcome marginals, which means the
+    # correlation never entered the density at all and `correlation_cholesky` was
+    # unidentifiable whenever eta was constant across observations.
+    #
+    # `MvNormalFamily` already implements this: get_dist_ref builds
+    # `Diagonal(s) * (L * L') * Diagonal(s)` from `extra_params[:correlation_cholesky]`.
+    # It needs one likelihood per OBSERVATION holding the K-vector of etas, which is why
+    # this is a separate branch rather than a tweak of the outcome loop below.
+    gaus_families = ("gaussian", "mvnormal", "multivariate_normal")
+    nspec = length(M.likelihood_specs)
+    # Guard on `is_multinomial` and on the spec actually existing: a multinomial /
+    # Dirichlet model has several outcomes but a SINGLE likelihood spec (the whole
+    # composition is one draw), so iterating `outcomes_N` over `likelihood_specs` would
+    # index past the end.
+    joint_ok = !get(M, :is_multinomial, false) && K > 1 && nspec >= K &&
+               all(string(get(M.likelihood_specs[k], :family, "")) in gaus_families
+                   for k in 1:K)
+    if joint_ok
+        return """
+        let
+            local log_lik_sum
+            d_lik_vec = [bstm_Likelihood(:"mvnormal", collect(view(eta_latent, i, :));
+                sigma_y = $(y_sigma_name),
+                extra_params = Dict(:correlation_cholesky => $(L_corr_name)))
+                for i in 1:N]
+            log_lik_sum = sum(Distributions.logpdf.(d_lik_vec, eachrow(M.y_obs)))
+            Turing.@addlogprob! log_lik_sum
+        end
+        """
+    end
+
     if get(M, :is_multinomial, false)
         fam = Symbol(get(M, :multinomial_family, :multinomial))
         trials_code = get(M, :user_provided_trials, false) ? "M.trials[:, 1]" : "vec(sum(M.y_obs, dims=2))"
@@ -9091,7 +9300,7 @@ function adjacency_to_bipartite(W::AbstractMatrix; force_bipartite::Bool=true)
         queue = [start_node]
         while !isempty(queue)
             u = popfirst!(queue)
-            for v in Neighbors(g, u)
+            for v in Graphs.neighbors(g, u)
                 if colors[v] == -1
                     colors[v] = 1 - colors[u]
                     push!(queue, v)
@@ -9114,7 +9323,7 @@ function adjacency_to_bipartite(W::AbstractMatrix; force_bipartite::Bool=true)
             # # Count neighbors already in set 0 and set 1
             n0 = 0
             n1 = 0
-            for v in Neighbors(g, u)
+            for v in Graphs.neighbors(g, u)
                 if colors[v] == 0
                     n0 += 1
                 else

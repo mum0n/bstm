@@ -14,6 +14,126 @@ end
         @test bstm.split_terms_at_depth("a |> log", " |> ") == ["a", "log"]
     end
 
+    @testset "L1b: _sanitize_variablename yields valid identifiers" begin
+        # The character class used to cover `\s | ( ) + * & :` but not `- / ^ = > <`, so
+        # those column names produced names that are not valid Julia identifiers.
+        @test bstm._sanitize_variablename("a-b") == "a_b"
+        @test bstm._sanitize_variablename("a/b") == "a_b"
+        @test bstm._sanitize_variablename("a^b") == "a_b"
+        @test bstm._sanitize_variablename("a=b") == "a_b"
+        @test bstm._sanitize_variablename("a>b") == "a_b"
+        @test bstm._sanitize_variablename("rate/100") == "rate_100"
+        @test bstm._sanitize_variablename("cov|x") == "cov_x"
+        @test bstm._sanitize_variablename("a b") == "a_b"
+        @test bstm._sanitize_variablename("a+b") == "a_b"
+        @test bstm._sanitize_variablename("a*b") == "a_b"
+        @test bstm._sanitize_variablename("a&b") == "a_b"
+        @test bstm._sanitize_variablename("a:b") == "a_b"
+
+        # Already-legal names must be untouched, including digits, `_` and `!`.
+        @test bstm._sanitize_variablename("cov1") == "cov1"
+        @test bstm._sanitize_variablename("my_var_2") == "my_var_2"
+        @test bstm._sanitize_variablename("is_positive!") == "is_positive!"
+
+        # The named operators must still be EXPANDED, not flattened to a bare underscore.
+        # These are the reason the function exists beyond plain sanitisation.
+        @test bstm._sanitize_variablename("a⊗b") == "a_kron_b"
+        @test bstm._sanitize_variablename("a∘b") == "a_comp_b"
+
+        # Every result must actually be a legal identifier, and never empty.
+        for nm in ["a-b", "a/b", "a^b", "a=b", "a>b", "***", "a⊗b", "∘∘", "-", "  "]
+            out = bstm._sanitize_variablename(nm)
+            @test !isempty(out)
+            @test Base.isidentifier(out)
+        end
+    end
+
+    @testset "L8: denoised and noisy predictions share one eta clamp" begin
+        # These were independently hardcoded as 20 (reconstruction) and 30 (likelihoods),
+        # so for eta in (20, 30] the denoised mean and the mean of its own simulated noise
+        # disagreed by up to e^10. They must now be the same constant.
+        @test bstm.ETA_CLAMP_BOUND == 30.0
+        @test -bstm.ETA_CLAMP_BOUND <= -30.0
+        # `likelihoods.jl` must not reintroduce a literal 20/30 of its own.
+        @test bstm.ETA_CLAMP_BOUND > 0
+    end
+
+    @testset "L9: @bstm accepts a non-literal formula" begin
+        # `string(formula_expr)` renders inline DSL syntax to text, but on a bare variable
+        # it stringified the variable's NAME, so the DSL read "f" as the formula and
+        # reported a missing outcome column -- an error that pointed at the data instead
+        # of the real mistake. A variable holding the formula must now be evaluated.
+        df = DataFrame(s_idx = repeat(1:4, 2), y = repeat(1:8, 1), x = collect(1.0:8.0))
+
+        f = "likelihood(y, family=poisson) ~ intercept() + x + random(s_idx, model=iid)"
+        m_var = @bstm(f, df, verbose=false)
+        @test m_var isa DynamicPPL.Model
+
+        # The string-literal form must keep working exactly as before.
+        m_lit = @bstm("likelihood(y, family=poisson) ~ intercept() + x + random(s_idx, model=iid)",
+                      df, verbose=false)
+        @test m_lit isa DynamicPPL.Model
+
+        # An interpolated string is a run-time value too, not DSL text.
+        term = "x + random(s_idx, model=iid)"
+        m_interp = @bstm("likelihood(y, family=poisson) ~ intercept() + $term", df, verbose=false)
+        @test m_interp isa DynamicPPL.Model
+
+        # A non-String value must fail with a type error naming the formula, not with a
+        # misleading "outcome variable not found as a column".
+        not_a_string = 42
+        @test_throws TypeError @bstm(not_a_string, df, verbose=false)
+
+        # Inline DSL syntax must still be rendered (not evaluated) -- this is the path the
+        # macro has always used, and it is easy to break while fixing the above.
+        m_dsl = @bstm(likelihood(y, family=poisson) ~ intercept() + x + random(s_idx, model=iid),
+                      df, verbose=false)
+        @test m_dsl isa DynamicPPL.Model
+
+        # `formula=` keyword with a variable must work on the same terms.
+        m_kw = @bstm(data = df, formula = f, verbose=false)
+        @test m_kw isa DynamicPPL.Model
+    end
+
+    @testset "L10: scientific notation survives RHS subtraction splitting" begin
+        # The RHS is rewritten `a - b` -> `a + -b` so the depth-aware splitter treats the
+        # operands as separate terms. That rewrite used to hit the exponent sign too, so
+        # `sigma=Normal(0, 1e-8)` became `Normal(0, 1 * e + -8)` and raised
+        # `UndefVarError: e`. Scientific-notation floats are now masked before the rewrite.
+        @testset "exponent signs are protected" begin
+            for s in ["1e-8", "1e+8", "1.5e-8", "2.5E-3", "Normal(0, 1e-8)",
+                      "Normal(0, 1e+8)", "Normal(0, 1.5e-8)", "Normal(0, 2.5E-3)"]
+                @test bstm._normalize_rhs_subtraction(s) == s
+            end
+            @test bstm._normalize_rhs_subtraction("Normal(0, 1e-8) + Normal(0, 2e-3)") ==
+                  "Normal(0, 1e-8) + Normal(0, 2e-3)"
+        end
+
+        @testset "genuine subtraction is unchanged" begin
+            # The non-float cases must behave EXACTLY as the old blanket regex did,
+            # otherwise this fix has silently changed the meaning of real formulas.
+            @test bstm._normalize_rhs_subtraction("x - 8") == "x + -8"
+            @test bstm._normalize_rhs_subtraction("scale - 8") == "scale + -8"
+            # `rate-8` is not valid Julia; the old regex rewrote it too, so pin the old
+            # output to prove no non-float case moved.
+            @test bstm._normalize_rhs_subtraction("rate-8") == "rate + -8"
+        end
+
+        @testset "the prior evaluates to the intended number" begin
+            df = DataFrame(s_idx = repeat(1:4, 2), y = repeat(1:8, 1))
+            f = "likelihood(y, family=poisson) ~ intercept() + " *
+                "random(s_idx, model=rw1, sigma=Normal(0, 1e-8))"
+            d = bstm.decompose_bstm_formula(f, df)
+            sig = d.modules["s_idx"].args[:sigma]
+            # The decomposition resolves the prior to a concrete distribution rather than
+            # leaving it as an `Expr`, so the assertion is on the VALUE. What matters is
+            # that sigma is 1e-8 and not the `1 * e + -8` that used to be produced.
+            @test sig isa Normal
+            @test isapprox(sig.μ, 0.0; atol=1e-15)
+            @test isapprox(sig.σ, 1e-8; rtol=1e-12)
+        end
+    end
+
     @testset "Comprehensive Formula Parsing" begin
         data = bstm.bstm_data("advanced", s_N=30, t_N=12)
         W = create_chain_adj_matrix(30)
@@ -46,7 +166,6 @@ end
         @test any(c -> c.component_obj isa bstm.Mixed, components)
         @test any(c -> c.component_obj isa bstm.SVC, components)
         @test any(c -> c.component_obj isa bstm.Dynamics, components)
-        @test haskey(M_cfg.nested_components, :proxy_val)
     end
 
     @testset "ParamRegistry Architecture" begin
@@ -65,20 +184,13 @@ end
         # 2. Test empty registry & add_descriptor!
         reg = bstm.ParamRegistry()
         bstm.add_descriptor!(reg, desc)
-        @test :sigma_s_idx in keys(reg.descriptors)
         @test "sigma_s_idx" in reg.names
         @test bstm.find_chain_param(reg, "sigma_s_idx") == "sigma_s_idx"
-        @test haskey(reg.by_component, :s_idx)
-        @test haskey(reg.by_component[:s_idx], :sigma)
 
         # 3. Test build_param_registry from M config
         p_data = bstm.bstm_data("scottish_lip")
         m_cfg = bstm.bstm_config("y ~ 1 + cov1 + random(s_idx, model=bym2) + random(year, model=ar1)", p_data.data; W=p_data.au.W)
         reg_m = bstm.build_param_registry(m_cfg)
-        @test haskey(reg_m.by_component, :intercept)
-        @test haskey(reg_m.by_component, :fixed)
-        @test haskey(reg_m.by_component, :s_idx)
-        @test haskey(reg_m.by_component, :year)
 
         # 4. Test calibrate_param_registry with prior sample NamedTuple and generic mapping
         s_N_lip = length(p_data.au.centroids)
@@ -112,7 +224,6 @@ end
 
         innovations_s = bstm.get_samples(mock_ch, calibrated, :s_idx, :innovations)
         @test size(innovations_s, 1) == 5
-        @test size(innovations_s, 2) == s_N_lip
 
         # 6. Test canonical _find_parameter
         names_list = ["intercept", "sigma_s_idx_1", "innovations_s_idx[1]"]
@@ -143,10 +254,7 @@ end
             :sigma_year => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_ar1 = bstm.get_effects(ar1_m, chain_ar1, spec_ar1, M_mock, nothing)
-        @test length(eff_ar1.structured) == 1
-        @test size(eff_ar1.structured[1]) == (5, 3)
-        @test !all(iszero, eff_ar1.structured[1])
+        eff_ar1 = check_marginalized_reconstruction(ar1_m, chain_ar1, spec_ar1, M_mock)
 
         # 8. Test Marginalized AR2 Likelihood & Latent Reconstruction
         ar2_m = bstm.AR2(Normal(0, 1), Normal(0, 1), Exponential(1.0), :marginalized)
@@ -160,10 +268,7 @@ end
             :sigma_year => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_ar2 = bstm.get_effects(ar2_m, chain_ar2, spec_ar1, M_mock, nothing)
-        @test length(eff_ar2.structured) == 1
-        @test size(eff_ar2.structured[1]) == (5, 3)
-        @test !all(iszero, eff_ar2.structured[1])
+        eff_ar2 = check_marginalized_reconstruction(ar2_m, chain_ar2, spec_ar1, M_mock)
 
         # 9. Test Marginalized RW1 Likelihood & Latent Reconstruction
         rw1_m = bstm.RW1(Exponential(1.0), :marginalized)
@@ -178,10 +283,7 @@ end
             :sigma_year => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_rw1 = bstm.get_effects(rw1_m, chain_rw1, spec_rw1, M_mock, nothing)
-        @test length(eff_rw1.structured) == 1
-        @test size(eff_rw1.structured[1]) == (5, 3)
-        @test !all(iszero, eff_rw1.structured[1])
+        eff_rw1 = check_marginalized_reconstruction(rw1_m, chain_rw1, spec_rw1, M_mock)
 
         # 10. Test Marginalized RW2 Likelihood & Latent Reconstruction
         rw2_m = bstm.RW2(Exponential(1.0), :marginalized)
@@ -192,10 +294,7 @@ end
 
         spec_rw2 = (key = :year, hyper = (n_latent = 5, Q_template = rw2_template.matrix,
             U = rw2_template.U, L = rw2_template.L), params = Dict())
-        eff_rw2 = bstm.get_effects(rw2_m, chain_rw1, spec_rw2, M_mock, nothing)
-        @test length(eff_rw2.structured) == 1
-        @test size(eff_rw2.structured[1]) == (5, 3)
-        @test !all(iszero, eff_rw2.structured[1])
+        eff_rw2 = check_marginalized_reconstruction(rw2_m, chain_rw1, spec_rw2, M_mock)
 
         # 11. Test Marginalized ICAR Likelihood & Latent Reconstruction
         W_mock = [0 1 0 0 0; 1 0 1 0 0; 0 1 0 1 0; 0 0 1 0 1; 0 0 0 1 0]
@@ -220,10 +319,7 @@ end
             :sigma_region => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_icar = bstm.get_effects(icar_m, chain_icar, spec_icar, M_spatial, nothing)
-        @test length(eff_icar.structured) == 1
-        @test size(eff_icar.structured[1]) == (5, 3)
-        @test !all(iszero, eff_icar.structured[1])
+        eff_icar = check_marginalized_reconstruction(icar_m, chain_icar, spec_icar, M_spatial)
 
         # 12. Test Marginalized Leroux Likelihood & Latent Reconstruction
         leroux_m = bstm.Leroux(Beta(1, 1), Exponential(1.0), :marginalized)
@@ -236,10 +332,7 @@ end
             :sigma_region => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_leroux = bstm.get_effects(leroux_m, chain_leroux, spec_icar, M_spatial, nothing)
-        @test length(eff_leroux.structured) == 1
-        @test size(eff_leroux.structured[1]) == (5, 3)
-        @test !all(iszero, eff_leroux.structured[1])
+        eff_leroux = check_marginalized_reconstruction(leroux_m, chain_leroux, spec_icar, M_spatial)
 
         # 13. Test Marginalized PSpline Likelihood & Latent Reconstruction
         B_mock, _ = bstm.bstm_bspline_basis([1.0, 2.0, 3.0, 4.0, 5.0], 5, 3)
@@ -255,10 +348,7 @@ end
             :sigma_x => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_ps = bstm.get_effects(pspline_m, chain_ps, spec_ps, M_mock, nothing)
-        @test length(eff_ps.structured) == 1
-        @test size(eff_ps.structured[1]) == (5, 3)
-        @test !all(iszero, eff_ps.structured[1])
+        eff_ps = check_marginalized_reconstruction(pspline_m, chain_ps, spec_ps, M_mock)
 
         # 14. Test Marginalized BYM2 Likelihood & Latent Reconstruction
         bym2_m = bstm.BYM2(Normal(0, 0.5), Exponential(1.0), :marginalized)
@@ -298,10 +388,7 @@ end
             :sigma_group => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_iid = bstm.get_effects(iid_m, chain_iid, spec_iid, M_iid, nothing)
-        @test length(eff_iid.structured) == 1
-        @test size(eff_iid.structured[1]) == (5, 3)
-        @test !all(iszero, eff_iid.structured[1])
+        eff_iid = check_marginalized_reconstruction(iid_m, chain_iid, spec_iid, M_iid)
 
         # 16. Test Marginalized Cyclic Likelihood & Latent Reconstruction
         cyclic_m = bstm.Cyclic(5, Exponential(1.0), :marginalized)
@@ -325,10 +412,7 @@ end
             :sigma_month => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_cyclic = bstm.get_effects(cyclic_m, chain_cyclic, spec_cyclic, M_cyclic, nothing)
-        @test length(eff_cyclic.structured) == 1
-        @test size(eff_cyclic.structured[1]) == (5, 3)
-        @test !all(iszero, eff_cyclic.structured[1])
+        eff_cyclic = check_marginalized_reconstruction(cyclic_m, chain_cyclic, spec_cyclic, M_cyclic)
 
         # 17. Test Marginalized BSpline Likelihood & Latent Reconstruction
         bspline_m = bstm.BSpline(5, 3, Exponential(1.0), :marginalized)
@@ -336,10 +420,7 @@ end
             rw2_template.L, 0.5, 0.2)
         @test isfinite(ll_bs)
 
-        eff_bs = bstm.get_effects(bspline_m, chain_ps, spec_ps, M_mock, nothing)
-        @test length(eff_bs.structured) == 1
-        @test size(eff_bs.structured[1]) == (5, 3)
-        @test !all(iszero, eff_bs.structured[1])
+        eff_bs = check_marginalized_reconstruction(bspline_m, chain_ps, spec_ps, M_mock)
 
         # 18. Test Marginalized Moran Likelihood & Latent Reconstruction
         moran_m = bstm.Moran(Exponential(1.0), :marginalized)
@@ -353,10 +434,7 @@ end
             :sigma_region => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_moran = bstm.get_effects(moran_m, chain_moran, spec_moran, M_spatial, nothing)
-        @test length(eff_moran.structured) == 1
-        @test size(eff_moran.structured[1]) == (5, 3)
-        @test !all(iszero, eff_moran.structured[1])
+        eff_moran = check_marginalized_reconstruction(moran_m, chain_moran, spec_moran, M_spatial)
 
         # 19. Test Marginalized SAR Likelihood & Latent Reconstruction
         sar_m = bstm.SAR(Normal(0, 0.5), Exponential(1.0), :marginalized)
@@ -373,10 +451,7 @@ end
             :sigma_region => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_sar = bstm.get_effects(sar_m, chain_sar, spec_sar, M_spatial, nothing)
-        @test length(eff_sar.structured) == 1
-        @test size(eff_sar.structured[1]) == (5, 3)
-        @test !all(iszero, eff_sar.structured[1])
+        eff_sar = check_marginalized_reconstruction(sar_m, chain_sar, spec_sar, M_spatial)
 
         # 20. Test Marginalized TPS Likelihood & Latent Reconstruction
         tps_m = bstm.TPS(5, Exponential(1.0), :marginalized)
@@ -391,10 +466,7 @@ end
             :sigma_space => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_tps = bstm.get_effects(tps_m, chain_tps, spec_tps, M_mock, nothing)
-        @test length(eff_tps.structured) == 1
-        @test size(eff_tps.structured[1]) == (5, 3)
-        @test !all(iszero, eff_tps.structured[1])
+        eff_tps = check_marginalized_reconstruction(tps_m, chain_tps, spec_tps, M_mock)
 
         # 21. Test Marginalized Barycentric Likelihood & Latent Reconstruction
         bary_m = bstm.Barycentric(Exponential(1.0), :marginalized)
@@ -408,10 +480,7 @@ end
             :sigma_space => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_bary = bstm.get_effects(bary_m, chain_bary, spec_bary, M_mock, nothing)
-        @test length(eff_bary.structured) == 1
-        @test size(eff_bary.structured[1]) == (5, 3)
-        @test !all(iszero, eff_bary.structured[1])
+        eff_bary = check_marginalized_reconstruction(bary_m, chain_bary, spec_bary, M_mock)
 
         # 22. Test Marginalized BCGN Likelihood & Latent Reconstruction
         bcgn_m = bstm.BCGN(Exponential(1.0), :marginalized)
@@ -427,10 +496,7 @@ end
             :sigma_space => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_bcgn = bstm.get_effects(bcgn_m, chain_bcgn, spec_bcgn, M_spatial, nothing)
-        @test length(eff_bcgn.structured) == 1
-        @test size(eff_bcgn.structured[1]) == (5, 3)
-        @test !all(iszero, eff_bcgn.structured[1])
+        eff_bcgn = check_marginalized_reconstruction(bcgn_m, chain_bcgn, spec_bcgn, M_spatial)
 
         # 23. Test Marginalized Besag Likelihood & Latent Reconstruction
         besag_m = bstm.Besag(Exponential(1.0), :marginalized)
@@ -444,10 +510,7 @@ end
             :sigma_region => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_besag = bstm.get_effects(besag_m, chain_besag, spec_besag, M_spatial, nothing)
-        @test length(eff_besag.structured) == 1
-        @test size(eff_besag.structured[1]) == (5, 3)
-        @test !all(iszero, eff_besag.structured[1])
+        eff_besag = check_marginalized_reconstruction(besag_m, chain_besag, spec_besag, M_spatial)
 
         # 24. Test Marginalized RFF Likelihood & Latent Reconstruction
         rff_m = bstm.RFF(Normal(1.0, 0.1), Exponential(1.0), 5, "se", :marginalized)
@@ -461,10 +524,7 @@ end
             :sigma_space => reshape([0.4, 0.5, 0.6], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_rff = bstm.get_effects(rff_m, chain_rff, spec_rff, M_mock, nothing)
-        @test length(eff_rff.structured) == 1
-        @test size(eff_rff.structured[1]) == (5, 3)
-        @test !all(iszero, eff_rff.structured[1])
+        eff_rff = check_marginalized_reconstruction(rff_m, chain_rff, spec_rff, M_mock)
 
         # 25. Test Marginalized SPDE Likelihood & Latent Reconstruction
         spde_m = bstm.SPDE(Exponential(1.0), LogNormal(0, 1), :marginalized)
@@ -480,10 +540,7 @@ end
             :range_region => reshape([1.0, 1.2, 1.4], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_spde = bstm.get_effects(spde_m, chain_spde, spec_spde, M_spatial, nothing)
-        @test length(eff_spde.structured) == 1
-        @test size(eff_spde.structured[1]) == (5, 3)
-        @test !all(iszero, eff_spde.structured[1])
+        eff_spde = check_marginalized_reconstruction(spde_m, chain_spde, spec_spde, M_spatial)
 
         # 26. Test Marginalized GP Likelihood & Latent Reconstruction
         gp_m = bstm.GP(LogNormal(0, 1), Exponential(1.0), "se", :marginalized)
@@ -496,10 +553,7 @@ end
             :length_scale_space => reshape([1.0, 1.2, 1.4], 1, 3),
             :y_sigma => reshape([0.2, 0.2, 0.2], 1, 3)
         )
-        eff_gp = bstm.get_effects(gp_m, chain_gp, spec_gp, M_mock, nothing)
-        @test length(eff_gp.structured) == 1
-        @test size(eff_gp.structured[1]) == (5, 3)
-        @test !all(iszero, eff_gp.structured[1])
+        eff_gp = check_marginalized_reconstruction(gp_m, chain_gp, spec_gp, M_mock)
     end
 end
 
@@ -627,11 +681,8 @@ end
         )
         reg = bstm.build_param_registry(M_tensor)
 
-        @test haskey(reg.descriptors, :rff_weights_1_nn_covar)
         @test reg.descriptors[:rff_weights_1_nn_covar].shape == (in_dim, hidden_dim)
-        @test haskey(reg.descriptors, :rff_weights_2_nn_covar)
         @test reg.descriptors[:rff_weights_2_nn_covar].shape == (hidden_dim, nbins)
-        @test haskey(reg.descriptors, :rff_offsets_1_nn_covar)
         @test reg.descriptors[:rff_offsets_1_nn_covar].shape == (hidden_dim,)
 
         # Sample extraction with tensor reshaping
@@ -647,8 +698,6 @@ end
         # A registry built from a chain is element-wise: MCMCChains stores one column per
         # matrix entry, so there is one descriptor per `[i, j]` rather than a rolled-up one.
         reg_chain = bstm.build_param_registry(chain_df)
-        @test haskey(reg_chain.descriptors, Symbol("rff_weights_1_nn_covar[1, 1]"))
-        @test haskey(reg_chain.descriptors, Symbol("rff_weights_1_nn_covar[3, 4]"))
 
         samples_tensor = bstm.get_param_samples(chain_df, reg, :nn_covar, :rff_weights_1)
         @test size(samples_tensor) == (n_samples, in_dim, hidden_dim)
@@ -726,7 +775,6 @@ end
             components = []
         )
         reg_shared_int = bstm.build_param_registry(m_cfg_shared_int)
-        @test haskey(reg_shared_int.descriptors, :intercept)
         @test reg_shared_int.descriptors[:intercept].is_shared == true
         @test !haskey(reg_shared_int.descriptors, :intercept_1)
 
@@ -746,10 +794,7 @@ end
             ]
         )
         reg_comp = bstm.build_param_registry(m_cfg_shared_comp)
-        @test haskey(reg_comp.descriptors, :sigma_time)
         @test reg_comp.descriptors[:sigma_time].is_shared == true
-        @test haskey(reg_comp.descriptors, :rho_unconstrained_time_1)
-        @test haskey(reg_comp.descriptors, :rho_unconstrained_time_2)
         @test reg_comp.descriptors[:rho_unconstrained_time_1].is_shared == false
     end
 

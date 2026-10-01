@@ -46,7 +46,7 @@ basis for the Knorr-Held Type IV interaction model.
 """
 struct TensorProductSmooth <: ComponentModel
     components::Vector{ComponentModel}
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     method::Symbol
 end
 
@@ -110,7 +110,7 @@ function get_priors(
     
     return """
     # Priors for Spatiotemporal Interaction: $(spec.key)
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+    $(_prior_or_constant(p_names.sigma, m.sigma))
     $(p_names.innovations) ~ MvNormal(
         zeros(T, spec_registry[:$(key)].hyper.n_latent), I
     )

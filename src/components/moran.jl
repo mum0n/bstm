@@ -50,7 +50,7 @@ where:
   understanding through theory and practice*. Springer Science & Business Media.
 """
 struct Moran <: ComponentModel
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     method::Symbol
 end
 
@@ -155,7 +155,7 @@ function get_priors(
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
     
-    priors = ["$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))"]
+    priors = ["$(_prior_or_constant(p_names.sigma, m.sigma))"]
 
     if m.method == :noncentered
         push!(
@@ -217,7 +217,7 @@ function get_updates(
                 size(moran_eigenvectors, 1),
                 moran_eigenvectors,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -268,15 +268,17 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        
-        if isempty(sigma_name)
-            @warn "Sigma parameter for Moran component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples;
+            as_matrix = true)
+
+        if isnothing(sigma_samples)
+            @warn "Parameters for $(spec.key) (outcome $k) not resolved, and " *
+                  "sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
-
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
         
         local latent_field_matrix
         if m.method == :marginalized

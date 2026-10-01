@@ -66,7 +66,7 @@ and \$\\mathcal{O}(N m)\$ memory, scaling to \$N > 10^5\$ without inducing point
   Statistical Software, 90(4), 1-26.
 """
 struct NNGP <: ComponentModel
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     length_scale::UnivariateDistribution
     m::Int
     kernel::Symbol
@@ -174,8 +174,8 @@ function get_priors(
     n_latent = spec.hyper.n_latent
 
     return """
-    $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
-    $(p_names.length_scale) ~ $(_distribution_to_string(m.length_scale))
+    $(_prior_or_constant(p_names.sigma, m.sigma))
+    $(_prior_or_constant(p_names.length_scale, m.length_scale))
     $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
     """
 end

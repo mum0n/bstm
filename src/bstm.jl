@@ -325,6 +325,11 @@ module bstm
         using CategoricalArrays
         # Cubic interpolation for the basis / spline components.
         using Interpolations
+        # `nzrange` for the `dag` component's generated neighbour loop. `SparseArrays`
+        # exports it and it is defined in bstm, but the runtime module does not inherit
+        # bstm's imports, so the unqualified name did not resolve there and `dag` failed at
+        # `rand(m)`. Same root cause as a missing entry in `_GENERATED_CODE_HELPERS` below.
+        using SparseArrays
     end
 
     # bstm's own helpers, reachable from the generated body. Bound as values once every
@@ -338,6 +343,8 @@ module bstm
         :bstm_Likelihood,
         :evaluate_kernel_matrix,
         :evaluate_cross_kernel_matrix,
+        :_sparse_gp_lambda_diag,
+        :_zero_null_modes!,
         :anisotropic_matern_spectral_density,
         :householder_to_eigenvector,
         :ar1_statespace,
@@ -363,6 +370,16 @@ module bstm
         :_sar_log_marginal_likelihood,
         :_spde_log_marginal_likelihood,
         :_tps_log_marginal_likelihood,
+        # --- added for the components that could not be sampled at all ---
+        # Each of these is a bstm helper called from a generated model body. They were
+        # missing from this list, so `fft`, `wavelet` and `hyperbolic` all failed at
+        # `rand(m)` with `UndefVarError: <helper> not defined in
+        # _GeneratedModelRuntime` -- i.e. these three components could not be sampled at all.
+        # The error names the missing binding, which is the intended behaviour of the
+        # allowlist: add the name here rather than widening the runtime module.
+        :bstm_fourier_basis,                      # `fft`
+        :bstm_tensor_product_wavelet_basis,       # `wavelet`
+        :_evaluate_hyperbolic_kernel_matrix,      # `hyperbolic`
     ]
     for _helper in _GENERATED_CODE_HELPERS
         isdefined(@__MODULE__, _helper) || error(

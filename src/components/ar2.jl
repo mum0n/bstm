@@ -68,7 +68,7 @@ controlled by the `random()` call:
 struct AR2 <: ComponentModel
     rho_regime_1_unconstrained::Distribution
     rho_regime_2_unconstrained::Distribution
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     method::Symbol
 end
 
@@ -109,7 +109,7 @@ function get_priors(
     priors_acc = String[]
 
     if !is_multivariate || (is_multivariate && (!is_shared || is_first_outcome))
-        push!(priors_acc, "$(p_names.sigma) ~ $(_distribution_to_string(m.sigma))")
+        push!(priors_acc, "$(_prior_or_constant(p_names.sigma, m.sigma))")
         push!(priors_acc, "$(p_names.rho_regime_1_unconstrained) ~ " *
                           "$(_distribution_to_string(m.rho_regime_1_unconstrained))")
         push!(priors_acc, "$(p_names.rho_regime_2_unconstrained) ~ " *
@@ -183,7 +183,7 @@ function get_updates(
                 rho_regime_1,
                 rho_regime_2,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(spec.key)
@@ -391,20 +391,21 @@ function get_effects(
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
         
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
-        rho_regime_1_name = _find_parameter(p_names, string(p_names_k.rho_regime_1_unconstrained), k,
-            is_multivariate_model)
-        rho_regime_2_name = _find_parameter(p_names, string(p_names_k.rho_regime_2_unconstrained), k,
-            is_multivariate_model)
-        
-        if isempty(sigma_name) || isempty(rho_regime_1_name) || isempty(rho_regime_2_name)
-            @warn "Base parameters for AR2 component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples)
+        rho_regime_1_name = _find_parameter(
+            p_names, string(p_names_k.rho_regime_1_unconstrained), k, is_multivariate_model)
+        rho_regime_2_name = _find_parameter(
+            p_names, string(p_names_k.rho_regime_2_unconstrained), k, is_multivariate_model)
+
+        if isnothing(sigma_samples) || isempty(rho_regime_1_name) || isempty(rho_regime_2_name)
+            @warn "Base parameters for AR2 component $(spec.key) (outcome $k) not " *
+                  "resolved, and sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total_obs, n_samples))
             continue
         end
 
-        # Extract posterior samples
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
         pi1_samples = tanh.(get_params_vector(chain, rho_regime_1_name, 1)[:, 1])
         pi2_samples = tanh.(get_params_vector(chain, rho_regime_2_name, 1)[:, 1])
         rho1_samples = pi1_samples .* (1 .- pi2_samples)

@@ -299,7 +299,7 @@ function get_effects(
             L = base_spec.hyper.L
             diag_D = 1.0 ./ sqrt.(L .+ noise)
             if typeof(m.base_model) in [ICAR, Besag]
-                diag_D[1] = 0.0
+                _zero_null_modes!(diag_D, L)   # zero EVERY null direction; a disconnected graph has more than one
             end
             
             # Vectorized reconstruction on CPU

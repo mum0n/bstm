@@ -147,7 +147,7 @@ function get_priors(
         
         return """
         # Priors for Spatiotemporal Interaction: $(spec.key)
-        $(p_names.sigma) ~ $(_distribution_to_string(st_sigma_prior))
+        $(_prior_or_constant(p_names.sigma, st_sigma_prior))
         $(p_names.innovations) ~ MvNormal(zeros(T, $(s_N * t_N)), I)
         """
     elseif m.operator == :composition # Non-stationary variance

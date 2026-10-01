@@ -59,7 +59,7 @@ is applied to the latent field.
 - Rue, H., & Held, L. (2005). *Gaussian Markov Random Fields: Theory and Applications*. CRC Press.
 """
 struct BCGN <: ComponentModel
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     method::Symbol
 end
 
@@ -195,12 +195,12 @@ function get_priors(
     if m.method == :marginalized
         return """
         # Priors for BCGN component: $(spec.key)
-        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(_prior_or_constant(p_names.sigma, m.sigma))
         """
     else
         return """
         # Priors for BCGN component: $(spec.key)
-        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(_prior_or_constant(p_names.sigma, m.sigma))
         $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     end
@@ -278,7 +278,7 @@ function get_updates(
                 hyper.Q_template,
                 hyper.L,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -346,16 +346,17 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples)
 
-        if isempty(sigma_name)
-            @warn "Parameters for BCGN component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        if isnothing(sigma_samples)
+            @warn "Parameters for $(spec.key) (outcome $k) not resolved, and " *
+                  "sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        # Extract posterior samples from the chain (these are on the CPU)
-        sigma_samples = get_params_vector(chain, sigma_name, 1)[:, 1]
 
         # Initialize the output matrix for latent effects on the CPU
         effect_k_matrix = zeros(Float64, n_latent, n_samples)

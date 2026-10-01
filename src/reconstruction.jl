@@ -121,6 +121,55 @@ function _get_chain_n_samples(chain::Any)::Int
 end
 
 """
+    _resolve_hyper_samples(chain, p_names, target, value, k, is_multivariate_model, n_samples)
+
+Posterior draws for one scalar hyperparameter of a component, or `nothing` when it cannot be
+resolved.
+
+**Why this exists.** Every component's `get_effects` used to bail to a zero matrix whenever a
+hyperparameter it needed was missing from the chain:
+
+    sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+    if isempty(sigma_name)
+        @warn "Parameters for ... not found. Returning zero-matrix."
+        push!(structured_effects, zeros(Float64, n_obs_full, n_samples))
+        continue
+    end
+
+That conflates two unrelated situations. A hyperparameter the user **pinned to a constant** is
+not a chain parameter at all: `_prior_or_constant` emits `name = value` rather than a
+`~` statement, so DynamicPPL never records it and `_find_parameter` can never find it. Those
+runs were reconstructing a **zero field with only a warning** -- silently wrong, for exactly
+the configuration a user pins a hyperparameter in order to hold it fixed. The 51 sites that
+carried this pattern are listed in `todo.md`; the failure was confirmed end-to-end for `FITC`,
+`ICAR` and `BYM2`.
+
+So: look the parameter up first, and if it is absent, fall back to the component's own
+declared value when that is a `Real`. A pinned hyperparameter has no posterior variation by
+construction, so replicating the constant across draws is the exact answer, not an
+approximation. `nothing` is returned only when the hyperparameter is genuinely unresolvable --
+neither a chain parameter nor a constant -- and only then is a zero matrix defensible.
+"""
+function _resolve_hyper_samples(
+    chain, p_names, target, value, k, is_multivariate_model::Bool, n_samples::Integer;
+    as_matrix::Bool = false
+)
+    name = _find_parameter(p_names, string(target), k, is_multivariate_model)
+    samples = if !isempty(name)
+        get_params_vector(chain, name, 1)[:, 1]
+    elseif value isa Real
+        fill(Float64(value), Int(n_samples))
+    else
+        return nothing
+    end
+    # Some sites index their samples as `sigma_samples[i, 1]` and some as `sigma_samples[i]`.
+    # Returning the requested shape here rather than reshaping at each call site keeps the
+    # `isnothing` guard correct: `reshape(nothing, ...)` throws, so a reshape placed BEFORE
+    # the guard would turn the genuinely-absent path into an error.
+    return as_matrix ? reshape(samples, Int(n_samples), 1) : samples
+end
+
+"""
     _find_parameter(reg::ParamRegistry, target_name_base, outcome_idx=nothing,
       is_multivariate_model=false)
     _find_parameter(p_names, target_name_base, outcome_idx=nothing, is_multivariate_model=false)
@@ -200,7 +249,7 @@ function _resolve_effect_indices(
     elseif haskey(M, var_sym)
         collect(Int, M[var_sym])
     else
-        Int[]
+        ones(Float64, n_samples, outcomes_N)
     end
 
     full_idx = if !isnothing(PS)
@@ -695,17 +744,20 @@ function _reconstruct(
         return pstats
     end
 
-    # --- 4. Apply Correlation Structure ---
+    # --- 4. Correlation Structure ---
+    # The generated model does NOT rotate the linear predictor: for the joint Gaussian the
+    # correlation lives in the residual covariance (D R D), not in the mean. Reconstruction
+    # must mirror that exactly. Rotating here as well would put the two in different
+    # outcome bases -- the exact mismatch that M2a was opened to remove.
+    #
+    # The factor is still extracted, and passed to the likelihood construction below, which
+    # is where it belongs.
     correlation_cholesky_name = !isempty(prefix) ? "L_corr_$(prefix)" : "correlation_cholesky"
     L_corr_samples = get_params_matrix(chain, correlation_cholesky_name, outcomes_N_val * outcomes_N_val)
     if isempty(L_corr_samples) && !isempty(prefix)
         L_corr_samples = get_params_matrix(chain, "correlation_cholesky", outcomes_N_val * outcomes_N_val)
     end
-    eta_post = similar(eta_latent_post)
-    for s in 1:n_samples_val
-        L_s = reshape(L_corr_samples[s, :], outcomes_N_val, outcomes_N_val)
-        eta_post[:, s, :] = eta_latent_post[:, s, :] * L_s'
-    end
+    eta_post = eta_latent_post
 
     # --- 5. Prediction and Log-Likelihood Calculation ---
     all_pred_results = [
@@ -717,10 +769,35 @@ function _reconstruct(
     
     p_denoised_summaries = [summarize_array(res.p_denoised,
         alpha=alpha) for res in all_pred_results]
-    p_noisy_summaries = [summarize_array(res.p_noisy, alpha=alpha) for res in all_pred_results]
     raw_denoised = [res.p_denoised for res in all_pred_results]
     raw_noisy = [res.p_noisy for res in all_pred_results]
     all_log_lik = hcat([res.log_lik for res in all_pred_results]...)
+
+    # --- 5b. Joint (multivariate-Gaussian) noisy draws ---
+    # `_process_ll_and_predictions` builds one SCALAR likelihood per outcome, so for a
+    # multivariate Gaussian it drew each outcome independently and threw away the residual
+    # correlation the model fits. That path is skipped for such models, leaving `p_noisy`
+    # uninitialised -- so the noisy summaries MUST be computed after this block, not
+    # before, or `summarize_array` reads uninitialised memory and reports NaN.
+    # `nothing` (i.e. the per-outcome draws and their summaries are kept) for every other
+    # family, where rotating the mean -- not a covariance -- carries the correlation.
+    joint = _joint_noisy_draws_if_applicable(
+        eta_post, L_corr_samples, chain, M, outcomes_N_val, n_samples_val, prefix
+    )
+    if !isnothing(joint)
+        joint_noisy, joint_log_lik = joint
+        raw_noisy = [joint_noisy[:, :, k] for k in 1:outcomes_N_val]
+        # The per-outcome log-likelihood was skipped for this model, so substitute the joint
+        # one -- it is the JOINT logpdf on the training rows, not a sum of marginals, or
+        # WAIC would be computed for a factorised model that is no longer the one fitted.
+        # Gated on shape rather than on `isnothing(PS)`: the per-outcome path allocates
+        # `log_lik` uninitialised and skips filling it, so an un-substituted joint model
+        # reports an all-NaN WAIC.
+        if !isempty(joint_log_lik) && size(joint_log_lik, 1) == size(all_log_lik, 1)
+            all_log_lik = joint_log_lik
+        end
+    end
+    p_noisy_summaries = [summarize_array(a, alpha=alpha) for a in raw_noisy]
 
     # --- 6. Final Result Consolidation ---
     pstats = (
@@ -1119,11 +1196,68 @@ function _modular_eta_assembly(registry, M, PS, n_samples, outcomes_N)
         end
     end
 
+    # Apply the Householder reflection LAST, mirroring the generated model, where
+    # `eta = eta * H_reflection` is the final update before the likelihood (model.jl:4294,
+    # pushed after offsets, fixed effects, component updates and the spatiotemporal
+    # interaction). A rotation does not commute with the additive terms, so the position
+    # matters: it must come after `log_offsets` above, not before.
+    #
+    # Previously the reflection was computed into the registry and never read, so every
+    # reconstructed field, prediction, log-likelihood and WAIC was produced in a different
+    # outcome basis than the one the model was actually fitted in.
+    #
+    # The guard must mirror the condition at line 563 that actually *fits* a reflection.
+    # `householder_effects_samples` is declared as a zeros array at line 562, before that
+    # branch, and the key is therefore always present in the registry -- gating on the key
+    # alone multiplies eta by zero and silently zeroes every multivariate prediction.
+    if outcomes_N > 1 && get(M, :spectral_orientation, false) &&
+            get(M, :model_arch, "") == "multivariate" &&
+            haskey(registry, :householder_reflection)
+        H_samples = registry.householder_reflection
+        if H_samples isa AbstractArray && ndims(H_samples) == 3 &&
+                size(H_samples, 1) == outcomes_N && size(H_samples, 2) == outcomes_N
+
+    for s in 1:n_samples
+                s <= size(H_samples, 3) || break
+                eta_latent[:, s, :] = eta_latent[:, s, :] * view(H_samples, :, :, s)
+            end
+        end
+    end
+
     return eta_latent
 end
 
 
 
+
+"""
+    _optional_param_matrix(chain, name, n_samples, outcomes_N, default)
+
+Fetch `name` from `chain` as an `(n_samples x outcomes_N)` matrix, returning `default` if
+the parameter is absent. Unlike `get_params_matrix`, which errors, this tolerates families
+that do not fit the parameter at all -- e.g. `lik_extra_params` exists only for the
+dispersion families, and `lik_phi_hurdle` only when a hurdle is specified.
+"""
+function _optional_param_matrix(chain, name, n_samples::Int, outcomes_N::Int, default)
+    try
+        m = get_params_matrix(chain, name, outcomes_N)
+        (size(m, 1) >= n_samples && size(m, 2) == outcomes_N) || return default
+        return m[1:n_samples, :]
+    catch
+        return default
+    end
+end
+
+"""
+    _dispersion_or_nothing(v)
+
+The dispersion sentinel: a `NaN` means the model fitted no dispersion parameter, and
+`bstm_Likelihood` expects `nothing` there so each family applies its own documented default
+(`alpha = 1.0`, `phi = 10.0`, `nu = 5.0`). Passing `NaN` through would reach the kernels as
+`extra_params` and be treated as a real, invalid value.
+"""
+_dispersion_or_nothing(v::Real) = isnan(v) ? nothing : v
+_dispersion_or_nothing(v) = v
 
 """
     _process_ll_and_predictions(eta_samples, chain, M, PS, outcomes_N, k)
@@ -1146,8 +1280,7 @@ v1.0.0
 """
 function _process_ll_and_predictions(
     eta_samples, chain, M, PS, outcomes_N, k; prefix::String = ""
-)
-    N_tot, n_samples = size(eta_samples)
+)    N_tot, n_samples = size(eta_samples)
     N_train = M.y_N
     
     y_obs_k = Array(outcomes_N > 1 ? M.y_obs[:, k] : M.y_obs)
@@ -1179,15 +1312,41 @@ function _process_ll_and_predictions(
         ones(Int, N_tot)
     end
 
+    # --- Hurdle and dispersion parameters (L2) ---
+    # The model fits these (model.jl:5299 samples `lik_phi_hurdle`, model.jl:5317 samples
+    # `lik_extra_params`, passed through at 5471/5483) but they were never threaded to the
+    # likelihood below, so it silently fell back to `phi_hurdle = -Inf` and
+    # `extra_params = nothing` -- i.e. hardcoded alpha=1.0 / phi=10.0 / nu=5.0. Every
+    # pointwise log-likelihood and noisy draw was then for a different model than the one
+    # that was fitted. A family that does not use them simply has no such parameter in the
+    # chain, in which case the previous default is kept and is correct.
+    #
+    # Extracted before `p_denoised_samples`, which needs `phi_hurdle_samples`.
+    phi_hurdle_name = !isempty(prefix) ? "lik_phi_hurdle_$(prefix)" : "lik_phi_hurdle"
+    extra_params_name = !isempty(prefix) ? "lik_extra_params_$(prefix)" : "lik_extra_params"
+    phi_hurdle_samples = _optional_param_matrix(
+        chain, phi_hurdle_name, n_samples, outcomes_N, fill(-Inf, n_samples, outcomes_N)
+    )
+    extra_params_samples = _optional_param_matrix(
+        chain, extra_params_name, n_samples, outcomes_N, fill(NaN, n_samples, outcomes_N)
+    )
+
     p_denoised_samples = similar(eta_samples)
     for s in 1:n_samples
         p_denoised_samples[:, s] = _apply_link_and_lik(
-            family, view(eta_samples, :, s), use_zi, phi_zi_samples[s], 1.0, trials_full
+            family, view(eta_samples, :, s), use_zi, phi_zi_samples[s], 1.0, trials_full;
+            phi_hurdle=phi_hurdle_samples[s, k]
         )
     end
 
     p_noisy_samples = similar(eta_samples)
-    log_lik_samples = zeros(Float64, min(N_train, N_tot), n_samples)
+    # `PS` supplies a *prediction* dataset, so `eta_samples` is indexed at prediction
+    # locations while `y_obs_k` (== M.y_obs) and N_train are the *training* quantities --
+    # different index spaces. The pointwise log-likelihood is therefore not computable here
+    # unless the caller passed the training data itself. Leave it as NaN rather than zeros:
+    # zeros make `_compute_waic` return a plausible-looking 0.0 for a model that was never
+    # evaluated, which is worse than reporting that it is unavailable.
+    log_lik_samples = fill(NaN, min(N_train, N_tot), n_samples)
 
     y_sigma_name = !isempty(prefix) ? "y_sigma_$(prefix)" : "y_sigma"
     r_nb_name = !isempty(prefix) ? "r_nb_$(prefix)" : "r_nb"
@@ -1228,27 +1387,36 @@ function _process_ll_and_predictions(
         ones(Float64, n_samples, outcomes_N)
     end
 
-    trials_full = if haskey(M, :trials)
-        if isnothing(PS)
-            M.trials[:, k]
-        elseif N_tot == PS.y_N
-            get(PS, :trials, ones(Int, PS.y_N, outcomes_N))[:, k]
-        else
-            vcat(M.trials[:, k], get(PS, :trials, ones(Int, PS.y_N, outcomes_N))[:, k])
-        end
-    else
-        ones(Int, N_tot)
-    end
-    
+    # A joint multivariate Gaussian draws each observation from ONE `MvNormal`, which needs
+    # the full K-vector of etas -- but this function is handed outcome `k` alone. Building a
+    # scalar likelihood for an `mvnormal` family is an outright type error
+    # (`Cannot convert Vector{Float64} to Float64`), so skip the scalar work below and let
+    # the caller (`_reconstruct`) fill `p_noisy` and `log_lik` from the joint draw. The
+    # denoised pass above is per-outcome and still correct, so it is not skipped.
+    #
+    # A marginal draw would look correct and silently discard the fitted correlation, which
+    # is the defect this whole path exists to close.
+    joint_model = _is_joint_gaussian_model(M, outcomes_N)
+
     for s in 1:n_samples
         phi_zi_s = phi_zi_samples isa AbstractMatrix ? phi_zi_samples[s, 1] : phi_zi_samples[s]
         y_sigma_s = y_sigma_samples[s, k]
         r_nb_s = r_nb_samples[s, k]
         
         # Explicitly loop to avoid broadcasting issues with keyword arguments.
+        # `phi_zi` must carry the -Inf "inactive" sentinel when zero-inflation is off: the
+        # likelihood treats any value > -Inf as an active ZI, and `bstm_Likelihood` rejects
+        # ZI together with a hurdle (likelihoods.jl:499-510). Passing 0.0 unconditionally
+        # made every hurdle model fail validation.
+        if joint_model
+            continue
+        end
         lik_obj_vec = [
-            bstm_Likelihood(family, eta_samples[i, s]; phi_zi=phi_zi_s, r_nb=r_nb_s,
-                sigma_y=y_sigma_s, trial=trials_full[min(i, length(trials_full))])
+            bstm_Likelihood(family, eta_samples[i, s];
+                phi_zi=(use_zi ? phi_zi_s : -Inf),
+                phi_hurdle=phi_hurdle_samples[s, k], r_nb=r_nb_s,
+                sigma_y=y_sigma_s, trial=trials_full[min(i, length(trials_full))],
+                extra_params=_dispersion_or_nothing(extra_params_samples[s, k]))
             for i in 1:N_tot
         ]
         
@@ -1261,6 +1429,109 @@ function _process_ll_and_predictions(
     end
 
     return (p_denoised = p_denoised_samples, p_noisy = p_noisy_samples, log_lik = log_lik_samples)
+end
+
+
+"""
+    _is_joint_gaussian_model(M, outcomes_N)
+
+`true` when the model is a plain multivariate Gaussian whose correlation lives in the
+residual covariance `D R D` (rather than in a mean rotation), so predictions must be drawn
+jointly across outcomes.
+
+The guards mirror `_generate_multivariate_likelihood_block` in `model.jl`: the family
+symbols, and `!is_multinomial` with a likelihood spec per outcome. A multinomial/Dirichlet
+model has several outcomes but a SINGLE spec -- the whole composition is one draw -- so
+iterating `outcomes_N` over `likelihood_specs` would index past the end.
+"""
+function _is_joint_gaussian_model(M, outcomes_N::Int)
+    outcomes_N <= 1 && return false
+    gaus_families = ("gaussian", "mvnormal", "multivariate_normal")
+    haskey(M, :likelihood_specs) || return false
+    nspec = length(M.likelihood_specs)
+    get(M, :is_multinomial, false) && return false
+    nspec >= outcomes_N || return false
+    return all(string(get(M.likelihood_specs[k], :family, "")) in gaus_families
+               for k in 1:outcomes_N)
+end
+
+
+"""
+    _joint_noisy_draws_if_applicable(eta_post, L_corr_samples, chain, M, outcomes_N,
+                                     n_samples, prefix)
+
+Returns an `N_tot x n_samples x outcomes_N` array of joint draws, or `nothing` when the model
+is not a plain multivariate Gaussian and the per-outcome draws must be kept.
+"""
+function _joint_noisy_draws_if_applicable(
+    eta_post::AbstractArray, L_corr_samples::AbstractMatrix, chain, M,
+    outcomes_N::Int, n_samples::Int, prefix::String
+)
+    _is_joint_gaussian_model(M, outcomes_N) || return nothing
+    isempty(L_corr_samples) && return nothing
+
+    y_sigma_name = !isempty(prefix) ? "y_sigma_$(prefix)" : "y_sigma"
+    sig = get_params_matrix(chain, y_sigma_name, outcomes_N)
+    if isempty(sig) && !isempty(prefix)
+        sig = get_params_matrix(chain, "y_sigma", outcomes_N)
+    end
+    (size(sig, 1) >= n_samples && size(sig, 2) == outcomes_N) || return nothing
+    size(L_corr_samples, 1) >= n_samples || return nothing
+
+    return _joint_noisy_draws(
+        eta_post, L_corr_samples, sig[1:n_samples, :], size(eta_post, 1), n_samples,
+        outcomes_N, M, Int(M.y_N)
+    )
+end
+
+
+"""
+    _joint_noisy_draws(eta_post, L_corr_samples, y_sigma_samples, N_tot, n_samples, outcomes_N)
+
+Joint draws of the noisy multivariate-Gaussian prediction, returned as an
+`N_tot x n_samples x outcomes_N` array.
+
+`eta_post` is `N_tot x n_samples x outcomes_N`. The generated model does **not** rotate the
+mean: for the joint Gaussian the correlation lives in the residual covariance `D R D`, so
+each observation must be drawn once from a single `MvNormal`, not once per outcome.
+
+Drawing per outcome instead is what made predictions silently lose their correlation: the
+marginals look right, which is exactly why the defect survived. The output is still
+*stored* per outcome (so `summarize_array` and the public result shape are unchanged), but
+the draws are correlated, so `raw_predictions_noisy` now carries the joint structure.
+
+Returns `nothing` when the model is not a plain multivariate Gaussian, so the caller falls
+back to the per-outcome path.
+"""
+function _joint_noisy_draws(
+    eta_post::AbstractArray, L_corr_samples::AbstractMatrix,
+    y_sigma_samples::AbstractMatrix, N_tot::Int, n_samples::Int, outcomes_N::Int,
+    M, N_train::Int
+)
+    joint = Array{Float64}(undef, N_tot, n_samples, outcomes_N)
+    # Joint log-likelihood on the training rows. Must be the JOINT logpdf, not the sum of
+    # marginals, or WAIC would be computed for a factorised model that is no longer the one
+    # being fitted. Left at zero by the per-outcome path, which is skipped for this model.
+    log_lik = zeros(Float64, N_train, n_samples)
+    for s in 1:n_samples
+        L_s = reshape(L_corr_samples[s, :], outcomes_N, outcomes_N)
+        sig_s = collect(y_sigma_samples[s, :])
+        for i in 1:N_tot
+            d = bstm_Likelihood(
+                :mvnormal, collect(view(eta_post, i, s, :));
+                sigma_y=sig_s,
+                extra_params=Dict(:correlation_cholesky => L_s)
+            )
+            if i <= N_train
+                log_lik[i, s] = logpdf(d, collect(view(M.y_obs, i, :)))
+            end
+            draw = rand(d)
+            for k in 1:outcomes_N
+                joint[i, s, k] = draw[k]
+            end
+        end
+    end
+    return joint, log_lik
 end
 
 
@@ -1467,7 +1738,7 @@ function _compute_waic(log_lik)
         return NaN
     end
     if isempty(log_lik)
-        return 0.0
+        return NaN
     end
 
     nobs, nsamples = size(log_lik)
@@ -1478,10 +1749,14 @@ function _compute_waic(log_lik)
 end
 
 function _apply_link_and_lik(family::String, eta::AbstractArray, use_zi::Bool, phi=0.0, r=1.0,
-    trials=nothing)
+    trials=nothing; phi_hurdle = -Inf)
     local mu
     if family in ["poisson", "negbin", "gamma", "exponential", "inverse_gaussian", "pareto", "lognormal"]
-        clamped_eta = clamp.(eta, -20.0, 20.0)
+        # Must use the SAME bound as `get_dist_ref` in likelihoods.jl, or the reported
+        # denoised mean and the mean of its own simulated noise disagree in the tails.
+        # See `ETA_CLAMP_BOUND`: these were 20 and 30, giving an e^10 discrepancy for
+        # eta in (20, 30]. (L8)
+        clamped_eta = clamp.(eta, -ETA_CLAMP_BOUND, ETA_CLAMP_BOUND)
         mu = exp.(clamped_eta)
     elseif family in ["bernoulli", "beta"]
         mu = LogExpFunctions.logistic.(eta)
@@ -1494,86 +1769,196 @@ function _apply_link_and_lik(family::String, eta::AbstractArray, use_zi::Bool, p
     if use_zi
         mu = (1.0 .- phi) .* mu
     end
+    # A hurdle places probability `phi_hurdle` on the hurdle value, so the population mean is
+    # `(1 - phi_hurdle) * E[y | not hurdle]` -- the same combination the kernels use
+    # (likelihoods.jl:675). Without this branch `p_denoised` reported the above-hurdle
+    # conditional mean as though it were the population mean. The `-Inf` default means the
+    # hurdle is inactive and must leave the mean untouched, mirroring how the kernels gate it.
+    if phi_hurdle > -Inf
+        mu = (1.0 .- phi_hurdle) .* mu
+    end
     return mu
 end
 
 """
-    post_stratification_weights(res, M, PS, samples_denoised)
+    post_stratification_weights(M, strata_ids, samples_denoised, totals;
+        normalize=true)
 
-Computes model-based post-stratification weights across spatial strata.
+**Model-based post-stratification weights**, one column per posterior draw.
+
+Returns a matrix \`[n_obs x n_samples]\` such that, within every stratum \$h\$ and every
+draw \$s\$,
+
+sum over i in h of  w[i,s] * yhat[i,s]  ==  T[h]
+
+where \$T_h\$ is the **externally known** total for that stratum and
+\$\\hat{y}_{i,s}\$ is the model's posterior prediction. That identity is the whole
+definition of post-stratification: the weight rescales the model's stratum total onto the
+known external total, so a weighted re-analysis reproduces the external control totals.
+
+## What this replaces, and why
+
+The previous implementation computed \`w_i = stratum_mean / pred_i\` — the mean prediction
+across a stratum divided by each unit's own prediction. That is **not**
+post-stratification and cannot be made into it:
+
+- it references **no external total at all**, so there is nothing to calibrate against;
+- the weights are not constant within a stratum, so they cannot shift a stratum total;
+- as a reweighting they satisfy no useful property, and for observations near zero the
+  ratio is dominated by the guard constant in the denominator.
+
+It is retained in name only; the function now requires the external totals, because
+post-stratification without a target is not post-stratification. **Callers that do not
+supply \`totals\` get \`nothing\`, not a number** — previously they got a number that looked
+authoritative and was meaningless.
+
+## Arguments
+- `M`: model configuration, used only for its spatial index when `strata_ids` is omitted.
+- `strata_ids`: stratum label per observation. Defaults to \`M.s_idx\`.
+- `samples_denoised`: \`[n_obs x n_samples]\$ posterior predictions.
+- `totals`: the external stratum totals, as a \`Dict\`/\`NamedTuple\` keyed by stratum, or a
+  vector ordered to match \`unique(strata_ids)\`. \`nothing\` disables post-stratification.
+- `normalize`: divide by the mean weight so the weights average 1, making them read as
+  "relative to an unweighted analysis".
+
+  ⚠️ This rescales the weighted totals by a single common factor, so the identity above
+  becomes `sum_{i in h} w[i,s]*yhat[i,s] == T[h] / c` for a common `c`. **Use
+  `normalize=false` when you need exact reconciliation to the external totals** — which is
+  the point of post-stratification. `normalize=true` is the right choice when the weights
+  are used for a *relative* reweighting (a weighted mean, a weighted fit, or comparing a
+  weighted analysis against an unweighted one), where a common factor cancels.
+
+## Returns
+\`[n_obs x n_samples]\` of weights, or \`nothing\` when no external totals are available.
+
+A draw whose stratum total is zero or non-finite gets \`NaN\` rather than a fabricated
+weight, because a silently-chosen substitute for a degenerate total would bias exactly the
+reweighted quantity it is meant to correct.
 """
-function post_stratification_weights(res, M, PS, samples_denoised)
-    # Assumptions:
-    #   1. The model configuration `M` contains the spatial index vector `:s_idx`.
-    # Inputs:
-    #   - res: The main results object (not used in this implementation).
-    #   - M: The model configuration object for the training data.
-    #   - PS: The prediction set configuration object (can be `nothing`).
-    #   - samples_denoised: A matrix of posterior predictions [n_obs x n_samples].
-    # Outputs: A matrix of weights of the same size as `samples_denoised`.
-
-    # #
-    # Input validation
-    if !haskey(M, :s_idx)
-        @warn "Post-stratification requires a spatial index `:s_idx` in the model configuration. Returning ones."
-        return ones(Float64, size(samples_denoised))
+function post_stratification_weights(
+    M,
+    strata_ids,
+    samples_denoised,
+    totals;
+    normalize::Bool = true
+)
+    ids = isnothing(strata_ids) ? get(M, :s_idx, nothing) : strata_ids
+    if isnothing(ids)
+        @warn "Post-stratification needs a stratum label per observation " *
+              "(`strata_ids`, or a spatial index `:s_idx` in the model configuration). " *
+              "Returning `nothing`." maxlog = 1
+        return nothing
     end
 
-    # #
-    # Combine stratum IDs from training and prediction sets
-    strata_ids_train = M.s_idx
+    # No external totals => no post-stratification. Do NOT fall back to a ratio.
+    if isnothing(totals)
+        @info "No external stratum totals supplied, so no post-stratification weights " *
+              "were computed. Pass `totals` (stratum => known total) to reweight " *
+              "observations. This is not an error; weights are simply undefined here."
+        return nothing
+    end
 
-    strata_ids_full = if !isnothing(PS)
-        if !haskey(PS, :s_idx)
-            @warn "Prediction set provided but is missing spatial index `:s_idx`. Post-stratification weights will only be calculated for training data."
-            strata_ids_train
-        else
-            vcat(strata_ids_train, PS.s_idx)
+    n_obs, n_samples = size(samples_denoised)
+    length(ids) == n_obs || begin
+        @error "Dimension mismatch: `samples_denoised` has $n_obs rows but there are " *
+               "$(length(ids)) stratum labels. Returning `nothing`." maxlog = 1
+        return nothing
+    end
+
+    unique_strata = unique(ids)
+    T = resolve_stratum_totals(totals, unique_strata, M, ids)
+
+    # Which external total applies to each observation?
+    total_per_obs = similar(unique_strata, Float64, n_obs)
+    for (k, h) in enumerate(unique_strata)
+        idx = findall(==(h), ids)
+        total_per_obs[idx] .= T[k]
+    end
+
+    weights = Matrix{Float64}(undef, n_obs, n_samples)
+    degenerate = 0
+    for s in 1:n_samples
+        ŷ = view(samples_denoised, :, s)
+        for (k, h) in enumerate(unique_strata)
+            idx = findall(==(h), ids)
+            ŷ_h = sum(ŷ[idx])
+            if !isfinite(ŷ_h) || abs(ŷ_h) <= _POST_STRAT_DEGENERATE_TOL
+                # Undefined: the model predicts no total for this stratum, so there is
+                # nothing to rescale. NaN rather than a fabricated weight.
+                weights[idx, s] .= NaN
+                degenerate += 1
+            else
+                weights[idx, s] .= T[k] / ŷ_h
+            end
         end
-    else
-        strata_ids_train
     end
 
-    n_obs_total, n_samples = size(samples_denoised)
-    
-    # Ensure the number of observations in samples_denoised matches the number of stratum IDs
-    if n_obs_total != length(strata_ids_full)
-        @error "Dimension mismatch: `samples_denoised` has $(n_obs_total) observations, but there are $(length(strata_ids_full)) stratum IDs. Cannot compute weights."
-        return ones(Float64, size(samples_denoised))
-    end
+    degenerate > 0 && @warn "Post-stratification: $degenerate of $(n_obs * n_samples) " *
+        "stratum-draw combinations have a zero or non-finite predicted total, so their " *
+        "weight is undefined and set to NaN. Check that the strata are populated in the " *
+        "region of interest." maxlog = 1
 
-    weights = zeros(Float64, n_obs_total, n_samples)
-    unique_strata = unique(strata_ids_full)
-
-    # #
-    # Calculate weights based on the ratio of stratum-mean prediction to observation-level
-    #   prediction
-    for stratum in unique_strata
-        # Find indices of observations in the current stratum
-        obs_indices_in_stratum = findall(x -> x == stratum, strata_ids_full)
-        
-        if isempty(obs_indices_in_stratum)
-            continue
+    if normalize
+        for s in 1:n_samples
+            col = view(weights, :, s)
+            m = mean(col)
+            # Only rescale if every weight is usable; a column containing NaN stays NaN.
+            if isfinite(m) && m != 0
+                col ./= m
+            end
         end
-
-        # Get the predictions for this stratum
-        predictions_in_stratum = view(samples_denoised, obs_indices_in_stratum, :)
-
-        # Calculate the mean prediction for the stratum for each posterior sample
-        # This results in a row vector of size [1 x n_samples]
-        mean_pred_per_sample = mean(predictions_in_stratum, dims=1)
-
-        # Calculate weights for each observation in the stratum.
-        # Weight = mean_pred_stratum / pred_observation
-        # This uses broadcasting to divide each element in predictions_in_stratum
-        # by the corresponding column mean in mean_pred_per_sample.
-        # A small epsilon is added to the denominator to prevent division by zero.
-        weights[obs_indices_in_stratum, :] = mean_pred_per_sample ./ (predictions_in_stratum .+ 1e-9)
     end
 
     return weights
 end
- 
+
+# A predicted stratum total below this is treated as degenerate. Relative rather than
+# absolute, so it means the same thing for a rate model and a count model.
+const _POST_STRAT_DEGENERATE_TOL = 1e-12
+
+"""
+    resolve_stratum_totals(totals, unique_strata, M, ids)::Vector{Float64}
+
+Normalise the several accepted forms of `totals` into one external total per stratum, in
+the order of `unique_strata`, and check that every stratum is covered.
+
+A missing stratum is an error rather than a default: silently post-stratifying some strata
+and not others produces a reweighted total that matches no control at all.
+"""
+function resolve_stratum_totals(totals, unique_strata, M, ids)
+    if totals isa AbstractDict || totals isa NamedTuple
+        pairs_ = collect(pairs(totals))
+        T = Vector{Float64}(undef, length(unique_strata))
+        seen = Dict{Any, Float64}()
+        for (k, v) in pairs_
+            seen[k] = Float64(v)
+        end
+        missing_strata = Any[]
+        for (k, h) in enumerate(unique_strata)
+            if haskey(seen, h)
+                T[k] = seen[h]
+            else
+                push!(missing_strata, h)
+            end
+        end
+        if !isempty(missing_strata)
+            error("`totals` is missing external totals for $(length(missing_strata)) " *
+                  "stratum/strata: $(first(missing_strata, 5)). Every stratum must have a " *
+                  "known total, otherwise the reweighted total reconciles to nothing.")
+        end
+        return T
+    elseif totals isa AbstractVector
+        length(totals) == length(unique_strata) || error(
+            "`totals` is a vector of length $(length(totals)) but there are " *
+            "$(length(unique_strata)) strata. A vector must be ordered to match " *
+            "`unique(strata_ids)`.")
+        return Float64.(totals)
+    else
+        error("`totals` must be a Dict/NamedTuple keyed by stratum, a vector ordered to " *
+              "match `unique(strata_ids)`, or `nothing`. Got $(typeof(totals)).")
+    end
+end
+
 
 """
     reconstruct(chain, M::NamedTuple; alpha::Float64=0.05, PS=nothing)
@@ -1669,7 +2054,7 @@ function _is_area_unit_object(obj)::Bool
 end
 
 function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothing, alpha=0.05,
-    strata_info=nothing, au=nothing, kwargs...)
+    strata_info=nothing, strata_totals=nothing, au=nothing, kwargs...)
     if _is_optimization_or_vi_result(chain)
         n_samples_req = get(kwargs, :n_samples, 100)
         chain = convert_to_chains(chain, model, n_samples_req)
@@ -1694,7 +2079,15 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothin
     res = _reconstruct(arch_type, "model_results", chain, M, nothing, alpha)
 
     # --- 2.5 Post-Stratification Weight Calculation (if applicable) ---
-    post_strat_weights = nothing 
+    #
+    # Weights are only defined when the caller supplies externally known stratum totals.
+    # They are returned in `draws_obj.weights` for a downstream reweighted analysis; note
+    # that this function does NOT itself reweight anything -- applying the weights is the
+    # caller's step, and the weights satisfy
+    #     sum_{i in h} w[i, s] * yhat[i, s] == T[h]
+    # for every stratum h and draw s, which is what makes that reweighting reconcile to
+    # the external totals.
+    post_strat_weights = nothing
 
     local M_for_post_strat = M
     if !haskey(M, :strata_info) && !isnothing(strata_info)
@@ -1708,7 +2101,7 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothin
         M.likelihood_specs
     )
 
-    if hasproperty(res, :raw_predictions_denoised)
+    if !isnothing(strata_totals) && hasproperty(res, :raw_predictions_denoised)
         samples_denoised = if res.raw_predictions_denoised isa AbstractArray{<:Real, 3}
             res.raw_predictions_denoised[:, 1, :]
         elseif res.raw_predictions_denoised isa AbstractVector
@@ -1716,8 +2109,8 @@ function model_results_comprehensive(model::DynamicPPL.Model, chain; data=nothin
         else
             res.raw_predictions_denoised
         end
-        post_strat_weights = post_stratification_weights(res, M_for_post_strat, nothing,
-            samples_denoised)
+        post_strat_weights = post_stratification_weights(
+            M_for_post_strat, get(M, :s_idx, nothing), samples_denoised, strata_totals)
     end
 
     # --- 3. Performance Metric Calculation ---

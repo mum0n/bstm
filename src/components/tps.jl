@@ -53,7 +53,7 @@ second-order random walk (RW2) prior:
 """
 struct TPS <: ComponentModel
     nbins::Int
-    sigma::Distribution
+    sigma::Union{Distribution, Real}
     method::Symbol
 end
 
@@ -203,16 +203,16 @@ function get_priors(
     M::NamedTuple
 )::String
     p_names = generate_full_variable_names(spec, arch, outcome_idx)
-    sigma_prior_str = _distribution_to_string(m.sigma)
+    sigma_prior_str = _prior_or_constant(p_names.sigma, m.sigma)
     key = spec.key
     
     if m.method == :marginalized
         return """
-            $(p_names.sigma) ~ $(sigma_prior_str)
+            $(sigma_prior_str)
         """
     else
         return """
-            $(p_names.sigma) ~ $(sigma_prior_str)
+            $(sigma_prior_str)
             $(p_names.innovations) ~ MvNormal(zeros(T, spec_registry[:$(key)].hyper.n_latent), I)
         """
     end
@@ -236,7 +236,9 @@ function get_updates(
         let
             $(common_code)
             local diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
-            diag_D[1] = 0.0; diag_D[2] = 0.0
+            # Zero every null direction: the count depends on the spectrum, and a
+            # disconnected graph has more than one. See _zero_null_modes!.
+            _zero_null_modes!(diag_D, hyper.L)
             local coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             $(p_names.latent_field) = B_basis * coeffs
             $(eta_target) = $(eta_target) .+ $(p_names.latent_field)
@@ -281,7 +283,7 @@ function get_updates(
                 hyper.Q_template,
                 hyper.L,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -358,15 +360,17 @@ function get_effects(
     # --- Reconstruction Loop ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
+        sigma_samples_cpu = _resolve_hyper_samples(
+            chain, p_names, v.sigma, m.sigma, k,
+            is_multivariate_model, n_samples)
 
-        if isempty(sigma_name)
-            @warn "Parameters for TPS component $(spec.key) (outcome $k) not found. Returning zero-matrix."
-            push!(structured_effects, zeros(Float64, size(B_full_cpu, 1), n_samples))
+        if isnothing(sigma_samples_cpu)
+            @warn "Parameters for $(spec.key) (outcome $k) not resolved, and " *
+                  "sigma is not a pinned constant. Returning zero-matrix."
+            push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
 
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
         effect_k_cpu = zeros(Float64, size(B_full_cpu, 1), n_samples)
 
         # --- Sample-wise Reconstruction ---
@@ -415,7 +419,9 @@ function get_effects(
                 if m.method == :spectral
                     U_cpu, L_cpu = hyper.U, hyper.L
                     diag_D = sigma_i ./ sqrt.(L_cpu .+ noise)
-                    diag_D[1] = 0.0; diag_D[2] = 0.0
+                    # Zero every null direction: the count depends on the spectrum, and a
+                    # disconnected graph has more than one. See _zero_null_modes!.
+                    _zero_null_modes!(diag_D, L_cpu)
                     coeffs_cpu = U_cpu * (diag_D .* innovations_i)
                 else # :cholesky or :cholesky_sparse
                     F_cpu = hyper.cholesky_factor

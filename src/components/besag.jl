@@ -68,7 +68,7 @@ strong prior belief in local spatial smoothing.
   `:cholesky` (AD-safe, dense), or `:cholesky_sparse` (didactic, not AD-safe).
 """
 struct Besag <: ComponentModel
-    sigma::UnivariateDistribution
+    sigma::Union{UnivariateDistribution, Real}
     method::Symbol
 end
 
@@ -141,11 +141,11 @@ function get_priors(
     
     if m.method == :marginalized
         return """
-        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(_prior_or_constant(p_names.sigma, m.sigma))
         """
     else
         return """
-        $(p_names.sigma) ~ $(_distribution_to_string(m.sigma))
+        $(_prior_or_constant(p_names.sigma, m.sigma))
         $(p_names.innovations) ~ MvNormal(zeros(T, $(n_latent)), I)
         """
     end
@@ -162,7 +162,7 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
         let
             hyper = spec_registry[:$(key)].hyper
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
-            diag_D[1] = 0.0
+            diag_D[hyper.L .<= (1e-10 * maximum(hyper.L))] .= 0.0   # zero EVERY null direction (a disconnected graph has more than one)
             
             $(p_names.latent_field) = hyper.U * (diag_D .* $(p_names.innovations))
             
@@ -210,7 +210,7 @@ function get_updates(m::Besag, spec::NamedTuple, arch::String, outcome_idx::Unio
                 hyper.Q_template,
                 hyper.L,
                 $(p_names.sigma),
-                y_sigma,
+                @isdefined(y_sigma) ? y_sigma : 0.0,
                 M.noise
             )
             Turing.@addlogprob! log_lik_marginalized_$(key)
@@ -264,16 +264,17 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         p_names_k = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(p_names_k.sigma), k, is_multivariate_model)
+        sigma_samples = _resolve_hyper_samples(
+            chain, p_names, p_names_k.sigma, m.sigma, k,
+            is_multivariate_model, n_samples;
+            as_matrix = true)
 
-        if isempty(sigma_name)
-            @warn "Parameters for Besag component $(spec.key) (outcome $k) not found. Returning zero-matrix."
+        if isnothing(sigma_samples)
+            @warn "Parameters for $(spec.key) (outcome $k) not resolved, and " *
+                  "sigma is not a pinned constant. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total, n_samples))
             continue
         end
-
-        # Extract posterior samples (these are on the CPU)
-        sigma_samples = get_params_vector(chain, sigma_name, 1) # (n_samples, 1)
 
         # Initialize the output matrix for latent effects
         effect_k_latent = zeros(Float64, n_latent, n_samples)
@@ -335,7 +336,7 @@ function get_effects(
                     innov_j = innovations_samples[j, :]
                     
                     diag_D = sigma_j ./ sqrt.(L .+ noise)
-                    diag_D[1] = 0.0
+                    _zero_null_modes!(diag_D, L)   # zero EVERY null direction; a disconnected graph has more than one
                     effect_k_latent[:, j] = U * (diag_D .* innov_j)
                 end
             else # :cholesky or :cholesky_sparse
