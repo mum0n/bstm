@@ -69,13 +69,17 @@ struct SVAR <: ComponentModel
 end
 
 COMPONENT_TYPE_REGISTRY[:svar] = SVAR
-COMPONENT_TYPE_REGISTRY[:spacetime] = SVAR
 
 COMPONENT_CONSTRUCTORS[:svar] = (p, params) -> begin
     raw_rho = get(params, :rho_model, get(params, :model, :icar))
-    rho_m = raw_rho in [:svar, :spacetime] ? :icar : raw_rho
+    rho_m = raw_rho === :svar ? :icar : raw_rho
+    # `precision_field_scale` is `UnivariateDistribution`-only, so it must NOT be fed a pinned
+    # `sigma`. The previous fallback used `p.sigma` for it, so pinning `sigma=1.0` produced
+    # `MethodError: Cannot convert an object of type Float64 to a value of type
+    # UnivariateDistribution` and the component could not be built at all. A pinned sigma
+    # populates `sigma` only; this field keeps its own prior.
     p_rho_sigma = hasproperty(p, :precision_field_scale) ? p.precision_field_scale :
-        (hasproperty(p, :sigma) ? p.sigma : Exponential(0.5))
+        Exponential(0.5)
     p_rho_rho = hasproperty(p, :precision_field_mixing) ? p.precision_field_mixing : nothing
     p_sigma = hasproperty(p, :sigma) ? p.sigma : Exponential(0.5)
     SVAR(
@@ -86,10 +90,32 @@ COMPONENT_CONSTRUCTORS[:svar] = (p, params) -> begin
         get(params, :method, :spectral)
     )
 end
-COMPONENT_CONSTRUCTORS[:spacetime] = COMPONENT_CONSTRUCTORS[:svar]
 
+# `spacetime` was a bare alias for `svar` -- `COMPONENT_CONSTRUCTORS[:spacetime]` was
+# assigned the same closure, and both registry entries pointed at the same `SVAR` struct, so
+# it was never a distinct space-time model. It is REMOVED. Two reasons:
+#
+#   * the DSL already expresses a space-time structure the current way, as a Kronecker
+#     product of a spatial and a temporal random effect:
+#         random(s_idx, model=icar, sigma=1.0) ⊗ random(t_idx, model=ar1, sigma=1.0)
+#     which builds a separable `ICAR`-by-`AR1` structure the user chooses and can vary
+#     independently, whereas the alias bundled both penalties into one component;
+#   * it left `svar` reachable under two names, which is how the two drifted apart in the
+#     first place.
+#
+# A constructor is retained purely to fail with guidance rather than a bare "unknown model".
+# It is deliberately NOT in `COMPONENT_TYPE_REGISTRY`, so `spacetime` is no longer a component.
+COMPONENT_CONSTRUCTORS[:spacetime] = (p, params) -> throw(ArgumentError(
+    "`model=spacetime` has been removed; it was only ever an alias for `model=svar`. Use " *
+    "`model=svar` for a single-factor spatial autoregressive field, or express a " *
+    "spatiotemporal structure as a Kronecker product of a spatial and a temporal effect, " *
+    "e.g. `random(s_idx, model=icar, sigma=1.0) ⊗ random(t_idx, model=ar1, sigma=1.0)`."
+))
+
+# NOTE: `:spacetime` survives as a STRUCTURE kind, not a component name. `svar`,
+# `tensorproductsmooth` and `dynamics` all map to it, and the assembly, reconstruction and
+# plotting code branches on `structure == :spacetime`. Only the component alias is gone.
 MODEL_TO_STRUCTURE_MAP[:svar] = :spacetime
-MODEL_TO_STRUCTURE_MAP[:spacetime] = :spacetime
 
 function get_precomputes(m::SVAR, M::NamedTuple, mod_data::Dict)::NamedTuple
     # Validation moved from get_datastructures!

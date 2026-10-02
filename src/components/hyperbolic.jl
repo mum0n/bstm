@@ -80,16 +80,30 @@ function get_precomputes(m::Hyperbolic, M::NamedTuple, mod_data::Dict)::NamedTup
         end
     end
 
-    coords = Matrix{Float64}(M.data[!, Symbol.(variables)])
-    
+    coords_raw = Matrix{Float64}(M.data[!, Symbol.(variables)])
+    n_latent = size(coords_raw, 1)
+
+    # If only a single coordinate is provided, embed it on a circle in the Poincaré disk.
+    # This allows the component to build with generic 1D fixtures while preserving
+    # the 2D hyperbolic geometry. The single coordinate is treated as an angular index.
+    if size(coords_raw, 2) == 1
+        idx = coords_raw[:, 1]
+        # Map index 1:n to angles 0:2π, radius < 1
+        n = length(idx)
+        angles = 2π .* (idx .- minimum(idx)) ./ max(1, maximum(idx) - minimum(idx))
+        radius = 0.5  # safely inside unit disk
+        coords = [radius .* cos.(angles)  radius .* sin.(angles)]
+    else
+        coords = coords_raw
+    end
+
     # Validate that coordinates are within the unit disk
     if any(sum(coords.^2, dims=2) .>= 1.0)
         @warn "Some coordinates for the Hyperbolic model lie on or outside the unit " *
               "disk. The model assumes coordinates are strictly inside the disk " *
               "(||s|| < 1). Results may be unstable."
     end
-    
-    n_latent = size(coords, 1)
+
     return (coords=coords, n_latent=n_latent)
 end
 

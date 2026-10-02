@@ -948,4 +948,78 @@ end
             end
         end
     end
+
+    @testset "`spacetime` is removed as a component; `svar` and the Kronecker form remain" begin
+        # `spacetime` was never a distinct space-time model: it was a bare alias, with
+        # `COMPONENT_CONSTRUCTORS[:spacetime] = COMPONENT_CONSTRUCTORS[:svar]` and both
+        # registry entries pointing at the same `SVAR` struct. It was removed because the DSL
+        # already expresses the structure the current way -- as a Kronecker product of a
+        # spatial and a temporal effect -- and because leaving `svar` reachable under two names
+        # is how the two drifted apart in the first place.
+        #
+        # `:spacetime` SURVIVES as a structure kind (not a component name): `svar`,
+        # `tensorproductsmooth` and `dynamics` all map to it, and the assembly, reconstruction
+        # and plotting code branches on `structure == :spacetime`. Only the alias is gone.
+        @test !haskey(bstm.COMPONENT_TYPE_REGISTRY, :spacetime)
+        @test haskey(bstm.COMPONENT_TYPE_REGISTRY, :svar)
+        # A constructor is retained so the failure carries guidance rather than being a bare
+        # "unknown model" -- the most common way a removed API name hurts someone.
+        @test haskey(bstm.COMPONENT_CONSTRUCTORS, :spacetime)
+
+        ns, nt = 4, 3
+        nst = ns * nt
+        dst = DataFrame(s_idx = repeat(1:ns, nt), s_x = repeat(collect(1.0:ns), nt),
+                        s_y = zeros(nst), t_idx = repeat(1:nt, inner = ns),
+                        t = repeat(collect(1.0:nt), inner = ns))
+        dst.depth = [10.0, 12.0, 9.0, 11.0][dst.s_idx] .+ dst.t
+        Wst = spzeros(Int, ns, ns)
+        for j in 1:(ns - 1)
+            Wst[j, j + 1] = 1
+            Wst[j + 1, j] = 1
+        end
+        Wst[1, ns] = 1
+        Wst[ns, 1] = 1
+
+        @testset "the removed name fails with guidance" begin
+            f = "likelihood(depth, family=gaussian) ~ intercept() + " *
+                "random(s_idx, model=spacetime, sigma=1.0)"
+            err = try
+                bstm.bstm_core(f, dst; W = Wst, verbose = false)
+                nothing
+            catch e
+                e
+            end
+            @test err !== nothing
+            msg = sprint(showerror, err)
+            # It must point at both replacements, or the removal is user-hostile.
+            @test occursin("svar", msg)
+            @test occursin("Kronecker", msg)
+        end
+
+        @testset "the supported forms still work" begin
+            f = "likelihood(depth, family=gaussian) ~ intercept() + " *
+                "random(s_idx, model=svar, sigma=1.0)"
+            m = bstm.bstm_core(f, dst; W = Wst, verbose = false)
+            @test m isa DynamicPPL.Model
+            @test sample(MersenneTwister(3), m, Prior(), 10; progress=false) isa Any
+
+            # The modern form builds a SEPARABLE structure -- a spatial and a temporal
+            # effect plus their composition -- rather than one monolithic component.
+            f2 = "likelihood(depth, family=gaussian) ~ intercept() + " *
+                 "random(s_idx, model=icar, sigma=1.0) " * "\u2297" * " " *
+                 "random(t_idx, model=ar1, sigma=1.0)"
+            m2 = bstm.bstm_core(f2, dst; W = Wst, verbose = false)
+            @test m2 isa DynamicPPL.Model
+            kinds = Set(nameof(typeof(c.component_obj)) for c in m2.args.M.components)
+            @test :ICAR in kinds
+            @test :AR1 in kinds
+            @test sample(MersenneTwister(3), m2, Prior(), 10; progress=false) isa Any
+        end
+
+        @testset "the structure kind survives" begin
+            @test bstm.MODEL_TO_STRUCTURE_MAP[:svar] == :spacetime
+            @test bstm.MODEL_TO_STRUCTURE_MAP[:tensorproductsmooth] == :spacetime
+            @test bstm.MODEL_TO_STRUCTURE_MAP[:dynamics] == :spacetime
+        end
+    end
 end

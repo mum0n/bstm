@@ -74,31 +74,62 @@ COMPONENT_CONSTRUCTORS[:waveletgp] = (p, params) -> WaveletGP(
 MODEL_TO_STRUCTURE_MAP[:waveletgp] = :smooth
  
 """
-    _get_wavelet_scale_indices_2d(res::Int, wt)
+    _wavelet_max_level(res::Integer)
 
-Computes the scale level for each coefficient in a 2D DWT.
+Number of wavelet decomposition levels usable for a `res`-point grid.
+
+This is `log2(res)`, i.e. `Wavelets.maxtransformlevels(res)`, and requires a
+power-of-two resolution because the multiresolution transform installed here is
+strictly dyadic and length-preserving (see [`_wavelet_decomposition_lengths`](@ref)).
 """
-function _get_wavelet_scale_indices_2d(res::Int, wt)
+function _wavelet_max_level(res::Integer)
+    res >= 2 || error("waveletgp requires resolution >= 2, got $res")
+    ispow2(res) || error(
+        "waveletgp requires a power-of-2 resolution for a dyadic wavelet basis, got $res. " *
+        "Use one of 4, 8, 16, 32, 64, ...")
+    return trailing_zeros(res)
+end
+
+"""
+    _get_wavelet_scale_indices_2d(res::Integer)
+
+Scale index of every coefficient of the 2-D `res`x`res` wavelet basis, as a vector
+of length `res^2`.
+
+Index `0` marks the coarsest (residual approximation) block; larger indices mark
+progressively finer detail subbands. This is the same convention as the 1-D path
+(see [`_wavelet_scale_indices_1d`](@ref)), which matters because the component turns
+these indices into variances as `sigma^2 * 2^(-alpha * j)`: with `alpha > 0` the
+variance must *decay* towards fine scales for the Whittle power law the component
+documents.
+
+At decomposition step `k` the three detail subbands live on a `res/2^k` grid, so their
+scale index is `max_level - k + 1`; the surviving approximation block gets `0`.
+
+The previous implementation instead assigned `k` -- growing with *coarseness* -- and gave
+the approximation block the *largest* index. That inverted the decay, and did so in the
+opposite direction from the 1-D path, so the same component shrank fine-scale variances
+in 2-D and fine-scale variances in 1-D meant the opposite thing.
+"""
+function _get_wavelet_scale_indices_2d(res::Integer)
     scale_indices_matrix = zeros(Int, res, res)
-    max_level = floor(Int, log2(res))
-    
+    max_level = _wavelet_max_level(res)
+
     current_res = res
-    for level in 1:max_level
+    for k in 1:max_level
         half_res = current_res ÷ 2
-        if half_res == 0
-            break
-        end
-        
-        # Assign level to the detail coefficient quadrants
+        half_res == 0 && break
+
+        level = max_level - k + 1   # finest first, so the index grows as scales refine
         scale_indices_matrix[1:half_res, (half_res+1):current_res] .= level # Horizontal details
         scale_indices_matrix[(half_res+1):current_res, 1:half_res] .= level # Vertical details
         scale_indices_matrix[(half_res+1):current_res, (half_res+1):current_res] .= level # Diagonal details
-        
+
         current_res = half_res
     end
-    # Assign the highest level to the remaining approximation coefficients
-    scale_indices_matrix[1:current_res, 1:current_res] .= max_level
-    
+    # Coarsest block: index 0, so it carries the unattenuated overall variance.
+    scale_indices_matrix[1:current_res, 1:current_res] .= 0
+
     return vec(scale_indices_matrix)
 end
 
@@ -133,6 +164,71 @@ function _resolve_wavelet(w)
     end
 end
 
+"""
+    _wavelet_decomposition_lengths(res::Integer)
+
+Band lengths of the length-preserving multiresolution wavelet coefficient vector that
+Wavelets 0.10 produces for a `res`-point signal.
+
+**Why this exists.** `waveletgp` previously called `c, l = wavedec(x_dummy, wt)` and was
+therefore **unimplementable**: `wavedec` does not exist in the installed `Wavelets` 0.10 or
+`WaveletsExt` 0.2, so the component could not be built at all. The decomposition itself was
+never needed -- `x_dummy` is an all-zero signal, the coefficients `c` were discarded, and
+only `length(c)` and the entries of `l` were read, purely to label which scale each basis
+column belongs to. The scale boundaries are a property of the wavelet *family*, not of the
+data, so they are computed directly here.
+
+The installed transform is **length-preserving**, which is what makes the reconstruction
+self-consistent: `dwt(x, wt, L)` returns exactly `length(x)` coefficients, `idwt(c, wt, L)`
+inverts it to machine precision, and the `Phi[:, j] = idwt(e_j, wt, L)` basis built from it
+is exactly orthonormal (`Phi' * Phi == I`). That is why `n_latent == res` holds.
+
+Coefficients are stored coarsest-first, so the bands are
+
+    1, 1, 2, 4, ..., 2^(L-1)        with  sum(lengths) == res == 2^L
+
+Verified against the installed library: `dwt(ones(res), wt, L)` is nonzero *only* at position
+1 (the approximation band), and the remaining positions group into bands of `2^(l-1)` -- the
+groups are homogeneous in `sum(abs)/max(abs)`, e.g. for `res == 16`, `L == 4` the groups are
+`{1}`, `{2}`, `{3:4}`, `{5:8}`, `{9:16}` with ratios `16.0`, `9.77`, `6.27`, `5.52`, `2.61`.
+
+A classic MATLAB-style `wavedec` length vector (`[1, 8, 8, 4, 4, 2, 2, 1, 1]`, summing to 31
+for a 16-point signal) does **not** apply here: it belongs to the boundary-extending variant,
+which this Wavelets version does not implement.
+"""
+function _wavelet_decomposition_lengths(res::Integer)
+    max_lvl = _wavelet_max_level(res)
+    return [1; [2^(l - 1) for l in 1:max_lvl]]
+end
+
+"""
+    _wavelet_scale_indices_1d(res::Integer)
+
+Scale index of every coefficient of the 1-D length-`res` wavelet basis: a vector of length
+`res` whose entries are the band level `0, 1, 2, ..., max_lvl` in coarsest-first order.
+
+Index `0` is the coarsest (approximation) band, which carries the unattenuated overall
+variance; each finer band gets a larger index and therefore a smaller variance under
+`var_j = sigma^2 * 2^(-alpha * j)`.
+
+The previous implementation had three defects here: it sized the vector as `length(c)` from a
+standard `wavedec` layout (31 entries for `res == 16`) while the innovations vector has
+`n_latent == res` entries, so `innovations .* sqrt.(scale_variances)` in `get_updates` was a
+dimension mismatch that could never succeed; it looped over `2:length(l)-1`, skipping the
+final band; and it assigned `max_lvl - (i - 1)`, which runs **negative** for the later bands
+and inflates their variances above `sigma^2`.
+"""
+function _wavelet_scale_indices_1d(res::Integer)
+    lengths = _wavelet_decomposition_lengths(res)
+    idx = Vector{Int}(undef, sum(lengths))
+    pos = 1
+    for (band, n) in enumerate(lengths)
+        idx[pos:(pos + n - 1)] .= band - 1
+        pos += n
+    end
+    return idx
+end
+
 function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTuple
     variables = mod_data[:variables]
     if isempty(variables)
@@ -159,37 +255,31 @@ function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTupl
     grid_ranges = [range(min_coords[d], stop=max_coords[d], length=res) for d in 1:n_dims]
 
     wt = _resolve_wavelet(m.wavelet)
+    max_lvl = _wavelet_max_level(res)
     local scale_indices_cpu
     if n_dims == 1
-        x_dummy = zeros(res)
-        c, l = wavedec(x_dummy, wt)
-        scale_indices_cpu = zeros(Int, length(c))
-        start_idx = 1
-        
-        max_lvl = floor(Int, log2(res))
-        scale_indices_cpu[start_idx : start_idx + l[1] - 1] .= max_lvl
-        start_idx += l[1]
-        
-        # Detail coefficients scales
-        for i in 2:length(l)-1
-            current_level = max_lvl - (i - 1)
-            scale_indices_cpu[start_idx : start_idx + l[i] - 1] .= current_level
-            start_idx += l[i]
-        end
+        scale_indices_cpu = _wavelet_scale_indices_1d(res)
     else # 2D
-        scale_indices_cpu = _get_wavelet_scale_indices_2d(res, wt)
+        scale_indices_cpu = _get_wavelet_scale_indices_2d(res)
     end
+    # The innovations vector has exactly `n_latent` entries, and `get_updates` multiplies it
+    # elementwise by `sqrt.(scale_variances)`, so these must agree exactly.
+    length(scale_indices_cpu) == n_latent || error(
+        "internal waveletgp error: got $(length(scale_indices_cpu)) scale indices " *
+        "for $(n_dims)D resolution $res but n_latent is $n_latent.")
 
     # Precompute wavelet synthesis basis matrix: [n_latent, n_latent]
+    # `idwt(c, wt, max_lvl)` is the exact inverse of the installed length-preserving
+    # `dwt`, so these columns are an orthonormal wavelet basis for an orthonormal filter.
     Phi_wavelet = zeros(Float64, n_latent, n_latent)
     for j in 1:n_latent
         e_j = zeros(Float64, n_latent)
         e_j[j] = 1.0
         if n_dims == 1
-            Phi_wavelet[:, j] = idwt(e_j, wt)
+            Phi_wavelet[:, j] = idwt(e_j, wt, max_lvl)
         else
             e_j_2d = reshape(e_j, res, res)
-            Phi_wavelet[:, j] = vec(idwt(e_j_2d, wt))
+            Phi_wavelet[:, j] = vec(idwt(e_j_2d, wt, max_lvl))
         end
     end
 
@@ -204,6 +294,7 @@ function get_precomputes(m::WaveletGP, M::NamedTuple, mod_data::Dict)::NamedTupl
     
     return (
         resolution = res,
+        max_lvl = max_lvl,
         n_dims = n_dims,
         n_latent = n_latent,
         coords = coords_cpu,
@@ -272,6 +363,7 @@ function get_effects(
     # --- Get precomputed data (all on CPU) ---
     hyper = spec.hyper
     res = hyper.resolution
+    max_lvl = hyper.max_lvl
     n_dims = hyper.n_dims
     n_latent = hyper.n_latent
     scale_indices_cpu = hyper.scale_indices
@@ -294,19 +386,27 @@ function get_effects(
     # --- Reconstruction Loop: Iterate over each outcome variable ---
     for k in 1:outcomes_N
         v = generate_full_variable_names(spec, M.model_arch, k)
-        sigma_name = _find_parameter(p_names, string(v.sigma), k, is_multivariate_model)
-        alpha_name = _find_parameter(p_names, string(v.alpha), k, is_multivariate_model)
         innovations_name = _find_parameter(p_names, string(v.innovations), k, is_multivariate_model)
 
-        if isempty(sigma_name) || isempty(alpha_name) || isempty(innovations_name)
+        # Resolve the hyperparameters through the shared helper so a pinned constant (e.g.
+        # `random(x, model=waveletgp, sigma=1.0)`) falls back to its value. The previous code
+        # demanded a chain variable for `sigma`, so every pinned-sigma model matched none of
+        # the three names and reconstruction silently returned an all-zero effect matrix --
+        # the fit looked empty rather than failing.
+        sigma_samples_cpu = _resolve_hyper_samples(
+            chain, p_names, v.sigma, m.sigma, k, is_multivariate_model, n_samples)
+        alpha_samples_cpu = _resolve_hyper_samples(
+            chain, p_names, v.alpha, m.alpha, k, is_multivariate_model, n_samples)
+
+        if isempty(innovations_name) || isnothing(sigma_samples_cpu) || isnothing(alpha_samples_cpu)
             @warn "Parameters for WaveletGP component $(spec.key) (outcome $k) not found. Returning zero-matrix."
             push!(structured_effects, zeros(Float64, N_total_eff, n_samples))
             continue
         end
 
         # Extract posterior samples (these are on the CPU)
-        sigma_samples_cpu = get_params_vector(chain, sigma_name, 1)[:, 1]
-        alpha_samples_cpu = get_params_vector(chain, alpha_name, 1)[:, 1]
+        sigma_samples_cpu = vec(sigma_samples_cpu)
+        alpha_samples_cpu = vec(alpha_samples_cpu)
         innovations_samples_cpu = get_params_matrix(chain, innovations_name, n_latent)
 
         effect_k = zeros(Float64, N_total_eff, n_samples)
@@ -323,10 +423,10 @@ function get_effects(
             
             local latent_field_grid_cpu
             if n_dims == 1
-                latent_field_grid_cpu = idwt(wavelet_coeffs, wt)
+                latent_field_grid_cpu = idwt(wavelet_coeffs, wt, max_lvl)
             else
                 coeffs_reshaped = reshape(wavelet_coeffs, res, res)
-                latent_field_grid_cpu = idwt(coeffs_reshaped, wt)
+                latent_field_grid_cpu = idwt(coeffs_reshaped, wt, max_lvl)
             end
             
             itp_s = linear_interpolation(Tuple(grid_ranges_cpu), latent_field_grid_cpu,

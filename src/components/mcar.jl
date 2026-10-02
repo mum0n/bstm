@@ -129,9 +129,21 @@ function get_priors(
     s_N = spec.hyper.s_N
     K = spec.hyper.K
 
+    # `sigma` is a K-vector (one marginal SD per outcome) and is declared
+    # `Union{UnivariateDistribution, Real}`, so a pinned constant is representable. Calling
+    # `_distribution_to_string` on it raised
+    # `MethodError: no method matching _distribution_to_string(::Float64)`; a scalar prior
+    # also cannot express a K-vector, so the pinned case is emitted as a filled constant of
+    # the right length rather than via `filldist`.
+    sigma_prior = if m.sigma isa Real
+        "$(p_names.sigma) = fill($(m.sigma), $(K))"
+    else
+        "$(p_names.sigma) ~ filldist($(_distribution_to_string(m.sigma)), $(K))"
+    end
+
     return """
     $(_prior_or_constant(p_names.rho_unconstrained, m.rho_unconstrained))
-    $(p_names.sigma) ~ filldist($(_distribution_to_string(m.sigma)), $(K))
+    $(sigma_prior)
     L_corr_$(spec.key) ~ LKJCholesky($(K), $(m.correlation_lkj))
     $(p_names.innovations) ~ MvNormal(zeros(T, $(s_N * K)), I)
     """

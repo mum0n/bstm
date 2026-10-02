@@ -255,10 +255,16 @@ function get_updates(
             
             # Construct diag_D on the CPU
             diag_D = $(p_names.sigma) ./ sqrt.(hyper.L .+ M.noise)
-            # Enforce sum-to-zero constraints for RW2 penalty
             # Zero every null direction: the count depends on the spectrum, and a
             # disconnected graph has more than one. See _zero_null_modes!.
-            _zero_null_modes!(diag_D, L)
+            #
+            # The argument MUST be `hyper.L` here, not a bare `L`. This is the generated
+            # model body, where the eigenvalues are reached through `hyper`; the `get_effects`
+            # reconstruction below binds a local `L = hyper.L` instead. An automated rewrite
+            # assumed the two shared a name, got them backwards, and the result was
+            # `UndefVarError: L not defined in _GeneratedModelRuntime` -- i.e. `fft` could not
+            # be sampled at all.
+            _zero_null_modes!(diag_D, hyper.L)
             
             coeffs = hyper.U * (diag_D .* $(p_names.innovations))
             $(p_names.latent_field) = B_fft * coeffs
